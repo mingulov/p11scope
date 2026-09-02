@@ -1199,6 +1199,9 @@ impl Owned {
         let Some(child) = self.child.take() else {
             return Ok(());
         };
+        let natural_exit =
+            end == CaptureEnd::TargetExit && child.pin().original_exited().unwrap_or(false);
+        engine.finish_owned_selection_coverage(natural_exit);
         let cleanup = {
             let marker = marker_never_seen();
             let cancelled = cancelled_by(signals);

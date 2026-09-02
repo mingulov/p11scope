@@ -41,6 +41,7 @@ use p11scope_manifest::manifest::{
 use p11scope_manifest::maps::{Device, MapEntry, MapIndex, MappedPath, ObjectKey, Resolved};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
+use std::num::NonZeroU64;
 use std::os::fd::AsRawFd as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{FileExt as _, MetadataExt as _};
@@ -612,7 +613,7 @@ fn same_selection_target_set(
 /// changed complete target set is factual loss, never a union of authorities.
 fn prune_selection_table_conflicts(
     claims: &mut BTreeMap<SelectionClaimKey, SelectionClaim>,
-) -> bool {
+) -> BTreeSet<SelectionTableKey> {
     type ClaimEntries = Vec<(SelectionClaimKey, SelectionClaim)>;
     type ClaimsByBinding = BTreeMap<(u64, PinnedObjectId, u64), ClaimEntries>;
     let mut groups: BTreeMap<SelectionTableKey, ClaimsByBinding> = BTreeMap::new();
@@ -625,6 +626,7 @@ fn prune_selection_table_conflicts(
             .push((key.clone(), claim.clone()));
     }
     let mut remove = BTreeSet::new();
+    let mut conflicts = BTreeSet::new();
     for (semantic, by_binding) in groups {
         let mut known: Option<(u64, PinnedObjectId, Vec<plan::SelectionTableTarget>)> = None;
         let mut conflict = false;
@@ -649,13 +651,13 @@ fn prune_selection_table_conflicts(
                     .filter(|claim| selection_table_key(claim) == semantic)
                     .cloned(),
             );
+            conflicts.insert(semantic);
         }
     }
-    let changed = !remove.is_empty();
     for key in remove {
         claims.remove(&key);
     }
-    changed
+    conflicts
 }
 
 fn selection_tables_from_claims(
@@ -2017,6 +2019,54 @@ struct DynamicExportWork {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionCoverageState {
+    Uncovered,
+    OwnedPending(NonZeroU64),
+    OwnedOpen(NonZeroU64),
+    OwnedClosed(NonZeroU64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Task 4 consumes this crate-private reducer contract.
+pub(crate) enum SelectionCoverageVerdict {
+    Observed,
+    ObservedUncovered,
+    AbsentCovered,
+    AbsentUncovered,
+}
+
+impl SelectionCoverageState {
+    fn invalidate(&mut self) {
+        *self = Self::Uncovered;
+    }
+
+    fn retire(&mut self) {
+        if !matches!(self, Self::OwnedClosed(_)) {
+            *self = Self::Uncovered;
+        }
+    }
+
+    fn open(&mut self) {
+        if let Self::OwnedPending(generation) = *self {
+            *self = Self::OwnedOpen(generation);
+        }
+    }
+
+    fn close_naturally(&mut self) {
+        match *self {
+            Self::OwnedOpen(generation) => *self = Self::OwnedClosed(generation),
+            Self::OwnedPending(_) => *self = Self::Uncovered,
+            Self::Uncovered | Self::OwnedClosed(_) => {}
+        }
+    }
+
+    #[allow(dead_code)] // Used by the Task-4-facing reducer below.
+    fn silently_covered(self) -> bool {
+        matches!(self, Self::OwnedOpen(_) | Self::OwnedClosed(_))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SelectionBindingFact {
     id: u64,
     context: LoaderContextId,
@@ -2027,6 +2077,9 @@ struct SelectionBindingFact {
     abi: HookAbi,
     attached: bool,
     retired: bool,
+    provider: plan::ModuleId,
+    observed: bool,
+    coverage: SelectionCoverageState,
 }
 
 #[derive(Clone)]
@@ -5317,6 +5370,7 @@ impl Engine {
             return;
         }
         self.discovery_truncated = self.discovery_truncated.saturating_add(count);
+        self.invalidate_silent_selection_coverage();
         self.invalidate_causal_timing();
     }
 
@@ -5353,6 +5407,146 @@ impl Engine {
         if !self.counters.object_skips.contains(&skipped) {
             self.counters.object_skips.push(skipped);
         }
+    }
+
+    #[allow(dead_code)] // Task 4 consumes this crate-private reducer accessor.
+    pub(crate) fn selection_coverage(
+        &self,
+        provider: plan::ModuleId,
+    ) -> Option<SelectionCoverageVerdict> {
+        let bindings: Vec<_> = self
+            .selection_bindings
+            .values()
+            .filter(|binding| binding.provider == provider)
+            .collect();
+        if bindings.is_empty() {
+            return None;
+        }
+        let observed = bindings.iter().any(|binding| binding.observed);
+        let uncovered = bindings
+            .iter()
+            .any(|binding| !binding.observed && !binding.coverage.silently_covered());
+        Some(match (observed, uncovered) {
+            (true, true) => SelectionCoverageVerdict::ObservedUncovered,
+            (true, false) => SelectionCoverageVerdict::Observed,
+            (false, true) => SelectionCoverageVerdict::AbsentUncovered,
+            (false, false) => SelectionCoverageVerdict::AbsentCovered,
+        })
+    }
+
+    fn mark_owned_selection_pending(&mut self, generation: NonZeroU64) {
+        let prior_selection_loss = {
+            let history = self.capture_facts.visible_history();
+            history.selection_truncated
+                || history
+                    .losses
+                    .keys()
+                    .any(|(subject, _)| subject == "live interface selection")
+        };
+        let transport_loss = self.counter_snapshot.ring_loss > 0
+            || self.counter_snapshot.export_state_failures > 0
+            || self.counter_snapshot.export_bounded_read_failures > 0
+            || self.malformed_discovery > 0;
+        for binding in self.selection_bindings.values_mut() {
+            if binding.attached && !binding.retired {
+                binding.coverage = if prior_selection_loss || transport_loss {
+                    SelectionCoverageState::Uncovered
+                } else {
+                    SelectionCoverageState::OwnedPending(generation)
+                };
+            }
+        }
+    }
+
+    fn open_owned_selection(&mut self, id: u64) {
+        if let Some(binding) = self.selection_bindings.get_mut(&id) {
+            if binding.attached && !binding.retired {
+                binding.coverage.open();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn close_owned_selection(&mut self, id: u64) {
+        if let Some(binding) = self.selection_bindings.get_mut(&id) {
+            binding.coverage.close_naturally();
+        }
+    }
+
+    fn close_owned_selection_for_view(&mut self, view: ProcessViewId) {
+        for binding in self
+            .selection_bindings
+            .values_mut()
+            .filter(|binding| binding.view == view)
+        {
+            binding.coverage.close_naturally();
+        }
+    }
+
+    fn invalidate_silent_selection_coverage(&mut self) {
+        for binding in self.selection_bindings.values_mut() {
+            binding.coverage.invalidate();
+        }
+    }
+
+    pub(crate) fn finish_owned_selection_coverage(&mut self, natural_exit: bool) {
+        for binding in self.selection_bindings.values_mut() {
+            if natural_exit {
+                binding.coverage.close_naturally();
+            } else {
+                binding.coverage.invalidate();
+            }
+        }
+    }
+
+    fn observe_selection(&mut self, id: u64) {
+        if let Some(binding) = self.selection_bindings.get_mut(&id) {
+            binding.observed = true;
+        }
+    }
+
+    fn invalidate_selection_coverage(&mut self, id: u64) {
+        if let Some(binding) = self.selection_bindings.get_mut(&id) {
+            binding.coverage.invalidate();
+        }
+    }
+
+    fn invalidate_selection_provider_coverage(&mut self, provider: plan::ModuleId) {
+        for binding in self
+            .selection_bindings
+            .values_mut()
+            .filter(|binding| binding.provider == provider)
+        {
+            binding.coverage.invalidate();
+        }
+    }
+
+    fn invalidate_selection_table_coverage(&mut self, key: &SelectionTableKey) {
+        let ids: Vec<_> = self
+            .selection_bindings
+            .values()
+            .filter(|binding| {
+                binding.view == key.view
+                    && self
+                        .pinned
+                        .owned_timing_key(binding.object)
+                        .is_some_and(|provider| provider == key.provider)
+            })
+            .map(|binding| binding.id)
+            .collect();
+        for id in ids {
+            self.invalidate_selection_coverage(id);
+        }
+    }
+
+    fn record_selection_loss(&mut self, reason: &str) {
+        self.capture_facts.record_selection_loss(reason);
+        self.invalidate_silent_selection_coverage();
+    }
+
+    fn record_selection_loss_for(&mut self, id: u64, reason: &str) {
+        self.capture_facts.record_selection_loss(reason);
+        self.invalidate_selection_coverage(id);
     }
 
     fn record_lifecycle_tracking_unavailable(&mut self, fact: Option<&str>) {
@@ -5625,6 +5819,7 @@ impl Engine {
             return;
         }
         self.malformed_discovery = self.malformed_discovery.saturating_add(malformed);
+        self.invalidate_silent_selection_coverage();
         self.invalidate_causal_timing();
         self.mark_partial(
             "live discovery transport",
@@ -5907,8 +6102,9 @@ impl Engine {
                 pending_selection.is_some_and(|pending| selection_table_key(key) == *pending);
             live_view && binding_live && (pending || active_keys.contains(&claim.target))
         });
-        if prune_selection_table_conflicts(&mut selection_claims) {
-            self.refuse_selection_authority(
+        for key in prune_selection_table_conflicts(&mut selection_claims) {
+            self.refuse_selection_authority_for(
+                &key,
                 "conflicting selection claims shared one semantic table key",
             );
         }
@@ -5931,7 +6127,8 @@ impl Engine {
                     || known.file_offset != table.file_offset
                     || !same_selection_target_set(&known.targets, &table.targets)
             }) {
-                self.refuse_selection_authority(
+                self.refuse_selection_authority_for(
+                    &key,
                     "a live selection claim conflicted with its provider-generation table latch",
                 );
                 selection_claims.retain(|claim, _| selection_table_key(claim) != key);
@@ -5956,8 +6153,7 @@ impl Engine {
                 })
                 .map(|module| module.id)
             else {
-                self.capture_facts
-                    .record_selection_loss("a live selection claim lost its provider module");
+                self.record_selection_loss("a live selection claim lost its provider module");
                 selection_claims.retain(|claim, _| selection_table_key(claim) != key);
                 continue;
             };
@@ -5965,7 +6161,10 @@ impl Engine {
                 rebuilt.add_selection_table(&self.plan, module_id, table.targets.clone())
             {
                 self.mark_partial("live interface selection", &reason);
-                self.refuse_selection_authority("a live selection table could not be admitted");
+                self.refuse_selection_authority_for(
+                    &key,
+                    "a live selection table could not be admitted",
+                );
                 selection_claims.retain(|claim, _| selection_table_key(claim) != key);
             }
         }
@@ -6438,7 +6637,8 @@ impl Engine {
                         candidate.selection_tables.remove(&pending.key);
                     }
                 }
-                self.refuse_selection_authority(
+                self.refuse_selection_authority_for(
+                    &pending.key,
                     "a selection table did not survive exact admission and attachment",
                 );
             }
@@ -6448,6 +6648,16 @@ impl Engine {
         self.pinned = candidate.pinned;
         self.modules = candidate.modules;
         self.plan = candidate.plan;
+        for binding in self.selection_bindings.values_mut() {
+            if let Some(module) = self
+                .plan
+                .modules
+                .iter()
+                .find(|module| module.object == binding.object)
+            {
+                binding.provider = module.id;
+            }
+        }
         self.counters.corroboration = candidate.corroboration;
         self.counters.manifest_fallbacks = candidate.manifest_fallbacks;
         self.selection_claims = candidate.selection_claims;
@@ -6485,6 +6695,7 @@ impl Engine {
         for binding in self.selection_bindings.values_mut() {
             if stale_views.contains(&binding.view) {
                 binding.retired = true;
+                binding.coverage.retire();
             }
         }
         let mut cleaned_pins = candidate.pinned.clone();
@@ -6581,6 +6792,7 @@ impl Engine {
     fn update_counter_snapshot(&mut self, session: &dyn EngineSession) -> Result<()> {
         let next = session.counter_snapshot()?;
         if !self.counter_snapshot.replace_with(next) {
+            self.invalidate_silent_selection_coverage();
             self.invalidate_causal_timing();
             self.mark_partial(
                 "live discovery counters",
@@ -6589,6 +6801,7 @@ impl Engine {
             return Ok(());
         }
         if self.counter_snapshot.ring_loss > 0 {
+            self.invalidate_silent_selection_coverage();
             self.invalidate_causal_timing();
             self.mark_partial(
                 "live discovery transport",
@@ -6598,6 +6811,7 @@ impl Engine {
         if self.counter_snapshot.export_state_failures > 0
             || self.counter_snapshot.export_bounded_read_failures > 0
         {
+            self.invalidate_silent_selection_coverage();
             self.invalidate_causal_timing();
             self.mark_partial(
                 "live export discovery",
@@ -6914,6 +7128,16 @@ impl Engine {
                 let view = self.views[position].id();
                 self.queue_stale_views(&[view].into_iter().collect(), pending_views);
             }
+            for work in &collected.dynamic {
+                if let Some(binding) = work.selection_binding
+                    && self
+                        .selection_bindings
+                        .get(&binding.id)
+                        .is_some_and(|binding| binding.attached)
+                {
+                    self.open_owned_selection(binding.id);
+                }
+            }
         } else {
             lose_unperformed_dynamic_work(&mut self.timings, &collected.dynamic);
         }
@@ -6929,40 +7153,50 @@ impl Engine {
         let Some(table_file_offset) = table.file_offset else {
             return;
         };
-        let history = self.capture_facts.visible_history_mut();
-        let mut record = |name: &'static str, object: Option<(PinnedTimingKey, u64)>| {
-            let Some(ordinal) =
-                crate::kinds::function_id(name).and_then(|ordinal| u16::try_from(ordinal).ok())
-            else {
-                history.selection_truncated = true;
-                insert_selection_loss(
-                    history,
-                    "a selection table contained an unknown canonical function name",
-                );
-                return;
+        let mut invalidates = false;
+        {
+            let history = self.capture_facts.visible_history_mut();
+            let mut record = |name: &'static str, object: Option<(PinnedTimingKey, u64)>| {
+                let Some(ordinal) =
+                    crate::kinds::function_id(name).and_then(|ordinal| u16::try_from(ordinal).ok())
+                else {
+                    history.selection_truncated = true;
+                    insert_selection_loss(
+                        history,
+                        "a selection table contained an unknown canonical function name",
+                    );
+                    invalidates = true;
+                    return;
+                };
+                history.decoded.insert(DecodedOccurrence::Selection {
+                    module,
+                    provider: provider.clone(),
+                    table_file_offset,
+                    version: table.version,
+                    ordinal,
+                    name,
+                    object,
+                });
             };
-            history.decoded.insert(DecodedOccurrence::Selection {
-                module,
-                provider: provider.clone(),
-                table_file_offset,
-                version: table.version,
-                ordinal,
-                name,
-                object,
-            });
-        };
-        for name in &table.null_entries {
-            record(name, None);
+            for name in &table.null_entries {
+                record(name, None);
+            }
+            for entry in &table.entries {
+                record(entry.name, Some((provider.clone(), entry.file_offset)));
+            }
         }
-        for entry in &table.entries {
-            record(entry.name, Some((provider.clone(), entry.file_offset)));
+        if invalidates {
+            self.invalidate_selection_provider_coverage(module);
         }
     }
 
-    fn refuse_selection_authority(&mut self, reason: &str) {
-        let history = self.capture_facts.visible_history_mut();
-        history.selection_truncated = true;
-        insert_selection_loss(history, reason);
+    fn refuse_selection_authority_for(&mut self, key: &SelectionTableKey, reason: &str) {
+        {
+            let history = self.capture_facts.visible_history_mut();
+            history.selection_truncated = true;
+            insert_selection_loss(history, reason);
+        }
+        self.invalidate_selection_table_coverage(key);
     }
 
     fn propose_selection_claim(
@@ -7001,12 +7235,15 @@ impl Engine {
                 || known.file_offset != table_file_offset
                 || !same_selection_target_set(&known.targets, &targets)
             {
-                let history = self.capture_facts.visible_history_mut();
-                history.selection_truncated = true;
-                insert_selection_loss(
-                    history,
-                    "conflicting selection tables shared one returned version and flags",
-                );
+                {
+                    let history = self.capture_facts.visible_history_mut();
+                    history.selection_truncated = true;
+                    insert_selection_loss(
+                        history,
+                        "conflicting selection tables shared one returned version and flags",
+                    );
+                }
+                self.invalidate_selection_coverage(binding.id);
                 return None;
             }
         } else {
@@ -7133,6 +7370,7 @@ impl Engine {
                 "live interface selection",
                 "a selection record named an unknown capture-local binding",
             );
+            self.invalidate_silent_selection_coverage();
             return Ok(DiscoveryRecordOutcome::Rejected(
                 RecordRejection::SelectionUnattributed,
             ));
@@ -7171,6 +7409,7 @@ impl Engine {
                 "live interface selection",
                 "a selection record failed binding, context, or process-generation attribution",
             );
+            self.invalidate_selection_coverage(binding.id);
             return Ok(DiscoveryRecordOutcome::Rejected(
                 RecordRejection::SelectionUnattributed,
             ));
@@ -7181,6 +7420,7 @@ impl Engine {
                 "live interface selection",
                 "a selection record carried an unknown request-name class",
             );
+            self.invalidate_selection_coverage(binding.id);
             return Ok(DiscoveryRecordOutcome::Rejected(
                 RecordRejection::SelectionUnattributed,
             ));
@@ -7190,6 +7430,7 @@ impl Engine {
                 "live interface selection",
                 "a selection record carried an unknown request-version class",
             );
+            self.invalidate_selection_coverage(binding.id);
             return Ok(DiscoveryRecordOutcome::Rejected(
                 RecordRejection::SelectionUnattributed,
             ));
@@ -7209,12 +7450,12 @@ impl Engine {
                     "live interface selection",
                     "a selection binding had no stable provider module",
                 );
+                self.invalidate_selection_coverage(binding.id);
                 return Ok(DiscoveryRecordOutcome::Rejected(
                     RecordRejection::SelectionUnattributed,
                 ));
             }
         };
-
         let mut result = None;
         let mut inventory_matches = Vec::new();
         let mut matches_truncated = false;
@@ -7227,6 +7468,7 @@ impl Engine {
                     "live interface selection",
                     "a selection record carried an unknown result-name class",
                 );
+                self.invalidate_selection_coverage(binding.id);
                 return Ok(DiscoveryRecordOutcome::Rejected(
                     RecordRejection::SelectionUnattributed,
                 ));
@@ -7237,6 +7479,7 @@ impl Engine {
                     "live interface selection",
                     "a selection record carried an unknown result-version class",
                 );
+                self.invalidate_selection_coverage(binding.id);
                 return Ok(DiscoveryRecordOutcome::Rejected(
                     RecordRejection::SelectionUnattributed,
                 ));
@@ -7246,6 +7489,7 @@ impl Engine {
                 version: result_version,
                 flags: record.interface_flags,
             };
+            self.observe_selection(binding.id);
             read_loss = matches!(result_name, SelectionNameClass::Unreadable)
                 || matches!(result_version, SelectionVersionClass::Unreadable);
             let assessed = (|| -> Result<Vec<LiveInventoryMatch>, ()> {
@@ -7336,7 +7580,10 @@ impl Engine {
             }
             result = Some(observed);
         } else if record.return_rv == 0 {
+            self.observe_selection(binding.id);
             read_loss = true;
+        } else {
+            self.observe_selection(binding.id);
         }
 
         let authority_shape = request.name == SelectionNameClass::ExactStandard
@@ -7393,6 +7640,9 @@ impl Engine {
             },
             matches_truncated,
         );
+        if selection_became_truncated {
+            self.invalidate_silent_selection_coverage();
+        }
         let unmatched = result.is_some() && inventory_matches.is_empty() && !assessment_loss;
         let mut claim_authorized = false;
         if unmatched
@@ -7467,19 +7717,25 @@ impl Engine {
             }
         }
         if read_loss {
-            self.capture_facts
-                .record_selection_loss("a successful selection result was unreadable");
+            self.record_selection_loss_for(
+                binding.id,
+                "a successful selection result was unreadable",
+            );
         }
         if assessment_loss {
-            self.capture_facts
-                .record_selection_loss(if queued.terminal_owner.is_some() {
+            self.record_selection_loss_for(
+                binding.id,
+                if queued.terminal_owner.is_some() {
                     "a terminal selection result had no stable live table assessment"
                 } else {
                     "a selection result had no stable live table assessment"
-                });
+                },
+            );
         } else if unmatched && !claim_authorized {
-            self.capture_facts
-                .record_selection_loss("a successful selection result matched no inventory table");
+            self.record_selection_loss_for(
+                binding.id,
+                "a successful selection result matched no inventory table",
+            );
         }
         if transactional {
             self.project_capture_facts();
@@ -7691,13 +7947,21 @@ impl Engine {
                     }) {
                         continue;
                     }
+                    let provider = match self.capture_facts.module_id_for_object(pinned, object) {
+                        Ok(provider) => provider,
+                        Err(error) => {
+                            collected.required_seed_complete = false;
+                            self.mark_partial("live selection hook", &error.to_string());
+                            continue;
+                        }
+                    };
                     let Some(binding) = self.selection_binding_candidate(
                         context,
                         view,
                         object,
                         fact.file_offset,
                         hook_id,
-                        abi,
+                        provider,
                     ) else {
                         collected.required_seed_complete = false;
                         continue;
@@ -7740,13 +8004,13 @@ impl Engine {
         object: PinnedObjectId,
         file_offset: u64,
         hook_id: u32,
-        abi: HookAbi,
+        provider: plan::ModuleId,
     ) -> Option<SelectionBindingFact> {
         if let Some(binding) = self.selection_bindings.values().find(|binding| {
             binding.context == context
                 && binding.object == object
                 && binding.file_offset == file_offset
-                && binding.abi == abi
+                && binding.abi == HookAbi::Interface
         }) {
             return Some(*binding);
         }
@@ -7765,9 +8029,12 @@ impl Engine {
             object,
             file_offset,
             hook_id,
-            abi,
+            abi: HookAbi::Interface,
             attached: false,
             retired: false,
+            provider,
+            observed: false,
+            coverage: SelectionCoverageState::Uncovered,
         })
     }
 
@@ -8612,6 +8879,7 @@ impl Engine {
         }
         *additions_allowed = false;
         closure.fail();
+        self.invalidate_silent_selection_coverage();
         self.mark_live_loss(
             "live discovery counters",
             "the terminal batch exhausted its one predispatch retry and was cleaned without replay",
@@ -8711,6 +8979,7 @@ impl Engine {
             .expect("journal checked above")
             .dispatch_started = true;
         returned.take();
+        self.invalidate_silent_selection_coverage();
         self.mark_live_loss(
             TERMINAL_DRAIN_SUBJECT,
             "the bounded terminal cleanup retry failed; its undispatched batch was discarded without replay",
@@ -8900,6 +9169,7 @@ impl Engine {
                 for binding in self.selection_bindings.values_mut() {
                     if binding.context == context_id {
                         binding.retired = true;
+                        binding.coverage.retire();
                     }
                 }
                 if detach_failed {
@@ -9397,6 +9667,9 @@ impl Engine {
                         );
                         continue;
                     }
+                }
+                if cause == RetirementCause::ExpectedRemoval {
+                    self.close_owned_selection_for_view(view);
                 }
                 let (retirement_changed, complete) = self.retire_loader_contexts(
                     view,
@@ -10342,13 +10615,18 @@ impl Engine {
             let mut collect = Self::collect_discovery_records;
             let mut closure = PauseClosure::new(true);
             let mut fatal = None;
+            let owned_generation = owned_child.map(OwnedChild::generation);
+            let mut owned_prearmed = false;
             if let Some(child) = owned_child {
-                let _ = self.arm_owned_loader_before_release(
-                    child,
-                    &mut session,
-                    &mut additions_allowed,
-                    &mut pending_views,
-                )?;
+                owned_prearmed = matches!(
+                    self.arm_owned_loader_before_release(
+                        child,
+                        &mut session,
+                        &mut additions_allowed,
+                        &mut pending_views,
+                    )?,
+                    OwnedLoaderPrearmOutcome::Armed
+                );
                 // One initial-set context per owned run, armed or not.
                 if let Some(view) = self
                     .views
@@ -10388,6 +10666,9 @@ impl Engine {
                     &mut pending_views,
                     &mut closure,
                 );
+                if owned_prearmed && let Some(generation) = owned_generation {
+                    self.mark_owned_selection_pending(generation);
+                }
             }
             let cleanup = self.process_discovery_records(
                 &mut session,
@@ -11296,6 +11577,36 @@ mod tests {
         assert!(route.contains("arm_owned_loader_before_release("));
         assert!(!route.contains("child.release()"));
         assert!(source.contains("child.revalidate_after_exec()"));
+        let prearm = route.find("self.arm_owned_loader_before_release(").unwrap();
+        let exports = route.find("self.attach_initial_exports(").unwrap();
+        let coverage = route.find("self.mark_owned_selection_pending(").unwrap();
+        let ready = route.rfind("Ok(session)").unwrap();
+        assert!(prearm < exports && exports < coverage && coverage < ready);
+        assert!(route.contains("if owned_prearmed && let Some(generation)"));
+
+        let run = include_str!("../run.rs");
+        let owned_run = run
+            .split_once("fn run_owned_inner(")
+            .unwrap()
+            .1
+            .split_once("\nfn no_modules_hint(")
+            .unwrap()
+            .0;
+        assert!(
+            owned_run.find(".start_owned_session(").unwrap()
+                < owned_run.find(".release()").unwrap()
+        );
+        let finish = run
+            .split_once("    fn finish(\n")
+            .unwrap()
+            .1
+            .split_once("\n    }\n}")
+            .unwrap()
+            .0;
+        assert!(
+            finish.find("finish_owned_selection_coverage(").unwrap()
+                < finish.find("self.coordinator.cleanup(").unwrap()
+        );
     }
 
     #[test]
@@ -14767,7 +15078,7 @@ int main(int argc, char **argv) {
                 PinnedObjectId(2),
                 0x10,
                 3,
-                HookAbi::Interface,
+                plan::ModuleId(0),
             )
             .unwrap();
         assert_eq!(last.id, u64::MAX);
@@ -14780,7 +15091,7 @@ int main(int argc, char **argv) {
                     PinnedObjectId(2),
                     0x10,
                     3,
-                    HookAbi::Interface,
+                    plan::ModuleId(0),
                 )
                 .unwrap()
                 .id,
@@ -14795,7 +15106,7 @@ int main(int argc, char **argv) {
                     PinnedObjectId(2),
                     0x20,
                     3,
-                    HookAbi::Interface,
+                    plan::ModuleId(0),
                 )
                 .is_none(),
             "exhaustion refuses rather than wrapping to zero"
@@ -14813,7 +15124,7 @@ int main(int argc, char **argv) {
                 PinnedObjectId(2),
                 0x10,
                 3,
-                HookAbi::Interface,
+                plan::ModuleId(0),
             )
             .unwrap();
         engine.selection_bindings.insert(binding.id, binding);
@@ -14827,7 +15138,7 @@ int main(int argc, char **argv) {
                 PinnedObjectId(5),
                 0x20,
                 3,
-                HookAbi::Interface,
+                plan::ModuleId(0),
             )
             .unwrap();
         engine.selection_bindings.insert(attempted.id, attempted);
@@ -14865,6 +15176,7 @@ int main(int argc, char **argv) {
         assert_eq!(engine.selection_bindings.len(), 1);
         let binding = *engine.selection_bindings.values().next().unwrap();
         assert!(binding.attached);
+        assert_eq!(binding.coverage, SelectionCoverageState::Uncovered);
         assert!(
             session
                 .dynamic_attach_calls
@@ -14878,6 +15190,397 @@ int main(int argc, char **argv) {
         assert!(!additions_allowed);
         assert!(pending.contains_key(&view));
         assert!(!closure.required_complete());
+    }
+
+    #[test]
+    fn owned_run_selection_coverage() {
+        let (_fixture, mut engine, _session, binding) = attached_selection_route();
+        let provider = binding.provider;
+        assert_eq!(binding.coverage, SelectionCoverageState::Uncovered);
+        assert_eq!(engine.selection_coverage(plan::ModuleId(u32::MAX)), None);
+        assert_eq!(
+            engine.selection_coverage(provider),
+            Some(SelectionCoverageVerdict::AbsentUncovered)
+        );
+        engine
+            .selection_bindings
+            .get_mut(&binding.id)
+            .unwrap()
+            .observed = true;
+        assert_eq!(
+            engine.selection_coverage(provider),
+            Some(SelectionCoverageVerdict::Observed)
+        );
+        engine
+            .selection_bindings
+            .get_mut(&binding.id)
+            .unwrap()
+            .observed = false;
+
+        let generation = std::num::NonZeroU64::new(7).unwrap();
+        engine.mark_owned_selection_pending(generation);
+        assert_eq!(
+            engine.selection_bindings[&binding.id].coverage,
+            SelectionCoverageState::OwnedPending(generation)
+        );
+        assert_eq!(
+            engine.selection_coverage(provider),
+            Some(SelectionCoverageVerdict::AbsentUncovered)
+        );
+        engine.open_owned_selection(binding.id);
+        assert_eq!(
+            engine.selection_bindings[&binding.id].coverage,
+            SelectionCoverageState::OwnedOpen(generation)
+        );
+
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_INTERFACE_RETURN;
+        record.pid_tgid = u64::from(engine.views[0].pid()) << 32;
+        record.case_id = DISCOVERY_NAME_EXACT_STANDARD;
+        record.interface_index = DISCOVERY_VERSION_V3_0;
+        record.return_rv = 7;
+        record.binding_id = binding.id;
+        assert_eq!(
+            engine.process_selection_record(&QueuedDiscoveryRecord {
+                record,
+                terminal_owner: None,
+                terminal_exports: Vec::new(),
+            }),
+            DiscoveryRecordOutcome::applied(false, true)
+        );
+        assert!(engine.selection_bindings[&binding.id].observed);
+        assert_eq!(
+            engine.selection_coverage(provider),
+            Some(SelectionCoverageVerdict::Observed)
+        );
+        let uncovered = SelectionBindingFact {
+            id: binding.id + 1,
+            observed: false,
+            coverage: SelectionCoverageState::Uncovered,
+            ..binding
+        };
+        engine.selection_bindings.insert(uncovered.id, uncovered);
+        assert_eq!(
+            engine.selection_coverage(provider),
+            Some(SelectionCoverageVerdict::ObservedUncovered)
+        );
+        engine.selection_bindings.remove(&uncovered.id);
+
+        engine.close_owned_selection(binding.id);
+        assert_eq!(
+            engine.selection_bindings[&binding.id].coverage,
+            SelectionCoverageState::OwnedClosed(generation)
+        );
+
+        engine
+            .selection_bindings
+            .get_mut(&binding.id)
+            .unwrap()
+            .observed = false;
+        engine
+            .selection_bindings
+            .get_mut(&binding.id)
+            .unwrap()
+            .coverage = SelectionCoverageState::OwnedOpen(generation);
+        engine.finish_owned_selection_coverage(true);
+        assert_eq!(
+            engine.selection_bindings[&binding.id].coverage,
+            SelectionCoverageState::OwnedClosed(generation)
+        );
+        assert_eq!(
+            engine.selection_coverage(provider),
+            Some(SelectionCoverageVerdict::AbsentCovered)
+        );
+
+        engine
+            .selection_bindings
+            .get_mut(&binding.id)
+            .unwrap()
+            .coverage = SelectionCoverageState::OwnedOpen(generation);
+        engine.finish_owned_selection_coverage(false);
+        assert_eq!(
+            engine.selection_bindings[&binding.id].coverage,
+            SelectionCoverageState::Uncovered
+        );
+        assert_eq!(
+            engine.selection_coverage(provider),
+            Some(SelectionCoverageVerdict::AbsentUncovered)
+        );
+    }
+
+    #[test]
+    fn selection_ring_loss_invalidates_silent_coverage() {
+        let (_fixture, mut engine, mut session, binding) = attached_selection_route();
+        let generation = std::num::NonZeroU64::new(9).unwrap();
+        engine.mark_owned_selection_pending(generation);
+        engine.open_owned_selection(binding.id);
+        assert_eq!(
+            engine.selection_bindings[&binding.id].coverage,
+            SelectionCoverageState::OwnedOpen(generation)
+        );
+
+        session.counters.ring_loss = 1;
+        engine.update_counter_snapshot(&session).unwrap();
+        assert_eq!(
+            engine.selection_bindings[&binding.id].coverage,
+            SelectionCoverageState::Uncovered
+        );
+        assert_eq!(
+            engine.selection_coverage(binding.provider),
+            Some(SelectionCoverageVerdict::AbsentUncovered)
+        );
+
+        engine.mark_owned_selection_pending(generation);
+        assert_eq!(
+            engine.selection_bindings[&binding.id].coverage,
+            SelectionCoverageState::Uncovered,
+            "a loss known before prearm cannot mint covered silence"
+        );
+
+        engine.counter_snapshot.ring_loss = 0;
+        session.counters.ring_loss = 0;
+        engine.mark_owned_selection_pending(generation);
+        engine.open_owned_selection(binding.id);
+        engine.finish_owned_selection_coverage(true);
+        assert_eq!(
+            engine.selection_bindings[&binding.id].coverage,
+            SelectionCoverageState::OwnedClosed(generation)
+        );
+        session.counters.ring_loss = 1;
+        engine.update_counter_snapshot(&session).unwrap();
+        assert_eq!(
+            engine.selection_bindings[&binding.id].coverage,
+            SelectionCoverageState::Uncovered,
+            "loss discovered after closure invalidates the historical proof"
+        );
+    }
+
+    #[test]
+    fn selection_counter_regression_invalidates_silent_coverage() {
+        let (_fixture, mut engine, mut session, binding) = attached_selection_route();
+        let generation = NonZeroU64::new(13).unwrap();
+        engine.mark_owned_selection_pending(generation);
+        engine.open_owned_selection(binding.id);
+        engine.counter_snapshot.loader_hits = 2;
+        session.counters.loader_hits = 1;
+        session.counters.ring_loss = 1;
+
+        engine.update_counter_snapshot(&session).unwrap();
+
+        assert_eq!(
+            engine.selection_bindings[&binding.id].coverage,
+            SelectionCoverageState::Uncovered
+        );
+    }
+
+    #[test]
+    fn selection_table_refusal_isolates_provider_coverage() {
+        let (child, mut engine, modules) = engine_with_one_accepted_provider();
+        let mut session = ScriptedSession::default();
+        let mut additions_allowed = true;
+        engine
+            .arm_loader_or_partial(
+                0,
+                &mut session,
+                &mut additions_allowed,
+                &mut PendingViewRetirements::new(),
+            )
+            .unwrap();
+        let context = engine.loader_registry.ids_for_view(engine.views[0].id())[0];
+        let candidate = peer_candidate(&mut engine, &modules);
+        assert!(
+            engine
+                .apply_candidate(&mut session, candidate, &mut additions_allowed, false, &[])
+                .unwrap()
+                .accepted()
+        );
+        let first = engine
+            .modules
+            .iter()
+            .find(|module| module.object == engine.plan.modules[0].object)
+            .unwrap()
+            .object;
+        let second = engine
+            .modules
+            .iter()
+            .find(|module| module.object != first)
+            .unwrap()
+            .object;
+        let first_provider = engine.pinned.owned_timing_key(first).unwrap();
+        let first_id = engine
+            .plan
+            .modules
+            .iter()
+            .find(|module| module.object == first)
+            .unwrap()
+            .id;
+        let second_id = engine
+            .plan
+            .modules
+            .iter()
+            .find(|module| module.object == second)
+            .unwrap()
+            .id;
+        let generation = NonZeroU64::new(17).unwrap();
+        let first_binding = SelectionBindingFact {
+            id: 1,
+            context,
+            view: engine.views[0].id(),
+            object: first,
+            file_offset: 0x10,
+            hook_id: 0,
+            abi: HookAbi::Interface,
+            attached: true,
+            retired: false,
+            provider: first_id,
+            observed: false,
+            coverage: SelectionCoverageState::OwnedOpen(generation),
+        };
+        let second_binding = SelectionBindingFact {
+            id: 2,
+            object: second,
+            provider: second_id,
+            coverage: SelectionCoverageState::OwnedOpen(generation),
+            ..first_binding
+        };
+        engine
+            .selection_bindings
+            .extend([(1, first_binding), (2, second_binding)]);
+        let table_key = SelectionTableKey {
+            view: engine.views[0].id(),
+            provider: first_provider.clone(),
+            version: SelectionVersionClass::V3_0,
+            flags: 0,
+        };
+        let claim = SelectionClaim {
+            target: plan::AttachKey {
+                object: first,
+                file_offset: 0x100,
+            },
+            object_path: String::new(),
+        };
+        let mut key = SelectionClaimKey {
+            binding_id: 1,
+            view: table_key.view,
+            context: context.get(),
+            hook_owner: first,
+            provider: first_provider,
+            selected_object: first,
+            table_file_offset: 0x20,
+            version: table_key.version,
+            flags: table_key.flags,
+            name: "C_Initialize",
+            file_offset: 0x100,
+        };
+        let mut claims: BTreeMap<SelectionClaimKey, SelectionClaim> =
+            [(key.clone(), claim.clone())].into_iter().collect();
+        key.table_file_offset = 0x28;
+        claims.insert(key, claim);
+        let table = SelectionTableFact {
+            object: first,
+            file_offset: 0x20,
+            targets: vec![plan::SelectionTableTarget {
+                object: first,
+                object_path: String::new(),
+                file_offset: 0x100,
+                name: "C_Initialize",
+            }],
+        };
+        let pending = PendingSelectionAdmission {
+            key: table_key.clone(),
+            table: table.clone(),
+            previous_claims: BTreeMap::new(),
+            previous_tables: BTreeMap::new(),
+        };
+        let candidate = engine
+            .live_candidate_with_selection(
+                engine.pinned.clone(),
+                engine
+                    .modules
+                    .iter()
+                    .map(|module| module.scanned.clone())
+                    .collect(),
+                claims,
+                [(table_key, table)].into_iter().collect(),
+                pending,
+            )
+            .unwrap();
+        assert!(candidate.plan.slots.len() >= engine.plan.slots.len());
+        assert_eq!(
+            engine.selection_bindings[&1].coverage,
+            SelectionCoverageState::Uncovered
+        );
+        assert_eq!(
+            engine.selection_bindings[&2].coverage,
+            SelectionCoverageState::OwnedOpen(generation)
+        );
+        let mut child = child;
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn interface_list_truncation_preserves_selection_coverage() {
+        let (_fixture, mut engine, mut session, binding) = attached_selection_route();
+        let generation = NonZeroU64::new(19).unwrap();
+        engine.mark_owned_selection_pending(generation);
+        engine.open_owned_selection(binding.id);
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN;
+        record.pid_tgid = u64::from(engine.views[0].pid()) << 32;
+        record.interface_index = 0;
+        record.announced_count = u32::from(DISCOVERY_INTERFACES) + 1;
+        let mut additions_allowed = true;
+        let mut pending = PendingViewRetirements::new();
+        let _ = engine.process_export_record(
+            &record,
+            &mut session,
+            &mut additions_allowed,
+            &mut pending,
+        );
+
+        assert_eq!(engine.discovery_truncated, 1);
+        assert_eq!(
+            engine.selection_bindings[&binding.id].coverage,
+            SelectionCoverageState::OwnedOpen(generation)
+        );
+    }
+
+    #[test]
+    fn attributed_selection_loss_does_not_poison_another_provider() {
+        let (_fixture, mut engine, _session, binding) = attached_selection_route();
+        let generation = NonZeroU64::new(11).unwrap();
+        engine.mark_owned_selection_pending(generation);
+        engine.open_owned_selection(binding.id);
+        let unrelated = SelectionBindingFact {
+            id: binding.id + 1,
+            provider: plan::ModuleId(binding.provider.0 + 1),
+            coverage: SelectionCoverageState::OwnedOpen(generation),
+            ..binding
+        };
+        engine.selection_bindings.insert(unrelated.id, unrelated);
+
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_INTERFACE_RETURN;
+        record.pid_tgid = u64::from(engine.views[0].pid()) << 32;
+        record.case_id = u8::MAX;
+        record.binding_id = binding.id;
+        assert_eq!(
+            engine.process_selection_record(&QueuedDiscoveryRecord {
+                record,
+                terminal_owner: None,
+                terminal_exports: Vec::new(),
+            }),
+            DiscoveryRecordOutcome::Rejected(RecordRejection::SelectionUnattributed)
+        );
+        assert_eq!(
+            engine.selection_bindings[&binding.id].coverage,
+            SelectionCoverageState::Uncovered
+        );
+        assert_eq!(
+            engine.selection_bindings[&unrelated.id].coverage,
+            SelectionCoverageState::OwnedOpen(generation)
+        );
     }
 
     #[test]
@@ -15780,6 +16483,7 @@ int main(int argc, char **argv) {
     #[test]
     fn loader_batch_route_adds_one_count_only_seed_without_table_surface() {
         let (_dir, mut engine, _context, record, mut session) = armed_seed_route(2);
+        engine.capture_facts.next_module_id = 7;
         let first = apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
 
         assert!(first.required_complete);
@@ -15793,6 +16497,19 @@ int main(int argc, char **argv) {
         );
         assert_eq!(engine.plan.entries_seen, 0);
         assert!(engine.plan.surfaces.is_empty());
+        let binding = engine
+            .selection_bindings
+            .values()
+            .next()
+            .expect("the newly loader-discovered provider has a selection binding");
+        let provider = engine
+            .plan
+            .modules
+            .iter()
+            .find(|module| module.object == binding.object)
+            .expect("the selection hook owner has a committed provider module");
+        assert_eq!(binding.provider, provider.id);
+        assert_eq!(binding.provider, plan::ModuleId(7));
         assert_eq!(
             engine
                 .plan
@@ -16776,6 +17493,41 @@ int main(int argc, char **argv) {
         }
     }
 
+    fn closed_terminal_selection(
+        engine: &mut Engine,
+        owner: LoaderContextId,
+        pid: u32,
+    ) -> (DynamicExportIdentity, DiscoveryRecord) {
+        let identity = DynamicExportIdentity {
+            object: PinnedObjectId(7),
+            file_offset: 0x20,
+            cookie: 2,
+            abi: HookAbi::Interface,
+        };
+        engine.selection_bindings.insert(
+            identity.cookie,
+            SelectionBindingFact {
+                id: identity.cookie,
+                context: owner,
+                view: ProcessViewId(0),
+                object: identity.object,
+                file_offset: identity.file_offset,
+                hook_id: HookRegistry::builtin().id("C_GetInterface").unwrap(),
+                abi: identity.abi,
+                attached: true,
+                retired: false,
+                provider: plan::ModuleId(0),
+                observed: false,
+                coverage: SelectionCoverageState::OwnedClosed(NonZeroU64::new(1).unwrap()),
+            },
+        );
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_INTERFACE_RETURN;
+        record.pid_tgid = u64::from(pid) << 32;
+        record.binding_id = identity.cookie;
+        (identity, record)
+    }
+
     fn loader_record_for(context: LoaderContextId, pid: u32) -> DiscoveryRecord {
         let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
         record.kind = DISCOVERY_KIND_LOADER;
@@ -16973,11 +17725,17 @@ int main(int argc, char **argv) {
         let (mut engine, owner) = Engine::retiring_loader_context(pid);
         let other = LoaderContextId::from_case_id(9);
         let export = terminal_export();
+        let (selection_export, selection_record) =
+            closed_terminal_selection(&mut engine, owner, pid);
         let mut returned = TerminalBatch::empty(TerminalAuthority {
             owner,
-            exports: vec![export],
+            exports: vec![export, selection_export],
         });
-        returned.extend([loader_record_for(owner, pid), loader_record_for(other, pid)]);
+        returned.extend([
+            loader_record_for(owner, pid),
+            loader_record_for(other, pid),
+            selection_record,
+        ]);
         returned.complete = true;
         let mut returned = Some(returned);
         engine.terminal_journal = Some(TerminalJournal {
@@ -16996,6 +17754,10 @@ int main(int argc, char **argv) {
 
         assert!(error.to_string().contains("not tombstoned"), "{error:#}");
         assert!(returned.is_none(), "the coordinator batch was consumed");
+        assert_eq!(
+            engine.selection_bindings[&selection_export.cookie].coverage,
+            SelectionCoverageState::Uncovered
+        );
         assert!(engine.terminal_batch_for_test().is_none());
         assert_eq!(
             engine.terminal_journal_for_test(),
@@ -17338,15 +18100,18 @@ int main(int argc, char **argv) {
         let pid = std::process::id();
         let (mut engine, owner) = Engine::retiring_loader_context(pid);
         let unrelated = LoaderContextId::from_case_id(9);
+        let (selection_export, selection_record) =
+            closed_terminal_selection(&mut engine, owner, pid);
         let mut session = ScriptedSession::with_records(
             [
                 loader_record_for(owner, pid),
                 loader_record_for(owner, pid),
                 loader_record_for(unrelated, pid),
+                selection_record,
             ],
             16,
         );
-        session.detach_exports = vec![terminal_export()];
+        session.detach_exports = vec![terminal_export(), selection_export];
         session.fail_counter_reads([false, true]);
 
         apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
@@ -17356,17 +18121,25 @@ int main(int argc, char **argv) {
             "a predispatch counter failure dispatches nothing"
         );
         let batch = engine.terminal_batch.as_ref().unwrap();
-        assert_eq!(batch.record_count(), 3);
+        assert_eq!(batch.record_count(), 4);
         assert!(batch.complete());
         assert_eq!(batch.authority.owner, owner);
-        assert_eq!(batch.authority.exports, [terminal_export()]);
+        assert_eq!(
+            batch.authority.exports,
+            [terminal_export(), selection_export]
+        );
         assert_eq!(
             batch.tagged_owners(),
-            [Some(owner), Some(owner), None],
+            [Some(owner), Some(owner), None, Some(owner)],
             "only the owned records carry terminal authority"
         );
         let journal = engine.terminal_journal.unwrap();
         assert!(journal.retry_used && !journal.dispatch_started);
+        assert_eq!(
+            engine.selection_bindings[&selection_export.cookie].coverage,
+            SelectionCoverageState::OwnedClosed(NonZeroU64::new(1).unwrap()),
+            "a retained retry does not invalidate the closed proof"
+        );
 
         apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
 
@@ -17383,11 +18156,19 @@ int main(int argc, char **argv) {
     fn an_exhausted_terminal_predispatch_retry_cleans_up_without_dispatching() {
         let pid = std::process::id();
         let (mut engine, owner) = Engine::retiring_loader_context(pid);
-        let mut session = ScriptedSession::with_records([loader_record_for(owner, pid)], 16);
+        let (selection_export, selection_record) =
+            closed_terminal_selection(&mut engine, owner, pid);
+        let mut session =
+            ScriptedSession::with_records([loader_record_for(owner, pid), selection_record], 16);
+        session.detach_exports = vec![selection_export];
         session.fail_counter_reads([false, true]);
 
         apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
         assert!(engine.terminal_journal.unwrap().retry_used);
+        assert_eq!(
+            engine.selection_bindings[&selection_export.cookie].coverage,
+            SelectionCoverageState::OwnedClosed(NonZeroU64::new(1).unwrap())
+        );
 
         session.fail_counter_reads([false, true]);
         apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
@@ -17399,6 +18180,10 @@ int main(int argc, char **argv) {
         assert!(engine.terminal_batch.is_none());
         assert!(engine.terminal_journal.is_none());
         assert!(engine.loader_registry.context(owner).is_none());
+        assert_eq!(
+            engine.selection_bindings[&selection_export.cookie].coverage,
+            SelectionCoverageState::Uncovered
+        );
     }
 
     #[test]

@@ -18,6 +18,10 @@ bypass closed and raised only a transient malicious same-UID swap/restore
 race, which the ratified Task 4 receipt architecture explicitly excludes.
 There are no accepted W1 blockers remaining.
 
+Review count: three completed full/pair cycles (Task 11 cycles 1 and 2, plus
+the bounded full-diff pair that replaced the scheduled-but-UNRUN cycle 3) and
+two completed scoped final reads (`330c81d` and `e792843`).
+
 `docs/privacy/allowlist-v1.md` is unchanged across the wave.
 
 ## Finding closure matrix
@@ -58,6 +62,11 @@ The earlier `7edc70f` test failure is superseded evidence, not hidden: two
 lifecycle tests timed out and a third test was vacuous because C1 added `-I`
 without shifting three test-wrapper argv parsers. `e66434e` includes the root
 fix; focused tests and the complete 937-test gate then passed.
+
+Historical product defect: `-o` output was broken under old Docker seccomp
+because every failed `openat2` call was treated as a hard error. `4108a4c`
+added the ENOSYS/EPERM no-follow directory-walk fallback and pinned equivalent
+symlink refusal in both paths.
 
 ## Private custody
 

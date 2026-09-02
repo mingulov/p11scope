@@ -636,9 +636,9 @@ founding rule).
 | W2 | Storage consolidation: two-directory rule, migrate + repoint, `p11scope-ws` custody | [full plan](2026-09-01-wave2-storage-consolidation.md) |
 | W3 | **Priority 1: `C_GetInterface` compatibility closure** (partial passive behavior → separate live request/result/failure evidence plus finite offline helper matrix; selection authority limited to exact retained generation or attested exact provider, never inventory); then tracepoint offsets (research #1), opened-inode identity (#2), capability tier ladder + caps model, honest-degradation fixes, and `uprobe_multi` attach | [charter](2026-09-01-release-wave-charters.md#w3) |
 | W4 | Hosted CI running the full suite; "green locally, not in CI" dies | [charter](2026-09-01-release-wave-charters.md#w4) |
+| W7 | ia32 targets on x86-64 hosts | [charter](2026-09-01-release-wave-charters.md#w7) |
 | W5 | Container/K8s requalification (provisional; W8 re-runs on the final tip) + seccomp/SELinux artifacts | [charter](2026-09-01-release-wave-charters.md#w5) |
 | W6 | Multi-distro/kernel matrix; support restated "5.15.x, tested on ⟨list⟩"; load-only CI matrix | [charter](2026-09-01-release-wave-charters.md#w6) |
-| W7 | ia32 targets on x86-64 hosts | [charter](2026-09-01-release-wave-charters.md#w7) |
 | W8 | Release assembly: receipt, docs truth pass, final review-to-zero, ready-to-publish bundle | [charter](2026-09-01-release-wave-charters.md#w8) |
 
 Publication (push, tag, release) is NOT a wave — it is an explicit owner

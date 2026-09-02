@@ -1017,6 +1017,10 @@ fn unsupported_environment_context(error: anyhow::Error) -> anyhow::Error {
 }
 
 impl Session {
+    pub(crate) const fn capture_policy(&self) -> CapturePolicy {
+        self.policy
+    }
+
     pub(crate) fn start(
         plan: &AttachPlan,
         scope: &Scope,

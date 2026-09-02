@@ -39,7 +39,7 @@ cd "$(dirname "$0")/../.."
 . scripts/lib.sh
 
 MODULE=/usr/lib/softhsm/libsofthsm2.so
-PKCS11_CHECK_DIR=/home/user/src/m/pkcs11-check-ws/pkcs11-check
+PKCS11_CHECK_DIR=${PKCS11_CHECK_DIR:-$HOME/src/m/pkcs11-check-ws/pkcs11-check}
 # Invoke the venv's own installed console script directly, NOT `uv run`.
 # Measured directly while building this script: `uv` here is a snap
 # package (/snap/bin/uv), and snap's confinement machinery (snap-confine)

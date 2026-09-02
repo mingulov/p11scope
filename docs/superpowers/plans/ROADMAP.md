@@ -212,7 +212,8 @@ commit `fd3d08ad9bd2f58508eda1ee4a50882c0633d850` (tree
 `0decc4dee974707468b5758107fb055c30d44d7d`). Its zero-unavailable PASS oracle
 applies only to a topology proposed for supported acceptance. The completed
 pre-r3 attempt-6 exclusion is input-bound to
-`/home/user/.local/state/p11scope/task4-lane13-a2fd9ee-20260826T2135EEST/facts.log`
+`/home/user/src/m/p11scope-ws/preserved/evidence-roots/task4-lane13-a2fd9ee-20260826T2135EEST/facts.log`
+(originally under `~/.local/state/p11scope/`, relocated 2026-09-02)
 (SHA-256 `b96cbed6cbc2963dab2c5963b5c52f6378d9bef313479b83a56c259df79b94f3`,
 exact HEAD/tree `a2fd9ee8eddfaff34b3fb6b65267688b5a90aa03` /
 `f90e2dfe8dbd0a211f9e32055a37ff7320080b88`). The receipt binds the lane

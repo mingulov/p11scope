@@ -3667,7 +3667,7 @@ mod tests {
         assert!(status.success());
         let output = std::process::Command::new("bash")
             .arg("-c")
-            .arg("source \"$1\"; lane_config jammy; lane_config noble")
+            .arg("P11SCOPE_VM_BASES=/test/vm-bases; source \"$1\"; lane_config jammy; lane_config noble")
             .arg("bash")
             .arg(script)
             .output()
@@ -3676,8 +3676,8 @@ mod tests {
         let lines = String::from_utf8(output.stdout).unwrap();
         let lines: Vec<&str> = lines.lines().collect();
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].starts_with("/tmp/p11scope-slice1b2-vms/jammy/overlay.qcow2|"));
-        assert!(lines[1].starts_with("/tmp/p11scope-slice1b2-vms/noble/overlay.qcow2|"));
+        assert!(lines[0].starts_with("/test/vm-bases/jammy/overlay.qcow2|"));
+        assert!(lines[1].starts_with("/test/vm-bases/noble/overlay.qcow2|"));
     }
 
     fn write_loader_export(func_ip_zero_hits: u64) -> PathBuf {

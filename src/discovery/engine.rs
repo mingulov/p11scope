@@ -3731,6 +3731,14 @@ fn lower_export_record(
     if !view.still_the_same() {
         return Err("process generation changed before export lowering".into());
     }
+    // The live path's one clock poll per record: nothing between the bounded
+    // snapshot read and this decode polls the batch deadline, and a sticky stop
+    // another consumer of the one budget left must refuse the record here — the
+    // caller publishes either as live loss. Admission below refuses on the
+    // sticky stop too; a decode ceiling stays the count-only outcome it was.
+    if let Some(reason) = budget.stopped_now() {
+        return Err(reason.into());
+    }
 
     budget.spend(1)?;
     let Resolved::File {
@@ -9124,7 +9132,7 @@ mod tests {
     };
     use crate::discovery::loader::LoaderContextSpec;
     use crate::discovery::scan::{
-        ScanLimits, ScannedEntry, ScannedTable, WORK_CEILING_REASON, scan_pid,
+        SCAN_DEADLINE_REASON, ScanLimits, ScannedEntry, ScannedTable, WORK_CEILING_REASON, scan_pid,
     };
     use crate::{semantics, trace};
     use p11scope_manifest::manifest::{
@@ -15570,6 +15578,204 @@ int main(int argc, char **argv) {
         assert_eq!(
             merged[0].interfaces[0].name_lossy.as_deref(),
             Some("PKCS 11")
+        );
+    }
+
+    /// The valid self-export fixture: a retained view of this process, its own
+    /// `/proc/self/maps`, and one structurally valid FUNCTION_LIST record whose
+    /// table owner is a file-backed readable data mapping of the test
+    /// executable and whose single pointer is the matching code mapping —
+    /// exactly the shape `engine_lowers_export_table_owner_and_prefix` proves
+    /// lowers whole.
+    fn self_export_fixture(id: ProcessViewId) -> (ProcessView, Vec<MapEntry>, DiscoveryRecord) {
+        use p11scope_ebpf_common::DISCOVERY_KIND_FUNCTION_LIST_RETURN;
+
+        let pid = std::process::id();
+        let view = ProcessView::open(id, pid).unwrap();
+        let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let executable = executable.canonicalize().unwrap_or(executable);
+        let owner = maps
+            .iter()
+            .find(|mapping| {
+                mapping.inode != 0
+                    && mapping.permissions[0] == b'r'
+                    && mapping.permissions[2] != b'x'
+                    && matches!(
+                        resolve(&maps, mapping.start),
+                        Resolved::File {
+                            path: MappedPath::Usable(ref path),
+                            ..
+                        } if path == &executable
+                    )
+            })
+            .expect("the test executable has a file-backed data mapping")
+            .clone();
+        let code = maps
+            .iter()
+            .find(|mapping| {
+                mapping.inode == owner.inode
+                    && mapping.device == owner.device
+                    && mapping.permissions[2] == b'x'
+            })
+            .expect("the test executable has a matching code mapping")
+            .clone();
+
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_FUNCTION_LIST_RETURN;
+        record.symbol_id = 1;
+        record.pid_tgid = u64::from(pid) << 32;
+        record.table_ptr = owner.start;
+        record.version_major = 2;
+        record.version_minor = 40;
+        record.pointers[0] = code.start;
+        record.pointers_attempted = 1;
+        record.completed_prefix = 1;
+        record.usable_n = 1;
+        (view, maps, record)
+    }
+
+    /// Task 11 fix round 3 (shadow finding 5): live admission is stop-aware.
+    /// A structurally valid record used to lower whole through a capture that
+    /// had already stopped — `admit_table`/`admit_interface` looked only at
+    /// their own cardinality counters, so a sticky work stop refused nothing
+    /// and an expired batch deadline was never polled between the snapshot and
+    /// the decode.
+    #[test]
+    fn a_stopped_capture_refuses_a_valid_live_export_record() {
+        let (view, maps, record) = self_export_fixture(ProcessViewId(42));
+        let hooks = HookRegistry::builtin();
+        let index = MapIndex::new(&maps).expect("a kernel-ordered self snapshot");
+
+        // An expired batch deadline, nothing sticky yet: only an admission
+        // clock poll can catch it.
+        let mut budget = CaptureWorkBudget::default();
+        budget.set_deadline(Some(0));
+        assert_eq!(
+            lower_export_record(&view, &index, &hooks, &record, &mut budget).unwrap_err(),
+            SCAN_DEADLINE_REASON
+        );
+
+        // A sticky work stop left by any other consumer of the one budget.
+        let mut budget = CaptureWorkBudget::default();
+        assert!(
+            !budget.charge(u64::MAX),
+            "the work ceiling refuses and sticks"
+        );
+        assert_eq!(
+            lower_export_record(&view, &index, &hooks, &record, &mut budget).unwrap_err(),
+            WORK_CEILING_REASON
+        );
+
+        // The same record still lowers when neither ceiling was reached: the
+        // refusals above are the capture's stop, not the fixture's shape.
+        let mut budget = CaptureWorkBudget::default();
+        assert!(
+            lower_export_record(&view, &index, &hooks, &record, &mut budget)
+                .unwrap()
+                .is_some()
+        );
+
+        // And the admission functions refuse the stop themselves, so no caller
+        // of theirs can decode new work past the capture's ceiling.
+        let mut budget = CaptureWorkBudget::default();
+        assert!(budget.admit_table(1) && budget.admit_interface());
+        assert!(!budget.charge(u64::MAX));
+        assert!(!budget.admit_table(1), "a stopped capture admits no table");
+        assert!(
+            !budget.admit_interface(),
+            "a stopped capture admits no interface"
+        );
+    }
+
+    /// Task 11 fix round 3 (shadow-review test blocker 1): the production call
+    /// site. An ordinary batch carrying the valid self-export record under an
+    /// expired batch deadline admits no candidate and no slot, and publishes
+    /// the exact live loss — and the refusal lands before one byte of the
+    /// target's maps is read.
+    #[test]
+    fn an_expired_batch_deadline_admits_no_live_export_record() {
+        let refused = {
+            let (view, _maps, record) = self_export_fixture(ProcessViewId(0));
+            let mut engine = Engine::empty();
+            engine.next_view_id = 1;
+            engine.views.push(view);
+            let mut session = ScriptedSession::default();
+            let mut collect = Engine::collect_discovery_records;
+            let outcome = engine
+                .apply_discovery_batch_with(
+                    &mut session,
+                    vec![record],
+                    0,
+                    true,
+                    false,
+                    &mut collect,
+                    Some(0),
+                )
+                .expect("a refused live snapshot is loss, never a batch error");
+            assert!(!outcome.required_complete, "the batch is incomplete");
+            assert!(engine.plan.slots.is_empty(), "no slot is admitted");
+            assert!(engine.modules.is_empty(), "no candidate is admitted");
+            assert!(
+                engine.counters.object_skips.contains(&Skipped {
+                    subject: "live discovery record".into(),
+                    reason: "a structurally valid private record failed exact live resolution"
+                        .into(),
+                }),
+                "{:?}",
+                engine.counters.object_skips
+            );
+            assert_eq!(
+                engine.budget.attempted_io_bytes(),
+                0,
+                "the expired deadline refuses the snapshot before a byte is read"
+            );
+            engine.counters.object_skips.clone()
+        };
+
+        // The positive control: the same fixture through the same route with no
+        // deadline is admitted, so the refusal above is the deadline's.
+        let (view, _maps, record) = self_export_fixture(ProcessViewId(0));
+        let mut engine = Engine::empty();
+        engine.next_view_id = 1;
+        engine.views.push(view);
+        // This test binary is larger than the default per-object cap, which
+        // would skip its own pin for an unrelated reason.
+        engine.budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        });
+        let mut session = ScriptedSession::default();
+        let mut collect = Engine::collect_discovery_records;
+        engine
+            .apply_discovery_batch_with(
+                &mut session,
+                vec![record],
+                0,
+                true,
+                false,
+                &mut collect,
+                None,
+            )
+            .expect("an ordinary batch");
+        assert_eq!(
+            engine.plan.slots.len(),
+            1,
+            "{:?}",
+            engine.counters.object_skips
+        );
+        assert!(
+            engine.budget.attempted_io_bytes() > 0,
+            "the snapshot was read"
+        );
+        assert!(
+            !engine
+                .counters
+                .object_skips
+                .iter()
+                .any(|skip| refused.contains(skip)),
+            "{:?}",
+            engine.counters.object_skips
         );
     }
 

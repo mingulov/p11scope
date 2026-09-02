@@ -30,7 +30,7 @@ task4_receipt_self_test() {
     REPORT=${P11SCOPE_TASK4_SELF_TEST_REPORT-}
     if [ -z "$REPORT" ]; then TASK4_SELF_TMP=$(mktemp -d); trap 'rm -rf "$TASK4_SELF_TMP"' EXIT INT TERM; REPORT=$TASK4_SELF_TMP/report.tsv; fi
     umask 077
-    python3 - "$REPORT" <<'PY'
+    python3 -I - "$REPORT" <<'PY'
 import copy, fcntl, os, stat, sys, tempfile
 from pathlib import Path
 
@@ -131,7 +131,8 @@ sealed-environment-allowlist-exact-accepted
 forged-seal-marker-rejected
 inventory-wide-tool-ledger-exact-accepted
 sealed-bin-removed-after-terminal-status
-nightly-toolchain-closure-exact-accepted""".splitlines()
+nightly-toolchain-closure-exact-accepted
+isolated-python-invocations-exact-accepted""".splitlines()
 
 good={"owners":1,"child_status":False,"facts":["43:99","hash"],"executables":["p11scope","p11scope-discover","p11scope-discover-glibc","p11scope-discover-musl"],"softhsm":68,"fixture":[68,92,104],"static":[68,68,136]}
 def lane_valid(d):
@@ -201,7 +202,7 @@ mark(lane[21],capture_binding(work_entries)=="observed-static-smoke.json"
 try: capture_binding(work_entries+["observed-decoy.json"]); decoy_rejected=False
 except SystemExit: decoy_rejected=True
 mark(lane[22],decoy_rejected)
-framed="argv\tpython3 scripts/check-capture-evidence.py clean-metrics-manifest-only observed-static-smoke.json spike/expected.txt\nstatus\t0"
+framed="argv\tpython3 -I scripts/check-capture-evidence.py clean-metrics-manifest-only observed-static-smoke.json spike/expected.txt\nstatus\t0"
 aggregate="=== release privacy gate ===\n=== build-release: ALL OK ==="
 def checker_evidence_framed(text):
     lines=text.splitlines()
@@ -241,6 +242,14 @@ nightly_closure={"toolchain_nightly_cargo","toolchain_nightly_rustc","toolchain_
 def closure_bound(rows): return stable_closure|nightly_closure<=rows
 mark(lane[29],closure_bound(stable_closure|nightly_closure) and not closure_bound(stable_closure)
      and not closure_bound((stable_closure|nightly_closure)-{"toolchain_nightly_rust_src"}))
+# `sitecustomize`/PYTHONHOME run before the first line of a checker. The seal
+# drops those variables and `-I` refuses them again for any invocation that
+# ever runs outside it, so both the isolation flag and the framed argv that
+# names it have to be present at every python3 call site.
+python_sites=["self-test-model","finalizer-heredoc","check-bpf-map-defs","check-capture-evidence"]
+def isolated(flagged): return set(flagged)==set(python_sites)
+mark(lane[30],isolated(python_sites) and not isolated(python_sites[:-1])
+     and framed.startswith("argv\tpython3 -I "))
 
 if len(rows)!=len(common)+len(lane) or len(rows)!=len(set(rows)): raise SystemExit("row coverage")
 report.parent.mkdir(parents=True,exist_ok=True);fd=os.open(report,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
@@ -541,7 +550,7 @@ task4_finalize() {
     fi
     find "$TASK4_ROOT" -type d -exec chmod 700 {} + 2>/dev/null || t4_result=1
     find "$TASK4_ROOT" -type f -exec chmod 600 {} + 2>/dev/null || t4_result=1
-    "$T4_TOOL_python3" - "$TASK4_ROOT" <<'PY' || t4_result=1
+    "$T4_TOOL_python3" -I - "$TASK4_ROOT" <<'PY' || t4_result=1
 import os, stat, sys
 root=sys.argv[1]
 if set(os.listdir(root)) != {"facts.log","stdout.log","stderr.log","artifacts","work"}: raise SystemExit("foreign root entry")
@@ -700,7 +709,7 @@ OFFICIAL_BPF=$1
 set -- "$CANARY_WORK"/feature-build/release/build/p11scope-*/out/p11scope-ebpf
 [ "$#" -eq 1 ] && [ -f "$1" ] || { echo "diagnostic BPF object is not unique"; exit 1; }
 DIAGNOSTIC_BPF=$1
-"$T4_TOOL_python3" scripts/check-bpf-map-defs.py --policy-inventory "$OFFICIAL_BPF" "$DIAGNOSTIC_BPF"
+"$T4_TOOL_python3" -I scripts/check-bpf-map-defs.py --policy-inventory "$OFFICIAL_BPF" "$DIAGNOSTIC_BPF"
 
 if "$P11SCOPE_STATIC" profile --unsafe-unvalidated-metadata \
     --manifest /nonexistent/manifest.json --pid 1 \
@@ -849,11 +858,11 @@ reclaim_root_output "$WORK/observed-static-smoke.json"
 # stdout/stderr, and a terminal status line. The frame keeps the record
 # non-empty even though the checker is silent on success, and it -- not the
 # aggregate body stdout -- is what the receipt retains as checker.log.
-t4_checker_argv="$T4_TOOL_python3 scripts/check-capture-evidence.py clean-metrics-manifest-only $WORK/observed-static-smoke.json spike/expected.txt"
+t4_checker_argv="$T4_TOOL_python3 -I scripts/check-capture-evidence.py clean-metrics-manifest-only $WORK/observed-static-smoke.json spike/expected.txt"
 t4_checker_status=0
 {
     printf 'argv\t%s\n' "$t4_checker_argv"
-    "$T4_TOOL_python3" scripts/check-capture-evidence.py clean-metrics-manifest-only \
+    "$T4_TOOL_python3" -I scripts/check-capture-evidence.py clean-metrics-manifest-only \
         "$WORK/observed-static-smoke.json" spike/expected.txt 2>&1 || t4_checker_status=$?
     printf 'status\t%s\n' "$t4_checker_status"
 } > "$WORK/checker.log"

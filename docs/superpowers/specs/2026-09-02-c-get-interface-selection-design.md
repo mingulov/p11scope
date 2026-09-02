@@ -318,7 +318,10 @@ for an already-authorized pair is a conflict: retain the factual outcome, add no
 slots, set `selection_truncated`, and force `PARTIAL`. This bounds live authority
 to the six standard version/flag pairs before the existing capture-wide 512-slot
 ceiling; that ceiling still refuses an indivisible claim rather than attaching a
-prefix.
+prefix. The conflict remains latched for that exact provider generation even if
+the first table's final live claim retires: later records may retain facts but
+cannot reopen the conflicted pair. The latch clears only with the provider
+generation.
 
 Selection-only targets appear only in selection evidence and the aggregate
 function rows they count. They do not contribute to

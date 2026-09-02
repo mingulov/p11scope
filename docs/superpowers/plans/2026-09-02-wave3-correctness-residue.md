@@ -234,10 +234,11 @@ The 2026-09-02 independent Task-3 pre-mortem adds these execution invariants:
   refresh does not reattach or recount an existing binding and
   `selection_postcheck_failure_retains_attached_binding` proves rollback or
   retirement still owns every link created before a generation postcheck.
-- [ ] RED: same-address/different-name and two-view claims produce occurrence-
-  based `table_entries`, one physical `AttachKey`, one aggregate cell, and
-  independent retirement. Delayed records for retired IDs fail closed.
-- [ ] GREEN: implement `SelectionClaimKey -> AttachKey` reference ownership and
+- [x] RED: same-address/different-name claims produce occurrence-based
+  `table_entries`, one physical `AttachKey`, and one aggregate cell.
+- [ ] RED: two-view claims retire independently while sharing physical targets.
+  Delayed records for retired IDs fail closed.
+- [x] GREEN: implement `SelectionClaimKey -> AttachKey` reference ownership and
   source-local count-only authorization through the existing
   preflight/apply/rollback transaction. Never attach a duplicate offset.
 - [ ] RED: `owned_run_selection_coverage` proves an exact provider prearmed
@@ -251,15 +252,16 @@ The 2026-09-02 independent Task-3 pre-mortem adds these execution invariants:
 - [ ] RED: `selection_ring_loss_invalidates_silent_coverage` proves nonzero
   discovery-ring loss makes affected silent bindings uncovered and the verdict
   `PARTIAL`; it never becomes an empty/covered result.
-- [ ] RED: `selection_only_claims_are_semantically_bounded` permits one
-  distinct table per exact provider generation and standard `(returned version,
-  returned flags)` pair, reuses repeated exact claims, and refuses a conflicting
-  table as truncated without allocating slots. Unknown flag bits remain factual
-  evidence but authorize nothing.
-- [ ] GREEN: enforce that finite semantic key before the existing indivisible
+- [x] RED: `selection_semantic_key_reuses_same_table_and_refuses_changed_targets`
+  permits one distinct table per exact provider generation and standard
+  `(returned version, returned flags)` pair, reuses repeated exact claims, and
+  refuses a conflicting table as truncated without allocating slots. Unknown
+  flag bits remain factual evidence but authorize nothing.
+- [x] GREEN: enforce that finite semantic key before the existing indivisible
   512-slot admission; add no separate quota or slot allocator.
-- [ ] RED: `selection_table_admission_is_indivisible_at_the_slot_ceiling`
-  proves a table that cannot fit contributes no prefix, link, or slot index.
+- [x] RED: `selection_table_capacity_refusal_mutates_nothing`
+  (landed in `a182f93`) proves a table that cannot fit contributes no prefix,
+  link, or slot index.
 - [ ] RED: `manifest_selection_tables_enter_the_attach_transaction` proves a
   reachable manifest-v5 selection table creates source-local count-only claims,
   `semantic_authorized=false`, and `PARTIAL`; an inventory target at the same
@@ -294,8 +296,11 @@ Design acceptance: §12 items 3, 14, and 15.
   `PARTIAL`, and no individual trace-line selection output.
 - [ ] GREEN: profile and terminal trace use observed-profile v3; metrics stays
   v2-metrics and reads no selection arguments. Preserve v1 allowlist unchanged;
-  v2 authorizes only the reviewed finite classes and existing offline inventory
-  name exception.
+  v2 authorizes only the reviewed finite classes, a finite sorted
+  `evidence.attach_mechanisms` array, and the existing offline inventory name
+  exception. Before Task 7, derive the array only from successfully owned links
+  and emit only `per-offset`; Task 7 may add the already-versioned
+  `uprobe-multi` value without reopening the schema or allowlist.
 - [ ] RED: `profile_v3_selection_contract_is_exact` and the two validator
   self-tests reject missing/extra v3 selection fields, secret canaries, stale
   live profile-v2 pins, and an observer/helper description with reversed roles.
@@ -455,10 +460,10 @@ Evidence and upstream contribution guidance:
 - Modify: `Cargo.toml`, `Cargo.lock`
 - Modify: `crates/ebpf/src/main.rs`
 - Modify: `src/attach.rs`, `src/discovery/engine.rs`, `src/render.rs`, `src/run.rs`
-- Modify: `docs/schema/observed-profile-v3.md`,
-  `docs/privacy/allowlist-v2.md`, `docs/usage.md`
+- Modify: `docs/usage.md`
 - Modify: `docs/notes/2026-09-02-aya-uprobe-multi-status.md`
-- Modify: `tests/artifact_contracts.rs`, `scripts/verify-attach-e2e.sh`
+- Modify: `tests/artifact_contracts.rs`, `scripts/verify-attach-e2e.sh`,
+  `scripts/check-bpf-map-defs.py`, `scripts/check-live-discovery-object.py`
 
 Charter acceptance: W3 item 6.
 
@@ -475,7 +480,11 @@ attach transaction at `:734`, dynamic attach/detach at `:1450,1564`. Aya 0.14
   add no raw syscall, direct `aya-obj` dependency, or private link owner.
 - [ ] RED pin: initial grouping test requires exact `{object, program}`
   bundles, all return bundles before entries, and logical endpoint counts.
-- [ ] GREEN pin: implement that grouping with dedicated multi twins.
+- [ ] GREEN pin: implement that grouping with dedicated multi twins. A logical
+  endpoint is multi-eligible only when entry/return cookie attribution and every
+  reachable tail-call target are proven under expected attach type 48; otherwise
+  keep that endpoint per-offset. Update both static BPF object-inventory
+  checkers, and report mixed mechanisms from successfully owned links.
 - [ ] RED: `uprobe_multi_probe_is_once_strict_and_sticky` injects public
   process-scoped probe results `Ok(true)`, `Ok(false)`, and `Err`; proves exactly
   one call before either multi twin loads; and statically rejects use of the
@@ -504,8 +513,8 @@ attach transaction at `:734`, dynamic attach/detach at `:1450,1564`. Aya 0.14
   support probe returning `Ok(false)` selects per-offset. After `Ok(true)`,
   every transaction error rolls back all links owned by the attempt without
   fallback.
-- [ ] Add finite sorted `evidence.attach_mechanisms` containing only
-  `uprobe-multi` and/or `per-offset`; authorize it in allowlist v2.
+- [ ] Populate Task 4's finite sorted `evidence.attach_mechanisms` with only
+  `uprobe-multi` and/or `per-offset`; do not change its schema or allowlist.
 - [ ] Focused checks:
   `cargo +1.88 test --locked --lib uprobe_multi`,
   `cargo +1.88 test --locked --test artifact_contracts attach_mechanisms`, and
@@ -531,8 +540,10 @@ Commit: `feat: attach initial probe sets with uprobe_multi`
 - [ ] Record privileged/container/VM rows as PASS, FAIL, or `UNRUN`; never
   inherit W1/W2 evidence.
 - [ ] Record the two post-W3 product-qualification rows in the closure report:
-  `supported_rate_loss_oracle` (fixed burst, exact counts, zero loss at the
-  declared supported rate, induced loss forces `PARTIAL`) and
+  `supported_rate_loss_oracle` (an empirically declared, matrix-specific fixed
+  burst/rate, exact counts, zero loss, and induced loss forcing `PARTIAL`; never
+  derive a supported events/second claim from ring capacity or drain cadence)
+  and
   `fork_exec_loader_unload_oracle` (fork, exec, `dlopen`, calls, `dlclose`,
   replacement/reload, exact retirement and attribution). These privileged
   runtime rows may be `UNRUN` at W3 closeout, but both must PASS on the exact

@@ -1620,6 +1620,7 @@ fn release_preflight_pins_its_tools_before_the_first_digest() {
 /// inside a container resolve through the image, so neither is under the
 /// caller's PATH authority and neither is a member.
 const TASK11_TOOL_INVENTORY: &[&str] = &[
+    "as",
     "awk",
     "bpf-linker",
     "bpftool",
@@ -1642,7 +1643,10 @@ const TASK11_TOOL_INVENTORY: &[&str] = &[
     "head",
     "id",
     "jq",
+    "ld",
     "ldd",
+    "llvm-objcopy",
+    "llvm-readelf",
     "ln",
     "ls",
     "mkdir",
@@ -1721,7 +1725,10 @@ impl SealedDriverRun {
 /// `rustup` is stubbed too so the 1.88 toolchain probe succeeds under the
 /// fixture HOME. Stub paths are baked in, never inherited: the seal drops
 /// every variable a stub could otherwise read.
-fn task11_run_to_the_sudo_probe(extra_env: &[(&str, &str)]) -> SealedDriverRun {
+fn task11_run_to_the_sudo_probe(
+    extra_env: &[(&str, &str)],
+    sabotage_rust_src: bool,
+) -> SealedDriverRun {
     let repo = task7_pristine_driver_repo();
     let fixture = tempfile::tempdir().expect("create sealed release-driver fixture");
     let fake_bin = fixture.path().join("bin");
@@ -1737,8 +1744,42 @@ fn task11_run_to_the_sudo_probe(extra_env: &[(&str, &str)]) -> SealedDriverRun {
 
     let tripwire_log = fixture.path().join("tripwire.log");
     let environment_dump = fixture.path().join("sealed-environment");
+
+    // The nightly closure the eBPF object is actually built from: cargo,
+    // rustc, its sysroot, the `rust-src` tree `-Z build-std=core` consumes,
+    // and the BPF linker. `bpf-linker` lives under the effective cargo home,
+    // which Cargo prepends to the PATH of every rustc it spawns.
+    let sysroot = fixture.path().join("sysroot");
+    let rust_src = sysroot.join("lib/rustlib/src/rust");
+    fs::create_dir_all(rust_src.join("library/core/src")).expect("create rust-src fixture");
+    for (name, body) in [
+        ("library/core/src/lib.rs", "#![no_std]\n"),
+        ("library/core/Cargo.toml", "[package]\nname = \"core\"\n"),
+    ] {
+        fs::write(rust_src.join(name), body).expect("write rust-src fixture file");
+    }
+    let cargo_bin = home.join(".cargo/bin");
+    fs::create_dir_all(&cargo_bin).expect("create the fixture cargo home");
+    fs::write(cargo_bin.join("bpf-linker"), b"#!/bin/sh\nexit 0\n").expect("write bpf-linker");
+    fs::set_permissions(
+        cargo_bin.join("bpf-linker"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .expect("make bpf-linker executable");
+    if sabotage_rust_src {
+        std::os::unix::fs::symlink("/etc/passwd", rust_src.join("library/core/planted"))
+            .expect("plant a symlink in the rust-src fixture");
+    }
+
     let toolchain = fixture.path().join("toolchain-binary");
-    fs::write(&toolchain, b"#!/bin/sh\nexit 0\n").expect("write toolchain fixture binary");
+    fs::write(
+        &toolchain,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in\n\"--print sysroot\") echo {sysroot} ;;\nesac\nexit 0\n",
+            sysroot = sysroot.display()
+        ),
+    )
+    .expect("write toolchain fixture binary");
     fs::set_permissions(&toolchain, fs::Permissions::from_mode(0o700))
         .expect("make the toolchain fixture binary executable");
 
@@ -1751,7 +1792,12 @@ fn task11_run_to_the_sudo_probe(extra_env: &[(&str, &str)]) -> SealedDriverRun {
     stub(
         "rustup",
         format!(
-            "#!/bin/sh\ncase \"$*\" in\n\"which --toolchain 1.88 cargo\"|\"which --toolchain 1.88 rustc\")\n    echo {toolchain}; exit 0 ;;\nesac\nexit 1\n",
+            r#"#!/bin/sh
+case "$1 $2 $3" in
+"which --toolchain 1.88"|"which --toolchain nightly-2026-05-20") echo {toolchain}; exit 0 ;;
+esac
+exit 1
+"#,
             toolchain = toolchain.display()
         ),
     );
@@ -1815,7 +1861,7 @@ fn release_seal_denies_the_caller_path_to_every_reached_command() {
     // ratified rule (W1 plan line 417) is that no inherited PATH authority
     // survives anywhere in the receipt chain, so the closure is a sealed
     // execution environment, not a longer hand-maintained tool list.
-    let run = task11_run_to_the_sudo_probe(&[]);
+    let run = task11_run_to_the_sudo_probe(&[], false);
     let stderr = run.stderr();
 
     assert_eq!(
@@ -1869,6 +1915,40 @@ fn release_seal_denies_the_caller_path_to_every_reached_command() {
         );
     }
 
+    // The nightly eBPF toolchain closure is an effective input of the release
+    // artifact and is bound like one. `cc` is reached through PATH by rustc's
+    // gcc-flavour linker driver, so it is an ordinary inventory member above;
+    // gcc's own collect2/ld/as come from its configured prefix, not PATH
+    // (verified by execve trace on this host).
+    for (row, shape) in [
+        ("toolchain_nightly_cargo", 2usize),
+        ("toolchain_nightly_rustc", 2),
+        ("toolchain_nightly_sysroot", 1),
+        ("toolchain_nightly_rust_src", 2),
+        ("toolchain_bpf_linker", 2),
+    ] {
+        let value = run
+            .fact(row)
+            .unwrap_or_else(|| panic!("the receipt omits the {row} closure row"));
+        let fields: Vec<&str> = value.split(' ').collect();
+        assert_eq!(fields.len(), shape, "malformed {row} row: {value:?}");
+        assert!(
+            fields[0].starts_with('/'),
+            "malformed {row} path: {value:?}"
+        );
+        if shape == 2 {
+            assert!(
+                fields[1].len() == 64 && fields[1].bytes().all(|b| b.is_ascii_hexdigit()),
+                "{row} must carry a digest: {value:?}"
+            );
+        }
+    }
+    assert!(
+        run.fact("toolchain_bpf_linker")
+            .is_some_and(|row| row.contains("/.cargo/bin/bpf-linker")),
+        "the BPF linker must be bound where rustc actually reaches it"
+    );
+
     let caller_path = run
         .fact("caller_path")
         .expect("the receipt records the caller's PATH");
@@ -1898,7 +1978,7 @@ fn release_seal_exports_exactly_the_reviewed_environment() {
         ("DOCKER_HOST", "tcp://task11.invalid:2375"),
         ("LANG", "en_US.UTF-8"),
     ];
-    let run = task11_run_to_the_sudo_probe(&planted);
+    let run = task11_run_to_the_sudo_probe(&planted, false);
     assert_eq!(
         run.output.status.code(),
         Some(77),
@@ -1952,6 +2032,43 @@ fn release_seal_exports_exactly_the_reviewed_environment() {
         run.fact("head"),
         Some(driver_head.trim()),
         "an inherited GIT_DIR must never decide the recorded HEAD"
+    );
+}
+
+#[test]
+fn release_refuses_an_unbound_nightly_rust_src_tree() {
+    // `-Z build-std=core` compiles the installed `rust-src` tree into the
+    // shipped eBPF object, so the tree is an effective input and is digested
+    // whole. A symlink inside it would make that digest describe something
+    // other than what the compiler read, so it refuses instead.
+    let run = task11_run_to_the_sudo_probe(&[], true);
+    let stderr = run.stderr();
+    assert_eq!(
+        run.output.status.code(),
+        Some(77),
+        "a symlinked rust-src tree must refuse: stderr={stderr:?}"
+    );
+    assert!(
+        run.fact("head").is_some(),
+        "the refusal must come from the ledger, after the source facts"
+    );
+    for absent in ["toolchain_nightly_rust_src", "tool_awk", "tool_bpf-linker"] {
+        assert!(
+            run.fact(absent).is_none(),
+            "an unbindable rust-src tree still published the {absent} ledger row"
+        );
+    }
+    assert_eq!(
+        run.tripped(),
+        "",
+        "the refusal ran past the ledger into the body probe"
+    );
+    let sealed_bin = run
+        .fact("sealed_bin")
+        .expect("the receipt records the sealed bin directory");
+    assert!(
+        !std::path::Path::new(sealed_bin).exists(),
+        "finalization left the sealed bin directory behind: {sealed_bin}"
     );
 }
 
@@ -2110,6 +2227,35 @@ fn release_pins_its_reached_command_inventory_and_sealed_environment() {
         release.contains("PATH=\"$P11SCOPE_TASK4_CALLER_PATH\" command -v"),
         "the ledger never re-resolves the caller's PATH, so a divergence cannot refuse"
     );
+    // The nightly closure is rechecked at finalization, so it lives in the
+    // ledger the finalizer compares, not in a one-shot preflight block.
+    let ledger = between(&release, "\ntask4_tool_ledger() {", "\n}\n");
+    assert!(
+        ledger.contains("task4_nightly_closure || return 1"),
+        "the rechecked tool ledger does not bind the nightly closure"
+    );
+    let ledger = between(&release, "\ntask4_nightly_closure() {", "\n}\n");
+    for row in [
+        "toolchain_nightly_cargo",
+        "toolchain_nightly_rustc",
+        "toolchain_nightly_sysroot",
+        "toolchain_nightly_rust_src",
+        "toolchain_bpf_linker",
+    ] {
+        assert!(
+            ledger.contains(row),
+            "the rechecked tool ledger omits {row}"
+        );
+    }
+    assert!(
+        ledger.contains("nightly-2026-05-20"),
+        "the ledger does not name the pinned nightly toolchain"
+    );
+    assert!(
+        ledger.contains("-type l -print -quit"),
+        "the rust-src digest accepts a symlinked tree"
+    );
+
     // The sealed bin directory is evidence until the receipt status exists.
     let finalize = between(&release, "\ntask4_finalize() {", "\ntask4_receipt_run() {");
     let status = finalize
@@ -3754,6 +3900,7 @@ fn task4_receipt_drivers_execute_behavioral_self_tests() {
         "forged-seal-marker-rejected",
         "inventory-wide-tool-ledger-exact-accepted",
         "sealed-bin-removed-after-terminal-status",
+        "nightly-toolchain-closure-exact-accepted",
     ];
     const LANE16_CASES: &[&str] = &[
         "never-68-68-136-one-timing-zero-loss-ambiguity-inflight-child-false-none-0-0-0-exact-accepted",

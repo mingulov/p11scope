@@ -25,7 +25,7 @@ self_test() {
     command -v jq >/dev/null || { echo "jq required"; exit 1; }
     st_work=$(mktemp -d "${TMPDIR:-/tmp}/p11scope-discover-selftest-XXXXXX")
     trap 'rm -rf "$st_work"' EXIT INT TERM
-    python3 - "$st_work" "$ORACLE" "$SOFTHSM_FUNCTION_RECORDS" <<'PY'
+    python3 -I - "$st_work" "$ORACLE" "$SOFTHSM_FUNCTION_RECORDS" <<'PY'
 import copy
 import json
 from pathlib import Path

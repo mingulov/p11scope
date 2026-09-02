@@ -1716,6 +1716,17 @@ impl SealedDriverRun {
     }
 }
 
+#[derive(Default)]
+struct Task11FixtureOptions {
+    external_rust_src_symlink: bool,
+    internal_rust_src_symlink: bool,
+    cargo_proxy_mismatch: bool,
+    cargo_proxy_regular_mismatch: bool,
+    cargo_home_raw_target_newline: bool,
+    cargo_home_inventory_shadow: bool,
+    missing_musl: bool,
+}
+
 /// Runs the pristine driver until it reaches the pinned `sudo -n true` probe
 /// -- the first external command the receipt chain executes that a test can
 /// own -- with `sudo` replaced by a stub that is the seal's positive control:
@@ -1727,7 +1738,7 @@ impl SealedDriverRun {
 /// every variable a stub could otherwise read.
 fn task11_run_to_the_sudo_probe(
     extra_env: &[(&str, &str)],
-    sabotage_rust_src: bool,
+    options: Task11FixtureOptions,
 ) -> SealedDriverRun {
     let repo = task7_pristine_driver_repo();
     let fixture = tempfile::tempdir().expect("create sealed release-driver fixture");
@@ -1752,6 +1763,19 @@ fn task11_run_to_the_sudo_probe(
     let sysroot = fixture.path().join("sysroot");
     let rust_src = sysroot.join("lib/rustlib/src/rust");
     fs::create_dir_all(rust_src.join("library/core/src")).expect("create rust-src fixture");
+    fs::create_dir_all(sysroot.join("lib/rustlib/x86_64-unknown-linux-musl/lib"))
+        .expect("create stable musl sysroot fixture");
+    fs::write(sysroot.join("lib/librustc_driver.so"), b"rustc-driver\n")
+        .expect("write top-level rustc driver fixture");
+    fs::write(
+        sysroot.join("lib/rustlib/x86_64-unknown-linux-musl/lib/libc.rlib"),
+        b"musl-target\n",
+    )
+    .expect("write stable musl target fixture");
+    if options.missing_musl {
+        fs::remove_dir_all(sysroot.join("lib/rustlib/x86_64-unknown-linux-musl/lib"))
+            .expect("remove stable musl target fixture");
+    }
     for (name, body) in [
         ("library/core/src/lib.rs", "#![no_std]\n"),
         ("library/core/Cargo.toml", "[package]\nname = \"core\"\n"),
@@ -1766,7 +1790,11 @@ fn task11_run_to_the_sudo_probe(
         fs::Permissions::from_mode(0o700),
     )
     .expect("make bpf-linker executable");
-    if sabotage_rust_src {
+    if options.internal_rust_src_symlink {
+        std::os::unix::fs::symlink("lib.rs", rust_src.join("library/core/src/internal-link"))
+            .expect("plant an internal rust-src symlink");
+    }
+    if options.external_rust_src_symlink {
         std::os::unix::fs::symlink("/etc/passwd", rust_src.join("library/core/planted"))
             .expect("plant a symlink in the rust-src fixture");
     }
@@ -1801,6 +1829,70 @@ exit 1
             toolchain = toolchain.display()
         ),
     );
+    let proxy_target = fake_bin.join("rustup-proxy-target");
+    fs::write(&proxy_target, b"#!/bin/sh\nexit 0\n").expect("write mismatched cargo proxy");
+    fs::set_permissions(&proxy_target, fs::Permissions::from_mode(0o700))
+        .expect("make mismatched cargo proxy executable");
+    let rustup_target = fake_bin.join("rustup");
+    if options.cargo_proxy_regular_mismatch {
+        fs::write(cargo_bin.join("cargo"), b"#!/bin/sh\nexit 0\n")
+            .expect("write regular cargo proxy mismatch");
+        fs::set_permissions(cargo_bin.join("cargo"), fs::Permissions::from_mode(0o700))
+            .expect("make regular cargo proxy mismatch executable");
+    } else {
+        std::os::unix::fs::symlink(
+            if options.cargo_proxy_mismatch {
+                proxy_target.as_path()
+            } else {
+                rustup_target.as_path()
+            },
+            cargo_bin.join("cargo"),
+        )
+        .expect("link cargo proxy");
+    }
+    std::os::unix::fs::symlink(&rustup_target, cargo_bin.join("rustc")).expect("link rustc proxy");
+    std::os::unix::fs::symlink(&rustup_target, cargo_bin.join("rustup"))
+        .expect("link rustup proxy");
+    let third_party = cargo_bin.join("cargo-third-party");
+    fs::write(&third_party, b"#!/bin/sh\nexit 0\n").expect("write third-party cargo command");
+    fs::set_permissions(&third_party, fs::Permissions::from_mode(0o700))
+        .expect("make third-party cargo command executable");
+    fs::write(
+        cargo_bin.join("cargo-third-party-target"),
+        b"#!/bin/sh\nexit 0\n",
+    )
+    .expect("write third-party symlink target");
+    fs::set_permissions(
+        cargo_bin.join("cargo-third-party-target"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .expect("make third-party symlink target executable");
+    let third_party_link_target = if options.cargo_home_raw_target_newline {
+        let external_plain_target = fake_bin.join("third-party-target");
+        fs::write(&external_plain_target, b"#!/bin/sh\nexit 0\n")
+            .expect("write plain symlink target twin");
+        fs::set_permissions(&external_plain_target, fs::Permissions::from_mode(0o700))
+            .expect("make plain symlink target twin executable");
+        let external_target = fake_bin.join("third-party-target\n");
+        fs::write(&external_target, b"#!/bin/sh\nexit 0\n")
+            .expect("write newline-terminated symlink target");
+        fs::set_permissions(&external_target, fs::Permissions::from_mode(0o700))
+            .expect("make newline-terminated symlink target executable");
+        external_target
+    } else {
+        cargo_bin.join("cargo-third-party-target")
+    };
+    std::os::unix::fs::symlink(
+        &third_party_link_target,
+        cargo_bin.join("cargo-third-party-link"),
+    )
+    .expect("link third-party cargo command");
+    if options.cargo_home_inventory_shadow {
+        fs::write(cargo_bin.join("date"), b"#!/bin/sh\nexit 0\n")
+            .expect("write cargo-home inventory shadow");
+        fs::set_permissions(cargo_bin.join("date"), fs::Permissions::from_mode(0o700))
+            .expect("make cargo-home inventory shadow executable");
+    }
     stub(
         "sudo",
         format!(
@@ -1861,7 +1953,7 @@ fn release_seal_denies_the_caller_path_to_every_reached_command() {
     // ratified rule (W1 plan line 417) is that no inherited PATH authority
     // survives anywhere in the receipt chain, so the closure is a sealed
     // execution environment, not a longer hand-maintained tool list.
-    let run = task11_run_to_the_sudo_probe(&[], false);
+    let run = task11_run_to_the_sudo_probe(&[], Task11FixtureOptions::default());
     let stderr = run.stderr();
 
     assert_eq!(
@@ -1921,9 +2013,10 @@ fn release_seal_denies_the_caller_path_to_every_reached_command() {
     // gcc's own collect2/ld/as come from its configured prefix, not PATH
     // (verified by execve trace on this host).
     for (row, shape) in [
+        ("toolchain_sysroot", 2usize),
         ("toolchain_nightly_cargo", 2usize),
         ("toolchain_nightly_rustc", 2),
-        ("toolchain_nightly_sysroot", 1),
+        ("toolchain_nightly_sysroot", 2),
         ("toolchain_nightly_rust_src", 2),
         ("toolchain_bpf_linker", 2),
     ] {
@@ -1937,8 +2030,11 @@ fn release_seal_denies_the_caller_path_to_every_reached_command() {
             "malformed {row} path: {value:?}"
         );
         if shape == 2 {
+            let digest = fields[1]
+                .strip_prefix("tree-sha256-v1:")
+                .unwrap_or(fields[1]);
             assert!(
-                fields[1].len() == 64 && fields[1].bytes().all(|b| b.is_ascii_hexdigit()),
+                digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()),
                 "{row} must carry a digest: {value:?}"
             );
         }
@@ -1991,7 +2087,7 @@ fn release_seal_exports_exactly_the_reviewed_environment() {
         ("DOCKER_HOST", "tcp://task11.invalid:2375"),
         ("LANG", "en_US.UTF-8"),
     ];
-    let run = task11_run_to_the_sudo_probe(&planted, false);
+    let run = task11_run_to_the_sudo_probe(&planted, Task11FixtureOptions::default());
     assert_eq!(
         run.output.status.code(),
         Some(77),
@@ -2072,7 +2168,7 @@ fn release_runs_every_python3_in_isolated_mode() {
         .collect();
     assert_eq!(
         sites.len(),
-        4,
+        5,
         "the pinned-interpreter call sites moved; re-check each one for -I"
     );
     for site in sites {
@@ -2115,14 +2211,12 @@ fn release_runs_every_python3_in_isolated_mode() {
                 let bytes = code.as_bytes();
                 let token_before = start == 0
                     || !bytes[start - 1].is_ascii_alphanumeric() && bytes[start - 1] != b'_';
-                let token_after = end == bytes.len()
-                    || !bytes[end].is_ascii_alphanumeric() && bytes[end] != b'_';
+                let token_after =
+                    end == bytes.len() || !bytes[end].is_ascii_alphanumeric() && bytes[end] != b'_';
                 if token_before && token_after {
                     let after = code[end..].trim_start();
                     let rest = after.strip_prefix("-I").unwrap_or_else(|| {
-                        panic!(
-                            "unisolated executable python3 in {path}:{line_number}: {line:?}"
-                        )
+                        panic!("unisolated executable python3 in {path}:{line_number}: {line:?}")
                     });
                     assert!(
                         rest.is_empty()
@@ -2138,12 +2232,176 @@ fn release_runs_every_python3_in_isolated_mode() {
 }
 
 #[test]
-fn release_refuses_an_unbound_nightly_rust_src_tree() {
+fn release_cargo_home_bin_closure_is_complete_and_refuses_shadows() {
+    // The rustup proxy prepends HOME/.cargo/bin to the nightly build's PATH.
+    // Every immediate entry is therefore part of the receipt: regular files,
+    // internal symlinks, and the cargo/rustc/rustup proxy identity alike.
+    let safe = task11_run_to_the_sudo_probe(&[], Task11FixtureOptions::default());
+    assert_eq!(safe.output.status.code(), Some(77));
+    for name in [
+        "cargo",
+        "rustc",
+        "rustup",
+        "bpf-linker",
+        "cargo-third-party",
+        "cargo-third-party-link",
+        "cargo-third-party-target",
+    ] {
+        assert!(
+            safe.fact(&format!("cargo_home_bin_{name}")).is_some(),
+            "the cargo-home ledger omits {name}"
+        );
+    }
+    assert!(
+        safe.fact("cargo_home_bin_cargo-third-party-link")
+            .is_some_and(|row| row.contains("cargo-third-party-target")),
+        "the cargo-home symlink row must bind its raw target"
+    );
+    assert_eq!(
+        safe.tripped(),
+        "sudo\n",
+        "the safe fixture reaches only the probe"
+    );
+
+    let shadow = task11_run_to_the_sudo_probe(
+        &[],
+        Task11FixtureOptions {
+            cargo_home_inventory_shadow: true,
+            ..Task11FixtureOptions::default()
+        },
+    );
+    assert_eq!(shadow.output.status.code(), Some(77));
+    assert!(
+        shadow.tripped().is_empty(),
+        "an exact inventory-name shadow reached the release body: {}",
+        shadow.tripped()
+    );
+
+    let mismatch = task11_run_to_the_sudo_probe(
+        &[],
+        Task11FixtureOptions {
+            cargo_proxy_mismatch: true,
+            ..Task11FixtureOptions::default()
+        },
+    );
+    assert_eq!(mismatch.output.status.code(), Some(77));
+    assert!(
+        mismatch.tripped().is_empty(),
+        "a cargo proxy mismatch reached the release body: {}",
+        mismatch.tripped()
+    );
+
+    let regular_mismatch = task11_run_to_the_sudo_probe(
+        &[],
+        Task11FixtureOptions {
+            cargo_proxy_regular_mismatch: true,
+            ..Task11FixtureOptions::default()
+        },
+    );
+    assert_eq!(regular_mismatch.output.status.code(), Some(77));
+    assert!(
+        regular_mismatch.tripped().is_empty(),
+        "a regular cargo proxy mismatch reached the release body: {}",
+        regular_mismatch.tripped()
+    );
+
+    let raw_target_newline = task11_run_to_the_sudo_probe(
+        &[],
+        Task11FixtureOptions {
+            cargo_home_raw_target_newline: true,
+            ..Task11FixtureOptions::default()
+        },
+    );
+    assert_eq!(raw_target_newline.output.status.code(), Some(77));
+    assert!(
+        raw_target_newline.tripped().is_empty(),
+        "a newline-terminated raw target reached the release body: {}",
+        raw_target_newline.tripped()
+    );
+}
+
+#[test]
+fn release_sysroot_closure_is_bound_and_missing_musl_refuses_before_body() {
+    let release = read("scripts/build-release.sh");
+    assert!(
+        release.contains("tree-sha256-v1:"),
+        "sysroot closure does not use the typed tree digest"
+    );
+    assert!(
+        !release.contains("target add"),
+        "the release body may not mutate the stable toolchain"
+    );
+
+    let safe = task11_run_to_the_sudo_probe(
+        &[],
+        Task11FixtureOptions {
+            internal_rust_src_symlink: true,
+            ..Task11FixtureOptions::default()
+        },
+    );
+    assert_eq!(safe.output.status.code(), Some(77));
+    for row in [
+        "toolchain_sysroot",
+        "toolchain_nightly_sysroot",
+        "toolchain_nightly_rust_src",
+    ] {
+        let value = safe.fact(row).unwrap_or_else(|| panic!("missing {row}"));
+        assert!(
+            value.contains("tree-sha256-v1:"),
+            "{row} is not a typed tree digest: {value:?}"
+        );
+    }
+    assert_eq!(safe.tripped(), "sudo\n");
+
+    let missing = task11_run_to_the_sudo_probe(
+        &[],
+        Task11FixtureOptions {
+            missing_musl: true,
+            ..Task11FixtureOptions::default()
+        },
+    );
+    assert_eq!(missing.output.status.code(), Some(77));
+    assert!(
+        missing.tripped().is_empty(),
+        "missing stable musl target reached the body: {}",
+        missing.tripped()
+    );
+    assert!(
+        missing.fact("toolchain_sysroot").is_none(),
+        "missing stable musl target was recorded as a valid sysroot"
+    );
+}
+
+#[test]
+fn release_root_with_a_real_tab_is_refused_before_creation() {
+    let repo = task7_pristine_driver_repo();
+    let campaign = task7_campaign();
+    let home = tempfile::tempdir().expect("create release preflight home");
+    let bin = task7_tripwire_bin(&campaign.path().join("tripwire.log"));
+    let root = campaign.path().join("evidence\troot");
+    let output = task7_run_preflight(&repo, Some(home.path()), &bin, &root, &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(77),
+        "a real tab in the root path must refuse with 77: stderr={stderr:?}"
+    );
+    assert!(!root.exists(), "the tabbed root was created before refusal");
+}
+
+#[test]
+fn release_refuses_an_external_nightly_rust_src_symlink() {
     // `-Z build-std=core` compiles the installed `rust-src` tree into the
     // shipped eBPF object, so the tree is an effective input and is digested
-    // whole. A symlink inside it would make that digest describe something
-    // other than what the compiler read, so it refuses instead.
-    let run = task11_run_to_the_sudo_probe(&[], true);
+    // whole. An external symlink is outside the typed tree closure and must
+    // refuse; an internal symlink is covered by the positive case above.
+    let run = task11_run_to_the_sudo_probe(
+        &[],
+        Task11FixtureOptions {
+            external_rust_src_symlink: true,
+            ..Task11FixtureOptions::default()
+        },
+    );
     let stderr = run.stderr();
     assert_eq!(
         run.output.status.code(),
@@ -2354,8 +2612,12 @@ fn release_pins_its_reached_command_inventory_and_sealed_environment() {
         "the ledger does not name the pinned nightly toolchain"
     );
     assert!(
-        ledger.contains("-type l -print -quit"),
-        "the rust-src digest accepts a symlinked tree"
+        ledger.contains("task4_tree_digest \"$t4_src\""),
+        "the rust-src closure does not use the typed tree digest"
+    );
+    assert!(
+        ledger.contains("librustc_driver*.so"),
+        "the sysroot closure does not require the top-level compiler driver"
     );
 
     // The sealed bin directory is evidence until the receipt status exists.
@@ -4004,6 +4266,7 @@ fn task4_receipt_drivers_execute_behavioral_self_tests() {
         "sealed-bin-removed-after-terminal-status",
         "nightly-toolchain-closure-exact-accepted",
         "isolated-python-invocations-exact-accepted",
+        "tab-or-newline-root-rejected-status-77",
     ];
     const LANE16_CASES: &[&str] = &[
         "never-68-68-136-one-timing-zero-loss-ambiguity-inflight-child-false-none-0-0-0-exact-accepted",

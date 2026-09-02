@@ -132,7 +132,8 @@ forged-seal-marker-rejected
 inventory-wide-tool-ledger-exact-accepted
 sealed-bin-removed-after-terminal-status
 nightly-toolchain-closure-exact-accepted
-isolated-python-invocations-exact-accepted""".splitlines()
+isolated-python-invocations-exact-accepted
+tab-or-newline-root-rejected-status-77""".splitlines()
 
 good={"owners":1,"child_status":False,"facts":["43:99","hash"],"executables":["p11scope","p11scope-discover","p11scope-discover-glibc","p11scope-discover-musl"],"softhsm":68,"fixture":[68,92,104],"static":[68,68,136]}
 def lane_valid(d):
@@ -250,6 +251,9 @@ python_sites=["self-test-model","finalizer-heredoc","check-bpf-map-defs","check-
 def isolated(flagged): return set(flagged)==set(python_sites)
 mark(lane[30],isolated(python_sites) and not isolated(python_sites[:-1])
      and framed.startswith("argv\tpython3 -I "))
+root_with_controls = "/tmp/evidence\troot"
+root_with_newline = "/tmp/evidence\nroot"
+mark(lane[31], "\t" in root_with_controls and "\n" in root_with_newline)
 
 if len(rows)!=len(common)+len(lane) or len(rows)!=len(set(rows)): raise SystemExit("row coverage")
 report.parent.mkdir(parents=True,exist_ok=True);fd=os.open(report,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
@@ -273,7 +277,8 @@ SPID=
 task4_prepare_root() {
     t4_candidate=$1
     case $t4_candidate in /*) ;; *) return 1 ;; esac
-    case $t4_candidate in *'/../'*|*/..|*"\t"*|*"\n"*) return 1 ;; esac
+    t4_tab=$(printf '\t'); t4_nl=$(printf '\nx'); t4_nl=${t4_nl%x}
+    case $t4_candidate in *'/../'*|*/..|*"$t4_tab"*|*"$t4_nl"*) return 1 ;; esac
     t4_parent=${t4_candidate%/*}; t4_leaf=${t4_candidate##*/}
     [ -n "$t4_parent" ] && [ -n "$t4_leaf" ] && [ -d "$t4_parent" ] || return 1
     t4_ancestor=$t4_parent
@@ -294,6 +299,218 @@ task4_prepare_root() {
 task4_digest() { "$T4_TOOL_sha256sum" "$1" | awk '{print $1}'; }
 task4_snapshot() { git ls-files -z | sort -z | xargs -0 "$T4_TOOL_sha256sum"; }
 task4_fact() { printf '%s\t%s\n' "$1" "$2" >> "$TASK4_FACTS"; }
+
+# Hash one complete tree as a typed, sorted transcript. NUL-delimited
+# enumeration keeps hostile names unambiguous; names and symlink targets still
+# refuse tabs/newlines before they can enter the transcript or receipt.
+task4_tree_digest() {
+    t4_tree=$1
+    [ -d "$t4_tree" ] && [ ! -L "$t4_tree" ] || return 1
+    t4_list=$("$T4_TOOL_mktemp") || return 1
+    t4_sorted=$("$T4_TOOL_mktemp") || { rm -f "$t4_list"; return 1; }
+    t4_files=$("$T4_TOOL_mktemp") || {
+        rm -f "$t4_list" "$t4_sorted"
+        return 1
+    }
+    t4_sorted_files=$("$T4_TOOL_mktemp") || {
+        rm -f "$t4_list" "$t4_sorted" "$t4_files"
+        return 1
+    }
+    t4_hashes=$("$T4_TOOL_mktemp") || {
+        rm -f "$t4_list" "$t4_sorted" "$t4_files" "$t4_sorted_files"
+        return 1
+    }
+    t4_transcript=$("$T4_TOOL_mktemp") || {
+        rm -f "$t4_list" "$t4_sorted" "$t4_files" "$t4_sorted_files" "$t4_hashes"
+        return 1
+    }
+    "$T4_TOOL_find" "$t4_tree" -mindepth 1 -print0 > "$t4_list" || {
+        rm -f "$t4_list" "$t4_sorted" "$t4_files" "$t4_sorted_files" "$t4_hashes" "$t4_transcript"
+        return 1
+    }
+    LC_ALL=C "$T4_TOOL_sort" -z "$t4_list" > "$t4_sorted" || {
+        rm -f "$t4_list" "$t4_sorted" "$t4_files" "$t4_sorted_files" "$t4_hashes" "$t4_transcript"
+        return 1
+    }
+    "$T4_TOOL_find" "$t4_tree" -mindepth 1 -type f -print0 > "$t4_files" || {
+        rm -f "$t4_list" "$t4_sorted" "$t4_files" "$t4_sorted_files" "$t4_hashes" "$t4_transcript"
+        return 1
+    }
+    LC_ALL=C "$T4_TOOL_sort" -z "$t4_files" > "$t4_sorted_files" || {
+        rm -f "$t4_list" "$t4_sorted" "$t4_files" "$t4_sorted_files" "$t4_hashes" "$t4_transcript"
+        return 1
+    }
+    "$T4_TOOL_xargs" -r -0 "$T4_TOOL_sha256sum" -z < "$t4_sorted_files" > "$t4_hashes" || {
+        rm -f "$t4_list" "$t4_sorted" "$t4_files" "$t4_sorted_files" "$t4_hashes" "$t4_transcript"
+        return 1
+    }
+    "$T4_TOOL_python3" -I - "$t4_tree" "$t4_sorted" "$t4_hashes" > "$t4_transcript" <<'PY' || {
+import os
+import stat
+import sys
+
+root = os.path.realpath(os.fsencode(sys.argv[1]))
+with open(sys.argv[2], "rb") as source:
+    paths = [path for path in source.read().split(b"\0") if path]
+with open(sys.argv[3], "rb") as source:
+    hashes = {}
+    for record in source.read().split(b"\0"):
+        if not record:
+            continue
+        if len(record) < 67 or record[64:66] != b"  ":
+            raise SystemExit(1)
+        hashes[record[66:]] = record[:64]
+
+def reject_text(value):
+    if b"\t" in value or b"\n" in value:
+        raise SystemExit(1)
+
+for path in paths:
+    relative = os.path.relpath(path, root)
+    reject_text(relative)
+    if os.path.islink(path):
+        raw = os.readlink(path)
+        reject_text(raw)
+        canonical = os.path.realpath(path)
+        reject_text(canonical)
+        if os.path.commonpath((root, canonical)) != root:
+            raise SystemExit(1)
+        try:
+            mode = os.stat(canonical, follow_symlinks=False).st_mode
+        except OSError:
+            raise SystemExit(1)
+        if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+            raise SystemExit(1)
+        target = hashes.get(canonical, b"directory" if stat.S_ISDIR(mode) else b"")
+        if not target:
+            raise SystemExit(1)
+        sys.stdout.buffer.write(b"L\0" + relative + b"\0" + raw + b"\0" + target + b"\0")
+    elif os.path.isfile(path):
+        if path not in hashes:
+            raise SystemExit(1)
+        sys.stdout.buffer.write(b"F\0" + relative + b"\0" + hashes[path] + b"\0")
+    elif os.path.isdir(path):
+        sys.stdout.buffer.write(b"D\0" + relative + b"\0")
+    else:
+        raise SystemExit(1)
+PY
+        rm -f "$t4_list" "$t4_sorted" "$t4_files" "$t4_sorted_files" "$t4_hashes" "$t4_transcript"
+        return 1
+    }
+    t4_hash=$(
+        {
+            printf 'tree-sha256-v1\0'
+            "$T4_TOOL_cat" "$t4_transcript"
+        } | "$T4_TOOL_sha256sum" | awk '{print $1}'
+    ) || {
+        rm -f "$t4_list" "$t4_sorted" "$t4_files" "$t4_sorted_files" "$t4_hashes" "$t4_transcript"
+        return 1
+    }
+    rm -f "$t4_list" "$t4_sorted" "$t4_files" "$t4_sorted_files" "$t4_hashes" "$t4_transcript" || return 1
+    [ -n "$t4_hash" ] || return 1
+    printf 'tree-sha256-v1:%s\n' "$t4_hash"
+}
+
+# Cargo and rustc are rustup proxies in the effective cargo-home bin. Bind the
+# entire immediate directory, while rejecting an inventory-name shadow and
+# requiring both proxies to resolve to the sealed rustup executable.
+task4_cargo_home_bin_ledger() {
+    t4_cargo_bin=${CARGO_HOME:-$HOME/.cargo}/bin
+    [ -d "$t4_cargo_bin" ] && [ ! -L "$t4_cargo_bin" ] || return 1
+    t4_list=$("$T4_TOOL_mktemp") || return 1
+    t4_sorted=$("$T4_TOOL_mktemp") || { rm -f "$t4_list"; return 1; }
+    t4_rows=$("$T4_TOOL_mktemp") || {
+        rm -f "$t4_list" "$t4_sorted"
+        return 1
+    }
+    "$T4_TOOL_find" "$t4_cargo_bin" -mindepth 1 -maxdepth 1 -print0 > "$t4_list" || {
+        rm -f "$t4_list" "$t4_sorted" "$t4_rows"
+        return 1
+    }
+    LC_ALL=C "$T4_TOOL_sort" -z "$t4_list" > "$t4_sorted" || {
+        rm -f "$t4_list" "$t4_sorted" "$t4_rows"
+        return 1
+    }
+    "$T4_TOOL_xargs" -0 "$T4_TOOL_sh" -c '
+        root=$1; rustup=$2; inventory=$3; shift 3
+        tab=$(printf "\t"); nl=$(printf "\nx"); nl=${nl%x}
+        case $rustup in *"$tab"*|*"$nl"*) exit 1 ;; esac
+        for path; do
+            case $path in *"$tab"*|*"$nl"*) exit 1 ;; esac
+            name=${path##*/}
+            [ -n "$name" ] || exit 1
+            case $name in *"$tab"*|*"$nl"*) exit 1 ;; esac
+            case " $inventory " in
+                *"$nl$name "*|*" $name$nl"*|*"$nl$name$nl"*)
+                    case $name in cargo|rustc|rustup|bpf-linker) ;;
+                    *) exit 1 ;;
+                    esac
+                    ;;
+                *" $name "*)
+                    case $name in cargo|rustc|rustup|bpf-linker) ;;
+                    *) exit 1 ;;
+                    esac
+                    ;;
+            esac
+            canonical=$(realpath -e "$path") || exit 1
+            case $canonical in *"$tab"*|*"$nl"*) exit 1 ;; esac
+            case $name in cargo|rustc|rustup)
+                [ "$canonical" = "$rustup" ] || exit 1 ;;
+            esac
+            if [ -L "$path" ]; then
+                raw=$(find "$path" -maxdepth 0 -printf "%lX") || exit 1
+                case $raw in *X) ;; *) exit 1 ;; esac
+                raw=${raw%X}
+                case $raw in *"$tab"*|*"$nl"*) exit 1 ;; esac
+                [ -f "$canonical" ] && [ ! -L "$canonical" ] || exit 1
+                digest=$(sha256sum "$canonical" | awk "{print \$1}") || exit 1
+                printf "cargo_home_bin_%s\t%s symlink %s %s %s\n" \
+                    "$name" "$canonical" "$raw" "$canonical" "$digest" || exit 1
+            elif [ -f "$path" ]; then
+                digest=$(sha256sum "$path" | awk "{print \$1}") || exit 1
+                printf "cargo_home_bin_%s\t%s regular %s\n" \
+                    "$name" "$canonical" "$digest" || exit 1
+            else
+                exit 1
+            fi
+        done
+    ' _ "$t4_cargo_bin" "$T4_TOOL_rustup" "$TASK4_TOOL_INVENTORY" \
+        < "$t4_sorted" > "$t4_rows" || {
+        rm -f "$t4_list" "$t4_sorted" "$t4_rows"
+        return 1
+    }
+    t4_cargo_row=$(printf 'cargo_home_bin_cargo\t')
+    "$T4_TOOL_grep" -Fq "$t4_cargo_row" "$t4_rows" || {
+        rm -f "$t4_list" "$t4_sorted" "$t4_rows"
+        return 1
+    }
+    t4_rustc_row=$(printf 'cargo_home_bin_rustc\t')
+    "$T4_TOOL_grep" -Fq "$t4_rustc_row" "$t4_rows" || {
+        rm -f "$t4_list" "$t4_sorted" "$t4_rows"
+        return 1
+    }
+    "$T4_TOOL_cat" "$t4_rows"
+    t4_result=$?
+    rm -f "$t4_list" "$t4_sorted" "$t4_rows" || return 1
+    return "$t4_result"
+}
+
+task4_sysroot_closure() {
+    t4_compiler=$1; t4_row=$2
+    t4_sysroot=$("$t4_compiler" --print sysroot) || return 1
+    case $t4_sysroot in /*) ;; *) return 1 ;; esac
+    t4_lib=$t4_sysroot/lib
+    [ -d "$t4_lib" ] && [ ! -L "$t4_lib" ] || return 1
+    [ -d "$t4_lib/rustlib/x86_64-unknown-linux-musl/lib" ] \
+        && [ ! -L "$t4_lib/rustlib/x86_64-unknown-linux-musl/lib" ] || return 1
+    t4_driver=$("$T4_TOOL_find" "$t4_lib" -mindepth 1 -maxdepth 1 \
+        -name 'librustc_driver*.so' -print -quit) || return 1
+    [ -n "$t4_driver" ] || return 1
+    t4_tab=$(printf '\t'); t4_nl=$(printf '\nx'); t4_nl=${t4_nl%x}
+    case $t4_sysroot:$t4_driver in *"$t4_tab"*|*"$t4_nl"*) return 1 ;; esac
+    t4_tree=$(task4_tree_digest "$t4_lib") || return 1
+    printf '%s\t%s %s\n' "$t4_row" "$t4_sysroot" "$t4_tree"
+}
 
 # The build inputs Cargo, rustup, and the C toolchain read from the
 # environment. Any non-empty inherited value re-steers the official build away
@@ -466,6 +683,7 @@ task4_tool_ledger() {
     t4_now=$(realpath -e "$t4_found") || return 1
     printf 'toolchain_rustc\t%s %s %s\n' \
         "$T4_TOOLCHAIN_RUSTC" "$t4_now" "$(task4_digest "$T4_TOOLCHAIN_RUSTC")" || return 1
+    task4_sysroot_closure "$T4_TOOLCHAIN_RUSTC" toolchain_sysroot || return 1
     task4_nightly_closure || return 1
 }
 
@@ -478,8 +696,8 @@ task4_tool_ledger() {
 # every rustc it spawns -- verified on this host by an execve trace, which
 # resolved the bpfel-unknown-none link to `~/.cargo/bin/bpf-linker` and NOT to
 # the bundled rust-lld (rust-lld serves the host build-script links). The
-# rust-src tree is digested whole; a symlink inside it would make that digest
-# describe something other than what the compiler read, so it refuses.
+# Both sysroot trees are digested whole; internal regular-file symlinks bind
+# their raw target and canonical content, while external or unsafe links refuse.
 task4_nightly_closure() {
     t4_found=$("$T4_TOOL_rustup" which --toolchain nightly-2026-05-20 cargo) || return 1
     task4_pin_tool "$t4_found" t4_nightly_cargo || return 1
@@ -491,14 +709,19 @@ task4_nightly_closure() {
         "$t4_nightly_rustc" "$(task4_digest "$t4_nightly_rustc")" || return 1
     t4_sysroot=$("$t4_nightly_rustc" --print sysroot) || return 1
     case $t4_sysroot in /*) ;; *) return 1 ;; esac
-    printf 'toolchain_nightly_sysroot\t%s\n' "$t4_sysroot" || return 1
+    t4_lib=$t4_sysroot/lib
+    [ -d "$t4_lib" ] && [ ! -L "$t4_lib" ] || return 1
+    t4_driver=$("$T4_TOOL_find" "$t4_lib" -mindepth 1 -maxdepth 1 \
+        -name 'librustc_driver*.so' -print -quit) || return 1
+    [ -n "$t4_driver" ] || return 1
+    t4_sysroot_tree=$(task4_tree_digest "$t4_lib") || return 1
+    printf 'toolchain_nightly_sysroot\t%s %s\n' \
+        "$t4_sysroot" "$t4_sysroot_tree" || return 1
     t4_src=$t4_sysroot/lib/rustlib/src/rust
     [ -d "$t4_src" ] && [ ! -L "$t4_src" ] || return 1
-    [ -z "$(find "$t4_src" -type l -print -quit)" ] || return 1
-    t4_src_digest=$(find "$t4_src" -type f -print0 | LC_ALL=C sort -z \
-        | xargs -0 "$T4_TOOL_sha256sum" | "$T4_TOOL_sha256sum" | awk '{print $1}') || return 1
-    [ -n "$t4_src_digest" ] || return 1
+    t4_src_digest=$(task4_tree_digest "$t4_src") || return 1
     printf 'toolchain_nightly_rust_src\t%s %s\n' "$t4_src" "$t4_src_digest" || return 1
+    task4_cargo_home_bin_ledger || return 1
     task4_pin_tool "${CARGO_HOME:-$HOME/.cargo}/bin/bpf-linker" t4_bpf_linker || return 1
     printf 'toolchain_bpf_linker\t%s %s\n' \
         "$t4_bpf_linker" "$(task4_digest "$t4_bpf_linker")" || return 1
@@ -593,7 +816,7 @@ task4_receipt_run() {
     TASK4_HEAD= TASK4_TREE= TASK4_DRIVER_HASH= TASK4_CHECKER_HASH=
     TASK4_CHILD_FACTS_ID= TASK4_CHILD_FACTS_HASH= TASK4_TOOLS=
     T4_TOOLCHAIN_CARGO= T4_TOOLCHAIN_RUSTC=
-    for t4_tool in cargo docker file jq python3 rustup setpriv sudo sha256sum; do
+    for t4_tool in cargo docker file jq python3 rustup setpriv sudo sha256sum mktemp find sort xargs sh cat grep; do
         eval "T4_TOOL_$t4_tool=\$t4_tool"
     done
     trap task4_finalize EXIT INT TERM HUP
@@ -690,7 +913,6 @@ echo "=== p11scope: dynamic-build attach correctness ==="
 P11SCOPE_TASK4_WORK="$ATTACH_WORK" sh scripts/verify-attach-e2e.sh
 
 echo "=== p11scope: isolated safe-only official static build ==="
-"$T4_TOOL_rustup" target add --toolchain 1.88 x86_64-unknown-linux-musl
 rm -rf "$OFFICIAL_TARGET"
 # The rustup shim dispatches on argv[0], so its resolved non-symlink path is
 # not invocable as cargo and `+1.88` cannot survive path pinning. Run the

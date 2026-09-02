@@ -125,7 +125,7 @@ release gate.
 
 **Provenance and continuity**
 
-- Discovery emits `p11scope-manifest/4`: bounded process-memory pointer
+- Discovery emits `p11scope-manifest/5`: bounded process-memory pointer
   snapshots, reporting build IDs, mandatory whole-file SHA-256 identities, and
   the exact-inode provenance closure recorded separately from attach objects.
 - Stored manifests never authorize probes by themselves. Every attach requires

@@ -1,14 +1,17 @@
 use p11scope::discovery::scan::{CaptureWorkBudget, ScanLimits};
 use p11scope::manifest_input::{MAX_MANIFEST_BYTES, read_manifest};
 use p11scope::process::{MountNamespaceId, ProcessView, ProcessViewId};
+use p11scope_discover::discover::discover as discover_provider;
 use p11scope_manifest::identity::{IdentityKind, ObjectIdentity};
 use p11scope_manifest::manifest::*;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 static CC_LOCK: Mutex<()> = Mutex::new(());
+static DISCOVER_FIXTURE_ID: AtomicUsize = AtomicUsize::new(0);
 
 fn current_mount_namespace() -> MountNamespaceId {
     let metadata = std::fs::metadata("/proc/self/ns/mnt").unwrap();
@@ -50,6 +53,67 @@ fn cc_so(dir: &Path, name: &str, body: &str) -> PathBuf {
     so
 }
 
+fn discover_fixture(mode: &str) -> PathBuf {
+    let _guard = CC_LOCK.lock().unwrap();
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "manifest-discover-{mode}-{}-{}",
+        std::process::id(),
+        DISCOVER_FIXTURE_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/discover/tests/fixture");
+    let helper = dir.join("helper.so");
+    let provider = dir.join("provider.so");
+    let mut helper_command = Command::new("gcc");
+    helper_command
+        .args(["-shared", "-fPIC", "-Wl,-soname,helper.so", "-o"])
+        .arg(&helper)
+        .arg(fixture.join("helper.c"));
+    if mode == "outside" {
+        let outside = dir.join("outside.c");
+        std::fs::write(
+            &outside,
+            "typedef unsigned long CK_RV; CK_RV C_GetInterface(void*a,void*b,void**c,unsigned long d){(void)a;(void)b;(void)c;(void)d;__builtin_trap();}\n",
+        )
+        .unwrap();
+        helper_command.arg(outside);
+    }
+    assert!(helper_command.status().unwrap().success());
+    let mut provider_command = Command::new("gcc");
+    provider_command
+        .args(["-shared", "-fPIC", "-o"])
+        .arg(&provider)
+        .arg(fixture.join("provider.c"))
+        .arg(&helper);
+    match mode {
+        "conflict" => {
+            provider_command.arg("-DCONFLICT_FIXTURE=1");
+        }
+        "post-failure" => {
+            provider_command.arg("-DPOST_FAILURE_FIXTURE=1");
+        }
+        "absent" | "outside" => {
+            provider_command.arg("-DNO_GET_INTERFACE=1");
+        }
+        "unknown-flags" => {
+            provider_command.arg("-DUNKNOWN_FLAGS_FIXTURE=1");
+        }
+        "short-table" => {
+            provider_command.arg("-DSHORT_TABLE_FIXTURE=1");
+        }
+        "normal" => {}
+        other => panic!("unknown fixture mode {other}"),
+    }
+    assert!(
+        provider_command
+            .arg(format!("-Wl,-rpath,{}", dir.display()))
+            .status()
+            .unwrap()
+            .success()
+    );
+    provider
+}
+
 fn manifest_for(path: &Path) -> Manifest {
     let provenance = provenance_for(path);
     let id = provenance.identity.clone();
@@ -72,6 +136,7 @@ fn manifest_for(path: &Path) -> Manifest {
         }],
         vendor_interfaces: vec![],
         alias_groups: vec![],
+        selection_evidence: SelectionEvidence::default(),
     }
 }
 
@@ -87,6 +152,251 @@ fn provenance_for(path: &Path) -> ProvenanceObject {
             .unwrap()
             .identity,
     }
+}
+
+fn queried_selection_matrix() -> SelectionEvidence {
+    let queries = (0..5)
+        .flat_map(|selector| {
+            (0..2).map(move |flags| SelectionQuery {
+                selector,
+                request: SelectionRequest {
+                    name: match selector {
+                        0 => SelectionNameClass::Null,
+                        _ => SelectionNameClass::ExactStandard,
+                    },
+                    version: match selector {
+                        0 | 1 => SelectionVersionClass::Null,
+                        2 => SelectionVersionClass::V3_0,
+                        3 => SelectionVersionClass::V3_1,
+                        _ => SelectionVersionClass::V3_2,
+                    },
+                    flags,
+                },
+                rv: 7,
+                result: None,
+                inventory_matches: vec![],
+                selection_table: None,
+                authority: SelectionAuthority::None,
+                helper_failure: None,
+            })
+        })
+        .collect();
+    SelectionEvidence {
+        acquisition: SelectionAcquisition::Queried,
+        queries,
+        tables: vec![],
+        selection_truncated: false,
+    }
+}
+
+#[test]
+fn manifest_v5_selection_matrix_is_exact() {
+    let path = Path::new("/bin/true");
+    let mut manifest = manifest_for(path);
+    manifest.schema = "p11scope-manifest/5".into();
+    manifest.selection_evidence = queried_selection_matrix();
+    assert!(
+        p11scope::manifest_input::validate_structure(&manifest).is_empty(),
+        "a v5 manifest with the fixed selection matrix should validate"
+    );
+}
+
+#[test]
+fn emitted_selection_fixtures_validate_as_v5_manifests() {
+    for mode in [
+        "normal",
+        "conflict",
+        "post-failure",
+        "absent",
+        "unknown-flags",
+        "outside",
+        "short-table",
+    ] {
+        let provider = discover_fixture(mode);
+        let manifest = discover_provider(&provider).unwrap();
+        let problems = p11scope::manifest_input::validate_structure(&manifest);
+        assert!(problems.is_empty(), "{mode} fixture: {problems:?}");
+    }
+}
+
+#[test]
+fn selection_agreement_requires_readable_fields() {
+    let path = Path::new("/bin/true");
+    let mut manifest = manifest_for(path);
+    manifest.schema = "p11scope-manifest/5".into();
+    manifest.selection_evidence = queried_selection_matrix();
+    manifest.selection_evidence.queries[0].rv = 0;
+    manifest.selection_evidence.queries[0].result = Some(SelectionResult {
+        name: SelectionNameClass::Unreadable,
+        version: SelectionVersionClass::V3_0,
+        flags: 0,
+    });
+    manifest.selection_evidence.queries[0].inventory_matches = vec![SelectionInventoryMatch {
+        surface: 0,
+        name_agrees: true,
+        version_agrees: false,
+    }];
+    assert!(
+        p11scope::manifest_input::validate_structure(&manifest)
+            .iter()
+            .any(|problem| problem.contains("agreement")),
+        "v5 agreement must be false for an unreadable result field"
+    );
+}
+
+#[test]
+fn selection_validation_rejects_review_mutations() {
+    let path = Path::new("/bin/true");
+
+    let mut unknown = serde_json::to_value(manifest_for(path)).unwrap();
+    unknown["selection_evidence"]["unknown"] = serde_json::Value::Bool(true);
+    assert!(serde_json::from_value::<Manifest>(unknown).is_err());
+
+    let mut bounds = manifest_for(path);
+    bounds.selection_evidence = queried_selection_matrix();
+    bounds.selection_evidence.queries[0].inventory_matches = (0..17)
+        .map(|surface| SelectionInventoryMatch {
+            surface,
+            name_agrees: false,
+            version_agrees: false,
+        })
+        .collect();
+    assert!(
+        p11scope::manifest_input::validate_structure(&bounds)
+            .iter()
+            .any(|problem| problem.contains("more than 16"))
+    );
+
+    let mut null_fields = manifest_for(path);
+    null_fields.selection_evidence = queried_selection_matrix();
+    null_fields.selection_evidence.queries[0].rv = 0;
+    null_fields.selection_evidence.queries[0].authority = SelectionAuthority::Inventory;
+    null_fields.selection_evidence.queries[0].helper_failure = Some(SelectionFailure::NullOutput);
+    assert!(
+        p11scope::manifest_input::validate_structure(&null_fields)
+            .iter()
+            .any(|problem| problem.contains("null result cross-fields"))
+    );
+
+    let mut changed_result = manifest_for(path);
+    changed_result.selection_evidence = queried_selection_matrix();
+    changed_result.selection_evidence.queries[0].rv = 0;
+    changed_result.selection_evidence.queries[0].helper_failure =
+        Some(SelectionFailure::ProviderChanged);
+    assert!(
+        p11scope::manifest_input::validate_structure(&changed_result).is_empty(),
+        "provider-change may explain a safely unreadable result"
+    );
+
+    let mut unsorted = manifest_for(path);
+    unsorted.selection_evidence = queried_selection_matrix();
+    unsorted.selection_evidence.queries[0].inventory_matches = vec![
+        SelectionInventoryMatch {
+            surface: 1,
+            name_agrees: false,
+            version_agrees: false,
+        },
+        SelectionInventoryMatch {
+            surface: 0,
+            name_agrees: false,
+            version_agrees: false,
+        },
+    ];
+    assert!(
+        p11scope::manifest_input::validate_structure(&unsorted)
+            .iter()
+            .any(|problem| problem.contains("unsorted"))
+    );
+
+    let malformed_table = SelectionTable {
+        id: 0,
+        version: Version {
+            major: 2,
+            minor: 40,
+        },
+        walk: WalkOutcome::Refused,
+        functions: vec![FunctionRecord {
+            name: "C_Initialize".into(),
+            resolution: Resolution::Resolved {
+                object: 1,
+                file_offset: 0,
+            },
+        }],
+        semantic_authorized: true,
+    };
+    let mut table_fields = manifest_for(path);
+    table_fields.selection_evidence = queried_selection_matrix();
+    table_fields.selection_evidence.tables = vec![malformed_table];
+    let query = &mut table_fields.selection_evidence.queries[4];
+    query.rv = 0;
+    query.result = Some(SelectionResult {
+        name: SelectionNameClass::ExactStandard,
+        version: SelectionVersionClass::V3_0,
+        flags: 0,
+    });
+    query.selection_table = Some(0);
+    query.authority = SelectionAuthority::SelectionCountOnly;
+    let problems = p11scope::manifest_input::validate_structure(&table_fields);
+    assert!(
+        problems
+            .iter()
+            .any(|problem| problem.contains("unsupported version"))
+    );
+    assert!(problems.iter().any(|problem| problem.contains("full walk")));
+    assert!(
+        problems
+            .iter()
+            .any(|problem| problem.contains("dependency object"))
+    );
+    assert!(
+        problems
+            .iter()
+            .any(|problem| problem.contains("semantic decoding"))
+    );
+    assert!(
+        problems
+            .iter()
+            .any(|problem| problem.contains("table version disagrees"))
+    );
+
+    let mut orphan = manifest_for(path);
+    orphan.selection_evidence = queried_selection_matrix();
+    orphan.selection_evidence.tables = vec![SelectionTable {
+        id: 0,
+        version: Version { major: 3, minor: 0 },
+        walk: WalkOutcome::Full,
+        functions: vec![],
+        semantic_authorized: false,
+    }];
+    assert!(
+        p11scope::manifest_input::validate_structure(&orphan)
+            .iter()
+            .any(|problem| problem.contains("orphaned"))
+    );
+
+    let mut unexplained = manifest_for(path);
+    unexplained.selection_evidence = queried_selection_matrix();
+    unexplained.selection_evidence.selection_truncated = true;
+    unexplained.selection_evidence.queries[4].rv = 0;
+    unexplained.selection_evidence.queries[4].result = Some(SelectionResult {
+        name: SelectionNameClass::ExactStandard,
+        version: SelectionVersionClass::V3_0,
+        flags: 0,
+    });
+    assert!(
+        p11scope::manifest_input::validate_structure(&unexplained)
+            .iter()
+            .any(|problem| problem.contains("unexplained selection truncation"))
+    );
+}
+
+#[test]
+fn manifest_v4_is_rejected_precisely() {
+    let mut manifest = manifest_for(Path::new("/bin/true"));
+    manifest.schema = "p11scope-manifest/4".into();
+    let problems = p11scope::manifest_input::validate_structure(&manifest);
+    assert_eq!(problems.len(), 1);
+    assert!(problems[0].contains("p11scope-manifest/5"));
 }
 
 /// The `(device, inode)` a mapping of this file would show — the key every pin is
@@ -722,6 +1032,46 @@ fn symlink_is_pinned_and_non_executable_offsets_are_refused() {
             .collect(),
     };
     let err = p11scope::discovery::identity::pin_manifest_objects(&offset_manifest).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|problem| problem.contains("executable ELF segment")),
+        "{err:?}"
+    );
+
+    let mut selection_offset_manifest = manifest_for(&so);
+    selection_offset_manifest.selection_evidence = queried_selection_matrix();
+    selection_offset_manifest.selection_evidence.tables = vec![SelectionTable {
+        id: 0,
+        version: Version { major: 3, minor: 0 },
+        walk: WalkOutcome::Full,
+        functions: pkcs11_module::FUNCTION_LIST_FIELDS
+            .iter()
+            .chain(pkcs11_module::FUNCTION_LIST_3_0_EXTRA_FIELDS.iter())
+            .map(|field| FunctionRecord {
+                name: field.name.into(),
+                resolution: Resolution::Resolved {
+                    object: 0,
+                    file_offset: if field.name == "C_Initialize" {
+                        non_executable_offset
+                    } else {
+                        first_executable_offset(&so)
+                    },
+                },
+            })
+            .collect(),
+        semantic_authorized: false,
+    }];
+    let query = &mut selection_offset_manifest.selection_evidence.queries[4];
+    query.rv = 0;
+    query.result = Some(SelectionResult {
+        name: SelectionNameClass::ExactStandard,
+        version: SelectionVersionClass::V3_0,
+        flags: 0,
+    });
+    query.selection_table = Some(0);
+    query.authority = SelectionAuthority::SelectionCountOnly;
+    let err = p11scope::discovery::identity::pin_manifest_objects(&selection_offset_manifest)
+        .unwrap_err();
     assert!(
         err.iter()
             .any(|problem| problem.contains("executable ELF segment")),

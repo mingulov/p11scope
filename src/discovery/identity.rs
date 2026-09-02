@@ -1150,7 +1150,13 @@ pub fn pin_manifest_objects_deferred_in_views(
             }
         }
         let mut offsets_valid = true;
-        for function in m.surfaces.iter().flat_map(|surface| &surface.functions) {
+        let surface_functions = m.surfaces.iter().flat_map(|surface| &surface.functions);
+        let selection_functions = m
+            .selection_evidence
+            .tables
+            .iter()
+            .flat_map(|table| &table.functions);
+        for function in surface_functions.chain(selection_functions) {
             let Resolution::Resolved {
                 object: target,
                 file_offset,
@@ -1715,6 +1721,7 @@ mod tests {
             }],
             vendor_interfaces: vec![],
             alias_groups: vec![],
+            selection_evidence: Default::default(),
         }
     }
 

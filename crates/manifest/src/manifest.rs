@@ -1,4 +1,4 @@
-//! Probe-manifest schema v4. Offsets are ELF object-file byte offsets —
+//! Probe-manifest schema v5. Offsets are ELF object-file byte offsets —
 //! aya 0.14 `UProbeAttachLocation::AbsoluteOffset` semantics, pinned in
 //! docs/notes/aya-offset-semantics.md. Evidence (NULL entries, vendor
 //! interfaces, non-file-backed pointers, acquisition failures) is recorded,
@@ -7,9 +7,10 @@
 use crate::identity::ObjectIdentity;
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA: &str = "p11scope-manifest/4";
+pub const SCHEMA: &str = "p11scope-manifest/5";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub schema: String,
     /// The dlopen target as given on the command line.
@@ -30,6 +31,120 @@ pub struct Manifest {
     pub vendor_interfaces: Vec<VendorInterface>,
     /// ≥2 distinct logical names resolving to one {object, file_offset}.
     pub alias_groups: Vec<AliasGroup>,
+    /// Bounded, caller-dependent C_GetInterface selection evidence. This is
+    /// deliberately separate from the caller-independent inventory above.
+    pub selection_evidence: SelectionEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelectionEvidence {
+    pub acquisition: SelectionAcquisition,
+    pub queries: Vec<SelectionQuery>,
+    pub tables: Vec<SelectionTable>,
+    pub selection_truncated: bool,
+}
+
+impl Default for SelectionEvidence {
+    fn default() -> Self {
+        Self {
+            acquisition: SelectionAcquisition::ExportAbsent,
+            queries: Vec::new(),
+            tables: Vec::new(),
+            selection_truncated: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionAcquisition {
+    ExportAbsent,
+    ExportOutsideModule,
+    Queried,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionNameClass {
+    Null,
+    ExactStandard,
+    Other,
+    Unreadable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionVersionClass {
+    Null,
+    Unreadable,
+    V2_40,
+    V3_0,
+    V3_1,
+    V3_2,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionAuthority {
+    Inventory,
+    SelectionCountOnly,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionFailure {
+    NullOutput,
+    UnreadableInterface,
+    UnreadableName,
+    UnreadableVersion,
+    UnreadableTable,
+    OutsideProvider,
+    UnresolvedFunction,
+    ProviderChanged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelectionRequest {
+    pub name: SelectionNameClass,
+    pub version: SelectionVersionClass,
+    pub flags: u64,
+}
+
+pub type SelectionResult = SelectionRequest;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelectionQuery {
+    pub selector: u8,
+    pub request: SelectionRequest,
+    pub rv: u64,
+    pub result: Option<SelectionResult>,
+    pub inventory_matches: Vec<SelectionInventoryMatch>,
+    pub selection_table: Option<u8>,
+    pub authority: SelectionAuthority,
+    pub helper_failure: Option<SelectionFailure>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelectionInventoryMatch {
+    pub surface: usize,
+    pub name_agrees: bool,
+    pub version_agrees: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelectionTable {
+    pub id: u8,
+    pub version: Version,
+    pub walk: WalkOutcome,
+    pub functions: Vec<FunctionRecord>,
+    pub semantic_authorized: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -256,9 +371,10 @@ mod tests {
                 func_list_null: false,
             }],
             alias_groups: vec![],
+            selection_evidence: SelectionEvidence::default(),
         };
         let json = serde_json::to_string_pretty(&m).unwrap();
-        assert!(json.contains("\"schema\": \"p11scope-manifest/4\""));
+        assert!(json.contains("\"schema\": \"p11scope-manifest/5\""));
         assert!(json.contains("\"sha256\": \"1111"));
         assert!(json.contains("\"status\": \"null_pointer\""));
         assert!(json.contains("\"classification\": \"exact_standard\""));

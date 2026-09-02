@@ -27,7 +27,9 @@ the final 3.2 header). Exact `"PKCS 11"` interface names take the normal path.
 Alternate, null, or unreadable names are not discarded: discovery accepts a
 bounded known prefix only when the table is independently corroborated by the
 module's standard exports or legacy table, records that evidence as `PARTIAL`,
-and leaves deceptive/vendor tables undecoded. It never calls `C_GetInterface`.
+and leaves deceptive/vendor tables undecoded. The explicit offline helper
+performs ten fixed `C_GetInterface` queries before any provider initialization;
+live observation remains passive.
 
 **v0.1.0, unreleased.** See [CHANGELOG.md](CHANGELOG.md) for what is in the
 tree, and
@@ -172,7 +174,7 @@ for the CLI, live output, trace lines, and an example `observed-profile.json`.
   [docs/usage.md](docs/usage.md#honest-claims).
 - The schema is `pkcs11-scope/observed-profile/v2` for `profile` and
   `pkcs11-scope/observed-profile/v2-metrics` for `metrics`, with optional
-  discovery input at `p11scope-manifest/4`, documented at
+  discovery input at `p11scope-manifest/5`, documented at
   [docs/schema/observed-profile-v2.md](docs/schema/observed-profile-v2.md).
   Schema ids are opaque exact dispatch keys; the major/minor spelling grants
   no compatibility.
@@ -196,7 +198,9 @@ overlay instances, so every such collapse is published as uncertainty and forces
 `PARTIAL`; a distinct byte-identical instance could otherwise be under-counted.
 
 Initial discovery scans provider tables already mapped in the target and
-executes no provider code. For a command the observer owns, `p11scope run`
+executes no provider code. The explicit unprivileged `p11scope-discover`
+helper performs exactly ten bounded `C_GetInterface` compatibility queries
+before any provider initialization. For a command the observer owns, `p11scope run`
 starts capture before releasing the child and loader/export hooks react to
 later loads. The
 optional unprivileged helper (`p11scope-discover`) can prepare a manifest

@@ -2242,15 +2242,17 @@ fn scope_label(scope: &Scope) -> String {
 fn read_manifest_file(path: &Path) -> Result<Manifest> {
     let text = read_manifest(path)
         .map_err(|error| anyhow!("reading manifest {}: {error}", path.display()))?;
-    let manifest: Manifest = serde_json::from_str(&text)
+    let document: serde_json::Value = serde_json::from_str(&text)
         .with_context(|| format!("parsing manifest {}", path.display()))?;
-    if manifest.schema != SCHEMA {
+    if document.get("schema").and_then(serde_json::Value::as_str) != Some(SCHEMA) {
         bail!(
             "manifest schema mismatch: got {:?}, this build expects {SCHEMA:?}; \
              rerun `p11scope-discover` to rediscover the module",
-            manifest.schema
+            document.get("schema")
         );
     }
+    let manifest: Manifest = serde_json::from_str(&text)
+        .with_context(|| format!("parsing manifest {}", path.display()))?;
     Ok(manifest)
 }
 
@@ -16247,6 +16249,7 @@ int main(int argc, char **argv) {
             }],
             vendor_interfaces: vec![],
             alias_groups: vec![],
+            selection_evidence: Default::default(),
         }
     }
 
@@ -17452,8 +17455,13 @@ int main(int argc, char **argv) {
     }
 
     #[test]
-    fn manifest_v1_and_v2_are_rejected_with_rediscovery_instruction() {
-        for schema in ["p11scope-manifest/1", "p11scope-manifest/2"] {
+    fn legacy_manifest_schemas_are_rejected_with_rediscovery_instruction() {
+        for schema in [
+            "p11scope-manifest/1",
+            "p11scope-manifest/2",
+            "p11scope-manifest/3",
+            "p11scope-manifest/4",
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("m.json");
             std::fs::write(
@@ -17515,9 +17523,10 @@ int main(int argc, char **argv) {
             .map(|m| m.end - m.start)
             .sum();
         let hash_bytes = std::fs::metadata(&exe).unwrap().len();
+        let scan_pass = maps_bytes.len() as u64 + scan_bytes;
         let mut budget = CaptureWorkBudget::new(ScanLimits {
             per_object_bytes: scan_bytes.max(hash_bytes),
-            total_bytes: scan_bytes + hash_bytes + maps_bytes.len() as u64,
+            total_bytes: scan_pass * 2 + hash_bytes,
         });
         let hints = vec![exe];
         let hooks = HookRegistry::builtin();
@@ -18315,6 +18324,7 @@ int main(int argc, char **argv) {
             }],
             vendor_interfaces: vec![],
             alias_groups: vec![],
+            selection_evidence: Default::default(),
         };
         let manifest_pins = pin_manifest_objects(&manifest).unwrap();
         let view = scan_view(
@@ -18453,6 +18463,7 @@ int main(int argc, char **argv) {
             }],
             vendor_interfaces: vec![],
             alias_groups: vec![],
+            selection_evidence: Default::default(),
         }
     }
 

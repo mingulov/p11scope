@@ -548,8 +548,8 @@ target_root = Path(target_root)
 if not target_root.is_absolute():
     raise SystemExit(f"target root is not absolute: {target_root}")
 manifest = json.loads(Path(source).read_text(encoding="utf-8"))
-if manifest.get("schema") != "p11scope-manifest/4":
-    raise SystemExit(f"container manifest is not schema v4: {manifest.get('schema')!r}")
+if manifest.get("schema") != "p11scope-manifest/5":
+    raise SystemExit(f"container manifest is not schema v5: {manifest.get('schema')!r}")
 if not manifest.get("objects"):
     raise SystemExit("container manifest has no attach objects")
 

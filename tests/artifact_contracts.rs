@@ -1338,8 +1338,11 @@ fn task7_pristine_driver_repo() -> tempfile::TempDir {
     repo
 }
 
-/// Tripwires for every command the preflight refusal must never reach.
-fn task7_tripwire_bin() -> tempfile::TempDir {
+/// Tripwires for the mutating and build commands a preflight refusal reaches,
+/// or must never reach. The log path is baked into each stub rather than read
+/// from the environment: the seal drops every variable a stub could inherit,
+/// so an environment-driven tripwire would pass vacuously.
+fn task7_tripwire_bin(log: &std::path::Path) -> tempfile::TempDir {
     let bin = tempfile::tempdir().expect("create release preflight tripwires");
     for command in [
         "cargo", "docker", "file", "jq", "rm", "rustup", "setpriv", "sudo",
@@ -1347,7 +1350,10 @@ fn task7_tripwire_bin() -> tempfile::TempDir {
         let path = bin.path().join(command);
         fs::write(
             &path,
-            b"#!/bin/sh\nprintf '%s\\n' \"${0##*/}\" >> \"$P11SCOPE_TASK4_TRIPWIRE_LOG\"\nexit 97\n",
+            format!(
+                "#!/bin/sh\necho \"${{0##*/}}\" >> {log}\nexit 97\n",
+                log = log.display()
+            ),
         )
         .expect("write release preflight tripwire");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
@@ -1356,13 +1362,17 @@ fn task7_tripwire_bin() -> tempfile::TempDir {
     bin
 }
 
+/// The one command a sealed refusal does legitimately reach: `task4_finalize`
+/// removes the sealed bin directory once the terminal status exists. Any other
+/// name in the log is a command that escaped the refusal.
+const TASK7_EXPECTED_TRIPWIRES: &str = "rm\n";
+
 /// Runs the pristine driver against an absent evidence root, with every
 /// refused build input cleared and only `inherited` restored.
 fn task7_run_preflight(
     repo: &tempfile::TempDir,
     home: Option<&std::path::Path>,
     bin: &tempfile::TempDir,
-    tripwire: &std::path::Path,
     root: &std::path::Path,
     inherited: &[(&str, &str)],
 ) -> std::process::Output {
@@ -1370,8 +1380,17 @@ fn task7_run_preflight(
     command
         .arg(repo.path().join("scripts/build-release.sh"))
         .arg(root)
-        .env("PATH", format!("{}:/usr/bin:/bin", bin.path().display()))
-        .env("P11SCOPE_TASK4_TRIPWIRE_LOG", tripwire);
+        // The whole reached-command inventory must resolve through the
+        // caller's PATH for the seal to be built at all; the tripwires only
+        // shadow the build and mutating commands ahead of it.
+        .env(
+            "PATH",
+            format!(
+                "{}:{}:/usr/local/sbin:/usr/sbin:/sbin:/usr/local/bin:/usr/bin:/bin",
+                bin.path().display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        );
     match home {
         Some(home) => command.env("HOME", home),
         None => command.env_remove("HOME"),
@@ -1401,8 +1420,9 @@ fn release_preflight_refuses_an_untracked_cargo_config_before_the_body() {
     // source ledger, and to the tracked-cleanliness gate, yet Cargo obeys it.
     // The driver must refuse it before it touches a build command.
     let repo = task7_pristine_driver_repo();
-    let bin = task7_tripwire_bin();
     let campaign = task7_campaign();
+    let tripwire = campaign.path().join("tripwire.log");
+    let bin = task7_tripwire_bin(&tripwire);
     let home = tempfile::tempdir().expect("create release preflight home");
     fs::create_dir(home.path().join(".cargo")).expect("create untracked cargo home");
     fs::write(
@@ -1411,12 +1431,10 @@ fn release_preflight_refuses_an_untracked_cargo_config_before_the_body() {
     )
     .expect("write the untracked cargo config");
 
-    let tripwire = campaign.path().join("tripwire.log");
     let output = task7_run_preflight(
         &repo,
         Some(home.path()),
         &bin,
-        &tripwire,
         &campaign.path().join("evidence"),
         &[],
     );
@@ -1431,10 +1449,10 @@ fn release_preflight_refuses_an_untracked_cargo_config_before_the_body() {
         stderr.contains("untracked cargo config"),
         "refusal must name the untracked cargo config: stderr={stderr:?}"
     );
-    assert!(
-        !tripwire.exists(),
-        "refusal reached a build command: {:?}",
-        fs::read_to_string(&tripwire).unwrap_or_default()
+    assert_eq!(
+        fs::read_to_string(&tripwire).unwrap_or_default(),
+        TASK7_EXPECTED_TRIPWIRES,
+        "refusal reached a command beyond the finalizer's sealed-directory removal"
     );
     let residue = Command::new("git")
         .arg("-C")
@@ -1455,17 +1473,16 @@ fn release_preflight_refuses_every_inherited_build_input_variable() {
     // clean fixture proves the refusal is per-variable and not an accident of
     // the earlier untracked-config gate.
     let repo = task7_pristine_driver_repo();
-    let bin = task7_tripwire_bin();
     let campaign = task7_campaign();
+    let tripwire = campaign.path().join("tripwire.log");
+    let bin = task7_tripwire_bin(&tripwire);
     let home = tempfile::tempdir().expect("create release preflight home");
 
     for (index, variable) in TASK7_BUILD_INPUT_VARIABLES.iter().enumerate() {
-        let tripwire = campaign.path().join(format!("tripwire-{index}.log"));
         let output = task7_run_preflight(
             &repo,
             Some(home.path()),
             &bin,
-            &tripwire,
             &campaign.path().join(format!("evidence-{index}")),
             &[(variable, "/task7/poisoned")],
         );
@@ -1486,8 +1503,12 @@ fn release_preflight_refuses_every_inherited_build_input_variable() {
         );
         assert!(
             !tripwire.exists(),
-            "inherited {variable} reached a build command: {:?}",
+            "inherited {variable} reached a command: {:?}",
             fs::read_to_string(&tripwire).unwrap_or_default()
+        );
+        assert!(
+            !campaign.path().join(format!("evidence-{index}")).exists(),
+            "inherited {variable} was refused only after the evidence root existed"
         );
     }
 }
@@ -1498,17 +1519,10 @@ fn release_preflight_refuses_an_unevaluable_cargo_home() {
     // Cargo can still reach one through the passwd database. Checking
     // `/.cargo` instead would vouch for a location Cargo never reads.
     let repo = task7_pristine_driver_repo();
-    let bin = task7_tripwire_bin();
     let campaign = task7_campaign();
     let tripwire = campaign.path().join("tripwire.log");
-    let output = task7_run_preflight(
-        &repo,
-        None,
-        &bin,
-        &tripwire,
-        &campaign.path().join("evidence"),
-        &[],
-    );
+    let bin = task7_tripwire_bin(&tripwire);
+    let output = task7_run_preflight(&repo, None, &bin, &campaign.path().join("evidence"), &[]);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert_eq!(
@@ -1520,10 +1534,10 @@ fn release_preflight_refuses_an_unevaluable_cargo_home() {
         stderr.contains("cannot evaluate the effective cargo home"),
         "refusal must name the unevaluable cargo home: stderr={stderr:?}"
     );
-    assert!(
-        !tripwire.exists(),
-        "unevaluable cargo home reached a build command: {:?}",
-        fs::read_to_string(&tripwire).unwrap_or_default()
+    assert_eq!(
+        fs::read_to_string(&tripwire).unwrap_or_default(),
+        TASK7_EXPECTED_TRIPWIRES,
+        "unevaluable cargo home reached a command beyond the sealed-directory removal"
     );
 }
 
@@ -1592,6 +1606,521 @@ fn release_preflight_pins_its_tools_before_the_first_digest() {
     assert!(
         pinned < first_digest,
         "the first digest runs before the tool-pinning loop, so it resolves sha256sum through PATH"
+    );
+}
+
+/// Every external command the receipt chain reaches, in the exact `LC_ALL=C`
+/// order the driver pins, symlinks into its sealed bin directory, and
+/// self-checks. Derived statically from `scripts/build-release.sh` (including
+/// its `cd`/`dirname` line and `task4_finalize`), `scripts/lib.sh`, the three
+/// nested gate scripts, and `build.rs`'s nightly Cargo invocation plus the
+/// linker drivers rustc reaches through PATH -- then proven by execution
+/// under the seal. Shell builtins are excluded. Commands that run under
+/// `sudo` resolve through sudo's root-owned `secure_path`, and commands
+/// inside a container resolve through the image, so neither is under the
+/// caller's PATH authority and neither is a member.
+const TASK11_TOOL_INVENTORY: &[&str] = &[
+    "awk",
+    "bpf-linker",
+    "bpftool",
+    "cargo",
+    "cat",
+    "cc",
+    "chmod",
+    "cmp",
+    "cp",
+    "date",
+    "dirname",
+    "docker",
+    "env",
+    "file",
+    "find",
+    "flock",
+    "gcc",
+    "git",
+    "grep",
+    "head",
+    "id",
+    "jq",
+    "ldd",
+    "ln",
+    "ls",
+    "mkdir",
+    "mktemp",
+    "mv",
+    "python3",
+    "realpath",
+    "rm",
+    "rustup",
+    "sed",
+    "setpriv",
+    "sh",
+    "sha256sum",
+    "sleep",
+    "softhsm2-util",
+    "sort",
+    "stat",
+    "sudo",
+    "sync",
+    "tail",
+    "timeout",
+    "touch",
+    "uname",
+    "xargs",
+];
+
+/// The exact environment name set the sealed child may observe. `env -i`
+/// supplies seven of them; dash itself adds `PWD` and nothing else.
+const TASK11_SEALED_ENVIRONMENT: &[&str] = &[
+    "HOME",
+    "LC_ALL",
+    "OLDPWD",
+    "P11SCOPE_TASK4_CALLER_ARGV0",
+    "P11SCOPE_TASK4_CALLER_PATH",
+    "P11SCOPE_TASK4_SEALED",
+    "P11SCOPE_TASK4_SEALED_BIN",
+    "PATH",
+    "PWD",
+];
+
+struct SealedDriverRun {
+    output: std::process::Output,
+    root: std::path::PathBuf,
+    repo: std::path::PathBuf,
+    facts: String,
+    tripwire_log: std::path::PathBuf,
+    environment_dump: std::path::PathBuf,
+    seal_parent: std::path::PathBuf,
+    _repo: tempfile::TempDir,
+    _fixture: tempfile::TempDir,
+}
+
+impl SealedDriverRun {
+    fn fact(&self, name: &str) -> Option<&str> {
+        self.facts.lines().find_map(|line| {
+            line.strip_prefix(name)
+                .and_then(|rest| rest.strip_prefix('\t'))
+        })
+    }
+
+    fn tripped(&self) -> String {
+        fs::read_to_string(&self.tripwire_log).unwrap_or_default()
+    }
+
+    fn stderr(&self) -> String {
+        String::from_utf8_lossy(&self.output.stderr).into_owned()
+    }
+}
+
+/// Runs the pristine driver until it reaches the pinned `sudo -n true` probe
+/// -- the first external command the receipt chain executes that a test can
+/// own -- with `sudo` replaced by a stub that is the seal's positive control:
+/// it records that it ran, dumps the environment it was handed, and plants a
+/// tripwire named for every inventory member into a directory that is FIRST
+/// in the caller's PATH. Nothing the driver runs afterwards may reach one.
+/// `rustup` is stubbed too so the 1.88 toolchain probe succeeds under the
+/// fixture HOME. Stub paths are baked in, never inherited: the seal drops
+/// every variable a stub could otherwise read.
+fn task11_run_to_the_sudo_probe(extra_env: &[(&str, &str)]) -> SealedDriverRun {
+    let repo = task7_pristine_driver_repo();
+    let fixture = tempfile::tempdir().expect("create sealed release-driver fixture");
+    let fake_bin = fixture.path().join("bin");
+    let tripwire_bin = fixture.path().join("tripwire-bin");
+    let home = fixture.path().join("home");
+    let seal_parent = fixture.path().join("tmp");
+    let campaign = fixture.path().join("campaign");
+    for directory in [&fake_bin, &tripwire_bin, &home, &seal_parent, &campaign] {
+        fs::create_dir(directory).expect("create sealed release-driver fixture directory");
+    }
+    fs::set_permissions(&campaign, fs::Permissions::from_mode(0o700))
+        .expect("make the campaign parent private");
+
+    let tripwire_log = fixture.path().join("tripwire.log");
+    let environment_dump = fixture.path().join("sealed-environment");
+    let toolchain = fixture.path().join("toolchain-binary");
+    fs::write(&toolchain, b"#!/bin/sh\nexit 0\n").expect("write toolchain fixture binary");
+    fs::set_permissions(&toolchain, fs::Permissions::from_mode(0o700))
+        .expect("make the toolchain fixture binary executable");
+
+    let stub = |name: &str, body: String| {
+        let path = fake_bin.join(name);
+        fs::write(&path, body).expect("write sealed release-driver stub");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+            .expect("make the sealed release-driver stub executable");
+    };
+    stub(
+        "rustup",
+        format!(
+            "#!/bin/sh\ncase \"$*\" in\n\"which --toolchain 1.88 cargo\"|\"which --toolchain 1.88 rustc\")\n    echo {toolchain}; exit 0 ;;\nesac\nexit 1\n",
+            toolchain = toolchain.display()
+        ),
+    );
+    stub(
+        "sudo",
+        format!(
+            "#!/bin/sh\n\
+             echo \"${{0##*/}}\" >> {log}\n\
+             env > {dump}\n\
+             for name in {inventory}; do\n\
+             \x20   printf '#!/bin/sh\\necho \"${{0##*/}}\" >> {log}\\nexit 97\\n' > \"{bin}/$name\"\n\
+             \x20   chmod 700 \"{bin}/$name\"\n\
+             done\n\
+             exit 1\n",
+            log = tripwire_log.display(),
+            dump = environment_dump.display(),
+            bin = tripwire_bin.display(),
+            inventory = TASK11_TOOL_INVENTORY.join(" "),
+        ),
+    );
+
+    let root = campaign.join("evidence");
+    let caller_path = format!(
+        "{}:{}:{}:/usr/local/sbin:/usr/sbin:/sbin:/usr/local/bin:/usr/bin:/bin",
+        tripwire_bin.display(),
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut command = Command::new("/bin/sh");
+    command
+        .arg(repo.path().join("scripts/build-release.sh"))
+        .arg(&root)
+        .env("PATH", &caller_path)
+        .env("HOME", &home)
+        .env("TMPDIR", &seal_parent);
+    for name in TASK7_BUILD_INPUT_VARIABLES {
+        command.env_remove(name);
+    }
+    for (name, value) in extra_env {
+        command.env(name, value);
+    }
+    let output = command.output().expect("run the sealed release driver");
+    let facts = fs::read_to_string(root.join("facts.log")).unwrap_or_default();
+    SealedDriverRun {
+        output,
+        root,
+        repo: repo.path().to_path_buf(),
+        facts,
+        tripwire_log,
+        environment_dump,
+        seal_parent,
+        _repo: repo,
+        _fixture: fixture,
+    }
+}
+
+#[test]
+fn release_seal_denies_the_caller_path_to_every_reached_command() {
+    // csf_014eb65 / shadow finding 3: bare PATH-resolved commands establish
+    // HEAD, the source ledger, every digest, and the receipt itself. The
+    // ratified rule (W1 plan line 417) is that no inherited PATH authority
+    // survives anywhere in the receipt chain, so the closure is a sealed
+    // execution environment, not a longer hand-maintained tool list.
+    let run = task11_run_to_the_sudo_probe(&[]);
+    let stderr = run.stderr();
+
+    assert_eq!(
+        run.output.status.code(),
+        Some(77),
+        "the stubbed sudo probe must refuse the run: stderr={stderr:?}"
+    );
+    // The positive control proves the tripwire mechanism itself works: the
+    // one command legitimately reached after the seal did write the log.
+    assert_eq!(
+        run.tripped(),
+        "sudo\n",
+        "exactly the positive control may appear in the tripwire log"
+    );
+    assert_eq!(
+        fs::read_to_string(run.root.join("status"))
+            .expect("the refusal still writes its terminal status"),
+        "77\n"
+    );
+
+    let sealed_bin = run
+        .fact("sealed_bin")
+        .expect("the receipt records the sealed bin directory");
+    assert!(
+        !std::path::Path::new(sealed_bin).exists(),
+        "finalization left the sealed bin directory behind: {sealed_bin}"
+    );
+    assert_eq!(
+        fs::read_dir(&run.seal_parent)
+            .expect("read the seal parent")
+            .count(),
+        0,
+        "the seal parent still holds sealed-run residue"
+    );
+    // Every inventory member -- not the nine-name floor -- is recorded with
+    // the path the seal selects, what the caller's PATH resolves it to, and
+    // the pinned binary's digest.
+    for tool in TASK11_TOOL_INVENTORY {
+        let row = run
+            .fact(&format!("tool_{tool}"))
+            .unwrap_or_else(|| panic!("the receipt tool ledger omits {tool}"));
+        let fields: Vec<&str> = row.split(' ').collect();
+        assert_eq!(fields.len(), 3, "malformed tool_{tool} row: {row:?}");
+        assert!(
+            fields[0].starts_with('/') && fields[0] == fields[1],
+            "tool_{tool} must pin one absolute path the caller's PATH still resolves: {row:?}"
+        );
+        assert!(
+            fields[2].len() == 64 && fields[2].bytes().all(|b| b.is_ascii_hexdigit()),
+            "tool_{tool} must carry the pinned binary's digest: {row:?}"
+        );
+    }
+
+    let caller_path = run
+        .fact("caller_path")
+        .expect("the receipt records the caller's PATH");
+    assert!(
+        caller_path
+            .split(':')
+            .any(|entry| entry.ends_with("tripwire-bin")),
+        "the recorded caller PATH is not the PATH the driver was handed: {caller_path}"
+    );
+}
+
+#[test]
+fn release_seal_exports_exactly_the_reviewed_environment() {
+    // Shadow finding 6: RUSTC_WORKSPACE_WRAPPER re-steers the official build,
+    // PYTHONPATH/PYTHONHOME re-steer both Python steps, and the GIT_* family
+    // re-steers the source authority itself -- none of them recorded. The
+    // driver runs under an explicit allowlist instead of a longer denylist.
+    let planted = [
+        ("RUSTC_WORKSPACE_WRAPPER", "/task11/wrapper"),
+        ("P11SCOPE_SMALL_RING", "1"),
+        ("PYTHONPATH", "/task11/python"),
+        ("PYTHONHOME", "/task11/pythonhome"),
+        ("GIT_DIR", "/task11/git"),
+        ("GIT_WORK_TREE", "/task11/worktree"),
+        ("GIT_INDEX_FILE", "/task11/index"),
+        ("GIT_CONFIG_GLOBAL", "/task11/gitconfig"),
+        ("DOCKER_HOST", "tcp://task11.invalid:2375"),
+        ("LANG", "en_US.UTF-8"),
+    ];
+    let run = task11_run_to_the_sudo_probe(&planted);
+    assert_eq!(
+        run.output.status.code(),
+        Some(77),
+        "the stubbed sudo probe must refuse the run: stderr={:?}",
+        run.stderr()
+    );
+
+    let dumped = fs::read_to_string(&run.environment_dump)
+        .expect("the positive control dumped the sealed environment");
+    let mut names: Vec<&str> = dumped
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(name, _)| name)
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names, TASK11_SEALED_ENVIRONMENT,
+        "the sealed child saw an environment outside its allowlist: {dumped:?}"
+    );
+    for (name, _) in planted {
+        assert!(
+            !dumped.contains(&format!("{name}=")),
+            "planted {name} survived the seal: {dumped:?}"
+        );
+    }
+    let value = |name: &str| {
+        dumped
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert_eq!(value("LC_ALL"), "C");
+    assert_eq!(value("P11SCOPE_TASK4_SEALED"), "1");
+    assert_eq!(
+        value("PATH"),
+        value("P11SCOPE_TASK4_SEALED_BIN"),
+        "PATH must be exactly the sealed bin directory"
+    );
+    let driver_head = String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(&run.repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("read the driver repository HEAD")
+            .stdout,
+    )
+    .expect("UTF-8 HEAD");
+    assert_eq!(
+        run.fact("head"),
+        Some(driver_head.trim()),
+        "an inherited GIT_DIR must never decide the recorded HEAD"
+    );
+}
+
+#[test]
+fn release_refuses_a_forged_seal_marker() {
+    // A caller who merely exports the marker must not skip the seal: the
+    // exact-name-set self-check refuses the extra variables it inherited.
+    let repo = task7_pristine_driver_repo();
+    let campaign = task7_campaign();
+    let home = tempfile::tempdir().expect("create forged-marker home");
+    let root = campaign.path().join("evidence");
+    let mut command = Command::new("/bin/sh");
+    command
+        .arg(repo.path().join("scripts/build-release.sh"))
+        .arg(&root)
+        .env("HOME", home.path())
+        .env("P11SCOPE_TASK4_SEALED", "1");
+    for name in TASK7_BUILD_INPUT_VARIABLES {
+        command.env_remove(name);
+    }
+    let output = command
+        .output()
+        .expect("run the driver with a forged marker");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(77),
+        "a forged seal marker must refuse: stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("unsealed or forged"),
+        "the refusal must name the forged seal: stderr={stderr:?}"
+    );
+    assert!(
+        !root.exists(),
+        "the forged marker created an evidence root before refusing"
+    );
+
+    // The forgery that matters: a caller who reproduces the seal's shape --
+    // a private 0700 directory holding exactly the inventory as symlinks,
+    // PATH pointing at it, all four markers set -- but keeps one variable of
+    // its own. Only the exact-name-set check separates that from the real
+    // seal, and it must refuse before any root exists.
+    let forged_bin = campaign.path().join("forged-bin");
+    fs::create_dir(&forged_bin).expect("create the forged sealed bin");
+    fs::set_permissions(&forged_bin, fs::Permissions::from_mode(0o700)).unwrap();
+    for tool in TASK11_TOOL_INVENTORY {
+        let resolved = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("command -v {tool}"))
+            .output()
+            .expect("resolve an inventory tool");
+        assert!(
+            resolved.status.success(),
+            "inventory member {tool} is absent from this host's PATH"
+        );
+        std::os::unix::fs::symlink(
+            String::from_utf8_lossy(&resolved.stdout).trim(),
+            forged_bin.join(tool),
+        )
+        .expect("link the forged sealed bin");
+    }
+    let forged_root = campaign.path().join("forged-evidence");
+    let forged = Command::new("/bin/sh")
+        .env_clear()
+        .arg(repo.path().join("scripts/build-release.sh"))
+        .arg(&forged_root)
+        .env("PATH", &forged_bin)
+        .env("HOME", home.path())
+        .env("LC_ALL", "C")
+        .env("P11SCOPE_TASK4_SEALED", "1")
+        .env("P11SCOPE_TASK4_SEALED_BIN", &forged_bin)
+        .env("P11SCOPE_TASK4_CALLER_PATH", "/forged")
+        .env("P11SCOPE_TASK4_CALLER_ARGV0", "forged")
+        .env("PYTHONPATH", "/task11/forged-python")
+        .output()
+        .expect("run the driver with a reproduced seal plus one extra variable");
+    let forged_stderr = String::from_utf8_lossy(&forged.stderr);
+    assert_eq!(
+        forged.status.code(),
+        Some(77),
+        "one variable outside the allowlist must refuse: stderr={forged_stderr:?}"
+    );
+    assert!(
+        forged_stderr.contains("unsealed or forged"),
+        "the refusal must name the forged seal: stderr={forged_stderr:?}"
+    );
+    assert!(
+        !forged_root.exists(),
+        "the forged seal created an evidence root before refusing"
+    );
+}
+
+#[test]
+fn release_pins_its_reached_command_inventory_and_sealed_environment() {
+    let release = read("scripts/build-release.sh");
+
+    let inventory: Vec<&str> = between(&release, "\nTASK4_TOOL_INVENTORY='", "'")
+        .split_whitespace()
+        .collect();
+    assert_eq!(
+        inventory, TASK11_TOOL_INVENTORY,
+        "the driver's reached-command inventory drifted from the contract"
+    );
+    let mut ordered = TASK11_TOOL_INVENTORY.to_vec();
+    ordered.sort_unstable();
+    assert_eq!(
+        ordered, TASK11_TOOL_INVENTORY,
+        "the inventory must stay in LC_ALL=C order: the seal compares it to `ls -A1` directly"
+    );
+    assert_eq!(
+        between(&release, "\nTASK4_SEALED_ENVIRONMENT='", "'")
+            .lines()
+            .collect::<Vec<_>>(),
+        TASK11_SEALED_ENVIRONMENT,
+        "the driver's sealed-environment allowlist drifted from the contract"
+    );
+
+    // The seal is built in the unsealed parent, before any root, lock, git,
+    // tool, or cargo-config decision -- and after the ten explicit refusals,
+    // which stay recognisable named signals rather than becoming a silent drop.
+    let bootstrap = between(&release, "\ntask4_seal_and_reexec() {", "\n}\n");
+    let refusal = bootstrap
+        .find("echo \"refusing inherited $t4_var\" >&2; exit 77;")
+        .expect("the bootstrap refuses each inherited build input by name");
+    let reexec = bootstrap
+        .find("exec \"$t4_seal_env\" -i")
+        .expect("the bootstrap re-execs under an emptied environment");
+    assert!(
+        refusal < reexec,
+        "the inherited-build-input refusals must precede the re-exec"
+    );
+    let seal = release
+        .find("task4_seal_and_reexec \"$1\"")
+        .expect("the driver seals its environment before the receipt chain");
+    for later in [
+        "\n    task4_prepare_root \"$1\"",
+        "TASK4_HEAD=$(git rev-parse HEAD)",
+        "TASK4_CONFIGS=$(task4_cargo_config_scan)",
+        "\"$T4_TOOL_sudo\" -n true",
+    ] {
+        assert!(
+            seal < release
+                .find(later)
+                .unwrap_or_else(|| panic!("missing {later}")),
+            "the seal must precede {later}"
+        );
+    }
+
+    // The ledger covers every inventory member, not the nine-name floor.
+    assert!(
+        release.contains("for t4_tool in $TASK4_TOOL_INVENTORY; do"),
+        "the tool ledger still walks a hand-maintained name list"
+    );
+    assert!(
+        release.contains("PATH=\"$P11SCOPE_TASK4_CALLER_PATH\" command -v"),
+        "the ledger never re-resolves the caller's PATH, so a divergence cannot refuse"
+    );
+    // The sealed bin directory is evidence until the receipt status exists.
+    let finalize = between(&release, "\ntask4_finalize() {", "\ntask4_receipt_run() {");
+    let status = finalize
+        .find("printf '%s\\n' \"$t4_result\" > \"$TASK4_ROOT/status\"")
+        .expect("finalization writes the terminal status");
+    let removal = finalize
+        .find("rm -rf \"$P11SCOPE_TASK4_SEALED_BIN\"")
+        .expect("finalization removes the sealed bin directory");
+    assert!(
+        status < removal,
+        "the sealed bin directory is removed before the receipt status is written"
     );
 }
 
@@ -3220,6 +3749,11 @@ fn task4_receipt_drivers_execute_behavioral_self_tests() {
         "literal-static-smoke-capture-path-exact-accepted",
         "decoy-observed-json-under-work-rejected",
         "aggregate-stdout-as-checker-evidence-rejected",
+        "sealed-command-inventory-pinned-before-root-and-git-decisions",
+        "sealed-environment-allowlist-exact-accepted",
+        "forged-seal-marker-rejected",
+        "inventory-wide-tool-ledger-exact-accepted",
+        "sealed-bin-removed-after-terminal-status",
     ];
     const LANE16_CASES: &[&str] = &[
         "never-68-68-136-one-timing-zero-loss-ambiguity-inflight-child-false-none-0-0-0-exact-accepted",

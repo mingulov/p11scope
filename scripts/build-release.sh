@@ -125,7 +125,12 @@ recorded-tool-replaced-between-preflight-and-finalization-rejected
 path-change-resolving-a-different-binary-rejected
 literal-static-smoke-capture-path-exact-accepted
 decoy-observed-json-under-work-rejected
-aggregate-stdout-as-checker-evidence-rejected""".splitlines()
+aggregate-stdout-as-checker-evidence-rejected
+sealed-command-inventory-pinned-before-root-and-git-decisions
+sealed-environment-allowlist-exact-accepted
+forged-seal-marker-rejected
+inventory-wide-tool-ledger-exact-accepted
+sealed-bin-removed-after-terminal-status""".splitlines()
 
 good={"owners":1,"child_status":False,"facts":["43:99","hash"],"executables":["p11scope","p11scope-discover","p11scope-discover-glibc","p11scope-discover-musl"],"softhsm":68,"fixture":[68,92,104],"static":[68,68,136]}
 def lane_valid(d):
@@ -202,6 +207,31 @@ def checker_evidence_framed(text):
     return (len(lines)>=2 and lines[0].startswith("argv\t") and "check-capture-evidence.py" in lines[0]
             and lines[-1].startswith("status\t") and lines[-1].split("\t",1)[1].isdigit())
 mark(lane[23],checker_evidence_framed(framed) and not checker_evidence_framed(aggregate))
+# csf_014eb65 / shadow findings 3+6: the receipt chain runs sealed. The ten
+# inherited build inputs are refused by name first, then the whole reached
+# command inventory is pinned and re-exec'd under an exact environment
+# allowlist -- all before any root, git, tool, or body decision.
+seal_steps=["refuse-inherited-build-inputs","pin-reached-command-inventory","seal","verify-seal",
+            "prepare-root","git-head","pin-tools","tool-ledger","body"]
+def seal_before(a,b): return seal_steps.index(a)<seal_steps.index(b)
+mark(lane[24],all(seal_before("refuse-inherited-build-inputs",step) for step in ("seal","prepare-root","git-head"))
+     and all(seal_before("seal",step) for step in ("verify-seal","prepare-root","git-head","pin-tools","body")))
+sealed_environment={"HOME","LC_ALL","OLDPWD","P11SCOPE_TASK4_CALLER_ARGV0","P11SCOPE_TASK4_CALLER_PATH",
+                    "P11SCOPE_TASK4_SEALED","P11SCOPE_TASK4_SEALED_BIN","PATH","PWD"}
+steering={"RUSTC_WORKSPACE_WRAPPER","P11SCOPE_SMALL_RING","PYTHONPATH","PYTHONHOME","GIT_DIR",
+          "GIT_WORK_TREE","GIT_INDEX_FILE","GIT_CONFIG_GLOBAL","DOCKER_HOST","TMPDIR","LANG"}
+def seal_accepts(names): return names==sealed_environment
+mark(lane[25],seal_accepts(set(sealed_environment)) and not seal_accepts(sealed_environment|steering)
+     and not sealed_environment&steering)
+mark(lane[26],not seal_accepts({"P11SCOPE_TASK4_SEALED"}|steering)
+     and "prepare-root" not in seal_steps[:seal_steps.index("verify-seal")])
+reached={"git","awk","sort","xargs","realpath","find","cp","sh","stat","id","mkdir","flock","cmp",
+         "chmod","date","sync","rm","grep","ldd","cat","ls","cc","gcc","env","ln","mktemp"}
+floor={"cargo","docker","file","jq","python3","rustup","setpriv","sudo","sha256sum"}
+mark(lane[27],not reached<=floor and bool(reached-floor) and reached<=reached|floor)
+finalization=["body","evidence-checks","terminal-status","remove-sealed-bin"]
+mark(lane[28],finalization.index("terminal-status")<finalization.index("remove-sealed-bin")
+     and finalization[-1]=="remove-sealed-bin")
 
 if len(rows)!=len(common)+len(lane) or len(rows)!=len(set(rows)): raise SystemExit("row coverage")
 report.parent.mkdir(parents=True,exist_ok=True);fd=os.open(report,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
@@ -254,6 +284,37 @@ task4_fact() { printf '%s\t%s\n' "$1" "$2" >> "$TASK4_FACTS"; }
 TASK4_BUILD_INPUTS='RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_TARGET_DIR CARGO_BUILD_TARGET
 CARGO_HOME RUSTUP_HOME RUSTUP_TOOLCHAIN RUSTC_WRAPPER CC CFLAGS'
 
+# Every external command the receipt chain reaches, in LC_ALL=C order. The
+# chain runs sealed: the unsealed parent resolves each name once through the
+# caller's PATH, pins it to an absolute non-symlink executable, and symlinks
+# it into a private 0700 directory that becomes the sealed child's entire
+# PATH. Symlinks rather than copies or rewritten call sites because the rustup
+# proxy dispatches on argv[0], so `cargo +nightly-2026-05-20` from build.rs
+# still selects its own toolchain. Commands run under `sudo` resolve through
+# sudo's root-owned secure_path and commands inside a container resolve
+# through the image, so neither is under the caller's PATH authority and
+# neither is a member. An incomplete inventory fails closed as "not found"
+# under the seal; it never falls back to the caller's PATH.
+TASK4_TOOL_INVENTORY='awk bpf-linker bpftool cargo cat cc chmod cmp cp date
+dirname docker env file find flock gcc git grep head id jq ldd ln ls mkdir
+mktemp mv python3 realpath rm rustup sed setpriv sh sha256sum sleep
+softhsm2-util sort stat sudo sync tail timeout touch uname xargs'
+
+# The exact environment the sealed child may observe. `env -i` supplies seven
+# of these; dash itself adds PWD and, because line 26 `cd`s, OLDPWD. Nothing
+# else survives -- the set was pinned by observation, not by assumption. The
+# comparison is exact, so a P11SCOPE_TASK4_SEALED forged by the caller refuses
+# on the variables it also inherited instead of skipping the seal.
+TASK4_SEALED_ENVIRONMENT='HOME
+LC_ALL
+OLDPWD
+P11SCOPE_TASK4_CALLER_ARGV0
+P11SCOPE_TASK4_CALLER_PATH
+P11SCOPE_TASK4_SEALED
+P11SCOPE_TASK4_SEALED_BIN
+PATH
+PWD'
+
 # An untracked `.cargo/config.toml` is invisible to `git ls-files`, to the
 # source ledger, and to the cleanliness gate, yet Cargo obeys it. Report every
 # one Cargo would consult: each repository ancestor up to /, then the effective
@@ -288,14 +349,92 @@ task4_pin_tool() {
     eval "$2=\$t4_path"
 }
 
-# One row per pinned tool: the path the driver invokes, what the current PATH
-# (or rustup) resolves that name to now, and the pinned binary's digest.
-# Re-running this at finalization catches an in-place replacement and a PATH
-# that resolves a different binary alike -- both refuse, neither warns.
+# Resolve one inventory name through the CALLER's PATH and print its pinned
+# absolute path. Used only by the unsealed bootstrap.
+task4_seal_pin() {
+    t4_found=$(command -v "$1") || return 1
+    task4_pin_tool "$t4_found" t4_seal_pinned || return 1
+    printf '%s\n' "$t4_seal_pinned"
+}
+
+# The bootstrap, in the unsealed parent. Refuse the inherited build inputs as
+# explicit named signals, pin the whole reached-command inventory once, and
+# re-exec this same driver under `env -i` with the sealed directory as its
+# entire PATH and an exact environment allowlist. Nothing after this point
+# resolves a command, or reads a variable, that the caller still controls.
+# A HOME, PATH, or argv[0] carrying a tab or newline cannot be recorded as one
+# TSV fact row, so it is a refusal rather than a corrupted receipt.
+task4_seal_and_reexec() {
+    for t4_var in $TASK4_BUILD_INPUTS; do
+        eval "t4_value=\${$t4_var-}"
+        [ -z "$t4_value" ] || { echo "refusing inherited $t4_var" >&2; exit 77; }
+    done
+    t4_tab=$(printf '\t'); t4_nl=$(printf '\nx'); t4_nl=${t4_nl%x}
+    for t4_value in "${HOME-}" "$PATH" "$0"; do
+        case $t4_value in
+            *"$t4_nl"*|*"$t4_tab"*)
+                echo "refusing an unrecordable HOME, PATH, or argv[0]" >&2; exit 77 ;;
+        esac
+    done
+    t4_driver=$(pwd -P)/scripts/build-release.sh
+    for t4_tool in mktemp ln env sh rm; do
+        t4_pinned=$(task4_seal_pin "$t4_tool") \
+            || { echo "release tool not usable: $t4_tool" >&2; exit 77; }
+        eval "t4_seal_$t4_tool=\$t4_pinned"
+    done
+    umask 077
+    t4_seal_bin=$("$t4_seal_mktemp" -d "${TMPDIR:-/tmp}/p11scope-task4-seal-XXXXXX") \
+        || { echo "cannot create the sealed release bin directory" >&2; exit 77; }
+    for t4_tool in $TASK4_TOOL_INVENTORY; do
+        t4_pinned=$(task4_seal_pin "$t4_tool") \
+            && "$t4_seal_ln" -s "$t4_pinned" "$t4_seal_bin/$t4_tool" \
+            || { "$t4_seal_rm" -rf "$t4_seal_bin" || :
+                 echo "release tool not usable: $t4_tool" >&2; exit 77; }
+    done
+    exec "$t4_seal_env" -i \
+        PATH="$t4_seal_bin" \
+        HOME="${HOME-}" \
+        LC_ALL=C \
+        P11SCOPE_TASK4_SEALED=1 \
+        P11SCOPE_TASK4_SEALED_BIN="$t4_seal_bin" \
+        P11SCOPE_TASK4_CALLER_PATH="$PATH" \
+        P11SCOPE_TASK4_CALLER_ARGV0="$0" \
+        "$t4_seal_sh" "$t4_driver" "$1"
+    "$t4_seal_rm" -rf "$t4_seal_bin" || :
+    echo "cannot enter the sealed release environment" >&2
+    exit 77
+}
+
+# The sealed child's own check, before it takes any authority: the exported
+# name set, the PATH, and the sealed directory's ownership, mode and exact
+# contents all have to be what the bootstrap built.
+task4_verify_seal() {
+    [ "${P11SCOPE_TASK4_SEALED-}" = 1 ] || return 1
+    t4_bin=${P11SCOPE_TASK4_SEALED_BIN-}
+    case $t4_bin in /*) ;; *) return 1 ;; esac
+    [ "$PATH" = "$t4_bin" ] || return 1
+    [ "${LC_ALL-}" = C ] || return 1
+    [ ! -L "$t4_bin" ] && [ -d "$t4_bin" ] || return 1
+    [ "$(env | awk -F= '/^[A-Za-z_][A-Za-z0-9_]*=/ { print $1 }' | LC_ALL=C sort)" \
+        = "$TASK4_SEALED_ENVIRONMENT" ] || return 1
+    [ "$(stat -Lc %u:%a "$t4_bin")" = "$(id -u):700" ] || return 1
+    [ "$(ls -A1 "$t4_bin")" = "$(printf '%s\n' $TASK4_TOOL_INVENTORY)" ] || return 1
+    for t4_tool in $TASK4_TOOL_INVENTORY; do
+        [ -L "$t4_bin/$t4_tool" ] && [ -x "$t4_bin/$t4_tool" ] || return 1
+    done
+}
+
+# One row per inventory member: the path the sealed directory selects, what
+# the CALLER's PATH resolves that same name to now, and the pinned binary's
+# digest. Re-running this at finalization catches an in-place replacement and
+# a caller PATH that resolves a different binary alike -- both refuse, neither
+# warns. `task4_digest` pipes the pinned sha256sum through `awk`, itself a
+# sealed inventory member, so no unrecorded executable can decide a recorded
+# digest.
 task4_tool_ledger() {
-    for t4_tool in cargo docker file jq python3 rustup setpriv sudo sha256sum; do
-        eval "t4_pinned=\$T4_TOOL_$t4_tool"
-        t4_found=$(command -v "$t4_tool") || return 1
+    for t4_tool in $TASK4_TOOL_INVENTORY; do
+        t4_pinned=$(realpath -e "$P11SCOPE_TASK4_SEALED_BIN/$t4_tool") || return 1
+        t4_found=$(PATH="$P11SCOPE_TASK4_CALLER_PATH" command -v "$t4_tool") || return 1
         t4_now=$(realpath -e "$t4_found") || return 1
         printf 'tool_%s\t%s %s %s\n' \
             "$t4_tool" "$t4_pinned" "$t4_now" "$(task4_digest "$t4_pinned")" || return 1
@@ -376,12 +515,20 @@ PY
     else
         t4_result=1
     fi
+    # The sealed directory is the receipt's own tool evidence: it stays until
+    # the terminal status exists, never earlier.
+    rm -rf "$P11SCOPE_TASK4_SEALED_BIN"
     exit "$t4_result"
 }
 
 task4_receipt_run() {
     [ "$#" -eq 1 ] || { echo "usage: $0 --self-test | ABSENT_EVIDENCE_ROOT" >&2; exit 2; }
-    task4_prepare_root "$1" || { echo "invalid Task 4 evidence root" >&2; exit 77; }
+    if [ -z "${P11SCOPE_TASK4_SEALED-}" ]; then task4_seal_and_reexec "$1"; fi
+    task4_verify_seal \
+        || { echo "refusing an unsealed or forged release environment" >&2; exit 77; }
+    task4_prepare_root "$1" \
+        || { rm -rf "$P11SCOPE_TASK4_SEALED_BIN" || :
+             echo "invalid Task 4 evidence root" >&2; exit 77; }
     TASK4_FACTS=$TASK4_ROOT/facts.log
     : > "$TASK4_FACTS"; : > "$TASK4_ROOT/stdout.log"; : > "$TASK4_ROOT/stderr.log"
     chmod 600 "$TASK4_FACTS" "$TASK4_ROOT/stdout.log" "$TASK4_ROOT/stderr.log"
@@ -411,7 +558,16 @@ task4_receipt_run() {
     TASK4_DRIVER_HASH=$(task4_digest scripts/build-release.sh); TASK4_CHECKER_HASH=$(task4_digest scripts/check-capture-evidence.py)
     task4_snapshot > "$TASK4_ROOT/artifacts/source.start.tsv" || exit 77
     TASK4_SOURCE_HASH=$(task4_digest "$TASK4_ROOT/artifacts/source.start.tsv")
-    task4_fact started_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; task4_fact argv "$0 $1"; task4_fact cwd "$(pwd -P)"
+    task4_fact started_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    task4_fact argv "$P11SCOPE_TASK4_CALLER_ARGV0 $1"; task4_fact cwd "$(pwd -P)"
+    task4_fact sealed_bin "$P11SCOPE_TASK4_SEALED_BIN"
+    task4_fact sealed_bin_identity "$(stat -Lc %d:%i "$P11SCOPE_TASK4_SEALED_BIN")"
+    task4_fact sealed_environment "$(echo $TASK4_SEALED_ENVIRONMENT)"
+    for t4_var in $TASK4_SEALED_ENVIRONMENT; do
+        eval "t4_value=\${$t4_var-}"
+        task4_fact "sealed_env_$t4_var" "$t4_value"
+    done
+    task4_fact caller_path "$P11SCOPE_TASK4_CALLER_PATH"
     task4_fact uid_gid "$(id -u):$(id -g)"; task4_fact kernel "$(uname -srmo)"; task4_fact head "$TASK4_HEAD"; task4_fact tree "$TASK4_TREE"
     task4_fact root_identity "$TASK4_ROOT_ID"; task4_fact artifacts_identity "$TASK4_ARTIFACTS_ID"; task4_fact work_identity "$TASK4_WORK_ID"
     task4_fact lock_identity "$TASK4_LOCK_ID"; task4_fact lock_holder "$$:$(process_starttime $$)"

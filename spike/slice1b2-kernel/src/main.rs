@@ -9052,7 +9052,7 @@ mod tests {
         let known = temp.path().join("known_hosts");
         let lines = shell_lines(
             script,
-            "source \"$1\"; shift; ssh_argv \"$1\" 2222 | tr '\\0' '\\n'",
+            "P11SCOPE_VM_BASES=/test/vm-bases; source \"$1\"; shift; ssh_argv \"$1\" 2222 | tr '\\0' '\\n'",
             &[known.as_os_str()],
         );
         assert_eq!(
@@ -9061,7 +9061,7 @@ mod tests {
                 "ssh",
                 "-vv",
                 "-i",
-                "/tmp/p11scope-slice1b2-vms/id_ed25519",
+                "/test/vm-bases/id_ed25519",
                 "-o",
                 "BatchMode=yes",
                 "-o",
@@ -9080,16 +9080,16 @@ mod tests {
         );
         let lanes = shell_lines(
             script,
-            "source \"$1\"; lane_config jammy; lane_config noble",
+            "P11SCOPE_VM_BASES=/test/vm-bases; source \"$1\"; lane_config jammy; lane_config noble",
             &[],
         );
         assert_eq!(
             lanes[0],
-            "/tmp/p11scope-slice1b2-vms/jammy/overlay.qcow2|/tmp/p11scope-slice1b2-vms/jammy/serial.log|2222|SHA256:GD2UX29+dul1JSEIm9k1XjotD9Exr1j9vrTgG92wQEY"
+            "/test/vm-bases/jammy/overlay.qcow2|/test/vm-bases/jammy/serial.log|2222|SHA256:GD2UX29+dul1JSEIm9k1XjotD9Exr1j9vrTgG92wQEY"
         );
         assert_eq!(
             lanes[1],
-            "/tmp/p11scope-slice1b2-vms/noble/overlay.qcow2|/tmp/p11scope-slice1b2-vms/noble/serial.log|2223|SHA256:lJncGXZAZRDW+QEdhkWpCyhco+DDPxnYB8J6IEha1aQ"
+            "/test/vm-bases/noble/overlay.qcow2|/test/vm-bases/noble/serial.log|2223|SHA256:lJncGXZAZRDW+QEdhkWpCyhco+DDPxnYB8J6IEha1aQ"
         );
     }
 

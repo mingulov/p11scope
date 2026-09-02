@@ -3,13 +3,15 @@
 # (Task 5 freeze boundary): the VM lane functions here are copied from it with
 # loader-specific bundle inventory, validator, and build steps.
 
+P11SCOPE_VM_BASES=${P11SCOPE_VM_BASES:-$HOME/src/m/p11scope-ws/vm-bases}
+
 lane_config() {
     case "$1" in
         jammy)
-            printf '%s\n' '/tmp/p11scope-slice1b2-vms/jammy/overlay.qcow2|/tmp/p11scope-slice1b2-vms/jammy/serial.log|2222|SHA256:GD2UX29+dul1JSEIm9k1XjotD9Exr1j9vrTgG92wQEY'
+            printf '%s\n' "$P11SCOPE_VM_BASES/jammy/overlay.qcow2|$P11SCOPE_VM_BASES/jammy/serial.log|2222|SHA256:GD2UX29+dul1JSEIm9k1XjotD9Exr1j9vrTgG92wQEY"
             ;;
         noble)
-            printf '%s\n' '/tmp/p11scope-slice1b2-vms/noble/overlay.qcow2|/tmp/p11scope-slice1b2-vms/noble/serial.log|2223|SHA256:lJncGXZAZRDW+QEdhkWpCyhco+DDPxnYB8J6IEha1aQ'
+            printf '%s\n' "$P11SCOPE_VM_BASES/noble/overlay.qcow2|$P11SCOPE_VM_BASES/noble/serial.log|2223|SHA256:lJncGXZAZRDW+QEdhkWpCyhco+DDPxnYB8J6IEha1aQ"
             ;;
         *)
             return 64
@@ -21,7 +23,7 @@ ssh_argv() {
     local known_hosts=$1 port=$2
     printf '%s\0' \
         ssh -vv \
-        -i /tmp/p11scope-slice1b2-vms/id_ed25519 \
+        -i "$P11SCOPE_VM_BASES/id_ed25519" \
         -o BatchMode=yes \
         -o IdentitiesOnly=yes \
         -o StrictHostKeyChecking=yes \
@@ -35,7 +37,7 @@ scp_argv() {
     local known_hosts=$1 port=$2
     printf '%s\0' \
         scp -vv \
-        -i /tmp/p11scope-slice1b2-vms/id_ed25519 \
+        -i "$P11SCOPE_VM_BASES/id_ed25519" \
         -o BatchMode=yes \
         -o IdentitiesOnly=yes \
         -o StrictHostKeyChecking=yes \
@@ -403,8 +405,8 @@ private_start_lane() {
     config=$(lane_config "$lane") || return
     IFS='|' read -r retained initial_serial port fingerprint <<<"$config"
     case "$lane" in
-        jammy) official=/tmp/p11scope-slice1b2-vms/jammy/jammy-server-cloudimg-amd64.img ;;
-        noble) official=/tmp/p11scope-slice1b2-vms/noble/noble-server-cloudimg-amd64.img ;;
+        jammy) official="$P11SCOPE_VM_BASES/jammy/jammy-server-cloudimg-amd64.img" ;;
+        noble) official="$P11SCOPE_VM_BASES/noble/noble-server-cloudimg-amd64.img" ;;
         *) return 64 ;;
     esac
     [[ ! -e $run_dir && ! -L $run_dir ]] || return 64

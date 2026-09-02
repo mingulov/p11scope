@@ -212,7 +212,8 @@ commit `fd3d08ad9bd2f58508eda1ee4a50882c0633d850` (tree
 `0decc4dee974707468b5758107fb055c30d44d7d`). Its zero-unavailable PASS oracle
 applies only to a topology proposed for supported acceptance. The completed
 pre-r3 attempt-6 exclusion is input-bound to
-`/home/user/.local/state/p11scope/task4-lane13-a2fd9ee-20260826T2135EEST/facts.log`
+`/home/user/src/m/p11scope-ws/preserved/evidence-roots/task4-lane13-a2fd9ee-20260826T2135EEST/facts.log`
+(originally under `~/.local/state/p11scope/`, relocated 2026-09-02)
 (SHA-256 `b96cbed6cbc2963dab2c5963b5c52f6378d9bef313479b83a56c259df79b94f3`,
 exact HEAD/tree `a2fd9ee8eddfaff34b3fb6b65267688b5a90aa03` /
 `f90e2dfe8dbd0a211f9e32055a37ff7320080b88`). The receipt binds the lane
@@ -635,9 +636,9 @@ founding rule).
 | W2 | Storage consolidation: two-directory rule, migrate + repoint, `p11scope-ws` custody | [full plan](2026-09-01-wave2-storage-consolidation.md) |
 | W3 | **Priority 1: `C_GetInterface` compatibility closure** (partial passive behavior → separate live request/result/failure evidence plus finite offline helper matrix; selection authority limited to exact retained generation or attested exact provider, never inventory); then tracepoint offsets (research #1), opened-inode identity (#2), capability tier ladder + caps model, honest-degradation fixes, and `uprobe_multi` attach | [charter](2026-09-01-release-wave-charters.md#w3) |
 | W4 | Hosted CI running the full suite; "green locally, not in CI" dies | [charter](2026-09-01-release-wave-charters.md#w4) |
+| W7 | ia32 targets on x86-64 hosts | [charter](2026-09-01-release-wave-charters.md#w7) |
 | W5 | Container/K8s requalification (provisional; W8 re-runs on the final tip) + seccomp/SELinux artifacts | [charter](2026-09-01-release-wave-charters.md#w5) |
 | W6 | Multi-distro/kernel matrix; support restated "5.15.x, tested on ⟨list⟩"; load-only CI matrix | [charter](2026-09-01-release-wave-charters.md#w6) |
-| W7 | ia32 targets on x86-64 hosts | [charter](2026-09-01-release-wave-charters.md#w7) |
 | W8 | Release assembly: receipt, docs truth pass, final review-to-zero, ready-to-publish bundle | [charter](2026-09-01-release-wave-charters.md#w8) |
 
 Publication (push, tag, release) is NOT a wave — it is an explicit owner
@@ -665,11 +666,11 @@ generalization of how wave 1 was planned and reviewed on 2026-09-01.
    correctness/security + test-quality/regression) over the wave's full diff;
    triage with reasoning; fix accepted findings TDD-style; repeat with fresh
    agents until a full cycle accepts zero findings.
-5. **Subagent policy:** Opus/Sonnet subagents liberally and in parallel for
-   research, briefs, implementation, review; depth over speed. Reviews, deep
-   planning, adjudication, and security-critical writing run on Fable 5.1
-   (owner decision 2026-09-01); when Fable writes, the review pair adds an
-   Opus adversarial reviewer for model diversity.
+5. **Subagent policy:** use the configured p11scope roles by their real names:
+   Luna high for narrow read-only searches and inventories, Luna worker xhigh
+   for one bounded patch, and Sol xhigh for architecture, lifecycle,
+   concurrency, security, adjudication, and final review. Add a distinct Terra
+   xhigh lane only when a third independent review materially reduces risk.
 6. **Branch/commit:** one branch per wave (`hardening/<wave-name>`), one
    commit per task, merge to `main` only after review-to-zero; rerun gates on
    `main`. Never push, except the owner-approved W4 test/CI branch.

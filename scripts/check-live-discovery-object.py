@@ -59,10 +59,10 @@ def initializer_contract(source):
         if not match:
             fail(f"initializer contains non-approved text: {line!r}")
         indices.append(int(match.group(1)))
-    if len(indices) != 112:
-        fail(f"initializer has {len(indices)} stores, expected 112")
-    if indices != list(range(112)):
-        fail("initializer indices must be the ordered exact set 0..111")
+    if len(indices) != 115:
+        fail(f"initializer has {len(indices)} stores, expected 115")
+    if indices != list(range(115)):
+        fail("initializer indices must be the ordered exact set 0..114")
     return region
 
 
@@ -127,6 +127,10 @@ def production_source_contract(source):
             fail(f"production source contract missing {marker!r}")
     if source.count("DISCOVERY.reserve::<DiscoveryRecord>(0)") != 1:
         fail("all discovery producers must share the sole reservation path")
+    if source.count("domain: STATE_DOMAIN_EXPORT") != 3:
+        fail("export state-key constructors must use the export namespace")
+    if source.count("domain: STATE_DOMAIN_SELECTION") != 1:
+        fail("selection state-key constructor must use the selection namespace")
     if "target-cpu=v3" in source:
         fail("production source requests forbidden target-cpu=v3")
     loader = source.split("fn loader_cookie_of(", 1)[1].split("fn loader_runtime_ip", 1)[0]
@@ -195,11 +199,11 @@ def expected_manifest_values(variant):
         fail(f"unknown variant {variant!r}")
     maps, programs = expected_inventory(variant)
     return {
-        "record_size": 896,
+        "record_size": 920,
         "record_align": 8,
         "counter_indices": COUNTERS,
-        "initializer_words": 112,
-        "initializer_indices": list(range(112)),
+        "initializer_words": 115,
+        "initializer_indices": list(range(115)),
         "inventory": {"maps": maps, "programs": sorted(programs)},
     }
 
@@ -286,17 +290,17 @@ def initializer_regions(disassembly):
             if reserve is None:
                 fail(f"{function}: DISCOVERY relocation lacks ring reservation")
             size_window = "\n".join(lines[max(relocation - 2, 0) : reserve + 1])
-            if "r2 = 0x380" not in size_window:
-                fail(f"{function}: discovery reservation is not 896 bytes")
+            if "r2 = 0x398" not in size_window:
+                fail(f"{function}: discovery reservation is not 920 bytes")
 
             candidate = None
-            for start in range(reserve + 1, len(lines) - 111):
+            for start in range(reserve + 1, len(lines) - 114):
                 first = OBJECT_STORE.search(lines[start])
                 if not first or int(first.group("offset"), 16) != 0:
                     continue
                 base, zero = first.group("base"), first.group("zero")
                 stores = []
-                for offset, line in enumerate(lines[start : start + 112]):
+                for offset, line in enumerate(lines[start : start + 115]):
                     store = OBJECT_STORE.search(line)
                     if (
                         not store
@@ -306,11 +310,11 @@ def initializer_regions(disassembly):
                     ):
                         break
                     stores.append(offset * 8)
-                if len(stores) == 112:
-                    candidate = (start, start + 112, base, zero, stores)
+                if len(stores) == 115:
+                    candidate = (start, start + 115, base, zero, stores)
                     break
             if candidate is None:
-                fail(f"{function}: missing exact 112-store initializer")
+                fail(f"{function}: missing exact 115-store initializer")
             start, end, base, zero, stores = candidate
             prefix = "\n".join(lines[:start])
             if not re.search(rf"r{zero} = 0x0\b", prefix):
@@ -344,10 +348,10 @@ def initializer_regions(disassembly):
                 fail(f"{function}: record submit precedes initialization")
             trailing = "\n".join(lines[end:])
             if re.search(
-                rf"\*\(u64 \*\)\(r{base} \+ 0x(?:38[0-9a-f]|3[9a-f][0-9a-f]|[4-9a-f][0-9a-f]{{2,}})\) = r{zero}\b",
+                rf"\*\(u64 \*\)\(r{base} \+ 0x(?:39[89a-f]|3[a-f][0-9a-f]|[4-9a-f][0-9a-f]{{2,}})\) = r{zero}\b",
                 trailing,
             ):
-                fail(f"{function}: initializer writes beyond the 896-byte record")
+                fail(f"{function}: initializer writes beyond the 920-byte record")
             regions.append(
                 {
                     "function": function,
@@ -712,6 +716,49 @@ def interface_tail_contract(disassembly):
     return True
 
 
+def state_domain_store(block, expected):
+    """Tie each DISCOVERY_STATE call to a live r2 key's +16 domain word."""
+    lines = block.splitlines()
+    assignment = re.compile(r"\b(?P<register>r\d+) = 0x(?P<value>[0-9a-f]+)\b")
+    domain_store = re.compile(
+        r"\*\(u64 \*\)\(r2 \+ 0x10\) = (?P<register>r\d+)\b"
+    )
+    key_pointer = re.compile(r"\br2 = r10\b")
+    r2_clobber = re.compile(r"\br2\s*(?:=|\+=|-=|<<=|>>=|&=|\|=)")
+    for call_index, _, _ in map_call_sites(lines, "DISCOVERY_STATE"):
+        found = False
+        for store_index in range(call_index - 1, -1, -1):
+            store = domain_store.search(lines[store_index])
+            if store is None:
+                continue
+            if any(r2_clobber.search(lines[index]) for index in range(store_index + 1, call_index)):
+                break
+            if not any(key_pointer.search(lines[index]) for index in range(store_index)):
+                break
+            register = store.group("register")
+            for value_index in range(store_index - 1, -1, -1):
+                value = assignment.search(lines[value_index])
+                if value is None or value.group("register") != register:
+                    continue
+                register_number = register.removeprefix("r")
+                destination = re.compile(
+                    rf"^\s*(?:\d+:\s+)?[rw]{register_number}\b"
+                )
+                if (
+                    int(value.group("value"), 16) == expected
+                    and not any(
+                        destination.search(lines[index])
+                        for index in range(value_index + 1, store_index)
+                    )
+                ):
+                    found = True
+                break
+            break
+        if not found:
+            return False
+    return bool(map_call_sites(lines, "DISCOVERY_STATE"))
+
+
 def cookie_object_contract(disassembly):
     blocks = function_blocks(disassembly)
     loader = "\n".join(blocks.get("dl_debug_state", []))
@@ -727,13 +774,13 @@ def cookie_object_contract(disassembly):
         "interface_list_entry",
         "interface_list_return",
         "interface_list_worker",
-        "interface_entry",
-        "interface_return",
     )
     for name in export_programs:
         block = "\n".join(blocks.get(name, []))
         if name == "interface_list_worker":
             if re.search(r"\bcall 0xae\b", block):
+                return False
+            if not state_domain_store(block, 1):
                 return False
             continue
         if (
@@ -744,7 +791,18 @@ def cookie_object_contract(disassembly):
                 name != "interface_list_return"
                 and re.search(r"(?:s)?>>= 0x20\b", block)
             )
+            or not state_domain_store(block, 1)
         ):
+            return False
+    for name in ("interface_entry", "interface_return"):
+        block = "\n".join(blocks.get(name, []))
+        if len(re.findall(r"\bcall 0xae\b", block)) != 1:
+            return False
+        if not re.search(r"\bif r\d+ == 0x0 goto", block):
+            return False
+        if re.search(r"(?:&=|(?:s)?>>=|<<=|0xffffffff|0x100000000)", block):
+            return False
+        if not state_domain_store(block, 2):
             return False
     return not re.search(r"(?:s)?>>= 0x20\b", loader)
 
@@ -935,7 +993,7 @@ def counter_ownership_contract(uses):
             "interface_entry",
             "interface_return",
         ),
-        2: ("emit_export", "interface_list_return"),
+        2: ("emit_export", "interface_list_return", "interface_entry"),
         3: ("dl_debug_state",),
         4: ("dl_debug_state",),
     }
@@ -995,7 +1053,7 @@ def object_contract(facts, variant):
     checks = [
         (facts["maps"] == maps, "map ABI/inventory differs"),
         (facts["programs"] == programs, "program inventory differs"),
-        (facts["record_size"] == 896, "record size differs"),
+        (facts["record_size"] == 920, "record size differs"),
         (facts["record_align"] == 8, "record alignment differs"),
         (facts["counter_indices"] == COUNTERS, "counter permutation differs"),
         (facts["counter_ownership"], "counter ownership differs"),
@@ -1012,7 +1070,7 @@ def object_contract(facts, variant):
     for region in facts["initializer_regions"]:
         checks.extend(
             [
-                (region["offsets"] == list(range(0, 896, 8)), "initializer offsets differ"),
+                (region["offsets"] == list(range(0, 920, 8)), "initializer offsets differ"),
             ]
         )
     for okay, message in checks:
@@ -1020,7 +1078,7 @@ def object_contract(facts, variant):
             fail(message)
 
 
-def _initializer(stores=range(112)):
+def _initializer(stores=range(115)):
     return "\n".join(
         [INITIALIZER_BEGIN]
         + [f"core::ptr::write_volatile(words.add({index}), 0u64);" for index in stores]
@@ -1042,7 +1100,7 @@ entry.submit(0);
 {PAUSE_END}"""
 
 
-def _source(stores=range(112)):
+def _source(stores=range(115)):
     return "\n".join(
         [
             "fn unrelated() { core::ptr::write_bytes(dst, 0, 8); }",
@@ -1060,7 +1118,7 @@ def _initializer_block(function, tail=""):
         "       0:\tr7 = 0x0",
         "       1:\tr1 = 0x0 ll",
         "\t\t0000000000000008:  R_BPF_64_64\tDISCOVERY",
-        "       3:\tr2 = 0x380",
+        "       3:\tr2 = 0x398",
         "       4:\tr3 = 0x0",
         "       5:\tcall 0x83",
         "       6:\tr6 = r0",
@@ -1076,7 +1134,7 @@ def _initializer_block(function, tail=""):
     ]
     lines.extend(
         f"{15 + index:8}:\t*(u64 *)(r6 + 0x{index * 8:x}) = r7"
-        for index in range(112)
+        for index in range(115)
     )
     lines.append("     127:\tcall 0x84")
     if tail:
@@ -1126,7 +1184,23 @@ def _cookie_disassembly():
        1:\tr1 = -0x100000000 ll
        3:\tr1 = -0xffffffff ll
        5:\tcall 0xae
-       6:\texit"""
+       6:\tr2 = r10
+       7:\tr2 += -0x18
+       8:\tr3 = 0x1
+       9:\t*(u64 *)(r2 + 0x10) = r3
+		0000000000000048:  R_BPF_64_64\tDISCOVERY_STATE
+      10:\tcall 0x1
+      11:\texit"""
+    selection = """0000000000000000 <{name}>:
+       0:\tcall 0xae
+       1:\tif r1 == 0x0 goto +0x2
+       2:\tr2 = r10
+       3:\tr2 += -0x18
+       4:\tr3 = 0x2
+       5:\t*(u64 *)(r2 + 0x10) = r3
+		0000000000000028:  R_BPF_64_64\tDISCOVERY_STATE
+       6:\tcall 0x1
+       7:\texit"""
     names = (
         "function_list_entry",
         "function_list_return",
@@ -1137,8 +1211,23 @@ def _cookie_disassembly():
     )
     worker = """0000000000001000 <interface_list_worker>:
        0:\tcall 0x1
-       1:\texit"""
-    return "\n".join([loader] + [export.format(name=name) for name in names] + [worker])
+       1:\tr2 = r10
+       2:\tr2 += -0x18
+       3:\tr3 = 0x1
+       4:\t*(u64 *)(r2 + 0x10) = r3
+		0000000000000020:  R_BPF_64_64\tDISCOVERY_STATE
+       5:\tcall 0x1
+       6:\texit"""
+    return "\n".join(
+        [loader]
+        + [
+            (selection if name in ("interface_entry", "interface_return") else export).format(
+                name=name
+            )
+            for name in names
+        ]
+        + [worker]
+    )
 
 
 def _bounded_disassembly():
@@ -1366,14 +1455,14 @@ def self_test():
             initializer.replace("if r6 != 0x0 goto +0x7", "if r6 != 0x0 goto +0x6", 1),
         ),
         (
-            "111 object stores",
+            "114 object stores",
             initializer.replace("*(u64 *)(r6 + 0x378) = r7\n", "", 1),
         ),
         (
-            "113 object stores",
+            "116 object stores",
             initializer.replace(
                 "     127:\tcall 0x84",
-                "     127:\t*(u64 *)(r6 + 0x380) = r7\n     128:\tcall 0x84",
+                "     127:\t*(u64 *)(r6 + 0x398) = r7\n     128:\tcall 0x84",
                 1,
             ),
         ),
@@ -1436,6 +1525,107 @@ def self_test():
         cookie.replace("       5:\tcall 0xae", "       5:\tr1 >>= 0x20\n       6:\tcall 0xae", 1)
     ):
         raise AssertionError("mutation accepted: export cookie slot collision")
+    selection_zero = cookie.replace(
+        "0000000000000000 <interface_entry>:\n       0:\tcall 0xae\n       1:\tif r1 == 0x0 goto +0x2",
+        "0000000000000000 <interface_entry>:\n       0:\tcall 0xae\n       1:\tif r1 != 0x0 goto +0x2",
+        1,
+    )
+    if cookie_object_contract(selection_zero):
+        raise AssertionError("mutation accepted: selection zero-cookie guard")
+    selection_truncated = cookie.replace(
+        "0000000000000000 <interface_return>:\n       0:\tcall 0xae\n       1:\tif r1 == 0x0 goto +0x2",
+        "0000000000000000 <interface_return>:\n       0:\tcall 0xae\n       1:\tr1 >>= 0x20\n       2:\tif r1 == 0x0 goto +0x2",
+        1,
+    )
+    if cookie_object_contract(selection_truncated):
+        raise AssertionError("mutation accepted: selection high-bit truncation")
+    for label, mutation in [
+        (
+            "export domain swapped",
+            cookie.replace("       8:\tr3 = 0x1", "       8:\tr3 = 0x2", 1),
+        ),
+        (
+            "export domain removed",
+            cookie.replace("       9:\t*(u64 *)(r2 + 0x10) = r3\n", "", 1),
+        ),
+        (
+            "worker domain swapped",
+            cookie.replace(
+                "0000000000001000 <interface_list_worker>:\n       0:\tcall 0x1\n       1:\tr2 = r10\n       2:\tr2 += -0x18\n       3:\tr3 = 0x1",
+                "0000000000001000 <interface_list_worker>:\n       0:\tcall 0x1\n       1:\tr2 = r10\n       2:\tr2 += -0x18\n       3:\tr3 = 0x2",
+                1,
+            ),
+        ),
+        (
+            "selection domain swapped",
+            cookie.replace("       4:\tr3 = 0x2", "       4:\tr3 = 0x1", 1),
+        ),
+        (
+            "selection domain removed",
+            cookie.replace("       5:\t*(u64 *)(r2 + 0x10) = r3\n", "", 1),
+        ),
+        (
+            "domain value mutated before store",
+            cookie.replace(
+                "       8:\tr3 = 0x1\n       9:\t*(u64 *)(r2 + 0x10) = r3",
+                "       8:\tr3 = 0x1\n"
+                "       9:\tr3 += 0x1\n"
+                "      10:\t*(u64 *)(r2 + 0x10) = r3",
+                1,
+            ),
+        ),
+        (
+            "domain value mutated through ALU32 alias",
+            cookie.replace(
+                "       8:\tr3 = 0x1\n       9:\t*(u64 *)(r2 + 0x10) = r3",
+                "       8:\tr3 = 0x1\n"
+                "       9:\tw3 += 0x1\n"
+                "      10:\t*(u64 *)(r2 + 0x10) = r3",
+                1,
+            ),
+        ),
+        (
+            "domain value mutated through signed shift",
+            cookie.replace(
+                "       8:\tr3 = 0x1\n       9:\t*(u64 *)(r2 + 0x10) = r3",
+                "       8:\tr3 = 0x1\n"
+                "       9:\tr3 s>>= 0x1\n"
+                "      10:\t*(u64 *)(r2 + 0x10) = r3",
+                1,
+            ),
+        ),
+        (
+            "domain stored at wrong offset",
+            cookie.replace(
+                "*(u64 *)(r2 + 0x10) = r3", "*(u64 *)(r2 + 0x8) = r3", 1
+            ),
+        ),
+        (
+            "domain stored after map call",
+            cookie.replace(
+                "       9:\t*(u64 *)(r2 + 0x10) = r3\n"
+                "\t\t0000000000000048:  R_BPF_64_64\tDISCOVERY_STATE\n"
+                "      10:\tcall 0x1",
+                "\t\t0000000000000048:  R_BPF_64_64\tDISCOVERY_STATE\n"
+                "      10:\tcall 0x1\n"
+                "      11:\t*(u64 *)(r2 + 0x10) = r3",
+                1,
+            ),
+        ),
+        (
+            "decoy domain store",
+            cookie.replace(
+                "       8:\tr3 = 0x1\n       9:\t*(u64 *)(r2 + 0x10) = r3",
+                "       8:\tr3 = 0x2\n"
+                "       9:\t*(u64 *)(r2 + 0x10) = r3\n"
+                "      10:\tr4 = 0x1\n"
+                "      11:\t*(u64 *)(r10 - 0x8) = r4",
+                1,
+            ),
+        ),
+    ]:
+        if cookie_object_contract(mutation):
+            raise AssertionError(f"mutation accepted: {label}")
 
     bounded = _bounded_disassembly()
     if not table_bounds_object_contract(bounded):
@@ -1516,6 +1706,19 @@ def self_test():
     producer = _producer_disassembly()
     if not producer_object_contract(producer):
         raise AssertionError("valid producer-edge disassembly fixture was rejected")
+    classifier_counter = [
+        ("emit_export", 0),
+        ("function_list_entry", 1),
+        ("interface_list_return", 2),
+        ("dl_debug_state", 3),
+        ("dl_debug_state", 4),
+        ("interface_entry", 2),
+    ]
+    if not counter_ownership_contract(classifier_counter):
+        raise AssertionError("request-classifier counter ownership was rejected")
+    classifier_counter[-1] = ("interface_entry", 3)
+    if counter_ownership_contract(classifier_counter):
+        raise AssertionError("request-classifier counter mutation was accepted")
     for label, mutation in [
         ("state insert no-overwrite", producer.replace("       0:\tr4 = 0x1", "       0:\tr4 = 0x0", 1)),
         ("state insertion cleanup", producer.replace("       2:\tcall 0x3", "       2:\tcall 0x2", 1)),

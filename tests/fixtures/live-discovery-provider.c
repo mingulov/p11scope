@@ -23,7 +23,7 @@
  * manifest, so the two byte identities stay fixed):
  *   P11SCOPE_FIXTURE_TRUNCATE=1  C_GetFunctionList returns a table that ends
  *                                one byte before an unmapped page, so a
- *                                bounded 896-byte read must truncate.
+ *                                bounded 920-byte read must truncate.
  *   P11SCOPE_FIXTURE_QUIET=1     suppress markers (loss lanes call surfaces in
  *                                a tight loop and must not be rate-limited by
  *                                stderr).

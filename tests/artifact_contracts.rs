@@ -4932,6 +4932,163 @@ fn live_discovery_bpf_classification_is_exact_and_output_only() {
 }
 
 #[test]
+fn selection_transport_never_carries_name_bytes() {
+    let common = read("crates/ebpf-common/src/lib.rs");
+    let source = read("crates/ebpf/src/main.rs");
+    for marker in [
+        "pub return_rv: u64",
+        "pub request_flags: u64",
+        "pub binding_id: u64",
+        "DISCOVERY_VERSION_V3_2",
+        "record.binding_id != 0",
+    ] {
+        assert!(
+            common.contains(marker),
+            "selection transport misses {marker}"
+        );
+    }
+    let entry = between(
+        &source,
+        "pub fn interface_entry(ctx: ProbeContext)",
+        "#[uretprobe]\npub fn interface_return",
+    );
+    for marker in [
+        "classify_selection_name",
+        "classify_selection_version",
+        "ctx.arg::<u64>(3)",
+        "insert_selection_state",
+    ] {
+        assert!(entry.contains(marker), "selection entry misses {marker}");
+    }
+    let gate = entry
+        .find("scope_auth()")
+        .expect("selection entry must gate before reading arguments");
+    let first_arg = entry
+        .find("ctx.arg::<u64>")
+        .expect("selection entry must retain only classified scalar arguments");
+    assert!(
+        gate < first_arg,
+        "selection scope must precede argument reads"
+    );
+    let aggregate = entry
+        .find("FLAG_POLICY_AGGREGATE")
+        .expect("selection entry must gate aggregate policy");
+    assert!(
+        aggregate < first_arg,
+        "aggregate policy must precede argument reads"
+    );
+    assert_eq!(
+        source
+            .matches("core::ptr::write_volatile(words.add(")
+            .count(),
+        115,
+        "the record initializer must use exactly 115 ordered stores"
+    );
+    assert!(!entry.contains("arg3:"));
+    assert!(entry.contains("arg0: ctx.arg::<u64>(2)"));
+    assert!(entry.contains("arg1: selection_request_word"));
+    assert!(entry.contains("arg2: ctx.arg::<u64>(3)"));
+    assert!(!entry.contains("bpf_probe_read_user_str"));
+    assert!(!entry.contains("name_ptr"));
+    let returned = between(
+        &source,
+        "pub fn interface_return(ctx: RetProbeContext)",
+        "fn loader_cookie_of",
+    );
+    for marker in ["take_selection_state", "return_rv", "binding_id"] {
+        assert!(
+            returned.contains(marker),
+            "selection return misses {marker}"
+        );
+    }
+    assert!(returned.contains("classify_indirect_interface"));
+    assert!(returned.contains("if rv != 0"));
+    assert!(
+        returned.find("FLAG_POLICY_AGGREGATE").unwrap()
+            < returned.find("take_selection_state").unwrap()
+    );
+    assert!(returned.contains("let scope = scope_auth();"));
+    assert!(returned.contains("take_selection_state(&ctx, scope.is_some())"));
+    assert!(returned.contains("let Some(scope) = scope else"));
+    let nonzero = between(returned, "if rv != 0 {", "    } else {");
+    assert!(!nonzero.contains("classify_indirect_interface"));
+    assert!(!nonzero.contains("bpf_probe_read_user"));
+    assert!(returned.contains("pause_eligible: rv == 0"));
+    let insertion = between(
+        &source,
+        "fn insert_selection_state(",
+        "fn take_selection_state(",
+    );
+    assert!(insertion.contains("BPF_NOEXIST"));
+    assert!(insertion.contains("DISCOVERY_STATE.remove(&key)"));
+    assert!(insertion.contains("DISCOVERY_COUNTER_EXPORT_STATE_FAILURES"));
+    let indirect = between(
+        &source,
+        "fn classify_indirect_interface(",
+        "#[inline(never)]\nfn emit_export(",
+    );
+    assert!(indirect.contains("address as *const u64"));
+    assert!(indirect.contains("classify_direct_interface"));
+    let selection_key = between(
+        &source,
+        "fn selection_state_key<",
+        "fn classify_selection_name(",
+    );
+    assert_eq!(selection_key.matches("bpf_get_attach_cookie").count(), 1);
+    assert!(selection_key.contains("attach_cookie != 0"));
+    assert!(!selection_key.contains("as u32"));
+    assert!(!selection_key.contains(">>"));
+    assert!(!selection_key.contains("&="));
+    let assert_state_key_domains = |candidate: &str| {
+        assert_eq!(candidate.matches("domain: STATE_DOMAIN_EXPORT").count(), 3);
+        assert_eq!(
+            candidate.matches("domain: STATE_DOMAIN_SELECTION").count(),
+            1
+        );
+    };
+    assert_state_key_domains(&source);
+    let missing_selection_domain = source.replacen("domain: STATE_DOMAIN_SELECTION,", "", 1);
+    assert!(
+        std::panic::catch_unwind(|| assert_state_key_domains(&missing_selection_domain)).is_err()
+    );
+    let wrong_selection_domain = source.replacen(
+        "domain: STATE_DOMAIN_SELECTION",
+        "domain: STATE_DOMAIN_EXPORT",
+        1,
+    );
+    assert!(
+        std::panic::catch_unwind(|| assert_state_key_domains(&wrong_selection_domain)).is_err()
+    );
+    let request_name = between(
+        &source,
+        "fn classify_selection_name(",
+        "fn classify_selection_version(",
+    );
+    let request_version = between(
+        &source,
+        "fn classify_selection_version(",
+        "fn selection_request_word(",
+    );
+    assert!(request_name.contains("DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES"));
+    assert!(request_version.contains("DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES"));
+    let emitter = between(
+        &source,
+        "fn emit_export(payload: &ExportPayload",
+        "#[inline(always)]\nfn classify_export",
+    );
+    assert_eq!(
+        emitter.matches("while pointer_index < 104").count(),
+        1,
+        "export emission must have one bounded table walker"
+    );
+    for path in ["src/metrics.rs", "src/trace.rs", "src/output.rs"] {
+        let consumer = read(path);
+        assert!(!consumer.contains("request_flags"));
+        assert!(!consumer.contains("binding_id"));
+    }
+}
+
+#[test]
 fn scope_auth_layout_and_padding_are_explicit_and_initialized() {
     let source = read("crates/ebpf/src/main.rs");
     let assert_contract = |source: &str| {

@@ -213,6 +213,14 @@ pub const DISCOVERY_NAME_OTHER: u8 = 2;
 pub const DISCOVERY_NAME_NULL: u8 = 3;
 pub const DISCOVERY_NAME_UNREADABLE: u8 = 4;
 
+pub const DISCOVERY_VERSION_NULL: u8 = 0;
+pub const DISCOVERY_VERSION_UNREADABLE: u8 = 1;
+pub const DISCOVERY_VERSION_V2_40: u8 = 2;
+pub const DISCOVERY_VERSION_V3_0: u8 = 3;
+pub const DISCOVERY_VERSION_V3_1: u8 = 4;
+pub const DISCOVERY_VERSION_V3_2: u8 = 5;
+pub const DISCOVERY_VERSION_OTHER: u8 = 6;
+
 pub const DISCOVERY_STATUS_READ_FAILURE: u8 = 0x01;
 pub const DISCOVERY_STATUS_COALESCED_NO_HELPER: u8 = 0x02;
 pub const DISCOVERY_STATUS_LOADER_CONTEXT_INVALID: u8 = 0x04;
@@ -243,6 +251,8 @@ pub const LOADER_STATE_SHIFT: u32 = 9;
 pub const LOADER_STATE_PAYLOAD_MASK: u64 = (1u64 << 55) - 1;
 pub const LOADER_STATE_ABSENT_SENTINEL: u64 = 1;
 pub const R_STATE_OFFSET: u64 = 24;
+pub const STATE_DOMAIN_EXPORT: u64 = 1;
+pub const STATE_DOMAIN_SELECTION: u64 = 2;
 
 pub const fn discovery_table_slots(version_major: u8, version_minor: u8) -> u8 {
     match (version_major, version_minor) {
@@ -251,6 +261,16 @@ pub const fn discovery_table_slots(version_major: u8, version_minor: u8) -> u8 {
         (3, 0 | 1) => 92,
         (3, 2..) => 104,
         _ => 0,
+    }
+}
+
+pub const fn discovery_version_class(major: u8, minor: u8) -> u8 {
+    match (major, minor) {
+        (2, 40) => DISCOVERY_VERSION_V2_40,
+        (3, 0) => DISCOVERY_VERSION_V3_0,
+        (3, 1) => DISCOVERY_VERSION_V3_1,
+        (3, 2) => DISCOVERY_VERSION_V3_2,
+        _ => DISCOVERY_VERSION_OTHER,
     }
 }
 
@@ -355,11 +375,18 @@ pub struct DiscoveryRecord {
     pub completed_prefix: u8,
     pub version_major: u8,
     pub version_minor: u8,
-    pub reserved_zero: [u8; 2],
+    pub selection_version_class: u8,
+    pub reserved_zero: [u8; 1],
     pub symbol_id: u32,
     pub announced_count: u32,
     pub reserved_tail_zero: [u8; 4],
     pub send_signal_rc: i64,
+    /// Full CK_RV for kind 4; zero is the successful outcome.
+    pub return_rv: u64,
+    /// Full request CK_FLAGS for kind 4.
+    pub request_flags: u64,
+    /// Full-width private selection binding id for kind 4.
+    pub binding_id: u64,
 }
 
 #[repr(C)]
@@ -367,6 +394,7 @@ pub struct DiscoveryRecord {
 pub struct StateKey {
     pub pid_tgid: u64,
     pub attach_cookie: u64,
+    pub domain: u64,
 }
 
 #[repr(C)]
@@ -374,6 +402,7 @@ pub struct StateKey {
 pub struct StartState {
     pub arg0: u64,
     pub arg1: u64,
+    pub arg2: u64,
 }
 
 #[repr(C)]
@@ -395,7 +424,18 @@ fn zero_discovery_payload(record: &DiscoveryRecord) -> bool {
         && record.completed_prefix == 0
         && record.version_major == 0
         && record.version_minor == 0
+        && record.selection_version_class == 0
         && record.symbol_id == 0
+        && record.return_rv == 0
+        && record.request_flags == 0
+        && record.binding_id == 0
+}
+
+fn zero_selection_payload(record: &DiscoveryRecord) -> bool {
+    record.return_rv == 0
+        && record.request_flags == 0
+        && record.binding_id == 0
+        && record.selection_version_class == 0
 }
 
 fn valid_export_prefix(record: &DiscoveryRecord) -> bool {
@@ -416,7 +456,7 @@ fn valid_export_prefix(record: &DiscoveryRecord) -> bool {
 /// Structural validation owned by the raw transport. Loader registry and
 /// process-generation agreement remain Task 6 responsibilities.
 pub fn valid_discovery_record(record: &DiscoveryRecord) -> bool {
-    if record.reserved_zero != [0; 2]
+    if record.reserved_zero != [0; 1]
         || record.reserved_tail_zero != [0; 4]
         || (record.status_flags & DISCOVERY_STATUS_COALESCED_NO_HELPER != 0)
             != (record.send_signal_rc == COALESCED_NO_HELPER_RC)
@@ -437,6 +477,7 @@ pub fn valid_discovery_record(record: &DiscoveryRecord) -> bool {
                 && record.announced_count == 0
                 && (record.table_ptr != 0
                     || record.status_flags & DISCOVERY_STATUS_READ_FAILURE != 0)
+                && zero_selection_payload(record)
                 && valid_export_prefix(record)
         }
         DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN => {
@@ -452,6 +493,7 @@ pub fn valid_discovery_record(record: &DiscoveryRecord) -> bool {
                         | DISCOVERY_NAME_UNREADABLE
                 )
                 && record.symbol_id != 0
+                && zero_selection_payload(record)
                 && valid_export_prefix(record)
                 && (record.name_class == DISCOVERY_NAME_EXACT_STANDARD
                     || (record.usable_n == 0
@@ -471,6 +513,7 @@ pub fn valid_discovery_record(record: &DiscoveryRecord) -> bool {
                 && record.version_major == 0
                 && record.version_minor == 0
                 && record.symbol_id == 0
+                && zero_selection_payload(record)
                 && match record.status_flags {
                     0 | DISCOVERY_STATUS_COALESCED_NO_HELPER => {
                         record.table_ptr != 0 && record.announced_count <= 2
@@ -486,24 +529,53 @@ pub fn valid_discovery_record(record: &DiscoveryRecord) -> bool {
         }
         DISCOVERY_KIND_INTERFACE_RETURN => {
             record.status_flags <= 0x03
-                && record.case_id == 0
-                && record.interface_index == 0
                 && matches!(
-                    record.name_class,
+                    record.case_id,
                     DISCOVERY_NAME_EXACT_STANDARD
                         | DISCOVERY_NAME_OTHER
                         | DISCOVERY_NAME_NULL
                         | DISCOVERY_NAME_UNREADABLE
                 )
-                && record.symbol_id != 0
+                && record.interface_index <= DISCOVERY_VERSION_OTHER
+                && record.symbol_id == 0
+                && record.binding_id != 0
                 && record.announced_count == 0
+                && record.version_major == 0
+                && record.version_minor == 0
+                && record.selection_version_class <= DISCOVERY_VERSION_OTHER
                 && valid_export_prefix(record)
-                && (record.name_class == DISCOVERY_NAME_EXACT_STANDARD
-                    || (record.usable_n == 0
+                && if record.return_rv != 0 {
+                    record.status_flags == 0
+                        && record.table_ptr == 0
+                        && record.interface_flags == 0
+                        && record.pointers.iter().all(|pointer| *pointer == 0)
+                        && record.name_class == DISCOVERY_NAME_NA
+                        && record.selection_version_class == DISCOVERY_VERSION_NULL
+                        && record.usable_n == 0
                         && record.pointers_attempted == 0
                         && record.completed_prefix == 0
-                        && record.version_major == 0
-                        && record.version_minor == 0))
+                } else {
+                    matches!(
+                        record.name_class,
+                        DISCOVERY_NAME_EXACT_STANDARD
+                            | DISCOVERY_NAME_OTHER
+                            | DISCOVERY_NAME_NULL
+                            | DISCOVERY_NAME_UNREADABLE
+                    ) && (record.name_class == DISCOVERY_NAME_EXACT_STANDARD
+                        || (record.usable_n == 0
+                            && record.pointers_attempted == 0
+                            && record.completed_prefix == 0))
+                        && (record.name_class != DISCOVERY_NAME_UNREADABLE
+                            || record.status_flags & DISCOVERY_STATUS_READ_FAILURE != 0)
+                        && (record.selection_version_class > DISCOVERY_VERSION_NULL
+                            || (record.status_flags & DISCOVERY_STATUS_READ_FAILURE != 0
+                                && record.table_ptr == 0))
+                        && (record.selection_version_class == DISCOVERY_VERSION_NULL
+                            || record.selection_version_class == DISCOVERY_VERSION_UNREADABLE
+                            || record.table_ptr != 0)
+                        && (record.selection_version_class != DISCOVERY_VERSION_UNREADABLE
+                            || record.status_flags & DISCOVERY_STATUS_READ_FAILURE != 0)
+                }
         }
         DISCOVERY_KIND_EXEC => {
             matches!(
@@ -1032,7 +1104,7 @@ mod tests {
     /// makes host and BPF disagree about the private discovery transport.
     #[test]
     fn discovery_transport_has_the_exact_frozen_layout() {
-        assert_eq!(core::mem::size_of::<DiscoveryRecord>(), 896);
+        assert_eq!(core::mem::size_of::<DiscoveryRecord>(), 920);
         assert_eq!(core::mem::align_of::<DiscoveryRecord>(), 8);
         assert_eq!(core::mem::offset_of!(DiscoveryRecord, hook_ts_ns), 0);
         assert_eq!(core::mem::offset_of!(DiscoveryRecord, pid_tgid), 8);
@@ -1055,7 +1127,11 @@ mod tests {
         );
         assert_eq!(core::mem::offset_of!(DiscoveryRecord, version_major), 872);
         assert_eq!(core::mem::offset_of!(DiscoveryRecord, version_minor), 873);
-        assert_eq!(core::mem::offset_of!(DiscoveryRecord, reserved_zero), 874);
+        assert_eq!(
+            core::mem::offset_of!(DiscoveryRecord, selection_version_class),
+            874
+        );
+        assert_eq!(core::mem::offset_of!(DiscoveryRecord, reserved_zero), 875);
         assert_eq!(core::mem::offset_of!(DiscoveryRecord, symbol_id), 876);
         assert_eq!(core::mem::offset_of!(DiscoveryRecord, announced_count), 880);
         assert_eq!(
@@ -1063,22 +1139,23 @@ mod tests {
             884
         );
         assert_eq!(core::mem::offset_of!(DiscoveryRecord, send_signal_rc), 888);
+        assert_eq!(core::mem::offset_of!(DiscoveryRecord, return_rv), 896);
+        assert_eq!(core::mem::offset_of!(DiscoveryRecord, request_flags), 904);
+        assert_eq!(core::mem::offset_of!(DiscoveryRecord, binding_id), 912);
 
         assert_eq!(core::mem::offset_of!(StateKey, pid_tgid), 0);
         assert_eq!(core::mem::offset_of!(StateKey, attach_cookie), 8);
+        assert_eq!(core::mem::offset_of!(StateKey, domain), 16);
         assert_eq!(core::mem::offset_of!(StartState, arg0), 0);
         assert_eq!(core::mem::offset_of!(StartState, arg1), 8);
+        assert_eq!(core::mem::offset_of!(StartState, arg2), 16);
         assert_eq!(core::mem::offset_of!(PauseKey, tgid), 0);
         assert_eq!(core::mem::offset_of!(PauseKey, pad), 4);
         assert_eq!(core::mem::offset_of!(PauseKey, generation_token), 8);
 
-        for size in [
-            core::mem::size_of::<StateKey>(),
-            core::mem::size_of::<StartState>(),
-            core::mem::size_of::<PauseKey>(),
-        ] {
-            assert_eq!(size, 16);
-        }
+        assert_eq!(core::mem::size_of::<StateKey>(), 24);
+        assert_eq!(core::mem::size_of::<StartState>(), 24);
+        assert_eq!(core::mem::size_of::<PauseKey>(), 16);
         for align in [
             core::mem::align_of::<StateKey>(),
             core::mem::align_of::<StartState>(),
@@ -1316,6 +1393,153 @@ mod tests {
         assert!(valid_discovery_record(&record));
     }
 
+    #[test]
+    fn selection_transport_round_trips_failures() {
+        assert_eq!(
+            [
+                DISCOVERY_VERSION_NULL,
+                DISCOVERY_VERSION_UNREADABLE,
+                DISCOVERY_VERSION_V2_40,
+                DISCOVERY_VERSION_V3_0,
+                DISCOVERY_VERSION_V3_1,
+                DISCOVERY_VERSION_V3_2,
+                DISCOVERY_VERSION_OTHER,
+            ],
+            [0, 1, 2, 3, 4, 5, 6]
+        );
+        assert_eq!(discovery_version_class(3, 2), DISCOVERY_VERSION_V3_2);
+        assert_eq!(discovery_version_class(0, 0), DISCOVERY_VERSION_OTHER);
+        assert_eq!(discovery_version_class(9, 9), DISCOVERY_VERSION_OTHER);
+        for request_name in [
+            DISCOVERY_NAME_EXACT_STANDARD,
+            DISCOVERY_NAME_OTHER,
+            DISCOVERY_NAME_NULL,
+            DISCOVERY_NAME_UNREADABLE,
+        ] {
+            for request_version in 0..=DISCOVERY_VERSION_OTHER {
+                let mut record = discovery_record(DISCOVERY_KIND_INTERFACE_RETURN);
+                record.binding_id = u64::MAX;
+                record.case_id = request_name;
+                record.interface_index = request_version;
+                record.request_flags = u64::MAX;
+                record.return_rv = u64::MAX;
+                assert!(valid_discovery_record(&record));
+            }
+        }
+
+        for result_name in [
+            DISCOVERY_NAME_EXACT_STANDARD,
+            DISCOVERY_NAME_OTHER,
+            DISCOVERY_NAME_NULL,
+            DISCOVERY_NAME_UNREADABLE,
+        ] {
+            let mut record = discovery_record(DISCOVERY_KIND_INTERFACE_RETURN);
+            record.binding_id = u64::MAX;
+            record.case_id = DISCOVERY_NAME_EXACT_STANDARD;
+            record.interface_index = DISCOVERY_VERSION_V3_0;
+            record.name_class = result_name;
+            record.interface_flags = u64::MAX;
+            record.table_ptr = 0x1000;
+            record.selection_version_class = DISCOVERY_VERSION_V3_0;
+            record.status_flags = if result_name == DISCOVERY_NAME_UNREADABLE {
+                DISCOVERY_STATUS_READ_FAILURE
+            } else {
+                0
+            };
+            if result_name == DISCOVERY_NAME_UNREADABLE {
+                record.selection_version_class = DISCOVERY_VERSION_UNREADABLE;
+            }
+            assert!(valid_discovery_record(&record));
+        }
+
+        for result_version in 0..=DISCOVERY_VERSION_OTHER {
+            let mut record = discovery_record(DISCOVERY_KIND_INTERFACE_RETURN);
+            record.binding_id = u64::MAX;
+            record.case_id = DISCOVERY_NAME_EXACT_STANDARD;
+            record.interface_index = DISCOVERY_VERSION_V3_0;
+            record.name_class = DISCOVERY_NAME_EXACT_STANDARD;
+            record.table_ptr = if result_version == DISCOVERY_VERSION_NULL {
+                0
+            } else {
+                0x1000
+            };
+            record.selection_version_class = result_version;
+            record.status_flags = if matches!(
+                result_version,
+                DISCOVERY_VERSION_NULL | DISCOVERY_VERSION_UNREADABLE
+            ) {
+                DISCOVERY_STATUS_READ_FAILURE
+            } else {
+                0
+            };
+            assert!(valid_discovery_record(&record));
+        }
+
+        let mut record = discovery_record(DISCOVERY_KIND_INTERFACE_RETURN);
+        record.binding_id = u64::MAX;
+        record.case_id = DISCOVERY_NAME_EXACT_STANDARD;
+        record.interface_index = DISCOVERY_VERSION_V3_0;
+        record.name_class = DISCOVERY_NAME_EXACT_STANDARD;
+        record.table_ptr = 0x1000;
+        record.selection_version_class = DISCOVERY_VERSION_V3_0;
+        record.version_major = 3;
+        record.version_minor = 0;
+        assert!(!valid_discovery_record(&record));
+
+        record.binding_id = 0;
+        assert!(!valid_discovery_record(&record));
+
+        let mut walked = discovery_record(DISCOVERY_KIND_INTERFACE_RETURN);
+        walked.binding_id = 1;
+        walked.case_id = DISCOVERY_NAME_EXACT_STANDARD;
+        walked.interface_index = DISCOVERY_VERSION_V3_0;
+        walked.name_class = DISCOVERY_NAME_EXACT_STANDARD;
+        walked.table_ptr = 0x2000;
+        walked.selection_version_class = DISCOVERY_VERSION_V3_0;
+        walked.pointers_attempted = 92;
+        walked.completed_prefix = 92;
+        walked.usable_n = 92;
+        for (index, pointer) in walked.pointers[..92].iter_mut().enumerate() {
+            *pointer = 0x3000 + index as u64;
+        }
+        assert!(valid_discovery_record(&walked));
+
+        let mut bad = walked;
+        bad.return_rv = 1;
+        assert!(!valid_discovery_record(&bad));
+        bad = walked;
+        bad.return_rv = 1;
+        bad.name_class = DISCOVERY_NAME_OTHER;
+        assert!(!valid_discovery_record(&bad));
+        bad = walked;
+        bad.name_class = DISCOVERY_NAME_UNREADABLE;
+        assert!(!valid_discovery_record(&bad));
+        bad = walked;
+        bad.selection_version_class = DISCOVERY_VERSION_UNREADABLE;
+        assert!(!valid_discovery_record(&bad));
+        bad.status_flags = 0;
+        bad.selection_version_class = DISCOVERY_VERSION_V3_0;
+        bad.table_ptr = 0;
+        assert!(!valid_discovery_record(&bad));
+        bad = walked;
+        bad.symbol_id = 1;
+        assert!(!valid_discovery_record(&bad));
+    }
+
+    #[test]
+    fn state_key_domains_separate_equal_pid_and_cookie() {
+        let export = StateKey {
+            pid_tgid: 7,
+            attach_cookie: u64::MAX,
+            domain: STATE_DOMAIN_EXPORT,
+        };
+        let selection = StateKey {
+            domain: STATE_DOMAIN_SELECTION,
+            ..export
+        };
+        assert_ne!(export, selection);
+    }
+
     /// Mutation caught: a producer-owned field, finite status, prefix bound,
     /// or required zero is silently accepted for the wrong record kind.
     #[test]
@@ -1401,11 +1625,15 @@ mod tests {
         assert!(!valid_discovery_record(&listed));
 
         let mut direct = discovery_record(DISCOVERY_KIND_INTERFACE_RETURN);
-        direct.symbol_id = 3;
+        direct.symbol_id = 0;
+        direct.binding_id = 1;
+        direct.case_id = DISCOVERY_NAME_EXACT_STANDARD;
+        direct.interface_index = DISCOVERY_VERSION_NULL;
         direct.name_class = DISCOVERY_NAME_NULL;
         direct.interface_flags = 9;
+        direct.status_flags = DISCOVERY_STATUS_READ_FAILURE;
         assert!(valid_discovery_record(&direct));
-        direct.interface_index = 1;
+        direct.interface_index = DISCOVERY_VERSION_OTHER + 1;
         assert!(!valid_discovery_record(&direct));
         direct.interface_index = 0;
         direct.announced_count = 1;

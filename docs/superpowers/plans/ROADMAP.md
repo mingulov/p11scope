@@ -665,11 +665,11 @@ generalization of how wave 1 was planned and reviewed on 2026-09-01.
    correctness/security + test-quality/regression) over the wave's full diff;
    triage with reasoning; fix accepted findings TDD-style; repeat with fresh
    agents until a full cycle accepts zero findings.
-5. **Subagent policy:** Opus/Sonnet subagents liberally and in parallel for
-   research, briefs, implementation, review; depth over speed. Reviews, deep
-   planning, adjudication, and security-critical writing run on Fable 5.1
-   (owner decision 2026-09-01); when Fable writes, the review pair adds an
-   Opus adversarial reviewer for model diversity.
+5. **Subagent policy:** use the configured p11scope roles by their real names:
+   Luna high for narrow read-only searches and inventories, Luna worker xhigh
+   for one bounded patch, and Sol xhigh for architecture, lifecycle,
+   concurrency, security, adjudication, and final review. Add a distinct Terra
+   xhigh lane only when a third independent review materially reduces risk.
 6. **Branch/commit:** one branch per wave (`hardening/<wave-name>`), one
    commit per task, merge to `main` only after review-to-zero; rerun gates on
    `main`. Never push, except the owner-approved W4 test/CI branch.

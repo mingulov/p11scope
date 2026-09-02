@@ -103,10 +103,11 @@ but selection requests, failures, and aliases are not yet release-complete.
    the loss-counter → consumer-verdict binding with a test (checklist 9 —
    PRD §6 requires it as evidence, not assumption).
 6. **`uprobe_multi` attach (owner decision 2026-09-01 — release scope):**
-   attach all offsets of an object via `uprobe_multi` where the running
-   kernel supports it (link type landed in 6.6), keeping the existing
+   attach all eligible offsets of an object via `uprobe_multi` only where the
+   strict runtime probe proves the required mechanism class, keeping the existing
    per-offset attach as the mandatory fallback at the 5.15 floor. Runtime
-   feature detection, never a compile-time split; the attach mechanism in use
+   feature detection, never kernel-version inference or a compile-time split;
+   the attach mechanism in use
    is recorded in the evidence output; both paths covered by the e2e oracle
    lane. **Planner verification:** aya 0.14.0's support surface and the
    PidPin/attach-before-run interaction were checked; the verified ruling below
@@ -219,6 +220,13 @@ criterion whose first qualification this wave owns; W8 re-runs it on the
 final tip) as a matrix row; record every cell
 pass/fail/UNRUN; update README/usage support statement to the tested list
 (PRD §7).
+
+For attachment evidence, record the strict runtime-probe result and actual
+mechanism for every kernel. Require the 5.15 per-offset row and at least one
+exact kernel/distro row whose probe selected `uprobe-multi`; do not assume a
+mechanism from the kernel version. The supported-rate oracle compares the
+generator's completed calls, STATS entered/returned, and raw consumed `CALL`
+records. It measures only the runtime-selected mechanism for that matrix cell.
 
 **Owner-gated:** VM-based lanes (uses `p11scope-ws/vm-bases` after W2).
 

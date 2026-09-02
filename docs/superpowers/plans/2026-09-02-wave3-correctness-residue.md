@@ -236,8 +236,8 @@ The 2026-09-02 independent Task-3 pre-mortem adds these execution invariants:
   retirement still owns every link created before a generation postcheck.
 - [x] RED: same-address/different-name claims produce occurrence-based
   `table_entries`, one physical `AttachKey`, and one aggregate cell.
-- [ ] RED: two-view claims retire independently while sharing physical targets.
-  Delayed records for retired IDs fail closed.
+- [x] RED: two-view claims retire independently while sharing physical targets.
+  Delayed records for retired IDs fail closed. Landed in `484036c`.
 - [x] GREEN: implement `SelectionClaimKey -> AttachKey` reference ownership and
   source-local count-only authorization through the existing
   preflight/apply/rollback transaction. Never attach a duplicate offset.
@@ -294,7 +294,8 @@ Design acceptance: §12 items 3, 14, and 15.
 
 - [ ] RED: exact JSON/mutation tests pin `interface_selection`, all finite
   arrays/enums/cross-references, count saturation, every selection loss to
-  `PARTIAL`, and no individual trace-line selection output.
+  `PARTIAL`, finite saturating `pid_descendant_gaps` and
+  `multi_rebuild_gaps`, and no individual trace-line selection output.
 - [ ] GREEN: profile and terminal trace use observed-profile v3; metrics stays
   v2-metrics and reads no selection arguments. Preserve v1 allowlist unchanged;
   v2 authorizes only the reviewed finite classes, a finite sorted
@@ -421,9 +422,16 @@ capture verdict.
   diagnostics on load failure without target data.
 - [ ] RED: for each discovery loss counter, serialize profile/metrics/terminal
   evidence and prove consumer verdict is `PARTIAL` exactly once.
+- [ ] RED: `pid_scope_fork_marks_descendant_unobserved_partial` proves a fork
+  observed under one-process PID scope records one finite count-only descendant
+  gap and forces `PARTIAL`; document cgroup scope as the descendant-coverage
+  route. Never inherit child semantic state as tracing coverage.
+- [ ] GREEN: record that gap at the existing fork observation boundary and
+  expose only its saturating count through Task 4's versioned evidence.
 - [ ] Update capability self-test and docs; privileged rows remain `UNRUN` if
   not authorized. Focused checks:
   `cargo +1.88 test --locked --lib capability_tier`,
+  `cargo +1.88 test --locked --lib pid_scope_fork_marks_descendant_unobserved_partial`,
   `cargo +1.88 test --locked --test proc_access capability_tier`, and
   `sh scripts/verify-capability-tier.sh --self-test`; then four canonical
   gates; commit.
@@ -462,7 +470,8 @@ Evidence and upstream contribution guidance:
 
 - Modify: `Cargo.toml`, `Cargo.lock`
 - Modify: `crates/ebpf/src/main.rs`
-- Modify: `src/attach.rs`, `src/discovery/engine.rs`, `src/render.rs`, `src/run.rs`
+- Modify: `src/attach.rs`, `src/discovery/engine.rs`, `src/render.rs`, `src/run.rs`,
+  `src/doctor.rs`
 - Modify: `docs/usage.md`
 - Modify: `docs/notes/2026-09-02-aya-uprobe-multi-status.md`
 - Modify: `tests/artifact_contracts.rs`, `scripts/verify-attach-e2e.sh`,
@@ -474,6 +483,12 @@ Current anchors: registered-link ownership around `src/attach.rs:488`, static
 attach transaction at `:734`, dynamic attach/detach at `:1450,1564`. Aya 0.14
 `UProbe::load()` uses expected attach type zero. Aya master recognizes
 `uprobe.multi` sections, loads attach type 48, and owns multi links natively.
+
+Execute and commit Task 7 as three reviewable batches: **7a** pins Aya and
+adapts every compiled attach call site while retaining per-offset behavior;
+**7b** adds the strict probe, multi twins, tail-call eligibility, grouping, and
+initial all-or-none transaction; **7c** adds bundle retirement/downgrade and
+its explicit gap evidence. Run Cargo and integrate these batches serially.
 
 - [ ] RED pin: dependency test proves the multi twin loads with expected
   attach type 48 while the legacy twin remains zero; p11scope proves the two
@@ -505,7 +520,8 @@ attach transaction at `:734`, dynamic attach/detach at `:1450,1564`. Aya 0.14
   reinterpret a later failure as unsupported.
 - [ ] RED: `multi_bundle_retirement_downgrades_without_orphans` proves bundle
   close, pin recheck, surviving sibling per-offset reattach, exact endpoint
-  ownership, and a real `PARTIAL` gap.
+  ownership, one saturating `multi_rebuild_gaps` increment, and a real
+  `PARTIAL` gap.
 - [ ] GREEN: implement that selective retirement; later additions stay
   per-offset.
 - [ ] RED: `uprobe_multi_attempt_rolls_back_every_owned_link` injects a second
@@ -521,11 +537,15 @@ attach transaction at `:734`, dynamic attach/detach at `:1450,1564`. Aya 0.14
 - [ ] Focused checks:
   `cargo +1.88 test --locked --lib uprobe_multi`,
   `cargo +1.88 test --locked --test artifact_contracts attach_mechanisms`, and
-  `sh scripts/verify-attach-e2e.sh --self-test`. Actual 5.15/6.6 kernel
-  attachment rows are privileged evidence and remain `UNRUN` unless
-  authorized. Four canonical gates; commit.
+  `sh scripts/verify-attach-e2e.sh --self-test`. The Linux 5.15 per-offset row
+  plus an exact kernel/distro row where the strict runtime probe returned true
+  are privileged evidence and remain `UNRUN` unless authorized. A kernel
+  version alone never proves the mechanism. Four canonical gates; commit each
+  7a/7b/7c batch.
 
-Commit: `feat: attach initial probe sets with uprobe_multi`
+Commits: 7a `build: pin Aya multi attach API`; 7b
+`feat: attach initial probe sets with uprobe_multi`; 7c
+`fix: downgrade multi bundles with explicit gap evidence`.
 
 ## Task 8: W3 closeout and review to zero
 
@@ -544,8 +564,10 @@ Commit: `feat: attach initial probe sets with uprobe_multi`
   inherit W1/W2 evidence.
 - [ ] Record the two post-W3 product-qualification rows in the closure report:
   `supported_rate_loss_oracle` (an empirically declared, matrix-specific fixed
-  burst/rate, exact counts, zero loss, and induced loss forcing `PARTIAL`; never
-  derive a supported events/second claim from ring capacity or drain cadence)
+  burst/rate with exact agreement between generator-completed calls, STATS
+  entered/returned, and raw consumed `CALL` records, zero loss, and induced
+  loss forcing `PARTIAL`; never derive a supported events/second claim from
+  ring capacity or drain cadence; test the runtime-selected mechanism)
   and
   `fork_exec_loader_unload_oracle` (fork, exec, `dlopen`, calls, `dlclose`,
   replacement/reload, exact retirement and attribution). These privileged

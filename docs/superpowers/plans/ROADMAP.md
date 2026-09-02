@@ -647,9 +647,11 @@ decision after W8.
 The two product oracles are release gates, not inherited historical evidence:
 
 - `supported_rate_loss_oracle`: an empirically declared, matrix-specific fixed
-  PKCS#11 burst/rate must produce exact profile/trace counts and zero loss; ring
-  capacity and drain cadence alone never establish a supported events/second
-  claim. A deliberately constrained ring must report exact nonzero loss and
+  PKCS#11 burst/rate must produce exact agreement between generator-completed
+  calls, STATS entered/returned, and raw consumed `CALL` records with zero
+  loss; ring capacity and drain cadence alone never establish a supported
+  events/second claim. Test the runtime-selected mechanism for each matrix
+  cell. A deliberately constrained ring must report exact nonzero loss and
   force `PARTIAL`.
 - `fork_exec_loader_unload_oracle`: one adversarial lifecycle must cover
   fork, exec, `dlopen`, calls, `dlclose`, pathname replacement/reload, terminal

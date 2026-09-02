@@ -55,7 +55,8 @@ preserved artifacts). Nothing durable anywhere else.
 - Privacy allowlist (`docs/privacy/allowlist-v1.md`) is never broadened
   implicitly.
 - Branch per wave off `main`, commit per task, merge only after
-  review-to-zero. **Never push.**
+  review-to-zero. **Never push** (sole exception: the owner-approved W4
+  test/CI branch).
 
 ## Owner-gated — surface and STOP, never do autonomously
 

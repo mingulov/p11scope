@@ -241,11 +241,12 @@ The 2026-09-02 independent Task-3 pre-mortem adds these execution invariants:
 - [x] GREEN: implement `SelectionClaimKey -> AttachKey` reference ownership and
   source-local count-only authorization through the existing
   preflight/apply/rollback transaction. Never attach a duplicate offset.
-- [ ] RED: `owned_run_selection_coverage` proves an exact provider prearmed
-  behind the owned-child barrier observes a constructor call and reports a
-  silent completed run as `absent_covered`; non-prearmed `run` and `--pid`
-  report `absent_uncovered`; normal finalization preserves the closed coverage
-  interval.
+- [ ] RED: `owned_run_selection_coverage` proves the private coverage reducer:
+  an exact provider prearmed behind the owned-child barrier observes a
+  constructor call and classifies a silent completed run as `absent_covered`;
+  non-prearmed `run` and `--pid` classify as `absent_uncovered`; normal
+  finalization preserves the closed coverage interval. Task 4 alone proves the
+  corresponding public JSON.
 - [ ] GREEN: preattach entry+return to exact freshly pinned provider exports
   before `OwnedChild::release`, then accept proof only after the eventual
   mapping agrees on device, inode, view, and generation.
@@ -274,7 +275,7 @@ The 2026-09-02 independent Task-3 pre-mortem adds these execution invariants:
 - [ ] Focused checks:
   `cargo +1.88 test --locked --lib c_get_interface_selection`,
   `cargo +1.88 test --locked --test live_discovery selection`, and
-  `cargo +1.88 test --locked --test run_lifecycle owned_run_selection_coverage`;
+  `cargo +1.88 test --locked --lib owned_run_selection_coverage`;
   then four canonical gates; commit.
 
 Commit: `feat: reduce interface selection with exact lifecycle authority`
@@ -303,7 +304,9 @@ Design acceptance: §12 items 3, 14, and 15.
   `uprobe-multi` value without reopening the schema or allowlist.
 - [ ] RED: `profile_v3_selection_contract_is_exact` and the two validator
   self-tests reject missing/extra v3 selection fields, secret canaries, stale
-  live profile-v2 pins, and an observer/helper description with reversed roles.
+  live profile-v2 pins, and an observer/helper description with reversed roles;
+  the public four-state coverage value must be derived exactly from Task 3's
+  private reducer.
 - [ ] GREEN: update docs, exact-schema dispatch, and canaries so the observer
   remains passive while the explicit helper is documented as making ten calls.
   Migrate live profile-v2 exact pins; retain historical records as historical.

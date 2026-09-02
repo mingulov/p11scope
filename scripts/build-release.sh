@@ -130,7 +130,8 @@ sealed-command-inventory-pinned-before-root-and-git-decisions
 sealed-environment-allowlist-exact-accepted
 forged-seal-marker-rejected
 inventory-wide-tool-ledger-exact-accepted
-sealed-bin-removed-after-terminal-status""".splitlines()
+sealed-bin-removed-after-terminal-status
+nightly-toolchain-closure-exact-accepted""".splitlines()
 
 good={"owners":1,"child_status":False,"facts":["43:99","hash"],"executables":["p11scope","p11scope-discover","p11scope-discover-glibc","p11scope-discover-musl"],"softhsm":68,"fixture":[68,92,104],"static":[68,68,136]}
 def lane_valid(d):
@@ -232,6 +233,14 @@ mark(lane[27],not reached<=floor and bool(reached-floor) and reached<=reached|fl
 finalization=["body","evidence-checks","terminal-status","remove-sealed-bin"]
 mark(lane[28],finalization.index("terminal-status")<finalization.index("remove-sealed-bin")
      and finalization[-1]=="remove-sealed-bin")
+# The shipped observer embeds an eBPF object built by a second toolchain, so
+# the recorded 1.88 pair is not the effective build closure on its own.
+stable_closure={"toolchain_cargo","toolchain_rustc"}
+nightly_closure={"toolchain_nightly_cargo","toolchain_nightly_rustc","toolchain_nightly_sysroot",
+                 "toolchain_nightly_rust_src","toolchain_bpf_linker"}
+def closure_bound(rows): return stable_closure|nightly_closure<=rows
+mark(lane[29],closure_bound(stable_closure|nightly_closure) and not closure_bound(stable_closure)
+     and not closure_bound((stable_closure|nightly_closure)-{"toolchain_nightly_rust_src"}))
 
 if len(rows)!=len(common)+len(lane) or len(rows)!=len(set(rows)): raise SystemExit("row coverage")
 report.parent.mkdir(parents=True,exist_ok=True);fd=os.open(report,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
@@ -295,10 +304,11 @@ CARGO_HOME RUSTUP_HOME RUSTUP_TOOLCHAIN RUSTC_WRAPPER CC CFLAGS'
 # through the image, so neither is under the caller's PATH authority and
 # neither is a member. An incomplete inventory fails closed as "not found"
 # under the seal; it never falls back to the caller's PATH.
-TASK4_TOOL_INVENTORY='awk bpf-linker bpftool cargo cat cc chmod cmp cp date
-dirname docker env file find flock gcc git grep head id jq ldd ln ls mkdir
-mktemp mv python3 realpath rm rustup sed setpriv sh sha256sum sleep
-softhsm2-util sort stat sudo sync tail timeout touch uname xargs'
+TASK4_TOOL_INVENTORY='as awk bpf-linker bpftool cargo cat cc chmod cmp cp
+date dirname docker env file find flock gcc git grep head id jq ld ldd
+llvm-objcopy llvm-readelf ln ls mkdir mktemp mv python3 realpath rm rustup sed
+setpriv sh sha256sum sleep softhsm2-util sort stat sudo sync tail timeout touch
+uname xargs'
 
 # The exact environment the sealed child may observe. `env -i` supplies seven
 # of these; dash itself adds PWD and, because line 26 `cd`s, OLDPWD. Nothing
@@ -447,6 +457,42 @@ task4_tool_ledger() {
     t4_now=$(realpath -e "$t4_found") || return 1
     printf 'toolchain_rustc\t%s %s %s\n' \
         "$T4_TOOLCHAIN_RUSTC" "$t4_now" "$(task4_digest "$T4_TOOLCHAIN_RUSTC")" || return 1
+    task4_nightly_closure || return 1
+}
+
+# The shipped observer embeds an eBPF object that `build.rs` builds with a
+# SECOND toolchain: `cargo +nightly-2026-05-20 ... -Z build-std=core`. Its
+# cargo, rustc, sysroot, the `rust-src` tree build-std compiles, and the BPF
+# linker are all effective inputs of the release artifact, and none of them is
+# the 1.88 pair the receipt already records. `bpf-linker` is bound at the
+# effective cargo home because Cargo prepends `$CARGO_HOME/bin` to the PATH of
+# every rustc it spawns -- verified on this host by an execve trace, which
+# resolved the bpfel-unknown-none link to `~/.cargo/bin/bpf-linker` and NOT to
+# the bundled rust-lld (rust-lld serves the host build-script links). The
+# rust-src tree is digested whole; a symlink inside it would make that digest
+# describe something other than what the compiler read, so it refuses.
+task4_nightly_closure() {
+    t4_found=$("$T4_TOOL_rustup" which --toolchain nightly-2026-05-20 cargo) || return 1
+    task4_pin_tool "$t4_found" t4_nightly_cargo || return 1
+    printf 'toolchain_nightly_cargo\t%s %s\n' \
+        "$t4_nightly_cargo" "$(task4_digest "$t4_nightly_cargo")" || return 1
+    t4_found=$("$T4_TOOL_rustup" which --toolchain nightly-2026-05-20 rustc) || return 1
+    task4_pin_tool "$t4_found" t4_nightly_rustc || return 1
+    printf 'toolchain_nightly_rustc\t%s %s\n' \
+        "$t4_nightly_rustc" "$(task4_digest "$t4_nightly_rustc")" || return 1
+    t4_sysroot=$("$t4_nightly_rustc" --print sysroot) || return 1
+    case $t4_sysroot in /*) ;; *) return 1 ;; esac
+    printf 'toolchain_nightly_sysroot\t%s\n' "$t4_sysroot" || return 1
+    t4_src=$t4_sysroot/lib/rustlib/src/rust
+    [ -d "$t4_src" ] && [ ! -L "$t4_src" ] || return 1
+    [ -z "$(find "$t4_src" -type l -print -quit)" ] || return 1
+    t4_src_digest=$(find "$t4_src" -type f -print0 | LC_ALL=C sort -z \
+        | xargs -0 "$T4_TOOL_sha256sum" | "$T4_TOOL_sha256sum" | awk '{print $1}') || return 1
+    [ -n "$t4_src_digest" ] || return 1
+    printf 'toolchain_nightly_rust_src\t%s %s\n' "$t4_src" "$t4_src_digest" || return 1
+    task4_pin_tool "${CARGO_HOME:-$HOME/.cargo}/bin/bpf-linker" t4_bpf_linker || return 1
+    printf 'toolchain_bpf_linker\t%s %s\n' \
+        "$t4_bpf_linker" "$(task4_digest "$t4_bpf_linker")" || return 1
 }
 
 release_body_cleanup() {

@@ -106,7 +106,7 @@ FUNCTION_NONE = (1 << 32) - 1
 ARG_READ_FAILURE = 1 << 4
 CALL_START_SIZE = 272
 EVENT_SIZE = 288
-DISCOVERY_RECORD_SIZE = 896
+DISCOVERY_RECORD_SIZE = 920
 # Every owned ringbuf, with the exact record length its mmap oracle accepts.
 # Keyed by name only because a record layout is per-map; which maps are
 # ringbufs is decided by `type`, from the one checked-in BPF inventory.

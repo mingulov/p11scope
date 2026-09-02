@@ -51,7 +51,7 @@ pub(crate) fn decode_discovery(bytes: &[u8]) -> Option<DiscoveryRecord> {
 }
 
 #[derive(Clone, Copy)]
-#[allow(clippy::large_enum_variant)] // The fixed 896-byte ring ABI stays allocation-free per dequeue.
+#[allow(clippy::large_enum_variant)] // The fixed 920-byte ring ABI stays allocation-free per dequeue.
 pub(crate) enum DiscoveryItem {
     Record(DiscoveryRecord),
     Malformed,

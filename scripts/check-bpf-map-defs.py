@@ -103,7 +103,7 @@ SAFE_MAPS = {
         "CONFIG": (2, 4, 8, 1, 128),
         "COUNTERS": (6, 4, 8, 5),
         "DISCOVERY": (27, 0, 0, 65_536),
-        "DISCOVERY_STATE": (1, 16, 16, 64),
+        "DISCOVERY_STATE": (1, 24, 24, 64),
         "EVENTS": (27, 0, 0, 262_144),
         "EVIDENCE": (6, 4, 8, 8),
         "MECH_SHAPE": (1, 8, 4, 1_024, 128),
@@ -161,7 +161,7 @@ def validate_policy_inventory(safe, unsafe):
 
 def self_test():
     assert SAFE_MAPS["DISCOVERY"] == map_def(27, 0, 0, 65_536)
-    assert SAFE_MAPS["DISCOVERY_STATE"] == map_def(1, 16, 16, 64)
+    assert SAFE_MAPS["DISCOVERY_STATE"] == map_def(1, 24, 24, 64)
     assert SAFE_MAPS["COUNTERS"] == map_def(6, 4, 8, 5)
     assert SAFE_MAPS["PAUSE_PIDS"] == map_def(1, 16, 8, 1)
     assert SAFE_MAPS["PID_FILTER"] == map_def(1, 4, 8, 1_024, 128)

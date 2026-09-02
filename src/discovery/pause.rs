@@ -303,7 +303,7 @@ pub(crate) struct PauseBatchOutcome {
     diagnostic: Option<PauseDiagnostic>,
 }
 
-#[allow(clippy::large_enum_variant)] // The frozen 896-byte item stays allocation-free in transfer.
+#[allow(clippy::large_enum_variant)] // The frozen 920-byte item stays allocation-free in transfer.
 pub(crate) enum PauseRevalidationOutcome {
     Complete(PauseBatchOutcome),
     Deferred(TimedItem),

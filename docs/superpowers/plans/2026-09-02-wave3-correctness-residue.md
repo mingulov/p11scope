@@ -138,8 +138,14 @@ Commit: `feat: record bounded offline interface selection evidence`
 
 - Modify: `crates/ebpf-common/src/lib.rs`
 - Modify: `crates/ebpf/src/main.rs`
-- Modify: `src/discovery/hooks.rs`
+- Modify: `src/attach.rs`
+- Modify: `src/discovery/pause.rs`
+- Modify: `src/events.rs`
+- Modify: `scripts/check-bpf-map-defs.py`
+- Modify: `scripts/check-live-discovery-object.py`
+- Modify: `scripts/verify-canaries.sh`
 - Modify: `tests/artifact_contracts.rs`
+- Modify: `tests/fixtures/live-discovery-provider.c`
 
 Design acceptance: §12 items 2, 3, and 8.
 
@@ -148,26 +154,26 @@ Current anchors: `DiscoveryRecord` at
 `interface_entry`/`interface_return` at
 `crates/ebpf/src/main.rs:847,859`.
 
-- [ ] RED: ABI tests cover all finite request/result classes, full-width flags
+- [x] RED: ABI tests cover all finite request/result classes, full-width flags
   and `CK_RV`, nonzero return without output dereference, null/unreadable
   success, reserved-zero layout, record size, recursive no-overwrite loss, and
   a dedicated full-width nonzero `u64` binding id. A failed provider outcome
   emits but never requests the owned-child discovery pause.
-- [ ] GREEN: extend the existing state and kind-4 record only enough to carry
+- [x] GREEN: extend the existing state and kind-4 record only enough to carry
   sanitized classifications/scalars and private return correlation. Emit one
   record for every matched return, including failure.
-- [ ] RED: static/round-trip contract proves request name bytes and pointers
+- [x] RED: static/round-trip contract proves request name bytes and pointers
   never enter BPF maps or records; metrics and non-interface hooks read no new
   arguments.
-- [ ] GREEN: make kind 4 structurally selection-only. Preserve existing ring,
+- [x] GREEN: make kind 4 structurally selection-only. Preserve existing ring,
   maps, read/state/ring counters, and bounded table walker.
-- [ ] Focused checks:
+- [x] Focused checks:
   `cargo +1.88 test --locked -p p11scope-ebpf-common` and
   `cargo +1.88 test --locked --test artifact_contracts`; the RED test names
   are `selection_transport_round_trips_failures` and
   `selection_transport_never_carries_name_bytes`; the former pins zero-id
   refusal and `u64::MAX` round-trip.
-- [ ] Four canonical gates; commit.
+- [x] Four canonical gates; commit.
 
 Commit: `feat: capture bounded C_GetInterface request outcomes`
 

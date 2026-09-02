@@ -22,7 +22,8 @@ use p11scope_ebpf_common::{
     interface_continuation_pack, interface_continuation_unpack, lifecycle,
     return_allows_mechanism, shape, valid_config, valid_loader_cookie, CallStart, DiscoveryRecord,
     Event, FunctionNameKey, PauseKey, RvKey, SlotSemantics, SlotStats, StartKey, StartState,
-    StateKey, ARG_NONE, CFG_FLAGS, COALESCED_NO_HELPER_RC, DISCOVERY_BYTES,
+    StateKey, STATE_DOMAIN_EXPORT, STATE_DOMAIN_SELECTION, ARG_NONE, CFG_FLAGS,
+    COALESCED_NO_HELPER_RC, DISCOVERY_BYTES,
     DISCOVERY_COUNTER_CELLS,
     DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES, DISCOVERY_COUNTER_EXPORT_STATE_FAILURES,
     DISCOVERY_COUNTER_LOADER_HITS, DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES,
@@ -31,6 +32,9 @@ use p11scope_ebpf_common::{
     DISCOVERY_INTERFACES,
     DISCOVERY_KIND_LEADER_EXIT, DISCOVERY_KIND_LOADER, DISCOVERY_NAME_EXACT_STANDARD,
     DISCOVERY_NAME_NA, DISCOVERY_NAME_NULL, DISCOVERY_NAME_OTHER, DISCOVERY_NAME_UNREADABLE,
+    DISCOVERY_VERSION_NULL, DISCOVERY_VERSION_UNREADABLE, DISCOVERY_VERSION_V3_0,
+    DISCOVERY_VERSION_V3_1, DISCOVERY_VERSION_V3_2,
+    discovery_version_class,
     DISCOVERY_STATUS_COALESCED_NO_HELPER, DISCOVERY_STATUS_LOADER_CONTEXT_INVALID,
     DISCOVERY_STATUS_READ_FAILURE, EVIDENCE_CELLS, EVIDENCE_CGROUP_SCOPE_FAILURES,
     EVIDENCE_RING_LOSS, EVIDENCE_RV_UPDATE_FAILURES, EVIDENCE_SEMANTIC_CAPTURE_FAILURES,
@@ -185,7 +189,7 @@ fn bump_discovery_counter(index: u32) {
 
 /// One source-bounded reservation/initializer path for every private
 /// discovery record. The object checker proves that this always-inlined region
-/// becomes 112 aligned u64 zero stores before any field use or submit.
+/// becomes 115 aligned u64 zero stores before any field use or submit.
 #[inline(always)]
 fn reserve_discovery() -> Option<RingBufEntry<DiscoveryRecord>> {
     let Some(mut entry) = DISCOVERY.reserve::<DiscoveryRecord>(0) else {
@@ -194,8 +198,8 @@ fn reserve_discovery() -> Option<RingBufEntry<DiscoveryRecord>> {
     };
     let raw = entry.as_mut_ptr();
     let words = raw.cast::<u64>();
-    // SAFETY: the reservation owns exactly one aligned 896-byte record. These
-    // straight-line volatile stores cover word indices 0..=111 exactly once.
+    // SAFETY: the reservation owns exactly one aligned 920-byte record. These
+    // straight-line volatile stores cover word indices 0..=114 exactly once.
     unsafe {
         // TASK5_DISCOVERY_INITIALIZER_BEGIN
         core::ptr::write_volatile(words.add(0), 0u64);
@@ -310,6 +314,9 @@ fn reserve_discovery() -> Option<RingBufEntry<DiscoveryRecord>> {
         core::ptr::write_volatile(words.add(109), 0u64);
         core::ptr::write_volatile(words.add(110), 0u64);
         core::ptr::write_volatile(words.add(111), 0u64);
+        core::ptr::write_volatile(words.add(112), 0u64);
+        core::ptr::write_volatile(words.add(113), 0u64);
+        core::ptr::write_volatile(words.add(114), 0u64);
         // TASK5_DISCOVERY_INITIALIZER_END
     }
     Some(entry)
@@ -379,7 +386,6 @@ fn finish_discovery_record(
 // TASK5_PAUSE_WRITER_END
 
 const EXPORT_SOURCE_FUNCTION_LIST: u8 = 1;
-const EXPORT_SOURCE_INTERFACE_INDIRECT: u8 = 3;
 
 struct ExportArgs {
     kind: u8,
@@ -390,14 +396,43 @@ struct ExportArgs {
     address: u64,
 }
 
+#[derive(Clone, Copy)]
+struct SelectionTransport {
+    request_name_class: u8,
+    request_version_class: u8,
+    request_flags: u64,
+    binding_id: u64,
+    return_rv: u64,
+    pause_eligible: bool,
+}
+
+const NO_SELECTION: SelectionTransport = SelectionTransport {
+    request_name_class: DISCOVERY_NAME_NA,
+    request_version_class: DISCOVERY_VERSION_NULL,
+    request_flags: 0,
+    binding_id: 0,
+    return_rv: 0,
+    pause_eligible: true,
+};
+
+struct ExportPayload {
+    record_meta: u64,
+    announced_count: u32,
+    table_ptr: u64,
+    interface_flags: u64,
+    selection: SelectionTransport,
+}
+
 #[inline(never)]
 fn classify_direct_interface(
     mut record_meta: u64,
     announced_count: u32,
     address: u64,
     scope: &ScopeAuth,
+    selection: &SelectionTransport,
 ) {
     let mut read_failed = false;
+    let mut interface_unreadable = false;
     let mut table_ptr = 0u64;
     let mut interface_flags = 0u64;
     let mut name_class = DISCOVERY_NAME_NA;
@@ -405,6 +440,7 @@ fn classify_direct_interface(
     if address == 0 {
         name_class = DISCOVERY_NAME_UNREADABLE;
         read_failed = true;
+        interface_unreadable = true;
     } else {
         match unsafe { helpers::bpf_probe_read_user(address as *const [u64; 3]) } {
             Ok([name, table, flags]) => {
@@ -434,86 +470,149 @@ fn classify_direct_interface(
             Err(_) => {
                 name_class = DISCOVERY_NAME_UNREADABLE;
                 read_failed = true;
+                interface_unreadable = true;
             }
         }
     }
 
-    record_meta = (record_meta & !(0xff00_0000u64 | 0x00ff_0000u64))
+    record_meta = (record_meta & !(0xff00_0000u64 | 0x00ff_0000u64 | 1u64 << 25))
         | ((name_class as u64) << 16)
-        | ((read_failed as u64) << 24);
+        | ((read_failed as u64) << 24)
+        | ((interface_unreadable as u64) << 25);
     emit_export(
-        record_meta,
-        announced_count,
-        table_ptr,
-        interface_flags,
+        &ExportPayload {
+            record_meta,
+            announced_count,
+            table_ptr,
+            interface_flags,
+            selection: *selection,
+        },
         scope,
     );
 }
 
 #[inline(never)]
-fn emit_export(
+fn classify_indirect_interface(
     record_meta: u64,
     announced_count: u32,
-    table_ptr: u64,
-    interface_flags: u64,
+    pp_interface: u64,
     scope: &ScopeAuth,
+    selection: &SelectionTransport,
 ) {
+    let interface_address = if pp_interface == 0 {
+        0
+    } else {
+        let address = pp_interface;
+        match unsafe { helpers::bpf_probe_read_user(address as *const u64) } {
+            Ok(pointer) => pointer,
+            Err(_) => 0,
+        }
+    };
+    classify_direct_interface(
+        record_meta,
+        announced_count,
+        interface_address,
+        scope,
+        selection,
+    );
+}
+
+#[inline(never)]
+fn emit_export(payload: &ExportPayload, scope: &ScopeAuth) {
     let Some(mut entry) = reserve_discovery() else {
         return;
     };
     let raw = entry.as_mut_ptr();
-    let kind = record_meta as u8;
-    let interface_index = (record_meta >> 8) as u8;
-    let name_class = (record_meta >> 16) as u8;
-    let mut read_failed = (record_meta >> 24) & 1 != 0;
-    let symbol_id = (record_meta >> 32) as u32;
+    let kind = payload.record_meta as u8;
+    let interface_index = (payload.record_meta >> 8) as u8;
+    let name_class = (payload.record_meta >> 16) as u8;
+    let mut read_failed = (payload.record_meta >> 24) & 1 != 0;
+    let interface_unreadable = (payload.record_meta >> 25) & 1 != 0;
+    let symbol_id = (payload.record_meta >> 32) as u32;
+    let selection = payload.selection;
     let read_table =
         name_class == DISCOVERY_NAME_NA || name_class == DISCOVERY_NAME_EXACT_STANDARD;
     let mut version_major = 0u8;
     let mut version_minor = 0u8;
+    let mut selection_version_class = DISCOVERY_VERSION_NULL;
     let mut attempted = 0u8;
     let mut completed = 0u8;
-    if read_table && !read_failed {
-        match unsafe { helpers::bpf_probe_read_user(table_ptr as *const [u8; 2]) } {
+    let mut walk_slots = 0u8;
+    let mut read_version = false;
+    if selection.return_rv != 0 {
+        read_failed = false;
+    } else if selection.binding_id != 0 {
+        if interface_unreadable {
+            selection_version_class = DISCOVERY_VERSION_UNREADABLE;
+        } else if payload.table_ptr == 0 {
+            read_failed = true;
+        } else {
+            read_version = true;
+        }
+    } else if read_table && !read_failed {
+        read_version = true;
+    }
+    if read_version {
+        match unsafe { helpers::bpf_probe_read_user(payload.table_ptr as *const [u8; 2]) } {
             Ok(version) => {
-                version_major = version[0];
-                version_minor = version[1];
-                let slots = discovery_table_slots(version_major, version_minor);
-                let mut pointer_index = 0usize;
-                while pointer_index < 104 {
-                    if pointer_index >= slots as usize {
-                        break;
+                if selection.binding_id != 0 {
+                    selection_version_class = discovery_version_class(version[0], version[1]);
+                    if name_class == DISCOVERY_NAME_EXACT_STANDARD
+                        && matches!(
+                            selection_version_class,
+                            DISCOVERY_VERSION_V3_0
+                                | DISCOVERY_VERSION_V3_1
+                                | DISCOVERY_VERSION_V3_2
+                        )
+                    {
+                        walk_slots = discovery_table_slots(version[0], version[1]);
                     }
-                    attempted += 1;
-                    let Some(address) = table_ptr
-                        .checked_add(8)
-                        .and_then(|base| base.checked_add(pointer_index as u64 * 8))
-                    else {
-                        read_failed = true;
-                        break;
-                    };
-                    match unsafe { helpers::bpf_probe_read_user(address as *const u64) } {
-                        Ok(pointer) => {
-                            // SAFETY: pointer_index is statically bounded below
-                            // DISCOVERY_POINTERS and the record is initialized.
-                            unsafe {
-                                core::ptr::write_volatile(
-                                    core::ptr::addr_of_mut!((*raw).pointers[pointer_index]),
-                                    pointer,
-                                );
-                            }
-                            completed += 1;
-                        }
-                        Err(_) => {
-                            read_failed = true;
-                            break;
-                        }
-                    }
-                    pointer_index += 1;
+                } else {
+                    version_major = version[0];
+                    version_minor = version[1];
+                    walk_slots = discovery_table_slots(version_major, version_minor);
                 }
             }
-            Err(_) => read_failed = true,
+            Err(_) => {
+                if selection.binding_id != 0 {
+                    selection_version_class = DISCOVERY_VERSION_UNREADABLE;
+                }
+                read_failed = true;
+            }
         }
+    }
+    let mut pointer_index = 0usize;
+    while pointer_index < 104 {
+        if pointer_index >= walk_slots as usize {
+            break;
+        }
+        attempted += 1;
+        let Some(address) = payload
+            .table_ptr
+            .checked_add(8)
+            .and_then(|base| base.checked_add(pointer_index as u64 * 8))
+        else {
+            read_failed = true;
+            break;
+        };
+        match unsafe { helpers::bpf_probe_read_user(address as *const u64) } {
+            Ok(pointer) => {
+                // SAFETY: pointer_index is statically bounded below
+                // DISCOVERY_POINTERS and the record is initialized.
+                unsafe {
+                    core::ptr::write_volatile(
+                        core::ptr::addr_of_mut!((*raw).pointers[pointer_index]),
+                        pointer,
+                    );
+                }
+                completed += 1;
+            }
+            Err(_) => {
+                read_failed = true;
+                break;
+            }
+        }
+        pointer_index += 1;
     }
     if read_failed {
         bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES);
@@ -527,16 +626,40 @@ fn emit_export(
     };
     // SAFETY: the shared initializer completed before every field write.
     unsafe {
-        core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).table_ptr), table_ptr);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).table_ptr), payload.table_ptr);
         core::ptr::write_volatile(
             core::ptr::addr_of_mut!((*raw).interface_flags),
-            interface_flags,
+            payload.interface_flags,
         );
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).kind), kind);
-        core::ptr::write_volatile(
-            core::ptr::addr_of_mut!((*raw).interface_index),
-            interface_index,
-        );
+        if selection.binding_id != 0 {
+            core::ptr::write_volatile(
+                core::ptr::addr_of_mut!((*raw).case_id),
+                selection.request_name_class,
+            );
+            core::ptr::write_volatile(
+                core::ptr::addr_of_mut!((*raw).interface_index),
+                selection.request_version_class,
+            );
+            core::ptr::write_volatile(
+                core::ptr::addr_of_mut!((*raw).return_rv),
+                selection.return_rv,
+            );
+            core::ptr::write_volatile(
+                core::ptr::addr_of_mut!((*raw).request_flags),
+                selection.request_flags,
+            );
+            core::ptr::write_volatile(
+                core::ptr::addr_of_mut!((*raw).binding_id),
+                selection.binding_id,
+            );
+        }
+        if selection.binding_id == 0 {
+            core::ptr::write_volatile(
+                core::ptr::addr_of_mut!((*raw).interface_index),
+                interface_index,
+            );
+        }
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).name_class), name_class);
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).usable_n), usable);
         core::ptr::write_volatile(
@@ -546,14 +669,23 @@ fn emit_export(
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).completed_prefix), completed);
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).version_major), version_major);
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).version_minor), version_minor);
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!((*raw).selection_version_class),
+            if selection.binding_id != 0 {
+                selection_version_class
+            } else {
+                0
+            },
+        );
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).symbol_id), symbol_id);
         core::ptr::write_volatile(
             core::ptr::addr_of_mut!((*raw).announced_count),
-            announced_count,
+            payload.announced_count,
         );
     }
     let pid_tgid = helpers::bpf_get_current_pid_tgid();
-    finish_discovery_record(entry, *scope, true, pid_tgid, status);
+    let pause_eligible = selection.pause_eligible;
+    finish_discovery_record(entry, *scope, pause_eligible, pid_tgid, status);
 }
 
 #[inline(always)]
@@ -571,10 +703,13 @@ fn classify_export(args: &ExportArgs, scope: &ScopeAuth) {
             }
         };
         emit_export(
-            record_meta | ((read_failed as u64) << 24),
-            args.announced_count,
-            table_ptr,
-            0,
+            &ExportPayload {
+                record_meta: record_meta | ((read_failed as u64) << 24),
+                announced_count: args.announced_count,
+                table_ptr,
+                interface_flags: 0,
+                selection: NO_SELECTION,
+            },
             scope,
         );
     } else {
@@ -588,6 +723,7 @@ fn classify_export(args: &ExportArgs, scope: &ScopeAuth) {
             args.announced_count,
             interface_address,
             scope,
+            &NO_SELECTION,
         );
     }
 }
@@ -603,6 +739,7 @@ fn export_state_key<C: aya_ebpf::EbpfContext>(ctx: &C) -> Option<StateKey> {
     Some(StateKey {
         pid_tgid: helpers::bpf_get_current_pid_tgid(),
         attach_cookie: unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) },
+        domain: STATE_DOMAIN_EXPORT,
     })
 }
 
@@ -650,6 +787,84 @@ fn finish_export_state(key: &StateKey) {
     }
 }
 
+#[inline(always)]
+fn selection_state_key<C: aya_ebpf::EbpfContext>(ctx: &C) -> Option<StateKey> {
+    let attach_cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
+    (attach_cookie != 0).then_some(StateKey {
+        pid_tgid: helpers::bpf_get_current_pid_tgid(),
+        attach_cookie,
+        domain: STATE_DOMAIN_SELECTION,
+    })
+}
+
+fn classify_selection_name(pointer: u64) -> u8 {
+    if pointer == 0 {
+        return DISCOVERY_NAME_NULL;
+    }
+    let mut bytes = [0u8; 9];
+    let read = unsafe {
+        helpers::generated::bpf_probe_read_user_str(
+            bytes.as_mut_ptr().cast(),
+            bytes.len() as u32,
+            pointer as *const core::ffi::c_void,
+        )
+    };
+    if read < 0 {
+        bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES);
+        DISCOVERY_NAME_UNREADABLE
+    } else if read == 8 && bytes[..8] == *b"PKCS 11\0" {
+        DISCOVERY_NAME_EXACT_STANDARD
+    } else {
+        DISCOVERY_NAME_OTHER
+    }
+}
+
+fn classify_selection_version(pointer: u64) -> u8 {
+    if pointer == 0 {
+        return DISCOVERY_VERSION_NULL;
+    }
+    match unsafe { helpers::bpf_probe_read_user(pointer as *const [u8; 2]) } {
+        Ok([major, minor]) => discovery_version_class(major, minor),
+        Err(_) => {
+            bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES);
+            DISCOVERY_VERSION_UNREADABLE
+        }
+    }
+}
+
+fn selection_request_word(name_class: u8, version_class: u8) -> u64 {
+    u64::from(name_class) | (u64::from(version_class) << 8)
+}
+
+fn insert_selection_state(ctx: &ProbeContext, state: StartState) {
+    let Some(key) = selection_state_key(ctx) else {
+        return;
+    };
+    if DISCOVERY_STATE
+        .insert(&key, &state, aya_ebpf::bindings::BPF_NOEXIST as u64)
+        .is_err()
+    {
+        let _ = DISCOVERY_STATE.remove(&key);
+        bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_STATE_FAILURES);
+    }
+}
+
+fn take_selection_state(
+    ctx: &RetProbeContext,
+    scoped: bool,
+) -> Option<(StateKey, StartState)> {
+    let key = selection_state_key(ctx)?;
+    let state = unsafe { DISCOVERY_STATE.get(&key) }.copied();
+    let removed = DISCOVERY_STATE.remove(&key).is_ok();
+    if discovery_state_take_failed(state.is_some(), removed) {
+        if scoped {
+            bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_STATE_FAILURES);
+        }
+        return None;
+    }
+    state.map(|state| (key, state))
+}
+
 #[uprobe]
 pub fn function_list_entry(ctx: ProbeContext) -> u32 {
     insert_export_state(
@@ -657,6 +872,7 @@ pub fn function_list_entry(ctx: ProbeContext) -> u32 {
         StartState {
             arg0: ctx.arg::<u64>(0).unwrap_or(0),
             arg1: 0,
+            arg2: 0,
         },
     );
     0
@@ -695,6 +911,7 @@ pub fn interface_list_entry(ctx: ProbeContext) -> u32 {
         StartState {
             arg0: ctx.arg::<u64>(0).unwrap_or(0),
             arg1: ctx.arg::<u64>(1).unwrap_or(0),
+            arg2: 0,
         },
     );
     0
@@ -740,10 +957,12 @@ pub fn interface_list_return(ctx: RetProbeContext) -> u32 {
     let key = StateKey {
         pid_tgid: entry_key.pid_tgid,
         attach_cookie: 0,
+        domain: STATE_DOMAIN_EXPORT,
     };
     let continuation = StartState {
         arg0: state.arg0,
         arg1: packed,
+        arg2: 0,
     };
     if DISCOVERY_STATE
         .insert(
@@ -766,6 +985,7 @@ pub fn interface_list_worker(ctx: RetProbeContext) -> u32 {
     let key = StateKey {
         pid_tgid: helpers::bpf_get_current_pid_tgid(),
         attach_cookie: 0,
+        domain: STATE_DOMAIN_EXPORT,
     };
     let Some(scope) = scope_auth() else {
         discard_export_state(&key);
@@ -821,6 +1041,7 @@ pub fn interface_list_worker(ctx: RetProbeContext) -> u32 {
         announced_count,
         address,
         &scope,
+        &NO_SELECTION,
     );
 
     let Some(next) = interface_continuation_next(state.arg1) else {
@@ -830,6 +1051,7 @@ pub fn interface_list_worker(ctx: RetProbeContext) -> u32 {
     let continuation = StartState {
         arg0: state.arg0,
         arg1: next,
+        arg2: 0,
     };
     if DISCOVERY_STATE
         .insert(&key, &continuation, aya_ebpf::bindings::BPF_EXIST as u64)
@@ -845,11 +1067,20 @@ pub fn interface_list_worker(ctx: RetProbeContext) -> u32 {
 
 #[uprobe]
 pub fn interface_entry(ctx: ProbeContext) -> u32 {
-    insert_export_state(
+    let Some(scope) = scope_auth() else {
+        return 0;
+    };
+    if scope.flags & FLAG_POLICY_AGGREGATE != 0 {
+        return 0;
+    }
+    let request_name_class = classify_selection_name(ctx.arg::<u64>(0).unwrap_or(0));
+    let request_version_class = classify_selection_version(ctx.arg::<u64>(1).unwrap_or(0));
+    insert_selection_state(
         &ctx,
         StartState {
             arg0: ctx.arg::<u64>(2).unwrap_or(0),
-            arg1: 0,
+            arg1: selection_request_word(request_name_class, request_version_class),
+            arg2: ctx.arg::<u64>(3).unwrap_or(0),
         },
     );
     0
@@ -858,24 +1089,45 @@ pub fn interface_entry(ctx: ProbeContext) -> u32 {
 #[uretprobe]
 pub fn interface_return(ctx: RetProbeContext) -> u32 {
     let scope = scope_auth();
-    let Some((key, state)) = take_export_state(&ctx, scope.is_some()) else {
+    if scope
+        .as_ref()
+        .is_some_and(|scope| scope.flags & FLAG_POLICY_AGGREGATE != 0)
+    {
+        return 0;
+    }
+    let Some((key, state)) = take_selection_state(&ctx, scope.is_some()) else {
         return 0;
     };
     let Some(scope) = scope else {
         return 0;
     };
     let rv: u64 = ctx.ret();
-    if rv == 0 {
-        classify_export(
-            &ExportArgs {
-                kind: DISCOVERY_KIND_INTERFACE_RETURN,
-                source: EXPORT_SOURCE_INTERFACE_INDIRECT,
-                interface_index: 0,
-                symbol_id: key.attach_cookie as u32,
+    let selection = SelectionTransport {
+        request_name_class: state.arg1 as u8,
+        request_version_class: (state.arg1 >> 8) as u8,
+        request_flags: state.arg2,
+        binding_id: key.attach_cookie,
+        return_rv: rv,
+        pause_eligible: rv == 0,
+    };
+    if rv != 0 {
+        emit_export(
+            &ExportPayload {
+                record_meta: DISCOVERY_KIND_INTERFACE_RETURN as u64,
                 announced_count: 0,
-                address: state.arg0,
+                table_ptr: 0,
+                interface_flags: 0,
+                selection,
             },
             &scope,
+        );
+    } else {
+        classify_indirect_interface(
+            DISCOVERY_KIND_INTERFACE_RETURN as u64,
+            0,
+            state.arg0,
+            &scope,
+            &selection,
         );
     }
     0

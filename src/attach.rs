@@ -923,7 +923,7 @@ fn validate_runtime_maps(ebpf: &Ebpf) -> Result<()> {
         0,
         p11scope_ebpf_common::DISCOVERY_BYTES,
     )?;
-    validate_runtime_map(ebpf, "DISCOVERY_STATE", MapType::Hash, 16, 16, 64)?;
+    validate_runtime_map(ebpf, "DISCOVERY_STATE", MapType::Hash, 24, 24, 64)?;
     validate_runtime_map(
         ebpf,
         "COUNTERS",

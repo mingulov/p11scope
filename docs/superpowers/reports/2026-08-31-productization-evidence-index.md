@@ -90,7 +90,7 @@ Jammy 22.04 / kernel 5.15.0-187:
 - Evidence archive:
   `a34461f4fea672f7a125706df5250c7bad5f84e09fb34f803408c08435f284f9`.
 - Sealed manifest copy:
-  `/home/user/.local/state/p11scope/mvp-semantic-jammy-attempt28-two-phase-six-row/`.
+  `/home/user/src/m/p11scope-ws/preserved/evidence-roots/mvp-semantic-jammy-attempt28-two-phase-six-row/` (originally under `~/.local/state/p11scope/`, relocated 2026-09-02).
 
 Noble 24.04 / kernel 6.8.0-137:
 
@@ -99,7 +99,7 @@ Noble 24.04 / kernel 6.8.0-137:
 - Evidence archive:
   `837a560140f3f5161c6781f745059034028981b15fac793eaed109ec1abdc8fa`.
 - Sealed manifest copy:
-  `/home/user/.local/state/p11scope/mvp-semantic-noble-attempt29-two-phase-six-row/`.
+  `/home/user/src/m/p11scope-ws/preserved/evidence-roots/mvp-semantic-noble-attempt29-two-phase-six-row/` (originally under `~/.local/state/p11scope/`, relocated 2026-09-02).
 - A separate Noble diagnostic Gate A was not repeated; all six product rows
   loaded and exercised the identical object. Independent review accepted this
   with the Jammy Gate A as sufficient for the MVP two-kernel gate.
@@ -156,7 +156,7 @@ Jammy 5.15:
   `12e25383ed7a7d9c4e5f652ca34fba52e7e32e373e8373c865f714b1061e7afe`.
   A verified preservation copy, including the candidate runner/object and
   manifest, is under
-  `/home/user/.local/state/p11scope/mvp-semantic-jammy-attempt15-clean-row02/`.
+  `/home/user/src/m/p11scope-ws/preserved/evidence-roots/mvp-semantic-jammy-attempt15-clean-row02/` (originally under `~/.local/state/p11scope/`, relocated 2026-09-02).
   Its disposable child was deleted after graceful shutdown and successful
   image/input checks.
 
@@ -190,7 +190,7 @@ The historical `main` history through
 `90a03acbbbaff6de39fe56d3eb4de8b8add27e43` and its then-current evidence set
 remain packaged at:
 
-`/home/user/.local/state/p11scope/pkcs11-scope-portable-90a03ac.tar.zst`
+`/home/user/src/m/p11scope-ws/preserved/portable/pkcs11-scope-portable-90a03ac.tar.zst` (originally under `~/.local/state/p11scope/`, relocated 2026-09-02)
 
 - archive SHA-256:
   `e4d6cf6294d7717c5b89cd38bec3a608e1fc8d8696a3f86f074a6bbcb4c2d6cf`
@@ -230,7 +230,7 @@ validated findings: one high, six medium, and two low.
   finding.
 
 Durable private copy (mode 0700/0600):
-`/home/user/.local/state/p11scope/security-scan-3e10be9/`.
+`/home/user/src/m/p11scope-ws/preserved/security-scan-3e10be9/` (originally under `~/.local/state/p11scope/`, relocated 2026-09-02).
 
 - `scan-manifest.json`: `efe277bfb3f2a3f0c439c2239e5c2f0725bb0dfbbbd65d3b8010b8078b07d16b`
 - `findings.json`: `014e94863827184010218f07cc1a28cd47c310eab7090875df7fa75fb173b8a9`

@@ -6478,6 +6478,15 @@ impl Engine {
         candidate: &mut LiveCandidate,
         stale_views: &BTreeSet<ProcessViewId>,
     ) {
+        // A binding belongs to one process view even when its physical target is
+        // shared with another view. Retire the binding itself before dropping
+        // this view's claims so delayed records cannot reuse its capture-local
+        // ID while the surviving owner keeps the shared slot attached.
+        for binding in self.selection_bindings.values_mut() {
+            if stale_views.contains(&binding.view) {
+                binding.retired = true;
+            }
+        }
         let mut cleaned_pins = candidate.pinned.clone();
         for view in stale_views {
             cleaned_pins.remove_view(*view);
@@ -14085,6 +14094,7 @@ mod tests {
 
     struct LoadedSeedProvider {
         child: std::process::Child,
+        peers: Vec<std::process::Child>,
         _dir: tempfile::TempDir,
     }
 
@@ -14092,6 +14102,22 @@ mod tests {
         fn drop(&mut self) {
             let _ = self.child.kill();
             let _ = self.child.wait();
+            for peer in &mut self.peers {
+                let _ = peer.kill();
+                let _ = peer.wait();
+            }
+        }
+    }
+
+    impl LoadedSeedProvider {
+        fn spawn_peer(&mut self) -> u32 {
+            let child = std::process::Command::new(self._dir.path().join("seed-runner"))
+                .arg(self._dir.path().join("seed-provider.so"))
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            self.peers.push(child);
+            pid
         }
     }
 
@@ -14171,7 +14197,11 @@ int main(int argc, char **argv) {
             .arg(&library)
             .spawn()
             .unwrap();
-        let fixture = LoadedSeedProvider { child, _dir: dir };
+        let fixture = LoadedSeedProvider {
+            child,
+            peers: Vec::new(),
+            _dir: dir,
+        };
         let view = ProcessView::open(ProcessViewId(0), fixture.child.id()).unwrap();
         let mut mapped = None;
         for _ in 0..200 {
@@ -14443,6 +14473,259 @@ int main(int argc, char **argv) {
         );
         assert_eq!(session.dynamic_attach_calls.len(), 3);
         assert_eq!(engine.selection_bindings.len(), 1);
+    }
+
+    #[test]
+    fn two_view_selection_claims_retire_independently() {
+        let (mut fixture, mut engine, mut session, first_binding) = attached_selection_route();
+        let provider_path = PathBuf::from(&engine.modules[0].scanned.path);
+        let peer_pid = fixture.spawn_peer();
+        let second_view = ProcessView::open(ProcessViewId(1), peer_pid).unwrap();
+        let second_view_id = second_view.id();
+        let (cgroup_engine, _scope_dir) =
+            engine_over_cgroup_naming(&[engine.views[0].pid(), peer_pid]);
+        engine.scope = cgroup_engine.scope;
+        let provider = engine
+            .pinned
+            .owned_timing_key(first_binding.object)
+            .unwrap();
+        let first_table = selection_only_table(
+            &engine,
+            first_binding,
+            0x20,
+            &[("C_Initialize", 0x100)],
+            Vec::new(),
+        );
+        let result = SelectionRequest {
+            name: SelectionNameClass::ExactStandard,
+            version: SelectionVersionClass::V3_0,
+            flags: 0,
+        };
+        let (claims, tables, pending) = engine
+            .propose_selection_claim(&first_binding, provider, &first_table, &result)
+            .unwrap();
+        let candidate = engine
+            .live_candidate_with_selection(
+                engine.pinned.clone(),
+                engine
+                    .modules
+                    .iter()
+                    .map(|module| module.scanned.clone())
+                    .collect(),
+                claims,
+                tables,
+                pending,
+            )
+            .unwrap();
+        engine
+            .apply_candidate(&mut session, candidate, &mut true, false, &[])
+            .unwrap();
+
+        let mut mapped = None;
+        for _ in 0..200 {
+            let maps =
+                parse_maps(&std::fs::read(format!("/proc/{peer_pid}/maps")).unwrap()).unwrap();
+            mapped = maps.iter().find_map(|mapping| {
+                matches!(
+                    resolve(&maps, mapping.start),
+                    Resolved::File {
+                        path: MappedPath::Usable(ref path),
+                        ..
+                    } if path == &provider_path
+                )
+                .then(|| mapping.clone())
+            });
+            if mapped.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let mut second_module = mapped_object(
+            &second_view,
+            &mapped.expect("the peer seed provider is mapped"),
+            &provider_path,
+        );
+        second_module.exports = vec![
+            "C_GetFunctionList".into(),
+            "C_GetInterfaceList".into(),
+            "C_GetInterface".into(),
+        ];
+        let mut candidate_pinned = engine.pinned.clone();
+        assert!(
+            candidate_pinned
+                .absorb(pin_test_module(&second_view, &second_module))
+                .is_empty()
+        );
+        engine.next_view_id = 2;
+        let raw_modules = engine
+            .modules
+            .iter()
+            .map(|module| module.scanned.clone())
+            .chain([second_module.clone()])
+            .collect();
+        let candidate = engine
+            .live_candidate(candidate_pinned, raw_modules, Vec::new())
+            .unwrap();
+        assert!(
+            engine
+                .apply_candidate(&mut session, candidate, &mut true, false, &[&second_view],)
+                .unwrap()
+                .accepted()
+        );
+        engine.views.push(second_view);
+        engine
+            .arm_loader_or_partial(
+                1,
+                &mut session,
+                &mut true,
+                &mut PendingViewRetirements::new(),
+            )
+            .unwrap();
+        let (retire, complete) =
+            engine.attach_refreshed_exports(second_view_id, &mut session, &mut true);
+        assert!(!retire && complete);
+        let second_binding = *engine
+            .selection_bindings
+            .values()
+            .find(|binding| binding.view == second_view_id)
+            .unwrap();
+        let second_table = selection_only_table(
+            &engine,
+            second_binding,
+            0x20,
+            &[("C_Initialize", 0x100)],
+            Vec::new(),
+        );
+        let (claims, tables, pending) = engine
+            .propose_selection_claim(
+                &second_binding,
+                engine
+                    .pinned
+                    .owned_timing_key(second_binding.object)
+                    .unwrap(),
+                &second_table,
+                &result,
+            )
+            .unwrap();
+        let raw_modules = engine
+            .modules
+            .iter()
+            .map(|module| module.scanned.clone())
+            .collect();
+        let candidate = engine
+            .live_candidate_with_selection(
+                engine.pinned.clone(),
+                raw_modules,
+                claims,
+                tables,
+                pending,
+            )
+            .unwrap();
+        assert!(
+            engine
+                .apply_candidate(&mut session, candidate, &mut true, false, &[])
+                .unwrap()
+                .accepted()
+        );
+
+        let selection_slot = engine
+            .plan
+            .slots
+            .iter()
+            .find(|slot| slot.file_offset == 0x100)
+            .map(|slot| slot.index)
+            .unwrap();
+        assert_eq!(engine.selection_claims.len(), 2);
+        assert_eq!(
+            engine
+                .plan
+                .slots
+                .iter()
+                .filter(|slot| slot.file_offset == 0x100 && engine.plan.is_active(slot.index))
+                .count(),
+            1
+        );
+        let raw_modules = engine
+            .modules
+            .iter()
+            .map(|module| module.scanned.clone())
+            .collect();
+        let candidate = engine
+            .live_candidate(engine.pinned.clone(), raw_modules, Vec::new())
+            .unwrap();
+        let mut first_retirement =
+            ScriptedSession::losing_generation_at_attach(engine.views[0].pid());
+        let first_outcome = engine
+            .apply_candidate(&mut first_retirement, candidate, &mut true, false, &[])
+            .unwrap();
+
+        assert!(!first_outcome.accepted());
+        assert!(
+            engine.selection_bindings[&first_binding.id].retired,
+            "retiring the first view must retire its binding ID"
+        );
+        assert!(!engine.selection_bindings[&second_binding.id].retired);
+        assert_eq!(engine.selection_claims.len(), 1);
+        assert_eq!(
+            engine.selection_claims.keys().next().unwrap().binding_id,
+            second_binding.id
+        );
+        assert!(engine.plan.is_active(selection_slot));
+        assert_eq!(first_retirement.detached_slots.iter().sum::<usize>(), 0);
+
+        let mut delayed: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        delayed.kind = DISCOVERY_KIND_INTERFACE_RETURN;
+        delayed.pid_tgid = u64::from(engine.views[0].pid()) << 32;
+        delayed.case_id = DISCOVERY_NAME_EXACT_STANDARD;
+        delayed.interface_index = DISCOVERY_VERSION_V3_0;
+        delayed.name_class = DISCOVERY_NAME_EXACT_STANDARD;
+        delayed.selection_version_class = DISCOVERY_VERSION_V3_0;
+        delayed.binding_id = first_binding.id;
+        assert_eq!(
+            engine.process_selection_record(&QueuedDiscoveryRecord {
+                record: delayed,
+                terminal_owner: None,
+                terminal_exports: Vec::new(),
+            }),
+            DiscoveryRecordOutcome::Rejected(RecordRejection::SelectionUnattributed)
+        );
+
+        let mut usable: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        usable.kind = DISCOVERY_KIND_INTERFACE_RETURN;
+        usable.pid_tgid = u64::from(engine.views[1].pid()) << 32;
+        usable.case_id = DISCOVERY_NAME_EXACT_STANDARD;
+        usable.interface_index = DISCOVERY_VERSION_V3_0;
+        usable.name_class = DISCOVERY_NAME_EXACT_STANDARD;
+        usable.selection_version_class = DISCOVERY_VERSION_V3_0;
+        usable.return_rv = 1;
+        usable.binding_id = second_binding.id;
+        assert_eq!(
+            engine.process_selection_record(&QueuedDiscoveryRecord {
+                record: usable,
+                terminal_owner: None,
+                terminal_exports: Vec::new(),
+            }),
+            DiscoveryRecordOutcome::applied(false, true)
+        );
+
+        let raw_modules = engine
+            .modules
+            .iter()
+            .map(|module| module.scanned.clone())
+            .collect();
+        let candidate = engine
+            .live_candidate(engine.pinned.clone(), raw_modules, Vec::new())
+            .unwrap();
+        let mut second_retirement = ScriptedSession::losing_generation_at_attach(peer_pid);
+        let second_outcome = engine
+            .apply_candidate(&mut second_retirement, candidate, &mut true, false, &[])
+            .unwrap();
+        assert!(!second_outcome.accepted());
+        assert_eq!(second_retirement.detached_slots.iter().sum::<usize>(), 1);
+        assert!(!engine.plan.is_active(selection_slot));
+        assert!(engine.selection_bindings[&second_binding.id].retired);
+        assert!(engine.selection_claims.is_empty());
+        assert!(engine.selection_tables.is_empty());
     }
 
     #[test]

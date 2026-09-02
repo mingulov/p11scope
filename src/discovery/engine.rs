@@ -74,6 +74,8 @@ pub struct Engine {
     ready_expected_removals: BTreeSet<ProcessViewId>,
     expected_target_exit_pending: Option<ProcessViewId>,
     expected_target_exit: bool,
+    next_selection_binding_id: Option<u64>,
+    selection_bindings: BTreeMap<u64, SelectionBindingFact>,
     /// The deduplicated bound-context set behind `loader_discovery`'s
     /// strategy/timing/capture counts (design §9.2). Keyed by the exact
     /// internal `{process generation, bound identity state, load kind}` — so
@@ -1014,6 +1016,7 @@ type ReplacementAttachResult = (Vec<SlotCompletion>, bool);
 /// BPF object; `Session` is the only production implementation and every method
 /// is a plain delegation to the existing inherent one.
 pub(crate) trait EngineSession {
+    fn capture_policy(&self) -> CapturePolicy;
     fn discovery_dequeue(&mut self) -> Result<Option<crate::events::DiscoveryItem>>;
     fn counter_snapshot(&self) -> Result<CounterSnapshot>;
     fn detach_failures(&self) -> &[String];
@@ -1067,6 +1070,10 @@ pub(crate) trait EngineSession {
 }
 
 impl EngineSession for Session {
+    fn capture_policy(&self) -> CapturePolicy {
+        Session::capture_policy(self)
+    }
+
     fn discovery_dequeue(&mut self) -> Result<Option<crate::events::DiscoveryItem>> {
         Session::discovery_dequeue(self)
     }
@@ -1299,6 +1306,8 @@ struct StartPublicationSnapshot {
     corroboration: Vec<(BTreeSet<PinnedObjectId>, &'static str)>,
     manifest_fallbacks: Vec<ManifestFallback>,
     views: BTreeSet<ProcessViewId>,
+    next_selection_binding_id: Option<u64>,
+    selection_bindings: BTreeMap<u64, SelectionBindingFact>,
 }
 
 /// What one `apply_candidate` actually did. `committed` used to conflate all
@@ -1353,6 +1362,7 @@ fn begin_discovery_batch(
 enum RecordRejection {
     ExportNoRetainedView,
     ExportNoLowerableOwner,
+    SelectionUnattributed,
     LoaderMissingCounterAuthority,
     LoaderInvalidContext,
     LoaderNoRetainedView,
@@ -1486,6 +1496,20 @@ struct DynamicExportWork {
     cookie: u64,
     abi: HookAbi,
     already_attached: bool,
+    selection_binding: Option<SelectionBindingFact>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelectionBindingFact {
+    id: u64,
+    context: LoaderContextId,
+    view: ProcessViewId,
+    object: PinnedObjectId,
+    file_offset: u64,
+    hook_id: u32,
+    abi: HookAbi,
+    attached: bool,
+    retired: bool,
 }
 
 #[derive(Clone)]
@@ -1574,9 +1598,13 @@ impl TerminalAuthority {
     fn tag_matching(&self, records: &mut [QueuedDiscoveryRecord]) -> bool {
         let mut matched = false;
         for queued in records {
-            if queued.record.kind == DISCOVERY_KIND_LOADER
-                && LoaderContextId::from_case_id(queued.record.case_id) == self.owner
-            {
+            let loader_matches = queued.record.kind == DISCOVERY_KIND_LOADER
+                && LoaderContextId::from_case_id(queued.record.case_id) == self.owner;
+            let selection_matches = queued.record.kind == DISCOVERY_KIND_INTERFACE_RETURN
+                && self.exports.iter().any(|export| {
+                    export.abi == HookAbi::Interface && export.cookie == queued.record.binding_id
+                });
+            if loader_matches || selection_matches {
                 queued.terminal_owner = Some(self.owner);
                 queued.terminal_exports = self.exports.clone();
                 matched = true;
@@ -3685,7 +3713,6 @@ fn export_abi(kind: u8) -> Option<HookAbi> {
     match kind {
         DISCOVERY_KIND_FUNCTION_LIST_RETURN => Some(HookAbi::FunctionList),
         DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN => Some(HookAbi::InterfaceList),
-        DISCOVERY_KIND_INTERFACE_RETURN => Some(HookAbi::Interface),
         _ => None,
     }
 }
@@ -3715,6 +3742,9 @@ fn lower_export_record(
     record: &DiscoveryRecord,
     budget: &mut CaptureWorkBudget,
 ) -> Result<Option<ScannedModule>, String> {
+    if record.kind == DISCOVERY_KIND_INTERFACE_RETURN {
+        return Err("selection record reached export lowering".into());
+    }
     if !valid_discovery_record(record) {
         return Err("malformed discovery record reached export lowering".into());
     }
@@ -4652,6 +4682,8 @@ impl Engine {
             ready_expected_removals: BTreeSet::new(),
             expected_target_exit_pending: None,
             expected_target_exit: false,
+            next_selection_binding_id: Some(1),
+            selection_bindings: BTreeMap::new(),
             loader_contexts: BTreeMap::new(),
         }
     }
@@ -5123,6 +5155,8 @@ impl Engine {
             corroboration: self.counters.corroboration.clone(),
             manifest_fallbacks: self.counters.manifest_fallbacks.clone(),
             views: self.views.iter().map(ProcessView::id).collect(),
+            next_selection_binding_id: self.next_selection_binding_id,
+            selection_bindings: self.selection_bindings.clone(),
         }
     }
 
@@ -5133,6 +5167,8 @@ impl Engine {
             self.capture_facts.rollback_stage();
             return Err(error);
         }
+        self.next_selection_binding_id = Some(1);
+        self.selection_bindings.clear();
         Ok(snapshot)
     }
 
@@ -5167,6 +5203,8 @@ impl Engine {
         self.modules = modules;
         self.counters.corroboration = snapshot.corroboration;
         self.counters.manifest_fallbacks = snapshot.manifest_fallbacks;
+        self.next_selection_binding_id = snapshot.next_selection_binding_id;
+        self.selection_bindings = snapshot.selection_bindings;
         if removed_views.is_empty() {
             self.discovery = snapshot.discovery;
         } else if self.capture_facts.history.modules.is_empty()
@@ -6057,6 +6095,57 @@ impl Engine {
         Ok(DiscoveryRecordOutcome::applied(changed, required_complete))
     }
 
+    fn process_selection_record(
+        &mut self,
+        queued: &QueuedDiscoveryRecord,
+    ) -> DiscoveryRecordOutcome {
+        let record = &queued.record;
+        let Some(binding) = self.selection_bindings.get(&record.binding_id).copied() else {
+            self.mark_live_loss(
+                "live interface selection",
+                "a selection record named an unknown capture-local binding",
+            );
+            return DiscoveryRecordOutcome::Rejected(RecordRejection::SelectionUnattributed);
+        };
+        let hook_matches = self
+            .hooks
+            .by_id(binding.hook_id)
+            .is_some_and(|(_, abi)| abi == binding.abi);
+        let identity = DynamicExportIdentity {
+            object: binding.object,
+            file_offset: binding.file_offset,
+            cookie: binding.id,
+            abi: binding.abi,
+        };
+        let pid = (record.pid_tgid >> 32) as u32;
+        let authorized = if let Some(owner) = queued.terminal_owner {
+            binding.attached
+                && hook_matches
+                && owner == binding.context
+                && queued.terminal_exports.contains(&identity)
+        } else {
+            binding.attached
+                && !binding.retired
+                && hook_matches
+                && !self.loader_registry.is_tombstoned(binding.context)
+                && self
+                    .loader_registry
+                    .context(binding.context)
+                    .is_some_and(|context| context.spec.view == binding.view)
+                && self.views.iter().any(|view| {
+                    view.id() == binding.view && view.pid() == pid && view.still_the_same()
+                })
+        };
+        if !authorized {
+            self.mark_live_loss(
+                "live interface selection",
+                "a selection record failed binding, context, or process-generation attribution",
+            );
+            return DiscoveryRecordOutcome::Rejected(RecordRejection::SelectionUnattributed);
+        }
+        DiscoveryRecordOutcome::applied(false, true)
+    }
+
     fn collect_dynamic_export_work(
         &mut self,
         context: LoaderContextId,
@@ -6073,10 +6162,20 @@ impl Engine {
         };
         let mut seed_keys = BTreeSet::new();
         for module in modules {
-            let requires_seed = module
+            let actionable_exports: Vec<_> = module
                 .exports
                 .iter()
-                .any(|name| name == "C_GetFunctionList");
+                .filter(|name| {
+                    session.capture_policy() != CapturePolicy::AggregateOnly
+                        || self.hooks.abi(name) != Some(HookAbi::Interface)
+                })
+                .collect();
+            if actionable_exports.is_empty() {
+                continue;
+            }
+            let requires_seed = actionable_exports
+                .iter()
+                .any(|name| name.as_str() == "C_GetFunctionList");
             let Some(object) = pinned.id_for_scanned(module, module.key, &module.path) else {
                 if requires_seed {
                     collected.required_seed_complete = false;
@@ -6115,11 +6214,11 @@ impl Engine {
                     );
                 }
             }
-            for name in &module.exports {
+            for name in actionable_exports {
                 let Some(abi) = self.hooks.abi(name) else {
                     continue;
                 };
-                let Some(cookie) = self.hooks.export_cookie(name) else {
+                let Some(hook_id) = self.hooks.id(name) else {
                     continue;
                 };
                 let fact = snapshot.as_ref().and_then(|snapshot| {
@@ -6139,6 +6238,57 @@ impl Engine {
                     );
                     continue;
                 };
+                let selection_binding = if abi == HookAbi::Interface {
+                    let Some(view) = self
+                        .loader_registry
+                        .context(context)
+                        .map(|context| context.spec.view)
+                    else {
+                        collected.required_seed_complete = false;
+                        self.mark_partial(
+                            "live selection hook",
+                            "an interface hook had no retained loader context",
+                        );
+                        continue;
+                    };
+                    if terminal
+                        && !self.selection_bindings.values().any(|binding| {
+                            binding.context == context
+                                && binding.object == object
+                                && binding.file_offset == fact.file_offset
+                                && binding.abi == abi
+                        })
+                    {
+                        continue;
+                    }
+                    if collected.dynamic.iter().any(|work| {
+                        work.selection_binding.is_some_and(|binding| {
+                            binding.context == context
+                                && binding.object == object
+                                && binding.file_offset == fact.file_offset
+                                && binding.abi == abi
+                        })
+                    }) {
+                        continue;
+                    }
+                    let Some(binding) = self.selection_binding_candidate(
+                        context,
+                        view,
+                        object,
+                        fact.file_offset,
+                        hook_id,
+                        abi,
+                    ) else {
+                        collected.required_seed_complete = false;
+                        continue;
+                    };
+                    Some(binding)
+                } else {
+                    None
+                };
+                let cookie = selection_binding
+                    .map(|binding| binding.id)
+                    .unwrap_or(u64::from(hook_id));
                 collected.dynamic.push(DynamicExportWork {
                     context,
                     module: timing_key.clone(),
@@ -6156,10 +6306,49 @@ impl Engine {
                     } else {
                         session.has_dynamic_export(context, (object, fact.file_offset), cookie, abi)
                     },
+                    selection_binding,
                 });
             }
         }
         collected
+    }
+
+    fn selection_binding_candidate(
+        &mut self,
+        context: LoaderContextId,
+        view: ProcessViewId,
+        object: PinnedObjectId,
+        file_offset: u64,
+        hook_id: u32,
+        abi: HookAbi,
+    ) -> Option<SelectionBindingFact> {
+        if let Some(binding) = self.selection_bindings.values().find(|binding| {
+            binding.context == context
+                && binding.object == object
+                && binding.file_offset == file_offset
+                && binding.abi == abi
+        }) {
+            return Some(*binding);
+        }
+        let Some(id) = self.next_selection_binding_id.take() else {
+            self.mark_partial(
+                "live selection hook",
+                "the capture-local selection binding ID space was exhausted",
+            );
+            return None;
+        };
+        self.next_selection_binding_id = id.checked_add(1);
+        Some(SelectionBindingFact {
+            id,
+            context,
+            view,
+            object,
+            file_offset,
+            hook_id,
+            abi,
+            attached: false,
+            retired: false,
+        })
     }
 
     fn attach_export_work(
@@ -6212,6 +6401,10 @@ impl Engine {
             );
             match attach {
                 GenerationMutation::Committed(Ok((added, completed))) => {
+                    if let Some(mut binding) = work.selection_binding {
+                        binding.attached = true;
+                        self.selection_bindings.insert(binding.id, binding);
+                    }
                     if added {
                         if let Some(module) = &work.module {
                             self.complete_causal_timing(
@@ -6234,7 +6427,24 @@ impl Engine {
                         "a fixed-purpose dynamic export attachment failed",
                     );
                 }
-                GenerationMutation::PrecheckFailed | GenerationMutation::PostcheckFailed(_) => {
+                GenerationMutation::PostcheckFailed(Ok((_added, _))) => {
+                    if let Some(mut binding) = work.selection_binding {
+                        binding.attached = true;
+                        self.selection_bindings.insert(binding.id, binding);
+                    }
+                    complete = false;
+                    if let Some(module) = &work.module {
+                        self.timings.lose(module);
+                    }
+                    *additions_allowed = false;
+                    retire = true;
+                    self.mark_partial(
+                        "live export hook",
+                        "the process generation changed around a dynamic export attachment",
+                    );
+                }
+                GenerationMutation::PrecheckFailed
+                | GenerationMutation::PostcheckFailed(Err(_)) => {
                     complete = false;
                     if let Some(module) = &work.module {
                         self.timings.lose(module);
@@ -7267,6 +7477,11 @@ impl Engine {
                     bail!("terminal loader drain authority is already pending");
                 }
                 let (terminal_exports, detach_failed) = session.detach_dynamic_context(context_id);
+                for binding in self.selection_bindings.values_mut() {
+                    if binding.context == context_id {
+                        binding.retired = true;
+                    }
+                }
                 if detach_failed {
                     closure.fail();
                     *additions_allowed = false;
@@ -7627,11 +7842,10 @@ impl Engine {
     ) -> Result<DiscoveryRecordOutcome> {
         let record = queued.record;
         match record.kind {
-            DISCOVERY_KIND_FUNCTION_LIST_RETURN
-            | DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN
-            | DISCOVERY_KIND_INTERFACE_RETURN => {
+            DISCOVERY_KIND_FUNCTION_LIST_RETURN | DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN => {
                 self.process_export_record(&record, session, additions_allowed, pending_views)
             }
+            DISCOVERY_KIND_INTERFACE_RETURN => Ok(self.process_selection_record(&queued)),
             DISCOVERY_KIND_LOADER => self.process_loader_record(
                 queued,
                 session,
@@ -8782,6 +8996,7 @@ pub(crate) mod session_fixture {
 
     #[derive(Default)]
     pub(crate) struct ScriptedSession {
+        pub(crate) capture_policy: Option<CapturePolicy>,
         pub(crate) dequeues: VecDeque<Result<Option<crate::events::DiscoveryItem>>>,
         pub(crate) counters: CounterSnapshot,
         /// One entry per upcoming `counter_snapshot` call; `true` fails it.
@@ -8801,6 +9016,7 @@ pub(crate) mod session_fixture {
         pub(crate) attached_slots: Vec<usize>,
         /// Dynamic exports requested by the Engine, in order.
         pub(crate) dynamic_attach_calls: Vec<DynamicExportIdentity>,
+        pub(crate) dynamic_attach_reports_added: bool,
         /// Killed and reaped from inside `attach_targets`, i.e. exactly between
         /// a generation precheck and its postcheck.
         kill_on_attach: Option<u32>,
@@ -8884,6 +9100,10 @@ pub(crate) mod session_fixture {
     }
 
     impl EngineSession for ScriptedSession {
+        fn capture_policy(&self) -> CapturePolicy {
+            self.capture_policy.unwrap_or(CapturePolicy::Allowlisted)
+        }
+
         fn discovery_dequeue(&mut self) -> Result<Option<crate::events::DiscoveryItem>> {
             self.dequeues.pop_front().unwrap_or(Ok(None))
         }
@@ -8986,7 +9206,7 @@ pub(crate) mod session_fixture {
             if self.kill_on_dynamic_attach.take().is_some() {
                 kill_and_reap(pid);
             }
-            Ok((false, None))
+            Ok((self.dynamic_attach_reports_added, None))
         }
 
         fn attach_dynamic_loader(
@@ -9293,6 +9513,7 @@ mod tests {
             cookie: 1,
             abi: HookAbi::FunctionList,
             already_attached,
+            selection_binding: None,
         }
     }
 
@@ -9356,6 +9577,7 @@ mod tests {
         let rejections = [
             RecordRejection::ExportNoRetainedView,
             RecordRejection::ExportNoLowerableOwner,
+            RecordRejection::SelectionUnattributed,
             RecordRejection::LoaderMissingCounterAuthority,
             RecordRejection::LoaderInvalidContext,
             RecordRejection::LoaderNoRetainedView,
@@ -12661,20 +12883,26 @@ int main(int argc, char **argv) {
         let contexts = engine.loader_registry.ids_for_view(view_id);
         assert_eq!(contexts.len(), 1);
         assert_ne!(contexts[0], retired);
+        assert_eq!(session.dynamic_attach_calls.len(), 3);
         assert_eq!(
             session
                 .dynamic_attach_calls
                 .iter()
                 .map(|export| export.cookie)
                 .collect::<BTreeSet<_>>(),
-            [1, 2, 3].into_iter().collect(),
+            [1, 2].into_iter().collect(),
             "readiness requires all configured exports from the refreshed provider"
         );
     }
 
     #[test]
-    fn initial_export_route_attaches_once_before_readiness() {
+    fn selection_bindings_reuse_existing_physical_attachments() {
         let (_fixture, mut engine, mut session) = initial_export_route();
+        engine.modules[0]
+            .scanned
+            .exports
+            .push("C_GetInterface".into());
+        session.dynamic_attach_reports_added = true;
         let mut additions_allowed = true;
         let mut pending = PendingViewRetirements::new();
         let mut closure = PauseClosure::new(true);
@@ -12685,13 +12913,43 @@ int main(int argc, char **argv) {
             &mut pending,
             &mut closure,
         );
+        assert_eq!(session.dynamic_attach_calls.len(), 3);
         assert_eq!(
             session
                 .dynamic_attach_calls
                 .iter()
                 .map(|export| export.cookie)
                 .collect::<BTreeSet<_>>(),
-            [1, 2, 3].into_iter().collect()
+            [1, 2].into_iter().collect()
+        );
+        assert_eq!(engine.selection_bindings.len(), 1);
+        assert!(engine.selection_bindings[&1].attached);
+        assert_eq!(
+            session
+                .dynamic_attach_calls
+                .iter()
+                .find(|export| export.abi == HookAbi::FunctionList)
+                .unwrap()
+                .cookie,
+            u64::from(engine.hooks.id("C_GetFunctionList").unwrap())
+        );
+        assert_eq!(
+            session
+                .dynamic_attach_calls
+                .iter()
+                .find(|export| export.abi == HookAbi::InterfaceList)
+                .unwrap()
+                .cookie,
+            u64::from(engine.hooks.id("C_GetInterfaceList").unwrap())
+        );
+        assert_eq!(
+            session
+                .dynamic_attach_calls
+                .iter()
+                .find(|export| export.abi == HookAbi::Interface)
+                .unwrap()
+                .cookie,
+            engine.selection_bindings[&1].id
         );
         assert!(additions_allowed && pending.is_empty() && closure.required_complete());
 
@@ -12702,6 +12960,239 @@ int main(int argc, char **argv) {
             &mut closure,
         );
         assert_eq!(session.dynamic_attach_calls.len(), 3);
+        assert_eq!(engine.selection_bindings.len(), 1);
+    }
+
+    #[test]
+    fn aggregate_policy_creates_no_selection_bindings() {
+        let (_fixture, mut engine, mut session) = initial_export_route();
+        engine.modules[0].scanned.exports = vec!["C_GetInterface".into()];
+        session.capture_policy = Some(CapturePolicy::AggregateOnly);
+        session.dynamic_attach_reports_added = true;
+        let mut additions_allowed = true;
+        let mut pending = PendingViewRetirements::new();
+        let mut closure = PauseClosure::new(true);
+
+        engine.attach_initial_exports(
+            &mut session,
+            &mut additions_allowed,
+            &mut pending,
+            &mut closure,
+        );
+
+        assert!(session.dynamic_attach_calls.is_empty());
+        assert!(engine.selection_bindings.is_empty());
+        assert_eq!(engine.next_selection_binding_id, Some(1));
+        assert!(closure.required_complete());
+        assert!(!engine.counters.object_skips.iter().any(|skip| {
+            skip.subject.contains("selection") || skip.reason.contains("selection")
+        }));
+    }
+
+    #[test]
+    fn selection_binding_ids_never_reuse() {
+        let mut engine = Engine::empty();
+        let context = LoaderContextId::from_case_id(0);
+        engine.next_selection_binding_id = Some(u64::MAX);
+
+        let last = engine
+            .selection_binding_candidate(
+                context,
+                ProcessViewId(1),
+                PinnedObjectId(2),
+                0x10,
+                3,
+                HookAbi::Interface,
+            )
+            .unwrap();
+        assert_eq!(last.id, u64::MAX);
+        engine.selection_bindings.insert(last.id, last);
+        assert_eq!(
+            engine
+                .selection_binding_candidate(
+                    context,
+                    ProcessViewId(1),
+                    PinnedObjectId(2),
+                    0x10,
+                    3,
+                    HookAbi::Interface,
+                )
+                .unwrap()
+                .id,
+            u64::MAX,
+            "the same physical attachment reuses its retained ID"
+        );
+        assert!(
+            engine
+                .selection_binding_candidate(
+                    context,
+                    ProcessViewId(1),
+                    PinnedObjectId(2),
+                    0x20,
+                    3,
+                    HookAbi::Interface,
+                )
+                .is_none(),
+            "exhaustion refuses rather than wrapping to zero"
+        );
+        assert_eq!(engine.next_selection_binding_id, None);
+    }
+
+    #[test]
+    fn selection_binding_start_failure_restores_capture_state() {
+        let mut engine = Engine::empty();
+        let binding = engine
+            .selection_binding_candidate(
+                LoaderContextId::from_case_id(0),
+                ProcessViewId(1),
+                PinnedObjectId(2),
+                0x10,
+                3,
+                HookAbi::Interface,
+            )
+            .unwrap();
+        engine.selection_bindings.insert(binding.id, binding);
+        let snapshot = engine.begin_start_capture_attempt().unwrap();
+        assert!(engine.selection_bindings.is_empty());
+        assert_eq!(engine.next_selection_binding_id, Some(1));
+        let attempted = engine
+            .selection_binding_candidate(
+                LoaderContextId::from_case_id(1),
+                ProcessViewId(4),
+                PinnedObjectId(5),
+                0x20,
+                3,
+                HookAbi::Interface,
+            )
+            .unwrap();
+        engine.selection_bindings.insert(attempted.id, attempted);
+
+        let error = engine
+            .finish_start_capture_attempt::<()>(snapshot, Err(anyhow!("late start failure")))
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "late start failure");
+        assert_eq!(
+            engine.selection_bindings,
+            [(1, binding)].into_iter().collect()
+        );
+        assert_eq!(engine.next_selection_binding_id, Some(2));
+    }
+
+    #[test]
+    fn selection_postcheck_failure_retains_attached_binding() {
+        let (_fixture, mut engine, mut session) = initial_export_route();
+        engine.modules[0].scanned.exports = vec!["C_GetInterface".into()];
+        let view = engine.views[0].id();
+        session.dynamic_attach_reports_added = true;
+        session.lose_generation_at_dynamic_attach(engine.views[0].pid());
+        let mut additions_allowed = true;
+        let mut pending = PendingViewRetirements::new();
+        let mut closure = PauseClosure::new(true);
+
+        engine.attach_initial_exports(
+            &mut session,
+            &mut additions_allowed,
+            &mut pending,
+            &mut closure,
+        );
+
+        assert_eq!(engine.selection_bindings.len(), 1);
+        let binding = *engine.selection_bindings.values().next().unwrap();
+        assert!(binding.attached);
+        assert!(
+            session
+                .dynamic_attach_calls
+                .contains(&DynamicExportIdentity {
+                    object: binding.object,
+                    file_offset: binding.file_offset,
+                    cookie: binding.id,
+                    abi: binding.abi,
+                })
+        );
+        assert!(!additions_allowed);
+        assert!(pending.contains_key(&view));
+        assert!(!closure.required_complete());
+    }
+
+    #[test]
+    fn c_get_interface_selection_never_mutates_inventory() {
+        let (_fixture, mut engine, mut session) = initial_export_route();
+        session.dynamic_attach_reports_added = true;
+        let mut additions_allowed = true;
+        let mut pending = PendingViewRetirements::new();
+        let mut closure = PauseClosure::new(true);
+        engine.attach_initial_exports(
+            &mut session,
+            &mut additions_allowed,
+            &mut pending,
+            &mut closure,
+        );
+        let binding = *engine.selection_bindings.values().next().unwrap();
+        let before_plan = engine.plan.clone();
+        let before_modules = engine.modules.clone();
+        let before_discovery = engine.discovery.clone();
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_INTERFACE_RETURN;
+        record.pid_tgid = u64::from(engine.views[0].pid()) << 32;
+        record.case_id = DISCOVERY_NAME_NULL;
+        record.return_rv = 1;
+        record.binding_id = binding.id;
+        assert!(valid_discovery_record(&record));
+
+        let outcome = engine
+            .dispatch_discovery_record(
+                QueuedDiscoveryRecord {
+                    record,
+                    terminal_owner: None,
+                    terminal_exports: Vec::new(),
+                },
+                &mut session,
+                &mut additions_allowed,
+                &mut pending,
+                &mut BTreeSet::new(),
+                &mut Vec::new(),
+            )
+            .unwrap();
+
+        assert_eq!(outcome, DiscoveryRecordOutcome::applied(false, true));
+        assert_eq!(engine.plan, before_plan);
+        assert_eq!(engine.modules, before_modules);
+        assert_eq!(engine.discovery, before_discovery);
+
+        engine
+            .selection_bindings
+            .get_mut(&binding.id)
+            .unwrap()
+            .retired = true;
+        engine.loader_registry.tombstone(binding.context).unwrap();
+        let identity = DynamicExportIdentity {
+            object: binding.object,
+            file_offset: binding.file_offset,
+            cookie: binding.id,
+            abi: binding.abi,
+        };
+        assert_eq!(
+            engine.process_selection_record(&tagged_by_authority(
+                binding.context,
+                &[identity],
+                record,
+            )),
+            DiscoveryRecordOutcome::applied(false, true),
+            "the exact terminal export snapshot remains historical authority"
+        );
+        let skips = engine.counters.object_skips.len();
+        let ordinary = engine.process_selection_record(&QueuedDiscoveryRecord {
+            record,
+            terminal_owner: None,
+            terminal_exports: Vec::new(),
+        });
+        assert_eq!(
+            ordinary,
+            DiscoveryRecordOutcome::Rejected(RecordRejection::SelectionUnattributed),
+            "a delayed ordinary record fails closed after retirement"
+        );
+        assert_eq!(engine.counters.object_skips.len(), skips + 1);
     }
 
     #[test]
@@ -13453,6 +13944,7 @@ int main(int argc, char **argv) {
             cookie: exact.cookie,
             abi: exact.abi,
             already_attached: queued.terminal_exports.contains(&exact),
+            selection_binding: None,
         };
         lose_unperformed_dynamic_work(&mut timings, std::slice::from_ref(&duplicate));
         assert_eq!(timings.gap_ns(&module), Some(10));
@@ -13511,6 +14003,40 @@ int main(int argc, char **argv) {
         assert_eq!(records[0].terminal_exports, [export]);
         assert_eq!(records[1].terminal_exports, [export]);
         assert!(records[2].terminal_exports.is_empty());
+    }
+
+    #[test]
+    fn terminal_authority_tags_selection_by_binding_not_request_class() {
+        let owner = LoaderContextId::from_case_id(2);
+        let export = DynamicExportIdentity {
+            object: PinnedObjectId(7),
+            file_offset: 0x10,
+            cookie: 41,
+            abi: HookAbi::Interface,
+        };
+        let mut matching: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        matching.kind = DISCOVERY_KIND_INTERFACE_RETURN;
+        matching.case_id = DISCOVERY_NAME_NULL;
+        matching.binding_id = export.cookie;
+        let mut wrong_binding = matching;
+        wrong_binding.binding_id += 1;
+        let mut records = [matching, wrong_binding].map(|record| QueuedDiscoveryRecord {
+            record,
+            terminal_owner: None,
+            terminal_exports: Vec::new(),
+        });
+
+        assert!(
+            (TerminalAuthority {
+                owner,
+                exports: vec![export],
+            })
+            .tag_matching(&mut records)
+        );
+        assert_eq!(records[0].terminal_owner, Some(owner));
+        assert_eq!(records[0].terminal_exports, [export]);
+        assert_eq!(records[1].terminal_owner, None);
+        assert!(records[1].terminal_exports.is_empty());
     }
 
     #[test]

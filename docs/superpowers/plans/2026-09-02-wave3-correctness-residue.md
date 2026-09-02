@@ -197,6 +197,25 @@ merge at `:5752`, dispatch at `:7617`, owned-loader prearm at `:6539`, owned
 child execution at `src/run.rs:1484`, and physical slot state at
 `src/plan.rs:176`.
 
+The 2026-09-02 independent Task-3 pre-mortem adds these execution invariants:
+
+- Allocate a binding only when no existing
+  `(loader context, object, hook offset, ABI)` binding exists; refresh and
+  loader hits reuse its id. Record a binding whenever an entry/return pair was
+  attached, even when the later generation postcheck rejects its authority.
+- Keep one capture-lifetime binding fact map. Active attribution additionally
+  requires the loader registry/context and exact generation to remain live;
+  delayed records after retirement fail closed. Mark confirmed coverage closed
+  before removing the loader context that proves the closure.
+- Route kind 4 explicitly before generic export lowering. Task 2 deliberately
+  leaves these records non-authoritative until this task; they must not become
+  generic live-loss skips or inventory mutations.
+- Replay every live selection claim into each rebuilt candidate, then prune its
+  inactive owners after apply. Preflight a whole selection table against the
+  512-slot ceiling before adding any target; a prefix is never admissible.
+- Aggregate policy creates no selection binding, tuple, coverage debt, or
+  selection loss.
+
 - [ ] RED first: `c_get_interface_selection_never_mutates_inventory` proves
   kind 4 changes no caller-independent surface, interface, alias group,
   `fork_safe`, or inventory table.
@@ -211,6 +230,10 @@ child execution at `src/run.rs:1484`, and physical slot state at
   lookup, and a delayed record cannot resolve to a later binding.
 - [ ] GREEN: use one capture-local checked counter plus the existing active
   binding map; no retained-id registry or allocator abstraction is needed.
+- [ ] RED: `selection_bindings_reuse_existing_physical_attachments` proves
+  refresh does not reattach or recount an existing binding and
+  `selection_postcheck_failure_retains_attached_binding` proves rollback or
+  retirement still owns every link created before a generation postcheck.
 - [ ] RED: same-address/different-name and two-view claims produce occurrence-
   based `table_entries`, one physical `AttachKey`, one aggregate cell, and
   independent retirement. Delayed records for retired IDs fail closed.
@@ -235,6 +258,8 @@ child execution at `src/run.rs:1484`, and physical slot state at
   evidence but authorize nothing.
 - [ ] GREEN: enforce that finite semantic key before the existing indivisible
   512-slot admission; add no separate quota or slot allocator.
+- [ ] RED: `selection_table_admission_is_indivisible_at_the_slot_ceiling`
+  proves a table that cannot fit contributes no prefix, link, or slot index.
 - [ ] RED: `manifest_selection_tables_enter_the_attach_transaction` proves a
   reachable manifest-v5 selection table creates source-local count-only claims,
   `semantic_authorized=false`, and `PARTIAL`; an inventory target at the same

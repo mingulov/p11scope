@@ -65,8 +65,14 @@ legacy surfaces always have `name_agrees: false`. A nonzero `rv` has null
 `uprobe-multi`, derived only from successfully owned links. Before the
 uprobe-multi attachment slice, a nonempty array can contain only `per-offset`.
 
-`pid_descendant_gaps` and `multi_rebuild_gaps` are saturating u64 counts. They
-are always present and zero when the corresponding path did not lose evidence.
+`pid_descendant_gaps` and `multi_rebuild_gaps` are saturating u64 counts.
+`pid_descendant_gaps` counts PID-scope descendants that cannot be covered and,
+for cgroup scope, observed child-fork windows before the child's per-process
+dynamic selection-export links can be refreshed. Static function probes still
+cover cgroup child calls during that window. The fields are always present and
+zero when the corresponding path did not lose evidence. When required fork
+tracking is unavailable, `pid_descendant_gaps: 1` is an unavailability sentinel
+and lower bound, not a claim that exactly one fork was observed.
 
 ## Completeness and terminal trace
 

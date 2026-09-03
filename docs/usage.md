@@ -5,16 +5,14 @@ how to run it, and what its output actually proves. Measured examples below
 name the script that produced them so they can be reproduced; fixed
 implementation limits are code contracts, not measurements.
 
-> **Status: unreleased; the local MVP candidate is runtime-qualified.**
-> Memory-scan discovery, `inspect`, `doctor`, public `run`, multi-module
-> capture, schema v2, and owned-child live discovery are implemented. The
-> frozen candidate passed all six semantic/privacy/cleanup rows on Ubuntu
-> 22.04 kernel 5.15 and Ubuntu 24.04 kernel 6.8. The static security closeout
-> found release-blocking privilege, identity, boundedness, output, and
-> build-receipt gaps. The highest-severity owned-child privilege boundary is
-> remediated; exact-tip privileged confirmation, lower-severity remediation,
-> CI, complete packaging, publication, and release remain pending; these local
-> results make no release or security-clearance claim.
+> **Status: unreleased; the current tree is a W3 engineering candidate.**
+> Memory-scan discovery, `C_GetInterface`, `inspect`, `doctor`, public `run`,
+> multi-module capture, schema v3, and owned-child live discovery are
+> implemented. The frozen pre-W3 candidate at `ae8494d` passed all six
+> semantic/privacy/cleanup rows on Ubuntu 22.04 kernel 5.15 and Ubuntu 24.04
+> kernel 6.8. Those historical results do not qualify the W3 tip. Fresh
+> exact-tip runtime qualification, CI, complete packaging, publication, and
+> release remain pending.
 > See the
 > [safe metadata design](superpowers/specs/2026-08-13-safe-and-unvalidated-metadata-design.md)
 > and the
@@ -148,9 +146,10 @@ sudo p11scope run --module /opt/vendor/lib/pkcs11.so \
 
 The memory scan builds the initial attach plan. For an owned command,
 `p11scope run` starts capture before releasing the child and can acquire a
-provider loaded later. This path passed the local six-row campaign on kernels
-5.15 and 6.8; CI and release qualification remain pending. For an already
-running external process, a provider loaded before attachment can still be
+provider loaded later. The frozen pre-W3 candidate at `ae8494d` passed the
+local six-row campaign on kernels 5.15 and 6.8; that campaign has not been
+repeated on the W3 tip. For an already running external process, a provider
+loaded before attachment can still be
 missed. If a suitable manifest was prepared while the same provider identity
 was available, pass it
 with `--manifest`; it is explicit operator attestation of exact accepted
@@ -477,10 +476,11 @@ evidence are PARTIAL while scan-only semantic claims remain. P11Lab joins reject
 scan-only and conflict modules. An accepted manifest authorizes only the exact
 pinned object, offset, and canonical function name it attests; stale fallback,
 hash agreement, path identity, and raw `{dev,ino}` never transfer that
-attestation. The owned-child `run` path and capture-history corrections passed
-the local 5.15/6.8 semantic campaign. Exact-tip CI, complete packaging, and
-the recorded security remediations remain pending, so no release or full
-security-clearance claim applies yet.
+attestation. The owned-child `run` path and capture-history corrections in the
+frozen pre-W3 candidate at `ae8494d` passed the local 5.15/6.8 semantic
+campaign. Those results have not been repeated on the W3 tip. Exact-tip
+runtime qualification, CI, complete packaging, publication, and release
+remain pending.
 
 **`PARTIAL`** is forced by any single gap in that list — an attach
 failure, ring-buffer loss, a template the in-kernel walk couldn't finish

@@ -173,6 +173,16 @@ pub struct InterfaceSelection {
 }
 
 impl InterfaceSelection {
+    pub(crate) fn mark_descendant_gap(&mut self) {
+        for provider in &mut self.providers {
+            provider.coverage = match provider.coverage {
+                "observed" => "observed_uncovered",
+                "absent_covered" => "absent_uncovered",
+                coverage => coverage,
+            };
+        }
+    }
+
     fn complete(&self) -> bool {
         !self.selection_truncated
             && self
@@ -3895,6 +3905,42 @@ mod tests {
             ev.verdict();
             assert_eq!(ev.completeness, "COMPLETE", "{name}");
         }
+    }
+
+    #[test]
+    fn descendant_gap_downgrades_only_covered_selection_states() {
+        let mut selection = InterfaceSelection {
+            providers: [
+                "observed",
+                "observed_uncovered",
+                "absent_covered",
+                "absent_uncovered",
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(module, coverage)| SelectionProvider {
+                module: module as u32,
+                coverage,
+            })
+            .collect(),
+            ..Default::default()
+        };
+
+        selection.mark_descendant_gap();
+
+        assert_eq!(
+            selection
+                .providers
+                .iter()
+                .map(|provider| provider.coverage)
+                .collect::<Vec<_>>(),
+            [
+                "observed_uncovered",
+                "observed_uncovered",
+                "absent_uncovered",
+                "absent_uncovered",
+            ]
+        );
     }
 
     /// The capture ended the ordinary way: the process is gone, its links and

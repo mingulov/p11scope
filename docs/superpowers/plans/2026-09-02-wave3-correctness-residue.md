@@ -459,14 +459,17 @@ capture verdict.
   evidence and prove consumer verdict is `PARTIAL` exactly once.
 - [x] RED: `pid_scope_fork_marks_descendant_unobserved_partial` proves a fork
   observed under one-process PID scope records one finite count-only descendant
-  gap and forces `PARTIAL`; document cgroup scope as the descendant-coverage
-  route. Never inherit child semantic state as tracing coverage.
+  gap and forces `PARTIAL`. Cgroup scope covers ordinary child function calls
+  immediately, but each observed fork records the bounded window before the
+  child's per-process dynamic selection-export links are refreshed. Never
+  inherit child semantic state as tracing coverage.
 - [x] GREEN: attach the fork observation boundary for one-process PID scope as
   well as cgroup scope, record each child as a finite saturating gap, and expose
   only that count through Task 4's versioned evidence. A missing PID-scope fork
   boundary degrades the attempted capture to explicit `PARTIAL`; it must never
   leave `pid_descendant_gaps` at an invented zero or silently inherit child
-  tracing coverage.
+  tracing coverage. A missing cgroup fork boundary likewise starts with one
+  explicit gap because early child selection coverage cannot be established.
 - [x] Update capability self-test and docs; privileged rows remain `UNRUN` if
   not authorized. Focused checks:
   `cargo +1.88 test --locked --lib capability_tier`,

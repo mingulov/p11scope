@@ -39,5 +39,8 @@ signature, random output, operation-state blob, arbitrary input/output buffer,
 raw interface name, vendor name, pointer, address, table contents, PID/TID,
 process generation, attach cookie, private binding id, or helper error string
 may enter a public capture artifact or observer-owned map as selection
-evidence. The v1 release canaries and their positive controls remain mandatory;
-v2 adds selection-name and closed-shape mutations.
+evidence. The v1 release canaries and their positive controls remain mandatory.
+V2 additionally invokes observed `C_GetInterface` calls with unique secret,
+unterminated-at-the-observer-bound, and hostile-alias name buffers, then scans
+every output/log artifact and every observer-owned map for those exact bytes.
+Closed-shape mutations reject the same bytes if injected as JSON fields.

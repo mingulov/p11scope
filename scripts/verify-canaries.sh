@@ -66,7 +66,8 @@ FEATURE_MAPS = set(BPF_MAP_DEFS["UNSAFE_MAPS"])
 EXPECTED_SENTINEL_FAMILIES = {
     "PIN", "KEY", "LABEL", "ID", "PLAINTEXT", "IV", "AAD", "BOOLLONG",
     "USERNAME", "CIPHERTEXT", "SIGNATURE", "WRAPPED", "RANDOM", "OUTPUT",
-    "ARG7", "ARG8", "ARG9", "ASYNC",
+    "ARG7", "ARG8", "ARG9", "ASYNC", "INTERFACE", "UNTERMINATED",
+    "INTERFACEALIAS",
 }
 EXPECTED_SOURCE_FAMILIES = {
     "canary_workload.c": EXPECTED_SENTINEL_FAMILIES - {"ASYNC"},
@@ -267,6 +268,7 @@ def exact_role_counts(description):
 def profile_terminal(doc, schema="pkcs11-scope/observed-profile/v3"):
     assert doc["schema"] == schema, doc["schema"]
     ev = doc["evidence"]
+    assert "secret_selection_payload" not in ev, ev
     assert ev["completeness"] == "PARTIAL", ev
     if schema == "pkcs11-scope/observed-profile/v3":
         selection_terminal(ev)
@@ -397,8 +399,9 @@ def assert_aggregate_metrics(doc):
     assert doc["schema"] == "pkcs11-scope/observed-profile/v2-metrics"
     assert doc["capture"]["mode"] == "metrics"
     assert doc["capture"]["privacy_mode"] == "aggregate-only"
+    assert "secret_selection_payload" not in doc["evidence"], doc["evidence"]
     profile_terminal(doc, "pkcs11-scope/observed-profile/v2-metrics")
-    assert sum(item["calls"] for item in doc["functions"]) == 25, doc["functions"]
+    assert sum(item["calls"] for item in doc["functions"]) == 28, doc["functions"]
 
 
 def assert_scan_only_hostile_output(doc, text, hostile):
@@ -693,7 +696,7 @@ def ring_records(manifest, name="EVENTS"):
 
 
 def assert_event_records(raw_records, lane, workload_pid):
-    expected = 0 if lane == "aggregate-only-metrics" else 25
+    expected = 0 if lane == "aggregate-only-metrics" else 28
     assert len(raw_records) == expected, f"{lane}: {len(raw_records)} records, expected {expected}"
     if not raw_records:
         return
@@ -901,6 +904,9 @@ if work == "--self-test":
     stale_v2 = json.loads(json.dumps(v3))
     stale_v2["schema"] = "pkcs11-scope/observed-profile/v2"
     reject("stale live profile v2", lambda: assert_safe_profile(stale_v2))
+    extra_evidence = json.loads(json.dumps(v3))
+    extra_evidence["evidence"]["secret_selection_payload"] = "CANARY"
+    reject("v3 extra evidence field", lambda: assert_safe_profile(extra_evidence))
     reject("safe profile unknown-id", lambda: assert_safe_profile({
         **safe, "mechanisms": safe["mechanisms"] + [{"mechanism": UNKNOWN, "params": None}]
     }))
@@ -1003,9 +1009,12 @@ if work == "--self-test":
             "surfaces": [{"walk": "full", "acquisition": "ok"}],
             "vendor_interfaces": 0, "interface_list": "ok",
         },
-        "functions": [{"calls": 25}],
+        "functions": [{"calls": 28}],
     }
     assert_aggregate_metrics(aggregate)
+    extra_metrics = json.loads(json.dumps(aggregate))
+    extra_metrics["evidence"]["secret_selection_payload"] = "CANARY"
+    reject("metrics extra evidence field", lambda: assert_aggregate_metrics(extra_metrics))
 
     # This preserves the artifact-side output/privacy contract. The
     # producer-shaped Rust test proves the State/Tracer path; this oracle keeps
@@ -1200,7 +1209,7 @@ if work == "--self-test":
                     attr_seen=0, capture=0):
         raw_event = bytearray(EVENT_SIZE)
         struct.pack_into("<Q", raw_event, 16, 0x555 << 32 | index)
-        if index >= 22:
+        if 22 <= index < 25:
             session, target = ((0x11d, 30), (0x11e, FUNCTION_NONE),
                                (0x11f, FUNCTION_NONE))[index - 22]
         else:
@@ -1220,7 +1229,7 @@ if work == "--self-test":
         struct.pack_into("<I", raw_event, 280, capture)
         return bytes(raw_event)
 
-    safe_events = [event_bytes(index) for index in range(25)]
+    safe_events = [event_bytes(index) for index in range(28)]
     assert_event_records(safe_events, "default-safe-profile", 0x555)
     assert_event_records([], "aggregate-only-metrics", 0x555)
     reject("raw event count", lambda: assert_event_records(

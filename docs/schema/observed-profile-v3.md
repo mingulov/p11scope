@@ -30,8 +30,10 @@ fact; it is never created by probing the observed process.
 - `inventory_surfaces`: at most 512 sorted `{module, ordinal, kind}` objects.
   `kind` is `legacy` or `interface`; `ordinal` starts at zero and is contiguous
   within each module.
-- `tuples`: at most 16 distinct capture-wide selection tuples, sorted
-  deterministically. The bound is global, not per provider.
+- `tuples`: at most 16 distinct capture-wide selection tuples, sorted by the
+  fixed field-order serialization listed below. Input JSON object key order is
+  irrelevant to sorting and duplicate detection. The bound is global, not per
+  provider.
 - `selection_truncated`: boolean; true when a tuple, match, surface, or other
   selection fact exceeded its bound or could not be retained.
 
@@ -49,7 +51,10 @@ is nonempty. Authority is exactly `inventory`, `selection_count_only`, or
 `none`: inventory authority requires a readable successful result and at least
 one match; count-only authority has no match and is limited to a successful
 exact-standard result with a known 3.x version and standard returned flags.
-A nonzero `rv` has null `result`, no matches, and `none` authority.
+A successful matched result with an unreadable/null name or version retains its
+match but has `none` authority. The corresponding agreement boolean is false;
+legacy surfaces always have `name_agrees: false`. A nonzero `rv` has null
+`result`, no matches, and `none` authority.
 
 `attach_mechanisms` is a sorted, duplicate-free subset of `per-offset` and
 `uprobe-multi`, derived only from successfully owned links. Before the
@@ -61,10 +66,15 @@ are always present and zero when the corresponding path did not lose evidence.
 ## Completeness and terminal trace
 
 Any truncation, uncovered provider, export status other than `present` or
-`legacy_absent`, count-only tuple, nonzero descendant gap, or nonzero rebuild
-gap forces `evidence.completeness` to `PARTIAL`. The ordinary terminal trace
+`legacy_absent`, count-only tuple, successful tuple with `none` authority,
+nonzero descendant gap, or nonzero rebuild gap forces
+`evidence.completeness` to `PARTIAL`. The ordinary terminal trace
 `EVIDENCE` object carries the same four fields and rules. Individual trace
 event lines never contain request/result selection data.
+
+The v3 profile evidence object and unchanged v2-metrics evidence object each
+have a closed exact key set. Unknown fields are rejected; v2-metrics contains
+none of the four v3-only fields.
 
 ## Migration
 

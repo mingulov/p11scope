@@ -118,6 +118,18 @@ PROFILE_V3_FIELDS = {
     "interface_selection", "attach_mechanisms", "pid_descendant_gaps",
     "multi_rebuild_gaps",
 }
+BASE_EVIDENCE_KEYS = set(COUNTERS) | {
+    "authority", "discovery", "manifest_object_fallbacks", "modules_skipped",
+    "scan_unavailable", "scan_ms", "table_entries", "slots", "attached_probes",
+    "attach_failures", "aliased", "skipped", "in_flight_at_end", "surfaces",
+    "vendor_interfaces", "interface_list", "attach_gap_ms", "pause",
+    *PAUSE_COUNTERS, "loader_discovery", "templates_truncated", "provider_changed",
+    "completeness",
+}
+TRACE_TERMINAL_KEYS = {
+    "privacy_mode", "capture_aborted", "final_drain", "counters_available",
+    "trace_truncated",
+}
 
 # The version-matrix provider, seen two ways. Both are measured, both are exact.
 #
@@ -285,6 +297,7 @@ def exact_profile_v3_selection(document, *, terminal=False):
         evidence = document["evidence"]
     else:
         evidence = document
+    exact_evidence_keys(evidence, profile=True, terminal=terminal, child=False)
     missing = {
         "interface_selection", "attach_mechanisms", "pid_descendant_gaps",
         "multi_rebuild_gaps",
@@ -367,10 +380,12 @@ def exact_profile_v3_selection(document, *, terminal=False):
             require(not matches and not tuple_["table_match"] and tuple_["authority"] == "none", tuple_)
             require(tuple_["rv"] == 0 or result is None, tuple_)
         elif matches:
+            readable = (
+                result["name"] not in {"null", "unreadable"}
+                and result["version"] not in {"null", "unreadable"}
+            )
             require(
-                tuple_["authority"] == "inventory"
-                and result["name"] not in {"null", "unreadable"}
-                and result["version"] not in {"null", "unreadable"},
+                tuple_["authority"] == ("inventory" if readable else "none"),
                 tuple_,
             )
         elif tuple_["authority"] == "selection_count_only":
@@ -382,7 +397,13 @@ def exact_profile_v3_selection(document, *, terminal=False):
             )
         else:
             require(tuple_["authority"] == "none", tuple_)
-    serialized_tuples = [json.dumps(item, separators=(",", ":")) for item in tuples]
+        for match in matches:
+            surface = surfaces[match["surface"]]
+            if surface["kind"] == "legacy" or result is None or result["name"] in {"null", "unreadable"}:
+                require(not match["name_agrees"], f"invalid name agreement: {match}")
+            if result is None or result["version"] in {"null", "unreadable"}:
+                require(not match["version_agrees"], f"invalid version agreement: {match}")
+    serialized_tuples = [selection_tuple_key(item) for item in tuples]
     require(serialized_tuples == sorted(serialized_tuples), "unsorted selection tuples")
     require(len(set(serialized_tuples)) == len(tuples), "duplicate selection tuples")
 
@@ -403,6 +424,7 @@ def exact_profile_v3_selection(document, *, terminal=False):
         or any(item["coverage"] not in {"observed", "absent_covered"} for item in providers)
         or any(item["status"] not in {"present", "legacy_absent"} for item in exports)
         or any(item["authority"] == "selection_count_only" for item in tuples)
+        or any(item["rv"] == 0 and item["authority"] == "none" for item in tuples)
         or evidence["pid_descendant_gaps"] != 0
         or evidence["multi_rebuild_gaps"] != 0
     )
@@ -417,12 +439,44 @@ def exact_role_counts(description):
     }, f"observer/helper roles are reversed or widened: {description}")
 
 
-def exact_metrics_schema(document):
+def exact_evidence_keys(evidence, *, profile, terminal=False, child=False):
+    wanted = BASE_EVIDENCE_KEYS | (PROFILE_V3_FIELDS if profile else set())
+    if terminal:
+        wanted |= TRACE_TERMINAL_KEYS
+    actual = set(evidence)
+    if child:
+        wanted.add("child_still_running")
+    require(actual == wanted, f"unexpected evidence keys: missing={sorted(wanted - actual)}, extra={sorted(actual - wanted)}")
+
+
+def selection_tuple_key(tuple_):
+    """Producer field order, rebuilt independently of input object key order."""
+    request = tuple_["request"]
+    result = tuple_["result"]
+    canonical = {
+        "module": tuple_["module"],
+        "request": {"name": request["name"], "version": request["version"], "flags": request["flags"]},
+        "rv": tuple_["rv"],
+        "result": None if result is None else {
+            "name": result["name"], "version": result["version"], "flags": result["flags"],
+        },
+        "table_match": tuple_["table_match"],
+        "inventory_matches": [
+            {"surface": item["surface"], "name_agrees": item["name_agrees"],
+             "version_agrees": item["version_agrees"]}
+            for item in tuple_["inventory_matches"]
+        ],
+        "authority": tuple_["authority"],
+        "count": tuple_["count"],
+    }
+    return json.dumps(canonical, separators=(",", ":"))
+
+
+def exact_metrics_schema(document, *, run=False):
     require(document["schema"] == METRICS_SCHEMA, document["schema"])
     require(document["capture"]["mode"] == "metrics", document["capture"])
     require(document["capture"]["privacy_mode"] == "aggregate-only", document["capture"])
-    leaked = PROFILE_V3_FIELDS & set(document["evidence"])
-    require(not leaked, f"metrics publishes profile-v3 evidence: {sorted(leaked)}")
+    exact_evidence_keys(document["evidence"], profile=False, child=run)
 
 
 def exact_identity(carrier):
@@ -1243,7 +1297,7 @@ def validate_clean_metrics(
     require(discovery in CLEAN_DISCOVERY, f"unknown clean-metrics discovery: {discovery}")
     wanted_sources, allowances = CLEAN_DISCOVERY[discovery]
     require(multiplier >= 1, f"invalid clean-metrics multiplier: {multiplier}")
-    exact_metrics_schema(document)
+    exact_metrics_schema(document, run=run)
     evidence = document["evidence"]
     surfaces = (
         LEGACY_SURFACES + LEGACY_SURFACES
@@ -1474,7 +1528,7 @@ def validate_canary(lane, document):
         exact_capture_modules(document)
     if policy == "aggregate":
         calls = sum(item["calls"] for item in document["functions"])
-        require(calls == 25, f"aggregate calls: want 25, got {calls}")
+        require(calls == 28, f"aggregate calls: want 28, got {calls}")
 
 
 # Every induced-gap lane holds its workload behind a go-file, so nothing has
@@ -1752,7 +1806,7 @@ def self_test():
     )
     validate_clean_metrics(clean, {"C_Initialize": 1})
     bad_metrics = copy.deepcopy(clean)
-    bad_metrics["evidence"]["interface_selection"] = {}
+    bad_metrics["evidence"]["secret_selection_payload"] = "CANARY"
     rejected(lambda: validate_clean_metrics(bad_metrics, {"C_Initialize": 1}))
     shared = copy.deepcopy(clean)
     shared["evidence"]["skipped"] = [
@@ -2185,7 +2239,7 @@ def self_test():
             "result": {"name": "exact_standard", "version": "v3_0", "flags": 0},
             "table_match": True,
             "inventory_matches": [
-                {"surface": 0, "name_agrees": True, "version_agrees": True},
+                {"surface": 0, "name_agrees": False, "version_agrees": True},
                 {"surface": 1, "name_agrees": True, "version_agrees": True},
             ],
             "authority": "inventory",
@@ -2194,6 +2248,22 @@ def self_test():
         "selection_truncated": False,
     }
     exact_profile_v3_selection(selection_doc)
+    unreadable_match = copy.deepcopy(selection_doc)
+    unreadable_tuple = unreadable_match["evidence"]["interface_selection"]["tuples"][0]
+    unreadable_tuple["result"]["name"] = "unreadable"
+    unreadable_tuple["inventory_matches"][1]["name_agrees"] = False
+    unreadable_tuple["authority"] = "none"
+    exact_profile_v3_selection(unreadable_match)
+    null_name_match = copy.deepcopy(unreadable_match)
+    null_name_match["evidence"]["interface_selection"]["tuples"][0]["result"]["name"] = "null"
+    exact_profile_v3_selection(null_name_match)
+    unreadable_version = copy.deepcopy(selection_doc)
+    unreadable_tuple = unreadable_version["evidence"]["interface_selection"]["tuples"][0]
+    unreadable_tuple["result"]["version"] = "unreadable"
+    for match in unreadable_tuple["inventory_matches"]:
+        match["version_agrees"] = False
+    unreadable_tuple["authority"] = "none"
+    exact_profile_v3_selection(unreadable_version)
     for mutate in (
         lambda d: d["evidence"]["interface_selection"].update(secret="canary"),
         lambda d: d["evidence"]["interface_selection"]["providers"].append(
@@ -2214,6 +2284,7 @@ def self_test():
         lambda d: d["evidence"]["interface_selection"]["tuples"][0].update(authority="none"),
         lambda d: d["evidence"]["interface_selection"]["tuples"][0]["inventory_matches"].reverse(),
         lambda d: d["evidence"]["interface_selection"]["tuples"][0]["inventory_matches"][0].update(surface=2),
+        lambda d: d["evidence"]["interface_selection"]["tuples"][0]["inventory_matches"][0].update(name_agrees=True),
         lambda d: d["evidence"].update(pid_descendant_gaps=-1),
         lambda d: d["evidence"].update(multi_rebuild_gaps=U64_MAX + 1),
     ):
@@ -2225,9 +2296,33 @@ def self_test():
     failed.update(rv=5, result=None, table_match=False, inventory_matches=[], authority="none", count=1)
     unordered["evidence"]["interface_selection"]["tuples"].append(failed)
     unordered["evidence"]["interface_selection"]["tuples"].sort(
-        key=lambda item: json.dumps(item, separators=(",", ":")), reverse=True
+        key=selection_tuple_key, reverse=True
     )
     rejected(lambda: exact_profile_v3_selection(unordered))
+    bad_unreadable = copy.deepcopy(unreadable_match)
+    bad_unreadable["evidence"]["interface_selection"]["tuples"][0]["inventory_matches"][1]["name_agrees"] = True
+    rejected(lambda: exact_profile_v3_selection(bad_unreadable))
+    unreadable_authority = copy.deepcopy(unreadable_match)
+    unreadable_authority["evidence"]["interface_selection"]["tuples"][0]["authority"] = "inventory"
+    rejected(lambda: exact_profile_v3_selection(unreadable_authority))
+    authority_none = copy.deepcopy(selection_doc)
+    authority_none_tuple = authority_none["evidence"]["interface_selection"]["tuples"][0]
+    authority_none_tuple.update(table_match=False, inventory_matches=[], authority="none")
+    authority_none["evidence"]["completeness"] = "COMPLETE"
+    rejected(lambda: exact_profile_v3_selection(authority_none))
+    unreadable_match["evidence"]["completeness"] = "COMPLETE"
+    rejected(lambda: exact_profile_v3_selection(unreadable_match))
+    semantic_duplicate = copy.deepcopy(selection_doc)
+    original = semantic_duplicate["evidence"]["interface_selection"]["tuples"][0]
+    reordered = {key: original[key] for key in reversed(original)}
+    semantic_duplicate["evidence"]["interface_selection"]["tuples"] = [original, reordered]
+    semantic_duplicate["evidence"]["interface_selection"]["tuples"].sort(
+        key=selection_tuple_key
+    )
+    rejected(lambda: exact_profile_v3_selection(semantic_duplicate))
+    extra_profile = copy.deepcopy(selection_doc)
+    extra_profile["evidence"]["secret_selection_payload"] = "CANARY"
+    rejected(lambda: exact_profile_v3_selection(extra_profile))
     loss = copy.deepcopy(selection_doc)
     loss["evidence"]["interface_selection"]["providers"][0]["coverage"] = "observed_uncovered"
     loss["evidence"]["completeness"] = "COMPLETE"
@@ -2321,7 +2416,7 @@ def self_test():
         mode="metrics",
         privacy="aggregate-only",
     )
-    aggregate["functions"] = function_items([(["C_GetInterfaceList"], 25)])
+    aggregate["functions"] = function_items([(["C_GetInterfaceList"], 28)])
     validate_canary("aggregate-only-metrics", aggregate)
     bad = copy.deepcopy(aggregate)
     bad["functions"][0]["calls"] = 24

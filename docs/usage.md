@@ -40,7 +40,7 @@ replacing the module with a shim. It aggregates function/mechanism/error/
 latency counts (`profile`/`metrics` modes) or streams one line per call
 for a bounded investigation window (`trace` mode), and writes a versioned
 `observed-profile.json` for migration assessment
-(`docs/schema/observed-profile-v2.md`) or an operator to read directly.
+(`docs/schema/observed-profile-v3.md`) or an operator to read directly.
 
 ## What it does NOT intentionally decode
 
@@ -71,7 +71,7 @@ The official release artifact is built `--no-default-features`, and packaging
 fails if the unsafe path is reachable. See
 [docs/superpowers/specs/2026-08-10-pkcs11-scope-outputs.md](superpowers/specs/2026-08-10-pkcs11-scope-outputs.md#what-you-will-not-see-by-design-in-every-mode)
 for the design commitment and
-[docs/privacy/allowlist-v1.md](privacy/allowlist-v1.md) for the field-by-field
+[docs/privacy/allowlist-v2.md](privacy/allowlist-v2.md) for the field-by-field
 enforcement (what is captured, why, and how each read is gated — structural
 where a leak is impossible by construction, runtime-gated where a length/
 null check stands in front of the read, each gate named with the test that
@@ -92,10 +92,12 @@ handles alternate, null, unreadable, and non-UTF-8 names. It walks those tables
 only when standard export anchors—or an independently acquired legacy 2.40
 table—corroborate the expected layout. Such a walk is a known prefix and keeps
 the report `PARTIAL`; uncorroborated entries remain present as vendor evidence
-and are not decoded. Discovery enumerates `C_GetInterfaceList`, then performs
-exactly ten bounded `C_GetInterface` compatibility queries (the fixed
-selector/version/flag matrix) before `C_Initialize`; these helper calls are
-separate from live target observation and never initialize the provider.
+and are not decoded. The observer and `p11scope inspect` make zero PKCS #11
+calls. Only the explicit offline `p11scope-discover` helper enumerates
+`C_GetInterfaceList`, then makes exactly ten bounded `C_GetInterface`
+compatibility calls (the fixed selector/version/flag matrix) before
+`C_Initialize`; these helper calls are separate from live target observation
+and never initialize the provider.
 
 Interface-name discovery reads at most 64 bytes and never crosses the readable
 VMA containing the pointer. A name without an in-VMA NUL is unreadable. Text
@@ -391,7 +393,7 @@ deliberately on a lighter workload (`docs/notes/phase2-induced-gaps.md`).
 ## The evidence/completeness model
 
 Every `observed-profile.json` carries an `evidence` section
-(`docs/schema/observed-profile-v2.md`) ending in a `completeness` verdict:
+(`docs/schema/observed-profile-v3.md`) ending in a `completeness` verdict:
 `"COMPLETE"` or `"PARTIAL"`.
 
 Discovery normally scans the target's mapped memory. An optional `--manifest`
@@ -508,12 +510,12 @@ What this tool proves, and what it deliberately does not claim to:
 
 ## Related docs
 
-- [`docs/privacy/allowlist-v1.md`](privacy/allowlist-v1.md) — the
+- [`docs/privacy/allowlist-v2.md`](privacy/allowlist-v2.md) — the
   field-by-field decoder inventory, policy boundary, and implemented
   hostile-pointer canary coverage.
-- [`docs/schema/observed-profile-v2.md`](schema/observed-profile-v2.md) —
+- [`docs/schema/observed-profile-v3.md`](schema/observed-profile-v3.md) —
   the versioned `observed-profile.json` schema (current:
-  `pkcs11-scope/observed-profile/v2`), the integration boundary
+  `pkcs11-scope/observed-profile/v3`), the integration boundary
   `pkcs11-lab` reads.
 - [`docs/superpowers/specs/2026-08-10-pkcs11-scope-outputs.md`](superpowers/specs/2026-08-10-pkcs11-scope-outputs.md)
   — the original "what you will see" design commitment.

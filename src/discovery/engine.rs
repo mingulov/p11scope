@@ -5643,8 +5643,12 @@ impl Engine {
             .collect();
         providers.sort_by_key(|provider| provider.module);
         providers.dedup_by_key(|provider| provider.module);
+        if providers.len() > MAX_LIVE_SELECTION_SURFACES {
+            providers.truncate(MAX_LIVE_SELECTION_SURFACES);
+            selection_truncated = true;
+        }
 
-        let standard_exports = history
+        let mut standard_exports: Vec<_> = history
             .modules
             .keys()
             .map(|stable| render::StandardExport {
@@ -5655,6 +5659,10 @@ impl Engine {
                 ),
             })
             .collect();
+        if standard_exports.len() > MAX_LIVE_SELECTION_SURFACES {
+            standard_exports.truncate(MAX_LIVE_SELECTION_SURFACES);
+            selection_truncated = true;
+        }
 
         let mut tuples: Vec<_> = history
             .selections
@@ -5687,9 +5695,25 @@ impl Engine {
                 inventory_matches.sort_by_key(|matched| {
                     (matched.surface, matched.name_agrees, matched.version_agrees)
                 });
-                inventory_matches.dedup();
+                let mut inventory_conflict = false;
+                let mut canonical_matches: Vec<render::SelectionMatch> = Vec::new();
+                for matched in inventory_matches {
+                    if let Some(prior) = canonical_matches
+                        .last_mut()
+                        .filter(|prior| prior.surface == matched.surface)
+                    {
+                        inventory_conflict |= prior.name_agrees != matched.name_agrees
+                            || prior.version_agrees != matched.version_agrees;
+                        prior.name_agrees &= matched.name_agrees;
+                        prior.version_agrees &= matched.version_agrees;
+                    } else {
+                        canonical_matches.push(matched);
+                    }
+                }
+                let inventory_matches = canonical_matches;
+                selection_truncated |= inventory_conflict;
                 let lost_inventory_authority = tuple.authority == SelectionAuthority::Inventory
-                    && inventory_matches.is_empty();
+                    && (inventory_matches.is_empty() || inventory_conflict);
                 Some(render::SelectionTuple {
                     module,
                     request: tuple.request,
@@ -17003,13 +17027,67 @@ int main(int argc, char **argv) {
                 .iter()
                 .map(|matched| (matched.surface, matched.name_agrees, matched.version_agrees))
                 .collect::<Vec<_>>(),
-            [(0, true, true), (1, false, true), (1, true, false)]
+            [(0, true, true), (1, false, false)]
         );
+        assert!(selection.selection_truncated);
+        assert_eq!(selection.tuples[0].authority, SelectionAuthority::None);
         assert_eq!(selection.tuples[0].count, u64::MAX);
         assert_eq!(selection.tuples.len(), 1);
-        let json = serde_json::to_string(&selection).unwrap();
+        let value = serde_json::to_value(&selection).unwrap();
+        assert_eq!(
+            value["tuples"][0]["inventory_matches"],
+            serde_json::json!([
+                {"surface": 0, "name_agrees": true, "version_agrees": true},
+                {"surface": 1, "name_agrees": false, "version_agrees": false},
+            ])
+        );
+        let json = serde_json::to_string(&value).unwrap();
         assert!(!json.contains("private-name-canary"));
         assert!(!json.contains("feed"));
+    }
+
+    #[test]
+    fn public_selection_module_rows_stop_at_exactly_512_dense_indices() {
+        let (_fixture, _source, _session, binding) = attached_selection_route();
+        for (count, truncated) in [(512, false), (513, true)] {
+            let mut engine = Engine::empty();
+            for index in 0..count {
+                let stable = plan::ModuleId(index as u32);
+                let mut module = merged_module(vec!["scan"]);
+                module.id = stable;
+                engine.capture_facts.history.modules.insert(stable, module);
+                engine
+                    .capture_facts
+                    .history
+                    .standard_exports
+                    .insert(stable, BTreeSet::from([StandardExportFact::Present]));
+                let mut retained = binding;
+                retained.id = index as u64 + 1;
+                retained.provider = stable;
+                retained.observed = true;
+                engine.selection_bindings.insert(retained.id, retained);
+            }
+
+            let selection = engine.interface_selection();
+            let expected = (0..512.min(count as u32)).collect::<Vec<_>>();
+            assert_eq!(
+                selection
+                    .providers
+                    .iter()
+                    .map(|row| row.module)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(
+                selection
+                    .standard_exports
+                    .iter()
+                    .map(|row| row.module)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(selection.selection_truncated, truncated);
+        }
     }
 
     #[test]

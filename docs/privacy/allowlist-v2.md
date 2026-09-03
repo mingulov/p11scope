@@ -18,7 +18,7 @@ helper and never executes provider code.
 | Selection inventory relation | Exact pointer/object/offset equality against a separately accepted caller-independent inventory surface. Name/version equality alone grants no authority. | At most 512 finite `{module, ordinal, kind}` surface records and at most 16 sorted surface references per tuple. |
 | Selection aggregate | One capture-wide reducer with at most 16 distinct tuples; repeated equal tuples increment one saturating u64 count. | `evidence.interface_selection`; only the exact fields and enums in the v3 schema. |
 | Attach mechanism | Successfully owned links, after attachment succeeds. | Sorted duplicate-free `evidence.attach_mechanisms`, a subset of `per-offset` and `uprobe-multi`. |
-| Descendant/rebuild loss | Saturating userspace counters; no task, PID, generation, link, or timing identity crosses the render boundary. | `evidence.pid_descendant_gaps` and `evidence.multi_rebuild_gaps`. |
+| Descendant/rebuild loss | Saturating userspace counters; cgroup ingress gaps are authenticated by membership-refresh admission or a scoped leader-exit boundary, never by creator-event identity. No task, PID, generation, link, or timing identity crosses the render boundary. | `evidence.pid_descendant_gaps` and `evidence.multi_rebuild_gaps`. |
 | Task-uprobe link loss | A matched leader-exit record is settled against the retained generation-bound `ProcessView`; no process identity or independent `/proc` probe is captured. | Aggregate-only `evidence.task_uprobe_link_losses`, counted once per affected process view; nonzero forces `PARTIAL`. |
 
 The existing offline exception remains narrow: `p11scope inspect` and an
@@ -27,6 +27,16 @@ because they are discovery tools. Profile, metrics, trace lines, and terminal
 trace evidence never publish those bytes. Unknown, unterminated, or aliased
 bytes become only `other` or `unreadable`; even exact `PKCS 11` bytes are
 discarded after classification.
+
+For cgroup event captures, ordinary and `CLONE_INTO_CGROUP` creator records are
+semantic hints only. Ingress loss is counted from destination-authenticated
+membership admission or an unmatched scoped leader exit; initially retained
+views do not add a count. Arbitrary enter-then-migrate-out before refresh or
+exit remains outside W3. PID-scoped captures always report zero descendant
+gaps. A novel unmatched exit latches one lower-bound overflow increment when
+the bounded ledger is full. If admission already counted the gap, coalescing
+overflow marks `PARTIAL` without another increment. Replays and further
+unremembered keys do not increment again.
 
 Metrics remains `aggregate-only`, reads no selection arguments, and uses the
 exact `pkcs11-scope/observed-profile/v3-metrics` shape. Historical

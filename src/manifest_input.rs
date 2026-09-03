@@ -235,6 +235,19 @@ fn selection_version_agrees(result: &SelectionResult, surface: &SurfaceRecord) -
     ) && result.version == surface_version
 }
 
+pub(crate) fn selection_surface_usable(surface: &SurfaceRecord) -> bool {
+    if !matches!(surface.acquisition, Acquisition::Ok) {
+        return false;
+    }
+    let Ok((_, expected_walk)) = expected_surface(surface) else {
+        return false;
+    };
+    matches!(
+        (&surface.walk, expected_walk),
+        (WalkOutcome::Full, "full") | (WalkOutcome::KnownPrefix, "known_prefix")
+    )
+}
+
 fn validate_selection_table(
     table: &SelectionTable,
     object_ids: &BTreeSet<u32>,
@@ -371,9 +384,17 @@ fn validate_selection_evidence(
         }
         let mut previous_surface = None;
         for found in &query.inventory_matches {
-            if found.surface >= surfaces.len() {
+            let Some(surface) = surfaces.get(found.surface) else {
                 problems.push(format!(
                     "selection query {position} refers to missing surface {}",
+                    found.surface
+                ));
+                previous_surface = Some(found.surface);
+                continue;
+            };
+            if !selection_surface_usable(surface) {
+                problems.push(format!(
+                    "selection query {position} refers to unavailable inventory surface {}",
                     found.surface
                 ));
             }
@@ -383,9 +404,7 @@ fn validate_selection_evidence(
                 ));
             }
             previous_surface = Some(found.surface);
-            if let (Some(result), Some(surface)) =
-                (query.result.as_ref(), surfaces.get(found.surface))
-            {
+            if let Some(result) = query.result.as_ref() {
                 if found.name_agrees != selection_name_agrees(result, surface) {
                     problems.push(format!(
                         "selection query {position} has incorrect name agreement"

@@ -67,13 +67,22 @@ uprobe-multi attachment slice, a nonempty array can contain only `per-offset`.
 
 `pid_descendant_gaps` and `multi_rebuild_gaps` are saturating u64 counts.
 `pid_descendant_gaps` is zero for exact PID scope because process-creation
-tracking is not attached there. For cgroup scope it counts observed child
-creation windows before the child's per-process dynamic selection-export links
-can be refreshed; static function probes still cover cgroup child calls during
-that window. The fields are always present and zero when the corresponding
-path did not lose evidence. When required cgroup process-creation tracking is
-unavailable, `pid_descendant_gaps: 1` is an unavailability sentinel and lower
-bound, not a claim that exactly one child was observed.
+tracking is not attached there. For cgroup scope it counts destination-
+authenticated ingress gaps: a newly admitted child `ProcessView` after a
+membership refresh, or a valid leader-exit boundary that cannot match an
+admitted process generation. Initially retained views are seeded without a
+count, and each admitted generation or unmatched exit is counted at most once.
+Creator records are semantic hints only: ordinary fork may retain the parent's
+state, while `CLONE_INTO_CGROUP` never inherits; neither creator event itself
+increments this counter. The fields are always present and zero when the
+corresponding path did not lose evidence. When required cgroup creation or
+lifecycle tracking is unavailable, `pid_descendant_gaps: 1` is an
+unavailability sentinel and lower bound, not a claim that exactly one child
+was observed. Arbitrary enter-then-migrate-out before refresh or exit remains
+outside W3's completeness claim. A novel unmatched exit latches one lower-bound
+overflow increment when the bounded ledger is full. If admission already
+counted the gap, coalescing overflow marks `PARTIAL` without another increment.
+Replays and further unremembered keys do not increment again.
 
 `task_uprobe_link_losses` is a saturating u64 count of matched leader-exit
 records whose retained process generation proved that a member of the process

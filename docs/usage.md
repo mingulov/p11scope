@@ -205,12 +205,19 @@ either subcommand; Ctrl-C or SIGTERM also ends a capture cleanly (final frame
 printed, `-o` file written) instead of aborting it.
 
 For cgroup event captures, `task/task_newtask` records ordinary non-thread
-creation and preserves the parent's proven semantic state while the child is
-refreshed. `CLONE_INTO_CGROUP` is recorded as a selection gap without
-inheritance because destination membership is unproven. Arbitrary post-start
-cgroup migration is outside the `COMPLETE` and runtime-qualified claims; no
-migration subsystem is provided. PID scope remains exact and does not attach
-process-creation tracking.
+creation as a semantic hint and may preserve the parent's proven state while
+the child is refreshed; the creator event itself does not increment
+`pid_descendant_gaps`. `CLONE_INTO_CGROUP` never inherits state at the hint
+boundary. The counter is destination-authenticated by successful membership
+refresh admission and by a scoped leader-exit record that cannot match an
+admitted generation, with each generation or unmatched exit counted once.
+When the bounded unmatched-exit ledger is full, a novel unmatched exit latches
+one lower-bound overflow increment. If admission already counted the gap,
+coalescing overflow marks `PARTIAL` without another increment. Replayed or
+further unremembered exits do not increment again.
+Arbitrary enter-then-migrate-out before refresh or exit remains outside W3's
+`COMPLETE` and runtime-qualified claims; no migration subsystem is provided.
+PID scope remains exact and does not attach process-creation tracking.
 
 Before either command attaches, every accepted object from the scan or an
 optional manifest is opened once and pinned by file descriptor. The whole-file

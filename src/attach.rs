@@ -513,6 +513,7 @@ pub struct Session {
     /// `EVENTS` ring finite and a poll of it allowed to read it whole.
     producers_detached: bool,
     successful_static: BTreeSet<StaticEndpoint>,
+    successful_dynamic: bool,
     policy: CapturePolicy,
     uprobe_scope: UProbeScope,
     #[allow(dead_code)] // Task 8 drives the Task 7 pause coordinator.
@@ -791,6 +792,15 @@ fn detach_selected_with<T>(
         .into_iter()
         .filter_map(|(_, link)| detach(link).err())
         .collect()
+}
+
+fn register_dynamic_success<T>(
+    links: &mut Vec<T>,
+    successful_dynamic: &mut bool,
+    attached: impl IntoIterator<Item = T>,
+) {
+    links.extend(attached);
+    *successful_dynamic = true;
 }
 
 /// Renders `e` and every `.source()` beneath it, joined by `: `. Several
@@ -1359,6 +1369,7 @@ impl Session {
             detach_failures: vec![],
             producers_detached: false,
             successful_static: BTreeSet::new(),
+            successful_dynamic: false,
             policy,
             uprobe_scope,
             pause_key,
@@ -1437,15 +1448,19 @@ impl Session {
         );
         match probe.attach(point, &path, scope) {
             Ok(id) => {
-                self.links.push(RegisteredLink::DynamicUProbe {
-                    program,
-                    context,
-                    object,
-                    file_offset,
-                    cookie,
-                    abi: None,
-                    id,
-                });
+                register_dynamic_success(
+                    &mut self.links,
+                    &mut self.successful_dynamic,
+                    [RegisteredLink::DynamicUProbe {
+                        program,
+                        context,
+                        object,
+                        file_offset,
+                        cookie,
+                        abi: None,
+                        id,
+                    }],
+                );
                 Ok(true)
             }
             Err(error) => {
@@ -1535,17 +1550,21 @@ impl Session {
         };
         // Register entry first so selective and terminal drains stop new state
         // before removing the matching return consumer.
-        for (program, id) in [(entry_program, entry_id), (return_program, return_id)] {
-            self.links.push(RegisteredLink::DynamicUProbe {
-                program,
-                context,
-                object,
-                file_offset,
-                cookie,
-                abi: Some(abi),
-                id,
-            });
-        }
+        register_dynamic_success(
+            &mut self.links,
+            &mut self.successful_dynamic,
+            [(entry_program, entry_id), (return_program, return_id)].map(|(program, id)| {
+                RegisteredLink::DynamicUProbe {
+                    program,
+                    context,
+                    object,
+                    file_offset,
+                    cookie,
+                    abi: Some(abi),
+                    id,
+                }
+            }),
+        );
         Ok((true, monotonic_ns()))
     }
 
@@ -1943,6 +1962,10 @@ impl Session {
     pub fn attached_probes(&self) -> usize {
         self.successful_static.len()
     }
+
+    pub(crate) fn dynamic_per_offset_attached(&self) -> bool {
+        self.successful_dynamic
+    }
 }
 
 impl Drop for Session {
@@ -2147,6 +2170,17 @@ mod policy_output {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dynamic_registration_retains_lifetime_per_offset_success() {
+        let mut links = Vec::new();
+        let mut successful_dynamic = false;
+
+        register_dynamic_success(&mut links, &mut successful_dynamic, [1]);
+
+        assert_eq!(links, [1]);
+        assert!(successful_dynamic);
+    }
     use p11scope_ebpf_common::{ARG_NONE, SlotSemantics};
     use std::io;
 

@@ -2028,6 +2028,7 @@ fn capture_profile(
                 engine,
                 engine.capture_facts(),
                 session.attached_probes(),
+                session.dynamic_per_offset_attached(),
                 session.attach_failures(),
                 &reports,
                 kernel_evidence,
@@ -2109,6 +2110,7 @@ fn capture_profile(
         engine,
         engine.capture_facts(),
         session.attached_probes(),
+        session.dynamic_per_offset_attached(),
         session.attach_failures(),
         &reports,
         kernel_evidence,
@@ -2367,6 +2369,7 @@ fn capture_trace(
         engine,
         engine.capture_facts(),
         session.attached_probes(),
+        session.dynamic_per_offset_attached(),
         session.attach_failures(),
         &reports,
         metrics::kernel_evidence(session)?,
@@ -2388,13 +2391,9 @@ fn capture_trace(
             out_file,
         )?;
     }
-    emit_trace_line(
-        &terminal_trace_count_line(&reports, &tracer),
-        stdout,
-        &mut stdout_open,
-        out_file,
-    )?;
-    emit_trace_line(
+    emit_trace_terminal(
+        &reports,
+        &tracer,
         &trace::evidence_line(&evidence, policy, trace_truncated),
         stdout,
         &mut stdout_open,
@@ -2416,6 +2415,23 @@ fn capture_trace(
 
 fn terminal_trace_count_line(reports: &[metrics::SlotReport], tracer: &trace::Tracer) -> String {
     trace::count_evidence_line(reports, tracer.raw_calls())
+}
+
+fn emit_trace_terminal<W: Write>(
+    reports: &[metrics::SlotReport],
+    tracer: &trace::Tracer,
+    evidence_line: &str,
+    stdout: &mut dyn Write,
+    stdout_open: &mut bool,
+    out_file: &mut Option<W>,
+) -> Result<()> {
+    emit_trace_line(
+        &terminal_trace_count_line(reports, tracer),
+        stdout,
+        stdout_open,
+        out_file,
+    )?;
+    emit_trace_line(evidence_line, stdout, stdout_open, out_file)
 }
 
 /// Prints (and, if given, appends to the `-o` file) every rendered line.
@@ -2625,6 +2641,7 @@ fn evidence_for(
     engine: &Engine,
     facts: render::CaptureFacts,
     attached_probes: usize,
+    dynamic_per_offset_attached: bool,
     attach_failures: &[(u32, String)],
     reports: &[metrics::SlotReport],
     kernel_evidence: metrics::KernelEvidence,
@@ -2744,7 +2761,7 @@ fn evidence_for(
         loader_discovery: facts.loader_discovery(),
         interface_selection,
         attach_mechanisms: if include_selection {
-            attach_mechanisms(attached_probes)
+            attach_mechanisms(attached_probes, dynamic_per_offset_attached)
         } else {
             Vec::new()
         },
@@ -2768,8 +2785,11 @@ fn evidence_for(
     ev
 }
 
-fn attach_mechanisms(attached_probes: usize) -> Vec<&'static str> {
-    if attached_probes == 0 {
+fn attach_mechanisms(
+    attached_probes: usize,
+    dynamic_per_offset_attached: bool,
+) -> Vec<&'static str> {
+    if attached_probes == 0 && !dynamic_per_offset_attached {
         Vec::new()
     } else {
         vec!["per-offset"]
@@ -4060,6 +4080,55 @@ mod tests {
         assert!(stdout.iter().filter(|byte| **byte == b'\n').count() <= 1);
     }
 
+    #[test]
+    fn terminal_trace_emission_orders_exact_count_before_evidence() {
+        let (_, _, tracer) = trace_fixture();
+        let reports = [metrics::SlotReport {
+            names: vec!["C_Initialize".to_string()],
+            aliased: false,
+            semantic_authorized: true,
+            module: None,
+            module_ambiguous: false,
+            module_unresolved: false,
+            calls: 5,
+            errors: 0,
+            in_flight: 2,
+            total_ns: 0,
+            max_ns: 0,
+            buckets: [0; p11scope_ebpf_common::LATENCY_BUCKETS],
+            rv_counts: std::collections::BTreeMap::new(),
+        }];
+        let mut stdout = Vec::new();
+        let mut stdout_open = true;
+        let mut out_file: Option<Vec<u8>> = None;
+
+        emit_trace_terminal(
+            &reports,
+            &tracer,
+            "EVIDENCE {}",
+            &mut stdout,
+            &mut stdout_open,
+            &mut out_file,
+        )
+        .unwrap();
+
+        let lines = String::from_utf8(stdout).unwrap();
+        let lines = lines.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1], "EVIDENCE {}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                lines[0].strip_prefix("COUNT_EVIDENCE ").unwrap()
+            )
+            .unwrap(),
+            serde_json::json!({
+                "stats_entered": 7,
+                "stats_returned": 5,
+                "raw_calls": 0,
+            })
+        );
+    }
+
     /// Both loops take their poll bound from the session — the quantum while
     /// the producers are live, whole only once `detach_producers` detached
     /// them all — so duration, signal and the line limit are checked between
@@ -4268,8 +4337,9 @@ mod tests {
 
     #[test]
     fn attach_mechanism_requires_a_successfully_owned_link() {
-        assert!(attach_mechanisms(0).is_empty());
-        assert_eq!(attach_mechanisms(2), ["per-offset"]);
+        assert!(attach_mechanisms(0, false).is_empty());
+        assert_eq!(attach_mechanisms(0, true), ["per-offset"]);
+        assert_eq!(attach_mechanisms(2, false), ["per-offset"]);
     }
 
     #[test]
@@ -4283,6 +4353,7 @@ mod tests {
                     engine,
                     engine.capture_facts(),
                     0,
+                    false,
                     &[],
                     &[],
                     metrics::KernelEvidence::default(),
@@ -4351,6 +4422,7 @@ mod tests {
             &engine,
             facts,
             0,
+            false,
             &[],
             &[],
             metrics::KernelEvidence::default(),
@@ -4395,6 +4467,7 @@ mod tests {
             &engine,
             engine.capture_facts(),
             0,
+            false,
             &[],
             &[],
             metrics::KernelEvidence::default(),

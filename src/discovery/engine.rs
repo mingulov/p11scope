@@ -937,6 +937,7 @@ impl CaptureFacts {
                 && known.rv == tuple.rv
                 && known.result == tuple.result
                 && known.inventory_matches == tuple.inventory_matches
+                && known.authority == tuple.authority
         }) || selections.len() < MAX_LIVE_SELECTION_TUPLES
     }
 
@@ -987,12 +988,10 @@ impl CaptureFacts {
                 && known.rv == tuple.rv
                 && known.result == tuple.result
                 && known.inventory_matches == tuple.inventory_matches
+                && known.authority == tuple.authority
         });
         if let Some(existing) = existing {
             existing.count = existing.count.saturating_add(1);
-            if tuple.authority != SelectionAuthority::None {
-                existing.authority = tuple.authority;
-            }
         } else if history.selections.len() < MAX_LIVE_SELECTION_TUPLES {
             tuple.count = 1;
             history.selections.push(tuple);
@@ -17622,6 +17621,63 @@ int main(int argc, char **argv) {
         }
         assert_eq!(facts.history.selections.len(), MAX_LIVE_SELECTION_TUPLES);
         assert!(facts.history.selection_truncated);
+    }
+
+    #[test]
+    fn selection_authority_is_part_of_exact_tuple_identity_and_bound() {
+        let tuple = LiveSelectionTuple {
+            module: plan::ModuleId(1),
+            request: SelectionRequest {
+                name: SelectionNameClass::ExactStandard,
+                version: SelectionVersionClass::V3_0,
+                flags: 0,
+            },
+            rv: 0,
+            result: None,
+            inventory_matches: Vec::new(),
+            authority: SelectionAuthority::SelectionCountOnly,
+            count: 1,
+        };
+        let mut facts = CaptureFacts::default();
+        facts.record_selection(tuple.clone(), false);
+        facts.record_selection(
+            LiveSelectionTuple {
+                authority: SelectionAuthority::None,
+                ..tuple.clone()
+            },
+            false,
+        );
+        assert_eq!(facts.history.selections.len(), 2);
+        assert_eq!(
+            facts
+                .history
+                .selections
+                .iter()
+                .map(|tuple| (tuple.authority, tuple.count))
+                .collect::<Vec<_>>(),
+            [
+                (SelectionAuthority::SelectionCountOnly, 1),
+                (SelectionAuthority::None, 1),
+            ]
+        );
+
+        let mut bounded = CaptureFacts::default();
+        for flags in 0..MAX_LIVE_SELECTION_TUPLES {
+            bounded.record_selection(
+                LiveSelectionTuple {
+                    request: SelectionRequest {
+                        flags: flags as u64,
+                        ..tuple.request
+                    },
+                    authority: SelectionAuthority::None,
+                    ..tuple.clone()
+                },
+                false,
+            );
+        }
+        bounded.record_selection(tuple, false);
+        assert_eq!(bounded.history.selections.len(), MAX_LIVE_SELECTION_TUPLES);
+        assert!(bounded.history.selection_truncated);
     }
 
     #[test]

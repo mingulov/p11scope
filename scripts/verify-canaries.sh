@@ -228,7 +228,9 @@ def trace_scannable(label, text):
     """
     kept = []
     for line in text.splitlines():
-        if not line or line.startswith(("CAPTURE ", "EVIDENCE ", "LOST ")):
+        if not line or line.startswith((
+            "CAPTURE ", "COUNT_EVIDENCE ", "EVIDENCE ", "LOST "
+        )):
             kept.append(line)
             continue
         event = TRACE_EVENT.match(line)
@@ -280,10 +282,19 @@ def profile_terminal(doc, schema="pkcs11-scope/observed-profile/v3"):
 
 
 def trace_terminal(text, privacy):
-    records = [line.removeprefix("EVIDENCE ") for line in text.splitlines()
-               if line.startswith("EVIDENCE ")]
-    assert len(records) == 1, f"expected one terminal EVIDENCE record, got {len(records)}"
-    ev = json.loads(records[0])
+    lines = text.splitlines()
+    evidence = [index for index, line in enumerate(lines)
+                if line.startswith("EVIDENCE ")]
+    counts = [index for index, line in enumerate(lines)
+              if line.startswith("COUNT_EVIDENCE ")]
+    assert len(evidence) == 1, f"expected one terminal EVIDENCE record, got {len(evidence)}"
+    assert len(counts) == 1, f"expected one COUNT_EVIDENCE record, got {len(counts)}"
+    assert counts[0] + 1 == evidence[0], "COUNT_EVIDENCE must immediately precede EVIDENCE"
+    count = json.loads(lines[counts[0]].removeprefix("COUNT_EVIDENCE "))
+    assert set(count) == {"stats_entered", "stats_returned", "raw_calls"}, count
+    assert all(isinstance(value, int) and not isinstance(value, bool)
+               and 0 <= value <= (1 << 64) - 1 for value in count.values()), count
+    ev = json.loads(lines[evidence[0]].removeprefix("EVIDENCE "))
     assert ev["privacy_mode"] == privacy, ev
     assert ev["completeness"] == "PARTIAL", ev
     assert ev["capture_aborted"] is None, ev
@@ -332,7 +343,9 @@ def assert_safe_trace(text):
     assert text.startswith("CAPTURE privacy=allowlisted\n"), text[:200]
     ev = trace_terminal(text, "allowlisted")
     events = [line for line in text.splitlines()
-              if line and not line.startswith(("CAPTURE ", "EVIDENCE ", "LOST "))]
+              if line and not line.startswith((
+                  "CAPTURE ", "COUNT_EVIDENCE ", "EVIDENCE ", "LOST "
+              ))]
     assert events, "safe trace has no rendered call"
     assert "C_DigestInit 0x250" in text, "registered mechanism missing from trace"
     for value in set(ALIASES.values()) | {MAXIMUM}:
@@ -468,7 +481,9 @@ def assert_scan_only_hostile_output(doc, text, hostile):
     assert terminal["attached_probes"] == 2, terminal
     assert terminal["semantic_capture_failures"] == 0, terminal
     events = [line for line in text.splitlines()
-              if line and not line.startswith(("CAPTURE ", "EVIDENCE ", "LOST "))]
+              if line and not line.startswith((
+                  "CAPTURE ", "COUNT_EVIDENCE ", "EVIDENCE ", "LOST "
+              ))]
     assert events == [
         "00:00:00.000000 pid 100 tid 1 C_OpenSession [semantics unverified] → CKR_OK 100ns",
         "00:00:00.000001 pid 100 tid 1 C_OpenSession [semantics unverified] → CKR_GENERAL_ERROR 100ns",
@@ -875,6 +890,11 @@ if work == "--self-test":
             **selection_fixture,
         }
 
+    def count_line():
+        return "COUNT_EVIDENCE " + json.dumps({
+            "stats_entered": 7, "stats_returned": 5, "raw_calls": 3,
+        }) + "\n"
+
     safe = {
         "schema": "pkcs11-scope/observed-profile/v3",
         "capture": {"mode": "profile", "privacy_mode": "allowlisted"},
@@ -920,7 +940,8 @@ if work == "--self-test":
     bad_safe["evidence"]["semantic_capture_failures"] = 4
     reject("safe profile failure total", lambda: assert_safe_profile(bad_safe))
 
-    safe_trace = "CAPTURE privacy=allowlisted\nC_DigestInit 0x250\nEVIDENCE " + json.dumps(
+    safe_trace = "CAPTURE privacy=allowlisted\nC_DigestInit 0x250\n" + count_line() + \
+        "EVIDENCE " + json.dumps(
         terminal("allowlisted", 3, 2)
     )
     assert_safe_trace(safe_trace)
@@ -928,7 +949,19 @@ if work == "--self-test":
         safe_trace.replace("C_DigestInit 0x250", f"C_DigestInit 0x250 0x{UNKNOWN:x}")
     ))
     reject("safe trace needs rendered call", lambda: assert_safe_trace(
-        "CAPTURE privacy=allowlisted\nEVIDENCE " + json.dumps(terminal("allowlisted", 3, 2))
+        "CAPTURE privacy=allowlisted\n" + count_line() +
+        "EVIDENCE " + json.dumps(terminal("allowlisted", 3, 2))
+    ))
+    reject("safe trace missing count evidence", lambda: assert_safe_trace(
+        safe_trace.replace(count_line(), "")
+    ))
+    reject("safe trace count evidence ordering", lambda: assert_safe_trace(
+        safe_trace.replace(count_line(), "").replace(
+            "C_DigestInit 0x250\n", count_line() + "C_DigestInit 0x250\n"
+        )
+    ))
+    reject("safe trace count evidence shape", lambda: assert_safe_trace(
+        safe_trace.replace('"raw_calls": 3', '"raw_calls_extra": 3')
     ))
 
     pss = [{
@@ -979,7 +1012,8 @@ if work == "--self-test":
         "pss_hash", "pss_mgf", "pss_salt", "gcm220_iv", "gcm220_aad",
         "gcm220_tag", "gcm240_iv", "gcm240_aad", "gcm240_tag")]]
     unsafe_trace = "CAPTURE privacy=unsafe-unvalidated-metadata\n" + \
-        " ".join(f"0x{value:x}" for value in unsafe_values) + "\nEVIDENCE " + \
+        " ".join(f"0x{value:x}" for value in unsafe_values) + "\n" + count_line() + \
+        "EVIDENCE " + \
         json.dumps(terminal("unsafe-unvalidated-metadata", 7))
     assert_unsafe_trace(unsafe_trace)
     missing = f"0x{ALIASES['pss_hash']:x}"
@@ -1093,11 +1127,16 @@ if work == "--self-test":
         "00:00:00.000000 pid 100 tid 1 C_OpenSession [semantics unverified] → CKR_OK 100ns",
         "00:00:00.000001 pid 100 tid 1 C_OpenSession [semantics unverified] → CKR_GENERAL_ERROR 100ns",
         "00:00:00.000024 pid 100 tid 1 C_OpenSession [semantics unverified] → CKR_PENDING 100ns",
-    ]) + "\nEVIDENCE " + json.dumps(scan_terminal)
+    ]) + "\n" + count_line() + "EVIDENCE " + json.dumps(scan_terminal)
     assert_scan_only_hostile_output(scan_only, scan_trace, hostile)
     reject("scan-only hostile trace payload", lambda: assert_scan_only_hostile_output(
         scan_only,
         scan_trace.replace("CKR_PENDING", "CKR_PENDING " + hostile[0]),
+        hostile,
+    ))
+    reject("scan-only hostile count payload", lambda: assert_scan_only_hostile_output(
+        scan_only,
+        scan_trace.replace('"raw_calls": 3', f'"raw_calls": "{hostile[0]}"'),
         hostile,
     ))
     # The owner relation is part of that exact shape: an owned cell may not be

@@ -5388,7 +5388,7 @@ aggregate-only-metrics default metrics"
     sentinels.extend(canary_literals(&read(
         "scripts/fixtures/privacy-stack-workload.c",
     )));
-    assert_eq!(sentinels.len(), 18, "unexpected fixture sentinel inventory");
+    assert_eq!(sentinels.len(), 21, "unexpected fixture sentinel inventory");
     for sentinel in sentinels {
         assert!(
             lanes.contains(&sentinel),

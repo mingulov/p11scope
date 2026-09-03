@@ -238,6 +238,8 @@ def trace_scannable(label, text):
 
 
 def selection_terminal(ev):
+    # This is a shallow privacy/shape guard. check-capture-evidence.py performs
+    # the exact schema validation for every produced profile and terminal record.
     assert {
         "interface_selection", "attach_mechanisms", "pid_descendant_gaps",
         "multi_rebuild_gaps",

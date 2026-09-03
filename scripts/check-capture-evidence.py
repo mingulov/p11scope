@@ -290,14 +290,14 @@ def exact_selection_request(value, label):
     uint(value["flags"], U64_MAX, f"{label}.flags")
 
 
-def exact_profile_v3_selection(document, *, terminal=False):
+def exact_profile_v3_selection(document, *, terminal=False, run=False):
     """Validate the closed, bounded profile-v3 selection/privacy extension."""
     if not terminal:
         require(document["schema"] == PROFILE_SCHEMA, document["schema"])
         evidence = document["evidence"]
     else:
         evidence = document
-    exact_evidence_keys(evidence, profile=True, terminal=terminal, child=False)
+    exact_evidence_keys(evidence, profile=True, terminal=terminal, child=run)
     missing = {
         "interface_selection", "attach_mechanisms", "pid_descendant_gaps",
         "multi_rebuild_gaps",
@@ -447,6 +447,9 @@ def exact_evidence_keys(evidence, *, profile, terminal=False, child=False):
     if child:
         wanted.add("child_still_running")
     require(actual == wanted, f"unexpected evidence keys: missing={sorted(wanted - actual)}, extra={sorted(actual - wanted)}")
+    if child:
+        require(isinstance(evidence["child_still_running"], bool),
+                f"invalid child_still_running: {evidence['child_still_running']!r}")
 
 
 def selection_tuple_key(tuple_):
@@ -2248,6 +2251,17 @@ def self_test():
         "selection_truncated": False,
     }
     exact_profile_v3_selection(selection_doc)
+    run_profile = copy.deepcopy(selection_doc)
+    run_profile["evidence"]["child_still_running"] = False
+    exact_profile_v3_selection(run_profile, run=True)
+    run_trace = copy.deepcopy(run_profile["evidence"])
+    run_trace.update(
+        privacy_mode="allowlisted", capture_aborted=None, final_drain=False,
+        counters_available=True, trace_truncated=False,
+    )
+    exact_profile_v3_selection(run_trace, terminal=True, run=True)
+    external_pid = copy.deepcopy(run_profile)
+    rejected(lambda: exact_profile_v3_selection(external_pid, run=False))
     unreadable_match = copy.deepcopy(selection_doc)
     unreadable_tuple = unreadable_match["evidence"]["interface_selection"]["tuples"][0]
     unreadable_tuple["result"]["name"] = "unreadable"
@@ -2264,6 +2278,37 @@ def self_test():
         match["version_agrees"] = False
     unreadable_tuple["authority"] = "none"
     exact_profile_v3_selection(unreadable_version)
+    for coverage in sorted(SELECTION_COVERAGE):
+        candidate = copy.deepcopy(selection_doc)
+        candidate["evidence"]["interface_selection"]["providers"][0]["coverage"] = coverage
+        candidate["evidence"]["completeness"] = "PARTIAL"
+        exact_profile_v3_selection(candidate)
+    for status in sorted(STANDARD_EXPORT_STATUS):
+        candidate = copy.deepcopy(selection_doc)
+        candidate["evidence"]["interface_selection"]["standard_exports"][0]["status"] = status
+        candidate["evidence"]["completeness"] = "PARTIAL"
+        exact_profile_v3_selection(candidate)
+    for name in sorted(SELECTION_NAME_CLASSES):
+        candidate = copy.deepcopy(selection_doc)
+        tuple_ = candidate["evidence"]["interface_selection"]["tuples"][0]
+        tuple_.update(rv=1, result=None, table_match=False, inventory_matches=[], authority="none")
+        tuple_["request"]["name"] = name
+        exact_profile_v3_selection(candidate)
+    for version_class in sorted(SELECTION_VERSION_CLASSES):
+        candidate = copy.deepcopy(selection_doc)
+        tuple_ = candidate["evidence"]["interface_selection"]["tuples"][0]
+        tuple_.update(rv=1, result=None, table_match=False, inventory_matches=[], authority="none")
+        tuple_["request"]["version"] = version_class
+        exact_profile_v3_selection(candidate)
+    for field, classes in (("name", SELECTION_NAME_CLASSES),
+                           ("version", SELECTION_VERSION_CLASSES)):
+        for class_ in sorted(classes):
+            candidate = copy.deepcopy(selection_doc)
+            tuple_ = candidate["evidence"]["interface_selection"]["tuples"][0]
+            tuple_.update(table_match=False, inventory_matches=[], authority="none")
+            tuple_["result"][field] = class_
+            candidate["evidence"]["completeness"] = "PARTIAL"
+            exact_profile_v3_selection(candidate)
     for mutate in (
         lambda d: d["evidence"]["interface_selection"].update(secret="canary"),
         lambda d: d["evidence"]["interface_selection"]["providers"].append(
@@ -2323,6 +2368,81 @@ def self_test():
     extra_profile = copy.deepcopy(selection_doc)
     extra_profile["evidence"]["secret_selection_payload"] = "CANARY"
     rejected(lambda: exact_profile_v3_selection(extra_profile))
+    sixteen = copy.deepcopy(selection_doc)
+    sixteen["evidence"]["interface_selection"]["tuples"] = []
+    for rv in range(1, 17):
+        tuple_ = copy.deepcopy(selection_doc["evidence"]["interface_selection"]["tuples"][0])
+        tuple_.update(rv=rv, result=None, table_match=False, inventory_matches=[], authority="none", count=U64_MAX)
+        sixteen["evidence"]["interface_selection"]["tuples"].append(tuple_)
+    sixteen["evidence"]["interface_selection"]["tuples"].sort(key=selection_tuple_key)
+    exact_profile_v3_selection(sixteen)
+    surface_bound = copy.deepcopy(selection_doc)
+    surface_bound["evidence"]["interface_selection"].update(
+        inventory_surfaces=[
+            {"module": 0, "ordinal": ordinal, "kind": "interface"}
+            for ordinal in range(512)
+        ],
+        tuples=[],
+    )
+    exact_profile_v3_selection(surface_bound)
+    surface_overflow = copy.deepcopy(surface_bound)
+    surface_overflow["evidence"]["interface_selection"]["inventory_surfaces"].append(
+        {"module": 0, "ordinal": 512, "kind": "interface"}
+    )
+    rejected(lambda: exact_profile_v3_selection(surface_overflow))
+    for mechanisms in ([], ["per-offset"], ["uprobe-multi"], ["per-offset", "uprobe-multi"]):
+        candidate = copy.deepcopy(selection_doc)
+        candidate["evidence"]["attached_probes"] = 0 if not mechanisms else 2
+        candidate["evidence"]["attach_mechanisms"] = mechanisms
+        exact_profile_v3_selection(candidate)
+    for mechanisms in (["per-offset", "per-offset"], ["uprobe-multi", "per-offset"]):
+        candidate = copy.deepcopy(selection_doc)
+        candidate["evidence"]["attach_mechanisms"] = mechanisms
+        rejected(lambda candidate=candidate: exact_profile_v3_selection(candidate))
+    two_modules = copy.deepcopy(selection_doc)
+    two_modules["evidence"]["discovery"].append(copy.deepcopy(two_modules["evidence"]["discovery"][0]))
+    two_modules["evidence"]["interface_selection"]["inventory_surfaces"][1]["module"] = 1
+    rejected(lambda: exact_profile_v3_selection(two_modules))
+    count_only = copy.deepcopy(selection_doc)
+    tuple_ = count_only["evidence"]["interface_selection"]["tuples"][0]
+    tuple_.update(table_match=False, inventory_matches=[], authority="selection_count_only")
+    count_only["evidence"]["completeness"] = "PARTIAL"
+    exact_profile_v3_selection(count_only)
+    for mutate in (
+        lambda t: t["request"].update(name="other"),
+        lambda t: t["result"].update(name="other"),
+        lambda t: t["result"].update(version="v2_40"),
+        lambda t: t["result"].update(flags=2),
+    ):
+        invalid = copy.deepcopy(count_only)
+        mutate(invalid["evidence"]["interface_selection"]["tuples"][0])
+        rejected(lambda invalid=invalid: exact_profile_v3_selection(invalid))
+    no_authority = copy.deepcopy(selection_doc)
+    no_authority_tuple = no_authority["evidence"]["interface_selection"]["tuples"][0]
+    no_authority_tuple.update(table_match=False, inventory_matches=[], authority="none")
+    no_authority["evidence"]["completeness"] = "PARTIAL"
+    for authority, candidate in {
+        "inventory": selection_doc,
+        "selection_count_only": count_only,
+        "none": no_authority,
+    }.items():
+        require(candidate["evidence"]["interface_selection"]["tuples"][0]["authority"] == authority,
+                f"authority fixture mismatch: {authority}")
+        exact_profile_v3_selection(candidate)
+    overflow_count = copy.deepcopy(selection_doc)
+    overflow_count["evidence"]["interface_selection"]["tuples"][0]["count"] = U64_MAX + 1
+    rejected(lambda: exact_profile_v3_selection(overflow_count))
+    allowlist = Path("docs/privacy/allowlist-v2.md").read_text(encoding="utf-8")
+    for term in (
+        "export_absent", "export_outside_module", "queried", "selector 0",
+        "selector 4", "exactly ten", "helper_failure", "null_output",
+        "unreadable_interface", "unreadable_name", "unreadable_version",
+        "unreadable_table", "outside_provider", "unresolved_function",
+        "provider_changed", "selection_count_only", "table id", "orphan tables",
+        "semantic_authorized=false", "full", "104", "3.0", "3.1", "3.2",
+        "no raw interface names or pointers",
+    ):
+        require(term in allowlist, f"allowlist-v2 omits {term!r}")
     loss = copy.deepcopy(selection_doc)
     loss["evidence"]["interface_selection"]["providers"][0]["coverage"] = "observed_uncovered"
     loss["evidence"]["completeness"] = "COMPLETE"

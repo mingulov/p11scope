@@ -89,7 +89,7 @@ The official release artifact is built `--no-default-features`, so packaging
 fails if the unsafe path is reachable at all.
 
 The inventory is maintained in the written, field-by-field allowlist
-([docs/privacy/allowlist-v1.md](docs/privacy/allowlist-v1.md)) and a
+([docs/privacy/allowlist-v2.md](docs/privacy/allowlist-v2.md)) and a
 secret-canary suite (`scripts/verify-canaries.sh`) that plants sentinel PINs,
 key material, and buffer contents in a real workload and scans every output
 artifact and every observer-owned BPF map for leaks — including hostile-alias
@@ -172,10 +172,10 @@ for the CLI, live output, trace lines, and an example `observed-profile.json`.
   ambiguous by construction; requested attributes are what the app asked for,
   not the key's effective policy. Full honest-claims section:
   [docs/usage.md](docs/usage.md#honest-claims).
-- The schema is `pkcs11-scope/observed-profile/v2` for `profile` and
+- The schema is `pkcs11-scope/observed-profile/v3` for `profile` and
   `pkcs11-scope/observed-profile/v2-metrics` for `metrics`, with optional
   discovery input at `p11scope-manifest/5`, documented at
-  [docs/schema/observed-profile-v2.md](docs/schema/observed-profile-v2.md).
+  [docs/schema/observed-profile-v3.md](docs/schema/observed-profile-v3.md).
   Schema ids are opaque exact dispatch keys; the major/minor spelling grants
   no compatibility.
 
@@ -197,10 +197,10 @@ inode metadata, and identical bytes do not prove physical identity across separa
 overlay instances, so every such collapse is published as uncertainty and forces
 `PARTIAL`; a distinct byte-identical instance could otherwise be under-counted.
 
-Initial discovery scans provider tables already mapped in the target and
-executes no provider code. The explicit unprivileged `p11scope-discover`
-helper performs exactly ten bounded `C_GetInterface` compatibility queries
-before any provider initialization. For a command the observer owns, `p11scope run`
+Initial discovery and `p11scope inspect` scan provider tables already mapped in
+the target and make zero PKCS #11 calls. The explicit unprivileged
+`p11scope-discover` helper alone performs exactly ten bounded `C_GetInterface`
+compatibility queries before any provider initialization. For a command the observer owns, `p11scope run`
 starts capture before releasing the child and loader/export hooks react to
 later loads. The
 optional unprivileged helper (`p11scope-discover`) can prepare a manifest

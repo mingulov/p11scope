@@ -1,5 +1,6 @@
 //! `p11scope inspect --pid N`: renders a completed memory scan as text or JSON.
-//! No BPF, no pause, no capture (spec §4.6) — reads `/proc` and nothing else, so
+//! No BPF, no pause, no capture, and zero PKCS #11 calls (spec §4.6) — reads
+//! `/proc` and nothing else, so
 //! it works unprivileged against a same-uid target and answers "which providers
 //! does this process actually use". Interface names are shown here on purpose:
 //! `inspect` is a discovery tool, not capture output (spec §4.3).

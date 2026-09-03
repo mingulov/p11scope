@@ -94,6 +94,30 @@ ALLOWED_CORROBORATION = {
 }
 COMPARABLE_CORROBORATION = {"agreed", "conflict"}
 U64_MAX = (1 << 64) - 1
+U32_MAX = (1 << 32) - 1
+U16_MAX = (1 << 16) - 1
+PROFILE_SCHEMA = "pkcs11-scope/observed-profile/v3"
+METRICS_SCHEMA = "pkcs11-scope/observed-profile/v2-metrics"
+SELECTION_KEYS = {
+    "providers", "standard_exports", "inventory_surfaces", "tuples",
+    "selection_truncated",
+}
+SELECTION_NAME_CLASSES = {"null", "exact_standard", "other", "unreadable"}
+SELECTION_VERSION_CLASSES = {
+    "null", "unreadable", "v2_40", "v3_0", "v3_1", "v3_2", "other",
+}
+SELECTION_AUTHORITIES = {"inventory", "selection_count_only", "none"}
+SELECTION_COVERAGE = {
+    "observed", "observed_uncovered", "absent_covered", "absent_uncovered",
+}
+STANDARD_EXPORT_STATUS = {
+    "present", "outside_module", "legacy_absent", "required_absent", "unresolved",
+}
+ATTACH_MECHANISMS = {"per-offset", "uprobe-multi"}
+PROFILE_V3_FIELDS = {
+    "interface_selection", "attach_mechanisms", "pid_descendant_gaps",
+    "multi_rebuild_gaps",
+}
 
 # The version-matrix provider, seen two ways. Both are measured, both are exact.
 #
@@ -233,6 +257,172 @@ def u64(value, *, positive=False):
         and (value > 0 if positive else value >= 0)
         and value <= U64_MAX
     )
+
+
+def exact_keys(value, keys, label):
+    require(isinstance(value, dict) and set(value) == set(keys), f"{label} key set: {value!r}")
+
+
+def uint(value, maximum, label, *, positive=False):
+    require(
+        isinstance(value, int) and not isinstance(value, bool)
+        and (value > 0 if positive else value >= 0) and value <= maximum,
+        f"invalid {label}: {value!r}",
+    )
+
+
+def exact_selection_request(value, label):
+    exact_keys(value, {"name", "version", "flags"}, label)
+    require(value["name"] in SELECTION_NAME_CLASSES, f"invalid {label}.name: {value!r}")
+    require(value["version"] in SELECTION_VERSION_CLASSES, f"invalid {label}.version: {value!r}")
+    uint(value["flags"], U64_MAX, f"{label}.flags")
+
+
+def exact_profile_v3_selection(document, *, terminal=False):
+    """Validate the closed, bounded profile-v3 selection/privacy extension."""
+    if not terminal:
+        require(document["schema"] == PROFILE_SCHEMA, document["schema"])
+        evidence = document["evidence"]
+    else:
+        evidence = document
+    missing = {
+        "interface_selection", "attach_mechanisms", "pid_descendant_gaps",
+        "multi_rebuild_gaps",
+    } - set(evidence)
+    require(not missing, f"missing profile-v3 evidence: {sorted(missing)}")
+    selection = evidence["interface_selection"]
+    exact_keys(selection, SELECTION_KEYS, "interface_selection")
+    require(isinstance(selection["selection_truncated"], bool), selection)
+    modules = evidence["discovery"]
+
+    def module_ref(value, label):
+        uint(value, U32_MAX, label)
+        require(value < len(modules), f"{label} refers to missing module: {value}")
+
+    providers = selection["providers"]
+    require(isinstance(providers, list) and len(providers) <= len(modules), providers)
+    for provider in providers:
+        exact_keys(provider, {"module", "coverage"}, "selection provider")
+        module_ref(provider["module"], "selection provider module")
+        require(provider["coverage"] in SELECTION_COVERAGE, provider)
+    require(providers == sorted(providers, key=lambda item: item["module"]), "unsorted providers")
+    require(len({item["module"] for item in providers}) == len(providers), "duplicate providers")
+
+    exports = selection["standard_exports"]
+    require(isinstance(exports, list) and len(exports) <= len(modules), exports)
+    for export in exports:
+        exact_keys(export, {"module", "status"}, "standard export")
+        module_ref(export["module"], "standard export module")
+        require(export["status"] in STANDARD_EXPORT_STATUS, export)
+    require(exports == sorted(exports, key=lambda item: item["module"]), "unsorted exports")
+    require(len({item["module"] for item in exports}) == len(exports), "duplicate exports")
+
+    surfaces = selection["inventory_surfaces"]
+    require(isinstance(surfaces, list) and len(surfaces) <= 512, surfaces)
+    expected_ordinal = Counter()
+    for surface in surfaces:
+        exact_keys(surface, {"module", "ordinal", "kind"}, "inventory surface")
+        module_ref(surface["module"], "inventory surface module")
+        uint(surface["ordinal"], U16_MAX, "inventory surface ordinal")
+        require(surface["ordinal"] == expected_ordinal[surface["module"]], surface)
+        expected_ordinal[surface["module"]] += 1
+        require(surface["kind"] in {"legacy", "interface"}, surface)
+    require(
+        surfaces == sorted(surfaces, key=lambda item: (item["module"], item["ordinal"])),
+        "unsorted inventory surfaces",
+    )
+
+    tuples = selection["tuples"]
+    require(isinstance(tuples, list) and len(tuples) <= 16, tuples)
+    for tuple_ in tuples:
+        exact_keys(
+            tuple_,
+            {"module", "request", "rv", "result", "table_match",
+             "inventory_matches", "authority", "count"},
+            "selection tuple",
+        )
+        module_ref(tuple_["module"], "selection tuple module")
+        exact_selection_request(tuple_["request"], "selection request")
+        uint(tuple_["rv"], U64_MAX, "selection rv")
+        uint(tuple_["count"], U64_MAX, "selection count", positive=True)
+        require(isinstance(tuple_["table_match"], bool), tuple_)
+        require(tuple_["authority"] in SELECTION_AUTHORITIES, tuple_)
+        matches = tuple_["inventory_matches"]
+        require(isinstance(matches, list) and len(matches) <= 16, matches)
+        previous = -1
+        for match in matches:
+            exact_keys(match, {"surface", "name_agrees", "version_agrees"}, "selection match")
+            uint(match["surface"], U16_MAX, "selection match surface")
+            require(match["surface"] < len(surfaces), f"missing selection surface: {match}")
+            require(surfaces[match["surface"]]["module"] == tuple_["module"], match)
+            require(match["surface"] > previous, "duplicate or unsorted selection matches")
+            previous = match["surface"]
+            require(isinstance(match["name_agrees"], bool), match)
+            require(isinstance(match["version_agrees"], bool), match)
+        require(tuple_["table_match"] == bool(matches), tuple_)
+        result = tuple_["result"]
+        if result is not None:
+            exact_selection_request(result, "selection result")
+        if tuple_["rv"] != 0 or result is None:
+            require(not matches and not tuple_["table_match"] and tuple_["authority"] == "none", tuple_)
+            require(tuple_["rv"] == 0 or result is None, tuple_)
+        elif matches:
+            require(
+                tuple_["authority"] == "inventory"
+                and result["name"] not in {"null", "unreadable"}
+                and result["version"] not in {"null", "unreadable"},
+                tuple_,
+            )
+        elif tuple_["authority"] == "selection_count_only":
+            require(
+                tuple_["request"]["name"] == result["name"] == "exact_standard"
+                and result["version"] in {"v3_0", "v3_1", "v3_2"}
+                and result["flags"] in {0, 1},
+                tuple_,
+            )
+        else:
+            require(tuple_["authority"] == "none", tuple_)
+    serialized_tuples = [json.dumps(item, separators=(",", ":")) for item in tuples]
+    require(serialized_tuples == sorted(serialized_tuples), "unsorted selection tuples")
+    require(len(set(serialized_tuples)) == len(tuples), "duplicate selection tuples")
+
+    mechanisms = evidence["attach_mechanisms"]
+    require(
+        isinstance(mechanisms, list) and mechanisms == sorted(set(mechanisms))
+        and set(mechanisms) <= ATTACH_MECHANISMS,
+        f"invalid attach mechanisms: {mechanisms!r}",
+    )
+    require(
+        (not mechanisms) == (evidence["attached_probes"] == 0),
+        f"attach mechanisms disagree with attached probes: {mechanisms!r}",
+    )
+    for field in ("pid_descendant_gaps", "multi_rebuild_gaps"):
+        uint(evidence[field], U64_MAX, field)
+    loss = (
+        selection["selection_truncated"]
+        or any(item["coverage"] not in {"observed", "absent_covered"} for item in providers)
+        or any(item["status"] not in {"present", "legacy_absent"} for item in exports)
+        or any(item["authority"] == "selection_count_only" for item in tuples)
+        or evidence["pid_descendant_gaps"] != 0
+        or evidence["multi_rebuild_gaps"] != 0
+    )
+    if loss:
+        require(evidence["completeness"] == "PARTIAL", "selection loss cannot be COMPLETE")
+
+
+def exact_role_counts(description):
+    exact_keys(description, {"observer_calls", "inspect_calls", "helper_calls"}, "role description")
+    require(description == {
+        "observer_calls": 0, "inspect_calls": 0, "helper_calls": 10,
+    }, f"observer/helper roles are reversed or widened: {description}")
+
+
+def exact_metrics_schema(document):
+    require(document["schema"] == METRICS_SCHEMA, document["schema"])
+    require(document["capture"]["mode"] == "metrics", document["capture"])
+    require(document["capture"]["privacy_mode"] == "aggregate-only", document["capture"])
+    leaked = PROFILE_V3_FIELDS & set(document["evidence"])
+    require(not leaked, f"metrics publishes profile-v3 evidence: {sorted(leaked)}")
 
 
 def exact_identity(carrier):
@@ -896,9 +1086,7 @@ def validate_proxy_capacity_fallback(document, module_path=None):
     caller controls it, pins the one directly-attached module by the exact path
     the lane configured rather than by a substring.
     """
-    require(document["schema"] == "pkcs11-scope/observed-profile/v2-metrics", document["schema"])
-    require(document["capture"]["mode"] == "metrics", document["capture"])
-    require(document["capture"]["privacy_mode"] == "aggregate-only", document["capture"])
+    exact_metrics_schema(document)
     exact_capture_modules(document)
 
     evidence = document["evidence"]
@@ -1055,9 +1243,7 @@ def validate_clean_metrics(
     require(discovery in CLEAN_DISCOVERY, f"unknown clean-metrics discovery: {discovery}")
     wanted_sources, allowances = CLEAN_DISCOVERY[discovery]
     require(multiplier >= 1, f"invalid clean-metrics multiplier: {multiplier}")
-    require(document["schema"] == "pkcs11-scope/observed-profile/v2-metrics", document["schema"])
-    require(document["capture"]["mode"] == "metrics", document["capture"])
-    require(document["capture"]["privacy_mode"] == "aggregate-only", document["capture"])
+    exact_metrics_schema(document)
     evidence = document["evidence"]
     surfaces = (
         LEGACY_SURFACES + LEGACY_SURFACES
@@ -1238,6 +1424,11 @@ def validate_canary(lane, document):
     policy, kind, discovery = lanes[lane]
     trace = kind == "trace"
     evidence = document if trace else document["evidence"]
+    if kind == "metrics":
+        require(document["schema"] == METRICS_SCHEMA, document["schema"])
+        exact_metrics_schema(document)
+    else:
+        exact_profile_v3_selection(document, terminal=trace)
 
     scanned = discovery == "scanned"
     exact_shape(
@@ -1276,11 +1467,7 @@ def validate_canary(lane, document):
         require(evidence["final_drain"] is False, evidence["final_drain"])
         require(evidence["counters_available"] is True, evidence["counters_available"])
     else:
-        schema = (
-            "pkcs11-scope/observed-profile/v2-metrics"
-            if kind == "metrics"
-            else "pkcs11-scope/observed-profile/v2"
-        )
+        schema = METRICS_SCHEMA if kind == "metrics" else PROFILE_SCHEMA
         require(document["schema"] == schema, document["schema"])
         require(document["capture"]["mode"] == kind, document["capture"])
         require(document["capture"]["privacy_mode"] == privacy, document["capture"])
@@ -1310,7 +1497,7 @@ def validate_canary(lane, document):
 
 def validate_induced(lane, document):
     require(lane in {"G1", "G2", "G3", "G4", "G5"}, f"unknown induced lane: {lane}")
-    require(document["schema"] == "pkcs11-scope/observed-profile/v2", document["schema"])
+    exact_profile_v3_selection(document)
     require(document["capture"]["mode"] == "profile", document["capture"])
     require(document["capture"]["privacy_mode"] == "allowlisted", document["capture"])
     exact_capture_modules(document)
@@ -1509,7 +1696,19 @@ def evidence_fixture(surfaces, sources=("scan",), discovery_skipped=0):
     }
 
 
-def document_fixture(evidence, *, schema="pkcs11-scope/observed-profile/v2", mode="profile", privacy="allowlisted"):
+def document_fixture(evidence, *, schema=PROFILE_SCHEMA, mode="profile", privacy="allowlisted"):
+    evidence = copy.deepcopy(evidence)
+    if schema == PROFILE_SCHEMA:
+        evidence.setdefault("interface_selection", {
+            "providers": [], "standard_exports": [], "inventory_surfaces": [],
+            "tuples": [], "selection_truncated": False,
+        })
+        evidence.setdefault("attach_mechanisms", [] if evidence["attached_probes"] == 0 else ["per-offset"])
+        evidence.setdefault("pid_descendant_gaps", 0)
+        evidence.setdefault("multi_rebuild_gaps", 0)
+    elif schema == METRICS_SCHEMA:
+        for field in PROFILE_V3_FIELDS:
+            evidence.pop(field, None)
     return {
         "schema": schema,
         "capture": {
@@ -1535,11 +1734,16 @@ def rejected(action):
 
 
 def self_test():
+    roles = {"observer_calls": 0, "inspect_calls": 0, "helper_calls": 10}
+    exact_role_counts(roles)
+    reversed_roles = {"observer_calls": 10, "inspect_calls": 0, "helper_calls": 0}
+    rejected(lambda: exact_role_counts(reversed_roles))
+    print("observer and inspect make zero calls; only the offline helper makes ten: OK")
     clean_evidence = evidence_fixture(LEGACY_SURFACES)
     clean_evidence.update(table_entries=68, slots=68, attached_probes=136)
     clean = document_fixture(
         clean_evidence,
-        schema="pkcs11-scope/observed-profile/v2-metrics",
+        schema=METRICS_SCHEMA,
         mode="metrics",
         privacy="aggregate-only",
     )
@@ -1547,6 +1751,9 @@ def self_test():
         [(["C_GetFunctionList"], 1), (["C_Initialize"], 1)]
     )
     validate_clean_metrics(clean, {"C_Initialize": 1})
+    bad_metrics = copy.deepcopy(clean)
+    bad_metrics["evidence"]["interface_selection"] = {}
+    rejected(lambda: validate_clean_metrics(bad_metrics, {"C_Initialize": 1}))
     shared = copy.deepcopy(clean)
     shared["evidence"]["skipped"] = [
         {
@@ -1660,7 +1867,7 @@ def self_test():
     )
     manifest_only = document_fixture(
         manifest_only_evidence,
-        schema="pkcs11-scope/observed-profile/v2-metrics",
+        schema=METRICS_SCHEMA,
         mode="metrics",
         privacy="aggregate-only",
     )
@@ -1955,6 +2162,77 @@ def self_test():
     safe = document_fixture(copy.deepcopy(version))
     safe["evidence"].update(SAFE_ALLOWANCES)
     validate_canary("default-safe-profile", safe)
+    for mutate in (
+        lambda d: d["evidence"].pop("interface_selection"),
+        lambda d: d["evidence"].update(attach_mechanisms=["secret-canary"]),
+        lambda d: d.update(schema="pkcs11-scope/observed-profile/v2"),
+    ):
+        bad = copy.deepcopy(safe)
+        mutate(bad)
+        rejected(lambda bad=bad: validate_canary("default-safe-profile", bad))
+    selection_doc = copy.deepcopy(safe)
+    selection_doc["evidence"]["interface_selection"] = {
+        "providers": [{"module": 0, "coverage": "observed"}],
+        "standard_exports": [{"module": 0, "status": "present"}],
+        "inventory_surfaces": [
+            {"module": 0, "ordinal": 0, "kind": "legacy"},
+            {"module": 0, "ordinal": 1, "kind": "interface"},
+        ],
+        "tuples": [{
+            "module": 0,
+            "request": {"name": "exact_standard", "version": "v3_0", "flags": 0},
+            "rv": 0,
+            "result": {"name": "exact_standard", "version": "v3_0", "flags": 0},
+            "table_match": True,
+            "inventory_matches": [
+                {"surface": 0, "name_agrees": True, "version_agrees": True},
+                {"surface": 1, "name_agrees": True, "version_agrees": True},
+            ],
+            "authority": "inventory",
+            "count": U64_MAX,
+        }],
+        "selection_truncated": False,
+    }
+    exact_profile_v3_selection(selection_doc)
+    for mutate in (
+        lambda d: d["evidence"]["interface_selection"].update(secret="canary"),
+        lambda d: d["evidence"]["interface_selection"]["providers"].append(
+            {"module": 0, "coverage": "observed"}
+        ),
+        lambda d: d["evidence"]["interface_selection"]["providers"][0].update(module=1),
+        lambda d: d["evidence"]["interface_selection"]["providers"][0].update(coverage="secret-canary"),
+        lambda d: d["evidence"]["interface_selection"]["standard_exports"][0].update(status="unknown"),
+        lambda d: d["evidence"]["interface_selection"]["inventory_surfaces"].reverse(),
+        lambda d: d["evidence"]["interface_selection"]["inventory_surfaces"][1].update(ordinal=0),
+        lambda d: d["evidence"]["interface_selection"]["tuples"].__imul__(17),
+        lambda d: d["evidence"]["interface_selection"]["tuples"].append(
+            copy.deepcopy(d["evidence"]["interface_selection"]["tuples"][0])
+        ),
+        lambda d: d["evidence"]["interface_selection"]["tuples"][0].update(count=0),
+        lambda d: d["evidence"]["interface_selection"]["tuples"][0]["request"].update(name="secret-canary"),
+        lambda d: d["evidence"]["interface_selection"]["tuples"][0].update(result=None),
+        lambda d: d["evidence"]["interface_selection"]["tuples"][0].update(authority="none"),
+        lambda d: d["evidence"]["interface_selection"]["tuples"][0]["inventory_matches"].reverse(),
+        lambda d: d["evidence"]["interface_selection"]["tuples"][0]["inventory_matches"][0].update(surface=2),
+        lambda d: d["evidence"].update(pid_descendant_gaps=-1),
+        lambda d: d["evidence"].update(multi_rebuild_gaps=U64_MAX + 1),
+    ):
+        bad = copy.deepcopy(selection_doc)
+        mutate(bad)
+        rejected(lambda bad=bad: exact_profile_v3_selection(bad))
+    unordered = copy.deepcopy(selection_doc)
+    failed = copy.deepcopy(unordered["evidence"]["interface_selection"]["tuples"][0])
+    failed.update(rv=5, result=None, table_match=False, inventory_matches=[], authority="none", count=1)
+    unordered["evidence"]["interface_selection"]["tuples"].append(failed)
+    unordered["evidence"]["interface_selection"]["tuples"].sort(
+        key=lambda item: json.dumps(item, separators=(",", ":")), reverse=True
+    )
+    rejected(lambda: exact_profile_v3_selection(unordered))
+    loss = copy.deepcopy(selection_doc)
+    loss["evidence"]["interface_selection"]["providers"][0]["coverage"] = "observed_uncovered"
+    loss["evidence"]["completeness"] = "COMPLETE"
+    rejected(lambda: exact_profile_v3_selection(loss))
+    print("profile-v3 selection fields, bounds, order, enums, cross-references, and loss verdict are exact: OK")
     bounded_skips = copy.deepcopy(safe["evidence"])
     bounded_skips["skipped"] = [dict(DISCOVERY_SKIP)]
     discovery_skips(bounded_skips)
@@ -2039,7 +2317,7 @@ def self_test():
 
     aggregate = document_fixture(
         copy.deepcopy(version),
-        schema="pkcs11-scope/observed-profile/v2-metrics",
+        schema=METRICS_SCHEMA,
         mode="metrics",
         privacy="aggregate-only",
     )

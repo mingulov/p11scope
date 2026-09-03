@@ -236,10 +236,40 @@ def trace_scannable(label, text):
     return "\n".join(kept)
 
 
-def profile_terminal(doc, schema="pkcs11-scope/observed-profile/v2"):
+def selection_terminal(ev):
+    assert {
+        "interface_selection", "attach_mechanisms", "pid_descendant_gaps",
+        "multi_rebuild_gaps",
+    } <= set(ev), ev
+    selection = ev["interface_selection"]
+    assert set(selection) == {
+        "providers", "standard_exports", "inventory_surfaces", "tuples",
+        "selection_truncated",
+    }, selection
+    assert all(isinstance(selection[name], list) for name in (
+        "providers", "standard_exports", "inventory_surfaces", "tuples",
+    )), selection
+    assert isinstance(selection["selection_truncated"], bool), selection
+    mechanisms = ev["attach_mechanisms"]
+    assert mechanisms == sorted(set(mechanisms)), mechanisms
+    assert set(mechanisms) <= {"per-offset", "uprobe-multi"}, mechanisms
+    for name in ("pid_descendant_gaps", "multi_rebuild_gaps"):
+        assert isinstance(ev[name], int) and not isinstance(ev[name], bool)
+        assert 0 <= ev[name] <= (1 << 64) - 1, ev[name]
+
+
+def exact_role_counts(description):
+    assert description == {
+        "observer_calls": 0, "inspect_calls": 0, "helper_calls": 10,
+    }, description
+
+
+def profile_terminal(doc, schema="pkcs11-scope/observed-profile/v3"):
     assert doc["schema"] == schema, doc["schema"]
     ev = doc["evidence"]
     assert ev["completeness"] == "PARTIAL", ev
+    if schema == "pkcs11-scope/observed-profile/v3":
+        selection_terminal(ev)
 
 
 def trace_terminal(text, privacy):
@@ -252,6 +282,7 @@ def trace_terminal(text, privacy):
     assert ev["capture_aborted"] is None, ev
     assert ev["final_drain"] is False, ev
     assert ev["counters_available"] is True, ev
+    selection_terminal(ev)
     return ev
 
 
@@ -810,6 +841,19 @@ if work == "--self-test":
         "surfaces": [{"walk": "full", "acquisition": "ok"}],
         "shape_decode_failures": 0,
     }
+    selection_fixture = {
+        "interface_selection": {
+            "providers": [], "standard_exports": [],
+            "inventory_surfaces": [], "tuples": [],
+            "selection_truncated": False,
+        },
+        "attach_mechanisms": ["per-offset"],
+        "pid_descendant_gaps": 0, "multi_rebuild_gaps": 0,
+    }
+    exact_role_counts({"observer_calls": 0, "inspect_calls": 0, "helper_calls": 10})
+    reject("reversed observer/helper roles", lambda: exact_role_counts({
+        "observer_calls": 10, "inspect_calls": 0, "helper_calls": 0,
+    }))
 
     def terminal(privacy, semantic, unregistered=0):
         return {
@@ -819,17 +863,44 @@ if work == "--self-test":
             "final_drain": False, "counters_available": True,
             "semantic_capture_failures": semantic,
             "unregistered_mechanisms": unregistered, "async_target_failures": 2,
+            **selection_fixture,
         }
 
     safe = {
-        "schema": "pkcs11-scope/observed-profile/v2",
+        "schema": "pkcs11-scope/observed-profile/v3",
         "capture": {"mode": "profile", "privacy_mode": "allowlisted"},
-        "evidence": {**full_fixture, "completeness": "PARTIAL", "unregistered_mechanisms": 2,
+        "evidence": {**full_fixture, **selection_fixture,
+                     "completeness": "PARTIAL", "unregistered_mechanisms": 2,
                      "semantic_capture_failures": 3, "async_target_failures": 2},
         "mechanisms": [{"mechanism": REGISTERED, "params": None}],
         "templates": {"operations": []},
     }
     assert_safe_profile(safe)
+    v3 = json.loads(json.dumps(safe))
+    v3["evidence"].update(
+        interface_selection={
+            "providers": [], "standard_exports": [],
+            "inventory_surfaces": [], "tuples": [],
+            "selection_truncated": False,
+        },
+        attach_mechanisms=[], pid_descendant_gaps=0, multi_rebuild_gaps=0,
+    )
+    assert_safe_profile(v3)
+    reject("v3 missing interface selection", lambda: assert_safe_profile({
+        **v3, "evidence": {
+            key: value for key, value in v3["evidence"].items()
+            if key != "interface_selection"
+        },
+    }))
+    extra_v3 = json.loads(json.dumps(v3))
+    extra_v3["evidence"]["interface_selection"]["secret"] = "canary"
+    reject("v3 extra selection field", lambda: assert_safe_profile(extra_v3))
+    secret_v3 = json.loads(json.dumps(v3))
+    secret_v3["evidence"]["attach_mechanisms"] = ["secret-canary"]
+    reject("v3 secret canary", lambda: assert_safe_profile(secret_v3))
+    stale_v2 = json.loads(json.dumps(v3))
+    stale_v2["schema"] = "pkcs11-scope/observed-profile/v2"
+    reject("stale live profile v2", lambda: assert_safe_profile(stale_v2))
     reject("safe profile unknown-id", lambda: assert_safe_profile({
         **safe, "mechanisms": safe["mechanisms"] + [{"mechanism": UNKNOWN, "params": None}]
     }))
@@ -860,7 +931,7 @@ if work == "--self-test":
          "aad_len": ALIASES["gcm240_aad"], "tag_bits": ALIASES["gcm240_tag"]},
     ]
     unsafe = {
-        "schema": "pkcs11-scope/observed-profile/v2",
+        "schema": "pkcs11-scope/observed-profile/v3",
         "capture": {"mode": "profile", "privacy_mode": "unsafe-unvalidated-metadata"},
         "evidence": {**terminal("unsafe-unvalidated-metadata", 7),
                      "templates_truncated": False},
@@ -946,7 +1017,7 @@ if work == "--self-test":
     ]
     scan_module = {"dev": [8, 1], "ino": 42, "sha256": "11" * 32}
     scan_only = {
-        "schema": "pkcs11-scope/observed-profile/v2",
+        "schema": "pkcs11-scope/observed-profile/v3",
         "capture": {
             "start": "t0", "end": "t1", "mode": "profile",
             "privacy_mode": "allowlisted", "kernel": "6.8.0",
@@ -955,6 +1026,7 @@ if work == "--self-test":
             }],
         },
         "evidence": {
+            **selection_fixture,
             "completeness": "PARTIAL", "table_entries": 1, "slots": 1,
             "attached_probes": 2,
             "surfaces": [{
@@ -994,6 +1066,7 @@ if work == "--self-test":
         }],
     }
     scan_terminal = {
+        **selection_fixture,
         "completeness": "PARTIAL", "privacy_mode": "allowlisted",
         "capture_aborted": None, "final_drain": False, "counters_available": True,
         "table_entries": 1, "slots": 1, "attached_probes": 2,

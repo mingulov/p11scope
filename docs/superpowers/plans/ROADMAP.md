@@ -645,8 +645,8 @@ founding rule).
 Publication (push, tag, release) is NOT a wave — it is an explicit owner
 decision after W8.
 
-**W3 engineering gate: CLOSED AND LOCALLY INTEGRATED 2026-09-03.** The exact tested code tip
-`93e0cb1` passed the four Rust 1.88 gates with 1,071 tests and independent
+**W3 engineering gate: CLOSED AND LOCALLY INTEGRATED 2026-09-03.** The final production tip
+`ec5e0ae` passed the four Rust 1.88 gates with 1,072 tests and independent
 correctness/security plus test-quality review accepted zero findings.
 Privileged Jammy/5.15, Noble/6.8, `pkcs11-check`, and lifecycle/rate product
 oracles remain explicitly `UNRUN`; they are W6/W8 qualification gates and no

@@ -782,7 +782,16 @@ fn selection_request(selector: u8, flags: u64) -> SelectionRequest {
 }
 
 fn selection_maps_unchanged(first: &[maps::MapEntry], second: &[maps::MapEntry]) -> bool {
-    first == second
+    let file_backed = |entry: &&maps::MapEntry| {
+        entry
+            .raw_path
+            .as_deref()
+            .is_some_and(|path| path.starts_with(b"/"))
+    };
+    first
+        .iter()
+        .filter(file_backed)
+        .eq(second.iter().filter(file_backed))
 }
 
 fn selection_bracket<T, SnapshotA, Resolve, SnapshotB>(
@@ -1772,6 +1781,34 @@ mod tests {
         remapped.start = 0x3000;
         let result = selection_bracket(|| Ok(vec![first]), |_| Ok(7u8), || Ok(vec![remapped]));
         assert_eq!(result, Err(SelectionFailure::ProviderChanged));
+    }
+
+    #[test]
+    fn selection_bracket_ignores_unrelated_anonymous_mapping_churn() {
+        let provider = maps::MapEntry {
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            permissions: *b"r-xp",
+            device: Device { major: 1, minor: 2 },
+            inode: 3,
+            raw_path: Some(b"/provider.so".to_vec()),
+        };
+        let worker_stack = maps::MapEntry {
+            start: 0x3000,
+            end: 0x4000,
+            file_offset: 0,
+            permissions: *b"rw-p",
+            device: Device { major: 0, minor: 0 },
+            inode: 0,
+            raw_path: None,
+        };
+        let result = selection_bracket(
+            || Ok(vec![provider.clone(), worker_stack]),
+            |_| Ok(7u8),
+            || Ok(vec![provider.clone()]),
+        );
+        assert_eq!(result, Ok(7));
     }
 
     #[test]

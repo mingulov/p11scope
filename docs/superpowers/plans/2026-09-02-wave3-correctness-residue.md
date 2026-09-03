@@ -496,9 +496,6 @@ No code, dependency, schema, gate, or runtime row is owed by this deferred task.
 
 - Modify: `src/run.rs`
 - Modify: `src/trace.rs`
-- Create: `scripts/matrix/verify-w3-runtime.sh`
-- Create: `scripts/matrix/w3-runtime-harness.c`
-- Modify: `spike/slice1b2-kernel/run.sh`
 - Modify: `docs/usage.md`
 - Create: `docs/superpowers/reports/2026-09-02-wave3-correctness-closure.md`
 - Modify: `docs/superpowers/plans/ROADMAP.md`
@@ -512,20 +509,16 @@ No code, dependency, schema, gate, or runtime row is owed by this deferred task.
   call before output truncation or semantic reduction; derive STATS entered as
   completed calls plus in-flight calls. Keep this aggregate-only and do not
   change the privacy allowlist or public profile schema.
-- [ ] Add one self-testing `verify-w3-runtime.sh` driver and the minimum C
-  fixture needed to prove the two product rows below. Reuse existing evidence,
-  lifecycle, VM, and cleanup machinery; do not add a second framework.
-- [ ] Add one `w3-lane` entry point to the existing VM runner. Run Jammy/5.15
-  and Noble/6.8 serially from fresh overlays with KVM as part of the recorded
-  lane identity. A slower or higher supported-rate claim is follow-up work:
-  W3 needs one predeclared, repeatable initial baseline, not adaptive peak-rate
-  discovery.
+- [ ] Do not add a second runtime framework. The owner will run the real
+  `pkcs11-check`, Jammy/5.15, and Noble/6.8 qualification after W3 while
+  evaluating the candidate. Preserve exact commands and expected relationships
+  in the closure report, and record these rows as `UNRUN` until then.
 - [ ] Run every unprivileged validator self-test and focused W3 test named in
   Tasks 1–6.
 - [ ] Run the four canonical gates on the exact branch tip and record counts.
 - [ ] Record privileged/container/VM rows as PASS, FAIL, or `UNRUN`; never
   inherit W1/W2 evidence.
-- [ ] Run and record the two W3 product-qualification rows on the exact tip:
+- [ ] Specify the two later product-qualification rows against the exact tip:
   `supported_rate_loss_oracle` (an empirically declared, matrix-specific fixed
   burst/rate with exact agreement between generator-completed calls, STATS
   entered/returned, and raw consumed `CALL` records, zero loss, and induced
@@ -534,11 +527,12 @@ No code, dependency, schema, gate, or runtime row is owed by this deferred task.
   and
   `fork_exec_loader_unload_oracle` (fork, exec, `dlopen`, calls, `dlclose`,
   replacement/reload, exact retirement and attribution). These privileged
-  runtime rows must PASS for W3 product closeout on Linux 5.15 and 6.8 using
-  the per-offset mechanism. If the required environment is unavailable, W3
-  remains explicitly open rather than converting `UNRUN` into a
-  working-product claim. W6 repeats the broader release matrix.
-- [ ] On those same exact-tip runtime lanes, use the existing documented
+  runtime rows must PASS before a public runtime-qualified or release claim on
+  Linux 5.15 and 6.8 using the per-offset mechanism. Owner decision 2026-09-03:
+  they may remain explicitly `UNRUN` for the W3 engineering closeout so the
+  resulting candidate can be evaluated manually; never convert that status
+  into a working-product claim. W6 repeats the broader release matrix.
+- [ ] For those future exact-tip runtime lanes, use the existing documented
   commands and checkers for one operator journey
   (`doctor -> inspect -> run/profile -> trace`). Add an exact-count
   `trace --pid` row against the deterministic PKCS#11 oracle; canary presence

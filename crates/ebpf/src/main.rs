@@ -17,7 +17,8 @@ use aya_ebpf::{helpers, EbpfContext as _};
 use core::mem::MaybeUninit;
 use p11scope_ebpf_common::{
     bucket_of, capture, cookie_descriptor, cookie_slot, discovery_pause_coalesced,
-    discovery_pause_enabled, discovery_state_take_failed, discovery_table_slots,
+    discovery_pause_enabled, discovery_state_take_failed, discovery_state_take_scope_lost,
+    discovery_table_slots,
     discovery_usable_prefix, event_type, interface_continuation_next,
     interface_continuation_pack, interface_continuation_unpack, lifecycle,
     return_allows_mechanism, shape, valid_config, valid_loader_cookie, CallStart, DiscoveryRecord,
@@ -763,11 +764,16 @@ fn insert_export_state(ctx: &ProbeContext, state: StartState) {
 fn take_export_state(ctx: &RetProbeContext, scoped: bool) -> Option<(StateKey, StartState)> {
     let key = export_state_key(ctx)?;
     let state = unsafe { DISCOVERY_STATE.get(&key) }.copied();
+    let state_present = state.is_some();
     let removed = DISCOVERY_STATE.remove(&key).is_ok();
-    if discovery_state_take_failed(state.is_some(), removed) {
+    if discovery_state_take_failed(state_present, removed) {
         if scoped {
             bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_STATE_FAILURES);
         }
+        return None;
+    }
+    if discovery_state_take_scope_lost(state_present, removed, scoped) {
+        bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_STATE_FAILURES);
         return None;
     }
     state.map(|state| (key, state))
@@ -856,11 +862,16 @@ fn take_selection_state(
 ) -> Option<(StateKey, StartState)> {
     let key = selection_state_key(ctx)?;
     let state = unsafe { DISCOVERY_STATE.get(&key) }.copied();
+    let state_present = state.is_some();
     let removed = DISCOVERY_STATE.remove(&key).is_ok();
-    if discovery_state_take_failed(state.is_some(), removed) {
+    if discovery_state_take_failed(state_present, removed) {
         if scoped {
             bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_STATE_FAILURES);
         }
+        return None;
+    }
+    if discovery_state_take_scope_lost(state_present, removed, scoped) {
+        bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_STATE_FAILURES);
         return None;
     }
     state.map(|state| (key, state))

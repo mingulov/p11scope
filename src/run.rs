@@ -2384,7 +2384,7 @@ fn capture_trace(
         )?;
     }
     emit_trace_line(
-        &trace::count_evidence_line(&reports, tracer.raw_calls()),
+        &terminal_trace_count_line(&reports, &tracer),
         stdout,
         &mut stdout_open,
         out_file,
@@ -2407,6 +2407,10 @@ fn capture_trace(
     Ok(evidence)
     })();
     combine_detach(terminal, detach)
+}
+
+fn terminal_trace_count_line(reports: &[metrics::SlotReport], tracer: &trace::Tracer) -> String {
+    trace::count_evidence_line(reports, tracer.raw_calls())
 }
 
 /// Prints (and, if given, appends to the `-o` file) every rendered line.
@@ -4025,6 +4029,21 @@ mod tests {
     fn terminal_trace_count_evidence_counts_before_limit_and_excludes_fork() {
         use crate::events::{EventDrain, ScriptedRecords};
         let (mut state, mut tracker, mut tracer) = trace_fixture();
+        let reports = [metrics::SlotReport {
+            names: vec!["C_Initialize".to_string()],
+            aliased: false,
+            semantic_authorized: true,
+            module: None,
+            module_ambiguous: false,
+            module_unresolved: false,
+            calls: 5,
+            errors: 0,
+            in_flight: 2,
+            total_ns: 0,
+            max_ns: 0,
+            buckets: [0; p11scope_ebpf_common::LATENCY_BUCKETS],
+            rv_counts: std::collections::BTreeMap::new(),
+        }];
         let mut remaining = Some(1);
         let mut stdout = Vec::new();
         let mut stdout_open = true;
@@ -4058,7 +4077,7 @@ mod tests {
 
         assert_eq!(tracer.raw_calls(), 3);
         let value: serde_json::Value = serde_json::from_str(
-            trace::count_evidence_line(&[], tracer.raw_calls())
+            terminal_trace_count_line(&reports, &tracer)
                 .strip_prefix("COUNT_EVIDENCE ")
                 .unwrap(),
         )
@@ -4066,8 +4085,8 @@ mod tests {
         assert_eq!(
             value,
             serde_json::json!({
-                "stats_entered": 0,
-                "stats_returned": 0,
+                "stats_entered": 7,
+                "stats_returned": 5,
                 "raw_calls": 3,
             })
         );

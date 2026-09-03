@@ -75,7 +75,9 @@ for the design commitment and
 enforcement (what is captured, why, and how each read is gated — structural
 where a leak is impossible by construction, runtime-gated where a length/
 null check stands in front of the read, each gate named with the test that
-exercises it).
+exercises it). The canary matrix includes secret, unterminated, and hostile-
+alias `C_GetInterface` names and scans every artifact and observer-owned map
+for their bytes.
 
 A profile is evidence of what the application *did* during the capture
 window. It is never proof of what the application *cannot* do — see

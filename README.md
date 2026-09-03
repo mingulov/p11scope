@@ -93,7 +93,8 @@ The inventory is maintained in the written, field-by-field allowlist
 secret-canary suite (`scripts/verify-canaries.sh`) that plants sentinel PINs,
 key material, and buffer contents in a real workload and scans every output
 artifact and every observer-owned BPF map for leaks — including hostile-alias
-lanes and the transient raw `pMechanism` address the return probe needs.
+lanes, secret/unterminated/hostile-alias `C_GetInterface` names, and the
+transient raw `pMechanism` address the return probe needs.
 
 See [what you will see](docs/superpowers/specs/2026-08-10-pkcs11-scope-outputs.md)
 for the CLI, live output, trace lines, and an example `observed-profile.json`.

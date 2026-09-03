@@ -20,6 +20,7 @@ typedef unsigned long CK_OBJECT_HANDLE, CK_ATTRIBUTE_TYPE;
 typedef unsigned long CK_FLAGS;
 typedef struct { CK_BYTE major; CK_BYTE minor; } CK_VERSION;
 typedef struct { char *name; void *table; CK_FLAGS flags; } CK_INTERFACE;
+typedef CK_RV (*get_interface_fn)(char *, CK_VERSION *, CK_INTERFACE **, CK_FLAGS);
 typedef struct { CK_ULONG mechanism; void *pParameter; CK_ULONG ulParameterLen; } CK_MECHANISM;
 typedef struct { CK_ATTRIBUTE_TYPE type; void *pValue; CK_ULONG ulValueLen; } CK_ATTRIBUTE;
 
@@ -113,6 +114,11 @@ static const char SENT_OUTPUT[]    = "CANARY_OUTPUT_5391960450406458bc83e37c2b43
 static const char SENT_ARG7[]      = "CANARY_ARG7_b2747079a35f10aba729f83ff3285ddc";
 static const char SENT_ARG8[]      = "CANARY_ARG8_1752403b4bb53924b6881d095e3e9198";
 static const char SENT_ARG9[]      = "CANARY_ARG9_8f119353c9e69ce4f2f3b9a4d2aa2fab";
+static const char SENT_INTERFACE[] = "CANARY_INTERFACE_1d81db70d53d4f4687632075b653f921";
+static const char SENT_UNTERMINATED[] = "CANARY_UNTERMINATED_713527eb86c54ad0bf40cfa7c399d440";
+static const char SENT_INTERFACEALIAS[] =
+    "CANARY_INTERFACEALIAS_51bb6d171fdb45de985f29ee36bbab14"
+    "PKCS 11";
 
 /* Benign scalar aliases for every diagnostic pointer decoder. Safe mode may
  * retain only finite catalog matches; diagnostic mode must reproduce the
@@ -238,6 +244,18 @@ static int run_matrix(void *module, const char *ready, const char *gate)
 {
     void **functions = matrix_functions(module);
     if (!functions || wait_for_gate(ready, gate) != 0) return 1;
+
+    get_interface_fn get_interface = (get_interface_fn)dlsym(module, "C_GetInterface");
+    if (!get_interface) return 1;
+    CK_VERSION requested = {3, 0};
+    CK_INTERFACE *selected = NULL;
+    char unterminated[65];
+    memset(unterminated, 'U', sizeof(unterminated) - 1);
+    memcpy(unterminated, SENT_UNTERMINATED, sizeof(SENT_UNTERMINATED) - 1);
+    unterminated[sizeof(unterminated) - 1] = '\0';
+    (void)get_interface((char *)SENT_INTERFACE, &requested, &selected, 0);
+    (void)get_interface(unterminated, &requested, &selected, 0);
+    (void)get_interface(strstr(SENT_INTERFACEALIAS, "PKCS 11"), &requested, &selected, 0);
 
     int failures = 0;
     CK_ULONG session = 0x101;

@@ -620,6 +620,12 @@ Commits: 7a `build: pin Aya multi attach API`; 7b
   on one exact strict-probe-true multi kernel. If the required environment is
   unavailable, W3 remains explicitly open rather than converting `UNRUN` into
   a working-product claim. W6 repeats the broader release matrix.
+- [ ] On those same exact-tip runtime lanes, use the existing documented
+  commands and checkers for one operator journey
+  (`doctor -> inspect -> run/profile -> trace`). Add an exact-count
+  `trace --pid` row against the deterministic PKCS#11 oracle; canary presence
+  alone is insufficient. Bind the record to the exact binary and embedded BPF
+  object hashes and require actionable insufficient-authority diagnostics.
 - [ ] Independent full-diff Sol correctness/security review and Luna
   test-quality/regression review. Add a third distinct reviewer only for a
   genuinely separate risk. Triage with source evidence; batch accepted fixes

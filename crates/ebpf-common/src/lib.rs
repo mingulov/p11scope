@@ -876,7 +876,7 @@ pub mod event_type {
 }
 
 pub const CLONE_THREAD: u64 = 0x0001_0000;
-pub const CLONE_INTO_CGROUP: u64 = 0x2000_0000;
+pub const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
 
 /// Classify task_newtask without carrying clone flags through the Event ABI.
 pub const fn classify_task_newtask(clone_flags: u64) -> Option<u32> {
@@ -1050,6 +1050,11 @@ mod tests {
     #[test]
     fn task_newtask_classification_filters_threads_and_hides_clone_flags() {
         assert_eq!(classify_task_newtask(0), Some(event_type::FORK));
+        assert_eq!(
+            classify_task_newtask(0x2_0000_0000),
+            Some(event_type::FORK_INTO_CGROUP)
+        );
+        assert_eq!(classify_task_newtask(0x2000_0000), Some(event_type::FORK));
         assert_eq!(
             classify_task_newtask(CLONE_INTO_CGROUP),
             Some(event_type::FORK_INTO_CGROUP)

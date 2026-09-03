@@ -391,6 +391,149 @@ fn selection_validation_rejects_review_mutations() {
 }
 
 #[test]
+fn helper_failure_cross_fields_are_exact() {
+    let result = |name, version| {
+        Some(SelectionResult {
+            name,
+            version,
+            flags: 0,
+        })
+    };
+    let check = |failure, result, authority, selection_table, diagnostic: Option<&str>| {
+        let mut manifest = manifest_for(Path::new("/bin/true"));
+        manifest.schema = "p11scope-manifest/5".into();
+        manifest.selection_evidence = queried_selection_matrix();
+        let query = &mut manifest.selection_evidence.queries[0];
+        query.rv = 0;
+        query.result = result;
+        query.authority = authority;
+        query.selection_table = selection_table;
+        query.helper_failure = Some(failure);
+        let problems = p11scope::manifest_input::validate_structure(&manifest);
+        assert_eq!(problems.is_empty(), diagnostic.is_none(), "{problems:?}");
+        if let Some(diagnostic) = diagnostic {
+            assert!(
+                problems.iter().any(|problem| problem.contains(diagnostic)),
+                "{problems:?}"
+            );
+        }
+    };
+    let none = SelectionAuthority::None;
+    let null = result(SelectionNameClass::Null, SelectionVersionClass::Null);
+
+    for failure in [
+        SelectionFailure::NullOutput,
+        SelectionFailure::UnreadableInterface,
+    ] {
+        check(failure, None, none, None, None);
+        check(
+            failure,
+            null,
+            none,
+            None,
+            Some("invalid helper failure for a result"),
+        );
+    }
+    check(SelectionFailure::ProviderChanged, None, none, None, None);
+    for name in [
+        SelectionNameClass::Null,
+        SelectionNameClass::ExactStandard,
+        SelectionNameClass::Other,
+        SelectionNameClass::Unreadable,
+    ] {
+        check(
+            SelectionFailure::UnreadableName,
+            result(name, SelectionVersionClass::Null),
+            none,
+            None,
+            (!matches!(
+                name,
+                SelectionNameClass::Null | SelectionNameClass::Unreadable
+            ))
+            .then_some("unreadable-name failure disagrees with result"),
+        );
+    }
+    for version in [
+        SelectionVersionClass::Null,
+        SelectionVersionClass::Unreadable,
+        SelectionVersionClass::V2_40,
+        SelectionVersionClass::V3_0,
+        SelectionVersionClass::V3_1,
+        SelectionVersionClass::V3_2,
+        SelectionVersionClass::Other,
+    ] {
+        check(
+            SelectionFailure::UnreadableVersion,
+            result(SelectionNameClass::Null, version),
+            none,
+            None,
+            (version != SelectionVersionClass::Unreadable)
+                .then_some("unreadable-version failure disagrees with result"),
+        );
+        check(
+            SelectionFailure::UnreadableTable,
+            result(SelectionNameClass::Null, version),
+            none,
+            None,
+            (!matches!(
+                version,
+                SelectionVersionClass::Null
+                    | SelectionVersionClass::V3_0
+                    | SelectionVersionClass::V3_1
+                    | SelectionVersionClass::V3_2
+            ))
+            .then_some("unreadable-table failure disagrees with result"),
+        );
+    }
+    for failure in [
+        SelectionFailure::OutsideProvider,
+        SelectionFailure::UnresolvedFunction,
+        SelectionFailure::ProviderChanged,
+    ] {
+        check(failure, null, none, None, None);
+    }
+    for failure in [
+        SelectionFailure::UnreadableTable,
+        SelectionFailure::OutsideProvider,
+        SelectionFailure::UnresolvedFunction,
+        SelectionFailure::ProviderChanged,
+    ] {
+        check(
+            failure,
+            null,
+            none,
+            Some(0),
+            Some("helper failure has a selection table"),
+        );
+    }
+    for (failure, valid_result) in [
+        (SelectionFailure::NullOutput, None),
+        (SelectionFailure::UnreadableInterface, None),
+        (SelectionFailure::UnreadableName, null),
+        (
+            SelectionFailure::UnreadableVersion,
+            result(SelectionNameClass::Null, SelectionVersionClass::Unreadable),
+        ),
+        (SelectionFailure::UnreadableTable, null),
+        (SelectionFailure::OutsideProvider, null),
+        (SelectionFailure::UnresolvedFunction, null),
+        (SelectionFailure::ProviderChanged, null),
+    ] {
+        check(
+            failure,
+            valid_result,
+            SelectionAuthority::Inventory,
+            None,
+            Some(if valid_result.is_none() {
+                "null result cross-fields"
+            } else {
+                "with helper failure has authority"
+            }),
+        );
+    }
+}
+
+#[test]
 fn manifest_v4_is_rejected_precisely() {
     let mut manifest = manifest_for(Path::new("/bin/true"));
     manifest.schema = "p11scope-manifest/4".into();

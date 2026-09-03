@@ -272,6 +272,9 @@ def profile_terminal(doc, schema="pkcs11-scope/observed-profile/v3"):
     ev = doc["evidence"]
     assert "secret_selection_payload" not in ev, ev
     assert ev["completeness"] == "PARTIAL", ev
+    assert isinstance(ev["task_uprobe_link_losses"], int) and not isinstance(
+        ev["task_uprobe_link_losses"], bool
+    ) and 0 <= ev["task_uprobe_link_losses"] <= (1 << 64) - 1, ev
     if schema == "pkcs11-scope/observed-profile/v3":
         selection_terminal(ev)
 
@@ -398,11 +401,11 @@ def assert_unsafe_trace(text):
 
 def assert_aggregate_metrics(doc):
     assert set(doc) == {"schema", "capture", "evidence", "functions"}, doc
-    assert doc["schema"] == "pkcs11-scope/observed-profile/v2-metrics"
+    assert doc["schema"] == "pkcs11-scope/observed-profile/v3-metrics"
     assert doc["capture"]["mode"] == "metrics"
     assert doc["capture"]["privacy_mode"] == "aggregate-only"
     assert "secret_selection_payload" not in doc["evidence"], doc["evidence"]
-    profile_terminal(doc, "pkcs11-scope/observed-profile/v2-metrics")
+    profile_terminal(doc, "pkcs11-scope/observed-profile/v3-metrics")
     assert sum(item["calls"] for item in doc["functions"]) == 28, doc["functions"]
 
 
@@ -845,6 +848,7 @@ if work == "--self-test":
         "attached_probes": 136, "table_entries": 68,
         "surfaces": [{"walk": "full", "acquisition": "ok"}],
         "shape_decode_failures": 0,
+        "task_uprobe_link_losses": 0,
     }
     selection_fixture = {
         "interface_selection": {
@@ -1001,7 +1005,7 @@ if work == "--self-test":
            trace_abort_terminal("EVIDENCE " + json.dumps(mutated), "allowlisted"))
 
     aggregate = {
-        "schema": "pkcs11-scope/observed-profile/v2-metrics",
+        "schema": "pkcs11-scope/observed-profile/v3-metrics",
         "capture": {"mode": "metrics", "privacy_mode": "aggregate-only"},
         "evidence": {
             **full_fixture,
@@ -1040,6 +1044,7 @@ if work == "--self-test":
             **selection_fixture,
             "completeness": "PARTIAL", "table_entries": 1, "slots": 1,
             "attached_probes": 2,
+            "task_uprobe_link_losses": 0,
             "surfaces": [{
                 "source": "/opt/p11.so table 2.40", "walk": "full", "acquisition": "ok",
                 "functions": 1,
@@ -1081,6 +1086,7 @@ if work == "--self-test":
         "completeness": "PARTIAL", "privacy_mode": "allowlisted",
         "capture_aborted": None, "final_drain": False, "counters_available": True,
         "table_entries": 1, "slots": 1, "attached_probes": 2,
+        "task_uprobe_link_losses": 0,
         "semantic_capture_failures": 0,
     }
     scan_trace = "CAPTURE privacy=allowlisted\n" + "\n".join([
@@ -1324,6 +1330,7 @@ if work == "--self-test":
             "pause_confirmed": 1, "pause_partial": 1,
             "discovery_ring_loss": 0, "discovery_state_failures": 0,
             "discovery_read_failures": 0, "discovery_truncated": 0,
+            "task_uprobe_link_losses": 0,
             "loader_discovery": {
                 # Two exact bound contexts: one ordinary `dlopen`, and the
                 # owned run's one pre-exec initial-set context.

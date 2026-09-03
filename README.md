@@ -171,7 +171,7 @@ for the CLI, live output, trace lines, and an example `observed-profile.json`.
   not the key's effective policy. Full honest-claims section:
   [docs/usage.md](docs/usage.md#honest-claims).
 - The schema is `pkcs11-scope/observed-profile/v3` for `profile` and
-  `pkcs11-scope/observed-profile/v2-metrics` for `metrics`, with optional
+  `pkcs11-scope/observed-profile/v3-metrics` for `metrics`, with optional
   discovery input at `p11scope-manifest/5`, documented at
   [docs/schema/observed-profile-v3.md](docs/schema/observed-profile-v3.md).
   Schema ids are opaque exact dispatch keys; the major/minor spelling grants

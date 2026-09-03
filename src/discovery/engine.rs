@@ -82,6 +82,9 @@ pub struct Engine {
     ready_expected_removals: BTreeSet<ProcessViewId>,
     expected_target_exit_pending: Option<ProcessViewId>,
     expected_target_exit: bool,
+    pending_leader_exit_views: BTreeSet<ProcessViewId>,
+    counted_leader_exit_views: BTreeSet<ProcessViewId>,
+    task_uprobe_link_losses: u64,
     next_selection_binding_id: Option<u64>,
     selection_bindings: BTreeMap<u64, SelectionBindingFact>,
     /// The deduplicated bound-context set behind `loader_discovery`'s
@@ -5309,6 +5312,52 @@ fn lifecycle_retirement(
     Some((view.id(), cause))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaderExitAssessment {
+    AlreadySettled,
+    Pending,
+    WholeGroupExit,
+    LinkLoss,
+}
+
+fn settle_leader_exit_view(
+    pending: &mut BTreeSet<ProcessViewId>,
+    counted: &mut BTreeSet<ProcessViewId>,
+    losses: &mut u64,
+    view: ProcessViewId,
+    original_exited: Result<bool, String>,
+) -> LeaderExitAssessment {
+    if !pending.contains(&view) || counted.contains(&view) {
+        return LeaderExitAssessment::AlreadySettled;
+    }
+    match original_exited {
+        Ok(true) => {
+            pending.remove(&view);
+            LeaderExitAssessment::WholeGroupExit
+        }
+        Ok(false) => {
+            pending.remove(&view);
+            if counted.insert(view) {
+                *losses = losses.saturating_add(1);
+            }
+            LeaderExitAssessment::LinkLoss
+        }
+        Err(_) => LeaderExitAssessment::Pending,
+    }
+}
+
+fn finalize_pending_leader_exit_views(
+    pending: &mut BTreeSet<ProcessViewId>,
+    counted: &mut BTreeSet<ProcessViewId>,
+    losses: &mut u64,
+) {
+    for view in std::mem::take(pending) {
+        if counted.insert(view) {
+            *losses = losses.saturating_add(1);
+        }
+    }
+}
+
 fn finalize_batch_retirement_cause(
     cause: RetirementCause,
     original_current: bool,
@@ -5466,6 +5515,9 @@ impl Engine {
             ready_expected_removals: BTreeSet::new(),
             expected_target_exit_pending: None,
             expected_target_exit: false,
+            pending_leader_exit_views: BTreeSet::new(),
+            counted_leader_exit_views: BTreeSet::new(),
+            task_uprobe_link_losses: 0,
             next_selection_binding_id: Some(1),
             selection_bindings: BTreeMap::new(),
             selection_claims: BTreeMap::new(),
@@ -5564,6 +5616,7 @@ impl Engine {
             discovery_ring_loss: self.counter_snapshot.ring_loss,
             discovery_state_failures: self.counter_snapshot.export_state_failures,
             discovery_read_failures: self.counter_snapshot.export_bounded_read_failures,
+            task_uprobe_link_losses: self.task_uprobe_link_losses,
             // One accumulator, each source feeding it once (design §9.1).
             discovery_truncated: self
                 .discovery_truncated
@@ -9319,6 +9372,15 @@ impl Engine {
         };
         self.counters.object_skips.retain(|skip| *skip != announced);
         self.plan.skipped.retain(|skip| *skip != announced);
+        let pending_views = self.pending_leader_exit_views.clone();
+        finalize_pending_leader_exit_views(
+            &mut self.pending_leader_exit_views,
+            &mut self.counted_leader_exit_views,
+            &mut self.task_uprobe_link_losses,
+        );
+        for view in pending_views {
+            self.close_owned_selection_for_view(view);
+        }
     }
 
     fn terminal_owner(&self) -> Option<LoaderContextId> {
@@ -9994,7 +10056,11 @@ impl Engine {
         if let Some((view, cause)) =
             lifecycle_retirement(&self.views, pid, record.hook_ts_ns, record.kind)
         {
-            self.queue_retirement(view, cause, pending_views);
+            if cause == RetirementCause::ExpectedRemoval {
+                self.queue_leader_exit_assessment(view);
+            } else {
+                self.queue_retirement(view, cause, pending_views);
+            }
             (cause == RetirementCause::ExecRefresh).then_some(view)
         } else if record.kind == DISCOVERY_KIND_EXEC
             && unmatched_exec_requests_refresh(&self.views, pid)
@@ -10016,6 +10082,85 @@ impl Engine {
                 self.reject_loader_record(
                     "a loader hit failed generation, mapping, identity, or hook-IP validation",
                 );
+            }
+        }
+    }
+
+    fn queue_leader_exit_assessment(&mut self, view: ProcessViewId) {
+        if !self.counted_leader_exit_views.contains(&view) {
+            self.pending_leader_exit_views.insert(view);
+        }
+    }
+
+    /// Retire a view whose task-bound links died while its retained process
+    /// generation is still live. This uses the ordinary conservative cleanup
+    /// path but does not relabel the event as a generic generation loss.
+    fn queue_link_loss_retirement(
+        &mut self,
+        view: ProcessViewId,
+        pending_views: &mut PendingViewRetirements,
+    ) {
+        let cause = self
+            .retirement_intents
+            .get(&view)
+            .copied()
+            .map_or(RetirementCause::GenerationLost, |current| {
+                current.merge(RetirementCause::GenerationLost)
+            });
+        if let Some(pid) = self
+            .views
+            .iter()
+            .find(|candidate| candidate.id() == view)
+            .map(ProcessView::pid)
+        {
+            self.refresh_requested.remove(&pid);
+        }
+        self.ready_expected_removals.remove(&view);
+        self.retirement_intents.insert(view, cause);
+        pending_views
+            .entry(view)
+            .and_modify(|current| *current = current.merge(cause))
+            .or_insert(cause);
+    }
+
+    fn settle_leader_exit_assessments(
+        &mut self,
+        pending_views: &mut PendingViewRetirements,
+        additions_allowed: &mut bool,
+        closure: &mut PauseClosure,
+    ) {
+        let views: Vec<_> = self.pending_leader_exit_views.iter().copied().collect();
+        for view in views {
+            let result = self
+                .views
+                .iter()
+                .find(|candidate| candidate.id() == view)
+                .map_or_else(
+                    || Err("retained process view is no longer available".to_string()),
+                    ProcessView::original_exited,
+                );
+            match settle_leader_exit_view(
+                &mut self.pending_leader_exit_views,
+                &mut self.counted_leader_exit_views,
+                &mut self.task_uprobe_link_losses,
+                view,
+                result,
+            ) {
+                LeaderExitAssessment::AlreadySettled => {}
+                LeaderExitAssessment::Pending => {
+                    *additions_allowed = false;
+                    closure.fail();
+                }
+                LeaderExitAssessment::WholeGroupExit => {
+                    self.queue_retirement(view, RetirementCause::ExpectedRemoval, pending_views);
+                }
+                LeaderExitAssessment::LinkLoss => {
+                    *additions_allowed = false;
+                    closure.fail();
+                    self.invalidate_causal_timing();
+                    self.close_owned_selection_for_view(view);
+                    self.queue_link_loss_retirement(view, pending_views);
+                }
             }
         }
     }
@@ -10137,6 +10282,7 @@ impl Engine {
             }
             self.settle_deferred_loader_mismatches(deferred_mismatches, &exec_refresh_views);
             self.promote_stale_execs(pending_views);
+            self.settle_leader_exit_assessments(pending_views, additions_allowed, closure);
             if pending_views.is_empty() {
                 if (self.pending_rejected_keys.is_empty() && self.pending_retirements.is_empty())
                     || conservative_replay_attempted
@@ -13590,6 +13736,142 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn leader_exit_assessment_settles_once_and_terminalizes_pending_views() {
+        let view = ProcessViewId(22);
+        let mut pending = [view].into_iter().collect();
+        let mut counted = BTreeSet::new();
+        let mut losses = 0;
+
+        assert_eq!(
+            settle_leader_exit_view(&mut pending, &mut counted, &mut losses, view, Ok(false),),
+            LeaderExitAssessment::LinkLoss
+        );
+        assert_eq!(losses, 1);
+        assert_eq!(
+            settle_leader_exit_view(&mut pending, &mut counted, &mut losses, view, Ok(false),),
+            LeaderExitAssessment::AlreadySettled
+        );
+        assert_eq!(losses, 1, "repeated leader records cannot double count");
+
+        let clean = ProcessViewId(23);
+        pending.insert(clean);
+        assert_eq!(
+            settle_leader_exit_view(&mut pending, &mut counted, &mut losses, clean, Ok(true),),
+            LeaderExitAssessment::WholeGroupExit
+        );
+        assert_eq!(losses, 1, "ordinary whole-group exit is not a link loss");
+
+        let unresolved = ProcessViewId(24);
+        pending.insert(unresolved);
+        assert_eq!(
+            settle_leader_exit_view(
+                &mut pending,
+                &mut counted,
+                &mut losses,
+                unresolved,
+                Err("pidfd poll failed".into()),
+            ),
+            LeaderExitAssessment::Pending
+        );
+        assert!(pending.contains(&unresolved));
+        finalize_pending_leader_exit_views(&mut pending, &mut counted, &mut losses);
+        assert_eq!(
+            losses, 2,
+            "terminalization promotes unresolved evidence once"
+        );
+        finalize_pending_leader_exit_views(&mut pending, &mut counted, &mut losses);
+        assert_eq!(losses, 2, "terminalization is sticky");
+    }
+
+    #[test]
+    fn leader_exit_dispatch_is_two_phase_and_uses_the_admitted_view() {
+        let view = ProcessView::open(ProcessViewId(26), std::process::id()).unwrap();
+        let pid = view.pid();
+        let admitted = view.admitted_ns();
+        let mut engine = Engine::empty();
+        engine.views.push(view);
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_LEADER_EXIT;
+        record.pid_tgid = u64::from(pid) << 32;
+        record.hook_ts_ns = admitted;
+        let mut pending_views = PendingViewRetirements::new();
+
+        assert_eq!(
+            engine.dispatch_lifecycle_record(&record, &mut pending_views),
+            None
+        );
+        assert!(pending_views.is_empty(), "dispatch does not retire yet");
+        assert!(
+            engine
+                .pending_leader_exit_views
+                .contains(&ProcessViewId(26)),
+            "the matched event is assessed at the next settlement point"
+        );
+        assert_eq!(engine.task_uprobe_link_losses, 0);
+        assert_eq!(
+            settle_leader_exit_view(
+                &mut engine.pending_leader_exit_views,
+                &mut engine.counted_leader_exit_views,
+                &mut engine.task_uprobe_link_losses,
+                ProcessViewId(26),
+                engine.views[0].original_exited(),
+            ),
+            LeaderExitAssessment::LinkLoss
+        );
+        assert_eq!(engine.task_uprobe_link_losses, 1);
+    }
+
+    #[test]
+    fn leader_exit_loss_closes_only_the_owned_selection_view() {
+        let view = ProcessView::open(ProcessViewId(25), std::process::id()).unwrap();
+        let mut engine = Engine::empty();
+        engine.views.push(view);
+        let generation = NonZeroU64::new(1).unwrap();
+        engine.selection_bindings.insert(
+            1,
+            SelectionBindingFact {
+                id: 1,
+                context: LoaderContextId::from_case_id(1),
+                view: ProcessViewId(25),
+                object: PinnedObjectId(1),
+                file_offset: 0,
+                hook_id: 0,
+                abi: HookAbi::Interface,
+                attached: true,
+                retired: false,
+                provider: plan::ModuleId(0),
+                observed: false,
+                coverage: SelectionCoverageState::OwnedOpen(generation),
+            },
+        );
+        engine.pending_leader_exit_views.insert(ProcessViewId(25));
+        engine.refresh_requested.insert(std::process::id());
+        let mut pending_views = PendingViewRetirements::new();
+        let mut additions_allowed = true;
+        let mut closure = PauseClosure::new(true);
+        engine.settle_leader_exit_assessments(
+            &mut pending_views,
+            &mut additions_allowed,
+            &mut closure,
+        );
+        assert_eq!(engine.task_uprobe_link_losses, 1);
+        assert!(!additions_allowed);
+        assert!(!closure.required_complete());
+        assert_eq!(
+            pending_views.get(&ProcessViewId(25)),
+            Some(&RetirementCause::GenerationLost)
+        );
+        assert_eq!(
+            engine.selection_bindings[&1].coverage,
+            SelectionCoverageState::OwnedClosed(generation)
+        );
+        assert!(
+            !engine.refresh_requested.contains(&std::process::id()),
+            "link loss does not re-arm the same live view"
+        );
+    }
+
+    #[test]
     fn retirement_cause_merge_never_downgrades_real_loss() {
         assert_eq!(
             RetirementCause::ExecRefresh.merge(RetirementCause::ExpectedRemoval),
@@ -15103,14 +15385,27 @@ pub(crate) mod tests {
         let mut pending = PendingViewRetirements::new();
         engine.dispatch_lifecycle_record(&record, &mut pending);
 
+        assert!(
+            pending.is_empty(),
+            "leader exit awaits generation settlement"
+        );
+        assert!(
+            engine
+                .pending_leader_exit_views
+                .contains(&ProcessViewId(16))
+        );
+        assert_eq!(engine.task_uprobe_link_losses, 0);
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let mut additions_allowed = true;
+        let mut closure = PauseClosure::new(true);
+        engine.settle_leader_exit_assessments(&mut pending, &mut additions_allowed, &mut closure);
         assert_eq!(
             pending.get(&ProcessViewId(16)),
             Some(&RetirementCause::ExpectedRemoval)
         );
-        assert!(!retirement_ready(RetirementCause::ExpectedRemoval, &engine.views[0]).unwrap());
-
-        child.kill().unwrap();
-        child.wait().unwrap();
+        assert_eq!(engine.task_uprobe_link_losses, 0);
         assert!(retirement_ready(RetirementCause::ExpectedRemoval, &engine.views[0]).unwrap());
     }
 
@@ -15589,6 +15884,7 @@ int main(int argc, char **argv) {
             discovery_state_failures: 0,
             discovery_read_failures: 0,
             discovery_truncated: 0,
+            task_uprobe_link_losses: 0,
             loader_discovery: render::LoaderDiscovery::default(),
             interface_selection: render::InterfaceSelection::default(),
             attach_mechanisms: vec![],
@@ -23606,6 +23902,7 @@ int main(int argc, char **argv) {
             discovery_state_failures: 0,
             discovery_read_failures: 0,
             discovery_truncated: 0,
+            task_uprobe_link_losses: 0,
             loader_discovery: render::LoaderDiscovery::default(),
             interface_selection: render::InterfaceSelection::default(),
             attach_mechanisms: vec![],

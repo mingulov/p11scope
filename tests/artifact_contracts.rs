@@ -5945,6 +5945,7 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
         discovery_state_failures: 0,
         discovery_read_failures: 0,
         discovery_truncated: 0,
+        task_uprobe_link_losses: 0,
         loader_discovery: p11scope::render::LoaderDiscovery {
             strategies: p11scope::render::LoaderStrategies {
                 debug_state_every_hit: 1,
@@ -7783,7 +7784,7 @@ evidence["skipped"] = [{
 evidence.update(table_entries=68, slots=68, attached_probes=136)
 document = check["document_fixture"](
     evidence,
-    schema="pkcs11-scope/observed-profile/v2-metrics",
+    schema=check["METRICS_SCHEMA"],
     mode="metrics",
     privacy="aggregate-only",
 )

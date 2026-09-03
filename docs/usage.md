@@ -458,10 +458,10 @@ at the attach ceiling, that no module's targets went uncorroborated,
 conflicted or ambiguous, that every discovery surface was fully acquired and
 walked, that every planned probe attached, and that there are zero START/RV/
 ring, cgroup, process-identity, semantic-state, process-creation, cancellation, async,
-template, or parameter-decode gaps. A capture that observed nothing has no
+template, parameter-decode, or task-uprobe-link-loss gaps. A capture that observed nothing has no
 failure to report, so "found something" is part of the verdict rather than
 something a reader has to check separately. The schema document lists every
-field and the four explicitly informational exceptions.
+field and the explicitly informational exceptions.
 
 **In a written profile you will not see `COMPLETE`.** Detaching a perf link
 stops new probe invocations but does not wait for BPF callbacks already

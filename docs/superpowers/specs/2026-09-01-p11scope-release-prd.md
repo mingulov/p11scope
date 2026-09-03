@@ -9,13 +9,13 @@ and what it must be true of it*. The owner requirements spec
 hardening work is done and prioritized*; `docs/superpowers/plans/ROADMAP.md`
 §"Release program" is the authority for *sequencing*. Post-release feature work
 lives in `2026-09-01-post-release-feature-slices.md`, not here.
-**Scope decision (owner, 2026-09-01):** the release baseline is the **hardened
-current feature set plus `uprobe_multi` attach** (owner: "more
-straightforward" — pulled into release scope explicitly). Slice 2/3 and the
-other deferred items are **deferred by default, not excluded**: depending on
-execution speed the owner may pull any of them into v0.1.0 — the deferral
-list is a default, the owner decides per item. Shippable artifact set is
-**tag + binaries + docs** (no container images, no distro packages).
+**Scope decision (owner, amended 2026-09-03):** the release baseline is the
+**hardened current feature set using the existing per-offset attach path**.
+`uprobe_multi` is deferred to a standalone task after a stable Aya release
+exposes the required support. Slice 2/3 and the other deferred items are
+**deferred by default, not excluded**: depending on execution speed the owner
+may pull any of them into v0.1.0. Shippable artifact set is **tag + binaries +
+docs** (no container images, no distro packages).
 
 ## 1. Product statement
 
@@ -83,12 +83,9 @@ The behavior authority is `docs/usage.md`; this list fixes *scope*, not detail.
   limits) — the release documents this, it does not fix it.
 - **Attach engine:** offset-based uprobe/uretprobe, PID/cgroup filter maps,
   in-kernel ring-loss counters, PidPin (pidfd + starttime) generation guard.
-  **`uprobe_multi` attach is release scope** (owner decision 2026-09-01):
-  used only when the runtime
-  `ProcessScopedPidFilter` feature probe returns `Ok(true)`, with the existing
-  per-offset attach otherwise. Link creation began in 6.6, but that version
-  fact alone does not prove process-scoped filtering. The attach mechanism in
-  use is recorded in evidence (W3).
+  The existing per-offset mechanism is the W3/release path. `uprobe_multi` is
+  deferred by the 2026-09-03 owner amendment until stable Aya support and is
+  not a release requirement.
 - **Capture policy:** `allowlisted` default; pointer-derived bytes only by
   exact membership in the published finite sets.
 

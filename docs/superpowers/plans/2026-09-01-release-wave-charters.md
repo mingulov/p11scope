@@ -33,7 +33,7 @@ model — after this wave the *product logic* is release-final.
 
 **Execution priority:** W3 starts with `C_GetInterface` selection evidence.
 Only after that compatibility slice is closed does it proceed to
-`uprobe_multi`, capability breadth, and the remaining residue. The existing
+capability breadth and the remaining correctness residue. The existing
 implementation is only partial: passive return discovery/inventory exists,
 but selection requests, failures, and aliases are not yet release-complete.
 
@@ -102,27 +102,13 @@ but selection requests, failures, and aliases are not yet release-complete.
    (checklist 8 — aya reports verifier rejections as bare `EACCES`); prove
    the loss-counter → consumer-verdict binding with a test (checklist 9 —
    PRD §6 requires it as evidence, not assumption).
-6. **`uprobe_multi` attach (owner decision 2026-09-01 — release scope):**
-   attach all eligible offsets of an object via `uprobe_multi` only where the
-   strict runtime probe proves the required mechanism class, keeping the existing
-   per-offset attach as the mandatory fallback at the 5.15 floor. Runtime
-   feature detection, never kernel-version inference or a compile-time split;
-   the attach mechanism in use
-   is recorded in the evidence output; both paths covered by the e2e oracle
-   lane. **Planner verification:** aya 0.14.0's support surface and the
-   PidPin/attach-before-run interaction were checked; the verified ruling below
-   supersedes the earlier raw-link contingency.
-   **Verified ruling (2026-09-02):** aya 0.14.0 cannot provide a valid
-   `uprobe_multi` program FD because it loads ordinary uprobes with expected
-   attach type zero; a raw link syscall is therefore not a fallback. The owner
-   delegated autonomous W3 implementation and the reviewed plan selected exact
-   open-PR Aya revision `8d16163ca436e3030cbd45a0f331c62cd6c059fa`, with
-   dedicated ordinary/multi program twins, Aya-managed links, and the mandatory
-   5.15 per-offset path. Before loading multi twins, p11scope calls the public
-   `ProcessScopedPidFilter` support probe once: `Ok(true)` selects multi,
-   `Ok(false)` selects sticky per-offset fallback, and probe errors fail. After
-   a positive probe, every load/link error fails and rolls back. Do not add a
-   raw syscall, direct `aya-obj`, moving branch, or Aya fork.
+6. **Deferred `uprobe_multi` (owner decision 2026-09-03):** multi-attach is a
+   performance optimization, not a W3 correctness or product-qualification
+   requirement. Keep Aya `=0.14.0` and the Linux 5.15 per-offset path. Reopen
+   multi-attach as a standalone post-W3 task only after a stable Aya release
+   exposes the required multi load/attach/link and process-scoped PID-filter
+   support. W3 does not pin an upstream PR, add a raw syscall, or claim
+   `uprobe-multi` evidence.
 **Owner-gated:** any privileged e2e verification lanes (unprivileged rows
 run; privileged rows recorded UNRUN unless approved); all allowlist/schema
 revision wording for selection-evidence fields.
@@ -221,12 +207,11 @@ final tip) as a matrix row; record every cell
 pass/fail/UNRUN; update README/usage support statement to the tested list
 (PRD §7).
 
-For attachment evidence, record the strict runtime-probe result and actual
-mechanism for every kernel. Require the 5.15 per-offset row and at least one
-exact kernel/distro row whose probe selected `uprobe-multi`; do not assume a
-mechanism from the kernel version. The supported-rate oracle compares the
-generator's completed calls, STATS entered/returned, and raw consumed `CALL`
-records. It measures only the runtime-selected mechanism for that matrix cell.
+For attachment evidence, record the actual per-offset mechanism for every
+kernel. The supported-rate oracle compares the generator's completed calls,
+STATS entered/returned, and raw consumed `CALL` records. Multi-attach is not a
+W6 prerequisite unless its separately planned task has already landed from a
+stable Aya release.
 
 **Owner-gated:** VM-based lanes (uses `p11scope-ws/vm-bases` after W2).
 

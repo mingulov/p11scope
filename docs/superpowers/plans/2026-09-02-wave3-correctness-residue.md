@@ -8,24 +8,19 @@
 
 **Goal:** Make W3 product logic release-final: complete `C_GetInterface`
 selection tracing and offline probing, remove the two remaining tracing
-correctness hazards, ship honest capability/diagnostic tiers, and use
-`uprobe_multi` where the kernel supports it without weakening the 5.15
-fallback.
+correctness hazards, ship honest capability/diagnostic tiers, and qualify the
+existing per-offset attach path on Linux 5.15 and 6.8.
 
 **Architecture:** Reuse the current discovery ring, process-view lifecycle,
 transactional attach plan, exact-object pinning, and render path. Selection is a
 bounded sibling of inventory, never a new inventory source. Tracepoint offsets
 come from tracefs format metadata; scan-open identity is checked before parsing
 the opened object. Capability and attach-mechanism evidence use finite enums.
-`uprobe_multi` cannot use Aya 0.14's ordinary loaded program FD: the kernel
-requires a distinct `BPF_TRACE_UPROBE_MULTI` expected attach type. Aya master
-now supports that path. Task 7 uses the selected exact upstream revision with
-dedicated multi twins; dynamic changes retain the existing per-offset path.
+`uprobe_multi` remains a separate performance optimization, deferred by the
+owner until a stable Aya release exposes the required API.
 
 **Tech stack:** Rust 1.88 / edition 2024, Aya 0.14.0 baseline, existing `libc`,
-`cryptoki-sys`, and `libloading`. Tasks 1–6 add no dependency. Task 7 changes
-Aya from that crates.io release to the exact reviewed Git revision recorded
-below.
+`cryptoki-sys`, and `libloading`. W3 adds no dependency.
 
 **Authorities:**
 
@@ -39,9 +34,8 @@ below.
 
 - Preserve `docs/privacy/allowlist-v1.md` byte-for-byte. Create v2 explicitly;
   do not broaden target reads or output by implication.
-- Preserve Rust 1.88, Linux x86-64 first, Aya 0.14.0 through Tasks 1–6, and the
-  5.15 per-offset attach path. Task 7 uses only the exact reviewed Aya revision
-  recorded below.
+- Preserve Rust 1.88, Linux x86-64 first, Aya 0.14.0, and the 5.15 per-offset
+  attach path.
 - No raw names, pointers, addresses, PIDs/TIDs, provider errors, or target paths
   in selection or attach-mechanism output.
 - Parallel writers may touch only disjoint file sets. Review starts only after
@@ -304,9 +298,9 @@ Design acceptance: §12 items 3, 14, and 15.
   v2-metrics and reads no selection arguments. Preserve v1 allowlist unchanged;
   v2 authorizes only the reviewed finite classes, a finite sorted
   `evidence.attach_mechanisms` array, and the existing offline inventory name
-  exception. Before Task 7, derive the array only from successfully owned links
-  and emit only `per-offset`; Task 7 may add the already-versioned
-  `uprobe-multi` value without reopening the schema or allowlist.
+  exception. Derive the array only from successfully owned links and emit only
+  `per-offset` in W3; the already-versioned `uprobe-multi` value remains unused
+  until its deferred implementation task.
 - [x] RED: `profile_v3_selection_contract_is_exact` and the two validator
   self-tests reject missing/extra v3 selection fields, secret canaries, stale
   live profile-v2 pins, and an observer/helper description with reversed roles;
@@ -349,10 +343,12 @@ fork program again.
   qualified from local Rust gates alone.
 
 Exact-tip checkpoint at `d66e969` on 2026-09-03: all four Jammy 5.15 rows and
-all four Noble 6.8 rows are `UNRUN`. The current host is Linux 7.0; the original
-VM bases are absent, and the relocated overlays reference deleted backing
-files. Containers do not substitute for the required guest kernels. Historical
-evidence was not inherited, so W3 runtime qualification remains open.
+all four Noble 6.8 rows were initially recorded `UNRUN`. That record is
+superseded: the relocated `overlay.qcow2` files do reference deleted backing
+paths, but the standalone Jammy 5.15 and Noble 6.8 cloud images are present and
+valid under `/home/user/src/m/p11scope-ws/vm-bases`. Create fresh disposable
+overlays from those bases and run the rows on the final W3 tip in Task 8.
+Historical evidence is still not inherited.
 
 ## Task 5: Dynamic tracepoint offsets and scan-open identity
 
@@ -369,26 +365,31 @@ Current anchors: literal fork offsets at `crates/ebpf/src/main.rs:1955,1958`;
 target open at `src/discovery/scan.rs:970`; size-only `hint_gate` at `:1003`;
 scan entry at `:1195`.
 
-- [ ] RED A: parse synthetic tracefs format with shifted `parent_pid` and
+- [x] RED A: parse synthetic tracefs format with shifted `parent_pid` and
   `child_pid`; reject missing, duplicate, wrong-size, negative, or overflowing
   fields; static test rejects literal 24/44 reads.
-- [ ] GREEN A: parse
+- [x] GREEN A: parse
   `/sys/kernel/tracing/events/sched/sched_process_fork/format`, publish checked
   offsets through existing config-map ownership before attach, and make BPF read
   only those values. Fail closed; add no BTF/CO-RE dependency.
-- [ ] RED B: replace a mapped provider pathname with another inode and scan with
-  both hinted and unhinted paths; neither may parse or attribute the replacement.
-- [ ] GREEN B: immediately after `open_in_target`, compare the opened file's
+- [x] RED B: pass a same-size replacement inode to the opened-file identity
+  boundary and prove it is refused before hint matching; pin the unconditional
+  scan call site for hinted and unhinted candidates.
+- [x] GREEN B: immediately after `open_in_target`, compare the opened file's
   maps-comparable device/inode against the maps snapshot key using the existing
   identity operation; size remains supplementary only.
-- [ ] Focused checks:
+- [x] Focused checks:
   `cargo +1.88 test --locked --lib tracepoint_format`,
   `cargo +1.88 test --locked --test artifact_contracts dynamic_sched_fork_offsets`,
-  and `cargo +1.88 test --locked --test discovery_scan opened_file_identity`;
+  and `cargo +1.88 test --locked --lib opened_file_identity`;
   then four canonical gates and commit the two root fixes together after
   integration review.
 
 Commit: `fix: bind tracing metadata and scan opens to live identities`
+
+Completed at `02eedbd`: both independent reviews passed; focused checks, the
+15-test discovery scanner suite, and all four canonical gates passed with
+1,017 tests. Allowlist v1 remained byte-identical.
 
 ## Task 6: Capability tiers, diagnostics, and verdict honesty
 
@@ -476,121 +477,18 @@ capture verdict.
 
 Commit: `feat: report capability tiers and tracing degradation honestly`
 
-## Task 7: `uprobe_multi` initial attach with safe fallback
+## Deferred Task 7: `uprobe_multi`
 
-**Decision recorded 2026-09-02:** the owner's autonomous W3 implementation
-authority selects exact Aya revision
-`8d16163ca436e3030cbd45a0f331c62cd6c059fa`, the locally reviewed snapshot of
-upstream-unreviewed open PR #1696. Released Aya 0.14 loads
-ordinary `UProbe` programs with expected attach type zero. A raw
-`BPF_LINK_CREATE(BPF_TRACE_UPROBE_MULTI)` using that FD is invalid, so the prior
-raw-link-only design would fall back everywhere and publish misleading
-evidence. Raising the kernel floor does not fix the program-load type.
+**Owner decision 2026-09-03:** `uprobe_multi` is no longer a W3 requirement.
+Keep Aya `=0.14.0` and the correct Linux 5.15 per-offset implementation. Reopen
+multi-attach as its own post-W3 performance task only after a stable Aya
+release exposes the required multi program-load, attach/link ownership, and
+process-scoped PID-filter support. Do not pin an upstream PR or add a raw-link
+fallback in W3.
 
-- **Master baseline:** Aya master `03bee7dca209651c2f8a951d362665294c0144c9`
-  contains merged PRs #1417/#1654 and native multi
-  sections/load/attach/link ownership. The dependency pin above additionally
-  exposes the process-scoped PID-filter probe required to avoid silently
-  missing sibling threads on affected early multi-uprobe kernels. Aya declares
-  MSRV 1.87; both exact revisions passed
-  `cargo +1.88 check --locked -p aya`.
-- **Rejected wait/defer alternative:** waiting for the next Aya release, or
-  amending the
-  PRD/charter/ROADMAP, keep the existing per-offset path for v0.1, omit
-  `attach_mechanisms`, and move multi attach to the post-release slices.
-- Dropping Linux 5.15 is rejected: it saves none of the required loader work and
-  removes an owner-approved release platform.
-
-Evidence and upstream contribution guidance:
+The feasibility record and proposed upstream contribution remain in
 [`docs/notes/2026-09-02-aya-uprobe-multi-status.md`](../../notes/2026-09-02-aya-uprobe-multi-status.md).
-
-**Files:**
-
-- Modify: `Cargo.toml`, `Cargo.lock`
-- Modify: `crates/ebpf/src/main.rs`
-- Modify: `src/attach.rs`, `src/discovery/engine.rs`, `src/render.rs`, `src/run.rs`,
-  `src/doctor.rs`
-- Modify: `docs/usage.md`
-- Modify: `docs/notes/2026-09-02-aya-uprobe-multi-status.md`
-- Modify: `tests/artifact_contracts.rs`, `scripts/verify-attach-e2e.sh`,
-  `scripts/check-bpf-map-defs.py`, `scripts/check-live-discovery-object.py`
-
-Charter acceptance: W3 item 6.
-
-Current anchors: registered-link ownership around `src/attach.rs:488`, static
-attach transaction at `:734`, dynamic attach/detach at `:1450,1564`. Aya 0.14
-`UProbe::load()` uses expected attach type zero. Aya master recognizes
-`uprobe.multi` sections, loads attach type 48, and owns multi links natively.
-
-Execute and commit Task 7 as three reviewable batches: **7a** pins Aya and
-adapts every compiled attach call site while retaining per-offset behavior;
-**7b** adds the strict probe, multi twins, tail-call eligibility, grouping, and
-initial all-or-none transaction; **7c** adds bundle retirement/downgrade and
-its explicit gap evidence. Run Cargo and integrate these batches serially.
-
-- [ ] RED pin: dependency test proves the multi twin loads with expected
-  attach type 48 while the legacy twin remains zero; p11scope proves the two
-  mechanisms use distinct program FDs with shared maps/lifecycle state.
-- [ ] GREEN pin: add dedicated `#[uprobe(multi)]`/`#[uretprobe(multi)]` wrappers
-  calling the existing handlers and use Aya's iterator attach/managed link API;
-  add no raw syscall, direct `aya-obj` dependency, or private link owner.
-- [ ] RED pin: initial grouping test requires exact `{object, program}`
-  bundles, all return bundles before entries, and logical endpoint counts.
-- [ ] GREEN pin: implement that grouping with dedicated multi twins. A logical
-  endpoint is multi-eligible only when entry/return cookie attribution and every
-  reachable tail-call target are proven under expected attach type 48; otherwise
-  keep that endpoint per-offset. Update both static BPF object-inventory
-  checkers, and report mixed mechanisms from successfully owned links.
-- [ ] RED: `uprobe_multi_probe_is_once_strict_and_sticky` injects public
-  process-scoped probe results `Ok(true)`, `Ok(false)`, and `Err`; proves exactly
-  one call before either multi twin loads; and statically rejects use of the
-  weaker `LinkCreation` feature. This stricter probe governs every capture,
-  including cgroup scope.
-- [ ] GREEN: call
-  `aya::sys::is_uprobe_multi_supported(UProbeMultiFeature::ProcessScopedPidFilter)`
-  once. `Ok(true)` selects the dedicated multi twins, `Ok(false)` selects
-  ordinary per-offset twins for the capture, and `Err` fails with the probe
-  diagnostic. Never use Aya's `AttachMode::Unknown` fallback.
-- [ ] RED: `positive_uprobe_multi_probe_never_falls_back` proves every multi
-  load/link `EINVAL`, `EOPNOTSUPP`, `EPERM`, `EACCES`, identity/process error,
-  and failure after a successful multi link is a real transactional failure.
-- [ ] GREEN: after `Ok(true)`, roll back on every multi load/link error; never
-  reinterpret a later failure as unsupported.
-- [ ] RED: `multi_bundle_retirement_downgrades_without_orphans` proves bundle
-  close, pin recheck, surviving sibling per-offset reattach, exact endpoint
-  ownership, one saturating `multi_rebuild_gaps` increment, and a real
-  `PARTIAL` gap.
-- [ ] GREEN: implement that selective retirement; later additions stay
-  per-offset.
-- [ ] RED: `uprobe_multi_attempt_rolls_back_every_owned_link` injects a second
-  return-group failure and an entry-group failure after a shared return bundle;
-  both close every link created by that attempt and leave no return-only or
-  successful endpoint state.
-- [ ] GREEN: make the initial multi attach one transaction. Only the pre-load
-  support probe returning `Ok(false)` selects per-offset. After `Ok(true)`,
-  every transaction error rolls back all links owned by the attempt without
-  fallback.
-- [ ] Populate Task 4's finite sorted `evidence.attach_mechanisms` with only
-  `uprobe-multi` and/or `per-offset`; do not change its schema or allowlist.
-- [ ] Privileged acceptance pins Linux 5.15 strict-probe `Ok(false)`, not
-  `Err`; compares identical logical endpoint counts under per-offset and multi;
-  and proves a non-leader thread is captured on the strict-probe-true kernel.
-  After 7b, load the complete embedded object again on Linux 5.15 so multi
-  twins cannot regress the floor even though that lane selects per-offset.
-- [ ] Record the exact pinned Aya revision's tree hash in the dependency
-  closure report; do not rely only on a movable upstream PR head name.
-- [ ] Focused checks:
-  `cargo +1.88 test --locked --lib uprobe_multi`,
-  `cargo +1.88 test --locked --test artifact_contracts attach_mechanisms`, and
-  `sh scripts/verify-attach-e2e.sh --self-test`. The Linux 5.15 per-offset row
-  plus an exact kernel/distro row where the strict runtime probe returned true
-  are privileged evidence and remain `UNRUN` unless authorized. A kernel
-  version alone never proves the mechanism. Four canonical gates; commit each
-  7a/7b/7c batch.
-
-Commits: 7a `build: pin Aya multi attach API`; 7b
-`feat: attach initial probe sets with uprobe_multi`; 7c
-`fix: downgrade multi bundles with explicit gap evidence`.
+No code, dependency, schema, gate, or runtime row is owed by this deferred task.
 
 ## Task 8: W3 closeout and review to zero
 
@@ -603,7 +501,7 @@ Commits: 7a `build: pin Aya multi attach API`; 7b
 - Modify: `CHANGELOG.md` only if its existing release convention requires it
 
 - [ ] Run every unprivileged validator self-test and focused W3 test named in
-  Tasks 1–7.
+  Tasks 1–6.
 - [ ] Run the four canonical gates on the exact branch tip and record counts.
 - [ ] Record privileged/container/VM rows as PASS, FAIL, or `UNRUN`; never
   inherit W1/W2 evidence.
@@ -612,14 +510,14 @@ Commits: 7a `build: pin Aya multi attach API`; 7b
   burst/rate with exact agreement between generator-completed calls, STATS
   entered/returned, and raw consumed `CALL` records, zero loss, and induced
   loss forcing `PARTIAL`; never derive a supported events/second claim from
-  ring capacity or drain cadence; test the runtime-selected mechanism)
+  ring capacity or drain cadence; test the per-offset mechanism)
   and
   `fork_exec_loader_unload_oracle` (fork, exec, `dlopen`, calls, `dlclose`,
   replacement/reload, exact retirement and attribution). These privileged
-  runtime rows must PASS for W3 product closeout on Linux 5.15 per-offset and
-  on one exact strict-probe-true multi kernel. If the required environment is
-  unavailable, W3 remains explicitly open rather than converting `UNRUN` into
-  a working-product claim. W6 repeats the broader release matrix.
+  runtime rows must PASS for W3 product closeout on Linux 5.15 and 6.8 using
+  the per-offset mechanism. If the required environment is unavailable, W3
+  remains explicitly open rather than converting `UNRUN` into a
+  working-product claim. W6 repeats the broader release matrix.
 - [ ] On those same exact-tip runtime lanes, use the existing documented
   commands and checkers for one operator journey
   (`doctor -> inspect -> run/profile -> trace`). Add an exact-count

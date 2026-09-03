@@ -5,10 +5,10 @@
 default, not excluded from v0.1.0**: depending on execution speed the owner
 may pull any item into the release (owner decision 2026-09-01); a pulled item
 joins a release wave with full gate coverage and gets recorded here and in
-the ROADMAP. `uprobe_multi` and `C_GetInterface` selection evidence were already pulled
-INTO release scope (2026-09-01, now W3 — see the charter) and are no longer
-listed below. This
-document exists so deferred work is planned deliberately, not re-derived;
+the ROADMAP. `C_GetInterface` selection evidence was pulled into W3.
+`uprobe_multi` was pulled in on 2026-09-01, then deferred again by the owner on
+2026-09-03 until stable Aya support and is listed below. This document exists
+so deferred work is planned deliberately, not re-derived;
 each slice gets its own spec → plan cycle when it starts.
 **Consumes:** `2026-09-01-p11scope-release-prd.md` §8 (non-goals),
 `docs/superpowers/plans/ROADMAP.md`, `docs/notes/2026-09-01-ebpf-comparable-tool-pitfalls.md`.
@@ -43,6 +43,7 @@ Deepens what a capture can express; no structural change.
 
 | Item | Trigger to start |
 | --- | --- |
+| `uprobe_multi` attach optimization | A stable Aya release exposes multi program load, managed attach/link ownership, and the process-scoped PID-filter probe; retain Linux 5.15 per-offset fallback |
 | Raw-tracepoint exec/exit variants (same object, 12→14 programs) | v0.1.0 shipped. Buys tracefs independence + offset-drift immunity, but sells a BTF/CO-RE dependency — keep BOTH variants in one object; never lose the BTF-independence currently held for free (research #12; owner note 2026-08-31) |
 | AArch64 host support | First real user ask, or owner decision |
 | 32-bit counting mode (full ia32 capture beyond W7's observe-target scope) | W7 evidence shows demand |

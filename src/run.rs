@@ -1964,7 +1964,8 @@ fn capture_profile(
             last_frame = Instant::now();
             let ev = evidence_for(
                 engine,
-                session,
+                session.attached_probes(),
+                session.attach_failures(),
                 &reports,
                 kernel_evidence,
                 process_tracker.evidence(),
@@ -2028,7 +2029,8 @@ fn capture_profile(
     engine.settle_terminal_drain();
     let mut ev = evidence_for(
         engine,
-        session,
+        session.attached_probes(),
+        session.attach_failures(),
         &reports,
         kernel_evidence,
         process_tracker.evidence(),
@@ -2263,7 +2265,8 @@ fn capture_trace(
     let trace_truncated = end == CaptureEnd::LimitReached || remaining == Some(0);
     let mut evidence = evidence_for(
         engine,
-        session,
+        session.attached_probes(),
+        session.attach_failures(),
         &reports,
         metrics::kernel_evidence(session)?,
         process_tracker.evidence(),
@@ -2498,7 +2501,8 @@ fn report_trace_loss<W: Write>(
 #[allow(clippy::too_many_arguments)]
 fn evidence_for(
     engine: &Engine,
-    session: &Session,
+    attached_probes: usize,
+    attach_failures: &[(u32, String)],
     reports: &[metrics::SlotReport],
     kernel_evidence: metrics::KernelEvidence,
     tracking_evidence: process::TrackingEvidence,
@@ -2535,12 +2539,8 @@ fn evidence_for(
     let mut ev = render::Evidence {
         table_entries: facts.table_entries(),
         slots: facts.slots(),
-        attached_probes: session.attached_probes(),
-        attach_failures: session
-            .attach_failures()
-            .iter()
-            .map(|(_, msg)| msg.clone())
-            .collect(),
+        attached_probes,
+        attach_failures: attach_failures.iter().map(|(_, msg)| msg.clone()).collect(),
         aliased: plan
             .slots
             .iter()
@@ -2613,7 +2613,7 @@ fn evidence_for(
             Default::default()
         },
         attach_mechanisms: if include_selection {
-            attach_mechanisms(session.attached_probes())
+            attach_mechanisms(attached_probes)
         } else {
             Vec::new()
         },
@@ -3902,6 +3902,55 @@ mod tests {
     fn attach_mechanism_requires_a_successfully_owned_link() {
         assert!(attach_mechanisms(0).is_empty());
         assert_eq!(attach_mechanisms(2), ["per-offset"]);
+    }
+
+    #[test]
+    fn evidence_for_metrics_excludes_hidden_selection_at_the_call_boundary() {
+        let (clean, truncated) = crate::discovery::engine::tests::selection_output_engines();
+        let clean_state = semantics::State::new(clean.plan());
+        let truncated_state = semantics::State::new(truncated.plan());
+        let build = |engine: &Engine, state: &semantics::State, include_selection| {
+            evidence_for(
+                engine,
+                0,
+                &[],
+                &[],
+                metrics::KernelEvidence::default(),
+                process::TrackingEvidence::default(),
+                0,
+                state,
+                false,
+                include_selection,
+                None,
+            )
+        };
+
+        let clean_metrics = build(&clean, &clean_state, false);
+        let truncated_metrics = build(&truncated, &truncated_state, false);
+        assert_eq!(truncated_metrics.completeness, clean_metrics.completeness);
+        assert_eq!(
+            truncated_metrics.interface_selection,
+            render::InterfaceSelection::default()
+        );
+        let capture = render::CaptureMeta {
+            started: "t0",
+            ended: "t1",
+            kernel: "test",
+            policy: CapturePolicy::AggregateOnly,
+        };
+        let document = render::json(&[], &truncated_metrics, &capture);
+        for field in [
+            "interface_selection",
+            "attach_mechanisms",
+            "pid_descendant_gaps",
+            "multi_rebuild_gaps",
+        ] {
+            assert!(document["evidence"].get(field).is_none(), "{field}");
+        }
+
+        let profile = build(&truncated, &truncated_state, true);
+        assert!(profile.interface_selection.selection_truncated);
+        assert_eq!(profile.completeness, "PARTIAL");
     }
 
     #[test]

@@ -64,10 +64,8 @@ but selection requests, failures, and aliases are not yet release-complete.
    wording; target-controlled name bytes surface only by exact membership in
    the published name set.
 2. **Tracepoint offsets (checklist 1 / item #1):** stop hardcoding field
-   offsets — the literal `24`/`44` reads for `sched_process_fork` are at
-   `crates/ebpf/src/main.rs:1704,1707` (the research note and spec §5 cite
-   :1703,:1706 — off by one, the comment line; corrected here 2026-09-01).
-   Parse `/sys/kernel/tracing/events/sched/*/format` at load, pass offsets
+   offsets. Parse the live `/sys/kernel/tracing/events/task/task_newtask/format`
+   at load, pass offsets
    via a config map, hard-assert on mismatch (the bcc precedent failed
    *silently with wrong data* — an error is the required behavior). Preserve
    BTF-independence (item #12): no CO-RE dependency may enter.

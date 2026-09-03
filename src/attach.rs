@@ -14,13 +14,13 @@ use aya::programs::trace_point::TracePointLinkId;
 use aya::programs::uprobe::{UProbeAttachLocation, UProbeAttachPoint, UProbeLinkId, UProbeScope};
 use aya::programs::{ProgramError, TracePoint, TracePointError, UProbe};
 use p11scope_ebpf_common::{
-    ARG_NONE, CFG_FORK_OFFSETS, DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES,
+    ARG_NONE, CFG_TASK_NEWTASK_OFFSETS, DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES,
     DISCOVERY_COUNTER_EXPORT_STATE_FAILURES, DISCOVERY_COUNTER_LOADER_HITS,
     DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES, DISCOVERY_COUNTER_RING_LOSS,
     FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED, FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA,
     FUNCTION_NAME_MAX_BYTES, FunctionNameKey, MAX_DESCRIPTORS, PAUSE_ARMED, PauseKey,
     SlotSemantics, TAIL_CALLS_INTERFACE_WORKER_SLOT, TAIL_CALLS_TEMPLATE_SECOND_SLOT,
-    attach_cookie, pack_fork_offsets,
+    attach_cookie, pack_task_newtask_offsets,
 };
 use pkcs11_proxy_ng_types::mechanism_registry::MechanismRegistry;
 use std::collections::{BTreeMap, BTreeSet};
@@ -32,9 +32,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const BPF_F_RDONLY_PROG: u32 = 1 << 7;
-const SCHED_PROCESS_FORK_FORMATS: [&str; 2] = [
-    "/sys/kernel/tracing/events/sched/sched_process_fork/format",
-    "/sys/kernel/debug/tracing/events/sched/sched_process_fork/format",
+const TASK_NEWTASK_FORMATS: [&str; 2] = [
+    "/sys/kernel/tracing/events/task/task_newtask/format",
+    "/sys/kernel/debug/tracing/events/task/task_newtask/format",
 ];
 
 #[derive(Debug)]
@@ -131,7 +131,7 @@ const TAIL_POLICY_MAP: &str = "TAIL_CALLS";
 const DEFAULT_PROGRAMS: [&str; 13] = [
     "p11_entry",
     "p11_return",
-    "sched_process_fork",
+    "task_newtask",
     "dl_debug_state",
     "function_list_entry",
     "function_list_return",
@@ -205,7 +205,12 @@ fn validate_policy_maps(ebpf: &Ebpf, object_has_unsafe: bool) -> Result<()> {
     Ok(())
 }
 
-fn parse_tracepoint_field(line: &str, name: &str) -> Result<Option<u16>> {
+fn parse_task_newtask_field(
+    line: &str,
+    name: &str,
+    expected_size: &str,
+    expected_signed: &str,
+) -> Result<Option<u16>> {
     let matching_fields = line
         .split(';')
         .filter_map(|part| part.trim().split_once(':'))
@@ -217,7 +222,7 @@ fn parse_tracepoint_field(line: &str, name: &str) -> Result<Option<u16>> {
         return Ok(None);
     }
     if matching_fields != 1 {
-        bail!("duplicate {name} field attribute in sched_process_fork format");
+        bail!("duplicate {name} field attribute in task_newtask format");
     }
 
     let mut offset = None;
@@ -249,39 +254,49 @@ fn parse_tracepoint_field(line: &str, name: &str) -> Result<Option<u16>> {
     }
     let offset = offset
         .context("missing offset")?
-        .parse::<u16>()
+        .parse::<usize>()
         .with_context(|| format!("invalid offset for {name}"))?;
-    if size.context("missing size")? != "4" {
-        bail!("{name} must have size 4");
+    if size.context("missing size")? != expected_size {
+        bail!("{name} must have size {expected_size}");
     }
-    if signed.context("missing signedness")? != "1" {
-        bail!("{name} must be a signed pid_t");
+    if signed.context("missing signedness")? != expected_signed {
+        bail!("{name} has unexpected signedness");
     }
-    Ok(Some(offset))
+    let _end = offset
+        .checked_add(expected_size.parse::<usize>().expect("fixed field size"))
+        .context("field offset overflows tracepoint record")?;
+    Ok(Some(u16::try_from(offset).with_context(|| {
+        format!("offset outside packed form for {name}")
+    })?))
 }
 
-fn parse_tracepoint_format(format: &str) -> Result<(u16, u16)> {
-    let mut parent = None;
-    let mut child = None;
+fn parse_task_newtask_format(format: &str) -> Result<(u16, u16)> {
+    let mut pid = None;
+    let mut clone_flags = None;
     for line in format.lines() {
-        for (name, found) in [("parent_pid", &mut parent), ("child_pid", &mut child)] {
-            if let Some(offset) = parse_tracepoint_field(line, name)? {
+        for (name, size, signed, found) in [
+            ("pid", "4", "1", &mut pid),
+            ("clone_flags", "8", "0", &mut clone_flags),
+        ] {
+            if let Some(offset) = parse_task_newtask_field(line, name, size, signed)? {
                 if found.replace(offset).is_some() {
-                    bail!("duplicate {name} field in sched_process_fork format");
+                    bail!("duplicate {name} field in task_newtask format");
                 }
             }
         }
     }
     Ok((
-        parent.context("missing parent_pid field in sched_process_fork format")?,
-        child.context("missing child_pid field in sched_process_fork format")?,
+        pid.context("missing pid field in task_newtask format")?,
+        clone_flags.context("missing clone_flags field in task_newtask format")?,
     ))
 }
 
-fn read_fork_format_with(mut read: impl FnMut(&Path) -> std::io::Result<String>) -> Result<String> {
+fn read_task_newtask_format_with(
+    mut read: impl FnMut(&Path) -> std::io::Result<String>,
+) -> Result<String> {
     let mut failures = Vec::new();
     let mut unavailable = true;
-    for path in SCHED_PROCESS_FORK_FORMATS.map(Path::new) {
+    for path in TASK_NEWTASK_FORMATS.map(Path::new) {
         match read(path) {
             Ok(format) => return Ok(format),
             Err(error) => {
@@ -294,7 +309,7 @@ fn read_fork_format_with(mut read: impl FnMut(&Path) -> std::io::Result<String>)
         }
     }
     let message = format!(
-        "reading sched_process_fork format failed: {}",
+        "reading task/task_newtask format failed: {}",
         failures.join("; ")
     );
     if unavailable {
@@ -303,15 +318,15 @@ fn read_fork_format_with(mut read: impl FnMut(&Path) -> std::io::Result<String>)
     bail!("{message}")
 }
 
-fn publish_fork_offsets(ebpf: &mut Ebpf) -> Result<()> {
-    let format = read_fork_format_with(|path| std::fs::read_to_string(path))?;
-    let (parent, child) = parse_tracepoint_format(&format)?;
-    let expected = pack_fork_offsets(parent, child);
+fn publish_task_newtask_offsets(ebpf: &mut Ebpf) -> Result<()> {
+    let format = read_task_newtask_format_with(|path| std::fs::read_to_string(path))?;
+    let (pid, clone_flags) = parse_task_newtask_format(&format)?;
+    let expected = pack_task_newtask_offsets(pid, clone_flags);
     let mut config: Array<_, u64> = Array::try_from(ebpf.map_mut("CONFIG").context("CONFIG map")?)?;
-    config.set(CFG_FORK_OFFSETS, expected, 0)?;
+    config.set(CFG_TASK_NEWTASK_OFFSETS, expected, 0)?;
     let config: Array<_, u64> = Array::try_from(ebpf.map("CONFIG").context("CONFIG map")?)?;
-    if config.get(&CFG_FORK_OFFSETS, 0)? != expected {
-        bail!("CONFIG fork offsets exact readback differs from parsed tracefs format");
+    if config.get(&CFG_TASK_NEWTASK_OFFSETS, 0)? != expected {
+        bail!("CONFIG task_newtask offsets exact readback differs from parsed tracefs format");
     }
     Ok(())
 }
@@ -452,8 +467,8 @@ impl CapturePolicy {
     }
 }
 
-fn fork_capture_enabled(scope: &Scope, policy: CapturePolicy) -> bool {
-    matches!(scope, Scope::Pid(_) | Scope::Cgroup { .. }) && policy.uses_events()
+fn process_creation_capture_enabled(scope: &Scope, policy: CapturePolicy) -> bool {
+    matches!(scope, Scope::Cgroup { .. }) && policy.uses_events()
 }
 
 pub(crate) struct OwnedPauseGeneration {
@@ -503,7 +518,7 @@ pub struct Session {
     #[allow(dead_code)] // Task 8 drives the Task 7 pause coordinator.
     pause_key: Option<PauseKey>,
     lifecycle_tracking_unavailable: Option<String>,
-    fork_tracking_unavailable: Option<String>,
+    process_creation_tracking_unavailable: Option<String>,
     links: Vec<RegisteredLink>,
 }
 
@@ -520,12 +535,17 @@ enum LifecycleAttachOutcome<T> {
 }
 
 fn expected_tracefs_id_path(program: &str, path: &Path) -> bool {
+    let category = if program == "task_newtask" {
+        "task"
+    } else {
+        "sched"
+    };
     ["/sys/kernel/tracing", "/sys/kernel/debug/tracing"]
         .into_iter()
         .any(|root| {
             path == Path::new(root)
                 .join("events")
-                .join("sched")
+                .join(category)
                 .join(program)
                 .join("id")
         })
@@ -745,7 +765,7 @@ fn detach_producers_with(
         }
     }
     if fork_attached {
-        detach_one(ProducerProgram::TracePoint("sched_process_fork"));
+        detach_one(ProducerProgram::TracePoint("task_newtask"));
     }
     detach_one(ProducerProgram::UProbe("p11_return"));
     first_error.map_or(Ok(()), Err)
@@ -763,7 +783,7 @@ fn detach_selected_with<T>(
         ProducerProgram::UProbe("p11_entry_template") => 1,
         ProducerProgram::UProbe("p11_entry_template_types") => 2,
         ProducerProgram::UProbe("p11_entry_template_pair") => 3,
-        ProducerProgram::TracePoint("sched_process_fork") => 4,
+        ProducerProgram::TracePoint("task_newtask") => 4,
         ProducerProgram::UProbe("p11_return") => 5,
         _ => 6,
     });
@@ -1175,13 +1195,13 @@ impl Session {
     }
 
     /// Exercises the real embedded object, policy maps, program inventory,
-    /// requested scope, fork boundary, and exec/exit links. Dropping the local
+    /// requested scope, process-creation boundary, and exec/exit links. Dropping the local
     /// session detaches every link before this finite result is returned.
     pub(crate) fn preflight(scope: &Scope) -> Result<AttachPreflight> {
         let session = Self::start_inner(scope, CapturePolicy::Allowlisted, None)?;
         Ok(AttachPreflight {
             lifecycle: session.lifecycle_tracking_unavailable.is_none(),
-            scope: session.fork_tracking_unavailable.is_none(),
+            scope: session.process_creation_tracking_unavailable.is_none(),
         })
     }
 
@@ -1204,11 +1224,11 @@ impl Session {
         let generation_token = pause_key.map(|key| key.generation_token);
         crate::scope::publish(&mut ebpf, scope, policy, generation_token)
             .context("publishing scope and capture policy")?;
-        let fork_enabled = fork_capture_enabled(scope, policy);
-        let mut fork_tracking_unavailable = None;
-        if fork_enabled
+        let process_creation_enabled = process_creation_capture_enabled(scope, policy);
+        let mut process_creation_tracking_unavailable = None;
+        if process_creation_enabled
             && let Err(error) =
-                publish_fork_offsets(&mut ebpf).context("publishing sched_process_fork offsets")
+                publish_task_newtask_offsets(&mut ebpf).context("publishing task_newtask offsets")
         {
             if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
                 matches!(
@@ -1216,8 +1236,8 @@ impl Session {
                     std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
                 )
             }) {
-                fork_tracking_unavailable = Some(format!(
-                    "live fork tracking unavailable: {}",
+                process_creation_tracking_unavailable = Some(format!(
+                    "live process-creation tracking unavailable: {}",
                     error.root_cause()
                 ));
             } else {
@@ -1250,7 +1270,10 @@ impl Session {
 
         let programs = expected_programs(object_has_unsafe);
         for prog_name in programs {
-            if prog_name.starts_with("sched_process_") {
+            if matches!(
+                prog_name,
+                "task_newtask" | "sched_process_exec" | "sched_process_exit"
+            ) {
                 let prog: &mut TracePoint = ebpf
                     .program_mut(prog_name)
                     .with_context(|| format!("program {prog_name} missing from object"))?
@@ -1279,23 +1302,24 @@ impl Session {
             .context("publishing and freezing TAIL_CALLS")?;
 
         let mut links = Vec::new();
-        if fork_enabled && fork_tracking_unavailable.is_none() {
-            let fork: &mut TracePoint = ebpf
-                .program_mut("sched_process_fork")
-                .context("program sched_process_fork missing from object")?
+        if process_creation_enabled && process_creation_tracking_unavailable.is_none() {
+            let process_creation: &mut TracePoint = ebpf
+                .program_mut("task_newtask")
+                .context("program task_newtask missing from object")?
                 .try_into()?;
-            match fork.attach("sched", "sched_process_fork") {
+            match process_creation.attach("task", "task_newtask") {
                 Ok(id) => links.push(RegisteredLink::TracePoint {
-                    program: "sched_process_fork",
+                    program: "task_newtask",
                     id,
                 }),
                 Err(error) => {
                     let error = anyhow::Error::from(error);
-                    if let Some(cause) = tracefs_lifecycle_failure(&error, "sched_process_fork") {
-                        fork_tracking_unavailable =
-                            Some(format!("live fork tracking unavailable: {cause}"));
+                    if let Some(cause) = tracefs_lifecycle_failure(&error, "task_newtask") {
+                        process_creation_tracking_unavailable = Some(format!(
+                            "live process-creation tracking unavailable: {cause}"
+                        ));
                     } else {
-                        return Err(error.context("attaching sched_process_fork"));
+                        return Err(error.context("attaching task_newtask"));
                     }
                 }
             }
@@ -1339,7 +1363,7 @@ impl Session {
             uprobe_scope,
             pause_key,
             lifecycle_tracking_unavailable,
-            fork_tracking_unavailable,
+            process_creation_tracking_unavailable,
             links,
         })
     }
@@ -1911,8 +1935,8 @@ impl Session {
         self.lifecycle_tracking_unavailable.as_deref()
     }
 
-    pub(crate) fn fork_tracking_unavailable(&self) -> Option<&str> {
-        self.fork_tracking_unavailable.as_deref()
+    pub(crate) fn process_creation_tracking_unavailable(&self) -> Option<&str> {
+        self.process_creation_tracking_unavailable.as_deref()
     }
 
     /// Lifetime successful static endpoints (2 per fully-attached slot).
@@ -1966,32 +1990,46 @@ mod capture_policy {
 
 #[cfg(test)]
 mod tracepoint_format {
-    use super::{SCHED_PROCESS_FORK_FORMATS, parse_tracepoint_format, read_fork_format_with};
+    use super::{TASK_NEWTASK_FORMATS, parse_task_newtask_format, read_task_newtask_format_with};
 
-    const VALID: &str = "field:pid_t parent_pid; offset:32; size:4; signed:1;\nfield:pid_t child_pid; offset:56; size:4; signed:1;\n";
+    const VALID: &str = "field:pid_t pid; offset:32; size:4; signed:1;\nfield:unsigned long clone_flags; offset:56; size:8; signed:0;\n";
 
     #[test]
-    fn tracepoint_format_parses_shifted_fork_pid_offsets() {
-        assert_eq!(parse_tracepoint_format(VALID).unwrap(), (32, 56));
+    fn tracepoint_format_parses_shifted_task_newtask_offsets() {
+        assert_eq!(parse_task_newtask_format(VALID).unwrap(), (32, 56));
     }
 
     #[test]
     fn tracepoint_format_rejects_malformed_and_unrepresentable_fields() {
         let cases = [
             (
-                "missing parent_pid",
-                VALID.replace("field:pid_t parent_pid; offset:32; size:4; signed:1;\n", ""),
+                "missing pid",
+                VALID.replace("field:pid_t pid; offset:32; size:4; signed:1;\n", ""),
             ),
             (
-                "missing child_pid",
-                VALID.replace("field:pid_t child_pid; offset:56; size:4; signed:1;\n", ""),
+                "missing clone_flags",
+                VALID.replace(
+                    "field:unsigned long clone_flags; offset:56; size:8; signed:0;\n",
+                    "",
+                ),
             ),
             (
-                "duplicate parent_pid",
-                format!("{VALID}field:pid_t parent_pid; offset:64; size:4; signed:1;\n"),
+                "duplicate pid",
+                format!("{VALID}field:pid_t pid; offset:64; size:4; signed:1;\n"),
             ),
-            ("size other than four", VALID.replace("size:4", "size:8")),
-            ("unsigned field", VALID.replace("signed:1", "signed:0")),
+            (
+                "pid size other than four",
+                VALID.replace("size:4", "size:8"),
+            ),
+            ("pid unsigned field", VALID.replace("signed:1", "signed:0")),
+            (
+                "clone flags size other than eight",
+                VALID.replace("size:8", "size:4"),
+            ),
+            (
+                "clone flags signed field",
+                VALID.replace("signed:0", "signed:1"),
+            ),
             ("negative offset", VALID.replace("offset:32", "offset:-1")),
             (
                 "offset outside CONFIG packed form",
@@ -2020,7 +2058,7 @@ mod tracepoint_format {
 
         for (reason, format) in cases {
             assert!(
-                parse_tracepoint_format(&format).is_err(),
+                parse_task_newtask_format(&format).is_err(),
                 "accepted {reason}"
             );
         }
@@ -2029,9 +2067,9 @@ mod tracepoint_format {
     #[test]
     fn tracepoint_format_reader_falls_back_to_debugfs() {
         let mut visited = Vec::new();
-        let format = read_fork_format_with(|path| {
+        let format = read_task_newtask_format_with(|path| {
             visited.push(path.to_path_buf());
-            if path == std::path::Path::new(SCHED_PROCESS_FORK_FORMATS[1]) {
+            if path == std::path::Path::new(TASK_NEWTASK_FORMATS[1]) {
                 Ok(VALID.to_string())
             } else {
                 Err(std::io::Error::from(std::io::ErrorKind::NotFound))
@@ -2044,8 +2082,8 @@ mod tracepoint_format {
 
     #[test]
     fn tracepoint_format_reader_reports_both_failed_paths() {
-        let error = read_fork_format_with(|path| {
-            if path == std::path::Path::new(SCHED_PROCESS_FORK_FORMATS[0]) {
+        let error = read_task_newtask_format_with(|path| {
+            if path == std::path::Path::new(TASK_NEWTASK_FORMATS[0]) {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     "primary tracefs denied",
@@ -2060,8 +2098,8 @@ mod tracepoint_format {
         .unwrap_err()
         .to_string();
         for expected in [
-            SCHED_PROCESS_FORK_FORMATS[0],
-            SCHED_PROCESS_FORK_FORMATS[1],
+            TASK_NEWTASK_FORMATS[0],
+            TASK_NEWTASK_FORMATS[1],
             "primary tracefs denied",
             "debugfs tracepoint missing",
         ] {
@@ -2172,7 +2210,7 @@ mod tests {
             "interface_list_return",
             "interface_entry",
             "interface_return",
-            "sched_process_fork",
+            "task_newtask",
             "sched_process_exec",
             "sched_process_exit",
         ] {
@@ -2206,23 +2244,23 @@ mod tests {
     }
 
     #[test]
-    fn pid_event_capture_requires_sched_process_fork() {
+    fn process_creation_capture_is_cgroup_only() {
         let cgroup = Scope::Cgroup {
             id: 1,
             path: "/".into(),
             dir: Arc::new(File::open("/").unwrap()),
         };
         for (scope, policy, expected) in [
-            (Scope::Pid(7), CapturePolicy::Allowlisted, true),
+            (Scope::Pid(7), CapturePolicy::Allowlisted, false),
             (
                 Scope::Pid(7),
                 CapturePolicy::UnsafeUnvalidatedMetadata,
-                true,
+                false,
             ),
             (Scope::Pid(7), CapturePolicy::AggregateOnly, false),
             (cgroup, CapturePolicy::Allowlisted, true),
         ] {
-            assert_eq!(fork_capture_enabled(&scope, policy), expected);
+            assert_eq!(process_creation_capture_enabled(&scope, policy), expected);
         }
     }
 
@@ -2591,7 +2629,7 @@ mod tests {
                 ProducerProgram::UProbe("p11_entry_template"),
                 ProducerProgram::UProbe("p11_entry_template_types"),
                 ProducerProgram::UProbe("p11_entry_template_pair"),
-                ProducerProgram::TracePoint("sched_process_fork"),
+                ProducerProgram::TracePoint("task_newtask"),
                 ProducerProgram::UProbe("p11_return"),
             ]
         );

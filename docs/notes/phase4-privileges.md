@@ -90,8 +90,8 @@ their IDs from tracefs. The enhanced tier therefore requires readable
 PID observation session may retain its other attachable probes and publish
 `PARTIAL` through the existing discovery-unavailable evidence. A cgroup
 observation path may degrade only when it does not require the mandatory
-`sched_process_fork`; an event-producing cgroup scope still requires readable
-fork tracefs and can fail closed under the controller ruling. Owned `run`
+`task/task_newtask`; an event-producing cgroup scope still requires readable
+process-creation tracefs and can fail closed under the controller ruling. Owned `run`
 refuses before releasing its barrier. The interim non-root host preparation is
 a tracefs remount granting the observer's dedicated group, for example
 `gid=<observer-group>,mode=0750`. The current restricted-observer rows above

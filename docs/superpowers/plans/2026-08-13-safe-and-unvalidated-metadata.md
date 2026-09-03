@@ -263,7 +263,7 @@ Expected: FAIL because all current policies execute the entry-time unvalidated d
 
 - [x] **Step 3: Implement `aggregate-only` before all semantic reads**
 
-After scope and CONFIG validation, aggregate entry records only timestamp/key and increments `STATS.entered`; it returns before reading `SLOT_SEMANTICS` or any argument. Aggregate return updates `STATS`/`RV_COUNTS`, removes `START`, and returns before cgroup/semantic state or ring reservation. Do not attach `sched_process_fork` for this policy.
+After scope and CONFIG validation, aggregate entry records only timestamp/key and increments `STATS.entered`; it returns before reading `SLOT_SEMANTICS` or any argument. Aggregate return updates `STATS`/`RV_COUNTS`, removes `START`, and returns before cgroup/semantic state or ring reservation. Do not attach `task_newtask` for this policy.
 
 ```rust
 if flags & FLAG_POLICY_AGGREGATE != 0 {

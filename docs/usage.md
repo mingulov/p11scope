@@ -204,6 +204,14 @@ directory reaches the workload's actual nested cgroup. `--duration` (bare second
 either subcommand; Ctrl-C or SIGTERM also ends a capture cleanly (final frame
 printed, `-o` file written) instead of aborting it.
 
+For cgroup event captures, `task/task_newtask` records ordinary non-thread
+creation and preserves the parent's proven semantic state while the child is
+refreshed. `CLONE_INTO_CGROUP` is recorded as a selection gap without
+inheritance because destination membership is unproven. Arbitrary post-start
+cgroup migration is outside the `COMPLETE` and runtime-qualified claims; no
+migration subsystem is provided. PID scope remains exact and does not attach
+process-creation tracking.
+
 Before either command attaches, every accepted object from the scan or an
 optional manifest is opened once and pinned by file descriptor. The whole-file
 SHA-256 is taken at pin time; manifest identities are matched against it (and
@@ -270,7 +278,7 @@ promise. With no `--pid`, target readability is explicitly `unassessed`.
 | T1 host attach | supported kernel, real embedded BPF object/maps/program load, and an actual self-uprobe | Live observation works on this host; target readability is failed or unassessed. |
 | T2 target readable | T1 plus one stable target generation, readable `maps`, `mem`, and `root`, and exact executable/provider identity opens through that root | The target can be planned; lifecycle changes may be missed, so an attempted capture can be `PARTIAL`. |
 | T3 lifecycle | T2 plus successful real exec and exit lifecycle links | Base lifecycle coverage works; a requested scope-specific lane is unavailable or degraded. |
-| T4 current full | T3 plus every requested scope operation, including filter publication, cgroup access, and fork tracing when required | Current mechanisms preflighted; this is neither leased/hardened authority nor a `COMPLETE` promise. |
+| T4 current full | T3 plus every requested scope operation, including filter publication, cgroup access, and process-creation tracing when required | Current mechanisms preflighted; this is neither leased/hardened authority nor a `COMPLETE` promise. |
 
 The doctor runs the real embedded BPF object/map/program inventory and drops a
 temporary session after preflighting exec/exit lifecycle links and every
@@ -449,7 +457,7 @@ it, that no scan-only semantic claim remains, that the memory scan could read ev
 at the attach ceiling, that no module's targets went uncorroborated,
 conflicted or ambiguous, that every discovery surface was fully acquired and
 walked, that every planned probe attached, and that there are zero START/RV/
-ring, cgroup, process-identity, semantic-state, fork, cancellation, async,
+ring, cgroup, process-identity, semantic-state, process-creation, cancellation, async,
 template, or parameter-decode gaps. A capture that observed nothing has no
 failure to report, so "found something" is part of the verdict rather than
 something a reader has to check separately. The schema document lists every

@@ -223,7 +223,7 @@ fn assert_live_discovery_host_contract(
     require_before(
         attach,
         "publish_and_freeze_tail_calls(&mut ebpf, unsafe_enabled)",
-        ".attach(\"sched\", \"sched_process_fork\")",
+        ".attach(\"task\", \"task_newtask\")",
         "tail publication before first producer attach",
     )?;
 
@@ -558,7 +558,7 @@ fn assert_static_descriptor_cookie_contract(attach: &str, ebpf: &str) -> Result<
     let returned = contract_section(
         ebpf,
         "pub fn p11_return(ctx: RetProbeContext) -> u32 {",
-        "#[tracepoint(category = \"sched\", name = \"sched_process_fork\")]",
+        "#[tracepoint(category = \"task\", name = \"task_newtask\")]",
     )?;
     for (marker, contract) in [
         ("let slot = slot_of(&ctx);", "return low-word slot"),
@@ -4679,28 +4679,31 @@ fn descriptor_cookie_and_publication_source_guard_rejects_contract_regressions()
 }
 
 #[test]
-fn dynamic_sched_fork_offsets() {
+fn dynamic_task_newtask_offsets() {
     let attach = read("src/attach.rs");
     let common = read("crates/ebpf-common/src/lib.rs");
     let ebpf = read("crates/ebpf/src/main.rs");
     let fork = between(
         &ebpf,
-        "pub fn sched_process_fork(ctx: TracePointContext)",
+        "pub fn task_newtask(ctx: TracePointContext)",
         "#[panic_handler]",
     );
-    assert_eq!(p11scope_ebpf_common::CFG_FORK_OFFSETS, 1);
+    assert_eq!(p11scope_ebpf_common::CFG_TASK_NEWTASK_OFFSETS, 1);
     assert_eq!(embedded_map_definitions()["CONFIG"][3], 2);
 
-    for marker in ["CFG_FORK_PARENT_OFFSET", "CFG_FORK_CHILD_OFFSET"] {
+    for marker in [
+        "CFG_TASK_NEWTASK_PID_OFFSET",
+        "CFG_TASK_NEWTASK_CLONE_FLAGS_OFFSET",
+    ] {
         assert!(
             common.contains(marker),
             "shared CONFIG contract misses {marker}"
         );
     }
     for marker in [
-        "parse_tracepoint_format",
-        "pack_fork_offsets",
-        "CFG_FORK_OFFSETS",
+        "parse_task_newtask_format",
+        "pack_task_newtask_offsets",
+        "CFG_TASK_NEWTASK_OFFSETS",
     ] {
         assert!(
             attach.contains(marker),
@@ -4708,33 +4711,45 @@ fn dynamic_sched_fork_offsets() {
         );
     }
     for marker in [
-        ".get(CFG_FORK_OFFSETS)",
-        "CFG_FORK_OFFSETS",
-        "unpack_fork_offsets",
+        ".get(CFG_TASK_NEWTASK_OFFSETS)",
+        "CFG_TASK_NEWTASK_OFFSETS",
+        "unpack_task_newtask_offsets",
     ] {
         assert!(fork.contains(marker), "fork program misses {marker}");
     }
     for root in ["/sys/kernel/tracing", "/sys/kernel/debug/tracing"] {
-        assert!(attach.contains(&format!("{root}/events/sched/sched_process_fork/format")));
+        assert!(attach.contains(&format!("{root}/events/task/task_newtask/format")));
     }
-    assert!(attach.contains("read_fork_format_with(|path| std::fs::read_to_string(path))"));
-    assert!(attach.contains("config.set(CFG_FORK_OFFSETS"));
+    assert!(attach.contains("read_task_newtask_format_with(|path| std::fs::read_to_string(path))"));
+    assert!(attach.contains("config.set(CFG_TASK_NEWTASK_OFFSETS"));
     assert!(!fork.contains("read_at::<u32>(24)"));
     assert!(!fork.contains("read_at::<u32>(44)"));
-    assert!(fork.contains(".and_then(unpack_fork_offsets)\n    else {\n        return 0;\n    };"));
+    assert!(fork.contains("scope_auth()"));
+    assert!(fork.contains("FLAG_CGROUP_FILTER"));
+    assert!(fork.contains("read_at::<i32>"));
+    assert!(fork.contains("read_at::<u64>"));
+    assert!(fork.contains("classify_task_newtask"));
+    assert!(fork.find("classify_task_newtask").unwrap() < fork.find("EVENTS.reserve").unwrap());
     assert!(
-        attach.find("crate::scope::publish(&mut ebpf").unwrap()
-            < attach.find("publish_fork_offsets(&mut ebpf)").unwrap()
+        fork.contains(
+            ".and_then(unpack_task_newtask_offsets)\n    else {\n        return 0;\n    };"
+        )
     );
     assert!(
-        attach.find("publish_fork_offsets(&mut ebpf)").unwrap()
+        attach.find("crate::scope::publish(&mut ebpf").unwrap()
+            < attach
+                .find("publish_task_newtask_offsets(&mut ebpf)")
+                .unwrap()
+    );
+    assert!(
+        attach
+            .find("publish_task_newtask_offsets(&mut ebpf)")
+            .unwrap()
             < attach.find("freeze_published_maps(&ebpf)").unwrap()
     );
     assert!(
         attach.find("freeze_published_maps(&ebpf)").unwrap()
-            < attach
-                .find(".attach(\"sched\", \"sched_process_fork\")")
-                .unwrap()
+            < attach.find(".attach(\"task\", \"task_newtask\")").unwrap()
     );
 }
 
@@ -5307,7 +5322,7 @@ fn descriptors_are_published_read_back_and_frozen_before_probe_attachment() {
         .find("publish_and_freeze_tail_calls(&mut ebpf, unsafe_enabled)")
         .expect("Session must publish and freeze TAIL_CALLS");
     let fork_attach = source
-        .find(".attach(\"sched\", \"sched_process_fork\")")
+        .find(".attach(\"task\", \"task_newtask\")")
         .expect("Session must attach the fork probe");
     let uprobe_attach = source
         .find("prog.attach(point")
@@ -5603,45 +5618,67 @@ fn operator_docs_preserve_semantic_authority_limits() {
         );
     }
 
-    for path in [
-        "README.md",
-        "docs/usage.md",
-        "CHANGELOG.md",
-        "docs/superpowers/plans/ROADMAP.md",
-    ] {
+    for path in ["README.md", "docs/usage.md"] {
         let document = read(path)
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ")
             .to_lowercase();
-        for statement in ["exact-tip ci", "pending"] {
-            assert!(
-                document.contains(statement),
-                "{path} is missing: {statement}"
-            );
-        }
+        assert!(
+            document.contains("exact-tip runtime qualification") && document.contains("pending"),
+            "{path} must say exact-tip runtime qualification is pending"
+        );
+    }
+    for path in ["CHANGELOG.md", "docs/superpowers/plans/ROADMAP.md"] {
+        let document = read(path)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+        assert!(
+            document.contains("exact-tip ci") && document.contains("pending"),
+            "{path} must say exact-tip CI is pending"
+        );
     }
 
     for path in ["README.md", "docs/usage.md", "CHANGELOG.md"] {
         assert!(read(path).to_lowercase().contains("unreleased"), "{path}");
     }
-    for path in ["docs/usage.md", "docs/superpowers/plans/ROADMAP.md"] {
-        let document = read(path).split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(
-            document.contains("no release or security-clearance claim"),
-            "{path}"
-        );
-    }
-    for path in ["README.md", "docs/usage.md"] {
-        let document = read(path).split_whitespace().collect::<Vec<_>>().join(" ");
-        for statement in [
-            "local MVP candidate is runtime-qualified",
-            "22.04 kernel 5.15",
-            "24.04 kernel 6.8",
-        ] {
-            assert!(document.contains(statement), "{path}: {statement}");
-        }
-    }
+    let usage = read("docs/usage.md")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    assert!(
+        usage.contains("runtime qualification") && usage.contains("remain pending"),
+        "docs/usage.md must keep runtime qualification pending"
+    );
+    let roadmap = read("docs/superpowers/plans/ROADMAP.md")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    assert!(
+        roadmap.contains("ci remains pending")
+            && roadmap.contains("no release or security-clearance claim applies yet"),
+        "ROADMAP must keep CI and release authority pending"
+    );
+    let readme = read("README.md")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    assert!(
+        readme.contains("previous frozen mvp passed")
+            && readme.contains("w3 tip")
+            && readme.contains("remain pending"),
+        "README must distinguish historical MVP evidence from W3 qualification"
+    );
+    assert!(
+        usage.contains("frozen pre-w3 candidate")
+            && usage.contains("not been repeated on the w3 tip"),
+        "docs/usage.md must distinguish historical evidence from W3 qualification"
+    );
 }
 
 #[test]

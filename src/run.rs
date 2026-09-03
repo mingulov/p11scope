@@ -1743,21 +1743,24 @@ fn observe_fork(
     pid_descendant_gaps: &mut u64,
     ev: &p11scope_ebpf_common::Event,
 ) -> bool {
-    if ev.event_type != p11scope_ebpf_common::event_type::FORK {
+    if !matches!(
+        ev.event_type,
+        p11scope_ebpf_common::event_type::FORK | p11scope_ebpf_common::event_type::FORK_INTO_CGROUP
+    ) {
         return false;
     }
-    let parent_pid = (ev.pid_tgid >> 32) as u32;
-    if let Scope::Pid(selected) = scope {
-        if parent_pid == *selected {
-            *pid_descendant_gaps = pid_descendant_gaps.saturating_add(1);
-        }
+    if !matches!(scope, Scope::Cgroup { .. }) {
         return true;
     }
+    let parent_pid = (ev.pid_tgid >> 32) as u32;
     // Static function probes cover cgroup descendants immediately, but Aya's
     // per-process dynamic export links cannot cover a child's C_GetInterface
     // calls before the next membership refresh. Keep semantic inheritance,
     // while making that selection-discovery window explicit.
     *pid_descendant_gaps = pid_descendant_gaps.saturating_add(1);
+    if ev.event_type == p11scope_ebpf_common::event_type::FORK_INTO_CGROUP {
+        return true;
+    }
     if !state.pid_has_process_state(parent_pid) {
         return true;
     }
@@ -1783,17 +1786,14 @@ fn observe_fork(
 
 fn initial_tracking_evidence(
     scope: &Scope,
-    fork_tracking_unavailable: bool,
+    process_creation_tracking_unavailable: bool,
     lifecycle_tracking_unavailable: bool,
 ) -> (u64, bool) {
     match scope {
-        Scope::Pid(_) => (
-            u64::from(fork_tracking_unavailable),
-            lifecycle_tracking_unavailable,
-        ),
+        Scope::Pid(_) => (0, lifecycle_tracking_unavailable),
         Scope::Cgroup { .. } => (
-            u64::from(fork_tracking_unavailable),
-            fork_tracking_unavailable || lifecycle_tracking_unavailable,
+            u64::from(process_creation_tracking_unavailable),
+            process_creation_tracking_unavailable || lifecycle_tracking_unavailable,
         ),
     }
 }
@@ -1975,7 +1975,7 @@ fn capture_profile(
     let mut malformed_records: u64 = 0;
     let (mut pid_descendant_gaps, capture_tracking_degraded) = initial_tracking_evidence(
         scope,
-        session.fork_tracking_unavailable().is_some(),
+        session.process_creation_tracking_unavailable().is_some(),
         session.lifecycle_tracking_unavailable().is_some(),
     );
     let mut stdout_open = true;
@@ -2226,7 +2226,7 @@ fn capture_trace(
     let mut malformed_records: u64 = 0;
     let (mut pid_descendant_gaps, capture_tracking_degraded) = initial_tracking_evidence(
         scope,
-        session.fork_tracking_unavailable().is_some(),
+        session.process_creation_tracking_unavailable().is_some(),
         session.lifecycle_tracking_unavailable().is_some(),
     );
     let mut last_reported_loss: u64 = 0;
@@ -3774,86 +3774,7 @@ mod tests {
     }
 
     #[test]
-    fn pid_scope_fork_marks_descendant_unobserved_partial() {
-        use crate::events::{EventDrain, ScriptedRecords};
-
-        let parent = 41u32;
-        let child = 42u32;
-        let event = p11scope_ebpf_common::Event {
-            event_type: p11scope_ebpf_common::event_type::FORK,
-            pid_tgid: (u64::from(parent) << 32) | 9001,
-            session: u64::from(child),
-            ..Default::default()
-        };
-        let plan = crate::plan::AttachPlan::from_slots(vec![crate::plan::Slot {
-            index: 0,
-            descriptor_index: crate::kinds::function_id("C_OpenSession").unwrap() + 1,
-            object: crate::plan::TEST_PINNED_OBJECT,
-            object_path: "/opt/p11.so".into(),
-            file_offset: 0x10,
-            names: vec!["C_OpenSession".into()],
-            aliased: false,
-            semantics: crate::kinds::descriptor("C_OpenSession").unwrap(),
-            semantic_authorized: true,
-            semantic_ambiguous: false,
-            fork_safe: true,
-            module_ids: vec![crate::plan::ModuleId(0)],
-        }]);
-        let mut state = semantics::State::new(&plan);
-        let mut tracker = process::Tracker::new();
-        let parent_process = tracker.identify(parent).key;
-        state.observe_process(
-            parent_process,
-            &p11scope_ebpf_common::Event {
-                event_type: p11scope_ebpf_common::event_type::CALL,
-                pid_tgid: u64::from(parent) << 32,
-                session: 7,
-                slot_id: 3,
-                slot: 0,
-                capture: p11scope_ebpf_common::capture::OUTPUT_NON_NULL,
-                ..Default::default()
-            },
-        );
-        assert!(state.pid_has_process_state(parent));
-        let mut gaps = 0;
-        let mut drain = EventDrain::over(ScriptedRecords::events([event], usize::MAX));
-
-        assert_eq!(
-            drain_profile_events(
-                &mut drain,
-                &mut state,
-                &mut tracker,
-                &Scope::Pid(parent),
-                &mut gaps,
-                None,
-            ),
-            0
-        );
-        assert_eq!(drain.source().remaining(), 0, "fork records are handled");
-        assert_eq!(gaps, 1, "one worker-thread fork is one descendant gap");
-        assert!(
-            !state.pid_has_process_state(child),
-            "PID-scope descendants never inherit semantic tracing state"
-        );
-
-        gaps = u64::MAX;
-        let mut drain = EventDrain::over(ScriptedRecords::events([event], usize::MAX));
-        assert_eq!(
-            drain_profile_events(
-                &mut drain,
-                &mut state,
-                &mut tracker,
-                &Scope::Pid(parent),
-                &mut gaps,
-                None,
-            ),
-            0
-        );
-        assert_eq!(gaps, u64::MAX, "the finite counter saturates");
-    }
-
-    #[test]
-    fn cgroup_fork_retains_semantics_but_marks_selection_window_gap() {
+    fn cgroup_process_creation_inherits_once_and_tags_into_cgroup_no_inherit() {
         use crate::events::{EventDrain, ScriptedRecords};
 
         let event = p11scope_ebpf_common::Event {
@@ -3920,6 +3841,30 @@ mod tests {
             "cgroup scope retains existing semantic inheritance"
         );
         assert_eq!(drain.source().remaining(), 0, "fork records are handled");
+
+        let into_event = p11scope_ebpf_common::Event {
+            event_type: p11scope_ebpf_common::event_type::FORK_INTO_CGROUP,
+            pid_tgid: 41u64 << 32,
+            session: 43,
+            ..Default::default()
+        };
+        let mut drain = EventDrain::over(ScriptedRecords::events([into_event], usize::MAX));
+        assert_eq!(
+            drain_profile_events(
+                &mut drain,
+                &mut state,
+                &mut tracker,
+                &scope,
+                &mut gaps,
+                None,
+            ),
+            0
+        );
+        assert_eq!(gaps, 2, "each non-thread process creation adds one gap");
+        assert!(
+            !state.pid_has_process_state(43),
+            "destination cgroup membership is unproven"
+        );
     }
 
     fn trace_fixture() -> (semantics::State, process::Tracker, trace::Tracer) {
@@ -4038,7 +3983,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_trace_count_evidence_counts_before_limit_and_excludes_fork() {
+    fn terminal_trace_count_evidence_counts_before_limit_and_excludes_process_creation() {
         use crate::events::{EventDrain, ScriptedRecords};
         let (mut state, mut tracker, mut tracer) = trace_fixture();
         let reports = [metrics::SlotReport {
@@ -4067,6 +4012,10 @@ mod tests {
                 event_type: p11scope_ebpf_common::event_type::FORK,
                 ..Default::default()
             },
+            p11scope_ebpf_common::Event {
+                event_type: p11scope_ebpf_common::event_type::FORK_INTO_CGROUP,
+                ..Default::default()
+            },
             call_event(),
             call_event(),
         ];
@@ -4077,7 +4026,11 @@ mod tests {
             &mut remaining,
             &mut state,
             &mut tracker,
-            &Scope::Pid(std::process::id()),
+            &Scope::Cgroup {
+                id: 0,
+                path: PathBuf::from("/"),
+                dir: Arc::new(File::open("/").unwrap()),
+            },
             &mut gaps,
             &mut tracer,
             &mut stdout,
@@ -4471,41 +4424,10 @@ mod tests {
     }
 
     #[test]
-    fn missing_pid_fork_boundary_is_partial_not_zero() {
-        let (engine, _) = crate::discovery::engine::tests::selection_output_engines();
-        let state = semantics::State::new(engine.plan());
+    fn pid_scope_process_creation_tracking_is_not_required_or_counted() {
         let (pid_descendant_gaps, capture_tracking_degraded) =
             initial_tracking_evidence(&Scope::Pid(41), true, false);
-        let evidence = evidence_for(
-            &engine,
-            engine.capture_facts(),
-            0,
-            &[],
-            &[],
-            metrics::KernelEvidence::default(),
-            process::TrackingEvidence::default(),
-            0,
-            &state,
-            false,
-            true,
-            None,
-            pid_descendant_gaps,
-            capture_tracking_degraded,
-        );
-
-        assert_eq!(evidence.pid_descendant_gaps, 1);
-        assert_eq!(evidence.completeness, "PARTIAL");
-        assert_eq!(
-            render::versioned_evidence(&evidence)["pid_descendant_gaps"],
-            1
-        );
-
-        let cgroup = Scope::Cgroup {
-            id: 1,
-            path: "/".into(),
-            dir: std::sync::Arc::new(std::fs::File::open("/").unwrap()),
-        };
-        assert_eq!(initial_tracking_evidence(&cgroup, true, false), (1, true));
+        assert_eq!((pid_descendant_gaps, capture_tracking_degraded), (0, false));
     }
 
     #[test]
@@ -4518,31 +4440,6 @@ mod tests {
 
         assert_eq!(state.first_signal(), Some(libc::SIGTERM));
         assert_eq!(state.sigint_deliveries(), 2);
-    }
-
-    #[test]
-    fn fork_only_traffic_does_not_consume_process_tracking_budget() {
-        let plan = crate::plan::AttachPlan::from_slots(vec![]);
-        let mut state = semantics::State::new(&plan);
-        let mut tracker = process::Tracker::with_limits(0, 1);
-        let mut gaps = 0;
-        for parent in 100_000..100_100u32 {
-            let event = p11scope_ebpf_common::Event {
-                event_type: p11scope_ebpf_common::event_type::FORK,
-                pid_tgid: u64::from(parent) << 32,
-                session: u64::from(parent + 1),
-                ..Default::default()
-            };
-            assert!(observe_fork(
-                &mut tracker,
-                &mut state,
-                &Scope::Pid(1),
-                &mut gaps,
-                &event,
-            ));
-        }
-        assert_eq!(tracker.evidence(), process::TrackingEvidence::default());
-        assert_eq!(gaps, 0, "unrelated fork records cannot fabricate gaps");
     }
 
     /// Finding nothing is not an error, so the only thing that keeps the operator

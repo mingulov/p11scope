@@ -241,16 +241,16 @@ The 2026-09-02 independent Task-3 pre-mortem adds these execution invariants:
 - [x] GREEN: implement `SelectionClaimKey -> AttachKey` reference ownership and
   source-local count-only authorization through the existing
   preflight/apply/rollback transaction. Never attach a duplicate offset.
-- [ ] RED: `owned_run_selection_coverage` proves the private coverage reducer:
+- [x] RED: `owned_run_selection_coverage` proves the private coverage reducer:
   an exact provider prearmed behind the owned-child barrier observes a
   constructor call and classifies a silent completed run as `absent_covered`;
   non-prearmed `run` and `--pid` classify as `absent_uncovered`; normal
   finalization preserves the closed coverage interval. Task 4 alone proves the
   corresponding public JSON.
-- [ ] GREEN: preattach entry+return to exact freshly pinned provider exports
+- [x] GREEN: preattach entry+return to exact freshly pinned provider exports
   before `OwnedChild::release`, then accept proof only after the eventual
   mapping agrees on device, inode, view, and generation.
-- [ ] RED: `selection_ring_loss_invalidates_silent_coverage` proves nonzero
+- [x] RED: `selection_ring_loss_invalidates_silent_coverage` proves nonzero
   discovery-ring loss makes affected silent bindings uncovered and the verdict
   `PARTIAL`; it never becomes an empty/covered result.
 - [x] RED: `selection_semantic_key_reuses_same_table_and_refuses_changed_targets`
@@ -263,20 +263,21 @@ The 2026-09-02 independent Task-3 pre-mortem adds these execution invariants:
 - [x] RED: `selection_table_capacity_refusal_mutates_nothing`
   (landed in `a182f93`) proves a table that cannot fit contributes no prefix,
   link, or slot index.
-- [ ] RED: `manifest_selection_tables_enter_the_attach_transaction` proves a
+- [x] RED: `manifest_selection_tables_enter_the_attach_transaction` proves a
   reachable manifest-v5 selection table creates source-local count-only claims,
   `semantic_authorized=false`, and `PARTIAL`; an inventory target at the same
   physical key shares one slot, and rollback/retirement remove only the
   applicable owner without mutating inventory.
-- [ ] GREEN: lower only reachable, structurally validated manifest-v5 tables
+- [x] GREEN: lower only reachable, structurally validated manifest-v5 tables
   through the existing candidate preflight/apply/rollback path and the same
   `SelectionClaimKey -> AttachKey` reference ownership as live selection. Add
   no manifest-only attach path.
-- [ ] Focused checks:
+- [x] Focused checks:
   `cargo +1.88 test --locked --lib c_get_interface_selection`,
-  `cargo +1.88 test --locked --test live_discovery selection`, and
+  `cargo +1.88 test --locked --lib manifest_selection`, and
   `cargo +1.88 test --locked --lib owned_run_selection_coverage`;
-  then four canonical gates; commit.
+  then four canonical gates; review clean after three scoped fix rounds at
+  `64b7790` (731 main-library tests plus every integration/crate target); commit.
 
 Commit: `feat: reduce interface selection with exact lifecycle authority`
 

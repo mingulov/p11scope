@@ -1971,6 +1971,7 @@ fn capture_profile(
                 malformed_records,
                 &state,
                 engine.pinned().provider_changed(),
+                profile,
                 owned.as_deref(),
             );
             let frame = render::live(
@@ -2034,6 +2035,7 @@ fn capture_profile(
         malformed_records,
         &state,
         engine.pinned().provider_changed(),
+        profile,
         owned.as_deref(),
     );
     ev.mark_terminal_drain_unproven();
@@ -2268,6 +2270,7 @@ fn capture_trace(
         malformed_records,
         &state,
         engine.pinned().provider_changed(),
+        true,
         owned.as_deref(),
     );
     evidence.mark_terminal_drain_unproven();
@@ -2502,6 +2505,7 @@ fn evidence_for(
     malformed_records: u64,
     state: &semantics::State,
     provider_changed: bool,
+    include_selection: bool,
     owned: Option<&Owned>,
 ) -> render::Evidence {
     let semantic = state.semantic_evidence();
@@ -2603,8 +2607,16 @@ fn evidence_for(
         discovery_read_failures,
         discovery_truncated,
         loader_discovery: facts.loader_discovery(),
-        interface_selection: facts.interface_selection().clone(),
-        attach_mechanisms: attach_mechanisms(session.attached_probes()),
+        interface_selection: if include_selection {
+            engine.interface_selection()
+        } else {
+            Default::default()
+        },
+        attach_mechanisms: if include_selection {
+            attach_mechanisms(session.attached_probes())
+        } else {
+            Vec::new()
+        },
         pid_descendant_gaps: 0,
         multi_rebuild_gaps: 0,
         // Design §5.7: a live-learned attach key is protected only inside a
@@ -2621,7 +2633,7 @@ fn evidence_for(
         discovery: facts.discovery().clone(),
         completeness: "UNKNOWN",
     };
-    ev.verdict();
+    ev.verdict_with_selection(include_selection);
     ev
 }
 

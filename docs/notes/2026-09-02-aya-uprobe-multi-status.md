@@ -2,7 +2,7 @@
 
 **Checked:** 2026-09-02  
 **Aya master:** `03bee7dca209651c2f8a951d362665294c0144c9`  
-**Selected PR head:** `8d16163ca436e3030cbd45a0f331c62cd6c059fa`
+**Evaluated PR head:** `8d16163ca436e3030cbd45a0f331c62cd6c059fa`
 
 **p11scope constraint:** Rust 1.88, Linux 5.15 per-offset fallback
 
@@ -13,12 +13,13 @@ multi-uprobe program sections, load-time `BPF_TRACE_UPROBE_MULTI`, batched
 locations/cookies, PID scopes, link ownership, and legacy multi-point fallback.
 The latest released userspace crate is still Aya 0.14.0 and predates that work.
 
-The practical p11scope decision is to pin a locally reviewed exact snapshot of
-upstream-unreviewed open [PR #1696](https://github.com/aya-rs/aya/pull/1696).
-In addition to master, that head exposes a public probe for the process-scoped
-PID-filter behavior p11scope requires. Early multi-uprobe kernels filtered one
-thread rather than every thread sharing the process address space; using only
-basic link support could therefore miss sibling-thread calls silently.
+W3 defers `uprobe_multi` and stays on released Aya 0.14.0. A future dedicated
+task may evaluate an exact snapshot of upstream-unreviewed open
+[PR #1696](https://github.com/aya-rs/aya/pull/1696), which exposes a public probe
+for the process-scoped PID-filter behavior p11scope requires. Early
+multi-uprobe kernels filtered one thread rather than every thread sharing the
+process address space; using only basic link support could therefore miss
+sibling-thread calls silently.
 
 The alternatives were:
 
@@ -135,9 +136,8 @@ is consumed. No new attach implementation or raw syscall is warranted.
   test those helper results only as success/failure and do not decode the errno,
   so it does not change the W3 plan.
 
-## Recommended W3 decision
+## W3 decision
 
-W3 selected exact open-PR revision
-`8d16163ca436e3030cbd45a0f331c62cd6c059fa`. If later release policy rejects an
-unreleased Git dependency, defer multi attach rather than vendoring Aya or
-reimplementing its loader; never substitute a moving branch.
+W3 selected deferral. Keep the exact PR revision above only as a future
+evaluation reference after suitable Aya support is released; do not vendor
+Aya, reimplement its loader, or substitute a moving branch.

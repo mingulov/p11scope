@@ -63,7 +63,7 @@ fn assert_exact_policy_map_metadata_contract(attach: &str) -> Result<(), String>
         .collect::<String>()
         .replace(",)", ")");
     for expected in [
-        "(\"CONFIG\",map_metadata(MapType::Array,4,8,1,BPF_F_RDONLY_PROG))",
+        "(\"CONFIG\",map_metadata(MapType::Array,4,8,2,BPF_F_RDONLY_PROG))",
         "(\"PID_FILTER\",map_metadata(MapType::Hash,4,8,1_024,BPF_F_RDONLY_PROG))",
         "(\"CGROUP_FILTER\",map_metadata(MapType::CgroupArray,4,4,1,0))",
         "(\"DESCRIPTORS\",map_metadata(MapType::Array,4,18,MAX_DESCRIPTORS,BPF_F_RDONLY_PROG))",
@@ -4675,6 +4675,66 @@ fn descriptor_cookie_and_publication_source_guard_rejects_contract_regressions()
     assert!(
         assert_descriptor_publication_contract(&changed_readback_refusal).is_err(),
         "publication must refuse an inexact descriptor readback"
+    );
+}
+
+#[test]
+fn dynamic_sched_fork_offsets() {
+    let attach = read("src/attach.rs");
+    let common = read("crates/ebpf-common/src/lib.rs");
+    let ebpf = read("crates/ebpf/src/main.rs");
+    let fork = between(
+        &ebpf,
+        "pub fn sched_process_fork(ctx: TracePointContext)",
+        "#[panic_handler]",
+    );
+    assert_eq!(p11scope_ebpf_common::CFG_FORK_OFFSETS, 1);
+    assert_eq!(embedded_map_definitions()["CONFIG"][3], 2);
+
+    for marker in ["CFG_FORK_PARENT_OFFSET", "CFG_FORK_CHILD_OFFSET"] {
+        assert!(
+            common.contains(marker),
+            "shared CONFIG contract misses {marker}"
+        );
+    }
+    for marker in [
+        "parse_tracepoint_format",
+        "pack_fork_offsets",
+        "CFG_FORK_OFFSETS",
+    ] {
+        assert!(
+            attach.contains(marker),
+            "CONFIG publication misses {marker}"
+        );
+    }
+    for marker in [
+        ".get(CFG_FORK_OFFSETS)",
+        "CFG_FORK_OFFSETS",
+        "unpack_fork_offsets",
+    ] {
+        assert!(fork.contains(marker), "fork program misses {marker}");
+    }
+    for root in ["/sys/kernel/tracing", "/sys/kernel/debug/tracing"] {
+        assert!(attach.contains(&format!("{root}/events/sched/sched_process_fork/format")));
+    }
+    assert!(attach.contains("read_fork_format_with(|path| std::fs::read_to_string(path))"));
+    assert!(attach.contains("config.set(CFG_FORK_OFFSETS"));
+    assert!(!fork.contains("read_at::<u32>(24)"));
+    assert!(!fork.contains("read_at::<u32>(44)"));
+    assert!(fork.contains(".and_then(unpack_fork_offsets)\n    else {\n        return 0;\n    };"));
+    assert!(
+        attach.find("crate::scope::publish(&mut ebpf").unwrap()
+            < attach.find("publish_fork_offsets(&mut ebpf)").unwrap()
+    );
+    assert!(
+        attach.find("publish_fork_offsets(&mut ebpf)").unwrap()
+            < attach.find("freeze_published_maps(&ebpf)").unwrap()
+    );
+    assert!(
+        attach.find("freeze_published_maps(&ebpf)").unwrap()
+            < attach
+                .find(".attach(\"sched\", \"sched_process_fork\")")
+                .unwrap()
     );
 }
 

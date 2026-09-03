@@ -23,6 +23,7 @@ use p11scope_ebpf_common::{
     return_allows_mechanism, shape, valid_config, valid_loader_cookie, CallStart, DiscoveryRecord,
     Event, FunctionNameKey, PauseKey, RvKey, SlotSemantics, SlotStats, StartKey, StartState,
     StateKey, STATE_DOMAIN_EXPORT, STATE_DOMAIN_SELECTION, ARG_NONE, CFG_FLAGS,
+    CFG_FORK_OFFSETS,
     COALESCED_NO_HELPER_RC, DISCOVERY_BYTES,
     DISCOVERY_COUNTER_CELLS,
     DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES, DISCOVERY_COUNTER_EXPORT_STATE_FAILURES,
@@ -43,7 +44,7 @@ use p11scope_ebpf_common::{
     FUNCTION_NAME_MAX_BYTES, FUNCTION_NONE, LOADER_STATE_PRESENT, MAX_ATTRS, MAX_DESCRIPTORS,
     MAX_MECH_SHAPES, MAX_SLOTS, MECH_NONE, PAUSE_ARMED, PAUSE_REQUESTED, RING_BYTES, RV_ENTRIES,
     R_STATE_OFFSET, SESSION_NONE, START_ENTRIES, TAIL_CALLS_INTERFACE_WORKER_SLOT,
-    USER_TYPE_NONE,
+    USER_TYPE_NONE, unpack_fork_offsets,
 };
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 use p11scope_ebpf_common::{
@@ -52,7 +53,7 @@ use p11scope_ebpf_common::{
 };
 
 #[map]
-static CONFIG: Array<u64> = Array::with_max_entries(1, BPF_F_RDONLY_PROG);
+static CONFIG: Array<u64> = Array::with_max_entries(2, BPF_F_RDONLY_PROG);
 
 #[map]
 static PID_FILTER: HashMap<u32, u64> = HashMap::with_max_entries(1024, BPF_F_RDONLY_PROG);
@@ -1949,14 +1950,19 @@ pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
     if flags & FLAG_POLICY_AGGREGATE != 0 {
         return 0;
     }
-    // Linux sched_process_fork format: common fields (8), parent_comm
-    // (16), parent_pid (4), child_comm (16), child_pid (4).
-    // SAFETY: offsets are fixed by the sched_process_fork tracepoint ABI
-    // described above and each read stays within that record.
-    let Ok(parent) = (unsafe { ctx.read_at::<u32>(24) }) else {
+    let Some((parent_offset, child_offset)) = CONFIG
+        .get(CFG_FORK_OFFSETS)
+        .copied()
+        .and_then(unpack_fork_offsets)
+    else {
         return 0;
     };
-    let Ok(child) = (unsafe { ctx.read_at::<u32>(44) }) else {
+    // SAFETY: userspace parsed and checked both offsets from this tracepoint's
+    // live tracefs format before freezing CONFIG and attaching this program.
+    let Ok(parent) = (unsafe { ctx.read_at::<u32>(parent_offset) }) else {
+        return 0;
+    };
+    let Ok(child) = (unsafe { ctx.read_at::<u32>(child_offset) }) else {
         return 0;
     };
     let ev = Event {

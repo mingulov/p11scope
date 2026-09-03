@@ -10,15 +10,12 @@ table (including stripped providers with no `C_*` symbols), attaches probes by
 file offset, and produces a versioned `observed-profile.json` for migration
 assessment and incident diagnostics.
 
-> **Status: unreleased; the local MVP candidate is runtime-qualified.**
-> Memory-scan discovery, `inspect`, `doctor`, public `run`, multi-module
-> capture, schema v2, and owned-child live discovery are implemented. The
-> frozen candidate passed all six semantic/privacy/cleanup rows on Ubuntu
-> 22.04 kernel 5.15 and Ubuntu 24.04 kernel 6.8, and its merged `main` tree
-> passes the four locked workspace gates. The exact-candidate static security
-> review is complete and found one high, six medium, and two low issues; the
-> default `sudo p11scope run` child-authority finding blocks a public release.
-> Exact-tip CI, complete packaging, remediation, publication, and release
+> **Status: unreleased; the current tree is a W3 engineering candidate.**
+> Memory-scan discovery, `C_GetInterface`, `inspect`, `doctor`, public `run`,
+> multi-module capture, schema v3, and owned-child live discovery are
+> implemented. A previous frozen MVP passed the Ubuntu 22.04/5.15 and Ubuntu
+> 24.04/6.8 runtime matrix, but those results do not qualify the W3 tip. Fresh
+> exact-tip runtime qualification, CI, packaging, publication, and release
 > remain pending.
 
 Function-table support is cumulative: legacy PKCS #11 2.00, every 2.01–2.40

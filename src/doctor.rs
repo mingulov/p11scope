@@ -217,7 +217,7 @@ fn attach_preflight_checks(pid: Option<u32>, cgroup: Option<&Path>) -> Vec<Check
     let scope = match (pid, cgroup) {
         (None, None) => not_applicable("scope preflight", "no requested scope"),
         (pid, cgroup) => {
-            let pid_scope = pid.map_or(true, |pid| {
+            let pid_scope = pid.is_none_or(|pid| {
                 if pid == self_pid {
                     host_scope
                 } else {

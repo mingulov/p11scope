@@ -6,6 +6,7 @@ use crate::discovery::scan::Skipped;
 use crate::kinds;
 use crate::metrics::{SlotReport, percentile_ns};
 use crate::plan::{ModuleId, TableSummary};
+use p11scope_manifest::manifest::{SelectionAuthority, SelectionRequest};
 use serde::Serialize;
 use std::time::Duration;
 
@@ -110,6 +111,7 @@ pub struct CaptureFacts {
     pub(crate) discovery_state_failures: u64,
     pub(crate) discovery_read_failures: u64,
     pub(crate) discovery_truncated: u64,
+    pub(crate) interface_selection: InterfaceSelection,
 }
 
 impl CaptureFacts {
@@ -146,6 +148,10 @@ impl CaptureFacts {
         ]
     }
 
+    pub fn interface_selection(&self) -> &InterfaceSelection {
+        &self.interface_selection
+    }
+
     /// The one live-heading policy: every ordinary heading names the providers
     /// this capture accepted over its lifetime, never the currently active
     /// topology. A target that exited keeps its provider in the heading, so
@@ -160,6 +166,71 @@ impl CaptureFacts {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct InterfaceSelection {
+    pub providers: Vec<SelectionProvider>,
+    pub standard_exports: Vec<StandardExport>,
+    pub inventory_surfaces: Vec<SelectionSurface>,
+    pub tuples: Vec<SelectionTuple>,
+    pub selection_truncated: bool,
+}
+
+impl InterfaceSelection {
+    fn complete(&self) -> bool {
+        !self.selection_truncated
+            && self
+                .providers
+                .iter()
+                .all(|provider| matches!(provider.coverage, "observed" | "absent_covered"))
+            && self
+                .standard_exports
+                .iter()
+                .all(|export| matches!(export.status, "present" | "legacy_absent"))
+            && self
+                .tuples
+                .iter()
+                .all(|tuple| tuple.authority != SelectionAuthority::SelectionCountOnly)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct SelectionProvider {
+    pub module: u32,
+    pub coverage: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct StandardExport {
+    pub module: u32,
+    pub status: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct SelectionSurface {
+    pub module: u32,
+    pub ordinal: u16,
+    pub kind: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct SelectionMatch {
+    pub surface: u16,
+    pub name_agrees: bool,
+    pub version_agrees: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct SelectionTuple {
+    pub module: u32,
+    pub request: SelectionRequest,
+    pub rv: u64,
+    pub result: Option<SelectionRequest>,
+    pub table_match: bool,
+    pub inventory_matches: Vec<SelectionMatch>,
+    pub authority: SelectionAuthority,
+    pub count: u64,
 }
 
 /// What discovery learned, carried into evidence (spec §4.8). Flattened into
@@ -414,6 +485,14 @@ pub struct Evidence {
     pub discovery_truncated: u64,
     /// The always-present finite live-loader aggregate (design §9.2).
     pub loader_discovery: LoaderDiscovery,
+    #[serde(skip)]
+    pub interface_selection: InterfaceSelection,
+    #[serde(skip)]
+    pub attach_mechanisms: Vec<&'static str>,
+    #[serde(skip)]
+    pub pid_descendant_gaps: u64,
+    #[serde(skip)]
+    pub multi_rebuild_gaps: u64,
     /// Modules whose first required attach key was learned from a live loader
     /// or export event outside a confirmed pause owner (design §5.7). Design
     /// §5.7 explicitly forbids a public field for this, so it follows the
@@ -562,6 +641,9 @@ impl Evidence {
             && self.discovery_truncated == 0
             && self.pause_partial == 0
             && self.loader_discovery.complete()
+            && self.interface_selection.complete()
+            && self.pid_descendant_gaps == 0
+            && self.multi_rebuild_gaps == 0
         {
             "COMPLETE"
         } else {
@@ -963,6 +1045,22 @@ pub fn json(reports: &[SlotReport], ev: &Evidence, capture: &CaptureMeta<'_>) ->
     })
 }
 
+pub(crate) fn versioned_evidence(ev: &Evidence) -> serde_json::Value {
+    let mut evidence = serde_json::to_value(ev).expect("Evidence serializes");
+    let object = evidence.as_object_mut().expect("Evidence is an object");
+    object.insert(
+        "interface_selection".into(),
+        serde_json::to_value(&ev.interface_selection).expect("selection evidence serializes"),
+    );
+    object.insert(
+        "attach_mechanisms".into(),
+        serde_json::json!(ev.attach_mechanisms),
+    );
+    object.insert("pid_descendant_gaps".into(), ev.pid_descendant_gaps.into());
+    object.insert("multi_rebuild_gaps".into(), ev.multi_rebuild_gaps.into());
+    evidence
+}
+
 /// One mechanism id's aggregate stats, event-derived (see module docs):
 /// the aggregate maps have no per-mechanism breakdown, only the ring
 /// buffer / semantic state machine does.
@@ -1299,14 +1397,14 @@ pub fn profile_json(
     };
 
     serde_json::json!({
-        "schema": "pkcs11-scope/observed-profile/v2",
+        "schema": "pkcs11-scope/observed-profile/v3",
         "capture": {
             "start": capture.started, "end": capture.ended, "mode": "profile",
             "privacy_mode": capture.policy.privacy_mode(),
             "kernel": capture.kernel,
             "modules": capture_modules(ev),
         },
-        "evidence": ev,
+        "evidence": versioned_evidence(ev),
         "functions": functions_out(reports, &ev.discovery.modules),
         "mechanisms": mechanisms,
         "sessions": sessions_out,
@@ -1428,6 +1526,10 @@ mod tests {
             discovery_read_failures: 0,
             discovery_truncated: 0,
             loader_discovery: LoaderDiscovery::default(),
+            interface_selection: InterfaceSelection::default(),
+            attach_mechanisms: vec![],
+            pid_descendant_gaps: 0,
+            multi_rebuild_gaps: 0,
             unprotected_live_windows: 0,
             module_unresolved_slots: 0,
             provider_changed: false,
@@ -1436,6 +1538,49 @@ mod tests {
                 ..DiscoveryEvidence::default()
             },
             completeness: "UNKNOWN",
+        }
+    }
+
+    #[test]
+    fn profile_v3_selection_contract_is_exact() {
+        let ev = evidence();
+        let profile = profile_json(
+            &reports_fixture(),
+            &ev,
+            &state_fixture(),
+            &capture_fixture(),
+        );
+
+        assert_eq!(profile["schema"], "pkcs11-scope/observed-profile/v3");
+        assert_eq!(
+            profile["evidence"]["interface_selection"],
+            serde_json::json!({
+                "providers": [],
+                "standard_exports": [],
+                "inventory_surfaces": [],
+                "tuples": [],
+                "selection_truncated": false,
+            })
+        );
+        assert_eq!(
+            profile["evidence"]["attach_mechanisms"],
+            serde_json::json!([])
+        );
+        assert_eq!(profile["evidence"]["pid_descendant_gaps"], 0);
+        assert_eq!(profile["evidence"]["multi_rebuild_gaps"], 0);
+
+        let metrics = json(&reports_fixture(), &ev, &capture_fixture());
+        assert_eq!(
+            metrics["schema"],
+            "pkcs11-scope/observed-profile/v2-metrics"
+        );
+        for field in [
+            "interface_selection",
+            "attach_mechanisms",
+            "pid_descendant_gaps",
+            "multi_rebuild_gaps",
+        ] {
+            assert!(metrics["evidence"].get(field).is_none(), "{field}");
         }
     }
 
@@ -1961,7 +2106,7 @@ mod tests {
         );
         let rendered = profile.to_string();
         assert!(!rendered.contains("/private/"));
-        assert!(!rendered.contains("pid"));
+        assert!(!rendered.contains("\"pid\":"));
     }
 
     #[test]
@@ -2002,14 +2147,14 @@ mod tests {
     }
 
     #[test]
-    fn v2_json_publishes_modules_and_per_function_module_identity() {
+    fn v3_json_publishes_modules_and_per_function_module_identity() {
         let v = profile_json(
             &reports_fixture(),
             &evidence(),
             &state_fixture(),
             &capture_fixture(),
         );
-        assert_eq!(v["schema"], "pkcs11-scope/observed-profile/v2");
+        assert_eq!(v["schema"], "pkcs11-scope/observed-profile/v3");
         assert_eq!(v["capture"]["modules"][0]["path"], "/opt/p11.so");
         assert_eq!(
             v["capture"]["modules"][0]["sha256"].as_str().unwrap().len(),
@@ -2376,7 +2521,7 @@ mod tests {
         };
         let v = profile_json(&[], &ev, &state, &capture);
 
-        assert_eq!(v["schema"], "pkcs11-scope/observed-profile/v2");
+        assert_eq!(v["schema"], "pkcs11-scope/observed-profile/v3");
         assert_eq!(v["capture"]["privacy_mode"], "allowlisted");
         for section in [
             "capture",
@@ -3297,6 +3442,41 @@ mod tests {
             }),
             ("identity ambiguity", |ev| ev.discovery.module_ambiguous = 1),
             ("unresolved owner", |ev| ev.module_unresolved_slots = 1),
+            ("selection truncation", |ev| {
+                ev.interface_selection.selection_truncated = true
+            }),
+            ("selection uncovered", |ev| {
+                ev.interface_selection.providers.push(SelectionProvider {
+                    module: 0,
+                    coverage: "absent_uncovered",
+                })
+            }),
+            ("required standard export absent", |ev| {
+                ev.interface_selection
+                    .standard_exports
+                    .push(StandardExport {
+                        module: 0,
+                        status: "required_absent",
+                    })
+            }),
+            ("selection count-only authority", |ev| {
+                ev.interface_selection.tuples.push(SelectionTuple {
+                    module: 0,
+                    request: SelectionRequest {
+                        name: p11scope_manifest::manifest::SelectionNameClass::ExactStandard,
+                        version: p11scope_manifest::manifest::SelectionVersionClass::V3_0,
+                        flags: 0,
+                    },
+                    rv: 0,
+                    result: None,
+                    table_match: false,
+                    inventory_matches: vec![],
+                    authority: SelectionAuthority::SelectionCountOnly,
+                    count: 1,
+                })
+            }),
+            ("pid descendant gap", |ev| ev.pid_descendant_gaps = 1),
+            ("multi rebuild gap", |ev| ev.multi_rebuild_gaps = 1),
             ("changed provider", |ev| ev.provider_changed = true),
             ("zero modules", |ev| ev.discovery.modules.clear()),
         ];

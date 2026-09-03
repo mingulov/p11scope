@@ -179,9 +179,7 @@ pub fn capture_line(policy: CapturePolicy) -> String {
 /// Detaching perf links does not prove already-running callbacks quiesced, so
 /// this record must remain PARTIAL and must not claim a proven final drain.
 pub fn evidence_line(ev: &render::Evidence, policy: CapturePolicy, truncated: bool) -> String {
-    let encoded = serde_json::to_string(ev).expect("Evidence serializes");
-    let mut value: serde_json::Value =
-        serde_json::from_str(&encoded).expect("serialized Evidence is valid JSON");
+    let mut value = render::versioned_evidence(ev);
     let object = value
         .as_object_mut()
         .expect("Evidence serializes as an object");
@@ -491,6 +489,10 @@ mod tests {
             discovery_read_failures: 0,
             discovery_truncated: 0,
             loader_discovery: render::LoaderDiscovery::default(),
+            interface_selection: render::InterfaceSelection::default(),
+            attach_mechanisms: vec![],
+            pid_descendant_gaps: 0,
+            multi_rebuild_gaps: 0,
             unprotected_live_windows: 0,
             module_unresolved_slots: 0,
             provider_changed: false,
@@ -525,6 +527,26 @@ mod tests {
         }
         assert_eq!(value["modules_skipped"], serde_json::json!([]));
         assert_eq!(value["scan_unavailable"], serde_json::Value::Null);
+        assert_eq!(
+            value["interface_selection"]["tuples"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn selection_evidence_is_terminal_only() {
+        for line in [
+            capture_line(CapturePolicy::Allowlisted),
+            lost_line(1).unwrap(),
+            truncated_line(1),
+        ] {
+            assert!(!line.contains("interface_selection"));
+            assert!(!line.contains("selection_truncated"));
+        }
+        assert!(
+            evidence_line(&empty_evidence(), CapturePolicy::Allowlisted, false)
+                .contains("\"interface_selection\"")
+        );
     }
 
     #[test]

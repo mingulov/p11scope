@@ -35,8 +35,8 @@ use p11scope_ebpf_common::{
 };
 use p11scope_manifest::elf::ElfSnapshot;
 use p11scope_manifest::manifest::{
-    Acquisition, Manifest, Resolution, SCHEMA, SelectionAuthority, SelectionNameClass,
-    SelectionRequest, SelectionVersionClass, WalkOutcome,
+    Acquisition, Manifest, Resolution, SCHEMA, SelectionAcquisition, SelectionAuthority,
+    SelectionNameClass, SelectionRequest, SelectionVersionClass, WalkOutcome,
 };
 use p11scope_manifest::maps::{Device, MapEntry, MapIndex, MappedPath, ObjectKey, Resolved};
 use std::collections::{BTreeMap, BTreeSet};
@@ -286,6 +286,56 @@ struct CaptureHistory {
     selection_surfaces: BTreeSet<InventorySurfaceKey>,
     selections: Vec<LiveSelectionTuple>,
     selection_truncated: bool,
+    standard_exports: BTreeMap<plan::ModuleId, BTreeSet<StandardExportFact>>,
+    standard_requirements: BTreeMap<plan::ModuleId, BTreeSet<StandardRequirementFact>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum StandardExportFact {
+    Present,
+    Absent,
+    Outside,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum StandardRequirementFact {
+    Legacy,
+    V3,
+}
+
+fn standard_export_status(
+    exports: Option<&BTreeSet<StandardExportFact>>,
+    requirements: Option<&BTreeSet<StandardRequirementFact>>,
+) -> &'static str {
+    match (exports, requirements) {
+        (Some(exports), _)
+            if exports.len() == 1 && exports.contains(&StandardExportFact::Present) =>
+        {
+            "present"
+        }
+        (Some(exports), _)
+            if exports.len() == 1 && exports.contains(&StandardExportFact::Outside) =>
+        {
+            "outside_module"
+        }
+        (Some(exports), Some(requirements))
+            if exports.len() == 1
+                && exports.contains(&StandardExportFact::Absent)
+                && requirements.len() == 1
+                && requirements.contains(&StandardRequirementFact::Legacy) =>
+        {
+            "legacy_absent"
+        }
+        (Some(exports), Some(requirements))
+            if exports.len() == 1
+                && exports.contains(&StandardExportFact::Absent)
+                && requirements.len() == 1
+                && requirements.contains(&StandardRequirementFact::V3) =>
+        {
+            "required_absent"
+        }
+        _ => "unresolved",
+    }
 }
 
 const MAX_LIVE_SELECTION_TUPLES: usize = 16;
@@ -358,6 +408,7 @@ struct LiveSelectionTuple {
     rv: u64,
     result: Option<SelectionRequest>,
     inventory_matches: Vec<LiveInventoryMatch>,
+    authority: SelectionAuthority,
     count: u64,
 }
 
@@ -875,6 +926,17 @@ fn manifest_function_skip(
 }
 
 impl CaptureFacts {
+    fn can_record_selection(&self, tuple: &LiveSelectionTuple) -> bool {
+        let selections = &self.visible_history().selections;
+        selections.iter().any(|known| {
+            known.module == tuple.module
+                && known.request == tuple.request
+                && known.rv == tuple.rv
+                && known.result == tuple.result
+                && known.inventory_matches == tuple.inventory_matches
+        }) || selections.len() < MAX_LIVE_SELECTION_TUPLES
+    }
+
     fn begin_stage(&mut self) -> Result<()> {
         if self.staged.is_some() {
             bail!("capture-fact transaction is already active");
@@ -925,13 +987,10 @@ impl CaptureFacts {
         });
         if let Some(existing) = existing {
             existing.count = existing.count.saturating_add(1);
-        } else if history
-            .selections
-            .iter()
-            .filter(|known| known.module == tuple.module)
-            .count()
-            < MAX_LIVE_SELECTION_TUPLES
-        {
+            if tuple.authority != SelectionAuthority::None {
+                existing.authority = tuple.authority;
+            }
+        } else if history.selections.len() < MAX_LIVE_SELECTION_TUPLES {
             tuple.count = 1;
             history.selections.push(tuple);
         } else {
@@ -1172,6 +1231,32 @@ impl CaptureFacts {
             let provider = pinned
                 .owned_timing_key(module.object)
                 .ok_or_else(|| anyhow!("scanned provider has no exact opened identity"))?;
+            history.standard_exports.entry(owner).or_default().insert(
+                if module
+                    .scanned
+                    .exports
+                    .iter()
+                    .any(|name| name == "C_GetInterface")
+                {
+                    StandardExportFact::Present
+                } else {
+                    StandardExportFact::Absent
+                },
+            );
+            for table in &module.scanned.tables {
+                let requirement = match table.version.0 {
+                    2 => Some(StandardRequirementFact::Legacy),
+                    3.. => Some(StandardRequirementFact::V3),
+                    _ => None,
+                };
+                if let Some(requirement) = requirement {
+                    history
+                        .standard_requirements
+                        .entry(owner)
+                        .or_default()
+                        .insert(requirement);
+                }
+            }
             let mut targets = BTreeMap::new();
             let mut skips = BTreeMap::new();
             let mut surfaces = BTreeMap::new();
@@ -1338,6 +1423,29 @@ impl CaptureFacts {
                 )
             })?;
             let owner = self.module_id_for_object(pinned, object)?;
+            let export = match manifest.selection_evidence.acquisition {
+                SelectionAcquisition::Queried => StandardExportFact::Present,
+                SelectionAcquisition::ExportAbsent => StandardExportFact::Absent,
+                SelectionAcquisition::ExportOutsideModule => StandardExportFact::Outside,
+            };
+            history
+                .standard_exports
+                .entry(owner)
+                .or_default()
+                .insert(export);
+            for surface in &manifest.surfaces {
+                if let Some(requirement) = surface.version.and_then(|version| match version.major {
+                    2 => Some(StandardRequirementFact::Legacy),
+                    3.. => Some(StandardRequirementFact::V3),
+                    _ => None,
+                }) {
+                    history
+                        .standard_requirements
+                        .entry(owner)
+                        .or_default()
+                        .insert(requirement);
+                }
+            }
             for (surface_index, surface) in manifest.surfaces.iter().enumerate() {
                 let surface_key = SurfaceOccurrence::Manifest {
                     module: owner,
@@ -5462,6 +5570,119 @@ impl Engine {
                 .saturating_add(self.malformed_discovery)
                 .saturating_add(self.loader_registry.discovery_truncated())
                 .saturating_add(self.loader_registry.context_failures()),
+            interface_selection: self.interface_selection(),
+        }
+    }
+
+    fn interface_selection(&self) -> render::InterfaceSelection {
+        let history = self.capture_facts.visible_history();
+        let mut surface_indices = BTreeMap::new();
+        let mut module_ordinals = BTreeMap::<plan::ModuleId, u16>::new();
+        let mut inventory_surfaces = Vec::new();
+        let mut surfaces: Vec<_> = history
+            .selection_surfaces
+            .iter()
+            .filter_map(|surface| {
+                self.capture_facts
+                    .module_ids
+                    .get(&surface.base.provider)
+                    .copied()
+                    .map(|module| (module, surface))
+            })
+            .collect();
+        surfaces.sort();
+        for (module, surface) in surfaces {
+            let ordinal = module_ordinals.entry(module).or_default();
+            let Ok(index) = u16::try_from(inventory_surfaces.len()) else {
+                break;
+            };
+            surface_indices.insert(surface.clone(), index);
+            inventory_surfaces.push(render::SelectionSurface {
+                module: module.0,
+                ordinal: *ordinal,
+                kind: match surface.base.kind {
+                    InventorySurfaceKind::Legacy => "legacy",
+                    InventorySurfaceKind::Interface => "interface",
+                },
+            });
+            *ordinal = ordinal.saturating_add(1);
+        }
+
+        let mut providers: Vec<_> = self
+            .selection_bindings
+            .values()
+            .map(|binding| binding.provider)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter_map(|module| {
+                self.selection_coverage(module)
+                    .map(|coverage| render::SelectionProvider {
+                        module: module.0,
+                        coverage: match coverage {
+                            SelectionCoverageVerdict::Observed => "observed",
+                            SelectionCoverageVerdict::ObservedUncovered => "observed_uncovered",
+                            SelectionCoverageVerdict::AbsentCovered => "absent_covered",
+                            SelectionCoverageVerdict::AbsentUncovered => "absent_uncovered",
+                        },
+                    })
+            })
+            .collect();
+        providers.sort_by_key(|provider| provider.module);
+
+        let mut standard_exports = Vec::new();
+        for module in history.modules.keys() {
+            let exports = history.standard_exports.get(module);
+            let requirements = history.standard_requirements.get(module);
+            let status = standard_export_status(exports, requirements);
+            standard_exports.push(render::StandardExport {
+                module: module.0,
+                status,
+            });
+        }
+
+        let mut tuples: Vec<_> = history
+            .selections
+            .iter()
+            .map(|tuple| {
+                let inventory_matches: Vec<_> = tuple
+                    .inventory_matches
+                    .iter()
+                    .filter_map(|matched| {
+                        surface_indices.get(&matched.surface).map(|surface| {
+                            render::SelectionMatch {
+                                surface: *surface,
+                                name_agrees: matched.name_agrees,
+                                version_agrees: matched.version_agrees,
+                            }
+                        })
+                    })
+                    .collect();
+                let lost_inventory_authority = tuple.authority == SelectionAuthority::Inventory
+                    && inventory_matches.is_empty();
+                render::SelectionTuple {
+                    module: tuple.module.0,
+                    request: tuple.request,
+                    rv: tuple.rv,
+                    result: tuple.result,
+                    table_match: !inventory_matches.is_empty(),
+                    inventory_matches,
+                    authority: if lost_inventory_authority {
+                        SelectionAuthority::None
+                    } else {
+                        tuple.authority
+                    },
+                    count: tuple.count,
+                }
+            })
+            .collect();
+        tuples.sort_by_key(|tuple| serde_json::to_string(tuple).unwrap_or_default());
+
+        render::InterfaceSelection {
+            providers,
+            standard_exports,
+            inventory_surfaces,
+            tuples,
+            selection_truncated: history.selection_truncated,
         }
     }
 
@@ -7856,26 +8077,32 @@ impl Engine {
             }
         }
 
-        let selection_became_truncated = self.capture_facts.record_selection(
-            LiveSelectionTuple {
-                module,
-                request,
-                rv: record.return_rv,
-                result,
-                inventory_matches: inventory_matches.clone(),
-                count: 1,
+        let mut tuple = LiveSelectionTuple {
+            module,
+            request,
+            rv: record.return_rv,
+            result,
+            inventory_matches: inventory_matches.clone(),
+            authority: if !inventory_matches.is_empty()
+                && !read_loss
+                && !assessment_loss
+                && result.as_ref().is_some_and(|result| {
+                    readable_name(result.name) && readable_version(result.version)
+                }) {
+                SelectionAuthority::Inventory
+            } else {
+                SelectionAuthority::None
             },
-            matches_truncated,
-        );
-        if selection_became_truncated {
-            self.invalidate_silent_selection_coverage();
-        }
+            count: 1,
+        };
+        let selection_will_truncate =
+            matches_truncated || !self.capture_facts.can_record_selection(&tuple);
         let unmatched = result.is_some() && inventory_matches.is_empty() && !assessment_loss;
         let mut claim_authorized = false;
         if unmatched
             && can_attach
             && queued.terminal_owner.is_none()
-            && !selection_became_truncated
+            && !selection_will_truncate
             && !read_loss
             && !matches_truncated
             && self.counter_snapshot.ring_loss == 0
@@ -7942,6 +8169,15 @@ impl Engine {
                     }
                 }
             }
+        }
+        if claim_authorized {
+            tuple.authority = SelectionAuthority::SelectionCountOnly;
+        }
+        let selection_became_truncated = self
+            .capture_facts
+            .record_selection(tuple, matches_truncated);
+        if selection_became_truncated {
+            self.invalidate_silent_selection_coverage();
         }
         if read_loss {
             self.record_selection_loss_for(
@@ -15026,6 +15262,10 @@ int main(int argc, char **argv) {
             discovery_read_failures: 0,
             discovery_truncated: 0,
             loader_discovery: render::LoaderDiscovery::default(),
+            interface_selection: render::InterfaceSelection::default(),
+            attach_mechanisms: vec![],
+            pid_descendant_gaps: 0,
+            multi_rebuild_gaps: 0,
             unprotected_live_windows: 0,
             module_unresolved_slots: 0,
             provider_changed: false,
@@ -16130,6 +16370,46 @@ int main(int argc, char **argv) {
     }
 
     #[test]
+    fn public_selection_coverage_uses_the_private_four_state_reducer() {
+        let (_fixture, mut engine, _session, binding) = attached_selection_route();
+        let generation = NonZeroU64::new(1).unwrap();
+        let cases = [
+            (false, SelectionCoverageState::Uncovered, "absent_uncovered"),
+            (
+                false,
+                SelectionCoverageState::OwnedClosed(generation),
+                "absent_covered",
+            ),
+            (
+                true,
+                SelectionCoverageState::OwnedClosed(generation),
+                "observed",
+            ),
+        ];
+        for (observed, coverage, expected) in cases {
+            let retained = engine.selection_bindings.get_mut(&binding.id).unwrap();
+            retained.observed = observed;
+            retained.coverage = coverage;
+            let public = engine.interface_selection();
+            assert_eq!(public.providers[0].coverage, expected);
+        }
+        let mut silent = binding;
+        silent.id = binding.id + 1;
+        silent.observed = false;
+        silent.coverage = SelectionCoverageState::Uncovered;
+        engine.selection_bindings.insert(silent.id, silent);
+        engine
+            .selection_bindings
+            .get_mut(&binding.id)
+            .unwrap()
+            .observed = true;
+        assert_eq!(
+            engine.interface_selection().providers[0].coverage,
+            "observed_uncovered"
+        );
+    }
+
+    #[test]
     fn selection_ring_loss_invalidates_silent_coverage() {
         let (_fixture, mut engine, mut session, binding) = attached_selection_route();
         let generation = std::num::NonZeroU64::new(9).unwrap();
@@ -16537,6 +16817,146 @@ int main(int argc, char **argv) {
     }
 
     #[test]
+    fn selection_tuple_bound_is_global_across_modules() {
+        let mut facts = CaptureFacts::default();
+        for index in 0..=MAX_LIVE_SELECTION_TUPLES {
+            facts.record_selection(
+                LiveSelectionTuple {
+                    module: plan::ModuleId(index as u32),
+                    request: SelectionRequest {
+                        name: SelectionNameClass::Null,
+                        version: SelectionVersionClass::Null,
+                        flags: index as u64,
+                    },
+                    rv: 1,
+                    result: None,
+                    inventory_matches: vec![],
+                    authority: SelectionAuthority::None,
+                    count: 1,
+                },
+                false,
+            );
+        }
+        assert_eq!(facts.history.selections.len(), MAX_LIVE_SELECTION_TUPLES);
+        assert!(facts.history.selection_truncated);
+    }
+
+    #[test]
+    fn public_selection_projection_is_sorted_bounded_and_address_free() {
+        let mut engine = Engine::empty();
+        let first = timing_key(1);
+        let second = timing_key(2);
+        engine
+            .capture_facts
+            .module_ids
+            .insert(first.clone(), plan::ModuleId(0));
+        engine
+            .capture_facts
+            .module_ids
+            .insert(second.clone(), plan::ModuleId(1));
+        let surface = |provider, offset, name| InventorySurfaceKey {
+            base: InventorySurfaceBase {
+                provider,
+                table_file_offset: offset,
+                kind: InventorySurfaceKind::Interface,
+                name,
+                version: SelectionVersionClass::V3_0,
+                flags: 0,
+            },
+            duplicate: 0,
+        };
+        let first_surface = surface(
+            first,
+            0xfeed,
+            PrivateSelectionName::Other(b"private-name-canary".to_vec()),
+        );
+        engine
+            .capture_facts
+            .history
+            .selection_surfaces
+            .insert(surface(second, 1, PrivateSelectionName::ExactStandard));
+        engine
+            .capture_facts
+            .history
+            .selection_surfaces
+            .insert(first_surface.clone());
+        engine
+            .capture_facts
+            .history
+            .selections
+            .push(LiveSelectionTuple {
+                module: plan::ModuleId(0),
+                request: SelectionRequest {
+                    name: SelectionNameClass::ExactStandard,
+                    version: SelectionVersionClass::V3_0,
+                    flags: 0,
+                },
+                rv: 0,
+                result: Some(SelectionRequest {
+                    name: SelectionNameClass::ExactStandard,
+                    version: SelectionVersionClass::V3_0,
+                    flags: 0,
+                }),
+                inventory_matches: vec![LiveInventoryMatch {
+                    surface: first_surface,
+                    name_agrees: false,
+                    version_agrees: true,
+                }],
+                authority: SelectionAuthority::Inventory,
+                count: u64::MAX,
+            });
+
+        let selection = engine.interface_selection();
+        assert_eq!(
+            selection
+                .inventory_surfaces
+                .iter()
+                .map(|row| row.module)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert_eq!(selection.tuples[0].inventory_matches[0].surface, 0);
+        assert_eq!(selection.tuples[0].count, u64::MAX);
+        let json = serde_json::to_string(&selection).unwrap();
+        assert!(!json.contains("private-name-canary"));
+        assert!(!json.contains("feed"));
+    }
+
+    #[test]
+    fn standard_export_reducer_is_order_independent_and_fail_closed() {
+        let present = BTreeSet::from([StandardExportFact::Present]);
+        let absent = BTreeSet::from([StandardExportFact::Absent]);
+        let outside = BTreeSet::from([StandardExportFact::Outside]);
+        let conflicting = BTreeSet::from([StandardExportFact::Present, StandardExportFact::Absent]);
+        let legacy = BTreeSet::from([StandardRequirementFact::Legacy]);
+        let v3 = BTreeSet::from([StandardRequirementFact::V3]);
+        let mixed = BTreeSet::from([StandardRequirementFact::Legacy, StandardRequirementFact::V3]);
+
+        assert_eq!(standard_export_status(Some(&present), None), "present");
+        assert_eq!(
+            standard_export_status(Some(&outside), None),
+            "outside_module"
+        );
+        assert_eq!(
+            standard_export_status(Some(&absent), Some(&legacy)),
+            "legacy_absent"
+        );
+        assert_eq!(
+            standard_export_status(Some(&absent), Some(&v3)),
+            "required_absent"
+        );
+        assert_eq!(standard_export_status(Some(&absent), None), "unresolved");
+        assert_eq!(
+            standard_export_status(Some(&absent), Some(&mixed)),
+            "unresolved"
+        );
+        assert_eq!(
+            standard_export_status(Some(&conflicting), Some(&v3)),
+            "unresolved"
+        );
+    }
+
+    #[test]
     fn selection_unknown_result_flags_remain_factual_without_authority() {
         let (_fixture, mut engine, _session, binding) = attached_selection_route();
         let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
@@ -16753,6 +17173,7 @@ int main(int argc, char **argv) {
             rv: 1,
             result: None,
             inventory_matches: Vec::new(),
+            authority: SelectionAuthority::None,
             count: 1,
         };
         let mut facts = CaptureFacts::default();
@@ -16798,7 +17219,7 @@ int main(int argc, char **argv) {
         let mut other_provider = tuple.clone();
         other_provider.module = plan::ModuleId(8);
         facts.record_selection(other_provider, false);
-        assert_eq!(facts.visible_history().selections.len(), 17);
+        assert_eq!(facts.visible_history().selections.len(), 16);
         assert!(facts.visible_history().selection_truncated);
         assert_eq!(facts.visible_history().losses.len(), 1);
         facts.rollback_stage();
@@ -16837,7 +17258,7 @@ int main(int argc, char **argv) {
             facts.history.selection_surfaces.len(),
             MAX_LIVE_SELECTION_SURFACES
         );
-        assert_eq!(facts.history.selections.len(), 17);
+        assert_eq!(facts.history.selections.len(), 16);
         assert!(facts.history.selection_truncated);
         assert_eq!(facts.history.losses.len(), 1);
     }
@@ -22442,6 +22863,10 @@ int main(int argc, char **argv) {
             discovery_read_failures: 0,
             discovery_truncated: 0,
             loader_discovery: render::LoaderDiscovery::default(),
+            interface_selection: render::InterfaceSelection::default(),
+            attach_mechanisms: vec![],
+            pid_descendant_gaps: 0,
+            multi_rebuild_gaps: 0,
             unprotected_live_windows: 0,
             module_unresolved_slots: 0,
             provider_changed: false,

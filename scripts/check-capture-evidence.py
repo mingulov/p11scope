@@ -475,6 +475,23 @@ def selection_tuple_key(tuple_):
     return json.dumps(canonical, separators=(",", ":"))
 
 
+def selection_matrix_rows(document):
+    """Return every data row in the allowlist's selector matrix."""
+    lines = document.splitlines()
+    header = "| query order | selector | flags | request name | request version |"
+    start = lines.index(header)
+    require(
+        lines[start + 1] == "| ---: | ---: | ---: | --- | --- |",
+        "allowlist-v2 selector matrix header is malformed",
+    )
+    rows = []
+    for line in lines[start + 2:]:
+        if not line.startswith("|"):
+            break
+        rows.append(line)
+    return rows
+
+
 def exact_metrics_schema(document, *, run=False):
     require(document["schema"] == METRICS_SCHEMA, document["schema"])
     require(document["capture"]["mode"] == "metrics", document["capture"])
@@ -2478,21 +2495,33 @@ def self_test():
             tuple_["rv"] = value
         rejected(lambda invalid=invalid: exact_profile_v3_selection(invalid))
     allowlist = Path("docs/privacy/allowlist-v2.md").read_text(encoding="utf-8")
-    matrix = [line for line in allowlist.splitlines()
-              if line.startswith(tuple(f"| {index} |" for index in range(10)))]
-    require(matrix == [
+    expected_matrix = [
         f"| {selector * 2 + flags} | selector {selector} | {flags} | "
         f"`{'null' if selector == 0 else 'exact_standard'}` | "
         f"`{('null', 'null', 'v3_0', 'v3_1', 'v3_2')[selector]}` |"
         for selector in range(5) for flags in range(2)
-    ], "allowlist-v2 selector matrix is not exact")
+    ]
+    require(selection_matrix_rows(allowlist) == expected_matrix,
+            "allowlist-v2 selector matrix is not exact")
+    for extra_row in (
+        "| 10 | selector 4 | 1 | `exact_standard` | `v3_2` |",
+        "| malformed | selector 0 | 0 | `null` | `null` |",
+    ):
+        widened = allowlist.replace(expected_matrix[-1], expected_matrix[-1] + "\n" + extra_row)
+        rejected(lambda widened=widened: require(
+            selection_matrix_rows(widened) == expected_matrix,
+            "widened allowlist-v2 selector matrix",
+        ))
     normalized_allowlist = " ".join(allowlist.split())
     for statement in (
         "`selection_evidence` has exactly `acquisition`, `queries`, `tables`, and `selection_truncated`.",
         "For `export_absent` and `export_outside_module`, `queries` and `tables` are empty and `selection_truncated` is false.",
         "For `queried`, `queries` contains exactly the ten rows above and `selection_truncated` is boolean.",
         "Each row has exactly `selector`, `request`, `rv`, `result`, `inventory_matches`, `selection_table`, `authority`, and `helper_failure`.",
-        "A successful query may retain both its factual non-null `result` and a non-null `helper_failure`.",
+        "`null_output` and `unreadable_interface` require `result=null`.",
+        "A successful query with `result=null` permits only `null_output`, `unreadable_interface`, or `provider_changed`.",
+        "Only `unreadable_name`, `unreadable_version`, `unreadable_table`, `outside_provider`, `unresolved_function`, and `provider_changed` may coexist with a factual non-null result.",
+        "With a factual non-null result, `unreadable_name` requires a `null` or `unreadable` result name; `unreadable_version` requires an `unreadable` result version; and `unreadable_table` requires a `null`, `v3_0`, `v3_1`, or `v3_2` result version.",
         "`inventory_matches` is a sorted, unique array of at most 16 exact `{surface, name_agrees, version_agrees}` records.",
         "Authority is exactly `inventory`, `selection_count_only`, or `none`.",
         "That failure class is exactly `null_output`, `unreadable_interface`, `unreadable_name`, `unreadable_version`, `unreadable_table`, `outside_provider`, `unresolved_function`, or `provider_changed`.",

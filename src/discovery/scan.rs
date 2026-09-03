@@ -1025,6 +1025,26 @@ fn hint_gate(
 /// record per finished subprocess, the pid in both the subject and the message,
 /// on every `--cgroup` capture of a workload that forks per unit of work. Every
 /// refusal — ptrace, Yama, anything unreadable — is a real loss and stays loud.
+fn opened_file_identity_guard(
+    view: &ProcessView,
+    file: &File,
+    expected: ObjectKey,
+) -> Result<(), String> {
+    let actual = crate::discovery::identity::retained_object_key(view, file)?;
+    if actual == expected {
+        return Ok(());
+    }
+    Err(format!(
+        "opened object identity {}:{} inode {} does not match mapped object {}:{} inode {}",
+        actual.device.major,
+        actual.device.minor,
+        actual.inode,
+        expected.device.major,
+        expected.device.minor,
+        expected.inode
+    ))
+}
+
 fn mem_unavailable(error: &std::io::Error) -> (&'static str, bool) {
     match error.raw_os_error() {
         Some(libc::EACCES | libc::EPERM) => ("ptrace", true),
@@ -1334,6 +1354,10 @@ pub fn scan_process_view(
                 continue;
             }
         };
+        if let Err(reason) = opened_file_identity_guard(view, &file, key) {
+            skipped.push(Skipped { subject, reason });
+            continue;
+        }
         // Corroborate an inode-only match before attributing the object to the hint.
         let actual_size = file.metadata().ok().map(|metadata| metadata.len());
         let mut refusal = None;
@@ -1922,6 +1946,87 @@ mod tests {
         // An inode match cannot arise without a local identity, but must not be
         // silently accepted if one ever did.
         assert!(hint_gate(HintMatch::Inode, None, Some(8192)).is_err());
+    }
+
+    #[test]
+    fn opened_file_identity_rejects_same_size_inode_before_hint_matching() {
+        let directory = tempfile::tempdir().unwrap();
+        let original_path = directory.path().join("provider.so");
+        let replacement_path = directory.path().join("replacement.so");
+        std::fs::write(&original_path, b"same-size provider bytes").unwrap();
+        std::fs::copy(&original_path, &replacement_path).unwrap();
+
+        let original_file = p11scope_manifest::identity::open_object(&original_path).unwrap();
+        let original_identity =
+            p11scope_manifest::identity::mapping_file_key(&original_file).unwrap();
+        let captured = ObjectKey {
+            device: p11scope_manifest::maps::Device {
+                major: original_identity.device_major,
+                minor: original_identity.device_minor,
+            },
+            inode: original_identity.inode,
+        };
+        let replacement_file = p11scope_manifest::identity::open_object(&replacement_path).unwrap();
+        let replacement_identity =
+            p11scope_manifest::identity::mapping_file_key(&replacement_file).unwrap();
+        assert_eq!(
+            original_file.metadata().unwrap().len(),
+            replacement_file.metadata().unwrap().len(),
+            "the replacement must be the same size"
+        );
+        assert_ne!(captured.inode, replacement_identity.inode);
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        assert!(
+            opened_file_identity_guard(&view, &replacement_file, captured).is_err(),
+            "a same-size replacement inode must be refused before hint matching"
+        );
+
+        let scan_body = &include_str!("scan.rs")[include_str!("scan.rs")
+            .find("pub fn scan_process_view(")
+            .expect("scan entry")..];
+        let scan_lines = scan_body.lines().map(str::trim).collect::<Vec<_>>();
+        let guard = scan_lines
+            .iter()
+            .position(|line| {
+                *line == "if let Err(reason) = opened_file_identity_guard(view, &file, key) {"
+            })
+            .expect("the shared identity guard must run in the scan");
+        assert_eq!(
+            scan_lines[guard - 1],
+            "};",
+            "the identity guard must immediately follow every successful target open"
+        );
+        assert_eq!(
+            &scan_lines[guard + 1..guard + 4],
+            [
+                "skipped.push(Skipped { subject, reason });",
+                "continue;",
+                "}"
+            ],
+            "identity mismatch must always skip the opened object"
+        );
+        let hint_gate = scan_lines
+            .iter()
+            .position(|line| *line == "let attributable = matched.iter().any(|(index, kind)| {")
+            .expect("hint-specific attribution must remain after the guard");
+        assert!(
+            guard < hint_gate,
+            "identity must be checked before hint gating"
+        );
+        let guard_body = &include_str!("scan.rs")[include_str!("scan.rs")
+            .find("fn opened_file_identity_guard(")
+            .expect("identity guard")..];
+        assert!(guard_body.contains("crate::discovery::identity::retained_object_key(view, file)"));
+        for decision in [
+            "if !request.hints.is_empty() && !hinted {\n            continue;\n        }",
+            "if hinted && !attributable {",
+            "if request.hints.is_empty() && exports.is_empty() {\n            continue;\n        }",
+        ] {
+            assert!(
+                scan_body.contains(decision),
+                "missing scan decision: {decision}"
+            );
+        }
     }
 
     #[test]

@@ -167,6 +167,37 @@ pub const LATENCY_BUCKETS: usize = 32;
 
 /// CONFIG map indices.
 pub const CFG_FLAGS: u32 = 0;
+/// Packed `sched_process_fork` field offsets, present only for cgroup event
+/// capture. The low CONFIG cell remains the sole scope/policy owner.
+pub const CFG_FORK_OFFSETS: u32 = 1;
+/// Bit shift of the packed parent PID field offset.
+pub const CFG_FORK_PARENT_OFFSET: u32 = 0;
+/// Bit shift of the packed child PID field offset.
+pub const CFG_FORK_CHILD_OFFSET: u32 = 16;
+const CFG_FORK_OFFSET_MASK: u64 = u16::MAX as u64;
+const CFG_FORK_OFFSETS_VALID: u64 = 1 << 32;
+const CFG_FORK_OFFSETS_KNOWN: u64 = CFG_FORK_OFFSETS_VALID
+    | (CFG_FORK_OFFSET_MASK << CFG_FORK_PARENT_OFFSET)
+    | (CFG_FORK_OFFSET_MASK << CFG_FORK_CHILD_OFFSET);
+
+/// Pack checked tracepoint offsets into the second CONFIG cell.
+pub const fn pack_fork_offsets(parent: u16, child: u16) -> u64 {
+    CFG_FORK_OFFSETS_VALID
+        | ((parent as u64) << CFG_FORK_PARENT_OFFSET)
+        | ((child as u64) << CFG_FORK_CHILD_OFFSET)
+}
+
+/// Decode a packed fork-offset cell, rejecting absence and unknown bits.
+pub const fn unpack_fork_offsets(value: u64) -> Option<(usize, usize)> {
+    if value & CFG_FORK_OFFSETS_VALID == 0 || value & !CFG_FORK_OFFSETS_KNOWN != 0 {
+        return None;
+    }
+    Some((
+        ((value >> CFG_FORK_PARENT_OFFSET) & CFG_FORK_OFFSET_MASK) as usize,
+        ((value >> CFG_FORK_CHILD_OFFSET) & CFG_FORK_OFFSET_MASK) as usize,
+    ))
+}
+
 /// CONFIG flag bits.
 pub const FLAG_PID_FILTER: u64 = 1 << 0;
 pub const FLAG_CGROUP_FILTER: u64 = 1 << 1;
@@ -979,6 +1010,16 @@ mod tests {
         assert_eq!(core::mem::size_of::<SlotSemantics>(), 18);
         assert_eq!(core::mem::align_of::<SlotSemantics>(), 2);
         assert_eq!(ARG_NONE, u8::MAX);
+    }
+
+    #[test]
+    fn fork_offset_config_cell_is_exact_and_fail_closed() {
+        assert_eq!(CFG_FORK_OFFSETS, 1);
+        let packed = pack_fork_offsets(32, 56);
+        assert_eq!(packed, (1u64 << 32) | (56u64 << 16) | 32);
+        assert_eq!(unpack_fork_offsets(packed), Some((32, 56)));
+        assert_eq!(unpack_fork_offsets(packed & !(1u64 << 32)), None);
+        assert_eq!(unpack_fork_offsets(packed | (1u64 << 63)), None);
     }
 
     /// Mutation caught: treating the full cookie as a slot corrupts the

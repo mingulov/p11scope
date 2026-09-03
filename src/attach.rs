@@ -14,13 +14,13 @@ use aya::programs::trace_point::TracePointLinkId;
 use aya::programs::uprobe::{UProbeAttachLocation, UProbeAttachPoint, UProbeLinkId, UProbeScope};
 use aya::programs::{ProgramError, TracePoint, TracePointError, UProbe};
 use p11scope_ebpf_common::{
-    ARG_NONE, DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES,
+    ARG_NONE, CFG_FORK_OFFSETS, DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES,
     DISCOVERY_COUNTER_EXPORT_STATE_FAILURES, DISCOVERY_COUNTER_LOADER_HITS,
     DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES, DISCOVERY_COUNTER_RING_LOSS,
     FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED, FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA,
     FUNCTION_NAME_MAX_BYTES, FunctionNameKey, MAX_DESCRIPTORS, PAUSE_ARMED, PauseKey,
     SlotSemantics, TAIL_CALLS_INTERFACE_WORKER_SLOT, TAIL_CALLS_TEMPLATE_SECOND_SLOT,
-    attach_cookie,
+    attach_cookie, pack_fork_offsets,
 };
 use pkcs11_proxy_ng_types::mechanism_registry::MechanismRegistry;
 use std::collections::{BTreeMap, BTreeSet};
@@ -32,6 +32,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const BPF_F_RDONLY_PROG: u32 = 1 << 7;
+const SCHED_PROCESS_FORK_FORMATS: [&str; 2] = [
+    "/sys/kernel/tracing/events/sched/sched_process_fork/format",
+    "/sys/kernel/debug/tracing/events/sched/sched_process_fork/format",
+];
 
 #[derive(Debug)]
 pub(crate) enum DynamicLoaderAttachFailure {
@@ -86,7 +90,7 @@ const fn map_metadata(
 const BASE_POLICY_MAPS: [(&str, ExactMapMetadata); 7] = [
     (
         "CONFIG",
-        map_metadata(MapType::Array, 4, 8, 1, BPF_F_RDONLY_PROG),
+        map_metadata(MapType::Array, 4, 8, 2, BPF_F_RDONLY_PROG),
     ),
     (
         "PID_FILTER",
@@ -197,6 +201,106 @@ fn validate_policy_maps(ebpf: &Ebpf, object_has_unsafe: bool) -> Result<()> {
         } else if ebpf.map(name).is_some() {
             bail!("{name} must be absent from the default eBPF object");
         }
+    }
+    Ok(())
+}
+
+fn parse_tracepoint_field(line: &str, name: &str) -> Result<Option<u16>> {
+    let matching_fields = line
+        .split(';')
+        .filter_map(|part| part.trim().split_once(':'))
+        .filter(|(key, value)| {
+            key.trim() == "field" && value.split_whitespace().last() == Some(name)
+        })
+        .count();
+    if matching_fields == 0 {
+        return Ok(None);
+    }
+    if matching_fields != 1 {
+        bail!("duplicate {name} field attribute in sched_process_fork format");
+    }
+
+    let mut offset = None;
+    let mut size = None;
+    let mut signed = None;
+    for part in line.split(';') {
+        let Some((key, value)) = part.trim().split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.trim() {
+            "offset" => {
+                if offset.replace(value).is_some() {
+                    bail!("duplicate offset attribute for {name}");
+                }
+            }
+            "size" => {
+                if size.replace(value).is_some() {
+                    bail!("duplicate size attribute for {name}");
+                }
+            }
+            "signed" => {
+                if signed.replace(value).is_some() {
+                    bail!("duplicate signed attribute for {name}");
+                }
+            }
+            _ => {}
+        }
+    }
+    let offset = offset
+        .context("missing offset")?
+        .parse::<u16>()
+        .with_context(|| format!("invalid offset for {name}"))?;
+    if size.context("missing size")? != "4" {
+        bail!("{name} must have size 4");
+    }
+    if signed.context("missing signedness")? != "1" {
+        bail!("{name} must be a signed pid_t");
+    }
+    Ok(Some(offset))
+}
+
+fn parse_tracepoint_format(format: &str) -> Result<(u16, u16)> {
+    let mut parent = None;
+    let mut child = None;
+    for line in format.lines() {
+        for (name, found) in [("parent_pid", &mut parent), ("child_pid", &mut child)] {
+            if let Some(offset) = parse_tracepoint_field(line, name)? {
+                if found.replace(offset).is_some() {
+                    bail!("duplicate {name} field in sched_process_fork format");
+                }
+            }
+        }
+    }
+    Ok((
+        parent.context("missing parent_pid field in sched_process_fork format")?,
+        child.context("missing child_pid field in sched_process_fork format")?,
+    ))
+}
+
+fn read_fork_format_with(mut read: impl FnMut(&Path) -> std::io::Result<String>) -> Result<String> {
+    let mut failures = Vec::new();
+    for path in SCHED_PROCESS_FORK_FORMATS.map(Path::new) {
+        match read(path) {
+            Ok(format) => return Ok(format),
+            Err(error) => failures.push(format!("{}: {error}", path.display())),
+        }
+    }
+    bail!(
+        "reading sched_process_fork format failed: {}",
+        failures.join("; ")
+    )
+}
+
+fn publish_fork_offsets(ebpf: &mut Ebpf) -> Result<()> {
+    let format = read_fork_format_with(|path| std::fs::read_to_string(path))?;
+    let (parent, child) = parse_tracepoint_format(&format)?;
+    let expected = pack_fork_offsets(parent, child);
+    let mut config: Array<_, u64> = Array::try_from(ebpf.map_mut("CONFIG").context("CONFIG map")?)?;
+    config.set(CFG_FORK_OFFSETS, expected, 0)?;
+    let config: Array<_, u64> = Array::try_from(ebpf.map("CONFIG").context("CONFIG map")?)?;
+    if config.get(&CFG_FORK_OFFSETS, 0)? != expected {
+        bail!("CONFIG fork offsets exact readback differs from parsed tracefs format");
     }
     Ok(())
 }
@@ -1067,6 +1171,10 @@ impl Session {
         let generation_token = pause_key.map(|key| key.generation_token);
         crate::scope::publish(&mut ebpf, scope, policy, generation_token)
             .context("publishing scope and capture policy")?;
+        let fork_enabled = matches!(scope, Scope::Cgroup { .. }) && policy.uses_events();
+        if fork_enabled {
+            publish_fork_offsets(&mut ebpf).context("publishing sched_process_fork offsets")?;
+        }
         publish_descriptors(&mut ebpf).context("publishing DESCRIPTORS")?;
         publish_async_catalog(&mut ebpf).context("publishing ASYNC_FUNCTIONS")?;
         {
@@ -1122,7 +1230,7 @@ impl Session {
             .context("publishing and freezing TAIL_CALLS")?;
 
         let mut links = Vec::new();
-        if matches!(scope, Scope::Cgroup { .. }) && policy.uses_events() {
+        if fork_enabled {
             let fork: &mut TracePoint = ebpf
                 .program_mut("sched_process_fork")
                 .context("program sched_process_fork missing from object")?
@@ -1791,6 +1899,112 @@ mod capture_policy {
             CapturePolicy::UnsafeUnvalidatedMetadata.config_bit(),
             CapturePolicy::AggregateOnly.config_bit()
         );
+    }
+}
+
+#[cfg(test)]
+mod tracepoint_format {
+    use super::{SCHED_PROCESS_FORK_FORMATS, parse_tracepoint_format, read_fork_format_with};
+
+    const VALID: &str = "field:pid_t parent_pid; offset:32; size:4; signed:1;\nfield:pid_t child_pid; offset:56; size:4; signed:1;\n";
+
+    #[test]
+    fn tracepoint_format_parses_shifted_fork_pid_offsets() {
+        assert_eq!(parse_tracepoint_format(VALID).unwrap(), (32, 56));
+    }
+
+    #[test]
+    fn tracepoint_format_rejects_malformed_and_unrepresentable_fields() {
+        let cases = [
+            (
+                "missing parent_pid",
+                VALID.replace("field:pid_t parent_pid; offset:32; size:4; signed:1;\n", ""),
+            ),
+            (
+                "missing child_pid",
+                VALID.replace("field:pid_t child_pid; offset:56; size:4; signed:1;\n", ""),
+            ),
+            (
+                "duplicate parent_pid",
+                format!("{VALID}field:pid_t parent_pid; offset:64; size:4; signed:1;\n"),
+            ),
+            ("size other than four", VALID.replace("size:4", "size:8")),
+            ("unsigned field", VALID.replace("signed:1", "signed:0")),
+            ("negative offset", VALID.replace("offset:32", "offset:-1")),
+            (
+                "offset outside CONFIG packed form",
+                VALID.replace("offset:32", "offset:65536"),
+            ),
+            ("missing offset", VALID.replace("offset:32; ", "")),
+            ("missing size", VALID.replace("size:4; ", "")),
+            ("missing signedness", VALID.replace("signed:1;", "")),
+            (
+                "duplicate offset",
+                VALID.replace("offset:32;", "offset:32; offset:33;"),
+            ),
+            (
+                "duplicate size",
+                VALID.replace("size:4;", "size:4; size:4;"),
+            ),
+            (
+                "duplicate signedness",
+                VALID.replace("signed:1;", "signed:1; signed:1;"),
+            ),
+            (
+                "malformed offset",
+                VALID.replace("offset:32", "offset:32junk"),
+            ),
+        ];
+
+        for (reason, format) in cases {
+            assert!(
+                parse_tracepoint_format(&format).is_err(),
+                "accepted {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn tracepoint_format_reader_falls_back_to_debugfs() {
+        let mut visited = Vec::new();
+        let format = read_fork_format_with(|path| {
+            visited.push(path.to_path_buf());
+            if path == std::path::Path::new(SCHED_PROCESS_FORK_FORMATS[1]) {
+                Ok(VALID.to_string())
+            } else {
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            }
+        })
+        .unwrap();
+        assert_eq!(format, VALID);
+        assert_eq!(visited.len(), 2);
+    }
+
+    #[test]
+    fn tracepoint_format_reader_reports_both_failed_paths() {
+        let error = read_fork_format_with(|path| {
+            if path == std::path::Path::new(SCHED_PROCESS_FORK_FORMATS[0]) {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "primary tracefs denied",
+                ))
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "debugfs tracepoint missing",
+                ))
+            }
+        })
+        .unwrap_err()
+        .to_string();
+        for expected in [
+            SCHED_PROCESS_FORK_FORMATS[0],
+            SCHED_PROCESS_FORK_FORMATS[1],
+            "primary tracefs denied",
+            "debugfs tracepoint missing",
+        ] {
+            assert!(error.contains(expected), "{error}");
+        }
     }
 }
 

@@ -331,6 +331,14 @@ pub const fn discovery_state_take_failed(state_present: bool, removed: bool) -> 
     !state_present || !removed
 }
 
+pub const fn discovery_state_take_scope_lost(
+    state_present: bool,
+    removed: bool,
+    scoped: bool,
+) -> bool {
+    state_present && removed && !scoped
+}
+
 /// Pack the export identity, bounded interface-list count, and index.
 /// Values above the ABI's u32 count saturate. Zero and oversized symbol IDs
 /// fail closed because only 24 bits remain after the count and index.
@@ -1238,6 +1246,14 @@ mod tests {
         assert!(!discovery_state_take_failed(true, true));
         assert!(discovery_state_take_failed(false, true));
         assert!(discovery_state_take_failed(true, false));
+    }
+
+    #[test]
+    fn discovery_state_take_scope_loss_is_counted_only_after_a_successful_take() {
+        assert!(discovery_state_take_scope_lost(true, true, false));
+        assert!(!discovery_state_take_scope_lost(true, true, true));
+        assert!(!discovery_state_take_scope_lost(false, true, false));
+        assert!(!discovery_state_take_scope_lost(true, false, false));
     }
 
     #[test]

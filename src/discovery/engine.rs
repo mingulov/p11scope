@@ -16453,6 +16453,41 @@ int main(int argc, char **argv) {
     fn selection_binding_ids_never_reuse() {
         let mut engine = Engine::empty();
         let context = LoaderContextId::from_case_id(0);
+
+        let ordinary = engine
+            .selection_binding_candidate(
+                context,
+                ProcessViewId(1),
+                PinnedObjectId(2),
+                0x10,
+                3,
+                plan::ModuleId(0),
+            )
+            .unwrap();
+        assert_eq!(ordinary.id, 1);
+        engine.selection_bindings.insert(ordinary.id, ordinary);
+        engine
+            .selection_bindings
+            .get_mut(&ordinary.id)
+            .unwrap()
+            .retired = true;
+        assert!(engine.selection_bindings.remove(&ordinary.id).is_some());
+
+        let replacement = engine
+            .selection_binding_candidate(
+                context,
+                ProcessViewId(1),
+                PinnedObjectId(3),
+                0x20,
+                3,
+                plan::ModuleId(0),
+            )
+            .unwrap();
+        assert!(replacement.id > ordinary.id);
+        engine
+            .selection_bindings
+            .insert(replacement.id, replacement);
+
         engine.next_selection_binding_id = Some(u64::MAX);
 
         let last = engine
@@ -16798,7 +16833,7 @@ int main(int argc, char **argv) {
     }
 
     #[test]
-    fn selection_table_refusal_isolates_provider_coverage() {
+    fn selection_bindings_isolate_provider_attribution_and_refusal() {
         let (child, mut engine, modules) = engine_with_one_accepted_provider();
         let mut session = ScriptedSession::default();
         let mut additions_allowed = true;
@@ -16846,13 +16881,14 @@ int main(int argc, char **argv) {
             .unwrap()
             .id;
         let generation = NonZeroU64::new(17).unwrap();
+        let interface_hook = engine.hooks.id("C_GetInterface").unwrap();
         let first_binding = SelectionBindingFact {
             id: 1,
             context,
             view: engine.views[0].id(),
             object: first,
             file_offset: 0x10,
-            hook_id: 0,
+            hook_id: interface_hook,
             abi: HookAbi::Interface,
             attached: true,
             retired: false,
@@ -16870,6 +16906,35 @@ int main(int argc, char **argv) {
         engine
             .selection_bindings
             .extend([(1, first_binding), (2, second_binding)]);
+
+        for (binding_id, module) in [(1, first_id), (2, second_id)] {
+            let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+            record.kind = DISCOVERY_KIND_INTERFACE_RETURN;
+            record.pid_tgid = u64::from(engine.views[0].pid()) << 32;
+            record.case_id = DISCOVERY_NAME_EXACT_STANDARD;
+            record.interface_index = DISCOVERY_VERSION_V3_0;
+            record.return_rv = 1;
+            record.binding_id = binding_id;
+            assert_eq!(
+                engine.process_selection_record(&QueuedDiscoveryRecord {
+                    record,
+                    terminal_owner: None,
+                    terminal_exports: Vec::new(),
+                }),
+                DiscoveryRecordOutcome::applied(false, true)
+            );
+            assert_eq!(
+                engine
+                    .capture_facts
+                    .history
+                    .selections
+                    .last()
+                    .unwrap()
+                    .module,
+                module
+            );
+        }
+
         let table_key = SelectionTableKey {
             view: engine.views[0].id(),
             provider: first_provider.clone(),

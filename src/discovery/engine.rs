@@ -6831,14 +6831,11 @@ impl Engine {
                     continue;
                 };
                 if let Some(inventory) = inventory {
-                    *slot = inventory.clone();
+                    slot.names.clone_from(&inventory.names);
+                    slot.aliased = inventory.aliased;
                 } else {
                     slot.names.clear();
                     slot.aliased = false;
-                    slot.semantics = p11scope_ebpf_common::SlotSemantics::COUNT_ONLY;
-                    slot.semantic_authorized = false;
-                    slot.semantic_ambiguous = false;
-                    slot.fork_safe = false;
                 }
                 if let Some(names) = names {
                     slot.names.extend(names.iter().copied().map(str::to_string));
@@ -10944,6 +10941,8 @@ pub(crate) mod session_fixture {
         pub(crate) detached: Vec<LoaderContextId>,
         /// Slot counts of every `detach_slots` call, in order.
         pub(crate) detached_slots: Vec<usize>,
+        /// Exact slot identities of every `detach_slots` call, in order.
+        pub(crate) detached_slot_indices: Vec<Vec<u32>>,
         /// One entry per upcoming `detach_slots` call; `true` fails it.
         detach_slot_script: VecDeque<bool>,
         /// Static target slot indices that the next attach reports as failed.
@@ -11103,6 +11102,8 @@ pub(crate) mod session_fixture {
 
         fn detach_slots(&mut self, slots: &[plan::Slot]) -> Result<()> {
             self.detached_slots.push(slots.len());
+            self.detached_slot_indices
+                .push(slots.iter().map(|slot| slot.index).collect());
             if self.detach_slot_script.pop_front().unwrap_or(false) {
                 bail!("scripted one-shot slot detach failed");
             }
@@ -15079,20 +15080,24 @@ int main(int argc, char **argv) {
         engine
             .apply_candidate(&mut session, initial, &mut true, false, &[])
             .unwrap();
+        let shared_inventory = base + 10;
         let inventory = engine
             .plan
             .slots
-            .iter()
-            .find(|slot| slot.file_offset == base)
-            .unwrap()
-            .clone();
+            .iter_mut()
+            .find(|slot| slot.file_offset == shared_inventory)
+            .unwrap();
+        assert_ne!(inventory.index, 0);
+        inventory.descriptor_index = 0;
+        inventory.semantics = p11scope_ebpf_common::SlotSemantics::COUNT_ONLY;
+        let inventory = inventory.clone();
         let inventory_tables = engine.plan.modules[0].tables.clone();
         let extra = base + 80;
 
         let mut selection = manifest_selection_evidence(
             Version { major: 3, minor: 0 },
             &[
-                ("C_Finalize", base),
+                ("C_Finalize", shared_inventory),
                 ("C_GetInfo", extra),
                 ("C_GetSlotList", extra + 1),
                 ("C_GetMechanismList", extra + 2),
@@ -15100,7 +15105,7 @@ int main(int argc, char **argv) {
         );
         let mut survivor = manifest_selection_evidence(
             Version { major: 3, minor: 1 },
-            &[("C_GetInfo", base), ("C_GetSlotList", extra)],
+            &[("C_GetInfo", shared_inventory), ("C_GetSlotList", extra)],
         );
         survivor.tables[0].id = 1;
         for query in &mut survivor.queries {
@@ -15134,7 +15139,7 @@ int main(int argc, char **argv) {
                 .plan
                 .slots
                 .iter()
-                .filter(|slot| slot.file_offset == base)
+                .filter(|slot| slot.file_offset == shared_inventory)
                 .count(),
             1,
             "inventory and selection share one physical slot"
@@ -15149,6 +15154,19 @@ int main(int argc, char **argv) {
             assert!(!slot.semantic_authorized);
         }
         assert_eq!(candidate.plan.modules[0].tables, inventory_tables);
+        let committed_inventory = candidate
+            .plan
+            .slots
+            .iter()
+            .find(|slot| slot.file_offset == shared_inventory)
+            .unwrap()
+            .clone();
+        assert_eq!(committed_inventory.index, inventory.index);
+        assert_eq!(committed_inventory.descriptor_index, 0);
+        assert_eq!(
+            committed_inventory.semantics,
+            p11scope_ebpf_common::SlotSemantics::COUNT_ONLY
+        );
         let evidence = evidence_verdict(&candidate.plan, &candidate.pinned, &engine.counters);
         assert!(evidence.semantic_unverified_slots > 0);
         assert_eq!(
@@ -15176,18 +15194,20 @@ int main(int argc, char **argv) {
             .apply_candidate(&mut session, candidate, &mut true, false, &[])
             .unwrap();
 
+        let mut expected_inventory = committed_inventory;
+        expected_inventory.names.clone_from(&inventory.names);
+        expected_inventory.names.push("C_GetInfo".into());
+        expected_inventory.names.sort();
+        expected_inventory.names.dedup();
+        expected_inventory.aliased = expected_inventory.names.len() >= 2;
         assert_eq!(
             engine
                 .plan
                 .slots
                 .iter()
-                .find(|slot| slot.file_offset == base)
+                .find(|slot| slot.file_offset == shared_inventory)
                 .unwrap(),
-            &plan::Slot {
-                names: vec!["C_GetInfo".into(), "C_Initialize".into()],
-                aliased: true,
-                ..inventory
-            },
+            &expected_inventory,
             "rollback removes only the failed manifest alias from inventory"
         );
         let shared = engine
@@ -15208,6 +15228,7 @@ int main(int argc, char **argv) {
             "a later failure rolls back the successful selection-only prefix"
         );
         assert_eq!(session.detached_slots.last(), Some(&1));
+        assert_eq!(session.detached_slot_indices.last(), Some(&vec![earlier]));
         assert_eq!(session.attached_slots.last(), Some(&3));
         let evidence = evidence_verdict(&engine.plan, &engine.pinned, &engine.counters);
         assert_eq!(
@@ -15288,6 +15309,59 @@ int main(int argc, char **argv) {
     }
 
     #[test]
+    fn structurally_valid_orphan_table_record_is_rejected_and_never_lowered() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = dir.path().join("provider.so");
+        std::fs::copy("/bin/sh", &provider).unwrap();
+        let base = object_facts(&provider).2;
+        let mut manifest = valid_manifest_for(std::slice::from_ref(&provider), &[0; 67]);
+        manifest.selection_evidence = manifest_selection_evidence(
+            Version { major: 3, minor: 0 },
+            &[("C_GetInfo", base + 80)],
+        );
+        let pins = pin_manifest_objects(&manifest).unwrap();
+        let mut orphan = manifest.selection_evidence.tables[0].clone();
+        orphan.id = 1;
+        orphan
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "C_GetInfo")
+            .unwrap()
+            .resolution = Resolution::Resolved {
+            object: 0,
+            file_offset: base + 90,
+        };
+        manifest.selection_evidence.tables.push(orphan);
+        // The table record itself is fully valid. Schema v5 deliberately makes
+        // the containing document invalid solely because no authoritative
+        // query references it, so no valid orphan document exists to accept.
+        assert_eq!(
+            crate::manifest_input::validate_structure(&manifest),
+            ["selection table 1 is orphaned"]
+        );
+        let mut plan = plan::build_from_sources(&[], std::slice::from_ref(&manifest), &pins);
+        let allocated = plan.clone();
+
+        let (admissions, refused) = lower_manifest_selection_tables(
+            &mut plan,
+            &allocated,
+            std::slice::from_ref(&manifest),
+            &[7],
+            &pins,
+        );
+
+        assert_eq!(
+            admissions
+                .iter()
+                .map(|admission| admission.source)
+                .collect::<Vec<_>>(),
+            [(7, 0)]
+        );
+        assert!(refused.is_empty());
+        assert!(plan.slots.iter().all(|slot| slot.file_offset != base + 90));
+    }
+
+    #[test]
     fn stale_manifest_selection_does_not_transfer_to_scan_replacement() {
         let dir = tempfile::tempdir().unwrap();
         let provider = dir.path().join("provider.so");
@@ -15322,6 +15396,16 @@ int main(int argc, char **argv) {
         rebuild_discovered(&mut discovered).unwrap();
 
         assert!(discovered.manifests.is_empty());
+        assert_eq!(discovered.plan.modules.len(), 1);
+        assert_eq!(discovered.plan.modules[0].source, "scan");
+        assert!(
+            discovered
+                .plan
+                .slots
+                .iter()
+                .any(|slot| slot.file_offset == base),
+            "the exact scan replacement was accepted"
+        );
         assert!(
             discovered
                 .plan

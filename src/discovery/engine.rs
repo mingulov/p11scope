@@ -5664,7 +5664,7 @@ impl Engine {
                     selection_truncated = true;
                     return None;
                 };
-                let inventory_matches: Vec<_> = tuple
+                let mut inventory_matches: Vec<_> = tuple
                     .inventory_matches
                     .iter()
                     .filter_map(|matched| {
@@ -5684,6 +5684,10 @@ impl Engine {
                     })
                     .collect();
                 selection_truncated |= inventory_matches.len() != tuple.inventory_matches.len();
+                inventory_matches.sort_by_key(|matched| {
+                    (matched.surface, matched.name_agrees, matched.version_agrees)
+                });
+                inventory_matches.dedup();
                 let lost_inventory_authority = tuple.authority == SelectionAuthority::Inventory
                     && inventory_matches.is_empty();
                 Some(render::SelectionTuple {
@@ -11556,7 +11560,7 @@ impl Engine {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::session_fixture::ScriptedSession;
     use super::*;
     use crate::discovery::identity::test_fixture::{
@@ -15086,6 +15090,30 @@ int main(int argc, char **argv) {
         (fixture, engine, session, binding)
     }
 
+    pub(crate) fn selection_output_engines() -> (Engine, Engine) {
+        let (_fixture, clean, _session, _binding) = attached_selection_route();
+        let (_fixture, mut truncated, _session, binding) = attached_selection_route();
+        for flags in 0..=MAX_LIVE_SELECTION_TUPLES {
+            truncated.capture_facts.record_selection(
+                LiveSelectionTuple {
+                    module: binding.provider,
+                    request: SelectionRequest {
+                        name: SelectionNameClass::Null,
+                        version: SelectionVersionClass::Null,
+                        flags: flags as u64,
+                    },
+                    rv: 1,
+                    result: None,
+                    inventory_matches: vec![],
+                    authority: SelectionAuthority::None,
+                    count: 1,
+                },
+                false,
+            );
+        }
+        (clean, truncated)
+    }
+
     fn selection_only_table(
         engine: &Engine,
         binding: SelectionBindingFact,
@@ -16899,10 +16927,11 @@ int main(int argc, char **argv) {
             duplicate: 0,
         };
         let first_surface = surface(
-            first,
-            0xfeed,
+            first.clone(),
+            10,
             PrivateSelectionName::Other(b"private-name-canary".to_vec()),
         );
+        let later_surface = surface(first, 20, PrivateSelectionName::ExactStandard);
         engine
             .capture_facts
             .history
@@ -16913,6 +16942,11 @@ int main(int argc, char **argv) {
             .history
             .selection_surfaces
             .insert(first_surface.clone());
+        engine
+            .capture_facts
+            .history
+            .selection_surfaces
+            .insert(later_surface.clone());
         let tuple = LiveSelectionTuple {
             module: plan::ModuleId(0),
             request: SelectionRequest {
@@ -16926,11 +16960,28 @@ int main(int argc, char **argv) {
                 version: SelectionVersionClass::V3_0,
                 flags: 0,
             }),
-            inventory_matches: vec![LiveInventoryMatch {
-                surface: first_surface,
-                name_agrees: false,
-                version_agrees: true,
-            }],
+            inventory_matches: vec![
+                LiveInventoryMatch {
+                    surface: later_surface.clone(),
+                    name_agrees: true,
+                    version_agrees: false,
+                },
+                LiveInventoryMatch {
+                    surface: first_surface.clone(),
+                    name_agrees: true,
+                    version_agrees: true,
+                },
+                LiveInventoryMatch {
+                    surface: later_surface,
+                    name_agrees: false,
+                    version_agrees: true,
+                },
+                LiveInventoryMatch {
+                    surface: first_surface,
+                    name_agrees: true,
+                    version_agrees: true,
+                },
+            ],
             authority: SelectionAuthority::Inventory,
             count: u64::MAX,
         };
@@ -16944,9 +16995,16 @@ int main(int argc, char **argv) {
                 .iter()
                 .map(|row| row.module)
                 .collect::<Vec<_>>(),
-            [0, 1]
+            [0, 0, 1]
         );
-        assert_eq!(selection.tuples[0].inventory_matches[0].surface, 0);
+        assert_eq!(
+            selection.tuples[0]
+                .inventory_matches
+                .iter()
+                .map(|matched| (matched.surface, matched.name_agrees, matched.version_agrees))
+                .collect::<Vec<_>>(),
+            [(0, true, true), (1, false, true), (1, true, false)]
+        );
         assert_eq!(selection.tuples[0].count, u64::MAX);
         assert_eq!(selection.tuples.len(), 1);
         let json = serde_json::to_string(&selection).unwrap();
@@ -17150,6 +17208,71 @@ int main(int argc, char **argv) {
         assert!(selection.tuples[0].inventory_matches.is_empty());
         assert_eq!(selection.tuples[0].authority, SelectionAuthority::None);
         assert!(selection.selection_truncated);
+    }
+
+    #[test]
+    fn retained_standard_export_facts_project_through_public_selection() {
+        let (_fixture, mut engine, _session, _binding) = attached_selection_route();
+        engine.capture_facts.history.standard_exports.clear();
+        engine.capture_facts.history.standard_requirements.clear();
+        for id in 1..5 {
+            let id = plan::ModuleId(id);
+            let mut module = merged_module(vec!["manifest", "scan"]);
+            module.id = id;
+            engine.capture_facts.history.modules.insert(id, module);
+        }
+        let history = &mut engine.capture_facts.history;
+        history.standard_exports.insert(
+            plan::ModuleId(0),
+            BTreeSet::from([StandardExportFact::Present]),
+        );
+        history.standard_requirements.insert(
+            plan::ModuleId(1),
+            BTreeSet::from([StandardRequirementFact::Legacy]),
+        );
+        history.standard_exports.insert(
+            plan::ModuleId(1),
+            BTreeSet::from([StandardExportFact::Absent]),
+        );
+        history.standard_exports.insert(
+            plan::ModuleId(2),
+            BTreeSet::from([StandardExportFact::Absent]),
+        );
+        history.standard_requirements.insert(
+            plan::ModuleId(2),
+            BTreeSet::from([StandardRequirementFact::V3]),
+        );
+        history.standard_exports.insert(
+            plan::ModuleId(3),
+            BTreeSet::from([StandardExportFact::Outside]),
+        );
+        history.standard_exports.insert(
+            plan::ModuleId(4),
+            BTreeSet::from([StandardExportFact::Absent, StandardExportFact::Present]),
+        );
+
+        let selection = engine.interface_selection();
+        assert_eq!(
+            selection
+                .standard_exports
+                .iter()
+                .map(|export| (export.module, export.status))
+                .collect::<Vec<_>>(),
+            [
+                (0, "present"),
+                (1, "legacy_absent"),
+                (2, "required_absent"),
+                (3, "outside_module"),
+                (4, "unresolved"),
+            ]
+        );
+        let mut evidence = evidence_verdict(engine.plan(), engine.pinned(), &engine.counters);
+        evidence.slots = 1;
+        evidence.verdict();
+        assert_eq!(evidence.completeness, "COMPLETE");
+        evidence.interface_selection = selection;
+        evidence.verdict();
+        assert_eq!(evidence.completeness, "PARTIAL");
     }
 
     #[test]

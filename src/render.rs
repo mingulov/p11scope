@@ -1778,6 +1778,17 @@ mod tests {
                     BTreeSet::from(["flags", "name", "version"])
                 );
             }
+            let matches = tuple["inventory_matches"].as_array().unwrap();
+            assert_eq!(tuple["table_match"], !matches.is_empty());
+            assert!(tuple["count"].as_u64().unwrap() >= 1);
+            for matched in matches {
+                let surface = matched["surface"].as_u64().unwrap() as usize;
+                assert!(surface < selection["inventory_surfaces"].as_array().unwrap().len());
+                assert_eq!(
+                    selection["inventory_surfaces"][surface]["module"],
+                    tuple["module"]
+                );
+            }
         }
         assert_eq!(
             keys(&selection["tuples"][7]["inventory_matches"][0]),

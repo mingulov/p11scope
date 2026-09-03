@@ -13,6 +13,7 @@ use crate::render;
 use crate::semantics::ProcessKey;
 use crate::semantics::State;
 use p11scope_ebpf_common::{Event, SESSION_NONE, capture, shape};
+use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// `pid_tgid` (`bpf_get_current_pid_tgid()`) -> (pid, tid): tgid (process
@@ -198,6 +199,40 @@ pub fn evidence_line(ev: &render::Evidence, policy: CapturePolicy, truncated: bo
     format!("EVIDENCE {value}")
 }
 
+#[derive(Serialize)]
+struct CountEvidence {
+    stats_entered: u64,
+    stats_returned: u64,
+    raw_calls: u64,
+}
+
+/// Final aggregate count record for trace. `raw_calls` is maintained by the
+/// drain before output truncation; STATS values come from the same reports as
+/// terminal evidence and are summed with saturation.
+pub(crate) fn count_evidence_line(
+    reports: &[crate::metrics::SlotReport],
+    raw_calls: u64,
+) -> String {
+    let (stats_returned, stats_entered) =
+        reports
+            .iter()
+            .fold((0u64, 0u64), |(stats_returned, stats_entered), report| {
+                (
+                    stats_returned.saturating_add(report.calls),
+                    stats_entered.saturating_add(report.calls.saturating_add(report.in_flight)),
+                )
+            });
+    let value = CountEvidence {
+        stats_entered,
+        stats_returned,
+        raw_calls,
+    };
+    format!(
+        "COUNT_EVIDENCE {}",
+        serde_json::to_string(&value).expect("count evidence serializes")
+    )
+}
+
 /// Turns completed events into trace lines, tracking the two bits of
 /// state a pure per-line formatter cannot carry itself: the wall-clock
 /// anchor (kernel timestamps are boot-relative monotonic, not epoch —
@@ -228,6 +263,7 @@ fn trace_slots(plan: &AttachPlan) -> Vec<Option<TraceSlot>> {
 
 pub struct Tracer {
     slots: Vec<Option<TraceSlot>>,
+    raw_calls: u64,
     /// (first observed event's kernel monotonic ts_ns, wall-clock ns at
     /// that same moment) — every later line's wall time is this anchor
     /// plus the kernel-monotonic delta, so line-to-line spacing tracks
@@ -240,6 +276,7 @@ impl Tracer {
     pub fn new(plan: &AttachPlan) -> Self {
         Self {
             slots: trace_slots(plan),
+            raw_calls: 0,
             anchor: None,
         }
     }
@@ -248,6 +285,19 @@ impl Tracer {
     /// updates semantic state; no immutable plan borrow survives a live sync.
     pub fn sync_plan(&mut self, plan: &AttachPlan) {
         self.slots = trace_slots(plan);
+    }
+
+    /// Counts one well-formed event consumed by trace before truncation or
+    /// semantic reduction. Fork lifecycle records are transport events, not
+    /// calls, and are intentionally excluded.
+    pub(crate) fn count_raw_call(&mut self, ev: &Event) {
+        if ev.event_type != p11scope_ebpf_common::event_type::FORK {
+            self.raw_calls = self.raw_calls.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn raw_calls(&self) -> u64 {
+        self.raw_calls
     }
 
     fn wall_ns_for(&mut self, ts_ns: u64) -> u128 {
@@ -433,6 +483,47 @@ mod tests {
     fn nonzero_loss_counter_produces_the_lost_line() {
         assert_eq!(lost_line(1), Some("LOST 1 events".to_string()));
         assert_eq!(lost_line(42), Some("LOST 42 events".to_string()));
+    }
+
+    fn slot_report(calls: u64, in_flight: u64) -> crate::metrics::SlotReport {
+        crate::metrics::SlotReport {
+            names: vec![],
+            aliased: false,
+            semantic_authorized: true,
+            module: None,
+            module_ambiguous: false,
+            module_unresolved: false,
+            calls,
+            errors: 0,
+            in_flight,
+            total_ns: 0,
+            max_ns: 0,
+            buckets: [0; p11scope_ebpf_common::LATENCY_BUCKETS],
+            rv_counts: Default::default(),
+        }
+    }
+
+    #[test]
+    fn count_evidence_line_has_exact_fields_and_derives_entered_calls() {
+        let line = count_evidence_line(&[slot_report(3, 2), slot_report(4, 1)], 9);
+        let value: serde_json::Value =
+            serde_json::from_str(line.strip_prefix("COUNT_EVIDENCE ").unwrap()).unwrap();
+
+        assert_eq!(value.as_object().unwrap().len(), 3);
+        assert_eq!(value["stats_entered"], 10);
+        assert_eq!(value["stats_returned"], 7);
+        assert_eq!(value["raw_calls"], 9);
+    }
+
+    #[test]
+    fn count_evidence_line_saturates_each_aggregate() {
+        let line = count_evidence_line(&[slot_report(u64::MAX, 1)], u64::MAX);
+        let value: serde_json::Value =
+            serde_json::from_str(line.strip_prefix("COUNT_EVIDENCE ").unwrap()).unwrap();
+
+        assert_eq!(value["stats_entered"], u64::MAX);
+        assert_eq!(value["stats_returned"], u64::MAX);
+        assert_eq!(value["raw_calls"], u64::MAX);
     }
 
     fn empty_evidence() -> render::Evidence {

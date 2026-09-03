@@ -254,6 +254,10 @@ Every trace ends with the same machine-readable evidence object used by
 profile output. If the ring buffer drops events, it also emits an explicit
 `LOST n events` line rather than silently under-reporting — see
 [Overhead](#overhead-measured) for when that actually happens.
+Immediately before `EVIDENCE`, trace emits one aggregate-only
+`COUNT_EVIDENCE {"stats_entered":…,"stats_returned":…,"raw_calls":…}` line:
+the STATS fields include completed and in-flight calls, while `raw_calls`
+counts every well-formed non-fork event consumed before truncation.
 
 ## Privileges, per environment
 

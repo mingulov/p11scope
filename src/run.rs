@@ -2384,6 +2384,12 @@ fn capture_trace(
         )?;
     }
     emit_trace_line(
+        &trace::count_evidence_line(&reports, tracer.raw_calls()),
+        stdout,
+        &mut stdout_open,
+        out_file,
+    )?;
+    emit_trace_line(
         &trace::evidence_line(&evidence, policy, trace_truncated),
         stdout,
         &mut stdout_open,
@@ -2541,6 +2547,7 @@ fn drain_trace_events_from<S: crate::events::RecordSource, W: Write>(
 ) -> Result<u64> {
     let mut write_error = None;
     drain.poll(quantum, |ev| {
+        tracer.count_raw_call(&ev);
         if observe_fork(tracker, state, scope, pid_descendant_gaps, &ev) {
             return ControlFlow::Continue(());
         }
@@ -4012,6 +4019,60 @@ mod tests {
         assert!(stdout.is_empty());
         assert_eq!(remaining, Some(0));
         assert_eq!(drain.source().remaining(), 0);
+    }
+
+    #[test]
+    fn terminal_trace_count_evidence_counts_before_limit_and_excludes_fork() {
+        use crate::events::{EventDrain, ScriptedRecords};
+        let (mut state, mut tracker, mut tracer) = trace_fixture();
+        let mut remaining = Some(1);
+        let mut stdout = Vec::new();
+        let mut stdout_open = true;
+        let mut out_file: Option<Vec<u8>> = None;
+        let mut gaps = 0;
+        let events = [
+            call_event(),
+            p11scope_ebpf_common::Event {
+                event_type: p11scope_ebpf_common::event_type::FORK,
+                ..Default::default()
+            },
+            call_event(),
+            call_event(),
+        ];
+        let mut drain = EventDrain::over(ScriptedRecords::events(events, usize::MAX));
+
+        drain_trace_events_from(
+            &mut drain,
+            &mut remaining,
+            &mut state,
+            &mut tracker,
+            &Scope::Pid(std::process::id()),
+            &mut gaps,
+            &mut tracer,
+            &mut stdout,
+            &mut stdout_open,
+            &mut out_file,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(tracer.raw_calls(), 3);
+        let value: serde_json::Value = serde_json::from_str(
+            trace::count_evidence_line(&[], tracer.raw_calls())
+                .strip_prefix("COUNT_EVIDENCE ")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "stats_entered": 0,
+                "stats_returned": 0,
+                "raw_calls": 3,
+            })
+        );
+        assert_eq!(remaining, Some(0));
+        assert!(stdout.iter().filter(|byte| **byte == b'\n').count() <= 1);
     }
 
     /// Both loops take their poll bound from the session — the quantum while

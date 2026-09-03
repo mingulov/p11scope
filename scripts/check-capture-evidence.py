@@ -313,7 +313,7 @@ def exact_profile_v3_selection(document, *, terminal=False, run=False):
         require(value < len(modules), f"{label} refers to missing module: {value}")
 
     providers = selection["providers"]
-    require(isinstance(providers, list) and len(providers) <= len(modules), providers)
+    require(isinstance(providers, list) and len(providers) <= min(len(modules), 512), providers)
     for provider in providers:
         exact_keys(provider, {"module", "coverage"}, "selection provider")
         module_ref(provider["module"], "selection provider module")
@@ -322,7 +322,7 @@ def exact_profile_v3_selection(document, *, terminal=False, run=False):
     require(len({item["module"] for item in providers}) == len(providers), "duplicate providers")
 
     exports = selection["standard_exports"]
-    require(isinstance(exports, list) and len(exports) <= len(modules), exports)
+    require(isinstance(exports, list) and len(exports) <= min(len(modules), 512), exports)
     for export in exports:
         exact_keys(export, {"module", "status"}, "standard export")
         module_ref(export["module"], "standard export module")
@@ -2390,6 +2390,26 @@ def self_test():
         {"module": 0, "ordinal": 512, "kind": "interface"}
     )
     rejected(lambda: exact_profile_v3_selection(surface_overflow))
+    module_bound = copy.deepcopy(selection_doc)
+    module_bound["evidence"]["discovery"] = [
+        copy.deepcopy(selection_doc["evidence"]["discovery"][0]) for _ in range(512)
+    ]
+    module_bound["evidence"]["interface_selection"].update(
+        providers=[{"module": module, "coverage": "observed"} for module in range(512)],
+        standard_exports=[{"module": module, "status": "present"} for module in range(512)],
+        inventory_surfaces=[], tuples=[],
+    )
+    exact_profile_v3_selection(module_bound)
+    for field, record in (
+        ("providers", {"module": 512, "coverage": "observed"}),
+        ("standard_exports", {"module": 512, "status": "present"}),
+    ):
+        overflow = copy.deepcopy(module_bound)
+        overflow["evidence"]["discovery"].append(
+            copy.deepcopy(selection_doc["evidence"]["discovery"][0])
+        )
+        overflow["evidence"]["interface_selection"][field].append(record)
+        rejected(lambda overflow=overflow: exact_profile_v3_selection(overflow))
     for mechanisms in ([], ["per-offset"], ["uprobe-multi"], ["per-offset", "uprobe-multi"]):
         candidate = copy.deepcopy(selection_doc)
         candidate["evidence"]["attached_probes"] = 0 if not mechanisms else 2
@@ -2432,17 +2452,55 @@ def self_test():
     overflow_count = copy.deepcopy(selection_doc)
     overflow_count["evidence"]["interface_selection"]["tuples"][0]["count"] = U64_MAX + 1
     rejected(lambda: exact_profile_v3_selection(overflow_count))
-    allowlist = Path("docs/privacy/allowlist-v2.md").read_text(encoding="utf-8")
-    for term in (
-        "export_absent", "export_outside_module", "queried", "selector 0",
-        "selector 4", "exactly ten", "helper_failure", "null_output",
-        "unreadable_interface", "unreadable_name", "unreadable_version",
-        "unreadable_table", "outside_provider", "unresolved_function",
-        "provider_changed", "selection_count_only", "table id", "orphan tables",
-        "semantic_authorized=false", "full", "104", "3.0", "3.1", "3.2",
-        "no raw interface names or pointers",
+    full_width = copy.deepcopy(no_authority)
+    full_width_tuple = full_width["evidence"]["interface_selection"]["tuples"][0]
+    full_width_tuple["request"]["flags"] = U64_MAX
+    full_width_tuple["result"]["flags"] = U64_MAX
+    exact_profile_v3_selection(full_width)
+    full_width_rv = copy.deepcopy(selection_doc)
+    full_width_rv_tuple = full_width_rv["evidence"]["interface_selection"]["tuples"][0]
+    full_width_rv_tuple.update(
+        rv=U64_MAX, result=None, table_match=False, inventory_matches=[], authority="none",
+    )
+    exact_profile_v3_selection(full_width_rv)
+    for field, value in (
+        ("request.flags", U64_MAX + 1), ("request.flags", True),
+        ("result.flags", U64_MAX + 1), ("result.flags", True),
+        ("rv", U64_MAX + 1), ("rv", True),
     ):
-        require(term in allowlist, f"allowlist-v2 omits {term!r}")
+        invalid = copy.deepcopy(selection_doc)
+        tuple_ = invalid["evidence"]["interface_selection"]["tuples"][0]
+        if field == "request.flags":
+            tuple_["request"]["flags"] = value
+        elif field == "result.flags":
+            tuple_["result"]["flags"] = value
+        else:
+            tuple_["rv"] = value
+        rejected(lambda invalid=invalid: exact_profile_v3_selection(invalid))
+    allowlist = Path("docs/privacy/allowlist-v2.md").read_text(encoding="utf-8")
+    matrix = [line for line in allowlist.splitlines()
+              if line.startswith(tuple(f"| {index} |" for index in range(10)))]
+    require(matrix == [
+        f"| {selector * 2 + flags} | selector {selector} | {flags} | "
+        f"`{'null' if selector == 0 else 'exact_standard'}` | "
+        f"`{('null', 'null', 'v3_0', 'v3_1', 'v3_2')[selector]}` |"
+        for selector in range(5) for flags in range(2)
+    ], "allowlist-v2 selector matrix is not exact")
+    normalized_allowlist = " ".join(allowlist.split())
+    for statement in (
+        "`selection_evidence` has exactly `acquisition`, `queries`, `tables`, and `selection_truncated`.",
+        "For `export_absent` and `export_outside_module`, `queries` and `tables` are empty and `selection_truncated` is false.",
+        "For `queried`, `queries` contains exactly the ten rows above and `selection_truncated` is boolean.",
+        "Each row has exactly `selector`, `request`, `rv`, `result`, `inventory_matches`, `selection_table`, `authority`, and `helper_failure`.",
+        "A successful query may retain both its factual non-null `result` and a non-null `helper_failure`.",
+        "`inventory_matches` is a sorted, unique array of at most 16 exact `{surface, name_agrees, version_agrees}` records.",
+        "Authority is exactly `inventory`, `selection_count_only`, or `none`.",
+        "That failure class is exactly `null_output`, `unreadable_interface`, `unreadable_name`, `unreadable_version`, `unreadable_table`, `outside_provider`, `unresolved_function`, or `provider_changed`.",
+        "Each table id is an integer from 0 through 9, its version is 3.0, 3.1, or 3.2, its walk is exactly `full`, and it contains at most 104 function records with `semantic_authorized=false`.",
+        "A selector is an integer from 0 through 4 and request flags are exactly 0 or 1.",
+    ):
+        require(statement in normalized_allowlist,
+                f"allowlist-v2 omits exact relation: {statement}")
     loss = copy.deepcopy(selection_doc)
     loss["evidence"]["interface_selection"]["providers"][0]["coverage"] = "observed_uncovered"
     loss["evidence"]["completeness"] = "COMPLETE"

@@ -52,8 +52,10 @@ is nonempty. Authority is exactly `inventory`, `selection_count_only`, or
 one match; count-only authority has no match and is limited to a successful
 request and result whose names are both `exact_standard`, whose returned
 version is `v3_0`, `v3_1`, or `v3_2`, and whose returned flags are 0 or 1.
-It records only the fixed helper selector/count relation, has
-`semantic_authorized=false`, grants no inventory match, and forces `PARTIAL`.
+Count-only authority applies to a live or offline selection-only target, grants
+no inventory match, is semantically unauthorized, and forces `PARTIAL`. The
+profile tuple does not expose a helper selector or `semantic_authorized` field;
+those are not part of the observed-profile-v3 shape.
 A successful matched result with an unreadable/null name or version retains its
 match but has `none` authority. The corresponding agreement boolean is false;
 legacy surfaces always have `name_agrees: false`. A nonzero `rv` has null

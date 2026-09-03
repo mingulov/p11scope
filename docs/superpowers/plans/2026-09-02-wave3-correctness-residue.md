@@ -285,11 +285,14 @@ Commit: `feat: reduce interface selection with exact lifecycle authority`
 
 **Files:**
 
-- Modify: `src/render.rs`, `src/run.rs`, `src/trace.rs`
+- Modify: `src/discovery/engine.rs`, `src/render.rs`, `src/run.rs`,
+  `src/trace.rs`
 - Create: `docs/schema/observed-profile-v3.md`
 - Create: `docs/privacy/allowlist-v2.md`
 - Modify: `README.md`, `docs/usage.md`, `src/inspect.rs`
-- Modify: `scripts/{check-capture-evidence.py,verify-canaries.sh}`
+- Modify: `scripts/{check-capture-evidence.py,check-live-discovery-evidence.py,verify-canaries.sh}`
+- Inspect and modify if its live-profile pin is active:
+  `scripts/matrix/verify-oracle.sh`
 
 Design acceptance: §12 items 3, 14, and 15.
 
@@ -312,6 +315,8 @@ Design acceptance: §12 items 3, 14, and 15.
 - [ ] GREEN: update docs, exact-schema dispatch, and canaries so the observer
   remains passive while the explicit helper is documented as making ten calls.
   Migrate live profile-v2 exact pins; retain historical records as historical.
+  Enforce the 16-tuple bound globally per capture, not independently per
+  module, and project public coverage only through Task 3's reducer.
 - [ ] Focused checks:
   `cargo +1.88 test --locked --lib profile_v3_selection_contract_is_exact`,
   `python3 -I scripts/check-capture-evidence.py --self-test`, and

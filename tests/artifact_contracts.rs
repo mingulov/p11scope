@@ -5756,7 +5756,9 @@ fn both_capture_loops_keep_the_one_frozen_per_tick_ordering() {
 #[test]
 fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
     use p11scope::plan::{ModuleId, SurfaceSummary, TableSummary};
-    use p11scope::render::{DiscoveredModule, DiscoveryEvidence, Evidence, ObjectSummary};
+    use p11scope::render::{
+        DiscoveredModule, DiscoveryEvidence, Evidence, InterfaceSelection, ObjectSummary,
+    };
 
     let object = ObjectSummary {
         dev: (8, 1),
@@ -5860,6 +5862,10 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
             hits: 4,
             state_read_failures: 0,
         },
+        interface_selection: InterfaceSelection::default(),
+        attach_mechanisms: vec!["per-offset"],
+        pid_descendant_gaps: 0,
+        multi_rebuild_gaps: 0,
         unprotected_live_windows: 1,
         module_unresolved_slots: 0,
         discovery: DiscoveryEvidence {

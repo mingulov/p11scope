@@ -494,12 +494,32 @@ No code, dependency, schema, gate, or runtime row is owed by this deferred task.
 
 **Files:**
 
+- Modify: `src/run.rs`
+- Modify: `src/trace.rs`
+- Create: `scripts/matrix/verify-w3-runtime.sh`
+- Create: `scripts/matrix/w3-runtime-harness.c`
+- Modify: `spike/slice1b2-kernel/run.sh`
+- Modify: `docs/usage.md`
 - Create: `docs/superpowers/reports/2026-09-02-wave3-correctness-closure.md`
 - Modify: `docs/superpowers/plans/ROADMAP.md`
 - Modify: `docs/superpowers/plans/2026-09-01-release-wave-charters.md` only if
   closeout evidence changes its recorded Aya decision
 - Modify: `CHANGELOG.md` only if its existing release convention requires it
 
+- [ ] Emit one terminal machine-readable `COUNT_EVIDENCE` line from `trace`.
+  It must contain aggregate `stats_entered`, `stats_returned`, and the number
+  of well-formed non-fork `raw_calls` consumed by that trace session. Count a
+  call before output truncation or semantic reduction; derive STATS entered as
+  completed calls plus in-flight calls. Keep this aggregate-only and do not
+  change the privacy allowlist or public profile schema.
+- [ ] Add one self-testing `verify-w3-runtime.sh` driver and the minimum C
+  fixture needed to prove the two product rows below. Reuse existing evidence,
+  lifecycle, VM, and cleanup machinery; do not add a second framework.
+- [ ] Add one `w3-lane` entry point to the existing VM runner. Run Jammy/5.15
+  and Noble/6.8 serially from fresh overlays with KVM as part of the recorded
+  lane identity. A slower or higher supported-rate claim is follow-up work:
+  W3 needs one predeclared, repeatable initial baseline, not adaptive peak-rate
+  discovery.
 - [ ] Run every unprivileged validator self-test and focused W3 test named in
   Tasks 1–6.
 - [ ] Run the four canonical gates on the exact branch tip and record counts.

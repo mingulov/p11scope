@@ -339,14 +339,20 @@ exact clean Task-4 tip, run the real embedded object on the existing Ubuntu
 22.04 / Linux 5.15 and Ubuntu 24.04 / Linux 6.8 lanes before Task 5 changes the
 fork program again.
 
-- [ ] Record `doctor`, the attach e2e, the privacy canary, and induced-gap G3
+- [x] Record `doctor`, the attach e2e, the privacy canary, and induced-gap G3
   as PASS, FAIL, or `UNRUN` on each exact kernel. Do not inherit W1/W2 evidence.
 - [ ] Require the real object to load, expected slots to attach, canaries to
   report no leak (including interface-selection names), and G3 to retain exact
   aggregate counts while reporting nonzero loss and `PARTIAL`.
-- [ ] If privilege or a required VM is unavailable, keep the row `UNRUN` and
+- [x] If privilege or a required VM is unavailable, keep the row `UNRUN` and
   continue only with that explicit evidence debt; never call the W3 tip runtime
   qualified from local Rust gates alone.
+
+Exact-tip checkpoint at `d66e969` on 2026-09-03: all four Jammy 5.15 rows and
+all four Noble 6.8 rows are `UNRUN`. The current host is Linux 7.0; the original
+VM bases are absent, and the relocated overlays reference deleted backing
+files. Containers do not substitute for the required guest kernels. Historical
+evidence was not inherited, so W3 runtime qualification remains open.
 
 ## Task 5: Dynamic tracepoint offsets and scan-open identity
 

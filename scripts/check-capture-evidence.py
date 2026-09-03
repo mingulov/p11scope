@@ -39,7 +39,7 @@ COUNTERS = (
     "unmatched_closes",
     "shape_decode_failures",
     "shape_decode_total_failures",
-    # Discovery gaps (schema v2). Every one of them forces PARTIAL. None of them
+    # Discovery gaps (schema v3). Every one of them forces PARTIAL. None of them
     # may be nonzero by accident: each lane below states the value it expects and
     # why, because "which sources described this provider" is now part of the
     # oracle, not a detail of how the lane was set up.
@@ -53,6 +53,14 @@ COUNTERS = (
     "discovery_state_failures",
     "discovery_read_failures",
     "discovery_truncated",
+    "task_uprobe_link_losses",
+)
+
+# v2-metrics is retained only for historical fixtures and compatibility reads;
+# it predates the task-uprobe link-loss evidence added to v3-metrics.
+HISTORICAL_METRICS_SCHEMA = "pkcs11-scope/observed-profile/v2-metrics"
+HISTORICAL_COUNTERS = tuple(
+    counter for counter in COUNTERS if counter != "task_uprobe_link_losses"
 )
 
 # `evidence.loader_discovery` (design §9.2): finite, aggregate, and closed.
@@ -97,7 +105,7 @@ U64_MAX = (1 << 64) - 1
 U32_MAX = (1 << 32) - 1
 U16_MAX = (1 << 16) - 1
 PROFILE_SCHEMA = "pkcs11-scope/observed-profile/v3"
-METRICS_SCHEMA = "pkcs11-scope/observed-profile/v2-metrics"
+METRICS_SCHEMA = "pkcs11-scope/observed-profile/v3-metrics"
 SELECTION_KEYS = {
     "providers", "standard_exports", "inventory_surfaces", "tuples",
     "selection_truncated",
@@ -439,8 +447,10 @@ def exact_role_counts(description):
     }, f"observer/helper roles are reversed or widened: {description}")
 
 
-def exact_evidence_keys(evidence, *, profile, terminal=False, child=False):
-    wanted = BASE_EVIDENCE_KEYS | (PROFILE_V3_FIELDS if profile else set())
+def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, historical=False):
+    counter_keys = set(HISTORICAL_COUNTERS if historical else COUNTERS)
+    wanted = (BASE_EVIDENCE_KEYS - set(COUNTERS)) | counter_keys
+    wanted |= PROFILE_V3_FIELDS if profile else set()
     if terminal:
         wanted |= TRACE_TERMINAL_KEYS
     actual = set(evidence)
@@ -497,6 +507,16 @@ def exact_metrics_schema(document, *, run=False):
     require(document["capture"]["mode"] == "metrics", document["capture"])
     require(document["capture"]["privacy_mode"] == "aggregate-only", document["capture"])
     exact_evidence_keys(document["evidence"], profile=False, child=run)
+
+
+def exact_historical_metrics_schema(document, *, run=False):
+    """Validate a retained v2-metrics document without accepting v3 fields."""
+    require(document["schema"] == HISTORICAL_METRICS_SCHEMA, document["schema"])
+    require(document["capture"]["mode"] == "metrics", document["capture"])
+    require(document["capture"]["privacy_mode"] == "aggregate-only", document["capture"])
+    exact_evidence_keys(
+        document["evidence"], profile=False, child=run, historical=True
+    )
 
 
 def exact_identity(carrier):
@@ -1780,9 +1800,11 @@ def document_fixture(evidence, *, schema=PROFILE_SCHEMA, mode="profile", privacy
         evidence.setdefault("attach_mechanisms", [] if evidence["attached_probes"] == 0 else ["per-offset"])
         evidence.setdefault("pid_descendant_gaps", 0)
         evidence.setdefault("multi_rebuild_gaps", 0)
-    elif schema == METRICS_SCHEMA:
+    elif schema in (METRICS_SCHEMA, HISTORICAL_METRICS_SCHEMA):
         for field in PROFILE_V3_FIELDS:
             evidence.pop(field, None)
+        if schema == HISTORICAL_METRICS_SCHEMA:
+            evidence.pop("task_uprobe_link_losses", None)
     return {
         "schema": schema,
         "capture": {
@@ -1825,6 +1847,15 @@ def self_test():
         [(["C_GetFunctionList"], 1), (["C_Initialize"], 1)]
     )
     validate_clean_metrics(clean, {"C_Initialize": 1})
+    historical = document_fixture(
+        clean_evidence,
+        schema=HISTORICAL_METRICS_SCHEMA,
+        mode="metrics",
+        privacy="aggregate-only",
+    )
+    exact_historical_metrics_schema(historical)
+    rejected(lambda: exact_metrics_schema(historical))
+    print("historical v2-metrics fixture remains closed and non-emitted: OK")
     bad_metrics = copy.deepcopy(clean)
     bad_metrics["evidence"]["secret_selection_payload"] = "CANARY"
     rejected(lambda: validate_clean_metrics(bad_metrics, {"C_Initialize": 1}))
@@ -2015,7 +2046,7 @@ def self_test():
     corroborated_evidence.update(table_entries=68, slots=68, attached_probes=136)
     corroborated = document_fixture(
         corroborated_evidence,
-        schema="pkcs11-scope/observed-profile/v2-metrics",
+        schema=METRICS_SCHEMA,
         mode="metrics",
         privacy="aggregate-only",
     )

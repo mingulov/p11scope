@@ -2740,6 +2740,7 @@ fn evidence_for(
         discovery_state_failures,
         discovery_read_failures,
         discovery_truncated,
+        task_uprobe_link_losses: facts.task_uprobe_link_losses(),
         loader_discovery: facts.loader_discovery(),
         interface_selection,
         attach_mechanisms: if include_selection {
@@ -4345,6 +4346,7 @@ mod tests {
         facts.discovery_state_failures = 2;
         facts.discovery_read_failures = 3;
         facts.discovery_truncated = 4;
+        facts.task_uprobe_link_losses = 5;
         let evidence = evidence_for(
             &engine,
             facts,
@@ -4380,6 +4382,7 @@ mod tests {
             assert_eq!(document["discovery_state_failures"], 2);
             assert_eq!(document["discovery_read_failures"], 3);
             assert_eq!(document["discovery_truncated"], 4);
+            assert_eq!(document["task_uprobe_link_losses"], 5);
             assert_eq!(document["completeness"], "PARTIAL");
         }
     }

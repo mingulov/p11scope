@@ -579,6 +579,7 @@ mod tests {
             discovery_state_failures: 0,
             discovery_read_failures: 0,
             discovery_truncated: 0,
+            task_uprobe_link_losses: 0,
             loader_discovery: render::LoaderDiscovery::default(),
             interface_selection: render::InterfaceSelection::default(),
             attach_mechanisms: vec![],

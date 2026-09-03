@@ -201,6 +201,7 @@ fn the_run_only_evidence_field_reaches_the_written_document() {
                 "discovery_state_failures",
                 "discovery_read_failures",
                 "discovery_truncated",
+                "task_uprobe_link_losses",
                 "loader_discovery",
             ] {
                 assert!(

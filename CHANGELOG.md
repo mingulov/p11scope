@@ -27,7 +27,7 @@ pending.
   module-scoped session/operation/async state and explicit count-only evidence
   when two modules publish the same target.
 - **Evidence**: profile and metrics schemas are now
-  `pkcs11-scope/observed-profile/v2` and `v2-metrics`, with
+  `pkcs11-scope/observed-profile/v3` and `v3-metrics`, with
   `capture.modules[]`, per-function module identity, `evidence.discovery[]`,
   `authority: "hash-pinned"`, and explicit scan/corroboration/capacity gaps.
   Top-level skip records retain exact standard function names but bound all

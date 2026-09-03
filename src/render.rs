@@ -111,6 +111,7 @@ pub struct CaptureFacts {
     pub(crate) discovery_state_failures: u64,
     pub(crate) discovery_read_failures: u64,
     pub(crate) discovery_truncated: u64,
+    pub(crate) task_uprobe_link_losses: u64,
 }
 
 impl CaptureFacts {
@@ -145,6 +146,12 @@ impl CaptureFacts {
             self.discovery_read_failures,
             self.discovery_truncated,
         ]
+    }
+
+    /// Task-uprobe links that disappeared while their retained process group
+    /// still had a live member, counted once per affected process view.
+    pub fn task_uprobe_link_losses(&self) -> u64 {
+        self.task_uprobe_link_losses
     }
 
     /// The one live-heading policy: every ordinary heading names the providers
@@ -491,6 +498,9 @@ pub struct Evidence {
     /// userspace decode failures, and every refused/invalid/stale loader
     /// context, each fed exactly once.
     pub discovery_truncated: u64,
+    /// Matched leader exits whose retained process generation stayed live,
+    /// proving task-uprobe link loss; counted once per process view.
+    pub task_uprobe_link_losses: u64,
     /// The always-present finite live-loader aggregate (design §9.2).
     pub loader_discovery: LoaderDiscovery,
     #[serde(skip)]
@@ -651,6 +661,7 @@ impl Evidence {
             && self.discovery_state_failures == 0
             && self.discovery_read_failures == 0
             && self.discovery_truncated == 0
+            && self.task_uprobe_link_losses == 0
             && self.pause_partial == 0
             && self.loader_discovery.complete()
             && (!include_selection
@@ -1048,7 +1059,7 @@ fn capture_modules(ev: &Evidence) -> Vec<serde_json::Value> {
 
 pub fn json(reports: &[SlotReport], ev: &Evidence, capture: &CaptureMeta<'_>) -> serde_json::Value {
     serde_json::json!({
-        "schema": "pkcs11-scope/observed-profile/v2-metrics",
+        "schema": "pkcs11-scope/observed-profile/v3-metrics",
         "capture": { "start": capture.started, "end": capture.ended, "mode": "metrics",
                      "privacy_mode": capture.policy.privacy_mode(),
                      "kernel": capture.kernel,
@@ -1538,6 +1549,7 @@ mod tests {
             discovery_state_failures: 0,
             discovery_read_failures: 0,
             discovery_truncated: 0,
+            task_uprobe_link_losses: 0,
             loader_discovery: LoaderDiscovery::default(),
             interface_selection: InterfaceSelection::default(),
             attach_mechanisms: vec![],
@@ -1603,7 +1615,7 @@ mod tests {
         let metrics = json(&reports_fixture(), &ev, &capture_fixture());
         assert_eq!(
             metrics["schema"],
-            "pkcs11-scope/observed-profile/v2-metrics"
+            "pkcs11-scope/observed-profile/v3-metrics"
         );
         for field in [
             "interface_selection",
@@ -2774,7 +2786,7 @@ mod tests {
             policy: crate::attach::CapturePolicy::AggregateOnly,
         };
         let v = json(&[r], &ev, &capture);
-        assert_eq!(v["schema"], "pkcs11-scope/observed-profile/v2-metrics");
+        assert_eq!(v["schema"], "pkcs11-scope/observed-profile/v3-metrics");
         assert_eq!(v["capture"]["privacy_mode"], "aggregate-only");
         assert_eq!(v["functions"][0]["latency_ns"]["approximate"], true);
         assert_eq!(v["functions"][0]["rv_counts"]["0x0000000000000000"], 1);
@@ -3455,7 +3467,7 @@ mod tests {
     /// The fields §9.1 adds to profile, metrics, and the final trace evidence
     /// object. `child_still_running` is deliberately not here: it is the one
     /// run-only field and must be absent from an ordinary capture.
-    const LIVE_EVIDENCE_FIELDS: [&str; 10] = [
+    const LIVE_EVIDENCE_FIELDS: [&str; 11] = [
         "attach_gap_ms",
         "pause",
         "pause_attempts",
@@ -3465,6 +3477,7 @@ mod tests {
         "discovery_state_failures",
         "discovery_read_failures",
         "discovery_truncated",
+        "task_uprobe_link_losses",
         "loader_discovery",
     ];
 
@@ -3737,6 +3750,7 @@ mod tests {
                 ev.discovery_read_failures = 1
             }),
             ("discovery truncation", |ev| ev.discovery_truncated = 1),
+            ("task-uprobe link loss", |ev| ev.task_uprobe_link_losses = 1),
             ("loader fallback", |ev| {
                 ev.loader_discovery.strategies.dlopen_return = 1
             }),
@@ -3834,7 +3848,7 @@ mod tests {
 
     #[test]
     fn every_discovery_loss_serializes_nonzero_and_independently_forces_partial() {
-        let losses: [(&str, NamedLoss); 4] = [
+        let losses: [(&str, NamedLoss); 5] = [
             ("discovery_ring_loss", |ev| ev.discovery_ring_loss = 7),
             ("discovery_state_failures", |ev| {
                 ev.discovery_state_failures = 7
@@ -3843,6 +3857,9 @@ mod tests {
                 ev.discovery_read_failures = 7
             }),
             ("discovery_truncated", |ev| ev.discovery_truncated = 7),
+            ("task_uprobe_link_losses", |ev| {
+                ev.task_uprobe_link_losses = 7
+            }),
         ];
         let reports = reports_fixture();
         for (field, apply) in losses {

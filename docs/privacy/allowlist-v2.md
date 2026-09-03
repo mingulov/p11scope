@@ -19,6 +19,7 @@ helper and never executes provider code.
 | Selection aggregate | One capture-wide reducer with at most 16 distinct tuples; repeated equal tuples increment one saturating u64 count. | `evidence.interface_selection`; only the exact fields and enums in the v3 schema. |
 | Attach mechanism | Successfully owned links, after attachment succeeds. | Sorted duplicate-free `evidence.attach_mechanisms`, a subset of `per-offset` and `uprobe-multi`. |
 | Descendant/rebuild loss | Saturating userspace counters; no task, PID, generation, link, or timing identity crosses the render boundary. | `evidence.pid_descendant_gaps` and `evidence.multi_rebuild_gaps`. |
+| Task-uprobe link loss | A matched leader-exit record is settled against the retained generation-bound `ProcessView`; no process identity or independent `/proc` probe is captured. | Aggregate-only `evidence.task_uprobe_link_losses`, counted once per affected process view; nonzero forces `PARTIAL`. |
 
 The existing offline exception remains narrow: `p11scope inspect` and an
 explicit `p11scope-discover` inventory may display provider interface names
@@ -27,10 +28,11 @@ trace evidence never publish those bytes. Unknown, unterminated, or aliased
 bytes become only `other` or `unreadable`; even exact `PKCS 11` bytes are
 discarded after classification.
 
-Metrics remains `aggregate-only`, reads no selection arguments, and retains
-the exact `pkcs11-scope/observed-profile/v2-metrics` shape. Individual trace
-lines likewise gain no selection fields. All selection loss is reduced to the
-bounded aggregate and `PARTIAL` verdict.
+Metrics remains `aggregate-only`, reads no selection arguments, and uses the
+exact `pkcs11-scope/observed-profile/v3-metrics` shape. Historical
+`pkcs11-scope/observed-profile/v2-metrics` documents retain their old shape.
+Individual trace lines likewise gain no selection fields. All selection loss is
+reduced to the bounded aggregate and `PARTIAL` verdict.
 
 ## Manifest-v5 selection vocabulary
 

@@ -396,7 +396,7 @@ import json, sys
 d = json.load(open(sys.argv[1])); e = d["evidence"]; mode = sys.argv[2]
 assert (e["table_entries"], e["slots"], e["attached_probes"]) == (68, 68, 136)
 assert e["skipped"] == [{"name": "discovery subject", "reason": "discovery unavailable"}]
-assert [e[k] for k in ("event_loss", "discovery_ring_loss", "discovery_state_failures", "discovery_read_failures", "discovery_truncated")] == [0] * 5
+assert [e[k] for k in ("event_loss", "discovery_ring_loss", "discovery_state_failures", "discovery_read_failures", "discovery_truncated", "task_uprobe_link_losses")] == [0] * 6
 assert all(row["module_ambiguous"] is False for row in d["functions"])
 assert [e[k] for k in ("session_cancel_ambiguities", "auth_state_ambiguities", "fork_state_ambiguities")] == [0] * 3
 assert [e[k] for k in ("in_flight_at_end", "pending_at_end")] == [0, 0]

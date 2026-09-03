@@ -635,7 +635,7 @@ founding rule).
 | --- | --- | --- |
 | W1 | **Task 0 custody rescue first**, then eight scan findings (Tasks 1–8), TDD, review-to-zero; private SDD trove only in `p11scope-ws` | [full plan, reviewed 2026-09-01](2026-09-01-release-hardening-wave1-findings.md) |
 | W2 | Storage consolidation: two-directory rule, migrate + repoint, `p11scope-ws` custody | [full plan](2026-09-01-wave2-storage-consolidation.md) |
-| W3 | **Priority 1: `C_GetInterface` compatibility closure** (partial passive behavior → separate live request/result/failure evidence plus finite offline helper matrix; selection authority limited to exact retained generation or attested exact provider, never inventory); then tracepoint offsets (research #1), opened-inode identity (#2), capability tier ladder + caps model, honest-degradation fixes, and exact-tip per-offset runtime qualification | [charter](2026-09-01-release-wave-charters.md#w3) |
+| W3 | **Priority 1: `C_GetInterface` compatibility closure** (partial passive behavior → separate live request/result/failure evidence plus finite offline helper matrix; selection authority limited to exact retained generation or attested exact provider, never inventory); then tracepoint offsets, opened-inode identity, capability tiers, honest-degradation fixes, and per-offset qualification inputs | [plan](2026-09-02-wave3-correctness-residue.md) / [closure](../reports/2026-09-02-wave3-correctness-closure.md) |
 | W4 | Hosted CI running the full suite; "green locally, not in CI" dies | [charter](2026-09-01-release-wave-charters.md#w4) |
 | W7 | ia32 targets on x86-64 hosts | [charter](2026-09-01-release-wave-charters.md#w7) |
 | W5 | Container/K8s requalification (provisional; W8 re-runs on the final tip) + seccomp/SELinux artifacts | [charter](2026-09-01-release-wave-charters.md#w5) |
@@ -644,6 +644,14 @@ founding rule).
 
 Publication (push, tag, release) is NOT a wave — it is an explicit owner
 decision after W8.
+
+**W3 engineering candidate: READY FOR LOCAL INTEGRATION 2026-09-03.** The exact tested code tip
+`93e0cb1` passed the four Rust 1.88 gates with 1,071 tests and independent
+correctness/security plus test-quality review accepted zero findings.
+Privileged Jammy/5.15, Noble/6.8, `pkcs11-check`, and lifecycle/rate product
+oracles remain explicitly `UNRUN`; they are W6/W8 qualification gates and no
+runtime-qualified or release claim is made. `uprobe_multi` remains a separate
+post-W3 optimization after suitable stable Aya support.
 
 The two product oracles are release gates, not inherited historical evidence:
 

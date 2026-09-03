@@ -61,8 +61,16 @@ an integer from 0 through 4 and request flags are exactly 0 or 1.
 
 Each row has exactly `selector`, `request`, `rv`, `result`,
 `inventory_matches`, `selection_table`, `authority`, and `helper_failure`.
-It has a bounded CK_RV. A successful query may retain both its factual non-null
-`result` and a non-null `helper_failure`. Authority is exactly `inventory`,
+It has a bounded CK_RV. `null_output` and `unreadable_interface` require
+`result=null`. A successful query with `result=null` permits only `null_output`,
+`unreadable_interface`, or `provider_changed`. Only `unreadable_name`, `unreadable_version`,
+`unreadable_table`, `outside_provider`, `unresolved_function`, and
+`provider_changed` may coexist with a factual non-null result. With a factual
+non-null result, `unreadable_name` requires a `null` or `unreadable` result
+name; `unreadable_version` requires an `unreadable` result version; and
+`unreadable_table` requires a `null`, `v3_0`, `v3_1`, or `v3_2` result version.
+Every helper failure requires `authority=none` and a null `selection_table`.
+Authority is exactly `inventory`,
 `selection_count_only`, or `none`. That failure class is exactly `null_output`,
 `unreadable_interface`, `unreadable_name`, `unreadable_version`,
 `unreadable_table`, `outside_provider`, `unresolved_function`, or

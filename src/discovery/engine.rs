@@ -1072,7 +1072,7 @@ impl CaptureFacts {
     /// Retains only the finite, address-free selection tuple. Returns true
     /// when either the tuple or its exact alias set exceeded the capture bound.
     fn record_selection(&mut self, tuple: LiveSelectionTuple, matches_truncated: bool) -> bool {
-        record_selection_in(&mut self.visible_history_mut(), tuple, matches_truncated)
+        record_selection_in(self.visible_history_mut(), tuple, matches_truncated)
     }
 }
 
@@ -11638,14 +11638,16 @@ impl Engine {
                 &mut closure,
             )?;
         }
-        changed |= self.process_discovery_records(
-            session,
-            &mut records,
-            &mut pending_views,
-            &mut additions_allowed,
-            collect,
-            &mut closure,
-        )?;
+        if !records.is_empty() {
+            changed |= self.process_discovery_records(
+                session,
+                &mut records,
+                &mut pending_views,
+                &mut additions_allowed,
+                collect,
+                &mut closure,
+            )?;
+        }
         record_object_skips(&mut self.plan, &self.counters.object_skips);
         self.publish_current_capture_facts()?;
         Ok(DiscoveryBatchOutcome {

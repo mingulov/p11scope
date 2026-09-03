@@ -4,10 +4,10 @@
 
 The Wave 3 engineering candidate is ready for local integration on
 `hardening/wave3-correctness`, based on merged W2
-`a2a264456bc0c30d3c30e727c85507940a90b75f`. The tested code tip is
-`93e0cb1a495b59eb33195766e1117c30f3982dc6` (69 commits before this report).
-The Rust 1.88 gates passed at that exact tree: formatting, check, 1,071 tests
-with zero failures, and Clippy with warnings denied.
+`a2a264456bc0c30d3c30e727c85507940a90b75f`. The final integrated production
+tip is `ec5e0aef329dbccec472bb1e0d369d5cbb9deeee`. The Rust 1.88 gates passed
+on the final documented main tree: formatting, check, 1,072 tests with zero
+failures, and Clippy with warnings denied.
 
 The candidate now records bounded offline and live `C_GetInterface` request,
 result, failure, alias, and coverage evidence without turning selection into
@@ -32,11 +32,11 @@ error text are not added to capture output.
 
 ## Verification
 
-At tested code tip `93e0cb1`:
+On the final locally integrated main tree (production tip `ec5e0ae`):
 
 - `cargo +1.88 fmt --all -- --check`: PASS.
 - `cargo +1.88 check --locked --workspace --all-targets`: PASS.
-- `cargo +1.88 test --locked --workspace --all-targets`: PASS, 1,071/0.
+- `cargo +1.88 test --locked --workspace --all-targets`: PASS, 1,072/0.
 - `cargo +1.88 clippy --locked --workspace --all-targets -- -D warnings`: PASS.
 
 The focused W3 checks also passed: manifest/discover selection matrices,
@@ -54,6 +54,14 @@ Two independent full-diff lanes reviewed the final W3 production tree. The Sol
 correctness/security lane and Luna test-quality/regression lane both accepted
 zero actionable findings after the last lifecycle fix and stale Aya-note
 correction. No third lane was needed.
+
+The first merged-main gate then exposed a parallel-only false
+`ProviderChanged` result in the offline helper: its selection bracket compared
+unrelated anonymous worker-stack mappings. A RED mutation test and
+`ec5e0ae` restrict that stability comparison to the exact file-backed mapping
+class that can authorize provider/function identities. The affected fixture
+binary passed five consecutive parallel runs, and independent Sol and Luna
+reviews accepted the correction with zero findings before the final main gate.
 
 ## Runtime evidence boundary
 

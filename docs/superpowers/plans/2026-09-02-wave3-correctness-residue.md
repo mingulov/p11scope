@@ -504,22 +504,22 @@ No code, dependency, schema, gate, or runtime row is owed by this deferred task.
   closeout evidence changes its recorded Aya decision
 - Modify: `CHANGELOG.md` only if its existing release convention requires it
 
-- [ ] Emit one terminal machine-readable `COUNT_EVIDENCE` line from `trace`.
+- [x] Emit one terminal machine-readable `COUNT_EVIDENCE` line from `trace`.
   It must contain aggregate `stats_entered`, `stats_returned`, and the number
   of well-formed non-fork `raw_calls` consumed by that trace session. Count a
   call before output truncation or semantic reduction; derive STATS entered as
   completed calls plus in-flight calls. Keep this aggregate-only and do not
   change the privacy allowlist or public profile schema.
-- [ ] Do not add a second runtime framework. The owner will run the real
+- [x] Do not add a second runtime framework. The owner will run the real
   `pkcs11-check`, Jammy/5.15, and Noble/6.8 qualification after W3 while
   evaluating the candidate. Preserve exact commands and expected relationships
   in the closure report, and record these rows as `UNRUN` until then.
-- [ ] Run every unprivileged validator self-test and focused W3 test named in
+- [x] Run every unprivileged validator self-test and focused W3 test named in
   Tasks 1–6.
-- [ ] Run the four canonical gates on the exact branch tip and record counts.
-- [ ] Record privileged/container/VM rows as PASS, FAIL, or `UNRUN`; never
+- [x] Run the four canonical gates on the exact branch tip and record counts.
+- [x] Record privileged/container/VM rows as PASS, FAIL, or `UNRUN`; never
   inherit W1/W2 evidence.
-- [ ] Specify the two later product-qualification rows against the exact tip:
+- [x] Specify the two later product-qualification rows against the exact tip:
   `supported_rate_loss_oracle` (an empirically declared, matrix-specific fixed
   burst/rate with exact agreement between generator-completed calls, STATS
   entered/returned, and raw consumed `CALL` records, zero loss, and induced
@@ -533,17 +533,17 @@ No code, dependency, schema, gate, or runtime row is owed by this deferred task.
   they may remain explicitly `UNRUN` for the W3 engineering closeout so the
   resulting candidate can be evaluated manually; never convert that status
   into a working-product claim. W6 repeats the broader release matrix.
-- [ ] For those future exact-tip runtime lanes, use the existing documented
+- [x] For those future exact-tip runtime lanes, use the existing documented
   commands and checkers for one operator journey
   (`doctor -> inspect -> run/profile -> trace`). Add an exact-count
   `trace --pid` row against the deterministic PKCS#11 oracle; canary presence
   alone is insufficient. Bind the record to the exact binary and embedded BPF
   object hashes and require actionable insufficient-authority diagnostics.
-- [ ] Independent full-diff Sol correctness/security review and Luna
+- [x] Independent full-diff Sol correctness/security review and Luna
   test-quality/regression review. Add a third distinct reviewer only for a
   genuinely separate risk. Triage with source evidence; batch accepted fixes
   three to five at a time; repeat until a complete cycle accepts zero findings.
-- [ ] Update the closure report and ROADMAP with exact commit/test evidence.
+- [x] Update the closure report and ROADMAP with exact commit/test evidence.
 - [ ] Use `superpowers:finishing-a-development-branch`: merge locally to main
   only after review-to-zero, rerun all four gates on merged main, and leave
   push/tag/publish untouched.

@@ -3823,6 +3823,42 @@ mod tests {
     }
 
     #[test]
+    fn every_discovery_loss_serializes_nonzero_and_independently_forces_partial() {
+        let losses: [(&str, NamedLoss); 4] = [
+            ("discovery_ring_loss", |ev| ev.discovery_ring_loss = 7),
+            ("discovery_state_failures", |ev| {
+                ev.discovery_state_failures = 7
+            }),
+            ("discovery_read_failures", |ev| {
+                ev.discovery_read_failures = 7
+            }),
+            ("discovery_truncated", |ev| ev.discovery_truncated = 7),
+        ];
+        let reports = reports_fixture();
+        for (field, apply) in losses {
+            let mut ev = evidence();
+            apply(&mut ev);
+            ev.verdict();
+            assert_eq!(ev.completeness, "PARTIAL", "{field}");
+
+            let profile = profile_json(&reports, &ev, &state_fixture(), &capture_fixture());
+            let metrics = json(&reports, &ev, &capture_fixture());
+            let terminal = trace_evidence_object(&ev);
+            for document in [&profile["evidence"], &metrics["evidence"], &terminal] {
+                assert_eq!(document[field], 7, "{field}");
+                assert_eq!(document["completeness"], "PARTIAL", "{field}");
+                for (other, _) in losses {
+                    assert_eq!(
+                        document[other],
+                        if other == field { 7 } else { 0 },
+                        "{field} must not alias {other}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn neutral_selection_states_preserve_baseline_completeness() {
         let neutral: Vec<(&str, NamedLoss)> = vec![
             ("observed", |ev| {

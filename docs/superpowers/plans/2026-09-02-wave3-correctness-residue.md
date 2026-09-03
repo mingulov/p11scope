@@ -436,15 +436,15 @@ the highest proven prefix; unknown target/scope inputs produce T1 plus
 change `evidence.authority`; actual attach/loss/skipped-object evidence owns the
 capture verdict.
 
-- [ ] RED: `capability_tier_is_monotonic_without_lease_authority` covers the
+- [x] RED: `capability_tier_is_monotonic_without_lease_authority` covers the
   exact `H/R/L/S` truth table, `R=unassessed`, and operational results overriding
   capability guesses; classifier inputs contain no lease, trusted-workload,
   root-authority, or hardened-oracle predicate. Add CAP_DAC_READ_SEARCH bit 2.
   Do not claim CAP_SYS_RESOURCE or an RLIMIT_MEMLOCK requirement.
-- [ ] GREEN: emit the finite tier and assessed/unassessed state from `doctor`;
+- [x] GREEN: emit the finite tier and assessed/unassessed state from `doctor`;
   reuse current real probes rather than a toy program. Capture output gains no
   `tier`, lease, or hardened authority field. Document exact losses per tier.
-- [ ] RED: `eperm_origin_requires_independent_evidence` proves bare `EPERM`
+- [x] RED: `eperm_origin_requires_independent_evidence` proves bare `EPERM`
   stays unknown, merely observing seccomp mode 2 is not causal proof, a
   controlled syscall-denial fact selects seccomp, and a proven missing
   capability selects capability. `verifier_diagnostics_are_bounded` accepts
@@ -452,22 +452,22 @@ capture verdict.
   the existing terminal helper, and caps the complete rendered fragment at
   4096 UTF-8 bytes including a literal ` [truncated]` suffix without splitting
   a scalar; it never includes a target path or generic error chain.
-- [ ] GREEN: distinguish evidence-backed seccomp denial from missing-capability
+- [x] GREEN: distinguish evidence-backed seccomp denial from missing-capability
   denial without guessing from `EPERM` alone, and surface bounded Aya verifier
   diagnostics on load failure without target data.
-- [ ] RED: for each discovery loss counter, serialize profile/metrics/terminal
+- [x] RED: for each discovery loss counter, serialize profile/metrics/terminal
   evidence and prove consumer verdict is `PARTIAL` exactly once.
-- [ ] RED: `pid_scope_fork_marks_descendant_unobserved_partial` proves a fork
+- [x] RED: `pid_scope_fork_marks_descendant_unobserved_partial` proves a fork
   observed under one-process PID scope records one finite count-only descendant
   gap and forces `PARTIAL`; document cgroup scope as the descendant-coverage
   route. Never inherit child semantic state as tracing coverage.
-- [ ] GREEN: attach the fork observation boundary for one-process PID scope as
+- [x] GREEN: attach the fork observation boundary for one-process PID scope as
   well as cgroup scope, record each child as a finite saturating gap, and expose
   only that count through Task 4's versioned evidence. A missing PID-scope fork
   boundary degrades the attempted capture to explicit `PARTIAL`; it must never
   leave `pid_descendant_gaps` at an invented zero or silently inherit child
   tracing coverage.
-- [ ] Update capability self-test and docs; privileged rows remain `UNRUN` if
+- [x] Update capability self-test and docs; privileged rows remain `UNRUN` if
   not authorized. Focused checks:
   `cargo +1.88 test --locked --lib capability_tier`,
   `cargo +1.88 test --locked --lib pid_scope_fork_marks_descendant_unobserved_partial`,

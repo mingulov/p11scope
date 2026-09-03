@@ -257,6 +257,26 @@ profile output. If the ring buffer drops events, it also emits an explicit
 
 ## Privileges, per environment
 
+`doctor` reports one finite availability tier for the requested host and
+target. The tier is preflight evidence, not capture authority or a completeness
+promise. With no `--pid`, target readability is explicitly `unassessed`.
+
+| Tier | Proven prefix | Meaning and loss |
+| --- | --- | --- |
+| T0 offline | host attach failed | Offline helper, inspect, and report work only; no live-call evidence. |
+| T1 host attach | supported kernel, real embedded BPF object/maps/program load, and an actual self-uprobe | Live observation works on this host; target readability is failed or unassessed. |
+| T2 target readable | T1 plus one stable target generation, readable `maps`, `mem`, and `root`, and exact executable/provider identity opens through that root | The target can be planned; lifecycle changes may be missed, so an attempted capture can be `PARTIAL`. |
+| T3 lifecycle | T2 plus successful real exec and exit lifecycle links | Base lifecycle coverage works; a requested scope-specific lane is unavailable or degraded. |
+| T4 current full | T3 plus every requested scope operation, including filter publication, cgroup access, and fork tracing when required | Current mechanisms preflighted; this is neither leased/hardened authority nor a `COMPLETE` promise. |
+
+The doctor runs the real embedded BPF object/map/program inventory and drops a
+temporary session after preflighting exec/exit lifecycle links and every
+requested PID/cgroup scope. T3/T4 come only from those observed operations;
+they are never inferred from uid, seccomp mode, sysctls, or capabilities.
+`CAP_DAC_READ_SEARCH`, `CAP_SYS_PTRACE`, `CAP_SYS_ADMIN`,
+`CAP_PERFMON`, `CAP_BPF`, and `CAP_CHECKPOINT_RESTORE` are diagnostic rows only.
+There is no `CAP_SYS_RESOURCE` or `RLIMIT_MEMLOCK` requirement claim.
+
 The current manifest-free matrix was measured on 2026-08-17 by
 `scripts/matrix/verify-fork-scope.sh`, against a same-UID non-descendant with
 SoftHSM2 already mapped. Host: kernel 7.0.0-28-generic,

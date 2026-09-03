@@ -10840,6 +10840,98 @@ impl Engine {
         self.drain_discovery_from(session)
     }
 
+    /// Drains the detached discovery ring to an observed empty read. Every
+    /// quantum is applied before collecting the next one, so each exact prefix
+    /// remains accounted for and producer counters are refreshed per batch.
+    pub fn drain_discovery_terminal(&mut self, session: &mut Session) -> Result<bool> {
+        self.drain_discovery_terminal_from(session)
+    }
+
+    /// Drains one discovery quantum after a failed producer detach. The exact
+    /// prefix is applied without admitting new static or dynamic producers;
+    /// any remaining records stay queued for bounded terminal evidence.
+    pub(crate) fn drain_discovery_terminal_bounded_from(
+        &mut self,
+        session: &mut dyn EngineSession,
+    ) -> Result<bool> {
+        let mut collect = Self::collect_discovery_records;
+        let (records, malformed, failure) = match Self::collect_discovery_records(session) {
+            Ok((records, malformed)) => (records, malformed, None),
+            Err(error) => match error.downcast::<IncompleteTerminalDrain>() {
+                Ok(incomplete) if incomplete.backlog => {
+                    (incomplete.records, incomplete.malformed, None)
+                }
+                Ok(incomplete) => {
+                    self.account_unvalidated_discovery(incomplete.unvalidated_records);
+                    (
+                        incomplete.records,
+                        incomplete.malformed,
+                        Some(anyhow::Error::msg(incomplete.cause)),
+                    )
+                }
+                Err(error) => return Err(error),
+            },
+        };
+        let outcome = self.apply_discovery_batch_with(
+            session,
+            records,
+            malformed,
+            false,
+            false,
+            &mut collect,
+            None,
+        )?;
+        if let Some(failure) = failure {
+            return Err(failure);
+        }
+        Ok(outcome.changed)
+    }
+
+    pub(crate) fn drain_discovery_terminal_from(
+        &mut self,
+        session: &mut dyn EngineSession,
+    ) -> Result<bool> {
+        let mut changed = false;
+        let mut collect = Self::collect_discovery_records;
+        loop {
+            let (records, malformed, complete, failure) =
+                match Self::collect_discovery_records(session) {
+                    Ok((records, malformed)) => (records, malformed, true, None),
+                    Err(error) => match error.downcast::<IncompleteTerminalDrain>() {
+                        Ok(incomplete) if incomplete.backlog => {
+                            (incomplete.records, incomplete.malformed, false, None)
+                        }
+                        Ok(incomplete) => {
+                            self.account_unvalidated_discovery(incomplete.unvalidated_records);
+                            (
+                                incomplete.records,
+                                incomplete.malformed,
+                                true,
+                                Some(anyhow::Error::msg(incomplete.cause)),
+                            )
+                        }
+                        Err(error) => return Err(error),
+                    },
+                };
+            let outcome = self.apply_discovery_batch_with(
+                session,
+                records,
+                malformed,
+                false,
+                false,
+                &mut collect,
+                None,
+            )?;
+            changed |= outcome.changed;
+            if let Some(failure) = failure {
+                return Err(failure);
+            }
+            if complete {
+                return Ok(changed);
+            }
+        }
+    }
+
     /// A quantum stop is backlog, not failure: the exact prefix is applied now
     /// and the rest stays on the ring for the next tick, which the run loop's
     /// duration/signal checks precede. Overflow in between is the producer's
@@ -11932,6 +12024,157 @@ pub(crate) mod tests {
             engine.malformed_discovery,
             LIVE_DISCOVERY_DRAIN_QUANTUM as u64 + 1
         );
+        assert!(session.dequeues.is_empty());
+    }
+
+    #[test]
+    fn terminal_drain_consumes_all_discovery_quanta_and_refreshes_counters() {
+        let (mut engine, _scope) = engine_over_cgroup_naming(&[]);
+        let mut session = ScriptedSession::default();
+        session.counters.loader_hits = 7;
+        session.dequeues.extend(
+            (0..=LIVE_DISCOVERY_DRAIN_QUANTUM)
+                .map(|_| Ok(Some(crate::events::DiscoveryItem::Malformed))),
+        );
+        session.dequeues.push_back(Ok(None));
+
+        assert!(!engine.drain_discovery_terminal_from(&mut session).unwrap());
+        assert_eq!(
+            engine.malformed_discovery_for_test(),
+            LIVE_DISCOVERY_DRAIN_QUANTUM as u64 + 1
+        );
+        assert_eq!(
+            engine.capture_facts().discovery_truncated,
+            LIVE_DISCOVERY_DRAIN_QUANTUM as u64 + 1
+        );
+        assert_eq!(engine.loader_discovery().hits, 7);
+        assert_eq!(
+            session.counter_reads(),
+            2,
+            "each applied quantum refreshes counters"
+        );
+        assert!(
+            session.dequeues.is_empty(),
+            "the terminating empty read is consumed"
+        );
+    }
+
+    #[test]
+    fn terminal_drain_never_attaches_a_late_valid_export() {
+        let (view, _maps, record) = self_export_fixture(ProcessViewId(0));
+        let mut engine = Engine::empty();
+        engine.next_view_id = 1;
+        engine.views.push(view);
+        engine.budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        });
+        let mut session = ScriptedSession::default();
+        session.dequeues.extend([
+            Ok(Some(crate::events::DiscoveryItem::Record(record))),
+            Ok(None),
+        ]);
+
+        engine
+            .drain_discovery_terminal_from(&mut session)
+            .expect("a valid late record is accounted without post-detach attach");
+
+        assert!(session.attached_slots.is_empty());
+        assert!(session.dynamic_attach_calls.is_empty());
+        assert!(
+            engine
+                .plan
+                .slots
+                .iter()
+                .all(|slot| !engine.plan.is_active(slot.index)),
+            "terminal discovery must not admit active targets"
+        );
+        assert!(session.dequeues.is_empty());
+    }
+
+    #[test]
+    fn bounded_terminal_drain_rejects_late_export_and_leaves_one_quantum_backlog() {
+        let (view, _maps, record) = self_export_fixture(ProcessViewId(0));
+        let mut engine = Engine::empty();
+        engine.next_view_id = 1;
+        engine.views.push(view);
+        engine.budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        });
+        let mut session = ScriptedSession::default();
+        session
+            .dequeues
+            .push_back(Ok(Some(crate::events::DiscoveryItem::Record(record))));
+        session.dequeues.extend(
+            (0..LIVE_DISCOVERY_DRAIN_QUANTUM)
+                .map(|_| Ok(Some(crate::events::DiscoveryItem::Malformed))),
+        );
+
+        engine
+            .drain_discovery_terminal_bounded_from(&mut session)
+            .expect("a bounded terminal drain keeps its unread backlog");
+
+        assert!(session.attached_slots.is_empty());
+        assert!(session.dynamic_attach_calls.is_empty());
+        assert!(
+            engine
+                .plan
+                .slots
+                .iter()
+                .all(|slot| !engine.plan.is_active(slot.index)),
+            "detach-failure discovery must not admit active targets"
+        );
+        assert_eq!(
+            session.dequeues.len(),
+            1,
+            "only the record beyond the bounded quantum remains queued"
+        );
+        assert_eq!(
+            engine.malformed_discovery_for_test(),
+            (LIVE_DISCOVERY_DRAIN_QUANTUM - 1) as u64
+        );
+    }
+
+    #[test]
+    fn terminal_drain_applies_a_consumed_prefix_before_reporting_dequeue_failure() {
+        let (mut engine, _scope) = engine_over_cgroup_naming(&[]);
+        let mut session = ScriptedSession::default();
+        session.dequeues.extend([
+            Ok(Some(crate::events::DiscoveryItem::Malformed)),
+            Ok(Some(crate::events::DiscoveryItem::Malformed)),
+            Err(anyhow!("scripted terminal dequeue failed")),
+        ]);
+
+        let error = engine
+            .drain_discovery_terminal_from(&mut session)
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "scripted terminal dequeue failed");
+        assert_eq!(engine.malformed_discovery_for_test(), 2);
+        assert_eq!(engine.capture_facts().discovery_truncated, 2);
+        assert!(session.dequeues.is_empty());
+    }
+
+    #[test]
+    fn bounded_terminal_drain_applies_a_consumed_prefix_before_dequeue_failure() {
+        let (mut engine, _scope) = engine_over_cgroup_naming(&[]);
+        let mut session = ScriptedSession::default();
+        session.dequeues.extend([
+            Ok(Some(crate::events::DiscoveryItem::Malformed)),
+            Err(anyhow!("scripted bounded terminal dequeue failed")),
+        ]);
+
+        let error = engine
+            .drain_discovery_terminal_bounded_from(&mut session)
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "scripted bounded terminal dequeue failed"
+        );
+        assert_eq!(engine.malformed_discovery_for_test(), 1);
+        assert_eq!(engine.capture_facts().discovery_truncated, 1);
         assert!(session.dequeues.is_empty());
     }
 

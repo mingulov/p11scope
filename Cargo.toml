@@ -33,6 +33,7 @@ serde_json = "1"
 signal-hook = { version = "0.4.4", default-features = false }
 
 [dev-dependencies]
+aya-obj = "=0.3.0"
 p11scope-discover = { path = "crates/discover" }
 tempfile = "3"
 

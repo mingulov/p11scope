@@ -1959,14 +1959,17 @@ pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
     };
     // SAFETY: userspace parsed and checked both offsets from this tracepoint's
     // live tracefs format before freezing CONFIG and attaching this program.
-    let Ok(parent) = (unsafe { ctx.read_at::<u32>(parent_offset) }) else {
+    let Ok(_parent_tid) = (unsafe { ctx.read_at::<u32>(parent_offset) }) else {
         return 0;
     };
     let Ok(child) = (unsafe { ctx.read_at::<u32>(child_offset) }) else {
         return 0;
     };
+    // `parent_pid` is the calling thread ID. The admitted scope and userspace
+    // process state are keyed by TGID, including when a worker thread forks.
+    let parent_tgid = helpers::bpf_get_current_pid_tgid() >> 32;
     let ev = Event {
-        pid_tgid: (parent as u64) << 32,
+        pid_tgid: parent_tgid << 32,
         session: child as u64,
         event_type: event_type::FORK,
         ..Event::default()

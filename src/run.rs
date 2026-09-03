@@ -1059,6 +1059,7 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
     run_loop(
         &mut engine,
         &mut session,
+        &scope,
         kind,
         policy,
         a.duration,
@@ -1114,6 +1115,7 @@ impl OutputSink {
 fn run_loop(
     engine: &mut Engine,
     session: &mut Session,
+    scope: &Scope,
     kind: Kind,
     policy: CapturePolicy,
     duration: Option<Duration>,
@@ -1129,7 +1131,16 @@ fn run_loop(
                 OutputSink::Profile(file) => Some(*file),
                 _ => None,
             };
-            capture_profile(engine, session, policy, duration, out, interrupted, owned)
+            capture_profile(
+                engine,
+                session,
+                scope,
+                policy,
+                duration,
+                out,
+                interrupted,
+                owned,
+            )
         }
         Kind::Trace => {
             let out = match out {
@@ -1139,6 +1150,7 @@ fn run_loop(
             capture_trace(
                 engine,
                 session,
+                scope,
                 policy,
                 duration,
                 max_events,
@@ -1591,6 +1603,7 @@ fn run_owned_inner(args: &RunArgs) -> Result<OwnedRunOutcome> {
     let evidence = run_loop(
         &mut engine,
         &mut session,
+        &scope,
         args.kind,
         policy,
         args.duration,
@@ -1726,12 +1739,20 @@ fn retire_exited(tracker: &mut process::Tracker, state: &mut semantics::State) {
 fn observe_fork(
     tracker: &mut process::Tracker,
     state: &mut semantics::State,
+    scope: &Scope,
+    pid_descendant_gaps: &mut u64,
     ev: &p11scope_ebpf_common::Event,
 ) -> bool {
     if ev.event_type != p11scope_ebpf_common::event_type::FORK {
         return false;
     }
     let parent_pid = (ev.pid_tgid >> 32) as u32;
+    if let Scope::Pid(selected) = scope {
+        if parent_pid == *selected {
+            *pid_descendant_gaps = pid_descendant_gaps.saturating_add(1);
+        }
+        return true;
+    }
     if !state.pid_has_process_state(parent_pid) {
         return true;
     }
@@ -1753,6 +1774,23 @@ fn observe_fork(
         tracker.retire(child.key);
     }
     true
+}
+
+fn initial_tracking_evidence(
+    scope: &Scope,
+    fork_tracking_unavailable: bool,
+    lifecycle_tracking_unavailable: bool,
+) -> (u64, bool) {
+    match scope {
+        Scope::Pid(_) => (
+            u64::from(fork_tracking_unavailable),
+            lifecycle_tracking_unavailable,
+        ),
+        Scope::Cgroup { .. } => (
+            0,
+            fork_tracking_unavailable || lifecycle_tracking_unavailable,
+        ),
+    }
 }
 
 /// One tick's discovery step, and the one place the pause policy changes the
@@ -1883,6 +1921,7 @@ fn resolve_trace_max_events(max_events: Option<u64>) -> u64 {
 fn capture_profile(
     engine: &mut Engine,
     session: &mut Session,
+    scope: &Scope,
     policy: CapturePolicy,
     duration: Option<Duration>,
     output: Option<AtomicFile>,
@@ -1914,13 +1953,26 @@ fn capture_profile(
     }
     let drain_events = |session: &mut Session,
                         state: &mut semantics::State,
-                        tracker: &mut process::Tracker|
+                        tracker: &mut process::Tracker,
+                        pid_descendant_gaps: &mut u64|
      -> Result<u64> {
         let quantum = session.live_poll_quantum();
         let mut drain = session.event_drain()?;
-        Ok(drain_profile_events(&mut drain, state, tracker, quantum))
+        Ok(drain_profile_events(
+            &mut drain,
+            state,
+            tracker,
+            scope,
+            pid_descendant_gaps,
+            quantum,
+        ))
     };
     let mut malformed_records: u64 = 0;
+    let (mut pid_descendant_gaps, capture_tracking_degraded) = initial_tracking_evidence(
+        scope,
+        session.fork_tracking_unavailable().is_some(),
+        session.lifecycle_tracking_unavailable().is_some(),
+    );
     let mut stdout_open = true;
     let wall_start = SystemTime::now();
     let clock = Instant::now();
@@ -1944,7 +1996,12 @@ fn capture_profile(
         // 3. Drain call events — one quantum while the producers are live, so
         //    a hot producer hands control back to step 2's checks every tick.
         if profile {
-            malformed_records += drain_events(session, &mut state, &mut process_tracker)?;
+            malformed_records += drain_events(
+                session,
+                &mut state,
+                &mut process_tracker,
+                &mut pid_descendant_gaps,
+            )?;
         }
         // 4. Retire exited process state.
         retire_exited(&mut process_tracker, &mut state);
@@ -1964,6 +2021,7 @@ fn capture_profile(
             last_frame = Instant::now();
             let ev = evidence_for(
                 engine,
+                engine.capture_facts(),
                 session.attached_probes(),
                 session.attach_failures(),
                 &reports,
@@ -1974,6 +2032,8 @@ fn capture_profile(
                 engine.pinned().provider_changed(),
                 profile,
                 owned.as_deref(),
+                pid_descendant_gaps,
+                capture_tracking_degraded,
             );
             let frame = render::live(
                 &reports,
@@ -2009,8 +2069,21 @@ fn capture_profile(
     let terminal = (|| -> Result<render::Evidence> {
     // A detach error is retained until after this terminal drain. Do not put a
     // fallible provider check between those two operations.
+    let plan_changed = if detach.is_ok() {
+        engine.drain_discovery_terminal(session)?
+    } else {
+        engine.drain_discovery_terminal_bounded_from(session)?
+    };
+    if plan_changed {
+        state.sync_plan(engine.plan());
+    }
     if profile {
-        malformed_records += drain_events(session, &mut state, &mut process_tracker)?;
+        malformed_records += drain_events(
+            session,
+            &mut state,
+            &mut process_tracker,
+            &mut pid_descendant_gaps,
+        )?;
     }
     retire_exited(&mut process_tracker, &mut state);
     let reports = metrics::read(session, engine.plan())?;
@@ -2029,6 +2102,7 @@ fn capture_profile(
     engine.settle_terminal_drain();
     let mut ev = evidence_for(
         engine,
+        engine.capture_facts(),
         session.attached_probes(),
         session.attach_failures(),
         &reports,
@@ -2039,6 +2113,8 @@ fn capture_profile(
         engine.pinned().provider_changed(),
         profile,
         owned.as_deref(),
+        pid_descendant_gaps,
+        capture_tracking_degraded,
     );
     ev.mark_terminal_drain_unproven();
     // The terminal frame and the JSON use the same capture facts.
@@ -2109,6 +2185,7 @@ fn write_json_report(file: &mut std::fs::File, j: &serde_json::Value) -> Result<
 fn capture_trace(
     engine: &mut Engine,
     session: &mut Session,
+    scope: &Scope,
     policy: CapturePolicy,
     duration: Option<Duration>,
     max_events: Option<u64>,
@@ -2142,6 +2219,11 @@ fn capture_trace(
 
     let mut stdout_open = true;
     let mut malformed_records: u64 = 0;
+    let (mut pid_descendant_gaps, capture_tracking_degraded) = initial_tracking_evidence(
+        scope,
+        session.fork_tracking_unavailable().is_some(),
+        session.lifecycle_tracking_unavailable().is_some(),
+    );
     let mut last_reported_loss: u64 = 0;
     if let Err(error) = emit_trace_line(
         &trace::capture_line(policy),
@@ -2182,6 +2264,8 @@ fn capture_trace(
             &mut remaining,
             &mut state,
             &mut process_tracker,
+            scope,
+            &mut pid_descendant_gaps,
             &mut tracer,
             stdout,
             &mut stdout_open,
@@ -2232,11 +2316,22 @@ fn capture_trace(
     // Drain everything currently visible after detach, then report the closing
     // loss line. Kernel detach does not wait for callbacks already executing
     // on another CPU, so terminal evidence below remains explicitly PARTIAL.
+    let plan_changed = if detach.is_ok() {
+        engine.drain_discovery_terminal(session)?
+    } else {
+        engine.drain_discovery_terminal_bounded_from(session)?
+    };
+    if plan_changed {
+        state.sync_plan(engine.plan());
+        tracer.sync_plan(engine.plan());
+    }
     malformed_records += drain_trace_events(
         session,
         &mut remaining,
         &mut state,
         &mut process_tracker,
+        scope,
+        &mut pid_descendant_gaps,
         &mut tracer,
         stdout,
         &mut stdout_open,
@@ -2265,6 +2360,7 @@ fn capture_trace(
     let trace_truncated = end == CaptureEnd::LimitReached || remaining == Some(0);
     let mut evidence = evidence_for(
         engine,
+        engine.capture_facts(),
         session.attached_probes(),
         session.attach_failures(),
         &reports,
@@ -2275,6 +2371,8 @@ fn capture_trace(
         engine.pinned().provider_changed(),
         true,
         owned.as_deref(),
+        pid_descendant_gaps,
+        capture_tracking_degraded,
     );
     evidence.mark_terminal_drain_unproven();
     if trace_truncated {
@@ -2374,10 +2472,12 @@ fn drain_profile_events<S: crate::events::RecordSource>(
     drain: &mut crate::events::EventDrain<S>,
     state: &mut semantics::State,
     tracker: &mut process::Tracker,
+    scope: &Scope,
+    pid_descendant_gaps: &mut u64,
     quantum: Option<usize>,
 ) -> u64 {
     drain.poll(quantum, |ev| {
-        if observe_fork(tracker, state, &ev) {
+        if observe_fork(tracker, state, scope, pid_descendant_gaps, &ev) {
             return ControlFlow::Continue(());
         }
         let process = identify_tracked(tracker, state, &ev);
@@ -2401,6 +2501,8 @@ fn drain_trace_events<W: Write>(
     remaining: &mut Option<u64>,
     state: &mut semantics::State,
     tracker: &mut process::Tracker,
+    scope: &Scope,
+    pid_descendant_gaps: &mut u64,
     tracer: &mut trace::Tracer,
     stdout: &mut dyn Write,
     stdout_open: &mut bool,
@@ -2413,6 +2515,8 @@ fn drain_trace_events<W: Write>(
         remaining,
         state,
         tracker,
+        scope,
+        pid_descendant_gaps,
         tracer,
         stdout,
         stdout_open,
@@ -2427,6 +2531,8 @@ fn drain_trace_events_from<S: crate::events::RecordSource, W: Write>(
     remaining: &mut Option<u64>,
     state: &mut semantics::State,
     tracker: &mut process::Tracker,
+    scope: &Scope,
+    pid_descendant_gaps: &mut u64,
     tracer: &mut trace::Tracer,
     stdout: &mut dyn Write,
     stdout_open: &mut bool,
@@ -2435,7 +2541,7 @@ fn drain_trace_events_from<S: crate::events::RecordSource, W: Write>(
 ) -> Result<u64> {
     let mut write_error = None;
     drain.poll(quantum, |ev| {
-        if observe_fork(tracker, state, &ev) {
+        if observe_fork(tracker, state, scope, pid_descendant_gaps, &ev) {
             return ControlFlow::Continue(());
         }
         let process = identify_tracked(tracker, state, &ev);
@@ -2501,6 +2607,7 @@ fn report_trace_loss<W: Write>(
 #[allow(clippy::too_many_arguments)]
 fn evidence_for(
     engine: &Engine,
+    facts: render::CaptureFacts,
     attached_probes: usize,
     attach_failures: &[(u32, String)],
     reports: &[metrics::SlotReport],
@@ -2511,6 +2618,8 @@ fn evidence_for(
     provider_changed: bool,
     include_selection: bool,
     owned: Option<&Owned>,
+    pid_descendant_gaps: u64,
+    capture_tracking_degraded: bool,
 ) -> render::Evidence {
     let semantic = state.semantic_evidence();
     // The frozen consumer map (plan Task 8 Step 2), in one place:
@@ -2523,7 +2632,6 @@ fn evidence_for(
     //  * the coordinator's fields come only from its own finite aggregate.
     // Loader and pause identities are discarded before this point: nothing in
     // `facts` or `pause` can name a process, a path, or a proof.
-    let facts = engine.capture_facts();
     let plan = engine.plan();
     // Internal-only, stderr-only, `skip-attribution` builds only: which site
     // raised each record the document is about to publish.
@@ -2571,7 +2679,9 @@ fn evidence_for(
         unregistered_mechanisms: kernel_evidence.unregistered_mechanisms,
         template_tail_failures: kernel_evidence.template_tail_failures,
         process_tracking_fallbacks: tracking_evidence.fallbacks,
-        process_tracking_failures: tracking_evidence.failures,
+        process_tracking_failures: tracking_evidence
+            .failures
+            .saturating_add(u64::from(capture_tracking_degraded)),
         process_tracking_evictions: tracking_evidence.evictions,
         state_reconciliations: semantic.state_reconciliations,
         session_cancel_ambiguities: semantic.session_cancel_ambiguities,
@@ -2617,7 +2727,7 @@ fn evidence_for(
         } else {
             Vec::new()
         },
-        pid_descendant_gaps: 0,
+        pid_descendant_gaps,
         multi_rebuild_gaps: 0,
         // Design §5.7: a live-learned attach key is protected only inside a
         // confirmed pause owner's window. A nonzero debug-state hit counter is
@@ -3626,6 +3736,7 @@ mod tests {
         let plan = crate::plan::AttachPlan::from_slots(vec![]);
         let mut state = semantics::State::new(&plan);
         let mut tracker = process::Tracker::new();
+        let mut gaps = 0;
         let events = (0..=LIVE_POLL_QUANTUM).map(|_| call_event());
         let mut drain = EventDrain::over(ScriptedRecords::events(events, LIVE_POLL_QUANTUM));
 
@@ -3633,11 +3744,159 @@ mod tests {
             &mut drain,
             &mut state,
             &mut tracker,
+            &Scope::Pid(std::process::id()),
+            &mut gaps,
             Some(LIVE_POLL_QUANTUM),
         );
 
         assert_eq!(malformed, 0);
         assert_eq!(drain.source().remaining(), 1);
+    }
+
+    #[test]
+    fn pid_scope_fork_marks_descendant_unobserved_partial() {
+        use crate::events::{EventDrain, ScriptedRecords};
+
+        let parent = 41u32;
+        let child = 42u32;
+        let event = p11scope_ebpf_common::Event {
+            event_type: p11scope_ebpf_common::event_type::FORK,
+            pid_tgid: (u64::from(parent) << 32) | 9001,
+            session: u64::from(child),
+            ..Default::default()
+        };
+        let plan = crate::plan::AttachPlan::from_slots(vec![crate::plan::Slot {
+            index: 0,
+            descriptor_index: crate::kinds::function_id("C_OpenSession").unwrap() + 1,
+            object: crate::plan::TEST_PINNED_OBJECT,
+            object_path: "/opt/p11.so".into(),
+            file_offset: 0x10,
+            names: vec!["C_OpenSession".into()],
+            aliased: false,
+            semantics: crate::kinds::descriptor("C_OpenSession").unwrap(),
+            semantic_authorized: true,
+            semantic_ambiguous: false,
+            fork_safe: true,
+            module_ids: vec![crate::plan::ModuleId(0)],
+        }]);
+        let mut state = semantics::State::new(&plan);
+        let mut tracker = process::Tracker::new();
+        let parent_process = tracker.identify(parent).key;
+        state.observe_process(
+            parent_process,
+            &p11scope_ebpf_common::Event {
+                event_type: p11scope_ebpf_common::event_type::CALL,
+                pid_tgid: u64::from(parent) << 32,
+                session: 7,
+                slot_id: 3,
+                slot: 0,
+                capture: p11scope_ebpf_common::capture::OUTPUT_NON_NULL,
+                ..Default::default()
+            },
+        );
+        assert!(state.pid_has_process_state(parent));
+        let mut gaps = 0;
+        let mut drain = EventDrain::over(ScriptedRecords::events([event], usize::MAX));
+
+        assert_eq!(
+            drain_profile_events(
+                &mut drain,
+                &mut state,
+                &mut tracker,
+                &Scope::Pid(parent),
+                &mut gaps,
+                None,
+            ),
+            0
+        );
+        assert_eq!(drain.source().remaining(), 0, "fork records are handled");
+        assert_eq!(gaps, 1, "one worker-thread fork is one descendant gap");
+        assert!(
+            !state.pid_has_process_state(child),
+            "PID-scope descendants never inherit semantic tracing state"
+        );
+
+        gaps = u64::MAX;
+        let mut drain = EventDrain::over(ScriptedRecords::events([event], usize::MAX));
+        assert_eq!(
+            drain_profile_events(
+                &mut drain,
+                &mut state,
+                &mut tracker,
+                &Scope::Pid(parent),
+                &mut gaps,
+                None,
+            ),
+            0
+        );
+        assert_eq!(gaps, u64::MAX, "the finite counter saturates");
+    }
+
+    #[test]
+    fn cgroup_fork_retains_inheritance_without_pid_gap() {
+        use crate::events::{EventDrain, ScriptedRecords};
+
+        let event = p11scope_ebpf_common::Event {
+            event_type: p11scope_ebpf_common::event_type::FORK,
+            pid_tgid: 41u64 << 32,
+            session: 42,
+            ..Default::default()
+        };
+        let plan = crate::plan::AttachPlan::from_slots(vec![crate::plan::Slot {
+            index: 0,
+            descriptor_index: crate::kinds::function_id("C_OpenSession").unwrap() + 1,
+            object: crate::plan::TEST_PINNED_OBJECT,
+            object_path: "/opt/p11.so".into(),
+            file_offset: 0x10,
+            names: vec!["C_OpenSession".into()],
+            aliased: false,
+            semantics: crate::kinds::descriptor("C_OpenSession").unwrap(),
+            semantic_authorized: true,
+            semantic_ambiguous: false,
+            fork_safe: true,
+            module_ids: vec![crate::plan::ModuleId(0)],
+        }]);
+        let mut state = semantics::State::new(&plan);
+        let mut tracker = process::Tracker::new();
+        let parent_process = tracker.identify(41).key;
+        state.observe_process(
+            parent_process,
+            &p11scope_ebpf_common::Event {
+                event_type: p11scope_ebpf_common::event_type::CALL,
+                pid_tgid: 41u64 << 32,
+                session: 7,
+                slot_id: 3,
+                slot: 0,
+                capture: p11scope_ebpf_common::capture::OUTPUT_NON_NULL,
+                ..Default::default()
+            },
+        );
+        assert!(state.pid_has_process_state(41));
+        let mut gaps = 0;
+        let mut drain = EventDrain::over(ScriptedRecords::events([event], usize::MAX));
+        let scope = Scope::Cgroup {
+            id: 1,
+            path: "/".into(),
+            dir: std::sync::Arc::new(std::fs::File::open("/").unwrap()),
+        };
+
+        assert_eq!(
+            drain_profile_events(
+                &mut drain,
+                &mut state,
+                &mut tracker,
+                &scope,
+                &mut gaps,
+                None,
+            ),
+            0
+        );
+        assert_eq!(gaps, 0, "cgroup scope covers descendants");
+        assert!(
+            state.pid_has_process_state(42),
+            "cgroup scope retains existing semantic inheritance"
+        );
+        assert_eq!(drain.source().remaining(), 0, "fork records are handled");
     }
 
     fn trace_fixture() -> (semantics::State, process::Tracker, trace::Tracer) {
@@ -3660,6 +3919,7 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stdout_open = true;
         let mut out_file: Option<Vec<u8>> = None;
+        let mut gaps = 0;
         let events = (0..5).map(|_| call_event());
         let mut drain = EventDrain::over(ScriptedRecords::events(events, 2));
 
@@ -3668,6 +3928,8 @@ mod tests {
             &mut remaining,
             &mut state,
             &mut tracker,
+            &Scope::Pid(std::process::id()),
+            &mut gaps,
             &mut tracer,
             &mut stdout,
             &mut stdout_open,
@@ -3695,6 +3957,7 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stdout_open = true;
         let mut out_file: Option<Vec<u8>> = None;
+        let mut gaps = 0;
         let events = (0..=LIVE_POLL_QUANTUM).map(|_| call_event());
         let mut drain = EventDrain::over(ScriptedRecords::events(events, LIVE_POLL_QUANTUM));
 
@@ -3703,6 +3966,8 @@ mod tests {
             &mut remaining,
             &mut state,
             &mut tracker,
+            &Scope::Pid(std::process::id()),
+            &mut gaps,
             &mut tracer,
             &mut stdout,
             &mut stdout_open,
@@ -3725,6 +3990,7 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stdout_open = true;
         let mut out_file: Option<Vec<u8>> = None;
+        let mut gaps = 0;
         let events = (0..crate::events::LIVE_POLL_QUANTUM + 5).map(|_| call_event());
         let mut drain = EventDrain::over(ScriptedRecords::events(events, usize::MAX));
 
@@ -3733,6 +3999,8 @@ mod tests {
             &mut remaining,
             &mut state,
             &mut tracker,
+            &Scope::Pid(std::process::id()),
+            &mut gaps,
             &mut tracer,
             &mut stdout,
             &mut stdout_open,
@@ -3772,6 +4040,60 @@ mod tests {
             detach.contains("self.producers_detached = detached.is_ok();"),
             "only a fully successful detach makes the ring finite"
         );
+    }
+
+    #[test]
+    fn terminal_discovery_drains_before_each_event_drain() {
+        let source = include_str!("run.rs");
+        for (function, event_call, consumers) in [
+            (
+                "fn capture_profile(",
+                "drain_events(",
+                ["state.sync_plan(engine.plan());"].as_slice(),
+            ),
+            (
+                "fn capture_trace(",
+                "drain_trace_events(",
+                [
+                    "state.sync_plan(engine.plan());",
+                    "tracer.sync_plan(engine.plan());",
+                ]
+                .as_slice(),
+            ),
+        ] {
+            let body = source.split_once(function).unwrap().1;
+            let body = body
+                .split_once("fn write_json_report")
+                .map_or(body, |(body, _)| body);
+            let detached = body
+                .find("let detach = session.detach_producers();")
+                .expect("terminal detach");
+            let terminal = &body[detached..];
+            let discovery = terminal
+                .find("let plan_changed = if detach.is_ok()")
+                .expect("terminal discovery branch");
+            let events = terminal.find(event_call).expect("terminal event drain");
+            assert!(
+                discovery < events,
+                "discovery must precede events for {function}"
+            );
+            let branch = &terminal[discovery..events];
+            let (_, after_if) = branch.split_once("if detach.is_ok() {").unwrap();
+            let (success, after_else) = after_if.split_once("} else {").unwrap();
+            let (failure, _) = after_else.split_once("};").unwrap();
+            assert!(success.contains("engine.drain_discovery_terminal(session)?"));
+            assert!(!success.contains("engine.drain_discovery(session)?"));
+            assert!(failure.contains("engine.drain_discovery_terminal_bounded_from(session)?"));
+            assert!(!failure.contains("engine.drain_discovery(session)?"));
+            assert!(!failure.contains("engine.drain_discovery_terminal(session)?"));
+            for &consumer in consumers {
+                let synced = terminal.find(consumer).expect("plan synchronization");
+                assert!(
+                    synced > discovery && synced < events,
+                    "{consumer} ordering for {function}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3912,6 +4234,7 @@ mod tests {
         let build = |engine: &Engine, state: &semantics::State, include_selection| {
             evidence_for(
                 engine,
+                engine.capture_facts(),
                 0,
                 &[],
                 &[],
@@ -3922,6 +4245,8 @@ mod tests {
                 false,
                 include_selection,
                 None,
+                0,
+                false,
             )
         };
 
@@ -3954,6 +4279,124 @@ mod tests {
     }
 
     #[test]
+    fn evidence_for_keeps_distinct_discovery_losses_across_all_renderers() {
+        let (engine, _) = crate::discovery::engine::tests::selection_output_engines();
+        let state = semantics::State::new(engine.plan());
+        let mut facts = engine.capture_facts();
+        facts.discovery_ring_loss = 1;
+        facts.discovery_state_failures = 2;
+        facts.discovery_read_failures = 3;
+        facts.discovery_truncated = 4;
+        let evidence = evidence_for(
+            &engine,
+            facts,
+            0,
+            &[],
+            &[],
+            metrics::KernelEvidence::default(),
+            process::TrackingEvidence::default(),
+            0,
+            &state,
+            false,
+            true,
+            None,
+            0,
+            false,
+        );
+        let capture = render::CaptureMeta {
+            started: "t0",
+            ended: "t1",
+            kernel: "test",
+            policy: CapturePolicy::Allowlisted,
+        };
+        let profile = render::versioned_evidence(&evidence);
+        let metrics = render::json(&[], &evidence, &capture)["evidence"].clone();
+        let terminal: serde_json::Value = serde_json::from_str(
+            trace::evidence_line(&evidence, CapturePolicy::Allowlisted, false)
+                .strip_prefix("EVIDENCE ")
+                .unwrap(),
+        )
+        .unwrap();
+        for document in [&profile, &metrics, &terminal] {
+            assert_eq!(document["discovery_ring_loss"], 1);
+            assert_eq!(document["discovery_state_failures"], 2);
+            assert_eq!(document["discovery_read_failures"], 3);
+            assert_eq!(document["discovery_truncated"], 4);
+            assert_eq!(document["completeness"], "PARTIAL");
+        }
+    }
+
+    #[test]
+    fn lifecycle_attach_degradation_is_reported_and_forces_partial() {
+        let (engine, _) = crate::discovery::engine::tests::selection_output_engines();
+        let state = semantics::State::new(engine.plan());
+        let evidence = evidence_for(
+            &engine,
+            engine.capture_facts(),
+            0,
+            &[],
+            &[],
+            metrics::KernelEvidence::default(),
+            process::TrackingEvidence::default(),
+            0,
+            &state,
+            false,
+            true,
+            None,
+            0,
+            true,
+        );
+
+        assert_eq!(evidence.pid_descendant_gaps, 0);
+        assert_eq!(evidence.process_tracking_failures, 1);
+        assert_eq!(evidence.completeness, "PARTIAL");
+        let profile = render::versioned_evidence(&evidence);
+        assert_eq!(profile["pid_descendant_gaps"], 0);
+        assert_eq!(profile["process_tracking_failures"], 1);
+        let terminal = trace::evidence_line(&evidence, CapturePolicy::Allowlisted, false);
+        assert!(terminal.contains("\"pid_descendant_gaps\":0"), "{terminal}");
+        assert!(
+            terminal.contains("\"completeness\":\"PARTIAL\""),
+            "{terminal}"
+        );
+        assert!(
+            !terminal.contains("tracefs"),
+            "raw lifecycle diagnostics leaked"
+        );
+    }
+
+    #[test]
+    fn missing_pid_fork_boundary_is_partial_not_zero() {
+        let (engine, _) = crate::discovery::engine::tests::selection_output_engines();
+        let state = semantics::State::new(engine.plan());
+        let (pid_descendant_gaps, capture_tracking_degraded) =
+            initial_tracking_evidence(&Scope::Pid(41), true, false);
+        let evidence = evidence_for(
+            &engine,
+            engine.capture_facts(),
+            0,
+            &[],
+            &[],
+            metrics::KernelEvidence::default(),
+            process::TrackingEvidence::default(),
+            0,
+            &state,
+            false,
+            true,
+            None,
+            pid_descendant_gaps,
+            capture_tracking_degraded,
+        );
+
+        assert_eq!(evidence.pid_descendant_gaps, 1);
+        assert_eq!(evidence.completeness, "PARTIAL");
+        assert_eq!(
+            render::versioned_evidence(&evidence)["pid_descendant_gaps"],
+            1
+        );
+    }
+
+    #[test]
     fn signal_state_retains_first_identity_and_saturates_sigint_deliveries() {
         let state = SignalState::new();
         state.observe(libc::SIGTERM);
@@ -3970,6 +4413,7 @@ mod tests {
         let plan = crate::plan::AttachPlan::from_slots(vec![]);
         let mut state = semantics::State::new(&plan);
         let mut tracker = process::Tracker::with_limits(0, 1);
+        let mut gaps = 0;
         for parent in 100_000..100_100u32 {
             let event = p11scope_ebpf_common::Event {
                 event_type: p11scope_ebpf_common::event_type::FORK,
@@ -3977,9 +4421,16 @@ mod tests {
                 session: u64::from(parent + 1),
                 ..Default::default()
             };
-            assert!(observe_fork(&mut tracker, &mut state, &event));
+            assert!(observe_fork(
+                &mut tracker,
+                &mut state,
+                &Scope::Pid(1),
+                &mut gaps,
+                &event,
+            ));
         }
         assert_eq!(tracker.evidence(), process::TrackingEvidence::default());
+        assert_eq!(gaps, 0, "unrelated fork records cannot fabricate gaps");
     }
 
     /// Finding nothing is not an error, so the only thing that keeps the operator

@@ -54,16 +54,24 @@ then flags order:
 | 8 | selector 4 | 0 | `exact_standard` | `v3_2` |
 | 9 | selector 4 | 1 | `exact_standard` | `v3_2` |
 
+For `export_absent` and `export_outside_module`, `queries` and `tables` are
+empty and `selection_truncated` is false. For `queried`, `queries` contains
+exactly the ten rows above and `selection_truncated` is boolean. A selector is
+an integer from 0 through 4 and request flags are exactly 0 or 1.
+
 Each row has exactly `selector`, `request`, `rv`, `result`,
 `inventory_matches`, `selection_table`, `authority`, and `helper_failure`.
-It has a bounded CK_RV and either a bounded result classification or one
-`helper_failure` class. Authority is exactly `inventory`,
+It has a bounded CK_RV. A successful query may retain both its factual non-null
+`result` and a non-null `helper_failure`. Authority is exactly `inventory`,
 `selection_count_only`, or `none`. That failure class is exactly `null_output`,
 `unreadable_interface`, `unreadable_name`, `unreadable_version`,
 `unreadable_table`, `outside_provider`, `unresolved_function`, or
 `provider_changed`. A result name is one of `null`, `exact_standard`, `other`,
 or `unreadable`; a result version is one of `null`, `unreadable`, `v2_40`,
 `v3_0`, `v3_1`, `v3_2`, or `other`; flags retain their full u64 width.
+`inventory_matches` is a sorted, unique array of at most 16 exact
+`{surface, name_agrees, version_agrees}` records. Each surface index is in
+bounds, and both agreement fields are boolean.
 
 There are at most ten tables. Each table id is 0 through 9; a non-null
 `selection_table` refers to that exact id. Every table is referenced by a
@@ -74,6 +82,10 @@ most 104 classified standard function slots, and
 addresses, function-table contents, or helper error strings. Only the
 existing offline inventory-name exception may retain raw names; selection
 queries and tables never do.
+
+Each table id is an integer from 0 through 9, its version is 3.0, 3.1, or 3.2,
+its walk is exactly `full`, and it contains at most 104 function records with
+`semantic_authorized=false`.
 
 ## Still prohibited
 

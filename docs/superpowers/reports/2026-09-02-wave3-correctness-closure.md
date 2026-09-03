@@ -152,12 +152,16 @@ this engineering closeout.
 - Privileged real-kernel behavior, kernel support, and provider conformance are
   not established by the unprivileged suite.
 
-This is therefore a source-reviewed W3 engineering candidate, not yet a
-runtime-qualified or publication-ready release.
+This is therefore a source-reviewed and locally integrated W3 engineering
+candidate, not yet a runtime-qualified or publication-ready release.
 
 ## Integration and authority
 
-The owner pre-approved a local merge after review-to-zero and green gates.
-Merged `main` must pass the same four gates before W3 is marked integrated.
-The owner's main-checkout edit and pre-existing stash must be preserved.
-Nothing in W3 authorizes push, tag, package publication, or release.
+The reviewed W3 branch was fast-forwarded locally to `main` at `ba6689d`.
+The integration-status update introduced no production change, and its final
+main tree is the subject of the same four canonical gates. The owner's earlier
+checker patch is preserved in named stash
+`owner-main-check-live-discovery-object-before-w3-merge`; replaying it would
+revert later reviewed checker corrections. The pre-existing
+`owner-main-discovery_scan-dirty-2026-09-02` stash is unchanged. Nothing was
+pushed, tagged, packaged, published, or released.

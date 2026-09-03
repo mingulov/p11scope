@@ -544,7 +544,7 @@ No code, dependency, schema, gate, or runtime row is owed by this deferred task.
   genuinely separate risk. Triage with source evidence; batch accepted fixes
   three to five at a time; repeat until a complete cycle accepts zero findings.
 - [x] Update the closure report and ROADMAP with exact commit/test evidence.
-- [ ] Use `superpowers:finishing-a-development-branch`: merge locally to main
+- [x] Use `superpowers:finishing-a-development-branch`: merge locally to main
   only after review-to-zero, rerun all four gates on merged main, and leave
   push/tag/publish untouched.
 

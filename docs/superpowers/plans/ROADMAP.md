@@ -596,7 +596,8 @@ boundaries.
   (also holds the parked items: AArch64, 32-bit counting mode, freezer pause,
   manifest catalog, raw-tracepoint variants, packages/images). Deferral is a
   default, not a lock — the owner may pull items into v0.1.0 depending on
-  pace; `uprobe_multi` was pulled into release scope on 2026-09-01 (W3).
+  pace. `uprobe_multi` was pulled into W3 on 2026-09-01, then deferred again by
+  the owner on 2026-09-03 until a stable Aya release exposes the required API.
 
 **Gate for each slice:** the four cargo checks, the unprivileged suite, and the CI e2e job
 green; root gates run locally only with owner approval and are otherwise recorded UNRUN.
@@ -634,11 +635,11 @@ founding rule).
 | --- | --- | --- |
 | W1 | **Task 0 custody rescue first**, then eight scan findings (Tasks 1–8), TDD, review-to-zero; private SDD trove only in `p11scope-ws` | [full plan, reviewed 2026-09-01](2026-09-01-release-hardening-wave1-findings.md) |
 | W2 | Storage consolidation: two-directory rule, migrate + repoint, `p11scope-ws` custody | [full plan](2026-09-01-wave2-storage-consolidation.md) |
-| W3 | **Priority 1: `C_GetInterface` compatibility closure** (partial passive behavior → separate live request/result/failure evidence plus finite offline helper matrix; selection authority limited to exact retained generation or attested exact provider, never inventory); then tracepoint offsets (research #1), opened-inode identity (#2), capability tier ladder + caps model, honest-degradation fixes, and `uprobe_multi` attach | [charter](2026-09-01-release-wave-charters.md#w3) |
+| W3 | **Priority 1: `C_GetInterface` compatibility closure** (partial passive behavior → separate live request/result/failure evidence plus finite offline helper matrix; selection authority limited to exact retained generation or attested exact provider, never inventory); then tracepoint offsets (research #1), opened-inode identity (#2), capability tier ladder + caps model, honest-degradation fixes, and exact-tip per-offset runtime qualification | [charter](2026-09-01-release-wave-charters.md#w3) |
 | W4 | Hosted CI running the full suite; "green locally, not in CI" dies | [charter](2026-09-01-release-wave-charters.md#w4) |
 | W7 | ia32 targets on x86-64 hosts | [charter](2026-09-01-release-wave-charters.md#w7) |
 | W5 | Container/K8s requalification (provisional; W8 re-runs on the final tip) + seccomp/SELinux artifacts | [charter](2026-09-01-release-wave-charters.md#w5) |
-| W6 | Multi-distro/kernel matrix; support restated "5.15.x, tested on ⟨list⟩"; load-only CI matrix; run the supported-rate/loss and fork-exec-loader-unload product oracles on 5.15 per-offset and a supported `uprobe_multi` kernel | [charter](2026-09-01-release-wave-charters.md#w6) |
+| W6 | Multi-distro/kernel matrix; support restated "5.15.x, tested on ⟨list⟩"; load-only CI matrix; run the supported-rate/loss and fork-exec-loader-unload product oracles on the per-offset path | [charter](2026-09-01-release-wave-charters.md#w6) |
 | W8 | Release assembly: receipt, docs truth pass, final review-to-zero, repeat both product oracles on the exact release tip, ready-to-publish bundle | [charter](2026-09-01-release-wave-charters.md#w8) |
 
 Publication (push, tag, release) is NOT a wave — it is an explicit owner

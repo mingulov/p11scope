@@ -35,8 +35,8 @@ use p11scope_ebpf_common::{
 };
 use p11scope_manifest::elf::ElfSnapshot;
 use p11scope_manifest::manifest::{
-    Acquisition, Manifest, Resolution, SCHEMA, SelectionNameClass, SelectionRequest,
-    SelectionVersionClass, WalkOutcome,
+    Acquisition, Manifest, Resolution, SCHEMA, SelectionAuthority, SelectionNameClass,
+    SelectionRequest, SelectionVersionClass, WalkOutcome,
 };
 use p11scope_manifest::maps::{Device, MapEntry, MapIndex, MappedPath, ObjectKey, Resolved};
 use std::collections::{BTreeMap, BTreeSet};
@@ -398,6 +398,12 @@ struct SelectionTableFact {
     targets: Vec<plan::SelectionTableTarget>,
 }
 
+#[derive(Debug, Clone)]
+struct ManifestSelectionAdmission {
+    source: (u32, u8),
+    targets: BTreeSet<plan::AttachKey>,
+}
+
 type SelectionClaims = BTreeMap<SelectionClaimKey, SelectionClaim>;
 type SelectionTables = BTreeMap<SelectionTableKey, SelectionTableFact>;
 type ProposedSelectionClaim = (SelectionClaims, SelectionTables, PendingSelectionAdmission);
@@ -715,6 +721,90 @@ fn manifest_module_object(manifest: &Manifest, pinned: &PinnedObjects) -> Option
         .find(|object| object.path == manifest.module_path)?;
     let (key, path) = capture_manifest_object_key(manifest, module.id)?;
     pinned.id_for_manifest(key, path)
+}
+
+fn lower_manifest_selection_tables(
+    plan: &mut plan::AttachPlan,
+    allocated: &plan::AttachPlan,
+    manifests: &[Manifest],
+    manifest_ordinals: &[u32],
+    pinned: &PinnedObjects,
+) -> (Vec<ManifestSelectionAdmission>, Vec<String>) {
+    let mut admissions = Vec::new();
+    let mut refused = Vec::new();
+    for (manifest, ordinal) in manifests.iter().zip(manifest_ordinals) {
+        let Some(provider) = manifest_module_object(manifest, pinned) else {
+            continue;
+        };
+        let Some(module) = plan
+            .modules
+            .iter()
+            .find(|module| module.object == provider)
+            .map(|module| module.id)
+        else {
+            continue;
+        };
+        let reachable: BTreeSet<_> = manifest
+            .selection_evidence
+            .queries
+            .iter()
+            .filter(|query| matches!(query.authority, SelectionAuthority::SelectionCountOnly))
+            .filter_map(|query| query.selection_table)
+            .collect();
+        for table in manifest
+            .selection_evidence
+            .tables
+            .iter()
+            .filter(|table| reachable.contains(&table.id))
+        {
+            let mut targets = Vec::new();
+            for function in &table.functions {
+                let Resolution::Resolved {
+                    object,
+                    file_offset,
+                } = function.resolution
+                else {
+                    continue;
+                };
+                let Some((key, path)) = capture_manifest_object_key(manifest, object) else {
+                    continue;
+                };
+                let Some(object) = pinned.id_for_manifest(key, path) else {
+                    continue;
+                };
+                let Some(name) = pkcs11_module::FUNCTION_LIST_FIELDS
+                    .iter()
+                    .chain(pkcs11_module::FUNCTION_LIST_3_0_EXTRA_FIELDS)
+                    .chain(pkcs11_module::FUNCTION_LIST_3_2_EXTRA_FIELDS)
+                    .find(|field| field.name == function.name)
+                    .map(|field| field.name)
+                else {
+                    continue;
+                };
+                targets.push(plan::SelectionTableTarget {
+                    object,
+                    object_path: path.into(),
+                    file_offset,
+                    name,
+                });
+            }
+            let keys = targets
+                .iter()
+                .map(|target| plan::AttachKey {
+                    object: target.object,
+                    file_offset: target.file_offset,
+                })
+                .collect();
+            match plan.add_selection_table(allocated, module, targets) {
+                Ok(()) => admissions.push(ManifestSelectionAdmission {
+                    source: (*ordinal, table.id),
+                    targets: keys,
+                }),
+                Err(reason) => refused.push(reason),
+            }
+        }
+    }
+    (admissions, refused)
 }
 
 fn manifest_walk_label(walk: &WalkOutcome) -> String {
@@ -1812,6 +1902,8 @@ struct LiveCandidate {
     selection_claims: BTreeMap<SelectionClaimKey, SelectionClaim>,
     selection_tables: BTreeMap<SelectionTableKey, SelectionTableFact>,
     selection_admission: Option<PendingSelectionAdmission>,
+    manifest_selection_admissions: Vec<ManifestSelectionAdmission>,
+    manifest_inventory_slots: BTreeMap<plan::AttachKey, plan::Slot>,
 }
 
 struct StartPublicationSnapshot {
@@ -4192,6 +4284,21 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
     discovered
         .capture_facts
         .bind_plan_module_ids(&mut plan, &modules, &accepted, &pinned)?;
+    let allocated = plan.clone();
+    let (_, selection_refusals) = lower_manifest_selection_tables(
+        &mut plan,
+        &allocated,
+        &accepted,
+        &accepted_ordinals,
+        &pinned,
+    );
+    for reason in selection_refusals {
+        counters.object_skips.push(Skipped {
+            subject: "offline interface selection".into(),
+            reason,
+        });
+    }
+    record_object_skips(&mut plan, &counters.object_skips);
     if let Some(fallback) = counters
         .manifest_fallbacks
         .iter()
@@ -6019,6 +6126,29 @@ impl Engine {
             &self.manifests,
             &pinned,
         )?;
+        let manifest_inventory_slots = rebuilt
+            .slots
+            .iter()
+            .map(|slot| {
+                (
+                    plan::AttachKey {
+                        object: slot.object,
+                        file_offset: slot.file_offset,
+                    },
+                    slot.clone(),
+                )
+            })
+            .collect();
+        let (manifest_selection_admissions, selection_refusals) = lower_manifest_selection_tables(
+            &mut rebuilt,
+            &self.plan,
+            &self.manifests,
+            &self.manifest_ordinals,
+            &pinned,
+        );
+        for reason in selection_refusals {
+            self.mark_partial("offline interface selection", &reason);
+        }
         record_object_skips(&mut rebuilt, &self.counters.object_skips);
         let module_objects: BTreeSet<_> =
             rebuilt.modules.iter().map(|module| module.object).collect();
@@ -6188,6 +6318,8 @@ impl Engine {
             selection_claims,
             selection_tables,
             selection_admission: None,
+            manifest_selection_admissions,
+            manifest_inventory_slots,
         })
     }
 
@@ -6642,6 +6774,92 @@ impl Engine {
                     "a selection table did not survive exact admission and attachment",
                 );
             }
+        }
+        let failed_manifest_tables: Vec<_> = candidate
+            .manifest_selection_admissions
+            .iter()
+            .filter(|table| {
+                table.targets.iter().any(|key| {
+                    candidate
+                        .plan
+                        .slots
+                        .iter()
+                        .find(|slot| {
+                            slot.object == key.object && slot.file_offset == key.file_offset
+                        })
+                        .is_none_or(|slot| !candidate.plan.is_active(slot.index))
+                })
+            })
+            .cloned()
+            .collect();
+        if !failed_manifest_tables.is_empty() {
+            let failed_sources: BTreeSet<_> = failed_manifest_tables
+                .iter()
+                .map(|table| table.source)
+                .collect();
+            let retained_keys: BTreeSet<_> = candidate
+                .manifest_inventory_slots
+                .keys()
+                .copied()
+                .chain(
+                    candidate
+                        .manifest_selection_admissions
+                        .iter()
+                        .filter(|table| !failed_sources.contains(&table.source))
+                        .flat_map(|table| table.targets.iter().copied()),
+                )
+                .chain(
+                    candidate
+                        .selection_tables
+                        .values()
+                        .flat_map(|table| table.targets.iter())
+                        .map(|target| plan::AttachKey {
+                            object: target.object,
+                            file_offset: target.file_offset,
+                        }),
+                )
+                .collect();
+            let rollback_keys: BTreeSet<_> = failed_manifest_tables
+                .iter()
+                .flat_map(|table| table.targets.iter().copied())
+                .filter(|key| !retained_keys.contains(key))
+                .collect();
+            for table in &failed_manifest_tables {
+                for key in &table.targets {
+                    if let Some(inventory) = candidate.manifest_inventory_slots.get(key)
+                        && let Some(slot) = candidate.plan.slots.iter_mut().find(|slot| {
+                            slot.object == key.object && slot.file_offset == key.file_offset
+                        })
+                    {
+                        *slot = inventory.clone();
+                    }
+                }
+            }
+            let rollback: Vec<_> = candidate
+                .plan
+                .slots
+                .iter()
+                .filter(|slot| {
+                    rollback_keys.contains(&plan::AttachKey {
+                        object: slot.object,
+                        file_offset: slot.file_offset,
+                    }) && candidate.plan.is_active(slot.index)
+                })
+                .cloned()
+                .collect();
+            if session.detach_slots(&rollback).is_err() {
+                self.mark_partial(
+                    "offline interface selection",
+                    "a failed manifest selection table could not detach its successful prefix",
+                );
+            }
+            for slot in rollback {
+                candidate.plan.deactivate(slot.index);
+            }
+            self.mark_partial(
+                "offline interface selection",
+                "a manifest selection table failed indivisible attachment and was rolled back",
+            );
         }
         record_object_skips(&mut candidate.plan, &self.counters.object_skips);
         outcome.changed |= candidate.plan != self.plan;
@@ -14626,6 +14844,212 @@ int main(int argc, char **argv) {
         }
     }
 
+    fn manifest_selection_evidence(
+        offsets: [u64; 3],
+    ) -> p11scope_manifest::manifest::SelectionEvidence {
+        use p11scope_manifest::manifest::{
+            SelectionAcquisition, SelectionAuthority, SelectionEvidence, SelectionNameClass,
+            SelectionQuery, SelectionRequest, SelectionTable, SelectionVersionClass,
+        };
+
+        let functions = pkcs11_module::FUNCTION_LIST_FIELDS
+            .iter()
+            .chain(pkcs11_module::FUNCTION_LIST_3_0_EXTRA_FIELDS)
+            .map(|field| FunctionRecord {
+                name: field.name.into(),
+                resolution: match field.name {
+                    "C_Initialize" => Resolution::Resolved {
+                        object: 0,
+                        file_offset: offsets[0],
+                    },
+                    "C_Finalize" => Resolution::Resolved {
+                        object: 0,
+                        file_offset: offsets[1],
+                    },
+                    "C_GetInfo" => Resolution::Resolved {
+                        object: 0,
+                        file_offset: offsets[2],
+                    },
+                    _ => Resolution::NullPointer,
+                },
+            })
+            .collect();
+        let mut queries = Vec::new();
+        for selector in 0..5 {
+            for flags in 0..=1 {
+                let (name, version) = match selector {
+                    0 => (SelectionNameClass::Null, SelectionVersionClass::Null),
+                    1 => (
+                        SelectionNameClass::ExactStandard,
+                        SelectionVersionClass::Null,
+                    ),
+                    2 => (
+                        SelectionNameClass::ExactStandard,
+                        SelectionVersionClass::V3_0,
+                    ),
+                    3 => (
+                        SelectionNameClass::ExactStandard,
+                        SelectionVersionClass::V3_1,
+                    ),
+                    _ => (
+                        SelectionNameClass::ExactStandard,
+                        SelectionVersionClass::V3_2,
+                    ),
+                };
+                let request = SelectionRequest {
+                    name,
+                    version,
+                    flags,
+                };
+                queries.push(if selector == 2 && flags == 0 {
+                    SelectionQuery {
+                        selector,
+                        request,
+                        rv: 0,
+                        result: Some(request),
+                        inventory_matches: Vec::new(),
+                        selection_table: Some(0),
+                        authority: SelectionAuthority::SelectionCountOnly,
+                        helper_failure: None,
+                    }
+                } else {
+                    SelectionQuery {
+                        selector,
+                        request,
+                        rv: 1,
+                        result: None,
+                        inventory_matches: Vec::new(),
+                        selection_table: None,
+                        authority: SelectionAuthority::None,
+                        helper_failure: None,
+                    }
+                });
+            }
+        }
+        SelectionEvidence {
+            acquisition: SelectionAcquisition::Queried,
+            queries,
+            tables: vec![SelectionTable {
+                id: 0,
+                version: Version { major: 3, minor: 0 },
+                walk: WalkOutcome::Full,
+                functions,
+                semantic_authorized: false,
+            }],
+            selection_truncated: false,
+        }
+    }
+
+    #[test]
+    fn manifest_selection_tables_enter_the_attach_transaction() {
+        let (_fixture, view, mut module, mut pins) = loaded_seed_provider();
+        let provider = pins.pinned().next().unwrap();
+        let path = provider.path.to_string();
+        let base = object_facts(Path::new(&path)).2;
+        module.tables.push(ScannedTable {
+            version: (2, 40),
+            walk: "full",
+            entries: vec![ScannedEntry {
+                name: "C_Initialize",
+                object: provider.key,
+                object_path: path.clone(),
+                file_offset: base,
+            }],
+            null_entries: Vec::new(),
+            unpinned: Vec::new(),
+            address: 0,
+            file_offset: Some(base),
+        });
+
+        let mut manifest = valid_manifest_for(&[PathBuf::from(&path)], &[0; 67]);
+        for function in &mut manifest.surfaces[0].functions {
+            function.resolution = Resolution::Resolved {
+                object: 0,
+                file_offset: base,
+            };
+        }
+        let manifest_pins = pin_manifest_objects(&manifest).unwrap();
+        assert!(pins.absorb(manifest_pins).is_empty());
+
+        let mut engine = Engine::empty();
+        engine.scope = Scope::Pid(view.pid());
+        engine.next_view_id = 1;
+        engine.views.push(view);
+        engine.manifests.push(manifest.clone());
+        engine.manifest_ordinals.push(0);
+        let mut session = ScriptedSession::default();
+        let initial = engine
+            .live_candidate(pins, vec![module.clone()], Vec::new())
+            .unwrap();
+        engine
+            .apply_candidate(&mut session, initial, &mut true, false, &[])
+            .unwrap();
+        let inventory = engine
+            .plan
+            .slots
+            .iter()
+            .find(|slot| slot.file_offset == base)
+            .unwrap()
+            .clone();
+        let inventory_tables = engine.plan.modules[0].tables.clone();
+
+        manifest.selection_evidence = manifest_selection_evidence([base, base + 1, base + 2]);
+        let problems = crate::manifest_input::validate_structure(&manifest);
+        assert!(problems.is_empty(), "{problems:?}");
+        engine.manifests[0] = manifest;
+        let candidate = engine
+            .live_candidate(engine.pinned.clone(), vec![module], Vec::new())
+            .unwrap();
+
+        assert_eq!(candidate.delta.new.len(), 2, "null entries do not attach");
+        assert_eq!(
+            candidate
+                .plan
+                .slots
+                .iter()
+                .filter(|slot| slot.file_offset == base)
+                .count(),
+            1,
+            "inventory and selection share one physical slot"
+        );
+        for slot in candidate.plan.slots.iter().filter(
+            |slot| matches!(slot.file_offset, offset if offset == base + 1 || offset == base + 2),
+        ) {
+            assert_eq!(
+                slot.semantics,
+                p11scope_ebpf_common::SlotSemantics::COUNT_ONLY
+            );
+            assert!(!slot.semantic_authorized);
+        }
+        assert_eq!(candidate.plan.modules[0].tables, inventory_tables);
+
+        session.fail_target_slots([candidate.delta.new[1].index]);
+        engine
+            .apply_candidate(&mut session, candidate, &mut true, false, &[])
+            .unwrap();
+
+        assert_eq!(
+            engine
+                .plan
+                .slots
+                .iter()
+                .find(|slot| slot.file_offset == base)
+                .unwrap(),
+            &inventory,
+            "selection rollback preserves the shared inventory slot"
+        );
+        assert!(
+            engine
+                .plan
+                .slots
+                .iter()
+                .filter(|slot| matches!(slot.file_offset, offset if offset == base + 1 || offset == base + 2))
+                .all(|slot| !engine.plan.is_active(slot.index)),
+            "a later failure rolls back the successful selection-only prefix"
+        );
+        assert_eq!(session.detached_slots.last(), Some(&1));
+    }
+
     fn selection_provider_address(engine: &Engine, binding: SelectionBindingFact) -> u64 {
         let provider = engine.pinned.summary(binding.object).unwrap().key;
         parse_maps(&std::fs::read(format!("/proc/{}/maps", engine.views[0].pid())).unwrap())
@@ -19216,6 +19640,8 @@ int main(int argc, char **argv) {
             selection_claims: BTreeMap::new(),
             selection_tables: BTreeMap::new(),
             selection_admission: None,
+            manifest_selection_admissions: Vec::new(),
+            manifest_inventory_slots: BTreeMap::new(),
         };
         commit_cleaned_candidate_identity(
             &mut candidate,

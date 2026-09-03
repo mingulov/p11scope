@@ -10216,8 +10216,6 @@ impl Engine {
         let mut changed = false;
         let mut named_generation_lost = false;
         let mut conservative_replay_attempted = false;
-        let leader_exit_assessments = self.pending_leader_exit_views.clone();
-        let mut leader_exit_assessments_settled = false;
         for (view, cause) in self.retirement_intents.clone() {
             pending_views
                 .entry(view)
@@ -10258,15 +10256,6 @@ impl Engine {
             }
             self.settle_deferred_loader_mismatches(deferred_mismatches, &exec_refresh_views);
             self.promote_stale_execs(pending_views);
-            if !leader_exit_assessments_settled {
-                self.settle_leader_exit_assessments(
-                    &leader_exit_assessments,
-                    pending_views,
-                    additions_allowed,
-                    closure,
-                );
-                leader_exit_assessments_settled = true;
-            }
             if pending_views.is_empty() {
                 if (self.pending_rejected_keys.is_empty() && self.pending_retirements.is_empty())
                     || conservative_replay_attempted
@@ -11169,6 +11158,13 @@ impl Engine {
         let mut additions_allowed = additions_allowed;
         let mut closure = PauseClosure::new(additions_allowed && malformed == 0);
         let mut pending_views = PendingViewRetirements::new();
+        let leader_exit_assessments = self.pending_leader_exit_views.clone();
+        self.settle_leader_exit_assessments(
+            &leader_exit_assessments,
+            &mut pending_views,
+            &mut additions_allowed,
+            &mut closure,
+        );
         let mut changed = self.process_discovery_records(
             session,
             &mut records,
@@ -13905,6 +13901,34 @@ pub(crate) mod tests {
                 .iter()
                 .any(|candidate| candidate.id() == ProcessViewId(27))
         );
+    }
+
+    #[test]
+    fn mixed_refresh_batch_does_not_settle_new_leader_until_next_outer_batch() {
+        let view = ProcessView::open(ProcessViewId(30), std::process::id()).unwrap();
+        let mut leader: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        leader.kind = DISCOVERY_KIND_LEADER_EXIT;
+        leader.pid_tgid = u64::from(view.pid()) << 32;
+        leader.hook_ts_ns = view.admitted_ns();
+        let mut exec = leader;
+        exec.kind = DISCOVERY_KIND_EXEC;
+        let mut engine = Engine::empty();
+        engine.views.push(view);
+        let mut session = ScriptedSession::default();
+
+        apply_ordinary_batch(&mut engine, &mut session, vec![leader, exec])
+            .expect("mixed refresh batch remains processable");
+        assert_eq!(engine.task_uprobe_link_losses, 0);
+        assert!(
+            engine
+                .pending_leader_exit_views
+                .contains(&ProcessViewId(30))
+        );
+
+        apply_ordinary_batch(&mut engine, &mut session, Vec::new())
+            .expect("the next outer batch settles the retained assessment");
+        assert_eq!(engine.task_uprobe_link_losses, 1);
+        assert!(engine.pending_leader_exit_views.is_empty());
     }
 
     #[test]

@@ -399,13 +399,37 @@ fn helper_failure_cross_fields_are_exact() {
             flags: 0,
         })
     };
-    let check = |failure, result, authority, selection_table, diagnostic: Option<&str>| {
+    let check = |failure, query_result, authority, selection_table, diagnostic: Option<&str>| {
         let mut manifest = manifest_for(Path::new("/bin/true"));
         manifest.schema = "p11scope-manifest/5".into();
         manifest.selection_evidence = queried_selection_matrix();
+        if let Some(table_id) = selection_table {
+            manifest.selection_evidence.tables = vec![SelectionTable {
+                id: table_id,
+                version: Version { major: 3, minor: 0 },
+                walk: WalkOutcome::Full,
+                functions: pkcs11_module::FUNCTION_LIST_FIELDS
+                    .iter()
+                    .chain(pkcs11_module::FUNCTION_LIST_3_0_EXTRA_FIELDS.iter())
+                    .map(|field| FunctionRecord {
+                        name: field.name.into(),
+                        resolution: Resolution::NullPointer,
+                    })
+                    .collect(),
+                semantic_authorized: false,
+            }];
+            let reference = &mut manifest.selection_evidence.queries[4];
+            reference.rv = 0;
+            reference.result = result(
+                SelectionNameClass::ExactStandard,
+                SelectionVersionClass::V3_0,
+            );
+            reference.selection_table = Some(table_id);
+            reference.authority = SelectionAuthority::SelectionCountOnly;
+        }
         let query = &mut manifest.selection_evidence.queries[0];
         query.rv = 0;
-        query.result = result;
+        query.result = query_result;
         query.authority = authority;
         query.selection_table = selection_table;
         query.helper_failure = Some(failure);
@@ -435,6 +459,33 @@ fn helper_failure_cross_fields_are_exact() {
         );
     }
     check(SelectionFailure::ProviderChanged, None, none, None, None);
+    for failure in [
+        SelectionFailure::UnreadableName,
+        SelectionFailure::UnreadableVersion,
+        SelectionFailure::UnreadableTable,
+        SelectionFailure::OutsideProvider,
+        SelectionFailure::UnresolvedFunction,
+    ] {
+        check(
+            failure,
+            None,
+            none,
+            None,
+            Some("successful selection query 0 has no result"),
+        );
+    }
+    for failure in [
+        SelectionFailure::NullOutput,
+        SelectionFailure::UnreadableInterface,
+    ] {
+        check(
+            failure,
+            None,
+            none,
+            Some(0),
+            Some("successful selection query 0 has null result cross-fields"),
+        );
+    }
     for name in [
         SelectionNameClass::Null,
         SelectionNameClass::ExactStandard,

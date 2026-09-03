@@ -1732,6 +1732,12 @@ pub(crate) trait EngineSession {
     fn capture_policy(&self) -> CapturePolicy;
     fn discovery_dequeue(&mut self) -> Result<Option<crate::events::DiscoveryItem>>;
     fn counter_snapshot(&self) -> Result<CounterSnapshot>;
+    fn read_selection_table(
+        &mut self,
+        view: &ProcessView,
+        address: u64,
+        budget: &mut CaptureWorkBudget,
+    ) -> std::result::Result<(MapEntry, ScannedTable), ()>;
     fn detach_failures(&self) -> &[String];
     fn lifecycle_tracking_unavailable(&self) -> Option<&str>;
     fn preflight_targets(&self, targets: &[plan::Slot], objects: &PinnedObjects) -> Result<()>;
@@ -1793,6 +1799,15 @@ impl EngineSession for Session {
 
     fn counter_snapshot(&self) -> Result<CounterSnapshot> {
         Session::counter_snapshot(self)
+    }
+
+    fn read_selection_table(
+        &mut self,
+        view: &ProcessView,
+        address: u64,
+        budget: &mut CaptureWorkBudget,
+    ) -> std::result::Result<(MapEntry, ScannedTable), ()> {
+        Engine::read_selection_table(view, address, budget)
     }
 
     fn detach_failures(&self) -> &[String] {
@@ -7917,7 +7932,7 @@ impl Engine {
     fn process_selection_record_inner(
         &mut self,
         queued: &QueuedDiscoveryRecord,
-        transaction: Option<(
+        mut transaction: Option<(
             &mut dyn EngineSession,
             &mut bool,
             &mut PendingViewRetirements,
@@ -8176,8 +8191,11 @@ impl Engine {
                     if !self.pinned.check_unchanged().unwrap_or(false) {
                         return Err(());
                     }
-                    let (mapping, table) =
-                        Self::read_selection_table(view, record.table_ptr, &mut self.budget)?;
+                    let (mapping, table) = if let Some((session, _, _)) = transaction.as_mut() {
+                        session.read_selection_table(view, record.table_ptr, &mut self.budget)?
+                    } else {
+                        Self::read_selection_table(view, record.table_ptr, &mut self.budget)?
+                    };
                     if !self.pinned.check_unchanged().unwrap_or(false) {
                         return Err(());
                     }
@@ -11468,6 +11486,7 @@ pub(crate) mod session_fixture {
         /// Dynamic exports requested by the Engine, in order.
         pub(crate) dynamic_attach_calls: Vec<DynamicExportIdentity>,
         pub(crate) dynamic_attach_reports_added: bool,
+        pub(crate) selection_table_read: Option<(MapEntry, ScannedTable)>,
         /// Killed and reaped from inside `attach_targets`, i.e. exactly between
         /// a generation precheck and its postcheck.
         kill_on_attach: Option<u32>,
@@ -11571,6 +11590,17 @@ pub(crate) mod session_fixture {
                 bail!("scripted producer counter read failed");
             }
             Ok(self.counters)
+        }
+
+        fn read_selection_table(
+            &mut self,
+            view: &ProcessView,
+            address: u64,
+            budget: &mut CaptureWorkBudget,
+        ) -> std::result::Result<(MapEntry, ScannedTable), ()> {
+            self.selection_table_read
+                .take()
+                .map_or_else(|| Engine::read_selection_table(view, address, budget), Ok)
         }
 
         fn detach_failures(&self) -> &[String] {
@@ -17722,7 +17752,6 @@ int main(int argc, char **argv) {
             tuple.clone(),
             LiveSelectionTuple {
                 authority: SelectionAuthority::SelectionCountOnly,
-                count: 3,
                 ..tuple
             },
         ]);
@@ -17735,8 +17764,98 @@ int main(int argc, char **argv) {
                 .any(|tuple| { tuple.authority == SelectionAuthority::None && tuple.count == 2 })
         );
         assert!(tuples.iter().any(|tuple| {
-            tuple.authority == SelectionAuthority::SelectionCountOnly && tuple.count == 3
+            tuple.authority == SelectionAuthority::SelectionCountOnly && tuple.count == 2
         }));
+    }
+
+    #[test]
+    fn selection_claim_cap_is_checked_before_production_candidate_application() {
+        let (_fixture, mut engine, mut session, binding) = attached_selection_route();
+        let provider = engine.pinned.summary(binding.object).unwrap().key;
+        let mapping =
+            parse_maps(&std::fs::read(format!("/proc/{}/maps", engine.views[0].pid())).unwrap())
+                .unwrap()
+                .into_iter()
+                .find(|mapping| ObjectKey::of(mapping) == provider)
+                .unwrap();
+        session.selection_table_read = Some((
+            mapping,
+            selection_only_table(
+                &engine,
+                binding,
+                0x20,
+                &[("C_Initialize", 0x100)],
+                Vec::new(),
+            ),
+        ));
+        let tuple = LiveSelectionTuple {
+            module: binding.provider,
+            request: SelectionRequest {
+                name: SelectionNameClass::ExactStandard,
+                version: SelectionVersionClass::V3_0,
+                flags: 0,
+            },
+            rv: 0,
+            result: Some(SelectionRequest {
+                name: SelectionNameClass::ExactStandard,
+                version: SelectionVersionClass::V3_0,
+                flags: 0,
+            }),
+            inventory_matches: Vec::new(),
+            authority: SelectionAuthority::None,
+            count: 1,
+        };
+        engine.capture_facts.history.selections.push(tuple.clone());
+        for flags in 1..MAX_LIVE_SELECTION_TUPLES {
+            engine
+                .capture_facts
+                .history
+                .selections
+                .push(LiveSelectionTuple {
+                    request: SelectionRequest {
+                        flags: flags as u64,
+                        ..tuple.request
+                    },
+                    ..tuple.clone()
+                });
+        }
+        let before_calls = session.attached_slots.len();
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_INTERFACE_RETURN;
+        record.pid_tgid = u64::from(engine.views[0].pid()) << 32;
+        record.case_id = DISCOVERY_NAME_EXACT_STANDARD;
+        record.interface_index = DISCOVERY_VERSION_V3_0;
+        record.name_class = DISCOVERY_NAME_EXACT_STANDARD;
+        record.selection_version_class = DISCOVERY_VERSION_V3_0;
+        record.table_ptr = 1;
+        record.binding_id = binding.id;
+        let outcome = engine
+            .dispatch_discovery_record(
+                QueuedDiscoveryRecord {
+                    record,
+                    terminal_owner: None,
+                    terminal_exports: Vec::new(),
+                },
+                &mut session,
+                &mut true,
+                &mut PendingViewRetirements::new(),
+                &mut BTreeSet::new(),
+                &mut Vec::new(),
+            )
+            .unwrap();
+
+        assert_eq!(outcome, DiscoveryRecordOutcome::applied(false, true));
+        assert_eq!(session.attached_slots.len(), before_calls);
+        assert!(engine.selection_claims.is_empty());
+        assert!(engine.selection_tables.is_empty());
+        assert_eq!(engine.capture_facts.history.selections.len(), 16);
+        assert_eq!(engine.capture_facts.history.selections[0].count, 2);
+        assert!(
+            !engine.capture_facts.history.selections.iter().any(|known| {
+                known.authority == SelectionAuthority::SelectionCountOnly
+                    && known.request == tuple.request
+            })
+        );
     }
 
     #[test]

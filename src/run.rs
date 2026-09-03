@@ -3743,6 +3743,27 @@ mod tests {
         fail_flush: bool,
     }
 
+    struct FailAfterLines {
+        allowed_lines: usize,
+        bytes: Vec<u8>,
+        attempts: Vec<Vec<u8>>,
+    }
+
+    impl Write for FailAfterLines {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.attempts.push(buf.to_vec());
+            if self.bytes.iter().filter(|byte| **byte == b'\n').count() >= self.allowed_lines {
+                return Err(std::io::Error::other("scripted write failure"));
+            }
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     impl Write for FailingWriter {
         fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
             if self.fail_flush {
@@ -4100,7 +4121,7 @@ mod tests {
         }];
         let mut stdout = Vec::new();
         let mut stdout_open = true;
-        let mut out_file: Option<Vec<u8>> = None;
+        let mut out_file = Some(Vec::new());
         let mut remaining = None;
         let mut gaps = 0;
         let mut drain = crate::events::EventDrain::over(crate::events::ScriptedRecords::events(
@@ -4132,6 +4153,7 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(out_file.as_ref().unwrap(), &stdout);
         let lines = String::from_utf8(stdout).unwrap();
         let lines = lines.lines().collect::<Vec<_>>();
         assert_eq!(lines.len(), 2);
@@ -4147,6 +4169,47 @@ mod tests {
                 "raw_calls": 1,
             })
         );
+    }
+
+    #[test]
+    fn terminal_trace_stops_after_either_file_write_failure() {
+        let (_, _, tracer) = trace_fixture();
+        for allowed_lines in [0, 1] {
+            let mut stdout = Vec::new();
+            let mut stdout_open = true;
+            let mut file = Some(FailAfterLines {
+                allowed_lines,
+                bytes: Vec::new(),
+                attempts: Vec::new(),
+            });
+            assert!(
+                emit_trace_terminal(
+                    &[],
+                    &tracer,
+                    "EVIDENCE {}",
+                    &mut stdout,
+                    &mut stdout_open,
+                    &mut file,
+                )
+                .is_err()
+            );
+            let file = file.unwrap();
+            assert_eq!(
+                file.bytes.iter().filter(|byte| **byte == b'\n').count(),
+                allowed_lines
+            );
+            assert!(
+                !String::from_utf8_lossy(&file.bytes)
+                    .lines()
+                    .any(|line| line == "EVIDENCE {}")
+            );
+            assert_eq!(
+                file.attempts
+                    .iter()
+                    .any(|attempt| attempt.windows(11).any(|bytes| bytes == b"EVIDENCE {}")),
+                allowed_lines == 1,
+            );
+        }
     }
 
     /// Both loops take their poll bound from the session — the quantum while

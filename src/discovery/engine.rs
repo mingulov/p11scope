@@ -15093,6 +15093,18 @@ int main(int argc, char **argv) {
         let inventory = inventory.clone();
         let inventory_tables = engine.plan.modules[0].tables.clone();
         let extra = base + 80;
+        let removed_inventory = base + 1;
+        manifest.surfaces[0]
+            .functions
+            .iter_mut()
+            .find(|function| {
+                matches!(
+                    function.resolution,
+                    Resolution::Resolved { file_offset, .. } if file_offset == removed_inventory
+                )
+            })
+            .unwrap()
+            .resolution = Resolution::NullPointer;
 
         let mut selection = manifest_selection_evidence(
             Version { major: 3, minor: 0 },
@@ -15154,6 +15166,25 @@ int main(int argc, char **argv) {
             assert!(!slot.semantic_authorized);
         }
         assert_eq!(candidate.plan.modules[0].tables, inventory_tables);
+        let inventory_key = plan::AttachKey {
+            object: inventory.object,
+            file_offset: inventory.file_offset,
+        };
+        let rebuilt_inventory = candidate
+            .manifest_inventory_slots
+            .get(&inventory_key)
+            .unwrap();
+        assert_ne!(
+            rebuilt_inventory.index, inventory.index,
+            "removing an earlier target must compact the pre-reconciliation snapshot"
+        );
+        assert!(
+            candidate
+                .delta
+                .retire
+                .iter()
+                .any(|slot| slot.file_offset == removed_inventory)
+        );
         let committed_inventory = candidate
             .plan
             .slots

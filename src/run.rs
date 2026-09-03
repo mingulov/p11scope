@@ -1740,7 +1740,6 @@ fn observe_fork(
     tracker: &mut process::Tracker,
     state: &mut semantics::State,
     scope: &Scope,
-    pid_descendant_gaps: &mut u64,
     ev: &p11scope_ebpf_common::Event,
 ) -> bool {
     if !matches!(
@@ -1753,11 +1752,6 @@ fn observe_fork(
         return true;
     }
     let parent_pid = (ev.pid_tgid >> 32) as u32;
-    // Static function probes cover cgroup descendants immediately, but Aya's
-    // per-process dynamic export links cannot cover a child's C_GetInterface
-    // calls before the next membership refresh. Keep semantic inheritance,
-    // while making that selection-discovery window explicit.
-    *pid_descendant_gaps = pid_descendant_gaps.saturating_add(1);
     if ev.event_type == p11scope_ebpf_common::event_type::FORK_INTO_CGROUP {
         return true;
     }
@@ -1788,13 +1782,12 @@ fn initial_tracking_evidence(
     scope: &Scope,
     process_creation_tracking_unavailable: bool,
     lifecycle_tracking_unavailable: bool,
-) -> (u64, bool) {
+) -> bool {
     match scope {
-        Scope::Pid(_) => (0, lifecycle_tracking_unavailable),
-        Scope::Cgroup { .. } => (
-            u64::from(process_creation_tracking_unavailable),
-            process_creation_tracking_unavailable || lifecycle_tracking_unavailable,
-        ),
+        Scope::Pid(_) => lifecycle_tracking_unavailable,
+        Scope::Cgroup { .. } => {
+            process_creation_tracking_unavailable || lifecycle_tracking_unavailable
+        }
     }
 }
 
@@ -1958,22 +1951,16 @@ fn capture_profile(
     }
     let drain_events = |session: &mut Session,
                         state: &mut semantics::State,
-                        tracker: &mut process::Tracker,
-                        pid_descendant_gaps: &mut u64|
+                        tracker: &mut process::Tracker|
      -> Result<u64> {
         let quantum = session.live_poll_quantum();
         let mut drain = session.event_drain()?;
         Ok(drain_profile_events(
-            &mut drain,
-            state,
-            tracker,
-            scope,
-            pid_descendant_gaps,
-            quantum,
+            &mut drain, state, tracker, scope, quantum,
         ))
     };
     let mut malformed_records: u64 = 0;
-    let (mut pid_descendant_gaps, capture_tracking_degraded) = initial_tracking_evidence(
+    let capture_tracking_degraded = initial_tracking_evidence(
         scope,
         session.process_creation_tracking_unavailable().is_some(),
         session.lifecycle_tracking_unavailable().is_some(),
@@ -2005,7 +1992,6 @@ fn capture_profile(
                 session,
                 &mut state,
                 &mut process_tracker,
-                &mut pid_descendant_gaps,
             )?;
         }
         // 4. Retire exited process state.
@@ -2038,7 +2024,6 @@ fn capture_profile(
                 engine.pinned().provider_changed(),
                 profile,
                 owned.as_deref(),
-                pid_descendant_gaps,
                 capture_tracking_degraded,
             );
             let frame = render::live(
@@ -2088,7 +2073,6 @@ fn capture_profile(
             session,
             &mut state,
             &mut process_tracker,
-            &mut pid_descendant_gaps,
         )?;
     }
     retire_exited(&mut process_tracker, &mut state);
@@ -2120,7 +2104,6 @@ fn capture_profile(
         engine.pinned().provider_changed(),
         profile,
         owned.as_deref(),
-        pid_descendant_gaps,
         capture_tracking_degraded,
     );
     ev.mark_terminal_drain_unproven();
@@ -2226,7 +2209,7 @@ fn capture_trace(
 
     let mut stdout_open = true;
     let mut malformed_records: u64 = 0;
-    let (mut pid_descendant_gaps, capture_tracking_degraded) = initial_tracking_evidence(
+    let capture_tracking_degraded = initial_tracking_evidence(
         scope,
         session.process_creation_tracking_unavailable().is_some(),
         session.lifecycle_tracking_unavailable().is_some(),
@@ -2272,7 +2255,6 @@ fn capture_trace(
             &mut state,
             &mut process_tracker,
             scope,
-            &mut pid_descendant_gaps,
             &mut tracer,
             stdout,
             &mut stdout_open,
@@ -2338,7 +2320,6 @@ fn capture_trace(
         &mut state,
         &mut process_tracker,
         scope,
-        &mut pid_descendant_gaps,
         &mut tracer,
         stdout,
         &mut stdout_open,
@@ -2379,7 +2360,6 @@ fn capture_trace(
         engine.pinned().provider_changed(),
         true,
         owned.as_deref(),
-        pid_descendant_gaps,
         capture_tracking_degraded,
     );
     evidence.mark_terminal_drain_unproven();
@@ -2504,11 +2484,10 @@ fn drain_profile_events<S: crate::events::RecordSource>(
     state: &mut semantics::State,
     tracker: &mut process::Tracker,
     scope: &Scope,
-    pid_descendant_gaps: &mut u64,
     quantum: Option<usize>,
 ) -> u64 {
     drain.poll(quantum, |ev| {
-        if observe_fork(tracker, state, scope, pid_descendant_gaps, &ev) {
+        if observe_fork(tracker, state, scope, &ev) {
             return ControlFlow::Continue(());
         }
         let process = identify_tracked(tracker, state, &ev);
@@ -2533,7 +2512,6 @@ fn drain_trace_events<W: Write>(
     state: &mut semantics::State,
     tracker: &mut process::Tracker,
     scope: &Scope,
-    pid_descendant_gaps: &mut u64,
     tracer: &mut trace::Tracer,
     stdout: &mut dyn Write,
     stdout_open: &mut bool,
@@ -2547,7 +2525,6 @@ fn drain_trace_events<W: Write>(
         state,
         tracker,
         scope,
-        pid_descendant_gaps,
         tracer,
         stdout,
         stdout_open,
@@ -2563,7 +2540,6 @@ fn drain_trace_events_from<S: crate::events::RecordSource, W: Write>(
     state: &mut semantics::State,
     tracker: &mut process::Tracker,
     scope: &Scope,
-    pid_descendant_gaps: &mut u64,
     tracer: &mut trace::Tracer,
     stdout: &mut dyn Write,
     stdout_open: &mut bool,
@@ -2573,7 +2549,7 @@ fn drain_trace_events_from<S: crate::events::RecordSource, W: Write>(
     let mut write_error = None;
     drain.poll(quantum, |ev| {
         tracer.count_raw_call(&ev);
-        if observe_fork(tracker, state, scope, pid_descendant_gaps, &ev) {
+        if observe_fork(tracker, state, scope, &ev) {
             return ControlFlow::Continue(());
         }
         let process = identify_tracked(tracker, state, &ev);
@@ -2651,7 +2627,6 @@ fn evidence_for(
     provider_changed: bool,
     include_selection: bool,
     owned: Option<&Owned>,
-    pid_descendant_gaps: u64,
     capture_tracking_degraded: bool,
 ) -> render::Evidence {
     let semantic = state.semantic_evidence();
@@ -2677,6 +2652,7 @@ fn evidence_for(
     ] = facts.discovery_losses();
     let pause = owned.map_or_else(Default::default, |owned| owned.coordinator.counters());
     let pause_status = pause.status();
+    let pid_descendant_gaps = engine.pid_descendant_gaps();
     let mut interface_selection = if include_selection {
         engine.interface_selection()
     } else {
@@ -3798,7 +3774,6 @@ mod tests {
         let plan = crate::plan::AttachPlan::from_slots(vec![]);
         let mut state = semantics::State::new(&plan);
         let mut tracker = process::Tracker::new();
-        let mut gaps = 0;
         let events = (0..=LIVE_POLL_QUANTUM).map(|_| call_event());
         let mut drain = EventDrain::over(ScriptedRecords::events(events, LIVE_POLL_QUANTUM));
 
@@ -3807,7 +3782,6 @@ mod tests {
             &mut state,
             &mut tracker,
             &Scope::Pid(std::process::id()),
-            &mut gaps,
             Some(LIVE_POLL_QUANTUM),
         );
 
@@ -3855,7 +3829,6 @@ mod tests {
             },
         );
         assert!(state.pid_has_process_state(41));
-        let mut gaps = 0;
         let mut drain = EventDrain::over(ScriptedRecords::events([event], usize::MAX));
         let scope = Scope::Cgroup {
             id: 1,
@@ -3864,19 +3837,8 @@ mod tests {
         };
 
         assert_eq!(
-            drain_profile_events(
-                &mut drain,
-                &mut state,
-                &mut tracker,
-                &scope,
-                &mut gaps,
-                None,
-            ),
+            drain_profile_events(&mut drain, &mut state, &mut tracker, &scope, None,),
             0
-        );
-        assert_eq!(
-            gaps, 1,
-            "one fork creates one pre-refresh selection-discovery window"
         );
         assert!(
             state.pid_has_process_state(42),
@@ -3892,17 +3854,9 @@ mod tests {
         };
         let mut drain = EventDrain::over(ScriptedRecords::events([into_event], usize::MAX));
         assert_eq!(
-            drain_profile_events(
-                &mut drain,
-                &mut state,
-                &mut tracker,
-                &scope,
-                &mut gaps,
-                None,
-            ),
+            drain_profile_events(&mut drain, &mut state, &mut tracker, &scope, None,),
             0
         );
-        assert_eq!(gaps, 2, "each non-thread process creation adds one gap");
         assert!(
             !state.pid_has_process_state(43),
             "destination cgroup membership is unproven"
@@ -3929,7 +3883,6 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stdout_open = true;
         let mut out_file: Option<Vec<u8>> = None;
-        let mut gaps = 0;
         let events = (0..5).map(|_| call_event());
         let mut drain = EventDrain::over(ScriptedRecords::events(events, 2));
 
@@ -3939,7 +3892,6 @@ mod tests {
             &mut state,
             &mut tracker,
             &Scope::Pid(std::process::id()),
-            &mut gaps,
             &mut tracer,
             &mut stdout,
             &mut stdout_open,
@@ -3967,7 +3919,6 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stdout_open = true;
         let mut out_file: Option<Vec<u8>> = None;
-        let mut gaps = 0;
         let events = (0..=LIVE_POLL_QUANTUM).map(|_| call_event());
         let mut drain = EventDrain::over(ScriptedRecords::events(events, LIVE_POLL_QUANTUM));
 
@@ -3977,7 +3928,6 @@ mod tests {
             &mut state,
             &mut tracker,
             &Scope::Pid(std::process::id()),
-            &mut gaps,
             &mut tracer,
             &mut stdout,
             &mut stdout_open,
@@ -4000,7 +3950,6 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stdout_open = true;
         let mut out_file: Option<Vec<u8>> = None;
-        let mut gaps = 0;
         let events = (0..crate::events::LIVE_POLL_QUANTUM + 5).map(|_| call_event());
         let mut drain = EventDrain::over(ScriptedRecords::events(events, usize::MAX));
 
@@ -4010,7 +3959,6 @@ mod tests {
             &mut state,
             &mut tracker,
             &Scope::Pid(std::process::id()),
-            &mut gaps,
             &mut tracer,
             &mut stdout,
             &mut stdout_open,
@@ -4047,7 +3995,6 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stdout_open = true;
         let mut out_file: Option<Vec<u8>> = None;
-        let mut gaps = 0;
         let events = [
             call_event(),
             p11scope_ebpf_common::Event {
@@ -4073,7 +4020,6 @@ mod tests {
                 path: PathBuf::from("/"),
                 dir: Arc::new(File::open("/").unwrap()),
             },
-            &mut gaps,
             &mut tracer,
             &mut stdout,
             &mut stdout_open,
@@ -4123,7 +4069,6 @@ mod tests {
         let mut stdout_open = true;
         let mut out_file = Some(Vec::new());
         let mut remaining = None;
-        let mut gaps = 0;
         let mut drain = crate::events::EventDrain::over(crate::events::ScriptedRecords::events(
             [call_event()],
             usize::MAX,
@@ -4134,7 +4079,6 @@ mod tests {
             &mut state,
             &mut tracker,
             &Scope::Pid(std::process::id()),
-            &mut gaps,
             &mut tracer,
             &mut Vec::new(),
             &mut true,
@@ -4430,29 +4374,27 @@ mod tests {
         let (clean, truncated) = crate::discovery::engine::tests::selection_output_engines();
         let clean_state = semantics::State::new(clean.plan());
         let truncated_state = semantics::State::new(truncated.plan());
-        let build =
-            |engine: &Engine, state: &semantics::State, include_selection, pid_descendant_gaps| {
-                evidence_for(
-                    engine,
-                    engine.capture_facts(),
-                    0,
-                    false,
-                    &[],
-                    &[],
-                    metrics::KernelEvidence::default(),
-                    process::TrackingEvidence::default(),
-                    0,
-                    state,
-                    false,
-                    include_selection,
-                    None,
-                    pid_descendant_gaps,
-                    false,
-                )
-            };
+        let build = |engine: &Engine, state: &semantics::State, include_selection| {
+            evidence_for(
+                engine,
+                engine.capture_facts(),
+                0,
+                false,
+                &[],
+                &[],
+                metrics::KernelEvidence::default(),
+                process::TrackingEvidence::default(),
+                0,
+                state,
+                false,
+                include_selection,
+                None,
+                false,
+            )
+        };
 
-        let clean_metrics = build(&clean, &clean_state, false, 0);
-        let truncated_metrics = build(&truncated, &truncated_state, false, 0);
+        let clean_metrics = build(&clean, &clean_state, false);
+        let truncated_metrics = build(&truncated, &truncated_state, false);
         assert_eq!(truncated_metrics.completeness, clean_metrics.completeness);
         assert_eq!(
             truncated_metrics.interface_selection,
@@ -4474,7 +4416,7 @@ mod tests {
             assert!(document["evidence"].get(field).is_none(), "{field}");
         }
 
-        let profile = build(&truncated, &truncated_state, true, 0);
+        let profile = build(&truncated, &truncated_state, true);
         assert!(profile.interface_selection.selection_truncated);
         assert_eq!(profile.completeness, "PARTIAL");
 
@@ -4482,13 +4424,12 @@ mod tests {
             clean.interface_selection().providers[0].coverage,
             "absent_covered"
         );
-        let gap_profile = build(&clean, &clean_state, true, 1);
+        let gap_profile = build(&clean, &clean_state, true);
         assert_eq!(
             gap_profile.interface_selection.providers[0].coverage,
-            "absent_uncovered"
+            "absent_covered"
         );
-        assert_eq!(gap_profile.pid_descendant_gaps, 1);
-        assert_eq!(gap_profile.completeness, "PARTIAL");
+        assert_eq!(gap_profile.pid_descendant_gaps, 0);
     }
 
     #[test]
@@ -4515,7 +4456,6 @@ mod tests {
             false,
             true,
             None,
-            0,
             false,
         );
         let capture = render::CaptureMeta {
@@ -4560,7 +4500,6 @@ mod tests {
             false,
             true,
             None,
-            0,
             true,
         );
 
@@ -4584,9 +4523,39 @@ mod tests {
 
     #[test]
     fn pid_scope_process_creation_tracking_is_not_required_or_counted() {
-        let (pid_descendant_gaps, capture_tracking_degraded) =
-            initial_tracking_evidence(&Scope::Pid(41), true, false);
-        assert_eq!((pid_descendant_gaps, capture_tracking_degraded), (0, false));
+        assert!(!initial_tracking_evidence(&Scope::Pid(41), true, false));
+    }
+
+    #[test]
+    fn cgroup_creator_events_are_hints_and_never_count_descendant_gaps() {
+        let scope = Scope::Cgroup {
+            id: 1,
+            path: PathBuf::from("/sys/fs/cgroup/test"),
+            dir: Arc::new(File::open("/dev/null").unwrap()),
+        };
+        let plan = crate::plan::build_from_reconciled_modules(&[]);
+        let mut state = semantics::State::new(&plan);
+        let mut tracker = process::Tracker::with_limits(0, 16);
+        for event_type in [
+            p11scope_ebpf_common::event_type::FORK,
+            p11scope_ebpf_common::event_type::FORK_INTO_CGROUP,
+        ] {
+            let mut event: p11scope_ebpf_common::Event = unsafe { std::mem::zeroed() };
+            event.event_type = event_type;
+            event.pid_tgid = u64::from(std::process::id()) << 32;
+            event.session = u64::from(std::process::id());
+            assert!(observe_fork(&mut tracker, &mut state, &scope, &event,));
+        }
+    }
+
+    #[test]
+    fn unavailable_cgroup_creation_boundary_does_not_precount_a_creator_gap() {
+        let scope = Scope::Cgroup {
+            id: 1,
+            path: PathBuf::from("/sys/fs/cgroup/test"),
+            dir: Arc::new(File::open("/dev/null").unwrap()),
+        };
+        assert!(initial_tracking_evidence(&scope, true, false));
     }
 
     #[test]

@@ -19,7 +19,7 @@ use crate::discovery::scan::{
     ScannedTable, Skipped, decode_exact_table, exact_table_addresses, exact_table_bytes,
     index_maps_or_refuse, read_maps_or_refuse, scan_process_view, spans_for,
 };
-use crate::manifest_input::{read_manifest, validate_structure};
+use crate::manifest_input::{read_manifest, selection_surface_usable, validate_structure};
 use crate::process::{self, ProcessView, ProcessViewId};
 use crate::run::OwnedChild;
 use crate::{plan, render};
@@ -36,7 +36,7 @@ use p11scope_ebpf_common::{
 use p11scope_manifest::elf::ElfSnapshot;
 use p11scope_manifest::manifest::{
     Acquisition, Manifest, Resolution, SCHEMA, SelectionAcquisition, SelectionAuthority,
-    SelectionNameClass, SelectionRequest, SelectionVersionClass, WalkOutcome,
+    SelectionNameClass, SelectionRequest, SelectionVersionClass, SurfaceSource, WalkOutcome,
 };
 use p11scope_manifest::maps::{Device, MapEntry, MapIndex, MappedPath, ObjectKey, Resolved};
 use std::collections::{BTreeMap, BTreeSet};
@@ -46,6 +46,8 @@ use std::os::fd::AsRawFd as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::Arc;
 
 pub struct Engine {
     plan: plan::AttachPlan,
@@ -84,6 +86,12 @@ pub struct Engine {
     expected_target_exit: bool,
     pending_leader_exit_views: BTreeSet<ProcessViewId>,
     counted_leader_exit_views: BTreeSet<ProcessViewId>,
+    pid_descendant_gaps: u64,
+    // Both ledgers are capture-local and bounded by the process-view ceiling;
+    // only the scalar crosses the render boundary.
+    admitted_cgroup_views: BTreeMap<ProcessViewId, CgroupAdmission>,
+    unmatched_leader_exit_events: BTreeSet<(u32, u64)>,
+    cgroup_ingress_overflow: bool,
     task_uprobe_link_losses: u64,
     next_selection_binding_id: Option<u64>,
     selection_bindings: BTreeMap<u64, SelectionBindingFact>,
@@ -287,6 +295,7 @@ struct CaptureHistory {
     interface_list: String,
     selection_inventory: BTreeMap<ExactSelectionTable, Vec<InventorySurfaceKey>>,
     selection_surfaces: BTreeSet<InventorySurfaceKey>,
+    manifest_selection_ordinals: BTreeSet<u32>,
     selections: Vec<LiveSelectionTuple>,
     selection_truncated: bool,
     standard_exports: BTreeMap<plan::ModuleId, BTreeSet<StandardExportFact>>,
@@ -389,12 +398,33 @@ struct InventorySurfaceBase {
     name: PrivateSelectionName,
     version: SelectionVersionClass,
     flags: u64,
+    /// Address-free source identity for offline surfaces. Scan surfaces use
+    /// `None`; a manifest ordinal and surface index cannot collide with a
+    /// different accepted manifest.
+    manifest_identity: Option<(u32, u32)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct InventorySurfaceKey {
     base: InventorySurfaceBase,
     duplicate: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CgroupAdmission {
+    pid: u32,
+    admitted_ns: u64,
+    closed_ns: Option<u64>,
+}
+
+impl CgroupAdmission {
+    fn covers(self, hook_ts_ns: u64, pid: u32) -> bool {
+        self.pid == pid
+            && hook_ts_ns >= self.admitted_ns
+            && self
+                .closed_ns
+                .is_none_or(|closed_ns| hook_ts_ns <= closed_ns)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -518,6 +548,54 @@ fn private_selection_name(
     }
 }
 
+fn manifest_inventory_surface_key(
+    provider: PinnedTimingKey,
+    manifest: u32,
+    index: usize,
+    surface: &p11scope_manifest::manifest::SurfaceRecord,
+) -> Option<InventorySurfaceKey> {
+    let index = u32::try_from(index).ok()?;
+    let (kind, name, flags) = match &surface.source {
+        SurfaceSource::LegacyFunctionList => (
+            InventorySurfaceKind::Legacy,
+            PrivateSelectionName::Legacy,
+            0,
+        ),
+        SurfaceSource::Interface {
+            classification,
+            flags,
+            ..
+        } => (
+            InventorySurfaceKind::Interface,
+            match classification {
+                p11scope_manifest::manifest::InterfaceClassification::ExactStandard => {
+                    PrivateSelectionName::ExactStandard
+                }
+                p11scope_manifest::manifest::InterfaceClassification::CorroboratedStandardPrefix => {
+                    PrivateSelectionName::Other(Vec::new())
+                }
+            },
+            *flags,
+        ),
+    };
+    Some(InventorySurfaceKey {
+        base: InventorySurfaceBase {
+            provider,
+            table_file_offset: index as u64,
+            kind,
+            name,
+            version: surface
+                .version
+                .map_or(SelectionVersionClass::Other, |version| {
+                    inventory_version_class((version.major, version.minor))
+                }),
+            flags,
+            manifest_identity: Some((manifest, index)),
+        },
+        duplicate: 0,
+    })
+}
+
 fn readable_name(class: SelectionNameClass) -> bool {
     !matches!(
         class,
@@ -533,8 +611,12 @@ fn readable_version(class: SelectionVersionClass) -> bool {
 }
 
 fn insert_selection_loss(history: &mut CaptureHistory, reason: &str) {
+    insert_selection_loss_for(history, "live interface selection", reason);
+}
+
+fn insert_selection_loss_for(history: &mut CaptureHistory, subject: &str, reason: &str) {
     let skipped = Skipped {
-        subject: "live interface selection".into(),
+        subject: subject.into(),
         reason: reason.into(),
     };
     history
@@ -542,6 +624,9 @@ fn insert_selection_loss(history: &mut CaptureHistory, reason: &str) {
         .entry((skipped.subject.clone(), skipped.reason.clone()))
         .or_insert(skipped);
 }
+
+const OFFLINE_SELECTION_LOSS_REASON: &str =
+    "offline interface selection helper reported incomplete evidence";
 
 fn canonical_inventory_keys(mut bases: Vec<InventorySurfaceBase>) -> Vec<InventorySurfaceKey> {
     bases.sort();
@@ -986,32 +1071,41 @@ impl CaptureFacts {
 
     /// Retains only the finite, address-free selection tuple. Returns true
     /// when either the tuple or its exact alias set exceeded the capture bound.
-    fn record_selection(&mut self, mut tuple: LiveSelectionTuple, matches_truncated: bool) -> bool {
-        let history = self.visible_history_mut();
-        let was_truncated = history.selection_truncated;
-        let existing = history.selections.iter_mut().find(|known| {
-            known.module == tuple.module
-                && known.request == tuple.request
-                && known.rv == tuple.rv
-                && known.result == tuple.result
-                && known.inventory_matches == tuple.inventory_matches
-                && known.authority == tuple.authority
-        });
-        if let Some(existing) = existing {
-            existing.count = existing.count.saturating_add(1);
-        } else if history.selections.len() < MAX_LIVE_SELECTION_TUPLES {
-            tuple.count = 1;
-            history.selections.push(tuple);
-        } else {
-            history.selection_truncated = true;
-        }
-        history.selection_truncated |= matches_truncated;
-        if history.selection_truncated && !was_truncated {
-            insert_selection_loss(history, "the bounded selection evidence was truncated");
-        }
-        !was_truncated && history.selection_truncated
+    fn record_selection(&mut self, tuple: LiveSelectionTuple, matches_truncated: bool) -> bool {
+        record_selection_in(&mut self.visible_history_mut(), tuple, matches_truncated)
     }
+}
 
+fn record_selection_in(
+    history: &mut CaptureHistory,
+    mut tuple: LiveSelectionTuple,
+    matches_truncated: bool,
+) -> bool {
+    let was_truncated = history.selection_truncated;
+    let existing = history.selections.iter_mut().find(|known| {
+        known.module == tuple.module
+            && known.request == tuple.request
+            && known.rv == tuple.rv
+            && known.result == tuple.result
+            && known.inventory_matches == tuple.inventory_matches
+            && known.authority == tuple.authority
+    });
+    if let Some(existing) = existing {
+        existing.count = existing.count.saturating_add(1);
+    } else if history.selections.len() < MAX_LIVE_SELECTION_TUPLES {
+        tuple.count = 1;
+        history.selections.push(tuple);
+    } else {
+        history.selection_truncated = true;
+    }
+    history.selection_truncated |= matches_truncated;
+    if history.selection_truncated && !was_truncated {
+        insert_selection_loss(history, "the bounded selection evidence was truncated");
+    }
+    !was_truncated && history.selection_truncated
+}
+
+impl CaptureFacts {
     fn record_selection_loss(&mut self, reason: &str) {
         insert_selection_loss(self.visible_history_mut(), reason);
     }
@@ -1304,6 +1398,7 @@ impl CaptureFacts {
                             name: PrivateSelectionName::Legacy,
                             version: inventory_version_class(table.version),
                             flags: 0,
+                            manifest_identity: None,
                         }]
                     })
                     .unwrap_or_default();
@@ -1341,6 +1436,7 @@ impl CaptureFacts {
                             name: private_selection_name(interface, module.scanned.view),
                             version: inventory_version_class(table.version),
                             flags: interface.flags,
+                            manifest_identity: None,
                         });
                     }
                 }
@@ -1432,6 +1528,9 @@ impl CaptureFacts {
                 )
             })?;
             let owner = self.module_id_for_object(pinned, object)?;
+            let provider = pinned
+                .owned_timing_key(object)
+                .ok_or_else(|| anyhow!("manifest provider has no exact opened identity"))?;
             let export = match manifest.selection_evidence.acquisition {
                 SelectionAcquisition::Queried => StandardExportFact::Present,
                 SelectionAcquisition::ExportAbsent => StandardExportFact::Absent,
@@ -1453,6 +1552,28 @@ impl CaptureFacts {
                         .entry(owner)
                         .or_default()
                         .insert(requirement);
+                }
+            }
+            let mut manifest_surface_keys = BTreeMap::new();
+            let manifest_surface_candidates: Vec<_> = manifest
+                .surfaces
+                .iter()
+                .enumerate()
+                .filter(|(_, surface)| selection_surface_usable(surface))
+                .filter_map(|(surface_index, surface)| {
+                    manifest_inventory_surface_key(
+                        provider.clone(),
+                        *manifest_ordinal,
+                        surface_index,
+                        surface,
+                    )
+                })
+                .collect();
+            for surface_key in admit_inventory_keys(&mut history, manifest_surface_candidates) {
+                if let Some((ordinal, surface_index)) = surface_key.base.manifest_identity
+                    && ordinal == *manifest_ordinal
+                {
+                    manifest_surface_keys.insert(surface_index as usize, surface_key);
                 }
             }
             for (surface_index, surface) in manifest.surfaces.iter().enumerate() {
@@ -1518,6 +1639,55 @@ impl CaptureFacts {
                     ) {
                         history.skips.entry(key).or_insert(skipped);
                     }
+                }
+            }
+            if history
+                .manifest_selection_ordinals
+                .insert(*manifest_ordinal)
+            {
+                if manifest.selection_evidence.selection_truncated {
+                    history.selection_truncated = true;
+                    insert_selection_loss_for(
+                        &mut history,
+                        "offline interface selection",
+                        OFFLINE_SELECTION_LOSS_REASON,
+                    );
+                }
+                for query in &manifest.selection_evidence.queries {
+                    let mut matches = Vec::new();
+                    let mut match_loss = false;
+                    for found in &query.inventory_matches {
+                        let Some(surface) = manifest_surface_keys.get(&found.surface) else {
+                            match_loss = true;
+                            continue;
+                        };
+                        matches.push(LiveInventoryMatch {
+                            surface: surface.clone(),
+                            name_agrees: found.name_agrees,
+                            version_agrees: found.version_agrees,
+                        });
+                    }
+                    if query.helper_failure.is_some() || match_loss {
+                        history.selection_truncated = true;
+                        insert_selection_loss_for(
+                            &mut history,
+                            "offline interface selection",
+                            OFFLINE_SELECTION_LOSS_REASON,
+                        );
+                    }
+                    record_selection_in(
+                        &mut history,
+                        LiveSelectionTuple {
+                            module: owner,
+                            request: query.request,
+                            rv: query.rv,
+                            result: query.result,
+                            inventory_matches: matches,
+                            authority: query.authority,
+                            count: 1,
+                        },
+                        false,
+                    );
                 }
             }
         }
@@ -1732,6 +1902,7 @@ pub(crate) trait EngineSession {
     fn capture_policy(&self) -> CapturePolicy;
     fn discovery_dequeue(&mut self) -> Result<Option<crate::events::DiscoveryItem>>;
     fn counter_snapshot(&self) -> Result<CounterSnapshot>;
+    fn process_creation_tracking_unavailable(&self) -> Option<&str>;
     fn read_selection_table(
         &mut self,
         view: &ProcessView,
@@ -1799,6 +1970,10 @@ impl EngineSession for Session {
 
     fn counter_snapshot(&self) -> Result<CounterSnapshot> {
         Session::counter_snapshot(self)
+    }
+
+    fn process_creation_tracking_unavailable(&self) -> Option<&str> {
+        Session::process_creation_tracking_unavailable(self)
     }
 
     fn read_selection_table(
@@ -3218,6 +3393,7 @@ fn discover_plan(
         }
     }
 
+    discovered.seed_initial_cgroup_views();
     for path in &a.manifests {
         let manifest =
             read_manifest_file(path).inspect_err(|_| discovered.base_counters.report_notes())?;
@@ -4457,6 +4633,7 @@ fn remove_stale_views(discovered: &mut Engine, stale: &[ProcessViewId]) -> Resul
         .copied()
         .filter(|view| accepted.contains(view))
         .collect();
+    discovered.close_cgroup_admissions_at_removal(&stale);
     let before = discovered.views.len();
     discovered.views.retain(|view| !stale.contains(&view.id()));
     let removed = before - discovered.views.len();
@@ -5538,6 +5715,10 @@ impl Engine {
             expected_target_exit: false,
             pending_leader_exit_views: BTreeSet::new(),
             counted_leader_exit_views: BTreeSet::new(),
+            pid_descendant_gaps: 0,
+            admitted_cgroup_views: BTreeMap::new(),
+            unmatched_leader_exit_events: BTreeSet::new(),
+            cgroup_ingress_overflow: false,
             task_uprobe_link_losses: 0,
             next_selection_binding_id: Some(1),
             selection_bindings: BTreeMap::new(),
@@ -5645,6 +5826,169 @@ impl Engine {
                 .saturating_add(self.loader_registry.discovery_truncated())
                 .saturating_add(self.loader_registry.context_failures()),
         }
+    }
+
+    pub(crate) fn pid_descendant_gaps(&self) -> u64 {
+        if matches!(self.scope, Scope::Cgroup { .. }) {
+            self.pid_descendant_gaps
+        } else {
+            0
+        }
+    }
+
+    fn seed_initial_cgroup_views(&mut self) {
+        if matches!(self.scope, Scope::Cgroup { .. }) {
+            self.admitted_cgroup_views
+                .extend(self.views.iter().map(|view| {
+                    (
+                        view.id(),
+                        CgroupAdmission {
+                            pid: view.pid(),
+                            admitted_ns: view.admitted_ns(),
+                            closed_ns: None,
+                        },
+                    )
+                }));
+        }
+    }
+
+    fn record_cgroup_view_admissions(&mut self, views: impl IntoIterator<Item = ProcessViewId>) {
+        if !matches!(self.scope, Scope::Cgroup { .. }) {
+            return;
+        }
+        for view in views {
+            let Some(view_data) = self
+                .views
+                .iter()
+                .find(|candidate| candidate.id() == view)
+                .map(|candidate| CgroupAdmission {
+                    pid: candidate.pid(),
+                    admitted_ns: candidate.admitted_ns(),
+                    closed_ns: None,
+                })
+            else {
+                continue;
+            };
+            if self.admitted_cgroup_views.insert(view, view_data).is_none() {
+                self.pid_descendant_gaps = self.pid_descendant_gaps.saturating_add(1);
+            }
+        }
+    }
+
+    fn record_unmatched_cgroup_leader_exit(&mut self, record: &DiscoveryRecord) {
+        if !matches!(self.scope, Scope::Cgroup { .. }) {
+            return;
+        }
+        let pid = (record.pid_tgid >> 32) as u32;
+        if self
+            .admitted_cgroup_views
+            .values()
+            .any(|admission| admission.covers(record.hook_ts_ns, pid))
+        {
+            return;
+        }
+        let key = (pid, record.hook_ts_ns);
+        if self.unmatched_leader_exit_events.contains(&key) {
+            return;
+        }
+        if self.unmatched_leader_exit_events.len() >= MAX_SCAN_PIDS {
+            if !self.cgroup_ingress_overflow {
+                self.cgroup_ingress_overflow = true;
+                self.pid_descendant_gaps = self.pid_descendant_gaps.saturating_add(1);
+                self.mark_partial(
+                    "cgroup ingress tracking",
+                    "the bounded unmatched-exit ledger overflowed; the gap count is a lower bound",
+                );
+            }
+            return;
+        }
+        self.unmatched_leader_exit_events.insert(key);
+        self.pid_descendant_gaps = self.pid_descendant_gaps.saturating_add(1);
+    }
+
+    fn close_cgroup_admission(&mut self, view: ProcessViewId, closed_ns: u64) {
+        if let Some(admission) = self.admitted_cgroup_views.get_mut(&view) {
+            if admission.closed_ns.is_none() {
+                admission.closed_ns = Some(closed_ns);
+            }
+        }
+    }
+
+    fn update_cgroup_admissions_at_removal(
+        &mut self,
+        views: &BTreeSet<ProcessViewId>,
+        closed_ns: Option<u64>,
+    ) {
+        if !matches!(self.scope, Scope::Cgroup { .. }) {
+            return;
+        }
+        if let Some(closed_ns) = closed_ns {
+            for view in views {
+                self.close_cgroup_admission(*view, closed_ns);
+            }
+            return;
+        }
+        let before = self.admitted_cgroup_views.len();
+        self.admitted_cgroup_views
+            .retain(|view, admission| !views.contains(view) || admission.closed_ns.is_some());
+        if self.admitted_cgroup_views.len() == before {
+            return;
+        }
+        let skipped = Skipped {
+            subject: "cgroup admission removal".into(),
+            reason: "the monotonic removal boundary was unavailable; the descendant gap count is a lower bound".into(),
+        };
+        if !self.base_counters.object_skips.contains(&skipped) {
+            self.pid_descendant_gaps = self.pid_descendant_gaps.saturating_add(1);
+            attribution::note(&skipped);
+            self.base_counters.object_skips.push(skipped.clone());
+        }
+        if !self.counters.object_skips.contains(&skipped) {
+            self.counters.object_skips.push(skipped);
+        }
+    }
+
+    fn close_cgroup_admission_at_removal(&mut self, view: ProcessViewId) {
+        self.update_cgroup_admissions_at_removal(
+            &[view].into_iter().collect(),
+            crate::attach::monotonic_ns(),
+        );
+    }
+
+    fn close_cgroup_admissions_at_removal(&mut self, views: &BTreeSet<ProcessViewId>) {
+        self.update_cgroup_admissions_at_removal(views, crate::attach::monotonic_ns());
+    }
+
+    fn coalesce_pre_admission_exits(
+        &mut self,
+        records: &mut Vec<QueuedDiscoveryRecord>,
+        admitted: &BTreeSet<ProcessViewId>,
+    ) {
+        records.retain(|queued| {
+            let record = &queued.record;
+            let pid = (record.pid_tgid >> 32) as u32;
+            let coalesced = record.kind == DISCOVERY_KIND_LEADER_EXIT
+                && admitted.iter().any(|view| {
+                    self.admitted_cgroup_views
+                        .get(view)
+                        .is_some_and(|admission| {
+                            admission.pid == pid && record.hook_ts_ns <= admission.admitted_ns
+                        })
+                });
+            if coalesced {
+                if self.unmatched_leader_exit_events.len() < MAX_SCAN_PIDS {
+                    self.unmatched_leader_exit_events
+                        .insert((pid, record.hook_ts_ns));
+                } else {
+                    self.cgroup_ingress_overflow = true;
+                    self.mark_partial(
+                        "cgroup ingress tracking",
+                        "the bounded unmatched-exit ledger overflowed; the gap count is a lower bound",
+                    );
+                }
+            }
+            !coalesced
+        });
     }
 
     pub(crate) fn interface_selection(&self) -> render::InterfaceSelection {
@@ -6008,6 +6352,19 @@ impl Engine {
 
     fn record_session_lifecycle_tracking(&mut self, session: &impl EngineSession) {
         self.record_lifecycle_tracking_unavailable(session.lifecycle_tracking_unavailable());
+        if matches!(self.scope, Scope::Cgroup { .. })
+            && session.capture_policy().uses_events()
+            && (session.process_creation_tracking_unavailable().is_some()
+                || session.lifecycle_tracking_unavailable().is_some())
+        {
+            if self.pid_descendant_gaps == 0 {
+                self.pid_descendant_gaps = 1;
+            }
+            self.mark_partial(
+                "live lifecycle tracking",
+                "a required cgroup creation or lifecycle boundary was unavailable",
+            );
+        }
     }
 
     /// A retained generation changed under an operation that needed it. Loss —
@@ -10078,11 +10435,39 @@ impl Engine {
     ) -> Option<ProcessViewId> {
         let pid = (record.pid_tgid >> 32) as u32;
         if let Some((view, cause)) =
-            lifecycle_retirement(&self.views, pid, record.hook_ts_ns, record.kind)
+            lifecycle_retirement(&self.views, pid, record.hook_ts_ns, record.kind).filter(
+                |(view, _)| {
+                    !matches!(self.scope, Scope::Cgroup { .. })
+                        || self
+                            .admitted_cgroup_views
+                            .get(view)
+                            .is_some_and(|admission| {
+                                if record.kind == DISCOVERY_KIND_LEADER_EXIT {
+                                    admission.covers(record.hook_ts_ns, pid)
+                                } else {
+                                    admission.pid == pid
+                                        && self
+                                            .views
+                                            .iter()
+                                            .find(|candidate| candidate.id() == *view)
+                                            .is_some_and(ProcessView::still_the_same)
+                                }
+                            })
+                },
+            )
         {
+            if record.kind == DISCOVERY_KIND_LEADER_EXIT {
+                self.close_cgroup_admission(view, record.hook_ts_ns);
+                if !self.admitted_cgroup_views.contains_key(&view) {
+                    self.record_unmatched_cgroup_leader_exit(record);
+                }
+            }
             if cause == RetirementCause::ExpectedRemoval {
                 self.queue_leader_exit_assessment(view);
             } else {
+                if let Some(admission) = self.admitted_cgroup_views.get_mut(&view) {
+                    admission.closed_ns = None;
+                }
                 self.queue_retirement(view, cause, pending_views);
             }
             (cause == RetirementCause::ExecRefresh).then_some(view)
@@ -10092,6 +10477,9 @@ impl Engine {
             self.refresh_requested.insert(pid);
             None
         } else {
+            if record.kind == DISCOVERY_KIND_LEADER_EXIT {
+                self.record_unmatched_cgroup_leader_exit(record);
+            }
             None
         }
     }
@@ -10366,6 +10754,7 @@ impl Engine {
                 self.retirement_intents.remove(&view);
                 self.ready_expected_removals.remove(&view);
                 if cause == RetirementCause::ExpectedRemoval {
+                    self.close_cgroup_admission_at_removal(view);
                     self.views.retain(|candidate| candidate.id() != view);
                     self.scan_inputs.remove(&view);
                     self.arm_expected_target_exit(view);
@@ -10676,6 +11065,8 @@ impl Engine {
                 });
             }
         }
+        let new_view_pids: BTreeSet<_> = new_views.iter().map(|(view, _, _)| view.pid()).collect();
+        let mut deferred_new_view_records = Vec::new();
         let mut refreshed_ok: BTreeSet<_> =
             refreshed_scans.iter().map(|(view, _, _)| *view).collect();
         let candidate =
@@ -10786,14 +11177,25 @@ impl Engine {
             completed_retirement_intent(&removed, &context_retirements, &failed_retirements);
         self.pending_retirements
             .extend(completed_retirements.iter().copied());
-        changed |= self.process_discovery_records(
+        let mut pre_candidate_records = Vec::new();
+        for queued in std::mem::take(records) {
+            if new_view_pids.contains(&((queued.record.pid_tgid >> 32) as u32)) {
+                deferred_new_view_records.push(queued);
+            } else {
+                pre_candidate_records.push(queued);
+            }
+        }
+        *records = pre_candidate_records;
+        let pre_candidate_result = self.process_discovery_records(
             session,
             records,
             pending_views,
             additions_allowed,
             collect,
             closure,
-        )?;
+        );
+        records.extend(deferred_new_view_records);
+        changed |= pre_candidate_result?;
         if !self.pending_retirements.is_empty() || !self.pending_rejected_keys.is_empty() {
             self.mark_partial(
                 "live inventory transaction",
@@ -10801,7 +11203,6 @@ impl Engine {
             );
             return Ok(changed);
         }
-
         let (rescanned, failed_rescan_pids, rescan_skips) =
             self.scan_inventory_views(&refreshed_ok, "a post-retirement inventory refresh failed");
         failed_refresh_pids.extend(failed_rescan_pids);
@@ -10854,6 +11255,7 @@ impl Engine {
             if conservative_only {
                 *additions_allowed = false;
             }
+            self.close_cgroup_admissions_at_removal(&removed);
             self.views.retain(|view| !removed.contains(&view.id()));
             for view in removed.iter().chain(&refreshed_ok) {
                 self.scan_inputs.remove(view);
@@ -10878,6 +11280,12 @@ impl Engine {
         let outcome =
             self.apply_candidate(session, candidate, additions_allowed, true, &extra_views)?;
         self.record_apply_timing(&outcome);
+        let new_view_ids: BTreeSet<_> = if conservative_only {
+            BTreeSet::new()
+        } else {
+            new_views.iter().map(|(view, _, _)| view.id()).collect()
+        };
+        let new_view_pids: Vec<_> = new_view_pids.into_iter().collect();
         for view in &outcome.stale_views {
             if let Some(pid) = new_views
                 .iter()
@@ -10886,6 +11294,13 @@ impl Engine {
             {
                 self.refresh_requested.insert(pid);
             }
+        }
+        if outcome.accepted() && !conservative_only {
+            for (view, _, _) in std::mem::take(&mut new_views) {
+                self.views.push(view);
+            }
+            self.record_cgroup_view_admissions(new_view_ids.iter().copied());
+            self.coalesce_pre_admission_exits(records, &new_view_ids);
         }
         self.queue_apply_outcome(&outcome, pending_views);
         closure.observe_apply(&outcome);
@@ -10901,7 +11316,6 @@ impl Engine {
         if !outcome.accepted() {
             return Ok(changed);
         }
-
         if conservative_only || !*additions_allowed {
             failed_refresh_pids.extend(retirement_views.iter().filter_map(|view| {
                 self.views
@@ -10909,21 +11323,12 @@ impl Engine {
                     .find(|candidate| candidate.id() == *view)
                     .map(ProcessView::pid)
             }));
-            failed_refresh_pids.extend(new_views.iter().map(|(view, _, _)| view.pid()));
+            failed_refresh_pids.extend(new_view_pids);
         }
         self.refresh_requested
             .retain(|pid| failed_refresh_pids.contains(pid));
-        let new_view_ids: BTreeSet<_> = if conservative_only {
-            BTreeSet::new()
-        } else {
-            new_views.iter().map(|(view, _, _)| view.id()).collect()
-        };
+        self.close_cgroup_admissions_at_removal(&removed);
         self.views.retain(|view| !removed.contains(&view.id()));
-        if !conservative_only {
-            for (view, _, _) in new_views {
-                self.views.push(view);
-            }
-        }
         for view in removed.iter().chain(&refreshed_ok) {
             self.scan_inputs.remove(view);
         }
@@ -11179,6 +11584,20 @@ impl Engine {
         };
         let mut records = queued;
 
+        let retained_pids: BTreeSet<_> = self.views.iter().map(ProcessView::pid).collect();
+        let mut deferred_exits = Vec::new();
+        if matches!(self.scope, Scope::Cgroup { .. }) {
+            records.retain(|queued| {
+                let record = &queued.record;
+                let defer = record.kind == DISCOVERY_KIND_LEADER_EXIT
+                    && !retained_pids.contains(&((record.pid_tgid >> 32) as u32));
+                if defer {
+                    deferred_exits.push(queued.clone());
+                }
+                !defer
+            });
+        }
+
         let mut additions_allowed = additions_allowed;
         let mut closure = PauseClosure::new(additions_allowed && malformed == 0);
         let mut pending_views = PendingViewRetirements::new();
@@ -11197,6 +11616,7 @@ impl Engine {
             collect,
             &mut closure,
         )?;
+        records.extend(deferred_exits);
         if terminal_dispatch
             && let Some(terminal_changed) = self.continue_terminal_batch(
                 session,
@@ -11218,6 +11638,14 @@ impl Engine {
                 &mut closure,
             )?;
         }
+        changed |= self.process_discovery_records(
+            session,
+            &mut records,
+            &mut pending_views,
+            &mut additions_allowed,
+            collect,
+            &mut closure,
+        )?;
         record_object_skips(&mut self.plan, &self.counters.object_skips);
         self.publish_current_capture_facts()?;
         Ok(DiscoveryBatchOutcome {
@@ -11355,6 +11783,7 @@ impl Engine {
         mut pause_generation: Option<OwnedPauseGeneration>,
         owned_child: Option<&OwnedChild>,
     ) -> Result<Session> {
+        self.seed_initial_cgroup_views();
         let snapshot = self.begin_start_capture_attempt()?;
         let retained_scope = self.scope.clone();
         let named = matches!(retained_scope, Scope::Pid(_));
@@ -11472,6 +11901,7 @@ pub(crate) mod session_fixture {
         pub(crate) detach_exports: Vec<DynamicExportIdentity>,
         pub(crate) detach_failed: bool,
         pub(crate) lifecycle_tracking_unavailable: Option<&'static str>,
+        pub(crate) process_creation_tracking_unavailable: Option<&'static str>,
         pub(crate) detached: Vec<LoaderContextId>,
         /// Slot counts of every `detach_slots` call, in order.
         pub(crate) detached_slots: Vec<usize>,
@@ -11609,6 +12039,10 @@ pub(crate) mod session_fixture {
 
         fn lifecycle_tracking_unavailable(&self) -> Option<&str> {
             self.lifecycle_tracking_unavailable
+        }
+
+        fn process_creation_tracking_unavailable(&self) -> Option<&str> {
+            self.process_creation_tracking_unavailable
         }
 
         fn preflight_targets(&self, _: &[plan::Slot], _: &PinnedObjects) -> Result<()> {
@@ -13843,6 +14277,389 @@ pub(crate) mod tests {
             LeaderExitAssessment::LinkLoss
         );
         assert_eq!(engine.task_uprobe_link_losses, 1);
+    }
+
+    #[test]
+    fn cgroup_ingress_admission_and_delayed_exit_are_generation_bounded() {
+        let first = ProcessView::open(ProcessViewId(31), std::process::id()).unwrap();
+        let pid = first.pid();
+        let admitted = first.admitted_ns();
+        let mut engine = Engine::empty();
+        engine.scope = Scope::Cgroup {
+            id: 1,
+            path: PathBuf::from("/sys/fs/cgroup/test"),
+            dir: Arc::new(File::open("/dev/null").unwrap()),
+        };
+        engine.views.push(first);
+        engine.seed_initial_cgroup_views();
+        assert_eq!(engine.pid_descendant_gaps(), 0);
+
+        let second = ProcessView::open(ProcessViewId(32), pid).unwrap();
+        engine.views.push(second);
+        engine.record_cgroup_view_admissions([ProcessViewId(32)]);
+        assert_eq!(engine.pid_descendant_gaps(), 1);
+
+        // A delayed exit for the first generation arrives after that view was
+        // retired; its admission timestamp still authenticates it exactly once.
+        engine.views.retain(|view| view.id() != ProcessViewId(31));
+        let mut delayed: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        delayed.kind = DISCOVERY_KIND_LEADER_EXIT;
+        delayed.pid_tgid = u64::from(pid) << 32;
+        delayed.hook_ts_ns = admitted;
+        let mut pending = PendingViewRetirements::new();
+        engine.dispatch_lifecycle_record(&delayed, &mut pending);
+        assert_eq!(engine.pid_descendant_gaps(), 1);
+
+        let mut short_lived: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        short_lived.kind = DISCOVERY_KIND_LEADER_EXIT;
+        short_lived.pid_tgid = u64::from(pid.saturating_add(1)) << 32;
+        short_lived.hook_ts_ns = admitted;
+        engine.dispatch_lifecycle_record(&short_lived, &mut pending);
+        engine.dispatch_lifecycle_record(&short_lived, &mut pending);
+        assert_eq!(engine.pid_descendant_gaps(), 2);
+    }
+
+    #[test]
+    fn cgroup_boundary_unavailability_latches_one_ingress_sentinel() {
+        let mut engine = Engine::empty();
+        engine.scope = Scope::Cgroup {
+            id: 1,
+            path: PathBuf::from("/sys/fs/cgroup/test"),
+            dir: Arc::new(File::open("/dev/null").unwrap()),
+        };
+        let mut session = ScriptedSession::default();
+        session.process_creation_tracking_unavailable = Some("creation unavailable");
+        engine.record_session_lifecycle_tracking(&session);
+        engine.record_session_lifecycle_tracking(&session);
+        assert_eq!(engine.pid_descendant_gaps(), 1);
+        session.process_creation_tracking_unavailable = None;
+        engine.record_session_lifecycle_tracking(&session);
+        assert_eq!(engine.pid_descendant_gaps(), 1);
+    }
+
+    #[test]
+    fn cgroup_same_pid_unseen_generation_after_closed_interval_counts_once() {
+        let first = ProcessView::open(ProcessViewId(33), std::process::id()).unwrap();
+        let pid = first.pid();
+        let admitted = first.admitted_ns();
+        let mut engine = Engine::empty();
+        engine.scope = Scope::Cgroup {
+            id: 1,
+            path: PathBuf::from("/sys/fs/cgroup/test"),
+            dir: Arc::new(File::open("/dev/null").unwrap()),
+        };
+        engine.views.push(first);
+        engine.seed_initial_cgroup_views();
+        let mut exit: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        exit.kind = DISCOVERY_KIND_LEADER_EXIT;
+        exit.pid_tgid = u64::from(pid) << 32;
+        exit.hook_ts_ns = admitted;
+        let mut pending = PendingViewRetirements::new();
+        engine.dispatch_lifecycle_record(&exit, &mut pending);
+        assert_eq!(engine.pid_descendant_gaps(), 0);
+
+        exit.hook_ts_ns = admitted.saturating_add(1);
+        engine.dispatch_lifecycle_record(&exit, &mut pending);
+        assert_eq!(engine.pid_descendant_gaps(), 1);
+        engine.dispatch_lifecycle_record(&exit, &mut pending);
+        assert_eq!(engine.pid_descendant_gaps(), 1);
+    }
+
+    /// Mutation caught: applying the leader-exit interval predicate to EXEC
+    /// suppresses the required refresh of the still-current selected view.
+    #[test]
+    fn cgroup_live_sibling_exec_refreshes_after_leader_interval_closed() {
+        let view = ProcessView::open(ProcessViewId(34), std::process::id()).unwrap();
+        let pid = view.pid();
+        let admitted = view.admitted_ns();
+        let mut engine = Engine::empty();
+        engine.scope = Scope::Cgroup {
+            id: 1,
+            path: PathBuf::from("/sys/fs/cgroup/test"),
+            dir: Arc::new(File::open("/dev/null").unwrap()),
+        };
+        engine.views.push(view);
+        engine.seed_initial_cgroup_views();
+        engine.close_cgroup_admission(ProcessViewId(34), admitted);
+        let mut exec: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        exec.kind = DISCOVERY_KIND_EXEC;
+        exec.pid_tgid = u64::from(pid) << 32;
+        exec.hook_ts_ns = admitted.saturating_add(1);
+        let mut pending = PendingViewRetirements::new();
+
+        engine.dispatch_lifecycle_record(&exec, &mut pending);
+
+        assert_eq!(
+            pending.get(&ProcessViewId(34)),
+            Some(&RetirementCause::ExecRefresh)
+        );
+    }
+
+    /// Mutation caught: reopening only after inventory lets the next record in
+    /// one outer batch misclassify the exact live generation as unseen.
+    #[test]
+    fn cgroup_exec_reopens_before_same_batch_leader_exit() {
+        let pid = std::process::id();
+        let view = ProcessView::open(ProcessViewId(38), pid).unwrap();
+        let admitted = view.admitted_ns();
+        let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
+        engine.views.push(view);
+        engine.seed_initial_cgroup_views();
+        engine.close_cgroup_admission(ProcessViewId(38), admitted);
+        let mut exec: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        exec.kind = DISCOVERY_KIND_EXEC;
+        exec.pid_tgid = u64::from(pid) << 32;
+        exec.hook_ts_ns = admitted.saturating_add(1);
+        let mut session = ScriptedSession::default();
+
+        let mut exit = exec;
+        exit.kind = DISCOVERY_KIND_LEADER_EXIT;
+        exit.hook_ts_ns = admitted.saturating_add(2);
+        apply_ordinary_batch(&mut engine, &mut session, vec![exec, exit])
+            .expect("same-batch exec and exit remain processable");
+
+        assert_eq!(
+            engine.admitted_cgroup_views[&ProcessViewId(38)].closed_ns,
+            Some(admitted.saturating_add(2))
+        );
+        assert_eq!(engine.pid_descendant_gaps(), 0);
+        assert!(
+            engine
+                .pending_leader_exit_views
+                .contains(&ProcessViewId(38))
+        );
+    }
+
+    /// Mutation caught: accepting an EXEC from a retained but stale process pin
+    /// binds a later same-PID generation to historical admission evidence.
+    #[test]
+    fn cgroup_exec_rejects_a_stale_retained_generation() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let view = ProcessView::open(ProcessViewId(35), child.id()).unwrap();
+        let admitted = view.admitted_ns();
+        let mut engine = Engine::empty();
+        engine.scope = Scope::Cgroup {
+            id: 1,
+            path: PathBuf::from("/sys/fs/cgroup/test"),
+            dir: Arc::new(File::open("/dev/null").unwrap()),
+        };
+        engine.views.push(view);
+        engine.seed_initial_cgroup_views();
+        engine.close_cgroup_admission(ProcessViewId(35), admitted);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let mut exec: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        exec.kind = DISCOVERY_KIND_EXEC;
+        exec.pid_tgid = u64::from(child.id()) << 32;
+        exec.hook_ts_ns = admitted.saturating_add(1);
+        let mut pending = PendingViewRetirements::new();
+
+        engine.dispatch_lifecycle_record(&exec, &mut pending);
+
+        assert!(pending.is_empty());
+        assert!(!engine.refresh_requested.contains(&child.id()));
+        assert!(
+            engine.admitted_cgroup_views[&ProcessViewId(35)]
+                .closed_ns
+                .is_some(),
+            "a stale reused generation cannot reopen historical admission"
+        );
+    }
+
+    /// Mutation caught: returning early when the removal clock is unavailable
+    /// retains an unauthenticated open interval and rebuild erases its PARTIAL.
+    #[test]
+    fn missing_removal_clock_drops_open_admission_and_latches_one_gap() {
+        let view = ProcessView::open(ProcessViewId(36), std::process::id()).unwrap();
+        let mut engine = Engine::empty();
+        engine.scope = Scope::Cgroup {
+            id: 1,
+            path: PathBuf::from("/sys/fs/cgroup/test"),
+            dir: Arc::new(File::open("/dev/null").unwrap()),
+        };
+        engine.views.push(view);
+        engine.seed_initial_cgroup_views();
+        let removed = [ProcessViewId(36)].into_iter().collect();
+
+        engine.update_cgroup_admissions_at_removal(&removed, None);
+        engine.update_cgroup_admissions_at_removal(&removed, None);
+
+        assert!(
+            !engine
+                .admitted_cgroup_views
+                .contains_key(&ProcessViewId(36))
+        );
+        assert_eq!(engine.pid_descendant_gaps(), 1);
+        assert_eq!(
+            engine
+                .base_counters
+                .object_skips
+                .iter()
+                .filter(|skip| skip.subject == "cgroup admission removal")
+                .count(),
+            1
+        );
+        rebuild_discovered(&mut engine).unwrap();
+        assert_eq!(
+            engine
+                .counters
+                .object_skips
+                .iter()
+                .filter(|skip| skip.subject == "cgroup admission removal")
+                .count(),
+            1
+        );
+        assert_eq!(
+            evidence_verdict(&engine.plan, &engine.pinned, &engine.counters).completeness,
+            "PARTIAL"
+        );
+    }
+
+    /// Mutation caught: deleting a pre-attach stale view before closing its
+    /// admission makes delayed exits indistinguishable from post-close exits.
+    #[test]
+    fn preattach_stale_removal_closes_admission_before_view_deletion() {
+        let view = ProcessView::open(ProcessViewId(37), std::process::id()).unwrap();
+        let pid = view.pid();
+        let admitted = view.admitted_ns();
+        let mut engine = lifecycle_discovered(vec![view]);
+        engine.scope = Scope::Cgroup {
+            id: 1,
+            path: PathBuf::from("/sys/fs/cgroup/test"),
+            dir: Arc::new(File::open("/dev/null").unwrap()),
+        };
+        engine.seed_initial_cgroup_views();
+
+        remove_stale_views(&mut engine, &[ProcessViewId(37)]).unwrap();
+
+        let closed = engine.admitted_cgroup_views[&ProcessViewId(37)]
+            .closed_ns
+            .unwrap();
+        let mut exit: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        exit.kind = DISCOVERY_KIND_LEADER_EXIT;
+        exit.pid_tgid = u64::from(pid) << 32;
+        exit.hook_ts_ns = admitted;
+        let mut pending = PendingViewRetirements::new();
+        engine.dispatch_lifecycle_record(&exit, &mut pending);
+        assert_eq!(engine.pid_descendant_gaps(), 0);
+
+        exit.hook_ts_ns = closed.saturating_add(1);
+        engine.dispatch_lifecycle_record(&exit, &mut pending);
+        assert_eq!(engine.pid_descendant_gaps(), 1);
+    }
+
+    #[test]
+    fn outer_batch_coalesces_pre_admission_exit_into_the_admission_gap() {
+        let pid = std::process::id();
+        let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
+        let mut exit: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        exit.kind = DISCOVERY_KIND_LEADER_EXIT;
+        exit.pid_tgid = u64::from(pid) << 32;
+        exit.hook_ts_ns = 0;
+        let mut session = ScriptedSession::with_records([], 0);
+
+        apply_ordinary_batch(&mut engine, &mut session, vec![exit])
+            .expect("accepted admission and deferred exit remain processable");
+
+        assert_eq!(engine.pid_descendant_gaps(), 1);
+        assert!(engine.unmatched_leader_exit_events.contains(&(pid, 0)));
+    }
+
+    #[test]
+    fn outer_batch_counts_deferred_exit_once_when_no_view_is_admitted() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
+        let mut exit: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        exit.kind = DISCOVERY_KIND_LEADER_EXIT;
+        exit.pid_tgid = u64::from(pid) << 32;
+        exit.hook_ts_ns = 1;
+        let mut session = ScriptedSession::with_records([], 0);
+
+        apply_ordinary_batch(&mut engine, &mut session, vec![exit])
+            .expect("a vanished candidate leaves its deferred exit processable");
+
+        assert_eq!(engine.pid_descendant_gaps(), 1);
+        assert!(engine.unmatched_leader_exit_events.contains(&(pid, 1)));
+    }
+
+    /// Mutation caught: treating coalescing-ledger overflow as a novel unseen
+    /// exit adds a second gap after the accepted admission already counted one.
+    #[test]
+    fn coalesced_exit_ledger_overflow_marks_partial_without_a_second_gap() {
+        let pid = std::process::id();
+        let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
+        engine.unmatched_leader_exit_events = (0..MAX_SCAN_PIDS)
+            .map(|index| (index as u32 + 1, index as u64 + 1))
+            .collect();
+        let mut exit: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        exit.kind = DISCOVERY_KIND_LEADER_EXIT;
+        exit.pid_tgid = u64::from(pid) << 32;
+        exit.hook_ts_ns = 0;
+        let mut session = ScriptedSession::default();
+
+        apply_ordinary_batch(&mut engine, &mut session, vec![exit])
+            .expect("the accepted admission coalesces despite a full replay ledger");
+
+        assert_eq!(engine.pid_descendant_gaps(), 1);
+        assert!(engine.cgroup_ingress_overflow);
+        assert_eq!(
+            engine
+                .counters
+                .object_skips
+                .iter()
+                .filter(|skip| skip.subject == "cgroup ingress tracking")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn cgroup_unmatched_exit_overflow_latches_one_lower_bound() {
+        let mut engine = Engine::empty();
+        engine.scope = Scope::Cgroup {
+            id: 1,
+            path: PathBuf::from("/sys/fs/cgroup/test"),
+            dir: Arc::new(File::open("/dev/null").unwrap()),
+        };
+        let mut pending = PendingViewRetirements::new();
+        for index in 0..=MAX_SCAN_PIDS {
+            let mut exit: DiscoveryRecord = unsafe { std::mem::zeroed() };
+            exit.kind = DISCOVERY_KIND_LEADER_EXIT;
+            exit.pid_tgid = (index as u64 + 1) << 32;
+            exit.hook_ts_ns = index as u64 + 1;
+            engine.dispatch_lifecycle_record(&exit, &mut pending);
+        }
+        let after_overflow = engine.pid_descendant_gaps();
+        let mut replay: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        replay.kind = DISCOVERY_KIND_LEADER_EXIT;
+        replay.pid_tgid = (MAX_SCAN_PIDS as u64 + 1) << 32;
+        replay.hook_ts_ns = MAX_SCAN_PIDS as u64 + 1;
+        engine.dispatch_lifecycle_record(&replay, &mut pending);
+        let mut further: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        further.kind = DISCOVERY_KIND_LEADER_EXIT;
+        further.pid_tgid = (MAX_SCAN_PIDS as u64 + 2) << 32;
+        further.hook_ts_ns = MAX_SCAN_PIDS as u64 + 2;
+        engine.dispatch_lifecycle_record(&further, &mut pending);
+        assert_eq!(after_overflow, MAX_SCAN_PIDS as u64 + 1);
+        assert_eq!(engine.pid_descendant_gaps(), after_overflow);
+        assert_eq!(
+            engine
+                .counters
+                .object_skips
+                .iter()
+                .filter(|skip| skip.subject == "cgroup ingress tracking")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -17884,6 +18701,7 @@ int main(int argc, char **argv) {
                 name,
                 version: SelectionVersionClass::V3_0,
                 flags: 0,
+                manifest_identity: None,
             },
             duplicate: 0,
         };
@@ -18150,6 +18968,7 @@ int main(int argc, char **argv) {
                 name: PrivateSelectionName::ExactStandard,
                 version: SelectionVersionClass::V3_0,
                 flags: 0,
+                manifest_identity: None,
             },
             duplicate: 0,
         };
@@ -18170,6 +18989,7 @@ int main(int argc, char **argv) {
                     name: PrivateSelectionName::Legacy,
                     version: SelectionVersionClass::V2_40,
                     flags: 0,
+                    manifest_identity: None,
                 },
                 duplicate: 0,
             });
@@ -18556,6 +19376,7 @@ int main(int argc, char **argv) {
                         name: PrivateSelectionName::ExactStandard,
                         version: SelectionVersionClass::V3_0,
                         flags: 0,
+                        manifest_identity: None,
                     })
                     .collect(),
             )
@@ -18950,6 +19771,7 @@ int main(int argc, char **argv) {
             name,
             version: SelectionVersionClass::V3_0,
             flags,
+            manifest_identity: None,
         };
         let first = base(0x20, PrivateSelectionName::Other(b"alpha".to_vec()), 0);
         let second = base(0x20, PrivateSelectionName::Other(b"beta".to_vec()), 1);
@@ -25247,5 +26069,261 @@ int main(int argc, char **argv) {
         merge_discovered_module(&mut retained, incoming);
         assert_eq!(retained.objects.len(), 2);
         assert_eq!(retained.sources, vec!["scan", "manifest"]);
+    }
+
+    #[test]
+    fn manifest_selection_queries_merge_once_and_preserve_manifest_loss() {
+        let (_fixture, mut engine, _session) = initial_export_route();
+        let path = engine.modules[0].scanned.path.clone();
+        let function_offset = object_facts(Path::new(&path)).2;
+        let mut manifest = valid_manifest_for(&[PathBuf::from(&path)], &[0; 67]);
+        manifest.interface_list = Acquisition::Ok;
+        manifest.surfaces[0].acquisition = Acquisition::Absent;
+        manifest.surfaces[0].walk = WalkOutcome::NotWalked;
+        manifest.surfaces[0].functions.clear();
+        let interface_functions: Vec<_> = pkcs11_module::FUNCTION_LIST_FIELDS
+            .iter()
+            .chain(pkcs11_module::FUNCTION_LIST_3_0_EXTRA_FIELDS.iter())
+            .map(|field| FunctionRecord {
+                name: field.name.into(),
+                resolution: Resolution::NullPointer,
+            })
+            .collect();
+        for index in 0..16 {
+            manifest.surfaces.push(SurfaceRecord {
+                source: SurfaceSource::Interface {
+                    index,
+                    raw_name_hex: Some("504b4353203131".into()),
+                    name_lossy: Some("PKCS 11".into()),
+                    name_error: None,
+                    flags: 0,
+                    classification: InterfaceClassification::ExactStandard,
+                },
+                acquisition: Acquisition::Ok,
+                version: Some(Version { major: 3, minor: 0 }),
+                walk: WalkOutcome::Full,
+                functions: interface_functions.clone(),
+            });
+        }
+        manifest.selection_evidence = manifest_selection_evidence(
+            Version { major: 3, minor: 0 },
+            &[("C_Initialize", function_offset)],
+        );
+        {
+            let query = &mut manifest.selection_evidence.queries[4];
+            query.result = Some(SelectionRequest {
+                name: SelectionNameClass::ExactStandard,
+                version: SelectionVersionClass::V3_0,
+                flags: 0,
+            });
+            query.selection_table = None;
+            query.inventory_matches = (1..=16)
+                .map(
+                    |surface| p11scope_manifest::manifest::SelectionInventoryMatch {
+                        surface,
+                        name_agrees: true,
+                        version_agrees: true,
+                    },
+                )
+                .collect();
+            query.authority = SelectionAuthority::Inventory;
+        }
+        manifest.selection_evidence.tables.clear();
+        manifest.selection_evidence.queries[5].rv = 0;
+        manifest.selection_evidence.queries[5].helper_failure =
+            Some(p11scope_manifest::manifest::SelectionFailure::NullOutput);
+        manifest.selection_evidence.selection_truncated = true;
+        let expected_queries: Vec<_> = manifest
+            .selection_evidence
+            .queries
+            .iter()
+            .map(|query| (query.request, query.rv, query.result, query.authority))
+            .collect();
+        let manifest_pins = pin_manifest_objects(&manifest).unwrap();
+        assert!(engine.pinned.absorb(manifest_pins.clone()).is_empty());
+        engine.manifests.push(manifest.clone());
+        engine.manifest_ordinals.push(17);
+
+        engine.publish_current_capture_facts().unwrap();
+        let first = engine.capture_facts.history.selections.clone();
+        let first_surfaces = engine.capture_facts.history.selection_surfaces.clone();
+        engine.publish_current_capture_facts().unwrap();
+
+        assert_eq!(engine.capture_facts.history.selections, first);
+        assert_eq!(first.len(), 10, "all ten fixed manifest rows are imported");
+        assert!(first.iter().all(|tuple| tuple.count == 1));
+        assert_eq!(
+            first
+                .iter()
+                .map(|tuple| (tuple.request, tuple.rv, tuple.result, tuple.authority))
+                .collect::<Vec<_>>(),
+            expected_queries,
+            "every fixed query, including the helper-failure row, is imported exactly"
+        );
+        let inventory_tuple = first
+            .iter()
+            .find(|tuple| tuple.authority == SelectionAuthority::Inventory)
+            .expect("the inventory-backed row is retained");
+        assert_eq!(inventory_tuple.inventory_matches.len(), 16);
+        assert!(
+            inventory_tuple
+                .inventory_matches
+                .iter()
+                .enumerate()
+                .all(|(index, matched)| {
+                    matched.surface.base.manifest_identity == Some((17, index as u32 + 1))
+                })
+        );
+        assert_eq!(
+            engine.capture_facts.history.selection_surfaces,
+            first_surfaces
+        );
+        assert!(engine.capture_facts.history.selection_truncated);
+        let manifest_identities: BTreeSet<_> = first_surfaces
+            .iter()
+            .filter_map(|surface| surface.base.manifest_identity)
+            .collect();
+        assert_eq!(
+            manifest_identities,
+            (1..=16).map(|index| (17, index)).collect()
+        );
+
+        let projected = engine.interface_selection();
+        assert_eq!(projected.inventory_surfaces.len(), 16);
+        assert!(
+            projected
+                .inventory_surfaces
+                .iter()
+                .all(|surface| surface.module == 0)
+        );
+        assert!(projected.tuples.iter().all(|tuple| {
+            tuple.module == 0
+                && tuple
+                    .inventory_matches
+                    .iter()
+                    .all(|matched| matched.surface < projected.inventory_surfaces.len() as u16)
+        }));
+        assert!(
+            !serde_json::to_string(&projected)
+                .unwrap()
+                .contains("manifest_identity")
+        );
+
+        let mut rendered = evidence_verdict(&engine.plan, &engine.pinned, &engine.counters);
+        rendered.interface_selection = projected;
+        rendered.verdict_with_selection(true);
+        assert_eq!(rendered.completeness, "PARTIAL");
+
+        // A second accepted manifest gets a distinct private ordinal, but a
+        // repeated publication must not duplicate either its rows or matches.
+        engine.pinned.absorb(manifest_pins);
+        engine.manifests.push(manifest);
+        engine.manifest_ordinals.push(18);
+        engine.publish_current_capture_facts().unwrap();
+        let twice = engine.capture_facts.history.selections.clone();
+        assert_eq!(twice.len(), 11);
+        assert!(twice.iter().all(|tuple| {
+            if tuple.authority == SelectionAuthority::Inventory {
+                tuple.count == 1
+            } else {
+                tuple.count == 2
+            }
+        }));
+        let inventory_matches: BTreeSet<_> = twice
+            .iter()
+            .filter(|tuple| tuple.authority == SelectionAuthority::Inventory)
+            .flat_map(|tuple| {
+                tuple
+                    .inventory_matches
+                    .iter()
+                    .map(|matched| matched.surface.base.manifest_identity)
+            })
+            .collect();
+        assert_eq!(inventory_matches.len(), 32);
+        assert!(inventory_matches.contains(&Some((17, 1))));
+        assert!(inventory_matches.contains(&Some((18, 16))));
+        let reprojected = engine.interface_selection();
+        engine.publish_current_capture_facts().unwrap();
+        assert_eq!(engine.capture_facts.history.selections, twice);
+        assert_eq!(
+            engine.interface_selection(),
+            reprojected,
+            "the second manifest ordinal reprojects identically after republication"
+        );
+
+        // The tuple budget is capture-wide: seven live tuples plus the ten
+        // offline rows leave only nine offline rows admitted.
+        let (_bound_fixture, mut bound, _bound_session) = initial_export_route();
+        for flags in 0..7 {
+            bound.capture_facts.record_selection(
+                LiveSelectionTuple {
+                    module: plan::ModuleId(0),
+                    request: SelectionRequest {
+                        name: SelectionNameClass::Null,
+                        version: SelectionVersionClass::Null,
+                        flags,
+                    },
+                    rv: 99,
+                    result: None,
+                    inventory_matches: Vec::new(),
+                    authority: SelectionAuthority::None,
+                    count: 1,
+                },
+                false,
+            );
+        }
+        let bound_path = bound.modules[0].scanned.path.clone();
+        let bound_offset = object_facts(Path::new(&bound_path)).2;
+        let mut bound_manifest = valid_manifest_for(&[PathBuf::from(&bound_path)], &[0; 67]);
+        bound_manifest.selection_evidence = manifest_selection_evidence(
+            Version { major: 3, minor: 0 },
+            &[("C_Initialize", bound_offset)],
+        );
+        let bound_pins = pin_manifest_objects(&bound_manifest).unwrap();
+        assert!(bound.pinned.absorb(bound_pins).is_empty());
+        bound.manifests.push(bound_manifest);
+        bound.manifest_ordinals.push(19);
+        bound.publish_current_capture_facts().unwrap();
+        assert_eq!(bound.capture_facts.history.selections.len(), 16);
+        assert!(bound.capture_facts.history.selection_truncated);
+    }
+
+    #[test]
+    fn offline_helper_failure_alone_marks_exact_loss_and_partial() {
+        let (_fixture, mut engine, _session) = initial_export_route();
+        let path = engine.modules[0].scanned.path.clone();
+        let offset = object_facts(Path::new(&path)).2;
+        let mut manifest = valid_manifest_for(&[PathBuf::from(&path)], &[0; 67]);
+        manifest.selection_evidence = manifest_selection_evidence(
+            Version { major: 3, minor: 0 },
+            &[("C_Initialize", offset)],
+        );
+        manifest.selection_evidence.selection_truncated = false;
+        manifest.selection_evidence.queries[5].rv = 0;
+        manifest.selection_evidence.queries[5].helper_failure =
+            Some(p11scope_manifest::manifest::SelectionFailure::NullOutput);
+        let pins = pin_manifest_objects(&manifest).unwrap();
+        assert!(engine.pinned.absorb(pins).is_empty());
+        engine.manifests.push(manifest);
+        engine.manifest_ordinals.push(20);
+
+        engine.publish_current_capture_facts().unwrap();
+
+        let loss = Skipped {
+            subject: "offline interface selection".into(),
+            reason: OFFLINE_SELECTION_LOSS_REASON.into(),
+        };
+        assert_eq!(
+            engine
+                .capture_facts
+                .history
+                .losses
+                .get(&(loss.subject.clone(), loss.reason.clone())),
+            Some(&loss)
+        );
+        let mut evidence = evidence_verdict(&engine.plan, &engine.pinned, &engine.counters);
+        evidence.interface_selection = engine.interface_selection();
+        evidence.verdict_with_selection(true);
+        assert_eq!(evidence.completeness, "PARTIAL");
     }
 }

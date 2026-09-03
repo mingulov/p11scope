@@ -315,6 +315,34 @@ fn selection_agreement_requires_readable_fields() {
 }
 
 #[test]
+fn selection_inventory_matches_reject_unacquired_surfaces() {
+    let path = Path::new("/bin/true");
+    let mut manifest = manifest_for(path);
+    manifest.schema = SCHEMA.into();
+    manifest.selection_evidence = queried_selection_matrix();
+    let query = &mut manifest.selection_evidence.queries[4];
+    query.rv = 0;
+    query.result = Some(SelectionResult {
+        name: SelectionNameClass::ExactStandard,
+        version: SelectionVersionClass::V3_0,
+        flags: 0,
+    });
+    query.inventory_matches = vec![SelectionInventoryMatch {
+        surface: 0,
+        name_agrees: false,
+        version_agrees: false,
+    }];
+    query.authority = SelectionAuthority::Inventory;
+
+    assert!(
+        p11scope::manifest_input::validate_structure(&manifest)
+            .iter()
+            .any(|problem| problem.contains("unavailable inventory surface")),
+        "an absent/not-walked legacy surface cannot authorize inventory evidence"
+    );
+}
+
+#[test]
 fn selection_validation_rejects_review_mutations() {
     let path = Path::new("/bin/true");
     let reference_table = |manifest: &mut Manifest, table_id| {

@@ -459,8 +459,10 @@ capture verdict.
   evidence and prove consumer verdict is `PARTIAL` exactly once.
 - [x] RED: process creation is cgroup/event-policy only: PID scope neither
   attaches `task_newtask` nor reports a missing-boundary sentinel. A cgroup
-  `task_newtask` record adds one finite selection window gap; ordinary children
-  inherit proven semantic state while `CLONE_INTO_CGROUP` children do not.
+  `task_newtask` record is a semantic hint; destination-authenticated
+  membership admission and scoped leader-exit boundaries own the bounded gap
+  evidence. Ordinary children inherit proven semantic state while
+  `CLONE_INTO_CGROUP` children do not.
 - [x] GREEN: attach the cgroup `task/task_newtask` boundary, parse its live
   signed `pid` and unsigned `clone_flags` offsets, filter `CLONE_THREAD` before
   reservation, and expose only the existing bounded gap evidence. A missing

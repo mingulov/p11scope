@@ -291,7 +291,7 @@ impl Tracer {
     /// semantic reduction. Fork lifecycle records are transport events, not
     /// calls, and are intentionally excluded.
     pub(crate) fn count_raw_call(&mut self, ev: &Event) {
-        if ev.event_type != p11scope_ebpf_common::event_type::FORK {
+        if matches!(ev.event_type, p11scope_ebpf_common::event_type::CALL) {
             self.raw_calls = self.raw_calls.saturating_add(1);
         }
     }

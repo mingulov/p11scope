@@ -1849,7 +1849,7 @@ def self_test():
                 _patch(
                     manifest,
                     ["surfaces", "C_GetInterface", "targets"],
-                    ["sched_process_fork", "sched_process_exit"],
+                    ["task_newtask", "sched_process_exit"],
                 ),
             ),
             (

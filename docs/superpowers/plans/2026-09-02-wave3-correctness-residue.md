@@ -355,7 +355,7 @@ Historical evidence is still not inherited.
 This is one review batch but permits two disjoint writers:
 
 - Writer A owns `crates/ebpf-common/src/lib.rs`, `crates/ebpf/src/main.rs`,
-  `src/attach.rs` (`parse_tracepoint_format` and CONFIG publication), and
+  `src/attach.rs` (`parse_task_newtask_format` and CONFIG publication), and
   `tests/artifact_contracts.rs`.
 - Writer B owns `src/discovery/scan.rs` and `tests/discovery_scan.rs`.
 - Neither writer edits the other's files; the primary integrates and runs Cargo
@@ -369,7 +369,7 @@ scan entry at `:1195`.
   `child_pid`; reject missing, duplicate, wrong-size, negative, or overflowing
   fields; static test rejects literal 24/44 reads.
 - [x] GREEN A: parse
-  `/sys/kernel/tracing/events/sched/sched_process_fork/format`, publish checked
+  `/sys/kernel/tracing/events/task/task_newtask/format`, publish checked
   offsets through existing config-map ownership before attach, and make BPF read
   only those values. Fail closed; add no BTF/CO-RE dependency.
 - [x] RED B: pass a same-size replacement inode to the opened-file identity
@@ -380,7 +380,7 @@ scan entry at `:1195`.
   identity operation; size remains supplementary only.
 - [x] Focused checks:
   `cargo +1.88 test --locked --lib tracepoint_format`,
-  `cargo +1.88 test --locked --test artifact_contracts dynamic_sched_fork_offsets`,
+  `cargo +1.88 test --locked --test artifact_contracts dynamic_task_newtask_offsets`,
   and `cargo +1.88 test --locked --lib opened_file_identity`;
   then four canonical gates and commit the two root fixes together after
   integration review.
@@ -457,23 +457,19 @@ capture verdict.
   diagnostics on load failure without target data.
 - [x] RED: for each discovery loss counter, serialize profile/metrics/terminal
   evidence and prove consumer verdict is `PARTIAL` exactly once.
-- [x] RED: `pid_scope_fork_marks_descendant_unobserved_partial` proves a fork
-  observed under one-process PID scope records one finite count-only descendant
-  gap and forces `PARTIAL`. Cgroup scope covers ordinary child function calls
-  immediately, but each observed fork records the bounded window before the
-  child's per-process dynamic selection-export links are refreshed. Never
-  inherit child semantic state as tracing coverage.
-- [x] GREEN: attach the fork observation boundary for one-process PID scope as
-  well as cgroup scope, record each child as a finite saturating gap, and expose
-  only that count through Task 4's versioned evidence. A missing PID-scope fork
-  boundary degrades the attempted capture to explicit `PARTIAL`; it must never
-  leave `pid_descendant_gaps` at an invented zero or silently inherit child
-  tracing coverage. A missing cgroup fork boundary likewise starts with one
-  explicit gap because early child selection coverage cannot be established.
+- [x] RED: process creation is cgroup/event-policy only: PID scope neither
+  attaches `task_newtask` nor reports a missing-boundary sentinel. A cgroup
+  `task_newtask` record adds one finite selection window gap; ordinary children
+  inherit proven semantic state while `CLONE_INTO_CGROUP` children do not.
+- [x] GREEN: attach the cgroup `task/task_newtask` boundary, parse its live
+  signed `pid` and unsigned `clone_flags` offsets, filter `CLONE_THREAD` before
+  reservation, and expose only the existing bounded gap evidence. A missing
+  cgroup boundary starts with one explicit gap because early child selection
+  coverage cannot be established. PID scope remains exact and reports zero.
 - [x] Update capability self-test and docs; privileged rows remain `UNRUN` if
   not authorized. Focused checks:
   `cargo +1.88 test --locked --lib capability_tier`,
-  `cargo +1.88 test --locked --lib pid_scope_fork_marks_descendant_unobserved_partial`,
+  `cargo +1.88 test --locked --lib process_creation`,
   `cargo +1.88 test --locked --test proc_access capability_tier`, and
   `sh scripts/verify-capability-tier.sh --self-test`; then four canonical
   gates; commit.

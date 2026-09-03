@@ -18,13 +18,13 @@ use core::mem::MaybeUninit;
 use p11scope_ebpf_common::{
     bucket_of, capture, cookie_descriptor, cookie_slot, discovery_pause_coalesced,
     discovery_pause_enabled, discovery_state_take_failed, discovery_state_take_scope_lost,
-    discovery_table_slots,
+    classify_task_newtask, discovery_table_slots,
     discovery_usable_prefix, event_type, interface_continuation_next,
     interface_continuation_pack, interface_continuation_unpack, lifecycle,
     return_allows_mechanism, shape, valid_config, valid_loader_cookie, CallStart, DiscoveryRecord,
     Event, FunctionNameKey, PauseKey, RvKey, SlotSemantics, SlotStats, StartKey, StartState,
     StateKey, STATE_DOMAIN_EXPORT, STATE_DOMAIN_SELECTION, ARG_NONE, CFG_FLAGS,
-    CFG_FORK_OFFSETS,
+    CFG_TASK_NEWTASK_OFFSETS,
     COALESCED_NO_HELPER_RC, DISCOVERY_BYTES,
     DISCOVERY_COUNTER_CELLS,
     DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES, DISCOVERY_COUNTER_EXPORT_STATE_FAILURES,
@@ -45,7 +45,7 @@ use p11scope_ebpf_common::{
     FUNCTION_NAME_MAX_BYTES, FUNCTION_NONE, LOADER_STATE_PRESENT, MAX_ATTRS, MAX_DESCRIPTORS,
     MAX_MECH_SHAPES, MAX_SLOTS, MECH_NONE, PAUSE_ARMED, PAUSE_REQUESTED, RING_BYTES, RV_ENTRIES,
     R_STATE_OFFSET, SESSION_NONE, START_ENTRIES, TAIL_CALLS_INTERFACE_WORKER_SLOT,
-    USER_TYPE_NONE, unpack_fork_offsets,
+    USER_TYPE_NONE, unpack_task_newtask_offsets,
 };
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 use p11scope_ebpf_common::{
@@ -1953,36 +1953,47 @@ pub fn p11_return(ctx: RetProbeContext) -> u32 {
     0
 }
 
-#[tracepoint(category = "sched", name = "sched_process_fork")]
-pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
-    let Some(flags) = scope_flags() else {
+#[tracepoint(category = "task", name = "task_newtask")]
+pub fn task_newtask(ctx: TracePointContext) -> u32 {
+    let Some(scope) = scope_auth() else {
         return 0;
     };
+    if scope.flags & FLAG_CGROUP_FILTER == 0 {
+        return 0;
+    }
+    let flags = scope.flags;
     if flags & FLAG_POLICY_AGGREGATE != 0 {
         return 0;
     }
-    let Some((parent_offset, child_offset)) = CONFIG
-        .get(CFG_FORK_OFFSETS)
+    let Some((pid_offset, clone_flags_offset)) = CONFIG
+        .get(CFG_TASK_NEWTASK_OFFSETS)
         .copied()
-        .and_then(unpack_fork_offsets)
+        .and_then(unpack_task_newtask_offsets)
     else {
         return 0;
     };
     // SAFETY: userspace parsed and checked both offsets from this tracepoint's
     // live tracefs format before freezing CONFIG and attaching this program.
-    let Ok(_parent_tid) = (unsafe { ctx.read_at::<u32>(parent_offset) }) else {
+    let Ok(pid) = (unsafe { ctx.read_at::<i32>(pid_offset) }) else {
         return 0;
     };
-    let Ok(child) = (unsafe { ctx.read_at::<u32>(child_offset) }) else {
+    let Ok(clone_flags) = (unsafe { ctx.read_at::<u64>(clone_flags_offset) }) else {
         return 0;
     };
-    // `parent_pid` is the calling thread ID. The admitted scope and userspace
-    // process state are keyed by TGID, including when a worker thread forks.
-    let parent_tgid = helpers::bpf_get_current_pid_tgid() >> 32;
+    let Ok(child_pid) = u32::try_from(pid) else {
+        return 0;
+    };
+    let Some(event_type) = classify_task_newtask(clone_flags) else {
+        return 0;
+    };
+    if child_pid == 0 {
+        return 0;
+    }
+    let creator_tgid = helpers::bpf_get_current_pid_tgid() >> 32;
     let ev = Event {
-        pid_tgid: parent_tgid << 32,
-        session: child as u64,
-        event_type: event_type::FORK,
+        pid_tgid: creator_tgid << 32,
+        session: child_pid as u64,
+        event_type,
         ..Event::default()
     };
     match EVENTS.reserve::<Event>(0) {

@@ -167,34 +167,34 @@ pub const LATENCY_BUCKETS: usize = 32;
 
 /// CONFIG map indices.
 pub const CFG_FLAGS: u32 = 0;
-/// Packed `sched_process_fork` field offsets, present only for cgroup event
-/// capture. The low CONFIG cell remains the sole scope/policy owner.
-pub const CFG_FORK_OFFSETS: u32 = 1;
-/// Bit shift of the packed parent PID field offset.
-pub const CFG_FORK_PARENT_OFFSET: u32 = 0;
+/// Packed `task_newtask` field offsets, present only for cgroup event capture.
+/// The low CONFIG cell remains the sole scope/policy owner.
+pub const CFG_TASK_NEWTASK_OFFSETS: u32 = 1;
 /// Bit shift of the packed child PID field offset.
-pub const CFG_FORK_CHILD_OFFSET: u32 = 16;
-const CFG_FORK_OFFSET_MASK: u64 = u16::MAX as u64;
-const CFG_FORK_OFFSETS_VALID: u64 = 1 << 32;
-const CFG_FORK_OFFSETS_KNOWN: u64 = CFG_FORK_OFFSETS_VALID
-    | (CFG_FORK_OFFSET_MASK << CFG_FORK_PARENT_OFFSET)
-    | (CFG_FORK_OFFSET_MASK << CFG_FORK_CHILD_OFFSET);
+pub const CFG_TASK_NEWTASK_PID_OFFSET: u32 = 0;
+/// Bit shift of the packed clone flags field offset.
+pub const CFG_TASK_NEWTASK_CLONE_FLAGS_OFFSET: u32 = 16;
+const CFG_TASK_NEWTASK_OFFSET_MASK: u64 = u16::MAX as u64;
+const CFG_TASK_NEWTASK_OFFSETS_VALID: u64 = 1 << 32;
+const CFG_TASK_NEWTASK_OFFSETS_KNOWN: u64 = CFG_TASK_NEWTASK_OFFSETS_VALID
+    | (CFG_TASK_NEWTASK_OFFSET_MASK << CFG_TASK_NEWTASK_PID_OFFSET)
+    | (CFG_TASK_NEWTASK_OFFSET_MASK << CFG_TASK_NEWTASK_CLONE_FLAGS_OFFSET);
 
 /// Pack checked tracepoint offsets into the second CONFIG cell.
-pub const fn pack_fork_offsets(parent: u16, child: u16) -> u64 {
-    CFG_FORK_OFFSETS_VALID
-        | ((parent as u64) << CFG_FORK_PARENT_OFFSET)
-        | ((child as u64) << CFG_FORK_CHILD_OFFSET)
+pub const fn pack_task_newtask_offsets(pid: u16, clone_flags: u16) -> u64 {
+    CFG_TASK_NEWTASK_OFFSETS_VALID
+        | ((pid as u64) << CFG_TASK_NEWTASK_PID_OFFSET)
+        | ((clone_flags as u64) << CFG_TASK_NEWTASK_CLONE_FLAGS_OFFSET)
 }
 
-/// Decode a packed fork-offset cell, rejecting absence and unknown bits.
-pub const fn unpack_fork_offsets(value: u64) -> Option<(usize, usize)> {
-    if value & CFG_FORK_OFFSETS_VALID == 0 || value & !CFG_FORK_OFFSETS_KNOWN != 0 {
+/// Decode a packed task_newtask offset cell, rejecting absence and unknown bits.
+pub const fn unpack_task_newtask_offsets(value: u64) -> Option<(usize, usize)> {
+    if value & CFG_TASK_NEWTASK_OFFSETS_VALID == 0 || value & !CFG_TASK_NEWTASK_OFFSETS_KNOWN != 0 {
         return None;
     }
     Some((
-        ((value >> CFG_FORK_PARENT_OFFSET) & CFG_FORK_OFFSET_MASK) as usize,
-        ((value >> CFG_FORK_CHILD_OFFSET) & CFG_FORK_OFFSET_MASK) as usize,
+        ((value >> CFG_TASK_NEWTASK_PID_OFFSET) & CFG_TASK_NEWTASK_OFFSET_MASK) as usize,
+        ((value >> CFG_TASK_NEWTASK_CLONE_FLAGS_OFFSET) & CFG_TASK_NEWTASK_OFFSET_MASK) as usize,
     ))
 }
 
@@ -870,6 +870,23 @@ pub const fn return_allows_mechanism(rv: u64) -> bool {
 pub mod event_type {
     pub const CALL: u32 = 0;
     pub const FORK: u32 = 1;
+    /// Process creation with `CLONE_INTO_CGROUP`; the private marker carries
+    /// no clone flags or other task data across the Event ABI.
+    pub const FORK_INTO_CGROUP: u32 = 2;
+}
+
+pub const CLONE_THREAD: u64 = 0x0001_0000;
+pub const CLONE_INTO_CGROUP: u64 = 0x2000_0000;
+
+/// Classify task_newtask without carrying clone flags through the Event ABI.
+pub const fn classify_task_newtask(clone_flags: u64) -> Option<u32> {
+    if clone_flags & CLONE_THREAD != 0 {
+        None
+    } else if clone_flags & CLONE_INTO_CGROUP != 0 {
+        Some(event_type::FORK_INTO_CGROUP)
+    } else {
+        Some(event_type::FORK)
+    }
 }
 
 /// Capture-state bits stored in CallStart/Event. Pointer values themselves
@@ -1021,13 +1038,27 @@ mod tests {
     }
 
     #[test]
-    fn fork_offset_config_cell_is_exact_and_fail_closed() {
-        assert_eq!(CFG_FORK_OFFSETS, 1);
-        let packed = pack_fork_offsets(32, 56);
+    fn task_newtask_offset_config_cell_is_exact_and_fail_closed() {
+        assert_eq!(CFG_TASK_NEWTASK_OFFSETS, 1);
+        let packed = pack_task_newtask_offsets(32, 56);
         assert_eq!(packed, (1u64 << 32) | (56u64 << 16) | 32);
-        assert_eq!(unpack_fork_offsets(packed), Some((32, 56)));
-        assert_eq!(unpack_fork_offsets(packed & !(1u64 << 32)), None);
-        assert_eq!(unpack_fork_offsets(packed | (1u64 << 63)), None);
+        assert_eq!(unpack_task_newtask_offsets(packed), Some((32, 56)));
+        assert_eq!(unpack_task_newtask_offsets(packed & !(1u64 << 32)), None);
+        assert_eq!(unpack_task_newtask_offsets(packed | (1u64 << 63)), None);
+    }
+
+    #[test]
+    fn task_newtask_classification_filters_threads_and_hides_clone_flags() {
+        assert_eq!(classify_task_newtask(0), Some(event_type::FORK));
+        assert_eq!(
+            classify_task_newtask(CLONE_INTO_CGROUP),
+            Some(event_type::FORK_INTO_CGROUP)
+        );
+        assert_eq!(classify_task_newtask(CLONE_THREAD), None);
+        assert_eq!(
+            classify_task_newtask(CLONE_THREAD | CLONE_INTO_CGROUP),
+            None
+        );
     }
 
     /// Mutation caught: treating the full cookie as a slot corrupts the

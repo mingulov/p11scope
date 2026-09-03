@@ -1568,12 +1568,16 @@ impl State {
     }
 
     pub fn observe(&mut self, ev: &Event) {
-        if ev.event_type == event_type::FORK {
-            self.fork_process(
-                ProcessKey::from_pid(pid_of(ev)),
-                ProcessKey::from_pid(ev.session as u32),
-            );
-            return;
+        match ev.event_type {
+            event_type::FORK => {
+                self.fork_process(
+                    ProcessKey::from_pid(pid_of(ev)),
+                    ProcessKey::from_pid(ev.session as u32),
+                );
+                return;
+            }
+            event_type::FORK_INTO_CGROUP => return,
+            _ => {}
         }
         let process = self
             .current_process

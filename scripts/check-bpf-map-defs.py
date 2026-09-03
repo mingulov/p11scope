@@ -122,7 +122,7 @@ UNSAFE_MAPS = SAFE_MAPS | {
 SAFE_PROGRAMS = {
     "p11_entry",
     "p11_return",
-    "sched_process_fork",
+    "task_newtask",
     "dl_debug_state",
     "function_list_entry",
     "function_list_return",

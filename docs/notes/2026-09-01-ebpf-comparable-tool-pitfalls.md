@@ -13,7 +13,8 @@ Datadog agent, Sysdig, Parca/Pyroscope. Each candidate was checked against this 
 
 1. **Stop hardcoding tracepoint offsets.** Parse `/sys/kernel/tracing/events/sched/*/format`
    at load, pass offsets via a config map, assert on mismatch. Site:
-   `crates/ebpf/src/main.rs:1703,1706` (literal offsets 24/44 for `sched_process_fork`).
+   `crates/ebpf/src/main.rs` (the tracepoint fields must come from the live
+   `task/task_newtask` format, not literal offsets).
    In 6.16 `sched_process_free`'s `comm` became `__data_loc` and moved `pid` 24→12;
    the bcc precedent (PR #2812, RHEL-RT extra `common_*` fields) returned **silently
    wrong data** rather than an error.

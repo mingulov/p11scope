@@ -482,8 +482,10 @@ v3 adds `evidence.interface_selection`; consumers must dispatch on v3 before
 reading it. Repository scripts, fixtures, examples, docs, and schema pins move
 in the same implementation task. There is no claim that v2 was unpublished.
 
-Metrics output remains `pkcs11-scope/observed-profile/v2-metrics` because its
-shape and no-argument-read contract do not change. Profile and terminal trace
+Metrics output is now `pkcs11-scope/observed-profile/v3-metrics`; it retains the
+no-argument-read contract and adds the typed task-uprobe link-loss counter.
+The historical `pkcs11-scope/observed-profile/v2-metrics` shape remains a
+compatibility-read fixture and is not emitted. Profile and terminal trace
 evidence add `evidence.interface_selection`:
 
 ```json

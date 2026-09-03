@@ -306,6 +306,7 @@ def exact_profile_v3_selection(document, *, terminal=False, run=False):
     else:
         evidence = document
     exact_evidence_keys(evidence, profile=True, terminal=terminal, child=run)
+    exact_task_uprobe_link_losses(evidence)
     missing = {
         "interface_selection", "attach_mechanisms", "pid_descendant_gaps",
         "multi_rebuild_gaps",
@@ -507,6 +508,7 @@ def exact_metrics_schema(document, *, run=False):
     require(document["capture"]["mode"] == "metrics", document["capture"])
     require(document["capture"]["privacy_mode"] == "aggregate-only", document["capture"])
     exact_evidence_keys(document["evidence"], profile=False, child=run)
+    exact_task_uprobe_link_losses(document["evidence"])
 
 
 def exact_historical_metrics_schema(document, *, run=False):
@@ -517,6 +519,17 @@ def exact_historical_metrics_schema(document, *, run=False):
     exact_evidence_keys(
         document["evidence"], profile=False, child=run, historical=True
     )
+
+
+def exact_task_uprobe_link_losses(evidence):
+    """The live v3 schemas make task-uprobe loss a typed completeness gate."""
+    value = evidence["task_uprobe_link_losses"]
+    require(u64(value), f"invalid task_uprobe_link_losses: {value!r}")
+    if value != 0:
+        require(
+            evidence["completeness"] != "COMPLETE",
+            "task-uprobe link loss cannot be COMPLETE",
+        )
 
 
 def exact_identity(carrier):
@@ -2299,6 +2312,18 @@ def self_test():
         "selection_truncated": False,
     }
     exact_profile_v3_selection(selection_doc)
+    for validator, live_document in (
+        (exact_metrics_schema, clean),
+        (exact_profile_v3_selection, selection_doc),
+    ):
+        for invalid in (True, "1", -1, U64_MAX + 1):
+            bad = copy.deepcopy(live_document)
+            bad["evidence"]["task_uprobe_link_losses"] = invalid
+            rejected(lambda bad=bad, validator=validator: validator(bad))
+        bad = copy.deepcopy(live_document)
+        bad["evidence"].update(task_uprobe_link_losses=1, completeness="COMPLETE")
+        rejected(lambda bad=bad, validator=validator: validator(bad))
+    print("live profile-v3 and metrics-v3 task-uprobe loss typing and verdict gate are exact: OK")
     run_profile = copy.deepcopy(selection_doc)
     run_profile["evidence"]["child_still_running"] = False
     exact_profile_v3_selection(run_profile, run=True)

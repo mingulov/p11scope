@@ -5327,7 +5327,7 @@ fn settle_leader_exit_view(
     view: ProcessViewId,
     original_exited: Result<bool, String>,
 ) -> LeaderExitAssessment {
-    if !pending.contains(&view) || counted.contains(&view) {
+    if !pending.contains(&view) {
         return LeaderExitAssessment::AlreadySettled;
     }
     match original_exited {
@@ -9363,15 +9363,6 @@ impl Engine {
     /// and the empty-scan rule; a journal still pending keeps the record, and
     /// the timing proof this loss already invalidated is not given back.
     pub(crate) fn settle_terminal_drain(&mut self) {
-        if self.terminal_journal.is_some() {
-            return;
-        }
-        let announced = Skipped {
-            subject: TERMINAL_DRAIN_SUBJECT.into(),
-            reason: TERMINAL_DRAIN_RETRY_REASON.into(),
-        };
-        self.counters.object_skips.retain(|skip| *skip != announced);
-        self.plan.skipped.retain(|skip| *skip != announced);
         let pending_views = self.pending_leader_exit_views.clone();
         finalize_pending_leader_exit_views(
             &mut self.pending_leader_exit_views,
@@ -9381,6 +9372,15 @@ impl Engine {
         for view in pending_views {
             self.close_owned_selection_for_view(view);
         }
+        if self.terminal_journal.is_some() {
+            return;
+        }
+        let announced = Skipped {
+            subject: TERMINAL_DRAIN_SUBJECT.into(),
+            reason: TERMINAL_DRAIN_RETRY_REASON.into(),
+        };
+        self.counters.object_skips.retain(|skip| *skip != announced);
+        self.plan.skipped.retain(|skip| *skip != announced);
     }
 
     fn terminal_owner(&self) -> Option<LoaderContextId> {
@@ -10087,54 +10087,21 @@ impl Engine {
     }
 
     fn queue_leader_exit_assessment(&mut self, view: ProcessViewId) {
-        if !self.counted_leader_exit_views.contains(&view) {
-            self.pending_leader_exit_views.insert(view);
-        }
-    }
-
-    /// Retire a view whose task-bound links died while its retained process
-    /// generation is still live. This uses the ordinary conservative cleanup
-    /// path but does not relabel the event as a generic generation loss.
-    fn queue_link_loss_retirement(
-        &mut self,
-        view: ProcessViewId,
-        pending_views: &mut PendingViewRetirements,
-    ) {
-        let cause = self
-            .retirement_intents
-            .get(&view)
-            .copied()
-            .map_or(RetirementCause::GenerationLost, |current| {
-                current.merge(RetirementCause::GenerationLost)
-            });
-        if let Some(pid) = self
-            .views
-            .iter()
-            .find(|candidate| candidate.id() == view)
-            .map(ProcessView::pid)
-        {
-            self.refresh_requested.remove(&pid);
-        }
-        self.ready_expected_removals.remove(&view);
-        self.retirement_intents.insert(view, cause);
-        pending_views
-            .entry(view)
-            .and_modify(|current| *current = current.merge(cause))
-            .or_insert(cause);
+        self.pending_leader_exit_views.insert(view);
     }
 
     fn settle_leader_exit_assessments(
         &mut self,
+        assessments: &BTreeSet<ProcessViewId>,
         pending_views: &mut PendingViewRetirements,
         additions_allowed: &mut bool,
         closure: &mut PauseClosure,
     ) {
-        let views: Vec<_> = self.pending_leader_exit_views.iter().copied().collect();
-        for view in views {
+        for view in assessments {
             let result = self
                 .views
                 .iter()
-                .find(|candidate| candidate.id() == view)
+                .find(|candidate| candidate.id() == *view)
                 .map_or_else(
                     || Err("retained process view is no longer available".to_string()),
                     ProcessView::original_exited,
@@ -10143,7 +10110,7 @@ impl Engine {
                 &mut self.pending_leader_exit_views,
                 &mut self.counted_leader_exit_views,
                 &mut self.task_uprobe_link_losses,
-                view,
+                *view,
                 result,
             ) {
                 LeaderExitAssessment::AlreadySettled => {}
@@ -10152,14 +10119,21 @@ impl Engine {
                     closure.fail();
                 }
                 LeaderExitAssessment::WholeGroupExit => {
-                    self.queue_retirement(view, RetirementCause::ExpectedRemoval, pending_views);
+                    self.queue_retirement(*view, RetirementCause::ExpectedRemoval, pending_views);
                 }
                 LeaderExitAssessment::LinkLoss => {
                     *additions_allowed = false;
                     closure.fail();
                     self.invalidate_causal_timing();
-                    self.close_owned_selection_for_view(view);
-                    self.queue_link_loss_retirement(view, pending_views);
+                    self.close_owned_selection_for_view(*view);
+                    if let Some(pid) = self
+                        .views
+                        .iter()
+                        .find(|candidate| candidate.id() == *view)
+                        .map(ProcessView::pid)
+                    {
+                        self.refresh_requested.remove(&pid);
+                    }
                 }
             }
         }
@@ -10242,6 +10216,8 @@ impl Engine {
         let mut changed = false;
         let mut named_generation_lost = false;
         let mut conservative_replay_attempted = false;
+        let leader_exit_assessments = self.pending_leader_exit_views.clone();
+        let mut leader_exit_assessments_settled = false;
         for (view, cause) in self.retirement_intents.clone() {
             pending_views
                 .entry(view)
@@ -10282,7 +10258,15 @@ impl Engine {
             }
             self.settle_deferred_loader_mismatches(deferred_mismatches, &exec_refresh_views);
             self.promote_stale_execs(pending_views);
-            self.settle_leader_exit_assessments(pending_views, additions_allowed, closure);
+            if !leader_exit_assessments_settled {
+                self.settle_leader_exit_assessments(
+                    &leader_exit_assessments,
+                    pending_views,
+                    additions_allowed,
+                    closure,
+                );
+                leader_exit_assessments_settled = true;
+            }
             if pending_views.is_empty() {
                 if (self.pending_rejected_keys.is_empty() && self.pending_retirements.is_empty())
                     || conservative_replay_attempted
@@ -13761,6 +13745,14 @@ pub(crate) mod tests {
         );
         assert_eq!(losses, 1, "ordinary whole-group exit is not a link loss");
 
+        pending.insert(view);
+        assert_eq!(
+            settle_leader_exit_view(&mut pending, &mut counted, &mut losses, view, Ok(true),),
+            LeaderExitAssessment::WholeGroupExit,
+            "a later definitive whole-group exit remains ordinary retirement"
+        );
+        assert_eq!(losses, 1);
+
         let unresolved = ProcessViewId(24);
         pending.insert(unresolved);
         assert_eq!(
@@ -13849,7 +13841,9 @@ pub(crate) mod tests {
         let mut pending_views = PendingViewRetirements::new();
         let mut additions_allowed = true;
         let mut closure = PauseClosure::new(true);
+        let assessments = engine.pending_leader_exit_views.clone();
         engine.settle_leader_exit_assessments(
+            &assessments,
             &mut pending_views,
             &mut additions_allowed,
             &mut closure,
@@ -13857,9 +13851,16 @@ pub(crate) mod tests {
         assert_eq!(engine.task_uprobe_link_losses, 1);
         assert!(!additions_allowed);
         assert!(!closure.required_complete());
-        assert_eq!(
-            pending_views.get(&ProcessViewId(25)),
-            Some(&RetirementCause::GenerationLost)
+        assert!(
+            pending_views.is_empty(),
+            "link loss does not retire the live view"
+        );
+        assert!(
+            engine
+                .views
+                .iter()
+                .any(|candidate| candidate.id() == ProcessViewId(25)),
+            "the live ProcessView remains available for later whole-group exit evidence"
         );
         assert_eq!(
             engine.selection_bindings[&1].coverage,
@@ -13869,6 +13870,69 @@ pub(crate) mod tests {
             !engine.refresh_requested.contains(&std::process::id()),
             "link loss does not re-arm the same live view"
         );
+    }
+
+    #[test]
+    fn leader_exit_batch_n_queues_and_batch_n_plus_1_settles() {
+        let view = ProcessView::open(ProcessViewId(27), std::process::id()).unwrap();
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_LEADER_EXIT;
+        record.pid_tgid = u64::from(view.pid()) << 32;
+        record.hook_ts_ns = view.admitted_ns();
+        let mut engine = Engine::empty();
+        engine.views.push(view);
+        let mut session = ScriptedSession::default();
+
+        let first = apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+        assert!(first.required_complete, "batch N has no settled loss yet");
+        assert_eq!(engine.task_uprobe_link_losses, 0);
+        assert!(
+            engine
+                .pending_leader_exit_views
+                .contains(&ProcessViewId(27))
+        );
+
+        let second = apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+        assert!(
+            !second.required_complete,
+            "batch N+1 publishes the link loss"
+        );
+        assert_eq!(engine.task_uprobe_link_losses, 1);
+        assert!(engine.pending_leader_exit_views.is_empty());
+        assert!(
+            engine
+                .views
+                .iter()
+                .any(|candidate| candidate.id() == ProcessViewId(27))
+        );
+    }
+
+    #[test]
+    fn named_pid_link_loss_continues_with_retained_view_and_partial_evidence() {
+        let view = ProcessView::open(ProcessViewId(28), std::process::id()).unwrap();
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_LEADER_EXIT;
+        record.pid_tgid = u64::from(view.pid()) << 32;
+        record.hook_ts_ns = view.admitted_ns();
+        let mut engine = Engine::empty();
+        engine.scope = Scope::Pid(view.pid());
+        engine.views.push(view);
+        let mut session = ScriptedSession::default();
+
+        apply_ordinary_batch(&mut engine, &mut session, vec![record])
+            .expect("a named PID link loss remains a successful batch");
+        let outcome = apply_ordinary_batch(&mut engine, &mut session, Vec::new())
+            .expect("confirmed link loss does not produce a named-PID fatal error");
+
+        assert!(!outcome.required_complete);
+        assert_eq!(engine.capture_facts().task_uprobe_link_losses(), 1);
+        assert!(
+            engine
+                .views
+                .iter()
+                .any(|candidate| candidate.id() == ProcessViewId(28))
+        );
+        assert!(engine.pending_leader_exit_views.is_empty());
     }
 
     #[test]
@@ -15400,7 +15464,13 @@ pub(crate) mod tests {
         child.wait().unwrap();
         let mut additions_allowed = true;
         let mut closure = PauseClosure::new(true);
-        engine.settle_leader_exit_assessments(&mut pending, &mut additions_allowed, &mut closure);
+        let assessments = engine.pending_leader_exit_views.clone();
+        engine.settle_leader_exit_assessments(
+            &assessments,
+            &mut pending,
+            &mut additions_allowed,
+            &mut closure,
+        );
         assert_eq!(
             pending.get(&ProcessViewId(16)),
             Some(&RetirementCause::ExpectedRemoval)
@@ -19881,6 +19951,54 @@ int main(int argc, char **argv) {
             Some(owner)
         );
         assert!(engine.loader_registry.is_tombstoned(owner));
+    }
+
+    #[test]
+    fn terminal_drain_promotes_pending_leader_loss_with_retained_journal() {
+        let view = ProcessView::open(ProcessViewId(29), std::process::id()).unwrap();
+        let mut engine = Engine::empty();
+        engine.views.push(view);
+        let generation = NonZeroU64::new(1).unwrap();
+        engine.selection_bindings.insert(
+            1,
+            SelectionBindingFact {
+                id: 1,
+                context: LoaderContextId::from_case_id(1),
+                view: ProcessViewId(29),
+                object: PinnedObjectId(1),
+                file_offset: 0,
+                hook_id: 0,
+                abi: HookAbi::Interface,
+                attached: true,
+                retired: false,
+                provider: plan::ModuleId(0),
+                observed: false,
+                coverage: SelectionCoverageState::OwnedOpen(generation),
+            },
+        );
+        engine.pending_leader_exit_views.insert(ProcessViewId(29));
+        let owner = LoaderContextId::from_case_id(1);
+        engine.terminal_journal = Some(TerminalJournal {
+            owner,
+            dispatch_started: false,
+            retry_used: false,
+        });
+
+        engine.settle_terminal_drain();
+
+        assert_eq!(engine.task_uprobe_link_losses, 1);
+        assert!(engine.pending_leader_exit_views.is_empty());
+        assert!(
+            engine
+                .views
+                .iter()
+                .any(|candidate| candidate.id() == ProcessViewId(29))
+        );
+        assert_eq!(
+            engine.selection_bindings[&1].coverage,
+            SelectionCoverageState::OwnedClosed(generation)
+        );
+        assert_eq!(engine.terminal_owner(), Some(owner));
     }
 
     #[test]

@@ -326,6 +326,22 @@ Design acceptance: §12 items 3, 14, and 15.
 
 Commit: `docs: publish versioned interface selection evidence`
 
+## Task 4.5: Exact-tip runtime smoke before more BPF churn
+
+This is an owner-gated evidence checkpoint, not a code-change task. On the
+exact clean Task-4 tip, run the real embedded object on the existing Ubuntu
+22.04 / Linux 5.15 and Ubuntu 24.04 / Linux 6.8 lanes before Task 5 changes the
+fork program again.
+
+- [ ] Record `doctor`, the attach e2e, the privacy canary, and induced-gap G3
+  as PASS, FAIL, or `UNRUN` on each exact kernel. Do not inherit W1/W2 evidence.
+- [ ] Require the real object to load, expected slots to attach, canaries to
+  report no leak (including interface-selection names), and G3 to retain exact
+  aggregate counts while reporting nonzero loss and `PARTIAL`.
+- [ ] If privilege or a required VM is unavailable, keep the row `UNRUN` and
+  continue only with that explicit evidence debt; never call the W3 tip runtime
+  qualified from local Rust gates alone.
+
 ## Task 5: Dynamic tracepoint offsets and scan-open identity
 
 This is one review batch but permits two disjoint writers:
@@ -337,9 +353,9 @@ This is one review batch but permits two disjoint writers:
 - Neither writer edits the other's files; the primary integrates and runs Cargo
   serially.
 
-Current anchors: literal fork offsets at `crates/ebpf/src/main.rs:1692-1707`;
-target open at `src/discovery/scan.rs:914`; size-only `hint_gate` at `:947`;
-scan entry at `:1139`.
+Current anchors: literal fork offsets at `crates/ebpf/src/main.rs:1955,1958`;
+target open at `src/discovery/scan.rs:970`; size-only `hint_gate` at `:1003`;
+scan entry at `:1195`.
 
 - [ ] RED A: parse synthetic tracefs format with shifted `parent_pid` and
   `child_pid`; reject missing, duplicate, wrong-size, negative, or overflowing
@@ -432,8 +448,12 @@ capture verdict.
   observed under one-process PID scope records one finite count-only descendant
   gap and forces `PARTIAL`; document cgroup scope as the descendant-coverage
   route. Never inherit child semantic state as tracing coverage.
-- [ ] GREEN: record that gap at the existing fork observation boundary and
-  expose only its saturating count through Task 4's versioned evidence.
+- [ ] GREEN: attach the fork observation boundary for one-process PID scope as
+  well as cgroup scope, record each child as a finite saturating gap, and expose
+  only that count through Task 4's versioned evidence. A missing PID-scope fork
+  boundary degrades the attempted capture to explicit `PARTIAL`; it must never
+  leave `pid_descendant_gaps` at an invented zero or silently inherit child
+  tracing coverage.
 - [ ] Update capability self-test and docs; privileged rows remain `UNRUN` if
   not authorized. Focused checks:
   `cargo +1.88 test --locked --lib capability_tier`,
@@ -540,6 +560,13 @@ its explicit gap evidence. Run Cargo and integrate these batches serially.
   fallback.
 - [ ] Populate Task 4's finite sorted `evidence.attach_mechanisms` with only
   `uprobe-multi` and/or `per-offset`; do not change its schema or allowlist.
+- [ ] Privileged acceptance pins Linux 5.15 strict-probe `Ok(false)`, not
+  `Err`; compares identical logical endpoint counts under per-offset and multi;
+  and proves a non-leader thread is captured on the strict-probe-true kernel.
+  After 7b, load the complete embedded object again on Linux 5.15 so multi
+  twins cannot regress the floor even though that lane selects per-offset.
+- [ ] Record the exact pinned Aya revision's tree hash in the dependency
+  closure report; do not rely only on a movable upstream PR head name.
 - [ ] Focused checks:
   `cargo +1.88 test --locked --lib uprobe_multi`,
   `cargo +1.88 test --locked --test artifact_contracts attach_mechanisms`, and
@@ -568,7 +595,7 @@ Commits: 7a `build: pin Aya multi attach API`; 7b
 - [ ] Run the four canonical gates on the exact branch tip and record counts.
 - [ ] Record privileged/container/VM rows as PASS, FAIL, or `UNRUN`; never
   inherit W1/W2 evidence.
-- [ ] Record the two post-W3 product-qualification rows in the closure report:
+- [ ] Run and record the two W3 product-qualification rows on the exact tip:
   `supported_rate_loss_oracle` (an empirically declared, matrix-specific fixed
   burst/rate with exact agreement between generator-completed calls, STATS
   entered/returned, and raw consumed `CALL` records, zero loss, and induced
@@ -577,8 +604,10 @@ Commits: 7a `build: pin Aya multi attach API`; 7b
   and
   `fork_exec_loader_unload_oracle` (fork, exec, `dlopen`, calls, `dlclose`,
   replacement/reload, exact retirement and attribution). These privileged
-  runtime rows may be `UNRUN` at W3 closeout, but both must PASS on the exact
-  release candidate before publication readiness.
+  runtime rows must PASS for W3 product closeout on Linux 5.15 per-offset and
+  on one exact strict-probe-true multi kernel. If the required environment is
+  unavailable, W3 remains explicitly open rather than converting `UNRUN` into
+  a working-product claim. W6 repeats the broader release matrix.
 - [ ] Independent full-diff Sol correctness/security review and Luna
   test-quality/regression review. Add a third distinct reviewer only for a
   genuinely separate risk. Triage with source evidence; batch accepted fixes

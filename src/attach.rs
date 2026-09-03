@@ -280,16 +280,27 @@ fn parse_tracepoint_format(format: &str) -> Result<(u16, u16)> {
 
 fn read_fork_format_with(mut read: impl FnMut(&Path) -> std::io::Result<String>) -> Result<String> {
     let mut failures = Vec::new();
+    let mut unavailable = true;
     for path in SCHED_PROCESS_FORK_FORMATS.map(Path::new) {
         match read(path) {
             Ok(format) => return Ok(format),
-            Err(error) => failures.push(format!("{}: {error}", path.display())),
+            Err(error) => {
+                unavailable &= matches!(
+                    error.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
+                );
+                failures.push(format!("{}: {error}", path.display()));
+            }
         }
     }
-    bail!(
+    let message = format!(
         "reading sched_process_fork format failed: {}",
         failures.join("; ")
-    )
+    );
+    if unavailable {
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, message).into());
+    }
+    bail!("{message}")
 }
 
 fn publish_fork_offsets(ebpf: &mut Ebpf) -> Result<()> {
@@ -441,6 +452,10 @@ impl CapturePolicy {
     }
 }
 
+fn fork_capture_enabled(scope: &Scope, policy: CapturePolicy) -> bool {
+    matches!(scope, Scope::Pid(_) | Scope::Cgroup { .. }) && policy.uses_events()
+}
+
 pub(crate) struct OwnedPauseGeneration {
     tgid: u32,
     generation: NonZeroU64,
@@ -488,7 +503,14 @@ pub struct Session {
     #[allow(dead_code)] // Task 8 drives the Task 7 pause coordinator.
     pause_key: Option<PauseKey>,
     lifecycle_tracking_unavailable: Option<String>,
+    fork_tracking_unavailable: Option<String>,
     links: Vec<RegisteredLink>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AttachPreflight {
+    pub(crate) lifecycle: bool,
+    pub(crate) scope: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1152,6 +1174,17 @@ impl Session {
         Ok(session)
     }
 
+    /// Exercises the real embedded object, policy maps, program inventory,
+    /// requested scope, fork boundary, and exec/exit links. Dropping the local
+    /// session detaches every link before this finite result is returned.
+    pub(crate) fn preflight(scope: &Scope) -> Result<AttachPreflight> {
+        let session = Self::start_inner(scope, CapturePolicy::Allowlisted, None)?;
+        Ok(AttachPreflight {
+            lifecycle: session.lifecycle_tracking_unavailable.is_none(),
+            scope: session.fork_tracking_unavailable.is_none(),
+        })
+    }
+
     fn start_inner(
         scope: &Scope,
         policy: CapturePolicy,
@@ -1171,9 +1204,25 @@ impl Session {
         let generation_token = pause_key.map(|key| key.generation_token);
         crate::scope::publish(&mut ebpf, scope, policy, generation_token)
             .context("publishing scope and capture policy")?;
-        let fork_enabled = matches!(scope, Scope::Cgroup { .. }) && policy.uses_events();
-        if fork_enabled {
-            publish_fork_offsets(&mut ebpf).context("publishing sched_process_fork offsets")?;
+        let fork_enabled = fork_capture_enabled(scope, policy);
+        let mut fork_tracking_unavailable = None;
+        if fork_enabled
+            && let Err(error) =
+                publish_fork_offsets(&mut ebpf).context("publishing sched_process_fork offsets")
+        {
+            if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
+                )
+            }) {
+                fork_tracking_unavailable = Some(format!(
+                    "live fork tracking unavailable: {}",
+                    error.root_cause()
+                ));
+            } else {
+                return Err(error);
+            }
         }
         publish_descriptors(&mut ebpf).context("publishing DESCRIPTORS")?;
         publish_async_catalog(&mut ebpf).context("publishing ASYNC_FUNCTIONS")?;
@@ -1230,18 +1279,26 @@ impl Session {
             .context("publishing and freezing TAIL_CALLS")?;
 
         let mut links = Vec::new();
-        if fork_enabled {
+        if fork_enabled && fork_tracking_unavailable.is_none() {
             let fork: &mut TracePoint = ebpf
                 .program_mut("sched_process_fork")
                 .context("program sched_process_fork missing from object")?
                 .try_into()?;
-            let id = fork
-                .attach("sched", "sched_process_fork")
-                .context("attaching sched_process_fork")?;
-            links.push(RegisteredLink::TracePoint {
-                program: "sched_process_fork",
-                id,
-            });
+            match fork.attach("sched", "sched_process_fork") {
+                Ok(id) => links.push(RegisteredLink::TracePoint {
+                    program: "sched_process_fork",
+                    id,
+                }),
+                Err(error) => {
+                    let error = anyhow::Error::from(error);
+                    if let Some(cause) = tracefs_lifecycle_failure(&error, "sched_process_fork") {
+                        fork_tracking_unavailable =
+                            Some(format!("live fork tracking unavailable: {cause}"));
+                    } else {
+                        return Err(error.context("attaching sched_process_fork"));
+                    }
+                }
+            }
         }
         let lifecycle_tracking_unavailable = match attach_lifecycle_with(
             &mut ebpf,
@@ -1282,6 +1339,7 @@ impl Session {
             uprobe_scope,
             pause_key,
             lifecycle_tracking_unavailable,
+            fork_tracking_unavailable,
             links,
         })
     }
@@ -1853,6 +1911,10 @@ impl Session {
         self.lifecycle_tracking_unavailable.as_deref()
     }
 
+    pub(crate) fn fork_tracking_unavailable(&self) -> Option<&str> {
+        self.fork_tracking_unavailable.as_deref()
+    }
+
     /// Lifetime successful static endpoints (2 per fully-attached slot).
     pub fn attached_probes(&self) -> usize {
         self.successful_static.len()
@@ -2141,6 +2203,27 @@ mod tests {
                 "live lifecycle tracking unavailable: tracefs not found".into()
             )
         );
+    }
+
+    #[test]
+    fn pid_event_capture_requires_sched_process_fork() {
+        let cgroup = Scope::Cgroup {
+            id: 1,
+            path: "/".into(),
+            dir: Arc::new(File::open("/").unwrap()),
+        };
+        for (scope, policy, expected) in [
+            (Scope::Pid(7), CapturePolicy::Allowlisted, true),
+            (
+                Scope::Pid(7),
+                CapturePolicy::UnsafeUnvalidatedMetadata,
+                true,
+            ),
+            (Scope::Pid(7), CapturePolicy::AggregateOnly, false),
+            (cgroup, CapturePolicy::Allowlisted, true),
+        ] {
+            assert_eq!(fork_capture_enabled(&scope, policy), expected);
+        }
     }
 
     #[test]

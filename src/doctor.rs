@@ -1,18 +1,18 @@
 //! `p11scope doctor`: host and target capability probes with a verdict (spec §4.6).
 //! Tells an operator *before* a capture attempt which lanes this host and this
 //! target support, and what to change when one does not. `probe` runs the real
-//! checks (I/O, one throwaway BPF load+attach); `render` and `verdict` are pure
+//! checks (I/O, temporary BPF loads and attaches); `render` and `verdict` are pure
 //! functions over the resulting rows, so the table layout and exit-code logic
 //! are both testable without any of the probes running.
 //!
 //! No BPF program stays loaded after `doctor` returns: `bpf_checks` owns the
-//! `Ebpf` handle locally and it drops at the end of that function, well before
-//! `probe`'s caller ever renders a line.
+//! probe handles are locally owned and drop before `probe` returns.
 
 use anyhow::Result;
 use aya::Ebpf;
-use aya::programs::UProbe;
 use aya::programs::uprobe::{UProbeAttachLocation, UProbeAttachPoint, UProbeScope};
+use aya::programs::{ProgramError, UProbe};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -30,11 +30,112 @@ pub struct Check {
     pub status: Status,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapabilityTier {
+    T0,
+    T1,
+    T2,
+    T3,
+    T4,
+}
+
+impl CapabilityTier {
+    fn label(self) -> &'static str {
+        match self {
+            Self::T0 => "T0 offline",
+            Self::T1 => "T1 host attach",
+            Self::T2 => "T2 target readable",
+            Self::T3 => "T3 lifecycle",
+            Self::T4 => "T4 current full",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CapabilityTierInput {
+    host_attach: bool,
+    target_readable: Option<bool>,
+    lifecycle: bool,
+    scope: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CapabilityTierResult {
+    tier: CapabilityTier,
+    target_assessed: bool,
+}
+
+fn classify_capability_tier(input: CapabilityTierInput) -> CapabilityTierResult {
+    let tier = if !input.host_attach {
+        CapabilityTier::T0
+    } else if input.target_readable != Some(true) {
+        CapabilityTier::T1
+    } else if !input.lifecycle {
+        CapabilityTier::T2
+    } else if !input.scope {
+        CapabilityTier::T3
+    } else {
+        CapabilityTier::T4
+    };
+    CapabilityTierResult {
+        tier,
+        target_assessed: input.target_readable.is_some(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpermOrigin {
+    Unknown,
+    Seccomp,
+    Capability,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct EpermEvidence {
+    pub errno: Option<i32>,
+    pub seccomp_mode: Option<u32>,
+    pub controlled_seccomp_denial: bool,
+    pub missing_required_capability: bool,
+}
+
+pub fn classify_eperm_origin(evidence: EpermEvidence) -> EpermOrigin {
+    let _diagnostic_context_only = evidence.seccomp_mode;
+    if evidence.errno != Some(libc::EPERM) {
+        return EpermOrigin::Unknown;
+    }
+    match (
+        evidence.controlled_seccomp_denial,
+        evidence.missing_required_capability,
+    ) {
+        (true, false) => EpermOrigin::Seccomp,
+        (false, true) => EpermOrigin::Capability,
+        _ => EpermOrigin::Unknown,
+    }
+}
+
+fn bounded_verifier_diagnostic(verifier_text: &str) -> String {
+    const MAX_BYTES: usize = 4096;
+    const PREFIX: &str = "verifier: ";
+    const SUFFIX: &str = " [truncated]";
+
+    let escaped = crate::render::escape_controls(verifier_text);
+    if escaped.is_empty() {
+        return "verifier rejected the embedded program".to_string();
+    }
+    if PREFIX.len() + escaped.len() <= MAX_BYTES {
+        return format!("{PREFIX}{escaped}");
+    }
+    let mut end = MAX_BYTES - PREFIX.len() - SUFFIX.len();
+    while !escaped.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{PREFIX}{}{SUFFIX}", &escaped[..end])
+}
+
 const KERNEL_FLOOR: (u32, u32) = (5, 15);
-/// (bit, name) — CAP_SYS_PTRACE, CAP_SYS_ADMIN, CAP_PERFMON, CAP_BPF,
-/// CAP_CHECKPOINT_RESTORE. Bit numbers are from the task brief, decoded from
-/// `CapEff` in `/proc/self/status`.
-const CAP_BITS: [(u32, &str); 5] = [
+/// Named diagnostic bits decoded from `CapEff` in `/proc/self/status`.
+const CAP_BITS: [(u32, &str); 6] = [
+    (2, "CAP_DAC_READ_SEARCH"),
     (19, "CAP_SYS_PTRACE"),
     (21, "CAP_SYS_ADMIN"),
     (38, "CAP_PERFMON"),
@@ -65,10 +166,16 @@ pub fn probe(pid: Option<u32>, cgroup: Option<&Path>) -> Vec<Check> {
         capabilities_check(),
     ];
     checks.extend(bpf_checks());
+    let attach_preflight = attach_preflight_checks(pid, cgroup);
     let capture_lane = !checks
         .iter()
+        .chain(attach_preflight.iter())
         .any(|c| is_capture_row(&c.name) && matches!(c.status, Status::Fail(_)));
     checks.extend(live_discovery_checks(pid, capture_lane));
+    checks.push(match pid {
+        Some(pid) => target_readability_check(pid),
+        None => not_applicable("target readability", "no --pid"),
+    });
     checks.push(match pid {
         Some(pid) => proc_maps_check(pid),
         None => not_applicable("/proc/<pid>/maps", "no --pid"),
@@ -81,7 +188,62 @@ pub fn probe(pid: Option<u32>, cgroup: Option<&Path>) -> Vec<Check> {
         Some(cgroup) => cgroup_check(cgroup),
         None => not_applicable("cgroup path", "no --cgroup"),
     });
+    checks.extend(attach_preflight);
     checks
+}
+
+fn attach_preflight_checks(pid: Option<u32>, cgroup: Option<&Path>) -> Vec<Check> {
+    let self_pid = std::process::id();
+    let host = crate::attach::Session::preflight(&crate::attach::Scope::Pid(self_pid));
+    let lifecycle = host.as_ref().is_ok_and(|fact| fact.lifecycle);
+    let host_scope = host.as_ref().is_ok_and(|fact| fact.scope);
+    let host_check = match host {
+        Ok(_) => Check {
+            name: "host program preflight".into(),
+            status: Status::Ok("available".into()),
+        },
+        Err(error) => Check {
+            name: "host program preflight".into(),
+            status: Status::Fail(format_preflight_error(error.as_ref())),
+        },
+    };
+    let status = |available| {
+        if available {
+            Status::Ok("available".into())
+        } else {
+            Status::Warn("unavailable".into())
+        }
+    };
+    let scope = match (pid, cgroup) {
+        (None, None) => not_applicable("scope preflight", "no requested scope"),
+        (pid, cgroup) => {
+            let pid_scope = pid.map_or(true, |pid| {
+                if pid == self_pid {
+                    host_scope
+                } else {
+                    crate::attach::Session::preflight(&crate::attach::Scope::Pid(pid))
+                        .is_ok_and(|fact| fact.scope)
+                }
+            });
+            let cgroup_scope = cgroup.is_none_or(|path| {
+                crate::scope::cgroup(path)
+                    .and_then(|scope| crate::attach::Session::preflight(&scope))
+                    .is_ok_and(|fact| fact.scope)
+            });
+            Check {
+                name: "scope preflight".into(),
+                status: status(pid_scope && cgroup_scope),
+            }
+        }
+    };
+    vec![
+        host_check,
+        Check {
+            name: "lifecycle preflight".into(),
+            status: status(lifecycle),
+        },
+        scope,
+    ]
 }
 
 fn not_applicable(name: &str, reason: &str) -> Check {
@@ -200,6 +362,69 @@ fn read_cap_eff() -> Result<u64, String> {
     u64::from_str_radix(hex.trim(), 16).map_err(|e| format!("CapEff {hex:?}: {e}"))
 }
 
+fn raw_errno(mut error: &(dyn std::error::Error + 'static)) -> Option<i32> {
+    loop {
+        if let Some(error) = error.downcast_ref::<std::io::Error>()
+            && error.raw_os_error().is_some()
+        {
+            return error.raw_os_error();
+        }
+        error = error.source()?;
+    }
+}
+
+fn bounded_error_detail(error: &(dyn std::error::Error + 'static)) -> String {
+    const MAX_BYTES: usize = 512;
+    let message = error.to_string();
+    let escaped = crate::render::escape_controls(&message);
+    if escaped.len() <= MAX_BYTES {
+        return escaped.into_owned();
+    }
+    let mut end = MAX_BYTES;
+    while !escaped.is_char_boundary(end) {
+        end -= 1;
+    }
+    escaped[..end].to_string()
+}
+
+fn format_preflight_error(mut error: &(dyn std::error::Error + 'static)) -> String {
+    loop {
+        if let Some(ProgramError::LoadError { verifier_log, .. }) =
+            error.downcast_ref::<ProgramError>()
+        {
+            return bounded_verifier_diagnostic(&verifier_log.to_string());
+        }
+        let Some(source) = error.source() else {
+            return bounded_error_detail(error);
+        };
+        error = source;
+    }
+}
+
+fn format_operation_error_with(
+    error: &(dyn std::error::Error + 'static),
+    seccomp_mode: Option<u32>,
+    controlled_seccomp_denial: bool,
+    missing_required_capability: bool,
+) -> String {
+    let origin = classify_eperm_origin(EpermEvidence {
+        errno: raw_errno(error),
+        seccomp_mode,
+        controlled_seccomp_denial,
+        missing_required_capability,
+    });
+    let label = match origin {
+        EpermOrigin::Unknown => "",
+        EpermOrigin::Seccomp => " (origin: controlled seccomp denial)",
+        EpermOrigin::Capability => " (origin: missing required capability)",
+    };
+    format!("{}{label}", bounded_error_detail(error))
+}
+
+fn format_operation_error(error: &(dyn std::error::Error + 'static)) -> String {
+    format_operation_error_with(error, None, false, false)
+}
+
 fn capabilities_check() -> Check {
     // A read/parse failure is reported, never coerced into "(none)" — an
     // unmeasured mask must not read the same as a genuinely empty one.
@@ -237,7 +462,11 @@ fn bpf_checks() -> Vec<Check> {
         Err(e) => vec![
             Check {
                 name: "BPF map create".to_string(),
-                status: Status::Fail(format!("{e} — {}", crate::attach::UNSUPPORTED_ENV_HINT)),
+                status: Status::Fail(format!(
+                    "{} — {}",
+                    format_operation_error(&e),
+                    crate::attach::UNSUPPORTED_ENV_HINT
+                )),
             },
             Check {
                 name: "uprobe attach (own libc)".to_string(),
@@ -275,18 +504,28 @@ fn attach_self_probe(ebpf: &mut Ebpf) -> Result<(), String> {
         .ok_or_else(|| "program p11_entry missing from the BPF object".to_string())?
         .try_into()
         .map_err(|e: aya::programs::ProgramError| e.to_string())?;
-    prog.load().map_err(|e| {
-        format!(
-            "loading p11_entry: {e} — {}",
+    prog.load().map_err(|error| match error {
+        ProgramError::LoadError { verifier_log, .. } => {
+            bounded_verifier_diagnostic(&verifier_log.to_string())
+        }
+        error => format!(
+            "loading p11_entry: {} — {}",
+            format_operation_error(&error),
             crate::attach::UNSUPPORTED_ENV_HINT
-        )
+        ),
     })?;
     let point = UProbeAttachPoint {
         location: UProbeAttachLocation::AbsoluteOffset(offset),
         cookie: None,
     };
     prog.attach(point, &libc_path, UProbeScope::CallingProcess)
-        .map_err(|e| format!("{e} — {}", crate::attach::UNSUPPORTED_ENV_HINT))?;
+        .map_err(|e| {
+            format!(
+                "{} — {}",
+                format_operation_error(&e),
+                crate::attach::UNSUPPORTED_ENV_HINT
+            )
+        })?;
     Ok(())
 }
 
@@ -410,6 +649,120 @@ fn own_libc_path() -> Result<PathBuf, String> {
         .ok_or_else(|| "no executable libc.so mapping in /proc/self/maps".to_string())
 }
 
+/// Pure seam for the five independent facts behind `R`. Capability bits and
+/// path spellings are intentionally absent: every fact is an observed target
+/// operation against one retained process generation.
+pub fn target_readability_proven<E>(
+    operations: impl IntoIterator<Item = std::result::Result<(), E>>,
+) -> bool {
+    operations.into_iter().all(|result| result.is_ok())
+}
+
+fn assess_target_readability(pid: u32) -> Result<usize, &'static str> {
+    use p11scope_manifest::maps::{MapIndex, MappedPath, ObjectKey, Resolved};
+
+    let view = crate::process::ProcessView::open(crate::process::ProcessViewId(0), pid)
+        .map_err(|_| "generation unavailable")?;
+    let root = format!("/proc/{pid}/root");
+    let maps_opened = view
+        .run_while_same(|| std::fs::read(format!("/proc/{pid}/maps")))
+        .map_err(|_| "generation changed")
+        .and_then(|result| result.map_err(|_| "maps unavailable"));
+    let maps = maps_opened.as_ref().map_err(|reason| *reason)?;
+    let entries = p11scope_manifest::maps::parse_maps(maps).map_err(|_| "maps invalid")?;
+    let index = MapIndex::new(&entries).ok_or("maps invalid")?;
+    let mem_opened = view
+        .run_while_same(|| std::fs::File::open(format!("/proc/{pid}/mem")))
+        .map_err(|_| "generation changed")
+        .and_then(|result| result.map_err(|_| "mem unavailable"));
+    let _mem = mem_opened.as_ref().map_err(|reason| *reason)?;
+    let root_opened = view
+        .run_while_same(|| std::fs::File::open(&root))
+        .map_err(|_| "generation changed")
+        .and_then(|result| result.map_err(|_| "root unavailable"));
+    let _root = root_opened.as_ref().map_err(|reason| *reason)?;
+
+    let mut executable_objects = BTreeMap::<ObjectKey, PathBuf>::new();
+    for entry in index
+        .entries()
+        .iter()
+        .filter(|entry| entry.permissions[2] == b'x' && entry.inode != 0)
+    {
+        match index.resolve(entry.start) {
+            Resolved::File {
+                path: MappedPath::Usable(path),
+                device,
+                inode,
+                ..
+            } => {
+                executable_objects
+                    .entry(ObjectKey { device, inode })
+                    .or_insert(path);
+            }
+            Resolved::File { .. } | Resolved::Anonymous | Resolved::Unmapped => {
+                return Err("executable identity unavailable");
+            }
+        }
+    }
+
+    let hooks = crate::discovery::hooks::HookRegistry::builtin();
+    let wanted = hooks.names();
+    let provider_identities_opened = (|| {
+        let mut providers = 0usize;
+        for (expected, path) in executable_objects {
+            let target_path = Path::new(&root).join(
+                path.strip_prefix("/")
+                    .map_err(|_| "executable identity unavailable")?,
+            );
+            let (file, actual) = crate::discovery::identity::open_view_object(&view, &target_path)
+                .map_err(|_| "executable identity unavailable")?;
+            if actual != expected {
+                return Err("executable identity mismatch");
+            }
+            if !p11scope_manifest::elf::exports_matching(&file, &wanted)
+                .map_err(|_| "executable identity unreadable")?
+                .is_empty()
+            {
+                providers += 1;
+            }
+        }
+        Ok(providers)
+    })();
+    let providers = *provider_identities_opened
+        .as_ref()
+        .map_err(|reason| *reason)?;
+    let generation_stable = view
+        .still_the_same()
+        .then_some(())
+        .ok_or("generation changed");
+    if !target_readability_proven([
+        generation_stable.as_ref().map(|_| ()).map_err(|_| ()),
+        maps_opened.as_ref().map(|_| ()).map_err(|_| ()),
+        mem_opened.as_ref().map(|_| ()).map_err(|_| ()),
+        root_opened.as_ref().map(|_| ()).map_err(|_| ()),
+        provider_identities_opened
+            .as_ref()
+            .map(|_| ())
+            .map_err(|_| ()),
+    ]) {
+        return Err("generation changed");
+    }
+    Ok(providers)
+}
+
+fn target_readability_check(pid: u32) -> Check {
+    let status = match assess_target_readability(pid) {
+        Ok(providers) => Status::Ok(format!(
+            "stable generation; maps/mem/root and {providers} provider identities opened"
+        )),
+        Err(reason) => Status::Fail(reason.to_string()),
+    };
+    Check {
+        name: "target readability".to_string(),
+        status,
+    }
+}
+
 fn short_errno(error: &std::io::Error) -> String {
     match error.raw_os_error() {
         Some(libc::EACCES) => "EACCES".to_string(),
@@ -481,11 +834,17 @@ fn status_detail(status: &Status) -> &str {
 }
 
 fn is_capture_row(name: &str) -> bool {
-    name == "BPF map create" || name.starts_with("uprobe attach")
+    name == "BPF map create"
+        || name == "host program preflight"
+        || name.starts_with("uprobe attach")
 }
 
 fn is_scan_row(name: &str) -> bool {
     name.starts_with("/proc/") && name.ends_with("/mem")
+}
+
+fn is_target_row(name: &str) -> bool {
+    name == "target readability"
 }
 
 fn is_cgroup_row(name: &str) -> bool {
@@ -505,6 +864,44 @@ fn scan_pid_suffix(name: &str) -> String {
         .and_then(|rest| rest.strip_suffix("/mem"))
         .map(|pid| format!(" for pid {pid}"))
         .unwrap_or_default()
+}
+
+fn capability_tier(checks: &[Check]) -> CapabilityTierResult {
+    let row_ok = |name: &str| {
+        checks
+            .iter()
+            .find(|check| check.name == name)
+            .is_some_and(|check| matches!(check.status, Status::Ok(_)))
+    };
+    let target_readable = checks
+        .iter()
+        .find(|check| check.name == "target readability")
+        .and_then(|check| match &check.status {
+            Status::Ok(_) => Some(true),
+            Status::Fail(_) | Status::Warn(_) => Some(false),
+            Status::NotApplicable(_) => None,
+        });
+    classify_capability_tier(CapabilityTierInput {
+        host_attach: row_ok("kernel release")
+            && row_ok("BPF map create")
+            && row_ok("uprobe attach (own libc)")
+            && row_ok("host program preflight"),
+        target_readable,
+        lifecycle: row_ok("lifecycle preflight"),
+        scope: row_ok("scope preflight"),
+    })
+}
+
+fn capability_tier_line(capability: CapabilityTierResult) -> String {
+    format!(
+        "capability tier: {} (target {})",
+        capability.tier.label(),
+        if capability.target_assessed {
+            "assessed"
+        } else {
+            "unassessed"
+        }
+    )
 }
 
 fn verdict_line(checks: &[Check]) -> String {
@@ -528,6 +925,13 @@ fn verdict_line(checks: &[Check]) -> String {
                 scan_pid_suffix(&check.name)
             )),
             _ => parts.push("memory scan available".to_string()),
+        }
+    }
+    if let Some(check) = checks.iter().find(|c| is_target_row(&c.name)) {
+        match &check.status {
+            Status::NotApplicable(_) => {}
+            Status::Fail(detail) => parts.push(format!("target unavailable ({detail})")),
+            _ => parts.push("target available".to_string()),
         }
     }
     if let Some(check) = checks.iter().find(|c| is_cgroup_row(&c.name)) {
@@ -557,6 +961,7 @@ pub fn render(checks: &[Check]) -> String {
         }
         out.push('\n');
     }
+    let _ = writeln!(out, "{}", capability_tier_line(capability_tier(checks)));
     let _ = write!(out, "{}", verdict_line(checks));
     out
 }
@@ -569,6 +974,7 @@ pub fn render(checks: &[Check]) -> String {
 pub fn verdict(checks: &[Check]) -> i32 {
     let gated = checks.iter().any(|c| {
         (is_capture_row(&c.name)
+            || is_target_row(&c.name)
             || is_scan_row(&c.name)
             || is_cgroup_row(&c.name)
             || is_run_capture_row(&c.name))
@@ -635,15 +1041,266 @@ mod tests {
             status: Status::Fail("EPERM".into()),
         }];
         assert_eq!(verdict(&fail), 1);
+
+        let target = vec![Check {
+            name: "target readability".into(),
+            status: Status::Fail("provider identity unavailable".into()),
+        }];
+        assert_eq!(verdict(&target), 1);
+        assert_eq!(
+            verdict_line(&target),
+            "verdict: capture available; target unavailable (provider identity unavailable)"
+        );
     }
 
     #[test]
-    fn decode_caps_reads_the_five_named_bits_alphabetically() {
-        let mask = (1u64 << 19) | (1u64 << 39); // CAP_SYS_PTRACE, CAP_BPF
-        assert_eq!(decode_caps(mask), vec!["CAP_BPF", "CAP_SYS_PTRACE"]);
+    fn capability_tier_is_monotonic_without_lease_authority() {
+        let expected =
+            |host_attach: bool, target_readable: Option<bool>, lifecycle: bool, scope: bool| {
+                if !host_attach {
+                    CapabilityTier::T0
+                } else if target_readable != Some(true) {
+                    CapabilityTier::T1
+                } else if !lifecycle {
+                    CapabilityTier::T2
+                } else if !scope {
+                    CapabilityTier::T3
+                } else {
+                    CapabilityTier::T4
+                }
+            };
+        for host_attach in [false, true] {
+            for target_readable in [None, Some(false), Some(true)] {
+                for lifecycle in [false, true] {
+                    for scope in [false, true] {
+                        // Deliberately exhaustive: classifier authority is only
+                        // H/R/L/S, with no lease, trust, uid, or root predicate.
+                        let input = CapabilityTierInput {
+                            host_attach,
+                            target_readable,
+                            lifecycle,
+                            scope,
+                        };
+                        let result = classify_capability_tier(input);
+                        assert_eq!(
+                            result.tier,
+                            expected(host_attach, target_readable, lifecycle, scope),
+                            "{input:?}"
+                        );
+                        assert_eq!(result.target_assessed, target_readable.is_some());
+                    }
+                }
+            }
+        }
+
+        let mask = (1u64 << 2) | (1u64 << 19) | (1u64 << 39);
+        assert_eq!(
+            decode_caps(mask),
+            vec!["CAP_BPF", "CAP_DAC_READ_SEARCH", "CAP_SYS_PTRACE"]
+        );
+        assert!(CAP_BITS.contains(&(2, "CAP_DAC_READ_SEARCH")));
+        assert!(!CAP_BITS.iter().any(|(_, name)| *name == "CAP_SYS_RESOURCE"));
         assert!(decode_caps(0).is_empty());
-        // A bit outside the five named ones must not appear.
+        // A bit outside the named set must not appear.
         assert!(decode_caps(1u64 << 12).is_empty());
+
+        for (tier, label) in [
+            (CapabilityTier::T0, "T0 offline"),
+            (CapabilityTier::T1, "T1 host attach"),
+            (CapabilityTier::T2, "T2 target readable"),
+            (CapabilityTier::T3, "T3 lifecycle"),
+            (CapabilityTier::T4, "T4 current full"),
+        ] {
+            for (target_assessed, assessment) in [(false, "unassessed"), (true, "assessed")] {
+                assert_eq!(
+                    capability_tier_line(CapabilityTierResult {
+                        tier,
+                        target_assessed,
+                    }),
+                    format!("capability tier: {label} (target {assessment})")
+                );
+            }
+        }
+
+        let mut operational = vec![
+            Check {
+                name: "kernel release".into(),
+                status: Status::Ok(String::new()),
+            },
+            Check {
+                name: "BPF map create".into(),
+                status: Status::Ok(String::new()),
+            },
+            Check {
+                name: "uprobe attach (own libc)".into(),
+                status: Status::Ok(String::new()),
+            },
+            Check {
+                name: "host program preflight".into(),
+                status: Status::Ok("available".into()),
+            },
+            Check {
+                name: "target readability".into(),
+                status: Status::Ok(String::new()),
+            },
+            Check {
+                name: "lifecycle preflight".into(),
+                status: Status::Ok("available".into()),
+            },
+            Check {
+                name: "scope preflight".into(),
+                status: Status::Warn("unavailable".into()),
+            },
+        ];
+        assert_eq!(capability_tier(&operational).tier, CapabilityTier::T3);
+        assert_eq!(
+            render(&operational)
+                .lines()
+                .find(|line| line.starts_with("capability tier:")),
+            Some("capability tier: T3 lifecycle (target assessed)")
+        );
+        operational.last_mut().unwrap().status = Status::Ok("available".into());
+        assert_eq!(capability_tier(&operational).tier, CapabilityTier::T4);
+        assert_eq!(
+            render(&operational)
+                .lines()
+                .find(|line| line.starts_with("capability tier:")),
+            Some("capability tier: T4 current full (target assessed)")
+        );
+    }
+
+    #[test]
+    fn host_lifecycle_survives_requested_scope_failure() {
+        let checks = vec![
+            Check {
+                name: "kernel release".into(),
+                status: Status::Ok(String::new()),
+            },
+            Check {
+                name: "BPF map create".into(),
+                status: Status::Ok(String::new()),
+            },
+            Check {
+                name: "uprobe attach (own libc)".into(),
+                status: Status::Ok(String::new()),
+            },
+            Check {
+                name: "host program preflight".into(),
+                status: Status::Ok("available".into()),
+            },
+            Check {
+                name: "target readability".into(),
+                status: Status::Ok(String::new()),
+            },
+            Check {
+                name: "lifecycle preflight".into(),
+                status: Status::Ok("available".into()),
+            },
+            Check {
+                name: "scope preflight".into(),
+                status: Status::Warn("unavailable".into()),
+            },
+        ];
+        assert_eq!(capability_tier(&checks).tier, CapabilityTier::T3);
+    }
+
+    #[test]
+    fn eperm_origin_requires_independent_evidence() {
+        let evidence =
+            |seccomp_mode, controlled_seccomp_denial, missing_required_capability| EpermEvidence {
+                errno: Some(libc::EPERM),
+                seccomp_mode,
+                controlled_seccomp_denial,
+                missing_required_capability,
+            };
+        assert_eq!(
+            classify_eperm_origin(evidence(None, false, false)),
+            EpermOrigin::Unknown
+        );
+        assert_eq!(
+            classify_eperm_origin(evidence(Some(2), false, false)),
+            EpermOrigin::Unknown,
+            "seccomp mode alone is diagnostic context, not causal proof"
+        );
+        assert_eq!(
+            classify_eperm_origin(evidence(Some(2), true, false)),
+            EpermOrigin::Seccomp
+        );
+        assert_eq!(
+            classify_eperm_origin(evidence(None, false, true)),
+            EpermOrigin::Capability
+        );
+        assert_eq!(
+            classify_eperm_origin(evidence(Some(2), true, true)),
+            EpermOrigin::Unknown,
+            "conflicting independent facts must not guess a cause"
+        );
+
+        let denied = std::io::Error::from_raw_os_error(libc::EPERM);
+        let rendered = |mode, controlled, capability| {
+            format_operation_error_with(&denied, mode, controlled, capability)
+        };
+        assert!(!rendered(None, false, false).contains("origin:"));
+        assert!(
+            !rendered(Some(2), false, false).contains("origin:"),
+            "seccomp mode alone must not reach the production label"
+        );
+        assert!(rendered(None, false, true).contains("missing required capability"));
+        assert!(
+            !format_operation_error(&denied).contains("origin:"),
+            "production callers must not infer an EPERM origin from CapEff"
+        );
+        assert!(rendered(Some(2), true, false).contains("controlled seccomp denial"));
+        let non_eperm = format_operation_error_with(
+            &std::io::Error::from_raw_os_error(libc::EIO),
+            Some(2),
+            true,
+            false,
+        );
+        assert!(non_eperm.contains("Input/output error"), "{non_eperm}");
+        assert!(
+            !non_eperm.contains("origin:"),
+            "non-EPERM errors remain useful without a causal label"
+        );
+    }
+
+    #[test]
+    fn verifier_diagnostics_are_bounded() {
+        let only_verifier_text: fn(&str) -> String = bounded_verifier_diagnostic;
+        let escaped = only_verifier_text("verifier\u{1b}[2J\rdenied");
+        assert_eq!(escaped, r"verifier: verifier\u{1b}[2J\rdenied");
+
+        let diagnostic = bounded_verifier_diagnostic(&"é".repeat(4096));
+        assert_eq!(
+            diagnostic.len(),
+            4096,
+            "complete fragment must fill its cap"
+        );
+        assert!(diagnostic.ends_with(" [truncated]"), "{diagnostic:?}");
+        assert!(std::str::from_utf8(diagnostic.as_bytes()).is_ok());
+        assert!(!diagnostic.contains('\u{fffd}'), "a UTF-8 scalar was split");
+    }
+
+    #[test]
+    fn wrapped_program_load_error_surfaces_only_the_bounded_verifier_log() {
+        let error = ProgramError::LoadError {
+            io_error: std::io::Error::from_raw_os_error(libc::EPERM),
+            verifier_log: aya_obj::VerifierLog::new("denied\u{1b}[2J".to_string()),
+        };
+        let wrapped = anyhow::Error::new(error).context("forbidden /proc/target/path");
+        let rendered = format_preflight_error(wrapped.as_ref());
+        assert_eq!(rendered, r"verifier: denied\u{1b}[2J");
+        assert!(!rendered.contains("/proc/target/path"));
+        assert!(!rendered.contains("Operation not permitted"));
+
+        let long = ProgramError::LoadError {
+            io_error: std::io::Error::from_raw_os_error(libc::EPERM),
+            verifier_log: aya_obj::VerifierLog::new("é".repeat(4096)),
+        };
+        let rendered = format_preflight_error(anyhow::Error::new(long).as_ref());
+        assert_eq!(rendered.len(), 4096);
+        assert!(rendered.ends_with(" [truncated]"));
+        assert!(std::str::from_utf8(rendered.as_bytes()).is_ok());
     }
 
     #[test]
@@ -659,8 +1316,8 @@ mod tests {
     #[test]
     fn probe_marks_unrequested_lanes_not_applicable_and_never_fails_them() {
         let checks = probe(None, None);
-        // 11 host/target rows plus the eight §10.1 live-discovery rows.
-        assert_eq!(checks.len(), 19, "{checks:?}");
+        // 12 host/target rows, eight §10.1 rows, and three finite preflight rows.
+        assert_eq!(checks.len(), 23, "{checks:?}");
         let by_name = |name: &str| checks.iter().find(|c| c.name == name).unwrap();
         assert_eq!(
             by_name("/proc/<pid>/maps").status,
@@ -673,6 +1330,10 @@ mod tests {
         assert_eq!(
             by_name("cgroup path").status,
             Status::NotApplicable("no --cgroup".into())
+        );
+        assert_eq!(
+            by_name("target readability").status,
+            Status::NotApplicable("no --pid".into())
         );
         // Unprivileged CI legitimately fails the BPF rows (no CAP_BPF): that
         // is real host state, not asserted here. What's invariant is that no

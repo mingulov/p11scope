@@ -152,3 +152,18 @@ fn proc_root_path_opens_the_same_inode_the_mapping_names() {
         "mountinfo-derived device must match the mapping's device"
     );
 }
+
+#[test]
+fn capability_tier_target_readability_requires_generation_root_and_provider_identity() {
+    use p11scope::doctor::target_readability_proven;
+
+    assert!(target_readability_proven([Ok::<(), ()>(()); 5]));
+    for missing in 0..5 {
+        let mut operations = [Ok(()); 5];
+        operations[missing] = Err(());
+        assert!(
+            !target_readability_proven(operations),
+            "fallible operation {missing} was not required"
+        );
+    }
+}

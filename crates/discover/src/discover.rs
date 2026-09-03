@@ -1862,6 +1862,50 @@ mod tests {
     }
 
     #[test]
+    fn selection_inventory_matches_are_bounded_at_sixteen() {
+        let surfaces = (0..17)
+            .map(|_| surface_with(Vec::new()))
+            .collect::<Vec<_>>();
+        let evidence_for = |count| {
+            selection_records(
+                (
+                    SelectionAcquisition::Queried,
+                    vec![RawSelectionQuery {
+                        selector: 0,
+                        request: selection_request(0, 0),
+                        rv: 0,
+                        result: Some(RawSelectionResult {
+                            name: SelectionNameClass::ExactStandard,
+                            version: SelectionVersionClass::V3_0,
+                            flags: 0,
+                            table: None,
+                            inventory_matches: (0..count).collect(),
+                        }),
+                        helper_failure: None,
+                    }],
+                ),
+                &surfaces,
+            )
+        };
+
+        let boundary = evidence_for(16);
+        assert_eq!(boundary.queries[0].inventory_matches.len(), 16);
+        assert!(!boundary.selection_truncated);
+
+        let evidence = evidence_for(17);
+
+        assert_eq!(
+            evidence.queries[0]
+                .inventory_matches
+                .iter()
+                .map(|matched| matched.surface)
+                .collect::<Vec<_>>(),
+            (0..16).collect::<Vec<_>>()
+        );
+        assert!(evidence.selection_truncated);
+    }
+
+    #[test]
     fn alias_groups_require_two_distinct_names() {
         let surfaces = vec![
             surface_with(vec![resolved("C_Sign", 0x10)]),

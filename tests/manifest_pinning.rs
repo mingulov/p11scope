@@ -189,6 +189,23 @@ fn queried_selection_matrix() -> SelectionEvidence {
     }
 }
 
+fn canonical_selection_table(id: u8) -> SelectionTable {
+    SelectionTable {
+        id,
+        version: Version { major: 3, minor: 0 },
+        walk: WalkOutcome::Full,
+        functions: pkcs11_module::FUNCTION_LIST_FIELDS
+            .iter()
+            .chain(pkcs11_module::FUNCTION_LIST_3_0_EXTRA_FIELDS.iter())
+            .map(|field| FunctionRecord {
+                name: field.name.into(),
+                resolution: Resolution::NullPointer,
+            })
+            .collect(),
+        semantic_authorized: false,
+    }
+}
+
 #[test]
 fn manifest_v5_selection_matrix_is_exact() {
     let path = Path::new("/bin/true");
@@ -222,31 +239,96 @@ fn emitted_selection_fixtures_validate_as_v5_manifests() {
 #[test]
 fn selection_agreement_requires_readable_fields() {
     let path = Path::new("/bin/true");
-    let mut manifest = manifest_for(path);
-    manifest.schema = "p11scope-manifest/5".into();
-    manifest.selection_evidence = queried_selection_matrix();
-    manifest.selection_evidence.queries[0].rv = 0;
-    manifest.selection_evidence.queries[0].result = Some(SelectionResult {
-        name: SelectionNameClass::Unreadable,
+    let mut base = manifest_for(path);
+    base.schema = "p11scope-manifest/5".into();
+    base.interface_list = Acquisition::Ok;
+    let mut interface = base.surfaces[0].clone();
+    interface.source = SurfaceSource::Interface {
+        index: 0,
+        raw_name_hex: Some("504b4353203131".into()),
+        name_lossy: Some("PKCS 11".into()),
+        name_error: None,
+        flags: 0,
+        classification: InterfaceClassification::ExactStandard,
+    };
+    interface.acquisition = Acquisition::Ok;
+    interface.version = Some(Version { major: 3, minor: 0 });
+    interface.walk = WalkOutcome::Full;
+    interface.functions = canonical_selection_table(0).functions;
+    base.surfaces.push(interface);
+    base.selection_evidence = queried_selection_matrix();
+    let query = &mut base.selection_evidence.queries[0];
+    query.rv = 0;
+    query.result = Some(SelectionResult {
+        name: SelectionNameClass::ExactStandard,
         version: SelectionVersionClass::V3_0,
         flags: 0,
     });
-    manifest.selection_evidence.queries[0].inventory_matches = vec![SelectionInventoryMatch {
-        surface: 0,
+    query.inventory_matches = vec![SelectionInventoryMatch {
+        surface: 1,
         name_agrees: true,
-        version_agrees: false,
+        version_agrees: true,
     }];
+    query.authority = SelectionAuthority::Inventory;
+    let problems = p11scope::manifest_input::validate_structure(&base);
     assert!(
-        p11scope::manifest_input::validate_structure(&manifest)
-            .iter()
-            .any(|problem| problem.contains("agreement")),
-        "v5 agreement must be false for an unreadable result field"
+        problems.is_empty(),
+        "the readable agreement fixture must be structurally valid: {problems:?}"
     );
+
+    for (name, version, field) in [
+        (
+            SelectionNameClass::Null,
+            SelectionVersionClass::V3_0,
+            "name agreement",
+        ),
+        (
+            SelectionNameClass::Unreadable,
+            SelectionVersionClass::V3_0,
+            "name agreement",
+        ),
+        (
+            SelectionNameClass::ExactStandard,
+            SelectionVersionClass::Null,
+            "version agreement",
+        ),
+        (
+            SelectionNameClass::ExactStandard,
+            SelectionVersionClass::Unreadable,
+            "version agreement",
+        ),
+    ] {
+        let mut manifest = base.clone();
+        let query = &mut manifest.selection_evidence.queries[0];
+        query.result = Some(SelectionResult {
+            name,
+            version,
+            flags: 0,
+        });
+        assert!(
+            p11scope::manifest_input::validate_structure(&manifest)
+                .iter()
+                .any(|problem| problem.contains(field)),
+            "{name:?}/{version:?} incorrectly allowed {field}"
+        );
+    }
 }
 
 #[test]
 fn selection_validation_rejects_review_mutations() {
     let path = Path::new("/bin/true");
+    let reference_table = |manifest: &mut Manifest, table_id| {
+        manifest.selection_evidence = queried_selection_matrix();
+        let query = &mut manifest.selection_evidence.queries[4];
+        query.rv = 0;
+        query.result = Some(SelectionResult {
+            name: SelectionNameClass::ExactStandard,
+            version: SelectionVersionClass::V3_0,
+            flags: 0,
+        });
+        query.selection_table = Some(table_id);
+        query.authority = SelectionAuthority::SelectionCountOnly;
+    };
 
     let mut unknown = serde_json::to_value(manifest_for(path)).unwrap();
     unknown["selection_evidence"]["unknown"] = serde_json::Value::Bool(true);
@@ -265,6 +347,38 @@ fn selection_validation_rejects_review_mutations() {
         p11scope::manifest_input::validate_structure(&bounds)
             .iter()
             .any(|problem| problem.contains("more than 16"))
+    );
+
+    let mut table_id = manifest_for(path);
+    reference_table(&mut table_id, 10);
+    table_id.selection_evidence.tables = vec![canonical_selection_table(10)];
+    assert!(
+        p11scope::manifest_input::validate_structure(&table_id)
+            .iter()
+            .any(|problem| problem.contains("id 10 is out of range"))
+    );
+
+    let mut table_count = manifest_for(path);
+    table_count.selection_evidence = queried_selection_matrix();
+    table_count.selection_evidence.tables = (0..10)
+        .chain(std::iter::once(9))
+        .map(canonical_selection_table)
+        .collect();
+    assert!(
+        p11scope::manifest_input::validate_structure(&table_count)
+            .iter()
+            .any(|problem| problem.contains("11 selection tables"))
+    );
+
+    let mut table_layout = manifest_for(path);
+    reference_table(&mut table_layout, 0);
+    let mut malformed_v3 = canonical_selection_table(0);
+    malformed_v3.functions.swap(0, 1);
+    table_layout.selection_evidence.tables = vec![malformed_v3];
+    assert!(
+        p11scope::manifest_input::validate_structure(&table_layout)
+            .iter()
+            .any(|problem| problem.contains("canonical function layout"))
     );
 
     let mut null_fields = manifest_for(path);
@@ -1434,7 +1548,7 @@ fn acquisition_evidence_cannot_be_omitted_or_invented() {
 }
 
 #[test]
-fn manifest_v4_requires_a_whole_file_provenance_closure() {
+fn manifest_v5_requires_a_whole_file_provenance_closure() {
     let d = tmpdir("manifest_pinning_missing_provenance_closure");
     let so = cc_so(&d, "missing-closure", "int f(void){return 1;}\n");
     let mut manifest = manifest_for(&so);

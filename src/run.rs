@@ -2603,6 +2603,10 @@ fn evidence_for(
         discovery_read_failures,
         discovery_truncated,
         loader_discovery: facts.loader_discovery(),
+        interface_selection: facts.interface_selection().clone(),
+        attach_mechanisms: attach_mechanisms(session.attached_probes()),
+        pid_descendant_gaps: 0,
+        multi_rebuild_gaps: 0,
         // Design §5.7: a live-learned attach key is protected only inside a
         // confirmed pause owner's window. A nonzero debug-state hit counter is
         // what says a live window happened at all; the design forbids
@@ -2619,6 +2623,14 @@ fn evidence_for(
     };
     ev.verdict();
     ev
+}
+
+fn attach_mechanisms(attached_probes: usize) -> Vec<&'static str> {
+    if attached_probes == 0 {
+        Vec::new()
+    } else {
+        vec!["per-offset"]
+    }
 }
 
 /// `SystemTime` → an RFC3339-ish UTC timestamp, no `chrono` dependency.
@@ -3875,6 +3887,12 @@ mod tests {
     }
 
     #[test]
+    fn attach_mechanism_requires_a_successfully_owned_link() {
+        assert!(attach_mechanisms(0).is_empty());
+        assert_eq!(attach_mechanisms(2), ["per-offset"]);
+    }
+
+    #[test]
     fn signal_state_retains_first_identity_and_saturates_sigint_deliveries() {
         let state = SignalState::new();
         state.observe(libc::SIGTERM);
@@ -3951,13 +3969,13 @@ mod tests {
         std::fs::set_permissions(dir.path(), permissions).unwrap();
         let path = dir.path().join("observed.json");
         std::fs::write(&path, b"stale trailing bytes that must disappear").unwrap();
-        let j = serde_json::json!({"schema": "pkcs11-scope/observed-profile/v2", "evidence": {}});
+        let j = serde_json::json!({"schema": "pkcs11-scope/observed-profile/v3", "evidence": {}});
         let mut out = AtomicFile::create(&path).unwrap();
         write_json_report(out.file(), &j).expect("shutdown finalization must write the report");
         out.commit().unwrap();
         let parsed: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(parsed["schema"], "pkcs11-scope/observed-profile/v2");
+        assert_eq!(parsed["schema"], "pkcs11-scope/observed-profile/v3");
     }
 
     /// The unsafe policy is refused by `CapturePolicy::from_cli` on the parsed

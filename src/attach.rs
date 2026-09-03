@@ -810,6 +810,30 @@ impl DynamicAttachEvidence {
     }
 }
 
+fn record_dynamic_attach_with<S, T, E>(
+    state: &mut S,
+    evidence: &mut DynamicAttachEvidence,
+    attach: impl FnOnce(&mut S) -> std::result::Result<T, E>,
+) -> std::result::Result<T, E> {
+    evidence.record(attach(state))
+}
+
+fn attach_dynamic_export_with<S, T, E>(
+    state: &mut S,
+    evidence: &mut DynamicAttachEvidence,
+    mut attach: impl FnMut(&mut S, bool) -> std::result::Result<T, E>,
+    mut detach_return: impl FnMut(&mut S, T),
+) -> std::result::Result<(T, T), E> {
+    let return_id = record_dynamic_attach_with(state, evidence, |state| attach(state, true))?;
+    match record_dynamic_attach_with(state, evidence, |state| attach(state, false)) {
+        Ok(entry_id) => Ok((entry_id, return_id)),
+        Err(error) => {
+            detach_return(state, return_id);
+            Err(error)
+        }
+    }
+}
+
 /// Renders `e` and every `.source()` beneath it, joined by `: `. Several
 /// of aya's error variants (e.g. `ProgramError::SyscallError`) are
 /// `#[error(transparent)]`, so `{e}` alone prints only the outer
@@ -1453,10 +1477,9 @@ impl Session {
         let scope = UProbeScope::OneProcess(
             std::num::NonZeroU32::new(pid).ok_or(DynamicLoaderAttachFailure::InvalidPid)?,
         );
-        match self
-            .dynamic_attach_evidence
-            .record(probe.attach(point, &path, scope))
-        {
+        match record_dynamic_attach_with(probe, &mut self.dynamic_attach_evidence, |probe| {
+            probe.attach(point, &path, scope)
+        }) {
             Ok(id) => {
                 self.links.push(RegisteredLink::DynamicUProbe {
                     program,
@@ -1509,56 +1532,43 @@ impl Session {
         let scope = UProbeScope::OneProcess(
             std::num::NonZeroU32::new(pid).context("dynamic export PID must be non-zero")?,
         );
-        let return_id = {
-            let probe: &mut UProbe = self
-                .ebpf
-                .program_mut(return_program)
-                .with_context(|| format!("program {return_program} missing from object"))?
-                .try_into()?;
-            self.dynamic_attach_evidence
-                .record(probe.attach(point(), &path, scope))
-                .map_err(|error| {
+        let detach_failures = &mut self.detach_failures;
+        let (entry_id, return_id) = attach_dynamic_export_with(
+            &mut self.ebpf,
+            &mut self.dynamic_attach_evidence,
+            |ebpf, is_return| {
+                let program = if is_return {
+                    return_program
+                } else {
+                    entry_program
+                };
+                let probe: &mut UProbe = ebpf
+                    .program_mut(program)
+                    .with_context(|| format!("program {program} missing from object"))?
+                    .try_into()?;
+                probe.attach(point(), &path, scope).map_err(|error| {
                     anyhow!(
-                        "{return_program} at object {:?}+{file_offset:#x}: {}",
+                        "{program} at object {:?}+{file_offset:#x}: {}",
                         object,
                         error_chain(&error)
                     )
-                })?
-        };
-        let entry_id = {
-            let probe: &mut UProbe = self
-                .ebpf
-                .program_mut(entry_program)
-                .with_context(|| format!("program {entry_program} missing from object"))?
-                .try_into()?;
-            match self
-                .dynamic_attach_evidence
-                .record(probe.attach(point(), &path, scope))
-            {
-                Ok(id) => id,
-                Err(error) => {
-                    let message = format!(
-                        "{entry_program} at object {:?}+{file_offset:#x}: {}",
-                        object,
-                        error_chain(&error)
-                    );
-                    let probe: &mut UProbe = self
-                        .ebpf
-                        .program_mut(return_program)
-                        .with_context(|| {
-                            format!("program {return_program} missing during partial detach")
-                        })?
-                        .try_into()?;
-                    if let Err(error) = probe.detach(return_id) {
-                        self.detach_failures.push(format!(
-                            "detaching partial {return_program}: {}",
-                            error_chain(&error)
-                        ));
-                    }
-                    return Err(anyhow!(message));
+                })
+            },
+            |ebpf, return_id| {
+                let result = ebpf
+                    .program_mut(return_program)
+                    .with_context(|| {
+                        format!("program {return_program} missing during partial detach")
+                    })
+                    .and_then(|program| {
+                        let probe: &mut UProbe = program.try_into()?;
+                        probe.detach(return_id).map_err(Into::into)
+                    });
+                if let Err(error) = result {
+                    detach_failures.push(format!("detaching partial {return_program}: {error:#}"));
                 }
-            }
-        };
+            },
+        )?;
         // Register entry first so selective and terminal drains stop new state
         // before removing the matching return consumer.
         self.links.extend(
@@ -2181,35 +2191,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn task_8d_dynamic_attach_evidence_retains_partial_and_detached_success() {
+    fn dynamic_export_sequence_retains_partial_success_and_cleans_up_once() {
         let mut failed = DynamicAttachEvidence::default();
+        let mut state = Vec::new();
         assert_eq!(
-            failed.record::<u8, _>(Err("return failed")),
+            attach_dynamic_export_with(
+                &mut state,
+                &mut failed,
+                |state, is_return| {
+                    state.push(if is_return { "return" } else { "entry" });
+                    Err::<u8, _>("return failed")
+                },
+                |state, _| state.push("cleanup"),
+            ),
             Err("return failed")
         );
-        assert!(
-            !failed.successful(),
-            "a failed attach is not lifetime evidence"
-        );
+        assert!(!failed.successful());
+        assert_eq!(state, ["return"]);
 
         let mut evidence = DynamicAttachEvidence::default();
-        let mut detached = Vec::new();
-
-        let return_id = evidence.record::<_, &str>(Ok(1)).unwrap();
+        state.clear();
         assert_eq!(
-            evidence.record::<u8, _>(Err("entry failed")),
+            attach_dynamic_export_with(
+                &mut state,
+                &mut evidence,
+                |state, is_return| {
+                    state.push(if is_return { "return" } else { "entry" });
+                    if is_return {
+                        Ok(1)
+                    } else {
+                        Err("entry failed")
+                    }
+                },
+                |state, _| state.push("cleanup"),
+            ),
             Err("entry failed")
         );
-        detached.push(return_id);
-
-        assert_eq!(detached, [1]);
+        assert_eq!(state, ["return", "entry", "cleanup"]);
         assert!(evidence.successful());
-        detached.push(evidence.record::<_, &str>(Ok(2)).unwrap());
-        assert_eq!(detached, [1, 2]);
-        assert!(
-            evidence.successful(),
-            "terminal detach cannot erase lifetime evidence"
+    }
+
+    #[test]
+    fn individual_dynamic_attach_records_lifetime_success() {
+        let mut evidence = DynamicAttachEvidence::default();
+        let mut state = ();
+        assert_eq!(
+            record_dynamic_attach_with(&mut state, &mut evidence, |_| Ok::<_, &str>(2)),
+            Ok(2)
         );
+        assert!(evidence.successful());
     }
     use p11scope_ebpf_common::{ARG_NONE, SlotSemantics};
     use std::io;

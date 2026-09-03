@@ -401,7 +401,7 @@ struct SelectionTableFact {
 #[derive(Debug, Clone)]
 struct ManifestSelectionAdmission {
     source: (u32, u8),
-    targets: BTreeSet<plan::AttachKey>,
+    targets: Vec<plan::SelectionTableTarget>,
 }
 
 type SelectionClaims = BTreeMap<SelectionClaimKey, SelectionClaim>;
@@ -788,17 +788,10 @@ fn lower_manifest_selection_tables(
                     name,
                 });
             }
-            let keys = targets
-                .iter()
-                .map(|target| plan::AttachKey {
-                    object: target.object,
-                    file_offset: target.file_offset,
-                })
-                .collect();
-            match plan.add_selection_table(allocated, module, targets) {
+            match plan.add_selection_table(allocated, module, targets.clone()) {
                 Ok(()) => admissions.push(ManifestSelectionAdmission {
                     source: (*ordinal, table.id),
-                    targets: keys,
+                    targets,
                 }),
                 Err(reason) => refused.push(reason),
             }
@@ -6779,13 +6772,13 @@ impl Engine {
             .manifest_selection_admissions
             .iter()
             .filter(|table| {
-                table.targets.iter().any(|key| {
+                table.targets.iter().any(|target| {
                     candidate
                         .plan
                         .slots
                         .iter()
                         .find(|slot| {
-                            slot.object == key.object && slot.file_offset == key.file_offset
+                            slot.object == target.object && slot.file_offset == target.file_offset
                         })
                         .is_none_or(|slot| !candidate.plan.is_active(slot.index))
                 })
@@ -6797,42 +6790,61 @@ impl Engine {
                 .iter()
                 .map(|table| table.source)
                 .collect();
-            let retained_keys: BTreeSet<_> = candidate
-                .manifest_inventory_slots
-                .keys()
-                .copied()
-                .chain(
-                    candidate
-                        .manifest_selection_admissions
-                        .iter()
-                        .filter(|table| !failed_sources.contains(&table.source))
-                        .flat_map(|table| table.targets.iter().copied()),
-                )
-                .chain(
-                    candidate
-                        .selection_tables
-                        .values()
-                        .flat_map(|table| table.targets.iter())
-                        .map(|target| plan::AttachKey {
-                            object: target.object,
-                            file_offset: target.file_offset,
-                        }),
-                )
-                .collect();
-            let rollback_keys: BTreeSet<_> = failed_manifest_tables
+            let live_tables = selection_tables_from_claims(&candidate.selection_claims);
+            let mut surviving_names = BTreeMap::<plan::AttachKey, BTreeSet<&'static str>>::new();
+            for target in candidate
+                .manifest_selection_admissions
                 .iter()
-                .flat_map(|table| table.targets.iter().copied())
-                .filter(|key| !retained_keys.contains(key))
+                .filter(|table| !failed_sources.contains(&table.source))
+                .flat_map(|table| &table.targets)
+                .chain(live_tables.values().flat_map(|table| &table.targets))
+            {
+                surviving_names
+                    .entry(plan::AttachKey {
+                        object: target.object,
+                        file_offset: target.file_offset,
+                    })
+                    .or_default()
+                    .insert(target.name);
+            }
+            let affected_keys: BTreeSet<_> = failed_manifest_tables
+                .iter()
+                .flat_map(|table| &table.targets)
+                .map(|target| plan::AttachKey {
+                    object: target.object,
+                    file_offset: target.file_offset,
+                })
                 .collect();
-            for table in &failed_manifest_tables {
-                for key in &table.targets {
-                    if let Some(inventory) = candidate.manifest_inventory_slots.get(key)
-                        && let Some(slot) = candidate.plan.slots.iter_mut().find(|slot| {
-                            slot.object == key.object && slot.file_offset == key.file_offset
-                        })
-                    {
-                        *slot = inventory.clone();
-                    }
+            let mut rollback_keys = BTreeSet::new();
+            for key in affected_keys {
+                let names = surviving_names.get(&key);
+                let inventory = candidate.manifest_inventory_slots.get(&key);
+                if inventory.is_none() && names.is_none_or(BTreeSet::is_empty) {
+                    rollback_keys.insert(key);
+                    continue;
+                }
+                let Some(slot) =
+                    candidate.plan.slots.iter_mut().find(|slot| {
+                        slot.object == key.object && slot.file_offset == key.file_offset
+                    })
+                else {
+                    continue;
+                };
+                if let Some(inventory) = inventory {
+                    *slot = inventory.clone();
+                } else {
+                    slot.names.clear();
+                    slot.aliased = false;
+                    slot.semantics = p11scope_ebpf_common::SlotSemantics::COUNT_ONLY;
+                    slot.semantic_authorized = false;
+                    slot.semantic_ambiguous = false;
+                    slot.fork_safe = false;
+                }
+                if let Some(names) = names {
+                    slot.names.extend(names.iter().copied().map(str::to_string));
+                    slot.names.sort();
+                    slot.names.dedup();
+                    slot.aliased = slot.names.len() >= 2;
                 }
             }
             let rollback: Vec<_> = candidate
@@ -14845,7 +14857,8 @@ int main(int argc, char **argv) {
     }
 
     fn manifest_selection_evidence(
-        offsets: [u64; 3],
+        version: Version,
+        resolved: &[(&str, u64)],
     ) -> p11scope_manifest::manifest::SelectionEvidence {
         use p11scope_manifest::manifest::{
             SelectionAcquisition, SelectionAuthority, SelectionEvidence, SelectionNameClass,
@@ -14855,29 +14868,29 @@ int main(int argc, char **argv) {
         let functions = pkcs11_module::FUNCTION_LIST_FIELDS
             .iter()
             .chain(pkcs11_module::FUNCTION_LIST_3_0_EXTRA_FIELDS)
+            .chain(
+                (version.minor == 2)
+                    .then_some(pkcs11_module::FUNCTION_LIST_3_2_EXTRA_FIELDS)
+                    .into_iter()
+                    .flatten(),
+            )
             .map(|field| FunctionRecord {
                 name: field.name.into(),
-                resolution: match field.name {
-                    "C_Initialize" => Resolution::Resolved {
-                        object: 0,
-                        file_offset: offsets[0],
-                    },
-                    "C_Finalize" => Resolution::Resolved {
-                        object: 0,
-                        file_offset: offsets[1],
-                    },
-                    "C_GetInfo" => Resolution::Resolved {
-                        object: 0,
-                        file_offset: offsets[2],
-                    },
-                    _ => Resolution::NullPointer,
-                },
+                resolution: resolved
+                    .iter()
+                    .find(|(name, _)| *name == field.name)
+                    .map_or(Resolution::NullPointer, |(_, file_offset)| {
+                        Resolution::Resolved {
+                            object: 0,
+                            file_offset: *file_offset,
+                        }
+                    }),
             })
             .collect();
         let mut queries = Vec::new();
         for selector in 0..5 {
             for flags in 0..=1 {
-                let (name, version) = match selector {
+                let (name, result_version) = match selector {
                     0 => (SelectionNameClass::Null, SelectionVersionClass::Null),
                     1 => (
                         SelectionNameClass::ExactStandard,
@@ -14898,32 +14911,34 @@ int main(int argc, char **argv) {
                 };
                 let request = SelectionRequest {
                     name,
-                    version,
+                    version: result_version,
                     flags,
                 };
-                queries.push(if selector == 2 && flags == 0 {
-                    SelectionQuery {
-                        selector,
-                        request,
-                        rv: 0,
-                        result: Some(request),
-                        inventory_matches: Vec::new(),
-                        selection_table: Some(0),
-                        authority: SelectionAuthority::SelectionCountOnly,
-                        helper_failure: None,
-                    }
-                } else {
-                    SelectionQuery {
-                        selector,
-                        request,
-                        rv: 1,
-                        result: None,
-                        inventory_matches: Vec::new(),
-                        selection_table: None,
-                        authority: SelectionAuthority::None,
-                        helper_failure: None,
-                    }
-                });
+                queries.push(
+                    if selector == version.minor.saturating_add(2) && flags == 0 {
+                        SelectionQuery {
+                            selector,
+                            request,
+                            rv: 0,
+                            result: Some(request),
+                            inventory_matches: Vec::new(),
+                            selection_table: Some(0),
+                            authority: SelectionAuthority::SelectionCountOnly,
+                            helper_failure: None,
+                        }
+                    } else {
+                        SelectionQuery {
+                            selector,
+                            request,
+                            rv: 1,
+                            result: None,
+                            inventory_matches: Vec::new(),
+                            selection_table: None,
+                            authority: SelectionAuthority::None,
+                            helper_failure: None,
+                        }
+                    },
+                );
             }
         }
         SelectionEvidence {
@@ -14931,13 +14946,93 @@ int main(int argc, char **argv) {
             queries,
             tables: vec![SelectionTable {
                 id: 0,
-                version: Version { major: 3, minor: 0 },
+                version,
                 walk: WalkOutcome::Full,
                 functions,
                 semantic_authorized: false,
             }],
             selection_truncated: false,
         }
+    }
+
+    fn evidence_verdict(
+        plan: &plan::AttachPlan,
+        pinned: &PinnedObjects,
+        counters: &DiscoveryCounters,
+    ) -> render::Evidence {
+        let mut evidence = render::Evidence {
+            table_entries: plan.entries_seen,
+            slots: plan.slots.len(),
+            attached_probes: 0,
+            attach_failures: Vec::new(),
+            aliased: plan
+                .slots
+                .iter()
+                .filter(|slot| slot.aliased)
+                .map(|slot| slot.names.clone())
+                .collect(),
+            skipped: plan
+                .skipped
+                .iter()
+                .map(render::capture_skipped_out)
+                .collect(),
+            semantic_unverified_slots: plan
+                .slots
+                .iter()
+                .filter(|slot| !slot.semantic_authorized)
+                .count(),
+            in_flight_at_end: 0,
+            surfaces: plan.surfaces.clone(),
+            vendor_interfaces: plan.vendor_interfaces,
+            interface_list: plan.interface_list.clone(),
+            event_loss: 0,
+            start_insert_failures: 0,
+            unmatched_returns: 0,
+            rv_update_failures: 0,
+            cgroup_scope_failures: 0,
+            semantic_capture_failures: 0,
+            unregistered_mechanisms: 0,
+            template_tail_failures: 0,
+            process_tracking_fallbacks: 0,
+            process_tracking_failures: 0,
+            process_tracking_evictions: 0,
+            state_reconciliations: 0,
+            session_cancel_ambiguities: 0,
+            session_cancel_unknown_flags: 0,
+            operation_state_imports: 0,
+            auth_state_ambiguities: 0,
+            async_target_failures: 0,
+            async_orphans: 0,
+            async_duplicates: 0,
+            async_evictions: 0,
+            fork_state_ambiguities: 0,
+            semantic_state_drops: 0,
+            pending_at_end: 0,
+            malformed_records: 0,
+            orphan_ops: 0,
+            unmatched_closes: 0,
+            shape_decode_failures: 0,
+            shape_decode_total_failures: 0,
+            templates_truncated: false,
+            attach_gap_ms: None,
+            pause: "none",
+            pause_attempts: 0,
+            pause_confirmed: 0,
+            pause_partial: 0,
+            child_still_running: None,
+            discovery_ring_loss: 0,
+            discovery_state_failures: 0,
+            discovery_read_failures: 0,
+            discovery_truncated: 0,
+            loader_discovery: render::LoaderDiscovery::default(),
+            unprotected_live_windows: 0,
+            module_unresolved_slots: 0,
+            provider_changed: false,
+            discovery: discovery_evidence(plan, pinned, counters),
+            completeness: "UNKNOWN",
+        };
+        evidence.verdict();
+        evidence
     }
 
     #[test]
@@ -14962,10 +15057,10 @@ int main(int argc, char **argv) {
         });
 
         let mut manifest = valid_manifest_for(&[PathBuf::from(&path)], &[0; 67]);
-        for function in &mut manifest.surfaces[0].functions {
+        for (index, function) in manifest.surfaces[0].functions.iter_mut().enumerate() {
             function.resolution = Resolution::Resolved {
                 object: 0,
-                file_offset: base,
+                file_offset: base + index as u64,
             };
         }
         let manifest_pins = pin_manifest_objects(&manifest).unwrap();
@@ -14992,8 +15087,40 @@ int main(int argc, char **argv) {
             .unwrap()
             .clone();
         let inventory_tables = engine.plan.modules[0].tables.clone();
+        let extra = base + 80;
 
-        manifest.selection_evidence = manifest_selection_evidence([base, base + 1, base + 2]);
+        let mut selection = manifest_selection_evidence(
+            Version { major: 3, minor: 0 },
+            &[
+                ("C_Finalize", base),
+                ("C_GetInfo", extra),
+                ("C_GetSlotList", extra + 1),
+                ("C_GetMechanismList", extra + 2),
+            ],
+        );
+        let mut survivor = manifest_selection_evidence(
+            Version { major: 3, minor: 1 },
+            &[("C_GetInfo", base), ("C_GetSlotList", extra)],
+        );
+        survivor.tables[0].id = 1;
+        for query in &mut survivor.queries {
+            if query.selection_table.is_some() {
+                query.selection_table = Some(1);
+            }
+        }
+        let survivor_query = survivor
+            .queries
+            .into_iter()
+            .find(|query| query.selection_table == Some(1))
+            .unwrap();
+        let survivor_key = (survivor_query.selector, survivor_query.request.flags);
+        *selection
+            .queries
+            .iter_mut()
+            .find(|query| (query.selector, query.request.flags) == survivor_key)
+            .unwrap() = survivor_query;
+        selection.tables.push(survivor.tables.pop().unwrap());
+        manifest.selection_evidence = selection;
         let problems = crate::manifest_input::validate_structure(&manifest);
         assert!(problems.is_empty(), "{problems:?}");
         engine.manifests[0] = manifest;
@@ -15001,7 +15128,7 @@ int main(int argc, char **argv) {
             .live_candidate(engine.pinned.clone(), vec![module], Vec::new())
             .unwrap();
 
-        assert_eq!(candidate.delta.new.len(), 2, "null entries do not attach");
+        assert_eq!(candidate.delta.new.len(), 3, "null entries do not attach");
         assert_eq!(
             candidate
                 .plan
@@ -15013,7 +15140,7 @@ int main(int argc, char **argv) {
             "inventory and selection share one physical slot"
         );
         for slot in candidate.plan.slots.iter().filter(
-            |slot| matches!(slot.file_offset, offset if offset == base + 1 || offset == base + 2),
+            |slot| matches!(slot.file_offset, offset if offset >= extra && offset <= extra + 2),
         ) {
             assert_eq!(
                 slot.semantics,
@@ -15022,8 +15149,29 @@ int main(int argc, char **argv) {
             assert!(!slot.semantic_authorized);
         }
         assert_eq!(candidate.plan.modules[0].tables, inventory_tables);
+        let evidence = evidence_verdict(&candidate.plan, &candidate.pinned, &engine.counters);
+        assert!(evidence.semantic_unverified_slots > 0);
+        assert_eq!(
+            serde_json::to_value(&evidence).unwrap()["completeness"],
+            "PARTIAL"
+        );
 
-        session.fail_target_slots([candidate.delta.new[1].index]);
+        let earlier = candidate
+            .delta
+            .new
+            .iter()
+            .find(|slot| slot.file_offset == extra + 1)
+            .unwrap()
+            .index;
+        let later = candidate
+            .delta
+            .new
+            .iter()
+            .find(|slot| slot.file_offset == extra + 2)
+            .unwrap()
+            .index;
+        assert_ne!(earlier, later);
+        session.fail_target_slots([later]);
         engine
             .apply_candidate(&mut session, candidate, &mut true, false, &[])
             .unwrap();
@@ -15035,19 +15183,153 @@ int main(int argc, char **argv) {
                 .iter()
                 .find(|slot| slot.file_offset == base)
                 .unwrap(),
-            &inventory,
-            "selection rollback preserves the shared inventory slot"
+            &plan::Slot {
+                names: vec!["C_GetInfo".into(), "C_Initialize".into()],
+                aliased: true,
+                ..inventory
+            },
+            "rollback removes only the failed manifest alias from inventory"
         );
+        let shared = engine
+            .plan
+            .slots
+            .iter()
+            .find(|slot| slot.file_offset == extra)
+            .unwrap();
+        assert!(engine.plan.is_active(shared.index));
+        assert_eq!(shared.names, ["C_GetSlotList"]);
         assert!(
             engine
                 .plan
                 .slots
                 .iter()
-                .filter(|slot| matches!(slot.file_offset, offset if offset == base + 1 || offset == base + 2))
+                .filter(|slot| matches!(slot.file_offset, offset if offset == extra + 1 || offset == extra + 2))
                 .all(|slot| !engine.plan.is_active(slot.index)),
             "a later failure rolls back the successful selection-only prefix"
         );
         assert_eq!(session.detached_slots.last(), Some(&1));
+        assert_eq!(session.attached_slots.last(), Some(&3));
+        let evidence = evidence_verdict(&engine.plan, &engine.pinned, &engine.counters);
+        assert_eq!(
+            serde_json::to_value(&evidence).unwrap()["completeness"],
+            "PARTIAL"
+        );
+        assert!(
+            engine
+                .plan
+                .skipped
+                .iter()
+                .any(|skip| skip.subject == "offline interface selection")
+        );
+    }
+
+    #[test]
+    fn manifest_selection_tables_lower_during_initial_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = dir.path().join("provider.so");
+        std::fs::copy("/bin/sh", &provider).unwrap();
+        let base = object_facts(&provider).2;
+        let mut manifest = valid_manifest_for(std::slice::from_ref(&provider), &[0; 67]);
+        manifest.selection_evidence = manifest_selection_evidence(
+            Version { major: 3, minor: 0 },
+            &[("C_GetInfo", base + 80)],
+        );
+        let problems = crate::manifest_input::validate_structure(&manifest);
+        assert!(problems.is_empty(), "{problems:?}");
+
+        let mut discovered = lifecycle_discovered(Vec::new());
+        discovered
+            .manifest_inputs
+            .push(manifest_input_from_pinning("initial.json", manifest));
+        rebuild_discovered(&mut discovered).unwrap();
+
+        let slot = discovered
+            .plan
+            .slots
+            .iter()
+            .find(|slot| slot.file_offset == base + 80)
+            .expect("initial manifest selection target enters the starting plan");
+        assert_eq!(
+            slot.semantics,
+            p11scope_ebpf_common::SlotSemantics::COUNT_ONLY
+        );
+        assert!(!slot.semantic_authorized);
+        assert_eq!(discovered.plan.modules[0].tables.len(), 1);
+    }
+
+    #[test]
+    fn manifest_selection_table_without_a_candidate_provider_adds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = dir.path().join("provider.so");
+        std::fs::copy("/bin/sh", &provider).unwrap();
+        let base = object_facts(&provider).2;
+        let mut manifest = valid_manifest_for(std::slice::from_ref(&provider), &[0; 67]);
+        manifest.selection_evidence = manifest_selection_evidence(
+            Version { major: 3, minor: 0 },
+            &[("C_GetInfo", base + 80)],
+        );
+        let problems = crate::manifest_input::validate_structure(&manifest);
+        assert!(problems.is_empty(), "{problems:?}");
+        let pins = pin_manifest_objects(&manifest).unwrap();
+        let mut plan = plan::build_from_reconciled_modules(&[]);
+        let allocated = plan.clone();
+
+        let (admissions, refused) = lower_manifest_selection_tables(
+            &mut plan,
+            &allocated,
+            std::slice::from_ref(&manifest),
+            &[0],
+            &pins,
+        );
+
+        assert!(admissions.is_empty());
+        assert!(refused.is_empty());
+        assert!(plan.slots.is_empty());
+    }
+
+    #[test]
+    fn stale_manifest_selection_does_not_transfer_to_scan_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = dir.path().join("provider.so");
+        std::fs::copy("/bin/sh", &provider).unwrap();
+        let base = object_facts(&provider).2;
+        let paths = vec![provider.clone()];
+        let targets = vec![0; 67];
+        let mut manifest = valid_manifest_for(&paths, &targets);
+        manifest.selection_evidence = manifest_selection_evidence(
+            Version { major: 3, minor: 0 },
+            &[("C_GetInfo", base + 80)],
+        );
+        let problems = crate::manifest_input::validate_structure(&manifest);
+        assert!(problems.is_empty(), "{problems:?}");
+        let scan = scanned_manifest_replacement(&paths, &targets);
+        let scan_pins = pin_scan(&scan);
+        std::fs::remove_file(&provider).unwrap();
+        let input = manifest_input_from_pinning("stale-selection.json", manifest);
+        assert_eq!(input.stale[0].reason, ManifestStaleReason::OpenStale);
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let mut discovered = lifecycle_discovered(vec![view]);
+        discovered.scan_inputs.insert(
+            ProcessViewId(0),
+            ScanInput {
+                modules: vec![scan],
+                pins: scan_pins,
+                counters: DiscoveryCounters::default(),
+            },
+        );
+        discovered.manifest_inputs.push(input);
+
+        rebuild_discovered(&mut discovered).unwrap();
+
+        assert!(discovered.manifests.is_empty());
+        assert!(
+            discovered
+                .plan
+                .slots
+                .iter()
+                .all(|slot| slot.file_offset != base + 80),
+            "the scan replacement cannot inherit stale offline selection authority"
+        );
     }
 
     fn selection_provider_address(engine: &Engine, binding: SelectionBindingFact) -> u64 {

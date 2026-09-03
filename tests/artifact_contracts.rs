@@ -5717,7 +5717,7 @@ fn both_capture_loops_keep_the_one_frozen_per_tick_ordering() {
             tick_end,
         );
         let drain_events = if name == "profile" {
-            "drain_events(session, &mut state, &mut process_tracker)"
+            "drain_events(\n                session,"
         } else {
             "drain_trace_events(\n            session,"
         };
@@ -5762,7 +5762,7 @@ fn both_capture_loops_keep_the_one_frozen_per_tick_ordering() {
     require_before(
         profile,
         "let detach = session.detach_producers();",
-        "        malformed_records += drain_events(session, &mut state, &mut process_tracker)?;\n    }\n    retire_exited",
+        "let plan_changed = if detach.is_ok()",
         "profile terminal detach before the final drain",
     )
     .unwrap();
@@ -6062,7 +6062,7 @@ fn the_capture_loop_consumer_map_is_frozen() {
     // Final evidence and discovery: sanitized capture facts, never the live
     // plan's own counts.
     for marker in [
-        "let facts = engine.capture_facts();",
+        "facts: render::CaptureFacts,",
         "table_entries: facts.table_entries()",
         "slots: facts.slots()",
         "attach_gap_ms: facts.attach_gap_ms()",

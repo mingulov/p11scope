@@ -215,9 +215,10 @@ Memory scanning is heuristic discovery. Live and terminal evidence are PARTIAL
 while scan-only semantic claims remain. P11Lab joins reject scan-only and
 conflict modules; an accepted manifest may authorize only its exact pinned
 object, offset, and canonical function name. The owned-child `run` path and
-capture-history corrections passed the local 5.15/6.8 semantic campaign.
-The project remains unreleased while exact-tip CI, packaging, and final
-security remediation/release review are pending. `p11scope run` never
+capture-history corrections in the frozen pre-W3 candidate at `ae8494d`
+passed the local 5.15/6.8 semantic campaign. Those results do not qualify the
+W3 tip. The project remains unreleased while exact-tip runtime qualification,
+CI, packaging, publication, and release review are pending. `p11scope run` never
 implicitly releases a root child: a non-root observer keeps its UID/GID while
 losing capabilities, and a sudo-root observer requires valid non-root
 `SUDO_UID`/`SUDO_GID` values naming one existing non-root account and drops to

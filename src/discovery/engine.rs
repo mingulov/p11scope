@@ -15358,7 +15358,12 @@ int main(int argc, char **argv) {
     }
 
     pub(crate) fn selection_output_engines() -> (Engine, Engine) {
-        let (_fixture, clean, _session, _binding) = attached_selection_route();
+        let (_fixture, mut clean, _session, binding) = attached_selection_route();
+        clean
+            .selection_bindings
+            .get_mut(&binding.id)
+            .unwrap()
+            .coverage = SelectionCoverageState::OwnedClosed(NonZeroU64::new(1).unwrap());
         let (_fixture, mut truncated, _session, binding) = attached_selection_route();
         for flags in 0..=MAX_LIVE_SELECTION_TUPLES {
             truncated.capture_facts.record_selection(

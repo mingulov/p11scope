@@ -1753,6 +1753,11 @@ fn observe_fork(
         }
         return true;
     }
+    // Static function probes cover cgroup descendants immediately, but Aya's
+    // per-process dynamic export links cannot cover a child's C_GetInterface
+    // calls before the next membership refresh. Keep semantic inheritance,
+    // while making that selection-discovery window explicit.
+    *pid_descendant_gaps = pid_descendant_gaps.saturating_add(1);
     if !state.pid_has_process_state(parent_pid) {
         return true;
     }
@@ -1787,7 +1792,7 @@ fn initial_tracking_evidence(
             lifecycle_tracking_unavailable,
         ),
         Scope::Cgroup { .. } => (
-            0,
+            u64::from(fork_tracking_unavailable),
             fork_tracking_unavailable || lifecycle_tracking_unavailable,
         ),
     }
@@ -2655,6 +2660,14 @@ fn evidence_for(
     ] = facts.discovery_losses();
     let pause = owned.map_or_else(Default::default, |owned| owned.coordinator.counters());
     let pause_status = pause.status();
+    let mut interface_selection = if include_selection {
+        engine.interface_selection()
+    } else {
+        Default::default()
+    };
+    if pid_descendant_gaps > 0 {
+        interface_selection.mark_descendant_gap();
+    }
     let mut ev = render::Evidence {
         table_entries: facts.table_entries(),
         slots: facts.slots(),
@@ -2728,11 +2741,7 @@ fn evidence_for(
         discovery_read_failures,
         discovery_truncated,
         loader_discovery: facts.loader_discovery(),
-        interface_selection: if include_selection {
-            engine.interface_selection()
-        } else {
-            Default::default()
-        },
+        interface_selection,
         attach_mechanisms: if include_selection {
             attach_mechanisms(attached_probes)
         } else {
@@ -3844,7 +3853,7 @@ mod tests {
     }
 
     #[test]
-    fn cgroup_fork_retains_inheritance_without_pid_gap() {
+    fn cgroup_fork_retains_semantics_but_marks_selection_window_gap() {
         use crate::events::{EventDrain, ScriptedRecords};
 
         let event = p11scope_ebpf_common::Event {
@@ -3902,7 +3911,10 @@ mod tests {
             ),
             0
         );
-        assert_eq!(gaps, 0, "cgroup scope covers descendants");
+        assert_eq!(
+            gaps, 1,
+            "one fork creates one pre-refresh selection-discovery window"
+        );
         assert!(
             state.pid_has_process_state(42),
             "cgroup scope retains existing semantic inheritance"
@@ -4311,27 +4323,28 @@ mod tests {
         let (clean, truncated) = crate::discovery::engine::tests::selection_output_engines();
         let clean_state = semantics::State::new(clean.plan());
         let truncated_state = semantics::State::new(truncated.plan());
-        let build = |engine: &Engine, state: &semantics::State, include_selection| {
-            evidence_for(
-                engine,
-                engine.capture_facts(),
-                0,
-                &[],
-                &[],
-                metrics::KernelEvidence::default(),
-                process::TrackingEvidence::default(),
-                0,
-                state,
-                false,
-                include_selection,
-                None,
-                0,
-                false,
-            )
-        };
+        let build =
+            |engine: &Engine, state: &semantics::State, include_selection, pid_descendant_gaps| {
+                evidence_for(
+                    engine,
+                    engine.capture_facts(),
+                    0,
+                    &[],
+                    &[],
+                    metrics::KernelEvidence::default(),
+                    process::TrackingEvidence::default(),
+                    0,
+                    state,
+                    false,
+                    include_selection,
+                    None,
+                    pid_descendant_gaps,
+                    false,
+                )
+            };
 
-        let clean_metrics = build(&clean, &clean_state, false);
-        let truncated_metrics = build(&truncated, &truncated_state, false);
+        let clean_metrics = build(&clean, &clean_state, false, 0);
+        let truncated_metrics = build(&truncated, &truncated_state, false, 0);
         assert_eq!(truncated_metrics.completeness, clean_metrics.completeness);
         assert_eq!(
             truncated_metrics.interface_selection,
@@ -4353,9 +4366,21 @@ mod tests {
             assert!(document["evidence"].get(field).is_none(), "{field}");
         }
 
-        let profile = build(&truncated, &truncated_state, true);
+        let profile = build(&truncated, &truncated_state, true, 0);
         assert!(profile.interface_selection.selection_truncated);
         assert_eq!(profile.completeness, "PARTIAL");
+
+        assert_eq!(
+            clean.interface_selection().providers[0].coverage,
+            "absent_covered"
+        );
+        let gap_profile = build(&clean, &clean_state, true, 1);
+        assert_eq!(
+            gap_profile.interface_selection.providers[0].coverage,
+            "absent_uncovered"
+        );
+        assert_eq!(gap_profile.pid_descendant_gaps, 1);
+        assert_eq!(gap_profile.completeness, "PARTIAL");
     }
 
     #[test]
@@ -4474,6 +4499,13 @@ mod tests {
             render::versioned_evidence(&evidence)["pid_descendant_gaps"],
             1
         );
+
+        let cgroup = Scope::Cgroup {
+            id: 1,
+            path: "/".into(),
+            dir: std::sync::Arc::new(std::fs::File::open("/").unwrap()),
+        };
+        assert_eq!(initial_tracking_evidence(&cgroup, true, false), (1, true));
     }
 
     #[test]

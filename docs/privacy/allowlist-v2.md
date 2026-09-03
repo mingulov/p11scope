@@ -32,6 +32,49 @@ the exact `pkcs11-scope/observed-profile/v2-metrics` shape. Individual trace
 lines likewise gain no selection fields. All selection loss is reduced to the
 bounded aggregate and `PARTIAL` verdict.
 
+## Manifest-v5 selection vocabulary
+
+Manifest v5 may carry only the following finite selection-discovery facts.
+`selection_evidence` has exactly `acquisition`, `queries`, `tables`, and
+`selection_truncated`.
+The acquisition state is exactly `export_absent`, `export_outside_module`, or
+`queried`. A queried acquisition has exactly ten selector rows, in selector
+then flags order:
+
+| query order | selector | flags | request name | request version |
+| ---: | ---: | ---: | --- | --- |
+| 0 | selector 0 | 0 | `null` | `null` |
+| 1 | selector 0 | 1 | `null` | `null` |
+| 2 | selector 1 | 0 | `exact_standard` | `null` |
+| 3 | selector 1 | 1 | `exact_standard` | `null` |
+| 4 | selector 2 | 0 | `exact_standard` | `v3_0` |
+| 5 | selector 2 | 1 | `exact_standard` | `v3_0` |
+| 6 | selector 3 | 0 | `exact_standard` | `v3_1` |
+| 7 | selector 3 | 1 | `exact_standard` | `v3_1` |
+| 8 | selector 4 | 0 | `exact_standard` | `v3_2` |
+| 9 | selector 4 | 1 | `exact_standard` | `v3_2` |
+
+Each row has exactly `selector`, `request`, `rv`, `result`,
+`inventory_matches`, `selection_table`, `authority`, and `helper_failure`.
+It has a bounded CK_RV and either a bounded result classification or one
+`helper_failure` class. Authority is exactly `inventory`,
+`selection_count_only`, or `none`. That failure class is exactly `null_output`,
+`unreadable_interface`, `unreadable_name`, `unreadable_version`,
+`unreadable_table`, `outside_provider`, `unresolved_function`, or
+`provider_changed`. A result name is one of `null`, `exact_standard`, `other`,
+or `unreadable`; a result version is one of `null`, `unreadable`, `v2_40`,
+`v3_0`, `v3_1`, `v3_2`, or `other`; flags retain their full u64 width.
+
+There are at most ten tables. Each table id is 0 through 9; a non-null
+`selection_table` refers to that exact id. Every table is referenced by a
+successful count-only query, and orphan tables are forbidden. A table has
+version 3.0, 3.1, or 3.2, a bounded walk of at
+most 104 classified standard function slots, and
+`semantic_authorized=false`. Selection records contain no raw interface names or pointers,
+addresses, function-table contents, or helper error strings. Only the
+existing offline inventory-name exception may retain raw names; selection
+queries and tables never do.
+
 ## Still prohibited
 
 No new PIN, username, label, `CKA_ID`, key material, plaintext, ciphertext,

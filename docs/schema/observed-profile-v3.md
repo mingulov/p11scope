@@ -50,7 +50,10 @@ and belong to the tuple's module. `table_match` is true exactly when this array
 is nonempty. Authority is exactly `inventory`, `selection_count_only`, or
 `none`: inventory authority requires a readable successful result and at least
 one match; count-only authority has no match and is limited to a successful
-exact-standard result with a known 3.x version and standard returned flags.
+request and result whose names are both `exact_standard`, whose returned
+version is `v3_0`, `v3_1`, or `v3_2`, and whose returned flags are 0 or 1.
+It records only the fixed helper selector/count relation, has
+`semantic_authorized=false`, grants no inventory match, and forces `PARTIAL`.
 A successful matched result with an unreadable/null name or version retains its
 match but has `none` authority. The corresponding agreement boolean is false;
 legacy surfaces always have `name_agrees: false`. A nonzero `rv` has null

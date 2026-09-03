@@ -4081,8 +4081,8 @@ mod tests {
     }
 
     #[test]
-    fn terminal_trace_emission_orders_exact_count_before_evidence() {
-        let (_, _, tracer) = trace_fixture();
+    fn task_8d_terminal_trace_emission_orders_exact_count_before_evidence() {
+        let (mut state, mut tracker, mut tracer) = trace_fixture();
         let reports = [metrics::SlotReport {
             names: vec!["C_Initialize".to_string()],
             aliased: false,
@@ -4101,6 +4101,26 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stdout_open = true;
         let mut out_file: Option<Vec<u8>> = None;
+        let mut remaining = None;
+        let mut gaps = 0;
+        let mut drain = crate::events::EventDrain::over(crate::events::ScriptedRecords::events(
+            [call_event()],
+            usize::MAX,
+        ));
+        drain_trace_events_from(
+            &mut drain,
+            &mut remaining,
+            &mut state,
+            &mut tracker,
+            &Scope::Pid(std::process::id()),
+            &mut gaps,
+            &mut tracer,
+            &mut Vec::new(),
+            &mut true,
+            &mut None::<Vec<u8>>,
+            None,
+        )
+        .unwrap();
 
         emit_trace_terminal(
             &reports,
@@ -4124,7 +4144,7 @@ mod tests {
             serde_json::json!({
                 "stats_entered": 7,
                 "stats_returned": 5,
-                "raw_calls": 0,
+                "raw_calls": 1,
             })
         );
     }
@@ -4336,7 +4356,7 @@ mod tests {
     }
 
     #[test]
-    fn attach_mechanism_requires_a_successfully_owned_link() {
+    fn task_8d_attach_mechanism_requires_a_successfully_owned_link() {
         assert!(attach_mechanisms(0, false).is_empty());
         assert_eq!(attach_mechanisms(0, true), ["per-offset"]);
         assert_eq!(attach_mechanisms(2, false), ["per-offset"]);

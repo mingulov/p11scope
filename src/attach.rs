@@ -513,7 +513,7 @@ pub struct Session {
     /// `EVENTS` ring finite and a poll of it allowed to read it whole.
     producers_detached: bool,
     successful_static: BTreeSet<StaticEndpoint>,
-    successful_dynamic: bool,
+    dynamic_attach_evidence: DynamicAttachEvidence,
     policy: CapturePolicy,
     uprobe_scope: UProbeScope,
     #[allow(dead_code)] // Task 8 drives the Task 7 pause coordinator.
@@ -794,13 +794,20 @@ fn detach_selected_with<T>(
         .collect()
 }
 
-fn register_dynamic_success<T>(
-    links: &mut Vec<T>,
-    successful_dynamic: &mut bool,
-    attached: impl IntoIterator<Item = T>,
-) {
-    links.extend(attached);
-    *successful_dynamic = true;
+#[derive(Default)]
+struct DynamicAttachEvidence(bool);
+
+impl DynamicAttachEvidence {
+    fn record<T, E>(&mut self, result: std::result::Result<T, E>) -> std::result::Result<T, E> {
+        if result.is_ok() {
+            self.0 = true;
+        }
+        result
+    }
+
+    fn successful(&self) -> bool {
+        self.0
+    }
 }
 
 /// Renders `e` and every `.source()` beneath it, joined by `: `. Several
@@ -1369,7 +1376,7 @@ impl Session {
             detach_failures: vec![],
             producers_detached: false,
             successful_static: BTreeSet::new(),
-            successful_dynamic: false,
+            dynamic_attach_evidence: DynamicAttachEvidence::default(),
             policy,
             uprobe_scope,
             pause_key,
@@ -1446,21 +1453,20 @@ impl Session {
         let scope = UProbeScope::OneProcess(
             std::num::NonZeroU32::new(pid).ok_or(DynamicLoaderAttachFailure::InvalidPid)?,
         );
-        match probe.attach(point, &path, scope) {
+        match self
+            .dynamic_attach_evidence
+            .record(probe.attach(point, &path, scope))
+        {
             Ok(id) => {
-                register_dynamic_success(
-                    &mut self.links,
-                    &mut self.successful_dynamic,
-                    [RegisteredLink::DynamicUProbe {
-                        program,
-                        context,
-                        object,
-                        file_offset,
-                        cookie,
-                        abi: None,
-                        id,
-                    }],
-                );
+                self.links.push(RegisteredLink::DynamicUProbe {
+                    program,
+                    context,
+                    object,
+                    file_offset,
+                    cookie,
+                    abi: None,
+                    id,
+                });
                 Ok(true)
             }
             Err(error) => {
@@ -1509,13 +1515,15 @@ impl Session {
                 .program_mut(return_program)
                 .with_context(|| format!("program {return_program} missing from object"))?
                 .try_into()?;
-            probe.attach(point(), &path, scope).map_err(|error| {
-                anyhow!(
-                    "{return_program} at object {:?}+{file_offset:#x}: {}",
-                    object,
-                    error_chain(&error)
-                )
-            })?
+            self.dynamic_attach_evidence
+                .record(probe.attach(point(), &path, scope))
+                .map_err(|error| {
+                    anyhow!(
+                        "{return_program} at object {:?}+{file_offset:#x}: {}",
+                        object,
+                        error_chain(&error)
+                    )
+                })?
         };
         let entry_id = {
             let probe: &mut UProbe = self
@@ -1523,7 +1531,10 @@ impl Session {
                 .program_mut(entry_program)
                 .with_context(|| format!("program {entry_program} missing from object"))?
                 .try_into()?;
-            match probe.attach(point(), &path, scope) {
+            match self
+                .dynamic_attach_evidence
+                .record(probe.attach(point(), &path, scope))
+            {
                 Ok(id) => id,
                 Err(error) => {
                     let message = format!(
@@ -1550,9 +1561,7 @@ impl Session {
         };
         // Register entry first so selective and terminal drains stop new state
         // before removing the matching return consumer.
-        register_dynamic_success(
-            &mut self.links,
-            &mut self.successful_dynamic,
+        self.links.extend(
             [(entry_program, entry_id), (return_program, return_id)].map(|(program, id)| {
                 RegisteredLink::DynamicUProbe {
                     program,
@@ -1964,7 +1973,7 @@ impl Session {
     }
 
     pub(crate) fn dynamic_per_offset_attached(&self) -> bool {
-        self.successful_dynamic
+        self.dynamic_attach_evidence.successful()
     }
 }
 
@@ -2172,14 +2181,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dynamic_registration_retains_lifetime_per_offset_success() {
-        let mut links = Vec::new();
-        let mut successful_dynamic = false;
+    fn task_8d_dynamic_attach_evidence_retains_partial_and_detached_success() {
+        let mut failed = DynamicAttachEvidence::default();
+        assert_eq!(
+            failed.record::<u8, _>(Err("return failed")),
+            Err("return failed")
+        );
+        assert!(
+            !failed.successful(),
+            "a failed attach is not lifetime evidence"
+        );
 
-        register_dynamic_success(&mut links, &mut successful_dynamic, [1]);
+        let mut evidence = DynamicAttachEvidence::default();
+        let mut detached = Vec::new();
 
-        assert_eq!(links, [1]);
-        assert!(successful_dynamic);
+        let return_id = evidence.record::<_, &str>(Ok(1)).unwrap();
+        assert_eq!(
+            evidence.record::<u8, _>(Err("entry failed")),
+            Err("entry failed")
+        );
+        detached.push(return_id);
+
+        assert_eq!(detached, [1]);
+        assert!(evidence.successful());
+        detached.push(evidence.record::<_, &str>(Ok(2)).unwrap());
+        assert_eq!(detached, [1, 2]);
+        assert!(
+            evidence.successful(),
+            "terminal detach cannot erase lifetime evidence"
+        );
     }
     use p11scope_ebpf_common::{ARG_NONE, SlotSemantics};
     use std::io;

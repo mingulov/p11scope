@@ -305,6 +305,9 @@ def trace_terminal(text, privacy):
 
 
 def trace_abort_terminal(text, privacy):
+    counts = [line for line in text.splitlines()
+              if line.startswith("COUNT_EVIDENCE ")]
+    assert not counts, f"expected no abort COUNT_EVIDENCE record, got {len(counts)}"
     records = [line.removeprefix("EVIDENCE ") for line in text.splitlines()
                if line.startswith("EVIDENCE ")]
     assert len(records) == 1, f"expected one terminal abort EVIDENCE record, got {len(records)}"
@@ -1027,6 +1030,13 @@ if work == "--self-test":
         "counters_available": False, "event_loss": None,
     })
     trace_abort_terminal(aborted, "allowlisted")
+    reject("trace abort extra count", lambda:
+           trace_abort_terminal(aborted + "\n" + count_line(), "allowlisted"))
+    reject("trace abort duplicate count", lambda:
+           trace_abort_terminal(count_line() + count_line() + aborted, "allowlisted"))
+    reject("trace abort misplaced count", lambda:
+           trace_abort_terminal(aborted.replace("EVIDENCE ", count_line() + "EVIDENCE "),
+                                "allowlisted"))
     for field, value in (("capture_aborted", None), ("final_drain", True),
                          ("counters_available", True), ("event_loss", 0)):
         mutated = json.loads(aborted.split("EVIDENCE ", 1)[1])

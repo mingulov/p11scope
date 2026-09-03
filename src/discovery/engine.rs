@@ -941,6 +941,13 @@ impl CaptureFacts {
         }) || selections.len() < MAX_LIVE_SELECTION_TUPLES
     }
 
+    fn can_record_selection_claim(&self, tuple: &LiveSelectionTuple) -> bool {
+        self.can_record_selection(&LiveSelectionTuple {
+            authority: SelectionAuthority::SelectionCountOnly,
+            ..tuple.clone()
+        })
+    }
+
     fn begin_stage(&mut self) -> Result<()> {
         if self.staged.is_some() {
             bail!("capture-fact transaction is already active");
@@ -8203,14 +8210,14 @@ impl Engine {
             },
             count: 1,
         };
-        let selection_will_truncate =
-            matches_truncated || !self.capture_facts.can_record_selection(&tuple);
+        let claim_will_truncate =
+            matches_truncated || !self.capture_facts.can_record_selection_claim(&tuple);
         let unmatched = result.is_some() && inventory_matches.is_empty() && !assessment_loss;
         let mut claim_authorized = false;
         if unmatched
             && can_attach
             && queued.terminal_owner.is_none()
-            && !selection_will_truncate
+            && !claim_will_truncate
             && !read_loss
             && !matches_truncated
             && self.counter_snapshot.ring_loss == 0
@@ -17624,7 +17631,7 @@ int main(int argc, char **argv) {
     }
 
     #[test]
-    fn selection_authority_is_part_of_exact_tuple_identity_and_bound() {
+    fn task_8d_selection_authority_is_part_of_exact_tuple_identity_and_bound() {
         let tuple = LiveSelectionTuple {
             module: plan::ModuleId(1),
             request: SelectionRequest {
@@ -17675,9 +17682,61 @@ int main(int argc, char **argv) {
                 false,
             );
         }
+        assert!(bounded.can_record_selection(&LiveSelectionTuple {
+            authority: SelectionAuthority::None,
+            ..tuple.clone()
+        }));
+        assert!(
+            !bounded.can_record_selection_claim(&LiveSelectionTuple {
+                authority: SelectionAuthority::None,
+                ..tuple.clone()
+            }),
+            "authority-distinct tuple is the seventeenth identity"
+        );
         bounded.record_selection(tuple, false);
         assert_eq!(bounded.history.selections.len(), MAX_LIVE_SELECTION_TUPLES);
         assert!(bounded.history.selection_truncated);
+    }
+
+    #[test]
+    fn task_8d_public_selection_projection_preserves_authority_distinct_tuples() {
+        let mut engine = Engine::empty();
+        let stable = plan::ModuleId(0);
+        let mut module = merged_module(vec!["scan"]);
+        module.id = stable;
+        engine.capture_facts.history.modules.insert(stable, module);
+        let tuple = LiveSelectionTuple {
+            module: stable,
+            request: SelectionRequest {
+                name: SelectionNameClass::ExactStandard,
+                version: SelectionVersionClass::V3_0,
+                flags: 0,
+            },
+            rv: 0,
+            result: None,
+            inventory_matches: Vec::new(),
+            authority: SelectionAuthority::None,
+            count: 2,
+        };
+        engine.capture_facts.history.selections.extend([
+            tuple.clone(),
+            LiveSelectionTuple {
+                authority: SelectionAuthority::SelectionCountOnly,
+                count: 3,
+                ..tuple
+            },
+        ]);
+
+        let tuples = engine.interface_selection().tuples;
+        assert_eq!(tuples.len(), 2);
+        assert!(
+            tuples
+                .iter()
+                .any(|tuple| { tuple.authority == SelectionAuthority::None && tuple.count == 2 })
+        );
+        assert!(tuples.iter().any(|tuple| {
+            tuple.authority == SelectionAuthority::SelectionCountOnly && tuple.count == 3
+        }));
     }
 
     #[test]

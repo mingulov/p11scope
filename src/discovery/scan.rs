@@ -1606,16 +1606,11 @@ mod tests {
             outcome.skipped()
         );
 
-        // The preprocessing itself is charged, one unit per snapshot entry: with
-        // fewer units left than this process has mappings, the scan stops right
-        // there. (The scan reads its own snapshot, so the allowance is one unit
-        // short of the count read here — a mapping added in between only makes
-        // the refusal more certain.)
+        // The preprocessing itself is charged, one unit per snapshot entry.
+        // Leave one unit: every live process has multiple mappings, so the scan
+        // stops there without racing a separate read of this process's map count.
         let mut budget = CaptureWorkBudget::default();
-        let entries = parse_maps(&std::fs::read(format!("/proc/{pid}/maps")).unwrap())
-            .unwrap()
-            .len() as u64;
-        assert!(budget.charge(DEFAULT_WORK_CEILING - entries + 1));
+        assert!(budget.charge(DEFAULT_WORK_CEILING - 1));
         let outcome = scan_pid(&request, &mut budget).expect("a scan of this process");
         assert!(
             outcome

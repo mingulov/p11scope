@@ -296,35 +296,41 @@ Commit: `feat: reduce interface selection with exact lifecycle authority`
 
 Design acceptance: §12 items 3, 14, and 15.
 
-- [ ] RED: exact JSON/mutation tests pin `interface_selection`, all finite
+- [x] RED: exact JSON/mutation tests pin `interface_selection`, all finite
   arrays/enums/cross-references, count saturation, every selection loss to
   `PARTIAL`, finite saturating `pid_descendant_gaps` and
   `multi_rebuild_gaps`, and no individual trace-line selection output.
-- [ ] GREEN: profile and terminal trace use observed-profile v3; metrics stays
+- [x] GREEN: profile and terminal trace use observed-profile v3; metrics stays
   v2-metrics and reads no selection arguments. Preserve v1 allowlist unchanged;
   v2 authorizes only the reviewed finite classes, a finite sorted
   `evidence.attach_mechanisms` array, and the existing offline inventory name
   exception. Before Task 7, derive the array only from successfully owned links
   and emit only `per-offset`; Task 7 may add the already-versioned
   `uprobe-multi` value without reopening the schema or allowlist.
-- [ ] RED: `profile_v3_selection_contract_is_exact` and the two validator
+- [x] RED: `profile_v3_selection_contract_is_exact` and the two validator
   self-tests reject missing/extra v3 selection fields, secret canaries, stale
   live profile-v2 pins, and an observer/helper description with reversed roles;
   the public four-state coverage value must be derived exactly from Task 3's
   private reducer.
-- [ ] GREEN: update docs, exact-schema dispatch, and canaries so the observer
+- [x] GREEN: update docs, exact-schema dispatch, and canaries so the observer
   remains passive while the explicit helper is documented as making ten calls.
   Migrate live profile-v2 exact pins; retain historical records as historical.
   Enforce the 16-tuple bound globally per capture, not independently per
   module, and project public coverage only through Task 3's reducer.
-- [ ] Focused checks:
+- [x] Focused checks:
   `cargo +1.88 test --locked --lib profile_v3_selection_contract_is_exact`,
   `python3 -I scripts/check-capture-evidence.py --self-test`, and
   `sh scripts/verify-canaries.sh --self-test`; then four canonical gates.
-- [ ] Independent selection-slice correctness and test-quality review; batch
+- [x] Independent selection-slice correctness and test-quality review; batch
   accepted fixes until one cycle is zero. Commit.
 
 Commit: `docs: publish versioned interface selection evidence`
+
+Completed through `620372a`: producer and consumer review reached zero after
+four related fix batches. The final clean-tip Rust 1.88 gates passed 1,010
+tests; their first run also found and closed two stale integration fixtures
+(`70775cf`, `620372a`) without changing production behavior. Allowlist v1
+remained byte-identical.
 
 ## Task 4.5: Exact-tip runtime smoke before more BPF churn
 

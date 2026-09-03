@@ -547,6 +547,12 @@ mod tests {
             evidence_line(&empty_evidence(), CapturePolicy::Allowlisted, false)
                 .contains("\"interface_selection\"")
         );
+        let plan = test_plan();
+        let mut state = State::new(&plan);
+        let mut tracer = Tracer::new(&plan);
+        let event = tracer.on_event(&open_event(100, 7), &mut state);
+        assert!(!event.contains("selection"));
+        assert!(!event.contains("interface"));
     }
 
     #[test]

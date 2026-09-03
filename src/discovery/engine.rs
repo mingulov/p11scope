@@ -5570,35 +5570,46 @@ impl Engine {
                 .saturating_add(self.malformed_discovery)
                 .saturating_add(self.loader_registry.discovery_truncated())
                 .saturating_add(self.loader_registry.context_failures()),
-            interface_selection: self.interface_selection(),
         }
     }
 
-    fn interface_selection(&self) -> render::InterfaceSelection {
+    pub(crate) fn interface_selection(&self) -> render::InterfaceSelection {
         let history = self.capture_facts.visible_history();
+        let public_modules: BTreeMap<_, _> = history
+            .modules
+            .keys()
+            .copied()
+            .enumerate()
+            .map(|(index, module)| (module, index as u32))
+            .collect();
+        let mut selection_truncated = history.selection_truncated;
         let mut surface_indices = BTreeMap::new();
-        let mut module_ordinals = BTreeMap::<plan::ModuleId, u16>::new();
+        let mut module_ordinals = BTreeMap::<u32, u16>::new();
         let mut inventory_surfaces = Vec::new();
         let mut surfaces: Vec<_> = history
             .selection_surfaces
             .iter()
             .filter_map(|surface| {
-                self.capture_facts
+                let stable = self
+                    .capture_facts
                     .module_ids
                     .get(&surface.base.provider)
-                    .copied()
-                    .map(|module| (module, surface))
+                    .copied();
+                let public = stable.and_then(|module| public_modules.get(&module).copied());
+                selection_truncated |= public.is_none();
+                public.map(|module| (module, surface))
             })
             .collect();
         surfaces.sort();
         for (module, surface) in surfaces {
             let ordinal = module_ordinals.entry(module).or_default();
             let Ok(index) = u16::try_from(inventory_surfaces.len()) else {
+                selection_truncated = true;
                 break;
             };
-            surface_indices.insert(surface.clone(), index);
+            surface_indices.insert(surface.clone(), (index, module));
             inventory_surfaces.push(render::SelectionSurface {
-                module: module.0,
+                module,
                 ordinal: *ordinal,
                 kind: match surface.base.kind {
                     InventorySurfaceKind::Legacy => "legacy",
@@ -5614,10 +5625,13 @@ impl Engine {
             .map(|binding| binding.provider)
             .collect::<BTreeSet<_>>()
             .into_iter()
-            .filter_map(|module| {
-                self.selection_coverage(module)
-                    .map(|coverage| render::SelectionProvider {
-                        module: module.0,
+            .filter_map(|stable| {
+                let module = public_modules.get(&stable).copied();
+                selection_truncated |= module.is_none();
+                module
+                    .zip(self.selection_coverage(stable))
+                    .map(|(module, coverage)| render::SelectionProvider {
+                        module,
                         coverage: match coverage {
                             SelectionCoverageVerdict::Observed => "observed",
                             SelectionCoverageVerdict::ObservedUncovered => "observed_uncovered",
@@ -5628,39 +5642,52 @@ impl Engine {
             })
             .collect();
         providers.sort_by_key(|provider| provider.module);
+        providers.dedup_by_key(|provider| provider.module);
 
-        let mut standard_exports = Vec::new();
-        for module in history.modules.keys() {
-            let exports = history.standard_exports.get(module);
-            let requirements = history.standard_requirements.get(module);
-            let status = standard_export_status(exports, requirements);
-            standard_exports.push(render::StandardExport {
-                module: module.0,
-                status,
-            });
-        }
+        let standard_exports = history
+            .modules
+            .keys()
+            .map(|stable| render::StandardExport {
+                module: public_modules[stable],
+                status: standard_export_status(
+                    history.standard_exports.get(stable),
+                    history.standard_requirements.get(stable),
+                ),
+            })
+            .collect();
 
         let mut tuples: Vec<_> = history
             .selections
             .iter()
-            .map(|tuple| {
+            .filter_map(|tuple| {
+                let Some(module) = public_modules.get(&tuple.module).copied() else {
+                    selection_truncated = true;
+                    return None;
+                };
                 let inventory_matches: Vec<_> = tuple
                     .inventory_matches
                     .iter()
                     .filter_map(|matched| {
-                        surface_indices.get(&matched.surface).map(|surface| {
-                            render::SelectionMatch {
-                                surface: *surface,
-                                name_agrees: matched.name_agrees,
-                                version_agrees: matched.version_agrees,
-                            }
+                        let Some((surface, owner)) = surface_indices.get(&matched.surface) else {
+                            selection_truncated = true;
+                            return None;
+                        };
+                        if *owner != module {
+                            selection_truncated = true;
+                            return None;
+                        }
+                        Some(render::SelectionMatch {
+                            surface: *surface,
+                            name_agrees: matched.name_agrees,
+                            version_agrees: matched.version_agrees,
                         })
                     })
                     .collect();
+                selection_truncated |= inventory_matches.len() != tuple.inventory_matches.len();
                 let lost_inventory_authority = tuple.authority == SelectionAuthority::Inventory
                     && inventory_matches.is_empty();
-                render::SelectionTuple {
-                    module: tuple.module.0,
+                Some(render::SelectionTuple {
+                    module,
                     request: tuple.request,
                     rv: tuple.rv,
                     result: tuple.result,
@@ -5672,17 +5699,18 @@ impl Engine {
                         tuple.authority
                     },
                     count: tuple.count,
-                }
+                })
             })
             .collect();
         tuples.sort_by_key(|tuple| serde_json::to_string(tuple).unwrap_or_default());
+        tuples.dedup();
 
         render::InterfaceSelection {
             providers,
             standard_exports,
             inventory_surfaces,
             tuples,
-            selection_truncated: history.selection_truncated,
+            selection_truncated,
         }
     }
 
@@ -16854,6 +16882,11 @@ int main(int argc, char **argv) {
             .capture_facts
             .module_ids
             .insert(second.clone(), plan::ModuleId(1));
+        for id in [plan::ModuleId(0), plan::ModuleId(1)] {
+            let mut module = merged_module(vec!["scan"]);
+            module.id = id;
+            engine.capture_facts.history.modules.insert(id, module);
+        }
         let surface = |provider, offset, name| InventorySurfaceKey {
             base: InventorySurfaceBase {
                 provider,
@@ -16880,31 +16913,29 @@ int main(int argc, char **argv) {
             .history
             .selection_surfaces
             .insert(first_surface.clone());
-        engine
-            .capture_facts
-            .history
-            .selections
-            .push(LiveSelectionTuple {
-                module: plan::ModuleId(0),
-                request: SelectionRequest {
-                    name: SelectionNameClass::ExactStandard,
-                    version: SelectionVersionClass::V3_0,
-                    flags: 0,
-                },
-                rv: 0,
-                result: Some(SelectionRequest {
-                    name: SelectionNameClass::ExactStandard,
-                    version: SelectionVersionClass::V3_0,
-                    flags: 0,
-                }),
-                inventory_matches: vec![LiveInventoryMatch {
-                    surface: first_surface,
-                    name_agrees: false,
-                    version_agrees: true,
-                }],
-                authority: SelectionAuthority::Inventory,
-                count: u64::MAX,
-            });
+        let tuple = LiveSelectionTuple {
+            module: plan::ModuleId(0),
+            request: SelectionRequest {
+                name: SelectionNameClass::ExactStandard,
+                version: SelectionVersionClass::V3_0,
+                flags: 0,
+            },
+            rv: 0,
+            result: Some(SelectionRequest {
+                name: SelectionNameClass::ExactStandard,
+                version: SelectionVersionClass::V3_0,
+                flags: 0,
+            }),
+            inventory_matches: vec![LiveInventoryMatch {
+                surface: first_surface,
+                name_agrees: false,
+                version_agrees: true,
+            }],
+            authority: SelectionAuthority::Inventory,
+            count: u64::MAX,
+        };
+        engine.capture_facts.history.selections.push(tuple.clone());
+        engine.capture_facts.history.selections.push(tuple);
 
         let selection = engine.interface_selection();
         assert_eq!(
@@ -16917,9 +16948,208 @@ int main(int argc, char **argv) {
         );
         assert_eq!(selection.tuples[0].inventory_matches[0].surface, 0);
         assert_eq!(selection.tuples[0].count, u64::MAX);
+        assert_eq!(selection.tuples.len(), 1);
         let json = serde_json::to_string(&selection).unwrap();
         assert!(!json.contains("private-name-canary"));
         assert!(!json.contains("feed"));
+    }
+
+    #[test]
+    fn public_module_indices_are_dense_after_stable_id_zero_is_refused() {
+        let (_fixture, _source, _session, binding) = attached_selection_route();
+        let mut engine = Engine::empty();
+        let refused = timing_key(0);
+        let first = timing_key(1);
+        let second = timing_key(2);
+        assert_eq!(
+            engine.capture_facts.resolve_module_id(&refused).unwrap(),
+            plan::ModuleId(0)
+        );
+        assert_eq!(
+            engine.capture_facts.resolve_module_id(&first).unwrap(),
+            plan::ModuleId(1)
+        );
+        assert_eq!(
+            engine.capture_facts.resolve_module_id(&second).unwrap(),
+            plan::ModuleId(2)
+        );
+
+        for (stable, public, key) in [
+            (plan::ModuleId(1), 0, first),
+            (plan::ModuleId(2), 1, second),
+        ] {
+            let mut module = merged_module(vec!["scan"]);
+            module.id = stable;
+            engine.capture_facts.history.modules.insert(stable, module);
+            assert_eq!(engine.capture_facts.module_ids[&key], stable);
+            engine
+                .capture_facts
+                .history
+                .standard_exports
+                .insert(stable, BTreeSet::from([StandardExportFact::Present]));
+            let mut retained = binding;
+            retained.id = u64::from(stable.0) + 10;
+            retained.provider = stable;
+            retained.observed = true;
+            engine.selection_bindings.insert(retained.id, retained);
+            assert_eq!(
+                engine.selection_coverage(stable),
+                Some(SelectionCoverageVerdict::Observed)
+            );
+            assert_eq!(public, usize::try_from(stable.0 - 1).unwrap());
+        }
+        engine
+            .capture_facts
+            .history
+            .selections
+            .push(LiveSelectionTuple {
+                module: plan::ModuleId(2),
+                request: SelectionRequest {
+                    name: SelectionNameClass::Null,
+                    version: SelectionVersionClass::Null,
+                    flags: 0,
+                },
+                rv: 1,
+                result: None,
+                inventory_matches: vec![],
+                authority: SelectionAuthority::None,
+                count: 1,
+            });
+
+        let selection = engine.interface_selection();
+        assert_eq!(
+            selection
+                .providers
+                .iter()
+                .map(|row| row.module)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert_eq!(
+            selection
+                .standard_exports
+                .iter()
+                .map(|row| row.module)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert!(
+            selection
+                .standard_exports
+                .iter()
+                .all(|row| row.status == "present")
+        );
+        assert_eq!(selection.tuples[0].module, 1);
+    }
+
+    #[test]
+    fn invalid_selection_cross_reference_is_dropped_and_truncated() {
+        let mut engine = Engine::empty();
+        let provider = timing_key(1);
+        let foreign = timing_key(2);
+        engine
+            .capture_facts
+            .module_ids
+            .insert(provider.clone(), plan::ModuleId(1));
+        engine
+            .capture_facts
+            .module_ids
+            .insert(foreign.clone(), plan::ModuleId(2));
+        let mut module = merged_module(vec!["scan"]);
+        module.id = plan::ModuleId(1);
+        engine
+            .capture_facts
+            .history
+            .modules
+            .insert(module.id, module);
+        let mut second_module = merged_module(vec!["scan"]);
+        second_module.id = plan::ModuleId(2);
+        engine
+            .capture_facts
+            .history
+            .modules
+            .insert(second_module.id, second_module);
+        let foreign_surface = InventorySurfaceKey {
+            base: InventorySurfaceBase {
+                provider: foreign,
+                table_file_offset: 1,
+                kind: InventorySurfaceKind::Interface,
+                name: PrivateSelectionName::ExactStandard,
+                version: SelectionVersionClass::V3_0,
+                flags: 0,
+            },
+            duplicate: 0,
+        };
+        engine
+            .capture_facts
+            .history
+            .selection_surfaces
+            .insert(foreign_surface.clone());
+        engine
+            .capture_facts
+            .history
+            .selection_surfaces
+            .insert(InventorySurfaceKey {
+                base: InventorySurfaceBase {
+                    provider: timing_key(0),
+                    table_file_offset: 2,
+                    kind: InventorySurfaceKind::Legacy,
+                    name: PrivateSelectionName::Legacy,
+                    version: SelectionVersionClass::V2_40,
+                    flags: 0,
+                },
+                duplicate: 0,
+            });
+        engine
+            .capture_facts
+            .history
+            .selections
+            .push(LiveSelectionTuple {
+                module: plan::ModuleId(1),
+                request: SelectionRequest {
+                    name: SelectionNameClass::ExactStandard,
+                    version: SelectionVersionClass::V3_0,
+                    flags: 0,
+                },
+                rv: 0,
+                result: Some(SelectionRequest {
+                    name: SelectionNameClass::ExactStandard,
+                    version: SelectionVersionClass::V3_0,
+                    flags: 0,
+                }),
+                inventory_matches: vec![LiveInventoryMatch {
+                    surface: foreign_surface,
+                    name_agrees: true,
+                    version_agrees: true,
+                }],
+                authority: SelectionAuthority::Inventory,
+                count: 1,
+            });
+        engine
+            .capture_facts
+            .history
+            .selections
+            .push(LiveSelectionTuple {
+                module: plan::ModuleId(0),
+                request: SelectionRequest {
+                    name: SelectionNameClass::Null,
+                    version: SelectionVersionClass::Null,
+                    flags: 0,
+                },
+                rv: 1,
+                result: None,
+                inventory_matches: vec![],
+                authority: SelectionAuthority::None,
+                count: 1,
+            });
+
+        let selection = engine.interface_selection();
+        assert_eq!(selection.inventory_surfaces.len(), 1);
+        assert_eq!(selection.inventory_surfaces[0].module, 1);
+        assert_eq!(selection.tuples.len(), 1);
+        assert!(selection.tuples[0].inventory_matches.is_empty());
+        assert_eq!(selection.tuples[0].authority, SelectionAuthority::None);
+        assert!(selection.selection_truncated);
     }
 
     #[test]

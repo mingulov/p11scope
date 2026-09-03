@@ -111,7 +111,6 @@ pub struct CaptureFacts {
     pub(crate) discovery_state_failures: u64,
     pub(crate) discovery_read_failures: u64,
     pub(crate) discovery_truncated: u64,
-    pub(crate) interface_selection: InterfaceSelection,
 }
 
 impl CaptureFacts {
@@ -146,10 +145,6 @@ impl CaptureFacts {
             self.discovery_read_failures,
             self.discovery_truncated,
         ]
-    }
-
-    pub fn interface_selection(&self) -> &InterfaceSelection {
-        &self.interface_selection
     }
 
     /// The one live-heading policy: every ordinary heading names the providers
@@ -188,10 +183,13 @@ impl InterfaceSelection {
                 .standard_exports
                 .iter()
                 .all(|export| matches!(export.status, "present" | "legacy_absent"))
-            && self
-                .tuples
-                .iter()
-                .all(|tuple| tuple.authority != SelectionAuthority::SelectionCountOnly)
+            && self.tuples.iter().all(|tuple| {
+                tuple.authority != SelectionAuthority::SelectionCountOnly
+                    && !(tuple.rv == 0
+                        && tuple.result.is_some()
+                        && tuple.inventory_matches.is_empty()
+                        && tuple.authority == SelectionAuthority::None)
+            })
     }
 }
 
@@ -583,6 +581,10 @@ impl Evidence {
     /// `scan_unavailable` is only transitively covered by `slots` for `--pid`;
     /// a cgroup with one readable and one unreadable process needs its own.
     pub fn verdict(&mut self) {
+        self.verdict_with_selection(true);
+    }
+
+    pub(crate) fn verdict_with_selection(&mut self, include_selection: bool) {
         let surfaces_complete = self
             .surfaces
             .iter()
@@ -641,9 +643,10 @@ impl Evidence {
             && self.discovery_truncated == 0
             && self.pause_partial == 0
             && self.loader_discovery.complete()
-            && self.interface_selection.complete()
-            && self.pid_descendant_gaps == 0
-            && self.multi_rebuild_gaps == 0
+            && (!include_selection
+                || self.interface_selection.complete()
+                    && self.pid_descendant_gaps == 0
+                    && self.multi_rebuild_gaps == 0)
         {
             "COMPLETE"
         } else {
@@ -1541,6 +1544,24 @@ mod tests {
         }
     }
 
+    fn selection_tuple(rv: u64, result: bool, authority: SelectionAuthority) -> SelectionTuple {
+        let request = SelectionRequest {
+            name: p11scope_manifest::manifest::SelectionNameClass::ExactStandard,
+            version: p11scope_manifest::manifest::SelectionVersionClass::V3_0,
+            flags: 0,
+        };
+        SelectionTuple {
+            module: 0,
+            request,
+            rv,
+            result: result.then_some(request),
+            table_match: false,
+            inventory_matches: vec![],
+            authority,
+            count: 1,
+        }
+    }
+
     #[test]
     fn profile_v3_selection_contract_is_exact() {
         let ev = evidence();
@@ -1582,6 +1603,285 @@ mod tests {
         ] {
             assert!(metrics["evidence"].get(field).is_none(), "{field}");
         }
+    }
+
+    #[test]
+    fn profile_v3_selection_variants_have_exact_inner_shapes() {
+        use p11scope_manifest::manifest::{
+            SelectionNameClass as Name, SelectionVersionClass as Version,
+        };
+        use std::collections::BTreeSet;
+
+        let names = [
+            Name::Null,
+            Name::ExactStandard,
+            Name::Other,
+            Name::Unreadable,
+        ];
+        let versions = [
+            Version::Null,
+            Version::Unreadable,
+            Version::V2_40,
+            Version::V3_0,
+            Version::V3_1,
+            Version::V3_2,
+            Version::Other,
+        ];
+        let mut ev = evidence();
+        ev.interface_selection.providers = [
+            "observed",
+            "observed_uncovered",
+            "absent_covered",
+            "absent_uncovered",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(module, coverage)| SelectionProvider {
+            module: module as u32,
+            coverage,
+        })
+        .collect();
+        ev.interface_selection.standard_exports = [
+            "present",
+            "legacy_absent",
+            "required_absent",
+            "outside_module",
+            "unresolved",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(module, status)| StandardExport {
+            module: module as u32,
+            status,
+        })
+        .collect();
+        ev.interface_selection.inventory_surfaces = vec![
+            SelectionSurface {
+                module: 0,
+                ordinal: 0,
+                kind: "legacy",
+            },
+            SelectionSurface {
+                module: 0,
+                ordinal: 1,
+                kind: "interface",
+            },
+        ];
+        ev.interface_selection.tuples = versions
+            .into_iter()
+            .enumerate()
+            .map(|(index, version)| {
+                let request = SelectionRequest {
+                    name: names[index.min(names.len() - 1)],
+                    version,
+                    flags: index as u64,
+                };
+                SelectionTuple {
+                    module: 0,
+                    request,
+                    rv: if index == 2 { 1 } else { 0 },
+                    result: (index != 2).then_some(request),
+                    table_match: false,
+                    inventory_matches: vec![],
+                    authority: SelectionAuthority::None,
+                    count: u64::MAX,
+                }
+            })
+            .collect();
+        let exact = SelectionRequest {
+            name: Name::ExactStandard,
+            version: Version::V3_0,
+            flags: 0,
+        };
+        ev.interface_selection.tuples.extend([
+            SelectionTuple {
+                module: 0,
+                request: exact,
+                rv: 0,
+                result: Some(exact),
+                table_match: true,
+                inventory_matches: vec![SelectionMatch {
+                    surface: 0,
+                    name_agrees: true,
+                    version_agrees: true,
+                }],
+                authority: SelectionAuthority::Inventory,
+                count: u64::MAX,
+            },
+            SelectionTuple {
+                module: 0,
+                request: exact,
+                rv: 0,
+                result: Some(exact),
+                table_match: false,
+                inventory_matches: vec![],
+                authority: SelectionAuthority::SelectionCountOnly,
+                count: u64::MAX,
+            },
+        ]);
+
+        let profile = profile_json(
+            &reports_fixture(),
+            &ev,
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        let selection = &profile["evidence"]["interface_selection"];
+        fn keys(value: &serde_json::Value) -> BTreeSet<&str> {
+            value
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>()
+        }
+        assert_eq!(
+            keys(selection),
+            BTreeSet::from([
+                "inventory_surfaces",
+                "providers",
+                "selection_truncated",
+                "standard_exports",
+                "tuples"
+            ])
+        );
+        for provider in selection["providers"].as_array().unwrap() {
+            assert_eq!(keys(provider), BTreeSet::from(["coverage", "module"]));
+        }
+        for export in selection["standard_exports"].as_array().unwrap() {
+            assert_eq!(keys(export), BTreeSet::from(["module", "status"]));
+        }
+        for surface in selection["inventory_surfaces"].as_array().unwrap() {
+            assert_eq!(keys(surface), BTreeSet::from(["kind", "module", "ordinal"]));
+        }
+        for tuple in selection["tuples"].as_array().unwrap() {
+            assert_eq!(
+                keys(tuple),
+                BTreeSet::from([
+                    "authority",
+                    "count",
+                    "inventory_matches",
+                    "module",
+                    "request",
+                    "result",
+                    "rv",
+                    "table_match"
+                ])
+            );
+            assert_eq!(
+                keys(&tuple["request"]),
+                BTreeSet::from(["flags", "name", "version"])
+            );
+            if !tuple["result"].is_null() {
+                assert_eq!(
+                    keys(&tuple["result"]),
+                    BTreeSet::from(["flags", "name", "version"])
+                );
+            }
+        }
+        assert_eq!(
+            keys(&selection["tuples"][7]["inventory_matches"][0]),
+            BTreeSet::from(["name_agrees", "surface", "version_agrees"])
+        );
+        assert_eq!(
+            selection["providers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["coverage"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "observed",
+                "observed_uncovered",
+                "absent_covered",
+                "absent_uncovered"
+            ]
+        );
+        assert_eq!(
+            selection["standard_exports"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["status"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "present",
+                "legacy_absent",
+                "required_absent",
+                "outside_module",
+                "unresolved"
+            ]
+        );
+        assert_eq!(
+            selection["inventory_surfaces"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["kind"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["legacy", "interface"]
+        );
+        assert_eq!(
+            selection["tuples"].as_array().unwrap()[..4]
+                .iter()
+                .map(|row| row["request"]["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["null", "exact_standard", "other", "unreadable"]
+        );
+        assert_eq!(
+            selection["tuples"].as_array().unwrap()[..7]
+                .iter()
+                .map(|row| row["request"]["version"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "null",
+                "unreadable",
+                "v2_40",
+                "v3_0",
+                "v3_1",
+                "v3_2",
+                "other"
+            ]
+        );
+        assert_eq!(selection["tuples"][7]["authority"], "inventory");
+        assert_eq!(selection["tuples"][8]["authority"], "selection_count_only");
+        assert_eq!(selection["tuples"][2]["result"], serde_json::Value::Null);
+        assert_eq!(selection["tuples"][2]["authority"], "none");
+        for (index, tuple) in selection["tuples"].as_array().unwrap().iter().enumerate() {
+            assert_eq!(tuple["result"].is_null(), tuple["rv"] != 0, "tuple {index}");
+        }
+        assert_eq!(selection["tuples"][0]["count"], u64::MAX);
+        assert_eq!(
+            selection,
+            &trace_evidence_object(&ev)["interface_selection"],
+            "profile and terminal trace must serialize identical selection evidence"
+        );
+    }
+
+    #[test]
+    fn metrics_completeness_ignores_hidden_selection_state() {
+        let mut baseline = evidence();
+        baseline.verdict_with_selection(false);
+        let expected = baseline.completeness;
+
+        baseline.interface_selection.selection_truncated = true;
+        baseline
+            .interface_selection
+            .providers
+            .push(SelectionProvider {
+                module: 0,
+                coverage: "absent_uncovered",
+            });
+        baseline.verdict_with_selection(false);
+        assert_eq!(baseline.completeness, expected);
+        assert!(
+            json(&reports_fixture(), &baseline, &capture_fixture())["evidence"]
+                .get("interface_selection")
+                .is_none()
+        );
+
+        baseline.verdict_with_selection(true);
+        assert_eq!(baseline.completeness, "PARTIAL");
     }
 
     fn discovered_fixture() -> DiscoveredModule {
@@ -3445,7 +3745,13 @@ mod tests {
             ("selection truncation", |ev| {
                 ev.interface_selection.selection_truncated = true
             }),
-            ("selection uncovered", |ev| {
+            ("selection observed uncovered", |ev| {
+                ev.interface_selection.providers.push(SelectionProvider {
+                    module: 0,
+                    coverage: "observed_uncovered",
+                })
+            }),
+            ("selection absent uncovered", |ev| {
                 ev.interface_selection.providers.push(SelectionProvider {
                     module: 0,
                     coverage: "absent_uncovered",
@@ -3459,21 +3765,35 @@ mod tests {
                         status: "required_absent",
                     })
             }),
+            ("standard export outside module", |ev| {
+                ev.interface_selection
+                    .standard_exports
+                    .push(StandardExport {
+                        module: 0,
+                        status: "outside_module",
+                    })
+            }),
+            ("standard export unresolved", |ev| {
+                ev.interface_selection
+                    .standard_exports
+                    .push(StandardExport {
+                        module: 0,
+                        status: "unresolved",
+                    })
+            }),
             ("selection count-only authority", |ev| {
-                ev.interface_selection.tuples.push(SelectionTuple {
-                    module: 0,
-                    request: SelectionRequest {
-                        name: p11scope_manifest::manifest::SelectionNameClass::ExactStandard,
-                        version: p11scope_manifest::manifest::SelectionVersionClass::V3_0,
-                        flags: 0,
-                    },
-                    rv: 0,
-                    result: None,
-                    table_match: false,
-                    inventory_matches: vec![],
-                    authority: SelectionAuthority::SelectionCountOnly,
-                    count: 1,
-                })
+                ev.interface_selection.tuples.push(selection_tuple(
+                    0,
+                    true,
+                    SelectionAuthority::SelectionCountOnly,
+                ))
+            }),
+            ("unmatched successful selection", |ev| {
+                ev.interface_selection.tuples.push(selection_tuple(
+                    0,
+                    true,
+                    SelectionAuthority::None,
+                ))
             }),
             ("pid descendant gap", |ev| ev.pid_descendant_gaps = 1),
             ("multi rebuild gap", |ev| ev.multi_rebuild_gaps = 1),
@@ -3488,6 +3808,45 @@ mod tests {
             // Sticky: a later clean pass cannot promote it back.
             ev.verdict();
             assert_eq!(ev.completeness, "PARTIAL", "{name} was un-stuck");
+        }
+    }
+
+    #[test]
+    fn neutral_selection_states_preserve_baseline_completeness() {
+        let neutral: Vec<(&str, NamedLoss)> = vec![
+            ("observed", |ev| {
+                ev.interface_selection.providers.push(SelectionProvider {
+                    module: 0,
+                    coverage: "observed",
+                })
+            }),
+            ("absent covered", |ev| {
+                ev.interface_selection.providers.push(SelectionProvider {
+                    module: 0,
+                    coverage: "absent_covered",
+                })
+            }),
+            ("legacy absent", |ev| {
+                ev.interface_selection
+                    .standard_exports
+                    .push(StandardExport {
+                        module: 0,
+                        status: "legacy_absent",
+                    })
+            }),
+            ("nonzero rv", |ev| {
+                ev.interface_selection.tuples.push(selection_tuple(
+                    1,
+                    false,
+                    SelectionAuthority::None,
+                ))
+            }),
+        ];
+        for (name, apply) in neutral {
+            let mut ev = evidence();
+            apply(&mut ev);
+            ev.verdict();
+            assert_eq!(ev.completeness, "COMPLETE", "{name}");
         }
     }
 

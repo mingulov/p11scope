@@ -368,8 +368,14 @@ partial). Slice-by-slice evidence including every deferred Minor is under
   sub-5.15 kernel in this repo — no such kernel was available
   (`docs/notes/phase5-unsupported.md`, case 5). `docs/usage.md` states
   this caveat explicitly, next to the kernel-floor claim itself.
-- **The canary suite is green locally, not in CI** — there is still no
-  CI pipeline in this repo (a Phase 3 G3 finding that remains true).
+- **The canary suite is green locally, not in CI** — narrowed and corrected
+  2026-09-05: the original "there is still no CI pipeline in this repo" has
+  been false since `64f9281` (2026-08-15). A pipeline exists
+  (`.github/workflows/ci.yml`), is present on `origin/main`, and has run
+  hosted successfully (run `31935749796`, 2026-08-16). What remains true is
+  narrower: the **canary and privileged lanes** have never run hosted, and by
+  design stay local-with-owner-approval. W4 widens the hosted lane set and
+  restates this bullet to its true scope.
 - **Matrix limitations still standing**, per
   `docs/notes/phase4-matrix.md`: Knative's `--cgroup` scope is node-wide,
   not per-Service (an honest limit of what Kubernetes exposes, not a
@@ -636,7 +642,7 @@ founding rule).
 | W1 | **Task 0 custody rescue first**, then eight scan findings (Tasks 1–8), TDD, review-to-zero; private SDD trove only in `p11scope-ws` | [full plan, reviewed 2026-09-01](2026-09-01-release-hardening-wave1-findings.md) |
 | W2 | Storage consolidation: two-directory rule, migrate + repoint, `p11scope-ws` custody | [full plan](2026-09-01-wave2-storage-consolidation.md) |
 | W3 | **Priority 1: `C_GetInterface` compatibility closure** (partial passive behavior → separate live request/result/failure evidence plus finite offline helper matrix; selection authority limited to exact retained generation or attested exact provider, never inventory); then tracepoint offsets, opened-inode identity, capability tiers, honest-degradation fixes, and per-offset qualification inputs | [plan](2026-09-02-wave3-correctness-residue.md) / [closure](../reports/2026-09-02-wave3-correctness-closure.md) |
-| W4 | Hosted CI running the full suite; "green locally, not in CI" dies | [charter](2026-09-01-release-wave-charters.md#w4) |
+| W4 | Widen the existing hosted pipeline to the four gates + unprivileged suite + container-less e2e; privileged lanes stay local and are recorded UNRUN visibly; fix the stale frozen BPF map inventory that three unrun lanes would fail on | [charter](2026-09-01-release-wave-charters.md#w4) |
 | W7 | ia32 targets on x86-64 hosts | [charter](2026-09-01-release-wave-charters.md#w7) |
 | W5 | Container/K8s requalification (provisional; W8 re-runs on the final tip) + seccomp/SELinux artifacts | [charter](2026-09-01-release-wave-charters.md#w5) |
 | W6 | Multi-distro/kernel matrix; support restated "5.15.x, tested on ⟨list⟩"; load-only CI matrix; run the supported-rate/loss and fork-exec-loader-unload product oracles on the per-offset path | [charter](2026-09-01-release-wave-charters.md#w6) |

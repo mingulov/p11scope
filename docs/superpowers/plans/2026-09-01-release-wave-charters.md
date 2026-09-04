@@ -128,35 +128,89 @@ checklist-9 verdict-binding test named in the wave report.
 
 ## W4 — Hosted CI {#w4}
 
-**Objective:** the full suite runs hosted; the "green locally, not in CI"
-caveat standing since Phase 3 G3 dies.
+**Objective:** the four canonical gates + the unprivileged suite + the
+container-less e2e lanes run hosted, and the "the canary/privileged suite is
+green locally, not in CI" caveat (ROADMAP "canary suite" bullet) is restated
+honestly rather than left overbroad. The privileged lanes stay local by
+design, so "the full suite runs hosted" was never the achievable objective.
 
 **Scope:** a hosted pipeline running the four canonical gates + the
-unprivileged test suite + the container-less e2e lanes on x86-64; artifacts
-(logs, junit) retained; badge/status truthful. Privileged/root lanes stay
-local-with-owner-approval — CI records them UNRUN, visibly. Pin toolchain
-1.88 and the lockfile; cache honestly (no cache-poisoned green).
+unprivileged test suite + the container-less e2e lanes on x86-64; run logs
+retained (`upload-artifact` plus an archived copy in `p11scope-ws`) — junit
+only if a producer is adopted, since stable `cargo test` emits none; no
+default-branch badge (origin/main lags, so a `main` badge would be
+untruthful) — status is reported per branch/commit in the wave report.
+Privileged/root lanes stay local-with-owner-approval — CI records them UNRUN,
+visibly, **in the log and summary, not via exit status**: `verify-capability-tier.sh`
+prints `UNRUN:` and exits 0, so a green step does not prove a lane ran. Pin
+toolchain 1.88 and the lockfile; cache honestly (no cache-poisoned green) —
+the pipeline currently has no cache at all, so "honest" is today trivially
+true and must stay so if a cache is added.
+
+**Release-blocking defect found during W4 pass-1 (2026-09-05) — fix in this
+wave, TDD:** the frozen BPF map inventory in `scripts/check-bpf-map-defs.py`
+is **stale**. W3 commit `02eedbd` changed `CONFIG` from
+`Array::with_max_entries(1, …)` to `(2, …)` (a second entry for the
+parent/child tracepoint offsets) without updating the freeze, which still
+pins `"CONFIG": (2, 4, 8, 1, 128)` — `max_entries` 1. Reproduced against a
+real built object: `--policy-inventory` exits `default map inventory
+differs`. A full field-by-field diff of the object against the freeze shows
+**exactly one** drift, `CONFIG.max_entries 1 → 2`, with no map added or
+removed — so this is a stale count, **not** a capture-surface or privacy
+regression, and the freeze's actual security purpose (no unexpected map can
+appear) is intact.
+
+It is release-blocking because `--policy-inventory` is invoked by
+`scripts/verify-canaries.sh` (the G3 privacy canary lane),
+`scripts/verify-induced-gaps.sh` (full), and `scripts/build-release.sh` (the
+W8 Lane 14 receipt) — all three fail the moment they run. It survived because
+CI and the four cargo gates run only `--self-test`, which validates the
+script against its own constant and is therefore self-consistent and blind to
+this class of drift.
+
+Root cause, and the real W4 deliverable: the freeze can drift from the code
+with no gate noticing. Fixing the constant alone leaves the hole open —
+**put an inventory comparison against a built object into the hosted
+pipeline** (ci.yml already installs bpf-linker and the pinned nightly, so
+this is affordable) so the next such drift fails immediately rather than at
+release assembly.
 
 **Owner-gated:** choice of CI host if it implies accounts/spend; ANY push to
 the remote (including a CI-enablement push).
 
-**Known constraint for the planner (corrected 2026-09-01):** the repo HAS a
-remote with old history — `origin/main` = `367cadd` (`.codex`), a strict
-fast-forwardable ancestor 239 commits behind verified local `main`
-`5d251b76b33b14839a7147e14b5ccd1348855587`, whose public tip
-sits one commit above a "not ready" wip checkpoint. So hosted CI is
-technically enableable on the existing remote, but bringing it current means
-pushing 239 commits — an owner decision. **The wave STARTS by surfacing that
-decision.** If the owner defers the push: deliver the complete pipeline
-definition (`.github/workflows/` or equivalent) with `act`/local dry-run
-evidence, and record — visibly, in the wave report and the W8 acceptance
-table — that spec §6's "CI runs the suite hosted" bullet is **UNMET** until
-the owner authorizes; W8 cannot close the acceptance table without either
-the hosted run or an owner amendment of the DoD. Never treat the dormant
-pipeline as satisfying spec §6.
+**Known constraint for the planner (re-verified 2026-09-05; the 2026-09-01
+text below it was stale on every number):** `origin/main` = **`a2a2644`**
+("docs: close wave 2 storage consolidation"), pushed from this clone on
+2026-09-02 15:04 +0300 — **not** `367cadd`, and **not** 239 commits behind.
+It is a strict fast-forwardable ancestor **74** commits behind local `main`
+`a50f841`. W1 and W2 are therefore **already public**. The "not ready" wip
+checkpoint `6fa7fb3` is still public but now sits ~293 commits deep in
+history, not one below the tip. `origin/main` here is a local
+remote-tracking copy, unfetched since 2026-08-21 — re-verify before acting.
+Critically, `.github/workflows/ci.yml` is **already on origin/main**,
+byte-identical to local, and **has already run hosted successfully** (run
+`31935749796`, 2026-08-16, `checks-and-e2e` success). So this wave is not
+building a pipeline from nothing; it is widening an existing, proven one.
 
-**Exit evidence:** pipeline definition merged; a complete hosted run log —
-or, under a deferred push, the dry-run log PLUS the explicit UNMET record.
+**Owner decision (2026-09-05) — supersedes the "wave STARTS by surfacing that
+decision" instruction, which is now discharged:** CI is enabled by pushing a
+**CI test branch only** (e.g. `ci/w4-hosted`); `origin/main` stays at
+`a2a2644` until W8's publication runbook reconciles it. A completed hosted run
+on that branch is the hosted-run evidence; `act`/local dry-run is optional and
+strictly weaker (act cannot run this pipeline faithfully — `rustup toolchain
+install` needs network and root BPF attach needs a privileged container on the
+host kernel), so it is not the evidence path. The **UNMET** rule now applies
+only if no hosted run of the current pipeline completes. Never treat a dormant
+pipeline as satisfying the requirements spec §6 bullet.
+
+Note for the report's honesty section: because the branch push publishes the
+same content on a visible non-default branch, "stale main" hides W3+ from the
+default view only — it is not a privacy control, and W1/W2 are public already.
+
+**Exit evidence:** pipeline definition merged; a complete hosted run with its
+run URL/ID, `success` conclusion, the run's commit SHA **and tree hash matching
+local `main`'s W4-closing tip**, the log archived in `p11scope-ws`, and the
+verbatim UNRUN lane list. Absent that, the explicit UNMET record.
 
 ---
 
@@ -224,15 +278,59 @@ statement updated in the same commit as the evidence.
 **Objective:** observe a 32-bit target process on an x86-64 host (PRD §7
 minimum; item #2 / checklist 10).
 
-**Scope:** make userspace pointer stride a parameter — every
-`bpf_probe_read_user(x as *const u64)` in the uprobe path assumes 8-byte
-pointers today; determine target ABI from the ELF class at exec and cache
-per-TGID (`in_ia32_syscall()` is invalid in uprobe context and always
-returns false — checklist 10); parse maps addresses width-agnostically;
-32-bit fixture provider (`gcc -m32`) through discovery, attach, and capture;
-honest refusal (recorded outcome, not silence) for whatever 32-bit corner
-stays unsupported. Full 32-bit *counting mode* is deferred by default
-(feature-slices doc) — this wave is observe-a-target only.
+**Scope (re-verified 2026-09-05 — the original wording understated the
+problem and overstated the machinery):** make the **target ABI**, not merely
+"pointer stride", a parameter of the uprobe path. Three things change on
+ia32, not one: (i) **argument fetch** — an ia32 cdecl callee takes arguments
+at `esp+4+4i`, not in `rdi..r9`, so `arg_u64` and the `ctx.arg::<u64>(n)`
+call sites are the largest break and are not `probe_read` sites at all;
+(ii) **width** — pointers *and* `CK_ULONG` are 4 bytes (`gcc -m32`:
+`sizeof(unsigned long)==4`), so there is no class of "ABI-independent
+`CK_ULONG`/handle/length" reads that stays 8-byte; (iii) **struct offsets** —
+`CK_FUNCTION_LIST`, `CK_INTERFACE`, `CK_MECHANISM`, `CK_ATTRIBUTE`,
+`CK_GCM_PARAMS`, `CK_RSA_PKCS_PSS_PARAMS`, and `r_debug` all shrink. The
+plan carries the authoritative per-site list split into MUST-parameterize
+and MUST-NOT-touch (`CK_VERSION` `[u8;2]`, `CK_BBOOL`, `probe_read_user_str`
+byte reads, `ctx.ret()`, the tracepoints, and the `pid_tgid`/cookie keying
+all stay).
+
+Determine ABI from the **pinned object's ELF class at plan/attach time**
+(`crates/manifest/src/elf.rs::parse` already computes `is_64()` — and today
+*refuses* anything else) and carry it in the **attach cookie**; the static
+cookie is `slot | descriptor<<32` with descriptor < 105, so bits 39-63 are
+free. **No per-TGID map, no exec-time cache, no kernel-struct read** — the
+charter's original "cache per-TGID" is unbuildable as written (`PID_FILTER`
+is `RDONLY_PROG` and its value is an exactly-read-back generation token) and
+unnecessary, since the dynamic loader refuses mixed-class objects, making ABI
+a property of the attached object. Avoiding a `task_struct` read also keeps
+BTF independence. `in_ia32_syscall()` remains correctly ruled out
+(checklist 10) and is moot — no BPF helper exposes it.
+
+**Delete from scope:** "parse maps addresses width-agnostically" — already
+true (`crates/manifest/src/maps.rs` uses `u64::from_str_radix`, verified
+against a real 32-bit process's `/proc/<pid>/maps`). Replace with a test row
+feeding a 32-bit maps snapshot through `parse_maps`.
+
+**W7 is NOT a BPF-only wave.** `elf.rs::parse` refuses non-64-bit objects and
+the `/proc/<pid>/mem` scan hard-codes `WORD=8` / `INTERFACE_BYTES=24`, so
+live discovery is in scope too. The 64-bit `p11scope-discover` helper cannot
+`dlopen` an ELFCLASS32 provider and stays refused-with-reason unless an i686
+build is owner-approved.
+
+Honest refusal reuses the existing `Skipped { subject, reason }` →
+`modules_skipped` → `PARTIAL` path (a 32-bit module already lands there).
+Fix the one silent-wrong spot: `src/run.rs` refuses a 32-bit ELF launch as
+*"must be an ELF executable"* rather than as *32-bit*.
+
+**Owner decision needed — "observe" is undefined and the deferral wording is
+self-contradictory:** feature-slices calls the deferred item "32-bit counting
+mode (full ia32 capture …)", but in this codebase counting/aggregate is the
+*least* demanding mode (`p11_entry_impl` returns before any user read) while
+full capture is the most. **Default adopted for planning, pullable by the
+owner:** observe = metrics/aggregate + allowlisted profile scalars
+(session/slot/flags/mechanism/rv); `unsafe-unvalidated-metadata` templates
+and params, and the ia32 loader hook, are refused-with-reason and force
+`PARTIAL`. Correct the feature-slices wording in the same commit.
 
 **Owner-gated:** the privileged 32-bit e2e lane (uprobe attach needs root —
 CLAUDE.md; unprivileged development rows run, the privileged lane is UNRUN
@@ -265,8 +363,11 @@ locally.
 requalification lane; and publication itself (push, tag, GitHub release) —
 the wave ENDS at "staged and verified"; the last artifact is a one-page
 publication runbook for the owner, which MUST address reconciling the stale
-public remote (its tip `367cadd` remains 239 commits behind local main and
-sits one commit above a "not ready" wip checkpoint that is already public).
+public remote (re-verified 2026-09-05: its tip is `a2a2644`, the W2 closure
+pushed 2026-09-02 — **not** `367cadd` — leaving it 74+ commits behind local
+main; the "not ready" wip checkpoint `6fa7fb3` is already public but now sits
+deep in history, not one below the tip; and W3+ content is additionally public
+on the `ci/w4-hosted` branch after W4).
 
 **Exit evidence:** the filled acceptance table; the staged bundle's checksums;
 zero accepted findings in the final cycle.

@@ -10,6 +10,35 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      # UNRUN lanes begin
+      # Honest scope, printed first so it reaches the log even when a later step
+      # fails. A passing --self-test exercises a lane's oracle model, never the
+      # lane; a green job never implies these lanes ran. The list is derived
+      # (privileged verify scripts minus the ones this job runs in full) and
+      # pinned by hosted_pipeline_names_every_unrun_privileged_lane.
+      - shell: bash
+        run: |
+          cat >"$RUNNER_TEMP/lanes.txt" <<EOF
+          commit $GITHUB_SHA tree $(git rev-parse 'HEAD^{tree}')
+          hosted: cargo fmt/check/test/clippy gates, every --self-test, scripts/verify-inspect-doctor.sh, scripts/verify-attach-e2e.sh
+          UNRUN: scripts/verify-canaries.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/verify-capability-tier.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/verify-discover-containers.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/verify-induced-gaps.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/verify-live-discovery-preflight.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/verify-task4-lane02.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/verify-task4-lane16.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/matrix/verify-fork-scope.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/matrix/verify-oracle.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/matrix/verify-shared-layer.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/matrix/verify-docker.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
+          UNRUN: scripts/matrix/verify-kind-pod.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
+          UNRUN: scripts/matrix/verify-knative.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
+          UNRUN: scripts/matrix/verify-proxy-stack.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
+          EOF
+          cat "$RUNNER_TEMP/lanes.txt"
+          { echo '## UNRUN lanes'; echo '```'; cat "$RUNNER_TEMP/lanes.txt"; echo '```'; } >>"$GITHUB_STEP_SUMMARY"
+      # UNRUN lanes end
       - run: rustup toolchain install 1.88 --profile minimal --component rustfmt,clippy
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
       # bpf-linker 0.10.4 (default feature rust-llvm-22) proxies to the LLVM bundled with the

@@ -5772,6 +5772,54 @@ fn hosted_pipeline_checks_the_diagnostic_inventory() {
     );
 }
 
+/// Owner decision 2026-09-05: every validator self-test runs hosted, by a
+/// mechanical rule rather than an enumerated list, so a lane cannot be added
+/// without its hosted self-test. `scripts/gates.sh` is the local entry point
+/// that only invokes the others; `lib.sh`, `cleanup-traps.sh` and `fixtures/`
+/// are not validators.
+#[test]
+fn hosted_pipeline_runs_every_unprivileged_self_test() {
+    let ci = read(".github/workflows/ci.yml");
+    let ci_lines: Vec<&str> = ci.lines().map(str::trim).collect();
+    let mut seen = 0;
+    let mut missing = Vec::new();
+    for dir in ["scripts", "scripts/matrix"] {
+        for entry in fs::read_dir(dir).expect("walk scripts") {
+            let path = entry.expect("script entry").path();
+            let path = path.to_str().expect("utf-8 script path");
+            let interpreter = match path.rsplit_once('.') {
+                Some((_, "sh")) => "",
+                Some((_, "py")) => "python3 ",
+                _ => continue,
+            };
+            if [
+                "scripts/gates.sh",
+                "scripts/lib.sh",
+                "scripts/cleanup-traps.sh",
+            ]
+            .contains(&path)
+                || !read(path).contains("--self-test")
+            {
+                continue;
+            }
+            seen += 1;
+            let expected = format!("- run: {interpreter}{path} --self-test");
+            if !ci_lines.contains(&expected.as_str()) {
+                missing.push(path.to_string());
+            }
+        }
+    }
+    assert!(
+        seen >= 19,
+        "the walk found only {seen} self-test-capable scripts"
+    );
+    missing.sort();
+    assert!(
+        missing.is_empty(),
+        "self-test-capable scripts with no hosted `--self-test` step: {missing:?}"
+    );
+}
+
 /// Task 8 Step 2's ordering sentence, frozen where the loops live: "Each tick
 /// drains discovery, lets `Engine` extend `AttachPlan` and apply attachment
 /// deltas, synchronizes immediate semantic/trace invalidations while

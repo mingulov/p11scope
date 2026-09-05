@@ -23,14 +23,32 @@ jobs:
       - run: cargo +1.88 test --locked --features unsafe-unvalidated-metadata --test artifact_contracts -- frozen_policy_inventory_matches_embedded_object
       - run: uname -r; cat /proc/sys/kernel/perf_event_paranoid; cat /proc/sys/kernel/yama/ptrace_scope
       # Unprivileged validator self-tests: every gate oracle, plus the frozen
-      # live-discovery evidence and preflight input contracts. The hosted
-      # SoftHSM live-discovery lane belongs to Task 9 Step 2.
+      # evidence/object/receipt validators and the matrix oracles: every
+      # self-test-capable script except scripts/gates.sh, the local entry point
+      # that only invokes these (mechanical rule, pinned by
+      # hosted_pipeline_runs_every_unprivileged_self_test). None needs sudo,
+      # docker, cargo or bpftool. verify-task4-lane02.sh is the one that is not
+      # a pure model check: it compiles spike/harness.c with gcc, reads it with
+      # readelf, runs it under `timeout 5`, and needs a non-root caller (the
+      # runner is one). The two container-less live lanes follow the block.
       - run: scripts/verify-inspect-doctor.sh --self-test
       - run: scripts/verify-attach-e2e.sh --self-test
       - run: scripts/verify-induced-gaps.sh --self-test
       - run: scripts/verify-discover-containers.sh --self-test
       - run: scripts/verify-capability-tier.sh --self-test
       - run: scripts/verify-live-discovery-preflight.sh --self-test
+      - run: scripts/verify-canaries.sh --self-test
+      - run: scripts/verify-task4-lane02.sh --self-test
+      - run: scripts/verify-task4-lane16.sh --self-test
+      - run: scripts/attach-pod.sh --self-test
+      - run: scripts/build-release.sh --self-test
+      - run: scripts/matrix/verify-fork-scope.sh --self-test
+      - run: scripts/matrix/verify-oracle.sh --self-test
+      - run: scripts/matrix/verify-shared-layer.sh --self-test
+      - run: python3 scripts/check-bpf-map-defs.py --self-test
+      - run: python3 scripts/check-capture-evidence.py --self-test
+      - run: python3 scripts/check-live-discovery-object.py --self-test
+      - run: python3 scripts/dump-owned-bpf-maps.py --self-test
       - run: python3 scripts/check-live-discovery-evidence.py --self-test
       - run: scripts/verify-inspect-doctor.sh
       - run: scripts/verify-attach-e2e.sh

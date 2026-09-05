@@ -81,11 +81,26 @@ def inspect(path):
         index for name, index in sections.items()
         if name in {"uprobe", "uretprobe"} or name.startswith("tracepoint/")
     }
-    programs = {
-        name for _, _, kind, bind, visibility, section, name in records
+    globals_in = lambda wanted: {
+        (name, section)
+        for _, _, kind, bind, visibility, section, name in records
         if kind == "FUNC" and bind == "GLOBAL" and visibility == "DEFAULT"
-        and section.isdigit() and int(section) in program_sections
+        and section.isdigit() and (int(section) in program_sections) == wanted
     }
+    programs = {name for name, _ in globals_in(True)}
+    # A program emitted under an attach type this whitelist does not name
+    # (`raw_tp/`, `kprobe/`, `fentry/`, `lsm/`, `uprobe.s`, ...) would land in an
+    # unlisted section and be silently dropped from `programs`, leaving the
+    # frozen count intact while the object gained a program. Refuse instead of
+    # skipping: only the compiler-emitted mem* helpers in `.text` are exempt.
+    by_index = {index: name for name, index in sections.items()}
+    stray = sorted(
+        f"{name} in {by_index.get(int(section), section)}"
+        for name, section in globals_in(False)
+        if name not in {"memcpy", "memmove", "memset"}
+    )
+    if stray:
+        raise RuntimeError(f"{path}: global functions in unclassified sections: {stray}")
     return maps, programs, {record[-1] for record in records}
 
 
@@ -148,6 +163,12 @@ FROZEN_INVENTORY = {
 }
 
 
+# Per-variant decoder-symbol freeze: (decode_params present?, walk_template count).
+# The default object must carry no parameter decoder at all; the diagnostic one
+# carries the decoder and exactly three template walkers.
+FROZEN_SYMBOLS = {"default": (False, 0), "diagnostic": (True, 3)}
+
+
 def validate_inventory(variant, maps, programs, symbols):
     """Compare ONE object's maps and programs against the frozen `variant` inventory.
 
@@ -172,22 +193,23 @@ def validate_inventory(variant, maps, programs, symbols):
         for name in sorted(frozen_programs - programs):
             print(f"program removed: {name}", file=sys.stderr)
         raise RuntimeError(f"{variant} program inventory differs")
+    found = (
+        any("decode_params" in name for name in symbols),
+        sum("walk_template" in name for name in symbols),
+    )
+    if found != FROZEN_SYMBOLS[variant]:
+        print(
+            f"decode_params={found[0]} walk_template={found[1]} "
+            f"frozen decode_params={FROZEN_SYMBOLS[variant][0]} "
+            f"walk_template={FROZEN_SYMBOLS[variant][1]}",
+            file=sys.stderr,
+        )
+        raise RuntimeError(f"{variant} decoder symbol inventory differs")
 
 
 def validate_policy_inventory(safe, unsafe):
     validate_inventory("default", *safe)
     validate_inventory("diagnostic", *unsafe)
-    safe_symbols, unsafe_symbols = safe[2], unsafe[2]
-    checks = [
-        (not any("decode_params" in n or "walk_template" in n for n in safe_symbols),
-         "default object contains an unsafe decoder symbol"),
-        (any("decode_params" in n for n in unsafe_symbols), "diagnostic object lacks decode_params"),
-        (sum("walk_template" in n for n in unsafe_symbols) == 3,
-         "diagnostic object must contain exactly three walk_template variants"),
-    ]
-    for okay, message in checks:
-        if not okay:
-            raise RuntimeError(message)
 
 
 def self_test():
@@ -234,6 +256,20 @@ def self_test():
     assert rejected(validate_inventory, "default", drifted, SAFE_PROGRAMS, set()) == [
         f"CONFIG.max_entries: object={frozen + 1} frozen={frozen}"
     ]
+    # A program leaving the object is named, not just counted.
+    assert rejected(
+        validate_inventory, "default", SAFE_MAPS, SAFE_PROGRAMS - {"p11_entry"}, {"p11_entry"}
+    ) == ["program removed: p11_entry"]
+    # A decoder symbol reaching the shipped object is refused even when its maps
+    # and programs are untouched -- the drift class `--inventory` alone would miss.
+    assert rejected(
+        validate_inventory, "default", SAFE_MAPS, SAFE_PROGRAMS, {"p11_entry", "decode_params"}
+    ) == [
+        "decode_params=True walk_template=0 frozen decode_params=False walk_template=0"
+    ]
+    assert rejected(validate_inventory, "diagnostic", UNSAFE_MAPS, UNSAFE_PROGRAMS, set()) == [
+        "decode_params=False walk_template=0 frozen decode_params=True walk_template=3"
+    ]
     record = (0, 28, "OBJECT", "GLOBAL", "DEFAULT", "9", "ONE")
     data = struct.pack("<7I", 1, 4, 8, 1, 0, 0, 0)
     assert decode_map_definitions([record], 9, data)["ONE"]["value_size"] == 8
@@ -256,11 +292,21 @@ def self_test():
     print("policy inventory self-test: OK")
 
 
+def usage():
+    return (
+        f"usage: {sys.argv[0]} BPF_ELF MAP=MAX_ENTRIES [...] | "
+        "--inventory default|diagnostic BPF_ELF | "
+        "--policy-inventory DEFAULT_ELF DIAGNOSTIC_ELF | --self-test"
+    )
+
+
 def main():
     if sys.argv[1:] == ["--self-test"]:
         self_test()
         return
-    if len(sys.argv) == 4 and sys.argv[1] == "--inventory":
+    if sys.argv[1:2] == ["--inventory"]:
+        if len(sys.argv) != 4:
+            raise SystemExit(usage())
         variant, path = sys.argv[2], sys.argv[3]
         if variant not in FROZEN_INVENTORY:
             raise RuntimeError(f"unknown inventory variant {variant!r}")
@@ -268,7 +314,9 @@ def main():
         validate_inventory(variant, maps, programs, symbols)
         print(f"inventory {variant}: maps={len(maps)} programs={len(programs)} OK")
         return
-    if len(sys.argv) == 4 and sys.argv[1] == "--policy-inventory":
+    if sys.argv[1:2] == ["--policy-inventory"]:
+        if len(sys.argv) != 4:
+            raise SystemExit(usage())
         safe, unsafe = inspect(sys.argv[2]), inspect(sys.argv[3])
         validate_policy_inventory(safe, unsafe)
         print(
@@ -277,11 +325,7 @@ def main():
         )
         return
     if len(sys.argv) < 3:
-        raise SystemExit(
-            f"usage: {sys.argv[0]} BPF_ELF MAP=MAX_ENTRIES [...] | "
-            "--inventory default|diagnostic BPF_ELF | "
-            "--policy-inventory DEFAULT_ELF DIAGNOSTIC_ELF | --self-test"
-        )
+        raise SystemExit(usage())
     path = sys.argv[1]
     expected = dict(item.split("=", 1) for item in sys.argv[2:])
     actual = definitions(path)

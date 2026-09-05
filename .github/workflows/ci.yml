@@ -64,7 +64,7 @@ jobs:
       # filter identically, and all of them fail here.
       - shell: bash
         run: |
-          cargo +1.88 test --locked --features unsafe-unvalidated-metadata --test artifact_contracts -- --nocapture frozen_policy_inventory_matches_embedded_object | tee "$RUNNER_TEMP/diagnostic-inventory.log"
+          cargo +1.88 test --locked --features unsafe-unvalidated-metadata --test artifact_contracts -- --exact --nocapture frozen_policy_inventory_matches_embedded_object | tee "$RUNNER_TEMP/diagnostic-inventory.log"
           grep -q "^test result: ok. 1 passed" "$RUNNER_TEMP/diagnostic-inventory.log"
       - run: uname -r; cat /proc/sys/kernel/perf_event_paranoid; cat /proc/sys/kernel/yama/ptrace_scope
       # Unprivileged validator self-tests: every gate oracle, plus the frozen
@@ -135,7 +135,10 @@ jobs:
             fi
             sleep 5
           done
-          wc -c "$RUNNER_TEMP/checks-and-e2e.log"
+          # Not just informational: the loop exits on a hardcoded attempt number,
+          # so shortening the list would fall through with the empty file `gh api`
+          # created. This is what actually refuses a 0-byte upload.
+          [ -s "$RUNNER_TEMP/checks-and-e2e.log" ] && wc -c "$RUNNER_TEMP/checks-and-e2e.log"
       - uses: actions/upload-artifact@v4
         with:
           name: checks-and-e2e-log

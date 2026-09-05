@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::process::Command;
@@ -5817,6 +5817,105 @@ fn hosted_pipeline_runs_every_unprivileged_self_test() {
     assert!(
         missing.is_empty(),
         "self-test-capable scripts with no hosted `--self-test` step: {missing:?}"
+    );
+}
+
+/// A green hosted job must never imply a privileged or container lane ran.
+/// The pipeline names every such lane verbatim as `UNRUN: <path>` (the
+/// `verify-capability-tier.sh` idiom) in the log and the job summary, as its
+/// first step after checkout so a later failure cannot suppress the list. The
+/// set is derived here — privileged verify scripts minus the ones the job runs
+/// in full — and the label says whether the script's `--self-test` runs in
+/// this job, so a lane whose self-test is hosted is not mislabelled as absent.
+#[test]
+fn hosted_pipeline_names_every_unrun_privileged_lane() {
+    let ci = read(".github/workflows/ci.yml");
+    let ci_lines: Vec<&str> = ci.lines().map(str::trim).collect();
+    let is_privileged = |script: &str| {
+        read(script)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with('#'))
+            .any(|line| {
+                line.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .any(|word| matches!(word, "sudo" | "docker" | "kind"))
+            })
+    };
+    let hosted_full: BTreeSet<&str> = ci_lines
+        .iter()
+        .filter_map(|line| line.strip_prefix("- run: "))
+        .filter(|call| call.starts_with("scripts/") && call.ends_with(".sh"))
+        .collect();
+    let mut expected = BTreeSet::new();
+    for dir in ["scripts", "scripts/matrix"] {
+        for entry in fs::read_dir(dir).expect("walk scripts") {
+            let path = entry.expect("script entry").path();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            let path = path.to_str().expect("utf-8 script path").to_string();
+            if name.starts_with("verify-")
+                && name.ends_with(".sh")
+                && is_privileged(&path)
+                && !hosted_full.contains(path.as_str())
+            {
+                expected.insert(path);
+            }
+        }
+    }
+    assert!(
+        expected.len() >= 14,
+        "the derivation found only {} privileged lanes not run hosted in full",
+        expected.len()
+    );
+
+    assert!(
+        ci.contains("      - uses: actions/checkout@v4\n      # UNRUN lanes begin\n"),
+        "the UNRUN lanes block must be the first step after checkout"
+    );
+    let block = between(&ci, "# UNRUN lanes begin", "# UNRUN lanes end");
+    let block_lines: Vec<&str> = block.lines().map(str::trim).collect();
+    let named: BTreeSet<String> = block_lines
+        .iter()
+        .filter_map(|line| line.strip_prefix("UNRUN: "))
+        .flat_map(|line| {
+            line.split_whitespace()
+                .filter(|t| t.starts_with("scripts/"))
+        })
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        named, expected,
+        "UNRUN lines must name exactly the derived lane set"
+    );
+    for path in &expected {
+        for line in block_lines
+            .iter()
+            .filter(|line| line.contains(path.as_str()))
+        {
+            assert!(
+                line.starts_with("UNRUN: "),
+                "{path} appears in the block without the UNRUN: prefix: {line:?}"
+            );
+        }
+        let self_test = format!("- run: {path} --self-test");
+        let note = if ci_lines.contains(&self_test.as_str()) {
+            "only its unprivileged self-test runs in this job"
+        } else {
+            "no self-test"
+        };
+        let expected_line = format!(
+            "UNRUN: {path} (privileged/container lane body UNRUN hosted; {note}; local run needs owner approval)"
+        );
+        assert!(
+            block_lines.contains(&expected_line.as_str()),
+            "missing verbatim lane line: {expected_line}"
+        );
+    }
+    assert!(
+        block.contains(">>\"$GITHUB_STEP_SUMMARY\""),
+        "the UNRUN block must append to the job summary"
     );
 }
 

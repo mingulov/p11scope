@@ -434,10 +434,14 @@ C
         exit 1
     fi
     set +e
-    RUSTFLAGS=-Cdebuginfo=0 "$0" "$self_root/early-receipt" >/dev/null 2>&1
+    RUSTFLAGS=-Cdebuginfo=0 "$0" "$self_root/early-receipt" >/dev/null 2>"$self_root/early.err"
     early_status=$?
     set -e
     [ "$early_status" -eq 77 ]
+    # 77 alone is ambiguous: the prerequisite loop above this refusal exits 77
+    # too, so on a host missing softhsm2-util (say) the oracle would pass green
+    # without the refusal ever being reached. Assert the refusal itself.
+    grep -Fq "refusing inherited RUSTFLAGS" "$self_root/early.err"
     grep -Fq "$(printf 'terminal_status\t77')" "$self_root/early-receipt/facts.log"
     : > "$self_root/pid-target"
     ln -s "$self_root/pid-target" "$self_root/observer.pid"
@@ -680,13 +684,15 @@ cleanup() {
 . scripts/cleanup-traps.sh
 fact started_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-for command in cargo rustc gcc ldd softhsm2-util sudo sha256sum readelf sync; do
-    command -v "$command" >/dev/null || { echo "$command required" >&2; exit 77; }
-done
+# Environment hygiene first: it needs no tools, and both loops exit 77, so a host
+# missing a prerequisite would otherwise mask this refusal behind the same code.
 for variable in RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_TARGET_DIR CARGO_BUILD_TARGET \
     CARGO_HOME RUSTUP_HOME RUSTUP_TOOLCHAIN RUSTC_WRAPPER CC CFLAGS; do
     eval "variable_value=\${$variable-}"
     [ -z "$variable_value" ] || { echo "refusing inherited $variable" >&2; exit 77; }
+done
+for command in cargo rustc gcc ldd softhsm2-util sudo sha256sum readelf sync; do
+    command -v "$command" >/dev/null || { echo "$command required" >&2; exit 77; }
 done
 cargo +1.88 --version >/dev/null || exit 77
 rustc +1.88 --version >/dev/null || exit 77

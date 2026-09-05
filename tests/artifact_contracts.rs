@@ -5919,6 +5919,47 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
     );
 }
 
+/// A step cannot read its own job's log, and a `tee` wrapper would break every
+/// exact-line pin above, so a second job fetches the finished job's log through
+/// the Actions API and keeps it as a run artifact. Its token gets `actions:
+/// read` and nothing else; the top-level `contents: read` and the checks job
+/// stay as they are.
+#[test]
+fn hosted_pipeline_retains_the_job_log() {
+    let ci = read(".github/workflows/ci.yml");
+    let (checks, archive) = ci
+        .split_once("\n  archive-log:\n")
+        .expect("ci.yml has no archive-log job");
+    assert!(checks.contains("\npermissions:\n  contents: read\n"));
+    assert!(
+        !checks.contains("    permissions:"),
+        "checks-and-e2e must not gain a job-level permissions block"
+    );
+    let permissions: Vec<&str> = archive
+        .lines()
+        .skip_while(|line| *line != "    permissions:")
+        .skip(1)
+        .take_while(|line| line.starts_with("      "))
+        .collect();
+    assert_eq!(
+        permissions,
+        ["      actions: read"],
+        "archive-log must hold exactly one permission, actions: read"
+    );
+    for required in [
+        "    needs: checks-and-e2e\n",
+        "    if: always()\n",
+        "- uses: actions/upload-artifact@v4\n",
+        "if-no-files-found: error\n",
+        "retention-days: 90\n",
+        "/actions/jobs/$JOB_ID/logs\"",
+        "for attempt in 1 2 3; do",
+        "sleep 5",
+    ] {
+        assert!(archive.contains(required), "archive-log lacks {required:?}");
+    }
+}
+
 /// Task 8 Step 2's ordering sentence, frozen where the loops live: "Each tick
 /// drains discovery, lets `Engine` extend `AttachPlan` and apply attachment
 /// deltas, synchronizes immediate semantic/trace invalidations while

@@ -81,3 +81,40 @@ jobs:
       - run: python3 scripts/check-live-discovery-evidence.py --self-test
       - run: scripts/verify-inspect-doctor.sh
       - run: scripts/verify-attach-e2e.sh
+  # A step cannot read its own job's log, so a second job fetches the finished
+  # log through the Actions API and keeps it as a run artifact (90 days). Its
+  # token gets actions: read and nothing else; upload-artifact uses the runtime
+  # token, not GITHUB_TOKEN. No cache anywhere.
+  archive-log:
+    needs: checks-and-e2e
+    if: always()
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - run: |
+          JOB_ID=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs" --jq '.jobs[] | select(.name == "checks-and-e2e") | .id')
+          test -n "$JOB_ID"
+          # .../jobs/<id>/logs answers 302 to blob storage and gh api follows it: a 302 in a
+          # verbose trace is the success path, not a failure. It can also 404 for a short
+          # window right after the job completes, while the log is finalized, hence the
+          # bounded retry: 3 attempts, 5s apart, fail after the third.
+          for attempt in 1 2 3; do
+            if gh api "repos/$GITHUB_REPOSITORY/actions/jobs/$JOB_ID/logs" > "$RUNNER_TEMP/checks-and-e2e.log"; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              echo "job $JOB_ID log fetch failed after 3 attempts" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          wc -c "$RUNNER_TEMP/checks-and-e2e.log"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: checks-and-e2e-log
+          path: ${{ runner.temp }}/checks-and-e2e.log
+          if-no-files-found: error
+          retention-days: 90

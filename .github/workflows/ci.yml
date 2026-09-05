@@ -20,6 +20,7 @@ jobs:
       - run: cargo +1.88 check --locked --workspace --all-targets
       - run: cargo +1.88 test --locked --workspace --all-targets
       - run: cargo +1.88 clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo +1.88 test --locked --features unsafe-unvalidated-metadata --test artifact_contracts -- frozen_policy_inventory_matches_embedded_object
       - run: uname -r; cat /proc/sys/kernel/perf_event_paranoid; cat /proc/sys/kernel/yama/ptrace_scope
       # Unprivileged validator self-tests: every gate oracle, plus the frozen
       # live-discovery evidence and preflight input contracts. The hosted

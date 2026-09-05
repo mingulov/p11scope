@@ -2,6 +2,8 @@
 """Inspect exact map/program policy inventory in a freshly built BPF ELF."""
 
 from pathlib import Path
+import contextlib
+import io
 import re
 import struct
 import subprocess
@@ -100,7 +102,7 @@ SAFE_MAPS = {
     for name, values in {
         "ASYNC_FUNCTIONS": (1, 32, 4, 128, 128),
         "CGROUP_FILTER": (8, 4, 4, 1),
-        "CONFIG": (2, 4, 8, 1, 128),
+        "CONFIG": (2, 4, 8, 2, 128),
         "COUNTERS": (6, 4, 8, 5),
         "DISCOVERY": (27, 0, 0, 65_536),
         "DISCOVERY_STATE": (1, 24, 24, 64),
@@ -140,14 +142,43 @@ UNSAFE_PROGRAMS = SAFE_PROGRAMS | {
 }
 
 
+FROZEN_INVENTORY = {
+    "default": (SAFE_MAPS, SAFE_PROGRAMS),
+    "diagnostic": (UNSAFE_MAPS, UNSAFE_PROGRAMS),
+}
+
+
+def validate_inventory(variant, maps, programs, symbols):
+    """Compare ONE object's maps and programs against the frozen `variant` inventory.
+
+    A mismatch prints every differing map name and field to stderr first, so a
+    stale freeze is diagnosable from the failing lane's log alone.
+    """
+    frozen_maps, frozen_programs = FROZEN_INVENTORY[variant]
+    if maps != frozen_maps:
+        for name in sorted(maps.keys() - frozen_maps.keys()):
+            print(f"map added: {name}", file=sys.stderr)
+        for name in sorted(frozen_maps.keys() - maps.keys()):
+            print(f"map removed: {name}", file=sys.stderr)
+        for name in sorted(maps.keys() & frozen_maps.keys()):
+            for field in MAP_FIELDS:
+                got, want = maps[name][field], frozen_maps[name][field]
+                if got != want:
+                    print(f"{name}.{field}: object={got} frozen={want}", file=sys.stderr)
+        raise RuntimeError(f"{variant} map inventory differs")
+    if programs != frozen_programs:
+        for name in sorted(programs - frozen_programs):
+            print(f"program added: {name}", file=sys.stderr)
+        for name in sorted(frozen_programs - programs):
+            print(f"program removed: {name}", file=sys.stderr)
+        raise RuntimeError(f"{variant} program inventory differs")
+
+
 def validate_policy_inventory(safe, unsafe):
-    safe_maps, safe_programs, safe_symbols = safe
-    unsafe_maps, unsafe_programs, unsafe_symbols = unsafe
+    validate_inventory("default", *safe)
+    validate_inventory("diagnostic", *unsafe)
+    safe_symbols, unsafe_symbols = safe[2], unsafe[2]
     checks = [
-        (safe_maps == SAFE_MAPS, "default map inventory differs"),
-        (unsafe_maps == UNSAFE_MAPS, "diagnostic map inventory differs"),
-        (safe_programs == SAFE_PROGRAMS, "default program inventory differs"),
-        (unsafe_programs == UNSAFE_PROGRAMS, "diagnostic program inventory differs"),
         (not any("decode_params" in n or "walk_template" in n for n in safe_symbols),
          "default object contains an unsafe decoder symbol"),
         (any("decode_params" in n for n in unsafe_symbols), "diagnostic object lacks decode_params"),
@@ -176,12 +207,33 @@ def self_test():
         {"decode_params", "walk_template-0", "walk_template-1", "walk_template-2"},
     )
     validate_policy_inventory(good, diagnostic)
-    try:
-        validate_policy_inventory((UNSAFE_MAPS, SAFE_PROGRAMS, {"decode_params"}), diagnostic)
-    except RuntimeError:
-        pass
-    else:
-        raise AssertionError("unsafe default inventory was accepted")
+
+    def rejected(check, *arguments):
+        errors = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(errors):
+                check(*arguments)
+        except RuntimeError:
+            return errors.getvalue().splitlines()
+        raise AssertionError(f"{check.__name__} accepted {arguments!r}")
+
+    assert rejected(
+        validate_policy_inventory, (UNSAFE_MAPS, SAFE_PROGRAMS, {"decode_params"}), diagnostic
+    ) == ["map added: ATTR_BOOL_BITS"]
+    # Each variant is compared against ITS OWN freeze, not the other one's.
+    assert rejected(validate_inventory, "diagnostic", SAFE_MAPS, SAFE_PROGRAMS, set()) == [
+        "map removed: ATTR_BOOL_BITS"
+    ]
+    assert rejected(validate_inventory, "default", UNSAFE_MAPS, UNSAFE_PROGRAMS, set()) == [
+        "map added: ATTR_BOOL_BITS"
+    ]
+    # A one-field drift names exactly that field, nothing else (the W3 CONFIG
+    # shape: same maps, one max_entries apart).
+    frozen = SAFE_MAPS["CONFIG"]["max_entries"]
+    drifted = SAFE_MAPS | {"CONFIG": SAFE_MAPS["CONFIG"] | {"max_entries": frozen + 1}}
+    assert rejected(validate_inventory, "default", drifted, SAFE_PROGRAMS, set()) == [
+        f"CONFIG.max_entries: object={frozen + 1} frozen={frozen}"
+    ]
     record = (0, 28, "OBJECT", "GLOBAL", "DEFAULT", "9", "ONE")
     data = struct.pack("<7I", 1, 4, 8, 1, 0, 0, 0)
     assert decode_map_definitions([record], 9, data)["ONE"]["value_size"] == 8
@@ -208,6 +260,14 @@ def main():
     if sys.argv[1:] == ["--self-test"]:
         self_test()
         return
+    if len(sys.argv) == 4 and sys.argv[1] == "--inventory":
+        variant, path = sys.argv[2], sys.argv[3]
+        if variant not in FROZEN_INVENTORY:
+            raise RuntimeError(f"unknown inventory variant {variant!r}")
+        maps, programs, symbols = inspect(path)
+        validate_inventory(variant, maps, programs, symbols)
+        print(f"inventory {variant}: maps={len(maps)} programs={len(programs)} OK")
+        return
     if len(sys.argv) == 4 and sys.argv[1] == "--policy-inventory":
         safe, unsafe = inspect(sys.argv[2]), inspect(sys.argv[3])
         validate_policy_inventory(safe, unsafe)
@@ -219,6 +279,7 @@ def main():
     if len(sys.argv) < 3:
         raise SystemExit(
             f"usage: {sys.argv[0]} BPF_ELF MAP=MAX_ENTRIES [...] | "
+            "--inventory default|diagnostic BPF_ELF | "
             "--policy-inventory DEFAULT_ELF DIAGNOSTIC_ELF | --self-test"
         )
     path = sys.argv[1]

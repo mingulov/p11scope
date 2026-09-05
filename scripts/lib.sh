@@ -509,12 +509,16 @@ wait_for_capture_ready() {
                 profile|metrics) grep -Fq " — privacy=$wcr_privacy" "$wcr_log" 2>/dev/null && return 0 ;;
             esac
             echo "observer exited before capture readiness: $wcr_log" >&2
+            # Name the reason, not just the file: on a hosted runner the log is
+            # discarded with the workspace, so a bare path is unactionable.
+            tail -30 "$wcr_log" >&2 2>/dev/null || :
             return 1
         }
         wcr_attempt=$((wcr_attempt + 1))
         sleep 0.05
     done
     echo "observer never reported capture readiness: $wcr_log" >&2
+    tail -30 "$wcr_log" >&2 2>/dev/null || :
     return 1
 }
 

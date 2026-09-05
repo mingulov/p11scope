@@ -137,8 +137,10 @@ jobs:
           done
           # Not just informational: the loop exits on a hardcoded attempt number,
           # so shortening the list would fall through with the empty file `gh api`
-          # created. This is what actually refuses a 0-byte upload.
-          [ -s "$RUNNER_TEMP/checks-and-e2e.log" ] && wc -c "$RUNNER_TEMP/checks-and-e2e.log"
+          # created. A simple command, NOT an `&&` list -- an `&&` list is exempt
+          # from errexit, so anywhere but the final line it would be inert.
+          test -s "$RUNNER_TEMP/checks-and-e2e.log"
+          wc -c "$RUNNER_TEMP/checks-and-e2e.log"
       - uses: actions/upload-artifact@v4
         with:
           name: checks-and-e2e-log

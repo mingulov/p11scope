@@ -5818,6 +5818,40 @@ fn checks_job(ci: &str) -> &str {
     block_under(ci, "  checks-and-e2e:")
 }
 
+/// The directories the lane derivations walk, asserted to be all of them: a lane
+/// dropped into a new subdirectory would otherwise get no UNRUN line and no
+/// hosted self-test while the block still claims "every privileged script under
+/// scripts/". `__pycache__` is generated, never tracked.
+fn script_dirs() -> Vec<&'static str> {
+    let mut found: Vec<String> = fs::read_dir("scripts")
+        .expect("walk scripts")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+        .filter(|name| name != "__pycache__")
+        .collect();
+    found.sort();
+    assert_eq!(
+        found,
+        ["fixtures", "matrix"],
+        "a new directory under scripts/: teach the UNRUN and self-test derivations \
+         about it, or a privileged lane there is invisible to both"
+    );
+    vec!["scripts", "scripts/matrix"]
+}
+
+/// A step's command, with the `- run:` / `run:` shape (a `- name:` label puts the
+/// command on its own line) and any trailing YAML comment normalised away, so
+/// neither a label nor a comment changes what a test believes ran.
+fn command_of(line: &str) -> Option<&str> {
+    let line = line
+        .split_once(" #")
+        .map_or(line, |(code, _)| code.trim_end());
+    line.trim()
+        .strip_prefix("- run: ")
+        .or_else(|| line.trim().strip_prefix("run: "))
+}
+
 /// The default embedded object is covered by the ordinary `cargo test` gate;
 /// the diagnostic object exists only under `unsafe-unvalidated-metadata`, so it
 /// needs its own hosted step — one test, not the whole target
@@ -5833,7 +5867,9 @@ fn hosted_pipeline_checks_the_diagnostic_inventory() {
     let clippy_at = lines
         .iter()
         .position(|line| {
-            *line == "- run: cargo +1.88 clippy --locked --workspace --all-targets -- -D warnings"
+            command_of(line).is_some_and(|call| {
+                call == "cargo +1.88 clippy --locked --workspace --all-targets -- -D warnings"
+            })
         })
         .expect("the checks job must run the clippy gate");
     // `--nocapture` so the inventory report the wave cites as exit evidence
@@ -5938,7 +5974,7 @@ fn hosted_pipeline_runs_every_unprivileged_self_test() {
     // The claim is about this job, so only its steps count.
     let ci_lines: Vec<&str> = checks_job(&ci).lines().map(str::trim).collect();
     let mut expected: BTreeSet<String> = BTreeSet::new();
-    for dir in ["scripts", "scripts/matrix"] {
+    for dir in script_dirs() {
         for entry in fs::read_dir(dir).expect("walk scripts") {
             let path = entry.expect("script entry").path();
             let path = path.to_str().expect("utf-8 script path");
@@ -6075,16 +6111,6 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
             .any(is_lane)
     };
     let mut hosted_full: BTreeSet<&str> = BTreeSet::new();
-    // Every step's command with `- run:` / `run:` (after a `- name:` label) and any
-    // trailing YAML comment normalised away, so a label or a comment cannot change
-    // what this test believes ran.
-    fn command_of(line: &str) -> Option<&str> {
-        let line = line
-            .split_once(" #")
-            .map_or(line, |(code, _)| code.trim_end());
-        line.strip_prefix("- run: ")
-            .or_else(|| line.strip_prefix("run: "))
-    }
     // Scoped to the checks job: the label says "runs in this job", so a step that
     // exists only in another job must not satisfy it. The full-run sweep below
     // stays on the whole file — a lane run from any job has run.
@@ -6141,7 +6167,7 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
         }
     }
     let mut expected = BTreeSet::new();
-    for dir in ["scripts", "scripts/matrix"] {
+    for dir in script_dirs() {
         for entry in fs::read_dir(dir).expect("walk scripts") {
             let path = entry.expect("script entry").path();
             let name = path
@@ -6171,8 +6197,9 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
 
     // Match the action, not its version: bumping checkout is an innocent edit,
     // and pinning the tag made it fail here with a message about step order.
-    let after_checkout = ci
-        .split_once("      - uses: actions/checkout@")
+    // `- uses:` or, under a `- name:` label, a bare `uses:` — match the key.
+    let after_checkout = checks
+        .split_once("uses: actions/checkout@")
         .and_then(|(_, rest)| rest.split_once('\n'))
         .map(|(_, rest)| rest)
         .expect("the checks job must check out the repository");
@@ -6224,10 +6251,14 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
         "fmt --all -- --check",
         "check --locked --workspace --all-targets",
         "test --locked --workspace --all-targets",
-        "clippy --locked --workspace --all-targets",
+        "clippy --locked --workspace --all-targets -- -D warnings",
     ] {
         assert!(
-            checks.contains(&format!("- run: cargo +1.88 {gate}")),
+            checks
+                .lines()
+                .map(str::trim)
+                .filter_map(command_of)
+                .any(|call| call == format!("cargo +1.88 {gate}")),
             "the scope: line claims the {gate} gate, which no step runs"
         );
     }
@@ -6286,15 +6317,22 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
 #[test]
 fn hosted_pipeline_retains_the_job_log() {
     let ci = read(".github/workflows/ci.yml");
-    let (checks, archive) = ci
-        .split_once("\n  archive-log:\n")
-        .expect("ci.yml has no archive-log job");
-    let default_permissions: Vec<&str> = block_under(&ci, "permissions:")
-        .lines()
-        .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
-        .collect();
+    let checks = checks_job(&ci);
+    let archive = block_under(&ci, "  archive-log:");
+    // Comments and blank lines are not permissions; a trailing comment on one is
+    // not part of its value either.
+    fn permission_lines(block: &str) -> Vec<&str> {
+        block
+            .lines()
+            .map(|line| {
+                line.split_once(" #")
+                    .map_or(line, |(code, _)| code.trim_end())
+            })
+            .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+            .collect()
+    }
     assert_eq!(
-        default_permissions,
+        permission_lines(block_under(&ci, "permissions:")),
         ["  contents: read"],
         "the workflow default must stay exactly contents: read — checks-and-e2e has no \
          job-level block, so it inherits this while building third-party crates"
@@ -6303,14 +6341,8 @@ fn hosted_pipeline_retains_the_job_log() {
         !checks.contains("    permissions:"),
         "checks-and-e2e must not gain a job-level permissions block"
     );
-    let permissions: Vec<&str> = archive
-        .lines()
-        .skip_while(|line| *line != "    permissions:")
-        .skip(1)
-        .take_while(|line| line.starts_with("      "))
-        .collect();
     assert_eq!(
-        permissions,
+        permission_lines(block_under(archive, "    permissions:")),
         ["      actions: read"],
         "archive-log must hold exactly one permission, actions: read"
     );
@@ -6325,7 +6357,8 @@ fn hosted_pipeline_retains_the_job_log() {
         "for attempt in ",
         // Without this the loop's hardcoded exit number is load-bearing: shortening
         // the attempt list would fall through with the empty file `gh api` created.
-        r#"[ -s "$RUNNER_TEMP/checks-and-e2e.log" ] && wc -c"#,
+        // A simple command, not an `&&` list: only this form aborts the step.
+        r#"test -s "$RUNNER_TEMP/checks-and-e2e.log""#,
         // An attempt that wrote nothing must not count as success: the retry
         // window answers 200 with an empty body, and `if-no-files-found: error`
         // only checks that the file exists.
@@ -8106,11 +8139,12 @@ fn every_gate_script_self_tests_its_own_validator() {
         "# if the CLI cannot even read a target, nothing below is worth waiting for.\nfor gate in ",
         "done\n",
     );
-    let ci_self_test_block = between(
-        &ci,
-        "      # Unprivileged validator self-tests:",
-        "      - run: python3 -I scripts/check-live-discovery-evidence.py --self-test",
-    );
+    // The checks job, not a byte-frozen window: the end marker used to be one
+    // specific self-test step, so reordering steps inside the block panicked in
+    // `between()` on an innocent edit. The set itself is proved two-way by
+    // `hosted_pipeline_runs_every_unprivileged_self_test`; this test only needs
+    // presence, and "exactly one" still holds job-wide.
+    let ci_self_test_block = checks_job(&ci);
     for script in [
         "scripts/verify-inspect-doctor.sh",
         "scripts/verify-attach-e2e.sh",

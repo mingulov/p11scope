@@ -111,9 +111,25 @@ fn assert_exact_policy_map_metadata_contract(attach: &str) -> Result<(), String>
     )?;
     require_contract_marker(
         freeze,
-        "matches!(name, \"DESCRIPTORS\" | TAIL_POLICY_MAP)",
-        "deferred DESCRIPTORS and TAIL_CALLS freeze",
+        "if defers_freeze_until_loaded(name, &meta)",
+        "deferred freeze for read-only arrays and TAIL_CALLS",
     )?;
+    // The rule itself, not the two names it happened to cover: freezing a
+    // multi-entry BPF_F_RDONLY_PROG array before its readers load makes
+    // BPF_PROG_LOAD fail with the kernel's internal ENOTSUPP.
+    let defers = contract_section(
+        attach,
+        "fn defers_freeze_until_loaded(",
+        "fn freeze_published_maps(",
+    )?;
+    for marker in [
+        "name == TAIL_POLICY_MAP",
+        "matches!(meta.map_type, MapType::Array)",
+        "meta.flags & BPF_F_RDONLY_PROG != 0",
+        "meta.max_entries != 1",
+    ] {
+        require_contract_marker(defers, marker, "deferred-freeze rule")?;
+    }
 
     let validator = contract_section(attach, "fn validate_map_metadata(", "fn freeze_map(")?;
     for marker in [
@@ -217,8 +233,8 @@ fn assert_live_discovery_host_contract(
     require_before(
         attach,
         "for prog_name in programs",
-        "freeze_map(\n            \"DESCRIPTORS\"",
-        "all program loads before descriptor freeze",
+        "if !defers_freeze_until_loaded(name, &meta) || name == TAIL_POLICY_MAP",
+        "all program loads before the deferred freezes",
     )?;
     require_before(
         attach,
@@ -5382,9 +5398,9 @@ fn descriptors_are_published_read_back_and_frozen_before_probe_attachment() {
     let publish = source
         .find("publish_descriptors(&mut ebpf)")
         .expect("Session must publish descriptors");
-    let descriptor_freeze = source
-        .find("freeze_map(\n            \"DESCRIPTORS\",")
-        .expect("Session must freeze descriptors");
+    let deferred_freeze = source
+        .find("if !defers_freeze_until_loaded(name, &meta) || name == TAIL_POLICY_MAP")
+        .expect("Session must freeze the deferred maps");
     let tail_publication = source
         .find("publish_and_freeze_tail_calls(&mut ebpf, unsafe_enabled)")
         .expect("Session must publish and freeze TAIL_CALLS");
@@ -5395,10 +5411,10 @@ fn descriptors_are_published_read_back_and_frozen_before_probe_attachment() {
         .find("prog.attach(point")
         .expect("Session must attach uprobes");
     assert_descriptor_publication_contract(&source).unwrap();
-    assert!(publish < descriptor_freeze);
-    assert!(descriptor_freeze < tail_publication);
-    assert!(descriptor_freeze < fork_attach);
-    assert!(descriptor_freeze < uprobe_attach);
+    assert!(publish < deferred_freeze);
+    assert!(deferred_freeze < tail_publication);
+    assert!(deferred_freeze < fork_attach);
+    assert!(deferred_freeze < uprobe_attach);
     assert!(tail_publication < fork_attach);
     assert!(tail_publication < uprobe_attach);
 }

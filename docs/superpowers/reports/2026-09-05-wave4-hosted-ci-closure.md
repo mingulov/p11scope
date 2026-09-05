@@ -150,24 +150,53 @@ privileged lanes ran. It did that, and then the lane it exposed turned out to
 be hiding a defect that made the product's core function fail on every kernel,
 undetected on the developer's own machine for two waves.
 
-## 5b. Open finding — spurious `task_uprobe_link_losses`
+## 5b. Closed finding — spurious `task_uprobe_link_losses`, fixed at `b74a65d`
 
-With the load fixed, the lane reaches **136/136 probes attached** and then fails
+With the load fixed the lane reached **136/136 probes attached** and then failed
 a later oracle: `task_uprobe_link_losses: want 0, got 1`, deterministically.
 
 Reduced to a minimal reproduction with no PKCS#11 involvement: attach to any
 process and let it exit while capture runs. With `0/0 probes attached` and `no
-modules discovered`, evidence still reports `task_uprobe_link_losses = 1`.
+modules discovered`, evidence still reported `task_uprobe_link_losses = 1` — a
+number describing a capture gap that never happened.
 
-`settle_leader_exit_view` (`src/discovery/engine.rs:5521`) receives
-`Err("retained process view is no longer available")` when the view has been
-retired — which is what a whole-process exit does — and returns `Pending`.
-`finalize_pending_leader_exit_views` (`:5547`) then counts every still-pending
-view as a loss at capture end. A normal target exit is recorded as a link loss
-that did not occur, which is evidence corruption in the direction that matters.
+### Root cause
 
-This is W3 machinery (`8a0d40c`, `ec5e0ae`), not W4, and it was unreachable
-while the load failed. Not yet fixed.
+A queued leader-exit assessment is answered by `ProcessView::original_exited()`,
+which reads that view's own pidfd. Retirement dropped the view without settling,
+so the lookup returned `retained process view is no longer available`,
+`settle_leader_exit_view` (`src/discovery/engine.rs:5521`) held it `Pending`,
+and `settle_terminal_drain` counted every still-pending assessment as a loss.
+
+Instrumented rather than assumed: the failing run printed
+`settle ProcessViewId(0) -> Pending: retained process view is no longer
+available` followed by `finalize ProcessViewId(0) -> counted as loss`. After the
+fix the same run prints `settle ProcessViewId(0) -> WholeGroupExit`. The first
+guess — `remove_stale_views` — was wrong and was discarded on evidence: that
+path emits a `Skipped` record and the repro had none.
+
+Retirement is the last point at which a whole-group exit can still be told apart
+from a leader that exited while its group kept running, so the settlement
+happens there, at all four retirement sites.
+
+### Coverage
+
+- Two unit tests pin **both** directions, so the fix cannot degenerate into
+  "stop counting": a view retired after its group exited is not a loss; one
+  retired while its group lives still is. The fail-closed property is asserted
+  too — an assessment that never became answerable is still counted at capture
+  end.
+- A contract guard reads **every** `views.retain` retirement site rather than
+  the four that exist today, since the next site added is the one that will
+  forget.
+- Both were mutation-checked: deleting one settlement call fails the guard,
+  and making the settlement a no-op fails both unit tests.
+
+### Evidence
+
+Four gates PASS at `b74a65d`. `scripts/verify-attach-e2e.sh` reaches
+`=== e2e: ALL OK ===` locally for the first time. The minimal reproduction
+reports `losses = 0` on `7.0.0-30-generic` and on `6.17.0-1022-azure` in the VM.
 
 ## 6. What this closure does NOT claim
 

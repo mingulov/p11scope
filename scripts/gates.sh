@@ -11,7 +11,7 @@ for gate in scripts/verify-inspect-doctor.sh scripts/verify-attach-e2e.sh \
     scripts/verify-capability-tier.sh; do
     "$gate" --self-test
 done
-python3 scripts/check-live-discovery-evidence.py --self-test
+python3 -I scripts/check-live-discovery-evidence.py --self-test
 # The inspect/doctor lane is unprivileged and takes seconds, so it runs first:
 # if the CLI cannot even read a target, nothing below is worth waiting for.
 for gate in scripts/verify-inspect-doctor.sh scripts/verify-attach-e2e.sh \

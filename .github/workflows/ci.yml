@@ -14,7 +14,8 @@ jobs:
       # Honest scope, printed first so it reaches the log even when a later step
       # fails. A passing --self-test exercises a lane's oracle model, never the
       # lane; a green job never implies these lanes ran. The list is derived
-      # (every privileged script minus the ones this job runs in full) and
+      # (every privileged script under scripts/, minus the ones this job runs
+      # in full; spike/ is research, not a release lane) and
       # pinned by hosted_pipeline_names_every_unrun_privileged_lane.
       - shell: bash
         run: |
@@ -97,7 +98,8 @@ jobs:
       - run: scripts/verify-inspect-doctor.sh
       - run: scripts/verify-attach-e2e.sh
   # A step cannot read its own job's log, so a second job fetches the finished
-  # log through the Actions API and keeps it as a run artifact (90 days). Its
+  # log through the Actions API and keeps it as a run artifact (90 days requested;
+  # repo and org settings can cap that). Its
   # token gets actions: read and nothing else; upload-artifact uses the runtime
   # token, not GITHUB_TOKEN. No cache anywhere.
   archive-log:

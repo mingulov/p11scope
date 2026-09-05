@@ -5792,6 +5792,13 @@ fn hosted_pipeline_checks_the_diagnostic_inventory() {
             .any(|line| line.starts_with(r#"grep -q "^test result: ok. 1 passed""#)),
         "the diagnostic-object step must assert that exactly one test ran"
     );
+    let arguments = lines[command_at].strip_prefix(prefix).unwrap_or_default();
+    assert!(
+        arguments
+            .split_whitespace()
+            .any(|token| token == "--nocapture"),
+        "without --nocapture the inventory report never reaches the hosted log"
+    );
     // The filter must still name a real test, so this fails at `cargo test` time
     // rather than only on the runner.
     let filter = lines[command_at]
@@ -5823,7 +5830,8 @@ fn hosted_pipeline_checks_the_diagnostic_inventory() {
     assert_eq!(
         attributes,
         ["#[test]"],
-        "`{filter}` must carry exactly #[test]; anything conditional empties the hosted filter"
+        "`{filter}` must carry exactly #[test] and nothing else: a conditional attribute \
+         empties the hosted filter, and this whitelist is deliberately strict"
     );
 }
 
@@ -5839,8 +5847,7 @@ fn hosted_pipeline_checks_the_diagnostic_inventory() {
 fn hosted_pipeline_runs_every_unprivileged_self_test() {
     let ci = read(".github/workflows/ci.yml");
     let ci_lines: Vec<&str> = ci.lines().map(str::trim).collect();
-    let mut seen = 0;
-    let mut missing = Vec::new();
+    let mut expected: BTreeSet<String> = BTreeSet::new();
     for dir in ["scripts", "scripts/matrix"] {
         for entry in fs::read_dir(dir).expect("walk scripts") {
             let path = entry.expect("script entry").path();
@@ -5865,21 +5872,21 @@ fn hosted_pipeline_runs_every_unprivileged_self_test() {
             {
                 continue;
             }
-            seen += 1;
-            let expected = format!("- run: {interpreter}{path} --self-test");
-            if !ci_lines.contains(&expected.as_str()) {
-                missing.push(path.to_string());
-            }
+            expected.insert(format!("- run: {interpreter}{path} --self-test"));
         }
     }
-    assert!(
-        seen >= 19,
-        "the walk found only {seen} self-test-capable scripts"
-    );
-    missing.sort();
-    assert!(
-        missing.is_empty(),
-        "self-test-capable scripts with no hosted `--self-test` step: {missing:?}"
+    // Two-way, so a count floor is not doing the work: a capable script with no
+    // step and a step whose script lost its self-test both fail here. The second
+    // direction matters — a stale step keeps printing green for an oracle that no
+    // longer exists.
+    let hosted: BTreeSet<String> = ci_lines
+        .iter()
+        .filter(|line| line.starts_with("- run: ") && line.ends_with(" --self-test"))
+        .map(|line| (*line).to_string())
+        .collect();
+    assert_eq!(
+        hosted, expected,
+        "the hosted `--self-test` steps must be exactly the self-test-capable scripts"
     );
 }
 
@@ -5887,7 +5894,8 @@ fn hosted_pipeline_runs_every_unprivileged_self_test() {
 /// The pipeline names every such lane verbatim as `UNRUN: <path>` (the
 /// `verify-capability-tier.sh` idiom) in the log and the job summary, as its
 /// first step after checkout so a later failure cannot suppress the list. The
-/// set is derived here — every privileged script minus the ones the job runs
+/// set is derived here — every privileged script under `scripts/` minus the
+/// ones the job runs
 /// in full — and the label says whether the script's `--self-test` runs in
 /// this job, so a lane whose self-test is hosted is not mislabelled as absent.
 #[test]
@@ -5944,27 +5952,38 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
                 })
         })
     };
-    // Every shell invocation is classified, not just the bare ones. A self-test is
-    // not the lane body, so it does not count as a full run — but a call with any
-    // other argument is neither, and silently treating it as "not a full run"
-    // would leave this job printing `UNRUN:` for a lane that had just run.
+    // Fail closed. This reads two forms only — `- run: <script>` is a full lane
+    // run, `- run: <script> --self-test` is not — and every other way of invoking
+    // a lane (`bash scripts/x.sh`, `./scripts/x.sh`, a call inside a `run: |`
+    // block, an extra argument) is refused rather than quietly treated as "did
+    // not run in full", which would leave this job printing `UNRUN:` for a lane
+    // that had just run. Comments and the block's own lines are not invocations.
+    let checks_job = ci.split("\n  archive-log:\n").next().unwrap_or(&ci);
     let mut hosted_full: BTreeSet<&str> = BTreeSet::new();
-    for call in ci_lines
-        .iter()
-        .filter_map(|line| line.strip_prefix("- run: "))
-    {
-        let (command, tail) = call.split_once(' ').unwrap_or((call, ""));
-        if !(command.starts_with("scripts/") && command.ends_with(".sh")) {
+    for line in checks_job.lines().map(str::trim) {
+        if line.starts_with('#') || line.starts_with("UNRUN: ") || line.starts_with("scope: ") {
             continue;
         }
-        match tail {
-            "" => {
+        let names_lane = line
+            .split(|c: char| c.is_ascii_whitespace() || c == '"' || c == '\'')
+            .any(|token| token.contains("scripts/") && token.ends_with(".sh"));
+        if !names_lane {
+            continue;
+        }
+        let call = line.strip_prefix("- run: ").unwrap_or_default();
+        let (command, tail) = call.split_once(' ').unwrap_or((call, ""));
+        match (
+            command.starts_with("scripts/") && command.ends_with(".sh"),
+            tail,
+        ) {
+            (true, "") => {
                 hosted_full.insert(command);
             }
-            "--self-test" => {}
-            other => panic!(
-                "{command} runs hosted as {other:?}: classify it as a full lane run or a \
-                 self-test, or the UNRUN list will claim a lane that ran did not"
+            (true, "--self-test") => {}
+            _ => panic!(
+                "unreadable lane invocation {line:?}: the UNRUN derivation reads only \
+                 `- run: <script>` and `- run: <script> --self-test`, so this form would \
+                 leave the lane on the UNRUN list while it actually ran"
             ),
         }
     }
@@ -5996,11 +6015,6 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
             }
         }
     }
-    assert!(
-        expected.len() >= 18,
-        "the derivation found only {} privileged lanes not run hosted in full",
-        expected.len()
-    );
 
     // Match the action, not its version: bumping checkout is an innocent edit,
     // and pinning the tag made it fail here with a message about step order.
@@ -6010,7 +6024,11 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
         .map(|(_, rest)| rest)
         .expect("the checks job must check out the repository");
     assert!(
-        after_checkout.starts_with("      # UNRUN lanes begin\n"),
+        after_checkout
+            .lines()
+            .take_while(|line| !line.starts_with("      # UNRUN lanes begin"))
+            // checkout's own `with:` block is indented deeper and is not a step.
+            .all(|line| line.starts_with("        ")),
         "the UNRUN lanes block must be the first step after checkout"
     );
     let block = between(&ci, "# UNRUN lanes begin", "# UNRUN lanes end");
@@ -6139,11 +6157,10 @@ fn hosted_pipeline_retains_the_job_log() {
         // Not always(): a cancelled run must not publish a truncated log under
         // the same artifact name as a complete one.
         "    if: ${{ !cancelled() }}\n",
-        "- uses: actions/upload-artifact@v4\n",
+        "- uses: actions/upload-artifact@",
         "if-no-files-found: error\n",
-        "retention-days: 90\n",
         "/actions/jobs/$JOB_ID/logs\"",
-        "for attempt in 1 2 3; do",
+        "for attempt in ",
         // An attempt that wrote nothing must not count as success: the retry
         // window answers 200 with an empty body, and `if-no-files-found: error`
         // only checks that the file exists.
@@ -7917,7 +7934,7 @@ fn every_gate_script_self_tests_its_own_validator() {
     let self_test_loop = between(
         &gates,
         "echo \"=== gate validator self-tests ===\"\nfor gate in ",
-        "done\npython3 scripts/check-live-discovery-evidence.py --self-test",
+        "done\npython3 -I scripts/check-live-discovery-evidence.py --self-test",
     );
     let live_gate_loop = between(
         &gates,

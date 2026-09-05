@@ -5764,50 +5764,75 @@ fn hosted_pipeline_checks_the_diagnostic_inventory() {
     // neighbouring step panic inside `between()`; the step only has to be in the
     // checks job, after the clippy gate it complements.
     let checks = ci.split("\n  archive-log:\n").next().unwrap_or(&ci);
-    let clippy_step = "- run: cargo +1.88 clippy --locked --workspace --all-targets -- -D warnings";
+    let lines: Vec<&str> = checks.lines().map(str::trim).collect();
+    let clippy_at = lines
+        .iter()
+        .position(|line| {
+            *line == "- run: cargo +1.88 clippy --locked --workspace --all-targets -- -D warnings"
+        })
+        .expect("the checks job must run the clippy gate");
     // `--nocapture` so the inventory report the wave cites as exit evidence
-    // actually reaches the hosted log; the filter stays last so it is one token.
-    let diagnostic_step = "- run: cargo +1.88 test --locked --features unsafe-unvalidated-metadata --test artifact_contracts -- --nocapture frozen_policy_inventory_matches_embedded_object";
-    let position = |needle: &str| {
-        checks
-            .lines()
-            .map(str::trim)
-            .position(|line| line == needle)
-    };
-    let (clippy_at, diagnostic_at) = (position(clippy_step), position(diagnostic_step));
+    // actually reaches the hosted log.
+    let prefix = "cargo +1.88 test --locked --features unsafe-unvalidated-metadata --test artifact_contracts -- ";
+    let command_at = lines
+        .iter()
+        .position(|line| line.starts_with(prefix))
+        .expect("the checks job must run the diagnostic-object inventory test");
     assert!(
-        diagnostic_at.is_some() && diagnostic_at > clippy_at,
-        "the checks job must run the diagnostic-object inventory test after the clippy gate"
+        command_at > clippy_at,
+        "the diagnostic-object inventory test must run after the clippy gate"
     );
-    // libtest exits 0 when a filter matches nothing, so that step is a real
-    // check only while its filter still names a test. Without this, renaming the
-    // test turns the sole hosted check of the diagnostic object green on zero
-    // tests run.
-    let filter = diagnostic_step
-        .rsplit_once(' ')
-        .expect("the diagnostic step carries a test filter")
-        .1;
+    // libtest exits 0 when a filter matches nothing, and a rename, an `#[ignore]`,
+    // a `#[cfg]` that excludes the test, or a deleted `#[test]` all empty the
+    // filter identically. Guarding the source text against each spelling is
+    // whack-a-mole, so the step itself must prove a test ran.
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with(r#"grep -q "^test result: ok. 1 passed""#)),
+        "the diagnostic-object step must assert that exactly one test ran"
+    );
+    // The filter must still name a real test, so this fails at `cargo test` time
+    // rather than only on the runner.
+    let filter = lines[command_at]
+        .strip_prefix(prefix)
+        .unwrap_or_default()
+        .split_whitespace()
+        .find(|token| !token.starts_with('-'))
+        .expect("the diagnostic step carries a test filter");
     let source = read("tests/artifact_contracts.rs");
-    let (attributes, _) = source
+    let (before, _) = source
         .split_once(&format!("\nfn {filter}()"))
         .unwrap_or_else(|| {
             panic!(
-                "ci.yml filters the hosted diagnostic-object step on `{filter}`, which names \
-             no test: the step would pass having run nothing"
+                "ci.yml filters the hosted diagnostic-object step on `{filter}`, \
+                 which names no test"
             )
         });
-    // `#[ignore]` (or a `cfg` that excludes it) empties the same filter just as
-    // effectively as a rename, and libtest still exits 0.
-    let attributes = attributes.rsplit("\n\n").next().unwrap_or_default();
-    assert!(
-        attributes.contains("#[test]") && !attributes.contains("#[ignore"),
-        "`{filter}` must be an unconditional #[test]; its attributes are {attributes:?}"
+    // Whitelist the attribute rather than blacklisting spellings: `#[ignore]`,
+    // `#[ignore = "..."]`, `#[cfg(...)]` and `#[cfg_attr(..., ignore)]` all empty
+    // the filter, and enumerating them is a losing game.
+    let attributes: Vec<&str> = before
+        .rsplit("\n\n")
+        .next()
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("#["))
+        .collect();
+    assert_eq!(
+        attributes,
+        ["#[test]"],
+        "`{filter}` must carry exactly #[test]; anything conditional empties the hosted filter"
     );
 }
 
 /// Owner decision 2026-09-05: every validator self-test runs hosted, by a
 /// mechanical rule rather than an enumerated list, so a lane cannot be added
-/// without its hosted self-test. `scripts/gates.sh` is the local entry point
+/// without its hosted self-test. The rule keys on the literal `--self-test`, so
+/// a validator spelling its flag any other way is invisible to it — the one that
+/// does (`task4-fcntl-experiment.py`, positional `self-test`) is covered inside
+/// the ordinary `cargo test` gate by `tests/task4_build_subjects.rs`. `scripts/gates.sh` is the local entry point
 /// that only invokes the others; `lib.sh`, `cleanup-traps.sh` and `fixtures/`
 /// are not validators.
 #[test]
@@ -5822,7 +5847,7 @@ fn hosted_pipeline_runs_every_unprivileged_self_test() {
             let path = path.to_str().expect("utf-8 script path");
             let interpreter = match path.rsplit_once('.') {
                 Some((_, "sh")) => "",
-                Some((_, "py")) => "python3 ",
+                Some((_, "py")) => "python3 -I ",
                 _ => continue,
             };
             if [
@@ -5869,6 +5894,10 @@ fn hosted_pipeline_runs_every_unprivileged_self_test() {
 fn hosted_pipeline_names_every_unrun_privileged_lane() {
     let ci = read(".github/workflows/ci.yml");
     let ci_lines: Vec<&str> = ci.lines().map(str::trim).collect();
+    // A heuristic in both directions: it reads words, so an unprivileged script
+    // whose prose happens to say "kind" is flagged, and a lane needing only
+    // `setcap` or `runuser` is not. It errs toward declaring more UNRUN, which is
+    // the honest direction; the set it produces is pinned exactly below.
     let is_privileged = |script: &str| {
         read(script)
             .lines()
@@ -5915,14 +5944,30 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
                 })
         })
     };
-    let hosted_full: BTreeSet<&str> = ci_lines
+    // Every shell invocation is classified, not just the bare ones. A self-test is
+    // not the lane body, so it does not count as a full run — but a call with any
+    // other argument is neither, and silently treating it as "not a full run"
+    // would leave this job printing `UNRUN:` for a lane that had just run.
+    let mut hosted_full: BTreeSet<&str> = BTreeSet::new();
+    for call in ci_lines
         .iter()
         .filter_map(|line| line.strip_prefix("- run: "))
-        // The bare-command test is deliberate: this job invokes most of these
-        // scripts as `<script> --self-test`, and a self-test is not the lane
-        // body. Only an unadorned invocation counts as running the lane in full.
-        .filter(|call| call.starts_with("scripts/") && call.ends_with(".sh"))
-        .collect();
+    {
+        let (command, tail) = call.split_once(' ').unwrap_or((call, ""));
+        if !(command.starts_with("scripts/") && command.ends_with(".sh")) {
+            continue;
+        }
+        match tail {
+            "" => {
+                hosted_full.insert(command);
+            }
+            "--self-test" => {}
+            other => panic!(
+                "{command} runs hosted as {other:?}: classify it as a full lane run or a \
+                 self-test, or the UNRUN list will claim a lane that ran did not"
+            ),
+        }
+    }
     let mut expected = BTreeSet::new();
     for dir in ["scripts", "scripts/matrix"] {
         for entry in fs::read_dir(dir).expect("walk scripts") {
@@ -6002,11 +6047,13 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
         "the scope: line must name exactly the lanes this job runs in full"
     );
     // The rest of that line is prose, so pin the steps it claims.
+    // Full strings: "test --locked" alone was also matched by the diagnostic
+    // step, so deleting the workspace test gate left this claim standing.
     for gate in [
         "fmt --all -- --check",
-        "check --locked",
-        "test --locked",
-        "clippy --locked",
+        "check --locked --workspace --all-targets",
+        "test --locked --workspace --all-targets",
+        "clippy --locked --workspace --all-targets",
     ] {
         assert!(
             ci.contains(&format!("- run: cargo +1.88 {gate}")),
@@ -6024,7 +6071,7 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
             );
         }
         let interpreter = if path.ends_with(".py") {
-            "python3 "
+            "python3 -I "
         } else {
             ""
         };
@@ -7880,7 +7927,7 @@ fn every_gate_script_self_tests_its_own_validator() {
     let ci_self_test_block = between(
         &ci,
         "      # Unprivileged validator self-tests:",
-        "      - run: python3 scripts/check-live-discovery-evidence.py --self-test",
+        "      - run: python3 -I scripts/check-live-discovery-evidence.py --self-test",
     );
     for script in [
         "scripts/verify-inspect-doctor.sh",
@@ -7988,7 +8035,7 @@ fn every_gate_script_self_tests_its_own_validator() {
         "the live induced-gaps driver is not labelled at the root gate boundary"
     );
     assert!(
-        ci.contains("python3 scripts/check-live-discovery-evidence.py --self-test"),
+        ci.contains("python3 -I scripts/check-live-discovery-evidence.py --self-test"),
         "the frozen evidence validator self-test is not wired into CI"
     );
     // The hosted SoftHSM live-discovery lane is Task 9 Step 2, not this step.

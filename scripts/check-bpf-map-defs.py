@@ -77,6 +77,20 @@ def inspect(path):
         subprocess.run(["llvm-objcopy", "--dump-section", f"maps={raw}", path], check=True)
         data = raw.read_bytes()
     maps = decode_map_definitions(records, sections["maps"], data)
+    return maps, classify(records, sections), {record[-1] for record in records}
+
+
+def classify(records, sections):
+    """Return the object's BPF program names, refusing what cannot be classified.
+
+    A program emitted under an attach type the whitelist does not name (`raw_tp/`,
+    `kprobe/`, `fentry/`, `lsm/`, `uprobe.s`, ...) lands in an unlisted section.
+    Silently skipping it would leave the frozen program count intact while the
+    object gained a program, so an unclassified global function is an error.
+
+    The `FUNC`/`GLOBAL`/`DEFAULT` filter is inherited from the program scan: the
+    compiler's mem* helpers are `GLOBAL HIDDEN` and never reach here.
+    """
     program_sections = {
         index for name, index in sections.items()
         if name in {"uprobe", "uretprobe"} or name.startswith("tracepoint/")
@@ -87,21 +101,14 @@ def inspect(path):
         if kind == "FUNC" and bind == "GLOBAL" and visibility == "DEFAULT"
         and section.isdigit() and (int(section) in program_sections) == wanted
     }
-    programs = {name for name, _ in globals_in(True)}
-    # A program emitted under an attach type this whitelist does not name
-    # (`raw_tp/`, `kprobe/`, `fentry/`, `lsm/`, `uprobe.s`, ...) would land in an
-    # unlisted section and be silently dropped from `programs`, leaving the
-    # frozen count intact while the object gained a program. Refuse instead of
-    # skipping: only the compiler-emitted mem* helpers in `.text` are exempt.
     by_index = {index: name for name, index in sections.items()}
     stray = sorted(
         f"{name} in {by_index.get(int(section), section)}"
         for name, section in globals_in(False)
-        if name not in {"memcpy", "memmove", "memset"}
     )
     if stray:
-        raise RuntimeError(f"{path}: global functions in unclassified sections: {stray}")
-    return maps, programs, {record[-1] for record in records}
+        raise RuntimeError(f"global functions in unclassified sections: {stray}")
+    return {name for name, _ in globals_in(True)}
 
 
 def definitions(path):
@@ -270,6 +277,27 @@ def self_test():
     assert rejected(validate_inventory, "diagnostic", UNSAFE_MAPS, UNSAFE_PROGRAMS, set()) == [
         "decode_params=False walk_template=0 frozen decode_params=True walk_template=3"
     ]
+    # The unclassified-section refusal, which no real object can exercise.
+    sections = {".text": 1, "uprobe": 2, "raw_tp/sched_process_exit": 3}
+    func = lambda section, name: (0, 0, "FUNC", "GLOBAL", "DEFAULT", str(section), name)
+    assert classify([func(2, "p11_entry")], sections) == {"p11_entry"}
+    for section, name in [(3, "extra_raw"), (1, "stray_text")]:
+        try:
+            classify([func(2, "p11_entry"), func(section, name)], sections)
+        except RuntimeError as error:
+            assert name in str(error), error
+        else:
+            raise AssertionError(f"unclassified {name} accepted")
+    # mem* helpers are GLOBAL HIDDEN, so the visibility filter already excludes
+    # them; the name carries no exemption of its own.
+    assert classify([(0, 0, "FUNC", "GLOBAL", "HIDDEN", "1", "memcpy")], sections) == set()
+    try:
+        classify([func(1, "memcpy")], sections)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("a GLOBAL DEFAULT memcpy was exempted by name")
+    print("unclassified program sections rejected: OK")
     record = (0, 28, "OBJECT", "GLOBAL", "DEFAULT", "9", "ONE")
     data = struct.pack("<7I", 1, 4, 8, 1, 0, 0, 0)
     assert decode_map_definitions([record], 9, data)["ONE"]["value_size"] == 8

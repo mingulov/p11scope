@@ -5824,15 +5824,28 @@ fn hosted_pipeline_checks_the_diagnostic_inventory() {
     // `|| true` on that line, or continue-on-error on the step, voids the proof
     // while leaving every pin above satisfied.
     assert!(
-        !checks.contains("continue-on-error"),
-        "no step in the checks job may set continue-on-error"
+        !ci.lines().map(str::trim).any(|line| {
+            // As a step's first key it renders `- continue-on-error:`.
+            let key = line.strip_prefix("- ").unwrap_or(line);
+            !key.starts_with('#') && key.starts_with("continue-on-error:")
+        }),
+        "no step in this workflow may set continue-on-error: it would turn a failed \
+         proof into a green job"
     );
     let arguments = lines[command_at].strip_prefix(prefix).unwrap_or_default();
+    for token in ["--exact", "--nocapture"] {
+        assert!(
+            arguments
+                .split_whitespace()
+                .any(|argument| argument == token),
+            "the diagnostic step needs {token}: --nocapture puts the inventory report in \
+             the log, --exact stops a future test whose name merely starts with this one \
+             from making the step report `2 passed` and turning the job red"
+        );
+    }
     assert!(
-        arguments
-            .split_whitespace()
-            .any(|token| token == "--nocapture"),
-        "without --nocapture the inventory report never reaches the hosted log"
+        arguments.ends_with(r#"| tee "$RUNNER_TEMP/diagnostic-inventory.log""#),
+        "the report must be teed to the log that the grep proof reads"
     );
     // The filter must still name a real test, so this fails at `cargo test` time
     // rather than only on the runner.
@@ -5916,6 +5929,10 @@ fn hosted_pipeline_runs_every_unprivileged_self_test() {
     // longer exists.
     let hosted: BTreeSet<String> = ci_lines
         .iter()
+        .map(|line| {
+            line.split_once(" #")
+                .map_or(*line, |(code, _)| code.trim_end())
+        })
         .filter_map(|line| {
             line.strip_prefix("- run: ")
                 .or_else(|| line.strip_prefix("run: "))
@@ -5940,7 +5957,6 @@ fn hosted_pipeline_runs_every_unprivileged_self_test() {
 #[test]
 fn hosted_pipeline_names_every_unrun_privileged_lane() {
     let ci = read(".github/workflows/ci.yml");
-    let ci_lines: Vec<&str> = ci.lines().map(str::trim).collect();
     // A heuristic in both directions: it reads words, so an unprivileged script
     // whose prose happens to say "kind" is flagged, and a lane needing only
     // `setcap` or `runuser` is not. It errs toward declaring more UNRUN, which is
@@ -6011,6 +6027,17 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
         token.contains("scripts/") && (token.ends_with(".sh") || token.ends_with(".py"))
     };
     let mut hosted_full: BTreeSet<&str> = BTreeSet::new();
+    // Every step's command with `- run:` / `run:` (after a `- name:` label) and any
+    // trailing YAML comment normalised away, so a label or a comment cannot change
+    // what this test believes ran.
+    fn command_of(line: &str) -> Option<&str> {
+        let line = line
+            .split_once(" #")
+            .map_or(line, |(code, _)| code.trim_end());
+        line.strip_prefix("- run: ")
+            .or_else(|| line.strip_prefix("run: "))
+    }
+    let run_calls: BTreeSet<&str> = ci.lines().map(str::trim).filter_map(command_of).collect();
     for line in ci.lines().map(str::trim) {
         // Trailing YAML comments are not invocations.
         let line = line
@@ -6152,8 +6179,8 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
         } else {
             ""
         };
-        let self_test = format!("- run: {interpreter}{path} --self-test");
-        let note = if ci_lines.contains(&self_test.as_str()) {
+        let self_test = format!("{interpreter}{path} --self-test");
+        let note = if run_calls.contains(self_test.as_str()) {
             "only its unprivileged self-test runs in this job"
         } else {
             "no self-test"
@@ -6220,6 +6247,9 @@ fn hosted_pipeline_retains_the_job_log() {
         "if-no-files-found: error\n",
         "/actions/jobs/$JOB_ID/logs\"",
         "for attempt in ",
+        // Without this the loop's hardcoded exit number is load-bearing: shortening
+        // the attempt list would fall through with the empty file `gh api` created.
+        r#"[ -s "$RUNNER_TEMP/checks-and-e2e.log" ] && wc -c"#,
         // An attempt that wrote nothing must not count as success: the retry
         // window answers 200 with an empty body, and `if-no-files-found: error`
         // only checks that the file exists.

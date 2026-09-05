@@ -9469,3 +9469,39 @@ fn tracked_ignore_rules_cover_agent_state_and_root_binaries() {
         String::from_utf8_lossy(&tracked.stdout)
     );
 }
+
+#[test]
+fn every_view_retirement_settles_its_leader_exit_assessment_first() {
+    // A pending leader-exit assessment can only be answered from the retiring
+    // view's own pidfd, and `settle_terminal_drain` counts every assessment
+    // still pending at capture end as a lost uprobe link. So a retirement that
+    // drops the view without settling turns an ordinary target exit into a
+    // published capture gap that never happened. This reads every retirement
+    // site rather than the two that were wrong, because the next one added is
+    // the one that will forget.
+    let source = read("src/discovery/engine.rs");
+    // Not `split("#[cfg(test)]")`: the first one in this file guards a `use`
+    // at line 49, which would leave 48 lines of "production" and pass on an
+    // empty search.
+    let production = source
+        .split_once("#[cfg(test)]\npub(crate) mod tests {")
+        .expect("engine.rs must have a test module")
+        .0;
+    let sites: Vec<usize> = ["self.views.retain(", "discovered.views.retain("]
+        .iter()
+        .flat_map(|form| production.match_indices(form).map(|(at, _)| at))
+        .collect();
+    assert!(
+        sites.len() >= 4,
+        "expected every process-view retirement to be found; got {}",
+        sites.len()
+    );
+    for at in sites {
+        let window = &production[at.saturating_sub(400)..at];
+        assert!(
+            window.contains("settle_leader_exits_at_removal"),
+            "a process-view retirement at byte {at} drops the view without first \
+             settling its pending leader-exit assessment"
+        );
+    }
+}

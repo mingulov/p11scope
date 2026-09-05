@@ -4634,6 +4634,7 @@ fn remove_stale_views(discovered: &mut Engine, stale: &[ProcessViewId]) -> Resul
         .filter(|view| accepted.contains(view))
         .collect();
     discovered.close_cgroup_admissions_at_removal(&stale);
+    discovered.settle_leader_exits_at_removal(stale.iter().copied());
     let before = discovered.views.len();
     discovered.views.retain(|view| !stale.contains(&view.id()));
     let removed = before - discovered.views.len();
@@ -10498,6 +10499,38 @@ impl Engine {
         }
     }
 
+    /// Settle any pending leader-exit assessment for views about to be retired.
+    ///
+    /// The assessment is answered from the view's own pidfd, so once the view
+    /// is dropped nothing can resolve it and `settle_terminal_drain` counts it
+    /// as a link loss. A process whose whole thread group exited is the
+    /// ordinary end of a capture, not a lost link, and retirement is the last
+    /// point at which that can still be told apart from a leader that exited
+    /// while its group kept running. Both answers are recorded here; only the
+    /// unanswerable one used to reach capture end.
+    fn settle_leader_exits_at_removal(&mut self, removed: impl IntoIterator<Item = ProcessViewId>) {
+        for view in removed {
+            if !self.pending_leader_exit_views.contains(&view) {
+                continue;
+            }
+            let original_exited = self
+                .views
+                .iter()
+                .find(|candidate| candidate.id() == view)
+                .map_or_else(
+                    || Err("retained process view is no longer available".to_string()),
+                    ProcessView::original_exited,
+                );
+            settle_leader_exit_view(
+                &mut self.pending_leader_exit_views,
+                &mut self.counted_leader_exit_views,
+                &mut self.task_uprobe_link_losses,
+                view,
+                original_exited,
+            );
+        }
+    }
+
     fn queue_leader_exit_assessment(&mut self, view: ProcessViewId) {
         self.pending_leader_exit_views.insert(view);
     }
@@ -10755,6 +10788,7 @@ impl Engine {
                 self.ready_expected_removals.remove(&view);
                 if cause == RetirementCause::ExpectedRemoval {
                     self.close_cgroup_admission_at_removal(view);
+                    self.settle_leader_exits_at_removal([view]);
                     self.views.retain(|candidate| candidate.id() != view);
                     self.scan_inputs.remove(&view);
                     self.arm_expected_target_exit(view);
@@ -11256,6 +11290,7 @@ impl Engine {
                 *additions_allowed = false;
             }
             self.close_cgroup_admissions_at_removal(&removed);
+            self.settle_leader_exits_at_removal(removed.iter().copied());
             self.views.retain(|view| !removed.contains(&view.id()));
             for view in removed.iter().chain(&refreshed_ok) {
                 self.scan_inputs.remove(view);
@@ -11328,6 +11363,7 @@ impl Engine {
         self.refresh_requested
             .retain(|pid| failed_refresh_pids.contains(pid));
         self.close_cgroup_admissions_at_removal(&removed);
+        self.settle_leader_exits_at_removal(removed.iter().copied());
         self.views.retain(|view| !removed.contains(&view.id()));
         for view in removed.iter().chain(&refreshed_ok) {
             self.scan_inputs.remove(view);
@@ -14434,6 +14470,68 @@ pub(crate) mod tests {
 
     /// Mutation caught: accepting an EXEC from a retained but stale process pin
     /// binds a later same-PID generation to historical admission evidence.
+    #[test]
+    fn a_view_retired_after_its_group_exited_is_not_a_link_loss() {
+        // A leader-exit assessment is answered from the view's own pidfd.
+        // Retiring the view without settling leaves it pending forever, and
+        // capture end counts every still-pending assessment as a lost uprobe
+        // link -- so an ordinary target exit was published as a capture gap
+        // that never happened.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let view = ProcessView::open(ProcessViewId(40), child.id()).unwrap();
+        let mut engine = Engine::empty();
+        engine.views.push(view);
+        engine.queue_leader_exit_assessment(ProcessViewId(40));
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        engine.settle_leader_exits_at_removal([ProcessViewId(40)]);
+
+        assert!(
+            engine.pending_leader_exit_views.is_empty(),
+            "retirement must settle the assessment while the pidfd can still answer it"
+        );
+        assert_eq!(
+            engine.task_uprobe_link_losses, 0,
+            "a whole-group exit is the ordinary end of a capture, not a lost link"
+        );
+
+        // The fail-closed path is untouched: an assessment that never became
+        // answerable is still counted at capture end.
+        engine.queue_leader_exit_assessment(ProcessViewId(41));
+        finalize_pending_leader_exit_views(
+            &mut engine.pending_leader_exit_views,
+            &mut engine.counted_leader_exit_views,
+            &mut engine.task_uprobe_link_losses,
+        );
+        assert_eq!(engine.task_uprobe_link_losses, 1);
+    }
+
+    #[test]
+    fn a_view_retired_while_its_group_lives_is_still_a_link_loss() {
+        // The other direction, so the fix cannot be "stop counting". The
+        // leader exited and the thread group did not: the link that probe
+        // held is genuinely gone and the gap is real.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let view = ProcessView::open(ProcessViewId(42), child.id()).unwrap();
+        let mut engine = Engine::empty();
+        engine.views.push(view);
+        engine.queue_leader_exit_assessment(ProcessViewId(42));
+
+        engine.settle_leader_exits_at_removal([ProcessViewId(42)]);
+
+        assert!(engine.pending_leader_exit_views.is_empty());
+        assert_eq!(engine.task_uprobe_link_losses, 1);
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
     #[test]
     fn cgroup_exec_rejects_a_stale_retained_generation() {
         let mut child = std::process::Command::new("sleep")

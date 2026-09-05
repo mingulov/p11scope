@@ -119,28 +119,50 @@ of `73578a6`, and in between, 16 commits touch `crates/ebpf/` and
 BPF object the lane loads is materially different; the machine loading it is
 byte-for-byte the same.
 
-### Hypothesis, explicitly not evidence
+### First hypothesis: tested on the runner, refuted
 
 524 is the kernel's internal `ENOTSUPP`. The verifier never returns it for a
-rejected program, and here it arrives *after* verification succeeds. The paths
-that leak it to userspace at that point are post-verifier JIT failures:
-`fixup_call_args()` under `CONFIG_BPF_JIT_ALWAYS_ON` when `jit_subprogs()`
-fails, and `bpf_prog_select_runtime()` when the JIT is required and produced no
-code. The trace shows `dl_debug_state` now making a BPF-to-BPF call (`call
-pc+309`, `frame1`), so subprogram JIT-ing is in play. The same object loads on
-the workstation, whose kernel is newer (`7.0.0-30-generic`, with
-`net.core.bpf_jit_harden=0`) — which is why no local gate sees this.
+rejected program, and here it arrives *after* verification succeeds, so the
+suspicion was a post-verifier JIT refusal — `fixup_call_args()` under
+`CONFIG_BPF_JIT_ALWAYS_ON` when `jit_subprogs()` fails, with constant blinding
+as the likely trigger, since the trace shows `dl_debug_state` making a
+BPF-to-BPF call (`call pc+309`, `frame1`).
 
-**None of that is confirmed.** No sysctl reading and no `dmesg` line has been
-collected from the runner. It is written down as the first thing to test, not
-as a finding.
+Run `33980606101` tested it directly and **refuted it**:
 
-Two cheap ways to close it, neither run:
+```
+net.core.bpf_jit_enable = 1
+net.core.bpf_jit_harden = 0
+net.core.bpf_jit_limit = 528482304
+```
 
-- Add `net.core.bpf_jit_harden`, `net.core.bpf_jit_enable`,
-  `net.core.bpf_jit_limit` and a `dmesg` tail to the existing runner-diagnostic
-  step. One push to `ci/w4-hosted` decides the JIT hypothesis in ~12 minutes.
-- Bisect `a7053d7..HEAD` hosted across the 16 eBPF commits to name the change.
+Blinding was already off. The run also re-ran the lane after explicitly setting
+`bpf_jit_harden=0`, and it failed identically; `dmesg` carries no BPF or JIT
+message anywhere near the failure. JIT hardening is not the cause.
+
+### What that run did establish
+
+The load loop walks `DEFAULT_PROGRAMS` (`src/attach.rs:131`) in order, and
+`dl_debug_state` is **fourth**. `p11_entry`, `p11_return` and `task_newtask`
+load successfully on this runner before it fails. So the runner loads BPF
+programs perfectly well — including uprobes, including a tracepoint — and this
+is not an environment-wide inability to load or attach. It is specific to one
+program.
+
+The narrowing that follows from it, offered as a lead and not as a finding:
+`dl_debug_state` is the only program in the object that reaches
+`loader_runtime_ip()` (`crates/ebpf/src/main.rs:1152`), and therefore the only
+one calling **`bpf_get_func_ip` on a plain, non-multi uprobe**. Attach cookies
+are not the distinguishing feature — `export_symbol_id`, `export_state_key` and
+`selection_state_key` all call `bpf_get_attach_cookie`, and the programs using
+them load. `bpf_get_func_ip` has exactly one caller, in the one program that
+fails, on a kernel (6.17) older than the workstation's (7.0.0) where the same
+object loads.
+
+The next experiment is one push: remove the `bpf_get_func_ip` call from
+`loader_runtime_ip` on the CI branch — the code already has a fallback to
+`(*ctx.regs).rip` for when the helper returns 0 — and see whether
+`dl_debug_state` loads. That is product debugging, not pipeline work.
 
 ### Why it stays open
 

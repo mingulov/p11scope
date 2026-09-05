@@ -441,7 +441,10 @@ C
     # 77 alone is ambiguous: the prerequisite loop above this refusal exits 77
     # too, so on a host missing softhsm2-util (say) the oracle would pass green
     # without the refusal ever being reached. Assert the refusal itself.
-    grep -Fq "refusing inherited RUSTFLAGS" "$self_root/early.err"
+    grep -Fq "refusing inherited RUSTFLAGS" "$self_root/early.err" || {
+        echo "refusal not reached; early run said: $(cat "$self_root/early.err")" >&2
+        exit 1
+    }
     grep -Fq "$(printf 'terminal_status\t77')" "$self_root/early-receipt/facts.log"
     : > "$self_root/pid-target"
     ln -s "$self_root/pid-target" "$self_root/observer.pid"

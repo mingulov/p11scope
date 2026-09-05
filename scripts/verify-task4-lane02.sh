@@ -443,8 +443,10 @@ C
     # oracle pass green without the refusal ever being reached. Assert the
     # refusal itself. Known ceiling: on a host where every prerequisite IS
     # present this cannot see the loops swapped back, because the refusal is
-    # reached either way. The Rust harness covers that case -- it runs this
-    # script under a PATH with no rustc, where the order is observable.
+    # reached either way. `task4_receipt_drivers_execute_behavioral_self_tests`
+    # covers that case: it runs this script under a PATH that excludes
+    # ~/.cargo/bin, so the swapped order surfaces as
+    # "refusal not reached; early run said: rustc required".
     grep -Fq "refusing inherited RUSTFLAGS" "$self_root/early.err" || {
         echo "refusal not reached; early run said: $(cat "$self_root/early.err")" >&2
         exit 1

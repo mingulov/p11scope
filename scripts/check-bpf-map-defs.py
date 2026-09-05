@@ -265,7 +265,10 @@ def self_test():
     assert rejected(validate_inventory, "default", drifted, SAFE_PROGRAMS, set()) == [
         f"CONFIG.max_entries: object={frozen + 1} frozen={frozen}"
     ]
-    # A program leaving the object is named, not just counted.
+    # A program entering or leaving the object is named, not just counted.
+    assert rejected(
+        validate_inventory, "default", SAFE_MAPS, SAFE_PROGRAMS | {"p11_extra"}, {"p11_entry"}
+    ) == ["program added: p11_extra"]
     assert rejected(
         validate_inventory, "default", SAFE_MAPS, SAFE_PROGRAMS - {"p11_entry"}, {"p11_entry"}
     ) == ["program removed: p11_entry"]

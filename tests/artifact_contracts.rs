@@ -4152,6 +4152,13 @@ fn lane02_cleanup_covers_both_harness_executables() {
     );
     assert!(driver.contains("argv[0] in wanted"));
     assert!(driver.contains("os.fsencode(exe) == argv[0]"));
+    // The oracle's refusal check: without it, `exit 77` alone is ambiguous
+    // between the env-hygiene refusal and a missing prerequisite, and reordering
+    // the two loops would silently restore that masking.
+    assert!(
+        driver.contains(r#"grep -Fq "refusing inherited RUSTFLAGS" "$self_root/early.err""#),
+        "the lane02 self-test must assert which refusal it reached"
+    );
 }
 
 #[test]
@@ -4635,6 +4642,27 @@ fn frozen_policy_inventory_matches_embedded_object() {
             "inventory {variant}: maps={maps} programs={programs} OK"
         )),
         "{report}"
+    );
+    // The count line alone would still print if `--inventory` stopped validating,
+    // so prove the same object is rejected against the other variant's freeze.
+    let other = if variant == "default" {
+        "diagnostic"
+    } else {
+        "default"
+    };
+    let control = Command::new("python3")
+        .args([
+            "-I",
+            "scripts/check-bpf-map-defs.py",
+            "--inventory",
+            other,
+            object.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run the inventory negative control");
+    assert!(
+        !control.status.success(),
+        "the {other} freeze must reject the {variant} object, or --inventory is not comparing"
     );
 }
 
@@ -5787,10 +5815,17 @@ fn hosted_pipeline_checks_the_diagnostic_inventory() {
     // filter identically. Guarding the source text against each spelling is
     // whack-a-mole, so the step itself must prove a test ran.
     assert!(
-        lines
-            .iter()
-            .any(|line| line.starts_with(r#"grep -q "^test result: ok. 1 passed""#)),
+        lines.iter().any(|line| {
+            *line
+                == r#"grep -q "^test result: ok. 1 passed" "$RUNNER_TEMP/diagnostic-inventory.log""#
+        }),
         "the diagnostic-object step must assert that exactly one test ran"
+    );
+    // `|| true` on that line, or continue-on-error on the step, voids the proof
+    // while leaving every pin above satisfied.
+    assert!(
+        !checks.contains("continue-on-error"),
+        "no step in the checks job may set continue-on-error"
     );
     let arguments = lines[command_at].strip_prefix(prefix).unwrap_or_default();
     assert!(
@@ -5820,7 +5855,7 @@ fn hosted_pipeline_checks_the_diagnostic_inventory() {
     // `#[ignore = "..."]`, `#[cfg(...)]` and `#[cfg_attr(..., ignore)]` all empty
     // the filter, and enumerating them is a losing game.
     let attributes: Vec<&str> = before
-        .rsplit("\n\n")
+        .rsplit("\n}\n")
         .next()
         .unwrap_or_default()
         .lines()
@@ -5881,8 +5916,12 @@ fn hosted_pipeline_runs_every_unprivileged_self_test() {
     // longer exists.
     let hosted: BTreeSet<String> = ci_lines
         .iter()
-        .filter(|line| line.starts_with("- run: ") && line.ends_with(" --self-test"))
-        .map(|line| (*line).to_string())
+        .filter_map(|line| {
+            line.strip_prefix("- run: ")
+                .or_else(|| line.strip_prefix("run: "))
+        })
+        .filter(|call| call.ends_with(" --self-test"))
+        .map(|call| format!("- run: {call}"))
         .collect();
     assert_eq!(
         hosted, expected,
@@ -5934,6 +5973,13 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
     // actually makes one privileged is how it is invoked:
     // `sudo python3 -I scripts/dump-owned-bpf-maps.py`.
     let sudo_invoked = |script: &str| {
+        // Its own text counts only for a quoted `sudo` argv token; the docstrings
+        // and parsed evidence that made a plain word-scan useless never quote it.
+        if read(script).lines().map(str::trim).any(|line| {
+            !line.starts_with('#') && (line.contains("\"sudo\"") || line.contains("'sudo'"))
+        }) {
+            return true;
+        }
         let file = script.rsplit('/').next().unwrap_or(script).to_string();
         ["scripts", "scripts/matrix"].iter().any(|dir| {
             fs::read_dir(dir)
@@ -5958,32 +6004,45 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
     // block, an extra argument) is refused rather than quietly treated as "did
     // not run in full", which would leave this job printing `UNRUN:` for a lane
     // that had just run. Comments and the block's own lines are not invocations.
-    let checks_job = ci.split("\n  archive-log:\n").next().unwrap_or(&ci);
+    // The whole file, not just the checks job: a lane run from any job has run.
+    // Both extensions, because the derivation below covers `.py` too — a `.py`
+    // lane run in full would otherwise stay on the UNRUN list.
+    let is_lane = |token: &str| {
+        token.contains("scripts/") && (token.ends_with(".sh") || token.ends_with(".py"))
+    };
     let mut hosted_full: BTreeSet<&str> = BTreeSet::new();
-    for line in checks_job.lines().map(str::trim) {
+    for line in ci.lines().map(str::trim) {
+        // Trailing YAML comments are not invocations.
+        let line = line
+            .split_once(" #")
+            .map_or(line, |(code, _)| code.trim_end());
         if line.starts_with('#') || line.starts_with("UNRUN: ") || line.starts_with("scope: ") {
             continue;
         }
-        let names_lane = line
+        if !line
             .split(|c: char| c.is_ascii_whitespace() || c == '"' || c == '\'')
-            .any(|token| token.contains("scripts/") && token.ends_with(".sh"));
-        if !names_lane {
+            .any(is_lane)
+        {
             continue;
         }
-        let call = line.strip_prefix("- run: ").unwrap_or_default();
+        // `- name:` above a step is an ordinary edit, so accept the bare `run:` form.
+        let call = line
+            .strip_prefix("- run: ")
+            .or_else(|| line.strip_prefix("run: "))
+            .unwrap_or_default();
+        let call = call.strip_prefix("python3 -I ").unwrap_or(call);
         let (command, tail) = call.split_once(' ').unwrap_or((call, ""));
-        match (
-            command.starts_with("scripts/") && command.ends_with(".sh"),
-            tail,
-        ) {
+        match (command.starts_with("scripts/") && is_lane(command), tail) {
             (true, "") => {
                 hosted_full.insert(command);
             }
             (true, "--self-test") => {}
             _ => panic!(
                 "unreadable lane invocation {line:?}: the UNRUN derivation reads only \
-                 `- run: <script>` and `- run: <script> --self-test`, so this form would \
-                 leave the lane on the UNRUN list while it actually ran"
+                 `run: <script>` and `run: <script> --self-test`, optionally via \
+                 `python3 -I`. If this line does not invoke a lane, keep the script path \
+                 out of it; if it does, the derivation cannot tell, and the block would \
+                 be wrong about what ran"
             ),
         }
     }

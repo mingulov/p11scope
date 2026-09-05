@@ -4627,6 +4627,9 @@ fn frozen_policy_inventory_matches_embedded_object() {
             object.to_str().unwrap(),
         ],
     );
+    // Printed, not just carried in the assert message: the hosted step runs with
+    // --nocapture so this line is the wave's exit evidence in the job log.
+    println!("{report}");
     assert!(
         report.contains(&format!(
             "inventory {variant}: maps={maps} programs={programs} OK"
@@ -5762,13 +5765,28 @@ fn hosted_pipeline_checks_the_diagnostic_inventory() {
         "- run: cargo +1.88 clippy --locked --workspace --all-targets -- -D warnings\n",
         "- run: uname -r;",
     );
-    let diagnostic_step = "- run: cargo +1.88 test --locked --features unsafe-unvalidated-metadata --test artifact_contracts -- frozen_policy_inventory_matches_embedded_object";
+    // `--nocapture` so the inventory report the wave cites as exit evidence
+    // actually reaches the hosted log; the filter stays last so it is one token.
+    let diagnostic_step = "- run: cargo +1.88 test --locked --features unsafe-unvalidated-metadata --test artifact_contracts -- --nocapture frozen_policy_inventory_matches_embedded_object";
     assert!(
         after_clippy
             .lines()
             .map(str::trim)
             .any(|line| line == diagnostic_step),
         "CI must run the diagnostic-object inventory test after the clippy gate and before `uname -r`"
+    );
+    // libtest exits 0 when a filter matches nothing, so that step is a real
+    // check only while its filter still names a test. Without this, renaming the
+    // test turns the sole hosted check of the diagnostic object green on zero
+    // tests run.
+    let filter = diagnostic_step
+        .rsplit_once(' ')
+        .expect("the diagnostic step carries a test filter")
+        .1;
+    assert!(
+        read("tests/artifact_contracts.rs").contains(&format!("\nfn {filter}()")),
+        "ci.yml filters the hosted diagnostic-object step on `{filter}`, which names \
+         no test: the step would pass having run nothing"
     );
 }
 
@@ -5824,7 +5842,7 @@ fn hosted_pipeline_runs_every_unprivileged_self_test() {
 /// The pipeline names every such lane verbatim as `UNRUN: <path>` (the
 /// `verify-capability-tier.sh` idiom) in the log and the job summary, as its
 /// first step after checkout so a later failure cannot suppress the list. The
-/// set is derived here — privileged verify scripts minus the ones the job runs
+/// set is derived here — every privileged script minus the ones the job runs
 /// in full — and the label says whether the script's `--self-test` runs in
 /// this job, so a lane whose self-test is hosted is not mislabelled as absent.
 #[test]
@@ -5838,12 +5856,28 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
             .filter(|line| !line.starts_with('#'))
             .any(|line| {
                 line.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                    .any(|word| matches!(word, "sudo" | "docker" | "kind"))
+                    .any(|word| {
+                        matches!(
+                            word,
+                            "sudo"
+                                | "docker"
+                                | "podman"
+                                | "kind"
+                                | "kubectl"
+                                | "bpftool"
+                                | "capsh"
+                                | "nsenter"
+                                | "unshare"
+                        )
+                    })
             })
     };
     let hosted_full: BTreeSet<&str> = ci_lines
         .iter()
         .filter_map(|line| line.strip_prefix("- run: "))
+        // The bare-command test is deliberate: this job invokes most of these
+        // scripts as `<script> --self-test`, and a self-test is not the lane
+        // body. Only an unadorned invocation counts as running the lane in full.
         .filter(|call| call.starts_with("scripts/") && call.ends_with(".sh"))
         .collect();
     let mut expected = BTreeSet::new();
@@ -5855,8 +5889,12 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
                 .and_then(|n| n.to_str())
                 .unwrap_or_default();
             let path = path.to_str().expect("utf-8 script path").to_string();
-            if name.starts_with("verify-")
-                && name.ends_with(".sh")
+            // Not just `verify-` lanes: `build-release.sh` (the W8 release
+            // receipt), `attach-pod.sh` and `bench-overhead.sh` are privileged
+            // too, and two of them have a hosted `--self-test` whose green step
+            // would otherwise stand unqualified.
+            if name.ends_with(".sh")
+                && !["gates.sh", "lib.sh", "cleanup-traps.sh"].contains(&name)
                 && is_privileged(&path)
                 && !hosted_full.contains(path.as_str())
             {
@@ -5865,7 +5903,7 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
         }
     }
     assert!(
-        expected.len() >= 14,
+        expected.len() >= 17,
         "the derivation found only {} privileged lanes not run hosted in full",
         expected.len()
     );
@@ -5889,6 +5927,18 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
         named, expected,
         "UNRUN lines must name exactly the derived lane set"
     );
+    // The block's positive claim is derived too, so it cannot drift into
+    // omitting a lane the job really does run in full.
+    let hosted_line = block_lines
+        .iter()
+        .find(|line| line.starts_with("hosted: "))
+        .expect("the block must also state what did run hosted");
+    for path in &hosted_full {
+        assert!(
+            hosted_line.contains(path),
+            "the hosted: line omits {path}, which this job runs in full"
+        );
+    }
     for path in &expected {
         for line in block_lines
             .iter()
@@ -5948,13 +5998,19 @@ fn hosted_pipeline_retains_the_job_log() {
     );
     for required in [
         "    needs: checks-and-e2e\n",
-        "    if: always()\n",
+        // Not always(): a cancelled run must not publish a truncated log under
+        // the same artifact name as a complete one.
+        "    if: ${{ !cancelled() }}\n",
         "- uses: actions/upload-artifact@v4\n",
         "if-no-files-found: error\n",
         "retention-days: 90\n",
         "/actions/jobs/$JOB_ID/logs\"",
         "for attempt in 1 2 3; do",
         "sleep 5",
+        // An attempt that wrote nothing must not count as success: the retry
+        // window answers 200 with an empty body, and `if-no-files-found: error`
+        // only checks that the file exists.
+        "&& [ -s \"$RUNNER_TEMP/checks-and-e2e.log\" ]; then",
     ] {
         assert!(archive.contains(required), "archive-log lacks {required:?}");
     }

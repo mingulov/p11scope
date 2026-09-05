@@ -86,72 +86,117 @@ Two further hosted-only findings, invisible to any local gate:
   workspace. The readiness helpers now print the log tail, which is how §5 has a
   diagnosis at all.
 
-## 5. Open finding — a p11scope regression, NOT a CI defect
+## 5. Closed finding — a p11scope defect, found by CI, fixed at `56101fa`
 
-`scripts/verify-attach-e2e.sh` fails hosted: the observer exits before capture
-readiness with **`Unknown error 524`** (ENOTSUPP):
+`scripts/verify-attach-e2e.sh` failed hosted with **`Unknown error 524`
+(ENOTSUPP)** from `BPF_PROG_LOAD`, after the verifier had accepted the program.
 
-```
-p11scope: starting attach session: ... loading dl_debug_state:
-the BPF_PROG_LOAD syscall returned Unknown error 524 (os error 524)
-```
+### Root cause
 
-The verifier log shows the program verifying cleanly (13 insns, ~160 usec)
-before the failure, so this is not a rejected program and not a plain
-permission denial.
+A frozen `BPF_F_RDONLY_PROG` map makes the verifier constant-fold
+constant-offset reads of it through `map_direct_value_addr`. For arrays that is
+`array_map_direct_value_addr()`, which opens with `if (map->max_entries != 1)
+return -ENOTSUPP;`, and `check_mem_access()` returns it verbatim with no
+`verbose()` message. So the load fails with a bare errno 524 and a verifier log
+that simply stops at the offending instruction — here
+`322: (79) r8 = *(u64 *)(r0 +0)`, `map=CONFIG`, 13 insns in.
 
-### The runner did not change
+`CONFIG` is a `BPF_F_RDONLY_PROG` array frozen before the load loop. W3's
+`02eedbd` grew it from 1 entry to 2 to carry the `task_newtask` offsets, which
+armed the path. The repository already had the workaround one map over:
+`7774bf6` deferred the `DESCRIPTORS` freeze past program load for exactly this
+reason, with a comment naming ENOTSUPP.
 
-This lane **passed hosted on 2026-08-16** (run `31935749796`, commit
-`a7053d7`), and that run's own diagnostic step printed the same environment the
-failing runs print:
+The fix (`56101fa`) states the rule instead of listing names, so no map can
+rejoin the early freeze by having its `max_entries` bumped. Every freeze still
+precedes every attach, so no probe can observe mutable policy. No BPF object
+change, no frozen-inventory change, no capture change.
 
-| | `31935749796` (lane PASS) | `33975372955` (lane FAIL) |
+### Two claims in the previous version of this section were wrong
+
+- **It was never specific to one program.** `expected_programs()` returns a
+  `BTreeSet` (`src/attach.rs:1143`), so programs load alphabetically and
+  `dl_debug_state` is *first*. Every program calls `scope_auth`, which reads
+  `CONFIG`; all 13 would have failed. Nothing loaded successfully before it.
+- **It was never kernel-specific.** The pre-fix binary fails on the workstation
+  too. The kernel code is unchanged from 5.4 through 7.0. p11scope's attach has
+  been broken on **every** kernel since `02eedbd`; hosted CI looked special only
+  because hosted CI is where the attach lane actually ran.
+
+### Evidence
+
+Same `p11scope profile` run, before and after, on three kernels:
+
+| Kernel | pre-fix | post-fix |
 | --- | --- | --- |
-| `uname -r` | `6.17.0-1022-azure` | `6.17.0-1022-azure` |
-| `kernel.perf_event_paranoid` | `4` | `4` |
-| `kernel.yama.ptrace_scope` | `1` | `1` |
+| `7.0.0-30-generic` (workstation) | errno 524 | attached, capturing |
+| `6.17.0-1022-azure` (the hosted runner, reproduced in a local QEMU VM) | errno 524 | attached, capturing |
+| `6.8.0-137-generic` (VM) | errno 524 | attached, capturing |
 
-That closes the disjunction this section previously left open. It is **not** a
-runner-kernel change: it is a regression in p11scope. `a7053d7` is an ancestor
-of `73578a6`, and in between, 16 commits touch `crates/ebpf/` and
-`crates/ebpf-common/`, with `crates/ebpf/src/main.rs` alone at +1254/-52. The
-BPF object the lane loads is materially different; the machine loading it is
-byte-for-byte the same.
+Four Rust 1.88 gates PASS at `56101fa`. A regression test in `src/attach.rs`
+asserts every multi-entry read-only array is in the deferred set and pins that
+set; reverting to the old name list makes it fail. Three existing contract
+guards pinned the old source text and were updated to assert the new rule.
 
-### Hypothesis, explicitly not evidence
+The reproduction environment is `linux-image-6.17.0-1022-azure` — the runner's
+exact kernel, an apt package — installed in a QEMU VM off
+`p11scope-ws/vm-bases/noble`. That turns a 12-minute hosted cycle into a
+40-second local one and is the reason this was findable at all.
 
-524 is the kernel's internal `ENOTSUPP`. The verifier never returns it for a
-rejected program, and here it arrives *after* verification succeeds. The paths
-that leak it to userspace at that point are post-verifier JIT failures:
-`fixup_call_args()` under `CONFIG_BPF_JIT_ALWAYS_ON` when `jit_subprogs()`
-fails, and `bpf_prog_select_runtime()` when the JIT is required and produced no
-code. The trace shows `dl_debug_state` now making a BPF-to-BPF call (`call
-pc+309`, `frame1`), so subprogram JIT-ing is in play. The same object loads on
-the workstation, whose kernel is newer (`7.0.0-30-generic`, with
-`net.core.bpf_jit_harden=0`) — which is why no local gate sees this.
+### What CI actually bought
 
-**None of that is confirmed.** No sysctl reading and no `dmesg` line has been
-collected from the runner. It is written down as the first thing to test, not
-as a finding.
+This wave's stated purpose was to stop a green pipeline from implying that
+privileged lanes ran. It did that, and then the lane it exposed turned out to
+be hiding a defect that made the product's core function fail on every kernel,
+undetected on the developer's own machine for two waves.
 
-Two cheap ways to close it, neither run:
+## 5b. Closed finding — spurious `task_uprobe_link_losses`, fixed at `b74a65d`
 
-- Add `net.core.bpf_jit_harden`, `net.core.bpf_jit_enable`,
-  `net.core.bpf_jit_limit` and a `dmesg` tail to the existing runner-diagnostic
-  step. One push to `ci/w4-hosted` decides the JIT hypothesis in ~12 minutes.
-- Bisect `a7053d7..HEAD` hosted across the 16 eBPF commits to name the change.
+With the load fixed the lane reached **136/136 probes attached** and then failed
+a later oracle: `task_uprobe_link_losses: want 0, got 1`, deterministically.
 
-### Why it stays open
+Reduced to a minimal reproduction with no PKCS#11 involvement: attach to any
+process and let it exit while capture runs. With `0/0 probes attached` and `no
+modules discovered`, evidence still reported `task_uprobe_link_losses = 1` — a
+number describing a capture gap that never happened.
 
-Marking the lane UNRUN would produce a green run, and would be defensible only
-if the lane genuinely could not run hosted. The evidence now says the opposite:
-it demonstrably ran, to completion, on this exact runner. Papering over it is
-what this wave exists to prevent.
+### Root cause
 
-**Owner decision needed:** diagnose the ENOTSUPP as product work — which is
-what the same-runner evidence points to — or reclassify the lane as UNRUN with
-evidence that hosted attach is impossible.
+A queued leader-exit assessment is answered by `ProcessView::original_exited()`,
+which reads that view's own pidfd. Retirement dropped the view without settling,
+so the lookup returned `retained process view is no longer available`,
+`settle_leader_exit_view` (`src/discovery/engine.rs:5521`) held it `Pending`,
+and `settle_terminal_drain` counted every still-pending assessment as a loss.
+
+Instrumented rather than assumed: the failing run printed
+`settle ProcessViewId(0) -> Pending: retained process view is no longer
+available` followed by `finalize ProcessViewId(0) -> counted as loss`. After the
+fix the same run prints `settle ProcessViewId(0) -> WholeGroupExit`. The first
+guess — `remove_stale_views` — was wrong and was discarded on evidence: that
+path emits a `Skipped` record and the repro had none.
+
+Retirement is the last point at which a whole-group exit can still be told apart
+from a leader that exited while its group kept running, so the settlement
+happens there, at all four retirement sites.
+
+### Coverage
+
+- Two unit tests pin **both** directions, so the fix cannot degenerate into
+  "stop counting": a view retired after its group exited is not a loss; one
+  retired while its group lives still is. The fail-closed property is asserted
+  too — an assessment that never became answerable is still counted at capture
+  end.
+- A contract guard reads **every** `views.retain` retirement site rather than
+  the four that exist today, since the next site added is the one that will
+  forget.
+- Both were mutation-checked: deleting one settlement call fails the guard,
+  and making the settlement a no-op fails both unit tests.
+
+### Evidence
+
+Four gates PASS at `b74a65d`. `scripts/verify-attach-e2e.sh` reaches
+`=== e2e: ALL OK ===` locally for the first time. The minimal reproduction
+reports `losses = 0` on `7.0.0-30-generic` and on `6.17.0-1022-azure` in the VM.
 
 ## 6. What this closure does NOT claim
 

@@ -15,7 +15,7 @@ gates, and four of the five were introduced in W3:
 | Ordinary target exit published as a lost uprobe link | `b74a65d` | Needs a live attach with a target that exits mid-capture |
 | Uninitialised struct padding rejected by pre-6.5 verifiers | `24f82d0` | Needs a 5.15 or 6.2 kernel; the dev box runs 7.0 |
 | `doctor` reports T0 offline on a working RHEL 9 host | `c1e1192` | Needs a backported vendor kernel |
-| uretprobe SIGSYS kills seccomp-filtered targets on 6.11–6.13 | **open**, §5 | Needs that kernel range *and* a filtered target |
+| uretprobe kills seccomp-filtered targets on affected kernels | **open**, measured §5 | Needs an affected kernel *and* a filtered target |
 
 The shape is always the same: the workstation runs one kernel, CI runs one
 kernel, and the supported range is far wider than either. The first thing a
@@ -108,16 +108,18 @@ RHEL, SUSE, Amazon Linux and every other backporting vendor. Prefer probing.
 | Ubuntu 24.04, **6.8** | `p11scope-ws/vm-bases/noble` (held) | The mainstream LTS, and the host kernel of every container lane |
 | Ubuntu 24.04, **6.17-azure** | `apt install linux-image-6.17.0-1022-azure` into the noble guest | The exact CI runner: turns a hosted red into a 40-second local reproduction |
 | CentOS Stream 9, **5.14-el9** | `cloud.centos.org/centos/9-stream/.../GenericCloud-9-latest` | Backported vendor kernels, where version numbers lie. Caught `c1e1192`. |
+| Ubuntu 24.04, **6.11.0-17** + filtered target | `apt install linux-image-6.11.0-17-generic` into the noble guest — it is in `noble-updates`, no mainline `.deb` needed | The only defect that *harms the observed process*: §5. Also the only cell proving a `uname` gate cannot express the affected set. |
 
-Four cells, each able to block a release alone. The RHEL row earns MUST because
+Five cells, each able to block a release alone. The RHEL row earns MUST because
 enterprise HSM users are the target population and because it is the only cell
-that exercises "version says no, capability says yes".
+that exercises "version says no, capability says yes". The 6.11.0-17 row earns
+it because everything else in this document is p11scope failing; that row is
+p11scope *destroying someone else's process* and reporting nothing.
 
 ### SHOULD
 
 | Cell | Obtain | What it catches |
 | --- | --- | --- |
-| **6.11–6.13 + seccomp-filtered target** | mainline `.deb` into a noble guest; target under `systemd-run -p SystemCallFilter=@system-service` or the Docker default profile | §5 — the only known defect that *harms the observed process* |
 | Debian 12, 6.1 | Debian cloud image | The most-deployed 6.x LTS; second sample of the pre-6.6 `regs.rip` loader path |
 | Fedora current | `p11scope-ws/vm-bases/fedora44-base` (held) | Newest verifier (rejections are non-monotonic in both directions), SELinux enforcing, upstream `perf_event_paranoid=2` |
 | Lockdown `confidentiality` | `echo confidentiality > /sys/kernel/security/lockdown` on a throwaway overlay | `bpf_probe_read_kernel` becomes unavailable → `task_newtask` fails to load → the whole session fails, **including `--pid` scope where that program is never attached**. `doctor` reports lockdown as `Ok`. Misleading twice, never once induced. |
@@ -133,25 +135,79 @@ prove the documentation, Debian 11 (5.10) to see the genuine below-floor message
 and the ia32 axis that W7 adds — where the matrix gains a `-m32` harness
 parameter rather than new cells.
 
-## 5. Open: uretprobe SIGSYS can kill the observed process
+## 5. Measured: attaching a uretprobe kills a seccomp-hardened target
 
-Linux 6.11 moved uretprobes to a syscall-based trampoline. A target whose
-seccomp filter does not allow that syscall is killed with **SIGSYS** the first
-time one of p11scope's uretprobes fires, and the observer records it as an
-ordinary leader exit. Upstream fix `cf6cb56ef244` ("seccomp: passthrough
-uretprobe systemcall") landed in 6.14-rc2; the affected range is roughly
-6.11 through 6.13 plus any kernel without the stable backport.
+Measured 2026-09-05. Cell: `scripts/matrix/verify-uretprobe-seccomp.sh`, which
+builds `scripts/matrix/uretprobe-seccomp-harness.c` — a target that arms a
+seccomp allowlist deliberately omitting the uretprobe syscall, then calls a
+probed function in a loop.
 
-Every uretprobe p11scope attaches is on this path, and Docker's default seccomp
-profile and `systemd`'s `SystemCallFilter=` are exactly the environments where
-PKCS#11 providers run.
+Linux 6.11 moved uretprobes to a syscall trampoline: when a probed function
+returns, the kernel makes the **target** issue `__NR_uretprobe` (x86-64 nr 335)
+from a trampoline page. A seccomp filter that does not allow 335 therefore
+fires on a syscall the target never wrote. All five of p11scope's
+`#[uretprobe]` programs are on this path.
 
-This is the worst failure mode in this document: an observability tool that
-kills what it observes, and reports the kill as a normal exit. It is **not
-measured** — the range is inferred from commit dates — and it is the single
-highest-value cell to build. If confirmed, p11scope should refuse to attach
-uretprobes on an affected kernel to a seccomp-filtered target, rather than
-discover it the hard way.
+| Kernel | uretprobe syscalls seen | Filtered target | Events delivered |
+| --- | --- | --- | --- |
+| `6.8.0-137-generic` | 0 — breakpoint trampoline, no syscall | survives | 40 |
+| **`6.11.0-17-generic`** (noble HWE, 24.04.2) | 0 — killed before the tracepoint | **SIGSYS, dead** | **0** |
+| `6.11.0-29-generic` (noble HWE, later SRU) | 40 | survives | 40 |
+| `6.17.0-1022-azure` | 39 | survives | 39 |
+| `7.0.0-30-generic` (workstation) | 40 | survives | 40 |
+
+On the affected kernel, by the target's seccomp default action:
+
+| Action | Outcome | Events |
+| --- | --- | --- |
+| `SECCOMP_RET_KILL_PROCESS` | **SIGSYS**, dead on the first return | 0 |
+| `SECCOMP_RET_KILL_THREAD` | **SIGSYS**, dead on the first return | 0 |
+| `SECCOMP_RET_ERRNO(EPERM)` | **SIGSEGV** — the trampoline never restores the return address | 0 |
+| `SECCOMP_RET_LOG` | survives | 40 |
+| entry-only `uprobe`, same filter | survives | 39 |
+
+### What this settles
+
+**The affected set is not a version range.** `6.11.0-17` is affected and
+`6.11.0-29` is clean: same upstream minor, same distro, same series, one SRU
+apart. The upstream fix (`cf6cb56ef244`, "seccomp: passthrough uretprobe
+systemcall", 6.14-rc2) is backported at a cadence no version comparison can
+model. A `uname` gate would be wrong in both directions — exactly the defect
+`c1e1192` fixed in `doctor` (§3). **Only probing answers this.**
+
+**"Warn in the docs" is not sufficient.** The tool kills the process it is
+observing, on the first return, and collects **zero events** in exchange. The
+`errno` row is worse than the kill rows: an operator who sets
+`SystemCallErrorNumber=EPERM` precisely to avoid being killed gets a
+**segfault** that looks like a crash in their own application.
+
+**Entry-only probing is a working fallback**, measured: the same filter, the
+same kernel, 39 hits delivered, target alive. Degrading to entry probes costs
+return values and latency and keeps call counts — strictly better than either
+killing the target or refusing to run.
+
+**The cheap pre-check is `/proc/<pid>/status`.** `Seccomp: 2` means a filter is
+installed. It does not say whether that filter allows 335 (reading the target's
+filter needs `PTRACE_SECCOMP_GET_FILTER`, too invasive), so the honest rule is:
+affected kernel **and** filtered target → degrade, do not attach uretprobes.
+Unfiltered targets — the common case — pay nothing.
+
+### Not yet done
+
+The fix itself. Three layers, cheapest first, in this order:
+
+1. **Never misreport the death.** `src/run.rs:916` already decodes
+   `WIFSIGNALED`/`WTERMSIG`, so `run` mode can name a SIGSYS or SIGSEGV during
+   capture instead of folding it into an exit code. In `--pid` mode the target
+   is not our child and the status is genuinely unavailable — that asymmetry
+   should be stated, not papered over.
+2. **Degrade to entry-only probes** when the target is filtered and the kernel
+   is affected.
+3. **Detect by self-probe, never by `uname`** — fork a child, arm a filter,
+   attach a uretprobe to it, see whether it dies. The victim is our own child,
+   so no user process is at risk. `verify-uretprobe-seccomp.sh` is that probe
+   already, in shell; it dies on the first return, so the check costs ~100 ms
+   and only runs when a filtered target is actually in scope.
 
 ## 6. What a cell runs, and where CI fits
 
@@ -162,6 +218,7 @@ discover it the hard way.
 | `sudo p11scope doctor` and assert the tier line | Loads all 13 programs, attaches a real uprobe. **Would have caught `56101fa` and `c1e1192`** in seconds, without a PKCS#11 target. | exists |
 | `scripts/verify-attach-e2e.sh` | Caught `b74a65d` and `24f82d0`. The only lane that loads *and* attaches *and* watches a target exit. | exists; needs a `P11SCOPE_BIN` override so a prebuilt binary can be used instead of an in-guest `cargo build` |
 | `scripts/verify-inspect-doctor.sh` | Unprivileged, seconds, scope-agnostic | exists |
+| `scripts/matrix/verify-uretprobe-seccomp.sh` | Classifies the kernel AFFECTED/CLEAN for §5. Needs no PKCS#11 target and no p11scope build — `cc` plus `bpftrace`. Its `--self-test` needs only `cc`, runs in hosted CI, and fails if the harness stops being able to detect a kill. | exists, §5 |
 | environment fingerprint | Records `uname`, lockdown, `bpf_jit_*`, relevant `CONFIG_*`, cgroup and tracefs mounts, glibc, binary hash. Records, never asserts — it is what makes a pass or fail interpretable a month later. | to write, ~20 lines |
 
 The ~20 `--self-test` oracles are deliberately **excluded** from a cell: they

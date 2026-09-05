@@ -4660,9 +4660,12 @@ fn frozen_policy_inventory_matches_embedded_object() {
         ])
         .output()
         .expect("run the inventory negative control");
+    let reason = String::from_utf8_lossy(&control.stderr);
     assert!(
-        !control.status.success(),
-        "the {other} freeze must reject the {variant} object, or --inventory is not comparing"
+        !control.status.success() && reason.contains(&format!("{other} map inventory differs")),
+        "the {other} freeze must reject the {variant} object BY COMPARING IT: any other \
+         non-zero exit (an unknown variant, a missing file) would satisfy a bare status \
+         check while nothing was compared. stderr was: {reason}"
     );
 }
 
@@ -5781,6 +5784,40 @@ fn production_bpf_toolchain_is_frozen() {
     assert!(!ci.contains("toolchain install nightly "));
 }
 
+/// The lines of the YAML block introduced by `header`, up to the next line at the
+/// same or shallower indent. Blank lines and comments belong to the block.
+///
+/// Three guards used to bound the checks job as "everything before
+/// `\n  archive-log:\n`", which is not the same thing: inserting a job between the
+/// two put it inside, and renaming `archive-log` fell back to the whole file, in
+/// both cases silently widening a claim that is about one job. Panicking on a
+/// missing header is the point — a silent fallback is what made that invisible.
+fn block_under<'a>(source: &'a str, header: &str) -> &'a str {
+    let indent = header.len() - header.trim_start().len();
+    let opened = format!("\n{header}\n");
+    let start = source
+        .find(&opened)
+        .unwrap_or_else(|| panic!("ci.yml has no {:?} block", header.trim()))
+        + opened.len();
+    let body = &source[start..];
+    let end = body
+        .match_indices('\n')
+        .map(|(at, _)| at + 1)
+        .find(|at| {
+            let line = body[*at..].split('\n').next().unwrap_or_default();
+            let trimmed = line.trim_start();
+            !trimmed.is_empty() && !trimmed.starts_with('#') && line.len() - trimmed.len() <= indent
+        })
+        .unwrap_or(body.len());
+    &body[..end]
+}
+
+/// The `checks-and-e2e` job, bounded by its own header rather than by whatever
+/// happens to follow it.
+fn checks_job(ci: &str) -> &str {
+    block_under(ci, "  checks-and-e2e:")
+}
+
 /// The default embedded object is covered by the ordinary `cargo test` gate;
 /// the diagnostic object exists only under `unsafe-unvalidated-metadata`, so it
 /// needs its own hosted step — one test, not the whole target
@@ -5791,7 +5828,7 @@ fn hosted_pipeline_checks_the_diagnostic_inventory() {
     // Position is not load-bearing and pinning it made an innocent edit to a
     // neighbouring step panic inside `between()`; the step only has to be in the
     // checks job, after the clippy gate it complements.
-    let checks = ci.split("\n  archive-log:\n").next().unwrap_or(&ci);
+    let checks = checks_job(&ci);
     let lines: Vec<&str> = checks.lines().map(str::trim).collect();
     let clippy_at = lines
         .iter()
@@ -5825,9 +5862,13 @@ fn hosted_pipeline_checks_the_diagnostic_inventory() {
     // while leaving every pin above satisfied.
     assert!(
         !ci.lines().map(str::trim).any(|line| {
-            // As a step's first key it renders `- continue-on-error:`.
+            // As a step's first key it renders `- continue-on-error:`, and YAML
+            // allows whitespace before the colon.
             let key = line.strip_prefix("- ").unwrap_or(line);
-            !key.starts_with('#') && key.starts_with("continue-on-error:")
+            !key.starts_with('#')
+                && key
+                    .split_once(':')
+                    .is_some_and(|(name, _)| name.trim() == "continue-on-error")
         }),
         "no step in this workflow may set continue-on-error: it would turn a failed \
          proof into a green job"
@@ -5895,8 +5936,7 @@ fn hosted_pipeline_checks_the_diagnostic_inventory() {
 fn hosted_pipeline_runs_every_unprivileged_self_test() {
     let ci = read(".github/workflows/ci.yml");
     // The claim is about this job, so only its steps count.
-    let checks = ci.split("\n  archive-log:\n").next().unwrap_or(&ci);
-    let ci_lines: Vec<&str> = checks.lines().map(str::trim).collect();
+    let ci_lines: Vec<&str> = checks_job(&ci).lines().map(str::trim).collect();
     let mut expected: BTreeSet<String> = BTreeSet::new();
     for dir in ["scripts", "scripts/matrix"] {
         for entry in fs::read_dir(dir).expect("walk scripts") {
@@ -6022,11 +6062,17 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
     // block, an extra argument) is refused rather than quietly treated as "did
     // not run in full", which would leave this job printing `UNRUN:` for a lane
     // that had just run. Comments and the block's own lines are not invocations.
-    // The whole file, not just the checks job: a lane run from any job has run.
     // Both extensions, because the derivation below covers `.py` too — a `.py`
-    // lane run in full would otherwise stay on the UNRUN list.
+    // lane run in full would otherwise stay on the UNRUN list. The split is the
+    // inverse of a path character rather than a list of separators: enumerating
+    // separators is what let `scripts/x.sh;` through, and the list was still
+    // missing backtick, brackets and comma one round later.
     let is_lane = |token: &str| {
         token.contains("scripts/") && (token.ends_with(".sh") || token.ends_with(".py"))
+    };
+    let names_lane = |line: &str| {
+        line.split(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, '.' | '/' | '_' | '-'))
+            .any(is_lane)
     };
     let mut hosted_full: BTreeSet<&str> = BTreeSet::new();
     // Every step's command with `- run:` / `run:` (after a `- name:` label) and any
@@ -6042,13 +6088,27 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
     // Scoped to the checks job: the label says "runs in this job", so a step that
     // exists only in another job must not satisfy it. The full-run sweep below
     // stays on the whole file — a lane run from any job has run.
-    let checks = ci.split("\n  archive-log:\n").next().unwrap_or(&ci);
+    let checks = checks_job(&ci);
     let run_calls: BTreeSet<&str> = checks
         .lines()
         .map(str::trim)
         .filter_map(command_of)
         .collect();
-    for line in ci.lines().map(str::trim) {
+    // A lane named anywhere but the checks job is refused rather than credited as
+    // a full run: `hosted_full` feeds the `scope:` line, whose text is a claim
+    // about THIS job, so the two must be scoped alike.
+    for line in ci.replacen(checks, "", 1).lines().map(str::trim) {
+        let line = line
+            .split_once(" #")
+            .map_or(line, |(code, _)| code.trim_end());
+        assert!(
+            line.starts_with('#') || !names_lane(line),
+            "a lane is named outside the checks job: {line:?}. The UNRUN and scope \
+             claims are about that job alone; running a lane elsewhere needs the \
+             derivation taught about it first"
+        );
+    }
+    for line in checks.lines().map(str::trim) {
         // Trailing YAML comments are not invocations.
         let line = line
             .split_once(" #")
@@ -6056,13 +6116,7 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
         if line.starts_with('#') || line.starts_with("UNRUN: ") || line.starts_with("scope: ") {
             continue;
         }
-        if !line
-            .split(|c: char| {
-                c.is_ascii_whitespace()
-                    || matches!(c, '"' | '\'' | ';' | '&' | '|' | '<' | '>' | '(' | ')')
-            })
-            .any(is_lane)
-        {
+        if !names_lane(line) {
             continue;
         }
         // `- name:` above a step is an ordinary edit, so accept the bare `run:` form.
@@ -6235,11 +6289,9 @@ fn hosted_pipeline_retains_the_job_log() {
     let (checks, archive) = ci
         .split_once("\n  archive-log:\n")
         .expect("ci.yml has no archive-log job");
-    let default_permissions: Vec<&str> = ci
+    let default_permissions: Vec<&str> = block_under(&ci, "permissions:")
         .lines()
-        .skip_while(|line| *line != "permissions:")
-        .skip(1)
-        .take_while(|line| line.starts_with("  "))
+        .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
         .collect();
     assert_eq!(
         default_permissions,

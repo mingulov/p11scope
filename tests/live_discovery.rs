@@ -57,6 +57,7 @@ fn engine_initial_discovery_preserves_plan() {
         out: None,
         max_events: None,
         unsafe_requested: false,
+        allow_confined_uretprobe: false,
     };
     let scope = Scope::Pid(pid);
     let view = ProcessView::open(ProcessViewId(0), pid).unwrap();

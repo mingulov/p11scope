@@ -34,6 +34,7 @@ fn run_args(command: &[&str]) -> RunArgs {
         out: None,
         max_events: None,
         unsafe_requested: false,
+        allow_confined_uretprobe: false,
         pause: PausePolicy::Never,
         kill_on_timeout: false,
         command: command.iter().map(|a| a.to_string()).collect(),

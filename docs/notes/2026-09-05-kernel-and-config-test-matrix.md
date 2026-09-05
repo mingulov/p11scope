@@ -192,22 +192,46 @@ filter needs `PTRACE_SECCOMP_GET_FILTER`, too invasive), so the honest rule is:
 affected kernel **and** filtered target → degrade, do not attach uretprobes.
 Unfiltered targets — the common case — pay nothing.
 
-### Not yet done
+### The fix, implemented 2026-09-06
 
-The fix itself. Three layers, cheapest first, in this order:
+`src/uretprobe_hazard.rs`, verified on `6.11.0-17` (affected) and `7.0.0-30`
+(clean), all three layers end to end:
 
-1. **Never misreport the death.** `src/run.rs:916` already decodes
-   `WIFSIGNALED`/`WTERMSIG`, so `run` mode can name a SIGSYS or SIGSEGV during
-   capture instead of folding it into an exit code. In `--pid` mode the target
-   is not our child and the status is genuinely unavailable — that asymmetry
-   should be stated, not papered over.
-2. **Degrade to entry-only probes** when the target is filtered and the kernel
-   is affected.
-3. **Detect by self-probe, never by `uname`** — fork a child, arm a filter,
-   attach a uretprobe to it, see whether it dies. The victim is our own child,
-   so no user process is at risk. `verify-uretprobe-seccomp.sh` is that probe
-   already, in shell; it dies on the first return, so the check costs ~100 ms
-   and only runs when a filtered target is actually in scope.
+1. **A signalled death is never reported as an exit.** `run` owns its child, so
+   a SIGSYS or SIGSEGV during capture is named, and the kernel is only consulted
+   for those two shapes. With no probe attached it says so instead of taking
+   blame it has not earned. `--pid` cannot read a non-child's status, so the
+   asymmetry is stated rather than papered over: it reports that the target went
+   away and that the capture knowingly carried the risk.
+2. **A confined target is refused before a probe is installed.** The cheap check
+   comes first — `/proc/<pid>/status` `Seccomp:` — so an unconfined target, the
+   common case, never pays for the self-probe.
+   `--allow-uretprobe-on-confined-target` is the operator's override, and it
+   warns with exactly the reason it would have refused with. `--cgroup` attaches
+   process-wide, so its targets cannot be enumerated and it is treated as
+   possibly confined.
+3. **The verdict comes from the mechanism, never from `uname`.** The self-probe
+   forks a child, gives it a one-syscall denylist, attaches a real `p11_return`
+   uretprobe to it, and reads how it died. The victim is always our own child.
+   `doctor` reports it as `uretprobe vs seccomp` — informational, and
+   deliberately not a `capability_tier` input, since an affected kernel captures
+   perfectly from any unconfined target.
+
+Guarded by `the_uretprobe_hazard_is_never_decided_by_a_kernel_version` and
+`the_uretprobe_hazard_row_is_not_a_capability_tier_input`, both
+mutation-verified.
+
+Measured end to end on `6.11.0-17` with a seccomp-confined process that maps
+`libsofthsm2.so`: refused by default and the target lives; under the override
+p11scope attaches 136/136 probes and kills it, leaving the call in flight — the
+defect reproduced through the real tool, and the reason the default is refusal.
+
+**Still open:** entry-only degradation. `attach_targets_with` requires a slot's
+return link before its entry link, and `in_flight = entered - returned` feeds
+the completeness lattice, so attaching entry-only would report every call as
+permanently in flight — "the call never returned" rather than "returns were not
+observed". That needs a distinct capture state, which is a schema question, not
+a patch.
 
 ## 6. What a cell runs, and where CI fits
 

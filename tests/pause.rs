@@ -28,6 +28,7 @@ fn paused_run(pause: PausePolicy, marker: &Path) -> RunArgs {
         out: None,
         max_events: None,
         unsafe_requested: false,
+        allow_confined_uretprobe: false,
         pause,
         kill_on_timeout: false,
         command: vec![

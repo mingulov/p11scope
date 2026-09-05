@@ -18,6 +18,7 @@ pub mod scope;
 pub mod semantics;
 pub mod shapes;
 pub mod trace;
+pub(crate) mod uretprobe_hazard;
 
 /// The whole public production surface of the capture loops. `run` stays a
 /// crate-private module: the owned child, the pause coordinator, its clocks,

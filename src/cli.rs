@@ -32,6 +32,9 @@ pub struct CaptureArgs {
     pub out: Option<PathBuf>,
     pub max_events: Option<u64>,
     pub unsafe_requested: bool,
+    /// `--allow-uretprobe-on-confined-target`: attach uretprobes even when this
+    /// kernel is measured to kill a seccomp-confined target for doing so.
+    pub allow_confined_uretprobe: bool,
 }
 
 /// What `run` is allowed to do to its own child to keep loader discovery from
@@ -60,6 +63,9 @@ pub struct RunArgs {
     pub out: Option<PathBuf>,
     pub max_events: Option<u64>,
     pub unsafe_requested: bool,
+    /// `--allow-uretprobe-on-confined-target`: attach uretprobes even when this
+    /// kernel is measured to kill a seccomp-confined target for doing so.
+    pub allow_confined_uretprobe: bool,
     pub pause: PausePolicy,
     /// `--kill-on-timeout`: `--duration` expiry ends the child too, instead of
     /// handing it back still running.
@@ -102,6 +108,7 @@ pub const USAGE: &str = "usage:
                    [--mode profile|metrics] [--duration <30|30s|5m|1h>] [-o <out.json>]
                    [--hook-symbol <NAME[:functionlist|interfacelist|interface]>]...
                    [--unsafe-unvalidated-metadata]
+                   [--allow-uretprobe-on-confined-target]
   p11scope trace   [same scope and discovery options] [--duration <…>] [--max-events <n>] [-o <out.file>]
   p11scope run     [same discovery options] [--mode profile|metrics | --trace] [--duration <…>]
                    [-o <out>] [--pause never|auto|always] [--kill-on-timeout] -- CMD [ARGS...]
@@ -182,6 +189,7 @@ struct Common {
     out: Option<PathBuf>,
     max_events: Option<u64>,
     unsafe_requested: bool,
+    allow_confined_uretprobe: bool,
 }
 
 impl Common {
@@ -243,6 +251,7 @@ fn capture_option(
         }
         "-o" => common.out = Some(require_value(args, "-o")?.into()),
         "--unsafe-unvalidated-metadata" => common.unsafe_requested = true,
+        "--allow-uretprobe-on-confined-target" => common.allow_confined_uretprobe = true,
         _ => return Ok(false),
     }
     Ok(true)
@@ -364,6 +373,7 @@ pub fn parse_capture(
         out: common.out,
         max_events: common.max_events,
         unsafe_requested: common.unsafe_requested,
+        allow_confined_uretprobe: common.allow_confined_uretprobe,
     })
 }
 
@@ -435,6 +445,7 @@ fn parse_run(mut args: impl Iterator<Item = String>) -> Result<RunArgs, CliError
         out: common.out,
         max_events: common.max_events,
         unsafe_requested: common.unsafe_requested,
+        allow_confined_uretprobe: common.allow_confined_uretprobe,
         pause,
         kill_on_timeout,
         command,

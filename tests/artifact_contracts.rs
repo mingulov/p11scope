@@ -9505,3 +9505,61 @@ fn every_view_retirement_settles_its_leader_exit_assessment_first() {
         );
     }
 }
+
+/// The uretprobe hazard must never be decided by a version comparison.
+///
+/// Measured 2026-09-05: Ubuntu `6.11.0-17` is affected and `6.11.0-29` is not
+/// — same upstream minor, one SRU apart — so any `uname` range is wrong in both
+/// directions. That is the same defect `c1e1192` removed from `capability_tier`,
+/// and the reason this module forks a child and runs the real mechanism instead.
+/// Guarding the source keeps a later "quick fix" from reintroducing it.
+#[test]
+fn the_uretprobe_hazard_is_never_decided_by_a_kernel_version() {
+    let source = read("src/uretprobe_hazard.rs");
+    let production = source
+        .split_once("#[cfg(test)]\nmod tests {")
+        .expect("uretprobe_hazard.rs must have a test module")
+        .0;
+    // Code only. The module's own prose says it must not consult `uname`, and a
+    // guard that cannot tell an explanation from an implementation would fire on
+    // the sentence forbidding the thing it is forbidding.
+    let code: String = production
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for banned in ["uname", "KERNEL_FLOOR", "kernel_release", "utsname"] {
+        assert!(
+            !code.contains(banned),
+            "src/uretprobe_hazard.rs must not consult {banned}: the affected set is not a \
+             version range (6.11.0-17 affected, 6.11.0-29 clean)"
+        );
+    }
+    // The positive half: it must actually run the mechanism.
+    assert!(
+        code.contains("libc::fork()") && code.contains("SECCOMP_SET_MODE_FILTER"),
+        "the verdict must come from forking a child and arming a real seccomp filter"
+    );
+}
+
+/// An affected kernel captures perfectly from every unconfined target, so the
+/// hazard is a property of the kernel/target pairing, not a capability this
+/// host lacks. Folding it into the tier would repeat `c1e1192` exactly.
+#[test]
+fn the_uretprobe_hazard_row_is_not_a_capability_tier_input() {
+    let source = read("src/doctor.rs");
+    let tier = source
+        .split_once("fn capability_tier(")
+        .expect("doctor.rs must define capability_tier")
+        .1;
+    let tier = tier.split_once("\nfn ").map_or(tier, |(body, _)| body);
+    assert!(
+        !tier.contains("uretprobe"),
+        "capability_tier must not read the uretprobe row: an affected kernel is fully capable \
+         against an unconfined target"
+    );
+    assert!(
+        source.contains("\"uretprobe vs seccomp\""),
+        "doctor must still report the row"
+    );
+}

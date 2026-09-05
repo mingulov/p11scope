@@ -15806,6 +15806,7 @@ pub(crate) mod tests {
             out: None,
             max_events: None,
             unsafe_requested: false,
+            allow_confined_uretprobe: false,
         };
         let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
 

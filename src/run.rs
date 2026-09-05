@@ -17,7 +17,7 @@ use crate::discovery::pause::{
 };
 use crate::output::AtomicFile;
 use crate::process::{PidPin, ProcessView, ProcessViewId};
-use crate::{metrics, process, render, scope, semantics, trace};
+use crate::{metrics, process, render, scope, semantics, trace, uretprobe_hazard};
 use anyhow::{Context as _, Result, anyhow};
 use p11scope_manifest::elf::ElfSnapshot;
 use std::ffi::{CString, OsStr, OsString};
@@ -1044,6 +1044,14 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
         );
     }
     warn_unsafe_policy(policy);
+    let accepted = preflight_uretprobe_hazard(
+        match &a.scope {
+            ScopeArg::Pid(pid) => Some(*pid),
+            ScopeArg::Cgroup(_) => None,
+        },
+        a.allow_confined_uretprobe,
+    )?;
+    let accepted_uretprobe_risk = accepted;
     let mut engine = Engine::discover(a, &scope, named_view)?;
     // Zero modules is not an error (spec §4.10): the capture still runs, still
     // writes its report, and says here how to find out why it found nothing.
@@ -1068,6 +1076,19 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
         &stop,
         None,
     )?;
+    // `--pid` cannot read a non-child's exit status, so the honest report is
+    // the pairing of two facts we do have: the target went away, and this
+    // capture knowingly attached uretprobes a measured-affected kernel kills
+    // confined targets for. Saying nothing here would leave the operator with
+    // a capture whose calls are all in flight and no reason given.
+    if accepted_uretprobe_risk && engine.expected_target_exit() {
+        eprintln!(
+            "p11scope: WARNING: the target exited during this capture, which attached uretprobes \
+             to a syscall-confined target on a kernel measured to kill one for exactly that. \
+             p11scope cannot read a non-child's exit status, so this is not proof — but calls \
+             left in flight with no returns are that death's fingerprint"
+        );
+    }
     Ok(())
 }
 
@@ -1526,6 +1547,7 @@ fn run_owned_inner(args: &RunArgs) -> Result<OwnedRunOutcome> {
         out: args.out.clone(),
         max_events: args.max_events,
         unsafe_requested: args.unsafe_requested,
+        allow_confined_uretprobe: args.allow_confined_uretprobe,
     };
     // Initial capture still uses the one `discover_plan` pass and keeps its
     // accepted state inside `Engine`; nothing below rescans or reopens.
@@ -1621,12 +1643,49 @@ fn run_owned_inner(args: &RunArgs) -> Result<OwnedRunOutcome> {
             abort_pending_handoff(&mut owned.pending_handoff),
         ));
     }
+    // A signalled death is reported as one. `run` owns this child, so its
+    // status is available and folding a SIGSYS into a bare exit code would be
+    // the tool hiding a kill it may itself have caused (uretprobe_hazard §1).
+    if let Some(code) = owned.exit_code
+        && let Some(explanation) =
+            uretprobe_hazard::describe_owned_child_death(code, evidence.attached_probes)
+    {
+        eprintln!("p11scope: {explanation}");
+    }
     Ok(OwnedRunOutcome {
         child_exit_code: owned.exit_code,
         child_still_running: owned.still_running,
         child_pid: owned.pid,
         evidence,
     })
+}
+
+/// Refuses before a single probe is installed when this kernel would kill the
+/// target for carrying a uretprobe, and warns instead when the operator has
+/// accepted that.
+///
+/// `target` is the one pid a `--pid` capture probes; `None` means the scope
+/// attaches process-wide, so the processes that would run the trampoline
+/// cannot be enumerated. `run` deliberately does not call this: its child arms
+/// any filter after exec, which is after attach, so there is nothing to read
+/// yet — that path reports the death instead.
+fn preflight_uretprobe_hazard(target: Option<u32>, overridden: bool) -> Result<bool> {
+    match uretprobe_hazard::evaluate(target, overridden) {
+        uretprobe_hazard::Action::Proceed => Ok(false),
+        uretprobe_hazard::Action::ProceedUnderOverride(reason) => {
+            eprintln!(
+                "p11scope: WARNING: {reason}. Continuing because \
+                 --allow-uretprobe-on-confined-target was given"
+            );
+            Ok(true)
+        }
+        uretprobe_hazard::Action::Refuse(reason) => Err(anyhow!(
+            "refusing to attach: {reason}. Re-run with \
+             --allow-uretprobe-on-confined-target to accept that risk, or capture on a kernel \
+             that exempts the trampoline — scripts/matrix/verify-uretprobe-seccomp.sh \
+             classifies the one you are on"
+        )),
+    }
 }
 
 /// Zero modules is not an error; point the operator at the discovery diagnostics.
@@ -3633,6 +3692,7 @@ mod tests {
             out: None,
             max_events: None,
             unsafe_requested: false,
+            allow_confined_uretprobe: false,
             pause,
             kill_on_timeout: false,
             command: command.iter().map(|a| a.to_string()).collect(),

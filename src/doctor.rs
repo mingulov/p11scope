@@ -457,7 +457,7 @@ fn bpf_checks() -> Vec<Check> {
                 status: Status::Ok(String::new()),
             };
             let uprobe = uprobe_attach_check(&mut ebpf);
-            vec![map_create, uprobe]
+            vec![map_create, uprobe, uretprobe_seccomp_check()]
         }
         Err(e) => vec![
             Check {
@@ -473,6 +473,37 @@ fn bpf_checks() -> Vec<Check> {
                 status: Status::Fail("skipped: BPF map create failed".to_string()),
             },
         ],
+    }
+}
+
+/// Whether a uretprobe on this kernel would kill a seccomp-confined target.
+///
+/// Informational, and deliberately absent from `capability_tier`: an affected
+/// kernel captures perfectly well from every unconfined target, so this is a
+/// property of the *pairing* of kernel and target, not a capability this host
+/// lacks. Folding an environmental fact into the tier is exactly the mistake
+/// `c1e1192` removed when it dropped the `uname` row from it.
+///
+/// `Warn`, not `Fail`, for the same reason: nothing here is broken, but an
+/// operator pointing this host at a hardened process needs to know first.
+fn uretprobe_seccomp_check() -> Check {
+    let status = match crate::uretprobe_hazard::probe_kernel() {
+        crate::uretprobe_hazard::KernelVerdict::Clean => Status::Ok(
+            "the trampoline's syscall is exempt from seccomp; confined targets are safe"
+                .to_string(),
+        ),
+        crate::uretprobe_hazard::KernelVerdict::Affected(how) => Status::Warn(format!(
+            "attaching a uretprobe kills a seccomp-confined target on this kernel ({how}); \
+             captures against confined targets are refused unless \
+             --allow-uretprobe-on-confined-target is given"
+        )),
+        crate::uretprobe_hazard::KernelVerdict::Unknown(why) => {
+            Status::Warn(format!("could not be determined: {why}"))
+        }
+    };
+    Check {
+        name: "uretprobe vs seccomp".to_string(),
+        status,
     }
 }
 

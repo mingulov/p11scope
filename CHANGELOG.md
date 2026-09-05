@@ -10,6 +10,16 @@ kernel 6.8, and the combined `main` tree passes all four locked workspace
 gates. Exact-tip CI, packaging, final security review, and release remain
 pending.
 
+- **Uretprobe/seccomp safety**: attaching a uretprobe makes the *target* issue
+  `__NR_uretprobe` on Linux 6.11+, so a seccomp-confined target could be killed
+  by being observed. Measured: Ubuntu `6.11.0-17` is affected and `6.11.0-29` is
+  not, so the affected set is not a version range and nothing consults `uname`.
+  p11scope now probes the kernel with a forked child of its own, refuses to
+  attach to a confined target on an affected kernel (override:
+  `--allow-uretprobe-on-confined-target`), reports a signalled death as one
+  instead of as an exit code, and adds a `uretprobe vs seccomp` row to `doctor`.
+  Unconfined targets are unaffected and pay nothing.
+
 - **Discovery**: `profile` and `trace` scan the target's mapped memory once at
   attach, so neither a manifest nor the offline helper is required. Repeatable
   `--module` hints and `--manifest` inputs are optional; manifests are

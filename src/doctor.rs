@@ -882,8 +882,16 @@ fn capability_tier(checks: &[Check]) -> CapabilityTierResult {
             Status::NotApplicable(_) => None,
         });
     classify_capability_tier(CapabilityTierInput {
-        host_attach: row_ok("kernel release")
-            && row_ok("BPF map create")
+        // Deliberately not `row_ok("kernel release")`. That row compares
+        // `uname` against a floor, and a version number is a proxy for the
+        // capability, while the three rows below are the capability itself:
+        // they create a map, load every program, and attach a real uprobe.
+        // RHEL 9 reports 5.14 with the cookie and perf-link support
+        // backported, and was measured attaching 136/136 probes while this
+        // function called it T0 offline on the strength of the version string
+        // alone. A kernel that genuinely lacks the support fails these three
+        // rows, so nothing is lost by trusting them instead.
+        host_attach: row_ok("BPF map create")
             && row_ok("uprobe attach (own libc)")
             && row_ok("host program preflight"),
         target_readable,
@@ -1051,6 +1059,44 @@ mod tests {
             verdict_line(&target),
             "verdict: capture available; target unavailable (provider identity unavailable)"
         );
+    }
+
+    #[test]
+    fn a_backported_kernel_below_the_floor_is_not_forced_offline() {
+        // RHEL 9 and its rebuilds report 5.14 with cookies and the perf link
+        // backported. Measured on CentOS Stream 9 (5.14.0-741.el9): every
+        // capability probe passes and a real capture attaches 136/136 probes,
+        // while the "kernel release" row warns about the 5.15 floor. Letting
+        // that row veto the tier reported T0 offline for a host that works.
+        let row = |name: &str, status: Status| Check {
+            name: name.to_string(),
+            status,
+        };
+        let checks = vec![
+            row(
+                "kernel release",
+                Status::Warn("5.14.0-741.el9.x86_64 is below the documented floor 5.15".into()),
+            ),
+            row("BPF map create", Status::Ok("created".into())),
+            row(
+                "uprobe attach (own libc)",
+                Status::Ok("attached and detached".into()),
+            ),
+            row("host program preflight", Status::Ok("available".into())),
+            row("lifecycle preflight", Status::Ok("available".into())),
+            row("scope preflight", Status::NotApplicable("no scope".into())),
+        ];
+        assert_ne!(
+            capability_tier(&checks).tier,
+            CapabilityTier::T0,
+            "a warning about the version string must not override three probes that succeeded"
+        );
+
+        // The other direction: a kernel that actually cannot attach is still
+        // T0, so this is not "stop checking".
+        let mut broken = checks;
+        broken[2].status = Status::Fail("unknown func bpf_get_attach_cookie#174".into());
+        assert_eq!(capability_tier(&broken).tier, CapabilityTier::T0);
     }
 
     #[test]

@@ -14,13 +14,20 @@ jobs:
       # Honest scope, printed first so it reaches the log even when a later step
       # fails. A passing --self-test exercises a lane's oracle model, never the
       # lane; a green job never implies these lanes ran. The list is derived
-      # (privileged verify scripts minus the ones this job runs in full) and
+      # (every privileged script minus the ones this job runs in full) and
       # pinned by hosted_pipeline_names_every_unrun_privileged_lane.
       - shell: bash
         run: |
+          # Standalone assignment, not a substitution inside the heredoc: only
+          # this form aborts under `set -e`. The tree hash is the wave's exit
+          # anchor, so it must never silently render blank.
+          TREE=$(git rev-parse 'HEAD^{tree}')
           cat >"$RUNNER_TEMP/lanes.txt" <<EOF
-          commit $GITHUB_SHA tree $(git rev-parse 'HEAD^{tree}')
-          hosted: cargo fmt/check/test/clippy gates, every --self-test, scripts/verify-inspect-doctor.sh, scripts/verify-attach-e2e.sh
+          commit $GITHUB_SHA tree $TREE
+          hosted: cargo fmt/check/test/clippy gates, the diagnostic-object inventory test, every --self-test, scripts/verify-inspect-doctor.sh, scripts/verify-attach-e2e.sh
+          UNRUN: scripts/attach-pod.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/bench-overhead.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
+          UNRUN: scripts/build-release.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/verify-canaries.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/verify-capability-tier.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/verify-discover-containers.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
@@ -49,7 +56,7 @@ jobs:
       - run: cargo +1.88 check --locked --workspace --all-targets
       - run: cargo +1.88 test --locked --workspace --all-targets
       - run: cargo +1.88 clippy --locked --workspace --all-targets -- -D warnings
-      - run: cargo +1.88 test --locked --features unsafe-unvalidated-metadata --test artifact_contracts -- frozen_policy_inventory_matches_embedded_object
+      - run: cargo +1.88 test --locked --features unsafe-unvalidated-metadata --test artifact_contracts -- --nocapture frozen_policy_inventory_matches_embedded_object
       - run: uname -r; cat /proc/sys/kernel/perf_event_paranoid; cat /proc/sys/kernel/yama/ptrace_scope
       # Unprivileged validator self-tests: every gate oracle, plus the frozen
       # evidence/object/receipt validators and the matrix oracles: every
@@ -87,7 +94,9 @@ jobs:
   # token, not GITHUB_TOKEN. No cache anywhere.
   archive-log:
     needs: checks-and-e2e
-    if: always()
+    # Not always(): with cancel-in-progress a superseded run would publish a
+    # truncated log under the same artifact name. Failures still archive.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     permissions:
       actions: read
@@ -100,13 +109,17 @@ jobs:
           # .../jobs/<id>/logs answers 302 to blob storage and gh api follows it: a 302 in a
           # verbose trace is the success path, not a failure. It can also 404 for a short
           # window right after the job completes, while the log is finalized, hence the
-          # bounded retry: 3 attempts, 5s apart, fail after the third.
+          # bounded retry: 3 attempts, 5s apart, fail after the third. That window
+          # also answers 200 with an empty body, so an attempt counts as success
+          # only when it produced a non-empty log; otherwise a green archive job
+          # would upload a 0-byte artifact and claim the log was retained.
           for attempt in 1 2 3; do
-            if gh api "repos/$GITHUB_REPOSITORY/actions/jobs/$JOB_ID/logs" > "$RUNNER_TEMP/checks-and-e2e.log"; then
+            if gh api "repos/$GITHUB_REPOSITORY/actions/jobs/$JOB_ID/logs" > "$RUNNER_TEMP/checks-and-e2e.log" \
+              && [ -s "$RUNNER_TEMP/checks-and-e2e.log" ]; then
               break
             fi
             if [ "$attempt" = 3 ]; then
-              echo "job $JOB_ID log fetch failed after 3 attempts" >&2
+              echo "job $JOB_ID log fetch produced no content after 3 attempts" >&2
               exit 1
             fi
             sleep 5

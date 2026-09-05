@@ -1066,9 +1066,27 @@ fn publish_attribute_catalog(ebpf: &mut Ebpf, enabled: bool) -> Result<()> {
     Ok(())
 }
 
+/// Whether freezing this map must wait until the programs are loaded.
+///
+/// The verifier constant-folds a constant-offset read from a map that is both
+/// `BPF_F_RDONLY_PROG` and frozen, and `array_map_direct_value_addr()` opens
+/// with `if (map->max_entries != 1) return -ENOTSUPP;`. That internal errno
+/// leaves the kernel unchanged, so `BPF_PROG_LOAD` fails with a bare
+/// `os error 524` and a verifier log that simply stops at the offending load.
+/// Kernels before ~7.0 take that path; freezing after the load avoids it, and
+/// every freeze still precedes attachment, so no probe can observe mutable
+/// policy. `TAIL_CALLS` is deferred for its own reason: it is populated with
+/// program fds that do not exist until the programs load.
+fn defers_freeze_until_loaded(name: &str, meta: &ExactMapMetadata) -> bool {
+    name == TAIL_POLICY_MAP
+        || (matches!(meta.map_type, MapType::Array)
+            && meta.flags & BPF_F_RDONLY_PROG != 0
+            && meta.max_entries != 1)
+}
+
 fn freeze_published_maps(ebpf: &Ebpf) -> Result<()> {
-    for (name, _) in BASE_POLICY_MAPS {
-        if matches!(name, "DESCRIPTORS" | TAIL_POLICY_MAP) {
+    for (name, meta) in BASE_POLICY_MAPS {
+        if defers_freeze_until_loaded(name, &meta) {
             continue;
         }
         freeze_map(name, ebpf.map(name).with_context(|| format!("{name} map"))?)?;
@@ -1334,11 +1352,13 @@ impl Session {
         // ENOTSUPP for direct reads before the program is loaded.
         // Loading first avoids that kernel path; freezing still precedes every
         // attachment, so no probe can observe mutable policy.
-        freeze_map(
-            "DESCRIPTORS",
-            ebpf.map("DESCRIPTORS").context("DESCRIPTORS map")?,
-        )
-        .context("freezing DESCRIPTORS")?;
+        for (name, meta) in BASE_POLICY_MAPS {
+            if !defers_freeze_until_loaded(name, &meta) || name == TAIL_POLICY_MAP {
+                continue;
+            }
+            freeze_map(name, ebpf.map(name).with_context(|| format!("{name} map"))?)
+                .with_context(|| format!("freezing {name}"))?;
+        }
         publish_and_freeze_tail_calls(&mut ebpf, unsafe_enabled)
             .context("publishing and freezing TAIL_CALLS")?;
 
@@ -2189,6 +2209,38 @@ mod policy_output {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rdonly_arrays_with_many_entries_freeze_only_after_programs_load() {
+        // A frozen BPF_F_RDONLY_PROG array makes the verifier constant-fold
+        // constant-offset reads of it, and the kernel's
+        // `array_map_direct_value_addr()` refuses any array with
+        // `max_entries != 1` with its internal ENOTSUPP. That reaches userspace
+        // as a bare `os error 524` from BPF_PROG_LOAD with no rejection
+        // message, and it is invisible on kernels new enough to have dropped
+        // the restriction, so no dev-machine gate catches it. W3's `02eedbd`
+        // took CONFIG from 1 to 2 entries and broke every kernel below ~7.0.
+        for (name, meta) in BASE_POLICY_MAPS {
+            let trips_the_kernel = matches!(meta.map_type, MapType::Array)
+                && meta.flags & BPF_F_RDONLY_PROG != 0
+                && meta.max_entries != 1;
+            assert!(
+                !trips_the_kernel || defers_freeze_until_loaded(name, &meta),
+                "{name} is a frozen read-only array with {} entries, so freezing it \
+                 before the programs load makes BPF_PROG_LOAD fail with ENOTSUPP",
+                meta.max_entries
+            );
+        }
+        // Pinned, not derived: bumping a max_entries from 1, or adding a
+        // read-only array, silently moves a map across this boundary. Making
+        // that edit fail here forces it to be a deliberate one.
+        let deferred: Vec<&str> = BASE_POLICY_MAPS
+            .iter()
+            .filter(|(name, meta)| defers_freeze_until_loaded(name, meta))
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(deferred, ["CONFIG", "DESCRIPTORS", TAIL_POLICY_MAP]);
+    }
 
     #[test]
     fn dynamic_export_sequence_retains_partial_success_and_cleans_up_once() {

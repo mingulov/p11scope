@@ -1073,7 +1073,9 @@ fn publish_attribute_catalog(ebpf: &mut Ebpf, enabled: bool) -> Result<()> {
 /// with `if (map->max_entries != 1) return -ENOTSUPP;`. That internal errno
 /// leaves the kernel unchanged, so `BPF_PROG_LOAD` fails with a bare
 /// `os error 524` and a verifier log that simply stops at the offending load.
-/// Kernels before ~7.0 take that path; freezing after the load avoids it, and
+/// Every kernel takes that path -- the check is unchanged from 5.5 through 7.0,
+/// and the defect reproduced on 6.8, 6.17 and 7.0 alike, so this is not a
+/// version-gated workaround. Freezing after the load avoids it, and
 /// every freeze still precedes attachment, so no probe can observe mutable
 /// policy. `TAIL_CALLS` is deferred for its own reason: it is populated with
 /// program fds that do not exist until the programs load.

@@ -398,17 +398,39 @@ struct ExportArgs {
     address: u64,
 }
 
+/// Laid out by hand, with the tail padding named.
+///
+/// This struct is copied whole onto the BPF stack. Under `repr(Rust)` the
+/// compiler ordered it with five trailing padding bytes that nothing wrote,
+/// and LLVM widened the copy to 8-byte loads that span them. Verifiers before
+/// ~6.5 refuse to read a stack byte that is neither MISC nor ZERO, so the copy
+/// was rejected with `invalid read from stack off -72+3 size 8` and
+/// `BPF_PROG_LOAD` returned EACCES -- on 5.15 and 6.2, while 6.5 and newer
+/// accepted the very same object. Naming the padding and initialising it makes
+/// the whole 32 bytes written, which every verifier accepts.
 #[derive(Clone, Copy)]
+#[repr(C)]
 struct SelectionTransport {
-    request_name_class: u8,
-    request_version_class: u8,
     request_flags: u64,
     binding_id: u64,
     return_rv: u64,
+    request_name_class: u8,
+    request_version_class: u8,
     pause_eligible: bool,
+    _pad: [u8; 5],
 }
 
+// Three u64 (24) + three single bytes + five named pad bytes = 32, with no
+// implicit padding left for a verifier to reject. Naming `_pad` in the
+// assertion is the point: deleting it, reordering the fields or dropping
+// `repr(C)` stops this compiling, instead of failing on somebody's 5.15
+// kernel. A size check alone would not -- implicit padding keeps the size at
+// 32 while leaving those bytes unwritten, which is exactly the bug.
+const _: () = assert!(core::mem::offset_of!(SelectionTransport, _pad) == 27);
+const _: () = assert!(core::mem::size_of::<SelectionTransport>() == 32);
+
 const NO_SELECTION: SelectionTransport = SelectionTransport {
+    _pad: [0; 5],
     request_name_class: DISCOVERY_NAME_NA,
     request_version_class: DISCOVERY_VERSION_NULL,
     request_flags: 0,
@@ -1115,6 +1137,7 @@ pub fn interface_return(ctx: RetProbeContext) -> u32 {
     };
     let rv: u64 = ctx.ret();
     let selection = SelectionTransport {
+        _pad: [0; 5],
         request_name_class: state.arg1 as u8,
         request_version_class: (state.arg1 >> 8) as u8,
         request_flags: state.arg2,

@@ -29,15 +29,18 @@ is verified by a real hosted run, which immediately did its job (§4).
 
 ### Hosted
 
-Three runs on `github.com/mingulov/p11scope`, branch `ci/w4-hosted`:
+Four runs on `github.com/mingulov/p11scope`, branch `ci/w4-hosted`:
 
 | Run | Commit | Result | Cause |
 | --- | --- | --- | --- |
 | `33973323902` | `5600225` | FAIL both jobs | `seccomp.h` absent on the runner; `gh api` refused to emit the log |
 | `33973869629` | `4d29bc7` | FAIL `checks-and-e2e`, PASS `archive-log` | live e2e lane, reason not yet diagnosable |
 | `33974684732` | `141a94e` | FAIL `checks-and-e2e`, PASS `archive-log` | live e2e lane, `os error 524` |
+| `33975372955` | `73578a6` | FAIL `checks-and-e2e`, PASS `archive-log` | live e2e lane, `os error 524` — identical |
 
-Run `33974684732`: **39 of 40 steps PASS**, one FAIL. Every step this wave added
+Run `33974684732`: **39 of 40 steps PASS**, one FAIL. Run `33975372955`, on the
+closure commit itself, reproduces exactly that: the same single step fails and
+nothing else does. Every step this wave added
 or changed passes hosted — the UNRUN block, all 19 self-tests, the four gates,
 the diagnostic-object inventory step (`inventory diagnostic: maps=17
 programs=17 OK`, `test result: ok. 1 passed`), and the log-archive job.
@@ -83,24 +86,72 @@ Two further hosted-only findings, invisible to any local gate:
   workspace. The readiness helpers now print the log tail, which is how §5 has a
   diagnosis at all.
 
-## 5. Open finding — NOT a CI defect
+## 5. Open finding — a p11scope regression, NOT a CI defect
 
 `scripts/verify-attach-e2e.sh` fails hosted: the observer exits before capture
-readiness with **`Unknown error 524` (ENOTSUPP)** when loading or attaching its
-BPF programs. The verifier log shows the program verifying cleanly (13 insns,
-159 usec) before the failure, so this is not a rejected program and not a plain
+readiness with **`Unknown error 524`** (ENOTSUPP):
+
+```
+p11scope: starting attach session: ... loading dl_debug_state:
+the BPF_PROG_LOAD syscall returned Unknown error 524 (os error 524)
+```
+
+The verifier log shows the program verifying cleanly (13 insns, ~160 usec)
+before the failure, so this is not a rejected program and not a plain
 permission denial.
 
-This lane **passed hosted on 2026-08-16** (run `31935749796`), so it is a
-regression between that commit and `141a94e`, or a change in the hosted runner
-kernel. It is a product/environment finding, not a pipeline one, and it is the
-only step of 40 that fails.
+### The runner did not change
 
-It is left open deliberately. Marking the lane UNRUN would produce a green run
-and would be defensible only if the lane genuinely cannot run hosted — which is
-not established. Papering over it is exactly what this wave exists to prevent.
-**Owner decision needed:** diagnose the ENOTSUPP (product work), or reclassify
-the lane as UNRUN with evidence that hosted attach is impossible.
+This lane **passed hosted on 2026-08-16** (run `31935749796`, commit
+`a7053d7`), and that run's own diagnostic step printed the same environment the
+failing runs print:
+
+| | `31935749796` (lane PASS) | `33975372955` (lane FAIL) |
+| --- | --- | --- |
+| `uname -r` | `6.17.0-1022-azure` | `6.17.0-1022-azure` |
+| `kernel.perf_event_paranoid` | `4` | `4` |
+| `kernel.yama.ptrace_scope` | `1` | `1` |
+
+That closes the disjunction this section previously left open. It is **not** a
+runner-kernel change: it is a regression in p11scope. `a7053d7` is an ancestor
+of `73578a6`, and in between, 16 commits touch `crates/ebpf/` and
+`crates/ebpf-common/`, with `crates/ebpf/src/main.rs` alone at +1254/-52. The
+BPF object the lane loads is materially different; the machine loading it is
+byte-for-byte the same.
+
+### Hypothesis, explicitly not evidence
+
+524 is the kernel's internal `ENOTSUPP`. The verifier never returns it for a
+rejected program, and here it arrives *after* verification succeeds. The paths
+that leak it to userspace at that point are post-verifier JIT failures:
+`fixup_call_args()` under `CONFIG_BPF_JIT_ALWAYS_ON` when `jit_subprogs()`
+fails, and `bpf_prog_select_runtime()` when the JIT is required and produced no
+code. The trace shows `dl_debug_state` now making a BPF-to-BPF call (`call
+pc+309`, `frame1`), so subprogram JIT-ing is in play. The same object loads on
+the workstation, whose kernel is newer (`7.0.0-30-generic`, with
+`net.core.bpf_jit_harden=0`) — which is why no local gate sees this.
+
+**None of that is confirmed.** No sysctl reading and no `dmesg` line has been
+collected from the runner. It is written down as the first thing to test, not
+as a finding.
+
+Two cheap ways to close it, neither run:
+
+- Add `net.core.bpf_jit_harden`, `net.core.bpf_jit_enable`,
+  `net.core.bpf_jit_limit` and a `dmesg` tail to the existing runner-diagnostic
+  step. One push to `ci/w4-hosted` decides the JIT hypothesis in ~12 minutes.
+- Bisect `a7053d7..HEAD` hosted across the 16 eBPF commits to name the change.
+
+### Why it stays open
+
+Marking the lane UNRUN would produce a green run, and would be defensible only
+if the lane genuinely could not run hosted. The evidence now says the opposite:
+it demonstrably ran, to completion, on this exact runner. Papering over it is
+what this wave exists to prevent.
+
+**Owner decision needed:** diagnose the ENOTSUPP as product work — which is
+what the same-runner evidence points to — or reclassify the lane as UNRUN with
+evidence that hosted attach is impossible.
 
 ## 6. What this closure does NOT claim
 

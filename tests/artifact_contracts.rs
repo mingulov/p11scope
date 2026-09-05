@@ -4602,6 +4602,39 @@ fn immutable_policy_maps() {
     }
 }
 
+/// The frozen inventory in `scripts/check-bpf-map-defs.py` is what the G3
+/// privacy lane, the induced-gaps lane, and the Lane 14 receipt compare a built
+/// object against, so it must match the object this crate embeds — `--self-test`
+/// only ever checked the freeze against itself. Under
+/// `unsafe-unvalidated-metadata` the embedded object is the diagnostic one.
+#[test]
+fn frozen_policy_inventory_matches_embedded_object() {
+    let directory = tempfile::tempdir().expect("temporary inventory directory");
+    let object = directory.path().join("p11scope-ebpf");
+    fs::write(&object, p11scope::EBPF_OBJECT).expect("write embedded eBPF object");
+    let (variant, maps, programs) = if cfg!(feature = "unsafe-unvalidated-metadata") {
+        ("diagnostic", 17, 17)
+    } else {
+        ("default", 16, 13)
+    };
+    let report = run_ok(
+        "python3",
+        &[
+            "-I",
+            "scripts/check-bpf-map-defs.py",
+            "--inventory",
+            variant,
+            object.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        report.contains(&format!(
+            "inventory {variant}: maps={maps} programs={programs} OK"
+        )),
+        "{report}"
+    );
+}
+
 #[test]
 fn descriptor_cookie_and_publication_source_guard_rejects_contract_regressions() {
     let attach = read("src/attach.rs");
@@ -5715,6 +5748,28 @@ fn production_bpf_toolchain_is_frozen() {
     assert!(!build.contains("\"+nightly\""));
     assert!(ci.contains("toolchain install nightly-2026-05-20 "));
     assert!(!ci.contains("toolchain install nightly "));
+}
+
+/// The default embedded object is covered by the ordinary `cargo test` gate;
+/// the diagnostic object exists only under `unsafe-unvalidated-metadata`, so it
+/// needs its own hosted step — one test, not the whole target
+/// (`immutable_policy_maps` correctly asserts `ATTR_BOOL_BITS` is absent).
+#[test]
+fn hosted_pipeline_checks_the_diagnostic_inventory() {
+    let ci = read(".github/workflows/ci.yml");
+    let after_clippy = between(
+        &ci,
+        "- run: cargo +1.88 clippy --locked --workspace --all-targets -- -D warnings\n",
+        "- run: uname -r;",
+    );
+    let diagnostic_step = "- run: cargo +1.88 test --locked --features unsafe-unvalidated-metadata --test artifact_contracts -- frozen_policy_inventory_matches_embedded_object";
+    assert!(
+        after_clippy
+            .lines()
+            .map(str::trim)
+            .any(|line| line == diagnostic_step),
+        "CI must run the diagnostic-object inventory test after the clippy gate and before `uname -r`"
+    );
 }
 
 /// Task 8 Step 2's ordering sentence, frozen where the loops live: "Each tick

@@ -5894,7 +5894,9 @@ fn hosted_pipeline_checks_the_diagnostic_inventory() {
 #[test]
 fn hosted_pipeline_runs_every_unprivileged_self_test() {
     let ci = read(".github/workflows/ci.yml");
-    let ci_lines: Vec<&str> = ci.lines().map(str::trim).collect();
+    // The claim is about this job, so only its steps count.
+    let checks = ci.split("\n  archive-log:\n").next().unwrap_or(&ci);
+    let ci_lines: Vec<&str> = checks.lines().map(str::trim).collect();
     let mut expected: BTreeSet<String> = BTreeSet::new();
     for dir in ["scripts", "scripts/matrix"] {
         for entry in fs::read_dir(dir).expect("walk scripts") {
@@ -6037,7 +6039,15 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
         line.strip_prefix("- run: ")
             .or_else(|| line.strip_prefix("run: "))
     }
-    let run_calls: BTreeSet<&str> = ci.lines().map(str::trim).filter_map(command_of).collect();
+    // Scoped to the checks job: the label says "runs in this job", so a step that
+    // exists only in another job must not satisfy it. The full-run sweep below
+    // stays on the whole file — a lane run from any job has run.
+    let checks = ci.split("\n  archive-log:\n").next().unwrap_or(&ci);
+    let run_calls: BTreeSet<&str> = checks
+        .lines()
+        .map(str::trim)
+        .filter_map(command_of)
+        .collect();
     for line in ci.lines().map(str::trim) {
         // Trailing YAML comments are not invocations.
         let line = line
@@ -6047,7 +6057,10 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
             continue;
         }
         if !line
-            .split(|c: char| c.is_ascii_whitespace() || c == '"' || c == '\'')
+            .split(|c: char| {
+                c.is_ascii_whitespace()
+                    || matches!(c, '"' | '\'' | ';' | '&' | '|' | '<' | '>' | '(' | ')')
+            })
             .any(is_lane)
         {
             continue;
@@ -6160,7 +6173,7 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
         "clippy --locked --workspace --all-targets",
     ] {
         assert!(
-            ci.contains(&format!("- run: cargo +1.88 {gate}")),
+            checks.contains(&format!("- run: cargo +1.88 {gate}")),
             "the scope: line claims the {gate} gate, which no step runs"
         );
     }
@@ -6222,7 +6235,18 @@ fn hosted_pipeline_retains_the_job_log() {
     let (checks, archive) = ci
         .split_once("\n  archive-log:\n")
         .expect("ci.yml has no archive-log job");
-    assert!(checks.contains("\npermissions:\n  contents: read\n"));
+    let default_permissions: Vec<&str> = ci
+        .lines()
+        .skip_while(|line| *line != "permissions:")
+        .skip(1)
+        .take_while(|line| line.starts_with("  "))
+        .collect();
+    assert_eq!(
+        default_permissions,
+        ["  contents: read"],
+        "the workflow default must stay exactly contents: read — checks-and-e2e has no \
+         job-level block, so it inherits this while building third-party crates"
+    );
     assert!(
         !checks.contains("    permissions:"),
         "checks-and-e2e must not gain a job-level permissions block"

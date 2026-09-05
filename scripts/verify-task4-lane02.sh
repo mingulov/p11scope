@@ -438,9 +438,13 @@ C
     early_status=$?
     set -e
     [ "$early_status" -eq 77 ]
-    # 77 alone is ambiguous: the prerequisite loop above this refusal exits 77
-    # too, so on a host missing softhsm2-util (say) the oracle would pass green
-    # without the refusal ever being reached. Assert the refusal itself.
+    # 77 alone is ambiguous: the prerequisite loop exits 77 too, so before the
+    # loops were ordered this way a host missing softhsm2-util (say) made the
+    # oracle pass green without the refusal ever being reached. Assert the
+    # refusal itself. Known ceiling: on a host where every prerequisite IS
+    # present this cannot see the loops swapped back, because the refusal is
+    # reached either way. The Rust harness covers that case -- it runs this
+    # script under a PATH with no rustc, where the order is observable.
     grep -Fq "refusing inherited RUSTFLAGS" "$self_root/early.err" || {
         echo "refusal not reached; early run said: $(cat "$self_root/early.err")" >&2
         exit 1

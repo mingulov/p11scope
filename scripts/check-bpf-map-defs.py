@@ -86,7 +86,9 @@ def classify(records, sections):
     A program emitted under an attach type the whitelist does not name (`raw_tp/`,
     `kprobe/`, `fentry/`, `lsm/`, `uprobe.s`, ...) lands in an unlisted section.
     Silently skipping it would leave the frozen program count intact while the
-    object gained a program, so an unclassified global function is an error.
+    object gained a program, so an unclassified *defined* global function is an
+    error. Symbols with a non-numeric section index (`UND`, `ABS` — a kfunc extern
+    appears this way) are neither counted nor refused, as they were before.
 
     The `FUNC`/`GLOBAL`/`DEFAULT` filter is inherited from the program scan: the
     compiler's mem* helpers are `GLOBAL HIDDEN` and never reach here.

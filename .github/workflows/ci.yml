@@ -57,7 +57,14 @@ jobs:
       - run: cargo +1.88 check --locked --workspace --all-targets
       - run: cargo +1.88 test --locked --workspace --all-targets
       - run: cargo +1.88 clippy --locked --workspace --all-targets -- -D warnings
-      - run: cargo +1.88 test --locked --features unsafe-unvalidated-metadata --test artifact_contracts -- --nocapture frozen_policy_inventory_matches_embedded_object
+      # libtest exits 0 when a filter matches nothing, so this step proves a test
+      # actually ran rather than trusting the source to keep naming one. A rename,
+      # an #[ignore], a #[cfg] that excludes it, or a deleted #[test] all empty the
+      # filter identically, and all of them fail here.
+      - shell: bash
+        run: |
+          cargo +1.88 test --locked --features unsafe-unvalidated-metadata --test artifact_contracts -- --nocapture frozen_policy_inventory_matches_embedded_object | tee "$RUNNER_TEMP/diagnostic-inventory.log"
+          grep -q "^test result: ok. 1 passed" "$RUNNER_TEMP/diagnostic-inventory.log"
       - run: uname -r; cat /proc/sys/kernel/perf_event_paranoid; cat /proc/sys/kernel/yama/ptrace_scope
       # Unprivileged validator self-tests: every gate oracle, plus the frozen
       # evidence/object/receipt validators and the matrix oracles: every
@@ -82,11 +89,11 @@ jobs:
       - run: scripts/matrix/verify-fork-scope.sh --self-test
       - run: scripts/matrix/verify-oracle.sh --self-test
       - run: scripts/matrix/verify-shared-layer.sh --self-test
-      - run: python3 scripts/check-bpf-map-defs.py --self-test
-      - run: python3 scripts/check-capture-evidence.py --self-test
-      - run: python3 scripts/check-live-discovery-object.py --self-test
-      - run: python3 scripts/dump-owned-bpf-maps.py --self-test
-      - run: python3 scripts/check-live-discovery-evidence.py --self-test
+      - run: python3 -I scripts/check-bpf-map-defs.py --self-test
+      - run: python3 -I scripts/check-capture-evidence.py --self-test
+      - run: python3 -I scripts/check-live-discovery-object.py --self-test
+      - run: python3 -I scripts/dump-owned-bpf-maps.py --self-test
+      - run: python3 -I scripts/check-live-discovery-evidence.py --self-test
       - run: scripts/verify-inspect-doctor.sh
       - run: scripts/verify-attach-e2e.sh
   # A step cannot read its own job's log, so a second job fetches the finished

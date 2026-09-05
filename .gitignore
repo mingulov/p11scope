@@ -8,4 +8,10 @@ target/
 spike/aya-offset-pin/work/
 crates/ebpf/target/
 __pycache__/
-/.superpowers/sdd/
+# Agent state: these must be ignored by a rule that travels with the repo,
+# not by .git/info/exclude, which a fresh clone never inherits.
+/.claude/
+/.superpowers/
+# Root build outputs (history already carries one committed binary).
+/p11scope
+/p11scope-discover

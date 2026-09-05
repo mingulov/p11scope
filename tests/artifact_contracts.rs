@@ -8764,3 +8764,40 @@ fn escalated_signal_wiring_is_reap_only_and_bounded() {
         );
     }
 }
+
+#[test]
+fn tracked_ignore_rules_cover_agent_state_and_root_binaries() {
+    // Agent state and root build outputs must be ignored by rules that travel
+    // with the repository. `.git/info/exclude` is local-only: a fresh clone, or
+    // a reviewer's checkout, would not inherit it, so a rule living only there
+    // is not a control at all.
+    for path in [
+        ".claude/worktrees/x",
+        ".superpowers/x",
+        "p11scope",
+        "p11scope-discover",
+    ] {
+        let output = Command::new("git")
+            .args(["check-ignore", "-v", path])
+            .output()
+            .expect("run git check-ignore");
+        assert!(output.status.success(), "{path} is not ignored by any rule");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let source = stdout.split(':').next().unwrap_or_default();
+        assert_eq!(
+            source, ".gitignore",
+            "{path} is ignored by {source}, which does not travel with the \
+             repository: {stdout:?}"
+        );
+    }
+
+    let tracked = Command::new("git")
+        .args(["ls-files", ".claude/", ".superpowers/"])
+        .output()
+        .expect("run git ls-files");
+    assert!(
+        tracked.stdout.is_empty(),
+        "agent state is tracked: {:?}",
+        String::from_utf8_lossy(&tracked.stdout)
+    );
+}

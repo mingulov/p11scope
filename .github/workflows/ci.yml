@@ -24,10 +24,11 @@ jobs:
           TREE=$(git rev-parse 'HEAD^{tree}')
           cat >"$RUNNER_TEMP/lanes.txt" <<EOF
           commit $GITHUB_SHA tree $TREE
-          hosted: cargo fmt/check/test/clippy gates, the diagnostic-object inventory test, every --self-test, scripts/verify-inspect-doctor.sh, scripts/verify-attach-e2e.sh
+          scope: printed before any step runs, so it is scope, never a result — each step's own status is the evidence. This job attempts the cargo fmt/check/test/clippy gates, the diagnostic-object inventory test, every --self-test, and these lanes in full: scripts/verify-inspect-doctor.sh, scripts/verify-attach-e2e.sh
           UNRUN: scripts/attach-pod.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/bench-overhead.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/build-release.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/dump-owned-bpf-maps.py (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/verify-canaries.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/verify-capability-tier.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/verify-discover-containers.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
@@ -94,8 +95,9 @@ jobs:
   # token, not GITHUB_TOKEN. No cache anywhere.
   archive-log:
     needs: checks-and-e2e
-    # Not always(): with cancel-in-progress a superseded run would publish a
-    # truncated log under the same artifact name. Failures still archive.
+    # Not always(): a cancelled run's log is truncated by definition, and
+    # publishing it produces an artifact that looks like evidence of a
+    # completed job and is not. Failures still archive.
     if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     permissions:

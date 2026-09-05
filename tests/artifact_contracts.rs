@@ -5760,20 +5760,24 @@ fn production_bpf_toolchain_is_frozen() {
 #[test]
 fn hosted_pipeline_checks_the_diagnostic_inventory() {
     let ci = read(".github/workflows/ci.yml");
-    let after_clippy = between(
-        &ci,
-        "- run: cargo +1.88 clippy --locked --workspace --all-targets -- -D warnings\n",
-        "- run: uname -r;",
-    );
+    // Position is not load-bearing and pinning it made an innocent edit to a
+    // neighbouring step panic inside `between()`; the step only has to be in the
+    // checks job, after the clippy gate it complements.
+    let checks = ci.split("\n  archive-log:\n").next().unwrap_or(&ci);
+    let clippy_step = "- run: cargo +1.88 clippy --locked --workspace --all-targets -- -D warnings";
     // `--nocapture` so the inventory report the wave cites as exit evidence
     // actually reaches the hosted log; the filter stays last so it is one token.
     let diagnostic_step = "- run: cargo +1.88 test --locked --features unsafe-unvalidated-metadata --test artifact_contracts -- --nocapture frozen_policy_inventory_matches_embedded_object";
-    assert!(
-        after_clippy
+    let position = |needle: &str| {
+        checks
             .lines()
             .map(str::trim)
-            .any(|line| line == diagnostic_step),
-        "CI must run the diagnostic-object inventory test after the clippy gate and before `uname -r`"
+            .position(|line| line == needle)
+    };
+    let (clippy_at, diagnostic_at) = (position(clippy_step), position(diagnostic_step));
+    assert!(
+        diagnostic_at.is_some() && diagnostic_at > clippy_at,
+        "the checks job must run the diagnostic-object inventory test after the clippy gate"
     );
     // libtest exits 0 when a filter matches nothing, so that step is a real
     // check only while its filter still names a test. Without this, renaming the
@@ -5783,10 +5787,21 @@ fn hosted_pipeline_checks_the_diagnostic_inventory() {
         .rsplit_once(' ')
         .expect("the diagnostic step carries a test filter")
         .1;
+    let source = read("tests/artifact_contracts.rs");
+    let (attributes, _) = source
+        .split_once(&format!("\nfn {filter}()"))
+        .unwrap_or_else(|| {
+            panic!(
+                "ci.yml filters the hosted diagnostic-object step on `{filter}`, which names \
+             no test: the step would pass having run nothing"
+            )
+        });
+    // `#[ignore]` (or a `cfg` that excludes it) empties the same filter just as
+    // effectively as a rename, and libtest still exits 0.
+    let attributes = attributes.rsplit("\n\n").next().unwrap_or_default();
     assert!(
-        read("tests/artifact_contracts.rs").contains(&format!("\nfn {filter}()")),
-        "ci.yml filters the hosted diagnostic-object step on `{filter}`, which names \
-         no test: the step would pass having run nothing"
+        attributes.contains("#[test]") && !attributes.contains("#[ignore"),
+        "`{filter}` must be an unconditional #[test]; its attributes are {attributes:?}"
     );
 }
 
@@ -5816,7 +5831,12 @@ fn hosted_pipeline_runs_every_unprivileged_self_test() {
                 "scripts/cleanup-traps.sh",
             ]
             .contains(&path)
-                || !read(path).contains("--self-test")
+                // A comment merely mentioning --self-test does not make the
+                // script self-test-capable; without this, a line explaining that
+                // a script has no self-test would demand a hosted step for it.
+                || !read(path).lines().any(|line| {
+                    !line.trim_start().starts_with('#') && line.contains("--self-test")
+                })
             {
                 continue;
             }
@@ -5872,6 +5892,29 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
                     })
             })
     };
+    // A python helper names sudo and bpftool in its docstrings and in the evidence
+    // it parses, so scanning its own text calls every validator privileged. What
+    // actually makes one privileged is how it is invoked:
+    // `sudo python3 -I scripts/dump-owned-bpf-maps.py`.
+    let sudo_invoked = |script: &str| {
+        let file = script.rsplit('/').next().unwrap_or(script).to_string();
+        ["scripts", "scripts/matrix"].iter().any(|dir| {
+            fs::read_dir(dir)
+                .expect("walk scripts")
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|e| e == "sh"))
+                .any(|entry| {
+                    read(entry.path().to_str().unwrap_or_default())
+                        .lines()
+                        .map(str::trim)
+                        .any(|line| {
+                            !line.starts_with('#')
+                                && line.contains("sudo")
+                                && line.contains(file.as_str())
+                        })
+                })
+        })
+    };
     let hosted_full: BTreeSet<&str> = ci_lines
         .iter()
         .filter_map(|line| line.strip_prefix("- run: "))
@@ -5889,13 +5932,19 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
                 .and_then(|n| n.to_str())
                 .unwrap_or_default();
             let path = path.to_str().expect("utf-8 script path").to_string();
-            // Not just `verify-` lanes: `build-release.sh` (the W8 release
-            // receipt), `attach-pod.sh` and `bench-overhead.sh` are privileged
-            // too, and two of them have a hosted `--self-test` whose green step
-            // would otherwise stand unqualified.
-            if name.ends_with(".sh")
+            // Not just `verify-` lanes, and not just shell: `build-release.sh`
+            // (the W8 release receipt), `attach-pod.sh`, `bench-overhead.sh` and
+            // `dump-owned-bpf-maps.py` are privileged too, and each has a hosted
+            // `--self-test` whose green step would otherwise stand unqualified.
+            if (name.ends_with(".sh") || name.ends_with(".py"))
                 && !["gates.sh", "lib.sh", "cleanup-traps.sh"].contains(&name)
-                && is_privileged(&path)
+                // Lazily: the walk also yields `scripts/fixtures/`, which is a
+                // directory and cannot be read as a file.
+                && (if name.ends_with(".py") {
+                    sudo_invoked(&path)
+                } else {
+                    is_privileged(&path)
+                })
                 && !hosted_full.contains(path.as_str())
             {
                 expected.insert(path);
@@ -5903,13 +5952,20 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
         }
     }
     assert!(
-        expected.len() >= 17,
+        expected.len() >= 18,
         "the derivation found only {} privileged lanes not run hosted in full",
         expected.len()
     );
 
+    // Match the action, not its version: bumping checkout is an innocent edit,
+    // and pinning the tag made it fail here with a message about step order.
+    let after_checkout = ci
+        .split_once("      - uses: actions/checkout@")
+        .and_then(|(_, rest)| rest.split_once('\n'))
+        .map(|(_, rest)| rest)
+        .expect("the checks job must check out the repository");
     assert!(
-        ci.contains("      - uses: actions/checkout@v4\n      # UNRUN lanes begin\n"),
+        after_checkout.starts_with("      # UNRUN lanes begin\n"),
         "the UNRUN lanes block must be the first step after checkout"
     );
     let block = between(&ci, "# UNRUN lanes begin", "# UNRUN lanes end");
@@ -5927,16 +5983,34 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
         named, expected,
         "UNRUN lines must name exactly the derived lane set"
     );
-    // The block's positive claim is derived too, so it cannot drift into
-    // omitting a lane the job really does run in full.
-    let hosted_line = block_lines
+    // The block's positive claim is `scope:`, not a status: it is printed before
+    // any of the work it names has run, so on a failed run it would otherwise be
+    // archived asserting steps that never executed. Its lane list is derived in
+    // both directions — it can neither omit a lane the job runs nor claim one it
+    // does not.
+    let scope_line = block_lines
         .iter()
-        .find(|line| line.starts_with("hosted: "))
-        .expect("the block must also state what did run hosted");
-    for path in &hosted_full {
+        .find(|line| line.starts_with("scope: "))
+        .expect("the block must also state this job's scope");
+    let scope_named: BTreeSet<&str> = scope_line
+        .split_whitespace()
+        .map(|token| token.trim_end_matches(','))
+        .filter(|token| token.starts_with("scripts/"))
+        .collect();
+    assert_eq!(
+        scope_named, hosted_full,
+        "the scope: line must name exactly the lanes this job runs in full"
+    );
+    // The rest of that line is prose, so pin the steps it claims.
+    for gate in [
+        "fmt --all -- --check",
+        "check --locked",
+        "test --locked",
+        "clippy --locked",
+    ] {
         assert!(
-            hosted_line.contains(path),
-            "the hosted: line omits {path}, which this job runs in full"
+            ci.contains(&format!("- run: cargo +1.88 {gate}")),
+            "the scope: line claims the {gate} gate, which no step runs"
         );
     }
     for path in &expected {
@@ -5949,7 +6023,12 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
                 "{path} appears in the block without the UNRUN: prefix: {line:?}"
             );
         }
-        let self_test = format!("- run: {path} --self-test");
+        let interpreter = if path.ends_with(".py") {
+            "python3 "
+        } else {
+            ""
+        };
+        let self_test = format!("- run: {interpreter}{path} --self-test");
         let note = if ci_lines.contains(&self_test.as_str()) {
             "only its unprivileged self-test runs in this job"
         } else {
@@ -5966,6 +6045,18 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
     assert!(
         block.contains(">>\"$GITHUB_STEP_SUMMARY\""),
         "the UNRUN block must append to the job summary"
+    );
+    // Step summaries are not archived; the job log is, and the whole archive-log
+    // job exists to retain it. Dropping this `cat` would silently empty it.
+    assert!(
+        block_lines.contains(&"cat \"$RUNNER_TEMP/lanes.txt\""),
+        "the UNRUN block must also print the list to the job log"
+    );
+    // A command substitution inside the heredoc cannot trip `set -e`, so a failed
+    // rev-parse would render the exit anchor blank on a green step.
+    assert!(
+        block.contains("TREE=$(git rev-parse") && block.contains("tree $TREE"),
+        "the tree hash must be assigned before the heredoc, not substituted inside it"
     );
 }
 
@@ -6006,7 +6097,6 @@ fn hosted_pipeline_retains_the_job_log() {
         "retention-days: 90\n",
         "/actions/jobs/$JOB_ID/logs\"",
         "for attempt in 1 2 3; do",
-        "sleep 5",
         // An attempt that wrote nothing must not count as success: the retry
         // window answers 200 with an empty body, and `if-no-files-found: error`
         // only checks that the file exists.

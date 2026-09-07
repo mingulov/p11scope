@@ -38,6 +38,7 @@ jobs:
           UNRUN: scripts/verify-task4-lane02.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/verify-task4-lane16.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/matrix/verify-fork-scope.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/matrix/verify-ia32-compat.sh (privileged kernel lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/matrix/verify-oracle.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/matrix/verify-shared-layer.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/matrix/verify-uretprobe-seccomp.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
@@ -89,6 +90,7 @@ jobs:
       - run: scripts/attach-pod.sh --self-test
       - run: scripts/build-release.sh --self-test
       - run: scripts/matrix/verify-fork-scope.sh --self-test
+      - run: scripts/matrix/verify-ia32-compat.sh --self-test
       - run: scripts/matrix/verify-oracle.sh --self-test
       - run: scripts/matrix/verify-shared-layer.sh --self-test
       - run: scripts/matrix/verify-uretprobe-seccomp.sh --self-test

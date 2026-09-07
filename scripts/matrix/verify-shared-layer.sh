@@ -53,6 +53,15 @@ task4_digest() { sha256sum "$1" | awk '{print $1}'; }
 task4_snapshot() { git ls-files -z | sort -z | xargs -0 sha256sum; }
 task4_fact() { printf '%s\t%s\n' "$1" "$2" >> "$TASK4_FACTS"; }
 
+task4_retain_capture() {
+    [ "$#" -eq 2 ] || return 2
+    for t4_name in broad a-only b-only; do
+        t4_capture=$1/$t4_name.json
+        [ -f "$t4_capture" ] && [ ! -L "$t4_capture" ] && [ -s "$t4_capture" ] || return 1
+    done
+    cp "$1/broad.json" "$2" && cmp -s "$1/broad.json" "$2"
+}
+
 task4_finalize() {
     t4_result=$?
     trap - EXIT INT TERM HUP
@@ -129,9 +138,7 @@ task4_receipt_run() {
     P11SCOPE_TASK4_BODY=1 P11SCOPE_TASK4_WORK="$TASK4_ROOT/work" \
         P11SCOPE_TASK4_PRODUCT="$TASK4_ROOT/work/product" \
         /bin/sh "$0" > "$TASK4_ROOT/stdout.log" 2> "$TASK4_ROOT/stderr.log"
-    t4_capture=$(find "$TASK4_ROOT/work" -type f -name '*observed*.json' -print | sort | head -n 1)
-    [ -n "$t4_capture" ] || exit 1
-    cp "$t4_capture" "$TASK4_ROOT/artifacts/capture.json"
+    task4_retain_capture "$TASK4_ROOT/work" "$TASK4_ROOT/artifacts/capture.json" || exit 1
     cp "$TASK4_ROOT/stdout.log" "$TASK4_ROOT/artifacts/checker.log"
 }
 
@@ -141,6 +148,34 @@ task4_receipt_self_test() {
     REPORT=${P11SCOPE_TASK4_SELF_TEST_REPORT-}
     if [ -z "$REPORT" ]; then TASK4_SELF_TMP=$(mktemp -d); trap 'rm -rf "$TASK4_SELF_TMP"' EXIT INT TERM; REPORT=$TASK4_SELF_TMP/report.tsv; fi
     umask 077
+    (
+        t4_tmp=$(mktemp -d)
+        trap 'rm -rf "$t4_tmp"' EXIT INT TERM
+        mkdir "$t4_tmp/work" "$t4_tmp/artifacts"
+        printf 'decoy\n' > "$t4_tmp/work/000-observed.json"
+        printf 'broad\n' > "$t4_tmp/work/broad.json"
+        printf 'a-only\n' > "$t4_tmp/work/a-only.json"
+        printf 'b-only\n' > "$t4_tmp/work/b-only.json"
+        task4_retain_capture "$t4_tmp/work" "$t4_tmp/artifacts/capture.json"
+        cmp -s "$t4_tmp/work/broad.json" "$t4_tmp/artifacts/capture.json"
+        rm "$t4_tmp/work/b-only.json"
+        if task4_retain_capture "$t4_tmp/work" "$t4_tmp/artifacts/capture.json"; then
+            echo "retention accepted missing b-only.json" >&2
+            exit 1
+        fi
+        : > "$t4_tmp/work/b-only.json"
+        if task4_retain_capture "$t4_tmp/work" "$t4_tmp/artifacts/capture.json"; then
+            echo "retention accepted empty b-only.json" >&2
+            exit 1
+        fi
+        printf 'b-only\n' > "$t4_tmp/work/b-only.json"
+        rm "$t4_tmp/work/a-only.json"
+        ln -s broad.json "$t4_tmp/work/a-only.json"
+        if task4_retain_capture "$t4_tmp/work" "$t4_tmp/artifacts/capture.json"; then
+            echo "retention accepted symlinked a-only.json" >&2
+            exit 1
+        fi
+    )
     python3 - "$REPORT" <<'PY'
 import copy, fcntl, os, stat, sys, tempfile
 from pathlib import Path

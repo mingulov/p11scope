@@ -1242,11 +1242,20 @@ def validate_proxy_capacity_fallback(document, module_path=None):
     require(len(refused) == 1, refused)
     require("p11-kit" in refused[0]["name"].lower(), refused)
     match = re.fullmatch(
-        rf"module needs ([0-9]+) more of the {MAX_SLOTS} attach slots; 0 are in use "
+        rf"module needs ([0-9]+) more of the {MAX_SLOTS} attach slots; ([0-9]+) are in use "
         r"— refusing to attach a prefix",
         refused[0]["reason"],
     )
-    require(match and int(match.group(1)) > MAX_SLOTS, refused)
+    require(match, refused)
+    wanted, occupied = map(int, match.groups())
+    require(
+        occupied in (0, evidence["slots"]),
+        f"capacity occupancy: {occupied}, {evidence['slots']}",
+    )
+    require(
+        occupied + wanted > MAX_SLOTS,
+        f"capacity refusal fits: {occupied} + {wanted}",
+    )
 
     # Decoded occurrences are recorded *before* slot-capacity admission, so a
     # module refused only by the attach ceiling keeps every entry it decoded;
@@ -2194,7 +2203,7 @@ def self_test():
     proxy["evidence"]["modules_skipped"] = [
         {
             "name": proxy_refused,
-            "reason": "module needs 5762 more of the 512 attach slots; 0 are in use "
+            "reason": "module needs 5762 more of the 512 attach slots; 68 are in use "
             "— refusing to attach a prefix",
         }
     ]
@@ -2218,6 +2227,13 @@ def self_test():
         + [([f"C_Unused_{index}"], 0) for index in range(66)]
     )
     validate_proxy_capacity_fallback(proxy, module_path=soft_path)
+    # Capacity records occupancy when this whole module is considered. The
+    # other module can be admitted before or after that refusal.
+    proxy_first = copy.deepcopy(proxy)
+    proxy_first["evidence"]["modules_skipped"][0]["reason"] = proxy_first[
+        "evidence"
+    ]["modules_skipped"][0]["reason"].replace("68 are in use", "0 are in use")
+    validate_proxy_capacity_fallback(proxy_first, module_path=soft_path)
     # The lane pins its own module by exact path, so a capture that attached
     # some other SoftHSM2 build is not this lane's evidence.
     rejected(
@@ -2232,6 +2248,14 @@ def self_test():
         lambda d: d["evidence"]["skipped"].append(dict(DISCOVERY_SKIP)),
         lambda d: d["evidence"].update(event_loss=1),
         lambda d: d["evidence"]["modules_skipped"][0].update(reason="capacity"),
+        lambda d: d["evidence"]["modules_skipped"][0].update(
+            reason="module needs 5762 more of the 512 attach slots; 67 are in use "
+            "— refusing to attach a prefix"
+        ),
+        lambda d: d["evidence"]["modules_skipped"][0].update(
+            reason="module needs 444 more of the 512 attach slots; 68 are in use "
+            "— refusing to attach a prefix"
+        ),
         lambda d: d["functions"][0]["module"].update(ino=999),
         lambda d: d["evidence"].update(completeness="COMPLETE"),
         lambda d: d["evidence"].update(slots=67),

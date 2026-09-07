@@ -23,6 +23,9 @@ MODULE=/usr/lib/softhsm/libsofthsm2.so
 WORK=target/matrix-proxy
 WPID=
 SPID=
+NESTED_ROOT_PID=
+NESTED_ROOT_START=
+NESTED=
 . scripts/lib.sh
 require_non_root_caller
 
@@ -39,6 +42,17 @@ cleanup() {
     trap - EXIT INT TERM
     set +e
     touch "$WORK/go" 2>/dev/null
+    [ -z "$NESTED" ] || touch "$NESTED/finish"
+    if [ -n "$NESTED_ROOT_PID" ] && root_process_matches_starttime "$NESTED_ROOT_PID" "$NESTED_ROOT_START"; then
+        signal_verified_root_process INT "$NESTED_ROOT_PID" "$NESTED_ROOT_START"
+        attempts=0
+        while root_process_matches_starttime "$NESTED_ROOT_PID" "$NESTED_ROOT_START" && [ "$attempts" -lt 40 ]; do
+            attempts=$((attempts + 1)); sleep 0.05
+        done
+        if root_process_matches_starttime "$NESTED_ROOT_PID" "$NESTED_ROOT_START"; then
+            signal_verified_root_process KILL "$NESTED_ROOT_PID" "$NESTED_ROOT_START"
+        fi
+    fi
     [ -z "$WPID" ] || kill "$WPID" 2>/dev/null
     [ -z "$SPID" ] || kill "$SPID" 2>/dev/null
     [ -z "$WPID" ] || wait "$WPID" 2>/dev/null
@@ -132,4 +146,96 @@ print("  decoded entries:", ev["table_entries"], "over", len(ev["surfaces"]), "s
 print("  refused whole:", refused)
 PY
 
+echo "=== nested function-list and interface-list exports ==="
+NESTED=$(mktemp -d "$PWD/$WORK/nested-XXXXXX")
+SRC=scripts/matrix/export-nesting-harness.c
+sha256sum "$SRC" > "$NESTED/source.sha256"
+for provider in 1 2; do
+    gcc -m64 -std=c11 -O1 -Wall -Wextra -Werror -fPIC -shared -Wl,-Bsymbolic \
+        "-DPROVIDER_ID=$provider" -o "$NESTED/provider-$provider.so" "$SRC"
+done
+gcc -m64 -std=c11 -O1 -Wall -Wextra -Werror -DNESTING_DRIVER -o "$NESTED/driver" "$SRC" -ldl
+"$NESTED/driver" "$NESTED/provider-1.so" "$NESTED/provider-2.so" \
+    "$NESTED/go" "$NESTED/finish" > "$NESTED/workload.log" 2>&1 &
+WPID=$!
+wait_for_mapped_provider "$WPID" provider-1.so
+wait_for_mapped_provider "$WPID" provider-2.so
+launch_root_recorded_process "$NESTED/observer.pid" "$NESTED/profile.log" \
+    "$WORK/build/release/p11scope" profile --pid "$WPID" \
+    --mode metrics --duration 10 -o "$NESTED/observed.json"
+SPID=$ROOT_LAUNCH_PID
+NESTED_ROOT_PID=$ROOT_PROCESS_PID
+NESTED_ROOT_START=$ROOT_PROCESS_STARTTIME
+wait_for_capture_ready "$NESTED/profile.log" aggregate-only metrics
+touch "$NESTED/go"
+attempts=0
+while recording_launcher_active "$SPID" && [ "$attempts" -lt 600 ]; do
+    attempts=$((attempts + 1)); sleep 0.05
+done
+[ "$attempts" -lt 600 ] || { echo "nested observer exceeded 30 seconds" >&2; exit 1; }
+wait "$SPID"
+SPID=
+NESTED_ROOT_PID=
+touch "$NESTED/finish"
+wait "$WPID"
+WPID=
+reclaim_root_output "$NESTED/observed.json" "$NESTED/observer.pid"
+grep -q '^NESTED_EXPORTS_DONE function_lists=2 interface_lists=2$' "$NESTED/workload.log"
+python3 - "$NESTED/observed.json" "$NESTED" <<'PY'
+import copy, importlib.util, json, sys
+from collections import Counter
+
+spec = importlib.util.spec_from_file_location("oracle", "scripts/check-capture-evidence.py")
+oracle = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(oracle)
+paths = {f"{sys.argv[2]}/provider-{index}.so" for index in (1, 2)}
+
+def validate(doc):
+    oracle.exact_metrics_schema(doc)
+    oracle.exact_capture_modules(doc)
+    ev = doc["evidence"]
+    oracle.exact_counters(ev)
+    assert ev["slots"] == 4 and ev["attached_probes"] == 8
+    assert ev["table_entries"] == 136 and ev["completeness"] == "PARTIAL"
+    assert ev["attach_failures"] == ev["modules_skipped"] == ev["skipped"] == []
+    assert ev["in_flight_at_end"] == 0 and ev["provider_changed"] is False
+    assert {module["path"] for module in doc["capture"]["modules"]} == paths
+    assert len(ev["discovery"]) == 2
+    for module in ev["discovery"]:
+        assert module["path"] in paths and module["interfaces"] == 1
+        assert module["tables"] == [{"entries": 68, "source": "scan", "version": [2, 40]}]
+        assert len(module["objects"]) == 1
+        target = module["objects"][0]
+        assert all(target[key] == module[key] for key in ("path", "dev", "ino", "sha256"))
+    assert Counter((s["source"], s["functions"], s["acquisition"], s["walk"]) for s in ev["surfaces"]) == Counter(
+        [(f"{path} table 2.40", 68, "ok", "full") for path in paths]
+        + [("interface[0] exact_standard", 68, "ok", "full")] * 2
+    )
+    called = [item for item in doc["functions"] if item["calls"]]
+    assert len(called) == 2
+    assert len({(tuple(item["module"]["dev"]), item["module"]["ino"]) for item in called}) == 2
+    for item in called:
+        assert item["names"] == ["C_GetFunctionList"] and item["calls"] == 1
+        assert item["rv_counts"] == {"0x0000000000000000": 1}
+        assert item["errors"] == item["in_flight"] == item["pending_returns"] == 0
+
+doc = json.load(open(sys.argv[1]))
+validate(doc)
+for mutate in (
+    lambda d: d["evidence"].update(discovery_state_failures=3),
+    lambda d: d["evidence"]["discovery"][1].update(interfaces=0),
+    lambda d: d["evidence"]["surfaces"].pop(),
+    lambda d: d["evidence"]["discovery"][0].update(objects=[]),
+    lambda d: d["evidence"]["discovery"][0].update(objects=d["evidence"]["discovery"][1]["objects"]),
+    lambda d: next(item for item in d["functions"] if item["calls"]).update(calls=2),
+):
+    bad = copy.deepcopy(doc)
+    mutate(bad)
+    try:
+        validate(bad)
+    except AssertionError:
+        continue
+    raise AssertionError("nested export oracle accepted corrupted evidence")
+print("nested FunctionList/InterfaceList: exact evidence and mutations OK")
+PY
 echo "=== proxy stack: ALL OK ==="

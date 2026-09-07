@@ -4,6 +4,12 @@
 **Status:** Owner-stated requirements, captured verbatim in intent. This file is the
 authority for *what the owner wants*; plans and designs argue from it.
 **Owner:** Denis Mingulov
+**Owner amendment (2026-09-07):** Initial support for different target ABIs may
+be skipped; ia32 remains desirable follow-up work. The current release is
+x86-64 host/target. Run CI tests locally instead of requiring a hosted run.
+Execution, testing and privileged work are authorized; tagging, pushing and
+publication remain excluded. These decisions supersede the corresponding
+original scope and definition-of-done bullets below.
 **Supersedes for scope/priority:** the "Next order" list in
 `docs/superpowers/reports/2026-08-31-consolidation-status.md` (that list is now a
 subset of §3 below).

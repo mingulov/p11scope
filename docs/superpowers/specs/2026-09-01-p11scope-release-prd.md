@@ -3,6 +3,10 @@
 **Date:** 2026-09-01
 **Status:** Owner-approved product definition for the first public release.
 **Owner:** Denis Mingulov
+**Owner amendment (2026-09-07):** Different target ABIs, including ia32, may be
+deferred from the initial release. This release targets x86-64 processes on
+x86-64 hosts; other ABIs must be refused honestly. Run the CI tests locally;
+tagging, pushing and publication remain excluded from the current goal.
 **Authority relationships:** This PRD is the product-truth authority — *what ships
 and what it must be true of it*. The owner requirements spec
 (`2026-09-01-release-requirements-and-goal.md`) is the authority for *how the
@@ -159,8 +163,8 @@ kernel is *expected to work*, not *supported*.
   Fedora 44 (6.19, SELinux Enforcing) — all three **re-run at the release tip
   in W6/W8, never inherited** from the earlier candidates — plus the W6
   additions; a load-only CI kernel matrix backs the list.
-- **Host arch:** x86-64 only. **Target ABI:** 64-bit and 32-bit (ia32)
-  processes on x86-64 hosts (W7).
+- **Host arch and target ABI:** x86-64. ia32 and other target ABIs are deferred
+  by the 2026-09-07 owner amendment (W7 follow-up).
 - **Containers:** Docker (including older seccomp profiles that block
   `openat2`/`bpf()` — degraded honestly, with a shippable localhost seccomp
   profile), kind/Kubernetes, Knative — requalified on the release tip (W5
@@ -221,10 +225,11 @@ The requirements spec §6 definition of done, plus, in PRD terms:
 1. Every §5 finding and research issue closed with a test that fails without
    the fix; a full independent review + gap-analysis cycle returns zero
    accepted findings.
-2. Four canonical gates green on `main`; hosted CI runs the suite.
+2. Four canonical gates green on `main`; CI tests run locally under the
+   2026-09-07 owner amendment.
 3. Tier ladder implemented and documented; `doctor` reports degraded tiers.
 4. Container/K8s qualification rerun on the release tip; multi-distro/kernel
-   and ia32-target results recorded honestly.
+   results recorded honestly. ia32-target support is deferred.
 5. Proxy-stack lane qualified.
 6. All durable state in the two directories (`pkcs11-scope`, `p11scope-ws`);
    no tracked **executable or live-navigation** path depends on

@@ -23,6 +23,13 @@ but W7 still changes the uprobe read path afterwards — so W5/W6 results are
 *provisional*; the release evidence is W8's final-tip requalification set.
 Spec §3.3/§6 "on the release tip" is satisfied by W8, not by W5/W6.
 
+**Owner amendment (2026-09-07):** W7 is deferred from the initial release;
+different target ABIs are desirable follow-up work. The active sequence after
+W4 is W5 → W6 → W8 for x86-64 hosts and targets. Run CI tests locally; the
+hosted-only clauses below no longer block this goal. Privileged execution is
+authorized, while tagging, pushing and publication stay excluded. W8 still
+requires final-candidate qualification, review, receipt and verified bundle.
+
 ---
 
 ## W3 — Correctness residue {#w3}

@@ -295,9 +295,11 @@ END { clear(@next); clear(@active); clear(@loader); }
 EOF
         [ -s "$program" ] || return 1
     fi
+    # Predicates scope every probe. On the qualified Jammy bpftrace 0.14,
+    # adding -p loses loader hits; our own timeout and cleanup bound lifetime.
     launch_root_recorded_process "$root_pidfile" "$trace_log" \
         timeout --kill-after=2 --foreground -s INT 20 bpftrace -kk -q -B line \
-        -p "$fixture_pid" "$program" || {
+        "$program" || {
             trace_pid=${ROOT_LAUNCH_PID:-}
             trace_root_pid=${ROOT_PROCESS_PID:-}
             trace_root_starttime=${ROOT_PROCESS_STARTTIME:-}

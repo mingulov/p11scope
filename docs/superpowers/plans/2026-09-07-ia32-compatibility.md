@@ -26,14 +26,14 @@ report is retained under p11scope-ws/incoming/2026-09-07-abi-research.
 
 ## 1. Decisive compat-kernel gate
 
-- [ ] Add a bounded native32/64 fixture and ordinary-caller driver using
+- [x] Add a bounded native32/64 fixture and ordinary-caller driver using
   installed tracing tools. Exact known seven arguments, entry/return pairing,
   success/vendor RVs, execution mode, loader IP/state and x64 control.
-- [ ] Run an unprivileged checker self-test with rejected wrong arguments,
+- [x] Run an unprivileged checker self-test with rejected wrong arguments,
   wrong return normalization and missing returns. Review the actual script.
-- [ ] Run on host and an exact5.15 qualification guest; record tool/kernel
+- [x] Run on host and an exact5.15 qualification guest; record tool/kernel
   versions, stdout/stderr, process status, source hash and cleanup.
-- [ ] Include a timeout-bounded process-scoped ASLR/endbr32 XOL case where
+- [x] Include a timeout-bounded process-scoped ASLR/endbr32 XOL case where
   supported. Never change host-wide ASLR. Unsupported test prerequisites are
   non-PASS, with precise remaining question.
 - [ ] Follow the tracing-tool gate with the actual Aya producer/readers and
@@ -51,16 +51,16 @@ proxy C_GetFunctionList entry → SoftHSM entry → SoftHSM return → proxy ret
 Existing non-selection cookies encode only symbol ID, colliding in the BPF
 state key. Preserve the zero-loss oracle.
 
-- [ ] Shared checked cookie = object_id:u32 | context_case:u8 | hook_id:u24.
+- [x] Shared checked cookie = object_id:u32 | context_case:u8 | hook_id:u24.
   Keep full cookie as state identity and emit only decoded symbol ID.
-- [ ] Update both FunctionList and InterfaceList producer paths and planning;
+- [x] Update both FunctionList and InterfaceList producer paths and planning;
   preserve selection cookies/domain, deterministic retry and terminal replay.
-- [ ] Test boundaries, same-site reuse, distinct sites/contexts, start rollback
+- [x] Test boundaries, same-site reuse, distinct sites/contexts, start rollback
   and terminal exact-snapshot behavior. No new allocator or stack-frame ABI.
-- [ ] Rerun the real proxy oracle and a nested InterfaceList fixture; require
+- [x] Rerun the real proxy oracle and a nested InterfaceList fixture; require
   zero state/read/ring loss and exact table evidence. Same-site recursion is
   a separate pre-existing loss behavior, not claimed solved by this fix.
-- [ ] Four gates and independent review before integration.
+- [x] Four gates and independent review before integration.
 
 Owned coupled files for this patch: crates/ebpf-common/src/lib.rs,
 crates/ebpf/src/main.rs, src/discovery/engine.rs, tests/artifact_contracts.rs.
@@ -68,12 +68,12 @@ The kernel-gate writer owns only its two new script/fixture files.
 
 ## 3. Shared target-layout facts
 
-- [ ] In proxy-ng crates/module, retain native API behavior and the single
+- [x] In proxy-ng crates/module, retain native API behavior and the single
   field/version catalog. Add explicit Linux layout/ordinal/pointer operations.
 - [ ] Expose a dependency-free layout surface for no_std consumers using a
   small feature boundary; verify it in the separate BPF workspace before
   choosing the final organization. Do not import wire/backend policy.
-- [ ] C and Rust tests:104 fields,67/68/92/104 prefixes, truncated final words,
+- [x] C and Rust tests:104 fields,67/68/92/104 prefixes, truncated final words,
   interface stride, native API compatibility and unknown-version boundaries.
 - [ ] Local cross-repo commit/pin only after review; keep release source bundle
   self-contained until remote publication is authorized. No hidden path patch
@@ -143,3 +143,37 @@ loader paths are coherent. Keep low-level preparation independently testable.
 No static-only substitute, lost selection/loader behavior, silent unsafe
 fallback, weakened oracle or unrun qualifier may be called proper support.
 A failed prerequisite changes the next investigation, not the requested goal.
+
+## Prerequisite checkpoint (2026-09-07)
+
+The final kernel gate passed all four rows on host 7.0.0-30-generic with
+bpftrace 0.20.2 and guest 5.15.0-187-generic with bpftrace 0.14.0-1:
+native x64, invalid-user-read control, ia32 core and ia32 process-ASLR-disabled
+endbr32 stepping. Both runs used identical script/harness hashes; every
+fixture, bystander, tracer and cleanup status was zero. Exact seven arguments,
+RVs, selectors and ordinal loader states matched. Upper-word poisoning remains
+a synthetic checker negative, not a product-runtime result.
+
+Jammy required its matching bpftrace debug-symbol package before even a minimal
+BEGIN probe worked. Its redundant `-p` option also caused missing loader hits;
+removing only that option passed the unchanged oracle. Explicit PID predicates,
+bystander exclusion, timeout and cleanup remain. The precise bpftrace internal
+cause is unresolved; neither CPU pinning nor an END counter supported the
+initial transport hypothesis. No product ABI fallback was introduced.
+
+The real proxy plus direct nested FunctionList/InterfaceList runtime passed
+at 3b68e94 with zero discovery state/read/ring loss and exact two-provider table,
+interface and call evidence. All four Rust 1.88 gates passed at f069c4e (1,107 tests, zero failures or
+ignored tests). These results do not constitute final W7 or release qualification.
+
+Shared target facts are reviewed and locally committed in proxy-ng at
+cbf3d019c43cf424d92a5d2033c6714c9f866f65. Native and no-default-feature tests ran
+on x64 and i686; 49 inventory checks passed. An independent C-header comparison
+matched all 104 API-produced offsets and seven size/interface assertions for
+each Linux layout. Scope still pins a2aab6cd: unpublished-source restoration,
+actual BPF compilation and coherent observer integration remain next.
+
+Raw prerequisite evidence is retained under
+`p11scope-ws/incoming/2026-09-07-abi-qualification/`; module results under
+`incoming/2026-09-07-abi-research/`; proxy and canonical-gate results under
+`incoming/2026-09-07-release-local/`. These are prerequisite receipts, not W8.

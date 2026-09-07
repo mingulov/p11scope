@@ -21,7 +21,9 @@ Kubernetes, Knative, SoftHSM2 and p11-kit.
 
 - No push, tag or publication. Privileged/container testing is authorized.
 - Preserve `docs/privacy/allowlist-v1.md` and unrelated work.
-- Initial target ABI scope is x86-64; ABI feasibility research runs separately.
+- This baseline began under the earlier x86-64-only decision. The later owner
+  decision restores ia32; W7 and W8 requalification supersede this provisional
+  baseline. The recorded proxy failure remains a required fix.
 - One Cargo-heavy or runtime lane at a time; no daemon-wide cleanup.
 - Main baseline is `fe46b37a4a142729392494b6406004e6eafde401`. Existing `.codex`
   edits are unrelated. Runtime scripts consume a clean committed snapshot.

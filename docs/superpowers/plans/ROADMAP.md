@@ -651,13 +651,14 @@ founding rule).
 Publication (push, tag, release) is NOT a wave — it is an explicit owner
 decision after W8.
 
-**Owner amendment (2026-09-07):** Defer W7 and initial support for other target
-ABIs; release x86-64 host/target first. Continue W5 → W6 → W8 after W4, running
-CI tests locally. Execution and privileged testing are authorized. Tagging,
-pushing and publication remain excluded. This supersedes W7's position and
-hosted-only acceptance requirements above; final-candidate runtime evidence,
-review, receipt and bundle verification remain required. See the
-[local continuation report](../reports/2026-09-07-release-local-continuation.md).
+**Latest owner amendment (2026-09-07, after ABI research):** Proper ia32
+support is authorized, superseding the earlier same-day deferral. Run the
+compat-kernel gate and close the independently reproduced export-state
+collision, then W7 → W5 → W6 → W8. Existing W5 baseline evidence remains
+provisional. CI runs locally; privileged testing is authorized; no tagging,
+pushing or publication. Final-candidate review, runtime evidence, receipt and
+bundle verification remain required. See the
+[ia32 implementation plan](2026-09-07-ia32-compatibility.md).
 
 **W3 engineering gate: CLOSED AND LOCALLY INTEGRATED 2026-09-03.** The final production tip
 `ec5e0ae` passed the four Rust 1.88 gates with 1,072 tests and independent

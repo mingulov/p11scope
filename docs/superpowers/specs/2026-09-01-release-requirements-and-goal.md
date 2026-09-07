@@ -4,12 +4,13 @@
 **Status:** Owner-stated requirements, captured verbatim in intent. This file is the
 authority for *what the owner wants*; plans and designs argue from it.
 **Owner:** Denis Mingulov
-**Owner amendment (2026-09-07):** Initial support for different target ABIs may
-be skipped; ia32 remains desirable follow-up work. The current release is
-x86-64 host/target. Run CI tests locally instead of requiring a hosted run.
-Execution, testing and privileged work are authorized; tagging, pushing and
-publication remain excluded. These decisions supersede the corresponding
-original scope and definition-of-done bullets below.
+**Latest owner amendment (2026-09-07, after ABI research):** "for ia32
+compatbility - yes just support it properly (do that needed check etc)".
+This restores ia32 compatibility to the implementation scope and supersedes
+the earlier same-day deferral. Start with compat-kernel feasibility, then
+implement and qualify the coherent discovery/capture/lifecycle path. Run CI
+locally. Execution, testing and privileged work remain authorized; tagging,
+pushing and publication remain excluded.
 **Supersedes for scope/priority:** the "Next order" list in
 `docs/superpowers/reports/2026-08-31-consolidation-status.md` (that list is now a
 subset of §3 below).
@@ -149,7 +150,8 @@ The owner considers this finished when:
 - Every finding in §5 is closed with a test that fails without the fix.
 - A full independent review + gap-analysis cycle returns zero accepted findings.
 - All four canonical gates are green (`CLAUDE.md` §Checks) on `main`.
-- CI runs the suite hosted, not only locally.
+- CI suite runs locally under the 2026-09-07 owner amendment; hosted execution
+  is not required for this goal.
 - Container/Kubernetes qualification is rerun on the release tip.
 - Multi-distro/kernel and 32-bit-target results are recorded honestly (pass, fail, or
   UNRUN — never inherited).

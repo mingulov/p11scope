@@ -23,12 +23,12 @@ but W7 still changes the uprobe read path afterwards — so W5/W6 results are
 *provisional*; the release evidence is W8's final-tip requalification set.
 Spec §3.3/§6 "on the release tip" is satisfied by W8, not by W5/W6.
 
-**Owner amendment (2026-09-07):** W7 is deferred from the initial release;
-different target ABIs are desirable follow-up work. The active sequence after
-W4 is W5 → W6 → W8 for x86-64 hosts and targets. Run CI tests locally; the
-hosted-only clauses below no longer block this goal. Privileged execution is
-authorized, while tagging, pushing and publication stay excluded. W8 still
-requires final-candidate qualification, review, receipt and verified bundle.
+**Latest owner amendment (2026-09-07, after ABI research):** Proper ia32
+compatibility is authorized. Begin with a compat-kernel check, close the
+runtime-proven nested-provider export-state collision, then W7 → W5 → W6 → W8.
+The earlier same-day ia32 deferral is superseded. Run CI locally; privileged
+execution remains authorized; tagging, pushing and publication stay excluded.
+W8 requires exact final-candidate qualification, review, receipt and bundle.
 
 ---
 
@@ -280,71 +280,39 @@ statement updated in the same commit as the evidence.
 
 ---
 
-## W7 — ia32 targets on x86-64 {#w7}
+## W7 — Proper ia32 compatibility {#w7}
 
-**Objective:** observe a 32-bit target process on an x86-64 host (PRD §7
-minimum; item #2 / checklist 10).
+**Objective:** One x86-64 observer supports conventional Linux ia32 alongside
+LP64, with the existing discovery, capture, loader and exec behavior intact.
+The 2026-09-07 owner decision supersedes the earlier static-only minimum.
 
-**Scope (re-verified 2026-09-05 — the original wording understated the
-problem and overstated the machinery):** make the **target ABI**, not merely
-"pointer stride", a parameter of the uprobe path. Three things change on
-ia32, not one: (i) **argument fetch** — an ia32 cdecl callee takes arguments
-at `esp+4+4i`, not in `rdi..r9`, so `arg_u64` and the `ctx.arg::<u64>(n)`
-call sites are the largest break and are not `probe_read` sites at all;
-(ii) **width** — pointers *and* `CK_ULONG` are 4 bytes (`gcc -m32`:
-`sizeof(unsigned long)==4`), so there is no class of "ABI-independent
-`CK_ULONG`/handle/length" reads that stays 8-byte; (iii) **struct offsets** —
-`CK_FUNCTION_LIST`, `CK_INTERFACE`, `CK_MECHANISM`, `CK_ATTRIBUTE`,
-`CK_GCM_PARAMS`, `CK_RSA_PKCS_PSS_PARAMS`, and `r_debug` all shrink. The
-plan carries the authoritative per-site list split into MUST-parameterize
-and MUST-NOT-touch (`CK_VERSION` `[u8;2]`, `CK_BBOOL`, `probe_read_user_str`
-byte reads, `ctx.ret()`, the tracepoints, and the `pid_tgid`/cookie keying
-all stay).
+**Plan:** [2026-09-07-ia32-compatibility.md](2026-09-07-ia32-compatibility.md).
+Start with the executable compat-kernel gate. Validate ELF class + machine +
+byte order from pinned object identity; do not admit x32 as ia32. Reuse shared
+PKCS#11 catalogs and introduce target-sized readers throughout scan, exact
+selection rereads, export probes, scalar/structure decoding and helper builds.
+Normalize return values before their use in every accounting path.
 
-Determine ABI from the **pinned object's ELF class at plan/attach time**
-(`crates/manifest/src/elf.rs::parse` already computes `is_64()` — and today
-*refuses* anything else) and carry it in the **attach cookie**; the static
-cookie is `slot | descriptor<<32` with descriptor < 105, so bits 39-63 are
-free. **No per-TGID map, no exec-time cache, no kernel-struct read** — the
-charter's original "cache per-TGID" is unbuildable as written (`PID_FILTER`
-is `RDONLY_PROG` and its value is an exactly-read-back generation token) and
-unnecessary, since the dynamic loader refuses mixed-class objects, making ABI
-a property of the attached object. Avoiding a `task_struct` read also keeps
-BTF independence. `in_ia32_syscall()` remains correctly ruled out
-(checklist 10) and is moot — no BPF helper exposes it.
+Prefer checked per-hit execution-mode dispatch using the host probe register
+context if qualified; use shared-source program specialization only if measured
+verifier constraints require it. Do not add an ABI flag indiscriminately to
+cookie domains. Unknown execution-mode selectors authorize no ABI-dependent
+reads; define and test supported selectors and document PARAVIRT exceptions.
+No mutable per-PID ABI cache is required. Preserve existing
+context identity, exact provenance, bounded work and privacy allowlists.
 
-**Delete from scope:** "parse maps addresses width-agnostically" — already
-true (`crates/manifest/src/maps.rs` uses `u64::from_str_radix`, verified
-against a real 32-bit process's `/proc/<pid>/maps`). Replace with a test row
-feeding a 32-bit maps snapshot through `parse_maps`.
+Both loader interpreter parsers and state addressing are in scope. Preserve
+owned startup, late loads, mixed-ABI cgroups, exec transitions, retirement,
+terminal draining and selection semantics. Include existing optional diagnostic
+layouts and same-bitness glibc/musl discovery helpers in the implementation
+closure; any unavailable qualification is recorded explicitly, never silently
+converted into reduced support.
 
-**W7 is NOT a BPF-only wave.** `elf.rs::parse` refuses non-64-bit objects and
-the `/proc/<pid>/mem` scan hard-codes `WORD=8` / `INTERFACE_BYTES=24`, so
-live discovery is in scope too. The 64-bit `p11scope-discover` helper cannot
-`dlopen` an ELFCLASS32 provider and stays refused-with-reason unless an i686
-build is owner-approved.
-
-Honest refusal reuses the existing `Skipped { subject, reason }` →
-`modules_skipped` → `PARTIAL` path (a 32-bit module already lands there).
-Fix the one silent-wrong spot: `src/run.rs` refuses a 32-bit ELF launch as
-*"must be an ELF executable"* rather than as *32-bit*.
-
-**Owner decision needed — "observe" is undefined and the deferral wording is
-self-contradictory:** feature-slices calls the deferred item "32-bit counting
-mode (full ia32 capture …)", but in this codebase counting/aggregate is the
-*least* demanding mode (`p11_entry_impl` returns before any user read) while
-full capture is the most. **Default adopted for planning, pullable by the
-owner:** observe = metrics/aggregate + allowlisted profile scalars
-(session/slot/flags/mechanism/rv); `unsafe-unvalidated-metadata` templates
-and params, and the ia32 loader hook, are refused-with-reason and force
-`PARTIAL`. Correct the feature-slices wording in the same commit.
-
-**Owner-gated:** the privileged 32-bit e2e lane (uprobe attach needs root —
-CLAUDE.md; unprivileged development rows run, the privileged lane is UNRUN
-until approved).
-
-**Exit evidence:** an e2e lane with a 32-bit SoftHSM (or fixture) target on
-x86-64, capture verified against the oracle; documented scope statement.
+**Exit evidence:** independently checked C layouts and bounded readers; actual
+ia32+x64 Aya producer/verifier tests on floor kernels; end-to-end counts,
+return values, metadata canaries, live selection/loader/lifecycle fixtures;
+helper compatibility; four Rust gates and review-to-zero. W8 repeats the final
+tip. The compat bpftrace gate alone does not establish product qualification.
 
 ---
 
@@ -361,9 +329,9 @@ literal capture binding from W1 T7/T8 now enforced); README/usage truth pass
 finalized; refreshed portable bundle + evidence archive into `p11scope-ws`
 with adjacent checksum; final program-wide review-to-zero (fresh agents, full
 diff since W1's base); the PRD §9 acceptance table filled in with evidence
-pointers, one row per criterion (including the W4 hosted-CI row — UNMET
-blocks closure absent an owner DoD amendment); tag-ready bundle staged
-locally.
+pointers, one row per criterion (the W4 suite runs locally under the
+2026-09-07 owner amendment; hosted execution is not a closure blocker);
+tag-ready bundle staged locally.
 
 **Owner-gated:** the privileged + container Lane 14 receipt run
 (`build-release.sh` hard-requires `sudo -n` and docker — CLAUDE.md) and every

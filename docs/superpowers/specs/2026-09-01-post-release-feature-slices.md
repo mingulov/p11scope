@@ -46,7 +46,7 @@ Deepens what a capture can express; no structural change.
 | `uprobe_multi` attach optimization | A stable Aya release exposes multi program load, managed attach/link ownership, and the process-scoped PID-filter probe; retain Linux 5.15 per-offset fallback |
 | Raw-tracepoint exec/exit variants (same object, 12→14 programs) | v0.1.0 shipped. Buys tracefs independence + offset-drift immunity, but sells a BTF/CO-RE dependency — keep BOTH variants in one object; never lose the BTF-independence currently held for free (research #12; owner note 2026-08-31) |
 | AArch64 host support | First real user ask, or owner decision |
-| ia32 target observation and other target ABIs (W7; deferred from the initial release by the owner on 2026-09-07) | Review the ABI design and establish demand after the x86-64 release |
+| Other target ABIs beyond Linux LP64/ia32 | Establish demand and qualify each ABI separately; the latest 2026-09-07 owner decision moved proper ia32 support into W7 for this release |
 | Freezer-cgroup pause | Pause-path evidence shows SIGSTOP insufficient |
 | Manifest catalog (known-provider manifests) | Recurring operator demand for offline path |
 | Container image + K8s manifests as shipped artifacts | Post-release; W5 qualification report is the v0.1.0 substitute |

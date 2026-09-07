@@ -3,10 +3,12 @@
 **Date:** 2026-09-01
 **Status:** Owner-approved product definition for the first public release.
 **Owner:** Denis Mingulov
-**Owner amendment (2026-09-07):** Different target ABIs, including ia32, may be
-deferred from the initial release. This release targets x86-64 processes on
-x86-64 hosts; other ABIs must be refused honestly. Run the CI tests locally;
-tagging, pushing and publication remain excluded from the current goal.
+**Latest owner amendment (2026-09-07, after ABI research):** Implement proper
+ia32 compatibility on x86-64 hosts, beginning with the necessary compat-kernel
+check. This supersedes the earlier same-day permission to defer ia32. Preserve
+full discovery and lifecycle behavior; ELF32 admission alone is insufficient.
+Other architectures/ABIs remain outside this change. Run CI locally; tagging,
+pushing and publication remain excluded.
 **Authority relationships:** This PRD is the product-truth authority — *what ships
 and what it must be true of it*. The owner requirements spec
 (`2026-09-01-release-requirements-and-goal.md`) is the authority for *how the
@@ -163,8 +165,9 @@ kernel is *expected to work*, not *supported*.
   Fedora 44 (6.19, SELinux Enforcing) — all three **re-run at the release tip
   in W6/W8, never inherited** from the earlier candidates — plus the W6
   additions; a load-only CI kernel matrix backs the list.
-- **Host arch and target ABI:** x86-64. ia32 and other target ABIs are deferred
-  by the 2026-09-07 owner amendment (W7 follow-up).
+- **Host arch:** x86-64. **Target ABIs:** Linux LP64 and conventional ia32
+  ILP32, qualified through W7 and repeated on the final tip. x32 and foreign
+  ELF class/machine/byte-order combinations remain explicitly unsupported.
 - **Containers:** Docker (including older seccomp profiles that block
   `openat2`/`bpf()` — degraded honestly, with a shippable localhost seccomp
   profile), kind/Kubernetes, Knative — requalified on the release tip (W5
@@ -229,7 +232,7 @@ The requirements spec §6 definition of done, plus, in PRD terms:
    2026-09-07 owner amendment.
 3. Tier ladder implemented and documented; `doctor` reports degraded tiers.
 4. Container/K8s qualification rerun on the release tip; multi-distro/kernel
-   results recorded honestly. ia32-target support is deferred.
+   results recorded honestly, including qualified ia32-target support.
 5. Proxy-stack lane qualified.
 6. All durable state in the two directories (`pkcs11-scope`, `p11scope-ws`);
    no tracked **executable or live-navigation** path depends on

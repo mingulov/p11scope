@@ -464,10 +464,12 @@ impl OwnedChild {
                 "owned command must be a regular executable file",
             ));
         }
-        if ElfSnapshot::read(&launch_file).is_err() {
+        if let Err(error) = ElfSnapshot::read(&launch_file) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "owned command must be an ELF executable; invoke scripts through an interpreter",
+                format!(
+                    "owned command must be an ELF executable: {error}; invoke scripts through an interpreter"
+                ),
             ));
         }
         let prepared = PreparedExecutable::resolve(resolved.as_os_str())
@@ -3142,6 +3144,42 @@ mod tests {
             signalled.wait_for(None, false).unwrap(),
             ChildOutcome::Exited(128 + libc::SIGTERM)
         );
+    }
+
+    #[test]
+    fn owned_child_launch_errors_preserve_elf_reason_and_script_guidance() {
+        let directory = tempfile::tempdir().unwrap();
+        let elf32 = [
+            0x7f, b'E', b'L', b'F', 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 3, 0, 1, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 52, 0, 32, 0, 0, 0, 40, 0, 0, 0, 0, 0,
+        ];
+        for (name, bytes) in [
+            ("elf32", elf32.as_slice()),
+            ("malformed-elf", b"\x7fELF".as_slice()),
+            ("script", b"#!/bin/sh\nexit 0\n".as_slice()),
+        ] {
+            let command = directory.path().join(name);
+            std::fs::write(&command, bytes).unwrap();
+            std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let reason = ElfSnapshot::read(&File::open(&command).unwrap()).unwrap_err();
+            if name == "elf32" {
+                assert!(reason.contains("architecture I386"), "{reason}");
+            }
+
+            let error = OwnedChild::spawn(command.into_os_string(), Vec::new())
+                .err()
+                .expect("unsupported executable must be refused before fork");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains(&reason), "{name}: {error}");
+            if name == "script" {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("invoke scripts through an interpreter"),
+                    "{error}"
+                );
+            }
+        }
     }
 
     #[test]

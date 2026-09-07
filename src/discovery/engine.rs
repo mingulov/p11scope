@@ -31,7 +31,8 @@ use p11scope_ebpf_common::{
     DISCOVERY_NAME_NULL, DISCOVERY_NAME_OTHER, DISCOVERY_NAME_UNREADABLE,
     DISCOVERY_STATUS_LOADER_CONTEXT_INVALID, DISCOVERY_VERSION_NULL, DISCOVERY_VERSION_OTHER,
     DISCOVERY_VERSION_UNREADABLE, DISCOVERY_VERSION_V2_40, DISCOVERY_VERSION_V3_0,
-    DISCOVERY_VERSION_V3_1, DISCOVERY_VERSION_V3_2, DiscoveryRecord, valid_discovery_record,
+    DISCOVERY_VERSION_V3_1, DISCOVERY_VERSION_V3_2, DiscoveryRecord, export_attach_cookie,
+    valid_discovery_record,
 };
 use p11scope_manifest::elf::ElfSnapshot;
 use p11scope_manifest::manifest::{
@@ -8924,9 +8925,21 @@ impl Engine {
                 } else {
                     None
                 };
-                let cookie = selection_binding
-                    .map(|binding| binding.id)
-                    .unwrap_or(u64::from(hook_id));
+                let cookie = if let Some(binding) = selection_binding {
+                    binding.id
+                } else {
+                    let context_case_id = (context.get() - 1) as u8;
+                    let Some(cookie) = export_attach_cookie(object.0, context_case_id, hook_id)
+                    else {
+                        collected.required_seed_complete = false;
+                        self.mark_partial(
+                            "live export hook",
+                            "an export hook identity did not fit the checked attachment cookie",
+                        );
+                        continue;
+                    };
+                    cookie
+                };
                 collected.dynamic.push(DynamicExportWork {
                     context,
                     module: timing_key.clone(),
@@ -17440,13 +17453,30 @@ int main(int argc, char **argv) {
         assert_eq!(contexts.len(), 1);
         assert_ne!(contexts[0], retired);
         assert_eq!(session.dynamic_attach_calls.len(), 3);
+        let context_case_id = (contexts[0].get() - 1) as u8;
         assert_eq!(
             session
                 .dynamic_attach_calls
                 .iter()
+                .filter(|export| export.abi != HookAbi::Interface)
                 .map(|export| export.cookie)
                 .collect::<BTreeSet<_>>(),
-            [1, 2].into_iter().collect(),
+            [
+                export_attach_cookie(
+                    session.dynamic_attach_calls[0].object.0,
+                    context_case_id,
+                    engine.hooks.id("C_GetFunctionList").unwrap(),
+                )
+                .unwrap(),
+                export_attach_cookie(
+                    session.dynamic_attach_calls[0].object.0,
+                    context_case_id,
+                    engine.hooks.id("C_GetInterfaceList").unwrap(),
+                )
+                .unwrap(),
+            ]
+            .into_iter()
+            .collect(),
             "readiness requires all configured exports from the refreshed provider"
         );
     }
@@ -17474,12 +17504,15 @@ int main(int argc, char **argv) {
             session
                 .dynamic_attach_calls
                 .iter()
+                .filter(|export| export.abi != HookAbi::Interface)
                 .map(|export| export.cookie)
-                .collect::<BTreeSet<_>>(),
-            [1, 2].into_iter().collect()
+                .collect::<BTreeSet<_>>()
+                .len(),
+            2
         );
         assert_eq!(engine.selection_bindings.len(), 1);
         assert!(engine.selection_bindings[&1].attached);
+        let context_case_id = (engine.selection_bindings[&1].context.get() - 1) as u8;
         assert_eq!(
             session
                 .dynamic_attach_calls
@@ -17487,7 +17520,12 @@ int main(int argc, char **argv) {
                 .find(|export| export.abi == HookAbi::FunctionList)
                 .unwrap()
                 .cookie,
-            u64::from(engine.hooks.id("C_GetFunctionList").unwrap())
+            export_attach_cookie(
+                engine.selection_bindings[&1].object.0,
+                context_case_id,
+                engine.hooks.id("C_GetFunctionList").unwrap(),
+            )
+            .unwrap()
         );
         assert_eq!(
             session
@@ -17496,7 +17534,12 @@ int main(int argc, char **argv) {
                 .find(|export| export.abi == HookAbi::InterfaceList)
                 .unwrap()
                 .cookie,
-            u64::from(engine.hooks.id("C_GetInterfaceList").unwrap())
+            export_attach_cookie(
+                engine.selection_bindings[&1].object.0,
+                context_case_id,
+                engine.hooks.id("C_GetInterfaceList").unwrap(),
+            )
+            .unwrap()
         );
         assert_eq!(
             session
@@ -20171,6 +20214,23 @@ int main(int argc, char **argv) {
         assert_eq!(collected.count_only_seeds[0].object_path, module.path);
         assert_eq!(collected.dynamic.len(), 1);
         assert_eq!(collected.dynamic[0].object, object);
+        let cookie = collected.dynamic[0].cookie;
+        assert_eq!(cookie >> 32, u64::from(object.0));
+        assert_eq!((cookie >> 24) as u8, 0);
+        assert_eq!(
+            cookie as u32 & 0x00ff_ffff,
+            engine.hooks.id("C_GetFunctionList").unwrap()
+        );
+        let other_context = engine.collect_dynamic_export_work(
+            LoaderContextId::from_case_id(1),
+            std::slice::from_ref(&module),
+            &candidate.pinned,
+            &ScriptedSession::default(),
+            false,
+            &[],
+        );
+        assert_eq!((other_context.dynamic[0].cookie >> 24) as u8, 1);
+        assert_ne!(other_context.dynamic[0].cookie, cookie);
         assert!(
             candidate
                 .plan
@@ -20733,7 +20793,7 @@ int main(int argc, char **argv) {
         let exact = crate::attach::DynamicExportIdentity {
             object,
             file_offset: 0x10,
-            cookie: 1,
+            cookie: export_attach_cookie(object.0, (context.get() - 1) as u8, 1).unwrap(),
             abi: HookAbi::FunctionList,
         };
         let snapshot = vec![exact];

@@ -5009,6 +5009,7 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_owned_child_only() {
 #[test]
 fn live_discovery_bpf_classification_is_exact_and_output_only() {
     let source = read("crates/ebpf/src/main.rs");
+    let engine = read("src/discovery/engine.rs");
     let classifier = between(
         &source,
         "fn classify_direct_interface(",
@@ -5023,6 +5024,35 @@ fn live_discovery_bpf_classification_is_exact_and_output_only() {
         "interface classification must require the exact eight-byte string"
     );
 
+    let export_symbol = between(
+        &source,
+        "fn export_symbol_id(cookie: u64)",
+        "fn export_state_key<",
+    );
+    assert!(export_symbol.contains("decode_export_attach_cookie(cookie)?"));
+    assert!(!export_symbol.contains("as u32"));
+    let export_key = between(&source, "fn export_state_key<", "fn insert_export_state(");
+    assert_eq!(export_key.matches("bpf_get_attach_cookie").count(), 1);
+    assert!(export_key.contains("export_symbol_id(attach_cookie)?"));
+    assert!(export_key.contains("attach_cookie,"));
+    let export_planning = between(
+        &engine,
+        "let cookie = if let Some(binding) = selection_binding",
+        "collected.dynamic.push(DynamicExportWork",
+    );
+    assert!(export_planning.contains("export_attach_cookie(object.0, context_case_id, hook_id)"));
+    assert!(export_planning.contains("collected.required_seed_complete = false"));
+    assert!(export_planning.contains("self.mark_partial("));
+    assert!(!export_planning.contains("unwrap_or(u64::from(hook_id))"));
+
+    let function_return = between(
+        &source,
+        "pub fn function_list_return(ctx: RetProbeContext) -> u32 {",
+        "#[uprobe]\npub fn interface_list_entry",
+    );
+    assert!(function_return.contains("export_symbol_id(key.attach_cookie)"));
+    assert!(!function_return.contains("key.attach_cookie as u32"));
+
     let listed = between(
         &source,
         "pub fn interface_list_return(ctx: RetProbeContext) -> u32 {",
@@ -5036,6 +5066,7 @@ fn live_discovery_bpf_classification_is_exact_and_output_only() {
         "if state.arg0 == 0",
         "checked_add((active_count - 1) * 24)",
         "interface_continuation_pack(count, 0, symbol_id)",
+        "export_symbol_id(entry_key.attach_cookie)",
         "take_export_state(&ctx, scope.is_some())",
         "StateKey {",
         "attach_cookie: 0",

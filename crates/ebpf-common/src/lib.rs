@@ -28,6 +28,30 @@ pub const fn cookie_descriptor(cookie: u64) -> u32 {
     (cookie >> 32) as u32
 }
 
+const EXPORT_HOOK_ID_MASK: u32 = 0x00ff_ffff;
+
+/// Encode one dynamic export attachment identity. Object and loader context
+/// distinguish equal export sites; the low 24 bits remain the emitted hook id.
+pub const fn export_attach_cookie(
+    object_id: u32,
+    context_case_id: u8,
+    hook_id: u32,
+) -> Option<u64> {
+    if hook_id == 0 || hook_id > EXPORT_HOOK_ID_MASK {
+        return None;
+    }
+    Some(((object_id as u64) << 32) | ((context_case_id as u64) << 24) | hook_id as u64)
+}
+
+/// Decode only a valid dynamic export attachment identity.
+pub const fn decode_export_attach_cookie(cookie: u64) -> Option<(u32, u8, u32)> {
+    let hook_id = cookie as u32 & EXPORT_HOOK_ID_MASK;
+    if hook_id == 0 {
+        return None;
+    }
+    Some(((cookie >> 32) as u32, (cookie >> 24) as u8, hook_id))
+}
+
 /// No argument is captured for this descriptor field.
 pub const ARG_NONE: u8 = u8::MAX;
 
@@ -1631,6 +1655,43 @@ mod tests {
             ..export
         };
         assert_ne!(export, selection);
+    }
+
+    #[test]
+    fn export_cookies_separate_state_owners_and_preserve_the_hook_id() {
+        let first = export_attach_cookie(7, 0, 0x00ab_cdef).unwrap();
+        let other_object = export_attach_cookie(8, 0, 0x00ab_cdef).unwrap();
+        let other_context = export_attach_cookie(7, 1, 0x00ab_cdef).unwrap();
+        assert_eq!(
+            decode_export_attach_cookie(first),
+            Some((7, 0, 0x00ab_cdef))
+        );
+        assert_ne!(first, other_object);
+        assert_ne!(first, other_context);
+        let key = |attach_cookie| StateKey {
+            pid_tgid: 9,
+            attach_cookie,
+            domain: STATE_DOMAIN_EXPORT,
+        };
+        assert_ne!(key(first), key(other_object));
+        assert_ne!(key(first), key(other_context));
+        assert_eq!(
+            export_attach_cookie(0, u8::MAX, 1),
+            Some(0x0000_0000_ff00_0001)
+        );
+        assert_eq!(
+            export_attach_cookie(u32::MAX, u8::MAX, 0x00ff_ffff),
+            Some(u64::MAX)
+        );
+        assert_eq!(export_attach_cookie(7, 0, 0), None);
+        assert_eq!(export_attach_cookie(7, 0, 0x0100_0000), None);
+        assert_eq!(decode_export_attach_cookie(0), None);
+        assert_eq!(decode_export_attach_cookie(1u64 << 32), None);
+        let (_, _, symbol_id) = decode_export_attach_cookie(first).unwrap();
+        assert_eq!(
+            interface_continuation_unpack(interface_continuation_pack(1, 0, symbol_id).unwrap()),
+            Some((1, 0, 0x00ab_cdef))
+        );
     }
 
     /// Mutation caught: a producer-owned field, finite status, prefix bound,

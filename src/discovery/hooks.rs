@@ -86,7 +86,8 @@ impl HookRegistry {
             .map(|(_, abi)| *abi)
     }
 
-    /// Stable one-based symbol identifier used as the export attach cookie.
+    /// Stable one-based symbol identifier. The dynamic export cookie encoder
+    /// accepts it only when it fits the cookie's low 24-bit field.
     pub fn id(&self, name: &str) -> Option<u32> {
         self.entries
             .iter()
@@ -99,10 +100,6 @@ impl HookRegistry {
         self.entries
             .get(position)
             .map(|(name, abi)| (name.as_str(), *abi))
-    }
-
-    pub fn export_cookie(&self, name: &str) -> Option<u64> {
-        self.id(name).map(u64::from)
     }
 }
 
@@ -172,7 +169,7 @@ mod tests {
     }
 
     /// Mutation caught: rebuilding IDs from the current ABI or vector length
-    /// changes an existing export cookie when a duplicate is replaced.
+    /// changes an existing symbol identifier when a duplicate is replaced.
     #[test]
     fn ids_are_one_based_stable_and_duplicates_keep_their_id() {
         let mut r = HookRegistry::builtin();
@@ -180,7 +177,6 @@ mod tests {
             let id = (position + 1) as u32;
             assert_eq!(r.id(name), Some(id));
             assert_eq!(r.by_id(id), Some((*name, *abi)));
-            assert_eq!(r.export_cookie(name), Some(u64::from(id)));
         }
         assert_eq!(r.by_id(0), None);
 

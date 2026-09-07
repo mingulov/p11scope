@@ -17,8 +17,8 @@ use aya_ebpf::{helpers, EbpfContext as _};
 use core::mem::MaybeUninit;
 use p11scope_ebpf_common::{
     bucket_of, capture, cookie_descriptor, cookie_slot, discovery_pause_coalesced,
-    discovery_pause_enabled, discovery_state_take_failed, discovery_state_take_scope_lost,
-    classify_task_newtask, discovery_table_slots,
+    decode_export_attach_cookie, discovery_pause_enabled, discovery_state_take_failed,
+    discovery_state_take_scope_lost, classify_task_newtask, discovery_table_slots,
     discovery_usable_prefix, event_type, interface_continuation_next,
     interface_continuation_pack, interface_continuation_unpack, lifecycle,
     return_allows_mechanism, shape, valid_config, valid_loader_cookie, CallStart, DiscoveryRecord,
@@ -752,17 +752,17 @@ fn classify_export(args: &ExportArgs, scope: &ScopeAuth) {
     }
 }
 
-fn export_symbol_id<C: aya_ebpf::EbpfContext>(ctx: &C) -> Option<u32> {
-    let cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
-    let symbol_id = u32::try_from(cookie).ok()?;
-    (symbol_id != 0).then_some(symbol_id)
+fn export_symbol_id(cookie: u64) -> Option<u32> {
+    let (_, _, symbol_id) = decode_export_attach_cookie(cookie)?;
+    Some(symbol_id)
 }
 
 fn export_state_key<C: aya_ebpf::EbpfContext>(ctx: &C) -> Option<StateKey> {
-    export_symbol_id(ctx)?;
+    let attach_cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
+    export_symbol_id(attach_cookie)?;
     Some(StateKey {
         pid_tgid: helpers::bpf_get_current_pid_tgid(),
-        attach_cookie: unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) },
+        attach_cookie,
         domain: STATE_DOMAIN_EXPORT,
     })
 }
@@ -923,12 +923,16 @@ pub fn function_list_return(ctx: RetProbeContext) -> u32 {
     };
     let rv: u64 = ctx.ret();
     if rv == 0 {
+        let Some(symbol_id) = export_symbol_id(key.attach_cookie) else {
+            bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_STATE_FAILURES);
+            return 0;
+        };
         classify_export(
             &ExportArgs {
                 kind: DISCOVERY_KIND_FUNCTION_LIST_RETURN,
                 source: EXPORT_SOURCE_FUNCTION_LIST,
                 interface_index: 0,
-                symbol_id: key.attach_cookie as u32,
+                symbol_id,
                 announced_count: 0,
                 address: state.arg0,
             },
@@ -983,7 +987,10 @@ pub fn interface_list_return(ctx: RetProbeContext) -> u32 {
         bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES);
         return 0;
     }
-    let symbol_id = entry_key.attach_cookie as u32;
+    let Some(symbol_id) = export_symbol_id(entry_key.attach_cookie) else {
+        bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_STATE_FAILURES);
+        return 0;
+    };
     let Some(packed) = interface_continuation_pack(count, 0, symbol_id) else {
         bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_STATE_FAILURES);
         return 0;

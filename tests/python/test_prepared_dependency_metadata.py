@@ -379,6 +379,12 @@ class PreparedDependencyMetadataTests(unittest.TestCase):
         malformed_kinds = self.fixture.metadata()
         malformed_kinds["resolve"]["nodes"][-1]["deps"][0]["dep_kinds"] = "normal"
         cases.append(("dep-kinds", malformed_kinds, "dep_kinds"))
+        missing_source = self.fixture.metadata()
+        del missing_source["packages"][0]["source"]
+        cases.append(("source", missing_source, "source has invalid type"))
+        malformed_features = self.fixture.metadata()
+        malformed_features["resolve"]["nodes"][-1]["features"] = ["one", "one"]
+        cases.append(("features", malformed_features, "features contain invalid or duplicate"))
         for label, metadata, needle in cases:
             with self.subTest(label=label):
                 root = self.fixture.write_metadata(f"malformed-{label}.json", metadata)

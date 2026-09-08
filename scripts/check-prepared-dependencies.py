@@ -40,7 +40,7 @@ def _absolute_path(value: object, workspace: str, field: str) -> Path:
     return Path(value).resolve()
 
 
-def _graph(metadata: dict, workspace: str, expected_root: Path) -> tuple[dict[str, dict], set[str]]:
+def _graph(metadata: dict, workspace: str, expected_root: Path) -> tuple[dict[str, dict], set[str], dict]:
     format_version = metadata.get("version")
     if isinstance(format_version, bool) or not isinstance(format_version, int) or format_version != 1:
         raise MetadataError(f"workspace {workspace}: Cargo metadata format version must be integer 1")
@@ -69,6 +69,10 @@ def _graph(metadata: dict, workspace: str, expected_root: Path) -> tuple[dict[st
             if not isinstance(package.get(field), str) or not package[field]:
                 raise MetadataError(f"workspace {workspace}: package {package_id}: missing {field}")
         _absolute_path(package["manifest_path"], workspace, f"package {package_id} manifest_path")
+        if "source" not in package or (
+            package["source"] is not None and not isinstance(package["source"], str)
+        ):
+            raise MetadataError(f"workspace {workspace}: package {package_id}: source has invalid type")
         if not isinstance(package.get("dependencies"), list) or not isinstance(package.get("features"), dict):
             raise MetadataError(
                 f"workspace {workspace}: package {package_id}: dependencies/features have invalid types"
@@ -76,6 +80,7 @@ def _graph(metadata: dict, workspace: str, expected_root: Path) -> tuple[dict[st
         packages[package_id] = package
 
     nodes: dict[str, list[str]] = {}
+    node_details: dict[str, dict] = {}
     for node in nodes_value:
         if not isinstance(node, dict) or not isinstance(node.get("id"), str):
             raise MetadataError(f"workspace {workspace}: malformed resolve node")
@@ -88,6 +93,8 @@ def _graph(metadata: dict, workspace: str, expected_root: Path) -> tuple[dict[st
             or not isinstance(node.get("features"), list)
         ):
             raise MetadataError(f"workspace {workspace}: package {node_id}: incomplete or duplicate resolve node")
+        if any(not isinstance(feature, str) for feature in node["features"]) or len(set(node["features"])) != len(node["features"]):
+            raise MetadataError(f"workspace {workspace}: package {node_id}: features contain invalid or duplicate values")
         manifest_path = packages.get(node_id, {}).get("manifest_path", "unknown path")
         if any(not isinstance(dependency_id, str) or not dependency_id for dependency_id in legacy_dependencies):
             raise MetadataError(
@@ -152,6 +159,22 @@ def _graph(metadata: dict, workspace: str, expected_root: Path) -> tuple[dict[st
                 f"workspace {workspace}: package {node_id} at {manifest_path}: dependency id sets differ: {difference}"
             )
         nodes[node_id] = dependencies
+        node_details[node_id] = {
+            "features": sorted(node["features"]),
+            "edges": [
+                {
+                    "name": name,
+                    "pkg": package_id,
+                    "dep_kinds": [
+                        {"kind": kind, "target": target} for kind, target in kinds
+                    ],
+                }
+                for name, package_id, kinds in sorted(
+                    structured_edges,
+                    key=lambda edge: json.dumps(edge, sort_keys=True),
+                )
+            ],
+        }
     if set(nodes) != set(packages):
         missing = sorted(set(packages) ^ set(nodes))
         raise MetadataError(f"workspace {workspace}: incomplete resolve/package identity set: {missing}")
@@ -191,7 +214,22 @@ def _graph(metadata: dict, workspace: str, expected_root: Path) -> tuple[dict[st
                     f"workspace {workspace}: package {package_id}: dependency id {dependency_id} is absent"
                 )
             pending.append(dependency_id)
-    return packages, reachable
+    snapshot = {
+        "workspace_members": sorted(members),
+        "packages": [
+            {
+                "id": package_id,
+                "name": packages[package_id]["name"],
+                "version": packages[package_id]["version"],
+                "source": packages[package_id].get("source"),
+                "manifest_path": str(Path(packages[package_id]["manifest_path"]).resolve()),
+                "features": node_details[package_id]["features"],
+                "edges": node_details[package_id]["edges"],
+            }
+            for package_id in sorted(reachable)
+        ],
+    }
+    return packages, reachable, snapshot
 
 
 def _manifest_contexts(values: list[str], expected: list[str]) -> dict[str, Path]:
@@ -212,7 +250,7 @@ def _manifest_contexts(values: list[str], expected: list[str]) -> dict[str, Path
     return contexts
 
 
-def verify(root: Path, sources: Path, metadata_values: list[str]) -> list[tuple[str, str]]:
+def verify_details(root: Path, sources: Path, metadata_values: list[str]) -> dict:
     expected_sources = (root / "third-party" / "sources.json").resolve()
     if sources.resolve() != expected_sources:
         raise MetadataError(f"--sources must name exact repository manifest {expected_sources}")
@@ -237,11 +275,18 @@ def verify(root: Path, sources: Path, metadata_values: list[str]) -> list[tuple[
                 )
             expected_mappings.add(mapping)
     selected_records = set()
+    graph_snapshots = {}
+    workspace_member_manifests = set()
 
     for workspace in manifest["workspace_manifests"]:
         metadata = _read_metadata(contexts[workspace], workspace)
         workspace_manifest = (root / workspace).resolve()
-        packages, reachable = _graph(metadata, workspace, workspace_manifest.parent)
+        packages, reachable, graph_snapshot = _graph(metadata, workspace, workspace_manifest.parent)
+        graph_snapshots[workspace] = graph_snapshot
+        workspace_member_manifests.update(
+            str(Path(packages[member]["manifest_path"]).resolve())
+            for member in graph_snapshot["workspace_members"]
+        )
         applicable = [record for record in manifest["packages"] if workspace in record["applies_to"]]
         expected_paths = {
             (root / "third-party" / "src" / preparer.output_name(record) / "Cargo.toml").resolve(): record
@@ -300,7 +345,16 @@ def verify(root: Path, sources: Path, metadata_values: list[str]) -> list[tuple[
             prior = ledger.setdefault(repository_relative, digest)
             if prior != digest:
                 raise MetadataError(f"ledger path collision for {repository_relative}")
-    return sorted(ledger.items(), key=lambda item: item[0].encode("utf-8"))
+    return {
+        "ledger": sorted(ledger.items(), key=lambda item: item[0].encode("utf-8")),
+        "graphs": graph_snapshots,
+        "workspace_member_manifests": sorted(workspace_member_manifests),
+        "selected_records": sorted(selected_records),
+    }
+
+
+def verify(root: Path, sources: Path, metadata_values: list[str]) -> list[tuple[str, str]]:
+    return verify_details(root, sources, metadata_values)["ledger"]
 
 
 def main(arguments: list[str] | None = None) -> int:

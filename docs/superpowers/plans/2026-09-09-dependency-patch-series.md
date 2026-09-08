@@ -46,13 +46,13 @@ isolated source root with small synthetic archives and recipes; no Cargo is
 needed to test missing manifests. Expose reusable recipe/tree verification
 functions for Task 2 without duplicating them in another script.
 
-- [ ] Freeze the current 131-file inventory, package manifests/locks and modes. Read original archives from an explicitly supplied location; do not discover or alter a global registry cache in maintained code.
-- [ ] Write failing native tests for fresh reconstruction, an order-dependent two-patch series, a third package and another version added through data, offline absence/corruption, partial patch failure and changed same-revision recipe. Assert the specific refusal and unchanged pre-existing output.
-- [ ] Add focused tests for archive traversal/links/duplicate entries, executable modes, output tampering, idempotent mtimes, two preparers, interrupted publication and preparing a new revision while the old tree is retained. Use only owned temporary files/processes.
-- [ ] Implement one record loop and ordered patch loop, finite acquisition/extraction limits, the selected digest/recipe receipt, stable lock and publish-once behavior. No arbitrary recipe command hooks or package-specific Python branches.
-- [ ] Generate three Aya patches (reader/tests, Rust 1.88 assertions, workspace) and two aya-obj patches (relocation/tests/note, workspace). Verify complete application against the exact archives, not an upstream Git draft.
-- [ ] Run the native suite. Reconstruct real packages in an isolated fresh source export without `.git`, from an unrelated working directory, with explicit offline archives. Compare every original file byte/mode and both unchanged package lockfiles.
-- [ ] Stop the writer; review source, negative controls and exact reconstruction independently. Commit only these maintained files through Luna after primary acceptance.
+- [x] Freeze the current 131-file inventory, package manifests/locks and modes. Read original archives from an explicitly supplied location; do not discover or alter a global registry cache in maintained code.
+- [x] Write failing native tests for fresh reconstruction, an order-dependent two-patch series, a third package and another version added through data, offline absence/corruption, partial patch failure and changed same-revision recipe. Assert the specific refusal and unchanged pre-existing output.
+- [x] Add focused tests for archive traversal/links/duplicate entries, executable modes, output tampering, idempotent mtimes, two preparers, interrupted publication and preparing a new revision while the old tree is retained. Use only owned temporary files/processes.
+- [x] Implement one record loop and ordered patch loop, finite acquisition/extraction limits, the selected digest/recipe receipt, stable lock and publish-once behavior. No arbitrary recipe command hooks or package-specific Python branches.
+- [x] Generate three Aya patches (reader/tests, Rust 1.88 assertions, workspace) and two aya-obj patches (relocation/tests/note, workspace). Verify complete application against the exact archives, not an upstream Git draft.
+- [x] Run the native suite. Reconstruct real packages in an isolated fresh source export without `.git`, from an unrelated working directory, with explicit offline archives. Compare every original file byte/mode and both unchanged package lockfiles.
+- [x] Stop the writer; review source, negative controls and exact reconstruction independently. Commit only these maintained files through Luna after primary acceptance.
 
 ## Task 2: Cargo source binding
 
@@ -68,11 +68,11 @@ python3 -I scripts/check-prepared-dependencies.py \
 python3 -I tests/python/test_prepared_dependency_metadata.py
 ```
 
-- [ ] Write fixtures for current generation, retained stale generation, registry fallback, transitive dependency, two versions of one crate, incomplete metadata, unknown generated package and separate BPF workspace. Each failure names the workspace/package/path and emits no partial ledger.
-- [ ] Implement JSON graph traversal from Cargo workspace members using package IDs, require full resolve data, verify root identity and exact applicable manifest paths, and reuse Task 1's actual byte verification. Do not run arbitrary commands supplied through metadata or parse Cargo TOML.
-- [ ] Prove metadata claiming the new tree cannot authorize a different on-disk tree. Prove a record for the root workspace does not authorize or require that package in BPF's independent graph.
-- [ ] Run native tests and one real metadata check using an isolated migrated checkout. Compare package identities, features and dependency edges with the current locked graph, allowing only intended local manifest path changes.
-- [ ] Stop, independently review and commit the bounded unit through Luna.
+- [x] Write fixtures for current generation, retained stale generation, registry fallback, transitive dependency, two versions of one crate, incomplete metadata, unknown generated package and separate BPF workspace. Each failure names the workspace/package/path and emits no partial ledger.
+- [x] Implement JSON graph traversal from Cargo workspace members using package IDs, require full resolve data, verify root identity and exact applicable manifest paths, and reuse Task 1's actual byte verification. Do not run arbitrary commands supplied through metadata or parse Cargo TOML.
+- [x] Prove metadata claiming the new tree cannot authorize a different on-disk tree. Prove a record for the root workspace does not authorize or require that package in BPF's independent graph.
+- [x] Run native tests and one real metadata check using an isolated migrated checkout. Compare package identities, features and dependency edges with the current locked graph, allowing only intended local manifest path changes.
+- [x] Stop, independently review and commit the bounded unit through Luna.
 
 ## Task 3: Build commands, CI and caller closure
 

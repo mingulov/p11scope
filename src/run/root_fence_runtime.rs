@@ -220,6 +220,7 @@ fn document(
         state,
         engine.pinned().provider_changed(),
         true,
+        Default::default(),
         None,
         initial_tracking_evidence(
             scope,

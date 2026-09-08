@@ -2802,7 +2802,8 @@ fn capture_profile(
                 &state,
                 engine.pinned().provider_changed(),
                 profile,
-                owned.as_deref(),
+                owned.as_deref().map_or_else(Default::default, |owned| owned.coordinator.counters()),
+                owned.as_deref().map(|owned| owned.still_running),
                 capture_tracking_degraded,
             );
             let frame = render::live(
@@ -2888,7 +2889,8 @@ fn capture_profile(
         &state,
         engine.pinned().provider_changed(),
         profile,
-        owned.as_deref(),
+        owned.as_deref().map_or_else(Default::default, |owned| owned.coordinator.counters()),
+        owned.as_deref().map(|owned| owned.still_running),
         capture_tracking_degraded,
     );
     ev.mark_terminal_drain_unproven();
@@ -3156,7 +3158,8 @@ fn capture_trace(
         &state,
         engine.pinned().provider_changed(),
         true,
-        owned.as_deref(),
+        owned.as_deref().map_or_else(Default::default, |owned| owned.coordinator.counters()),
+        owned.as_deref().map(|owned| owned.still_running),
         capture_tracking_degraded,
     );
     evidence.mark_terminal_drain_unproven();
@@ -3498,7 +3501,8 @@ fn evidence_for(
     state: &semantics::State,
     provider_changed: bool,
     include_selection: bool,
-    owned: Option<&Owned>,
+    pause: crate::discovery::pause::PauseCounters,
+    child_still_running: Option<bool>,
     capture_tracking_degraded: bool,
 ) -> render::Evidence {
     let semantic = state.semantic_evidence();
@@ -3522,7 +3526,6 @@ fn evidence_for(
         discovery_read_failures,
         discovery_truncated,
     ] = facts.discovery_losses();
-    let pause = owned.map_or_else(Default::default, |owned| owned.coordinator.counters());
     let pause_status = pause.status();
     let pid_descendant_gaps = engine.pid_descendant_gaps();
     let mut interface_selection = if include_selection {
@@ -3602,7 +3605,7 @@ fn evidence_for(
         pause_attempts: pause.attempts,
         pause_confirmed: pause.confirmed,
         pause_partial: pause.partial,
-        child_still_running: owned.map(|owned| owned.still_running),
+        child_still_running,
         discovery_ring_loss,
         discovery_state_failures,
         discovery_read_failures,
@@ -5984,6 +5987,7 @@ mod tests {
                 state,
                 false,
                 include_selection,
+                Default::default(),
                 None,
                 false,
             )
@@ -6029,6 +6033,90 @@ mod tests {
     }
 
     #[test]
+    fn evidence_for_projects_finite_pause_and_child_disposition_across_renderers() {
+        use crate::discovery::pause::PauseCounters;
+
+        let (engine, _) = crate::discovery::engine::tests::selection_output_engines();
+        let state = semantics::State::new(engine.plan());
+        let mut facts = engine.capture_facts();
+        facts.loader_discovery.hits = 17;
+        for (pause, status, unprotected) in [
+            (PauseCounters::default(), "none", 1),
+            (
+                PauseCounters {
+                    attempts: 5,
+                    confirmed: 5,
+                    partial: 0,
+                },
+                "sigstop",
+                0,
+            ),
+            (
+                PauseCounters {
+                    attempts: 5,
+                    confirmed: 2,
+                    partial: 3,
+                },
+                "partial",
+                1,
+            ),
+        ] {
+            for child_still_running in [None, Some(false), Some(true)] {
+                let evidence = evidence_for(
+                    &engine,
+                    facts.clone(),
+                    0,
+                    false,
+                    &[],
+                    &[],
+                    metrics::KernelEvidence::default(),
+                    process::TrackingEvidence::default(),
+                    0,
+                    &state,
+                    false,
+                    true,
+                    pause,
+                    child_still_running,
+                    false,
+                );
+                assert_eq!(evidence.pause, status);
+                assert_eq!(evidence.unprotected_live_windows, unprotected);
+                assert_eq!(evidence.child_still_running, child_still_running);
+                let profile = render::versioned_evidence(&evidence);
+                let metrics = render::json(
+                    &[],
+                    &evidence,
+                    &render::CaptureMeta {
+                        started: "t0",
+                        ended: "t1",
+                        kernel: "test",
+                        policy: CapturePolicy::AggregateOnly,
+                    },
+                )["evidence"]
+                    .clone();
+                let terminal: serde_json::Value = serde_json::from_str(
+                    trace::evidence_line(&evidence, CapturePolicy::Allowlisted, false)
+                        .strip_prefix("EVIDENCE ")
+                        .unwrap(),
+                )
+                .unwrap();
+                for document in [&profile, &metrics, &terminal] {
+                    assert_eq!(document["pause"], status);
+                    assert_eq!(document["pause_attempts"], pause.attempts);
+                    assert_eq!(document["pause_confirmed"], pause.confirmed);
+                    assert_eq!(document["pause_partial"], pause.partial);
+                    match child_still_running {
+                        Some(running) => {
+                            assert_eq!(document["child_still_running"], running);
+                        }
+                        None => assert!(document.get("child_still_running").is_none()),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn evidence_for_keeps_distinct_discovery_losses_across_all_renderers() {
         let (engine, _) = crate::discovery::engine::tests::selection_output_engines();
         let state = semantics::State::new(engine.plan());
@@ -6051,6 +6139,7 @@ mod tests {
             &state,
             false,
             true,
+            Default::default(),
             None,
             false,
         );
@@ -6095,6 +6184,7 @@ mod tests {
             &state,
             false,
             true,
+            Default::default(),
             None,
             true,
         );

@@ -1,0 +1,256 @@
+diff --git a/src/relocation.rs b/src/relocation.rs
+index a2ae5fd..08ac356 100644
+--- a/src/relocation.rs
++++ b/src/relocation.rs
+@@ -53,6 +53,24 @@ pub enum RelocationError {
+         symbol_name: Option<String>,
+     },
+ 
++    /// No map definition begins at the referenced section offset.
++    #[error("map at section `{section_index}` offset `{offset}` not found")]
++    MapOffsetNotFound {
++        /// The map-definition section.
++        section_index: usize,
++        /// The byte offset from the start of that section.
++        offset: u64,
++    },
++
++    /// Several distinct map definitions have the referenced section offset.
++    #[error("ambiguous map at section `{section_index}` offset `{offset}`")]
++    AmbiguousMapOffset {
++        /// The map-definition section.
++        section_index: usize,
++        /// The byte offset from the start of that section.
++        offset: u64,
++    },
++
+     /// Unknown function
+     #[error("function {address:#x} not found while relocating `{caller_name}`")]
+     UnknownFunction {
+@@ -113,9 +131,12 @@ impl Object {
+         let mut maps_by_section = HashMap::new();
+         let mut maps_by_symbol = HashMap::new();
+         for (name, fd, map) in maps {
+-            maps_by_section.insert(map.section_index(), (name, fd, map));
+             if let Some(index) = map.symbol_index() {
+                 maps_by_symbol.insert(index, (name, fd, map));
++            } else {
++                // Only global-data maps represent a whole section. Several
++                // named map definitions can share one maps/.maps section.
++                maps_by_section.insert(map.section_index(), (name, fd, map));
+             }
+         }
+ 
+@@ -223,6 +244,52 @@ fn relocate_maps<'a, I: Iterator<Item = &'a Relocation>>(
+             continue;
+         }
+ 
++        // LLVM references a local map through its section symbol and a 32-bit
++        // unsigned addend in LD_imm64. Resolve the exact definition boundary,
++        // rather than selecting an arbitrary map that shares the section.
++        // https://docs.kernel.org/bpf/llvm_reloc.html
++        let mut section_map = None;
++        if sym.kind == SymbolKind::Section {
++            let address = sym
++                .address
++                .checked_add(u64::from(instructions[ins_index].imm as u32))
++                .ok_or(RelocationError::InvalidRelocationOffset {
++                    offset: rel.offset,
++                    relocation_number: rel_n,
++                })?;
++            let mut has_definitions = false;
++            for (index, entry) in maps_by_symbol {
++                if entry.2.section_index() != section_index {
++                    continue;
++                }
++                has_definitions = true;
++                if rel.size != 64 || instructions[ins_index].code != 0x18 {
++                    return Err(RelocationError::InvalidRelocationOffset {
++                        offset: rel.offset,
++                        relocation_number: rel_n,
++                    });
++                }
++                let definition = symbol_table
++                    .get(index)
++                    .ok_or(RelocationError::UnknownSymbol { index: *index })?;
++                if definition.section_index == Some(section_index)
++                    && definition.address == address
++                    && section_map.replace(entry).is_some()
++                {
++                    return Err(RelocationError::AmbiguousMapOffset {
++                        section_index,
++                        offset: address,
++                    });
++                }
++            }
++            if has_definitions && section_map.is_none() {
++                return Err(RelocationError::MapOffsetNotFound {
++                    section_index,
++                    offset: address,
++                });
++            }
++        }
++
+         let (_name, fd, map) = if let Some(m) = maps_by_symbol.get(&rel.symbol_index) {
+             let map = &m.2;
+             debug!(
+@@ -233,6 +300,8 @@ fn relocate_maps<'a, I: Iterator<Item = &'a Relocation>>(
+             );
+             debug_assert_eq!(map.symbol_index().unwrap(), rel.symbol_index);
+             m
++        } else if let Some(m) = section_map {
++            m
+         } else {
+             let Some(m) = maps_by_section.get(&section_index) else {
+                 debug!("failed relocating map by section index {section_index}");
+@@ -548,6 +617,115 @@ mod test {
+         }
+     }
+ 
++    fn relocate_section_maps(
++        offsets: &[u32],
++        second_address: u64,
++    ) -> Result<Vec<bpf_insn>, RelocationError> {
++        let mut instructions = Vec::new();
++        let mut relocations = Vec::new();
++        for &offset in offsets {
++            relocations.push(Relocation {
++                offset: (instructions.len() * INS_SIZE) as u64,
++                symbol_index: 20,
++                size: 64,
++            });
++            let mut first = ins(&[0x18, 0x01, 0, 0, 0, 0, 0, 0]);
++            first.imm = offset as i32;
++            instructions.extend([first, ins(&[0; 8])]);
++        }
++        let mut fun = fake_func("section_maps", instructions);
++        let mut section = fake_sym(20, 0, 0, ".maps", 0);
++        section.kind = SymbolKind::Section;
++        let symbols = HashMap::from([
++            (1, fake_sym(1, 0, 0, "first", 40)),
++            (2, fake_sym(2, 0, second_address, "second", 32)),
++            (20, section),
++        ]);
++        let first = fake_btf_map(1);
++        let second = fake_btf_map(2);
++        let maps = HashMap::from([(1, ("first", 101, &first)), (2, ("second", 202, &second))]);
++        relocate_maps(
++            &mut fun,
++            relocations.iter(),
++            &HashMap::new(),
++            &maps,
++            &symbols,
++            &HashSet::new(),
++        )?;
++        Ok(fun.instructions)
++    }
++
++    #[test]
++    fn section_map_offsets_select_distinct_descriptors() {
++        let instructions = relocate_section_maps(&[40, 0, 40], 40).unwrap();
++        for (pair, expected) in instructions.chunks_exact(2).zip([202, 101, 202]) {
++            assert_eq!(pair[0].src_reg(), BPF_PSEUDO_MAP_FD as u8);
++            assert_eq!(pair[0].imm, expected);
++            assert_eq!(pair[1].imm, 0);
++        }
++    }
++
++    #[test]
++    fn section_map_offset_uses_unsigned_32_bit_addend() {
++        let instructions = relocate_section_maps(&[0x8000_0000], 0x8000_0000).unwrap();
++        assert_eq!(instructions[0].imm, 202);
++    }
++
++    #[test]
++    fn section_map_offsets_reject_interiors_and_missing_definitions() {
++        for offset in [1, 39, 41, 72, u32::MAX] {
++            assert!(relocate_section_maps(&[offset], 40).is_err(), "{offset}");
++        }
++    }
++
++    #[test]
++    fn section_map_offsets_reject_ambiguous_definitions() {
++        let error = relocate_section_maps(&[0], 0).unwrap_err();
++        assert!(error.to_string().contains("ambiguous map"), "{error}");
++    }
++
++    #[test]
++    fn global_data_section_offsets_remain_value_offsets() {
++        for kind in [
++            EbpfSectionKind::Data,
++            EbpfSectionKind::Bss,
++            EbpfSectionKind::Rodata,
++        ] {
++            let mut first = ins(&[0x18, 0x01, 0, 0, 0, 0, 0, 0]);
++            first.imm = 12;
++            let mut fun = fake_func("global_data", vec![first, ins(&[0; 8])]);
++            let mut symbol = fake_sym(20, 0, 0, "data", 0);
++            symbol.kind = SymbolKind::Section;
++            let symbols = HashMap::from([(20, symbol)]);
++            let map = Map::Legacy(LegacyMap {
++                def: Default::default(),
++                inner_def: None,
++                section_index: 0,
++                section_kind: kind,
++                symbol_index: None,
++                data: vec![0; 32],
++            });
++            let maps = HashMap::from([(0, ("data", 303, &map))]);
++            let relocations = [Relocation {
++                offset: 0,
++                symbol_index: 20,
++                size: 64,
++            }];
++            relocate_maps(
++                &mut fun,
++                relocations.iter(),
++                &maps,
++                &HashMap::new(),
++                &symbols,
++                &HashSet::new(),
++            )
++            .unwrap();
++            assert_eq!(fun.instructions[0].src_reg(), BPF_PSEUDO_MAP_VALUE as u8);
++            assert_eq!(fun.instructions[0].imm, 303);
++            assert_eq!(fun.instructions[1].imm, 12);
++        }
++    }
++
+     #[test]
+     fn test_single_legacy_map_relocation() {
+         let mut fun = fake_func(
+diff --git a/P11SCOPE-PATCH.md b/P11SCOPE-PATCH.md
+new file mode 100644
+index 0000000..cd37a84
+--- /dev/null
++++ b/P11SCOPE-PATCH.md
+@@ -0,0 +1,29 @@
++# Local aya-obj patch
++
++Based on the published `aya-obj 0.3.0` package, registry checksum
++`8c76b9c75d9cdc155ff8f6a06d61e873f67bf47be8cfa92a3b5aaea43f4b4077`,
++upstream commit `269dfaf4a20b99f2e3d384e3e5d13b226f507360`.
++Upstream licenses and sources are retained; `.cargo-ok` is a registry cache marker
++and is excluded. The empty workspace declaration permits standalone tests from
++inside a worktree. Package dependencies and its published lockfile are unchanged.
++
++The relocation patch resolves local map references by their section and exact
++definition offset. Multiple maps can share `.maps`; treating that section as one
++map caused a debug assertion and arbitrary descriptor selection. Whole-section
++fallback remains for global data maps. Missing and ambiguous definition offsets
++are errors. Named references and global-data value offsets retain their behavior.
++The addend follows the [LLVM BPF relocation format](https://docs.kernel.org/bpf/llvm_reloc.html).
++
++The crate's tests cover distinct, unsigned, missing, interior and ambiguous map
++offsets and unchanged global-data relocation. The application's
++`tests/bpf_map_contracts.rs` also relocates its actual embedded object without
++kernel syscalls and checks that all required native maps remain distinct.
++
++Run the upstream and added unit tests with:
++
++```sh
++cargo +1.88 test --locked --manifest-path third-party/aya-obj/Cargo.toml --target-dir target --lib
++```
++
++This patch changes object relocation only. Kernel verifier, map-freeze, attachment,
++capture and per-kernel qualification remain separate acceptance checks.

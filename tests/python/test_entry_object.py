@@ -7,6 +7,7 @@ import re
 import runpy
 import subprocess
 import sys
+from types import SimpleNamespace
 import unittest
 
 CHECKER = runpy.run_path(str(Path(__file__).resolve().parents[2] / "scripts/check-entry-object.py"))
@@ -112,6 +113,68 @@ class EntryObjectTests(unittest.TestCase):
                 restored = mutate(changed, "p11_entry", pc, new, old)
                 self.assertEqual(restored, original)
                 self.assertTrue(CHECKER["contract"](restored, variant)["verified"])
+
+    def test_signed_pointer_sink_causal_pair(self):
+        # Both layouts store signed-positive pointers. A u32 value 0x80000000
+        # is positive in JMP64 but negative in JMP32 and must not lose its sink.
+        for register in ("w7", "r7"):
+            with self.subTest(register=register):
+                changed = OBJECTS["unsafe"]
+                for pc, old, new in (
+                    (2096, "if r7 == 0x0 goto +0x1e", f"if {register} s> 0x0 goto +0x1"),
+                    (2097, "*(u64 *)(r10 - 0x108) = r7", "goto +0x1d"),
+                    (2098, "r9 &= 0x8", "*(u64 *)(r10 - 0x108) = r7"),
+                ):
+                    changed = mutate(changed, "p11_entry_ia32", pc, old, new)
+                if register == "w7":
+                    # Uncertain nonzero provenance can fail at the decoder
+                    # boundary before the final insertion is reached.
+                    with self.assertRaisesRegex(RuntimeError, r"final-sink 8: (decoder mechanism field 8 pointer|nonzero pointer predicate not proved|successful capture lost)"):
+                        CHECKER["contract"](changed, "unsafe")
+                else:
+                    self.assertTrue(CHECKER["contract"](changed, "unsafe")["verified"])
+
+    def test_signed_u32_false_edge_keeps_sink_obligation(self):
+        proof = CHECKER["SinkProof"](8, 1, True, ("stack", -0x128))
+        state = {"r7": ("scalar", 8, 32), ("success",): True}
+        for register in ("w7", "r7"):
+            with self.subTest(register=register):
+                consumer = SimpleNamespace(text={1: f"if {register} s> 0x0 goto +0x1"},
+                                           graph={1: [2, 3]}, label=lambda pc: f"signed-pointer:{pc}")
+                edges = dict(proof.edges(consumer, 1, state, state))
+                if register == "w7":
+                    self.assertIsNot(edges[2].get(("nonnull",)), False)
+                    self.assertTrue(proof.required(edges[2]))
+                    with self.assertRaisesRegex(RuntimeError, "nonzero pointer predicate not proved"):
+                        proof.check_sink(consumer, 2, edges[2])
+                else:
+                    self.assertIs(edges[2].get(("nonnull",)), False)
+                    self.assertFalse(proof.required(edges[2]))
+
+    def test_map_pointer_refinement_requires_zero_partition(self):
+        proof = CHECKER["SinkProof"](8, 0, True, ("stack", -0x128))
+        for fact in (("descriptor", 77), ("owned", 77, 0), ("function_value", 77, 0)):
+            for op in ("s>", ">=", "==", "!="):
+                with self.subTest(fact=fact, op=op):
+                    state = {"r7": fact}
+                    consumer = SimpleNamespace(text={1: f"if r7 {op} 0x0 goto +0x1"},
+                                               graph={1: [2, 3]}, label=lambda pc: f"map-pointer:{pc}")
+                    edges = dict(proof.edges(consumer, 1, state, state))
+                    if op in ("s>", ">="):
+                        # These predicates do not partition all u64 pointers
+                        # into exactly zero and nonzero classes.
+                        for edge in edges.values():
+                            self.assertEqual(edge["r7"], fact)
+                            self.assertIsNot(edge.get(("live", 77)), True)
+                        if op == "s>":
+                            self.assertEqual(set(edges), {2, 3})
+                    else:
+                        zero_edge, nonzero_edge = (3, 2) if op == "==" else (2, 3)
+                        if fact[0] == "descriptor":
+                            self.assertEqual(set(edges), {nonzero_edge})
+                        else:
+                            self.assertEqual(edges[zero_edge]["r7"], ("constant", 0))
+                            self.assertIs(edges[nonzero_edge][("live", 77)], True)
 
     def test_proven_32bit_comparisons_and_shared_index_alias(self):
         cases = [("default", "capture_scalar", 870),  # ABI constant

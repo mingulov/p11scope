@@ -360,6 +360,22 @@ def compare(left, op, right, width=64):
             ">=": left >= right, "<": left < right, "<=": left <= right}[op]
 
 
+def zero_partition(fact, op, width):
+    """Taken-edge zero status only for an exact zero/nonzero partition.
+
+    The comparison's right operand must be zero. Other predicates retain
+    uncertainty: a signed nonpositive pointer can still be nonzero, and an
+    unsigned >= 0 comparison admits both zero and nonzero on the same edge.
+    """
+    if op in ("==", "<="):
+        return True
+    if op in ("!=", ">"):
+        return False
+    if op == "s>" and width == 64 and fact[0] == "scalar" and fact[2] == 32:
+        return False  # Every nonzero zero-extended u32 is positive as s64.
+    return None
+
+
 class SinkProof:
     """Additional facts and obligations for one semantic role in Consumer.
 
@@ -680,6 +696,7 @@ class SinkProof:
                                 or fact == ("rsp", 32, 0),
                                 self.fail(consumer, pc, f"branch width 32 cannot refine full-width fact {fact}"))
                 taken = successor == D.relative_target(pc, text)
+                zero_taken = zero_partition(left, op, width) if left and right == ("constant", 0) else None
                 if left and right and left[0] == right[0] == "constant":
                     if compare(left[1], op, right[1], width) != taken:
                         continue
@@ -694,7 +711,7 @@ class SinkProof:
                         elif domain == {self.lifecycle}:
                             state[("life",)] = True
                 elif left and right and left[0] == "descriptor" and right == ("constant", 0):
-                    if compare(1, op, 0, width) != taken:
+                    if zero_taken is not None and taken == zero_taken:
                         continue
                 elif left and right and left[0] in ("option", "read_result", "insert_result") and right[0] == "constant":
                     require(op in ("==", "!=") and right[1] in ((0, 1) if left[0] == "option" else (0,)),
@@ -727,15 +744,15 @@ class SinkProof:
                         for key, fact in list(state.items()):
                             if isinstance(fact, tuple) and fact[:2] == ("candidate", left[1]):
                                 del state[key]
-                elif left and right and left[0] in ("owned", "function_value") and right == ("constant", 0):
-                    if compare(1, op, 0, width) == taken:
+                elif left and left[0] in ("owned", "function_value") and zero_taken is not None:
+                    if taken != zero_taken:
                         state[("live", left[1])] = True
                     else:
                         for key, fact in list(state.items()):
                             if fact == left:
                                 state[key] = ("constant", 0)
-                if self.role in (8, 16) and left == self.scalar() and right == ("constant", 0):
-                    state[("nonnull",)] = compare(1, op, 0, width) == taken
+                if self.role in (8, 16) and left == self.scalar() and zero_taken is not None:
+                    state[("nonnull",)] = taken != zero_taken
                 # Exact unsigned complete-span edges of the admitted forms.
                 if left == ("rsp", 64, 0) and right == ("constant", -16) and op == ">" and not taken:
                     state[("span", ("rsp", 64, 8))] = True

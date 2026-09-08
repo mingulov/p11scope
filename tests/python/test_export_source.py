@@ -148,6 +148,11 @@ class ExportSourceTests(unittest.TestCase):
     def test_clean_export_is_deterministic_and_prepares_from_fresh_offline_extraction(self):
         fixture = self.fixture()
         fixture.package("other", "2.1.0", b"other value\n")
+        (fixture.root / "AGENTS.md").write_text("repository instructions\n")
+        (fixture.root / "CLAUDE.md").symlink_to("AGENTS.md")
+        (fixture.root / "docs").mkdir()
+        (fixture.root / "docs/GUIDE.md").symlink_to("../AGENTS.md")
+        (fixture.root / "NORMALIZED.md").symlink_to("docs/../README.md")
         fixture.commit()
         (fixture.root / "ignored.out").write_text("generated\n")
         default_archives = fixture.root / "third-party/archives"
@@ -167,24 +172,46 @@ class ExportSourceTests(unittest.TestCase):
         with tarfile.open(first, "r:gz") as archive:
             names = archive.getnames()
             archive.extractall(extracted, filter="data")
+        ordinary = self.base / "ordinary"
+        with tarfile.open(second, "r:gz") as archive:
+            archive.extractall(ordinary)
         self.assertFalse(any("/.git/" in f"/{name}/" for name in names))
         self.assertFalse(any(name.endswith("/ignored.out") for name in names))
         self.assertFalse(any("/third-party/src/" in f"/{name}/" for name in names))
         roots = {name.split("/", 1)[0] for name in names}
         self.assertEqual(roots, {"pkcs11-scope-source"})
-        source = extracted / "pkcs11-scope-source"
-        self.assertEqual((source / "README.md").read_text(), "committed source\n")
-        export_manifest = json.loads((source / EXPORT_MANIFEST).read_text())
         revision = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=fixture.root, env=fixture.git_env,
             text=True, check=True, stdout=subprocess.PIPE,
         ).stdout.strip()
+        shutil.rmtree(fixture.root)
+        shutil.rmtree(fixture.archives)
+        source = extracted / "pkcs11-scope-source"
+        self.assertEqual((source / "README.md").read_text(), "committed source\n")
+        self.assertTrue((source / "CLAUDE.md").is_symlink())
+        self.assertEqual(os.readlink(source / "CLAUDE.md"), "AGENTS.md")
+        self.assertEqual((source / "CLAUDE.md").read_text(), "repository instructions\n")
+        self.assertTrue((source / "docs/GUIDE.md").is_symlink())
+        self.assertEqual(os.readlink(source / "docs/GUIDE.md"), "../AGENTS.md")
+        self.assertEqual((source / "docs/GUIDE.md").read_text(), "repository instructions\n")
+        ordinary_source = ordinary / "pkcs11-scope-source"
+        self.assertEqual(os.readlink(ordinary_source / "NORMALIZED.md"),
+                         "docs/../README.md")
+        self.assertEqual((ordinary_source / "NORMALIZED.md").read_text(), "committed source\n")
+        export_manifest = json.loads((source / EXPORT_MANIFEST).read_text())
         self.assertEqual(export_manifest["revision"], revision)
         readme_entry = next(item for item in export_manifest["source_entries"]
                             if item["path"] == "README.md")
         self.assertEqual(readme_entry, {
-            "path": "README.md", "mode": "0644", "size": 17,
+            "path": "README.md", "kind": "file", "mode": "0644", "size": 17,
             "sha256": hashlib.sha256(b"committed source\n").hexdigest(),
+        })
+        link_entry = next(item for item in export_manifest["source_entries"]
+                          if item["path"] == "CLAUDE.md")
+        self.assertEqual(link_entry, {
+            "path": "CLAUDE.md", "kind": "symlink", "mode": "120000",
+            "target": "AGENTS.md", "size": 9,
+            "sha256": hashlib.sha256(b"AGENTS.md").hexdigest(),
         })
         self.assertEqual(
             [item["path"] for item in export_manifest["archives"]],
@@ -198,8 +225,6 @@ class ExportSourceTests(unittest.TestCase):
             for item in export_manifest["archives"]
         ))
 
-        shutil.rmtree(fixture.root)
-        shutil.rmtree(fixture.archives)
         unrelated = self.base / "unrelated"
         unrelated.mkdir()
         prepare = subprocess.run(
@@ -328,6 +353,48 @@ class ExportSourceTests(unittest.TestCase):
                 result = fixture.offline(output)
                 self.assert_refused(result, "generated destination conflicts with committed source")
                 self.assertFalse(output.exists())
+
+    def test_symlinks_must_target_a_direct_contained_regular_file(self):
+        cases = {
+            "absolute": ("LINK", "/outside", {}),
+            "escaping": ("LINK", "../outside", {}),
+            "dangling": ("LINK", "missing", {}),
+            "chain": ("LINK", "SECOND", {"SECOND": "README.md"}),
+            "directory": ("LINK", "docs", {"docs/file.txt": None}),
+            "backslash": ("LINK", "dir\\file", {"dir/file": None}),
+            "control": ("LINK", "bad\ntarget", {}),
+            "missing-intermediate": ("LINK", "missing/../README.md", {}),
+            "regular-intermediate": ("LINK", "README.md/../README.md", {}),
+        }
+        for label, (link_name, target, extra) in cases.items():
+            with self.subTest(label=label):
+                fixture = self.fixture(label)
+                for relative, link_target in extra.items():
+                    path = fixture.root / relative
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    if link_target is None:
+                        path.write_text("target\n")
+                    else:
+                        path.symlink_to(link_target)
+                (fixture.root / link_name).symlink_to(target)
+                fixture.commit()
+                output = fixture.outputs / f"{label}.tar.gz"
+
+                result = fixture.offline(output)
+                self.assert_refused(result, "unsafe committed symlink", link_name)
+                self.assertFalse(output.exists())
+
+    def test_required_export_inputs_must_be_committed_regular_files(self):
+        fixture = self.fixture()
+        (fixture.root / "Cargo.toml").unlink()
+        (fixture.root / "Cargo.toml").symlink_to("README.md")
+        fixture.commit()
+        output = fixture.outputs / "required-link.tar.gz"
+
+        result = fixture.offline(output)
+        self.assert_refused(result, "required export input is not a committed regular file",
+                            "Cargo.toml")
+        self.assertFalse(output.exists())
 
 
 if __name__ == "__main__":

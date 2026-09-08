@@ -87,7 +87,7 @@ def _repository_state(root: Path, environment: dict[str, str]) -> tuple[str, dic
             relative = encoded_path.decode("utf-8")
         except (ValueError, UnicodeError) as error:
             raise ExportError("invalid tracked source entry") from error
-        if kind != b"blob" or mode not in (b"100644", b"100755"):
+        if kind != b"blob" or mode not in (b"100644", b"100755", b"120000"):
             raise ExportError(f"unsupported tracked source entry: {relative}")
         tracked[relative] = (mode.decode("ascii"), object_id.decode("ascii"))
     return revision, tracked
@@ -111,6 +111,18 @@ def _required_inputs(manifest: dict) -> set[str]:
     for record in manifest["packages"]:
         required.update(record["patches"])
     return required
+
+
+def _require_regular_inputs(tracked: dict[str, tuple[str, str]], required: set[str],
+                            revision: str) -> None:
+    for relative in sorted(required):
+        entry = tracked.get(relative)
+        if entry is None:
+            raise ExportError(f"required export input is not committed at {revision}: {relative}")
+        if entry[0] not in ("100644", "100755"):
+            raise ExportError(
+                f"required export input is not a committed regular file: {relative}"
+            )
 
 
 def _validate_output(root: Path, output: Path) -> Path:
@@ -156,11 +168,63 @@ def _add_bytes(output: tarfile.TarFile, name: str, content: bytes, mode: int = 0
     output.addfile(_tar_info(name, mode, len(content)), io.BytesIO(content))
 
 
+def _add_symlink(output: tarfile.TarFile, name: str, target: str) -> None:
+    info = _tar_info(name, 0o777)
+    info.type = tarfile.SYMTYPE
+    info.size = 0
+    info.linkname = target
+    output.addfile(info)
+
+
 def _git_blob_id(content: bytes) -> str:
     digest = hashlib.sha1()
     digest.update(f"blob {len(content)}\0".encode("ascii"))
     digest.update(content)
     return digest.hexdigest()
+
+
+def _validated_symlink_target(path: PurePosixPath, target: str,
+                              tracked: dict[str, tuple[str, str]]) -> bytes:
+    try:
+        encoded = target.encode("utf-8")
+    except UnicodeError as error:
+        raise ExportError(f"unsafe committed symlink {path}: target is not UTF-8") from error
+    if (not target or target.startswith("/") or "\\" in target
+            or any(ord(character) < 32 or ord(character) == 127 for character in target)):
+        raise ExportError(f"unsafe committed symlink {path}: invalid target {target!r}")
+    directories = {
+        parent.as_posix()
+        for relative in tracked
+        for parent in PurePosixPath(relative).parents
+        if parent != PurePosixPath(".")
+    }
+    parts = list(path.parent.parts) if path.parent != PurePosixPath(".") else []
+    target_parts = target.split("/")
+    for index, part in enumerate(target_parts):
+        if not part or part == ".":
+            if not part:
+                raise ExportError(f"unsafe committed symlink {path}: invalid target {target!r}")
+            continue
+        if part == "..":
+            if not parts:
+                raise ExportError(f"unsafe committed symlink {path}: target escapes archive root")
+            parts.pop()
+        else:
+            traversed = "/".join([*parts, part])
+            if index < len(target_parts) - 1 and traversed not in directories:
+                raise ExportError(
+                    f"unsafe committed symlink {path}: nonterminal target component is not a "
+                    f"committed directory: {part!r}"
+                )
+            parts.append(part)
+    resolved = "/".join(parts)
+    target_entry = tracked.get(resolved)
+    if target_entry is None or target_entry[0] not in ("100644", "100755"):
+        raise ExportError(
+            f"unsafe committed symlink {path}: target is not a direct committed regular file: "
+            f"{target!r}"
+        )
+    return encoded
 
 
 def _reject_generated_collisions(tracked: dict[str, tuple[str, str]],
@@ -195,11 +259,12 @@ def _build_archive(root: Path, revision: str, tracked: dict[str, tuple[str, str]
 
     source_entries = []
     archive_entries = []
+    symlink_targets = {}
     with source_tar.open("rb") as source_stream, tarfile.open(fileobj=source_stream, mode="r:") as source:
         members = source.getmembers()
         for member in members:
             path = _source_path(member.name.rstrip("/"))
-            if not (member.isdir() or member.isreg()):
+            if not (member.isdir() or member.isreg() or member.issym()):
                 raise ExportError(f"unsupported committed source entry: {member.name}")
             if member.isreg():
                 stream = source.extractfile(member)
@@ -213,6 +278,8 @@ def _build_archive(root: Path, revision: str, tracked: dict[str, tuple[str, str]
                         f"Git archive does not exactly match tracked source: {path.as_posix()}"
                     )
                 expected_mode, expected_object = expected
+                if expected_mode == "120000":
+                    raise ExportError(f"Git archive type differs from committed symlink: {path}")
                 archive_mode = "100755" if member.mode & 0o111 else "100644"
                 expected_tar_mode = 0o775 if expected_mode == "100755" else 0o664
                 if (archive_mode != expected_mode or member.mode != expected_tar_mode
@@ -222,9 +289,28 @@ def _build_archive(root: Path, revision: str, tracked: dict[str, tuple[str, str]
                     )
                 source_entries.append({
                     "path": path.as_posix(),
+                    "kind": "file",
                     "mode": "0755" if expected_mode == "100755" else "0644",
                     "size": len(content),
                     "sha256": hashlib.sha256(content).hexdigest(),
+                })
+            elif member.issym():
+                expected = tracked.get(path.as_posix())
+                if expected is None or expected[0] != "120000":
+                    raise ExportError(f"Git archive type differs from committed source: {path}")
+                target_bytes = _validated_symlink_target(path, member.linkname, tracked)
+                if member.mode != 0o777 or _git_blob_id(target_bytes) != expected[1]:
+                    raise ExportError(
+                        f"Git archive differs from committed symlink blob or mode: {path}"
+                    )
+                symlink_targets[path.as_posix()] = member.linkname
+                source_entries.append({
+                    "path": path.as_posix(),
+                    "kind": "symlink",
+                    "mode": "120000",
+                    "target": member.linkname,
+                    "size": len(target_bytes),
+                    "sha256": hashlib.sha256(target_bytes).hexdigest(),
                 })
         archived_paths = {item["path"] for item in source_entries}
         tracked_paths = set(tracked)
@@ -260,7 +346,7 @@ def _build_archive(root: Path, revision: str, tracked: dict[str, tuple[str, str]
                         name = f"{ARCHIVE_ROOT}/{path.as_posix()}"
                         if member.isdir():
                             output.addfile(_tar_info(name, 0o755, directory=True))
-                        else:
+                        elif member.isreg():
                             stream = source.extractfile(member)
                             if stream is None:
                                 raise ExportError(f"cannot reread committed source entry: {member.name}")
@@ -269,6 +355,8 @@ def _build_archive(root: Path, revision: str, tracked: dict[str, tuple[str, str]
                             git_mode = tracked[path.as_posix()][0]
                             _add_bytes(output, name, content,
                                        0o755 if git_mode == "100755" else 0o644)
+                        else:
+                            _add_symlink(output, name, symlink_targets[path.as_posix()])
                     known_directories = {member.name.rstrip("/") for member in members if member.isdir()}
                     for directory in ("third-party", "third-party/archives"):
                         if directory not in known_directories:
@@ -290,14 +378,18 @@ def run(root: Path, output: Path, *, offline: bool, archive_dir: Path | None) ->
     output = _validate_output(root, output)
     environment = _git_environment(root)
     revision, tracked = _repository_state(root, environment)
+    _require_regular_inputs(
+        tracked,
+        {"scripts/export-source.py", "scripts/prepare-dependencies.py",
+         "third-party/sources.json"},
+        revision,
+    )
     preparer = _load_preparer(root)
     try:
         manifest = preparer.load_manifest(root)
     except preparer.PreparationError as error:
         raise ExportError(str(error)) from error
-    missing = sorted(_required_inputs(manifest) - set(tracked))
-    if missing:
-        raise ExportError(f"required export input is not committed at {revision}: {missing[0]}")
+    _require_regular_inputs(tracked, _required_inputs(manifest), revision)
     archive_targets = [
         f"third-party/archives/{record['name']}-{record['version']}.crate"
         for record in manifest["packages"]

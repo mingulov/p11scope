@@ -9110,39 +9110,6 @@ fn lane13_evidence_finalizes_only_after_owned_cleanup() {
     let directory = tempfile::tempdir().expect("temporary lane-13 bridge directory");
     let ebpf_object = directory.path().join("p11scope-ebpf");
     fs::write(&ebpf_object, p11scope::EBPF_OBJECT).expect("write real embedded eBPF object");
-    let cases = [
-        "Lane13EvidenceTests.test_script_contract",
-        "Lane13EvidenceTests.test_private_and_public_injection_are_refused",
-        "Lane13EvidenceTests.test_tracked_aya_candidate_is_copied_and_hashed_by_actual_ledger",
-        "Lane13EvidenceTests.test_untracked_consumed_input_is_named_refusal_before_resources",
-        "Lane13EvidenceTests.test_start_ledger_failure_after_work_is_unavailable_and_nonpass",
-        "Lane13EvidenceTests.test_end_ledger_failure_after_start_skips_comparison_and_is_nonpass",
-        "Lane13EvidenceTests.test_git_ledger_early_write_failure_is_not_masked",
-        "Lane13EvidenceTests.test_root_creation_signals_and_collisions_preserve_foreign_entries",
-        "Lane13EvidenceTests.test_body_success_finalizes_after_cleanup",
-        "Lane13EvidenceTests.test_release_expected_sha256_rejects_pre_apply_corruption",
-        "Lane13EvidenceTests.test_release_same_size_mutation_during_apply_is_nonpass",
-        "Lane13EvidenceTests.test_private_project_cleanup_ignores_malformed_work_facts",
-        "Lane13EvidenceTests.test_signals_finalize_and_cleanup",
-        "Lane13EvidenceTests.test_retained_body_handle_settles_when_late_inventory_is_malformed",
-        "Lane13EvidenceTests.test_body_handle_admission_ignores_scheduler_state_only_transition",
-        "Lane13EvidenceTests.test_exit_before_real_term_keeps_published_descriptor_owned",
-        "Lane13EvidenceTests.test_exited_retained_body_ignores_late_numeric_observation",
-        "Lane13EvidenceTests.test_retained_body_exit_during_late_observation_owns_settlement",
-        "Lane13EvidenceTests.test_retained_body_inspection_error_still_settles_original",
-        "Lane13EvidenceTests.test_conflicting_unaccepted_record_cannot_suppress_original_settlement",
-        "Lane13EvidenceTests.test_controlled_body_setup_failures_settle_original_before_return",
-        "Lane13EvidenceTests.test_assertion_failure_runs_registered_original_and_decoy_cleanup",
-        "Lane13EvidenceTests.test_forced_holds_are_bounded_settled_and_preserve_decoy",
-        "Lane13EvidenceTests.test_cleanup_rejects_between_read_and_pin_identity_change",
-        "Lane13EvidenceTests.test_actual_port_forward_timeout_is_nonpass_and_settled",
-        "Lane13EvidenceTests.test_timeout_and_settlement_errors_remain_observable",
-        "Lane13EvidenceTests.test_query_failures_preserve_unknown_absence",
-        "Lane13EvidenceTests.test_partial_creation_cleanup_and_replacement_refusal",
-        "Lane13EvidenceTests.test_cleanup_failure_retains_diagnostics_and_continues",
-        "Lane13EvidenceTests.test_setup_copy_and_image_query_failures_are_nonpass",
-        "Lane13EvidenceTests.test_mutation_is_refused_with_both_ledgers",
-    ];
     let output = Command::new("python3")
         .args([
             "-I",
@@ -9150,7 +9117,7 @@ fn lane13_evidence_finalizes_only_after_owned_cleanup() {
             "--ebpf-object",
         ])
         .arg(&ebpf_object)
-        .args(cases)
+        .arg("Lane13EvidenceTests")
         .output()
         .expect("run native lane-13 evidence cases");
     assert!(

@@ -19,7 +19,7 @@ use crate::output::AtomicFile;
 use crate::process::{PidPin, ProcessView, ProcessViewId};
 use crate::{metrics, process, render, scope, semantics, trace, uretprobe_hazard};
 use anyhow::{Context as _, Result, anyhow};
-use p11scope_manifest::elf::ElfSnapshot;
+use p11scope_manifest::elf::{ElfAbi, ElfSnapshot};
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::File;
 use std::io;
@@ -34,7 +34,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+mod root_fence_runtime;
+
 const TERM_GRACE: Duration = Duration::from_secs(5);
+const EXEC_HANDOFF_TIMEOUT: Duration = Duration::from_secs(5);
+const WAIT_SLICE: Duration = Duration::from_millis(10);
+const FINAL_KILL_GRACE: Duration = Duration::from_secs(5);
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +74,210 @@ impl std::fmt::Display for ExecFailure {
 impl std::error::Error for ExecFailure {}
 
 #[derive(Debug)]
+pub(crate) enum ExecHandoffError {
+    Exec(ExecFailure),
+    Cancelled(i32),
+    Deadline,
+    Io {
+        phase: &'static str,
+        source: io::Error,
+    },
+}
+
+impl std::fmt::Display for ExecHandoffError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exec(failure) => failure.fmt(formatter),
+            Self::Cancelled(signal) => {
+                write!(formatter, "exec handoff cancelled by signal {signal}")
+            }
+            Self::Deadline => formatter.write_str("exec handoff deadline expired"),
+            Self::Io { phase, source } => write!(formatter, "exec handoff {phase}: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for ExecHandoffError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Exec(failure) => Some(failure),
+            Self::Io { source, .. } => Some(source),
+            Self::Cancelled(_) | Self::Deadline => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ExecDrain {
+    Pending,
+    EmptyEof,
+    Errno(i32),
+}
+
+fn drain_exec_with(
+    bytes: &mut [u8; std::mem::size_of::<i32>()],
+    used: &mut usize,
+    mut read: impl FnMut(&mut [u8]) -> io::Result<usize>,
+) -> Result<ExecDrain, ExecHandoffError> {
+    loop {
+        match read(&mut bytes[*used..]) {
+            Ok(0) if *used == 0 => return Ok(ExecDrain::EmptyEof),
+            Ok(0) => {
+                return Err(ExecHandoffError::Io {
+                    phase: "exec protocol",
+                    source: io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("short exec errno frame ({used}/4 bytes)"),
+                    ),
+                });
+            }
+            Ok(read) if read <= bytes.len() - *used => {
+                *used += read;
+                if *used == bytes.len() {
+                    return Ok(ExecDrain::Errno(i32::from_ne_bytes(*bytes)));
+                }
+            }
+            Ok(_) => {
+                return Err(ExecHandoffError::Io {
+                    phase: "exec read",
+                    source: io::Error::other("exec reader returned more bytes than requested"),
+                });
+            }
+            Err(error) if error.raw_os_error() == Some(libc::EINTR) => {
+                return Ok(ExecDrain::Pending);
+            }
+            Err(error) if error.raw_os_error() == Some(libc::EAGAIN) => {
+                return Ok(ExecDrain::Pending);
+            }
+            Err(source) => {
+                return Err(ExecHandoffError::Io {
+                    phase: "exec read",
+                    source,
+                });
+            }
+        }
+    }
+}
+
+fn write_release_with(
+    deadline: Instant,
+    mut cancelled: impl FnMut() -> Option<i32>,
+    mut write: impl FnMut() -> io::Result<usize>,
+) -> Result<(), ExecHandoffError> {
+    loop {
+        if let Some(signal) = cancelled() {
+            return Err(ExecHandoffError::Cancelled(signal));
+        }
+        if Instant::now() >= deadline {
+            return Err(ExecHandoffError::Deadline);
+        }
+        match write() {
+            Ok(1) => return Ok(()),
+            Ok(_) => {
+                return Err(ExecHandoffError::Io {
+                    phase: "release write",
+                    source: io::Error::new(io::ErrorKind::WriteZero, "short release write"),
+                });
+            }
+            Err(error) if error.raw_os_error() == Some(libc::EINTR) => continue,
+            Err(source) => {
+                return Err(ExecHandoffError::Io {
+                    phase: "release write",
+                    source,
+                });
+            }
+        }
+    }
+}
+
+fn poll_handoff_with(
+    deadline: Instant,
+    mut cancelled: impl FnMut() -> Option<i32>,
+    mut poll: impl FnMut(i32) -> io::Result<[i16; 2]>,
+) -> Result<[i16; 2], ExecHandoffError> {
+    loop {
+        if let Some(signal) = cancelled() {
+            return Err(ExecHandoffError::Cancelled(signal));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ExecHandoffError::Deadline);
+        }
+        let timeout = remaining.min(WAIT_SLICE);
+        let timeout_ms = i32::try_from(timeout.as_millis().max(1)).unwrap_or(i32::MAX);
+        match poll(timeout_ms) {
+            Ok(revents) => return Ok(revents),
+            Err(error) if error.raw_os_error() == Some(libc::EINTR) => continue,
+            Err(source) => {
+                return Err(ExecHandoffError::Io {
+                    phase: "poll",
+                    source,
+                });
+            }
+        }
+    }
+}
+
+fn retry_reap_with(
+    deadline: Option<Instant>,
+    mut reap: impl FnMut() -> io::Result<Option<i32>>,
+) -> io::Result<Option<i32>> {
+    loop {
+        match reap() {
+            Err(error) if error.raw_os_error() == Some(libc::EINTR) => {
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "reap retry deadline expired after EINTR",
+                    ));
+                }
+            }
+            result => return result,
+        }
+    }
+}
+
+fn exact_exit_after_error_with(
+    error: io::Error,
+    deadline: Option<Instant>,
+    reap: impl FnMut() -> io::Result<Option<i32>>,
+) -> io::Result<i32> {
+    match retry_reap_with(deadline, reap) {
+        Ok(Some(code)) => Ok(code),
+        Ok(None) => Err(error),
+        Err(reap) => Err(io::Error::other(format!(
+            "{error}; exact original-child reap also failed: {reap}"
+        ))),
+    }
+}
+
+fn initial_settlement_probe_with(
+    initial: io::Result<Option<i32>>,
+    active: Option<io::Result<()>>,
+    deadline: Option<Instant>,
+    reap: impl FnMut() -> io::Result<Option<i32>>,
+) -> io::Result<Option<i32>> {
+    match initial? {
+        Some(code) => Ok(Some(code)),
+        None => match active.expect("an empty initial reap has an active-generation result") {
+            Ok(()) => Ok(None),
+            Err(error) => exact_exit_after_error_with(error, deadline, reap).map(Some),
+        },
+    }
+}
+
+fn initial_signal_forward_with(
+    forward: io::Result<ForwardAction>,
+    deadline: Option<Instant>,
+    reap: impl FnMut() -> io::Result<Option<i32>>,
+) -> io::Result<Option<i32>> {
+    match forward {
+        Ok(_) => Ok(None),
+        Err(error) => exact_exit_after_error_with(error, deadline, reap).map(Some),
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct PreparedExecutable {
     path: PathBuf,
     file: File,
@@ -75,6 +285,7 @@ pub(crate) struct PreparedExecutable {
     interpreter: PathBuf,
     interpreter_file: File,
     interpreter_identity: FileIdentity,
+    abi: ElfAbi,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,7 +311,7 @@ impl FileIdentity {
 
 impl PreparedExecutable {
     /// Resolves normal PATH spelling in the parent, then accepts only a direct
-    /// x86-64 ELF with one absolute PT_INTERP. Shebang and non-ELF forms
+    /// conventional x86 ELF with one same-ABI absolute PT_INTERP. Shebang and non-ELF forms
     /// deliberately return `None` and use ordinary live discovery.
     pub(crate) fn resolve(program: &OsStr) -> io::Result<Option<Self>> {
         let path = resolve_program(program)?;
@@ -119,7 +330,11 @@ impl PreparedExecutable {
         }
         let interpreter_file = File::open(&interpreter)?;
         let interpreter_metadata = interpreter_file.metadata()?;
-        if ElfSnapshot::read(&interpreter_file).is_err() {
+        let interpreter_snapshot = match ElfSnapshot::read(&interpreter_file) {
+            Ok(snapshot) => snapshot,
+            Err(_) => return Ok(None),
+        };
+        if interpreter_snapshot.abi() != snapshot.abi() {
             return Ok(None);
         }
         Ok(Some(Self {
@@ -129,6 +344,7 @@ impl PreparedExecutable {
             interpreter,
             interpreter_file,
             interpreter_identity: FileIdentity::of(&interpreter_metadata),
+            abi: snapshot.abi(),
         }))
     }
 
@@ -148,6 +364,10 @@ impl PreparedExecutable {
 
     pub(crate) fn interpreter_file(&self) -> &File {
         &self.interpreter_file
+    }
+
+    pub(crate) fn abi(&self) -> ElfAbi {
+        self.abi
     }
 
     pub(crate) fn unchanged(&self) -> io::Result<bool> {
@@ -441,15 +661,17 @@ unsafe fn harden_owned_child(identity: ChildIdentity) -> std::result::Result<(),
 /// the CLOEXEC pre-exec barrier.
 pub(crate) struct OwnedChild {
     pid: u32,
-    pin: PidPin,
+    pin: std::sync::Arc<PidPin>,
     generation: NonZeroU64,
     release_writer: Option<OwnedFd>,
     exec_reader: Option<OwnedFd>,
     prepared: Option<PreparedExecutable>,
     released: bool,
     reaped: bool,
+    reaped_exit_code: Option<i32>,
     handed_off: bool,
     interrupt_count: u8,
+    settlement_deadline: Option<Instant>,
 }
 
 impl OwnedChild {
@@ -501,6 +723,7 @@ impl OwnedChild {
             .collect();
         let (release_reader, release_writer) = pipe_pair()?;
         let (exec_reader, exec_writer) = pipe_pair()?;
+        set_nonblocking(&exec_reader)?;
         // Allocate before fork so exhaustion cannot create an unguarded child.
         let generation = allocate_generation()?;
 
@@ -567,26 +790,37 @@ impl OwnedChild {
                 drop(exec_reader);
                 // The unreaped fork child cannot be numerically reused. This
                 // cleanup is the only path before an original pidfd exists.
-                kill_and_reap_fork_child(pid);
-                return Err(io::Error::other(error));
+                let cleanup = kill_and_reap_fork_child(pid);
+                return Err(match cleanup {
+                    Ok(()) => io::Error::other(error),
+                    Err(cleanup) => io::Error::other(format!(
+                        "{error}; cleaning up the original fork child also failed: {cleanup}"
+                    )),
+                });
             }
         };
         Ok(Self {
             pid,
-            pin,
+            pin: std::sync::Arc::new(pin),
             generation,
             release_writer: Some(release_writer),
             exec_reader: Some(exec_reader),
             prepared,
             released: false,
             reaped: false,
+            reaped_exit_code: None,
             handed_off: false,
             interrupt_count: 0,
+            settlement_deadline: None,
         })
     }
 
     pub(crate) fn pid(&self) -> u32 {
         self.pid
+    }
+
+    pub(crate) fn seed_pin(&self) -> std::sync::Arc<PidPin> {
+        self.pin.clone()
     }
 
     pub(crate) fn pin(&self) -> &PidPin {
@@ -601,84 +835,131 @@ impl OwnedChild {
         self.prepared.as_ref()
     }
 
-    pub(crate) fn release(&mut self) -> Result<(), ExecFailure> {
+    #[cfg(test)]
+    pub(crate) fn release(&mut self) -> Result<(), ExecHandoffError> {
+        self.release_until(Instant::now() + EXEC_HANDOFF_TIMEOUT, || None)
+    }
+
+    pub(crate) fn release_until(
+        &mut self,
+        deadline: Instant,
+        cancelled: impl FnMut() -> Option<i32>,
+    ) -> Result<(), ExecHandoffError> {
+        self.release_until_with_pending(deadline, cancelled, || {})
+    }
+
+    fn release_until_with_pending(
+        &mut self,
+        deadline: Instant,
+        mut cancelled: impl FnMut() -> Option<i32>,
+        mut pending: impl FnMut(),
+    ) -> Result<(), ExecHandoffError> {
         if self.released {
             return Ok(());
         }
-        self.released = true;
         let writer = self
             .release_writer
             .take()
-            .expect("unreleased child has barrier");
-        let byte = 1u8;
-        let written = loop {
-            // SAFETY: writer is live and byte is valid for one-byte write.
-            let written =
-                unsafe { libc::write(writer.as_raw_fd(), (&byte as *const u8).cast(), 1) };
-            if written >= 0 || io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-                break written;
-            }
-        };
-        drop(writer);
-        if written != 1 {
-            let errno = io::Error::last_os_error()
-                .raw_os_error()
-                .unwrap_or(libc::EIO);
-            return Err(ExecFailure {
-                errno,
-                exit_code: 127,
-            });
-        }
-
+            .ok_or_else(|| ExecHandoffError::Io {
+                phase: "state",
+                source: io::Error::other("release was already attempted without acknowledgement"),
+            })?;
         let reader = self
             .exec_reader
             .take()
-            .expect("unreleased child has exec pipe");
+            .ok_or_else(|| ExecHandoffError::Io {
+                phase: "state",
+                source: io::Error::other("unreleased child has no exec pipe"),
+            })?;
+        if let Some(signal) = cancelled() {
+            return Err(ExecHandoffError::Cancelled(signal));
+        }
+        if Instant::now() >= deadline {
+            return Err(ExecHandoffError::Deadline);
+        }
+        let byte = 1u8;
+        write_release_with(deadline, &mut cancelled, || {
+            // SAFETY: writer is live and byte is valid for one-byte write.
+            let written =
+                unsafe { libc::write(writer.as_raw_fd(), (&byte as *const u8).cast(), 1) };
+            if written >= 0 {
+                Ok(written as usize)
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        })?;
+        drop(writer);
         let mut bytes = [0u8; std::mem::size_of::<i32>()];
         let mut used = 0;
         loop {
-            // SAFETY: the remaining byte range is writable and reader is live.
-            let read = unsafe {
-                libc::read(
-                    reader.as_raw_fd(),
-                    bytes[used..].as_mut_ptr().cast(),
-                    bytes.len() - used,
-                )
-            };
-            if read == 0 {
-                break;
-            }
-            if read < 0 {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::EINTR) {
-                    continue;
+            let drained = drain_exec_with(&mut bytes, &mut used, |buffer| {
+                // SAFETY: the remaining byte range is writable and reader is live.
+                let read = unsafe {
+                    libc::read(reader.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len())
+                };
+                if read >= 0 {
+                    Ok(read as usize)
+                } else {
+                    Err(io::Error::last_os_error())
                 }
-                return Err(ExecFailure {
-                    errno: error.raw_os_error().unwrap_or(libc::EIO),
-                    exit_code: 127,
-                });
+            })?;
+            match drained {
+                ExecDrain::Errno(errno) => {
+                    return Err(ExecHandoffError::Exec(ExecFailure {
+                        errno,
+                        exit_code: 127,
+                    }));
+                }
+                ExecDrain::EmptyEof => {
+                    if let Some(signal) = cancelled() {
+                        return Err(ExecHandoffError::Cancelled(signal));
+                    }
+                    self.released = true;
+                    return Ok(());
+                }
+                ExecDrain::Pending => pending(),
             }
-            used += read as usize;
-            if used == bytes.len() {
-                break;
+            let mut pollfds = [
+                libc::pollfd {
+                    fd: reader.as_raw_fd(),
+                    events: libc::POLLIN | libc::POLLHUP,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: self
+                        .pin
+                        .pidfd()
+                        .map_err(|source| ExecHandoffError::Io {
+                            phase: "pidfd access",
+                            source,
+                        })?
+                        .as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            let revents = poll_handoff_with(deadline, &mut cancelled, |timeout_ms| {
+                // SAFETY: pollfds is a live two-entry array for this call.
+                let polled =
+                    unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, timeout_ms) };
+                if polled >= 0 {
+                    Ok([pollfds[0].revents, pollfds[1].revents])
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            })?;
+            for (pollfd, revents) in pollfds.iter().zip(revents) {
+                if revents & (libc::POLLNVAL | libc::POLLERR) != 0 {
+                    return Err(ExecHandoffError::Io {
+                        phase: "poll",
+                        source: io::Error::other(format!(
+                            "descriptor {} reported revents {:#x}",
+                            pollfd.fd, revents
+                        )),
+                    });
+                }
             }
         }
-        drop(reader);
-        if used == 0 {
-            return Ok(());
-        }
-        let errno = if used == bytes.len() {
-            i32::from_ne_bytes(bytes)
-        } else {
-            libc::EIO
-        };
-        // The child-side exec failure always exits 127. Leave the pidfd
-        // unreaped so an owned run can close coordinator state first; callers
-        // that do not have that coordinator still get safe Drop settlement.
-        Err(ExecFailure {
-            errno,
-            exit_code: 127,
-        })
     }
 
     pub(crate) fn revalidate_after_exec(&self) -> io::Result<bool> {
@@ -700,8 +981,14 @@ impl OwnedChild {
         if self.reaped {
             return Err(io::Error::other("owned child was already reaped"));
         }
-        if self.pin.wait_ready(duration)? {
-            return self.wait_blocking().map(ChildOutcome::Exited);
+        let deadline = duration.and_then(|duration| Instant::now().checked_add(duration));
+        if self.wait_ready_until(deadline)? {
+            return self
+                .try_reap_until(deadline)?
+                .map(ChildOutcome::Exited)
+                .ok_or_else(|| {
+                    io::Error::other("pidfd was ready without a reapable child status")
+                });
         }
         if !kill_on_timeout {
             return Ok(ChildOutcome::TimedOutRunning);
@@ -730,40 +1017,103 @@ impl OwnedChild {
         if self.reaped {
             return Err(io::Error::other("owned child was already reaped"));
         }
-        if self.pin.wait_ready(Some(Duration::ZERO))? {
-            return self.wait_blocking();
+        self.begin_settlement(grace.saturating_add(FINAL_KILL_GRACE));
+        let initial = self.try_reap();
+        let active = if matches!(&initial, Ok(None)) {
+            Some(self.ensure_active_generation())
+        } else {
+            None
+        };
+        let deadline = self.settlement_deadline;
+        if let Some(code) =
+            initial_settlement_probe_with(initial, active, deadline, || self.try_reap())?
+        {
+            return Ok(code);
         }
-        self.ensure_active_generation()?;
-        signal_group(self.pid, libc::SIGTERM)?;
-        if self.pin.wait_ready(Some(grace))? {
-            return self.wait_blocking();
+        let term_deadline = self.phase_deadline(grace);
+        if let Err(group) = signal_group(self.pid, libc::SIGTERM) {
+            if self.wait_ready_until(Some(term_deadline))?
+                && let Some(code) = self.try_reap_until(Some(term_deadline))?
+            {
+                return if self.released {
+                    Err(io::Error::other(format!(
+                        "owned process-group SIGTERM failed before exact child reap: {group}"
+                    )))
+                } else {
+                    Ok(code)
+                };
+            }
+            if self.released {
+                return Err(group);
+            }
+            return self.kill_and_reap_tail();
+        }
+        if self.wait_ready_until(Some(term_deadline))? {
+            return self.try_reap_until(Some(term_deadline))?.ok_or_else(|| {
+                io::Error::other("pidfd was ready without a reapable child status after SIGTERM")
+            });
         }
         self.kill_and_reap_tail()
     }
 
     fn kill_and_reap_tail(&mut self) -> io::Result<i32> {
-        if self.pin.wait_ready(Some(Duration::ZERO))? {
-            return self.wait_blocking();
+        self.begin_settlement(FINAL_KILL_GRACE);
+        if let Some(code) = self.try_reap()? {
+            return Ok(code);
         }
-        self.ensure_active_generation()?;
-        signal_group(self.pid, libc::SIGKILL)?;
-        if !self.pin.wait_ready(Some(Duration::from_secs(5)))? {
+        let group_error = signal_group(self.pid, libc::SIGKILL).err();
+        let direct_error = self.pin.send_signal(libc::SIGKILL).err();
+        if let Some(error) = direct_error {
+            if let Some(code) = self.try_reap()? {
+                return if self.released && group_error.is_some() {
+                    Err(io::Error::other(format!(
+                        "owned process-group SIGKILL failed after exact child exit: {}",
+                        group_error.unwrap()
+                    )))
+                } else {
+                    Ok(code)
+                };
+            }
+            return Err(io::Error::other(format!(
+                "direct original-pidfd SIGKILL failed: {error}{}",
+                group_error
+                    .map(|group| format!("; process-group SIGKILL also failed: {group}"))
+                    .unwrap_or_default()
+            )));
+        }
+        if !self.wait_ready_until(self.settlement_deadline)? {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "original child did not become reapable before the settlement deadline",
+            ));
+        }
+        let code = self
+            .try_reap_until(self.settlement_deadline)?
+            .ok_or_else(|| {
+                io::Error::other("pidfd was ready without a reapable child status after SIGKILL")
+            })?;
+        if self.released
+            && let Some(group) = group_error
+        {
+            return Err(io::Error::other(format!(
+                "owned process-group SIGKILL failed after exact child reap: {group}"
+            )));
+        }
+        Ok(code)
+    }
+
+    fn reap_after_escalation(&mut self) -> io::Result<i32> {
+        self.begin_settlement(FINAL_KILL_GRACE);
+        if !self.wait_ready_until(self.settlement_deadline)? {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "child reap timeout",
             ));
         }
-        self.wait_blocking()
-    }
-
-    fn reap_after_escalation(&mut self) -> io::Result<i32> {
-        match self.wait_for(Some(Duration::from_secs(5)), false)? {
-            ChildOutcome::Exited(code) => Ok(code),
-            ChildOutcome::TimedOutRunning => Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "child reap timeout",
-            )),
-        }
+        self.try_reap_until(self.settlement_deadline)?
+            .ok_or_else(|| {
+                io::Error::other("pidfd was ready without a reapable child status after escalation")
+            })
     }
 
     pub(crate) fn still_running(&self) -> bool {
@@ -786,23 +1136,78 @@ impl OwnedChild {
         Ok(self.pid)
     }
 
-    fn wait_blocking(&mut self) -> io::Result<i32> {
-        let mut status = 0;
+    fn begin_settlement(&mut self, budget: Duration) -> Instant {
+        *self.settlement_deadline.get_or_insert_with(|| {
+            Instant::now()
+                .checked_add(budget)
+                .unwrap_or_else(Instant::now)
+        })
+    }
+
+    fn phase_deadline(&self, budget: Duration) -> Instant {
+        let phase = Instant::now()
+            .checked_add(budget)
+            .unwrap_or_else(Instant::now);
+        self.settlement_deadline
+            .map_or(phase, |settlement| settlement.min(phase))
+    }
+
+    fn wait_ready_until(&self, deadline: Option<Instant>) -> io::Result<bool> {
         loop {
-            // SAFETY: this process is the parent of the exact unreaped child.
-            let waited = unsafe { libc::waitpid(self.pid as libc::pid_t, &mut status, 0) };
-            if waited == self.pid as libc::pid_t {
-                self.reaped = true;
-                return Ok(wait_status(status));
-            }
-            if waited < 0 {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::EINTR) {
-                    continue;
+            let timeout =
+                deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+            match self.pin.wait_ready(timeout) {
+                Ok(true) => return Ok(true),
+                Ok(false) => return Ok(false),
+                Err(error) if error.raw_os_error() == Some(libc::EINTR) => {
+                    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        return Ok(false);
+                    }
                 }
-                return Err(error);
+                Err(error) => return Err(error),
             }
         }
+    }
+
+    fn try_reap(&mut self) -> io::Result<Option<i32>> {
+        // SAFETY: zeroed siginfo_t is the documented waitid output buffer.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let pidfd = self.pin.pidfd()?;
+        // SAFETY: P_PIDFD identifies the retained original child descriptor;
+        // WNOHANG makes this an exact nonblocking reap attempt.
+        if unsafe {
+            libc::waitid(
+                libc::P_PIDFD,
+                pidfd.as_raw_fd() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: waitid initialized the CLD_* siginfo union fields when si_pid is nonzero.
+        let pid = unsafe { info.si_pid() };
+        if pid == 0 {
+            return Ok(None);
+        }
+        let status = unsafe { info.si_status() };
+        let code = match info.si_code {
+            libc::CLD_EXITED => status,
+            libc::CLD_KILLED | libc::CLD_DUMPED => 128 + status,
+            other => {
+                return Err(io::Error::other(format!(
+                    "unexpected waitid child status code {other}"
+                )));
+            }
+        };
+        self.reaped = true;
+        self.reaped_exit_code = Some(code);
+        Ok(Some(code))
+    }
+
+    fn try_reap_until(&mut self, deadline: Option<Instant>) -> io::Result<Option<i32>> {
+        retry_reap_with(deadline, || self.try_reap())
     }
 
     fn ensure_active_generation(&self) -> io::Result<()> {
@@ -825,17 +1230,18 @@ impl Drop for OwnedChild {
         // not, kill the owned process group and reap the exact fork child.
         self.release_writer.take();
         self.exec_reader.take();
-        if self
-            .pin
-            .wait_ready(Some(Duration::from_millis(50)))
-            .unwrap_or(false)
-        {
-            let _ = self.wait_blocking();
+        if self.try_reap().ok().flatten().is_some() {
             return;
         }
+        self.begin_settlement(FINAL_KILL_GRACE);
         let _ = signal_group(self.pid, libc::SIGKILL);
-        let _ = self.pin.wait_ready(Some(Duration::from_secs(5)));
-        let _ = self.wait_blocking();
+        let _ = self.pin.send_signal(libc::SIGKILL);
+        if self
+            .wait_ready_until(self.settlement_deadline)
+            .unwrap_or(false)
+        {
+            let _ = self.try_reap_until(self.settlement_deadline);
+        }
     }
 }
 
@@ -859,6 +1265,19 @@ fn pipe_pair() -> io::Result<(OwnedFd, OwnedFd)> {
     Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
 
+fn set_nonblocking(fd: &OwnedFd) -> io::Result<()> {
+    // SAFETY: F_GETFL reads flags for the live descriptor.
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: F_SETFL updates only status flags and preserves every existing flag.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 unsafe fn child_exec_failure_errno(fd: i32, errno: i32) -> ! {
     let errno = errno.to_ne_bytes();
     // SAFETY: this child-only error path writes one fixed stack buffer then exits.
@@ -879,26 +1298,36 @@ unsafe fn child_exec_failure_errno(fd: i32, errno: i32) -> ! {
     }
 }
 
-fn kill_and_reap_fork_child(pid: u32) {
+fn kill_and_reap_fork_child(pid: u32) -> io::Result<()> {
     // The exact fork child is still unreaped, so its numeric PID cannot have
     // been reused. This is intentionally not a general signal fallback.
     unsafe {
         libc::kill(pid as libc::pid_t, libc::SIGKILL);
     }
-    reap_fork_child(pid);
+    reap_fork_child(pid, Instant::now() + FINAL_KILL_GRACE)
 }
 
-fn reap_fork_child(pid: u32) {
+fn reap_fork_child(pid: u32, deadline: Instant) -> io::Result<()> {
     loop {
         // SAFETY: this process is the parent of the exact unreaped fork child.
-        let waited = unsafe { libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), 0) };
+        let waited =
+            unsafe { libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), libc::WNOHANG) };
         if waited == pid as libc::pid_t {
-            return;
+            return Ok(());
         }
-        if waited < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-            continue;
+        if waited < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EINTR) {
+                return Err(error);
+            }
         }
-        return;
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "original fork child cleanup deadline expired",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -909,16 +1338,6 @@ fn signal_group(pid: u32, signal: i32) -> io::Result<()> {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
-    }
-}
-
-fn wait_status(status: i32) -> i32 {
-    if libc::WIFEXITED(status) {
-        libc::WEXITSTATUS(status)
-    } else if libc::WIFSIGNALED(status) {
-        128 + libc::WTERMSIG(status)
-    } else {
-        127
     }
 }
 
@@ -1215,6 +1634,51 @@ struct Owned {
     still_running: bool,
 }
 
+/// Non-cloneable terminal authority: exact original reap AND that owner's
+/// successful loader acknowledgement. The original child stays owned until
+/// reduction completes or this optional retirement is explicitly abandoned.
+pub(crate) struct OriginalRootExit {
+    _child: OwnedChild,
+    seed: crate::attach::RootSeed,
+}
+impl OriginalRootExit {
+    fn take(
+        child: &mut Option<OwnedChild>,
+        seed: &mut Option<crate::attach::RootSeed>,
+    ) -> Result<Option<Self>> {
+        let (Some(owner), Some(ack)) = (child.as_ref(), seed.as_ref()) else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            ack.acknowledges(owner),
+            "root seed acknowledges a different original owner"
+        );
+        owner.pin().pidfd()?;
+        if !owner.is_reaped() || owner.handed_off {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            _child: child.take().unwrap(),
+            seed: seed.take().unwrap(),
+        }))
+    }
+    pub(crate) fn domain(&self) -> &crate::events::EventsDomain {
+        self.seed.domain()
+    }
+    #[cfg(test)]
+    pub(crate) fn test_reaped(domain: crate::events::EventsDomain) -> Self {
+        // A controlled fresh child and actual P_PIDFD reap; only the map/seed
+        // acknowledgement is synthetic, never kernel qualification.
+        let mut child = OwnedChild::spawn("/bin/true".into(), vec![]).unwrap();
+        let ack = crate::attach::RootSeed::test_acknowledgement(&child, domain);
+        child.release().unwrap();
+        child.terminate_and_reap().unwrap();
+        Self::take(&mut Some(child), &mut Some(ack))
+            .unwrap()
+            .unwrap()
+    }
+}
+
 fn pause_failure(error: PauseError) -> anyhow::Error {
     anyhow!("pause: {error}")
 }
@@ -1231,20 +1695,21 @@ impl Owned {
         end: CaptureEnd,
         signals: &SignalState,
     ) -> Result<()> {
-        let Some(child) = self.child.take() else {
+        let Some(child) = self.child.as_ref() else {
             return Ok(());
         };
-        let natural_exit =
-            end == CaptureEnd::TargetExit && child.pin().original_exited().unwrap_or(false);
-        engine.finish_owned_selection_coverage(natural_exit);
+        let observation = child.pin().original_exited().map_err(anyhow::Error::msg);
+        engine.finish_owned_selection_coverage(
+            end == CaptureEnd::TargetExit && matches!(observation, Ok(true)),
+        );
         let cleanup = {
             let marker = marker_never_seen();
             let cancelled = cancelled_by(signals);
-            let mut io = SessionPauseIo::new(engine, session, &child, &marker, &cancelled);
+            let mut io = SessionPauseIo::new(engine, session, child, &marker, &cancelled);
             self.coordinator.cleanup(&mut io)
         };
         let settled = settle_owned_child(
-            child,
+            &mut self.child,
             end,
             cleanup.is_ok(),
             self.kill_on_timeout,
@@ -1255,13 +1720,16 @@ impl Owned {
         );
         // Both outcomes are retained: a cleanup failure must not be lost
         // behind a reap failure, or the other way round (design §10.3).
-        combine_finish_errors(cleanup.map_err(pause_failure), settled)
+        combine_finish_errors(
+            observation.map(|_| ()),
+            combine_finish_errors(cleanup.map_err(pause_failure), settled),
+        )
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn settle_owned_child(
-    mut child: OwnedChild,
+    retained: &mut Option<OwnedChild>,
     end: CaptureEnd,
     cleanup_ok: bool,
     kill_on_timeout: bool,
@@ -1278,16 +1746,41 @@ fn settle_owned_child(
     // An expired `--duration` is the only end that may hand back a live
     // child, and only after coordinator cleanup succeeds.
     let can_hand_off = cleanup_ok && end.allows_handoff(kill_on_timeout) && signals.claim_handoff();
-    let settled: Result<ChildOutcome> = if can_hand_off {
-        stage_handoff(child, pending)
-    } else if (end == CaptureEnd::Signal || signals.interrupted()) && child.still_running() {
-        settle_after_signal(&mut child, signals)
-    } else {
-        child
-            .terminate_and_reap()
-            .map(ChildOutcome::Exited)
-            .map_err(|error| anyhow!("run: reaping the owned child: {error}"))
-    };
+    if can_hand_off {
+        let outcome = stage_handoff(retained, pending)?;
+        match outcome {
+            ChildOutcome::Exited(code) => {
+                *exit_code = Some(code);
+                *still_running = false;
+            }
+            ChildOutcome::TimedOutRunning => {
+                *exit_code = None;
+                *still_running = true;
+            }
+        }
+        return Ok(());
+    }
+    let child = retained
+        .as_mut()
+        .context("owned child missing during settlement")?;
+    let settled: Result<ChildOutcome> =
+        if (end == CaptureEnd::Signal || signals.interrupted()) && child.still_running() {
+            settle_after_signal(child, signals)
+        } else {
+            child
+                .terminate_and_reap()
+                .map(ChildOutcome::Exited)
+                .map_err(|error| anyhow!("run: reaping the owned child: {error}"))
+        };
+    record_settlement_result(child, settled, exit_code, still_running)
+}
+
+fn record_settlement_result(
+    child: &OwnedChild,
+    settled: Result<ChildOutcome>,
+    exit_code: &mut Option<i32>,
+    still_running: &mut bool,
+) -> Result<()> {
     match settled {
         Ok(ChildOutcome::Exited(code)) => {
             *exit_code = Some(code);
@@ -1299,17 +1792,29 @@ fn settle_owned_child(
             *still_running = true;
             Ok(())
         }
-        Err(error) => Err(anyhow!("run: reaping the owned child: {error}")),
+        Err(error) => {
+            if child.is_reaped() {
+                *exit_code = child.reaped_exit_code;
+                *still_running = false;
+            }
+            Err(anyhow!("run: reaping the owned child: {error}"))
+        }
     }
 }
 
-fn stage_handoff(mut child: OwnedChild, pending: &mut Option<OwnedChild>) -> Result<ChildOutcome> {
+fn stage_handoff(
+    retained: &mut Option<OwnedChild>,
+    pending: &mut Option<OwnedChild>,
+) -> Result<ChildOutcome> {
+    let child = retained
+        .as_mut()
+        .context("owned child missing during handoff")?;
     match child
         .wait_for(Some(Duration::ZERO), false)
         .map_err(|error| anyhow!("run: waiting for the owned child: {error}"))?
     {
         outcome @ ChildOutcome::TimedOutRunning => {
-            *pending = Some(child);
+            *pending = retained.take();
             Ok(outcome)
         }
         outcome => Ok(outcome),
@@ -1337,13 +1842,18 @@ fn settle_after_signal_with_grace(
     signals: &SignalState,
     grace: Duration,
 ) -> Result<ChildOutcome> {
+    child.begin_settlement(grace.saturating_mul(2).saturating_add(FINAL_KILL_GRACE));
     let signal = signals
         .first_signal()
         .ok_or_else(|| anyhow!("run: signal settlement lost the first signal identity"))?;
-    child
-        .forward_signal(signal)
-        .map_err(|error| anyhow!("run: forwarding signal {signal}: {error}"))?;
-    let mut deadline = Instant::now() + grace;
+    let forward = child.forward_signal(signal);
+    let deadline = child.settlement_deadline;
+    if let Some(code) = initial_signal_forward_with(forward, deadline, || child.try_reap())
+        .map_err(|error| anyhow!("run: forwarding signal {signal}: {error}"))?
+    {
+        return Ok(ChildOutcome::Exited(code));
+    }
+    let mut deadline = child.phase_deadline(grace);
     let mut second_sigint_forwarded = false;
     let mut fallback_term_forwarded = false;
     loop {
@@ -1385,7 +1895,7 @@ fn settle_after_signal_with_grace(
                 return Err(anyhow!("run: forwarding fallback SIGTERM: {error}"));
             }
             fallback_term_forwarded = true;
-            deadline = Instant::now() + grace;
+            deadline = child.phase_deadline(grace);
             continue;
         }
         match child
@@ -1417,6 +1927,24 @@ fn combine_handoff_failure(primary: anyhow::Error, abort: Result<()>) -> anyhow:
         Ok(()) => primary,
         Err(abort) => primary.context(format!("aborting pending handoff also failed: {abort:#}")),
     }
+}
+
+fn combine_setup_failure(primary: anyhow::Error, child: &mut OwnedChild) -> anyhow::Error {
+    match child.terminate_and_reap() {
+        Ok(_) => primary,
+        Err(cleanup) => primary.context(format!(
+            "settling the original child after setup failure also failed: {cleanup}"
+        )),
+    }
+}
+
+fn combine_preflight_failure_with(
+    primary: anyhow::Error,
+    mut detach: impl FnMut() -> Result<()>,
+    mut settle: impl FnMut() -> Result<()>,
+) -> anyhow::Error {
+    let primary = combine_detach::<()>(Err(primary), detach()).unwrap_err();
+    combine_finish_errors(Err(primary), settle()).unwrap_err()
 }
 
 fn combine_finish_errors(cleanup: Result<()>, settled: Result<()>) -> Result<()> {
@@ -1535,8 +2063,9 @@ fn run_owned_inner(args: &RunArgs) -> Result<OwnedRunOutcome> {
     let mut child = OwnedChild::spawn(program, command.collect())
         .map_err(|error| anyhow!("run: starting the owned child: {error}"))?;
     let pid = child.pid();
-    let view = ProcessView::open(ProcessViewId(0), pid)
-        .map_err(|error| anyhow!("run: opening the owned child: {error}"))?;
+    let view = ProcessView::open(ProcessViewId(0), pid).map_err(|error| {
+        combine_setup_failure(anyhow!("run: opening the owned child: {error}"), &mut child)
+    })?;
     let scope = Scope::Pid(pid);
     let capture_args = CaptureArgs {
         kind: args.kind,
@@ -1553,46 +2082,84 @@ fn run_owned_inner(args: &RunArgs) -> Result<OwnedRunOutcome> {
     };
     // Initial capture still uses the one `discover_plan` pass and keeps its
     // accepted state inside `Engine`; nothing below rescans or reopens.
-    let mut engine = Engine::discover(&capture_args, &scope, Some(view))?;
-    let stop = install_stop_flag()?;
+    let mut engine = Engine::discover(&capture_args, &scope, Some(view))
+        .map_err(|error| combine_setup_failure(error, &mut child))?;
+    let stop = install_stop_flag().map_err(|error| combine_setup_failure(error, &mut child))?;
     // Before the attach, and before the child crosses its barrier: a bad `-o`
     // path must never cost a released child or a loaded session.
-    let out = OutputSink::open(args.kind, args.out.as_deref())?;
+    let out = OutputSink::open(args.kind, args.out.as_deref())
+        .map_err(|error| combine_setup_failure(error, &mut child))?;
 
     // `start_owned_session` arms the pre-exec loader context before the
     // barrier when exact PT_INTERP binding is safe, and otherwise leaves
     // `initial_set_capture = none` with sticky `PARTIAL`.
     let mut session = engine
         .start_owned_session(policy, &mut child)
-        .context("starting attach session")?;
+        .context("starting attach session")
+        .map_err(|error| combine_setup_failure(error, &mut child))?;
 
-    let mut owned = {
+    let preflight = {
         let marker = marker_never_seen();
         let cancelled = cancelled_by(&stop);
         let mut io = SessionPauseIo::new(&mut engine, &mut session, &child, &marker, &cancelled);
-        let mut coordinator =
-            PauseCoordinator::preflight(args.pause, &child, &mut io).map_err(pause_failure)?;
-        // Arm before the barrier: the owned window has to be protected from
-        // the child's first loader event, not from the first tick after it.
-        coordinator.arm(&mut io).map_err(pause_failure)?;
-        Owned {
-            child: Some(child),
-            pending_handoff: None,
-            coordinator,
-            policy: args.pause,
-            kill_on_timeout: args.kill_on_timeout,
-            pid,
-            exit_code: None,
-            still_running: false,
+        PauseCoordinator::preflight(args.pause, &child, &mut io).map_err(pause_failure)
+    };
+    let coordinator = match preflight {
+        Ok(coordinator) => coordinator,
+        Err(error) => {
+            return Err(combine_preflight_failure_with(
+                error,
+                || session.detach_producers(),
+                || {
+                    child
+                        .terminate_and_reap()
+                        .map(|_| ())
+                        .map_err(|error| anyhow!("run: settling the original child: {error}"))
+                },
+            ));
         }
     };
+    let mut owned = Owned {
+        child: Some(child),
+        pending_handoff: None,
+        coordinator,
+        policy: args.pause,
+        kill_on_timeout: args.kill_on_timeout,
+        pid,
+        exit_code: None,
+        still_running: false,
+    };
+
+    // Arm before the barrier: the owned window has to be protected from the
+    // child's first loader event, not from the first tick after it. Owned is
+    // already constructed so an arm failure uses coordinator-first cleanup.
+    {
+        let marker = marker_never_seen();
+        let cancelled = cancelled_by(&stop);
+        let child = owned
+            .child
+            .as_ref()
+            .expect("owned child is present before arm");
+        let mut io = SessionPauseIo::new(&mut engine, &mut session, child, &marker, &cancelled);
+        if let Err(error) = owned.coordinator.arm(&mut io) {
+            return Err(finish_capture_error(
+                pause_failure(error),
+                &mut engine,
+                &mut session,
+                Some(&mut owned),
+                &stop,
+            ));
+        }
+    }
 
     let release = owned
         .child
         .as_mut()
         .expect("owned child is present before release")
-        .release()
-        .map_err(|failure| anyhow!("run: exec {failure}"));
+        .release_until(Instant::now() + EXEC_HANDOFF_TIMEOUT, || {
+            stop.first_signal()
+        })
+        .map_err(|failure| anyhow!("run: {failure}"));
     if let Err(error) = release {
         return Err(finish_capture_error(
             error,
@@ -1779,63 +2346,220 @@ fn warn_unsafe_policy(policy: CapturePolicy) {
 }
 
 fn identify_tracked(
+    domain: u64,
     tracker: &mut process::Tracker,
     state: &mut semantics::State,
     ev: &p11scope_ebpf_common::Event,
-) -> semantics::ProcessKey {
-    let pid = (ev.pid_tgid >> 32) as u32;
-    let identified = tracker.identify(pid);
-    if let Some(retired) = identified.retired {
-        state.retire_process(retired);
+) -> Option<semantics::ProcessKey> {
+    if !state.accepts_domain(domain) || ev.event_type != p11scope_ebpf_common::event_type::CALL {
+        state.reject_history(ev);
+        return None;
     }
-    identified.key
+    let (key, retired) = tracker.admit_history(domain, (ev.pid_tgid >> 32) as u32, ev.image);
+    for old in retired {
+        state.retire_process(old);
+    }
+    if let Some(key) = key {
+        tracker.history_call(key);
+        tracker.history_root(key, ev.root_affiliation);
+    } else {
+        state.reject_history(ev);
+    }
+    key
+}
+/// Legacy test-only injected retirement. Production requires the non-cloneable
+/// completed root-tail token below.
+#[cfg(test)]
+fn apply_confirmed_retirement(
+    tracker: &mut process::Tracker,
+    state: &mut semantics::State,
+    key: semantics::ProcessKey,
+) {
+    if let Some(key) = tracker.confirm_history_retirement(key) {
+        state.retire_process(key);
+    }
+}
+fn apply_original_root_retirement(
+    tracker: &mut process::Tracker,
+    state: &mut semantics::State,
+    tail: crate::events::ConsumedOriginalRootTail,
+) -> Result<()> {
+    anyhow::ensure!(
+        state.accepts_domain(tail.domain()),
+        "foreign root retirement state"
+    );
+    for key in tracker.complete_root(&tail)? {
+        state.retire_process(key);
+    }
+    Ok(())
 }
 
-fn retire_exited(tracker: &mut process::Tracker, state: &mut semantics::State) {
-    for process in tracker.poll_exited() {
-        state.retire_process(process);
+enum OriginalRootDrain {
+    Absent,
+    Completed {
+        malformed: u64,
+        tail: Box<crate::events::ConsumedOriginalRootTail>,
+    },
+    Cancelled {
+        malformed: u64,
+        remaining: usize,
+    },
+}
+
+/// The only production root-tail orchestration. A live handoff or an unowned
+/// session has no witness. No ordinary EVENTS read occurs while this tail is
+/// active, and all failure returns explicitly abandon optional retirement.
+fn drain_original_root_events(
+    session: &mut Session,
+    owned: Option<&mut Owned>,
+    signals: &SignalState,
+    reduce: impl FnMut(u64, p11scope_ebpf_common::Event) -> Result<()>,
+) -> Result<OriginalRootDrain> {
+    let Some(owned) = owned else {
+        return Ok(OriginalRootDrain::Absent);
+    };
+    let mut seed = session.take_root_seed();
+    let Some(exit) = OriginalRootExit::take(&mut owned.child, &mut seed)
+        .context("root_tail_incomplete: original ownership")?
+    else {
+        return Ok(OriginalRootDrain::Absent);
+    };
+    let tail = crate::events::OwnedRootTail::new(
+        exit,
+        Instant::now() + crate::events::ROOT_TAIL_FENCE_TIMEOUT,
+    );
+    let mut drain = session
+        .event_drain()
+        .context("root_tail_incomplete: EVENTS reader")?;
+    drain_original_root_events_from(&mut drain, tail, signals, reduce)
+}
+
+fn drain_original_root_events_from<S: crate::events::BoundedRecordSource>(
+    drain: &mut crate::events::EventDrain<S>,
+    mut tail: crate::events::OwnedRootTail,
+    signals: &SignalState,
+    mut reduce: impl FnMut(u64, p11scope_ebpf_common::Event) -> Result<()>,
+) -> Result<OriginalRootDrain> {
+    drain.begin_root_tail(&mut tail)?;
+    let domain = drain.domain_id();
+    loop {
+        if let Some(remaining) = tail.cancellation(signals.interrupted(), Instant::now())? {
+            // The original child and domain stay retained until this explicit
+            // abandonment; this outcome cannot carry a retirement token.
+            return Ok(OriginalRootDrain::Cancelled {
+                malformed: drain.malformed(),
+                remaining,
+            });
+        }
+        match drain.poll_root_tail(&mut tail, crate::events::LIVE_POLL_QUANTUM, |ev| {
+            reduce(domain, ev)
+        })? {
+            crate::events::RootTailProgress::Reached => {
+                if let Some(remaining) = tail.cancellation(signals.interrupted(), Instant::now())? {
+                    return Ok(OriginalRootDrain::Cancelled {
+                        malformed: drain.malformed(),
+                        remaining,
+                    });
+                }
+                return Ok(OriginalRootDrain::Completed {
+                    malformed: drain.malformed(),
+                    tail: Box::new(tail.complete()?),
+                });
+            }
+            crate::events::RootTailProgress::Yielded => {}
+            crate::events::RootTailProgress::Pending => {
+                std::thread::sleep(Duration::from_millis(1))
+            }
+        }
+    }
+}
+
+/// The existing profile and trace finalization paths share this root-error gate.
+fn terminal_after_root<T>(
+    root: Result<OriginalRootDrain>,
+    diagnostics: &mut dyn Write,
+    finalize: impl FnOnce((u64, Option<crate::events::ConsumedOriginalRootTail>)) -> Result<T>,
+) -> Result<T> {
+    let (malformed, completed, diagnostic) = match root? {
+        OriginalRootDrain::Absent => (0, None, Ok(())),
+        OriginalRootDrain::Completed { malformed, tail } => (malformed, Some(*tail), Ok(())),
+        OriginalRootDrain::Cancelled {
+            malformed,
+            remaining,
+        } => (
+            malformed,
+            None,
+            writeln!(
+                diagnostics,
+                "p11scope: root_tail_incomplete: cancelled; remaining={remaining}"
+            )
+            .context("writing incomplete root-tail diagnostic"),
+        ),
+    };
+    // Even a diagnostic write failure must not hide a concurrent genuine
+    // finalization/output error. The existing finalizer owns both output paths.
+    match (finalize((malformed, completed)), diagnostic) {
+        (result, Ok(())) => result,
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(diagnostic)) => {
+            Err(error.context(format!("root-tail diagnostic also failed: {diagnostic:#}")))
+        }
     }
 }
 
 fn observe_fork(
+    domain: u64,
     tracker: &mut process::Tracker,
     state: &mut semantics::State,
     scope: &Scope,
     ev: &p11scope_ebpf_common::Event,
 ) -> bool {
+    use p11scope_ebpf_common::event_type;
     if !matches!(
         ev.event_type,
-        p11scope_ebpf_common::event_type::FORK | p11scope_ebpf_common::event_type::FORK_INTO_CGROUP
+        event_type::FORK | event_type::FORK_INTO_CGROUP
     ) {
         return false;
     }
-    if !matches!(scope, Scope::Cgroup { .. }) {
+    if ev.root_affiliation == 0
+        && (ev.event_type == event_type::FORK_INTO_CGROUP || !matches!(scope, Scope::Cgroup { .. }))
+    {
         return true;
     }
     let parent_pid = (ev.pid_tgid >> 32) as u32;
-    if ev.event_type == p11scope_ebpf_common::event_type::FORK_INTO_CGROUP {
+    if !state.accepts_domain(domain)
+        || parent_pid == 0
+        || ev.session == 0
+        || ev.session > u64::from(u32::MAX)
+        || ev.session as u32 == parent_pid
+        || ev.image.task_cookie == 0
+        || ev.child_image.task_cookie == 0
+        || ev.image.task_cookie == ev.child_image.task_cookie
+    {
+        state.reject_history(ev);
         return true;
     }
-    if !state.pid_has_process_state(parent_pid) {
+    let (parent, retired) = tracker.admit_history(domain, (ev.pid_tgid >> 32) as u32, ev.image);
+    for old in retired {
+        state.retire_process(old);
+    }
+    if let Some(parent) = parent {
+        tracker.history_root(parent, ev.root_affiliation);
+    }
+    if ev.event_type == event_type::FORK_INTO_CGROUP || !matches!(scope, Scope::Cgroup { .. }) {
         return true;
     }
-    let parent = tracker.identify(parent_pid);
-    if let Some(retired) = parent.retired {
-        state.retire_process(retired);
+    let (child, retired) = tracker.admit_history(domain, ev.session as u32, ev.child_image);
+    for old in retired {
+        state.retire_process(old);
     }
-    if !state.has_process_state(parent.key) {
-        tracker.retire(parent.key);
-        return true;
+    if let (Some(parent), Some(child)) = (parent, child) {
+        if tracker.history_birth(parent, child) {
+            state.fork_process(parent, child);
+            return true;
+        }
     }
-    let child = tracker.identify(ev.session as u32);
-    if let Some(retired) = child.retired {
-        state.retire_process(retired);
-    }
-    state.fork_process(parent.key, child.key);
-    if !state.has_process_state(child.key) {
-        state.retire_process(child.key);
-        tracker.retire(child.key);
-    }
+    state.reject_history(ev);
     true
 }
 
@@ -1934,27 +2658,22 @@ fn capture_end(
     interrupted: &SignalState,
     elapsed: Duration,
     duration: Option<Duration>,
-) -> Option<CaptureEnd> {
+) -> Result<Option<CaptureEnd>> {
     if interrupted.interrupted() {
-        Some(CaptureEnd::Signal)
-    } else if engine.expected_target_exit()
-        // An owned child that has already exited ends its run the ordinary
-        // way too, without waiting for its exit record: the pidfd is the
-        // definitive answer, and the terminal drain below still collects
-        // everything the ring holds.
-        || owned.is_some_and(|owned| {
-            owned
-                .child
-                .as_ref()
-                .is_some_and(|child| !child.still_running())
-        })
-    {
+        return Ok(Some(CaptureEnd::Signal));
+    }
+    let original_exited = owned
+        .and_then(|owned| owned.child.as_ref())
+        .map(|child| child.pin().original_exited().map_err(anyhow::Error::msg))
+        .transpose()?
+        .unwrap_or(false);
+    Ok(if original_exited || engine.expected_target_exit() {
         Some(CaptureEnd::TargetExit)
     } else if should_stop(interrupted, elapsed, duration) {
         Some(CaptureEnd::DurationExpired)
     } else {
         None
-    }
+    })
 }
 
 /// How long to wait before the next tick. An open pause owner replaces the
@@ -1997,8 +2716,9 @@ fn capture_profile(
 
     // Only `--mode profile` decodes the event stream; `--mode metrics` never
     // drains the ring buffer, so it stays the lighter, maps-only level.
-    let mut state = semantics::State::with_policy(engine.plan(), policy);
-    let mut process_tracker = process::Tracker::new();
+    let domain = session.events_domain();
+    let mut state = semantics::State::for_capture(engine.plan(), policy, domain.clone());
+    let mut process_tracker = process::Tracker::for_producer(domain, 16_384);
     if policy.uses_unsafe_decoders() {
         if let Err(error) = load_mech_shapes(&mut state) {
             return Err(finish_capture_error(
@@ -2014,11 +2734,10 @@ fn capture_profile(
                         state: &mut semantics::State,
                         tracker: &mut process::Tracker|
      -> Result<u64> {
-        let quantum = session.live_poll_quantum();
-        let mut drain = session.event_drain()?;
-        Ok(drain_profile_events(
-            &mut drain, state, tracker, scope, quantum,
-        ))
+        select_and_drain_events(session, Session::live_poll_quantum, |session, quantum| {
+            let mut drain = session.event_drain()?;
+            drain_profile_events(&mut drain, state, tracker, scope, quantum)
+        })
     };
     let mut malformed_records: u64 = 0;
     let capture_tracking_degraded = initial_tracking_evidence(
@@ -2043,7 +2762,7 @@ fn capture_profile(
         if plan_changed {
             state.sync_plan(engine.plan());
         }
-        if let Some(end) = capture_end(engine, owned.as_deref(), interrupted, elapsed, duration) {
+        if let Some(end) = capture_end(engine, owned.as_deref(), interrupted, elapsed, duration)? {
             break Ok(end);
         }
         // 3. Drain call events — one quantum while the producers are live, so
@@ -2056,7 +2775,6 @@ fn capture_profile(
             )?;
         }
         // 4. Retire exited process state.
-        retire_exited(&mut process_tracker, &mut state);
         // 5. Snapshot metrics and counters.
         let mut kernel_evidence = metrics::kernel_evidence(session)?;
         if !profile {
@@ -2129,6 +2847,13 @@ fn capture_profile(
     if plan_changed {
         state.sync_plan(engine.plan());
     }
+    let root_result = if profile {
+        drain_original_root_events(session,owned.as_deref_mut(),interrupted,
+            |domain, ev| reduce_profile_event(domain,&mut process_tracker,&mut state,scope,ev))
+    } else { Ok(OriginalRootDrain::Absent) };
+    terminal_after_root(root_result,&mut std::io::stderr(),|(malformed,completed)| {
+        malformed_records += malformed;
+        if let Some(completed) = completed { apply_original_root_retirement(&mut process_tracker,&mut state,completed)?; }
     if profile {
         malformed_records += drain_events(
             session,
@@ -2136,7 +2861,6 @@ fn capture_profile(
             &mut process_tracker,
         )?;
     }
-    retire_exited(&mut process_tracker, &mut state);
     let reports = metrics::read(session, engine.plan())?;
     let mut kernel_evidence = metrics::kernel_evidence(session)?;
     if !profile {
@@ -2210,6 +2934,7 @@ fn capture_profile(
     }
 
     Ok(ev)
+    })
     })();
     combine_detach(terminal, detach)
 }
@@ -2253,8 +2978,9 @@ fn capture_trace(
     let mut stdout_sink = std::io::stdout().lock();
     let stdout: &mut dyn Write = &mut stdout_sink;
 
-    let mut state = semantics::State::with_policy(engine.plan(), policy);
-    let mut process_tracker = process::Tracker::new();
+    let domain = session.events_domain();
+    let mut state = semantics::State::for_capture(engine.plan(), policy, domain.clone());
+    let mut process_tracker = process::Tracker::for_producer(domain, 16_384);
     if policy.uses_unsafe_decoders()
         && let Err(error) = load_mech_shapes(&mut state)
     {
@@ -2304,7 +3030,7 @@ fn capture_trace(
             state.sync_plan(engine.plan());
             tracer.sync_plan(engine.plan());
         }
-        if let Some(end) = capture_end(engine, owned.as_deref(), interrupted, elapsed, duration) {
+        if let Some(end) = capture_end(engine, owned.as_deref(), interrupted, elapsed, duration)? {
             break Ok(end);
         }
         // 3. Drain call events — one quantum while the producers are live, and
@@ -2325,7 +3051,6 @@ fn capture_trace(
             break Ok(CaptureEnd::LimitReached);
         }
         // 4. Retire exited process state.
-        retire_exited(&mut process_tracker, &mut state);
         // 5. Snapshot the loss counter.
         report_trace_loss(
             session,
@@ -2375,6 +3100,18 @@ fn capture_trace(
         state.sync_plan(engine.plan());
         tracer.sync_plan(engine.plan());
     }
+    let mut root_write_error = None;
+    let root_result = drain_original_root_events(session,owned.as_deref_mut(),interrupted,
+        |domain, ev| reduce_trace_event(domain,&mut remaining,&mut state,&mut process_tracker,scope,&mut tracer,
+            stdout,&mut stdout_open,out_file,&mut root_write_error,ev));
+    let root_result = root_result.map_err(|error|
+        combine_trace_errors(Err(error),root_write_error.take()).unwrap_err());
+    terminal_after_root(root_result,&mut std::io::stderr(),|(malformed,completed)| {
+        malformed_records += malformed;
+        let retirement = if let Some(completed) = completed {
+            apply_original_root_retirement(&mut process_tracker,&mut state,completed)
+        } else { Ok(()) };
+        combine_trace_errors(retirement,root_write_error)?;
     malformed_records += drain_trace_events(
         session,
         &mut remaining,
@@ -2386,7 +3123,6 @@ fn capture_trace(
         &mut stdout_open,
         out_file,
     )?;
-    retire_exited(&mut process_tracker, &mut state);
     engine
         .pinned()
         .check_unchanged()
@@ -2450,6 +3186,7 @@ fn capture_trace(
     }
 
     Ok(evidence)
+    })
     })();
     combine_detach(terminal, detach)
 }
@@ -2540,26 +3277,52 @@ fn emit_bounded_trace_event<W: Write, F: FnOnce() -> String>(
 /// One profile poll: `Some(quantum)` on the live ring, `None` once the
 /// producers are detached and the drain is finite. Returns the malformed
 /// count so far.
+fn select_and_drain_events<C, T>(
+    context: &mut C,
+    select: impl FnOnce(&C) -> Option<usize>,
+    drain: impl FnOnce(&mut C, Option<usize>) -> Result<T>,
+) -> Result<T> {
+    let quantum = select(context);
+    drain(context, quantum)
+}
+
+fn reduce_profile_event(
+    domain: u64,
+    tracker: &mut process::Tracker,
+    state: &mut semantics::State,
+    scope: &Scope,
+    ev: p11scope_ebpf_common::Event,
+) -> Result<()> {
+    tracker.check_root_event(domain, ev.root_affiliation)?;
+    if !observe_fork(domain, tracker, state, scope, &ev)
+        && let Some(process) = identify_tracked(domain, tracker, state, &ev)
+    {
+        state.observe_process(process, &ev);
+    }
+    Ok(())
+}
+
 fn drain_profile_events<S: crate::events::RecordSource>(
     drain: &mut crate::events::EventDrain<S>,
     state: &mut semantics::State,
     tracker: &mut process::Tracker,
     scope: &Scope,
     quantum: Option<usize>,
-) -> u64 {
+) -> Result<u64> {
+    let domain = drain.domain_id();
+    let mut failure = None;
     drain.poll(quantum, |ev| {
-        if observe_fork(tracker, state, scope, &ev) {
-            return ControlFlow::Continue(());
+        if let Err(error) = reduce_profile_event(domain, tracker, state, scope, ev) {
+            failure = Some(error);
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
         }
-        let process = identify_tracked(tracker, state, &ev);
-        state.observe_process(process, &ev);
-        if !state.has_process_state(process) {
-            state.retire_process(process);
-            tracker.retire(process);
-        }
-        ControlFlow::Continue(())
     });
-    drain.malformed()
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    Ok(drain.malformed())
 }
 
 /// Drains what the ring buffer currently holds — one quantum on the live
@@ -2578,20 +3341,76 @@ fn drain_trace_events<W: Write>(
     stdout_open: &mut bool,
     out_file: &mut Option<W>,
 ) -> Result<u64> {
-    let quantum = session.live_poll_quantum();
-    let mut drain = session.event_drain()?;
-    drain_trace_events_from(
-        &mut drain,
-        remaining,
-        state,
-        tracker,
-        scope,
-        tracer,
-        stdout,
-        stdout_open,
-        out_file,
-        quantum,
-    )
+    select_and_drain_events(session, Session::live_poll_quantum, |session, quantum| {
+        let mut drain = session.event_drain()?;
+        drain_trace_events_from(
+            &mut drain,
+            remaining,
+            state,
+            tracker,
+            scope,
+            tracer,
+            stdout,
+            stdout_open,
+            out_file,
+            quantum,
+        )
+    })
+}
+
+fn combine_trace_errors(reduction: Result<()>, write_error: Option<anyhow::Error>) -> Result<()> {
+    match (reduction, write_error) {
+        (Ok(()), None) => Ok(()),
+        (Err(error), None) | (Ok(()), Some(error)) => Err(error),
+        (Err(reduction), Some(output)) => {
+            Err(reduction.context(format!("trace output also failed: {output:#}")))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reduce_trace_event<W: Write>(
+    domain: u64,
+    remaining: &mut Option<u64>,
+    state: &mut semantics::State,
+    tracker: &mut process::Tracker,
+    scope: &Scope,
+    tracer: &mut trace::Tracer,
+    stdout: &mut dyn Write,
+    stdout_open: &mut bool,
+    out_file: &mut Option<W>,
+    write_error: &mut Option<anyhow::Error>,
+    ev: p11scope_ebpf_common::Event,
+) -> Result<()> {
+    tracker.check_root_event(domain, ev.root_affiliation)?;
+    tracer.count_raw_call(&ev);
+    if observe_fork(domain, tracker, state, scope, &ev) {
+        return Ok(());
+    }
+    let process = identify_tracked(domain, tracker, state, &ev);
+    if write_error.is_some() {
+        if let Some(process) = process {
+            state.observe_process(process, &ev);
+        }
+    } else {
+        let (emitted, error) = emit_bounded_trace_event(
+            remaining,
+            || match process {
+                Some(process) => tracer.on_event_process(&ev, process, state),
+                None => tracer.on_rejected_history(&ev),
+            },
+            stdout,
+            stdout_open,
+            out_file,
+        );
+        *write_error = error;
+        if !emitted {
+            if let Some(process) = process {
+                state.observe_process(process, &ev);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2608,30 +3427,24 @@ fn drain_trace_events_from<S: crate::events::RecordSource, W: Write>(
     quantum: Option<usize>,
 ) -> Result<u64> {
     let mut write_error = None;
+    let mut reduction_error = None;
+    let domain = drain.domain_id();
     drain.poll(quantum, |ev| {
-        tracer.count_raw_call(&ev);
-        if observe_fork(tracker, state, scope, &ev) {
-            return ControlFlow::Continue(());
-        }
-        let process = identify_tracked(tracker, state, &ev);
-        if write_error.is_some() {
-            state.observe_process(process, &ev);
-        } else {
-            let (emitted, error) = emit_bounded_trace_event(
-                remaining,
-                || tracer.on_event_process(&ev, process, state),
-                stdout,
-                stdout_open,
-                out_file,
-            );
-            write_error = error;
-            if !emitted {
-                state.observe_process(process, &ev);
-            }
-        }
-        if !state.has_process_state(process) {
-            state.retire_process(process);
-            tracker.retire(process);
+        if let Err(error) = reduce_trace_event(
+            domain,
+            remaining,
+            state,
+            tracker,
+            scope,
+            tracer,
+            stdout,
+            stdout_open,
+            out_file,
+            &mut write_error,
+            ev,
+        ) {
+            reduction_error = Some(error);
+            return ControlFlow::Break(());
         }
         // Live only: the last permitted line ends the capture, and what is
         // still queued waits for the post-detach terminal drain, which reads
@@ -2642,9 +3455,7 @@ fn drain_trace_events_from<S: crate::events::RecordSource, W: Write>(
             ControlFlow::Continue(())
         }
     });
-    if let Some(error) = write_error {
-        return Err(error);
-    }
+    combine_trace_errors(reduction_error.map_or(Ok(()), Err), write_error)?;
     Ok(drain.malformed())
 }
 
@@ -2751,6 +3562,7 @@ fn evidence_for(
         start_insert_failures: kernel_evidence.start_insert_failures,
         unmatched_returns: kernel_evidence.unmatched_returns,
         rv_update_failures: kernel_evidence.rv_update_failures,
+        abi_refusals: kernel_evidence.abi_refusals,
         cgroup_scope_failures: kernel_evidence.cgroup_scope_failures,
         semantic_capture_failures: kernel_evidence.semantic_capture_failures
             + semantic.semantic_capture_failures,
@@ -2772,6 +3584,7 @@ fn evidence_for(
         async_evictions: semantic.async_evictions,
         fork_state_ambiguities: semantic.fork_state_ambiguities,
         semantic_state_drops: semantic.semantic_state_drops,
+        semantic_history_drops: semantic.semantic_history_drops,
         pending_at_end: state.pending_at_end(),
         malformed_records,
         orphan_ops: state.orphan_ops(),
@@ -2859,8 +3672,12 @@ fn fmt_rfc3339(t: SystemTime) -> String {
 mod tests {
     use super::*;
     use std::ffi::OsString;
+    use std::os::fd::{AsFd as _, BorrowedFd};
     use std::os::unix::fs::PermissionsExt as _;
+    use std::sync::Mutex;
     use std::time::{Duration, Instant};
+
+    static ACTUAL_SIGNAL_TEST: Mutex<()> = Mutex::new(());
 
     fn spawn(program: &str, args: &[&str]) -> OwnedChild {
         OwnedChild::spawn(
@@ -2887,6 +3704,469 @@ mod tests {
             assert!(Instant::now() < deadline, "{message}");
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    fn duplicate_fd(fd: BorrowedFd<'_>) -> OwnedFd {
+        // SAFETY: F_DUPFD_CLOEXEC duplicates the retained live descriptor and
+        // returns a separately owned descriptor on success.
+        let duplicate = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+        assert!(
+            duplicate >= 0,
+            "duplicating the original pidfd: {}",
+            io::Error::last_os_error()
+        );
+        // SAFETY: successful F_DUPFD_CLOEXEC returned a new owned descriptor.
+        unsafe { OwnedFd::from_raw_fd(duplicate) }
+    }
+
+    fn original_child_is_stopped(pidfd: BorrowedFd<'_>) -> bool {
+        // SAFETY: zeroed siginfo_t is the documented waitid output buffer.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: P_PIDFD consumes only the borrowed descriptor value and
+        // WNOWAIT observes without consuming the eventual exit status.
+        let waited = unsafe {
+            libc::waitid(
+                libc::P_PIDFD,
+                pidfd.as_raw_fd() as libc::id_t,
+                &mut info,
+                libc::WSTOPPED | libc::WNOWAIT | libc::WNOHANG,
+            )
+        };
+        assert_eq!(
+            waited,
+            0,
+            "observing stopped original child: {}",
+            io::Error::last_os_error()
+        );
+        // SAFETY: waitid initialized the CLD_STOPPED siginfo union fields.
+        unsafe {
+            info.si_pid() != 0
+                && info.si_code == libc::CLD_STOPPED
+                && info.si_status() == libc::SIGSTOP
+        }
+    }
+
+    fn release_for_cancellation_regression(
+        child: &mut OwnedChild,
+        deadline: Instant,
+        signals: &SignalState,
+        pending: impl FnMut(),
+    ) -> String {
+        match child.release_until_with_pending(deadline, || signals.first_signal(), pending) {
+            Ok(()) => "exec".into(),
+            Err(ExecHandoffError::Exec(error)) => format!("exec-error({})", error.errno),
+            Err(ExecHandoffError::Cancelled(signal)) => format!("cancelled({signal})"),
+            Err(ExecHandoffError::Deadline) => "deadline".into(),
+            Err(ExecHandoffError::Io { phase, source }) => format!("io({phase}: {source})"),
+        }
+    }
+
+    fn rescue_original_pidfd(fd: i32, rescued: &std::sync::atomic::AtomicBool) -> io::Result<()> {
+        rescued.store(true, Ordering::SeqCst);
+        // SAFETY: the caller supplies the retained original pidfd; the syscall
+        // borrows it only for this exact-child signal operation.
+        let sent = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                fd,
+                libc::SIGKILL,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        if sent == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    #[test]
+    fn stopped_preexec_release_observes_actual_sigterm_before_rescue() {
+        let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
+        let signals = install_stop_flag().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("ran");
+        let mut child = spawn("/usr/bin/touch", &[marker.to_str().unwrap()]);
+        wait_for_session_leader(&child);
+        let rescue_pidfd = duplicate_fd(child.pin().pidfd().unwrap());
+        child.pin().send_signal(libc::SIGSTOP).unwrap();
+        wait_until(
+            || original_child_is_stopped(rescue_pidfd.as_fd()),
+            "the original child never entered the stopped pre-exec state",
+        );
+        assert!(!marker.exists());
+
+        let release_returned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let rescued = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cleanup_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release_returned_for_rescue = Arc::clone(&release_returned);
+        let rescued_for_thread = Arc::clone(&rescued);
+        let cleanup_done_for_rescue = Arc::clone(&cleanup_done);
+        let rescue = std::thread::spawn(move || -> io::Result<()> {
+            let release_deadline = Instant::now() + Duration::from_millis(150);
+            while !release_returned_for_rescue.load(Ordering::SeqCst)
+                && Instant::now() < release_deadline
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if !release_returned_for_rescue.load(Ordering::SeqCst) {
+                rescue_original_pidfd(rescue_pidfd.as_raw_fd(), &rescued_for_thread)?;
+            }
+            let cleanup_deadline = Instant::now() + Duration::from_secs(2);
+            while !cleanup_done_for_rescue.load(Ordering::SeqCst)
+                && Instant::now() < cleanup_deadline
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if !cleanup_done_for_rescue.load(Ordering::SeqCst) {
+                rescue_original_pidfd(rescue_pidfd.as_raw_fd(), &rescued_for_thread)?;
+            }
+            Ok(())
+        });
+
+        let (released_tx, released_rx) = std::sync::mpsc::sync_channel(1);
+        let (pending_tx, pending_rx) = std::sync::mpsc::sync_channel(1);
+        let signals_for_release = Arc::clone(&signals);
+        let release_returned_for_thread = Arc::clone(&release_returned);
+        let release = std::thread::spawn(move || {
+            let result = release_for_cancellation_regression(
+                &mut child,
+                Instant::now() + Duration::from_secs(1),
+                &signals_for_release,
+                || {
+                    let _ = pending_tx.try_send(());
+                },
+            );
+            release_returned_for_thread.store(true, Ordering::SeqCst);
+            released_tx.send((result, child)).unwrap();
+        });
+        pending_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("release never reached the actual exec-reader pending boundary");
+        // SAFETY: SIGTERM is handled by the installed atomic-only handler.
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+        let (result, mut child) = released_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("release did not return even after retained-pidfd rescue");
+        assert_eq!(signals.first_signal(), Some(libc::SIGTERM));
+        let exit = settle_after_signal_with_grace(&mut child, &signals, Duration::from_millis(20))
+            .expect("settling the exact original child after release cancellation");
+        cleanup_done.store(true, Ordering::SeqCst);
+        release.join().unwrap();
+        rescue.join().unwrap().unwrap();
+
+        assert!(
+            !rescued.load(Ordering::SeqCst),
+            "old release loop required retained-original-pidfd rescue; result after rescue was {result}"
+        );
+        assert_eq!(result, "cancelled(15)");
+        assert_eq!(exit, ChildOutcome::Exited(128 + libc::SIGKILL));
+        assert!(child.is_reaped());
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn rescue_accounting_precedes_and_retains_signal_failure() {
+        let rescued = std::sync::atomic::AtomicBool::new(false);
+        let error = rescue_original_pidfd(-1, &rescued).unwrap_err();
+        assert!(rescued.load(Ordering::SeqCst));
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+    }
+
+    #[test]
+    fn pending_cancellation_never_releases_the_owned_command() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("ran");
+        let mut child = spawn("/usr/bin/touch", &[marker.to_str().unwrap()]);
+        let signals = SignalState::new();
+        signals.observe(libc::SIGINT);
+
+        assert!(matches!(
+            child.release_until(Instant::now() + Duration::from_secs(1), || signals
+                .first_signal()),
+            Err(ExecHandoffError::Cancelled(libc::SIGINT))
+        ));
+        let exit = child
+            .terminate_with_grace(Duration::from_millis(20))
+            .unwrap();
+
+        assert!([127, 128 + libc::SIGTERM, 128 + libc::SIGKILL].contains(&exit));
+        assert!(child.is_reaped());
+        assert!(!child.released);
+        assert!(!marker.exists());
+        assert!(child.hand_off_running().is_err());
+    }
+
+    #[test]
+    fn stopped_preexec_handoff_deadline_is_independent_and_settles_exact_child() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("ran");
+        let mut child = spawn("/usr/bin/touch", &[marker.to_str().unwrap()]);
+        wait_for_session_leader(&child);
+        child.pin().send_signal(libc::SIGSTOP).unwrap();
+        wait_until(
+            || original_child_is_stopped(child.pin().pidfd().unwrap()),
+            "the original child never stopped behind the barrier",
+        );
+        let started = Instant::now();
+        assert!(matches!(
+            child.release_until(started + Duration::from_millis(40), || None),
+            Err(ExecHandoffError::Deadline)
+        ));
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(!child.released);
+        assert!(child.hand_off_running().is_err());
+
+        assert_eq!(
+            child
+                .terminate_with_grace(Duration::from_millis(20))
+                .unwrap(),
+            128 + libc::SIGKILL
+        );
+        assert!(child.is_reaped());
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn actual_handoff_helpers_preserve_errno_and_retry_without_renewing_deadlines() {
+        let mut interrupted_reads = 0;
+        let mut interrupted_bytes = [0u8; 4];
+        let mut interrupted_used = 0;
+        assert!(matches!(
+            drain_exec_with(&mut interrupted_bytes, &mut interrupted_used, |_| {
+                interrupted_reads += 1;
+                if interrupted_reads > 1 {
+                    panic!("read EINTR retried without returning to the bounded loop");
+                }
+                Err(io::Error::from_raw_os_error(libc::EINTR))
+            })
+            .unwrap(),
+            ExecDrain::Pending
+        ));
+        for attempt in 0..3 {
+            assert!(matches!(
+                drain_exec_with(&mut interrupted_bytes, &mut interrupted_used, |_| Err(
+                    io::Error::from_raw_os_error(libc::EINTR)
+                ),)
+                .unwrap(),
+                ExecDrain::Pending
+            ));
+            let polled = poll_handoff_with(
+                Instant::now() + Duration::from_secs(1),
+                || (attempt == 2).then_some(libc::SIGTERM),
+                |_| Ok([libc::POLLIN, 0]),
+            );
+            if attempt == 2 {
+                assert!(matches!(
+                    polled,
+                    Err(ExecHandoffError::Cancelled(libc::SIGTERM))
+                ));
+            } else {
+                assert_eq!(polled.unwrap(), [libc::POLLIN, 0]);
+            }
+        }
+
+        let errno = libc::EACCES.to_ne_bytes();
+        let mut reads = std::collections::VecDeque::from([
+            Err(io::Error::from_raw_os_error(libc::EINTR)),
+            Ok(errno[..2].to_vec()),
+            Err(io::Error::from_raw_os_error(libc::EAGAIN)),
+            Ok(errno[2..].to_vec()),
+        ]);
+        let mut bytes = [0u8; 4];
+        let mut used = 0;
+        let mut read = |buffer: &mut [u8]| match reads.pop_front().unwrap() {
+            Ok(data) => {
+                buffer[..data.len()].copy_from_slice(&data);
+                Ok(data.len())
+            }
+            Err(error) => Err(error),
+        };
+        assert!(matches!(
+            drain_exec_with(&mut bytes, &mut used, &mut read).unwrap(),
+            ExecDrain::Pending
+        ));
+        assert!(matches!(
+            drain_exec_with(&mut bytes, &mut used, &mut read).unwrap(),
+            ExecDrain::Pending
+        ));
+        assert!(matches!(
+            drain_exec_with(&mut bytes, &mut used, &mut read).unwrap(),
+            ExecDrain::Errno(libc::EACCES)
+        ));
+
+        let mut partial = [0u8; 4];
+        let mut partial_used = 0;
+        let mut reads = std::collections::VecDeque::from([vec![1], Vec::new()]);
+        let error = drain_exec_with(&mut partial, &mut partial_used, |buffer| {
+            let data = reads.pop_front().unwrap();
+            buffer[..data.len()].copy_from_slice(&data);
+            Ok(data.len())
+        })
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ExecHandoffError::Io {
+                phase: "exec protocol",
+                source
+            } if source.kind() == io::ErrorKind::UnexpectedEof
+        ));
+
+        let mut writes = 0;
+        write_release_with(
+            Instant::now() + Duration::from_secs(1),
+            || None,
+            || {
+                writes += 1;
+                if writes < 3 {
+                    Err(io::Error::from_raw_os_error(libc::EINTR))
+                } else {
+                    Ok(1)
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(writes, 3);
+
+        let mut polls = 0;
+        assert_eq!(
+            poll_handoff_with(
+                Instant::now() + Duration::from_secs(1),
+                || None,
+                |_| {
+                    polls += 1;
+                    if polls < 3 {
+                        Err(io::Error::from_raw_os_error(libc::EINTR))
+                    } else {
+                        Ok([libc::POLLIN, 0])
+                    }
+                },
+            )
+            .unwrap(),
+            [libc::POLLIN, 0]
+        );
+        assert_eq!(polls, 3);
+
+        let deadline = Instant::now() + Duration::from_millis(2);
+        let error = poll_handoff_with(
+            deadline,
+            || None,
+            |_| Err(io::Error::from_raw_os_error(libc::EINTR)),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ExecHandoffError::Deadline));
+        assert!(Instant::now() < deadline + Duration::from_millis(100));
+
+        assert!(matches!(
+            write_release_with(
+                Instant::now() + Duration::from_secs(1),
+                || Some(libc::SIGTERM),
+                || panic!("pending cancellation wrote the barrier")
+            ),
+            Err(ExecHandoffError::Cancelled(libc::SIGTERM))
+        ));
+
+        let mut reaps = 0;
+        assert_eq!(
+            retry_reap_with(Some(Instant::now() + Duration::from_secs(1)), || {
+                reaps += 1;
+                if reaps < 3 {
+                    Err(io::Error::from_raw_os_error(libc::EINTR))
+                } else {
+                    Ok(Some(137))
+                }
+            })
+            .unwrap(),
+            Some(137)
+        );
+        assert_eq!(reaps, 3);
+        assert_eq!(
+            retry_reap_with(Some(Instant::now() + Duration::from_secs(1)), || {
+                Err(io::Error::from_raw_os_error(libc::ECHILD))
+            })
+            .unwrap_err()
+            .raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        let reap_deadline = Instant::now() + Duration::from_millis(2);
+        assert_eq!(
+            retry_reap_with(Some(reap_deadline), || {
+                Err(io::Error::from_raw_os_error(libc::EINTR))
+            })
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(Instant::now() < reap_deadline + Duration::from_millis(100));
+    }
+
+    #[test]
+    fn exact_exit_races_reap_through_the_original_pidfd() {
+        let deadline = Some(Instant::now() + Duration::from_secs(1));
+        assert_eq!(
+            initial_settlement_probe_with(
+                Ok(None),
+                Some(Err(io::Error::other("generation changed after exit"))),
+                deadline,
+                || Ok(Some(23)),
+            )
+            .unwrap(),
+            Some(23)
+        );
+        assert_eq!(
+            initial_signal_forward_with(
+                Err(io::Error::other("group vanished before initial signal")),
+                deadline,
+                || Ok(Some(143)),
+            )
+            .unwrap(),
+            Some(143)
+        );
+
+        let unresolved = initial_settlement_probe_with(
+            Ok(None),
+            Some(Err(io::Error::other("generation still unresolved"))),
+            deadline,
+            || Ok(None),
+        )
+        .unwrap_err();
+        assert_eq!(unresolved.to_string(), "generation still unresolved");
+
+        let combined = initial_signal_forward_with(
+            Err(io::Error::other("initial signal still unresolved")),
+            deadline,
+            || Err(io::Error::from_raw_os_error(libc::ECHILD)),
+        )
+        .unwrap_err();
+        let rendered = combined.to_string();
+        assert!(
+            rendered.contains("initial signal still unresolved"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("exact original-child reap"), "{rendered}");
+    }
+
+    #[test]
+    fn preflight_failure_detaches_before_settlement_and_keeps_every_error() {
+        let order = std::sync::Mutex::new(Vec::new());
+        let error = combine_preflight_failure_with(
+            anyhow!("preflight failed"),
+            || {
+                order.lock().unwrap().push("detach");
+                Err(anyhow!("detach failed"))
+            },
+            || {
+                order.lock().unwrap().push("settle");
+                Err(anyhow!("settlement failed"))
+            },
+        );
+
+        assert_eq!(*order.lock().unwrap(), ["detach", "settle"]);
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("preflight failed"), "{rendered}");
+        assert!(rendered.contains("detach failed"), "{rendered}");
+        assert!(rendered.contains("settlement failed"), "{rendered}");
     }
 
     #[test]
@@ -3149,12 +4429,12 @@ mod tests {
     #[test]
     fn owned_child_launch_errors_preserve_elf_reason_and_script_guidance() {
         let directory = tempfile::tempdir().unwrap();
-        let elf32 = [
-            0x7f, b'E', b'L', b'F', 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 3, 0, 1, 0, 0, 0, 0,
+        let x32 = [
+            0x7f, b'E', b'L', b'F', 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 62, 0, 1, 0, 0, 0, 0,
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 52, 0, 32, 0, 0, 0, 40, 0, 0, 0, 0, 0,
         ];
         for (name, bytes) in [
-            ("elf32", elf32.as_slice()),
+            ("x32", x32.as_slice()),
             ("malformed-elf", b"\x7fELF".as_slice()),
             ("script", b"#!/bin/sh\nexit 0\n".as_slice()),
         ] {
@@ -3162,8 +4442,8 @@ mod tests {
             std::fs::write(&command, bytes).unwrap();
             std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
             let reason = ElfSnapshot::read(&File::open(&command).unwrap()).unwrap_err();
-            if name == "elf32" {
-                assert!(reason.contains("architecture I386"), "{reason}");
+            if name == "x32" {
+                assert!(reason.contains("x32"), "{reason}");
             }
 
             let error = OwnedChild::spawn(command.into_os_string(), Vec::new())
@@ -3192,6 +4472,9 @@ mod tests {
         std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o000)).unwrap();
 
         let failure = child.release().unwrap_err();
+        let ExecHandoffError::Exec(failure) = failure else {
+            panic!("actual exec failure was misclassified: {failure}");
+        };
         assert_eq!(failure.errno, libc::EACCES);
         assert_eq!(failure.exit_code, 127);
         assert!(
@@ -3206,7 +4489,7 @@ mod tests {
         let pid = child.pid();
         child.release().unwrap();
         let mut pending = None;
-        let outcome = stage_handoff(child, &mut pending).unwrap();
+        let outcome = stage_handoff(&mut Some(child), &mut pending).unwrap();
         assert_eq!(outcome, ChildOutcome::TimedOutRunning);
         assert!(pending.is_some());
         assert!(!pending.as_ref().unwrap().handed_off);
@@ -3223,7 +4506,7 @@ mod tests {
         child.release().unwrap();
         let mut pending = None;
         assert_eq!(
-            stage_handoff(child, &mut pending).unwrap(),
+            stage_handoff(&mut Some(child), &mut pending).unwrap(),
             ChildOutcome::TimedOutRunning
         );
 
@@ -3255,6 +4538,154 @@ mod tests {
         assert!(
             synthetic_rendered.contains("aborting pending handoff failed"),
             "{synthetic_rendered}"
+        );
+    }
+
+    #[test]
+    fn root_fence_seed_requires_exact_owner_and_reap_and_retains_until_abort() {
+        let domain = crate::events::EventsDomain::test_standin(88);
+        let mut child = Some(spawn("/bin/true", &[]));
+        let weak = std::sync::Arc::downgrade(&child.as_ref().unwrap().pin);
+        let mut seed = Some(crate::attach::RootSeed::test_acknowledgement(
+            child.as_ref().unwrap(),
+            domain,
+        ));
+        assert!(
+            OriginalRootExit::take(&mut child, &mut seed)
+                .unwrap()
+                .is_none()
+        );
+        let mut other = Some(spawn("/bin/true", &[]));
+        assert!(OriginalRootExit::take(&mut other, &mut seed).is_err());
+        child.as_mut().unwrap().release().unwrap();
+        assert!(
+            child
+                .as_ref()
+                .unwrap()
+                .pin()
+                .wait_ready(Some(Duration::from_secs(1)))
+                .unwrap()
+        );
+        assert!(
+            OriginalRootExit::take(&mut child, &mut seed)
+                .unwrap()
+                .is_none(),
+            "readiness before the exact reap must not mint the witness"
+        );
+        child.as_mut().unwrap().terminate_and_reap().unwrap();
+        let mut code = None;
+        let mut running = true;
+        let error = record_settlement_result(
+            child.as_ref().unwrap(),
+            Err(anyhow!("group-signaling failed")),
+            &mut code,
+            &mut running,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("group-signaling failed"));
+        assert!(code.is_some());
+        assert!(!running);
+        let exit = OriginalRootExit::take(&mut child, &mut seed)
+            .unwrap()
+            .unwrap();
+        assert!(child.is_none() && seed.is_none());
+        assert!(weak.upgrade().is_some());
+        drop(exit);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn root_fence_live_handoff_and_unseeded_reap_have_no_witness() {
+        let mut child = Some(spawn("/bin/sleep", &["10"]));
+        let mut seed = Some(crate::attach::RootSeed::test_acknowledgement(
+            child.as_ref().unwrap(),
+            crate::events::EventsDomain::test_standin(90),
+        ));
+        child.as_mut().unwrap().release().unwrap();
+        let mut pending = None;
+        assert_eq!(
+            stage_handoff(&mut child, &mut pending).unwrap(),
+            ChildOutcome::TimedOutRunning
+        );
+        assert!(
+            OriginalRootExit::take(&mut child, &mut seed)
+                .unwrap()
+                .is_none()
+        );
+        assert!(pending.as_ref().unwrap().still_running());
+        let mut child = Some(spawn("/bin/true", &[]));
+        child.as_mut().unwrap().terminate_and_reap().unwrap();
+        assert!(
+            OriginalRootExit::take(&mut child, &mut None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(child.as_ref().unwrap().is_reaped());
+    }
+
+    #[test]
+    fn root_fence_proc_fallback_refuses_and_completed_token_retains_owner() {
+        let domain = crate::events::EventsDomain::test_standin(91);
+        let mut child = Some(spawn("/bin/true", &[]));
+        child.as_mut().unwrap().terminate_and_reap().unwrap();
+        let original = child.as_ref().unwrap().pin.clone();
+        child.as_mut().unwrap().pin =
+            std::sync::Arc::new(PidPin::test_proc_only(child.as_ref().unwrap().pid()));
+        let mut seed = Some(crate::attach::RootSeed::test_acknowledgement(
+            child.as_ref().unwrap(),
+            domain.clone(),
+        ));
+        assert!(OriginalRootExit::take(&mut child, &mut seed).is_err());
+        child.as_mut().unwrap().pin = original;
+        let weak = std::sync::Arc::downgrade(&child.as_ref().unwrap().pin);
+        let mut seed = Some(crate::attach::RootSeed::test_acknowledgement(
+            child.as_ref().unwrap(),
+            domain.clone(),
+        ));
+        let exit = OriginalRootExit::take(&mut child, &mut seed)
+            .unwrap()
+            .unwrap();
+        let mut tail =
+            crate::events::OwnedRootTail::new(exit, Instant::now() + Duration::from_secs(1));
+        let mut drain = crate::events::EventDrain::over_domain(
+            crate::events::root_fence_tests::source([]),
+            domain,
+        );
+        drain.begin_root_tail(&mut tail).unwrap();
+        drain.poll_root_tail(&mut tail, 1, |_| Ok(())).unwrap();
+        let completed = tail.complete().unwrap();
+        drop(drain);
+        assert!(weak.upgrade().is_some());
+        drop(completed);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn root_fence_settlement_retains_original_owner_after_exact_reap() {
+        let mut child = spawn("/bin/true", &[]);
+        child.release().unwrap();
+        let fd = child.pin().pidfd().unwrap().as_raw_fd();
+        let mut pending = None;
+        let mut exit_code = None;
+        let mut running = false;
+        let mut retained = Some(child);
+        settle_owned_child(
+            &mut retained,
+            CaptureEnd::TargetExit,
+            true,
+            true,
+            &SignalState::new(),
+            &mut pending,
+            &mut exit_code,
+            &mut running,
+        )
+        .unwrap();
+        assert!(exit_code.is_some());
+        // Only lifetime observation of this test's own original descriptor.
+        assert_ne!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) },
+            -1,
+            "settlement dropped the original owner before its EVENTS fence"
         );
     }
 
@@ -3343,8 +4774,9 @@ mod tests {
             let mut pending = None;
             let mut exit_code = None;
             let mut still_running = false;
+            let mut retained = Some(child);
             settle_owned_child(
-                child,
+                &mut retained,
                 end,
                 cleanup_ok,
                 kill_on_timeout,
@@ -3873,7 +5305,8 @@ mod tests {
         let mut state = semantics::State::new(&plan);
         let mut tracker = process::Tracker::new();
         let events = (0..=LIVE_POLL_QUANTUM).map(|_| call_event());
-        let mut drain = EventDrain::over(ScriptedRecords::events(events, LIVE_POLL_QUANTUM));
+        let mut drain =
+            EventDrain::over_test_domain(ScriptedRecords::events(events, LIVE_POLL_QUANTUM), 1);
 
         let malformed = drain_profile_events(
             &mut drain,
@@ -3881,7 +5314,8 @@ mod tests {
             &mut tracker,
             &Scope::Pid(std::process::id()),
             Some(LIVE_POLL_QUANTUM),
-        );
+        )
+        .unwrap();
 
         assert_eq!(malformed, 0);
         assert_eq!(drain.source().remaining(), 1);
@@ -3892,6 +5326,14 @@ mod tests {
         use crate::events::{EventDrain, ScriptedRecords};
 
         let event = p11scope_ebpf_common::Event {
+            image: p11scope_ebpf_common::ImageIdentity {
+                task_cookie: 41,
+                exec_id: 0,
+            },
+            child_image: p11scope_ebpf_common::ImageIdentity {
+                task_cookie: 42,
+                exec_id: 0,
+            },
             event_type: p11scope_ebpf_common::event_type::FORK,
             pid_tgid: 41u64 << 32,
             session: 42,
@@ -3912,8 +5354,25 @@ mod tests {
             module_ids: vec![crate::plan::ModuleId(0)],
         }]);
         let mut state = semantics::State::new(&plan);
-        let mut tracker = process::Tracker::new();
-        let parent_process = tracker.identify(41).key;
+        let adapter = super::history_tests::Adapter::new();
+        adapter.bind(41, 41);
+        adapter.bind(42, 42);
+        let mut tracker = process::Tracker::with_membership(1, 16, 16, Box::new(adapter));
+        let parent_event = p11scope_ebpf_common::Event {
+            image: p11scope_ebpf_common::ImageIdentity {
+                task_cookie: 41,
+                exec_id: 0,
+            },
+            pid_tgid: 41u64 << 32,
+            ..Default::default()
+        };
+        let parent_process = identify_tracked(
+            tracker.producer_domain(),
+            &mut tracker,
+            &mut state,
+            &parent_event,
+        )
+        .unwrap();
         state.observe_process(
             parent_process,
             &p11scope_ebpf_common::Event {
@@ -3927,7 +5386,8 @@ mod tests {
             },
         );
         assert!(state.pid_has_process_state(41));
-        let mut drain = EventDrain::over(ScriptedRecords::events([event], usize::MAX));
+        let mut drain =
+            EventDrain::over_test_domain(ScriptedRecords::events([event], usize::MAX), 1);
         let scope = Scope::Cgroup {
             id: 1,
             path: "/".into(),
@@ -3935,7 +5395,7 @@ mod tests {
         };
 
         assert_eq!(
-            drain_profile_events(&mut drain, &mut state, &mut tracker, &scope, None,),
+            drain_profile_events(&mut drain, &mut state, &mut tracker, &scope, None,).unwrap(),
             0
         );
         assert!(
@@ -3950,9 +5410,10 @@ mod tests {
             session: 43,
             ..Default::default()
         };
-        let mut drain = EventDrain::over(ScriptedRecords::events([into_event], usize::MAX));
+        let mut drain =
+            EventDrain::over_test_domain(ScriptedRecords::events([into_event], usize::MAX), 1);
         assert_eq!(
-            drain_profile_events(&mut drain, &mut state, &mut tracker, &scope, None,),
+            drain_profile_events(&mut drain, &mut state, &mut tracker, &scope, None,).unwrap(),
             0
         );
         assert!(
@@ -3982,7 +5443,7 @@ mod tests {
         let mut stdout_open = true;
         let mut out_file: Option<Vec<u8>> = None;
         let events = (0..5).map(|_| call_event());
-        let mut drain = EventDrain::over(ScriptedRecords::events(events, 2));
+        let mut drain = EventDrain::over_test_domain(ScriptedRecords::events(events, 2), 1);
 
         let malformed = drain_trace_events_from(
             &mut drain,
@@ -4018,7 +5479,8 @@ mod tests {
         let mut stdout_open = true;
         let mut out_file: Option<Vec<u8>> = None;
         let events = (0..=LIVE_POLL_QUANTUM).map(|_| call_event());
-        let mut drain = EventDrain::over(ScriptedRecords::events(events, LIVE_POLL_QUANTUM));
+        let mut drain =
+            EventDrain::over_test_domain(ScriptedRecords::events(events, LIVE_POLL_QUANTUM), 1);
 
         drain_trace_events_from(
             &mut drain,
@@ -4049,7 +5511,8 @@ mod tests {
         let mut stdout_open = true;
         let mut out_file: Option<Vec<u8>> = None;
         let events = (0..crate::events::LIVE_POLL_QUANTUM + 5).map(|_| call_event());
-        let mut drain = EventDrain::over(ScriptedRecords::events(events, usize::MAX));
+        let mut drain =
+            EventDrain::over_test_domain(ScriptedRecords::events(events, usize::MAX), 1);
 
         drain_trace_events_from(
             &mut drain,
@@ -4106,7 +5569,8 @@ mod tests {
             call_event(),
             call_event(),
         ];
-        let mut drain = EventDrain::over(ScriptedRecords::events(events, usize::MAX));
+        let mut drain =
+            EventDrain::over_test_domain(ScriptedRecords::events(events, usize::MAX), 1);
 
         drain_trace_events_from(
             &mut drain,
@@ -4167,10 +5631,10 @@ mod tests {
         let mut stdout_open = true;
         let mut out_file = Some(Vec::new());
         let mut remaining = None;
-        let mut drain = crate::events::EventDrain::over(crate::events::ScriptedRecords::events(
-            [call_event()],
-            usize::MAX,
-        ));
+        let mut drain = crate::events::EventDrain::over_test_domain(
+            crate::events::ScriptedRecords::events([call_event()], usize::MAX),
+            1,
+        );
         drain_trace_events_from(
             &mut drain,
             &mut remaining,
@@ -4260,26 +5724,59 @@ mod tests {
     /// quanta and the terminal drain still reads the detached ring whole.
     #[test]
     fn every_events_poll_takes_its_bound_from_the_session() {
-        let run = include_str!("run.rs");
-        let run = run.split_once("#[cfg(test)]\nmod tests {").unwrap().0;
-        assert_eq!(
-            run.matches("let quantum = session.live_poll_quantum();")
-                .count(),
-            2,
-            "one bound decision per drain wrapper, taken before the ring is opened"
-        );
-        assert_eq!(
-            run.matches(".poll(quantum, |ev|").count(),
-            2,
-            "both event polls carry that bound"
-        );
-        let attach = include_str!("attach.rs");
-        let detach = attach.split_once("pub fn detach_producers(").unwrap().1;
-        let detach = detach.split_once("fn has_slot_link").unwrap().0;
-        assert!(
-            detach.contains("self.producers_detached = detached.is_ok();"),
-            "only a fully successful detach makes the ring finite"
-        );
+        use crate::events::{EventDrain, LIVE_POLL_QUANTUM, ScriptedRecords};
+        for trace in [false, true] {
+            let (mut state, mut tracker, mut tracer) = trace_fixture();
+            let mut context = (
+                false,
+                EventDrain::over_test_domain(
+                    ScriptedRecords::events(
+                        (0..LIVE_POLL_QUANTUM + 2).map(|_| call_event()),
+                        usize::MAX,
+                    ),
+                    1,
+                ),
+            );
+            let selected = std::cell::Cell::new(0);
+            for (detached, want) in [(false, 2), (true, 0)] {
+                context.0 = detached;
+                select_and_drain_events(
+                    &mut context,
+                    |context| {
+                        selected.set(selected.get() + 1);
+                        crate::events::poll_quantum(context.0)
+                    },
+                    |context, quantum| {
+                        assert_eq!(selected.get(), if detached { 2 } else { 1 });
+                        if trace {
+                            drain_trace_events_from(
+                                &mut context.1,
+                                &mut None,
+                                &mut state,
+                                &mut tracker,
+                                &Scope::Pid(7),
+                                &mut tracer,
+                                &mut Vec::new(),
+                                &mut true,
+                                &mut None::<Vec<u8>>,
+                                quantum,
+                            )
+                        } else {
+                            drain_profile_events(
+                                &mut context.1,
+                                &mut state,
+                                &mut tracker,
+                                &Scope::Pid(7),
+                                quantum,
+                            )
+                        }
+                    },
+                )
+                .unwrap();
+                assert_eq!(context.1.source().remaining(), want);
+            }
+            assert_eq!(selected.get(), 2);
+        }
     }
 
     #[test]
@@ -4436,6 +5933,7 @@ mod tests {
     /// mid-write.
     #[test]
     fn sigterm_sets_the_stop_flag() {
+        let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
         let stop = install_stop_flag().unwrap();
         assert!(!should_stop(&stop, Duration::ZERO, None));
         // SAFETY: raise() with a handled signal; the handler only sets atomics.
@@ -4642,7 +6140,13 @@ mod tests {
             event.event_type = event_type;
             event.pid_tgid = u64::from(std::process::id()) << 32;
             event.session = u64::from(std::process::id());
-            assert!(observe_fork(&mut tracker, &mut state, &scope, &event,));
+            assert!(observe_fork(
+                tracker.producer_domain(),
+                &mut tracker,
+                &mut state,
+                &scope,
+                &event,
+            ));
         }
     }
 
@@ -4783,5 +6287,476 @@ mod tests {
         };
         let mut open = true;
         assert!(flush_stdout(&mut flush, &mut open).is_err());
+    }
+}
+
+#[cfg(test)]
+#[path = "history_tests.rs"]
+mod history_tests;
+
+#[cfg(test)]
+mod correction1_tests {
+    use super::*;
+    use crate::events::{EventDrain, ScriptedRecords};
+    use crate::history::{Membership, TaskMembership};
+    use p11scope_ebpf_common::{Event, ImageIdentity, capture, event_type};
+    use std::{
+        cell::RefCell,
+        collections::BTreeMap,
+        os::fd::{AsRawFd, OwnedFd, RawFd},
+        rc::Rc,
+    };
+
+    #[derive(Default)]
+    struct MembershipScript {
+        candidates: BTreeMap<u32, Arc<OwnedFd>>,
+        samples: BTreeMap<RawFd, Membership>,
+        queries: usize,
+    }
+    #[derive(Clone, Default)]
+    struct Adapter(Rc<RefCell<MembershipScript>>);
+    impl TaskMembership for Adapter {
+        fn candidate(&mut self, pid: u32) -> Option<Arc<OwnedFd>> {
+            self.0.borrow_mut().queries += 1;
+            self.0.borrow().candidates.get(&pid).cloned()
+        }
+        fn sample(&mut self, original: &OwnedFd) -> Membership {
+            self.0.borrow_mut().queries += 1;
+            self.0
+                .borrow()
+                .samples
+                .get(&original.as_raw_fd())
+                .copied()
+                .unwrap_or(Membership::Unavailable)
+        }
+    }
+    impl Adapter {
+        fn bind(&self, pid: u32, cookie: u64) -> Arc<OwnedFd> {
+            let fd: OwnedFd = File::open("/dev/null").unwrap().into();
+            let fd = Arc::new(fd);
+            self.0.borrow_mut().candidates.insert(pid, fd.clone());
+            self.set(&fd, Membership::Live { domain: 1, cookie });
+            fd
+        }
+        fn set(&self, fd: &OwnedFd, sample: Membership) {
+            self.0.borrow_mut().samples.insert(fd.as_raw_fd(), sample);
+        }
+    }
+    fn plan(authorized: bool) -> crate::plan::AttachPlan {
+        crate::plan::AttachPlan::from_slots(
+            ["C_OpenSession", "C_Sign", "C_GetInfo"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, name)| crate::plan::Slot {
+                    index: index as u32,
+                    descriptor_index: crate::kinds::function_id(name).unwrap() + 1,
+                    object: crate::plan::TEST_PINNED_OBJECT,
+                    object_path: "/opt/p11.so".into(),
+                    file_offset: index as u64 * 16,
+                    names: vec![name.into()],
+                    aliased: false,
+                    semantics: if authorized {
+                        crate::kinds::descriptor(name).unwrap()
+                    } else {
+                        p11scope_ebpf_common::SlotSemantics::COUNT_ONLY
+                    },
+                    semantic_authorized: authorized,
+                    semantic_ambiguous: false,
+                    fork_safe: true,
+                    module_ids: vec![crate::plan::ModuleId(0)],
+                })
+                .collect(),
+        )
+    }
+    fn event(pid: u32, cookie: u64, slot: u32) -> Event {
+        Event {
+            image: ImageIdentity {
+                task_cookie: cookie,
+                exec_id: 0,
+            },
+            event_type: event_type::CALL,
+            pid_tgid: u64::from(pid) << 32,
+            session: 7,
+            slot_id: 3,
+            slot,
+            capture: capture::OUTPUT_NON_NULL,
+            ..Event::default()
+        }
+    }
+    struct Consumer {
+        state: semantics::State,
+        tracker: process::Tracker,
+        tracer: trace::Tracer,
+        adapter: Adapter,
+        trace: bool,
+        output: Vec<u8>,
+    }
+    impl Consumer {
+        fn new(trace: bool, authorized: bool) -> Self {
+            let adapter = Adapter::default();
+            let plan = plan(authorized);
+            Self {
+                state: semantics::State::new(&plan),
+                tracker: process::Tracker::with_membership(1, 16, 16, Box::new(adapter.clone())),
+                tracer: trace::Tracer::new(&plan),
+                adapter,
+                trace,
+                output: Vec::new(),
+            }
+        }
+        fn feed(&mut self, records: impl IntoIterator<Item = Event>) {
+            self.feed_domain(self.tracker.producer_domain(), records);
+        }
+        fn feed_domain(&mut self, domain: u64, records: impl IntoIterator<Item = Event>) {
+            let mut drain =
+                EventDrain::over_test_domain(ScriptedRecords::events(records, usize::MAX), domain);
+            let scope = Scope::Cgroup {
+                id: 0,
+                path: "/".into(),
+                dir: Arc::new(File::open("/").unwrap()),
+            };
+            if self.trace {
+                drain_trace_events_from(
+                    &mut drain,
+                    &mut None,
+                    &mut self.state,
+                    &mut self.tracker,
+                    &scope,
+                    &mut self.tracer,
+                    &mut self.output,
+                    &mut true,
+                    &mut None::<Vec<u8>>,
+                    Some(crate::events::LIVE_POLL_QUANTUM),
+                )
+                .unwrap();
+            } else {
+                drain_profile_events(
+                    &mut drain,
+                    &mut self.state,
+                    &mut self.tracker,
+                    &scope,
+                    Some(crate::events::LIVE_POLL_QUANTUM),
+                )
+                .unwrap();
+            }
+            assert_eq!(drain.source().remaining(), 0);
+        }
+        fn vector(&self) -> (u64, u64, u64, u64, u64, u64) {
+            let s = self.state.sessions();
+            (
+                s.opened,
+                s.inherited,
+                s.closed,
+                s.opened
+                    .saturating_add(s.inherited)
+                    .saturating_sub(s.closed),
+                s.peak_concurrent,
+                self.state.pending_at_end(),
+            )
+        }
+    }
+
+    #[test]
+    fn replacement_first_open_retains_unfenced_predecessor_in_both_drains() {
+        for trace in [false, true] {
+            let mut c = Consumer::new(trace, true);
+            let old = c.adapter.bind(100, 90);
+            let mut pending = event(100, 90, 1);
+            pending.rv = pkcs11_proxy_ng_types::CkRv::PENDING.0;
+            c.feed([event(100, 90, 0), pending]);
+            assert_eq!(c.vector(), (1, 0, 0, 1, 1, 1));
+            let replacement = c.adapter.bind(100, 4);
+            c.adapter.set(&old, Membership::Exited);
+            // Actual capture drains before polling exits. No preceding poll here.
+            c.feed([event(100, 4, 0)]);
+            assert_eq!(c.vector(), (2, 0, 0, 2, 2, 1));
+            assert_eq!(c.state.semantic_evidence().semantic_history_drops, 0);
+            assert!(c.tracker.poll_exited().is_empty());
+            assert!(c.tracker.poll_exited().is_empty());
+            assert_eq!(c.vector(), (2, 0, 0, 2, 2, 1));
+            apply_confirmed_retirement(
+                &mut c.tracker,
+                &mut c.state,
+                semantics::ProcessKey::history(1, 90, 0, 100),
+            );
+            c.feed([event(100, 90, 0)]);
+            assert_eq!(c.vector(), (2, 0, 1, 1, 2, 0));
+            assert_eq!(c.state.semantic_evidence().semantic_history_drops, 1);
+            c.adapter.set(&replacement, Membership::Exited);
+            assert!(c.tracker.poll_exited().is_empty());
+            assert!(c.tracker.poll_exited().is_empty());
+            assert_eq!(c.vector(), (2, 0, 1, 1, 2, 0));
+            apply_confirmed_retirement(
+                &mut c.tracker,
+                &mut c.state,
+                semantics::ProcessKey::history(1, 4, 0, 100),
+            );
+            apply_confirmed_retirement(
+                &mut c.tracker,
+                &mut c.state,
+                semantics::ProcessKey::history(1, 4, 0, 100),
+            );
+            assert_eq!(c.vector(), (2, 0, 2, 0, 2, 0));
+            if trace {
+                assert_eq!(c.tracer.raw_calls(), 4);
+            }
+        }
+    }
+
+    #[test]
+    fn producer_admission_ignores_optional_control_samples_without_retiring() {
+        for trace in [false, true] {
+            for old_sample in [
+                Membership::Live {
+                    domain: 1,
+                    cookie: 90,
+                },
+                Membership::Unavailable,
+                Membership::Live {
+                    domain: 2,
+                    cookie: 90,
+                },
+            ] {
+                let mut c = Consumer::new(trace, true);
+                let old = c.adapter.bind(100, 90);
+                c.adapter.bind(200, 20);
+                c.feed([event(100, 90, 0), event(200, 20, 0)]);
+                c.adapter.bind(100, 4);
+                c.adapter.set(&old, old_sample);
+                c.feed([event(100, 4, 0), event(100, 4, 2)]);
+                assert!(c.tracker.poll_exited().is_empty());
+                assert_eq!(c.vector(), (3, 0, 0, 3, 3, 0));
+                assert_eq!(c.state.semantic_evidence().semantic_history_drops, 0);
+                // Exit alone changes no semantic eligibility; all histories survive.
+                c.adapter.set(&old, Membership::Exited);
+                c.feed([event(100, 4, 2)]);
+                assert_eq!(c.vector(), (3, 0, 0, 3, 3, 0));
+            }
+        }
+    }
+
+    #[test]
+    fn replacement_first_birth_fork_keeps_independent_unfenced_old_child() {
+        for trace in [false, true] {
+            let mut c = Consumer::new(trace, true);
+            c.adapter.bind(100, 90);
+            let old_child = c.adapter.bind(200, 80);
+            c.feed([event(100, 90, 0), event(200, 80, 0)]);
+            c.adapter.bind(200, 4);
+            c.adapter.set(&old_child, Membership::Exited);
+            let mut birth = event(100, 90, 0);
+            birth.event_type = event_type::FORK;
+            birth.session = 200;
+            birth.child_image = ImageIdentity {
+                task_cookie: 4,
+                exec_id: 0,
+            };
+            c.feed([birth]);
+            assert_eq!(c.vector(), (2, 1, 0, 3, 3, 0));
+            assert_eq!(c.state.semantic_evidence().semantic_history_drops, 0);
+            let key = semantics::ProcessKey::history(1, 4, 0, 200);
+            assert!(c.state.session_pseudonym_process(key, 0, 7).is_some());
+            c.feed([event(200, 4, 2), birth]);
+            assert_eq!(c.vector(), (2, 1, 0, 3, 3, 0));
+            assert_eq!(c.state.semantic_evidence().semantic_history_drops, 1);
+        }
+    }
+
+    #[test]
+    fn authentic_unbound_and_closed_trace_preserves_unverified_provider_annotation() {
+        for closed in [false, true] {
+            let mut c = Consumer::new(true, false);
+            if closed {
+                let fd = c.adapter.bind(100, 90);
+                c.feed([event(100, 90, 2)]);
+                c.adapter.set(&fd, Membership::Exited);
+                assert!(c.tracker.poll_exited().is_empty());
+                apply_confirmed_retirement(
+                    &mut c.tracker,
+                    &mut c.state,
+                    semantics::ProcessKey::history(1, 90, 0, 100),
+                );
+                c.output.clear();
+            }
+            let before = c.tracer.raw_calls();
+            let mut ev = event(100, 90, 0);
+            ev.capture |= capture::MECHANISM_VALUE;
+            ev.mechanism = 1;
+            c.feed([ev]);
+            let line = String::from_utf8(c.output).unwrap();
+            assert!(
+                line.contains("C_OpenSession [semantics unverified]"),
+                "{line}"
+            );
+            assert!(!line.contains("sess#"));
+            assert!(!line.contains("CKM_"));
+            assert_eq!(c.tracer.raw_calls(), before + 1);
+            assert_eq!(
+                c.state.semantic_evidence().semantic_history_drops,
+                u64::from(closed)
+            );
+            assert_eq!(c.state.sessions().opened, 0);
+            assert!(c.state.mechanisms().is_empty());
+        }
+    }
+
+    #[test]
+    fn correction2_unseeded_first_call_after_reap_or_unavailable_is_admitted() {
+        for trace in [false, true] {
+            for outcome in [Membership::Exited, Membership::Unavailable] {
+                let mut c = Consumer::new(trace, true);
+                let fd = c.adapter.bind(100, 90);
+                c.adapter.set(&fd, outcome);
+                c.feed([event(100, 90, 0)]);
+                assert_eq!(c.vector(), (1, 0, 0, 1, 1, 0));
+                assert_eq!(c.state.semantic_evidence().semantic_history_drops, 0);
+                assert_eq!(
+                    c.adapter.0.borrow().queries,
+                    0,
+                    "events grant no live/control binding"
+                );
+                if trace {
+                    assert_eq!(c.tracer.raw_calls(), 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn correction2_first_fork_after_both_reaped_preserves_inheritance_once() {
+        for trace in [false, true] {
+            let mut c = Consumer::new(trace, true);
+            let parent = c.adapter.bind(100, 90);
+            let child = c.adapter.bind(200, 4);
+            c.adapter.set(&parent, Membership::Exited);
+            c.adapter.set(&child, Membership::Exited);
+            c.feed([event(100, 90, 0)]);
+            let mut birth = event(100, 90, 0);
+            birth.event_type = event_type::FORK;
+            birth.session = 200;
+            birth.child_image = ImageIdentity {
+                task_cookie: 4,
+                exec_id: 0,
+            };
+            c.feed([birth]);
+            assert_eq!(c.vector(), (1, 1, 0, 2, 2, 0));
+            c.feed([event(200, 4, 2), birth]);
+            assert_eq!(c.vector(), (1, 1, 0, 2, 2, 0));
+            assert_eq!(c.state.semantic_evidence().semantic_history_drops, 1);
+            assert_eq!(c.adapter.0.borrow().queries, 0);
+        }
+    }
+
+    #[test]
+    fn correction2_first_fork_establishes_empty_parent_without_inventing_sessions() {
+        for trace in [false, true] {
+            let mut c = Consumer::new(trace, true);
+            let mut birth = event(100, 90, 0);
+            birth.event_type = event_type::FORK;
+            birth.session = 200;
+            birth.child_image = ImageIdentity {
+                task_cookie: 4,
+                exec_id: 0,
+            };
+            c.feed([birth]);
+            assert_eq!(c.vector(), (0, 0, 0, 0, 0, 0));
+            assert_eq!(c.state.semantic_evidence().semantic_history_drops, 0);
+            c.feed([event(200, 4, 0), birth]);
+            assert_eq!(c.vector(), (1, 0, 0, 1, 1, 0));
+            assert_eq!(c.state.semantic_evidence().semantic_history_drops, 1);
+        }
+    }
+
+    #[test]
+    fn correction2_same_pid_live_original_does_not_activate_or_close_other_cookie() {
+        for trace in [false, true] {
+            let mut c = Consumer::new(trace, true);
+            let original = c.adapter.bind(100, 90);
+            c.feed([event(100, 90, 0)]);
+            c.adapter.bind(100, 4);
+            c.feed([event(100, 4, 0)]);
+            assert_eq!(c.vector(), (2, 0, 0, 2, 2, 0));
+            c.adapter.set(&original, Membership::Exited);
+            assert!(c.tracker.poll_exited().is_empty());
+            c.feed([event(100, 90, 2)]);
+            assert_eq!(c.vector(), (2, 0, 0, 2, 2, 0));
+            assert_eq!(c.state.semantic_evidence().semantic_history_drops, 0);
+            assert_eq!(c.adapter.0.borrow().queries, 0);
+        }
+    }
+
+    #[test]
+    fn correction2_invalid_closed_lower_exec_foreign_and_capacity_are_counted_once() {
+        for trace in [false, true] {
+            let mut c = Consumer::new(trace, true);
+            c.tracker =
+                process::Tracker::for_producer(crate::events::EventsDomain::test_standin(1), 1);
+            c.feed([event(100, 90, 0)]);
+            let mut successor = event(100, 90, 0);
+            successor.image.exec_id = 1;
+            c.feed([successor]);
+            assert_eq!(c.vector(), (2, 0, 1, 1, 1, 0));
+            // Foreign or old exact retirement cannot retire the retained successor.
+            for key in [
+                semantics::ProcessKey::history(2, 90, 1, 100),
+                semantics::ProcessKey::history(1, 90, 0, 100),
+            ] {
+                apply_confirmed_retirement(&mut c.tracker, &mut c.state, key);
+            }
+            assert_eq!(c.vector(), (2, 0, 1, 1, 1, 0));
+            for (index, (domain, ev)) in [
+                (1, event(100, 90, 0)), // lower exec
+                (1, event(100, 0, 0)),  // invalid zero cookie
+                (2, successor),         // foreign source domain
+                (1, event(100, 4, 0)),  // finite cookie budget exhausted
+                (1, event(0, 90, 0)),   // malformed producer PID
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                c.feed_domain(domain, [ev]);
+                assert_eq!(
+                    c.state.semantic_evidence().semantic_history_drops,
+                    index as u64 + 1
+                );
+                assert_eq!(c.vector(), (2, 0, 1, 1, 1, 0));
+            }
+            let key = semantics::ProcessKey::history(1, 90, 1, 100);
+            apply_confirmed_retirement(&mut c.tracker, &mut c.state, key);
+            apply_confirmed_retirement(&mut c.tracker, &mut c.state, key);
+            assert_eq!(c.vector(), (2, 0, 2, 0, 1, 0));
+            c.feed([successor]); // Explicitly Closed is permanent.
+            c.feed_domain(0, [successor]);
+            assert_eq!(c.state.semantic_evidence().semantic_history_drops, 7);
+            assert_eq!(c.vector(), (2, 0, 2, 0, 1, 0));
+            if trace {
+                assert_eq!(c.tracer.raw_calls(), 9);
+            }
+        }
+    }
+
+    #[test]
+    fn correction2_exit_without_fence_preserves_tail_and_pending_until_explicit_retirement() {
+        for trace in [false, true] {
+            let mut c = Consumer::new(trace, true);
+            let fd = c.adapter.bind(100, 90);
+            let mut pending = event(100, 90, 1);
+            pending.rv = pkcs11_proxy_ng_types::CkRv::PENDING.0;
+            c.feed([event(100, 90, 0), pending]);
+            c.adapter.set(&fd, Membership::Exited);
+            assert!(c.tracker.poll_exited().is_empty());
+            let mut tail = event(100, 90, 0);
+            tail.session = 8;
+            c.feed([tail]);
+            assert_eq!(c.vector(), (2, 0, 0, 2, 2, 1));
+            assert_eq!(c.state.semantic_evidence().semantic_history_drops, 0);
+            // Explicit injected confirmation models the next owner's completed
+            // fence, not a claim that this test implements a real ring cursor.
+            let key = semantics::ProcessKey::history(1, 90, 0, 100);
+            apply_confirmed_retirement(&mut c.tracker, &mut c.state, key);
+            apply_confirmed_retirement(&mut c.tracker, &mut c.state, key);
+            assert_eq!(c.vector(), (2, 0, 2, 0, 2, 0));
+            assert_eq!(c.adapter.0.borrow().queries, 0);
+        }
     }
 }

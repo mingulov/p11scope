@@ -6,10 +6,53 @@
 
 use anyhow::{Context as _, Result};
 use aya::Ebpf;
-use aya::maps::MapData;
+use aya::maps::{Map, MapData};
 use p11scope_ebpf_common::{DiscoveryRecord, Event, valid_discovery_record};
 use std::mem::size_of;
 use std::ops::{ControlFlow, Deref};
+use std::{
+    num::NonZeroU64,
+    os::fd::{AsFd, OwnedFd},
+    sync::Arc,
+};
+
+/// Retains one live EVENTS map so its kernel ID cannot be reused while history survives.
+#[derive(Clone)]
+pub(crate) struct EventsDomain(Arc<RetainedEvents>);
+struct RetainedEvents {
+    id: NonZeroU64,
+    _fd: OwnedFd,
+}
+impl EventsDomain {
+    pub(crate) fn from_events(ebpf: &Ebpf) -> Result<Self> {
+        let Map::RingBuf(map) = ebpf.map("EVENTS").context("EVENTS map")? else {
+            anyhow::bail!("EVENTS is not a ring buffer");
+        };
+        let id = NonZeroU64::new(u64::from(map.info()?.id())).context("EVENTS map ID is zero")?;
+        let fd = map
+            .fd()
+            .as_fd()
+            .try_clone_to_owned()
+            .context("retaining EVENTS map descriptor")?;
+        Ok(Self(Arc::new(RetainedEvents { id, _fd: fd })))
+    }
+    pub(crate) fn id(&self) -> u64 {
+        self.0.id.get()
+    }
+
+    /// Synthetic identity for reducer tests; the owned FD is NOT a BPF map.
+    #[cfg(test)]
+    pub(crate) fn test_standin(id: u64) -> Self {
+        Self::test_with_fd(id, std::fs::File::open("/dev/null").unwrap().into())
+    }
+    #[cfg(test)]
+    fn test_with_fd(id: u64, fd: OwnedFd) -> Self {
+        Self(Arc::new(RetainedEvents {
+            id: NonZeroU64::new(id).unwrap(),
+            _fd: fd,
+        }))
+    }
+}
 
 /// Records one live poll consumes before returning to its caller's duration,
 /// signal and `--max-events` checks. Several times the 256 KiB ring's ~900
@@ -40,9 +83,10 @@ fn decode_exact<T: aya::Pod>(bytes: &[u8]) -> Option<T> {
 }
 
 /// Decodes one ring-buffer record into an `Event`, or `None` if its
-/// length doesn't match `size_of::<Event>()`.
+/// length differs from `size_of::<Event>()` or its root affiliation is invalid.
 pub fn decode(bytes: &[u8]) -> Option<Event> {
-    decode_exact(bytes)
+    let event: Event = decode_exact(bytes)?;
+    (event.root_affiliation <= 1).then_some(event)
 }
 
 pub(crate) fn decode_discovery(bytes: &[u8]) -> Option<DiscoveryRecord> {
@@ -73,19 +117,253 @@ impl RecordSource for aya::maps::RingBuf<&mut MapData> {
 /// The `EVENTS` drain over the live ring.
 pub type Drain<'a> = EventDrain<aya::maps::RingBuf<&'a mut MapData>>;
 
+pub(crate) enum BoundedRecord<T> {
+    Item(T),
+    Pending,
+    Reached,
+}
+
+/// Scheduling seam only. The native implementation delegates every byte read
+/// and discard to Aya's existing bounded parser.
+pub(crate) trait BoundedRecordSource: RecordSource {
+    fn positions(&self) -> aya::maps::ring_buf::RingBufPositions;
+    fn consumer(&self) -> usize;
+    fn bounded_record(
+        &mut self,
+        stop: usize,
+    ) -> Result<BoundedRecord<impl Deref<Target = [u8]> + '_>>;
+}
+impl BoundedRecordSource for aya::maps::RingBuf<&mut MapData> {
+    fn positions(&self) -> aya::maps::ring_buf::RingBufPositions {
+        self.snapshot_positions()
+    }
+    fn consumer(&self) -> usize {
+        self.consumer_position()
+    }
+    fn bounded_record(
+        &mut self,
+        stop: usize,
+    ) -> Result<BoundedRecord<impl Deref<Target = [u8]> + '_>> {
+        use aya::maps::ring_buf::BoundedRingBufRead;
+        Ok(match self.next_before(stop)? {
+            BoundedRingBufRead::Item(item) => BoundedRecord::Item(item),
+            BoundedRingBufRead::Pending => BoundedRecord::Pending,
+            BoundedRingBufRead::Reached => BoundedRecord::Reached,
+        })
+    }
+}
+
+pub(crate) const ROOT_TAIL_FENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RootTailProgress {
+    Pending,
+    Yielded,
+    Reached,
+}
+
+/// Owns the original child and retained map independently of borrowed drains.
+pub(crate) struct OwnedRootTail {
+    exit: crate::run::OriginalRootExit,
+    positions: Option<aya::maps::ring_buf::RingBufPositions>,
+    remaining: usize,
+    deadline: std::time::Instant,
+    reached: bool,
+    failed: bool,
+}
+pub(crate) struct ConsumedOriginalRootTail {
+    exit: crate::run::OriginalRootExit,
+}
+impl ConsumedOriginalRootTail {
+    pub(crate) fn domain(&self) -> u64 {
+        self.exit.domain().id()
+    }
+}
+impl OwnedRootTail {
+    /// Copies only the saved boundary and progress; never samples the producer.
+    #[cfg(test)]
+    pub(crate) fn observed_boundary(
+        &self,
+    ) -> (Option<aya::maps::ring_buf::RingBufPositions>, usize, bool) {
+        (self.positions, self.remaining, self.reached)
+    }
+
+    pub(crate) fn new(exit: crate::run::OriginalRootExit, deadline: std::time::Instant) -> Self {
+        Self {
+            exit,
+            positions: None,
+            remaining: 0,
+            deadline,
+            reached: false,
+            failed: false,
+        }
+    }
+    pub(crate) fn check(&mut self, cancelled: bool, now: std::time::Instant) -> Result<()> {
+        let reason = if self.failed {
+            Some("previous failure")
+        } else if cancelled {
+            Some("cancelled")
+        } else if now >= self.deadline {
+            Some("deadline")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            self.failed = true;
+            anyhow::bail!(
+                "root_tail_incomplete: {reason}; remaining={}",
+                self.remaining
+            );
+        }
+        Ok(())
+    }
+    /// Expected cancellation abandons only this optional retirement. Existing
+    /// failure and deadline checks take precedence; they remain genuine errors.
+    pub(crate) fn cancellation(
+        &mut self,
+        cancelled: bool,
+        now: std::time::Instant,
+    ) -> Result<Option<usize>> {
+        self.check(false, now)?;
+        if cancelled {
+            self.failed = true;
+            Ok(Some(self.remaining))
+        } else {
+            Ok(None)
+        }
+    }
+    pub(crate) fn complete(self) -> Result<ConsumedOriginalRootTail> {
+        anyhow::ensure!(
+            self.reached && !self.failed,
+            "root_tail_incomplete: prefix not reduced"
+        );
+        Ok(ConsumedOriginalRootTail { exit: self.exit })
+    }
+}
+
+impl<S: RecordSource> EventDrain<S> {
+    pub(crate) fn begin_root_tail(&mut self, tail: &mut OwnedRootTail) -> Result<()>
+    where
+        S: BoundedRecordSource,
+    {
+        let result = (|| {
+            tail.check(false, std::time::Instant::now())?;
+            anyhow::ensure!(tail.positions.is_none(), "root tail snapshot already taken");
+            anyhow::ensure!(
+                self.domain_id() == tail.exit.domain().id(),
+                "foreign EVENTS domain"
+            );
+            let p = self.source.positions();
+            let distance = p.producer.wrapping_sub(p.consumer);
+            anyhow::ensure!(
+                p.capacity >= 8
+                    && p.capacity.is_power_of_two()
+                    && p.consumer % 8 == 0
+                    && p.producer % 8 == 0
+                    && distance < p.capacity,
+                "invalid root tail boundary"
+            );
+            tail.remaining = distance;
+            tail.positions = Some(p);
+            Ok(())
+        })();
+        if result.is_err() {
+            tail.failed = true;
+        }
+        result.context("root_tail_incomplete: snapshot")
+    }
+
+    pub(crate) fn poll_root_tail(
+        &mut self,
+        tail: &mut OwnedRootTail,
+        quantum: usize,
+        mut reduce: impl FnMut(Event) -> Result<()>,
+    ) -> Result<RootTailProgress>
+    where
+        S: BoundedRecordSource,
+    {
+        let result = (|| {
+            tail.check(false, std::time::Instant::now())?;
+            let p = tail
+                .positions
+                .as_mut()
+                .context("root tail has no snapshot")?;
+            anyhow::ensure!(
+                self.domain_id() == tail.exit.domain().id(),
+                "foreign EVENTS domain"
+            );
+            anyhow::ensure!(
+                self.source.consumer() == p.consumer,
+                "unexpected EVENTS consumer cursor"
+            );
+            for _ in 0..quantum {
+                let progress = match self.source.bounded_record(p.producer)? {
+                    BoundedRecord::Item(item) => {
+                        match decode(&item) {
+                            Some(event) => reduce(event)?,
+                            None => self.malformed += 1,
+                        }
+                        drop(item);
+                        RootTailProgress::Yielded
+                    }
+                    BoundedRecord::Pending => RootTailProgress::Pending,
+                    BoundedRecord::Reached => RootTailProgress::Reached,
+                };
+                let current = self.source.consumer();
+                let delta = current.wrapping_sub(p.consumer);
+                anyhow::ensure!(
+                    delta <= tail.remaining && delta < p.capacity && delta % 8 == 0,
+                    "crossed root tail boundary"
+                );
+                tail.remaining -= delta;
+                p.consumer = current;
+                anyhow::ensure!(
+                    current.wrapping_add(tail.remaining) == p.producer,
+                    "invalid root tail progress"
+                );
+                if tail.remaining == 0 && current == p.producer {
+                    tail.reached = true;
+                    return Ok(RootTailProgress::Reached);
+                }
+                anyhow::ensure!(
+                    progress != RootTailProgress::Reached,
+                    "reader reached before semantic prefix"
+                );
+                if progress == RootTailProgress::Pending {
+                    return Ok(progress);
+                }
+            }
+            Ok(RootTailProgress::Yielded)
+        })();
+        if result.is_err() {
+            tail.failed = true;
+        }
+        result.context("root_tail_incomplete: bounded reduction")
+    }
+}
+
 /// Drains the `EVENTS` ring buffer, handing each well-formed record to a
 /// caller-supplied closure and counting the rest as malformed.
 pub struct EventDrain<S> {
     source: S,
     malformed: u64,
+    domain: Option<EventsDomain>,
 }
 
 impl<'a> Drain<'a> {
-    pub(crate) fn new(ebpf: &'a mut Ebpf) -> Result<Self> {
-        let ring = aya::maps::RingBuf::try_from(ebpf.map_mut("EVENTS").context("EVENTS map")?)?;
+    pub(crate) fn new(ebpf: &'a mut Ebpf, domain: EventsDomain) -> Result<Self> {
+        let map = ebpf.map_mut("EVENTS").context("EVENTS map")?;
+        let Map::RingBuf(data) = &*map else {
+            anyhow::bail!("EVENTS is not a ring buffer");
+        };
+        anyhow::ensure!(
+            u64::from(data.info()?.id()) == domain.id(),
+            "EVENTS map does not match retained domain"
+        );
+        let ring = aya::maps::RingBuf::try_from(map)?;
         Ok(Self {
             source: ring,
             malformed: 0,
+            domain: Some(domain),
         })
     }
 }
@@ -96,12 +374,33 @@ impl<S: RecordSource> EventDrain<S> {
         Self {
             source,
             malformed: 0,
+            domain: None,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn source(&self) -> &S {
         &self.source
+    }
+
+    #[cfg(test)]
+    pub(crate) fn over_domain(source: S, domain: EventsDomain) -> Self {
+        Self {
+            source,
+            malformed: 0,
+            domain: Some(domain),
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn over_test_domain(source: S, id: u64) -> Self {
+        if id == 0 {
+            Self::over(source)
+        } else {
+            Self::over_domain(source, EventsDomain::test_standin(id))
+        }
+    }
+    pub(crate) fn domain_id(&self) -> u64 {
+        self.domain.as_ref().map_or(0, EventsDomain::id)
     }
 
     /// Drains up to `quantum` records without blocking; `None` is for a ring
@@ -135,7 +434,7 @@ impl<S: RecordSource> EventDrain<S> {
         }
     }
 
-    /// Records rejected by the size check so far.
+    /// Records rejected by the size or affiliation check so far.
     pub fn malformed(&self) -> u64 {
         self.malformed
     }
@@ -217,9 +516,101 @@ impl<'a> DiscoveryDrain<'a> {
 }
 
 #[cfg(test)]
+mod runtime_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+
+    #[test]
+    fn domain_boundary_retention_survives_session_and_temporary_drains() {
+        const CHILD: &str = "P11SCOPE_EVENTS_RETENTION_CHILD";
+        const COMPLETE: &str = "EVENTS_RETENTION_CHILD_COMPLETE";
+        if std::env::var_os(CHILD).is_none() {
+            // A parallel OwnedChild test may fork while this fixture's socket
+            // is open. Its child then retains the socket until exec, despite
+            // our local FD being closed. Create this fixture only after exec.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "events::tests::domain_boundary_retention_survives_session_and_temporary_drains",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .expect("run isolated EVENTS retention fixture");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.lines().any(|line| line == COMPLETE),
+                "isolated retention fixture: {}\nstdout: {stdout}\nstderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        // A real owned file descriptor tests lifetime only, NOT BPF map identity.
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+        let (owner, mut peer) = UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let domain = EventsDomain::test_with_fd(7, owner.into());
+        let weak = Arc::downgrade(&domain.0);
+        let tracker = crate::process::Tracker::for_producer(domain.clone(), 16);
+        let plan = crate::plan::AttachPlan::from_slots(vec![]);
+        let state = crate::semantics::State::for_capture(
+            &plan,
+            crate::attach::CapturePolicy::Allowlisted,
+            domain.clone(),
+        );
+        for _ in 0..2 {
+            let drain = EventDrain::over_domain(ScriptedRecords::events([], 0), domain.clone());
+            assert_eq!(drain.domain_id(), 7);
+            assert!(Arc::ptr_eq(&domain.0, &drain.domain.as_ref().unwrap().0));
+        }
+        drop(domain);
+        assert!(weak.upgrade().is_some());
+        drop(tracker);
+        assert!(
+            weak.upgrade().is_some(),
+            "State retains the map after Tracker and Session"
+        );
+        assert!(peer.write(&[1]).is_ok());
+        drop(state);
+        assert!(weak.upgrade().is_none());
+        // Closing the last descriptor is visible at its actual peer.
+        let result = peer.read(&mut [0; 1]);
+        assert!(
+            matches!(result, Ok(0))
+                || result.is_err_and(|e| e.kind() == std::io::ErrorKind::ConnectionReset)
+        );
+
+        let domain = EventsDomain::test_standin(8);
+        let weak = Arc::downgrade(&domain.0);
+        let tracker = crate::process::Tracker::for_producer(domain.clone(), 16);
+        drop(domain);
+        assert!(
+            weak.upgrade().is_some(),
+            "Tracker independently retains the map"
+        );
+        drop(tracker);
+        assert!(weak.upgrade().is_none());
+        println!("\n{COMPLETE}");
+    }
+
+    #[test]
+    fn domain_boundary_decoder_accepts_only_event328_and_affiliations_zero_one() {
+        for tag in [0, 1, 2, u64::MAX] {
+            let event = Event {
+                root_affiliation: tag,
+                ..sample_event()
+            };
+            let bytes = event_bytes(&event);
+            assert_eq!(bytes.len(), 328);
+            assert_eq!(decode(&bytes).is_some(), tag <= 1);
+            assert!(decode(&bytes[..320]).is_none());
+        }
+    }
 
     fn sample_event() -> Event {
         Event {
@@ -387,5 +778,229 @@ mod tests {
         let mut malformed = record;
         malformed.reserved_tail_zero[0] = 1;
         assert!(decode_discovery(&discovery_bytes(&malformed)).is_none());
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod root_fence_tests {
+    use super::*;
+    use std::{
+        cell::Cell,
+        collections::VecDeque,
+        rc::Rc,
+        time::{Duration, Instant},
+    };
+    pub(crate) struct Source {
+        pub(crate) cursor: Rc<Cell<usize>>,
+        pub(crate) producer: usize,
+        pub(crate) capacity: usize,
+        pub(crate) records: VecDeque<Option<Vec<u8>>>,
+        pub(crate) busy: bool,
+    }
+    pub(crate) struct Item {
+        bytes: Vec<u8>,
+        cursor: Rc<Cell<usize>>,
+    }
+    impl Deref for Item {
+        type Target = [u8];
+        fn deref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+    impl Drop for Item {
+        fn drop(&mut self) {
+            self.cursor.set(self.cursor.get().wrapping_add(8));
+        }
+    }
+    fn forbidden_ordinary_read() -> Option<Vec<u8>> {
+        panic!("ordinary read bypassed the root fence")
+    }
+    impl RecordSource for Source {
+        fn next_record(&mut self) -> Option<impl Deref<Target = [u8]> + '_> {
+            forbidden_ordinary_read()
+        }
+    }
+    impl BoundedRecordSource for Source {
+        fn positions(&self) -> aya::maps::ring_buf::RingBufPositions {
+            aya::maps::ring_buf::RingBufPositions {
+                consumer: self.cursor.get(),
+                producer: self.producer,
+                capacity: self.capacity,
+            }
+        }
+        fn consumer(&self) -> usize {
+            self.cursor.get()
+        }
+        fn bounded_record(
+            &mut self,
+            stop: usize,
+        ) -> Result<BoundedRecord<impl Deref<Target = [u8]> + '_>> {
+            if self.cursor.get() == stop {
+                return Ok(BoundedRecord::Reached);
+            }
+            if self.busy {
+                return Ok(BoundedRecord::Pending);
+            }
+            match self.records.pop_front() {
+                Some(Some(bytes)) => Ok(BoundedRecord::Item(Item {
+                    bytes,
+                    cursor: self.cursor.clone(),
+                })),
+                Some(None) => {
+                    self.cursor.set(self.cursor.get().wrapping_add(8));
+                    Ok(BoundedRecord::Pending)
+                }
+                None => Ok(BoundedRecord::Pending),
+            }
+        }
+    }
+    pub(crate) fn source(events: impl IntoIterator<Item = Event>) -> Source {
+        let records: VecDeque<_> = events.into_iter().map(|e| Some(event_bytes(&e))).collect();
+        Source {
+            producer: records.len() * 8,
+            cursor: Rc::new(Cell::new(0)),
+            capacity: 4096,
+            records,
+            busy: false,
+        }
+    }
+    fn tail(domain: EventsDomain) -> OwnedRootTail {
+        OwnedRootTail::new(
+            crate::run::OriginalRootExit::test_reaped(domain),
+            Instant::now() + Duration::from_secs(1),
+        )
+    }
+    #[test]
+    fn root_fence_fixed_boundary_resumes_after_callback_and_drop() {
+        let domain = EventsDomain::test_standin(101);
+        let mut source = source([Event::default(); 3]);
+        source.producer = 16; // The third record is a later reservation.
+        let cursor = source.cursor.clone();
+        let mut tail = tail(domain.clone());
+        let mut drain = EventDrain::over_domain(source, domain.clone());
+        drain.begin_root_tail(&mut tail).unwrap();
+        let mut callbacks = 0;
+        assert_eq!(
+            drain
+                .poll_root_tail(&mut tail, 1, |_| {
+                    assert_eq!(cursor.get(), 0);
+                    callbacks += 1;
+                    Ok(())
+                })
+                .unwrap(),
+            RootTailProgress::Yielded
+        );
+        let mut source = drain.source;
+        source.producer = 24;
+        let mut drain = EventDrain::over_domain(source, domain);
+        assert_eq!(
+            drain
+                .poll_root_tail(&mut tail, 1, |_| {
+                    assert_eq!(cursor.get(), 8);
+                    callbacks += 1;
+                    Ok(())
+                })
+                .unwrap(),
+            RootTailProgress::Reached
+        );
+        assert_eq!(
+            (callbacks, cursor.get(), drain.source.records.len()),
+            (2, 16, 1)
+        );
+        assert!(tail.complete().is_ok());
+    }
+    #[test]
+    fn root_fence_foreign_cursor_busy_timeout_cancel_and_reduction_refuse_completion() {
+        for failure in 0..5 {
+            let domain = EventsDomain::test_standin(102);
+            let mut tail = tail(domain.clone());
+            let mut drain = EventDrain::over_domain(source([Event::default()]), domain);
+            drain.begin_root_tail(&mut tail).unwrap();
+            match failure {
+                0 => drain.domain = Some(EventsDomain::test_standin(103)),
+                1 => drain.source.cursor.set(8),
+                2 => {
+                    drain.source.busy = true;
+                    assert_eq!(
+                        drain.poll_root_tail(&mut tail, 1, |_| Ok(())).unwrap(),
+                        RootTailProgress::Pending
+                    );
+                    tail.check(false, Instant::now() + Duration::from_secs(2))
+                        .unwrap_err();
+                }
+                3 => {
+                    tail.check(true, Instant::now()).unwrap_err();
+                }
+                _ => {}
+            }
+            assert!(
+                drain
+                    .poll_root_tail(&mut tail, 1, |_| if failure == 4 {
+                        anyhow::bail!("reducer failed")
+                    } else {
+                        Ok(())
+                    })
+                    .is_err()
+            );
+            assert!(tail.complete().is_err());
+        }
+    }
+    #[test]
+    fn root_fence_crossed_progress_and_resnapshot_never_complete() {
+        for resnapshot in [false, true] {
+            let domain = EventsDomain::test_standin(105);
+            let mut tail = tail(domain.clone());
+            let mut drain = EventDrain::over_domain(source([Event::default()]), domain);
+            drain.begin_root_tail(&mut tail).unwrap();
+            if resnapshot {
+                drain.source.producer = 16;
+                assert!(drain.begin_root_tail(&mut tail).is_err());
+            } else {
+                let cursor = drain.source.cursor.clone();
+                assert!(
+                    drain
+                        .poll_root_tail(&mut tail, 1, |_| {
+                            cursor.set(8);
+                            Ok(())
+                        })
+                        .is_err()
+                );
+            }
+            assert!(tail.complete().is_err());
+        }
+    }
+
+    #[test]
+    fn root_fence_zero_wrapping_discard_malformed_and_invalid_boundaries() {
+        for (start, stop, valid) in [
+            (0, 0, true),
+            (usize::MAX - 7, 8, true),
+            (0, 4096, false),
+            (1, 8, false),
+            (0, 7, false),
+        ] {
+            let domain = EventsDomain::test_standin(104);
+            let mut tail = tail(domain.clone());
+            let mut source = source([]);
+            source.cursor.set(start);
+            source.producer = stop;
+            source.records.extend([None, Some(vec![1])]);
+            let mut drain = EventDrain::over_domain(source, domain);
+            assert_eq!(drain.begin_root_tail(&mut tail).is_ok(), valid);
+            if !valid {
+                assert!(tail.complete().is_err());
+                continue;
+            }
+            loop {
+                if drain.poll_root_tail(&mut tail, 1, |_| Ok(())).unwrap()
+                    == RootTailProgress::Reached
+                {
+                    break;
+                }
+            }
+            assert_eq!(drain.source.cursor.get(), stop);
+            assert_eq!(drain.malformed(), u64::from(start != stop));
+            assert!(tail.complete().is_ok());
+        }
     }
 }

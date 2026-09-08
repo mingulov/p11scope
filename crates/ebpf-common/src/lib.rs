@@ -3,6 +3,53 @@
 //! same bytes out of the same map.
 #![no_std]
 
+pub use pkcs11_module::layout::LinuxLayout;
+
+/// Conventional x86 userspace code selectors accepted by the observer.
+/// Exact equality is intentional: masking or narrowing would authorize an
+/// ABI-dependent read for an unqualified selector.
+#[inline(always)]
+pub const fn target_layout_from_cs(cs: u64) -> Option<LinuxLayout> {
+    match cs {
+        0x33 => Some(LinuxLayout::Lp64),
+        0x23 => Some(LinuxLayout::Ilp32),
+        _ => None,
+    }
+}
+
+#[inline(always)]
+pub const fn normalize_target_word(value: u64, layout: LinuxLayout) -> u64 {
+    match layout {
+        LinuxLayout::Lp64 => value,
+        LinuxLayout::Ilp32 => value as u32 as u64,
+    }
+}
+
+/// Validate the complete target word span and return its inclusive end.
+#[inline(always)]
+pub fn target_word_end(address: u64, layout: LinuxLayout) -> Option<u64> {
+    match layout {
+        LinuxLayout::Lp64 => address.checked_add(7),
+        LinuxLayout::Ilp32 if address <= u32::MAX as u64 - 3 => Some(address + 3),
+        LinuxLayout::Ilp32 => None,
+    }
+}
+
+/// Address of an ABI stack argument. LP64 places only argument seven here;
+/// ILP32 places all seven supported arguments after the return address.
+#[inline(always)]
+pub fn target_stack_arg_address(stack_pointer: u64, index: u8, layout: LinuxLayout) -> Option<u64> {
+    let offset = match layout {
+        LinuxLayout::Lp64 if index == 6 => 8,
+        LinuxLayout::Lp64 => return None,
+        LinuxLayout::Ilp32 if index <= 6 => (index as u64 + 1) * 4,
+        LinuxLayout::Ilp32 => return None,
+    };
+    let address = normalize_target_word(stack_pointer, layout).checked_add(offset)?;
+    target_word_end(address, layout)?;
+    Some(address)
+}
+
 /// Attach slots. One slot per unique {object, file_offset} target, not
 /// per function name — aliased names share a slot by construction.
 /// 512 covers the 104-entry 3.2 table several times over.
@@ -713,7 +760,8 @@ pub const EVIDENCE_CGROUP_SCOPE_FAILURES: u32 = 4;
 pub const EVIDENCE_SEMANTIC_CAPTURE_FAILURES: u32 = 5;
 pub const EVIDENCE_TEMPLATE_TAIL_FAILURES: u32 = 6;
 pub const EVIDENCE_UNREGISTERED_MECHANISMS: u32 = 7;
-pub const EVIDENCE_CELLS: u32 = 8;
+pub const EVIDENCE_ABI_REFUSALS: u32 = 8;
+pub const EVIDENCE_CELLS: u32 = 9;
 
 /// Hash-map capacities. The opt-in induced-gap build shrinks both maps so
 /// their independent failure counters can be exercised deterministically.
@@ -947,6 +995,120 @@ pub const RING_BYTES: u32 = 4096;
 /// Maximum template attributes captured per event.
 pub const MAX_ATTRS: usize = 8;
 
+/// Concurrent current-physical-task reservations, not image lifetime tickets.
+pub const THREAD_OWNER_LIMIT: u64 = START_ENTRIES as u64 + 64;
+
+pub const ROOT_AFFILIATION_LIMIT_NORMAL: u64 = 16_384;
+pub const ROOT_AFFILIATION_LIMIT_SMALL: u64 = 3;
+#[cfg(not(feature = "small-state-maps"))]
+pub const ROOT_AFFILIATION_LIMIT: u64 = ROOT_AFFILIATION_LIMIT_NORMAL;
+#[cfg(feature = "small-state-maps")]
+pub const ROOT_AFFILIATION_LIMIT: u64 = ROOT_AFFILIATION_LIMIT_SMALL;
+pub const ROOT_AFFILIATION_UNKNOWN: u64 = 0;
+pub const ROOT_AFFILIATION_POSITIVE: u64 = 1;
+
+/// Private root leases and root-only sticky failure evidence. No pairing health.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct RootAffiliationControl {
+    pub affiliation_reserved: u64,
+    pub failure_flags: u64,
+    pub admission_failures: u64,
+    pub create_failures: u64,
+    pub malformed_failures: u64,
+    pub classifier_failures: u64,
+    pub delete_failures: u64,
+    pub refund_failures: u64,
+}
+pub const ROOT_BAD_CONTROL: u64 = 1;
+pub const ROOT_CAPACITY: u64 = 2;
+pub const ROOT_RESERVE_CAS: u64 = 4;
+pub const ROOT_CREATE_FAILED: u64 = 8;
+pub const ROOT_EXISTING_CHILD: u64 = 16;
+pub const ROOT_BAD_CELL: u64 = 32;
+pub const ROOT_EXIT_CLASSIFIER: u64 = 64;
+pub const ROOT_EXIT_DELETE: u64 = 128;
+pub const ROOT_REFUND_FAILED: u64 = 256;
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for RootAffiliationControl {}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ThreadOwner {
+    pub original_pid_tgid: u64,
+    pub discovery_cookies: [u64; 64],
+    pub occupied: u64,
+    pub selection_domains: u64,
+    pub start_count: u32,
+    pub flags: u32,
+}
+
+/// OWNER_CTL[0]: initialize limit=THREAD_OWNER_LIMIT and other fields zero,
+/// freeze userspace mutation before links. Poison is terminal for these maps.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ThreadOwnerControl {
+    pub limit: u64,
+    pub outstanding: u64,
+    pub poison: u64,
+    pub admission_failures: u64,
+    pub reclamation_failures: u64,
+    pub abandoned_start: u64,
+    pub abandoned_discovery: u64,
+}
+
+pub const OWNER_BAD_CONTROL: u64 = 1;
+pub const OWNER_LOOKUP_UNKNOWN: u64 = 2;
+pub const OWNER_BAD_RECORD: u64 = 4;
+pub const OWNER_DELETE_FAILED: u64 = 8;
+pub const OWNER_BOOKKEEPING_FAILED: u64 = 16;
+pub const OWNER_REFUND_FAILED: u64 = 32;
+pub const OWNER_CLASSIFIER_FAILED: u64 = 64;
+pub const OWNER_STATE_DELETE_FAILED: u64 = 128;
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for ThreadOwner {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for ThreadOwnerControl {}
+
+/// Lifetime ticket budget for one production capture. Distinct from concurrent
+/// owner/affiliation reservations. Tickets are never reset or reused.
+pub const IMAGE_IDENTITY_TICKET_LIMIT: u64 = 16_384;
+
+/// Private producer transport identity. Zero cookie is unavailable; exec ID zero is valid.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ImageIdentity {
+    pub task_cookie: u64,
+    pub exec_id: u64,
+}
+
+#[inline(always)]
+pub const fn image_pair_matches(saved: ImageIdentity, current: ImageIdentity) -> bool {
+    saved.task_cookie != 0
+        && current.task_cookie != 0
+        && saved.task_cookie == current.task_cookie
+        && saved.exec_id == current.exec_id
+}
+
+/// COOKIE_CTL[0], shared with native/image_identity.h. Before links, the loader
+/// must publish limit=IMAGE_IDENTITY_TICKET_LIMIT and all other fields zero.
+/// During capture only BPF mutates this cell. Never reset next_ticket or reuse
+/// this control with retained task storage. Counters saturate (best effort).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ImageIdentityControl {
+    pub limit: u64,
+    pub next_ticket: u64,
+    pub unavailable: u64,
+    pub create_failures: u64,
+    pub retry_exhausted: u64,
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for ImageIdentityControl {}
+
 /// What the entry probe stashes until the matching return. Replaces the
 /// bare timestamp Phase 1b stored.
 #[repr(C)]
@@ -988,6 +1150,7 @@ pub struct CallStart {
     pub capture: u32,
     pub target_function: u32,
     pub _pad: u64,
+    pub image: ImageIdentity,
 }
 
 /// One completed call. Emitted at return only: a call with no return is
@@ -1040,6 +1203,10 @@ pub struct Event {
     pub attr_bools_seen1: u32,
     pub capture: u32,
     pub event_type: u32,
+    pub image: ImageIdentity,
+    pub child_image: ImageIdentity,
+    /// Private current physical affiliation: 0 UNKNOWN, 1 positive original root.
+    pub root_affiliation: u64,
 }
 
 #[cfg(feature = "user")]
@@ -1052,6 +1219,74 @@ unsafe impl aya::Pod for FunctionNameKey {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn target_layout_accepts_only_exact_conventional_selectors() {
+        assert_eq!(target_layout_from_cs(0x33), Some(LinuxLayout::Lp64));
+        assert_eq!(target_layout_from_cs(0x23), Some(LinuxLayout::Ilp32));
+        for refused in [0, 0x2b, 0x32, 0x34, 0x1_0000_0023, 0x1_0000_0033] {
+            assert_eq!(
+                target_layout_from_cs(refused),
+                None,
+                "selector {refused:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn target_words_and_stack_addresses_respect_the_selected_width() {
+        assert_eq!(
+            normalize_target_word(0xfeed_face_8000_0005, LinuxLayout::Ilp32),
+            0x8000_0005
+        );
+        assert_eq!(
+            normalize_target_word(0xfeed_face_8000_0005, LinuxLayout::Lp64),
+            0xfeed_face_8000_0005
+        );
+        assert_eq!(
+            target_word_end(u32::MAX as u64 - 3, LinuxLayout::Ilp32),
+            Some(u32::MAX as u64)
+        );
+        assert_eq!(
+            target_word_end(u32::MAX as u64 - 2, LinuxLayout::Ilp32),
+            None
+        );
+        assert_eq!(target_word_end(u64::MAX, LinuxLayout::Ilp32), None);
+        assert_eq!(
+            target_word_end(u64::MAX - 7, LinuxLayout::Lp64),
+            Some(u64::MAX)
+        );
+        assert_eq!(target_word_end(u64::MAX - 6, LinuxLayout::Lp64), None);
+        assert_eq!(target_word_end(u64::MAX, LinuxLayout::Lp64), None);
+
+        for index in 0..=6 {
+            assert_eq!(
+                target_stack_arg_address(0xaaaa_aaaa_0000_1000, index, LinuxLayout::Ilp32),
+                Some(0x1004 + u64::from(index) * 4),
+            );
+        }
+        assert_eq!(
+            target_stack_arg_address(0x1000, 7, LinuxLayout::Ilp32),
+            None
+        );
+        assert_eq!(
+            target_stack_arg_address(u32::MAX as u64 - 31, 6, LinuxLayout::Ilp32),
+            Some(u32::MAX as u64 - 3)
+        );
+        assert_eq!(
+            target_stack_arg_address(u32::MAX as u64 - 30, 6, LinuxLayout::Ilp32),
+            None
+        );
+        assert_eq!(
+            target_stack_arg_address(u64::MAX - 15, 6, LinuxLayout::Lp64),
+            Some(u64::MAX - 7)
+        );
+        assert_eq!(
+            target_stack_arg_address(u64::MAX - 14, 6, LinuxLayout::Lp64),
+            None
+        );
+        assert_eq!(target_stack_arg_address(0x1000, 5, LinuxLayout::Lp64), None);
+    }
 
     #[test]
     fn slot_semantics_is_a_padding_free_map_value() {
@@ -1128,6 +1363,7 @@ mod tests {
             EVIDENCE_SEMANTIC_CAPTURE_FAILURES,
             EVIDENCE_TEMPLATE_TAIL_FAILURES,
             EVIDENCE_UNREGISTERED_MECHANISMS,
+            EVIDENCE_ABI_REFUSALS,
         ];
         for (position, index) in indices.iter().enumerate() {
             assert_eq!(*index as usize, position);
@@ -1157,18 +1393,124 @@ mod tests {
     }
 
     #[test]
+    fn image_identity_refuses_missing_cookie_and_changed_image() {
+        let first = ImageIdentity {
+            task_cookie: 7,
+            exec_id: 0,
+        };
+        assert!(image_pair_matches(first, first));
+        for other in [
+            ImageIdentity::default(),
+            ImageIdentity {
+                task_cookie: 0,
+                exec_id: 1,
+            },
+            ImageIdentity {
+                task_cookie: 8,
+                exec_id: 0,
+            },
+            ImageIdentity {
+                task_cookie: 7,
+                exec_id: 1,
+            },
+        ] {
+            assert!(!image_pair_matches(first, other));
+            assert!(!image_pair_matches(other, first));
+        }
+        assert!(!image_pair_matches(
+            ImageIdentity::default(),
+            ImageIdentity::default()
+        ));
+    }
+
+    #[test]
+    fn physical_owner_and_control_have_exact_native_layouts() {
+        use core::mem::{align_of, offset_of, size_of};
+        assert_eq!(size_of::<ThreadOwner>(), 544);
+        assert_eq!(align_of::<ThreadOwner>(), 8);
+        assert_eq!(offset_of!(ThreadOwner, original_pid_tgid), 0);
+        assert_eq!(offset_of!(ThreadOwner, discovery_cookies), 8);
+        assert_eq!(offset_of!(ThreadOwner, occupied), 520);
+        assert_eq!(offset_of!(ThreadOwner, selection_domains), 528);
+        assert_eq!(offset_of!(ThreadOwner, start_count), 536);
+        assert_eq!(offset_of!(ThreadOwner, flags), 540);
+        assert_eq!(size_of::<ThreadOwnerControl>(), 56);
+        assert_eq!(offset_of!(ThreadOwnerControl, limit), 0);
+        assert_eq!(offset_of!(ThreadOwnerControl, outstanding), 8);
+        assert_eq!(offset_of!(ThreadOwnerControl, poison), 16);
+        assert_eq!(offset_of!(ThreadOwnerControl, admission_failures), 24);
+        assert_eq!(offset_of!(ThreadOwnerControl, reclamation_failures), 32);
+        assert_eq!(offset_of!(ThreadOwnerControl, abandoned_start), 40);
+        assert_eq!(offset_of!(ThreadOwnerControl, abandoned_discovery), 48);
+        assert_eq!(size_of::<StartKey>(), 16);
+        assert_eq!(size_of::<StateKey>(), 24);
+        assert_eq!(offset_of!(StartKey, slot), 8);
+        assert_eq!(offset_of!(StartKey, _pad), 12);
+        assert_eq!(offset_of!(StateKey, attach_cookie), 8);
+        assert_eq!(offset_of!(StateKey, domain), 16);
+        assert_eq!(
+            THREAD_OWNER_LIMIT,
+            if cfg!(feature = "small-state-maps") {
+                65
+            } else {
+                16448
+            }
+        );
+    }
+
+    #[test]
+    fn image_identity_wire_and_control_layout() {
+        use core::mem::{offset_of, size_of};
+        assert_eq!(size_of::<ImageIdentity>(), 16);
+        assert_eq!(offset_of!(ImageIdentity, exec_id), 8);
+        assert_eq!(size_of::<ImageIdentityControl>(), 40);
+        assert_eq!(offset_of!(ImageIdentityControl, limit), 0);
+        assert_eq!(offset_of!(ImageIdentityControl, next_ticket), 8);
+        assert_eq!(offset_of!(ImageIdentityControl, unavailable), 16);
+        assert_eq!(offset_of!(ImageIdentityControl, create_failures), 24);
+        assert_eq!(offset_of!(ImageIdentityControl, retry_exhausted), 32);
+        assert_eq!(offset_of!(CallStart, attr_types), 96);
+        assert_eq!(offset_of!(CallStart, attr_types1), 176);
+        assert_eq!(offset_of!(CallStart, capture), 256);
+        assert_eq!(offset_of!(CallStart, _pad), 264);
+        assert_eq!(offset_of!(CallStart, image), 272);
+        assert_eq!(offset_of!(Event, image), 288);
+        assert_eq!(offset_of!(Event, child_image), 304);
+        assert_eq!(offset_of!(Event, root_affiliation), 320);
+    }
+
+    #[test]
     fn event_and_callstart_have_no_implicit_padding() {
         // Both cross the kernel/userspace boundary as raw bytes; implicit
         // tail padding would read as uninitialized on one side.
-        assert_eq!(core::mem::size_of::<CallStart>(), 272);
-        assert_eq!(core::mem::size_of::<Event>(), 288);
+        assert_eq!(core::mem::size_of::<CallStart>(), 288);
+        assert_eq!(core::mem::size_of::<Event>(), 328);
         assert_eq!(core::mem::align_of::<CallStart>(), 8);
         assert_eq!(core::mem::align_of::<Event>(), 8);
         let call_start = CallStart::default();
         assert_eq!(
-            core::mem::offset_of!(CallStart, _pad) + core::mem::size_of_val(&call_start._pad),
+            core::mem::offset_of!(CallStart, image) + core::mem::size_of_val(&call_start.image),
             core::mem::size_of::<CallStart>()
         );
+    }
+
+    #[test]
+    fn root_affiliation_control_layout_and_separate_bounds() {
+        use core::mem::{align_of, offset_of, size_of};
+        assert_eq!(size_of::<RootAffiliationControl>(), 64);
+        assert_eq!(align_of::<RootAffiliationControl>(), 8);
+        assert_eq!(offset_of!(RootAffiliationControl, affiliation_reserved), 0);
+        assert_eq!(offset_of!(RootAffiliationControl, failure_flags), 8);
+        assert_eq!(offset_of!(RootAffiliationControl, admission_failures), 16);
+        assert_eq!(offset_of!(RootAffiliationControl, create_failures), 24);
+        assert_eq!(offset_of!(RootAffiliationControl, malformed_failures), 32);
+        assert_eq!(offset_of!(RootAffiliationControl, classifier_failures), 40);
+        assert_eq!(offset_of!(RootAffiliationControl, delete_failures), 48);
+        assert_eq!(offset_of!(RootAffiliationControl, refund_failures), 56);
+        assert_eq!(ROOT_AFFILIATION_LIMIT_NORMAL, 16_384);
+        assert_eq!(ROOT_AFFILIATION_LIMIT_SMALL, 3);
+        assert_eq!(ROOT_AFFILIATION_UNKNOWN, 0);
+        assert_eq!(ROOT_AFFILIATION_POSITIVE, 1);
     }
 
     #[test]

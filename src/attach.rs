@@ -8,35 +8,34 @@ use crate::events;
 use crate::plan::{AttachPlan, Slot};
 use crate::run::OwnedChild;
 use anyhow::{Context as _, Result, anyhow, bail};
-use aya::Ebpf;
 use aya::maps::{Array, HashMap, Map, MapError, MapType, PerCpuArray, ProgramArray};
-use aya::programs::trace_point::TracePointLinkId;
+use aya::programs::raw_trace_point::RawTracePointLinkId;
+use aya::programs::tp_btf::BtfTracePointLinkId;
 use aya::programs::uprobe::{UProbeAttachLocation, UProbeAttachPoint, UProbeLinkId, UProbeScope};
-use aya::programs::{ProgramError, TracePoint, TracePointError, UProbe};
+use aya::programs::{BtfTracePoint, RawTracePoint, UProbe};
+use aya::{Btf, Ebpf, EbpfLoader};
 use p11scope_ebpf_common::{
-    ARG_NONE, CFG_TASK_NEWTASK_OFFSETS, DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES,
+    ARG_NONE, DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES,
     DISCOVERY_COUNTER_EXPORT_STATE_FAILURES, DISCOVERY_COUNTER_LOADER_HITS,
     DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES, DISCOVERY_COUNTER_RING_LOSS,
-    FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED, FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA,
-    FUNCTION_NAME_MAX_BYTES, FunctionNameKey, MAX_DESCRIPTORS, PAUSE_ARMED, PauseKey,
-    SlotSemantics, TAIL_CALLS_INTERFACE_WORKER_SLOT, TAIL_CALLS_TEMPLATE_SECOND_SLOT,
-    attach_cookie, pack_task_newtask_offsets,
+    EVIDENCE_ABI_REFUSALS, FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED,
+    FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA, FUNCTION_NAME_MAX_BYTES, FunctionNameKey,
+    IMAGE_IDENTITY_TICKET_LIMIT, ImageIdentityControl, MAX_DESCRIPTORS, PAUSE_ARMED, PauseKey,
+    ROOT_AFFILIATION_POSITIVE, RootAffiliationControl, SlotSemantics,
+    TAIL_CALLS_INTERFACE_WORKER_SLOT, TAIL_CALLS_TEMPLATE_SECOND_SLOT, THREAD_OWNER_LIMIT,
+    ThreadOwnerControl, attach_cookie,
 };
+use p11scope_manifest::elf::ElfAbi;
 use pkcs11_proxy_ng_types::mechanism_registry::MechanismRegistry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::mem::size_of_val;
 use std::num::NonZeroU64;
-use std::os::fd::{AsFd as _, AsRawFd as _};
+use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const BPF_F_RDONLY_PROG: u32 = 1 << 7;
-const TASK_NEWTASK_FORMATS: [&str; 2] = [
-    "/sys/kernel/tracing/events/task/task_newtask/format",
-    "/sys/kernel/debug/tracing/events/task/task_newtask/format",
-];
-
 #[derive(Debug)]
 pub(crate) enum DynamicLoaderAttachFailure {
     KernelUnavailable(anyhow::Error),
@@ -143,7 +142,8 @@ const DEFAULT_PROGRAMS: [&str; 13] = [
     "sched_process_exec",
     "sched_process_exit",
 ];
-const UNSAFE_PROGRAMS: [&str; 4] = [
+const UNSAFE_PROGRAMS: [&str; 5] = [
+    "p11_entry_ia32",
     "p11_entry_template",
     "p11_entry_template_types",
     "p11_entry_template_pair",
@@ -170,20 +170,316 @@ fn validate_map_metadata(
     data: &aya::maps::MapData,
     expected: ExactMapMetadata,
 ) -> Result<()> {
+    compare_map_metadata(name, read_map_metadata(name, data)?, expected)
+}
+
+fn read_map_metadata(name: &str, data: &aya::maps::MapData) -> Result<ExactMapMetadata> {
     let info = data
         .info()
         .with_context(|| format!("reading {name} map info"))?;
-    let actual = ExactMapMetadata {
+    Ok(ExactMapMetadata {
         map_type: info.map_type()?,
         key_size: info.key_size(),
         value_size: info.value_size(),
         max_entries: info.max_entries(),
         flags: info.map_flags(),
-    };
+    })
+}
+
+fn compare_map_metadata(
+    name: &str,
+    actual: ExactMapMetadata,
+    expected: ExactMapMetadata,
+) -> Result<()> {
     if actual != expected {
         bail!("{name} metadata {actual:?} differs from exact expected {expected:?}");
     }
     Ok(())
+}
+
+const IDENTITY_MAPS: [(&str, ExactMapMetadata); 6] = [
+    (
+        "TASK_COOKIE",
+        map_metadata(MapType::TaskStorage, 4, 8, 0, 1),
+    ),
+    (
+        "THREAD_OWNER",
+        map_metadata(MapType::TaskStorage, 4, 544, 0, 1),
+    ),
+    (
+        "ROOT_AFFILIATION",
+        map_metadata(MapType::TaskStorage, 4, 8, 0, 1),
+    ),
+    ("COOKIE_CTL", map_metadata(MapType::Array, 4, 40, 1, 0)),
+    ("OWNER_CTL", map_metadata(MapType::Array, 4, 56, 1, 0)),
+    ("ROOT_CTL", map_metadata(MapType::Array, 4, 64, 1, 0)),
+];
+
+fn validate_identity_inventory<'a>(maps: impl Iterator<Item = (&'a str, bool)>) -> Result<()> {
+    let mut storage = BTreeSet::new();
+    for (name, unsupported) in maps {
+        if unsupported {
+            if !matches!(name, "TASK_COOKIE" | "THREAD_OWNER" | "ROOT_AFFILIATION") {
+                bail!("unexpected Unsupported map {name}");
+            }
+            storage.insert(name);
+        } else if matches!(name, "TASK_COOKIE" | "THREAD_OWNER" | "ROOT_AFFILIATION") {
+            bail!("{name} must be an Unsupported task-storage map");
+        }
+    }
+    if storage != BTreeSet::from(["ROOT_AFFILIATION", "TASK_COOKIE", "THREAD_OWNER"]) {
+        bail!("missing required task-storage maps: {storage:?}");
+    }
+    Ok(())
+}
+
+fn identity_map_data<'a>(name: &str, map: &'a Map) -> Result<&'a aya::maps::MapData> {
+    let (_, expected) = IDENTITY_MAPS
+        .iter()
+        .find(|(candidate, _)| *candidate == name)
+        .with_context(|| format!("unexpected identity map {name}"))?;
+    let data = match (name, map) {
+        ("TASK_COOKIE" | "THREAD_OWNER" | "ROOT_AFFILIATION", Map::Unsupported(data)) => data,
+        ("COOKIE_CTL" | "OWNER_CTL" | "ROOT_CTL", Map::Array(data)) => data,
+        _ => bail!("unexpected {name} identity map variant"),
+    };
+    validate_map_metadata(name, data, *expected)?;
+    Ok(data)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdentityPreparation {
+    WriteCookie,
+    ReadCookie,
+    WriteOwner,
+    ReadOwner,
+    WriteRoot,
+    ReadRoot,
+    SeedRoot,
+    ReadSeed,
+    Freeze(&'static str),
+}
+
+fn prepare_identity_with(
+    owned: bool,
+    mut operation: impl FnMut(IdentityPreparation) -> Result<()>,
+) -> Result<()> {
+    let controls = [
+        IdentityPreparation::WriteCookie,
+        IdentityPreparation::ReadCookie,
+        IdentityPreparation::WriteOwner,
+        IdentityPreparation::ReadOwner,
+        IdentityPreparation::WriteRoot,
+        IdentityPreparation::ReadRoot,
+    ];
+    for step in controls
+        .into_iter()
+        .chain(owned.then_some(IdentityPreparation::SeedRoot))
+        .chain(owned.then_some(IdentityPreparation::ReadSeed))
+        .chain([
+            IdentityPreparation::Freeze("TASK_COOKIE"),
+            IdentityPreparation::Freeze("THREAD_OWNER"),
+            IdentityPreparation::Freeze("ROOT_AFFILIATION"),
+            IdentityPreparation::Freeze("COOKIE_CTL"),
+            IdentityPreparation::Freeze("OWNER_CTL"),
+            IdentityPreparation::Freeze("ROOT_CTL"),
+        ])
+    {
+        operation(step).with_context(|| format!("identity preparation {step:?}"))?;
+    }
+    Ok(())
+}
+
+fn cookie_control_fields(c: ImageIdentityControl) -> [u64; 5] {
+    [
+        c.limit,
+        c.next_ticket,
+        c.unavailable,
+        c.create_failures,
+        c.retry_exhausted,
+    ]
+}
+
+fn owner_control_fields(c: ThreadOwnerControl) -> [u64; 7] {
+    [
+        c.limit,
+        c.outstanding,
+        c.poison,
+        c.admission_failures,
+        c.reclamation_failures,
+        c.abandoned_start,
+        c.abandoned_discovery,
+    ]
+}
+
+fn root_control_fields(c: RootAffiliationControl) -> [u64; 8] {
+    [
+        c.affiliation_reserved,
+        c.failure_flags,
+        c.admission_failures,
+        c.create_failures,
+        c.malformed_failures,
+        c.classifier_failures,
+        c.delete_failures,
+        c.refund_failures,
+    ]
+}
+
+fn validate_root_control_readback(
+    expected: RootAffiliationControl,
+    actual: RootAffiliationControl,
+) -> Result<()> {
+    if root_control_fields(actual) != root_control_fields(expected) {
+        bail!("ROOT_CTL exact readback differs from initial control");
+    }
+    Ok(())
+}
+
+fn initial_root_control(owned: bool) -> RootAffiliationControl {
+    RootAffiliationControl {
+        affiliation_reserved: u64::from(owned),
+        ..Default::default()
+    }
+}
+
+fn root_seed_authority<'fd>(
+    scope: &Scope,
+    child_pid: u32,
+    original_pidfd: std::io::Result<BorrowedFd<'fd>>,
+) -> Result<BorrowedFd<'fd>> {
+    if !matches!(scope, Scope::Pid(pid) if *pid == child_pid) {
+        bail!("owned root seed requires the exact retained child PID scope");
+    }
+    original_pidfd.context("borrowing original owned-child pidfd for root seed")
+}
+
+fn owner_limit_for_start(actual: ExactMapMetadata) -> Result<u64> {
+    // These are the two existing START object shapes. Accepting the small
+    // shape here does not relax the normal frozen object inventory elsewhere.
+    if !matches!(actual.max_entries, 16_384 | 1) {
+        bail!("unsupported START capacity {}", actual.max_entries);
+    }
+    compare_map_metadata(
+        "START",
+        actual,
+        map_metadata(
+            MapType::Hash,
+            std::mem::size_of::<p11scope_ebpf_common::StartKey>() as u32,
+            std::mem::size_of::<p11scope_ebpf_common::CallStart>() as u32,
+            actual.max_entries,
+            0,
+        ),
+    )?;
+    let overhead = THREAD_OWNER_LIMIT
+        .checked_sub(u64::from(p11scope_ebpf_common::START_ENTRIES))
+        .context("invalid common thread-owner reservation overhead")?;
+    u64::from(actual.max_entries)
+        .checked_add(overhead)
+        .context("thread-owner reservation limit overflow")
+}
+
+fn prepare_identity(ebpf: &mut Ebpf, scope: &Scope, child: Option<&OwnedChild>) -> Result<()> {
+    validate_identity_inventory(
+        ebpf.maps()
+            .map(|(name, map)| (name, matches!(map, Map::Unsupported(_)))),
+    )?;
+    for (name, _) in IDENTITY_MAPS {
+        identity_map_data(
+            name,
+            ebpf.map(name)
+                .with_context(|| format!("missing {name} map"))?,
+        )?;
+    }
+    let cookie = ImageIdentityControl {
+        limit: IMAGE_IDENTITY_TICKET_LIMIT,
+        ..Default::default()
+    };
+    let owner = ThreadOwnerControl {
+        limit: {
+            let map = ebpf.map("START").context("START map")?;
+            let Map::HashMap(data) = map else {
+                bail!("unexpected START map variant");
+            };
+            owner_limit_for_start(read_map_metadata("START", data)?)?
+        },
+        ..Default::default()
+    };
+    let root_pidfd = child
+        .map(|child| root_seed_authority(scope, child.pid(), child.pin().pidfd()))
+        .transpose()?;
+    let root = initial_root_control(root_pidfd.is_some());
+    prepare_identity_with(root_pidfd.is_some(), |step| {
+        match step {
+            IdentityPreparation::WriteCookie => {
+                let mut control: Array<_, ImageIdentityControl> =
+                    Array::try_from(ebpf.map_mut("COOKIE_CTL").context("COOKIE_CTL map")?)?;
+                control.set(0, cookie, 0)?;
+            }
+            IdentityPreparation::ReadCookie => {
+                let control: Array<_, ImageIdentityControl> =
+                    Array::try_from(ebpf.map("COOKIE_CTL").context("COOKIE_CTL map")?)?;
+                if cookie_control_fields(control.get(&0, 0)?) != cookie_control_fields(cookie) {
+                    bail!("COOKIE_CTL exact readback differs from initial control");
+                }
+            }
+            IdentityPreparation::WriteOwner => {
+                let mut control: Array<_, ThreadOwnerControl> =
+                    Array::try_from(ebpf.map_mut("OWNER_CTL").context("OWNER_CTL map")?)?;
+                control.set(0, owner, 0)?;
+            }
+            IdentityPreparation::ReadOwner => {
+                let control: Array<_, ThreadOwnerControl> =
+                    Array::try_from(ebpf.map("OWNER_CTL").context("OWNER_CTL map")?)?;
+                if owner_control_fields(control.get(&0, 0)?) != owner_control_fields(owner) {
+                    bail!("OWNER_CTL exact readback differs from initial control");
+                }
+            }
+            IdentityPreparation::WriteRoot => {
+                let mut control: Array<_, RootAffiliationControl> =
+                    Array::try_from(ebpf.map_mut("ROOT_CTL").context("ROOT_CTL map")?)?;
+                control.set(0, root, 0)?;
+            }
+            IdentityPreparation::ReadRoot => {
+                let control: Array<_, RootAffiliationControl> =
+                    Array::try_from(ebpf.map("ROOT_CTL").context("ROOT_CTL map")?)?;
+                validate_root_control_readback(root, control.get(&0, 0)?)?;
+            }
+            IdentityPreparation::SeedRoot => {
+                let pidfd = root_pidfd.context("owned root seed lost its original pidfd")?;
+                let map = ebpf
+                    .map("ROOT_AFFILIATION")
+                    .context("ROOT_AFFILIATION map")?;
+                let map_fd = identity_map_data("ROOT_AFFILIATION", map)?.fd().as_fd();
+                root_affiliation_element(map_fd, pidfd, RootElementOperation::Seed)?;
+            }
+            IdentityPreparation::ReadSeed => {
+                let pidfd = root_pidfd.context("owned root readback lost its original pidfd")?;
+                let map = ebpf
+                    .map("ROOT_AFFILIATION")
+                    .context("ROOT_AFFILIATION map")?;
+                let map_fd = identity_map_data("ROOT_AFFILIATION", map)?.fd().as_fd();
+                root_affiliation_element(map_fd, pidfd, RootElementOperation::Read)?;
+            }
+            IdentityPreparation::Freeze(name) => {
+                freeze_map(name, ebpf.map(name).with_context(|| format!("{name} map"))?)?
+            }
+        }
+        Ok(())
+    })
+}
+
+#[derive(Debug)]
+pub(crate) struct IdentityIntegrationPending;
+
+impl std::fmt::Display for IdentityIntegrationPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("development build: capture activation refused until consumer/domain/root/fence integration is complete")
+    }
+}
+impl std::error::Error for IdentityIntegrationPending {}
+
+pub(crate) fn require_identity_integration() -> Result<()> {
+    Err(IdentityIntegrationPending.into())
 }
 
 fn validate_policy_map(ebpf: &Ebpf, name: &str, expected: ExactMapMetadata) -> Result<()> {
@@ -205,135 +501,16 @@ fn validate_policy_maps(ebpf: &Ebpf, object_has_unsafe: bool) -> Result<()> {
     Ok(())
 }
 
-fn parse_task_newtask_field(
-    line: &str,
-    name: &str,
-    expected_size: &str,
-    expected_signed: &str,
-) -> Result<Option<u16>> {
-    let matching_fields = line
-        .split(';')
-        .filter_map(|part| part.trim().split_once(':'))
-        .filter(|(key, value)| {
-            key.trim() == "field" && value.split_whitespace().last() == Some(name)
-        })
-        .count();
-    if matching_fields == 0 {
-        return Ok(None);
-    }
-    if matching_fields != 1 {
-        bail!("duplicate {name} field attribute in task_newtask format");
-    }
-
-    let mut offset = None;
-    let mut size = None;
-    let mut signed = None;
-    for part in line.split(';') {
-        let Some((key, value)) = part.trim().split_once(':') else {
-            continue;
-        };
-        let value = value.trim();
-        match key.trim() {
-            "offset" => {
-                if offset.replace(value).is_some() {
-                    bail!("duplicate offset attribute for {name}");
-                }
-            }
-            "size" => {
-                if size.replace(value).is_some() {
-                    bail!("duplicate size attribute for {name}");
-                }
-            }
-            "signed" => {
-                if signed.replace(value).is_some() {
-                    bail!("duplicate signed attribute for {name}");
-                }
-            }
-            _ => {}
-        }
-    }
-    let offset = offset
-        .context("missing offset")?
-        .parse::<usize>()
-        .with_context(|| format!("invalid offset for {name}"))?;
-    if size.context("missing size")? != expected_size {
-        bail!("{name} must have size {expected_size}");
-    }
-    if signed.context("missing signedness")? != expected_signed {
-        bail!("{name} has unexpected signedness");
-    }
-    let _end = offset
-        .checked_add(expected_size.parse::<usize>().expect("fixed field size"))
-        .context("field offset overflows tracepoint record")?;
-    Ok(Some(u16::try_from(offset).with_context(|| {
-        format!("offset outside packed form for {name}")
-    })?))
-}
-
-fn parse_task_newtask_format(format: &str) -> Result<(u16, u16)> {
-    let mut pid = None;
-    let mut clone_flags = None;
-    for line in format.lines() {
-        for (name, size, signed, found) in [
-            ("pid", "4", "1", &mut pid),
-            ("clone_flags", "8", "0", &mut clone_flags),
-        ] {
-            if let Some(offset) = parse_task_newtask_field(line, name, size, signed)? {
-                if found.replace(offset).is_some() {
-                    bail!("duplicate {name} field in task_newtask format");
-                }
-            }
-        }
-    }
-    Ok((
-        pid.context("missing pid field in task_newtask format")?,
-        clone_flags.context("missing clone_flags field in task_newtask format")?,
-    ))
-}
-
-fn read_task_newtask_format_with(
-    mut read: impl FnMut(&Path) -> std::io::Result<String>,
-) -> Result<String> {
-    let mut failures = Vec::new();
-    let mut unavailable = true;
-    for path in TASK_NEWTASK_FORMATS.map(Path::new) {
-        match read(path) {
-            Ok(format) => return Ok(format),
-            Err(error) => {
-                unavailable &= matches!(
-                    error.kind(),
-                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
-                );
-                failures.push(format!("{}: {error}", path.display()));
-            }
-        }
-    }
-    let message = format!(
-        "reading task/task_newtask format failed: {}",
-        failures.join("; ")
-    );
-    if unavailable {
-        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, message).into());
-    }
-    bail!("{message}")
-}
-
-fn publish_task_newtask_offsets(ebpf: &mut Ebpf) -> Result<()> {
-    let format = read_task_newtask_format_with(|path| std::fs::read_to_string(path))?;
-    let (pid, clone_flags) = parse_task_newtask_format(&format)?;
-    let expected = pack_task_newtask_offsets(pid, clone_flags);
-    let mut config: Array<_, u64> = Array::try_from(ebpf.map_mut("CONFIG").context("CONFIG map")?)?;
-    config.set(CFG_TASK_NEWTASK_OFFSETS, expected, 0)?;
-    let config: Array<_, u64> = Array::try_from(ebpf.map("CONFIG").context("CONFIG map")?)?;
-    if config.get(&CFG_TASK_NEWTASK_OFFSETS, 0)? != expected {
-        bail!("CONFIG task_newtask offsets exact readback differs from parsed tracefs format");
-    }
-    Ok(())
-}
-
 fn freeze_map(name: &str, map: &Map) -> Result<()> {
-    let data = policy_map_data(name, map)
-        .with_context(|| format!("refusing to freeze unexpected {name} map variant"))?;
+    let data = if IDENTITY_MAPS
+        .iter()
+        .any(|(candidate, _)| *candidate == name)
+    {
+        identity_map_data(name, map)
+    } else {
+        policy_map_data(name, map)
+    }
+    .with_context(|| format!("refusing to freeze unexpected {name} map variant"))?;
     let attr = BpfMapFreezeAttr {
         map_fd: data.fd().as_fd().as_raw_fd() as u32,
     };
@@ -361,6 +538,73 @@ struct BpfMapElementAttr {
     key: u64,
     value: u64,
     flags: u64,
+}
+
+const BPF_MAP_LOOKUP_ELEM: u32 = 1;
+const BPF_MAP_UPDATE_ELEM: u32 = 2;
+const BPF_NOEXIST: u64 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RootElementOperation {
+    Seed,
+    Read,
+}
+
+fn root_affiliation_element_with(
+    map_fd: BorrowedFd<'_>,
+    pidfd: BorrowedFd<'_>,
+    operation: RootElementOperation,
+    mut syscall: impl FnMut(u32, &BpfMapElementAttr, usize) -> std::io::Result<()>,
+) -> Result<()> {
+    let key = pidfd.as_raw_fd();
+    match operation {
+        RootElementOperation::Seed => {
+            let value = ROOT_AFFILIATION_POSITIVE;
+            let attr = BpfMapElementAttr {
+                map_fd: map_fd.as_raw_fd() as u32,
+                key: (&key as *const i32) as u64,
+                value: (&value as *const u64) as u64,
+                flags: BPF_NOEXIST,
+                ..BpfMapElementAttr::default()
+            };
+            syscall(BPF_MAP_UPDATE_ELEM, &attr, size_of_val(&attr))
+                .context("seeding ROOT_AFFILIATION through original pidfd with BPF_NOEXIST")?;
+        }
+        RootElementOperation::Read => {
+            let mut readback = 0u64;
+            let attr = BpfMapElementAttr {
+                map_fd: map_fd.as_raw_fd() as u32,
+                key: (&key as *const i32) as u64,
+                value: (&mut readback as *mut u64) as u64,
+                ..BpfMapElementAttr::default()
+            };
+            syscall(BPF_MAP_LOOKUP_ELEM, &attr, size_of_val(&attr))
+                .context("reading back ROOT_AFFILIATION through original pidfd")?;
+            if readback != ROOT_AFFILIATION_POSITIVE {
+                bail!(
+                    "ROOT_AFFILIATION readback {readback} differs from expected positive value {ROOT_AFFILIATION_POSITIVE}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn root_affiliation_element(
+    map_fd: BorrowedFd<'_>,
+    pidfd: BorrowedFd<'_>,
+    operation: RootElementOperation,
+) -> Result<()> {
+    root_affiliation_element_with(map_fd, pidfd, operation, |command, attr, size| {
+        // SAFETY: the typed key/value and complete zero-reserved attr remain live
+        // for this exact map-element syscall invocation.
+        let rc = unsafe { libc::syscall(libc::SYS_bpf, command, attr, size) };
+        if rc == -1 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    })
 }
 
 fn program_array_lookup_result(
@@ -468,7 +712,8 @@ impl CapturePolicy {
 }
 
 fn process_creation_capture_enabled(scope: &Scope, policy: CapturePolicy) -> bool {
-    matches!(scope, Scope::Cgroup { .. }) && policy.uses_events()
+    let _ = (scope, policy);
+    true
 }
 
 pub(crate) struct OwnedPauseGeneration {
@@ -505,12 +750,90 @@ fn pause_key_for(
     }
 }
 
+/// Issued only after the original-pidfd seed, readback and all map freezes.
+/// Sharing this exact object proves which original owner was seeded; descriptor
+/// and PID numbers are not used to manufacture or compare acknowledgements.
+pub(crate) struct RootSeed {
+    pin: std::sync::Arc<crate::process::PidPin>,
+    domain: events::EventsDomain,
+}
+impl RootSeed {
+    pub(crate) fn acknowledges(&self, child: &OwnedChild) -> bool {
+        std::sync::Arc::ptr_eq(&self.pin, &child.seed_pin())
+    }
+    pub(crate) fn domain(&self) -> &events::EventsDomain {
+        &self.domain
+    }
+    #[cfg(test)]
+    pub(crate) fn test_acknowledgement(child: &OwnedChild, domain: events::EventsDomain) -> Self {
+        Self {
+            pin: child.seed_pin(),
+            domain,
+        }
+    }
+}
+
+/// An opaque capture session. Public callers can inspect session evidence:
+///
+/// ```
+/// use p11scope::attach::Session;
+/// fn evidence(session: &Session) -> (usize, usize) {
+///     (session.attached_probes(), session.attach_failures().len())
+/// }
+/// ```
+///
+/// Session state cannot be manufactured by external callers:
+///
+/// ```compile_fail
+/// use p11scope::attach::Session;
+/// #[allow(unreachable_code)]
+/// fn construct() -> Session {
+///     Session {
+///         ebpf: panic!("compile-only placeholder"),
+///         events_domain: panic!("compile-only placeholder"),
+///         root_seed: panic!("compile-only placeholder"),
+///         attach_failures: panic!("compile-only placeholder"),
+///         detach_failures: panic!("compile-only placeholder"),
+///         producers_detached: panic!("compile-only placeholder"),
+///         successful_static: panic!("compile-only placeholder"),
+///         dynamic_attach_evidence: panic!("compile-only placeholder"),
+///         policy: panic!("compile-only placeholder"),
+///         uprobe_scope: panic!("compile-only placeholder"),
+///         pause_key: panic!("compile-only placeholder"),
+///         lifecycle_tracking_unavailable: panic!("compile-only placeholder"),
+///         process_creation_tracking_unavailable: panic!("compile-only placeholder"),
+///         links: panic!("compile-only placeholder"),
+///     }
+/// }
+/// ```
+///
+/// Mutable access to the BPF object is reserved to the capture implementation:
+///
+/// ```compile_fail
+/// use p11scope::attach::Session;
+/// fn mutate(session: &mut Session) -> &mut aya::Ebpf {
+///     &mut session.ebpf
+/// }
+/// ```
+///
+/// Owned-root and pause capabilities are private to the capture implementation:
+///
+/// ```compile_fail
+/// use p11scope::attach::RootSeed;
+/// ```
+///
+/// ```compile_fail
+/// use p11scope::attach::OwnedPauseGeneration;
+/// ```
 pub struct Session {
     pub(crate) ebpf: Ebpf,
+    events_domain: events::EventsDomain,
+    root_seed: Option<RootSeed>,
     attach_failures: Vec<(u32, String)>,
     detach_failures: Vec<String>,
-    /// Set once `detach_producers` detached every producer: only then is the
-    /// `EVENTS` ring finite and a poll of it allowed to read it whole.
+    /// Every producer detach succeeded without retained ownership uncertainty.
+    /// This permits the existing best-effort terminal poll, not callback
+    /// settlement or exact root retirement.
     producers_detached: bool,
     successful_static: BTreeSet<StaticEndpoint>,
     dynamic_attach_evidence: DynamicAttachEvidence,
@@ -523,105 +846,65 @@ pub struct Session {
     links: Vec<RegisteredLink>,
 }
 
+/// A detach error leaves this Session's ownership bookkeeping inconsistent.
+/// It does not prove a kernel producer survived or that the kernel is quiet;
+/// recovery is a new Session. Refusing unrelated additions is the accepted
+/// availability cost, while capture and cleanup of existing ownership continue.
+pub(crate) fn attachment_admission(
+    detach_failures: &[String],
+    proposed_additions: bool,
+) -> Result<()> {
+    if proposed_additions && !detach_failures.is_empty() {
+        bail!(
+            "new producer attachment is refused after a detach bookkeeping failure; start a new session"
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AttachPreflight {
     pub(crate) lifecycle: bool,
     pub(crate) scope: bool,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum LifecycleAttachOutcome<T> {
-    Attached(Vec<(&'static str, T)>),
-    Degraded(String),
-}
-
-fn expected_tracefs_id_path(program: &str, path: &Path) -> bool {
-    let category = if program == "task_newtask" {
-        "task"
-    } else {
-        "sched"
-    };
-    ["/sys/kernel/tracing", "/sys/kernel/debug/tracing"]
-        .into_iter()
-        .any(|root| {
-            path == Path::new(root)
-                .join("events")
-                .join(category)
-                .join(program)
-                .join("id")
-        })
-}
-
-fn tracefs_lifecycle_failure(error: &anyhow::Error, program: &str) -> Option<String> {
-    match error.downcast_ref::<ProgramError>()? {
-        ProgramError::IOError(error)
-            if error.kind() == std::io::ErrorKind::Other
-                && error.to_string() == "tracefs not found" =>
-        {
-            Some("tracefs not found".into())
-        }
-        ProgramError::TracePointError(TracePointError::FileError { filename, io_error })
-            if expected_tracefs_id_path(program, filename)
-                && matches!(
-                    io_error.kind(),
-                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
-                ) =>
-        {
-            Some(format!(
-                "tracefs id file {}: {io_error}",
-                filename.display()
-            ))
-        }
-        _ => None,
-    }
-}
-
-/// Attaches the two all-session lifecycle programs as one tier. A future raw
-/// tracepoint implementation can replace this mechanism without changing its
-/// callers or its all-or-nothing lifecycle contract.
 fn attach_lifecycle_with<S, T>(
     state: &mut S,
-    owned_run: bool,
     mut attach: impl FnMut(&mut S, &'static str) -> Result<T>,
     mut detach: impl FnMut(&mut S, &'static str, T) -> Result<()>,
-) -> Result<LifecycleAttachOutcome<T>> {
+) -> Result<Vec<T>> {
     let mut links = Vec::new();
-    for program in ["sched_process_exec", "sched_process_exit"] {
+    for program in ["sched_process_exec", "sched_process_exit", "task_newtask"] {
         match attach(state, program) {
             Ok(link) => links.push((program, link)),
             Err(error) => {
-                let tracefs = tracefs_lifecycle_failure(&error, program);
-                let attach_failure = format!("{error:#}");
+                let mut rollback_errors = Vec::new();
                 for (attached_program, link) in links.into_iter().rev() {
-                    if let Err(rollback) =
-                        detach(state, attached_program, link).with_context(|| {
-                            format!("rolling back {attached_program} after {program} failed")
-                        })
-                    {
-                        bail!("attaching {program}: {attach_failure}; {rollback:#}");
+                    if let Err(rollback) = detach(state, attached_program, link) {
+                        rollback_errors
+                            .push(format!("rolling back {attached_program}: {rollback:#}"));
                     }
                 }
-                let error = error.context(format!("attaching {program}"));
-                if let Some(cause) = tracefs {
-                    let fact = format!("live lifecycle tracking unavailable: {cause}");
-                    if owned_run {
-                        return Err(error.context(format!(
-                            "owned run requires tracefs lifecycle tracking; run as root or remount tracefs with gid=<observer-group> and mode=0750: {fact}"
-                        )));
-                    }
-                    return Ok(LifecycleAttachOutcome::Degraded(fact));
-                }
-                return Err(error);
+                let error = error.context(format!("attaching required {program}"));
+                return if rollback_errors.is_empty() {
+                    Err(error)
+                } else {
+                    Err(error.context(format!(
+                        "lifecycle rollback failures: {}",
+                        rollback_errors.join("; ")
+                    )))
+                };
             }
         }
     }
-    Ok(LifecycleAttachOutcome::Attached(links))
+    Ok(links.into_iter().map(|(_, link)| link).collect())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProducerProgram {
     UProbe(&'static str),
-    TracePoint(&'static str),
+    RawTracePoint(&'static str),
+    BtfTracePoint(&'static str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -640,9 +923,17 @@ enum RegisteredLink {
         slot: u32,
         id: UProbeLinkId,
     },
-    TracePoint {
+    RawTracePoint {
         program: &'static str,
-        id: TracePointLinkId,
+        id: RawTracePointLinkId,
+    },
+    BtfTracePoint {
+        program: &'static str,
+        id: BtfTracePointLinkId,
+    },
+    DiagnosticUProbe {
+        program: &'static str,
+        id: UProbeLinkId,
     },
     DynamicUProbe {
         program: &'static str,
@@ -686,24 +977,31 @@ fn dynamic_export_snapshot_with<T>(
 impl RegisteredLink {
     fn producer(&self) -> ProducerProgram {
         match self {
-            Self::UProbe { program, .. } | Self::DynamicUProbe { program, .. } => {
-                ProducerProgram::UProbe(program)
-            }
-            Self::TracePoint { program, .. } => ProducerProgram::TracePoint(program),
+            Self::UProbe { program, .. }
+            | Self::DynamicUProbe { program, .. }
+            | Self::DiagnosticUProbe { program, .. } => ProducerProgram::UProbe(program),
+            Self::RawTracePoint { program, .. } => ProducerProgram::RawTracePoint(program),
+            Self::BtfTracePoint { program, .. } => ProducerProgram::BtfTracePoint(program),
         }
     }
 
     fn slot(&self) -> Option<u32> {
         match self {
             Self::UProbe { slot, .. } => Some(*slot),
-            Self::TracePoint { .. } | Self::DynamicUProbe { .. } => None,
+            Self::RawTracePoint { .. }
+            | Self::BtfTracePoint { .. }
+            | Self::DiagnosticUProbe { .. }
+            | Self::DynamicUProbe { .. } => None,
         }
     }
 
     fn context(&self) -> Option<LoaderContextId> {
         match self {
             Self::DynamicUProbe { context, .. } => Some(*context),
-            Self::UProbe { .. } | Self::TracePoint { .. } => None,
+            Self::UProbe { .. }
+            | Self::RawTracePoint { .. }
+            | Self::BtfTracePoint { .. }
+            | Self::DiagnosticUProbe { .. } => None,
         }
     }
 }
@@ -715,6 +1013,7 @@ pub(crate) struct CounterSnapshot {
     pub(crate) export_bounded_read_failures: u64,
     pub(crate) loader_hits: u64,
     pub(crate) loader_state_read_failures: u64,
+    pub(crate) abi_refusals: u64,
 }
 
 impl CounterSnapshot {
@@ -723,7 +1022,8 @@ impl CounterSnapshot {
             && next.export_state_failures >= self.export_state_failures
             && next.export_bounded_read_failures >= self.export_bounded_read_failures
             && next.loader_hits >= self.loader_hits
-            && next.loader_state_read_failures >= self.loader_state_read_failures;
+            && next.loader_state_read_failures >= self.loader_state_read_failures
+            && next.abi_refusals >= self.abi_refusals;
         if nondecreasing {
             *self = next;
         }
@@ -731,45 +1031,18 @@ impl CounterSnapshot {
     }
 }
 
-fn counter_snapshot_with(mut read: impl FnMut(u32) -> Result<u64>) -> Result<CounterSnapshot> {
+fn counter_snapshot_with(
+    mut read: impl FnMut(u32) -> Result<u64>,
+    abi_refusals: u64,
+) -> Result<CounterSnapshot> {
     Ok(CounterSnapshot {
         ring_loss: read(DISCOVERY_COUNTER_RING_LOSS)?,
         export_state_failures: read(DISCOVERY_COUNTER_EXPORT_STATE_FAILURES)?,
         export_bounded_read_failures: read(DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES)?,
         loader_hits: read(DISCOVERY_COUNTER_LOADER_HITS)?,
         loader_state_read_failures: read(DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES)?,
+        abi_refusals,
     })
-}
-
-#[cfg(test)]
-fn detach_producers_with(
-    policy: CapturePolicy,
-    fork_attached: bool,
-    mut detach: impl FnMut(ProducerProgram) -> Result<()>,
-) -> Result<()> {
-    let mut first_error = None;
-    let mut detach_one = |producer| {
-        if let Err(error) = detach(producer) {
-            if first_error.is_none() {
-                first_error = Some(error);
-            }
-        }
-    };
-    detach_one(ProducerProgram::UProbe("p11_entry"));
-    if policy.uses_unsafe_decoders() {
-        for name in [
-            "p11_entry_template",
-            "p11_entry_template_types",
-            "p11_entry_template_pair",
-        ] {
-            detach_one(ProducerProgram::UProbe(name));
-        }
-    }
-    if fork_attached {
-        detach_one(ProducerProgram::TracePoint("task_newtask"));
-    }
-    detach_one(ProducerProgram::UProbe("p11_return"));
-    first_error.map_or(Ok(()), Err)
 }
 
 /// Detaches each concrete registered link in producer order. A program can
@@ -781,12 +1054,14 @@ fn detach_selected_with<T>(
 ) -> Vec<anyhow::Error> {
     selected.sort_by_key(|(producer, _)| match producer {
         ProducerProgram::UProbe("p11_entry") => 0,
-        ProducerProgram::UProbe("p11_entry_template") => 1,
-        ProducerProgram::UProbe("p11_entry_template_types") => 2,
-        ProducerProgram::UProbe("p11_entry_template_pair") => 3,
-        ProducerProgram::TracePoint("task_newtask") => 4,
-        ProducerProgram::UProbe("p11_return") => 5,
-        _ => 6,
+        ProducerProgram::UProbe("p11_entry_ia32") => 1,
+        ProducerProgram::UProbe("p11_entry_template") => 2,
+        ProducerProgram::UProbe("p11_entry_template_types") => 3,
+        ProducerProgram::UProbe("p11_entry_template_pair") => 4,
+        ProducerProgram::BtfTracePoint("task_newtask") => 5,
+        ProducerProgram::UProbe("p11_return") => 6,
+        ProducerProgram::RawTracePoint(_) => 8,
+        _ => 7,
     });
     selected
         .into_iter()
@@ -855,23 +1130,29 @@ fn error_chain(e: &dyn std::error::Error) -> String {
     msg
 }
 
-fn entry_program(semantics: &SlotSemantics, policy: CapturePolicy) -> &'static str {
-    if !policy.uses_unsafe_decoders() {
-        return "p11_entry";
-    }
-    if semantics.template1_arg != ARG_NONE {
+fn entry_program(
+    semantics: &SlotSemantics,
+    policy: CapturePolicy,
+    object_has_unsafe: bool,
+    target_abi: ElfAbi,
+) -> &'static str {
+    if policy.uses_unsafe_decoders() && semantics.template1_arg != ARG_NONE {
         "p11_entry_template_pair"
-    } else if semantics.semantic_flags & p11scope_ebpf_common::semantic_flags::TEMPLATE0_TYPES_ONLY
-        != 0
+    } else if policy.uses_unsafe_decoders()
+        && semantics.semantic_flags & p11scope_ebpf_common::semantic_flags::TEMPLATE0_TYPES_ONLY
+            != 0
     {
         "p11_entry_template_types"
-    } else if semantics.template0_arg != ARG_NONE {
+    } else if policy.uses_unsafe_decoders() && semantics.template0_arg != ARG_NONE {
         "p11_entry_template"
+    } else if object_has_unsafe && target_abi == ElfAbi::Ilp32 {
+        "p11_entry_ia32"
     } else {
         "p11_entry"
     }
 }
 
+#[derive(Debug)]
 struct AttachOutcome {
     successful: BTreeSet<StaticEndpoint>,
     failures: Vec<(u32, String)>,
@@ -894,6 +1175,7 @@ fn static_endpoint(program: &str, slot: u32) -> Option<StaticEndpoint> {
     match program {
         "p11_return" => Some((slot, ProbeSide::Return)),
         "p11_entry"
+        | "p11_entry_ia32"
         | "p11_entry_template"
         | "p11_entry_template_types"
         | "p11_entry_template_pair" => Some((slot, ProbeSide::Entry)),
@@ -918,18 +1200,33 @@ pub(crate) fn monotonic_ns() -> Option<u64> {
 /// per-slot dependency explicit: no entry link exists unless its return link
 /// was created first. The closures are the existing Aya lifecycle seam and
 /// make the failure policy testable without a privileged attachment.
+fn slot_attach_point(slot: &Slot) -> UProbeAttachPoint<'static> {
+    UProbeAttachPoint {
+        location: UProbeAttachLocation::AbsoluteOffset(slot.file_offset),
+        cookie: Some(attach_cookie(slot.index, slot.descriptor_index)),
+    }
+}
+
 fn attach_targets_with(
     slots: &[Slot],
     policy: CapturePolicy,
-    mut attach: impl FnMut(&'static str, &Slot) -> Result<()>,
+    object_has_unsafe: bool,
+    mut abi_for: impl FnMut(&Slot) -> Result<ElfAbi>,
+    mut attach: impl FnMut(&'static str, &Slot, UProbeAttachPoint<'static>) -> Result<()>,
     mut completed_at: impl FnMut(&Slot) -> Option<u64>,
-) -> AttachOutcome {
+) -> Result<AttachOutcome> {
+    // Resolve every retained target ABI before the first return attachment.
+    // This keeps each return/entry pair bound to the same pinned object fact.
+    let targets = slots
+        .iter()
+        .map(|slot| abi_for(slot).map(|abi| (slot, abi)))
+        .collect::<Result<Vec<_>>>()?;
     let mut successful = BTreeSet::new();
     let mut failures = Vec::new();
     let mut completed = Vec::new();
     let mut return_attached = BTreeSet::new();
-    for slot in slots {
-        match attach("p11_return", slot) {
+    for (slot, _) in &targets {
+        match attach("p11_return", slot, slot_attach_point(slot)) {
             Ok(()) => {
                 successful.insert(
                     static_endpoint("p11_return", slot.index)
@@ -941,9 +1238,10 @@ fn attach_targets_with(
         }
     }
 
-    let entry_programs: &[&str] = if policy.uses_unsafe_decoders() {
+    let entry_programs: &[&str] = if object_has_unsafe {
         &[
             "p11_entry",
+            "p11_entry_ia32",
             "p11_entry_template",
             "p11_entry_template_types",
             "p11_entry_template_pair",
@@ -952,13 +1250,13 @@ fn attach_targets_with(
         &["p11_entry"]
     };
     for program in entry_programs {
-        for slot in slots {
+        for (slot, abi) in &targets {
             if !return_attached.contains(&slot.index)
-                || entry_program(&slot.semantics, policy) != *program
+                || entry_program(&slot.semantics, policy, object_has_unsafe, *abi) != *program
             {
                 continue;
             }
-            match attach(program, slot) {
+            match attach(program, slot, slot_attach_point(slot)) {
                 Ok(()) => {
                     successful.insert(
                         static_endpoint(program, slot.index)
@@ -970,11 +1268,11 @@ fn attach_targets_with(
             }
         }
     }
-    AttachOutcome {
+    Ok(AttachOutcome {
         successful,
         failures,
         completed,
-    }
+    })
 }
 
 fn standard_async_catalog() -> Result<BTreeMap<FunctionNameKey, u32>> {
@@ -1001,16 +1299,16 @@ fn standard_async_catalog() -> Result<BTreeMap<FunctionNameKey, u32>> {
     Ok(catalog)
 }
 
-fn publish_descriptors(ebpf: &mut Ebpf) -> Result<()> {
+fn publish_descriptors<S>(
+    state: &mut S,
+    mut set: impl FnMut(&mut S, u32, SlotSemantics) -> Result<()>,
+    readback: impl FnOnce(&mut S) -> Result<Vec<SlotSemantics>>,
+) -> Result<()> {
     let expected = crate::kinds::DESCRIPTORS.to_vec();
-    let mut semantics: Array<_, SlotSemantics> =
-        Array::try_from(ebpf.map_mut("DESCRIPTORS").context("DESCRIPTORS map")?)?;
     for (index, value) in expected.iter().copied().enumerate() {
-        semantics.set(index as u32, value, 0)?;
+        set(state, index as u32, value)?;
     }
-    let semantics: Array<_, SlotSemantics> =
-        Array::try_from(ebpf.map("DESCRIPTORS").context("DESCRIPTORS map")?)?;
-    let actual = semantics.iter().collect::<Result<Vec<_>, _>>()?;
+    let actual = readback(state)?;
     if actual != expected {
         bail!("DESCRIPTORS exact readback differs from the fixed inventory");
     }
@@ -1163,6 +1461,88 @@ fn validate_program_inventory(ebpf: &Ebpf, unsafe_enabled: bool) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionPreparation {
+    ValidatePolicy,
+    ValidateRuntime,
+    ValidatePrograms,
+    PublishScope,
+    PrepareIdentity,
+    PublishDescriptors,
+    PublishAsync,
+    PublishShapes,
+    PublishAttributes,
+    FreezePublished,
+    SelectScope,
+    LoadProgram(&'static str),
+    FreezeDeferred(&'static str),
+    PublishTailCalls,
+    PrepareEventsDomain,
+}
+
+// BTF and object creation are prerequisites. This is the single loaded-object
+// preparation order used by startup; an injected operation cannot bypass refusal.
+fn prepare_session_with(
+    object_has_unsafe: bool,
+    mut operation: impl FnMut(SessionPreparation) -> Result<()>,
+) -> Result<()> {
+    use SessionPreparation::*;
+    for step in [
+        ValidatePolicy,
+        ValidateRuntime,
+        ValidatePrograms,
+        PublishScope,
+        PrepareIdentity,
+        PublishDescriptors,
+        PublishAsync,
+        PublishShapes,
+        PublishAttributes,
+        FreezePublished,
+        SelectScope,
+    ] {
+        operation(step)?;
+    }
+    for name in expected_programs(object_has_unsafe) {
+        operation(LoadProgram(name))?;
+    }
+    for (name, meta) in BASE_POLICY_MAPS {
+        if defers_freeze_until_loaded(name, &meta) && name != TAIL_POLICY_MAP {
+            operation(FreezeDeferred(name))?;
+        }
+    }
+    operation(PublishTailCalls)?;
+    operation(PrepareEventsDomain)?;
+    require_identity_integration()
+}
+
+fn publish_tail_calls_with<S>(
+    state: &mut S,
+    worker_id: u32,
+    second_id: Option<u32>,
+    mut write: impl FnMut(&mut S, u32) -> Result<()>,
+    mut read: impl FnMut(&mut S, u32) -> Result<Option<u32>>,
+    freeze: impl FnOnce(&mut S) -> Result<()>,
+) -> Result<()> {
+    write(state, TAIL_CALLS_INTERFACE_WORKER_SLOT)?;
+    if second_id.is_some() {
+        write(state, TAIL_CALLS_TEMPLATE_SECOND_SLOT)?;
+    }
+    let actual_worker = read(state, TAIL_CALLS_INTERFACE_WORKER_SLOT)?;
+    if actual_worker != Some(worker_id) {
+        bail!(
+            "TAIL_CALLS worker exact readback id {actual_worker:?} differs from loaded program {worker_id}"
+        );
+    }
+    let actual_second = read(state, TAIL_CALLS_TEMPLATE_SECOND_SLOT)?;
+    let expected_second = second_id;
+    if actual_second != expected_second {
+        bail!(
+            "TAIL_CALLS template-second exact readback id {actual_second:?} differs from expected {expected_second:?}"
+        );
+    }
+    freeze(state)
+}
+
 fn publish_and_freeze_tail_calls(ebpf: &mut Ebpf, enabled: bool) -> Result<()> {
     let (worker_fd, worker_id) = {
         let worker: &UProbe = ebpf
@@ -1180,29 +1560,30 @@ fn publish_and_freeze_tail_calls(ebpf: &mut Ebpf, enabled: bool) -> Result<()> {
     } else {
         None
     };
-    {
-        let mut tails: ProgramArray<_> =
-            ProgramArray::try_from(ebpf.map_mut(TAIL_POLICY_MAP).context("TAIL_CALLS map")?)?;
-        tails.set(TAIL_CALLS_INTERFACE_WORKER_SLOT, &worker_fd, 0)?;
-        if let Some((second_fd, _)) = second.as_ref() {
-            tails.set(TAIL_CALLS_TEMPLATE_SECOND_SLOT, second_fd, 0)?;
-        }
-    }
-    let map = ebpf.map(TAIL_POLICY_MAP).context("TAIL_CALLS map")?;
-    let actual_worker = program_array_id(TAIL_POLICY_MAP, map, TAIL_CALLS_INTERFACE_WORKER_SLOT)?;
-    if actual_worker != Some(worker_id) {
-        bail!(
-            "TAIL_CALLS worker exact readback id {actual_worker:?} differs from loaded program {worker_id}"
-        );
-    }
-    let actual_second = program_array_id(TAIL_POLICY_MAP, map, TAIL_CALLS_TEMPLATE_SECOND_SLOT)?;
-    let expected_second = second.as_ref().map(|(_, id)| *id);
-    if actual_second != expected_second {
-        bail!(
-            "TAIL_CALLS template-second exact readback id {actual_second:?} differs from expected {expected_second:?}"
-        );
-    }
-    freeze_map(TAIL_POLICY_MAP, map)
+    publish_tail_calls_with(
+        ebpf,
+        worker_id,
+        second.as_ref().map(|(_, id)| *id),
+        |ebpf, slot| {
+            let fd = if slot == TAIL_CALLS_INTERFACE_WORKER_SLOT {
+                &worker_fd
+            } else {
+                &second.as_ref().expect("selected template-second program").0
+            };
+            let mut tails: ProgramArray<_> =
+                ProgramArray::try_from(ebpf.map_mut(TAIL_POLICY_MAP).context("TAIL_CALLS map")?)?;
+            tails.set(slot, fd, 0)?;
+            Ok(())
+        },
+        |ebpf, slot| {
+            let map = ebpf.map(TAIL_POLICY_MAP).context("TAIL_CALLS map")?;
+            program_array_id(TAIL_POLICY_MAP, map, slot)
+        },
+        |ebpf| {
+            let map = ebpf.map(TAIL_POLICY_MAP).context("TAIL_CALLS map")?;
+            freeze_map(TAIL_POLICY_MAP, map)
+        },
+    )
 }
 
 /// A kernel/environment that cannot load or attach BPF programs at all
@@ -1220,7 +1601,11 @@ lockdown mode, a kernel below the supported floor (>= 5.15), missing BTF \
 docs/notes/phase5-unsupported.md for what each looks like when observed.";
 
 fn unsupported_environment_context(error: anyhow::Error) -> anyhow::Error {
-    error.context(UNSUPPORTED_ENV_HINT)
+    if error.downcast_ref::<IdentityIntegrationPending>().is_some() {
+        error
+    } else {
+        error.context(UNSUPPORTED_ENV_HINT)
+    }
 }
 
 impl Session {
@@ -1234,6 +1619,7 @@ impl Session {
         objects: &PinnedObjects,
         policy: CapturePolicy,
         pause_generation: Option<OwnedPauseGeneration>,
+        owned_child: Option<&OwnedChild>,
     ) -> Result<Self> {
         let pause_key = pause_key_for(scope, pause_generation.as_ref())?;
         if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
@@ -1241,8 +1627,8 @@ impl Session {
                 "a pinned provider object changed before attach; refusing to observe changed bytes"
             );
         }
-        let mut session =
-            Self::start_inner(scope, policy, pause_key).map_err(unsupported_environment_context)?;
+        let mut session = Self::start_inner(scope, policy, pause_key, owned_child)
+            .map_err(unsupported_environment_context)?;
         session
             .attach_plan(plan, objects)
             .map_err(unsupported_environment_context)?;
@@ -1259,7 +1645,7 @@ impl Session {
     /// requested scope, process-creation boundary, and exec/exit links. Dropping the local
     /// session detaches every link before this finite result is returned.
     pub(crate) fn preflight(scope: &Scope) -> Result<AttachPreflight> {
-        let session = Self::start_inner(scope, CapturePolicy::Allowlisted, None)?;
+        let session = Self::start_inner(scope, CapturePolicy::Allowlisted, None, None)?;
         Ok(AttachPreflight {
             lifecycle: session.lifecycle_tracking_unavailable.is_none(),
             scope: session.process_creation_tracking_unavailable.is_none(),
@@ -1270,154 +1656,168 @@ impl Session {
         scope: &Scope,
         policy: CapturePolicy,
         pause_key: Option<PauseKey>,
+        owned_child: Option<&OwnedChild>,
     ) -> Result<Self> {
         if policy.uses_unsafe_decoders() && !cfg!(feature = "unsafe-unvalidated-metadata") {
             bail!("unsafe-unvalidated-metadata policy is absent from this eBPF object");
         }
-        let mut ebpf = Ebpf::load(crate::EBPF_OBJECT).context("loading BPF object")?;
+        let btf =
+            Btf::from_sys_fs().context("loading required vmlinux BTF for typed task_newtask")?;
+        let mut ebpf = EbpfLoader::new()
+            .btf(Some(&btf))
+            .allow_unsupported_maps()
+            .load(crate::EBPF_OBJECT)
+            .context("loading BPF object with required task storage")?;
         let object_has_unsafe = cfg!(feature = "unsafe-unvalidated-metadata");
         let unsafe_enabled = object_has_unsafe && policy.uses_unsafe_decoders();
-        validate_policy_maps(&ebpf, object_has_unsafe)
-            .context("validating exact policy-map metadata")?;
-        validate_runtime_maps(&ebpf).context("validating live-discovery runtime maps")?;
-        validate_program_inventory(&ebpf, object_has_unsafe)
-            .context("validating exact eBPF program inventory")?;
         let generation_token = pause_key.map(|key| key.generation_token);
-        crate::scope::publish(&mut ebpf, scope, policy, generation_token)
-            .context("publishing scope and capture policy")?;
-        let process_creation_enabled = process_creation_capture_enabled(scope, policy);
-        let mut process_creation_tracking_unavailable = None;
-        if process_creation_enabled
-            && let Err(error) =
-                publish_task_newtask_offsets(&mut ebpf).context("publishing task_newtask offsets")
-        {
-            if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
-                matches!(
-                    error.kind(),
-                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
-                )
-            }) {
-                process_creation_tracking_unavailable = Some(format!(
-                    "live process-creation tracking unavailable: {}",
-                    error.root_cause()
-                ));
-            } else {
-                return Err(error);
-            }
-        }
-        publish_descriptors(&mut ebpf).context("publishing DESCRIPTORS")?;
-        publish_async_catalog(&mut ebpf).context("publishing ASYNC_FUNCTIONS")?;
-        {
-            // Embedded defaults: this binary ships statically and has no
-            // config-file plumbing yet, so `None` is the only reachable
-            // path today. A future task can thread a path through here
-            // without touching the publish-before-attach placement.
-            let registry = MechanismRegistry::load(None)
-                .map_err(|e| anyhow!("loading mechanism registry: {e}"))?;
-            crate::shapes::publish(&mut ebpf, &registry).context("publishing MECH_SHAPE")?;
-        }
-        publish_attribute_catalog(&mut ebpf, unsafe_enabled)
-            .context("publishing ATTR_BOOL_BITS")?;
-        freeze_published_maps(&ebpf).context("freezing published policy maps")?;
-
-        let uprobe_scope = match scope {
-            Scope::Pid(pid) => UProbeScope::OneProcess(
-                std::num::NonZeroU32::new(*pid).context("pid must be non-zero")?,
-            ),
-            // Cgroup scoping is enforced in BPF, so the probe itself is
-            // process-wide and the filter map decides.
-            Scope::Cgroup { .. } => UProbeScope::AllProcesses,
-        };
-
-        let programs = expected_programs(object_has_unsafe);
-        for prog_name in programs {
-            if matches!(
-                prog_name,
-                "task_newtask" | "sched_process_exec" | "sched_process_exit"
-            ) {
-                let prog: &mut TracePoint = ebpf
-                    .program_mut(prog_name)
-                    .with_context(|| format!("program {prog_name} missing from object"))?
-                    .try_into()?;
-                prog.load()
-                    .with_context(|| format!("loading {prog_name}"))?;
-            } else {
-                let prog: &mut UProbe = ebpf
-                    .program_mut(prog_name)
-                    .with_context(|| format!("program {prog_name} missing from object"))?
-                    .try_into()?;
-                prog.load()
-                    .with_context(|| format!("loading {prog_name}"))?;
-            }
-        }
-        // Linux can constant-fold frozen arrays, but returns its internal
-        // ENOTSUPP for direct reads before the program is loaded.
-        // Loading first avoids that kernel path; freezing still precedes every
-        // attachment, so no probe can observe mutable policy.
-        for (name, meta) in BASE_POLICY_MAPS {
-            if !defers_freeze_until_loaded(name, &meta) || name == TAIL_POLICY_MAP {
-                continue;
-            }
-            freeze_map(name, ebpf.map(name).with_context(|| format!("{name} map"))?)
-                .with_context(|| format!("freezing {name}"))?;
-        }
-        publish_and_freeze_tail_calls(&mut ebpf, unsafe_enabled)
-            .context("publishing and freezing TAIL_CALLS")?;
-
-        let mut links = Vec::new();
-        if process_creation_enabled && process_creation_tracking_unavailable.is_none() {
-            let process_creation: &mut TracePoint = ebpf
-                .program_mut("task_newtask")
-                .context("program task_newtask missing from object")?
-                .try_into()?;
-            match process_creation.attach("task", "task_newtask") {
-                Ok(id) => links.push(RegisteredLink::TracePoint {
-                    program: "task_newtask",
-                    id,
-                }),
-                Err(error) => {
-                    let error = anyhow::Error::from(error);
-                    if let Some(cause) = tracefs_lifecycle_failure(&error, "task_newtask") {
-                        process_creation_tracking_unavailable = Some(format!(
-                            "live process-creation tracking unavailable: {cause}"
-                        ));
+        let mut uprobe_scope = UProbeScope::AllProcesses;
+        let mut prepared_domain = None;
+        let mut root_seed = None;
+        prepare_session_with(object_has_unsafe, |step| {
+            match step {
+                SessionPreparation::ValidatePolicy => {
+                    validate_policy_maps(&ebpf, object_has_unsafe)
+                        .context("validating exact policy-map metadata")?;
+                }
+                SessionPreparation::ValidateRuntime => {
+                    validate_runtime_maps(&ebpf)
+                        .context("validating live-discovery runtime maps")?;
+                }
+                SessionPreparation::ValidatePrograms => {
+                    validate_program_inventory(&ebpf, object_has_unsafe)
+                        .context("validating exact eBPF program inventory")?;
+                }
+                SessionPreparation::PublishScope => {
+                    crate::scope::publish(&mut ebpf, scope, policy, generation_token)
+                        .context("publishing scope and capture policy")?;
+                    debug_assert!(process_creation_capture_enabled(scope, policy));
+                }
+                SessionPreparation::PrepareIdentity => {
+                    prepare_identity(&mut ebpf, scope, owned_child)
+                        .context("preparing required image identity and thread ownership")?;
+                }
+                SessionPreparation::PublishDescriptors => {
+                    let mut semantics: Array<_, SlotSemantics> =
+                        Array::try_from(ebpf.map_mut("DESCRIPTORS").context("DESCRIPTORS map")?)?;
+                    publish_descriptors(
+                        &mut semantics,
+                        |semantics, index, value| {
+                            semantics.set(index, value, 0).map_err(anyhow::Error::from)
+                        },
+                        |semantics| {
+                            semantics
+                                .iter()
+                                .collect::<Result<Vec<_>, _>>()
+                                .map_err(anyhow::Error::from)
+                        },
+                    )
+                    .context("publishing DESCRIPTORS")?;
+                }
+                SessionPreparation::PublishAsync => {
+                    publish_async_catalog(&mut ebpf).context("publishing ASYNC_FUNCTIONS")?;
+                }
+                SessionPreparation::PublishShapes => {
+                    // Embedded defaults: this binary ships statically and has no
+                    // config-file plumbing yet, so `None` is the only reachable
+                    // path today. A future task can thread a path through here
+                    // without touching the publish-before-attach placement.
+                    let registry = MechanismRegistry::load(None)
+                        .map_err(|e| anyhow!("loading mechanism registry: {e}"))?;
+                    crate::shapes::publish(&mut ebpf, &registry)
+                        .context("publishing MECH_SHAPE")?;
+                }
+                SessionPreparation::PublishAttributes => {
+                    publish_attribute_catalog(&mut ebpf, unsafe_enabled)
+                        .context("publishing ATTR_BOOL_BITS")?;
+                }
+                SessionPreparation::FreezePublished => {
+                    freeze_published_maps(&ebpf).context("freezing published policy maps")?;
+                }
+                SessionPreparation::SelectScope => {
+                    uprobe_scope = match scope {
+                        Scope::Pid(pid) => UProbeScope::OneProcess(
+                            std::num::NonZeroU32::new(*pid).context("pid must be non-zero")?,
+                        ),
+                        // Cgroup scoping is enforced in BPF, so the probe itself is
+                        // process-wide and the filter map decides.
+                        Scope::Cgroup { .. } => UProbeScope::AllProcesses,
+                    };
+                }
+                SessionPreparation::LoadProgram(prog_name) => {
+                    if matches!(prog_name, "sched_process_exec" | "sched_process_exit") {
+                        let prog: &mut RawTracePoint = ebpf
+                            .program_mut(prog_name)
+                            .with_context(|| format!("program {prog_name} missing from object"))?
+                            .try_into()?;
+                        prog.load()
+                            .with_context(|| format!("loading required raw {prog_name}"))?;
+                    } else if prog_name == "task_newtask" {
+                        let prog: &mut BtfTracePoint = ebpf
+                            .program_mut(prog_name)
+                            .context("program task_newtask missing from object")?
+                            .try_into()?;
+                        prog.load("task_newtask", &btf)
+                            .context("loading required typed task_newtask")?;
                     } else {
-                        return Err(error.context("attaching task_newtask"));
+                        let prog: &mut UProbe = ebpf
+                            .program_mut(prog_name)
+                            .with_context(|| format!("program {prog_name} missing from object"))?
+                            .try_into()?;
+                        prog.load()
+                            .with_context(|| format!("loading {prog_name}"))?;
                     }
                 }
+                SessionPreparation::FreezeDeferred(name) => {
+                    freeze_map(name, ebpf.map(name).with_context(|| format!("{name} map"))?)
+                        .with_context(|| format!("freezing {name}"))?;
+                }
+                SessionPreparation::PublishTailCalls => {
+                    publish_and_freeze_tail_calls(&mut ebpf, unsafe_enabled)
+                        .context("publishing and freezing TAIL_CALLS")?;
+                }
+                SessionPreparation::PrepareEventsDomain => {
+                    let events_domain = events::EventsDomain::from_events(&ebpf)?;
+                    root_seed = owned_child.map(|child| RootSeed {
+                        pin: child.seed_pin(),
+                        domain: events_domain.clone(),
+                    });
+                    prepared_domain = Some(events_domain);
+                }
             }
-        }
-        let lifecycle_tracking_unavailable = match attach_lifecycle_with(
+            Ok(())
+        })?;
+        let events_domain = prepared_domain.expect("preparation established the events domain");
+        let links = attach_lifecycle_with(
             &mut ebpf,
-            pause_key.is_some(),
             |ebpf, program| {
-                let tracepoint: &mut TracePoint = ebpf
-                    .program_mut(program)
-                    .with_context(|| format!("program {program} missing from object"))?
-                    .try_into()?;
-                tracepoint.attach("sched", program).map_err(Into::into)
+                if program == "task_newtask" {
+                    let hook: &mut BtfTracePoint = ebpf
+                        .program_mut(program)
+                        .context("required task_newtask program")?
+                        .try_into()?;
+                    Ok(RegisteredLink::BtfTracePoint {
+                        program,
+                        id: hook.attach()?,
+                    })
+                } else {
+                    let hook: &mut RawTracePoint = ebpf
+                        .program_mut(program)
+                        .with_context(|| format!("required raw {program} program"))?
+                        .try_into()?;
+                    Ok(RegisteredLink::RawTracePoint {
+                        program,
+                        id: hook.attach(program)?,
+                    })
+                }
             },
-            |ebpf, program, id| {
-                let tracepoint: &mut TracePoint = ebpf
-                    .program_mut(program)
-                    .with_context(|| format!("program {program} missing during rollback"))?
-                    .try_into()?;
-                tracepoint.detach(id).map_err(Into::into)
-            },
-        )? {
-            LifecycleAttachOutcome::Attached(lifecycle_links) => {
-                links.extend(
-                    lifecycle_links
-                        .into_iter()
-                        .map(|(program, id)| RegisteredLink::TracePoint { program, id }),
-                );
-                None
-            }
-            LifecycleAttachOutcome::Degraded(fact) => Some(fact),
-        };
+            |ebpf, _, link| detach_registered_link(ebpf, link),
+        )?;
 
         Ok(Self {
             ebpf,
+            events_domain,
+            root_seed,
             attach_failures: vec![],
             detach_failures: vec![],
             producers_detached: false,
@@ -1426,8 +1826,8 @@ impl Session {
             policy,
             uprobe_scope,
             pause_key,
-            lifecycle_tracking_unavailable,
-            process_creation_tracking_unavailable,
+            lifecycle_tracking_unavailable: None,
+            process_creation_tracking_unavailable: None,
             links,
         })
     }
@@ -1442,7 +1842,14 @@ impl Session {
                 .copied()
                 .fold(0u64, u64::saturating_add))
         };
-        counter_snapshot_with(read)
+        let evidence: PerCpuArray<_, u64> =
+            PerCpuArray::try_from(self.ebpf.map("EVIDENCE").context("EVIDENCE map")?)?;
+        let abi_refusals = evidence
+            .get(&EVIDENCE_ABI_REFUSALS, 0)?
+            .iter()
+            .copied()
+            .fold(0u64, u64::saturating_add);
+        counter_snapshot_with(read, abi_refusals)
     }
 
     pub(crate) fn preflight_targets(
@@ -1450,6 +1857,7 @@ impl Session {
         targets: &[Slot],
         objects: &PinnedObjects,
     ) -> Result<()> {
+        attachment_admission(&self.detach_failures, !targets.is_empty())?;
         if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
             bail!("a pinned provider object changed before live attachment");
         }
@@ -1457,6 +1865,9 @@ impl Session {
             objects
                 .attach_path_for(target.object)
                 .map_err(anyhow::Error::msg)?;
+            objects
+                .abi_for(target.object)
+                .ok_or_else(|| anyhow!("object {:?} has no retained target ABI", target.object))?;
             let _ = attach_cookie(target.index, target.descriptor_index);
         }
         Ok(())
@@ -1482,6 +1893,8 @@ impl Session {
         if self.has_dynamic_link(context, "dl_debug_state", object, file_offset, cookie) {
             return Ok(false);
         }
+        attachment_admission(&self.detach_failures, true)
+            .map_err(DynamicLoaderAttachFailure::Registry)?;
         let path = objects
             .attach_path_for(object)
             .map_err(|error| DynamicLoaderAttachFailure::Registry(anyhow!(error)))?;
@@ -1544,6 +1957,7 @@ impl Session {
         if self.has_dynamic_link(context, return_program, object, file_offset, cookie) {
             return Ok((false, None));
         }
+        attachment_admission(&self.detach_failures, true)?;
         let path = objects
             .attach_path_for(object)
             .map_err(anyhow::Error::msg)?;
@@ -1668,7 +2082,10 @@ impl Session {
                     abi,
                 }),
             ),
-            RegisteredLink::UProbe { .. } | RegisteredLink::TracePoint { .. } => (context, None),
+            RegisteredLink::UProbe { .. }
+            | RegisteredLink::RawTracePoint { .. }
+            | RegisteredLink::BtfTracePoint { .. }
+            | RegisteredLink::DiagnosticUProbe { .. } => (context, None),
         });
         let failures = self.detach_failures.len();
         let _ = self.detach_links(|link| link.context() == Some(context));
@@ -1713,15 +2130,19 @@ impl Session {
         if let Some(slot) = targets.iter().find(|slot| self.has_slot_link(slot.index)) {
             bail!("slot {} already has an owned probe link", slot.index);
         }
-        let attach_paths: BTreeMap<_, _> = targets
+        attachment_admission(&self.detach_failures, !targets.is_empty())?;
+        let attach_targets: BTreeMap<_, _> = targets
             .iter()
             // By capture-local pinned ID only. There is deliberately no by-path
             // fallback: a target pathname can name a different object here.
             .map(|slot| {
-                objects
+                let path = objects
                     .attach_path_for(slot.object)
-                    .map(|path| (slot.index, path))
-                    .map_err(anyhow::Error::msg)
+                    .map_err(anyhow::Error::msg)?;
+                let abi = objects.abi_for(slot.object).ok_or_else(|| {
+                    anyhow!("object {:?} has no retained target ABI", slot.object)
+                })?;
+                Ok((slot.index, (path, abi)))
             })
             .collect::<Result<_>>()?;
         let scope = self.uprobe_scope;
@@ -1730,14 +2151,18 @@ impl Session {
         let outcome = attach_targets_with(
             targets,
             self.policy,
-            |program, slot| {
-                let path = attach_paths
+            cfg!(feature = "unsafe-unvalidated-metadata"),
+            |slot| {
+                Ok(attach_targets
                     .get(&slot.index)
-                    .expect("every selected target has a retained pinned path");
-                let point = UProbeAttachPoint {
-                    location: UProbeAttachLocation::AbsoluteOffset(slot.file_offset),
-                    cookie: Some(attach_cookie(slot.index, slot.descriptor_index)),
-                };
+                    .expect("every selected target has retained pinned facts")
+                    .1)
+            },
+            |program, slot, point| {
+                let path = &attach_targets
+                    .get(&slot.index)
+                    .expect("every selected target has retained pinned facts")
+                    .0;
                 let prog: &mut UProbe = ebpf
                     .program_mut(program)
                     .with_context(|| format!("program {program} missing from object"))?
@@ -1760,7 +2185,7 @@ impl Session {
                 }
             },
             |_| monotonic_ns(),
-        );
+        )?;
         let AttachOutcome {
             successful,
             failures,
@@ -1827,13 +2252,20 @@ impl Session {
     /// on another CPU; callers must not claim that the terminal drain is final.
     pub fn detach_producers(&mut self) -> Result<()> {
         let detached = self.detach_links(|_| true);
-        self.producers_detached = detached.is_ok();
-        detached
+        finish_producer_detach(
+            &mut self.producers_detached,
+            &self.detach_failures,
+            detached,
+        )
     }
 
     /// The bound the next `EVENTS` poll gets — see `events::poll_quantum`.
     pub fn live_poll_quantum(&self) -> Option<usize> {
         events::poll_quantum(self.producers_detached)
+    }
+
+    pub(crate) fn take_root_seed(&mut self) -> Option<RootSeed> {
+        self.root_seed.take()
     }
 
     fn has_slot_link(&self, slot: u32) -> bool {
@@ -1870,42 +2302,46 @@ impl Session {
     }
 
     fn detach_link(&mut self, link: RegisteredLink) -> Result<()> {
-        match link {
-            RegisteredLink::UProbe { program, id, .. } => (|| {
-                let probe: &mut UProbe = self
-                    .ebpf
-                    .program_mut(program)
-                    .with_context(|| format!("program {program} missing during detach"))?
-                    .try_into()?;
-                probe
-                    .detach(id)
-                    .with_context(|| format!("detaching {program}"))
-            })(),
-            RegisteredLink::TracePoint { program, id } => (|| {
-                let tracepoint: &mut TracePoint = self
-                    .ebpf
-                    .program_mut(program)
-                    .with_context(|| format!("program {program} missing during detach"))?
-                    .try_into()?;
-                tracepoint
-                    .detach(id)
-                    .with_context(|| format!("detaching {program}"))
-            })(),
-            RegisteredLink::DynamicUProbe { program, id, .. } => (|| {
-                let probe: &mut UProbe = self
-                    .ebpf
-                    .program_mut(program)
-                    .with_context(|| format!("program {program} missing during detach"))?
-                    .try_into()?;
-                probe
-                    .detach(id)
-                    .with_context(|| format!("detaching {program}"))
-            })(),
-        }
+        detach_registered_link(&mut self.ebpf, link)
+    }
+
+    pub(crate) fn diagnostic() -> Result<Self> {
+        Self::start_inner(
+            &Scope::Pid(std::process::id()),
+            CapturePolicy::Allowlisted,
+            None,
+            None,
+        )
+    }
+
+    pub(crate) fn attach_diagnostic_probe(&mut self, path: &Path, offset: u64) -> Result<()> {
+        attachment_admission(&self.detach_failures, true)?;
+        let probe: &mut UProbe = self
+            .ebpf
+            .program_mut("p11_entry")
+            .context("diagnostic p11_entry program")?
+            .try_into()?;
+        let id = probe.attach(
+            UProbeAttachPoint {
+                location: UProbeAttachLocation::AbsoluteOffset(offset),
+                cookie: None,
+            },
+            path,
+            UProbeScope::CallingProcess,
+        )?;
+        self.links.push(RegisteredLink::DiagnosticUProbe {
+            program: "p11_entry",
+            id,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn events_domain(&self) -> events::EventsDomain {
+        self.events_domain.clone()
     }
 
     pub fn event_drain(&mut self) -> Result<events::Drain<'_>> {
-        events::Drain::new(&mut self.ebpf)
+        events::Drain::new(&mut self.ebpf, self.events_domain.clone())
     }
 
     pub(crate) fn discovery_dequeue(&mut self) -> Result<Option<events::DiscoveryItem>> {
@@ -2009,6 +2445,64 @@ impl Session {
     }
 }
 
+fn detach_registered_link(ebpf: &mut Ebpf, link: RegisteredLink) -> Result<()> {
+    match link {
+        RegisteredLink::UProbe { program, id, .. }
+        | RegisteredLink::DiagnosticUProbe { program, id } => (|| {
+            let probe: &mut UProbe = ebpf
+                .program_mut(program)
+                .with_context(|| format!("program {program} missing during detach"))?
+                .try_into()?;
+            probe
+                .detach(id)
+                .with_context(|| format!("detaching {program}"))
+        })(),
+        RegisteredLink::RawTracePoint { program, id } => (|| {
+            let tracepoint: &mut RawTracePoint = ebpf
+                .program_mut(program)
+                .with_context(|| format!("program {program} missing during detach"))?
+                .try_into()?;
+            tracepoint
+                .detach(id)
+                .with_context(|| format!("detaching {program}"))
+        })(),
+        RegisteredLink::BtfTracePoint { program, id } => (|| {
+            let tracepoint: &mut BtfTracePoint = ebpf
+                .program_mut(program)
+                .with_context(|| format!("program {program} missing during detach"))?
+                .try_into()?;
+            tracepoint
+                .detach(id)
+                .with_context(|| format!("detaching {program}"))
+        })(),
+        RegisteredLink::DynamicUProbe { program, id, .. } => (|| {
+            let probe: &mut UProbe = ebpf
+                .program_mut(program)
+                .with_context(|| format!("program {program} missing during detach"))?
+                .try_into()?;
+            probe
+                .detach(id)
+                .with_context(|| format!("detaching {program}"))
+        })(),
+    }
+}
+
+fn finish_producer_detach(
+    detached: &mut bool,
+    failures: &[String],
+    result: Result<()>,
+) -> Result<()> {
+    *detached = result.is_ok() && failures.is_empty();
+    result?;
+    if !failures.is_empty() {
+        bail!(
+            "producer detach ownership remains uncertain: {}",
+            failures.join("; ")
+        );
+    }
+    Ok(())
+}
+
 impl Drop for Session {
     fn drop(&mut self) {
         let _ = self.detach_producers();
@@ -2053,126 +2547,6 @@ mod capture_policy {
 }
 
 #[cfg(test)]
-mod tracepoint_format {
-    use super::{TASK_NEWTASK_FORMATS, parse_task_newtask_format, read_task_newtask_format_with};
-
-    const VALID: &str = "field:pid_t pid; offset:32; size:4; signed:1;\nfield:unsigned long clone_flags; offset:56; size:8; signed:0;\n";
-
-    #[test]
-    fn tracepoint_format_parses_shifted_task_newtask_offsets() {
-        assert_eq!(parse_task_newtask_format(VALID).unwrap(), (32, 56));
-    }
-
-    #[test]
-    fn tracepoint_format_rejects_malformed_and_unrepresentable_fields() {
-        let cases = [
-            (
-                "missing pid",
-                VALID.replace("field:pid_t pid; offset:32; size:4; signed:1;\n", ""),
-            ),
-            (
-                "missing clone_flags",
-                VALID.replace(
-                    "field:unsigned long clone_flags; offset:56; size:8; signed:0;\n",
-                    "",
-                ),
-            ),
-            (
-                "duplicate pid",
-                format!("{VALID}field:pid_t pid; offset:64; size:4; signed:1;\n"),
-            ),
-            (
-                "pid size other than four",
-                VALID.replace("size:4", "size:8"),
-            ),
-            ("pid unsigned field", VALID.replace("signed:1", "signed:0")),
-            (
-                "clone flags size other than eight",
-                VALID.replace("size:8", "size:4"),
-            ),
-            (
-                "clone flags signed field",
-                VALID.replace("signed:0", "signed:1"),
-            ),
-            ("negative offset", VALID.replace("offset:32", "offset:-1")),
-            (
-                "offset outside CONFIG packed form",
-                VALID.replace("offset:32", "offset:65536"),
-            ),
-            ("missing offset", VALID.replace("offset:32; ", "")),
-            ("missing size", VALID.replace("size:4; ", "")),
-            ("missing signedness", VALID.replace("signed:1;", "")),
-            (
-                "duplicate offset",
-                VALID.replace("offset:32;", "offset:32; offset:33;"),
-            ),
-            (
-                "duplicate size",
-                VALID.replace("size:4;", "size:4; size:4;"),
-            ),
-            (
-                "duplicate signedness",
-                VALID.replace("signed:1;", "signed:1; signed:1;"),
-            ),
-            (
-                "malformed offset",
-                VALID.replace("offset:32", "offset:32junk"),
-            ),
-        ];
-
-        for (reason, format) in cases {
-            assert!(
-                parse_task_newtask_format(&format).is_err(),
-                "accepted {reason}"
-            );
-        }
-    }
-
-    #[test]
-    fn tracepoint_format_reader_falls_back_to_debugfs() {
-        let mut visited = Vec::new();
-        let format = read_task_newtask_format_with(|path| {
-            visited.push(path.to_path_buf());
-            if path == std::path::Path::new(TASK_NEWTASK_FORMATS[1]) {
-                Ok(VALID.to_string())
-            } else {
-                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
-            }
-        })
-        .unwrap();
-        assert_eq!(format, VALID);
-        assert_eq!(visited.len(), 2);
-    }
-
-    #[test]
-    fn tracepoint_format_reader_reports_both_failed_paths() {
-        let error = read_task_newtask_format_with(|path| {
-            if path == std::path::Path::new(TASK_NEWTASK_FORMATS[0]) {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "primary tracefs denied",
-                ))
-            } else {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "debugfs tracepoint missing",
-                ))
-            }
-        })
-        .unwrap_err()
-        .to_string();
-        for expected in [
-            TASK_NEWTASK_FORMATS[0],
-            TASK_NEWTASK_FORMATS[1],
-            "primary tracefs denied",
-            "debugfs tracepoint missing",
-        ] {
-            assert!(error.contains(expected), "{error}");
-        }
-    }
-}
-
-#[cfg(test)]
 mod policy_output {
     use super::CapturePolicy;
 
@@ -2210,7 +2584,965 @@ mod policy_output {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn owner_limit_uses_exact_loaded_start_shape() {
+        for (capacity, limit) in [(16_384, 16_448), (1, 65)] {
+            let actual = map_metadata(MapType::Hash, 16, 288, capacity, 0);
+            assert_eq!(owner_limit_for_start(actual).unwrap(), limit);
+            for bad in [
+                ExactMapMetadata {
+                    map_type: MapType::Array,
+                    ..actual
+                },
+                ExactMapMetadata {
+                    key_size: 17,
+                    ..actual
+                },
+                ExactMapMetadata {
+                    value_size: 289,
+                    ..actual
+                },
+                ExactMapMetadata {
+                    max_entries: 2,
+                    ..actual
+                },
+                ExactMapMetadata { flags: 1, ..actual },
+            ] {
+                assert!(owner_limit_for_start(bad).is_err());
+            }
+        }
+    }
+    #[test]
+    fn identity_metadata_checks_every_tuple_field() {
+        for (name, expected) in IDENTITY_MAPS {
+            compare_map_metadata(name, expected, expected).unwrap();
+            for actual in [
+                ExactMapMetadata {
+                    map_type: MapType::Hash,
+                    ..expected
+                },
+                ExactMapMetadata {
+                    key_size: expected.key_size + 1,
+                    ..expected
+                },
+                ExactMapMetadata {
+                    value_size: expected.value_size + 1,
+                    ..expected
+                },
+                ExactMapMetadata {
+                    max_entries: expected.max_entries + 1,
+                    ..expected
+                },
+                ExactMapMetadata {
+                    flags: expected.flags ^ 1,
+                    ..expected
+                },
+            ] {
+                assert!(
+                    compare_map_metadata(name, actual, expected).is_err(),
+                    "{name}: {actual:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn identity_inventory_rejects_missing_extra_and_wrong_variants() {
+        let valid = [
+            ("TASK_COOKIE", true),
+            ("THREAD_OWNER", true),
+            ("ROOT_AFFILIATION", true),
+            ("COOKIE_CTL", false),
+            ("OWNER_CTL", false),
+            ("ROOT_CTL", false),
+        ];
+        validate_identity_inventory(valid.into_iter()).unwrap();
+        for index in [0, 1, 2] {
+            assert!(
+                validate_identity_inventory(
+                    valid
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(i, v)| (i != index).then_some(v))
+                )
+                .is_err()
+            );
+            let mut wrong = valid;
+            wrong[index].1 = false;
+            assert!(validate_identity_inventory(wrong.into_iter()).is_err());
+        }
+        for extra in ["OTHER", "COOKIE_CTL", "OWNER_CTL", "ROOT_CTL"] {
+            assert!(validate_identity_inventory(valid.into_iter().chain([(extra, true)])).is_err());
+        }
+    }
+
+    #[test]
+    fn identity_preparation_stops_at_every_write_readback_and_freeze_failure() {
+        let mut expected = Vec::new();
+        prepare_identity_with(true, |step| {
+            expected.push(step);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            expected,
+            &[
+                IdentityPreparation::WriteCookie,
+                IdentityPreparation::ReadCookie,
+                IdentityPreparation::WriteOwner,
+                IdentityPreparation::ReadOwner,
+                IdentityPreparation::WriteRoot,
+                IdentityPreparation::ReadRoot,
+                IdentityPreparation::SeedRoot,
+                IdentityPreparation::ReadSeed,
+                IdentityPreparation::Freeze("TASK_COOKIE"),
+                IdentityPreparation::Freeze("THREAD_OWNER"),
+                IdentityPreparation::Freeze("ROOT_AFFILIATION"),
+                IdentityPreparation::Freeze("COOKIE_CTL"),
+                IdentityPreparation::Freeze("OWNER_CTL"),
+                IdentityPreparation::Freeze("ROOT_CTL")
+            ]
+        );
+        for fail in 0..expected.len() {
+            let mut calls = Vec::new();
+            let mut linked = false;
+            let result = prepare_identity_with(true, |step| {
+                calls.push(step);
+                if calls.len() == fail + 1 {
+                    bail!("injected setup failure");
+                }
+                Ok(())
+            })
+            .map(|()| {
+                linked = true;
+            });
+            assert!(result.is_err());
+            assert!(!linked);
+            assert_eq!(calls, expected[..=fail]);
+        }
+
+        let mut unowned = Vec::new();
+        prepare_identity_with(false, |step| {
+            unowned.push(step);
+            Ok(())
+        })
+        .unwrap();
+        assert!(!unowned.contains(&IdentityPreparation::SeedRoot));
+        assert!(!unowned.contains(&IdentityPreparation::ReadSeed));
+        assert!(
+            unowned
+                .iter()
+                .position(|step| *step == IdentityPreparation::ReadRoot)
+                .unwrap()
+                < unowned
+                    .iter()
+                    .position(|step| *step == IdentityPreparation::Freeze("ROOT_CTL"))
+                    .unwrap()
+        );
+    }
+
+    #[test]
+    fn identity_controls_read_back_every_named_field() {
+        assert_eq!(
+            cookie_control_fields(ImageIdentityControl {
+                limit: 1,
+                next_ticket: 2,
+                unavailable: 3,
+                create_failures: 4,
+                retry_exhausted: 5
+            }),
+            [1, 2, 3, 4, 5]
+        );
+        assert_eq!(
+            owner_control_fields(ThreadOwnerControl {
+                limit: 1,
+                outstanding: 2,
+                poison: 3,
+                admission_failures: 4,
+                reclamation_failures: 5,
+                abandoned_start: 6,
+                abandoned_discovery: 7
+            }),
+            [1, 2, 3, 4, 5, 6, 7]
+        );
+        assert_eq!(
+            root_control_fields(RootAffiliationControl {
+                affiliation_reserved: 1,
+                failure_flags: 2,
+                admission_failures: 3,
+                create_failures: 4,
+                malformed_failures: 5,
+                classifier_failures: 6,
+                delete_failures: 7,
+                refund_failures: 8,
+            }),
+            [1, 2, 3, 4, 5, 6, 7, 8]
+        );
+    }
+
+    #[test]
+    fn root_control_validator_rejects_each_individual_field_mismatch() {
+        let expected = initial_root_control(true);
+        validate_root_control_readback(expected, expected).unwrap();
+        for actual in [
+            RootAffiliationControl {
+                affiliation_reserved: 0,
+                ..expected
+            },
+            RootAffiliationControl {
+                failure_flags: 1,
+                ..expected
+            },
+            RootAffiliationControl {
+                admission_failures: 1,
+                ..expected
+            },
+            RootAffiliationControl {
+                create_failures: 1,
+                ..expected
+            },
+            RootAffiliationControl {
+                malformed_failures: 1,
+                ..expected
+            },
+            RootAffiliationControl {
+                classifier_failures: 1,
+                ..expected
+            },
+            RootAffiliationControl {
+                delete_failures: 1,
+                ..expected
+            },
+            RootAffiliationControl {
+                refund_failures: 1,
+                ..expected
+            },
+        ] {
+            assert!(validate_root_control_readback(expected, actual).is_err());
+        }
+    }
+
+    #[test]
+    fn root_seed_uses_exact_original_pidfd_abi_and_same_fd_readback() {
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+        use std::process::{Command, Stdio};
+
+        const FD0_CHILD: &str = "P11SCOPE_ROOT_SEED_FD0_CHILD";
+        if std::env::var_os(FD0_CHILD).is_none() {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("attach::tests::root_seed_uses_exact_original_pidfd_abi_and_same_fd_readback")
+                .arg("--nocapture")
+                .env(FD0_CHILD, "1")
+                .stdin(Stdio::from(std::fs::File::open("/dev/null").unwrap()))
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let map = tempfile::tempfile().unwrap();
+        let stdin = std::io::stdin();
+        assert_eq!(stdin.as_fd().as_raw_fd(), 0);
+        let map_fd = map.as_fd();
+        let pidfd = stdin.as_fd();
+        let expected_map_fd = map_fd.as_raw_fd() as u32;
+        let mut calls = Vec::new();
+        root_affiliation_element_with(
+            map_fd,
+            pidfd,
+            RootElementOperation::Seed,
+            |command, attr, size| {
+                assert_eq!(size, std::mem::size_of::<BpfMapElementAttr>());
+                assert_eq!(attr.map_fd, expected_map_fd);
+                // SAFETY: the production seam keeps exact typed storage live for the call.
+                calls.push((
+                    command,
+                    unsafe { *(attr.key as *const i32) },
+                    unsafe { *(attr.value as *const u64) },
+                    attr.flags,
+                ));
+                Ok(())
+            },
+        )
+        .unwrap();
+        root_affiliation_element_with(
+            map_fd,
+            pidfd,
+            RootElementOperation::Read,
+            |command, attr, size| {
+                assert_eq!(size, std::mem::size_of::<BpfMapElementAttr>());
+                assert_eq!(attr.map_fd, expected_map_fd);
+                // SAFETY: simulate the kernel's exact positive u64 readback.
+                unsafe { *(attr.value as *mut u64) = 1 };
+                calls.push((
+                    command,
+                    unsafe { *(attr.key as *const i32) },
+                    unsafe { *(attr.value as *const u64) },
+                    attr.flags,
+                ));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, [(2, 0, 1, BPF_NOEXIST), (1, 0, 1, 0)]);
+    }
+
+    #[test]
+    fn root_seed_refuses_duplicate_absence_errors_and_nonpositive_readback() {
+        use std::os::fd::AsFd as _;
+        let map = tempfile::tempfile().unwrap();
+        let process = tempfile::tempfile().unwrap();
+        let map_fd = map.as_fd();
+        let pidfd = process.as_fd();
+        for (operation, errno) in [
+            (RootElementOperation::Seed, libc::EEXIST),
+            (RootElementOperation::Read, libc::ENOENT),
+            (RootElementOperation::Read, libc::EPERM),
+        ] {
+            let error = root_affiliation_element_with(map_fd, pidfd, operation, |_, _, _| {
+                Err(std::io::Error::from_raw_os_error(errno))
+            })
+            .unwrap_err();
+            assert_eq!(
+                error
+                    .root_cause()
+                    .downcast_ref::<std::io::Error>()
+                    .and_then(std::io::Error::raw_os_error),
+                Some(errno)
+            );
+        }
+        root_affiliation_element_with(map_fd, pidfd, RootElementOperation::Read, |_, attr, _| {
+            // SAFETY: the production read seam supplies a live writable u64.
+            unsafe { *(attr.value as *mut u64) = ROOT_AFFILIATION_POSITIVE };
+            Ok(())
+        })
+        .unwrap();
+        for invalid in [0, 2, u64::MAX] {
+            let error = root_affiliation_element_with(
+                map_fd,
+                pidfd,
+                RootElementOperation::Read,
+                |_, attr, _| {
+                    // SAFETY: the production read seam supplies a live writable u64.
+                    unsafe { *(attr.value as *mut u64) = invalid };
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("expected positive value 1"));
+        }
+    }
+
+    #[test]
+    fn root_seed_authority_requires_exact_pid_scope_and_original_descriptor() {
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+        let missing = root_seed_authority(
+            &Scope::Pid(17),
+            17,
+            Err(std::io::Error::other("process pin has no original pidfd")),
+        )
+        .unwrap_err();
+        assert!(format!("{missing:#}").contains("no original pidfd"));
+        let process = tempfile::tempfile().unwrap();
+        let pidfd = process.as_fd();
+        assert_eq!(
+            root_seed_authority(&Scope::Pid(17), 17, Ok(pidfd))
+                .unwrap()
+                .as_raw_fd(),
+            process.as_raw_fd()
+        );
+        assert!(root_seed_authority(&Scope::Pid(18), 17, Ok(pidfd)).is_err());
+        let directory = tempfile::tempdir().unwrap();
+        let dir = std::sync::Arc::new(std::fs::File::open(directory.path()).unwrap());
+        assert!(
+            root_seed_authority(
+                &Scope::Cgroup {
+                    id: 1,
+                    path: directory.path().to_path_buf(),
+                    dir
+                },
+                17,
+                Ok(pidfd)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn root_control_is_zero_unowned_and_charged_once_owned() {
+        assert_eq!(root_control_fields(initial_root_control(false)), [0; 8]);
+        assert_eq!(
+            root_control_fields(initial_root_control(true)),
+            [1, 0, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn required_hooks_rollback_all_prior_links_and_retain_source() {
+        let hooks = ["sched_process_exec", "sched_process_exit", "task_newtask"];
+        for fail in 0..3 {
+            let mut operations = Vec::new();
+            let error = attach_lifecycle_with(
+                &mut operations,
+                |operations, name| {
+                    operations.push(format!("attach {name}"));
+                    if name == hooks[fail] {
+                        return Err(std::io::Error::from_raw_os_error(libc::EPERM).into());
+                    }
+                    Ok(name)
+                },
+                |operations, name, _| {
+                    operations.push(format!("detach {name}"));
+                    bail!("rollback {name} failed")
+                },
+            )
+            .unwrap_err();
+            assert!(error.downcast_ref::<std::io::Error>().is_some());
+            let mut expected: Vec<_> = hooks[..=fail]
+                .iter()
+                .map(|name| format!("attach {name}"))
+                .collect();
+            expected.extend(
+                hooks[..fail]
+                    .iter()
+                    .rev()
+                    .map(|name| format!("detach {name}")),
+            );
+            assert_eq!(operations, expected);
+            let rendered = format!("{error:#}");
+            assert!(rendered.contains(hooks[fail]));
+            for name in &hooks[..fail] {
+                assert!(rendered.contains(&format!("rollback {name} failed")));
+            }
+        }
+        let mut calls = Vec::new();
+        let links = attach_lifecycle_with(
+            &mut calls,
+            |calls, name| {
+                calls.push(name);
+                Ok(name)
+            },
+            |_, _, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(links, hooks);
+        assert_eq!(calls, hooks);
+    }
+
+    #[test]
+    fn cleanup_hooks_detach_after_shuffled_static_dynamic_and_diagnostic_links() {
+        let mut detached = Vec::new();
+        let failures = detach_selected_with(
+            vec![
+                (ProducerProgram::RawTracePoint("sched_process_exit"), "exit"),
+                (
+                    ProducerProgram::UProbe("function_list_return"),
+                    "dynamic return",
+                ),
+                (ProducerProgram::UProbe("p11_entry"), "diagnostic"),
+                (ProducerProgram::RawTracePoint("sched_process_exec"), "exec"),
+                (ProducerProgram::UProbe("p11_return"), "static return"),
+                (ProducerProgram::BtfTracePoint("task_newtask"), "typed"),
+                (
+                    ProducerProgram::UProbe("function_list_entry"),
+                    "dynamic entry",
+                ),
+                (ProducerProgram::UProbe("p11_entry"), "static entry"),
+            ],
+            |link| {
+                detached.push(link);
+                bail!("detach {link}")
+            },
+        );
+        assert_eq!(failures.len(), 8);
+        assert_eq!(&detached[6..], &["exit", "exec"]);
+    }
+
+    #[test]
+    fn failed_then_empty_detach_stays_uncertain_and_refuses_new_links() {
+        let failures = vec!["detach failed".into()];
+        let mut detached = false;
+        assert!(
+            finish_producer_detach(&mut detached, &failures, Err(anyhow!("detach failed")))
+                .is_err()
+        );
+        assert!(!detached);
+        assert!(finish_producer_detach(&mut detached, &failures, Ok(())).is_err());
+        assert!(!detached);
+        assert_eq!(
+            events::poll_quantum(detached),
+            Some(events::LIVE_POLL_QUANTUM)
+        );
+        let mut clean = false;
+        finish_producer_detach(&mut clean, &[], Ok(())).unwrap();
+        assert_eq!(events::poll_quantum(clean), None);
+        assert!(attachment_admission(&failures, true).is_err());
+        attachment_admission(&failures, false).unwrap();
+    }
+
+    #[test]
+    fn development_boundary_refuses_activation_without_unsupported_kernel_label() {
+        let mut linked = false;
+        let result = require_identity_integration().map(|()| {
+            linked = true;
+        });
+        assert!(!linked);
+        let error = unsupported_environment_context(result.unwrap_err());
+        assert!(error.downcast_ref::<IdentityIntegrationPending>().is_some());
+        assert!(!format!("{error:#}").contains(UNSUPPORTED_ENV_HINT));
+    }
     use super::*;
+
+    fn expected_preparation(unsafe_object: bool) -> Vec<SessionPreparation> {
+        use SessionPreparation::*;
+        let mut steps = vec![
+            ValidatePolicy,
+            ValidateRuntime,
+            ValidatePrograms,
+            PublishScope,
+            PrepareIdentity,
+            PublishDescriptors,
+            PublishAsync,
+            PublishShapes,
+            PublishAttributes,
+            FreezePublished,
+            SelectScope,
+            LoadProgram("dl_debug_state"),
+            LoadProgram("function_list_entry"),
+            LoadProgram("function_list_return"),
+            LoadProgram("interface_entry"),
+            LoadProgram("interface_list_entry"),
+            LoadProgram("interface_list_return"),
+            LoadProgram("interface_list_worker"),
+            LoadProgram("interface_return"),
+            LoadProgram("p11_entry"),
+        ];
+        if unsafe_object {
+            steps.extend([
+                LoadProgram("p11_entry_ia32"),
+                LoadProgram("p11_entry_template"),
+                LoadProgram("p11_entry_template_pair"),
+                LoadProgram("p11_entry_template_second"),
+                LoadProgram("p11_entry_template_types"),
+            ]);
+        }
+        steps.extend([
+            LoadProgram("p11_return"),
+            LoadProgram("sched_process_exec"),
+            LoadProgram("sched_process_exit"),
+            LoadProgram("task_newtask"),
+            FreezeDeferred("CONFIG"),
+            FreezeDeferred("DESCRIPTORS"),
+            PublishTailCalls,
+            PrepareEventsDomain,
+        ]);
+        steps
+    }
+
+    #[test]
+    fn preparation_contract_runs_every_phase_then_actual_refusal() {
+        for unsafe_object in [false, true] {
+            let mut seen = Vec::new();
+            let error = prepare_session_with(unsafe_object, |step| {
+                seen.push(step);
+                Ok(())
+            })
+            .unwrap_err();
+            assert_eq!(seen, expected_preparation(unsafe_object));
+            assert!(error.downcast_ref::<IdentityIntegrationPending>().is_some());
+        }
+    }
+
+    #[test]
+    fn preparation_contract_preserves_each_error_and_stops_later_operations() {
+        #[derive(Debug)]
+        struct Injected(usize);
+        impl std::fmt::Display for Injected {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "injected phase {}", self.0)
+            }
+        }
+        impl std::error::Error for Injected {}
+        for unsafe_object in [false, true] {
+            let expected = expected_preparation(unsafe_object);
+            for fail in 0..expected.len() {
+                let mut seen = Vec::new();
+                let error = prepare_session_with(unsafe_object, |step| {
+                    seen.push(step);
+                    if seen.len() == fail + 1 {
+                        return Err(Injected(fail).into());
+                    }
+                    Ok(())
+                })
+                .unwrap_err();
+                assert_eq!(seen, expected[..=fail]);
+                assert_eq!(error.downcast_ref::<Injected>().unwrap().0, fail);
+                assert_eq!(error.to_string(), format!("injected phase {fail}"));
+            }
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum TailOperation {
+        Write(u32),
+        Read(u32),
+        Freeze,
+    }
+
+    #[test]
+    fn tail_contract_writes_reads_exact_ids_then_freezes() {
+        for second in [None, Some(902)] {
+            let mut seen = Vec::new();
+            publish_tail_calls_with(
+                &mut seen,
+                701,
+                second,
+                |seen, slot| {
+                    seen.push(TailOperation::Write(slot));
+                    Ok(())
+                },
+                |seen, slot| {
+                    seen.push(TailOperation::Read(slot));
+                    Ok(if slot == 0 { Some(701) } else { second })
+                },
+                |seen| {
+                    seen.push(TailOperation::Freeze);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let expected = if second.is_some() {
+                vec![
+                    TailOperation::Write(0),
+                    TailOperation::Write(1),
+                    TailOperation::Read(0),
+                    TailOperation::Read(1),
+                    TailOperation::Freeze,
+                ]
+            } else {
+                vec![
+                    TailOperation::Write(0),
+                    TailOperation::Read(0),
+                    TailOperation::Read(1),
+                    TailOperation::Freeze,
+                ]
+            };
+            assert_eq!(seen, expected);
+        }
+    }
+
+    #[test]
+    fn tail_contract_rejects_absence_wrong_ids_and_unexpected_second_before_freeze() {
+        for (second, worker_read, second_read, message, reads) in [
+            (None, None, None, "worker", vec![0]),
+            (None, Some(700), None, "worker", vec![0]),
+            (None, Some(701), Some(902), "template-second", vec![0, 1]),
+            (Some(902), Some(701), None, "template-second", vec![0, 1]),
+            (
+                Some(902),
+                Some(701),
+                Some(903),
+                "template-second",
+                vec![0, 1],
+            ),
+        ] {
+            let mut seen = Vec::new();
+            let error = publish_tail_calls_with(
+                &mut seen,
+                701,
+                second,
+                |_, _| Ok(()),
+                |seen, slot| {
+                    seen.push(slot);
+                    Ok(if slot == 0 { worker_read } else { second_read })
+                },
+                |_| panic!("inexact readback must not freeze"),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(message), "{error}");
+            assert_eq!(seen, reads);
+        }
+    }
+
+    #[test]
+    fn tail_contract_distinguishes_empty_optional_slot_from_lookup_failure() {
+        for errno in [libc::ENOENT, libc::EPERM, libc::EIO] {
+            let mut frozen = false;
+            let result = publish_tail_calls_with(
+                &mut frozen,
+                701,
+                None,
+                |_, _| Ok(()),
+                |_, slot| {
+                    program_array_lookup_result(
+                        "TAIL_CALLS",
+                        slot,
+                        701,
+                        if slot == 0 {
+                            Ok(())
+                        } else {
+                            Err(io::Error::from_raw_os_error(errno))
+                        },
+                    )
+                },
+                |frozen| {
+                    *frozen = true;
+                    Ok(())
+                },
+            );
+            if errno == libc::ENOENT {
+                result.unwrap();
+                assert!(frozen);
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(
+                    error.downcast_ref::<io::Error>().unwrap().raw_os_error(),
+                    Some(errno)
+                );
+                assert_eq!(error.to_string(), "reading back TAIL_CALLS[1]");
+                assert!(!frozen);
+            }
+        }
+    }
+
+    #[test]
+    fn tail_contract_preserves_every_io_failure_and_stops() {
+        for second in [None, Some(902)] {
+            let expected = if second.is_some() {
+                vec![
+                    TailOperation::Write(0),
+                    TailOperation::Write(1),
+                    TailOperation::Read(0),
+                    TailOperation::Read(1),
+                    TailOperation::Freeze,
+                ]
+            } else {
+                vec![
+                    TailOperation::Write(0),
+                    TailOperation::Read(0),
+                    TailOperation::Read(1),
+                    TailOperation::Freeze,
+                ]
+            };
+            for fail in 0..expected.len() {
+                let mut seen = Vec::new();
+                let record = |seen: &mut Vec<TailOperation>, op| -> Result<()> {
+                    seen.push(op);
+                    if seen.len() == fail + 1 {
+                        bail!("injected tail I/O failure {fail}");
+                    }
+                    Ok(())
+                };
+                let error = publish_tail_calls_with(
+                    &mut seen,
+                    701,
+                    second,
+                    |seen, slot| record(seen, TailOperation::Write(slot)),
+                    |seen, slot| {
+                        record(seen, TailOperation::Read(slot))?;
+                        Ok(if slot == 0 { Some(701) } else { second })
+                    },
+                    |seen| record(seen, TailOperation::Freeze),
+                )
+                .unwrap_err();
+                assert_eq!(seen, expected[..=fail]);
+                assert_eq!(
+                    error.to_string(),
+                    format!("injected tail I/O failure {fail}")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn aya_cookie_contract_preserves_both_words_through_return_first_scheduling() {
+        let mut first = test_slot(0x1020_3040);
+        first.descriptor_index = 0x5060_7080;
+        first.file_offset = 0x1234_5678_9abc;
+        let mut second = test_slot(0xa1b2_c3d4);
+        second.descriptor_index = 0xe5f6_0718;
+        second.file_offset = 0x9876_5432_1000;
+        for fail_return in [false, true] {
+            let mut seen = Vec::new();
+            let outcome = attach_targets_with(
+                &[first.clone(), second.clone()],
+                CapturePolicy::Allowlisted,
+                false,
+                |_| Ok(ElfAbi::Lp64),
+                |program, slot, point| {
+                    let UProbeAttachLocation::AbsoluteOffset(offset) = point.location else {
+                        panic!("slot attaches must retain the concrete file offset");
+                    };
+                    seen.push((program, slot.index, offset, point.cookie));
+                    if fail_return && program == "p11_return" && slot.index == 0x1020_3040 {
+                        bail!("return refused");
+                    }
+                    Ok(())
+                },
+                |_| Some(10),
+            )
+            .unwrap();
+            let mut expected = vec![
+                (
+                    "p11_return",
+                    0x1020_3040,
+                    0x1234_5678_9abc,
+                    Some(0x5060_7080_1020_3040),
+                ),
+                (
+                    "p11_return",
+                    0xa1b2_c3d4,
+                    0x9876_5432_1000,
+                    Some(0xe5f6_0718_a1b2_c3d4),
+                ),
+            ];
+            if !fail_return {
+                expected.push((
+                    "p11_entry",
+                    0x1020_3040,
+                    0x1234_5678_9abc,
+                    Some(0x5060_7080_1020_3040),
+                ));
+            }
+            expected.push((
+                "p11_entry",
+                0xa1b2_c3d4,
+                0x9876_5432_1000,
+                Some(0xe5f6_0718_a1b2_c3d4),
+            ));
+            assert_eq!(seen, expected);
+            assert_eq!(outcome.failures.len(), usize::from(fail_return));
+        }
+    }
+
+    #[derive(Default)]
+    struct DescriptorPublicationIo {
+        writes: Vec<(u32, SlotSemantics)>,
+        read_calls: usize,
+    }
+
+    #[test]
+    fn descriptor_publication_writes_the_full_fixed_inventory_then_reads_it_once() {
+        let mut io = DescriptorPublicationIo::default();
+
+        publish_descriptors(
+            &mut io,
+            |io, index, value| {
+                io.writes.push((index, value));
+                Ok(())
+            },
+            |io| {
+                io.read_calls += 1;
+                Ok(io.writes.iter().map(|(_, value)| *value).collect())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(io.writes.len(), 105);
+        assert_eq!(io.read_calls, 1);
+        assert_eq!(
+            io.writes,
+            crate::kinds::DESCRIPTORS
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(index, value)| (index as u32, value))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn descriptor_publication_stops_at_each_injected_write_failure() {
+        for failed_index in [0, 52, 104] {
+            let mut io = DescriptorPublicationIo::default();
+
+            let error = publish_descriptors(
+                &mut io,
+                |io, index, value| {
+                    io.writes.push((index, value));
+                    if index == failed_index {
+                        anyhow::bail!("injected descriptor write failure at {index}");
+                    }
+                    Ok(())
+                },
+                |io| {
+                    io.read_calls += 1;
+                    Ok(Vec::new())
+                },
+            )
+            .unwrap_err();
+
+            assert_eq!(
+                error.to_string(),
+                format!("injected descriptor write failure at {failed_index}")
+            );
+            assert_eq!(
+                io.writes
+                    .iter()
+                    .map(|(index, _)| *index)
+                    .collect::<Vec<_>>(),
+                (0..=failed_index).collect::<Vec<_>>()
+            );
+            assert_eq!(io.read_calls, 0);
+        }
+    }
+
+    #[test]
+    fn descriptor_publication_preserves_read_failure() {
+        let mut io = DescriptorPublicationIo::default();
+
+        let error = publish_descriptors(
+            &mut io,
+            |io, index, value| {
+                io.writes.push((index, value));
+                Ok(())
+            },
+            |io| {
+                io.read_calls += 1;
+                anyhow::bail!("injected descriptor read failure")
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "injected descriptor read failure");
+        assert_eq!(io.writes.len(), 105);
+        assert_eq!(io.read_calls, 1);
+    }
+
+    #[test]
+    fn descriptor_publication_rejects_every_inexact_readback_shape() {
+        let expected = crate::kinds::DESCRIPTORS.to_vec();
+        let mut missing = expected.clone();
+        missing.pop();
+        let mut extra = expected.clone();
+        extra.push(SlotSemantics::COUNT_ONLY);
+        let mut different = expected.clone();
+        different[52].operations ^= 1;
+
+        for actual in [missing, extra, different] {
+            let mut io = DescriptorPublicationIo::default();
+            let error = publish_descriptors(
+                &mut io,
+                |io, index, value| {
+                    io.writes.push((index, value));
+                    Ok(())
+                },
+                |io| {
+                    io.read_calls += 1;
+                    Ok(actual)
+                },
+            )
+            .unwrap_err();
+
+            assert_eq!(
+                error.to_string(),
+                "DESCRIPTORS exact readback differs from the fixed inventory"
+            );
+            assert_eq!(io.writes.len(), 105);
+            assert_eq!(io.read_calls, 1);
+        }
+    }
 
     #[test]
     fn rdonly_arrays_with_many_entries_freeze_only_after_programs_load() {
@@ -2316,27 +3648,6 @@ mod tests {
     }
 
     #[test]
-    fn failed_dynamic_detach_is_sticky_and_blocks_replacement() {
-        let attempted = std::cell::RefCell::new(Vec::new());
-        let errors = detach_selected_with(
-            vec![
-                (ProducerProgram::UProbe("dynamic"), 1u8),
-                (ProducerProgram::UProbe("dynamic"), 2),
-            ],
-            |link| {
-                attempted.borrow_mut().push(link);
-                if link == 1 {
-                    anyhow::bail!("injected dynamic detach failure")
-                }
-                Ok(())
-            },
-        );
-
-        assert_eq!(*attempted.borrow(), [1, 2], "every detach is one-shot");
-        assert_eq!(errors.len(), 1);
-    }
-
-    #[test]
     fn only_static_slot_programs_have_endpoint_identities() {
         assert_eq!(
             static_endpoint("p11_return", 7),
@@ -2344,6 +3655,7 @@ mod tests {
         );
         for program in [
             "p11_entry",
+            "p11_entry_ia32",
             "p11_entry_template",
             "p11_entry_template_types",
             "p11_entry_template_pair",
@@ -2367,11 +3679,10 @@ mod tests {
     }
 
     #[test]
-    fn optional_lifecycle_tier_degrades_for_typed_tracefs_discovery_loss() {
+    fn mandatory_lifecycle_refuses_hook_loss() {
         let mut state = ();
         let outcome = attach_lifecycle_with::<_, ()>(
             &mut state,
-            false,
             |_, program| {
                 assert_eq!(program, "sched_process_exec");
                 Err(
@@ -2380,169 +3691,29 @@ mod tests {
                 )
             },
             |_, _, _| Ok(()),
-        )
-        .unwrap();
-
-        assert_eq!(
-            outcome,
-            LifecycleAttachOutcome::Degraded(
-                "live lifecycle tracking unavailable: tracefs not found".into()
-            )
         );
+        assert!(outcome.is_err());
     }
 
     #[test]
-    fn process_creation_capture_is_cgroup_only() {
+    fn process_creation_infrastructure_is_mandatory_in_every_scope() {
         let cgroup = Scope::Cgroup {
             id: 1,
             path: "/".into(),
             dir: Arc::new(File::open("/").unwrap()),
         };
         for (scope, policy, expected) in [
-            (Scope::Pid(7), CapturePolicy::Allowlisted, false),
+            (Scope::Pid(7), CapturePolicy::Allowlisted, true),
             (
                 Scope::Pid(7),
                 CapturePolicy::UnsafeUnvalidatedMetadata,
-                false,
+                true,
             ),
-            (Scope::Pid(7), CapturePolicy::AggregateOnly, false),
+            (Scope::Pid(7), CapturePolicy::AggregateOnly, true),
             (cgroup, CapturePolicy::Allowlisted, true),
         ] {
             assert_eq!(process_creation_capture_enabled(&scope, policy), expected);
         }
-    }
-
-    #[test]
-    fn optional_lifecycle_tier_rolls_back_the_first_link_when_second_is_unavailable() {
-        let mut detached = Vec::new();
-        let outcome = attach_lifecycle_with(
-            &mut detached,
-            false,
-            |_, program| match program {
-                "sched_process_exec" => Ok(program),
-                "sched_process_exit" => Err(aya::programs::ProgramError::IOError(
-                    io::Error::other("tracefs not found"),
-                )
-                .into()),
-                _ => unreachable!(),
-            },
-            |detached, _, link| {
-                detached.push(link);
-                Ok(())
-            },
-        )
-        .unwrap();
-
-        assert!(matches!(outcome, LifecycleAttachOutcome::Degraded(_)));
-        assert_eq!(detached, ["sched_process_exec"]);
-    }
-
-    #[test]
-    fn lifecycle_tier_rollback_failure_stays_fatal_and_retains_both_causes() {
-        let mut state = ();
-        let error = attach_lifecycle_with(
-            &mut state,
-            false,
-            |_, program| match program {
-                "sched_process_exec" => Ok(()),
-                "sched_process_exit" => {
-                    Err(ProgramError::IOError(io::Error::other("tracefs not found")).into())
-                }
-                _ => unreachable!(),
-            },
-            |_, _, _| anyhow::bail!("injected rollback failure"),
-        )
-        .unwrap_err();
-        let rendered = format!("{error:#}");
-
-        assert!(rendered.contains("tracefs not found"));
-        assert!(rendered.contains("injected rollback failure"));
-    }
-
-    #[test]
-    fn lifecycle_tier_classifies_only_expected_tracefs_id_file_access() {
-        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::NotFound] {
-            let error =
-                anyhow::Error::from(ProgramError::TracePointError(TracePointError::FileError {
-                    filename: PathBuf::from(
-                        "/sys/kernel/tracing/events/sched/sched_process_exec/id",
-                    ),
-                    io_error: io::Error::from(kind),
-                }));
-            assert!(tracefs_lifecycle_failure(&error, "sched_process_exec").is_some());
-        }
-
-        let unexpected =
-            anyhow::Error::from(ProgramError::TracePointError(TracePointError::FileError {
-                filename: PathBuf::from("/tmp/not-tracefs/id"),
-                io_error: io::Error::from(io::ErrorKind::PermissionDenied),
-            }));
-        assert!(tracefs_lifecycle_failure(&unexpected, "sched_process_exec").is_none());
-
-        let malformed_id =
-            anyhow::Error::from(ProgramError::TracePointError(TracePointError::FileError {
-                filename: PathBuf::from(
-                    "/sys/kernel/tracing/events/sched/sched_process_exec/id.bak",
-                ),
-                io_error: io::Error::from(io::ErrorKind::PermissionDenied),
-            }));
-        assert!(tracefs_lifecycle_failure(&malformed_id, "sched_process_exec").is_none());
-    }
-
-    #[test]
-    fn unsupported_environment_context_preserves_program_error() {
-        let error = unsupported_environment_context(
-            ProgramError::IOError(io::Error::other("tracefs not found")).into(),
-        );
-
-        assert!(format!("{error:#}").contains(UNSUPPORTED_ENV_HINT));
-        assert!(error.downcast_ref::<ProgramError>().is_some());
-    }
-
-    #[test]
-    fn owned_run_refuses_tracefs_lifecycle_loss_with_actionable_remediation() {
-        let mut state = ();
-        let error = attach_lifecycle_with::<_, ()>(
-            &mut state,
-            true,
-            |_, _| {
-                Err(
-                    aya::programs::ProgramError::IOError(io::Error::other("tracefs not found"))
-                        .into(),
-                )
-            },
-            |_, _, _| Ok(()),
-        )
-        .unwrap_err();
-        let rendered = format!("{error:#}");
-
-        assert!(rendered.contains("owned run"));
-        assert!(rendered.contains("tracefs"));
-        assert!(rendered.contains("root"));
-        assert!(rendered.contains("gid="));
-        assert!(rendered.contains("0750"));
-        assert!(rendered.contains("tracefs not found"));
-        assert!(error.downcast_ref::<ProgramError>().is_some());
-    }
-
-    #[test]
-    fn non_tracefs_lifecycle_error_stays_fail_closed() {
-        let mut state = ();
-        let error = attach_lifecycle_with::<_, ()>(
-            &mut state,
-            false,
-            |_, _| {
-                Err(ProgramError::SyscallError(aya::sys::SyscallError {
-                    call: "perf_event_open_trace_point",
-                    io_error: io::Error::from_raw_os_error(libc::EPERM),
-                })
-                .into())
-            },
-            |_, _, _| Ok(()),
-        )
-        .unwrap_err();
-
-        assert!(format!("{error:#}").contains("Operation not permitted"));
     }
 
     #[test]
@@ -2575,31 +3746,39 @@ mod tests {
     #[test]
     fn discovery_counter_snapshots_are_absolute_and_regressions_fail_closed() {
         let cells: [&[u64]; 5] = [&[1, 2], &[3, 4], &[5, 6], &[7, 8], &[9, 10]];
-        let first = counter_snapshot_with(|index| {
-            Ok(cells[index as usize]
-                .iter()
-                .copied()
-                .fold(0u64, u64::saturating_add))
-        })
+        let first = counter_snapshot_with(
+            |index| {
+                Ok(cells[index as usize]
+                    .iter()
+                    .copied()
+                    .fold(0u64, u64::saturating_add))
+            },
+            2,
+        )
         .unwrap();
         assert_eq!(first.ring_loss, 3);
         assert_eq!(first.export_state_failures, 7);
         assert_eq!(first.export_bounded_read_failures, 11);
         assert_eq!(first.loader_hits, 15);
         assert_eq!(first.loader_state_read_failures, 19);
+        assert_eq!(first.abi_refusals, 2);
 
         let mut retained = CounterSnapshot::default();
         assert!(retained.replace_with(first));
         assert_eq!(retained, first);
         let cells: [&[u64]; 5] = [&[2, 2], &[4, 4], &[6, 6], &[8, 8], &[10, 10]];
-        let next = counter_snapshot_with(|index| {
-            Ok(cells[index as usize]
-                .iter()
-                .copied()
-                .fold(0u64, u64::saturating_add))
-        })
+        let next = counter_snapshot_with(
+            |index| {
+                Ok(cells[index as usize]
+                    .iter()
+                    .copied()
+                    .fold(0u64, u64::saturating_add))
+            },
+            3,
+        )
         .unwrap();
         assert!(retained.replace_with(next));
+        assert_eq!(retained.abi_refusals, 3);
         assert_eq!(
             retained.loader_hits, 16,
             "absolute values are replaced, not added"
@@ -2610,6 +3789,10 @@ mod tests {
             ..next
         };
         assert!(!retained.replace_with(decreased));
+        assert!(!retained.replace_with(CounterSnapshot {
+            abi_refusals: next.abi_refusals - 1,
+            ..next
+        }));
         assert_eq!(
             retained, next,
             "a regressing cell retains the prior authority"
@@ -2618,35 +3801,106 @@ mod tests {
 
     #[test]
     fn return_failure_suppresses_its_entry_without_blocking_another_slot() {
-        let slots = [test_slot(0), test_slot(1)];
+        for (object_has_unsafe, target_abi, expected_entry) in [
+            (false, ElfAbi::Lp64, "p11_entry"),
+            (true, ElfAbi::Ilp32, "p11_entry_ia32"),
+        ] {
+            let slots = [test_slot(0), test_slot(1)];
+            let mut attempted = Vec::new();
+            let outcome = attach_targets_with(
+                &slots,
+                CapturePolicy::Allowlisted,
+                object_has_unsafe,
+                |_| Ok(target_abi),
+                |program, slot, _| {
+                    attempted.push((program, slot.index));
+                    if program == "p11_return" && slot.index == 0 {
+                        anyhow::bail!("injected return failure")
+                    }
+                    Ok(())
+                },
+                |_| Some(10),
+            )
+            .unwrap();
+
+            assert_eq!(
+                outcome.successful,
+                [(1, ProbeSide::Return), (1, ProbeSide::Entry)]
+                    .into_iter()
+                    .collect(),
+                "slot 1 gets its entry/return pair"
+            );
+            assert_eq!(outcome.failures.len(), 1);
+            assert_eq!(outcome.failures[0].0, 0);
+            assert_eq!(outcome.completed, [(1, Some(10))]);
+            assert_eq!(
+                attempted,
+                [("p11_return", 0), ("p11_return", 1), (expected_entry, 1),]
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostic_mixed_targets_select_one_width_matched_entry_each() {
+        let mut dependency = test_slot(1);
+        dependency.object = PinnedObjectId(1);
+        let slots = [test_slot(0), dependency];
         let mut attempted = Vec::new();
         let outcome = attach_targets_with(
             &slots,
             CapturePolicy::Allowlisted,
-            |program, slot| {
+            true,
+            |slot| {
+                Ok(if slot.object == crate::plan::TEST_PINNED_OBJECT {
+                    ElfAbi::Lp64
+                } else {
+                    ElfAbi::Ilp32
+                })
+            },
+            |program, slot, _| {
                 attempted.push((program, slot.index));
-                if program == "p11_return" && slot.index == 0 {
-                    anyhow::bail!("injected return failure")
-                }
                 Ok(())
             },
             |_| Some(10),
-        );
+        )
+        .unwrap();
 
         assert_eq!(
-            outcome.successful,
-            [(1, ProbeSide::Return), (1, ProbeSide::Entry)]
-                .into_iter()
-                .collect(),
-            "slot 1 gets its entry/return pair"
-        );
-        assert_eq!(outcome.failures.len(), 1);
-        assert_eq!(outcome.failures[0].0, 0);
-        assert_eq!(outcome.completed, [(1, Some(10))]);
-        assert_eq!(
             attempted,
-            [("p11_return", 0), ("p11_return", 1), ("p11_entry", 1),]
+            [
+                ("p11_return", 0),
+                ("p11_return", 1),
+                ("p11_entry", 0),
+                ("p11_entry_ia32", 1),
+            ]
         );
+        assert_eq!(outcome.completed, [(0, Some(10)), (1, Some(10))]);
+    }
+
+    #[test]
+    fn missing_pinned_target_abi_refuses_before_any_return_attach() {
+        let slots = [test_slot(0), test_slot(1)];
+        let mut attempted = Vec::new();
+        let error = attach_targets_with(
+            &slots,
+            CapturePolicy::Allowlisted,
+            true,
+            |slot| {
+                if slot.index == 1 {
+                    anyhow::bail!("object was not pinned")
+                }
+                Ok(ElfAbi::Lp64)
+            },
+            |program, slot, _| {
+                attempted.push((program, slot.index));
+                Ok(())
+            },
+            |_| Some(10),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "object was not pinned");
+        assert!(attempted.is_empty());
     }
 
     #[test]
@@ -2654,14 +3908,17 @@ mod tests {
         let outcome = attach_targets_with(
             &[test_slot(0)],
             CapturePolicy::Allowlisted,
-            |program, _| {
+            false,
+            |_| Ok(ElfAbi::Lp64),
+            |program, _, _| {
                 if program == "p11_entry" {
                     anyhow::bail!("injected entry failure")
                 }
                 Ok(())
             },
             |_| Some(10),
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             outcome.successful,
@@ -2679,7 +3936,9 @@ mod tests {
         let outcome = attach_targets_with(
             &slots,
             CapturePolicy::Allowlisted,
-            |program, slot| {
+            false,
+            |_| Ok(ElfAbi::Lp64),
+            |program, slot, _| {
                 events.borrow_mut().push((program, slot.index));
                 Ok(())
             },
@@ -2689,7 +3948,8 @@ mod tests {
                 events.borrow_mut().push(("completed", slot.index));
                 Some(now)
             },
-        );
+        )
+        .unwrap();
 
         assert_eq!(outcome.completed, [(0, Some(20)), (1, Some(30))]);
         assert_eq!(
@@ -2711,18 +3971,24 @@ mod tests {
         let initial = attach_targets_with(
             &[test_slot(0)],
             CapturePolicy::Allowlisted,
-            |_, _| Ok(()),
+            false,
+            |_| Ok(ElfAbi::Lp64),
+            |_, _, _| Ok(()),
             |_| Some(10),
-        );
+        )
+        .unwrap();
         let mut history = initial.successful;
         assert_eq!(history.len(), 2);
 
         let replacement = attach_targets_with(
             &[test_slot(0)],
             CapturePolicy::Allowlisted,
-            |_, _| Ok(()),
+            false,
+            |_| Ok(ElfAbi::Lp64),
+            |_, _, _| Ok(()),
             |_| Some(20),
-        );
+        )
+        .unwrap();
         history.extend(replacement.successful);
         assert_eq!(
             history.len(),
@@ -2733,102 +3999,143 @@ mod tests {
         let new_slot = attach_targets_with(
             &[test_slot(1)],
             CapturePolicy::Allowlisted,
-            |_, _| Ok(()),
+            false,
+            |_| Ok(ElfAbi::Lp64),
+            |_, _, _| Ok(()),
             |_| Some(30),
-        );
+        )
+        .unwrap();
         history.extend(new_slot.successful);
         assert_eq!(history.len(), 4);
     }
 
     #[test]
     fn terminal_detach_orders_every_static_and_dynamic_link_and_keeps_going_after_error() {
-        let mut safe = Vec::new();
-        detach_producers_with(CapturePolicy::Allowlisted, false, |producer| {
-            safe.push(producer);
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(
-            safe,
-            [
-                ProducerProgram::UProbe("p11_entry"),
-                ProducerProgram::UProbe("p11_return"),
-            ]
-        );
-
-        let mut aggregate = Vec::new();
-        detach_producers_with(CapturePolicy::AggregateOnly, false, |producer| {
-            aggregate.push(producer);
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(aggregate, safe);
-
-        let mut unsafe_cgroup = Vec::new();
-        detach_producers_with(CapturePolicy::UnsafeUnvalidatedMetadata, true, |producer| {
-            unsafe_cgroup.push(producer);
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(
-            unsafe_cgroup,
-            [
-                ProducerProgram::UProbe("p11_entry"),
-                ProducerProgram::UProbe("p11_entry_template"),
-                ProducerProgram::UProbe("p11_entry_template_types"),
-                ProducerProgram::UProbe("p11_entry_template_pair"),
-                ProducerProgram::TracePoint("task_newtask"),
-                ProducerProgram::UProbe("p11_return"),
-            ]
-        );
-
         let mut attempted = Vec::new();
-        let error = detach_producers_with(
-            CapturePolicy::UnsafeUnvalidatedMetadata,
-            false,
-            |producer| {
-                attempted.push(producer);
-                if producer == ProducerProgram::UProbe("p11_entry_template") {
-                    anyhow::bail!("injected detach failure");
-                }
-                Ok(())
-            },
-        )
-        .unwrap_err();
-        assert_eq!(error.to_string(), "injected detach failure");
-        assert_eq!(
-            attempted,
-            [
-                ProducerProgram::UProbe("p11_entry"),
-                ProducerProgram::UProbe("p11_entry_template"),
-                ProducerProgram::UProbe("p11_entry_template_types"),
-                ProducerProgram::UProbe("p11_entry_template_pair"),
-                ProducerProgram::UProbe("p11_return"),
-            ]
-        );
-
-        let mut links = Vec::new();
         let errors = detach_selected_with(
             vec![
-                (ProducerProgram::UProbe("p11_return"), 0),
-                (ProducerProgram::UProbe("p11_entry"), 1),
-                (ProducerProgram::UProbe("p11_entry"), 2),
-                (ProducerProgram::UProbe("p11_return"), 3),
+                (ProducerProgram::UProbe("p11_return"), "return-2"),
+                (
+                    ProducerProgram::UProbe("interface_list_entry"),
+                    "interface-list-entry-1",
+                ),
+                (
+                    ProducerProgram::UProbe("interface_list_return"),
+                    "interface-list-return-1",
+                ),
+                (ProducerProgram::BtfTracePoint("task_newtask"), "newtask-2"),
+                (
+                    ProducerProgram::UProbe("p11_entry_template_pair"),
+                    "template-pair-2",
+                ),
+                (ProducerProgram::UProbe("dl_debug_state"), "loader-1"),
+                (ProducerProgram::UProbe("p11_entry"), "lp64-entry-2"),
+                (
+                    ProducerProgram::UProbe("function_list_entry"),
+                    "function-list-entry-1",
+                ),
+                (
+                    ProducerProgram::UProbe("function_list_return"),
+                    "function-list-return-1",
+                ),
+                (
+                    ProducerProgram::UProbe("p11_entry_template_types"),
+                    "template-types-1",
+                ),
+                (
+                    ProducerProgram::UProbe("interface_entry"),
+                    "interface-entry-1",
+                ),
+                (
+                    ProducerProgram::UProbe("interface_return"),
+                    "interface-return-1",
+                ),
+                (ProducerProgram::UProbe("p11_entry_ia32"), "ilp32-entry-1"),
+                (ProducerProgram::UProbe("p11_entry_template"), "template-2"),
+                (
+                    ProducerProgram::UProbe("interface_list_entry"),
+                    "interface-list-entry-2",
+                ),
+                (
+                    ProducerProgram::UProbe("interface_list_return"),
+                    "interface-list-return-2",
+                ),
+                (ProducerProgram::UProbe("p11_return"), "return-1"),
+                (
+                    ProducerProgram::UProbe("p11_entry_template_pair"),
+                    "template-pair-1",
+                ),
+                (ProducerProgram::UProbe("dl_debug_state"), "loader-2"),
+                (ProducerProgram::UProbe("p11_entry"), "lp64-entry-1"),
+                (
+                    ProducerProgram::UProbe("function_list_entry"),
+                    "function-list-entry-2",
+                ),
+                (
+                    ProducerProgram::UProbe("function_list_return"),
+                    "function-list-return-2",
+                ),
+                (
+                    ProducerProgram::UProbe("p11_entry_template_types"),
+                    "template-types-2",
+                ),
+                (ProducerProgram::BtfTracePoint("task_newtask"), "newtask-1"),
+                (
+                    ProducerProgram::UProbe("interface_entry"),
+                    "interface-entry-2",
+                ),
+                (
+                    ProducerProgram::UProbe("interface_return"),
+                    "interface-return-2",
+                ),
+                (ProducerProgram::UProbe("p11_entry_ia32"), "ilp32-entry-2"),
+                (ProducerProgram::UProbe("p11_entry_template"), "template-1"),
             ],
             |link| {
-                links.push(link);
-                if link == 1 {
-                    anyhow::bail!("injected dynamic-link detach failure")
+                attempted.push(link);
+                if link == "template-types-1" {
+                    anyhow::bail!("injected detach failure")
                 }
                 Ok(())
             },
         );
         assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].to_string(), "injected detach failure");
         assert_eq!(
-            links,
-            [1, 2, 0, 3],
-            "both dynamic links are attempted after one fails"
+            attempted,
+            [
+                "lp64-entry-2",
+                "lp64-entry-1",
+                "ilp32-entry-1",
+                "ilp32-entry-2",
+                "template-2",
+                "template-1",
+                "template-types-1",
+                "template-types-2",
+                "template-pair-2",
+                "template-pair-1",
+                "newtask-2",
+                "newtask-1",
+                "return-2",
+                "return-1",
+                "interface-list-entry-1",
+                "interface-list-return-1",
+                "loader-1",
+                "function-list-entry-1",
+                "function-list-return-1",
+                "interface-entry-1",
+                "interface-return-1",
+                "interface-list-entry-2",
+                "interface-list-return-2",
+                "loader-2",
+                "function-list-entry-2",
+                "function-list-return-2",
+                "interface-entry-2",
+                "interface-return-2",
+            ],
+            "every registered link is attempted once and paired entries precede returns"
         );
+        assert_eq!(attempted.iter().copied().collect::<BTreeSet<_>>().len(), 28);
     }
 
     #[test]
@@ -2900,23 +4207,47 @@ mod tests {
 
     #[test]
     fn safe_capture_entry_program_selection_never_uses_unsafe_templates() {
+        let diagnostic = |semantics, policy, abi| entry_program(semantics, policy, true, abi);
         assert_eq!(
-            entry_program(&SlotSemantics::COUNT_ONLY, CapturePolicy::Allowlisted),
+            diagnostic(
+                &SlotSemantics::COUNT_ONLY,
+                CapturePolicy::Allowlisted,
+                ElfAbi::Lp64,
+            ),
             "p11_entry"
         );
+        for policy in [
+            CapturePolicy::Allowlisted,
+            CapturePolicy::AggregateOnly,
+            CapturePolicy::UnsafeUnvalidatedMetadata,
+        ] {
+            assert_eq!(
+                diagnostic(&SlotSemantics::COUNT_ONLY, policy, ElfAbi::Ilp32),
+                "p11_entry_ia32"
+            );
+            assert_eq!(
+                entry_program(&SlotSemantics::COUNT_ONLY, policy, false, ElfAbi::Ilp32),
+                "p11_entry",
+                "the default object keeps its mixed-ABI ordinary entry"
+            );
+        }
 
         let mut template = SlotSemantics::COUNT_ONLY;
         template.template0_arg = 1;
         assert_eq!(
-            entry_program(&template, CapturePolicy::UnsafeUnvalidatedMetadata),
+            diagnostic(
+                &template,
+                CapturePolicy::UnsafeUnvalidatedMetadata,
+                ElfAbi::Lp64,
+            ),
             "p11_entry_template"
         );
         assert_eq!(
-            entry_program(&template, CapturePolicy::Allowlisted),
+            diagnostic(&template, CapturePolicy::Allowlisted, ElfAbi::Lp64),
             "p11_entry"
         );
         assert_eq!(
-            entry_program(&template, CapturePolicy::AggregateOnly),
+            diagnostic(&template, CapturePolicy::AggregateOnly, ElfAbi::Lp64),
             "p11_entry"
         );
 
@@ -2924,7 +4255,11 @@ mod tests {
         second_template.template0_arg = 2;
         second_template.template1_arg = 4;
         assert_eq!(
-            entry_program(&second_template, CapturePolicy::UnsafeUnvalidatedMetadata),
+            diagnostic(
+                &second_template,
+                CapturePolicy::UnsafeUnvalidatedMetadata,
+                ElfAbi::Ilp32,
+            ),
             "p11_entry_template_pair"
         );
 
@@ -2932,7 +4267,11 @@ mod tests {
         types_only.template0_arg = 2;
         types_only.semantic_flags = p11scope_ebpf_common::semantic_flags::TEMPLATE0_TYPES_ONLY;
         assert_eq!(
-            entry_program(&types_only, CapturePolicy::UnsafeUnvalidatedMetadata),
+            diagnostic(
+                &types_only,
+                CapturePolicy::UnsafeUnvalidatedMetadata,
+                ElfAbi::Ilp32,
+            ),
             "p11_entry_template_types"
         );
 
@@ -2940,8 +4279,12 @@ mod tests {
         async_call.async_name_arg = 1;
         assert_ne!(async_call.async_name_arg, ARG_NONE);
         assert_eq!(
-            entry_program(&async_call, CapturePolicy::UnsafeUnvalidatedMetadata),
-            "p11_entry"
+            diagnostic(
+                &async_call,
+                CapturePolicy::UnsafeUnvalidatedMetadata,
+                ElfAbi::Ilp32,
+            ),
+            "p11_entry_ia32"
         );
     }
 

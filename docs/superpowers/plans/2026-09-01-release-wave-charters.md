@@ -18,9 +18,10 @@ Shared inputs for all waves: the release PRD
 "checklist N" = its `## Top 10 hardening checklist` (1–10); "item #N" = its
 tier-section bullets (`#1`–`#22`). Every citation below names its scheme.
 
-**Evidence staleness rule:** W5/W6 evidence is gathered when those waves run,
-but W7 still changes the uprobe read path afterwards — so W5/W6 results are
-*provisional*; the release evidence is W8's final-tip requalification set.
+**Evidence staleness rule:** W5/W6 evidence is gathered when those waves run
+and remains *provisional*; the release evidence is W8's final-tip
+requalification set. Any later change to a qualified path requires its
+affected checks to run again.
 Spec §3.3/§6 "on the release tip" is satisfied by W8, not by W5/W6.
 
 **Latest owner amendment (2026-09-07, after ABI research):** Proper ia32
@@ -319,6 +320,20 @@ tip. The compat bpftrace gate alone does not establish product qualification.
 ## W8 — Release assembly {#w8}
 
 **Objective:** the ready-to-publish bundle; everything in PRD §9 checked.
+
+**W8-A — final architecture and maintainability closure (owner amendment,
+2026-09-07):** mandatory before final qualification and assembly. Review BPF,
+Rust userspace, supporting scripts and tests for correctness gaps, duplication,
+unnecessary complexity, weak ownership boundaries and testability. Use Astra
+xhigh for the architectural analysis and independent design challenge; the
+primary retains requirements, integration decisions and acceptance. Implement
+and independently review justified redesigns and fixes, beginning during W7.
+The [architecture design](../specs/2026-09-07-final-architecture-and-test-design.md)
+defines native-language tests, preserved oracles and migration constraints.
+Close the [accepted findings/gap ledger](2026-09-07-architecture-closure.md#verified-baseline-and-findings-ledger)
+on the integrated candidate, then rerun
+all affected product/kernel/ABI/container checks on the final code. A source
+review or file reorganization does not replace runtime qualification.
 
 **Scope:** **final-tip requalification set** (the release evidence — W5/W6
 rows were provisional per the staleness rule): container lanes, the

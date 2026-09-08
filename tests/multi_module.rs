@@ -27,6 +27,7 @@ fn module(
         mount_namespace: MountNamespaceId { device: 1, inode },
         key: key(inode),
         path: path.to_string(),
+        decoder_abi: Some(p11scope_manifest::elf::ElfAbi::Lp64),
         exports: vec!["C_GetFunctionList".into()],
         tables: vec![ScannedTable {
             version: (2, 40),

@@ -18,3 +18,4 @@ small-discovery-ring = []
 
 [dependencies]
 aya = { version = "=0.14.0", optional = true }
+pkcs11-module = { git = "https://github.com/mingulov/pkcs11-proxy-ng", rev = "cbf3d019c43cf424d92a5d2033c6714c9f866f65", default-features = false }

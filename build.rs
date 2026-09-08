@@ -21,6 +21,12 @@ use std::{env, path::PathBuf, process::Command};
 
 fn main() {
     println!("cargo:rerun-if-changed=crates/ebpf/src");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity.c");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity.h");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/task_owner.c");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/task_owner.h");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/root_affiliation.c");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/root_affiliation.h");
     println!("cargo:rerun-if-changed=crates/ebpf/Cargo.toml");
     println!("cargo:rerun-if-changed=crates/ebpf/Cargo.lock");
     println!("cargo:rerun-if-changed=crates/ebpf/rust-toolchain.toml");
@@ -55,6 +61,68 @@ fn main() {
         _ => "bpfel-unknown-none",
     };
 
+    let native_bitcode = out_dir.join("image_identity.bc");
+    let status = Command::new("clang-18")
+        .args([
+            "-target",
+            if target.starts_with("bpfeb") {
+                "bpfeb"
+            } else {
+                "bpfel"
+            },
+            "-O2",
+            "-g",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-emit-llvm",
+            "-c",
+        ])
+        .arg(manifest_dir.join("crates/ebpf/native/image_identity.c"))
+        .arg("-o")
+        .arg(&native_bitcode)
+        .status()
+        .expect("failed to spawn clang-18 for image identity");
+    assert!(
+        status.success(),
+        "building native image identity failed: {status}"
+    );
+
+    let owner_bitcode = out_dir.join("task_owner.bc");
+    let root_bitcode = out_dir.join("root_affiliation.bc");
+    for (unit, bitcode) in [
+        ("task_owner", &owner_bitcode),
+        ("root_affiliation", &root_bitcode),
+    ] {
+        let mut compile = Command::new("clang-18");
+        compile
+            .args([
+                "-target",
+                if target.starts_with("bpfeb") {
+                    "bpfeb"
+                } else {
+                    "bpfel"
+                },
+                "-O2",
+                "-g",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-emit-llvm",
+                "-c",
+            ])
+            .arg(manifest_dir.join(format!("crates/ebpf/native/{unit}.c")))
+            .arg("-o")
+            .arg(bitcode);
+        if small_state_maps {
+            compile.arg("-DP11SCOPE_SMALL_STATE_MAPS");
+        }
+        let status = compile
+            .status()
+            .expect("failed to spawn clang-18 for native state");
+        assert!(status.success(), "building native {unit} failed: {status}");
+    }
+
     let ebpf_manifest = manifest_dir.join("crates/ebpf/Cargo.toml");
     let target_dir = out_dir.join("ebpf-target");
     let mut cmd = Command::new("cargo");
@@ -82,9 +150,55 @@ fn main() {
     if small_discovery_ring {
         features.push("small-discovery-ring");
     }
+    let mut flags = env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default();
+    let mut append_flag = |flag: &str| {
+        if !flags.is_empty() {
+            flags.push('\u{1f}');
+        }
+        flags.push_str(flag);
+    };
+    // Native task storage and typed tracepoint require BTF/CO-RE in every build.
+    for flag in [
+        "-C",
+        "linker=bpf-linker",
+        "-C",
+        "debuginfo=2",
+        "-C",
+        "link-arg=--btf",
+        "-C",
+        "link-arg=--export=p11_link_current_identity",
+        "-C",
+        "link-arg=--export=p11_link_fork_allowed",
+        "-C",
+        "link-arg=--export=p11_link_emit_fork",
+        "-C",
+        "link-arg=--export=task_newtask",
+    ] {
+        append_flag(flag);
+    }
+    append_flag("-C");
+    append_flag(&format!("link-arg={}", native_bitcode.display()));
+    append_flag("-C");
+    append_flag(&format!("link-arg={}", owner_bitcode.display()));
+    append_flag("-C");
+    append_flag(&format!("link-arg={}", root_bitcode.display()));
+    for symbol in ["START", "DISCOVERY_STATE"] {
+        append_flag("-C");
+        append_flag(&format!("link-arg=--export={symbol}"));
+    }
     if env::var_os("CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA").is_some() {
         features.push("unsafe-unvalidated-metadata");
+        // Preserve separately verified diagnostic helpers and their BTF signatures.
+        for flag in [
+            "-C",
+            "link-arg=--export=p11_decode_params",
+            "-C",
+            "link-arg=--export=p11_walk_template",
+        ] {
+            append_flag(flag);
+        }
     }
+    cmd.env("CARGO_ENCODED_RUSTFLAGS", flags);
     if !features.is_empty() {
         cmd.arg("--features").arg(features.join(","));
     }

@@ -29,3 +29,5 @@ pub use run::{OwnedRunOutcome, capture, run_owned};
 /// as ELF in place.
 pub static EBPF_OBJECT: &[u8] =
     aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/p11scope-ebpf"));
+
+pub(crate) mod history;

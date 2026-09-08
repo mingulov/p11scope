@@ -293,9 +293,17 @@ impl AttachPlan {
         manifests: &[Manifest],
         pinned: &PinnedObjects,
     ) -> AttachPlan {
-        self.rebuild_from_sources_with(scanned, manifests, |key, path| {
-            pinned.id_for_manifest(key, path)
-        })
+        self.rebuild_from_sources_with(
+            scanned,
+            manifests,
+            |key, path| pinned.id_for_manifest(key, path),
+            |provider, target| {
+                matches!(
+                    (pinned.abi_for(provider), pinned.abi_for(target)),
+                    (Some(provider), Some(target)) if provider == target
+                )
+            },
+        )
     }
 
     fn rebuild_from_sources_with(
@@ -303,11 +311,13 @@ impl AttachPlan {
         scanned: &[ReconciledModule],
         manifests: &[Manifest],
         pinned_id: impl FnMut(ObjectKey, &str) -> Option<PinnedObjectId>,
+        compatible: impl FnMut(PinnedObjectId, PinnedObjectId) -> bool,
     ) -> AttachPlan {
         let mut rebuilt = build_from_sources_with(
             scanned,
             manifests,
             pinned_id,
+            compatible,
             self.slots.len(),
             &self.slot_by_key,
         );
@@ -1314,6 +1324,12 @@ pub fn build_from_sources(
         scanned,
         manifests,
         |key, path| pinned.id_for_manifest(key, path),
+        |provider, target| {
+            matches!(
+                (pinned.abi_for(provider), pinned.abi_for(target)),
+                (Some(provider), Some(target)) if provider == target
+            )
+        },
         0,
         &BTreeMap::new(),
     )
@@ -1323,13 +1339,14 @@ fn build_from_sources_with(
     scanned: &[ReconciledModule],
     manifests: &[Manifest],
     mut pinned_id: impl FnMut(ObjectKey, &str) -> Option<PinnedObjectId>,
+    mut compatible: impl FnMut(PinnedObjectId, PinnedObjectId) -> bool,
     allocated_slots: usize,
     existing_slots: &BTreeMap<AttachKey, usize>,
 ) -> AttachPlan {
     let mut discovered: Vec<Discovered<'_>> = scanned.iter().map(lower_scanned).collect();
     let mut orphaned = Vec::new();
     for manifest in manifests {
-        let (module, skipped) = lower_manifest(manifest, &mut pinned_id);
+        let (module, skipped) = lower_manifest(manifest, &mut pinned_id, &mut compatible);
         discovered.extend(module);
         orphaned.extend(skipped);
     }
@@ -1356,6 +1373,7 @@ fn build_from_test_sources(scanned: &[ReconciledModule], manifests: &[Manifest])
         scanned,
         manifests,
         |key, _| u32::try_from(key.inode).ok().map(PinnedObjectId),
+        |_, _| true,
         0,
         &BTreeMap::new(),
     )
@@ -1488,7 +1506,7 @@ fn build(m: &Manifest) -> AttachPlan {
         let next = PinnedObjectId(ids.len() as u32);
         ids.entry(key).or_insert(next);
     }
-    let (discovered, orphaned) = lower_manifest(m, |key, _| ids.get(&key).copied());
+    let (discovered, orphaned) = lower_manifest(m, |key, _| ids.get(&key).copied(), |_, _| true);
     let mut plan = merge(
         discovered.into_iter().collect(),
         m.vendor_interfaces.len(),
@@ -1503,6 +1521,7 @@ fn build(m: &Manifest) -> AttachPlan {
 fn lower_manifest(
     m: &Manifest,
     mut pinned_id: impl FnMut(ObjectKey, &str) -> Option<PinnedObjectId>,
+    mut compatible: impl FnMut(PinnedObjectId, PinnedObjectId) -> bool,
 ) -> (Option<Discovered<'_>>, Vec<Skipped>) {
     let mut tables = Vec::new();
     let mut surfaces = Vec::new();
@@ -1558,6 +1577,22 @@ fn lower_manifest(
                         ));
                         continue;
                     };
+                    if let Some(provider) = m
+                        .objects
+                        .iter()
+                        .find(|candidate| candidate.path == m.module_path)
+                        .and_then(|candidate| {
+                            object_key(m, candidate).and_then(|key| pinned_id(key, &candidate.path))
+                        })
+                    {
+                        if !compatible(provider, object) {
+                            skip(format!(
+                                "object id {} has a different target ABI from the provider",
+                                record.id
+                            ));
+                            continue;
+                        }
+                    }
                     targets.push(Target {
                         name: &f.name,
                         object,
@@ -1586,12 +1621,13 @@ fn lower_manifest(
     let Some(module_record) = m.objects.iter().find(|o| o.path == m.module_path) else {
         return (None, skipped);
     };
-    let Some(object) = pinned_id(key, &module_record.path) else {
+    let Some(module_object) = pinned_id(key, &module_record.path) else {
         return (None, skipped);
     };
+
     (
         Some(Discovered {
-            object,
+            object: module_object,
             // Informational only: every target carries the key of the object it
             // resolved into, which for a forwarded entry is a dependency, not this.
             key,
@@ -1707,6 +1743,7 @@ mod tests {
                 },
                 key,
                 path: path.into(),
+                decoder_abi: Some(p11scope_manifest::elf::ElfAbi::Lp64),
                 exports: vec!["C_GetFunctionList".into()],
                 tables: vec![ScannedTable {
                     version: (2, 40),
@@ -1857,6 +1894,7 @@ mod tests {
             std::slice::from_ref(&scanned),
             std::slice::from_ref(&manifest),
             |_, _| Some(manifest_object),
+            |_, _| true,
             0,
             &BTreeMap::new(),
         );
@@ -1880,6 +1918,22 @@ mod tests {
             crate::kinds::descriptor("C_Sign").unwrap()
         );
         assert!(manifest_slot.semantic_authorized);
+    }
+
+    #[test]
+    fn manifest_target_with_a_different_provider_abi_is_skipped() {
+        let manifest = manifest_with(vec![resolved("C_Sign", 0x10)]);
+        let plan = build_from_sources_with(
+            &[],
+            std::slice::from_ref(&manifest),
+            |_, _| Some(PinnedObjectId(1)),
+            |_, _| false,
+            0,
+            &BTreeMap::new(),
+        );
+        assert!(plan.slots.is_empty());
+        assert_eq!(plan.entries_seen, 1);
+        assert!(plan.skipped[0].reason.contains("different target ABI"));
     }
 
     #[test]

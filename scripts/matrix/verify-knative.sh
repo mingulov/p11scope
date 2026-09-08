@@ -82,6 +82,7 @@ EVIDENCE_OWNED=0
 LANE13_OUTER_EXIT_ARMED=0
 LANE13_OUTER_PENDING_STATUS=
 FACTS=
+LANE13_START_LEDGER_ESTABLISHED=0
 . scripts/lib.sh
 require_non_root_caller
 
@@ -175,7 +176,7 @@ PY
         echo "lane-13 consumed tracked inputs are dirty" >&2; return 1;
     }
     lane13_untracked=$(git ls-files --others --exclude-standard -- \
-        .cargo src crates scripts spike Cargo.toml Cargo.lock build.rs)
+        .cargo src crates scripts spike third-party/aya Cargo.toml Cargo.lock build.rs)
     [ -z "$lane13_untracked" ] || { echo "lane-13 consumed input is untracked" >&2; return 1; }
     lane13_git_status_projection=$(python3 - "$lane13_git_status" <<'PY'
 import sys
@@ -189,8 +190,8 @@ PY
     lane13_kernel=$(uname -sr) || return 1
     lane13_cargo_stable=$(cargo +1.88 --version) || return 1
     lane13_rustc_stable=$(rustc +1.88 --version) || return 1
-    lane13_cargo_nightly=$(cargo +nightly --version) || return 1
-    lane13_rustc_nightly=$(rustc +nightly --version) || return 1
+    lane13_cargo_nightly=$(cargo +nightly-2026-05-20 --version) || return 1
+    lane13_rustc_nightly=$(rustc +nightly-2026-05-20 --version) || return 1
     lane13_python=$(python3 --version) || return 1
     lane13_gcc=$(gcc --version) || return 1
     lane13_docker_version=$(docker version --format '{{.Server.Version}}') || return 1
@@ -234,14 +235,20 @@ lane13_record_inputs() {
     lane13_input_phase=${1:-start}
     case $lane13_input_phase in start|end) ;; *) return 1 ;; esac
     lane13_input_ledger=$WORK/.lane13-inputs-$lane13_input_phase
-    git ls-files -z -- \
+    lane13_input_status=0
+    if git ls-files -z -- \
         Cargo.toml Cargo.lock build.rs \
-        src crates/discover crates/manifest crates/ebpf-common crates/ebpf \
+        src crates/discover crates/manifest crates/ebpf-common crates/ebpf third-party/aya \
         scripts/matrix/verify-knative.sh scripts/lib.sh scripts/cleanup-traps.sh \
         scripts/check-capture-evidence.py spike/expected.txt \
         scripts/matrix/Dockerfile.knative scripts/matrix/knative-server.py spike/harness.c \
-        > "$WORK/.lane13-inputs-list"
-    python3 - "$FACTS" "$WORK/.lane13-inputs-list" "$lane13_input_ledger" "$lane13_input_phase" <<'PY'
+        > "$WORK/.lane13-inputs-list"; then
+        :
+    else
+        lane13_input_status=$?
+    fi
+    if [ "$lane13_input_status" -eq 0 ]; then
+        python3 - "$FACTS" "$WORK/.lane13-inputs-list" "$lane13_input_ledger" "$lane13_input_phase" <<'PY'
 import hashlib
 import os
 import sys
@@ -260,40 +267,73 @@ with open(ledger, "w", encoding="utf-8") as output:
 with open(facts, "a", encoding="utf-8") as output:
     output.write(open(ledger, encoding="utf-8").read())
 PY
+        lane13_input_status=$?
+    fi
     rm -f -- "$WORK/.lane13-inputs-list"
+    lane13_input_remove_status=$?
+    if [ "$lane13_input_status" -eq 0 ] && [ "$lane13_input_remove_status" -ne 0 ]; then
+        lane13_input_status=$lane13_input_remove_status
+    fi
+    return "$lane13_input_status"
 }
 
 lane13_record_facts() {
     lane13_facts_phase=${1:-start}
-    lane13_fact "facts_phase=$lane13_facts_phase"
-    lane13_fact "body_status=${BODY_STATUS:-unknown}"
-    lane13_fact "cleanup_status_at_phase_${lane13_facts_phase}=${CLEANUP_STATUS:-unknown}"
-    lane13_fact "work=$WORK"
-    lane13_fact "product=$PRODUCT"
-    lane13_fact "outer_argv=${P11SCOPE_LANE13_OUTER_ARGV:-unknown}"
-    lane13_fact "body_argv=$0"
+    lane13_fact "facts_phase=$lane13_facts_phase" || return 1
+    lane13_fact "body_status=${BODY_STATUS:-unknown}" || return 1
+    lane13_fact "cleanup_status_at_phase_${lane13_facts_phase}=${CLEANUP_STATUS:-unknown}" \
+        || return 1
+    lane13_fact "work=$WORK" || return 1
+    lane13_fact "product=$PRODUCT" || return 1
+    lane13_fact "outer_argv=${P11SCOPE_LANE13_OUTER_ARGV:-unknown}" || return 1
+    lane13_fact "body_argv=$0" || return 1
     lane13_git_phase=$lane13_facts_phase
     lane13_git_phase_head=$(git rev-parse HEAD) || return 1
     lane13_git_phase_tree=$(git rev-parse HEAD^{tree}) || return 1
     lane13_git_phase_status=$(git status --porcelain=v1) || return 1
-    lane13_git_phase_clean=1
-    git diff --quiet || lane13_git_phase_clean=0
-    lane13_git_phase_index_clean=1
-    git diff --cached --quiet || lane13_git_phase_index_clean=0
-    lane13_fact "git_head_${lane13_git_phase}=$lane13_git_phase_head"
-    lane13_fact "git_tree_${lane13_git_phase}=$lane13_git_phase_tree"
-    lane13_git_phase_status_projection=$(printf '%s\n' "$lane13_git_phase_status" | tr '\n' '|')
-    lane13_fact "git_status_${lane13_git_phase}=$lane13_git_phase_status_projection"
-    lane13_fact "git_worktree_clean_${lane13_git_phase}=$lane13_git_phase_clean"
-    lane13_fact "git_index_clean_${lane13_git_phase}=$lane13_git_phase_index_clean"
-    {
-        printf 'head=%s\n' "$lane13_git_phase_head"
-        printf 'tree=%s\n' "$lane13_git_phase_tree"
-        printf 'worktree_clean=%s\n' "$lane13_git_phase_clean"
-        printf 'index_clean=%s\n' "$lane13_git_phase_index_clean"
-        printf 'status_begin\n%s\nstatus_end\n' "$lane13_git_phase_status"
-    } > "$WORK/.lane13-git-$lane13_git_phase"
-    lane13_record_inputs "$lane13_facts_phase"
+    if git diff --quiet; then
+        lane13_git_phase_clean=1
+    else
+        lane13_git_diff_status=$?
+        [ "$lane13_git_diff_status" -eq 1 ] || return "$lane13_git_diff_status"
+        lane13_git_phase_clean=0
+    fi
+    if git diff --cached --quiet; then
+        lane13_git_phase_index_clean=1
+    else
+        lane13_git_diff_status=$?
+        [ "$lane13_git_diff_status" -eq 1 ] || return "$lane13_git_diff_status"
+        lane13_git_phase_index_clean=0
+    fi
+    lane13_fact "git_head_${lane13_git_phase}=$lane13_git_phase_head" || return 1
+    lane13_fact "git_tree_${lane13_git_phase}=$lane13_git_phase_tree" || return 1
+    lane13_git_phase_status_input=$WORK/.lane13-git-status-$lane13_git_phase
+    if printf '%s\n' "$lane13_git_phase_status" > "$lane13_git_phase_status_input"; then
+        :
+    else
+        lane13_git_phase_status_result=$?
+        rm -f -- "$lane13_git_phase_status_input"
+        return "$lane13_git_phase_status_result"
+    fi
+    if lane13_git_phase_status_projection=$(tr '\n' '|' < "$lane13_git_phase_status_input"); then
+        :
+    else
+        lane13_git_phase_status_result=$?
+        rm -f -- "$lane13_git_phase_status_input"
+        return "$lane13_git_phase_status_result"
+    fi
+    rm -f -- "$lane13_git_phase_status_input" || return $?
+    lane13_fact "git_status_${lane13_git_phase}=$lane13_git_phase_status_projection" \
+        || return 1
+    lane13_fact "git_worktree_clean_${lane13_git_phase}=$lane13_git_phase_clean" \
+        || return 1
+    lane13_fact "git_index_clean_${lane13_git_phase}=$lane13_git_phase_index_clean" \
+        || return 1
+    printf 'head=%s\ntree=%s\nworktree_clean=%s\nindex_clean=%s\nstatus_begin\n%s\nstatus_end\n' \
+        "$lane13_git_phase_head" "$lane13_git_phase_tree" \
+        "$lane13_git_phase_clean" "$lane13_git_phase_index_clean" \
+        "$lane13_git_phase_status" > "$WORK/.lane13-git-$lane13_git_phase" || return $?
+    lane13_record_inputs "$lane13_facts_phase" || return $?
 }
 
 lane13_compare_input_ledgers() {
@@ -784,9 +824,12 @@ lane13_fetch_release() {
     lane13_url=$1
     lane13_name=$2
     case $lane13_url:$lane13_name in
-        "https://github.com/knative/serving/releases/download/${KNATIVE_VERSION}/serving-crds.yaml:serving-crds.yaml"|\
-        "https://github.com/knative/serving/releases/download/${KNATIVE_VERSION}/serving-core.yaml:serving-core.yaml"|\
-        "https://github.com/knative-extensions/net-kourier/releases/download/${KNATIVE_VERSION}/kourier.yaml:kourier.yaml") ;;
+        "https://github.com/knative/serving/releases/download/${KNATIVE_VERSION}/serving-crds.yaml:serving-crds.yaml")
+            lane13_expected_sha256=b172ff4901ed50f8e4e09ff8616e54d22e264df7086ce8cb74f513a04812fe74 ;;
+        "https://github.com/knative/serving/releases/download/${KNATIVE_VERSION}/serving-core.yaml:serving-core.yaml")
+            lane13_expected_sha256=be3f16c9c0ac9276cc173ef04871aaeac78537f9edb116310caa02f016e9cbc2 ;;
+        "https://github.com/knative-extensions/net-kourier/releases/download/${KNATIVE_VERSION}/kourier.yaml:kourier.yaml")
+            lane13_expected_sha256=cded0c3c1d7669b1aa9f7484234b454ff3940a2b54a27d5ec4825c2d4003d01d ;;
         *) return 1 ;;
     esac
     mkdir -p "$WORK/releases"
@@ -816,6 +859,10 @@ PY
     case $lane13_size in ''|*[!0-9]*) return 1 ;; esac
     [ "$lane13_size" -gt 0 ] && [ "$lane13_size" -le 16777216 ] || return 1
     lane13_before=$(lane13_sha256 "$lane13_release") || return 1
+    if [ "$lane13_before" != "$lane13_expected_sha256" ]; then
+        echo "Knative release SHA256 mismatch: $lane13_name" >&2
+        return 1
+    fi
     lane13_fact "release_declared=$lane13_url"
     lane13_fact "release_effective=$lane13_safe_url"
     lane13_fact "release_redirects=$lane13_redirects"
@@ -828,8 +875,14 @@ PY
     fi
     lane13_after_size=$(stat -Lc %s "$lane13_release") || return 1
     lane13_after=$(lane13_sha256 "$lane13_release") || return 1
-    [ "$lane13_after_size" = "$lane13_size" ] || return 1
-    [ "$lane13_before" = "$lane13_after" ] || return 1
+    [ "$lane13_after_size" = "$lane13_size" ] || {
+        echo "Knative release changed during apply: $lane13_name" >&2
+        return 1
+    }
+    [ "$lane13_before" = "$lane13_after" ] || {
+        echo "Knative release changed during apply: $lane13_name" >&2
+        return 1
+    }
     python3 - "$FACTS" "$lane13_name" "$WORK/releases/.lane13-applied" <<'PY' || return 1
 import re
 import sys
@@ -1600,10 +1653,23 @@ PY
             cleanup_step lane13_fact kubeconfig_absent=0
         fi
     }
-    [ -z "${EVIDENCE-}" ] || cleanup_step lane13_record_facts end
-    [ -z "${EVIDENCE-}" ] || cleanup_step lane13_compare_input_ledgers \
-        "$WORK/.lane13-inputs-start" "$WORK/.lane13-inputs-end"
-    [ -z "${EVIDENCE-}" ] || cleanup_step cmp "$WORK/.lane13-git-start" "$WORK/.lane13-git-end"
+    if [ -z "${EVIDENCE-}" ]; then
+        :
+    elif [ "${LANE13_START_LEDGER_ESTABLISHED:-0}" -eq 1 ]; then
+        cleanup_step lane13_record_facts end
+        lane13_end_record_status=$cleanup_step_status
+        if [ "$lane13_end_record_status" -eq 0 ]; then
+            cleanup_step lane13_compare_input_ledgers \
+                "$WORK/.lane13-inputs-start" "$WORK/.lane13-inputs-end"
+            cleanup_step cmp "$WORK/.lane13-git-start" "$WORK/.lane13-git-end"
+            cleanup_step lane13_fact input_ledger_phase=complete
+        else
+            cleanup_step lane13_fact input_ledger_phase=failed-end
+        fi
+    else
+        cleanup_step lane13_fact input_ledger_phase=unavailable-start
+        [ "$BODY_STATUS" -ne 0 ] || cleanup_step false
+    fi
     if [ -n "${WORK_CREATED-}" ] \
         && [ "$PF_SESSION_EMPTY" -eq 1 ] \
         && [ "$CLUSTER_ABSENT" -eq 1 ] \
@@ -1653,7 +1719,12 @@ WORK_CREATED=1
 WORK_DEV_INO=$(stat -Lc '%d:%i' "$WORK")
 [ "$(stat -Lc %u "$WORK")" = "$(id -u)" ] && [ "$(stat -Lc %a "$WORK")" = 700 ]
 lane13_fact "work_dev_ino=$WORK_DEV_INO"
-lane13_record_facts start
+if lane13_record_facts start; then
+    LANE13_START_LEDGER_ESTABLISHED=1
+else
+    lane13_start_record_status=$?
+    exit "$lane13_start_record_status"
+fi
 timeout --signal=TERM --kill-after=5s 600s cargo +1.88 build --locked --release \
     --workspace --target-dir "$PRODUCT"
 lane13_record_file_fact p11scope "$PRODUCT/release/p11scope"

@@ -1,5 +1,6 @@
 use object::elf;
-use p11scope_manifest::elf::{ElfSnapshot, exports_matching, symbol_file_offset};
+use p11scope_manifest::elf::{ElfAbi, ElfSnapshot, exports_matching, symbol_file_offset};
+use std::os::unix::fs::FileExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -20,11 +21,16 @@ fn cc_so(dir: &Path, name: &str, source: &str) -> PathBuf {
 }
 
 fn cc_exe(dir: &Path, name: &str, source: &str) -> PathBuf {
+    cc_exe_width(dir, name, source, 64)
+}
+
+fn cc_exe_width(dir: &Path, name: &str, source: &str, bits: u8) -> PathBuf {
     std::fs::create_dir_all(dir).unwrap();
     let c = dir.join(format!("{name}.c"));
     let exe = dir.join(name);
     std::fs::write(&c, source).unwrap();
     let ok = Command::new("gcc")
+        .arg(format!("-m{bits}"))
         .args(["-rdynamic", "-o"])
         .arg(&exe)
         .arg(&c)
@@ -252,6 +258,195 @@ fn a_table_less_object_reports_no_registry_exports() {
 }
 
 #[test]
+fn conventional_lp64_and_ilp32_are_classified_and_mismatches_refused() {
+    let d = tmp("elf-abi");
+    let lp64 = cc_so(&d, "lp64", "int hook(void) { return 0; }\n");
+    let file = p11scope_manifest::identity::open_object(&lp64).unwrap();
+    assert_eq!(ElfSnapshot::read(&file).unwrap().abi(), ElfAbi::Lp64);
+    assert_eq!(
+        ElfSnapshot::read_with_reader(&file, |file, bytes, offset| { file.read_at(bytes, offset) })
+            .unwrap()
+            .abi(),
+        ElfAbi::Lp64
+    );
+
+    let ilp32 = d.join("ilp32.so");
+    let status = Command::new("gcc")
+        .args(["-m32", "-shared", "-fPIC", "-o"])
+        .arg(&ilp32)
+        .arg("-x")
+        .arg("c")
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write as _;
+            child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(b"int hook(void) { return 0; }\n")?;
+            child.wait()
+        })
+        .unwrap();
+    assert!(
+        status.success(),
+        "the W7 test environment requires gcc -m32"
+    );
+    let file = p11scope_manifest::identity::open_object(&ilp32).unwrap();
+    assert_eq!(ElfSnapshot::read(&file).unwrap().abi(), ElfAbi::Ilp32);
+    assert_eq!(
+        ElfSnapshot::read_with_reader(&file, |file, bytes, offset| { file.read_at(bytes, offset) })
+            .unwrap()
+            .abi(),
+        ElfAbi::Ilp32
+    );
+
+    for (name, class, machine) in [("x32", 1, elf::EM_X86_64), ("elf64-i386", 2, elf::EM_386)] {
+        let path = d.join(name);
+        let mut bytes = std::fs::read(if class == 1 { &ilp32 } else { &lp64 }).unwrap();
+        bytes[4] = class;
+        bytes[18..20].copy_from_slice(&machine.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        let file = p11scope_manifest::identity::open_object(&path).unwrap();
+        assert!(ElfSnapshot::read(&file).is_err(), "{name} must be refused");
+    }
+
+    let path = d.join("big-endian");
+    let mut bytes = std::fs::read(&lp64).unwrap();
+    bytes[5] = 2;
+    std::fs::write(&path, bytes).unwrap();
+    let file = p11scope_manifest::identity::open_object(&path).unwrap();
+    assert!(ElfSnapshot::read(&file).is_err());
+}
+
+#[test]
+fn virtual_symbol_accepts_bss_but_requires_complete_load_memory_span() {
+    let d = tmp("elf-bss-symbol");
+    for (bits, abi) in [(32, ElfAbi::Ilp32), (64, ElfAbi::Lp64)] {
+        let exe = cc_exe_width(
+            &d,
+            &format!("bss-state-{bits}"),
+            "unsigned int loader_state;\nint main(void) { return (int)loader_state; }\n",
+            bits,
+        );
+        let file = p11scope_manifest::identity::open_object(&exe).unwrap();
+        let snapshot = ElfSnapshot::read(&file).unwrap();
+        assert_eq!(snapshot.abi(), abi);
+        let address = snapshot
+            .defined_symbol_virtual_address("loader_state", 4)
+            .unwrap()
+            .unwrap();
+        assert_ne!(address, 0);
+        assert_eq!(snapshot.defined_symbol("loader_state").unwrap(), None);
+        assert!(
+            snapshot
+                .defined_symbol_virtual_address("loader_state", usize::MAX)
+                .is_err()
+        );
+
+        // Keep the symbol and section metadata intact while shortening only
+        // its PT_LOAD memory boundary to one byte short of the requested word.
+        let mut bytes = std::fs::read(&exe).unwrap();
+        let (phoff, phsize, phnum) = if bits == 32 {
+            (
+                u32::from_le_bytes(bytes[28..32].try_into().unwrap()) as usize,
+                le_u16(&bytes, 42) as usize,
+                le_u16(&bytes, 44) as usize,
+            )
+        } else {
+            (
+                le_u64(&bytes, 32) as usize,
+                le_u16(&bytes, 54) as usize,
+                le_u16(&bytes, 56) as usize,
+            )
+        };
+        let mut shortened = false;
+        for header in (0..phnum).map(|index| phoff + index * phsize) {
+            if u32::from_le_bytes(bytes[header..header + 4].try_into().unwrap()) != elf::PT_LOAD {
+                continue;
+            }
+            let (vaddr, memsz) = if bits == 32 {
+                (
+                    u32::from_le_bytes(bytes[header + 8..header + 12].try_into().unwrap()) as u64,
+                    u32::from_le_bytes(bytes[header + 20..header + 24].try_into().unwrap()) as u64,
+                )
+            } else {
+                (le_u64(&bytes, header + 16), le_u64(&bytes, header + 40))
+            };
+            if vaddr <= address && address + 4 <= vaddr + memsz {
+                let size = address + 3 - vaddr;
+                if bits == 32 {
+                    bytes[header + 20..header + 24].copy_from_slice(&(size as u32).to_le_bytes());
+                } else {
+                    bytes[header + 40..header + 48].copy_from_slice(&size.to_le_bytes());
+                }
+                shortened = true;
+            }
+        }
+        assert!(shortened);
+        std::fs::write(&exe, bytes).unwrap();
+        let file = p11scope_manifest::identity::open_object(&exe).unwrap();
+        assert_eq!(
+            ElfSnapshot::read(&file)
+                .unwrap()
+                .defined_symbol_virtual_address("loader_state", 4),
+            Ok(None)
+        );
+    }
+}
+
+#[test]
+fn ilp32_interpreter_rejects_malformed_paths_and_program_headers() {
+    let d = tmp("elf32-interpreter-refusals");
+    let exe = cc_exe_width(&d, "interpreter", "int main(void) { return 0; }\n", 32);
+    let original = std::fs::read(&exe).unwrap();
+    let phoff = u32::from_le_bytes(original[28..32].try_into().unwrap()) as usize;
+    let phsize = le_u16(&original, 42) as usize;
+    let phnum = le_u16(&original, 44) as usize;
+    let headers: Vec<_> = (0..phnum).map(|i| phoff + i * phsize).collect();
+    let header = *headers
+        .iter()
+        .find(|&&h| u32::from_le_bytes(original[h..h + 4].try_into().unwrap()) == elf::PT_INTERP)
+        .unwrap();
+    let offset = u32::from_le_bytes(original[header + 4..header + 8].try_into().unwrap()) as usize;
+    let size = u32::from_le_bytes(original[header + 16..header + 20].try_into().unwrap()) as usize;
+    let file = p11scope_manifest::identity::open_object(&exe).unwrap();
+    let snapshot = ElfSnapshot::read(&file).unwrap();
+    assert_eq!(snapshot.abi(), ElfAbi::Ilp32);
+    assert_eq!(
+        snapshot.interpreter(),
+        Some(&original[offset..offset + size - 1])
+    );
+
+    for case in [
+        "missing-nul",
+        "embedded-nul",
+        "empty",
+        "past-eof",
+        "duplicate",
+    ] {
+        let mut bytes = original.clone();
+        match case {
+            "missing-nul" => bytes[offset + size - 1] = b'X',
+            "embedded-nul" => bytes[offset + 1] = 0,
+            "empty" => bytes[header + 16..header + 20].copy_from_slice(&0_u32.to_le_bytes()),
+            "past-eof" => bytes[header + 4..header + 8].copy_from_slice(&u32::MAX.to_le_bytes()),
+            "duplicate" => {
+                let other = *headers.iter().find(|&&h| h != header).unwrap();
+                bytes.copy_within(header..header + phsize, other);
+            }
+            _ => unreachable!(),
+        }
+        assert_ne!(bytes, original);
+        let path = d.join(case);
+        std::fs::write(&path, bytes).unwrap();
+        let file = p11scope_manifest::identity::open_object(&path).unwrap();
+        assert!(ElfSnapshot::read(&file).is_err(), "accepted {case}");
+    }
+}
+
+#[test]
 fn non_elf_and_foreign_class_are_refused_with_a_named_reason() {
     let d = tmp("elf-refuse");
     let text = d.join("not-an-elf.so");
@@ -260,8 +455,7 @@ fn non_elf_and_foreign_class_are_refused_with_a_named_reason() {
     let error = exports_matching(&file, REGISTRY).unwrap_err();
     assert!(error.contains("ELF"), "{error}");
 
-    // 32-bit is a named refusal, not a misread (spec §4.2): build one if the
-    // multilib compiler is available, otherwise state that it was not covered.
+    // Conventional ia32 is an admitted W7 target and must use the same export path.
     let ok = Command::new("gcc")
         .args(["-m32", "-shared", "-fPIC", "-o"])
         .arg(d.join("m32.so"))
@@ -280,14 +474,10 @@ fn non_elf_and_foreign_class_are_refused_with_a_named_reason() {
         })
         .map(|s| s.success())
         .unwrap_or(false);
-    if !ok {
-        eprintln!("SKIP: no -m32 toolchain; ELFCLASS32 refusal not covered on this host");
-        return;
-    }
+    assert!(ok, "the W7 test environment requires gcc -m32");
     let file = p11scope_manifest::identity::open_object(&d.join("m32.so")).unwrap();
-    let error = exports_matching(&file, REGISTRY).unwrap_err();
-    assert!(
-        error.contains("x86-64") || error.contains("64-bit"),
-        "{error}"
+    assert_eq!(
+        exports_matching(&file, REGISTRY).unwrap()[0].0,
+        "C_GetFunctionList"
     );
 }

@@ -15,6 +15,11 @@ cd "$(dirname "$0")/.."
 
 ORACLE=scripts/fixtures/discover-manifest.jq
 SOFTHSM_FUNCTION_RECORDS=68
+# Official registry index digests acquired on 2026-09-08. Retain Rust 1.88
+# and Ubuntu 24.04; changing a tag must not silently change the build inputs.
+DISCOVER_GLIBC_BUILD_IMAGE=rust:1.88.0-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0
+DISCOVER_GLIBC_RUN_IMAGE=ubuntu:noble-20260810@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517
+DISCOVER_MUSL_IMAGE=rust:1.88.0-alpine@sha256:9dfaae478ecd298b6b5a039e1f2cc4fc040fc818a2de9aa78fa714dea036574d
 
 # Both container lanes assert the same two things: SoftHSM2 publishes exactly
 # 68 function records, and the deterministic version-matrix manifest satisfies
@@ -215,9 +220,9 @@ create_owned() {
     printf '%s\n' "$owned"
 }
 
-timeout --signal=TERM --kill-after=5s 300s docker pull -q ubuntu:24.04
-timeout --signal=TERM --kill-after=5s 300s docker pull -q rust:1.88.0-bookworm
-timeout --signal=TERM --kill-after=5s 300s docker pull -q rust:1.88.0-alpine
+timeout --signal=TERM --kill-after=5s 300s docker pull -q "$DISCOVER_GLIBC_RUN_IMAGE"
+timeout --signal=TERM --kill-after=5s 300s docker pull -q "$DISCOVER_GLIBC_BUILD_IMAGE"
+timeout --signal=TERM --kill-after=5s 300s docker pull -q "$DISCOVER_MUSL_IMAGE"
 
 # Vendored so container builds need no network (sandbox git quirks).
 # The vendor config is rewritten with absolute /src paths because it is
@@ -228,9 +233,9 @@ timeout --signal=TERM --kill-after=5s 600s \
 sed 's|directory = ".*"|directory = "/receipt/vendor/src"|' \
     "$DISCOVER_WORK/vendor/config.toml" > "$DISCOVER_WORK/vendor/config.container.toml"
 
-echo "=== glibc: build in rust:1.88.0-bookworm, run in ubuntu:24.04 ==="
+echo "=== glibc: build in $DISCOVER_GLIBC_BUILD_IMAGE, run in $DISCOVER_GLIBC_RUN_IMAGE ==="
 GLIBC_BUILD_ID=$(create_owned --name "$GLIBC_BUILD" \
-    -v "$PWD:/src:ro" -v "$DISCOVER_WORK:/receipt" -w /src rust:1.88.0-bookworm sh -ec '
+    -v "$PWD:/src:ro" -v "$DISCOVER_WORK:/receipt" -w /src "$DISCOVER_GLIBC_BUILD_IMAGE" sh -ec '
   export CARGO_HOME=/tmp/cargo
   mkdir -p /tmp/cargo && cp /receipt/vendor/config.container.toml /tmp/cargo/config.toml
   cargo build --locked --release -p p11scope-discover --offline --target-dir /receipt/glibc-build')
@@ -239,7 +244,7 @@ timeout --signal=TERM --kill-after=5s 600s docker start -a "$GLIBC_BUILD_ID"
 GLIBC_RUN_ID=$(create_owned --name "$GLIBC_RUN" \
     -v "$PWD:/src:ro" \
     -v "$DISCOVER_WORK/glibc-build/release/p11scope-discover:/usr/local/bin/p11scope-discover:ro" \
-    ubuntu:24.04 sh -ec '
+    "$DISCOVER_GLIBC_RUN_IMAGE" sh -ec '
   apt-get update -q >/dev/null && apt-get install -qy gcc jq softhsm2 util-linux >/dev/null
   run_discover() {
     setpriv --reuid=65534 --regid=65534 --clear-groups --no-new-privs \
@@ -256,9 +261,9 @@ GLIBC_RUN_ID=$(create_owned --name "$GLIBC_RUN" \
 printf 'container_glibc_run\t%s\n' "$GLIBC_RUN_ID" >> "$LANE14_FACTS"
 timeout --signal=TERM --kill-after=5s 300s docker start -a "$GLIBC_RUN_ID"
 
-echo "=== musl-dynamic: build + run in rust:1.88.0-alpine ==="
+echo "=== musl-dynamic: build + run in $DISCOVER_MUSL_IMAGE ==="
 MUSL_BUILD_ID=$(create_owned --name "$MUSL_BUILD" \
-    -v "$PWD:/src:ro" -v "$DISCOVER_WORK:/receipt" -w /src rust:1.88.0-alpine sh -ec '
+    -v "$PWD:/src:ro" -v "$DISCOVER_WORK:/receipt" -w /src "$DISCOVER_MUSL_IMAGE" sh -ec '
   apk add -q musl-dev gcc softhsm file jq util-linux
   export CARGO_HOME=/tmp/cargo
   mkdir -p /tmp/cargo && cp /receipt/vendor/config.container.toml /tmp/cargo/config.toml

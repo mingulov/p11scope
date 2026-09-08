@@ -123,6 +123,20 @@ static const char SENT_INTERFACEALIAS[] =
 /* Benign scalar aliases for every diagnostic pointer decoder. Safe mode may
  * retain only finite catalog matches; diagnostic mode must reproduce the
  * pre-design scalar metadata, never the pointed-to ordinary buffers above. */
+/* Keep the ia32 controls in the vendor range after native-word conversion. */
+#if UINTPTR_MAX == UINT32_MAX
+#define ALIAS_MECHANISM_ID          0xf0010101UL
+#define ALIAS_PSS_HASH              0xf0020201UL
+#define ALIAS_PSS_MGF               0xf0030301UL
+#define ALIAS_PSS_SALT              0xf0040401UL
+#define ALIAS_GCM_V220_IV_LEN       0xf0050501UL
+#define ALIAS_GCM_V220_AAD_LEN      0xf0060601UL
+#define ALIAS_GCM_V220_TAG_BITS     0xf0070701UL
+#define ALIAS_GCM_V240_IV_LEN       0xf0080801UL
+#define ALIAS_GCM_V240_AAD_LEN      0xf0090901UL
+#define ALIAS_GCM_V240_TAG_BITS     0xf00a0a01UL
+#define ALIAS_TEMPLATE_TYPE        0xf00b0b01UL
+#else
 #define ALIAS_MECHANISM_ID          0xf001000000000101UL
 #define ALIAS_PSS_HASH              0xf002000000000201UL
 #define ALIAS_PSS_MGF               0xf003000000000301UL
@@ -134,8 +148,11 @@ static const char SENT_INTERFACEALIAS[] =
 #define ALIAS_GCM_V240_AAD_LEN      0xf009000000000901UL
 #define ALIAS_GCM_V240_TAG_BITS     0xf00a000000000a01UL
 #define ALIAS_TEMPLATE_TYPE         0xf00b000000000b01UL
+#endif
 #define REGISTERED_MECHANISM_CONTROL CKM_SHA256
 #define UNKNOWN_MECHANISM_CONTROL   ALIAS_MECHANISM_ID
+_Static_assert((CK_ULONG)UNKNOWN_MECHANISM_CONTROL >= 0x80000000UL,
+               "the native unknown-mechanism control must remain vendor-defined");
 #define MAXIMUM_MECHANISM_CONTROL   (~0UL)
 #define OVERFLOW_PARAMETER_POINTER  ((void *)(uintptr_t)(UINTPTR_MAX - 4))
 
@@ -165,7 +182,8 @@ static void **matrix_functions(void *module)
             !interfaces[i].table) continue;
         memcpy(&version, interfaces[i].table, sizeof(version));
         if (version.major == 3 && version.minor == 2) {
-            functions = (void **)((char *)interfaces[i].table + 8);
+            /* The two-byte version is padded to native pointer alignment. */
+            functions = (void **)((char *)interfaces[i].table + sizeof(void *));
             break;
         }
     }

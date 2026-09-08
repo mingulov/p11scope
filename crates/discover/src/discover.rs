@@ -731,6 +731,11 @@ type GetInterfaceFn = unsafe extern "C" fn(
     cryptoki_sys::CK_FLAGS,
 ) -> cryptoki_sys::CK_RV;
 
+#[allow(clippy::unnecessary_cast)]
+fn native_ulong_u64(value: cryptoki_sys::CK_ULONG) -> u64 {
+    value as u64
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct TableOrigin {
     object: ObjectKey,
@@ -864,8 +869,9 @@ fn selection_acquisition(
     };
     let mut queries = Vec::with_capacity(10);
     for selector in 0..5u8 {
-        for flags in [0u64, 1] {
-            let request = selection_request(selector, flags);
+        for flag in [0u8, 1] {
+            let flags: cryptoki_sys::CK_FLAGS = flag.into();
+            let request = selection_request(selector, native_ulong_u64(flags));
             let mut version = match request.version {
                 SelectionVersionClass::V3_0 => cryptoki_sys::CK_VERSION { major: 3, minor: 0 },
                 SelectionVersionClass::V3_1 => cryptoki_sys::CK_VERSION { major: 3, minor: 1 },
@@ -996,7 +1002,7 @@ fn selection_acquisition(
             queries.push(RawSelectionQuery {
                 selector,
                 request,
-                rv: rv as u64,
+                rv: native_ulong_u64(rv),
                 result,
                 helper_failure,
             });
@@ -1376,7 +1382,7 @@ fn interface_surface(
 ) -> SurfaceRecord {
     let Ok(version) = version else {
         return SurfaceRecord {
-            source: interface_source(index, entry.flags, name, classification),
+            source: interface_source(index, native_ulong_u64(entry.flags), name, classification),
             acquisition: Acquisition::Ok,
             version: None,
             walk: if entry.func_list.is_null() {
@@ -1425,7 +1431,7 @@ fn interface_surface_from_snapshot(
         snapshot.walk
     };
     SurfaceRecord {
-        source: interface_source(index, entry.flags, name, classification),
+        source: interface_source(index, native_ulong_u64(entry.flags), name, classification),
         acquisition: Acquisition::Ok,
         version: Some(manifest_version(version)),
         walk,
@@ -1463,7 +1469,7 @@ fn vendor_interface(
         name_error: name.error,
         version: version.map(manifest_version),
         version_error,
-        flags: entry.flags,
+        flags: native_ulong_u64(entry.flags),
         func_list_null: entry.func_list.is_null(),
     }
 }

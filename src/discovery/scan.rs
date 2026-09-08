@@ -7,10 +7,13 @@
 
 use crate::discovery::hooks::HookRegistry;
 use crate::process::{MountNamespaceId, ProcessView, ProcessViewId};
-use p11scope_manifest::elf::exports_matching;
+use p11scope_manifest::elf::{ElfAbi, ElfSnapshot};
 use p11scope_manifest::identity::open_object;
 use p11scope_manifest::maps::{MapEntry, MapIndex, MappedPath, ObjectKey, Resolved, parse_maps};
-use pkcs11_module::{Surface, TableSet, TableSpan, read_fn_pointers, tables_for};
+use pkcs11_module::{
+    LinuxLayout, Surface, TableSet, TableSpan, function_name, read_function_pointer, read_word_le,
+    table_bytes, tables_for,
+};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::Read;
@@ -18,9 +21,10 @@ use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-const WORD: usize = 8;
 const INTERFACE_NAME_CAP: usize = 64;
-/// One `CK_INTERFACE`: `{ char *name, void *function_list, CK_FLAGS flags }`.
+#[cfg(test)]
+const WORD: usize = 8;
+#[cfg(test)]
 const INTERFACE_BYTES: usize = 3 * WORD;
 const READ_CHUNK: usize = 1024 * 1024;
 const STANDARD_INTERFACE_NAME: &[u8] = b"PKCS 11";
@@ -29,6 +33,8 @@ const MAX_DECODED_TABLE_ENTRIES: usize = 512 * 104;
 const MAX_INTERFACE_RECORDS: usize = 512;
 const MAX_MAPS_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_MAP_ENTRIES: usize = 1_048_576;
+const MAX_MOUNTINFO_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_MOUNTINFO_ENTRIES: usize = 1_048_576;
 // ponytail: this independent ceiling is the calibration knob if real providers hit it.
 const DEFAULT_WORK_CEILING: u64 = 16 * 1024 * 1024;
 pub(crate) const IO_CEILING_REASON: &str =
@@ -43,6 +49,156 @@ pub(crate) const MAPS_CEILING_REASON: &str =
     "capture /proc maps byte ceiling reached; remaining mappings were not read";
 pub(crate) const MAPS_ENTRY_CEILING_REASON: &str =
     "capture /proc maps entry ceiling reached; remaining mappings were not read";
+pub(crate) const MOUNTINFO_CEILING_REASON: &str =
+    "capture mountinfo byte ceiling reached; the incomplete mount table was refused";
+pub(crate) const MOUNTINFO_ENTRY_CEILING_REASON: &str =
+    "capture mountinfo entry ceiling reached; the incomplete mount table was refused";
+
+pub(crate) fn target_layout(abi: ElfAbi) -> LinuxLayout {
+    match abi {
+        ElfAbi::Lp64 => LinuxLayout::Lp64,
+        ElfAbi::Ilp32 => LinuxLayout::Ilp32,
+    }
+}
+
+pub(crate) fn read_elf_snapshot(
+    file: &File,
+    budget: &mut CaptureWorkBudget,
+) -> Result<ElfSnapshot, String> {
+    read_elf_snapshot_with(
+        file,
+        budget,
+        CaptureWorkBudget::check_deadline_now,
+        |file, bytes, offset| file.read_at(bytes, offset),
+    )
+}
+
+fn read_elf_snapshot_with(
+    file: &File,
+    budget: &mut CaptureWorkBudget,
+    mut deadline: impl FnMut(&mut CaptureWorkBudget) -> Option<&'static str>,
+    mut reader: impl FnMut(&File, &mut [u8], u64) -> std::io::Result<usize>,
+) -> Result<ElfSnapshot, String> {
+    let size = file
+        .metadata()
+        .map_err(|error| format!("metadata failed: {error}"))?
+        .len();
+    if size > budget.limits().per_object_bytes {
+        return Err(format!(
+            "too_large ({size} bytes; per-object cap is {})",
+            budget.limits().per_object_bytes,
+        ));
+    }
+    let mut operation_bytes = 0u64;
+    ElfSnapshot::read_with_reader(file, |file, bytes, offset| {
+        if let Some(reason) = deadline(budget) {
+            return Err(std::io::Error::other(reason));
+        }
+        let allowed = budget.allowed_io(operation_bytes, bytes.len());
+        if allowed == 0 {
+            return Err(std::io::Error::other(IO_CEILING_REASON));
+        }
+        let read = reader(file, &mut bytes[..allowed], offset)?;
+        budget.record_io(read);
+        operation_bytes += read as u64;
+        Ok(read)
+    })
+}
+
+pub(crate) fn read_mountinfo<R: Read>(
+    reader: R,
+    budget: &mut CaptureWorkBudget,
+) -> Result<String, String> {
+    read_mountinfo_with(
+        reader,
+        budget,
+        READ_CHUNK,
+        CaptureWorkBudget::check_deadline_now,
+    )
+}
+
+pub(crate) fn read_mountinfo_with<R: Read>(
+    mut reader: R,
+    budget: &mut CaptureWorkBudget,
+    chunk_size: usize,
+    mut deadline: impl FnMut(&mut CaptureWorkBudget) -> Option<&'static str>,
+) -> Result<String, String> {
+    let table_cap = budget.limits().per_object_bytes.min(MAX_MOUNTINFO_BYTES);
+    if table_cap == 0 {
+        return Err(MOUNTINFO_CEILING_REASON.into());
+    }
+
+    let mut table = Vec::new();
+    let mut observed_lines = 0usize;
+    let mut newline_count = 0usize;
+    let mut chunk = vec![0; chunk_size.max(1)];
+    loop {
+        if let Some(reason) = budget.scan_stop_reason {
+            return Err(reason.into());
+        }
+        if let Some(reason) = deadline(budget) {
+            return Err(reason.into());
+        }
+
+        let capture_left = budget
+            .limits()
+            .total_bytes
+            .saturating_sub(budget.attempted_io_bytes());
+        if capture_left == 0 {
+            return Err(IO_CEILING_REASON.into());
+        }
+        let table_bytes = u64::try_from(table.len()).unwrap_or(u64::MAX);
+        let table_left = table_cap.saturating_sub(table_bytes);
+        let wanted = u64::try_from(chunk.len())
+            .unwrap_or(u64::MAX)
+            .min(capture_left)
+            .min(table_left.saturating_add(1));
+        let wanted = usize::try_from(wanted).unwrap_or(chunk.len());
+        if wanted == 0 {
+            return Err(MOUNTINFO_CEILING_REASON.into());
+        }
+        budget.spend(1).map_err(str::to_string)?;
+
+        let read = match reader.read(&mut chunk[..wanted]) {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(format!("cannot read mount table: {error}")),
+        };
+        budget.record_io(read);
+        if read == 0 {
+            if let Some(reason) = deadline(budget) {
+                return Err(reason.into());
+            }
+            return String::from_utf8(table)
+                .map_err(|error| format!("mount table is not valid UTF-8: {error}"));
+        }
+
+        let next_len = table
+            .len()
+            .checked_add(read)
+            .ok_or_else(|| MOUNTINFO_CEILING_REASON.to_string())?;
+        let newlines = chunk[..read].iter().filter(|byte| **byte == b'\n').count();
+        let next_newline_count = newline_count
+            .checked_add(newlines)
+            .ok_or_else(|| MOUNTINFO_ENTRY_CEILING_REASON.to_string())?;
+        let next_lines = next_newline_count
+            .checked_add(usize::from(chunk[read - 1] != b'\n'))
+            .ok_or_else(|| MOUNTINFO_ENTRY_CEILING_REASON.to_string())?;
+        let added_lines = next_lines.saturating_sub(observed_lines);
+        budget
+            .spend(u64::try_from(added_lines).unwrap_or(u64::MAX))
+            .map_err(str::to_string)?;
+        if u64::try_from(next_len).unwrap_or(u64::MAX) > table_cap {
+            return Err(MOUNTINFO_CEILING_REASON.into());
+        }
+        if next_lines > MAX_MOUNTINFO_ENTRIES {
+            return Err(MOUNTINFO_ENTRY_CEILING_REASON.into());
+        }
+        table.extend_from_slice(&chunk[..read]);
+        newline_count = next_newline_count;
+        observed_lines = next_lines;
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScanLimits {
@@ -361,6 +517,11 @@ pub struct ScannedModule {
     pub mount_namespace: MountNamespaceId,
     pub key: ObjectKey,
     pub path: String,
+    /// ABI used by the userspace memory decoder. Present only when this module
+    /// came from `scan_process_view`; mapping and kernel-record projections do
+    /// not manufacture this provenance.
+    #[doc(hidden)]
+    pub decoder_abi: Option<ElfAbi>,
     pub exports: Vec<String>,
     pub tables: Vec<ScannedTable>,
     pub interfaces: Vec<ScannedInterface>,
@@ -438,37 +599,27 @@ pub(crate) fn spans_for(word: u64) -> Option<((u8, u8), &'static [TableSpan], &'
 }
 
 /// How many bytes a layout occupies, including the version header word.
-fn span_bytes(spans: &[TableSpan]) -> Option<usize> {
-    spans
-        .iter()
-        .flat_map(|span| span.fields())
-        .filter_map(|field| field.offset.checked_add(WORD))
-        .max()
+fn span_bytes(layout: LinuxLayout, spans: &[TableSpan]) -> Option<usize> {
+    table_bytes(layout, spans.iter().map(|span| span.fields().len()).sum()).ok()
 }
 
-pub(crate) fn exact_table_bytes(header: &[u8]) -> Option<usize> {
-    let word = u64::from_ne_bytes(header.get(..WORD)?.try_into().ok()?);
+pub(crate) fn exact_table_bytes(header: &[u8], layout: LinuxLayout) -> Option<usize> {
+    let word = read_word_le(header, layout, 0).ok()?;
     let (_, spans, _) = spans_for(word)?;
-    span_bytes(spans)
+    span_bytes(layout, spans)
 }
 
 /// Returns every non-NULL function pointer in one complete table snapshot.
 /// Addresses are capture-local and are used only to close the maps-A/maps-B
 /// stability bracket; callers must not persist them as identity.
-pub(crate) fn exact_table_addresses(snapshot: &[u8]) -> Option<Vec<u64>> {
-    let word = u64::from_ne_bytes(snapshot.get(..WORD)?.try_into().ok()?);
+pub(crate) fn exact_table_addresses(snapshot: &[u8], layout: LinuxLayout) -> Option<Vec<u64>> {
+    let word = read_word_le(snapshot, layout, 0).ok()?;
     let (_, spans, _) = spans_for(word)?;
     let mut addresses = Vec::new();
-    for span in spans {
-        for field in span.fields() {
-            let raw = field
-                .offset
-                .checked_add(WORD)
-                .and_then(|end| snapshot.get(field.offset..end))?;
-            let address = u64::from_ne_bytes(raw.try_into().ok()?);
-            if address != 0 {
-                addresses.push(address);
-            }
+    for ordinal in 0..spans.iter().map(|span| span.fields().len()).sum() {
+        let address = read_function_pointer(snapshot, layout, ordinal).ok()?;
+        if address != 0 {
+            addresses.push(address);
         }
     }
     Some(addresses)
@@ -479,23 +630,25 @@ pub(crate) fn exact_table_addresses(snapshot: &[u8]) -> Option<Vec<u64>> {
 /// is either NULL or points into a file-backed executable mapping — the criterion
 /// that makes a run of pointers a function table rather than data that looks like one.
 fn decode_candidate(
+    layout: LinuxLayout,
     snapshot: &[u8],
     offset: usize,
     base_address: u64,
     maps: &MapIndex<'_>,
     budget: &mut CaptureWorkBudget,
 ) -> Result<Option<(ScannedTable, usize)>, ()> {
+    let width = layout.word_bytes();
     let Some(raw_word) = offset
-        .checked_add(WORD)
+        .checked_add(width)
         .and_then(|end| snapshot.get(offset..end))
     else {
         return Ok(None);
     };
-    let word = u64::from_ne_bytes(raw_word.try_into().expect("one word"));
+    let word = read_word_le(raw_word, layout, 0).expect("one target word");
     let Some((version, spans, walk)) = spans_for(word) else {
         return Ok(None);
     };
-    let Some(len) = span_bytes(spans) else {
+    let Some(len) = span_bytes(layout, spans) else {
         return Ok(None);
     };
     let Some(address) = base_address.checked_add(offset as u64) else {
@@ -514,36 +667,30 @@ fn decode_candidate(
 
     // Validate the whole candidate before reserving or allocating decoded records.
     let mut non_null = 0usize;
-    for span in spans {
-        for field in span.fields() {
-            if !budget.charge(1) {
-                return Err(());
-            }
-            let Some(raw) = field
-                .offset
-                .checked_add(WORD)
-                .and_then(|end| bytes.get(field.offset..end))
-            else {
-                return Ok(None);
-            };
-            let value = usize::from_ne_bytes(raw.try_into().expect("one pointer"));
-            if value == 0 {
-                continue;
-            }
-            non_null += 1;
-            let Resolved::File {
-                permissions, path, ..
-            } = maps.resolve(value as u64)
-            else {
-                return Ok(None); // anonymous or unmapped ⇒ not a function table
-            };
-            if permissions[2] != b'x' {
-                return Ok(None); // a pointer into data ⇒ not a function table
-            }
-            let MappedPath::Usable(_) = path else {
-                return Ok(None); // deleted/ambiguous pathname ⇒ cannot become an attach target
-            };
+    let field_count = spans.iter().map(|span| span.fields().len()).sum();
+    for ordinal in 0..field_count {
+        if !budget.charge(1) {
+            return Err(());
         }
+        let Ok(value) = read_function_pointer(bytes, layout, ordinal) else {
+            return Ok(None);
+        };
+        if value == 0 {
+            continue;
+        }
+        non_null += 1;
+        let Resolved::File {
+            permissions, path, ..
+        } = maps.resolve(value)
+        else {
+            return Ok(None); // anonymous or unmapped ⇒ not a function table
+        };
+        if permissions[2] != b'x' {
+            return Ok(None); // a pointer into data ⇒ not a function table
+        }
+        let MappedPath::Usable(_) = path else {
+            return Ok(None); // deleted/ambiguous pathname ⇒ cannot become an attach target
+        };
     }
     if non_null == 0 {
         return Ok(None);
@@ -555,32 +702,32 @@ fn decode_candidate(
 
     let mut entries = Vec::with_capacity(non_null);
     let mut null_entries = Vec::with_capacity(decoded_entries - non_null);
-    for span in spans {
-        for (name, value) in read_fn_pointers(bytes, span.fields()).expect("validated above") {
-            if value == 0 {
-                null_entries.push(name);
-                continue;
-            }
-            let Resolved::File {
-                path,
-                file_offset,
-                device,
-                inode,
-                ..
-            } = maps.resolve(value as u64)
-            else {
-                unreachable!("validated above")
-            };
-            let MappedPath::Usable(path) = path else {
-                unreachable!("validated above")
-            };
-            entries.push(ScannedEntry {
-                name,
-                object: ObjectKey { device, inode },
-                object_path: path.display().to_string(),
-                file_offset,
-            });
+    for ordinal in 0..field_count {
+        let name = function_name(ordinal).expect("validated shared field count");
+        let value = read_function_pointer(bytes, layout, ordinal).expect("validated above");
+        if value == 0 {
+            null_entries.push(name);
+            continue;
         }
+        let Resolved::File {
+            path,
+            file_offset,
+            device,
+            inode,
+            ..
+        } = maps.resolve(value)
+        else {
+            unreachable!("validated above")
+        };
+        let MappedPath::Usable(path) = path else {
+            unreachable!("validated above")
+        };
+        entries.push(ScannedEntry {
+            name,
+            object: ObjectKey { device, inode },
+            object_path: path.display().to_string(),
+            file_offset,
+        });
     }
     Ok(Some((
         ScannedTable {
@@ -602,22 +749,35 @@ fn decode_candidate(
 pub(crate) fn decode_exact_table(
     snapshot: &[u8],
     address: u64,
+    layout: LinuxLayout,
     maps: &MapIndex<'_>,
     budget: &mut CaptureWorkBudget,
 ) -> Result<Option<ScannedTable>, ()> {
-    decode_candidate(snapshot, 0, address, maps, budget)
+    decode_candidate(layout, snapshot, 0, address, maps, budget)
         .map(|decoded| decoded.map(|(table, _)| table))
 }
 
 /// Every 8-byte-aligned candidate in one snapshot, longest match kept on overlap.
 /// The second return carries the one bounded exhaustion reason, if decoding stopped.
+#[cfg(test)]
 fn detect_tables(
     snapshot: &[u8],
     base_address: u64,
     maps: &MapIndex<'_>,
     budget: &mut CaptureWorkBudget,
 ) -> (Vec<ScannedTable>, Vec<String>) {
+    detect_tables_for_layout(LinuxLayout::Lp64, snapshot, base_address, maps, budget)
+}
+
+fn detect_tables_for_layout(
+    layout: LinuxLayout,
+    snapshot: &[u8],
+    base_address: u64,
+    maps: &MapIndex<'_>,
+    budget: &mut CaptureWorkBudget,
+) -> (Vec<ScannedTable>, Vec<String>) {
     detect_tables_with_clock(
+        layout,
         snapshot,
         base_address,
         maps,
@@ -627,6 +787,7 @@ fn detect_tables(
 }
 
 fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
+    layout: LinuxLayout,
     snapshot: &[u8],
     base_address: u64,
     maps: &MapIndex<'_>,
@@ -636,8 +797,9 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
     let mut skipped = Vec::new();
     let mut found: Vec<(usize, usize, ScannedTable)> = Vec::new();
     let mut offset = 0usize;
-    while offset + WORD <= snapshot.len() {
-        if (offset / WORD) % 4096 == 0
+    let width = layout.word_bytes();
+    while offset + width <= snapshot.len() {
+        if (offset / width) % 4096 == 0
             && budget.deadline_ns.is_some()
             && budget.check_deadline(now()).is_some()
         {
@@ -658,7 +820,7 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
             }
             break;
         }
-        match decode_candidate(snapshot, offset, base_address, maps, budget) {
+        match decode_candidate(layout, snapshot, offset, base_address, maps, budget) {
             Ok(Some((table, len))) => found.push((offset, len, table)),
             Ok(None) => {}
             Err(()) => {
@@ -670,7 +832,7 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
                 break;
             }
         }
-        offset += WORD;
+        offset += width;
     }
     // Longest first, then drop anything overlapping an already-kept match.
     found.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
@@ -693,6 +855,7 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
 
 /// `CK_INTERFACE` triples in one snapshot that name a table this scan decoded.
 /// The triple's own address is not recorded, so no `base_address` is needed here.
+#[cfg(test)]
 fn scan_interfaces(
     snapshot: &[u8],
     mem: &File,
@@ -702,7 +865,31 @@ fn scan_interfaces(
     budget: &mut CaptureWorkBudget,
     operation_bytes: &mut u64,
 ) -> (Vec<ScannedInterface>, Vec<String>) {
+    scan_interfaces_for_layout(
+        LinuxLayout::Lp64,
+        snapshot,
+        mem,
+        tables,
+        maps,
+        key,
+        budget,
+        operation_bytes,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_interfaces_for_layout(
+    layout: LinuxLayout,
+    snapshot: &[u8],
+    mem: &File,
+    tables: &[ScannedTable],
+    maps: &MapIndex<'_>,
+    key: ObjectKey,
+    budget: &mut CaptureWorkBudget,
+    operation_bytes: &mut u64,
+) -> (Vec<ScannedInterface>, Vec<String>) {
     scan_interfaces_with_clock(
+        layout,
         snapshot,
         mem,
         tables,
@@ -716,6 +903,7 @@ fn scan_interfaces(
 
 #[allow(clippy::too_many_arguments)]
 fn scan_interfaces_with_clock<F: FnMut() -> Option<u64>>(
+    layout: LinuxLayout,
     snapshot: &[u8],
     mem: &File,
     tables: &[ScannedTable],
@@ -725,14 +913,8 @@ fn scan_interfaces_with_clock<F: FnMut() -> Option<u64>>(
     operation_bytes: &mut u64,
     mut now: F,
 ) -> (Vec<ScannedInterface>, Vec<String>) {
-    let word_at = |offset: usize| -> Option<u64> {
-        Some(u64::from_ne_bytes(
-            snapshot
-                .get(offset..offset.checked_add(WORD)?)?
-                .try_into()
-                .ok()?,
-        ))
-    };
+    let word_at = |offset: usize| read_word_le(snapshot, layout, offset).ok();
+    let interface = layout.interface();
     let mut found = Vec::new();
     let mut skipped = Vec::new();
     let mut io_exhausted = false;
@@ -745,8 +927,8 @@ fn scan_interfaces_with_clock<F: FnMut() -> Option<u64>>(
                 by_address
             });
     let mut offset = 0usize;
-    while offset + INTERFACE_BYTES <= snapshot.len() {
-        if (offset / WORD) % 4096 == 0
+    while offset + interface.stride <= snapshot.len() {
+        if (offset / layout.word_bytes()) % 4096 == 0
             && budget.deadline_ns.is_some()
             && budget.check_deadline(now()).is_some()
         {
@@ -768,9 +950,9 @@ fn scan_interfaces_with_clock<F: FnMut() -> Option<u64>>(
             break;
         }
         let scanned = (|| {
-            let name_ptr = word_at(offset)?;
-            let table_ptr = word_at(offset + WORD)?;
-            let flags = word_at(offset + 2 * WORD)?;
+            let name_ptr = word_at(offset + interface.name_offset)?;
+            let table_ptr = word_at(offset + interface.function_list_offset)?;
+            let flags = word_at(offset + interface.flags_offset)?;
             // The function-list pointer is the anchor: without it a triple of words
             // is just data. Requiring a decoded table also keeps the byte budget —
             // only the provider's own mappings are ever read.
@@ -840,7 +1022,7 @@ fn scan_interfaces_with_clock<F: FnMut() -> Option<u64>>(
             );
             break;
         }
-        offset += WORD;
+        offset += layout.word_bytes();
     }
     (found, skipped)
 }
@@ -1029,8 +1211,9 @@ fn opened_file_identity_guard(
     view: &ProcessView,
     file: &File,
     expected: ObjectKey,
+    budget: &mut CaptureWorkBudget,
 ) -> Result<(), String> {
-    let actual = crate::discovery::identity::retained_object_key(view, file)?;
+    let actual = crate::discovery::identity::retained_object_key(view, file, budget)?;
     if actual == expected {
         return Ok(());
     }
@@ -1354,7 +1537,7 @@ pub fn scan_process_view(
                 continue;
             }
         };
-        if let Err(reason) = opened_file_identity_guard(view, &file, key) {
+        if let Err(reason) = opened_file_identity_guard(view, &file, key, budget) {
             skipped.push(Skipped { subject, reason });
             continue;
         }
@@ -1378,7 +1561,15 @@ pub fn scan_process_view(
             });
             continue;
         }
-        let exports = match exports_matching(&file, &wanted) {
+        let object = match read_elf_snapshot(&file, budget) {
+            Ok(object) => object,
+            Err(reason) => {
+                skipped.push(Skipped { subject, reason });
+                continue;
+            }
+        };
+        let layout = target_layout(object.abi());
+        let exports = match object.exports_matching(&wanted) {
             Ok(exports) => exports,
             Err(reason) => {
                 skipped.push(Skipped { subject, reason });
@@ -1393,6 +1584,7 @@ pub fn scan_process_view(
             mount_namespace: view.mount_namespace(),
             key,
             path,
+            decoder_abi: Some(object.abi()),
             exports: exports.into_iter().map(|(name, _)| name).collect(),
             tables: Vec::new(),
             interfaces: Vec::new(),
@@ -1443,7 +1635,8 @@ pub fn scan_process_view(
             }
         }
         for (base, snapshot) in &snapshots {
-            let (tables, exhausted) = detect_tables(snapshot, *base, &map_index, budget);
+            let (tables, exhausted) =
+                detect_tables_for_layout(layout, snapshot, *base, &map_index, budget);
             module.tables.extend(tables);
             skipped.extend(
                 exhausted
@@ -1459,7 +1652,8 @@ pub fn scan_process_view(
             break;
         }
         for (_, snapshot) in &snapshots {
-            let (interfaces, exhausted) = scan_interfaces(
+            let (interfaces, exhausted) = scan_interfaces_for_layout(
+                layout,
                 snapshot,
                 mem,
                 &module.tables,
@@ -1663,11 +1857,56 @@ mod tests {
             (0x0203, Some(((3, 2), 8 + 104 * 8))),
         ] {
             let (version, spans, _) = spans_for(word).expect("walkable");
-            assert_eq!(Some((version, span_bytes(spans).unwrap())), expected);
+            assert_eq!(
+                Some((version, span_bytes(LinuxLayout::Lp64, spans).unwrap())),
+                expected
+            );
         }
         // Padding bytes set, implausible minor, unknown major, all-zero word.
         for word in [0x1_2802u64, 0x2902, 0x0304, 0x0004, 0] {
             assert!(spans_for(word).is_none(), "{word:#x} must not be a table");
+        }
+    }
+
+    #[test]
+    fn ilp32_tables_use_four_byte_words_and_ignore_adjacent_poison() {
+        let maps = parse_maps(b"1000-3000 r-xp 00000000 08:01 7 /lib/provider.so\n").unwrap();
+        let map_index = MapIndex::new(&maps).unwrap();
+        for (version, fields) in [(0x0002u32, 67), (0x2802, 68), (0x0003, 92), (0x0203, 104)] {
+            let mut snapshot = vec![0xa5; 4 + fields * 4 + 3];
+            snapshot[..4].copy_from_slice(&version.to_le_bytes());
+            for ordinal in 0..fields {
+                let offset = 4 + ordinal * 4;
+                snapshot[offset..offset + 4].copy_from_slice(&0x1500u32.to_le_bytes());
+            }
+            assert_eq!(
+                exact_table_bytes(&snapshot[..4], LinuxLayout::Ilp32),
+                Some(4 + fields * 4)
+            );
+            let (tables, skipped) = detect_tables_for_layout(
+                LinuxLayout::Ilp32,
+                &snapshot,
+                0x7000,
+                &map_index,
+                &mut CaptureWorkBudget::default(),
+            );
+            assert!(skipped.is_empty(), "{version:#x}: {skipped:?}");
+            assert_eq!(tables.len(), 1, "{version:#x}");
+            assert_eq!(tables[0].entries.len(), fields, "{version:#x}");
+
+            snapshot.truncate(4 + fields * 4 - 1);
+            assert!(
+                detect_tables_for_layout(
+                    LinuxLayout::Ilp32,
+                    &snapshot,
+                    0x7000,
+                    &map_index,
+                    &mut CaptureWorkBudget::default(),
+                )
+                .0
+                .is_empty(),
+                "a truncated final target word is never decoded"
+            );
         }
     }
 
@@ -1972,7 +2211,13 @@ mod tests {
         assert_ne!(captured.inode, replacement_identity.inode);
         let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
         assert!(
-            opened_file_identity_guard(&view, &replacement_file, captured).is_err(),
+            opened_file_identity_guard(
+                &view,
+                &replacement_file,
+                captured,
+                &mut CaptureWorkBudget::default(),
+            )
+            .is_err(),
             "a same-size replacement inode must be refused before hint matching"
         );
 
@@ -1983,7 +2228,8 @@ mod tests {
         let guard = scan_lines
             .iter()
             .position(|line| {
-                *line == "if let Err(reason) = opened_file_identity_guard(view, &file, key) {"
+                *line
+                    == "if let Err(reason) = opened_file_identity_guard(view, &file, key, budget) {"
             })
             .expect("the shared identity guard must run in the scan");
         assert_eq!(
@@ -2011,7 +2257,10 @@ mod tests {
         let guard_body = &include_str!("scan.rs")[include_str!("scan.rs")
             .find("fn opened_file_identity_guard(")
             .expect("identity guard")..];
-        assert!(guard_body.contains("crate::discovery::identity::retained_object_key(view, file)"));
+        assert!(
+            guard_body
+                .contains("crate::discovery::identity::retained_object_key(view, file, budget)")
+        );
         for decision in [
             "if !request.hints.is_empty() && !hinted {\n            continue;\n        }",
             "if hinted && !attributable {",
@@ -2122,7 +2371,10 @@ mod tests {
         snapshot[16..24].copy_from_slice(&0u64.to_ne_bytes());
         snapshot[24..32].copy_from_slice(&0x3330u64.to_ne_bytes());
 
-        assert_eq!(exact_table_addresses(&snapshot).unwrap(), [0x1110, 0x3330]);
+        assert_eq!(
+            exact_table_addresses(&snapshot, LinuxLayout::Lp64).unwrap(),
+            [0x1110, 0x3330]
+        );
     }
 
     #[test]
@@ -2185,11 +2437,17 @@ mod tests {
         let mut budget = CaptureWorkBudget::default();
         budget.set_deadline(Some(10));
         let mut polls = 0;
-        let (tables, skipped) =
-            detect_tables_with_clock(&snapshot, 0x7000, &map_index, &mut budget, || {
+        let (tables, skipped) = detect_tables_with_clock(
+            LinuxLayout::Lp64,
+            &snapshot,
+            0x7000,
+            &map_index,
+            &mut budget,
+            || {
                 polls += 1;
                 Some(if polls == 1 { 0 } else { 10 })
-            });
+            },
+        );
         assert_eq!(polls, 2, "initial and next local 4096-window boundary");
         assert!(
             tables
@@ -2243,6 +2501,76 @@ mod tests {
         assert_eq!(bytes, b"aa\n");
         assert!(reasons.contains(&MAPS_CEILING_REASON));
         assert!(reasons.contains(&MAPS_ENTRY_CEILING_REASON));
+    }
+
+    #[test]
+    fn budgeted_elf_reader_never_overspends_or_reads_after_deadline() {
+        let short = tempfile::tempfile().unwrap();
+        short.set_len(8).unwrap();
+        let mut budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: 8,
+            total_bytes: 7,
+        });
+        let mut requests = Vec::new();
+        let error = read_elf_snapshot_with(
+            &short,
+            &mut budget,
+            |_| None,
+            |file, bytes, offset| {
+                requests.push(bytes.len());
+                file.read_at(bytes, offset)
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains(IO_CEILING_REASON), "{error}");
+        assert_eq!(
+            requests,
+            [7],
+            "the underlying reader sees only admitted bytes"
+        );
+        assert_eq!(budget.attempted_io_bytes(), 7);
+
+        let mut budget = CaptureWorkBudget::default();
+        let mut reads = 0;
+        let error = read_elf_snapshot_with(
+            &short,
+            &mut budget,
+            |_| Some(SCAN_DEADLINE_REASON),
+            |file, bytes, offset| {
+                reads += 1;
+                file.read_at(bytes, offset)
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains(SCAN_DEADLINE_REASON), "{error}");
+        assert_eq!(
+            reads, 0,
+            "an expired deadline refuses before the first read"
+        );
+        assert_eq!(budget.attempted_io_bytes(), 0);
+
+        let long = tempfile::tempfile().unwrap();
+        long.set_len((READ_CHUNK + 1) as u64).unwrap();
+        let mut budget = CaptureWorkBudget::default();
+        let mut polls = 0;
+        let mut reads = 0;
+        let error = read_elf_snapshot_with(
+            &long,
+            &mut budget,
+            |_| {
+                polls += 1;
+                (polls == 2).then_some(SCAN_DEADLINE_REASON)
+            },
+            |file, bytes, offset| {
+                reads += 1;
+                file.read_at(bytes, offset)
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains(SCAN_DEADLINE_REASON), "{error}");
+        assert_eq!(polls, 2);
+        assert_eq!(reads, 1, "expiry between chunks prevents the next read");
+        assert_eq!(budget.attempted_io_bytes(), READ_CHUNK as u64);
     }
 
     #[test]
@@ -2349,5 +2677,191 @@ mod tests {
             u64::try_from(line.len()).unwrap(),
             "a complete snapshot is charged to the capture's I/O total"
         );
+    }
+
+    #[derive(Debug)]
+    enum ReaderStep {
+        Bytes(Vec<u8>),
+        Error(std::io::ErrorKind),
+        Eof,
+    }
+
+    #[derive(Debug)]
+    struct RecordingReader {
+        steps: std::collections::VecDeque<ReaderStep>,
+        requests: Vec<usize>,
+    }
+
+    impl RecordingReader {
+        fn new(steps: impl IntoIterator<Item = ReaderStep>) -> Self {
+            Self {
+                steps: steps.into_iter().collect(),
+                requests: Vec::new(),
+            }
+        }
+    }
+
+    impl Read for &mut RecordingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.requests.push(buffer.len());
+            match self.steps.pop_front().unwrap_or(ReaderStep::Eof) {
+                ReaderStep::Bytes(bytes) => {
+                    assert!(bytes.len() <= buffer.len());
+                    buffer[..bytes.len()].copy_from_slice(&bytes);
+                    Ok(bytes.len())
+                }
+                ReaderStep::Error(kind) => Err(std::io::Error::from(kind)),
+                ReaderStep::Eof => Ok(0),
+            }
+        }
+    }
+
+    #[test]
+    fn mountinfo_reader_proves_eof_at_the_exact_byte_cap_and_refuses_excess() {
+        let mut exact =
+            RecordingReader::new([ReaderStep::Bytes(b"abc\n".to_vec()), ReaderStep::Eof]);
+        let mut budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: 4,
+            total_bytes: 5,
+        });
+        assert_eq!(
+            read_mountinfo_with(&mut exact, &mut budget, 8, |_| None).unwrap(),
+            "abc\n"
+        );
+        assert_eq!(exact.requests, [5, 1], "the final request is EOF lookahead");
+        assert_eq!(budget.attempted_io_bytes(), 4);
+
+        let mut excess = RecordingReader::new([ReaderStep::Bytes(b"abc\nx".to_vec())]);
+        let mut budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: 4,
+            total_bytes: 5,
+        });
+        assert_eq!(
+            read_mountinfo_with(&mut excess, &mut budget, 8, |_| None).unwrap_err(),
+            MOUNTINFO_CEILING_REASON
+        );
+        assert_eq!(excess.requests, [5]);
+        assert_eq!(budget.attempted_io_bytes(), 5, "the excess byte is charged");
+    }
+
+    #[test]
+    fn mountinfo_reader_charges_lines_and_reused_aggregate_budget() {
+        let exact_lines = vec![b'\n'; MAX_MOUNTINFO_ENTRIES];
+        let mut exact = RecordingReader::new([ReaderStep::Bytes(exact_lines), ReaderStep::Eof]);
+        let mut budget = CaptureWorkBudget::default();
+        assert!(read_mountinfo_with(&mut exact, &mut budget, 2 * 1024 * 1024, |_| None).is_ok());
+        let first_bytes = budget.attempted_io_bytes();
+        assert_eq!(exact.requests.len(), 2);
+
+        let mut excess =
+            RecordingReader::new([ReaderStep::Bytes(vec![b'\n'; MAX_MOUNTINFO_ENTRIES + 1])]);
+        assert_eq!(
+            read_mountinfo_with(&mut excess, &mut budget, 2 * 1024 * 1024, |_| None).unwrap_err(),
+            MOUNTINFO_ENTRY_CEILING_REASON
+        );
+        assert_eq!(
+            budget.attempted_io_bytes(),
+            first_bytes + u64::try_from(MAX_MOUNTINFO_ENTRIES + 1).unwrap()
+        );
+    }
+
+    #[test]
+    fn mountinfo_reader_retries_interrupted_reads_but_refuses_other_partial_errors() {
+        let mut interrupted = RecordingReader::new([
+            ReaderStep::Bytes(b"17 ".to_vec()),
+            ReaderStep::Error(std::io::ErrorKind::Interrupted),
+            ReaderStep::Bytes(b"1\n".to_vec()),
+            ReaderStep::Eof,
+        ]);
+        let mut budget = CaptureWorkBudget::default();
+        assert_eq!(
+            read_mountinfo_with(&mut interrupted, &mut budget, 3, |_| None).unwrap(),
+            "17 1\n"
+        );
+        assert_eq!(interrupted.requests.len(), 4, "EINTR and EOF are attempts");
+        assert_eq!(budget.attempted_io_bytes(), 5);
+        assert_eq!(budget.work_units, 5, "four attempts plus one observed line");
+
+        let mut failed = RecordingReader::new([
+            ReaderStep::Bytes(b"17 1 8:1 /".to_vec()),
+            ReaderStep::Error(std::io::ErrorKind::Other),
+        ]);
+        let mut budget = CaptureWorkBudget::default();
+        assert!(read_mountinfo_with(&mut failed, &mut budget, 32, |_| None).is_err());
+        assert_eq!(failed.requests.len(), 2);
+        assert_eq!(budget.attempted_io_bytes(), 10);
+    }
+
+    #[test]
+    fn mountinfo_reader_never_reads_after_exhaustion_and_rechecks_deadline_before_publish() {
+        for mut budget in [
+            CaptureWorkBudget::new(ScanLimits {
+                per_object_bytes: 0,
+                total_bytes: 8,
+            }),
+            CaptureWorkBudget::new(ScanLimits {
+                per_object_bytes: 8,
+                total_bytes: 0,
+            }),
+        ] {
+            let mut reader = RecordingReader::new([ReaderStep::Bytes(b"x".to_vec())]);
+            assert!(read_mountinfo_with(&mut reader, &mut budget, 8, |_| None).is_err());
+            assert!(reader.requests.is_empty());
+        }
+
+        let mut aggregate_exact =
+            RecordingReader::new([ReaderStep::Bytes(b"abc\n".to_vec()), ReaderStep::Eof]);
+        let mut budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: 4,
+            total_bytes: 4,
+        });
+        assert_eq!(
+            read_mountinfo_with(&mut aggregate_exact, &mut budget, 8, |_| None).unwrap_err(),
+            IO_CEILING_REASON
+        );
+        assert_eq!(
+            aggregate_exact.requests,
+            [4],
+            "aggregate exhaustion refuses without an EOF probe"
+        );
+        assert_eq!(budget.attempted_io_bytes(), 4);
+
+        let mut budget = CaptureWorkBudget::default();
+        assert!(!budget.charge(u64::MAX));
+        let mut stopped = RecordingReader::new([ReaderStep::Bytes(b"x".to_vec())]);
+        assert_eq!(
+            read_mountinfo_with(&mut stopped, &mut budget, 8, |_| None).unwrap_err(),
+            WORK_CEILING_REASON
+        );
+        assert!(stopped.requests.is_empty());
+
+        let mut deadline =
+            RecordingReader::new([ReaderStep::Bytes(b"17 1\n".to_vec()), ReaderStep::Eof]);
+        let mut budget = CaptureWorkBudget::default();
+        let mut polls = 0;
+        let error = read_mountinfo_with(&mut deadline, &mut budget, 8, |_| {
+            polls += 1;
+            (polls == 3).then_some(SCAN_DEADLINE_REASON)
+        })
+        .unwrap_err();
+        assert_eq!(error, SCAN_DEADLINE_REASON);
+        assert_eq!(deadline.requests.len(), 2);
+        assert_eq!(polls, 3, "before each read and after EOF publication");
+
+        let mut between = RecordingReader::new([
+            ReaderStep::Bytes(b"17 ".to_vec()),
+            ReaderStep::Bytes(b"1\n".to_vec()),
+        ]);
+        let mut budget = CaptureWorkBudget::default();
+        let mut polls = 0;
+        assert_eq!(
+            read_mountinfo_with(&mut between, &mut budget, 3, |_| {
+                polls += 1;
+                (polls == 2).then_some(SCAN_DEADLINE_REASON)
+            })
+            .unwrap_err(),
+            SCAN_DEADLINE_REASON
+        );
+        assert_eq!(between.requests.len(), 1, "expiry prevents the next chunk");
     }
 }

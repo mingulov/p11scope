@@ -4,6 +4,7 @@
 from pathlib import Path
 import contextlib
 import io
+import json
 import re
 import struct
 import subprocess
@@ -40,6 +41,320 @@ def elf_records(path):
     return records, indices
 
 
+def checked_slice(data, offset, size, label):
+    if offset < 0 or size < 0 or offset > len(data) or size > len(data) - offset:
+        raise RuntimeError(f"{label} out of bounds")
+    return data[offset:offset + size]
+
+
+def string_at(data, offset):
+    if offset >= len(data):
+        raise RuntimeError("invalid string reference")
+    end = data.find(b"\0", offset)
+    if end < 0:
+        raise RuntimeError("unterminated string")
+    try:
+        return data[offset:end].decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise RuntimeError("invalid string encoding") from error
+
+
+class Elf:
+    """Bounded ELF64/BPF metadata used to cross-check LLVM and BTF relocation facts."""
+    def __init__(self, data):
+        header = checked_slice(data, 0, 64, "ELF header")
+        if header[:7] != b"\x7fELF\x02\x01\x01":
+            raise RuntimeError("unsupported ELF schema/endian (requires ELF64 little endian)")
+        if struct.unpack_from("<HHI", header, 16) != (1, 247, 1):
+            raise RuntimeError("unsupported ELF type/machine/version")
+        offset = struct.unpack_from("<Q", header, 40)[0]
+        ehsize, _, _, stride, count, names_index = struct.unpack_from("<6H", header, 52)
+        if ehsize != 64 or stride != 64 or not count or not 0 < names_index < count:
+            raise RuntimeError("unsupported ELF section schema")
+        table = checked_slice(data, offset, count * stride, "ELF sections")
+        headers = [struct.unpack_from("<IIQQQQIIQQ", table, i * stride) for i in range(count)]
+        names = headers[names_index]
+        if names[1] != 3:
+            raise RuntimeError("ELF section names are not STRTAB")
+        strings = checked_slice(data, names[4], names[5], "ELF section names")
+        self.sections = {}
+        self.indices = {}
+        for index, row in enumerate(headers):
+            name = string_at(strings, row[0])
+            if index == 0:
+                continue
+            if not name or name in self.sections:
+                raise RuntimeError(f"duplicate or empty ELF section {name!r}")
+            body = b"" if row[1] == 8 else checked_slice(data, row[4], row[5], name)
+            self.sections[name] = (row, body)
+            self.indices[name] = index
+        symtabs = [name for name, (row, _) in self.sections.items() if row[1] == 2]
+        if symtabs != [".symtab"]:
+            raise RuntimeError("requires exactly one .symtab")
+        row, body = self.sections[".symtab"]
+        if row[9] != 24 or len(body) % 24 or not 0 < row[6] < count:
+            raise RuntimeError("invalid ELF symbol table")
+        strings_row = headers[row[6]]
+        if strings_row[1] != 3:
+            raise RuntimeError("ELF symbol names are not STRTAB")
+        strings = checked_slice(data, strings_row[4], strings_row[5], "symbol strings")
+        self.symbols = []
+        self.records = []
+        kinds = {0: "NOTYPE", 1: "OBJECT", 2: "FUNC", 3: "SECTION", 4: "FILE"}
+        binds = {0: "LOCAL", 1: "GLOBAL", 2: "WEAK"}
+        for pos in range(0, len(body), 24):
+            no, info, other, section, value, size = struct.unpack_from("<IBBHQQ", body, pos)
+            name = string_at(strings, no)
+            self.symbols.append((name, info, other, section, value, size))
+            if section < 0xff00 and section >= count:
+                raise RuntimeError("ELF symbol section out of bounds")
+            if info & 15 == 3 and not name and section < count:
+                name = string_at(checked_slice(data, names[4], names[5], "section names"), headers[section][0])
+            if not name:
+                continue
+            sec = {0: "UND", 0xfff1: "ABS", 0xfff2: "COM"}.get(section, str(section))
+            self.records.append((value, size, kinds.get(info & 15, str(info & 15)),
+                                 binds.get(info >> 4, str(info >> 4)),
+                                 ("DEFAULT", "INTERNAL", "HIDDEN", "PROTECTED")[other & 3], sec, name))
+
+
+class Btf:
+    def __init__(self, data):
+        header = checked_slice(data, 0, 24, "BTF header")
+        magic, version, flags, hlen, toff, tlen, soff, slen = struct.unpack("<HBBIIIII", header)
+        if (magic, version, flags, hlen, toff) != (0xeb9f, 1, 0, 24, 0):
+            raise RuntimeError("unsupported BTF schema/endian")
+        if soff != tlen or hlen + soff + slen != len(data):
+            raise RuntimeError("invalid BTF section lengths")
+        self.strings = checked_slice(data, hlen + soff, slen, "BTF strings")
+        if not self.strings or self.strings[0] or self.strings[-1]:
+            raise RuntimeError("invalid BTF strings")
+        raw = checked_slice(data, hlen, tlen, "BTF types")
+        self.types = [None]
+        pos = 0
+        while pos < len(raw):
+            no, info, value = struct.unpack("<III", checked_slice(raw, pos, 12, "BTF type"))
+            kind, vlen, kflag = (info >> 24) & 31, info & 65535, info >> 31
+            if info & 0x60ff0000:
+                raise RuntimeError("invalid BTF type info")
+            sizes = {1: 4, 2: 0, 3: 12, 4: vlen * 12, 5: vlen * 12,
+                     6: vlen * 8, 7: 0, 8: 0, 9: 0, 10: 0, 11: 0,
+                     12: 0, 13: vlen * 8, 14: 4, 15: vlen * 12,
+                     16: 0, 17: 4, 18: 0, 19: vlen * 12}
+            if kflag and kind not in (4, 5, 6, 7, 19):
+                raise RuntimeError("invalid BTF kind flag")
+            if kind not in sizes:
+                raise RuntimeError(f"unsupported BTF kind {kind}")
+            if kind not in (4, 5, 6, 12, 13, 15, 19) and vlen:
+                raise RuntimeError("invalid BTF vlen")
+            extra = checked_slice(raw, pos + 12, sizes[kind], "BTF payload")
+            words = struct.unpack(f"<{len(extra)//4}I", extra)
+            self.types.append((kind, string_at(self.strings, no), value, vlen, kflag, words, hlen + pos))
+            pos += 12 + sizes[kind]
+        named_vars, datasecs = set(), set()
+        for kind, name, value, vlen, _, words, _ in self.types[1:]:
+            if kind in (14, 15):
+                names = named_vars if kind == 14 else datasecs
+                if not name or name in names:
+                    raise RuntimeError("duplicate/empty BTF VAR or DATASEC name")
+                names.add(name)
+            if kind == 14 and words[0] > 2 or kind == 12 and vlen > 2:
+                raise RuntimeError("invalid BTF linkage")
+            refs = []
+            if kind in (2, 8, 9, 10, 11, 12, 13, 14, 17, 18):
+                refs.append(value)
+            if kind == 3:
+                refs.extend(words[:2])
+            if kind in (4, 5):
+                refs.extend(words[1::3])
+            if kind == 15:
+                refs.extend(words[::3])
+            if kind == 13:
+                refs.extend(words[1::2])
+            if any(ref >= len(self.types) for ref in refs):
+                raise RuntimeError("invalid BTF type reference")
+            if kind in (4, 5, 6, 13, 19):
+                step = 3 if kind in (4, 5, 19) else 2
+                member_names = [string_at(self.strings, x) for x in words[::step]]
+                named = [name for name in member_names if name]
+                if len(named) != len(set(named)):
+                    raise RuntimeError("duplicate BTF member name")
+
+    def resolve(self, ref):
+        seen = set()
+        while ref and ref < len(self.types):
+            if ref in seen or len(seen) >= 64:
+                raise RuntimeError("BTF type resolution cycle/depth")
+            seen.add(ref)
+            node = self.types[ref]
+            if node[0] not in (8, 9, 10, 11, 18):
+                if node[0] == 1:
+                    encoding = node[5][0]
+                    offset, width = (encoding >> 16) & 255, encoding & 255
+                    if (encoding & 0xf800ff00 or node[2] not in (1, 2, 4, 8, 16)
+                            or not width or offset + width > node[2] * 8):
+                        raise RuntimeError("invalid BTF INT encoding/size bounds")
+                return node
+            ref = node[2]
+        raise RuntimeError("invalid BTF type reference/void")
+
+    def size(self, ref, seen=()):
+        if ref in seen or len(seen) >= 64:
+            raise RuntimeError("BTF size resolution cycle/depth")
+        node = self.resolve(ref)
+        kind, _, value, _, _, words, _ = node
+        if kind in (1, 4, 5, 6, 16, 19):
+            size = value
+            if kind in (4, 5):
+                for i in range(node[3]):
+                    _, member_ref, offset = words[i*3:i*3+3]
+                    width = offset >> 24 if node[4] else 0
+                    offset = offset & 0xffffff if node[4] else offset
+                    member_size = self.size(member_ref, seen + (ref,)) * 8
+                    if offset + (width or member_size) > size * 8 or width > member_size:
+                        raise RuntimeError("BTF value member bounds")
+        elif kind == 3:
+            if self.resolve(words[1])[0] != 1:
+                raise RuntimeError("invalid BTF array index")
+            size = self.size(words[0], seen + (ref,)) * words[2]
+        elif kind == 2:
+            size = 8
+        else:
+            raise RuntimeError(f"unsupported BTF sized type {kind}")
+        if not 0 < size <= 0xffffffff:
+            raise RuntimeError("BTF size out of range")
+        return size
+
+    def map_definition(self, ref):
+        kind, _, size, count, flag, members, _ = self.resolve(ref)
+        if kind != 4 or flag or size != count * 8:
+            raise RuntimeError("unsupported BTF map struct layout")
+        fields = {}
+        for i in range(count):
+            name, ref, offset = members[i*3:i*3+3]
+            name = string_at(self.strings, name)
+            if name in fields:
+                raise RuntimeError("duplicate BTF map member")
+            if name not in {"type", "key", "value", "key_size", "value_size", "max_entries", "map_flags"}:
+                raise RuntimeError(f"unknown BTF map member {name!r}")
+            pointer = self.resolve(ref)
+            if offset != i * 64 or pointer[0] != 2:
+                raise RuntimeError("unsupported BTF map member layout")
+            if name in ("key", "value"):
+                fields[name] = self.size(pointer[2])
+            else:
+                array = self.resolve(pointer[2])
+                if array[0] != 3 or self.resolve(array[5][0])[0] != 1 or self.resolve(array[5][1])[0] != 1:
+                    raise RuntimeError("unsupported BTF map integer encoding")
+                fields[name] = array[5][2]
+        if "type" not in fields or any(x in fields and x + "_size" in fields for x in ("key", "value")):
+            raise RuntimeError("missing/conflicting BTF map fields")
+        return map_def(fields["type"], fields.get("key", fields.get("key_size", 0)),
+                       fields.get("value", fields.get("value_size", 0)),
+                       fields.get("max_entries", 0), fields.get("map_flags", 0)), size
+
+
+def decode_btf_maps(elf):
+    if ".BTF" not in elf.sections:
+        raise RuntimeError("native .maps missing .BTF")
+    btf = Btf(elf.sections[".BTF"][1])
+    sections = [n for n in btf.types[1:] if n[0] == 15 and n[1] == ".maps"]
+    if len(sections) != 1:
+        raise RuntimeError("missing/duplicate .maps BTF DATASEC")
+    _, _, size, count, flag, entries, position = sections[0]
+    row, raw = elf.sections[".maps"]
+    if row[1] != 1 or flag or size not in (0, len(raw)) or not raw or any(raw):
+        raise RuntimeError("unsupported native map section size/content")
+    objects = {}
+    for name, info, other, section, offset, size in elf.symbols:
+        if section != elf.indices[".maps"] or info & 15 == 3:
+            continue
+        if info not in (1, 0x11) or other != 0 or not name or name in objects:
+            raise RuntimeError("duplicate/unsupported native map symbol")
+        objects[name] = (offset, size)
+    maps, offsets, vars_seen = {}, set(), set()
+    cursor = 0
+    for i in sorted(range(count), key=lambda i: entries[i*3+1]):
+        ref, offset, size = entries[i*3:i*3+3]
+        node = btf.resolve(ref)
+        if node[0] != 14 or node[5][0] not in (0, 1) or ref in vars_seen:
+            raise RuntimeError("invalid/duplicate native BTF VAR")
+        vars_seen.add(ref)
+        name = node[1]
+        if not name or name in maps or objects.get(name) != (offset, size):
+            raise RuntimeError(f"native VAR/symbol mismatch or duplicate: {name}")
+        definition, struct_size = btf.map_definition(node[2])
+        if offset != cursor or offset % 8 or size != struct_size or size > len(raw) - offset:
+            raise RuntimeError("native map bounds/coverage mismatch")
+        cursor += size
+        maps[name] = definition
+        offsets.add(position + 12 + i * 12 + 4)
+    if cursor != len(raw) or set(maps) != set(objects):
+        raise RuntimeError("native map incomplete coverage/extra symbol")
+    # Every native VAR has exactly one DATASEC owner, including VARs omitted
+    # from the selected DATASEC but still named by a native ELF symbol.
+    for ref, node in enumerate(btf.types[1:], 1):
+        if node[0] == 14 and node[1] in objects and ref not in vars_seen:
+            raise RuntimeError("extra native BTF VAR")
+        if node[0] == 15 and node[1] != ".maps" and any(x in vars_seen for x in node[5][::3]):
+            raise RuntimeError("native VAR appears in multiple DATASECs")
+    # Relocations from *any* section can overwrite native type metadata.
+    # Admit only DATASEC VAR-offset destinations and the two emitted forms:
+    # a zero-base section symbol or an exact OBJECT symbol plus its addend.
+    destinations = {}
+    for node in btf.types[1:]:
+        if node[0] != 15:
+            continue
+        section_name = node[1]
+        if section_name not in elf.sections:
+            raise RuntimeError("BTF relocation DATASEC missing ELF section")
+        section_row, section_data = elf.sections[section_name]
+        if section_row[1] != 1 or node[2] not in (0, len(section_data)):
+            raise RuntimeError("unsupported BTF relocation DATASEC size/type")
+        for i in range(node[3]):
+            ref, addend, size = node[5][i*3:i*3+3]
+            var = btf.resolve(ref)
+            if var[0] != 14:
+                raise RuntimeError("BTF relocation DATASEC entry is not VAR")
+            matches = [symbol for symbol in elf.symbols
+                       if symbol[0] == var[1] and symbol[1] in (1, 0x11)
+                       and symbol[2] == 0 and symbol[3] == elf.indices[section_name]]
+            if len(matches) != 1 or matches[0][5] != size:
+                raise RuntimeError("BTF relocation VAR/symbol mismatch")
+            actual = matches[0]
+            if actual[4] + size > len(section_data):
+                raise RuntimeError("BTF relocation VAR out of bounds")
+            destinations[node[6] + 16 + i * 12] = (actual, addend)
+    found = set()
+    for name, (rel, data) in elf.sections.items():
+        if rel[1] not in (4, 9) or rel[7] != elf.indices[".BTF"]:
+            continue
+        if name != ".rel.BTF" or rel[1] != 9 or rel[9] != 16 or len(data) % 16 or rel[6] != elf.indices[".symtab"]:
+            raise RuntimeError("unsupported BTF relocation section")
+        seen = set()
+        for pos in range(0, len(data), 16):
+            offset, info = struct.unpack_from("<QQ", data, pos)
+            if offset in seen or offset + 4 > len(elf.sections[".BTF"][1]) or info >> 32 >= len(elf.symbols):
+                raise RuntimeError("invalid/duplicate BTF relocation")
+            seen.add(offset)
+            symbol = elf.symbols[info >> 32]
+            if offset not in destinations or info & 0xffffffff != 4:
+                raise RuntimeError("unsupported BTF relocation destination/kind")
+            actual, addend = destinations[offset]
+            section_symbol = symbol[1] == 3 and symbol[2] == 0 and symbol[4:] == (0, 0)
+            if (symbol[3] != actual[3] or not (section_symbol or symbol == actual)
+                    or addend + symbol[4] != actual[4]):
+                raise RuntimeError("unsupported BTF relocation symbol/addend")
+            native = symbol[3] == elf.indices[".maps"]
+            if offset in offsets or native:
+                if offset not in offsets or symbol[1] != 3 or symbol[2] != 0 or not native or symbol[4] != 0 or symbol[5] != 0 or info & 0xffffffff != 4:
+                    raise RuntimeError("unsupported native BTF relocation")
+                found.add(offset)
+    if found != offsets:
+        raise RuntimeError("missing native BTF relocation")
+    return maps
+
+
 def decode_map_definitions(records, section, data):
     objects = sorted(
         (offset, size, name)
@@ -68,19 +383,209 @@ def decode_map_definitions(records, section, data):
     return maps
 
 
-def inspect(path):
+REQUIRED_GLOBAL_HELPERS = frozenset({
+    "p11_link_current_identity", "p11_link_emit_fork", "p11_link_fork_allowed",
+})
+REQUIRED_LOCAL_OWNER_HELPERS = frozenset({
+    "p11_owner_cleanup", "p11_owner_start_get",
+    "p11_owner_start_insert", "p11_owner_start_remove", "p11_owner_discovery_get",
+    "p11_owner_discovery_insert", "p11_owner_discovery_remove",
+})
+REQUIRED_LOCAL_ROOT_HELPERS = frozenset({
+    "p11_root_propagate_thread", "p11_root_current_tag", "p11_root_current_exit",
+})
+OPTIONAL_LOCAL_OWNER_HELPERS = frozenset({"p11_owner_healthy"})
+EXACT_PROGRAM_SECTIONS = {
+    "task_newtask": "tp_btf/task_newtask",
+    "sched_process_exec": "raw_tp/sched_process_exec",
+    "sched_process_exit": "raw_tp/sched_process_exit",
+}
+
+DIAGNOSTIC_GLOBAL_HELPERS = frozenset({"p11_decode_params", "p11_walk_template"})
+
+
+def validate_private_helpers(elf, prefix, required, optional, label):
+    """Private owner APIs need caller-context verification, never GLOBAL BTF.
+
+    Verify retained bodies, function metadata and reachable BPF call edges.
+    Healthy alone may disappear after inlining. Do not retain dummy bodies just
+    to satisfy an inventory, or admit arbitrary owner clones/attachment targets.
+    """
+    owners = [s for s in elf.symbols if s[0].startswith(prefix)]
+    production = any(s[0] in EXACT_PROGRAM_SECTIONS or s[0] in REQUIRED_GLOBAL_HELPERS
+                     for s in elf.symbols)
+    if not owners and not production:
+        return
+    allowed = required | optional
+    names = [s[0] for s in owners]
+    if len(names) != len(set(names)):
+        raise RuntimeError(f"duplicate {label} helper symbol")
+    if set(names) - allowed:
+        raise RuntimeError(f"unexpected {label} helper or clone")
+    if missing := required - set(names):
+        raise RuntimeError(f"missing required {label} helpers: {sorted(missing)}")
+    for name, info, other, section, value, size in owners:
+        if info != 2 or other != 0 or section != elf.indices.get(".text"):
+            raise RuntimeError(f"{label} helper {name} must be LOCAL DEFAULT FUNC in .text")
+        if not size or value % 8 or size % 8 or value + size > len(elf.sections[".text"][1]):
+            raise RuntimeError(f"{label} helper {name} has invalid/empty body")
+    for name, location in EXACT_PROGRAM_SECTIONS.items():
+        matches = [s for s in elf.symbols if s[0] == name]
+        if (len(matches) != 1 or matches[0][1] != 0x12 or matches[0][2] != 0
+                or matches[0][3] != elf.indices.get(location)):
+            raise RuntimeError(f"missing/unclassified required program {name} in {location}")
+    if ".BTF" not in elf.sections or ".BTF.ext" not in elf.sections:
+        raise RuntimeError(f"{label} helpers require BTF FUNC and function info")
+    btf = Btf(elf.sections[".BTF"][1])
+    functions = {}
+    for ident, node in enumerate(btf.types[1:], 1):
+        if node[0] == 12 and node[1].startswith(prefix):
+            if node[1] in functions:
+                raise RuntimeError(f"duplicate {label} BTF FUNC")
+            functions[node[1]] = ident
+    if set(functions) != set(names):
+        raise RuntimeError(f"{label} helper ELF/BTF FUNC association mismatch")
+    for name, ident in functions.items():
+        node = btf.types[ident]
+        if node[3] != 0:
+            raise RuntimeError(f"{label} helper {name} requires STATIC BTF linkage")
+        if not node[2] or btf.types[node[2]][0] != 13:
+            raise RuntimeError(f"{label} helper {name} requires FUNC_PROTO")
+    ext = elf.sections[".BTF.ext"][1]
+    magic, version, flags, hlen, off, length = struct.unpack(
+        "<HBBIII", checked_slice(ext, 0, 16, "BTF.ext function info header"))
+    if (magic, version, flags, hlen) != (0xeb9f, 1, 0, 32):
+        raise RuntimeError("unsupported BTF.ext function info header")
+    raw = checked_slice(ext, hlen + off, length, "BTF.ext function info")
+    stride, = struct.unpack("<I", checked_slice(raw, 0, 4, "function info stride"))
+    if stride != 8:
+        raise RuntimeError("unsupported function info stride")
+    info_relocs = {}
+    for row, relocation_data in elf.sections.values():
+        if row[1] != 9 or row[7] != elf.indices[".BTF.ext"]:
+            continue
+        if row[9] != 16 or len(relocation_data) % 16:
+            raise RuntimeError("invalid function info relocations")
+        for at in range(0, len(relocation_data), 16):
+            address, info = struct.unpack_from("<QQ", relocation_data, at)
+            if address in info_relocs or info >> 32 >= len(elf.symbols):
+                raise RuntimeError("invalid/duplicate function info relocation")
+            info_relocs[address] = (info & 0xffffffff, elf.symbols[info >> 32])
+    pos, found = 4, {}
+    by_name = {s[0]: s for s in owners}
+    while pos < len(raw):
+        sec_name, count = struct.unpack("<II", checked_slice(raw, pos, 8, "function info section"))
+        section = string_at(btf.strings, sec_name)
+        if section not in elf.indices:
+            raise RuntimeError("function info section missing")
+        pos += 8
+        for _ in range(count):
+            record_offset = hlen + off + pos
+            address, ident = struct.unpack("<II", checked_slice(raw, pos, stride, "function info record"))
+            pos += stride
+            if not 0 < ident < len(btf.types) or btf.types[ident][0] != 12:
+                raise RuntimeError("function info must reference BTF FUNC")
+            name = btf.types[ident][1]
+            if name in by_name:
+                sym = by_name[name]
+                if name in found or elf.indices[section] != sym[3] or address != sym[4]:
+                    raise RuntimeError(f"{label} helper {name} function info mismatch/duplicate")
+                relocation = info_relocs.get(record_offset)
+                if (not relocation or relocation[0] != 4 or relocation[1][1] != 3
+                        or relocation[1][3] != sym[3] or relocation[1][4] != 0):
+                    raise RuntimeError(f"{label} helper {name} function info relocation mismatch")
+                found[name] = ident
+    if found != functions:
+        raise RuntimeError(f"{label} helper function info missing/mismatched")
+
+    # Resolve actual BPF-to-BPF calls, including section-symbol relocations.
+    bodies = {(s[3], s[4]): s for s in elf.symbols if s[1] & 15 == 2 and s[5] and s[3]}
+    relocs = {}
+    for row, raw in elf.sections.values():
+        if row[1] != 9 or row[7] not in {key[0] for key in bodies}:
+            continue
+        if row[9] != 16 or len(raw) % 16:
+            raise RuntimeError(f"invalid {label} call relocation table")
+        for pos in range(0, len(raw), 16):
+            address, info = struct.unpack_from("<QQ", raw, pos)
+            if info >> 32 >= len(elf.symbols) or (row[7], address) in relocs:
+                raise RuntimeError(f"invalid/duplicate {label} call relocation")
+            relocs[row[7], address] = (info & 0xffffffff, elf.symbols[info >> 32])
+    sections = {elf.indices[name]: raw for name, (_, raw) in elf.sections.items()}
+    edges = {key: set() for key in bodies}
+    for key, sym in bodies.items():
+        section, start = key
+        raw = checked_slice(sections.get(section, b""), start, sym[5], "function body")
+        for pos in range(0, len(raw), 8):
+            op, reg, _, imm = struct.unpack("<BBhi", checked_slice(raw, pos, 8, "BPF instruction"))
+            if op != 0x85 or reg != 0x10:
+                continue
+            relocation = relocs.get((section, start + pos))
+            if relocation:
+                kind, target = relocation
+                if kind != 10:
+                    raise RuntimeError(f"invalid {label} BPF call relocation kind")
+                dest = (target[3], target[4] + (imm + 1) * 8)
+            else:
+                dest = (section, start + pos + (imm + 1) * 8)
+            if dest not in bodies:
+                raise RuntimeError(f"unresolved BPF call in {label} object")
+            edges[key].add(dest)
+    reachable, todo = set(), [key for key, sym in bodies.items()
+                             if sym[1] >> 4 == 1 and key[0] != elf.indices.get(".text")]
+    while todo:
+        key = todo.pop()
+        if key not in reachable:
+            reachable.add(key)
+            todo.extend(edges[key])
+    for name, _, _, section, start, _ in owners:
+        if name in required and (section, start) not in reachable:
+            raise RuntimeError(f"{label} helper {name} has no reachable call boundary")
+
+
+def validate_owner_helpers(elf):
+    validate_private_helpers(elf, "p11_owner_", REQUIRED_LOCAL_OWNER_HELPERS,
+                             OPTIONAL_LOCAL_OWNER_HELPERS, "owner")
+
+def validate_root_helpers(elf):
+    validate_private_helpers(elf, "p11_root_", REQUIRED_LOCAL_ROOT_HELPERS,
+                             frozenset(), "root")
+
+def inspect(path, allowed_text_globals=frozenset()):
+    elf = Elf(Path(path).read_bytes())
     records, sections = elf_records(path)
-    if "maps" not in sections:
+    if records != elf.records or {name: index for name, index in sections.items() if index} != elf.indices:
+        raise RuntimeError("LLVM/raw ELF metadata mismatch")
+    if "maps" not in sections and ".maps" not in sections:
         raise RuntimeError(f"{path} has no maps section")
-    with tempfile.TemporaryDirectory() as directory:
-        raw = Path(directory) / "maps.bin"
-        subprocess.run(["llvm-objcopy", "--dump-section", f"maps={raw}", path], check=True)
-        data = raw.read_bytes()
-    maps = decode_map_definitions(records, sections["maps"], data)
-    return maps, classify(records, sections), {record[-1] for record in records}
+    maps = {}
+    if "maps" in sections:
+        if elf.sections["maps"][0][1] != 1:
+            raise RuntimeError("unsupported legacy maps section type")
+        with tempfile.TemporaryDirectory() as directory:
+            raw = Path(directory) / "maps.bin"
+            subprocess.run(["llvm-objcopy", "--dump-section", f"maps={raw}", path], check=True)
+            data = raw.read_bytes()
+        if data != elf.sections["maps"][1]:
+            raise RuntimeError("LLVM/raw legacy section mismatch")
+        maps = decode_map_definitions(records, sections["maps"], data)
+    if ".maps" in sections:
+        native = decode_btf_maps(elf)
+        if maps.keys() & native.keys():
+            raise RuntimeError("cross-section duplicate map names")
+        maps.update(native)
+    elif ".BTF" in sections:
+        btf = Btf(elf.sections[".BTF"][1])
+        if any(node[0] == 15 and node[1] == ".maps" for node in btf.types[1:]):
+            raise RuntimeError("native BTF DATASEC missing ELF .maps section")
+    validate_owner_helpers(elf)
+    validate_root_helpers(elf)
+    return maps, classify(records, sections, allowed_text_globals | REQUIRED_GLOBAL_HELPERS), {
+        record[-1] for record in records
+    }
 
 
-def classify(records, sections):
+def classify(records, sections, allowed_text_globals=frozenset()):
     """Return the object's BPF program names, refusing what cannot be classified.
 
     A program emitted under an attach type the whitelist does not name (`raw_tp/`,
@@ -90,27 +595,47 @@ def classify(records, sections):
     error. Symbols with a non-numeric section index (`UND`, `ABS` — a kfunc extern
     appears this way) are neither counted nor refused, as they were before.
 
-    The `FUNC`/`GLOBAL`/`DEFAULT` filter is inherited from the program scan: the
-    compiler's mem* helpers are `GLOBAL HIDDEN` and never reach here.
+    Compiler mem* helpers are admitted only as unique GLOBAL HIDDEN functions
+    in .text; they cannot carry an unclassified program through another section.
     """
-    program_sections = {
-        index for name, index in sections.items()
-        if name in {"uprobe", "uretprobe"} or name.startswith("tracepoint/")
-    }
-    globals_in = lambda wanted: {
-        (name, section)
-        for _, _, kind, bind, visibility, section, name in records
-        if kind == "FUNC" and bind == "GLOBAL" and visibility == "DEFAULT"
-        and section.isdigit() and (int(section) in program_sections) == wanted
-    }
     by_index = {index: name for name, index in sections.items()}
-    stray = sorted(
-        f"{name} in {by_index.get(int(section), section)}"
-        for name, section in globals_in(False)
-    )
-    if stray:
-        raise RuntimeError(f"global functions in unclassified sections: {stray}")
-    return {name for name, _ in globals_in(True)}
+    programs, helpers, seen = set(), set(), set()
+    for _, _, kind, bind, visibility, section, name in records:
+        if kind != "FUNC" or not section.isdigit():
+            continue
+        location = by_index.get(int(section), section)
+        if bind == "LOCAL":
+            if location != ".text":
+                raise RuntimeError(f"unclassified local function {name} in {location}")
+            continue
+        if name in seen:
+            raise RuntimeError(f"duplicate global function {name}")
+        seen.add(name)
+        if (visibility == "HIDDEN" and bind == "GLOBAL" and location == ".text"
+                and name in {"memcpy", "memset", "memmove", "memcmp", "bcmp"}):
+            continue
+        exact = EXACT_PROGRAM_SECTIONS.get(name)
+        if bind != "GLOBAL" or visibility != "DEFAULT":
+            raise RuntimeError(f"unclassified global function {name} in {location}")
+        if name in REQUIRED_GLOBAL_HELPERS | DIAGNOSTIC_GLOBAL_HELPERS:
+            if name in allowed_text_globals and location == ".text":
+                helpers.add(name)
+                continue
+        elif exact:
+            if location == exact:
+                programs.add(name)
+                continue
+        elif location in {"uprobe", "uretprobe"} or location.startswith("tracepoint/"):
+            programs.add(name)
+            continue
+        raise RuntimeError(f"global functions in unclassified sections: {name} in {location}")
+    # Generic fixtures need no production helpers. A production hook or helper
+    # selects the complete exact export contract, independent of program counts.
+    if programs & EXACT_PROGRAM_SECTIONS.keys() or helpers & REQUIRED_GLOBAL_HELPERS:
+        missing = REQUIRED_GLOBAL_HELPERS - helpers
+        if missing:
+            raise RuntimeError(f"missing required .text helpers: {sorted(missing)}")
+    return programs
 
 
 def definitions(path):
@@ -131,13 +656,19 @@ SAFE_MAPS = {
         "DISCOVERY": (27, 0, 0, 65_536),
         "DISCOVERY_STATE": (1, 24, 24, 64),
         "EVENTS": (27, 0, 0, 262_144),
-        "EVIDENCE": (6, 4, 8, 8),
+        "EVIDENCE": (6, 4, 8, 9),
         "MECH_SHAPE": (1, 8, 4, 1_024, 128),
         "PAUSE_PIDS": (1, 16, 8, 1),
         "PID_FILTER": (1, 4, 8, 1_024, 128),
         "RV_COUNTS": (5, 16, 8, 4_096),
         "DESCRIPTORS": (2, 4, 18, 105, 128),
-        "START": (1, 16, 272, 16_384),
+        "START": (1, 16, 288, 16_384),
+        "TASK_COOKIE": (29, 4, 8, 0, 1),
+        "COOKIE_CTL": (2, 4, 40, 1),
+        "THREAD_OWNER": (29, 4, 544, 0, 1),
+        "OWNER_CTL": (2, 4, 56, 1),
+        "ROOT_AFFILIATION": (29, 4, 8, 0, 1),
+        "ROOT_CTL": (2, 4, 64, 1),
         "STATS": (6, 4, 296, 512),
         "TAIL_CALLS": (3, 4, 4, 2),
     }.items()
@@ -161,6 +692,7 @@ SAFE_PROGRAMS = {
     "sched_process_exit",
 }
 UNSAFE_PROGRAMS = SAFE_PROGRAMS | {
+    "p11_entry_ia32",
     "p11_entry_template", "p11_entry_template_pair",
     "p11_entry_template_second", "p11_entry_template_types",
 }
@@ -172,10 +704,15 @@ FROZEN_INVENTORY = {
 }
 
 
-# Per-variant decoder-symbol freeze: (decode_params present?, walk_template count).
-# The default object must carry no parameter decoder at all; the diagnostic one
-# carries the decoder and exactly three template walkers.
-FROZEN_SYMBOLS = {"default": (False, 0), "diagnostic": (True, 3)}
+# Per-variant private decoder freeze:
+# (global params?, global full-template?, local params count, local full walker
+# count, local types-only walker count).
+# The diagnostic object carries two ABI-specialized local implementations under
+# each global boundary, plus two ABI-specialized local types-only walkers.
+FROZEN_SYMBOLS = {
+    "default": (False, False, 0, 0, 0),
+    "diagnostic": (True, True, 2, 2, 2),
+}
 
 
 def validate_inventory(variant, maps, programs, symbols):
@@ -202,15 +739,21 @@ def validate_inventory(variant, maps, programs, symbols):
         for name in sorted(frozen_programs - programs):
             print(f"program removed: {name}", file=sys.stderr)
         raise RuntimeError(f"{variant} program inventory differs")
+    missing_helpers = REQUIRED_GLOBAL_HELPERS - symbols
+    if missing_helpers:
+        raise RuntimeError(f"missing required .text helpers: {sorted(missing_helpers)}")
     found = (
-        any("decode_params" in name for name in symbols),
-        sum("walk_template" in name for name in symbols),
+        "p11_decode_params" in symbols,
+        "p11_walk_template" in symbols,
+        sum("decode_params" in name for name in symbols if name != "p11_decode_params"),
+        sum("walk_template_impl" in name for name in symbols),
+        sum("walk_template_types" in name for name in symbols),
     )
     if found != FROZEN_SYMBOLS[variant]:
         print(
-            f"decode_params={found[0]} walk_template={found[1]} "
-            f"frozen decode_params={FROZEN_SYMBOLS[variant][0]} "
-            f"walk_template={FROZEN_SYMBOLS[variant][1]}",
+            f"global_params={found[0]} global_template={found[1]} "
+            f"local_params={found[2]} local_full={found[3]} local_types={found[4]} "
+            f"frozen={FROZEN_SYMBOLS[variant]}",
             file=sys.stderr,
         )
         raise RuntimeError(f"{variant} decoder symbol inventory differs")
@@ -227,19 +770,32 @@ def self_test():
     assert SAFE_MAPS["COUNTERS"] == map_def(6, 4, 8, 5)
     assert SAFE_MAPS["PAUSE_PIDS"] == map_def(1, 16, 8, 1)
     assert SAFE_MAPS["PID_FILTER"] == map_def(1, 4, 8, 1_024, 128)
-    assert len(SAFE_MAPS) == 16
-    assert len(UNSAFE_MAPS) == 17
+    assert SAFE_MAPS["EVIDENCE"] == map_def(6, 4, 8, 9)
+    assert len(SAFE_MAPS) == 22
+    assert len(UNSAFE_MAPS) == 23
     assert len(SAFE_PROGRAMS) == 13
-    assert len(UNSAFE_PROGRAMS) == 17
-    good = (SAFE_MAPS, SAFE_PROGRAMS, {"p11_entry"})
+    assert len(UNSAFE_PROGRAMS) == 18
+    good = (SAFE_MAPS, SAFE_PROGRAMS, {"p11_entry"} | REQUIRED_GLOBAL_HELPERS)
     diagnostic = (
         UNSAFE_MAPS,
         UNSAFE_PROGRAMS,
-        {"decode_params", "walk_template-0", "walk_template-1", "walk_template-2"},
+        {
+            "p11_decode_params",
+            "p11_walk_template",
+            "decode_params-0",
+            "decode_params-1",
+            "walk_template_impl-0",
+            "walk_template_impl-1",
+            "walk_template_types-0",
+            "walk_template_types-1",
+        } | REQUIRED_GLOBAL_HELPERS,
     )
     validate_policy_inventory(good, diagnostic)
 
     def rejected(check, *arguments):
+        if check is validate_inventory:
+            *prefix, symbols = arguments
+            arguments = (*prefix, symbols | REQUIRED_GLOBAL_HELPERS)
         errors = io.StringIO()
         try:
             with contextlib.redirect_stderr(errors):
@@ -277,10 +833,22 @@ def self_test():
     assert rejected(
         validate_inventory, "default", SAFE_MAPS, SAFE_PROGRAMS, {"p11_entry", "decode_params"}
     ) == [
-        "decode_params=True walk_template=0 frozen decode_params=False walk_template=0"
+        "global_params=False global_template=False local_params=1 local_full=0 local_types=0 "
+        "frozen=(False, False, 0, 0, 0)"
+    ]
+    assert rejected(
+        validate_inventory,
+        "default",
+        SAFE_MAPS,
+        SAFE_PROGRAMS,
+        {"p11_entry", "p11_decode_params"},
+    ) == [
+        "global_params=True global_template=False local_params=0 local_full=0 local_types=0 "
+        "frozen=(False, False, 0, 0, 0)"
     ]
     assert rejected(validate_inventory, "diagnostic", UNSAFE_MAPS, UNSAFE_PROGRAMS, set()) == [
-        "decode_params=False walk_template=0 frozen decode_params=True walk_template=3"
+        "global_params=False global_template=False local_params=0 local_full=0 local_types=0 "
+        "frozen=(True, True, 2, 2, 2)"
     ]
     # The unclassified-section refusal, which no real object can exercise.
     sections = {".text": 1, "uprobe": 2, "raw_tp/sched_process_exit": 3}
@@ -293,6 +861,24 @@ def self_test():
             assert name in str(error), error
         else:
             raise AssertionError(f"unclassified {name} accepted")
+    assert classify(
+        [func(2, "p11_entry")] + [func(1, name) for name in DIAGNOSTIC_GLOBAL_HELPERS],
+        sections,
+        DIAGNOSTIC_GLOBAL_HELPERS,
+    ) == {"p11_entry"}
+    for helper in DIAGNOSTIC_GLOBAL_HELPERS:
+        for section, name in [
+            (1, helper),
+            (1, f"{helper}_extra"),
+            (3, helper),
+        ]:
+            allowed = DIAGNOSTIC_GLOBAL_HELPERS if (section, name) != (1, helper) else set()
+            try:
+                classify([func(2, "p11_entry"), func(section, name)], sections, allowed)
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError(f"non-diagnostic or inexact global helper {name} accepted")
     # mem* helpers are GLOBAL HIDDEN, so the visibility filter already excludes
     # them; the name carries no exemption of its own.
     assert classify([(0, 0, "FUNC", "GLOBAL", "HIDDEN", "1", "memcpy")], sections) == set()
@@ -329,7 +915,7 @@ def usage():
     return (
         f"usage: {sys.argv[0]} BPF_ELF MAP=MAX_ENTRIES [...] | "
         "--inventory default|diagnostic BPF_ELF | "
-        "--policy-inventory DEFAULT_ELF DIAGNOSTIC_ELF | --self-test"
+        "--policy-inventory DEFAULT_ELF DIAGNOSTIC_ELF | --json BPF_ELF | --self-test"
     )
 
 
@@ -337,20 +923,31 @@ def main():
     if sys.argv[1:] == ["--self-test"]:
         self_test()
         return
+    if sys.argv[1:2] == ["--json"]:
+        if len(sys.argv) != 3:
+            raise SystemExit(usage())
+        maps, programs, symbols = inspect(sys.argv[2], DIAGNOSTIC_GLOBAL_HELPERS)
+        print(json.dumps({"maps": maps, "programs": sorted(programs), "symbols": sorted(symbols)}, sort_keys=True))
+        return
     if sys.argv[1:2] == ["--inventory"]:
         if len(sys.argv) != 4:
             raise SystemExit(usage())
         variant, path = sys.argv[2], sys.argv[3]
         if variant not in FROZEN_INVENTORY:
             raise RuntimeError(f"unknown inventory variant {variant!r}")
-        maps, programs, symbols = inspect(path)
+        # Permit only the two exact exported decoder names through section
+        # classification; the per-variant symbol freeze below still rejects
+        # either helper in a default object. This lets the cross-variant
+        # negative control reach the requested inventory comparison.
+        maps, programs, symbols = inspect(path, DIAGNOSTIC_GLOBAL_HELPERS)
         validate_inventory(variant, maps, programs, symbols)
         print(f"inventory {variant}: maps={len(maps)} programs={len(programs)} OK")
         return
     if sys.argv[1:2] == ["--policy-inventory"]:
         if len(sys.argv) != 4:
             raise SystemExit(usage())
-        safe, unsafe = inspect(sys.argv[2]), inspect(sys.argv[3])
+        safe = inspect(sys.argv[2])
+        unsafe = inspect(sys.argv[3], DIAGNOSTIC_GLOBAL_HELPERS)
         validate_policy_inventory(safe, unsafe)
         print(
             f"policy inventory: default maps={len(safe[0])} programs={len(safe[1])}; "

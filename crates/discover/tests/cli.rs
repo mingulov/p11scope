@@ -118,6 +118,7 @@ fn constructor_sees_no_planted_fd_or_loader_env() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture/fd_env_canary.c");
     assert!(
         Command::new("gcc")
+            .arg(format!("-m{}", usize::BITS))
             .args(["-shared", "-fPIC", "-o"])
             .arg(&provider)
             .arg(&src)
@@ -127,6 +128,7 @@ fn constructor_sees_no_planted_fd_or_loader_env() {
     );
     assert!(
         Command::new("gcc")
+            .arg(format!("-m{}", usize::BITS))
             .args(["-shared", "-fPIC", "-DDEPENDENCY", "-o"])
             .arg(&dependency)
             .arg(&src)

@@ -16,6 +16,7 @@ COUNTERS = (
     "unmatched_returns",
     "rv_update_failures",
     "cgroup_scope_failures",
+    "abi_refusals",
     "semantic_capture_failures",
     "unregistered_mechanisms",
     "template_tail_failures",
@@ -57,10 +58,11 @@ COUNTERS = (
 )
 
 # v2-metrics is retained only for historical fixtures and compatibility reads;
-# it predates the task-uprobe link-loss evidence added to v3-metrics.
+# it predates the task-uprobe link-loss and ABI-refusal evidence added to v3.
 HISTORICAL_METRICS_SCHEMA = "pkcs11-scope/observed-profile/v2-metrics"
 HISTORICAL_COUNTERS = tuple(
-    counter for counter in COUNTERS if counter != "task_uprobe_link_losses"
+    counter for counter in COUNTERS
+    if counter not in {"abi_refusals", "task_uprobe_link_losses"}
 )
 
 # `evidence.loader_discovery` (design §9.2): finite, aggregate, and closed.
@@ -160,22 +162,33 @@ VERSION_SURFACES = Counter(
     }
 )
 # SCANNED — the canary workload maps the provider *before* attach, so both
-# sources describe it. Only three of the provider's thirteen tables live in the
-# object's file-backed data; the other ten are built at run time in .bss. The
-# scan decoded a nonempty file-backed subset, so the runtime-only tables are not
-# object-level scan failures. The differing source sets are recorded by one
-# `discovery_conflict` and exact per-source table records.
+# sources describe it. LP64 scans three file-backed tables and reports one
+# conflict; ILP32 also scans the 3.1 and 3.2 tables and agrees with the manifest.
+# Tables built at run time in .bss are not object-level scan failures. Every
+# scanned table remains an exact per-source record.
 #
 # What the union does *not* change is the attach plan: 104 slots and 208 probes,
 # exactly as before, because a slot is one {object, file offset} however many
-# sources named it. `surfaces` keeps the per-source records, so the three scan
-# tables add three surfaces (13 -> 16). `table_entries` counts exact target
-# occurrences across sources, so this scan subset does not add another 228.
+# sources named it. `surfaces` keeps the per-source records, so the scan adds
+# three LP64 surfaces (13 -> 16) or five ILP32 surfaces (13 -> 18).
+# `table_entries` counts exact target occurrences across sources, so neither
+# scan subset changes the 988-entry union.
 VERSION_SURFACES_SCANNED = VERSION_SURFACES + Counter(
     {("full", 68): 2, ("full", 92): 1}
 )
+VERSION_SURFACES_SCANNED_IA32 = VERSION_SURFACES_SCANNED + Counter(
+    {("full", 92): 1, ("full", 104): 1}
+)
 VERSION_SHAPE_MANIFEST_ONLY = (988, 104, 208, VERSION_SURFACES, 1, "ok")
 VERSION_SHAPE_SCANNED = (988, 104, 208, VERSION_SURFACES_SCANNED, 1, "ok")
+VERSION_SHAPE_SCANNED_IA32 = (
+    988,
+    104,
+    208,
+    VERSION_SURFACES_SCANNED_IA32,
+    1,
+    "ok",
+)
 VERSION_TABLES_MANIFEST_ONLY = Counter(
     {
         ("manifest", (0, 0), 0): 1,
@@ -189,6 +202,9 @@ VERSION_TABLES_MANIFEST_ONLY = Counter(
 )
 VERSION_TABLES_SCANNED = VERSION_TABLES_MANIFEST_ONLY + Counter(
     {("scan", (2, 40), 68): 2, ("scan", (3, 0), 92): 1}
+)
+VERSION_TABLES_SCANNED_IA32 = VERSION_TABLES_SCANNED + Counter(
+    {("scan", (3, 1), 92): 1, ("scan", (3, 2), 104): 1}
 )
 DISCOVERY_SUBJECT = "discovery subject"
 DISCOVERY_UNAVAILABLE = "discovery unavailable"
@@ -1510,14 +1526,14 @@ def validate_lane13_knative_metrics(document, expected):
     )
 
 
-def validate_canary(lane, document):
+def validate_canary(lane, document, target_bits=64):
     """A canary lane: the version-matrix provider, exact in shape and policy.
 
     The third element of each row is how discovery saw the provider. The canary
     workload maps it before attach, so both sources describe it (`scanned`).
     Since 1d3837b the initial provider export hooks attach before readiness, so
     a workload released only after attach is still observed live: its bootstrap
-    calls trigger the scan, which corroborates the manifest mid-capture. The
+    calls trigger the scan, which compares with the manifest mid-capture. The
     live freeze lane therefore measures the scanned row exactly, and
     verify-induced-gaps.sh validates its capture as `feature-unsafe-profile`.
     The `freeze-unsafe-profile` row keeps the manifest-only expectation — still
@@ -1537,6 +1553,7 @@ def validate_canary(lane, document):
         "freeze-unsafe-profile": ("unsafe", "profile", "manifest-only"),
     }
     require(lane in lanes, f"unknown canary lane: {lane}")
+    require(target_bits in (32, 64), f"invalid canary target width: {target_bits!r}")
     policy, kind, discovery = lanes[lane]
     trace = kind == "trace"
     evidence = document if trace else document["evidence"]
@@ -1547,10 +1564,12 @@ def validate_canary(lane, document):
         exact_profile_v3_selection(document, terminal=trace)
 
     scanned = discovery == "scanned"
-    exact_shape(
-        evidence, *(VERSION_SHAPE_SCANNED if scanned else VERSION_SHAPE_MANIFEST_ONLY)
+    scanned_shape = VERSION_SHAPE_SCANNED_IA32 if target_bits == 32 else VERSION_SHAPE_SCANNED
+    exact_shape(evidence, *(scanned_shape if scanned else VERSION_SHAPE_MANIFEST_ONLY))
+    scanned_tables = (
+        VERSION_TABLES_SCANNED_IA32 if target_bits == 32 else VERSION_TABLES_SCANNED
     )
-    wanted_tables = VERSION_TABLES_SCANNED if scanned else VERSION_TABLES_MANIFEST_ONLY
+    wanted_tables = scanned_tables if scanned else VERSION_TABLES_MANIFEST_ONLY
     require(
         table_signature(evidence) == wanted_tables,
         f"unexpected discovery tables: {evidence['discovery']}",
@@ -1564,13 +1583,25 @@ def validate_canary(lane, document):
     allowances = dict(
         SAFE_ALLOWANCES if policy == "safe" else UNSAFE_ALLOWANCES if policy == "unsafe" else {}
     )
-    allowances["discovery_conflicts" if scanned else "discovery_uncorroborated"] = 1
+    if scanned and target_bits == 64:
+        allowances["discovery_conflicts"] = 1
+    elif not scanned:
+        allowances["discovery_uncorroborated"] = 1
     exact_counters(evidence, allowances)
     sources = [module["sources"] for module in evidence["discovery"]]
     require(
         sources == ([["scan", "manifest"]] if scanned else [["manifest"]]),
         f"unexpected discovery sources: {sources}",
     )
+    outcomes = [module["corroboration"] for module in evidence["discovery"]]
+    wanted_outcomes = (
+        [["agreed"]]
+        if scanned and target_bits == 32
+        else [["conflict"]]
+        if scanned
+        else [["uncorroborated"]]
+    )
+    require(outcomes == wanted_outcomes, f"unexpected corroboration: {outcomes}")
 
     privacy = {
         "safe": "allowlisted",
@@ -1827,6 +1858,7 @@ def document_fixture(evidence, *, schema=PROFILE_SCHEMA, mode="profile", privacy
             evidence.pop(field, None)
         if schema == HISTORICAL_METRICS_SCHEMA:
             evidence.pop("task_uprobe_link_losses", None)
+            evidence.pop("abi_refusals", None)
     return {
         "schema": schema,
         "capture": {
@@ -2304,6 +2336,51 @@ def self_test():
     safe = document_fixture(copy.deepcopy(version))
     safe["evidence"].update(SAFE_ALLOWANCES)
     validate_canary("default-safe-profile", safe)
+
+    safe32 = copy.deepcopy(safe)
+    safe32["evidence"]["surfaces"].extend(
+        [
+            {
+                "walk": "full",
+                "functions": functions,
+                "acquisition": "ok",
+                "source": f"/opt/p11.so table {major}.{minor}",
+            }
+            for major, minor, functions in ((3, 1, 92), (3, 2, 104))
+        ]
+    )
+    safe32["evidence"]["discovery"][0]["tables"].extend(
+        [
+            {"source": "scan", "version": [3, 1], "entries": 92},
+            {"source": "scan", "version": [3, 2], "entries": 104},
+        ]
+    )
+    safe32["evidence"]["discovery"][0].update(
+        corroborated=True,
+        corroboration=["agreed"],
+    )
+    safe32["evidence"]["discovery_conflicts"] = 0
+    validate_canary("default-safe-profile", safe32, 32)
+    rejected(lambda: validate_canary("default-safe-profile", safe32, 64))
+    rejected(lambda: validate_canary("default-safe-profile", safe, 32))
+    for label, mutate in (
+        ("missing ia32 scan table", lambda d: d["evidence"]["discovery"][0]["tables"].pop()),
+        (
+            "extra ia32 scan table",
+            lambda d: d["evidence"]["discovery"][0]["tables"].append(
+                {"source": "scan", "version": [3, 9], "entries": 104}
+            ),
+        ),
+        (
+            "relabeled ia32 scan table",
+            lambda d: d["evidence"]["discovery"][0]["tables"][-1].update(source="manifest"),
+        ),
+    ):
+        bad = copy.deepcopy(safe32)
+        mutate(bad)
+        rejected(lambda bad=bad: validate_canary("default-safe-profile", bad, 32))
+    print("canary ABI-specific scan shapes and cross-width refusals: OK")
+
     for mutate in (
         lambda d: d["evidence"].pop("interface_selection"),
         lambda d: d["evidence"].update(attach_mechanisms=["secret-canary"]),
@@ -2785,6 +2862,7 @@ def self_test():
         ("aliased", ["C_Sign"]),
         ("semantic_state_drops", 1),
         ("rv_update_failures", 1),
+        ("abi_refusals", 1),
     ):
         bad = copy.deepcopy(clean["evidence"])
         bad[field] = value
@@ -3225,9 +3303,10 @@ def main(argv):
             multiplier,
             discovery=discovery,
         )
-    elif argv[0] == "canary" and len(argv) == 3:
+    elif argv[0] == "canary" and len(argv) in (3, 4):
         trace = argv[1].endswith("-trace")
-        validate_canary(argv[1], load_canary(argv[2], trace))
+        target_bits = 64 if len(argv) == 3 else int(argv[3])
+        validate_canary(argv[1], load_canary(argv[2], trace), target_bits)
     elif argv[0] == "induced" and len(argv) == 3:
         validate_induced(argv[1], load_json(argv[2]))
     else:
@@ -3237,7 +3316,7 @@ def main(argv):
             "shared-layer-metrics OUTPUT EXPECTED [MULTIPLIER] | "
             "lane13-knative-metrics OUTPUT EXPECTED | "
             "lane02-owned-run-metrics OUTPUT EXPECTED POLICY | "
-            "canary LANE OUTPUT | induced G[1-5] OUTPUT | --self-test"
+            "canary LANE OUTPUT [32|64] | induced G[1-5] OUTPUT | --self-test"
         )
 
 

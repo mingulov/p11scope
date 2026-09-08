@@ -15,6 +15,8 @@ pub enum HookAbi {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookRegistry {
     entries: Vec<(String, HookAbi)>,
+    #[cfg(test)]
+    first_id_overflows_export_cookie: bool,
 }
 
 const BUILTIN: [(&str, HookAbi); 5] = [
@@ -34,6 +36,16 @@ impl HookRegistry {
                 .iter()
                 .map(|(name, abi)| ((*name).to_string(), *abi))
                 .collect(),
+            #[cfg(test)]
+            first_id_overflows_export_cookie: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_overflowing_export_cookie_id() -> Self {
+        Self {
+            first_id_overflows_export_cookie: true,
+            ..Self::builtin()
         }
     }
 
@@ -89,13 +101,29 @@ impl HookRegistry {
     /// Stable one-based symbol identifier. The dynamic export cookie encoder
     /// accepts it only when it fits the cookie's low 24-bit field.
     pub fn id(&self, name: &str) -> Option<u32> {
-        self.entries
+        let id = self
+            .entries
             .iter()
             .position(|(candidate, _)| candidate == name)
-            .and_then(|position| u32::try_from(position + 1).ok())
+            .and_then(|position| u32::try_from(position + 1).ok())?;
+        #[cfg(test)]
+        if self.first_id_overflows_export_cookie && id == 1 {
+            return Some(0x0100_0000);
+        }
+        Some(id)
     }
 
     pub fn by_id(&self, id: u32) -> Option<(&str, HookAbi)> {
+        #[cfg(test)]
+        let id = if self.first_id_overflows_export_cookie {
+            match id {
+                0x0100_0000 => 1,
+                1 => return None,
+                id => id,
+            }
+        } else {
+            id
+        };
         let position = usize::try_from(id.checked_sub(1)?).ok()?;
         self.entries
             .get(position)
@@ -189,5 +217,22 @@ mod tests {
 
         r.add_spec("V_Other").unwrap();
         assert_eq!(r.id("V_Other"), Some(7));
+    }
+
+    #[test]
+    fn overflowing_export_cookie_fixture_preserves_registry_inverses() {
+        let r = HookRegistry::with_overflowing_export_cookie_id();
+
+        assert_eq!(r.id("C_GetFunctionList"), Some(0x0100_0000));
+        assert_eq!(
+            r.by_id(0x0100_0000),
+            Some(("C_GetFunctionList", HookAbi::FunctionList))
+        );
+        assert_eq!(r.by_id(1), None);
+        for (position, (name, abi)) in BUILTIN.iter().enumerate().skip(1) {
+            let id = (position + 1) as u32;
+            assert_eq!(r.id(name), Some(id));
+            assert_eq!(r.by_id(id), Some((*name, *abi)));
+        }
     }
 }

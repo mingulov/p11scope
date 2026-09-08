@@ -1709,7 +1709,7 @@ fn safe_archive_path(value: &str) -> bool {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    p11scope_manifest::identity::hex(&Sha256::digest(bytes))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

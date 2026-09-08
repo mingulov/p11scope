@@ -844,6 +844,7 @@ fn retiring_one_shared_namespace_view_keeps_only_the_stable_views_claims() {
         mount_namespace: namespace,
         key: manifest_key(&provider),
         path: provider.display().to_string(),
+        decoder_abi: Some(p11scope_manifest::elf::ElfAbi::Lp64),
         exports: vec!["C_GetFunctionList".into()],
         tables: vec![ScannedTable {
             version: (2, 40),
@@ -920,6 +921,7 @@ fn retiring_a_rejected_provider_view_removes_its_unplanned_pins_and_raw_aliases(
         mount_namespace: current_mount_namespace(),
         key: rejected_provider,
         path: provider.display().to_string(),
+        decoder_abi: Some(p11scope_manifest::elf::ElfAbi::Lp64),
         exports: vec!["C_GetFunctionList".into()],
         tables: vec![ScannedTable {
             version: (2, 40),
@@ -1222,6 +1224,55 @@ fn ordinary_host_manifest_behavior_is_unchanged_with_retained_views() {
     let pinning = pin_manifest_objects_deferred_in_views(&manifest, &[view]).unwrap();
     assert!(pinning.stale.is_empty());
     assert_eq!(pinning.pins.pinned().count(), 1);
+}
+
+#[test]
+fn ordinary_host_manifest_forwards_mountinfo_budget() {
+    use p11scope::discovery::identity::{
+        ManifestPinError, pin_manifest_objects_deferred_in_views_with_budget,
+    };
+
+    let d = tmpdir("manifest_pinning_host_mountinfo_budget");
+    let so = cc_so(&d, "provider", "int f(void){return 1;}\n");
+    let manifest = manifest_for(&so);
+    let mut budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: u64::MAX,
+        total_bytes: 0,
+    });
+    let error = pin_manifest_objects_deferred_in_views_with_budget(&manifest, &[], &mut budget)
+        .expect_err("observer mountinfo must share the exhausted capture budget");
+    assert!(
+        matches!(error, ManifestPinError::Fatal(ref errors)
+            if errors.iter().any(|error| error.contains("attempted-I/O ceiling"))),
+        "{error:?}"
+    );
+    assert_eq!(budget.attempted_io_bytes(), 0);
+}
+
+#[test]
+fn retained_view_manifest_forwards_mountinfo_budget() {
+    use p11scope::discovery::identity::{
+        ManifestPinError, pin_manifest_objects_deferred_in_views_with_budget,
+    };
+
+    let d = tmpdir("manifest_pinning_retained_mountinfo_budget");
+    let so = cc_so(&d, "provider", "int f(void){return 1;}\n");
+    let pid = std::process::id();
+    let locator = PathBuf::from(format!("/proc/{pid}/root{}", so.display()));
+    let manifest = manifest_for(&locator);
+    let view = ProcessView::open(ProcessViewId(22), pid).unwrap();
+    let mut budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: u64::MAX,
+        total_bytes: 0,
+    });
+    let error = pin_manifest_objects_deferred_in_views_with_budget(&manifest, &[view], &mut budget)
+        .expect_err("retained mountinfo must share the exhausted capture budget");
+    assert!(
+        matches!(error, ManifestPinError::Fatal(ref errors)
+            if errors.iter().any(|error| error.contains("attempted-I/O ceiling"))),
+        "{error:?}"
+    );
+    assert_eq!(budget.attempted_io_bytes(), 0);
 }
 
 #[test]
@@ -1823,6 +1874,7 @@ fn a_retargeted_path_is_skipped_as_an_identity_mismatch() {
             inode: std::fs::metadata(&exe).unwrap().ino() + 1,
         },
         path: exe.display().to_string(),
+        decoder_abi: None,
         exports: vec![],
         tables: vec![],
         interfaces: vec![],
@@ -1878,6 +1930,7 @@ fn a_retargeted_path_is_skipped_as_an_identity_mismatch() {
             inode: metadata.ino(),
         },
         path: memfd_path.clone(),
+        decoder_abi: None,
         exports: vec![],
         tables: vec![],
         interfaces: vec![],
@@ -1970,6 +2023,27 @@ fn hash_budget_charges_the_prefix_read_before_aggregate_exhaustion() {
 }
 
 #[test]
+fn expired_deadline_refuses_pin_hash_before_reading() {
+    let (_, modules) = scan_self();
+    let mut budget = self_binary_budget();
+    budget.set_deadline(Some(0));
+    let (pinned, skipped) = p11scope::discovery::identity::pin_scanned_objects(
+        std::process::id(),
+        &modules,
+        &mut budget,
+    )
+    .unwrap();
+    assert_eq!(pinned.pinned().count(), 0);
+    assert_eq!(budget.attempted_io_bytes(), 0);
+    assert!(
+        skipped
+            .iter()
+            .any(|skip| skip.reason.contains("capture discovery deadline")),
+        "the refused hash must name the deadline: {skipped:?}"
+    );
+}
+
+#[test]
 fn a_failed_hash_attempt_still_consumes_the_capture_budget() {
     use p11scope::discovery::scan::{ScanLimits, ScannedModule};
 
@@ -1986,6 +2060,7 @@ fn a_failed_hash_attempt_still_consumes_the_capture_budget() {
         mount_namespace: current_mount_namespace(),
         key: manifest_key(path),
         path: path.display().to_string(),
+        decoder_abi: None,
         exports: vec![],
         tables: vec![],
         interfaces: vec![],

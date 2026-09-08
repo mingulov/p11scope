@@ -1,4 +1,7 @@
-use p11scope_manifest::identity::{IdentityKind, MappingFileKey, identify};
+use p11scope_manifest::elf::ElfAbi;
+use p11scope_manifest::identity::{
+    IdentityKind, MappingFileKey, identify, inspect_file, open_object,
+};
 use p11scope_manifest::maps::{executable_file_keys, parse_maps};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -85,6 +88,18 @@ fn strict_maps_refuse_malformed_lines_and_report_executable_inodes() {
         let error = parse_maps(malformed).unwrap_err();
         assert!(error.contains("line 1"), "{malformed:?}: {error}");
     }
+}
+
+#[test]
+fn inspection_retains_the_classified_object_abi() {
+    let d = tmpdir("identity-abi");
+    let so = cc_shared(&d, "native.so", &[]);
+    let file = open_object(&so).unwrap();
+    assert_eq!(inspect_file(&file).unwrap().abi, ElfAbi::Lp64);
+
+    let ilp32 = cc_shared(&d, "ilp32.so", &["-m32"]);
+    let file = open_object(&ilp32).unwrap();
+    assert_eq!(inspect_file(&file).unwrap().abi, ElfAbi::Ilp32);
 }
 
 #[test]

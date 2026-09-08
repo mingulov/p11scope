@@ -5,7 +5,7 @@
 //! explicitly not reusable.
 
 #[cfg(feature = "identify")]
-use object::{BinaryFormat, Object as _, ObjectSegment as _};
+use object::{Object as _, ObjectSegment as _};
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "identify")]
 use sha2::{Digest as _, Sha256};
@@ -15,6 +15,9 @@ use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::{FileExt as _, OpenOptionsExt as _};
 #[cfg(feature = "identify")]
 use std::path::Path;
+
+#[cfg(feature = "identify")]
+use crate::elf::{ElfAbi, classified_object};
 
 #[cfg(feature = "identify")]
 pub const MAX_OBJECT_BYTES: u64 = 256 * 1024 * 1024;
@@ -64,6 +67,7 @@ pub fn identify(path: &Path) -> ObjectIdentity {
 pub struct InspectedObject {
     pub identity: ObjectIdentity,
     pub executable_ranges: Vec<(u64, u64)>,
+    pub abi: ElfAbi,
 }
 
 #[cfg(feature = "identify")]
@@ -181,11 +185,7 @@ pub fn inspect_file_with_reader(
     reader: impl FnMut(&std::fs::File, &mut [u8], u64) -> std::io::Result<usize>,
 ) -> Result<InspectedObject, String> {
     let data = read_object_bytes_with(file, reader)?;
-    let object = object::File::parse(&*data)
-        .map_err(|error| format!("not parseable as an object file: {error}"))?;
-    if object.format() != BinaryFormat::Elf {
-        return Err(format!("not an ELF object ({:?})", object.format()));
-    }
+    let (object, abi) = classified_object(&data)?;
     let sha256 = hex(&Sha256::digest(&data));
     let mut note = None;
     // object reads the build-id from PT_NOTE program headers too, so a
@@ -227,6 +227,7 @@ pub fn inspect_file_with_reader(
     Ok(InspectedObject {
         identity,
         executable_ranges,
+        abi,
     })
 }
 
@@ -236,7 +237,7 @@ pub(crate) fn read_object_bytes(file: &std::fs::File) -> Result<Vec<u8>, String>
 }
 
 #[cfg(feature = "identify")]
-fn read_object_bytes_with(
+pub(crate) fn read_object_bytes_with(
     file: &std::fs::File,
     mut reader: impl FnMut(&std::fs::File, &mut [u8], u64) -> std::io::Result<usize>,
 ) -> Result<Vec<u8>, String> {

@@ -5,7 +5,8 @@
 //! `--nocapture` observability, no test result depends on it being read.
 
 use std::os::unix::fs::FileExt as _;
-use std::process::{Child, Command};
+
+mod support;
 
 fn ptrace_scope() -> i32 {
     std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
@@ -13,34 +14,30 @@ fn ptrace_scope() -> i32 {
         .unwrap_or(0)
 }
 
-/// A same-uid process that is NOT our descendant: spawn `sleep` from a
-/// double-fork through `setsid` so it is reparented to init.
-fn same_uid_non_descendant() -> (u32, Child) {
-    let child = Command::new("setsid")
-        .args(["--fork", "sleep", "31.4159"])
-        .spawn()
-        .expect("spawn setsid sleep");
-    // setsid --fork exits immediately; its grandchild survives, reparented.
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    let out = Command::new("pgrep")
-        .args(["-f", "sleep 31.4159"])
-        .output()
-        .unwrap();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let pids: Vec<&str> = stdout.split_whitespace().collect();
-    if pids.len() != 1 {
-        // Don't leak the target(s) on the failure path — kill whatever pgrep matched.
-        for pid in &pids {
-            let _ = Command::new("kill").arg(pid).status();
-        }
-        panic!(
-            "expected exactly one 'sleep 31.4159' process, found {}: {:?}",
-            pids.len(),
-            pids
-        );
-    }
-    let pid: u32 = pids[0].parse().expect("pgrep sleep pid");
-    (pid, child)
+#[test]
+fn non_descendant_fixture_owns_concurrent_launches_exactly() {
+    let mut decoy = support::MatchingDecoy::spawn().unwrap();
+    let mut first = support::SameUidNonDescendant::spawn().unwrap();
+    let mut second = support::SameUidNonDescendant::spawn().unwrap();
+    assert_ne!(first.pid(), second.pid());
+    assert!(first.is_alive().unwrap());
+    assert!(second.is_alive().unwrap());
+    assert!(decoy.is_alive().unwrap());
+
+    first.terminate().unwrap();
+    assert!(!first.is_alive().unwrap());
+    assert!(second.is_alive().unwrap());
+    assert!(
+        decoy.is_alive().unwrap(),
+        "matching-command decoy was touched"
+    );
+
+    second.terminate().unwrap();
+    assert!(!second.is_alive().unwrap());
+    assert!(
+        decoy.is_alive().unwrap(),
+        "decoy cleanup uses only its Child"
+    );
 }
 
 /// `/proc/<pid>/maps` needs `PTRACE_MODE_READ` (same uid, or `CAP_SYS_PTRACE`) and is not
@@ -54,8 +51,10 @@ fn same_uid_non_descendant() -> (u32, Child) {
 /// observed — none of them are skipped.
 #[test]
 fn mem_access_for_a_same_uid_non_descendant_follows_the_documented_ptrace_rules() {
-    let (pid, mut spawner) = same_uid_non_descendant();
-    let _ = spawner.wait();
+    let target = support::SameUidNonDescendant::spawn().expect("launch detached target");
+    let pid = target.pid();
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).expect("target exe link");
+    assert!(support::is_sleep(&exe));
 
     let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"));
     assert!(
@@ -100,7 +99,6 @@ fn mem_access_for_a_same_uid_non_descendant_follows_the_documented_ptrace_rules(
         "MEASURED: euid_root={is_root}, ptrace_scope={scope}, mem access allowed: {:?}",
         mem.is_ok()
     );
-    let _ = Command::new("kill").arg(pid.to_string()).status();
 }
 
 #[test]

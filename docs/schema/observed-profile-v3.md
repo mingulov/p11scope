@@ -9,7 +9,14 @@ Schema identifiers are opaque dispatch keys. A v3 profile is not accepted as
 v2, and the historical v2-metrics document is not accepted as a v3
 profile. All profile fields documented by
 [`observed-profile-v2.md`](observed-profile-v2.md) remain unchanged except for
-the profile identifier and the five additions below.
+the profile identifier and the six additions below.
+
+Under the default `allowlisted` policy, every emitted mechanism has
+`params: null` and `templates.operations` is always empty. The diagnostic
+parameter/template representations in the inherited schema are not default
+capture promises. Missing metadata is not evidence that the application used
+none. Scan-only function slots remain semantics-unverified/count-only; an
+accepted explicit manifest attests only its exact object/name/offset claims.
 
 The observer and `p11scope inspect` make zero PKCS #11 calls. Only the explicit
 offline `p11scope-discover` helper loads a provider and makes exactly ten
@@ -92,14 +99,24 @@ view. A nonzero value closes that view's owned selection coverage and forces
 `PARTIAL`; it is not merged into process-tracking or generic discovery-loss
 counters.
 
+`abi_refusals` is a u64 count of scoped probe processing refused because the
+execution-mode selector is unsupported or does not match the target-width
+specialization selected from the retained pinned object. It counts refused probe invocations,
+including returns and tail-call workers, rather than complete PKCS #11 calls.
+It contains no raw selector or register values. An unsupported entry adds no
+entered call; an accepted entry whose return has an unsupported mode remains
+an uncompleted call, with no fabricated return value. The field is always
+present in v3 profile, metrics and terminal trace evidence; nonzero forces
+`PARTIAL`.
+
 ## Completeness and terminal trace
 
 Any truncation, uncovered provider, export status other than `present` or
 `legacy_absent`, count-only tuple, successful tuple with `none` authority,
 nonzero descendant gap, nonzero rebuild gap, or nonzero
-`task_uprobe_link_losses` forces
+`task_uprobe_link_losses` or `abi_refusals` forces
 `evidence.completeness` to `PARTIAL`. The ordinary terminal trace
-`EVIDENCE` object carries the same five fields and rules. Individual trace
+`EVIDENCE` object carries the same six fields and rules. Individual trace
 event lines never contain request/result selection data.
 
 The v3 profile evidence object and v3-metrics evidence object each have a
@@ -115,4 +132,5 @@ enums, ordering, references, and result/authority relations above. Historical
 v2 profiles remain historical. Metrics consumers must dispatch live output on
 `pkcs11-scope/observed-profile/v3-metrics`; historical
 `pkcs11-scope/observed-profile/v2-metrics` documents remain readable as a
-separate compatibility shape and contain no `task_uprobe_link_losses` field.
+separate compatibility shape and contain neither `task_uprobe_link_losses`
+nor `abi_refusals`.

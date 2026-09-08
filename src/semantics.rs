@@ -53,6 +53,21 @@ mod corrective_tests {
     use super::*;
     use crate::plan::{AttachPlan, Slot};
 
+    #[test]
+    fn history_loss_saturates_and_capacity_open_remains_observed() {
+        let p = plan(&["C_OpenSession"]);
+        let mut state = State::with_limit(&p, 0);
+        state.observe_process(ProcessKey::history(1, 90, 0, 100), &open(&p, 7, 3));
+        assert_eq!(state.sessions().opened, 1);
+        assert_eq!(state.sessions().closed, 0);
+        assert_eq!(state.sessions().peak_concurrent, 0);
+        assert!(state.semantic_evidence().semantic_state_drops > 0);
+        state.evidence.semantic_history_drops = u64::MAX;
+        state.reject_history(&open(&p, 7, 3));
+        assert_eq!(state.semantic_evidence().semantic_history_drops, u64::MAX);
+        assert_eq!(state.sessions().opened, 1);
+    }
+
     fn plan(names: &[&str]) -> AttachPlan {
         plan_with_fork(names, false)
     }
@@ -443,14 +458,20 @@ mod corrective_tests {
         let parent = ProcessKey {
             pid: 100,
             generation: 1,
+            domain: 0,
+            exec_id: 0,
         };
         let child = ProcessKey {
             pid: 101,
             generation: 1,
+            domain: 0,
+            exec_id: 0,
         };
         let reused = ProcessKey {
             pid: 100,
             generation: 2,
+            domain: 0,
+            exec_id: 0,
         };
         let mut state = State::new(&p);
         state.observe_process(parent, &open(&p, 7, 3));
@@ -460,6 +481,7 @@ mod corrective_tests {
         assert_eq!(state.sessions().inherited, 1);
         assert_eq!(state.mechanisms()[&1].calls, 2);
 
+        state.retire_process(parent); // Explicit external retirement proof, never incoming PID activation.
         state.observe_process(reused, &event(&p, "C_Finalize", SESSION_NONE, 0));
         assert!(state.session_pseudonym_process(parent, 0, 7).is_none());
 
@@ -666,14 +688,20 @@ mod corrective_tests {
         let parent = ProcessKey {
             pid: 100,
             generation: 1,
+            domain: 0,
+            exec_id: 0,
         };
         let child = ProcessKey {
             pid: 101,
             generation: 1,
+            domain: 0,
+            exec_id: 0,
         };
         let exiting_child = ProcessKey {
             pid: 102,
             generation: 1,
+            domain: 0,
+            exec_id: 0,
         };
         let mut state = State::new(&p);
 
@@ -1072,15 +1100,57 @@ pub struct CgroupStat {
     pub mechanisms: BTreeMap<u64, MechCallStat>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy)]
 pub struct ProcessKey {
     pub pid: u32,
     pub generation: u64,
+    pub domain: u64,
+    pub exec_id: u64,
 }
 
+impl PartialEq for ProcessKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity() == other.identity()
+    }
+}
+impl Eq for ProcessKey {}
+impl PartialOrd for ProcessKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for ProcessKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.identity().cmp(&other.identity())
+    }
+}
 impl ProcessKey {
+    // Domain zero is solely the existing legacy helper namespace. Actual
+    // drains cannot admit it. Keep those helpers' distinct-PID test meaning.
+    fn identity(self) -> (u64, u64, u64, u32) {
+        (
+            self.domain,
+            self.generation,
+            self.exec_id,
+            if self.domain == 0 { self.pid } else { 0 },
+        )
+    }
+    pub(crate) const fn history(domain: u64, cookie: u64, exec_id: u64, pid: u32) -> Self {
+        Self {
+            domain,
+            generation: cookie,
+            exec_id,
+            pid,
+        }
+    }
+
     pub const fn from_pid(pid: u32) -> Self {
-        Self { pid, generation: 0 }
+        Self {
+            pid,
+            generation: 0,
+            domain: 0,
+            exec_id: 0,
+        }
     }
 }
 
@@ -1100,6 +1170,8 @@ pub struct SemanticEvidence {
     /// New semantic keys refused after the bounded per-capture budget was
     /// exhausted. Aggregate kernel counts remain authoritative.
     pub semantic_state_drops: u64,
+    /// Closed or unauthenticated history records omitted from semantic totals.
+    pub semantic_history_drops: u64,
 }
 
 /// Reserved module id for a slot no single module owns — unknown, or claimed
@@ -1334,7 +1406,7 @@ fn mechanism_capture(ev: &Event) -> MechanismCapture {
 pub struct State {
     policy: CapturePolicy,
     slots: Vec<Option<SlotMeta>>,
-    current_process: BTreeMap<u32, ProcessKey>,
+    reduced_histories: BTreeSet<ProcessKey>,
     next_pseudonym: BTreeMap<ProcessKey, u64>,
     open: BTreeMap<(ProcessKey, SessionRef), SessionInfo>,
     active_ops: BTreeMap<(ProcessKey, SessionRef, u16), Binding>,
@@ -1342,8 +1414,9 @@ pub struct State {
     inherited_ambiguous: BTreeSet<(ProcessKey, SessionRef)>,
     pending: BTreeMap<(ProcessKey, SessionRef, u32), Pending>,
     /// Async ids are only unique within one module's PKCS#11 slot, so the
-    /// issuing module is part of the key here too.
-    detached: BTreeMap<(ModuleId, u64, u32, u64), Detached>,
+    /// issuing module and loaded-object domain are part of the key here too.
+    /// Processes in the SAME domain may still transfer custody by successful join.
+    detached: BTreeMap<(ModuleId, u64, u32, u64, u64), Detached>,
     sequence: u64,
     mechanisms: BTreeMap<u64, MechStat>,
     templates: BTreeMap<(u32, u8), TemplateStat>,
@@ -1356,6 +1429,8 @@ pub struct State {
     mech_shapes: BTreeMap<u64, u32>,
     state_key_limit: usize,
     state_keys: usize,
+    // Drop the anchor after all domain-indexed state.
+    events_domain: Option<crate::events::EventsDomain>,
 }
 
 fn slot_metadata(plan: &AttachPlan) -> Vec<Option<SlotMeta>> {
@@ -1396,20 +1471,37 @@ impl State {
         Self::with_policy(plan, CapturePolicy::Allowlisted)
     }
 
+    pub(crate) fn for_capture(
+        plan: &AttachPlan,
+        policy: CapturePolicy,
+        domain: crate::events::EventsDomain,
+    ) -> Self {
+        let mut state = Self::with_policy(plan, policy);
+        state.events_domain = Some(domain);
+        state
+    }
+
+    pub(crate) fn accepts_domain(&self, domain: u64) -> bool {
+        self.events_domain
+            .as_ref()
+            .is_none_or(|anchor| anchor.id() == domain)
+    }
+
     pub fn with_policy(plan: &AttachPlan, policy: CapturePolicy) -> Self {
         Self::with_key_limit(plan, policy, MAX_STATE_KEYS)
     }
 
     #[cfg(test)]
-    fn with_limit(plan: &AttachPlan, limit: usize) -> Self {
+    pub(crate) fn with_limit(plan: &AttachPlan, limit: usize) -> Self {
         Self::with_key_limit(plan, CapturePolicy::Allowlisted, limit)
     }
 
     fn with_key_limit(plan: &AttachPlan, policy: CapturePolicy, state_key_limit: usize) -> Self {
         Self {
             policy,
+            events_domain: None,
             slots: slot_metadata(plan),
-            current_process: BTreeMap::new(),
+            reduced_histories: BTreeSet::new(),
             next_pseudonym: BTreeMap::new(),
             open: BTreeMap::new(),
             active_ops: BTreeMap::new(),
@@ -1485,7 +1577,7 @@ impl State {
             return;
         }
         let mut processes = BTreeSet::new();
-        processes.extend(self.current_process.values().copied());
+        processes.extend(self.reduced_histories.iter().copied());
         processes.extend(self.next_pseudonym.keys().copied());
         processes.extend(self.open.keys().map(|(process, _)| *process));
         processes.extend(self.active_ops.keys().map(|(process, _, _)| *process));
@@ -1536,7 +1628,7 @@ impl State {
 
     #[cfg(test)]
     fn retained_dynamic_keys(&self) -> usize {
-        self.current_process.len()
+        self.reduced_histories.len()
             + self.next_pseudonym.len()
             + self.open.len()
             + self.active_ops.len()
@@ -1579,21 +1671,35 @@ impl State {
             event_type::FORK_INTO_CGROUP => return,
             _ => {}
         }
-        let process = self
-            .current_process
-            .get(&pid_of(ev))
-            .copied()
-            .unwrap_or_else(|| ProcessKey::from_pid(pid_of(ev)));
+        let process = ProcessKey::from_pid(pid_of(ev));
         self.observe_process(process, ev);
     }
 
-    pub fn observe_process(&mut self, process: ProcessKey, ev: &Event) {
-        let previous = self.current_process.get(&process.pid).copied();
-        if previous != Some(process) && self.admit(usize::from(previous.is_none())) {
-            if let Some(old) = previous {
-                self.retire_process(old);
+    /// Count-only CALL evidence without any handle/mechanism enrichment.
+    pub(crate) fn reject_history(&mut self, ev: &Event) {
+        self.evidence.semantic_history_drops =
+            self.evidence.semantic_history_drops.saturating_add(1);
+        if ev.event_type != event_type::CALL {
+            return;
+        }
+        if !self.cgroups.contains_key(&ev.cgroup_id) && self.admit(1) {
+            self.cgroups.insert(ev.cgroup_id, CgroupStat::default());
+        }
+        if let Some(cg) = self.cgroups.get_mut(&ev.cgroup_id) {
+            cg.calls = cg.calls.saturating_add(1);
+            if ev.rv != CkRv::OK.0 && ev.rv != CkRv::PENDING.0 {
+                cg.errors = cg.errors.saturating_add(1);
             }
-            self.current_process.insert(process.pid, process);
+        }
+    }
+
+    pub fn observe_process(&mut self, process: ProcessKey, ev: &Event) {
+        if !self.accepts_domain(process.domain) {
+            self.reject_history(ev);
+            return;
+        }
+        if !self.reduced_histories.contains(&process) && self.admit(1) {
+            self.reduced_histories.insert(process);
         }
         let meta = self.slots.get(ev.slot as usize).and_then(Clone::clone);
         if !self.cgroups.contains_key(&ev.cgroup_id) && self.admit(1) {
@@ -2011,7 +2117,13 @@ impl State {
                 if self
                     .detached
                     .insert(
-                        (session.module, slot, ev.target_function, ev.async_value),
+                        (
+                            session.module,
+                            slot,
+                            ev.target_function,
+                            ev.async_value,
+                            process.domain,
+                        ),
                         Detached {
                             pending,
                             owner: Some((process, session)),
@@ -2033,6 +2145,7 @@ impl State {
                     slot,
                     ev.target_function,
                     ev.async_value,
+                    process.domain,
                 )) {
                     Some(detached) => {
                         // A successful join *assigns* the joining
@@ -2296,9 +2409,6 @@ impl State {
             // Pseudonym numbering is per process and must not restart while
             // another module's sessions are still live under it.
             self.next_pseudonym.remove(&process);
-            if self.current_process.get(&process.pid) == Some(&process) {
-                self.current_process.remove(&process.pid);
-            }
         }
         u64::from(had_state)
     }
@@ -2308,10 +2418,14 @@ impl State {
     }
 
     pub fn fork_process(&mut self, parent: ProcessKey, child: ProcessKey) {
-        if !self.current_process.contains_key(&child.pid) && !self.admit(1) {
+        if parent.domain != child.domain || !self.accepts_domain(parent.domain) {
             return;
         }
-        self.current_process.insert(child.pid, child);
+        // A birth FORK is one-shot and precedes every child's own CALL.
+        if self.reduced_histories.contains(&child) || !self.admit(1) {
+            return;
+        }
+        self.reduced_histories.insert(child);
         // Inherits every module's sessions; each carries its own module along.
         let sessions: Vec<(SessionRef, SessionInfo)> = self
             .open
@@ -2377,11 +2491,7 @@ impl State {
     /// its own pseudonym, drawn from one per-process sequence so the rendered
     /// numbers stay distinct.
     pub fn session_pseudonym(&self, pid: u32, slot: u32, raw: u64) -> Option<u64> {
-        let process = self
-            .current_process
-            .get(&pid)
-            .copied()
-            .unwrap_or_else(|| ProcessKey::from_pid(pid));
+        let process = ProcessKey::from_pid(pid);
         self.session_pseudonym_process(process, slot, raw)
     }
 
@@ -2473,9 +2583,9 @@ impl State {
                 .any(|(owner, session)| owned(owner, session))
     }
     pub fn pid_has_process_state(&self, pid: u32) -> bool {
-        self.current_process
-            .get(&pid)
-            .is_some_and(|process| self.has_process_state(*process))
+        self.reduced_histories
+            .iter()
+            .any(|process| process.pid == pid && self.has_process_state(*process))
     }
     pub fn templates_truncated(&self) -> bool {
         self.templates.values().any(|t| t.truncated)

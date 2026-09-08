@@ -38,6 +38,7 @@ fn build_fixture(mode: FixtureMode) -> PathBuf {
     }
     let mut helper_cmd = Command::new("gcc");
     helper_cmd
+        .arg(format!("-m{}", usize::BITS))
         .args(["-shared", "-fPIC", "-Wl,-soname,helper.so", "-o"])
         .arg(&helper)
         .arg(src.join("helper.c"));
@@ -48,6 +49,7 @@ fn build_fixture(mode: FixtureMode) -> PathBuf {
     assert!(ok, "gcc helper.so failed");
     let mut provider_cmd = Command::new("gcc");
     provider_cmd
+        .arg(format!("-m{}", usize::BITS))
         .args(["-shared", "-fPIC", "-o"])
         .arg(&provider)
         .arg(src.join("provider.c"))
@@ -74,6 +76,11 @@ fn build_fixture(mode: FixtureMode) -> PathBuf {
         .success();
     assert!(ok, "gcc provider.so failed");
     provider
+}
+
+#[allow(clippy::unnecessary_cast)]
+fn native_rv_u64(rv: cryptoki_sys::CK_RV) -> u64 {
+    rv as u64
 }
 
 fn resolution<'a>(s: &'a SurfaceRecord, name: &str) -> &'a Resolution {
@@ -176,9 +183,9 @@ fn selection_helper_makes_exactly_ten_queries() {
         assert_eq!(
             query.rv,
             if position == 1 {
-                cryptoki_sys::CKR_ARGUMENTS_BAD
+                native_rv_u64(cryptoki_sys::CKR_ARGUMENTS_BAD)
             } else {
-                cryptoki_sys::CKR_OK
+                native_rv_u64(cryptoki_sys::CKR_OK)
             }
         );
         if position >= 4 {
@@ -188,7 +195,10 @@ fn selection_helper_makes_exactly_ten_queries() {
             );
         }
     }
-    assert_eq!(evidence.queries[1].rv, cryptoki_sys::CKR_ARGUMENTS_BAD);
+    assert_eq!(
+        evidence.queries[1].rv,
+        native_rv_u64(cryptoki_sys::CKR_ARGUMENTS_BAD)
+    );
     assert!(evidence.queries[1].result.is_none());
 }
 
@@ -214,7 +224,7 @@ fn selection_helper_records_post_success_helper_failure() {
     let provider = build_fixture(FixtureMode::PostFailure);
     let m = discover(&provider).unwrap();
     let query = &m.selection_evidence.queries[2];
-    assert_eq!(query.rv, cryptoki_sys::CKR_OK);
+    assert_eq!(query.rv, native_rv_u64(cryptoki_sys::CKR_OK));
     assert!(query.result.is_some());
     assert_eq!(
         query.helper_failure,
@@ -261,7 +271,7 @@ fn selection_helper_preserves_unknown_returned_flags() {
             .as_ref()
             .unwrap()
             .flags,
-        1u64 << 63
+        1u64 << (cryptoki_sys::CK_FLAGS::BITS - 1)
     );
 }
 

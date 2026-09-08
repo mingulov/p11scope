@@ -106,7 +106,6 @@ def production_source_contract(source):
         "DISCOVERY.reserve::<DiscoveryRecord>(0)",
         "while pointer_index < 104",
         "aya_ebpf::bindings::BPF_NOEXIST",
-        "DISCOVERY_STATE.remove(&key)",
         "fn loader_cookie_of(",
         "fn export_state_key",
         "cookie_slot(cookie_of(ctx))",
@@ -150,7 +149,6 @@ def production_source_contract(source):
         "interface_continuation_pack(count, 0, symbol_id)",
         "active_count == 0",
         "state.arg0 == 0",
-        "checked_add((active_count - 1) * 24)",
         "take_export_state(&ctx, scope.is_some())",
         "StateKey {",
         "attach_cookie: 0",
@@ -160,6 +158,7 @@ def production_source_contract(source):
     ]:
         if marker not in return_region:
             fail(f"interface-list return contract missing {marker!r}")
+    interface_list_span_contract(return_region)
     if "export_state_key(&ctx)" in worker_region:
         fail("interface-list worker must not use the attach-cookie helper")
     for marker in [
@@ -167,17 +166,29 @@ def production_source_contract(source):
         "pid_tgid: helpers::bpf_get_current_pid_tgid()",
         "attach_cookie: 0",
         "interface_continuation_unpack(state.arg1)",
-        "DISCOVERY_STATE.get(&key)",
         "DISCOVERY_INTERFACES",
         "(u64::from(symbol_id) << 32)",
         "interface_continuation_next(state.arg1)",
-        "DISCOVERY_STATE\n        .insert(&key, &continuation, aya_ebpf::bindings::BPF_EXIST as u64)",
         "TAIL_CALLS.tail_call(&ctx, TAIL_CALLS_INTERFACE_WORKER_SLOT)",
         "fail_export_state(&key)",
         "finish_export_state(&key)",
     ]:
         if marker not in worker_region:
             fail(f"interface-list worker contract missing {marker!r}")
+
+
+def interface_list_span_contract(return_region):
+    markers = [
+        "checked_add((active_count - 1) * layout.interface().stride as u64)",
+        "address.checked_add(layout.interface().stride as u64 - layout.word_bytes() as u64)",
+        "target_word_end(address, layout)",
+    ]
+    for marker in markers:
+        if marker not in return_region:
+            fail(f"interface-list return contract missing {marker!r}")
+    continuation = return_region.find("interface_continuation_pack(count, 0, symbol_id)")
+    if not all(return_region.find(marker) < continuation for marker in markers):
+        fail("interface-list span validation must precede continuation state")
 
 
 def source_contract(source):
@@ -368,7 +379,9 @@ def instructions(lines):
             continue
         match = re.match(r"\s*(\d+):\s+(.*)", line)
         if match:
-            parsed.append((int(match.group(1)), match.group(2)))
+            text = re.sub(r"^(?:[0-9a-f]{2}\s+){8,16}", "", match.group(2))
+            text = re.sub(r"\s+<[^>]+>$", "", text)
+            parsed.append((int(match.group(1)), text))
     return parsed
 
 
@@ -450,6 +463,15 @@ def winner_finishes_without_helper(lines, signal_index):
     return submitted
 
 
+def pause_emitter(name):
+    return name == "dl_debug_state" or name.endswith(("emit_export", "emit_lifecycle"))
+
+
+def pause_cas_count(disassembly):
+    return sum(sum("cmpxchg_64" in line for line in lines)
+               for name, lines in function_blocks(disassembly).items() if pause_emitter(name))
+
+
 def pause_object_contract(disassembly):
     signal_blocks = []
     total_cas = 0
@@ -459,7 +481,10 @@ def pause_object_contract(disassembly):
         signals = [
             index for index, line in enumerate(lines) if re.search(r"call 0x6d\b", line)
         ]
-        total_cas += len(cas)
+        if pause_emitter(function):
+            total_cas += len(cas)
+        elif signals:
+            return False
         total_signals += len(signals)
         if signals:
             signal_blocks.append((function, lines, cas, signals))
@@ -541,33 +566,148 @@ def map_call_sites(lines, map_name, helper=None):
 
 def internal_call_targets(disassembly):
     blocks = function_blocks(disassembly)
-    starts = {
-        name: instruction_entries(lines)[0][1]
-        for name, lines in blocks.items()
-        if instruction_entries(lines)
+    by_pc = {
+        instruction_entries(lines)[0][1]: name
+        for name, lines in blocks.items() if instruction_entries(lines)
     }
-    by_pc = {pc: name for name, pc in starts.items()}
     calls = []
     for function, lines in blocks.items():
         for line_index, pc, text in instruction_entries(lines):
             match = re.search(r"\bcall (?P<sign>-?)0x(?P<value>[0-9a-f]+)\b", text)
             if not match:
                 continue
-            value = int(match.group("value"), 16)
-            if match.group("sign"):
-                candidates = [pc + 1 - value]
-            elif value >= 0x10:
-                candidates = [value + 1, pc + 1 + value]
+            # Raw BPF helper calls (src_reg=0) are never internal calls.
+            if re.match(r"85 00 ", text):
+                continue
+            relocation = next((target for index, kind, target in relocation_targets(lines)
+                               if index == line_index + 1 and kind == "32"), None)
+            value = int(match.group("value"), 16) * (-1 if match.group("sign") else 1)
+            if relocation == ".text":
+                target = by_pc.get(value + 1)
+            elif relocation:
+                target = relocation if relocation in blocks else None
+            elif re.match(r"85 10 ", text) or match.group("sign"):
+                target = by_pc.get(pc + 1 + value)
             else:
-                candidates = []
-            targets = {by_pc[candidate] for candidate in candidates if candidate in by_pc}
-            for target in targets:
+                target = None
+            if target:
                 calls.append((function, line_index, pc, target))
     return calls
 
 
+def discovery_call_sites(disassembly, function, operation):
+    return [(index, pc) for caller, index, pc, target in internal_call_targets(disassembly)
+            if caller == function and target == "p11_owner_discovery_" + operation]
+
+
+def call_argument_facts(lines):
+    """Finite constants/stack addresses at discovery call sites; joins lose facts.
+
+    This checks caller wiring only. The native transaction fixture remains the
+    oracle for physical task ownership, directory updates and poison/debt.
+    """
+    insns, graph = instruction_graph(lines)
+    if not insns:
+        return {}
+    texts = dict(insns)
+    internal_pcs = {pc for index, pc, text in instruction_entries(lines)
+                    if text.startswith("85 10 ") or any(
+                        relocation == index + 1 and kind == "32"
+                        for relocation, kind, _ in relocation_targets(lines))}
+    incoming = {insns[0][0]: {"r10": ("stack", 0)}}
+    pending = [insns[0][0]]
+    while pending:
+        pc = pending.pop()
+        state = incoming[pc].copy()
+        text = re.sub(r"^(?:[0-9a-f]{2}\s+){8,16}", "", texts[pc])
+        text = re.sub(r"\s+<[^>]+>$", "", text)
+        store = re.fullmatch(r"\*\(u(8|16|32|64) \*\)\(r(\d+) ([+-]) 0x([0-9a-f]+)\) = r(\d+)", text)
+        if store:
+            width, base, sign, offset, src = store.groups()
+            address = state.get("r" + base)
+            if address and address[0] == "stack":
+                offset = address[1] + int(offset, 16) * (1 if sign == "+" else -1)
+                for key in list(state):
+                    if isinstance(key, int) and key < offset + int(width)//8 and offset < key + 8:
+                        state.pop(key)
+                if width == "64" and "r" + src in state:
+                    state[offset] = state["r" + src]
+        elif re.search(r"\bcall ", text):
+            for register in range(6):
+                state.pop("r" + str(register), None)
+            state["r0"] = ("result", pc)
+            if re.fullmatch(r"call 0xae", text) and pc not in internal_pcs:
+                state["r0"] = ("cookie", pc)
+        elif match := re.fullmatch(r"(r\d+) &= (0xffffff|0x100|-0x200)", text):
+            register, mask = match.groups()
+            previous = state.pop(register, None)
+            if previous and previous[0] == "cookie":
+                state[register] = ("cookie_mask", previous[1], int(mask, 16))
+        elif match := re.fullmatch(r"(r\d+) s>>= 0x9", text):
+            previous = state.pop(match.group(1), None)
+            if previous and previous[0] == "cookie":
+                state[match.group(1)] = ("loader_delta", previous[1])
+        elif match := re.fullmatch(r"(r\d+) = \*\(u64 \*\)\(r10 ([+-]) 0x([0-9a-f]+)\)", text):
+            register, sign, offset = match.groups()
+            value = state.get(int(offset, 16) * (1 if sign == "+" else -1))
+            state.pop(register, None)
+            if value is not None:
+                state[register] = value
+        elif match := re.fullmatch(r"([rw]\d+) (=|\+=) (r\d+|-?0x[0-9a-f]+)(?: ll)?", text):
+            dst, op, src = match.groups()
+            register = "r" + dst[1:]
+            value = state.get(src) if src.startswith("r") else ("constant", int(src, 16))
+            if op == "+=":
+                previous = state.get(register)
+                value = ((previous[0], previous[1] + value[1])
+                         if previous and previous[0] in ("constant", "stack")
+                         and value and value[0] == "constant" else None)
+            if dst.startswith("w") and value:
+                value = ("constant", value[1] & 0xffffffff) if value[0] == "constant" else None
+            state.pop(register, None)
+            if value is not None:
+                state[register] = value
+        elif match := re.match(r"[rw](\d+)\s", text):
+            state.pop("r" + match.group(1), None)
+        for successor in graph[pc]:
+            edge_state = state.copy()
+            branch = re.fullmatch(r"if (r\d+) (==|!=) 0x0 goto [+-]0x[0-9a-f]+", text)
+            if branch:
+                register, comparison = branch.groups()
+                value = state.get(register)
+                taken = successor == relative_target(pc, text)
+                if value:
+                    predicate = "nonzero" if taken == (comparison == "!=") else "zero"
+                    edge_state[(predicate, value)] = True
+            if successor not in incoming:
+                merged = edge_state
+            else:
+                merged = {k: v for k, v in incoming[successor].items() if edge_state.get(k) == v}
+            if incoming.get(successor) != merged:
+                incoming[successor] = merged
+                pending.append(successor)
+    return incoming
+
+
+def discovery_arguments(disassembly, function, operation, argument):
+    lines = function_blocks(disassembly).get(function, [])
+    facts = call_argument_facts(lines)
+    sites = discovery_call_sites(disassembly, function, operation)
+    register = "r3" if operation == "insert" else "r2"
+    for _, pc in sites:
+        state = facts.get(pc, {})
+        key = state.get("r1")
+        if state.get(register) != ("constant", argument) or not key or key[0] != "stack":
+            return False
+        if operation == "insert":
+            value = state.get("r2")
+            if not value or value[0] != "stack" or abs(value[1] - key[1]) < 24:
+                return False
+    return bool(sites)
+
+
 def known_tail_relocations(lines):
-    allowed_maps = {"COUNTERS", "DISCOVERY_STATE", "TAIL_CALLS"}
+    allowed_maps = {"COUNTERS", "EVIDENCE", "TAIL_CALLS"}
     return all(
         (kind == "64" and target in allowed_maps)
         or (kind == "32" and target in {".text", "memset"})
@@ -576,45 +716,27 @@ def known_tail_relocations(lines):
 
 
 def has_counter_update_after(lines, start_pc, graph):
-    entries = instruction_entries(lines)
-    for _, lookup_pc, _ in map_call_sites(lines, "COUNTERS", helper=1):
-        if lookup_pc not in nodes_on_paths(graph, start_pc, lookup_pc):
-            continue
-        for _, load_pc, load_text in entries:
-            load = re.search(
-                r"\br(?P<value>\d+) = \*\(u64 \*\)\(r0 \+ 0x0\)$", load_text
-            )
-            if not load or load_pc not in nodes_on_paths(graph, lookup_pc, load_pc):
-                continue
-            value = load.group("value")
-            increment_pc = next(
-                (
-                    pc
-                    for _, pc, text in entries
-                    if re.search(rf"\br{value} \+= 0x1$", text)
-                    and pc in nodes_on_paths(graph, load_pc, pc)
-                ),
-                None,
-            )
-            if increment_pc is None:
-                continue
-            if any(
-                re.search(rf"\*\(u64 \*\)\(r0 \+ 0x0\) = r{value}$", text)
-                and pc in nodes_on_paths(graph, increment_pc, pc)
-                for _, pc, text in entries
-            ):
-                return True
-    return False
+    sites = {pc for index, pc, _ in map_call_sites(lines, "COUNTERS", helper=1)
+             if finite_counter_key(lines, index) == 1 and counter_writeback_contract(lines, pc)}
+    exits = {pc for pc, edges in graph.items() if not edges}
+    return bool(sites & reachable(graph, [start_pc])) and not (
+        exits & reachable(graph, [start_pc], sites))
 
 
-def tail_cleanup_contract(lines, tail_pc, graph):
-    reachable_pcs = reachable(graph, [tail_pc])
-    cleanup_sites = [
-        pc
-        for _, pc, _ in map_call_sites(lines, "DISCOVERY_STATE", helper=3)
-        if pc in reachable_pcs
-    ]
-    return any(has_counter_update_after(lines, pc, graph) for pc in cleanup_sites)
+def tail_cleanup_contract(disassembly, function, tail_pc, graph):
+    lines = function_blocks(disassembly)[function]
+    facts = call_argument_facts(lines)
+    cleanup = {pc for _, pc in discovery_call_sites(disassembly, function, "remove")
+               if facts.get(pc, {}).get("r2") == ("constant", 1)}
+    fallthrough = graph.get(tail_pc, [])
+    reachable_pcs = reachable(graph, fallthrough)
+    exits = {pc for pc, edges in graph.items() if not edges}
+    # Every falling-through path must perform owned required removal.
+    if exits & reachable(graph, fallthrough, cleanup):
+        return False
+    owned_paths = cleanup & reachable_pcs
+    return bool(owned_paths) and all(has_counter_update_after(lines, pc, graph)
+                                    for pc in owned_paths)
 
 
 def interface_tail_contract(disassembly):
@@ -654,39 +776,39 @@ def interface_tail_contract(disassembly):
         or len(classifier_emit_calls) != 1
     ):
         return False
-    if not map_call_sites(return_lines, "DISCOVERY_STATE", helper=2):
+    if not discovery_arguments(disassembly, return_name, "insert", 1):
         return False
-    if not map_call_sites(worker_lines, "DISCOVERY_STATE", helper=2):
+    if not discovery_arguments(disassembly, worker_name, "insert", 2):
         return False
-    for lines, graph in ((return_lines, return_graph), (worker_lines, worker_graph)):
+    if not discovery_arguments(disassembly, worker_name, "get", 1):
+        return False
+    reads = {pc for _, pc in discovery_call_sites(disassembly, worker_name, "get")}
+    classifier_state = call_argument_facts(worker_lines).get(worker_classifier_calls[0][2], {})
+    if (worker_classifier_calls[0][2] in reachable(worker_graph, [worker_insns[0][0]], reads)
+            or not any(classifier_state.get(("nonzero", ("result", pc))) for pc in reads)):
+        return False
+    for name, lines, graph in ((return_name, return_lines, return_graph),
+                               (worker_name, worker_lines, worker_graph)):
         tails = map_call_sites(lines, "TAIL_CALLS", helper=0xC)
         if len(tails) != 1:
             return False
         tail_index, tail_pc, _ = tails[0]
-        preceding = [
-            text
-            for line_index, _, text in instruction_entries(lines)
-            if line_index < tail_index and tail_index - line_index <= 6
-        ]
-        if not any(re.search(r"\br2 = 0x0\b", text) for text in preceding):
+        if call_argument_facts(lines).get(tail_pc, {}).get("r3") != ("constant", 0):
             return False
-        if not tail_cleanup_contract(lines, tail_pc, graph):
+        inserts = {pc for _, pc in discovery_call_sites(disassembly, name, "insert")}
+        tail_state = call_argument_facts(lines).get(tail_pc, {})
+        if (tail_pc in reachable(graph, [instruction_entries(lines)[0][1]], inserts)
+                or not any(tail_state.get(("zero", ("result", pc))) for pc in inserts)):
+            return False
+        if not tail_cleanup_contract(disassembly, name, tail_pc, graph):
             return False
     return_block = "\n".join(return_lines)
     worker_block = "\n".join(worker_lines)
-    if not re.search(r"\br\d+ = \*\(u64 \*\)\(r0 \+ 0x8\)", return_block):
+    if not re.search(r"\br\d+ = \*\(u64 \*\)\(r\d+ \+ 0x8\)", return_block):
         return False
     if not re.search(r"\bif r\d+ == 0x0 goto", return_block):
         return False
     if not re.search(r"\bif r\d+ > r\d+ goto", return_block):
-        return False
-    if not re.search(r"\br4 = 0x1\b", return_block):
-        return False
-    if not re.search(r"\bcall 0x2\b", return_block):
-        return False
-    if not re.search(r"\br4 = 0x2\b", worker_block):
-        return False
-    if not re.search(r"\bcall 0x2\b", worker_block):
         return False
     if re.search(r"\bcall 0xae\b", worker_block):
         return False
@@ -716,95 +838,55 @@ def interface_tail_contract(disassembly):
     return True
 
 
-def state_domain_store(block, expected):
-    """Tie each DISCOVERY_STATE call to a live r2 key's +16 domain word."""
-    lines = block.splitlines()
-    assignment = re.compile(r"\b(?P<register>r\d+) = 0x(?P<value>[0-9a-f]+)\b")
-    domain_store = re.compile(
-        r"\*\(u64 \*\)\(r2 \+ 0x10\) = (?P<register>r\d+)\b"
-    )
-    key_pointer = re.compile(r"\br2 = r10\b")
-    r2_clobber = re.compile(r"\br2\s*(?:=|\+=|-=|<<=|>>=|&=|\|=)")
-    for call_index, _, _ in map_call_sites(lines, "DISCOVERY_STATE"):
-        found = False
-        for store_index in range(call_index - 1, -1, -1):
-            store = domain_store.search(lines[store_index])
-            if store is None:
-                continue
-            if any(r2_clobber.search(lines[index]) for index in range(store_index + 1, call_index)):
-                break
-            if not any(key_pointer.search(lines[index]) for index in range(store_index)):
-                break
-            register = store.group("register")
-            for value_index in range(store_index - 1, -1, -1):
-                value = assignment.search(lines[value_index])
-                if value is None or value.group("register") != register:
-                    continue
-                register_number = register.removeprefix("r")
-                destination = re.compile(
-                    rf"^\s*(?:\d+:\s+)?[rw]{register_number}\b"
-                )
-                if (
-                    int(value.group("value"), 16) == expected
-                    and not any(
-                        destination.search(lines[index])
-                        for index in range(value_index + 1, store_index)
-                    )
-                ):
-                    found = True
-                break
-            break
-        if not found:
-            return False
-    return bool(map_call_sites(lines, "DISCOVERY_STATE"))
-
-
 def cookie_object_contract(disassembly):
     blocks = function_blocks(disassembly)
-    loader = "\n".join(blocks.get("dl_debug_state", []))
-    if len(re.findall(r"\bcall 0xae\b", loader)) != 1:
+    loader = blocks.get("dl_debug_state", [])
+    loader_facts = call_argument_facts(loader)
+    cookie_pcs = [pc for _, pc, text in instruction_entries(loader)
+                  if re.search(r"\bcall 0xae\b", text)]
+    if len(cookie_pcs) != 1:
         return False
-    if not all(
-        marker in loader for marker in ("&= 0x100", "&= -0x200", "s>>= 0x9")
-    ):
+    cookie_pc = cookie_pcs[0]
+    # Only operations on the loader cookie count; unrelated ABI shifts do not.
+    loader_values = {value for state in loader_facts.values()
+                     for value in state.values() if isinstance(value, tuple)}
+    if not {("cookie_mask", cookie_pc, 0x100),
+            ("cookie_mask", cookie_pc, -0x200),
+            ("loader_delta", cookie_pc)} <= loader_values:
         return False
-    export_programs = (
-        "function_list_entry",
-        "function_list_return",
-        "interface_list_entry",
-        "interface_list_return",
-        "interface_list_worker",
-    )
-    for name in export_programs:
-        block = "\n".join(blocks.get(name, []))
-        if name == "interface_list_worker":
-            if re.search(r"\bcall 0xae\b", block):
+    for name in ("function_list_entry", "function_list_return", "interface_list_entry",
+                 "interface_list_return", "interface_list_worker", "interface_entry",
+                 "interface_return"):
+        lines = blocks.get(name, [])
+        facts = call_argument_facts(lines)
+        domain = 2 if name in ("interface_entry", "interface_return") else 1
+        sites = [(pc, operation) for operation in ("get", "insert", "remove")
+                 for _, pc in discovery_call_sites(disassembly, name, operation)]
+        if not sites:
+            return False
+        if name == "interface_list_worker" and any("call 0xae" in line for line in lines):
+            return False
+        for pc, operation in sites:
+            state = facts.get(pc, {})
+            key = state.get("r1")
+            if not key or key[0] != "stack" or state.get(key[1] + 16) != ("constant", domain):
                 return False
-            if not state_domain_store(block, 1):
+            cookie = state.get(key[1] + 8)
+            if cookie == ("constant", 0):
+                if name == "interface_list_worker":
+                    continue
+                if name == "interface_list_return":
+                    _, graph = instruction_graph(lines)
+                    tails = [tail_pc for _, tail_pc, _ in map_call_sites(lines, "TAIL_CALLS", helper=12)]
+                    if operation == "insert" or (operation == "remove" and pc in reachable(graph, tails)):
+                        continue
                 return False
-            continue
-        if (
-            len(re.findall(r"\bcall 0xae\b", block)) != 2
-            or "= -0x100000000 ll" not in block
-            or "= -0xffffffff ll" not in block
-            or (
-                name != "interface_list_return"
-                and re.search(r"(?:s)?>>= 0x20\b", block)
-            )
-            or not state_domain_store(block, 1)
-        ):
-            return False
-    for name in ("interface_entry", "interface_return"):
-        block = "\n".join(blocks.get(name, []))
-        if len(re.findall(r"\bcall 0xae\b", block)) != 1:
-            return False
-        if not re.search(r"\bif r\d+ == 0x0 goto", block):
-            return False
-        if re.search(r"(?:&=|(?:s)?>>=|<<=|0xffffffff|0x100000000)", block):
-            return False
-        if not state_domain_store(block, 2):
-            return False
-    return not re.search(r"(?:s)?>>= 0x20\b", loader)
+            if not cookie or cookie[0] != "cookie":
+                return False
+            checked = cookie if domain == 2 else ("cookie_mask", cookie[1], 0xffffff)
+            if not state.get(("nonzero", checked)):
+                return False
+    return True
 
 
 def finite_counter_key(lines, relocation):
@@ -832,6 +914,49 @@ def finite_counter_key(lines, relocation):
         if re.search(rf"\br{register} =", lines[index]):
             break
     return None
+
+
+def counter_writeback_contract(lines, lookup_pc):
+    """Every non-null path from this lookup must increment and store its value."""
+    insns, graph = instruction_graph(lines)
+    texts = dict(insns)
+    pending = [(pc, None, False) for pc in graph.get(lookup_pc, [])]
+    seen = set()
+    stored = False
+    while pending:
+        pc, register, incremented = pending.pop()
+        key = (pc, register, incremented)
+        if key in seen:
+            return False  # An update-free cycle cannot establish loss accounting.
+        seen.add(key)
+        text = texts[pc]
+        if re.search(r"\bif r0 == 0x0 goto ", text) and register is None:
+            edges = [edge for edge in graph[pc] if edge != relative_target(pc, text)]
+        elif match := re.search(r"\br(\d+) = \*\(u64 \*\)\(r0 \+ 0x0\)$", text):
+            register = match.group(1)
+            if register == "0":
+                return False
+            incremented = False
+            edges = graph[pc]
+        elif register and re.search(rf"\br{register} \+= 0x1$", text) and not incremented:
+            incremented = True
+            edges = graph[pc]
+        elif register and incremented and re.search(rf"\*\(u64 \*\)\(r0 \+ 0x0\) = r{register}$", text):
+            stored = True
+            continue
+        else:
+            if re.search(r"\bcall ", text):
+                return False
+            # As in call_argument_facts, normalize r/w destination aliases and
+            # forget unsupported definitions, rather than enumerate ALU ops.
+            destination = re.match(r"[rw](\d+)\s", text)
+            if destination and destination.group(1) in ("0", register):
+                return False
+            edges = graph[pc]
+        if not edges:
+            return False
+        pending.extend((edge, register, incremented) for edge in edges)
+    return stored
 
 
 def reservation_loss_contract(disassembly):
@@ -876,40 +1001,18 @@ def reservation_loss_contract(disassembly):
                 for index, line in enumerate(failure)
                 if re.search(r"R_BPF_64_64\s+COUNTERS\s*$", line)
             ]
-            counter_instructions = (
-                instructions(failure[counters[0] :]) if len(counters) == 1 else []
-            )
-            lookup = next(
-                (
-                    index
-                    for index, (_, text) in enumerate(counter_instructions)
-                    if re.search(r"\bcall 0x1\b", text)
-                ),
-                None,
-            )
-            update = (
-                [text for _, text in counter_instructions[lookup + 1 : lookup + 5]]
-                if lookup is not None
-                else []
-            )
-            loaded = (
-                re.search(r"\br(?P<value>\d+) = \*\(u64 \*\)\(r0 \+ 0x0\)\s*$", update[1])
-                if len(update) == 4
-                and re.search(r"\bif r0 == 0x0 goto ", update[0])
-                else None
-            )
-            if (
-                len(counters) != 1
-                or finite_counter_key(lines, branch + 1 + counters[0]) != 0
-                or loaded is None
-                or not re.search(
-                    rf"\br{loaded.group('value')} \+= 0x1\s*$", update[2]
-                )
-                or not re.search(
-                    rf"\*\(u64 \*\)\(r0 \+ 0x0\) = r{loaded.group('value')}\s*$",
-                    update[3],
-                )
-            ):
+            if len(counters) != 1 or finite_counter_key(lines, branch + 1 + counters[0]) != 0:
+                return False
+            lookups = map_call_sites(lines, "COUNTERS", helper=1)
+            lookup = next((pc for index, pc, _ in lookups
+                           if branch < index < target_index), None)
+            if lookup is None or not counter_writeback_contract(lines, lookup):
+                return False
+            _, graph = instruction_graph(lines)
+            # The null reservation arm cannot bypass its COUNTERS lookup.
+            failure_start = line_pc(next(line for line in lines[branch + 1:] if line_pc(line) is not None))
+            unaccounted = reachable(graph, [failure_start], {lookup})
+            if target in unaccounted or any(not graph[pc] for pc in unaccounted):
                 return False
     return len(reservation_functions) == 3 and {
         next((name for name in reservation_functions if name.endswith("emit_export")), None),
@@ -923,25 +1026,18 @@ def producer_object_contract(disassembly):
     entry_names = ("function_list_entry", "interface_list_entry", "interface_entry")
     return_names = ("function_list_return", "interface_list_return", "interface_return")
     for name in entry_names:
-        block = "\n".join(blocks.get(name, []))
-        if (
-            len(re.findall(r"R_BPF_64_64\s+DISCOVERY_STATE\s*$", block, re.MULTILINE))
-            < 2
-            or "call 0x2" not in block
-            or "call 0x3" not in block
-            or not re.search(r"\br4 = 0x1\b", block)
-            or not re.search(r"R_BPF_64_64\s+COUNTERS\s*$", block, re.MULTILINE)
-        ):
+        lines = blocks.get(name, [])
+        if (not discovery_arguments(disassembly, name, "insert", 1)
+                or not discovery_call_sites(disassembly, name, "remove")
+                or not map_call_sites(lines, "COUNTERS", helper=1)):
             return False
     for name in return_names:
-        block = "\n".join(blocks.get(name, []))
-        if (
-            len(re.findall(r"R_BPF_64_64\s+DISCOVERY_STATE\s*$", block, re.MULTILINE))
-            < 3
-            or "call 0x1" not in block
-            or len(re.findall(r"\bcall 0x3\b", block)) < 2
-            or not re.search(r"R_BPF_64_64\s+COUNTERS\s*$", block, re.MULTILINE)
-        ):
+        lines = blocks.get(name, [])
+        if (not discovery_arguments(disassembly, name, "get", 0)
+                # Scope-refused and admitted returns each read their saved state.
+                or len(discovery_call_sites(disassembly, name, "get")) != 2
+                or len(discovery_call_sites(disassembly, name, "remove")) < 2
+                or not map_call_sites(lines, "COUNTERS", helper=1)):
             return False
 
     export = "\n".join(blocks.get("interface_list_return", []))
@@ -993,7 +1089,9 @@ def counter_ownership_contract(uses):
             "interface_entry",
             "interface_return",
         ),
-        2: ("emit_export", "interface_list_return", "interface_entry"),
+        2: ("emit_export", "interface_list_return", "interface_entry",
+            "classify_direct_interface", "classify_indirect_interface",
+            "function_list_entry", "interface_list_entry"),
         3: ("dl_debug_state",),
         4: ("dl_debug_state",),
     }
@@ -1007,7 +1105,8 @@ def counter_ownership_contract(uses):
 
 def inspect_object(path, source, variant):
     checker = map_checker()
-    maps, programs, _ = checker["inspect"](str(path))
+    allowed = checker["DIAGNOSTIC_GLOBAL_HELPERS"] if variant == "unsafe" else frozenset()
+    maps, programs, _ = checker["inspect"](str(path), allowed)
     disassembly = subprocess.run(
         ["llvm-objdump", "-dr", "--print-imm-hex", str(path)],
         capture_output=True,
@@ -1040,7 +1139,7 @@ def inspect_object(path, source, variant):
         and table_bounds_object_contract(disassembly),
         "interface_tail": interface_tail_contract(disassembly),
         "producer_edges": producer_object_contract(disassembly),
-        "cmpxchg_count": disassembly.count("cmpxchg_64"),
+        "cmpxchg_count": pause_cas_count(disassembly),
         "signal_count": len(re.findall(r"call 0x6d\b", disassembly)),
         "pause_order": pause_object_contract(disassembly),
         "unrelated_memset": "<memset>:" in disassembly,
@@ -1169,172 +1268,258 @@ def _pause_disassembly():
       12:\t*(u64 *)(r6 + 0x378) = r7
       13:\tcall 0x84
       14:\texit"""
-    return "\n".join(block.format(index=index) for index in range(3))
+    return "\n".join(block.format(index=name) for name in ("_emit_export", "_emit_lifecycle", "_dl_debug_state")).replace("pause_dl_debug_state", "dl_debug_state")
 
 
-def _cookie_disassembly():
-    loader = """0000000000000000 <dl_debug_state>:
-       0:\tcall 0xae
-       1:\tr1 &= 0x100
-       2:\tr1 &= -0x200
-       3:\tr1 s>>= 0x9
-       4:\texit"""
-    export = """0000000000000000 <{name}>:
-       0:\tcall 0xae
-       1:\tr1 = -0x100000000 ll
-       3:\tr1 = -0xffffffff ll
-       5:\tcall 0xae
-       6:\tr2 = r10
-       7:\tr2 += -0x18
-       8:\tr3 = 0x1
-       9:\t*(u64 *)(r2 + 0x10) = r3
-		0000000000000048:  R_BPF_64_64\tDISCOVERY_STATE
-      10:\tcall 0x1
-      11:\texit"""
-    selection = """0000000000000000 <{name}>:
-       0:\tcall 0xae
-       1:\tif r1 == 0x0 goto +0x2
-       2:\tr2 = r10
-       3:\tr2 += -0x18
-       4:\tr3 = 0x2
-       5:\t*(u64 *)(r2 + 0x10) = r3
-		0000000000000028:  R_BPF_64_64\tDISCOVERY_STATE
-       6:\tcall 0x1
-       7:\texit"""
-    names = (
-        "function_list_entry",
-        "function_list_return",
-        "interface_list_entry",
-        "interface_list_return",
-        "interface_entry",
-        "interface_return",
-    )
-    worker = """0000000000001000 <interface_list_worker>:
-       0:\tcall 0x1
-       1:\tr2 = r10
-       2:\tr2 += -0x18
-       3:\tr3 = 0x1
-       4:\t*(u64 *)(r2 + 0x10) = r3
-		0000000000000020:  R_BPF_64_64\tDISCOVERY_STATE
-       5:\tcall 0x1
-       6:\texit"""
-    return "\n".join(
-        [loader]
-        + [
-            (selection if name in ("interface_entry", "interface_return") else export).format(
-                name=name
-            )
-            for name in names
-        ]
-        + [worker]
-    )
+def _owned_disassembly():
+    """Small instruction/relocation fixtures for the native caller ABI."""
+    starts = {"p11_owner_discovery_get": 5000, "p11_owner_discovery_insert": 5100,
+              "p11_owner_discovery_remove": 5200, "classify_direct_interface": 6000,
+              "fixture_emit_export": 7000}
 
+    def call(name):
+        return [f"call 0x{starts[name] - 1:x}", "rel32:.text"]
 
-def _bounded_disassembly():
-    return """0000000000000000 <fixture_emit_export>:
-       0:\tr1 = 0x43
-       1:\tr2 = 0x44
-       2:\tr3 = 0x5c
-       3:\tr4 = 0x68
-       4:\tif r1 > r2 goto -0x1
-       5:\texit"""
+    def assemble(name, body, start):
+        labels = {}
+        pc = start
+        for text in body:
+            if text.startswith("label:"):
+                labels[text[6:]] = pc
+            elif not text.startswith("rel"):
+                pc += 1
+        pc = start
+        lines = [f"{start * 8:016x} <{name}>:"]
+        for text in body:
+            if text.startswith("label:"):
+                continue
+            if text.startswith("rel"):
+                kind, target = text[3:].split(":")
+                lines.append(f"                {(pc - 1) * 8:016x}:  R_BPF_64_{kind}\t{target}")
+                continue
+            if "@" in text:
+                prefix, label = text.split("@")
+                distance = labels[label] - pc - 1
+                text = prefix + ("+" if distance >= 0 else "-") + f"0x{abs(distance):x}"
+            lines.append(f"{pc:8}:\t{text}")
+            pc += 1
+        return "\n".join(lines)
 
+    def key(domain, continuation=False):
+        if continuation:
+            body = ["r6 = 0x0"]
+        else:
+            body = ["call 0xae", "r6 = r0"]
+            if domain == 1:
+                body += ["r7 = r6", "r7 &= 0xffffff", "if r7 == 0x0 goto @exit"]
+            else:
+                body += ["if r6 == 0x0 goto @exit"]
+        return body + ["call 0xe", "r1 = r10", "r1 += -0x18",
+                       "*(u64 *)(r1 + 0x0) = r0", "*(u64 *)(r1 + 0x8) = r6",
+                       f"r7 = 0x{domain:x}", "*(u64 *)(r1 + 0x10) = r7"]
 
-def _tail_disassembly():
-    return """0000000000000000 <interface_list_return>:
-       0:\tr1 = *(u64 *)(r0 + 0x8)
-       1:\tif r1 == 0x0 goto +0x8
-       2:\tif r2 == 0x0 goto +0x7
-       3:\tif r2 > r3 goto +0x6
-		0000000000000020:  R_BPF_64_64\tDISCOVERY_STATE
-       4:\tr4 = 0x1
-       5:\tcall 0x2
-       6:\tr2 = 0x0
-		0000000000000038:  R_BPF_64_64\tTAIL_CALLS
-       7:\tcall 0xc
-		0000000000000048:  R_BPF_64_64\tDISCOVERY_STATE
-       8:\tcall 0x3
-      9:\tr1 = 0x1
-		0000000000000058:  R_BPF_64_64\tCOUNTERS
-      10:\tcall 0x1
-      11:\tif r0 == 0x0 goto +0x3
-      12:\tr1 = *(u64 *)(r0 + 0x0)
-      13:\tr1 += 0x1
-      14:\t*(u64 *)(r0 + 0x0) = r1
-      15:\texit
-0000000000000060 <interface_list_worker>:
-      12:\tcall 0x1
-      13:\tcall 0x1
-		0000000000000070:  R_BPF_64_64\tDISCOVERY_STATE
-		0000000000000080:  R_BPF_64_64\tDISCOVERY_STATE
-      14:\tif r0 == 0x0 goto +0xd
-      15:\tif r8 > 0xffffff goto +0xc
-      16:\tr1 = 0x10
-      17:\tif r1 > 0xf goto +0xa
-      18:\tif r1 >= r2 goto +0x9
-       19:\tcall 0x1c
-		0000000000000090:  R_BPF_64_32\t.text
-      20:\tr1 += 0x1
-      21:\tr4 = 0x2
-		00000000000000a0:  R_BPF_64_64\tDISCOVERY_STATE
-      22:\tcall 0x2
-      23:\tr2 = 0x0
-		00000000000000b8:  R_BPF_64_64\tTAIL_CALLS
-      24:\tcall 0xc
-		00000000000000c8:  R_BPF_64_64\tDISCOVERY_STATE
-      25:\tcall 0x3
-		00000000000000d8:  R_BPF_64_64\tCOUNTERS
-      26:\tcall 0x1
-      27:\tif r0 == 0x0 goto +0x3
-      28:\tr5 = *(u64 *)(r0 + 0x0)
-      29:\tr5 += 0x1
-      30:\t*(u64 *)(r0 + 0x0) = r5
-      31:\texit
-00000000000000d0 <classify_direct_interface>:
-      29:\tcall 0x1d
-00000000000000e0 <emit_export>:
-      30:\tr1 = 0x43
-      31:\tr2 = 0x44
-      32:\tr3 = 0x5c
-      33:\tr4 = 0x68
-      34:\tif r1 > r2 goto -0x1
-      35:\texit"""
+    def operation(name, arg):
+        body = ["r1 = r10", "r1 += -0x18"]
+        if name == "insert":
+            body += ["r2 = r10", "r2 += -0x30", f"r3 = 0x{arg:x}"]
+        else:
+            body += [f"r2 = 0x{arg:x}"]
+        return body + call("p11_owner_discovery_" + name)
 
+    def counter():
+        return ["r7 = 0x1", "*(u32 *)(r10 - 0x4) = r7", "r2 = r10", "r2 += -0x4",
+                "r1 = 0x0 ll", "rel64:COUNTERS", "call 0x1", "if r0 == 0x0 goto @exit",
+                "r5 = *(u64 *)(r0 + 0x0)", "r5 += 0x1", "*(u64 *)(r0 + 0x0) = r5"]
 
-def _producer_disassembly():
-    loader_tail = """     128:\tr1 = 0x4
-     129:\tr7 = -0x8000000000000000 ll
-     131:\tif r0 == 0x2 goto +0x0
-     132:\tif r0 == 0x2 goto +0x0
-\t\t0000000000000400:  R_BPF_64_64\tPAUSE_PIDS"""
-    entry = """0000000000000000 <{name}>:
-       0:\tr4 = 0x1
-\t\t0000000000000000:  R_BPF_64_64\tDISCOVERY_STATE
-       1:\tcall 0x2
-\t\t0000000000000008:  R_BPF_64_64\tDISCOVERY_STATE
-       2:\tcall 0x3
-\t\t0000000000000010:  R_BPF_64_64\tCOUNTERS
-       3:\texit"""
-    returned = """0000000000000000 <{name}>:
-\t\t0000000000000000:  R_BPF_64_64\tDISCOVERY_STATE
-       0:\tcall 0x1
-\t\t0000000000000008:  R_BPF_64_64\tDISCOVERY_STATE
-       1:\tcall 0x3
-\t\t0000000000000010:  R_BPF_64_64\tDISCOVERY_STATE
-       2:\tcall 0x3
-\t\t0000000000000018:  R_BPF_64_64\tCOUNTERS
-       3:\tcall 0x70
-       4:\texit"""
-    parts = [_initializer_disassembly(loader_tail)]
-    parts.extend(
-        entry.format(name=name)
-        for name in ("function_list_entry", "interface_list_entry", "interface_entry")
-    )
-    parts.extend(
-        returned.format(name=name)
-        for name in ("function_list_return", "interface_list_return", "interface_return")
-    )
+    parts = []
+    names = ("function_list_entry", "interface_list_entry", "interface_entry",
+             "function_list_return", "interface_list_return", "interface_return",
+             "interface_list_worker")
+    for index, name in enumerate(names):
+        worker = name == "interface_list_worker"
+        domain = 2 if name in ("interface_entry", "interface_return") else 1
+        body = key(domain, worker)
+        if name.endswith("entry"):
+            body += operation("insert", 1) + operation("remove", 0) + counter()
+        elif worker or name == "interface_list_return":
+            body += operation("get", 1 if worker else 0)
+            if not worker:
+                body += operation("get", 0)
+            else:
+                body += ["if r0 == 0x0 goto @exit"]
+            body += ["r8 = *(u64 *)(r0 + 0x8)", "if r8 == 0x0 goto @exit", "if r1 > r2 goto @exit"]
+            if worker:
+                body += ["if r8 > 0xffffff goto @exit", "r1 = 0x10", "if r1 > 0xf goto @exit",
+                         "if r1 >= r2 goto @exit"] + call("classify_direct_interface") + ["r1 += 0x1"]
+            else:
+                body += operation("remove", 1) + operation("remove", 1) + ["call 0x70"] + key(1, True)
+            body += operation("insert", 2 if worker else 1)
+            body += ["if r0 != 0x0 goto @exit"]
+            body += ["r2 = 0x0 ll", "rel64:TAIL_CALLS", "r3 = 0x0", "call 0xc"]
+            body += operation("remove", 1) + counter()
+        else:
+            body += operation("get", 0) + operation("get", 0) + operation("remove", 1) + operation("remove", 1) + counter()
+        body += ["label:exit", "exit"]
+        parts.append(assemble(name, body, 100 + index * 100))
+    for name in starts:
+        if name.startswith("p11_owner_"):
+            parts.append(assemble(name, ["exit"], starts[name]))
+    parts.append(assemble("classify_direct_interface", call("fixture_emit_export") + ["exit"], 6000))
+    for index, name in enumerate(("fixture_emit_export", "fixture_emit_lifecycle", "dl_debug_state")):
+        tail = ["r1 = 0x43", "r2 = 0x44", "r3 = 0x5c", "r4 = 0x68", "if r1 > r2 goto -0x1"]
+        if name == "dl_debug_state":
+            tail = ["call 0xae", "r7 = r0", "r1 = r7", "r1 &= 0x100", "r2 = r7", "r2 &= -0x200",
+                    "r7 s>>= 0x9", "r1 = 0x4", "r7 = -0x8000000000000000 ll",
+                    "if r0 == 0x2 goto +0x0", "if r0 == 0x2 goto +0x0", "r1 = 0x0 ll", "rel64:PAUSE_PIDS"]
+        # Reuse the initializer fixture, fixing its historical duplicate PC at submit.
+        block = _initializer_block(name).replace("     127:\tcall 0x84", "     130:\tcall 0x84")
+        body = []
+        for line in block.splitlines()[1:]:
+            if "R_BPF" in line:
+                kind, target = re.search(r"R_BPF_64_(32|64)\s+(\S+)", line).groups()
+                body.append(f"rel{kind}:{target}")
+            elif (match := re.match(r"\s*\d+:\s+(.*)", line)):
+                body.append(match.group(1))
+        parts.append(assemble(name, body + tail + ["exit"], 7000 + index * 200))
     return "\n".join(parts)
+
+
+def _counter_writeback_self_test(disassembly=None, counter_keys=(0, 1)):
+    # The same maintained mutations run on the fixture and on retained decoded
+    # objects, including their backwards branches to shared counter updates.
+    good = _owned_disassembly() if disassembly is None else disassembly
+    blocks = function_blocks(good)
+    export = next(name for name in blocks if name.endswith("emit_export"))
+    worker = next(name for name in blocks if name.endswith("interface_list_worker"))
+
+    def accounting(disassembly, name, key):
+        if key == 0:
+            return reservation_loss_contract(disassembly)
+        lines = function_blocks(disassembly)[name]
+        _, graph = instruction_graph(lines)
+        tail = map_call_sites(lines, "TAIL_CALLS", helper=12)[0][1]
+        return tail_cleanup_contract(disassembly, name, tail, graph)
+
+    def insert_before(name, position, inserted):
+        # Shift only this function's decoded PCs and local branch targets. No
+        # ELF or kernel execution is implied by these instruction mutations.
+        changed = []
+        for line in blocks[name]:
+            if "R_BPF" in line or not (match := re.match(r"\s*(\d+):\s+(.*)", line)):
+                changed.append(line)
+                continue
+            pc = int(match.group(1))
+            text = re.sub(r"^(?:[0-9a-f]{2}\s+){8,16}", "", match.group(2))
+            text = re.sub(r"\s+<[^>]+>$", "", text)
+            new_pc = pc + (pc >= position)
+            target = relative_target(pc, text)
+            if target is not None:
+                target += target >= position
+                offset = target - new_pc - 1
+                text = re.sub(r"goto [+-]0x[0-9a-f]+",
+                              f"goto {'+' if offset >= 0 else '-'}0x{abs(offset):x}", text)
+            if pc == position:
+                changed.append(f"{position}: {inserted}")
+            changed.append(f"{new_pc}: {text}")
+        return good.replace("\n".join(blocks[name]), "\n".join(changed), 1)
+
+    tested = 0
+    for name, key in ((export, 0), (worker, 1)):
+        if key not in counter_keys:
+            continue
+        if not accounting(good, name, key):
+            raise AssertionError(f"counter{key} positive control rejected")
+        lines = blocks[name]
+        insns, graph = instruction_graph(lines)
+        start = insns[0][0] if key == 0 else map_call_sites(lines, "TAIL_CALLS", helper=12)[0][1]
+        lookup = next(pc for index, pc, _ in map_call_sites(lines, "COUNTERS", helper=1)
+                      if finite_counter_key(lines, index) == key and pc in reachable(graph, [start]))
+        downstream = reachable(graph, [lookup])
+        load, register = next((pc, match.group(1)) for pc, text in insns
+                              if pc in downstream
+                              if (match := re.fullmatch(r"r(\d+) = \*\(u64 \*\)\(r0 \+ 0x0\)", text)))
+        increment = graph[load][0]
+        store = graph[increment][0]
+        texts = dict(insns)
+        assert texts[increment] == f"r{register} += 0x1"
+        assert texts[store] == f"*(u64 *)(r0 + 0x0) = r{register}"
+        for position in (increment, store):
+            for clobber in (f"r{register} ^= 0x1", f"r{register} *= 0x0",
+                            f"w{register} ^= 0x1", "r0 ^= 0x8", "w0 ^= 0x8",
+                            f"r{register} += 0x1", "call 0x5"):
+                bad = insert_before(name, position, clobber)
+                if accounting(bad, name, key):
+                    raise AssertionError(f"counter{key} mutation accepted before {position}: {clobber}")
+                tested += 1
+    return tested
+
+
+def _owned_self_test():
+    good = _owned_disassembly()
+    checks = (cookie_object_contract, interface_tail_contract, producer_object_contract)
+    for check in checks:
+        if not check(good):
+            raise AssertionError(f"valid owned fixture rejected: {check.__name__}")
+    blocks = function_blocks(good)
+
+    def mutate(function, before, after, last=False):
+        block = "\n".join(blocks[function])
+        if before not in block:
+            raise AssertionError(f"mutation did not change {function}: {before}")
+        changed = after.join(block.rsplit(before, 1)) if last else block.replace(before, after, 1)
+        return good.replace(block, changed, 1)
+
+    for name in ("interface_list_return", "interface_list_worker"):
+        for label, before, after in (
+            ("insert flag", "r3 = 0x" + ("1" if name.endswith("return") else "2"), "r3 = 0x0"),
+            ("insert call", "call 0x13eb", "call 0x13ec"),
+            ("cleanup call", "call 0x144f", "call 0x1450"),
+            ("tail slot", "r3 = 0x0", "r3 = 0x1"),
+            ("insert success gate", "if r0 != 0x0 goto", "if r0 == 0x0 goto"),
+            ("counter increment", "r5 += 0x1", "r5 += 0x0"),
+            ("counter writeback", "*(u64 *)(r0 + 0x0) = r5", "r2 = r5"),
+        ):
+            if interface_tail_contract(mutate(name, before, after, last=label == "cleanup call")):
+                raise AssertionError(f"mutation accepted: {name} {label}")
+    for before, after in (("r2 = 0x1", "r2 = 0x0"), ("call 0x1387", "call 0x1388"),
+                          ("call 0x176f", "call 0x1770"), ("r1 += 0x1", "r1 += 0x0"),
+                          ("if r1 > 0xf", "if r1 > 0x10"), ("if r1 >= r2", "if r1 > r2"),
+                          ("if r8 > 0xffffff", "if r8 > 0x1000000")):
+        if interface_tail_contract(mutate("interface_list_worker", before, after)):
+            raise AssertionError(f"worker mutation accepted: {before}")
+    for name in ("function_list_entry", "interface_entry", "interface_list_worker"):
+        for before, after in (("*(u64 *)(r1 + 0x10) = r7", "*(u64 *)(r1 + 0x10) = r0"),
+                              ("r1 += -0x18", "r1 += -0x20")):
+            if cookie_object_contract(mutate(name, before, after)):
+                raise AssertionError(f"cookie domain/key mutation accepted: {name}")
+    for name in ("function_list_entry", "interface_entry"):
+        for before, after in (("call 0xae", "call 0x5"), ("r6 = r0", "w6 = w0"),
+                              ("r6 = r0", "r6 = 0x1"), ("== 0x0 goto", "!= 0x0 goto")):
+            if cookie_object_contract(mutate(name, before, after)):
+                raise AssertionError(f"cookie provenance mutation accepted: {name} {before}")
+    for before, after in (("r1 &= 0x100", "r1 &= 0x200"), ("r2 &= -0x200", "r2 &= -0x100"),
+                          ("r7 s>>= 0x9", "r7 >>= 0x20")):
+        if cookie_object_contract(mutate("dl_debug_state", before, after)):
+            raise AssertionError(f"loader cookie mutation accepted: {before}")
+    for before, after in (("call 0x13eb", "call 0x13ec"), ("r3 = 0x1", "r3 = 0x0"),
+                          ("call 0x144f", "call 0x1450")):
+        if producer_object_contract(mutate("function_list_entry", before, after)):
+            raise AssertionError(f"producer mutation accepted: {before}")
+    for name, before, after in (("function_list_return", "call 0x1387", "call 0x1388"),
+                               ("interface_list_return", "call 0x70", "call 0x71"),
+                               ("dl_debug_state", "r1 = 0x4", "r1 = 0x0"),
+                               ("dl_debug_state", "r7 = -0x8000000000000000 ll", "r7 = 0x0"),
+                               ("fixture_emit_export", "R_BPF_64_64\tCOUNTERS", "R_BPF_64_64\tNOT_COUNTERS"),
+                               ("fixture_emit_export", "r7 = 0x0", "r7 = 0x1"),
+                               ("fixture_emit_export", "r1 += 0x1", "r1 += 0x0"),
+                               ("fixture_emit_export", "*(u64 *)(r0 + 0x0) = r1", "r2 = r1")):
+        if producer_object_contract(mutate(name, before, after)):
+            raise AssertionError(f"producer edge mutation accepted: {before}")
+    if not table_bounds_object_contract(good):
+        raise AssertionError("valid table bounds rejected")
+    for bound in ("0x43", "0x44", "0x5c", "0x68"):
+        if table_bounds_object_contract(mutate("fixture_emit_export", " = " + bound, " = 0x42")):
+            raise AssertionError(f"table bound mutation accepted: {bound}")
 
 
 def _reject(action, label):
@@ -1416,6 +1601,22 @@ def self_test():
         lambda: source_contract(timestamp_before_cas),
         "winner timestamp before CAS",
     )
+    span = """
+checked_add((active_count - 1) * layout.interface().stride as u64)
+address.checked_add(layout.interface().stride as u64 - layout.word_bytes() as u64)
+target_word_end(address, layout)
+interface_continuation_pack(count, 0, symbol_id)
+"""
+    interface_list_span_contract(span)
+    for label, mutation in [
+        ("target-sized interface stride", span.replace("layout.interface().stride", "24", 1)),
+        ("complete final word", span.replace("target_word_end(address, layout)", "address")),
+        (
+            "span check after continuation",
+            "interface_continuation_pack(count, 0, symbol_id)\n" + span,
+        ),
+    ]:
+        _reject(lambda mutation=mutation: interface_list_span_contract(mutation), label)
     _reject(
         lambda: source_contract(
             good.replace(
@@ -1516,222 +1717,19 @@ def self_test():
         if pause_object_contract(mutation):
             raise AssertionError(f"mutation accepted: {label}")
 
-    cookie = _cookie_disassembly()
-    if not cookie_object_contract(cookie):
-        raise AssertionError("valid cookie disassembly fixture was rejected")
-    if cookie_object_contract(cookie.replace("       0:\tcall 0xae", "       0:\tcall 0x5", 1)):
-        raise AssertionError("mutation accepted: missing loader cookie")
-    if cookie_object_contract(
-        cookie.replace("       5:\tcall 0xae", "       5:\tr1 >>= 0x20\n       6:\tcall 0xae", 1)
-    ):
-        raise AssertionError("mutation accepted: export cookie slot collision")
-    selection_zero = cookie.replace(
-        "0000000000000000 <interface_entry>:\n       0:\tcall 0xae\n       1:\tif r1 == 0x0 goto +0x2",
-        "0000000000000000 <interface_entry>:\n       0:\tcall 0xae\n       1:\tif r1 != 0x0 goto +0x2",
-        1,
-    )
-    if cookie_object_contract(selection_zero):
-        raise AssertionError("mutation accepted: selection zero-cookie guard")
-    selection_truncated = cookie.replace(
-        "0000000000000000 <interface_return>:\n       0:\tcall 0xae\n       1:\tif r1 == 0x0 goto +0x2",
-        "0000000000000000 <interface_return>:\n       0:\tcall 0xae\n       1:\tr1 >>= 0x20\n       2:\tif r1 == 0x0 goto +0x2",
-        1,
-    )
-    if cookie_object_contract(selection_truncated):
-        raise AssertionError("mutation accepted: selection high-bit truncation")
-    for label, mutation in [
-        (
-            "export domain swapped",
-            cookie.replace("       8:\tr3 = 0x1", "       8:\tr3 = 0x2", 1),
-        ),
-        (
-            "export domain removed",
-            cookie.replace("       9:\t*(u64 *)(r2 + 0x10) = r3\n", "", 1),
-        ),
-        (
-            "worker domain swapped",
-            cookie.replace(
-                "0000000000001000 <interface_list_worker>:\n       0:\tcall 0x1\n       1:\tr2 = r10\n       2:\tr2 += -0x18\n       3:\tr3 = 0x1",
-                "0000000000001000 <interface_list_worker>:\n       0:\tcall 0x1\n       1:\tr2 = r10\n       2:\tr2 += -0x18\n       3:\tr3 = 0x2",
-                1,
-            ),
-        ),
-        (
-            "selection domain swapped",
-            cookie.replace("       4:\tr3 = 0x2", "       4:\tr3 = 0x1", 1),
-        ),
-        (
-            "selection domain removed",
-            cookie.replace("       5:\t*(u64 *)(r2 + 0x10) = r3\n", "", 1),
-        ),
-        (
-            "domain value mutated before store",
-            cookie.replace(
-                "       8:\tr3 = 0x1\n       9:\t*(u64 *)(r2 + 0x10) = r3",
-                "       8:\tr3 = 0x1\n"
-                "       9:\tr3 += 0x1\n"
-                "      10:\t*(u64 *)(r2 + 0x10) = r3",
-                1,
-            ),
-        ),
-        (
-            "domain value mutated through ALU32 alias",
-            cookie.replace(
-                "       8:\tr3 = 0x1\n       9:\t*(u64 *)(r2 + 0x10) = r3",
-                "       8:\tr3 = 0x1\n"
-                "       9:\tw3 += 0x1\n"
-                "      10:\t*(u64 *)(r2 + 0x10) = r3",
-                1,
-            ),
-        ),
-        (
-            "domain value mutated through signed shift",
-            cookie.replace(
-                "       8:\tr3 = 0x1\n       9:\t*(u64 *)(r2 + 0x10) = r3",
-                "       8:\tr3 = 0x1\n"
-                "       9:\tr3 s>>= 0x1\n"
-                "      10:\t*(u64 *)(r2 + 0x10) = r3",
-                1,
-            ),
-        ),
-        (
-            "domain stored at wrong offset",
-            cookie.replace(
-                "*(u64 *)(r2 + 0x10) = r3", "*(u64 *)(r2 + 0x8) = r3", 1
-            ),
-        ),
-        (
-            "domain stored after map call",
-            cookie.replace(
-                "       9:\t*(u64 *)(r2 + 0x10) = r3\n"
-                "\t\t0000000000000048:  R_BPF_64_64\tDISCOVERY_STATE\n"
-                "      10:\tcall 0x1",
-                "\t\t0000000000000048:  R_BPF_64_64\tDISCOVERY_STATE\n"
-                "      10:\tcall 0x1\n"
-                "      11:\t*(u64 *)(r2 + 0x10) = r3",
-                1,
-            ),
-        ),
-        (
-            "decoy domain store",
-            cookie.replace(
-                "       8:\tr3 = 0x1\n       9:\t*(u64 *)(r2 + 0x10) = r3",
-                "       8:\tr3 = 0x2\n"
-                "       9:\t*(u64 *)(r2 + 0x10) = r3\n"
-                "      10:\tr4 = 0x1\n"
-                "      11:\t*(u64 *)(r10 - 0x8) = r4",
-                1,
-            ),
-        ),
-    ]:
-        if cookie_object_contract(mutation):
-            raise AssertionError(f"mutation accepted: {label}")
-
-    bounded = _bounded_disassembly()
-    if not table_bounds_object_contract(bounded):
-        raise AssertionError("valid table-bounds disassembly fixture was rejected")
-    for label, mutation in [
-        ("104-slot cap", bounded.replace("r4 = 0x68", "r4 = 0x69")),
-    ]:
-        if table_bounds_object_contract(mutation):
-            raise AssertionError(f"mutation accepted: {label}")
-
-    tail = _tail_disassembly()
-    if not interface_tail_contract(tail):
-        raise AssertionError("valid interface-list tail fixture was rejected")
-    for label, mutation in [
-        (
-            "return counter increment skipped",
-            tail.replace(
-                "      11:\tif r0 == 0x0 goto +0x3\n"
-                "      12:\tr1 = *(u64 *)(r0 + 0x0)\n"
-                "      13:\tr1 += 0x1\n"
-                "      14:\t*(u64 *)(r0 + 0x0) = r1\n"
-                "      15:\texit",
-                "      11:\tif r0 == 0x0 goto +0x4\n"
-                "      12:\tr1 = *(u64 *)(r0 + 0x0)\n"
-                "      13:\tgoto +0x1\n"
-                "      14:\tr1 += 0x1\n"
-                "      15:\t*(u64 *)(r0 + 0x0) = r1\n"
-                "      16:\texit",
-                1,
-            ),
-        ),
-        (
-            "return counter writeback removed",
-            tail.replace("      14:\t*(u64 *)(r0 + 0x0) = r1", "      14:\tr2 = r1", 1),
-        ),
-        (
-            "worker counter increment skipped",
-            tail.replace(
-                "      27:\tif r0 == 0x0 goto +0x3\n"
-                "      28:\tr5 = *(u64 *)(r0 + 0x0)\n"
-                "      29:\tr5 += 0x1\n"
-                "      30:\t*(u64 *)(r0 + 0x0) = r5\n"
-                "      31:\texit",
-                "      27:\tif r0 == 0x0 goto +0x4\n"
-                "      28:\tr5 = *(u64 *)(r0 + 0x0)\n"
-                "      29:\tgoto +0x1\n"
-                "      30:\tr5 += 0x1\n"
-                "      31:\t*(u64 *)(r0 + 0x0) = r5\n"
-                "      32:\texit",
-                1,
-            ),
-        ),
-        (
-            "worker counter writeback removed",
-            tail.replace("      30:\t*(u64 *)(r0 + 0x0) = r5", "      30:\tr2 = r5", 1),
-        ),
-    ]:
-        if interface_tail_contract(mutation):
-            raise AssertionError(f"mutation accepted: {label}")
-    for label, mutation in [
-        ("return tail slot", tail.replace("r2 = 0x0", "r2 = 0x1", 1)),
-        ("worker tail slot", tail.replace("      23:\tr2 = 0x0", "      23:\tr2 = 0x1", 1)),
-        ("return BPF_NOEXIST", tail.replace("       4:\tr4 = 0x1", "       4:\tr4 = 0x2", 1)),
-        ("worker BPF_EXIST", tail.replace("      21:\tr4 = 0x2", "      21:\tr4 = 0x1", 1)),
-        ("return fallthrough cleanup", tail.replace("       8:\tcall 0x3\n", "", 1)),
-        ("worker fallthrough cleanup", tail.replace("      25:\tcall 0x3\n", "", 1)),
-        ("worker cookie", tail.replace("      12:\tcall 0x1\n", "      12:\tcall 0xae\n", 1)),
-        ("worker index cap", tail.replace("if r1 > 0xf", "if r1 > 0x10", 1)),
-        ("worker active-count gate", tail.replace("if r1 >= r2", "if r1 > r2", 1)),
-        ("worker classifier", tail.replace("      19:\tcall 0x1c", "      19:\tcall 0x1b", 1)),
-        ("duplicated classifier", tail.replace("      19:\tcall 0x1c", "      19:\tcall 0x1c\n      19:\tcall 0x1c", 1)),
-        ("worker progression", tail.replace("      20:\tr1 += 0x1", "      20:\tr1 += 0x0", 1)),
-        ("worker counter", tail.replace("      29:\tr5 += 0x1", "      29:\tr5 += 0x0", 1)),
-    ]:
-        if interface_tail_contract(mutation):
-            raise AssertionError(f"mutation accepted: {label}")
-
-    producer = _producer_disassembly()
-    if not producer_object_contract(producer):
-        raise AssertionError("valid producer-edge disassembly fixture was rejected")
-    classifier_counter = [
-        ("emit_export", 0),
-        ("function_list_entry", 1),
-        ("interface_list_return", 2),
-        ("dl_debug_state", 3),
-        ("dl_debug_state", 4),
-        ("interface_entry", 2),
-    ]
-    if not counter_ownership_contract(classifier_counter):
-        raise AssertionError("request-classifier counter ownership was rejected")
+    _owned_self_test()
+    _counter_writeback_self_test()
+    classifier_counter = [("emit_export", 0), ("function_list_entry", 1),
+                          ("interface_list_return", 2), ("dl_debug_state", 3),
+                          ("dl_debug_state", 4), ("interface_entry", 2)]
+    assert counter_ownership_contract(classifier_counter)
     classifier_counter[-1] = ("interface_entry", 3)
-    if counter_ownership_contract(classifier_counter):
-        raise AssertionError("request-classifier counter mutation was accepted")
-    for label, mutation in [
-        ("state insert no-overwrite", producer.replace("       0:\tr4 = 0x1", "       0:\tr4 = 0x0", 1)),
-        ("state insertion cleanup", producer.replace("       2:\tcall 0x3", "       2:\tcall 0x2", 1)),
-        ("state return removal", producer.replace("       1:\tcall 0x3", "       1:\tcall 0x2", 1)),
-        ("bounded-read failure counter", producer.replace("call 0x70", "call 0x71")),
-        ("invalid-loader marker", producer.replace("     128:\tr1 = 0x4", "     128:\tr1 = 0x0")),
-        ("coalesced pause sentinel", producer.replace("r7 = -0x8000000000000000 ll", "r7 = 0x0", 1)),
-        ("ring-reservation loss counter", producer.replace("R_BPF_64_64\tCOUNTERS", "R_BPF_64_64\tNOT_COUNTERS", 1)),
-        ("ring-reservation loss increment", producer.replace("      12:\tr1 += 0x1", "      12:\tr1 += 0x0", 1)),
-        ("ring-reservation loss store", producer.replace("      13:\t*(u64 *)(r0 + 0x0) = r1", "      13:\tr2 = r1", 1)),
-    ]:
-        if producer_object_contract(mutation):
-            raise AssertionError(f"mutation accepted: {label}")
+    assert not counter_ownership_contract(classifier_counter)
+    classifier_counter[-1] = ("unrelated_function", 2)
+    assert not counter_ownership_contract(classifier_counter)
+    extra_cas = pause + "\n0000000000100000 <p11_owner_fixture>:\n 131072: r0 = cmpxchg_64(r1 + 0x0, r0, r3)\n 131073: exit"
+    assert pause_object_contract(extra_cas)
+    assert not pause_object_contract(extra_cas.replace("131073: exit", "131073: call 0x6d\n 131074: exit"))
 
     manifest = test_manifest(Path("/canonical/main.rs"), "default", good)
     _reject(

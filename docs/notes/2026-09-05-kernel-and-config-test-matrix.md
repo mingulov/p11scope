@@ -100,6 +100,14 @@ RHEL, SUSE, Amazon Linux and every other backporting vendor. Prefer probing.
 
 ## 4. The matrix
 
+**Owner amendment (2026-09-07):** native64 and ia32 are required axes of every
+testable x86-64 kernel/configuration row below, including SHOULD/NICE rows
+when run. Reuse the same applicable product oracles for both widths. Missing
+IA32 execution prerequisites require explicit evidence and separate refusal
+checks; they are not positive ABI qualification. Actual product failures stay
+FAIL, and unexecuted positive checks stay UNRUN. See the
+[ABI qualification plan](../superpowers/plans/2026-09-07-ia32-compatibility.md#later-kernel-and-incompatibility-qualification-owner-request-2026-09-07).
+
 ### MUST — a release claim is false without it
 
 | Cell | Obtain | Uniquely tests |
@@ -131,9 +139,10 @@ p11scope *destroying someone else's process* and reporting nothing.
 Alpine/musl (a packaging question first — no musl target is built), Amazon
 Linux 2023, CentOS Stream 10, mainline `-rc` for early verifier warning,
 custom builds with `CONFIG_BPF_JIT_ALWAYS_ON=n` or `CONFIG_UPROBE_EVENTS=n` to
-prove the documentation, Debian 11 (5.10) to see the genuine below-floor message,
-and the ia32 axis that W7 adds — where the matrix gains a `-m32` harness
-parameter rather than new cells.
+prove the documentation, Debian 11 (5.10) to see the genuine below-floor message.
+
+The ia32 axis is required by the owner amendment above; it reuses the matrix
+with a `-m32` harness parameter rather than a separate set of kernel cells.
 
 ## 5. Measured: attaching a uretprobe kills a seccomp-hardened target
 

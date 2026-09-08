@@ -15,3 +15,6 @@ __pycache__/
 # Root build outputs (history already carries one committed binary).
 /p11scope
 /p11scope-discover
+
+# Generated local ABI qualification logs.
+/abi-qualification/

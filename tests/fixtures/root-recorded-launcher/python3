@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+if [ "${FAIL_PIDFD:-0}" = 1 ] && [ "${2-}" = - ]; then
+    shift 2
+    exec "$REAL_PYTHON" -I "$FIXTURE_DIR/fault.py" pidfd /dev/stdin "$@"
+fi
+if [ "${FAIL_PROC:-0}" = 1 ] && { [ "${3-}" = active ] || [ "${3-}" = wait-gone ]; }; then
+    shift
+    exec "$REAL_PYTHON" -I "$FIXTURE_DIR/fault.py" proc "$@"
+fi
+if [ "${3-}" = exec ]; then
+    exec "$REAL_PYTHON" -I "$FIXTURE_DIR/owned-exec.py" "$5" "$REAL_PYTHON" "$@"
+fi
+exec "$REAL_PYTHON" "$@"

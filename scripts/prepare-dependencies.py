@@ -151,9 +151,8 @@ def compute_recipe_identity(record: dict, patches: list[tuple[str, bytes]]) -> s
     return digest.hexdigest()
 
 
-def compute_tree_digest(root: Path) -> str:
-    """Return the prescribed v2 file tree digest, rejecting unsafe tree entries."""
-    digest = hashlib.sha256(TREE_DOMAIN)
+def tree_inventory(root: Path) -> list[tuple[str, int, str]]:
+    """Return sorted relative paths, modes and hashes after rejecting unsafe entries."""
     files = []
     if not root.is_dir() or root.is_symlink():
         raise PreparationError(f"prepared tree is not a directory: {root}")
@@ -174,9 +173,15 @@ def compute_tree_digest(root: Path) -> str:
             mode = stat.S_IMODE(metadata.st_mode)
             if not stat.S_ISREG(metadata.st_mode) or mode not in (0o644, 0o755):
                 raise PreparationError(f"unsafe file entry in prepared tree: {relative}")
-            if relative != RECEIPT_NAME:
-                files.append((relative, mode, _sha256_file(path)))
-    for relative, mode, content_digest in sorted(files, key=lambda item: item[0].encode("utf-8")):
+            files.append((relative, mode, _sha256_file(path)))
+    return sorted(files, key=lambda item: item[0].encode("utf-8"))
+
+
+def _tree_digest_from_inventory(files: list[tuple[str, int, str]]) -> str:
+    digest = hashlib.sha256(TREE_DOMAIN)
+    for relative, mode, content_digest in files:
+        if relative == RECEIPT_NAME:
+            continue
         digest.update(relative.encode("utf-8"))
         digest.update(b"\0")
         digest.update(f"{mode:04o}".encode("ascii"))
@@ -184,6 +189,11 @@ def compute_tree_digest(root: Path) -> str:
         digest.update(content_digest.encode("ascii"))
         digest.update(b"\0")
     return digest.hexdigest()
+
+
+def compute_tree_digest(root: Path) -> str:
+    """Return the prescribed v2 file tree digest, rejecting unsafe tree entries."""
+    return _tree_digest_from_inventory(tree_inventory(root))
 
 
 def normalize_tree_modes(root: Path) -> None:
@@ -205,8 +215,7 @@ def normalize_tree_modes(root: Path) -> None:
             os.chmod(path, 0o755 if metadata.st_mode & 0o111 else 0o644)
 
 
-def verify_prepared_tree(path: Path, record: dict, recipe_identity: str) -> None:
-    """Verify receipt identity and every source byte/mode for a prepared package."""
+def _verified_prepared_inventory(path: Path, record: dict, recipe_identity: str) -> list[tuple[str, int, str]]:
     receipt_path = path / RECEIPT_NAME
     try:
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
@@ -222,11 +231,23 @@ def verify_prepared_tree(path: Path, record: dict, recipe_identity: str) -> None
     }
     if receipt != expected_receipt:
         raise PreparationError(f"recipe identity mismatch for existing output {output_name(record)}")
-    actual = compute_tree_digest(path)
+    inventory = tree_inventory(path)
+    actual = _tree_digest_from_inventory(inventory)
     if actual != record["expected_tree_sha256"]:
         raise PreparationError(
             f"tree digest mismatch for {output_name(record)}: expected {record['expected_tree_sha256']}, got {actual}"
         )
+    return inventory
+
+
+def verify_prepared_tree(path: Path, record: dict, recipe_identity: str) -> None:
+    """Verify receipt identity and every source byte/mode for a prepared package."""
+    _verified_prepared_inventory(path, record, recipe_identity)
+
+
+def verified_prepared_inventory(path: Path, record: dict, recipe_identity: str) -> list[tuple[str, int, str]]:
+    """Verify a prepared package and return its receipt-inclusive safe inventory."""
+    return _verified_prepared_inventory(path, record, recipe_identity)
 
 
 def _archive_member_path(member_name: str, prefix: str) -> PurePosixPath | None:

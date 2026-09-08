@@ -2,7 +2,7 @@
   "schema_version": 1,
   "workspace_manifests": [
     "Cargo.toml",
-    "p11scope-bpf/Cargo.toml"
+    "crates/ebpf/Cargo.toml"
   ],
   "packages": [
     {

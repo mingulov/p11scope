@@ -155,6 +155,22 @@ repository-relative UTF-8 path and LF, sorted by path bytes. Include preparation
 receipts and emit nothing until every workspace and source tree passes. Caller
 adapters retain their existing ledger formats and reject duplicate input paths.
 
+Before the first metadata query, snapshot regular `Cargo.toml` candidates
+below the repository with deterministic traversal and fixed entry/manifest-byte
+limits. Do not follow symlink directories or use Git or `.gitignore` for this
+inventory. Prune directory names `target`, `.git`, `.claude`, `.superpowers`
+and `__pycache__`, root `dist`, `third-party/archives`, and direct
+`third-party/.prepare-dependencies-stage-*` directories. Every validated
+workspace member must already be present in that pre-query inventory; members
+in excluded namespaces are unsupported. Compare the complete candidate
+inventory and selected executable identities after the queries and retain them
+for recheck. This conservatively refuses changes to unrelated scanned fixture
+manifests as well. Candidate identities are separate from the generated-source
+checksum ledger. Reconstruct all retained graph, member and ledger projections
+from the retained metadata through the shared verifier before fresh recheck
+queries; require exact input coverage and fixed command/context/status facts.
+These endpoint comparisons do not establish continuous immutability.
+
 CI acquires ordinary locked dependencies for both workspaces outside sealed
 execution before running offline metadata verification. This acquisition is
 separate from the two patched archive downloads; a warm Cargo cache is not

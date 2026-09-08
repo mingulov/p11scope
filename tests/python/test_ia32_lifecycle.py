@@ -19,7 +19,7 @@ FIXTURES = ROOT / "tests/fixtures/ia32-lifecycle"
 DRIVER = FIXTURES / "driver.sh"
 TARGET = FIXTURES / "target.sh"
 GUARD_SOURCE = ROOT / "scripts/matrix/ia32-compat-trace-exec.c"
-EXPECTED_DEFAULT_TESTS = 26
+EXPECTED_DEFAULT_TESTS = 27
 
 
 def starttime(pid):
@@ -656,6 +656,56 @@ class Ia32LifecycleTests(unittest.TestCase):
         self.signal_owned(guard_owned, signal.SIGKILL)
         parent_status, _, _ = self.finish_guard_parent(proc)
         self.assertNotEqual(parent_status, None)
+
+    def test_guard_child_identity_is_atomic_and_gated_until_authenticated_ack(self):
+        guard, target = self.build_guard()
+        parent_record = self.work / "parent.pid"
+        child_record = Path(str(parent_record) + ".child")
+        child_temporary = Path(str(child_record) + ".tmp")
+        constructing = Path(str(child_record) + ".constructing")
+        construct_release = Path(str(child_record) + ".construct.release")
+        child_acquired = Path(str(child_record) + ".acquired")
+        self_record = self.work / "guard.pid"
+        program = self.work / "program.bt"
+        program.write_text("BEGIN { exit(); }\n")
+        env = self.env.copy()
+        env["IA32_GUARD_TEST_RECORD"] = str(target)
+        env["IA32_TEST_HOLD_CHILD_RECORD"] = "1"
+        proc, parent_owned = self.popen_owned(
+            [sys.executable, str(FIXTURES / "guard-parent.py"), "normal", guard,
+             parent_record, self_record, target, program],
+            cwd=ROOT, env=env, stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+
+        self.wait_file(constructing)
+        self.assertFalse(child_record.exists(), "partial child identity became public")
+        partial = child_temporary.read_text().split()
+        self.assertEqual(len(partial), 1, "construction hook did not expose one partial field")
+        self.assertGreater(int(partial[0]), 0)
+        self.assertFalse(Path(str(target) + ".ready").exists())
+
+        construct_release.touch()
+        self.wait_file(child_record)
+        fields = child_record.read_text().split()
+        self.assertEqual(len(fields), 2)
+        child_pid, child_generation = map(int, fields)
+        child_owned = self.own_pid(child_pid, child_generation)
+        child_owned["owner_entry"] = parent_owned
+        child_owned["parent_status"] = Path(str(child_record) + ".status")
+        self.guard_children[id(proc)] = child_owned
+        self.assertFalse(Path(str(target) + ".ready").exists(),
+                         "child passed its gate before authenticated ACK")
+
+        child_acquired.touch()
+        Path(str(target) + ".acquired").touch()
+        proc.stdin.write(b"guard stdin\n")
+        proc.stdin.close()
+        self.wait_file(Path(str(target) + ".ready"))
+        self.signal_owned(child_owned, signal.SIGKILL)
+        parent_status, _, _ = self.finish_guard_parent(proc)
+        self.assertNotEqual(parent_status, None)
+        self.assertFalse(child_temporary.exists())
 
     def test_guard_rejects_wrong_parent_generation_and_setid_target(self):
         for mode, target_mode in (("wrong", None), ("normal", "setid")):

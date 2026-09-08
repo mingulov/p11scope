@@ -68,6 +68,7 @@ os.close(gate_read)
 child_fd = None
 child_generation = None
 child_record = Path(parent_record + ".child")
+child_temporary = Path(str(child_record) + ".tmp")
 status_record = Path(parent_record + ".child.status")
 
 
@@ -101,8 +102,32 @@ try:
     child_fd = os.pidfd_open(pid)
     child_raw = Path(f"/proc/{pid}/stat").read_bytes().rsplit(b") ", 1)[1].split()
     child_generation = int(child_raw[19])
-    child_record.write_text(f"{pid} {child_generation}\n")
-except (OSError, ValueError):
+    temporary_fd = os.open(
+        child_temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        with os.fdopen(temporary_fd, "w") as stream:
+            stream.write(str(pid))
+            if os.environ.get("IA32_TEST_HOLD_CHILD_RECORD") == "1":
+                stream.flush()
+                Path(str(child_record) + ".constructing").touch()
+                release = Path(str(child_record) + ".construct.release")
+                deadline = time.monotonic() + 3
+                while not release.exists() and interrupted == 0:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("child record construction hook timed out")
+                    time.sleep(0.01)
+                if interrupted:
+                    raise InterruptedError
+            stream.write(f" {child_generation}\n")
+        os.link(child_temporary, child_record, follow_symlinks=False)
+        child_temporary.unlink()
+    except BaseException:
+        child_temporary.unlink(missing_ok=True)
+        raise
+except (OSError, ValueError, TimeoutError):
     os.close(gate_write)
     terminate_and_reap(124)
 

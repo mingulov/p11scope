@@ -7,6 +7,7 @@ from pathlib import Path
 import select
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -46,6 +47,7 @@ class RecordedLauncherTests(unittest.TestCase):
         self.env = dict(os.environ, CASE_DIR=str(self.work), PATH=f"{self.bin}:{os.environ['PATH']}",
                         REAL_PYTHON=shutil.which("python3"), FIXTURE_DIR=str(FIXTURES))
         self.adopted = {}
+        self.adopt_none_reasons = {}
         self.direct_children = []
         # Final subreaper drain follows all registered direct-parent and
         # published-record cleanup, before temporary evidence is removed.
@@ -116,18 +118,94 @@ class RecordedLauncherTests(unittest.TestCase):
         try:
             fd = os.pidfd_open(pid)
         except ProcessLookupError:
+            self.adopt_none_reasons[identity] = "pidfd-open-gone"
             return
         try:
             try:
                 actual = self.generation(pid)
             except (FileNotFoundError, ProcessLookupError):
+                self.adopt_none_reasons[identity] = "generation-read-gone"
                 return
             if actual != starttime:
+                self.adopt_none_reasons[identity] = (
+                    f"generation-mismatch expected={starttime} actual={actual}"
+                )
                 return
             self.adopted[identity] = fd
+            self.adopt_none_reasons.pop(identity, None)
         finally:
             if identity not in self.adopted:
                 os.close(fd)
+        return fd
+
+    @staticmethod
+    def diagnostic_file(label, path, limit=4096):
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            return f"{label}=<missing>"
+        except OSError as error:
+            return f"{label}=<unreadable {type(error).__name__} errno={error.errno}>"
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                return f"{label}=<unreadable non-regular mode={stat.S_IFMT(info.st_mode):#o}>"
+            raw = os.read(fd, limit + 1)
+            truncated = info.st_size > limit or len(raw) > limit
+            rendered = repr(raw[:limit].decode("utf-8", errors="backslashreplace"))
+            if truncated:
+                rendered += f"<truncated size={info.st_size} limit={limit}>"
+            return f"{label}={rendered}"
+        except OSError as error:
+            return f"{label}=<unreadable {type(error).__name__} errno={error.errno}>"
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def direct_parent_status(parent_fd):
+        try:
+            status = os.waitid(os.P_PIDFD, parent_fd,
+                               os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except BaseException as error:
+            return f"unavailable {type(error).__name__}: {error}"
+        if status is None:
+            return "running"
+        return (f"exited pid={status.si_pid} code={status.si_code} "
+                f"status={status.si_status}")
+
+    @staticmethod
+    def bounded_repr(value, limit=4096):
+        rendered = repr(value)
+        if len(rendered) <= limit:
+            return rendered
+        return rendered[:limit] + f"<truncated repr limit={limit}>"
+
+    def adopt_none_diagnostic(self, identity, snapshot, parent_fd):
+        now = time.monotonic_ns()
+        try:
+            context = json.loads(snapshot["ROOT_RECORD_IDENTITY"])
+            deadline = context["deadline"]
+        except BaseException as error:
+            deadline = f"<unreadable {type(error).__name__}: {error}>"
+        parts = [
+            f"adopt returned None: authenticated_identity={identity}",
+            f"reason={self.adopt_none_reasons.get(identity, '<unrecorded>')}",
+            f"context_deadline_ns={deadline}",
+            f"monotonic_ns={now}",
+            f"published_snapshot={self.bounded_repr(snapshot)}",
+            self.diagnostic_file("snapshot-file", self.work / "snapshot.json"),
+            self.diagnostic_file("hook-marker", self.work / "hook.waiting"),
+            self.diagnostic_file("split-stderr", self.work / "stderr space's.log"),
+            f"direct-parent-status={self.direct_parent_status(parent_fd)}",
+        ]
+        return "; ".join(parts)
+
+    def assert_adopted(self, identity, snapshot, parent_fd):
+        fd = self.adopt(*identity)
+        diagnostic = None
+        if fd is None:
+            diagnostic = self.adopt_none_diagnostic(identity, snapshot, parent_fd)
+        self.assertIsNotNone(fd, diagnostic)
         return fd
 
     def cleanup_adopted(self):
@@ -354,6 +432,66 @@ class RecordedLauncherTests(unittest.TestCase):
         self.assertTrue(diagnostic.strip(), "missing exec diagnostic")
         self.assertIn("No such file or directory", diagnostic)
 
+    def test_adopt_none_records_owned_generation_mismatch(self):
+        proc, parent_fd = self.child(["sleep", "300"])
+        actual = self.generation(proc.pid)
+        identity = (proc.pid, actual + 1)
+
+        self.assertIsNone(self.adopt(*identity))
+        self.assertEqual(
+            self.adopt_none_reasons[identity],
+            f"generation-mismatch expected={actual + 1} actual={actual}",
+        )
+        snapshot = {
+            "ROOT_RECORD_IDENTITY": json.dumps({"deadline": 123456789}),
+            "ROOT_LAUNCH_PID": str(identity[0]),
+            "ROOT_LAUNCH_STARTTIME": str(identity[1]),
+            "noise": "X" * 50000,
+        }
+        (self.work / "snapshot.json").write_text(json.dumps(snapshot))
+        (self.work / "hook.waiting").write_text("owned hook marker")
+        (self.work / "stderr space's.log").write_text("launcher deadline expired")
+
+        diagnostic = self.adopt_none_diagnostic(identity, snapshot, parent_fd)
+        self.assertIn(f"authenticated_identity={identity}", diagnostic)
+        self.assertIn(self.adopt_none_reasons[identity], diagnostic)
+        self.assertIn("context_deadline_ns=123456789", diagnostic)
+        self.assertRegex(diagnostic, r"monotonic_ns=[1-9][0-9]+")
+        self.assertIn("hook-marker='owned hook marker'", diagnostic)
+        self.assertIn("split-stderr='launcher deadline expired'", diagnostic)
+        self.assertIn("direct-parent-status=running", diagnostic)
+        self.assertIn("<truncated repr limit=4096>", diagnostic)
+        self.assertLess(len(diagnostic), 10000)
+
+    def test_diagnostic_file_names_missing_and_truncates_oversized_input(self):
+        missing = self.work / "missing.log"
+        oversized = self.work / "oversized.log"
+        oversized.write_bytes(b"A" * 5000)
+
+        self.assertEqual(self.diagnostic_file("split-stderr", missing),
+                         "split-stderr=<missing>")
+        evidence = self.diagnostic_file("split-stderr", oversized)
+        self.assertTrue(evidence.startswith("split-stderr='AAAA"))
+        self.assertIn("<truncated size=5000 limit=4096>", evidence)
+        self.assertLess(len(evidence), 4300)
+
+    def test_adopt_none_collects_diagnostic_before_strict_failure(self):
+        proc, parent_fd = self.child(["sleep", "300"])
+        identity = (proc.pid, self.generation(proc.pid) + 1)
+        snapshot = {"ROOT_RECORD_IDENTITY": json.dumps({"deadline": 123456789})}
+
+        with mock.patch.object(self, "adopt_none_diagnostic",
+                               wraps=self.adopt_none_diagnostic) as diagnostic:
+            with self.assertRaisesRegex(AssertionError, "generation-mismatch"):
+                self.assert_adopted(identity, snapshot, parent_fd)
+        diagnostic.assert_called_once_with(identity, snapshot, parent_fd)
+
+    def test_split_ack_success_path_skips_failure_diagnostics(self):
+        with mock.patch.object(self, "adopt_none_diagnostic",
+                               wraps=self.adopt_none_diagnostic) as diagnostic:
+            self.test_split_ack_interruption_cleans_up_original_launcher_handle()
+        diagnostic.assert_not_called()
+
     def test_split_ack_interruption_cleans_up_original_launcher_handle(self):
         self.env.update(HOOK_OPERATION="ack", HOOK_PHASE="launcher", HOOK_ACTION="hold",
                         CASE_DEADLINE="0.5")
@@ -364,9 +502,9 @@ class RecordedLauncherTests(unittest.TestCase):
         hook = json.loads(self.wait_path(self.work / "hook.waiting").read_text())
         snapshot = json.loads((self.work / "snapshot.json").read_text())
         identity = (int(snapshot["ROOT_LAUNCH_PID"]), int(snapshot["ROOT_LAUNCH_STARTTIME"]))
-        original_fd = self.adopt(*identity)
-        self.assertIsNotNone(original_fd)
-        self.assertIsNotNone(self.adopt(hook["pid"], hook["starttime"]))
+        original_fd = self.assert_adopted(identity, snapshot, parent_fd)
+        hook_identity = (hook["pid"], hook["starttime"])
+        self.assert_adopted(hook_identity, snapshot, parent_fd)
         signal.pidfd_send_signal(parent_fd, signal.SIGTERM)
         proc.wait(timeout=3)
         (self.work / "hook.release").touch()

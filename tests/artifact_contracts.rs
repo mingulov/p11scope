@@ -52,6 +52,54 @@ fn require_before(source: &str, first: &str, second: &str, contract: &str) -> Re
     }
 }
 
+fn assert_abi_routing_identity_contract(attach: &str, example: &str) -> Result<(), String> {
+    let wrapper = contract_section(
+        attach,
+        "#[doc(hidden)]\npub fn prepare_qualification_identity(",
+        "\n}\n\nfn validate_policy_map",
+    )?;
+    let direct = "ebpf: &mut Ebpf, pid: NonZeroU32) -> Result<()> {\n    prepare_identity(ebpf, &Scope::Pid(pid.get()), None)";
+    if wrapper != direct {
+        return Err(
+            "qualification identity wrapper must directly return unowned PID-scoped preparation"
+                .into(),
+        );
+    }
+
+    let row = contract_section(
+        example,
+        "fn run_row_body(",
+        "\nfn validate_and_write_observed(",
+    )?;
+    if row.matches("NonZeroU32::new(").count() != 1 {
+        return Err("the retained child PID must be converted exactly once".into());
+    }
+    for marker in [
+        "let child_pid = NonZeroU32::new(child_pid)",
+        "p11scope::attach::prepare_qualification_identity(&mut ebpf, child_pid)\n        .context(\"preparing qualification identity maps\")?;",
+        "let scope = UProbeScope::OneProcess(child_pid);",
+    ] {
+        require_contract_marker(
+            row,
+            marker,
+            "ABI-routing qualification identity preparation",
+        )?;
+    }
+    for later in [
+        "load_program(&mut ebpf, \"p11_return\")",
+        "let return_link = attach_program(",
+        "let entry_link = attach_program(",
+    ] {
+        require_before(
+            row,
+            "p11scope::attach::prepare_qualification_identity(&mut ebpf, child_pid)",
+            later,
+            "identity preparation before ABI-routing program load/attach",
+        )?;
+    }
+    Ok(())
+}
+
 fn assert_start_owner_seam(ebpf: &str, owner: &str) -> Result<(), String> {
     let wrappers = contract_section(ebpf, "unsafe extern \"C\" {", "fn store_start(")?;
     for marker in [
@@ -2549,6 +2597,43 @@ fn native_helper_suite_abi_routing_driver_preserves_runtime_ownership_and_failur
             line == "PASS: abi-routing production-path driver custody and launcher behavior"
         }),
         "the ABI shell lifecycle suite must emit its explicit PASS marker: {output}"
+    );
+}
+
+#[test]
+fn abi_routing_example_prepares_unowned_identity_before_either_attach() {
+    let attach = read("src/attach.rs");
+    let example = read("examples/abi-routing.rs");
+    assert_abi_routing_identity_contract(&attach, &example).unwrap();
+
+    let swallowed = attach.replacen(
+        "    prepare_identity(ebpf, &Scope::Pid(pid.get()), None)\n",
+        "    let _ = prepare_identity(ebpf, &Scope::Pid(pid.get()), None);\n    Ok(())\n",
+        1,
+    );
+    assert_ne!(attach, swallowed, "swallowed-error mutation must apply");
+    assert!(
+        assert_abi_routing_identity_contract(&swallowed, &example).is_err(),
+        "qualification identity wrapper must return preparation failures"
+    );
+
+    let preparation = "    p11scope::attach::prepare_qualification_identity(&mut ebpf, child_pid)\n        .context(\"preparing qualification identity maps\")?;\n";
+    let omitted = example.replacen(preparation, "", 1);
+    assert_ne!(example, omitted, "omitted-preparation mutation must apply");
+    assert!(
+        assert_abi_routing_identity_contract(&attach, &omitted).is_err(),
+        "ABI-routing must prepare identity maps"
+    );
+
+    let late = omitted.replacen(
+        "    runtime.entry_link = Some((spec.entry, entry_link));\n",
+        &format!("    runtime.entry_link = Some((spec.entry, entry_link));\n{preparation}"),
+        1,
+    );
+    assert_ne!(omitted, late, "late-preparation mutation must apply");
+    assert!(
+        assert_abi_routing_identity_contract(&attach, &late).is_err(),
+        "ABI-routing identity preparation must precede both attachments"
     );
 }
 

@@ -30,7 +30,7 @@ use pkcs11_proxy_ng_types::mechanism_registry::MechanismRegistry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::mem::size_of_val;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -466,6 +466,15 @@ fn prepare_identity(ebpf: &mut Ebpf, scope: &Scope, child: Option<&OwnedChild>) 
         }
         Ok(())
     })
+}
+
+/// Prepares identity maps for the unowned, PID-scoped ABI qualification example.
+///
+/// This grants no owned-child root-seed authority; production capture retains
+/// that authority internally.
+#[doc(hidden)]
+pub fn prepare_qualification_identity(ebpf: &mut Ebpf, pid: NonZeroU32) -> Result<()> {
+    prepare_identity(ebpf, &Scope::Pid(pid.get()), None)
 }
 
 fn validate_policy_map(ebpf: &Ebpf, name: &str, expected: ExactMapMetadata) -> Result<()> {
@@ -2732,6 +2741,25 @@ mod tests {
                     .position(|step| *step == IdentityPreparation::Freeze("ROOT_CTL"))
                     .unwrap()
         );
+        for fail in 0..unowned.len() {
+            let mut calls = Vec::new();
+            let mut completed = false;
+            let result = prepare_identity_with(false, |step| {
+                calls.push(step);
+                if calls.len() == fail + 1 {
+                    bail!("injected unowned setup failure");
+                }
+                Ok(())
+            })
+            .map(|()| {
+                completed = true;
+            });
+            assert!(result.is_err());
+            assert!(!completed);
+            assert!(!calls.contains(&IdentityPreparation::SeedRoot));
+            assert!(!calls.contains(&IdentityPreparation::ReadSeed));
+            assert_eq!(calls, unowned[..=fail]);
+        }
     }
 
     #[test]

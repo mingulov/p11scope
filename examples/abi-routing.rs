@@ -5,10 +5,10 @@
 //! native and ia32 subjects and invokes it under the qualification boundary.
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use aya::Ebpf;
 use aya::maps::{Array, HashMap, Map, PerCpuArray, PerCpuHashMap, RingBuf};
 use aya::programs::UProbe;
 use aya::programs::uprobe::{UProbeAttachLocation, UProbeAttachPoint, UProbeLinkId, UProbeScope};
+use aya::{Ebpf, EbpfLoader};
 use p11scope_ebpf_common::{
     CFG_FLAGS, CFG_TASK_NEWTASK_OFFSETS, CallStart, EVIDENCE_ABI_REFUSALS, EVIDENCE_CELLS, Event,
     FLAG_PID_FILTER, FLAG_POLICY_ALLOWLISTED, FUNCTION_NONE, MAX_SLOTS, MECH_NONE, RvKey,
@@ -21,6 +21,7 @@ use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
+use std::num::NonZeroU32;
 use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
 use std::os::unix::process::CommandExt as _;
@@ -416,20 +417,23 @@ fn run_row_body(
     child.require_stopped_identity(&fixture_meta)?;
     let child_pid = child.pid;
 
-    let mut ebpf =
-        Ebpf::load(p11scope::EBPF_OBJECT).context("loading exact embedded BPF object")?;
+    let mut ebpf = EbpfLoader::new()
+        .allow_unsupported_maps()
+        .load(p11scope::EBPF_OBJECT)
+        .context("loading exact embedded BPF object")?;
+    let child_pid = NonZeroU32::new(child_pid).context("owned child PID is zero")?;
+    p11scope::attach::prepare_qualification_identity(&mut ebpf, child_pid)
+        .context("preparing qualification identity maps")?;
     load_program(&mut ebpf, "p11_return")?;
     load_program(&mut ebpf, spec.entry)?;
-    publish_inputs(&mut ebpf, child_pid)?;
+    publish_inputs(&mut ebpf, child_pid.get())?;
     for name in ["CONFIG", "PID_FILTER", "DESCRIPTORS"] {
         freeze_map(&ebpf, name)?;
     }
-    validate_inputs(&ebpf, child_pid)?;
+    validate_inputs(&ebpf, child_pid.get())?;
     runtime.ebpf = Some(ebpf);
 
-    let scope = UProbeScope::OneProcess(
-        std::num::NonZeroU32::new(child_pid).context("owned child PID is zero")?,
-    );
+    let scope = UProbeScope::OneProcess(child_pid);
     let attach_path = format!(
         "/proc/self/fd/{}",
         runtime
@@ -471,7 +475,7 @@ fn run_row_body(
     let ebpf = runtime.ebpf.as_mut().context("BPF object disappeared")?;
     let events = drain_events(ebpf, &row_dir.join("events.raw"))?;
     let observed = snapshot_maps(ebpf, events)?;
-    validate_and_write_observed(spec, child_pid, row_dir, &observed)?;
+    validate_and_write_observed(spec, child_pid.get(), row_dir, &observed)?;
     Ok(())
 }
 

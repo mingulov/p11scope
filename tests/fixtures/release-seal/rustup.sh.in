@@ -1,0 +1,5 @@
+#!/bin/sh
+case "$1 $2 $3" in
+"which --toolchain 1.88"|"which --toolchain nightly-2026-05-20") printf '%s\n' @TOOLCHAIN@; exit 0 ;;
+esac
+exit 1

@@ -1,0 +1,5 @@
+#!/bin/sh
+case "$*" in
+"--print sysroot") printf '%s\n' @SYSROOT@ ;;
+esac
+exit 0

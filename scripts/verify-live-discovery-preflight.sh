@@ -19,6 +19,9 @@
 set -eu
 cd "$(dirname "$0")/.."
 . scripts/lib.sh
+. scripts/prepared-dependency-tools.sh
+. scripts/prepared-dependency-snapshot.sh
+. scripts/product-build.sh
 
 BPF_SOURCE_RELATIVE=crates/ebpf/src/main.rs
 
@@ -90,7 +93,7 @@ freeze() {
     fz_root=$1
     shift
     require_non_root_caller
-    [ ! -e "$fz_root" ] || {
+    [ ! -e "$fz_root" ] && [ ! -L "$fz_root" ] || {
         echo "refusing to reuse an existing private root: $fz_root" >&2
         exit 1
     }
@@ -99,6 +102,19 @@ freeze() {
         *) echo "private root must be an absolute path: $fz_root" >&2; exit 1 ;;
     esac
     command -v gcc >/dev/null || { echo "gcc required"; exit 1; }
+    umask 077
+    python3 scripts/check-live-discovery-evidence.py --create-root --private-root "$fz_root"
+    p11scope_prepared_tools_select "$(command -v python3)" "$(command -v rustup)"
+    fz_prefix=$fz_root/dependencies/prepared
+    "$P11SCOPE_PREPARED_PYTHON" -I scripts/prepared-dependency-evidence.py capture \
+        --prefix "$fz_prefix" \
+        --stable-cargo "$P11SCOPE_PREPARED_STABLE_CARGO" \
+        --stable-rustc "$P11SCOPE_PREPARED_STABLE_RUSTC" \
+        --bpf-cargo "$P11SCOPE_PREPARED_BPF_CARGO" \
+        --bpf-rustc "$P11SCOPE_PREPARED_BPF_RUSTC"
+    p11scope_prepared_snapshot "$P11SCOPE_PREPARED_PYTHON" \
+        "$fz_root/dependencies/source.initial" "$fz_prefix.initial.ledger.sha256" \
+        > "$fz_root/dependencies/source.initial.sha256"
     # Collected before the object glob below reuses the positional parameters.
     fz_bases=""
     for fz_base in "$@"; do
@@ -106,56 +122,33 @@ freeze() {
     done
 
     echo "=== build the exact product BPF object and runner ==="
-    rm -rf target/live-discovery-freeze
-    cargo +1.88 build --locked --release --workspace \
-        --target-dir target/live-discovery-freeze
-    set -- target/live-discovery-freeze/release/build/p11scope-*/out/p11scope-ebpf
+    p11scope_product_build prepared --release --workspace --target-dir "$fz_root/build"
+    set -- "$fz_root"/build/release/build/p11scope-*/out/p11scope-ebpf
     [ "$#" -eq 1 ] && [ -f "$1" ] || { echo "product BPF object is not unique"; exit 1; }
     FROZEN_BPF=$1
 
-    echo "=== lay out the mode-0700 private root ==="
-    umask 077
-    python3 - "$fz_root" "$FROZEN_BPF" target/live-discovery-freeze/release/p11scope <<'PY'
-import runpy
-import sys
-
-checker = runpy.run_path("scripts/check-live-discovery-evidence.py", run_name="preflight_freeze")
-checker["prepare_private_root"](checker["repo_root"](), sys.argv[1], sys.argv[2], sys.argv[3])
-PY
+    "$P11SCOPE_PREPARED_PYTHON" -I scripts/check-live-discovery-evidence.py \
+        --populate-root --private-root "$fz_root" --bpf-object "$FROZEN_BPF" \
+        --runner "$fz_root/build/release/p11scope"
 
     echo "=== freeze the production BPF inventory ==="
-    python3 scripts/check-live-discovery-object.py \
+    "$P11SCOPE_PREPARED_PYTHON" -I scripts/check-live-discovery-object.py \
         --source "$(realpath "$BPF_SOURCE_RELATIVE")" \
         --object "$fz_root/frozen/p11scope-ebpf" \
         --manifest "$fz_root/frozen/bpf-inventory.json"
 
+    "$P11SCOPE_PREPARED_PYTHON" -I scripts/check-live-discovery-evidence.py \
+        --build-fixtures --private-root "$fz_root"
+    "$P11SCOPE_PREPARED_PYTHON" -I scripts/prepared-dependency-evidence.py recheck \
+        --prefix "$fz_prefix"
+    p11scope_prepared_snapshot "$P11SCOPE_PREPARED_PYTHON" \
+        "$fz_root/dependencies/source.final" "$fz_prefix.final.ledger.sha256" \
+        > "$fz_root/dependencies/source.final.sha256"
+    cmp "$fz_root/dependencies/source.initial.sha256" "$fz_root/dependencies/source.final.sha256"
     echo "=== freeze the execution manifest ==="
     # shellcheck disable=SC2086
-    python3 scripts/check-live-discovery-evidence.py --write-manifest \
+    "$P11SCOPE_PREPARED_PYTHON" -I scripts/check-live-discovery-evidence.py --write-manifest \
         --private-root "$fz_root" $fz_bases
-
-    python3 - "$fz_root" <<'PY'
-import hashlib
-import json
-from pathlib import Path
-import sys
-
-root = Path(sys.argv[1])
-manifest = root / "execution-manifest.json"
-(root / "campaign" / "state.json").write_text(
-    json.dumps(
-        {
-            "schema": "p11scope-live-discovery-campaign/v1",
-            "manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
-            "state": "frozen",
-            "row_count": 0,
-        },
-        indent=2,
-        sort_keys=True,
-    )
-    + "\n"
-)
-PY
 
     require_frozen_inputs "$fz_root"
     echo "=== frozen inputs ==="
@@ -167,7 +160,6 @@ run() {
     rn_root=$1
     rn_kernel=$2
     require_non_root_caller
-    sudo -n true 2>/dev/null || { echo "passwordless sudo required"; exit 1; }
     require_frozen_inputs "$rn_root"
 
     # Bind every frozen input before anything privileged runs.
@@ -175,8 +167,9 @@ run() {
         --source "$(realpath "$BPF_SOURCE_RELATIVE")" \
         --object "$rn_root/frozen/p11scope-ebpf" \
         --manifest "$rn_root/frozen/bpf-inventory.json"
+    # Runtime admission also binds this requested path to the manifest's root.
     python3 scripts/check-live-discovery-evidence.py \
-        --manifest "$rn_root/execution-manifest.json"
+        --manifest "$rn_root/execution-manifest.json" --require-prepared-dependencies
 
     # The canonical PASS list covers in-kernel behaviour (every production
     # program accepted, all 256 context ids, the cookie boundaries, both
@@ -189,6 +182,7 @@ run() {
         echo "UNRUN: no frozen preflight harness at $RN_HARNESS" >&2
         exit 1
     }
+    sudo -n true 2>/dev/null || { echo "passwordless sudo required"; exit 1; }
     RN_REPORT=$rn_root/campaign/preflight/$rn_kernel.json
     sudo -n "$RN_HARNESS" \
         --object "$rn_root/frozen/p11scope-ebpf" \

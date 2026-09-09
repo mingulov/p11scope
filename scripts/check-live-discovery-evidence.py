@@ -10,8 +10,8 @@ the private root - nothing is trusted because the manifest said so.
 
 Modes:
   --write-manifest --private-root ROOT [--fixture-bits 32|64]
-                                         build the frozen fixtures and freeze
-                                         one execution manifest
+                                         publish v2 from built fixtures and
+                                         completed prepared dependency receipts
   --preflight FILE --manifest FILE       validate one preflight report
   --campaign ROOT --manifest FILE        validate the campaign under ROOT
   --self-test                            nonprivileged mutation self-test
@@ -30,7 +30,8 @@ import subprocess
 import sys
 import tempfile
 
-MANIFEST_SCHEMA = "p11scope-live-discovery-execution/v1"
+MANIFEST_SCHEMA = "p11scope-live-discovery-execution/v2"
+HISTORICAL_MANIFEST_SCHEMA = "p11scope-live-discovery-execution/v1"
 PREFLIGHT_SCHEMA = "p11scope-live-discovery-preflight/v1"
 CAMPAIGN_SCHEMA = "p11scope-live-discovery-campaign/v1"
 ROW_SCHEMA = "p11scope-live-discovery-row/v1"
@@ -45,10 +46,19 @@ FIXTURE_SOURCES = (
     "tests/fixtures/live-discovery-provider.c",
     "tests/fixtures/live-discovery-driver.c",
 )
-VALIDATORS = (
+HISTORICAL_VALIDATORS = (
     "scripts/check-live-discovery-evidence.py",
     "scripts/check-live-discovery-object.py",
     "scripts/verify-live-discovery-preflight.sh",
+)
+VALIDATORS = HISTORICAL_VALIDATORS + (
+    "scripts/prepared-dependency-tools.sh",
+    "scripts/prepared-dependency-snapshot.sh",
+    "scripts/product-build.sh",
+    "scripts/merge-checksum-ledgers.py",
+    "scripts/prepared-dependency-evidence.py",
+    "scripts/check-prepared-dependencies.py",
+    "scripts/prepare-dependencies.py",
 )
 PROVIDERS = {"exported": "provider-exported.so", "hidden": "provider-hidden.so"}
 DRIVERS = {
@@ -542,7 +552,77 @@ def frozen_paths(private_root):
         "fixtures": frozen / "fixtures",
         "campaign": private_root / "campaign",
         "manifest": private_root / "execution-manifest.json",
+        "dependencies": private_root / "dependencies",
     }
+
+
+def prepared_binding(private_root, root):
+    """Bind retained shared evidence without querying Cargo or selecting tools.
+
+    The private shared helper calls below deliberately remain a narrow adapter:
+    it owns metadata projection, prepared input admission and receipt identities.
+    This checker owns only their exact frozen layout and manifest binding.
+    """
+    directory = frozen_paths(private_root)["dependencies"]
+    check([(directory.is_dir() and not directory.is_symlink(),
+            "prepared dependency directory is missing or symlinked")])
+    evidence = runpy.run_path(str(root / "scripts/prepared-dependency-evidence.py"))
+    load = evidence["_load_module"]
+    checker = load(root / "scripts/check-prepared-dependencies.py", "live_prepared_checker")
+    preparer = load(root / "scripts/prepare-dependencies.py", "live_preparer")
+    ledger = runpy.run_path(str(root / "scripts/merge-checksum-ledgers.py"))
+    try:
+        return _bind_prepared_receipts(directory, root, evidence, checker, preparer, ledger)
+    except (evidence["EvidenceError"], checker.MetadataError,
+            preparer.PreparationError, ledger["LedgerError"]) as error:
+        fail(f"prepared dependencies: {error}")
+
+
+def _bind_prepared_receipts(directory, root, evidence, checker, preparer, ledger):
+    prefix = directory / "prepared"
+    initial = evidence["_read_initial"](prefix, root, checker, preparer)
+    final = evidence["_read_json_artifact"](Path(str(prefix) + ".final.receipt.json"), "final receipt")
+    check([(isinstance(final, dict) and set(final) == set(initial),
+            "prepared final receipt fields differ")])
+    check([(final.get("phase") == "final", "prepared final receipt phase differs")])
+    for field in set(initial) - {"phase", "artifacts"}:
+        check([(final.get(field) == initial[field], f"prepared final {field} differs")])
+    check([(final["artifacts"] == evidence["_artifact_identities"](prefix, "final"),
+            "prepared final retained artifact identities differ")])
+    # Reuse the metadata verifier and projection; never implement a resolver here.
+    metadata = [
+        f"{workspace}={prefix}.final.{context}.stdout.json"
+        for context, workspace, _ in evidence["WORKSPACES"]
+    ]
+    projection = evidence["_projection"](
+        checker.verify_details(root, root / "third-party/sources.json", metadata)
+    )
+    for field, value in projection.items():
+        check([(final[field] == value, f"prepared final {field} projection differs")])
+    for context, _, _ in evidence["WORKSPACES"]:
+        for suffix in ("command.json", "context.json", "status"):
+            check([(Path(f"{prefix}.initial.{context}.{suffix}").read_bytes()
+                    == Path(f"{prefix}.final.{context}.{suffix}").read_bytes(),
+                    f"prepared final {context} {suffix} differs")])
+    artifacts = {
+        f"{phase}.{suffix}": evidence["_identity"](
+            Path(f"{prefix}.{phase}.{suffix}"), f"prepared {phase} {suffix}"
+        )
+        for phase in ("initial", "final")
+        for suffix in evidence["_phase_suffixes"](phase)
+    }
+    snapshots = {
+        phase: evidence["_identity"](directory / f"source.{phase}.sha256", f"{phase} snapshot")
+        for phase in ("initial", "final")
+    }
+    check([(snapshots["initial"]["sha256"] == snapshots["final"]["sha256"],
+            "prepared source snapshots differ")])
+    rows = ledger["merge_ledgers"]([directory / "source.final.sha256"])
+    check([(bool(rows), "prepared source snapshot is empty")])
+    for relative, digest in rows:
+        check([(sha256_file(root / relative) == digest, f"prepared source changed: {relative}")])
+    return {"artifacts": artifacts, "snapshots": snapshots,
+            "selected_tools": initial["tools"], "selected_inputs": initial["inputs"]}
 
 
 def tool_line(argv):
@@ -568,7 +648,7 @@ def companion_libc_path(driver):
     fail(f"{driver}: no libc.so.6 in its resolved dependencies")
 
 
-def build_manifest(private_root, root, kernel_bases, fixture_bits=None):
+def _manifest_content(private_root, root, kernel_bases, fixture_bits=None, *, historical_fixture=False):
     """Build the frozen fixtures, then freeze one execution manifest.
 
     Every digest, ELF identity, toolchain identity and source-bound boundary
@@ -576,10 +656,11 @@ def build_manifest(private_root, root, kernel_bases, fixture_bits=None):
     because a caller passed it in.
     """
     paths = frozen_paths(private_root)
+    dependencies = None if historical_fixture else prepared_binding(private_root, root)
     constants = source_constants(root)
     inventory = production_inventory(root)
     fixtures = paths["fixtures"]
-    commands = build_fixtures(root, fixtures, fixture_bits)
+    commands = build_fixtures(root, fixtures, fixture_bits, execute=historical_fixture)
     toolchain = {
         "cc": "gcc",
         "cc_version": tool_line(["gcc", "--version"]),
@@ -651,7 +732,7 @@ def build_manifest(private_root, root, kernel_bases, fixture_bits=None):
     }
 
     manifest = {
-        "schema": MANIFEST_SCHEMA,
+        "schema": HISTORICAL_MANIFEST_SCHEMA if historical_fixture else MANIFEST_SCHEMA,
         "private_root": str(paths["private_root"]),
         "bpf_source": {
             "canonical_path": str((root / "crates/ebpf/src/main.rs").resolve(strict=True)),
@@ -663,7 +744,10 @@ def build_manifest(private_root, root, kernel_bases, fixture_bits=None):
             "sha256": sha256_file(paths["bpf_inventory"]),
         },
         "runner": {"path": str(paths["runner"]), "sha256": sha256_file(paths["runner"])},
-        "validators": {name: sha256_file(root / name) for name in VALIDATORS},
+        "validators": {
+            name: sha256_file(root / name)
+            for name in (HISTORICAL_VALIDATORS if historical_fixture else VALIDATORS)
+        },
         "inventory": inventory,
         "cookie": {
             "context_ids": constants["context_ids"],
@@ -764,14 +848,41 @@ def build_manifest(private_root, root, kernel_bases, fixture_bits=None):
         },
         "lanes": copy.deepcopy(LANES),
     }
+    if dependencies is not None:
+        manifest["prepared_dependencies"] = dependencies
     return manifest
+
+
+def build_manifest(private_root, root, kernel_bases, fixture_bits=None):
+    return _manifest_content(private_root, root, kernel_bases, fixture_bits)
+
+
+def _historical_fixture_manifest(private_root, root, kernel_bases, fixture_bits=None):
+    """Only the historical v1 mutation self-test constructs unprepared fixtures."""
+    return _manifest_content(private_root, root, kernel_bases, fixture_bits, historical_fixture=True)
 
 
 def write_manifest(private_root, root, kernel_bases=None, fixture_bits=None):
     paths = frozen_paths(private_root)
+    check([(not paths["manifest"].exists() and not paths["manifest"].is_symlink(),
+            "execution manifest already exists")])
     manifest = build_manifest(private_root, root, kernel_bases or {}, fixture_bits)
     bind_manifest(manifest, root)
-    paths["manifest"].write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    serialized = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+    # The manifest admits execution: publish it only after required state exists.
+    (paths["campaign"] / "state.json").write_text(json.dumps({
+        "schema": CAMPAIGN_SCHEMA,
+        "manifest_sha256": hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
+        "state": "frozen", "row_count": 0,
+    }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    stream = paths["manifest"].open("x", encoding="utf-8")
+    try:
+        with stream:
+            stream.write(serialized)
+    except OSError:
+        # Exclusive creation succeeded; only this newly created file is ours.
+        paths["manifest"].unlink()
+        raise
     return manifest
 
 
@@ -785,7 +896,11 @@ def bind_manifest(manifest, root):
     constants = source_constants(root)
     inventory = production_inventory(root)
     paths = frozen_paths(get(manifest, "private_root", default=""))
-    check([(manifest.get("schema") == MANIFEST_SCHEMA, "execution manifest schema differs")])
+    check([(manifest.get("schema") in (MANIFEST_SCHEMA, HISTORICAL_MANIFEST_SCHEMA),
+            "execution manifest schema differs")])
+    if manifest["schema"] == MANIFEST_SCHEMA:
+        check([(manifest.get("prepared_dependencies") == prepared_binding(paths["private_root"], root),
+                "frozen prepared dependency binding differs")])
 
     source_path = Path(get(manifest, "bpf_source", "canonical_path", default=""))
     canonical = (root / "crates/ebpf/src/main.rs").resolve(strict=True)
@@ -837,7 +952,11 @@ def bind_manifest(manifest, root):
     check(
         [
             (
-                manifest.get("validators") == {name: sha256_file(root / name) for name in VALIDATORS},
+                manifest.get("validators") == {
+                    name: sha256_file(root / name)
+                    for name in (VALIDATORS if manifest["schema"] == MANIFEST_SCHEMA
+                                 else HISTORICAL_VALIDATORS)
+                },
                 "a frozen validator changed after the freeze",
             ),
             (
@@ -1719,7 +1838,7 @@ class _Drop:
 _DROP = _Drop()
 
 
-def build_fixtures(root, fixtures, fixture_bits=None):
+def build_fixtures(root, fixtures, fixture_bits=None, *, execute=True):
     """Build the frozen fixtures with the exact frozen commands.
 
     One implementation, used by both the freeze and the self-test, so the
@@ -1751,9 +1870,21 @@ def build_fixtures(root, fixtures, fixture_bits=None):
         + ["-o", str(fixtures / "driver-dlopen"), driver]
         + DRIVER_LDFLAGS.split()
     )
-    for name in FIXTURE_OUTPUTS:
-        subprocess.run(commands[name], check=True)
+    if execute:
+        for name in FIXTURE_OUTPUTS:
+            subprocess.run(commands[name], check=True)
     return commands
+
+
+def create_private_root(private_root):
+    paths = frozen_paths(private_root)
+    check([(paths["private_root"].is_absolute(), "private root must be absolute")])
+    paths["private_root"].mkdir(mode=0o700, parents=True)
+    paths["frozen"].mkdir(mode=0o700)
+    paths["dependencies"].mkdir(mode=0o700)
+    (paths["campaign"] / "rows").mkdir(mode=0o700, parents=True)
+    (paths["campaign"] / "preflight").mkdir(mode=0o700)
+    return paths
 
 
 def prepare_private_root(root, private_root, bpf_object=None, runner=None):
@@ -1763,11 +1894,7 @@ def prepare_private_root(root, private_root, bpf_object=None, runner=None):
     build produces; the real freeze passes the built object and runner. Both
     are bound by digest only, so both paths exercise the same code.
     """
-    paths = frozen_paths(private_root)
-    paths["private_root"].mkdir(mode=0o700, parents=True)
-    paths["frozen"].mkdir(mode=0o700)
-    (paths["campaign"] / "rows").mkdir(mode=0o700, parents=True)
-    (paths["campaign"] / "preflight").mkdir(mode=0o700)
+    paths = create_private_root(private_root)
     if bpf_object is None:
         paths["bpf_object"].write_bytes(b"self-test stand-in for the product BPF object\n")
         paths["runner"].write_bytes(b"self-test stand-in for the product runner\n")
@@ -1946,6 +2073,14 @@ def _write_campaign(paths, manifest, state):
 
 
 def self_test():
+    # Current publication/admission is exercised with selected controlled tools.
+    # The original ELF/campaign mutation cases below retain explicit historical
+    # v1 fixture documents; no normal writer or --run admits those documents.
+    subprocess.run([
+        sys.executable, "-m", "unittest", "discover",
+        "-s", str(repo_root() / "tests/python"),
+        "-p", "test_live_freeze_prepared_dependencies.py",
+    ], check=True)
     root = repo_root()
     if shutil.which("gcc") is None:
         fail("--self-test builds the frozen fixtures and needs gcc")
@@ -2095,15 +2230,9 @@ def self_test():
         for bits, abi in ((32, "linux-ilp32"), (64, "linux-lp64")):
             width_root = Path(temporary) / f"private-{bits}"
             width_paths = prepare_private_root(root, width_root)
-            main(
-                [
-                    "--write-manifest",
-                    "--private-root",
-                    str(width_root),
-                    "--fixture-bits",
-                    str(bits),
-                ]
-            )
+            width_paths["manifest"].write_text(json.dumps(
+                _historical_fixture_manifest(width_root, root, {}, bits)
+            ))
             width_manifest = load_manifest(width_paths["manifest"])
             bind_manifest(width_manifest, root)
             fixture_abis = {
@@ -2133,10 +2262,12 @@ def self_test():
 
         private_root = Path(temporary) / "private"
         paths = prepare_private_root(root, private_root)
-        main(["--write-manifest", "--private-root", str(private_root)])
+        paths["manifest"].write_text(json.dumps(
+            _historical_fixture_manifest(private_root, root, {})
+        ))
         manifest = load_manifest(paths["manifest"])
         bind_manifest(manifest, root)
-        print("frozen manifest binding: OK")
+        print("historical v1 frozen manifest binding: OK")
 
         outputs = manifest["fixtures"]["outputs"]
         if outputs["provider-exported.so"]["sha256"] == outputs["provider-hidden.so"]["sha256"]:
@@ -2679,6 +2810,12 @@ def parse_args(argv):
     parser = argparse.ArgumentParser()
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--write-manifest", action="store_true")
+    parser.add_argument("--create-root", action="store_true")
+    parser.add_argument("--populate-root", action="store_true")
+    parser.add_argument("--build-fixtures", action="store_true")
+    parser.add_argument("--bpf-object", type=Path)
+    parser.add_argument("--runner", type=Path)
+    parser.add_argument("--require-prepared-dependencies", action="store_true")
     parser.add_argument("--private-root", type=Path)
     parser.add_argument("--fixture-bits", type=int, choices=(32, 64))
     parser.add_argument(
@@ -2697,6 +2834,32 @@ def parse_args(argv):
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     root = repo_root()
+    check([(not args.require_prepared_dependencies or args.manifest is not None,
+            "--require-prepared-dependencies requires --manifest")])
+    setup = [args.create_root, args.populate_root, args.build_fixtures]
+    if any(setup):
+        check([(sum(setup) == 1 and args.private_root is not None
+                and not any((args.self_test, args.write_manifest, args.manifest,
+                             args.campaign, args.preflight, args.kernel_base,
+                             args.require_prepared_dependencies)),
+                "private root setup takes exactly one mode and --private-root")])
+        check([(args.populate_root or (args.bpf_object is None and args.runner is None),
+                "--bpf-object and --runner require --populate-root"),
+               (args.build_fixtures or args.fixture_bits is None,
+                "--fixture-bits requires --build-fixtures or --write-manifest")])
+        paths = frozen_paths(args.private_root)
+        if args.create_root:
+            create_private_root(args.private_root)
+        elif args.populate_root:
+            check([(args.bpf_object is not None and args.runner is not None,
+                    "populate-root requires --bpf-object and --runner")])
+            shutil.copyfile(args.bpf_object, paths["bpf_object"])
+            shutil.copyfile(args.runner, paths["runner"])
+        else:
+            build_fixtures(root, paths["fixtures"], args.fixture_bits)
+        return
+    check([(args.bpf_object is None and args.runner is None,
+            "--bpf-object and --runner require --populate-root")])
     if args.self_test:
         if args.write_manifest or args.kernel_base or any(
             value is not None
@@ -2744,6 +2907,12 @@ def main(argv=None):
     if args.campaign is not None and args.preflight is not None:
         fail("check mode takes --campaign or --preflight, not both")
     manifest = load_manifest(args.manifest)
+    if args.require_prepared_dependencies:
+        check([(manifest.get("schema") == MANIFEST_SCHEMA,
+                "prepared v2 execution manifest required; historical v1 cannot run")])
+        check([(args.manifest.is_absolute()
+                and args.manifest == frozen_paths(get(manifest, "private_root", default=""))["manifest"],
+                "requested execution manifest path differs from its frozen private root")])
     bind_manifest(manifest, root)
     if args.campaign is None and args.preflight is None:
         # Bind-only: every frozen input still matches, before anything runs.

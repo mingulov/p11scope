@@ -82,6 +82,16 @@ Split this task into disjoint writer units if useful. Do not overlap writers
 of the shared script fixtures or `tests/artifact_contracts.rs`. Root runtime
 logic and generic build-subject architecture are outside ownership.
 
+**Caller integration checkpoint (2026-09-09):** The ordinary build entry
+points, release handoffs, Lane02/Lane16, capability, live-freeze, Knative,
+ABI-routing and container preparation changes are committed through
+`f67851f`. Focused native suites, independent failure controls and their Cargo
+bridges passed. The selected BPF compiler/LLVM build correction is committed
+in `889eae0`; fresh selected and fallback builds produced identical BPF
+objects. This accepts the bounded caller units, not the complete task:
+generated-source activation, CI preparation, current-graph offline packaging,
+fresh-checkout verification and the full integrated gates below remain open.
+
 - [ ] Add the thin automatic preparation/Cargo entry point. Point the two Cargo overrides and workspace exclusions at explicit version/revision directories. Ignore generated sources, archives, lock and stage paths without ignoring maintained recipes/patches.
 - [ ] Document fresh checkout, normal preparation/direct Cargo, offline preparation, patch addition/rebase/retirement and non-destructive recovery. Keep patch provenance with maintained files.
 - [ ] Prepare before CI's first Cargo manifest operation; acquire ordinary locked dependencies for both workspaces before offline graph verification. Retain all root gates and both standalone dependency suites, with test targets outside prepared sources.
@@ -103,3 +113,36 @@ logic and generic build-subject architecture are outside ownership.
 - [ ] From a fresh export of the committed result, perform preparation and locked metadata selection for root/BPF without relying on the original checkout. Verify generated sources and archive/export exclusions.
 - [ ] Run `cargo +1.88 fmt --all -- --check`, locked workspace all-target check/test/clippy with warnings denied, and both existing standalone dependency test commands with external targets. Record actual results and distinguish pre-existing failures from migration regressions.
 - [ ] Complete independent review of the integrated change and source-receipt closure. Update release status accurately; these checks do not close the pending runtime/kernel matrix or authorize publication.
+
+## Task 5: Full offline dependency delivery and recipient build
+
+**Own sequentially:** `third-party/offline-dependencies.json`,
+`scripts/export-source.py`, the narrow reusable receipt/inventory interfaces in
+`scripts/offline-dependencies.py`, `scripts/build-offline.sh`,
+`tests/python/test_export_source.py`, focused native offline fixture files, and
+`docs/build-offline.md`. Do not change the normal `scripts/cargo.sh` interface,
+the preparation recipe, dependency pins, or official sealed-release policy in
+this task.
+
+**Consumes:** the committed activated dependency graph, approved current-graph
+payload/recipe, `replacement_config`, `prepared-dependency-tools.sh`, and
+`p11scope_product_build prepared`. **Produces:** an unchanged originals-only
+source export, an explicit deterministic full-payload export, a finite
+extracted-export validator, and an unprivileged fixed recipient bootstrap.
+
+```text
+python3 -I scripts/export-source.py --output ABS.tar.gz \
+  --offline-payload ABS --nightly-rustc ABS
+python3 -I scripts/export-source.py --verify-extracted ABS_SOURCE_ROOT \
+  --cargo-home ABS_FRESH_CARGO_HOME
+sh scripts/build-offline.sh ABS_NEW_WORK_ROOT
+```
+
+- [ ] After Tasks 3–4 are committed and the graph is frozen, assemble the real current hybrid payload from the approved original archives/shared bundle and installed pinned nightly rust-src. Review candidate payload P and recipe R independently; commit only R. Reverify unchanged P against committed R without regenerating it for a source-only commit.
+- [ ] Preserve the existing originals-only CLI/schema/layout byte behavior. Add paired `--offline-payload` and `--nightly-rustc` arguments; reject partial pairs, archive overrides, recipe/source-pin/config overrides, dirty or uncommitted fixed recipes, reserved path-prefix collisions and unsafe payload entries before publication.
+- [ ] In full mode, copy the approved payload into private owned staging at `third-party/offline/`, generate `.cargo/config.toml` once through `replacement_config` with relative vendor path `third-party/offline/vendor`, and emit manifest schema v2 with exactly the v1 `schema_version`/`revision`/`source_entries`/`archives` fields plus the closed `offline_dependencies` object. Its exact string fields are `payload_path=third-party/offline`, `recipe_path=third-party/offline-dependencies.json`, `recipe_sha256`, `payload_tree_sha256`, `config_path=.cargo/config.toml`, and `config_sha256`; reject missing/additional/wrong-type fields, non-canonical paths and malformed digests. Do not duplicate archives, generated Aya trees, caches, targets, receipts, producer paths, timestamps or toolchain binaries.
+- [ ] Reuse the offline helper's canonical inventory and return its verified receipt rather than adding a second payload parser. Verify the private staged copy before archive construction and after the final sysroot query; stream only admitted bytes/modes, recheck clean HEAD/recipe/source identities, preserve existing outputs on failure, and retain exclusive final publication.
+- [ ] Add `validate_extracted(root, cargo_home=None)` and the CLI validator. Require the exact v2 schema/source/payload/config associations. Update `_project_source_identity` to dispatch explicitly between retained v1 and exact v2 shapes and reject unknown schemas; keep full entry/payload/config verification in `validate_extracted`. Scan root and nested BPF ancestor chains plus Cargo-home locations, admit only the generated root config, and refuse legacy/nested/ancestor/symlink configs and inherited Cargo source/build settings, Rust wrappers/flags, CC/CFLAGS and prepared/small-map context.
+- [ ] Add `scripts/build-offline.sh ABS_NEW_WORK_ROOT`: require a new canonical mode-0700 external work root, select the fixed stable/BPF tools with auto-install disabled, expose only the selected bpf-linker under its fresh Cargo home if required, verify/reconstruct from the embedded payload, and call `p11scope_product_build prepared` with fixed `--release --workspace --no-default-features --target-dir WORK/target`. Revalidate every bound input after the build and never download/install or modify global caches.
+- [ ] Write native tests first for deterministic originals/full exports, relocation and source-only commits, coherent payload tampering, unsafe entries/modes/links/collisions, source/payload/config mutation during streaming/build/final verification, no-clobber cleanup, exact tool forwarding, missing prerequisites, ancestor/environment overrides and no network fallback. Add a Git-free schema-v2 round trip through the real offline verifier plus missing/additional/wrong-type association and unknown-schema refusals; do not replace it with a source-string predicate. Compose the existing ExportFixture and OfflineFixture; keep programs in native fixture files.
+- [ ] Extract a real full export to a path with spaces, remove producer checkout/payload/archive/old-Cargo-home access, and build root plus nested BPF dependencies with fresh Cargo home/target and installed pinned prerequisites. Verify patched source selection, unchanged locks/config, no dependency network, then run independent architecture/spec/quality review before release qualification.

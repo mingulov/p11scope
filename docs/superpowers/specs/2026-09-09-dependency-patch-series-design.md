@@ -198,11 +198,61 @@ path list. Preserve unrelated-untracked-input refusal and target-output
 exclusions. Test ordering with controlled resource markers, without launching
 real containers merely to test source-input admission.
 
-An offline source archive contains maintained recipes, patches, preparation
-tools, and original checksum-pinned `.crate` archives. It reconstructs sources
-after extraction with no `.git`, original checkout, shared registry source
-copy, or network. Ordinary locked dependencies, BPF inputs, toolchains and
-host tools remain additional offline-build requirements.
+The default offline source archive contains maintained recipes, patches,
+preparation tools, and original checksum-pinned `.crate` archives. It
+reconstructs sources after extraction with no `.git`, original checkout,
+shared registry source copy, or network. Preserve this smaller archive and its
+existing interface.
+
+An explicit full-payload export additionally embeds one reviewed fixed-recipe
+payload under `third-party/offline/` and one generated finite root Cargo
+configuration. The payload contains the complete ordinary root, BPF and
+matching nightly rust-src Cargo dependency closure plus the original patched
+archives and provenance. It does not contain Rust toolchain binaries or OS
+build tools. Stable Rust 1.88, nightly `nightly-2026-05-20` with matching
+rust-src, bpf-linker, Clang/LLVM, the native linker/C prerequisites, Python,
+Git and ordinary shell/archive tools remain installed prerequisites.
+
+The default originals-only export retains manifest schema v1 and its exact
+byte behavior. Full-payload mode emits schema v2 with exactly these top-level
+fields: `schema_version`, `revision`, `source_entries`, `archives`, and
+`offline_dependencies`. The first four retain their v1 meanings, except that
+full-mode archive records name their actual paths below
+`third-party/offline/archives/`. The closed `offline_dependencies` object has
+exactly these string fields:
+
+- `payload_path`: `third-party/offline`;
+- `recipe_path`: `third-party/offline-dependencies.json`;
+- `recipe_sha256`: SHA-256 of the exact committed recipe bytes;
+- `payload_tree_sha256`: the canonical digest selected by that recipe;
+- `config_path`: `.cargo/config.toml`;
+- `config_sha256`: SHA-256 of the exact generated configuration bytes.
+
+Reject missing or additional fields, wrong types, non-canonical paths and
+invalid lowercase SHA-256 values. Generated payload/config entries are not
+committed `source_entries`; the canonical payload digest binds the full
+payload tree without listing every vendor file again.
+
+`_project_source_identity` must dispatch explicitly on source-export schema:
+retain v1 acceptance, accept the exact v2 top-level and association shapes
+above, and reject every unknown schema. It still returns only the export kind,
+revision and manifest digest for source identity; `validate_extracted` owns the
+complete entry, payload, recipe and configuration verification. Exercise this
+adapter through the real offline verifier against a Git-free v2 export, not a
+standalone predicate, including missing/additional/wrong-type association
+refusals.
+
+The trust chain is the reviewed source commit and distribution identity, then
+the committed fixed recipe, then the canonical payload bytes. Payload-internal
+checksums and the generated export manifest cannot authorize coherently
+replaced payload bytes. A full export copies the admitted payload into private
+staging, verifies that copy before and after deterministic archive creation,
+and publishes exclusively. Its recipient bootstrap uses a fresh Cargo home and
+target, rejects competing root/BPF/ancestor/Cargo-home configurations and
+ambient build overrides, reconstructs the patched trees, and invokes the
+existing selected-tool product-build helper with fixed locked/offline safe
+release flags. It never downloads, installs, edits global caches, or weakens
+the sealed official release path.
 
 ## Updates, retirement and acceptance
 

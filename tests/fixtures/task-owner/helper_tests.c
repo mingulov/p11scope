@@ -2,6 +2,9 @@
  * Only kernel helper operations and CAS interference are injected; there is no
  * second owner-accounting algorithm. */
 #include "task_owner.h"
+enum { OWNER_CAS_CONTRACT_TRIES = 8 };
+_Static_assert(OWNER_CAS_TRIES == OWNER_CAS_CONTRACT_TRIES,
+               "owner accounting requires exactly eight CAS attempts");
 static u64 *cas_interference_cell;
 static unsigned cas_failures_remaining, cas_attempts;
 static u64 controlled_cas(u64 *cell, u64 old, u64 replacement);
@@ -133,26 +136,26 @@ static void cas_boundaries(void)
 
     ctl.outstanding = 2;
     cas_interference_cell = &ctl.outstanding;
-    cas_failures_remaining = OWNER_CAS_TRIES - 1;
+    cas_failures_remaining = OWNER_CAS_CONTRACT_TRIES - 1;
     assert(p11_owner_reserve());
-    assert(cas_attempts == OWNER_CAS_TRIES);
+    assert(cas_attempts == OWNER_CAS_CONTRACT_TRIES);
 
     cas_attempts = 0;
-    cas_failures_remaining = OWNER_CAS_TRIES - 1;
+    cas_failures_remaining = OWNER_CAS_CONTRACT_TRIES - 1;
     assert(p11_owner_refund());
-    assert(cas_attempts == OWNER_CAS_TRIES);
+    assert(cas_attempts == OWNER_CAS_CONTRACT_TRIES);
 
     reset(); ctl.outstanding = 2;
     cas_interference_cell = &ctl.outstanding;
-    cas_failures_remaining = OWNER_CAS_TRIES;
+    cas_failures_remaining = OWNER_CAS_CONTRACT_TRIES;
     assert(!p11_owner_reserve());
-    assert(cas_attempts == OWNER_CAS_TRIES && ctl.admission_failures == 1);
+    assert(cas_attempts == OWNER_CAS_CONTRACT_TRIES && ctl.admission_failures == 1);
 
     reset(); ctl.outstanding = 2;
     cas_interference_cell = &ctl.outstanding;
-    cas_failures_remaining = OWNER_CAS_TRIES;
+    cas_failures_remaining = OWNER_CAS_CONTRACT_TRIES;
     assert(!p11_owner_refund());
-    assert(cas_attempts == OWNER_CAS_TRIES && (ctl.poison & OWNER_REFUND_FAILED));
+    assert(cas_attempts == OWNER_CAS_CONTRACT_TRIES && (ctl.poison & OWNER_REFUND_FAILED));
 
     reset(); ctl.outstanding = OWNER_LIMIT;
     cas_interference_cell = &ctl.outstanding;

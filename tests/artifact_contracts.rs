@@ -8424,3 +8424,13 @@ fn lane02_driver_binds_prepared_dependencies_after_cleanup() {
         "Lane02PreparedDependenciesTests",
     );
 }
+
+#[test]
+fn export_source_contracts_hold() {
+    run_native_python_suite("tests/python/test_export_source.py", "ExportSourceTests");
+}
+
+#[test]
+fn build_offline_contracts_hold() {
+    run_native_python_suite("tests/python/test_build_offline.py", "BuildOfflineTests");
+}

@@ -4,6 +4,7 @@
 ABI_ROUTING_REPO=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd -P)
 cd "$ABI_ROUTING_REPO"
 . scripts/lib.sh
+. scripts/prepared-dependency-tools.sh
 
 ABI_RUNTIME_LAUNCH_PID=
 ABI_RUNTIME_LAUNCH_STARTTIME=
@@ -19,8 +20,18 @@ ABI_RUNTIME_ACQUIRING=0
 ABI_DRIVER_FINISHING=0
 ABI_TERMINAL_REPORTED=0
 ABI_SUCCESS_DETAIL=
+ABI_PENDING_RESULT=
+ABI_PENDING_DETAIL=
+ABI_PREPARED_ADMITTED=0
+ABI_PREPARED_PREFIX=
+ABI_SOURCE_INPUTS=
 
 abi_result() {
+    if [ "$ABI_PREPARED_ADMITTED" -eq 1 ] && [ "$ABI_DRIVER_FINISHING" -eq 0 ]; then
+        ABI_PENDING_RESULT=$1
+        ABI_PENDING_DETAIL=${2-}
+        return 0
+    fi
     printf 'RESULT=%s%s\n' "$1" "${2:+ $2}"
     ABI_TERMINAL_REPORTED=1
 }
@@ -216,6 +227,24 @@ abi_driver_cleanup() {
     fi
     if [ "$ABI_RUNTIME_ACQUIRING" -eq 1 ]; then abi_status=1; fi
     if [ "$ABI_RUNTIME_OWNED" -eq 1 ]; then abi_stop_runtime || abi_status=1; fi
+    if [ "$ABI_PREPARED_ADMITTED" -eq 1 ]; then
+        abi_recheck_status=0
+        abi_evidence_root_stable || abi_recheck_status=1
+        if [ "$abi_recheck_status" -eq 0 ]; then
+            "$P11SCOPE_PREPARED_PYTHON" -I \
+                scripts/prepared-dependency-evidence.py recheck \
+                --prefix "$ABI_PREPARED_PREFIX" || abi_recheck_status=$?
+        fi
+        if [ "$abi_recheck_status" -eq 0 ]; then
+            abi_write_merged_source_snapshot final || abi_recheck_status=1
+        fi
+        if [ "$abi_recheck_status" -eq 0 ]; then
+            cmp -s "$EVIDENCE/source-initial.sha256" \
+                "$EVIDENCE/source-final.sha256" || abi_recheck_status=1
+        fi
+        abi_evidence_root_stable || abi_recheck_status=1
+        [ "$abi_recheck_status" -eq 0 ] || abi_status=1
+    fi
     if [ -n "${ABI_EVIDENCE_PIN:-}" ]; then
         printf 'cleanup_status=%s\n' "$abi_status" >"$ABI_EVIDENCE_PIN/driver-cleanup.status" || abi_status=1
         if [ "$abi_status" -eq 0 ]; then abi_final=PASS; else abi_final=NONPASS; fi
@@ -224,6 +253,8 @@ abi_driver_cleanup() {
     if [ "$ABI_TERMINAL_REPORTED" -eq 0 ]; then
         if [ "$abi_status" -eq 0 ]; then
             abi_result PASS "$ABI_SUCCESS_DETAIL"
+        elif [ "$ABI_PENDING_RESULT" = NONPASS ]; then
+            abi_result NONPASS "$ABI_PENDING_DETAIL"
         else
             abi_result NONPASS "reason=driver_exit exit_status=$abi_status"
         fi
@@ -248,11 +279,53 @@ abi_launch_variant_runtime() {
         "${ABI_RUNTIME_DURATION:-60}" python3 -I -c "$ABI_EXEC_GUARD" "$abi_binary" "$abi_run_root" "$@"
 }
 
+abi_evidence_root_stable() {
+    [ "$(readlink -f -- "$ABI_EVIDENCE_PIN")" = "$ABI_EVIDENCE" ]
+}
+
+abi_write_source_inventory() {
+    abi_unsorted_inputs=$WORK/source-inputs.unsorted
+    printf '%s\n' \
+        Cargo.lock Cargo.toml build.rs examples/abi-routing.rs \
+        scripts/lib.sh scripts/recorded-process-exec.py \
+        scripts/prepared-dependency-tools.sh \
+        scripts/prepared-dependency-evidence.py \
+        scripts/check-prepared-dependencies.py \
+        scripts/prepare-dependencies.py \
+        scripts/merge-checksum-ledgers.py \
+        scripts/matrix/ia32-compat-harness.c \
+        tests/fixtures/abi-routing/fail-ack.py \
+        tests/shell/test_abi_routing_driver.sh \
+        scripts/matrix/verify-abi-routing.sh \
+        third-party/sources.json >"$abi_unsorted_inputs" || return 1
+    find crates/ebpf/src crates/ebpf-common/src crates/manifest/src src \
+        -type f -print >>"$abi_unsorted_inputs" || return 1
+    find crates/ebpf crates/ebpf-common crates/manifest -maxdepth 1 \
+        -type f -print >>"$abi_unsorted_inputs" || return 1
+    find third-party/patches -type f -print \
+        >>"$abi_unsorted_inputs" || return 1
+    LC_ALL=C sort -u "$abi_unsorted_inputs" >"$ABI_SOURCE_INPUTS" || return 1
+    rm -f -- "$abi_unsorted_inputs"
+}
+
+abi_write_merged_source_snapshot() {
+    abi_snapshot_phase=$1
+    abi_ordinary=$EVIDENCE/source-$abi_snapshot_phase.ordinary.sha256
+    abi_merged=$EVIDENCE/source-$abi_snapshot_phase.sha256
+    while IFS= read -r abi_input; do
+        sha256sum "$abi_input" || return 1
+    done <"$ABI_SOURCE_INPUTS" >"$abi_ordinary" || return 1
+    "$P11SCOPE_PREPARED_PYTHON" -I scripts/merge-checksum-ledgers.py \
+        "$abi_ordinary" \
+        "$ABI_PREPARED_PREFIX.$abi_snapshot_phase.ledger.sha256" \
+        >"$abi_merged"
+}
+
 abi_main() {
     set -eu
     require_non_root_caller
     [ "$#" -eq 1 ] || { echo "usage: $0 ABSENT_PRIVATE_EVIDENCE_ROOT" >&2; exit 1; }
-    for abi_tool in cargo cmp find gcc grep id python3 readelf readlink rustc sed sha256sum sudo timeout uname; do
+    for abi_tool in cmp find gcc grep id python3 readelf readlink realpath rm rustup sed sha256sum sort sudo timeout uname; do
         command -v "$abi_tool" >/dev/null || { abi_result NONPASS "reason=missing_tool tool=$abi_tool" >&2; exit 1; }
     done
     [ "$(uname -m)" = x86_64 ] || { abi_result NONPASS reason=host_not_x86_64 >&2; exit 1; }
@@ -267,27 +340,72 @@ abi_main() {
     trap 'exit 129' HUP
     trap 'exit 130' INT
     trap 'exit 143' TERM
-    sudo -n true 2>/dev/null || { abi_result NONPASS reason=authorized_root_boundary_unavailable >&2; exit 1; }
     for abi_inherited in RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_TARGET_DIR CARGO_BUILD_TARGET CARGO_HOME RUSTUP_HOME RUSTUP_TOOLCHAIN RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER CC CFLAGS P11SCOPE_SMALL_RING P11SCOPE_SMALL_STATE_MAPS P11SCOPE_SMALL_DISCOVERY_RING; do
         eval "abi_value=\${$abi_inherited-}"
         [ -z "$abi_value" ] || { abi_result NONPASS "reason=inherited_build_variable variable=$abi_inherited" >&2; exit 1; }
     done
+    abi_python=$(command -v python3) || { abi_result NONPASS reason=python_selection_failed >&2; exit 77; }
+    abi_rustup=$(command -v rustup) || { abi_result NONPASS reason=rustup_selection_failed >&2; exit 77; }
+    p11scope_prepared_tools_select "$abi_python" "$abi_rustup" || {
+        abi_result NONPASS reason=prepared_tool_selection_failed >&2
+        exit 77
+    }
+    ABI_PREPARED_PREFIX=$ABI_EVIDENCE/abi.prepared
+    abi_evidence_root_stable || {
+        abi_result NONPASS reason=evidence_root_identity_changed >&2
+        exit 77
+    }
+    "$P11SCOPE_PREPARED_PYTHON" -I scripts/prepared-dependency-evidence.py \
+        capture --prefix "$ABI_PREPARED_PREFIX" \
+        --stable-cargo "$P11SCOPE_PREPARED_STABLE_CARGO" \
+        --stable-rustc "$P11SCOPE_PREPARED_STABLE_RUSTC" \
+        --bpf-cargo "$P11SCOPE_PREPARED_BPF_CARGO" \
+        --bpf-rustc "$P11SCOPE_PREPARED_BPF_RUSTC" || {
+            abi_result NONPASS reason=prepared_dependency_admission_failed >&2
+            exit 77
+        }
+    ABI_SOURCE_INPUTS=$WORK/source-inputs.list
+    abi_write_source_inventory || {
+        abi_result NONPASS reason=source_inventory_failed >&2
+        exit 77
+    }
+    abi_write_merged_source_snapshot initial || {
+        abi_result NONPASS reason=source_inventory_merge_failed >&2
+        exit 77
+    }
+    abi_evidence_root_stable || {
+        abi_result NONPASS reason=evidence_root_identity_changed >&2
+        exit 77
+    }
+    ABI_PREPARED_ADMITTED=1
+    sudo -n true 2>/dev/null || { abi_result NONPASS reason=authorized_root_boundary_unavailable >&2; exit 1; }
+    abi_cargo_version=$(
+        RUSTC="$P11SCOPE_PREPARED_STABLE_RUSTC" \
+            "$P11SCOPE_PREPARED_STABLE_CARGO" --version
+    ) || {
+        abi_result NONPASS reason=stable_cargo_version_failed
+        exit 1
+    }
+    abi_rustc_version=$(
+        "$P11SCOPE_PREPARED_STABLE_RUSTC" --version
+    ) || {
+        abi_result NONPASS reason=stable_rustc_version_failed
+        exit 1
+    }
+    abi_gcc_version=$(gcc -dumpfullversion -dumpversion)
+
     {
         echo "kernel_release=$(uname -r)"
         echo "kernel_version=$(uname -v)"
-        for abi_tool in cargo gcc readelf sha256sum sudo timeout; do
+        for abi_tool in gcc readelf sha256sum sudo timeout; do
             echo "$abi_tool=$(readlink -f "$(command -v "$abi_tool")")"
         done
-        echo "gcc_version=$(gcc -dumpfullversion -dumpversion)"
-        echo "cargo_version=$(cargo +1.88 --version)"
-        echo "rustc_version=$(rustc +1.88 --version)"
+        echo "cargo=$(readlink -f "$P11SCOPE_PREPARED_STABLE_CARGO")"
+        echo "rustc=$(readlink -f "$P11SCOPE_PREPARED_STABLE_RUSTC")"
+        echo "gcc_version=$abi_gcc_version"
+        echo "cargo_version=$abi_cargo_version"
+        echo "rustc_version=$abi_rustc_version"
     } >"$EVIDENCE/environment.status"
-    {
-        printf '%s\n' Cargo.lock Cargo.toml build.rs examples/abi-routing.rs scripts/lib.sh scripts/recorded-process-exec.py tests/fixtures/abi-routing/fail-ack.py scripts/matrix/ia32-compat-harness.c tests/shell/test_abi_routing_driver.sh scripts/matrix/verify-abi-routing.sh
-        find crates/ebpf/src crates/ebpf-common/src crates/manifest/src src third-party/aya -type f -print
-        find crates/ebpf crates/ebpf-common crates/manifest -maxdepth 1 -type f -print
-    } | LC_ALL=C sort -u >"$WORK/source-inputs.list"
-    while IFS= read -r abi_input; do sha256sum "$abi_input"; done <"$WORK/source-inputs.list" >"$EVIDENCE/source-before.sha256"
     abi_src=scripts/matrix/ia32-compat-harness.c
     abi_build_fixture() {
         abi_width=$1 abi_cfi=
@@ -302,8 +420,18 @@ abi_main() {
     [ "$(abi_elf_class "$FIXTURES/harness-32")" = ELF32 ] && [ "$(abi_elf_class "$FIXTURES/second-32.so")" = ELF32 ] || { abi_result NONPASS reason=ia32_subject_class_mismatch; exit 1; }
     abi_loader=$(readelf -l "$FIXTURES/harness-32" | sed -n 's/.*Requesting program interpreter: \([^]]*\)].*/\1/p')
     [ -n "$abi_loader" ] && [ -x "$abi_loader" ] || { abi_result NONPASS "reason=ia32_loader_unavailable loader=${abi_loader:-missing}"; exit 1; }
-    CARGO_TARGET_DIR="$DEFAULT_TARGET" cargo +1.88 build --locked --offline --example abi-routing --no-default-features >"$EVIDENCE/build-default.log" 2>&1 || { abi_result NONPASS reason=default_example_build_failed; exit 1; }
-    CARGO_TARGET_DIR="$DIAGNOSTIC_TARGET" cargo +1.88 build --locked --offline --example abi-routing --no-default-features --features unsafe-unvalidated-metadata >"$EVIDENCE/build-diagnostic.log" 2>&1 || { abi_result NONPASS reason=diagnostic_example_build_failed; exit 1; }
+    RUSTC="$P11SCOPE_PREPARED_STABLE_RUSTC" CARGO_TARGET_DIR="$DEFAULT_TARGET" \
+        "$P11SCOPE_PREPARED_STABLE_CARGO" build --locked --offline \
+        --example abi-routing --no-default-features \
+        >"$EVIDENCE/build-default.log" 2>&1 || \
+        { abi_result NONPASS reason=default_example_build_failed; exit 1; }
+    RUSTC="$P11SCOPE_PREPARED_STABLE_RUSTC" \
+        CARGO_TARGET_DIR="$DIAGNOSTIC_TARGET" \
+        "$P11SCOPE_PREPARED_STABLE_CARGO" build --locked --offline \
+        --example abi-routing --no-default-features \
+        --features unsafe-unvalidated-metadata \
+        >"$EVIDENCE/build-diagnostic.log" 2>&1 || \
+        { abi_result NONPASS reason=diagnostic_example_build_failed; exit 1; }
     DEFAULT_BIN=$DEFAULT_TARGET/debug/examples/abi-routing
     DIAGNOSTIC_BIN=$DIAGNOSTIC_TARGET/debug/examples/abi-routing
     [ -x "$DEFAULT_BIN" ] && [ -x "$DIAGNOSTIC_BIN" ] || { abi_result NONPASS reason=example_binary_missing; exit 1; }
@@ -325,8 +453,6 @@ abi_main() {
     }
     abi_default_status=0; abi_run_variant default "$DEFAULT_BIN" || abi_default_status=$?
     abi_diagnostic_status=0; abi_run_variant diagnostic "$DIAGNOSTIC_BIN" || abi_diagnostic_status=$?
-    while IFS= read -r abi_input; do sha256sum "$abi_input"; done <"$WORK/source-inputs.list" >"$EVIDENCE/source-after.sha256"
-    cmp -s "$EVIDENCE/source-before.sha256" "$EVIDENCE/source-after.sha256" || { abi_result NONPASS reason=source_inputs_changed_during_gate; exit 1; }
     for abi_artifact in "$EVIDENCE/run-default/embedded-bpf.o" "$EVIDENCE/run-diagnostic/embedded-bpf.o"; do
         [ -f "$abi_artifact" ] || { abi_result NONPASS "reason=embedded_object_evidence_missing path=$abi_artifact"; exit 1; }
     done

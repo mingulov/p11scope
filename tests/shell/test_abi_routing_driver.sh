@@ -180,4 +180,12 @@ grep -q '^result=NONPASS$' "$pending_parent/evidence/driver.status" || fail pend
 PATH=$old_path
 export PATH
 exec 8<&-
+native_output=$(python3 -I tests/python/test_prepared_abi_driver.py 2>&1) || {
+    printf '%s\n' "$native_output" >&2
+    fail prepared-abi-native-suite
+}
+[ -n "$native_output" ] || fail prepared-abi-native-suite-empty
+printf '%s\n' "$native_output" | grep -Eq '^Ran [1-9][0-9]* tests? in ' || fail prepared-abi-native-suite-unrun
+printf '%s\n' "$native_output" | grep -q '^OK$' || fail prepared-abi-native-suite-not-ok
+printf '%s\n' "$native_output"
 echo 'PASS: abi-routing production-path driver custody and launcher behavior'

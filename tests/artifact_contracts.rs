@@ -8344,3 +8344,8 @@ fn prepared_four_callers_bind_admission_build_handoff_and_finalization() {
         "PreparedFourCallersTests",
     );
 }
+
+#[test]
+fn product_build_preserves_explicit_build_context() {
+    run_native_python_suite("tests/python/test_product_build.py", "ProductBuildTests");
+}

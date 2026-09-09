@@ -5802,7 +5802,56 @@ aggregate-only-metrics default metrics"
     );
 
     let induced = read("scripts/verify-induced-gaps.sh");
+    for (name, caller) in [
+        ("canary", canaries.as_str()),
+        ("induced-gap", induced.as_str()),
+    ] {
+        assert_eq!(
+            caller
+                .matches("scripts/build-task-storage-reader.sh")
+                .count(),
+            1,
+            "{name} caller must build the reader exactly once"
+        );
+        assert_eq!(
+            caller
+                .matches("\"$TASK_STORAGE_READER\" \"$TASK_STORAGE_OBJECT\"")
+                .count(),
+            2,
+            "{name} caller must pass both explicit native paths to every live dump"
+        );
+        assert_eq!(
+            caller
+                .matches("sudo python3 -I scripts/dump-owned-bpf-maps.py")
+                .count(),
+            2,
+            "{name} live dumps must ignore ambient Python imports"
+        );
+    }
     let directory = tempfile::tempdir().unwrap();
+    let reader_build = directory.path().join("task-storage-reader");
+    let reader_build_text = reader_build.to_str().unwrap();
+    run_ok(
+        "sh",
+        &["scripts/build-task-storage-reader.sh", reader_build_text],
+    );
+    let reader = reader_build.join("dump-task-storage");
+    let iterator = reader_build.join("dump-task-storage.bpf.o");
+    assert!(reader.is_file() && iterator.is_file());
+    let reader_test = run_ok(reader.to_str().unwrap(), &["--self-test"]);
+    assert!(reader_test.contains("exact-map mutation self-test: OK"));
+    let iterator_disassembly = run_ok(
+        "llvm-objdump",
+        &["-dr", "--print-imm-hex", iterator.to_str().unwrap()],
+    );
+    assert!(
+        iterator_disassembly.contains("call 0x9c"),
+        "iterator must use non-creating bpf_task_storage_get: {iterator_disassembly}"
+    );
+    assert!(
+        iterator_disassembly.contains("call 0x7f"),
+        "iterator must write values directly with bpf_seq_write: {iterator_disassembly}"
+    );
     let provider = directory.path().join("matrix-provider.so");
     let workload = directory.path().join("canary-workload");
     run_ok(
@@ -5879,6 +5928,8 @@ aggregate-only-metrics default metrics"
                 "RawDiagnosticEventTests",
                 "ImportSafetyTests",
                 "OwnedMapWrapperTests",
+                "TaskStorageInventoryTests",
+                "TaskStorageReaderTests",
                 "TargetWidthPathTests",
                 "-v",
             ])
@@ -5902,6 +5953,8 @@ aggregate-only-metrics default metrics"
             "RawDiagnosticEventTests",
             "ImportSafetyTests",
             "OwnedMapWrapperTests",
+            "TaskStorageInventoryTests",
+            "TaskStorageReaderTests",
             "TargetWidthPathTests",
         ] {
             assert!(
@@ -5910,7 +5963,7 @@ aggregate-only-metrics default metrics"
             );
         }
         assert!(
-            report.contains("Ran 12 tests") && !report.contains("skipped="),
+            report.contains("Ran 18 tests") && !report.contains("skipped="),
             "native {bits}-bit suite must execute every required case: {report}"
         );
     }
@@ -5942,7 +5995,7 @@ aggregate-only-metrics default metrics"
 
     let dumper = run_ok(
         "python3",
-        &["scripts/dump-owned-bpf-maps.py", "--self-test"],
+        &["-I", "scripts/dump-owned-bpf-maps.py", "--self-test"],
     );
     assert!(dumper.contains("nonzero valid JSON rejected: OK"));
     assert!(dumper.contains("ordinary dump list validation: OK"));

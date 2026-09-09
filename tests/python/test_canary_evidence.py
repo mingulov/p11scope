@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -193,6 +194,170 @@ class TaskStorageInventoryTests(unittest.TestCase):
                     "task-storage", missing,
                     {item["name"] for item in task_storage}, str(prefix),
                 )
+
+
+class TaskStorageReaderTests(unittest.TestCase):
+    MAPS = [
+        {"name": "TASK_COOKIE", "id": 101, "type": "task_storage",
+         "bytes_key": 4, "bytes_value": 8, "max_entries": 0, "map_flags": 1},
+        {"name": "THREAD_OWNER", "id": 102, "type": "task_storage",
+         "bytes_key": 4, "bytes_value": 544, "max_entries": 0, "map_flags": 1},
+        {"name": "ROOT_AFFILIATION", "id": 103, "type": "task_storage",
+         "bytes_key": 4, "bytes_value": 8, "max_entries": 0, "map_flags": 1},
+    ]
+
+    @staticmethod
+    def frame(kind, map_id=0, pid=0, tid=0, value=b""):
+        return struct.pack(
+            "<8sIIIII", b"P11TSV1\0", kind, map_id, pid, tid, len(value)
+        ) + value
+
+    def complete_stream(self):
+        owner = bytearray(544)
+        owner[536:] = b"LATEBYTE"
+        return b"".join([
+            self.frame(1, 101, 7001, 7001, b"COOKIE01"),
+            self.frame(1, 102, 7001, 7002, bytes(owner)),
+            self.frame(1, 103, 7001, 7002, b"ROOTCELL"),
+            self.frame(2),
+        ])
+
+    def test_parser_preserves_full_values_and_late_sentinel(self):
+        dumper = load_dumper()
+        records = dumper.parse_task_storage_frames(
+            self.complete_stream(), self.MAPS, max_records=8, max_bytes=4096
+        )
+        self.assertEqual(len(records), 3)
+        self.assertEqual(len(records[1]["value"]), 544)
+        self.assertEqual(records[1]["value"][536:], b"LATEBYTE")
+        with tempfile.TemporaryDirectory() as directory:
+            paths = dumper.publish_task_storage_surfaces(
+                Path(directory), "case", self.MAPS, records
+            )
+            self.assertEqual(Path(paths["THREAD_OWNER"]).read_bytes()[536:], b"LATEBYTE")
+            self.assertTrue(all((Path(path).stat().st_mode & 0o777) == 0o600
+                                for path in paths.values()))
+
+    def test_parser_refuses_malformed_duplicate_truncated_overflow_and_missing_eof(self):
+        dumper = load_dumper()
+        good = self.complete_stream()
+        cases = {
+            "magic": b"BADMAGIC" + good[8:],
+            "duplicate": good[:-28] + good[:36] + self.frame(2),
+            "truncated": good[:-29],
+            "trailing": good + b"x",
+            "missing eof": good[:-28],
+        }
+        for label, stream in cases.items():
+            with self.subTest(label=label):
+                with self.assertRaises((RuntimeError, ValueError)):
+                    dumper.parse_task_storage_frames(
+                        stream, self.MAPS, max_records=8, max_bytes=4096
+                    )
+        with self.assertRaisesRegex(RuntimeError, "record bound"):
+            dumper.parse_task_storage_frames(good, self.MAPS, max_records=2, max_bytes=4096)
+        with self.assertRaisesRegex(RuntimeError, "byte bound"):
+            dumper.parse_task_storage_frames(good, self.MAPS, max_records=8, max_bytes=543)
+
+    def test_main_uses_reader_and_never_dumps_task_storage(self):
+        dumper = load_dumper()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reader = root / "reader"
+            obj = root / "reader.bpf.o"
+            reader.write_bytes(b"reader")
+            reader.chmod(0o700)
+            obj.write_bytes(b"object")
+            commands = []
+            inventory = [
+                {"name": "START", "id": 99, "type": "hash", "bytes_key": 8,
+                 "bytes_value": 288, "max_entries": 16384, "map_flags": 0},
+                self.MAPS[0], self.MAPS[1],
+                {**self.MAPS[2], "name": "ROOT_AFFILIATIO"},
+            ]
+
+            def fake_json(args, require_list=False, map_identity=None):
+                commands.append(tuple(args))
+                if args[2:4] == ["map", "show"]:
+                    map_id = int(args[-1])
+                    return [next(dict(item) for item in inventory if item["id"] == map_id)]
+                if args[2:4] == ["map", "dump"]:
+                    return []
+                raise AssertionError(f"unexpected bpftool command: {args}")
+
+            argv = [
+                "dump-owned-bpf-maps.py", "55", str(root), "case", "0", "16384",
+                str(reader.resolve()), str(obj.resolve()),
+            ]
+            with mock.patch.object(dumper, "map_ids_from_fdinfo", return_value=[99, 101, 102, 103]), \
+                    mock.patch.object(dumper.glob, "glob", return_value=[]), \
+                    mock.patch.object(dumper, "run_json", side_effect=fake_json), \
+                    mock.patch.object(dumper, "run_task_storage_reader",
+                                      return_value=self.complete_stream()), \
+                    mock.patch.object(sys, "argv", argv):
+                dumper.main()
+            dumped_ids = [int(command[-1]) for command in commands
+                          if command[2:5] == ("map", "dump", "id")]
+            self.assertEqual(dumped_ids, [99], commands)
+            manifest = json.loads((root / "mapdump_manifest_case.json").read_text())
+            task_items = [item for item in manifest if item["oracle"] == "task-storage"]
+            self.assertEqual(len(task_items), 3)
+            self.assertEqual(task_items[-1]["name"], "ROOT_AFFILIATION")
+            self.assertTrue(all(Path(item["file"]).is_file() for item in task_items))
+
+    def test_main_refuses_without_reader_before_manifest(self):
+        dumper = load_dumper()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            argv = ["dump-owned-bpf-maps.py", "55", str(root), "case", "0", "16384"]
+            with mock.patch.object(sys, "argv", argv):
+                with self.assertRaisesRegex((RuntimeError, SystemExit), "(?i)reader"):
+                    dumper.main()
+            self.assertFalse((root / "mapdump_manifest_case.json").exists())
+
+    def test_timeout_and_bounded_start_diagnostics_leave_no_surface(self):
+        dumper = load_dumper()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sleeper = root / "reader"
+            sleeper.write_text("#!/bin/sh\nsleep 2\n", encoding="utf-8")
+            sleeper.chmod(0o700)
+            obj = root / "reader.bpf.o"
+            obj.write_bytes(b"object")
+            with self.assertRaisesRegex(RuntimeError, "timed out"):
+                dumper.run_task_storage_reader(
+                    sleeper, obj, 55, self.MAPS, timeout_seconds=0.01,
+                    max_records=8, max_bytes=4096,
+                )
+            self.assertEqual(list(root.glob("mapdump_*.bin")), [])
+            real_write = dumper.write_binary_receipt
+            calls = 0
+
+            def fail_second(path, value):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("injected publish failure")
+                real_write(path, value)
+
+            records = dumper.parse_task_storage_frames(
+                self.complete_stream(), self.MAPS, max_records=8, max_bytes=4096
+            )
+            with mock.patch.object(dumper, "write_binary_receipt", side_effect=fail_second):
+                with self.assertRaisesRegex(OSError, "injected publish failure"):
+                    dumper.publish_task_storage_surfaces(root, "partial", self.MAPS, records)
+            self.assertEqual(list(root.glob("mapdump_*_partial.bin")), [])
+        error = None
+        try:
+            dumper.checked_json(
+                ["bpftool"], 1, "", "x" * 10000,
+                map_identity={"id": 77, "name": "START", "type": "hash"},
+            )
+        except RuntimeError as caught:
+            error = str(caught)
+        self.assertIsNotNone(error)
+        self.assertIn("id=77 name=START type=hash", error)
+        self.assertLess(len(error), 5000)
 
 
 class HostileStartTests(unittest.TestCase):

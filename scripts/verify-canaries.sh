@@ -49,6 +49,7 @@ require_non_root_caller
 (umask 077; mkdir -p "$WORK")
 
 command -v gcc >/dev/null || { echo "gcc required"; exit 1; }
+command -v clang-18 >/dev/null || { echo "clang-18 required"; exit 1; }
 command -v bpftool >/dev/null || { echo "bpftool required"; exit 1; }
 command -v python3 >/dev/null || { echo "python3 required"; exit 1; }
 WPID=
@@ -85,7 +86,11 @@ cleanup() {
 . scripts/cleanup-traps.sh
 
 echo "=== build ==="
-rm -rf "$WORK/default-build" "$WORK/feature-build" "$WORK/helper-build"
+rm -rf "$WORK/default-build" "$WORK/feature-build" "$WORK/helper-build" \
+    "$WORK/task-storage-reader"
+scripts/build-task-storage-reader.sh "$WORK/task-storage-reader"
+TASK_STORAGE_READER=$WORK/task-storage-reader/dump-task-storage
+TASK_STORAGE_OBJECT=$WORK/task-storage-reader/dump-task-storage.bpf.o
 p11scope_product_build "$P11SCOPE_PRODUCT_BUILD_MODE" \
     --release --workspace --target-dir "$WORK/default-build"
 p11scope_product_build "$P11SCOPE_PRODUCT_BUILD_MODE" \
@@ -199,7 +204,8 @@ run_lane() {
     rm -f "$WORK/$lane.ready" "$WORK/$lane.go" "$WORK/$lane.output" \
         "$WORK/$lane.observer.log" "$WORK/$lane.workload.log" \
         "$WORK/$lane".*.raw \
-        "$WORK"/mapdump_*_"$lane".json "$WORK/mapdump_manifest_$lane.json"
+        "$WORK"/mapdump_*_"$lane".json "$WORK"/mapdump_*_"$lane".bin \
+        "$WORK/mapdump_manifest_$lane.json"
     "$WORK/canary_workload" "$WORK/matrix-provider.so" matrix \
         "$WORK/$lane.ready" "$WORK/$lane.go" \
         > "$WORK/$lane.workload.log" 2>&1 &
@@ -238,7 +244,8 @@ run_lane() {
     touch "$WORK/$lane.go"
     wait_for_workload_stopped "$WPID" "$WORKLOAD_STARTTIME"
     sudo python3 -I scripts/dump-owned-bpf-maps.py \
-        "$OBSERVER_PID" "$WORK" "$lane" 0 16384
+        "$OBSERVER_PID" "$WORK" "$lane" 0 16384 \
+        "$TASK_STORAGE_READER" "$TASK_STORAGE_OBJECT"
     assert_lanes --raw-events "$WORK/mapdump_manifest_$lane.json" "$lane" \
         "$lane_workload_pid" "$WORK/$lane"
     reclaim_root_output "$WORK"/mapdump_*_"$lane".json \
@@ -270,7 +277,7 @@ echo "=== discover deterministic matrix providers ==="
     --module "$WORK/matrix-provider.so" -o "$WORK/matrix-manifest.json"
 "$P11SCOPE_DISCOVER" \
     --module "$WORK/privacy-provider.so" -o "$WORK/privacy-manifest.json"
-rm -f "$WORK"/mapdump_*.json "$WORK"/mapdump_manifest_*.json
+rm -f "$WORK"/mapdump_*.json "$WORK"/mapdump_*.bin "$WORK"/mapdump_manifest_*.json
 
 while read -r lane build kind; do
     run_lane "$lane" "$build" "$kind"
@@ -299,6 +306,7 @@ run_start_lane() {
     rm -f "$WORK/$start_lane.go" \
         "$WORK/$start_lane.output" "$WORK/$start_lane.observer.log" \
         "$WORK/$start_lane.workload.log" "$WORK"/mapdump_*_"$start_lane".json \
+        "$WORK"/mapdump_*_"$start_lane".bin \
         "$WORK/mapdump_manifest_$start_lane.json"
     ( while [ ! -f "$WORK/$start_lane.go" ]; do sleep 0.05; done
       exec "$WORK/canary_workload" "$WORK/privacy-provider.so" "$start_mode" ) \
@@ -322,7 +330,8 @@ run_start_lane() {
     wait_for_capture_ready "$WORK/$start_lane.observer.log" "$start_privacy" profile
     touch "$WORK/$start_lane.go"
     sudo python3 -I scripts/dump-owned-bpf-maps.py "$OBSERVER_PID" "$WORK" \
-        "$start_lane" "$start_entries" 16384
+        "$start_lane" "$start_entries" 16384 \
+        "$TASK_STORAGE_READER" "$TASK_STORAGE_OBJECT"
     reclaim_root_output "$WORK"/mapdump_*_"$start_lane".json
     if [ "$start_oracle" = --fault-starts ]; then
         assert_lanes "$start_oracle" "$WORK/mapdump_manifest_$start_lane.json" \

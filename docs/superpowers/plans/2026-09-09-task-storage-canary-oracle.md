@@ -42,18 +42,22 @@
 **Files:**
 - Create: `scripts/native/dump-task-storage.bpf.c`
 - Create: `scripts/native/dump-task-storage.c`
+- Create: `scripts/build-task-storage-reader.sh`
 - Modify: `scripts/dump-owned-bpf-maps.py`
+- Modify: `scripts/verify-canaries.sh`
+- Modify: `scripts/verify-induced-gaps.sh`
 - Modify: `tests/python/test_canary_evidence.py`
 - Modify: `tests/artifact_contracts.rs`
 
 **Interfaces:**
-- Consumes: observer PID, exact task-storage map IDs/FDs, expected map metadata, output directory, record/byte/time bounds.
+- Consumes: observer PID, explicit prebuilt reader/object paths, exact task-storage map IDs/FDs, expected map metadata, output directory, record/byte/time bounds.
 - Produces: fixed framed raw records keyed by task identity and map identity plus terminal EOF; Python publishes one 0600 scan surface per imported map only after complete validation.
 
 - [ ] Add mutation/contract tests for exact FD reuse, rejection of replacement maps, full 544-byte output, late-offset sentinel visibility, malformed/duplicate/truncated/overflow/timeout refusal, and cleanup.
 - [ ] Run the focused native Python and Cargo artifact tests; verify expected RED failures before adding either native source.
 - [ ] Implement the minimal iterator and loader. Use `bpf_map__reuse_fd()` before load, non-creating `bpf_task_storage_get(..., 0)`, direct `bpf_seq_write()`, bounded verifier logs, no bpffs pins, and cleanup on every exit.
-- [ ] Integrate compilation and invocation without ambient `PYTHONPATH`; validate IDs/type/key/value/max/flags before and after load and redact raw values from errors.
+- [ ] Compile the loader with the system C compiler and `-ldl`, compile the iterator with `clang-18`, and pass both explicit absolute paths from every dumper caller. Do not compile under sudo or depend on untracked ambient headers.
+- [ ] Integrate invocation without ambient `PYTHONPATH`; validate IDs/type/key/value/max/flags before and after load and redact raw values from errors.
 - [ ] Re-run focused tests, helper compilation, both embedded-object inventories, format, and `git diff --check`; require PASS.
 - [ ] Obtain independent spec and quality review to zero, then create one incremental local commit.
 

@@ -726,14 +726,20 @@ require_non_root_caller
 mkdir -p "$WORK"
 
 command -v gcc >/dev/null || { echo "gcc required"; exit 1; }
+command -v clang-18 >/dev/null || { echo "clang-18 required"; exit 1; }
 command -v softhsm2-util >/dev/null || { echo "softhsm2-util required"; exit 1; }
 command -v llvm-objcopy >/dev/null || { echo "llvm-objcopy required"; exit 1; }
 command -v llvm-readelf >/dev/null || { echo "llvm-readelf required"; exit 1; }
 command -v bpftool >/dev/null || { echo "bpftool required"; exit 1; }
 command -v python3 >/dev/null || { echo "python3 required"; exit 1; }
 command -v systemd-run >/dev/null || { echo "systemd-run required"; exit 1; }
-sudo -n true 2>/dev/null || { echo "passwordless sudo required"; exit 1; }
 test -f "$MODULE" || { echo "SoftHSM2 not installed at $MODULE"; exit 1; }
+
+rm -rf "$WORK/task-storage-reader"
+scripts/build-task-storage-reader.sh "$WORK_ABS/task-storage-reader"
+TASK_STORAGE_READER=$WORK_ABS/task-storage-reader/dump-task-storage
+TASK_STORAGE_OBJECT=$WORK_ABS/task-storage-reader/dump-task-storage.bpf.o
+sudo -n true 2>/dev/null || { echo "passwordless sudo required"; exit 1; }
 
 WPID=
 WORKLOAD_STARTTIME=
@@ -913,6 +919,7 @@ rm -f "$WORK/freeze-ready" "$WORK/freeze-go" "$WORK/freeze-observed.json" \
     "$WORK/freeze-profile.log" "$WORK/freeze-workload.log" \
     "$WORK/freeze-workload.pid" "$WORK/freeze-barrier" \
     "$WORK"/mapdump_*_freeze-before.json "$WORK"/mapdump_*_freeze-after.json \
+    "$WORK"/mapdump_*_freeze-before.bin "$WORK"/mapdump_*_freeze-after.bin \
     "$WORK/mapdump_manifest_freeze-before.json" "$WORK/mapdump_manifest_freeze-after.json"
 mkfifo "$WORK/freeze-barrier"
 WORKLOAD_UNIT="p11scope-freeze-$$"
@@ -948,15 +955,17 @@ OBSERVER_PID=$ROOT_PROCESS_PID
 OBSERVER_STARTTIME=$ROOT_PROCESS_STARTTIME
 wait_for_capture_ready "$WORK/freeze-profile.log" unsafe-unvalidated-metadata profile
 root_process_matches_starttime "$OBSERVER_PID" "$OBSERVER_STARTTIME" || exit 1
-sudo python3 scripts/dump-owned-bpf-maps.py \
-    "$OBSERVER_PID" "$WORK" freeze-before 0 16384
+sudo python3 -I scripts/dump-owned-bpf-maps.py \
+    "$OBSERVER_PID" "$WORK" freeze-before 0 16384 \
+    "$TASK_STORAGE_READER" "$TASK_STORAGE_OBJECT"
 freeze_policy_maps "$WPID" "$CGROUP_PATH" \
     "$WORK/mapdump_manifest_freeze-before.json"
 touch "$WORK/freeze-go"
 printf '\n' > "$WORK/freeze-barrier"
 wait_for_workload_stopped
-sudo python3 scripts/dump-owned-bpf-maps.py \
-    "$OBSERVER_PID" "$WORK" freeze-after 0 16384
+sudo python3 -I scripts/dump-owned-bpf-maps.py \
+    "$OBSERVER_PID" "$WORK" freeze-after 0 16384 \
+    "$TASK_STORAGE_READER" "$TASK_STORAGE_OBJECT"
 assert_dynamic_maps_advanced "$WORK/mapdump_manifest_freeze-before.json" \
     "$WORK/mapdump_manifest_freeze-after.json"
 signal_verified_root_process INT "$OBSERVER_PID" "$OBSERVER_STARTTIME"

@@ -277,6 +277,11 @@ at 3b68e94 with zero discovery state/read/ring loss and exact two-provider table
 interface and call evidence. All four Rust 1.88 gates passed at f069c4e (1,107 tests, zero failures or
 ignored tests). These results do not constitute final W7 or release qualification.
 
+The ABI driver's `driver-cleanup.status` receipt records cleanup independently;
+`driver.status` records the final result and exit derived from the original body
+status. Cleanup failure forces the final exit to 1, while successful cleanup
+preserves the body exit, including 143 from TERM.
+
 Shared target facts are reviewed and locally committed in proxy-ng at
 cbf3d019c43cf424d92a5d2033c6714c9f866f65. Native and no-default-feature tests ran
 on x64 and i686; 49 inventory checks passed. An independent C-header comparison

@@ -248,6 +248,14 @@ class PreparedAbiDriverTests(unittest.TestCase):
             (fixture.evidence / "driver.status").read_text(encoding="utf-8").splitlines()[0],
             "result=NONPASS",
         )
+        self.assertEqual(
+            (fixture.evidence / "driver-cleanup.status").read_text(encoding="utf-8"),
+            "cleanup_status=0\n",
+        )
+        self.assertIn(
+            "exit_status=1\n",
+            (fixture.evidence / "driver.status").read_text(encoding="utf-8"),
+        )
 
     def test_actual_cli_uses_exact_selected_tools_and_merged_source_inputs(self):
         fixture = self.fixture()
@@ -445,6 +453,10 @@ class PreparedAbiDriverTests(unittest.TestCase):
         status = (fixture.prefix.parent / "driver.status").read_text(encoding="utf-8")
         self.assertIn("result=NONPASS\n", status)
         self.assertIn("exit_status=1\n", status)
+        self.assertEqual(
+            (fixture.prefix.parent / "driver-cleanup.status").read_text(encoding="utf-8"),
+            "cleanup_status=1\n",
+        )
 
 
 if __name__ == "__main__":

@@ -158,6 +158,8 @@ read -r committed_pid committed_start <"$committed_parent/evidence/work/run-comm
 if recording_launcher_active "$committed_pid" "$committed_start"; then fail committed-process-live; else committed_state=$?; fi
 [ "$committed_state" -eq 1 ] || fail committed-process-unknown
 grep -q '^result=NONPASS$' "$committed_parent/evidence/driver.status" || fail committed-receipt
+grep -q '^cleanup_status=0$' "$committed_parent/evidence/driver-cleanup.status" || fail committed-cleanup-receipt
+grep -q '^exit_status=143$' "$committed_parent/evidence/driver.status" || fail committed-exit-receipt
 
 # A TERM during blocked ACK exercises pending finalization through the same
 # actual root-launch function. Only the direct driver child is signalled here.
@@ -176,6 +178,8 @@ pending_status=0
 wait "$pending_driver" || pending_status=$?
 [ "$pending_status" -eq 143 ] || fail pending-interrupt-status
 grep -q '^result=NONPASS$' "$pending_parent/evidence/driver.status" || fail pending-receipt
+grep -q '^cleanup_status=0$' "$pending_parent/evidence/driver-cleanup.status" || fail pending-cleanup-receipt
+grep -q '^exit_status=143$' "$pending_parent/evidence/driver.status" || fail pending-exit-receipt
 
 PATH=$old_path
 export PATH

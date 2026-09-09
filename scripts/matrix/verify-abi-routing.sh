@@ -208,8 +208,9 @@ abi_complete_pending_launcher_identity() {
 }
 
 abi_driver_cleanup() {
-    abi_status=$?
-    [ "$ABI_DRIVER_FINISHING" -eq 0 ] || exit "$abi_status"
+    abi_run_status=$?
+    abi_cleanup_status=0
+    [ "$ABI_DRIVER_FINISHING" -eq 0 ] || exit "$abi_run_status"
     ABI_DRIVER_FINISHING=1
     trap '' HUP INT TERM
     trap - EXIT
@@ -219,14 +220,14 @@ abi_driver_cleanup() {
         abi_capture_root_runtime
         ABI_RUNTIME_ACQUIRING=0
     fi
-    abi_complete_pending_launcher_identity || abi_status=1
+    abi_complete_pending_launcher_identity || abi_cleanup_status=1
     abi_finalize_status=0
-    finalize_root_recorded_process || { abi_finalize_status=1; abi_status=1; }
+    finalize_root_recorded_process || { abi_finalize_status=1; abi_cleanup_status=1; }
     if [ "$abi_finalize_status" -eq 0 ] && [ -z "${ROOT_RECORD_IDENTITY:-}" ]; then
         ABI_RUNTIME_ACQUIRING=0
     fi
-    if [ "$ABI_RUNTIME_ACQUIRING" -eq 1 ]; then abi_status=1; fi
-    if [ "$ABI_RUNTIME_OWNED" -eq 1 ]; then abi_stop_runtime || abi_status=1; fi
+    if [ "$ABI_RUNTIME_ACQUIRING" -eq 1 ]; then abi_cleanup_status=1; fi
+    if [ "$ABI_RUNTIME_OWNED" -eq 1 ]; then abi_stop_runtime || abi_cleanup_status=1; fi
     if [ "$ABI_PREPARED_ADMITTED" -eq 1 ]; then
         abi_recheck_status=0
         abi_evidence_root_stable || abi_recheck_status=1
@@ -243,10 +244,15 @@ abi_driver_cleanup() {
                 "$EVIDENCE/source-final.sha256" || abi_recheck_status=1
         fi
         abi_evidence_root_stable || abi_recheck_status=1
-        [ "$abi_recheck_status" -eq 0 ] || abi_status=1
+        [ "$abi_recheck_status" -eq 0 ] || abi_cleanup_status=1
     fi
+    abi_status=$abi_run_status
+    [ "$abi_cleanup_status" -eq 0 ] || abi_status=1
     if [ -n "${ABI_EVIDENCE_PIN:-}" ]; then
-        printf 'cleanup_status=%s\n' "$abi_status" >"$ABI_EVIDENCE_PIN/driver-cleanup.status" || abi_status=1
+        printf 'cleanup_status=%s\n' "$abi_cleanup_status" >"$ABI_EVIDENCE_PIN/driver-cleanup.status" || {
+            abi_cleanup_status=1
+            abi_status=1
+        }
         if [ "$abi_status" -eq 0 ]; then abi_final=PASS; else abi_final=NONPASS; fi
         printf 'result=%s\nexit_status=%s\n' "$abi_final" "$abi_status" >"$ABI_EVIDENCE_PIN/driver.status" || abi_status=1
     fi

@@ -1,0 +1,8 @@
+#!/bin/sh
+if [ "$*" = "ls-files -z" ]; then
+    case @BEHAVIOR@ in
+    fail) exit 39 ;;
+    duplicate) @GIT@ "$@"; @GIT@ "$@"; exit ;;
+    esac
+fi
+exec @GIT@ "$@"

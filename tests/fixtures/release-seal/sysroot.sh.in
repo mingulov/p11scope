@@ -1,5 +1,6 @@
 #!/bin/sh
 case "$*" in
 "--print sysroot") printf '%s\n' @SYSROOT@ ;;
+"metadata "*) exec @METADATA_COMMAND@ "$@" ;;
 esac
 exit 0

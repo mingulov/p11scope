@@ -1534,7 +1534,7 @@ fn release_runs_every_python3_in_isolated_mode() {
         .collect();
     assert_eq!(
         sites.len(),
-        5,
+        8,
         "the pinned-interpreter call sites moved; re-check each one for -I"
     );
     for site in sites {
@@ -8249,5 +8249,40 @@ fn the_uretprobe_hazard_row_is_not_a_capability_tier_input() {
     assert!(
         source.contains("\"uretprobe vs seccomp\""),
         "doctor must still report the row"
+    );
+}
+
+#[test]
+fn prepared_release_drivers_bind_admission_and_finalization() {
+    let output = Command::new("python3")
+        .args([
+            "-I",
+            "tests/python/test_prepared_release_drivers.py",
+            "PreparedReleaseDriverTests",
+        ])
+        .output()
+        .expect("run the complete native prepared release-driver suite");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "prepared release-driver suite: {report}"
+    );
+    let count = report
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("Ran ")?
+                .split_whitespace()
+                .next()?
+                .parse::<usize>()
+                .ok()
+        })
+        .unwrap_or(0);
+    assert!(
+        count > 0 && !report.contains("skipped="),
+        "prepared release-driver suite must run nonempty without skips: {report}"
     );
 }

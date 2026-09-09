@@ -7,6 +7,8 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
+import runpy
+import sys
 
 
 FIXTURES = Path(__file__).resolve().parent
@@ -57,11 +59,16 @@ class ReleaseSealFixture:
         self.base = Path(base)
         self.base.mkdir(mode=0o700)
         options = options or Task11FixtureOptions()
-        self.repo = self.base / "repo"
-        self.repo.mkdir(mode=0o700)
-        (self.repo / "scripts").mkdir()
-        for name in ("build-release.sh", "lib.sh", "check-capture-evidence.py"):
+        evidence_type = runpy.run_path(str(ROOT / "tests/python/test_prepared_dependency_evidence.py"))["EvidenceFixture"]
+        self.prepared = evidence_type(self.base)
+        self.repo = self.prepared.root
+        self.repo.chmod(0o700)
+        (self.repo / ".gitignore").write_text("/third-party/src/\n__pycache__/\n")
+        for name in ("build-release.sh", "lib.sh", "check-capture-evidence.py",
+                     "verify-task4-lane16.sh", "merge-checksum-ledgers.py", "prepared-dependency-tools.sh"):
             shutil.copy2(ROOT / "scripts" / name, self.repo / "scripts" / name)
+        (self.repo / "scripts/fixtures").mkdir()
+        shutil.copy2(ROOT / "scripts/fixtures/hammer.c", self.repo / "scripts/fixtures/hammer.c")
         for arguments in (
             ["init", "--quiet", "-b", "task7"], ["add", "-A"],
             ["-c", "user.email=task7@example.invalid", "-c", "user.name=task7",
@@ -101,7 +108,17 @@ class ReleaseSealFixture:
         cargo_bin.mkdir(parents=True)
         self.inert(cargo_bin / "bpf-linker")
         toolchain = self.base / "toolchain-binary"
-        self.template("sysroot.sh.in", toolchain, SYSROOT=sysroot)
+        self.prepared.config["driver_root"] = str(self.root)
+        self.prepared.config["events"] = str(self.base / "metadata-events.jsonl")
+        self.prepared.config["generic_program"] = str(self.base / "generic-cargo.py")
+        self.prepared.write_config()
+        shutil.copy2(ROOT / "tests/fixtures/prepared-dependency-evidence/fake-cargo.py",
+                     self.base / "generic-cargo.py")
+        shutil.copy2(ROOT / "tests/fixtures/prepared-release-drivers/metadata.py",
+                     self.base / "metadata.py")
+        self.template("sysroot.sh.in", toolchain, SYSROOT=sysroot,
+                      METADATA_COMMAND=[sys.executable, "-I", self.base / "metadata.py",
+                                        self.prepared.config_path, toolchain])
         rustup_target = self.fake_bin / "rustup"
         self.template("rustup.sh.in", rustup_target, TOOLCHAIN=toolchain)
         proxy_target = self.fake_bin / "rustup-proxy-target"
@@ -133,6 +150,8 @@ class ReleaseSealFixture:
         self.template("sudo.sh.in", self.fake_bin / "sudo", LOG=self.tripwire_log,
                       DUMP=self.environment_dump, BIN=self.tripwire_bin, TRIPWIRE=tripwire,
                       INVENTORY=EXPECTED["tool_inventory"])
+        for name in ("cargo", "rustc"):
+            shutil.copy2(toolchain, self.fake_bin / name)
 
     def command(self, argv, *, environment=None, overrides=None, removed=()):
         result = subprocess.run(argv, cwd=ROOT, env=environment, input="", text=True,

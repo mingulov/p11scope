@@ -236,7 +236,15 @@ prepare_root() {
 }
 
 digest() { sha256sum "$1" | awk '{print $1}'; }
-source_snapshot() { git ls-files -z | sort -z | xargs -0 sha256sum; }
+source_snapshot() {
+    case $1 in initial|final) ;; *) return 1 ;; esac
+    snapshot=$ROOT/artifacts/source.$1
+    git ls-files -z > "$snapshot.unsorted0" || return 1
+    sort -z < "$snapshot.unsorted0" > "$snapshot.sorted0" || return 1
+    xargs -0 -r sha256sum < "$snapshot.sorted0" > "$snapshot.tracked.sha256" || return 1
+    "$P11SCOPE_PREPARED_PYTHON" -I scripts/merge-checksum-ledgers.py \
+        "$snapshot.tracked.sha256" "$PREPARED_PREFIX.$1.ledger.sha256"
+}
 fact() { printf '%s\t%s\n' "$1" "$2" >> "$FACTS"; }
 
 finalize() {
@@ -253,8 +261,19 @@ finalize() {
         [ "$(digest scripts/verify-task4-lane16.sh 2>/dev/null)" = "$DRIVER_HASH" ] || result=1
         [ "$(digest scripts/fixtures/hammer.c 2>/dev/null)" = "$HAMMER_SOURCE_HASH" ] || result=1
         [ "$(digest scripts/check-capture-evidence.py 2>/dev/null)" = "$CHECKER_SOURCE_HASH" ] || result=1
-        source_snapshot > "$ROOT/artifacts/source.end.tsv" || result=1
-        cmp -s "$ROOT/artifacts/source.start.tsv" "$ROOT/artifacts/source.end.tsv" || result=1
+        if [ "$PREPARED_ADMITTED" -eq 1 ]; then
+            if "$P11SCOPE_PREPARED_PYTHON" -I scripts/prepared-dependency-evidence.py recheck \
+                --prefix "$PREPARED_PREFIX"; then
+                ledger_hash=$(digest "$PREPARED_PREFIX.final.ledger.sha256") \
+                    && fact prepared_final_ledger "lane16.prepared.final.ledger.sha256 $ledger_hash" || result=1
+                source_snapshot final > "$ROOT/artifacts/source.end.tsv" || result=1
+                cmp -s "$ROOT/artifacts/source.start.tsv" "$ROOT/artifacts/source.end.tsv" || result=1
+            else
+                result=1
+            fi
+        else
+            result=1
+        fi
         [ -s "$ROOT/artifacts/observed.json" ] || result=1
         [ -s "$ROOT/artifacts/checker.log" ] || result=1
     fi
@@ -308,6 +327,8 @@ mkdir -m 700 "$ROOT/artifacts" "$ROOT/work"
 ARTIFACTS_ID=$(stat -Lc %d:%i "$ROOT/artifacts")
 WORK_ID=$(stat -Lc %d:%i "$ROOT/work")
 HEAD_ID= TREE_ID= DRIVER_HASH= HAMMER_SOURCE_HASH= CHECKER_SOURCE_HASH=
+PREPARED_ADMITTED=0
+PREPARED_PREFIX=$ROOT/artifacts/lane16.prepared
 trap finalize EXIT INT TERM HUP
 
 LOCK=$CAMPAIGN/.task4.lock
@@ -324,8 +345,6 @@ git diff --quiet && git diff --cached --quiet || exit 77
 DRIVER_HASH=$(digest scripts/verify-task4-lane16.sh)
 HAMMER_SOURCE_HASH=$(digest scripts/fixtures/hammer.c)
 CHECKER_SOURCE_HASH=$(digest scripts/check-capture-evidence.py)
-source_snapshot > "$ROOT/artifacts/source.start.tsv" || exit 77
-SOURCE_LEDGER_HASH=$(digest "$ROOT/artifacts/source.start.tsv")
 fact started_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 fact argv "$0 $1 $MODE"
 fact cwd "$(pwd -P)"
@@ -341,18 +360,30 @@ fact lock_holder "$$:$(awk '{ sub(/^[0-9]+ \(.*\) /, ""); split($0, a, " "); pri
 fact driver_sha256 "$DRIVER_HASH"
 fact hammer_source_sha256 "$HAMMER_SOURCE_HASH"
 fact checker_source_sha256 "$CHECKER_SOURCE_HASH"
-fact source_input_ledger_sha256 "$SOURCE_LEDGER_HASH"
 
 for variable in RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_TARGET_DIR CARGO_BUILD_TARGET \
     CARGO_HOME RUSTUP_HOME RUSTUP_TOOLCHAIN RUSTC_WRAPPER CC CFLAGS; do
     eval "value=\${$variable-}"
     [ -z "$value" ] || { echo "refusing inherited $variable" >&2; exit 77; }
 done
-for tool in cargo rustc gcc python3 softhsm2-util sudo sha256sum; do
+for tool in cargo rustc rustup gcc python3 softhsm2-util sudo sha256sum; do
     command -v "$tool" >/dev/null || exit 77
 done
-cargo +1.88 --version >/dev/null || exit 77
-rustc +1.88 --version >/dev/null || exit 77
+[ -r scripts/prepared-dependency-tools.sh ] || exit 77
+. scripts/prepared-dependency-tools.sh
+p11scope_prepared_tools_select "$(command -v python3)" "$(command -v rustup)" || exit 77
+"$P11SCOPE_PREPARED_STABLE_CARGO" --version >/dev/null || exit 77
+"$P11SCOPE_PREPARED_STABLE_RUSTC" --version >/dev/null || exit 77
+"$P11SCOPE_PREPARED_PYTHON" -I scripts/prepared-dependency-evidence.py capture \
+    --prefix "$PREPARED_PREFIX" \
+    --stable-cargo "$P11SCOPE_PREPARED_STABLE_CARGO" --stable-rustc "$P11SCOPE_PREPARED_STABLE_RUSTC" \
+    --bpf-cargo "$P11SCOPE_PREPARED_BPF_CARGO" --bpf-rustc "$P11SCOPE_PREPARED_BPF_RUSTC" || exit 77
+PREPARED_ADMITTED=1
+ledger_hash=$(digest "$PREPARED_PREFIX.initial.ledger.sha256") || exit 77
+fact prepared_initial_ledger "lane16.prepared.initial.ledger.sha256 $ledger_hash"
+source_snapshot initial > "$ROOT/artifacts/source.start.tsv" || exit 77
+SOURCE_LEDGER_HASH=$(digest "$ROOT/artifacts/source.start.tsv") || exit 77
+fact source_input_ledger_sha256 "$SOURCE_LEDGER_HASH"
 sudo -n true >/dev/null 2>&1 || exit 77
 [ -f "$MODULE" ] && [ ! -L "$MODULE" ] || exit 77
 
@@ -369,16 +400,17 @@ chmod 600 "$ROOT/work/softhsm2.conf"
 SOFTHSM2_CONF="$ROOT/work/softhsm2.conf" softhsm2-util --init-token --free \
     --label task4-lane16 --so-pin 1234 --pin 1234 >/dev/null
 CARGO_TARGET_DIR="$ROOT/work/target" \
-    cargo +1.88 build --locked --release --workspace \
+    RUSTC="$P11SCOPE_PREPARED_STABLE_RUSTC" \
+    "$P11SCOPE_PREPARED_STABLE_CARGO" build --locked --release --workspace --offline \
     > "$ROOT/stdout.log" 2> "$ROOT/stderr.log"
 gcc -O0 -o "$ROOT/work/hammer" scripts/fixtures/hammer.c -ldl \
     >> "$ROOT/stdout.log" 2>> "$ROOT/stderr.log"
 OBSERVER=$ROOT/work/target/release/p11scope
 chmod 700 "$OBSERVER" "$ROOT/work/hammer"
-fact cargo_argv "cargo +1.88 build --locked --release --workspace"
+fact cargo_argv "$P11SCOPE_PREPARED_STABLE_CARGO build --locked --release --workspace --offline"
 fact cargo_target_dir "$ROOT/work/target"
 fact observer_identity "$(stat -Lc %d:%i:%s "$OBSERVER"):$(digest "$OBSERVER")"
-fact cargo_identity "$(cargo +1.88 --version)|$(rustc +1.88 --version)"
+fact cargo_identity "$("$P11SCOPE_PREPARED_STABLE_CARGO" --version)|$("$P11SCOPE_PREPARED_STABLE_RUSTC" --version)"
 
 set +e
 /usr/bin/env -i PATH="$PATH_FIXED" SOFTHSM2_CONF="$ROOT/work/softhsm2.conf" \

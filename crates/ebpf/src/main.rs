@@ -1885,8 +1885,8 @@ fn walk_template_impl<const IS_ILP32: bool>(
 fn arg_u64(ctx: &ProbeContext, index: u8, layout: LinuxLayout) -> Result<u64, ()> {
     if layout == LinuxLayout::Ilp32 {
         let rsp = unsafe { (*ctx.regs).rsp as u64 };
-        let address = target_stack_arg_address(rsp, index, layout).ok_or(())?;
-        return read_word(address, layout);
+        let value = p11_read_ia32_arg(rsp, index as u32);
+        return (value <= u32::MAX as u64).then_some(value).ok_or(());
     }
     match index {
         // Keep every register index a compile-time constant. A dynamic
@@ -1904,6 +1904,31 @@ fn arg_u64(ctx: &ProbeContext, index: u8, layout: LinuxLayout) -> Result<u64, ()
             read_word(address, layout)
         }
         _ => Err(()),
+    }
+}
+
+const IA32_ARG_READ_FAILURE: u64 = 1u64 << 32;
+
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn p11_read_ia32_arg(stack_pointer: u64, index: u32) -> u64 {
+    if index > 6 {
+        return IA32_ARG_READ_FAILURE;
+    }
+    let stack_pointer = stack_pointer & u32::MAX as u64;
+    let offset = (u64::from(index) + 1) * 4;
+    let Some(address) = stack_pointer.checked_add(offset) else {
+        return IA32_ARG_READ_FAILURE;
+    };
+    let Some(end) = address.checked_add(3) else {
+        return IA32_ARG_READ_FAILURE;
+    };
+    if end > u32::MAX as u64 {
+        return IA32_ARG_READ_FAILURE;
+    }
+    match unsafe { helpers::bpf_probe_read_user(address as *const u32) } {
+        Ok(value) => u64::from(value),
+        Err(_) => IA32_ARG_READ_FAILURE,
     }
 }
 

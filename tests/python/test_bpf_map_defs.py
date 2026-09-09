@@ -390,6 +390,143 @@ class MapDefsTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "unexpected owner"):
             checker.inspect(obj)
 
+    def test_ia32_reader_linkage_signature_body_and_call(self):
+        obj = Path(self.temp.name) / "ia32-reader.o"
+        source = Path(self.temp.name) / "ia32-reader.c"
+        fixture = (ROOT / "tests/fixtures/bpf-map-defs/mixed.c").read_text()
+        fixture = fixture.replace(
+            'SEC("uprobe") int probe(void *ctx) { return 0; }',
+            'static long (*read_user)(void *, unsigned long, const void *) = (void *)112;\n'
+            '__attribute__((noinline, used))\n'
+            'unsigned long long p11_read_ia32_arg(unsigned long long sp, unsigned index) {\n'
+            '    unsigned value = 0;\n'
+            '    unsigned long long address, end;\n'
+            '    if (index > 6) return 1ULL << 32;\n'
+            '    sp &= 0xffffffffULL;\n'
+            '    if (__builtin_add_overflow(sp, ((unsigned long long)index + 1) * 4, &address))\n'
+            '        return 1ULL << 32;\n'
+            '    if (__builtin_add_overflow(address, 3ULL, &end) || end > 0xffffffffULL)\n'
+            '        return 1ULL << 32;\n'
+            '    if (read_user(&value, 4, (const void *)address)) return 1ULL << 32;\n'
+            '    return value;\n'
+            '}\n'
+            'SEC("uprobe") int probe(void *ctx) {\n'
+            '    return (int)p11_read_ia32_arg((unsigned long long)ctx, *(volatile unsigned *)ctx);\n'
+            '}',
+        )
+        source.write_text(fixture)
+        subprocess.run(
+            ["clang-18", "-target", "bpfel", "-g", "-O2", "-c", str(source), "-o", str(obj)],
+            check=True,
+            capture_output=True,
+        )
+        checker.inspect(obj)
+        body, elf, btf = self.metadata(obj)
+        symbol_index = next(
+            i for i, symbol in enumerate(elf.symbols)
+            if symbol[0] == "p11_read_ia32_arg"
+        )
+        symbol = elf.symbols[symbol_index]
+        symbol_at = elf.sections[".symtab"][0][4] + symbol_index * 24
+        func_id, func = next(
+            (i, node) for i, node in enumerate(btf.types)
+            if node and node[:2] == (12, "p11_read_ia32_arg")
+        )
+        btf_base = elf.sections[".BTF"][0][4]
+        func_at = btf_base + func[6]
+        proto = btf.types[func[2]]
+        proto_at = btf_base + proto[6]
+        pointer_type = next(
+            i for i, node in enumerate(btf.types)
+            if node and node[0] == 2
+        )
+        u64_type = next(
+            i for i, node in enumerate(btf.types)
+            if node and node[0] == 1 and node[2] == 8 and node[5][0] >> 24 == 0
+        )
+
+        ext_base = elf.sections[".BTF.ext"][0][4]
+        ext = elf.sections[".BTF.ext"][1]
+        hlen, off, length = struct.unpack_from("<III", ext, 4)
+        pos = hlen + off
+        stride = struct.unpack_from("<I", ext, pos)[0]
+        pos += 4
+        records = []
+        while pos < hlen + off + length:
+            _, count = struct.unpack_from("<II", ext, pos)
+            pos += 8
+            for _ in range(count):
+                if struct.unpack_from("<I", ext, pos + 4)[0] == func_id:
+                    records.append(pos)
+                pos += stride
+        self.assertEqual(len(records), 1)
+
+        text_row, text = elf.sections[".text"]
+        instructions = [
+            (pc, *struct.unpack_from("<BBhi", text, pc))
+            for pc in range(symbol[4], symbol[4] + symbol[5], 8)
+        ]
+        read_call = next(pc for pc, op, reg, _, imm in instructions
+                         if (op, reg, imm) == (0x85, 0, 112))
+        width_move = next(
+            pc for pc, op, reg, _, imm in reversed(instructions)
+            if pc < read_call and op in (0xb4, 0xb7) and reg & 15 == 2 and imm == 4
+        )
+        sentinel_high = next(
+            pc + 8 for pc, op, _, _, imm in instructions[:-1]
+            if op == 0x18 and imm == 0
+            and struct.unpack_from("<BBhi", text, pc + 8)[3] == 1
+        )
+
+        bodies = {(s[3], s[4]): s for s in elf.symbols if s[1] & 15 == 2 and s[5] and s[3]}
+        call_relocations = {}
+        for section_row, relocations in elf.sections.values():
+            if section_row[1] != 9 or section_row[7] not in {key[0] for key in bodies}:
+                continue
+            for at in range(0, len(relocations), 16):
+                address, info = struct.unpack_from("<QQ", relocations, at)
+                call_relocations[section_row[7], address] = (
+                    info & 0xffffffff, elf.symbols[info >> 32]
+                )
+        target = (symbol[3], symbol[4])
+        real_calls = []
+        for (section, start), caller in bodies.items():
+            row, code = next(value for name, value in elf.sections.items()
+                             if elf.indices[name] == section)
+            for at in range(start, start + caller[5], 8):
+                op, reg, _, imm = struct.unpack_from("<BBhi", code, at)
+                if (op, reg) != (0x85, 0x10):
+                    continue
+                relocation = call_relocations.get((section, at))
+                destination = None
+                if relocation and relocation[0] == 10:
+                    destination = (
+                        relocation[1][3],
+                        relocation[1][4] + (imm + 1) * 8,
+                    )
+                elif not relocation:
+                    destination = (section, at + (imm + 1) * 8)
+                if destination == target:
+                    real_calls.append((row[4] + at, "B", 0xb7))
+        self.assertTrue(real_calls, "fixture must retain a real BPF-to-BPF reader call")
+
+        cases = {
+            "static_elf": ([(symbol_at + 4, "B", 0x02)], "GLOBAL DEFAULT"),
+            "absent_elf": ([(symbol_at + 6, "H", 0)], "GLOBAL DEFAULT"),
+            "static_btf": ([(func_at + 4, "I", 12 << 24)], "GLOBAL BTF"),
+            "inlined_body": ([(symbol_at + 16, "Q", 0)], "body"),
+            "pointer_return": ([(proto_at + 8, "I", pointer_type)], "return.*u64"),
+            "pointer_argument": ([(proto_at + 16, "I", pointer_type)], "argument.*scalar"),
+            "wrong_index_width": ([(proto_at + 24, "I", u64_type)], "index.*u32"),
+            "wrong_read_width": ([(text_row[4] + width_move + 4, "i", 8)], "four-byte user read"),
+            "wrong_read_helper": ([(text_row[4] + read_call + 4, "i", 113)], "one user read"),
+            "wrong_sentinel": ([(text_row[4] + sentinel_high + 4, "i", 2)], "failure sentinel"),
+            "uncalled": (real_calls, "real call"),
+        }
+        for name, (changes, reason) in cases.items():
+            with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, reason):
+                checker.inspect(self.mutate(changes, obj))
+
     def test_root_helpers(self):
         obj = Path(self.temp.name) / "root-helpers.o"
         subprocess.run(["clang-18", "-target", "bpfel", "-g", "-O2", "-DHELPERS", "-c",

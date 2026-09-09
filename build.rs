@@ -184,6 +184,8 @@ fn main() {
         "link-arg=--export=p11_owner_reserve",
         "-C",
         "link-arg=--export=p11_owner_refund",
+        "-C",
+        "link-arg=--export=p11_read_ia32_arg",
     ] {
         append_flag(flag);
     }

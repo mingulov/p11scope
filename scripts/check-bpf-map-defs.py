@@ -387,6 +387,7 @@ REQUIRED_GLOBAL_HELPERS = frozenset({
     "p11_link_current_identity", "p11_link_emit_fork", "p11_link_fork_allowed",
 })
 REQUIRED_GLOBAL_OWNER_HELPERS = frozenset({"p11_owner_reserve", "p11_owner_refund"})
+REQUIRED_GLOBAL_SCALAR_HELPERS = frozenset({"p11_read_ia32_arg"})
 REQUIRED_LOCAL_OWNER_HELPERS = frozenset({
     "p11_owner_cleanup", "p11_owner_start_get",
     "p11_owner_start_insert", "p11_owner_start_remove", "p11_owner_discovery_get",
@@ -593,6 +594,174 @@ def validate_owner_helpers(elf):
     validate_private_helpers(elf, "p11_owner_", REQUIRED_LOCAL_OWNER_HELPERS,
                              OPTIONAL_LOCAL_OWNER_HELPERS, "owner", exported, "OWNER_CTL")
 
+
+def validate_ia32_reader(elf):
+    """Verify the scalar-only ia32 user-read boundary and one reachable call."""
+    selected = [symbol for symbol in elf.symbols if symbol[0] == "p11_read_ia32_arg"]
+    production = any(symbol[0] == "p11_entry" for symbol in elf.symbols)
+    if not selected and not production:
+        return
+    if len(selected) != 1:
+        raise RuntimeError("missing/duplicate ia32 scalar reader")
+    symbol = selected[0]
+    if (symbol[1] != 0x12 or symbol[2] != 0
+            or symbol[3] != elf.indices.get(".text")):
+        raise RuntimeError("ia32 reader must be GLOBAL DEFAULT FUNC in .text")
+    if (not symbol[5] or symbol[4] % 8 or symbol[5] % 8
+            or symbol[4] + symbol[5] > len(elf.sections[".text"][1])):
+        raise RuntimeError("ia32 reader has invalid/empty body")
+    if ".BTF" not in elf.sections or ".BTF.ext" not in elf.sections:
+        raise RuntimeError("ia32 reader requires BTF and BTF.ext")
+    btf = Btf(elf.sections[".BTF"][1])
+    functions = [
+        (ident, node) for ident, node in enumerate(btf.types)
+        if node and node[:2] == (12, "p11_read_ia32_arg")
+    ]
+    if len(functions) != 1:
+        raise RuntimeError("ia32 reader requires one BTF FUNC")
+    func_id, func = functions[0]
+    if func[3] != 1:
+        raise RuntimeError("ia32 reader requires GLOBAL BTF linkage")
+    if not func[2] or btf.types[func[2]][0] != 13:
+        raise RuntimeError("ia32 reader requires FUNC_PROTO")
+    proto = btf.types[func[2]]
+    if proto[3] != 2 or len(proto[5]) != 4:
+        raise RuntimeError("ia32 reader requires exactly two scalar arguments")
+
+    def unsigned_int(ref, size):
+        node = btf.resolve(ref)
+        return (node[0] == 1 and node[2] == size
+                and node[5][0] >> 24 == 0 and node[5][0] & 0xffff == size * 8)
+
+    if not unsigned_int(proto[2], 8):
+        raise RuntimeError("ia32 reader return must be scalar u64")
+    if not unsigned_int(proto[5][1], 8):
+        raise RuntimeError("ia32 reader stack-pointer argument must be scalar u64")
+    if not unsigned_int(proto[5][3], 4):
+        raise RuntimeError("ia32 reader index must be scalar u32")
+
+    ext = elf.sections[".BTF.ext"][1]
+    magic, version, flags, hlen, off, length = struct.unpack(
+        "<HBBIII", checked_slice(ext, 0, 16, "BTF.ext function info header"))
+    if (magic, version, flags, hlen) != (0xeb9f, 1, 0, 32):
+        raise RuntimeError("unsupported BTF.ext function info header")
+    raw = checked_slice(ext, hlen + off, length, "BTF.ext function info")
+    stride, = struct.unpack("<I", checked_slice(raw, 0, 4, "function info stride"))
+    if stride != 8:
+        raise RuntimeError("unsupported function info stride")
+    info_relocs = {}
+    for row, relocations in elf.sections.values():
+        if row[1] != 9 or row[7] != elf.indices[".BTF.ext"]:
+            continue
+        for pos in range(0, len(relocations), 16):
+            address, info = struct.unpack_from("<QQ", relocations, pos)
+            info_relocs[address] = (info & 0xffffffff, elf.symbols[info >> 32])
+    pos, records = 4, []
+    while pos < len(raw):
+        section_name, count = struct.unpack(
+            "<II", checked_slice(raw, pos, 8, "function info section"))
+        section = string_at(btf.strings, section_name)
+        pos += 8
+        for _ in range(count):
+            record = hlen + off + pos
+            address, ident = struct.unpack(
+                "<II", checked_slice(raw, pos, stride, "function info record"))
+            pos += stride
+            if ident == func_id:
+                records.append((section, address, info_relocs.get(record)))
+    if len(records) != 1:
+        raise RuntimeError("ia32 reader BTF.ext function info missing/duplicate")
+    section, address, relocation = records[0]
+    if (section != ".text" or address != symbol[4] or not relocation
+            or relocation[0] != 4 or relocation[1][1] != 3
+            or relocation[1][3] != symbol[3] or relocation[1][4] != 0):
+        raise RuntimeError("ia32 reader BTF.ext function info relocation mismatch")
+
+    text = elf.sections[".text"][1]
+    body = checked_slice(text, symbol[4], symbol[5], "ia32 reader body")
+    insns = [struct.unpack_from("<BBhi", body, pos) for pos in range(0, len(body), 8)]
+    reads = [i for i, (op, reg, _, imm) in enumerate(insns)
+             if (op, reg, imm) == (0x85, 0, 112)]
+    if len(reads) != 1:
+        raise RuntimeError("ia32 reader requires exactly one user read")
+    read = reads[0]
+    width = next(
+        (imm for op, reg, _, imm in reversed(insns[:read])
+         if op in (0xb4, 0xb7) and reg & 15 == 2),
+        None,
+    )
+    if width != 4:
+        raise RuntimeError("ia32 reader requires an exact four-byte user read")
+    if not any(op in (0x25, 0x26) and imm == 6 for op, _, _, imm in insns[:read]):
+        raise RuntimeError("ia32 reader must reject index above six before the read")
+    normalized = any(op == 0xbc for op, _, _, _ in insns[:read])
+    normalized |= any(
+        op == 0x67 and imm == 32 and index + 1 < read
+        and insns[index + 1][0] == 0x77
+        and insns[index + 1][1] == reg and insns[index + 1][3] == 32
+        for index, (op, reg, _, imm) in enumerate(insns[:read])
+    )
+    if not normalized:
+        raise RuntimeError("ia32 reader must normalize the stack pointer to low 32 bits")
+    span_limit = any(
+        op == 0x18 and imm == -4 and index + 1 < read
+        and insns[index + 1][0] == 0 and insns[index + 1][3] == 0
+        for index, (op, _, _, imm) in enumerate(insns[:read])
+    )
+    span_check = any(op in (0x2d, 0x2e) for op, _, _, _ in insns[:read])
+    if not span_limit or not span_check:
+        raise RuntimeError("ia32 reader must prove the complete four-byte address span")
+    sentinel_words = [
+        insns[index + 1][3]
+        for index, (op, _, _, imm) in enumerate(insns)
+        if op == 0x18 and imm == 0 and index + 1 < len(insns)
+        and insns[index + 1][0] == 0 and insns[index + 1][3] != 0
+    ]
+    sentinel = bool(sentinel_words) and all(high == 1 for high in sentinel_words)
+    sentinel |= any(
+        op == 0x67 and imm == 32
+        and any(previous[0] == 0xb7 and previous[3] == 1 for previous in insns[:index])
+        for index, (op, _, _, imm) in enumerate(insns)
+    )
+    if not sentinel:
+        raise RuntimeError("ia32 reader requires the exact 1<<32 failure sentinel")
+    if not any(op == 0x61 for op, _, _, _ in insns[read + 1:]):
+        raise RuntimeError("ia32 reader must zero-extend the four-byte result")
+
+    bodies = {(s[3], s[4]): s for s in elf.symbols if s[1] & 15 == 2 and s[5] and s[3]}
+    target = (symbol[3], symbol[4])
+    call_relocations = {}
+    for row, relocations in elf.sections.values():
+        if row[1] != 9 or row[7] not in {key[0] for key in bodies}:
+            continue
+        for pos in range(0, len(relocations), 16):
+            address, info = struct.unpack_from("<QQ", relocations, pos)
+            call_relocations[row[7], address] = (
+                info & 0xffffffff, elf.symbols[info >> 32]
+            )
+    callers = set()
+    for (section_index, start), caller in bodies.items():
+        section = next(raw for name, (_, raw) in elf.sections.items()
+                       if elf.indices[name] == section_index)
+        code = checked_slice(section, start, caller[5], "ia32 reader caller")
+        for pos in range(0, len(code), 8):
+            op, reg, _, imm = struct.unpack_from("<BBhi", code, pos)
+            if (op, reg) == (0x85, 0x10):
+                relocation = call_relocations.get((section_index, start + pos))
+                if relocation and relocation[0] == 10:
+                    destination = (
+                        relocation[1][3],
+                        relocation[1][4] + (imm + 1) * 8,
+                    )
+                elif relocation:
+                    destination = None
+                else:
+                    destination = (section_index, start + pos + (imm + 1) * 8)
+                if destination == target:
+                    callers.add((section_index, start))
+    if not callers:
+        raise RuntimeError("ia32 reader requires a real call boundary")
+
 def validate_root_helpers(elf):
     validate_private_helpers(elf, "p11_root_", REQUIRED_LOCAL_ROOT_HELPERS,
                              frozenset(), "root")
@@ -626,8 +795,9 @@ def inspect(path, allowed_text_globals=frozenset()):
             raise RuntimeError("native BTF DATASEC missing ELF .maps section")
     validate_owner_helpers(elf)
     validate_root_helpers(elf)
+    validate_ia32_reader(elf)
     return maps, classify(records, sections, allowed_text_globals | REQUIRED_GLOBAL_HELPERS
-                          | REQUIRED_GLOBAL_OWNER_HELPERS), {
+                          | REQUIRED_GLOBAL_OWNER_HELPERS | REQUIRED_GLOBAL_SCALAR_HELPERS), {
         record[-1] for record in records
     }
 
@@ -664,7 +834,8 @@ def classify(records, sections, allowed_text_globals=frozenset()):
         exact = EXACT_PROGRAM_SECTIONS.get(name)
         if bind != "GLOBAL" or visibility != "DEFAULT":
             raise RuntimeError(f"unclassified global function {name} in {location}")
-        if name in REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_OWNER_HELPERS | DIAGNOSTIC_GLOBAL_HELPERS:
+        if name in (REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_OWNER_HELPERS
+                    | REQUIRED_GLOBAL_SCALAR_HELPERS | DIAGNOSTIC_GLOBAL_HELPERS):
             if name in allowed_text_globals and location == ".text":
                 helpers.add(name)
                 continue

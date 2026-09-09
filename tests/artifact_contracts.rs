@@ -22,6 +22,23 @@ fn owner_retry_boundaries_are_the_only_owner_exports_requested_by_the_build() {
     );
 }
 
+#[test]
+fn ia32_argument_reader_is_the_exact_scalar_reader_export_requested_by_the_build() {
+    let source = std::fs::read_to_string("build.rs").expect("read build script");
+    assert_eq!(
+        source
+            .matches("link-arg=--export=p11_read_ia32_arg")
+            .count(),
+        1,
+        "the ia32 scalar reader must be retained as one exported BPF global"
+    );
+    assert_eq!(
+        source.matches("link-arg=--export=p11_read_").count(),
+        1,
+        "no other pointer or reader boundary may cross the global ABI"
+    );
+}
+
 static NATIVE_SUITE_GATE: Mutex<()> = Mutex::new(());
 
 fn read(path: &str) -> String {

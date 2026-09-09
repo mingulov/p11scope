@@ -2,7 +2,7 @@
 use std::process::Command;
 
 #[test]
-fn embedded_owner_helpers_have_exact_linkage_btf_and_real_calls() {
+fn embedded_scalar_helpers_have_exact_linkage_btf_bodies_and_real_calls() {
     let directory = tempfile::tempdir().expect("temporary embedded BPF object");
     let object = directory.path().join("p11scope-ebpf");
     std::fs::write(&object, p11scope::EBPF_OBJECT).expect("write actual embedded object");
@@ -29,6 +29,10 @@ fn embedded_owner_helpers_have_exact_linkage_btf_and_real_calls() {
             "embedded object must export {helper}"
         );
     }
+    assert!(
+        symbols.iter().any(|symbol| symbol == "p11_read_ia32_arg"),
+        "embedded object must export p11_read_ia32_arg"
+    );
 }
 
 /// Relocation itself is an object transformation. Distinct sentinel descriptors
@@ -88,6 +92,7 @@ fn native_bpf_map_decoder_contracts() {
         "MapDefsTests.test_duplicate_and_missing_native_entries",
         "MapDefsTests.test_exact_helpers",
         "MapDefsTests.test_owner_linkage",
+        "MapDefsTests.test_ia32_reader_linkage_signature_body_and_call",
         "MapDefsTests.test_root_helpers",
         "MapDefsTests.test_json_and_legacy_cli",
         "MapDefsTests.test_runner_guards",

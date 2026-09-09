@@ -1958,10 +1958,7 @@ fn zero_function_name_key(key: &mut MaybeUninit<FunctionNameKey>) {
     }
 }
 
-fn capture_async_target(ctx: &ProbeContext, index: u8, layout: LinuxLayout, start: &mut CallStart) {
-    let Some(pointer) = capture_scalar(ctx, index, layout, start) else {
-        return;
-    };
+fn capture_async_target(pointer: u64, start: &mut CallStart) {
     if pointer == 0 {
         capture_failure(start);
         return;
@@ -2368,7 +2365,9 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
         }
     }
     if TEMPLATE_MODE == 0 && semantics.async_name_arg != ARG_NONE {
-        capture_async_target(&ctx, semantics.async_name_arg, layout, start);
+        if let Some(pointer) = capture_scalar(&ctx, semantics.async_name_arg, layout, start) {
+            capture_async_target(pointer, start);
+        }
         match semantics.lifecycle {
             lifecycle::ASYNC_JOIN => {
                 if let Some(value) = capture_scalar(&ctx, semantics.async_value_arg, layout, start)

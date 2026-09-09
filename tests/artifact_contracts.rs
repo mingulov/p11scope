@@ -5371,6 +5371,8 @@ fn async_key_initialization_and_copy_are_fixed_and_guarded() {
         "fn capture_async_target(",
         "#[uprobe]\npub fn p11_entry",
     );
+    assert!(source.contains("fn capture_async_target(pointer: u64, start: &mut CallStart)"));
+    assert!(!capture.contains("capture_scalar("));
     assert_eq!(capture.matches("bpf_probe_read_user_str(").count(), 1);
     assert!(capture.contains("(FUNCTION_NAME_MAX_BYTES + 2) as u32"));
     assert!(capture.contains("read <= 0 || read > (FUNCTION_NAME_MAX_BYTES + 1) as _"));

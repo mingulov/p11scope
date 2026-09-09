@@ -457,6 +457,17 @@ class MapDefsTests(unittest.TestCase):
             pc for pc, op, _, _, imm in instructions
             if op == 0x07 and imm == 4 and pc < read_call
         )
+        span_guard, _, _, span_offset, _ = next(
+            insn for insn in instructions if insn[1:3] == (0x2d, 0x13)
+        )
+        payload = next(pc for pc, op, reg, _, _ in instructions
+                       if op == 0x61 and reg & 15 == 0 and pc > read_call)
+        rejection_sentinel = max(pc for pc, op, reg, _, imm in instructions
+                                 if op == 0x18 and reg == 0 and imm == 0)
+        self.assertGreater(span_offset, 0)
+        # The alternate real sentinel block is also a valid rejection target.
+        checker.inspect(self.mutate([(text_row[4] + span_guard + 2, "h",
+                                      (rejection_sentinel - span_guard) // 8 - 1)], obj), allowed)
 
         bodies = {(s[3], s[4]): s for s in elf.symbols if s[1] & 15 == 2 and s[5] and s[3]}
         call_relocations = {}
@@ -560,6 +571,11 @@ class MapDefsTests(unittest.TestCase):
             "wrong_slot_offset": ([(text_row[4] + slot_offset + 4, "i", 8)], "slot/address"),
             "wrong_read_helper": ([(text_row[4] + read_call + 4, "i", 113)], "one user read"),
             "wrong_sentinel": ([(text_row[4] + sentinel_high + 4, "i", 2)], "failure sentinel"),
+            "span_rejection_falls_through": ([(text_row[4] + span_guard + 2, "h", 0)], "span"),
+            "span_rejection_deleted": ([(text_row[4] + span_guard, "B", 0x05),
+                                         (text_row[4] + span_guard + 2, "h", 0)], "span"),
+            "span_rejection_returns_payload": ([(text_row[4] + span_guard + 2, "h",
+                                                  (payload - span_guard) // 8 - 1)], "span.*sentinel"),
             "uncalled": (real_calls, "entry.*reachable"),
             "unreachable_decoy": (remove_entry_calls, "entry.*reachable"),
             "discovery_only": (remove_entry_calls + [discovery_call], "entry.*reachable"),

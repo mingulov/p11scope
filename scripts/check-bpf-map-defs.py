@@ -595,6 +595,84 @@ def validate_owner_helpers(elf):
                              OPTIONAL_LOCAL_OWNER_HELPERS, "owner", exported, "OWNER_CTL")
 
 
+def validate_ia32_span_paths(graph, entry, guard, rejected, read, updates, exits):
+    """Prove guard dominance and sentinel return on every rejected path.
+
+    Both raw-ELF and disassembly callers supply their own decoded CFG and r0
+    writes. An omitted update preserves r0; None is an unknown value. This
+    deliberately does not infer success from a comparison's mere presence.
+    """
+    guard_values = set()
+
+    def walk(pending, rejection):
+        visited, returned = set(), False
+        while pending:
+            pc, result, ancestors = pending.pop()
+            if pc not in graph or pc in ancestors:
+                raise RuntimeError("ia32 reader span path escapes body or cycles")
+            if pc == read:
+                reason = "rejection reaches user read" if rejection else "read bypasses guard"
+                raise RuntimeError("ia32 reader span " + reason)
+            if not rejection and pc == guard:
+                guard_values.add(result)
+                continue
+            if (pc, result) in visited:
+                continue
+            visited.add((pc, result))
+            result = updates.get(pc, result)
+            if pc in exits:
+                if rejection and result != 1 << 32:
+                    raise RuntimeError("ia32 reader span rejection must return failure sentinel")
+                returned = True
+                continue
+            if not graph[pc]:
+                raise RuntimeError("ia32 reader span path has no return")
+            pending.extend((target, result, ancestors | {pc}) for target in graph[pc])
+        return returned
+
+    walk([(entry, None, frozenset())], False)
+    if not guard_values:
+        raise RuntimeError("ia32 reader span guard is unreachable")
+    if not walk([(rejected, value, frozenset()) for value in guard_values], True):
+        raise RuntimeError("ia32 reader span rejection has no sentinel return")
+
+
+def validate_ia32_raw_span(insns, read):
+    """Decode the reader's raw instruction edges without fixed instruction PCs."""
+    guards = [pc for pc, (op, reg, _, _) in enumerate(insns[:read])
+              if (op, reg) == (0x2d, 0x13)]
+    if len(guards) != 1:
+        raise RuntimeError("ia32 reader requires one full-width address span guard")
+    graph, updates, exits = {}, {}, set()
+    pc = 0
+    while pc < len(insns):
+        op, reg, offset, imm = insns[pc]
+        size = 2 if op == 0x18 else 1
+        if size == 2 and (pc + 1 >= len(insns) or insns[pc + 1][0] != 0):
+            raise RuntimeError("ia32 reader span has malformed wide immediate")
+        if op == 0x95:
+            graph[pc] = []
+            exits.add(pc)
+        elif op == 0x05:
+            graph[pc] = [pc + 1 + offset]
+        elif op & 7 in (5, 6) and op != 0x85:
+            graph[pc] = [pc + 1, pc + 1 + offset]
+        else:
+            graph[pc] = [pc + size]
+        if op == 0x85:
+            updates[pc] = None
+        elif reg & 15 == 0 and op & 7 in (0, 1, 4, 7):
+            if op == 0x18:
+                updates[pc] = (imm & 0xffffffff) | ((insns[pc + 1][3] & 0xffffffff) << 32)
+            elif op in (0xb4, 0xb7):
+                updates[pc] = imm & ((1 << (32 if op == 0xb4 else 64)) - 1)
+            else:
+                updates[pc] = None
+        pc += size
+    guard = guards[0]
+    validate_ia32_span_paths(graph, 0, guard, guard + 1 + insns[guard][2], read, updates, exits)
+
+
 def validate_ia32_reader(elf):
     """Verify the scalar-only ia32 user-read boundary and one reachable call."""
     selected = [symbol for symbol in elf.symbols if symbol[0] == "p11_read_ia32_arg"]
@@ -720,6 +798,7 @@ def validate_ia32_reader(elf):
     span_check = any(op in (0x2d, 0x2e) for op, _, _, _ in insns[:read])
     if not span_limit or not span_check:
         raise RuntimeError("ia32 reader must prove the complete four-byte address span")
+    validate_ia32_raw_span(insns, read)
     sentinel_words = [
         insns[index + 1][3]
         for index, (op, _, _, imm) in enumerate(insns)

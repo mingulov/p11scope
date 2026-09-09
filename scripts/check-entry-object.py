@@ -23,6 +23,11 @@ _spec = importlib.util.spec_from_file_location(
 )
 D = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(D)
+_span_spec = importlib.util.spec_from_file_location(
+    "entry_span_primitives", Path(__file__).with_name("check-bpf-map-defs.py")
+)
+SPAN = importlib.util.module_from_spec(_span_spec)
+_span_spec.loader.exec_module(SPAN)
 SCHEMA = "p11scope-entry-object/v1"
 BASE_FIELDS = {3, 6, 7, 8, 9, 10, 11}
 LOAD = re.compile(r"([rw]\d+) = \*\(u(8|16|32|64) \*\)\(r(\d+) ([+-]) 0x([0-9a-f]+)\)")
@@ -313,35 +318,37 @@ DESTINATIONS = {6: (8, 8), 7: (0x10, 8), 10: (0x28, 8),
                 "join": (0x58, 8), "get": (0x30, 8), 16: (0x104, 4)}
 LP64_OFFSETS = (0x70, 0x68, 0x60, 0x58, 0x48, 0x40)
 LP64_READS = {
-    6: ([1099, 977, 1103, 1069, 1101, 1064], 1079),
-    7: ([1152, 1110, 1156, 1121, 1154, 1116], 1131),
-    10: ([1205, 1164, 1209, 1176, 1207, 1171], 1186),
-    11: ([1265, 1221, 1269, 1236, 1267, 1227], 1246),
-    8: ([1548, 1453, 1288, 1372, 1301, 1377], 1324),
-    9: ([1368, 1380, 1281, 1370, 1295, 1375], 1312),
-    "join": ([1530, 1427, 1536, 1466, 1533, 1443], 1478),
-    "get": ([1539, 1436, 1545, 1486, 1542, 1450], 1498),
+    6: ([1033, 908, 1037, 1000, 1035, 995], 1013),
+    7: ([1089, 1044, 1093, 1055, 1091, 1050], 1068),
+    10: ([1145, 1101, 1149, 1113, 1147, 1108], 1126),
+    11: ([1207, 1160, 1211, 1175, 1209, 1166], 1188),
+    8: ([1546, 1411, 1230, 1320, 1243, 1325], 1272),
+    9: ([1316, 1328, 1223, 1318, 1237, 1323], 1257),
+    16: ([1405, 1421, 1367, 1407, 1373, 1409], 1386),
+    "join": ([1528, 1432, 1534, 1460, 1531, 1447], 1474),
+    "get": ([1537, 1440, 1543, 1482, 1540, 1454], 1496),
 }
-IA32_READS = {6: 1788, 7: 1818, 10: 1850, 11: 1962,
-              8: 2051, 9: 1997, "join": 2202, "get": 2236}
-LP64_DISPATCH = {6: (971,), 7: (1105,), 10: (1158,), 11: (1216,),
-                 8: (1272, 1283), 9: (1275, 1276), "join": (1422,), "get": (1431,)}
-IA32_DISPATCH = {6: (1773,), 7: (1803,), 10: (1835,), 11: (1947,),
-                 8: (1979, 2037), 9: (1981,), "join": (2186,), "get": (2220,)}
+IA32_READS = {6: 1774, 7: 1863, 10: 1886, 11: 1913,
+              8: 1961, 9: 1938, 16: 2021, "join": 2051, "get": 2074}
+LP64_DISPATCH = {6: (902,), 7: (1039,), 10: (1095,), 11: (1155,),
+                 8: (1214, 1225), 9: (1217, 1218), 16: (1342, 1362),
+                 "join": (1427,), "get": (1435,)}
+IA32_DISPATCH = {6: (1771,), 7: (1860,), 10: (1884,), 11: (1911,),
+                 8: (1934,), 9: (1936,), 16: (2000,), "join": (2048,), "get": (2071,)}
 SCALAR_CALLS = {
-    "default": {978: 6, 991: 7, 1004: 10, 1020: 11, 1105: 8,
-                1138: 9, 1185: 16, 1356: "join", 1370: "get"},
-    "p11_entry_template": {2404: 6, 2417: 7, 2429: 10, 2446: 11,
-                           2462: 9, 2553: 8, 2604: 12, 2615: 13},
-    "p11_entry_template_pair": {2883: 6, 2896: 7, 2908: 10, 2925: 11,
-                                2941: 9, 3032: 8, 3083: 12, 3094: 13},
-    "p11_entry_template_types": {3493: 6, 3506: 7, 3518: 10, 3535: 11,
-                                 3551: 9, 3642: 8, 3693: 12, 3704: 13},
-    "p11_entry_template_second": {3302: 14, 3314: 15},
+    "default": {909: 6, 922: 7, 935: 10, 951: 11, 1036: 8,
+                1069: 9, 1116: 16, 1287: "join", 1301: "get"},
+    "p11_entry_template": {2328: 6, 2341: 7, 2353: 10, 2370: 11,
+                           2386: 9, 2477: 8, 2528: 12, 2539: 13},
+    "p11_entry_template_pair": {2807: 6, 2820: 7, 2832: 10, 2849: 11,
+                                2865: 9, 2956: 8, 3007: 12, 3018: 13},
+    "p11_entry_template_types": {3417: 6, 3430: 7, 3442: 10, 3459: 11,
+                                 3475: 9, 3566: 8, 3617: 12, 3628: 13},
+    "p11_entry_template_second": {3226: 14, 3238: 15},
 }
-SEMANTIC_INSERT = {"default": 1163, "p11_entry": 1398, "p11_entry_ia32": 2022,
-                   "p11_entry_template": 2648, "p11_entry_template_pair": 3127,
-                   "p11_entry_template_types": 3741}
+SEMANTIC_INSERT = {"default": 1094, "p11_entry": 1347, "p11_entry_ia32": 2005,
+                   "p11_entry_template": 2572, "p11_entry_template_pair": 3051,
+                   "p11_entry_template_types": 3665}
 BYTE_DOMAIN = frozenset(range(256))
 BRANCH = re.compile(r"if ([rw]\d+) (==|!=|s>|>|s>=|>=|<|<=) ([rw]\d+|-?0x[0-9a-f]+) goto [+-]0x[0-9a-f]+")
 
@@ -469,6 +476,15 @@ class SinkProof:
                 else:
                     allowed |= {(self.start[1], 8), (self.start[1]+8, 8)}
                 require((pointer[1], int(match[1])//8) in allowed, error("callee START/Option write footprint"))
+            source = value(before, match[5])
+            if pointer and pointer[0] == "stack" and source \
+                    and source[0] == "read_result":
+                if before.get(("read_ok", source[1])):
+                    state[("stack", pointer[1], int(match[1])//8)] = self.scalar(width=32)
+                    self.captured(state)
+                else:
+                    state[("stack", pointer[1], int(match[1])//8)] = \
+                        ("candidate", source[1], source[2], 32)
         if self.effect_start and ("atomic" in text or "xchg" in text or text.startswith("lock ")):
             match = ATOMIC_POINTER.search(text) or EXCHANGE_POINTER.search(text)
             pointer = address(before, *match.groups()[1:]) if match else None
@@ -497,8 +513,9 @@ class SinkProof:
                     self.captured(state)
             if pc in self.reads:
                 index = self.reads[pc]
-                require(self.abi == 0 and pointer == ("context", LP64_OFFSETS[index]) and width == "64"
-                        and self.domain(before, self.field) == {index}, error("scalar-read LP64 field/index/context provenance"))
+                require(self.abi == 0 and pointer == ("context", LP64_OFFSETS[index])
+                        and width == "64" and self.domain(before, self.field) == {index},
+                        error("scalar-read LP64 field/index/context provenance"))
                 state[reg(dst)] = self.scalar()
                 self.captured(state)
                 self.read_witnesses.add(index)
@@ -561,14 +578,24 @@ class SinkProof:
                 state[("stack", pointer[1]+8, 8)] = ("candidate", pc, field, 32 if self.abi else 64)
             else:
                 state[("stack", pointer[1], 8)] = ("constant", 0)
-        if pc in self.helpers:
+        if pc in self.helpers and target == "p11_read_ia32_arg":
             field = self.helpers[pc]
-            require(pc in consumer.helper and text == "call 0x70", error("scalar-read user helper missing"))
-            source = before.get("r3")
+            require(self.abi == 1,
+                    error("ia32 scalar boundary used outside ia32 capture"))
+            require(before.get("r1") == ("rsp", 64, 0),
+                    error("ia32 scalar boundary stack pointer"))
+            index = before.get("r2")
+            require(index == ("field", field),
+                    error("ia32 scalar boundary descriptor index"))
+            state["r0"] = ("read_result", pc, field)
+        elif pc in self.helpers:
+            field = self.helpers[pc]
             domain = self.domain(before, field)
             expected = ("arg_address", ("stride", field, 4, 4, 0xfc)) if self.abi else ("rsp", 64, 8)
+            source = before.get("r3")
+            require(pc in consumer.helper and text == "call 0x70", error("scalar-read user helper missing"))
             require(source == expected and domain <= set(range(7)) and (self.abi or domain == {6}),
-                    error(f"scalar-read RSP/index/stride source {source}, domain {sorted(domain)}"))
+                    error("scalar-read RSP/index/stride source"))
             require(before.get(("span", source)) is True, error("scalar-read complete address span not proved"))
             size, output = before.get("r2"), before.get("r1")
             require(size == ("constant", 4 if self.abi else 8), error("scalar-read helper width"))
@@ -597,16 +624,18 @@ class SinkProof:
         if target == "p11_owner_start_insert":
             state["r0"] = ("insert_result", pc)
         if target.endswith("capture_async_target"):
-            require(self.mode == 0 and before.get("r1") == ("context", 0)
-                    and before.get("r2") == ("field", 16)
-                    and before.get("r3") == ("constant", self.abi)
-                    and before.get("r4") == self.start, error("async target field/layout/START boundary"))
             if self.role == 16:
+                require(self.mode == 0 and before.get("r1") == self.scalar(16)
+                        and before.get("r2") == self.start,
+                        error(f"async target descriptor pointer/START boundary: "
+                              f"pointer={before.get('r1')} START={before.get('r2')}"))
                 # Conditional-success summary of the independently checked
                 # callee. Only its successful selection creates this obligation.
                 state[("stack", self.start[1]+0x104, 4)] = ("selected", 16)
                 self.captured(state)
+                self.boundaries.add("async_name")
         if text == "call 0x72" and self.role == 16:
+            require(pc in consumer.helper, error("async string read requires genuine helper provenance"))
             require(before.get("r3") == self.scalar(16) and before.get(("nonnull",)) is True
                     and before.get("r2") == ("constant", 29), error("async name pointer/nonzero/read bound"))
             output = before.get("r1")
@@ -713,6 +742,19 @@ class SinkProof:
                 elif left and right and left[0] == "descriptor" and right == ("constant", 0):
                     if zero_taken is not None and taken == zero_taken:
                         continue
+                elif right and right[0] == "read_result" \
+                        and left == ("constant", 1 << 32) and op == ">":
+                    if taken:
+                        domain = self.domain(before, right[2]) & frozenset(range(7))
+                        if not domain:
+                            continue
+                        state[("domain", right[2])] = domain
+                        state[("read_ok", right[1])] = True
+                        self.read_witnesses |= domain
+                        for key, fact in list(state.items()):
+                            if fact == right:
+                                state[key] = self.scalar(width=32)
+                        self.captured(state)
                 elif left and right and left[0] in ("option", "read_result", "insert_result") and right[0] == "constant":
                     require(op in ("==", "!=") and right[1] in ((0, 1) if left[0] == "option" else (0,)),
                             self.fail(consumer, pc, "unsupported success comparison"))
@@ -730,7 +772,11 @@ class SinkProof:
                             # Invocation alone is not evidence of a usable
                             # argument. In particular, indices 0..5 must not
                             # hide a deleted LP64 index-6 success branch.
-                            self.read_witnesses |= self.domain(before, left[2])
+                            domain = self.domain(before, left[2]) & frozenset(range(7))
+                            if not domain:
+                                continue
+                            state[("domain", left[2])] = domain
+                            self.read_witnesses |= domain
                         for key, fact in list(state.items()):
                             if isinstance(fact, tuple) and fact[:2] == ("candidate", left[1]):
                                 state[key] = ("scalar", fact[2], fact[3])
@@ -765,6 +811,9 @@ class SinkProof:
                         state[("string_low",)] = True
                     if left == ("constant", 29) and taken:
                         state[("string_high",)] = True
+                if left and left[0] == "string_result" and op == "s>" \
+                        and right == ("constant", 28) and not taken:
+                    state[("string_high",)] = True
             yield successor, state
 
     def finish(self, consumer):
@@ -781,30 +830,81 @@ class SinkProof:
 
 
 def scalar_body_contract(internal_blocks, internal_calls, variant):
+    # The scalar-return summary depends on normalization of the supplied RSP,
+    # independently of the index normalization also present in this body.
+    require("p11_read_ia32_arg" in internal_blocks, "missing ia32 scalar reader")
+    reader = D.instructions(internal_blocks["p11_read_ia32_arg"])
+    pointer_writes = [text for _, text in reader if re.match(r"[rw]3 ", text)]
+    require(reader[0][1] == "r3 = r1"
+            and pointer_writes == ["r3 = r1", "r3 <<= 0x20", "r3 >>= 0x20", "r3 += r2"],
+            "ia32 scalar reader stack-pointer normalization/address provenance")
+    span = [pc for pc, text in reader if re.fullmatch(r"if r3 > r1 goto .*", text)]
+    user_reads = [pc for pc, text in reader if text == "call 0x70"]
+    require(len(span) == len(user_reads) == 1 and span[0] < user_reads[0],
+            "ia32 scalar reader requires full-width address span before read")
+    reader_consumer = Consumer(".text", "p11_read_ia32_arg", internal_blocks["p11_read_ia32_arg"],
+                               internal_calls.get("p11_read_ia32_arg", {}))
+    require(user_reads[0] in reader_consumer.helper, "ia32 reader span requires genuine user helper")
+    updates = {}
+    for pc, text in reader:
+        constant = re.fullmatch(r"([rw])0 = (-?0x[0-9a-f]+)(?: ll)?", text)
+        if constant:
+            updates[pc] = int(constant[2], 16) & ((1 << (32 if constant[1] == "w" else 64)) - 1)
+        elif re.match(r"[rw]0 ", text) or text.startswith("call "):
+            updates[pc] = None
+    SPAN.validate_ia32_span_paths(reader_consumer.graph, reader[0][0], span[0],
+        D.relative_target(span[0], reader_consumer.text[span[0]]), user_reads[0], updates,
+        {pc for pc, text in reader if text == "exit"})
     names = [name for name in internal_blocks if name.endswith("capture_scalar")]
     require(len(names) == 1, "scalar-read callee inventory")
     name = names[0]
     consumer = Consumer(".text", name, internal_blocks[name], internal_calls.get(name, {}))
-    delta = 252 if variant == "unsafe" else 0
-    reads = {pc+delta: index for index, pc in enumerate((938, 944, 900, 940, 906, 942))}
+    instructions = consumer.insns
+    helper_reads = [pc for pc, text in instructions if pc in consumer.helper and text == "call 0x70"]
+    require(len(helper_reads) == 1, "scalar-read LP64 user-helper inventory")
+    ia32_calls = [pc for pc, target in consumer.calls.items() if target == "p11_read_ia32_arg"]
+    require(len(ia32_calls) == 1, "scalar-read ia32 boundary inventory")
+    reads = {}
+    for pc, text in instructions:
+        match = LOAD.fullmatch(text)
+        if match and match[2] == "64" and match[3] == "2" and match[4] == "+":
+            offset = int(match[5], 16)
+            if offset in LP64_OFFSETS:
+                reads[pc] = LP64_OFFSETS.index(offset)
+    require(set(reads.values()) == set(range(6)), "scalar-read LP64 register-read inventory")
     for abi in (0, 1):
         proof = SinkProof(6, abi, True, ("stack", -0x1000), kind="scalar",
-                          reads=reads if abi == 0 else {}, helpers={(890 if abi else 918)+delta: 6})
+                          reads=reads if abi == 0 else {},
+                          helpers={(ia32_calls[0] if abi else helper_reads[0]): 6})
         proof.effect_start = ("stack", -0x2000)
         initial = {"r1": proof.start, "r2": ("context", 0), "r3": ("field", 6),
                    "r4": ("constant", abi), "r5": ("stack", -0x2000), "r10": ("stack", 0),
                    ("domain", 6): BYTE_DOMAIN}
         consumer.facts(initial, proof)
-    if variant == "unsafe":
-        names = [name for name in internal_blocks if name.endswith("capture_async_target")]
-        require(len(names) == 1, "final-sink async callee inventory")
+    names = [name for name in internal_blocks if name.endswith("capture_async_target")]
+    require(len(names) <= 1, "final-sink async callee inventory")
+    if names:
         name = names[0]
+        pending, reached = [name], set()
+        while pending:
+            caller = pending.pop()
+            for _, pc, text in D.instruction_entries(internal_blocks[caller]):
+                if re.search(r"\bcall ", text) and not text.startswith("85 00 "):
+                    require(pc in internal_calls.get(caller, {}),
+                            f"final-sink async callee unresolved internal call: {caller}:{pc}")
+            for target in internal_calls.get(caller, {}).values():
+                if target not in reached:
+                    reached.add(target)
+                    pending.append(target)
+        require(not any(target.endswith("capture_scalar") or target == "p11_read_ia32_arg"
+                        for target in reached),
+                "final-sink async callee reaches scalar/ia32 reader")
         consumer = Consumer(".text", name, internal_blocks[name], internal_calls.get(name, {}))
         for abi in (0, 1):
-            proof = SinkProof(16, abi, True, ("stack", -0x1000), calls={1208: 16}, kind="async")
+            proof = SinkProof(16, abi, True, ("stack", -0x1000), kind="async")
             proof.effect_start = proof.start
-            initial = {"r1": ("context", 0), "r2": ("field", 16), "r3": ("constant", abi),
-                       "r4": proof.start, "r10": ("stack", 0), ("domain", 16): BYTE_DOMAIN}
+            initial = {"r1": proof.scalar(16), "r2": proof.start,
+                       "r10": ("stack", 0), ("domain", 16): BYTE_DOMAIN}
             consumer.facts(initial, proof)
 
 
@@ -815,8 +915,28 @@ def final_sink_contract(consumer, variant, selectors, internal_blocks, internal_
         return retained_contract(consumer, variant, selectors)
     mode = {"p11_entry_template": 1, "p11_entry_template_pair": 3,
             "p11_entry_template_types": 2, "p11_entry_template_second": "second"}.get(name, 0)
-    start = (("owned", 3268, 0) if mode == "second" else
-             ("stack", -0x168 if variant == "default" else -0x130 if name == "p11_entry" else -0x128))
+    if mode == 0:
+        # Capture failure must continue through the lifecycle match and START
+        # insertion, even though it creates no successful-scalar obligation.
+        lifecycle = [pc for pc, text in consumer.insns
+                     if re.fullmatch(r"if r\d+ == 0xc goto .*", text)]
+        require(len(lifecycle) == 1, name + ": async lifecycle continuation inventory")
+        capture = (next(pc for pc, role in SCALAR_CALLS["default"].items() if role == 16)
+                   if variant == "default" else LP64_DISPATCH[16][1]
+                   if name == "p11_entry" else IA32_READS[16])
+        exits = {pc for pc, text in consumer.insns if text == "exit"}
+        require(not exits & D.reachable(consumer.graph, [capture], blocked={lifecycle[0]}),
+                name + ": async scalar failure bypasses lifecycle continuation")
+        require(not exits & D.reachable(consumer.graph, lifecycle, blocked={SEMANTIC_INSERT[key]}),
+                name + ": async lifecycle continuation bypasses START insertion")
+    if mode == "second":
+        owner_gets = [pc for pc, target in consumer.calls.items()
+                      if target == "p11_owner_start_get"]
+        require(len(owner_gets) == 1, name + ": retained START lookup inventory")
+        start = ("owned", owner_gets[0], 0)
+    else:
+        start = ("stack", -0x168 if variant == "default" else -0x130
+                 if name == "p11_entry" else -0x128)
     roles = ["template"] if mode == "second" else [6, 7, 10, 11, 8, 9]
     roles += [16, "join", "get"] if mode == 0 else ([] if mode == "second" else ["template"])
     for selector in selectors:

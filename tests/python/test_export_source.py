@@ -28,6 +28,15 @@ OFFLINE_TESTS = ROOT / "tests/python/test_offline_dependencies.py"
 EXPORT_FIXTURES = ROOT / "tests/fixtures/export-source"
 
 
+def extract_archive(archive: Path, destination: Path) -> subprocess.CompletedProcess[str]:
+    destination.mkdir(parents=True, exist_ok=True)
+    return subprocess.run(
+        ["tar", "--same-permissions", "--no-same-owner", "-xzf", str(archive),
+         "-C", str(destination)],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+
+
 def load_module(path: Path, name: str):
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
@@ -89,6 +98,7 @@ class ExportFixture:
                 output.addfile(member, io.BytesIO(content))
         tree = self.base / f"tree-{name}-{version}"
         tree.mkdir(mode=0o755)
+        tree.chmod(0o755)
         for relative, content in files.items():
             path = tree / relative
             path.write_bytes(content)
@@ -246,8 +256,7 @@ class ExportSourceTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         extracted = self.base / f"{name} extraction"
         extracted.mkdir()
-        unpacked = subprocess.run(["tar", "-xzf", str(archive), "-C", str(extracted)],
-                                  text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        unpacked = extract_archive(archive, extracted)
         self.assertEqual(unpacked.returncode, 0, unpacked.stderr)
         return extracted / "pkcs11-scope-source"
 
@@ -305,10 +314,11 @@ class ExportSourceTests(unittest.TestCase):
         extracted = self.base / "extracted"
         with tarfile.open(first, "r:gz") as archive:
             names = archive.getnames()
-            archive.extractall(extracted, filter="data")
+        unpacked = extract_archive(first, extracted)
+        self.assertEqual(unpacked.returncode, 0, unpacked.stderr)
         ordinary = self.base / "ordinary"
-        with tarfile.open(second, "r:gz") as archive:
-            archive.extractall(ordinary)
+        unpacked = extract_archive(second, ordinary)
+        self.assertEqual(unpacked.returncode, 0, unpacked.stderr)
         self.assertFalse(any("/.git/" in f"/{name}/" for name in names))
         self.assertFalse(any(name.endswith("/ignored.out") for name in names))
         self.assertFalse(any("/third-party/src/" in f"/{name}/" for name in names))
@@ -547,10 +557,7 @@ class ExportSourceTests(unittest.TestCase):
                 0o755,
             )
         extracted.mkdir()
-        unpacked = subprocess.run(
-            ["tar", "-xzf", str(first), "-C", str(extracted)], text=True,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
+        unpacked = extract_archive(first, extracted)
         self.assertEqual(unpacked.returncode, 0, unpacked.stderr)
         source = extracted / "pkcs11-scope-source"
         manifest = json.loads((source / EXPORT_MANIFEST).read_text())
@@ -807,8 +814,7 @@ class ExportSourceTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         pristine = self.base / "validator pristine"
         pristine.mkdir()
-        unpacked = subprocess.run(["tar", "-xzf", str(archive), "-C", str(pristine)],
-                                  text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        unpacked = extract_archive(archive, pristine)
         self.assertEqual(unpacked.returncode, 0, unpacked.stderr)
         pristine_source = pristine / "pkcs11-scope-source"
         cargo_home = self.base / "validator cargo home"
@@ -842,7 +848,8 @@ class ExportSourceTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         extracted = self.base / "custody extraction"
         extracted.mkdir()
-        subprocess.run(["tar", "-xzf", str(archive), "-C", str(extracted)], check=True)
+        unpacked = extract_archive(archive, extracted)
+        self.assertEqual(unpacked.returncode, 0, unpacked.stderr)
         source = extracted / "pkcs11-scope-source"
         cargo_home = self.base / "custody cargo home"
         cargo_home.mkdir(mode=0o700)
@@ -968,6 +975,7 @@ class ExportSourceTests(unittest.TestCase):
         self.assert_refused(absent_require, "required prepared output is missing")
         prepared_root = source / "third-party/src"
         prepared_root.mkdir(mode=0o755)
+        prepared_root.chmod(0o755)
         empty_forbid = self.validate_full(source, cargo_home)
         self.assert_refused(empty_forbid, "prepared output is forbidden")
         prepared_root.rmdir()

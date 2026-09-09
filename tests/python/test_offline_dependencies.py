@@ -167,6 +167,7 @@ class OfflineFixture:
         self._archive(self.archive)
         expected = temporary / "expected"
         expected.mkdir(mode=0o755)
+        expected.chmod(0o755)
         (expected / "Cargo.toml").write_text(
             "[package]\nname = 'demo'\nversion = '1.0.0'\n", encoding="utf-8"
         )

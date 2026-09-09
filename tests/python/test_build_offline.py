@@ -22,6 +22,15 @@ FIXTURES = REPOSITORY / "tests/fixtures/build-offline"
 OFFLINE_TESTS = REPOSITORY / "tests/python/test_offline_dependencies.py"
 
 
+def extract_archive(archive: Path, destination: Path) -> subprocess.CompletedProcess[str]:
+    destination.mkdir(parents=True, exist_ok=True)
+    return subprocess.run(
+        ["tar", "--same-permissions", "--no-same-owner", "-xzf", str(archive),
+         "-C", str(destination)],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+
+
 def load_module(path, name):
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
@@ -525,8 +534,7 @@ class BuildOfflineTests(unittest.TestCase):
         self.assertEqual(export.returncode, 0, export.stderr)
         extraction = base / "extraction"
         extraction.mkdir()
-        unpack = subprocess.run(["tar", "-xzf", str(archive), "-C", str(extraction)],
-                                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        unpack = extract_archive(archive, extraction)
         self.assertEqual(unpack.returncode, 0, unpack.stderr)
         source = extraction / "pkcs11-scope-source"
         tools = base / "recipient tools"

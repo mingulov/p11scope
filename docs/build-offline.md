@@ -26,8 +26,18 @@ can import the helper:
 Python 3.11 and newer provide `tomllib` in the standard library and do not
 need `python3-tomli`.
 
-Extract the full export, change to its top-level directory, and choose a new,
-canonical absolute work path outside the extracted tree:
+Extract the full export into a private temporary parent, preserving the
+recorded directory modes and rejecting archive ownership changes:
+
+```sh
+umask 077
+mkdir -m 700 /absolute/export-parent
+tar --same-permissions --no-same-owner -xzf /absolute/source-export.tar.gz \
+  -C /absolute/export-parent
+```
+
+Change to the extracted top-level directory and choose a new, canonical
+absolute work path outside it:
 
 ```sh
 sh scripts/build-offline.sh /absolute/new/private-work

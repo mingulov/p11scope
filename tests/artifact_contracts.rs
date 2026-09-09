@@ -8373,3 +8373,11 @@ fn offline_dependencies_bind_complete_sources_and_final_inputs() {
         "OfflineDependenciesTests",
     );
 }
+
+#[test]
+fn capability_driver_binds_prepared_dependencies_after_cleanup() {
+    run_native_python_suite(
+        "tests/python/test_capability_prepared_dependencies.py",
+        "CapabilityPreparedDependenciesTests",
+    );
+}

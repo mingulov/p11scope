@@ -8299,16 +8299,11 @@ fn the_uretprobe_hazard_row_is_not_a_capability_tier_input() {
     );
 }
 
-#[test]
-fn prepared_release_drivers_bind_admission_and_finalization() {
+fn run_native_python_suite(script: &str, class: &str) {
     let output = Command::new("python3")
-        .args([
-            "-I",
-            "tests/python/test_prepared_release_drivers.py",
-            "PreparedReleaseDriverTests",
-        ])
+        .args(["-I", script, class])
         .output()
-        .expect("run the complete native prepared release-driver suite");
+        .expect("run the complete native Python suite");
     let report = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -8316,7 +8311,7 @@ fn prepared_release_drivers_bind_admission_and_finalization() {
     );
     assert!(
         output.status.success(),
-        "prepared release-driver suite: {report}"
+        "native suite {script}::{class}: {report}"
     );
     let count = report
         .lines()
@@ -8330,6 +8325,22 @@ fn prepared_release_drivers_bind_admission_and_finalization() {
         .unwrap_or(0);
     assert!(
         count > 0 && !report.contains("skipped="),
-        "prepared release-driver suite must run nonempty without skips: {report}"
+        "native suite {script}::{class} must run nonempty without skips: {report}"
+    );
+}
+
+#[test]
+fn prepared_release_drivers_bind_admission_and_finalization() {
+    run_native_python_suite(
+        "tests/python/test_prepared_release_drivers.py",
+        "PreparedReleaseDriverTests",
+    );
+}
+
+#[test]
+fn prepared_four_callers_bind_admission_build_handoff_and_finalization() {
+    run_native_python_suite(
+        "tests/python/test_prepared_four_callers.py",
+        "PreparedFourCallersTests",
     );
 }

@@ -338,7 +338,13 @@ task4_prepare_root() {
 }
 
 task4_digest() { sha256sum "$1" | awk '{print $1}'; }
-task4_snapshot() { git ls-files -z | sort -z | xargs -0 sha256sum; }
+task4_snapshot() {
+    [ "$#" -eq 1 ] || return 2
+    case $1 in initial|final) ;; *) return 2 ;; esac
+    p11scope_prepared_snapshot "$P11SCOPE_PREPARED_PYTHON" \
+        "$TASK4_ROOT/artifacts/oracle.source.$1" \
+        "$TASK4_PREPARED_PREFIX.$1.ledger.sha256"
+}
 task4_fact() { printf '%s\t%s\n' "$1" "$2" >> "$TASK4_FACTS"; }
 
 task4_sibling_snapshot() {
@@ -389,8 +395,18 @@ task4_validate_receipt() {
         [ "$(task4_digest "$ORACLE_CGROUP_HELPER" 2>/dev/null)" = "$TASK4_CGROUP_HELPER_HASH" ] || tvr_result=1
         [ "$(task4_digest "$ORACLE_LIFECYCLE_FIXTURE" 2>/dev/null)" = "$TASK4_LIFECYCLE_FIXTURE_HASH" ] || tvr_result=1
         [ "$(task4_digest "$ORACLE_SUDO_FIXTURE" 2>/dev/null)" = "$TASK4_SUDO_FIXTURE_HASH" ] || tvr_result=1
-        task4_snapshot > "$TASK4_ROOT/artifacts/source.end.tsv" || tvr_result=1
-        cmp -s "$TASK4_ROOT/artifacts/source.start.tsv" "$TASK4_ROOT/artifacts/source.end.tsv" || tvr_result=1
+        if [ "${TASK4_PREPARED_ADMITTED-0}" -eq 1 ]; then
+            if "$P11SCOPE_PREPARED_PYTHON" -I scripts/prepared-dependency-evidence.py \
+                recheck --prefix "$TASK4_PREPARED_PREFIX"; then
+                task4_snapshot final > "$TASK4_ROOT/artifacts/source.end.tsv" || tvr_result=1
+                cmp -s "$TASK4_ROOT/artifacts/source.start.tsv" \
+                    "$TASK4_ROOT/artifacts/source.end.tsv" || tvr_result=1
+            else
+                tvr_result=1
+            fi
+        else
+            tvr_result=1
+        fi
         [ -s "$TASK4_ROOT/artifacts/capture.json" ] || tvr_result=1
         [ -s "$TASK4_ROOT/artifacts/checker.log" ] || tvr_result=1
     fi
@@ -476,6 +492,8 @@ task4_receipt_run() {
     TASK4_SUBSET_HASH= TASK4_WORKLOAD_HASH= TASK4_CGROUP_HELPER_HASH=
     TASK4_LIFECYCLE_FIXTURE_HASH= TASK4_SUDO_FIXTURE_HASH=
     TASK4_LOCK_ID= TASK4_SIBLING_BASELINE=0
+    TASK4_PREPARED_ADMITTED=0
+    TASK4_PREPARED_PREFIX=$TASK4_ROOT/artifacts/oracle.prepared
     TASK4_RECEIPT_STARTTIME=$(process_starttime $$) || exit 77
     ORACLE_BODY_COMPLETE=0 ORACLE_LAUNCH_ATTEMPTED=0 ORACLE_CGROUP_PINNED=0
     ORACLE_PRODUCERS_QUIESCENT=0 ORACLE_ARTIFACTS_RECLAIMED=0
@@ -514,8 +532,6 @@ task4_receipt_run() {
     TASK4_CGROUP_HELPER_HASH=$(task4_digest "$ORACLE_CGROUP_HELPER")
     TASK4_LIFECYCLE_FIXTURE_HASH=$(task4_digest "$ORACLE_LIFECYCLE_FIXTURE")
     TASK4_SUDO_FIXTURE_HASH=$(task4_digest "$ORACLE_SUDO_FIXTURE")
-    task4_snapshot > "$TASK4_ROOT/artifacts/source.start.tsv" || exit 77
-    TASK4_SOURCE_HASH=$(task4_digest "$TASK4_ROOT/artifacts/source.start.tsv")
     task4_fact started_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; task4_fact argv "$0 $1"; task4_fact cwd "$(pwd -P)"
     task4_fact uid_gid "$(id -u):$(id -g)"; task4_fact kernel "$(uname -srmo)"; task4_fact head "$TASK4_HEAD"; task4_fact tree "$TASK4_TREE"
     task4_fact root_identity "$TASK4_ROOT_ID"; task4_fact artifacts_identity "$TASK4_ARTIFACTS_ID"; task4_fact work_identity "$TASK4_WORK_ID"
@@ -526,8 +542,20 @@ task4_receipt_run() {
     task4_fact cgroup_helper_sha256 "$TASK4_CGROUP_HELPER_HASH"
     task4_fact lifecycle_fixture_sha256 "$TASK4_LIFECYCLE_FIXTURE_HASH"
     task4_fact sudo_fixture_sha256 "$TASK4_SUDO_FIXTURE_HASH"
+    for tool in python3 rustup systemd-run systemctl sudo sha256sum timeout git sort xargs; do command -v "$tool" >/dev/null || exit 77; done
+    . scripts/prepared-dependency-tools.sh
+    . scripts/prepared-dependency-snapshot.sh
+    p11scope_prepared_tools_select "$(command -v python3)" "$(command -v rustup)" || exit 77
+    "$P11SCOPE_PREPARED_PYTHON" -I scripts/prepared-dependency-evidence.py capture \
+        --prefix "$TASK4_PREPARED_PREFIX" \
+        --stable-cargo "$P11SCOPE_PREPARED_STABLE_CARGO" \
+        --stable-rustc "$P11SCOPE_PREPARED_STABLE_RUSTC" \
+        --bpf-cargo "$P11SCOPE_PREPARED_BPF_CARGO" \
+        --bpf-rustc "$P11SCOPE_PREPARED_BPF_RUSTC" || exit 77
+    TASK4_PREPARED_ADMITTED=1
+    task4_snapshot initial > "$TASK4_ROOT/artifacts/source.start.tsv" || exit 77
+    TASK4_SOURCE_HASH=$(task4_digest "$TASK4_ROOT/artifacts/source.start.tsv")
     task4_fact source_input_ledger_sha256 "$TASK4_SOURCE_HASH"
-    for tool in cargo python3 systemd-run systemctl sudo sha256sum timeout; do command -v "$tool" >/dev/null || exit 77; done
     sudo -n true >/dev/null 2>&1 || exit 77
     [ -f "$MODULE" ] || exit 77
     [ ! -e "$PKCS11_CHECK_DIR/.pkcs11-check-isolation-state.json" ] \
@@ -653,8 +681,10 @@ fi
 
 oracle_build_product() {
     echo "=== build product ==="
-    timeout --signal=TERM --kill-after=10s 900s \
-        cargo +1.88 build --locked --release --workspace --target-dir "$PRODUCT"
+    RUSTC="$P11SCOPE_PREPARED_STABLE_RUSTC" \
+        timeout --signal=TERM --kill-after=10s 900s \
+        "$P11SCOPE_PREPARED_STABLE_CARGO" build --locked --offline --release \
+        --workspace --target-dir "$PRODUCT"
 }
 
 oracle_setup_token() {

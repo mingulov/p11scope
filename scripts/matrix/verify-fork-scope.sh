@@ -57,7 +57,13 @@ task4_prepare_root() {
 }
 
 task4_digest() { sha256sum "$1" | awk '{print $1}'; }
-task4_snapshot() { git ls-files -z | sort -z | xargs -0 sha256sum; }
+task4_snapshot() {
+    [ "$#" -eq 1 ] || return 2
+    case $1 in initial|final) ;; *) return 2 ;; esac
+    p11scope_prepared_snapshot "$P11SCOPE_PREPARED_PYTHON" \
+        "$TASK4_ROOT/artifacts/fork.source.$1" \
+        "$TASK4_PREPARED_PREFIX.$1.ledger.sha256"
+}
 task4_fact() { printf '%s\t%s\n' "$1" "$2" >> "$TASK4_FACTS"; }
 
 task4_finalize() {
@@ -73,8 +79,18 @@ task4_finalize() {
         git diff --quiet && git diff --cached --quiet || t4_result=1
         [ "$(task4_digest scripts/matrix/verify-fork-scope.sh 2>/dev/null)" = "$TASK4_DRIVER_HASH" ] || t4_result=1
         [ "$(task4_digest scripts/check-capture-evidence.py 2>/dev/null)" = "$TASK4_CHECKER_HASH" ] || t4_result=1
-        task4_snapshot > "$TASK4_ROOT/artifacts/source.end.tsv" || t4_result=1
-        cmp -s "$TASK4_ROOT/artifacts/source.start.tsv" "$TASK4_ROOT/artifacts/source.end.tsv" || t4_result=1
+        if [ "${TASK4_PREPARED_ADMITTED-0}" -eq 1 ]; then
+            if "$P11SCOPE_PREPARED_PYTHON" -I scripts/prepared-dependency-evidence.py \
+                recheck --prefix "$TASK4_PREPARED_PREFIX"; then
+                task4_snapshot final > "$TASK4_ROOT/artifacts/source.end.tsv" || t4_result=1
+                cmp -s "$TASK4_ROOT/artifacts/source.start.tsv" \
+                    "$TASK4_ROOT/artifacts/source.end.tsv" || t4_result=1
+            else
+                t4_result=1
+            fi
+        else
+            t4_result=1
+        fi
         [ -s "$TASK4_ROOT/artifacts/capture.json" ] || t4_result=1
         [ -s "$TASK4_ROOT/artifacts/checker.log" ] || t4_result=1
     fi
@@ -113,6 +129,8 @@ task4_receipt_run() {
     TASK4_ARTIFACTS_ID=$(stat -Lc %d:%i "$TASK4_ROOT/artifacts")
     TASK4_WORK_ID=$(stat -Lc %d:%i "$TASK4_ROOT/work")
     TASK4_HEAD= TASK4_TREE= TASK4_DRIVER_HASH= TASK4_CHECKER_HASH=
+    TASK4_PREPARED_ADMITTED=0
+    TASK4_PREPARED_PREFIX=$TASK4_ROOT/artifacts/fork.prepared
     trap task4_finalize EXIT INT TERM HUP
     [ ! -L "$TASK4_CAMPAIGN/.task4.lock" ] || exit 77
     exec 9>>"$TASK4_CAMPAIGN/.task4.lock"; chmod 600 "$TASK4_CAMPAIGN/.task4.lock"
@@ -123,18 +141,30 @@ task4_receipt_run() {
     TASK4_HEAD=$(git rev-parse HEAD) || exit 77; TASK4_TREE=$(git rev-parse 'HEAD^{tree}') || exit 77
     git diff --quiet && git diff --cached --quiet || exit 77
     TASK4_DRIVER_HASH=$(task4_digest scripts/matrix/verify-fork-scope.sh); TASK4_CHECKER_HASH=$(task4_digest scripts/check-capture-evidence.py)
-    task4_snapshot > "$TASK4_ROOT/artifacts/source.start.tsv" || exit 77
-    TASK4_SOURCE_HASH=$(task4_digest "$TASK4_ROOT/artifacts/source.start.tsv")
     task4_fact started_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; task4_fact argv "$0 $1"; task4_fact cwd "$(pwd -P)"
     task4_fact uid_gid "$(id -u):$(id -g)"; task4_fact kernel "$(uname -srmo)"; task4_fact head "$TASK4_HEAD"; task4_fact tree "$TASK4_TREE"
     task4_fact root_identity "$TASK4_ROOT_ID"; task4_fact artifacts_identity "$TASK4_ARTIFACTS_ID"; task4_fact work_identity "$TASK4_WORK_ID"
     task4_fact lock_identity "$TASK4_LOCK_ID"; task4_fact lock_holder "$$:$(process_starttime $$)"
     task4_fact driver_sha256 "$TASK4_DRIVER_HASH"; task4_fact checker_sha256 "$TASK4_CHECKER_HASH"
+    for tool in gcc python3 rustup capsh systemd-run sudo sha256sum git sort xargs; do command -v "$tool" >/dev/null || exit 77; done
+    . scripts/prepared-dependency-tools.sh
+    . scripts/prepared-dependency-snapshot.sh
+    p11scope_prepared_tools_select "$(command -v python3)" "$(command -v rustup)" || exit 77
+    "$P11SCOPE_PREPARED_PYTHON" -I scripts/prepared-dependency-evidence.py capture \
+        --prefix "$TASK4_PREPARED_PREFIX" \
+        --stable-cargo "$P11SCOPE_PREPARED_STABLE_CARGO" \
+        --stable-rustc "$P11SCOPE_PREPARED_STABLE_RUSTC" \
+        --bpf-cargo "$P11SCOPE_PREPARED_BPF_CARGO" \
+        --bpf-rustc "$P11SCOPE_PREPARED_BPF_RUSTC" || exit 77
+    TASK4_PREPARED_ADMITTED=1
+    task4_snapshot initial > "$TASK4_ROOT/artifacts/source.start.tsv" || exit 77
+    TASK4_SOURCE_HASH=$(task4_digest "$TASK4_ROOT/artifacts/source.start.tsv")
     task4_fact source_input_ledger_sha256 "$TASK4_SOURCE_HASH"
-    for tool in cargo gcc python3 capsh systemd-run sudo sha256sum; do command -v "$tool" >/dev/null || exit 77; done
     sudo -n true >/dev/null 2>&1 || exit 77
     [ -f "$MODULE" ] || exit 77
     P11SCOPE_TASK4_BODY=1 P11SCOPE_TASK4_WORK="$TASK4_ROOT/work" \
+        P11SCOPE_PREPARED_STABLE_CARGO="$P11SCOPE_PREPARED_STABLE_CARGO" \
+        P11SCOPE_PREPARED_STABLE_RUSTC="$P11SCOPE_PREPARED_STABLE_RUSTC" \
         /bin/sh "$0" > "$TASK4_ROOT/stdout.log" 2> "$TASK4_ROOT/stderr.log"
     t4_capture=$(find "$TASK4_ROOT/work" -type f -name '*observed*.json' -print | sort | head -n 1)
     [ -n "$t4_capture" ] || exit 1
@@ -258,6 +288,9 @@ if [ -z "${P11SCOPE_TASK4_BODY-}" ]; then
     exit 0
 fi
 [ "$#" -eq 0 ] || exit 2
+[ -n "${P11SCOPE_PREPARED_STABLE_CARGO-}" ] \
+    && [ -n "${P11SCOPE_PREPARED_STABLE_RUSTC-}" ] \
+    || { echo "prepared stable Cargo/rustc handoff required" >&2; exit 1; }
 command -v gcc >/dev/null || { echo "gcc required"; exit 1; }
 command -v softhsm2-util >/dev/null || { echo "softhsm2-util required"; exit 1; }
 command -v systemd-run >/dev/null || { echo "systemd-run required"; exit 1; }
@@ -288,7 +321,9 @@ cleanup() {
 . scripts/cleanup-traps.sh
 
 echo "=== build product + fork-harness ==="
-cargo +1.88 build --locked --release --workspace --target-dir "$PRODUCT"
+RUSTC="$P11SCOPE_PREPARED_STABLE_RUSTC" \
+    "$P11SCOPE_PREPARED_STABLE_CARGO" build --locked --offline --release --workspace \
+    --target-dir "$PRODUCT"
 P11SCOPE_BIN=$(realpath "$PRODUCT/release/p11scope")
 gcc -O0 -o "$WORK/fork-harness" scripts/matrix/fork-harness.c -ldl
 gcc -O0 -o "$WORK/harness" spike/harness.c -ldl

@@ -233,27 +233,16 @@ cleanup() {
 
 # Resolve only the selected installed tools; preparation and acquisition belong
 # outside this sealed caller. The helper retains these identities for recheck.
-resolve_executable() {
-    executable=$(readlink -f "$1") || return 1
-    case $executable in /*) ;; *) return 1 ;; esac
-    [ -f "$executable" ] && [ ! -L "$executable" ] && [ -x "$executable" ] || {
-        echo "prepared dependency tool refusal: not a regular executable: $1" >&2
-        return 1
-    }
-    printf '%s\n' "$executable"
-}
-selected_tool() {
-    selected=$(RUSTUP_AUTO_INSTALL=0 "$LANE14_RUSTUP" which --toolchain "$1" "$2") || return 1
-    resolve_executable "$selected"
-}
+. scripts/prepared-dependency-tools.sh
 LANE14_PYTHON=$(command -v python3) || exit 77
-LANE14_PYTHON=$(resolve_executable "$LANE14_PYTHON") || exit 77
 LANE14_RUSTUP=$(command -v rustup) || exit 77
-LANE14_RUSTUP=$(resolve_executable "$LANE14_RUSTUP") || exit 77
-LANE14_STABLE_CARGO=$(selected_tool 1.88 cargo) || exit 77
-LANE14_STABLE_RUSTC=$(selected_tool 1.88 rustc) || exit 77
-LANE14_BPF_CARGO=$(selected_tool nightly-2026-05-20 cargo) || exit 77
-LANE14_BPF_RUSTC=$(selected_tool nightly-2026-05-20 rustc) || exit 77
+p11scope_prepared_tools_select "$LANE14_PYTHON" "$LANE14_RUSTUP" || exit 77
+LANE14_PYTHON=$P11SCOPE_PREPARED_PYTHON
+LANE14_RUSTUP=$P11SCOPE_PREPARED_RUSTUP
+LANE14_STABLE_CARGO=$P11SCOPE_PREPARED_STABLE_CARGO
+LANE14_STABLE_RUSTC=$P11SCOPE_PREPARED_STABLE_RUSTC
+LANE14_BPF_CARGO=$P11SCOPE_PREPARED_BPF_CARGO
+LANE14_BPF_RUSTC=$P11SCOPE_PREPARED_BPF_RUSTC
 LANE14_PREPARED_PREFIX=$(readlink -f "$LANE14_ARTIFACTS") || exit 77
 LANE14_PREPARED_PREFIX=$LANE14_PREPARED_PREFIX/discover.prepared
 "$LANE14_PYTHON" -I scripts/prepared-dependency-evidence.py capture \

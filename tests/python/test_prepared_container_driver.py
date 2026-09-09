@@ -22,7 +22,7 @@ class DriverFixture:
         self.base = base
         self.evidence = EvidenceFixture(base)
         self.root = self.evidence.root
-        for name in ("verify-discover-containers.sh", "cleanup-traps.sh"):
+        for name in ("verify-discover-containers.sh", "cleanup-traps.sh", "prepared-dependency-tools.sh"):
             shutil.copy2(ROOT / "scripts" / name, self.root / "scripts" / name)
         self.bin = base / "bin"
         self.bin.mkdir()

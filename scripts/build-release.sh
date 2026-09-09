@@ -539,7 +539,7 @@ CARGO_HOME RUSTUP_HOME RUSTUP_TOOLCHAIN RUSTC_WRAPPER CC CFLAGS'
 # through the image, so neither is under the caller's PATH authority and
 # neither is a member. An incomplete inventory fails closed as "not found"
 # under the seal; it never falls back to the caller's PATH.
-TASK4_TOOL_INVENTORY='as awk bpf-linker bpftool cargo cat cc chmod cmp cp
+TASK4_TOOL_INVENTORY='as awk bpf-linker bpftool cargo cat cc chmod clang-18 cmp cp
 date dirname docker env file find flock gcc git grep head id jq ld ldd
 llvm-objcopy llvm-readelf ln ls mkdir mktemp mv python3 realpath rm rustup sed
 setpriv sh sha256sum sleep softhsm2-util sort stat sudo sync tail timeout touch

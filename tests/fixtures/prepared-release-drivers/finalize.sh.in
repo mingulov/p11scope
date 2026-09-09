@@ -55,6 +55,11 @@ if [ "$SCENARIO" != admission ]; then
         --prefix "$PREPARED_PREFIX" \
         --stable-cargo "$P11SCOPE_PREPARED_STABLE_CARGO" --stable-rustc "$P11SCOPE_PREPARED_STABLE_RUSTC" \
         --bpf-cargo "$P11SCOPE_PREPARED_BPF_CARGO" --bpf-rustc "$P11SCOPE_PREPARED_BPF_RUSTC"
+    if [ "$LANE" = release ]; then
+        unset P11SCOPE_PREPARED_PYTHON P11SCOPE_PREPARED_RUSTUP \
+            P11SCOPE_PREPARED_STABLE_CARGO P11SCOPE_PREPARED_STABLE_RUSTC \
+            P11SCOPE_PREPARED_BPF_CARGO P11SCOPE_PREPARED_BPF_RUSTC
+    fi
     PREPARED_ADMITTED=1
     if [ "$LANE" = release ]; then
         TASK4_PREPARED_ADMITTED=1

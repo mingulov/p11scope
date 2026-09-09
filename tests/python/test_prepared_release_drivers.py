@@ -13,6 +13,11 @@ ROOT = Path(__file__).resolve().parents[2]
 NATIVE = ROOT / "tests/fixtures/prepared-release-drivers"
 SEAL = runpy.run_path(str(ROOT / "tests/fixtures/release-seal/fixture.py"))
 FINALIZER = runpy.run_path(str(NATIVE / "harness.py"))["run_finalizer"]
+NEW_BUILD_CONTEXT = (
+    "P11SCOPE_PRODUCT_BUILD_MODE", "P11SCOPE_PREPARED_STABLE_CARGO",
+    "P11SCOPE_PREPARED_STABLE_RUSTC", "P11SCOPE_PREPARED_BPF_CARGO",
+    "P11SCOPE_PREPARED_BPF_RUSTC",
+)
 
 
 class PreparedReleaseDriverTests(unittest.TestCase):
@@ -152,7 +157,8 @@ class PreparedReleaseDriverTests(unittest.TestCase):
                                  "cargo": str(cargo), "rustc": str(rustc), "target": str(fixture.root / "work/target")})
 
     def test_early_release_refusals_do_not_require_new_helper_files(self):
-        for scenario in (*SEAL["BUILD_INPUT_VARIABLES"], "cargo-config", "missing-home", "forged", "tab-root"):
+        for scenario in (*SEAL["BUILD_INPUT_VARIABLES"], *NEW_BUILD_CONTEXT,
+                         "cargo-config", "missing-home", "forged", "tab-root"):
             with self.subTest(scenario=scenario):
                 fixture = self.fixture("release", "early-" + scenario)
                 for path in fixture.repo.iterdir():
@@ -165,7 +171,7 @@ class PreparedReleaseDriverTests(unittest.TestCase):
                     result = fixture.command(["git", "-C", str(fixture.repo), *args])
                     self.assertEqual(result.returncode, 0, result.stderr)
                 extra = {}
-                if scenario in SEAL["BUILD_INPUT_VARIABLES"]:
+                if scenario in (*SEAL["BUILD_INPUT_VARIABLES"], *NEW_BUILD_CONTEXT):
                     extra[scenario] = "/fixture/refused"
                     expected = "refusing inherited " + scenario
                 elif scenario == "cargo-config":
@@ -185,6 +191,39 @@ class PreparedReleaseDriverTests(unittest.TestCase):
                 self.assertIn(expected, result.stderr)
                 self.assertFalse(fixture.tripwire_log.exists())
                 self.assertEqual(self.events(fixture), [])
+
+    def test_release_static_build_forwards_exact_stable_and_bpf_tools(self):
+        fixture = self.fixture("release", "static build paths with spaces")
+        source = (fixture.repo / "scripts/build-release.sh").read_text()
+        start = 'CARGO_TARGET_DIR="$OFFICIAL_TARGET" \\\n'
+        end = 'P11SCOPE_STATIC=$OFFICIAL_TARGET/'
+        self.assertEqual(source.count(start), 1)
+        command = fixture.base / "static-build-command.sh"
+        command.write_text(source[source.index(start):source.index(end)])
+        cargo = fixture.base / "selected stable cargo"
+        shutil.copy2(NATIVE / "release-build-probe.py", cargo)
+        cargo.chmod(0o700)
+        tools = [cargo]
+        for name in ("selected stable rustc", "selected bpf cargo", "selected bpf rustc"):
+            path = fixture.base / name
+            fixture.inert(path)
+            tools.append(path)
+        record = fixture.base / "release-build.json"
+        result = fixture.command([
+            "/bin/sh", str(NATIVE / "release-root-build-launcher.sh"), str(command),
+            str(record), *(str(path) for path in tools),
+        ])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(record.read_text()), {
+            "argv": ["build", "--locked", "--offline", "--release",
+                     "--no-default-features", "--target", "x86_64-unknown-linux-musl",
+                     "--bin", "p11scope"],
+            "cargo_target_dir": str(fixture.base / "official target with spaces"),
+            "cargo": str(cargo.resolve()),
+            "rustflags": "-C target-feature=+crt-static",
+            "rustc": str(tools[1]), "bpf_cargo": str(tools[2]),
+            "bpf_rustc": str(tools[3]),
+        })
 
 
 if __name__ == "__main__":

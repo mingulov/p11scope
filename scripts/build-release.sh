@@ -172,7 +172,10 @@ supplied={"canary":str(paths["canary"]),"attach":str(paths["attach"])}
 mark(lane[17],all(value.startswith("/") for value in supplied.values())
      and all(not value.startswith("/") for value in legacy_defaults.values()))
 inherited=dict.fromkeys(("RUSTFLAGS","CARGO_ENCODED_RUSTFLAGS","CARGO_TARGET_DIR","CARGO_BUILD_TARGET",
-                         "CARGO_HOME","RUSTUP_HOME","RUSTUP_TOOLCHAIN","RUSTC_WRAPPER","CC","CFLAGS"),"")
+                         "CARGO_HOME","RUSTUP_HOME","RUSTUP_TOOLCHAIN","RUSTC_WRAPPER","CC","CFLAGS",
+                         "P11SCOPE_PRODUCT_BUILD_MODE","P11SCOPE_PREPARED_STABLE_CARGO",
+                         "P11SCOPE_PREPARED_STABLE_RUSTC","P11SCOPE_PREPARED_BPF_CARGO",
+                         "P11SCOPE_PREPARED_BPF_RUSTC"),"")
 def preflight_accepts(status,configs,env):
     return status=="" and not configs and not any(env.values())
 body_ran=False
@@ -521,12 +524,14 @@ task4_sysroot_closure() {
     printf '%s\t%s %s\n' "$t4_row" "$t4_sysroot" "$t4_tree"
 }
 
-# The build inputs Cargo, rustup, and the C toolchain read from the
-# environment. Any non-empty inherited value re-steers the official build away
-# from the recorded source tree without leaving a trace in the receipt, so the
-# driver refuses them outright and supplies only command-local values.
+# Cargo, rustup, the C toolchain, and the product-build handoff read these
+# inputs from the environment. Any non-empty inherited value can re-steer the
+# official build away from the recorded source tree without leaving a trace in
+# the receipt, so the driver refuses them and supplies only command-local values.
 TASK4_BUILD_INPUTS='RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_TARGET_DIR CARGO_BUILD_TARGET
-CARGO_HOME RUSTUP_HOME RUSTUP_TOOLCHAIN RUSTC_WRAPPER CC CFLAGS'
+CARGO_HOME RUSTUP_HOME RUSTUP_TOOLCHAIN RUSTC_WRAPPER CC CFLAGS
+P11SCOPE_PRODUCT_BUILD_MODE P11SCOPE_PREPARED_STABLE_CARGO P11SCOPE_PREPARED_STABLE_RUSTC
+P11SCOPE_PREPARED_BPF_CARGO P11SCOPE_PREPARED_BPF_RUSTC'
 
 # Every external command the receipt chain reaches, in LC_ALL=C order. The
 # chain runs sealed: the unsealed parent resolves each name once through the
@@ -947,9 +952,19 @@ rm -rf "$DIST"
 mkdir -p "$DIST"
 
 echo "=== release privacy gate ==="
+P11SCOPE_PRODUCT_BUILD_MODE=prepared \
+P11SCOPE_PREPARED_STABLE_CARGO="$T4_TOOLCHAIN_CARGO" \
+P11SCOPE_PREPARED_STABLE_RUSTC="$T4_TOOLCHAIN_RUSTC" \
+P11SCOPE_PREPARED_BPF_CARGO="$t4_nightly_cargo" \
+P11SCOPE_PREPARED_BPF_RUSTC="$t4_nightly_rustc" \
 P11SCOPE_TASK4_WORK="$CANARY_WORK" sh scripts/verify-canaries.sh
 
 echo "=== p11scope: dynamic-build attach correctness ==="
+P11SCOPE_PRODUCT_BUILD_MODE=prepared \
+P11SCOPE_PREPARED_STABLE_CARGO="$T4_TOOLCHAIN_CARGO" \
+P11SCOPE_PREPARED_STABLE_RUSTC="$T4_TOOLCHAIN_RUSTC" \
+P11SCOPE_PREPARED_BPF_CARGO="$t4_nightly_cargo" \
+P11SCOPE_PREPARED_BPF_RUSTC="$t4_nightly_rustc" \
 P11SCOPE_TASK4_WORK="$ATTACH_WORK" sh scripts/verify-attach-e2e.sh
 
 echo "=== p11scope: isolated safe-only official static build ==="
@@ -961,6 +976,8 @@ rm -rf "$OFFICIAL_TARGET"
 CARGO_TARGET_DIR="$OFFICIAL_TARGET" \
 RUSTFLAGS="-C target-feature=+crt-static" \
 RUSTC="$T4_TOOLCHAIN_RUSTC" \
+P11SCOPE_PREPARED_BPF_CARGO="$t4_nightly_cargo" \
+P11SCOPE_PREPARED_BPF_RUSTC="$t4_nightly_rustc" \
     "$T4_TOOLCHAIN_CARGO" build --locked --offline --release --no-default-features \
         --target x86_64-unknown-linux-musl --bin p11scope
 P11SCOPE_STATIC=$OFFICIAL_TARGET/x86_64-unknown-linux-musl/release/p11scope

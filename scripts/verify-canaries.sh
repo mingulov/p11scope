@@ -33,6 +33,9 @@ if [ "${1-}" = "--self-test" ]; then
     exit 0
 fi
 
+P11SCOPE_PRODUCT_BUILD_MODE=${P11SCOPE_PRODUCT_BUILD_MODE:-ordinary}
+. scripts/product-build.sh
+
 . scripts/lib.sh
 require_non_root_caller
 # The observer refuses to publish into a directory that has a group/world-writable
@@ -48,8 +51,6 @@ require_non_root_caller
 command -v gcc >/dev/null || { echo "gcc required"; exit 1; }
 command -v bpftool >/dev/null || { echo "bpftool required"; exit 1; }
 command -v python3 >/dev/null || { echo "python3 required"; exit 1; }
-sudo -n true 2>/dev/null || { echo "passwordless sudo required"; exit 1; }
-
 WPID=
 WORKLOAD_STARTTIME=
 SPID=
@@ -85,19 +86,23 @@ cleanup() {
 
 echo "=== build ==="
 rm -rf "$WORK/default-build" "$WORK/feature-build" "$WORK/helper-build"
-cargo +1.88 build --locked --release --workspace --target-dir "$WORK/default-build"
-cargo +1.88 build --locked --release --workspace --features unsafe-unvalidated-metadata \
+p11scope_product_build "$P11SCOPE_PRODUCT_BUILD_MODE" \
+    --release --workspace --target-dir "$WORK/default-build"
+p11scope_product_build "$P11SCOPE_PRODUCT_BUILD_MODE" \
+    --release --workspace --features unsafe-unvalidated-metadata \
     --target-dir "$WORK/feature-build"
 P11SCOPE_DEFAULT="$WORK/default-build/release/p11scope"
 P11SCOPE_FEATURE="$WORK/feature-build/release/p11scope"
 case $TARGET_BITS in
     32)
-        cargo +1.88 build --locked --release -p p11scope-discover \
+        p11scope_product_build "$P11SCOPE_PRODUCT_BUILD_MODE" \
+            --release -p p11scope-discover \
             --target i686-unknown-linux-gnu --target-dir "$WORK/helper-build"
         P11SCOPE_DISCOVER="$WORK/helper-build/i686-unknown-linux-gnu/release/p11scope-discover"
         ;;
     64) P11SCOPE_DISCOVER="$WORK/default-build/release/p11scope-discover" ;;
 esac
+sudo -n true 2>/dev/null || { echo "passwordless sudo required"; exit 1; }
 gcc "$TARGET_CC_FLAG" -std=c11 -O0 -Wall -Wextra -o "$WORK/canary_workload" \
     scripts/fixtures/canary_workload.c -ldl -pthread
 gcc "$TARGET_CC_FLAG" -shared -fPIC -Wall -Wextra -DPRIVACY_FIXTURE=1 \

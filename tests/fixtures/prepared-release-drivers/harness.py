@@ -33,7 +33,10 @@ def run_finalizer(fixture, scenario):
                      CONFIG=fixture.prepared.config_path, PREPARED_SOURCE=fixture.prepared.base.output / "src/lib.rs")
     environment = dict(os.environ)
     for name in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_TARGET_DIR", "CARGO_BUILD_TARGET",
-                 "CARGO_HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", "RUSTC_WRAPPER", "CC", "CFLAGS"):
+                 "CARGO_HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", "RUSTC_WRAPPER", "CC", "CFLAGS",
+                 "P11SCOPE_PRODUCT_BUILD_MODE", "P11SCOPE_PREPARED_STABLE_CARGO",
+                 "P11SCOPE_PREPARED_STABLE_RUSTC", "P11SCOPE_PREPARED_BPF_CARGO",
+                 "P11SCOPE_PREPARED_BPF_RUSTC"):
         environment.pop(name, None)
     overrides = {"PATH": str(fixture.fake_bin) + ":" + os.environ["PATH"], "HOME": str(fixture.home)}
     environment.update(overrides)

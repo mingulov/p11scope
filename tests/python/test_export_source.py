@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import builtins
 import hashlib
 import importlib.util
 import inspect
@@ -42,6 +43,7 @@ def load_module(path: Path, name: str):
 
 PREPARE = load_module(PREPARER, "export_test_preparer")
 OFFLINE_TEST_MODULE = load_module(OFFLINE_TESTS, "export_test_offline_fixture")
+EXPORT = load_module(EXPORTER, "export_test_exporter")
 
 
 class ExportFixture:
@@ -154,6 +156,32 @@ class ExportSourceTests(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         for needle in needles:
             self.assertIn(needle, result.stderr)
+
+    def test_offline_helper_missing_parser_is_named_export_refusal(self):
+        root = self.base / "loader"
+        (root / "scripts").mkdir(parents=True)
+        shutil.copy2(OFFLINE_TEST_MODULE.HELPER, root / "scripts/offline-dependencies.py")
+        original_import = builtins.__import__
+
+        def missing_parser(name, *args, **kwargs):
+            if name in {"tomllib", "tomli"}:
+                raise ModuleNotFoundError("missing parser", name=name)
+            return original_import(name, *args, **kwargs)
+
+        with mock.patch.object(builtins, "__import__", missing_parser):
+            with self.assertRaisesRegex(EXPORT.ExportError, "cannot load offline dependency helper"):
+                EXPORT._load_offline_helper(root)
+
+    def test_cli_converts_offline_helper_import_failure_to_refusal(self):
+        with mock.patch.object(
+            EXPORT, "run", side_effect=EXPORT.ExportError(
+                "cannot load offline dependency helper: Python TOML parser unavailable"
+            )
+        ):
+            with mock.patch.object(EXPORT, "print") as output:
+                self.assertEqual(EXPORT.main(["--output", str(self.base / "output")]), 1)
+        output.assert_called_once()
+        self.assertIn("export-source: refusal:", output.call_args.args[0])
 
     def full_fixture(self, name="full"):
         base = self.base / name

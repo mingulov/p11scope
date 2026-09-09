@@ -50,11 +50,15 @@ class OfflineDependencyError(Exception):
 def _select_toml_parser():
     try:
         import tomllib
-    except ModuleNotFoundError:
+    except ModuleNotFoundError as error:
+        if error.name != "tomllib":
+            raise
         try:
             import tomli as tomllib
         except ModuleNotFoundError as error:
-            raise OfflineDependencyError(
+            if error.name != "tomli":
+                raise
+            raise ImportError(
                 "Python TOML parser unavailable; use Python >=3.11 or install "
                 "distro package python3-tomli for Python 3.10"
             ) from error

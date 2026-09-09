@@ -32,7 +32,13 @@ def run_parser_import(import_mode: str) -> subprocess.CompletedProcess[str]:
 import builtins
 import importlib.util
 import json
-import tomllib as stdlib_tomllib
+
+try:
+    stdlib_tomllib = __import__("tomllib")
+except ModuleNotFoundError as error:
+    if error.name != "tomllib":
+        raise
+    stdlib_tomllib = __import__("tomli")
 
 helper_path = {str(HELPER)!r}
 real_import = builtins.__import__
@@ -41,13 +47,17 @@ calls = []
 def controlled_import(name, *args, **kwargs):
     if name == "tomllib":
         calls.append(name)
-        if {import_mode!r} == "fallback" or {import_mode!r} == "neither":
+        if {import_mode!r} in ("fallback", "neither", "nested-tomli"):
             raise ModuleNotFoundError("blocked", name="tomllib")
+        if {import_mode!r} == "nested-tomllib":
+            raise ModuleNotFoundError("nested", name="dependency")
         return stdlib_tomllib
     if name == "tomli":
         calls.append(name)
         if {import_mode!r} == "neither":
             raise ModuleNotFoundError("missing", name="tomli")
+        if {import_mode!r} == "nested-tomli":
+            raise ModuleNotFoundError("nested", name="dependency")
         return stdlib_tomllib
     return real_import(name, *args, **kwargs)
 
@@ -76,7 +86,13 @@ class TomlParserSelectionTests(unittest.TestCase):
 
         malformed = subprocess.run(
             [sys.executable, "-I", "-c", f"""
-import builtins, importlib.util, tomllib as stdlib_tomllib
+import builtins, importlib.util
+try:
+    stdlib_tomllib = __import__("tomllib")
+except ModuleNotFoundError as error:
+    if error.name != "tomllib":
+        raise
+    stdlib_tomllib = __import__("tomli")
 real_import = builtins.__import__
 def controlled_import(name, *args, **kwargs):
     if name == "tomllib":
@@ -103,6 +119,14 @@ raise SystemExit("malformed TOML was accepted")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Python TOML parser unavailable", result.stderr)
         self.assertIn("python3-tomli", result.stderr)
+
+    def test_reraises_nested_missing_dependency_from_parser_import(self):
+        for mode in ("nested-tomllib", "nested-tomli"):
+            with self.subTest(mode=mode):
+                result = run_parser_import(mode)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("nested", result.stderr)
+                self.assertNotIn("Python TOML parser unavailable", result.stderr)
 
 
 def load_module(path: Path, name: str):

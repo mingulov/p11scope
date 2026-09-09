@@ -360,6 +360,55 @@ class TaskStorageReaderTests(unittest.TestCase):
         self.assertLess(len(error), 5000)
 
 
+class FinalScannerSurfaceTests(unittest.TestCase):
+    LANES = ("default-safe-start", "feature-safe-start", "feature-unsafe-fault")
+
+    def surfaces(self, subject, root, payload):
+        result = {}
+        for index, lane in enumerate(self.LANES, start=1):
+            path = root / f"mapdump_THREAD_OWNER_{lane}.bin"
+            path.write_bytes(payload)
+            manifest = [{
+                "name": "THREAD_OWNER", "id": index, "type": "task_storage",
+                "key_size": 4, "value_size": 544, "max_entries": 0,
+                "oracle": "task-storage", "file": str(path),
+            }]
+            (root / f"mapdump_manifest_{lane}.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
+            result[lane] = subject.assert_exact_owned_map_inventory(
+                root, lane, {"THREAD_OWNER"}
+            )
+        return result
+
+    def test_final_scanner_rejects_late_task_storage_sentinel_in_every_start_lane(self):
+        subject = load_subject(TARGET_BITS)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for lane in self.LANES:
+                with self.subTest(lane=lane):
+                    surfaces = self.surfaces(
+                        subject, root, bytes(520) + subject.SENTINELS["PIN"]
+                    )
+                    with self.assertRaisesRegex(AssertionError, "pointer canaries leaked"):
+                        subject.assert_final_artifact_privacy(surfaces[lane])
+
+    def test_final_identity_and_safe_alias_scans_include_task_storage_surfaces(self):
+        subject = load_subject(TARGET_BITS)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            identity = struct.pack("<Q", subject.LOADER_PAUSE_IDENTITIES["marker"])
+            surfaces = self.surfaces(subject, root, bytes(520) + identity)
+            with self.assertRaisesRegex(AssertionError, "loader/pause identity"):
+                subject.assert_final_artifact_privacy(surfaces["default-safe-start"])
+            alias = struct.pack("<Q", subject.ALIASES["pss_hash"])
+            surfaces = self.surfaces(subject, root, bytes(520) + alias)
+            for lane in ("default-safe-start", "feature-safe-start"):
+                with self.subTest(lane=lane):
+                    with self.assertRaisesRegex(AssertionError, "scalar aliases"):
+                        subject.assert_safe_lane_alias_privacy(lane, surfaces[lane])
+
+
 class HostileStartTests(unittest.TestCase):
     def test_safe_start_records_and_padding_mutation(self):
         subject = load_subject(TARGET_BITS)

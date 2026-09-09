@@ -59,6 +59,12 @@ struct api {
     libbpf_print_fn (*set_print)(libbpf_print_fn);
 };
 
+struct kernel_api {
+    int (*fd_by_id)(uint32_t);
+    int (*info)(int, struct bpf_map_info *);
+    int (*close_fd)(int);
+};
+
 static size_t log_bytes;
 
 static int bounded_libbpf_log(int level, const char *format, va_list args)
@@ -121,6 +127,11 @@ static int bpf_iter_fd(int link_fd)
     return (int)syscall(SYS_bpf, BPF_ITER_CREATE, &attr, sizeof(attr));
 }
 
+static int close_fd(int fd)
+{
+    return close(fd);
+}
+
 static int parse_u32(const char *text, uint32_t *value)
 {
     char *end = NULL;
@@ -172,10 +183,11 @@ static bool info_matches(const struct bpf_map_info *info, const struct map_spec 
         info->name[kernel_name_length] == 0;
 }
 
-static int exact_info(int fd, const struct map_spec *spec)
+static int exact_info(const struct kernel_api *kernel, int fd,
+                      const struct map_spec *spec)
 {
     struct bpf_map_info info;
-    return bpf_info(fd, &info) || !info_matches(&info, spec) ? -1 : 0;
+    return kernel->info(fd, &info) || !info_matches(&info, spec) ? -1 : 0;
 }
 
 static int load_symbol(void *library, const char *name, void **output)
@@ -228,12 +240,257 @@ static int write_all(int fd, const void *buffer, size_t length)
     return 0;
 }
 
+static int acquire_reuse_load(const struct api *api, const struct kernel_api *kernel,
+                              struct bpf_object *object, struct map_spec specs[MAP_COUNT])
+{
+    size_t index;
+    for (index = 0; index < MAP_COUNT; index++) {
+        specs[index].fd = kernel->fd_by_id(specs[index].id);
+        if (specs[index].fd < 0 || exact_info(kernel, specs[index].fd, &specs[index]))
+            return -1;
+    }
+    for (index = 0; index < MAP_COUNT; index++) {
+        specs[index].map = api->object_find_map(object, specs[index].name);
+        if (!specs[index].map || api->map_reuse_fd(specs[index].map, specs[index].fd))
+            return -1;
+    }
+    if (api->object_load(object))
+        return -1;
+    for (index = 0; index < MAP_COUNT; index++) {
+        int object_fd = api->map_fd(specs[index].map);
+        if (object_fd < 0 || exact_info(kernel, object_fd, &specs[index]))
+            return -1;
+    }
+    return 0;
+}
+
+static void release_resources(const struct api *api, const struct kernel_api *kernel,
+                              int *iterator_fd, struct bpf_link **link,
+                              struct bpf_object **object,
+                              struct map_spec specs[MAP_COUNT])
+{
+    size_t index;
+    if (*iterator_fd >= 0) {
+        kernel->close_fd(*iterator_fd);
+        *iterator_fd = -1;
+    }
+    if (*link) {
+        api->link_destroy(*link);
+        *link = NULL;
+    }
+    if (*object) {
+        api->object_close(*object);
+        *object = NULL;
+    }
+    for (index = 0; index < MAP_COUNT; index++) {
+        if (specs[index].fd >= 0) {
+            kernel->close_fd(specs[index].fd);
+            specs[index].fd = -1;
+        }
+    }
+}
+
+struct lifecycle_state {
+    struct map_spec *specs;
+    int acquire_calls;
+    int acquire_failure;
+    int reuse_calls;
+    int reuse_failure;
+    int load_calls;
+    int substituted_loaded_map;
+    int close_calls;
+    int destroy_calls;
+    int object_close_calls;
+};
+
+static struct lifecycle_state lifecycle;
+
+static int fake_fd_by_id(uint32_t id)
+{
+    int index = lifecycle.acquire_calls++;
+    if (index >= MAP_COUNT || lifecycle.specs[index].id != id ||
+        index == lifecycle.acquire_failure)
+        return -1;
+    return 100 + index;
+}
+
+static int fake_info(int fd, struct bpf_map_info *info)
+{
+    int index = fd >= 200 ? fd - 200 : fd - 100;
+    struct map_spec *spec;
+    size_t name_length;
+    if (index < 0 || index >= MAP_COUNT)
+        return -1;
+    spec = &lifecycle.specs[index];
+    memset(info, 0, sizeof(*info));
+    info->id = spec->id;
+    info->type = BPF_MAP_TYPE_TASK_STORAGE;
+    info->key_size = spec->key_size;
+    info->value_size = spec->value_size;
+    info->max_entries = spec->max_entries;
+    info->map_flags = spec->map_flags;
+    name_length = strlen(spec->name);
+    if (name_length >= BPF_OBJ_NAME_LEN)
+        name_length = BPF_OBJ_NAME_LEN - 1;
+    memcpy(info->name, spec->name, name_length);
+    if (fd >= 200 && index == lifecycle.substituted_loaded_map)
+        info->id++;
+    return 0;
+}
+
+static int fake_close(int fd)
+{
+    if (fd < 0)
+        return -1;
+    lifecycle.close_calls++;
+    return 0;
+}
+
+static struct bpf_map *fake_find_map(const struct bpf_object *object, const char *name)
+{
+    size_t index;
+    (void)object;
+    for (index = 0; index < MAP_COUNT; index++) {
+        if (!strcmp(name, lifecycle.specs[index].name))
+            return (struct bpf_map *)(uintptr_t)(index + 1);
+    }
+    return NULL;
+}
+
+static int fake_reuse_fd(struct bpf_map *map, int fd)
+{
+    int index = (int)(uintptr_t)map - 1;
+    lifecycle.reuse_calls++;
+    if (index < 0 || index >= MAP_COUNT || fd != 100 + index ||
+        index == lifecycle.reuse_failure)
+        return -1;
+    return 0;
+}
+
+static int fake_load(struct bpf_object *object)
+{
+    (void)object;
+    lifecycle.load_calls++;
+    return 0;
+}
+
+static int fake_map_fd(const struct bpf_map *map)
+{
+    return 200 + (int)(uintptr_t)map - 1;
+}
+
+static int fake_destroy(struct bpf_link *link)
+{
+    (void)link;
+    lifecycle.destroy_calls++;
+    return 0;
+}
+
+static void fake_object_close(struct bpf_object *object)
+{
+    (void)object;
+    lifecycle.object_close_calls++;
+}
+
+static void reset_lifecycle(struct map_spec specs[MAP_COUNT])
+{
+    size_t index;
+    memset(&lifecycle, 0, sizeof(lifecycle));
+    lifecycle.specs = specs;
+    lifecycle.acquire_failure = -1;
+    lifecycle.reuse_failure = -1;
+    lifecycle.substituted_loaded_map = -1;
+    for (index = 0; index < MAP_COUNT; index++) {
+        specs[index].fd = -1;
+        specs[index].map = NULL;
+    }
+}
+
+static int lifecycle_self_test(void)
+{
+    static const char *names[MAP_COUNT] = {"TASK_COOKIE", "THREAD_OWNER", "ROOT_AFFILIATION"};
+    static const uint32_t sizes[MAP_COUNT] = {8, 544, 8};
+    struct map_spec specs[MAP_COUNT];
+    struct api api;
+    struct kernel_api kernel = {
+        .fd_by_id = fake_fd_by_id, .info = fake_info, .close_fd = fake_close,
+    };
+    struct bpf_object *object;
+    struct bpf_link *link;
+    int iterator_fd;
+    size_t index;
+    memset(&api, 0, sizeof(api));
+    api.object_find_map = fake_find_map;
+    api.map_reuse_fd = fake_reuse_fd;
+    api.object_load = fake_load;
+    api.map_fd = fake_map_fd;
+    api.link_destroy = fake_destroy;
+    api.object_close = fake_object_close;
+    memset(specs, 0, sizeof(specs));
+    for (index = 0; index < MAP_COUNT; index++) {
+        specs[index].name = names[index];
+        specs[index].id = 40 + (uint32_t)index;
+        specs[index].key_size = 4;
+        specs[index].value_size = sizes[index];
+        specs[index].map_flags = BPF_F_NO_PREALLOC;
+    }
+
+    reset_lifecycle(specs);
+    lifecycle.acquire_failure = 1;
+    object = (struct bpf_object *)(uintptr_t)1;
+    link = NULL;
+    iterator_fd = -1;
+    if (!acquire_reuse_load(&api, &kernel, object, specs))
+        return fail("self-test accepted partial map acquisition");
+    release_resources(&api, &kernel, &iterator_fd, &link, &object, specs);
+    if (lifecycle.acquire_calls != 2 || lifecycle.reuse_calls || lifecycle.load_calls ||
+        lifecycle.close_calls != 1 || lifecycle.object_close_calls != 1)
+        return fail("self-test partial-acquisition cleanup mismatch");
+
+    reset_lifecycle(specs);
+    lifecycle.reuse_failure = 1;
+    object = (struct bpf_object *)(uintptr_t)1;
+    if (!acquire_reuse_load(&api, &kernel, object, specs))
+        return fail("self-test accepted failed map reuse");
+    release_resources(&api, &kernel, &iterator_fd, &link, &object, specs);
+    if (lifecycle.reuse_calls != 2 || lifecycle.load_calls || lifecycle.close_calls != 3 ||
+        lifecycle.object_close_calls != 1)
+        return fail("self-test reuse failure loaded or leaked resources");
+
+    reset_lifecycle(specs);
+    lifecycle.substituted_loaded_map = 1;
+    object = (struct bpf_object *)(uintptr_t)1;
+    if (!acquire_reuse_load(&api, &kernel, object, specs))
+        return fail("self-test accepted substituted loaded-map id");
+    release_resources(&api, &kernel, &iterator_fd, &link, &object, specs);
+    if (lifecycle.reuse_calls != MAP_COUNT || lifecycle.load_calls != 1 ||
+        lifecycle.close_calls != MAP_COUNT || lifecycle.object_close_calls != 1)
+        return fail("self-test substitution cleanup mismatch");
+
+    reset_lifecycle(specs);
+    object = (struct bpf_object *)(uintptr_t)1;
+    link = (struct bpf_link *)(uintptr_t)1;
+    iterator_fd = 300;
+    if (acquire_reuse_load(&api, &kernel, object, specs))
+        return fail("self-test rejected exact reuse lifecycle");
+    release_resources(&api, &kernel, &iterator_fd, &link, &object, specs);
+    if (lifecycle.reuse_calls != MAP_COUNT || lifecycle.load_calls != 1 ||
+        lifecycle.close_calls != MAP_COUNT + 1 || lifecycle.destroy_calls != 1 ||
+        lifecycle.object_close_calls != 1 || iterator_fd != -1 || link || object)
+        return fail("self-test complete resource cleanup mismatch");
+    puts("dump-task-storage resource lifecycle mutation self-test: OK");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     static const char *names[MAP_COUNT] = {"TASK_COOKIE", "THREAD_OWNER", "ROOT_AFFILIATION"};
     static const uint32_t sizes[MAP_COUNT] = {8, 544, 8};
     struct map_spec specs[MAP_COUNT];
     struct api api;
+    struct kernel_api kernel = {
+        .fd_by_id = bpf_fd_by_id, .info = bpf_info, .close_fd = close_fd,
+    };
     struct bpf_object *object = NULL;
     struct bpf_program *program = NULL;
     struct bpf_link *link = NULL;
@@ -290,7 +547,7 @@ int main(int argc, char **argv)
         if (!info_matches(&info, &spec))
             return fail("self-test rejected canonical kernel-truncated map name");
         puts("dump-task-storage exact-map mutation self-test: OK");
-        return 0;
+        return lifecycle_self_test();
     }
     if (argc != 9 || parse_u32(argv[2], &observer_pid) || !observer_pid ||
         parse_u32(argv[3], &max_records) || !max_records || max_records > 131072 ||
@@ -313,36 +570,15 @@ int main(int argc, char **argv)
         goto cleanup;
     }
     api.set_print(bounded_libbpf_log);
-    for (index = 0; index < MAP_COUNT; index++) {
-        specs[index].fd = bpf_fd_by_id(specs[index].id);
-        if (specs[index].fd < 0 || exact_info(specs[index].fd, &specs[index])) {
-            fail("exact input map identity or metadata mismatch");
-            goto cleanup;
-        }
-    }
     object = api.object_open_file(argv[1], NULL);
     if (!object || error_pointer(object) || api.get_error(object)) {
         object = NULL;
         fail("cannot open iterator object");
         goto cleanup;
     }
-    for (index = 0; index < MAP_COUNT; index++) {
-        specs[index].map = api.object_find_map(object, specs[index].name);
-        if (!specs[index].map || api.map_reuse_fd(specs[index].map, specs[index].fd)) {
-            fail("cannot reuse exact task-storage map fd");
-            goto cleanup;
-        }
-    }
-    if (api.object_load(object)) {
-        fail("cannot load task iterator");
+    if (acquire_reuse_load(&api, &kernel, object, specs)) {
+        fail("cannot acquire, reuse, or validate exact task-storage maps");
         goto cleanup;
-    }
-    for (index = 0; index < MAP_COUNT; index++) {
-        int object_fd = api.map_fd(specs[index].map);
-        if (object_fd < 0 || exact_info(object_fd, &specs[index])) {
-            fail("loaded object replaced an imported task-storage map");
-            goto cleanup;
-        }
     }
     program = api.object_find_program(object, "dump_task_storage");
     if (!program) {
@@ -429,16 +665,7 @@ int main(int argc, char **argv)
     status = 0;
 
 cleanup:
-    if (iterator_fd >= 0)
-        close(iterator_fd);
-    if (link && api.link_destroy)
-        api.link_destroy(link);
-    if (object && api.object_close)
-        api.object_close(object);
-    for (index = 0; index < MAP_COUNT; index++) {
-        if (specs[index].fd >= 0)
-            close(specs[index].fd);
-    }
+    release_resources(&api, &kernel, &iterator_fd, &link, &object, specs);
     if (library)
         dlclose(library);
     free(raw);

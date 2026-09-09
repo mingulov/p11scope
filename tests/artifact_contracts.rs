@@ -5840,6 +5840,7 @@ aggregate-only-metrics default metrics"
     assert!(reader.is_file() && iterator.is_file());
     let reader_test = run_ok(reader.to_str().unwrap(), &["--self-test"]);
     assert!(reader_test.contains("exact-map mutation self-test: OK"));
+    assert!(reader_test.contains("resource lifecycle mutation self-test: OK"));
     let iterator_disassembly = run_ok(
         "llvm-objdump",
         &["-dr", "--print-imm-hex", iterator.to_str().unwrap()],
@@ -5930,6 +5931,7 @@ aggregate-only-metrics default metrics"
                 "OwnedMapWrapperTests",
                 "TaskStorageInventoryTests",
                 "TaskStorageReaderTests",
+                "FinalScannerSurfaceTests",
                 "TargetWidthPathTests",
                 "-v",
             ])
@@ -5955,6 +5957,7 @@ aggregate-only-metrics default metrics"
             "OwnedMapWrapperTests",
             "TaskStorageInventoryTests",
             "TaskStorageReaderTests",
+            "FinalScannerSurfaceTests",
             "TargetWidthPathTests",
         ] {
             assert!(
@@ -5963,7 +5966,7 @@ aggregate-only-metrics default metrics"
             );
         }
         assert!(
-            report.contains("Ran 18 tests") && !report.contains("skipped="),
+            report.contains("Ran 20 tests") && !report.contains("skipped="),
             "native {bits}-bit suite must execute every required case: {report}"
         );
     }

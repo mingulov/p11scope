@@ -889,6 +889,42 @@ def positive_control_content(value=None):
         f'"0x{byte:02x}"'.encode() for byte in value) + b"]}\n"
 
 
+def assert_final_artifact_privacy(artifacts):
+    artifacts = list(dict.fromkeys(map(Path, artifacts)))
+    for path in artifacts:
+        content = path.read_bytes()
+        if path.suffix == ".output":
+            rendered = content.decode("utf-8", "surrogateescape")
+            if rendered.lstrip().startswith("{"):
+                assert_json_identity_structure(str(path), json.loads(rendered))
+            else:
+                assert_no_loader_pause_identity(
+                    str(path), trace_scannable(str(path), rendered)
+                )
+        elif path.suffix == ".json":
+            assert_no_loader_pause_identity(str(path), reconstruct(content))
+        elif path.name.endswith(".workload.log"):
+            assert_no_loader_pause_identity(str(path), content, WORKLOAD_IDENTITIES)
+        else:
+            assert_no_loader_pause_identity(str(path), content)
+
+    leaks = {}
+    for path in artifacts:
+        content = path.read_bytes()
+        found = sentinel_hits(content, reconstruct(content) if path.suffix == ".json" else b"")
+        if found:
+            leaks[str(path)] = sorted(found)
+    assert not leaks, f"ordinary pointer canaries leaked: {leaks}"
+
+
+def assert_safe_lane_alias_privacy(lane, paths):
+    for path in map(Path, paths):
+        content = path.read_bytes()
+        reconstructed = reconstruct(content) if path.suffix == ".json" else b""
+        found = alias_hits(content, reconstructed)
+        assert not found, f"{lane}: scalar aliases {found} in {path}"
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else list(argv)
     if not argv:
@@ -1725,6 +1761,15 @@ def main(argv=None):
         lane: assert_exact_owned_map_inventory(work, lane, expected)
         for lane, expected in lanes.items()
     }
+    additional_lanes = {
+        "default-safe-start": SAFE_MAPS,
+        "feature-safe-start": FEATURE_MAPS,
+        "feature-unsafe-fault": FEATURE_MAPS,
+    }
+    lane_surfaces.update({
+        lane: assert_exact_owned_map_inventory(work, lane, expected)
+        for lane, expected in additional_lanes.items()
+    })
     for lane in ["default-safe-profile", "default-safe-trace",
                  "feature-safe-profile", "feature-safe-trace",
                  "aggregate-only-metrics"]:
@@ -1749,19 +1794,17 @@ def main(argv=None):
     assert sentinel_hits(content, reconstruct(content)) == {"PIN"}
     print(f"positive control OK: scanner found PIN in {control}")
 
+    all_lanes = (*lanes, *additional_lanes)
     artifacts = []
-    for lane in lanes:
+    for lane in all_lanes:
         artifacts.extend(Path(work) / f"{lane}.{suffix}" for suffix in
                          ("output", "observer.log", "workload.log"))
         # Every map the observer owns, as its own type says it must be read: the
         # dump files plus the raw records the mmap oracle pulled out of each
         # ringbuf. `owned_map_surfaces` already refused to return a missing one.
         artifacts.extend(lane_surfaces[lane])
-    artifacts.extend(Path(work).glob("mapdump_*.json"))
-    for lane in ("default-safe-start", "feature-safe-start", "feature-unsafe-fault"):
-        artifacts.extend(Path(work) / f"{lane}.{suffix}" for suffix in
-                         ("output", "observer.log", "workload.log"))
-    artifacts = list(dict.fromkeys(artifacts))
+        artifacts.append(Path(work) / f"mapdump_manifest_{lane}.json")
+    artifacts.append(Path(work) / "mapdump_START_live.json")
     # Loader and pause identities, over every artifact surface: the capture
     # documents, the trace streams, the observer/workload logs, the raw event
     # dumps, and every map owned by the exact observer map ids (including the
@@ -1773,30 +1816,7 @@ def main(argv=None):
     # an identity anywhere else on the line still does; a map dump as the bytes it
     # encodes, never as its `0x..` token text, whose two-hex-digit runs would match
     # a narrow spelling in every clean dump.
-    for path in artifacts:
-        content = path.read_bytes()
-        if path.suffix == ".output":
-            rendered = content.decode("utf-8", "surrogateescape")
-            if rendered.lstrip().startswith("{"):
-                assert_json_identity_structure(str(path), json.loads(rendered))
-            else:
-                assert_no_loader_pause_identity(
-                    str(path), trace_scannable(str(path), rendered)
-                )
-        elif path.suffix == ".json":
-            assert_no_loader_pause_identity(str(path), reconstruct(content))
-        elif path.name.endswith(".workload.log"):
-            assert_no_loader_pause_identity(str(path), content, WORKLOAD_IDENTITIES)
-        else:
-            assert_no_loader_pause_identity(str(path), content)
-
-    leaks = {}
-    for path in artifacts:
-        content = path.read_bytes()
-        found = sentinel_hits(content, reconstruct(content) if path.suffix == ".json" else b"")
-        if found:
-            leaks[str(path)] = sorted(found)
-    assert not leaks, f"ordinary pointer canaries leaked: {leaks}"
+    assert_final_artifact_privacy(artifacts)
 
     safe_lanes = (set(lanes) - {"feature-unsafe-profile", "feature-unsafe-trace"}) | {
         "default-safe-start", "feature-safe-start",
@@ -1804,15 +1824,11 @@ def main(argv=None):
     for lane in safe_lanes:
         paths = [Path(work) / f"{lane}.{suffix}" for suffix in
                  ("output", "observer.log", "workload.log")]
-        paths.extend(lane_surfaces[lane] if lane in lane_surfaces
-                     else Path(work).glob(f"mapdump_*_{lane}.json"))
-        for path in paths:
-            content = path.read_bytes()
-            reconstructed = reconstruct(content) if path.suffix == ".json" else b""
-            found = alias_hits(content, reconstructed)
-            assert not found, f"{lane}: scalar aliases {found} in {path}"
+        paths.extend(lane_surfaces[lane])
+        paths.append(Path(work) / f"mapdump_manifest_{lane}.json")
+        assert_safe_lane_alias_privacy(lane, paths)
 
-    print(f"canary matrix OK: {len(lanes)} lanes; no ordinary or safe-policy alias leak")
+    print(f"canary matrix OK: {len(all_lanes)} lanes; no ordinary or safe-policy alias leak")
 
 
 if __name__ == "__main__":

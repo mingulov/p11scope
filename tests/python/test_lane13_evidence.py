@@ -155,6 +155,18 @@ class Lane13InputLedgerTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.output.read_text(encoding="utf-8"), "foreign\n")
 
+    def test_snapshot_refuses_missing_non_obsolete_tracked_input(self):
+        config = json.loads(self.config.read_text(encoding="utf-8"))
+        config["tracked_paths"].append("scripts/missing-maintained-input.sh")
+        self.config.write_text(json.dumps(config), encoding="utf-8")
+        result = self.run_helper()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "tracked input scripts/missing-maintained-input.sh cannot be inspected",
+            result.stderr,
+        )
+        self.assertFalse(self.output.exists())
+
 
 class OwnedCommunicationTimeout(RuntimeError):
     def __init__(self, result):
@@ -194,7 +206,9 @@ class Lane13EvidenceTests(unittest.TestCase):
         tracked = subprocess.run(
             ["/usr/bin/git", "-C", str(ROOT), "ls-files", "-z", "--",
              ".cargo", "Cargo.toml", "Cargo.lock", "build.rs", "rust-toolchain.toml",
-             "build_support", "src", "crates", "scripts", "spike", "third-party"],
+             "build_support", "src", "crates", "scripts", "spike", "third-party",
+             ":(exclude)third-party/aya/**",
+             ":(exclude)third-party/aya-obj/**"],
             check=True, stdout=subprocess.PIPE, timeout=5,
         ).stdout.split(b"\0")
         tracked_paths = []
@@ -1287,6 +1301,41 @@ class Lane13EvidenceTests(unittest.TestCase):
         }
         self.assertEqual(observed, expected)
         self.assertNotIn("scripts/ambient-new.sh", observed)
+
+    def test_prepared_candidate_avoids_obsolete_sources_and_keeps_recipe_inputs(self):
+        candidate = json.loads(
+            Path(self.env["D2_CANDIDATE_INPUTS"]).read_text(encoding="utf-8")
+        )
+        tracked = set(candidate["tracked_paths"])
+        for obsolete in ("third-party/aya", "third-party/aya-obj"):
+            self.assertFalse(any(
+                path == obsolete or path.startswith(obsolete + "/")
+                for path in tracked
+            ))
+        self.assertIn("third-party/sources.json", tracked)
+        synthetic_recipe = json.loads(
+            (self.project / "third-party/sources.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            [record["name"] for record in synthetic_recipe["packages"]],
+            ["demo"],
+        )
+        self.assertTrue((self.prepared.base.output / ".p11scope-prepared.json").is_file())
+        maintained_recipe = json.loads(
+            (ROOT / "third-party/sources.json").read_text(encoding="utf-8")
+        )
+        maintained_patches = {
+            patch
+            for record in maintained_recipe["packages"]
+            for patch in record["patches"]
+        }
+        self.assertTrue(maintained_patches)
+        self.assertTrue(maintained_patches.issubset(tracked))
+        for relative in maintained_patches:
+            self.assertEqual(
+                (self.project / relative).read_bytes(),
+                (ROOT / relative).read_bytes(),
+            )
 
     def test_start_ledger_failure_after_work_is_unavailable_and_nonpass(self):
         output, evidence = self.run_lane("start-ledger-failure")

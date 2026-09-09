@@ -49,6 +49,254 @@ fn require_before(source: &str, first: &str, second: &str, contract: &str) -> Re
     }
 }
 
+fn assert_start_owner_seam(ebpf: &str, owner: &str) -> Result<(), String> {
+    let wrappers = contract_section(ebpf, "unsafe extern \"C\" {", "fn store_start(")?;
+    for marker in [
+        "p11_owner_start_get(key, 0)",
+        "p11_owner_start_get(key, 1)",
+        "p11_owner_start_remove(key, u32::from(required))",
+    ] {
+        require_contract_marker(wrappers, marker, "native START owner wrapper")?;
+    }
+    let get = contract_section(
+        owner,
+        "p11_owner_start_get(const struct owner_start_key *key, u32 required)",
+        "static __always_inline long remove_start",
+    )?;
+    require_contract_marker(get, "start_key_valid(owner, key)", "START get ownership")?;
+    let retire = contract_section(
+        owner,
+        "static __always_inline long remove_start",
+        "p11_owner_start_remove(const struct owner_start_key *key, u32 required)",
+    )?;
+    require_before(
+        retire,
+        "owner_map_delete(&START, key)",
+        "owner->start_count--;",
+        "START deletion before ownership refund",
+    )?;
+    let remove = contract_section(
+        owner,
+        "p11_owner_start_remove(const struct owner_start_key *key, u32 required)",
+        "p11_owner_start_insert(const struct owner_start_key *key",
+    )?;
+    for marker in [
+        "key->slot >= 512 || key->pad",
+        "start_key_valid(owner, key)",
+        "long rc = remove_start(ctl, owner, key);",
+    ] {
+        require_contract_marker(remove, marker, "native START remove")?;
+    }
+    require_before(
+        remove,
+        "long rc = remove_start(ctl, owner, key);",
+        "release_empty(ctl, owner)",
+        "START retirement before owner release",
+    )?;
+    Ok(())
+}
+
+fn assert_discovery_owner_seam(ebpf: &str, owner: &str) -> Result<(), String> {
+    let wrappers = contract_section(ebpf, "unsafe extern \"C\" {", "fn store_start(")?;
+    for marker in [
+        "p11_owner_discovery_get(key, u32::from(required))",
+        "p11_owner_discovery_insert(key, state, flags)",
+        "p11_owner_discovery_remove(key, u32::from(required))",
+    ] {
+        require_contract_marker(wrappers, marker, "native DISCOVERY_STATE owner wrapper")?;
+    }
+    let get = contract_section(
+        owner,
+        "p11_owner_discovery_get(const struct owner_discovery_key *key, u32 required)",
+        "static __always_inline long remove_discovery",
+    )?;
+    for marker in [
+        "(key->domain != 1 && key->domain != 2)",
+        "discovery_key_valid(owner, key)",
+        "directory_find(owner, key) < 0",
+    ] {
+        require_contract_marker(get, marker, "native DISCOVERY_STATE get")?;
+    }
+    let retire = contract_section(
+        owner,
+        "static __always_inline long remove_discovery",
+        "p11_owner_discovery_remove(const struct owner_discovery_key *key, u32 required)",
+    )?;
+    require_before(
+        retire,
+        "owner_map_delete(&DISCOVERY_STATE, key)",
+        "directory_clear(owner, index)",
+        "discovery deletion before directory retirement",
+    )?;
+    let remove = contract_section(
+        owner,
+        "p11_owner_discovery_remove(const struct owner_discovery_key *key, u32 required)",
+        "p11_owner_discovery_insert(const struct owner_discovery_key *key",
+    )?;
+    for marker in [
+        "(key->domain != 1 && key->domain != 2)",
+        "discovery_key_valid(owner, key)",
+        "long rc = remove_discovery(ctl, owner, key, (u32)index);",
+    ] {
+        require_contract_marker(remove, marker, "native DISCOVERY_STATE remove")?;
+    }
+    require_before(
+        remove,
+        "long rc = remove_discovery(ctl, owner, key, (u32)index);",
+        "release_empty(ctl, owner)",
+        "discovery retirement before owner release",
+    )?;
+    let insert = contract_section(
+        owner,
+        "p11_owner_discovery_insert(const struct owner_discovery_key *key",
+        "/* Called ONLY by the mandatory current-task raw exec/exit hooks.",
+    )?;
+    for marker in [
+        "discovery_key_valid(owner, key)",
+        "(flags != 1 && flags != 2)",
+        "remove_discovery(ctl, owner, key, (u32)index);",
+    ] {
+        require_contract_marker(insert, marker, "native DISCOVERY_STATE insert")?;
+    }
+    let collision = contract_section(
+        insert,
+        "/* An unindexed numeric collision cannot authorize its deletion. */",
+        "release_empty(ctl, owner)",
+    )?;
+    require_before(
+        collision,
+        "if (owner_map_lookup(&DISCOVERY_STATE, key))",
+        "poison(ctl, OWNER_BOOKKEEPING_FAILED);",
+        "unindexed discovery collision poisoning",
+    )?;
+    Ok(())
+}
+
+fn assert_python3_isolated(path: &str, source: &str) -> Result<(), String> {
+    for (line_number, line) in source.lines().enumerate() {
+        let code = line.split_once('#').map_or(line, |(code, _)| code);
+        let trimmed = code.trim();
+        if matches!(
+            trimmed,
+            "command -v python3"
+                | "command -v python3 >/dev/null || { echo \"python3 required\"; exit 1; }"
+                | "LANE14_PYTHON=$(command -v python3) || exit 77"
+        ) {
+            continue;
+        }
+        let mut offset = 0;
+        while let Some(relative) = code[offset..].find("python3") {
+            let start = offset + relative;
+            let end = start + "python3".len();
+            let bytes = code.as_bytes();
+            let token_before =
+                start == 0 || !bytes[start - 1].is_ascii_alphanumeric() && bytes[start - 1] != b'_';
+            let token_after =
+                end == bytes.len() || !bytes[end].is_ascii_alphanumeric() && bytes[end] != b'_';
+            if token_before && token_after {
+                let after = code[end..].trim_start();
+                let rest = after.strip_prefix("-I").ok_or_else(|| {
+                    format!("unisolated executable python3 in {path}:{line_number}: {line:?}")
+                })?;
+                if !rest.is_empty()
+                    && (rest.as_bytes()[0].is_ascii_alphanumeric() || rest.as_bytes()[0] == b'_')
+                {
+                    return Err(format!(
+                        "python3 option is not the isolated -I token in {path}:{line_number}: {line:?}"
+                    ));
+                }
+            }
+            offset = end;
+        }
+    }
+    Ok(())
+}
+
+fn assert_lane14_selected_python_isolated(source: &str) -> Result<(), String> {
+    for operation in ["capture", "recheck"] {
+        require_contract_marker(
+            source,
+            &format!(
+                r#""$LANE14_PYTHON" -I scripts/prepared-dependency-evidence.py {operation} \"#
+            ),
+            "selected Lane 14 isolated Python invocation",
+        )?;
+    }
+    Ok(())
+}
+
+fn assert_hosted_dependency_preparation(ci: &str) -> Result<(), String> {
+    let checks = checks_job(ci);
+    let prepare = "run: python3 -I scripts/prepare-dependencies.py";
+    let root_fetch = "run: cargo +1.88 fetch --locked --manifest-path Cargo.toml";
+    let selection =
+        "p11scope_prepared_tools_select \"$(command -v python3)\" \"$(command -v rustup)\"";
+    let root_metadata = "\"$P11SCOPE_PREPARED_STABLE_CARGO\" metadata --locked --offline --all-features --format-version 1 --manifest-path Cargo.toml";
+    let bpf_metadata = "\"$P11SCOPE_PREPARED_BPF_CARGO\" metadata --locked --offline --all-features --format-version 1 --manifest-path crates/ebpf/Cargo.toml";
+    let checker = "\"$P11SCOPE_PREPARED_PYTHON\" -I scripts/check-prepared-dependencies.py";
+    for (marker, contract) in [
+        (prepare, "dependency reconstruction"),
+        (
+            ". scripts/prepared-dependency-tools.sh",
+            "fixed prepared-tool selection helper",
+        ),
+        (selection, "fixed prepared-tool selection"),
+        (root_metadata, "root offline all-feature metadata"),
+        (bpf_metadata, "BPF offline all-feature metadata"),
+        (checker, "checked prepared-dependency invocation"),
+        (
+            "--metadata \"Cargo.toml=$RUNNER_TEMP/root-metadata.json\"",
+            "root metadata checker input",
+        ),
+        (
+            "--metadata \"crates/ebpf/Cargo.toml=$RUNNER_TEMP/bpf-metadata.json\" --ledger",
+            "BPF metadata checker input and ledger",
+        ),
+    ] {
+        require_contract_marker(checks, marker, contract)?;
+    }
+    require_before(
+        checks,
+        prepare,
+        root_fetch,
+        "dependency reconstruction before project Cargo",
+    )?;
+    for pair in [
+        (selection, root_metadata),
+        (root_metadata, bpf_metadata),
+        (bpf_metadata, checker),
+    ] {
+        require_before(
+            checks,
+            pair.0,
+            pair.1,
+            "prepared dependency verification order",
+        )?;
+    }
+    Ok(())
+}
+
+fn assert_hosted_offline_gates(checks: &str) -> Result<(), String> {
+    for gate in [
+        "fmt --all -- --check",
+        "check --locked --offline --workspace --all-targets",
+        "test --locked --offline --workspace --all-targets",
+        "clippy --locked --offline --workspace --all-targets -- -D warnings",
+    ] {
+        if !checks
+            .lines()
+            .map(str::trim)
+            .filter_map(command_of)
+            .any(|call| call == format!("cargo +1.88 {gate}"))
+        {
+            return Err(format!(
+                "the scope line claims the {gate} gate, which no step runs"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn assert_exact_policy_map_metadata_contract(attach: &str) -> Result<(), String> {
     let declarations = contract_section(
         attach,
@@ -216,30 +464,36 @@ fn assert_live_discovery_host_contract(
         "Self::start_inner(",
         "owned capability validation before load",
     )?;
-    require_before(
+    let preparation = contract_section(
         attach,
-        "crate::scope::publish(&mut ebpf, scope, policy, generation_token)",
-        "freeze_published_maps(&ebpf)",
-        "scope publication before base freeze",
+        "fn prepare_session_with(",
+        "fn publish_tail_calls_with",
     )?;
-    require_before(
-        attach,
-        "freeze_published_maps(&ebpf)",
-        "for prog_name in programs",
-        "base freeze before program load",
-    )?;
-    require_before(
-        attach,
-        "for prog_name in programs",
-        "if !defers_freeze_until_loaded(name, &meta) || name == TAIL_POLICY_MAP",
-        "all program loads before the deferred freezes",
-    )?;
-    require_before(
-        attach,
-        "publish_and_freeze_tail_calls(&mut ebpf, unsafe_enabled)",
-        ".attach(\"task\", \"task_newtask\")",
-        "tail publication before first producer attach",
-    )?;
+    let ordered_steps = [
+        "ValidatePolicy,",
+        "ValidateRuntime,",
+        "ValidatePrograms,",
+        "PublishScope,",
+        "PrepareIdentity,",
+        "PublishDescriptors,",
+        "PublishAsync,",
+        "PublishShapes,",
+        "PublishAttributes,",
+        "FreezePublished,",
+        "SelectScope,",
+        "operation(LoadProgram(name))?;",
+        "operation(FreezeDeferred(name))?;",
+        "operation(PublishTailCalls)?;",
+        "operation(PrepareEventsDomain)?;",
+    ];
+    for pair in ordered_steps.windows(2) {
+        require_before(
+            preparation,
+            pair[0],
+            pair[1],
+            "session preparation sequence",
+        )?;
+    }
 
     for (marker, contract) in [
         (
@@ -314,7 +568,7 @@ fn assert_live_discovery_host_contract(
             "object-feature inventory selection",
         ),
         (
-            "let programs = expected_programs(object_has_unsafe);",
+            "for name in expected_programs(object_has_unsafe)",
             "complete object program load",
         ),
         (
@@ -333,11 +587,91 @@ fn assert_live_discovery_host_contract(
         "fn attach_targets_with(",
         "fn standard_async_catalog",
     )?;
-    if scheduling.contains("interface_list_worker") {
+    if scheduling.contains("attach(\"interface_list_worker\",") {
         return Err("interface-list worker must be loaded but never attached".into());
     }
     let start_inner =
         contract_section(attach, "fn start_inner(", "pub(crate) fn counter_snapshot(")?;
+    for (step, next, operation) in [
+        (
+            "SessionPreparation::ValidatePolicy",
+            "SessionPreparation::ValidateRuntime",
+            "validate_policy_maps(&ebpf",
+        ),
+        (
+            "SessionPreparation::ValidateRuntime",
+            "SessionPreparation::ValidatePrograms",
+            "validate_runtime_maps(&ebpf)",
+        ),
+        (
+            "SessionPreparation::ValidatePrograms",
+            "SessionPreparation::PublishScope",
+            "validate_program_inventory(&ebpf",
+        ),
+        (
+            "SessionPreparation::PublishScope",
+            "SessionPreparation::PrepareIdentity",
+            "crate::scope::publish(&mut ebpf",
+        ),
+        (
+            "SessionPreparation::PrepareIdentity",
+            "SessionPreparation::PublishDescriptors",
+            "prepare_identity(&mut ebpf",
+        ),
+        (
+            "SessionPreparation::PublishDescriptors",
+            "SessionPreparation::PublishAsync",
+            "publish_descriptors(",
+        ),
+        (
+            "SessionPreparation::PublishAsync",
+            "SessionPreparation::PublishShapes",
+            "publish_async_catalog(&mut ebpf)",
+        ),
+        (
+            "SessionPreparation::PublishShapes",
+            "SessionPreparation::PublishAttributes",
+            "crate::shapes::publish(&mut ebpf",
+        ),
+        (
+            "SessionPreparation::PublishAttributes",
+            "SessionPreparation::FreezePublished",
+            "publish_attribute_catalog(&mut ebpf",
+        ),
+        (
+            "SessionPreparation::FreezePublished",
+            "SessionPreparation::SelectScope",
+            "freeze_published_maps(&ebpf)",
+        ),
+        (
+            "SessionPreparation::SelectScope",
+            "SessionPreparation::LoadProgram",
+            "uprobe_scope = match scope",
+        ),
+        (
+            "SessionPreparation::LoadProgram(prog_name)",
+            "SessionPreparation::FreezeDeferred(name)",
+            "prog.load()",
+        ),
+        (
+            "SessionPreparation::FreezeDeferred(name)",
+            "SessionPreparation::PublishTailCalls",
+            "freeze_map(name",
+        ),
+        (
+            "SessionPreparation::PublishTailCalls",
+            "SessionPreparation::PrepareEventsDomain",
+            "publish_and_freeze_tail_calls(&mut ebpf",
+        ),
+        (
+            "SessionPreparation::PrepareEventsDomain",
+            "            }\n            Ok(())",
+            "events::EventsDomain::from_events(&ebpf)",
+        ),
+    ] {
+        let arm = contract_section(start_inner, step, next)?;
+        require_contract_marker(arm, operation, "session preparation operation")?;
+    }
     let dynamic_loader = contract_section(
         attach,
         "pub(crate) fn attach_dynamic_loader(",
@@ -358,19 +692,66 @@ fn assert_live_discovery_host_contract(
             return Err("interface-list worker must never be attached".into());
         }
     }
+    let tail_helper = contract_section(
+        attach,
+        "fn publish_tail_calls_with",
+        "fn publish_and_freeze_tail_calls",
+    )?;
+    for marker in [
+        "if actual_worker != Some(worker_id)",
+        "if actual_second != expected_second",
+    ] {
+        require_contract_marker(tail_helper, marker, "TAIL_CALLS exact readback")?;
+    }
+    for pair in [
+        (
+            "write(state, TAIL_CALLS_INTERFACE_WORKER_SLOT)?;",
+            "write(state, TAIL_CALLS_TEMPLATE_SECOND_SLOT)?;",
+        ),
+        (
+            "write(state, TAIL_CALLS_TEMPLATE_SECOND_SLOT)?;",
+            "read(state, TAIL_CALLS_INTERFACE_WORKER_SLOT)?;",
+        ),
+        (
+            "read(state, TAIL_CALLS_INTERFACE_WORKER_SLOT)?;",
+            "read(state, TAIL_CALLS_TEMPLATE_SECOND_SLOT)?;",
+        ),
+        (
+            "read(state, TAIL_CALLS_TEMPLATE_SECOND_SLOT)?;",
+            "freeze(state)",
+        ),
+    ] {
+        require_before(tail_helper, pair.0, pair.1, "TAIL_CALLS helper sequence")?;
+    }
     let tail_publication = contract_section(
         attach,
         "fn publish_and_freeze_tail_calls(",
         "/// A kernel/environment",
     )?;
+    let fd_selection = contract_section(
+        tail_publication,
+        "let fd = if slot == TAIL_CALLS_INTERFACE_WORKER_SLOT",
+        "let mut tails: ProgramArray<_>",
+    )?;
+    for marker in [
+        "{\n                &worker_fd\n            } else {",
+        "&second.as_ref().expect(\"selected template-second program\").0",
+    ] {
+        require_contract_marker(fd_selection, marker, "TAIL_CALLS slot-to-FD mapping")?;
+    }
+    require_contract_marker(
+        tail_publication,
+        "worker_id,\n        second.as_ref().map(|(_, id)| *id)",
+        "TAIL_CALLS loaded program IDs",
+    )?;
     for marker in [
         ".program(\"interface_list_worker\")",
-        "tails.set(TAIL_CALLS_INTERFACE_WORKER_SLOT",
-        "program_array_id(TAIL_POLICY_MAP, map, TAIL_CALLS_INTERFACE_WORKER_SLOT)",
-        "program_array_id(TAIL_POLICY_MAP, map, TAIL_CALLS_TEMPLATE_SECOND_SLOT)",
-        "tails.set(TAIL_CALLS_TEMPLATE_SECOND_SLOT, second_fd, 0)?;",
-        "if actual_worker != Some(worker_id)",
-        "if actual_second != expected_second",
+        ".program(\"p11_entry_template_second\")",
+        "if slot == TAIL_CALLS_INTERFACE_WORKER_SLOT",
+        "&worker_fd",
+        "&second.as_ref().expect(\"selected template-second program\").0",
+        "tails.set(slot, fd, 0)?;",
+        "program_array_id(TAIL_POLICY_MAP, map, slot)",
         "freeze_map(TAIL_POLICY_MAP, map)",
     ] {
         require_contract_marker(tail_publication, marker, "TAIL_CALLS publication")?;
@@ -458,7 +839,11 @@ fn assert_owned_run_pause_internal_contract(
     )
 }
 
-fn assert_static_descriptor_cookie_contract(attach: &str, ebpf: &str) -> Result<(), String> {
+fn assert_static_descriptor_cookie_contract(
+    attach: &str,
+    ebpf: &str,
+    owner: &str,
+) -> Result<(), String> {
     const COOKIE: &str = "cookie: Some(attach_cookie(slot.index, slot.descriptor_index)),";
 
     let scheduling = contract_section(
@@ -468,7 +853,7 @@ fn assert_static_descriptor_cookie_contract(attach: &str, ebpf: &str) -> Result<
     )?;
     require_contract_marker(
         scheduling,
-        "attach(\"p11_return\", slot)",
+        "attach(\"p11_return\", slot, slot_attach_point(slot))",
         "return-before-entry scheduling",
     )?;
     require_contract_marker(
@@ -478,16 +863,26 @@ fn assert_static_descriptor_cookie_contract(attach: &str, ebpf: &str) -> Result<
     )?;
     require_contract_marker(
         scheduling,
+        "attach(program, slot, slot_attach_point(slot))",
+        "selected-entry shared slot attach point",
+    )?;
+    require_contract_marker(
+        scheduling,
         "!return_attached.contains(&slot.index)",
         "return failure entry suppression",
     )?;
+    let constructor = contract_section(attach, "fn slot_attach_point(", "fn attach_targets_with(")?;
+    if constructor.matches(COOKIE).count() != 1 {
+        return Err("slot attach point must construct exactly one shared descriptor cookie".into());
+    }
     let attach_targets = contract_section(
         attach,
         "pub(crate) fn attach_targets(",
         "pub fn replace_targets",
     )?;
-    require_contract_marker(attach_targets, COOKIE, "shared slot attach cookie")?;
     require_contract_marker(attach_targets, "prog.attach(point", "Aya uprobe attachment")?;
+
+    assert_start_owner_seam(ebpf, owner)?;
 
     let cookie = contract_section(ebpf, "fn slot_of<C>", "/// Decode allowlisted")?;
     require_contract_marker(
@@ -551,7 +946,7 @@ fn assert_static_descriptor_cookie_contract(attach: &str, ebpf: &str) -> Result<
             "let key = StartKey {\n        pid_tgid: helpers::bpf_get_current_pid_tgid(),\n        slot,\n        _pad: 0,\n    };",
             "template-second START slot",
         ),
-        ("START.get_ptr_mut(&key)", "template-second START lookup"),
+        ("owned_start_mut(&key)", "template-second START lookup"),
         (
             "let semantics = semantics_of(&ctx);",
             "template-second descriptor consumer",
@@ -591,8 +986,8 @@ fn assert_static_descriptor_cookie_contract(attach: &str, ebpf: &str) -> Result<
             "let key = StartKey {\n        pid_tgid: helpers::bpf_get_current_pid_tgid(),\n        slot,\n        _pad: 0,\n    };",
             "return START slot",
         ),
-        ("START.get(&key)", "return START lookup"),
-        ("START.remove(&key)", "return START removal"),
+        ("owned_start_get(&key)", "return START lookup"),
+        ("owned_start_remove(&key, true)", "return START removal"),
         ("STATS.get_ptr_mut(slot)", "return STATS slot"),
         (
             "let rk = RvKey { slot, _pad: 0, rv };",
@@ -630,7 +1025,12 @@ fn ordinary_entry_width_specialization_refuses_before_observation() {
     let entered = entry.find("STATS.get_ptr_mut(slot)").unwrap();
     let aggregate = entry.find("FLAG_POLICY_AGGREGATE").unwrap();
     assert!(classify < lp64 && lp64 < ilp32 && ilp32 < entered && entered < aggregate);
-    assert_eq!(entry[..entered].matches("START.remove(&key)").count(), 3);
+    assert_eq!(
+        entry[..entered]
+            .matches("owned_start_remove(&key, false)")
+            .count(),
+        3
+    );
     assert_eq!(
         entry[..entered]
             .matches("bump_evidence(EVIDENCE_ABI_REFUSALS)")
@@ -647,9 +1047,25 @@ fn ordinary_entry_width_specialization_refuses_before_observation() {
         "fn attach_targets_with(",
         "fn standard_async_catalog",
     );
+    let return_attach = "attach(\"p11_return\", slot, slot_attach_point(slot))";
+    require_before(
+        scheduling,
+        "collect::<Result<Vec<_>>>()?",
+        return_attach,
+        "ABI resolution before helper-mediated return attachment",
+    )
+    .unwrap();
+    let direct_return_attach =
+        scheduling.replacen(return_attach, "attach(\"p11_return\", slot, point)", 1);
     assert!(
-        scheduling.find("collect::<Result<Vec<_>>>()?").unwrap()
-            < scheduling.find("attach(\"p11_return\", slot)").unwrap()
+        require_before(
+            &direct_return_attach,
+            "collect::<Result<Vec<_>>>()?",
+            return_attach,
+            "ABI resolution before helper-mediated return attachment",
+        )
+        .is_err(),
+        "the return attachment must retain the shared slot attach point"
     );
     assert!(scheduling.contains("entry_program(&slot.semantics, policy, object_has_unsafe, *abi)"));
     let production = between(
@@ -758,6 +1174,8 @@ fn official_build_is_safe_only() {
         "CARGO_TARGET_DIR=\"$OFFICIAL_TARGET\" \\",
         "RUSTFLAGS=\"-C target-feature=+crt-static\" \\",
         "RUSTC=\"$T4_TOOLCHAIN_RUSTC\" \\",
+        "P11SCOPE_PREPARED_BPF_CARGO=\"$t4_nightly_cargo\" \\",
+        "P11SCOPE_PREPARED_BPF_RUSTC=\"$t4_nightly_rustc\" \\",
         "    \"$T4_TOOLCHAIN_CARGO\" build --locked --offline --release --no-default-features \\",
         "        --target x86_64-unknown-linux-musl --bin p11scope",
     ]
@@ -1565,36 +1983,31 @@ fn release_runs_every_python3_in_isolated_mode() {
         "scripts/verify-discover-containers.sh",
     ] {
         let source = read(path);
-        for (line_number, line) in source.lines().enumerate() {
-            let code = line.split_once('#').map_or(line, |(code, _)| code);
-            if code.trim_start().starts_with("command -v python3") {
-                continue;
-            }
-            let mut offset = 0;
-            while let Some(relative) = code[offset..].find("python3") {
-                let start = offset + relative;
-                let end = start + "python3".len();
-                let bytes = code.as_bytes();
-                let token_before = start == 0
-                    || !bytes[start - 1].is_ascii_alphanumeric() && bytes[start - 1] != b'_';
-                let token_after =
-                    end == bytes.len() || !bytes[end].is_ascii_alphanumeric() && bytes[end] != b'_';
-                if token_before && token_after {
-                    let after = code[end..].trim_start();
-                    let rest = after.strip_prefix("-I").unwrap_or_else(|| {
-                        panic!("unisolated executable python3 in {path}:{line_number}: {line:?}")
-                    });
-                    assert!(
-                        rest.is_empty()
-                            || (!rest.as_bytes()[0].is_ascii_alphanumeric()
-                                && rest.as_bytes()[0] != b'_'),
-                        "python3 option is not the isolated -I token in {path}:{line_number}: {line:?}"
-                    );
-                }
-                offset = end;
+        assert_python3_isolated(path, &source).unwrap();
+        if path == "scripts/verify-discover-containers.sh" {
+            assert_lane14_selected_python_isolated(&source).unwrap();
+            for invocation in [
+                "\"$LANE14_PYTHON\" -I scripts/prepared-dependency-evidence.py capture \\",
+                "\"$LANE14_PYTHON\" -I scripts/prepared-dependency-evidence.py recheck \\",
+            ] {
+                assert!(
+                    source.contains(invocation),
+                    "selected Lane 14 Python call is not isolated"
+                );
+                let unisolated = source.replacen(invocation, &invocation.replace(" -I", ""), 1);
+                assert!(
+                    assert_lane14_selected_python_isolated(&unisolated).is_err(),
+                    "removing isolation from either selected Lane 14 call must fail"
+                );
             }
         }
     }
+    assert_python3_isolated("lookup", "command -v python3").unwrap();
+    assert_python3_isolated("lookup", "LANE14_PYTHON=$(command -v python3) || exit 77").unwrap();
+    assert!(
+        assert_python3_isolated("compound", "command -v python3; python3 script.py").is_err(),
+        "a lookup must not exempt an unisolated execution on the same line"
+    );
 }
 
 #[test]
@@ -3926,15 +4339,27 @@ fn frozen_policy_inventory_matches_embedded_object() {
 fn descriptor_cookie_and_consumers_source_guard_rejects_contract_regressions() {
     let attach = read("src/attach.rs");
     let ebpf = read("crates/ebpf/src/main.rs");
+    let owner = read("crates/ebpf/native/task_owner.c");
 
-    assert_static_descriptor_cookie_contract(&attach, &ebpf).unwrap();
+    assert_static_descriptor_cookie_contract(&attach, &ebpf, &owner).unwrap();
+    let skipped_start_retirement = owner.replacen(
+        "long rc = remove_start(ctl, owner, key);",
+        "long rc = 0;",
+        1,
+    );
+    assert!(
+        assert_static_descriptor_cookie_contract(&attach, &ebpf, &skipped_start_retirement)
+            .is_err(),
+        "the native START remover must call the ownership-aware retirement helper"
+    );
     let dropped_return_descriptor = attach.replacen(
         "cookie: Some(attach_cookie(slot.index, slot.descriptor_index)),",
         "cookie: Some(attach_cookie(slot.index, 0)),",
         1,
     );
     assert!(
-        assert_static_descriptor_cookie_contract(&dropped_return_descriptor, &ebpf).is_err(),
+        assert_static_descriptor_cookie_contract(&dropped_return_descriptor, &ebpf, &owner)
+            .is_err(),
         "the return attach site must carry the descriptor word"
     );
 
@@ -3944,14 +4369,14 @@ fn descriptor_cookie_and_consumers_source_guard_rejects_contract_regressions() {
         1,
     );
     assert!(
-        assert_static_descriptor_cookie_contract(&attach, &high_word_stats).is_err(),
+        assert_static_descriptor_cookie_contract(&attach, &high_word_stats, &owner).is_err(),
         "a slot consumer must not use the descriptor word"
     );
 
     let no_count_only_fallback =
         ebpf.replacen(".unwrap_or(SlotSemantics::COUNT_ONLY)", ".unwrap()", 1);
     assert!(
-        assert_static_descriptor_cookie_contract(&attach, &no_count_only_fallback).is_err(),
+        assert_static_descriptor_cookie_contract(&attach, &no_count_only_fallback, &owner).is_err(),
         "a missing descriptor must remain count-only"
     );
 
@@ -3991,9 +4416,14 @@ fn descriptor_cookie_and_consumers_source_guard_rejects_contract_regressions() {
     );
     assert_eq!(
         [
-            assert_static_descriptor_cookie_contract(&attach, &template_second_high_word_slot)
+            assert_static_descriptor_cookie_contract(
+                &attach,
+                &template_second_high_word_slot,
+                &owner,
+            )
+            .is_err(),
+            assert_static_descriptor_cookie_contract(&attach, &bypassed_primary_semantics, &owner,)
                 .is_err(),
-            assert_static_descriptor_cookie_contract(&attach, &bypassed_primary_semantics).is_err(),
         ],
         [true, true],
         "the template-tail slot and every descriptor consumer must use the shared cookie path"
@@ -4058,8 +4488,8 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_owned_child_only() {
         );
     };
     let missing_second_slot_set = attach.replacen(
-        "tails.set(TAIL_CALLS_TEMPLATE_SECOND_SLOT, second_fd, 0)?;",
-        "tails.set(TAIL_CALLS_INTERFACE_WORKER_SLOT, second_fd, 0)?;",
+        "write(state, TAIL_CALLS_TEMPLATE_SECOND_SLOT)?;",
+        "write(state, TAIL_CALLS_INTERFACE_WORKER_SLOT)?;",
         1,
     );
     assert_rejects_attach_mutation(
@@ -4076,13 +4506,39 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_owned_child_only() {
         "TAIL_CALLS worker readback must be required",
     );
     let worker_attach = attach.replacen(
-        "let programs = expected_programs(object_has_unsafe);",
-        "let programs = expected_programs(object_has_unsafe);\n        let _ = ebpf.program_mut(\"interface_list_worker\").attach(...);",
+        "match attach(program, slot, slot_attach_point(slot))",
+        "match attach(\"interface_list_worker\", slot, slot_attach_point(slot))",
         1,
     );
     assert_rejects_attach_mutation(
         &worker_attach,
         "interface-list worker must not gain an attach site",
+    );
+    let benign_worker_comment = attach.replacen(
+        "fn attach_targets_with(",
+        "fn attach_targets_with(/* interface_list_worker remains unattached */",
+        1,
+    );
+    assert!(
+        assert_live_discovery_host_contract(
+            &benign_worker_comment,
+            &scope,
+            &events,
+            &hooks,
+            &engine,
+            &main,
+            &run,
+        )
+        .is_ok(),
+        "a benign worker comment must not count as an attachment"
+    );
+    let fd_mapping = "let fd = if slot == TAIL_CALLS_INTERFACE_WORKER_SLOT {\n                &worker_fd\n            } else {\n                &second.as_ref().expect(\"selected template-second program\").0\n            };";
+    let swapped_fd_mapping = "let fd = if slot == TAIL_CALLS_INTERFACE_WORKER_SLOT {\n                &second.as_ref().expect(\"selected template-second program\").0\n            } else {\n                &worker_fd\n            };";
+    let swapped_tail_fds = attach.replacen(fd_mapping, swapped_fd_mapping, 1);
+    assert_ne!(attach, swapped_tail_fds, "tail FD swap mutation must apply");
+    assert_rejects_attach_mutation(
+        &swapped_tail_fds,
+        "TAIL_CALLS fixed slots must retain their corresponding loaded FDs",
     );
 
     let public_run = library.replacen("pub(crate) mod run;", "pub mod run;", 1);
@@ -4202,7 +4658,9 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_owned_child_only() {
 #[test]
 fn live_discovery_bpf_classification_is_exact_and_output_only() {
     let source = read("crates/ebpf/src/main.rs");
+    let owner = read("crates/ebpf/native/task_owner.c");
     let engine = read("src/discovery/engine.rs");
+    assert_discovery_owner_seam(&source, &owner).unwrap();
     let classifier = between(
         &source,
         "fn classify_direct_interface(",
@@ -4289,7 +4747,7 @@ fn live_discovery_bpf_classification_is_exact_and_output_only() {
         "pid_tgid: helpers::bpf_get_current_pid_tgid()",
         "attach_cookie: 0",
         "interface_continuation_unpack(state.arg1)",
-        "DISCOVERY_STATE.get(&key)",
+        "owned_discovery_get(&key, true)",
         "DISCOVERY_INTERFACES",
         "(u64::from(symbol_id) << 32)",
         "if active_count == 0",
@@ -4317,6 +4775,8 @@ fn live_discovery_bpf_classification_is_exact_and_output_only() {
 fn selection_transport_never_carries_name_bytes() {
     let common = read("crates/ebpf-common/src/lib.rs");
     let source = read("crates/ebpf/src/main.rs");
+    let owner = read("crates/ebpf/native/task_owner.c");
+    assert_discovery_owner_seam(&source, &owner).unwrap();
     for marker in [
         "pub return_rv: u64",
         "pub request_flags: u64",
@@ -4422,8 +4882,28 @@ fn selection_transport_never_carries_name_bytes() {
         "fn take_selection_state(",
     );
     assert!(insertion.contains("BPF_NOEXIST"));
-    assert!(insertion.contains("DISCOVERY_STATE.remove(&key)"));
+    assert!(insertion.contains("owned_discovery_insert(&key, &state"));
     assert!(insertion.contains("DISCOVERY_COUNTER_EXPORT_STATE_FAILURES"));
+    let take = between(
+        &source,
+        "fn take_selection_state(",
+        "#[uprobe]\npub fn function_list_entry",
+    );
+    assert!(take.contains("owned_discovery_get(&key, false)"));
+    assert!(take.contains("owned_discovery_remove(&key, state_present)"));
+    let unindexed_collision = owner.replacen(
+        "            poison(ctl, OWNER_BOOKKEEPING_FAILED);\n        release_empty(ctl, owner);",
+        "            count(&ctl->admission_failures);\n        release_empty(ctl, owner);",
+        1,
+    );
+    assert_ne!(
+        owner, unindexed_collision,
+        "unindexed collision poison mutation must apply"
+    );
+    assert!(
+        assert_discovery_owner_seam(&source, &unindexed_collision).is_err(),
+        "an unindexed numeric collision must still poison the owner"
+    );
     let indirect = between(
         &source,
         "fn classify_indirect_interface(",
@@ -5594,11 +6074,14 @@ fn gate_scripts_pin_the_toolchain() {
 fn production_bpf_toolchain_is_frozen() {
     let toolchain = read("crates/ebpf/rust-toolchain.toml");
     let build = read("build.rs");
+    let tools = read("build_support/bpf_tools.rs");
     let ci = read(".github/workflows/ci.yml");
 
     assert!(toolchain.contains("channel = \"nightly-2026-05-20\""));
-    assert!(build.contains("\"+nightly-2026-05-20\""));
-    assert!(!build.contains("\"+nightly\""));
+    assert!(build.contains("#[path = \"build_support/bpf_tools.rs\"]\nmod bpf_tools;"));
+    assert!(build.contains("bpf_tools::bpf_cargo_command_from_env()"));
+    assert!(tools.contains("\"+nightly-2026-05-20\""));
+    assert!(!tools.contains("\"+nightly\""));
     assert!(ci.contains("toolchain install nightly-2026-05-20 "));
     assert!(!ci.contains("toolchain install nightly "));
 }
@@ -5687,13 +6170,14 @@ fn hosted_pipeline_checks_the_diagnostic_inventory() {
         .iter()
         .position(|line| {
             command_of(line).is_some_and(|call| {
-                call == "cargo +1.88 clippy --locked --workspace --all-targets -- -D warnings"
+                call
+                    == "cargo +1.88 clippy --locked --offline --workspace --all-targets -- -D warnings"
             })
         })
         .expect("the checks job must run the clippy gate");
     // `--nocapture` so the inventory report the wave cites as exit evidence
     // actually reaches the hosted log.
-    let prefix = "cargo +1.88 test --locked --features unsafe-unvalidated-metadata --test artifact_contracts -- ";
+    let prefix = "cargo +1.88 test --locked --offline --features unsafe-unvalidated-metadata --test artifact_contracts -- ";
     let command_at = lines
         .iter()
         .position(|line| line.starts_with(prefix))
@@ -5929,6 +6413,37 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
         line.split(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, '.' | '/' | '_' | '-'))
             .any(is_lane)
     };
+    let dependency_helpers = [
+        "scripts/prepare-dependencies.py",
+        "scripts/prepared-dependency-tools.sh",
+        "scripts/check-prepared-dependencies.py",
+    ];
+    let named_scripts = |line: &str| {
+        line.split(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, '.' | '/' | '_' | '-'))
+            .filter(|token| is_lane(token))
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    let is_exact_dependency_helper_call = |line: &str| {
+        let line = line.strip_prefix("- ").unwrap_or(line);
+        matches!(
+            line,
+            "run: python3 -I scripts/prepare-dependencies.py"
+                | ". scripts/prepared-dependency-tools.sh"
+                | r#""$P11SCOPE_PREPARED_PYTHON" -I scripts/check-prepared-dependencies.py \"#
+        )
+    };
+    let named_prepare = "run: python3 -I scripts/prepare-dependencies.py";
+    let unnamed_prepare = format!("- {named_prepare}");
+    assert!(is_exact_dependency_helper_call(named_prepare));
+    assert!(is_exact_dependency_helper_call(&unnamed_prepare));
+    let helper_plus_lane = format!("{unnamed_prepare} && scripts/verify-inspect-doctor.sh");
+    assert!(!is_exact_dependency_helper_call(&helper_plus_lane));
+    assert!(
+        named_scripts(&helper_plus_lane)
+            .iter()
+            .any(|script| !dependency_helpers.contains(&script.as_str()))
+    );
     let mut hosted_full: BTreeSet<&str> = BTreeSet::new();
     // Scoped to the checks job: the label says "runs in this job", so a step that
     // exists only in another job must not satisfy it. The full-run sweep below
@@ -5946,8 +6461,13 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
         let line = line
             .split_once(" #")
             .map_or(line, |(code, _)| code.trim_end());
+        let scripts = named_scripts(line);
+        let dependency_only = !scripts.is_empty()
+            && scripts
+                .iter()
+                .all(|script| dependency_helpers.contains(&script.as_str()));
         assert!(
-            line.starts_with('#') || !names_lane(line),
+            line.starts_with('#') || !names_lane(line) || dependency_only,
             "a lane is named outside the checks job: {line:?}. The UNRUN and scope \
              claims are about that job alone; running a lane elsewhere needs the \
              derivation taught about it first"
@@ -5962,6 +6482,18 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
             continue;
         }
         if !names_lane(line) {
+            continue;
+        }
+        let scripts = named_scripts(line);
+        if !scripts.is_empty()
+            && scripts
+                .iter()
+                .all(|script| dependency_helpers.contains(&script.as_str()))
+        {
+            assert!(
+                is_exact_dependency_helper_call(line),
+                "unreadable dependency preparation invocation {line:?}"
+            );
             continue;
         }
         // `- name:` above a step is an ordinary edit, so accept the bare `run:` form.
@@ -6066,19 +6598,36 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
     // The rest of that line is prose, so pin the steps it claims.
     // Full strings: "test --locked" alone was also matched by the diagnostic
     // step, so deleting the workspace test gate left this claim standing.
-    for gate in [
-        "fmt --all -- --check",
-        "check --locked --workspace --all-targets",
-        "test --locked --workspace --all-targets",
-        "clippy --locked --workspace --all-targets -- -D warnings",
+    assert_hosted_offline_gates(checks).unwrap();
+    assert_hosted_dependency_preparation(&ci).unwrap();
+    for marker in [
+        "--metadata \"Cargo.toml=$RUNNER_TEMP/root-metadata.json\"",
+        "--metadata \"crates/ebpf/Cargo.toml=$RUNNER_TEMP/bpf-metadata.json\" --ledger",
     ] {
+        let missing = ci.replacen(marker, "", 1);
         assert!(
-            checks
-                .lines()
-                .map(str::trim)
-                .filter_map(command_of)
-                .any(|call| call == format!("cargo +1.88 {gate}")),
-            "the scope: line claims the {gate} gate, which no step runs"
+            assert_hosted_dependency_preparation(&missing).is_err(),
+            "removing either metadata context must fail preparation activation"
+        );
+    }
+    let prepare = "run: python3 -I scripts/prepare-dependencies.py";
+    let first_project = "run: cargo +1.88 fetch --locked --manifest-path Cargo.toml";
+    let moved = ci.replacen(prepare, "", 1).replacen(
+        first_project,
+        &format!("{first_project}\n        {prepare}"),
+        1,
+    );
+    assert!(
+        assert_hosted_dependency_preparation(&moved).is_err(),
+        "dependency reconstruction after the first project operation must fail"
+    );
+    for gate in ["check", "test", "clippy"] {
+        let offline = format!("{gate} --locked --offline");
+        let online = format!("{gate} --locked");
+        let missing_offline = checks.replacen(&offline, &online, 1);
+        assert!(
+            assert_hosted_offline_gates(&missing_offline).is_err(),
+            "removing --offline from the {gate} gate must fail"
         );
     }
     for path in &expected {

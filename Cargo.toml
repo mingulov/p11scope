@@ -40,8 +40,8 @@ tempfile = "3"
 
 [workspace]
 members = ["crates/discover", "crates/manifest", "crates/ebpf-common"]
-exclude = ["third-party/aya", "third-party/aya-obj"]
+exclude = ["third-party/src/aya-0.14.0-p1", "third-party/src/aya-obj-0.3.0-p1"]
 
 [patch.crates-io]
-aya = { path = "third-party/aya" }
-aya-obj = { path = "third-party/aya-obj" }
+aya = { path = "third-party/src/aya-0.14.0-p1" }
+aya-obj = { path = "third-party/src/aya-obj-0.3.0-p1" }

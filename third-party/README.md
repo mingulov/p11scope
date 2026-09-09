@@ -1,8 +1,16 @@
 # Local dependency corrections
 
+`sources.json` is the source of truth for reconstructed packages. From a fresh
+checkout, `python3 -I scripts/prepare-dependencies.py` obtains and verifies the
+pinned archives; `--archive-dir DIRECTORY` supplies those archives explicitly.
+For offline use, populate `third-party/archives/` and pass `--offline`. The
+generated trees and receipts under `src/` are ignored, while `sources.json` and
+all files under `patches/` remain tracked.
+
 ## Aya 0.14.0
 
-`aya/` contains the published `aya` 0.14.0 package, selected by the root
+`src/aya-0.14.0-p1/` is reconstructed from the published `aya` 0.14.0 package
+and the ordered patches in `patches/aya-0.14.0/`, then selected by the root
 `[patch.crates-io]` while the dependency remains `aya = "=0.14.0"`. Its original
 MIT and Apache-2.0 license files, upstream attribution, and registry dependency
 declarations are retained. This is one package, not the Aya workspace.
@@ -49,19 +57,23 @@ lockfile retains all dependency versions and checksums except Aya's registry
 source/checksum, replaced by this local path selection. Package metadata and
 the resolved dependency graph must be compared when refreshing this patch.
 
-CI runs this explicit dependency gate after the root workspace tests, because
-the root workspace excludes Aya. Developers can run the same command from the
-repository root (use an external `CARGO_TARGET_DIR` for isolated evidence):
+CI reconstructs and validates both dependency graphs before the root workspace
+gates, then runs this explicit dependency gate because the root workspace
+excludes Aya. Developers can run the same command from the repository root;
+the target directory remains outside the immutable generated package. The
+`--offline` form assumes the locked Cargo dependencies are already cached:
 
 ```sh
-CARGO_PROFILE_TEST_OVERFLOW_CHECKS=true cargo +1.88 test --locked --manifest-path third-party/aya/Cargo.toml --lib
+CARGO_PROFILE_TEST_OVERFLOW_CHECKS=true cargo +1.88 test --locked --offline --manifest-path third-party/src/aya-0.14.0-p1/Cargo.toml --target-dir target/aya-tests --lib
 ```
 
 When validating changes to this patch, also repeat the focused `maps::ring_buf::tests`
 filter in debug with overflow checks, release with overflow checks, and ordinary
 release. Repository release gates and supported-kernel runtime qualification
-remain separate. Source export and offline packaging must retain this path
-package; vendoring registry dependencies alone does not include it.
+remain separate. Source exports omit generated trees and must retain
+`sources.json`, every named patch, and the exact archives when the export must
+reconstruct without network access. The generated `aya-obj` package is
+`src/aya-obj-0.3.0-p1/`; its standalone test target is `target/aya-obj-tests`.
 
 When replacing this copy with an upstream release, verify both production
 corrections and the same reader regressions before removing the patch. Do not

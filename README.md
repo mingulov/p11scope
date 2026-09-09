@@ -34,6 +34,28 @@ tree, and
 kernel floor, overhead, and the evidence/completeness model — every
 quantitative claim there cites the script that measured it).
 
+## Building from source
+
+The root manifest selects two patched crates reconstructed from
+`third-party/sources.json`; their generated trees are intentionally absent from
+Git. `scripts/cargo.sh` prepares them before executing ordinary Cargo commands:
+
+```sh
+scripts/cargo.sh +1.88 build --locked
+```
+
+Preparation downloads only the recipe-pinned crates.io archives and verifies
+their hashes, ordered patches, final tree hashes, and receipts. For an offline
+or frozen build, place the exact archives in `third-party/archives/` first, or
+run `python3 -I scripts/prepare-dependencies.py --archive-dir DIRECTORY`, then
+use `scripts/cargo.sh +1.88 build --locked --offline`. An ordinary fresh
+checkout therefore needs archive access. Git-based source exports exclude the
+generated trees, their receipts, and the local archive cache while retaining
+the recipe and patches. An offline distribution must add the exact pinned
+archives explicitly. All locked registry packages and the fixed
+`pkcs11-proxy-ng` Git revision are separate Cargo inputs and must already be
+available in the Cargo cache for a fully offline build.
+
 ## Why
 
 - **Black-box diagnostics** — "this app intermittently fails against our HSM;

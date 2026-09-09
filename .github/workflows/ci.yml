@@ -58,22 +58,42 @@ jobs:
       # toolchain that runs it (nightly); clang-18 compiles native CO-RE bitcode.
       - run: cargo +1.88 install bpf-linker --version 0.10.4 --locked
       - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 softhsm2
+      - name: Reconstruct pinned dependency sources
+        run: python3 -I scripts/prepare-dependencies.py
+      # Network acquisition is explicit and precedes every offline validation.
+      - run: cargo +1.88 fetch --locked --manifest-path Cargo.toml
+      - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
+      - run: cargo +1.88 fetch --locked --manifest-path third-party/src/aya-0.14.0-p1/Cargo.toml
+      - run: cargo +1.88 fetch --locked --manifest-path third-party/src/aya-obj-0.3.0-p1/Cargo.toml
+      - name: Verify prepared dependency selection
+        shell: bash
+        run: |
+          . scripts/prepared-dependency-tools.sh
+          p11scope_prepared_tools_select "$(command -v python3)" "$(command -v rustup)"
+          RUSTC="$P11SCOPE_PREPARED_STABLE_RUSTC" \
+            "$P11SCOPE_PREPARED_STABLE_CARGO" metadata --locked --offline --all-features --format-version 1 --manifest-path Cargo.toml >"$RUNNER_TEMP/root-metadata.json"
+          RUSTC="$P11SCOPE_PREPARED_BPF_RUSTC" \
+            "$P11SCOPE_PREPARED_BPF_CARGO" metadata --locked --offline --all-features --format-version 1 --manifest-path crates/ebpf/Cargo.toml >"$RUNNER_TEMP/bpf-metadata.json"
+          "$P11SCOPE_PREPARED_PYTHON" -I scripts/check-prepared-dependencies.py \
+            --sources third-party/sources.json \
+            --metadata "Cargo.toml=$RUNNER_TEMP/root-metadata.json" \
+            --metadata "crates/ebpf/Cargo.toml=$RUNNER_TEMP/bpf-metadata.json" --ledger
       - run: cargo +1.88 fmt --all -- --check
-      - run: cargo +1.88 check --locked --workspace --all-targets
-      - run: cargo +1.88 test --locked --workspace --all-targets
+      - run: cargo +1.88 check --locked --offline --workspace --all-targets
+      - run: cargo +1.88 test --locked --offline --workspace --all-targets
       - name: Aya dependency unit tests
         env:
           CARGO_PROFILE_TEST_OVERFLOW_CHECKS: "true"
-        run: cargo +1.88 test --locked --manifest-path third-party/aya/Cargo.toml --lib
-      - run: cargo +1.88 test --locked --manifest-path third-party/aya-obj/Cargo.toml --target-dir target --lib
-      - run: cargo +1.88 clippy --locked --workspace --all-targets -- -D warnings
+        run: cargo +1.88 test --locked --offline --manifest-path third-party/src/aya-0.14.0-p1/Cargo.toml --target-dir target/aya-tests --lib
+      - run: cargo +1.88 test --locked --offline --manifest-path third-party/src/aya-obj-0.3.0-p1/Cargo.toml --target-dir target/aya-obj-tests --lib
+      - run: cargo +1.88 clippy --locked --offline --workspace --all-targets -- -D warnings
       # libtest exits 0 when a filter matches nothing, so this step proves a test
       # actually ran rather than trusting the source to keep naming one. A rename,
       # an #[ignore], a #[cfg] that excludes it, or a deleted #[test] all empty the
       # filter identically, and all of them fail here.
       - shell: bash
         run: |
-          cargo +1.88 test --locked --features unsafe-unvalidated-metadata --test artifact_contracts -- --exact --nocapture frozen_policy_inventory_matches_embedded_object | tee "$RUNNER_TEMP/diagnostic-inventory.log"
+          cargo +1.88 test --locked --offline --features unsafe-unvalidated-metadata --test artifact_contracts -- --exact --nocapture frozen_policy_inventory_matches_embedded_object | tee "$RUNNER_TEMP/diagnostic-inventory.log"
           grep -q "^test result: ok. 1 passed" "$RUNNER_TEMP/diagnostic-inventory.log"
       - run: uname -r; cat /proc/sys/kernel/perf_event_paranoid; cat /proc/sys/kernel/yama/ptrace_scope
       # Unprivileged validator self-tests: every gate oracle, plus the frozen

@@ -836,7 +836,6 @@ fn root_cancel_output_case(is_trace: bool, partial: bool) {
         assert_eq!(before, (2, 0, 0, 2, 2, 2));
         let signals = SignalState::new();
         let exit = OriginalRootExit::test_reaped(domain.clone());
-        let tail = crate::events::OwnedRootTail::new(exit, Instant::now() + Duration::from_secs(1));
         let mut source = crate::events::root_fence_tests::source([]);
         if partial {
             let mut event = ev(100, 10, 0, 7);
@@ -854,6 +853,9 @@ fn root_cancel_output_case(is_trace: bool, partial: bool) {
         let mut drain = EventDrain::over_domain(source, domain);
         let mut tracer = trace::Tracer::new(&plan());
         let mut root_write_error = None;
+        let scope = scope();
+        let tail =
+            crate::events::OwnedRootTail::new(exit, Instant::now() + Duration::from_secs(30));
         let root = drain_original_root_events_from(&mut drain, tail, &signals, |domain, event| {
             if is_trace {
                 reduce_trace_event(
@@ -861,7 +863,7 @@ fn root_cancel_output_case(is_trace: bool, partial: bool) {
                     &mut Some(0),
                     &mut state,
                     &mut tracker,
-                    &scope(),
+                    &scope,
                     &mut tracer,
                     &mut Vec::new(),
                     &mut true,
@@ -870,7 +872,7 @@ fn root_cancel_output_case(is_trace: bool, partial: bool) {
                     event,
                 )?;
             } else {
-                reduce_profile_event(domain, &mut tracker, &mut state, &scope(), event)?;
+                reduce_profile_event(domain, &mut tracker, &mut state, &scope, event)?;
             }
             if !signals.interrupted() {
                 signals.observe(signal);

@@ -42,6 +42,13 @@ with open(ledger, "a", encoding="utf-8") as stream:
     os.fsync(stream.fileno())
 PY
 }
+observe_release_deletion() {
+    [ -f "$D2_STATE/last-release-path" ] || return 0
+    previous_release=$(cat "$D2_STATE/last-release-path") || return 1
+    [ ! -e "$previous_release" ] && [ ! -L "$previous_release" ] || return 1
+    basename "$previous_release" >> "$D2_STATE/release-deletion-observed" || return 1
+    rm -f "$D2_STATE/last-release-path"
+}
 case "$name" in
 mkdir)
     mkdir_target=
@@ -94,13 +101,23 @@ git)
     case " $* " in
         *" --show-object-format "*) echo sha1; exit 0 ;;
         *" ls-files --others --exclude-standard -- "*) exec "$D2_UNTRACKED_FIXTURE" "$@" ;;
-        *" ls-files "*) exec /usr/bin/git -C "$D2_ORIGINAL_ROOT" "$@" ;;
+        *" ls-files -z -- "*) exec "$D2_FIXTURES/candidate-git.py" "$@" ;;
         *" status --porcelain=v1 "*) [ ! -e "$D2_STATE/mutate-head" ] || echo ' M scripts/matrix/verify-knative.sh'; exit 0 ;;
         *" diff --quiet "*|*" diff --cached --quiet "*) [ ! -e "$D2_STATE/mutate-head" ]; exit $? ;;
     esac
     exit 1 ;;
-cargo)
-    if [ "$2" = --version ] || [ "$3" = --version ]; then echo 'cargo 1.88.0 (fake)'; exit 0; fi
+cargo|"stable cargo"|"bpf cargo")
+    if [ "${1-}" = --version ]; then echo 'cargo 1.88.0 (fake)'; exit 0; fi
+    [ "${1-}" != metadata ] || exec /usr/bin/python3 -I "$D2_METADATA_CARGO" "$@"
+    if [ "${1-}" = build ]; then
+        printf 'selected-build-rustc %s\n' "${RUSTC-}" >> "$D2_STATE/calls"
+        printf 'selected-build-stable-cargo %s\n' "$0" >> "$D2_STATE/calls"
+        printf 'selected-build-stable-rustc %s\n' "${RUSTC-}" >> "$D2_STATE/calls"
+        printf 'selected-build-bpf-cargo %s\n' \
+            "${P11SCOPE_PREPARED_BPF_CARGO-}" >> "$D2_STATE/calls"
+        printf 'selected-build-bpf-rustc %s\n' \
+            "${P11SCOPE_PREPARED_BPF_RUSTC-}" >> "$D2_STATE/calls"
+    fi
     target=target; previous=
     for argument do [ "$previous" = --target-dir ] && target=$argument; previous=$argument; done
     mkdir -p "$target/release/build/p11scope-1/out" "$target/release"
@@ -115,20 +132,28 @@ cargo)
     fi
     [ "$D2_MODE" = mutate-head ] && : > "$D2_STATE/mutate-head"
     exit 0 ;;
-rustc) echo 'rustc 1.88.0 (fake)'; exit 0 ;;
+rustc|"stable rustc"|"bpf rustc") echo 'rustc 1.88.0 (fake)'; exit 0 ;;
+rustup)
+    [ "$#" -eq 4 ] && [ "$1" = which ] && [ "$2" = --toolchain ] || exit 64
+    case "$3:$4" in
+        1.88:cargo) printf '%s\n' "$D2_STABLE_CARGO" ;;
+        1.88:rustc) printf '%s\n' "$D2_STABLE_RUSTC" ;;
+        nightly-2026-05-20:cargo) printf '%s\n' "$D2_BPF_CARGO" ;;
+        nightly-2026-05-20:rustc) printf '%s\n' "$D2_BPF_RUSTC" ;;
+        *) exit 65 ;;
+    esac ;;
 python3)
-    if [ "$1" = - ] && [ "${5-}" = start ] \
-        && [ "$D2_MODE" = start-ledger-failure ]; then
-        printf 'missing-consumed-input\000' >> "$3"
+    if [ "$D2_MODE" = outer-final-snapshot-unknown ] \
+        && [ -z "${P11SCOPE_LANE13_BODY-}" ] \
+        && [ "$#" -eq 3 ] && [ "$1" = -I ] && [ "$2" = - ]; then
+        exit 75
     fi
-    if [ "$1" = - ] && [ "${5-}" = end ] \
-        && [ "$D2_MODE" = end-ledger-failure ]; then
-        printf 'missing-consumed-input\000' >> "$3"
-    fi
-    if [ "$1" = - ] && [ -z "${5-}" ] \
-        && printf '%s\n' "${2-}" | grep -Fq .lane13-inputs-start \
-        && printf '%s\n' "${3-}" | grep -Fq .lane13-inputs-end; then
-        : > "$D2_STATE/input-compare-called"
+    if [ "$1" = -I ] && [ "$2" = scripts/lane13-input-ledger.py ] \
+        && [ "$3" = snapshot ]; then
+        case "$D2_MODE:$*" in
+            start-ledger-failure:*" --phase start "*) exit 73 ;;
+            end-ledger-failure:*" --phase end "*) exit 74 ;;
+        esac
     fi
     if [ "$1" = scripts/check-capture-evidence.py ]; then
         printf '%s\n' checker >> "$D2_STATE/checker.calls"
@@ -160,32 +185,24 @@ gcc)
     for argument do [ "$previous" = -o ] && output=$argument; previous=$argument; done
     : > "$output"; chmod 755 "$output"; exit 0 ;;
 curl)
-    if [ "$1" = --version ]; then echo 'curl 8.4.0'; exit 0; fi
-    output=; previous=; url=
-    for argument do
-        [ "$previous" = --output ] && output=$argument
-        case "$argument" in https://*) url=$argument ;; esac
-        previous=$argument
-    done
-    [ -n "$output" ] || exit 0
-    release_name=${output##*/}
-    case "$url:$release_name" in
-        https://github.com/knative/serving/releases/download/knative-v1.23.0/serving-crds.yaml:serving-crds.yaml|\
-        https://github.com/knative/serving/releases/download/knative-v1.23.0/serving-core.yaml:serving-core.yaml|\
-        https://github.com/knative-extensions/net-kourier/releases/download/knative-v1.23.0/kourier.yaml:kourier.yaml) ;;
-        *) exit 1 ;;
-    esac
-    release_source=$D2_RELEASE_FIXTURES/$release_name
-    if [ "$D2_MODE" = pre-apply-release-corruption ] \
-        && [ "$release_name" = "${D2_CORRUPT_RELEASE:?}" ]; then
-        release_source=$D2_CORRUPT_RELEASE_FIXTURES/$release_name
+    if [ "$#" -eq 1 ] && [ "$1" = --version ]; then echo 'curl 8.4.0'; exit 0; fi
+    if [ "$#" -eq 6 ] && [ "$1" = -fsS ] && [ "$2" = -H ] \
+        && [ "$3" = 'Host: fake.example' ] && [ "$5" = --max-time ] \
+        && [ "$6" = 60 ]; then
+        case "$4" in http://127.0.0.1:*/ ) exit 0 ;; *) exit 66 ;; esac
     fi
-    /bin/cp -- "$release_source" "$output" || exit 1
-    printf '%s\n%s\n' "$url" 0
-    exit 0 ;;
+    observe_release_deletion || exit 1
+    exec /usr/bin/python3 -I "$D2_FIXTURES/release-fetch.py" "$@" ;;
 docker)
     case " $* " in
-        *" version --format "*) [ "$D2_MODE" = setup-failure ] && exit 1; echo 27.0.0; exit 0 ;;
+        *" version --format "*)
+            [ "$D2_MODE" = setup-failure ] && exit 1
+            if [ "$D2_MODE" = work-collision ]; then
+                /bin/mkdir -p "$work"
+                printf '%s\n' foreign > "$work/foreign-sentinel"
+                printf '%s\n' "$work" > "$D2_STATE/work-collision-path"
+            fi
+            echo 27.0.0; exit 0 ;;
         *" info --format "*) echo overlay2; exit 0 ;;
         *" image ls "*)
             [ "$D2_MODE" = image-query-failure ] && exit 1
@@ -196,7 +213,7 @@ docker)
             fi
             exit 0 ;;
         *" pull "*) exit 0 ;;
-        *" build "*) : > "$D2_STATE/image-created"; echo sha256:workload; exit 0 ;;
+        *" build "*) case " $* " in *" --pull=false "*) ;; *) exit 64 ;; esac; : > "$D2_STATE/image-created"; echo sha256:workload; exit 0 ;;
         *" image rm "*) : > "$D2_STATE/image-cleaned"; [ "$D2_MODE" = cleanup-image-failure ] && exit 1; : > "$D2_STATE/image-removed"; exit 0 ;;
         *" container inspect "*)
             case " $* " in *" {{.Id}} "*) echo node-id ;; *" {{.Image}} "*) echo sha256:nodeimage ;; *) echo kindest/node:v1.33 ;; esac; exit 0 ;;
@@ -236,10 +253,11 @@ kind)
             echo fake-node; exit 0 ;;
         *" create cluster "*) mkdir -p "$(dirname "$KUBECONFIG")"; : > "$KUBECONFIG"; chmod 600 "$KUBECONFIG"; : > "$D2_STATE/cluster"; exit 0 ;;
         *" load docker-image "*) exit 0 ;;
-        *" delete cluster "*) : > "$D2_STATE/cluster-delete-called"; [ "$D2_MODE" = cleanup-cluster-failure ] || rm -f "$D2_STATE/cluster"; [ "$D2_MODE" = cleanup-cluster-failure ] && exit 1 || exit 0 ;;
+        *" delete cluster "*) : > "$D2_STATE/cluster-delete-called"; [ "$D2_MODE" = cleanup-cluster-failure ] || rm -f "$D2_STATE/cluster"; if [ "$D2_MODE" = cleanup-cluster-failure ]; then echo 'controlled cluster cleanup failure' >&2; exit 1; fi; exit 0 ;;
     esac
     exit 1 ;;
 kubectl)
+    [ "${1-}" = apply ] || observe_release_deletion || exit 1
     case " $* " in
         *" version --client "*) echo gitVersion: v1.33.0; exit 0 ;;
         *" get deployment "*) exit 1 ;;
@@ -255,16 +273,25 @@ kubectl)
             for argument do [ "$previous" = -f ] && file=$argument; previous=$argument; done
             case "$file" in
                 *serving-crds.yaml|*serving-core.yaml|*kourier.yaml)
+                    [ "$#" -eq 5 ] && [ "$1" = apply ] && [ "$2" = -f ] \
+                        && [ "$4" = -o ] && [ "$5" = name ] || exit 64
                     release_name=${file##*/}
+                    release_dir=$(cd "${file%/*}" && pwd -P) || exit 1
+                    [ "$release_dir/$release_name" = "$work/releases/$release_name" ] || exit 65
                     printf '%s\n' "$release_name" >> "$D2_STATE/release-applies"
                     if [ "$D2_MODE" = during-apply-release-corruption ] \
                         && [ "$release_name" = "${D2_CORRUPT_RELEASE:?}" ]; then
                         /bin/cp -- "$D2_CORRUPT_RELEASE_FIXTURES/$release_name" "$file" \
                             || exit 1
                     fi
-                    echo configmaps/fake
+                    case "$release_name" in
+                        serving-crds.yaml) printf '%s\n' namespace/knative-serving customresourcedefinitions.apiextensions.k8s.io/fake ;;
+                        serving-core.yaml) printf '%s\n' service/controller deployment.apps/controller ;;
+                        kourier.yaml) printf '%s\n' service/kourier namespace/kourier-system ;;
+                    esac
+                    printf '%s\n' "$release_dir/$release_name" > "$D2_STATE/last-release-path"
                     exit 0 ;;
-                *ksvc.yaml) for name in observed.json manifest-host.json profile.log portforward.log portforward.group.before.json portforward.group.after.json; do : > "$work/$name"; done; : > "$work/foreign-unrelated.tmp"; case "$D2_MODE" in body-success|end-ledger-failure|terminal-signal|terminal-communication-timeout|terminal-readiness-failure|body-port-forward-hold|cleanup-image-query-failure|cleanup-cluster-query-failure|cleanup-node-query-failure) exit 0 ;; esac; exit 1 ;;
+                *ksvc.yaml) for name in observed.json manifest-host.json profile.log portforward.log portforward.group.before.json portforward.group.after.json; do : > "$work/$name"; done; : > "$work/foreign-unrelated.tmp"; case "$D2_MODE" in body-success|end-ledger-failure|terminal-signal|terminal-communication-timeout|terminal-readiness-failure|body-port-forward-hold|cleanup-image-query-failure|cleanup-cluster-query-failure|cleanup-node-query-failure|outer-final-snapshot-unknown) exit 0 ;; esac; exit 1 ;;
                 *) exit 0 ;;
             esac ;;
     esac
@@ -278,14 +305,19 @@ kubectl)
         printf '{"metadata":{"namespace":"%s","name":"%s","uid":"uid-%s"},"spec":{"containers":[{"name":"anchor","image":"kind.local/fake:tag"}]},"status":{"containerStatuses":[{"name":"anchor","containerID":"containerd://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","imageID":"sha256:runtime","ready":true,"restartCount":0}]}}\n' "$namespace" "$pod" "$pod"; exit 0
     fi
     case " $* " in
-        *" config use-context "*|*" wait "*|*" patch "*|*" set env "*) exit 0 ;;
+        *" config use-context "*) observe_release_deletion || exit 1; exit 0 ;;
+        *" wait "*|*" patch "*|*" set env "*) exit 0 ;;
         *" port-forward "*)
             record_fixture_pid dispatch-kubectl
-            case "$D2_MODE" in body-success|end-ledger-failure|terminal-signal|terminal-communication-timeout|terminal-readiness-failure|body-port-forward-hold|cleanup-image-query-failure|cleanup-cluster-query-failure|cleanup-node-query-failure) exec "$D2_PORT_FORWARD_HELPER" "$@" ;; *) sleep "$D2_HOLD_SECONDS"; exit 143 ;; esac ;;
+            case "$D2_MODE" in body-success|end-ledger-failure|terminal-signal|terminal-communication-timeout|terminal-readiness-failure|body-port-forward-hold|cleanup-image-query-failure|cleanup-cluster-query-failure|cleanup-node-query-failure|outer-final-snapshot-unknown) exec "$D2_PORT_FORWARD_HELPER" "$@" ;; *) sleep "$D2_HOLD_SECONDS"; exit 143 ;; esac ;;
     esac
     exit 0 ;;
 sudo)
     [ "$1" = -n ] && shift
+    case "$D2_MODE:$*" in
+        mutate-prepared-*:true)
+            /usr/bin/python3 -I "$D2_FIXTURES/prepared-mutation.py" || exit 1 ;;
+    esac
     if [ "$1" = timeout ]; then
         shift
         while [ "$#" -gt 0 ]; do case "$1" in --signal=*|--kill-after=*) shift ;; --signal|--kill-after) shift 2 ;; *s) shift; break ;; *) break ;; esac; done

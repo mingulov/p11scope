@@ -18,12 +18,16 @@ import tempfile
 import time
 import unittest
 from unittest import mock
+import runpy
 
 
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = ROOT / "tests/fixtures/lane13-evidence"
 RELEASE_FIXTURES = FIXTURES / "releases"
 GATE = ROOT / "scripts/matrix/verify-knative.sh"
+EvidenceFixture = runpy.run_path(
+    str(ROOT / "tests/python/test_prepared_dependency_evidence.py")
+)["EvidenceFixture"]
 EBPF_OBJECT = None
 RELEASES = (
     ("serving-crds.yaml", 411211,
@@ -39,6 +43,117 @@ READINESS_DIAGNOSTIC_TAIL_BYTES = 2048
 READINESS_DIAGNOSTIC_FIELD_BYTES = 1024
 READINESS_DIAGNOSTIC_MAX_BYTES = 8192
 READINESS_DIAGNOSTIC_TRUNCATION = "; diagnostic_truncated=1"
+TERMINAL_READINESS_TIMEOUT_SECONDS = 20
+
+
+class Lane13InputLedgerTests(unittest.TestCase):
+    """Actual-CLI tests for the maintained lane-13 source snapshot helper."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="p11scope lane13 ledger ")
+        self.addCleanup(self.temporary.cleanup)
+        self.base = Path(self.temporary.name)
+        self.project = self.base / "project with spaces"
+        self.project.mkdir()
+        self.bin = self.base / "bin"
+        self.bin.mkdir()
+        (self.project / "scripts").mkdir()
+        for name in ("lane13-input-ledger.py", "merge-checksum-ledgers.py"):
+            source = ROOT / "scripts" / name
+            if source.exists():
+                shutil.copy2(source, self.project / "scripts" / name)
+        self.git = self.bin / "git"
+        self.git.symlink_to(FIXTURES / "candidate-git.py")
+        self.paths = (
+            ".cargo/config.toml",
+            "Cargo.toml",
+            "Cargo.lock",
+            "build.rs",
+            "build_support/bpf_tools.rs",
+            "src/main.rs",
+            "crates/demo/Cargo.toml",
+            "third-party/sources.json",
+            "third-party/patches/demo/ordered patch.diff",
+            "scripts/lane13-input-ledger.py",
+            "scripts/merge-checksum-ledgers.py",
+            "scripts/helper with spaces.sh",
+        )
+        for relative in self.paths:
+            path = self.project / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if not path.exists():
+                path.write_text(f"fixture {relative}\n", encoding="utf-8")
+        self.generated_relative = "third-party/src/generated crate/src/lib.rs"
+        generated = self.project / self.generated_relative
+        generated.parent.mkdir(parents=True)
+        generated.write_text("generated fixture\n", encoding="utf-8")
+        self.generated = self.base / "generated ledger.sha256"
+        self.generated.write_text(
+            f"{hashlib.sha256(generated.read_bytes()).hexdigest()}  {self.generated_relative}\n",
+            encoding="utf-8",
+        )
+        self.output = self.base / "source snapshot.sha256"
+        self.facts = self.base / "facts log"
+        self.config = self.base / "git inventory.json"
+        self.config.write_text(json.dumps({
+            "root": str(self.project),
+            "delegate": False,
+            "tracked_paths": list(self.paths),
+        }), encoding="utf-8")
+
+    def run_helper(self, phase="start", generated=None, output=None, facts=None):
+        return subprocess.run(
+            [
+                sys.executable, "-I", str(self.project / "scripts/lane13-input-ledger.py"),
+                "snapshot", "--phase", phase,
+                "--generated-ledger", str(generated or self.generated),
+                "--output", str(output or self.output),
+                "--facts", str(facts or self.facts),
+            ],
+            cwd=self.project,
+            env=os.environ | {
+                "PATH": f"{self.bin}:/usr/bin:/bin",
+                "D2_CANDIDATE_INPUTS": str(self.config),
+            },
+            text=True,
+            capture_output=True,
+            timeout=5,
+        )
+
+    def test_snapshot_hashes_fixed_tracked_inventory_and_merges_generated_rows(self):
+        result = self.run_helper()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = self.output.read_text(encoding="utf-8").splitlines()
+        expected_paths = sorted((*self.paths, self.generated_relative), key=os.fsencode)
+        self.assertEqual([row[66:] for row in rows], expected_paths)
+        self.assertIn("scripts/helper with spaces.sh", [row[66:] for row in rows])
+        self.assertIn("build_support/bpf_tools.rs", [row[66:] for row in rows])
+        facts = self.facts.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(
+            facts,
+            [f"input_ledger_start={row[:64]} path={row[66:]}" for row in rows],
+        )
+
+    def test_snapshot_refuses_empty_missing_duplicate_and_existing_outputs(self):
+        cases = {
+            "empty": "",
+            "missing": f"{'0' * 64}  third-party/src/missing.rs\n",
+            "duplicate": self.generated.read_text(encoding="utf-8") * 2,
+        }
+        for name, content in cases.items():
+            with self.subTest(name=name):
+                generated = self.base / f"{name}.sha256"
+                generated.write_text(content, encoding="utf-8")
+                output = self.base / f"{name}.out"
+                facts = self.base / f"{name}.facts"
+                result = self.run_helper(generated=generated, output=output, facts=facts)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(output.exists())
+                self.assertFalse(facts.exists())
+        self.output.write_text("foreign\n", encoding="utf-8")
+        result = self.run_helper()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.output.read_text(encoding="utf-8"), "foreign\n")
 
 
 class OwnedCommunicationTimeout(RuntimeError):
@@ -71,25 +186,38 @@ class Lane13EvidenceTests(unittest.TestCase):
         self.state = self.root / "state"
         self.addCleanup(self.outside_temp.cleanup)
         self.addCleanup(self.cleanup_case)
-        self.project = self.root / "project"
-        self.project.mkdir()
+        prepared_area = self.root / "prepared"
+        prepared_area.mkdir()
+        self.prepared = EvidenceFixture(prepared_area)
+        self.project = self.prepared.root
         self.gate = self.project / "scripts/matrix/verify-knative.sh"
         tracked = subprocess.run(
             ["/usr/bin/git", "-C", str(ROOT), "ls-files", "-z", "--",
-             ".cargo", "Cargo.toml", "Cargo.lock", "build.rs", "src", "crates",
-             "scripts", "spike", "third-party/aya"],
+             ".cargo", "Cargo.toml", "Cargo.lock", "build.rs", "rust-toolchain.toml",
+             "build_support", "src", "crates", "scripts", "spike", "third-party"],
             check=True, stdout=subprocess.PIPE, timeout=5,
         ).stdout.split(b"\0")
+        tracked_paths = []
         for raw in tracked:
             if not raw:
                 continue
-            relative = Path(os.fsdecode(raw))
+            relative_text = os.fsdecode(raw)
+            relative = Path(relative_text)
+            if relative_text not in tracked_paths:
+                tracked_paths.append(relative_text)
             destination = self.project / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(ROOT / relative, destination)
-        reached = Path("scripts/recorded-process-exec.py")
-        (self.project / reached).parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(ROOT / reached, self.project / reached)
+            if not destination.exists():
+                shutil.copy2(ROOT / relative, destination)
+        for reached in (
+            Path("scripts/recorded-process-exec.py"),
+            Path("scripts/lane13-input-ledger.py"),
+        ):
+            (self.project / reached).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / reached, self.project / reached)
+            reached_text = str(reached)
+            if reached_text not in tracked_paths:
+                tracked_paths.append(reached_text)
         self.release_fixtures = self.project / "tests/fixtures/lane13-evidence/releases"
         shutil.copytree(RELEASE_FIXTURES, self.release_fixtures, dirs_exist_ok=True)
         self.corrupt_release_fixtures = self.root / "corrupt-releases"
@@ -109,19 +237,35 @@ class Lane13EvidenceTests(unittest.TestCase):
         self.dispatch = self.fake_bin / "dispatch"
         shutil.copy2(FIXTURES / "dispatch.sh", self.dispatch)
         self.dispatch.chmod(0o755)
+        self.metadata_cargo = self.root / "metadata-cargo.py"
+        shutil.copy2(FIXTURES / "prepared-metadata.py", self.metadata_cargo)
+        for name in ("stable cargo", "stable rustc", "bpf cargo", "bpf rustc"):
+            destination = self.prepared.tools / name
+            destination.unlink()
+            shutil.copy2(self.dispatch, destination)
+            destination.chmod(0o755)
         self.port_forward = self.fake_bin / "kubectl"
-        subprocess.run(
-            ["/usr/bin/cc", "-O0", "-o", str(self.port_forward),
-             str(FIXTURES / "port-forward.c")],
-            check=True,
-            timeout=5,
-        )
+        if self._testMethodName.startswith("test_prepared_"):
+            shutil.copy2(self.dispatch, self.port_forward)
+            self.port_forward.chmod(0o755)
+        else:
+            subprocess.run(
+                ["/usr/bin/cc", "-O0", "-o", str(self.port_forward),
+                 str(FIXTURES / "port-forward.c")],
+                check=True,
+                timeout=5,
+            )
         for command in (
-            "git", "cargo", "rustc", "gcc", "curl", "docker", "kind",
+            "git", "cargo", "rustc", "rustup", "gcc", "curl", "docker", "kind",
             "sudo", "timeout", "readelf", "cp", "tar", "sha256sum",
             "python3", "mkdir", "cmp",
         ):
             (self.fake_bin / command).symlink_to("dispatch")
+        for command in ("python3", "rustup"):
+            path = self.fake_bin / command
+            path.unlink()
+            shutil.copy2(self.dispatch, path)
+            path.chmod(0o755)
         self.env = os.environ.copy()
         self.env.update({
             "PATH": f"{self.fake_bin}:/usr/bin:/bin",
@@ -146,7 +290,39 @@ class Lane13EvidenceTests(unittest.TestCase):
                     else "untracked-query-current.sh"
                 )
             ),
+            "D2_CANDIDATE_INPUTS": str(self.root / "candidate-inputs.json"),
+            "D2_METADATA_CARGO": str(self.metadata_cargo),
+            "P11SCOPE_FAKE_CARGO_CONFIG": str(self.prepared.config_path),
+            "D2_STABLE_CARGO": str(self.prepared.tools / "stable cargo"),
+            "D2_STABLE_RUSTC": str(self.prepared.tools / "stable rustc"),
+            "D2_BPF_CARGO": str(self.prepared.tools / "bpf cargo"),
+            "D2_BPF_RUSTC": str(self.prepared.tools / "bpf rustc"),
         })
+        alternate = self.root / "alternate-root-metadata.json"
+        alternate_metadata = json.loads(self.prepared.root_metadata.read_text(encoding="utf-8"))
+        alternate_metadata["resolve"]["nodes"][0]["features"].append("redirected")
+        alternate.write_text(json.dumps(alternate_metadata), encoding="utf-8")
+        self.prepared.config.update({
+            "lane13_cargo_config": str(self.project / ".cargo/config.toml"),
+            "lane13_redirected_root_metadata": str(alternate),
+        })
+        self.prepared.write_config()
+        mutation_config = self.root / "prepared-mutation.json"
+        mutation_config.write_text(json.dumps({
+            "generated": str(self.prepared.base.output / "src/lib.rs"),
+            "recipe": str(self.project / "third-party/sources.json"),
+            "patch": str(self.project / self.prepared.base.record["patches"][0]),
+            "script": str(self.project / "scripts/prepared-dependency-evidence.py"),
+            "selection": str(self.prepared.selection),
+            "alternate_root_metadata": str(alternate),
+            "cargo_config": str(self.project / ".cargo/config.toml"),
+        }), encoding="utf-8")
+        self.env["D2_MUTATION_CONFIG"] = str(mutation_config)
+        (self.root / "candidate-inputs.json").write_text(json.dumps({
+            "root": str(ROOT),
+            "delegate": False,
+            "tracked_paths": tracked_paths,
+        }), encoding="utf-8")
 
     @staticmethod
     def read_process_snapshot(pid):
@@ -572,7 +748,8 @@ class Lane13EvidenceTests(unittest.TestCase):
             "terminal-signal-ready", "terminal-signal-go", "terminal-communication-go",
             "terminal-readiness-hold", "sleep-build-ready", "checker.calls",
             "input-compare-called", "git-compare-called",
-            "release-applies",
+            "release-applies", "release-deletion-observed", "last-release-path",
+            "curl-argv.jsonl", "work-collision-path",
         ):
             try:
                 (self.state / marker).unlink()
@@ -606,6 +783,8 @@ class Lane13EvidenceTests(unittest.TestCase):
             raise ValueError("owned evidence root must be absolute")
         if evidence not in self.evidence_roots:
             self.evidence_roots.append(evidence)
+        self.prepared.config["prefix"] = str(evidence / "dependencies")
+        self.prepared.write_config()
         owner = secrets.token_hex(16)
         launch_env = env.copy()
         launch_env["D2_OWNER_ID"] = owner
@@ -865,7 +1044,7 @@ class Lane13EvidenceTests(unittest.TestCase):
             "P11SCOPE_LANE13_TOKEN is private lane state", "LANE13_BODY_STARTTIME",
             "LANE13_BODY_SIGNAL", "lane13_container_absent",
             "len(items) != len(set(items))", "for item in sorted(items):",
-            "git diff --cached --quiet", "input_ledger_start=", "input_ledger_end=",
+            "git diff --cached --quiet", "scripts/lane13-input-ledger.py snapshot",
             "RepoDigests", "diff_ids", "dev_ino",
         ):
             self.assertIn(marker, gate)
@@ -878,6 +1057,158 @@ class Lane13EvidenceTests(unittest.TestCase):
         self.assertLess(signal_check, status_write)
         retained = gate.rindex("if ! lane13_validate_retained_root; then lane13_outer_status=1; fi")
         self.assertLess(retained, status_write)
+
+    def test_prepared_metadata_failures_stop_before_privilege_runtime_and_work(self):
+        for context in ("root", "bpf"):
+            with self.subTest(context=context):
+                self.prepared.config.pop("root_status", None)
+                self.prepared.config.pop("bpf_status", None)
+                self.prepared.config[f"{context}_status"] = 42
+                output, evidence = self.run_lane(
+                    f"prepared-{context}-failure", f"prepared-{context}-failure"
+                )
+                self.assertNotEqual(output.returncode, 0)
+                calls = self.calls().splitlines()
+                forbidden = ("sudo ", "docker ", "kind ", "gcc ")
+                self.assertFalse(any(line.startswith(forbidden) for line in calls), calls)
+                self.assertFalse(any(" build " in f" {line} " for line in calls), calls)
+                self.assertFalse(any(line.startswith("mkdir ") and "target/matrix-knative" in line
+                                     for line in calls), calls)
+                facts = self.facts(evidence)
+                self.assertIn("input_ledger_phase=unavailable-start", facts)
+                self.assertNotIn("prepared_recheck_status=", facts)
+                self.assertFalse((evidence / "source.start.sha256").exists())
+                self.assertFalse(any(path.name.startswith("dependencies.final.")
+                                     for path in evidence.iterdir()))
+
+    def test_prepared_stale_input_is_refused_before_privilege_runtime_and_work(self):
+        generated = self.prepared.base.output / "src/lib.rs"
+        original = generated.read_bytes()
+        self.prepared.config["root_mutations"] = [{
+            "path": str(generated), "action": "append", "content": "stale during capture\n",
+        }]
+        output, evidence = self.run_lane("prepared-stale-capture")
+        self.assertNotEqual(output.returncode, 0)
+        calls = self.calls().splitlines()
+        self.assertFalse(any(line.startswith(("sudo ", "docker ", "kind ", "gcc "))
+                             for line in calls), calls)
+        self.assertFalse(any(" build " in f" {line} " for line in calls), calls)
+        self.assertFalse((evidence / "source.start.sha256").exists())
+        self.assertIn("input_ledger_phase=unavailable-start", self.facts(evidence))
+        generated.write_bytes(original)
+        self.prepared.config.pop("root_mutations")
+
+    def test_prepared_initial_and_final_queries_bracket_all_resource_cleanup(self):
+        self.prepared.config.pop("root_status", None)
+        self.prepared.config.pop("bpf_status", None)
+        output, evidence = self.run_lane("normal", "prepared-final-recheck")
+        self.assertNotEqual(output.returncode, 0)
+        invocations = self.prepared.invocations()
+        self.assertEqual(
+            [("initial" if index < 2 else "final", row["context"])
+             for index, row in enumerate(invocations)],
+            [("initial", "root"), ("initial", "bpf"), ("final", "root"), ("final", "bpf")],
+        )
+        calls = self.calls().splitlines()
+        metadata_calls = [
+            index for index, line in enumerate(calls)
+            if line.startswith("stable cargo metadata") or line.startswith("bpf cargo metadata")
+        ]
+        self.assertEqual(len(metadata_calls), 4, calls)
+        final_metadata = metadata_calls[2:]
+        cleanup_calls = [
+            index for index, line in enumerate(calls)
+            if line.startswith("kind get clusters") or line.startswith("docker image ls")
+        ]
+        self.assertTrue(cleanup_calls, calls)
+        self.assertLess(max(cleanup_calls), min(final_metadata))
+        for query in invocations[2:]:
+            self.assertTrue(query["lane13_work_absent"], query)
+            self.assertTrue(query["lane13_status_unpublished"], query)
+        build = [line for line in calls if line.startswith("stable cargo build ")]
+        self.assertEqual(len(build), 1, calls)
+        self.assertEqual(
+            build[0].split(),
+            ["stable", "cargo", "build", "--locked", "--offline", "--release",
+             "--workspace", "--target-dir", build[0].split()[-1]],
+        )
+        self.assertEqual(
+            [line for line in calls if line.startswith("selected-build-rustc ")],
+            [f"selected-build-rustc {self.prepared.tools / 'stable rustc'}"],
+        )
+        self.assertEqual(
+            [line for line in calls if line.startswith("selected-build-")
+             and not line.startswith("selected-build-rustc ")],
+            [
+                f"selected-build-stable-cargo {self.prepared.tools / 'stable cargo'}",
+                f"selected-build-stable-rustc {self.prepared.tools / 'stable rustc'}",
+                f"selected-build-bpf-cargo {self.prepared.tools / 'bpf cargo'}",
+                f"selected-build-bpf-rustc {self.prepared.tools / 'bpf rustc'}",
+            ],
+        )
+        for phase in ("initial", "final"):
+            for context, cargo, rustc in (
+                ("root", self.prepared.tools / "stable cargo",
+                 self.prepared.tools / "stable rustc"),
+                ("bpf", self.prepared.tools / "bpf cargo",
+                 self.prepared.tools / "bpf rustc"),
+            ):
+                command = json.loads((evidence / f"dependencies.{phase}.{context}.command.json").read_text())
+                query_context = json.loads((evidence / f"dependencies.{phase}.{context}.context.json").read_text())
+                self.assertEqual(command["argv"], [
+                    str(cargo), "metadata", "--locked", "--offline", "--all-features",
+                    "--format-version", "1", "--manifest-path",
+                    "Cargo.toml" if context == "root" else "crates/ebpf/Cargo.toml",
+                ])
+                self.assertEqual(query_context["environment"], {"RUSTC": str(rustc)})
+        expected = {"source.start.sha256", "source.end.sha256", "git.start", "git.end"}
+        for phase in ("initial", "final"):
+            for context in ("root", "bpf"):
+                for suffix in ("command.json", "context.json", "status", "stdout.json", "stderr"):
+                    expected.add(f"dependencies.{phase}.{context}.{suffix}")
+            expected.add(f"dependencies.{phase}.ledger.sha256")
+            expected.add(f"dependencies.{phase}.receipt.json")
+        self.assertTrue(expected.issubset({entry.name for entry in evidence.iterdir()}))
+        facts = self.facts(evidence)
+        self.assertIn("prepared_admission=complete", facts)
+        self.assertIn("prepared_recheck_status=0", facts)
+        self.assertIn("input_ledger_phase=complete", facts)
+
+    def test_prepared_final_recheck_refuses_every_bound_input_mutation(self):
+        targets = {
+            "mutate-prepared-generated": self.prepared.base.output / "src/lib.rs",
+            "mutate-prepared-recipe": self.project / "third-party/sources.json",
+            "mutate-prepared-patch": self.project / self.prepared.base.record["patches"][0],
+            "mutate-prepared-script": self.project / "scripts/prepared-dependency-evidence.py",
+        }
+        originals = {path: path.read_bytes() for path in targets.values()}
+        original_selection = self.prepared.selection.read_bytes()
+        modes = (*targets, "mutate-prepared-final-graph", "mutate-prepared-config-redirect")
+        for mode in modes:
+            with self.subTest(mode=mode):
+                output, evidence = self.run_lane(mode)
+                self.assertNotEqual(output.returncode, 0)
+                facts = self.facts(evidence)
+                self.assertIn("prepared_admission=complete", facts)
+                self.assertRegex(facts, r"prepared_recheck_status=[1-9][0-9]*")
+                self.assertIn("input_ledger_phase=failed-end", facts)
+                self.assertFalse((evidence / "source.end.sha256").exists())
+                if mode == "mutate-prepared-config-redirect":
+                    self.assertEqual(self.prepared.selection.read_bytes(), original_selection)
+                    self.assertTrue((self.project / ".cargo/config.toml").is_file())
+                    final_root = json.loads(
+                        (evidence / "dependencies.final.root.stdout.json").read_text()
+                    )
+                    self.assertIn(
+                        "redirected", final_root["resolve"]["nodes"][0]["features"]
+                    )
+                for path, value in originals.items():
+                    path.write_bytes(value)
+                self.prepared.selection.write_bytes(original_selection)
+                try:
+                    (self.project / ".cargo/config.toml").unlink()
+                except FileNotFoundError:
+                    pass
 
     def test_private_and_public_injection_are_refused(self):
         for arguments, extra in (
@@ -895,95 +1226,10 @@ class Lane13EvidenceTests(unittest.TestCase):
             self.assertEqual(output.returncode, 2, output.stderr)
             self.assertFalse(evidence.exists())
 
-    def test_tracked_aya_candidate_is_copied_and_hashed_by_actual_ledger(self):
-        # Synthetic tracked-name input, not final tracked-candidate qualification.
-        # The same bounded inventory serves setup and the actual ledger query;
-        # file copying, byte reads, hashing and missing-file refusal are real.
-        target = ROOT / "third-party/aya/target"
-        target.mkdir(exist_ok=True)
-        ignored_output = tempfile.TemporaryDirectory(prefix="p11scope-ignored-", dir=target)
-        self.addCleanup(ignored_output.cleanup)
-        sentinel = Path(ignored_output.name) / "generated-output.bin"
-        sentinel.write_bytes(b"owned ignored build output\n")
-        sentinel_relative = str(sentinel.relative_to(ROOT))
-        ignored = subprocess.run(
-            ["/usr/bin/git", "-C", str(ROOT), "check-ignore", "--verbose", "--",
-             sentinel_relative],
-            capture_output=True, text=True, timeout=5,
-        )
-        self.assertEqual(ignored.returncode, 0, ignored.stderr)
-        visible = subprocess.run(
-            ["/usr/bin/git", "-C", str(ROOT), "ls-files", "--cached", "--others",
-             "--exclude-standard", "-z", "--", "third-party/aya"],
-            check=True, stdout=subprocess.PIPE, timeout=5,
-        ).stdout.split(b"\0")
-        aya_paths = sorted({os.fsdecode(path) for path in visible if path})
-        self.assertTrue(aya_paths)
-        self.assertIn("third-party/aya/Cargo.lock", aya_paths)
-        inventory = self.root / "candidate-inputs.json"
-        inventory.write_text(json.dumps({"root": str(ROOT), "aya_paths": aya_paths}))
-        candidate_git = FIXTURES / "candidate-git.py"
-        candidate = Lane13EvidenceTests(methodName="runTest")
-        self.addCleanup(candidate.doCleanups)
-        original_run = subprocess.run
-
-        def candidate_query(command, *args, **kwargs):
-            if command[:4] == ["/usr/bin/git", "-C", str(ROOT), "ls-files"]:
-                command = [str(candidate_git), *command[3:]]
-                kwargs["env"] = (kwargs.get("env") or os.environ) | {
-                    "D2_CANDIDATE_INPUTS": str(inventory),
-                }
-            return original_run(command, *args, **kwargs)
-
-        with mock.patch.object(subprocess, "run", side_effect=candidate_query):
-            candidate.setUp()
-        ledger_bin = candidate.root / "ledger-bin"
-        ledger_bin.mkdir()
-        git = ledger_bin / "git"
-        git.symlink_to(candidate_git)
-        source = candidate.gate.read_text()
-        ledger = "lane13_record_inputs() {" + source.split(
-            "\nlane13_record_inputs() {", 1
-        )[1].split("\nlane13_record_facts() {", 1)[0]
-        work = candidate.root / "ledger-work"
-        work.mkdir()
-        facts = candidate.root / "ledger-facts"
-        env = candidate.env | {
-            "WORK": str(work), "FACTS": str(facts), "D2_MODE": "normal",
-            "PATH": f"{ledger_bin}:/usr/bin:/bin",
-            "D2_CANDIDATE_INPUTS": str(inventory),
-        }
-        command = ["/bin/sh", "-c", "set -eu\n" + ledger
-                   + "\nlane13_record_inputs start\nlane13_record_inputs end\n"]
-        output = subprocess.run(command, cwd=candidate.project, env=env,
-                                capture_output=True, text=True, timeout=5)
-        self.assertEqual(output.returncode, 0, output.stderr)
-        rows = facts.read_text().splitlines()
-        for relative in aya_paths:
-            raw = (ROOT / relative).read_bytes()
-            self.assertEqual((candidate.project / relative).read_bytes(), raw)
-            digest = hashlib.sha256(raw).hexdigest()
-            for phase in ("start", "end"):
-                self.assertEqual(rows.count(
-                    f"input_ledger_{phase}={digest} path={relative}"
-                ), 1)
-        self.assertEqual(
-            (work / ".lane13-inputs-start").read_bytes().replace(
-                b"input_ledger_start=", b"input_ledger_end="
-            ),
-            (work / ".lane13-inputs-end").read_bytes(),
-        )
-        self.assertFalse((candidate.project / sentinel_relative).exists(),
-                         f"ignored build output copied: {sentinel_relative}")
-        self.assertFalse(any(f" path={sentinel_relative}" in row for row in rows))
-        missing = "third-party/aya/src/maps/ring_buf.rs"
-        (candidate.project / missing).unlink()
-        refused = subprocess.run(command, cwd=candidate.project, env=env,
-                                 capture_output=True, text=True, timeout=5)
-        self.assertNotEqual(refused.returncode, 0)
-        self.assertIn(f"invalid consumed input: {missing}", refused.stderr)
-
     def test_untracked_consumed_input_is_named_refusal_before_resources(self):
+        self.env["D2_UNTRACKED_FIXTURE"] = str(
+            FIXTURES / "untracked-build-support.sh"
+        )
         output, evidence = self.run_lane("untracked-consumed-input")
         self.assertNotEqual(output.returncode, 0)
         body_stderr = (evidence / "stderr.log").read_text()
@@ -1009,16 +1255,49 @@ class Lane13EvidenceTests(unittest.TestCase):
         self.assertNotIn("Traceback", body_stderr)
         self.assertRegex((evidence / "status").read_text(), r"^[1-9][0-9]*\n$")
 
+    def test_prepared_candidate_inventory_is_frozen_against_ambient_git_index(self):
+        candidate_path = Path(self.env["D2_CANDIDATE_INPUTS"])
+        candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+        ambient = self.root / "ambient-index"
+        ambient.mkdir()
+        subprocess.run(["/usr/bin/git", "init", "-q", str(ambient)], check=True)
+        ambient_input = ambient / "scripts/ambient-new.sh"
+        ambient_input.parent.mkdir()
+        ambient_input.write_text("ambient\n", encoding="utf-8")
+        subprocess.run(
+            ["/usr/bin/git", "-C", str(ambient), "add", "scripts/ambient-new.sh"],
+            check=True,
+        )
+        candidate["root"] = str(ambient)
+        candidate_path.write_text(json.dumps(candidate), encoding="utf-8")
+        output = subprocess.run(
+            [sys.executable, "-I", str(FIXTURES / "candidate-git.py"),
+             "ls-files", "-z", "--", "scripts"],
+            env=os.environ | {"D2_CANDIDATE_INPUTS": str(candidate_path)},
+            check=True,
+            stdout=subprocess.PIPE,
+            timeout=5,
+        )
+        observed = {
+            os.fsdecode(item) for item in output.stdout.split(b"\0") if item
+        }
+        expected = {
+            path for path in candidate["tracked_paths"]
+            if path == "scripts" or path.startswith("scripts/")
+        }
+        self.assertEqual(observed, expected)
+        self.assertNotIn("scripts/ambient-new.sh", observed)
+
     def test_start_ledger_failure_after_work_is_unavailable_and_nonpass(self):
         output, evidence = self.run_lane("start-ledger-failure")
         self.assertNotEqual(output.returncode, 0)
         facts = self.facts(evidence)
-        self.assertIn("work_dev_ino=", facts)
+        self.assertNotIn("work_dev_ino=", facts)
         self.assertIn("input_ledger_phase=unavailable-start", facts)
         self.assertNotIn("input_ledger_end=", facts)
         self.assertFalse((self.state / "input-compare-called").exists())
         self.assertFalse((self.state / "git-compare-called").exists())
-        self.assertFalse(any(line.startswith("cargo +1.88 build")
+        self.assertFalse(any(" build " in f" {line} "
                              for line in self.calls().splitlines()))
         work = next(line.removeprefix("work=") for line in facts.splitlines()
                     if line.startswith("work="))
@@ -1043,7 +1322,7 @@ class Lane13EvidenceTests(unittest.TestCase):
         gate = self.gate.read_text()
         helper_start = gate.index("lane13_record_facts() {")
         helper_end = gate.index(
-            "\n}\n\nlane13_compare_input_ledgers()", helper_start
+            "\n}\n\nlane13_record_file_fact()", helper_start
         ) + 3
         helper = gate[helper_start:helper_end]
         work = self.root / "git-ledger-write-failure"
@@ -1053,6 +1332,7 @@ class Lane13EvidenceTests(unittest.TestCase):
             """#!/bin/sh
 set +e
 WORK=$1
+EVIDENCE=$WORK
 FACTS=$WORK/facts.log
 BODY_STATUS=0
 CLEANUP_STATUS=0
@@ -1141,7 +1421,7 @@ exit "$helper_status"
         self.assertEqual((evidence / "status").read_text(), "0\n")
         facts = self.facts(evidence)
         self.assertIn("input_ledger_phase=complete", facts)
-        self.assertTrue((self.state / "input-compare-called").exists())
+        self.assertTrue((self.state / "git-compare-called").exists())
         work = next(line.removeprefix("work=") for line in facts.splitlines() if line.startswith("work="))
         expected = {
             f"generated_bpf_path={work}/product/release/build/p11scope-1/out/p11scope-ebpf",
@@ -1162,21 +1442,161 @@ exit "$helper_status"
             self.assertIn(f"release_apply_success_{release_name}=1", facts)
             self.assertIn(f"release_deleted={release_name}", facts)
             self.assertIn(f"release_absent={release_name}", facts)
+            self.assertIn(f"release_redirects=1", facts)
+            self.assertIn(
+                f"release_effective=https://release-assets.githubusercontent.com/{release_name}",
+                facts,
+            )
+        expected_resources = {
+            "serving-crds.yaml": [
+                "customresourcedefinitions.apiextensions.k8s.io/fake",
+                "namespace/knative-serving",
+            ],
+            "serving-core.yaml": [
+                "deployment.apps/controller", "service/controller",
+            ],
+            "kourier.yaml": [
+                "namespace/kourier-system", "service/kourier",
+            ],
+        }
+        fact_lines = facts.splitlines()
+        for release_name, resources in expected_resources.items():
+            self.assertEqual(
+                [line for line in fact_lines
+                 if line.startswith(f"release_apply_{release_name}=")],
+                [f"release_apply_{release_name}={resource}"
+                 for resource in sorted(resources)],
+            )
+        self.assertFalse(any(line.startswith("release_apply=") for line in fact_lines))
+        self.assertNotRegex(facts, r"input_ledger_(?:start|end)=.* path=.*\.lane13-")
+        for scratch_name in (
+            ".lane13-inputs", ".lane13-git-status", ".lane13-applied",
+        ):
+            self.assertNotIn(scratch_name, facts)
         self.assertEqual(
             (self.state / "release-applies").read_text().splitlines(),
             [name for name, _, _ in RELEASES],
+        )
+        self.assertEqual(
+            (self.state / "release-deletion-observed").read_text().splitlines(),
+            [name for name, _, _ in RELEASES],
+        )
+        calls = self.calls().splitlines()
+        curl_calls = [line for line in calls if line.startswith("curl ")]
+        self.assertEqual(curl_calls.count("curl --version"), 1)
+        self.assertEqual(calls.count("kubectl version --client --output=yaml"), 1)
+        downloads = [json.loads(line) for line in
+                     (self.state / "curl-argv.jsonl").read_text().splitlines()]
+        self.assertEqual(len(downloads), 3)
+        for arguments, (release_name, _, _) in zip(downloads, RELEASES):
+            owner = ("knative-extensions/net-kourier" if release_name == "kourier.yaml"
+                     else "knative/serving")
+            self.assertEqual(
+                arguments,
+                [
+                    "--fail", "--silent", "--show-error", "--retry", "0",
+                    "--connect-timeout", "30", "--max-time", "180",
+                    "--max-filesize", "16777216", "--proto", "=https",
+                    "--proto-redir", "=https", "--location", "--max-redirs", "1",
+                    "--output", f"{work}/releases/{release_name}", "--write-out",
+                    "%{url_effective}\\n%{num_redirects}",
+                    f"https://github.com/{owner}/releases/download/"
+                    f"knative-v1.23.0/{release_name}",
+                ],
+            )
+        build_calls = [line for line in calls if line.startswith("docker build ")]
+        self.assertEqual(len(build_calls), 1)
+        self.assertIn(" --pull=false ", f" {build_calls[0]} ")
+        release_apply_calls = [
+            line for line in calls
+            if line.startswith("kubectl apply -f ") and "/releases/" in line
+        ]
+        self.assertEqual(
+            release_apply_calls,
+            [f"kubectl apply -f {work}/releases/{name} -o name"
+             for name, _, _ in RELEASES],
         )
         self.assertFalse(self.work_path(work).exists())
         for fact in ("cluster_absent=1", "workload_tag_absent=1",
                      "kubeconfig_absent=1", "work_absent=1"):
             self.assertIn(fact, facts)
-        self.assertEqual(
-            {entry.name for entry in evidence.iterdir()},
-            {"stdout.log", "stderr.log", "facts.log", "status", "observed.json",
-             "manifest-host.json", "profile.log", "portforward.log",
-             "portforward.group.before.json", "portforward.group.after.json"},
-        )
+        expected_evidence = {
+            "stdout.log", "stderr.log", "facts.log", "status", "observed.json",
+            "manifest-host.json", "profile.log", "portforward.log",
+            "portforward.group.before.json", "portforward.group.after.json",
+            "source.start.sha256", "source.end.sha256", "git.start", "git.end",
+        }
+        for phase in ("initial", "final"):
+            for context in ("root", "bpf"):
+                for suffix in ("command.json", "context.json", "status", "stdout.json", "stderr"):
+                    expected_evidence.add(f"dependencies.{phase}.{context}.{suffix}")
+            expected_evidence.add(f"dependencies.{phase}.ledger.sha256")
+            expected_evidence.add(f"dependencies.{phase}.receipt.json")
+        self.assertEqual({entry.name for entry in evidence.iterdir()}, expected_evidence)
         self.assertEqual((self.state / "checker.calls").read_text().splitlines(), ["checker"])
+
+    def test_obsolete_kourier_owner_is_refused_before_fetch_or_facts(self):
+        self.assertTrue((FIXTURES / "invoke-release-policy.sh").is_file())
+        facts = self.root / "obsolete-owner.facts"
+        facts.write_text("sentinel=fixed\n", encoding="utf-8")
+        marker = self.root / "obsolete-owner.calls"
+        result = subprocess.run(
+            [
+                sys.executable, "-I", str(FIXTURES / "invoke-release-policy.py"),
+                "--driver", str(self.gate),
+                "--url", (
+                    "https://github.com/knative/net-kourier/releases/download/"
+                    "knative-v1.23.0/kourier.yaml"
+                ),
+                "--name", "kourier.yaml", "--facts", str(facts),
+                "--calls", str(marker),
+            ],
+            cwd=self.project, text=True, capture_output=True, timeout=5,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(facts.read_text(encoding="utf-8"), "sentinel=fixed\n")
+        self.assertFalse(marker.exists())
+        canonical = subprocess.run(
+            [
+                sys.executable, "-I", str(FIXTURES / "invoke-release-policy.py"),
+                "--driver", str(self.gate),
+                "--url", (
+                    "https://github.com/knative-extensions/net-kourier/releases/download/"
+                    "knative-v1.23.0/kourier.yaml"
+                ),
+                "--name", "kourier.yaml", "--facts", str(facts),
+                "--calls", str(marker),
+            ],
+            cwd=self.project, text=True, capture_output=True, timeout=5,
+        )
+        self.assertNotEqual(canonical.returncode, 0)
+        self.assertEqual(facts.read_text(encoding="utf-8"), "sentinel=fixed\n")
+        self.assertEqual(marker.read_text(encoding="utf-8"), "curl\n")
+
+    def test_preexisting_work_is_refused_before_resource_queries_or_build(self):
+        output, evidence = self.run_lane("work-collision")
+        self.assertNotEqual(output.returncode, 0)
+        calls = self.calls().splitlines()
+        self.assertFalse(any(line.startswith("docker image ls ") for line in calls), calls)
+        self.assertFalse(any(line.startswith("docker build ") for line in calls), calls)
+        self.assertFalse(any(line.startswith("kind get clusters") for line in calls), calls)
+        self.assertFalse(any(line.startswith("kind create cluster") for line in calls), calls)
+        collision = self.state / "work-collision-path"
+        work = Path(collision.read_text(encoding="utf-8").strip())
+        self.assertTrue((work / "foreign-sentinel").is_file())
+        self.assertIn("lane-13 work path already exists", (evidence / "stderr.log").read_text())
+
+    def test_unknown_final_body_group_snapshot_retains_custody_and_is_nonpass(self):
+        output, evidence = self.run_lane("outer-final-snapshot-unknown")
+        self.assertNotEqual(output.returncode, 0)
+        self.assertEqual((evidence / "status").read_text(), "1\n")
+        for name in (".lane13-body.pid", ".lane13-body-launch.log"):
+            artifact = evidence / name
+            self.assertTrue(artifact.is_file(), name)
+            self.assertFalse(artifact.is_symlink(), name)
+            self.assertEqual(artifact.stat().st_mode & 0o777, 0o600)
+        record = json.loads((evidence / ".lane13-body.pid").read_text())
+        self.assertGreater(record["pid"], 0)
 
     def test_release_expected_sha256_rejects_pre_apply_corruption(self):
         names = [name for name, _, _ in RELEASES]
@@ -1275,7 +1695,7 @@ exit "$helper_status"
                         "P11SCOPE_LANE_EVIDENCE_DIR": str(evidence)},
         )
         try:
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + TERMINAL_READINESS_TIMEOUT_SECONDS
             while not (self.state / "terminal-signal-ready").exists() and time.monotonic() < deadline:
                 self.assertIsNone(proc.poll(), "terminal boundary exited early")
                 time.sleep(0.01)
@@ -1895,7 +2315,7 @@ exit "$helper_status"
             },
         )
         launched = time.monotonic()
-        deadline = launched + 5
+        deadline = launched + TERMINAL_READINESS_TIMEOUT_SECONDS
         while not (self.state / "terminal-signal-ready").exists() and time.monotonic() < deadline:
             self.assertIsNone(proc.poll(), "terminal boundary exited before controlled timeout")
             time.sleep(0.01)
@@ -1978,6 +2398,9 @@ exit "$helper_status"
         output, evidence = self.run_lane("cleanup-cluster-failure", "cleanup-failure")
         self.assertNotEqual(output.returncode, 0)
         self.assertIn("build product", (evidence / "stdout.log").read_text())
+        self.assertIn(
+            "controlled cluster cleanup failure", (evidence / "stderr.log").read_text()
+        )
         facts = self.facts(evidence)
         work = next(line.removeprefix("work=") for line in facts.splitlines() if line.startswith("work="))
         self.assertTrue(self.work_path(work).is_dir())
@@ -2040,7 +2463,10 @@ def main():
             unittest.TestSuite([unittest.FunctionTestCase(skip_probe)])
         )
     else:
-        argv = [sys.argv[0], *(tests or ["Lane13EvidenceTests"])]
+        argv = [
+            sys.argv[0],
+            *(tests or ["Lane13InputLedgerTests", "Lane13EvidenceTests"]),
+        ]
         result = unittest.main(argv=argv, exit=False, verbosity=2).result
     if result.testsRun == 0 or result.skipped or not result.wasSuccessful():
         raise SystemExit(1)

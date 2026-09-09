@@ -13,11 +13,14 @@ def main():
     args = sys.argv[1:]
     if args[:2] != ["ls-files", "-z"] or "--" not in args:
         raise SystemExit("candidate Git fixture requires a NUL-delimited pathspec query")
-    paths = set(subprocess.check_output(
-        ["/usr/bin/git", "-C", candidate["root"], *args], timeout=5,
-    ).split(b"\0")) - {b""}
+    if candidate.get("delegate", True):
+        paths = set(subprocess.check_output(
+            ["/usr/bin/git", "-C", candidate["root"], *args], timeout=5,
+        ).split(b"\0")) - {b""}
+    else:
+        paths = set()
     specs = args[args.index("--") + 1:]
-    for path in candidate["aya_paths"]:
+    for path in candidate["tracked_paths"]:
         if any(path == spec or path.startswith(spec + "/") for spec in specs):
             paths.add(os.fsencode(path))
     sys.stdout.buffer.write(b"".join(path + b"\0" for path in sorted(paths)))

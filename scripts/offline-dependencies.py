@@ -800,12 +800,12 @@ def assemble(root: Path, options, preparer, checker) -> None:
             archives.mkdir(mode=0o755)
             shared_output.mkdir(mode=0o755, parents=True)
             nightly_output.mkdir(mode=0o755, parents=True)
-            vendor_argv = [tools["stable"]["cargo"]["path"], "vendor", "--locked", "--offline",
+            vendor_argv = [tools["bpf"]["cargo"]["path"], "vendor", "--locked", "--offline",
                            "--versioned-dirs", "--manifest-path", str(root / "Cargo.toml"),
                            "--sync", str(root / "crates/ebpf/Cargo.toml"),
                            "--sync", str(rust / "library/sysroot/Cargo.toml"), str(payload / "vendor")]
             environment = os.environ.copy()
-            environment.update({"RUSTC": tools["stable"]["rustc"]["path"],
+            environment.update({"RUSTC": tools["bpf"]["rustc"]["path"],
                                 "CARGO_NET_OFFLINE": "true"})
             try:
                 vendor_result = subprocess.run(vendor_argv, cwd=root, env=environment,
@@ -881,7 +881,7 @@ def assemble(root: Path, options, preparer, checker) -> None:
     command_evidence = {"metadata_initial": metadata_commands,
                         "metadata_final": final_commands, "vendor": {
         "argv": vendor_argv, "cwd": str(root),
-        "environment": {"RUSTC": tools["stable"]["rustc"]["path"], "CARGO_NET_OFFLINE": "true"}}}
+        "environment": {"RUSTC": tools["bpf"]["rustc"]["path"], "CARGO_NET_OFFLINE": "true"}}}
     inputs = {"workspaces": workspace_before, "preparation": recipe["preparation"],
               "nightly": nightly, "shared_git": shared,
               "archives": _required_archives(manifest),

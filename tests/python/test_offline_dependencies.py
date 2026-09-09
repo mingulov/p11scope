@@ -292,11 +292,15 @@ class OfflineDependenciesTests(unittest.TestCase):
         self.fixture.assemble()
         calls = [json.loads(line) for line in self.fixture.log.read_text().splitlines()]
         self.assertEqual([call["program"] for call in calls],
-                         ["stable cargo", "bpf cargo", "stable cargo", "stable cargo", "bpf cargo"])
+                         ["stable cargo", "bpf cargo", "bpf cargo", "stable cargo", "bpf cargo"])
         self.assertTrue(all(call["cargo_net_offline"] == "true" for call in calls))
-        self.assertEqual(calls[0]["rustc"], str(self.fixture.tools / "stable rustc"))
-        self.assertEqual(calls[1]["rustc"], str(self.fixture.tools / "bpf rustc"))
-        self.assertEqual(calls[2]["rustc"], str(self.fixture.tools / "stable rustc"))
+        self.assertEqual([call["rustc"] for call in calls], [
+            str(self.fixture.tools / "stable rustc"),
+            str(self.fixture.tools / "bpf rustc"),
+            str(self.fixture.tools / "bpf rustc"),
+            str(self.fixture.tools / "stable rustc"),
+            str(self.fixture.tools / "bpf rustc"),
+        ])
         self.assertEqual(calls[0]["argv"], [
             "metadata", "--locked", "--offline", "--all-features", "--format-version", "1",
             "--manifest-path", str(self.fixture.root / "Cargo.toml"),

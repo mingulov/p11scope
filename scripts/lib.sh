@@ -59,6 +59,66 @@ recorded_process_control() {
     python3 -I "$RECORDED_PROCESS_EXEC" "$@"
 }
 
+# Read the coordinator's own Linux identity without forking, changing caller
+# positional parameters, or retaining a modified IFS.
+recorded_process_coordinator_identity() {
+    RECORDED_COORDINATOR_PID=
+    RECORDED_COORDINATOR_STARTTIME=
+    if ! IFS= read -r _rp_coordinator_stat </proc/self/stat; then
+        unset _rp_coordinator_stat
+        return 1
+    fi
+    _rp_coordinator_pid=${_rp_coordinator_stat%% *}
+    _rp_coordinator_tail=${_rp_coordinator_stat##*) }
+    if [ "$_rp_coordinator_tail" = "$_rp_coordinator_stat" ]; then
+        unset _rp_coordinator_stat _rp_coordinator_pid _rp_coordinator_tail
+        return 1
+    fi
+    if ! IFS=' ' read -r _rp_coordinator_state _rp_coordinator_ppid _rp_coordinator_pgrp \
+        _rp_coordinator_session _rp_coordinator_tty _rp_coordinator_tpgid _rp_coordinator_flags \
+        _rp_coordinator_minflt _rp_coordinator_cminflt _rp_coordinator_majflt \
+        _rp_coordinator_cmajflt _rp_coordinator_utime _rp_coordinator_stime \
+        _rp_coordinator_cutime _rp_coordinator_cstime _rp_coordinator_priority \
+        _rp_coordinator_nice _rp_coordinator_threads _rp_coordinator_itrealvalue \
+        _rp_coordinator_starttime _rp_coordinator_rest <<EOF
+$_rp_coordinator_tail
+EOF
+    then
+        unset _rp_coordinator_stat _rp_coordinator_pid _rp_coordinator_tail \
+            _rp_coordinator_state _rp_coordinator_ppid _rp_coordinator_pgrp \
+            _rp_coordinator_session _rp_coordinator_tty _rp_coordinator_tpgid \
+            _rp_coordinator_flags _rp_coordinator_minflt _rp_coordinator_cminflt \
+            _rp_coordinator_majflt _rp_coordinator_cmajflt _rp_coordinator_utime \
+            _rp_coordinator_stime _rp_coordinator_cutime _rp_coordinator_cstime \
+            _rp_coordinator_priority _rp_coordinator_nice _rp_coordinator_threads \
+            _rp_coordinator_itrealvalue _rp_coordinator_starttime _rp_coordinator_rest
+        return 1
+    fi
+    case $_rp_coordinator_pid:$_rp_coordinator_starttime in
+        ''|*[!0-9:]*|0:*|*:0)
+            unset _rp_coordinator_stat _rp_coordinator_pid _rp_coordinator_tail \
+                _rp_coordinator_state _rp_coordinator_ppid _rp_coordinator_pgrp \
+                _rp_coordinator_session _rp_coordinator_tty _rp_coordinator_tpgid \
+                _rp_coordinator_flags _rp_coordinator_minflt _rp_coordinator_cminflt \
+                _rp_coordinator_majflt _rp_coordinator_cmajflt _rp_coordinator_utime \
+                _rp_coordinator_stime _rp_coordinator_cutime _rp_coordinator_cstime \
+                _rp_coordinator_priority _rp_coordinator_nice _rp_coordinator_threads \
+                _rp_coordinator_itrealvalue _rp_coordinator_starttime _rp_coordinator_rest
+            return 1
+            ;;
+    esac
+    RECORDED_COORDINATOR_PID=$_rp_coordinator_pid
+    RECORDED_COORDINATOR_STARTTIME=$_rp_coordinator_starttime
+    unset _rp_coordinator_stat _rp_coordinator_pid _rp_coordinator_tail \
+        _rp_coordinator_state _rp_coordinator_ppid _rp_coordinator_pgrp \
+        _rp_coordinator_session _rp_coordinator_tty _rp_coordinator_tpgid \
+        _rp_coordinator_flags _rp_coordinator_minflt _rp_coordinator_cminflt \
+        _rp_coordinator_majflt _rp_coordinator_cmajflt _rp_coordinator_utime \
+        _rp_coordinator_stime _rp_coordinator_cutime _rp_coordinator_cstime \
+        _rp_coordinator_priority _rp_coordinator_nice _rp_coordinator_threads \
+        _rp_coordinator_itrealvalue _rp_coordinator_starttime _rp_coordinator_rest
+}
+
 # 0: exact generation live; 1: gone/replaced/zombie; 2: observation unknown.
 recording_launcher_active() {
     RECORDED_LAUNCHER_STATE=unknown
@@ -140,6 +200,14 @@ $_rp_prepared
 EOF
     _rp_launcher= _rp_launch_start= _rp_process= _rp_process_start= _rp_phase=prepared
     publish_recorded_process_fields
+    if ! recorded_process_coordinator_identity \
+        || ! recorded_process_control bind-coordinator "$_rp_context" \
+            "$RECORDED_COORDINATOR_PID" "$RECORDED_COORDINATOR_STARTTIME"; then
+        recorded_process_control cleanup "$_rp_context" || return 1
+        _rp_path= _rp_context= _rp_phase=finalized
+        publish_recorded_process_fields
+        return 1
+    fi
     # Async POSIX shells otherwise replace inherited stdin with /dev/null.
     # Explicit duplication preserves it, without using it as a control channel.
     if [ "$_rp_mode" = root ]; then

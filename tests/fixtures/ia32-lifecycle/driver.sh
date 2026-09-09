@@ -72,6 +72,9 @@ case $1 in
         { IFS= read -r USER_RECORD_CONTROL; IFS= read -r USER_RECORD_IDENTITY; } <<EOF
 $prepared
 EOF
+        recorded_process_coordinator_identity || exit 2
+        recorded_process_control bind-coordinator "$USER_RECORD_IDENTITY" \
+            "$RECORDED_COORDINATOR_PID" "$RECORDED_COORDINATOR_STARTTIME" || exit 2
         USER_RECORD_PHASE=prepared USER_PROCESS_LAUNCH_PID= USER_PROCESS_LAUNCH_STARTTIME=
         USER_PROCESS_PID= USER_PROCESS_STARTTIME=
         python3 -I "$RECORDED_PROCESS_EXEC" exec "$USER_RECORD_IDENTITY" user \

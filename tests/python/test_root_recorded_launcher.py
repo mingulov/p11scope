@@ -342,7 +342,93 @@ class RecordedLauncherTests(unittest.TestCase):
     def context(self, timeout=2):
         self.assertTrue(HELPER.is_file(), "native SELF/ACK helper is missing")
         lines = self.native("prepare", self.work / "process.pid", timeout).stdout.splitlines()
-        return lines[1].decode()
+        context = lines[1].decode()
+        self.bind_context(context)
+        return context
+
+    def bind_context(self, context, pid=None, starttime=None, check=True):
+        pid = os.getpid() if pid is None else pid
+        starttime = self.generation(pid) if starttime is None else starttime
+        return self.native("bind-coordinator", context, pid, starttime, check=check)
+
+    def test_bind_coordinator_rejects_mismatched_parent_generation_and_owner(self):
+        for case in ("parent", "generation", "owner"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory(dir=self.work) as work:
+                context = self.native("prepare", Path(work) / "pid", 2).stdout.splitlines()[1].decode()
+                if case == "parent":
+                    result = self.bind_context(context, pid=os.getpid() + 1, starttime=1, check=False)
+                elif case == "generation":
+                    result = self.bind_context(context, starttime=self.generation(os.getpid()) + 1,
+                                               check=False)
+                else:
+                    changed = json.loads(context)
+                    changed["owner"] += 1
+                    result = self.bind_context(json.dumps(changed, separators=(",", ":")), check=False)
+                self.assertNotEqual(result.returncode, 0)
+                control = Path(json.loads(context)["path"])
+                self.assertFalse((control / "coordinator").exists())
+                self.native("cleanup", context)
+                self.assertFalse(control.exists())
+
+    def test_coordinator_record_missing_malformed_and_replaced_refuse_promptly(self):
+        for case in ("missing", "malformed", "replaced", "zombie"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory(dir=self.work) as work:
+                context = self.native("prepare", Path(work) / "pid", 8).stdout.splitlines()[1].decode()
+                control = Path(json.loads(context)["path"])
+                coordinator = control / "coordinator"
+                if case == "malformed":
+                    coordinator.write_text('{"pid":')
+                    coordinator.chmod(0o600)
+                elif case in ("replaced", "zombie"):
+                    self.bind_context(context)
+                    record = json.loads(coordinator.read_text())
+                    if case == "replaced":
+                        record["starttime"] += 1
+                    else:
+                        zombie, zombie_fd = self.child(["sleep", "0.1"])
+                        record["pid"] = zombie.pid
+                        record["starttime"] = self.generation(zombie.pid)
+                        self.assertTrue(select.select([zombie_fd], [], [], 3)[0])
+                        state = Path(f"/proc/{zombie.pid}/stat").read_bytes().rsplit(b") ", 1)[1].split()[0]
+                        self.assertEqual(state, b"Z")
+                    coordinator.write_text(json.dumps(record, separators=(",", ":")) + "\n")
+                started = time.monotonic()
+                proc, _ = self.child(["python3", "-I", str(HELPER), "exec", context, "launcher", "-",
+                                      "sh", str(FIXTURES / "target.sh")], stderr=subprocess.PIPE)
+                self.assertNotEqual(proc.wait(timeout=3), 0)
+                self.assertLess(time.monotonic() - started, 3, "coordinator refusal was not prompt")
+                self.assertFalse((self.work / "target.entered").exists())
+
+    def test_direct_subshell_binding_preserves_state_and_dead_coordinator_refuses_promptly(self):
+        context = self.native("prepare", self.work / "process.pid", 8).stdout.splitlines()[1].decode()
+        environment = dict(self.env, BIND_CONTEXT=context)
+        script = r'''
+. scripts/lib.sh
+set -- "left arg" "" right
+IFS=:
+(
+    recorded_process_coordinator_identity || exit 31
+    [ "$#" -eq 3 ] && [ "$1" = "left arg" ] && [ -z "$2" ] && [ "$3" = right ] || exit 32
+    [ "$IFS" = : ] || exit 33
+    recorded_process_control bind-coordinator "$BIND_CONTEXT" \
+        "$RECORDED_COORDINATOR_PID" "$RECORDED_COORDINATOR_STARTTIME" || exit 34
+    [ "$#" -eq 3 ] && [ "$1" = "left arg" ] && [ -z "$2" ] && [ "$3" = right ] || exit 35
+    [ "$IFS" = : ] || exit 36
+)
+'''
+        binder = subprocess.run(["sh", "-c", script], cwd=ROOT, env=environment,
+                                capture_output=True, timeout=3)
+        self.assertEqual(binder.returncode, 0, binder.stderr.decode())
+        record = json.loads((Path(json.loads(context)["path"]) / "coordinator").read_text())
+        coordinator_state = self.native("active", record["pid"], record["starttime"], check=False)
+        self.assertNotEqual(coordinator_state.returncode, 0, "subshell coordinator unexpectedly live")
+        started = time.monotonic()
+        proc, _ = self.child(["python3", "-I", str(HELPER), "exec", context, "launcher", "-",
+                              "sh", str(FIXTURES / "target.sh")], stderr=subprocess.PIPE)
+        self.assertNotEqual(proc.wait(timeout=3), 0)
+        self.assertLess(time.monotonic() - started, 3, "dead coordinator refusal was not prompt")
+        self.assertFalse((self.work / "target.entered").exists())
+        self.native("cleanup", context)
 
     def test_root_two_barriers_preserve_identity_argv_stdin_and_status(self):
         args = ["space arg", "", "$(no-evaluation);*", "tail"]
@@ -639,12 +725,17 @@ class RecordedLauncherTests(unittest.TestCase):
         self.delayed_phase("user")
 
     def parent_eof(self, phase):
-        self.env.update(HOOK_OPERATION="ack", HOOK_PHASE=phase, HOOK_ACTION="hold", CASE_DEADLINE="0.5")
+        self.env.update(HOOK_OPERATION="ack", HOOK_PHASE=phase, HOOK_ACTION="hold", CASE_DEADLINE="8")
         mode = "user" if phase == "user" else "root"
         proc, parent_fd = self.child(["sh", str(FIXTURES / "driver.sh"), mode, "sh", str(FIXTURES / "target.sh")],
                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         hook = json.loads(self.wait_path(self.work / "hook.waiting").read_text())
         snapshot = json.loads((self.work / "snapshot.json").read_text())
+        context_key = "USER_RECORD_IDENTITY" if mode == "user" else "ROOT_RECORD_IDENTITY"
+        context = json.loads(snapshot[context_key])
+        remaining_ns = context["deadline"] - time.monotonic_ns()
+        self.assertGreater(remaining_ns, 5_000_000_000,
+                           "launch deadline must retain headroom before parent EOF")
         prefix = "USER_PROCESS_LAUNCH" if mode == "user" else "ROOT_LAUNCH"
         fd = self.adopt(int(snapshot[prefix + "_PID"]), int(snapshot[prefix + "_STARTTIME"]))
         self.assertIsNotNone(fd)
@@ -652,7 +743,11 @@ class RecordedLauncherTests(unittest.TestCase):
         signal.pidfd_send_signal(parent_fd, signal.SIGTERM)
         proc.wait(timeout=3)
         (self.work / "hook.release").touch()
-        self.assertTrue(select.select([fd], [], [], 3)[0])
+        self.assertTrue(select.select([fd], [], [], 10)[0])
+        self.assertLess(time.monotonic_ns(), context["deadline"],
+                        "authenticated launch exited only after its deadline expired")
+        self.assertFalse((Path(context["path"]) / f"{phase}.ack").exists(),
+                         "orphaned ACK helper resumed after coordinator exit")
         if phase != "root":
             self.assertFalse((self.work / "sudo.entered").exists())
         self.assertFalse((self.work / "target.entered").exists())
@@ -727,6 +822,7 @@ class RecordedLauncherTests(unittest.TestCase):
             with self.subTest(field=field), tempfile.TemporaryDirectory(dir=self.work) as work:
                 result = self.native("prepare", Path(work) / "pid", 1)
                 context = result.stdout.splitlines()[1].decode()
+                self.bind_context(context)
                 proc, _ = self.child(["python3", "-I", str(HELPER), "exec", context, "launcher", "-",
                                       "sh", str(FIXTURES / "target.sh")], stderr=subprocess.PIPE)
                 record = self.self_record(context, "launcher", proc)
@@ -742,6 +838,7 @@ class RecordedLauncherTests(unittest.TestCase):
         for kind in ("partial", "symlink", "temporary", "complete-stale"):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory(dir=self.work) as work:
                 context = self.native("prepare", Path(work) / "pid", 1).stdout.splitlines()[1].decode()
+                self.bind_context(context)
                 control = Path(json.loads(context)["path"])
                 record = control / ("launcher.self.tmp" if kind == "temporary" else "launcher.self")
                 if kind == "symlink":
@@ -821,6 +918,7 @@ class RecordedLauncherTests(unittest.TestCase):
             with self.subTest(phase=phase), tempfile.TemporaryDirectory(dir=self.work) as work:
                 pidfile = Path(work) / "pid"
                 context = self.native("prepare", pidfile, 0.4).stdout.splitlines()[1].decode()
+                self.bind_context(context)
                 proc, fd = self.child(["python3", "-I", str(HELPER), "exec", context, phase,
                                        "-" if phase == "launcher" else str(pidfile),
                                        "sh", str(FIXTURES / "target.sh")], stderr=subprocess.PIPE)

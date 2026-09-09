@@ -2,6 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::process::Command;
+use std::sync::Mutex;
+
+static NATIVE_SUITE_GATE: Mutex<()> = Mutex::new(());
 
 fn read(path: &str) -> String {
     fs::read_to_string(path).unwrap_or_else(|error| panic!("reading {path}: {error}"))
@@ -2506,14 +2509,10 @@ fn subset_oracle_requires_independent_calls_and_clean_capture() {
 }
 
 #[test]
-fn recorded_launcher_requires_authenticated_generations_and_bounded_cleanup() {
-    run_ok(
-        "python3",
-        &[
-            "-I",
-            "tests/python/test_root_recorded_launcher.py",
-            "RecordedLauncherTests",
-        ],
+fn native_helper_suite_recorded_launcher_requires_authenticated_generations_and_bounded_cleanup() {
+    run_native_python_suite(
+        "tests/python/test_root_recorded_launcher.py",
+        "RecordedLauncherTests",
     );
 }
 
@@ -2526,8 +2525,16 @@ fn owned_process_group_native_cases_preserve_bounded_authenticated_cleanup() {
 }
 
 #[test]
-fn abi_routing_driver_preserves_runtime_ownership_and_failure_evidence() {
-    run_ok(
+fn native_helper_suite_abi_routing_driver_preserves_runtime_ownership_and_failure_evidence() {
+    let shell = read("tests/shell/test_abi_routing_driver.sh");
+    assert!(
+        !shell.contains("test_prepared_abi_driver.py"),
+        "the ABI shell lifecycle suite must not embed the prepared ABI Python suite"
+    );
+    let _native_suite_guard = NATIVE_SUITE_GATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let output = run_ok(
         "timeout",
         &[
             "--signal=TERM",
@@ -2536,6 +2543,20 @@ fn abi_routing_driver_preserves_runtime_ownership_and_failure_evidence() {
             "sh",
             "tests/shell/test_abi_routing_driver.sh",
         ],
+    );
+    assert!(
+        output.lines().any(|line| {
+            line == "PASS: abi-routing production-path driver custody and launcher behavior"
+        }),
+        "the ABI shell lifecycle suite must emit its explicit PASS marker: {output}"
+    );
+}
+
+#[test]
+fn native_helper_suite_prepared_abi_driver_binds_admission_build_handoff_and_finalization() {
+    run_native_python_suite(
+        "tests/python/test_prepared_abi_driver.py",
+        "PreparedAbiDriverTests",
     );
 }
 
@@ -8335,6 +8356,9 @@ fn the_uretprobe_hazard_row_is_not_a_capability_tier_input() {
 }
 
 fn run_native_python_suite(script: &str, class: &str) {
+    let _native_suite_guard = NATIVE_SUITE_GATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let output = Command::new("python3")
         .args(["-I", script, class])
         .output()

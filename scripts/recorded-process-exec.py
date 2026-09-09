@@ -144,8 +144,44 @@ class Control:
         try:
             os.stat("cancel", dir_fd=self.fd, follow_symlinks=False)
         except FileNotFoundError:
-            return
-        raise ValueError("recorded launch canceled")
+            pass
+        else:
+            raise ValueError("recorded launch canceled")
+        self.coordinator()
+
+    def coordinator_record(self, pid, generation):
+        return dict(kind="coordinator", attempt=self.ctx["attempt"], owner=self.ctx["owner"],
+                    pid=positive(pid), starttime=positive(generation))
+
+    def check_coordinator_process(self, record):
+        state, label = proc_state(record["pid"], record["starttime"])
+        if state:
+            raise ValueError(f"recorded launch coordinator is {label}")
+        try:
+            owner = os.stat(f"/proc/{record['pid']}", follow_symlinks=False).st_uid
+        except (FileNotFoundError, ProcessLookupError):
+            raise ValueError("recorded launch coordinator is gone") from None
+        if owner != self.ctx["owner"]:
+            raise ValueError("recorded launch coordinator owner changed")
+
+    def coordinator(self, require_live=True):
+        raw = self.read("coordinator")
+        record = json.loads(raw, object_pairs_hook=unique_object)
+        if record != self.coordinator_record(record["pid"], record["starttime"]):
+            raise ValueError("coordinator attempt/identity mismatch")
+        if require_live:
+            self.check_coordinator_process(record)
+        return record
+
+    def bind_coordinator(self, pid, generation):
+        record = self.coordinator_record(pid, generation)
+        if os.getuid() != self.ctx["owner"]:
+            raise ValueError("coordinator binder owner mismatch")
+        if os.getppid() != record["pid"]:
+            raise ValueError("coordinator binder is not a direct child")
+        self.check_coordinator_process(record)
+        self.publish("coordinator", (json.dumps(record, separators=(",", ":")) + "\n").encode(),
+                     owner=self.ctx["owner"])
 
     def read(self, name, owner=None):
         self.validate()
@@ -218,12 +254,14 @@ class Control:
 
     def cleanup(self):
         self.validate()
-        known = {"cancel", "cancel.tmp", "durable.tmp"}
+        known = {"cancel", "cancel.tmp", "coordinator", "coordinator.tmp", "durable.tmp"}
         known.update(phase + "." + kind + suffix for phase in PHASES
                      for kind in KINDS for suffix in ("", ".tmp"))
         names = os.listdir(self.fd)
         if set(names) - known:
             raise ValueError("unknown control entries; retaining custody")
+        if "coordinator" in names:
+            self.coordinator(require_live=False)
         for name in names:
             info = os.stat(name, dir_fd=self.fd, follow_symlinks=False)
             if (not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600
@@ -279,6 +317,9 @@ def main(args):
             except FileExistsError:
                 if control.read("cancel") != (control.ctx["attempt"] + "\n").encode():
                     raise ValueError("invalid cancellation record")
+        elif operation == "bind-coordinator":
+            pid, generation = map(int, args)
+            control.bind_coordinator(pid, generation)
         elif operation == "cleanup":
             control.cleanup()
         elif operation == "read":
@@ -293,6 +334,7 @@ def main(args):
             if record != expected:
                 raise ValueError("ACK does not match SELF")
             expected["kind"] = "ack"
+            control.before_exec()
             control.put(expected)
         elif operation == "exec":
             phase, pidfile, *command = args

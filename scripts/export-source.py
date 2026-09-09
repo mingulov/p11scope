@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import gzip
 import hashlib
 import importlib.util
@@ -676,7 +678,9 @@ def _validate_absolute_directory(path: Path, label: str) -> Path:
     return path
 
 
-def _validate_source_entries(root: Path, records: object) -> dict[str, dict]:
+def _validate_source_entries(root: Path, records: object,
+                             admitted_generated: set[str] | None = None, *,
+                             scan: bool = True) -> dict[str, dict]:
     if not isinstance(records, list):
         raise ExportError("source export manifest source_entries must be an array")
     expected = {}
@@ -729,6 +733,8 @@ def _validate_source_entries(root: Path, records: object) -> dict[str, dict]:
             raise ExportError(f"source export entry digest mismatch: {relative}")
         expected[relative] = record
 
+    if not scan:
+        return expected
     actual = set()
     pending = [root]
     while pending:
@@ -751,8 +757,9 @@ def _validate_source_entries(root: Path, records: object) -> dict[str, dict]:
                 actual.add(relative)
             else:
                 raise ExportError(f"unsafe extracted source entry type: {relative}")
-    if actual != set(expected):
-        difference = sorted(actual ^ set(expected), key=os.fsencode)
+    admitted = admitted_generated or set()
+    if actual != set(expected) | admitted:
+        difference = sorted(actual ^ (set(expected) | admitted), key=os.fsencode)
         raise ExportError(f"source export entries do not exactly match extraction: {difference[0]}")
     tracked = {
         relative: (
@@ -766,6 +773,128 @@ def _validate_source_entries(root: Path, records: object) -> dict[str, dict]:
         if record["kind"] == "symlink":
             _validated_symlink_target(PurePosixPath(relative), record["target"], tracked)
     return expected
+
+
+def _validate_prepared_state(root: Path, records: object, strict_manifest: dict,
+                             preparer, mode: str) -> tuple[set[str], dict]:
+    if mode not in {"forbid", "allow", "require"}:
+        raise ExportError(f"unsupported prepared-state mode: {mode}")
+    if not isinstance(records, list):
+        raise ExportError("source export manifest source_entries must be an array")
+    reserved = {"third-party/.prepare-dependencies.lock"}
+    for record in records:
+        if isinstance(record, dict) and isinstance(record.get("path"), str):
+            relative = _source_path(record["path"]).as_posix()
+            if relative == "third-party/src" or relative.startswith("third-party/src/") \
+                    or relative in reserved:
+                raise ExportError(f"prepared output collides with maintained source: {relative}")
+
+    expected = {}
+    try:
+        for record in strict_manifest["packages"]:
+            name = preparer.output_name(record)
+            patches = preparer.read_patch_bytes(root, record)
+            expected[name] = (record, preparer.compute_recipe_identity(record, patches))
+    except preparer.PreparationError as error:
+        raise ExportError(f"cannot derive prepared output identity: {error}") from error
+
+    generated = set()
+    custody = {"mode": mode, "root": None, "lock": None, "packages": {}}
+    prepared_root = root / "third-party/src"
+    if os.path.lexists(prepared_root):
+        metadata = prepared_root.lstat()
+        if (not stat.S_ISDIR(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o755
+                or metadata.st_uid != os.getuid() or prepared_root.resolve() != prepared_root):
+            raise ExportError("prepared output root has unsafe type, mode, ownership, or path")
+        observed = {entry.name: entry for entry in os.scandir(prepared_root)}
+        custody["root"] = {
+            "device": metadata.st_dev, "inode": metadata.st_ino,
+            "mode": stat.S_IMODE(metadata.st_mode), "mtime_ns": metadata.st_mtime_ns,
+        }
+    else:
+        observed = {}
+    unknown = sorted(set(observed) - set(expected), key=os.fsencode)
+    if unknown:
+        raise ExportError(f"unexpected prepared output: third-party/src/{unknown[0]}")
+    if mode == "forbid" and os.path.lexists(prepared_root):
+        raise ExportError("prepared output is forbidden")
+    missing = sorted(set(expected) - set(observed), key=os.fsencode)
+    if mode == "require" and missing:
+        raise ExportError(f"required prepared output is missing: third-party/src/{missing[0]}")
+
+    for name in sorted(observed, key=os.fsencode):
+        path = prepared_root / name
+        metadata = path.lstat()
+        if (not stat.S_ISDIR(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o755
+                or metadata.st_uid != os.getuid() or path.resolve() != path):
+            raise ExportError(f"prepared output has unsafe type, mode, ownership, or path: {name}")
+        record, recipe_identity = expected[name]
+        try:
+            inventory = preparer.verified_prepared_inventory(path, record, recipe_identity)
+        except preparer.PreparationError as error:
+            raise ExportError(f"prepared output {name}: {error}") from error
+        entries = []
+        for directory, directory_names, file_names in os.walk(path, followlinks=False):
+            for entry_name in (*directory_names, *file_names):
+                entry = Path(directory) / entry_name
+                entry_metadata = entry.lstat()
+                if entry_metadata.st_uid != os.getuid():
+                    raise ExportError(f"prepared output has unsafe ownership: {entry.relative_to(root)}")
+                entries.append({
+                    "path": entry.relative_to(path).as_posix(),
+                    "device": entry_metadata.st_dev, "inode": entry_metadata.st_ino,
+                    "mode": stat.S_IMODE(entry_metadata.st_mode),
+                    "size": entry_metadata.st_size, "mtime_ns": entry_metadata.st_mtime_ns,
+                })
+        for relative, _file_mode, _digest in inventory:
+            generated.add(f"third-party/src/{name}/{relative}")
+        encoded = json.dumps(inventory, sort_keys=True, separators=(",", ":"),
+                             ensure_ascii=True).encode("ascii")
+        custody["packages"][name] = {
+            "device": metadata.st_dev, "inode": metadata.st_ino,
+            "mode": stat.S_IMODE(metadata.st_mode), "mtime_ns": metadata.st_mtime_ns,
+            "inventory_sha256": hashlib.sha256(encoded).hexdigest(),
+            "entries": sorted(entries, key=lambda entry: os.fsencode(entry["path"])),
+        }
+
+    lock = root / "third-party/.prepare-dependencies.lock"
+    if os.path.lexists(lock):
+        metadata = lock.lstat()
+        if mode == "forbid":
+            raise ExportError("prepared output is forbidden: third-party/.prepare-dependencies.lock")
+        if (not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_uid != os.getuid() or metadata.st_size != 0
+                or lock.resolve() != lock):
+            raise ExportError("prepared dependency lock has unsafe type, mode, ownership, or content")
+        generated.add("third-party/.prepare-dependencies.lock")
+        custody["lock"] = {"device": metadata.st_dev, "inode": metadata.st_ino,
+                           "mode": stat.S_IMODE(metadata.st_mode),
+                           "mtime_ns": metadata.st_mtime_ns}
+    elif mode == "require":
+        raise ExportError("required prepared output is missing: third-party/.prepare-dependencies.lock")
+    if mode == "allow" and os.path.lexists(prepared_root) and custody["lock"] is None:
+        raise ExportError("prepared output requires third-party/.prepare-dependencies.lock")
+    return generated, custody
+
+
+@contextlib.contextmanager
+def _prepared_inspection_lock(root: Path):
+    """Serialize inspection when the stable preparer lock already exists."""
+    path = root / "third-party/.prepare-dependencies.lock"
+    if not os.path.lexists(path):
+        yield
+        if os.path.lexists(path):
+            raise ExportError("prepared state changed during unlocked inspection")
+        return
+    try:
+        descriptor = os.open(path, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    except OSError as error:
+        raise ExportError(f"cannot lock prepared state for inspection: {error}") from error
+    finally:
+        if "descriptor" in locals():
+            os.close(descriptor)
 
 
 def _cargo_config_paths(root: Path, cargo_home: Path | None) -> set[Path]:
@@ -782,7 +911,8 @@ def _cargo_config_paths(root: Path, cargo_home: Path | None) -> set[Path]:
     return paths
 
 
-def validate_extracted(root: Path, cargo_home: Path | None = None) -> dict:
+def validate_extracted(root: Path, cargo_home: Path | None = None, *,
+                       prepared: str = "forbid") -> dict:
     """Validate one extracted schema-v2 source export without Git."""
     root = _validate_absolute_directory(root, "extracted source root")
     if cargo_home is not None:
@@ -807,9 +937,13 @@ def validate_extracted(root: Path, cargo_home: Path | None = None) -> dict:
             or stat.S_IMODE(manifest_metadata.st_mode) != 0o644):
         raise ExportError("source export manifest has unsafe type or mode")
     try:
-        manifest = helper._read_json(manifest_path, "source export manifest")
+        manifest_bytes = manifest_path.read_bytes()
+        manifest = json.loads(manifest_bytes.decode("utf-8"),
+                              object_pairs_hook=helper._no_duplicate_keys)
     except helper.OfflineDependencyError as error:
         raise ExportError(str(error)) from error
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ExportError(f"cannot read valid source export manifest {manifest_path}: {error}") from error
     top = {"schema_version", "revision", "source_entries", "archives",
            "offline_dependencies"}
     if (not isinstance(manifest, dict) or set(manifest) != top
@@ -831,26 +965,33 @@ def validate_extracted(root: Path, cargo_home: Path | None = None) -> dict:
                    for field in ("recipe_sha256", "payload_tree_sha256", "config_sha256"))):
         raise ExportError("source export offline_dependencies association is malformed")
 
-    source_records = _validate_source_entries(root, manifest["source_entries"])
+    source_records = _validate_source_entries(root, manifest["source_entries"], scan=False)
     recipe_path = root / OFFLINE_RECIPE_PATH
     config_path = root / OFFLINE_CONFIG_PATH
     payload = root / OFFLINE_PAYLOAD_PATH
-    if OFFLINE_RECIPE_PATH not in source_records:
-        raise ExportError("fixed recipe is not bound as committed source")
     recipe_bytes = recipe_path.read_bytes()
-    if (hashlib.sha256(recipe_bytes).hexdigest() != association["recipe_sha256"]
-            or source_records[OFFLINE_RECIPE_PATH]["sha256"] != association["recipe_sha256"]):
-        raise ExportError("fixed recipe association digest mismatch")
     try:
         strict_manifest = helper._strict_manifest(root, preparer)
         recipe = helper._validate_recipe(
-            helper._read_json(recipe_path, "fixed recipe"), strict_manifest, preparer, root
+            json.loads(recipe_bytes.decode("utf-8"), object_pairs_hook=helper._no_duplicate_keys),
+            strict_manifest, preparer, root
         )
         helper.check_fixed_recipe_inputs(root, recipe, strict_manifest, preparer)
         inventory = helper.payload_inventory(payload)
         payload_digest = helper.tree_content_digest(payload)
-    except helper.OfflineDependencyError as error:
+    except (helper.OfflineDependencyError, UnicodeError, json.JSONDecodeError) as error:
         raise ExportError(f"offline dependency payload: {error}") from error
+    with _prepared_inspection_lock(root):
+        admitted, prepared_state = _validate_prepared_state(
+            root, manifest["source_entries"], strict_manifest, preparer, prepared
+        )
+    source_records = _validate_source_entries(root, manifest["source_entries"], admitted)
+    if OFFLINE_RECIPE_PATH not in source_records:
+        raise ExportError("fixed recipe is not bound as committed source")
+    recipe_digest = hashlib.sha256(recipe_bytes).hexdigest()
+    if (recipe_digest != association["recipe_sha256"]
+            or source_records[OFFLINE_RECIPE_PATH]["sha256"] != association["recipe_sha256"]):
+        raise ExportError("fixed recipe association digest mismatch")
     if (payload_digest != association["payload_tree_sha256"]
             or recipe["payload_tree_sha256"] != payload_digest):
         raise ExportError("offline dependency payload association digest mismatch")
@@ -900,9 +1041,35 @@ def validate_extracted(root: Path, cargo_home: Path | None = None) -> dict:
     if (config != expected_config
             or hashlib.sha256(config).hexdigest() != association["config_sha256"]):
         raise ExportError("generated Cargo configuration custody mismatch")
-    return {"schema_version": FULL_SCHEMA_VERSION, "revision": manifest["revision"],
-            "manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
-            "payload_tree_sha256": payload_digest, "payload_inventory": inventory}
+    try:
+        if manifest_path.read_bytes() != manifest_bytes or recipe_path.read_bytes() != recipe_bytes:
+            raise ExportError("source identity changed during extracted validation")
+        if config_path.read_bytes() != config:
+            raise ExportError("generated Cargo configuration changed during validation")
+        if (helper.payload_inventory(payload) != inventory
+                or helper.tree_content_digest(payload) != payload_digest):
+            raise ExportError("offline dependency payload changed during validation")
+    except OSError as error:
+        raise ExportError(f"bound input disappeared during validation: {error}") from error
+    with _prepared_inspection_lock(root):
+        final_admitted, final_prepared = _validate_prepared_state(
+            root, manifest["source_entries"], strict_manifest, preparer, prepared
+        )
+    if final_admitted != admitted or final_prepared != prepared_state:
+        raise ExportError("prepared state changed during extracted validation")
+    _validate_source_entries(root, manifest["source_entries"], final_admitted)
+    return {
+        "identity": {
+            "schema_version": FULL_SCHEMA_VERSION,
+            "revision": manifest["revision"],
+            "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+            "recipe_sha256": recipe_digest,
+            "payload_tree_sha256": payload_digest,
+            "config_sha256": hashlib.sha256(config).hexdigest(),
+        },
+        "prepared": prepared_state,
+        "payload_inventory": inventory,
+    }
 
 
 def main(arguments: list[str] | None = None) -> int:
@@ -919,6 +1086,8 @@ def main(arguments: list[str] | None = None) -> int:
                         help="validate an extracted full source export")
     parser.add_argument("--cargo-home", type=Path,
                         help="fresh Cargo home whose configuration custody is checked")
+    parser.add_argument("--prepared", choices=("forbid", "allow", "require"),
+                        help="admit recipe-owned prepared outputs while validating extraction")
     options = parser.parse_args(arguments)
     root = Path(__file__).resolve().parents[1]
     archive_dir = options.archive_dir.resolve() if options.archive_dir is not None else None
@@ -929,12 +1098,15 @@ def main(arguments: list[str] | None = None) -> int:
             if (options.output is not None or options.offline or options.archive_dir is not None
                     or options.offline_payload is not None or options.nightly_rustc is not None):
                 raise ExportError("verify-extracted cannot be combined with export arguments")
-            validate_extracted(options.verify_extracted, options.cargo_home)
+            validate_extracted(options.verify_extracted, options.cargo_home,
+                               prepared=options.prepared or "forbid")
         else:
             if options.output is None:
                 raise ExportError("output is required for source export")
             if options.cargo_home is not None:
                 raise ExportError("cargo-home is only accepted with verify-extracted")
+            if options.prepared is not None:
+                raise ExportError("prepared is only accepted with verify-extracted")
             run(
                 root, options.output, offline=options.offline, archive_dir=archive_dir,
                 offline_payload=options.offline_payload, nightly_rustc=options.nightly_rustc,

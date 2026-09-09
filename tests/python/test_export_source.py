@@ -163,9 +163,11 @@ class ExportSourceTests(unittest.TestCase):
         fixture.assemble()
         fixture.approve()
         shutil.rmtree(fixture.root / "third-party/src")
+        (fixture.root / "third-party/.prepare-dependencies.lock").unlink(missing_ok=True)
         fixture.export_manifest.unlink()
         (fixture.root / ".gitignore").write_text(
-            "third-party/src/\nthird-party/archives/\n", encoding="utf-8"
+            "third-party/src/\nthird-party/archives/\nthird-party/.prepare-dependencies.lock\n",
+            encoding="utf-8"
         )
         commands = (
             ["git", "init", "--quiet", "--template="],
@@ -194,16 +196,20 @@ class ExportSourceTests(unittest.TestCase):
         ], cwd=fixture.root.parent, env=environment, text=True,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-    def validate_full(self, source: Path, cargo_home: Path, *, environment=None):
+    def validate_full(self, source: Path, cargo_home: Path, *, environment=None,
+                      prepared=None):
         clean = {key: value for key, value in os.environ.items()
                  if not key.startswith(("CARGO_", "RUST", "P11SCOPE_"))
                  and key not in ("CC", "CFLAGS")}
         if environment:
             clean.update(environment)
-        return subprocess.run([
+        command = [
             sys.executable, "-I", str(source / "scripts/export-source.py"),
             "--verify-extracted", str(source), "--cargo-home", str(cargo_home),
-        ], cwd=self.base, env=clean, text=True, stdout=subprocess.PIPE,
+        ]
+        if prepared is not None:
+            command += ["--prepared", prepared]
+        return subprocess.run(command, cwd=self.base, env=clean, text=True, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE)
 
     def extracted_full(self, fixture, name: str):
@@ -921,6 +927,96 @@ class ExportSourceTests(unittest.TestCase):
                 self.update_source_row(case, relative)
                 refused = self.validate_full(case, cargo_home)
                 self.assert_refused(refused, needle)
+
+    def test_extracted_validator_prepared_modes_preserve_verified_outputs_and_lock(self):
+        fixture = self.full_fixture("prepared-modes")
+        source = self.extracted_full(fixture, "prepared-modes")
+        cargo_home = self.base / "prepared modes cargo home"
+        cargo_home.mkdir(mode=0o700)
+
+        absent_allow = self.validate_full(source, cargo_home, prepared="allow")
+        self.assertEqual(absent_allow.returncode, 0, absent_allow.stderr)
+        absent_require = self.validate_full(source, cargo_home, prepared="require")
+        self.assert_refused(absent_require, "required prepared output is missing")
+        prepared_root = source / "third-party/src"
+        prepared_root.mkdir(mode=0o755)
+        empty_forbid = self.validate_full(source, cargo_home)
+        self.assert_refused(empty_forbid, "prepared output is forbidden")
+        prepared_root.rmdir()
+        lock = source / "third-party/.prepare-dependencies.lock"
+        descriptor = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(descriptor)
+        lock_only = self.validate_full(source, cargo_home, prepared="allow")
+        self.assertEqual(lock_only.returncode, 0, lock_only.stderr)
+        lock_only_require = self.validate_full(source, cargo_home, prepared="require")
+        self.assert_refused(lock_only_require, "required prepared output is missing")
+        lock.unlink()
+
+        prepare = subprocess.run([
+            sys.executable, "-I", str(source / "scripts/prepare-dependencies.py"),
+            "--offline", "--archive-dir", str(source / "third-party/offline/archives"),
+        ], cwd=source, text=True, capture_output=True)
+        self.assertEqual(prepare.returncode, 0, prepare.stderr)
+        package = source / "third-party/src/demo-1.0.0-p1/value.txt"
+        lock = source / "third-party/.prepare-dependencies.lock"
+        lock.unlink()
+        missing_lock_allow = self.validate_full(source, cargo_home, prepared="allow")
+        self.assert_refused(missing_lock_allow, "third-party/.prepare-dependencies.lock")
+        missing_lock = self.validate_full(source, cargo_home, prepared="require")
+        self.assert_refused(missing_lock, "third-party/.prepare-dependencies.lock")
+        descriptor = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(descriptor)
+        before = (package.read_bytes(), package.stat().st_mode, package.stat().st_mtime_ns,
+                  lock.stat().st_ino, lock.stat().st_mode, lock.stat().st_mtime_ns)
+
+        default = self.validate_full(source, cargo_home)
+        self.assert_refused(default, "prepared output is forbidden")
+        for mode in ("allow", "require"):
+            result = self.validate_full(source, cargo_home, prepared=mode)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        after = (package.read_bytes(), package.stat().st_mode, package.stat().st_mtime_ns,
+                 lock.stat().st_ino, lock.stat().st_mode, lock.stat().st_mtime_ns)
+        self.assertEqual(after, before)
+
+    def test_extracted_validator_refuses_and_preserves_unknown_or_corrupt_prepared_state(self):
+        fixture = self.full_fixture("prepared-refusals")
+        source = self.extracted_full(fixture, "prepared-refusals")
+        cargo_home = self.base / "prepared refusal cargo home"
+        cargo_home.mkdir(mode=0o700)
+        prepare = subprocess.run([
+            sys.executable, "-I", str(source / "scripts/prepare-dependencies.py"),
+            "--offline", "--archive-dir", str(source / "third-party/offline/archives"),
+        ], cwd=source, text=True, capture_output=True)
+        self.assertEqual(prepare.returncode, 0, prepare.stderr)
+
+        unknown = source / "third-party/src/unknown-sibling"
+        unknown.mkdir()
+        sentinel = unknown / "sentinel"
+        sentinel.write_text("preserve\n", encoding="utf-8")
+        refused = self.validate_full(source, cargo_home, prepared="allow")
+        self.assert_refused(refused, "unexpected prepared output")
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve\n")
+        shutil.rmtree(unknown)
+
+        package = source / "third-party/src/demo-1.0.0-p1/value.txt"
+        package.write_text("corrupt\n", encoding="utf-8")
+        refused = self.validate_full(source, cargo_home, prepared="require")
+        self.assert_refused(refused, "tree digest mismatch")
+        self.assertEqual(package.read_text(encoding="utf-8"), "corrupt\n")
+
+    def test_prepared_cli_option_is_closed_and_verify_extracted_only(self):
+        fixture = self.full_fixture("prepared-cli")
+        source = self.extracted_full(fixture, "prepared-cli")
+        cargo_home = self.base / "prepared cli cargo home"
+        cargo_home.mkdir(mode=0o700)
+        invalid = self.validate_full(source, cargo_home, prepared="unknown")
+        self.assertNotEqual(invalid.returncode, 0)
+        output = self.base / "invalid prepared export.tar.gz"
+        mixed = subprocess.run([
+            sys.executable, "-I", str(fixture.root / "scripts/export-source.py"),
+            "--output", str(output), "--prepared", "allow",
+        ], cwd=self.base, text=True, capture_output=True)
+        self.assert_refused(mixed, "only accepted with verify-extracted")
 
 
 if __name__ == "__main__":

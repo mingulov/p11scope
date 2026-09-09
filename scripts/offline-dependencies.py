@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -161,6 +163,44 @@ def _absolute_directory(path: Path, label: str) -> None:
         raise OfflineDependencyError(f"{label} is unavailable: {error}") from error
     if not stat.S_ISDIR(metadata.st_mode) or path.resolve() != path:
         raise OfflineDependencyError(f"{label} must be a real directory without symbolic links")
+
+
+def _existing_lock_identity(metadata: os.stat_result, label: str) -> tuple[int, int]:
+    if (not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_uid != os.getuid() or metadata.st_size != 0):
+        raise OfflineDependencyError(f"{label} has unsafe type, mode, ownership, or content")
+    return metadata.st_dev, metadata.st_ino
+
+
+@contextlib.contextmanager
+def _existing_preparation_lock(root: Path):
+    """Lock the stable preparer lock without creating or following it."""
+    path = root / "third-party/.prepare-dependencies.lock"
+    descriptor = None
+    try:
+        named_before = path.lstat()
+        identity = _existing_lock_identity(named_before, "prepared dependency lock")
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        if _existing_lock_identity(os.fstat(descriptor), "opened prepared dependency lock") != identity:
+            raise OfflineDependencyError("prepared dependency lock changed before open")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        named_locked = path.lstat()
+        if _existing_lock_identity(named_locked, "locked prepared dependency lock") != identity:
+            raise OfflineDependencyError("prepared dependency lock changed while locking")
+        try:
+            yield
+        finally:
+            named_after = path.lstat()
+            if (_existing_lock_identity(os.fstat(descriptor), "opened prepared dependency lock") != identity
+                    or _existing_lock_identity(named_after, "prepared dependency lock") != identity):
+                raise OfflineDependencyError("prepared dependency lock changed during verification")
+    except FileNotFoundError as error:
+        raise OfflineDependencyError("prepared dependency lock is missing") from error
+    except OSError as error:
+        raise OfflineDependencyError(f"cannot inspect existing prepared dependency lock: {error}") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _entry_inventory(root: Path, *, payload_modes: bool) -> list[tuple[str, str, int, str]]:
@@ -953,7 +993,7 @@ def assemble(root: Path, options, preparer, checker) -> None:
                                            "inputs": inputs, "outcome": outcome})
 
 
-def verify(root: Path, options, preparer) -> dict:
+def verify(root: Path, options, preparer, *, reconstruct: bool = True) -> dict:
     _external_target(root, options.prefix, "evidence prefix")
     _absolute_directory(options.payload, "offline dependency payload")
     recipe_path = root / RECIPE_RELATIVE
@@ -994,9 +1034,16 @@ def verify(root: Path, options, preparer) -> dict:
     _payload_structure(options.payload, manifest, expected_vendor, expected_shared)
     _verify_nightly_provenance(options.payload, nightly)
     try:
-        preparer.run(root, check=False, offline=True, archive_dir=options.payload / "archives")
+        if reconstruct:
+            preparer.run(root, check=False, offline=True,
+                         archive_dir=options.payload / "archives")
+        else:
+            with _existing_preparation_lock(root):
+                preparer.run(root, check=True, offline=False, archive_dir=None)
     except preparer.PreparationError as error:
-        raise OfflineDependencyError(f"original archives cannot reconstruct prepared trees: {error}") from error
+        action = "original archives cannot reconstruct prepared trees" if reconstruct \
+            else "existing prepared outputs failed read-only verification"
+        raise OfflineDependencyError(f"{action}: {error}") from error
     final_rust, final_nightly = _rust_source(options.nightly_rustc)
     if final_rust != rust or final_nightly != nightly:
         raise OfflineDependencyError("nightly source input changed during verification")
@@ -1064,6 +1111,8 @@ def main(arguments: list[str] | None = None) -> int:
     verify_parser = subparsers.add_parser("verify")
     for option in ("payload", "nightly-rustc", "prefix"):
         verify_parser.add_argument(f"--{option}", type=Path, required=True)
+    verify_parser.add_argument("--check-prepared", action="store_true",
+                               help="verify existing prepared outputs without reconstruction")
     options = parser.parse_args(arguments)
     root = Path(__file__).resolve().parents[1]
     preparer = _load_module(root / "scripts/prepare-dependencies.py", "p11scope_offline_preparer")
@@ -1072,7 +1121,7 @@ def main(arguments: list[str] | None = None) -> int:
         if options.operation == "assemble":
             assemble(root, options, preparer, checker)
         else:
-            verify(root, options, preparer)
+            verify(root, options, preparer, reconstruct=not options.check_prepared)
     except OfflineDependencyError as error:
         print(f"offline-dependencies: refusal: {error}", file=sys.stderr)
         return 1

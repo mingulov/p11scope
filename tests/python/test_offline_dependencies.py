@@ -238,7 +238,7 @@ class OfflineFixture:
         (self.tools / "bpf-metadata.json").write_text(json.dumps(bpf_metadata), encoding="utf-8")
 
     def run(self, phase: str, *, payload: Path | None = None, prefix: Path | None = None,
-            environment: dict[str, str] | None = None):
+            environment: dict[str, str] | None = None, check_prepared: bool = False):
         command = [sys.executable, "-I", str(self.root / "scripts/offline-dependencies.py"), phase]
         if phase == "assemble":
             command += [
@@ -256,6 +256,8 @@ class OfflineFixture:
                 "--nightly-rustc", str(self.tools / "nightly rustc"),
                 "--prefix", str(prefix or self.prefix),
             ]
+            if check_prepared:
+                command.append("--check-prepared")
         return subprocess.run(command, cwd=self.root.parent, env=environment, text=True,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
@@ -515,6 +517,55 @@ class OfflineDependenciesTests(unittest.TestCase):
         provenance["packages"][0]["manifest_sha256"] = digest(manifest.read_bytes())
         provenance_path.write_text(json.dumps(provenance, sort_keys=True) + "\n", encoding="utf-8")
         self.assert_refused(self.fixture.run("verify"), "payload tree digest mismatch")
+
+    def test_check_prepared_verifies_without_reconstructing_or_repairing(self):
+        self.fixture.assemble()
+        self.fixture.approve()
+        generated = self.fixture.root / "third-party/src"
+        shutil.rmtree(generated)
+        missing_prefix = self.fixture.prefix.parent / "missing prepared"
+
+        missing = self.fixture.run(
+            "verify", prefix=missing_prefix, check_prepared=True
+        )
+
+        self.assert_refused(missing, "existing prepared outputs")
+        self.assertFalse(generated.exists())
+        self.assertFalse(Path(f"{missing_prefix}.verify.receipt.json").exists())
+
+        reconstructed = self.fixture.run("verify")
+        self.assertEqual(reconstructed.returncode, 0, reconstructed.stderr)
+        target = generated / "demo-1.0.0-p1/value.txt"
+        target.write_text("corrupt and preserve\n", encoding="utf-8")
+        before = (target.read_bytes(), target.stat().st_mtime_ns)
+        corrupt_prefix = self.fixture.prefix.parent / "corrupt prepared"
+
+        corrupt = self.fixture.run(
+            "verify", prefix=corrupt_prefix, check_prepared=True
+        )
+
+        self.assert_refused(corrupt, "existing prepared outputs")
+        self.assertEqual((target.read_bytes(), target.stat().st_mtime_ns), before)
+        self.assertFalse(Path(f"{corrupt_prefix}.verify.receipt.json").exists())
+
+    def test_check_prepared_requires_existing_safe_lock_without_creating_or_following(self):
+        self.fixture.assemble()
+        self.fixture.approve()
+        lock = self.fixture.root / "third-party/.prepare-dependencies.lock"
+        lock.unlink()
+        missing = self.fixture.run("verify", check_prepared=True)
+        self.assert_refused(missing, "prepared", "lock")
+        self.assertFalse(os.path.lexists(lock))
+
+        sentinel = Path(self.temporary.name) / "external lock sentinel"
+        sentinel.write_text("keep", encoding="utf-8")
+        before = (sentinel.read_bytes(), sentinel.stat().st_mode, sentinel.stat().st_mtime_ns)
+        lock.symlink_to(sentinel)
+        linked = self.fixture.run("verify", check_prepared=True)
+        self.assert_refused(linked, "prepared", "lock")
+        self.assertTrue(lock.is_symlink())
+        self.assertEqual((sentinel.read_bytes(), sentinel.stat().st_mode,
+                          sentinel.stat().st_mtime_ns), before)
 
     def test_verify_binds_inputs_but_ignores_unrelated_project_source_identity(self):
         self.fixture.assemble()

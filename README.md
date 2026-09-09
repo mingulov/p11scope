@@ -56,6 +56,9 @@ archives explicitly. All locked registry packages and the fixed
 `pkcs11-proxy-ng` Git revision are separate Cargo inputs and must already be
 available in the Cargo cache for a fully offline build.
 
+For a self-contained full source export and its fixed unprivileged recipient
+bootstrap, see [the offline build guide](docs/build-offline.md).
+
 ## Why
 
 - **Black-box diagnostics** — "this app intermittently fails against our HSM;

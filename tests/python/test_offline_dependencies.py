@@ -326,6 +326,49 @@ class OfflineDependenciesTests(unittest.TestCase):
         for suffix in ("command.json", "tools.json", "inputs.json", "outcome.json"):
             self.assertTrue(Path(f"{self.fixture.prefix}.assemble.{suffix}").is_file())
 
+    def test_assemble_refuses_unrecognized_cargo_checksum_schema(self):
+        mutations = (
+            ("altered comment", {"$comment": "altered"}),
+            ("extra key", {"unexpected": True}),
+        )
+        for index, (label, mutation) in enumerate(mutations):
+            with self.subTest(label=label):
+                temporary = Path(self.temporary.name) / f"checksum schema {index}"
+                temporary.mkdir()
+                fixture = OfflineFixture(temporary)
+                fixture.testcase = self
+                fixture.update_tool_configuration(vendor_checksum_mutation=mutation)
+
+                result = fixture.run("assemble")
+
+                self.assert_refused(result, "malformed Cargo vendor checksum")
+                self.assertFalse(fixture.candidate.exists())
+                self.assertFalse(fixture.output.exists())
+                self.assertFalse(Path(f"{fixture.prefix}.assemble.outcome.json").exists())
+
+    def test_verify_refuses_unrecognized_cargo_checksum_schema_before_receipt(self):
+        self.fixture.assemble()
+        self.fixture.approve()
+        mutations = (
+            ("altered comment", {"$comment": "altered"}),
+            ("extra key", {"unexpected": True}),
+        )
+        for index, (label, mutation) in enumerate(mutations):
+            with self.subTest(label=label):
+                payload = Path(self.temporary.name) / f"checksum verify {index}"
+                shutil.copytree(self.fixture.output, payload)
+                checksum_path = payload / "vendor/shared-0.1.0/.cargo-checksum.json"
+                checksum = json.loads(checksum_path.read_text(encoding="utf-8"))
+                checksum.update(mutation)
+                checksum_path.write_text(json.dumps(checksum) + "\n", encoding="utf-8")
+                prefix = self.fixture.prefix.parent / f"checksum verify evidence {index}"
+
+                result = self.fixture.run("verify", payload=payload, prefix=prefix)
+
+                self.assert_refused(result, "malformed Cargo vendor checksum")
+                self.assertFalse(Path(f"{prefix}.verify.outcome.json").exists())
+                self.assertFalse(Path(f"{prefix}.verify.receipt.json").exists())
+
     def test_bundle_advertisement_requires_self_contained_commit_closure(self):
         pack = b"PACK" + struct.pack(">II", 2, 0)
         pack += hashlib.sha1(pack).digest()

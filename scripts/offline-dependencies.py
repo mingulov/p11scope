@@ -22,6 +22,10 @@ from urllib.parse import parse_qs, urlsplit, urlunsplit
 SCHEMA_VERSION = 1
 TREE_DOMAIN = b"p11scope-offline-dependency-tree-v1\0"
 NIGHTLY_TOOLCHAIN = "nightly-2026-05-20"
+CARGO_CHECKSUM_COMMENT = (
+    "This file only protects against accidental modifications. It is not a security mechanism "
+    "and does not protect against malicious changes."
+)
 RECIPE_RELATIVE = Path("third-party/offline-dependencies.json")
 METADATA_ARGUMENTS = ("metadata", "--locked", "--offline", "--all-features",
                       "--format-version", "1", "--manifest-path")
@@ -421,7 +425,9 @@ def _workspace_identities(root: Path, manifest: dict) -> dict:
 def _validate_checksum_tree(package: Path, expected: dict) -> dict:
     checksum_path = package / ".cargo-checksum.json"
     checksum = _read_json(checksum_path, "Cargo vendor checksum")
-    if not isinstance(checksum, dict) or set(checksum) != {"files", "package"}:
+    if (not isinstance(checksum, dict)
+            or set(checksum) != {"$comment", "files", "package"}
+            or checksum["$comment"] != CARGO_CHECKSUM_COMMENT):
         raise OfflineDependencyError(f"malformed Cargo vendor checksum: {checksum_path}")
     wanted_package = expected["checksum"] if expected["kind"] == "registry" else None
     if checksum["package"] != wanted_package or not isinstance(checksum["files"], dict):

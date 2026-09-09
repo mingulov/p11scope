@@ -41,6 +41,14 @@ elif sys.argv[1:2] == ["vendor"]:
         raise SystemExit(status)
     destination = Path(sys.argv[-1])
     shutil.copytree(configuration["vendor_template"], destination)
+    for checksum_path in destination.glob("*/.cargo-checksum.json"):
+        checksum = json.loads(checksum_path.read_text(encoding="utf-8"))
+        checksum["$comment"] = (
+            "This file only protects against accidental modifications. It is not a security "
+            "mechanism and does not protect against malicious changes."
+        )
+        checksum.update(configuration.get("vendor_checksum_mutation", {}))
+        checksum_path.write_text(json.dumps(checksum, sort_keys=True) + "\n", encoding="utf-8")
     sys.stdout.write("# controlled cargo vendor configuration\n")
 else:
     sys.stderr.write("unsupported controlled Cargo invocation\n")

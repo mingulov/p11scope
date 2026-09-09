@@ -2695,6 +2695,79 @@ fn resolve_trace_max_events(max_events: Option<u64>) -> u64 {
     max_events.unwrap_or(DEFAULT_TRACE_MAX_EVENTS)
 }
 
+struct CaptureConsumers<'state> {
+    state: &'state mut semantics::State,
+    tracker: &'state mut process::Tracker,
+    tracer: Option<&'state mut trace::Tracer>,
+    malformed_records: &'state mut u64,
+}
+
+type ProfileTickContext<'tick, 'owned> = (
+    &'tick mut Engine,
+    &'tick mut Session,
+    &'tick mut Option<&'owned mut Owned>,
+);
+
+type TraceTickContext<
+    'engine,
+    'session,
+    'owned_ref,
+    'owned,
+    'remaining,
+    'loss,
+    'stdout_ref,
+    'stdout_object,
+    'stdout_open,
+    'out_file,
+> = (
+    &'engine mut Engine,
+    &'session mut Session,
+    &'owned_ref mut Option<&'owned mut Owned>,
+    &'remaining mut Option<u64>,
+    &'loss mut u64,
+    &'stdout_ref mut (dyn Write + 'stdout_object),
+    &'stdout_open mut bool,
+    &'out_file mut Option<std::fs::File>,
+);
+
+#[derive(Debug)]
+enum CaptureTick<T> {
+    Continue { paused: bool, snapshot: T },
+    End(CaptureEnd),
+}
+
+fn capture_tick_with<'state, C, T>(
+    context: &mut C,
+    consumers: &mut CaptureConsumers<'state>,
+    discovery: impl for<'tick> FnOnce(
+        &'tick mut C,
+    ) -> Result<(bool, bool, &'tick crate::plan::AttachPlan)>,
+    end: impl FnOnce(&mut C) -> Result<Option<CaptureEnd>>,
+    drain: impl FnOnce(&mut C, &mut CaptureConsumers<'state>) -> Result<Option<CaptureEnd>>,
+    snapshot: impl FnOnce(&mut C, &CaptureConsumers<'state>) -> Result<T>,
+    check: impl FnOnce(&mut C) -> Result<()>,
+) -> Result<CaptureTick<T>> {
+    let paused = {
+        let (plan_changed, paused, plan) = discovery(context)?;
+        if plan_changed {
+            consumers.state.sync_plan(plan);
+            if let Some(tracer) = consumers.tracer.as_deref_mut() {
+                tracer.sync_plan(plan);
+            }
+        }
+        paused
+    };
+    if let Some(end) = end(context)? {
+        return Ok(CaptureTick::End(end));
+    }
+    if let Some(end) = drain(context, consumers)? {
+        return Ok(CaptureTick::End(end));
+    }
+    let snapshot = snapshot(context, consumers)?;
+    check(context)?;
+    Ok(CaptureTick::Continue { paused, snapshot })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn capture_profile(
     engine: &mut Engine,
@@ -2753,39 +2826,65 @@ fn capture_profile(
     let loop_result = (|| -> Result<CaptureEnd> {
     loop {
         let elapsed = clock.elapsed();
-        // 1. Drain discovery: `Engine` extends `AttachPlan` and applies the
-        //    attachment deltas inside this call.
-        let (plan_changed, paused) =
-            drain_discovery_tick(engine, session, owned.as_deref_mut(), interrupted)?;
-        // 2. Synchronize the immediate semantic invalidations, which preserve
-        //    unchanged retired decode metadata, before anything reads state.
-        if plan_changed {
-            state.sync_plan(engine.plan());
-        }
-        if let Some(end) = capture_end(engine, owned.as_deref(), interrupted, elapsed, duration)? {
-            break Ok(end);
-        }
-        // 3. Drain call events — one quantum while the producers are live, so
-        //    a hot producer hands control back to step 2's checks every tick.
-        if profile {
-            malformed_records += drain_events(
-                session,
-                &mut state,
-                &mut process_tracker,
-            )?;
-        }
-        // 4. Retire exited process state.
-        // 5. Snapshot metrics and counters.
-        let mut kernel_evidence = metrics::kernel_evidence(session)?;
-        if !profile {
-            kernel_evidence.ring_loss = 0;
-        }
-        let reports = metrics::read(session, engine.plan())?;
-        // 6. Check the retained generations and objects.
-        engine
-            .pinned()
-            .check_unchanged()
-            .map_err(anyhow::Error::msg)?;
+        let tick = {
+            let mut context = (&mut *engine, &mut *session, &mut owned);
+            let mut consumers = CaptureConsumers {
+                state: &mut state,
+                tracker: &mut process_tracker,
+                tracer: None,
+                malformed_records: &mut malformed_records,
+            };
+            capture_tick_with(
+                &mut context,
+                &mut consumers,
+                |context: &mut ProfileTickContext<'_, '_>| {
+                    let (plan_changed, paused) = drain_discovery_tick(
+                        context.0,
+                        context.1,
+                        context.2.as_deref_mut(),
+                        interrupted,
+                    )?;
+                    Ok((plan_changed, paused, context.0.plan()))
+                },
+                |context| capture_end(
+                    context.0,
+                    context.2.as_deref(),
+                    interrupted,
+                    elapsed,
+                    duration,
+                ),
+                |context, consumers| {
+                    if profile {
+                        *consumers.malformed_records += drain_events(
+                            context.1,
+                            consumers.state,
+                            consumers.tracker,
+                        )?;
+                    }
+                    Ok(None)
+                },
+                |context, _| {
+                    let mut kernel_evidence = metrics::kernel_evidence(context.1)?;
+                    if !profile {
+                        kernel_evidence.ring_loss = 0;
+                    }
+                    let reports = metrics::read(context.1, context.0.plan())?;
+                    Ok((reports, kernel_evidence))
+                },
+                |context| {
+                    context
+                        .0
+                        .pinned()
+                        .check_unchanged()
+                        .map(|_| ())
+                        .map_err(anyhow::Error::msg)
+                },
+            )?
+        };
+        let (paused, (reports, kernel_evidence)) = match tick {
+            CaptureTick::Continue { paused, snapshot } => (paused, snapshot),
+            CaptureTick::End(end) => break Ok(end),
+        };
 
         if last_frame.elapsed() >= PROFILE_CADENCE {
             last_frame = Instant::now();
@@ -3023,49 +3122,90 @@ fn capture_trace(
     let loop_result = (|| -> Result<CaptureEnd> {
     loop {
         let elapsed = clock.elapsed();
-        // 1. Drain discovery; the Engine extends the plan and applies deltas.
-        let (plan_changed, paused) =
-            drain_discovery_tick(engine, session, owned.as_deref_mut(), interrupted)?;
-        // 2. Synchronize both immediate invalidation consumers at once, so a
-        //    trace line can never name a slot semantics has already retired.
-        if plan_changed {
-            state.sync_plan(engine.plan());
-            tracer.sync_plan(engine.plan());
-        }
-        if let Some(end) = capture_end(engine, owned.as_deref(), interrupted, elapsed, duration)? {
-            break Ok(end);
-        }
-        // 3. Drain call events — one quantum while the producers are live, and
-        //    the poll itself stops at the last permitted line, so a hot
-        //    producer can neither hold off step 2's checks nor the limit below.
-        malformed_records += drain_trace_events(
-            session,
-            &mut remaining,
-            &mut state,
-            &mut process_tracker,
-            scope,
-            &mut tracer,
-            stdout,
-            &mut stdout_open,
-            out_file,
-        )?;
-        if remaining == Some(0) {
-            break Ok(CaptureEnd::LimitReached);
-        }
-        // 4. Retire exited process state.
-        // 5. Snapshot the loss counter.
-        report_trace_loss(
-            session,
-            &mut last_reported_loss,
-            stdout,
-            &mut stdout_open,
-            out_file,
-        )?;
-        // 6. Check the retained generations and objects.
-        engine
-            .pinned()
-            .check_unchanged()
-            .map_err(anyhow::Error::msg)?;
+        let tick = {
+            let mut context = (
+                &mut *engine,
+                &mut *session,
+                &mut owned,
+                &mut remaining,
+                &mut last_reported_loss,
+                &mut *stdout,
+                &mut stdout_open,
+                &mut *out_file,
+            );
+            let mut consumers = CaptureConsumers {
+                state: &mut state,
+                tracker: &mut process_tracker,
+                tracer: Some(&mut tracer),
+                malformed_records: &mut malformed_records,
+            };
+            capture_tick_with(
+                &mut context,
+                &mut consumers,
+                |context: &mut TraceTickContext<
+                    '_,
+                    '_,
+                    '_,
+                    '_,
+                    '_,
+                    '_,
+                    '_,
+                    '_,
+                    '_,
+                    '_,
+                >| {
+                    let (plan_changed, paused) = drain_discovery_tick(
+                        context.0,
+                        context.1,
+                        context.2.as_deref_mut(),
+                        interrupted,
+                    )?;
+                    Ok((plan_changed, paused, context.0.plan()))
+                },
+                |context| capture_end(
+                    context.0,
+                    context.2.as_deref(),
+                    interrupted,
+                    elapsed,
+                    duration,
+                ),
+                |context, consumers| {
+                    *consumers.malformed_records += drain_trace_events(
+                        context.1,
+                        context.3,
+                        consumers.state,
+                        consumers.tracker,
+                        scope,
+                        consumers.tracer.as_deref_mut().expect("trace consumer"),
+                        context.5,
+                        context.6,
+                        context.7,
+                    )?;
+                    Ok((*context.3 == Some(0)).then_some(CaptureEnd::LimitReached))
+                },
+                |context, _| {
+                    report_trace_loss(
+                        context.1,
+                        context.4,
+                        context.5,
+                        context.6,
+                        context.7,
+                    )
+                },
+                |context| {
+                    context
+                        .0
+                        .pinned()
+                        .check_unchanged()
+                        .map(|_| ())
+                        .map_err(anyhow::Error::msg)
+                },
+            )?
+        };
+        let paused = match tick {
+            CaptureTick::Continue { paused, snapshot: () } => paused,
+            CaptureTick::End(end) => break Ok(end),
+        };
         flush_stdout(stdout, &mut stdout_open)?;
         if let Some(f) = out_file.as_mut() {
             f.flush().context("flushing trace output file")?;
@@ -3670,6 +3810,10 @@ fn fmt_rfc3339(t: SystemTime) -> String {
 
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
 }
+
+#[cfg(test)]
+#[path = "run/capture_loop_tests.rs"]
+mod capture_loop_tests;
 
 #[cfg(test)]
 mod tests {

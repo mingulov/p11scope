@@ -8349,3 +8349,27 @@ fn prepared_four_callers_bind_admission_build_handoff_and_finalization() {
 fn product_build_preserves_explicit_build_context() {
     run_native_python_suite("tests/python/test_product_build.py", "ProductBuildTests");
 }
+
+#[test]
+fn dual_build_callers_preserve_ordinary_and_prepared_contexts() {
+    run_native_python_suite(
+        "tests/python/test_dual_build_callers.py",
+        "DualBuildCallerTests",
+    );
+}
+
+#[test]
+fn ordinary_build_callers_prepare_before_build_and_privilege() {
+    run_native_python_suite(
+        "tests/python/test_ordinary_build_callers.py",
+        "OrdinaryBuildCallerTests",
+    );
+}
+
+#[test]
+fn offline_dependencies_bind_complete_sources_and_final_inputs() {
+    run_native_python_suite(
+        "tests/python/test_offline_dependencies.py",
+        "OfflineDependenciesTests",
+    );
+}

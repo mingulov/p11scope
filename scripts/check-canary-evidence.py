@@ -134,6 +134,9 @@ DISCOVERY_RECORD_SIZE = 920
 # Keyed by name only because a record layout is per-map; which maps are
 # ringbufs is decided by `type`, from the one checked-in BPF inventory.
 RING_RECORD_SIZES = {"EVENTS": EVENT_SIZE, "DISCOVERY": DISCOVERY_RECORD_SIZE}
+START_SNAPSHOT_LANES = {
+    "default-safe-start", "feature-safe-start", "feature-unsafe-fault",
+}
 
 
 # Loader and pause identities the observer holds privately. None of them may
@@ -805,6 +808,13 @@ def assert_event_records(raw_records, lane, workload_pid):
                 event["attr_seen"]) == (1, 1, 0, 0), event
 
 
+def assert_start_event_records(raw_records, lane):
+    assert lane in START_SNAPSHOT_LANES, lane
+    assert not raw_records, (
+        f"{lane}: blocked START snapshot contains {len(raw_records)} completed EVENTS"
+    )
+
+
 def assert_raw_records(manifest, lane, workload_pid, prefix):
     """Reads every owned ringbuf through the mmap oracle and keeps its bytes.
 
@@ -818,7 +828,10 @@ def assert_raw_records(manifest, lane, workload_pid, prefix):
             continue
         records = ring_records(manifest, item["name"])
         if item["name"] == "EVENTS":
-            assert_event_records(records, lane, workload_pid)
+            if lane in START_SNAPSHOT_LANES:
+                assert_start_event_records(records, lane)
+            else:
+                assert_event_records(records, lane, workload_pid)
         ring_raw_path(prefix, item["name"]).write_bytes(b"".join(records))
         read.add(item["name"])
     assert read == set(RING_RECORD_SIZES), f"{lane}: owned ringbufs {read} were not all read"

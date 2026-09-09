@@ -409,6 +409,95 @@ class FinalScannerSurfaceTests(unittest.TestCase):
                         subject.assert_safe_lane_alias_privacy(lane, surfaces[lane])
 
 
+class StartRingSurfaceIntegrationTests(unittest.TestCase):
+    LANES = {
+        "default-safe-start": "SAFE_MAPS",
+        "feature-safe-start": "UNSAFE_MAPS",
+        "feature-unsafe-fault": "UNSAFE_MAPS",
+    }
+
+    def inventory(self, subject, root, lane, inventory_name):
+        manifest = []
+        for map_id, (name, definition) in enumerate(
+            sorted(subject.BPF_MAP_DEFS[inventory_name].items()), start=1
+        ):
+            ring = definition["type"] == 27
+            task_storage = definition["type"] == 29
+            item = {
+                "name": name,
+                "id": map_id,
+                "max_entries": definition["max_entries"],
+                "key_size": 0 if ring else definition["key_size"],
+                "value_size": 0 if ring else definition["value_size"],
+                "type": "ringbuf" if ring else "task_storage" if task_storage else "hash",
+                "oracle": "mmap" if ring else "task-storage" if task_storage else "dump",
+            }
+            if not ring:
+                suffix = "bin" if task_storage else "json"
+                path = root / f"mapdump_{name}_{lane}.{suffix}"
+                path.write_bytes(bytes(544) if task_storage else b"[]\n")
+                item["file"] = str(path)
+            manifest.append(item)
+        manifest_path = root / f"mapdump_manifest_{lane}.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        return manifest_path
+
+    def test_complete_start_inventory_retains_real_ring_bytes_and_scans_every_surface(self):
+        subject = load_subject(TARGET_BITS)
+        discovery = bytes(subject.DISCOVERY_RECORD_SIZE)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for lane, inventory_name in self.LANES.items():
+                manifest = self.inventory(subject, root, lane, inventory_name)
+
+                def records(_manifest, name):
+                    return [] if name == "EVENTS" else [discovery]
+
+                with mock.patch.object(subject, "ring_records", side_effect=records):
+                    subject.assert_raw_records(manifest, lane, 0x555, root / lane)
+                self.assertEqual(
+                    subject.ring_raw_path(root / lane, "DISCOVERY").read_bytes(),
+                    discovery,
+                )
+                expected = set(subject.BPF_MAP_DEFS[inventory_name])
+                surfaces = subject.assert_exact_owned_map_inventory(root, lane, expected)
+                subject.assert_final_artifact_privacy(surfaces)
+                if lane != "feature-unsafe-fault":
+                    subject.assert_safe_lane_alias_privacy(lane, surfaces)
+
+            missing = subject.ring_raw_path(root / "feature-unsafe-fault", "DISCOVERY")
+            missing.unlink()
+            with self.assertRaisesRegex(AssertionError, "has no scanned surface"):
+                subject.assert_exact_owned_map_inventory(
+                    root, "feature-unsafe-fault",
+                    set(subject.BPF_MAP_DEFS["UNSAFE_MAPS"]),
+                )
+
+            owner = root / "mapdump_THREAD_OWNER_default-safe-start.bin"
+            owner.write_bytes(bytes(520) + subject.SENTINELS["PIN"])
+            surfaces = subject.assert_exact_owned_map_inventory(
+                root, "default-safe-start", set(subject.BPF_MAP_DEFS["SAFE_MAPS"])
+            )
+            with self.assertRaisesRegex(AssertionError, "pointer canaries leaked"):
+                subject.assert_final_artifact_privacy(surfaces)
+
+    def test_start_snapshot_rejects_completed_event_records(self):
+        subject = load_subject(TARGET_BITS)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self.inventory(subject, root, "default-safe-start", "SAFE_MAPS")
+
+            def records(_manifest, name):
+                return [event_bytes(0)] if name == "EVENTS" else []
+
+            with mock.patch.object(subject, "ring_records", side_effect=records):
+                with self.assertRaisesRegex(AssertionError, "blocked START snapshot"):
+                    subject.assert_raw_records(
+                        manifest, "default-safe-start", 0x555,
+                        root / "default-safe-start",
+                    )
+
+
 class HostileStartTests(unittest.TestCase):
     def test_safe_start_records_and_padding_mutation(self):
         subject = load_subject(TARGET_BITS)

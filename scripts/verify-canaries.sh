@@ -307,6 +307,7 @@ run_start_lane() {
         "$WORK/$start_lane.output" "$WORK/$start_lane.observer.log" \
         "$WORK/$start_lane.workload.log" "$WORK"/mapdump_*_"$start_lane".json \
         "$WORK"/mapdump_*_"$start_lane".bin \
+        "$WORK/$start_lane".*.raw \
         "$WORK/mapdump_manifest_$start_lane.json"
     ( while [ ! -f "$WORK/$start_lane.go" ]; do sleep 0.05; done
       exec "$WORK/canary_workload" "$WORK/privacy-provider.so" "$start_mode" ) \
@@ -332,7 +333,10 @@ run_start_lane() {
     sudo python3 -I scripts/dump-owned-bpf-maps.py "$OBSERVER_PID" "$WORK" \
         "$start_lane" "$start_entries" 16384 \
         "$TASK_STORAGE_READER" "$TASK_STORAGE_OBJECT"
-    reclaim_root_output "$WORK"/mapdump_*_"$start_lane".json
+    assert_lanes --raw-events "$WORK/mapdump_manifest_$start_lane.json" \
+        "$start_lane" "$start_workload_pid" "$WORK/$start_lane"
+    reclaim_root_output "$WORK"/mapdump_*_"$start_lane".json \
+        "$WORK/$start_lane".*.raw
     if [ "$start_oracle" = --fault-starts ]; then
         assert_lanes "$start_oracle" "$WORK/mapdump_manifest_$start_lane.json" \
             "$start_workload_pid"

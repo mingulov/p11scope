@@ -5800,6 +5800,22 @@ aggregate-only-metrics default metrics"
         blocked_lanes,
         "default-safe-start default\nfeature-safe-start feature"
     );
+    let start_lane = between(
+        &canaries,
+        "run_start_lane() {",
+        "\n}\n\necho \"=== live safe START policy",
+    );
+    let raw_start = start_lane
+        .find("assert_lanes --raw-events")
+        .expect("START lanes must retain their real ring records");
+    let teardown = start_lane
+        .find("signal_verified_process TERM")
+        .expect("START workload teardown");
+    assert!(
+        raw_start < teardown
+            && start_lane.contains("\"$WORK/$start_lane\".*.raw")
+            && start_lane.contains("reclaim_root_output")
+    );
 
     let induced = read("scripts/verify-induced-gaps.sh");
     for (name, caller) in [
@@ -5932,6 +5948,7 @@ aggregate-only-metrics default metrics"
                 "TaskStorageInventoryTests",
                 "TaskStorageReaderTests",
                 "FinalScannerSurfaceTests",
+                "StartRingSurfaceIntegrationTests",
                 "TargetWidthPathTests",
                 "-v",
             ])
@@ -5958,6 +5975,7 @@ aggregate-only-metrics default metrics"
             "TaskStorageInventoryTests",
             "TaskStorageReaderTests",
             "FinalScannerSurfaceTests",
+            "StartRingSurfaceIntegrationTests",
             "TargetWidthPathTests",
         ] {
             assert!(
@@ -5966,7 +5984,7 @@ aggregate-only-metrics default metrics"
             );
         }
         assert!(
-            report.contains("Ran 20 tests") && !report.contains("skipped="),
+            report.contains("Ran 22 tests") && !report.contains("skipped="),
             "native {bits}-bit suite must execute every required case: {report}"
         );
     }

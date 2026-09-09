@@ -146,15 +146,33 @@ class PreparedReleaseDriverTests(unittest.TestCase):
         cargo = fixture.base / "selected cargo.py"
         shutil.copyfile(NATIVE / "build-probe.py", cargo)
         cargo.chmod(0o700)
-        rustc = fixture.base / "selected rustc"
-        fixture.inert(rustc)
+        tools = []
+        for name in ("selected rustc", "selected bpf cargo", "selected bpf rustc"):
+            path = fixture.base / name
+            fixture.inert(path)
+            tools.append(path)
         harness = fixture.base / "build.sh"
-        fixture.template(str(NATIVE / "build.sh.in"), harness, ROOT=fixture.root, CARGO=cargo, RUSTC=rustc, COMMAND=command)
+        fixture.template(str(NATIVE / "build.sh.in"), harness, ROOT=fixture.root,
+                         CARGO=cargo, RUSTC=tools[0], BPF_CARGO=tools[1],
+                         BPF_RUSTC=tools[2], OMIT="none", COMMAND=command)
         result = fixture.command(["/bin/sh", str(harness)])
         self.assertEqual(result.returncode, 0, result.stderr)
         event = json.loads(cargo.with_suffix(".json").read_text())
         self.assertEqual(event, {"argv": ["build", "--locked", "--release", "--workspace", "--offline"],
-                                 "cargo": str(cargo), "rustc": str(rustc), "target": str(fixture.root / "work/target")})
+                                 "cargo": str(cargo), "rustc": str(tools[0]),
+                                 "bpf_cargo": str(tools[1]), "bpf_rustc": str(tools[2]),
+                                 "target": str(fixture.root / "work/target")})
+        for omitted in ("P11SCOPE_PREPARED_STABLE_CARGO", "P11SCOPE_PREPARED_STABLE_RUSTC",
+                        "P11SCOPE_PREPARED_BPF_CARGO", "P11SCOPE_PREPARED_BPF_RUSTC"):
+            with self.subTest(omitted=omitted):
+                harness = fixture.base / ("omit-" + omitted + ".sh")
+                fixture.template(str(NATIVE / "build.sh.in"), harness, ROOT=fixture.root,
+                                 CARGO=cargo, RUSTC=tools[0], BPF_CARGO=tools[1],
+                                 BPF_RUSTC=tools[2], OMIT=omitted, COMMAND=command)
+                cargo.with_suffix(".json").unlink(missing_ok=True)
+                result = fixture.command(["/bin/sh", str(harness)])
+                self.assertNotEqual(result.returncode, 0, omitted)
+                self.assertFalse(cargo.with_suffix(".json").exists(), omitted)
 
     def test_early_release_refusals_do_not_require_new_helper_files(self):
         for scenario in (*SEAL["BUILD_INPUT_VARIABLES"], *NEW_BUILD_CONTEXT,

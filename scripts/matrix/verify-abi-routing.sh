@@ -420,12 +420,16 @@ abi_main() {
     [ "$(abi_elf_class "$FIXTURES/harness-32")" = ELF32 ] && [ "$(abi_elf_class "$FIXTURES/second-32.so")" = ELF32 ] || { abi_result NONPASS reason=ia32_subject_class_mismatch; exit 1; }
     abi_loader=$(readelf -l "$FIXTURES/harness-32" | sed -n 's/.*Requesting program interpreter: \([^]]*\)].*/\1/p')
     [ -n "$abi_loader" ] && [ -x "$abi_loader" ] || { abi_result NONPASS "reason=ia32_loader_unavailable loader=${abi_loader:-missing}"; exit 1; }
-    RUSTC="$P11SCOPE_PREPARED_STABLE_RUSTC" CARGO_TARGET_DIR="$DEFAULT_TARGET" \
+    P11SCOPE_PREPARED_BPF_CARGO="$P11SCOPE_PREPARED_BPF_CARGO" \
+        P11SCOPE_PREPARED_BPF_RUSTC="$P11SCOPE_PREPARED_BPF_RUSTC" \
+        RUSTC="$P11SCOPE_PREPARED_STABLE_RUSTC" CARGO_TARGET_DIR="$DEFAULT_TARGET" \
         "$P11SCOPE_PREPARED_STABLE_CARGO" build --locked --offline \
         --example abi-routing --no-default-features \
         >"$EVIDENCE/build-default.log" 2>&1 || \
         { abi_result NONPASS reason=default_example_build_failed; exit 1; }
-    RUSTC="$P11SCOPE_PREPARED_STABLE_RUSTC" \
+    P11SCOPE_PREPARED_BPF_CARGO="$P11SCOPE_PREPARED_BPF_CARGO" \
+        P11SCOPE_PREPARED_BPF_RUSTC="$P11SCOPE_PREPARED_BPF_RUSTC" \
+        RUSTC="$P11SCOPE_PREPARED_STABLE_RUSTC" \
         CARGO_TARGET_DIR="$DIAGNOSTIC_TARGET" \
         "$P11SCOPE_PREPARED_STABLE_CARGO" build --locked --offline \
         --example abi-routing --no-default-features \

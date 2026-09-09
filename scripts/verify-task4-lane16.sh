@@ -401,6 +401,8 @@ SOFTHSM2_CONF="$ROOT/work/softhsm2.conf" softhsm2-util --init-token --free \
     --label task4-lane16 --so-pin 1234 --pin 1234 >/dev/null
 CARGO_TARGET_DIR="$ROOT/work/target" \
     RUSTC="$P11SCOPE_PREPARED_STABLE_RUSTC" \
+    P11SCOPE_PREPARED_BPF_CARGO="$P11SCOPE_PREPARED_BPF_CARGO" \
+    P11SCOPE_PREPARED_BPF_RUSTC="$P11SCOPE_PREPARED_BPF_RUSTC" \
     "$P11SCOPE_PREPARED_STABLE_CARGO" build --locked --release --workspace --offline \
     > "$ROOT/stdout.log" 2> "$ROOT/stderr.log"
 gcc -O0 -o "$ROOT/work/hammer" scripts/fixtures/hammer.c -ldl \

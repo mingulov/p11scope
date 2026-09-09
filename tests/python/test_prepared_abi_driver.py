@@ -278,6 +278,64 @@ class PreparedAbiDriverTests(unittest.TestCase):
         self.assertIn("third-party/src/demo-1.0.0-p1/src/lib.rs", initial)
         self.assertNotIn("third-party/aya", "\n".join(initial))
 
+    def test_actual_builds_forward_all_selected_tools_with_unexported_parent_variables(self):
+        fixture = self.fixture("build paths with spaces")
+        source = (fixture.root / "scripts/matrix/verify-abi-routing.sh").read_text()
+        start = '    P11SCOPE_PREPARED_BPF_CARGO="$P11SCOPE_PREPARED_BPF_CARGO" \\\n'
+        end = "    DEFAULT_BIN="
+        self.assertEqual(source.count(start), 2)
+        command = fixture.base / "abi-build-commands.sh"
+        command.write_text(source[source.index(start):source.index(end)])
+        cargo = fixture.base / "selected stable cargo"
+        shutil.copy2(FIXTURES / "build-probe.py", cargo)
+        cargo.chmod(0o700)
+        tools = [cargo]
+        for name in ("selected stable rustc", "selected bpf cargo", "selected bpf rustc"):
+            path = fixture.base / name
+            path.write_text("fixture tool\n")
+            path.chmod(0o700)
+            tools.append(path)
+        launcher = FIXTURES / "build-launcher.sh.in"
+
+        def run(omitted):
+            record = fixture.base / "abi-builds.jsonl"
+            record.unlink(missing_ok=True)
+            result = subprocess.run(
+                ["/bin/sh", str(launcher), str(command), str(record),
+                 *(str(path) for path in tools), omitted],
+                cwd=fixture.root, env=fixture.environment(), text=True,
+                capture_output=True, timeout=15,
+            )
+            return result, record
+
+        result, record = run("none")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = [json.loads(line) for line in record.read_text().splitlines()]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([row["target"] for row in rows], [
+            str(command.parent / "default target"),
+            str(command.parent / "diagnostic target"),
+        ])
+        self.assertEqual(rows[0]["argv"], ["build", "--locked", "--offline",
+                                                   "--example", "abi-routing",
+                                                   "--no-default-features"])
+        self.assertEqual(rows[1]["argv"], rows[0]["argv"] +
+                         ["--features", "unsafe-unvalidated-metadata"])
+        for row in rows:
+            self.assertEqual(row["cargo"], str(cargo.resolve()))
+            self.assertEqual(row["rustc"], str(tools[1]))
+            self.assertEqual(row["bpf_cargo"], str(tools[2]))
+            self.assertEqual(row["bpf_rustc"], str(tools[3]))
+
+        for omitted in ("P11SCOPE_PREPARED_STABLE_CARGO",
+                        "P11SCOPE_PREPARED_STABLE_RUSTC",
+                        "P11SCOPE_PREPARED_BPF_CARGO",
+                        "P11SCOPE_PREPARED_BPF_RUSTC"):
+            with self.subTest(omitted=omitted):
+                result, record = run(omitted)
+                self.assertNotEqual(result.returncode, 0, omitted)
+                self.assertFalse(record.exists(), omitted)
+
     def test_actual_cli_quotes_spaced_version_tools_before_compiler(self):
         fixture = self.fixture()
         fixture.config["sudo_status"] = 0

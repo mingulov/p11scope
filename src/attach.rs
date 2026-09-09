@@ -468,20 +468,6 @@ fn prepare_identity(ebpf: &mut Ebpf, scope: &Scope, child: Option<&OwnedChild>) 
     })
 }
 
-#[derive(Debug)]
-pub(crate) struct IdentityIntegrationPending;
-
-impl std::fmt::Display for IdentityIntegrationPending {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("development build: capture activation refused until consumer/domain/root/fence integration is complete")
-    }
-}
-impl std::error::Error for IdentityIntegrationPending {}
-
-pub(crate) fn require_identity_integration() -> Result<()> {
-    Err(IdentityIntegrationPending.into())
-}
-
 fn validate_policy_map(ebpf: &Ebpf, name: &str, expected: ExactMapMetadata) -> Result<()> {
     let map = ebpf.map(name).with_context(|| format!("{name} map"))?;
     validate_map_metadata(name, policy_map_data(name, map)?, expected)
@@ -1481,7 +1467,7 @@ enum SessionPreparation {
 }
 
 // BTF and object creation are prerequisites. This is the single loaded-object
-// preparation order used by startup; an injected operation cannot bypass refusal.
+// preparation order used by startup; activation cannot bypass a preparation failure.
 fn prepare_session_with(
     object_has_unsafe: bool,
     mut operation: impl FnMut(SessionPreparation) -> Result<()>,
@@ -1512,7 +1498,15 @@ fn prepare_session_with(
     }
     operation(PublishTailCalls)?;
     operation(PrepareEventsDomain)?;
-    require_identity_integration()
+    Ok(())
+}
+
+fn activate_after_preparation_with<T>(
+    preparation: Result<()>,
+    activate: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    preparation?;
+    activate()
 }
 
 fn publish_tail_calls_with<S>(
@@ -1601,11 +1595,7 @@ lockdown mode, a kernel below the supported floor (>= 5.15), missing BTF \
 docs/notes/phase5-unsupported.md for what each looks like when observed.";
 
 fn unsupported_environment_context(error: anyhow::Error) -> anyhow::Error {
-    if error.downcast_ref::<IdentityIntegrationPending>().is_some() {
-        error
-    } else {
-        error.context(UNSUPPORTED_ENV_HINT)
-    }
+    error.context(UNSUPPORTED_ENV_HINT)
 }
 
 impl Session {
@@ -1674,7 +1664,7 @@ impl Session {
         let mut uprobe_scope = UProbeScope::AllProcesses;
         let mut prepared_domain = None;
         let mut root_seed = None;
-        prepare_session_with(object_has_unsafe, |step| {
+        let preparation = prepare_session_with(object_has_unsafe, |step| {
             match step {
                 SessionPreparation::ValidatePolicy => {
                     validate_policy_maps(&ebpf, object_has_unsafe)
@@ -1786,33 +1776,36 @@ impl Session {
                 }
             }
             Ok(())
+        });
+        let (events_domain, links) = activate_after_preparation_with(preparation, || {
+            let events_domain = prepared_domain.expect("preparation established the events domain");
+            let links = attach_lifecycle_with(
+                &mut ebpf,
+                |ebpf, program| {
+                    if program == "task_newtask" {
+                        let hook: &mut BtfTracePoint = ebpf
+                            .program_mut(program)
+                            .context("required task_newtask program")?
+                            .try_into()?;
+                        Ok(RegisteredLink::BtfTracePoint {
+                            program,
+                            id: hook.attach()?,
+                        })
+                    } else {
+                        let hook: &mut RawTracePoint = ebpf
+                            .program_mut(program)
+                            .with_context(|| format!("required raw {program} program"))?
+                            .try_into()?;
+                        Ok(RegisteredLink::RawTracePoint {
+                            program,
+                            id: hook.attach(program)?,
+                        })
+                    }
+                },
+                |ebpf, _, link| detach_registered_link(ebpf, link),
+            )?;
+            Ok((events_domain, links))
         })?;
-        let events_domain = prepared_domain.expect("preparation established the events domain");
-        let links = attach_lifecycle_with(
-            &mut ebpf,
-            |ebpf, program| {
-                if program == "task_newtask" {
-                    let hook: &mut BtfTracePoint = ebpf
-                        .program_mut(program)
-                        .context("required task_newtask program")?
-                        .try_into()?;
-                    Ok(RegisteredLink::BtfTracePoint {
-                        program,
-                        id: hook.attach()?,
-                    })
-                } else {
-                    let hook: &mut RawTracePoint = ebpf
-                        .program_mut(program)
-                        .with_context(|| format!("required raw {program} program"))?
-                        .try_into()?;
-                    Ok(RegisteredLink::RawTracePoint {
-                        program,
-                        id: hook.attach(program)?,
-                    })
-                }
-            },
-            |ebpf, _, link| detach_registered_link(ebpf, link),
-        )?;
 
         Ok(Self {
             ebpf,
@@ -3082,15 +3075,24 @@ mod tests {
     }
 
     #[test]
-    fn development_boundary_refuses_activation_without_unsupported_kernel_label() {
-        let mut linked = false;
-        let result = require_identity_integration().map(|()| {
-            linked = true;
-        });
-        assert!(!linked);
-        let error = unsupported_environment_context(result.unwrap_err());
-        assert!(error.downcast_ref::<IdentityIntegrationPending>().is_some());
-        assert!(!format!("{error:#}").contains(UNSUPPORTED_ENV_HINT));
+    fn unsupported_environment_hint_preserves_the_underlying_error_chain() {
+        #[derive(Debug)]
+        struct Injected;
+        impl std::fmt::Display for Injected {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("injected loader failure")
+            }
+        }
+        impl std::error::Error for Injected {}
+
+        let error = unsupported_environment_context(
+            anyhow::Error::new(Injected).context("loading required typed task_newtask"),
+        );
+        assert!(error.downcast_ref::<Injected>().is_some());
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("loading required typed task_newtask"));
+        assert!(rendered.contains("injected loader failure"));
+        assert!(rendered.contains(UNSUPPORTED_ENV_HINT));
     }
     use super::*;
 
@@ -3141,16 +3143,55 @@ mod tests {
     }
 
     #[test]
-    fn preparation_contract_runs_every_phase_then_actual_refusal() {
+    fn preparation_contract_runs_every_phase_successfully() {
         for unsafe_object in [false, true] {
             let mut seen = Vec::new();
-            let error = prepare_session_with(unsafe_object, |step| {
+            prepare_session_with(unsafe_object, |step| {
                 seen.push(step);
                 Ok(())
             })
-            .unwrap_err();
+            .unwrap();
             assert_eq!(seen, expected_preparation(unsafe_object));
-            assert!(error.downcast_ref::<IdentityIntegrationPending>().is_some());
+        }
+    }
+
+    #[test]
+    fn successful_preparation_reaches_actual_lifecycle_activation() {
+        for unsafe_object in [false, true] {
+            let expected = expected_preparation(unsafe_object);
+            let mut preparation = Vec::new();
+            let mut activation_calls = 0;
+            let mut attach_calls = Vec::new();
+            let preparation_result = prepare_session_with(unsafe_object, |step| {
+                preparation.push(step);
+                Ok(())
+            });
+            let (events_domain, links) =
+                activate_after_preparation_with(preparation_result, || {
+                    assert_eq!(preparation, expected);
+                    activation_calls += 1;
+                    let links = attach_lifecycle_with(
+                        &mut attach_calls,
+                        |calls, program| {
+                            calls.push(program);
+                            Ok(program)
+                        },
+                        |_, _, _| Ok(()),
+                    )?;
+                    Ok(("events-domain", links))
+                })
+                .unwrap();
+
+            assert_eq!(events_domain, "events-domain");
+            assert_eq!(activation_calls, 1);
+            assert_eq!(
+                attach_calls,
+                ["sched_process_exec", "sched_process_exit", "task_newtask"]
+            );
+            assert_eq!(
+                links,
+                ["sched_process_exec", "sched_process_exit", "task_newtask"]
+            );
         }
     }
 
@@ -3168,18 +3209,58 @@ mod tests {
             let expected = expected_preparation(unsafe_object);
             for fail in 0..expected.len() {
                 let mut seen = Vec::new();
-                let error = prepare_session_with(unsafe_object, |step| {
+                let mut activation_calls = 0;
+                let mut attach_calls = 0;
+                let preparation_result = prepare_session_with(unsafe_object, |step| {
                     seen.push(step);
                     if seen.len() == fail + 1 {
                         return Err(Injected(fail).into());
                     }
                     Ok(())
+                });
+                let error = activate_after_preparation_with(preparation_result, || {
+                    activation_calls += 1;
+                    attach_lifecycle_with(
+                        &mut attach_calls,
+                        |calls, _| {
+                            *calls += 1;
+                            Ok(())
+                        },
+                        |_, _, _| Ok(()),
+                    )
                 })
                 .unwrap_err();
                 assert_eq!(seen, expected[..=fail]);
+                assert_eq!(activation_calls, 0);
+                assert_eq!(attach_calls, 0);
                 assert_eq!(error.downcast_ref::<Injected>().unwrap().0, fail);
                 assert_eq!(error.to_string(), format!("injected phase {fail}"));
             }
+        }
+    }
+
+    #[test]
+    fn successful_preparation_preserves_typed_activation_failure() {
+        #[derive(Debug)]
+        struct ActivationFailure;
+        impl std::fmt::Display for ActivationFailure {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("typed activation failure")
+            }
+        }
+        impl std::error::Error for ActivationFailure {}
+
+        for unsafe_object in [false, true] {
+            let mut activation_calls = 0;
+            let preparation = prepare_session_with(unsafe_object, |_| Ok(()));
+            let result: Result<()> = activate_after_preparation_with(preparation, || {
+                activation_calls += 1;
+                Err(ActivationFailure.into())
+            });
+            let error = result.unwrap_err();
+            assert_eq!(activation_calls, 1);
+            assert!(error.downcast_ref::<ActivationFailure>().is_some());
+            assert_eq!(error.to_string(), "typed activation failure");
         }
     }
 

@@ -468,8 +468,8 @@ fn capabilities_check() -> Check {
     }
 }
 
-/// Uses capture's complete preparation, mandatory lifecycle ownership and
-/// activation boundary. The diagnostic link shares Session teardown ordering.
+/// Uses capture's complete preparation and mandatory lifecycle ownership. The
+/// diagnostic link shares Session teardown ordering.
 fn bpf_checks() -> Vec<Check> {
     bpf_checks_with_seccomp(
         crate::attach::Session::diagnostic(),
@@ -517,22 +517,6 @@ fn bpf_checks_with<T>(
                 },
             ]
         }
-        Err(error)
-            if error
-                .downcast_ref::<crate::attach::IdentityIntegrationPending>()
-                .is_some() =>
-        {
-            vec![
-                Check {
-                    name: "BPF map create".into(),
-                    status: Status::Ok("shared capture preparation completed".into()),
-                },
-                Check {
-                    name: "uprobe attach (own libc)".into(),
-                    status: Status::Fail(format_preflight_error(error.as_ref())),
-                },
-            ]
-        }
         Err(error) => vec![
             Check {
                 name: "BPF map create".into(),
@@ -540,9 +524,7 @@ fn bpf_checks_with<T>(
             },
             Check {
                 name: "uprobe attach (own libc)".into(),
-                status: Status::Fail(
-                    "skipped: shared capture preparation or activation refused".into(),
-                ),
+                status: Status::Fail("skipped: shared capture setup failed".into()),
             },
         ],
     }
@@ -1074,35 +1056,29 @@ pub fn run(pid: Option<u32>, cgroup: Option<&Path>) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn correction1_refused_setup_never_invokes_active_seccomp_probe() {
-        for setup in [
-            crate::attach::require_identity_integration(),
+    fn correction1_failed_setup_never_invokes_active_seccomp_probe() {
+        let mut active_calls = 0;
+        let checks = bpf_checks_with_seccomp::<()>(
             Err(std::io::Error::from_raw_os_error(libc::EPERM).into()),
-        ] {
-            let mut active_calls = 0;
-            let checks = bpf_checks_with_seccomp(
-                setup,
-                |_| panic!("diagnostic after refusal"),
-                || {
-                    active_calls += 1;
-                    Check {
-                        name: "uretprobe vs seccomp".into(),
-                        status: Status::Ok("unexpected active probe".into()),
-                    }
-                },
-            );
-            assert_eq!(active_calls, 0);
-            assert_eq!(verdict(&checks), 1);
-            assert_eq!(checks.last().unwrap().name, "uretprobe vs seccomp");
-            assert!(matches!(
-                checks.last().unwrap().status,
-                Status::NotApplicable(_)
-            ));
-            assert!(
-                status_detail(&checks.last().unwrap().status)
-                    .contains("shared capture setup refused")
-            );
-        }
+            |_| panic!("diagnostic after failed setup"),
+            || {
+                active_calls += 1;
+                Check {
+                    name: "uretprobe vs seccomp".into(),
+                    status: Status::Ok("unexpected active probe".into()),
+                }
+            },
+        );
+        assert_eq!(active_calls, 0);
+        assert_eq!(verdict(&checks), 1);
+        assert_eq!(checks.last().unwrap().name, "uretprobe vs seccomp");
+        assert!(matches!(
+            checks.last().unwrap().status,
+            Status::NotApplicable(_)
+        ));
+        assert!(
+            status_detail(&checks.last().unwrap().status).contains("shared capture setup refused")
+        );
     }
 
     #[test]
@@ -1198,19 +1174,6 @@ mod tests {
         assert!(detail.contains("Operation not permitted"));
         assert!(!detail.contains('\u{fffd}') && !detail.contains('\n'));
     }
-    #[test]
-    fn loader_development_refusal_is_a_failed_capture_verdict_after_preparation() {
-        let checks = bpf_checks_with(crate::attach::require_identity_integration(), |_| {
-            panic!("diagnostic link crossed activation boundary")
-        });
-        assert!(matches!(checks[0].status, Status::Ok(_)));
-        assert!(matches!(checks[1].status, Status::Fail(_)));
-        assert_eq!(verdict(&checks), 1);
-        let detail = status_detail(&checks[1].status);
-        assert!(detail.contains("development build"));
-        assert!(!detail.contains(crate::attach::UNSUPPORTED_ENV_HINT));
-    }
-
     #[test]
     fn loader_missing_capability_stays_distinct_and_skips_diagnostic_attachment() {
         let checks = bpf_checks_with::<()>(

@@ -9,9 +9,9 @@ from fixture_common import CONFIG, record, refuse
 arguments = sys.argv[1:]
 vendor_arguments = arguments[1:] if arguments[:1] == ["+1.88"] else arguments
 if vendor_arguments[:1] == ["vendor"]:
-    # The legacy spelling is admitted solely to expose the driver's RED behavior.
-    if not (len(vendor_arguments) == 3 and vendor_arguments[1] == "--locked"
-            or len(vendor_arguments) == 4 and vendor_arguments[1:3] == ["--locked", "--offline"]):
+    if len(vendor_arguments) != 5 or vendor_arguments[1:4] != [
+        "--locked", "--offline", "--respect-source-config"
+    ]:
         refuse("unsupported vendor arguments")
     record("vendor")
     print('[source.vendored-sources]\ndirectory = "/fixture/vendor"')

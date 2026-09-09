@@ -272,7 +272,8 @@ timeout --signal=TERM --kill-after=5s 300s docker pull -q "$DISCOVER_MUSL_IMAGE"
 # copied into $CARGO_HOME inside the containers.
 mkdir -p "$DISCOVER_WORK/vendor"
 RUSTC="$LANE14_STABLE_RUSTC" timeout --signal=TERM --kill-after=5s 600s \
-    "$LANE14_STABLE_CARGO" vendor --locked --offline "$DISCOVER_WORK/vendor/src" > "$DISCOVER_WORK/vendor/config.toml"
+    "$LANE14_STABLE_CARGO" vendor --locked --offline --respect-source-config \
+    "$DISCOVER_WORK/vendor/src" > "$DISCOVER_WORK/vendor/config.toml"
 sed 's|directory = ".*"|directory = "/receipt/vendor/src"|' \
     "$DISCOVER_WORK/vendor/config.toml" > "$DISCOVER_WORK/vendor/config.container.toml"
 

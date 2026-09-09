@@ -116,7 +116,9 @@ class PreparedContainerDriverTests(unittest.TestCase):
         vendor = next(row for _, row in resources if row["kind"] == "vendor")
         self.assertEqual(vendor["executable"], str(fixture.stable_cargo.resolve()))
         self.assertEqual(vendor["rustc"], str(fixture.stable_rustc.resolve()))
-        self.assertEqual(vendor["argv"], ["vendor", "--locked", "--offline", str(fixture.work / "discover/vendor/src")])
+        self.assertEqual(vendor["argv"], ["vendor", "--locked", "--offline",
+                                                "--respect-source-config",
+                                                str(fixture.work / "discover/vendor/src")])
         creates = [row["argv"] for _, row in resources if row["kind"] == "docker" and row["argv"][0] == "create"]
         self.assertEqual(len(creates), 3)
         for arguments in creates:

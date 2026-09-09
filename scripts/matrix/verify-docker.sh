@@ -29,7 +29,6 @@ require_non_root_caller
 for tool in cargo docker gcc python3 timeout; do
     command -v "$tool" >/dev/null || { echo "$tool required"; exit 1; }
 done
-sudo -n true 2>/dev/null || { echo "passwordless sudo required"; exit 1; }
 mkdir -p "$WORK/shared"
 
 remove_owned_container() {
@@ -60,8 +59,9 @@ cleanup() {
 . scripts/cleanup-traps.sh
 
 echo "=== build product + workload ==="
-timeout --signal=TERM --kill-after=5s 600s cargo +1.88 build --locked --release \
+timeout --signal=TERM --kill-after=5s 600s scripts/cargo.sh +1.88 build --locked --release \
     --workspace --target-dir "$PRODUCT"
+sudo -n true 2>/dev/null || { echo "passwordless sudo required"; exit 1; }
 timeout --signal=TERM --kill-after=5s 60s gcc -O0 -o "$WORK/harness" \
     spike/harness.c -ldl
 

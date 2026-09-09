@@ -56,13 +56,12 @@ cleanup() {
 for command in cargo docker gcc kind kubectl python3 timeout; do
     command -v "$command" >/dev/null || { echo "$command required" >&2; exit 1; }
 done
-sudo -n true 2>/dev/null || { echo "passwordless sudo required" >&2; exit 1; }
-
 echo "=== build product, workload, and unique pod image ==="
 mkdir -p "$WORK"
 rm -rf "$WORK/build"
-timeout --signal=TERM --kill-after=5s 600s cargo +1.88 build --locked --release \
+timeout --signal=TERM --kill-after=5s 600s scripts/cargo.sh +1.88 build --locked --release \
     --workspace --target-dir "$PRODUCT"
+sudo -n true 2>/dev/null || { echo "passwordless sudo required" >&2; exit 1; }
 mkdir -p "$WORK/build"
 IMAGE_CREATED=1
 timeout --signal=TERM --kill-after=5s 60s gcc -O0 -o "$WORK/build/harness" \

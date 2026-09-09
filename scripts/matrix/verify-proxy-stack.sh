@@ -33,8 +33,6 @@ test -f "$PROXY" || { echo "SKIP: p11-kit proxy not installed at $PROXY"; exit 0
 test -f "$MODULE" || { echo "SKIP: SoftHSM2 not installed at $MODULE"; exit 0; }
 command -v gcc >/dev/null || { echo "gcc required"; exit 1; }
 command -v softhsm2-util >/dev/null || { echo "softhsm2-util required"; exit 1; }
-sudo -n true 2>/dev/null || { echo "passwordless sudo required"; exit 1; }
-
 mkdir -p "$WORK"
 
 cleanup() {
@@ -62,7 +60,8 @@ cleanup() {
 . scripts/cleanup-traps.sh
 
 echo "=== build ==="
-cargo +1.88 build --locked --release --workspace --target-dir "$WORK/build"
+scripts/cargo.sh +1.88 build --locked --release --workspace --target-dir "$WORK/build"
+sudo -n true 2>/dev/null || { echo "passwordless sudo required"; exit 1; }
 gcc -O0 -o "$WORK/harness" spike/harness.c -ldl
 
 echo "=== softhsm token (private, disposable) ==="

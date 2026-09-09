@@ -18,24 +18,33 @@ def map_ids_from_fdinfo(texts):
     return sorted({int(match.group(1)) for text in texts for match in MAP_ID.finditer(text)})
 
 
-def checked_json(args, returncode, stdout, stderr, require_list=False):
+def checked_json(args, returncode, stdout, stderr, require_list=False, map_identity=None):
+    identity = ""
+    if map_identity is not None:
+        identity = (
+            f" for map id={map_identity['id']} name={map_identity['name']}"
+            f" type={map_identity['type']}"
+        )
     if returncode:
-        raise RuntimeError(f"{' '.join(args)} failed: {stderr.strip()}")
+        raise RuntimeError(f"{' '.join(args)}{identity} failed: {stderr.strip()}")
     try:
         value = json.loads(stdout)
     except json.JSONDecodeError as error:
         raise RuntimeError(
-            f"{' '.join(args)} produced invalid JSON: stderr={stderr!r}"
+            f"{' '.join(args)}{identity} produced invalid JSON: stderr={stderr!r}"
         ) from error
     if require_list and not isinstance(value, list):
-        raise RuntimeError(f"{' '.join(args)} produced {type(value).__name__}, expected JSON list")
+        raise RuntimeError(
+            f"{' '.join(args)}{identity} produced {type(value).__name__}, expected JSON list"
+        )
     return value
 
 
-def run_json(args, require_list=False):
+def run_json(args, require_list=False, map_identity=None):
     proc = subprocess.run(args, capture_output=True, text=True)
     return checked_json(
-        args, proc.returncode, proc.stdout, proc.stderr, require_list=require_list
+        args, proc.returncode, proc.stdout, proc.stderr,
+        require_list=require_list, map_identity=map_identity,
     )
 
 
@@ -43,11 +52,13 @@ def map_oracle(item):
     """Which oracle reads this map: `bpftool map dump`, or an mmap consumer.
 
     A ringbuf has no key/value iteration, so `bpftool map dump` refuses it
-    (exit 244, empty stderr) whatever it is called. Dispatch on the map type,
-    never on the name: Slice 1b-2 owns two ringbufs, EVENTS and DISCOVERY.
+    (exit 244, empty stderr) whatever it is called. Task-storage maps require
+    the native reader added by Task 2. Dispatch on the map type, never name.
     """
     if item.get("type") == "ringbuf":
         return "mmap"
+    if item.get("type") == "task_storage":
+        return "task-storage"
     if item["name"] == "EVENTS":
         raise RuntimeError(f"EVENTS is not a ringbuf: {item}")
     return "dump"
@@ -107,8 +118,13 @@ def self_test():
         {"name": "DISCOVERY", "type": "ringbuf"},
         {"name": "START", "type": "hash"},
         {"name": "COUNTERS", "type": "percpu_array"},
+        {"name": "TASK_COOKIE", "type": "task_storage"},
+        {"name": "THREAD_OWNER", "type": "task_storage"},
+        {"name": "ROOT_AFFILIATION", "type": "task_storage"},
     ]
-    assert [map_oracle(item) for item in inventory] == ["mmap", "mmap", "dump", "dump"], [
+    assert [map_oracle(item) for item in inventory] == [
+        "mmap", "mmap", "dump", "dump", "task-storage", "task-storage", "task-storage"
+    ], [
         map_oracle(item) for item in inventory
     ]
     print("every owned ringbuf routes to the mmap oracle: OK")
@@ -196,11 +212,17 @@ def main():
             "max_entries": item.get("max_entries"),
             "oracle": map_oracle(item),
         }
+        if record["oracle"] == "task-storage":
+            raise RuntimeError(
+                f"task-storage map id={item['id']} name={name} type={item.get('type')} "
+                "has no native reader; Task 2 is required"
+            )
         if record["oracle"] == "dump":
             output = out_dir / f"mapdump_{name}{suffix}.json"
             dumped = run_json(
                 ["bpftool", "-j", "map", "dump", "id", str(item["id"])],
                 require_list=True,
+                map_identity=item,
             )
             write_receipt(output, json.dumps(dumped, separators=(",", ":")) + "\n")
             record["file"] = str(output)

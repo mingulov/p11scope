@@ -16,6 +16,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 SUBJECT = ROOT / "scripts" / "check-canary-evidence.py"
+DUMPER = ROOT / "scripts" / "dump-owned-bpf-maps.py"
 
 
 def load_subject(bits):
@@ -23,6 +24,13 @@ def load_subject(bits):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     module.initialize(bits)
+    return module
+
+
+def load_dumper():
+    spec = importlib.util.spec_from_file_location("owned_bpf_maps", DUMPER)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
     return module
 
 
@@ -118,14 +126,15 @@ class OwnedMapWrapperTests(unittest.TestCase):
                 sorted(subject.BPF_MAP_DEFS["SAFE_MAPS"].items()), start=1
             ):
                 ring = definition["type"] == 27
+                task_storage = definition["type"] == 29
                 item = {
                     "name": name,
                     "id": map_id,
                     "max_entries": definition["max_entries"],
                     "key_size": 0 if ring else definition["key_size"],
                     "value_size": 0 if ring else definition["value_size"],
-                    "type": "ringbuf" if ring else "hash",
-                    "oracle": "mmap" if ring else "dump",
+                    "type": "ringbuf" if ring else "task_storage" if task_storage else "hash",
+                    "oracle": "mmap" if ring else "task-storage" if task_storage else "dump",
                 }
                 if ring:
                     subject.ring_raw_path(prefix, name).write_bytes(b"")
@@ -145,6 +154,45 @@ class OwnedMapWrapperTests(unittest.TestCase):
             missing.unlink()
             with self.assertRaisesRegex(AssertionError, "has no scanned surface"):
                 subject.assert_exact_owned_map_inventory(root, lane, subject.SAFE_MAPS)
+
+
+class TaskStorageInventoryTests(unittest.TestCase):
+    def test_task_storage_maps_use_task_storage_oracle_and_need_surfaces(self):
+        subject = load_subject(TARGET_BITS)
+        dumper = load_dumper()
+        task_storage = [
+            {"name": "TASK_COOKIE", "id": 101, "type": "task_storage",
+             "key_size": 4, "value_size": 8, "max_entries": 0,
+             "oracle": dumper.map_oracle({"name": "TASK_COOKIE", "type": "task_storage"})},
+            {"name": "THREAD_OWNER", "id": 102, "type": "task_storage",
+             "key_size": 4, "value_size": 544, "max_entries": 0,
+             "oracle": dumper.map_oracle({"name": "THREAD_OWNER", "type": "task_storage"})},
+            {"name": "ROOT_AFFILIATION", "id": 103, "type": "task_storage",
+             "key_size": 4, "value_size": 8, "max_entries": 0,
+             "oracle": dumper.map_oracle({"name": "ROOT_AFFILIATION", "type": "task_storage"})},
+        ]
+        self.assertEqual([item["oracle"] for item in task_storage],
+                         ["task-storage"] * 3)
+        with tempfile.TemporaryDirectory() as directory:
+            prefix = Path(directory) / "synthetic"
+            prefix.mkdir()
+            for item in task_storage:
+                item["file"] = str(prefix / f"mapdump_{item['name']}.bin")
+                Path(item["file"]).write_bytes(b"task-storage-records")
+            surfaces = subject.owned_map_surfaces(
+                "task-storage", task_storage,
+                {item["name"] for item in task_storage}, str(prefix),
+            )
+            self.assertEqual(len(surfaces), 3)
+            self.assertTrue(all(path.is_file() for path in surfaces))
+            missing = list(task_storage)
+            missing[1] = dict(missing[1])
+            missing[1].pop("file")
+            with self.assertRaisesRegex(AssertionError, "has no scanned surface"):
+                subject.owned_map_surfaces(
+                    "task-storage", missing,
+                    {item["name"] for item in task_storage}, str(prefix),
+                )
 
 
 class HostileStartTests(unittest.TestCase):

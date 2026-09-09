@@ -845,9 +845,12 @@ def owned_map_surfaces(label, manifest, expected, prefix):
             assert item["oracle"] == "mmap" and "file" not in item, item
             assert item["key_size"] == item["value_size"] == 0, item
             path = ring_raw_path(prefix, item["name"])
+        elif item["type"] == "task_storage":
+            assert item["oracle"] == "task-storage", item
+            path = Path(item.get("file", ""))
         else:
             assert item["oracle"] == "dump", item
-            path = Path(item["file"])
+            path = Path(item.get("file", ""))
         assert path.is_file(), f"{label}: {item['name']} has no scanned surface {path}"
         surfaces.append(path)
     return surfaces
@@ -1616,12 +1619,13 @@ def main(argv=None):
                     sorted(BPF_MAP_DEFS["SAFE_MAPS"].items()), start=1
                 ):
                     ring = definition["type"] == RINGBUF
+                    task_storage = definition["type"] == 29
                     item = {
                         "name": name, "id": map_id, "max_entries": definition["max_entries"],
                         "key_size": definition["key_size"] if not ring else 0,
                         "value_size": definition["value_size"] if not ring else 0,
-                        "type": "ringbuf" if ring else "hash",
-                        "oracle": "mmap" if ring else "dump",
+                        "type": "ringbuf" if ring else "task_storage" if task_storage else "hash",
+                        "oracle": "mmap" if ring else "task-storage" if task_storage else "dump",
                     }
                     if not ring:
                         item["file"] = f"{scan_dir}/mapdump_{name}_lane.json"

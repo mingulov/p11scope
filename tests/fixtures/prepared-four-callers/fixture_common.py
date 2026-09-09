@@ -17,6 +17,8 @@ def record(kind, **details):
         "cwd": os.getcwd(),
         "executable": str(Path(sys.argv[0]).resolve()),
         "rustc": os.environ.get("RUSTC"),
+        "bpf_cargo": os.environ.get("P11SCOPE_PREPARED_BPF_CARGO"),
+        "bpf_rustc": os.environ.get("P11SCOPE_PREPARED_BPF_RUSTC"),
         "auto_install": os.environ.get("RUSTUP_AUTO_INSTALL"),
         "small_ring": os.environ.get("P11SCOPE_SMALL_RING"),
         "small_state": os.environ.get("P11SCOPE_SMALL_STATE_MAPS"),

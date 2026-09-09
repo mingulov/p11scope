@@ -124,8 +124,7 @@ class FinalizerFixture:
         self._capture_initial()
         stem = self.artifacts / f"{labels[caller]}.source.initial"
         snapshot = subprocess.run([
-            "sh", "-c", '. scripts/prepared-dependency-snapshot.sh; '
-            'p11scope_prepared_snapshot "$1" "$2" "$3"', "initial-snapshot",
+            "sh", str(FIXTURES / "snapshot-launcher.sh"),
             str(self.python), str(stem), str(Path(str(self.prefix) + ".initial.ledger.sha256")),
         ], cwd=self.root, env=self.environment, text=False, stdout=subprocess.PIPE,
            stderr=subprocess.PIPE)
@@ -262,10 +261,8 @@ class SnapshotFixture:
 
     def run(self, *, prepared: Path | None = None, environment: dict[str, str] | None = None):
         command = [
-            "sh", "-c",
-            '. scripts/prepared-dependency-snapshot.sh; '
-            'p11scope_prepared_snapshot "$1" "$2" "$3"',
-            "snapshot-test", sys.executable, str(self.stem), str(prepared or self.prepared),
+            "sh", str(FIXTURES / "snapshot-launcher.sh"),
+            sys.executable, str(self.stem), str(prepared or self.prepared),
         ]
         return subprocess.run(command, cwd=self.root, env=environment, text=True,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -549,8 +546,14 @@ class PreparedFourCallersTests(unittest.TestCase):
             calls = [__import__("json").loads(row) for row in events.read_text().splitlines()]
             build = [call for call in calls if call["kind"] == "build"]
             self.assertEqual(len(build), 1)
+            selections = [call for call in calls if call["kind"] == "rustup"]
+            self.assertEqual(len(selections), 4)
+            self.assertTrue(all(calls.index(call) < calls.index(build[0])
+                                for call in selections))
             self.assertEqual(build[0]["executable"], str((prepared.tools / "stable cargo").resolve()))
             self.assertEqual(build[0]["rustc"], str((prepared.tools / "stable rustc").resolve()))
+            self.assertEqual(build[0]["bpf_cargo"], str((prepared.tools / "bpf cargo").resolve()))
+            self.assertEqual(build[0]["bpf_rustc"], str((prepared.tools / "bpf rustc").resolve()))
             self.assertEqual(build[0]["argv"], [
                 "build", "--locked", "--offline", "--release", "--workspace",
                 "--target-dir", str(evidence / "work/product"),
@@ -590,7 +593,7 @@ class PreparedFourCallersTests(unittest.TestCase):
             base = Path(raw)
             fixture = SnapshotFixture(base)
             bad = subprocess.run(
-                ["sh", "-c", ". scripts/prepared-dependency-snapshot.sh; p11scope_prepared_snapshot"],
+                ["sh", str(FIXTURES / "snapshot-launcher.sh")],
                 cwd=fixture.root, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
             self.assertNotEqual(bad.returncode, 0)
@@ -616,13 +619,14 @@ class PreparedFourCallersTests(unittest.TestCase):
                 self.assertIn(f"{failed} fixture refusal", result.stderr)
 
     def test_sourcing_snapshot_defines_only_function_and_preserves_shell_state(self):
-        result = subprocess.run(
-            ["sh", "-c", 'before="$(pwd)|$(umask)|$-|$(trap)"; . "$1"; '
-             'after="$(pwd)|$(umask)|$-|$(trap)"; [ "$before" = "$after" ]; '
-             'command -v p11scope_prepared_snapshot >/dev/null', "source-test", str(SNAPSHOT)],
-            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
+        with tempfile.TemporaryDirectory(prefix="snapshot source state ") as scratch:
+            result = subprocess.run(
+                ["sh", str(REPOSITORY / "tests/fixtures/source-state.sh"), str(SNAPSHOT),
+                 "p11scope_prepared_snapshot", scratch],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
 
     def test_executes_every_selected_build_variant_and_timeout_path(self):
         expected = {
@@ -654,6 +658,12 @@ class PreparedFourCallersTests(unittest.TestCase):
                     selected_cargo.chmod(0o755)
                     selected_rustc.write_text("fixture rustc\n")
                     selected_rustc.chmod(0o755)
+                    selected_bpf_cargo = tools / "selected bpf cargo"
+                    selected_bpf_rustc = tools / "selected bpf rustc"
+                    selected_bpf_cargo.write_text("fixture bpf cargo\n")
+                    selected_bpf_rustc.write_text("fixture bpf rustc\n")
+                    selected_bpf_cargo.chmod(0o755)
+                    selected_bpf_rustc.chmod(0o755)
                     fixture_bin = base / "bin"
                     fixture_bin.mkdir()
                     shutil.copy2(FIXTURES / "fake-timeout.py", fixture_bin / "timeout")
@@ -674,12 +684,15 @@ class PreparedFourCallersTests(unittest.TestCase):
                     environment.update(
                         PATH=f"{fixture_bin}:/usr/bin:/bin",
                         P11SCOPE_FOUR_CALLERS_FIXTURE=str(config),
-                        P11SCOPE_PREPARED_STABLE_CARGO=str(selected_cargo),
-                        P11SCOPE_PREPARED_STABLE_RUSTC=str(selected_rustc),
                         WORK=str(work), PRODUCT=str(product),
                     )
+                    command_file = base / "build-command.sh"
+                    command_file.write_text(command, encoding="utf-8")
                     result = subprocess.run(
-                        ["sh", "-c", command], cwd=REPOSITORY, env=environment,
+                        ["sh", str(FIXTURES / "unexported-build-launcher.sh"),
+                         str(command_file), str(selected_cargo), str(selected_rustc),
+                         str(selected_bpf_cargo), str(selected_bpf_rustc)],
+                        cwd=REPOSITORY, env=environment,
                         text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     )
                     self.assertEqual(result.returncode, 83, result.stderr)
@@ -692,6 +705,8 @@ class PreparedFourCallersTests(unittest.TestCase):
                         expected_argv.extend(["--features", feature])
                     expected_argv.extend(["--target-dir", str(work / target)])
                     self.assertEqual(build["rustc"], str(selected_rustc))
+                    self.assertEqual(build["bpf_cargo"], str(selected_bpf_cargo))
+                    self.assertEqual(build["bpf_rustc"], str(selected_bpf_rustc))
                     self.assertEqual(build["small_ring"], ring)
                     self.assertEqual(build["small_state"], state)
                     self.assertEqual(build["argv"], expected_argv)
@@ -716,6 +731,8 @@ class PreparedFourCallersTests(unittest.TestCase):
                 record = base / "handoff.txt"
                 cargo = base / "selected cargo with spaces"
                 rustc = base / "selected rustc with spaces"
+                bpf_cargo = base / "selected bpf cargo with spaces"
+                bpf_rustc = base / "selected bpf rustc with spaces"
                 command_file = base / "command.sh"
                 command_file.write_text(commands[0], encoding="utf-8")
                 environment = os.environ.copy()
@@ -735,32 +752,43 @@ class PreparedFourCallersTests(unittest.TestCase):
                 result = subprocess.run(
                     ["sh", str(FIXTURES / "unexported-handoff-launcher.sh"),
                      str(command_file), str(FIXTURES / "handoff-recorder.sh"),
-                     str(cargo), str(rustc)],
+                     str(cargo), str(rustc), str(bpf_cargo), str(bpf_rustc)],
                     cwd=REPOSITORY, env=environment, text=True,
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 rows = record.read_text().splitlines()
-                self.assertEqual(rows[:2], [f"cargo={cargo}", f"rustc={rustc}"])
-                self.assertEqual(rows[2:], [
+                self.assertEqual(rows[:4], [f"cargo={cargo}", f"rustc={rustc}",
+                                           f"bpf_cargo={bpf_cargo}",
+                                           f"bpf_rustc={bpf_rustc}"])
+                self.assertEqual(rows[4:], [
+                    "name=P11SCOPE_PREPARED_BPF_CARGO",
+                    "name=P11SCOPE_PREPARED_BPF_RUSTC",
                     "name=P11SCOPE_PREPARED_STABLE_CARGO",
                     "name=P11SCOPE_PREPARED_STABLE_RUSTC",
                 ])
 
     def test_direct_child_missing_handoff_refuses_before_resources(self):
         for caller in CHILD_CALLERS:
-            with self.subTest(caller=caller.name):
-                environment = os.environ.copy()
-                environment["P11SCOPE_TASK4_BODY"] = "1"
-                environment.pop("P11SCOPE_PREPARED_STABLE_CARGO", None)
-                environment.pop("P11SCOPE_PREPARED_STABLE_RUSTC", None)
-                result = subprocess.run(
-                    ["sh", str(caller)], cwd=REPOSITORY, env=environment,
-                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5,
-                )
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn("prepared stable Cargo/rustc handoff required", result.stderr)
-                self.assertNotIn("passwordless sudo", result.stderr)
+            for mask in range(15):
+                with self.subTest(caller=caller.name, mask=mask):
+                    environment = os.environ.copy()
+                    environment["P11SCOPE_TASK4_BODY"] = "1"
+                    values = ("/stable/cargo", "/stable/rustc", "/bpf/cargo", "/bpf/rustc")
+                    for index, name in enumerate((
+                        "P11SCOPE_PREPARED_STABLE_CARGO", "P11SCOPE_PREPARED_STABLE_RUSTC",
+                        "P11SCOPE_PREPARED_BPF_CARGO", "P11SCOPE_PREPARED_BPF_RUSTC",
+                    )):
+                        environment.pop(name, None)
+                        if mask & (1 << index):
+                            environment[name] = values[index]
+                    result = subprocess.run(
+                        ["sh", str(caller)], cwd=REPOSITORY, env=environment,
+                        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("prepared stable/BPF Cargo/rustc handoff required", result.stderr)
+                    self.assertNotIn("passwordless sudo", result.stderr)
 
     def test_oracle_source_only_remains_side_effect_free_without_selection(self):
         environment = os.environ.copy()

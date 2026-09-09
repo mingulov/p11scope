@@ -171,7 +171,8 @@ class ProductBuildTests(unittest.TestCase):
         self.assertIn("usage: p11scope_product_build ordinary|prepared", invalid.stderr)
         self.assertFalse(self.record.exists())
         result = subprocess.run(
-            ["sh", str(FIXTURES / "source-state.sh"), str(HELPER)],
+            ["sh", str(ROOT / "tests/fixtures/source-state.sh"), str(HELPER),
+             "p11scope_product_build", str(self.base)],
             cwd=self.base, env=self.environment,
             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )

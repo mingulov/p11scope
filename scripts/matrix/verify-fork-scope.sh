@@ -165,6 +165,8 @@ task4_receipt_run() {
     P11SCOPE_TASK4_BODY=1 P11SCOPE_TASK4_WORK="$TASK4_ROOT/work" \
         P11SCOPE_PREPARED_STABLE_CARGO="$P11SCOPE_PREPARED_STABLE_CARGO" \
         P11SCOPE_PREPARED_STABLE_RUSTC="$P11SCOPE_PREPARED_STABLE_RUSTC" \
+        P11SCOPE_PREPARED_BPF_CARGO="$P11SCOPE_PREPARED_BPF_CARGO" \
+        P11SCOPE_PREPARED_BPF_RUSTC="$P11SCOPE_PREPARED_BPF_RUSTC" \
         /bin/sh "$0" > "$TASK4_ROOT/stdout.log" 2> "$TASK4_ROOT/stderr.log"
     t4_capture=$(find "$TASK4_ROOT/work" -type f -name '*observed*.json' -print | sort | head -n 1)
     [ -n "$t4_capture" ] || exit 1
@@ -290,7 +292,9 @@ fi
 [ "$#" -eq 0 ] || exit 2
 [ -n "${P11SCOPE_PREPARED_STABLE_CARGO-}" ] \
     && [ -n "${P11SCOPE_PREPARED_STABLE_RUSTC-}" ] \
-    || { echo "prepared stable Cargo/rustc handoff required" >&2; exit 1; }
+    && [ -n "${P11SCOPE_PREPARED_BPF_CARGO-}" ] \
+    && [ -n "${P11SCOPE_PREPARED_BPF_RUSTC-}" ] \
+    || { echo "prepared stable/BPF Cargo/rustc handoff required" >&2; exit 1; }
 command -v gcc >/dev/null || { echo "gcc required"; exit 1; }
 command -v softhsm2-util >/dev/null || { echo "softhsm2-util required"; exit 1; }
 command -v systemd-run >/dev/null || { echo "systemd-run required"; exit 1; }
@@ -322,6 +326,8 @@ cleanup() {
 
 echo "=== build product + fork-harness ==="
 RUSTC="$P11SCOPE_PREPARED_STABLE_RUSTC" \
+    P11SCOPE_PREPARED_BPF_CARGO="$P11SCOPE_PREPARED_BPF_CARGO" \
+    P11SCOPE_PREPARED_BPF_RUSTC="$P11SCOPE_PREPARED_BPF_RUSTC" \
     "$P11SCOPE_PREPARED_STABLE_CARGO" build --locked --offline --release --workspace \
     --target-dir "$PRODUCT"
 P11SCOPE_BIN=$(realpath "$PRODUCT/release/p11scope")

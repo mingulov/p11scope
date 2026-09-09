@@ -560,6 +560,8 @@ task4_receipt_run() {
     P11SCOPE_TASK4_BODY=1 P11SCOPE_TASK4_WORK="$TASK4_ROOT/work" \
         P11SCOPE_PREPARED_STABLE_CARGO="$P11SCOPE_PREPARED_STABLE_CARGO" \
         P11SCOPE_PREPARED_STABLE_RUSTC="$P11SCOPE_PREPARED_STABLE_RUSTC" \
+        P11SCOPE_PREPARED_BPF_CARGO="$P11SCOPE_PREPARED_BPF_CARGO" \
+        P11SCOPE_PREPARED_BPF_RUSTC="$P11SCOPE_PREPARED_BPF_RUSTC" \
         /bin/sh "$0" > "$TASK4_ROOT/stdout.log" 2> "$TASK4_ROOT/stderr.log"
     t4_capture=$(find "$TASK4_ROOT/work" -type f -name '*observed*.json' -print | sort | head -n 1)
     [ -n "$t4_capture" ] || exit 1
@@ -717,7 +719,9 @@ fi
 [ "$#" -eq 0 ] || exit 2
 [ -n "${P11SCOPE_PREPARED_STABLE_CARGO-}" ] \
     && [ -n "${P11SCOPE_PREPARED_STABLE_RUSTC-}" ] \
-    || { echo "prepared stable Cargo/rustc handoff required" >&2; exit 1; }
+    && [ -n "${P11SCOPE_PREPARED_BPF_CARGO-}" ] \
+    && [ -n "${P11SCOPE_PREPARED_BPF_RUSTC-}" ] \
+    || { echo "prepared stable/BPF Cargo/rustc handoff required" >&2; exit 1; }
 require_non_root_caller
 mkdir -p "$WORK"
 
@@ -767,6 +771,8 @@ cleanup() {
 echo "=== build isolated default + induced-gap variants ==="
 rm -rf "$WORK/default-build" "$WORK/ring-build" "$WORK/state-build" "$WORK/freeze-build"
 RUSTC="$P11SCOPE_PREPARED_STABLE_RUSTC" \
+    P11SCOPE_PREPARED_BPF_CARGO="$P11SCOPE_PREPARED_BPF_CARGO" \
+    P11SCOPE_PREPARED_BPF_RUSTC="$P11SCOPE_PREPARED_BPF_RUSTC" \
     "$P11SCOPE_PREPARED_STABLE_CARGO" build --locked --offline --release --workspace \
     --target-dir "$WORK/default-build"
 DISCOVER="$WORK/default-build/release/p11scope-discover"
@@ -778,13 +784,19 @@ echo "=== build small-ring p11scope (Gap 3 only; default build untouched) ==="
 # set. A separate --target-dir keeps this build fully out of target/release
 # so scripts/verify-attach-e2e.sh's binary is never touched by this script.
 P11SCOPE_SMALL_RING=1 RUSTC="$P11SCOPE_PREPARED_STABLE_RUSTC" \
+    P11SCOPE_PREPARED_BPF_CARGO="$P11SCOPE_PREPARED_BPF_CARGO" \
+    P11SCOPE_PREPARED_BPF_RUSTC="$P11SCOPE_PREPARED_BPF_RUSTC" \
     "$P11SCOPE_PREPARED_STABLE_CARGO" build --locked --offline --release --workspace \
     --target-dir "$WORK/ring-build"
 echo "=== build small-state-map p11scope (Gaps 4/5 only) ==="
 P11SCOPE_SMALL_STATE_MAPS=1 RUSTC="$P11SCOPE_PREPARED_STABLE_RUSTC" \
+    P11SCOPE_PREPARED_BPF_CARGO="$P11SCOPE_PREPARED_BPF_CARGO" \
+    P11SCOPE_PREPARED_BPF_RUSTC="$P11SCOPE_PREPARED_BPF_RUSTC" \
     "$P11SCOPE_PREPARED_STABLE_CARGO" build --locked --offline --release --workspace \
     --target-dir "$WORK/state-build"
 RUSTC="$P11SCOPE_PREPARED_STABLE_RUSTC" \
+    P11SCOPE_PREPARED_BPF_CARGO="$P11SCOPE_PREPARED_BPF_CARGO" \
+    P11SCOPE_PREPARED_BPF_RUSTC="$P11SCOPE_PREPARED_BPF_RUSTC" \
     "$P11SCOPE_PREPARED_STABLE_CARGO" build --locked --offline --release --workspace \
     --features unsafe-unvalidated-metadata \
     --target-dir "$WORK/freeze-build"

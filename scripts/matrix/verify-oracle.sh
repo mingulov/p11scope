@@ -682,6 +682,8 @@ fi
 oracle_build_product() {
     echo "=== build product ==="
     RUSTC="$P11SCOPE_PREPARED_STABLE_RUSTC" \
+        P11SCOPE_PREPARED_BPF_CARGO="$P11SCOPE_PREPARED_BPF_CARGO" \
+        P11SCOPE_PREPARED_BPF_RUSTC="$P11SCOPE_PREPARED_BPF_RUSTC" \
         timeout --signal=TERM --kill-after=10s 900s \
         "$P11SCOPE_PREPARED_STABLE_CARGO" build --locked --offline --release \
         --workspace --target-dir "$PRODUCT"

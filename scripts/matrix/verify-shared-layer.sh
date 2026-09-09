@@ -167,6 +167,8 @@ task4_receipt_run() {
         P11SCOPE_TASK4_PRODUCT="$TASK4_ROOT/work/product" \
         P11SCOPE_PREPARED_STABLE_CARGO="$P11SCOPE_PREPARED_STABLE_CARGO" \
         P11SCOPE_PREPARED_STABLE_RUSTC="$P11SCOPE_PREPARED_STABLE_RUSTC" \
+        P11SCOPE_PREPARED_BPF_CARGO="$P11SCOPE_PREPARED_BPF_CARGO" \
+        P11SCOPE_PREPARED_BPF_RUSTC="$P11SCOPE_PREPARED_BPF_RUSTC" \
         /bin/sh "$0" > "$TASK4_ROOT/stdout.log" 2> "$TASK4_ROOT/stderr.log"
     task4_retain_capture "$TASK4_ROOT/work" "$TASK4_ROOT/artifacts/capture.json" || exit 1
     cp "$TASK4_ROOT/stdout.log" "$TASK4_ROOT/artifacts/checker.log"
@@ -318,7 +320,9 @@ fi
 [ "$#" -eq 0 ] || exit 2
 [ -n "${P11SCOPE_PREPARED_STABLE_CARGO-}" ] \
     && [ -n "${P11SCOPE_PREPARED_STABLE_RUSTC-}" ] \
-    || { echo "prepared stable Cargo/rustc handoff required" >&2; exit 1; }
+    && [ -n "${P11SCOPE_PREPARED_BPF_CARGO-}" ] \
+    && [ -n "${P11SCOPE_PREPARED_BPF_RUSTC-}" ] \
+    || { echo "prepared stable/BPF Cargo/rustc handoff required" >&2; exit 1; }
 require_non_root_caller
 for tool in docker gcc python3 timeout; do
     command -v "$tool" >/dev/null || { echo "$tool required"; exit 1; }
@@ -359,6 +363,8 @@ cleanup() {
 
 echo "=== build product + workload ==="
 RUSTC="$P11SCOPE_PREPARED_STABLE_RUSTC" \
+    P11SCOPE_PREPARED_BPF_CARGO="$P11SCOPE_PREPARED_BPF_CARGO" \
+    P11SCOPE_PREPARED_BPF_RUSTC="$P11SCOPE_PREPARED_BPF_RUSTC" \
     timeout --signal=TERM --kill-after=5s 600s \
     "$P11SCOPE_PREPARED_STABLE_CARGO" build --locked --offline --release \
     --workspace --target-dir "$PRODUCT"

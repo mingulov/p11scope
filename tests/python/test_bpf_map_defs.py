@@ -197,9 +197,36 @@ class MapDefsTests(unittest.TestCase):
 
     def test_owner_linkage(self):
         obj = Path(self.temp.name) / "owner-linkage.o"
+        source = Path(self.temp.name) / "owner-linkage.c"
+        fixture = (ROOT / "tests/fixtures/bpf-map-defs/mixed.c").read_text()
+        fixture = fixture.replace(
+            'SEC("uprobe") int probe(void *ctx) { return 0; }',
+            'static struct { UINT(type, 2); UINT(max_entries, 1); TYPE(key, unsigned); '
+            'TYPE(value, unsigned long long); } OWNER_CTL SEC(".maps");\n'
+            'SEC("uprobe") int probe(void *ctx) { return 0; }',
+        )
+        fixture = fixture.replace(
+            '#ifdef OWNER_GLOBAL',
+            'static void *(*fixture_map_lookup)(void *, const void *) = (void *)1;\n'
+            '__attribute__((noinline, used)) unsigned p11_owner_reserve(void) {\n'
+            '    unsigned key = 0; unsigned long long *ctl = fixture_map_lookup(&OWNER_CTL, &key);\n'
+            '    return ctl && *ctl;\n}\n'
+            '__attribute__((noinline, used)) unsigned p11_owner_refund(void) {\n'
+            '    unsigned key = 0; unsigned long long *ctl = fixture_map_lookup(&OWNER_CTL, &key);\n'
+            '    return ctl && *ctl;\n}\n'
+            '#ifdef OWNER_EXTRA_GLOBAL\n'
+            '__attribute__((noinline, used)) unsigned p11_owner_extra(void) { return 0; }\n'
+            '#endif\n'
+            '#ifdef OWNER_GLOBAL',
+        )
+        fixture = fixture.replace(
+            'int result = p11_owner_start_get(ctx)',
+            'int result = p11_owner_reserve() + p11_owner_refund() + p11_owner_start_get(ctx)',
+        )
+        source.write_text(fixture)
         def compile_fixture(*flags):
             subprocess.run(["clang-18", "-target", "bpfel", "-g", "-O2", "-DHELPERS", *flags,
-                            "-c", str(ROOT / "tests/fixtures/bpf-map-defs/mixed.c"), "-o", str(obj)],
+                            "-c", str(source), "-o", str(obj)],
                            check=True, capture_output=True)
         compile_fixture("-DOWNER_GLOBAL", "-DOWNER_HEALTHY")
         with self.assertRaisesRegex(RuntimeError, "owner.*LOCAL"):
@@ -215,6 +242,29 @@ class MapDefsTests(unittest.TestCase):
         func = btf.types[func_id]
         fb = elf.sections[".BTF"][0][4] + func[6]
         other = next(i for i, s in enumerate(elf.symbols) if s[0] == "p11_owner_start_get")
+        global_owner_helpers = {"p11_owner_reserve", "p11_owner_refund"}
+        exported = {
+            name: next(i for i, s in enumerate(elf.symbols) if s[0] == name)
+            for name in global_owner_helpers
+        }
+        exported_btf = {
+            name: next((i, n) for i, n in enumerate(btf.types) if n and n[:2] == (12, name))
+            for name in global_owner_helpers
+        }
+        pointer_proto_id = next(
+            n[2] for n in btf.types[1:]
+            if n and n[:2] == (12, "p11_owner_start_get")
+        )
+        bodies = {(s[3], s[4]): s for s in elf.symbols if s[1] & 15 == 2 and s[5] and s[3]}
+        call_relocations = {}
+        for section_row, relocations in elf.sections.values():
+            if section_row[1] != 9 or section_row[7] not in {key[0] for key in bodies}:
+                continue
+            for pos in range(0, len(relocations), 16):
+                address, info = struct.unpack_from("<QQ", relocations, pos)
+                call_relocations[section_row[7], address] = (
+                    info & 0xffffffff, elf.symbols[info >> 32]
+                )
         healthy = next(i for i, s in enumerate(elf.symbols) if s[0] == "p11_owner_healthy")
         healthy_btf = next(n for n in btf.types[1:] if n[:2] == (12, "p11_owner_healthy"))
         healthy_name = struct.unpack_from("<I", body, sb + healthy * 24)[0]
@@ -263,9 +313,82 @@ class MapDefsTests(unittest.TestCase):
             "wrong_func_relocation": ([(relrow[4] + relslot + 8, "Q", (relinfo & ~0xffffffff) | 10)], "function info relocation"),
             "uncalled_body": (remove_calls, "no reachable call boundary"),
         }
+        for public_name, public_index in exported.items():
+            public = elf.symbols[public_index]
+            public_at = sb + public_index * 24
+            func_id, func_node = exported_btf[public_name]
+            func_at = elf.sections[".BTF"][0][4] + func_node[6]
+            public_info_records = []
+            pos = hlen + off + 4
+            while pos < hlen + off + length:
+                _, count = struct.unpack_from("<II", ext, pos)
+                pos += 8
+                for _ in range(count):
+                    if struct.unpack_from("<I", ext, pos + 4)[0] == func_id:
+                        public_info_records.append(pos)
+                    pos += stride
+            self.assertEqual(len(public_info_records), 1)
+            public_relslot = next(
+                i for i in range(0, len(relbody), 16)
+                if struct.unpack_from("<Q", relbody, i)[0] == public_info_records[0]
+            )
+            public_relinfo = struct.unpack_from("<Q", relbody, public_relslot + 8)[0]
+            target = (public[3], public[4])
+            call_changes = []
+            for (section, start), caller in bodies.items():
+                section_row, section_code = next(
+                    row for name, row in elf.sections.items() if elf.indices[name] == section
+                )
+                code = section_code[start:start + caller[5]]
+                for pos in range(0, len(code), 8):
+                    if code[pos:pos + 2] != b"\x85\x10":
+                        continue
+                    imm = struct.unpack_from("<i", code, pos + 4)[0]
+                    relocation = call_relocations.get((section, start + pos))
+                    if relocation:
+                        kind, symbol = relocation
+                        destination = (symbol[3], symbol[4] + (imm + 1) * 8) if kind == 10 else None
+                    else:
+                        destination = (section, start + pos + (imm + 1) * 8)
+                    if destination == target:
+                        call_changes.append((section_row[4] + start + pos, "H", 0xb7))
+            self.assertTrue(call_changes, f"fixture must call {public_name}")
+
+            map_relocations = []
+            owner_ctl = next(symbol for symbol in elf.symbols if symbol[0] == "OWNER_CTL")
+            for section_row, relocations in elf.sections.values():
+                if section_row[1] != 9 or section_row[7] != public[3]:
+                    continue
+                for pos in range(0, len(relocations), 16):
+                    address, info = struct.unpack_from("<QQ", relocations, pos)
+                    symbol = elf.symbols[info >> 32]
+                    code = elf.sections[".text"][1]
+                    imm = struct.unpack_from("<i", code, address + 4)[0]
+                    targets_owner_ctl = (
+                        (symbol == owner_ctl and imm == 0)
+                        or (symbol[1:] == (3, 0, owner_ctl[3], 0, 0) and imm == owner_ctl[4])
+                    )
+                    if public[4] <= address < public[4] + public[5] and targets_owner_ctl:
+                        map_relocations.append((section_row[4] + pos + 8, "Q", info & ~0xffffffff))
+            self.assertEqual(len(map_relocations), 1)
+
+            cases.update({
+                f"{public_name}_static_elf": ([(public_at + 4, "B", 0x02)], "GLOBAL DEFAULT"),
+                f"{public_name}_extern_elf": ([(public_at + 6, "H", 0)], "GLOBAL DEFAULT"),
+                f"{public_name}_static_btf": ([(func_at + 4, "I", 12 << 24)], "GLOBAL BTF"),
+                f"{public_name}_pointer_proto": ([(func_at + 8, "I", pointer_proto_id)], "no-argument scalar"),
+                f"{public_name}_wrong_func_info": ([(extbase + public_info_records[0] + 4, "I", func_node[2])], "function info"),
+                f"{public_name}_wrong_func_relocation": ([(relrow[4] + public_relslot + 8, "Q", (public_relinfo & ~0xffffffff) | 10)], "function info relocation"),
+                f"{public_name}_empty_body": ([(public_at + 16, "Q", 0)], "body"),
+                f"{public_name}_uncalled": (call_changes, "no reachable call boundary"),
+                f"{public_name}_missing_owner_ctl": (map_relocations, "OWNER_CTL relocation"),
+            })
         for name, (changes, reason) in cases.items():
             with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, reason):
                 checker.inspect(self.mutate(changes, obj))
+        compile_fixture("-DOWNER_EXTRA_GLOBAL")
+        with self.assertRaisesRegex(RuntimeError, "unexpected owner"):
+            checker.inspect(obj)
 
     def test_root_helpers(self):
         obj = Path(self.temp.name) / "root-helpers.o"

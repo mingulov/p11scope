@@ -50,7 +50,7 @@ __attribute__((always_inline)) u32 p11_owner_healthy(void)
     return healthy(control());
 }
 
-static __always_inline int reserve(struct owner_control *ctl)
+static __always_inline int reserve_local(struct owner_control *ctl)
 {
 #pragma unroll
     for (int i = 0; i < OWNER_CAS_TRIES; i++) {
@@ -64,7 +64,7 @@ static __always_inline int reserve(struct owner_control *ctl)
     return 0;
 }
 
-static __always_inline int refund(struct owner_control *ctl)
+static __always_inline int refund_local(struct owner_control *ctl)
 {
 #pragma unroll
     for (int i = 0; i < OWNER_CAS_TRIES; i++) {
@@ -76,6 +76,28 @@ static __always_inline int refund(struct owner_control *ctl)
     }
     poison(ctl, OWNER_REFUND_FAILED);
     return 0;
+}
+
+/* BPF global functions deliberately take no map-value pointers across their
+ * ABI. Keeping these retry loops out of their transaction callers gives older
+ * verifiers one bounded state frontier per accounting operation. */
+__attribute__((noinline)) u32 p11_owner_reserve(void)
+{
+    struct owner_control *ctl = control();
+    if (!ctl)
+        return 0;
+    return reserve_local(ctl);
+}
+
+/* Cleanup must be able to settle an existing lease after a terminal poison.
+ * control() validates the frozen scalar bounds but healthy() is intentionally
+ * not consulted here. */
+__attribute__((noinline)) u32 p11_owner_refund(void)
+{
+    struct owner_control *ctl = control();
+    if (!ctl)
+        return 0;
+    return refund_local(ctl);
 }
 
 static __always_inline int valid_owner(struct owner_control *ctl, struct thread_owner *owner)
@@ -109,20 +131,20 @@ static __always_inline struct thread_owner *get_owner(struct owner_control *ctl,
         poison(ctl, OWNER_LOOKUP_UNKNOWN);
         return (void *)0;
     }
-    if (!reserve(ctl))
+    if (!p11_owner_reserve())
         return (void *)0;
     /* NULL initialization requests kernel-zeroed map storage, not a 544-byte
      * stack argument. A failed CREATE installed no new value for this lease. */
     owner = owner_storage_get(&THREAD_OWNER, task, (void *)0, 1);
     if (!owner) {
         count(&ctl->admission_failures);
-        refund(ctl);
+        p11_owner_refund();
         return (void *)0;
     }
     if (owner->flags) {
         /* A busy initial probe may have hidden an existing owner. Its lease
          * and keys remain untouched; refund only our speculative reservation. */
-        if (!refund(ctl) || !valid_owner(ctl, owner))
+        if (!p11_owner_refund() || !valid_owner(ctl, owner))
             return (void *)0;
         return healthy(ctl) ? owner : (void *)0;
     }
@@ -145,7 +167,7 @@ static __always_inline int release_empty(struct owner_control *ctl, struct threa
         return 0;
     }
     /* owner is invalid after successful deletion. Refund only now. */
-    return refund(ctl);
+    return p11_owner_refund();
 }
 
 static __always_inline int start_key_valid(struct thread_owner *owner,

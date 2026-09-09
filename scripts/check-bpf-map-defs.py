@@ -386,6 +386,7 @@ def decode_map_definitions(records, section, data):
 REQUIRED_GLOBAL_HELPERS = frozenset({
     "p11_link_current_identity", "p11_link_emit_fork", "p11_link_fork_allowed",
 })
+REQUIRED_GLOBAL_OWNER_HELPERS = frozenset({"p11_owner_reserve", "p11_owner_refund"})
 REQUIRED_LOCAL_OWNER_HELPERS = frozenset({
     "p11_owner_cleanup", "p11_owner_start_get",
     "p11_owner_start_insert", "p11_owner_start_remove", "p11_owner_discovery_get",
@@ -404,19 +405,20 @@ EXACT_PROGRAM_SECTIONS = {
 DIAGNOSTIC_GLOBAL_HELPERS = frozenset({"p11_decode_params", "p11_walk_template"})
 
 
-def validate_private_helpers(elf, prefix, required, optional, label):
-    """Private owner APIs need caller-context verification, never GLOBAL BTF.
+def validate_private_helpers(elf, prefix, required, optional, label,
+                             global_helpers=frozenset(), required_map=None):
+    """Verify exact native helper linkage, metadata, calls and map boundaries.
 
-    Verify retained bodies, function metadata and reachable BPF call edges.
-    Healthy alone may disappear after inlining. Do not retain dummy bodies just
-    to satisfy an inventory, or admit arbitrary owner clones/attachment targets.
+    Pointer-taking owner APIs stay LOCAL/STATIC; only the supplied scalar owner
+    boundaries may be GLOBAL. Healthy alone may disappear after inlining. Do
+    not retain dummy bodies or admit arbitrary clones/attachment targets.
     """
     owners = [s for s in elf.symbols if s[0].startswith(prefix)]
     production = any(s[0] in EXACT_PROGRAM_SECTIONS or s[0] in REQUIRED_GLOBAL_HELPERS
                      for s in elf.symbols)
     if not owners and not production:
         return
-    allowed = required | optional
+    allowed = required | optional | global_helpers
     names = [s[0] for s in owners]
     if len(names) != len(set(names)):
         raise RuntimeError(f"duplicate {label} helper symbol")
@@ -424,9 +426,13 @@ def validate_private_helpers(elf, prefix, required, optional, label):
         raise RuntimeError(f"unexpected {label} helper or clone")
     if missing := required - set(names):
         raise RuntimeError(f"missing required {label} helpers: {sorted(missing)}")
+    if missing := global_helpers - set(names):
+        raise RuntimeError(f"missing required global {label} helpers: {sorted(missing)}")
     for name, info, other, section, value, size in owners:
-        if info != 2 or other != 0 or section != elf.indices.get(".text"):
-            raise RuntimeError(f"{label} helper {name} must be LOCAL DEFAULT FUNC in .text")
+        expected = 0x12 if name in global_helpers else 2
+        linkage = "GLOBAL" if name in global_helpers else "LOCAL"
+        if info != expected or other != 0 or section != elf.indices.get(".text"):
+            raise RuntimeError(f"{label} helper {name} must be {linkage} DEFAULT FUNC in .text")
         if not size or value % 8 or size % 8 or value + size > len(elf.sections[".text"][1]):
             raise RuntimeError(f"{label} helper {name} has invalid/empty body")
     for name, location in EXACT_PROGRAM_SECTIONS.items():
@@ -447,10 +453,19 @@ def validate_private_helpers(elf, prefix, required, optional, label):
         raise RuntimeError(f"{label} helper ELF/BTF FUNC association mismatch")
     for name, ident in functions.items():
         node = btf.types[ident]
-        if node[3] != 0:
-            raise RuntimeError(f"{label} helper {name} requires STATIC BTF linkage")
+        expected_linkage = 1 if name in global_helpers else 0
+        if node[3] != expected_linkage:
+            linkage = "GLOBAL" if name in global_helpers else "STATIC"
+            raise RuntimeError(f"{label} helper {name} requires {linkage} BTF linkage")
         if not node[2] or btf.types[node[2]][0] != 13:
             raise RuntimeError(f"{label} helper {name} requires FUNC_PROTO")
+        if name in global_helpers:
+            proto = btf.types[node[2]]
+            scalar = btf.resolve(proto[2])
+            if proto[3] or proto[5] or scalar[0] != 1 or scalar[2] != 4:
+                raise RuntimeError(
+                    f"{label} helper {name} requires a no-argument scalar FUNC_PROTO"
+                )
     ext = elf.sections[".BTF.ext"][1]
     magic, version, flags, hlen, off, length = struct.unpack(
         "<HBBIII", checked_slice(ext, 0, 16, "BTF.ext function info header"))
@@ -539,13 +554,44 @@ def validate_private_helpers(elf, prefix, required, optional, label):
             reachable.add(key)
             todo.extend(edges[key])
     for name, _, _, section, start, _ in owners:
-        if name in required and (section, start) not in reachable:
+        if name in required | global_helpers and (section, start) not in reachable:
             raise RuntimeError(f"{label} helper {name} has no reachable call boundary")
+    if required_map and global_helpers:
+        map_symbols = [symbol for symbol in elf.symbols if symbol[0] == required_map]
+        if (len(map_symbols) != 1 or map_symbols[0][1] not in (1, 0x11)
+                or map_symbols[0][2] != 0
+                or map_symbols[0][3] != elf.indices.get(".maps")
+                or map_symbols[0][5] != 32):
+            raise RuntimeError(f"{label} helpers require exact {required_map} map symbol")
+        map_symbol = map_symbols[0]
+        for name, _, _, section, start, size in owners:
+            if name not in global_helpers:
+                continue
+            body_relocations = []
+            for (rel_section, address), (kind, target) in relocs.items():
+                if rel_section == section and start <= address < start + size:
+                    body_relocations.append((address, kind, target))
+            map_relocations = []
+            for address, kind, target in body_relocations:
+                instruction = checked_slice(sections[section], address, 8, "map relocation instruction")
+                imm = struct.unpack_from("<i", instruction, 4)[0]
+                direct = target == map_symbol and imm == 0
+                section_relative = (target[1:] == (3, 0, map_symbol[3], 0, 0)
+                                    and imm == map_symbol[4])
+                if kind == 1 and instruction[0] == 0x18 and (direct or section_relative):
+                    map_relocations.append((address, kind, target))
+            if len(map_relocations) != 1:
+                raise RuntimeError(
+                    f"{label} helper {name} requires one exact {required_map} relocation"
+                )
 
 
 def validate_owner_helpers(elf):
+    exported = (REQUIRED_GLOBAL_OWNER_HELPERS
+                if any(symbol[0] == "OWNER_CTL" for symbol in elf.symbols)
+                else frozenset())
     validate_private_helpers(elf, "p11_owner_", REQUIRED_LOCAL_OWNER_HELPERS,
-                             OPTIONAL_LOCAL_OWNER_HELPERS, "owner")
+                             OPTIONAL_LOCAL_OWNER_HELPERS, "owner", exported, "OWNER_CTL")
 
 def validate_root_helpers(elf):
     validate_private_helpers(elf, "p11_root_", REQUIRED_LOCAL_ROOT_HELPERS,
@@ -580,7 +626,8 @@ def inspect(path, allowed_text_globals=frozenset()):
             raise RuntimeError("native BTF DATASEC missing ELF .maps section")
     validate_owner_helpers(elf)
     validate_root_helpers(elf)
-    return maps, classify(records, sections, allowed_text_globals | REQUIRED_GLOBAL_HELPERS), {
+    return maps, classify(records, sections, allowed_text_globals | REQUIRED_GLOBAL_HELPERS
+                          | REQUIRED_GLOBAL_OWNER_HELPERS), {
         record[-1] for record in records
     }
 
@@ -617,7 +664,7 @@ def classify(records, sections, allowed_text_globals=frozenset()):
         exact = EXACT_PROGRAM_SECTIONS.get(name)
         if bind != "GLOBAL" or visibility != "DEFAULT":
             raise RuntimeError(f"unclassified global function {name} in {location}")
-        if name in REQUIRED_GLOBAL_HELPERS | DIAGNOSTIC_GLOBAL_HELPERS:
+        if name in REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_OWNER_HELPERS | DIAGNOSTIC_GLOBAL_HELPERS:
             if name in allowed_text_globals and location == ".text":
                 helpers.add(name)
                 continue

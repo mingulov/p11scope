@@ -1,6 +1,13 @@
 /* Executes the actual production transaction and classifier implementation.
- * Only kernel helper operations are injected; there is no second algorithm. */
+ * Only kernel helper operations and CAS interference are injected; there is no
+ * second owner-accounting algorithm. */
+#include "task_owner.h"
+static u64 *cas_interference_cell;
+static unsigned cas_failures_remaining, cas_attempts;
+static u64 controlled_cas(u64 *cell, u64 old, u64 replacement);
+#define __sync_val_compare_and_swap controlled_cas
 #include "task_owner.c"
+#undef __sync_val_compare_and_swap
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -18,6 +25,19 @@ static u64 expected_delete_debt;
 static unsigned char value[288];
 struct row { int used; void *map; unsigned char key[24], value[288]; };
 static struct row rows[600];
+
+static u64 controlled_cas(u64 *cell, u64 old, u64 replacement)
+{
+    if (cell == cas_interference_cell) {
+        cas_attempts++;
+        if (cas_failures_remaining) {
+            cas_failures_remaining--;
+            *cell = old ^ 1ULL;
+            return old ^ 1ULL;
+        }
+    }
+    return __sync_val_compare_and_swap(cell, old, replacement);
+}
 
 static size_t key_size(void *map) { return map == &START ? 16 : 24; }
 static struct row *row(void *map, const void *key)
@@ -93,9 +113,61 @@ static void reset(void)
     for (unsigned i = 0; i < 3; i++) current_number[i] = (42ULL << 32) | (100 + i);
     current_index = miss_get = fail_create = delete_error = update_error = pair_delete_error = 0;
     gets = creates = deletes = 0; expected_delete_debt = 0;
+    cas_interference_cell = NULL; cas_failures_remaining = cas_attempts = 0;
     owner_map_lookup = lookup; owner_map_update = update; owner_map_delete = pair_delete;
     owner_storage_get = storage_get; owner_storage_delete = storage_delete;
     owner_current_task = current_task; owner_pid_tgid = pid_tgid;
+}
+
+static void cas_boundaries(void)
+{
+    reset();
+    assert(ctl.limit == OWNER_LIMIT);
+    assert(OWNER_LIMIT ==
+#ifdef P11SCOPE_SMALL_STATE_MAPS
+           65ULL
+#else
+           16448ULL
+#endif
+    );
+
+    ctl.outstanding = 2;
+    cas_interference_cell = &ctl.outstanding;
+    cas_failures_remaining = OWNER_CAS_TRIES - 1;
+    assert(p11_owner_reserve());
+    assert(cas_attempts == OWNER_CAS_TRIES);
+
+    cas_attempts = 0;
+    cas_failures_remaining = OWNER_CAS_TRIES - 1;
+    assert(p11_owner_refund());
+    assert(cas_attempts == OWNER_CAS_TRIES);
+
+    reset(); ctl.outstanding = 2;
+    cas_interference_cell = &ctl.outstanding;
+    cas_failures_remaining = OWNER_CAS_TRIES;
+    assert(!p11_owner_reserve());
+    assert(cas_attempts == OWNER_CAS_TRIES && ctl.admission_failures == 1);
+
+    reset(); ctl.outstanding = 2;
+    cas_interference_cell = &ctl.outstanding;
+    cas_failures_remaining = OWNER_CAS_TRIES;
+    assert(!p11_owner_refund());
+    assert(cas_attempts == OWNER_CAS_TRIES && (ctl.poison & OWNER_REFUND_FAILED));
+
+    reset(); ctl.outstanding = OWNER_LIMIT;
+    cas_interference_cell = &ctl.outstanding;
+    assert(!p11_owner_reserve());
+    assert(!cas_attempts && ctl.outstanding == OWNER_LIMIT && ctl.admission_failures == 1);
+
+    reset();
+    cas_interference_cell = &ctl.outstanding;
+    assert(!p11_owner_refund());
+    assert(!cas_attempts && (ctl.poison & OWNER_REFUND_FAILED));
+
+    reset(); ctl.outstanding = 1; ctl.poison = OWNER_CLASSIFIER_FAILED;
+    cas_interference_cell = &ctl.outstanding;
+    assert(p11_owner_refund());
+    assert(cas_attempts == 1 && !ctl.outstanding && ctl.poison == OWNER_CLASSIFIER_FAILED);
 }
 static struct owner_start_key start_key(u32 slot)
 {
@@ -372,9 +444,10 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[1], "discovery-foreign")) discovery_foreign_owner();
         else if (!strcmp(argv[1], "capacity")) capacity_collision();
         else if (!strcmp(argv[1], "absence")) ordinary_absence();
+        else if (!strcmp(argv[1], "cas")) cas_boundaries();
         else assert(0);
     } else {
-        classifier(); transactions(); directory(); lifecycle(); poisoned_reads(); capacity_collision(); ordinary_absence(); discovery_foreign_owner();
+        cas_boundaries(); classifier(); transactions(); directory(); lifecycle(); poisoned_reads(); capacity_collision(); ordinary_absence(); discovery_foreign_owner();
     }
     puts("task-owner: actual helper classifier, transactions, directory and lifecycle controls passed");
 }

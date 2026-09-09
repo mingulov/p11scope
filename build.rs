@@ -180,6 +180,10 @@ fn main() {
         "link-arg=--export=p11_link_emit_fork",
         "-C",
         "link-arg=--export=task_newtask",
+        "-C",
+        "link-arg=--export=p11_owner_reserve",
+        "-C",
+        "link-arg=--export=p11_owner_refund",
     ] {
         append_flag(flag);
     }

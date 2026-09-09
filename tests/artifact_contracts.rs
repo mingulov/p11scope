@@ -4,6 +4,24 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::process::Command;
 use std::sync::Mutex;
 
+#[test]
+fn owner_retry_boundaries_are_the_only_owner_exports_requested_by_the_build() {
+    let source = std::fs::read_to_string("build.rs").expect("read build script");
+    for helper in ["p11_owner_reserve", "p11_owner_refund"] {
+        let export = format!("link-arg=--export={helper}");
+        assert_eq!(
+            source.matches(&export).count(),
+            1,
+            "missing exact {helper} export"
+        );
+    }
+    assert_eq!(
+        source.matches("link-arg=--export=p11_owner_").count(),
+        2,
+        "no pointer-taking owner transaction may be exported"
+    );
+}
+
 static NATIVE_SUITE_GATE: Mutex<()> = Mutex::new(());
 
 fn read(path: &str) -> String {

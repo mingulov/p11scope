@@ -2,7 +2,7 @@
 use std::process::Command;
 
 #[test]
-fn embedded_owner_helpers_have_private_btf_and_real_calls() {
+fn embedded_owner_helpers_have_exact_linkage_btf_and_real_calls() {
     let directory = tempfile::tempdir().expect("temporary embedded BPF object");
     let object = directory.path().join("p11scope-ebpf");
     std::fs::write(&object, p11scope::EBPF_OBJECT).expect("write actual embedded object");
@@ -18,6 +18,17 @@ fn embedded_owner_helpers_have_private_btf_and_real_calls() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    let contract: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("decode embedded owner contract report");
+    let symbols = contract["symbols"]
+        .as_array()
+        .expect("embedded owner symbol inventory");
+    for helper in ["p11_owner_reserve", "p11_owner_refund"] {
+        assert!(
+            symbols.iter().any(|symbol| symbol == helper),
+            "embedded object must export {helper}"
+        );
+    }
 }
 
 /// Relocation itself is an object transformation. Distinct sentinel descriptors

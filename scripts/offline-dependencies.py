@@ -34,6 +34,12 @@ REVISION_RE = re.compile(r"[0-9a-f]{40}\Z")
 PAYLOAD_TOP = {"vendor", "archives", "provenance"}
 SHARED_FILES = {"source.bundle", "LICENSE-MIT", "LICENSE-APACHE", "packages.json"}
 NIGHTLY_FILES = {"sysroot-Cargo.toml", "Cargo.lock"}
+SOURCE_EXPORT_V1_FIELDS = {"schema_version", "revision", "source_entries", "archives"}
+SOURCE_EXPORT_V2_FIELDS = SOURCE_EXPORT_V1_FIELDS | {"offline_dependencies"}
+OFFLINE_ASSOCIATION_FIELDS = {
+    "payload_path", "recipe_path", "recipe_sha256", "payload_tree_sha256",
+    "config_path", "config_sha256",
+}
 
 
 class OfflineDependencyError(Exception):
@@ -216,6 +222,11 @@ def tree_content_digest(root: Path, *, installed_rust_src: bool = False) -> str:
         digest.update(executable_bits.to_bytes(2, "big"))
         digest.update(bytes.fromhex(content_digest) if content_digest else b"")
     return digest.hexdigest()
+
+
+def payload_inventory(root: Path) -> list[tuple[str, str, int, str]]:
+    """Return the canonical, safety-checked payload inventory."""
+    return _entry_inventory(root, payload_modes=True)
 
 
 def _strict_manifest(root: Path, preparer) -> dict:
@@ -617,7 +628,9 @@ def _recipe_value(root: Path, manifest: dict, preparer, nightly: dict, shared: d
 def _validate_recipe(value: object, manifest: dict, preparer, root: Path) -> dict:
     top = {"schema_version", "workspaces", "preparation", "nightly", "shared_git",
            "payload_tree_sha256"}
-    if not isinstance(value, dict) or set(value) != top or value.get("schema_version") != 1:
+    if (not isinstance(value, dict) or set(value) != top
+            or type(value.get("schema_version")) is not int
+            or value["schema_version"] != 1):
         raise OfflineDependencyError("fixed recipe has unknown or missing top-level fields")
     expected_workspaces = set(manifest["workspace_manifests"])
     workspaces = value["workspaces"]
@@ -656,20 +669,38 @@ def _validate_recipe(value: object, manifest: dict, preparer, root: Path) -> dic
     return value
 
 
-def _check_current_inputs(root: Path, recipe: dict, manifest: dict, preparer,
-                          nightly: dict, shared: dict) -> dict:
-    current = _recipe_value(root, manifest, preparer, nightly, shared, recipe["payload_tree_sha256"])
+def check_fixed_recipe_inputs(root: Path, recipe: dict, manifest: dict, preparer) -> dict:
+    """Bind maintained workspace and preparation bytes to one fixed recipe."""
+    current = {
+        "workspaces": _workspace_identities(root, manifest),
+        "preparation": {
+            "sources_manifest_sha256": _sha256_file(root / "third-party/sources.json"),
+            "package_recipes": _package_recipes(root, manifest, preparer),
+        },
+    }
     if current["workspaces"] != recipe["workspaces"]:
         raise OfflineDependencyError("workspace lock or manifest input changed")
     if current["preparation"]["sources_manifest_sha256"] != recipe["preparation"]["sources_manifest_sha256"]:
         raise OfflineDependencyError("sources manifest input changed")
     if current["preparation"]["package_recipes"] != recipe["preparation"]["package_recipes"]:
         raise OfflineDependencyError("package recipe input changed")
+    return current
+
+
+def _check_current_inputs(root: Path, recipe: dict, manifest: dict, preparer,
+                          nightly: dict, shared: dict) -> dict:
+    fixed = check_fixed_recipe_inputs(root, recipe, manifest, preparer)
     if nightly != recipe["nightly"]:
         raise OfflineDependencyError("nightly source input changed")
     if shared != recipe["shared_git"]:
         raise OfflineDependencyError("shared Git revision in dependency locks changed")
-    return current
+    return {
+        "schema_version": SCHEMA_VERSION,
+        **fixed,
+        "nightly": nightly,
+        "shared_git": shared,
+        "payload_tree_sha256": recipe["payload_tree_sha256"],
+    }
 
 
 def _run_metadata(root: Path, cargo: Path, rustc: Path, manifest: str) -> tuple[list[str], bytes]:
@@ -725,11 +756,32 @@ def _project_source_identity(root: Path) -> dict:
     manifest_path = root / ".p11scope-source-export.json"
     if manifest_path.is_file():
         value = _read_json(manifest_path, "source export manifest")
-        if (not isinstance(value, dict) or value.get("schema_version") != 1
-                or not REVISION_RE.fullmatch(value.get("revision", ""))
+        if not isinstance(value, dict):
+            raise OfflineDependencyError("source export manifest is malformed")
+        schema = value.get("schema_version")
+        if type(schema) is not int:
+            raise OfflineDependencyError("source export manifest is malformed")
+        expected_fields = SOURCE_EXPORT_V1_FIELDS if schema == 1 else (
+            SOURCE_EXPORT_V2_FIELDS if schema == 2 else None
+        )
+        if (expected_fields is None or set(value) != expected_fields
+                or not isinstance(value.get("revision"), str)
+                or not REVISION_RE.fullmatch(value["revision"])
                 or not isinstance(value.get("source_entries"), list)
                 or not isinstance(value.get("archives"), list)):
             raise OfflineDependencyError("source export manifest is malformed")
+        if schema == 2:
+            association = value["offline_dependencies"]
+            if (not isinstance(association, dict)
+                    or set(association) != OFFLINE_ASSOCIATION_FIELDS
+                    or any(not isinstance(item, str) for item in association.values())
+                    or association["payload_path"] != "third-party/offline"
+                    or association["recipe_path"] != "third-party/offline-dependencies.json"
+                    or association["config_path"] != ".cargo/config.toml"
+                    or any(not SHA256_RE.fullmatch(association[field]) for field in (
+                        "recipe_sha256", "payload_tree_sha256", "config_sha256"
+                    ))):
+                raise OfflineDependencyError("source export manifest is malformed")
         return {"kind": "source-export", "revision": value["revision"],
                 "manifest_sha256": _sha256_file(manifest_path)}
     raise OfflineDependencyError(
@@ -901,7 +953,7 @@ def assemble(root: Path, options, preparer, checker) -> None:
                                            "inputs": inputs, "outcome": outcome})
 
 
-def verify(root: Path, options, preparer) -> None:
+def verify(root: Path, options, preparer) -> dict:
     _external_target(root, options.prefix, "evidence prefix")
     _absolute_directory(options.payload, "offline dependency payload")
     recipe_path = root / RECIPE_RELATIVE
@@ -973,6 +1025,7 @@ def verify(root: Path, options, preparer) -> None:
     }
     _evidence(options.prefix, "verify", values)
     _write_new(Path(f"{options.prefix}.verify.receipt.json"), _canonical_json(receipt) + b"\n")
+    return receipt
 
 
 def replacement_config(payload: Path, shared_git: dict, *, vendor_path: str | None = None) -> bytes:

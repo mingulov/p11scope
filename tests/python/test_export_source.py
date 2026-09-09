@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -15,23 +16,32 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
 EXPORTER = ROOT / "scripts/export-source.py"
 PREPARER = ROOT / "scripts/prepare-dependencies.py"
 EXPORT_MANIFEST = ".p11scope-source-export.json"
+OFFLINE_TESTS = ROOT / "tests/python/test_offline_dependencies.py"
+EXPORT_FIXTURES = ROOT / "tests/fixtures/export-source"
 
 
 def load_module(path: Path, name: str):
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
-    spec.loader.exec_module(module)
+    previous = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = previous
     return module
 
 
 PREPARE = load_module(PREPARER, "export_test_preparer")
+OFFLINE_TEST_MODULE = load_module(OFFLINE_TESTS, "export_test_offline_fixture")
 
 
 class ExportFixture:
@@ -144,6 +154,96 @@ class ExportSourceTests(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         for needle in needles:
             self.assertIn(needle, result.stderr)
+
+    def full_fixture(self, name="full"):
+        base = self.base / name
+        fixture = OFFLINE_TEST_MODULE.OfflineFixture(base)
+        fixture.testcase = self
+        shutil.copy2(EXPORTER, fixture.root / "scripts/export-source.py")
+        fixture.assemble()
+        fixture.approve()
+        shutil.rmtree(fixture.root / "third-party/src")
+        fixture.export_manifest.unlink()
+        (fixture.root / ".gitignore").write_text(
+            "third-party/src/\nthird-party/archives/\n", encoding="utf-8"
+        )
+        commands = (
+            ["git", "init", "--quiet", "--template="],
+            ["git", "add", "--all"],
+            ["git", "-c", "user.name=Full Export Test", "-c",
+             "user.email=test.invalid", "commit", "--quiet", "-m", "fixture"],
+        )
+        git_environment = {
+            key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+        }
+        git_environment.update({
+            "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+        })
+        for command in commands:
+            result = subprocess.run(command, cwd=fixture.root, env=git_environment,
+                                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        return fixture
+
+    @staticmethod
+    def full_export(fixture, output: Path, *, environment=None, extra=()):
+        return subprocess.run([
+            sys.executable, "-I", str(fixture.root / "scripts/export-source.py"),
+            "--output", str(output), "--offline-payload", str(fixture.output),
+            "--nightly-rustc", str(fixture.tools / "nightly rustc"), *extra,
+        ], cwd=fixture.root.parent, env=environment, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def validate_full(self, source: Path, cargo_home: Path, *, environment=None):
+        clean = {key: value for key, value in os.environ.items()
+                 if not key.startswith(("CARGO_", "RUST", "P11SCOPE_"))
+                 and key not in ("CC", "CFLAGS")}
+        if environment:
+            clean.update(environment)
+        return subprocess.run([
+            sys.executable, "-I", str(source / "scripts/export-source.py"),
+            "--verify-extracted", str(source), "--cargo-home", str(cargo_home),
+        ], cwd=self.base, env=clean, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE)
+
+    def extracted_full(self, fixture, name: str):
+        archive = fixture.root.parent / f"{name}.tar.gz"
+        result = self.full_export(fixture, archive)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        extracted = self.base / f"{name} extraction"
+        extracted.mkdir()
+        unpacked = subprocess.run(["tar", "-xzf", str(archive), "-C", str(extracted)],
+                                  text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(unpacked.returncode, 0, unpacked.stderr)
+        return extracted / "pkcs11-scope-source"
+
+    @staticmethod
+    def update_source_row(source: Path, relative: str):
+        manifest_path = source / EXPORT_MANIFEST
+        manifest = json.loads(manifest_path.read_text())
+        content = (source / relative).read_bytes()
+        row = next(item for item in manifest["source_entries"] if item["path"] == relative)
+        row["size"] = len(content)
+        row["sha256"] = hashlib.sha256(content).hexdigest()
+        manifest_path.write_text(json.dumps(
+            manifest, sort_keys=True, separators=(",", ":")
+        ) + "\n")
+
+    @staticmethod
+    def add_symlink_row(source: Path, relative: str, target: str):
+        (source / relative).symlink_to(target)
+        encoded = target.encode()
+        manifest_path = source / EXPORT_MANIFEST
+        manifest = json.loads(manifest_path.read_text())
+        manifest["source_entries"].append({
+            "path": relative, "kind": "symlink", "mode": "120000",
+            "target": target, "size": len(encoded),
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+        })
+        manifest["source_entries"].sort(key=lambda item: item["path"].encode())
+        manifest_path.write_text(json.dumps(
+            manifest, sort_keys=True, separators=(",", ":")
+        ) + "\n")
 
     def test_clean_export_is_deterministic_and_prepares_from_fresh_offline_extraction(self):
         fixture = self.fixture()
@@ -395,6 +495,432 @@ class ExportSourceTests(unittest.TestCase):
         self.assert_refused(result, "required export input is not a committed regular file",
                             "Cargo.toml")
         self.assertFalse(output.exists())
+
+    def test_full_export_is_deterministic_relocatable_and_has_closed_v2_schema(self):
+        fixture = self.full_fixture()
+        first = fixture.root.parent / "full first.tar.gz"
+        second = fixture.root.parent / "full second.tar.gz"
+        one = self.full_export(fixture, first)
+        two = self.full_export(fixture, second)
+        self.assertEqual(one.returncode, 0, one.stderr)
+        self.assertEqual(two.returncode, 0, two.stderr)
+        self.assertEqual(first.read_bytes(), second.read_bytes())
+
+        extracted = self.base / "relocated export with spaces"
+        with tarfile.open(first, "r:gz") as archive:
+            self.assertEqual(
+                archive.getmember("pkcs11-scope-source/third-party/offline").mode,
+                0o755,
+            )
+        extracted.mkdir()
+        unpacked = subprocess.run(
+            ["tar", "-xzf", str(first), "-C", str(extracted)], text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(unpacked.returncode, 0, unpacked.stderr)
+        source = extracted / "pkcs11-scope-source"
+        manifest = json.loads((source / EXPORT_MANIFEST).read_text())
+        self.assertEqual(set(manifest), {
+            "schema_version", "revision", "source_entries", "archives",
+            "offline_dependencies",
+        })
+        self.assertEqual(manifest["schema_version"], 2)
+        self.assertEqual(set(manifest["offline_dependencies"]), {
+            "payload_path", "recipe_path", "recipe_sha256", "payload_tree_sha256",
+            "config_path", "config_sha256",
+        })
+        self.assertTrue(all(
+            entry["path"].startswith("third-party/offline/archives/")
+            for entry in manifest["archives"]
+        ))
+        self.assertFalse(any(
+            entry["path"].startswith("third-party/offline/")
+            or entry["path"] == ".cargo/config.toml"
+            for entry in manifest["source_entries"]
+        ))
+        cargo_home = self.base / "fresh cargo home"
+        cargo_home.mkdir(mode=0o700)
+        verified = self.validate_full(source, cargo_home)
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+
+    def test_full_mode_pairs_inputs_and_refuses_overrides_collisions_and_mutations(self):
+        basic = self.fixture("paired")
+        basic.commit()
+        output = basic.outputs / "paired.tar.gz"
+        for arguments in (
+            ("--offline-payload", str(basic.archives)),
+            ("--nightly-rustc", sys.executable),
+        ):
+            with self.subTest(arguments=arguments):
+                result = basic.run(output, *arguments)
+                self.assert_refused(result, "must be supplied together")
+                self.assertFalse(output.exists())
+
+        fixture = self.full_fixture("refusals")
+        override = fixture.root.parent / "override.tar.gz"
+        result = self.full_export(
+            fixture, override, extra=("--archive-dir", str(fixture.archive_dir))
+        )
+        self.assert_refused(result, "archive-dir", "full")
+        self.assertFalse(override.exists())
+
+        collision = fixture.root / "third-party/offline/collision"
+        collision.parent.mkdir(parents=True)
+        collision.write_text("collision\n")
+        subprocess.run(["git", "add", "--force", str(collision)], cwd=fixture.root,
+                       check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run([
+            "git", "-c", "user.name=Full Export Test", "-c", "user.email=test.invalid",
+            "commit", "--quiet", "-m", "collision",
+        ], cwd=fixture.root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        collided = fixture.root.parent / "collision.tar.gz"
+        result = self.full_export(fixture, collided)
+        self.assert_refused(result, "generated destination conflicts")
+        self.assertFalse(collided.exists())
+
+    def test_full_export_detects_private_streaming_mutation_and_cleans_without_publication(self):
+        fixture = self.full_fixture("stream-mutation")
+        nightly = fixture.tools / "nightly rustc"
+        shutil.copy2(EXPORT_FIXTURES / "mutating-rustc.py", nightly)
+        nightly.chmod(0o755)
+        configuration_path = fixture.tools / "fixture.json"
+        configuration = json.loads(configuration_path.read_text())
+        configuration.update({
+            "export_parent": str(fixture.root.parent),
+            "export_mutation_call": 5,
+        })
+        configuration_path.write_text(json.dumps(configuration), encoding="utf-8")
+        output = fixture.root.parent / "stream-mutated.tar.gz"
+
+        result = self.full_export(fixture, output)
+
+        self.assert_refused(result, "payload tree digest mismatch")
+        self.assertFalse(output.exists())
+        self.assertEqual(
+            list(fixture.root.parent.glob(".stream-mutated.tar.gz.export-*")), []
+        )
+
+    def test_full_export_binds_every_streamed_payload_read_to_retained_inventory(self):
+        cases = (
+            ("content", "vendor/shared-0.1.0/src.rs", "read"),
+            ("archive", "archives/demo-1.0.0.crate", "read"),
+            ("mode", "vendor/shared-0.1.0/src.rs", "mode"),
+        )
+        for index, (label, relative, mutation) in enumerate(cases):
+            with self.subTest(label=label):
+                fixture = self.full_fixture(f"stream-custody-{index}")
+                module = load_module(
+                    fixture.root / "scripts/export-source.py", f"stream_custody_{index}"
+                )
+                output = fixture.root.parent / f"custody-{index}.tar.gz"
+                original_read = Path.read_bytes
+                original_lstat = Path.lstat
+
+                def transient_read(path):
+                    content = original_read(path)
+                    if ("private-payload" in path.parts
+                            and path.as_posix().endswith(relative)):
+                        return content + b"transient mutation"
+                    return content
+
+                def transient_lstat(path):
+                    metadata = original_lstat(path)
+                    completed = list(fixture.root.parent.glob(
+                        f".{output.name}.export-*/completed.tar.gz"
+                    ))
+                    if (completed and "private-payload" in path.parts
+                            and path.as_posix().endswith(relative)
+                            and any(frame.function == "_build_archive"
+                                    for frame in inspect.stack())):
+                        values = list(metadata)
+                        values[0] = (metadata.st_mode & ~0o777) | 0o600
+                        return os.stat_result(values)
+                    return metadata
+
+                patcher = (mock.patch.object(Path, "read_bytes", transient_read)
+                           if mutation == "read" else
+                           mock.patch.object(Path, "lstat", transient_lstat))
+                with patcher, self.assertRaisesRegex(module.ExportError, "payload.*(digest|mode)"):
+                    module.run(
+                        fixture.root, output, offline=False, archive_dir=None,
+                        offline_payload=fixture.output,
+                        nightly_rustc=fixture.tools / "nightly rustc",
+                    )
+                self.assertFalse(output.exists())
+                self.assertEqual(
+                    list(fixture.root.parent.glob(f".{output.name}.export-*")), []
+                )
+
+    def test_full_producer_refuses_root_and_nested_competing_cargo_configs(self):
+        paths = (
+            ".cargo/config",
+            "crates/.cargo/config",
+            "crates/.cargo/config.toml",
+            "crates/ebpf/.cargo/config",
+            "crates/ebpf/.cargo/config.toml",
+        )
+        for index, relative in enumerate(paths):
+            with self.subTest(relative=relative):
+                fixture = self.full_fixture(f"producer-config-{index}")
+                path = fixture.root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("[net]\noffline = false\n")
+                subprocess.run(["git", "add", relative], cwd=fixture.root, check=True)
+                subprocess.run([
+                    "git", "-c", "user.name=Full Export Test", "-c",
+                    "user.email=test.invalid", "commit", "--quiet", "-m", "config",
+                ], cwd=fixture.root, check=True)
+                output = fixture.root.parent / f"config-{index}.tar.gz"
+
+                result = self.full_export(fixture, output)
+
+                self.assert_refused(result, "competing Cargo configuration", relative)
+                self.assertFalse(output.exists())
+
+    def test_full_producer_refuses_directory_at_delivered_cargo_config_before_work(self):
+        fixture = self.full_fixture("producer-config-directory")
+        relative = "crates/.cargo/config.toml/unexpected"
+        path = fixture.root / relative
+        path.parent.mkdir(parents=True)
+        path.write_text("committed descendant\n")
+        subprocess.run(["git", "add", relative], cwd=fixture.root, check=True)
+        subprocess.run([
+            "git", "-c", "user.name=Full Export Test", "-c",
+            "user.email=test.invalid", "commit", "--quiet", "-m", "config directory",
+        ], cwd=fixture.root, check=True)
+        module = load_module(
+            fixture.root / "scripts/export-source.py", "producer_config_directory"
+        )
+        output = fixture.root.parent / "config-directory.tar.gz"
+        original_run = subprocess.run
+
+        def refuse_compiler(command, *args, **kwargs):
+            if command and Path(command[0]) == fixture.tools / "nightly rustc":
+                raise AssertionError("compiler invocation reached")
+            return original_run(command, *args, **kwargs)
+
+        with (
+            mock.patch.object(
+                module.tempfile, "mkdtemp",
+                side_effect=AssertionError("staging reached"),
+            ),
+            mock.patch.object(
+                module, "_verify_payload",
+                side_effect=AssertionError("payload verification reached"),
+            ),
+            mock.patch.object(module.subprocess, "run", refuse_compiler),
+        ):
+            with self.assertRaisesRegex(
+                module.ExportError, "generated destination conflicts.*config.toml"
+            ):
+                module.run(
+                    fixture.root,
+                    output,
+                    offline=False,
+                    archive_dir=None,
+                    offline_payload=fixture.output,
+                    nightly_rustc=fixture.tools / "nightly rustc",
+                )
+
+        self.assertFalse(output.exists())
+        self.assertEqual(
+            list(fixture.root.parent.glob(f".{output.name}.export-*")), []
+        )
+
+    def test_committed_source_second_read_is_bound_to_git_blob_and_cleans(self):
+        fixture = self.fixture("source-stream-custody")
+        fixture.commit()
+        module = load_module(
+            fixture.root / "scripts/export-source.py", "source_stream_custody"
+        )
+        output = fixture.outputs / "source-mutated.tar.gz"
+        original_extractfile = tarfile.TarFile.extractfile
+        read_count = 0
+
+        def transient_extractfile(archive, member):
+            nonlocal read_count
+            stream = original_extractfile(archive, member)
+            if member.name == "README.md":
+                read_count += 1
+                if read_count == 2:
+                    with stream:
+                        content = stream.read()
+                    return io.BytesIO(content + b"transient mutation")
+            return stream
+
+        with mock.patch.object(
+            tarfile.TarFile, "extractfile", transient_extractfile
+        ):
+            with self.assertRaisesRegex(
+                module.ExportError,
+                "Git archive changed during committed source emission",
+            ):
+                module.run(
+                    fixture.root,
+                    output,
+                    offline=True,
+                    archive_dir=fixture.archives,
+                )
+
+        self.assertEqual(read_count, 2)
+        self.assertFalse(output.exists())
+        self.assertEqual(list(fixture.outputs.glob(f".{output.name}.export-*")), [])
+
+    def test_extracted_validator_refuses_mutated_source_payload_config_and_extra_entries(self):
+        fixture = self.full_fixture("validator-mutations")
+        archive = fixture.root.parent / "validator.tar.gz"
+        result = self.full_export(fixture, archive)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        pristine = self.base / "validator pristine"
+        pristine.mkdir()
+        unpacked = subprocess.run(["tar", "-xzf", str(archive), "-C", str(pristine)],
+                                  text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(unpacked.returncode, 0, unpacked.stderr)
+        pristine_source = pristine / "pkcs11-scope-source"
+        cargo_home = self.base / "validator cargo home"
+        cargo_home.mkdir(mode=0o700)
+        mutations = (
+            ("source", lambda root: (root / "Cargo.toml").write_text("changed\n"),
+             "source export entry digest mismatch"),
+            ("payload", lambda root: (root / "third-party/offline/vendor/shared-0.1.0/src.rs")
+             .write_text("changed\n"), "payload"),
+            ("config", lambda root: (root / ".cargo/config.toml").write_text("[net]\n"),
+             "configuration custody"),
+            ("extra payload", lambda root: (root / "third-party/offline/extra").write_text("x"),
+             "payload"),
+            ("payload link", lambda root: (root / "third-party/offline/link")
+             .symlink_to("vendor"), "symbolic link"),
+            ("payload mode", lambda root: (root / "third-party/offline/vendor")
+             .chmod(0o700), "unsafe delivery mode"),
+        )
+        for index, (label, mutate, needle) in enumerate(mutations):
+            with self.subTest(label=label):
+                case = self.base / f"validator mutation {index}"
+                shutil.copytree(pristine_source, case, symlinks=True)
+                mutate(case)
+                refused = self.validate_full(case, cargo_home)
+                self.assert_refused(refused, needle)
+
+    def test_extracted_validator_refuses_competing_configs_and_build_environment(self):
+        fixture = self.full_fixture("validator-custody")
+        archive = fixture.root.parent / "custody.tar.gz"
+        result = self.full_export(fixture, archive)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        extracted = self.base / "custody extraction"
+        extracted.mkdir()
+        subprocess.run(["tar", "-xzf", str(archive), "-C", str(extracted)], check=True)
+        source = extracted / "pkcs11-scope-source"
+        cargo_home = self.base / "custody cargo home"
+        cargo_home.mkdir(mode=0o700)
+
+        config_cases = (
+            source / ".cargo/config",
+            source / "crates/ebpf/.cargo/config.toml",
+            source.parent / ".cargo/config.toml",
+            cargo_home / "config.toml",
+        )
+        for path in config_cases:
+            with self.subTest(config=str(path)):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("[net]\noffline = false\n")
+                refused = self.validate_full(source, cargo_home)
+                self.assert_refused(refused, "competing Cargo configuration")
+                path.unlink()
+
+        variables = (
+            "CARGO_HOME", "CARGO_TARGET_DIR", "CARGO_BUILD_TARGET", "RUSTFLAGS",
+            "CARGO_ENCODED_RUSTFLAGS", "CARGO_SOURCE_CRATES_IO_REPLACE_WITH",
+            "CARGO_BUILD_JOBS", "RUSTC", "RUSTC_WRAPPER", "RUSTDOCFLAGS",
+            "RUSTC_WORKSPACE_WRAPPER", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", "CC",
+            "CFLAGS", "P11SCOPE_PRODUCT_BUILD_MODE", "P11SCOPE_PREPARED_STABLE_CARGO",
+            "P11SCOPE_PREPARED_BPF_RUSTC", "P11SCOPE_PREPARED_PYTHON",
+            "P11SCOPE_SMALL_RING", "P11SCOPE_SMALL_STATE_MAPS", "P11SCOPE_SMALL_MAPS",
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER", "CC_X86_64_UNKNOWN_LINUX_GNU",
+            "CFLAGS_x86_64_unknown_linux_gnu", "HOST_CC", "TARGET_CC", "HOST_CFLAGS",
+            "TARGET_CFLAGS",
+        )
+        for variable in variables:
+            with self.subTest(variable=variable):
+                refused = self.validate_full(source, cargo_home, environment={variable: "set"})
+                self.assert_refused(refused, "refusing inherited build environment", variable)
+
+    def test_extracted_validator_revalidates_contained_direct_source_symlinks(self):
+        fixture = self.full_fixture("source-symlinks")
+        pristine = self.extracted_full(fixture, "source-symlink-pristine")
+        cargo_home = self.base / "source symlink cargo home"
+        cargo_home.mkdir(mode=0o700)
+        valid = self.base / "valid source symlink"
+        shutil.copytree(pristine, valid, symlinks=True)
+        self.add_symlink_row(valid, "VALID-LINK", "Cargo.toml")
+        accepted = self.validate_full(valid, cargo_home)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+        cases = (
+            ("absolute", "/etc/passwd", None),
+            ("escape", "../outside", None),
+            ("dangling", "missing", None),
+            ("chain", "SECOND-LINK", "Cargo.toml"),
+            ("directory", "crates", None),
+        )
+        for index, (label, target, chained_target) in enumerate(cases):
+            with self.subTest(label=label):
+                case = self.base / f"source symlink {index}"
+                shutil.copytree(pristine, case, symlinks=True)
+                if chained_target is not None:
+                    self.add_symlink_row(case, "SECOND-LINK", chained_target)
+                self.add_symlink_row(case, "BAD-LINK", target)
+                refused = self.validate_full(case, cargo_home)
+                self.assert_refused(refused, "unsafe", "symlink")
+
+    def test_extracted_validator_rejects_non_integer_schema_and_size(self):
+        fixture = self.full_fixture("json-numbers")
+        pristine = self.extracted_full(fixture, "json-number-pristine")
+        cargo_home = self.base / "json number cargo home"
+        cargo_home.mkdir(mode=0o700)
+        schema = self.base / "float schema"
+        shutil.copytree(pristine, schema, symlinks=True)
+        manifest_path = schema / EXPORT_MANIFEST
+        manifest = json.loads(manifest_path.read_text())
+        manifest["schema_version"] = 2.0
+        manifest_path.write_text(json.dumps(manifest) + "\n")
+        size = self.base / "boolean size"
+        shutil.copytree(pristine, size, symlinks=True)
+        (size / "one-byte").write_bytes(b"x")
+        (size / "one-byte").chmod(0o644)
+        manifest_path = size / EXPORT_MANIFEST
+        manifest = json.loads(manifest_path.read_text())
+        manifest["source_entries"].append({
+            "path": "one-byte", "kind": "file", "mode": "0644", "size": True,
+            "sha256": hashlib.sha256(b"x").hexdigest(),
+        })
+        manifest_path.write_text(json.dumps(manifest) + "\n")
+        for case in (schema, size):
+            with self.subTest(case=case.name):
+                refused = self.validate_full(case, cargo_home)
+                self.assert_refused(refused, "source export")
+
+    def test_extracted_validator_binds_fixed_recipe_workspace_and_preparation_inputs(self):
+        fixture = self.full_fixture("fixed-inputs")
+        pristine = self.extracted_full(fixture, "fixed-input-pristine")
+        cargo_home = self.base / "fixed input cargo home"
+        cargo_home.mkdir(mode=0o700)
+        cases = (
+            ("root manifest", "Cargo.toml", "workspace lock or manifest"),
+            ("root lock", "Cargo.lock", "workspace lock or manifest"),
+            ("bpf manifest", "crates/ebpf/Cargo.toml", "workspace lock or manifest"),
+            ("bpf lock", "crates/ebpf/Cargo.lock", "workspace lock or manifest"),
+            ("sources", "third-party/sources.json", "sources manifest"),
+            ("patch", "third-party/patches/demo-1.0.0/value.patch", "package recipe"),
+        )
+        for index, (label, relative, needle) in enumerate(cases):
+            with self.subTest(label=label):
+                case = self.base / f"fixed input {index}"
+                shutil.copytree(pristine, case, symlinks=True)
+                target = case / relative
+                target.write_bytes(target.read_bytes() + b"\n")
+                self.update_source_row(case, relative)
+                refused = self.validate_full(case, cargo_home)
+                self.assert_refused(refused, needle)
 
 
 if __name__ == "__main__":

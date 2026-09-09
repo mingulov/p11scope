@@ -18,6 +18,7 @@ import tarfile
 import tempfile
 import tomllib
 import unittest
+from types import SimpleNamespace
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -608,6 +609,122 @@ class OfflineDependenciesTests(unittest.TestCase):
         self.assertTrue(parsed["net"]["offline"])
         with self.assertRaises(module.OfflineDependencyError):
             module.replacement_config(relocated, shared, vendor_path="../vendor")
+
+    def test_git_free_v2_source_identity_is_accepted_by_real_verify_and_returns_receipt(self):
+        self.fixture.assemble()
+        self.fixture.approve()
+        association = {
+            "payload_path": "third-party/offline",
+            "recipe_path": "third-party/offline-dependencies.json",
+            "recipe_sha256": digest(
+                (self.fixture.root / "third-party/offline-dependencies.json").read_bytes()
+            ),
+            "payload_tree_sha256": json.loads(self.fixture.candidate.read_text())[
+                "payload_tree_sha256"
+            ],
+            "config_path": ".cargo/config.toml",
+            "config_sha256": "2" * 64,
+        }
+        self.fixture.export_manifest.write_text(json.dumps({
+            "schema_version": 2, "revision": "1" * 40,
+            "source_entries": [], "archives": [],
+            "offline_dependencies": association,
+        }) + "\n", encoding="utf-8")
+        module = load_module(self.root_helper, "offline_dependency_v2_receipt")
+        options = SimpleNamespace(
+            payload=self.fixture.output,
+            nightly_rustc=self.fixture.tools / "nightly rustc",
+            prefix=self.fixture.prefix.parent / "v2 direct receipt",
+        )
+
+        receipt = module.verify(self.fixture.root, options, self.fixture.preparer)
+
+        self.assertEqual(receipt["project_source"]["kind"], "source-export")
+        self.assertEqual(receipt["project_source"]["revision"], "1" * 40)
+        self.assertEqual(receipt["payload_tree_sha256"], association["payload_tree_sha256"])
+
+    def test_v2_source_identity_refuses_open_or_malformed_association_and_unknown_schema(self):
+        self.fixture.assemble()
+        self.fixture.approve()
+        valid = {
+            "schema_version": 2, "revision": "1" * 40,
+            "source_entries": [], "archives": [],
+            "offline_dependencies": {
+                "payload_path": "third-party/offline",
+                "recipe_path": "third-party/offline-dependencies.json",
+                "recipe_sha256": "0" * 64,
+                "payload_tree_sha256": "1" * 64,
+                "config_path": ".cargo/config.toml",
+                "config_sha256": "2" * 64,
+            },
+        }
+        mutations = []
+        missing = json.loads(json.dumps(valid))
+        del missing["offline_dependencies"]["config_sha256"]
+        mutations.append(("missing", missing))
+        additional = json.loads(json.dumps(valid))
+        additional["offline_dependencies"]["extra"] = "value"
+        mutations.append(("additional", additional))
+        wrong_type = json.loads(json.dumps(valid))
+        wrong_type["offline_dependencies"]["payload_path"] = 7
+        mutations.append(("wrong type", wrong_type))
+        unknown = json.loads(json.dumps(valid))
+        unknown["schema_version"] = 3
+        mutations.append(("unknown schema", unknown))
+
+        module = load_module(self.root_helper, "offline_dependency_v2_refusals")
+        for label, manifest in mutations:
+            with self.subTest(label=label):
+                self.fixture.export_manifest.write_text(json.dumps(manifest) + "\n")
+                with self.assertRaisesRegex(
+                    module.OfflineDependencyError, "source export manifest"
+                ):
+                    module._project_source_identity(self.fixture.root)
+
+    def test_real_verify_rejects_non_integer_export_and_recipe_schema_versions(self):
+        self.fixture.assemble()
+        self.fixture.approve()
+        v1 = {
+            "schema_version": 1, "revision": "1" * 40,
+            "source_entries": [], "archives": [],
+        }
+        association = {
+            "payload_path": "third-party/offline",
+            "recipe_path": "third-party/offline-dependencies.json",
+            "recipe_sha256": "0" * 64,
+            "payload_tree_sha256": json.loads(self.fixture.candidate.read_text())[
+                "payload_tree_sha256"
+            ],
+            "config_path": ".cargo/config.toml",
+            "config_sha256": "2" * 64,
+        }
+        exports = []
+        boolean_v1 = dict(v1)
+        boolean_v1["schema_version"] = True
+        exports.append(("boolean v1", boolean_v1))
+        float_v2 = dict(v1)
+        float_v2.update({"schema_version": 2.0, "offline_dependencies": association})
+        exports.append(("float v2", float_v2))
+        string_v1 = dict(v1)
+        string_v1["schema_version"] = "1"
+        exports.append(("string v1", string_v1))
+        for index, (label, manifest) in enumerate(exports):
+            with self.subTest(label=label):
+                self.fixture.export_manifest.write_text(json.dumps(manifest) + "\n")
+                result = self.fixture.run(
+                    "verify", prefix=self.fixture.prefix.parent / f"numeric export {index}"
+                )
+                self.assert_refused(result, "source export manifest")
+
+        self.fixture.export_manifest.write_text(json.dumps(v1) + "\n")
+        recipe_path = self.fixture.root / "third-party/offline-dependencies.json"
+        recipe = json.loads(recipe_path.read_text())
+        recipe["schema_version"] = True
+        recipe_path.write_text(json.dumps(recipe) + "\n")
+        result = self.fixture.run(
+            "verify", prefix=self.fixture.prefix.parent / "numeric recipe"
+        )
+        self.assert_refused(result, "fixed recipe")
 
     @property
     def root_helper(self):

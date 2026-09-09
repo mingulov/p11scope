@@ -12,6 +12,8 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import shutil
+import stat
+from types import SimpleNamespace
 import subprocess
 import sys
 import tarfile
@@ -21,6 +23,32 @@ import tempfile
 ARCHIVE_ROOT = "pkcs11-scope-source"
 EXPORT_MANIFEST = ".p11scope-source-export.json"
 SCHEMA_VERSION = 1
+FULL_SCHEMA_VERSION = 2
+OFFLINE_PAYLOAD_PATH = "third-party/offline"
+OFFLINE_RECIPE_PATH = "third-party/offline-dependencies.json"
+OFFLINE_CONFIG_PATH = ".cargo/config.toml"
+OFFLINE_ASSOCIATION_FIELDS = {
+    "payload_path", "recipe_path", "recipe_sha256", "payload_tree_sha256",
+    "config_path", "config_sha256",
+}
+REFUSED_ENVIRONMENT = {
+    "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_TARGET_DIR", "CARGO_BUILD_TARGET",
+    "CARGO_HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", "RUSTC", "RUSTC_WRAPPER",
+    "RUSTC_WORKSPACE_WRAPPER", "CC", "CFLAGS", "P11SCOPE_PRODUCT_BUILD_MODE",
+    "P11SCOPE_PREPARED_STABLE_CARGO", "P11SCOPE_PREPARED_STABLE_RUSTC",
+    "P11SCOPE_PREPARED_BPF_CARGO", "P11SCOPE_PREPARED_BPF_RUSTC",
+    "P11SCOPE_SMALL_RING", "P11SCOPE_SMALL_STATE_MAPS",
+}
+
+
+def _refused_environment(name: str) -> bool:
+    return (name in REFUSED_ENVIRONMENT or name.startswith("CARGO_SOURCE_")
+            or name.startswith("CARGO_BUILD_") or name.startswith("CARGO_TARGET_")
+            or name.startswith("CC_") or name.startswith("CFLAGS_")
+            or name in {"HOST_CC", "TARGET_CC", "HOST_CFLAGS", "TARGET_CFLAGS"}
+            or name.startswith("RUST")
+            or name.startswith("P11SCOPE_PREPARED_")
+            or name.startswith("P11SCOPE_SMALL_"))
 
 
 class ExportError(Exception):
@@ -39,6 +67,23 @@ def _load_preparer(root: Path):
         spec.loader.exec_module(module)
     except (OSError, ImportError) as error:
         raise ExportError(f"cannot load dependency preparer {path}: {error}") from error
+    finally:
+        sys.dont_write_bytecode = previous
+    return module
+
+
+def _load_offline_helper(root: Path):
+    path = root / "scripts/offline-dependencies.py"
+    spec = importlib.util.spec_from_file_location("p11scope_export_offline", path)
+    if spec is None or spec.loader is None:
+        raise ExportError(f"cannot load offline dependency helper {path}")
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec.loader.exec_module(module)
+    except (OSError, ImportError) as error:
+        raise ExportError(f"cannot load offline dependency helper {path}: {error}") from error
     finally:
         sys.dont_write_bytecode = previous
     return module
@@ -243,9 +288,48 @@ def _reject_generated_collisions(tracked: dict[str, tuple[str, str]],
                 )
 
 
+def _verified_payload_directory(path: Path) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise ExportError(f"payload directory unavailable during streaming: {path}: {error}") from error
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o755:
+        raise ExportError(f"payload directory mode or type changed during streaming: {path}")
+
+
+def _verified_payload_bytes(path: Path, executable_bits: int, expected_digest: str) -> bytes:
+    expected_mode = 0o755 if executable_bits else 0o644
+    try:
+        before = path.lstat()
+        if (not stat.S_ISREG(before.st_mode)
+                or stat.S_IMODE(before.st_mode) != expected_mode):
+            raise ExportError(f"payload file mode or type changed during streaming: {path}")
+        content = path.read_bytes()
+        after = path.lstat()
+    except ExportError:
+        raise
+    except OSError as error:
+        raise ExportError(f"payload file unavailable during streaming: {path}: {error}") from error
+    identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mode)
+    identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mode)
+    if (identity_before != identity_after or not stat.S_ISREG(after.st_mode)
+            or stat.S_IMODE(after.st_mode) != expected_mode):
+        raise ExportError(f"payload file mode or identity changed during streaming: {path}")
+    actual_digest = hashlib.sha256(content).hexdigest()
+    if actual_digest != expected_digest:
+        raise ExportError(
+            f"payload file digest changed during streaming: {path}: "
+            f"expected {expected_digest}, got {actual_digest}"
+        )
+    return content
+
+
 def _build_archive(root: Path, revision: str, tracked: dict[str, tuple[str, str]],
                    originals: list[tuple[dict, Path]], destination: Path,
-                   environment: dict[str, str]) -> None:
+                   environment: dict[str, str], *, payload: Path | None = None,
+                   payload_inventory: list[tuple[str, str, int, str]] | None = None,
+                   config: bytes | None = None,
+                   offline_association: dict[str, str] | None = None) -> None:
     source_tar = destination.parent / "committed-source.tar"
     with source_tar.open("xb") as stream:
         result = subprocess.run(
@@ -260,6 +344,10 @@ def _build_archive(root: Path, revision: str, tracked: dict[str, tuple[str, str]
     source_entries = []
     archive_entries = []
     symlink_targets = {}
+    payload_records = ({relative: (kind, executable_bits, digest)
+                        for relative, kind, executable_bits, digest in payload_inventory}
+                       if payload_inventory is not None else {})
+    payload_archive_bytes = {}
     with source_tar.open("rb") as source_stream, tarfile.open(fileobj=source_stream, mode="r:") as source:
         members = source.getmembers()
         for member in members:
@@ -320,19 +408,35 @@ def _build_archive(root: Path, revision: str, tracked: dict[str, tuple[str, str]
             detail = missing[0] if missing else unexpected[0]
             raise ExportError(f"Git archive does not exactly match tracked source: {detail}")
         for record, path in originals:
-            content = path.read_bytes()
+            if payload is None:
+                content = path.read_bytes()
+            else:
+                relative = path.relative_to(payload).as_posix()
+                admitted = payload_records.get(relative)
+                if admitted is None or admitted[0] != "file":
+                    raise ExportError(f"payload archive is absent from retained inventory: {relative}")
+                content = _verified_payload_bytes(path, admitted[1], admitted[2])
+                payload_archive_bytes[relative] = content
             archive_entries.append({
-                "path": f"third-party/archives/{record['name']}-{record['version']}.crate",
+                "path": (
+                    f"{OFFLINE_PAYLOAD_PATH}/archives/{record['name']}-{record['version']}.crate"
+                    if payload is not None else
+                    f"third-party/archives/{record['name']}-{record['version']}.crate"
+                ),
                 "size": len(content),
                 "sha256": hashlib.sha256(content).hexdigest(),
             })
 
         export_manifest = {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": FULL_SCHEMA_VERSION if payload is not None else SCHEMA_VERSION,
             "revision": revision,
             "source_entries": sorted(source_entries, key=lambda item: item["path"].encode()),
             "archives": sorted(archive_entries, key=lambda item: item["path"].encode()),
         }
+        if payload is not None:
+            if config is None or offline_association is None or payload_inventory is None:
+                raise ExportError("full export inputs are incomplete")
+            export_manifest["offline_dependencies"] = offline_association
         manifest_bytes = (json.dumps(
             export_manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False
         ) + "\n").encode()
@@ -352,28 +456,80 @@ def _build_archive(root: Path, revision: str, tracked: dict[str, tuple[str, str]
                                 raise ExportError(f"cannot reread committed source entry: {member.name}")
                             with stream:
                                 content = stream.read()
-                            git_mode = tracked[path.as_posix()][0]
+                            git_mode, git_object = tracked[path.as_posix()]
+                            archive_mode = "100755" if member.mode & 0o111 else "100644"
+                            expected_tar_mode = 0o775 if git_mode == "100755" else 0o664
+                            if (archive_mode != git_mode or member.mode != expected_tar_mode
+                                    or _git_blob_id(content) != git_object):
+                                raise ExportError(
+                                    "Git archive changed during committed source emission: "
+                                    f"{path.as_posix()}"
+                                )
                             _add_bytes(output, name, content,
                                        0o755 if git_mode == "100755" else 0o644)
                         else:
                             _add_symlink(output, name, symlink_targets[path.as_posix()])
                     known_directories = {member.name.rstrip("/") for member in members if member.isdir()}
-                    for directory in ("third-party", "third-party/archives"):
-                        if directory not in known_directories:
-                            output.addfile(_tar_info(f"{ARCHIVE_ROOT}/{directory}", 0o755, directory=True))
-                    ordered_originals = sorted(
-                        originals,
-                        key=lambda pair: (
-                            f"third-party/archives/{pair[0]['name']}-{pair[0]['version']}.crate"
-                        ).encode(),
+                    generated_directories = (
+                        ("third-party", OFFLINE_PAYLOAD_PATH, ".cargo")
+                        if payload is not None else ("third-party", "third-party/archives")
                     )
-                    for item, (_record, path) in zip(export_manifest["archives"], ordered_originals):
-                        _add_bytes(output, f"{ARCHIVE_ROOT}/{item['path']}", path.read_bytes())
+                    for directory in generated_directories:
+                        if directory not in known_directories:
+                            if directory == OFFLINE_PAYLOAD_PATH:
+                                assert payload is not None
+                                _verified_payload_directory(payload)
+                            output.addfile(_tar_info(f"{ARCHIVE_ROOT}/{directory}", 0o755, directory=True))
+                    if payload is None:
+                        ordered_originals = sorted(
+                            originals,
+                            key=lambda pair: (
+                                f"third-party/archives/{pair[0]['name']}-{pair[0]['version']}.crate"
+                            ).encode(),
+                        )
+                        for item, (_record, path) in zip(export_manifest["archives"], ordered_originals):
+                            _add_bytes(output, f"{ARCHIVE_ROOT}/{item['path']}", path.read_bytes())
+                    else:
+                        for relative, kind, executable_bits, _digest in payload_inventory:
+                            name = f"{ARCHIVE_ROOT}/{OFFLINE_PAYLOAD_PATH}/{relative}"
+                            if kind == "directory":
+                                _verified_payload_directory(payload / relative)
+                                output.addfile(_tar_info(name, 0o755, directory=True))
+                            else:
+                                content = payload_archive_bytes.get(relative)
+                                if content is None:
+                                    content = _verified_payload_bytes(
+                                        payload / relative, executable_bits, _digest
+                                    )
+                                _add_bytes(output, name, content,
+                                           0o755 if executable_bits else 0o644)
+                        _add_bytes(output, f"{ARCHIVE_ROOT}/{OFFLINE_CONFIG_PATH}", config)
                     _add_bytes(output, f"{ARCHIVE_ROOT}/{EXPORT_MANIFEST}", manifest_bytes)
     os.chmod(destination, 0o644)
 
 
-def run(root: Path, output: Path, *, offline: bool, archive_dir: Path | None) -> None:
+def _verify_payload(helper, root: Path, payload: Path, nightly_rustc: Path,
+                    prefix: Path, preparer) -> dict:
+    try:
+        return helper.verify(root, SimpleNamespace(
+            payload=payload, nightly_rustc=nightly_rustc, prefix=prefix
+        ), preparer)
+    except helper.OfflineDependencyError as error:
+        raise ExportError(f"offline dependency payload: {error}") from error
+
+
+def _delivered_cargo_config_paths(root: Path) -> set[Path]:
+    paths = set()
+    current = root / "crates/ebpf"
+    while True:
+        paths.update((current / ".cargo/config", current / ".cargo/config.toml"))
+        if current == root:
+            return paths
+        current = current.parent
+
+
+def run(root: Path, output: Path, *, offline: bool, archive_dir: Path | None,
+        offline_payload: Path | None = None, nightly_rustc: Path | None = None) -> None:
     root = root.resolve()
     output = _validate_output(root, output)
     environment = _git_environment(root)
@@ -384,6 +540,11 @@ def run(root: Path, output: Path, *, offline: bool, archive_dir: Path | None) ->
          "third-party/sources.json"},
         revision,
     )
+    full_mode = offline_payload is not None or nightly_rustc is not None
+    if (offline_payload is None) != (nightly_rustc is None):
+        raise ExportError("offline-payload and nightly-rustc must be supplied together")
+    if full_mode and archive_dir is not None:
+        raise ExportError("archive-dir is not accepted in full export mode")
     preparer = _load_preparer(root)
     try:
         manifest = preparer.load_manifest(root)
@@ -391,32 +552,110 @@ def run(root: Path, output: Path, *, offline: bool, archive_dir: Path | None) ->
         raise ExportError(str(error)) from error
     _require_regular_inputs(tracked, _required_inputs(manifest), revision)
     archive_targets = [
-        f"third-party/archives/{record['name']}-{record['version']}.crate"
+        (f"{OFFLINE_PAYLOAD_PATH}/archives/" if full_mode else "third-party/archives/")
+        + f"{record['name']}-{record['version']}.crate"
         for record in manifest["packages"]
     ]
     if len(archive_targets) != len(set(archive_targets)):
         duplicate = next(path for path in archive_targets if archive_targets.count(path) > 1)
         raise ExportError(f"duplicate embedded archive destination: {duplicate}")
-    _reject_generated_collisions(tracked, [EXPORT_MANIFEST, *archive_targets])
+    if full_mode:
+        _require_regular_inputs(tracked, {
+            "scripts/offline-dependencies.py", "scripts/check-prepared-dependencies.py",
+            OFFLINE_RECIPE_PATH,
+        }, revision)
+        _reject_generated_collisions(
+            tracked, [EXPORT_MANIFEST, OFFLINE_PAYLOAD_PATH, OFFLINE_CONFIG_PATH]
+        )
+        delivered_configs = {
+            path.relative_to(root).as_posix()
+            for path in _delivered_cargo_config_paths(root)
+        }
+        competing = sorted(delivered_configs & set(tracked), key=os.fsencode)
+        if competing:
+            raise ExportError(f"competing Cargo configuration: {competing[0]}")
+        _reject_generated_collisions(tracked, sorted(delivered_configs, key=os.fsencode))
+    else:
+        _reject_generated_collisions(tracked, [EXPORT_MANIFEST, *archive_targets])
 
     stage = Path(tempfile.mkdtemp(prefix=f".{output.name}.export-", dir=output.parent))
     try:
-        acquisition = stage / "originals"
-        acquisition.mkdir(mode=0o700)
         originals = []
-        try:
+        staged_payload = None
+        inventory = None
+        config = None
+        association = None
+        helper = None
+        if full_mode:
+            assert offline_payload is not None and nightly_rustc is not None
+            helper = _load_offline_helper(root)
+            input_receipt = _verify_payload(
+                helper, root, offline_payload, nightly_rustc, stage / "input", preparer
+            )
+            try:
+                helper.payload_inventory(offline_payload)
+                staged_payload = stage / "private-payload"
+                shutil.copytree(offline_payload, staged_payload, symlinks=True)
+            except (OSError, helper.OfflineDependencyError) as error:
+                raise ExportError(f"cannot stage safe offline dependency payload: {error}") from error
+            staged_receipt = _verify_payload(
+                helper, root, staged_payload, nightly_rustc, stage / "staged", preparer
+            )
+            if staged_receipt["payload_tree_sha256"] != input_receipt["payload_tree_sha256"]:
+                raise ExportError("offline dependency payload changed while staging")
+            inventory = helper.payload_inventory(staged_payload)
             for record in manifest["packages"]:
-                path = preparer._obtain_archive(
-                    root, archive_dir, record, offline, acquisition
-                )
-                originals.append((record, path))
-        except preparer.PreparationError as error:
-            raise ExportError(str(error)) from error
+                originals.append((
+                    record,
+                    staged_payload / "archives" / f"{record['name']}-{record['version']}.crate",
+                ))
+            recipe_bytes = (root / OFFLINE_RECIPE_PATH).read_bytes()
+            recipe = helper._read_json(root / OFFLINE_RECIPE_PATH, "fixed recipe")
+            config = helper.replacement_config(
+                staged_payload, recipe["shared_git"],
+                vendor_path=f"{OFFLINE_PAYLOAD_PATH}/vendor",
+            )
+            association = {
+                "payload_path": OFFLINE_PAYLOAD_PATH,
+                "recipe_path": OFFLINE_RECIPE_PATH,
+                "recipe_sha256": hashlib.sha256(recipe_bytes).hexdigest(),
+                "payload_tree_sha256": staged_receipt["payload_tree_sha256"],
+                "config_path": OFFLINE_CONFIG_PATH,
+                "config_sha256": hashlib.sha256(config).hexdigest(),
+            }
+        else:
+            acquisition = stage / "originals"
+            acquisition.mkdir(mode=0o700)
+            try:
+                for record in manifest["packages"]:
+                    path = preparer._obtain_archive(
+                        root, archive_dir, record, offline, acquisition
+                    )
+                    originals.append((record, path))
+            except preparer.PreparationError as error:
+                raise ExportError(str(error)) from error
         current_revision, current_tracked = _repository_state(root, environment)
         if current_revision != revision or current_tracked != tracked:
             raise ExportError("source repository identity changed during export")
         built = stage / "completed.tar.gz"
-        _build_archive(root, revision, tracked, originals, built, environment)
+        try:
+            _build_archive(
+                root, revision, tracked, originals, built, environment,
+                payload=staged_payload, payload_inventory=inventory, config=config,
+                offline_association=association,
+            )
+        except OSError as error:
+            raise ExportError(f"cannot stream source export: {error}") from error
+        if full_mode:
+            assert helper is not None and staged_payload is not None and nightly_rustc is not None
+            final_receipt = _verify_payload(
+                helper, root, staged_payload, nightly_rustc, stage / "final", preparer
+            )
+            if final_receipt["payload_tree_sha256"] != association["payload_tree_sha256"]:
+                raise ExportError("offline dependency payload changed during archive streaming")
+            final_revision, final_tracked = _repository_state(root, environment)
+            if final_revision != revision or final_tracked != tracked:
+                raise ExportError("source repository identity changed during export")
         try:
             os.link(built, output, follow_symlinks=False)
         except FileExistsError as error:
@@ -425,17 +664,281 @@ def run(root: Path, output: Path, *, offline: bool, archive_dir: Path | None) ->
         shutil.rmtree(stage, ignore_errors=True)
 
 
+def _validate_absolute_directory(path: Path, label: str) -> Path:
+    if not path.is_absolute() or Path(os.path.normpath(str(path))) != path:
+        raise ExportError(f"{label} must be a normalized absolute path")
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise ExportError(f"{label} is unavailable: {error}") from error
+    if not stat.S_ISDIR(metadata.st_mode) or path.resolve() != path:
+        raise ExportError(f"{label} must be a real directory without symbolic links")
+    return path
+
+
+def _validate_source_entries(root: Path, records: object) -> dict[str, dict]:
+    if not isinstance(records, list):
+        raise ExportError("source export manifest source_entries must be an array")
+    expected = {}
+    for record in records:
+        if not isinstance(record, dict) or not isinstance(record.get("kind"), str):
+            raise ExportError("source export manifest contains malformed source entry")
+        kind = record["kind"]
+        fields = {"path", "kind", "mode", "size", "sha256"}
+        if kind == "symlink":
+            fields.add("target")
+        if (set(record) != fields or not isinstance(record.get("path"), str)
+                or not isinstance(record.get("mode"), str)
+                or type(record.get("size")) is not int or record["size"] < 0
+                or not isinstance(record.get("sha256"), str)
+                or len(record["sha256"]) != 64
+                or any(character not in "0123456789abcdef" for character in record["sha256"])):
+            raise ExportError("source export manifest contains malformed source entry")
+        path = _source_path(record["path"])
+        relative = path.as_posix()
+        if (relative == EXPORT_MANIFEST or relative == OFFLINE_CONFIG_PATH
+                or relative == OFFLINE_PAYLOAD_PATH
+                or relative.startswith(OFFLINE_PAYLOAD_PATH + "/")):
+            raise ExportError(f"generated payload/config must not be a source entry: {relative}")
+        if relative in expected:
+            raise ExportError(f"duplicate source export entry: {relative}")
+        target = root / relative
+        try:
+            metadata = target.lstat()
+        except OSError as error:
+            raise ExportError(f"missing source export entry {relative}: {error}") from error
+        if kind == "file":
+            if not stat.S_ISREG(metadata.st_mode) or record["mode"] not in ("0644", "0755"):
+                raise ExportError(f"source export entry type or mode mismatch: {relative}")
+            mode = "0755" if stat.S_IMODE(metadata.st_mode) == 0o755 else "0644"
+            if stat.S_IMODE(metadata.st_mode) not in (0o644, 0o755) or mode != record["mode"]:
+                raise ExportError(f"source export entry type or mode mismatch: {relative}")
+            content = target.read_bytes()
+        elif kind == "symlink":
+            if (not stat.S_ISLNK(metadata.st_mode) or record["mode"] != "120000"
+                    or not isinstance(record.get("target"), str)):
+                raise ExportError(f"source export entry type or mode mismatch: {relative}")
+            link = os.readlink(target)
+            if link != record["target"]:
+                raise ExportError(f"source export symlink target mismatch: {relative}")
+            content = link.encode("utf-8")
+        else:
+            raise ExportError(f"unsupported source export entry kind: {relative}")
+        if (len(content) != record["size"]
+                or hashlib.sha256(content).hexdigest() != record["sha256"]):
+            raise ExportError(f"source export entry digest mismatch: {relative}")
+        expected[relative] = record
+
+    actual = set()
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = sorted(os.scandir(directory), key=lambda item: os.fsencode(item.name))
+        except OSError as error:
+            raise ExportError(f"cannot scan extracted source {directory}: {error}") from error
+        for entry in entries:
+            path = Path(entry.path)
+            relative = path.relative_to(root).as_posix()
+            if relative == EXPORT_MANIFEST or relative == OFFLINE_CONFIG_PATH:
+                continue
+            if relative == OFFLINE_PAYLOAD_PATH:
+                continue
+            metadata = path.lstat()
+            if stat.S_ISDIR(metadata.st_mode):
+                pending.append(path)
+            elif stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+                actual.add(relative)
+            else:
+                raise ExportError(f"unsafe extracted source entry type: {relative}")
+    if actual != set(expected):
+        difference = sorted(actual ^ set(expected), key=os.fsencode)
+        raise ExportError(f"source export entries do not exactly match extraction: {difference[0]}")
+    tracked = {
+        relative: (
+            "120000" if record["kind"] == "symlink" else
+            "100755" if record["mode"] == "0755" else "100644",
+            "",
+        )
+        for relative, record in expected.items()
+    }
+    for relative, record in expected.items():
+        if record["kind"] == "symlink":
+            _validated_symlink_target(PurePosixPath(relative), record["target"], tracked)
+    return expected
+
+
+def _cargo_config_paths(root: Path, cargo_home: Path | None) -> set[Path]:
+    paths = _delivered_cargo_config_paths(root)
+    current = root.parent
+    while True:
+        paths.update((current / ".cargo/config", current / ".cargo/config.toml"))
+        if current.parent == current:
+            break
+        current = current.parent
+    if cargo_home is not None:
+        paths.update((cargo_home / "config", cargo_home / "config.toml",
+                      cargo_home / ".cargo/config", cargo_home / ".cargo/config.toml"))
+    return paths
+
+
+def validate_extracted(root: Path, cargo_home: Path | None = None) -> dict:
+    """Validate one extracted schema-v2 source export without Git."""
+    root = _validate_absolute_directory(root, "extracted source root")
+    if cargo_home is not None:
+        cargo_home = _validate_absolute_directory(cargo_home, "fresh Cargo home")
+    inherited = sorted(key for key, value in os.environ.items()
+                       if value and _refused_environment(key))
+    if inherited:
+        raise ExportError(f"refusing inherited build environment: {inherited[0]}")
+    allowed_config = root / OFFLINE_CONFIG_PATH
+    for path in sorted(_cargo_config_paths(root, cargo_home), key=lambda item: os.fsencode(str(item))):
+        if os.path.lexists(path) and path != allowed_config:
+            raise ExportError(f"competing Cargo configuration: {path}")
+
+    helper = _load_offline_helper(root)
+    preparer = _load_preparer(root)
+    manifest_path = root / EXPORT_MANIFEST
+    try:
+        manifest_metadata = manifest_path.lstat()
+    except OSError as error:
+        raise ExportError(f"source export manifest is unavailable: {error}") from error
+    if (not stat.S_ISREG(manifest_metadata.st_mode)
+            or stat.S_IMODE(manifest_metadata.st_mode) != 0o644):
+        raise ExportError("source export manifest has unsafe type or mode")
+    try:
+        manifest = helper._read_json(manifest_path, "source export manifest")
+    except helper.OfflineDependencyError as error:
+        raise ExportError(str(error)) from error
+    top = {"schema_version", "revision", "source_entries", "archives",
+           "offline_dependencies"}
+    if (not isinstance(manifest, dict) or set(manifest) != top
+            or type(manifest.get("schema_version")) is not int
+            or manifest["schema_version"] != FULL_SCHEMA_VERSION
+            or not isinstance(manifest.get("revision"), str)
+            or len(manifest["revision"]) != 40
+            or any(character not in "0123456789abcdef" for character in manifest["revision"])
+            or not isinstance(manifest.get("archives"), list)):
+        raise ExportError("source export manifest is not exact schema v2")
+    association = manifest["offline_dependencies"]
+    if (not isinstance(association, dict) or set(association) != OFFLINE_ASSOCIATION_FIELDS
+            or any(not isinstance(value, str) for value in association.values())
+            or association["payload_path"] != OFFLINE_PAYLOAD_PATH
+            or association["recipe_path"] != OFFLINE_RECIPE_PATH
+            or association["config_path"] != OFFLINE_CONFIG_PATH
+            or any(len(association[field]) != 64
+                   or any(character not in "0123456789abcdef" for character in association[field])
+                   for field in ("recipe_sha256", "payload_tree_sha256", "config_sha256"))):
+        raise ExportError("source export offline_dependencies association is malformed")
+
+    source_records = _validate_source_entries(root, manifest["source_entries"])
+    recipe_path = root / OFFLINE_RECIPE_PATH
+    config_path = root / OFFLINE_CONFIG_PATH
+    payload = root / OFFLINE_PAYLOAD_PATH
+    if OFFLINE_RECIPE_PATH not in source_records:
+        raise ExportError("fixed recipe is not bound as committed source")
+    recipe_bytes = recipe_path.read_bytes()
+    if (hashlib.sha256(recipe_bytes).hexdigest() != association["recipe_sha256"]
+            or source_records[OFFLINE_RECIPE_PATH]["sha256"] != association["recipe_sha256"]):
+        raise ExportError("fixed recipe association digest mismatch")
+    try:
+        strict_manifest = helper._strict_manifest(root, preparer)
+        recipe = helper._validate_recipe(
+            helper._read_json(recipe_path, "fixed recipe"), strict_manifest, preparer, root
+        )
+        helper.check_fixed_recipe_inputs(root, recipe, strict_manifest, preparer)
+        inventory = helper.payload_inventory(payload)
+        payload_digest = helper.tree_content_digest(payload)
+    except helper.OfflineDependencyError as error:
+        raise ExportError(f"offline dependency payload: {error}") from error
+    if (payload_digest != association["payload_tree_sha256"]
+            or recipe["payload_tree_sha256"] != payload_digest):
+        raise ExportError("offline dependency payload association digest mismatch")
+
+    expected_archives = {}
+    for record in strict_manifest["packages"]:
+        relative = (f"{OFFLINE_PAYLOAD_PATH}/archives/"
+                    f"{record['name']}-{record['version']}.crate")
+        expected_archives[relative] = record["archive_sha256"]
+    observed_archives = {}
+    for record in manifest["archives"]:
+        if (not isinstance(record, dict) or set(record) != {"path", "size", "sha256"}
+                or not isinstance(record["path"], str)
+                or type(record["size"]) is not int or record["size"] < 0
+                or not isinstance(record["sha256"], str)):
+            raise ExportError("source export manifest contains malformed archive entry")
+        path = _source_path(record["path"]).as_posix()
+        if path in observed_archives:
+            raise ExportError(f"duplicate source export archive entry: {path}")
+        archive = root / path
+        try:
+            metadata = archive.lstat()
+            content = archive.read_bytes()
+        except OSError as error:
+            raise ExportError(f"cannot read embedded archive {path}: {error}") from error
+        if (not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o644
+                or len(content) != record["size"]
+                or hashlib.sha256(content).hexdigest() != record["sha256"]):
+            raise ExportError(f"embedded archive entry mismatch: {path}")
+        observed_archives[path] = record["sha256"]
+    if observed_archives != expected_archives:
+        raise ExportError("embedded archive set or digest mismatch")
+
+    try:
+        metadata = config_path.lstat()
+    except OSError as error:
+        raise ExportError(f"generated Cargo configuration is missing: {error}") from error
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o644:
+        raise ExportError("generated Cargo configuration has unsafe type or mode")
+    config = config_path.read_bytes()
+    try:
+        expected_config = helper.replacement_config(
+            payload, recipe["shared_git"], vendor_path=f"{OFFLINE_PAYLOAD_PATH}/vendor"
+        )
+    except helper.OfflineDependencyError as error:
+        raise ExportError(str(error)) from error
+    if (config != expected_config
+            or hashlib.sha256(config).hexdigest() != association["config_sha256"]):
+        raise ExportError("generated Cargo configuration custody mismatch")
+    return {"schema_version": FULL_SCHEMA_VERSION, "revision": manifest["revision"],
+            "manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+            "payload_tree_sha256": payload_digest, "payload_inventory": inventory}
+
+
 def main(arguments: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--output", type=Path)
     parser.add_argument("--offline", action="store_true", help="forbid archive downloads")
     parser.add_argument("--archive-dir", type=Path,
                         help="directory containing explicitly supplied .crate archives")
+    parser.add_argument("--offline-payload", type=Path,
+                        help="verified complete offline dependency payload")
+    parser.add_argument("--nightly-rustc", type=Path,
+                        help="selected pinned nightly rustc used to verify the payload")
+    parser.add_argument("--verify-extracted", type=Path,
+                        help="validate an extracted full source export")
+    parser.add_argument("--cargo-home", type=Path,
+                        help="fresh Cargo home whose configuration custody is checked")
     options = parser.parse_args(arguments)
     root = Path(__file__).resolve().parents[1]
     archive_dir = options.archive_dir.resolve() if options.archive_dir is not None else None
     try:
-        run(root, options.output, offline=options.offline, archive_dir=archive_dir)
+        if options.verify_extracted is not None:
+            if options.cargo_home is None:
+                raise ExportError("verify-extracted requires cargo-home")
+            if (options.output is not None or options.offline or options.archive_dir is not None
+                    or options.offline_payload is not None or options.nightly_rustc is not None):
+                raise ExportError("verify-extracted cannot be combined with export arguments")
+            validate_extracted(options.verify_extracted, options.cargo_home)
+        else:
+            if options.output is None:
+                raise ExportError("output is required for source export")
+            if options.cargo_home is not None:
+                raise ExportError("cargo-home is only accepted with verify-extracted")
+            run(
+                root, options.output, offline=options.offline, archive_dir=archive_dir,
+                offline_payload=options.offline_payload, nightly_rustc=options.nightly_rustc,
+            )
     except ExportError as error:
         print(f"export-source: refusal: {error}", file=sys.stderr)
         return 1

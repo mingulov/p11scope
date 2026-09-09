@@ -35,16 +35,44 @@ pub fn target_word_end(address: u64, layout: LinuxLayout) -> Option<u64> {
     }
 }
 
+pub const IA32_ARG_READ_FAILURE: u64 = 1u64 << 32;
+
+/// Address of one ia32 argument after the four-byte return address.
+#[inline(always)]
+pub fn ia32_arg_address(stack_pointer: u64, index: u32) -> Option<u64> {
+    if index > 6 {
+        return None;
+    }
+    let stack_pointer = stack_pointer & u32::MAX as u64;
+    let offset = (u64::from(index) + 1).checked_mul(4)?;
+    let address = stack_pointer.checked_add(offset)?;
+    target_word_end(address, LinuxLayout::Ilp32)?;
+    Some(address)
+}
+
+/// Execute the ia32 argument-read policy with a caller-supplied four-byte read.
+#[inline(always)]
+pub fn read_ia32_arg_with<F>(stack_pointer: u64, index: u32, read: F) -> u64
+where
+    F: FnOnce(u64) -> Result<u32, ()>,
+{
+    let Some(address) = ia32_arg_address(stack_pointer, index) else {
+        return IA32_ARG_READ_FAILURE;
+    };
+    match read(address) {
+        Ok(value) => u64::from(value),
+        Err(()) => IA32_ARG_READ_FAILURE,
+    }
+}
+
 /// Address of an ABI stack argument. LP64 places only argument seven here;
 /// ILP32 places all seven supported arguments after the return address.
 #[inline(always)]
 pub fn target_stack_arg_address(stack_pointer: u64, index: u8, layout: LinuxLayout) -> Option<u64> {
-    let offset = match layout {
-        LinuxLayout::Lp64 if index == 6 => 8,
-        LinuxLayout::Lp64 => return None,
-        LinuxLayout::Ilp32 if index <= 6 => (index as u64 + 1) * 4,
-        LinuxLayout::Ilp32 => return None,
-    };
+    if layout == LinuxLayout::Ilp32 {
+        return ia32_arg_address(stack_pointer, u32::from(index));
+    }
+    let offset = if index == 6 { 8 } else { return None };
     let address = normalize_target_word(stack_pointer, layout).checked_add(offset)?;
     target_word_end(address, layout)?;
     Some(address)
@@ -1219,6 +1247,64 @@ unsafe impl aya::Pod for FunctionNameKey {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::cell::Cell;
+
+    fn ia32_oracle(stack_pointer: u64, index: u32) -> Option<u64> {
+        if index > 6 {
+            return None;
+        }
+        let base = u128::from(stack_pointer & 0xffff_ffff);
+        let address = base + (u128::from(index) + 1) * 4;
+        (address + 3 <= 0xffff_ffff).then_some(address as u64)
+    }
+
+    #[test]
+    fn ia32_argument_reader_matches_literal_address_and_value_oracle() {
+        for stack_pointer in [0x1000, 0xaaaa_aaaa_0000_1000, u32::MAX as u64 - 31] {
+            for index in 0..=6 {
+                let expected_address = ia32_oracle(stack_pointer, index);
+                let calls = Cell::new(0);
+                let actual = read_ia32_arg_with(stack_pointer, index, |address| {
+                    calls.set(calls.get() + 1);
+                    assert_eq!(Some(address), expected_address);
+                    Ok(if index == 0 { 0 } else { u32::MAX })
+                });
+                assert_eq!(actual, if index == 0 { 0 } else { u32::MAX as u64 });
+                assert_eq!(calls.get(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn ia32_argument_reader_refuses_without_read_and_uses_exact_sentinel() {
+        for (stack_pointer, index) in [
+            (0x1000, 7),
+            (0x1000, u32::MAX),
+            (u32::MAX as u64 - 30, 6),
+            (0xffff_ffff_ffff_ffff, 0),
+        ] {
+            let calls = Cell::new(0);
+            let actual = read_ia32_arg_with(stack_pointer, index, |_| {
+                calls.set(calls.get() + 1);
+                Ok(0)
+            });
+            assert_eq!(actual, IA32_ARG_READ_FAILURE);
+            assert_eq!(calls.get(), 0);
+            assert_eq!(ia32_oracle(stack_pointer, index), None);
+        }
+    }
+
+    #[test]
+    fn ia32_argument_reader_propagates_read_failure_as_exact_sentinel() {
+        let calls = Cell::new(0);
+        let actual = read_ia32_arg_with(0x1000, 3, |address| {
+            calls.set(calls.get() + 1);
+            assert_eq!(address, 0x1010);
+            Err(())
+        });
+        assert_eq!(actual, IA32_ARG_READ_FAILURE);
+        assert_eq!(calls.get(), 1);
+    }
 
     #[test]
     fn target_layout_accepts_only_exact_conventional_selectors() {

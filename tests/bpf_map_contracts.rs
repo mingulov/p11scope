@@ -33,6 +33,28 @@ fn embedded_scalar_helpers_have_exact_linkage_btf_bodies_and_real_calls() {
         symbols.iter().any(|symbol| symbol == "p11_read_ia32_arg"),
         "embedded object must export p11_read_ia32_arg"
     );
+    let variant = if cfg!(feature = "unsafe-unvalidated-metadata") {
+        "diagnostic"
+    } else {
+        "default"
+    };
+    let mutations = Command::new("python3")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("P11SCOPE_IA32_OBJECT", &object)
+        .env("P11SCOPE_IA32_VARIANT", variant)
+        .args([
+            "-I",
+            "tests/python/test_bpf_map_defs.py",
+            "MapDefsTests.test_ia32_reader_linkage_signature_body_and_call",
+        ])
+        .output()
+        .expect("run actual ia32 reader object mutations");
+    assert!(
+        mutations.status.success(),
+        "actual ia32 reader mutations failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&mutations.stdout),
+        String::from_utf8_lossy(&mutations.stderr)
+    );
 }
 
 /// Relocation itself is an object transformation. Distinct sentinel descriptors
@@ -92,7 +114,6 @@ fn native_bpf_map_decoder_contracts() {
         "MapDefsTests.test_duplicate_and_missing_native_entries",
         "MapDefsTests.test_exact_helpers",
         "MapDefsTests.test_owner_linkage",
-        "MapDefsTests.test_ia32_reader_linkage_signature_body_and_call",
         "MapDefsTests.test_root_helpers",
         "MapDefsTests.test_json_and_legacy_cli",
         "MapDefsTests.test_runner_guards",

@@ -694,6 +694,15 @@ def validate_ia32_reader(elf):
         raise RuntimeError("ia32 reader requires an exact four-byte user read")
     if not any(op in (0x25, 0x26) and imm == 6 for op, _, _, imm in insns[:read]):
         raise RuntimeError("ia32 reader must reject index above six before the read")
+    scale = next((index for index, (op, _, _, imm) in enumerate(insns[:read])
+                  if op == 0x67 and imm == 2), None)
+    return_address = next(
+        (index for index, (op, _, _, imm) in enumerate(insns[:read])
+         if op == 0x07 and imm == 4 and scale is not None and index > scale),
+        None,
+    )
+    if scale is None or return_address is None:
+        raise RuntimeError("ia32 reader requires exact (index + 1) * 4 slot/address semantics")
     normalized = any(op == 0xbc for op, _, _, _ in insns[:read])
     normalized |= any(
         op == 0x67 and imm == 32 and index + 1 < read
@@ -739,7 +748,7 @@ def validate_ia32_reader(elf):
             call_relocations[row[7], address] = (
                 info & 0xffffffff, elf.symbols[info >> 32]
             )
-    callers = set()
+    edges = {key: set() for key in bodies}
     for (section_index, start), caller in bodies.items():
         section = next(raw for name, (_, raw) in elf.sections.items()
                        if elf.indices[name] == section_index)
@@ -757,10 +766,26 @@ def validate_ia32_reader(elf):
                     destination = None
                 else:
                     destination = (section_index, start + pos + (imm + 1) * 8)
-                if destination == target:
-                    callers.add((section_index, start))
-    if not callers:
-        raise RuntimeError("ia32 reader requires a real call boundary")
+                if destination in bodies:
+                    edges[section_index, start].add(destination)
+    root_name = ("p11_entry_ia32"
+                 if any(candidate[0] == "p11_entry_ia32" for candidate in elf.symbols)
+                 else "p11_entry")
+    roots = [candidate for candidate in elf.symbols if candidate[0] == root_name]
+    if len(roots) != 1:
+        raise RuntimeError(f"ia32 reader requires exact {root_name} entry root")
+    if (roots[0][1] != 0x12 or roots[0][2] != 0
+            or roots[0][3] != elf.indices.get("uprobe")):
+        raise RuntimeError(f"ia32 reader requires {root_name} GLOBAL DEFAULT uprobe root")
+    root = (roots[0][3], roots[0][4])
+    reachable, todo = set(), [root]
+    while todo:
+        candidate = todo.pop()
+        if candidate not in reachable:
+            reachable.add(candidate)
+            todo.extend(edges.get(candidate, ()))
+    if target not in reachable:
+        raise RuntimeError(f"ia32 reader requires {root_name} entry-root reachable call")
 
 def validate_root_helpers(elf):
     validate_private_helpers(elf, "p11_root_", REQUIRED_LOCAL_ROOT_HELPERS,
@@ -793,9 +818,9 @@ def inspect(path, allowed_text_globals=frozenset()):
         btf = Btf(elf.sections[".BTF"][1])
         if any(node[0] == 15 and node[1] == ".maps" for node in btf.types[1:]):
             raise RuntimeError("native BTF DATASEC missing ELF .maps section")
+    validate_ia32_reader(elf)
     validate_owner_helpers(elf)
     validate_root_helpers(elf)
-    validate_ia32_reader(elf)
     return maps, classify(records, sections, allowed_text_globals | REQUIRED_GLOBAL_HELPERS
                           | REQUIRED_GLOBAL_OWNER_HELPERS | REQUIRED_GLOBAL_SCALAR_HELPERS), {
         record[-1] for record in records

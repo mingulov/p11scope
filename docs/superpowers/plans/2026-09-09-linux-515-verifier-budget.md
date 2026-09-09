@@ -71,9 +71,12 @@ its native64/ia32 positive and deliberate opposite-width refusal cases.
 1. Retain both scalar verifier frontiers and collect the next Linux 5.15
    processed-instruction witness from the unchanged routing driver.
 2. If the next frontier is still an owner transaction, review one bounded
-   scalar global around the complete owner transaction while keeping all
-   pointer-taking operations local.  Do not add that boundary without a fresh
-   object contract and a Linux 5.15 before/after witness.
+   global around the complete owner transaction with a fixed typed 16-byte key
+   input, a fixed typed 288-byte value input, and a scalar return.  Keep every
+   pointer-returning owner API private.  A scalar-only owner boundary would
+   require a separately reviewed staging design; do not infer one from the
+   scalar ia32 reader.  Do not add either boundary without a fresh object
+   contract and a Linux 5.15 before/after witness.
 3. If the remaining frontier is ABI-specific entry expansion, review dedicated
    production native64 and ia32 entries with unchanged attachment and refusal
    semantics.  This plan does not authorize those entries.

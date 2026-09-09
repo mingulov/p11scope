@@ -41,8 +41,8 @@ use p11scope_ebpf_common::{
     discovery_state_take_scope_lost, discovery_table_slots, discovery_usable_prefix,
     discovery_version_class, event_type, image_pair_matches, interface_continuation_next,
     interface_continuation_pack, interface_continuation_unpack, lifecycle, normalize_target_word,
-    return_allows_mechanism, shape, target_layout_from_cs, target_stack_arg_address,
-    target_word_end, valid_config, valid_loader_cookie,
+    read_ia32_arg_with, return_allows_mechanism, shape, target_layout_from_cs,
+    target_stack_arg_address, target_word_end, valid_config, valid_loader_cookie,
 };
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 use p11scope_ebpf_common::{
@@ -1907,29 +1907,12 @@ fn arg_u64(ctx: &ProbeContext, index: u8, layout: LinuxLayout) -> Result<u64, ()
     }
 }
 
-const IA32_ARG_READ_FAILURE: u64 = 1u64 << 32;
-
 #[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn p11_read_ia32_arg(stack_pointer: u64, index: u32) -> u64 {
-    if index > 6 {
-        return IA32_ARG_READ_FAILURE;
-    }
-    let stack_pointer = stack_pointer & u32::MAX as u64;
-    let offset = (u64::from(index) + 1) * 4;
-    let Some(address) = stack_pointer.checked_add(offset) else {
-        return IA32_ARG_READ_FAILURE;
-    };
-    let Some(end) = address.checked_add(3) else {
-        return IA32_ARG_READ_FAILURE;
-    };
-    if end > u32::MAX as u64 {
-        return IA32_ARG_READ_FAILURE;
-    }
-    match unsafe { helpers::bpf_probe_read_user(address as *const u32) } {
-        Ok(value) => u64::from(value),
-        Err(_) => IA32_ARG_READ_FAILURE,
-    }
+    read_ia32_arg_with(stack_pointer, index, |address| unsafe {
+        helpers::bpf_probe_read_user(address as *const u32).map_err(|_| ())
+    })
 }
 
 fn capture_failure(start: &mut CallStart) {

@@ -5,6 +5,7 @@ import json
 import importlib.util
 import os
 from pathlib import Path
+import select
 import shutil
 import signal
 import stat
@@ -35,6 +36,65 @@ BUILD_MODULE = load_module(REPOSITORY / "scripts/build-offline.py", "build_offli
 
 def restrictive_child_umask():
     os.umask(0o777)
+
+
+def _wait_for_descendant_not_live(pid, *, proc_root=Path("/proc"), timeout=10.0):
+    """Wait for a non-child fixture process to disappear or become terminal."""
+    if pid <= 0:
+        raise AssertionError(f"invalid descendant pid {pid}")
+    stat_path = proc_root / str(pid) / "stat"
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            raw = stat_path.read_bytes()
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise AssertionError(f"cannot inspect descendant {pid}: {error}") from error
+        try:
+            identity, fields = raw.rsplit(b") ", 1)
+            expected = str(pid).encode("ascii") + b" ("
+            if not identity.startswith(expected):
+                raise ValueError("pid identity changed")
+            state = fields.split()[0].decode("ascii")
+        except (UnicodeError, ValueError, IndexError):
+            raise AssertionError(f"malformed /proc/{pid}/stat") from None
+        if state in {"Z", "X", "x"}:
+            return None
+        if state not in {"R", "S", "D", "T", "t", "W", "K", "I", "P"}:
+            raise AssertionError(f"unknown /proc/{pid}/stat state {state!r}")
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"descendant {pid} remained live")
+        time.sleep(0.02)
+
+
+def _pidfd_exit_ready(pidfd, timeout):
+    poller = select.poll()
+    poller.register(pidfd, select.POLLIN | select.POLLHUP)
+    return bool(poller.poll(max(1, int(timeout * 1000))))
+
+
+def _terminate_exact_descendant(pidfd, timeout=2.0):
+    try:
+        if not _pidfd_exit_ready(pidfd, timeout):
+            signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+            if not _pidfd_exit_ready(pidfd, timeout):
+                raise AssertionError("descendant remained live after pidfd SIGKILL")
+    finally:
+        os.close(pidfd)
+
+
+def _settle_coordinator(process, timeout=2.0):
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=timeout)
+    for stream in (process.stdout, process.stderr):
+        if stream is not None:
+            stream.close()
 
 
 class BuildOfflineTests(unittest.TestCase):
@@ -322,6 +382,55 @@ class BuildOfflineTests(unittest.TestCase):
         with self.assertRaises(ProcessLookupError):
             os.kill(spawned[0], 0)
 
+    def test_descendant_terminal_wait_accepts_zombie_and_rejects_live_or_malformed(self):
+        proc_root = self.base / "proc"
+        proc_root.mkdir()
+        stat_path = proc_root / "41/stat"
+        stat_path.parent.mkdir()
+        for state in ("Z", "X", "x"):
+            stat_path.write_bytes(f"41 (fixture) {state} 1 2 3 4 5".encode())
+            self.assertIsNone(_wait_for_descendant_not_live(
+                41, proc_root=proc_root, timeout=0.02))
+
+        stat_path.unlink()
+        self.assertIsNone(_wait_for_descendant_not_live(
+            41, proc_root=proc_root, timeout=0.02))
+        stat_path.parent.mkdir(exist_ok=True)
+
+        stat_path.write_bytes(b"41 (fixture) R 1 2 3 4 5")
+        with self.assertRaisesRegex(AssertionError, "remained live"):
+            _wait_for_descendant_not_live(41, proc_root=proc_root, timeout=0.02)
+
+        stat_path.write_bytes(b"malformed")
+        with self.assertRaisesRegex(AssertionError, "malformed"):
+            _wait_for_descendant_not_live(41, proc_root=proc_root, timeout=0.02)
+
+    def test_signal_cleanup_kills_descendant_after_coordinator_exit(self):
+        descendant = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        pidfd = os.pidfd_open(descendant.pid)
+        coordinator = subprocess.Popen(
+            [sys.executable, "-c", "raise SystemExit(143)"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            self.assertEqual(coordinator.wait(timeout=2), 143)
+            self.assertFalse(_pidfd_exit_ready(pidfd, 0.02))
+            _terminate_exact_descendant(pidfd)
+            pidfd = None
+            descendant.wait(timeout=2)
+            self.assertIsNotNone(descendant.returncode)
+        finally:
+            if pidfd is not None:
+                _terminate_exact_descendant(pidfd)
+            _settle_coordinator(coordinator)
+            if descendant.poll() is None:
+                descendant.kill()
+                descendant.wait(timeout=2)
+            for stream in (descendant.stdout, descendant.stderr):
+                if stream is not None:
+                    stream.close()
+
     def test_evidence_collisions_refuse_without_modifying_external_sentinel(self):
         for kind in ("regular", "symlink", "fifo", "directory"):
             with self.subTest(kind=kind):
@@ -340,34 +449,48 @@ class BuildOfflineTests(unittest.TestCase):
                 for record in (self.source / "test-record").iterdir():
                     record.unlink()
 
-    def test_direct_and_wrapper_signals_forward_reap_cleanup_and_return_signal_status(self):
+    def test_direct_and_wrapper_signals_forward_terminal_cleanup_and_return_signal_status(self):
         for wrapper in (False, True):
             for number in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
                 with self.subTest(wrapper=wrapper, signal=number):
-                    self.control({"hold": True})
+                    process = None
+                    child_pidfd = None
                     work = self.base / f"signal-{wrapper}-{number}"
-                    env = {"PATH": f"{self.source}:/usr/bin:/bin", "LC_ALL": "C"}
-                    process = subprocess.Popen(self.command(work, wrapper=wrapper), cwd=self.source,
-                                               env=env, stdout=subprocess.PIPE,
-                                               stderr=subprocess.PIPE)
-                    marker = self.source / "test-record/child-pid"
-                    deadline = time.monotonic() + 10
-                    while not marker.exists() and process.poll() is None and time.monotonic() < deadline:
-                        time.sleep(0.02)
-                    self.assertTrue(marker.exists())
-                    child = int(marker.read_text(encoding="ascii"))
-                    process.send_signal(number)
-                    process.communicate(timeout=10)
-                    self.assertEqual(process.returncode, 128 + number)
-                    self.assertFalse(work.exists())
-                    with self.assertRaises(ProcessLookupError):
-                        os.kill(child, 0)
-                    shutil.rmtree(self.source / "third-party/src", ignore_errors=True)
-                    lock = self.source / "third-party/.prepare-dependencies.lock"
-                    if lock.exists():
-                        lock.unlink()
-                    for record in (self.source / "test-record").iterdir():
-                        record.unlink()
+                    try:
+                        self.control({"hold": True})
+                        for record in (self.source / "test-record").iterdir():
+                            record.unlink()
+                        shutil.rmtree(self.source / "third-party/src", ignore_errors=True)
+                        (self.source / "third-party/.prepare-dependencies.lock").unlink(
+                            missing_ok=True)
+                        env = {"PATH": f"{self.source}:/usr/bin:/bin", "LC_ALL": "C"}
+                        process = subprocess.Popen(
+                            self.command(work, wrapper=wrapper), cwd=self.source,
+                            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                        marker = self.source / "test-record/child-pid"
+                        deadline = time.monotonic() + 10
+                        while (not marker.exists() and process.poll() is None
+                               and time.monotonic() < deadline):
+                            time.sleep(0.02)
+                        self.assertTrue(marker.exists())
+                        child = int(marker.read_text(encoding="ascii"))
+                        child_pidfd = os.pidfd_open(child)
+                        process.send_signal(number)
+                        process.communicate(timeout=10)
+                        self.assertEqual(process.returncode, 128 + number)
+                        self.assertFalse(work.exists())
+                        _wait_for_descendant_not_live(child)
+                    finally:
+                        if child_pidfd is not None:
+                            _terminate_exact_descendant(child_pidfd)
+                        if process is not None:
+                            _settle_coordinator(process)
+                        shutil.rmtree(work, ignore_errors=True)
+                        shutil.rmtree(self.source / "third-party/src", ignore_errors=True)
+                        (self.source / "third-party/.prepare-dependencies.lock").unlink(
+                            missing_ok=True)
+                        for record in (self.source / "test-record").iterdir():
+                            record.unlink()
 
     def test_real_export_extract_verifier_preparer_and_product_helper_compose(self):
         base = self.base / "real integration"

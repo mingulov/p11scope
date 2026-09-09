@@ -19,6 +19,9 @@
 //!
 use std::{env, path::PathBuf, process::Command};
 
+#[path = "build_support/bpf_tools.rs"]
+mod bpf_tools;
+
 fn main() {
     println!("cargo:rerun-if-changed=crates/ebpf/src");
     println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity.c");
@@ -32,6 +35,7 @@ fn main() {
     println!("cargo:rerun-if-changed=crates/ebpf/rust-toolchain.toml");
     println!("cargo:rerun-if-changed=crates/ebpf-common/src");
     println!("cargo:rerun-if-changed=crates/ebpf-common/Cargo.toml");
+    println!("cargo:rerun-if-changed=build_support/bpf_tools.rs");
     // Gate G2 induced-gap test (Task 7): forces a tiny RING_BYTES so a high
     // call rate overflows the ring buffer deliberately. Unset (the default)
     // leaves the build byte-for-byte identical to before this flag existed.
@@ -39,6 +43,9 @@ fn main() {
     println!("cargo:rerun-if-env-changed=P11SCOPE_SMALL_STATE_MAPS");
     println!("cargo:rerun-if-env-changed=P11SCOPE_SMALL_DISCOVERY_RING");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA");
+    println!("cargo:rerun-if-env-changed=P11SCOPE_PREPARED_BPF_CARGO");
+    println!("cargo:rerun-if-env-changed=P11SCOPE_PREPARED_BPF_RUSTC");
+    println!("cargo:rerun-if-env-changed=LD_LIBRARY_PATH");
     let small_ring = matches!(
         env::var("P11SCOPE_SMALL_RING").as_deref(),
         Ok("1") | Ok("true")
@@ -60,6 +67,8 @@ fn main() {
         Ok("big") => "bpfeb-unknown-none",
         _ => "bpfel-unknown-none",
     };
+    let mut cmd = bpf_tools::bpf_cargo_command_from_env()
+        .unwrap_or_else(|error| panic!("selecting BPF Cargo and rustc: {error}"));
 
     let native_bitcode = out_dir.join("image_identity.bc");
     let status = Command::new("clang-18")
@@ -125,9 +134,7 @@ fn main() {
 
     let ebpf_manifest = manifest_dir.join("crates/ebpf/Cargo.toml");
     let target_dir = out_dir.join("ebpf-target");
-    let mut cmd = Command::new("cargo");
     cmd.args([
-        "+nightly-2026-05-20",
         "build",
         "--locked",
         "--release",
@@ -203,13 +210,8 @@ fn main() {
         cmd.arg("--features").arg(features.join(","));
     }
     let status = cmd
-        // Cargo sets these for build-script subprocesses to point at the
-        // *outer* (stable) toolchain; left alone they'd override `+nightly-2026-05-20`
-        // on the inner cargo invocation. Same workaround as `aya-build`.
-        .env_remove("RUSTC")
-        .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .status()
-        .expect("failed to spawn `cargo +nightly-2026-05-20 build` for crates/ebpf");
+        .expect("failed to spawn selected Cargo for crates/ebpf");
     assert!(status.success(), "building crates/ebpf failed: {status}");
 
     let built = target_dir.join(target).join("release/p11scope-ebpf");

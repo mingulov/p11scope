@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+{
+    for argument in "$@"; do
+        printf 'arg=%s\n' "$argument"
+    done
+} > "$0.query"
+[ "$#" -eq 2 ] && [ "$1" = --print ] && [ "$2" = sysroot ] || exit 64
+printf '%s\n' "${0%/*}/sysroot with space"

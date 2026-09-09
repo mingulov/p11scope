@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+: "${P11SCOPE_BPF_TEST_RECORD:?}"
+{
+    printf 'program=%s\n' "$0"
+    printf 'rustc=%s\n' "${RUSTC-unset}"
+    printf 'ld_library_path=%s\n' "${LD_LIBRARY_PATH-unset}"
+    printf 'workspace_wrapper=%s\n' "${RUSTC_WORKSPACE_WRAPPER-unset}"
+    printf 'wrapper=%s\n' "${RUSTC_WRAPPER-unset}"
+    for argument in "$@"; do
+        printf 'arg=%s\n' "$argument"
+    done
+} > "$P11SCOPE_BPF_TEST_RECORD"

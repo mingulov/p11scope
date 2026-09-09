@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+[ "$#" -eq 2 ] && [ "$1" = --print ] && [ "$2" = sysroot ] || exit 64
+printf 'fixture query failed\n' >&2
+exit 41

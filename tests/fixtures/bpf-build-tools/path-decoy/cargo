@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+printf 'decoy\n' > "${P11SCOPE_BPF_TEST_RECORD:?}"
+exit 99

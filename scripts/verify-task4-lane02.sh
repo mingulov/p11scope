@@ -67,47 +67,15 @@ PY
 }
 
 validate_terminal_tree() {
-    python3 - "$ROOT" <<'PY'
-import os, stat, sys
-root = sys.argv[1]
-rows = {
-    "01-initial-set-never", "02-initial-set-auto", "03-initial-set-always",
-    "04-dlopen-never", "05-dlopen-auto", "06-dlopen-always",
+    "$P11SCOPE_PREPARED_PYTHON" -I scripts/lane02-inputs.py terminal-tree "$ROOT"
 }
-required_dirs = {"bin", "rows", "tokens"} | {f"rows/{row}" for row in rows}
-required_files = {
-    "facts.log", "cargo-configs.tsv", "softhsm2.conf", "bin/p11scope",
-    "bin/harness", "bin/harness-initial"
-}
-required_files |= {f"rows/{row}/observer.log" for row in rows}
-required_files |= {f"rows/{row}/checker.log" for row in rows}
-seen_dirs, seen_files = set(), set()
-for directory, dirs, files in os.walk(root, followlinks=False):
-    relative = os.path.relpath(directory, root)
-    if relative != ".":
-        seen_dirs.add(relative)
-        if relative not in required_dirs and not relative.startswith("tokens/"):
-            raise SystemExit(f"foreign terminal directory: {relative}")
-    for name in dirs + files:
-        path = os.path.join(directory, name)
-        mode = os.lstat(path).st_mode
-        if stat.S_ISLNK(mode) or stat.S_IMODE(mode) & 0o077:
-            raise SystemExit(f"unsafe terminal artifact: {os.path.relpath(path, root)}")
-    for name in files:
-        path = os.path.join(directory, name)
-        relative_file = os.path.relpath(path, root)
-        if not stat.S_ISREG(os.lstat(path).st_mode):
-            raise SystemExit(f"non-file terminal artifact: {relative_file}")
-        if (relative_file not in required_files
-                and not relative_file.startswith("tokens/")
-                and not any(relative_file in {
-                    f"rows/{row}/observed.json",
-                } for row in rows)):
-            raise SystemExit(f"foreign terminal file: {relative_file}")
-        seen_files.add(relative_file)
-if not required_dirs.issubset(seen_dirs) or not required_files.issubset(seen_files):
-    raise SystemExit("terminal evidence tree is incomplete")
-PY
+
+prepared_snapshot() {
+    [ "$#" -eq 1 ] || return 2
+    case $1 in initial|final) ;; *) return 2 ;; esac
+    p11scope_prepared_snapshot "$P11SCOPE_PREPARED_PYTHON" \
+        "$ROOT/prepared/source.$1" \
+        "$PREPARED_PREFIX.$1.ledger.sha256"
 }
 
 digest() {
@@ -247,6 +215,7 @@ contained_refusal() {
 
 self_test() {
     SELF_TESTING=1
+    P11SCOPE_PREPARED_PYTHON=$(command -v python3)
     expected='01-initial-set-never initial-set never
 02-initial-set-auto initial-set auto
 03-initial-set-always initial-set always
@@ -404,13 +373,27 @@ C
         exit 1
     fi
     prepare_evidence_root "$self_root/private-parent/evidence"
-    install -d -m 700 "$ROOT/bin" "$ROOT/rows" "$ROOT/tokens"
+    install -d -m 700 "$ROOT/bin" "$ROOT/prepared" "$ROOT/rows" "$ROOT/tokens"
     : > "$ROOT/facts.log"
     : > "$ROOT/cargo-configs.tsv"
     : > "$ROOT/softhsm2.conf"
     : > "$ROOT/bin/p11scope"
     : > "$ROOT/bin/harness"
     : > "$ROOT/bin/harness-initial"
+    : > "$ROOT/prepared/source.start.tsv"
+    : > "$ROOT/prepared/source.end.tsv"
+    for phase in initial final; do
+        for context in root bpf; do
+            for kind in command.json context.json status stdout.json stderr; do
+                : > "$ROOT/prepared/lane02.$phase.$context.$kind"
+            done
+        done
+        : > "$ROOT/prepared/lane02.$phase.ledger.sha256"
+        : > "$ROOT/prepared/lane02.$phase.receipt.json"
+        : > "$ROOT/prepared/source.$phase.tracked.paths.z"
+        : > "$ROOT/prepared/source.$phase.tracked.sorted.z"
+        : > "$ROOT/prepared/source.$phase.tracked.ledger.sha256"
+    done
     lane02_rows | while read -r row_id _; do
         install -d -m 700 "$ROOT/rows/$row_id"
         : > "$ROOT/rows/$row_id/observer.log"
@@ -498,6 +481,7 @@ HARNESS_INITIAL=$ROOT/bin/harness-initial
 RUN_FAILED=0
 INVOCATIONS=0
 FINALIZED=0
+BODY_COMPLETE=0
 OWNED_RUN_STARTED=0
 if ! : > "$FACTS"; then
     validate_root && rmdir -- "$ROOT" 2>/dev/null || true
@@ -682,8 +666,35 @@ cleanup() {
     if [ "$OWNED_RUN_STARTED" -eq 1 ]; then
         terminate_owned_harness >/dev/null || cleanup_status=1
     fi
+    if [ -n "${ROOT-}" ] && [ -d "$ROOT/build" ]; then
+        find "$ROOT/build" -depth -delete || cleanup_status=1
+    fi
+    if [ "$cleanup_status" -eq 77 ]; then
+        [ -z "${FACTS-}" ] || fact prepared_final_ledger UNAVAILABLE || cleanup_status=1
+    elif [ "${PREPARED_ADMITTED-0}" -eq 1 ]; then
+        if "$P11SCOPE_PREPARED_PYTHON" -I scripts/prepared-dependency-evidence.py \
+            recheck --prefix "$PREPARED_PREFIX"; then
+            prepared_final_hash=$(digest "$PREPARED_PREFIX.final.ledger.sha256") \
+                && fact prepared_final_ledger \
+                    "lane02.final.ledger.sha256 $prepared_final_hash" \
+                || cleanup_status=1
+            prepared_snapshot final > "$ROOT/prepared/source.end.tsv" \
+                || cleanup_status=1
+            cmp -s "$ROOT/prepared/source.start.tsv" \
+                "$ROOT/prepared/source.end.tsv" || cleanup_status=1
+        else
+            fact prepared_final_ledger UNAVAILABLE || cleanup_status=1
+            cleanup_status=1
+        fi
+    else
+        [ -z "${FACTS-}" ] || fact prepared_final_ledger UNAVAILABLE || cleanup_status=1
+        cleanup_status=1
+    fi
     if [ "$FINALIZED" -eq 0 ] && [ -n "${FACTS-}" ] && [ -f "$FACTS" ] \
         && validate_root; then
+        if [ "${BODY_COMPLETE-0}" -eq 1 ]; then
+            validate_terminal_tree || cleanup_status=1
+        fi
         fact terminal_status "$cleanup_status" || cleanup_status=1
         fact ended_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)" || cleanup_status=1
         durable || cleanup_status=1
@@ -700,14 +711,12 @@ for variable in RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_TARGET_DIR CARGO_BUILD_T
     eval "variable_value=\${$variable-}"
     [ -z "$variable_value" ] || { echo "refusing inherited $variable" >&2; exit 77; }
 done
-for command in cargo rustc gcc ldd softhsm2-util sudo sha256sum readelf sync; do
+for command in python3 rustup gcc ldd softhsm2-util sudo sha256sum readelf sync \
+    git sort xargs; do
     command -v "$command" >/dev/null || { echo "$command required" >&2; exit 77; }
 done
-cargo +1.88 --version >/dev/null || exit 77
-rustc +1.88 --version >/dev/null || exit 77
 gcc --version >/dev/null || exit 77
 softhsm2-util --version >/dev/null || exit 77
-sudo -n true || { echo "passwordless sudo required" >&2; exit 77; }
 [ -f "$MODULE" ] && [ ! -L "$MODULE" ] || {
     echo "SoftHSM2 not installed at $MODULE" >&2
     exit 77
@@ -718,11 +727,44 @@ TRACKED_STATUS=$(git status --porcelain=v1 --untracked-files=no) || exit 77
     exit 77
 }
 for source in scripts/verify-task4-lane02.sh scripts/check-capture-evidence.py \
-    scripts/lib.sh scripts/cleanup-traps.sh spike/harness.c spike/expected.txt; do
+    scripts/lib.sh scripts/cleanup-traps.sh scripts/lane02-inputs.py \
+    scripts/prepared-dependency-tools.sh scripts/prepared-dependency-snapshot.sh \
+    scripts/prepared-dependency-evidence.py scripts/product-build.sh \
+    scripts/merge-checksum-ledgers.py scripts/check-prepared-dependencies.py \
+    scripts/prepare-dependencies.py spike/harness.c spike/expected.txt; do
     git ls-files --error-unmatch -- "$source" >/dev/null || exit 77
 done
 cargo_config_snapshot > "$CARGO_CONFIG_FACTS" || exit 77
 CARGO_CONFIG_HASH=$(digest "$CARGO_CONFIG_FACTS")
+
+. scripts/prepared-dependency-tools.sh
+. scripts/prepared-dependency-snapshot.sh
+. scripts/product-build.sh
+p11scope_prepared_tools_select "$(command -v python3)" "$(command -v rustup)" || exit 77
+PREPARED_PREFIX=$ROOT/prepared/lane02
+install -d -m 700 "$ROOT/prepared"
+"$P11SCOPE_PREPARED_PYTHON" -I scripts/prepared-dependency-evidence.py capture \
+    --prefix "$PREPARED_PREFIX" \
+    --stable-cargo "$P11SCOPE_PREPARED_STABLE_CARGO" \
+    --stable-rustc "$P11SCOPE_PREPARED_STABLE_RUSTC" \
+    --bpf-cargo "$P11SCOPE_PREPARED_BPF_CARGO" \
+    --bpf-rustc "$P11SCOPE_PREPARED_BPF_RUSTC" || exit 77
+PREPARED_ADMITTED=1
+PREPARED_INITIAL_HASH=$(digest "$PREPARED_PREFIX.initial.ledger.sha256") || exit 77
+fact prepared_initial_ledger "lane02.initial.ledger.sha256 $PREPARED_INITIAL_HASH"
+prepared_snapshot initial > "$ROOT/prepared/source.start.tsv" || exit 77
+SOURCE_INPUT_HASH=$(digest "$ROOT/prepared/source.start.tsv") || exit 77
+fact source_input_ledger_sha256 "$SOURCE_INPUT_HASH"
+SELECTED_CARGO_VERSION=$("$P11SCOPE_PREPARED_STABLE_CARGO" --version) || {
+    echo "selected stable Cargo diagnostic failed" >&2
+    exit 77
+}
+SELECTED_RUSTC_VERSION=$("$P11SCOPE_PREPARED_STABLE_RUSTC" --version) || {
+    echo "selected stable rustc diagnostic failed" >&2
+    exit 77
+}
+
+sudo -n true || { echo "passwordless sudo required" >&2; exit 77; }
 
 install -d -m 700 "$ROOT/bin" "$ROOT/rows" "$ROOT/tokens"
 HEAD_ID=$(git rev-parse HEAD) || exit 1
@@ -754,14 +796,14 @@ fact lib_sha256 "$LIB_HASH"
 fact cleanup_traps_sha256 "$CLEANUP_HASH"
 fact harness_source_sha256 "$HARNESS_SOURCE_HASH"
 fact expected_sha256 "$EXPECTED_HASH"
-fact cargo_version "$(cargo +1.88 --version)"
-fact rustc_version "$(rustc +1.88 --version)"
+fact cargo_version "$SELECTED_CARGO_VERSION"
+fact rustc_version "$SELECTED_RUSTC_VERSION"
 fact gcc_version "$(gcc -dumpfullversion -dumpversion)"
 fact softhsm_version "$(softhsm2-util --version)"
 durable
 
 install -d -m 700 "$ROOT/build"
-cargo +1.88 build --locked --release --workspace --target-dir "$ROOT/build" || exit 1
+p11scope_product_build prepared --release --workspace --target-dir "$ROOT/build" || exit 1
 install -m 700 "$ROOT/build/release/p11scope" "$P11SCOPE"
 gcc -O0 -o "$HARNESS" spike/harness.c -ldl || exit 1
 MODULE_DIR=${MODULE%/*}
@@ -970,10 +1012,7 @@ CARGO_CONFIG_THEN=$(cat "$CARGO_CONFIG_FACTS") || exit 1
 [ "$(digest "$LIBC_REALPATH")" = "$LIBC_HASH" ] || exit 1
 find "$ROOT/build" -depth -delete
 validate_root
-validate_terminal_tree
 fact invocation_count "$INVOCATIONS"
-fact terminal_status "$RUN_FAILED"
-fact ended_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 durable
-FINALIZED=1
+BODY_COMPLETE=1
 exit "$RUN_FAILED"

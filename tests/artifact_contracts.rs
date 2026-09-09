@@ -8381,3 +8381,11 @@ fn capability_driver_binds_prepared_dependencies_after_cleanup() {
         "CapabilityPreparedDependenciesTests",
     );
 }
+
+#[test]
+fn lane02_driver_binds_prepared_dependencies_after_cleanup() {
+    run_native_python_suite(
+        "tests/python/test_lane02_prepared_dependencies.py",
+        "Lane02PreparedDependenciesTests",
+    );
+}

@@ -2708,6 +2708,24 @@ type ProfileTickContext<'tick, 'owned> = (
     &'tick mut Option<&'owned mut Owned>,
 );
 
+type ProfileTerminalContext<
+    'engine,
+    'session,
+    'owned_ref,
+    'owned,
+    'stdout_ref,
+    'stdout_object,
+    'stdout_open,
+    'output,
+> = (
+    &'engine mut Engine,
+    &'session mut Session,
+    &'owned_ref mut Option<&'owned mut Owned>,
+    &'stdout_ref mut (dyn Write + 'stdout_object),
+    &'stdout_open mut bool,
+    &'output mut Option<AtomicFile>,
+);
+
 type TraceTickContext<
     'engine,
     'session,
@@ -2768,6 +2786,62 @@ fn capture_tick_with<'state, C, T>(
     Ok(CaptureTick::Continue { paused, snapshot })
 }
 
+fn finish_capture_with<C, T>(
+    context: &mut C,
+    loop_result: Result<CaptureEnd>,
+    finish: impl FnOnce(&mut C, Result<CaptureEnd>) -> Result<CaptureEnd>,
+    detach: impl FnOnce(&mut C) -> Result<()>,
+    terminal: impl FnOnce(&mut C, CaptureEnd, bool) -> Result<T>,
+) -> Result<T> {
+    let end = finish(context, loop_result)?;
+    let detach_result = detach(context);
+    let terminal_result = terminal(context, end, detach_result.is_ok());
+    combine_detach(terminal_result, detach_result)
+}
+
+// Explicit phase callbacks keep the terminal sequence visible at each caller.
+#[allow(clippy::too_many_arguments)]
+fn drain_capture_terminal_with<'state, C, T>(
+    context: &mut C,
+    consumers: &mut CaptureConsumers<'state>,
+    detached: bool,
+    diagnostics: &mut dyn Write,
+    discovery: impl for<'phase> FnOnce(
+        &'phase mut C,
+        bool,
+    ) -> Result<(bool, &'phase crate::plan::AttachPlan)>,
+    root: impl FnOnce(
+        &mut C,
+        &mut CaptureConsumers<'state>,
+    ) -> (Result<OriginalRootDrain>, Option<anyhow::Error>),
+    drain: impl FnOnce(&mut C, &mut CaptureConsumers<'state>) -> Result<()>,
+    snapshot_and_publish: impl FnOnce(&mut C, &CaptureConsumers<'state>) -> Result<T>,
+) -> Result<T> {
+    {
+        let (plan_changed, plan) = discovery(context, detached)?;
+        if plan_changed {
+            consumers.state.sync_plan(plan);
+            if let Some(tracer) = consumers.tracer.as_deref_mut() {
+                tracer.sync_plan(plan);
+            }
+        }
+    }
+    let (root_result, mut root_write_error) = root(context, consumers);
+    let root_result = root_result
+        .map_err(|error| combine_trace_errors(Err(error), root_write_error.take()).unwrap_err());
+    terminal_after_root(root_result, diagnostics, |(malformed, completed)| {
+        *consumers.malformed_records += malformed;
+        let retirement = if let Some(completed) = completed {
+            apply_original_root_retirement(consumers.tracker, consumers.state, completed)
+        } else {
+            Ok(())
+        };
+        combine_trace_errors(retirement, root_write_error)?;
+        drain(context, consumers)?;
+        snapshot_and_publish(context, consumers)
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn capture_profile(
     engine: &mut Engine,
@@ -2775,7 +2849,7 @@ fn capture_profile(
     scope: &Scope,
     policy: CapturePolicy,
     duration: Option<Duration>,
-    output: Option<AtomicFile>,
+    mut output: Option<AtomicFile>,
     interrupted: &SignalState,
     mut owned: Option<&mut Owned>,
 ) -> Result<render::Evidence> {
@@ -2926,118 +3000,153 @@ fn capture_profile(
         tick_sleep(paused, PROFILE_CADENCE);
     }
     })();
-    finish_capture_loop(
+    let mut finish_context = (&mut *engine, &mut *session, &mut owned);
+    finish_capture_with(
+        &mut finish_context,
         loop_result,
-        engine,
-        session,
-        owned.as_deref_mut(),
-        interrupted,
-    )?;
+        |context, result| {
+            finish_capture_loop(
+                result,
+                context.0,
+                context.1,
+                context.2.as_deref_mut(),
+                interrupted,
+            )
+        },
+        |context| context.1.detach_producers(),
+        |context, _end, detached| {
+            let mut terminal_context = (
+                &mut *context.0,
+                &mut *context.1,
+                &mut *context.2,
+                &mut *stdout,
+                &mut stdout_open,
+                &mut output,
+            );
+            let mut consumers = CaptureConsumers {
+                state: &mut state,
+                tracker: &mut process_tracker,
+                tracer: None,
+                malformed_records: &mut malformed_records,
+            };
+            drain_capture_terminal_with(
+                &mut terminal_context,
+                &mut consumers,
+                detached,
+                &mut std::io::stderr(),
+                |context: &mut ProfileTerminalContext<'_, '_, '_, '_, '_, '_, '_, '_>, detached| {
+                    let plan_changed = if detached {
+                        context.0.drain_discovery_terminal(context.1)?
+                    } else {
+                        context.0.drain_discovery_terminal_bounded_from(context.1)?
+                    };
+                    Ok((plan_changed, context.0.plan()))
+                },
+                |context, consumers| {
+                    if profile {
+                        (
+                            drain_original_root_events(
+                                context.1,
+                                context.2.as_deref_mut(),
+                                interrupted,
+                                |domain, event| {
+                                    reduce_profile_event(
+                                        domain,
+                                        consumers.tracker,
+                                        consumers.state,
+                                        scope,
+                                        event,
+                                    )
+                                },
+                            ),
+                            None,
+                        )
+                    } else {
+                        (Ok(OriginalRootDrain::Absent), None)
+                    }
+                },
+                |context, consumers| {
+                    if profile {
+                        *consumers.malformed_records +=
+                            drain_events(context.1, consumers.state, consumers.tracker)?;
+                    }
+                    Ok(())
+                },
+                |context, consumers| {
+                    let reports = metrics::read(context.1, context.0.plan())?;
+                    let mut kernel_evidence = metrics::kernel_evidence(context.1)?;
+                    if !profile {
+                        kernel_evidence.ring_loss = 0;
+                    }
+                    context
+                        .0
+                        .pinned()
+                        .check_unchanged()
+                        .map_err(anyhow::Error::msg)?;
+                    context.0.settle_terminal_drain();
+                    let mut ev = evidence_for(
+                        context.0,
+                        context.0.capture_facts(),
+                        context.1.attached_probes(),
+                        context.1.dynamic_per_offset_attached(),
+                        context.1.attach_failures(),
+                        &reports,
+                        kernel_evidence,
+                        consumers.tracker.evidence(),
+                        *consumers.malformed_records,
+                        consumers.state,
+                        context.0.pinned().provider_changed(),
+                        profile,
+                        context
+                            .2
+                            .as_deref()
+                            .map_or_else(Default::default, |owned| owned.coordinator.counters()),
+                        context.2.as_deref().map(|owned| owned.still_running),
+                        capture_tracking_degraded,
+                    );
+                    ev.mark_terminal_drain_unproven();
+                    let facts = context.0.capture_facts();
+                    let frame = render::live(
+                        &reports,
+                        &ev,
+                        clock.elapsed(),
+                        &facts.heading(),
+                        mode,
+                        policy,
+                    );
+                    write_stdout(
+                        context.3,
+                        context.4,
+                        format!("\x1b[2J\x1b[H{frame}").as_bytes(),
+                    )?;
+                    flush_stdout(context.3, context.4)?;
 
-    let detach = session.detach_producers();
-    #[rustfmt::skip]
-    let terminal = (|| -> Result<render::Evidence> {
-    // A detach error is retained until after this terminal drain. Do not put a
-    // fallible provider check between those two operations.
-    let plan_changed = if detach.is_ok() {
-        engine.drain_discovery_terminal(session)?
-    } else {
-        engine.drain_discovery_terminal_bounded_from(session)?
-    };
-    if plan_changed {
-        state.sync_plan(engine.plan());
-    }
-    let root_result = if profile {
-        drain_original_root_events(session,owned.as_deref_mut(),interrupted,
-            |domain, ev| reduce_profile_event(domain,&mut process_tracker,&mut state,scope,ev))
-    } else { Ok(OriginalRootDrain::Absent) };
-    terminal_after_root(root_result,&mut std::io::stderr(),|(malformed,completed)| {
-        malformed_records += malformed;
-        if let Some(completed) = completed { apply_original_root_retirement(&mut process_tracker,&mut state,completed)?; }
-    if profile {
-        malformed_records += drain_events(
-            session,
-            &mut state,
-            &mut process_tracker,
-        )?;
-    }
-    let reports = metrics::read(session, engine.plan())?;
-    let mut kernel_evidence = metrics::kernel_evidence(session)?;
-    if !profile {
-        kernel_evidence.ring_loss = 0;
-    }
-    // Last look before the evidence that the final frame and the `-o` report
-    // are built from, so an in-place provider change is reflected in both.
-    engine
-        .pinned()
-        .check_unchanged()
-        .map_err(anyhow::Error::msg)?;
-    // A terminal-drain retry the capture proved is not a loss: judged here,
-    // at capture end, before the document that would carry the announcement.
-    engine.settle_terminal_drain();
-    let mut ev = evidence_for(
-        engine,
-        engine.capture_facts(),
-        session.attached_probes(),
-        session.dynamic_per_offset_attached(),
-        session.attach_failures(),
-        &reports,
-        kernel_evidence,
-        process_tracker.evidence(),
-        malformed_records,
-        &state,
-        engine.pinned().provider_changed(),
-        profile,
-        owned.as_deref().map_or_else(Default::default, |owned| owned.coordinator.counters()),
-        owned.as_deref().map(|owned| owned.still_running),
-        capture_tracking_degraded,
-    );
-    ev.mark_terminal_drain_unproven();
-    // The terminal frame and the JSON use the same capture facts.
-    let facts = engine.capture_facts();
-    let frame = render::live(
-        &reports,
-        &ev,
-        clock.elapsed(),
-        &facts.heading(),
-        mode,
-        policy,
-    );
-    write_stdout(
-        stdout,
-        &mut stdout_open,
-        format!("\x1b[2J\x1b[H{frame}").as_bytes(),
-    )?;
-    flush_stdout(stdout, &mut stdout_open)?;
-
-    if let Some(mut out_file) = output {
-        let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        let started = fmt_rfc3339(wall_start);
-        let ended = fmt_rfc3339(SystemTime::now());
-        // `capture.modules[]` comes from the evidence, not from here: one list,
-        // rendered twice, so the two sections cannot disagree.
-        let capture = render::CaptureMeta {
-            started: &started,
-            ended: &ended,
-            kernel: &kernel,
-            policy,
-        };
-        let j = if profile {
-            render::profile_json(&reports, &ev, &state, &capture)
-        } else {
-            render::json(&reports, &ev, &capture)
-        };
-        write_json_report(out_file.file(), &j)?;
-        out_file.commit().map_err(anyhow::Error::msg)?;
-    }
-
-    Ok(ev)
-    })
-    })();
-    combine_detach(terminal, detach)
+                    if let Some(mut out_file) = context.5.take() {
+                        let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+                            .unwrap_or_default()
+                            .trim()
+                            .to_string();
+                        let started = fmt_rfc3339(wall_start);
+                        let ended = fmt_rfc3339(SystemTime::now());
+                        let capture = render::CaptureMeta {
+                            started: &started,
+                            ended: &ended,
+                            kernel: &kernel,
+                            policy,
+                        };
+                        let j = if profile {
+                            render::profile_json(&reports, &ev, consumers.state, &capture)
+                        } else {
+                            render::json(&reports, &ev, &capture)
+                        };
+                        write_json_report(out_file.file(), &j)?;
+                        out_file.commit().map_err(anyhow::Error::msg)?;
+                    }
+                    Ok(ev)
+                },
+            )
+        },
+    )
 }
 
 /// Writes the `-o` report — the same call whether the loop above it
@@ -3217,121 +3326,155 @@ fn capture_trace(
     }
     })();
 
-    #[rustfmt::skip]
-    let end =
-    finish_capture_loop(
+    let mut finish_context = (&mut *engine, &mut *session, &mut owned);
+    finish_capture_with(
+        &mut finish_context,
         loop_result,
-        engine,
-        session,
-        owned.as_deref_mut(),
-        interrupted,
-    )?;
-
-    let detach = session.detach_producers();
-    #[rustfmt::skip]
-    let terminal = (|| -> Result<render::Evidence> {
-    // Drain everything currently visible after detach, then report the closing
-    // loss line. Kernel detach does not wait for callbacks already executing
-    // on another CPU, so terminal evidence below remains explicitly PARTIAL.
-    let plan_changed = if detach.is_ok() {
-        engine.drain_discovery_terminal(session)?
-    } else {
-        engine.drain_discovery_terminal_bounded_from(session)?
-    };
-    if plan_changed {
-        state.sync_plan(engine.plan());
-        tracer.sync_plan(engine.plan());
-    }
-    let mut root_write_error = None;
-    let root_result = drain_original_root_events(session,owned.as_deref_mut(),interrupted,
-        |domain, ev| reduce_trace_event(domain,&mut remaining,&mut state,&mut process_tracker,scope,&mut tracer,
-            stdout,&mut stdout_open,out_file,&mut root_write_error,ev));
-    let root_result = root_result.map_err(|error|
-        combine_trace_errors(Err(error),root_write_error.take()).unwrap_err());
-    terminal_after_root(root_result,&mut std::io::stderr(),|(malformed,completed)| {
-        malformed_records += malformed;
-        let retirement = if let Some(completed) = completed {
-            apply_original_root_retirement(&mut process_tracker,&mut state,completed)
-        } else { Ok(()) };
-        combine_trace_errors(retirement,root_write_error)?;
-    malformed_records += drain_trace_events(
-        session,
-        &mut remaining,
-        &mut state,
-        &mut process_tracker,
-        scope,
-        &mut tracer,
-        stdout,
-        &mut stdout_open,
-        out_file,
-    )?;
-    engine
-        .pinned()
-        .check_unchanged()
-        .map_err(anyhow::Error::msg)?;
-    report_trace_loss(
-        session,
-        &mut last_reported_loss,
-        stdout,
-        &mut stdout_open,
-        out_file,
-    )?;
-    let reports = metrics::read(session, engine.plan())?;
-    // Last look before the evidence line the trace ends with, so an in-place
-    // provider change is reflected in it.
-    engine
-        .pinned()
-        .check_unchanged()
-        .map_err(anyhow::Error::msg)?;
-    engine.settle_terminal_drain();
-    let trace_truncated = end == CaptureEnd::LimitReached || remaining == Some(0);
-    let mut evidence = evidence_for(
-        engine,
-        engine.capture_facts(),
-        session.attached_probes(),
-        session.dynamic_per_offset_attached(),
-        session.attach_failures(),
-        &reports,
-        metrics::kernel_evidence(session)?,
-        process_tracker.evidence(),
-        malformed_records,
-        &state,
-        engine.pinned().provider_changed(),
-        true,
-        owned.as_deref().map_or_else(Default::default, |owned| owned.coordinator.counters()),
-        owned.as_deref().map(|owned| owned.still_running),
-        capture_tracking_degraded,
-    );
-    evidence.mark_terminal_drain_unproven();
-    if trace_truncated {
-        emit_trace_line(
-            &trace::truncated_line(trace_limit),
-            stdout,
-            &mut stdout_open,
-            out_file,
-        )?;
-    }
-    emit_trace_terminal(
-        &reports,
-        &tracer,
-        &trace::evidence_line(&evidence, policy, trace_truncated),
-        stdout,
-        &mut stdout_open,
-        out_file,
-    )?;
-    if malformed_records > 0 {
-        eprintln!(
-            "p11scope: {malformed_records} malformed ring-buffer records discarded this capture"
-        );
-    }
-    if let Some(f) = out_file.as_mut() {
-        f.flush().context("flushing trace output file")?;
-    }
-
-    Ok(evidence)
-    })
-    })();
-    combine_detach(terminal, detach)
+        |context, result| {
+            finish_capture_loop(
+                result,
+                context.0,
+                context.1,
+                context.2.as_deref_mut(),
+                interrupted,
+            )
+        },
+        |context| context.1.detach_producers(),
+        |context, end, detached| {
+            let mut terminal_context = (
+                &mut *context.0,
+                &mut *context.1,
+                &mut *context.2,
+                &mut remaining,
+                &mut last_reported_loss,
+                &mut *stdout,
+                &mut stdout_open,
+                &mut *out_file,
+            );
+            let mut consumers = CaptureConsumers {
+                state: &mut state,
+                tracker: &mut process_tracker,
+                tracer: Some(&mut tracer),
+                malformed_records: &mut malformed_records,
+            };
+            drain_capture_terminal_with(
+                &mut terminal_context,
+                &mut consumers,
+                detached,
+                &mut std::io::stderr(),
+                |context: &mut TraceTickContext<'_, '_, '_, '_, '_, '_, '_, '_, '_, '_>,
+                 detached| {
+                    let plan_changed = if detached {
+                        context.0.drain_discovery_terminal(context.1)?
+                    } else {
+                        context.0.drain_discovery_terminal_bounded_from(context.1)?
+                    };
+                    Ok((plan_changed, context.0.plan()))
+                },
+                |context, consumers| {
+                    let mut root_write_error = None;
+                    let root_result = drain_original_root_events(
+                        context.1,
+                        context.2.as_deref_mut(),
+                        interrupted,
+                        |domain, event| {
+                            reduce_trace_event(
+                                domain,
+                                context.3,
+                                consumers.state,
+                                consumers.tracker,
+                                scope,
+                                consumers.tracer.as_deref_mut().expect("trace consumer"),
+                                context.5,
+                                context.6,
+                                context.7,
+                                &mut root_write_error,
+                                event,
+                            )
+                        },
+                    );
+                    (root_result, root_write_error)
+                },
+                |context, consumers| {
+                    *consumers.malformed_records += drain_trace_events(
+                        context.1,
+                        context.3,
+                        consumers.state,
+                        consumers.tracker,
+                        scope,
+                        consumers.tracer.as_deref_mut().expect("trace consumer"),
+                        context.5,
+                        context.6,
+                        context.7,
+                    )?;
+                    Ok(())
+                },
+                |context, consumers| {
+                    context
+                        .0
+                        .pinned()
+                        .check_unchanged()
+                        .map_err(anyhow::Error::msg)?;
+                    report_trace_loss(context.1, context.4, context.5, context.6, context.7)?;
+                    let reports = metrics::read(context.1, context.0.plan())?;
+                    context
+                        .0
+                        .pinned()
+                        .check_unchanged()
+                        .map_err(anyhow::Error::msg)?;
+                    context.0.settle_terminal_drain();
+                    let trace_truncated = end == CaptureEnd::LimitReached || *context.3 == Some(0);
+                    let mut evidence = evidence_for(
+                        context.0,
+                        context.0.capture_facts(),
+                        context.1.attached_probes(),
+                        context.1.dynamic_per_offset_attached(),
+                        context.1.attach_failures(),
+                        &reports,
+                        metrics::kernel_evidence(context.1)?,
+                        consumers.tracker.evidence(),
+                        *consumers.malformed_records,
+                        consumers.state,
+                        context.0.pinned().provider_changed(),
+                        true,
+                        context
+                            .2
+                            .as_deref()
+                            .map_or_else(Default::default, |owned| owned.coordinator.counters()),
+                        context.2.as_deref().map(|owned| owned.still_running),
+                        capture_tracking_degraded,
+                    );
+                    evidence.mark_terminal_drain_unproven();
+                    if trace_truncated {
+                        emit_trace_line(
+                            &trace::truncated_line(trace_limit),
+                            context.5,
+                            context.6,
+                            context.7,
+                        )?;
+                    }
+                    emit_trace_terminal(
+                        &reports,
+                        consumers.tracer.as_deref().expect("trace consumer"),
+                        &trace::evidence_line(&evidence, policy, trace_truncated),
+                        context.5,
+                        context.6,
+                        context.7,
+                    )?;
+                    if *consumers.malformed_records > 0 {
+                        eprintln!(
+                            "p11scope: {} malformed ring-buffer records discarded this capture",
+                            *consumers.malformed_records
+                        );
+                    }
+                    if let Some(file) = context.7.as_mut() {
+                        file.flush().context("flushing trace output file")?;
+                    }
+                    Ok(evidence)
+                },
+            )
+        },
+    )
 }
 
 fn terminal_trace_count_line(reports: &[metrics::SlotReport], tracer: &trace::Tracer) -> String {
@@ -5927,56 +6070,73 @@ mod tests {
     }
 
     #[test]
-    fn terminal_discovery_drains_before_each_event_drain() {
+    fn terminal_capture_modes_wire_shared_finish_and_drain_helpers() {
         let source = include_str!("run.rs");
-        for (function, event_call, consumers) in [
-            (
-                "fn capture_profile(",
-                "drain_events(",
-                ["state.sync_plan(engine.plan());"].as_slice(),
-            ),
-            (
-                "fn capture_trace(",
-                "drain_trace_events(",
-                [
-                    "state.sync_plan(engine.plan());",
-                    "tracer.sync_plan(engine.plan());",
-                ]
-                .as_slice(),
-            ),
+        let profile = source
+            .split_once("fn capture_profile(")
+            .unwrap()
+            .1
+            .split_once("fn capture_trace(")
+            .unwrap()
+            .0;
+        let trace = source
+            .split_once("fn capture_trace(")
+            .unwrap()
+            .1
+            .split_once("fn terminal_trace_count_line")
+            .unwrap()
+            .0;
+        for (function, body, consumer_mode) in [
+            ("capture_profile", profile, "tracer: None,"),
+            ("capture_trace", trace, "tracer: Some(&mut tracer),"),
         ] {
-            let body = source.split_once(function).unwrap().1;
-            let body = body
-                .split_once("fn write_json_report")
-                .map_or(body, |(body, _)| body);
-            let detached = body
-                .find("let detach = session.detach_producers();")
-                .expect("terminal detach");
-            let terminal = &body[detached..];
-            let discovery = terminal
-                .find("let plan_changed = if detach.is_ok()")
-                .expect("terminal discovery branch");
-            let events = terminal.find(event_call).expect("terminal event drain");
-            assert!(
-                discovery < events,
-                "discovery must precede events for {function}"
+            assert_eq!(
+                body.matches("finish_capture_with(").count(),
+                1,
+                "{function}"
             );
-            let branch = &terminal[discovery..events];
-            let (_, after_if) = branch.split_once("if detach.is_ok() {").unwrap();
+            assert_eq!(
+                body.matches("drain_capture_terminal_with(").count(),
+                1,
+                "{function}"
+            );
+            let finish = body.find("finish_capture_with(").unwrap();
+            let tail = &body[finish..];
+            let detach = tail
+                .find("|context| context.1.detach_producers(),")
+                .expect("shared detach callback");
+            let terminal = tail
+                .find("drain_capture_terminal_with(")
+                .expect("shared terminal helper");
+            assert!(
+                tail[..detach].contains("finish_capture_loop("),
+                "real finish callback for {function}"
+            );
+            assert!(
+                detach < terminal,
+                "detach callback must be supplied before terminal callback for {function}"
+            );
+            assert!(
+                tail[detach..terminal].contains(consumer_mode),
+                "consumer mode for {function}"
+            );
+            let terminal = &tail[terminal..];
+            let discovery = terminal
+                .find("let plan_changed = if detached {")
+                .expect("detach-aware terminal discovery");
+            let plan = terminal
+                .find("Ok((plan_changed, context.0.plan()))")
+                .expect("actual engine plan handoff");
+            let discovery = &terminal[discovery..plan];
+            let (_, after_if) = discovery.split_once("if detached {").unwrap();
             let (success, after_else) = after_if.split_once("} else {").unwrap();
             let (failure, _) = after_else.split_once("};").unwrap();
-            assert!(success.contains("engine.drain_discovery_terminal(session)?"));
-            assert!(!success.contains("engine.drain_discovery(session)?"));
-            assert!(failure.contains("engine.drain_discovery_terminal_bounded_from(session)?"));
-            assert!(!failure.contains("engine.drain_discovery(session)?"));
-            assert!(!failure.contains("engine.drain_discovery_terminal(session)?"));
-            for &consumer in consumers {
-                let synced = terminal.find(consumer).expect("plan synchronization");
-                assert!(
-                    synced > discovery && synced < events,
-                    "{consumer} ordering for {function}"
-                );
-            }
+            assert!(success.contains("context.0.drain_discovery_terminal(context.1)?"));
+            assert!(!success.contains("drain_discovery_terminal_bounded_from"));
+            assert!(
+                failure.contains("context.0.drain_discovery_terminal_bounded_from(context.1)?")
+            );
+            assert!(!failure.contains("context.0.drain_discovery_terminal(context.1)?"));
         }
     }
 

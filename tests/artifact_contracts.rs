@@ -6187,126 +6187,139 @@ fn hosted_pipeline_retains_the_job_log() {
     }
 }
 
-/// Task 8 Step 2's ordering sentence, frozen where the loops live: "Each tick
-/// drains discovery, lets `Engine` extend `AttachPlan` and apply attachment
-/// deltas, synchronizes immediate semantic/trace invalidations while
-/// preserving unchanged retired decode metadata, drains call events, retires
-/// exited process state, snapshots metrics/counters, and checks retained
-/// generations/objects."
-///
-/// The synchronization step landing before the event drain and the snapshot is
-/// what makes a slot discovered mid-capture visible to metrics and to trace in
-/// the same tick it arrived; the terminal section is what keeps detach ahead of
-/// the final drain and snapshot, with the in-flight honesty boundary intact.
+/// Bind the behavioral capture helpers to production mode-specific callbacks.
+/// Completed-root retirement is covered by terminal behavioral tests; capture
+/// facts and terminal publication retain their separate provenance checks.
 #[test]
-fn both_capture_loops_keep_the_one_frozen_per_tick_ordering() {
+fn both_capture_loops_wire_behavioral_helpers_and_terminal_publication() {
+    // Ordering inside the helpers is exercised by capture_loop_tests, including
+    // compiled mutation controls. This guard binds their real production callers
+    // and the mode-specific publication callbacks that those tests do not invoke.
     let run = read("src/run.rs");
     let profile = between(&run, "fn capture_profile(", "fn write_json_report(");
     let trace = between(&run, "fn capture_trace(", "\n/// Prints (and, if given,");
-
-    for (name, source, tick_end, sync) in [
+    for (name, source, consumer, drain, snapshot) in [
         (
             "profile",
             profile,
-            "    finish_capture_loop(",
-            "state.sync_plan(engine.plan());",
+            "tracer: None,",
+            "drain_events(",
+            "metrics::kernel_evidence(context.1)?",
         ),
         (
             "trace",
             trace,
-            "    finish_capture_loop(",
-            "tracer.sync_plan(engine.plan());",
+            "tracer: Some(&mut tracer),",
+            "drain_trace_events(",
+            "report_trace_loss(",
         ),
     ] {
-        let tick = between(
-            source,
-            "    loop {\n        let elapsed = clock.elapsed();",
-            tick_end,
-        );
-        let drain_events = if name == "profile" {
-            "drain_events(\n                session,"
-        } else {
-            "drain_trace_events(\n            session,"
-        };
-        let snapshot = if name == "profile" {
-            "metrics::kernel_evidence(session)?"
-        } else {
-            "report_trace_loss("
-        };
-        for (first, second, contract) in [
-            (
-                "drain_discovery_tick(engine, session,",
-                sync,
-                "discovery drain before its immediate invalidation sync",
-            ),
-            (
-                sync,
-                drain_events,
-                "invalidation sync before the call-event drain",
-            ),
-            (
-                drain_events,
-                "retire_exited(&mut process_tracker, &mut state);",
-                "call-event drain before exited-process retirement",
-            ),
-            (
-                "retire_exited(&mut process_tracker, &mut state);",
-                snapshot,
-                "exited-process retirement before the metrics/counter snapshot",
-            ),
-            (
-                snapshot,
-                ".check_unchanged()",
-                "metrics/counter snapshot before the retained generation/object check",
-            ),
+        let tick = between(source, "let tick = {", "let mut finish_context =");
+        for marker in [
+            "capture_tick_with(",
+            "drain_discovery_tick(",
+            "Ok((plan_changed, paused, context.0.plan()))",
+            "capture_end(",
+            consumer,
+            drain,
+            snapshot,
+            ".check_unchanged()",
         ] {
-            require_before(tick, first, second, &format!("{name} tick: {contract}")).unwrap();
+            assert!(
+                tick.contains(marker),
+                "{name} live callback missing {marker}"
+            );
         }
-    }
-
-    // Terminal: detach the producers, then drain, then snapshot. A fallible
-    // provider check must not sit between the detach and its drain.
-    require_before(
-        profile,
-        "let detach = session.detach_producers();",
-        "let plan_changed = if detach.is_ok()",
-        "profile terminal detach before the final drain",
-    )
-    .unwrap();
-    require_before(
-        profile,
-        "let detach = session.detach_producers();",
-        "    let reports = metrics::read(session, engine.plan())?;\n    let mut kernel_evidence",
-        "profile terminal detach before the final snapshot",
-    )
-    .unwrap();
-    require_before(
-        trace,
-        "let detach = session.detach_producers();",
-        "    let reports = metrics::read(session, engine.plan())?;",
-        "trace terminal detach before the final snapshot",
-    )
-    .unwrap();
-    // The owned child is settled before any terminal evidence is built, so
-    // `child_still_running` is reported rather than guessed after the fact.
-    for source in [profile, trace] {
+        assert_eq!(tick.matches("capture_tick_with(").count(), 1);
         require_before(
-            source,
-            "finish_capture_loop(",
-            "let detach = session.detach_producers();",
-            "owned-child settlement before terminal evidence",
+            tick,
+            drain,
+            snapshot,
+            &format!("{name} live drain before snapshot"),
+        )
+        .unwrap();
+        require_before(
+            tick,
+            snapshot,
+            ".check_unchanged()",
+            &format!("{name} live snapshot before retained check"),
+        )
+        .unwrap();
+        let terminal = source.split_once("drain_capture_terminal_with(").unwrap().1;
+        assert!(
+            terminal.contains(drain),
+            "{name} terminal event consumer missing"
+        );
+        assert!(terminal.contains("context.0.capture_facts()"));
+        assert!(terminal.contains("context.0.settle_terminal_drain();"));
+    }
+    // Metrics must not consume EVENTS; both live and terminal profile paths gate it.
+    assert!(profile.contains(
+        "if profile {\n                        *consumers.malformed_records += drain_events("
+    ));
+    assert!(profile.contains("if profile {\n                        (\n                            drain_original_root_events("));
+    assert!(profile.contains("if profile {\n                        *consumers.malformed_records +=\n                            drain_events("));
+    let profile_terminal = profile
+        .split_once("drain_capture_terminal_with(")
+        .unwrap()
+        .1;
+    for (first, second) in [
+        ("let reports = metrics::read(", "let mut kernel_evidence ="),
+        ("let mut kernel_evidence =", ".check_unchanged()"),
+        (".check_unchanged()", "context.0.settle_terminal_drain();"),
+        (
+            "context.0.settle_terminal_drain();",
+            "let mut ev = evidence_for(",
+        ),
+        (
+            "ev.mark_terminal_drain_unproven();",
+            "let frame = render::live(",
+        ),
+        ("let frame = render::live(", "write_stdout("),
+    ] {
+        require_before(
+            profile_terminal,
+            first,
+            second,
+            "profile terminal publication",
         )
         .unwrap();
     }
-    // And the honesty boundary the plan says to retain is still there.
-    assert!(
-        profile.contains("ev.mark_terminal_drain_unproven();"),
-        "the profile terminal snapshot must stay explicitly unproven"
+    let trace_terminal = trace.split_once("drain_capture_terminal_with(").unwrap().1;
+    let checks: Vec<_> = trace_terminal
+        .match_indices(".check_unchanged()")
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        checks.len(),
+        2,
+        "trace retains both terminal provider checks"
     );
-    assert!(
-        trace.contains("evidence.mark_terminal_drain_unproven();"),
-        "the trace terminal evidence must stay explicitly unproven"
-    );
+    let loss = trace_terminal.find("report_trace_loss(").unwrap();
+    let reports = trace_terminal.find("let reports = metrics::read(").unwrap();
+    let settle = trace_terminal
+        .find("context.0.settle_terminal_drain();")
+        .unwrap();
+    let late_kernel = trace_terminal
+        .find("metrics::kernel_evidence(context.1)?")
+        .unwrap();
+    assert!(trace_terminal.find("drain_trace_events(").unwrap() < checks[0]);
+    assert!(checks[0] < loss && loss < reports && reports < checks[1]);
+    assert!(checks[1] < settle && settle < late_kernel);
+    require_before(
+        trace_terminal,
+        "evidence.mark_terminal_drain_unproven();",
+        "emit_trace_line(",
+        "trace truncation output honesty",
+    )
+    .unwrap();
+    require_before(
+        trace_terminal,
+        "evidence.mark_terminal_drain_unproven();",
+        "emit_trace_terminal(",
+        "trace terminal output honesty",
+    )
+    .unwrap();
 }
 
 /// CI viability (8.1 review, Important 1): after Task 8 Step 2 the extended
@@ -6598,7 +6611,7 @@ fn the_capture_loop_consumer_map_is_frozen() {
 
     // Coordinator fields: only its own finite aggregate, never its identity.
     for marker in [
-        "let pause = owned.map_or_else(Default::default, |owned| owned.coordinator.counters());",
+        "pause: crate::discovery::pause::PauseCounters,",
         "pause_attempts: pause.attempts",
         "pause_confirmed: pause.confirmed",
         "pause_partial: pause.partial",
@@ -6610,6 +6623,40 @@ fn the_capture_loop_consumer_map_is_frozen() {
             !evidence.contains(forbidden),
             "a loader/pause identity reached a render type: {forbidden}"
         );
+    }
+
+    // Each real caller must supply the owned coordinator projection; the
+    // projection's argument type alone would also accept fabricated defaults.
+    for (mode, body, expected_calls) in [
+        (
+            "profile",
+            between(&run, "fn capture_profile(", "fn write_json_report("),
+            2,
+        ),
+        (
+            "trace",
+            between(&run, "fn capture_trace(", "\n/// Prints (and, if given,"),
+            1,
+        ),
+    ] {
+        let calls: Vec<_> = body.split("evidence_for(").skip(1).collect();
+        assert_eq!(calls.len(), expected_calls, "{mode} evidence callers");
+        for call in calls {
+            let args = call
+                .split_once("capture_tracking_degraded,")
+                .expect("bounded evidence arguments")
+                .0;
+            assert!(
+                args.contains(
+                    ".map_or_else(Default::default, |owned| owned.coordinator.counters())"
+                ),
+                "{mode} coordinator counter source"
+            );
+            assert!(
+                args.contains(".as_deref().map(|owned| owned.still_running)"),
+                "{mode} owned disposition source"
+            );
+        }
     }
 
     // Module labels: capture-lifetime facts only. The old active-topology
@@ -6629,10 +6676,10 @@ fn the_capture_loop_consumer_map_is_frozen() {
 
     // Semantic attachment decisions still read the active topology.
     for marker in [
-        "semantics::State::with_policy(engine.plan(), policy)",
-        "state.sync_plan(engine.plan());",
+        "semantics::State::for_capture(engine.plan(), policy, domain.clone())",
+        "consumers.state.sync_plan(plan);",
         "trace::Tracer::new(engine.plan())",
-        "tracer.sync_plan(engine.plan());",
+        "tracer.sync_plan(plan);",
     ] {
         assert!(
             run.contains(marker),

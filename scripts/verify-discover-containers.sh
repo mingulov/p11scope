@@ -188,6 +188,13 @@ MUSL_BUILD="p11scope-discover-musl-build-$TOKEN"
 GLIBC_BUILD_ID=
 GLIBC_RUN_ID=
 MUSL_BUILD_ID=
+LANE14_PREPARED_ADMITTED=0
+bind_prepared_ledger() {
+    ledger=$LANE14_PREPARED_PREFIX.$1.ledger.sha256
+    ledger_digest=$(sha256sum < "$ledger") || return 1
+    [ "$(stat -Lc %d:%i "$LANE14_FACTS" 2>/dev/null)" = "$LANE14_FACTS_ID" ] || return 1
+    printf 'prepared_%s_ledger\t%s\t%s\n' "$1" "${ledger##*/}" "${ledger_digest%% *}" >> "$LANE14_FACTS"
+}
 cleanup() {
     status=$?
     trap - EXIT INT TERM
@@ -195,12 +202,27 @@ cleanup() {
         [ -z "$owned_id" ] || timeout --signal=TERM --kill-after=5s 30s \
             docker rm -f "$owned_id" >/dev/null 2>&1 || status=1
     done
+    for owned_id in "$GLIBC_BUILD_ID" "$GLIBC_RUN_ID" "$MUSL_BUILD_ID"; do
+        [ -z "$owned_id" ] || if docker inspect "$owned_id" >/dev/null 2>&1; then status=1; fi
+    done
+    # Final verification follows every owned-container cleanup attempt, even
+    # when cleanup failed. Successful verification cannot erase that failure.
+    if [ "$LANE14_PREPARED_ADMITTED" -eq 1 ]; then
+        if "$LANE14_PYTHON" -I scripts/prepared-dependency-evidence.py recheck \
+            --prefix "$LANE14_PREPARED_PREFIX"; then
+            recheck_status=0
+        else
+            recheck_status=$?
+            status=1
+        fi
+    fi
     if [ "$(stat -Lc %d:%i "$LANE14_FACTS" 2>/dev/null)" != "$LANE14_FACTS_ID" ]; then
         status=1
     else
-        for owned_id in "$GLIBC_BUILD_ID" "$GLIBC_RUN_ID" "$MUSL_BUILD_ID"; do
-            [ -z "$owned_id" ] || if docker inspect "$owned_id" >/dev/null 2>&1; then status=1; fi
-        done
+        if [ "$LANE14_PREPARED_ADMITTED" -eq 1 ]; then
+            printf 'prepared_recheck_status\t%s\n' "$recheck_status" >> "$LANE14_FACTS" || status=1
+            if [ "$recheck_status" -eq 0 ]; then bind_prepared_ledger final || status=1; fi
+        fi
         printf 'cleanup_query\tcontainers-absent\nended_utc\t%s\nchild_exit\t%s\n' \
             "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$status" >> "$LANE14_FACTS" || status=1
         sync -f "$LANE14_FACTS" 2>/dev/null || status=1
@@ -208,6 +230,38 @@ cleanup() {
     exit "$status"
 }
 . scripts/cleanup-traps.sh
+
+# Resolve only the selected installed tools; preparation and acquisition belong
+# outside this sealed caller. The helper retains these identities for recheck.
+resolve_executable() {
+    executable=$(readlink -f "$1") || return 1
+    case $executable in /*) ;; *) return 1 ;; esac
+    [ -f "$executable" ] && [ ! -L "$executable" ] && [ -x "$executable" ] || {
+        echo "prepared dependency tool refusal: not a regular executable: $1" >&2
+        return 1
+    }
+    printf '%s\n' "$executable"
+}
+selected_tool() {
+    selected=$(RUSTUP_AUTO_INSTALL=0 "$LANE14_RUSTUP" which --toolchain "$1" "$2") || return 1
+    resolve_executable "$selected"
+}
+LANE14_PYTHON=$(command -v python3) || exit 77
+LANE14_PYTHON=$(resolve_executable "$LANE14_PYTHON") || exit 77
+LANE14_RUSTUP=$(command -v rustup) || exit 77
+LANE14_RUSTUP=$(resolve_executable "$LANE14_RUSTUP") || exit 77
+LANE14_STABLE_CARGO=$(selected_tool 1.88 cargo) || exit 77
+LANE14_STABLE_RUSTC=$(selected_tool 1.88 rustc) || exit 77
+LANE14_BPF_CARGO=$(selected_tool nightly-2026-05-20 cargo) || exit 77
+LANE14_BPF_RUSTC=$(selected_tool nightly-2026-05-20 rustc) || exit 77
+LANE14_PREPARED_PREFIX=$(readlink -f "$LANE14_ARTIFACTS") || exit 77
+LANE14_PREPARED_PREFIX=$LANE14_PREPARED_PREFIX/discover.prepared
+"$LANE14_PYTHON" -I scripts/prepared-dependency-evidence.py capture \
+    --prefix "$LANE14_PREPARED_PREFIX" \
+    --stable-cargo "$LANE14_STABLE_CARGO" --stable-rustc "$LANE14_STABLE_RUSTC" \
+    --bpf-cargo "$LANE14_BPF_CARGO" --bpf-rustc "$LANE14_BPF_RUSTC" || exit 77
+LANE14_PREPARED_ADMITTED=1
+bind_prepared_ledger initial || exit 77
 
 # Prints the immutable id of a newly created container, refusing anything the
 # daemon does not hand back under that exact id. The caller records the id
@@ -228,8 +282,8 @@ timeout --signal=TERM --kill-after=5s 300s docker pull -q "$DISCOVER_MUSL_IMAGE"
 # The vendor config is rewritten with absolute /src paths because it is
 # copied into $CARGO_HOME inside the containers.
 mkdir -p "$DISCOVER_WORK/vendor"
-timeout --signal=TERM --kill-after=5s 600s \
-    cargo +1.88 vendor --locked "$DISCOVER_WORK/vendor/src" > "$DISCOVER_WORK/vendor/config.toml"
+RUSTC="$LANE14_STABLE_RUSTC" timeout --signal=TERM --kill-after=5s 600s \
+    "$LANE14_STABLE_CARGO" vendor --locked --offline "$DISCOVER_WORK/vendor/src" > "$DISCOVER_WORK/vendor/config.toml"
 sed 's|directory = ".*"|directory = "/receipt/vendor/src"|' \
     "$DISCOVER_WORK/vendor/config.toml" > "$DISCOVER_WORK/vendor/config.container.toml"
 

@@ -57,7 +57,9 @@ archives explicitly. All locked registry packages and the fixed
 available in the Cargo cache for a fully offline build.
 
 For a self-contained full source export and its fixed unprivileged recipient
-bootstrap, see [the offline build guide](docs/build-offline.md).
+bootstrap, use Python >=3.11, or Python 3.10 with the distro `python3-tomli`
+package installed and verified before disconnection; see [the offline build
+guide](docs/build-offline.md).
 
 ## Why
 

@@ -3,9 +3,28 @@
 The full source export contains the complete Cargo dependency payload but does
 not contain Rust toolchains or operating-system build tools. Install Rust 1.88,
 `nightly-2026-05-20` with `rust-src`, `bpf-linker`, Clang/LLVM, the native C
-toolchain, Python 3, Git, and ordinary POSIX shell/archive tools before the
-machine is disconnected. `rustup` and `bpf-linker` must be in the same
+toolchain, Python >=3.11 (or Python 3.10 with the distro `python3-tomli`
+package), Git, and ordinary POSIX shell/archive tools before the machine is
+disconnected. `rustup` and `bpf-linker` must be in the same
 canonical executable directory.
+
+On Debian or Ubuntu with Python 3.10, install and verify the TOML parser while
+the machine is still connected:
+
+```sh
+sudo apt-get install python3-tomli
+/usr/bin/python3 -I -c 'import tomli; print("python3-tomli: OK")'
+```
+
+Before disconnecting, verify the exact interpreter used by the offline path
+can import the helper:
+
+```sh
+/usr/bin/python3 -I scripts/offline-dependencies.py --help
+```
+
+Python 3.11 and newer provide `tomllib` in the standard library and do not
+need `python3-tomli`.
 
 Extract the full export, change to its top-level directory, and choose a new,
 canonical absolute work path outside the extracted tree:

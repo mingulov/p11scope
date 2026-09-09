@@ -16,7 +16,6 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-import tomllib
 import unittest
 from types import SimpleNamespace
 
@@ -26,6 +25,84 @@ HELPER = REPOSITORY / "scripts/offline-dependencies.py"
 PREPARER = REPOSITORY / "scripts/prepare-dependencies.py"
 CHECKER = REPOSITORY / "scripts/check-prepared-dependencies.py"
 FIXTURES = REPOSITORY / "tests/fixtures/offline-dependencies"
+
+
+def run_parser_import(import_mode: str) -> subprocess.CompletedProcess[str]:
+    script = f"""
+import builtins
+import importlib.util
+import json
+import tomllib as stdlib_tomllib
+
+helper_path = {str(HELPER)!r}
+real_import = builtins.__import__
+calls = []
+
+def controlled_import(name, *args, **kwargs):
+    if name == "tomllib":
+        calls.append(name)
+        if {import_mode!r} == "fallback" or {import_mode!r} == "neither":
+            raise ModuleNotFoundError("blocked", name="tomllib")
+        return stdlib_tomllib
+    if name == "tomli":
+        calls.append(name)
+        if {import_mode!r} == "neither":
+            raise ModuleNotFoundError("missing", name="tomli")
+        return stdlib_tomllib
+    return real_import(name, *args, **kwargs)
+
+builtins.__import__ = controlled_import
+spec = importlib.util.spec_from_file_location("offline_helper", helper_path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+print(json.dumps({{"calls": calls, "value": module.tomllib.loads("value = 42") ["value"]}}))
+"""
+    return subprocess.run(
+        [sys.executable, "-I", "-c", script],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+
+
+class TomlParserSelectionTests(unittest.TestCase):
+    def test_prefers_stdlib_parser_without_importing_tomli(self):
+        result = run_parser_import("stdlib")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"calls": ["tomllib"], "value": 42})
+
+    def test_fallback_parser_handles_valid_and_malformed_toml(self):
+        result = run_parser_import("fallback")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"calls": ["tomllib", "tomli"], "value": 42})
+
+        malformed = subprocess.run(
+            [sys.executable, "-I", "-c", f"""
+import builtins, importlib.util, tomllib as stdlib_tomllib
+real_import = builtins.__import__
+def controlled_import(name, *args, **kwargs):
+    if name == "tomllib":
+        raise ModuleNotFoundError("blocked", name="tomllib")
+    if name == "tomli":
+        return stdlib_tomllib
+    return real_import(name, *args, **kwargs)
+builtins.__import__ = controlled_import
+spec = importlib.util.spec_from_file_location("offline_helper", {str(HELPER)!r})
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+try:
+    module.tomllib.loads("[")
+except module.tomllib.TOMLDecodeError:
+    raise SystemExit(0)
+raise SystemExit("malformed TOML was accepted")
+"""],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(malformed.returncode, 0, malformed.stderr)
+
+    def test_reports_actionable_error_when_neither_parser_is_available(self):
+        result = run_parser_import("neither")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Python TOML parser unavailable", result.stderr)
+        self.assertIn("python3-tomli", result.stderr)
 
 
 def load_module(path: Path, name: str):
@@ -655,7 +732,7 @@ class OfflineDependenciesTests(unittest.TestCase):
         self.assertIn(str(relocated / "vendor").encode(), absolute)
         self.assertIn(b'directory = "deps/vendor"', relative)
         self.assertEqual(absolute.count(b"replace-with"), 2)
-        parsed = tomllib.loads(relative.decode("utf-8"))
+        parsed = module.tomllib.loads(relative.decode("utf-8"))
         self.assertEqual(parsed["source"]["vendored-sources"]["directory"], "deps/vendor")
         self.assertTrue(parsed["net"]["offline"])
         with self.assertRaises(module.OfflineDependencyError):

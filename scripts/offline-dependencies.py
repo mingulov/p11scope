@@ -17,7 +17,6 @@ import stat
 import subprocess
 import sys
 import tempfile
-import tomllib
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 
@@ -46,6 +45,23 @@ OFFLINE_ASSOCIATION_FIELDS = {
 
 class OfflineDependencyError(Exception):
     """A deterministic refusal caused by invalid or inconsistent inputs."""
+
+
+def _select_toml_parser():
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        try:
+            import tomli as tomllib
+        except ModuleNotFoundError as error:
+            raise OfflineDependencyError(
+                "Python TOML parser unavailable; use Python >=3.11 or install "
+                "distro package python3-tomli for Python 3.10"
+            ) from error
+    return tomllib
+
+
+tomllib = _select_toml_parser()
 
 
 def _canonical_json(value: object) -> bytes:

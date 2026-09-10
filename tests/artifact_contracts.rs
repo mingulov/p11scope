@@ -5812,7 +5812,7 @@ fn canary_process_custody_lifecycle() {
         "canary custody tests failed: {report}"
     );
     assert!(
-        report.contains("Ran 30 tests")
+        report.contains("Ran 40 tests")
             && report.contains("ProcessCustodyTests")
             && !report.contains("skipped="),
         "canary custody suite must execute every required case: {report}"
@@ -5843,7 +5843,7 @@ fn stopped_canary_capture_lifecycle() {
         "stopped coordinator tests failed: {report}"
     );
     assert!(
-        report.contains("Ran 81 tests")
+        report.contains("Ran 106 tests")
             && report.contains("StoppedCanaryCaptureTests")
             && !report.contains("skipped="),
         "stopped coordinator suite must execute every required case: {report}"
@@ -5899,6 +5899,37 @@ aggregate-only-metrics default metrics"
         blocked_lanes,
         "default-safe-start default\nfeature-safe-start feature"
     );
+    let owned_lanes = canaries
+        .split_once("done <<'OWNED_LANES'\n")
+        .expect("owned metrics lane table")
+        .1
+        .split_once("\nOWNED_LANES")
+        .unwrap()
+        .0;
+    assert_eq!(
+        owned_lanes,
+        "owned-default-metrics default\nowned-feature-metrics feature"
+    );
+    let owned_lane = between(
+        &canaries,
+        "run_owned_lane() {",
+        "\n}\n\nwhile read -r owned_lane owned_build; do",
+    );
+    assert!(
+        owned_lane.contains("--workload-origin owned")
+            && owned_lane.contains("run --manifest \"$WORK/matrix-manifest.json\"")
+            && owned_lane.contains("--mode metrics --pause never --duration 120 --kill-on-timeout")
+            && owned_lane.contains(
+                "--observer-log \"$WORK/$owned_lane.observer.log\" --workload-log \"$WORK/$owned_lane.observer.log\""
+            )
+            && owned_lane.contains("\"$WORK/$owned_lane.done\" \"$WORK/$owned_lane.finish\"")
+            && owned_lane.contains("python3 -I scripts/check-capture-evidence.py canary")
+            && !owned_lane.contains("--workload-pid")
+            && !owned_lane.contains("--generation")
+            && !owned_lane.contains("wait \"$WPID\"")
+            && !owned_lane.contains("signal_verified_process"),
+        "owned metrics lanes must bind run argv and combined logs while preserving observer wait ownership"
+    );
     let start_lane = between(
         &canaries,
         "run_start_lane() {",
@@ -5917,18 +5948,20 @@ aggregate-only-metrics default metrics"
     );
 
     let induced = read("scripts/verify-induced-gaps.sh");
-    for (name, caller, paths, entrypoint) in [
+    for (name, caller, paths, entrypoint, acquisitions) in [
         (
             "canary",
             canaries.as_str(),
             "\"$TASK_STORAGE_READER\" --obj \"$TASK_STORAGE_OBJECT\"",
             "sudo python3 -I scripts/capture-stopped-canary.py",
+            3,
         ),
         (
             "induced-gap",
             induced.as_str(),
             "\"$TASK_STORAGE_READER\" \"$TASK_STORAGE_OBJECT\"",
             "sudo python3 -I scripts/dump-owned-bpf-maps.py",
+            2,
         ),
     ] {
         assert_eq!(
@@ -5940,12 +5973,12 @@ aggregate-only-metrics default metrics"
         );
         assert_eq!(
             caller.matches(paths).count(),
-            2,
+            acquisitions,
             "{name} caller must pass both explicit native paths to every live acquisition"
         );
         assert_eq!(
             caller.matches(entrypoint).count(),
-            2,
+            acquisitions,
             "{name} live acquisitions must ignore ambient Python imports"
         );
     }
@@ -6064,6 +6097,7 @@ aggregate-only-metrics default metrics"
                 "HostileStartTests",
                 "FaultStartTests",
                 "RingLayoutTests",
+                "OwnedMetricsOracleTests",
                 "EventLayoutTests",
                 "RawSafeEventTests",
                 "RawDiagnosticEventTests",
@@ -6092,6 +6126,7 @@ aggregate-only-metrics default metrics"
             "HostileStartTests",
             "FaultStartTests",
             "RingLayoutTests",
+            "OwnedMetricsOracleTests",
             "EventLayoutTests",
             "RawSafeEventTests",
             "RawDiagnosticEventTests",
@@ -6110,7 +6145,7 @@ aggregate-only-metrics default metrics"
             );
         }
         assert!(
-            report.contains("Ran 57 tests") && !report.contains("skipped="),
+            report.contains("Ran 60 tests") && !report.contains("skipped="),
             "native {bits}-bit suite must execute every required case: {report}"
         );
 

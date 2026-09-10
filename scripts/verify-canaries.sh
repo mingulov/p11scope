@@ -328,6 +328,41 @@ BLOCKED_LANES
 echo "=== live diagnostic START policy: distinct template faults ==="
 run_start_lane feature-unsafe-fault feature-unsafe faults 2 --fault-starts
 
+run_owned_lane() {
+    owned_lane=$1
+    owned_build=$2
+    case "$owned_lane:$owned_build" in
+        owned-default-metrics:default) owned_observer=$P11SCOPE_DEFAULT; owned_variant=default ;;
+        owned-feature-metrics:feature) owned_observer=$P11SCOPE_FEATURE; owned_variant=diagnostic ;;
+        *) echo "unknown owned lane/build: $owned_lane:$owned_build" >&2; exit 1 ;;
+    esac
+    echo "=== $owned_lane ($owned_build owned metrics) ==="
+    refuse_lane_destinations "$owned_lane"
+    set -- "$owned_observer" run --manifest "$WORK/matrix-manifest.json" \
+        --mode metrics --pause never --duration 120 --kill-on-timeout -o "$WORK/$owned_lane.output" -- \
+        "$WORK/canary_workload" "$WORK/matrix-provider.so" matrix \
+        "$WORK/$owned_lane.ready" "$WORK/$owned_lane.go" "$WORK/$owned_lane.done" "$WORK/$owned_lane.finish"
+    sudo python3 -I scripts/capture-stopped-canary.py \
+        --lane "$owned_lane" --variant "$owned_variant" --mode metrics --privacy aggregate-only \
+        --target-bits "$TARGET_BITS" --workload-mode matrix --workload-origin owned \
+        --out-dir "$WORK" --prefix "$WORK/$owned_lane" \
+        --ready "$WORK/$owned_lane.ready" --go "$WORK/$owned_lane.go" \
+        --done "$WORK/$owned_lane.done" --finish "$WORK/$owned_lane.finish" \
+        --observer-log "$WORK/$owned_lane.observer.log" --workload-log "$WORK/$owned_lane.observer.log" \
+        --reader "$TASK_STORAGE_READER" --obj "$TASK_STORAGE_OBJECT" -- "$@"
+    reclaim_root_output "$WORK"/mapdump_*_"$owned_lane".json "$WORK"/mapdump_*_"$owned_lane".bin \
+        "$WORK/$owned_lane".*.raw "$WORK/$owned_lane.observer.log" "$WORK/$owned_lane.output"
+    python3 -I scripts/check-capture-evidence.py canary "$owned_lane" "$WORK/$owned_lane.output" \
+        "$TARGET_BITS"
+}
+
+while read -r owned_lane owned_build; do
+    run_owned_lane "$owned_lane" "$owned_build"
+done <<'OWNED_LANES'
+owned-default-metrics default
+owned-feature-metrics feature
+OWNED_LANES
+
 echo "=== assert capture-policy matrix ==="
 assert_lanes "$WORK"
 echo "=== canary matrix: ALL OK ==="

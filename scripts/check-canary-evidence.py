@@ -138,6 +138,7 @@ RING_RECORD_SIZES = {"EVENTS": EVENT_SIZE, "DISCOVERY": DISCOVERY_RECORD_SIZE}
 START_SNAPSHOT_LANES = {
     "default-safe-start", "feature-safe-start", "feature-unsafe-fault",
 }
+OWNED_METRICS_LANES = {"owned-default-metrics", "owned-feature-metrics"}
 
 
 # Loader and pause identities the observer holds privately. None of them may
@@ -441,14 +442,22 @@ def assert_unsafe_trace(text):
     assert ev["async_target_failures"] == 2, ev
 
 
-def assert_aggregate_metrics(doc):
+def _assert_aggregate_metrics(doc, expected_calls):
     assert set(doc) == {"schema", "capture", "evidence", "functions"}, doc
     assert doc["schema"] == "pkcs11-scope/observed-profile/v3-metrics"
     assert doc["capture"]["mode"] == "metrics"
     assert doc["capture"]["privacy_mode"] == "aggregate-only"
     assert "secret_selection_payload" not in doc["evidence"], doc["evidence"]
     profile_terminal(doc, "pkcs11-scope/observed-profile/v3-metrics")
-    assert sum(item["calls"] for item in doc["functions"]) == 28, doc["functions"]
+    assert sum(item["calls"] for item in doc["functions"]) == expected_calls, doc["functions"]
+
+
+def assert_aggregate_metrics(doc):
+    _assert_aggregate_metrics(doc, 28)
+
+
+def assert_owned_aggregate_metrics(doc):
+    _assert_aggregate_metrics(doc, 30)
 
 
 def assert_scan_only_hostile_output(doc, text, hostile):
@@ -812,7 +821,7 @@ def ring_records(manifest, name="EVENTS"):
 
 
 def assert_event_records(raw_records, lane, workload_pid):
-    expected = 0 if lane == "aggregate-only-metrics" else 28
+    expected = 0 if lane == "aggregate-only-metrics" or lane in OWNED_METRICS_LANES else 28
     assert len(raw_records) == expected, f"{lane}: {len(raw_records)} records, expected {expected}"
     if not raw_records:
         return
@@ -873,6 +882,8 @@ def assert_retained_ring_records(retained, lane, workload_pid):
         assert_start_event_records(retained["EVENTS"], lane)
     else:
         assert_event_records(retained["EVENTS"], lane, workload_pid)
+    if lane in OWNED_METRICS_LANES:
+        assert retained["DISCOVERY"], f"{lane}: retained DISCOVERY is empty"
 
 
 def assert_raw_records(manifest, lane, workload_pid, prefix):
@@ -1144,6 +1155,25 @@ def assert_safe_lane_alias_privacy(lane, paths):
         reconstructed = reconstruct(content) if path.suffix == ".json" else b""
         found = alias_hits(content, reconstructed)
         assert not found, f"{lane}: scalar aliases {found} in {path}"
+
+
+def final_lane_artifacts(work, lane, surfaces, *, combined_log=False):
+    work = Path(work)
+    paths = [work / f"{lane}.output", work / f"{lane}.observer.log"]
+    if not combined_log:
+        paths.append(work / f"{lane}.workload.log")
+    paths.extend(map(Path, surfaces))
+    manifest_path = work / f"mapdump_manifest_{lane}.json"
+    paths.append(manifest_path)
+    if combined_log:
+        manifest = read_json(manifest_path)
+        assert isinstance(manifest, list) and manifest, f"{lane}: empty owned manifest"
+        claim = manifest[0].get("snapshot")
+        assert isinstance(claim, dict), f"{lane}: missing stopped snapshot claim"
+        receipt = Path(claim.get("receipt", ""))
+        assert receipt.is_absolute(), f"{lane}: invalid stopped receipt path"
+        paths.append(receipt)
+    return paths
 
 
 def main(argv=None):
@@ -1420,6 +1450,14 @@ def main(argv=None):
             "functions": [{"calls": 28}],
         }
         assert_aggregate_metrics(aggregate)
+        owned_aggregate = json.loads(json.dumps(aggregate))
+        owned_aggregate["functions"][0]["calls"] = 30
+        assert_owned_aggregate_metrics(owned_aggregate)
+        for calls in (28, 29, 31):
+            bad_owned = json.loads(json.dumps(owned_aggregate))
+            bad_owned["functions"][0]["calls"] = calls
+            reject(f"owned metrics call count {calls}",
+                   lambda bad_owned=bad_owned: assert_owned_aggregate_metrics(bad_owned))
         extra_metrics = json.loads(json.dumps(aggregate))
         extra_metrics["evidence"]["secret_selection_payload"] = "CANARY"
         reject("metrics extra evidence field", lambda: assert_aggregate_metrics(extra_metrics))
@@ -1649,6 +1687,14 @@ def main(argv=None):
         safe_events[0] = event_bytes(0, root_affiliation=1)
         assert_event_records(safe_events, "default-safe-profile", 0x555)
         assert_event_records([], "aggregate-only-metrics", 0x555)
+        discovery_record = bytes(DISCOVERY_RECORD_SIZE)
+        for lane in OWNED_METRICS_LANES:
+            assert_retained_ring_records(
+                {"EVENTS": [], "DISCOVERY": [discovery_record]}, lane, 0x555)
+            reject(f"{lane} ordinary event", lambda lane=lane: assert_retained_ring_records(
+                {"EVENTS": [safe_events[0]], "DISCOVERY": [discovery_record]}, lane, 0x555))
+            reject(f"{lane} empty discovery", lambda lane=lane: assert_retained_ring_records(
+                {"EVENTS": [], "DISCOVERY": []}, lane, 0x555))
         reject("raw event count", lambda: assert_event_records(
             safe_events[:-1], "default-safe-profile", 0x555
         ))
@@ -1958,7 +2004,8 @@ def main(argv=None):
     profiles = {
         lane: read_json(f"{work}/{lane}.output")
         for lane in ["default-safe-profile", "feature-safe-profile",
-                     "feature-unsafe-profile", "aggregate-only-metrics"]
+                     "feature-unsafe-profile", "aggregate-only-metrics",
+                     "owned-default-metrics", "owned-feature-metrics"]
     }
     traces = {
         lane: Path(f"{work}/{lane}.output").read_text(encoding="utf-8")
@@ -1971,12 +2018,16 @@ def main(argv=None):
     assert_unsafe_profile(profiles["feature-unsafe-profile"])
     assert_unsafe_trace(traces["feature-unsafe-trace"])
     assert_aggregate_metrics(profiles["aggregate-only-metrics"])
+    assert_owned_aggregate_metrics(profiles["owned-default-metrics"])
+    assert_owned_aggregate_metrics(profiles["owned-feature-metrics"])
 
     lanes = {
         "default-safe-profile": SAFE_MAPS, "default-safe-trace": SAFE_MAPS,
         "feature-safe-profile": FEATURE_MAPS, "feature-safe-trace": FEATURE_MAPS,
         "feature-unsafe-profile": FEATURE_MAPS, "feature-unsafe-trace": FEATURE_MAPS,
         "aggregate-only-metrics": SAFE_MAPS,
+        "owned-default-metrics": SAFE_MAPS,
+        "owned-feature-metrics": FEATURE_MAPS,
     }
     lane_surfaces = {
         lane: assert_exact_owned_map_inventory(work, lane, expected)
@@ -1993,9 +2044,10 @@ def main(argv=None):
     })
     for lane in ["default-safe-profile", "default-safe-trace",
                  "feature-safe-profile", "feature-safe-trace",
-                 "aggregate-only-metrics"]:
+                 "aggregate-only-metrics", "owned-default-metrics",
+                 "owned-feature-metrics"]:
         assert len(read_json(f"{work}/mapdump_TAIL_CALLS_{lane}.json")) == 1
-    for lane in ["feature-safe-profile", "feature-safe-trace"]:
+    for lane in ["feature-safe-profile", "feature-safe-trace", "owned-feature-metrics"]:
         assert read_json(f"{work}/mapdump_ATTR_BOOL_BITS_{lane}.json") == []
     for lane in ["feature-unsafe-profile", "feature-unsafe-trace"]:
         assert len(read_json(f"{work}/mapdump_ATTR_BOOL_BITS_{lane}.json")) == 11
@@ -2018,13 +2070,9 @@ def main(argv=None):
     all_lanes = (*lanes, *additional_lanes)
     artifacts = []
     for lane in all_lanes:
-        artifacts.extend(Path(work) / f"{lane}.{suffix}" for suffix in
-                         ("output", "observer.log", "workload.log"))
-        # Every map the observer owns, as its own type says it must be read: the
-        # dump files plus the raw records the mmap oracle pulled out of each
-        # ringbuf. `owned_map_surfaces` already refused to return a missing one.
-        artifacts.extend(lane_surfaces[lane])
-        artifacts.append(Path(work) / f"mapdump_manifest_{lane}.json")
+        artifacts.extend(final_lane_artifacts(
+            work, lane, lane_surfaces[lane], combined_log=lane in OWNED_METRICS_LANES
+        ))
     artifacts.append(Path(work) / "mapdump_START_live.json")
     # Loader and pause identities, over every artifact surface: the capture
     # documents, the trace streams, the observer/workload logs, the raw event
@@ -2043,10 +2091,9 @@ def main(argv=None):
         "default-safe-start", "feature-safe-start",
     }
     for lane in safe_lanes:
-        paths = [Path(work) / f"{lane}.{suffix}" for suffix in
-                 ("output", "observer.log", "workload.log")]
-        paths.extend(lane_surfaces[lane])
-        paths.append(Path(work) / f"mapdump_manifest_{lane}.json")
+        paths = final_lane_artifacts(
+            work, lane, lane_surfaces[lane], combined_log=lane in OWNED_METRICS_LANES
+        )
         assert_safe_lane_alias_privacy(lane, paths)
 
     print(f"canary matrix OK: {len(all_lanes)} lanes; no ordinary or safe-policy alias leak")

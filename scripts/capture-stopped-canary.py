@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""One retained, stopped acquisition for the closed external canary lanes.
+"""One retained, stopped acquisition for the closed canary lanes.
 
-The shell owns the workload's ordinary wait. This dedicated coordinator owns
-its observer, BPF references and acquisition files. Controlled fixtures must
+The shell owns external workload waits; an owned run observer waits its child.
+This coordinator owns its observer, BPF references and acquisition files. Controlled fixtures must
 not exec or independently mutate STOP/CONT, task membership or output paths.
 No Python result alone qualifies a live kernel, BPF build or target ABI.
 """
@@ -46,7 +46,11 @@ LANES = {
     'default-safe-start': ('default', 'profile', 'allowlisted', 'blocked'),
     'feature-safe-start': ('diagnostic', 'profile', 'allowlisted', 'blocked'),
     'feature-unsafe-fault': ('diagnostic', 'profile', 'unsafe-unvalidated-metadata', 'faults'),
+    'owned-default-metrics': ('default', 'metrics', 'aggregate-only', 'matrix'),
+    'owned-feature-metrics': ('diagnostic', 'metrics', 'aggregate-only', 'matrix'),
 }
+OWNED_LANES = frozenset(('owned-default-metrics', 'owned-feature-metrics'))
+OWNED_DURATION_SECONDS = 120
 MAP_TYPES = {1: 'hash', 2: 'array', 3: 'prog_array', 5: 'percpu_hash',
              6: 'percpu_array', 8: 'cgroup_array', 27: 'ringbuf', 29: 'task_storage'}
 STOP_SECONDS = 30
@@ -150,13 +154,36 @@ def encoded(value):
     return (json.dumps(value, sort_keys=True, separators=(',', ':')) + '\n').encode()
 
 
+def validate_owned_argv(config):
+    argv = config.observer_args
+    require(len(argv) == 21, 'owned observer command has unexpected arguments')
+    manifest, executable, provider = config.out_dir / 'matrix-manifest.json', Path(argv[14]), Path(argv[15])
+    require(argv == [argv[0], 'run', '--manifest', str(manifest), '--mode', 'metrics',
+                    '--pause', 'never', '--duration', str(OWNED_DURATION_SECONDS),
+                    '--kill-on-timeout', '-o', f'{config.prefix}.output', '--',
+                    str(executable), str(provider), 'matrix', str(config.ready),
+                    str(config.go), str(config.done), str(config.finish)],
+            'owned observer command contradicts lane or barrier paths')
+    require(manifest.is_file() and executable.is_absolute() and executable.is_file()
+            and os.access(executable, os.X_OK) and provider.is_absolute() and provider.is_file(),
+            'owned manifest, executable or provider unavailable')
+    config.workload_executable = executable
+
+
 def validate_config(config):
     require(config.lane in LANES, 'unknown canary lane')
     require((config.variant, config.mode, config.privacy, config.workload_mode) == LANES[config.lane],
             'lane configuration contradiction')
     require(type(config.target_bits) is int and config.target_bits in (32, 64), 'invalid target width')
-    require(dumper.snapshot_uint(config.workload_pid, 32, positive=True)
-            and dumper.snapshot_uint(config.generation, positive=True), 'invalid workload identity')
+    config.workload_origin = getattr(config, 'workload_origin', 'external')
+    require(config.workload_origin in ('external', 'owned')
+            and (config.lane in OWNED_LANES) == (config.workload_origin == 'owned'),
+            'workload origin contradicts lane')
+    if config.workload_origin == 'owned':
+        require(config.workload_pid is None and config.generation is None, 'owned workload identity must come from READY')
+    else:
+        require(dumper.snapshot_uint(config.workload_pid, 32, positive=True)
+                and dumper.snapshot_uint(config.generation, positive=True), 'invalid workload identity')
     for name in ('out_dir', 'prefix', 'ready', 'go', 'done', 'finish', 'observer_log',
                  'workload_log', 'reader', 'obj'):
         value = getattr(config, name)
@@ -168,8 +195,10 @@ def validate_config(config):
             and stat.S_IMODE(config.out_dir.stat().st_mode) & 0o077 == 0, 'output directory must be private')
     require(config.prefix == config.out_dir / config.lane, 'output prefix contradicts lane')
     for field, suffix in (('ready', 'ready'), ('go', 'go'), ('done', 'done'), ('finish', 'finish'),
-                          ('observer_log', 'observer.log'), ('workload_log', 'workload.log')):
+                          ('observer_log', 'observer.log')):
         require(getattr(config, field) == Path(f'{config.prefix}.{suffix}'), 'lane path contradiction')
+    require(config.workload_log == (config.observer_log if config.workload_origin == 'owned'
+                                   else Path(f'{config.prefix}.workload.log')), 'workload log contradicts origin')
     require(config.reader.is_file() and os.access(config.reader, os.X_OK) and config.obj.is_file(),
             'native reader or object unavailable')
     argv = config.observer_args
@@ -178,12 +207,16 @@ def validate_config(config):
             and sum(len(arg) for arg in argv) <= 32768, 'invalid observer argv')
     require(Path(argv[0]).is_absolute() and Path(argv[0]).is_file() and os.access(argv[0], os.X_OK),
             'observer executable must be absolute')
+    if config.workload_origin == 'owned':
+        validate_owned_argv(config)
     expected = definitions.SAFE_MAPS if config.variant == 'default' else definitions.UNSAFE_MAPS
     destinations = [config.go, config.finish, config.observer_log, Path(f'{config.prefix}.output'),
                     config.out_dir / f'mapdump_manifest_{config.lane}.json',
                     config.out_dir / f'mapdump_snapshot_{config.lane}.json']
     if config.workload_mode == 'matrix':
         destinations.append(config.done)
+    if config.workload_origin == 'owned':
+        destinations.append(config.ready)
     for name, item in expected.items():
         if item['type'] == 27:
             destinations.append(evidence.ring_raw_path(config.prefix, name))
@@ -196,6 +229,12 @@ def validate_config(config):
 
 def ready_roster(config, deadline):
     doc = read_json(config.ready, deadline=deadline)
+    if config.workload_origin == 'owned' and config.workload_pid is None and config.generation is None:
+        require(isinstance(doc, dict) and dumper.snapshot_uint(doc.get('pid'), 32, positive=True)
+                and isinstance(doc.get('tasks'), list) and len(doc['tasks']) == 1
+                and isinstance(doc['tasks'][0], dict)
+                and dumper.snapshot_uint(doc['tasks'][0].get('generation'), positive=True), 'invalid owned READY identity')
+        config.workload_pid, config.generation = doc['pid'], doc['tasks'][0]['generation']
     require(isinstance(doc, dict) and set(doc) == {'schema', 'mode', 'pid', 'tasks'}
             and doc['schema'] == 'p11scope/canary-roster/v1'
             and doc['mode'] == config.workload_mode and type(doc['pid']) is int
@@ -527,22 +566,57 @@ class Coordinator:
         if deadline is not None:
             remaining(deadline)
 
-    def readiness(self, observer, deadline):
+    def capture_ready(self, deadline):
         marker = (f'CAPTURE privacy={self.config.privacy}' if self.config.mode == 'trace'
                   else f' — privacy={self.config.privacy}').encode()
+        lines = read_bytes(self.config.observer_log, MAX_LOG_BYTES, deadline).splitlines()
+        return marker in lines if self.config.mode == 'trace' else any(marker in line for line in lines)
+
+    def readiness(self, observer, deadline):
         while True:
             self.check('observer-readiness', deadline)
             observer.group.snapshot(deadline)
-            lines = read_bytes(self.config.observer_log, MAX_LOG_BYTES, deadline).splitlines()
-            if (marker in lines if self.config.mode == 'trace' else any(marker in line for line in lines)):
+            if self.capture_ready(deadline):
                 return
+            time.sleep(min(.01, remaining(deadline)))
+
+    def owned_lineage(self, observer, workload, tasks, deadline):
+        observer.group.children(deadline, allowed={workload.pid: workload.generation})
+        workload.children(deadline, allowed={})
+        expected = {row['tid']: row['generation'] for row in tasks}
+        before = workload.snapshot(deadline, expected=expected)
+        actual = os.stat(f'/proc/{workload.pid}/exe')
+        wanted = self.config.workload_executable.stat()
+        require(stat.S_ISREG(actual.st_mode) and (actual.st_dev, actual.st_ino) == (wanted.st_dev, wanted.st_ino),
+                'owned workload executable changed')
+        after = workload.snapshot(deadline, expected=expected)
+        require(all(row[2] == observer.group.pid for row in (*before.values(), *after.values())),
+                'owned workload parent changed')
+        remaining(deadline)
+
+    def owned_readiness(self, observer, deadline):
+        tasks = None
+        while True:
+            self.check('owned-readiness', deadline)
+            observer.group.snapshot(deadline)
+            if tasks is None and os.path.lexists(self.config.ready):
+                tasks = ready_roster(self.config, deadline)
+            if self.capture_ready(deadline) and tasks is not None:
+                workload = self.owner.retain_observer_child(observer, self.config.workload_pid,
+                                                            self.config.generation, deadline)
+                self.owned_lineage(observer, workload, tasks, deadline)
+                return workload, tasks
             time.sleep(min(.01, remaining(deadline)))
 
     def acquire(self, observer, workload, tasks):
         cfg, source, deadline = self.config, self.source, self.stopped_deadline
+        owned = cfg.workload_origin == 'owned'
+        allowed_children = {workload.pid: workload.generation} if owned else {}
+        if owned:
+            self.owned_lineage(observer, workload, tasks, deadline)
         expected_members = {row['tid']: row['generation'] for row in tasks}
         observer_members = {tid: row[0] for tid, row in observer.group.snapshot(deadline).items()}
-        observer.group.stop(deadline, expected=observer_members, allowed_children={})
+        observer.group.stop(deadline, expected=observer_members, allowed_children=allowed_children)
         self.check('observer-stopped', deadline)
         create_control(cfg.go, lambda: setattr(self, 'go_created', True))
         self.check('GO-created', deadline)
@@ -562,7 +636,7 @@ class Coordinator:
                     break
                 time.sleep(min(.01, remaining(deadline)))
         self.check('workload-readiness', deadline)
-        workload.stop(deadline, expected=expected_members)
+        workload.stop(deadline, expected=expected_members, allowed_children={} if owned else None)
         self.check('workload-stopped', deadline)
         before = stopped_rows(workload, deadline, expected_members)
         observer_before = stopped_rows(observer.group, deadline, observer_members)
@@ -603,7 +677,9 @@ class Coordinator:
         self.check('after-identities', deadline)
         after = stopped_rows(workload, deadline, expected_members)
         require(observer_before == stopped_rows(observer.group, deadline, observer_members), 'observer roster changed')
-        observer.group.children(deadline, allowed={})
+        observer.group.children(deadline, allowed=allowed_children)
+        if owned:
+            self.owned_lineage(observer, workload, tasks, deadline)
         require(maps == source.inventory(observer.group, deadline), 'map inventory changed during acquisition')
         require(positions == source.positions(), 'retained ring positions changed')
         self.check('retained-semantics', deadline)
@@ -615,9 +691,10 @@ class Coordinator:
                 controls[item['name']] = {**item, 'value': evidence.bpftool_bytes(cells[0]['value'], item['bytes_value'])}
         expected = [{key: row[key] for key in ('pid', 'tid', 'generation')} |
                     {'cookie': row['role'] == 'leader' and cfg.mode != 'metrics',
-                     'owner': row['role'] == 'worker', 'root': False} for row in tasks]
+                     'owner': row['role'] == 'worker', 'root': owned and row['role'] == 'leader'} for row in tasks]
+        receipt_lane = 'owned-root' if owned else 'external'
         bound = dumper.reconcile_task_storage(task_maps, records, expected=expected, before=before, after=after,
-                                             controls=controls, lane='external', small_state=False)
+                                             controls=controls, lane=receipt_lane, small_state=False)
         if cfg.mode == 'metrics':
             require(evidence.u64(controls['COOKIE_CTL']['value'], 8) == 0, 'aggregate-only cookie allocation history')
         if cfg.workload_mode == 'matrix':
@@ -641,7 +718,7 @@ class Coordinator:
         evidence.assert_retained_ring_records(rings, cfg.lane, cfg.workload_pid)
         acquisition = uuid.uuid4().hex
         receipt = {'contract': dumper.STOPPED_SNAPSHOT_CONTRACT, 'acquisition_id': acquisition,
-                   'phase': 'stopped', 'lane': 'external', 'small_state': False,
+                   'phase': 'stopped', 'lane': receipt_lane, 'small_state': False,
                    'expected': expected, 'before': before, 'after': after, 'surfaces': []}
         for item in maps:
             raw = values[item['name']]
@@ -699,11 +776,13 @@ class Coordinator:
             self.owner = custody.Custody(cleanup_seconds=RESUME_SECONDS)
             self.owner.__enter__()
             evidence.initialize(self.config.target_bits)
-            ready_deadline = time.monotonic() + READY_SECONDS
-            tasks = ready_roster(self.config, ready_deadline)
-            workload = self.owner.borrow(self.config.workload_pid, self.config.generation, role='workload')
-            workload.snapshot(ready_deadline,
-                              expected={row['tid']: row['generation'] for row in tasks})
+            owned = self.config.workload_origin == 'owned'
+            if not owned:
+                ready_deadline = time.monotonic() + READY_SECONDS
+                tasks = ready_roster(self.config, ready_deadline)
+                workload = self.owner.borrow(self.config.workload_pid, self.config.generation, role='workload')
+                workload.snapshot(ready_deadline,
+                                  expected={row['tid']: row['generation'] for row in tasks})
             if self.source is None:
                 self.source = LiveMaps(self.config)
             self.source.owner = self.owner
@@ -714,8 +793,13 @@ class Coordinator:
             except BaseException:
                 os.close(fd)
                 raise
-            observer = self.owner.launch(self.config.observer_args, stdout=log, stderr=log)
-            self.readiness(observer, time.monotonic() + READY_SECONDS)
+            ready_deadline = time.monotonic() + READY_SECONDS
+            observer = self.owner.launch(self.config.observer_args, stdout=log, stderr=log,
+                                         deadline=ready_deadline if owned else None)
+            if owned:
+                workload, tasks = self.owned_readiness(observer, ready_deadline)
+            else:
+                self.readiness(observer, time.monotonic() + READY_SECONDS)
             self.stopped_deadline = time.monotonic() + STOP_SECONDS
             self.acquire(observer, workload, tasks)
         except BaseException as error:
@@ -780,10 +864,16 @@ def parse_args(argv):
     for name in ('lane', 'variant', 'mode', 'privacy', 'workload-mode', 'out-dir', 'prefix',
                  'ready', 'go', 'done', 'finish', 'observer-log', 'workload-log', 'reader', 'obj'):
         parser.add_argument('--' + name, required=True)
-    for name in ('workload-pid', 'generation', 'target-bits'):
-        parser.add_argument('--' + name, required=True, type=int)
+    parser.add_argument('--workload-origin', choices=('external', 'owned'), default='external')
+    parser.add_argument('--target-bits', required=True, type=int)
+    for name in ('workload-pid', 'generation'):
+        parser.add_argument('--' + name, type=int)
     parser.add_argument('observer_args', nargs=argparse.REMAINDER)
     result = parser.parse_args(argv)
+    if result.workload_origin == 'external' and (result.workload_pid is None or result.generation is None):
+        parser.error('external workloads require --workload-pid and --generation')
+    if result.workload_origin == 'owned' and (result.workload_pid is not None or result.generation is not None):
+        parser.error('owned workloads must obtain identity from READY')
     if result.observer_args[:1] == ['--']:
         result.observer_args = result.observer_args[1:]
     return result

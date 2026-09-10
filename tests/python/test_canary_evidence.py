@@ -30,6 +30,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[2]
 SUBJECT = ROOT / "scripts" / "check-canary-evidence.py"
 DUMPER = ROOT / "scripts" / "dump-owned-bpf-maps.py"
+CAPTURE_CHECKER = ROOT / "scripts" / "check-capture-evidence.py"
 
 
 def load_subject(bits):
@@ -45,6 +46,57 @@ def load_dumper():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def load_capture_checker():
+    spec = importlib.util.spec_from_file_location("capture_evidence", CAPTURE_CHECKER)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def owned_metrics_document(bits, calls=30):
+    subject = load_capture_checker()
+    evidence = subject.evidence_fixture(
+        subject.VERSION_SURFACES_SCANNED,
+        sources=("scan", "manifest"),
+        discovery_skipped=0,
+    )
+    evidence["discovery"][0]["tables"] = [
+        {"source": source, "version": list(version), "entries": entries}
+        for (source, version, entries), count in subject.VERSION_TABLES_SCANNED.items()
+        for _ in range(count)
+    ]
+    evidence.update(
+        table_entries=988,
+        slots=104,
+        attached_probes=208,
+        vendor_interfaces=1,
+        interface_list="ok",
+        child_still_running=False,
+    )
+    if bits == 64:
+        evidence["discovery_conflicts"] = 1
+        evidence["discovery"][0]["corroboration"] = ["conflict"]
+    else:
+        evidence["surfaces"].extend([
+            {"walk": "full", "functions": functions, "acquisition": "ok",
+             "source": f"/opt/p11.so table {major}.{minor}"}
+            for major, minor, functions in ((3, 1, 92), (3, 2, 104))
+        ])
+        evidence["discovery"][0]["tables"].extend([
+            {"source": "scan", "version": [3, 1], "entries": 92},
+            {"source": "scan", "version": [3, 2], "entries": 104},
+        ])
+        evidence["discovery"][0].update(corroborated=True, corroboration=["agreed"])
+    document = subject.document_fixture(
+        evidence,
+        schema=subject.METRICS_SCHEMA,
+        mode="metrics",
+        privacy="aggregate-only",
+    )
+    document["functions"] = subject.function_items([(["C_GetInterfaceList"], calls)])
+    return subject, document
 
 
 def json_signal_lifetime_probe(case, interposer=None):
@@ -2414,6 +2466,105 @@ class RingLayoutTests(unittest.TestCase):
                                side_effect=AssertionError("live BPF open forbidden")):
             subject.assert_retained_ring_records(
                 retained, "default-safe-profile", 0x555)
+
+
+class OwnedMetricsOracleTests(unittest.TestCase):
+    def test_owned_metrics_require_exact_30_and_closed_run_evidence(self):
+        canary = load_subject(TARGET_BITS)
+        capture, owned = owned_metrics_document(TARGET_BITS)
+        for lane in ("owned-default-metrics", "owned-feature-metrics"):
+            with self.subTest(lane=lane):
+                capture.validate_canary(lane, copy.deepcopy(owned), TARGET_BITS)
+                canary.assert_owned_aggregate_metrics(copy.deepcopy(owned))
+                for calls in (28, 29, 31):
+                    bad = copy.deepcopy(owned)
+                    bad["functions"][0]["calls"] = calls
+                    with self.assertRaises(AssertionError):
+                        capture.validate_canary(lane, bad, TARGET_BITS)
+                    with self.assertRaises(AssertionError):
+                        canary.assert_owned_aggregate_metrics(bad)
+                for mutate in (
+                    lambda d: d["evidence"].pop("child_still_running"),
+                    lambda d: d["evidence"].update(child_still_running=True),
+                    lambda d: d["evidence"].update(
+                        pause="sigstop", pause_attempts=1, pause_confirmed=1),
+                ):
+                    bad = copy.deepcopy(owned)
+                    mutate(bad)
+                    with self.assertRaises(AssertionError):
+                        capture.validate_canary(lane, bad, TARGET_BITS)
+
+        external = copy.deepcopy(owned)
+        external["evidence"].pop("child_still_running")
+        external["functions"][0]["calls"] = 28
+        capture.validate_canary("aggregate-only-metrics", external, TARGET_BITS)
+        canary.assert_aggregate_metrics(external)
+        external_30 = copy.deepcopy(external)
+        external_30["functions"][0]["calls"] = 30
+        with self.assertRaises(AssertionError):
+            capture.validate_canary("aggregate-only-metrics", external_30, TARGET_BITS)
+        with self.assertRaises(AssertionError):
+            canary.assert_aggregate_metrics(external_30)
+        external_owned_evidence = copy.deepcopy(external)
+        external_owned_evidence["evidence"]["child_still_running"] = False
+        with self.assertRaises(AssertionError):
+            capture.validate_canary(
+                "aggregate-only-metrics", external_owned_evidence, TARGET_BITS)
+
+    def test_owned_metrics_retain_zero_events_and_real_discovery_separately(self):
+        subject = load_subject(TARGET_BITS)
+        discovery = bytes(subject.DISCOVERY_RECORD_SIZE)
+        for lane in ("owned-default-metrics", "owned-feature-metrics"):
+            with self.subTest(lane=lane):
+                subject.assert_retained_ring_records(
+                    {"EVENTS": [], "DISCOVERY": [discovery]}, lane, 0x555)
+                with self.assertRaises(AssertionError):
+                    subject.assert_retained_ring_records(
+                        {"EVENTS": [event_bytes(0)], "DISCOVERY": [discovery]},
+                        lane, 0x555)
+                with self.assertRaises(AssertionError):
+                    subject.assert_retained_ring_records(
+                        {"EVENTS": [], "DISCOVERY": []}, lane, 0x555)
+
+    def test_owned_final_surface_set_includes_combined_log_maps_manifest_and_receipt(self):
+        subject = load_subject(TARGET_BITS)
+        _capture, owned = owned_metrics_document(TARGET_BITS)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lane = "owned-default-metrics"
+            output = root / f"{lane}.output"
+            observer = root / f"{lane}.observer.log"
+            manifest = root / f"mapdump_manifest_{lane}.json"
+            receipt = root / f"{lane}.receipt.json"
+            root_surface = root / f"mapdump_ROOT_AFFILIATION_{lane}.bin"
+            owner_surface = root / f"mapdump_THREAD_OWNER_{lane}.bin"
+            output.write_text(json.dumps(owned), encoding="utf-8")
+            observer.write_bytes(b"")
+            receipt.write_text("{}", encoding="utf-8")
+            root_surface.write_bytes(bytes(8))
+            owner_surface.write_bytes(bytes(544))
+            manifest.write_text(json.dumps([{"snapshot": {"receipt": str(receipt)}}]),
+                                encoding="utf-8")
+            paths = subject.final_lane_artifacts(
+                root, lane, [root_surface, owner_surface], combined_log=True)
+            self.assertEqual(set(paths), {
+                output, observer, root_surface, owner_surface, manifest, receipt,
+            })
+            subject.assert_final_artifact_privacy(paths)
+            owner_surface.unlink()
+            with self.assertRaises(OSError):
+                subject.assert_final_artifact_privacy(paths)
+            owner_surface.write_bytes(bytes(520) + subject.SENTINELS["PIN"])
+            with self.assertRaisesRegex(AssertionError, "pointer canaries leaked"):
+                subject.assert_final_artifact_privacy(paths)
+            owner_surface.write_bytes(bytes(544))
+            root_surface.write_bytes(subject.SENTINELS["PIN"])
+            with self.assertRaisesRegex(AssertionError, "pointer canaries leaked"):
+                subject.assert_final_artifact_privacy(paths)
+            root_surface.write_bytes(bytes(8))
+            receipt.write_bytes(subject.positive_control_content())
+            with self.assertRaisesRegex(AssertionError, "pointer canaries leaked"):
+                subject.assert_final_artifact_privacy(paths)
 
 
 class EventLayoutTests(unittest.TestCase):

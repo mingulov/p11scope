@@ -700,6 +700,170 @@ def owned_stop_refusal(observer, workload):
     os.close(fd)
 
 
+def retained_observer_child_wait(observer, workload):
+    with tempfile.TemporaryDirectory() as directory:
+        ready, release, waited = [Path(directory) / name for name in ('ready', 'release', 'waited')]
+        code = f"""
+pid = os.fork()
+if pid == 0:
+    while not os.path.exists({str(release)!r}):
+        time.sleep(.005)
+    os._exit(7)
+open({str(ready)!r}, 'w').write(str(pid))
+got, status = os.waitpid(pid, 0)
+code = os.waitstatus_to_exitcode(status)
+open({str(waited)!r}, 'w').write(str(code))
+os._exit(0 if got == pid and code == 7 else 19)
+"""
+        owner = c.Custody()
+        parent, test_handles = None, []
+        owner.__enter__()
+        try:
+            parent = launch(owner, '\n' + code)
+            test_handles.append(os.dup(parent.group.fd))
+            until(lambda: ready.exists() and ready.read_text())
+            pid = int(ready.read_text())
+            test_handles.append(os.pidfd_open(pid))
+            child = owner.retain_observer_child(parent, pid, identity(pid), time.monotonic() + 2)
+            assert child.wait_owner == 'observer' and child.origin == 'observer-child'
+            assert child.process is None and len(owner.processes) == 1
+            raises(ChildProcessError, lambda: os.waitid(os.P_PIDFD, child.fd, os.WEXITED | os.WNOHANG))
+            parent.group.stop(time.monotonic() + 1, allowed_children={pid: child.generation})
+            child.stop(time.monotonic() + 1, allowed_children={})
+            assert state(parent.popen.pid) == state(pid) == 'T'
+            parent.group.resume(time.monotonic() + 1)
+            child.resume(time.monotonic() + 1)
+            release.touch()
+            assert parent.wait(time.monotonic() + 2) == 0
+            assert waited.read_text() == '7', 'observer lost its ordinary child wait status'
+            owner.close()
+            assert not owner.reaped_orphans and all(group.closed for group in owner.groups)
+            for fd in test_handles:
+                gone(fd)
+        finally:
+            # Independently retained handles protect the failure-first probe.
+            for fd in test_handles:
+                try:
+                    signal.pidfd_send_signal(fd, signal.SIGCONT)
+                except ProcessLookupError:
+                    pass
+            release.touch()
+            if parent is not None and not parent.settled:
+                parent.wait(time.monotonic() + 2)
+            if owner.active:
+                owner.close()
+            for fd in test_handles:
+                os.close(fd)
+
+
+def retained_child_refusal(kind, outside):
+    with tempfile.TemporaryDirectory() as directory:
+        ready, release, wait_gate, waited = [Path(directory) / name for name in ('ready', 'release', 'wait', 'waited')]
+        count = 2 if kind == 'extra' else 1
+        code = f"""
+pids = []
+for _ in range({count}):
+    pid = os.fork()
+    if pid == 0:
+        while not os.path.exists({str(release)!r}):
+            time.sleep(.005)
+        os._exit(7)
+    pids.append(pid)
+open({str(ready)!r}, 'w').write(' '.join(map(str, pids)))
+while not os.path.exists({str(wait_gate)!r}):
+    time.sleep(.005)
+statuses = [os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]) for pid in pids]
+open({str(waited)!r}, 'w').write(str(statuses))
+os._exit(0 if statuses == [7] * {count} else 19)
+"""
+        owner, parent, test_handles = c.Custody(), None, []
+        owner.__enter__()
+        try:
+            parent = launch(owner, '\n' + code)
+            test_handles.append(os.dup(parent.group.fd))
+            until(lambda: ready.exists() and ready.read_text())
+            pids = list(map(int, ready.read_text().split()))
+            test_handles.extend(os.pidfd_open(pid) for pid in pids)
+            pid, gen = pids[0], identity(pids[0])
+            deadline = time.monotonic() + 2
+            if kind == 'outside':
+                raises(c.CustodyError, lambda: owner.retain_observer_child(parent, outside, identity(outside), deadline))
+            elif kind == 'stale':
+                raises(c.CustodyError, lambda: owner.retain_observer_child(parent, pid, gen + 1, deadline))
+                for bad_pid, bad_gen in ((True, gen), (pid, True), (0, gen), (pid, 0)):
+                    raises(c.CustodyError, lambda: owner.retain_observer_child(parent, bad_pid, bad_gen, deadline))
+            elif kind == 'extra':
+                raises(c.CustodyError, lambda: owner.retain_observer_child(parent, pid, gen, deadline))
+            elif kind == 'foreign_observer':
+                raises(c.CustodyError, lambda: owner.retain_observer_child(c.OwnedProcess(c.Custody()), pid, gen, deadline))
+                raises(c.CustodyError, lambda: owner.retain_observer_child(c.OwnedProcess(owner), pid, gen, deadline))
+                with patch.object(parent, 'settled', True):
+                    raises(c.CustodyError, lambda: owner.retain_observer_child(parent, pid, gen, deadline))
+            elif kind == 'duplicate':
+                owner.retain_observer_child(parent, pid, gen, deadline)
+                raises(c.CustodyError, lambda: owner.retain_observer_child(parent, pid, gen, deadline))
+            elif kind == 'dead':
+                release.touch()
+                until(lambda: state(pid) == 'Z')
+                raises(c.CustodyError, lambda: owner.retain_observer_child(parent, pid, gen, deadline))
+                assert state(pid) == 'Z', 'observer child wait was consumed'
+            elif kind in ('unavailable', 'post_pin_census'):
+                census, calls = parent.group.children, []
+                def unavailable(*args, **kwargs):
+                    calls.append(True)
+                    if kind == 'unavailable' or len(calls) == 2:
+                        raise PermissionError('child census unavailable')
+                    return census(*args, **kwargs)
+                with patch.object(parent.group, 'children', side_effect=unavailable):
+                    raises(PermissionError, lambda: owner.retain_observer_child(parent, pid, gen, deadline))
+                if kind == 'post_pin_census':
+                    group = next(group for group in owner.groups if group.pid == pid)
+                    os.fstat(group.fd)
+            elif kind == 'parent_death':
+                pin = owner._pin
+                def lost_parent(*args, **kwargs):
+                    group = pin(*args, **kwargs)
+                    signal.pidfd_send_signal(parent.group.fd, signal.SIGKILL)
+                    assert select.select([parent.group.fd], [], [], 1)[0]
+                    return group
+                with patch.object(owner, '_pin', side_effect=lost_parent):
+                    raises(c.CustodyError, lambda: owner.retain_observer_child(parent, pid, gen, deadline))
+                assert parent.wait(time.monotonic() + 1) == -signal.SIGKILL
+                error = raises(c.CleanupError, owner.close)
+                assert 'unexpected adopted children' in str(error)
+                assert {row[0] for row in owner.reaped_orphans} == set(pids)
+            else:
+                raise AssertionError(kind)
+            if kind != 'parent_death':
+                release.touch()
+                wait_gate.touch()
+                assert parent.wait(time.monotonic() + 2) == 0
+                assert waited.read_text() == str([7] * count)
+                owner.close()
+                assert not owner.reaped_orphans
+            assert all(group.closed for group in owner.groups)
+            for fd in test_handles:
+                gone(fd)
+        finally:
+            for fd in test_handles:
+                try:
+                    signal.pidfd_send_signal(fd, signal.SIGCONT)
+                except ProcessLookupError:
+                    pass
+            release.touch()
+            wait_gate.touch()
+            if parent is not None and not parent.settled:
+                parent.wait(time.monotonic() + 2)
+            if owner.active:
+                try:
+                    owner.close()
+                except c.CleanupError:
+                    if kind != 'parent_death':
+                        raise
+            for fd in test_handles:
+                os.close(fd)
+
+
 class ProcessCustodyTests(unittest.TestCase):
     def probe(self, name):
         old_subreaper = c._subreaper()
@@ -742,6 +906,7 @@ class ProcessCustodyTests(unittest.TestCase):
                         os.close(fd)
             c._subreaper(old_subreaper)
 
+    def test_retained_observer_child_keeps_its_observers_ordinary_wait(self): self.probe('retained_observer_child_wait')
     def test_stop_refusal_resumes_only_successful_stop(self): self.probe('first_red')
     def test_direct_term_and_policy_restoration(self): self.probe('direct_term')
     def test_complete_thread_roster_and_read_failure(self): self.probe('complete_threads')
@@ -772,6 +937,17 @@ class ProcessCustodyTests(unittest.TestCase):
     def test_native_only_ignored_term_refused_before_mutation(self): self.probe('native_ignored_term')
     def test_direct_wait_is_bounded_and_failure_reaped(self): self.probe('bounded_direct_wait')
     def test_direct_owned_observer_resumed_and_reaped_after_refusal(self): self.probe('owned_stop_refusal')
+
+
+for kind in ('outside', 'stale', 'extra', 'unavailable', 'duplicate', 'dead',
+             'post_pin_census', 'foreign_observer', 'parent_death'):
+    name = 'retained_child_' + kind
+    def probe_case(observer, workload, kind=kind):
+        retained_child_refusal(kind, workload)
+    globals()[name] = probe_case
+    def test(self, name=name):
+        self.probe(name)
+    setattr(ProcessCustodyTests, 'test_' + name, test)
 
 
 if __name__ == '__main__':

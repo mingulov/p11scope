@@ -2,6 +2,8 @@
 """Unprivileged coordinator probes with injected BPF acquisition boundaries."""
 import importlib.util
 import copy
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -117,7 +119,8 @@ class FakeMaps(capture.LiveMaps):
         name, size = item['name'], item['bytes_value']
         workers = [row for row in capture.ready_roster(self.config, deadline) if row['role'] == 'worker']
         controls = {'COOKIE_CTL': [16384, int(self.config.mode != 'metrics'), 0, 0, 0],
-                    'OWNER_CTL': [16448, len(workers), 0, 0, 0, 0, 0], 'ROOT_CTL': [0] * 8}
+                    'OWNER_CTL': [16448, len(workers), 0, 0, 0, 0, 0],
+                    'ROOT_CTL': [int(self.config.lane in capture.OWNED_LANES)] + [0] * 7}
         if name in controls:
             raw = struct.pack('<' + 'Q' * len(controls[name]), *controls[name])
             cells = [{'key': [0] * 4, 'value': list(raw)}]
@@ -160,7 +163,9 @@ class FakeMaps(capture.LiveMaps):
         stream = []
         for item in maps:
             for task in tasks:
-                if item['name'] == 'TASK_COOKIE' and task['role'] == 'leader' and self.config.mode != 'metrics':
+                if item['name'] == 'ROOT_AFFILIATION' and self.config.lane in capture.OWNED_LANES:
+                    raw = struct.pack('<Q', 1)
+                elif item['name'] == 'TASK_COOKIE' and task['role'] == 'leader' and self.config.mode != 'metrics':
                     raw = struct.pack('<Q', 1)
                 elif item['name'] == 'THREAD_OWNER' and task['role'] == 'worker':
                     raw = bytearray(544)
@@ -176,6 +181,8 @@ class FakeMaps(capture.LiveMaps):
     def open_rings(self, maps, deadline):
         for name in ('DISCOVERY', 'EVENTS'):
             rows = []
+            if name == 'DISCOVERY' and self.config.lane in capture.OWNED_LANES:
+                rows = [bytes(capture.evidence.RING_RECORD_SIZES[name])]
             if name == 'EVENTS' and self.config.workload_mode == 'matrix' and self.config.mode != 'metrics':
                 for index in range(28):
                     kwargs = {}
@@ -632,6 +639,231 @@ def coordinator_case(pid, directory, case):
             os.close(fd)
 
 
+OWNED_OBSERVER = r'''import json, os, pathlib, subprocess, sys, time
+root = pathlib.Path(sys.argv[0]).parent
+control = json.loads((root / 'owned-control.json').read_text())
+case = control['case']
+args = sys.argv[1:]
+assert len(args) == 20 and args[:2] == ['run', '--manifest']
+assert args[3:10] == ['--mode', 'metrics', '--pause', 'never', '--duration', '120', '--kill-on-timeout']
+assert args[10] == '-o' and args[12] == '--'
+assert args[15] == 'matrix'
+ready = pathlib.Path(args[16])
+def marker():
+    print('fixture — privacy=aggregate-only', flush=True)
+def record(pid):
+    with (root / 'owned-pids').open('a') as stream:
+        stream.write(str(pid) + '\n')
+record(os.getpid())
+if case.startswith('capture_first'):
+    marker()
+    time.sleep(.08)
+if case in ('death_unknown', 'missing_ready'):
+    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+    record(child.pid)
+    if case == 'missing_ready':
+        marker()
+        child.wait()
+    time.sleep(.08)
+    os._exit(7)
+if case == 'wrong_executable':
+    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+    record(child.pid)
+    generation = int(pathlib.Path('/proc/%d/stat' % child.pid).read_text().rsplit(') ',1)[1].split()[19])
+    ready.write_text(json.dumps(dict(schema='p11scope/canary-roster/v1', mode='matrix', pid=child.pid,
+        tasks=[dict(pid=child.pid, tid=child.pid, generation=generation, role='leader', call_index=None)])))
+else:
+    child = subprocess.Popen(args[13:])
+    record(child.pid)
+end = time.monotonic() + 3
+while not ready.exists():
+    assert child.poll() is None and time.monotonic() < end
+    time.sleep(.005)
+if case == 'extra_child':
+    extra = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+    record(extra.pid)
+if case in ('stale_generation', 'foreign_ready'):
+    roster = json.loads(ready.read_text())
+    if case == 'stale_generation':
+        roster['tasks'][0]['generation'] += 1
+    else:
+        roster['pid'] = control['outside_pid']
+        roster['tasks'][0].update(pid=roster['pid'], tid=roster['pid'], generation=control['outside_generation'])
+    ready.write_text(json.dumps(roster))
+if not case.startswith('capture_first'):
+    time.sleep(1 if case == 'missing_capture' else .08)
+    marker()
+status = child.wait()
+(root / 'owned-wait.json').write_text(json.dumps({'status': status, 'pid': child.pid}))
+sys.exit(7 if case == 'observer_bad_exit' else status)
+'''
+
+
+def owned_config(pid, directory, case, program, provider):
+    directory = Path(directory)
+    lane = 'owned-feature-metrics' if case.endswith('_feature') else 'owned-default-metrics'
+    prefix = directory / lane
+    executable = directory / 'owned-observer'
+    executable.write_text('#!' + sys.executable + '\n' + OWNED_OBSERVER)
+    executable.chmod(0o700)
+    (directory / 'owned-control.json').write_text(json.dumps({'case': case,
+        'outside_pid': pid, 'outside_generation': generation(pid)}))
+    (directory / 'matrix-manifest.json').write_text('{}')
+    variant, mode, privacy, workload_mode = capture.LANES[lane]
+    config = SimpleNamespace(lane=lane, variant=variant, mode=mode, privacy=privacy,
+        workload_mode=workload_mode, workload_origin='owned', workload_pid=None, generation=None,
+        target_bits=64, out_dir=directory, prefix=prefix, reader=Path(sys.executable), obj=Path(sys.executable),
+        **{name: Path(f'{prefix}.{suffix}') for name, suffix in (
+            ('ready', 'ready'), ('go', 'go'), ('done', 'done'), ('finish', 'finish'),
+            ('observer_log', 'observer.log'), ('workload_log', 'observer.log'))})
+    config.observer_args = [str(executable), 'run', '--manifest', str(directory / 'matrix-manifest.json'),
+        '--mode', 'metrics', '--pause', 'never', '--duration', '120', '--kill-on-timeout', '-o',
+        str(prefix) + '.output', '--', program, provider, 'matrix', str(config.ready),
+        str(config.go), str(config.done), str(config.finish)]
+    return config
+
+
+def owned_case(pid, directory, case, program, provider):
+    config = owned_config(pid, directory, case, program, provider)
+    source = FakeMaps(config)
+    coordinator, owner = capture.Coordinator(config, source), c.Custody()
+    handles, signals, waits, replays, readiness_deadlines = [], [], [], [], []
+    launch, retain, send = owner.launch, owner.retain_observer_child, signal.pidfd_send_signal
+    check, frames, dump = coordinator.check, source.frames, source.dump
+    replay = capture.evidence.assert_stopped_snapshot
+    positive = case.startswith(('ready_first', 'capture_first'))
+    def launched(*args, **kwargs):
+        readiness_deadlines.append(kwargs['deadline'])
+        observer = launch(*args, **kwargs)
+        handles.append(os.dup(observer.group.fd))
+        return observer
+    def retained(*args, **kwargs):
+        assert args[3] == readiness_deadlines[0], 'owned readiness budget was reset'
+        group = retain(*args, **kwargs)
+        handles.append(os.dup(group.fd))
+        assert group.wait_owner == 'observer' and group.origin == 'observer-child'
+        assert all(process.group is not group for process in owner.processes)
+        # While the observer is alive, this coordinator cannot consume its
+        # child's ordinary status even when using its retained pidfd.
+        try:
+            os.waitid(os.P_PIDFD, group.fd, os.WEXITED | os.WNOHANG)
+        except ChildProcessError:
+            waits.append('ECHILD')
+        else:
+            raise AssertionError('coordinator stole observer child wait')
+        return group
+    def sent(fd, number, *args):
+        signals.append((fd, number))
+        if number == signal.SIGSTOP:
+            group = next(group for group in owner.groups if group.fd == fd)
+            if group.role == 'workload':
+                assert config.done.is_file(), 'owned workload STOP preceded DONE'
+        return send(fd, number, *args)
+    def checked(phase, deadline=None):
+        check(phase, deadline)
+        if case == 'death_stopped' and phase == 'workload-stopped':
+            observer = next(group for group in owner.groups if group.role == 'observer')
+            send(observer.fd, signal.SIGKILL)
+            assert select.select([observer.fd], [], [], 1)[0]
+            raise capture.CaptureError('injected observer death after workload STOP')
+    def framed(*args):
+        raw = frames(*args)
+        header = capture.dumper.TASK_STORAGE_HEADER
+        if case == 'root_missing':
+            return raw[header.size + 8:]
+        if case == 'root_invalid':
+            raw = bytearray(raw)
+            struct.pack_into('<Q', raw, header.size, 0x100000001)
+            return bytes(raw)
+        if case in ('cookie', 'owner'):
+            name, size = ('TASK_COOKIE', 8) if case == 'cookie' else ('THREAD_OWNER', 544)
+            item = next(item for item in source.maps if item['name'] == name)
+            value = struct.pack('<Q', 1) + bytes(size - 8)
+            return header.pack(capture.dumper.TASK_STORAGE_MAGIC, 1, item['id'], config.workload_pid,
+                               config.workload_pid, size) + value + raw
+        return raw
+    def dumped(item, *args):
+        rows = dump(item, *args)
+        if (case == 'root_control' and item['name'] == 'ROOT_CTL') or (
+                case == 'cookie_history' and item['name'] == 'COOKIE_CTL'):
+            rows[0]['value'][8] = '01'
+        if case == 'start' and item['name'] == 'START':
+            rows.append({'key': list(bytes(16)), 'value': list(bytes(288))})
+        return rows
+    def replayed(manifest, prefix):
+        replays.append(Path(prefix))
+        assert not (Path(directory) / f'mapdump_manifest_{config.lane}.json').exists()
+        if len(replays) == 2:
+            observer = next(process for process in owner.processes if process.group.role == 'observer')
+            assert observer.settled and observer.popen.returncode == 0
+            assert json.loads((Path(directory) / 'owned-wait.json').read_text())['status'] == 0
+            assert not owner.active and all(group.closed for group in owner.groups)
+        return replay(manifest, prefix)
+    error = None
+    try:
+        with ExitStack() as stack:
+            for target, name, side_effect in ((owner, 'launch', launched),
+                    (owner, 'retain_observer_child', retained), (signal, 'pidfd_send_signal', sent),
+                    (coordinator, 'check', checked), (source, 'frames', framed), (source, 'dump', dumped),
+                    (capture.evidence, 'assert_stopped_snapshot', replayed)):
+                stack.enter_context(patch.object(target, name, side_effect=side_effect))
+            stack.enter_context(patch.object(c, 'Custody', return_value=owner))
+            if case in ('missing_ready', 'missing_capture'):
+                stack.enter_context(patch.object(capture, 'READY_SECONDS', .25))
+            if case == 'unavailable_children':
+                children = c.Group.children
+                def unavailable(group, *args, **kwargs):
+                    if group.role == 'observer':
+                        raise c.CustodyError('injected unavailable complete child census')
+                    return children(group, *args, **kwargs)
+                stack.enter_context(patch.object(c.Group, 'children', side_effect=unavailable, autospec=True))
+            if case == 'events':
+                opened = source.open_rings
+                def event(*args):
+                    opened(*args)
+                    source.rings['EVENTS'].rows = [fixtures.event_bytes(0)]
+                stack.enter_context(patch.object(source, 'open_rings', side_effect=event))
+            try:
+                manifest = coordinator.run()
+            except capture.CaptureError as caught:
+                error = caught
+        assert (error is None) == positive, (case, error)
+        assert not owner.active and all(group.closed for group in owner.groups)
+        assert all(reader.closed for reader in source.opened_rings)
+        assert not Path(str(config.prefix) + '.workload.log').exists()
+        if positive:
+            assert manifest.is_file() and len(replays) == 2 and waits == ['ECHILD']
+            assert config.done.is_file() and config.finish.is_file()
+            assert 'canary_workload matrix: all calls CKR_OK' in config.observer_log.read_text()
+            receipt = json.loads((Path(directory) / f'mapdump_snapshot_{config.lane}.json').read_text())
+            assert receipt['lane'] == 'owned-root' and receipt['expected'][0]['root'] is True
+            assert receipt['expected'][0]['cookie'] is False and receipt['expected'][0]['owner'] is False
+            for group in owner.groups:
+                if group.role in ('observer', 'workload'):
+                    assert (group.fd, signal.SIGSTOP) in signals and (group.fd, signal.SIGCONT) in signals
+        else:
+            assert not list(Path(directory).glob('mapdump_*'))
+            assert not list(Path(directory).glob(f'.{config.lane}.*'))
+        if case in ('death_unknown', 'death_stopped'):
+            assert 'custody-close' in str(error), str(error)
+        if case in ('missing_ready', 'missing_capture'):
+            assert 'phase deadline expired' in str(error), str(error)
+            assert not config.go.exists() and not source.opened_rings
+        for fd in handles:
+            assert select.select([fd], [], [], 1)[0], 'owned process survived cleanup'
+    finally:
+        for fd in handles:
+            try:
+                send(fd, signal.SIGCONT)
+                send(fd, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if owner.active:
+            owner.close()
+        for fd in handles:
+            os.close(fd)
+
+
 class StoppedCanaryCaptureTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -657,6 +889,7 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
         child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
         outside = os.pidfd_open(child.pid)
         workload, workload_fd, log, fifo_observer_fd = None, None, None, None
+        owned_handles = {}
         try:
             with tempfile.TemporaryDirectory() as directory:
                 pid = child.pid
@@ -678,7 +911,23 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
                         time.sleep(.005)
                 command = ['timeout', '--kill-after=1s', '2s' if name.startswith('case:fifo:') else '12s',
                            sys.executable, '-I', __file__, '--probe', name, str(pid), directory]
-                if name.startswith('case:fifo:'):
+                if name.startswith('owned:'):
+                    command += [str(self.program), str(self.matrix)]
+                    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    marker = Path(directory) / 'owned-pids'
+                    end = time.monotonic() + 14
+                    while process.poll() is None and time.monotonic() < end:
+                        if marker.exists():
+                            for line in marker.read_text().splitlines():
+                                if line.isdecimal() and int(line) not in owned_handles:
+                                    try:
+                                        owned_handles[int(line)] = os.pidfd_open(int(line))
+                                    except ProcessLookupError:
+                                        pass
+                        time.sleep(.005)
+                    stdout, stderr = process.communicate(timeout=2)
+                    result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+                elif name.startswith('case:fifo:'):
                     # Keep an observer handle outside the watchdog's process
                     # tree: even a RED coordinator killed while blocked cannot
                     # strand its stopped observer during test teardown.
@@ -708,6 +957,13 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
                         self.assertEqual(workload.wait(timeout=2), -signal.SIGTERM)
                 self.assertEqual(c._children(os.getpid(), [os.getpid()], time.monotonic() + 1), [child.pid])
         finally:
+            for fd in owned_handles.values():
+                try:
+                    signal.pidfd_send_signal(fd, signal.SIGCONT)
+                    signal.pidfd_send_signal(fd, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                os.close(fd)
             if fifo_observer_fd is not None:
                 try:
                     signal.pidfd_send_signal(fifo_observer_fd, signal.SIGCONT)
@@ -866,6 +1122,78 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
     def test_complete_metrics_replays_stage_and_final_before_manifest(self):
         self.probe('complete_metrics')
 
+    def test_owned_argv_rejects_options_overrides_and_mismatched_paths_before_launch(self):
+        changes = {'command': (1, 'profile'), 'manifest': (3, '/tmp/other-manifest.json'),
+            'mode': (5, 'profile'), 'pause': (7, 'always'), 'duration': (9, '6'),
+            'kill_timeout': (10, '--other'), 'output': (12, '/tmp/other-output'),
+            'separator': (13, '--pid'), 'provider': (15, 'relative-provider.so'),
+            'matrix': (16, 'blocked'), 'ready': (17, '/tmp/other-ready'),
+            'go': (18, '/tmp/other-go'), 'done': (19, '/tmp/other-done'),
+            'finish': (20, '/tmp/other-finish')}
+        for problem in (*changes, 'duplicate_pause', 'missing_tail', 'missing_manifest'):
+            with self.subTest(problem=problem), tempfile.TemporaryDirectory() as directory:
+                config = owned_config(os.getpid(), directory, 'ready_first', str(self.program), str(self.matrix))
+                if problem in changes:
+                    index, value = changes[problem]
+                    config.observer_args[index] = value
+                elif problem == 'duplicate_pause':
+                    config.observer_args[10:10] = ['--pause', 'never']
+                elif problem == 'missing_tail':
+                    config.observer_args.pop()
+                else:
+                    (Path(directory) / 'matrix-manifest.json').unlink()
+                with patch.object(c.Custody, 'launch') as launched:
+                    with self.assertRaises(capture.CaptureError):
+                        capture.capture(config, FakeMaps(config))
+                    launched.assert_not_called()
+                self.assertFalse(config.observer_log.exists())
+
+    def test_owned_config_rejects_external_identity_origin_split_logs_and_stale_ready(self):
+        for problem in ('pid', 'generation', 'origin', 'separate_log', 'stale_ready'):
+            with self.subTest(problem=problem), tempfile.TemporaryDirectory() as directory:
+                config = owned_config(os.getpid(), directory, 'ready_first', str(self.program), str(self.matrix))
+                if problem == 'pid':
+                    config.workload_pid = os.getpid()
+                elif problem == 'generation':
+                    config.generation = generation(os.getpid())
+                elif problem == 'origin':
+                    config.workload_origin = 'external'
+                elif problem == 'separate_log':
+                    config.workload_log = Path(str(config.prefix) + '.workload.log')
+                else:
+                    config.ready.write_bytes(b'preserve stale READY')
+                with patch.object(c.Custody, 'launch') as launched:
+                    with self.assertRaises(capture.CaptureError):
+                        capture.capture(config, FakeMaps(config))
+                    launched.assert_not_called()
+                self.assertFalse(config.observer_log.exists())
+                if problem == 'stale_ready':
+                    self.assertEqual(config.ready.read_bytes(), b'preserve stale READY')
+
+    def test_origin_cli_requires_external_identity_and_forbids_owned_supplied_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = owned_config(os.getpid(), directory, 'ready_first', str(self.program), str(self.matrix))
+            base = []
+            for name in ('lane', 'variant', 'mode', 'privacy', 'workload_mode', 'out_dir', 'prefix',
+                         'ready', 'go', 'done', 'finish', 'observer_log', 'workload_log', 'reader', 'obj',
+                         'target_bits'):
+                base += ['--' + name.replace('_', '-'), str(getattr(config, name))]
+            parsed = capture.parse_args(base + ['--workload-origin', 'owned', '--'] + config.observer_args)
+            self.assertIsNone(parsed.workload_pid)
+            self.assertIsNone(parsed.generation)
+            capture.validate_config(parsed)
+            for options in ([], ['--workload-pid', str(os.getpid())], ['--generation', '1'],
+                    ['--workload-origin', 'owned', '--workload-pid', '1'],
+                    ['--workload-origin', 'owned', '--generation', '1'],
+                    ['--workload-origin', 'unknown']):
+                with self.subTest(options=options), contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as raised:
+                        capture.parse_args(base + options + ['--'] + config.observer_args)
+                    self.assertEqual(raised.exception.code, 2)
+            external = capture.parse_args(base + ['--workload-pid', str(os.getpid()), '--generation', '1',
+                                                   '--'] + config.observer_args)
+            self.assertEqual(external.workload_origin, 'external')
+
 
 CASES = (
     ['native:' + lane for lane in ('aggregate-only-metrics', 'default-safe-profile', 'default-safe-trace',
@@ -891,10 +1219,21 @@ for case in CASES:
         self.probe('case:' + case)
     setattr(StoppedCanaryCaptureTests, 'test_' + case.replace(':', '_').replace('-', '_'), test)
 
+for case in ('ready_first', 'capture_first', 'ready_first_feature', 'capture_first_feature',
+             'death_unknown', 'death_stopped', 'wrong_executable', 'extra_child', 'stale_generation',
+             'foreign_ready', 'unavailable_children', 'root_missing', 'root_invalid', 'root_control',
+             'cookie', 'cookie_history', 'owner', 'start', 'events', 'observer_bad_exit',
+             'missing_ready', 'missing_capture'):
+    def test(self, case=case):
+        self.probe('owned:' + case)
+    setattr(StoppedCanaryCaptureTests, 'test_owned_' + case, test)
+
 
 if __name__ == '__main__':
     if len(sys.argv) > 1 and sys.argv[1] == '--probe':
-        if sys.argv[2].startswith('case:'):
+        if sys.argv[2].startswith('owned:'):
+            owned_case(int(sys.argv[3]), sys.argv[4], sys.argv[2][6:], sys.argv[5], sys.argv[6])
+        elif sys.argv[2].startswith('case:'):
             coordinator_case(int(sys.argv[3]), sys.argv[4], sys.argv[2][5:])
         else:
             globals()[sys.argv[2]](int(sys.argv[3]), sys.argv[4])

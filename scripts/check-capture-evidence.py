@@ -1550,16 +1550,19 @@ def validate_canary(lane, document, target_bits=64):
         "feature-unsafe-profile": ("unsafe", "profile", "scanned"),
         "feature-unsafe-trace": ("unsafe", "trace", "scanned"),
         "aggregate-only-metrics": ("aggregate", "metrics", "scanned"),
+        "owned-default-metrics": ("aggregate", "metrics", "scanned"),
+        "owned-feature-metrics": ("aggregate", "metrics", "scanned"),
         "freeze-unsafe-profile": ("unsafe", "profile", "manifest-only"),
     }
     require(lane in lanes, f"unknown canary lane: {lane}")
     require(target_bits in (32, 64), f"invalid canary target width: {target_bits!r}")
     policy, kind, discovery = lanes[lane]
+    owned_metrics = lane in {"owned-default-metrics", "owned-feature-metrics"}
     trace = kind == "trace"
     evidence = document if trace else document["evidence"]
     if kind == "metrics":
         require(document["schema"] == METRICS_SCHEMA, document["schema"])
-        exact_metrics_schema(document)
+        exact_metrics_schema(document, run=owned_metrics)
     else:
         exact_profile_v3_selection(document, terminal=trace)
 
@@ -1579,6 +1582,7 @@ def validate_canary(lane, document, target_bits=64):
         aliases=[],
         skipped=[],
         in_flight=0,
+        run=owned_metrics,
     )
     allowances = dict(
         SAFE_ALLOWANCES if policy == "safe" else UNSAFE_ALLOWANCES if policy == "unsafe" else {}
@@ -1621,7 +1625,18 @@ def validate_canary(lane, document, target_bits=64):
         exact_capture_modules(document)
     if policy == "aggregate":
         calls = sum(item["calls"] for item in document["functions"])
-        require(calls == 28, f"aggregate calls: want 28, got {calls}")
+        wanted_calls = 30 if owned_metrics else 28
+        require(calls == wanted_calls,
+                f"aggregate calls: want {wanted_calls}, got {calls}")
+        if owned_metrics:
+            require(evidence["child_still_running"] is False,
+                    f"owned child still running: {evidence['child_still_running']!r}")
+            require(
+                (evidence["pause"], evidence["pause_attempts"],
+                 evidence["pause_confirmed"], evidence["pause_partial"])
+                == ("none", 0, 0, 0),
+                "owned metrics requires exact never-pause evidence",
+            )
 
 
 # Every induced-gap lane holds its workload behind a go-file, so nothing has
@@ -2786,6 +2801,29 @@ def self_test():
     bad["functions"][0]["calls"] = 24
     rejected(lambda: validate_canary("aggregate-only-metrics", bad))
     print("canary aggregate exact baseline: OK")
+
+    owned_aggregate = copy.deepcopy(aggregate)
+    owned_aggregate["functions"] = function_items([(["C_GetInterfaceList"], 30)])
+    owned_aggregate["evidence"]["child_still_running"] = False
+    for lane in ("owned-default-metrics", "owned-feature-metrics"):
+        validate_canary(lane, owned_aggregate)
+        for calls in (28, 29, 31):
+            bad = copy.deepcopy(owned_aggregate)
+            bad["functions"][0]["calls"] = calls
+            rejected(lambda bad=bad, lane=lane: validate_canary(lane, bad))
+        for mutate in (
+            lambda d: d["evidence"].pop("child_still_running"),
+            lambda d: d["evidence"].update(child_still_running=True),
+            lambda d: d["evidence"].update(
+                pause="sigstop", pause_attempts=1, pause_confirmed=1),
+        ):
+            bad = copy.deepcopy(owned_aggregate)
+            mutate(bad)
+            rejected(lambda bad=bad, lane=lane: validate_canary(lane, bad))
+    external_owned = copy.deepcopy(aggregate)
+    external_owned["evidence"]["child_still_running"] = False
+    rejected(lambda: validate_canary("aggregate-only-metrics", external_owned))
+    print("canary owned aggregate exact30 run contract: OK")
 
     induced = {}
     g1 = evidence_fixture(G1_SURFACES, sources=("scan", "manifest"))

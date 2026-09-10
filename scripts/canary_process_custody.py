@@ -410,6 +410,34 @@ class Custody:
         return self._pin(pid, generation, role=role, wait_owner=wait_owner,
                          origin='external', deadline=deadline if deadline is not None else time.monotonic() + 1)
 
+    def retain_observer_child(self, observer, pid, generation, deadline):
+        """Retain this scope's live observer's sole child without taking its wait."""
+        self._require_active()
+        self.check_cancelled()
+        _remaining(deadline)
+        if (self.sealed or self.helper_depth or not isinstance(observer, OwnedProcess)
+                or observer.scope is not self or observer not in self.processes
+                or observer.settled or observer.popen is None or observer.group is None):
+            raise CustodyError('child retention requires this active owned observer')
+        parent = observer.group
+        if (parent not in self.groups or parent.scope is not self or parent.process is not observer
+                or parent.pid != observer.popen.pid or parent.role != 'observer'
+                or parent.origin != 'direct' or parent.wait_owner != 'custody'):
+            raise CustodyError('child retention requires the original direct observer')
+        if type(pid) is not int or pid <= 0 or type(generation) is not int or generation <= 0:
+            raise CustodyError('invalid observer child identity')
+        if any(group.pid == pid for group in self.groups):
+            raise CustodyError('group already retained')
+        allowed = {pid: generation}
+        parent.children(deadline, allowed=allowed)
+        group = self._pin(pid, generation, role='workload', wait_owner='observer',
+                          origin='observer-child', deadline=deadline)
+        parent.children(deadline, allowed=allowed)
+        if any(record[2] != parent.pid for record in group.snapshot(deadline).values()):
+            raise CustodyError('observer child parent changed')
+        self.check_cancelled()
+        return group
+
     def launch(self, argv, *, role='observer', stdout=None, stderr=None, deadline=None):
         self._require_active()
         self.check_cancelled()

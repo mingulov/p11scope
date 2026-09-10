@@ -3680,6 +3680,84 @@ mod tests {
         assert!(lines[1].starts_with("/test/vm-bases/noble/overlay.qcow2|"));
     }
 
+    #[test]
+    fn qemu_preflight_requires_exact_retained_tool_versions() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        use std::process::Command;
+
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
+        let directory = std::env::temp_dir().join(format!(
+            "slice1b2-qemu-preflight-{}-{}",
+            std::process::id(),
+            monotonic_ns().unwrap()
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
+        let system = directory.join("qemu-system-x86_64");
+        let image = directory.join("qemu-img");
+        std::fs::write(
+            &system,
+            "#!/bin/sh\nprintf '%s\\n' 'QEMU emulator version 10.2.1 (pinned)'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &image,
+            "#!/bin/sh\nprintf '%s\\n' 'qemu-img version 10.2.1 (pinned)'\n",
+        )
+        .unwrap();
+        for path in [&system, &image] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = format!("{}:/usr/bin:/bin", directory.display());
+        let accepted = Command::new("bash")
+            .arg("-c")
+            .arg("source \"$1\"; qemu_preflight")
+            .arg("bash")
+            .arg(script)
+            .env("PATH", &path)
+            .status()
+            .unwrap();
+        assert!(accepted.success());
+
+        std::fs::write(
+            &image,
+            "#!/bin/sh\nprintf '%s\\n' 'qemu-img version 10.2.0 (wrong)'\n",
+        )
+        .unwrap();
+        let rejected = Command::new("bash")
+            .arg("-c")
+            .arg("source \"$1\"; qemu_preflight")
+            .arg("bash")
+            .arg(script)
+            .env("PATH", &path)
+            .status()
+            .unwrap();
+        assert!(!rejected.success());
+
+        std::fs::write(
+            &system,
+            "#!/bin/sh\nprintf '%s\\n' 'QEMU emulator version 10.2.0 (mixed)'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &image,
+            "#!/bin/sh\nprintf '%s\\n' 'qemu-img version 10.2.1 (matched)'\n",
+        )
+        .unwrap();
+        let mixed = Command::new("bash")
+            .arg("-c")
+            .arg("source \"$1\"; qemu_preflight")
+            .arg("bash")
+            .arg(script)
+            .env("PATH", &path)
+            .status()
+            .unwrap();
+        assert!(!mixed.success());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     fn write_loader_export(func_ip_zero_hits: u64) -> PathBuf {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 

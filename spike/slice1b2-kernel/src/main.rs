@@ -9101,12 +9101,12 @@ mod tests {
         let image = temp.path().join("qemu-img");
         std::fs::write(
             &system,
-            "#!/bin/sh\nprintf '%s\\n' 'QEMU emulator version 8.2.2 (pinned)'\n",
+            "#!/bin/sh\nprintf '%s\\n' 'QEMU emulator version 10.2.1 (pinned)'\n",
         )
         .unwrap();
         std::fs::write(
             &image,
-            "#!/bin/sh\nprintf '%s\\n' 'qemu-img version 8.2.2 (pinned)'\n",
+            "#!/bin/sh\nprintf '%s\\n' 'qemu-img version 10.2.1 (pinned)'\n",
         )
         .unwrap();
         for path in [&system, &image] {
@@ -9125,7 +9125,7 @@ mod tests {
 
         std::fs::write(
             &image,
-            "#!/bin/sh\nprintf '%s\\n' 'qemu-img version 9.0.0 (wrong)'\n",
+            "#!/bin/sh\nprintf '%s\\n' 'qemu-img version 10.2.0 (wrong)'\n",
         )
         .unwrap();
         let rejected = Command::new("bash")
@@ -9133,10 +9133,30 @@ mod tests {
             .arg("source \"$1\"; qemu_preflight")
             .arg("bash")
             .arg(script)
-            .env("PATH", path)
+            .env("PATH", &path)
             .status()
             .unwrap();
         assert!(!rejected.success());
+
+        std::fs::write(
+            &system,
+            "#!/bin/sh\nprintf '%s\\n' 'QEMU emulator version 10.2.0 (mixed)'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &image,
+            "#!/bin/sh\nprintf '%s\\n' 'qemu-img version 10.2.1 (matched)'\n",
+        )
+        .unwrap();
+        let mixed = Command::new("bash")
+            .arg("-c")
+            .arg("source \"$1\"; qemu_preflight")
+            .arg("bash")
+            .arg(script)
+            .env("PATH", &path)
+            .status()
+            .unwrap();
+        assert!(!mixed.success());
     }
 
     #[test]

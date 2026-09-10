@@ -95,8 +95,8 @@ qemu_preflight() {
     local system_version image_version
     system_version=$(qemu-system-x86_64 --version | sed -n '1p')
     image_version=$(qemu-img --version | sed -n '1p')
-    [[ $system_version =~ ^QEMU\ emulator\ version\ 8\.2\.2([[:space:]\(]|$) ]]
-    [[ $image_version =~ ^qemu-img\ version\ 8\.2\.2([[:space:]\(]|$) ]]
+    [[ $system_version =~ ^QEMU\ emulator\ version\ 10\.2\.1([[:space:]\(]|$) ]] \
+        && [[ $image_version =~ ^qemu-img\ version\ 10\.2\.1([[:space:]\(]|$) ]]
 }
 
 fixed_inventory() {

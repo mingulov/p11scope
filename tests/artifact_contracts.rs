@@ -6035,7 +6035,7 @@ aggregate-only-metrics default metrics"
             );
         }
         assert!(
-            report.contains("Ran 53 tests") && !report.contains("skipped="),
+            report.contains("Ran 57 tests") && !report.contains("skipped="),
             "native {bits}-bit suite must execute every required case: {report}"
         );
 

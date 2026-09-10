@@ -12,7 +12,6 @@ import signal
 import struct
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 
@@ -84,22 +83,36 @@ def bounded_diagnostic(value):
 
 def run_json(args, require_list=False, map_identity=None, *,
              timeout_seconds=JSON_TIMEOUT_SECONDS, max_bytes=JSON_OUTPUT_MAX_BYTES):
-    """Run one bounded JSON acquisition and reap only its direct child.
-
-    Call only from an isolated, single-threaded script with default SIGCHLD
-    retention and no competing waiters (including signal handlers or native
-    threads). Keep those conditions unchanged until this call returns. They
-    preserve direct-child ownership if pidfd acquisition itself fails.
-    """
+    """Acquire JSON under the caller preconditions of _run_bounded_bytes."""
     if (type(timeout_seconds) not in (int, float) or not math.isfinite(timeout_seconds)
             or not 0 < timeout_seconds <= JSON_TIMEOUT_SECONDS
             or not snapshot_uint(max_bytes, 63, positive=True)
             or max_bytes > JSON_OUTPUT_MAX_BYTES):
         raise RuntimeError("bpftool JSON acquisition has invalid bounds")
+    returncode, output, diagnostic = _run_bounded_bytes(
+        args, timeout_seconds=timeout_seconds, max_bytes=max_bytes,
+        label="bpftool JSON acquisition",
+    )
+    return checked_json(
+        args, returncode, output.decode("utf-8", "replace"),
+        diagnostic.decode("utf-8", "replace"), require_list=require_list,
+        map_identity=map_identity,
+    )
+
+
+def _run_bounded_bytes(args, *, timeout_seconds, max_bytes, label):
+    """Collect bounded bytes and reap only this acquisition's direct child.
+
+    Callers validate their own timeout and output limits before entering here.
+    Run only in an isolated, single-threaded script with default SIGCHLD
+    retention and no competing waiters (including signal handlers or native
+    threads). Keep those conditions unchanged until this call returns. They
+    preserve direct-child ownership if pidfd acquisition itself fails.
+    """
     if (threading.current_thread() is not threading.main_thread()
             or threading.active_count() != 1
             or signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL):
-        raise RuntimeError("bpftool JSON acquisition requires one main thread and default SIGCHLD")
+        raise RuntimeError(f"{label} requires one main thread and default SIGCHLD")
     output = bytearray()
     diagnostic = bytearray()
     streams = None
@@ -133,7 +146,7 @@ def run_json(args, require_list=False, map_identity=None, *,
         while streams.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                failure = f"bpftool JSON acquisition timed out after {timeout_seconds:g}s"
+                failure = f"{label} timed out after {timeout_seconds:g}s"
                 break
             for key, _events in streams.select(min(0.05, remaining)):
                 chunk = os.read(key.fileobj.fileno(), 65536)
@@ -144,7 +157,7 @@ def run_json(args, require_list=False, map_identity=None, *,
                 if target is output:
                     target.extend(chunk[:max_bytes + 1 - len(target)])
                     if len(target) > max_bytes:
-                        failure = f"bpftool JSON acquisition exceeded output bound {max_bytes}"
+                        failure = f"{label} exceeded output bound {max_bytes}"
                         break
                 elif len(target) <= DIAGNOSTIC_LIMIT:
                     target.extend(chunk[:DIAGNOSTIC_LIMIT + 1 - len(target)])
@@ -155,12 +168,12 @@ def run_json(args, require_list=False, map_identity=None, *,
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise RuntimeError(
-                f"bpftool JSON acquisition timed out after {timeout_seconds:g}s")
+                f"{label} timed out after {timeout_seconds:g}s")
         try:
             returncode = process.wait(timeout=remaining)
         except subprocess.TimeoutExpired:
             raise RuntimeError(
-                f"bpftool JSON acquisition timed out after {timeout_seconds:g}s") from None
+                f"{label} timed out after {timeout_seconds:g}s") from None
     except BaseException as error:
         primary_error = error
         primary_traceback = error.__traceback__
@@ -211,11 +224,7 @@ def run_json(args, require_list=False, map_identity=None, *,
         raise primary_error.with_traceback(primary_traceback)
     if cleanup_error is not None:
         raise cleanup_error.with_traceback(cleanup_error.__traceback__)
-    return checked_json(
-        args, returncode, output.decode("utf-8", "replace"),
-        diagnostic.decode("utf-8", "replace"), require_list=require_list,
-        map_identity=map_identity,
-    )
+    return returncode, bytes(output), bytes(diagnostic)
 
 
 def map_oracle(item):
@@ -425,6 +434,15 @@ def task_storage_specs(maps):
 
 def run_task_storage_reader(reader, obj, observer_pid, maps, *, timeout_seconds,
                             max_records, max_bytes):
+    """Acquire native frames under _run_bounded_bytes' caller preconditions."""
+    if (not snapshot_uint(observer_pid, 32, positive=True)
+            or not snapshot_uint(max_records, 32, positive=True)
+            or max_records > TASK_STORAGE_MAX_RECORDS
+            or not snapshot_uint(max_bytes, 32, positive=True)
+            or max_bytes > TASK_STORAGE_MAX_BYTES
+            or type(timeout_seconds) not in (int, float)
+            or not 0 < timeout_seconds <= 60 or not math.isfinite(timeout_seconds)):
+        raise RuntimeError("task-storage reader has invalid bounds")
     reader = Path(reader)
     obj = Path(obj)
     if not reader.is_absolute() or not obj.is_absolute():
@@ -446,29 +464,15 @@ def run_task_storage_reader(reader, obj, observer_pid, maps, *, timeout_seconds,
             ))
         )
     output_limit = max_bytes + (max_records + 1) * TASK_STORAGE_HEADER.size
-    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-        process = subprocess.Popen(arguments, stdout=stdout, stderr=stderr)
-        try:
-            returncode = process.wait(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired as error:
-            process.kill()
-            process.wait()
-            raise RuntimeError(
-                f"task-storage reader timed out after {timeout_seconds:g}s"
-            ) from error
-        stderr.seek(0)
-        diagnostic = bounded_diagnostic(stderr.read(DIAGNOSTIC_LIMIT + 1))
-        if returncode:
-            raise RuntimeError(
-                f"task-storage reader failed with status {returncode}: {diagnostic}"
-            )
-        size = os.fstat(stdout.fileno()).st_size
-        if size > output_limit:
-            raise RuntimeError(
-                f"task-storage reader exceeded framed output bound: {size} > {output_limit}"
-            )
-        stdout.seek(0)
-        return stdout.read()
+    returncode, output, diagnostic = _run_bounded_bytes(
+        arguments, timeout_seconds=timeout_seconds, max_bytes=output_limit,
+        label="task-storage reader",
+    )
+    if returncode:
+        raise RuntimeError(
+            f"task-storage reader failed with status {returncode}: {bounded_diagnostic(diagnostic)}"
+        )
+    return output
 
 
 def parse_task_storage_frames(data, maps, *, max_records, max_bytes):

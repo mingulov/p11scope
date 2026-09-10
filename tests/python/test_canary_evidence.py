@@ -87,14 +87,15 @@ def json_signal_lifetime_probe(case, interposer=None):
             native.interrupt_then_block()
         return real_mask(how, signals)
 
-    source, first_line = inspect.getsourcelines(dumper.run_json)
+    lifetime = getattr(dumper, "_run_bounded_bytes", dumper.run_json)
+    source, first_line = inspect.getsourcelines(lifetime)
     boundary = ("        cleanup_error = None\n" if case.startswith("entry") else
                 "        if streams is not None:\n")
     boundary_line = first_line + source.index(boundary)
 
     def trace(frame, event, _arg):
         nonlocal injected
-        if (event == "line" and frame.f_code is dumper.run_json.__code__
+        if (event == "line" and frame.f_code is lifetime.__code__
                 and frame.f_lineno == boundary_line and not injected):
             injected = True
             # A real signal at a control-flow boundary, outside cleanup(action).
@@ -368,6 +369,275 @@ class TaskStorageReaderTests(unittest.TestCase):
             self.frame(1, 103, 7001, 7002, b"ROOTCELL"),
             self.frame(2),
         ])
+
+    def test_native_reader_interruptions_reap_only_the_retained_helper(self):
+        dumper = load_dumper()
+        real_popen, real_open, real_kill = subprocess.Popen, os.pidfd_open, os.kill
+        real_selector = dumper.selectors.DefaultSelector
+        unrelated = real_popen([sys.executable, "-c", "import time; time.sleep(5)"])
+        try:
+            for case in ("wait", "reaped-wait", "collection"):
+                with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    reader, obj = root / "reader", root / "reader.bpf.o"
+                    obj.write_bytes(b"object")
+                    reader.write_text(
+                        f"#!{sys.executable}\nimport os,time\n"
+                        f"os.write(1, {self.frame(2)!r})\n" + (
+                            "os.close(1); os.close(2); time.sleep(5)\n"
+                            if case != "reaped-wait" else ""), encoding="utf-8")
+                    reader.chmod(0o700)
+                    children, test_handles, handles, pipes, selectors, raw_signals = [], [], [], [], [], []
+
+                    def capture_popen(*args, **kwargs):
+                        process = real_popen(*args, **kwargs)
+                        children.append(process)
+                        test_handles.append(real_open(process.pid))
+                        pipes.extend([process.stdout or kwargs["stdout"],
+                                      process.stderr or kwargs["stderr"]])
+                        original_wait = process.wait
+                        interrupted = False
+
+                        def interrupt_wait(*args, **kwargs):
+                            nonlocal interrupted
+                            if case != "collection" and not interrupted:
+                                interrupted = True
+                                if case == "reaped-wait":
+                                    self.assertEqual(original_wait(*args, **kwargs), 0)
+                                    with self.assertRaises(ChildProcessError):
+                                        os.waitpid(process.pid, os.WNOHANG)
+                                raise KeyboardInterrupt("injected native wait interruption")
+                            return original_wait(*args, **kwargs)
+
+                        process.wait = interrupt_wait
+                        return process
+
+                    def capture_open(pid, flags=0):
+                        fd = real_open(pid, flags)
+                        handles.append(fd)
+                        return fd
+
+                    def capture_selector():
+                        selector = real_selector()
+                        selectors.append(selector)
+                        if case == "collection":
+                            selector.select = mock.Mock(side_effect=KeyboardInterrupt(
+                                "injected native collection interruption"))
+                        return selector
+
+                    def intercept_kill(pid, sig):
+                        raw_signals.append((pid, sig))
+                        self.assertEqual(pid, children[0].pid)
+                        try:
+                            os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                        except ChildProcessError:
+                            return  # Never forward a signal after actual reap.
+                        real_kill(pid, sig)  # Safe RED cleanup of a still-owned child.
+
+                    try:
+                        with mock.patch.object(dumper.subprocess, "Popen", side_effect=capture_popen), \
+                                mock.patch.object(dumper.os, "pidfd_open", side_effect=capture_open), \
+                                mock.patch.object(dumper.os, "kill", side_effect=intercept_kill), \
+                                mock.patch.object(dumper.selectors, "DefaultSelector", side_effect=capture_selector):
+                            with self.assertRaisesRegex(KeyboardInterrupt, "native .* interruption"):
+                                dumper.run_task_storage_reader(
+                                    reader, obj, 55, self.MAPS, timeout_seconds=0.2,
+                                    max_records=8, max_bytes=4096)
+                        with self.assertRaises(ChildProcessError):
+                            os.waitid(os.P_PIDFD, test_handles[0], os.WEXITED | os.WNOHANG)
+                        self.assertTrue(all(pipe.closed for pipe in pipes))
+                        self.assertEqual(len(handles), 1)
+                        with self.assertRaises(OSError):
+                            os.fstat(handles[0])
+                        self.assertEqual(len(selectors), 1)
+                        with self.assertRaises(ValueError):
+                            type(selectors[0]).select(selectors[0], 0)
+                        self.assertEqual(raw_signals, [])
+                        self.assertIsNone(unrelated.poll())
+                    finally:
+                        for fd in test_handles:
+                            try:
+                                signal.pidfd_send_signal(fd, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                        for process in children:
+                            type(process).wait(process, timeout=1)
+                        for pipe in pipes:
+                            pipe.close()
+                        for selector in selectors:
+                            selector.close()
+                        for fd in test_handles:
+                            os.close(fd)
+        finally:
+            unrelated.kill()
+            unrelated.wait(timeout=1)
+
+    def test_native_reader_validates_native_limits_before_spawn(self):
+        dumper = load_dumper()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reader, obj = root / "reader", root / "reader.bpf.o"
+            reader.write_text(f"#!{sys.executable}\n", encoding="utf-8")
+            reader.chmod(0o700)
+            obj.write_bytes(b"object")
+            good = {"observer_pid": 55, "max_records": 8, "max_bytes": 4096, "timeout_seconds": 1}
+            invalid = {
+                "observer_pid": (0, -1, 1 << 32, True, 55.0, "55"),
+                "max_records": (0, -1, 131073, True, 8.0, "8"),
+                "max_bytes": (0, -1, 64 * 1024 * 1024 + 1, True, 8.0, "8"),
+                "timeout_seconds": (0, -1, 60.001, 10 ** 1000, True, float("inf"), float("nan"), "1"),
+            }
+            for field, values in invalid.items():
+                for value in values:
+                    with self.subTest(field=field, value=value):
+                        arguments = dict(good, **{field: value})
+                        with mock.patch.object(dumper.subprocess, "Popen", side_effect=AssertionError(
+                                "native helper spawned with invalid bounds")):
+                            with self.assertRaisesRegex(RuntimeError, "task-storage reader.*invalid bounds"):
+                                dumper.run_task_storage_reader(reader, obj, maps=self.MAPS, **arguments)
+
+    def test_native_reader_preserves_framed_bytes_argv_and_independent_limits(self):
+        dumper = load_dumper()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reader, obj, argvfile = root / "reader", root / "reader.bpf.o", root / "argv.json"
+            obj.write_bytes(b"object")
+            cases = (
+                (1, 8, 9.25, self.frame(1, 101, 7001, 7001, b"COOKIE01") + self.frame(2)),
+                (3, 560, 8.5, self.complete_stream()),
+                (131072, 64 * 1024 * 1024, 60, self.frame(2)),
+            )
+            for maximum_records, maximum_bytes, timeout, stream in cases:
+                with self.subTest(records=maximum_records, payload=maximum_bytes, timeout=timeout):
+                    reader.write_text(
+                        f"#!{sys.executable}\nimport json,pathlib,sys\n"
+                        f"pathlib.Path({str(argvfile)!r}).write_text(json.dumps(sys.argv[1:]))\n"
+                        f"sys.stdout.buffer.write({stream!r})\n", encoding="utf-8")
+                    reader.chmod(0o700)
+                    # Native framing may exceed the JSON caller's limit. This
+                    # small independent limit detects accidental shared caps.
+                    with mock.patch.object(dumper, "JSON_OUTPUT_MAX_BYTES", 32):
+                        actual = dumper.run_task_storage_reader(
+                            reader, obj, (1 << 32) - 1, list(reversed(self.MAPS)),
+                            timeout_seconds=timeout, max_records=maximum_records,
+                            max_bytes=maximum_bytes)
+                    self.assertIs(type(actual), bytes)
+                    self.assertEqual(actual, stream)
+                    self.assertEqual(json.loads(argvfile.read_text()), [
+                        str(obj), "4294967295", str(maximum_records), str(maximum_bytes),
+                        str(int(timeout * 1000)),
+                        "TASK_COOKIE:101:task_storage:4:8:0:1",
+                        "THREAD_OWNER:102:task_storage:4:544:0:1",
+                        "ROOT_AFFILIATION:103:task_storage:4:8:0:1",
+                    ])
+                    parsed = dumper.parse_task_storage_frames(
+                        actual, self.MAPS, max_records=maximum_records, max_bytes=maximum_bytes)
+                    self.assertEqual(len(parsed), 0 if maximum_records == 131072 else maximum_records)
+                    if maximum_records == 3:
+                        self.assertEqual(parsed[1]["value"][536:], b"LATEBYTE")
+                    if maximum_records < 4:
+                        self.assertEqual(len(actual), maximum_bytes + (maximum_records + 1) * 28)
+
+    def test_native_main_bounds_collection_and_never_publishes_failed_frames(self):
+        dumper = load_dumper()
+        real_popen, real_open, real_close = subprocess.Popen, os.pidfd_open, os.close
+        unrelated = real_popen([sys.executable, "-c", "import time; time.sleep(5)"])
+        good = self.complete_stream()
+        cases = {
+            "output": ("os.write(1, b'x' * 4349); time.sleep(5)", "output bound"),
+            "eof-timeout": (f"os.write(1, {self.frame(2)!r}); os.close(1); os.close(2); time.sleep(5)",
+                            "timed out"),
+            "diagnostic": ("os.write(2, b'e' * 50000); sys.exit(7)", "failed with status 7"),
+            "magic": (f"os.write(1, {b'BADMAGIC' + good[8:]!r})", "invalid magic"),
+            "truncated": (f"os.write(1, {good[:-29]!r})", "truncated"),
+            "trailing": (f"os.write(1, {good + b'x'!r})", "after terminal EOF"),
+            "missing-eof": (f"os.write(1, {good[:-28]!r})", "before terminal EOF"),
+            "eof-metadata": (f"os.write(1, {self.frame(2, map_id=101)!r})", "nonzero metadata"),
+            "pidfd-refusal": ("time.sleep(5)", "native pin refusal"),
+            "pidfd-close": (f"os.write(1, {good!r})", "native pidfd close failure"),
+        }
+        inventory = [{"name": "START", "id": 99, "type": "hash", "bytes_key": 8,
+                      "bytes_value": 288, "max_entries": 16384, "map_flags": 0}, *self.MAPS]
+
+        def fake_json(args, **_kwargs):
+            if args[2:4] == ["map", "show"]:
+                return [next(dict(item) for item in inventory if item["id"] == int(args[-1]))]
+            self.assertEqual(args[2:], ["map", "dump", "id", "99"])
+            return []
+
+        try:
+            for case, (body, message) in cases.items():
+                with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    reader, obj = root / "reader", root / "reader.bpf.o"
+                    obj.write_bytes(b"object")
+                    reader.write_text(f"#!{sys.executable}\nimport os,sys,time\n{body}\n", encoding="utf-8")
+                    reader.chmod(0o700)
+                    children, test_handles, handles, pipes = [], [], [], []
+
+                    def capture_popen(*args, **kwargs):
+                        process = real_popen(*args, **kwargs)
+                        children.append(process)
+                        test_handles.append(real_open(process.pid))
+                        pipes.extend([process.stdout or kwargs["stdout"],
+                                      process.stderr or kwargs["stderr"]])
+                        return process
+
+                    def capture_open(pid, flags=0):
+                        if case == "pidfd-refusal":
+                            raise OSError("injected native pin refusal")
+                        fd = real_open(pid, flags)
+                        handles.append(fd)
+                        return fd
+
+                    def close_then_fail(fd):
+                        real_close(fd)
+                        if case == "pidfd-close" and fd in handles:
+                            raise OSError("injected native pidfd close failure")
+
+                    argv = ["dump-owned-bpf-maps.py", "55", str(root), "case", "0", "16384",
+                            str(reader), str(obj)]
+                    try:
+                        with mock.patch.object(dumper.subprocess, "Popen", side_effect=capture_popen), \
+                                mock.patch.object(dumper.os, "pidfd_open", side_effect=capture_open), \
+                                mock.patch.object(dumper.os, "close", side_effect=close_then_fail), \
+                                mock.patch.object(dumper.glob, "glob", return_value=[]), \
+                                mock.patch.object(dumper, "map_ids_from_fdinfo", return_value=[99, 101, 102, 103]), \
+                                mock.patch.object(dumper, "run_json", side_effect=fake_json), \
+                                mock.patch.object(dumper, "TASK_STORAGE_TIMEOUT_SECONDS", 0.2), \
+                                mock.patch.object(dumper, "TASK_STORAGE_MAX_RECORDS", 8), \
+                                mock.patch.object(dumper, "TASK_STORAGE_MAX_BYTES", 4096), \
+                                mock.patch.object(sys, "argv", argv):
+                            with self.assertRaisesRegex((RuntimeError, OSError), message) as raised:
+                                dumper.main()
+                        self.assertNotIn("LATEBYTE", str(raised.exception))
+                        if case in ("output", "eof-timeout", "diagnostic"):
+                            self.assertIn("task-storage reader", str(raised.exception))
+                            self.assertLess(len(str(raised.exception)), 4300)
+                        with self.assertRaises(ChildProcessError):
+                            os.waitid(os.P_PIDFD, test_handles[0], os.WEXITED | os.WNOHANG)
+                        self.assertTrue(all(pipe.closed for pipe in pipes))
+                        for fd in handles:
+                            with self.assertRaises(OSError):
+                                os.fstat(fd)
+                        self.assertEqual(list(root.glob("mapdump_*.bin")), [])
+                        self.assertFalse((root / "mapdump_manifest_case.json").exists())
+                        self.assertIsNone(unrelated.poll())
+                    finally:
+                        for fd in test_handles:
+                            try:
+                                signal.pidfd_send_signal(fd, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                        for process in children:
+                            process.wait(timeout=1)
+                        for pipe in pipes:
+                            pipe.close()
+                        for fd in test_handles:
+                            os.close(fd)
+        finally:
+            unrelated.kill()
+            unrelated.wait(timeout=1)
 
     def test_parser_preserves_full_values_and_late_sentinel(self):
         dumper = load_dumper()

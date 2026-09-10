@@ -5820,6 +5820,37 @@ fn canary_process_custody_lifecycle() {
 }
 
 #[test]
+fn stopped_canary_capture_lifecycle() {
+    let output = Command::new("timeout")
+        .args([
+            "--kill-after=2s",
+            "90s",
+            "python3",
+            "-I",
+            "tests/python/test_stopped_canary_capture.py",
+            "StoppedCanaryCaptureTests",
+            "-v",
+        ])
+        .output()
+        .expect("run isolated stopped canary coordinator tests");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "stopped coordinator tests failed: {report}"
+    );
+    assert!(
+        report.contains("Ran 81 tests")
+            && report.contains("StoppedCanaryCaptureTests")
+            && !report.contains("skipped="),
+        "stopped coordinator suite must execute every required case: {report}"
+    );
+}
+
+#[test]
 fn metadata_canary_matrix() {
     let canaries = read("scripts/verify-canaries.sh");
     let checker = read("scripts/check-canary-evidence.py");
@@ -5874,8 +5905,8 @@ aggregate-only-metrics default metrics"
         "\n}\n\necho \"=== live safe START policy",
     );
     let raw_start = start_lane
-        .find("assert_lanes --raw-events")
-        .expect("START lanes must retain their real ring records");
+        .find("sudo python3 -I scripts/capture-stopped-canary.py")
+        .expect("START lanes must acquire retained records through the coordinator");
     let teardown = start_lane
         .find("signal_verified_process TERM")
         .expect("START workload teardown");
@@ -5886,9 +5917,19 @@ aggregate-only-metrics default metrics"
     );
 
     let induced = read("scripts/verify-induced-gaps.sh");
-    for (name, caller) in [
-        ("canary", canaries.as_str()),
-        ("induced-gap", induced.as_str()),
+    for (name, caller, paths, entrypoint) in [
+        (
+            "canary",
+            canaries.as_str(),
+            "\"$TASK_STORAGE_READER\" --obj \"$TASK_STORAGE_OBJECT\"",
+            "sudo python3 -I scripts/capture-stopped-canary.py",
+        ),
+        (
+            "induced-gap",
+            induced.as_str(),
+            "\"$TASK_STORAGE_READER\" \"$TASK_STORAGE_OBJECT\"",
+            "sudo python3 -I scripts/dump-owned-bpf-maps.py",
+        ),
     ] {
         assert_eq!(
             caller
@@ -5898,20 +5939,23 @@ aggregate-only-metrics default metrics"
             "{name} caller must build the reader exactly once"
         );
         assert_eq!(
-            caller
-                .matches("\"$TASK_STORAGE_READER\" \"$TASK_STORAGE_OBJECT\"")
-                .count(),
+            caller.matches(paths).count(),
             2,
-            "{name} caller must pass both explicit native paths to every live dump"
+            "{name} caller must pass both explicit native paths to every live acquisition"
         );
         assert_eq!(
-            caller
-                .matches("sudo python3 -I scripts/dump-owned-bpf-maps.py")
-                .count(),
+            caller.matches(entrypoint).count(),
             2,
-            "{name} live dumps must ignore ambient Python imports"
+            "{name} live acquisitions must ignore ambient Python imports"
         );
     }
+    assert!(
+        !canaries.contains("--raw-events")
+            && !canaries.contains("launch_root_recorded_process")
+            && !canaries.contains("signal_verified_root_process")
+            && canaries.contains("\"$WORK/$lane.done\" \"$WORK/$lane.finish\""),
+        "canary lanes must use coordinator custody and the matrix DONE/FINISH handshake"
+    );
     let directory = tempfile::tempdir().unwrap();
     let reader_build = directory.path().join("task-storage-reader");
     let reader_build_text = reader_build.to_str().unwrap();

@@ -137,7 +137,8 @@ class CanaryWorkloadTests(unittest.TestCase):
         wrapper_source.write_text(PTHREAD_WRAP_SOURCE, encoding="utf-8")
         clock_wrapper_source.write_text(CLOCK_WRAP_SOURCE, encoding="utf-8")
         common = ["cc", f"-m{TARGET_BITS}", "-std=c11", "-Wall", "-Wextra", "-Werror"]
-        cls.compile(common + ["-shared", "-fPIC", "-DPRIVACY_FIXTURE=1", "-o",
+        # The provider uses MAP_ANONYMOUS, hidden by strict C11 on older glibc.
+        cls.compile(common + ["-shared", "-fPIC", "-D_DEFAULT_SOURCE", "-DPRIVACY_FIXTURE=1", "-o",
                             str(cls.provider), str(PROVIDER_SOURCE)])
         cls.compile(common + ["-shared", "-fPIC", "-o", str(cls.recorder),
                             str(recorder_source)])

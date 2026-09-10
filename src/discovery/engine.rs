@@ -24515,6 +24515,15 @@ int main(int argc, char **argv) {
         )
     }
 
+    fn replace_fixture_with_changed_elf(path: &Path) {
+        let before = object_facts(path);
+        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        file.write_all(&[0]).unwrap();
+        let after = object_facts(path);
+        assert_eq!(before.2, after.2, "fixture executable layout changed");
+        assert_ne!(before.1, after.1, "fixture identity did not change");
+    }
+
     fn valid_manifest_for(paths: &[PathBuf], targets: &[u32]) -> Manifest {
         use p11scope_manifest::manifest::*;
 
@@ -24694,7 +24703,7 @@ int main(int argc, char **argv) {
         let paths = vec![provider.clone()];
         let targets = vec![0; 67];
         let manifest = valid_manifest_for(&paths, &targets);
-        std::fs::copy("/bin/ls", &provider).unwrap();
+        replace_fixture_with_changed_elf(&provider);
         let mut scan = scanned_manifest_replacement(&paths, &targets);
         let mut second = scan.tables[0].clone();
         let midpoint = scan.tables[0].entries.len() / 2;
@@ -24763,7 +24772,7 @@ int main(int argc, char **argv) {
             functions: functions.clone(),
         };
         manifest.surfaces.extend([interface(0), interface(1)]);
-        std::fs::copy("/bin/ls", &provider).unwrap();
+        replace_fixture_with_changed_elf(&provider);
         let mut scan = scanned_manifest_replacement(&paths, &targets);
         let (key, _, offset) = object_facts(&provider);
         scan.tables[0].version = (3, 0);
@@ -24811,7 +24820,7 @@ int main(int argc, char **argv) {
         let targets = vec![0; 67];
         let mut manifest = valid_manifest_for(&paths, &targets);
         manifest.surfaces[0].functions[66].resolution = Resolution::NullPointer;
-        std::fs::copy("/bin/ls", &provider).unwrap();
+        replace_fixture_with_changed_elf(&provider);
         let mut scan = scanned_manifest_replacement(&paths, &targets);
         scan.tables[0].entries.pop();
         let pins = pin_scan(&scan);
@@ -24883,7 +24892,7 @@ int main(int argc, char **argv) {
             },
         ];
 
-        std::fs::copy("/bin/ls", &replaced).unwrap();
+        replace_fixture_with_changed_elf(&replaced);
         let mut scan_targets = targets.clone();
         scan_targets[1] = 0;
         scan_targets[2] = 0;
@@ -24993,7 +25002,7 @@ int main(int argc, char **argv) {
         manifest_targets[0] = 1;
         let manifest = valid_manifest_for(&paths, &manifest_targets);
 
-        std::fs::copy("/bin/ls", &replaced).unwrap();
+        replace_fixture_with_changed_elf(&replaced);
         let owner_scan = scanned_manifest_replacement(&paths, &vec![0; 67]);
         let unrelated_scan =
             scanned_manifest_replacement(&[unrelated, replaced], &manifest_targets);
@@ -25039,7 +25048,7 @@ int main(int argc, char **argv) {
         let mut targets = vec![0; 67];
         targets[0] = 1;
         let manifest = valid_manifest_for(&paths, &targets);
-        std::fs::copy("/bin/ls", &replaced).unwrap();
+        replace_fixture_with_changed_elf(&replaced);
 
         let mut proof_module = scanned_manifest_replacement(&paths, &targets);
         let (provider_key, _, _) = object_facts(&provider);
@@ -25090,7 +25099,7 @@ int main(int argc, char **argv) {
         let paths = vec![provider.clone()];
         let targets = vec![0; 67];
         let manifest = valid_manifest_for(&paths, &targets);
-        std::fs::copy("/bin/ls", &provider).unwrap();
+        replace_fixture_with_changed_elf(&provider);
         let scan = scanned_manifest_replacement(&paths, &targets);
         let mut pins = pin_scan(&scan);
         let input = manifest_input_from_pinning("reconciliation-loss.json", manifest);
@@ -25147,7 +25156,7 @@ int main(int argc, char **argv) {
             &[provider.clone(), replaced.clone(), sole.clone()],
             &targets,
         );
-        std::fs::copy("/bin/ls", &replaced).unwrap();
+        replace_fixture_with_changed_elf(&replaced);
         std::fs::remove_file(&sole).unwrap();
 
         let mut scan_targets = targets.clone();

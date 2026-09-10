@@ -15,6 +15,27 @@ SPEC.loader.exec_module(C)
 OBJECTS = []
 
 
+def instruction_site(lines, sequence, offset=0):
+    """Select one instruction by a short, function-local decoded neighborhood."""
+    insns = C.D.instructions(lines)
+    starts = [i for i in range(len(insns) - len(sequence) + 1)
+              if tuple(op for _, op in insns[i:i + len(sequence)]) == sequence]
+    assert len(starts) == 1, (sequence, starts)
+    return insns[starts[0] + offset]
+
+
+def early_class_site(lines, offset=0):
+    return instruction_site(lines, ('r9 = 0x40000', 'r5 = 0x0', 'r6 = 0x0'), offset)
+
+
+def instruction_change(lines, instruction, new):
+    pc, old = instruction
+    raw = [line for line in lines if C.D.line_pc(line) == pc]
+    assert len(raw) == 1, (pc, raw)
+    assert raw[0].count(old) == 1, (pc, old)
+    return raw[0], raw[0].replace(old, new)
+
+
 def change_function(disassembly, suffix, old, new):
     matches = list(re.finditer(r'(?m)^\s*[0-9a-f]+ <([^>]+)>:\s*$', disassembly))
     selected = [(m.end(), matches[i + 1].start() if i + 1 < len(matches) else len(disassembly))
@@ -40,6 +61,14 @@ class DiscoveryFlow(unittest.TestCase):
     def reject(self, elf, disassembly, contract, reason):
         with self.assertRaisesRegex(RuntimeError, re.escape(contract + ':' + reason)):
             C.check_decoded(elf, disassembly, contract)
+
+    def reject_and_restore(self, elf, disassembly, function, old, new, contract, reason):
+        bad = change_function(disassembly, function, old, new)
+        self.reject(elf, bad, contract, reason)
+        (original, changed), = [(a, b) for a, b in zip(disassembly.splitlines(), bad.splitlines()) if a != b]
+        restored = change_function(bad, function, changed, original)
+        self.assertEqual(restored, disassembly)
+        self.assertTrue(C.check_decoded(elf, restored, contract))
 
     def test_untouched_objects(self):
         for variant, elf, disassembly in self.objects:
@@ -75,7 +104,7 @@ class DiscoveryFlow(unittest.TestCase):
             ('child-null', 'p11_link_emit_fork', 'if r4 == 0x0 goto', 'if r4 != 0x0 goto', 'classification'),
             ('context-child-width', 'task_newtask', 'r7 = *(u64 *)(r1 + 0x0)', 'r7 = *(u32 *)(r1 + 0x0)', 'context'),
             ('context-flags-width', 'task_newtask', 'r6 = *(u64 *)(r1 + 0x8)', 'r6 = *(u32 *)(r1 + 0x8)', 'context'),
-            ('flags-restore', 'task_newtask', '\tr2 = r6\n     379:', '\tw2 = w6\n     379:', 'flags'),
+            ('flags-restore', 'task_newtask', '@flags-restore', 'w2 = w6', 'flags'),
             ('redirect-allowed', 'task_newtask', 'R_BPF_64_32\tp11_link_fork_allowed', 'R_BPF_64_32\tp11_link_emit_fork', 'link'),
             ('omit-emit', 'task_newtask', 'R_BPF_64_32\tp11_link_emit_fork', 'R_BPF_64_32\tmissing_bridge', 'link'),
             ('scope-bypass', 'task_newtask', 'if r0 == 0x0 goto +0x21', 'if r0 == 0x1 goto +0x21', 'scope'),
@@ -97,7 +126,7 @@ class DiscoveryFlow(unittest.TestCase):
             ('result-eight', 'classify_direct_interface', 'if r0 != 0x8 goto', 'if r0 != 0x7 goto', 'classification'),
             ('byte-constant', 'classify_direct_interface', '0x31312053434b50 ll', '0x31312053434b51 ll', 'classification'),
             ('nul-constant', 'classify_direct_interface', '0x31312053434b50 ll', '0x131312053434b50 ll', 'classification'),
-            ('wrong-destination', 'classify_direct_interface', '\tr1 = r9\n     766:', '\tr1 = r8\n     766:', 'read'),
+            ('wrong-destination', 'classify_direct_interface', '@name-read-destination', 'r1 = r8', 'read'),
             ('wrong-source', 'classify_direct_interface', '\tr3 = *(u64 *)(r10 - 0x48)', '\tr3 = *(u64 *)(r10 - 0x50)', 'read'),
             ('wrong-readback', 'classify_direct_interface', '\tr1 = *(u64 *)(r10 - 0x40)', '\tr1 = *(u64 *)(r10 - 0x38)', 'classification'),
             ('inverted-length', 'classify_direct_interface', 'if r0 != 0x8 goto', 'if r0 == 0x8 goto', 'classification'),
@@ -115,42 +144,51 @@ class DiscoveryFlow(unittest.TestCase):
     def test_all_payload_predecessors(self):
         # Single decoded instructions, including the independent BN-R1 control.
         cases = [
-            ('BN-R1-early-w9-exact', 709, 'r9 = 0x40000', 'w9 = 0x10000'),
-            ('early-copy', 709, 'r9 = 0x40000', 'r9 = r1'),
-            ('early-alias-copy', 709, 'r9 = 0x40000', 'w9 = w1'),
-            ('early-arithmetic', 709, 'r9 = 0x40000', 'r9 += 0x10000'),
-            ('early-bitwise', 709, 'r9 = 0x40000', 'w9 |= 0x10000'),
-            ('early-unknown-load', 709, 'r9 = 0x40000', 'w9 = *(u32 *)(r10 - 0x40)'),
-            ('early-wrong-finite-class', 709, 'r9 = 0x40000', 'w9 = 0x20000'),
-            ('later-clobber', 710, 'r5 = 0x0', 'w9 = 0x10000'),
-            ('later-unconditional-exact', 711, 'r6 = 0x0', 'r9 = 0x10000'),
-            ('flag-class-contamination', 705, 'r2 = 0x1000000', 'r2 = 0x10000'),
-            ('flag-slot-clobber', 710, 'r5 = 0x0', '*(u64 *)(r10 - 0x48) = r8'),
-            ('unknown-atomic-flag-write', 710, 'r5 = 0x0', 'r0 = cmpxchg_64(r10 - 0x48, r0, r8)'),
-            ('unknown-lock-flag-write', 710, 'r5 = 0x0', 'lock *(u64 *)(r10 - 0x48) += r8'),
-            ('builder-bypass', 712, 'if r3 == 0x0 goto +0x48', 'if r3 == 0x0 goto +0x4a'),
+            ('BN-R1-early-w9-exact', 'early-class', 'w9 = 0x10000'),
+            ('early-copy', 'early-class', 'r9 = r1'),
+            ('early-alias-copy', 'early-class', 'w9 = w1'),
+            ('early-arithmetic', 'early-class', 'r9 += 0x10000'),
+            ('early-bitwise', 'early-class', 'w9 |= 0x10000'),
+            ('early-unknown-load', 'early-class', 'w9 = *(u32 *)(r10 - 0x40)'),
+            ('early-wrong-finite-class', 'early-class', 'w9 = 0x20000'),
+            ('later-clobber', 'early-r5', 'w9 = 0x10000'),
+            ('later-unconditional-exact', 'early-r6', 'r9 = 0x10000'),
+            ('flag-class-contamination', 'flag-init', 'r2 = 0x10000'),
+            ('flag-slot-clobber', 'early-r5', '*(u64 *)(r10 - 0x48) = r8'),
+            ('unknown-atomic-flag-write', 'early-r5', 'r0 = cmpxchg_64(r10 - 0x48, r0, r8)'),
+            ('unknown-lock-flag-write', 'early-r5', 'lock *(u64 *)(r10 - 0x48) += r8'),
+            ('builder-bypass', 'early-null', None),
         ]
         for variant, elf, disassembly in self.objects:
             _, lines = C.function(C.sections(disassembly)['.text'], 'classify_direct_interface', 'fixture')
-            for label, pc, old, new in cases:
+            sites = {name: early_class_site(lines, offset) for offset, name in enumerate(
+                ('early-class', 'early-r5', 'early-r6', 'early-null'))}
+            sites['flag-init'] = instruction_site(lines, ('r2 = 0x1000000', '*(u64 *)(r10 - 0x50) = r2'))
+            branch_pc, branch = sites['early-null']
+            self.assertTrue(branch.startswith('if r3 == 0x0 goto '))
+            insns = C.D.instructions(lines)
+            builder = instruction_site(lines, ('r1 = 0xffffff0000ffff ll', 'r8 &= r1'))
+            self.assertEqual(C.D.relative_target(branch_pc, branch), builder[0])
+            # Enter at the next decoded instruction, skipping the mask initializer.
+            target = insns[insns.index(builder) + 1][0]
+            bypass = f'if r3 == 0x0 goto {target - branch_pc - 1:+#x}'
+            for label, site, new in cases:
                 with self.subTest(variant=variant, mutation=label):
-                    self.assertEqual(dict(C.D.instructions(lines))[pc], old)
-                    raw = [line for line in lines if C.D.line_pc(line) == pc]
-                    self.assertEqual(len(raw), 1)
-                    self.assertEqual(raw[0].count(old), 1)
-                    bad = change_function(disassembly, 'classify_direct_interface', raw[0], raw[0].replace(old, new))
-                    self.reject(elf, bad, 'interface-name', 'provenance')
+                    old, new = instruction_change(lines, sites[site], bypass if new is None else new)
+                    self.reject_and_restore(elf, disassembly, 'classify_direct_interface', old, new,
+                                            'interface-name', 'provenance')
                     print(f'verified {variant} interface-name:provenance {label}')
 
     def test_equivalent_class_alias(self):
         for variant, elf, disassembly in self.objects:
             _, lines = C.function(C.sections(disassembly)['.text'], 'classify_direct_interface', 'fixture')
-            raw = [line for line in lines if C.D.line_pc(line) == 709]
-            self.assertEqual(len(raw), 1)
-            self.assertEqual(dict(C.D.instructions(lines))[709], 'r9 = 0x40000')
-            bad = change_function(disassembly, 'classify_direct_interface', raw[0], raw[0].replace('r9 =', 'w9 ='))
+            old, new = instruction_change(lines, early_class_site(lines), 'w9 = 0x40000')
+            bad = change_function(disassembly, 'classify_direct_interface', old, new)
             with self.subTest(variant=variant):
                 self.assertTrue(C.check_decoded(elf, bad, 'interface-name'))
+                restored = change_function(bad, 'classify_direct_interface', new, old)
+                self.assertEqual(restored, disassembly)
+                self.assertTrue(C.check_decoded(elf, restored, 'interface-name'))
 
     def mutations(self, cases, contract):
         for variant, elf, disassembly in self.objects:
@@ -163,8 +201,25 @@ class DiscoveryFlow(unittest.TestCase):
                         self.assertEqual(len(targets), 1)
                         hook = C.D.function_blocks(secs['tp_btf/task_newtask'])['task_newtask']
                         old = dict(C.D.instructions(hook))[targets[0][2]]
-                    bad = change_function(disassembly, function, old, new)
-                    self.reject(elf, bad, contract, reason)
+                    elif old == '@flags-restore':
+                        secs = C.sections(disassembly)
+                        links = C.D.internal_call_targets(secs['tp_btf/task_newtask'] + secs['.text'])
+                        targets = [c for c in links if c[0] == 'task_newtask' and c[3] == 'p11_link_emit_fork']
+                        self.assertEqual(len(targets), 1)
+                        _, lines = C.function(secs['tp_btf/task_newtask'], function, 'fixture')
+                        insns = C.D.instructions(lines)
+                        call_index = [i for i, (pc, _) in enumerate(insns) if pc == targets[0][2]]
+                        self.assertEqual(len(call_index), 1)
+                        self.assertGreater(call_index[0], 0)
+                        site = insns[call_index[0] - 1]
+                        self.assertEqual(site[1], 'r2 = r6')
+                        old, new = instruction_change(lines, site, new)
+                    elif old == '@name-read-destination':
+                        _, lines = C.function(C.sections(disassembly)['.text'], function, 'fixture')
+                        site = instruction_site(lines, ('r1 = r9', 'r2 = 0x9',
+                                                       'r3 = *(u64 *)(r10 - 0x48)', 'call 0x72'))
+                        old, new = instruction_change(lines, site, new)
+                    self.reject_and_restore(elf, disassembly, function, old, new, contract, reason)
                     print(f'verified {variant} {contract}:{reason} {label}')
 
 

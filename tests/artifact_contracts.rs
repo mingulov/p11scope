@@ -6341,7 +6341,7 @@ fn checks_job(ci: &str) -> &str {
 /// dropped into a new subdirectory would otherwise get no UNRUN line and no
 /// hosted self-test while the block still claims "every privileged script under
 /// scripts/". `__pycache__` is generated, never tracked.
-fn script_dirs() -> Vec<&'static str> {
+fn script_dirs() -> Vec<String> {
     let mut found: Vec<String> = fs::read_dir("scripts")
         .expect("walk scripts")
         .filter_map(Result::ok)
@@ -6352,11 +6352,27 @@ fn script_dirs() -> Vec<&'static str> {
     found.sort();
     assert_eq!(
         found,
-        ["fixtures", "matrix"],
+        ["fixtures", "matrix", "native"],
         "a new directory under scripts/: teach the UNRUN and self-test derivations \
          about it, or a privileged lane there is invisible to both"
     );
-    vec!["scripts", "scripts/matrix"]
+    std::iter::once("scripts".to_string())
+        .chain(
+            found
+                .into_iter()
+                .filter(|name| name != "fixtures")
+                .map(|name| format!("scripts/{name}")),
+        )
+        .collect()
+}
+
+#[test]
+fn every_admitted_script_directory_is_scanned() {
+    assert_eq!(
+        script_dirs(),
+        ["scripts", "scripts/matrix", "scripts/native"],
+        "every admitted non-fixture directory must participate in the lane derivations"
+    );
 }
 
 /// A step's command, with the `- run:` / `run:` shape (a `- name:` label puts the
@@ -6555,6 +6571,7 @@ fn hosted_pipeline_runs_every_unprivileged_self_test() {
 #[test]
 fn hosted_pipeline_names_every_unrun_privileged_lane() {
     let ci = read(".github/workflows/ci.yml");
+    let script_roots = script_dirs();
     // A heuristic in both directions: it reads words, so an unprivileged script
     // whose prose happens to say "kind" is flagged, and a lane needing only
     // `setcap` or `runuser` is not. It errs toward declaring more UNRUN, which is
@@ -6595,7 +6612,7 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
             return true;
         }
         let file = script.rsplit('/').next().unwrap_or(script).to_string();
-        ["scripts", "scripts/matrix"].iter().any(|dir| {
+        script_roots.iter().any(|dir| {
             fs::read_dir(dir)
                 .expect("walk scripts")
                 .filter_map(Result::ok)
@@ -6735,7 +6752,7 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
         }
     }
     let mut expected = BTreeSet::new();
-    for dir in script_dirs() {
+    for dir in &script_roots {
         for entry in fs::read_dir(dir).expect("walk scripts") {
             let path = entry.expect("script entry").path();
             let name = path

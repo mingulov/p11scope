@@ -86,11 +86,7 @@ cleanup() {
 . scripts/cleanup-traps.sh
 
 echo "=== build ==="
-rm -rf "$WORK/default-build" "$WORK/feature-build" "$WORK/helper-build" \
-    "$WORK/task-storage-reader"
-scripts/build-task-storage-reader.sh "$WORK/task-storage-reader"
-TASK_STORAGE_READER=$WORK/task-storage-reader/dump-task-storage
-TASK_STORAGE_OBJECT=$WORK/task-storage-reader/dump-task-storage.bpf.o
+rm -rf "$WORK/default-build" "$WORK/feature-build" "$WORK/helper-build"
 p11scope_product_build "$P11SCOPE_PRODUCT_BUILD_MODE" \
     --release --workspace --target-dir "$WORK/default-build"
 p11scope_product_build "$P11SCOPE_PRODUCT_BUILD_MODE" \
@@ -107,6 +103,10 @@ case $TARGET_BITS in
         ;;
     64) P11SCOPE_DISCOVER="$WORK/default-build/release/p11scope-discover" ;;
 esac
+rm -rf "$WORK/task-storage-reader"
+scripts/build-task-storage-reader.sh "$WORK/task-storage-reader"
+TASK_STORAGE_READER=$WORK/task-storage-reader/dump-task-storage
+TASK_STORAGE_OBJECT=$WORK/task-storage-reader/dump-task-storage.bpf.o
 sudo -n true 2>/dev/null || { echo "passwordless sudo required"; exit 1; }
 gcc "$TARGET_CC_FLAG" -std=c11 -O0 -Wall -Wextra -o "$WORK/canary_workload" \
     scripts/fixtures/canary_workload.c -ldl -pthread

@@ -130,6 +130,16 @@ class DualBuildCallerTests(unittest.TestCase):
             self.assertTrue(all(row["isolated"] == 1 and row["argv"] == []
                                 for row in preparations))
 
+    def test_canary_product_builds_precede_task_storage_helper(self):
+        commands = [command.lstrip() for command in logical_commands(CHILDREN[1])]
+        product_builds = [index for index, command in enumerate(commands)
+                          if command.startswith("p11scope_product_build ")]
+        helper_builds = [index for index, command in enumerate(commands)
+                         if command.startswith("scripts/build-task-storage-reader.sh ")]
+        self.assertEqual(len(product_builds), 3)
+        self.assertEqual(len(helper_builds), 1)
+        self.assertLess(max(product_builds), helper_builds[0])
+
     def test_standalone_defaults_to_ordinary_for_all_variants(self):
         self.assert_builds(CHILDREN[0], 64, False)
         self.assert_builds(CHILDREN[1], 64, False)

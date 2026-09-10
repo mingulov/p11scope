@@ -30,6 +30,7 @@ if [ "${1-}" = "--self-test" ]; then
     python3 -I scripts/check-capture-evidence.py --self-test
     assert_lanes --self-test
     python3 -I tests/python/test_canary_evidence.py --target-bits "$TARGET_BITS" -v
+    python3 -I tests/python/test_canary_workload.py --target-bits "$TARGET_BITS" -v
     exit 0
 fi
 
@@ -303,14 +304,14 @@ run_start_lane() {
         feature-unsafe) start_observer=$P11SCOPE_FEATURE; start_privacy=unsafe-unvalidated-metadata; start_unsafe=1 ;;
         *) echo "unknown START build: $start_build" >&2; exit 1 ;;
     esac
-    rm -f "$WORK/$start_lane.go" \
+    rm -f "$WORK/$start_lane.ready" "$WORK/$start_lane.go" \
         "$WORK/$start_lane.output" "$WORK/$start_lane.observer.log" \
         "$WORK/$start_lane.workload.log" "$WORK"/mapdump_*_"$start_lane".json \
         "$WORK"/mapdump_*_"$start_lane".bin \
         "$WORK/$start_lane".*.raw \
         "$WORK/mapdump_manifest_$start_lane.json"
-    ( while [ ! -f "$WORK/$start_lane.go" ]; do sleep 0.05; done
-      exec "$WORK/canary_workload" "$WORK/privacy-provider.so" "$start_mode" ) \
+    "$WORK/canary_workload" "$WORK/privacy-provider.so" "$start_mode" \
+        "$WORK/$start_lane.ready" "$WORK/$start_lane.go" \
         > "$WORK/$start_lane.workload.log" 2>&1 &
     WPID=$!
     WORKLOAD_STARTTIME=$(process_starttime "$WPID") || {
@@ -318,6 +319,19 @@ run_start_lane() {
         exit 1
     }
     start_workload_pid=$WPID
+    start_ready_attempt=0
+    while [ ! -f "$WORK/$start_lane.ready" ] && [ "$start_ready_attempt" -lt 160 ]; do
+        kill -0 "$WPID" 2>/dev/null || {
+            echo "$start_lane workload exited before complete READY"
+            exit 1
+        }
+        start_ready_attempt=$((start_ready_attempt + 1))
+        sleep 0.05
+    done
+    test -f "$WORK/$start_lane.ready" || {
+        echo "$start_lane workload never published complete READY"
+        exit 1
+    }
     set -- "$start_observer" profile --manifest "$WORK/privacy-manifest.json" \
         --pid "$WPID" \
         --mode profile --duration 8 -o "$WORK/$start_lane.output"

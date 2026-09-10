@@ -5984,6 +5984,7 @@ aggregate-only-metrics default metrics"
                 "OwnedMapWrapperTests",
                 "TaskStorageInventoryTests",
                 "TaskStorageReaderTests",
+                "StoppedPopulationTests",
                 "FinalScannerSurfaceTests",
                 "StartRingSurfaceIntegrationTests",
                 "TargetWidthPathTests",
@@ -6011,6 +6012,7 @@ aggregate-only-metrics default metrics"
             "OwnedMapWrapperTests",
             "TaskStorageInventoryTests",
             "TaskStorageReaderTests",
+            "StoppedPopulationTests",
             "FinalScannerSurfaceTests",
             "StartRingSurfaceIntegrationTests",
             "TargetWidthPathTests",
@@ -6021,8 +6023,35 @@ aggregate-only-metrics default metrics"
             );
         }
         assert!(
-            report.contains("Ran 22 tests") && !report.contains("skipped="),
+            report.contains("Ran 34 tests") && !report.contains("skipped="),
             "native {bits}-bit suite must execute every required case: {report}"
+        );
+
+        let workload_output = Command::new("python3")
+            .args([
+                "-I",
+                "tests/python/test_canary_workload.py",
+                "--target-bits",
+                bits,
+                "CanaryWorkloadTests",
+                "-v",
+            ])
+            .output()
+            .unwrap_or_else(|error| panic!("run canary workload tests for {bits}-bit: {error}"));
+        let workload_report = format!(
+            "{}{}",
+            String::from_utf8_lossy(&workload_output.stdout),
+            String::from_utf8_lossy(&workload_output.stderr)
+        );
+        assert!(
+            workload_output.status.success(),
+            "native {bits}-bit workload tests failed: {workload_report}"
+        );
+        assert!(
+            workload_report.contains("Ran 5 tests")
+                && workload_report.contains("CanaryWorkloadTests")
+                && !workload_report.contains("skipped="),
+            "native {bits}-bit workload suite must execute every required case: {workload_report}"
         );
     }
     let empty = Command::new("python3")

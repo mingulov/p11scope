@@ -4,6 +4,9 @@
  * scripts own all output, map, and non-disclosure assertions. */
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
@@ -11,6 +14,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <time.h>
 #include <unistd.h>
 
 typedef unsigned char CK_BYTE;
@@ -210,26 +216,335 @@ struct concurrent_call {
     fn10 function;
     CK_ULONG args[10];
     CK_RV rv;
+    struct release_barrier *barrier;
+    size_t call_index;
 };
+
+struct task_identity {
+    pid_t tid;
+    uint64_t generation;
+};
+
+struct release_barrier {
+    pthread_mutex_t mutex;
+    pthread_cond_t condition;
+    int initialized;
+    int abort;
+    int released;
+    size_t expected;
+    size_t registered;
+    pid_t pid;
+    struct task_identity leader;
+    struct task_identity workers[4];
+};
+
+static int task_identity(pid_t tid, struct task_identity *identity)
+{
+    char path[64], buffer[1024];
+    snprintf(path, sizeof(path), "/proc/self/task/%ld/stat", (long)tid);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 1;
+    ssize_t length = read(fd, buffer, sizeof(buffer) - 1);
+    int saved_errno = errno;
+    if (close(fd) != 0 && length >= 0) return 1;
+    errno = saved_errno;
+    if (length <= 0 || (size_t)length >= sizeof(buffer)) return 1;
+    buffer[length] = '\0';
+    char *cursor = strrchr(buffer, ')');
+    if (!cursor || cursor[1] != ' ') return 1;
+    cursor += 2;
+    /* starttime is field 22, or the twentieth token after the comm field. */
+    for (unsigned field = 3; field < 22; field++) {
+        cursor = strchr(cursor, ' ');
+        if (!cursor) return 1;
+        cursor++;
+    }
+    errno = 0;
+    char *end = NULL;
+    unsigned long long generation = strtoull(cursor, &end, 10);
+    if (errno || generation == 0 || !end || (*end != ' ' && *end != '\n')) return 1;
+    identity->tid = tid;
+    identity->generation = (uint64_t)generation;
+    return 0;
+}
+
+static struct timespec deadline_after(unsigned seconds)
+{
+    struct timespec deadline;
+    if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) return (struct timespec){0, 0};
+    deadline.tv_sec += (time_t)seconds;
+    return deadline;
+}
+
+static int path_absent(const char *path, const char *label)
+{
+    struct stat metadata;
+    if (lstat(path, &metadata) == 0) {
+        fprintf(stderr, "%s already exists: %s\n", label, path);
+        return 1;
+    }
+    if (errno != ENOENT) {
+        fprintf(stderr, "%s lookup failed: %s: %s\n", label, path, strerror(errno));
+        return 1;
+    }
+    return 0;
+}
+
+static int normalized_destination(const char *path, char output[PATH_MAX])
+{
+    char copy[PATH_MAX], parent[PATH_MAX], resolved[PATH_MAX];
+    if (snprintf(copy, sizeof(copy), "%s", path) >= (int)sizeof(copy)) return 1;
+    char *slash = strrchr(copy, '/');
+    const char *base = copy;
+    if (!slash) {
+        strcpy(parent, ".");
+    } else {
+        base = slash + 1;
+        if (!*base) return 1;
+        if (slash == copy) strcpy(parent, "/");
+        else {
+            *slash = '\0';
+            strcpy(parent, copy);
+        }
+    }
+    if (!realpath(parent, resolved)) return 1;
+    if (snprintf(output, PATH_MAX, "%s/%s", resolved, base) >= PATH_MAX) return 1;
+    return 0;
+}
+
+static int same_destination(const char *first, const char *second)
+{
+    if (strcmp(first, second) == 0) return 1;
+    char normalized_first[PATH_MAX], normalized_second[PATH_MAX];
+    return normalized_destination(first, normalized_first) == 0 &&
+           normalized_destination(second, normalized_second) == 0 &&
+           strcmp(normalized_first, normalized_second) == 0;
+}
+
+static int barrier_init(struct release_barrier *barrier, size_t expected)
+{
+    memset(barrier, 0, sizeof(*barrier));
+    pthread_condattr_t attributes;
+    if (pthread_mutex_init(&barrier->mutex, NULL) != 0) return 1;
+    if (pthread_condattr_init(&attributes) != 0) {
+        pthread_mutex_destroy(&barrier->mutex);
+        return 1;
+    }
+    int status = pthread_condattr_setclock(&attributes, CLOCK_MONOTONIC);
+    if (status == 0) status = pthread_cond_init(&barrier->condition, &attributes);
+    pthread_condattr_destroy(&attributes);
+    if (status != 0) {
+        pthread_mutex_destroy(&barrier->mutex);
+        return 1;
+    }
+    barrier->initialized = 1;
+    barrier->expected = expected;
+    barrier->pid = getpid();
+    if (task_identity((pid_t)syscall(SYS_gettid), &barrier->leader) != 0) {
+        fprintf(stderr, "leader identity read failed\n");
+        pthread_cond_destroy(&barrier->condition);
+        pthread_mutex_destroy(&barrier->mutex);
+        barrier->initialized = 0;
+        return 1;
+    }
+    return 0;
+}
+
+static void barrier_abort(struct release_barrier *barrier)
+{
+    pthread_mutex_lock(&barrier->mutex);
+    barrier->abort = 1;
+    pthread_cond_broadcast(&barrier->condition);
+    pthread_mutex_unlock(&barrier->mutex);
+}
+
+static void barrier_destroy(struct release_barrier *barrier)
+{
+    if (!barrier->initialized) return;
+    pthread_cond_destroy(&barrier->condition);
+    pthread_mutex_destroy(&barrier->mutex);
+    barrier->initialized = 0;
+}
+
+static int write_all(int fd, const char *buffer, size_t length)
+{
+    while (length) {
+        ssize_t written = write(fd, buffer, length);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) return 1;
+        buffer += written;
+        length -= (size_t)written;
+    }
+    return 0;
+}
+
+static int publish_roster(const struct release_barrier *barrier, const char *mode,
+                          const char *ready)
+{
+    char temporary[4096], roster[2048];
+    if (snprintf(temporary, sizeof(temporary), "%s.tmp.%ld", ready,
+                 (long)barrier->pid) >= (int)sizeof(temporary)) {
+        fprintf(stderr, "READY path is too long\n");
+        return 1;
+    }
+    int used = snprintf(roster, sizeof(roster),
+        "{\"schema\":\"p11scope/canary-roster/v1\",\"mode\":\"%s\","
+        "\"pid\":%ld,\"tasks\":[{\"pid\":%ld,\"tid\":%ld,"
+        "\"generation\":%llu,\"role\":\"leader\",\"call_index\":null}",
+        mode, (long)barrier->pid, (long)barrier->pid, (long)barrier->leader.tid,
+        (unsigned long long)barrier->leader.generation);
+    for (size_t i = 0; used > 0 && i < barrier->expected; i++) {
+        int added = snprintf(roster + used, sizeof(roster) - (size_t)used,
+            ",{\"pid\":%ld,\"tid\":%ld,\"generation\":%llu,"
+            "\"role\":\"worker\",\"call_index\":%zu}",
+            (long)barrier->pid, (long)barrier->workers[i].tid,
+            (unsigned long long)barrier->workers[i].generation, i);
+        if (added < 0 || (size_t)added >= sizeof(roster) - (size_t)used) used = -1;
+        else used += added;
+    }
+    if (used < 0 || snprintf(roster + used, sizeof(roster) - (size_t)used, "]}\n") >=
+                        (int)(sizeof(roster) - (size_t)used)) {
+        fprintf(stderr, "READY roster is too large\n");
+        return 1;
+    }
+    size_t length = strlen(roster);
+    int fd = open(temporary, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        fprintf(stderr, "READY temporary create failed: %s\n", strerror(errno));
+        return 1;
+    }
+    int failed = write_all(fd, roster, length);
+    if (!failed && fsync(fd) != 0) failed = 1;
+    if (close(fd) != 0) failed = 1;
+    int linked = 0;
+    if (!failed && link(temporary, ready) != 0) failed = 1;
+    else if (!failed) linked = 1;
+    int saved_errno = errno;
+    if (unlink(temporary) != 0) {
+        failed = 1;
+        saved_errno = errno;
+    }
+    if (failed) {
+        if (linked) unlink(ready);
+        errno = saved_errno;
+        fprintf(stderr, "READY publication failed: %s\n", strerror(errno));
+        return 1;
+    }
+    return 0;
+}
+
+static int wait_for_go(struct release_barrier *barrier, const char *gate)
+{
+    struct timespec deadline = deadline_after(10);
+    for (;;) {
+        struct stat metadata;
+        if (lstat(gate, &metadata) == 0) break;
+        if (errno != ENOENT) {
+            fprintf(stderr, "GO lookup failed: %s: %s\n", gate, strerror(errno));
+            barrier_abort(barrier);
+            return 1;
+        }
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec > deadline.tv_sec ||
+            (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) {
+            fprintf(stderr, "timed out waiting for GO: %s\n", gate);
+            barrier_abort(barrier);
+            return 1;
+        }
+        nanosleep(&(struct timespec){0, 50000000}, NULL);
+    }
+    pthread_mutex_lock(&barrier->mutex);
+    barrier->released = 1;
+    pthread_cond_broadcast(&barrier->condition);
+    pthread_mutex_unlock(&barrier->mutex);
+    return 0;
+}
+
+static int wait_for_registration(struct release_barrier *barrier)
+{
+    struct timespec deadline = deadline_after(10);
+    pthread_mutex_lock(&barrier->mutex);
+    while (!barrier->abort && barrier->registered < barrier->expected) {
+        int status = pthread_cond_timedwait(&barrier->condition, &barrier->mutex, &deadline);
+        if (status == ETIMEDOUT) {
+            fprintf(stderr, "timed out waiting for worker registration\n");
+            barrier->abort = 1;
+            pthread_cond_broadcast(&barrier->condition);
+            break;
+        }
+        if (status != 0) barrier->abort = 1;
+    }
+    int failed = barrier->abort;
+    pthread_mutex_unlock(&barrier->mutex);
+    return failed;
+}
 
 static void *invoke(void *opaque)
 {
     struct concurrent_call *call = opaque;
+    if (call->barrier) {
+        struct task_identity identity;
+        int failed = task_identity((pid_t)syscall(SYS_gettid), &identity);
+        pthread_mutex_lock(&call->barrier->mutex);
+        if (failed || call->call_index >= call->barrier->expected) {
+            fprintf(stderr, "worker identity read failed for call %zu\n", call->call_index);
+            call->barrier->abort = 1;
+        } else {
+            call->barrier->workers[call->call_index] = identity;
+            call->barrier->registered++;
+        }
+        pthread_cond_broadcast(&call->barrier->condition);
+        while (!call->barrier->released && !call->barrier->abort) {
+            if (pthread_cond_wait(&call->barrier->condition,
+                                  &call->barrier->mutex) != 0)
+                call->barrier->abort = 1;
+        }
+        failed = call->barrier->abort;
+        pthread_mutex_unlock(&call->barrier->mutex);
+        if (failed) return NULL;
+    }
     call->rv = call->function(call->args[0], call->args[1], call->args[2], call->args[3],
                              call->args[4], call->args[5], call->args[6], call->args[7],
                              call->args[8], call->args[9]);
     return NULL;
 }
 
-static int run_concurrent(struct concurrent_call *calls, size_t count, const char *label)
+static int run_concurrent(struct concurrent_call *calls, size_t count, const char *label,
+                          const char *mode, const char *ready, const char *gate)
 {
     pthread_t threads[4];
+    struct release_barrier barrier;
+    struct release_barrier *shared = NULL;
     if (count > sizeof(threads) / sizeof(threads[0])) return 1;
+    if (gate) {
+        if (barrier_init(&barrier, count) != 0) return 1;
+        shared = &barrier;
+    }
+    size_t created = 0;
     for (size_t i = 0; i < count; i++) {
-        if (pthread_create(&threads[i], NULL, invoke, &calls[i]) != 0) return 1;
+        calls[i].barrier = shared;
+        calls[i].call_index = i;
+        int status = pthread_create(&threads[i], NULL, invoke, &calls[i]);
+        if (status != 0) {
+            fprintf(stderr, "pthread_create failed for call %zu: %s\n", i, strerror(status));
+            if (shared) barrier_abort(shared);
+            for (size_t j = 0; j < created; j++) pthread_join(threads[j], NULL);
+            if (shared) barrier_destroy(shared);
+            return 1;
+        }
+        created++;
+    }
+    if (shared && (wait_for_registration(shared) != 0 ||
+                   publish_roster(shared, mode, ready) != 0 ||
+                   wait_for_go(shared, gate) != 0)) {
+        barrier_abort(shared);
+        for (size_t i = 0; i < created; i++) pthread_join(threads[i], NULL);
+        barrier_destroy(shared);
+        return 1;
     }
     fprintf(stderr, "%s started %zu calls\n", label, count);
     for (size_t i = 0; i < count; i++) pthread_join(threads[i], NULL);
+    if (shared) barrier_destroy(shared);
     for (size_t i = 0; i < count; i++) if (calls[i].rv != CKR_OK) return 1;
     printf("%s: all calls CKR_OK\n", label);
     return 0;
@@ -248,20 +563,20 @@ static int matrix_call(void **functions, unsigned index, const char *label,
     failures += matrix_call(functions, (index), (label), (CK_ULONG[10]){__VA_ARGS__}); \
 } while (0)
 
-static int wait_for_gate(const char *ready, const char *gate)
+static int wait_for_gate(const char *mode, const char *ready, const char *gate)
 {
     if (!gate) return 0;
-    FILE *handle = fopen(ready, "w");
-    if (!handle) return 1;
-    if (fputs("ready\n", handle) < 0 || fclose(handle) != 0) return 1;
-    while (access(gate, F_OK) != 0) usleep(50000);
-    return 0;
+    struct release_barrier barrier;
+    if (barrier_init(&barrier, 0) != 0) return 1;
+    int status = publish_roster(&barrier, mode, ready) || wait_for_go(&barrier, gate);
+    barrier_destroy(&barrier);
+    return status;
 }
 
 static int run_matrix(void *module, const char *ready, const char *gate)
 {
     void **functions = matrix_functions(module);
-    if (!functions || wait_for_gate(ready, gate) != 0) return 1;
+    if (!functions || wait_for_gate("matrix", ready, gate) != 0) return 1;
 
     get_interface_fn get_interface = (get_interface_fn)dlsym(module, "C_GetInterface");
     if (!get_interface) return 1;
@@ -386,26 +701,28 @@ static int run_matrix(void *module, const char *ready, const char *gate)
     return failures == 0 ? 0 : 1;
 }
 
-static int run_blocked(void *module)
+static int run_blocked(void *module, const char *ready, const char *gate)
 {
     void **functions = matrix_functions(module);
     if (!functions) return 1;
     CK_MECHANISM unknown = {UNKNOWN_MECHANISM_CONTROL, NULL, 0};
     static const char exact[] = "C_Encrypt";
     struct concurrent_call calls[] = {
-        {(fn10)functions[I_EncryptInit], {0x301, ptr(&unknown)}, 0},
-        {(fn10)functions[I_AsyncComplete], {0x302, ptr(exact)}, 0},
-        {(fn10)functions[I_AsyncComplete], {0x303, ptr(LEGACY_HASH_CANDIDATE)}, 0},
-        {(fn10)functions[I_AsyncComplete], {0x304, ptr(ALIAS_ASYNC_NAME)}, 0},
+        {.function = (fn10)functions[I_EncryptInit], .args = {0x301, ptr(&unknown)}},
+        {.function = (fn10)functions[I_AsyncComplete], .args = {0x302, ptr(exact)}},
+        {.function = (fn10)functions[I_AsyncComplete],
+         .args = {0x303, ptr(LEGACY_HASH_CANDIDATE)}},
+        {.function = (fn10)functions[I_AsyncComplete], .args = {0x304, ptr(ALIAS_ASYNC_NAME)}},
     };
     printf("P11SCOPE_POINTERS {\"unknown_mechanism\":%lu,"
            "\"exact_async\":%lu,\"legacy_name\":%lu,\"alias_name\":%lu}\n",
            ptr(&unknown), ptr(exact), ptr(LEGACY_HASH_CANDIDATE), ptr(ALIAS_ASYNC_NAME));
     fflush(stdout);
-    return run_concurrent(calls, sizeof(calls) / sizeof(calls[0]), "blocked hostile subset");
+    return run_concurrent(calls, sizeof(calls) / sizeof(calls[0]), "blocked hostile subset",
+                          "blocked", ready, gate);
 }
 
-static int run_faults(void *module)
+static int run_faults(void *module, const char *ready, const char *gate)
 {
     void **functions = matrix_functions(module);
     if (!functions) return 1;
@@ -415,11 +732,13 @@ static int run_faults(void *module)
     if (!metadata_fault) return 1;
     CK_ATTRIBUTE value_fault = {CKA_TOKEN, (void *)(uintptr_t)1, 1};
     struct concurrent_call calls[] = {
-        {(fn10)functions[I_CopyObject], {0x401, 1, ptr(metadata_fault), 1}, 0},
-        {(fn10)functions[I_SetAttributeValue], {0x402, 1, ptr(&value_fault), 1}, 0},
+        {.function = (fn10)functions[I_CopyObject],
+         .args = {0x401, 1, ptr(metadata_fault), 1}},
+        {.function = (fn10)functions[I_SetAttributeValue],
+         .args = {0x402, 1, ptr(&value_fault), 1}},
     };
     int status = run_concurrent(calls, sizeof(calls) / sizeof(calls[0]),
-                                "blocked template faults");
+                                "blocked template faults", "faults", ready, gate);
     munmap(mapping, mapping_len);
     return status;
 }
@@ -428,16 +747,24 @@ static int run_faults(void *module)
 
 int main(int argc, char **argv)
 {
-    if (argc < 3 || argc > 5) {
+    if (argc != 3 && argc != 5) {
         fprintf(stderr, "usage: %s /path/to/fixture.so matrix|blocked|faults [READY GO]\n", argv[0]);
         return 2;
     }
+    const char *ready = argc == 5 ? argv[3] : NULL;
+    const char *gate = argc == 5 ? argv[4] : NULL;
+    if (gate && same_destination(ready, gate)) {
+        fprintf(stderr, "READY and GO must name distinct destinations\n");
+        return 2;
+    }
+    if (gate && (path_absent(ready, "READY") != 0 || path_absent(gate, "GO") != 0))
+        return 2;
     void *h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
     if (!h) { fprintf(stderr, "dlopen: %s\n", dlerror()); return 1; }
     if (strcmp(argv[2], "matrix") == 0 && argc == 3) return run_matrix(h, NULL, NULL);
     if (strcmp(argv[2], "matrix") == 0 && argc == 5) return run_matrix(h, argv[3], argv[4]);
-    if (strcmp(argv[2], "blocked") == 0) return run_blocked(h);
-    if (strcmp(argv[2], "faults") == 0) return run_faults(h);
+    if (strcmp(argv[2], "blocked") == 0) return run_blocked(h, ready, gate);
+    if (strcmp(argv[2], "faults") == 0) return run_faults(h, ready, gate);
     fprintf(stderr, "usage: %s /path/to/fixture.so matrix|blocked|faults [READY GO]\n", argv[0]);
     return 2;
 }

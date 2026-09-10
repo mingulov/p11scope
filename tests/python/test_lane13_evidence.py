@@ -868,6 +868,20 @@ class Lane13EvidenceTests(unittest.TestCase):
             )
             raise OwnedCommunicationTimeout(result)
 
+    def reap_controlled_body_after_final_read(self, process, descriptor, body, sender):
+        self.signal_owned_process(process, signal.SIGSTOP)
+        try:
+            sender(descriptor, signal.SIGKILL, None, 0)
+            deadline = time.monotonic() + 2
+            while self._pidfd_is_live(descriptor) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertFalse(self._pidfd_is_live(descriptor))
+        finally:
+            self.signal_owned_process(process, signal.SIGCONT)
+        outer_stdout, outer_stderr = process.communicate(timeout=2)
+        self.assertEqual(process.returncode, 0, outer_stderr)
+        self.assertIn(f"controlled child settled {body['pid']}", outer_stdout)
+
     def run_lane(self, mode, name=None, timeout=20, extra_env=None):
         self.clear_state()
         evidence = self.root / (name or mode)
@@ -1888,11 +1902,9 @@ exit "$helper_status"
             nonlocal exited
             if record["record_id"] == body["record_id"] and not exited:
                 exited = True
-                real_sender(control, signal.SIGKILL, None, 0)
-                deadline = time.monotonic() + 2
-                while self._pidfd_is_live(control) and time.monotonic() < deadline:
-                    time.sleep(0.01)
-                self.assertFalse(self._pidfd_is_live(control))
+                self.reap_controlled_body_after_final_read(
+                    proc, control, body, real_sender
+                )
             return real_reread(record)
 
         def observe_real_sender(descriptor, signal_number, siginfo=None, flags=0):
@@ -1918,7 +1930,39 @@ exit "$helper_status"
             except subprocess.TimeoutExpired:
                 decoy.kill()
                 decoy.wait(timeout=2)
-        proc.communicate(timeout=2)
+
+    def test_failed_exit_readiness_assertion_resumes_outer_and_reaps_child(self):
+        proc, evidence, _, release, body = self.start_controlled_body(
+            "failed-exit-readiness"
+        )
+        decoy = self.start_decoy()
+        control = os.dup(self.controlled_bodies[evidence]["pidfd"])
+        self.addCleanup(os.close, control)
+        try:
+            with mock.patch.object(
+                self, "assertFalse", side_effect=AssertionError("injected readiness failure")
+            ):
+                with self.assertRaisesRegex(AssertionError, "injected readiness failure"):
+                    self.reap_controlled_body_after_final_read(
+                        proc, control, body, signal.pidfd_send_signal
+                    )
+            try:
+                outer_stdout, outer_stderr = proc.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.fail("controlled outer remained stopped after readiness failure")
+            self.assertEqual(proc.returncode, 0, outer_stderr)
+            self.assertIn(f"controlled child settled {body['pid']}", outer_stdout)
+            self.assert_process_absent(body["pid"], body["starttime"])
+            self.assertEqual(self.settle_recorded(), [])
+            self.assertIsNone(decoy.poll(), "readiness failure settlement signaled decoy")
+        finally:
+            release.write_text("exit\n")
+            decoy.terminate()
+            try:
+                decoy.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                decoy.kill()
+                decoy.wait(timeout=2)
 
     def test_exited_retained_body_ignores_late_numeric_observation(self):
         proc, evidence, _, release, body = self.start_controlled_body(

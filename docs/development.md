@@ -13,7 +13,7 @@ Install the host build prerequisites from the Ubuntu repositories:
 ```sh
 sudo apt-get update
 sudo apt-get install -y ca-certificates curl git build-essential gcc-multilib \
-  clang-18 llvm jq libseccomp-dev pkg-config python3
+  clang-18 llvm jq libseccomp-dev pkg-config python3 bpftool bpftrace
 ```
 
 Install mise and rustup as your normal user. Keep their standard per-user
@@ -21,8 +21,9 @@ locations: mise data under `~/.local/share/mise`, rustup toolchains under
 `~/.rustup`, and Cargo state and installed tools under `~/.cargo`. Do not set
 project-specific `MISE_DATA_DIR`, `RUSTUP_HOME`, or `CARGO_HOME` values.
 
-The tracked `mise.toml` selects stable Rust 1.88.0. The eBPF build also needs
-the exact nightly and linker used by CI:
+The tracked `mise.toml` selects stable Rust 1.88.0 and Kind 0.33.0 for the
+later Kubernetes lane. The eBPF build also needs the exact nightly and linker
+used by CI:
 
 ```sh
 rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
@@ -30,6 +31,22 @@ rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-s
 mise install
 mise exec -- cargo +1.88 install bpf-linker --version 0.10.4 --locked
 ```
+
+Keep `~/.cargo/bin` on `PATH` so Cargo-installed tools such as `bpf-linker`
+are directly discoverable. The later container lanes also require a working
+Docker daemon; verify both client and server access before running them:
+
+```sh
+command -v bpf-linker
+bpf-linker --version | grep -Fx 'bpf-linker 0.10.4'
+mise exec -- kind version
+docker version
+```
+
+Privileged W7 qualification additionally requires `sudo -n`, `bpftool`,
+`bpftrace`, and `systemd-run`. These are runtime-lane prerequisites rather than
+requirements for ordinary unprivileged builds. Run privileged lanes only when
+they are explicitly authorized.
 
 SoftHSM is optional for the local provider lanes:
 

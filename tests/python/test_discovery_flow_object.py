@@ -136,6 +136,9 @@ class DiscoveryFlow(unittest.TestCase):
             ('null-as-exact', 'classify_direct_interface', 'r9 = 0x30000', 'r9 = 0x10000', 'null'),
             ('other-as-exact', 'classify_direct_interface', 'r9 = 0x20000', 'r9 = 0x10000', 'classification'),
             ('wrong-class-field', 'classify_direct_interface', '*(u64 *)(r10 - 0x40) = r9', '*(u64 *)(r10 - 0x38) = r9', 'metadata'),
+            ('metadata-width', 'classify_direct_interface', '@metadata-u32-store', '*(u64 *)(r10 - 0x8) = r1', 'metadata'),
+            ('metadata-destination', 'classify_direct_interface', '@metadata-u32-store', '*(u32 *)(r10 - 0x10) = r1', 'metadata'),
+            ('metadata-source', 'classify_direct_interface', '@metadata-u32-store', '*(u32 *)(r10 - 0x8) = r2', 'metadata'),
             ('dead-class', 'classify_direct_interface', 'r9 |= r8', 'r9 = r8', 'metadata'),
             ('old-class-retained', 'classify_direct_interface', '0xffffff0000ffff ll', '0xffffffffffffffff ll', 'metadata'),
         ]
@@ -219,6 +222,13 @@ class DiscoveryFlow(unittest.TestCase):
                         site = instruction_site(lines, ('r1 = r9', 'r2 = 0x9',
                                                        'r3 = *(u64 *)(r10 - 0x48)', 'call 0x72'))
                         old, new = instruction_change(lines, site, new)
+                    elif old == '@metadata-u32-store':
+                        _, lines = C.function(C.sections(disassembly)['.text'], function, 'fixture')
+                        matches = [(pc, text) for pc, text in C.D.instructions(lines)
+                                   if re.fullmatch(r'\*\(u32 \*\)\(r10 - 0x8\) = [rw]1', text)]
+                        self.assertEqual(len(matches), 1)
+                        mutation = re.sub(r' = r1$', ' = ' + matches[0][1].rsplit(' = ', 1)[1], new)
+                        old, new = instruction_change(lines, matches[0], mutation)
                     self.reject_and_restore(elf, disassembly, function, old, new, contract, reason)
                     print(f'verified {variant} {contract}:{reason} {label}')
 

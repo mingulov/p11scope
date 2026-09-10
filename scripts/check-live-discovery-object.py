@@ -891,7 +891,7 @@ def cookie_object_contract(disassembly):
 
 def finite_counter_key(lines, relocation):
     key_store = re.compile(
-        r"\*\(u32 \*\)\(r10 - 0x[0-9a-f]+\) = r(?P<register>\d+)"
+        r"\*\(u32 \*\)\(r10 - 0x[0-9a-f]+\) = [rw](?P<register>\d+)"
     )
     stored = next(
         (
@@ -1423,6 +1423,12 @@ def _counter_writeback_self_test(disassembly=None, counter_keys=(0, 1)):
             changed.append(f"{new_pc}: {text}")
         return good.replace("\n".join(blocks[name]), "\n".join(changed), 1)
 
+    def replace_in_function(disassembly, name, before, after):
+        block = "\n".join(function_blocks(disassembly)[name])
+        if block.count(before) != 1:
+            raise AssertionError(f"counter mutation ambiguous in {name}: {before}")
+        return disassembly.replace(block, block.replace(before, after, 1), 1)
+
     tested = 0
     for name, key in ((export, 0), (worker, 1)):
         if key not in counter_keys:
@@ -1432,8 +1438,48 @@ def _counter_writeback_self_test(disassembly=None, counter_keys=(0, 1)):
         lines = blocks[name]
         insns, graph = instruction_graph(lines)
         start = insns[0][0] if key == 0 else map_call_sites(lines, "TAIL_CALLS", helper=12)[0][1]
-        lookup = next(pc for index, pc, _ in map_call_sites(lines, "COUNTERS", helper=1)
-                      if finite_counter_key(lines, index) == key and pc in reachable(graph, [start]))
+        relocation, lookup = next((index, pc) for index, pc, _ in map_call_sites(lines, "COUNTERS", helper=1)
+                                  if finite_counter_key(lines, index) == key
+                                  and pc in reachable(graph, [start]))
+        key_store = re.compile(
+            r"\*\(u32 \*\)\(r10 - 0x(?P<offset>[0-9a-f]+)\) = (?P<width>[rw])(?P<register>\d+)"
+        )
+        store_index, store, store_match = next(
+            (index, lines[index], match)
+            for index in range(relocation - 1, max(-1, relocation - 12), -1)
+            if (match := key_store.search(lines[index]))
+        )
+        register = store_match.group("register")
+        assignment = next(
+            lines[index]
+            for index in range(store_index - 1, -1, -1)
+            if re.search(rf"\br{register} = 0x{key:x}\b", lines[index])
+        )
+        alias_width = "w" if store_match.group("width") == "r" else "r"
+        alias_store = (
+            store[: store_match.start("width")]
+            + alias_width
+            + store[store_match.end("width") :]
+        )
+        alias_good = replace_in_function(good, name, store, alias_store)
+        alias_lines = function_blocks(alias_good)[name]
+        alias_relocation = next(index for index, _, _ in map_call_sites(alias_lines, "COUNTERS", helper=1)
+                                if finite_counter_key(alias_lines, index) == key)
+        if finite_counter_key(alias_lines, alias_relocation) != key or not accounting(alias_good, name, key):
+            raise AssertionError(f"counter{key} {alias_width}{register} stack-store alias rejected")
+        wrong_register = str(int(register) - 1 if register == "9" else int(register) + 1)
+        for label, before, after in (
+            ("wrong key", assignment,
+             assignment.replace(f"r{register} = 0x{key:x}", f"r{register} = 0x{1 - key:x}")),
+            ("missing key store", store,
+             store[:store_match.start()] + "r0 = r0" + store[store_match.end():]),
+            ("wrong key source", store,
+             store[:store_match.start("register")] + wrong_register
+             + store[store_match.end("register"):]),
+        ):
+            bad = replace_in_function(good, name, before, after)
+            if accounting(bad, name, key):
+                raise AssertionError(f"counter{key} {label} accepted")
         downstream = reachable(graph, [lookup])
         load, register = next((pc, match.group(1)) for pc, text in insns
                               if pc in downstream

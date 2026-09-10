@@ -18,7 +18,7 @@ import re
 import subprocess
 import sys
 
-DECODER_SHA256 = 'd370a08ea7a0f0a21db8374ecd3b82d2d59f05c66dbd63c68faf5e9667a7a140'
+DECODER_SHA256 = '75f5e9f29aa3b9dad230ed01edea04c165980d359431a62da11dff4afb189174'
 _decoder = Path(__file__).with_name('check-live-discovery-object.py')
 if hashlib.sha256(_decoder.read_bytes()).hexdigest() != DECODER_SHA256:
     raise RuntimeError('discovery decoder source hash changed; review required')
@@ -379,11 +379,14 @@ def interface_name(elf, secs):
         r4 = *(u64 *)(r10 - 0x60)
         r5 = *(u64 *)(r10 - 0x68)
         ''', tag + 'classification')
-    meta = recipe(insns, '''
+    metadata_stores = [text for _, text in insns
+                       if re.fullmatch(r'\*\(u32 \*\)\(r10 - 0x8\) = [rw]1', text)]
+    require(len(metadata_stores) == 1, tag + 'metadata: exact u32 field store')
+    meta = recipe(insns, f'''
         r1 = 0xffffff0000ffff ll
         r8 &= r1
         r1 = *(u64 *)(r10 - 0x58)
-        *(u32 *)(r10 - 0x8) = r1
+        {metadata_stores[0]}
         *(u64 *)(r10 - 0x30) = r5
         *(u64 *)(r10 - 0x38) = r6
         r9 |= r8

@@ -144,7 +144,11 @@ sudo p11scope run --module /opt/vendor/lib/pkcs11.so \
 > and `SOFTHSM2_CONF`, and does not inherit unrelated file descriptors. The
 > command is an opened ELF executable; invoke scripts explicitly as
 > `/bin/sh /path/to/script`, and use `/usr/bin/env NAME=value command` after
-> `--` for other application variables. The sudo path currently clears
+> `--` for other application variables. Owned launch requires procfs mounted
+> at `/proc`: the opened executable is invoked through `/proc/self/fd` so a
+> later path replacement cannot change the selected inode. If that descriptor
+> path is unavailable, `run` reports the exec failure and refuses to retry the
+> command's original path. The sudo path currently clears
 > supplementary groups; use `profile`/`trace` against an already-running
 > workload when the application needs an HSM/device group.
 

@@ -721,6 +721,8 @@ impl OwnedChild {
             .map(|entry| entry.as_ptr())
             .chain(std::iter::once(std::ptr::null()))
             .collect();
+        let launch_proc_path = CString::new(format!("/proc/self/fd/{}", launch_file.as_raw_fd()))
+            .expect("a decimal file descriptor path cannot contain NUL");
         let (release_reader, release_writer) = pipe_pair()?;
         let (exec_reader, exec_writer) = pipe_pair()?;
         set_nonblocking(&exec_reader)?;
@@ -767,14 +769,7 @@ impl OwnedChild {
                         child_exec_failure_errno(exec_writer.as_raw_fd(), errno);
                     }
                 }
-                libc::syscall(
-                    libc::SYS_execveat,
-                    launch_file.as_raw_fd(),
-                    c"".as_ptr(),
-                    argv.as_ptr(),
-                    envp.as_ptr(),
-                    libc::AT_EMPTY_PATH,
-                );
+                libc::execve(launch_proc_path.as_ptr(), argv.as_ptr(), envp.as_ptr());
                 child_exec_failure_errno(exec_writer.as_raw_fd(), last_errno());
             }
         }
@@ -4659,6 +4654,59 @@ mod tests {
             child.wait_for(None, false).unwrap(),
             ChildOutcome::Exited(0)
         );
+    }
+
+    #[test]
+    fn owned_child_direct_sleep_avoids_multicall_applet_misdispatch() {
+        let mut child = spawn("/bin/sleep", &["0"]);
+        child.release().unwrap();
+        assert_eq!(
+            child.wait_for(None, false).unwrap(),
+            ChildOutcome::Exited(0)
+        );
+    }
+
+    #[test]
+    fn owned_child_exec_closes_the_launch_descriptor() {
+        let executable = std::fs::metadata("/bin/sleep").unwrap();
+        let mut child = spawn("/bin/sleep", &["10"]);
+        child.release().unwrap();
+        assert!(child.still_running(), "sleep exited before fd inspection");
+
+        for descriptor in std::fs::read_dir(format!("/proc/{}/fd", child.pid())).unwrap() {
+            let descriptor = descriptor.unwrap();
+            let metadata = match descriptor.path().metadata() {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => panic!(
+                    "inspecting owned child descriptor {}: {error}",
+                    descriptor.path().display()
+                ),
+            };
+            assert_ne!(
+                (metadata.dev(), metadata.ino()),
+                (executable.dev(), executable.ino()),
+                "the opened executable descriptor survived exec"
+            );
+        }
+        assert!(child.still_running(), "sleep exited during fd inspection");
+
+        child.terminate_and_reap().unwrap();
+    }
+
+    #[test]
+    fn owned_child_exec_preserves_no_new_privs() {
+        let mut child = spawn("/bin/sleep", &["10"]);
+        child.release().unwrap();
+
+        let status = std::fs::read_to_string(format!("/proc/{}/status", child.pid())).unwrap();
+        let no_new_privs = status
+            .lines()
+            .find_map(|line| line.strip_prefix("NoNewPrivs:"))
+            .map(str::trim);
+        assert_eq!(no_new_privs, Some("1"));
+
+        child.terminate_and_reap().unwrap();
     }
 
     #[test]

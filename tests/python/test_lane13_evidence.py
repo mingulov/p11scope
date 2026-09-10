@@ -584,7 +584,7 @@ class Lane13EvidenceTests(unittest.TestCase):
                 raise ValueError("controlled outer did not acknowledge retained ownership")
         return retained
 
-    def settle_recorded(self):
+    def settle_recorded(self, defer_owned_process=None):
         failures = []
         for marker in ("terminal-signal-go", "terminal-communication-go"):
             try:
@@ -616,7 +616,8 @@ class Lane13EvidenceTests(unittest.TestCase):
             "record_id": f"launch:{owner}",
             "kind": "owned-launch",
             "owner": owner,
-        } for owner, launch in self.owned_launches.items())
+        } for owner, launch in self.owned_launches.items()
+                       if launch["process"] is not defer_owned_process)
         pinned = []
         seen = set()
         for record in records:
@@ -849,13 +850,17 @@ class Lane13EvidenceTests(unittest.TestCase):
         try:
             return process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired as error:
-            settlement = self.settle_recorded()
+            settlement = self.settle_recorded(defer_owned_process=process)
+            finalization_timeout = False
             try:
                 stdout, stderr = process.communicate(timeout=2)
             except subprocess.TimeoutExpired:
-                self.signal_owned_process(process, signal.SIGKILL)
+                finalization_timeout = True
+                settlement.extend(self.settle_recorded())
                 stdout, stderr = process.communicate(timeout=2)
             detail = "" if not settlement else "\n" + "\n".join(settlement)
+            if finalization_timeout:
+                detail += "\nowned outer finalization timeout"
             result = subprocess.CompletedProcess(
                 process.args, 124, stdout or error.stdout or "",
                 (stderr or error.stderr or "")
@@ -2344,6 +2349,64 @@ exit "$helper_status"
             self.assertNotEqual(int((evidence / "status").read_text()), 0)
             self.assert_process_absent(native["pid"], native["starttime"])
             self.assert_process_absent(body["pid"], body["starttime"])
+            self.assertEqual(self.settle_recorded(), [])
+            self.assertIsNone(decoy.poll())
+        finally:
+            decoy.terminate()
+            try:
+                decoy.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                decoy.kill()
+                decoy.wait(timeout=2)
+
+    def test_finish_owned_allows_outer_to_finalize_after_descendant_settlement(self):
+        decoy = self.start_decoy()
+        evidence = self.root / "delayed-outer-finalization"
+        outer = """
+import os
+from pathlib import Path
+import subprocess
+import time
+
+evidence = Path(os.environ["P11SCOPE_LANE_EVIDENCE_DIR"])
+evidence.mkdir(mode=0o700)
+status = evidence / "status"
+status.touch(mode=0o600)
+child = subprocess.Popen(
+    ["kubectl", "port-forward", "-n", "kourier-system",
+     "svc/kourier-internal", "127.0.0.1:80"],
+    executable=os.environ["D2_PORT_FORWARD_HELPER"],
+    start_new_session=True,
+)
+child.wait()
+time.sleep(1.2)
+status.write_text("1\\n", encoding="utf-8")
+raise SystemExit(1)
+"""
+        proc = self.start_owned(
+            [sys.executable, "-c", outer],
+            self.env | {
+                "D2_PORT_FORWARD_HOLD": "1",
+                "D2_HOLD_SECONDS": "15",
+                "P11SCOPE_LANE_EVIDENCE_DIR": str(evidence),
+            },
+        )
+        try:
+            ready = self.state / "portforward-ready"
+            deadline = time.monotonic() + 5
+            while not ready.exists() and time.monotonic() < deadline:
+                self.assertIsNone(proc.poll(), "delayed outer exited before native readiness")
+                time.sleep(0.01)
+            self.assertTrue(ready.exists(), "native descendant did not publish readiness")
+            native = json.loads(ready.read_text())
+
+            with self.assertRaisesRegex(
+                OwnedCommunicationTimeout, "native fixture communication timeout"
+            ) as caught:
+                self.finish_owned(proc, 0.05)
+            self.assertEqual(caught.exception.result.returncode, 124)
+            self.assertEqual((evidence / "status").read_text(), "1\n")
+            self.assert_process_absent(native["pid"], native["starttime"])
             self.assertEqual(self.settle_recorded(), [])
             self.assertIsNone(decoy.poll())
         finally:

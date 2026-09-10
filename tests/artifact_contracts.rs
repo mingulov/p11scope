@@ -5789,6 +5789,37 @@ fn policy_specific_ebpf() {
 }
 
 #[test]
+fn canary_process_custody_lifecycle() {
+    let output = Command::new("timeout")
+        .args([
+            "--kill-after=2s",
+            "60s",
+            "python3",
+            "-I",
+            "tests/python/test_canary_process_custody.py",
+            "ProcessCustodyTests",
+            "-v",
+        ])
+        .output()
+        .expect("run isolated canary process custody tests");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "canary custody tests failed: {report}"
+    );
+    assert!(
+        report.contains("Ran 30 tests")
+            && report.contains("ProcessCustodyTests")
+            && !report.contains("skipped="),
+        "canary custody suite must execute every required case: {report}"
+    );
+}
+
+#[test]
 fn metadata_canary_matrix() {
     let canaries = read("scripts/verify-canaries.sh");
     let checker = read("scripts/check-canary-evidence.py");

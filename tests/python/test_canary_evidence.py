@@ -1,18 +1,28 @@
 #!/usr/bin/env python3
-"""Native tests for the checked-in canary evidence validator."""
+"""Native canary evidence tests; run under an independent process watchdog.
+
+run_json defers callable handlers (including SIGALRM) while owning resources.
+In-process alarm diagnostics alone cannot enforce the suite's wall-clock bound.
+"""
 
 import argparse
 import copy
+import ctypes
 import hashlib
 import importlib.util
+import inspect
 import json
 import mmap
 import os
 from pathlib import Path
+import re
+import signal
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -35,6 +45,138 @@ def load_dumper():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def json_signal_lifetime_probe(case, interposer=None):
+    """Run a signal-boundary probe under the test parent's independent timeout."""
+    dumper = load_dumper()
+    real_popen, real_open = subprocess.Popen, os.pidfd_open
+    real_mask = signal.pthread_sigmask
+    real_selector = dumper.selectors.DefaultSelector
+    before = real_mask(signal.SIG_BLOCK, [])
+    spawned, handles, selectors = [], [], []
+    unrelated = real_popen([sys.executable, "-c", "import time; time.sleep(5)"])
+    injected = False
+    errors = []
+
+    def capture_popen(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        spawned.append(process)
+        if case == "watchdog-stall":
+            pending = Path(interposer).with_suffix(".tmp")
+            pending.write_text(json.dumps([os.getpid(), process.pid, unrelated.pid]))
+            pending.replace(interposer)
+        return process
+
+    def capture_open(pid, flags=0):
+        fd = real_open(pid, flags)
+        handles.append(fd)
+        return fd
+
+    def capture_selector():
+        selector = real_selector()
+        selectors.append(selector)
+        return selector
+
+    def interposed_mask(how, signals):
+        nonlocal injected
+        if how == signal.SIG_BLOCK and signal.SIGINT in signals and not injected:
+            injected = True
+            # The real native call raises SIGINT before changing the kernel
+            # mask. Python delivers KeyboardInterrupt only after it returns.
+            native.interrupt_then_block()
+        return real_mask(how, signals)
+
+    source, first_line = inspect.getsourcelines(dumper.run_json)
+    boundary = ("        cleanup_error = None\n" if case.startswith("entry") else
+                "        if streams is not None:\n")
+    boundary_line = first_line + source.index(boundary)
+
+    def trace(frame, event, _arg):
+        nonlocal injected
+        if (event == "line" and frame.f_code is dumper.run_json.__code__
+                and frame.f_lineno == boundary_line and not injected):
+            injected = True
+            # A real signal at a control-flow boundary, outside cleanup(action).
+            os.kill(os.getpid(), signal.SIGINT)
+        return trace
+
+    def closed_fd(fd):
+        try:
+            os.fstat(fd)
+        except OSError:
+            return True
+        return False
+
+    try:
+        if case == "mask-mutation":
+            native = ctypes.PyDLL(interposer)
+            native.interrupt_then_block.argtypes = []
+            native.interrupt_then_block.restype = ctypes.c_int
+            mask_patch = mock.patch.object(dumper.signal, "pthread_sigmask",
+                                           side_effect=interposed_mask)
+        else:
+            mask_patch = mock.patch.object(dumper.signal, "pthread_sigmask", wraps=real_mask)
+            sys.settrace(trace)
+        try:
+            with mock.patch.object(dumper.subprocess, "Popen", side_effect=capture_popen), \
+                    mock.patch.object(dumper.os, "pidfd_open", side_effect=capture_open), \
+                    mock.patch.object(dumper.selectors, "DefaultSelector", side_effect=capture_selector), \
+                    mask_patch:
+                dumper.run_json([sys.executable, "-c", (
+                    "import time; time.sleep(5)" if case in ("entry-live", "watchdog-stall")
+                    else "print('[]')")],
+                    timeout_seconds=8 if case == "watchdog-stall" else 0.2, max_bytes=1024)
+        except BaseException as error:
+            while error is not None:
+                errors.append({"type": type(error).__name__, "message": str(error)})
+                error = error.__cause__
+        finally:
+            sys.settrace(None)
+
+        reaped = []
+        for process in spawned:
+            try:
+                os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                reaped.append(False)
+            except ChildProcessError:
+                reaped.append(True)
+        selector_closed = []
+        for selector in selectors:
+            try:
+                selector.select(0)
+                selector_closed.append(False)
+            except ValueError:
+                selector_closed.append(True)
+        report = {
+            "injected": injected, "errors": errors,
+            "mask_before": sorted(before),
+            "mask_after": sorted(real_mask(signal.SIG_BLOCK, [])),
+            "spawn_count": len(spawned), "reaped": reaped,
+            "pipes_closed": [p.stdout.closed and p.stderr.closed for p in spawned],
+            "pidfds_closed": [closed_fd(fd) for fd in handles],
+            "selectors_closed": selector_closed,
+            "unrelated_alive": unrelated.poll() is None,
+        }
+    finally:
+        sys.settrace(None)
+        # Safe RED teardown: restore the caller mask and close/terminate/reap
+        # only the actual children and resources captured by this probe.
+        real_mask(signal.SIG_SETMASK, before)
+        for process in spawned:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=1)
+            process.stdout.close()
+            process.stderr.close()
+        for selector in selectors:
+            selector.close()
+        for fd in handles:
+            if not closed_fd(fd):
+                os.close(fd)
+        unrelated.kill()
+        unrelated.wait(timeout=1)
+    print(json.dumps(report))
 
 
 def start_bytes(module, session, target=None, mechanism=None, mechanism_ptr=0,
@@ -266,6 +408,7 @@ class TaskStorageReaderTests(unittest.TestCase):
 
     def test_main_uses_reader_and_never_dumps_task_storage(self):
         dumper = load_dumper()
+        subject = load_subject(TARGET_BITS)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             reader = root / "reader"
@@ -275,10 +418,18 @@ class TaskStorageReaderTests(unittest.TestCase):
             obj.write_bytes(b"object")
             commands = []
             inventory = [
+                {"name": "OWNER_CTL", "id": 97, "type": "array", "bytes_key": 4,
+                 "bytes_value": 56, "max_entries": 1, "flags": 0},
                 {"name": "START", "id": 99, "type": "hash", "bytes_key": 8,
-                 "bytes_value": 288, "max_entries": 16384, "map_flags": 0},
-                self.MAPS[0], self.MAPS[1],
-                {**self.MAPS[2], "name": "ROOT_AFFILIATIO"},
+                 "bytes_value": 288, "max_entries": 16384, "flags": 0},
+                {"name": "PERCPU_TEST", "id": 98, "type": "percpu_array", "bytes_key": 4,
+                 "bytes_value": 296, "max_entries": 1, "flags": 0},
+                *({key: value for key, value in item.items()
+                   if key not in ("map_flags", "oracle")} | {"flags": item["map_flags"]}
+                  for item in self.MAPS[:2]),
+                {**{key: value for key, value in self.MAPS[2].items()
+                    if key not in ("map_flags", "oracle")},
+                 "name": "ROOT_AFFILIATIO", "flags": self.MAPS[2]["map_flags"]},
             ]
 
             def fake_json(args, require_list=False, map_identity=None):
@@ -287,6 +438,18 @@ class TaskStorageReaderTests(unittest.TestCase):
                     map_id = int(args[-1])
                     return [next(dict(item) for item in inventory if item["id"] == map_id)]
                 if args[2:4] == ["map", "dump"]:
+                    if int(args[-1]) == 97:
+                        return [{"key": ["0x00"] * 4, "value": ["0x00"] * 56,
+                                 "formatted": {"key": 0, "value": {"limit": 0}}}]
+                    if int(args[-1]) == 98:
+                        planted = bytearray(296)
+                        planted[100:100 + len(subject.SENTINELS["PIN"])] = subject.SENTINELS["PIN"]
+                        return [{"key": ["0x00"] * 4,
+                                 "values": [{"cpu": 0, "value": ["0x00"] * 296},
+                                            {"cpu": 1, "value": [
+                                                byte for byte in planted
+                                            ]}],
+                                 "formatted": {"key": 0, "values": [1, 2]}}]
                     return []
                 raise AssertionError(f"unexpected bpftool command: {args}")
 
@@ -294,21 +457,888 @@ class TaskStorageReaderTests(unittest.TestCase):
                 "dump-owned-bpf-maps.py", "55", str(root), "case", "0", "16384",
                 str(reader.resolve()), str(obj.resolve()),
             ]
-            with mock.patch.object(dumper, "map_ids_from_fdinfo", return_value=[99, 101, 102, 103]), \
+            with mock.patch.object(dumper, "map_ids_from_fdinfo",
+                                   return_value=[97, 98, 99, 101, 102, 103]), \
                     mock.patch.object(dumper.glob, "glob", return_value=[]), \
                     mock.patch.object(dumper, "run_json", side_effect=fake_json), \
+                    mock.patch.object(dumper, "possible_cpu_ids", return_value=(0, 1)), \
                     mock.patch.object(dumper, "run_task_storage_reader",
                                       return_value=self.complete_stream()), \
                     mock.patch.object(sys, "argv", argv):
                 dumper.main()
             dumped_ids = [int(command[-1]) for command in commands
                           if command[2:5] == ("map", "dump", "id")]
-            self.assertEqual(dumped_ids, [99], commands)
+            self.assertEqual(dumped_ids, [97, 98, 99], commands)
             manifest = json.loads((root / "mapdump_manifest_case.json").read_text())
+            self.assertTrue(all("map_flags" in item for item in manifest))
             task_items = [item for item in manifest if item["oracle"] == "task-storage"]
             self.assertEqual(len(task_items), 3)
             self.assertEqual(task_items[-1]["name"], "ROOT_AFFILIATION")
             self.assertTrue(all(Path(item["file"]).is_file() for item in task_items))
+            stats = next(item for item in manifest if item["name"] == "PERCPU_TEST")
+            cells = json.loads(Path(stats["file"]).read_text())
+            self.assertNotIn("formatted", cells[0])
+            self.assertEqual([row["cpu"] for row in cells[0]["values"]], [0, 1])
+            self.assertEqual(len(cells[0]["values"][1]["value"]), 296)
+            self.assertTrue(all(re.fullmatch(r"0x[0-9a-f]{2}", byte)
+                                for byte in cells[0]["values"][1]["value"]))
+            with self.assertRaisesRegex(AssertionError, "pointer canaries leaked"):
+                subject.assert_final_artifact_privacy([Path(stats["file"])])
+            owner_control = next(item for item in manifest if item["name"] == "OWNER_CTL")
+            self.assertNotIn("formatted", json.loads(Path(owner_control["file"]).read_text())[0])
+
+    def test_main_rejects_returned_id_and_conflicting_flags(self):
+        dumper = load_dumper()
+        normalized_alias = {"name": "START", "id": 99, "type": "hash", "bytes_key": 8,
+                            "bytes_value": 288, "max_entries": 16384, "map_flags": 0}
+        self.assertEqual(dumper.normalize_map_metadata(normalized_alias, 99)["map_flags"], 0)
+        self.assertEqual(dumper.normalize_map_metadata(
+            {**normalized_alias, "flags": 0}, 99)["map_flags"], 0)
+        for case in ("returned-id", "flags"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                reader = root / "reader"
+                reader.write_bytes(b"reader")
+                reader.chmod(0o700)
+                obj = root / "reader.bpf.o"
+                obj.write_bytes(b"object")
+                item = {"name": "START", "id": 99, "type": "hash", "bytes_key": 8,
+                        "bytes_value": 288, "max_entries": 16384, "flags": 0}
+                if case == "returned-id":
+                    item["id"] = 100
+                else:
+                    item["map_flags"] = 1
+                argv = ["dump-owned-bpf-maps.py", "55", str(root), "case", "0", "16384",
+                        str(reader.resolve()), str(obj.resolve())]
+                with mock.patch.object(dumper, "map_ids_from_fdinfo", return_value=[99]), \
+                        mock.patch.object(dumper.glob, "glob", return_value=[]), \
+                        mock.patch.object(dumper, "run_json", return_value=[item]), \
+                        mock.patch.object(sys, "argv", argv):
+                    with self.assertRaisesRegex(RuntimeError, "map metadata"):
+                        dumper.main()
+                self.assertFalse((root / "mapdump_manifest_case.json").exists())
+
+    def test_raw_dump_normalization_rejects_formatted_only_and_preserves_percpu(self):
+        dumper = load_dumper()
+        metadata = {"id": 7, "name": "COUNTERS", "type": "percpu_array",
+                    "oracle": "dump", "bytes_key": 4, "bytes_value": 8,
+                    "max_entries": 1, "map_flags": 0}
+        cell = {"key": ["0x00"] * 4,
+                "values": [{"cpu": 0, "value": ["0x01"] * 8},
+                           {"cpu": 1, "value": ["0x02"] * 8}],
+                "formatted": {"key": 0, "values": [1, 2]}}
+        normalized = dumper.normalize_map_dump([cell], metadata, possible_cpus=(0, 1))
+        self.assertEqual(normalized, [{"key": cell["key"], "values": cell["values"]}])
+        reversed_cell = {**cell, "values": list(reversed(cell["values"]))}
+        self.assertEqual(dumper.normalize_map_dump(
+            [reversed_cell], metadata, possible_cpus=(0, 1)), normalized)
+        mutations = [
+            {"key": cell["key"], "formatted": {}},
+            {**cell, "formatted": []},
+            {**cell, "value": ["0x00"] * 8},
+            {**cell, "values": [cell["values"][0], dict(cell["values"][0])]},
+            {**cell, "values": [{"cpu": 0, "value": ["0x01"] * 7}]},
+            {**cell, "values": [{"cpu": 0, "value": ["0x01"] * 8}]},
+        ]
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                with self.assertRaisesRegex(RuntimeError, "raw map dump"):
+                    dumper.normalize_map_dump([mutation], metadata, possible_cpus=(0, 1))
+        control = {"id": 8, "name": "OWNER_CTL", "type": "array", "oracle": "dump",
+                   "bytes_key": 4, "bytes_value": 56, "max_entries": 1, "map_flags": 0}
+        with self.assertRaisesRegex(RuntimeError, "raw map dump"):
+            dumper.normalize_map_dump([{"formatted": {"key": 0, "value": {}}}], control)
+        for invalid_byte in (True, -1, 256):
+            with self.subTest(invalid_byte=invalid_byte):
+                with self.assertRaisesRegex(RuntimeError, "malformed byte array"):
+                    dumper.normalize_map_dump(
+                        [{"key": [invalid_byte] + [0] * 3, "value": [0] * 56}], control)
+        incomplete_array = {**control, "max_entries": 2}
+        with self.assertRaisesRegex(RuntimeError, "incomplete array keys"):
+            dumper.normalize_map_dump(
+                [{"key": ["0x00"] * 4, "value": ["0x00"] * 56}], incomplete_array)
+        sparse = {"id": 9, "name": "SPARSE", "type": "prog_array", "oracle": "dump",
+                  "bytes_key": 4, "bytes_value": 4, "max_entries": 8, "map_flags": 0}
+        self.assertEqual(len(dumper.normalize_map_dump(
+            [{"key": ["0x03", "0x00", "0x00", "0x00"], "value": ["0x01"] * 4}],
+            sparse)), 1)
+        with tempfile.TemporaryDirectory() as directory:
+            possible = Path(directory) / "possible"
+            possible.write_text("0-1,4\n", encoding="ascii")
+            self.assertEqual(dumper.possible_cpu_ids(possible), (0, 1, 4))
+            possible.write_text("0-1,1\n", encoding="ascii")
+            with self.assertRaisesRegex(RuntimeError, "duplicates"):
+                dumper.possible_cpu_ids(possible)
+
+    def test_bounded_json_acquisition_rejects_duplicates_timeout_and_output(self):
+        dumper = load_dumper()
+        with tempfile.TemporaryDirectory() as directory:
+            pidfile = Path(directory) / "acquisition.pid"
+            unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(2)"])
+            try:
+                cases = (
+                    ("duplicate", [sys.executable, "-c", "print('{\\\"id\\\":1,\\\"id\\\":2}')"],
+                     1, 1024, "duplicate"),
+                    ("timeout", [sys.executable, "-c",
+                                 "import os,pathlib,time; "
+                                 f"pathlib.Path({str(pidfile)!r}).write_text(str(os.getpid())); "
+                                 "time.sleep(2)"],
+                     0.2, 1024, "timed out"),
+                    ("output", [sys.executable, "-c", "print('x' * 100000)"],
+                     1, 1024, "output bound"),
+                )
+                for label, command, timeout, maximum, message in cases:
+                    with self.subTest(label=label):
+                        with self.assertRaisesRegex(RuntimeError, message):
+                            dumper.run_json(command, timeout_seconds=timeout, max_bytes=maximum)
+                acquisition_pid = int(pidfile.read_text())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(acquisition_pid, 0)
+                with self.assertRaises(ChildProcessError):
+                    os.waitpid(acquisition_pid, os.WNOHANG)
+                self.assertIsNone(unrelated.poll())
+            finally:
+                unrelated.terminate()
+                unrelated.wait()
+        for timeout, maximum in ((0, 1024), (float("inf"), 1024), (1, 0),
+                                 (1, dumper.JSON_OUTPUT_MAX_BYTES + 1)):
+            with self.subTest(timeout=timeout, maximum=maximum):
+                with self.assertRaisesRegex(RuntimeError, "invalid bounds"):
+                    dumper.run_json([sys.executable, "-c", "print('[]')"],
+                                    timeout_seconds=timeout, max_bytes=maximum)
+
+    def test_json_acquisition_deadline_includes_exit_after_pipe_eof(self):
+        dumper = load_dumper()
+        with tempfile.TemporaryDirectory() as directory:
+            pidfile = Path(directory) / "eof-child.pid"
+            command = [sys.executable, "-c",
+                       "import os,pathlib,time; "
+                       f"pathlib.Path({str(pidfile)!r}).write_text(str(os.getpid())); "
+                       "os.write(1, b'[]'); os.close(1); os.close(2); time.sleep(0.7)"]
+            previous = signal.signal(
+                signal.SIGALRM,
+                lambda _signal, _frame: (_ for _ in ()).throw(
+                    TimeoutError("outer watchdog: run_json blocked past deadline")),
+            )
+            signal.setitimer(signal.ITIMER_REAL, 0.5)
+            try:
+                with self.assertRaisesRegex(RuntimeError, "timed out"):
+                    dumper.run_json(command, timeout_seconds=0.05, max_bytes=1024)
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, previous)
+            child_pid = int(pidfile.read_text())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child_pid, 0)
+            with self.assertRaises(ChildProcessError):
+                os.waitpid(child_pid, os.WNOHANG)
+
+    def test_json_acquisition_setup_and_cleanup_failures_reap_only_owned_child(self):
+        dumper = load_dumper()
+        real_popen = dumper.subprocess.Popen
+        real_selector = dumper.selectors.DefaultSelector
+
+        class SelectorFailure:
+            def __init__(self, fail_register=None, fail_close=False):
+                self.inner = real_selector()
+                self.fail_register = fail_register
+                self.fail_close = fail_close
+                self.register_calls = 0
+
+            def register(self, *args):
+                self.register_calls += 1
+                if self.register_calls == self.fail_register:
+                    raise OSError(f"injected register {self.register_calls} failure")
+                return self.inner.register(*args)
+
+            def unregister(self, *args):
+                return self.inner.unregister(*args)
+
+            def get_map(self):
+                return self.inner.get_map()
+
+            def select(self, *args):
+                return self.inner.select(*args)
+
+            def close(self):
+                self.inner.close()
+                if self.fail_close:
+                    raise OSError("injected selector close failure")
+
+        unrelated = real_popen([sys.executable, "-c", "import time; time.sleep(3)"])
+        try:
+            for case in ("constructor", "register-1", "register-2", "close"):
+                with self.subTest(case=case):
+                    spawned = []
+                    selectors = []
+
+                    def capture_popen(*args, **kwargs):
+                        process = real_popen(*args, **kwargs)
+                        spawned.append(process)
+                        return process
+
+                    def selector_factory():
+                        if case == "constructor":
+                            raise OSError("injected selector construction failure")
+                        selector = SelectorFailure(
+                            fail_register={"register-1": 1, "register-2": 2}.get(case),
+                            fail_close=case == "close",
+                        )
+                        selectors.append(selector)
+                        return selector
+
+                    child = [sys.executable, "-c", (
+                        "print('[]', flush=True)" if case == "close" else
+                        "import time; print('[]', flush=True); time.sleep(2)"
+                    )]
+                    expected = ("construction" if case == "constructor" else
+                                "register" if case.startswith("register") else "close")
+                    with mock.patch.object(dumper.subprocess, "Popen", side_effect=capture_popen), \
+                            mock.patch.object(dumper.selectors, "DefaultSelector",
+                                              side_effect=selector_factory):
+                        with self.assertRaisesRegex(OSError, expected):
+                            dumper.run_json(child, timeout_seconds=0.2, max_bytes=1024)
+                    process = spawned[0]
+                    self.assertIsNotNone(process.poll())
+                    self.assertTrue(process.stdout.closed)
+                    self.assertTrue(process.stderr.closed)
+                    with self.assertRaises(ProcessLookupError):
+                        os.kill(process.pid, 0)
+                    with self.assertRaises(ChildProcessError):
+                        os.waitpid(process.pid, os.WNOHANG)
+                    if selectors:
+                        with self.assertRaises(ValueError):
+                            selectors[0].select(0)
+                    self.assertIsNone(unrelated.poll())
+        finally:
+            unrelated.terminate()
+            unrelated.wait()
+
+    def test_json_acquisition_combines_legacy_primary_and_cleanup_errors(self):
+        dumper = load_dumper()
+        real_popen = dumper.subprocess.Popen
+        real_selector = dumper.selectors.DefaultSelector
+        spawned = []
+
+        class LegacyPrimary(RuntimeError):
+            add_note = None
+
+        class FailingSelector:
+            def __init__(self):
+                self.inner = real_selector()
+
+            def register(self, *args):
+                return self.inner.register(*args)
+
+            def get_map(self):
+                return self.inner.get_map()
+
+            def select(self, *_args):
+                raise LegacyPrimary("legacy acquisition failure")
+
+            def close(self):
+                self.inner.close()
+                raise OSError("secondary selector cleanup failure")
+
+        def capture_popen(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            spawned.append(process)
+            return process
+
+        child = [sys.executable, "-c", "import time; time.sleep(2)"]
+        with mock.patch.object(dumper.subprocess, "Popen", side_effect=capture_popen), \
+                mock.patch.object(dumper.selectors, "DefaultSelector",
+                                  side_effect=FailingSelector):
+            with self.assertRaisesRegex(LegacyPrimary, "legacy acquisition") as raised:
+                dumper.run_json(child, timeout_seconds=0.2, max_bytes=1024)
+        self.assertIsInstance(raised.exception.__cause__, OSError)
+        self.assertIn("secondary selector cleanup", str(raised.exception.__cause__))
+        process = spawned[0]
+        self.assertTrue(process.stdout.closed and process.stderr.closed)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(process.pid, 0)
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(process.pid, os.WNOHANG)
+
+    def test_json_acquisition_owns_child_across_initialization_and_cleanup_entry(self):
+        dumper = load_dumper()
+        real_popen = dumper.subprocess.Popen
+        unrelated = real_popen([sys.executable, "-c", "import time; time.sleep(3)"])
+
+        def watchdog(_signal, _frame):
+            raise TimeoutError("outer watchdog: acquisition cleanup blocked")
+
+        previous = signal.signal(signal.SIGALRM, watchdog)
+        try:
+            with self.subTest(case="pre-spawn-allocation"):
+                spawned = []
+
+                def capture_popen(*args, **kwargs):
+                    process = real_popen(*args, **kwargs)
+                    spawned.append(process)
+                    return process
+
+                with mock.patch.object(dumper, "bytearray", side_effect=MemoryError(
+                        "injected allocation failure"), create=True), \
+                        mock.patch.object(dumper.subprocess, "Popen", side_effect=capture_popen):
+                    with self.assertRaisesRegex(MemoryError, "allocation"):
+                        dumper.run_json(
+                            [sys.executable, "-c", "import time; time.sleep(2)"],
+                            timeout_seconds=0.2, max_bytes=1024)
+                did_spawn = bool(spawned)
+                for process in spawned:
+                    os.kill(process.pid, signal.SIGKILL)
+                    process.wait()
+                    process.stdout.close()
+                    process.stderr.close()
+                self.assertFalse(did_spawn, "fallible buffer allocation must precede Popen")
+
+            for case in ("first-protected-step", "cleanup-entry"):
+                with self.subTest(case=case):
+                    spawned = []
+
+                    def prepared_popen(*args, **kwargs):
+                        process = capture_popen(*args, **kwargs)
+                        if case == "cleanup-entry":
+                            process.poll = mock.Mock(side_effect=KeyboardInterrupt(
+                                "injected cleanup-entry poll interruption"))
+                        return process
+
+                    patches = [mock.patch.object(
+                        dumper.subprocess, "Popen", side_effect=prepared_popen)]
+                    if case == "first-protected-step":
+                        patches.append(mock.patch.object(
+                            dumper.time, "monotonic", side_effect=MemoryError(
+                                "injected first protected step failure")))
+                    else:
+                        patches.append(mock.patch.object(
+                            dumper.selectors, "DefaultSelector",
+                            side_effect=OSError("injected selector setup failure")))
+                    signal.setitimer(signal.ITIMER_REAL, 0.7)
+                    caught = None
+                    try:
+                        with patches[0], patches[1]:
+                            try:
+                                dumper.run_json(
+                                    [sys.executable, "-c", "import time; time.sleep(2)"],
+                                    timeout_seconds=0.2, max_bytes=1024)
+                            except BaseException as error:
+                                caught = error
+                    finally:
+                        signal.setitimer(signal.ITIMER_REAL, 0)
+                    process = spawned[0]
+                    real_poll = type(process).poll
+                    was_reaped = real_poll(process) is not None
+                    pipes_closed = process.stdout.closed and process.stderr.closed
+                    if not was_reaped:
+                        os.kill(process.pid, signal.SIGKILL)
+                        type(process).wait(process)
+                    process.stdout.close()
+                    process.stderr.close()
+                    expected = MemoryError if case == "first-protected-step" else OSError
+                    self.assertIsInstance(caught, expected)
+                    self.assertTrue(was_reaped)
+                    self.assertTrue(pipes_closed)
+                    self.assertIsNone(unrelated.poll())
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
+            unrelated.terminate()
+            unrelated.wait()
+
+    def test_json_acquisition_retains_identity_after_wait_reaps_then_interrupts(self):
+        dumper = load_dumper()
+        real_popen = subprocess.Popen
+        real_open = os.pidfd_open
+        real_send = signal.pidfd_send_signal
+        real_selector = dumper.selectors.DefaultSelector
+        spawned, handles, selectors, deliveries, raw_signals = [], [], [], [], []
+        unrelated = real_popen([sys.executable, "-c", "import time; time.sleep(5)"])
+
+        def capture_popen(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            spawned.append(process)
+            original_wait = process.wait
+            interrupted = False
+
+            def reap_then_interrupt(*args, **kwargs):
+                nonlocal interrupted
+                result = original_wait(*args, **kwargs)
+                if not interrupted:
+                    interrupted = True
+                    self.assertEqual(result, 0)
+                    with self.assertRaises(ChildProcessError):
+                        os.waitpid(process.pid, os.WNOHANG)
+                    raise KeyboardInterrupt("injected after actual reap")
+                return result
+
+            process.wait = reap_then_interrupt
+            return process
+
+        def capture_open(pid, flags=0):
+            fd = real_open(pid, flags)
+            handles.append(fd)
+            return fd
+
+        def capture_send(fd, sig, *args):
+            # This really signals the retained kernel handle after waitpid
+            # has proved the child reaped; it must report ESRCH, not retarget.
+            try:
+                return real_send(fd, sig, *args)
+            except ProcessLookupError:
+                deliveries.append((fd, sig, "already reaped"))
+                raise
+
+        def capture_selector():
+            selector = real_selector()
+            selectors.append(selector)
+            return selector
+
+        previous = signal.signal(signal.SIGALRM, lambda *_args: (_ for _ in ()).throw(
+            TimeoutError("outer watchdog: post-reap cleanup blocked")))
+        signal.setitimer(signal.ITIMER_REAL, 2)
+        try:
+            with mock.patch.object(dumper.subprocess, "Popen", side_effect=capture_popen), \
+                    mock.patch.object(dumper.os, "pidfd_open", side_effect=capture_open), \
+                    mock.patch.object(dumper.signal, "pidfd_send_signal", side_effect=capture_send), \
+                    mock.patch.object(dumper.selectors, "DefaultSelector", side_effect=capture_selector), \
+                    mock.patch.object(dumper.os, "kill", side_effect=lambda *args: raw_signals.append(args)):
+                with self.assertRaisesRegex(KeyboardInterrupt, "after actual reap"):
+                    dumper.run_json([sys.executable, "-c", "print('[]')"],
+                                    timeout_seconds=0.5, max_bytes=1024)
+            self.assertEqual(raw_signals, [], "cleanup must never signal a reaped numeric PID")
+            self.assertEqual(len(handles), 1)
+            self.assertEqual(deliveries, [(handles[0], signal.SIGKILL, "already reaped")])
+            with self.assertRaises(OSError):
+                os.fstat(handles[0])
+            self.assertTrue(spawned[0].stdout.closed and spawned[0].stderr.closed)
+            with self.assertRaises(ValueError):
+                selectors[0].select(0)
+            self.assertIsNone(unrelated.poll())
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
+            for process in spawned:
+                if process.poll() is None:
+                    process.kill()
+                type(process).wait(process, timeout=1)
+                process.stdout.close()
+                process.stderr.close()
+            unrelated.kill()
+            unrelated.wait(timeout=1)
+
+    def test_json_acquisition_pidfd_refusal_requires_waitable_child(self):
+        dumper = load_dumper()
+        real_popen, real_kill = subprocess.Popen, os.kill
+        unrelated = real_popen([sys.executable, "-c", "import time; time.sleep(5)"])
+        previous = signal.signal(signal.SIGALRM, lambda *_args: (_ for _ in ()).throw(
+            TimeoutError("outer watchdog: pidfd refusal cleanup blocked")))
+        try:
+            for case in ("live", "zombie", "reaped", "waitability-refused"):
+                with self.subTest(case=case):
+                    spawned, signals = [], []
+
+                    def capture_popen(*args, **kwargs):
+                        process = real_popen(*args, **kwargs)
+                        spawned.append(process)
+                        return process
+
+                    def refuse_pidfd(pid, _flags=0):
+                        if case == "zombie":
+                            result = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
+                            self.assertEqual(result.si_pid, pid)
+                        elif case == "reaped":
+                            spawned[0].wait(timeout=1)
+                        raise OSError("injected pidfd acquisition refusal")
+
+                    def owned_kill(pid, sig):
+                        # Never forward an attempted stale/unrelated PID signal.
+                        self.assertEqual(pid, spawned[0].pid)
+                        if case in ("reaped", "waitability-refused"):
+                            signals.append("unsafe signal")
+                            return
+                        os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                        signals.append(sig)
+                        real_kill(pid, sig)
+
+                    wait_patch = (mock.patch.object(dumper.os, "waitid", side_effect=OSError(
+                        "injected waitability refusal")) if case == "waitability-refused"
+                        else mock.patch.object(dumper.os, "waitid", wraps=os.waitid))
+                    signal.setitimer(signal.ITIMER_REAL, 2)
+                    try:
+                        with mock.patch.object(dumper.subprocess, "Popen", side_effect=capture_popen), \
+                                mock.patch.object(dumper.os, "pidfd_open", side_effect=refuse_pidfd), \
+                                mock.patch.object(dumper.os, "kill", side_effect=owned_kill), \
+                                mock.patch.object(dumper.selectors, "DefaultSelector", side_effect=
+                                                  AssertionError("acquisition continued without pidfd")), \
+                                wait_patch:
+                            with self.assertRaisesRegex(OSError, "pidfd acquisition refusal") as raised:
+                                dumper.run_json([sys.executable, "-c", (
+                                    "print('[]')" if case in ("zombie", "reaped") else
+                                    "import time; time.sleep(5)")], timeout_seconds=0.1, max_bytes=1024)
+                        self.assertEqual(signals, [signal.SIGKILL] if case in ("live", "zombie") else [])
+                        self.assertTrue(spawned[0].stdout.closed and spawned[0].stderr.closed)
+                        if case == "waitability-refused":
+                            self.assertIsNone(spawned[0].poll())
+                            self.assertIsInstance(raised.exception.__cause__, subprocess.TimeoutExpired)
+                            self.assertIn("waitability refusal", str(raised.exception.__cause__.__cause__))
+                        else:
+                            with self.assertRaises(ChildProcessError):
+                                os.waitpid(spawned[0].pid, os.WNOHANG)
+                        self.assertIsNone(unrelated.poll())
+                    finally:
+                        signal.setitimer(signal.ITIMER_REAL, 0)
+                        for process in spawned:
+                            if process.poll() is None:
+                                process.kill()
+                            process.wait(timeout=1)
+                            process.stdout.close()
+                            process.stderr.close()
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
+            unrelated.kill()
+            unrelated.wait(timeout=1)
+
+    def test_json_acquisition_pidfd_close_failure_is_nonpass_and_chained(self):
+        dumper = load_dumper()
+        real_popen, real_open, real_close = subprocess.Popen, os.pidfd_open, os.close
+        real_selector = dumper.selectors.DefaultSelector
+        for fail_acquisition in (False, True):
+            with self.subTest(fail_acquisition=fail_acquisition):
+                spawned, handles, selectors = [], [], []
+
+                def capture_popen(*args, **kwargs):
+                    process = real_popen(*args, **kwargs)
+                    spawned.append(process)
+                    return process
+
+                def capture_open(pid, flags=0):
+                    fd = real_open(pid, flags)
+                    handles.append(fd)
+                    return fd
+
+                def close_then_fail(fd):
+                    real_close(fd)
+                    if fd in handles:
+                        raise OSError("injected pidfd close failure")
+
+                def capture_selector():
+                    selector = real_selector()
+                    selectors.append(selector)
+                    if fail_acquisition:
+                        selector.select = mock.Mock(side_effect=KeyboardInterrupt(
+                            "injected retained acquisition failure"))
+                        original_close = selector.close
+
+                        def close_selector():
+                            original_close()
+                            raise OSError("injected additional selector close failure")
+
+                        selector.close = close_selector
+                    return selector
+
+                try:
+                    with mock.patch.object(dumper.subprocess, "Popen", side_effect=capture_popen), \
+                            mock.patch.object(dumper.os, "pidfd_open", side_effect=capture_open), \
+                            mock.patch.object(dumper.os, "close", side_effect=close_then_fail), \
+                            mock.patch.object(dumper.selectors, "DefaultSelector", side_effect=capture_selector):
+                        expected = KeyboardInterrupt if fail_acquisition else OSError
+                        with self.assertRaisesRegex(expected, "acquisition failure" if fail_acquisition
+                                                    else "pidfd close failure") as raised:
+                            dumper.run_json([sys.executable, "-c", "print('[]')"],
+                                            timeout_seconds=0.5, max_bytes=1024)
+                    errors = []
+                    error = raised.exception
+                    while error is not None:
+                        errors.append(str(error))
+                        error = error.__cause__
+                    self.assertTrue(any("pidfd close failure" in error for error in errors))
+                    if fail_acquisition:
+                        self.assertTrue(any("selector close failure" in error for error in errors))
+                    self.assertEqual(len(handles), 1)
+                    with self.assertRaises(OSError):
+                        os.fstat(handles[0])
+                    self.assertTrue(spawned[0].stdout.closed and spawned[0].stderr.closed)
+                    with self.assertRaises(ChildProcessError):
+                        os.waitpid(spawned[0].pid, os.WNOHANG)
+                    with self.assertRaises(ValueError):
+                        type(selectors[0]).select(selectors[0], 0)
+                finally:
+                    for process in spawned:
+                        if process.poll() is None:
+                            process.kill()
+                        process.wait(timeout=1)
+                        process.stdout.close()
+                        process.stderr.close()
+
+    def test_json_acquisition_refuses_nonretaining_sigchld_before_spawn(self):
+        dumper = load_dumper()
+        for handler in (signal.SIG_IGN, lambda *_args: None):
+            with self.subTest(handler=handler):
+                previous = signal.signal(signal.SIGCHLD, handler)
+                try:
+                    with mock.patch.object(dumper.subprocess, "Popen", side_effect=AssertionError(
+                            "spawned with unsupported child wait ownership")):
+                        with self.assertRaisesRegex(RuntimeError, "SIGCHLD"):
+                            dumper.run_json([sys.executable, "-c", "print('[]')"])
+                finally:
+                    signal.signal(signal.SIGCHLD, previous)
+
+    def test_json_acquisition_defers_signals_until_owned_and_restores_masks(self):
+        dumper = load_dumper()
+        real_popen, real_open = subprocess.Popen, os.pidfd_open
+        original_mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+        previous = signal.signal(signal.SIGALRM, lambda *_args: (_ for _ in ()).throw(
+            TimeoutError("outer watchdog: deferred signal cleanup blocked")))
+        try:
+            for case in ("spawn", "pin", "pin-refused"):
+                with self.subTest(case=case):
+                    spawned, handles = [], []
+
+                    def capture_popen(*args, **kwargs):
+                        process = real_popen(*args, **kwargs)
+                        spawned.append(process)
+                        if case == "spawn":
+                            os.kill(os.getpid(), signal.SIGINT)
+                        return process
+
+                    def capture_open(pid, flags=0):
+                        if case == "pin-refused":
+                            os.kill(os.getpid(), signal.SIGINT)
+                            raise OSError("injected pidfd refusal with pending interrupt")
+                        fd = real_open(pid, flags)
+                        handles.append(fd)
+                        if case == "pin":
+                            os.kill(os.getpid(), signal.SIGINT)
+                        return fd
+
+                    signal.setitimer(signal.ITIMER_REAL, 2)
+                    try:
+                        with mock.patch.object(dumper.subprocess, "Popen", side_effect=capture_popen), \
+                                mock.patch.object(dumper.os, "pidfd_open", side_effect=capture_open):
+                            with self.assertRaises(OSError if case == "pin-refused" else
+                                                   RuntimeError) as raised:
+                                dumper.run_json([sys.executable, "-c", "import time; time.sleep(5)"],
+                                                timeout_seconds=0.2, max_bytes=1024)
+                        self.assertIn("pidfd refusal" if case == "pin-refused" else "timed out",
+                                      str(raised.exception))
+                        self.assertIsInstance(raised.exception.__cause__, KeyboardInterrupt)
+                        self.assertTrue(spawned[0].stdout.closed and spawned[0].stderr.closed)
+                        with self.assertRaises(ChildProcessError):
+                            os.waitpid(spawned[0].pid, os.WNOHANG)
+                        self.assertEqual(len(handles), 0 if case == "pin-refused" else 1)
+                        for fd in handles:
+                            with self.assertRaises(OSError):
+                                os.fstat(fd)
+                        self.assertEqual(signal.pthread_sigmask(signal.SIG_BLOCK, []), original_mask)
+                    finally:
+                        signal.setitimer(signal.ITIMER_REAL, 0)
+                        for process in spawned:
+                            if process.poll() is None:
+                                process.kill()
+                            process.wait(timeout=1)
+                            process.stdout.close()
+                            process.stderr.close()
+
+            # Preserve even a pre-existing caller mask in the actual exec'd
+            # helper; temporary SIGINT/SIGALRM blocks must not survive exec.
+            signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1})
+            expected_mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+            actual = dumper.run_json([sys.executable, "-c", (
+                "import json,signal; "
+                "print(json.dumps(sorted(signal.pthread_sigmask(signal.SIG_BLOCK, []))))")],
+                timeout_seconds=0.5, max_bytes=1024)
+            self.assertEqual(actual, sorted(expected_mask))
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                with self.subTest(child_signal=sig):
+                    with self.assertRaisesRegex(RuntimeError, "failed"):
+                        dumper.run_json([sys.executable, "-c", (
+                            f"import os,signal; signal.signal({int(sig)}, signal.SIG_DFL); "
+                            f"os.kill(os.getpid(), {int(sig)}); print('[]')")],
+                            timeout_seconds=0.5, max_bytes=1024)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
+            signal.signal(signal.SIGALRM, previous)
+
+    def test_json_acquisition_refuses_concurrent_threads_before_spawn(self):
+        dumper = load_dumper()
+        release = threading.Event()
+        worker = threading.Thread(target=lambda: release.wait(2))
+        worker.start()
+        try:
+            with mock.patch.object(dumper.subprocess, "Popen", side_effect=AssertionError(
+                    "spawned with concurrent thread")):
+                with self.assertRaisesRegex(RuntimeError, "one main thread"):
+                    dumper.run_json([sys.executable, "-c", "print('[]')"])
+        finally:
+            release.set()
+            worker.join(timeout=1)
+        self.assertFalse(worker.is_alive())
+
+    def test_json_acquisition_records_mask_before_interruptible_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "interrupt-mask.c"
+            library = Path(directory) / "interrupt-mask.so"
+            source.write_text(
+                "#include <signal.h>\n#include <pthread.h>\n"
+                "int interrupt_then_block(void) {\n"
+                "  sigset_t mask;\n"
+                "  sigemptyset(&mask); sigaddset(&mask, SIGINT);\n"
+                "  if (raise(SIGINT) != 0) return -1;\n"
+                "  return pthread_sigmask(SIG_BLOCK, &mask, 0);\n}\n",
+                encoding="ascii",
+            )
+            compiled = subprocess.run(
+                ["cc", "-shared", "-fPIC", "-pthread", str(source), "-o", str(library)],
+                text=True, capture_output=True, timeout=10, check=False,
+            )
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            command = (
+                f"import runpy; m=runpy.run_path({str(Path(__file__).resolve())!r}); "
+                f"m['json_signal_lifetime_probe']('mask-mutation', {str(library)!r})"
+            )
+            result = subprocess.run(
+                ["timeout", "--kill-after=1s", "3s", sys.executable, "-I", "-c", command],
+                text=True, capture_output=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(result.stdout)
+            self.assertTrue(report["injected"])
+            self.assertEqual(report["errors"][0]["type"], "KeyboardInterrupt")
+            self.assertEqual(report["spawn_count"], 0)
+            self.assertEqual(report["mask_after"], report["mask_before"])
+            self.assertTrue(report["unrelated_alive"])
+
+    def test_json_acquisition_defers_actual_signal_across_cleanup_entry_and_steps(self):
+        for case in ("entry", "entry-live", "between-steps"):
+            with self.subTest(case=case):
+                command = (
+                    f"import runpy; m=runpy.run_path({str(Path(__file__).resolve())!r}); "
+                    f"m['json_signal_lifetime_probe']({case!r})"
+                )
+                result = subprocess.run(
+                    ["timeout", "--kill-after=1s", "3s", sys.executable, "-I", "-c", command],
+                    text=True, capture_output=True, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                report = json.loads(result.stdout)
+                self.assertTrue(report["injected"])
+                self.assertTrue(any(error["type"] == "KeyboardInterrupt"
+                                    for error in report["errors"]))
+                if case == "entry-live":
+                    self.assertEqual(report["errors"][0]["type"], "RuntimeError")
+                    self.assertIn("timed out", report["errors"][0]["message"])
+                self.assertEqual(report["spawn_count"], 1)
+                self.assertEqual(report["reaped"], [True])
+                self.assertEqual(report["pipes_closed"], [True])
+                self.assertEqual(report["pidfds_closed"], [True])
+                self.assertEqual(report["selectors_closed"], [True])
+                self.assertEqual(report["mask_after"], report["mask_before"])
+                self.assertTrue(report["unrelated_alive"])
+
+    def test_json_acquisition_probe_watchdog_terminates_only_its_scope(self):
+        # Exercise the external watchdog, including descendants whose cleanup
+        # cannot run once their probe parent is terminated. A separate child
+        # outside the timeout-created process group must survive. Become the
+        # temporary subreaper so exit-readiness is followed by actual reaping.
+        libc = ctypes.CDLL(None, use_errno=True)
+        original_subreaper = ctypes.c_int()
+        self.assertEqual(libc.prctl(37, ctypes.byref(original_subreaper), 0, 0, 0), 0)
+        with tempfile.TemporaryDirectory() as directory:
+            pidfile = Path(directory) / "scope.json"
+            command = (
+                f"import runpy; m=runpy.run_path({str(Path(__file__).resolve())!r}); "
+                f"m['json_signal_lifetime_probe']('watchdog-stall', {str(pidfile)!r})"
+            )
+            unrelated = None
+            watchdog = None
+            handles = []
+            selector_module = load_dumper().selectors
+            selector = selector_module.DefaultSelector()
+            try:
+                self.assertEqual(libc.prctl(36, 1, 0, 0, 0), 0)
+                enabled = ctypes.c_int()
+                self.assertEqual(libc.prctl(37, ctypes.byref(enabled), 0, 0, 0), 0)
+                self.assertEqual(enabled.value, 1)
+                unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"])
+                watchdog = subprocess.Popen(
+                    ["timeout", "--kill-after=0.2s", "1s", sys.executable, "-I", "-c", command],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                deadline = time.monotonic() + 0.8
+                while not pidfile.exists() and time.monotonic() < deadline:
+                    time.sleep(0.005)
+                pids = json.loads(pidfile.read_text())
+                self.assertEqual(len(pids), 3)
+                for pid in pids:
+                    fd = os.pidfd_open(pid)
+                    handles.append(fd)
+                    selector.register(fd, selector_module.EVENT_READ)
+                self.assertEqual(selector.select(0), [])
+                _stdout, stderr = watchdog.communicate(timeout=3)
+                self.assertEqual(watchdog.returncode, 124, stderr)
+                exited = set()
+                deadline = time.monotonic() + 0.5
+                while len(exited) < len(handles) and time.monotonic() < deadline:
+                    for key, _event in selector.select(max(0, deadline - time.monotonic())):
+                        exited.add(key.fd)
+                        selector.unregister(key.fd)
+                self.assertEqual(exited, set(handles), "watchdog left a live owned descendant")
+                # timeout reaps its immediate probe before it exits. Only
+                # the probe's two children are adopted by this subreaper.
+                with self.assertRaises(ChildProcessError):
+                    os.waitid(os.P_PIDFD, handles[0], os.WEXITED | os.WNOHANG)
+                for pid, fd in zip(pids[1:], handles[1:]):
+                    status = os.waitid(os.P_PIDFD, fd, os.WEXITED | os.WNOHANG)
+                    self.assertIsNotNone(status, "exit-ready descendant was not waitable")
+                    self.assertEqual(status.si_pid, pid)
+                    self.assertEqual(status.si_code, os.CLD_KILLED)
+                    self.assertEqual(status.si_status, signal.SIGTERM)
+                    with self.assertRaises(ChildProcessError):
+                        os.waitid(os.P_PIDFD, fd, os.WEXITED | os.WNOHANG)
+                self.assertIsNone(unrelated.poll())
+            finally:
+                cleanup_errors = []
+
+                def cleanup(action):
+                    try:
+                        action()
+                    except BaseException as error:
+                        cleanup_errors.append(error)
+
+                # Leave the independent watchdog alive to settle its scope
+                # even if PID publication or an earlier assertion failed.
+                if watchdog is not None:
+                    cleanup(lambda: watchdog.wait(timeout=3))
+                for fd in handles:
+                    def settle_retained(fd=fd):
+                        try:
+                            signal.pidfd_send_signal(fd, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        deadline = time.monotonic() + 1
+                        while True:
+                            try:
+                                status = os.waitid(os.P_PIDFD, fd, os.WEXITED | os.WNOHANG)
+                            except ChildProcessError:
+                                return  # Already reaped by the assertion above.
+                            if status is not None:
+                                return
+                            if time.monotonic() >= deadline:
+                                raise TimeoutError("watchdog descendant did not settle")
+                            time.sleep(0.005)
+
+                    cleanup(settle_retained)
+                    cleanup(lambda fd=fd: os.close(fd))
+                cleanup(selector.close)
+                if watchdog is not None:
+                    cleanup(watchdog.stdout.close)
+                    cleanup(watchdog.stderr.close)
+                if unrelated is not None:
+                    cleanup(unrelated.kill)
+                    cleanup(lambda: unrelated.wait(timeout=1))
+                cleanup(lambda: self.assertEqual(libc.prctl(36, original_subreaper.value, 0, 0, 0), 0))
+                self.assertEqual(cleanup_errors, [])
 
     def test_main_refuses_without_reader_before_manifest(self):
         dumper = load_dumper()
@@ -944,6 +1974,58 @@ class FaultStartTests(unittest.TestCase):
 
 
 class RingLayoutTests(unittest.TestCase):
+    class Mapping:
+        def __init__(self, size, *, close_error=False):
+            self.data = bytearray(size)
+            self.closed = False
+            self.close_error = close_error
+
+        def __getitem__(self, key):
+            return self.data[key]
+
+        def close(self):
+            self.closed = True
+            if self.close_error:
+                raise OSError("injected mapping close failure")
+
+    def retained_fixture(self, subject, *, name="EVENTS", busy=False, close_error=False):
+        mappings = [self.Mapping(mmap.PAGESIZE),
+                    self.Mapping(mmap.PAGESIZE * 3, close_error=close_error)]
+        event = bytes(subject.RING_RECORD_SIZES[name])
+        record_size = (8 + len(event) + 7) & ~7
+        struct.pack_into("<Q", mappings[1].data, 0, record_size)
+        struct.pack_into("<I", mappings[1].data, mmap.PAGESIZE,
+                         len(event) | ((1 << 31) if busy else 0))
+        mappings[1].data[mmap.PAGESIZE + 8:mmap.PAGESIZE + 8 + len(event)] = event
+
+        class Libc:
+            def __init__(self):
+                self.fds = []
+
+            def syscall(self, *_args):
+                fd = os.open("/dev/null", os.O_RDONLY)
+                self.fds.append(fd)
+                return fd
+
+        libc = Libc()
+        mapping_index = 0
+
+        def fake_mmap(*_args, **_kwargs):
+            nonlocal mapping_index
+            result = mappings[mapping_index]
+            mapping_index += 1
+            return result
+
+        real_u64 = subject.u64
+
+        def fake_u64(value, offset):
+            return real_u64(value.data if isinstance(value, self.Mapping) else value, offset)
+
+        item = {"oracle": "mmap", "type": "ringbuf", "key_size": 0,
+                "value_size": 0, "id": 7, "name": name,
+                "max_entries": mmap.PAGESIZE, "map_flags": 0}
+        return item, mappings, libc, fake_mmap, fake_u64
+
     def test_ring_layout_rejects_busy_and_wrap(self):
         subject = load_subject(TARGET_BITS)
         raw = bytearray(2 * mmap.PAGESIZE)
@@ -1006,6 +2088,62 @@ class RingLayoutTests(unittest.TestCase):
                     os.close(libc.fd)
                 except OSError:
                     pass
+
+    def test_retained_ring_readers_keep_both_mappings_and_fds_until_close(self):
+        subject = load_subject(TARGET_BITS)
+        first = self.retained_fixture(subject)
+        second = self.retained_fixture(subject, name="DISCOVERY")
+        item, mappings, libc, _fake_mmap, fake_u64 = first
+        second_item, second_mappings = second[:2]
+        all_mappings = mappings + second_mappings
+        mapping_iterator = iter(all_mappings)
+        with mock.patch.object(subject.ctypes, "CDLL", return_value=libc), \
+                mock.patch.object(subject.mmap, "mmap", side_effect=lambda *_a, **_k: next(mapping_iterator)), \
+                mock.patch.object(subject, "u64", side_effect=fake_u64):
+            readers = [subject.RetainedRingReader(item), subject.RetainedRingReader(second_item)]
+            self.assertFalse(any(mapping.closed for mapping in all_mappings))
+            discovery_position = (8 + subject.DISCOVERY_RECORD_SIZE + 7) & ~7
+            self.assertEqual([reader.positions() for reader in readers],
+                             [(0, 336), (0, discovery_position)])
+            self.assertEqual(readers[0].read_records((0, 336)), [bytes(328)])
+            self.assertEqual(readers[1].read_records((0, discovery_position)),
+                             [bytes(subject.DISCOVERY_RECORD_SIZE)])
+            self.assertTrue(all(os.fstat(fd) for fd in libc.fds))
+            for reader in readers:
+                reader.close()
+        self.assertTrue(all(mapping.closed for mapping in all_mappings))
+        for fd in libc.fds:
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+
+    def test_retained_ring_reader_cleans_up_after_position_decode_and_close_failures(self):
+        subject = load_subject(TARGET_BITS)
+        for case in ("position", "decode", "close"):
+            with self.subTest(case=case):
+                item, mappings, libc, fake_mmap, fake_u64 = self.retained_fixture(
+                    subject, busy=case == "decode", close_error=case == "close")
+                with mock.patch.object(subject.ctypes, "CDLL", return_value=libc), \
+                        mock.patch.object(subject.mmap, "mmap", side_effect=fake_mmap), \
+                        mock.patch.object(subject, "u64", side_effect=(
+                            OSError("injected position failure") if case == "position" else fake_u64)):
+                    with self.assertRaises((AssertionError, OSError)):
+                        with subject.RetainedRingReader(item) as reader:
+                            positions = reader.positions()
+                            reader.read_records(positions)
+                self.assertTrue(all(mapping.closed for mapping in mappings))
+                with self.assertRaises(OSError):
+                    os.fstat(libc.fds[0])
+
+    def test_retained_event_validation_never_opens_live_bpf_maps(self):
+        subject = load_subject(TARGET_BITS)
+        retained = {
+            "EVENTS": [event_bytes(index) for index in range(28)],
+            "DISCOVERY": [bytes(subject.DISCOVERY_RECORD_SIZE)],
+        }
+        with mock.patch.object(subject.ctypes, "CDLL",
+                               side_effect=AssertionError("live BPF open forbidden")):
+            subject.assert_retained_ring_records(
+                retained, "default-safe-profile", 0x555)
 
 
 class EventLayoutTests(unittest.TestCase):

@@ -5959,7 +5959,16 @@ aggregate-only-metrics default metrics"
     );
     assert!(faults.contains("blocked template faults: all calls CKR_OK"));
 
-    let lanes = run_ok("sh", &["scripts/verify-canaries.sh", "--self-test"]);
+    let lanes = run_ok(
+        "timeout",
+        &[
+            "--kill-after=2s",
+            "60s",
+            "sh",
+            "scripts/verify-canaries.sh",
+            "--self-test",
+        ],
+    );
     assert!(lanes.contains("canary lane assertion self-test: OK"));
     assert!(lanes.contains("raw binary alias scanner self-test: OK"));
     assert!(lanes.contains("unsafe raw template oracle self-test: OK"));
@@ -5968,8 +5977,11 @@ aggregate-only-metrics default metrics"
     assert!(lanes.contains("scan-only hostile output contract: OK"));
     assert!(lanes.contains("canary matrix 988/104/208 with 16 mixed surfaces: OK"));
     for bits in ["32", "64"] {
-        let output = Command::new("python3")
+        let output = Command::new("timeout")
             .args([
+                "--kill-after=2s",
+                "60s",
+                "python3",
                 "-I",
                 "tests/python/test_canary_evidence.py",
                 "--target-bits",
@@ -6023,7 +6035,7 @@ aggregate-only-metrics default metrics"
             );
         }
         assert!(
-            report.contains("Ran 34 tests") && !report.contains("skipped="),
+            report.contains("Ran 53 tests") && !report.contains("skipped="),
             "native {bits}-bit suite must execute every required case: {report}"
         );
 

@@ -3,13 +3,17 @@
 
 import glob
 import json
+import math
 import os
 from pathlib import Path
 import re
+import selectors
+import signal
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 
@@ -29,6 +33,8 @@ SNAPSHOT_MAP_ORACLES = {
     "ringbuf": "mmap", "task_storage": "task-storage",
 }
 DIAGNOSTIC_LIMIT = 4096
+JSON_TIMEOUT_SECONDS = 8
+JSON_OUTPUT_MAX_BYTES = TASK_STORAGE_MAX_BYTES
 
 
 def map_ids_from_fdinfo(texts):
@@ -47,7 +53,15 @@ def checked_json(args, returncode, stdout, stderr, require_list=False, map_ident
             f"{' '.join(args)}{identity} failed: {bounded_diagnostic(stderr)}"
         )
     try:
-        value = json.loads(stdout)
+        def unique_object(pairs):
+            result = {}
+            for key, child in pairs:
+                if key in result:
+                    raise RuntimeError("bpftool JSON contains duplicate object key")
+                result[key] = child
+            return result
+
+        value = json.loads(stdout, object_pairs_hook=unique_object)
     except json.JSONDecodeError as error:
         raise RuntimeError(
             f"{' '.join(args)}{identity} produced invalid JSON: "
@@ -68,11 +82,139 @@ def bounded_diagnostic(value):
     return text
 
 
-def run_json(args, require_list=False, map_identity=None):
-    proc = subprocess.run(args, capture_output=True, text=True)
+def run_json(args, require_list=False, map_identity=None, *,
+             timeout_seconds=JSON_TIMEOUT_SECONDS, max_bytes=JSON_OUTPUT_MAX_BYTES):
+    """Run one bounded JSON acquisition and reap only its direct child.
+
+    Call only from an isolated, single-threaded script with default SIGCHLD
+    retention and no competing waiters (including signal handlers or native
+    threads). Keep those conditions unchanged until this call returns. They
+    preserve direct-child ownership if pidfd acquisition itself fails.
+    """
+    if (type(timeout_seconds) not in (int, float) or not math.isfinite(timeout_seconds)
+            or not 0 < timeout_seconds <= JSON_TIMEOUT_SECONDS
+            or not snapshot_uint(max_bytes, 63, positive=True)
+            or max_bytes > JSON_OUTPUT_MAX_BYTES):
+        raise RuntimeError("bpftool JSON acquisition has invalid bounds")
+    if (threading.current_thread() is not threading.main_thread()
+            or threading.active_count() != 1
+            or signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL):
+        raise RuntimeError("bpftool JSON acquisition requires one main thread and default SIGCHLD")
+    output = bytearray()
+    diagnostic = bytearray()
+    streams = None
+    process = None
+    pidfd = None
+    original_mask = None
+    returncode = None
+    primary_error = None
+    primary_traceback = None
+    try:
+        # Record restoration before the mutating call: a Python handler can
+        # raise after the kernel changes the mask but before that call returns.
+        handled_signals = {sig for sig in signal.valid_signals()
+                           if callable(signal.getsignal(sig))}
+        original_mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+        signal.pthread_sigmask(signal.SIG_BLOCK, handled_signals)
+        # Keep handlers deferred through acquisition AND all cleanup entry/
+        # transition steps. Cancellation is delivered after bounded cleanup;
+        # callers testing that bound need an independent process watchdog.
+        # The child must not inherit the temporary blocked mask.
+        process = subprocess.Popen(
+            args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_SETMASK, original_mask),
+        )
+        pidfd = os.pidfd_open(process.pid)
+        deadline = time.monotonic() + timeout_seconds
+        streams = selectors.DefaultSelector()
+        streams.register(process.stdout, selectors.EVENT_READ, output)
+        streams.register(process.stderr, selectors.EVENT_READ, diagnostic)
+        failure = None
+        while streams.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                failure = f"bpftool JSON acquisition timed out after {timeout_seconds:g}s"
+                break
+            for key, _events in streams.select(min(0.05, remaining)):
+                chunk = os.read(key.fileobj.fileno(), 65536)
+                if not chunk:
+                    streams.unregister(key.fileobj)
+                    continue
+                target = key.data
+                if target is output:
+                    target.extend(chunk[:max_bytes + 1 - len(target)])
+                    if len(target) > max_bytes:
+                        failure = f"bpftool JSON acquisition exceeded output bound {max_bytes}"
+                        break
+                elif len(target) <= DIAGNOSTIC_LIMIT:
+                    target.extend(chunk[:DIAGNOSTIC_LIMIT + 1 - len(target)])
+            if failure is not None:
+                break
+        if failure is not None:
+            raise RuntimeError(failure)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                f"bpftool JSON acquisition timed out after {timeout_seconds:g}s")
+        try:
+            returncode = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(
+                f"bpftool JSON acquisition timed out after {timeout_seconds:g}s") from None
+    except BaseException as error:
+        primary_error = error
+        primary_traceback = error.__traceback__
+    finally:
+        cleanup_error = None
+
+        def cleanup(action):
+            nonlocal cleanup_error
+            try:
+                action()
+            except BaseException as error:
+                if cleanup_error is not None:
+                    error.__cause__ = cleanup_error
+                cleanup_error = error
+
+        def terminate_child():
+            if pidfd is not None:
+                try:
+                    signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass  # The retained identity exited, possibly already reaped.
+            else:
+                # No reaping wait has occurred on this path. With exclusive
+                # waits and retained zombies, WNOWAIT proves the direct child
+                # still owns this PID even if it exits before kill(). ECHILD
+                # refuses signaling; never infer ownership from Popen state.
+                try:
+                    os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                except ChildProcessError:
+                    return
+                os.kill(process.pid, signal.SIGKILL)
+
+        if process is not None and returncode is None:
+            cleanup(terminate_child)
+        if streams is not None:
+            cleanup(streams.close)
+        if process is not None:
+            cleanup(process.stdout.close)
+            cleanup(process.stderr.close)
+            cleanup(lambda: process.wait(timeout=min(timeout_seconds, 1)))
+        if pidfd is not None:
+            cleanup(lambda: os.close(pidfd))
+        if original_mask is not None:
+            cleanup(lambda: signal.pthread_sigmask(signal.SIG_SETMASK, original_mask))
+    if primary_error is not None:
+        if cleanup_error is not None:
+            raise primary_error.with_traceback(primary_traceback) from cleanup_error
+        raise primary_error.with_traceback(primary_traceback)
+    if cleanup_error is not None:
+        raise cleanup_error.with_traceback(cleanup_error.__traceback__)
     return checked_json(
-        args, proc.returncode, proc.stdout, proc.stderr,
-        require_list=require_list, map_identity=map_identity,
+        args, returncode, output.decode("utf-8", "replace"),
+        diagnostic.decode("utf-8", "replace"), require_list=require_list,
+        map_identity=map_identity,
     )
 
 
@@ -98,6 +240,125 @@ def canonical_map_name(item):
         return name
     matches = [candidate for candidate in TASK_STORAGE_NAMES if candidate[:15] == name]
     return matches[0] if len(matches) == 1 else name
+
+
+def normalize_map_metadata(item, requested_id):
+    """Translate one real bpftool map-show row to the strict internal shape."""
+    if not isinstance(item, dict) or not snapshot_uint(requested_id, 32, positive=True):
+        raise RuntimeError("map metadata: malformed result")
+    if item.get("id") != requested_id:
+        raise RuntimeError(f"map metadata: returned map id differs from requested id={requested_id}")
+    has_flags = "flags" in item
+    has_alias = "map_flags" in item
+    if not has_flags and not has_alias:
+        raise RuntimeError(f"map metadata: missing flags for requested id={requested_id}")
+    if has_flags and has_alias and item["flags"] != item["map_flags"]:
+        raise RuntimeError(f"map metadata: conflicting flags for requested id={requested_id}")
+    flags = item["flags"] if has_flags else item["map_flags"]
+    normalized = {
+        "id": item.get("id"), "name": canonical_map_name(item), "type": item.get("type"),
+        "bytes_key": item.get("bytes_key"), "bytes_value": item.get("bytes_value"),
+        "max_entries": item.get("max_entries"), "map_flags": flags,
+    }
+    map_type = normalized["type"]
+    normalized["oracle"] = SNAPSHOT_MAP_ORACLES.get(map_type)
+    snapshot_map_metadata(normalized)
+    if normalized["name"] == "EVENTS" and map_type != "ringbuf":
+        raise RuntimeError(f"map metadata: EVENTS is not a ringbuf for requested id={requested_id}")
+    return normalized
+
+
+def _raw_bytes(value, expected):
+    if not isinstance(value, list) or len(value) != expected:
+        raise RuntimeError("raw map dump: malformed byte array")
+    result = []
+    for byte in value:
+        if type(byte) is int and 0 <= byte <= 0xff:
+            result.append(f"0x{byte:02x}")
+        elif type(byte) is str and re.fullmatch(r"0x[0-9a-fA-F]{2}", byte) is not None:
+            result.append(f"0x{int(byte, 16):02x}")
+        else:
+            raise RuntimeError("raw map dump: malformed byte array")
+    return result
+
+
+def possible_cpu_ids(path=Path("/sys/devices/system/cpu/possible")):
+    """Return the kernel possible-CPU set, which sizes per-CPU map values."""
+    with Path(path).open(encoding="ascii") as handle:
+        text = handle.read(4097)
+    if len(text) > 4096:
+        raise RuntimeError("possible CPU set exceeds input bound")
+    cpus = set()
+    for part in text.strip().split(","):
+        match = re.fullmatch(r"([0-9]+)(?:-([0-9]+))?", part)
+        if match is None:
+            raise RuntimeError("possible CPU set is malformed")
+        first = int(match.group(1))
+        last = first if match.group(2) is None else int(match.group(2))
+        if first > last or last >= (1 << 20):
+            raise RuntimeError("possible CPU set is malformed")
+        before = len(cpus)
+        cpus.update(range(first, last + 1))
+        if len(cpus) != before + last - first + 1:
+            raise RuntimeError("possible CPU set contains duplicates")
+    if not cpus:
+        raise RuntimeError("possible CPU set is empty")
+    return tuple(sorted(cpus))
+
+
+def normalize_map_dump(entries, metadata, *, possible_cpus=None):
+    """Retain complete raw bpftool cells while discarding validated BTF formatting."""
+    snapshot_map_metadata(metadata)
+    if metadata["oracle"] != "dump" or not isinstance(entries, list):
+        raise RuntimeError("raw map dump: invalid map or result")
+    if len(entries) > metadata["max_entries"]:
+        raise RuntimeError("raw map dump: entry bound exceeded")
+    per_cpu = metadata["type"] in ("percpu_hash", "percpu_array")
+    array = metadata["type"] in ("array", "percpu_array")
+    if array and metadata["bytes_key"] != 4:
+        raise RuntimeError("raw map dump: malformed array key metadata")
+    if per_cpu:
+        possible_cpus = possible_cpu_ids() if possible_cpus is None else possible_cpus
+        if (not isinstance(possible_cpus, (list, tuple)) or not possible_cpus
+                or any(not snapshot_uint(cpu, 32) for cpu in possible_cpus)
+                or list(possible_cpus) != sorted(set(possible_cpus))):
+            raise RuntimeError("raw map dump: invalid possible CPU set")
+    result = []
+    keys = set()
+    for entry in entries:
+        expected_fields = {"key", "values" if per_cpu else "value"}
+        if not isinstance(entry, dict) or set(entry) not in (expected_fields,
+                                                             expected_fields | {"formatted"}):
+            raise RuntimeError("raw map dump: malformed cell")
+        if "formatted" in entry and not isinstance(entry["formatted"], dict):
+            raise RuntimeError("raw map dump: malformed formatted metadata")
+        key = _raw_bytes(entry["key"], metadata["bytes_key"])
+        identity = tuple(key)
+        if identity in keys:
+            raise RuntimeError("raw map dump: duplicate key")
+        keys.add(identity)
+        if array and int.from_bytes(bytes(int(byte, 16) for byte in key), "little") >= metadata["max_entries"]:
+            raise RuntimeError("raw map dump: invalid array key")
+        if not per_cpu:
+            result.append({"key": key,
+                           "value": _raw_bytes(entry["value"], metadata["bytes_value"])})
+            continue
+        values = entry["values"]
+        if (not isinstance(values, list) or not values
+                or any(not isinstance(row, dict) or set(row) != {"cpu", "value"}
+                       for row in values)):
+            raise RuntimeError("raw map dump: malformed per-CPU values")
+        cpus = [row["cpu"] for row in values]
+        if (any(not snapshot_uint(cpu, 32) for cpu in cpus)
+                or len(cpus) != len(set(cpus)) or set(cpus) != set(possible_cpus)):
+            raise RuntimeError("raw map dump: incomplete or duplicate CPU values")
+        rows = {row["cpu"]: row for row in values}
+        result.append({"key": key, "values": [{
+            "cpu": cpu, "value": _raw_bytes(rows[cpu]["value"], metadata["bytes_value"])
+        } for cpu in possible_cpus]})
+    if array and len(keys) != metadata["max_entries"]:
+        raise RuntimeError("raw map dump: incomplete array keys")
+    return result
 
 
 def one(value):
@@ -564,9 +825,10 @@ def main():
 
     maps = []
     for map_id in ids:
-        info = one(run_json(["bpftool", "-j", "map", "show", "id", str(map_id)]))
-        info["id"] = map_id
-        info["name"] = canonical_map_name(info)
+        info = normalize_map_metadata(
+            one(run_json(["bpftool", "-j", "map", "show", "id", str(map_id)])),
+            map_id,
+        )
         maps.append(info)
     names = [item.get("name") for item in maps]
     if len(names) != len(set(names)):
@@ -586,10 +848,12 @@ def main():
     if min_start:
         deadline = time.monotonic() + 8
         while True:
-            entries = run_json(
-                ["bpftool", "-j", "map", "dump", "id", str(start["id"])],
-                require_list=True,
-                map_identity=start,
+            entries = normalize_map_dump(
+                run_json(
+                    ["bpftool", "-j", "map", "dump", "id", str(start["id"])],
+                    require_list=True, map_identity=start,
+                ),
+                start,
             )
             if len(entries) >= min_start:
                 break
@@ -604,6 +868,8 @@ def main():
     suffix = f"_{label}" if label else ""
     manifest = []
     task_records = []
+    possible_cpus = possible_cpu_ids() if any(
+        item["type"] in ("percpu_hash", "percpu_array") for item in maps) else None
     for item in maps:
         name = item["name"]
         record = {
@@ -613,16 +879,19 @@ def main():
             "key_size": item.get("bytes_key"),
             "value_size": item.get("bytes_value"),
             "max_entries": item.get("max_entries"),
+            "map_flags": item.get("map_flags"),
             "oracle": map_oracle(item),
         }
         if record["oracle"] == "task-storage":
             task_records.append((item, record))
         if record["oracle"] == "dump":
             output = out_dir / f"mapdump_{name}{suffix}.json"
-            dumped = run_json(
-                ["bpftool", "-j", "map", "dump", "id", str(item["id"])],
-                require_list=True,
-                map_identity=item,
+            dumped = normalize_map_dump(
+                run_json(
+                    ["bpftool", "-j", "map", "dump", "id", str(item["id"])],
+                    require_list=True, map_identity=item,
+                ),
+                item, possible_cpus=possible_cpus,
             )
             write_receipt(output, json.dumps(dumped, separators=(",", ":")) + "\n")
             record["file"] = str(output)

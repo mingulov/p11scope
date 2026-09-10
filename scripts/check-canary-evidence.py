@@ -720,49 +720,95 @@ def parse_ring_records(data, capacity, consumer_pos, producer_pos,
     return records
 
 
-def ring_records(manifest, name="EVENTS"):
-    assert platform.machine() == "x86_64", "raw ring oracle requires Linux x86-64"
-    item = manifest_map(manifest, name)
-    assert item["oracle"] == "mmap" and "file" not in item, item
-    assert item["type"] == "ringbuf" and item["key_size"] == item["value_size"] == 0, item
-    map_id, capacity = item["id"], item["max_entries"]
-    attr = ctypes.create_string_buffer(struct.pack("=III", map_id, 0, 0))
-    libc = ctypes.CDLL(None, use_errno=True)
-    fd = libc.syscall(321, 14, ctypes.byref(attr), ctypes.sizeof(attr))
-    if fd < 0:
-        error = ctypes.get_errno()
-        raise OSError(error, f"BPF_MAP_GET_FD_BY_ID for {name} id {map_id}")
-    page = mmap.PAGESIZE
-    consumer = None
-    producer = None
-    try:
-        consumer = mmap.mmap(fd, page, flags=mmap.MAP_SHARED,
-                             prot=mmap.PROT_READ, offset=0)
-        producer = mmap.mmap(fd, page + 2 * capacity, flags=mmap.MAP_SHARED,
-                             prot=mmap.PROT_READ, offset=page)
-        before = (u64(consumer, 0), u64(producer, 0))
-        records = parse_ring_records(producer[page:], capacity, *before,
-                                     RING_RECORD_SIZES[name])
-        after = (u64(consumer, 0), u64(producer, 0))
-        assert after == before, f"ring moved during snapshot: {before} -> {after}"
-        return records
-    finally:
-        active_error = sys.exc_info()[0] is not None
+class RetainedRingReader:
+    """Own one ring map FD and both read-only mappings across an acquisition."""
+
+    def __init__(self, item):
+        assert platform.machine() == "x86_64", "raw ring oracle requires Linux x86-64"
+        assert isinstance(item, dict) and item.get("oracle") == "mmap" and "file" not in item, item
+        assert (item.get("type"), item.get("key_size"), item.get("value_size")) == (
+            "ringbuf", 0, 0), item
+        assert (type(item.get("id")) is int and item["id"] > 0
+                and item.get("name") in RING_RECORD_SIZES), item
+        capacity = item.get("max_entries")
+        assert (type(capacity) is int and capacity >= mmap.PAGESIZE
+                and capacity & (capacity - 1) == 0
+                and capacity % mmap.PAGESIZE == 0), item
+        self.item = item
+        self.fd = None
+        self.consumer = None
+        self.producer = None
+        map_id = item["id"]
+        attr = ctypes.create_string_buffer(struct.pack("=III", map_id, 0, 0))
+        libc = ctypes.CDLL(None, use_errno=True)
+        self.fd = libc.syscall(321, 14, ctypes.byref(attr), ctypes.sizeof(attr))
+        if self.fd < 0:
+            self.fd = None
+            error = ctypes.get_errno()
+            raise OSError(error, f"BPF_MAP_GET_FD_BY_ID for {item['name']} id {map_id}")
+        page = mmap.PAGESIZE
+        try:
+            self.consumer = mmap.mmap(self.fd, page, flags=mmap.MAP_SHARED,
+                                      prot=mmap.PROT_READ, offset=0)
+            self.producer = mmap.mmap(
+                self.fd, page + 2 * capacity, flags=mmap.MAP_SHARED,
+                prot=mmap.PROT_READ, offset=page)
+        except BaseException:
+            self._close(preserve_error=True)
+            raise
+
+    def positions(self):
+        if self.consumer is None or self.producer is None:
+            raise RuntimeError("retained ring reader is closed")
+        return u64(self.consumer, 0), u64(self.producer, 0)
+
+    def read_records(self, positions=None):
+        if self.producer is None:
+            raise RuntimeError("retained ring reader is closed")
+        positions = self.positions() if positions is None else positions
+        if (not isinstance(positions, tuple) or len(positions) != 2
+                or any(type(position) is not int or position < 0 for position in positions)):
+            raise RuntimeError("invalid retained ring positions")
+        page = mmap.PAGESIZE
+        return parse_ring_records(
+            self.producer[page:], self.item["max_entries"], *positions,
+            RING_RECORD_SIZES[self.item["name"]])
+
+    def _close(self, *, preserve_error=False):
         cleanup_error = None
-        for action in (
-            None if producer is None else producer.close,
-            None if consumer is None else consumer.close,
-            lambda: os.close(fd),
-        ):
-            if action is None:
+        resources = (self.producer, self.consumer, self.fd)
+        self.producer = self.consumer = self.fd = None
+        for resource in resources:
+            if resource is None:
                 continue
             try:
-                action()
+                resource.close() if hasattr(resource, "close") else os.close(resource)
             except Exception as error:
                 if cleanup_error is None:
                     cleanup_error = error
-        if cleanup_error is not None and not active_error:
+        if cleanup_error is not None and not preserve_error:
             raise cleanup_error
+
+    def close(self):
+        self._close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, error_type, _error, _traceback):
+        self._close(preserve_error=error_type is not None)
+        return False
+
+
+def ring_records(manifest, name="EVENTS"):
+    item = dict(manifest_map(manifest, name))
+    item.setdefault("name", name)
+    with RetainedRingReader(item) as reader:
+        before = reader.positions()
+        records = reader.read_records(before)
+        after = reader.positions()
+        assert after == before, f"ring moved during snapshot: {before} -> {after}"
+        return records
 
 
 def assert_event_records(raw_records, lane, workload_pid):
@@ -816,6 +862,19 @@ def assert_start_event_records(raw_records, lane):
     )
 
 
+def assert_retained_ring_records(retained, lane, workload_pid):
+    """Validate already-retained ring bytes without opening or mapping BPF maps."""
+    assert isinstance(retained, dict) and set(retained) == set(RING_RECORD_SIZES), retained
+    for name, expected_size in RING_RECORD_SIZES.items():
+        records = retained[name]
+        assert isinstance(records, list), (name, type(records).__name__)
+        assert all(type(record) is bytes and len(record) == expected_size for record in records), name
+    if lane in START_SNAPSHOT_LANES:
+        assert_start_event_records(retained["EVENTS"], lane)
+    else:
+        assert_event_records(retained["EVENTS"], lane, workload_pid)
+
+
 def assert_raw_records(manifest, lane, workload_pid, prefix):
     """Reads every owned ringbuf through the mmap oracle and keeps its bytes.
 
@@ -823,19 +882,14 @@ def assert_raw_records(manifest, lane, workload_pid, prefix):
     kept for the matrix scan, which is what makes a ringbuf a scanned privacy
     surface rather than a map the dump loop silently walked past.
     """
-    read = set()
+    retained = {}
     for item in read_json(manifest):
         if item["type"] != "ringbuf":
             continue
         records = ring_records(manifest, item["name"])
-        if item["name"] == "EVENTS":
-            if lane in START_SNAPSHOT_LANES:
-                assert_start_event_records(records, lane)
-            else:
-                assert_event_records(records, lane, workload_pid)
+        retained[item["name"]] = records
         ring_raw_path(prefix, item["name"]).write_bytes(b"".join(records))
-        read.add(item["name"])
-    assert read == set(RING_RECORD_SIZES), f"{lane}: owned ringbufs {read} were not all read"
+    assert_retained_ring_records(retained, lane, workload_pid)
 
 
 def assert_stopped_snapshot(manifest, prefix):

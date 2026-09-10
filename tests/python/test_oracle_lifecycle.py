@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import signal
 import subprocess
 import tempfile
 import threading
@@ -20,6 +21,83 @@ FIXTURE = ROOT / "tests/fixtures/oracle-lifecycle/scenarios.sh"
 def process_starttime(pid):
     fields = Path(f"/proc/{pid}/stat").read_bytes().rsplit(b") ", 1)[1].split()
     return int(fields[19])
+
+
+def assert_process_generation_absent(testcase, pid, starttime):
+    try:
+        current = process_starttime(pid)
+    except (FileNotFoundError, ProcessLookupError):
+        return
+    testcase.assertNotEqual(
+        current, starttime, f"process {pid}/{starttime} remains"
+    )
+
+
+def read_process_identity(path):
+    try:
+        fields = path.read_text().split()
+    except (FileNotFoundError, OSError, UnicodeError):
+        return None
+    if len(fields) != 2:
+        return None
+    try:
+        pid, starttime = map(int, fields)
+    except ValueError:
+        return None
+    if pid <= 0 or starttime <= 0:
+        return None
+    return pid, starttime
+
+
+def wait_process_identity(testcase, path, process, timeout=1.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        identity = read_process_identity(path)
+        if identity is not None:
+            return identity
+        if process.poll() is not None:
+            break
+        time.sleep(0.005)
+    testcase.fail("fixture did not publish a complete child identity")
+
+
+def wait_process_state(testcase, pid, expected, timeout=1.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            state = Path(f"/proc/{pid}/stat").read_bytes().rsplit(b") ", 1)[1][:1]
+        except (FileNotFoundError, ProcessLookupError):
+            break
+        if state == expected:
+            return
+        time.sleep(0.005)
+    testcase.fail(f"process {pid} did not enter state {expected.decode()}")
+
+
+def terminate_process_generation(pid, starttime, timeout=2.0):
+    try:
+        pidfd = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return
+    try:
+        try:
+            current = process_starttime(pid)
+        except (FileNotFoundError, ProcessLookupError):
+            return
+        if current != starttime:
+            return
+        signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+    finally:
+        os.close(pidfd)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if process_starttime(pid) != starttime:
+                return
+        except (FileNotFoundError, ProcessLookupError):
+            return
+        time.sleep(0.005)
+    raise AssertionError(f"process {pid}/{starttime} remained after SIGKILL")
 
 
 @contextmanager
@@ -72,6 +150,46 @@ class OracleLifecycleTests(unittest.TestCase):
             timeout=timeout,
             env={**os.environ, **(env or {})},
         )
+
+    def start_hung_fixture(self, identity, env=None):
+        return subprocess.Popen(
+            ["/bin/sh", str(FIXTURE), str(DRIVER), "hung-clients", str(identity)],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={**os.environ, **(env or {})},
+        )
+
+    def cleanup_hung_fixture(self, process, identity):
+        errors = []
+        try:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=1)
+        except Exception as error:
+            errors.append(error)
+        published = read_process_identity(identity)
+        if published is not None:
+            try:
+                terminate_process_generation(*published)
+            except Exception as error:
+                errors.append(error)
+        output = ("", "")
+        if any(
+            stream is not None and not stream.closed
+            for stream in (process.stdout, process.stderr)
+        ):
+            try:
+                output = process.communicate(timeout=2)
+            except Exception as error:
+                errors.append(error)
+                for stream in (process.stdout, process.stderr):
+                    if stream is not None:
+                        stream.close()
+        if errors:
+            raise errors[0]
+        return output
 
     def test_workload_preserves_quoted_argv_and_fresh_identity(self):
         with tempfile.TemporaryDirectory(prefix="oracle path's ") as raw:
@@ -337,10 +455,87 @@ class OracleLifecycleTests(unittest.TestCase):
         self.assertEqual(result.returncode, 124, result.stderr)
         self.assertLess(time.monotonic() - started, 2)
 
-    def test_hung_descendant_and_observer_first_are_bounded(self):
-        result = self.run_fixture("hung-clients", timeout=3)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "hung=124 observer=1")
+    def test_hung_descendant_is_terminated_reaped_and_closes_capture_pipe(self):
+        with tempfile.TemporaryDirectory() as raw:
+            identity = Path(raw) / "hung.identity"
+            started = time.monotonic()
+            # Capturing the fixture's real stdout makes communicate wait for EOF
+            # from every inheriting descendant; a leaked sleep cannot be hidden.
+            process = self.start_hung_fixture(identity)
+            try:
+                pid, starttime = wait_process_identity(self, identity, process)
+                stdout, stderr = process.communicate(timeout=3)
+                elapsed = time.monotonic() - started
+                self.assertEqual(process.returncode, 0, stderr)
+                self.assertEqual(stdout.strip(), "hung=124 observer=1")
+                self.assertLess(elapsed, 2)
+                assert_process_generation_absent(self, pid, starttime)
+            finally:
+                self.cleanup_hung_fixture(process, identity)
+
+    def test_outer_timeout_cleans_published_descendant_and_capture_pipe(self):
+        with tempfile.TemporaryDirectory() as raw:
+            identity = Path(raw) / "hung.identity"
+            process = self.start_hung_fixture(
+                identity, env={"STOP_AFTER_IDENTITY": "1"}
+            )
+            try:
+                pid, starttime = wait_process_identity(self, identity, process)
+                wait_process_state(self, process.pid, b"T")
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    process.communicate(timeout=0.05)
+                process.kill()
+                process.wait(timeout=1)
+                self.assertEqual(process_starttime(pid), starttime)
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    process.communicate(timeout=0.05)
+                stdout, stderr = self.cleanup_hung_fixture(process, identity)
+                self.assertEqual(process.returncode, -signal.SIGKILL, stderr)
+                self.assertEqual(stdout, "")
+                assert_process_generation_absent(self, pid, starttime)
+            finally:
+                self.cleanup_hung_fixture(process, identity)
+
+    def test_parent_cleanup_ignores_unauthenticated_identity_receipts(self):
+        decoy = subprocess.Popen(["sleep", "30"])
+        try:
+            decoy_start = process_starttime(decoy.pid)
+            receipts = (
+                f"{decoy.pid}\n",
+                f"{decoy.pid} invalid\n",
+                f"{decoy.pid} {decoy_start} extra\n",
+                "",
+                None,
+            )
+            with tempfile.TemporaryDirectory() as raw:
+                identity = Path(raw) / "hung.identity"
+                for receipt in receipts:
+                    with self.subTest(receipt=receipt):
+                        identity.unlink(missing_ok=True)
+                        if receipt is not None:
+                            identity.write_text(receipt)
+                        process = subprocess.Popen(
+                            ["/bin/true"],
+                            text=True,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                        )
+                        try:
+                            stdout, stderr = self.cleanup_hung_fixture(
+                                process, identity
+                            )
+                            self.assertEqual((stdout, stderr), ("", ""))
+                            self.assertIsNone(decoy.poll())
+                        finally:
+                            if process.poll() is None:
+                                process.kill()
+                            process.wait(timeout=1)
+                            for stream in (process.stdout, process.stderr):
+                                stream.close()
+        finally:
+            if decoy.poll() is None:
+                decoy.kill()
+            decoy.wait(timeout=1)
 
     def test_authentication_pins_actual_membership_and_rejects_mismatch(self):
         membership = next(

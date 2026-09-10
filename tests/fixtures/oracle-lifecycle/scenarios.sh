@@ -106,13 +106,54 @@ wait-query-error)
     printf 'wait=%s reap=%s foreign=live\n' "$wait_rc" "$reap_rc"
     ;;
 hung-clients)
-    setsid timeout --signal=KILL 1s /bin/sh -c 'sleep 30 & wait' & hung=$!
-    hung_start=$(process_starttime "$hung")
-    if oracle_wait_child "$hung" "$hung_start" 2; then hung_rc=0; else hung_rc=$?; fi
-    wait "$hung" 2>/dev/null || :
-    /bin/false & observer=$!
-    observer_start=$(process_starttime "$observer")
-    if oracle_wait_child "$observer" "$observer_start" 20; then observer_rc=0; else observer_rc=$?; fi
+    identity=$1
+    owned_hung_pid= owned_hung_start= owned_observer_pid= owned_observer_start=
+    fixture_terminate_owned() {
+        fto_pid=$1
+        fto_start=$2
+        if recording_launcher_active "$fto_pid" "$fto_start"; then
+            signal_verified_process KILL "$fto_pid" "$fto_start" || return 2
+        else
+            fto_query=$?
+            fto_state=${RECORDED_LAUNCHER_STATE-unknown}
+            case $fto_query:$fto_state in
+            1:gone|1:zombie) : ;;
+            *) return 2 ;;
+            esac
+        fi
+        oracle_reap_child "$fto_pid" "$fto_start" 20
+    }
+    fixture_cleanup_owned() {
+        fco_status=$?
+        trap - EXIT
+        fco_cleanup=0
+        if [ -n "$owned_observer_pid" ] && [ -n "$owned_observer_start" ]; then
+            fixture_terminate_owned "$owned_observer_pid" "$owned_observer_start" \
+                || fco_cleanup=$?
+        fi
+        if [ -n "$owned_hung_pid" ] && [ -n "$owned_hung_start" ]; then
+            fixture_terminate_owned "$owned_hung_pid" "$owned_hung_start" \
+                || fco_cleanup=$?
+        fi
+        [ "$fco_status" -ne 0 ] || fco_status=$fco_cleanup
+        exit "$fco_status"
+    }
+    trap 'fixture_cleanup_owned' EXIT
+
+    sleep 30 & owned_hung_pid=$!
+    owned_hung_start=$(process_starttime "$owned_hung_pid")
+    printf '%s %s\n' "$owned_hung_pid" "$owned_hung_start" > "$identity"
+    [ "${STOP_AFTER_IDENTITY-0}" = 0 ] || kill -STOP $$
+    if oracle_wait_child "$owned_hung_pid" "$owned_hung_start" 2; then hung_rc=0; else hung_rc=$?; fi
+    [ "$hung_rc" -eq 124 ]
+    fixture_terminate_owned "$owned_hung_pid" "$owned_hung_start"
+    owned_hung_pid= owned_hung_start=
+
+    /bin/false & owned_observer_pid=$!
+    owned_observer_start=$(process_starttime "$owned_observer_pid")
+    if oracle_wait_child "$owned_observer_pid" "$owned_observer_start" 20; then observer_rc=0; else observer_rc=$?; fi
+    [ "$observer_rc" -ne 1 ] || owned_observer_pid= owned_observer_start=
+    [ "$observer_rc" -eq 1 ]
     printf 'hung=%s observer=%s\n' "$hung_rc" "$observer_rc"
     ;;
 authentication)

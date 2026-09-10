@@ -15,8 +15,8 @@
 ## Checks
 
 ```sh
-cargo +1.88 fmt --all -- --check
-cargo +1.88 check --locked --workspace --all-targets
-cargo +1.88 test --locked --workspace --all-targets
-cargo +1.88 clippy --locked --workspace --all-targets -- -D warnings
+mise exec -- ./scripts/cargo.sh +1.88 fmt --all -- --check
+mise exec -- ./scripts/cargo.sh +1.88 check --locked --workspace --all-targets
+mise exec -- ./scripts/cargo.sh +1.88 test --locked --workspace --all-targets
+mise exec -- ./scripts/cargo.sh +1.88 clippy --locked --workspace --all-targets -- -D warnings
 ```

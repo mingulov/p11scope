@@ -38,18 +38,20 @@ quantitative claim there cites the script that measured it).
 
 The root manifest selects two patched crates reconstructed from
 `third-party/sources.json`; their generated trees are intentionally absent from
-Git. `scripts/cargo.sh` prepares them before executing ordinary Cargo commands:
+Git. Mise selects the project's Rust 1.88.0 toolchain, and `scripts/cargo.sh`
+prepares the generated sources before executing Cargo:
 
 ```sh
-scripts/cargo.sh +1.88 build --locked
+mise install
+mise exec -- ./scripts/cargo.sh +1.88 build --locked
 ```
 
 Preparation downloads only the recipe-pinned crates.io archives and verifies
 their hashes, ordered patches, final tree hashes, and receipts. For an offline
 or frozen build, place the exact archives in `third-party/archives/` first, or
 run `python3 -I scripts/prepare-dependencies.py --archive-dir DIRECTORY`, then
-use `scripts/cargo.sh +1.88 build --locked --offline`. An ordinary fresh
-checkout therefore needs archive access. Git-based source exports exclude the
+use `mise exec -- ./scripts/cargo.sh +1.88 build --locked --offline`. An
+ordinary fresh checkout therefore needs archive access. Git-based source exports exclude the
 generated trees, their receipts, and the local archive cache while retaining
 the recipe and patches. An offline distribution must add the exact pinned
 archives explicitly. All locked registry packages and the fixed
@@ -60,6 +62,11 @@ For a self-contained full source export and its fixed unprivileged recipient
 bootstrap, use Python >=3.11, or Python 3.10 with the distro `python3-tomli`
 package installed and verified before disconnection; see [the offline build
 guide](docs/build-offline.md).
+
+See [development setup](docs/development.md) for the Ubuntu 26.04 primary-host
+packages, pinned Rust/BPF tools, canonical checks, and the exact Git dependency
+bootstrap. Ubuntu 26.04 is a development host choice, not a product runtime
+dependency.
 
 ## Why
 

@@ -378,15 +378,48 @@ static int write_all(int fd, const char *buffer, size_t length)
     return 0;
 }
 
+static int publish_private(const char *destination, const char *label,
+                           const char *contents, size_t length)
+{
+    char temporary[4096];
+    if (snprintf(temporary, sizeof(temporary), "%s.tmp.%ld", destination,
+                 (long)getpid()) >= (int)sizeof(temporary)) {
+        fprintf(stderr, "%s path is too long\n", label);
+        return 1;
+    }
+    int fd = open(temporary, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        fprintf(stderr, "%s temporary create failed: %s\n", label, strerror(errno));
+        return 1;
+    }
+    int failed = write_all(fd, contents, length);
+    if (!failed && fsync(fd) != 0) failed = 1;
+    if (close(fd) != 0) failed = 1;
+    int saved_errno = failed ? errno : 0;
+    int linked = 0;
+    if (!failed && link(temporary, destination) != 0) {
+        failed = 1;
+        saved_errno = errno;
+    } else if (!failed) {
+        linked = 1;
+    }
+    if (unlink(temporary) != 0) {
+        failed = 1;
+        saved_errno = errno;
+    }
+    if (failed) {
+        if (linked) (void)unlink(destination);
+        errno = saved_errno;
+        fprintf(stderr, "%s publication failed: %s\n", label, strerror(errno));
+        return 1;
+    }
+    return 0;
+}
+
 static int publish_roster(const struct release_barrier *barrier, const char *mode,
                           const char *ready)
 {
-    char temporary[4096], roster[2048];
-    if (snprintf(temporary, sizeof(temporary), "%s.tmp.%ld", ready,
-                 (long)barrier->pid) >= (int)sizeof(temporary)) {
-        fprintf(stderr, "READY path is too long\n");
-        return 1;
-    }
+    char roster[2048];
     int used = snprintf(roster, sizeof(roster),
         "{\"schema\":\"p11scope/canary-roster/v1\",\"mode\":\"%s\","
         "\"pid\":%ld,\"tasks\":[{\"pid\":%ld,\"tid\":%ld,"
@@ -407,35 +440,13 @@ static int publish_roster(const struct release_barrier *barrier, const char *mod
         fprintf(stderr, "READY roster is too large\n");
         return 1;
     }
-    size_t length = strlen(roster);
-    int fd = open(temporary, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-    if (fd < 0) {
-        fprintf(stderr, "READY temporary create failed: %s\n", strerror(errno));
-        return 1;
-    }
-    int failed = write_all(fd, roster, length);
-    if (!failed && fsync(fd) != 0) failed = 1;
-    if (close(fd) != 0) failed = 1;
-    int linked = 0;
-    if (!failed && link(temporary, ready) != 0) failed = 1;
-    else if (!failed) linked = 1;
-    int saved_errno = errno;
-    if (unlink(temporary) != 0) {
-        failed = 1;
-        saved_errno = errno;
-    }
-    if (failed) {
-        if (linked) unlink(ready);
-        errno = saved_errno;
-        fprintf(stderr, "READY publication failed: %s\n", strerror(errno));
-        return 1;
-    }
-    return 0;
+    return publish_private(ready, "READY", roster, strlen(roster));
 }
 
-static int wait_for_go(struct release_barrier *barrier, const char *gate)
+static int wait_for_go(struct release_barrier *barrier, const char *gate,
+                       unsigned timeout_seconds)
 {
-    struct timespec deadline = deadline_after(10);
+    struct timespec deadline = deadline_after(timeout_seconds);
     for (;;) {
         struct stat metadata;
         if (lstat(gate, &metadata) == 0) break;
@@ -536,7 +547,7 @@ static int run_concurrent(struct concurrent_call *calls, size_t count, const cha
     }
     if (shared && (wait_for_registration(shared) != 0 ||
                    publish_roster(shared, mode, ready) != 0 ||
-                   wait_for_go(shared, gate) != 0)) {
+                   wait_for_go(shared, gate, 10) != 0)) {
         barrier_abort(shared);
         for (size_t i = 0; i < created; i++) pthread_join(threads[i], NULL);
         barrier_destroy(shared);
@@ -563,36 +574,79 @@ static int matrix_call(void **functions, unsigned index, const char *label,
     failures += matrix_call(functions, (index), (label), (CK_ULONG[10]){__VA_ARGS__}); \
 } while (0)
 
-static int wait_for_gate(const char *mode, const char *ready, const char *gate)
+static int wait_for_gate(const char *mode, const char *ready, const char *gate,
+                         unsigned timeout_seconds, struct task_identity *leader)
 {
     if (!gate) return 0;
     struct release_barrier barrier;
     if (barrier_init(&barrier, 0) != 0) return 1;
-    int status = publish_roster(&barrier, mode, ready) || wait_for_go(&barrier, gate);
+    int status = publish_roster(&barrier, mode, ready) ||
+                 wait_for_go(&barrier, gate, timeout_seconds);
+    if (!status && leader) *leader = barrier.leader;
     barrier_destroy(&barrier);
     return status;
 }
 
-static int run_matrix(void *module, const char *ready, const char *gate)
+static int wait_for_finish(const char *finish, const struct timespec *deadline)
+{
+    for (;;) {
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec > deadline->tv_sec ||
+            (now.tv_sec == deadline->tv_sec && now.tv_nsec >= deadline->tv_nsec)) {
+            fprintf(stderr, "timed out waiting for FINISH: %s\n", finish);
+            return 1;
+        }
+        struct stat metadata;
+        if (lstat(finish, &metadata) == 0) return 0;
+        if (errno != ENOENT) {
+            fprintf(stderr, "FINISH lookup failed: %s: %s\n", finish, strerror(errno));
+            return 1;
+        }
+        nanosleep(&(struct timespec){0, 50000000}, NULL);
+    }
+}
+
+static int publish_done(const struct task_identity *leader, const char *done)
+{
+    char contents[256];
+    int used = snprintf(contents, sizeof(contents),
+        "{\"schema\":\"p11scope/canary-done/v1\",\"mode\":\"matrix\","
+        "\"pid\":%ld,\"generation\":%llu}\n", (long)getpid(),
+        (unsigned long long)leader->generation);
+    if (used < 0 || (size_t)used >= sizeof(contents)) {
+        fprintf(stderr, "DONE evidence is too large\n");
+        return 1;
+    }
+    return publish_private(done, "DONE", contents, (size_t)used);
+}
+
+static int run_matrix(void *module, const char *ready, const char *gate,
+                      const char *done, const char *finish)
 {
     void **functions = matrix_functions(module);
-    if (!functions || wait_for_gate("matrix", ready, gate) != 0) return 1;
+    struct task_identity leader = {0};
+    unsigned go_timeout = done ? 30 : 10;
+    if (!functions || wait_for_gate("matrix", ready, gate, go_timeout,
+                                    done ? &leader : NULL) != 0) return 1;
 
     get_interface_fn get_interface = (get_interface_fn)dlsym(module, "C_GetInterface");
     if (!get_interface) return 1;
     CK_VERSION requested = {3, 0};
     CK_INTERFACE *selected = NULL;
+    int failures = 0;
     char unterminated[65];
     memset(unterminated, 'U', sizeof(unterminated) - 1);
     memcpy(unterminated, SENT_UNTERMINATED, sizeof(SENT_UNTERMINATED) - 1);
     unterminated[sizeof(unterminated) - 1] = '\0';
     char interfacealias[sizeof(SENT_INTERFACEALIAS)];
     memcpy(interfacealias, SENT_INTERFACEALIAS, sizeof(interfacealias));
-    (void)get_interface((char *)SENT_INTERFACE, &requested, &selected, 0);
-    (void)get_interface(unterminated, &requested, &selected, 0);
-    (void)get_interface(strstr(interfacealias, "PKCS 11"), &requested, &selected, 0);
+    CK_RV interface_rv = get_interface((char *)SENT_INTERFACE, &requested, &selected, 0);
+    if (done && interface_rv != CKR_OK) failures++;
+    interface_rv = get_interface(unterminated, &requested, &selected, 0);
+    if (done && interface_rv != CKR_OK) failures++;
+    interface_rv = get_interface(strstr(interfacealias, "PKCS 11"), &requested, &selected, 0);
+    if (done && interface_rv != CKR_OK) failures++;
 
-    int failures = 0;
     CK_ULONG session = 0x101;
     CK_ULONG output_len = sizeof(SENT_OUTPUT) - 1;
     CK_OBJECT_HANDLE object = 0;
@@ -696,7 +750,16 @@ static int run_matrix(void *module, const char *ready, const char *gate)
                 0);
 
     printf("canary_workload matrix: %s\n", failures == 0 ? "all calls CKR_OK" : "FAILED");
-    fflush(stdout);
+    int output_failed = fflush(stdout) != 0;
+    if (ferror(stdout)) output_failed = 1;
+    if (done) {
+        struct timespec finish_deadline = deadline_after(60);
+        if (failures != 0 || output_failed ||
+            (finish_deadline.tv_sec == 0 && finish_deadline.tv_nsec == 0) ||
+            publish_done(&leader, done) != 0)
+            return 1;
+        return wait_for_finish(finish, &finish_deadline);
+    }
     if (gate && raise(SIGSTOP) != 0) return 1;
     return failures == 0 ? 0 : 1;
 }
@@ -747,24 +810,38 @@ static int run_faults(void *module, const char *ready, const char *gate)
 
 int main(int argc, char **argv)
 {
-    if (argc != 3 && argc != 5) {
-        fprintf(stderr, "usage: %s /path/to/fixture.so matrix|blocked|faults [READY GO]\n", argv[0]);
+    if (argc != 3 && argc != 5 && argc != 7) {
+        fprintf(stderr, "usage: %s /path/to/fixture.so matrix|blocked|faults [READY GO [DONE FINISH]]\n", argv[0]);
         return 2;
     }
-    const char *ready = argc == 5 ? argv[3] : NULL;
-    const char *gate = argc == 5 ? argv[4] : NULL;
-    if (gate && same_destination(ready, gate)) {
-        fprintf(stderr, "READY and GO must name distinct destinations\n");
+    if (argc == 7 && strcmp(argv[2], "matrix") != 0) {
+        fprintf(stderr, "the completed barrier is supported only for matrix mode\n");
         return 2;
     }
-    if (gate && (path_absent(ready, "READY") != 0 || path_absent(gate, "GO") != 0))
-        return 2;
+    const char *labels[] = {"READY", "GO", "DONE", "FINISH"};
+    size_t path_count = argc == 3 ? 0 : (size_t)argc - 3;
+    for (size_t i = 0; i < path_count; i++) {
+        for (size_t j = 0; j < i; j++) {
+            if (same_destination(argv[3 + i], argv[3 + j])) {
+                fprintf(stderr, "%s and %s must name distinct destinations\n",
+                        labels[j], labels[i]);
+                return 2;
+            }
+        }
+        if (path_absent(argv[3 + i], labels[i]) != 0) return 2;
+    }
+    const char *ready = argc >= 5 ? argv[3] : NULL;
+    const char *gate = argc >= 5 ? argv[4] : NULL;
     void *h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
     if (!h) { fprintf(stderr, "dlopen: %s\n", dlerror()); return 1; }
-    if (strcmp(argv[2], "matrix") == 0 && argc == 3) return run_matrix(h, NULL, NULL);
-    if (strcmp(argv[2], "matrix") == 0 && argc == 5) return run_matrix(h, argv[3], argv[4]);
+    if (strcmp(argv[2], "matrix") == 0 && argc == 3)
+        return run_matrix(h, NULL, NULL, NULL, NULL);
+    if (strcmp(argv[2], "matrix") == 0 && argc == 5)
+        return run_matrix(h, argv[3], argv[4], NULL, NULL);
+    if (strcmp(argv[2], "matrix") == 0 && argc == 7)
+        return run_matrix(h, argv[3], argv[4], argv[5], argv[6]);
     if (strcmp(argv[2], "blocked") == 0) return run_blocked(h, ready, gate);
     if (strcmp(argv[2], "faults") == 0) return run_faults(h, ready, gate);
-    fprintf(stderr, "usage: %s /path/to/fixture.so matrix|blocked|faults [READY GO]\n", argv[0]);
+    fprintf(stderr, "usage: %s /path/to/fixture.so matrix|blocked|faults [READY GO [DONE FINISH]]\n", argv[0]);
     return 2;
 }

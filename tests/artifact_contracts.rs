@@ -6060,7 +6060,7 @@ aggregate-only-metrics default metrics"
             "native {bits}-bit workload tests failed: {workload_report}"
         );
         assert!(
-            workload_report.contains("Ran 5 tests")
+            workload_report.contains("Ran 11 tests")
                 && workload_report.contains("CanaryWorkloadTests")
                 && !workload_report.contains("skipped="),
             "native {bits}-bit workload suite must execute every required case: {workload_report}"

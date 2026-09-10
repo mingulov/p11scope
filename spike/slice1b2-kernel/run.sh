@@ -799,8 +799,12 @@ private_start_lane() {
     done
     grep -F "pid=$PRIVATE_QEMU_PID," "$run_dir/listener.txt" >/dev/null || return 64
     for attempt in $(seq 1 120); do
+        # OpenSSH versions differ on whether banner comments go to stdout.
+        # Retain the raw result and count only host-key records below.
         if ssh-keyscan -T 5 -p "$port" -t ed25519 127.0.0.1 \
-            >"$PRIVATE_KNOWN_HOSTS.tmp" 2>"$run_dir/ssh-keyscan.stderr"; then
+            >"$run_dir/ssh-keyscan.stdout" 2>"$run_dir/ssh-keyscan.stderr" \
+            && awk 'NF && $1 !~ /^#/' "$run_dir/ssh-keyscan.stdout" \
+                >"$PRIVATE_KNOWN_HOSTS.tmp"; then
             mv "$PRIVATE_KNOWN_HOSTS.tmp" "$PRIVATE_KNOWN_HOSTS"
             chmod 0600 "$PRIVATE_KNOWN_HOSTS"
             break

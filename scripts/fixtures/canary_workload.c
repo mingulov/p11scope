@@ -271,9 +271,11 @@ static int run_matrix(void *module, const char *ready, const char *gate)
     memset(unterminated, 'U', sizeof(unterminated) - 1);
     memcpy(unterminated, SENT_UNTERMINATED, sizeof(SENT_UNTERMINATED) - 1);
     unterminated[sizeof(unterminated) - 1] = '\0';
+    char interfacealias[sizeof(SENT_INTERFACEALIAS)];
+    memcpy(interfacealias, SENT_INTERFACEALIAS, sizeof(interfacealias));
     (void)get_interface((char *)SENT_INTERFACE, &requested, &selected, 0);
     (void)get_interface(unterminated, &requested, &selected, 0);
-    (void)get_interface(strstr(SENT_INTERFACEALIAS, "PKCS 11"), &requested, &selected, 0);
+    (void)get_interface(strstr(interfacealias, "PKCS 11"), &requested, &selected, 0);
 
     int failures = 0;
     CK_ULONG session = 0x101;

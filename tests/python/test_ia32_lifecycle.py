@@ -19,7 +19,7 @@ FIXTURES = ROOT / "tests/fixtures/ia32-lifecycle"
 DRIVER = FIXTURES / "driver.sh"
 TARGET = FIXTURES / "target.sh"
 GUARD_SOURCE = ROOT / "scripts/matrix/ia32-compat-trace-exec.c"
-EXPECTED_DEFAULT_TESTS = 27
+EXPECTED_DEFAULT_TESTS = 28
 
 
 def starttime(pid):
@@ -412,20 +412,50 @@ class Ia32LifecycleTests(unittest.TestCase):
 
     def test_real_timeout_statuses_remain_distinct(self):
         cases = (
-            ("exit9", 9, ["timeout", "2", TARGET, self.work / "exit9", "exit", 9]),
-            ("timeout124", 124, ["timeout", "-s", "TERM", "0.2", TARGET, self.work / "timeout124", "hold", 0]),
-            ("escalation137", 137, ["timeout", "--kill-after=0.1", "-s", "INT", "0.1", TARGET, self.work / "escalation137", "ignore", 0]),
+            ("exit9", 9, ["timeout", "2"], ["exit", 9]),
+            ("timeout124", 124, ["timeout", "-s", "TERM", "0.2"], ["hold", 0]),
+            (
+                "escalation137", 137,
+                ["timeout", "--kill-after=0.1", "-s", "INT", "0.1"], ["ignore", 0],
+            ),
         )
-        for name, expected, command in cases:
+        for name, expected, wrapper, target_args in cases:
             with self.subTest(name=name):
-                result = self.run_driver("launch", *command, timeout=8)
+                case_dir = self.work / name
+                case_dir.mkdir(mode=0o700)
+                env = self.env.copy()
+                env["CASE_DIR"] = str(case_dir)
+                command = [*wrapper, TARGET, case_dir / name, *target_args]
+                result = self.run_driver("launch", *command, timeout=8, env=env)
                 self.assertEqual(result.returncode, 0, result.stderr.decode())
-                self.assertEqual(int((self.work / "wait").read_text().splitlines()[1]), expected)
-                for path in ("fields", "wait", "process.pid"):
-                    try:
-                        (self.work / path).unlink()
-                    except FileNotFoundError:
-                        pass
+                self.assertEqual(int((case_dir / "wait").read_text().splitlines()[1]), expected)
+
+    def test_timeout_status_failure_is_isolated_before_later_oracles(self):
+        nested = Ia32LifecycleTests("test_real_timeout_statuses_remain_distinct")
+        nested_result = unittest.TestResult()
+        case_dirs = []
+        later_oracles = []
+
+        def run_case(*args, timeout=8, env=None, **_kwargs):
+            case_dir = Path((nested.env if env is None else env)["CASE_DIR"])
+            case_dirs.append(case_dir)
+            if len(case_dirs) == 1:
+                (case_dir / "process.pid").write_text("unresolved\n")
+                raise subprocess.TimeoutExpired(args, timeout)
+            if (case_dir / "process.pid").exists():
+                raise AssertionError("later case reused unresolved process identity")
+            expected = (124, 137)[len(case_dirs) - 2]
+            (case_dir / "wait").write_text(f"gone\n{expected}\n")
+            later_oracles.append(expected)
+            return subprocess.CompletedProcess(args, 0, b"", b"")
+
+        with mock.patch.object(nested, "run_driver", side_effect=run_case):
+            nested.run(nested_result)
+
+        self.assertEqual(len(nested_result.errors), 1, nested_result.errors)
+        self.assertEqual(nested_result.failures, [])
+        self.assertEqual(len(set(case_dirs)), 3)
+        self.assertEqual(later_oracles, [124, 137])
 
     def test_killed_foreground_timeout_status_does_not_prove_command_ended(self):
         record = self.work / "orphan"

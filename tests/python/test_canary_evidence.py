@@ -2,6 +2,8 @@
 """Native tests for the checked-in canary evidence validator."""
 
 import argparse
+import copy
+import hashlib
 import importlib.util
 import json
 import mmap
@@ -199,11 +201,14 @@ class TaskStorageInventoryTests(unittest.TestCase):
 class TaskStorageReaderTests(unittest.TestCase):
     MAPS = [
         {"name": "TASK_COOKIE", "id": 101, "type": "task_storage",
-         "bytes_key": 4, "bytes_value": 8, "max_entries": 0, "map_flags": 1},
+         "oracle": "task-storage", "bytes_key": 4, "bytes_value": 8,
+         "max_entries": 0, "map_flags": 1},
         {"name": "THREAD_OWNER", "id": 102, "type": "task_storage",
-         "bytes_key": 4, "bytes_value": 544, "max_entries": 0, "map_flags": 1},
+         "oracle": "task-storage", "bytes_key": 4, "bytes_value": 544,
+         "max_entries": 0, "map_flags": 1},
         {"name": "ROOT_AFFILIATION", "id": 103, "type": "task_storage",
-         "bytes_key": 4, "bytes_value": 8, "max_entries": 0, "map_flags": 1},
+         "oracle": "task-storage", "bytes_key": 4, "bytes_value": 8,
+         "max_entries": 0, "map_flags": 1},
     ]
 
     @staticmethod
@@ -358,6 +363,407 @@ class TaskStorageReaderTests(unittest.TestCase):
         self.assertIsNotNone(error)
         self.assertIn("id=77 name=START type=hash", error)
         self.assertLess(len(error), 5000)
+
+
+class StoppedPopulationTests(unittest.TestCase):
+    """Valid EOF and byte counts cannot substitute for exact stopped owners."""
+
+    def fixture(self, root, *, owned=False, empty=False):
+        tasks = [
+            {"pid": 7001, "tid": tid, "generation": generation,
+             "cookie": tid == 7001, "owner": tid != 7001, "root": owned}
+            for tid, generation in ((7001, 900), (7002, 901), (7003, 902))
+        ]
+        if empty:
+            for task in tasks:
+                task.update(cookie=False, owner=False, root=False)
+        roster = [{**{k: task[k] for k in ("pid", "tid", "generation")}, "state": "T"}
+                  for task in tasks]
+        receipt = {
+            "contract": "p11scope/stopped-task-storage/v1",
+            "acquisition_id": "a" * 32, "phase": "stopped",
+            "lane": "owned-root" if owned else "external", "small_state": False,
+            "expected": tasks, "before": roster, "after": copy.deepcopy(roster),
+            "surfaces": [],
+        }
+        manifest = []
+        for spec in TaskStorageReaderTests.MAPS:
+            manifest.append({"id": spec["id"], "name": spec["name"],
+                             "type": "task_storage", "key_size": 4,
+                             "value_size": spec["bytes_value"], "max_entries": 0,
+                             "map_flags": 1, "oracle": "task-storage"})
+        for name, map_id, size in (("COOKIE_CTL", 104, 40), ("OWNER_CTL", 105, 56),
+                                   ("ROOT_CTL", 106, 64), ("START", 107, 288)):
+            manifest.append({"id": map_id, "name": name,
+                             "type": "hash" if name == "START" else "array",
+                             "key_size": 16 if name == "START" else 4,
+                             "value_size": size, "max_entries": 16384 if name == "START" else 1,
+                             "map_flags": 0, "oracle": "dump"})
+        for name, map_id in (("EVENTS", 108), ("DISCOVERY", 109)):
+            manifest.append({"id": map_id, "name": name, "type": "ringbuf",
+                             "key_size": 0, "value_size": 0, "max_entries": 4096,
+                             "map_flags": 0, "oracle": "mmap"})
+        records = []
+        for task in tasks:
+            for name, map_id, flag in (("TASK_COOKIE", 101, "cookie"),
+                                       ("THREAD_OWNER", 102, "owner"),
+                                       ("ROOT_AFFILIATION", 103, "root")):
+                if not task[flag]:
+                    continue
+                value = struct.pack("<Q", 3 if flag == "cookie" else 1)
+                if flag == "owner":
+                    value = bytearray(544)
+                    struct.pack_into("<Q", value, 0, (task["pid"] << 32) | task["tid"])
+                    # Valid production discovery directory and both late fields.
+                    struct.pack_into("<Q", value, 8, 47)
+                    struct.pack_into("<QQII", value, 520, 1, 1, 1, 1)
+                records.append({"map_id": map_id, "pid": task["pid"],
+                                "tid": task["tid"], "generation": task["generation"],
+                                "value": bytes(value)})
+        controls = {
+            "COOKIE_CTL": [16384, 7, 0, 0, 0],  # history exceeds live cells
+            "OWNER_CTL": [16448, 0 if empty else 2, 0, 0, 0, 0, 0],
+            "ROOT_CTL": [3 if owned else 0, 0, 0, 0, 0, 0, 0, 0],
+        }
+        return manifest, receipt, records, controls
+
+    def publish_fixture(self, root, manifest, receipt, records, controls):
+        # Exercise the real framed parser, including valid EOF on empty maps.
+        stream = b"".join(TaskStorageReaderTests.frame(
+            1, row["map_id"], row["pid"], row["tid"], row["value"]
+        ) for row in records) + TaskStorageReaderTests.frame(2)
+        parsed = load_dumper().parse_task_storage_frames(
+            stream, TaskStorageReaderTests.MAPS, max_records=100, max_bytes=65536)
+        receipt["surfaces"] = []
+        for item in manifest:
+            name = item["name"]
+            if item["type"] == "ringbuf":
+                # Use the existing scanner's ring naming convention.
+                path = load_subject(TARGET_BITS).ring_raw_path(str(root / "case"), name)
+                content = b""
+            else:
+                path = root / f"mapdump_{name}.bin"
+                item["file"] = str(path)
+                if item["type"] == "task_storage":
+                    content = b"".join(row["value"] for row in parsed if row["map_id"] == item["id"])
+                elif name in controls:
+                    words = controls[name]
+                    raw = struct.pack("<" + "Q" * len(words), *words)
+                    content = json.dumps([{"key": [0, 0, 0, 0], "value": list(raw)}]).encode()
+                else:
+                    content = b"[]"
+            path.write_bytes(content)
+            surface = {"id": item["id"], "phase": "stopped",
+                       "acquisition_id": "a" * 32, "size": len(content),
+                       "sha256": hashlib.sha256(content).hexdigest()}
+            if item["type"] == "task_storage":
+                surface["records"] = [{k: row[k] for k in ("pid", "tid", "generation")}
+                                      for row in records if row["map_id"] == item["id"]]
+            receipt["surfaces"].append(surface)
+            item["snapshot"] = {"contract": receipt["contract"],
+                                "acquisition_id": "a" * 32, "phase": "stopped",
+                                "receipt": str(root / "snapshot.json")}
+        (root / "snapshot.json").write_text(json.dumps(receipt))
+
+    def check(self, root, manifest):
+        return load_subject(TARGET_BITS).owned_map_surfaces(
+            "population", manifest, {item["name"] for item in manifest}, str(root / "case"))
+
+    def test_exact_external_owned_and_permitted_empty_populations(self):
+        for owned, empty, small in ((False, False, False), (True, False, False),
+                                    (False, True, False), (True, False, True)):
+            with self.subTest(owned=owned, empty=empty, small=small), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                args = self.fixture(root, owned=owned, empty=empty)
+                if small:
+                    args[1]["small_state"] = True
+                    args[3]["OWNER_CTL"][0] = 65
+                    next(m for m in args[0] if m["name"] == "START")["max_entries"] = 1
+                args[1]["after"].reverse()  # roster order is not task identity
+                self.publish_fixture(root, *args)
+                self.assertEqual(len(self.check(root, args[0])), 9)
+
+    def test_framed_records_bind_generations_for_future_coordinator(self):
+        dumper = load_dumper()
+        manifest, receipt, records, values = self.fixture(Path("/unused"))
+        controls = {}
+        for item in manifest:
+            if item["name"] in values:
+                words = values[item["name"]]
+                controls[item["name"]] = {
+                    "id": item["id"], "type": item["type"], "bytes_key": item["key_size"],
+                    "bytes_value": item["value_size"], "max_entries": item["max_entries"],
+                    "map_flags": item["map_flags"], "name": item["name"],
+                    "oracle": item["oracle"],
+                    "value": struct.pack("<" + "Q" * len(words), *words)}
+        stream = b"".join(TaskStorageReaderTests.frame(
+            1, row["map_id"], row["pid"], row["tid"], row["value"]
+        ) for row in records) + TaskStorageReaderTests.frame(2)
+        parsed = dumper.parse_task_storage_frames(
+            stream, TaskStorageReaderTests.MAPS, max_records=100, max_bytes=65536)
+        arguments = {key: receipt[key] for key in ("expected", "before", "after", "lane")}
+        arguments["controls"] = controls
+        self.assertEqual(dumper.reconcile_task_storage(TaskStorageReaderTests.MAPS, parsed, **arguments), {
+            "TASK_COOKIE": [{"pid": 7001, "tid": 7001, "generation": 900}],
+            "THREAD_OWNER": [{"pid": 7001, "tid": 7002, "generation": 901},
+                             {"pid": 7001, "tid": 7003, "generation": 902}],
+            "ROOT_AFFILIATION": [],
+        })
+        for key in ("expected", "before", "after"):
+            with self.subTest(bound=key):
+                oversized = {**arguments, key: [arguments[key][0]] * 131073}
+                with self.assertRaisesRegex(RuntimeError, "roster.*oversized"):
+                    dumper.reconcile_task_storage(TaskStorageReaderTests.MAPS, parsed, **oversized)
+        with self.assertRaisesRegex(RuntimeError, "record population"):
+            dumper.reconcile_task_storage(TaskStorageReaderTests.MAPS, [parsed[0]] * 131073, **arguments)
+
+    def test_valid_eof_with_missing_or_wrong_identity_population_is_terminal(self):
+        for case in ("empty", "missing-worker", "foreign-owner", "nonleader-cookie",
+                     "unexpected-root", "owned-missing-root", "owned-foreign-root"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                manifest, receipt, records, controls = self.fixture(root, owned=case.startswith("owned"))
+                if case == "empty":
+                    records.clear()
+                elif case == "missing-worker":
+                    records.pop(1)
+                elif case in ("foreign-owner", "nonleader-cookie", "owned-foreign-root"):
+                    row = next(r for r in records if r["map_id"] == {
+                        "foreign-owner": 102, "nonleader-cookie": 101, "owned-foreign-root": 103}[case])
+                    row["tid"] = 7002 if case == "nonleader-cookie" else 8888
+                elif case == "owned-missing-root":
+                    records[:] = [r for r in records if r["map_id"] != 103]
+                else:
+                    records.append({"map_id": 103, "pid": 7001, "tid": 7001,
+                                    "generation": 900, "value": struct.pack("<Q", 1)})
+                self.publish_fixture(root, manifest, receipt, records, controls)
+                with self.assertRaisesRegex(AssertionError, "stopped.*map.*(population|identity)"):
+                    self.check(root, manifest)
+
+    def test_roster_rejects_missing_changed_reused_and_unstopped_tasks(self):
+        for case in ("missing", "changed", "reused", "duplicate", "running", "no-state", "no-after"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                manifest, receipt, records, controls = self.fixture(root)
+                if case == "missing":
+                    receipt["before"].pop()
+                elif case == "changed":
+                    receipt["after"][-1]["tid"] = 8888
+                elif case == "reused":
+                    receipt["after"][-1]["generation"] += 1
+                elif case == "duplicate":
+                    receipt["expected"].append(dict(receipt["expected"][-1]))
+                elif case == "running":
+                    receipt["before"][-1]["state"] = "S"
+                elif case == "no-state":
+                    receipt["before"][-1].pop("state")
+                else:
+                    receipt.pop("after")
+                self.publish_fixture(root, manifest, receipt, records, controls)
+                with self.assertRaisesRegex(AssertionError, "stopped.*roster"):
+                    self.check(root, manifest)
+
+    def test_control_health_and_exact_reservations(self):
+        for name, offset, value in (("COOKIE_CTL", 0, 1), ("COOKIE_CTL", 1, 16385),
+                                    ("COOKIE_CTL", 1, 2), ("OWNER_CTL", 0, 65),
+                                    ("OWNER_CTL", 1, 1), ("ROOT_CTL", 0, 1)):
+            with self.subTest(name=name, offset=offset), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                manifest, receipt, records, controls = self.fixture(root)
+                controls[name][offset] = value
+                self.publish_fixture(root, manifest, receipt, records, controls)
+                with self.assertRaisesRegex(AssertionError, f"stopped.*{name}"):
+                    self.check(root, manifest)
+        for name, first, end in (("COOKIE_CTL", 2, 5), ("OWNER_CTL", 2, 7), ("ROOT_CTL", 1, 8)):
+            for offset in range(first, end):
+                with self.subTest(name=name, offset=offset), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    manifest, receipt, records, controls = self.fixture(root)
+                    controls[name][offset] = 1
+                    self.publish_fixture(root, manifest, receipt, records, controls)
+                    with self.assertRaisesRegex(AssertionError, f"stopped.*{name}"):
+                        self.check(root, manifest)
+
+    def test_empty_roster_cannot_certify_an_empty_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest, receipt, records, controls = self.fixture(root, empty=True)
+            for key in ("expected", "before", "after"):
+                receipt[key] = []
+            self.publish_fixture(root, manifest, receipt, records, controls)
+            with self.assertRaisesRegex(AssertionError, "stopped.*roster"):
+                self.check(root, manifest)
+
+    def test_boolean_map_metadata_is_not_an_integer_contract(self):
+        for name, key, value in (("TASK_COOKIE", "map_flags", True),
+                                 ("OWNER_CTL", "max_entries", True),
+                                 ("ROOT_CTL", "map_flags", False)):
+            with self.subTest(name=name, key=key), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                manifest, receipt, records, controls = self.fixture(root)
+                next(m for m in manifest if m["name"] == name)[key] = value
+                self.publish_fixture(root, manifest, receipt, records, controls)
+                with self.assertRaisesRegex(AssertionError, "stopped.*metadata"):
+                    self.check(root, manifest)
+
+    def test_snapshot_configuration_matches_start_and_ring_definitions(self):
+        for name, key, value in (("START", "max_entries", 1), ("START", "type", "array"),
+                                 ("EVENTS", "type", "hash"), ("DISCOVERY", "type", "hash")):
+            with self.subTest(name=name, key=key), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                manifest, receipt, records, controls = self.fixture(root)
+                item = next(m for m in manifest if m["name"] == name)
+                item[key] = value
+                if value == "hash":
+                    item["oracle"] = "dump"
+                self.publish_fixture(root, manifest, receipt, records, controls)
+                with self.assertRaisesRegex(AssertionError, "stopped.*metadata"):
+                    self.check(root, manifest)
+
+    def test_owner_value_ownership_directory_and_production_tail(self):
+        for offset, fmt, value in ((0, "Q", (7001 << 32) | 8888), (520, "Q", 0),
+                                   (528, "Q", 2), (536, "I", 513), (540, "I", 0),
+                                   (540, "I", 2), (16, "Q", 123)):
+            with self.subTest(offset=offset, value=value), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                manifest, receipt, records, controls = self.fixture(root)
+                row = next(r for r in records if r["map_id"] == 102)
+                raw = bytearray(row["value"])
+                struct.pack_into("<" + fmt, raw, offset, value)
+                row["value"] = bytes(raw)
+                self.publish_fixture(root, manifest, receipt, records, controls)
+                with self.assertRaisesRegex(AssertionError, "stopped.*THREAD_OWNER.*(value|identity)"):
+                    self.check(root, manifest)
+
+    def test_settled_owner_rejects_empty_lease_but_accepts_real_activity(self):
+        for occupied, domains, starts in ((0, 0, 1), (1, 1, 0)):
+            with self.subTest(occupied=occupied, starts=starts), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                manifest, receipt, records, controls = self.fixture(root)
+                for row in (record for record in records if record["map_id"] == 102):
+                    raw = bytearray(row["value"])
+                    if not occupied:
+                        raw[8:520] = bytes(512)
+                    struct.pack_into("<QQII", raw, 520, occupied, domains, starts, 1)
+                    row["value"] = bytes(raw)
+                self.publish_fixture(root, manifest, receipt, records, controls)
+                self.assertEqual(len(self.check(root, manifest)), 9)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest, receipt, records, controls = self.fixture(root)
+            row = next(record for record in records if record["map_id"] == 102)
+            raw = bytearray(row["value"])
+            raw[8:520] = bytes(512)
+            struct.pack_into("<QQII", raw, 520, 0, 0, 0, 1)
+            self.assertEqual(raw[543], 0)
+            row["value"] = bytes(raw)
+            self.publish_fixture(root, manifest, receipt, records, controls)
+            with self.assertRaisesRegex(AssertionError, "stopped.*THREAD_OWNER.*tail"):
+                self.check(root, manifest)
+
+    def test_strict_metadata_diagnostics_are_bounded_and_redacted(self):
+        marker = "PRIVATE_METADATA_MARKER"
+        malformed_value = marker + "_" * 20_000
+        dumper = load_dumper()
+        for map_type, oracle in (("hash", "dump"), ("array", "dump"),
+                                 ("prog_array", "dump"), ("cgroup_array", "dump"),
+                                 ("percpu_hash", "dump"),
+                                 ("percpu_array", "dump"), ("ringbuf", "mmap"),
+                                 ("task_storage", "task-storage")):
+            dumper.snapshot_map_metadata({
+                "id": 1, "name": "CURRENT_MAP", "type": map_type, "oracle": oracle,
+                "bytes_key": 0, "bytes_value": 0, "max_entries": 0, "map_flags": 0,
+            })
+        manifest, receipt, records, values = self.fixture(Path("/unused"))
+        controls = {}
+        for item in manifest:
+            if item["name"] in values:
+                words = values[item["name"]]
+                controls[item["name"]] = {
+                    "id": item["id"], "name": item["name"], "type": item["type"],
+                    "oracle": item["oracle"], "bytes_key": item["key_size"],
+                    "bytes_value": item["value_size"], "max_entries": item["max_entries"],
+                    "map_flags": item["map_flags"],
+                    "value": struct.pack("<" + "Q" * len(words), *words),
+                }
+        arguments = {key: receipt[key] for key in ("expected", "before", "after", "lane")}
+        arguments["controls"] = controls
+        direct_maps = [
+            {"id": item["id"], "name": item["name"], "type": item["type"],
+             "oracle": item["oracle"], "bytes_key": item["key_size"],
+             "bytes_value": item["value_size"], "max_entries": item["max_entries"],
+             "map_flags": item["map_flags"]}
+            for item in manifest[:3]
+        ]
+        for key in ("name", "type", "oracle"):
+            with self.subTest(boundary="direct", key=key):
+                malformed = copy.deepcopy(direct_maps)
+                malformed[0][key] = malformed_value
+                with self.assertRaises(RuntimeError) as caught:
+                    dumper.reconcile_task_storage(malformed, records, **arguments)
+                error = str(caught.exception)
+                self.assertNotIn(marker, error)
+                self.assertLess(len(error), 256)
+
+        for key in ("name", "type", "oracle"):
+            with self.subTest(boundary="claimed", key=key), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                manifest, receipt, records, controls = self.fixture(root)
+                self.publish_fixture(root, manifest, receipt, records, controls)
+                manifest[0][key] = malformed_value
+                with self.assertRaises(AssertionError) as caught:
+                    self.check(root, manifest)
+                error = str(caught.exception)
+                self.assertNotIn(marker, error)
+                self.assertLess(len(error), 256)
+
+    def test_receipt_binds_every_surface_to_one_stopped_acquisition(self):
+        for case in ("phase", "acquisition", "hash", "size", "missing-surface", "duplicate-surface",
+                     "partial-claim", "unknown-contract", "no-receipt", "record-generation",
+                     "duplicate-record", "missing-controls", "malformed-control", "oversized",
+                     "boolean-control-byte", "duplicate-json-field"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                manifest, receipt, records, controls = self.fixture(root)
+                self.publish_fixture(root, manifest, receipt, records, controls)
+                if case in ("phase", "acquisition", "hash", "size", "oversized"):
+                    key, value = {"phase": ("phase", "resumed"),
+                                  "acquisition": ("acquisition_id", "b" * 32),
+                                  "hash": ("sha256", "0" * 64), "size": ("size", 99),
+                                  "oversized": ("size", 64 * 1024 * 1024 + 1)}[case]
+                    receipt["surfaces"][-1][key] = value
+                elif case == "missing-surface":
+                    receipt["surfaces"].pop()
+                elif case == "duplicate-surface":
+                    receipt["surfaces"].append(dict(receipt["surfaces"][-1]))
+                elif case == "partial-claim":
+                    manifest[-1].pop("snapshot")
+                elif case == "unknown-contract":
+                    manifest[0]["snapshot"]["contract"] = "future"
+                elif case == "no-receipt":
+                    manifest[0]["snapshot"]["receipt"] = str(root / "missing")
+                elif case == "record-generation":
+                    receipt["surfaces"][1]["records"][0]["generation"] += 1
+                elif case == "duplicate-record":
+                    receipt["surfaces"][1]["records"][1] = dict(receipt["surfaces"][1]["records"][0])
+                elif case == "missing-controls":
+                    manifest[:] = [m for m in manifest if m["name"] != "OWNER_CTL"]
+                    receipt["surfaces"][:] = [s for s in receipt["surfaces"] if s["id"] != 105]
+                elif case != "duplicate-json-field":
+                    path = Path(manifest[3]["file"])
+                    content = b'[{"key":[0,0,0,0],"value":"PRIVATE_RAW_VALUE"}]'
+                    if case == "boolean-control-byte":
+                        content = path.read_bytes().replace(b'"key": [0', b'"key": [false', 1)
+                    path.write_bytes(content)
+                    receipt["surfaces"][3].update(size=len(content), sha256=hashlib.sha256(content).hexdigest())
+                (root / "snapshot.json").write_text(json.dumps(receipt))
+                if case == "duplicate-json-field":
+                    path = root / "snapshot.json"
+                    path.write_text(path.read_text().replace('{"contract":', '{"phase":"resumed","contract":', 1))
+                with self.assertRaises(AssertionError) as caught:
+                    self.check(root, manifest)
+                self.assertNotIn("PRIVATE_RAW_VALUE", str(caught.exception))
 
 
 class FinalScannerSurfaceTests(unittest.TestCase):

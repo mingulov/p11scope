@@ -22,6 +22,12 @@ TASK_STORAGE_NAMES = ("TASK_COOKIE", "THREAD_OWNER", "ROOT_AFFILIATION")
 TASK_STORAGE_MAX_RECORDS = 131072
 TASK_STORAGE_MAX_BYTES = 64 * 1024 * 1024
 TASK_STORAGE_TIMEOUT_SECONDS = 8
+STOPPED_SNAPSHOT_CONTRACT = "p11scope/stopped-task-storage/v1"
+SNAPSHOT_MAP_ORACLES = {
+    "hash": "dump", "array": "dump", "prog_array": "dump", "cgroup_array": "dump",
+    "percpu_hash": "dump", "percpu_array": "dump",
+    "ringbuf": "mmap", "task_storage": "task-storage",
+}
 DIAGNOSTIC_LIMIT = 4096
 
 
@@ -257,6 +263,193 @@ def parse_task_storage_frames(data, maps, *, max_records, max_bytes):
             "map_id": map_id, "pid": pid, "tid": tid, "value": data[offset:end],
         })
         offset = end
+
+
+def snapshot_uint(value, bits=64, *, positive=False):
+    return type(value) is int and (1 if positive else 0) <= value < (1 << bits)
+
+
+def stopped_roster(rows, *, expected=False):
+    """Validate bounded physical identities; generation is /proc starttime ticks.
+
+    Only a confirmed group stop (T), not a ptrace stop (t), qualifies. The
+    coordinator must prevent exec/clone/exit over both roster samples.
+    """
+    if not isinstance(rows, list) or not 0 < len(rows) <= TASK_STORAGE_MAX_RECORDS:
+        raise RuntimeError("stopped roster: missing, empty or oversized task list")
+    result = {}
+    fields = {"pid", "tid", "generation"} | (
+        {"cookie", "owner", "root"} if expected else {"state"})
+    for row in rows:
+        if (not isinstance(row, dict) or set(row) != fields
+                or not snapshot_uint(row.get("pid"), 32, positive=True)
+                or not snapshot_uint(row.get("tid"), 32, positive=True)
+                or not snapshot_uint(row.get("generation"), positive=True)):
+            raise RuntimeError("stopped roster: malformed task identity or fields")
+        if row["tid"] in result:
+            raise RuntimeError(f"stopped roster: duplicate or reused tid={row['tid']}")
+        if expected:
+            if any(type(row[key]) is not bool for key in ("cookie", "owner", "root")):
+                raise RuntimeError("stopped roster: malformed population expectation")
+            if row["cookie"] and row["pid"] != row["tid"]:
+                raise RuntimeError("stopped roster: TASK_COOKIE requires a leader")
+        elif row["state"] != "T":
+            raise RuntimeError(f"stopped roster: unconfirmed group stop tid={row['tid']}")
+        result[row["tid"]] = row
+    if any(row["pid"] not in result or result[row["pid"]]["pid"] != row["pid"]
+           for row in result.values()):
+        raise RuntimeError("stopped roster: missing group leader")
+    return result
+
+
+def snapshot_map_metadata(item):
+    if (not isinstance(item, dict)
+            or not snapshot_uint(item.get("id"), 32, positive=True)
+            or any(not snapshot_uint(item.get(key), 32) for key in (
+                "bytes_key", "bytes_value", "max_entries", "map_flags"))):
+        raise RuntimeError("stopped map: invalid numeric metadata")
+    name = item.get("name")
+    map_type = item.get("type")
+    if type(name) is not str or re.fullmatch(r"[A-Z0-9_]{1,32}", name) is None:
+        raise RuntimeError("stopped map: invalid textual metadata")
+    if type(map_type) is not str or map_type not in SNAPSHOT_MAP_ORACLES:
+        raise RuntimeError("stopped map: invalid textual metadata")
+    if item.get("oracle") != SNAPSHOT_MAP_ORACLES[map_type]:
+        raise RuntimeError("stopped map: invalid textual metadata")
+
+
+def reconcile_task_storage(maps, records, *, expected, before, after, controls,
+                           lane, small_state=False):
+    """Pure population check after bounded framing/EOF validation.
+
+    V1 frames contain pid/tid, not generation. Bind them to identical stopped
+    before/after rosters here, and return generation-bearing identities in raw
+    surface order for a later receipt. Replayed receipts must supply that same
+    generation. This function neither acquires nor publishes evidence and does
+    not establish pidfd custody; the Task 3C coordinator owns that obligation.
+    Controls are exact map metadata plus complete raw single-cell values.
+    """
+    roster = stopped_roster(expected, expected=True)
+    def identity(row):
+        return row["pid"], row["tid"], row["generation"]
+
+    wanted_roster = {identity(row) for row in roster.values()}
+    for sample in (before, after):
+        if {identity(row) for row in stopped_roster(sample).values()} != wanted_roster:
+            raise RuntimeError("stopped roster: expected/before/after identity mismatch")
+    if lane not in ("external", "owned-root") or type(small_state) is not bool:
+        raise RuntimeError("stopped roster: invalid lane or state-map configuration")
+    roots = {identity(row) for row in roster.values() if row["root"]}
+    if (lane == "external" and roots) or (lane == "owned-root" and not roots):
+        raise RuntimeError("stopped roster: root expectations contradict lane")
+    if not isinstance(maps, list) or len(maps) != 3:
+        raise RuntimeError("stopped map: invalid task-storage inventory")
+    for item in maps:
+        snapshot_map_metadata(item)
+    ordered = task_storage_specs(maps)
+    by_id = {item["id"]: item for item in ordered}
+    if any(not snapshot_uint(map_id, 32, positive=True) for map_id in by_id):
+        raise RuntimeError("stopped map: invalid task-storage map identity")
+    if not isinstance(records, list) or len(records) > TASK_STORAGE_MAX_RECORDS:
+        raise RuntimeError("stopped map: missing or oversized record population")
+    seen = {item["name"]: set() for item in ordered}
+    bound = {item["name"]: [] for item in ordered}
+    for record in records:
+        if (not isinstance(record, dict)
+                or not snapshot_uint(record.get("map_id"), 32, positive=True)
+                or record["map_id"] not in by_id):
+            raise RuntimeError("stopped map: unexpected record map identity")
+        item = by_id[record["map_id"]]
+        context = f"stopped map id={item['id']} name={item['name']}"
+        if (not snapshot_uint(record.get("pid"), 32, positive=True)
+                or not snapshot_uint(record.get("tid"), 32, positive=True)):
+            raise RuntimeError(f"{context}: invalid task identity")
+        task = roster.get(record["tid"])
+        if task is None or task["pid"] != record["pid"]:
+            raise RuntimeError(f"{context}: foreign identity pid={record['pid']} tid={record['tid']}")
+        if "generation" in record and (
+                not snapshot_uint(record["generation"], positive=True)
+                or record["generation"] != task["generation"]):
+            raise RuntimeError(f"{context}: reused identity tid={record['tid']}")
+        key = identity(task)
+        if key in seen[item["name"]]:
+            raise RuntimeError(f"{context}: duplicate identity tid={record['tid']}")
+        seen[item["name"]].add(key)
+        bound[item["name"]].append({k: task[k] for k in ("pid", "tid", "generation")})
+        if type(record.get("value")) is not bytes or len(record["value"]) != item["bytes_value"]:
+            raise RuntimeError(f"{context}: invalid value length")
+    for name, flag in zip(TASK_STORAGE_NAMES, ("cookie", "owner", "root")):
+        required = {identity(row) for row in roster.values() if row[flag]}
+        if seen[name] != required:
+            item = next(item for item in ordered if item["name"] == name)
+            raise RuntimeError(f"stopped map id={item['id']} name={name}: population identity mismatch")
+
+    control_sizes = {"COOKIE_CTL": 40, "OWNER_CTL": 56, "ROOT_CTL": 64}
+    if not isinstance(controls, dict) or set(controls) != set(control_sizes):
+        raise RuntimeError("stopped control maps: missing exact COOKIE_CTL/OWNER_CTL/ROOT_CTL")
+    words = {}
+    ids = set(by_id)
+    for name, size in control_sizes.items():
+        cell = controls[name]
+        context = f"stopped control map name={name}"
+        if (not isinstance(cell, dict)
+                or not snapshot_uint(cell.get("id"), 32, positive=True)
+                or cell["id"] in ids):
+            raise RuntimeError(f"{context}: invalid map identity")
+        snapshot_map_metadata(cell)
+        ids.add(cell["id"])
+        context += f" id={cell['id']}"
+        if (tuple(cell.get(key) for key in ("type", "bytes_key", "bytes_value", "max_entries", "map_flags"))
+                != ("array", 4, size, 1, 0)
+                or type(cell.get("value")) is not bytes or len(cell["value"]) != size):
+            raise RuntimeError(f"{context}: malformed metadata or value")
+        values = struct.unpack("<" + "Q" * (size // 8), cell["value"])
+        words[name] = values
+        if name == "COOKIE_CTL":
+            healthy = values[0] == 16384 and values[1] <= 16384 and not any(values[2:])
+        elif name == "OWNER_CTL":
+            limit = 65 if small_state else 16448
+            healthy = values[0] == limit and values[1] == len(seen["THREAD_OWNER"]) <= limit and not any(values[2:])
+        else:
+            limit = 3 if small_state else 16384
+            healthy = values[0] == len(roots) <= limit and not any(values[1:])
+        if not healthy:
+            raise RuntimeError(f"{context}: unhealthy or inconsistent control")
+    tickets = set()
+    for record in records:
+        item = by_id[record["map_id"]]
+        name = item["name"]
+        raw = record["value"]
+        context = f"stopped map id={item['id']} name={name} tid={record['tid']}"
+        if name == "TASK_COOKIE":
+            ticket, = struct.unpack("<Q", raw)
+            if not 0 < ticket <= words["COOKIE_CTL"][1] or ticket in tickets:
+                raise RuntimeError(f"{context}: value contradicts COOKIE_CTL allocation history")
+            tickets.add(ticket)
+        elif name == "ROOT_AFFILIATION":
+            if struct.unpack("<Q", raw)[0] != 1:
+                raise RuntimeError(f"{context}: invalid affiliation value")
+        else:
+            original, = struct.unpack_from("<Q", raw)
+            cookies = struct.unpack_from("<64Q", raw, 8)
+            occupied, domains, starts, flags = struct.unpack_from("<QQII", raw, 520)
+            if original != (record["pid"] << 32) | record["tid"]:
+                raise RuntimeError(f"{context}: value ownership identity mismatch")
+            if (flags != 1 or starts > 512 or domains & ~occupied
+                    or starts == occupied == 0):
+                raise RuntimeError(f"{context}: invalid production tail value")
+            directory = set()
+            for index, cookie in enumerate(cookies):
+                bit = 1 << index
+                if not occupied & bit:
+                    if cookie:
+                        raise RuntimeError(f"{context}: unoccupied directory value")
+                else:
+                    key = (cookie, bool(domains & bit))
+                    if key in directory:
+                        raise RuntimeError(f"{context}: duplicate directory value")
+                    directory.add(key)
+    return bound
 
 
 def publish_task_storage_surfaces(out_dir, label, maps, records):

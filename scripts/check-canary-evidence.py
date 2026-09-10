@@ -2,6 +2,7 @@
 """Validate canary capture evidence without import-time side effects."""
 
 import ctypes
+import hashlib
 import json
 import mmap
 import os
@@ -837,6 +838,157 @@ def assert_raw_records(manifest, lane, workload_pid, prefix):
     assert read == set(RING_RECORD_SIZES), f"{lane}: owned ringbufs {read} were not all read"
 
 
+def assert_stopped_snapshot(manifest, prefix):
+    """Replay an opt-in V1 receipt against every surface actually scanned.
+
+    Legacy Task 1/2 manifests remain usable while Task 3C is staged. Any row
+    claiming snapshot evidence requires the complete contract on every row.
+    Digests bind retained bytes, not the truth of process custody: only the
+    retained-pidfd coordinator may issue a live qualification receipt.
+    """
+    api = runpy.run_path(str(SCRIPT_DIR / "dump-owned-bpf-maps.py"))
+    uint = api["snapshot_uint"]
+    maximum = api["TASK_STORAGE_MAX_BYTES"]
+    context = "stopped snapshot"
+
+    def require(condition, message):
+        if not condition:
+            raise RuntimeError(f"{context}: {message}")
+
+    def read_bounded(path, bound):
+        with Path(path).open("rb") as handle:
+            raw = handle.read(bound + 1)
+        require(len(raw) <= bound, "surface or receipt exceeds byte bound")
+        return raw
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            require(key not in result, "duplicate JSON field")
+            result[key] = value
+        return result
+
+    def read_json_bytes(raw):
+        return json.loads(raw, object_pairs_hook=unique_object)
+
+    def byte_array(value, size):
+        require(isinstance(value, list) and len(value) == size, "malformed control value")
+        result = bytearray()
+        for byte in value:
+            if type(byte) is str and re.fullmatch(r"(?:0x)?[0-9a-fA-F]{2}", byte):
+                byte = int(byte, 16)
+            require(uint(byte, 8), "malformed control value")
+            result.append(byte)
+        return bytes(result)
+
+    try:
+        require(isinstance(manifest, list) and 0 < len(manifest) <= 128,
+                "invalid manifest bound")
+        claim = manifest[0].get("snapshot")
+        require(isinstance(claim, dict) and set(claim) == {
+            "contract", "acquisition_id", "phase", "receipt"}, "incomplete claim")
+        require(claim["contract"] == api["STOPPED_SNAPSHOT_CONTRACT"], "unknown contract")
+        acquisition = claim["acquisition_id"]
+        require(type(acquisition) is str and re.fullmatch(r"[0-9a-f]{32}", acquisition),
+                "invalid acquisition identity")
+        require(claim["phase"] == "stopped", "invalid receipt phase")
+        require(type(claim["receipt"]) is str and len(claim["receipt"]) <= 4096
+                and Path(claim["receipt"]).is_absolute(), "invalid receipt path")
+        require(all(item.get("snapshot") == claim for item in manifest), "partial or mixed claim")
+        receipt = read_json_bytes(read_bounded(claim["receipt"], 16 * 1024 * 1024))
+        require(isinstance(receipt, dict) and set(receipt) == {
+            "contract", "acquisition_id", "phase", "lane", "small_state",
+            "expected", "before", "after", "surfaces"}, "incomplete roster receipt")
+        require(all(receipt[key] == claim[key] for key in ("contract", "acquisition_id", "phase")),
+                "receipt acquisition or phase mismatch")
+        rows = receipt["surfaces"]
+        require(isinstance(rows, list) and len(rows) == len(manifest), "incomplete surface set")
+        require(all(isinstance(row, dict) and uint(row.get("id"), 32, positive=True)
+                    for row in rows), "invalid surface identity")
+        surfaces = {row["id"]: row for row in rows}
+        require(len(surfaces) == len(rows), "duplicate surface identity")
+        require(all(uint(item.get("id"), 32, positive=True) for item in manifest),
+                "invalid map identity")
+        require(set(surfaces) == {item["id"] for item in manifest}, "surface map identity mismatch")
+        metadata_rows = [{"id": item.get("id"), "name": item.get("name"),
+                          "type": item.get("type"), "oracle": item.get("oracle"),
+                          "bytes_key": item.get("key_size"),
+                          "bytes_value": item.get("value_size"),
+                          "max_entries": item.get("max_entries"),
+                          "map_flags": item.get("map_flags")}
+                         for item in manifest]
+        for metadata in metadata_rows:
+            api["snapshot_map_metadata"](metadata)
+        names = [metadata["name"] for metadata in metadata_rows]
+        require(len(set(names)) == len(names), "duplicate map names")
+        require(set(api["TASK_STORAGE_NAMES"]) | {
+            "COOKIE_CTL", "OWNER_CTL", "ROOT_CTL", "START", "EVENTS", "DISCOVERY"
+        } <= set(names), "missing required acquisition map")
+        records, maps, controls = [], [], {}
+        total = 0
+        for item, metadata in zip(manifest, metadata_rows):
+            name = metadata["name"]
+            context = f"stopped map id={item['id']} name={name}"
+            surface = surfaces[item["id"]]
+            task_storage = metadata["type"] == "task_storage"
+            fields = {"id", "acquisition_id", "phase", "size", "sha256"}
+            require(set(surface) == fields | ({"records"} if task_storage else set()),
+                    "malformed surface metadata")
+            require(surface["acquisition_id"] == acquisition and surface["phase"] == "stopped",
+                    "surface acquisition or phase mismatch")
+            require(uint(surface["size"]) and surface["size"] <= maximum - total,
+                    "surface exceeds aggregate byte bound")
+            if metadata["type"] == "ringbuf":
+                path = ring_raw_path(prefix, name)
+            else:
+                require(type(item.get("file")) is str and len(item["file"]) <= 4096,
+                        "missing surface path")
+                path = Path(item["file"])
+            raw = read_bounded(path, surface["size"])
+            require(len(raw) == surface["size"] and hashlib.sha256(raw).hexdigest() == surface["sha256"],
+                    "surface size or digest mismatch")
+            total += len(raw)
+            if name == "START":
+                require((item["type"], item["key_size"], item["value_size"],
+                         item["max_entries"], item["map_flags"]) == (
+                             "hash", 16, 288, 1 if receipt["small_state"] else 16384, 0),
+                        "START metadata contradicts state-map configuration")
+            elif name in ("EVENTS", "DISCOVERY"):
+                require(item["type"] == "ringbuf" and item["oracle"] == "mmap"
+                        and item["key_size"] == item["value_size"] == 0 and "file" not in item,
+                        "invalid ring surface metadata")
+            if task_storage:
+                maps.append(metadata)
+                identities = surface["records"]
+                require(isinstance(identities, list)
+                        and len(identities) <= api["TASK_STORAGE_MAX_RECORDS"] - len(records),
+                        "invalid record population bound")
+                size = item["value_size"]
+                require(uint(size, 32, positive=True) and len(raw) == len(identities) * size,
+                        "record population byte count mismatch")
+                for index, identity in enumerate(identities):
+                    require(isinstance(identity, dict) and set(identity) == {"pid", "tid", "generation"},
+                            "malformed record identity")
+                    records.append({**identity, "map_id": item["id"],
+                                    "value": raw[index * size:(index + 1) * size]})
+            elif name in ("COOKIE_CTL", "OWNER_CTL", "ROOT_CTL"):
+                cells = read_json_bytes(raw)
+                require(isinstance(cells, list) and len(cells) == 1
+                        and isinstance(cells[0], dict) and set(cells[0]) == {"key", "value"},
+                        "malformed control cell")
+                require(byte_array(cells[0]["key"], 4) == bytes(4), "invalid control key")
+                controls[name] = {**metadata, "value": byte_array(cells[0]["value"], item["value_size"])}
+        api["reconcile_task_storage"](
+            maps, records, expected=receipt["expected"], before=receipt["before"],
+            after=receipt["after"], controls=controls, lane=receipt["lane"],
+            small_state=receipt["small_state"])
+    except RuntimeError as error:
+        raise AssertionError(str(error)) from None
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError, RecursionError):
+        # Native/JSON exceptions may quote input or raw values. Never forward them.
+        raise AssertionError("stopped snapshot: malformed or unavailable evidence") from None
+
+
 def owned_map_surfaces(label, manifest, expected, prefix):
     """Every owned map paired with the file the privacy scan reads it from.
 
@@ -847,6 +999,8 @@ def owned_map_surfaces(label, manifest, expected, prefix):
     failure, never a skip — an unscanned owned map is exactly the privacy hole
     this gate exists to close.
     """
+    if any("snapshot" in item for item in manifest):
+        assert_stopped_snapshot(manifest, prefix)
     names = {item["name"] for item in manifest}
     assert names == expected, f"{label}: map inventory {names} != {expected}"
     ids = [item['id'] for item in manifest]

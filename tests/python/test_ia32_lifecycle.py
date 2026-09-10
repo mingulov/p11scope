@@ -5,6 +5,7 @@ import hashlib
 import os
 from pathlib import Path
 import select
+import shutil
 import signal
 import subprocess
 import sys
@@ -16,6 +17,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = ROOT / "tests/fixtures/ia32-lifecycle"
+ROOT_FIXTURES = ROOT / "tests/fixtures/root-recorded-launcher"
 DRIVER = FIXTURES / "driver.sh"
 TARGET = FIXTURES / "target.sh"
 GUARD_SOURCE = ROOT / "scripts/matrix/ia32-compat-trace-exec.c"
@@ -51,6 +53,11 @@ class Ia32LifecycleTests(unittest.TestCase):
         self.env["CASE_DIR"] = str(self.work)
         self.env["IA32_TEST_HOLD_SECONDS"] = "12"
         self.env["IA32_GUARD_TEST_SECONDS"] = "12"
+        self.bin = self.work / "bin"
+        self.bin.mkdir(mode=0o700)
+        self.mock_sudo = self.bin / "sudo"
+        shutil.copyfile(ROOT_FIXTURES / "sudo", self.mock_sudo)
+        self.mock_sudo.chmod(0o700)
         self.owned = []
         self.guard_children = {}
 
@@ -242,6 +249,12 @@ class Ia32LifecycleTests(unittest.TestCase):
             ["sh", str(DRIVER), *map(str, args)], input=input, timeout=timeout, env=env,
         )
 
+    def root_fixture_env(self):
+        env = self.env.copy()
+        env["PATH"] = str(self.bin) + os.pathsep + env["PATH"]
+        self.assertEqual(shutil.which("sudo", path=env["PATH"]), str(self.mock_sudo))
+        return env
+
     def test_direct_user_launch_preserves_exact_identity_argv_stdin_and_exit9(self):
         record = self.work / "target"
         result = self.run_driver(
@@ -314,11 +327,9 @@ class Ia32LifecycleTests(unittest.TestCase):
         self.assertEqual((self.work / "evidence/cleanup.status").read_text(), "cleanup_status=0\n")
 
     def test_user_and_root_committed_transfer_signal_is_adopted_by_cleanup(self):
-        root_fixtures = ROOT / "tests/fixtures/root-recorded-launcher"
         for role in ("user", "root"):
             with self.subTest(role=role):
-                env = self.env.copy()
-                env["PATH"] = str(root_fixtures) + os.pathsep + env["PATH"]
+                env = self.root_fixture_env()
                 record = self.work / f"{role}-target"
                 result = self.run_driver(
                     "acquisition-signal", role, TARGET, record, "hold", "0",
@@ -362,9 +373,7 @@ class Ia32LifecycleTests(unittest.TestCase):
         self.assertNotIn(status_log["fixture_status"], ("STARTED", "UNKNOWN"))
 
     def test_real_cleanup_attempts_timeout_after_guard_failure_and_is_nonpass(self):
-        root_fixtures = ROOT / "tests/fixtures/root-recorded-launcher"
-        env = self.env.copy()
-        env["PATH"] = str(root_fixtures) + os.pathsep + env["PATH"]
+        env = self.root_fixture_env()
         record = self.work / "cleanup-target"
         result = self.run_driver(
             "cleanup-independent", TARGET, record, "hold", "0", env=env, timeout=10,
@@ -373,7 +382,19 @@ class Ia32LifecycleTests(unittest.TestCase):
         self.assertIn(b"CLEANUP_RESULT=NONPASS status=1\n", result.stdout)
         self.assertEqual((self.work / "evidence/cleanup.status").read_text(), "cleanup_status=1\n")
         status = dict(line.split("=", 1) for line in (self.work / "evidence/status").read_text().splitlines())
-        self.assertNotIn(status["tracer_status"], ("STARTED", "UNKNOWN"))
+        self.assertTrue((self.work / "sudo.entered").exists())
+        sudo_calls = (self.work / "sudo.calls").read_text().splitlines()
+        call_fields = [call.split() for call in sudo_calls]
+        self.assertTrue(any(
+            len(fields) > 3
+            and fields[:2] == ["python3", "-I"]
+            and Path(fields[2]).name == "recorded-process-exec.py"
+            and fields[3] == "exec"
+            for fields in call_fields
+        ), sudo_calls)
+        self.assertTrue(any(fields[:4] == ["python3", "-I", "-", "CONT"]
+                            for fields in call_fields), sudo_calls)
+        self.assertEqual(int(status["tracer_status"]), 128 + signal.SIGTERM)
 
     def test_cleanup_output_failure_is_terminal_nonpass_after_owned_cleanup(self):
         record = self.work / "cleanup-target"
@@ -395,9 +416,7 @@ class Ia32LifecycleTests(unittest.TestCase):
         self.assertEqual(fields[:2], identity)
 
     def test_root_launch_transfers_launcher_and_process_generations_before_wait(self):
-        root_fixtures = ROOT / "tests/fixtures/root-recorded-launcher"
-        env = self.env.copy()
-        env["PATH"] = str(root_fixtures) + os.pathsep + env["PATH"]
+        env = self.root_fixture_env()
         record = self.work / "target"
         result = self.run_driver(
             "root-launch", TARGET, record, "exit", "9", "root arg",

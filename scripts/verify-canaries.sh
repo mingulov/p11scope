@@ -31,6 +31,7 @@ if [ "${1-}" = "--self-test" ]; then
     assert_lanes --self-test
     python3 -I tests/python/test_canary_evidence.py --target-bits "$TARGET_BITS" -v
     python3 -I tests/python/test_canary_workload.py --target-bits "$TARGET_BITS" -v
+    python3 -I tests/python/test_task_storage_canary.py -v
     exit 0
 fi
 
@@ -90,6 +91,10 @@ rm -rf "$WORK/task-storage-reader"
 scripts/build-task-storage-reader.sh "$WORK/task-storage-reader"
 TASK_STORAGE_READER=$WORK/task-storage-reader/dump-task-storage
 TASK_STORAGE_OBJECT=$WORK/task-storage-reader/dump-task-storage.bpf.o
+# The seed fixture is x86-64 only and is always built unprivileged, never under sudo.
+rm -rf "$WORK/task-storage-canary"
+scripts/build-task-storage-canary.sh "$WORK/task-storage-canary"
+TASK_STORAGE_FIXTURE=$WORK/task-storage-canary/task-storage-canary
 sudo -n true 2>/dev/null || { echo "existing sudo authorization required"; exit 1; }
 gcc "$TARGET_CC_FLAG" -std=c11 -O0 -Wall -Wextra -o "$WORK/canary_workload" \
     scripts/fixtures/canary_workload.c -ldl -pthread
@@ -362,6 +367,28 @@ done <<'OWNED_LANES'
 owned-default-metrics default
 owned-feature-metrics feature
 OWNED_LANES
+
+run_task_storage_seed_stage() {
+    # A private out-dir distinct from the lane work root: no seed artifact may
+    # ever join a lane's surfaces, a lane manifest, or the final all-lane scan.
+    seed_dir=$WORK/task-storage-seed
+    [ ! -e "$seed_dir" ] && [ ! -L "$seed_dir" ] || {
+        echo "existing task-storage seed destination: $seed_dir" >&2
+        exit 1
+    }
+    echo "=== isolated seeded task-storage byte controls ==="
+    sudo python3 -I scripts/qualify-task-storage-canary.py \
+        --fixture "$TASK_STORAGE_FIXTURE" --reader "$TASK_STORAGE_READER" \
+        --obj "$TASK_STORAGE_OBJECT" --out-dir "$seed_dir" \
+        --receipt "$seed_dir/seed-qualification.json"
+    reclaim_root_output "$seed_dir"
+    for seed_artifact in "$seed_dir"/*; do
+        [ -e "$seed_artifact" ] || continue
+        reclaim_root_output "$seed_artifact"
+    done
+}
+
+run_task_storage_seed_stage
 
 echo "=== assert capture-policy matrix ==="
 assert_lanes "$WORK"

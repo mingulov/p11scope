@@ -5932,6 +5932,32 @@ fn stopped_canary_capture_lifecycle() {
 }
 
 #[test]
+fn task_storage_canary_seed_lifecycle() {
+    let output = Command::new("timeout")
+        .args([
+            "--kill-after=2s",
+            "60s",
+            "python3",
+            "-I",
+            "tests/python/test_task_storage_canary.py",
+            "TaskStorageCanaryTests",
+            "-v",
+        ])
+        .output()
+        .expect("run isolated task-storage seed qualifier tests");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "task-storage seed qualifier tests failed: {report}"
+    );
+    assert_clean_python_suite(&report, "TaskStorageCanaryTests", 26);
+}
+
+#[test]
 fn metadata_canary_matrix() {
     let canaries = read("scripts/verify-canaries.sh");
     let checker = read("scripts/check-canary-evidence.py");
@@ -6094,6 +6120,64 @@ aggregate-only-metrics default metrics"
     assert!(
         iterator_disassembly.contains("call 0x7f"),
         "iterator must write values directly with bpf_seq_write: {iterator_disassembly}"
+    );
+    // The D2 seed fixture is a separate x86-64 native binary that reuses this
+    // same iterator object with every program's autoload disabled; it builds
+    // without a second BPF object and never teaches the reader to create maps.
+    let fixture_build = directory.path().join("task-storage-canary");
+    let fixture_build_text = fixture_build.to_str().unwrap();
+    run_ok(
+        "sh",
+        &["scripts/build-task-storage-canary.sh", fixture_build_text],
+    );
+    let fixture = fixture_build.join("task-storage-canary");
+    assert!(
+        fixture.is_file() && !fixture_build.join("dump-task-storage.bpf.o").exists(),
+        "the seed fixture builder must produce only the native fixture"
+    );
+    let fixture_test = run_ok(fixture.to_str().unwrap(), &["--self-test"]);
+    for group in [
+        "exact-map mutation self-test: OK",
+        "seed layout self-test: OK",
+        "READY document self-test: OK",
+        "injected lifecycle self-test: OK",
+    ] {
+        assert!(
+            fixture_test.contains(group),
+            "seed fixture self-test must report {group}: {fixture_test}"
+        );
+    }
+    let fixture_source = read("scripts/native/task-storage-canary.c");
+    assert!(
+        fixture_source.contains("program_set_autoload")
+            && fixture_source.contains("object_next_program")
+            && !fixture_source.contains("BPF_MAP_CREATE")
+            && !fixture_source.contains("program_attach"),
+        "the seed fixture must disable autoload for every program and attach nothing"
+    );
+    let builder = read("scripts/build-task-storage-canary.sh");
+    assert!(
+        !builder.contains("sudo") && !builder.contains("clang"),
+        "the seed fixture builder must stay unprivileged and build no BPF object"
+    );
+    // The seed stage is isolated from every production lane: its own private
+    // out-dir, never the lane work root whose surfaces the final scan reads.
+    assert!(
+        canaries.contains("scripts/build-task-storage-canary.sh \"$WORK/task-storage-canary\"")
+            && canaries.contains("seed_dir=$WORK/task-storage-seed")
+            && canaries.contains("--out-dir \"$seed_dir\"")
+            && canaries.contains("python3 -I tests/python/test_task_storage_canary.py"),
+        "the canary gate must build the fixture unprivileged, isolate the seed \
+         out-dir, and delegate the seed suite to its checked-in entry point"
+    );
+    let seed_build = between(
+        &canaries,
+        "scripts/build-task-storage-canary.sh",
+        "sudo -n true",
+    );
+    assert!(
+        !seed_build.contains("sudo"),
+        "the seed fixture must be built before the gate acquires sudo authorization"
     );
     let provider = directory.path().join("matrix-provider.so");
     let workload = directory.path().join("canary-workload");

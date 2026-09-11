@@ -5788,6 +5788,97 @@ fn policy_specific_ebpf() {
     }
 }
 
+/// Assert a Python `unittest` suite ran clean, without pinning an exact count.
+///
+/// Pinning `Ran N tests` made every *added* case a build break, which punished
+/// the one change a suite should always welcome, and the bump that followed
+/// carried no information. The contract those assertions were reaching for is
+/// narrower: coverage must never silently shrink, and no case may be skipped or
+/// tolerated. So require the named class, a run of at least the cases the suite
+/// had when its floor was recorded, and `unittest`'s own bare `OK` verdict — a
+/// qualified `OK (skipped=1)`, `OK (expected failures=1)` or any `FAILED (...)`
+/// is not clean. Adding a case passes; deleting one below the floor does not.
+fn assert_clean_python_suite(report: &str, class: &str, floor: usize) {
+    assert!(report.contains(class), "{class} did not run: {report}");
+    let ran = report
+        .match_indices("Ran ")
+        .filter_map(|(at, _)| report[at + "Ran ".len()..].split_once(" test"))
+        .filter_map(|(count, _)| count.parse::<usize>().ok())
+        // `MatchIndices` is not double-ended, so take the last by reduction.
+        .reduce(|_, last| last)
+        .unwrap_or_else(|| panic!("no unittest summary for {class}: {report}"));
+    assert!(
+        ran >= floor,
+        "{class} coverage shrank below its recorded floor: ran {ran}, floor {floor}: {report}"
+    );
+    // The verdict line, not the last line: suites may print after unittest does.
+    let verdict = report
+        .lines()
+        .map(str::trim)
+        .filter(|line| *line == "OK" || line.starts_with("OK (") || line.starts_with("FAILED"))
+        .next_back()
+        .unwrap_or_else(|| panic!("no unittest verdict for {class}: {report}"));
+    assert_eq!(
+        verdict, "OK",
+        "{class} must finish on a clean OK, with no skipped, expected-failure or \
+         unexpected-success case: {report}"
+    );
+}
+
+/// The suite gate is itself a contract, so prove both directions rather than
+/// trusting it: a grown suite passes, and every way coverage can quietly go
+/// missing fails.
+#[test]
+fn clean_python_suite_gate_accepts_growth_and_refuses_loss() {
+    let clean = "test_one (__main__.ExampleTests.test_one) ... ok\n\
+                 ----\nRan 12 tests in 0.4s\n\nOK\n";
+    assert_clean_python_suite(clean, "ExampleTests", 12);
+    // Added cases are the change a suite should welcome, not a build break.
+    assert_clean_python_suite(
+        &clean.replace("Ran 12 tests", "Ran 13 tests"),
+        "ExampleTests",
+        12,
+    );
+    // Trailing chatter after unittest's verdict must not hide it.
+    assert_clean_python_suite(
+        &format!("{clean}observer pid 55: dumped 6 owned maps\n"),
+        "ExampleTests",
+        12,
+    );
+    // No panic-hook swap: the hook is process-global while tests run in parallel,
+    // and restoring it after the assertions would leave it silenced for the rest
+    // of the binary on exactly the failure this test exists to report. The other
+    // `catch_unwind` sites in this file take the same expected-panic noise.
+    let mut accepted = Vec::new();
+    for (report, reason) in [
+        (
+            clean.replace("Ran 12 tests", "Ran 11 tests"),
+            "deleted case",
+        ),
+        (
+            clean.replace("\nOK\n", "\nOK (skipped=1)\n"),
+            "skipped case",
+        ),
+        (
+            clean.replace("\nOK\n", "\nOK (expected failures=1)\n"),
+            "tolerated failure",
+        ),
+        (
+            clean.replace("\nOK\n", "\nFAILED (failures=1)\n"),
+            "failing case",
+        ),
+        (clean.replace("ExampleTests", "OtherTests"), "wrong suite"),
+        (clean.replace("Ran 12 tests", "no summary"), "no summary"),
+    ] {
+        let caught =
+            std::panic::catch_unwind(|| assert_clean_python_suite(&report, "ExampleTests", 12));
+        if caught.is_ok() {
+            accepted.push(reason);
+        }
+    }
+    assert!(accepted.is_empty(), "the suite gate accepted: {accepted:?}");
+}
+
 #[test]
 fn canary_process_custody_lifecycle() {
     let output = Command::new("timeout")
@@ -5811,12 +5902,7 @@ fn canary_process_custody_lifecycle() {
         output.status.success(),
         "canary custody tests failed: {report}"
     );
-    assert!(
-        report.contains("Ran 40 tests")
-            && report.contains("ProcessCustodyTests")
-            && !report.contains("skipped="),
-        "canary custody suite must execute every required case: {report}"
-    );
+    assert_clean_python_suite(&report, "ProcessCustodyTests", 40);
 }
 
 #[test]
@@ -5842,12 +5928,7 @@ fn stopped_canary_capture_lifecycle() {
         output.status.success(),
         "stopped coordinator tests failed: {report}"
     );
-    assert!(
-        report.contains("Ran 106 tests")
-            && report.contains("StoppedCanaryCaptureTests")
-            && !report.contains("skipped="),
-        "stopped coordinator suite must execute every required case: {report}"
-    );
+    assert_clean_python_suite(&report, "StoppedCanaryCaptureTests", 106);
 }
 
 #[test]
@@ -6144,10 +6225,7 @@ aggregate-only-metrics default metrics"
                 "native {bits}-bit suite missed {family}: {report}"
             );
         }
-        assert!(
-            report.contains("Ran 60 tests") && !report.contains("skipped="),
-            "native {bits}-bit suite must execute every required case: {report}"
-        );
+        assert_clean_python_suite(&report, "TargetWidthPathTests", 60);
 
         let workload_output = Command::new("python3")
             .args([
@@ -6169,12 +6247,7 @@ aggregate-only-metrics default metrics"
             workload_output.status.success(),
             "native {bits}-bit workload tests failed: {workload_report}"
         );
-        assert!(
-            workload_report.contains("Ran 11 tests")
-                && workload_report.contains("CanaryWorkloadTests")
-                && !workload_report.contains("skipped="),
-            "native {bits}-bit workload suite must execute every required case: {workload_report}"
-        );
+        assert_clean_python_suite(&workload_report, "CanaryWorkloadTests", 11);
     }
     let empty = Command::new("python3")
         .args([

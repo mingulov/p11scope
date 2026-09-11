@@ -195,10 +195,18 @@ class DualBuildCallerTests(unittest.TestCase):
                                     and row["bpf_rustc"] == str(self.selected[3]) for row in builds))
 
     def test_self_test_fast_paths_remain_before_build_setup(self):
+        # The claim is that `--self-test` returns before `product-build.sh` runs
+        # two `--release --workspace` builds, which take minutes; the timeout is
+        # only a coarse guard for it. The delegated validator suites grew with
+        # the canary matrix (60 evidence + 11 workload cases per width, each
+        # compiling fixtures and spawning subprocesses), so the original 20s sat
+        # under the observed cost on the slower supported guests and made this a
+        # timing tripwire rather than a build-setup check. The budget is set well
+        # clear of that cost and still far below any build.
         for child in CHILDREN:
             result = subprocess.run(["sh", str(child), "--self-test"], cwd=ROOT,
                                     text=True, stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE, timeout=20)
+                                    stderr=subprocess.PIPE, timeout=120)
             self.assertEqual(result.returncode, 0, result.stderr)
 
 

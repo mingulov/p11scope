@@ -171,17 +171,35 @@ class InjectedSeedMaps:
             return stream(seeded_rows(self.case, pid, self.ids))
 
     def absent(self, map_id):
-        self.probed.append(map_id)
+        # Record how many closes preceded each probe. A retained descriptor
+        # keeps its map id resolvable on a live kernel, so an id probed before
+        # the explicit `source.close()` must never read as cleanup here either.
+        self.probed.append((map_id, self.closed))
+        if not self.closed:
+            return 'resolvable'
         return self.plan.get('absence', 'absent')
 
     def close(self):
         self.closed += 1
 
 
-def injected_factory(plan):
+def injected_factory(plan, created=None):
     def factory(case):
-        return InjectedSeedMaps(case, plan)
+        source = InjectedSeedMaps(case, plan)
+        if created is not None:
+            created.append(source)
+        return source
     return factory
+
+
+def assert_close_precedes_absence(sources, cases):
+    """Every absence probe ran after the explicit close, and only after it."""
+    assert len(sources) == cases, (len(sources), cases)
+    for source in sources:
+        assert [map_id for map_id, _ in source.probed] == list(IDS), source.probed
+        assert [closes for _, closes in source.probed] == [1, 1, 1], source.probed
+        # The explicit cleanup close, then the ledger close in the finally.
+        assert source.closed == 2, source.closed
 
 
 def probe_case(directory, name):
@@ -204,9 +222,9 @@ def probe_case(directory, name):
             value = original(pid, deadline)
             return value + 1 if len(calls) > bump_after else value
         qualifier.read_generation = bumped
-    failure = None
+    failure, sources = None, []
     try:
-        receipt = qualifier.qualify(config, injected_factory(plan))
+        receipt = qualifier.qualify(config, injected_factory(plan, sources))
     except coordinator.CaptureError as error:
         failure, receipt = error, None
     surfaces = sorted(path.name for path in config.out_dir.glob('*.bin'))
@@ -231,6 +249,14 @@ def probe_case(directory, name):
             assert summary['cleanup'] == 'map ids absent with ENOENT', summary
         assert len(surfaces) == 9 and len(seeds) == 3, (surfaces, seeds)
         assert receipt.stat().st_mode & 0o777 == 0o600
+        assert_close_precedes_absence(sources, len(qualifier.CASES))
+    elif name == 'close_ordering':
+        # The cleanup close must precede the absence probe: the injected
+        # boundary reports a still-retained id as resolvable, so a probe that
+        # ran before `source.close()` cannot reach a cleanup pass.
+        assert failure is None, str(failure)
+        assert receipt is None, 'a single-case run published a receipt'
+        assert_close_precedes_absence(sources, 1)
     elif name == 'subset':
         assert failure is None, str(failure)
         assert receipt is None, 'a subset run published a receipt'
@@ -820,6 +846,10 @@ class TaskStorageCanaryTests(unittest.TestCase):
 
     def test_complete_run_publishes_one_receipt_injected(self):
         self.probe('complete', {'ready': ready_template(), 'ids': list(IDS)})
+
+    def test_absence_probe_runs_only_after_the_explicit_close_injected(self):
+        self.probe('close_ordering', {'ready': ready_template(), 'ids': list(IDS),
+                                      'cases': ['baseline']})
 
     def test_case_subset_publishes_no_receipt_injected(self):
         self.probe('subset', {'ready': ready_template(), 'ids': list(IDS),

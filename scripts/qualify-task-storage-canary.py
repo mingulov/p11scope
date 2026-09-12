@@ -114,8 +114,8 @@ def seed_bytes(case):
 
 
 def read_generation(pid, deadline):
-    """/proc/PID/stat field 22, through the accepted custody proc decoder."""
-    return custody._stat(pid, deadline)[0]
+    """/proc/PID/stat field 22, through the custody module's public seam."""
+    return custody.read_generation(pid, deadline)
 
 
 def validate_ready(document, pid, generation):

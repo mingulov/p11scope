@@ -673,6 +673,28 @@ class TaskStorageCanaryTests(unittest.TestCase):
             config.cases = ('baseline', 'early', 'late')
             qualifier.validate_config(config)
 
+    # ---- the public custody seam for proc generations ---------------------
+
+    def test_generation_reads_use_the_public_custody_seam(self):
+        """Same decoder, same refusals, no reach into the custody privates."""
+        pid, deadline = os.getpid(), time.monotonic() + 5
+        expected = custody._stat(pid, deadline)[0]
+        self.assertGreater(expected, 0)
+        self.assertEqual(custody.read_generation(pid, deadline), expected)
+        self.assertEqual(qualifier.read_generation(pid, deadline), expected)
+        tid = custody._tasks(pid, deadline)[0]
+        self.assertEqual(custody.read_generation(pid, deadline, tid), expected)
+        source = (ROOT / 'scripts/qualify-task-storage-canary.py').read_text()
+        self.assertNotIn('custody._', source, 'the qualifier reaches into custody privates')
+        for label, deadline_value in (('expired', time.monotonic() - 1),
+                                      ('nonfinite', float('inf'))):
+            with self.subTest(deadline=label):
+                with self.assertRaises(custody.CustodyError):
+                    custody.read_generation(pid, deadline_value)
+        with self.subTest(problem='unreadable-proc-path'):
+            with self.assertRaises(OSError):
+                custody.read_generation(1 << 30, time.monotonic() + 5)
+
     # ---- the rollback ledger over adopted handshake files -----------------
 
     def test_adopted_handshake_paths_roll_back_and_keep_their_ownership_check(self):

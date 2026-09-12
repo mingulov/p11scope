@@ -115,6 +115,17 @@ def _ready(fd):
     return bool(select.select([fd], [], [], 0)[0])
 
 
+def read_generation(pid, deadline, tid=None):
+    """Public seam for one process/thread generation: /proc stat field 22.
+
+    The same bounded decoder Group identity uses, so a caller outside this
+    module never needs its privates. Raises CustodyError for a nonfinite or
+    expired deadline, an oversized record or an identity that does not decode,
+    and propagates the OSError of an unreadable /proc path unchanged.
+    """
+    return _stat(pid, deadline, tid)[0]
+
+
 def check_owner_policy():
     """Validate original owner policy without mutation; return its signal mask.
 

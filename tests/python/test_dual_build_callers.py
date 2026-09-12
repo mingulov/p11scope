@@ -194,20 +194,50 @@ class DualBuildCallerTests(unittest.TestCase):
                                     and row["bpf_cargo"] == str(self.selected[2])
                                     and row["bpf_rustc"] == str(self.selected[3]) for row in builds))
 
+    def compiler_free_tripwires(self):
+        """The PATH tripwires a delegated `--self-test` may never reach.
+
+        The validator suites compile their own fixtures, so a real compiler is
+        part of the self-test and `gcc` is deliberately left resolvable; cargo,
+        the privilege escalator and the hardware tools are not, and
+        `dispatch.py` records any attempt to run one.
+        """
+        directory = self.base / "PATH tripwires without a compiler"
+        directory.mkdir()
+        shutil.copy2(FIXTURES / "dispatch.py", directory / "dispatch.py")
+        (directory / "dispatch.py").chmod(0o755)
+        for name in ("cargo", "softhsm2-util", "bpftool", "sudo", "rustup"):
+            (directory / name).symlink_to("dispatch.py")
+        return directory
+
     def test_self_test_fast_paths_remain_before_build_setup(self):
         # The claim is that `--self-test` returns before `product-build.sh` runs
-        # two `--release --workspace` builds, which take minutes; the timeout is
-        # only a coarse guard for it. The delegated validator suites grew with
-        # the canary matrix (60 evidence + 11 workload cases per width, each
-        # compiling fixtures and spawning subprocesses), so the original 20s sat
-        # under the observed cost on the slower supported guests and made this a
-        # timing tripwire rather than a build-setup check. The budget is set well
-        # clear of that cost and still far below any build.
+        # two `--release --workspace` builds. This file's own PATH tripwires are
+        # the check, not a clock: a self-test that reached build setup, sudo or
+        # a hardware tool leaves a recorded event behind, which is caught even
+        # when the stand-in returns instantly. The delegated validator suites
+        # grew with the canary matrix (60 evidence + 11 workload cases per
+        # width, each compiling fixtures and spawning subprocesses), so a
+        # budget under their cost on a slower supported guest had made this a
+        # timing tripwire rather than a build-setup check; the timeout below is
+        # only a hang guard, far above any observed self-test cost.
+        self.configure([0, 0, 0])
+        environment = dict(self.environment,
+                           PATH=f"{self.compiler_free_tripwires()}:/usr/bin:/bin")
         for child in CHILDREN:
-            result = subprocess.run(["sh", str(child), "--self-test"], cwd=ROOT,
-                                    text=True, stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE, timeout=120)
-            self.assertEqual(result.returncode, 0, result.stderr)
+            with self.subTest(child=child.name):
+                self.events.unlink(missing_ok=True)
+                result = subprocess.run(["sh", str(child), "--self-test"], cwd=ROOT,
+                                        env=environment, text=True,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                        timeout=900)
+                # The substantive check first: a recorded event names exactly
+                # which tool a fallen-through self-test reached.
+                self.assertFalse(
+                    self.events.exists(),
+                    f"{child.name} --self-test reached build setup or a resource tool: "
+                    f"{self.rows() if self.events.exists() else ''}")
+                self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":

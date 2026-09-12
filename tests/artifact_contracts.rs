@@ -2592,6 +2592,33 @@ fn subset_oracle_requires_independent_calls_and_clean_capture() {
 }
 
 #[test]
+fn subset_oracle_entry_paths_are_cwd_independent_in_both_invocation_modes() {
+    let output = Command::new("python3")
+        .args([
+            "-I",
+            "tests/python/test_subset_oracle.py",
+            "SubsetOracleTests.test_source_only_entry_is_cwd_independent_when_executed",
+            "SubsetOracleTests.test_source_only_entry_is_cwd_independent_when_sourced",
+        ])
+        .output()
+        .expect("run subset-oracle entry-path regressions");
+    assert!(
+        output.status.success(),
+        "subset-oracle entry-path regressions failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        report.contains("Ran 2 tests") && report.contains("OK"),
+        "subset-oracle entry-path regressions must run exactly two tests: {report}"
+    );
+}
+
+#[test]
 fn native_helper_suite_recorded_launcher_requires_authenticated_generations_and_bounded_cleanup() {
     run_native_python_suite(
         "tests/python/test_root_recorded_launcher.py",

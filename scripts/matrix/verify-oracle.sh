@@ -1,4 +1,8 @@
 #!/bin/sh
+if [ -n "${P11SCOPE_ORACLE_SOURCE_ONLY-}" ]; then
+    return 0 2>/dev/null || exit 0
+fi
+
 # Phase 4 Task 7: pkcs11-check oracle diff. Every other script in this repo
 # checks p11scope's capture against a workload WE wrote (spike/harness.c +
 # spike/expected.txt). This is the first check against an INDEPENDENT
@@ -870,9 +874,5 @@ oracle_body() {
     ORACLE_BODY_COMPLETE=1
     echo "=== oracle: ALL OK ==="
 }
-
-if [ -n "${P11SCOPE_ORACLE_SOURCE_ONLY-}" ]; then
-    return 0
-fi
 
 task4_receipt_run "$@"

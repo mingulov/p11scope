@@ -5977,7 +5977,7 @@ fn task_storage_canary_seed_lifecycle() {
         output.status.success(),
         "task-storage seed qualifier tests failed: {report}"
     );
-    assert_clean_python_suite(&report, "TaskStorageCanaryTests", 26);
+    assert_clean_python_suite(&report, "TaskStorageCanaryTests", 34);
 }
 
 #[test]

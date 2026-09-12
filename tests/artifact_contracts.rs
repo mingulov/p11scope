@@ -6278,7 +6278,7 @@ aggregate-only-metrics default metrics"
     // per class. This floor is that combined total, not a per-class count for
     // `TargetWidthPathTests` alone — keep the name and value paired so a
     // future reader can't mistake it for the latter.
-    const NATIVE_LANE_15_CLASS_AGGREGATE_FLOOR: usize = 60;
+    const NATIVE_LANE_15_CLASS_AGGREGATE_FLOOR: usize = 63;
     for bits in ["32", "64"] {
         let output = Command::new("timeout")
             .args([

@@ -1165,11 +1165,22 @@ def final_lane_artifacts(work, lane, surfaces, *, combined_log=False):
     paths.extend(map(Path, surfaces))
     manifest_path = work / f"mapdump_manifest_{lane}.json"
     paths.append(manifest_path)
+    manifest = read_json(manifest_path)
+    assert isinstance(manifest, list) and manifest, f"{lane}: empty owned manifest"
+    claim = manifest[0].get("snapshot") if isinstance(manifest[0], dict) else None
+    # The two owned-metrics lanes must claim a stopped snapshot; an inherited
+    # external lane may still carry a legacy Task 1/2 manifest that claims none.
     if combined_log:
-        manifest = read_json(manifest_path)
-        assert isinstance(manifest, list) and manifest, f"{lane}: empty owned manifest"
-        claim = manifest[0].get("snapshot")
         assert isinstance(claim, dict), f"{lane}: missing stopped snapshot claim"
+    if isinstance(claim, dict):
+        # A stopped receipt is a scanned privacy surface in EVERY lane, not just
+        # the two owned rows. Replaying a receipt semantically and scanning the
+        # lane's surface set says nothing about the receipt's own bytes, so a
+        # sentinel landing in one of the 10 external receipts used to escape the
+        # final scan outright. The path is taken from the manifest claim: the
+        # receipt is reached by being NAMED, never by walking the lane
+        # directory, which is what keeps this scanner tree-walk-free and the
+        # nested seed out-dir outside the scan surface (see verify-canaries.sh).
         receipt = Path(claim.get("receipt", ""))
         assert receipt.is_absolute(), f"{lane}: invalid stopped receipt path"
         paths.append(receipt)
@@ -2075,16 +2086,18 @@ def main(argv=None):
         ))
     artifacts.append(Path(work) / "mapdump_START_live.json")
     # Loader and pause identities, over every artifact surface: the capture
-    # documents, the trace streams, the observer/workload logs, the raw event
-    # dumps, and every map owned by the exact observer map ids (including the
-    # published copy of the private temporary START dump). Each surface is scanned
-    # the way a leak into it would actually look: a capture document structurally,
-    # because its allowlisted `rv_counts`/mechanism values legitimately spell
-    # narrow private constants; a trace with its two allowlisted call-event
-    # identity positions removed by shape, so a real PID cannot fire the scan and
-    # an identity anywhere else on the line still does; a map dump as the bytes it
-    # encodes, never as its `0x..` token text, whose two-hex-digit runs would match
-    # a narrow spelling in every clean dump.
+    # documents, the trace streams, the observer/workload logs, the raw event dumps,
+    # every map owned by the exact observer map ids (including the published copy of
+    # the private temporary START dump), and every lane's stopped receipt bytes --
+    # all 12 of them, not just the two owned rows, because a semantic receipt replay
+    # never reads the receipt's own bytes. Each surface is scanned the way a leak
+    # into it would actually look: a capture document structurally, because its
+    # allowlisted `rv_counts`/mechanism values legitimately spell narrow private
+    # constants; a trace with its two allowlisted call-event identity positions
+    # removed by shape, so a real PID cannot fire the scan and an identity anywhere
+    # else on the line still does; a map dump as the bytes it encodes, never as its
+    # `0x..` token text, whose two-hex-digit runs would match a narrow spelling in
+    # every clean dump.
     assert_final_artifact_privacy(artifacts)
 
     safe_lanes = (set(lanes) - {"feature-unsafe-profile", "feature-unsafe-trace"}) | {

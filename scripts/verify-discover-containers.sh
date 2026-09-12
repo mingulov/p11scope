@@ -15,11 +15,21 @@ cd "$(dirname "$0")/.."
 
 ORACLE=scripts/fixtures/discover-manifest.jq
 SOFTHSM_FUNCTION_RECORDS=68
-# Official registry index digests acquired on 2026-09-08. Retain Rust 1.88
-# and Ubuntu 24.04; changing a tag must not silently change the build inputs.
+# Official registry index digests acquired on 2026-09-08, with their exact
+# linux/amd64 platform manifests resolved on 2026-09-12. Retain Rust 1.88 and
+# Ubuntu 24.04; changing a tag, index or selected platform must not silently
+# change the qualification inputs.
 DISCOVER_GLIBC_BUILD_IMAGE=rust:1.88.0-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0
+DISCOVER_GLIBC_BUILD_PLATFORM_IMAGE=rust:1.88.0-bookworm@sha256:4727898c104ecd2e22d780925832502faee9fe4e70581b8572af081370b315a0
 DISCOVER_GLIBC_RUN_IMAGE=ubuntu:noble-20260810@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517
+DISCOVER_GLIBC_RUN_PLATFORM_IMAGE=ubuntu:noble-20260810@sha256:1e0a86e57d247923571b75e0aaf48a1449cf8c543d51fb3e07a4a7d7bfa79316
 DISCOVER_MUSL_IMAGE=rust:1.88.0-alpine@sha256:9dfaae478ecd298b6b5a039e1f2cc4fc040fc818a2de9aa78fa714dea036574d
+DISCOVER_MUSL_PLATFORM_IMAGE=rust:1.88.0-alpine@sha256:b18203be0f58e16fe47250bf98bbe83c61bbfa97a0f5a94cebf34605bb000137
+# Ubuntu 24.04's signed snapshot service freezes the complete apt dependency
+# closure. Alpine has no equivalent archive snapshot, so every requested v3.22
+# package is exact-versioned and restricted to the official main repository.
+UBUNTU_APT_SNAPSHOT=20260810T000000Z
+ALPINE_MAIN_REPOSITORY=https://dl-cdn.alpinelinux.org/alpine/v3.22/main
 
 # Both container lanes assert the same two things: SoftHSM2 publishes exactly
 # 68 function records, and the deterministic version-matrix manifest satisfies
@@ -30,14 +40,189 @@ self_test() {
     command -v jq >/dev/null || { echo "jq required"; exit 1; }
     st_work=$(mktemp -d "${TMPDIR:-/tmp}/p11scope-discover-selftest-XXXXXX")
     trap 'rm -rf "$st_work"' EXIT INT TERM
-    python3 -I - "$st_work" "$ORACLE" "$SOFTHSM_FUNCTION_RECORDS" <<'PY'
+    python3 -I - "$st_work" "$ORACLE" "$SOFTHSM_FUNCTION_RECORDS" "$0" \
+        scripts/matrix/Dockerfile <<'PY'
 import copy
 import json
 from pathlib import Path
+import re
+import shlex
 import subprocess
 import sys
 
 work, oracle, records = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+script_path, matrix_path = Path(sys.argv[4]), Path(sys.argv[5])
+
+EXPECTED_PINS = (
+    "DISCOVER_GLIBC_BUILD_IMAGE=rust:1.88.0-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0",
+    "DISCOVER_GLIBC_BUILD_PLATFORM_IMAGE=rust:1.88.0-bookworm@sha256:4727898c104ecd2e22d780925832502faee9fe4e70581b8572af081370b315a0",
+    "DISCOVER_GLIBC_RUN_IMAGE=ubuntu:noble-20260810@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517",
+    "DISCOVER_GLIBC_RUN_PLATFORM_IMAGE=ubuntu:noble-20260810@sha256:1e0a86e57d247923571b75e0aaf48a1449cf8c543d51fb3e07a4a7d7bfa79316",
+    "DISCOVER_MUSL_IMAGE=rust:1.88.0-alpine@sha256:9dfaae478ecd298b6b5a039e1f2cc4fc040fc818a2de9aa78fa714dea036574d",
+    "DISCOVER_MUSL_PLATFORM_IMAGE=rust:1.88.0-alpine@sha256:b18203be0f58e16fe47250bf98bbe83c61bbfa97a0f5a94cebf34605bb000137",
+    "UBUNTU_APT_SNAPSHOT=20260810T000000Z",
+    "ALPINE_MAIN_REPOSITORY=https://dl-cdn.alpinelinux.org/alpine/v3.22/main",
+)
+EXPECTED_APK_PACKAGES = (
+    "musl=1.2.5-r12",
+    "musl-dev=1.2.5-r12",
+    "gcc=14.2.0-r6",
+    "softhsm=2.6.1-r6",
+    "sqlite=3.49.2-r1",
+    "sqlite-libs=3.49.2-r1",
+    "readline=8.2.13-r1",
+    "libncursesw=6.5_p20250503-r0",
+    "ncurses-terminfo-base=6.5_p20250503-r0",
+    "file=5.46-r2",
+    "libmagic=5.46-r2",
+    "jq=1.8.2-r0",
+    "oniguruma=6.9.10-r0",
+    "setpriv=2.41.6-r1",
+    "libcap-ng=0.8.5-r0",
+)
+MATRIX_FROM = (
+    "FROM ubuntu:noble-20260810@sha256:"
+    "1e0a86e57d247923571b75e0aaf48a1449cf8c543d51fb3e07a4a7d7bfa79316"
+)
+
+
+def check_container_pins(script, matrix):
+    try:
+        production = script.split("\nPY\n", 1)[1].replace("\\\n", " ")
+        declarations = script.split("    python3 -I -", 1)[0]
+    except IndexError as error:
+        raise ValueError("cannot isolate production shell after self-test heredoc") from error
+    contract_source = declarations + production
+    normalized_matrix = matrix.replace("\\\n", " ")
+
+    for pin in EXPECTED_PINS:
+        if contract_source.count(pin) != 1:
+            raise ValueError(f"missing or duplicated pin: {pin}")
+    for package in EXPECTED_APK_PACKAGES:
+        if production.count(package) != 1:
+            raise ValueError(f"missing or duplicated Alpine package pin: {package}")
+    matrix_froms = [
+        line.strip() for line in matrix.splitlines()
+        if line.lstrip().startswith("FROM ")
+    ]
+    if matrix_froms != [MATRIX_FROM]:
+        raise ValueError("matrix base is not the approved linux/amd64 manifest")
+    if "ARG UBUNTU_APT_SNAPSHOT=20260810T000000Z" not in matrix:
+        raise ValueError("matrix apt snapshot is absent")
+    if re.search(r"\bapt-get\s+(?:update|install)\b", production + normalized_matrix):
+        raise ValueError("live apt operation lacks an intervening snapshot selector")
+    if not re.search(
+        r'--no-deps\s+--repositories-file\s+/dev/null\s+'
+        r'--repository\s+"\$ALPINE_MAIN_REPOSITORY"\s+add\b',
+        production,
+    ):
+        raise ValueError("Alpine package origin or dependency closure is not exclusive")
+    apk_lines = [
+        line.strip() for line in production.splitlines()
+        if line.lstrip().startswith("apk ")
+    ]
+    if len(apk_lines) != 1:
+        raise ValueError("expected exactly one Alpine package install")
+    apk_words = shlex.split(apk_lines[0])
+    try:
+        add_index = apk_words.index("add")
+    except ValueError as error:
+        raise ValueError("Alpine package install lacks add operation") from error
+    apk_packages = tuple(
+        word for word in apk_words[add_index + 1:]
+        if not word.startswith("-")
+    )
+    for package in apk_packages:
+        if "=" not in package:
+            raise ValueError(f"Alpine package is not exact-versioned: {package}")
+    if apk_packages != EXPECTED_APK_PACKAGES:
+        raise ValueError("Alpine package set differs from the approved closure")
+    if "verify_platform_manifest \"$DISCOVER_GLIBC_BUILD_IMAGE\" \"$DISCOVER_GLIBC_BUILD_PLATFORM_IMAGE\"" not in production:
+        raise ValueError("glibc build index-to-platform verification is absent")
+    if "verify_platform_manifest \"$DISCOVER_GLIBC_RUN_IMAGE\" \"$DISCOVER_GLIBC_RUN_PLATFORM_IMAGE\"" not in production:
+        raise ValueError("glibc run index-to-platform verification is absent")
+    if "verify_platform_manifest \"$DISCOVER_MUSL_IMAGE\" \"$DISCOVER_MUSL_PLATFORM_IMAGE\"" not in production:
+        raise ValueError("musl index-to-platform verification is absent")
+
+
+script_source = script_path.read_text()
+matrix_source = matrix_path.read_text()
+check_container_pins(script_source, matrix_source)
+
+
+def mutate_production(source, old, new):
+    before, production = source.split("\nPY\n", 1)
+    if old not in production:
+        raise SystemExit(f"self-test mutation target absent: {old}")
+    return before + "\nPY\n" + production.replace(old, new, 1)
+
+
+pin_mutations = (
+    (
+        "mutable matrix base",
+        script_source,
+        matrix_source.replace(MATRIX_FROM, "FROM ubuntu:24.04"),
+    ),
+    (
+        "live apt",
+        mutate_production(
+            script_source,
+            'apt-get -S "$UBUNTU_APT_SNAPSHOT" update',
+            "apt-get update",
+        ),
+        matrix_source,
+    ),
+    (
+        "live matrix apt",
+        script_source,
+        matrix_source.replace(
+            'apt-get -S "$UBUNTU_APT_SNAPSHOT" update',
+            "apt-get update",
+            1,
+        ),
+    ),
+    (
+        "unpinned Alpine package",
+        mutate_production(script_source, "musl-dev=1.2.5-r12", "musl-dev"),
+        matrix_source,
+    ),
+    (
+        "new unpinned Alpine package",
+        mutate_production(
+            script_source,
+            "setpriv=2.41.6-r1 libcap-ng=0.8.5-r0",
+            "setpriv=2.41.6-r1 libcap-ng=0.8.5-r0 curl",
+        ),
+        matrix_source,
+    ),
+    (
+        "implicit Alpine dependency resolution",
+        mutate_production(script_source, "--no-deps ", ""),
+        matrix_source,
+    ),
+    (
+        "added mutable matrix stage",
+        script_source,
+        matrix_source + "\nFROM ubuntu:24.04\n",
+    ),
+    (
+        "wrong linux platform manifest",
+        script_source.replace(
+            "b18203be0f58e16fe47250bf98bbe83c61bbfa97a0f5a94cebf34605bb000137",
+            "4cd7a3f9ccccbdf1825d14a015a30ac19bf8b959ec3d18aa5da8e6a17ce7ec70",
+            1,
+        ),
+        matrix_source,
+    ),
+)
+for label, mutated_script, mutated_matrix in pin_mutations:
+    try:
+        check_container_pins(mutated_script, mutated_matrix)
+    except ValueError as error:
+        print(f"container pin mutation rejected: {label}: {error}")
+    else:
+        raise SystemExit(f"container pin mutation accepted: {label}")
+print(f"container pin mutations rejected: OK ({len(pin_mutations)} lanes)")
 
 
 def surface(major, minor, count, name=None, error=None):
@@ -263,9 +448,36 @@ create_owned() {
     printf '%s\n' "$owned"
 }
 
-timeout --signal=TERM --kill-after=5s 300s docker pull -q "$DISCOVER_GLIBC_RUN_IMAGE"
-timeout --signal=TERM --kill-after=5s 300s docker pull -q "$DISCOVER_GLIBC_BUILD_IMAGE"
-timeout --signal=TERM --kill-after=5s 300s docker pull -q "$DISCOVER_MUSL_IMAGE"
+# Keep the existing index pins as supply-chain identities, and independently
+# refuse if any no longer selects the recorded linux/amd64 manifest. Runtime
+# pulls and creates then use the platform manifest itself, not host selection.
+verify_platform_manifest() {
+    index=$1
+    platform_image=$2
+    expected_digest=${platform_image##*@}
+    resolved_digest=$(timeout --signal=TERM --kill-after=5s 60s \
+        docker manifest inspect "$index" | jq -r '
+            [.manifests[]
+             | select(.platform.os == "linux"
+                      and .platform.architecture == "amd64"
+                      and (.platform.variant // "") == "")
+             | .digest]
+            | if length == 1 then .[0] else empty end')
+    [ "$resolved_digest" = "$expected_digest" ] || {
+        echo "linux/amd64 platform manifest mismatch for $index" >&2
+        exit 1
+    }
+}
+verify_platform_manifest "$DISCOVER_GLIBC_BUILD_IMAGE" "$DISCOVER_GLIBC_BUILD_PLATFORM_IMAGE"
+verify_platform_manifest "$DISCOVER_GLIBC_RUN_IMAGE" "$DISCOVER_GLIBC_RUN_PLATFORM_IMAGE"
+verify_platform_manifest "$DISCOVER_MUSL_IMAGE" "$DISCOVER_MUSL_PLATFORM_IMAGE"
+
+timeout --signal=TERM --kill-after=5s 300s docker pull --platform linux/amd64 -q \
+    "$DISCOVER_GLIBC_RUN_PLATFORM_IMAGE"
+timeout --signal=TERM --kill-after=5s 300s docker pull --platform linux/amd64 -q \
+    "$DISCOVER_GLIBC_BUILD_PLATFORM_IMAGE"
+timeout --signal=TERM --kill-after=5s 300s docker pull --platform linux/amd64 -q \
+    "$DISCOVER_MUSL_PLATFORM_IMAGE"
 
 # Vendored so container builds need no network (sandbox git quirks).
 # The vendor config is rewritten with absolute /src paths because it is
@@ -277,19 +489,22 @@ RUSTC="$LANE14_STABLE_RUSTC" timeout --signal=TERM --kill-after=5s 600s \
 sed 's|directory = ".*"|directory = "/receipt/vendor/src"|' \
     "$DISCOVER_WORK/vendor/config.toml" > "$DISCOVER_WORK/vendor/config.container.toml"
 
-echo "=== glibc: build in $DISCOVER_GLIBC_BUILD_IMAGE, run in $DISCOVER_GLIBC_RUN_IMAGE ==="
+echo "=== glibc: build in $DISCOVER_GLIBC_BUILD_PLATFORM_IMAGE, run in $DISCOVER_GLIBC_RUN_PLATFORM_IMAGE ==="
 GLIBC_BUILD_ID=$(create_owned --name "$GLIBC_BUILD" \
-    -v "$PWD:/src:ro" -v "$DISCOVER_WORK:/receipt" -w /src "$DISCOVER_GLIBC_BUILD_IMAGE" sh -ec '
+    --platform linux/amd64 -v "$PWD:/src:ro" -v "$DISCOVER_WORK:/receipt" -w /src \
+    "$DISCOVER_GLIBC_BUILD_PLATFORM_IMAGE" sh -ec '
   export CARGO_HOME=/tmp/cargo
   mkdir -p /tmp/cargo && cp /receipt/vendor/config.container.toml /tmp/cargo/config.toml
   cargo build --locked --release -p p11scope-discover --offline --target-dir /receipt/glibc-build')
 printf 'container_glibc_build\t%s\n' "$GLIBC_BUILD_ID" >> "$LANE14_FACTS"
 timeout --signal=TERM --kill-after=5s 600s docker start -a "$GLIBC_BUILD_ID"
 GLIBC_RUN_ID=$(create_owned --name "$GLIBC_RUN" \
+    --platform linux/amd64 -e UBUNTU_APT_SNAPSHOT="$UBUNTU_APT_SNAPSHOT" \
     -v "$PWD:/src:ro" \
     -v "$DISCOVER_WORK/glibc-build/release/p11scope-discover:/usr/local/bin/p11scope-discover:ro" \
-    "$DISCOVER_GLIBC_RUN_IMAGE" sh -ec '
-  apt-get update -q >/dev/null && apt-get install -qy gcc jq softhsm2 util-linux >/dev/null
+    "$DISCOVER_GLIBC_RUN_PLATFORM_IMAGE" sh -ec '
+  apt-get -S "$UBUNTU_APT_SNAPSHOT" update -q >/dev/null
+  apt-get -S "$UBUNTU_APT_SNAPSHOT" install -qy gcc jq softhsm2 util-linux >/dev/null
   run_discover() {
     setpriv --reuid=65534 --regid=65534 --clear-groups --no-new-privs \
       p11scope-discover "$@"
@@ -305,10 +520,19 @@ GLIBC_RUN_ID=$(create_owned --name "$GLIBC_RUN" \
 printf 'container_glibc_run\t%s\n' "$GLIBC_RUN_ID" >> "$LANE14_FACTS"
 timeout --signal=TERM --kill-after=5s 300s docker start -a "$GLIBC_RUN_ID"
 
-echo "=== musl-dynamic: build + run in $DISCOVER_MUSL_IMAGE ==="
+echo "=== musl-dynamic: build + run in $DISCOVER_MUSL_PLATFORM_IMAGE ==="
 MUSL_BUILD_ID=$(create_owned --name "$MUSL_BUILD" \
-    -v "$PWD:/src:ro" -v "$DISCOVER_WORK:/receipt" -w /src "$DISCOVER_MUSL_IMAGE" sh -ec '
-  apk add -q musl-dev gcc softhsm file jq util-linux
+    --platform linux/amd64 -e ALPINE_MAIN_REPOSITORY="$ALPINE_MAIN_REPOSITORY" \
+    -v "$PWD:/src:ro" -v "$DISCOVER_WORK:/receipt" -w /src \
+    "$DISCOVER_MUSL_PLATFORM_IMAGE" sh -ec '
+  apk --no-cache --no-deps --repositories-file /dev/null \
+      --repository "$ALPINE_MAIN_REPOSITORY" add -q \
+      musl=1.2.5-r12 musl-dev=1.2.5-r12 gcc=14.2.0-r6 \
+      softhsm=2.6.1-r6 sqlite=3.49.2-r1 sqlite-libs=3.49.2-r1 \
+      readline=8.2.13-r1 libncursesw=6.5_p20250503-r0 \
+      ncurses-terminfo-base=6.5_p20250503-r0 \
+      file=5.46-r2 libmagic=5.46-r2 jq=1.8.2-r0 oniguruma=6.9.10-r0 \
+      setpriv=2.41.6-r1 libcap-ng=0.8.5-r0
   export CARGO_HOME=/tmp/cargo
   mkdir -p /tmp/cargo && cp /receipt/vendor/config.container.toml /tmp/cargo/config.toml
   export RUSTFLAGS="-C target-feature=-crt-static"

@@ -348,7 +348,12 @@ class TaskStorageCanaryTests(unittest.TestCase):
                                 text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len([line for line in result.stdout.splitlines()
-                              if line.endswith(': OK')]), 4, result.stdout)
+                              if line.endswith(': OK')]), 5, result.stdout)
+        # The identity/release case owns the one expected stderr diagnostic.
+        self.assertEqual([line for line in result.stderr.splitlines()
+                          if 'timed out waiting for RELEASE' in line],
+                         ['task-storage-canary: timed out waiting for RELEASE'],
+                         result.stderr)
 
     def test_fixture_refuses_wrong_argument_counts(self):
         with tempfile.TemporaryDirectory() as directory:

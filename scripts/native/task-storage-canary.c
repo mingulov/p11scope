@@ -446,20 +446,31 @@ static int read_roster(uint32_t pid, struct identity *tasks, size_t limit, size_
     return failed ? -1 : 0;
 }
 
-static int read_identity(struct identity *identity, struct identity *tasks, size_t limit,
-                         size_t *count)
+/* The roster source is a seam so the single-task guard below is testable
+ * without a second thread: the self-test injects rosters this task cannot
+ * produce. Production always passes read_roster. */
+typedef int (*roster_fn)(uint32_t, struct identity *, size_t, size_t *);
+
+static int read_identity_from(roster_fn roster, struct identity *identity,
+                              struct identity *tasks, size_t limit, size_t *count)
 {
     identity->pid = (uint32_t)getpid();
     identity->tid = (uint32_t)syscall(SYS_gettid);
     if (!identity->pid || !identity->tid ||
         read_generation("/proc/self/stat", &identity->generation))
         return -1;
-    if (read_roster(identity->pid, tasks, limit, count))
+    if (roster(identity->pid, tasks, limit, count))
         return -1;
     if (*count != 1 || tasks[0].tid != identity->tid ||
         tasks[0].generation != identity->generation)
         return -1;
     return 0;
+}
+
+static int read_identity(struct identity *identity, struct identity *tasks, size_t limit,
+                         size_t *count)
+{
+    return read_identity_from(read_roster, identity, tasks, limit, count);
 }
 
 static int render_ready(char *output, size_t capacity, const struct identity *identity,
@@ -853,6 +864,43 @@ static int fake_publish(const char *destination, const char *label, const char *
     return lifecycle.publish_failure ? 1 : 0;
 }
 
+enum {
+    ROSTER_EXACT = 0, ROSTER_EMPTY, ROSTER_TWO_TASKS, ROSTER_OTHER_TID,
+    ROSTER_OTHER_GENERATION, ROSTER_FAILS, ROSTER_VARIANTS,
+};
+
+static struct {
+    struct identity truth;
+    int variant;
+    int calls;
+} roster_plan;
+
+/* Rosters a single-threaded fixture cannot produce for itself. Only the exact
+ * variant is faithful; every other one must be refused by the guard. */
+static int fake_roster(uint32_t pid, struct identity *tasks, size_t limit, size_t *count)
+{
+    roster_plan.calls++;
+    if (!tasks || limit < 2 || pid != roster_plan.truth.pid)
+        return -1;
+    *count = 0;
+    if (roster_plan.variant == ROSTER_FAILS)
+        return -1;
+    if (roster_plan.variant == ROSTER_EMPTY)
+        return 0;
+    tasks[0] = roster_plan.truth;
+    *count = 1;
+    if (roster_plan.variant == ROSTER_OTHER_TID)
+        tasks[0].tid++;
+    else if (roster_plan.variant == ROSTER_OTHER_GENERATION)
+        tasks[0].generation++;
+    else if (roster_plan.variant == ROSTER_TWO_TASKS) {
+        tasks[1] = roster_plan.truth;
+        tasks[1].tid++;
+        *count = 2;
+    }
+    return 0;
+}
+
 static void reset_lifecycle(struct map_spec specs[MAP_COUNT], const unsigned char *seed)
 {
     size_t index;
@@ -1041,6 +1089,72 @@ static int ready_document_self_test(void)
     return 0;
 }
 
+/* The identity guard and the RELEASE wait, both unprivileged: no BPF map, no
+ * second thread and no writable directory are involved. */
+static int identity_release_self_test(void)
+{
+    static const char present[] = "/proc/self/stat";
+    static const char absent[] = "/proc/self/p11scope-release-never-created";
+    static const uint32_t budget_ms = 30;
+    struct identity identity;
+    struct identity tasks[TASK_LIMIT];
+    size_t count = 0;
+    uint64_t start, elapsed;
+    int variant;
+
+    memset(&identity, 0, sizeof(identity));
+    memset(tasks, 0, sizeof(tasks));
+    /* This process is single-threaded, so the real roster must be accepted. */
+    if (read_identity(&identity, tasks, TASK_LIMIT, &count))
+        return fail("self-test rejected its own single-task identity");
+    if (count != 1 || !identity.pid || identity.tid != identity.pid || !identity.generation ||
+        tasks[0].pid != identity.pid || tasks[0].tid != identity.tid ||
+        tasks[0].generation != identity.generation)
+        return fail("self-test single-task roster is not the running task");
+    roster_plan.truth = identity;
+    for (variant = 0; variant < ROSTER_VARIANTS; variant++) {
+        struct identity probe;
+        struct identity roster[TASK_LIMIT];
+        size_t probed = 0;
+        int refused;
+        memset(&probe, 0, sizeof(probe));
+        memset(roster, 0, sizeof(roster));
+        roster_plan.variant = variant;
+        roster_plan.calls = 0;
+        refused = read_identity_from(fake_roster, &probe, roster, TASK_LIMIT, &probed) != 0;
+        if (roster_plan.calls != 1)
+            return fail("self-test roster seam was not consulted exactly once");
+        if (variant == ROSTER_EXACT) {
+            if (refused || probed != 1 || probe.pid != identity.pid ||
+                probe.tid != identity.tid || probe.generation != identity.generation)
+                return fail("self-test rejected the exact injected single-task roster");
+        } else if (!refused) {
+            return fail("self-test accepted a roster that is not this one task");
+        }
+    }
+
+    start = monotonic_millis();
+    if (start == UINT64_MAX)
+        return fail("self-test cannot read the monotonic clock");
+    if (wait_for_release(present, budget_ms))
+        return fail("self-test refused an existing RELEASE path");
+    elapsed = monotonic_millis() - start;
+    if (elapsed >= 1000)
+        return fail("self-test waited on an already existing RELEASE path");
+    /* The expiry below is the tested branch, so its diagnostic is expected. */
+    fputs("task-storage-canary: the RELEASE timeout below is the self-test's own\n", stderr);
+    start = monotonic_millis();
+    if (!wait_for_release(absent, budget_ms))
+        return fail("self-test accepted an expired RELEASE deadline as a pass");
+    elapsed = monotonic_millis() - start;
+    if (elapsed < budget_ms)
+        return fail("self-test abandoned the RELEASE wait before its deadline");
+    if (elapsed >= 5000)
+        return fail("self-test RELEASE wait overran its deadline");
+    puts("task-storage-canary identity and release self-test: OK");
+    return 0;
+}
+
 static int check_counters(const char *label, int expect_dup, int expect_update,
                           int expect_publish, int expect_close)
 {
@@ -1174,7 +1288,7 @@ static int lifecycle_self_test(void)
 static int self_test(void)
 {
     if (exact_map_self_test() || seed_layout_self_test() || ready_document_self_test() ||
-        lifecycle_self_test())
+        identity_release_self_test() || lifecycle_self_test())
         return 1;
     return 0;
 }

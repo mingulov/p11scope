@@ -1579,6 +1579,8 @@ fn pin_scanned_object(
             before.size, limits.per_object_bytes,
         ));
     }
+    #[cfg(test)]
+    tests::run_before_hash_test_hook();
     let mut operation_bytes = 0u64;
     let inspected = inspect_file_with_reader(&file, |file, bytes, offset| {
         if let Some(reason) = budget.check_deadline_now() {
@@ -1711,6 +1713,37 @@ mod tests {
         Acquisition, FunctionRecord, ObjectRecord, ProvenanceObject, SurfaceRecord, SurfaceSource,
         Version, WalkOutcome,
     };
+    use std::cell::RefCell;
+
+    thread_local! {
+        static BEFORE_HASH_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    struct BeforeHashHookGuard;
+
+    impl BeforeHashHookGuard {
+        fn install(hook: impl FnOnce() + 'static) -> Self {
+            BEFORE_HASH_HOOK.with(|slot| {
+                assert!(slot.borrow_mut().replace(Box::new(hook)).is_none());
+            });
+            Self
+        }
+    }
+
+    impl Drop for BeforeHashHookGuard {
+        fn drop(&mut self) {
+            BEFORE_HASH_HOOK.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+
+    pub(super) fn run_before_hash_test_hook() {
+        let hook = BEFORE_HASH_HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
 
     fn set_pin_abi(pins: &mut PinnedObjects, key: ObjectKey, abi: ElfAbi) {
         let entry = pins
@@ -1762,6 +1795,57 @@ mod tests {
         let (opened, key) = open_view_object(&view, path, &mut CaptureWorkBudget::default())
             .expect("the same caller accepts the EOF-proven complete table");
         assert_eq!(key, object_key(identity_of(&opened).unwrap()));
+    }
+
+    #[test]
+    fn a_scan_object_changed_after_pinning_is_not_accepted() {
+        use crate::discovery::scan::ScannedModule;
+        use std::io::Write as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("changed-after-pin.so");
+        std::fs::copy("/bin/sh", &path).unwrap();
+        let file = open_object(&path).unwrap();
+        let mapping = mapping_file_key(&file).unwrap();
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let module = ScannedModule {
+            view: view.id(),
+            mount_namespace: view.mount_namespace(),
+            key: ObjectKey {
+                device: Device {
+                    major: mapping.device_major,
+                    minor: mapping.device_minor,
+                },
+                inode: mapping.inode,
+            },
+            path: path.display().to_string(),
+            decoder_abi: None,
+            exports: Vec::new(),
+            tables: Vec::new(),
+            interfaces: Vec::new(),
+        };
+        let changed_path = path.clone();
+        let _hook = BeforeHashHookGuard::install(move || {
+            let mut changed = std::fs::OpenOptions::new()
+                .append(true)
+                .open(changed_path)
+                .unwrap();
+            changed.write_all(&[0]).unwrap();
+        });
+
+        let (pinned, skipped) = pin_scanned_view_objects(
+            &view,
+            std::slice::from_ref(&module),
+            &mut CaptureWorkBudget::default(),
+        )
+        .unwrap();
+
+        assert_eq!(pinned.pinned().count(), 0, "a changed hash has no pin");
+        assert_eq!(skipped.len(), 1, "the changed object is reported once");
+        assert_eq!(
+            skipped[0].reason,
+            "file changed while it was being identified — retry"
+        );
     }
 
     #[test]

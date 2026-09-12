@@ -296,6 +296,7 @@ pub fn hex(bytes: &[u8]) -> String {
 #[cfg(all(test, feature = "identify"))]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     #[test]
     fn retained_process_view_mount_table_controls_the_mapping_device() {
@@ -320,5 +321,28 @@ mod tests {
             mapping_file_key_in_mountinfo(&file, "999999 1 8:1 / /other rw - ext4 /dev/other rw\n")
                 .expect_err("an absent view-local mount ID must remain incomparable");
         assert!(error.contains("is missing from the mount table"), "{error}");
+    }
+
+    #[test]
+    fn an_early_zero_read_is_rejected_as_a_short_read() {
+        let file = open_object(Path::new("/bin/sh")).unwrap();
+        let len = file.metadata().unwrap().len();
+        let calls = Cell::new(0);
+        let result = read_object_bytes_with(&file, |_, bytes, _| {
+            let call = calls.get();
+            calls.set(call + 1);
+            if call == 0 { Ok(0) } else { Ok(bytes.len()) }
+        });
+
+        assert_eq!(calls.get(), 1, "the short-read guard stops before a retry");
+        let expected = format!("short read: 0 of {len} bytes");
+        assert!(
+            matches!(&result, Err(error) if error == &expected),
+            "expected {expected:?}, got {}",
+            match &result {
+                Ok(bytes) => format!("Ok({} bytes)", bytes.len()),
+                Err(error) => format!("Err({error})"),
+            }
+        );
     }
 }

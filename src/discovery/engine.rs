@@ -12492,7 +12492,7 @@ pub(crate) mod tests {
         view_pin as overlay_view_pin,
     };
     use crate::discovery::identity::{
-        ManifestPinError, ManifestStaleReason, PinnedObjectId, ReconciledModule,
+        ManifestPinError, ManifestStaleReason, PinnedObjectId, ReconciledModule, open_view_object,
         pin_manifest_objects, pin_manifest_objects_deferred, pin_scanned_objects,
         reconcile_scanned_modules,
     };
@@ -15343,6 +15343,18 @@ pub(crate) mod tests {
             .unwrap();
         let loader_subject = locator.authority.loader_path.display().to_string();
         let locator_bytes = sizing_budget.attempted_io_bytes();
+        let loader_target_path = PathBuf::from(format!(
+            "/proc/{pid}/root{}",
+            locator.authority.loader_path.display()
+        ));
+        let mut mount_budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes,
+            total_bytes: u64::MAX,
+        });
+        open_view_object(&view, &loader_target_path, &mut mount_budget).unwrap();
+        let hash_start = locator_bytes
+            .checked_add(mount_budget.attempted_io_bytes())
+            .unwrap();
         let loader_module = mapped_object(
             &view,
             &locator.authority.loader_maps[0],
@@ -15383,6 +15395,10 @@ pub(crate) mod tests {
         assert!(
             locator_bytes < candidate_bytes && candidate_bytes < revalidation_bytes,
             "L={locator_bytes} C={candidate_bytes} R={revalidation_bytes}"
+        );
+        assert!(
+            locator_bytes < hash_start && hash_start < candidate_bytes,
+            "the calibration must place the hash between L={locator_bytes} and C={candidate_bytes}; H={hash_start}"
         );
 
         let arm = |total_bytes| {
@@ -15451,6 +15467,20 @@ pub(crate) mod tests {
                 .is_empty()
         );
         assert_named_io_cause(&snapshot_engine);
+
+        let hash_cut = hash_start.checked_add(1).unwrap();
+        let (hash_engine, hash_pending, hash_session, hash_result) = arm(hash_cut);
+        assert!(!hash_result.unwrap());
+        assert_eq!(hash_session.dynamic_loader_attach_calls, 0);
+        assert_eq!(hash_engine.budget.attempted_io_bytes(), hash_cut);
+        assert_eq!(hash_pending.get(&ProcessViewId(0)), None);
+        assert!(
+            hash_engine
+                .loader_registry
+                .ids_for_view(ProcessViewId(0))
+                .is_empty()
+        );
+        assert_named_io_cause(&hash_engine);
 
         let (pre_engine, pre_pending, pre_session, pre_result) = arm(candidate_bytes);
         assert!(!pre_result.unwrap());

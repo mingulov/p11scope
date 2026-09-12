@@ -457,6 +457,19 @@ class AcquisitionFiles:
                 os.close(fd)
         self.total += len(raw)
 
+    def adopt(self, path):
+        """Ledger a path this acquisition created outside write().
+
+        Handshake and log files are created by the fixture or by a bare
+        `O_EXCL` open, so they never reach the ledger through write(); without
+        an entry a rolled-back run leaves them behind and a later run refuses
+        its own destinations. Ownership is recorded the same way, so rollback
+        still refuses to unlink a path that is no longer the file we created.
+        """
+        identity = Path(path).lstat()
+        require(stat.S_ISREG(identity.st_mode), 'adopted acquisition file is not regular')
+        self.owned.append((Path(path), identity.st_dev, identity.st_ino))
+
     def publish(self, staged, destination):
         identity = staged.stat()
         os.link(staged, destination, follow_symlinks=False)
@@ -493,9 +506,13 @@ def create_control(path, created=None):
     # GO and FINISH are handshake/diagnostic files, not published BPF evidence.
     # Keep them available for the shell's still-owned workload on failure.
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    if created is not None:
-        created()
-    os.close(fd)
+    try:
+        # The hook records ownership between creation and close; a raising hook
+        # must not leak the descriptor it was handed the path for.
+        if created is not None:
+            created()
+    finally:
+        os.close(fd)
 
 
 class CoordinatorSignals:

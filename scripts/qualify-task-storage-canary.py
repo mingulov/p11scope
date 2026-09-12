@@ -440,6 +440,9 @@ class Qualifier:
         try:
             fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
             try:
+                # Ledger the log before it is wrapped: rollback owns every
+                # path this case creates, not only the written evidence.
+                self.files.adopt(log_path)
                 log = os.fdopen(fd, 'wb')
             except BaseException:
                 os.close(fd)
@@ -477,6 +480,8 @@ class Qualifier:
             # A fixture exit before READY is a failure here, never a retry.
             group.snapshot(deadline)
             time.sleep(min(.005, remaining(deadline)))
+        # The fixture created READY, so the ledger adopts it before it is read.
+        self.files.adopt(ready)
         group.snapshot(deadline)
         self.check(f'{case}-ready-document', deadline)
         document = coordinator.read_json(ready, READY_BOUND, deadline=deadline)
@@ -516,7 +521,7 @@ class Qualifier:
         resume = time.monotonic() + CLEANUP_SECONDS
         self.check(f'{case}-release', resume)
         group.resume(resume)
-        coordinator.create_control(release)
+        coordinator.create_control(release, lambda: self.files.adopt(release))
         self.check(f'{case}-fixture-wait')
         require(process.wait(time.monotonic() + RELEASE_SECONDS) == 0,
                 'fixture did not exit successfully after release')

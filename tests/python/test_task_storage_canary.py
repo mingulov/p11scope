@@ -265,6 +265,11 @@ def probe_case(directory, name):
         assert failure is not None, f'{name} was accepted'
         assert not config.receipt.exists(), f'{name} published a receipt'
         assert not surfaces and not seeds, (name, surfaces, seeds)
+        # Rollback covers every path this run created, the READY/RELEASE
+        # handshake and the fixture log included, so a refused case leaves its
+        # private out-dir empty and re-runnable.
+        left = sorted(entry.name for entry in config.out_dir.iterdir())
+        assert not left, (name, left)
         issue = plan.get('issue')
         # Pin the named invariant: another check refusing first is not a pass.
         assert issue is None or issue in str(failure), (name, issue, str(failure))
@@ -667,6 +672,49 @@ class TaskStorageCanaryTests(unittest.TestCase):
             config = self.prepared(Path(directory))
             config.cases = ('baseline', 'early', 'late')
             qualifier.validate_config(config)
+
+    # ---- the rollback ledger over adopted handshake files -----------------
+
+    def test_adopted_handshake_paths_roll_back_and_keep_their_ownership_check(self):
+        """Adoption is the seam that puts fixture-created paths in the ledger."""
+        with tempfile.TemporaryDirectory() as directory:
+            config = config_for(Path(directory))
+            config.out_dir.mkdir(mode=0o700)
+            files = coordinator.AcquisitionFiles(config)
+            seed = config.out_dir / 'baseline.seed'
+            files.write(seed, qualifier.seed_bytes('baseline'))
+            release = config.out_dir / 'baseline.release'
+            coordinator.create_control(release, lambda: files.adopt(release))
+            log = config.out_dir / 'baseline.fixture.log'
+            log.write_bytes(b'fixture stderr')
+            files.adopt(log)
+            self.assertEqual(files.remove(), [])
+            self.assertEqual(sorted(entry.name for entry in config.out_dir.iterdir()), [])
+            with self.subTest(problem='non-regular'):
+                (config.out_dir / 'handshake-directory').mkdir()
+                (config.out_dir / 'handshake-link').symlink_to(log)
+                for name in ('handshake-directory', 'handshake-link', 'absent'):
+                    with self.assertRaises((coordinator.CaptureError, OSError)):
+                        files.adopt(config.out_dir / name)
+            with self.subTest(problem='replaced-after-adoption'):
+                replaced = config.out_dir / 'baseline.ready.json'
+                replaced.write_bytes(b'{}')
+                files.adopt(replaced)
+                replaced.unlink()
+                replaced.write_bytes(b'{}')
+                issues = files.remove()
+                self.assertTrue(issues, 'a substituted adopted path was unlinked anyway')
+                self.assertTrue(replaced.is_file(), 'rollback unlinked a foreign file')
+            with self.subTest(problem='raising-ledger-hook'):
+                # The hook runs between the exclusive create and the close, so a
+                # raising hook must not leak the descriptor it was handed.
+                hooked = config.out_dir / 'hooked.release'
+                descriptors = len(os.listdir('/proc/self/fd'))
+                with self.assertRaises(RuntimeError):
+                    coordinator.create_control(hooked, lambda: (_ for _ in ()).throw(
+                        RuntimeError('ledger hook')))
+                self.assertTrue(hooked.is_file())
+                self.assertEqual(len(os.listdir('/proc/self/fd')), descriptors)
 
     # ---- injected READY refusals ------------------------------------------
 

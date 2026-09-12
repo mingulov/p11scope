@@ -2179,11 +2179,12 @@ class FinalScannerSurfaceTests(unittest.TestCase):
         "default-safe-start", "feature-safe-start", "feature-unsafe-fault",
     )
 
-    def external_lane_set(self, subject, root, lane, receipt_bytes, *, claim=True):
-        """One external lane's final surface set, as the lane driver builds it.
+    def lane_final_set(self, subject, root, lane, receipt_bytes, *,
+                       claim=True, combined_log=False):
+        """One lane's final surface set, as the lane driver builds it.
 
         External lanes keep observer and workload logs apart, so `combined_log`
-        stays false. That is exactly the path that used to drop the receipt.
+        defaults false. That is exactly the path that used to drop the receipt.
         """
         (root / f"{lane}.output").write_text("{}\n", encoding="utf-8")
         (root / f"{lane}.observer.log").write_bytes(b"")
@@ -2205,13 +2206,15 @@ class FinalScannerSurfaceTests(unittest.TestCase):
         (root / f"mapdump_manifest_{lane}.json").write_text(
             json.dumps([item]), encoding="utf-8"
         )
-        return receipt, subject.final_lane_artifacts(root, lane, [surface])
+        return receipt, subject.final_lane_artifacts(
+            root, lane, [surface], combined_log=combined_log
+        )
 
     def test_external_receipt_bytes_reach_the_final_privacy_scan_in_every_lane(self):
         subject = load_subject(TARGET_BITS)
         for lane in self.EXTERNAL_RECEIPT_LANES:
             with self.subTest(lane=lane), tempfile.TemporaryDirectory() as directory:
-                receipt, paths = self.external_lane_set(
+                receipt, paths = self.lane_final_set(
                     subject, Path(directory), lane, b"{}\n"
                 )
                 self.assertIn(receipt, [Path(path) for path in paths])
@@ -2229,32 +2232,63 @@ class FinalScannerSurfaceTests(unittest.TestCase):
         lane = "default-safe-profile"
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            _receipt, paths = self.external_lane_set(
+            _receipt, paths = self.lane_final_set(
                 subject, root, lane, subject.positive_control_content(marker)
             )
             with self.assertRaisesRegex(AssertionError, "loader/pause identity"):
                 subject.assert_final_artifact_privacy(paths)
-            _receipt, paths = self.external_lane_set(
+            _receipt, paths = self.lane_final_set(
                 subject, root, lane, subject.positive_control_content(alias)
             )
             with self.assertRaisesRegex(AssertionError, "scalar aliases"):
                 subject.assert_safe_lane_alias_privacy(lane, paths)
 
-    def test_legacy_external_manifest_without_claim_names_no_receipt(self):
-        """A receipt joins the scan by being NAMED, never by lying next to a lane.
+    def test_claimless_manifest_is_refused_in_every_lane(self):
+        """A manifest claiming no snapshot must fail its lane, never pass it.
 
-        A legacy Task 1/2 manifest claims no snapshot, so its lane set stays
-        exactly what the manifest names -- the proof that the widened scan is
-        still manifest-driven and does not walk the lane directory.
+        Losing the claim loses both the semantic replay and the receipt scan at
+        once, and a lane that reports OK over bytes nobody read is the exact
+        failure this gate exists to prevent. External lanes are held to the
+        owned lanes' own fail-closed terms, so both are pinned here.
         """
         subject = load_subject(TARGET_BITS)
+        for lane, combined_log in (("default-safe-profile", False),
+                                   ("owned-default-metrics", True)):
+            with self.subTest(lane=lane), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(
+                    AssertionError, "missing stopped snapshot claim"
+                ):
+                    self.lane_final_set(
+                        subject, Path(directory), lane,
+                        subject.positive_control_content(),
+                        claim=False, combined_log=combined_log,
+                    )
+
+    def test_final_scan_names_its_receipt_and_ignores_an_unnamed_neighbour(self):
+        """Scanned because NAMED in a manifest, not because present on disk.
+
+        A claim-bearing lane whose directory also holds a sentinel-bearing file
+        that no manifest names: the same bytes must draw opposite verdicts --
+        invisible as the unnamed neighbour, caught as the named receipt. That
+        isolates "named" from "present", which is what keeps this scanner
+        tree-walk-free and the nested task-storage seed out-dir, a real
+        subdirectory of the lane work root, outside the scan surface.
+        """
+        subject = load_subject(TARGET_BITS)
+        lane = "default-safe-profile"
         with tempfile.TemporaryDirectory() as directory:
-            receipt, paths = self.external_lane_set(
-                subject, Path(directory), "default-safe-trace",
-                subject.positive_control_content(), claim=False,
-            )
-            self.assertNotIn(receipt, [Path(path) for path in paths])
+            root = Path(directory)
+            receipt, paths = self.lane_final_set(subject, root, lane, b"{}\n")
+            neighbour = root / "task-storage-seed" / "seed-qualification.json"
+            neighbour.parent.mkdir()
+            neighbour.write_bytes(subject.positive_control_content())
+            scanned = [Path(path) for path in paths]
+            self.assertIn(receipt, scanned)
+            self.assertNotIn(neighbour, scanned)
             subject.assert_final_artifact_privacy(paths)
+            receipt.write_bytes(neighbour.read_bytes())
+            with self.assertRaisesRegex(AssertionError, "pointer canaries leaked"):
+                subject.assert_final_artifact_privacy(paths)
 
 
 class StartRingSurfaceIntegrationTests(unittest.TestCase):

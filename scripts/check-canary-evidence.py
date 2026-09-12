@@ -1166,24 +1166,28 @@ def final_lane_artifacts(work, lane, surfaces, *, combined_log=False):
     manifest_path = work / f"mapdump_manifest_{lane}.json"
     paths.append(manifest_path)
     manifest = read_json(manifest_path)
-    assert isinstance(manifest, list) and manifest, f"{lane}: empty owned manifest"
+    assert isinstance(manifest, list) and manifest, f"{lane}: empty lane map manifest"
     claim = manifest[0].get("snapshot") if isinstance(manifest[0], dict) else None
-    # The two owned-metrics lanes must claim a stopped snapshot; an inherited
-    # external lane may still carry a legacy Task 1/2 manifest that claims none.
-    if combined_log:
-        assert isinstance(claim, dict), f"{lane}: missing stopped snapshot claim"
-    if isinstance(claim, dict):
-        # A stopped receipt is a scanned privacy surface in EVERY lane, not just
-        # the two owned rows. Replaying a receipt semantically and scanning the
-        # lane's surface set says nothing about the receipt's own bytes, so a
-        # sentinel landing in one of the 10 external receipts used to escape the
-        # final scan outright. The path is taken from the manifest claim: the
-        # receipt is reached by being NAMED, never by walking the lane
-        # directory, which is what keeps this scanner tree-walk-free and the
-        # nested seed out-dir outside the scan surface (see verify-canaries.sh).
-        receipt = Path(claim.get("receipt", ""))
-        assert receipt.is_absolute(), f"{lane}: invalid stopped receipt path"
-        paths.append(receipt)
+    # Required in EVERY lane, on the owned lanes' own fail-closed terms. A
+    # manifest claiming no snapshot would otherwise lose both the semantic
+    # replay -- `owned_map_surfaces` runs it only for a claiming manifest --
+    # and the receipt scan below, while the lane still reported OK: a privacy
+    # scan passing over bytes nobody read, which is the exact failure G3 exists
+    # to prevent and worse here than a crash. Every producer of a lane manifest
+    # stamps the claim (`capture-stopped-canary.py` `manifest()`), so this is a
+    # no-op on a real run and a loud failure if that ever stops being true.
+    assert isinstance(claim, dict), f"{lane}: missing stopped snapshot claim"
+    # A stopped receipt is a scanned privacy surface in EVERY lane, not just the
+    # two owned rows. Replaying a receipt semantically and scanning the lane's
+    # surface set says nothing about the receipt's own bytes, so a sentinel
+    # landing in one of the 10 external receipts used to escape the final scan
+    # outright. The path is taken from the manifest claim: the receipt is
+    # reached by being NAMED, never by walking the lane directory, which is what
+    # keeps this scanner tree-walk-free and the nested seed out-dir outside the
+    # scan surface (see verify-canaries.sh).
+    receipt = Path(claim.get("receipt", ""))
+    assert receipt.is_absolute(), f"{lane}: invalid stopped receipt path"
+    paths.append(receipt)
     return paths
 
 

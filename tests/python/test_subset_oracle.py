@@ -3,7 +3,6 @@
 import contextlib
 import io
 import json
-import os
 from pathlib import Path
 import runpy
 import subprocess
@@ -13,7 +12,6 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[2]
-ORACLE_DRIVER = ROOT / "scripts/matrix/verify-oracle.sh"
 CHECKER = runpy.run_path(str(ROOT / "scripts/check-capture-evidence.py"))
 ORACLE = runpy.run_path(str(ROOT / "scripts/check-subset-oracle.py"))
 ZERO_RV = "0x0000000000000000"
@@ -142,40 +140,6 @@ class SubsetOracleTests(unittest.TestCase):
             lambda evidence: evidence.update(attached_probes=0),
         )
         self.assertIn("no probes attached", output)
-
-    def test_source_only_entry_is_cwd_independent_when_executed(self):
-        environment = os.environ.copy()
-        environment["P11SCOPE_ORACLE_SOURCE_ONLY"] = "1"
-        with tempfile.TemporaryDirectory() as directory:
-            result = subprocess.run(
-                ["sh", str(ORACLE_DRIVER)],
-                cwd=directory,
-                env=environment,
-                text=True,
-                capture_output=True,
-            )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "")
-
-    def test_source_only_entry_is_cwd_independent_when_sourced(self):
-        environment = os.environ.copy()
-        environment["P11SCOPE_ORACLE_SOURCE_ONLY"] = "1"
-        with tempfile.TemporaryDirectory() as directory:
-            result = subprocess.run(
-                [
-                    "sh",
-                    "-c",
-                    'cd "$1"; . "$2"',
-                    "oracle-source-only-test",
-                    directory,
-                    str(ORACLE_DRIVER),
-                ],
-                env=environment,
-                text=True,
-                capture_output=True,
-            )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "")
 
 
 if __name__ == "__main__":

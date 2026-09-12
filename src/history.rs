@@ -96,8 +96,13 @@ impl Registry {
         );
         (Some(key), retired)
     }
+    /// Exact-key like every other mutator: a retired generation's CALL must
+    /// never mark the successor generation as called.
     pub(crate) fn mark_call(&mut self, key: ProcessKey) {
-        if let Some(task) = self.tasks.get_mut(&key.generation) {
+        if let Some(task) = self.tasks.get_mut(&key.generation)
+            && task.key == key
+            && !task.closed
+        {
             task.called = true;
         }
     }

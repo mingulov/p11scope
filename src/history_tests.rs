@@ -308,6 +308,138 @@ fn history_old_init_and_detached_state_cannot_enrich_successor_or_late_fork() {
     assert_eq!(s.semantic_evidence().semantic_history_drops, 3);
 }
 
+/// AR-13 / AC-01. Old INIT/FORK records arriving after a replacement process
+/// generation reach the real profile consumers (`observe_fork` and
+/// `identify_tracked`, through `drain_profile_events`) and are refused on the
+/// producer-authenticated `(domain, task_cookie, exec_id)` identity alone:
+/// only count-only evidence is retained and no semantic state crosses the
+/// generation boundary. Two replacements are exercised: the same task after
+/// exec (cookie 90, exec 1) and a different task reusing pid 100 (cookie 91).
+/// The pid-keyed stat/pidfd acquisition table (`Tracker::identify`) is never
+/// consulted, and FORK `ts_ns`, which the producer leaves at zero, plays no
+/// part in admission.
+#[test]
+fn ar13_delayed_init_and_fork_admit_only_to_the_authenticated_generation() {
+    let (mut s, mut t, _) = setup(16);
+    let mut init = ev(100, 90, 0, 1);
+    init.capture = capture::MECHANISM_VALUE;
+    init.mechanism = 1;
+    feed(&mut s, &mut t, [ev(100, 90, 0, 0), init]);
+    assert_eq!(vector(&s), (1, 0, 0, 1, 1, 0));
+    assert_eq!(s.mechanisms()[&1].calls, 1);
+    assert!(s.has_process_state(key(90, 0)));
+
+    // Replacement 1: the same task after exec. The old generation is retired
+    // in band; nothing is carried into exec 1.
+    feed(&mut s, &mut t, [ev(100, 90, 1, 0)]);
+    assert!(!s.has_process_state(key(90, 0)));
+    assert!(s.has_process_state(key(90, 1)));
+    // Replacement 2: a different task reusing pid 100.
+    feed(&mut s, &mut t, [ev(100, 91, 0, 0)]);
+    assert_eq!(vector(&s), (3, 0, 1, 2, 2, 0));
+    assert_eq!(s.semantic_evidence().semantic_history_drops, 0);
+    let counted = s.cgroups()[&0].calls;
+
+    // Delayed old INIT and delayed old FORK, both stamped with the retired
+    // generation (cookie 90, exec 0). A fresh-looking timestamp cannot rescue
+    // an old generation: identity decides, not time.
+    let child = semantics::ProcessKey::history(1, 20, 0, 200);
+    let mut old_fork = ev(100, 90, 0, 0);
+    old_fork.event_type = event_type::FORK;
+    old_fork.session = 200;
+    old_fork.child_image = ImageIdentity {
+        task_cookie: 20,
+        exec_id: 0,
+    };
+    old_fork.ts_ns = u64::MAX;
+    feed(&mut s, &mut t, [init, old_fork]);
+    assert_eq!(s.mechanisms()[&1].calls, 1, "old INIT enriched a successor");
+    assert_eq!(
+        s.sessions().inherited,
+        0,
+        "old FORK inherited into a successor"
+    );
+    assert!(s.session_pseudonym_process(child, 0, 7).is_none());
+    assert_eq!(s.semantic_evidence().semantic_history_drops, 2);
+    assert_eq!(
+        s.cgroups()[&0].calls,
+        counted + 1,
+        "rejected CALL not counted"
+    );
+    assert_eq!(s.semantic_evidence().fork_state_ambiguities, 0);
+    assert_eq!(vector(&s), (3, 0, 1, 2, 2, 0));
+    assert!(s.has_process_state(key(90, 1)));
+    assert!(s.has_process_state(key(91, 0)));
+
+    // A FORK naming a child that already made its own CALL is refused too:
+    // birth is one-shot and precedes every child CALL.
+    feed(&mut s, &mut t, [ev(201, 21, 0, 7)]);
+    let mut late_fork = ev(100, 90, 1, 0);
+    late_fork.event_type = event_type::FORK;
+    late_fork.session = 201;
+    late_fork.child_image = ImageIdentity {
+        task_cookie: 21,
+        exec_id: 0,
+    };
+    feed(&mut s, &mut t, [late_fork]);
+    assert_eq!(s.sessions().inherited, 0);
+    assert_eq!(s.semantic_evidence().semantic_history_drops, 3);
+
+    // The consumers never touched the pid-keyed acquisition table. Positive
+    // control: one direct acquisition for the same pid is visible there.
+    assert_eq!(t.evidence(), process::TrackingEvidence::default());
+    t.identify(100);
+    assert_ne!(t.evidence(), process::TrackingEvidence::default());
+
+    // FORK ts_ns is never written by the producer; an authentic first FORK is
+    // admitted identically at zero, at the maximum, and older than the
+    // parent's own CALL.
+    for ts_ns in [0, u64::MAX, 1] {
+        let (mut s, mut t, _) = setup(16);
+        let mut opened = ev(100, 90, 0, 0);
+        opened.ts_ns = 1_000;
+        let mut birth = old_fork;
+        birth.ts_ns = ts_ns;
+        feed(&mut s, &mut t, [opened, birth]);
+        assert_eq!(s.sessions().inherited, 1, "ts_ns={ts_ns}");
+        assert!(s.session_pseudonym_process(child, 0, 7).is_some());
+        assert_eq!(
+            s.semantic_evidence().semantic_history_drops,
+            0,
+            "ts_ns={ts_ns}"
+        );
+    }
+}
+
+/// AR-13 defense in depth. `Registry::mark_call` was the one mutator that did
+/// not authenticate its key. Its sole production caller (`identify_tracked`)
+/// passes the key `admit` returned two statements earlier, so the gap is not
+/// reachable through the consumers; the registry API is closed regardless, so
+/// a CALL mark stamped with a retired generation can never suppress the
+/// successor generation's authentic first FORK.
+#[test]
+fn ar13_stale_generation_call_mark_cannot_suppress_successor_first_fork() {
+    let child = |exec_id| semantics::ProcessKey::history(1, 20, exec_id, 200);
+    let mut birth = ev(100, 90, 0, 0);
+    birth.event_type = event_type::FORK;
+    birth.session = 200;
+    birth.child_image = ImageIdentity {
+        task_cookie: 20,
+        exec_id: 1,
+    };
+    for (mark, inherited) in [(None, 1), (Some(child(0)), 1), (Some(child(1)), 0)] {
+        let (mut s, mut t, _) = setup(16);
+        feed(&mut s, &mut t, [ev(100, 90, 0, 0), ev(200, 20, 0, 7)]);
+        // Task 20 execs: generation 1 is admitted with no CALL of its own.
+        assert_eq!(t.admit_history(1, 200, birth.child_image).0, Some(child(1)));
+        if let Some(key) = mark {
+            t.history_call(key);
+        }
+        feed(&mut s, &mut t, [birth]);
+        assert_eq!(s.sessions().inherited, inherited, "mark={mark:?}");
+    }
+}
+
 #[test]
 fn history_authentic_reaped_first_trace_has_semantics_without_raw_identity_output() {
     let (mut s, mut t, a) = setup(16);

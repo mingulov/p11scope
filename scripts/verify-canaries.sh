@@ -371,6 +371,13 @@ OWNED_LANES
 run_task_storage_seed_stage() {
     # A private out-dir distinct from the lane work root: no seed artifact may
     # ever join a lane's surfaces, a lane manifest, or the final all-lane scan.
+    # This path is a subdirectory of $WORK, not a sibling of it. That nesting
+    # is safe only because the final scan in check-canary-evidence.py is
+    # manifest-driven and never walks the tree (no glob/iterdir/rglob/scandir/
+    # os.walk there) -- it can only see what a lane manifest names, so a
+    # nested-but-unlisted out-dir cannot widen the scan surface. If that
+    # script is ever made to walk the tree, this nesting stops being safe and
+    # must move outside $WORK first.
     seed_dir=$WORK/task-storage-seed
     [ ! -e "$seed_dir" ] && [ ! -L "$seed_dir" ] || {
         echo "existing task-storage seed destination: $seed_dir" >&2

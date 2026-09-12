@@ -6273,6 +6273,12 @@ aggregate-only-metrics default metrics"
     assert!(lanes.contains("full CallStart safe defaults self-test: OK"));
     assert!(lanes.contains("scan-only hostile output contract: OK"));
     assert!(lanes.contains("canary matrix 988/104/208 with 16 mixed surfaces: OK"));
+    // The 15 classes below run together as one native lane, so `unittest`
+    // prints a single combined "Ran N tests" summary for all of them, not one
+    // per class. This floor is that combined total, not a per-class count for
+    // `TargetWidthPathTests` alone — keep the name and value paired so a
+    // future reader can't mistake it for the latter.
+    const NATIVE_LANE_15_CLASS_AGGREGATE_FLOOR: usize = 60;
     for bits in ["32", "64"] {
         let output = Command::new("timeout")
             .args([
@@ -6333,7 +6339,11 @@ aggregate-only-metrics default metrics"
                 "native {bits}-bit suite missed {family}: {report}"
             );
         }
-        assert_clean_python_suite(&report, "TargetWidthPathTests", 60);
+        assert_clean_python_suite(
+            &report,
+            "TargetWidthPathTests",
+            NATIVE_LANE_15_CLASS_AGGREGATE_FLOOR,
+        );
 
         let workload_output = Command::new("python3")
             .args([

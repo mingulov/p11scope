@@ -5800,7 +5800,22 @@ fn policy_specific_ebpf() {
 /// is not clean. Adding a case passes; deleting one below the floor does not.
 fn assert_clean_python_suite(report: &str, class: &str, floor: usize) {
     assert!(report.contains(class), "{class} did not run: {report}");
-    let ran = report
+    // The verdict line, not the last line: suites may print after unittest does.
+    let mut verdict = None;
+    let mut offset = 0;
+    for raw in report.split_inclusive('\n') {
+        let line = raw.trim();
+        if line == "OK" || line.starts_with("OK (") || line.starts_with("FAILED") {
+            verdict = Some((offset, line));
+        }
+        offset += raw.len();
+    }
+    let (verdict_at, verdict) =
+        verdict.unwrap_or_else(|| panic!("no unittest verdict for {class}: {report}"));
+    // The count of that verdict's own summary, which `unittest` prints just
+    // before it. Taking the last match in the whole report would let a stale
+    // count in trailing chatter decide the floor, in either direction.
+    let ran = report[..verdict_at]
         .match_indices("Ran ")
         .filter_map(|(at, _)| report[at + "Ran ".len()..].split_once(" test"))
         .filter_map(|(count, _)| count.parse::<usize>().ok())
@@ -5811,13 +5826,6 @@ fn assert_clean_python_suite(report: &str, class: &str, floor: usize) {
         ran >= floor,
         "{class} coverage shrank below its recorded floor: ran {ran}, floor {floor}: {report}"
     );
-    // The verdict line, not the last line: suites may print after unittest does.
-    let verdict = report
-        .lines()
-        .map(str::trim)
-        .filter(|line| *line == "OK" || line.starts_with("OK (") || line.starts_with("FAILED"))
-        .next_back()
-        .unwrap_or_else(|| panic!("no unittest verdict for {class}: {report}"));
     assert_eq!(
         verdict, "OK",
         "{class} must finish on a clean OK, with no skipped, expected-failure or \
@@ -5839,9 +5847,15 @@ fn clean_python_suite_gate_accepts_growth_and_refuses_loss() {
         "ExampleTests",
         12,
     );
-    // Trailing chatter after unittest's verdict must not hide it.
+    // Trailing chatter after unittest's verdict must not hide it, and a count
+    // inside that chatter is not this verdict's summary in either direction.
     assert_clean_python_suite(
         &format!("{clean}observer pid 55: dumped 6 owned maps\n"),
+        "ExampleTests",
+        12,
+    );
+    assert_clean_python_suite(
+        &format!("{clean}replaying: Ran 11 tests in 0.1s\n"),
         "ExampleTests",
         12,
     );
@@ -5869,6 +5883,15 @@ fn clean_python_suite_gate_accepts_growth_and_refuses_loss() {
         ),
         (clean.replace("ExampleTests", "OtherTests"), "wrong suite"),
         (clean.replace("Ran 12 tests", "no summary"), "no summary"),
+        // Chatter after the verdict may not supply the count either: the
+        // summary that belongs to this verdict is the one that precedes it.
+        (
+            format!(
+                "{}Ran 12 tests in 0.4s\n",
+                clean.replace("Ran 12 tests", "Ran 11 tests")
+            ),
+            "deleted case behind a stale trailing count",
+        ),
     ] {
         let caught =
             std::panic::catch_unwind(|| assert_clean_python_suite(&report, "ExampleTests", 12));

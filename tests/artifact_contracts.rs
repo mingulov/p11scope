@@ -6163,6 +6163,7 @@ aggregate-only-metrics default metrics"
         "exact-map mutation self-test: OK",
         "seed layout self-test: OK",
         "READY document self-test: OK",
+        "identity and release self-test: OK",
         "injected lifecycle self-test: OK",
     ] {
         assert!(

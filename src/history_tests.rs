@@ -385,8 +385,11 @@ fn ar13_delayed_init_and_fork_admit_only_to_the_authenticated_generation() {
     assert_eq!(s.sessions().inherited, 0);
     assert_eq!(s.semantic_evidence().semantic_history_drops, 3);
 
-    // The consumers never touched the pid-keyed acquisition table. Positive
-    // control: one direct acquisition for the same pid is visible there.
+    // The consumers never touched the pid-keyed acquisition table. The
+    // tripwire holds because production trackers use `for_producer` with
+    // pidfd_limit == 0, so any nonzero evidence means the pid table has
+    // been re-wired. Positive control: one direct acquisition for the
+    // same pid is visible there.
     assert_eq!(t.evidence(), process::TrackingEvidence::default());
     t.identify(100);
     assert_ne!(t.evidence(), process::TrackingEvidence::default());

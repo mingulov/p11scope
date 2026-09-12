@@ -438,11 +438,12 @@ class Qualifier:
         owner.__enter__()
         self.owner = owner
         try:
+            # The fixture log is deliberately NOT ledgered: under the live
+            # sudo'd gate it is the only trace a failed case leaves, the shell
+            # never removes the work root, and no sanitized issue carries
+            # subprocess stderr. Rollback owns the handshake files, not this.
             fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
             try:
-                # Ledger the log before it is wrapped: rollback owns every
-                # path this case creates, not only the written evidence.
-                self.files.adopt(log_path)
                 log = os.fdopen(fd, 'wb')
             except BaseException:
                 os.close(fd)

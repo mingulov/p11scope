@@ -265,11 +265,11 @@ def probe_case(directory, name):
         assert failure is not None, f'{name} was accepted'
         assert not config.receipt.exists(), f'{name} published a receipt'
         assert not surfaces and not seeds, (name, surfaces, seeds)
-        # Rollback covers every path this run created, the READY/RELEASE
-        # handshake and the fixture log included, so a refused case leaves its
-        # private out-dir empty and re-runnable.
+        # Rollback covers every path this run created except the per-case
+        # fixture log, which is the only trace a refused live run leaves: the
+        # READY/RELEASE handshake, the seed and every surface must be gone.
         left = sorted(entry.name for entry in config.out_dir.iterdir())
-        assert not left, (name, left)
+        assert set(left) <= {f'{case}.fixture.log' for case in qualifier.CASES}, (name, left)
         issue = plan.get('issue')
         # Pin the named invariant: another check refusing first is not a pass.
         assert issue is None or issue in str(failure), (name, issue, str(failure))
@@ -712,19 +712,19 @@ class TaskStorageCanaryTests(unittest.TestCase):
             files.write(seed, qualifier.seed_bytes('baseline'))
             release = config.out_dir / 'baseline.release'
             coordinator.create_control(release, lambda: files.adopt(release))
-            log = config.out_dir / 'baseline.fixture.log'
-            log.write_bytes(b'fixture stderr')
-            files.adopt(log)
+            ready = config.out_dir / 'baseline.ready.json'
+            ready.write_bytes(b'{}')
+            files.adopt(ready)
             self.assertEqual(files.remove(), [])
             self.assertEqual(sorted(entry.name for entry in config.out_dir.iterdir()), [])
             with self.subTest(problem='non-regular'):
                 (config.out_dir / 'handshake-directory').mkdir()
-                (config.out_dir / 'handshake-link').symlink_to(log)
+                (config.out_dir / 'handshake-link').symlink_to(release)
                 for name in ('handshake-directory', 'handshake-link', 'absent'):
                     with self.assertRaises((coordinator.CaptureError, OSError)):
                         files.adopt(config.out_dir / name)
             with self.subTest(problem='replaced-after-adoption'):
-                replaced = config.out_dir / 'baseline.ready.json'
+                replaced = config.out_dir / 'replaced.ready.json'
                 replaced.write_bytes(b'{}')
                 files.adopt(replaced)
                 replaced.unlink()

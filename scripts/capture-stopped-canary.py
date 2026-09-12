@@ -460,8 +460,8 @@ class AcquisitionFiles:
     def adopt(self, path):
         """Ledger a path this acquisition created outside write().
 
-        Handshake and log files are created by the fixture or by a bare
-        `O_EXCL` open, so they never reach the ledger through write(); without
+        Handshake files are created by the fixture or by a bare `O_EXCL`
+        open, so they never reach the ledger through write(); without
         an entry a rolled-back run leaves them behind and a later run refuses
         its own destinations. Ownership is recorded the same way, so rollback
         still refuses to unlink a path that is no longer the file we created.

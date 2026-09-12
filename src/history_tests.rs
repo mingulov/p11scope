@@ -189,6 +189,54 @@ fn history_birth_fork_once_before_child_call_and_exact_death() {
 }
 
 #[test]
+fn history_registry_exec_bump_clears_forked_latch() {
+    // Internal state-contract test: an exec-id bump clears the current
+    // image's inherited-fork latch; this is not a second authentic birth.
+    let domain = crate::events::EventsDomain::test_standin(1);
+    let mut registry = crate::history::Registry::new(domain, 4);
+    let parent = key(90, 0);
+    let child = semantics::ProcessKey::history(1, 20, 0, 200);
+    let child_image = ImageIdentity {
+        task_cookie: 20,
+        exec_id: 0,
+    };
+    assert_eq!(
+        registry
+            .admit(
+                1,
+                100,
+                ImageIdentity {
+                    task_cookie: 90,
+                    exec_id: 0,
+                },
+            )
+            .0,
+        Some(parent)
+    );
+    assert_eq!(registry.admit(1, 200, child_image).0, Some(child));
+    assert!(registry.birth(parent, child));
+
+    let current = semantics::ProcessKey::history(1, 20, 1, 200);
+    assert_eq!(
+        registry
+            .admit(
+                1,
+                200,
+                ImageIdentity {
+                    task_cookie: 20,
+                    exec_id: 1,
+                },
+            )
+            .0,
+        Some(current)
+    );
+    assert!(
+        registry.birth(parent, current),
+        "current image's forked latch must clear after exec-id bump"
+    );
+}
+
+#[test]
 fn history_same_cookie_exec_closes_before_open_and_late_old_never_reduces() {
     let (mut s, mut t, _) = setup(16);
     feed(&mut s, &mut t, [ev(100, 90, 0, 0)]);

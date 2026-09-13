@@ -858,7 +858,7 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
 #[cfg(test)]
 fn scan_interfaces(
     snapshot: &[u8],
-    mem: &File,
+    mem: &impl ScanMemory,
     tables: &[ScannedTable],
     maps: &MapIndex<'_>,
     key: ObjectKey,
@@ -881,7 +881,7 @@ fn scan_interfaces(
 fn scan_interfaces_for_layout(
     layout: LinuxLayout,
     snapshot: &[u8],
-    mem: &File,
+    mem: &impl ScanMemory,
     tables: &[ScannedTable],
     maps: &MapIndex<'_>,
     key: ObjectKey,
@@ -905,7 +905,7 @@ fn scan_interfaces_for_layout(
 fn scan_interfaces_with_clock<F: FnMut() -> Option<u64>>(
     layout: LinuxLayout,
     snapshot: &[u8],
-    mem: &File,
+    mem: &impl ScanMemory,
     tables: &[ScannedTable],
     maps: &MapIndex<'_>,
     key: ObjectKey,
@@ -1030,7 +1030,7 @@ fn scan_interfaces_with_clock<F: FnMut() -> Option<u64>>(
 /// A NUL-terminated name of at most `INTERFACE_NAME_CAP` bytes, or `None` when the
 /// target memory could not be read or the name reaches the mapping end or cap.
 fn read_name(
-    mem: &File,
+    mem: &impl ScanMemory,
     address: u64,
     mapping_end: u64,
     budget: &mut CaptureWorkBudget,
@@ -1054,7 +1054,7 @@ fn read_name(
         if allowed == 0 {
             return Err(());
         }
-        let read = match mem.read_at(&mut chunk[..allowed], at) {
+        let read = match mem.read_memory_at(&mut chunk[..allowed], at) {
             Ok(0) | Err(_) => return Ok(None),
             Ok(read) => read,
         };
@@ -1075,7 +1075,7 @@ fn read_name(
 /// that point went unscanned, and the caller must record that rather than imply it was
 /// examined and found empty.
 fn read_mapping(
-    mem: &File,
+    mem: &impl ScanMemory,
     entry: &MapEntry,
     budget: &mut CaptureWorkBudget,
     operation_bytes: &mut u64,
@@ -1105,7 +1105,7 @@ fn read_mapping(
             break;
         };
         bytes.resize(done + want, 0);
-        match mem.read_at(&mut bytes[done..], at) {
+        match mem.read_memory_at(&mut bytes[done..], at) {
             Ok(0) => {
                 bytes.truncate(done);
                 // Addresses stay out of the reason: it is published in the capture
@@ -1393,12 +1393,210 @@ pub fn scan_pid(
     scan_process_view(request, &view, budget)
 }
 
+// Private I/O seam: production and mutation tests share the entire acquisition loop.
+trait ScanMemory {
+    fn read_memory_at(&self, bytes: &mut [u8], offset: u64) -> std::io::Result<usize>;
+}
+
+impl ScanMemory for File {
+    fn read_memory_at(&self, bytes: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        std::os::unix::fs::FileExt::read_at(self, bytes, offset)
+    }
+}
+
+trait ScanIo {
+    type Memory: ScanMemory;
+    fn open_maps(
+        &mut self,
+        view: &ProcessView,
+        budget: &CaptureWorkBudget,
+    ) -> std::io::Result<Box<dyn Read>>;
+    fn open_mem(&mut self, view: &ProcessView) -> std::io::Result<Self::Memory>;
+    fn final_generation(&mut self, view: &ProcessView) -> Result<(), String>;
+    fn maps_now(&self) -> Option<u64> {
+        crate::attach::monotonic_ns()
+    }
+}
+
+struct ProcScanIo;
+
+impl ScanIo for ProcScanIo {
+    type Memory = File;
+
+    fn open_maps(
+        &mut self,
+        view: &ProcessView,
+        _: &CaptureWorkBudget,
+    ) -> std::io::Result<Box<dyn Read>> {
+        Ok(Box::new(File::open(format!("/proc/{}/maps", view.pid()))?))
+    }
+
+    fn open_mem(&mut self, view: &ProcessView) -> std::io::Result<File> {
+        File::open(format!("/proc/{}/mem", view.pid()))
+    }
+
+    fn final_generation(&mut self, view: &ProcessView) -> Result<(), String> {
+        view.run_while_same(|| ())
+    }
+}
+
+pub(crate) const MAPPING_CHANGED_REASON: &str =
+    "memory scan refused: mapping changed during acquisition";
+const FINAL_MAPS_UNAVAILABLE_REASON: &str =
+    "memory scan refused: final mapping validation unavailable";
+const INITIAL_MAPS_UNAVAILABLE_REASON: &str =
+    "memory scan refused: initial mapping validation unavailable";
+const SCAN_GENERATION_CHANGED_REASON: &str =
+    "memory scan refused: process generation changed during acquisition";
+
+/// All provider mappings establish inventory authority. They also cover every
+/// searched data snapshot (even empty ones), complete interface descriptors, and
+/// same-object name reads, including their bounded read-ahead. Function targets
+/// can belong to other objects and must be retained separately, from decoded bytes.
+#[derive(Default)]
+struct ScanDependencies<'a> {
+    inventory: Vec<&'a MapEntry>,
+    targets: BTreeMap<u64, &'a MapEntry>,
+    invalid_span: bool,
+}
+
+impl<'a> ScanDependencies<'a> {
+    fn retain_tables(
+        &mut self,
+        tables: &[ScannedTable],
+        snapshot: &[u8],
+        base: u64,
+        layout: LinuxLayout,
+        maps: &MapIndex<'a>,
+        budget: &mut CaptureWorkBudget,
+    ) {
+        for table in tables {
+            let dependency = (|| {
+                let offset = usize::try_from(table.address.checked_sub(base)?).ok()?;
+                let bytes = snapshot.get(offset..)?;
+                let len = exact_table_bytes(bytes, layout)?;
+                let bytes = bytes.get(..len)?;
+                let end = table.address.checked_add(len as u64)?;
+                let mapping = maps.containing(table.address)?;
+                if mapping.permissions[0] != b'r' || end > mapping.end {
+                    return None;
+                }
+                let addresses = exact_table_addresses(bytes, layout)?;
+                for address in addresses {
+                    budget.spend(1).ok()?;
+                    let target = maps.containing(address)?;
+                    self.targets.insert(target.start, target);
+                }
+                Some(())
+            })();
+            if dependency.is_none() {
+                self.invalid_span = true;
+            }
+        }
+    }
+
+    fn validate(
+        &self,
+        module: &ScannedModule,
+        maps_b: &MapIndex<'_>,
+        groups_b: &BTreeMap<ObjectKey, Vec<&MapEntry>>,
+        budget: &mut CaptureWorkBudget,
+    ) -> Result<bool, &'static str> {
+        if self.invalid_span {
+            return Ok(false);
+        }
+        for entry in self
+            .inventory
+            .iter()
+            .copied()
+            .chain(self.targets.values().copied())
+        {
+            // Account for both the lookup and full mapping/path comparison.
+            budget.spend(1 + entry.raw_path.as_ref().map_or(0, |path| path.len() as u64))?;
+            if maps_b.containing(entry.start) != Some(entry) {
+                return Ok(false);
+            }
+        }
+        // Absence of a decoded table is evidence only for the entire searched
+        // provider data set; additions in B must not escape a vacuous table loop.
+        if module.tables.is_empty() {
+            let data =
+                |entry: &&MapEntry| entry.permissions[0] == b'r' && entry.permissions[2] != b'x';
+            let before = self.inventory.iter().copied().filter(data);
+            let after = groups_b
+                .get(&module.key)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(data);
+            let mut before = before;
+            let mut after = after;
+            loop {
+                budget.spend(1)?;
+                match (before.next(), after.next()) {
+                    (None, None) => break,
+                    (Some(a), Some(b)) if a == b => {}
+                    _ => return Ok(false),
+                }
+            }
+        }
+        Ok(true)
+    }
+}
+
+fn acquire_scan_maps(
+    view: &ProcessView,
+    budget: &mut CaptureWorkBudget,
+    io: &mut impl ScanIo,
+) -> Result<Vec<MapEntry>, String> {
+    if let Some(reason) = budget.stopped_now() {
+        return Err(reason.into());
+    }
+    let reader = view
+        .run_while_same(|| io.open_maps(view, budget))?
+        .map_err(|error| error.to_string())?;
+    budget.spend(1).map_err(str::to_owned)?;
+    let (bytes, reasons) = read_maps_with_limits(
+        reader,
+        budget,
+        MAX_MAPS_BYTES,
+        MAX_MAP_ENTRIES,
+        64 * 1024,
+        || io.maps_now(),
+    )
+    .map_err(|error| error.to_string())?;
+    if let Some(reason) = reasons.first().copied().or(budget.stopped_now()) {
+        return Err(reason.into());
+    }
+    if bytes.is_empty() || !bytes.ends_with(b"\n") {
+        return Err("empty or truncated /proc maps snapshot".into());
+    }
+    // Parsing is charged independently of the single charged index construction.
+    budget
+        .spend(bytes.iter().filter(|byte| **byte == b'\n').count() as u64)
+        .map_err(str::to_owned)?;
+    let maps = parse_maps(&bytes)?;
+    if maps.is_empty() {
+        return Err("empty /proc maps snapshot".into());
+    }
+    Ok(maps)
+}
+
 /// Scan through an already accepted process-generation pin. Capture discovery uses
 /// this entry point so one monotonically allocated `ProcessViewId` owns every result.
 pub fn scan_process_view(
     request: &ScanRequest<'_>,
     view: &ProcessView,
     budget: &mut CaptureWorkBudget,
+) -> Result<ScanOutcome, String> {
+    scan_process_view_with_io(request, view, budget, &mut ProcScanIo)
+}
+
+fn scan_process_view_with_io(
+    request: &ScanRequest<'_>,
+    view: &ProcessView,
+    budget: &mut CaptureWorkBudget,
+    io: &mut impl ScanIo,
 ) -> Result<ScanOutcome, String> {
     if request.pid != view.pid() {
         return Err("scan request pid does not match its process view".into());
@@ -1408,46 +1606,46 @@ pub fn scan_process_view(
     }
     let started = Instant::now();
     let pid = request.pid;
-    let (map_bytes, map_reasons) = view
-        .run_while_same(|| {
-            File::open(format!("/proc/{pid}/maps")).and_then(|maps_file| {
-                read_maps_with_limits(
-                    maps_file,
-                    budget,
-                    MAX_MAPS_BYTES,
-                    MAX_MAP_ENTRIES,
-                    64 * 1024,
-                    crate::attach::monotonic_ns,
-                )
-                .map_err(std::io::Error::other)
-            })
-        })
-        .map_err(|error| format!("/proc/{pid}/maps: {error}"))?
-        .map_err(|error| format!("/proc/{pid}/maps: {error}"))?;
-    let maps = parse_maps(&map_bytes)?;
-    let map_index = MapIndex::new(&maps)
-        .ok_or_else(|| "reversed or overlapping /proc/<pid>/maps intervals".to_string())?;
-    let mut modules = Vec::new();
-    let map_subject = format!("/proc/{pid}/maps");
-    let mut skipped = map_reasons
-        .into_iter()
-        .map(|reason| scan_skip(&map_subject, reason.into()))
-        .collect::<Vec<_>>();
-    // `parse_maps`, `MapIndex::new` and `candidate_groups` are each O(entries)
-    // on a snapshot the target sizes. Charge that preprocessing and answer the
-    // capture's stop here: a dense map cannot defer the first check past it,
-    // and a stop that arrived before this scan is published instead of
-    // breaking the group loop with no reason at all.
-    let scannable = budget.spend(maps.len() as u64).is_ok() && budget.stopped_now().is_none();
-    if !scannable {
-        if let Some(reason) = budget.take_scan_stop_reason() {
-            skipped.push(scan_skip("capture discovery", reason.into()));
+    let refused_initial = |reason: String| {
+        let mut skipped = vec![scan_skip(
+            "capture discovery",
+            format!("{INITIAL_MAPS_UNAVAILABLE_REASON}: {reason}"),
+        )];
+        if capture_scan_reason(&reason) {
+            skipped.push(scan_skip("capture discovery", reason));
         }
+        ScanOutcome::Scanned {
+            modules: Vec::new(),
+            skipped,
+            scan_ms: started.elapsed().as_millis() as u64,
+        }
+    };
+    let maps = match acquire_scan_maps(view, budget, io) {
+        Ok(maps) => maps,
+        Err(reason) => return Ok(refused_initial(reason)),
+    };
+    let map_index = match index_maps_or_refuse(&maps, budget) {
+        Ok(index) => index,
+        Err(reason) => return Ok(refused_initial(reason)),
+    };
+    let mut modules = Vec::new();
+    let mut dependencies = BTreeMap::new();
+    let mut skipped = Vec::new();
+    // Group construction also consumes the capture's existing work allowance.
+    if let Err(reason) = budget.spend(maps.len() as u64) {
+        return Ok(refused_initial(reason.into()));
     }
     // `/proc/<pid>/mem` is gated by PTRACE_MODE_ATTACH and Yama; losing it costs the
     // tables, never the object inventory (spec §4.1 step 3). Only an access refusal is
     // a ptrace refusal — a pid that died mid-scan gets its own label.
-    let mem = view.run_while_same(|| File::open(format!("/proc/{pid}/mem")))?;
+    let mem = match view.run_while_same(|| io.open_mem(view)) {
+        Ok(mem) => mem,
+        Err(reason) => {
+            return Ok(refused_initial(format!(
+                "{SCAN_GENERATION_CHANGED_REASON}: {reason}"
+            )));
+        }
+    };
     let unavailable = mem.as_ref().err().map(|error| {
         let (class, publishes) = mem_unavailable(error);
         if publishes {
@@ -1465,11 +1663,7 @@ pub fn scan_process_view(
         request.hints.iter().map(|h| hint_identity(h)).collect();
     let mut hint_matched = vec![false; request.hints.len()];
 
-    let groups = if scannable {
-        candidate_groups(&maps)
-    } else {
-        BTreeMap::new()
-    };
+    let groups = candidate_groups(&maps);
     for (key, group) in groups {
         if budget.scan_stopped() {
             break;
@@ -1589,6 +1783,10 @@ pub fn scan_process_view(
             tables: Vec::new(),
             interfaces: Vec::new(),
         };
+        let dependency = dependencies.entry(key).or_insert_with(|| ScanDependencies {
+            inventory: group.clone(),
+            ..ScanDependencies::default()
+        });
         let Some(mem) = &mem else {
             modules.push(module);
             continue;
@@ -1637,6 +1835,7 @@ pub fn scan_process_view(
         for (base, snapshot) in &snapshots {
             let (tables, exhausted) =
                 detect_tables_for_layout(layout, snapshot, *base, &map_index, budget);
+            dependency.retain_tables(&tables, snapshot, *base, layout, &map_index, budget);
             module.tables.extend(tables);
             skipped.extend(
                 exhausted
@@ -1712,6 +1911,60 @@ pub fn scan_process_view(
         }
     }
 
+    // No pending module escapes until the second complete snapshot, dependency
+    // comparisons and final generation check have all succeeded. A failed bracket
+    // remains an explicit occurrence even when a later scan or manifest attaches.
+    let validation = (|| {
+        let maps_b = acquire_scan_maps(view, budget, io)?;
+        let index_b = index_maps_or_refuse(&maps_b, budget)?;
+        budget.spend(maps_b.len() as u64).map_err(str::to_owned)?;
+        let groups_b = candidate_groups(&maps_b);
+        let mut accepted = Vec::with_capacity(modules.len());
+        for module in &modules {
+            accepted.push(
+                dependencies[&module.key]
+                    .validate(module, &index_b, &groups_b, budget)
+                    .map_err(str::to_owned)?,
+            );
+        }
+        if let Some(reason) = budget.stopped_now() {
+            return Err(reason.into());
+        }
+        Ok::<_, String>(accepted)
+    })();
+    let generation = io.final_generation(view);
+    match (validation, generation) {
+        (Ok(accepted), Ok(())) => {
+            modules = modules
+                .into_iter()
+                .zip(accepted)
+                .filter_map(|(module, accepted)| {
+                    if accepted {
+                        Some(module)
+                    } else {
+                        skipped.push(scan_skip(&module.path, MAPPING_CHANGED_REASON.into()));
+                        None
+                    }
+                })
+                .collect();
+        }
+        (validation, generation) => {
+            if let Err(reason) = validation {
+                skipped.push(scan_skip(
+                    "capture discovery",
+                    format!("{FINAL_MAPS_UNAVAILABLE_REASON}: {reason}"),
+                ));
+            }
+            if let Err(reason) = generation {
+                skipped.push(scan_skip(
+                    "capture discovery",
+                    format!("{SCAN_GENERATION_CHANGED_REASON}: {reason}"),
+                ));
+            }
+            modules.clear();
+        }
+    }
+
     let outcome = match unavailable {
         None => ScanOutcome::Scanned {
             modules,
@@ -1724,13 +1977,598 @@ pub fn scan_process_view(
             skipped,
         },
     };
-    view.run_while_same(|| ())?;
     Ok(outcome)
+}
+
+#[cfg(test)]
+pub(crate) fn bracket_refusal_for_test(
+    view: &ProcessView,
+    budget: &mut CaptureWorkBudget,
+) -> ScanOutcome {
+    tests::bracket_refusal(view, budget)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    pub(super) fn bracket_refusal(
+        view: &ProcessView,
+        budget: &mut CaptureWorkBudget,
+    ) -> ScanOutcome {
+        let mut fixture = BracketFixture::new(8, true);
+        fixture.maps_b = fixture.maps_b.replace("4000-6000", "4000-4810");
+        let hints = [fixture.path.clone()];
+        scan_process_view_with_io(
+            &ScanRequest {
+                pid: view.pid(),
+                hints: &hints,
+                hooks: &HookRegistry::builtin(),
+            },
+            view,
+            budget,
+            &mut fixture,
+        )
+        .unwrap()
+    }
+
+    // Raw maps text is authored independently of candidate_groups/MapIndex. Only
+    // the temporary file identity is interpolated; no production maps builder is used.
+    struct BracketFixture {
+        _dir: tempfile::TempDir,
+        path: PathBuf,
+        view: ProcessView,
+        maps_a: String,
+        maps_b: String,
+        mem: File,
+        log: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        maps_reads: usize,
+        before_b: Option<(u64, u64)>,
+        fail_open_b: bool,
+        fail_read_b: bool,
+        fail_generation: bool,
+        expire_at_b: bool,
+    }
+
+    struct BracketMemory {
+        file: File,
+        log: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    }
+
+    impl ScanMemory for BracketMemory {
+        fn read_memory_at(&self, bytes: &mut [u8], offset: u64) -> std::io::Result<usize> {
+            self.log
+                .borrow_mut()
+                .push(format!("memory {offset:x} {}", bytes.len()));
+            self.file.read_at(bytes, offset)
+        }
+    }
+
+    impl ScanIo for BracketFixture {
+        type Memory = BracketMemory;
+        fn open_maps(
+            &mut self,
+            _: &ProcessView,
+            budget: &CaptureWorkBudget,
+        ) -> std::io::Result<Box<dyn Read>> {
+            self.maps_reads += 1;
+            if self.maps_reads == 2 {
+                self.before_b = Some((budget.attempted_io_bytes(), budget.work_units));
+            }
+            self.log
+                .borrow_mut()
+                .push(format!("maps {}", self.maps_reads));
+            if self.maps_reads == 2 && self.fail_open_b {
+                return Err(std::io::Error::other("injected maps B open failure"));
+            }
+            if self.maps_reads == 2 && self.fail_read_b {
+                struct FailedRead;
+                impl Read for FailedRead {
+                    fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                        Err(std::io::Error::other("injected maps B read failure"))
+                    }
+                }
+                return Ok(Box::new(FailedRead));
+            }
+            Ok(Box::new(std::io::Cursor::new(
+                if self.maps_reads == 1 {
+                    &self.maps_a
+                } else {
+                    &self.maps_b
+                }
+                .as_bytes()
+                .to_vec(),
+            )))
+        }
+        fn open_mem(&mut self, _: &ProcessView) -> std::io::Result<BracketMemory> {
+            Ok(BracketMemory {
+                file: self.mem.try_clone()?,
+                log: self.log.clone(),
+            })
+        }
+        fn maps_now(&self) -> Option<u64> {
+            if self.expire_at_b && self.maps_reads == 2 {
+                Some(u64::MAX)
+            } else {
+                crate::attach::monotonic_ns()
+            }
+        }
+        fn final_generation(&mut self, view: &ProcessView) -> Result<(), String> {
+            self.log.borrow_mut().push("final generation".into());
+            if self.fail_generation {
+                Err("injected generation loss".into())
+            } else {
+                view.run_while_same(|| ())
+            }
+        }
+    }
+
+    impl BracketFixture {
+        fn new(width: usize, populated: bool) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("provider.so");
+            // Minimal independent x86 ELF header; the real ELF reader selects ABI.
+            let mut elf = vec![0u8; 64];
+            elf[..7].copy_from_slice(&[
+                0x7f,
+                b'E',
+                b'L',
+                b'F',
+                if width == 8 { 2 } else { 1 },
+                1,
+                1,
+            ]);
+            elf[16..18].copy_from_slice(&3u16.to_le_bytes());
+            elf[18..20].copy_from_slice(&(if width == 8 { 62u16 } else { 3 }).to_le_bytes());
+            elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+            if width == 8 {
+                elf[52..54].copy_from_slice(&64u16.to_le_bytes());
+                elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+                elf[58..60].copy_from_slice(&64u16.to_le_bytes());
+            } else {
+                elf[40..42].copy_from_slice(&52u16.to_le_bytes());
+                elf[42..44].copy_from_slice(&32u16.to_le_bytes());
+                elf[46..48].copy_from_slice(&40u16.to_le_bytes());
+            }
+            std::fs::write(&path, elf).unwrap();
+            let view = ProcessView::open(ProcessViewId(71), std::process::id()).unwrap();
+            let file = File::open(&path).unwrap();
+            let key = crate::discovery::identity::retained_object_key(
+                &view,
+                &file,
+                &mut CaptureWorkBudget::default(),
+            )
+            .unwrap();
+            let identity = format!(
+                "{:x}:{:x} {} {}",
+                key.device.major,
+                key.device.minor,
+                key.inode,
+                path.display()
+            );
+            let maps_a = format!(
+                "1000-2000 r-xp 00000000 {identity}\n\
+                 4000-6000 rw-p 00002000 {identity}\n\
+                 7000-8000 r--p 00004000 {identity}\n\
+                 9000-a000 r-xp 00000000 08:01 999 /dependency.so\n\
+                 b000-c000 r-xp 00005000 {identity}\n"
+            );
+            let mem = tempfile::tempfile().unwrap();
+            mem.set_len(0xc000).unwrap();
+            if populated {
+                let mut table = vec![0u8; 69 * width];
+                table[..2].copy_from_slice(&[2, 40]);
+                for slot in 0..68 {
+                    // Null slot plus both provider and dependency function targets.
+                    let pointer: u64 = match slot {
+                        0 => 0x1100,
+                        1 => 0,
+                        _ => 0x9100,
+                    };
+                    table[(slot + 1) * width..(slot + 2) * width]
+                        .copy_from_slice(&pointer.to_le_bytes()[..width]);
+                }
+                mem.write_all_at(&table, 0x4800).unwrap();
+                for (slot, value) in [0xb100u64, 0x4800, 0].into_iter().enumerate() {
+                    mem.write_all_at(
+                        &value.to_le_bytes()[..width],
+                        0x7100 + (slot * width) as u64,
+                    )
+                    .unwrap();
+                }
+                mem.write_all_at(b"PKCS 11\0PRIVATE_READ_AHEAD_CANARY", 0xb100)
+                    .unwrap();
+            }
+            Self {
+                _dir: dir,
+                path,
+                view,
+                maps_b: maps_a.clone(),
+                maps_a,
+                mem,
+                log: Default::default(),
+                maps_reads: 0,
+                before_b: None,
+                fail_open_b: false,
+                fail_read_b: false,
+                fail_generation: false,
+                expire_at_b: false,
+            }
+        }
+
+        fn run(&mut self, budget: &mut CaptureWorkBudget) -> Result<ScanOutcome, String> {
+            let view = ProcessView::open(self.view.id(), self.view.pid()).unwrap();
+            let hints = [self.path.clone()];
+            let hooks = HookRegistry::builtin();
+            let outcome = scan_process_view_with_io(
+                &ScanRequest {
+                    pid: view.pid(),
+                    hints: &hints,
+                    hooks: &hooks,
+                },
+                &view,
+                budget,
+                self,
+            );
+            self.log.borrow_mut().push("publication".into());
+            outcome
+        }
+
+        fn assert_refused(&mut self, budget: &mut CaptureWorkBudget, reason: &str) {
+            let outcome = self
+                .run(budget)
+                .expect("refusals must carry evidence, not discard it in Err");
+            assert_eq!(
+                outcome
+                    .modules()
+                    .iter()
+                    .map(|m| m.tables.len() + m.interfaces.len())
+                    .sum::<usize>(),
+                0,
+                "unvalidated tables/interfaces escaped"
+            );
+            assert!(
+                outcome
+                    .skipped()
+                    .iter()
+                    .any(|skip| skip.reason.contains(reason)),
+                "missing explicit {reason:?}: {:?}",
+                outcome.skipped()
+            );
+        }
+    }
+
+    #[test]
+    fn p2_bracket_split_span_with_unchanged_generation() {
+        let mut f = BracketFixture::new(8, true);
+        let original = f
+            .maps_b
+            .lines()
+            .find(|line| line.starts_with("4000-"))
+            .unwrap()
+            .to_owned();
+        let identity = original.split_once("00002000 ").unwrap().1;
+        f.maps_b = f.maps_b.replace(
+            &original,
+            &format!("4000-5000 rw-p 00002000 {identity}\n5000-6000 r--p 00003000 {identity}"),
+        );
+        f.assert_refused(
+            &mut CaptureWorkBudget::default(),
+            "memory scan refused: mapping changed during acquisition",
+        );
+        assert!(f.view.still_the_same());
+    }
+
+    #[test]
+    fn p2_bracket_function_dependency_full_mapping_equality() {
+        for replacement in [
+            "9000-a000 r-xp 00000010 08:01 999 /dependency.so",
+            "9000-a000 r-xp 00000000 08:01 998 /dependency.so",
+            "9000-a000 r-xp 00000000 08:02 999 /dependency.so",
+            "9000-a000 r--p 00000000 08:01 999 /dependency.so",
+            "9000-a000 r-xs 00000000 08:01 999 /dependency.so",
+            "9080-a000 r-xp 00000000 08:01 999 /dependency.so",
+            "9000-a000 r-xp 00000000 08:01 999 /replacement.so",
+        ] {
+            let mut f = BracketFixture::new(8, true);
+            f.maps_b = f.maps_b.replace(
+                "9000-a000 r-xp 00000000 08:01 999 /dependency.so",
+                replacement,
+            );
+            f.assert_refused(
+                &mut CaptureWorkBudget::default(),
+                "mapping changed during acquisition",
+            );
+        }
+    }
+
+    #[test]
+    fn p2_bracket_span_end_both_abis() {
+        for width in [8, 4] {
+            let mut f = BracketFixture::new(width, true);
+            f.maps_b = f.maps_b.replace("4000-6000", "4000-4810");
+            f.assert_refused(
+                &mut CaptureWorkBudget::default(),
+                "mapping changed during acquisition",
+            );
+        }
+    }
+
+    #[test]
+    fn p2_bracket_empty_result_checks_changed_and_added_data() {
+        for added in [false, true] {
+            let mut f = BracketFixture::new(8, false);
+            if added {
+                let identity = f
+                    .maps_a
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_once("00000000 ")
+                    .unwrap()
+                    .1;
+                f.maps_b
+                    .push_str(&format!("d000-e000 rw-p 00006000 {identity}\n"));
+            } else {
+                f.maps_b = f.maps_b.replace("4000-6000", "4000-5000");
+            }
+            f.assert_refused(
+                &mut CaptureWorkBudget::default(),
+                "mapping changed during acquisition",
+            );
+        }
+    }
+
+    #[test]
+    fn p2_bracket_interface_descriptor_and_name_mapping() {
+        for (old, new) in [("7000-8000", "7000-7110"), ("b000-c000", "b000-b110")] {
+            let mut f = BracketFixture::new(8, true);
+            f.maps_b = f.maps_b.replace(old, new);
+            f.assert_refused(
+                &mut CaptureWorkBudget::default(),
+                "mapping changed during acquisition",
+            );
+            let reads = f
+                .log
+                .borrow()
+                .iter()
+                .filter(|event| event.starts_with("memory b100"))
+                .count();
+            assert_eq!(reads, 1, "validation must not dereference names again");
+        }
+    }
+
+    #[test]
+    fn p2_bracket_blank_maps_b_is_unavailable() {
+        let mut f = BracketFixture::new(8, true);
+        f.maps_b = "\n".into();
+        f.assert_refused(
+            &mut CaptureWorkBudget::default(),
+            "final mapping validation unavailable",
+        );
+    }
+
+    #[test]
+    fn p2_bracket_unavailable_b() {
+        for case in [
+            "open",
+            "read",
+            "malformed",
+            "overlap",
+            "truncated",
+            "empty",
+            "bytes",
+            "entries",
+        ] {
+            let mut f = BracketFixture::new(8, true);
+            match case {
+                "open" => f.fail_open_b = true,
+                "read" => f.fail_read_b = true,
+                "malformed" => f.maps_b.push_str("malformed\n"),
+                "overlap" => f.maps_b.push_str("b000-d000 r--p 0 0:0 0\n"),
+                "truncated" => {
+                    f.maps_b.pop();
+                }
+                "empty" => f.maps_b.clear(),
+                "bytes" => f.maps_b.push_str(&format!(
+                    "d000-e000 r--p 0 0:0 0 /{}\n",
+                    "x".repeat(MAX_MAPS_BYTES as usize)
+                )),
+                "entries" => f
+                    .maps_b
+                    .push_str(&"d000-e000 r--p 0 0:0 0\n".repeat(MAX_MAP_ENTRIES + 1)),
+                _ => unreachable!(),
+            }
+            let detail = match case {
+                "open" => "injected maps B open failure",
+                "read" => "injected maps B read failure",
+                "malformed" => "invalid /proc maps line",
+                "overlap" => "reversed or overlapping",
+                "truncated" | "empty" => "empty or truncated",
+                "bytes" => MAPS_CEILING_REASON,
+                "entries" => MAPS_ENTRY_CEILING_REASON,
+                _ => unreachable!(),
+            };
+            f.assert_refused(
+                &mut CaptureWorkBudget::default(),
+                &format!("{FINAL_MAPS_UNAVAILABLE_REASON}: {detail}"),
+            );
+            eprintln!("unavailable B case {case}: refused with {detail}");
+        }
+    }
+
+    #[test]
+    fn p2_bracket_incomplete_a_never_scans() {
+        let mut f = BracketFixture::new(8, true);
+        let mut budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: f.maps_a.len() as u64 - 1,
+        });
+        f.assert_refused(
+            &mut budget,
+            "memory scan refused: initial mapping validation unavailable",
+        );
+        assert!(
+            !f.log
+                .borrow()
+                .iter()
+                .any(|event| event.starts_with("memory "))
+        );
+    }
+
+    #[test]
+    fn p2_bracket_generation_loss_keeps_refusal() {
+        let mut f = BracketFixture::new(8, true);
+        f.fail_generation = true;
+        f.assert_refused(
+            &mut CaptureWorkBudget::default(),
+            "memory scan refused: process generation changed during acquisition",
+        );
+    }
+
+    #[test]
+    fn p2_bracket_b_consumes_capture_io_allowance() {
+        let mut control = BracketFixture::new(8, true);
+        let mut measured = CaptureWorkBudget::default();
+        assert_eq!(
+            control.run(&mut measured).unwrap().modules()[0]
+                .tables
+                .len(),
+            1
+        );
+        let mut f = BracketFixture::new(8, true);
+        let mut budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: u64::MAX,
+            // Unfixed A-only cost plus less than one B snapshot.
+            total_bytes: control
+                .before_b
+                .map_or(measured.attempted_io_bytes(), |b| b.0)
+                + f.maps_b.len() as u64 / 2,
+        });
+        f.assert_refused(&mut budget, "final mapping validation unavailable");
+    }
+
+    #[test]
+    fn p2_bracket_b_consumes_work_allowance() {
+        let mut control = BracketFixture::new(8, true);
+        let mut measured = CaptureWorkBudget::default();
+        assert_eq!(
+            control.run(&mut measured).unwrap().modules()[0]
+                .tables
+                .len(),
+            1
+        );
+        let mut f = BracketFixture::new(8, true);
+        let mut budget = CaptureWorkBudget {
+            work_ceiling: control.before_b.map_or(measured.work_units, |b| b.1) + 1,
+            ..CaptureWorkBudget::default()
+        };
+        f.assert_refused(&mut budget, "final mapping validation unavailable");
+    }
+
+    #[test]
+    fn p2_bracket_independent_module_survives_refused_neighbor() {
+        let mut f = BracketFixture::new(8, true);
+        let neighbor = BracketFixture::new(8, true);
+        let extra = neighbor
+            .maps_a
+            .lines()
+            .filter(|line| !line.contains("/dependency.so"))
+            .map(|line| {
+                line.replace("1000-2000", "11000-12000")
+                    .replace("4000-6000", "14000-16000")
+                    .replace("7000-8000", "17000-18000")
+                    .replace("b000-c000", "1b000-1c000")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        f.maps_a.push_str(&extra);
+        f.maps_b = f.maps_a.replacen("4000-6000 rw-p", "4000-4810 rw-p", 1);
+        f.mem.set_len(0x1c000).unwrap();
+        let mut table = [0; 69 * 8];
+        neighbor.mem.read_exact_at(&mut table, 0x4800).unwrap();
+        f.mem.write_all_at(&table, 0x14800).unwrap();
+        let view = ProcessView::open(ProcessViewId(71), std::process::id()).unwrap();
+        let hints = [f.path.clone(), neighbor.path.clone()];
+        let outcome = scan_process_view_with_io(
+            &ScanRequest {
+                pid: view.pid(),
+                hints: &hints,
+                hooks: &HookRegistry::builtin(),
+            },
+            &view,
+            &mut CaptureWorkBudget::default(),
+            &mut f,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.modules().len(),
+            1,
+            "only the independent module should survive"
+        );
+        assert_eq!(
+            outcome.modules()[0].path,
+            neighbor.path.display().to_string()
+        );
+        assert_eq!(outcome.modules()[0].tables.len(), 1);
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.subject == f.path.display().to_string()
+                    && skip.reason == MAPPING_CHANGED_REASON)
+        );
+    }
+
+    #[test]
+    fn p2_bracket_b_checks_deadline() {
+        let mut f = BracketFixture::new(8, true);
+        f.expire_at_b = true;
+        let mut budget = CaptureWorkBudget::default();
+        budget.set_deadline(Some(u64::MAX));
+        f.assert_refused(&mut budget, "final mapping validation unavailable");
+    }
+
+    #[test]
+    fn p2_bracket_stable_and_unrelated_vma_positive_controls() {
+        for width in [8, 4] {
+            for unrelated in [false, true] {
+                let mut f = BracketFixture::new(width, true);
+                if unrelated {
+                    f.maps_a.push_str("d000-e000 rw-p 0 0:0 0 [unrelated]\n");
+                    f.maps_b.push_str("d000-f000 rw-p 0 0:0 0 [unrelated]\n");
+                }
+                let mut budget = CaptureWorkBudget::default();
+                let outcome = f.run(&mut budget).unwrap();
+                assert_eq!(outcome.modules().len(), 1, "{outcome:?}");
+                assert_eq!(outcome.modules()[0].tables.len(), 1, "{outcome:?}");
+                assert_eq!(outcome.modules()[0].tables[0].entries.len(), 67);
+                assert_eq!(outcome.modules()[0].tables[0].null_entries.len(), 1);
+                assert_eq!(outcome.modules()[0].interfaces.len(), 1);
+                assert_eq!(
+                    outcome.modules()[0].interfaces[0].name_lossy.as_deref(),
+                    Some("PKCS 11")
+                );
+                assert!(outcome.skipped().is_empty(), "{outcome:?}");
+                let log = f.log.borrow();
+                assert_eq!(log.first().unwrap(), "maps 1");
+                assert_eq!(
+                    &log[log.len() - 3..],
+                    ["maps 2", "final generation", "publication"]
+                );
+                assert!(
+                    log[1..log.len() - 3]
+                        .iter()
+                        .all(|event| event.starts_with("memory "))
+                );
+                assert!(
+                    budget.attempted_io_bytes()
+                        >= (f.maps_a.len() + f.maps_b.len()) as u64 + 0x3000 + 32 + 64
+                );
+            }
+        }
+    }
 
     #[test]
     fn source_pins_one_index_per_live_snapshot() {

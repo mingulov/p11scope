@@ -638,7 +638,8 @@ fn the_per_capture_byte_cap_accumulates_across_objects() {
     };
     // The native child blocks with both providers loaded, so test-worker maps
     // cannot alter acquisition costs between these scans. Measure all identity
-    // work, then cut the replay precisely before the final object's data.
+    // work, then remove the final object's data allowance. The replay cannot
+    // finish maps B, so even the earlier object's private result must be refused.
     let mut calibration_budget = CaptureWorkBudget::new(ScanLimits {
         per_object_bytes: 64 * 1024 * 1024,
         total_bytes: 512 * 1024 * 1024,
@@ -677,24 +678,22 @@ fn the_per_capture_byte_cap_accumulates_across_objects() {
     else {
         panic!("scan must be available")
     };
-    assert_eq!(modules.len(), 2, "both objects are identified: {modules:?}");
-    assert_eq!(
-        modules.iter().filter(|m| !m.tables.is_empty()).count(),
-        1,
-        "the budget admits exactly one object: {modules:?}"
+    assert!(
+        modules.is_empty(),
+        "no object can be published without maps B: {modules:?}"
     );
-    assert_eq!(
-        skipped.len(),
-        1,
-        "the object over the running total must be reported: {skipped:?}"
+    assert!(
+        skipped
+            .iter()
+            .any(|skip| skip.reason.contains("capture attempted-I/O ceiling")),
+        "{skipped:?}"
     );
-    assert_eq!(modules[0].path, calibrated[0].path);
-    assert_eq!(modules[1].path, last.path);
-    assert!(!modules[0].tables.is_empty());
-    assert!(modules[1].tables.is_empty());
-    assert_eq!(modules[1].exports, last.exports);
-    assert_eq!(skipped[0].subject, last.path);
-    assert!(skipped[0].reason.contains("capture attempted-I/O ceiling"));
+    assert!(
+        skipped.iter().any(|skip| skip
+            .reason
+            .starts_with("memory scan refused: final mapping validation unavailable")),
+        "{skipped:?}"
+    );
     assert_eq!(budget.attempted_io_bytes(), total_bytes);
     child
         .terminate()
@@ -714,8 +713,12 @@ fn separate_process_scans_cannot_renew_the_capture_byte_budget() {
     assert_eq!(object_bytes, readable_data_bytes(&second));
     let total_bytes = maps_snapshot_bytes()
         .checked_mul(2)
+        .and_then(|bytes| {
+            bytes.checked_add(std::fs::read("/proc/self/mountinfo").unwrap().len() as u64)
+        })
         .and_then(|bytes| bytes.checked_add(elf_bytes))
         .and_then(|bytes| bytes.checked_add(object_bytes))
+        .and_then(|bytes| bytes.checked_add(1)) // room to establish maps B EOF
         .expect("capture byte budget fits in u64");
     let hooks = HookRegistry::builtin();
     let limits = ScanLimits {
@@ -858,15 +861,15 @@ fn scan_budget_charges_only_the_prefix_read_before_aggregate_exhaustion() {
         "only the bytes actually read before the next refused read are charged"
     );
     assert!(
-        outcome.modules().iter().any(|module| {
-            module.path.ends_with("prefix-capped.so")
-                && module
-                    .exports
-                    .iter()
-                    .any(|name| name == "C_GetFunctionList")
-        }),
-        "the ELF inventory must succeed before memory is deliberately cut: {:?}",
-        outcome.modules()
+        outcome.modules().is_empty(),
+        "unvalidated ELF/memory inventory must stay private"
+    );
+    assert!(
+        outcome.skipped().iter().any(|skip| skip
+            .reason
+            .starts_with("memory scan refused: final mapping validation unavailable")),
+        "{:?}",
+        outcome.skipped()
     );
     assert!(
         outcome
@@ -890,6 +893,23 @@ fn an_unreadable_proc_mem_is_reported_as_unavailable_not_as_an_error() {
 
     let exe = std::fs::read_link(format!("/proc/{pid}/exe")).expect("target exe link");
     assert!(support::is_sleep(&exe));
+    // The launcher proves exec, which can precede relocation/RELRO. This
+    // inventory control requires sleep to have finished startup and blocked.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        if stat
+            .rsplit_once(") ")
+            .is_some_and(|(_, rest)| rest.starts_with("S "))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "target did not enter sleep"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
     let hooks = HookRegistry::builtin();
     let mut budget = CaptureWorkBudget::default();
     let outcome = scan_pid(
@@ -924,7 +944,7 @@ fn an_unreadable_proc_mem_is_reported_as_unavailable_not_as_an_error() {
         .modules()
         .iter()
         .find(|m| m.path == exe.display().to_string())
-        .unwrap_or_else(|| panic!("{} must still be identified", exe.display()));
+        .unwrap_or_else(|| panic!("{} must still be identified: {outcome:?}", exe.display()));
     if refused {
         assert!(
             module.tables.is_empty() && module.interfaces.is_empty(),

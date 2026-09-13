@@ -2462,6 +2462,45 @@ mod tests {
     }
 
     #[test]
+    fn p2_bracket_refusals_remain_distinct_finite_partial_evidence() {
+        let mut ev = evidence();
+        let reasons = [
+            crate::discovery::scan::MAPPING_CHANGED_REASON,
+            "memory scan refused: final mapping validation unavailable: PRIVATE_DETAIL",
+        ];
+        ev.skipped = reasons
+            .iter()
+            .map(|reason| {
+                capture_skipped_out(&crate::discovery::scan::Skipped {
+                    subject: "/PRIVATE_PROVIDER_PATH".into(),
+                    reason: (*reason).into(),
+                })
+            })
+            .collect();
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        for document in [
+            profile_json(
+                &reports_fixture(),
+                &ev,
+                &state_fixture(),
+                &capture_fixture(),
+            ),
+            json(&reports_fixture(), &ev, &capture_fixture()),
+        ] {
+            assert_eq!(document["evidence"]["completeness"], "PARTIAL");
+            assert_eq!(
+                document["evidence"]["skipped"],
+                serde_json::json!([
+                    {"name":"discovery subject","reason":"discovery unavailable"},
+                    {"name":"discovery subject","reason":"discovery unavailable"}
+                ])
+            );
+            assert!(!document.to_string().contains("PRIVATE_"));
+        }
+    }
+
+    #[test]
     fn bounded_decode_omissions_render_finite_partial_evidence() {
         use crate::discovery::scan::{Skipped, WORK_CEILING_REASON};
 

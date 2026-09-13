@@ -3261,7 +3261,22 @@ fn scan_and_pin(
     budget: &mut CaptureWorkBudget,
     counters: &mut DiscoveryCounters,
 ) -> Result<(Vec<ScannedModule>, PinnedObjects)> {
-    let outcome = scan_process_view(
+    scan_and_pin_with(view, hints, hooks, budget, counters, scan_process_view)
+}
+
+fn scan_and_pin_with(
+    view: &ProcessView,
+    hints: &[PathBuf],
+    hooks: &HookRegistry,
+    budget: &mut CaptureWorkBudget,
+    counters: &mut DiscoveryCounters,
+    scan: impl FnOnce(
+        &ScanRequest<'_>,
+        &ProcessView,
+        &mut CaptureWorkBudget,
+    ) -> std::result::Result<ScanOutcome, String>,
+) -> Result<(Vec<ScannedModule>, PinnedObjects)> {
+    let outcome = scan(
         &ScanRequest {
             pid: view.pid(),
             hints,
@@ -3272,12 +3287,8 @@ fn scan_and_pin(
     )
     .map_err(|error| anyhow!("scanning process view {:?}: {error}", view.id()))?;
     counters.scan_unavailable = counters.scan_unavailable.or(outcome.unavailable_reason());
-    let (pinned, pin_skips) = pin_scanned_view_objects(view, outcome.modules(), budget)
-        .map_err(|error| anyhow!("pinning process view {:?}: {error}", view.id()))?;
-    // Printed *and* kept: an object discovery could not read is a provider that
-    // may never have been observed, and a report that only prints it leaves the
-    // document claiming a clean capture.
-    for skipped in outcome.skipped().iter().chain(&pin_skips) {
+    // Retain acquisition losses before pinning can fail on an exited generation.
+    for skipped in outcome.skipped() {
         eprintln!(
             "{}",
             format_discovery_skip(&skipped.subject, &skipped.reason)
@@ -3285,14 +3296,21 @@ fn scan_and_pin(
         attribution::note(skipped);
         counters.object_skips.push(skipped.clone());
     }
+    if let ScanOutcome::Scanned { scan_ms, .. } = &outcome {
+        counters.scan_ms = counters.scan_ms.saturating_add(*scan_ms);
+    }
+    let (pinned, pin_skips) = pin_scanned_view_objects(view, outcome.modules(), budget)
+        .map_err(|error| anyhow!("pinning process view {:?}: {error}", view.id()))?;
+    for skipped in pin_skips {
+        eprintln!(
+            "{}",
+            format_discovery_skip(&skipped.subject, &skipped.reason)
+        );
+        attribution::note(&skipped);
+        counters.object_skips.push(skipped);
+    }
     let modules = match outcome {
-        ScanOutcome::Scanned {
-            modules, scan_ms, ..
-        } => {
-            counters.scan_ms += scan_ms;
-            modules
-        }
-        ScanOutcome::Unavailable { modules, .. } => modules,
+        ScanOutcome::Scanned { modules, .. } | ScanOutcome::Unavailable { modules, .. } => modules,
     };
     Ok((modules, pinned))
 }
@@ -6707,16 +6725,37 @@ impl Engine {
         module_hints: &[PathBuf],
         hooks: &HookRegistry,
         budget: &mut CaptureWorkBudget,
-    ) -> Result<(Vec<ScannedModule>, PinnedObjects, DiscoveryCounters)> {
+    ) -> (
+        Result<(Vec<ScannedModule>, PinnedObjects)>,
+        DiscoveryCounters,
+    ) {
+        Self::scan_retained_view_with(|counters| {
+            scan_and_pin(view, module_hints, hooks, budget, counters)
+        })
+    }
+
+    fn scan_retained_view_with(
+        scan: impl FnOnce(&mut DiscoveryCounters) -> Result<(Vec<ScannedModule>, PinnedObjects)>,
+    ) -> (
+        Result<(Vec<ScannedModule>, PinnedObjects)>,
+        DiscoveryCounters,
+    ) {
         let mut counters = DiscoveryCounters::default();
-        let (modules, pins) = scan_and_pin(view, module_hints, hooks, budget, &mut counters)?;
-        Ok((modules, pins, counters))
+        let result = scan(&mut counters);
+        (result, counters)
     }
 
     fn absorb_scan_counters(&mut self, counters: DiscoveryCounters) -> Vec<Skipped> {
         self.counters.scan_unavailable =
             self.counters.scan_unavailable.or(counters.scan_unavailable);
         self.counters.scan_ms = self.counters.scan_ms.saturating_add(counters.scan_ms);
+        // An acquisition failure has already happened. Keep it even if later
+        // inventory construction fails or normal exit suppresses a generic gap.
+        for skipped in &counters.object_skips {
+            if skipped.reason.starts_with("memory scan refused: ") {
+                self.mark_partial(&skipped.subject, &skipped.reason);
+            }
+        }
         counters.object_skips
     }
 
@@ -8035,13 +8074,22 @@ impl Engine {
             ));
         }
 
-        let (found, fresh_pins, scan_counters) = Self::scan_retained_view(
+        let (scan_result, scan_counters) = Self::scan_retained_view(
             &self.views[position],
             &self.module_hints,
             &self.hooks,
             &mut self.budget,
-        )?;
+        );
         let mut skipped = self.absorb_scan_counters(scan_counters);
+        let (found, fresh_pins) = match scan_result {
+            Ok(value) => value,
+            Err(error) => {
+                for skip in skipped {
+                    self.mark_partial(&skip.subject, &skip.reason);
+                }
+                return Err(error);
+            }
+        };
         let export_modules = found.clone();
         let mut candidate_pins = self.pinned.clone();
         skipped.extend(candidate_pins.replace_view_pins(
@@ -10947,14 +10995,15 @@ impl Engine {
                 .iter()
                 .position(|view| view.id() == *view_id)
                 .expect("inventory view remains retained");
-            match Self::scan_retained_view(
+            let (scan_result, counters) = Self::scan_retained_view(
                 &self.views[position],
                 &self.module_hints,
                 &self.hooks,
                 &mut self.budget,
-            ) {
-                Ok((modules, pins, counters)) => {
-                    skipped.extend(self.absorb_scan_counters(counters));
+            );
+            skipped.extend(self.absorb_scan_counters(counters));
+            match scan_result {
+                Ok((modules, pins)) => {
                     scans.push((*view_id, modules, pins));
                 }
                 Err(error) => {
@@ -11204,10 +11253,11 @@ impl Engine {
                     continue;
                 }
             };
-            match Self::scan_retained_view(&view, &self.module_hints, &self.hooks, &mut self.budget)
-            {
-                Ok((modules, pins, counters)) => {
-                    skipped.extend(self.absorb_scan_counters(counters));
+            let (scan_result, counters) =
+                Self::scan_retained_view(&view, &self.module_hints, &self.hooks, &mut self.budget);
+            skipped.extend(self.absorb_scan_counters(counters));
+            match scan_result {
+                Ok((modules, pins)) => {
                     new_views.push((view, modules, pins));
                 }
                 Err(error) => {
@@ -25897,7 +25947,8 @@ int main(int argc, char **argv) {
             .sum();
         let hash_bytes = std::fs::metadata(&exe).unwrap().len();
         let elf_snapshot_bytes = hash_bytes;
-        let scan_pass = maps_bytes.len() as u64 + scan_bytes;
+        // Both complete maps snapshots belong to each scan operation.
+        let scan_pass = maps_bytes.len() as u64 * 2 + scan_bytes;
         let mut budget = CaptureWorkBudget::new(ScanLimits {
             per_object_bytes: scan_bytes.max(hash_bytes),
             total_bytes: scan_pass * 2 + elf_snapshot_bytes * 2 + hash_bytes,
@@ -26172,6 +26223,156 @@ int main(int argc, char **argv) {
     /// entry to skip, no attach to fail and no counter to raise. Printed and
     /// dropped, it leaves a document whose every field says the capture was
     /// clean while a provider went unobserved.
+    fn p2_refuse_then_exit(
+        counters: &mut DiscoveryCounters,
+    ) -> Result<(Vec<ScannedModule>, PinnedObjects)> {
+        let mut child = std::process::Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let view = ProcessView::open(ProcessViewId(711), child.id()).unwrap();
+        let result = scan_and_pin_with(
+            &view,
+            &[],
+            &HookRegistry::builtin(),
+            &mut CaptureWorkBudget::default(),
+            counters,
+            |_, view, budget| {
+                let outcome = crate::discovery::scan::bracket_refusal_for_test(view, budget);
+                assert!(outcome.modules().is_empty());
+                assert!(
+                    outcome
+                        .skipped()
+                        .iter()
+                        .any(|skip| skip.reason == crate::discovery::scan::MAPPING_CHANGED_REASON)
+                );
+                drop(child.stdin.take());
+                assert!(child.wait().unwrap().success());
+                assert_eq!(view.original_exited(), Ok(true));
+                Ok(outcome)
+            },
+        );
+        assert!(
+            result
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("pinning process view")
+        );
+        result
+    }
+
+    #[test]
+    fn p2_refusal_occurrences_survive_history_and_sanitized_duplicates() {
+        let (result, mut counters) = Engine::scan_retained_view_with(p2_refuse_then_exit);
+        assert!(result.is_err());
+        let mut distinct = counters.object_skips[0].clone();
+        distinct.reason = "memory scan refused: final mapping validation unavailable".into();
+        counters.object_skips.push(distinct);
+        assert_eq!(counters.object_skips.len(), 2);
+        let mut facts = CaptureFacts::default();
+        let mut plan = plan::build_from_reconciled_modules(&[]);
+        facts
+            .merge_current(&plan, &PinnedObjects::empty(), &[], &[], &[], &counters)
+            .unwrap();
+        facts
+            .merge_current(
+                &plan,
+                &PinnedObjects::empty(),
+                &[],
+                &[],
+                &[],
+                &DiscoveryCounters::default(),
+            )
+            .unwrap();
+        facts.apply_to_plan(&mut plan);
+        assert_eq!(
+            plan.skipped.len(),
+            2,
+            "retirement must retain both distinct acquisition losses"
+        );
+        let public: Vec<_> = plan
+            .skipped
+            .iter()
+            .map(render::capture_skipped_out)
+            .collect();
+        assert_eq!(
+            serde_json::to_value(public).unwrap(),
+            serde_json::json!([
+                {"name":"discovery subject","reason":"discovery unavailable"},
+                {"name":"discovery subject","reason":"discovery unavailable"}
+            ])
+        );
+    }
+
+    #[test]
+    fn p2_absorbed_refusal_survives_later_inventory_failure() {
+        let (result, counters) = Engine::scan_retained_view_with(p2_refuse_then_exit);
+        assert!(result.is_err());
+        let expected = counters.object_skips[0].clone();
+        let mut engine = Engine::empty();
+        let pending_skips = engine.absorb_scan_counters(counters);
+        assert!(pending_skips.contains(&expected));
+        // Subsequent candidate construction may fail; publishing retained
+        // capture facts must still include the already incurred acquisition loss.
+        engine.publish_current_capture_facts().unwrap();
+        assert!(
+            engine.plan.skipped.contains(&expected),
+            "absorbed acquisition loss depended on candidate success"
+        );
+    }
+
+    #[test]
+    fn p2_refusal_saved_before_pinning_failure() {
+        let mut counters = DiscoveryCounters::default();
+        assert!(p2_refuse_then_exit(&mut counters).is_err());
+        assert!(
+            counters
+                .object_skips
+                .iter()
+                .any(|skip| skip.reason == crate::discovery::scan::MAPPING_CHANGED_REASON),
+            "pinning error lost bracket refusal: {:?}",
+            counters.object_skips
+        );
+    }
+
+    #[test]
+    fn p2_retained_scan_error_keeps_counters_and_survives_attachment() {
+        let (result, counters) = Engine::scan_retained_view_with(p2_refuse_then_exit);
+        assert!(result.is_err());
+        let refusal = counters
+            .object_skips
+            .iter()
+            .find(|skip| skip.reason == crate::discovery::scan::MAPPING_CHANGED_REASON)
+            .expect("retained scan error discarded bracket refusal")
+            .clone();
+        // Normal-exit bookkeeping suppresses only the generic unreadable member.
+        assert!(unreadable_member_skip(711, true, "pin failure").is_none());
+        for source in ["manifest", "scan"] {
+            let mut plan = plan_with(1, 0);
+            plan.modules[0].path = refusal.subject.clone();
+            plan.modules[0].source = source;
+            plan.modules[0].tables.push(plan::TableSummary {
+                version: (2, 40),
+                entries: 68,
+                source,
+            });
+            record_object_skips(&mut plan, std::slice::from_ref(&refusal));
+            record_object_skips(&mut plan, &[]);
+            assert_eq!(
+                plan.skipped,
+                [refusal.clone()],
+                "later {source} erased acquisition loss"
+            );
+            let public = render::capture_skipped_out(&plan.skipped[0]);
+            assert_eq!(
+                serde_json::to_value(public).unwrap(),
+                serde_json::json!({"name":"discovery subject","reason":"discovery unavailable"})
+            );
+        }
+    }
+
     #[test]
     fn an_object_the_scan_could_not_read_is_published_not_only_printed() {
         let (modules, _) = pinned_self();

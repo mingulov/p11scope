@@ -842,6 +842,24 @@ pin_workload() {
     }
 }
 
+# The workload publishes READY and then waits for the GO gate, and it REFUSES
+# to start if GO already exists (canary_workload.c, "GO already exists"). So GO
+# must be created only after the workload is up, never before it is released.
+wait_for_workload_ready() {
+    wfwr_attempt=0
+    while [ "$wfwr_attempt" -lt 400 ]; do
+        [ -f "$WORK/freeze-ready" ] && return 0
+        process_matches_starttime "$WPID" "$WORKLOAD_STARTTIME" || {
+            echo "workload $WPID exited before publishing READY" >&2
+            return 1
+        }
+        wfwr_attempt=$((wfwr_attempt + 1))
+        sleep 0.05
+    done
+    echo "workload $WPID never published READY" >&2
+    return 1
+}
+
 wait_for_workload_stopped() {
     wfws_attempt=0
     while [ "$wfws_attempt" -lt 400 ]; do
@@ -976,8 +994,9 @@ sudo python3 -I scripts/dump-owned-bpf-maps.py \
     "$TASK_STORAGE_READER" "$TASK_STORAGE_OBJECT"
 freeze_policy_maps "$WPID" "$CGROUP_PATH" \
     "$WORK/mapdump_manifest_freeze-before.json"
-touch "$WORK/freeze-go"
 printf '\n' > "$WORK/freeze-barrier"
+wait_for_workload_ready
+touch "$WORK/freeze-go"
 wait_for_workload_stopped
 sudo python3 -I scripts/dump-owned-bpf-maps.py \
     "$OBSERVER_PID" "$WORK" freeze-after 0 16384 \

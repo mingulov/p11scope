@@ -495,7 +495,12 @@ LANE14_STABLE_CARGO=$P11SCOPE_PREPARED_STABLE_CARGO
 LANE14_STABLE_RUSTC=$P11SCOPE_PREPARED_STABLE_RUSTC
 LANE14_BPF_CARGO=$P11SCOPE_PREPARED_BPF_CARGO
 LANE14_BPF_RUSTC=$P11SCOPE_PREPARED_BPF_RUSTC
-LANE14_PREPARED_PREFIX=$(readlink -f "$LANE14_ARTIFACTS") || exit 77
+# `realpath -e`, not `readlink -f`: build-release runs this lane under a sealed
+# PATH whose tool set includes realpath and NOT readlink, so readlink here fails
+# with "not found" only in the release driver and never in a standalone run. The
+# artifacts directory is already required to exist and not be a symlink above, so
+# -e is exact rather than merely equivalent.
+LANE14_PREPARED_PREFIX=$(realpath -e "$LANE14_ARTIFACTS") || exit 77
 LANE14_PREPARED_PREFIX=$LANE14_PREPARED_PREFIX/discover.prepared
 "$LANE14_PYTHON" -I scripts/prepared-dependency-evidence.py capture \
     --prefix "$LANE14_PREPARED_PREFIX" \

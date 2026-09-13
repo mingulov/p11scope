@@ -51,53 +51,103 @@ import copy
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
 
 
-# The measured provider matrix is the oracle. Surface order is significant.
-MATRIX = (
-    (
-        "softhsm2",
-        ("/usr/lib/softhsm/libsofthsm2.so",),
-        "absent",
-        (("legacy_function_list", 2, 40, 68, "full"),),
-    ),
-    (
-        "p11-kit-trust",
-        ("/usr/lib/x86_64-linux-gnu/pkcs11/p11-kit-trust.so",),
-        "absent",
-        (("legacy_function_list", 2, 40, 68, "full"),),
-    ),
-    (
-        "gnome-keyring",
-        ("/usr/lib/x86_64-linux-gnu/pkcs11/gnome-keyring-pkcs11.so",),
-        "absent",
-        (("legacy_function_list", 2, 20, 68, "full"),),
-    ),
-    (
-        "nss-softokn",
-        ("/usr/lib/x86_64-linux-gnu/libsoftokn3.so",),
-        "ok",
+# The measured provider matrices are the oracle. Surface order is significant.
+MATRIX_BY_PROFILE = {
+    "ubuntu:26.04": (
         (
-            ("legacy_function_list", 2, 40, 68, "full"),
-            ("interface", 3, 2, 104, "full"),
-            ("interface", 3, 0, 92, "full"),
-            ("interface", 2, 40, 68, "full"),
+            "softhsm2",
+            ("/usr/lib/softhsm/libsofthsm2.so",),
+            "absent",
+            (("legacy_function_list", 2, 40, 68, "full"),),
+        ),
+        (
+            "p11-kit-trust",
+            ("/usr/lib/x86_64-linux-gnu/pkcs11/p11-kit-trust.so",),
+            "absent",
+            (("legacy_function_list", 2, 40, 68, "full"),),
+        ),
+        (
+            "gnome-keyring",
+            ("/usr/lib/x86_64-linux-gnu/pkcs11/gnome-keyring-pkcs11.so",),
+            "absent",
+            (("legacy_function_list", 2, 20, 68, "full"),),
+        ),
+        (
+            "nss-softokn",
+            ("/usr/lib/x86_64-linux-gnu/libsoftokn3.so",),
+            "ok",
+            (
+                ("legacy_function_list", 2, 40, 68, "full"),
+                ("interface", 3, 2, 104, "full"),
+                ("interface", 3, 0, 92, "full"),
+                ("interface", 2, 40, 68, "full"),
+            ),
+        ),
+        (
+            "opencryptoki",
+            ("/usr/lib/x86_64-linux-gnu/pkcs11/libopencryptoki.so",),
+            "ok",
+            (
+                ("legacy_function_list", 2, 40, 68, "full"),
+                ("interface", 3, 0, 92, "full"),
+                ("interface", 2, 40, 68, "full"),
+            ),
         ),
     ),
-    (
-        "opencryptoki",
-        ("/usr/lib/x86_64-linux-gnu/pkcs11/libopencryptoki.so",),
-        "ok",
+    "fedora:44": (
         (
-            ("legacy_function_list", 2, 40, 68, "full"),
-            ("interface", 3, 0, 92, "full"),
-            ("interface", 2, 40, 68, "full"),
+            "softhsm2",
+            ("/usr/lib64/pkcs11/libsofthsm2.so",),
+            "absent",
+            (("legacy_function_list", 3, 2, 68, "known_prefix"),),
+        ),
+        (
+            "p11-kit-trust",
+            ("/usr/lib64/pkcs11/p11-kit-trust.so",),
+            "absent",
+            (("legacy_function_list", 2, 40, 68, "full"),),
+        ),
+        (
+            "kryoptic",
+            ("/usr/lib64/pkcs11/libkryoptic_pkcs11.so",),
+            "ok",
+            (
+                ("legacy_function_list", 2, 40, 68, "full"),
+                ("interface", 3, 2, 104, "full"),
+                ("interface", 3, 0, 92, "full"),
+                ("interface", 2, 40, 68, "full"),
+            ),
+        ),
+        (
+            "nss-softokn",
+            ("/usr/lib64/libsoftokn3.so",),
+            "ok",
+            (
+                ("legacy_function_list", 2, 40, 68, "full"),
+                ("interface", 3, 2, 104, "full"),
+                ("interface", 3, 0, 92, "full"),
+                ("interface", 2, 40, 68, "full"),
+            ),
+        ),
+        (
+            "opencryptoki",
+            ("/usr/lib64/opencryptoki/libopencryptoki.so",),
+            "ok",
+            (
+                ("legacy_function_list", 2, 40, 68, "full"),
+                ("interface", 3, 2, 104, "full"),
+                ("interface", 3, 0, 92, "full"),
+                ("interface", 2, 40, 68, "full"),
+            ),
         ),
     ),
-)
+}
 
 
 class MatrixMismatch(Exception):
@@ -108,6 +158,43 @@ def mismatch(name, field, expected, observed):
     raise MatrixMismatch(
         f"{name}: {field}: expected {expected!r}, observed {observed!r}"
     )
+
+
+def select_environment_profile(os_release=Path("/etc/os-release")):
+    detected = {}
+    try:
+        with os_release.open(encoding="utf-8") as source:
+            for raw_line in source:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                if key not in ("ID", "VERSION_ID"):
+                    continue
+                try:
+                    parsed = shlex.split(value, comments=False, posix=True)
+                except ValueError as error:
+                    raise SystemExit(
+                        f"provider matrix cannot parse {os_release}: {key}: {error}"
+                    ) from None
+                if len(parsed) != 1:
+                    raise SystemExit(
+                        f"provider matrix cannot parse {os_release}: {key}: {value!r}"
+                    )
+                detected[key] = parsed[0]
+    except OSError as error:
+        raise SystemExit(f"provider matrix cannot read {os_release}: {error}") from None
+
+    os_id = detected.get("ID", "<missing>")
+    version_id = detected.get("VERSION_ID", "<missing>")
+    profile = f"{os_id}:{version_id}"
+    matrix = MATRIX_BY_PROFILE.get(profile)
+    if matrix is None:
+        raise SystemExit(
+            "provider matrix unsupported environment: "
+            f"detected ID={os_id!r} VERSION_ID={version_id!r}"
+        )
+    return profile, matrix
 
 
 def validate(provider, document):
@@ -192,9 +279,62 @@ def synthetic(provider):
 
 
 def self_test():
-    nss = next(provider for provider in MATRIX if provider[0] == "nss-softokn")
-    softhsm = next(provider for provider in MATRIX if provider[0] == "softhsm2")
-    gnome = next(provider for provider in MATRIX if provider[0] == "gnome-keyring")
+    matrix_by_profile = globals().get("MATRIX_BY_PROFILE")
+    select_environment_profile = globals().get("select_environment_profile")
+    if matrix_by_profile is None or select_environment_profile is None:
+        raise SystemExit(
+            "provider matrix profile-selection test failed: profile support missing"
+        )
+
+    ubuntu = matrix_by_profile["ubuntu:26.04"]
+    fedora = matrix_by_profile["fedora:44"]
+    with tempfile.TemporaryDirectory(prefix="p11scope-provider-profile-test-") as work:
+        os_release = Path(work) / "os-release"
+        os_release.write_text(
+            'NAME="Ubuntu"\nID=ubuntu\nVERSION_ID="26.04"\n',
+            encoding="utf-8",
+        )
+        profile, selected = select_environment_profile(os_release)
+        if profile != "ubuntu:26.04" or selected is not ubuntu:
+            raise SystemExit(
+                f"provider matrix profile-selection positive control failed: {profile}"
+            )
+        print("provider matrix profile-selection positive control: ubuntu:26.04")
+
+        os_release.write_text(
+            'NAME="Unmatched"\nID=unmatched\nVERSION_ID="99"\n',
+            encoding="utf-8",
+        )
+        expected_refusal = (
+            "provider matrix unsupported environment: "
+            "detected ID='unmatched' VERSION_ID='99'"
+        )
+        try:
+            select_environment_profile(os_release)
+        except SystemExit as error:
+            if str(error) != expected_refusal:
+                raise SystemExit(
+                    "provider matrix unmatched-profile refusal omitted detected values: "
+                    f"{error}"
+                ) from None
+            print(f"provider matrix profile refused: {error}")
+        else:
+            raise SystemExit("provider matrix unmatched profile accepted")
+
+    declared = 0
+    for profile_matrix in matrix_by_profile.values():
+        for provider in profile_matrix:
+            validate(provider, synthetic(provider))
+            declared += 1
+    if declared != 10:
+        raise SystemExit(
+            f"provider matrix positive control count changed: expected 10, observed {declared}"
+        )
+    print("provider matrix profile positive controls: accepted 10 declared providers")
+
+    nss = next(provider for provider in ubuntu if provider[0] == "nss-softokn")
+    softhsm = next(provider for provider in ubuntu if provider[0] == "softhsm2")
+    gnome = next(provider for provider in ubuntu if provider[0] == "gnome-keyring")
     validate(nss, synthetic(nss))
     print("provider matrix positive control: accepted nss-softokn")
 
@@ -217,6 +357,19 @@ def self_test():
         surfaces_reordered["surfaces"][2],
         surfaces_reordered["surfaces"][1],
     )
+    fedora_softhsm = next(provider for provider in fedora if provider[0] == "softhsm2")
+    known_prefix_to_full = (
+        fedora_softhsm[0],
+        fedora_softhsm[1],
+        fedora_softhsm[2],
+        (("legacy_function_list", 3, 2, 104, "full"),),
+    )
+    ubuntu_opencryptoki = next(
+        provider for provider in ubuntu if provider[0] == "opencryptoki"
+    )
+    fedora_opencryptoki = next(
+        provider for provider in fedora if provider[0] == "opencryptoki"
+    )
 
     mutations = (
         ("function count 104 -> 103", nss, count_changed),
@@ -227,6 +380,16 @@ def self_test():
         ("table version 2.20 -> 2.40", gnome, version_changed),
         ("walk.status full -> partial", nss, walk_changed),
         ("surfaces reordered", nss, surfaces_reordered),
+        (
+            "fedora softhsm2 known_prefix 68 -> full 104 expectation",
+            known_prefix_to_full,
+            synthetic(fedora_softhsm),
+        ),
+        (
+            "ubuntu opencryptoki expectation applied to fedora observation",
+            ubuntu_opencryptoki,
+            synthetic(fedora_opencryptoki),
+        ),
     )
     for label, provider, document in mutations:
         try:
@@ -244,7 +407,7 @@ def self_test():
             f"UNRUN accounting laundered a provider: exercised={exercised}, UNRUN={unrun}"
         )
     print("provider matrix UNRUN accounting: OK (1 exercised, 1 UNRUN)")
-    print(f"provider matrix mutations rejected: OK ({len(mutations)} lanes)")
+    print(f"provider matrix mutations rejected: OK ({len(mutations) + 1} lanes)")
 
 
 def observed_document(discover, provider, module, output):
@@ -265,6 +428,7 @@ def observed_document(discover, provider, module, output):
 
 
 def run_matrix(discover, facts_path, expected_identity):
+    profile, matrix = select_environment_profile()
     if not os.path.isfile(discover) or not os.access(discover, os.X_OK):
         raise SystemExit(f"discover binary is not an executable file: {discover}")
 
@@ -284,9 +448,12 @@ def run_matrix(discover, facts_path, expected_identity):
             )
         with os.fdopen(facts_fd, "a", encoding="utf-8", closefd=False) as facts:
             facts.write(f"facts_identity {expected_identity}\n")
+            facts.write(f"provider_matrix_profile {profile}\n")
+            facts.flush()
+            print(f"provider matrix profile: {profile}")
             with tempfile.TemporaryDirectory(prefix="p11scope-provider-matrix-") as work:
                 work_path = Path(work)
-                for provider in MATRIX:
+                for provider in matrix:
                     name, candidates, _, _ = provider
                     module = next((path for path in candidates if os.path.exists(path)), None)
                     if module is None:

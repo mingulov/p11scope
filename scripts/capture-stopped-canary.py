@@ -319,7 +319,7 @@ class LiveMaps:
     """Only live BPF acquisition boundaries; process lifetime belongs to Custody."""
     def __init__(self, config):
         self.config, self.owner = config, None
-        self.fds, self.rings = [], {}
+        self.fds, self.fd_by_id, self.rings = [], {}, {}
         self.cpus = dumper.possible_cpu_ids()
 
     def _json(self, args, deadline, *, bound, item=None):
@@ -363,11 +363,20 @@ class LiveMaps:
             if fd < 0:
                 raise OSError(ctypes.get_errno(), 'retain acquisition map')
             self.fds.append(fd)
+            self.fd_by_id[item['id']] = fd
 
     def dump(self, item, deadline, bound):
         raw = self._json(['bpftool', '-j', 'map', 'dump', 'id', str(item['id'])],
                          deadline, bound=bound, item=item)
         return dumper.normalize_map_dump(raw, item, possible_cpus=self.cpus)
+
+    def refuse(self, item, deadline):
+        # An in-process syscall on the descriptor already retained for this
+        # map id: no child, so none of _run_bounded_bytes' preconditions apply,
+        # and no second reference to the map is opened mid-acquisition.
+        remaining(deadline)
+        return dumper.normalize_refused_lookup(
+            dumper.probe_refused_lookup(item, fd=self.fd_by_id[item['id']]), item)
 
     def frames(self, pid, maps, deadline, bound):
         with self.owner.helper_wait():
@@ -398,6 +407,7 @@ class LiveMaps:
                 issues.extend(sanitized(f'close-ring-{name}', error))
         self.rings.clear()
         fds, self.fds = self.fds, []
+        self.fd_by_id.clear()
         for fd in fds:
             try:
                 os.close(fd)
@@ -676,6 +686,14 @@ class Coordinator:
                 raw = encoded(cells)
                 self.files.write(self.files.stage / f'mapdump_{item["name"]}_{cfg.lane}.json', raw)
                 ordinary[item['name']], values[item['name']] = cells, raw
+            elif item['oracle'] == 'refused-lookup':
+                # The kernel's own per-key refusal is this map's whole surface.
+                # It is deliberately not `ordinary`: that dict carries decoded
+                # control/START/EVIDENCE cells, and there is no cell to decode.
+                self.check(f'refuse-{item["name"]}', deadline)
+                raw = encoded(source.refuse(item, deadline))
+                self.files.write(self.files.stage / f'mapdump_{item["name"]}_{cfg.lane}.json', raw)
+                values[item['name']] = raw
         task_maps = [item for item in maps if item['type'] == 'task_storage']
         self.check('task-frames', deadline)
         frames = source.frames(observer.popen.pid, task_maps, deadline, MAX_BYTES - self.files.total)

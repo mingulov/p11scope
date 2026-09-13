@@ -48,6 +48,17 @@ def load_dumper():
     return module
 
 
+def refusal_cells(item, errno=524):
+    """A cgroup_array surface: one kernel -ENOTSUPP per key, and no value.
+
+    `cgroup_array_map_ops` has no `map_fd_sys_lookup_elem`, so this refusal is
+    the only thing userspace can witness about the map's values.
+    """
+    return [{"key": [f"0x{byte:02x}" for byte
+                     in index.to_bytes(item["key_size"], "little")], "errno": errno}
+            for index in range(item["max_entries"])]
+
+
 def load_capture_checker():
     spec = importlib.util.spec_from_file_location("capture_evidence", CAPTURE_CHECKER)
     module = importlib.util.module_from_spec(spec)
@@ -324,21 +335,28 @@ class OwnedMapWrapperTests(unittest.TestCase):
                 sorted(subject.BPF_MAP_DEFS["SAFE_MAPS"].items()), start=1
             ):
                 ring = definition["type"] == 27
-                task_storage = definition["type"] == 29
+                # Type from the checked-in definition: a cgroup_array has no
+                # userspace lookup, so it is never a dump of anything.
+                map_type, oracle = {
+                    27: ("ringbuf", "mmap"), 29: ("task_storage", "task-storage"),
+                    8: ("cgroup_array", "refused-lookup"),
+                }.get(definition["type"], ("hash", "dump"))
                 item = {
                     "name": name,
                     "id": map_id,
                     "max_entries": definition["max_entries"],
                     "key_size": 0 if ring else definition["key_size"],
                     "value_size": 0 if ring else definition["value_size"],
-                    "type": "ringbuf" if ring else "task_storage" if task_storage else "hash",
-                    "oracle": "mmap" if ring else "task-storage" if task_storage else "dump",
+                    "type": map_type,
+                    "oracle": oracle,
                 }
                 if ring:
                     subject.ring_raw_path(prefix, name).write_bytes(b"")
                 else:
                     item["file"] = str(root / f"mapdump_{name}_{lane}.json")
-                    Path(item["file"]).write_text("[]\n", encoding="utf-8")
+                    Path(item["file"]).write_text(
+                        json.dumps(refusal_cells(item)) + "\n" if map_type == "cgroup_array"
+                        else "[]\n", encoding="utf-8")
                 manifest.append(item)
             manifest_path = root / f"mapdump_manifest_{lane}.json"
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
@@ -740,6 +758,8 @@ class TaskStorageReaderTests(unittest.TestCase):
             obj.write_bytes(b"object")
             commands = []
             inventory = [
+                {"name": "CGROUP_FILTER", "id": 96, "type": "cgroup_array", "bytes_key": 4,
+                 "bytes_value": 4, "max_entries": 1, "flags": 0},
                 {"name": "OWNER_CTL", "id": 97, "type": "array", "bytes_key": 4,
                  "bytes_value": 56, "max_entries": 1, "flags": 0},
                 {"name": "START", "id": 99, "type": "hash", "bytes_key": 8,
@@ -779,10 +799,21 @@ class TaskStorageReaderTests(unittest.TestCase):
                 "dump-owned-bpf-maps.py", "55", str(root), "case", "0", "16384",
                 str(reader.resolve()), str(obj.resolve()),
             ]
+            probes = []
+
+            def fake_probe(item, *, fd=None):
+                # Stand in for bpf(BPF_MAP_LOOKUP_ELEM) against the observer's
+                # own map: one -ENOTSUPP per key, and no value anywhere.
+                probes.append((item["id"], fd))
+                return [{"key": list(index.to_bytes(item["bytes_key"], "little")),
+                         "errno": dumper.ENOTSUPP}
+                        for index in range(item["max_entries"])]
+
             with mock.patch.object(dumper, "map_ids_from_fdinfo",
-                                   return_value=[97, 98, 99, 101, 102, 103]), \
+                                   return_value=[96, 97, 98, 99, 101, 102, 103]), \
                     mock.patch.object(dumper.glob, "glob", return_value=[]), \
                     mock.patch.object(dumper, "run_json", side_effect=fake_json), \
+                    mock.patch.object(dumper, "probe_refused_lookup", side_effect=fake_probe), \
                     mock.patch.object(dumper, "possible_cpu_ids", return_value=(0, 1)), \
                     mock.patch.object(dumper, "run_task_storage_reader",
                                       return_value=self.complete_stream()), \
@@ -791,7 +822,12 @@ class TaskStorageReaderTests(unittest.TestCase):
             dumped_ids = [int(command[-1]) for command in commands
                           if command[2:5] == ("map", "dump", "id")]
             self.assertEqual(dumped_ids, [97, 98, 99], commands)
+            self.assertEqual(probes, [(96, None)])
             manifest = json.loads((root / "mapdump_manifest_case.json").read_text())
+            refused = next(item for item in manifest if item["name"] == "CGROUP_FILTER")
+            self.assertEqual(refused["oracle"], "refused-lookup")
+            self.assertEqual(json.loads(Path(refused["file"]).read_text()),
+                             [{"key": ["0x00"] * 4, "errno": 524}])
             self.assertTrue(all("map_flags" in item for item in manifest))
             task_items = [item for item in manifest if item["oracle"] == "task-storage"]
             self.assertEqual(len(task_items), 3)
@@ -808,6 +844,47 @@ class TaskStorageReaderTests(unittest.TestCase):
                 subject.assert_final_artifact_privacy([Path(stats["file"])])
             owner_control = next(item for item in manifest if item["name"] == "OWNER_CTL")
             self.assertNotIn("formatted", json.loads(Path(owner_control["file"]).read_text())[0])
+
+    def test_main_refuses_to_publish_an_invented_cgroup_array_value(self):
+        """A refusal the kernel did not give is never written to disk.
+
+        `main()` normalizes the probe's own cells, so a value beside them or a
+        successful lookup fails the run instead of leaving a surface behind.
+        """
+        dumper = load_dumper()
+        inventory = [
+            {"name": "CGROUP_FILTER", "id": 96, "type": "cgroup_array", "bytes_key": 4,
+             "bytes_value": 4, "max_entries": 1, "flags": 0},
+            {"name": "START", "id": 99, "type": "hash", "bytes_key": 16,
+             "bytes_value": 288, "max_entries": 16384, "flags": 0},
+        ]
+
+        def fake_json(args, **_kwargs):
+            if args[2:4] == ["map", "show"]:
+                return [next(dict(row) for row in inventory if row["id"] == int(args[-1]))]
+            return []
+
+        for case, cells in (
+            ("value", [{"key": [0] * 4, "value": [0] * 4}]),
+            ("readable", [{"key": [0] * 4, "errno": 0}]),
+            ("empty", []),
+        ):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                reader, obj = root / "reader", root / "reader.bpf.o"
+                reader.write_bytes(b"reader")
+                reader.chmod(0o700)
+                obj.write_bytes(b"object")
+                argv = ["dump-owned-bpf-maps.py", "55", str(root), "case", "0", "16384",
+                        str(reader.resolve()), str(obj.resolve())]
+                with mock.patch.object(dumper, "map_ids_from_fdinfo", return_value=[96, 99]), \
+                        mock.patch.object(dumper.glob, "glob", return_value=[]), \
+                        mock.patch.object(dumper, "run_json", side_effect=fake_json), \
+                        mock.patch.object(dumper, "probe_refused_lookup", return_value=cells), \
+                        mock.patch.object(sys, "argv", argv):
+                    with self.assertRaisesRegex(RuntimeError, "stopped map refusal"):
+                        dumper.main()
+                self.assertEqual(list(root.glob("mapdump_*")), [])
 
     def test_main_rejects_returned_id_and_conflicting_flags(self):
         dumper = load_dumper()
@@ -1755,6 +1832,11 @@ class StoppedPopulationTests(unittest.TestCase):
             manifest.append({"id": map_id, "name": name, "type": "ringbuf",
                              "key_size": 0, "value_size": 0, "max_entries": 4096,
                              "map_flags": 0, "oracle": "mmap"})
+        # The one owned map userspace cannot read at all: its surface is the
+        # kernel's refusal, so the replay must validate it and not just hash it.
+        manifest.append({"id": 110, "name": "CGROUP_FILTER", "type": "cgroup_array",
+                         "key_size": 4, "value_size": 4, "max_entries": 1,
+                         "map_flags": 0, "oracle": "refused-lookup"})
         records = []
         for task in tasks:
             for name, map_id, flag in (("TASK_COOKIE", 101, "cookie"),
@@ -1779,13 +1861,14 @@ class StoppedPopulationTests(unittest.TestCase):
         }
         return manifest, receipt, records, controls
 
-    def publish_fixture(self, root, manifest, receipt, records, controls):
+    def publish_fixture(self, root, manifest, receipt, records, controls, refusals=()):
         # Exercise the real framed parser, including valid EOF on empty maps.
         stream = b"".join(TaskStorageReaderTests.frame(
             1, row["map_id"], row["pid"], row["tid"], row["value"]
         ) for row in records) + TaskStorageReaderTests.frame(2)
         parsed = load_dumper().parse_task_storage_frames(
             stream, TaskStorageReaderTests.MAPS, max_records=100, max_bytes=65536)
+        refusals = dict(refusals)
         receipt["surfaces"] = []
         for item in manifest:
             name = item["name"]
@@ -1802,6 +1885,8 @@ class StoppedPopulationTests(unittest.TestCase):
                     words = controls[name]
                     raw = struct.pack("<" + "Q" * len(words), *words)
                     content = json.dumps([{"key": [0, 0, 0, 0], "value": list(raw)}]).encode()
+                elif item["type"] == "cgroup_array":
+                    content = json.dumps(refusals.get(name, refusal_cells(item))).encode()
                 else:
                     content = b"[]"
             path.write_bytes(content)
@@ -1833,7 +1918,7 @@ class StoppedPopulationTests(unittest.TestCase):
                     next(m for m in args[0] if m["name"] == "START")["max_entries"] = 1
                 args[1]["after"].reverse()  # roster order is not task identity
                 self.publish_fixture(root, *args)
-                self.assertEqual(len(self.check(root, args[0])), 9)
+                self.assertEqual(len(self.check(root, args[0])), 10)
 
     def test_framed_records_bind_generations_for_future_coordinator(self):
         dumper = load_dumper()
@@ -1999,7 +2084,7 @@ class StoppedPopulationTests(unittest.TestCase):
                     struct.pack_into("<QQII", raw, 520, occupied, domains, starts, 1)
                     row["value"] = bytes(raw)
                 self.publish_fixture(root, manifest, receipt, records, controls)
-                self.assertEqual(len(self.check(root, manifest)), 9)
+                self.assertEqual(len(self.check(root, manifest)), 10)
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2014,12 +2099,42 @@ class StoppedPopulationTests(unittest.TestCase):
             with self.assertRaisesRegex(AssertionError, "stopped.*THREAD_OWNER.*tail"):
                 self.check(root, manifest)
 
+    def test_cgroup_array_surface_is_a_kernel_refusal_and_never_a_value(self):
+        """The one map with no userspace lookup cannot be replayed as a dump.
+
+        Its surface is `bpf(BPF_MAP_LOOKUP_ELEM)`'s own errno per key. A dump
+        oracle on the row, an empty list, a value beside or instead of the
+        refusal, and an errno that says the lookup succeeded or is merely
+        unpopulated are each a different map than the one being claimed.
+        """
+        item = {"key_size": 4, "max_entries": 1}
+        for case, oracle, cells in (
+            ("dumped", "dump", None),
+            ("empty", "refused-lookup", []),
+            ("fabricated", "refused-lookup", [{"key": ["0x00"] * 4, "value": ["0x00"] * 4}]),
+            ("valued", "refused-lookup",
+             [{"key": ["0x00"] * 4, "errno": 524, "value": ["0x00"] * 4}]),
+            ("readable", "refused-lookup", refusal_cells(item, errno=0)),
+            ("unpopulated", "refused-lookup", refusal_cells(item, errno=2)),
+            ("textual", "refused-lookup", [{"key": ["0x00"] * 4, "errno": "524"}]),
+        ):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                manifest, receipt, records, controls = self.fixture(root)
+                row = next(m for m in manifest if m["name"] == "CGROUP_FILTER")
+                row["oracle"] = oracle
+                refusals = {} if cells is None else {"CGROUP_FILTER": cells}
+                self.publish_fixture(root, manifest, receipt, records, controls, refusals)
+                with self.assertRaisesRegex(AssertionError, "stopped map"):
+                    self.check(root, manifest)
+
     def test_strict_metadata_diagnostics_are_bounded_and_redacted(self):
         marker = "PRIVATE_METADATA_MARKER"
         malformed_value = marker + "_" * 20_000
         dumper = load_dumper()
         for map_type, oracle in (("hash", "dump"), ("array", "dump"),
-                                 ("prog_array", "dump"), ("cgroup_array", "dump"),
+                                 ("prog_array", "dump"),
+                                 ("cgroup_array", "refused-lookup"),
                                  ("percpu_hash", "dump"),
                                  ("percpu_array", "dump"), ("ringbuf", "mmap"),
                                  ("task_storage", "task-storage")):

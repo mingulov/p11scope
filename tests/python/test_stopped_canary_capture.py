@@ -92,7 +92,8 @@ class FakeRing:
 class FakeMaps(capture.LiveMaps):
     def __init__(self, config):
         self.config, self.owner, self.cpus = config, None, [0]
-        self.fds, self.rings, self.opened_rings, self.closed_fds = [], {}, [], []
+        self.fds, self.fd_by_id, self.rings = [], {}, {}
+        self.opened_rings, self.closed_fds = [], []
         self.calls = []
         definitions = capture.definitions.SAFE_MAPS if config.variant == 'default' else capture.definitions.UNSAFE_MAPS
         self.maps = [capture.dumper.normalize_map_metadata({
@@ -111,21 +112,30 @@ class FakeMaps(capture.LiveMaps):
 
     def pin(self, maps, deadline):
         capture.remaining(deadline)
-        self.fds.extend(os.open('/dev/null', os.O_RDONLY) for _ in maps)
+        for item in maps:
+            self.fds.append(os.open('/dev/null', os.O_RDONLY))
+            self.fd_by_id[item['id']] = self.fds[-1]
 
     def dump(self, item, deadline, bound):
         capture.remaining(deadline)
+        # Only a dumpable map is ever dumped. A cgroup_array has no userspace
+        # lookup, so fabricating an empty dump for it here is exactly the
+        # evidence the refusal oracle exists to refuse.
+        assert item['oracle'] == 'dump', item
         self.calls.append((item['name'], deadline))
         name, size = item['name'], item['bytes_value']
         workers = [row for row in capture.ready_roster(self.config, deadline) if row['role'] == 'worker']
         controls = {'COOKIE_CTL': [16384, int(self.config.mode != 'metrics'), 0, 0, 0],
                     'OWNER_CTL': [16448, len(workers), 0, 0, 0, 0, 0],
                     'ROOT_CTL': [int(self.config.lane in capture.OWNED_LANES)] + [0] * 7}
+        # Empty is the honest dump of an unpopulated hash, prog_array or
+        # percpu_hash, and only of those: it is never a stand-in for a map the
+        # kernel would not let userspace read at all.
+        cells = []
         if name in controls:
             raw = struct.pack('<' + 'Q' * len(controls[name]), *controls[name])
             cells = [{'key': [0] * 4, 'value': list(raw)}]
         elif name == 'START':
-            cells = []
             for worker in workers:
                 index = worker['call_index']
                 if self.config.workload_mode == 'blocked':
@@ -143,7 +153,6 @@ class FakeMaps(capture.LiveMaps):
                 key = struct.pack('<QII', (worker['pid'] << 32) | worker['tid'], slot, 0)
                 cells.append({'key': list(key), 'value': list(raw)})
         elif item['type'] in ('array', 'percpu_array'):
-            cells = []
             for index in range(item['max_entries']):
                 value = list(bytes(size))
                 if name == 'EVIDENCE' and index == 5 and self.config.workload_mode == 'faults':
@@ -151,11 +160,19 @@ class FakeMaps(capture.LiveMaps):
                 cell = {'key': list(struct.pack('<I', index))}
                 cell.update({'values': [{'cpu': 0, 'value': value}]} if item['type'] == 'percpu_array' else {'value': value})
                 cells.append(cell)
-        else:
-            cells = []
         normalized = capture.dumper.normalize_map_dump(cells, item, possible_cpus=self.cpus)
         assert len(capture.encoded(normalized)) <= bound
         return normalized
+
+    def refuse(self, item, deadline):
+        capture.remaining(deadline)
+        assert item['oracle'] == 'refused-lookup', item
+        self.calls.append((item['name'], deadline))
+        # What a real bpf(BPF_MAP_LOOKUP_ELEM) answers for every key of a map
+        # whose ops define no map_fd_sys_lookup_elem, empty or populated.
+        return capture.dumper.normalize_refused_lookup(
+            [{'key': list(struct.pack('<I', index)), 'errno': capture.dumper.ENOTSUPP}
+             for index in range(item['max_entries'])], item)
 
     def frames(self, pid, maps, deadline, bound):
         capture.remaining(deadline)
@@ -336,6 +353,7 @@ def coordinator_case(pid, directory, case):
     original_launch, original_signal = owner.launch, signal.pidfd_send_signal
     original_check = coordinator.check
     original_replay, original_dump, original_frames = capture.evidence.assert_stopped_snapshot, source.dump, source.frames
+    original_refuse = source.refuse
     original_inventory, original_positions = source.inventory, source.positions
     original_stopped_rows = capture.stopped_rows
     roster_samples, start_dumps = {}, 0
@@ -465,6 +483,16 @@ def coordinator_case(pid, directory, case):
                 struct.pack_into('<I', raw, 8, 8)
             rows[0]['key'], rows[0]['value'] = list(raw), list(value)
         return rows
+    def refuse(item, deadline):
+        # A refusal is a kernel observation, so mutate what the kernel is
+        # pretended to have answered and let the same normalization the live
+        # acquisition performs decide. A value, a readable errno and no
+        # refusal at all must each be refused where the map is read.
+        if kind == 'refuse':
+            cells = {'value': [{'key': [0] * 4, 'value': [0] * item['bytes_value']}],
+                     'errno': [{'key': [0] * 4, 'errno': 0}]}.get(detail, [])
+            return capture.dumper.normalize_refused_lookup(cells, item)
+        return original_refuse(item, deadline)
     def frames(*args):
         raw = original_frames(*args)
         if kind == 'frames':
@@ -494,7 +522,8 @@ def coordinator_case(pid, directory, case):
                 (source, 'inventory', {'side_effect': inventory}),
                 (source, 'positions', {'side_effect': positions}),
                 (capture, 'stopped_rows', {'side_effect': stopped_rows}),
-                (source, 'dump', {'side_effect': dump}), (source, 'frames', {'side_effect': frames})):
+                (source, 'dump', {'side_effect': dump}), (source, 'refuse', {'side_effect': refuse}),
+                (source, 'frames', {'side_effect': frames})):
                 stack.enter_context(patch.object(target, attr, **kwargs))
             if kind not in ('native', 'binding', 'fifo'):
                 stack.enter_context(patch.object(capture, 'wait_done', side_effect=synthetic_done))
@@ -571,6 +600,11 @@ def coordinator_case(pid, directory, case):
                 assert expected_success, ('unexpected successful capture', case)
                 assert result.is_file()
         assert bool(errors) != expected_success, (case, errors)
+        if kind == 'refuse':
+            # Where the failure lands matters: the map is read once, so an
+            # invented refusal must die there, not survive into a receipt.
+            assert errors[0].startswith('refuse-CGROUP_FILTER: RuntimeError'), errors
+            assert not list(Path(directory).glob('mapdump_CGROUP_FILTER_*'))
         assert not owner.active and all(group.closed for group in owner.groups)
         assert all(reader.closed for reader in source.opened_rings)
         assert sentinel.read_bytes() == b'preserve unrelated bytes'
@@ -729,7 +763,7 @@ def owned_case(pid, directory, case, program, provider):
     coordinator, owner = capture.Coordinator(config, source), c.Custody()
     handles, signals, waits, replays, readiness_deadlines = [], [], [], [], []
     launch, retain, send = owner.launch, owner.retain_observer_child, signal.pidfd_send_signal
-    check, frames, dump = coordinator.check, source.frames, source.dump
+    check, frames, dump, refuse = coordinator.check, source.frames, source.dump, source.refuse
     replay = capture.evidence.assert_stopped_snapshot
     positive = case.startswith(('ready_first', 'capture_first'))
     def launched(*args, **kwargs):
@@ -790,6 +824,11 @@ def owned_case(pid, directory, case, program, provider):
         if case == 'start' and item['name'] == 'START':
             rows.append({'key': list(bytes(16)), 'value': list(bytes(288))})
         return rows
+    def refused(item, *args):
+        if case == 'cgroup_value':
+            return capture.dumper.normalize_refused_lookup(
+                [{'key': [0] * 4, 'value': [0] * item['bytes_value']}], item)
+        return refuse(item, *args)
     def replayed(manifest, prefix):
         replays.append(Path(prefix))
         assert not (Path(directory) / f'mapdump_manifest_{config.lane}.json').exists()
@@ -805,6 +844,7 @@ def owned_case(pid, directory, case, program, provider):
             for target, name, side_effect in ((owner, 'launch', launched),
                     (owner, 'retain_observer_child', retained), (signal, 'pidfd_send_signal', sent),
                     (coordinator, 'check', checked), (source, 'frames', framed), (source, 'dump', dumped),
+                    (source, 'refuse', refused),
                     (capture.evidence, 'assert_stopped_snapshot', replayed)):
                 stack.enter_context(patch.object(target, name, side_effect=side_effect))
             stack.enter_context(patch.object(c, 'Custody', return_value=owner))
@@ -1116,6 +1156,32 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
                         self.assertIn('close-input: OSError', message)
                     self.assertEqual(open_descriptors(), before)
 
+    def test_inventory_requires_the_exact_cgroup_filter_definition(self):
+        """The checked-in ELF map list is the authority for CGROUP_FILTER too.
+
+        A dropped row is an owned map nothing witnessed, and a row re-typed to
+        an ordinary array is claiming a dump no cgroup_array can answer.
+        """
+        def inventory():
+            return [capture.dumper.normalize_map_metadata({
+                'id': index + 100, 'name': name, 'type': capture.MAP_TYPES[row['type']],
+                'bytes_key': row['key_size'], 'bytes_value': row['value_size'],
+                'max_entries': row['max_entries'], 'flags': row['flags']}, index + 100)
+                for index, (name, row) in enumerate(sorted(capture.definitions.SAFE_MAPS.items()))]
+        maps = inventory()
+        capture.validate_inventory(maps, 'default')
+        self.assertEqual(next(item for item in maps if item['name'] == 'CGROUP_FILTER')['oracle'],
+                         'refused-lookup')
+        with self.assertRaisesRegex(capture.CaptureError, 'map inventory mismatch'):
+            capture.validate_inventory(
+                [item for item in inventory() if item['name'] != 'CGROUP_FILTER'], 'default')
+        retyped = inventory()
+        next(item for item in retyped if item['name'] == 'CGROUP_FILTER').update(
+            type='array', oracle='dump')
+        with self.assertRaisesRegex(capture.CaptureError,
+                                    'map definition mismatch name=CGROUP_FILTER'):
+            capture.validate_inventory(retyped, 'default')
+
     def test_real_stop_refusal_resumes_only_observer_and_never_publishes(self):
         self.probe('first_refusal')
 
@@ -1203,10 +1269,12 @@ CASES = (
     + ['binding:default-safe-start:' + problem for problem in
        ('tid', 'padding', 'slot', 'session', 'slot_relationship', 'owner_count', 'key_change')]
     + ['phase:' + phase for phase in ('observer-log', 'observer-stopped', 'GO-created', 'workload-stopped',
-       'rings-retained', 'stage-created', 'dump-START', 'task-frames', 'retained-rings', 'after-identities',
+       'rings-retained', 'stage-created', 'dump-START', 'refuse-CGROUP_FILTER', 'task-frames',
+       'retained-rings', 'after-identities',
        'retained-semantics', 'staged-replay-complete', 'custody-closed', 'final-replay-complete',
        'manifest-ready', 'manifest-published', 'publication-complete')]
     + ['cancel:' + phase for phase in ('workload-stopped', 'custody-closed', 'manifest-published')]
+    + ['refuse:' + problem for problem in ('value', 'errno', 'empty')]
     + ['config:lane', 'config:width', 'config:roster', 'stale:ordinary', 'stale:manifest',
        'immediate_exit', 'immediate_bad_exit', 'resume', 'deadline', 'ring:EVENTS', 'ring:DISCOVERY',
        'inventory:definition', 'inventory:changed', 'population', 'frames', 'close',
@@ -1223,7 +1291,7 @@ for case in ('ready_first', 'capture_first', 'ready_first_feature', 'capture_fir
              'death_unknown', 'death_stopped', 'wrong_executable', 'extra_child', 'stale_generation',
              'foreign_ready', 'unavailable_children', 'root_missing', 'root_invalid', 'root_control',
              'cookie', 'cookie_history', 'owner', 'start', 'events', 'observer_bad_exit',
-             'missing_ready', 'missing_capture'):
+             'cgroup_value', 'missing_ready', 'missing_capture'):
     def test(self, case=case):
         self.probe('owned:' + case)
     setattr(StoppedCanaryCaptureTests, 'test_owned_' + case, test)

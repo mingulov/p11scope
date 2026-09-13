@@ -1036,6 +1036,10 @@ def assert_stopped_snapshot(manifest, prefix):
                             "malformed record identity")
                     records.append({**identity, "map_id": item["id"],
                                     "value": raw[index * size:(index + 1) * size]})
+            elif metadata["oracle"] == "refused-lookup":
+                # Validate the refusal, never merely hash it: a surface with a
+                # value in it cannot have come from a map with no lookup.
+                api["normalize_refused_lookup"](read_json_bytes(raw), metadata)
             elif name in ("COOKIE_CTL", "OWNER_CTL", "ROOT_CTL"):
                 cells = read_json_bytes(raw)
                 require(isinstance(cells, list) and len(cells) == 1
@@ -1059,10 +1063,11 @@ def owned_map_surfaces(label, manifest, expected, prefix):
 
     Dispatch is by map *type*, never by name: a ringbuf has no key/value
     iteration, so `bpftool map dump` cannot read it at all and it is read
-    through the mmap oracle instead, landing as its raw records; every other
-    map is read as its `bpftool` dump. A map with no surface on disk is a
-    failure, never a skip — an unscanned owned map is exactly the privacy hole
-    this gate exists to close.
+    through the mmap oracle instead, landing as its raw records; a cgroup_array
+    has no userspace lookup at all, so it lands as the kernel's own per-key
+    refusal; every other map is read as its `bpftool` dump. A map with no
+    surface on disk is a failure, never a skip — an unscanned owned map is
+    exactly the privacy hole this gate exists to close.
     """
     if any("snapshot" in item for item in manifest):
         assert_stopped_snapshot(manifest, prefix)
@@ -1079,6 +1084,9 @@ def owned_map_surfaces(label, manifest, expected, prefix):
             path = ring_raw_path(prefix, item["name"])
         elif item["type"] == "task_storage":
             assert item["oracle"] == "task-storage", item
+            path = Path(item.get("file", ""))
+        elif item["type"] == "cgroup_array":
+            assert item["oracle"] == "refused-lookup", item
             path = Path(item.get("file", ""))
         else:
             assert item["oracle"] == "dump", item
@@ -1916,6 +1924,7 @@ def main(argv=None):
         # map must end up with a file the matrix scan actually reads.
         # ------------------------------------------------------------------
         RINGBUF = 27
+        CGROUP_ARRAY = 8
         assert set(RING_RECORD_SIZES) == {
             name for name, definition in BPF_MAP_DEFS["UNSAFE_MAPS"].items()
             if definition["type"] == RINGBUF
@@ -1937,18 +1946,29 @@ def main(argv=None):
                     sorted(BPF_MAP_DEFS["SAFE_MAPS"].items()), start=1
                 ):
                     ring = definition["type"] == RINGBUF
-                    task_storage = definition["type"] == 29
+                    # Type every row from the one checked-in BPF list. A blanket
+                    # "everything else is a hash/dump" is the fiction that let a
+                    # cgroup_array claim a dump no kernel will ever answer.
+                    map_type, oracle = {
+                        RINGBUF: ("ringbuf", "mmap"), 29: ("task_storage", "task-storage"),
+                        CGROUP_ARRAY: ("cgroup_array", "refused-lookup"),
+                    }.get(definition["type"], ("hash", "dump"))
                     item = {
                         "name": name, "id": map_id, "max_entries": definition["max_entries"],
                         "key_size": definition["key_size"] if not ring else 0,
                         "value_size": definition["value_size"] if not ring else 0,
-                        "type": "ringbuf" if ring else "task_storage" if task_storage else "hash",
-                        "oracle": "mmap" if ring else "task-storage" if task_storage else "dump",
+                        "type": map_type, "oracle": oracle,
                     }
                     if not ring:
                         item["file"] = f"{scan_dir}/mapdump_{name}_lane.json"
                     manifest.append(item)
                 return manifest
+
+            def refusal_cells(item):
+                """One kernel -ENOTSUPP per key: a cgroup_array's whole surface."""
+                return [{"key": [f"0x{byte:02x}" for byte
+                                 in index.to_bytes(item["key_size"], "little")], "errno": 524}
+                        for index in range(item["max_entries"])]
 
             def write_surfaces(manifest, planted=None):
                 for item in manifest:
@@ -1956,9 +1976,12 @@ def main(argv=None):
                         payload = planted if planted and item["name"] == planted[0] else (b"", b"")
                         ring_raw_path(prefix, item["name"]).write_bytes(bytes(64) + payload[1])
                     else:
-                        content = (positive_control_content(planted[1])
-                                   if planted and item["name"] == planted[0]
-                                   else b"[]\n")
+                        if planted and item["name"] == planted[0]:
+                            content = positive_control_content(planted[1])
+                        elif item["type"] == "cgroup_array":
+                            content = json.dumps(refusal_cells(item)).encode() + b"\n"
+                        else:
+                            content = b"[]\n"
                         Path(item["file"]).write_bytes(content)
 
             manifest = owned_manifest()
@@ -1987,12 +2010,47 @@ def main(argv=None):
                     if i["name"] == "COUNTERS"]),
                 ("ring surface missing",
                  lambda m: ring_raw_path(prefix, "DISCOVERY").unlink()),
+                # A cgroup_array has no userspace lookup, so a row claiming a
+                # dump of one is claiming evidence the kernel never produced,
+                # and a dropped row is an owned map nothing ever scanned.
+                ("cgroup_array dropped", lambda m: m.pop(
+                    [i["name"] for i in m].index("CGROUP_FILTER"))),
+                ("cgroup_array dumped", lambda m: [
+                    i.update(oracle="dump") for i in m if i["name"] == "CGROUP_FILTER"]),
+                ("cgroup_array surface missing", lambda m: [
+                    i.update(file=f"{scan_dir}/absent.json") for i in m
+                    if i["name"] == "CGROUP_FILTER"]),
             ):
                 mutated = json.loads(json.dumps(manifest))
                 mutate(mutated)
                 reject(label, lambda mutated=mutated:
                        owned_map_surfaces("lane", mutated, SAFE_MAPS, prefix))
             print("owned map surface mutations are all rejected: OK")
+
+            # `owned_map_surfaces` pairs a refusal with the file the scan reads;
+            # the bytes are refused by the validator the stopped replay runs over
+            # them, which raises RuntimeError rather than the AssertionError
+            # shape the surface mutations above produce.
+            normalize_refused_lookup = runpy.run_path(
+                str(SCRIPT_DIR / "dump-owned-bpf-maps.py"))["normalize_refused_lookup"]
+            filter_row = next(i for i in manifest if i["name"] == "CGROUP_FILTER")
+            filter_metadata = {
+                "id": filter_row["id"], "name": "CGROUP_FILTER", "type": "cgroup_array",
+                "oracle": "refused-lookup", "bytes_key": filter_row["key_size"],
+                "bytes_value": filter_row["value_size"], "map_flags": 0,
+                "max_entries": filter_row["max_entries"],
+            }
+            assert normalize_refused_lookup(refusal_cells(filter_row), filter_metadata)
+            for label, cells in (
+                ("cgroup_array fabricated", [{"key": ["0x00"] * 4, "value": ["0x00"] * 4}]),
+                ("cgroup_array errno 0", [{"key": ["0x00"] * 4, "errno": 0}]),
+            ):
+                try:
+                    normalize_refused_lookup(cells, filter_metadata)
+                except RuntimeError:
+                    continue
+                raise AssertionError(f"{label} mutation was accepted")
+            print("a fabricated cgroup_array value is never a refusal: OK")
 
             # Each owned map is a scan surface in its own right: a canary
             # planted in it must be found by the same reader the matrix uses.

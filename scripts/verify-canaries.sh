@@ -124,6 +124,11 @@ for path in map(Path, sys.argv[6:]):
 print(f"target/helper ELF{bits} and x86-64 observers: OK")
 PY
 python3 -I scripts/dump-owned-bpf-maps.py --self-test
+# CGROUP_FILTER is witnessed by the kernel's refusal to look it up, so prove on
+# this kernel that the refusal is still what a cgroup_array answers. A kernel
+# that started returning values would leave every lane green under an oracle
+# that no longer describes it.
+sudo python3 -I scripts/dump-owned-bpf-maps.py --refusal-probe
 
 set -- "$WORK"/default-build/release/build/p11scope-*/out/p11scope-ebpf
 [ "$#" -eq 1 ] && [ -f "$1" ] || { echo "default BPF object is not unique"; exit 1; }

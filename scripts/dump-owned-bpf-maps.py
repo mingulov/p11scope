@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Dump only BPF maps whose fds are owned by one observer process."""
 
+import ctypes
 import glob
 import json
 import math
@@ -27,10 +28,27 @@ TASK_STORAGE_MAX_BYTES = 64 * 1024 * 1024
 TASK_STORAGE_TIMEOUT_SECONDS = 8
 STOPPED_SNAPSHOT_CONTRACT = "p11scope/stopped-task-storage/v1"
 SNAPSHOT_MAP_ORACLES = {
-    "hash": "dump", "array": "dump", "prog_array": "dump", "cgroup_array": "dump",
+    "hash": "dump", "array": "dump", "prog_array": "dump",
+    "cgroup_array": "refused-lookup",
     "percpu_hash": "dump", "percpu_array": "dump",
     "ringbuf": "mmap", "task_storage": "task-storage",
 }
+# `cgroup_array_map_ops` defines no `map_fd_sys_lookup_elem`, so every
+# userspace lookup of one is answered -ENOTSUPP by `bpf_fd_array_map_lookup_elem`
+# whether the map is empty or populated. Record that kernel errno per key.
+ENOTSUPP = 524
+BPF_SYSCALL = 321
+BPF_MAP_CREATE = 0
+BPF_MAP_LOOKUP_ELEM = 1
+BPF_MAP_GET_FD_BY_ID = 14
+BPF_OBJ_GET_INFO_BY_FD = 15
+BPF_MAP_TYPE_CGROUP_ARRAY = 8
+BPF_ATTR_BYTES = 64
+BPF_ATTR_MAP_CREATE = struct.Struct("=IIIIIII16s")
+BPF_ATTR_MAP_ID = struct.Struct("=III")
+BPF_ATTR_MAP_ELEM = struct.Struct("=IIQQQ")
+BPF_ATTR_OBJ_INFO = struct.Struct("=IIQ")
+BPF_MAP_INFO = struct.Struct("=IIIIII")
 DIAGNOSTIC_LIMIT = 4096
 JSON_TIMEOUT_SECONDS = 8
 JSON_OUTPUT_MAX_BYTES = TASK_STORAGE_MAX_BYTES
@@ -228,19 +246,22 @@ def _run_bounded_bytes(args, *, timeout_seconds, max_bytes, label):
 
 
 def map_oracle(item):
-    """Which oracle reads this map: `bpftool map dump`, or an mmap consumer.
+    """Which oracle witnesses this map, read from the one type-to-oracle table.
 
     A ringbuf has no key/value iteration, so `bpftool map dump` refuses it
     (exit 244, empty stderr) whatever it is called. Task-storage maps require
-    the native reader added by Task 2. Dispatch on the map type, never name.
+    the native reader added by Task 2. A cgroup_array has no userspace lookup
+    at all, so the kernel's refusal is the only value evidence there is.
+    Dispatch on the map type, never name, and read the same table
+    `normalize_map_metadata` validates against: a dispatcher that keeps its own
+    opinion is how a cgroup_array came to be routed to a dump it cannot answer.
     """
-    if item.get("type") == "ringbuf":
-        return "mmap"
-    if item.get("type") == "task_storage":
-        return "task-storage"
-    if item["name"] == "EVENTS":
+    oracle = SNAPSHOT_MAP_ORACLES.get(item.get("type"))
+    if oracle is None:
+        raise RuntimeError(f"unknown owned map type: {item}")
+    if item["name"] == "EVENTS" and oracle != "mmap":
         raise RuntimeError(f"EVENTS is not a ringbuf: {item}")
-    return "dump"
+    return oracle
 
 
 def canonical_map_name(item):
@@ -368,6 +389,127 @@ def normalize_map_dump(entries, metadata, *, possible_cpus=None):
     if array and len(keys) != metadata["max_entries"]:
         raise RuntimeError("raw map dump: incomplete array keys")
     return result
+
+
+def refused_lookup_metadata(metadata):
+    """The exact shape a refusal oracle applies to, or a refusal to proceed.
+
+    The kernel itself only builds an fd array with 4-byte keys and values
+    (`fd_array_map_alloc_check`), so anything else claiming this oracle is not
+    the map the refusal would be about.
+    """
+    snapshot_map_metadata(metadata)
+    if metadata["oracle"] != "refused-lookup" or metadata["type"] != "cgroup_array":
+        raise RuntimeError("stopped map refusal: invalid map or result")
+    if (metadata["bytes_key"], metadata["bytes_value"]) != (4, 4):
+        raise RuntimeError("stopped map refusal: malformed fd-array metadata")
+
+
+def probe_refused_lookup(item, *, fd=None):
+    """Ask the kernel for every key of a map whose values it will not return.
+
+    This is the whole content oracle for a cgroup_array: `bpftool map dump`
+    reports the same failure as a per-cell `{"error": "Unknown error 524"}`
+    blob, which is glibc's `strerror` text for the kernel's -ENOTSUPP and not
+    a kernel fact. Record the raw errno instead, one cell per key, so a future
+    kernel that does answer the lookup turns the lane RED rather than passing
+    a readable map off under a refusal. Callers that already retain a
+    descriptor pass it; otherwise one is acquired by map id for the probe.
+    """
+    refused_lookup_metadata(item)
+    libc = ctypes.CDLL(None, use_errno=True)
+    acquired = fd is None
+    if acquired:
+        attr = ctypes.create_string_buffer(BPF_ATTR_MAP_ID.pack(item["id"], 0, 0))
+        fd = libc.syscall(BPF_SYSCALL, BPF_MAP_GET_FD_BY_ID,
+                          ctypes.byref(attr), ctypes.sizeof(attr))
+        if fd < 0:
+            raise OSError(ctypes.get_errno(), "retain refused-lookup map")
+    cells = []
+    try:
+        for index in range(item["max_entries"]):
+            key = ctypes.create_string_buffer(
+                index.to_bytes(item["bytes_key"], "little"), item["bytes_key"])
+            value = ctypes.create_string_buffer(item["bytes_value"])
+            attr = ctypes.create_string_buffer(BPF_ATTR_MAP_ELEM.pack(
+                fd, 0, ctypes.addressof(key), ctypes.addressof(value), 0))
+            ctypes.set_errno(0)
+            result = libc.syscall(BPF_SYSCALL, BPF_MAP_LOOKUP_ELEM,
+                                  ctypes.byref(attr), ctypes.sizeof(attr))
+            cells.append({"key": list(key.raw),
+                          "errno": ctypes.get_errno() if result < 0 else 0})
+    finally:
+        if acquired:
+            os.close(fd)
+    return cells
+
+
+def normalize_refused_lookup(cells, metadata):
+    """Retain the kernel's own per-key refusal, and never a value beside it.
+
+    No value was read, so a value here was invented; an empty list witnesses
+    nothing at all; and an errno other than ENOTSUPP says this map is not the
+    map the oracle claims -- 0 that a value came back, ENOENT that the lookup
+    is supported and the slot is merely empty. Each is a deliberate oracle
+    change, not something to accept quietly.
+    """
+    refused_lookup_metadata(metadata)
+    if not isinstance(cells, list) or len(cells) != metadata["max_entries"]:
+        raise RuntimeError("stopped map refusal: incomplete refusal population")
+    result = []
+    keys = set()
+    for cell in cells:
+        if not isinstance(cell, dict) or set(cell) != {"key", "errno"}:
+            raise RuntimeError("stopped map refusal: malformed cell")
+        key = _raw_bytes(cell["key"], metadata["bytes_key"])
+        index = int.from_bytes(bytes(int(byte, 16) for byte in key), "little")
+        if index >= metadata["max_entries"]:
+            raise RuntimeError("stopped map refusal: invalid array key")
+        if index in keys:
+            raise RuntimeError("stopped map refusal: duplicate key")
+        keys.add(index)
+        if type(cell["errno"]) is not int or cell["errno"] != ENOTSUPP:
+            raise RuntimeError("stopped map refusal: value was read or refusal is unexplained")
+        result.append({"key": key, "errno": ENOTSUPP})
+    return result
+
+
+def refusal_probe():
+    """Privileged: prove on this kernel that a cgroup_array refuses lookups.
+
+    Creating one costs nothing and reads nothing, but it is the only check
+    that would notice a kernel which starts answering the lookup. On such a
+    kernel the refusal is no longer the honest oracle for CGROUP_FILTER, and
+    the lanes must stop here rather than accept a readable map under it.
+    """
+    libc = ctypes.CDLL(None, use_errno=True)
+    attr = ctypes.create_string_buffer(BPF_ATTR_MAP_CREATE.pack(
+        BPF_MAP_TYPE_CGROUP_ARRAY, 4, 4, 1, 0, 0, 0, b"REFUSAL_PROBE"), BPF_ATTR_BYTES)
+    ctypes.set_errno(0)
+    fd = libc.syscall(BPF_SYSCALL, BPF_MAP_CREATE, ctypes.byref(attr), ctypes.sizeof(attr))
+    if fd < 0:
+        raise OSError(ctypes.get_errno(), "create the cgroup_array refusal probe")
+    try:
+        info = ctypes.create_string_buffer(BPF_MAP_INFO.size)
+        attr = ctypes.create_string_buffer(BPF_ATTR_OBJ_INFO.pack(
+            fd, BPF_MAP_INFO.size, ctypes.addressof(info)), BPF_ATTR_OBJ_INFO.size)
+        ctypes.set_errno(0)
+        if libc.syscall(BPF_SYSCALL, BPF_OBJ_GET_INFO_BY_FD,
+                        ctypes.byref(attr), ctypes.sizeof(attr)) < 0:
+            raise OSError(ctypes.get_errno(), "identify the cgroup_array refusal probe")
+        map_type, map_id, bytes_key, bytes_value, max_entries, map_flags = BPF_MAP_INFO.unpack(info.raw)
+        if map_type != BPF_MAP_TYPE_CGROUP_ARRAY:
+            raise RuntimeError(f"refusal probe is not a cgroup_array: type={map_type}")
+        item = {"id": map_id, "name": "REFUSAL_PROBE", "type": "cgroup_array",
+                "bytes_key": bytes_key, "bytes_value": bytes_value,
+                "max_entries": max_entries, "map_flags": map_flags,
+                "oracle": "refused-lookup"}
+        cells = normalize_refused_lookup(probe_refused_lookup(item, fd=fd), item)
+    finally:
+        os.close(fd)
+    if cells != [{"key": ["0x00"] * 4, "errno": ENOTSUPP}]:
+        raise RuntimeError(f"unexpected cgroup_array refusal: {cells}")
+    print(f"cgroup_array userspace lookup is refused ENOTSUPP={ENOTSUPP}: OK")
 
 
 def one(value):
@@ -772,12 +914,14 @@ def self_test():
         {"name": "DISCOVERY", "type": "ringbuf"},
         {"name": "START", "type": "hash"},
         {"name": "COUNTERS", "type": "percpu_array"},
+        {"name": "CGROUP_FILTER", "type": "cgroup_array"},
         {"name": "TASK_COOKIE", "type": "task_storage"},
         {"name": "THREAD_OWNER", "type": "task_storage"},
         {"name": "ROOT_AFFILIATION", "type": "task_storage"},
     ]
     assert [map_oracle(item) for item in inventory] == [
-        "mmap", "mmap", "dump", "dump", "task-storage", "task-storage", "task-storage"
+        "mmap", "mmap", "dump", "dump", "refused-lookup",
+        "task-storage", "task-storage", "task-storage"
     ], [
         map_oracle(item) for item in inventory
     ]
@@ -789,12 +933,67 @@ def self_test():
     else:
         raise AssertionError("EVENTS built as a non-ringbuf was accepted")
     print("EVENTS ringbuf build guard: OK")
+
+    def reject(label, thunk):
+        try:
+            thunk()
+        except RuntimeError:
+            return
+        raise AssertionError(f"{label} was accepted")
+
+    # The dispatcher and the validation table are now one table, so a row can
+    # never claim an oracle its type does not have -- in either direction.
+    filter_map = {"id": 7, "name": "CGROUP_FILTER", "type": "cgroup_array",
+                  "bytes_key": 4, "bytes_value": 4, "max_entries": 1, "map_flags": 0,
+                  "oracle": "refused-lookup"}
+    snapshot_map_metadata(filter_map)
+    reject("cgroup_array claiming a dump",
+           lambda: snapshot_map_metadata({**filter_map, "oracle": "dump"}))
+    reject("hash claiming a refused lookup",
+           lambda: snapshot_map_metadata({**filter_map, "type": "hash", "oracle": "refused-lookup"}))
+    # An empty list is what `bpftool map dump` on an unreadable map would have
+    # to be believed as. It is not a dump of anything, so it is not one here.
+    reject("cgroup_array normalized as an empty dump",
+           lambda: normalize_map_dump([], filter_map))
+    print("a cgroup_array is never dumpable, even empty: OK")
+
+    # The positive control both ways: raw probe bytes canonicalize, and the
+    # retained receipt replays to exactly the bytes that were retained.
+    refusal = [{"key": ["0x00", "0x00", "0x00", "0x00"], "errno": ENOTSUPP}]
+    assert normalize_refused_lookup([{"key": [0, 0, 0, 0], "errno": ENOTSUPP}],
+                                    filter_map) == refusal
+    assert normalize_refused_lookup(refusal, filter_map) == refusal
+    for label, cells in (
+        # Zeroes nobody read, with or without the refusal kept beside them.
+        ("fabricated value cell", [{"key": [0] * 4, "value": [0] * 4}]),
+        ("refusal carrying a value", [{"key": [0] * 4, "errno": ENOTSUPP, "value": [0] * 4}]),
+        ("refusal carrying per-CPU values", [{"key": [0] * 4, "values": [{"cpu": 0, "value": [0] * 4}]}]),
+        # A readable map is a different map: 0 returned a value, ENOENT says
+        # the lookup is supported and the slot is empty.
+        ("value returned instead of a refusal", [{"key": [0] * 4, "errno": 0}]),
+        ("supported lookup of an empty slot", [{"key": [0] * 4, "errno": 2}]),
+        ("errno as text", [{"key": [0] * 4, "errno": "524"}]),
+        ("errno as a boolean", [{"key": [0] * 4, "errno": True}]),
+        ("no refusal at all", []),
+        ("duplicate key", [{"key": [0] * 4, "errno": ENOTSUPP}] * 2),
+        ("key beyond max_entries", [{"key": [1, 0, 0, 0], "errno": ENOTSUPP}]),
+        ("more cells than keys",
+         [{"key": [0] * 4, "errno": ENOTSUPP}, {"key": [1, 0, 0, 0], "errno": ENOTSUPP}]),
+        ("key of the wrong width", [{"key": [0] * 8, "errno": ENOTSUPP}]),
+    ):
+        reject(label, lambda cells=cells: normalize_refused_lookup(cells, filter_map))
+    reject("refusal claiming a dumpable map",
+           lambda: normalize_refused_lookup(refusal, {**filter_map, "type": "hash", "oracle": "dump"}))
+    print("a refused lookup records the kernel errno and never a value: OK")
     print("dump-owned-bpf-maps self-test: OK")
 
 
 def main():
     if sys.argv[1:] == ["--self-test"]:
         self_test()
+        return
+    if sys.argv[1:] == ["--refusal-probe"]:
+        refusal_probe()
         return
     if len(sys.argv) != 8:
         raise SystemExit(
@@ -898,6 +1097,11 @@ def main():
                 item, possible_cpus=possible_cpus,
             )
             write_receipt(output, json.dumps(dumped, separators=(",", ":")) + "\n")
+            record["file"] = str(output)
+        elif record["oracle"] == "refused-lookup":
+            output = out_dir / f"mapdump_{name}{suffix}.json"
+            refused = normalize_refused_lookup(probe_refused_lookup(item), item)
+            write_receipt(output, json.dumps(refused, separators=(",", ":")) + "\n")
             record["file"] = str(output)
         manifest.append(record)
 

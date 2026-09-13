@@ -94,6 +94,14 @@ EXPECTED_APK_PACKAGES = (
     "zlib=1.3.2-r0",
     "zstd-libs=1.5.7-r0",
 )
+PRODUCTION_CA_BOOTSTRAP = (
+    "apt-get update -q >/dev/null",
+    "apt-get install -qy --no-install-recommends ca-certificates >/dev/null",
+)
+MATRIX_CA_BOOTSTRAP = (
+    "apt-get update ",
+    "apt-get install -y --no-install-recommends ca-certificates ",
+)
 MATRIX_FROM = (
     "FROM ubuntu:noble-20260810@sha256:"
     "1e0a86e57d247923571b75e0aaf48a1449cf8c543d51fb3e07a4a7d7bfa79316"
@@ -124,8 +132,26 @@ def check_container_pins(script, matrix):
         raise ValueError("matrix base is not the approved linux/amd64 manifest")
     if "ARG UBUNTU_APT_SNAPSHOT=20260810T000000Z" not in matrix:
         raise ValueError("matrix apt snapshot is absent")
-    if re.search(r"\bapt-get\s+(?:update|install)\b", production + normalized_matrix):
-        raise ValueError("live apt operation lacks an intervening snapshot selector")
+    # ubuntu:noble carries no trust store at all, and -S rewrites the archive to
+    # HTTPS snapshot.ubuntu.com, so exactly one bare apt pair is permitted per
+    # source: fetch ca-certificates and nothing else. Every other apt operation
+    # must carry the snapshot selector. Each allowed line is stripped once, then
+    # any surviving bare apt-get is a live operation.
+    for label, text, allowed in (
+        ("driver", production, PRODUCTION_CA_BOOTSTRAP),
+        ("matrix", normalized_matrix, MATRIX_CA_BOOTSTRAP),
+    ):
+        remainder = text
+        for line in allowed:
+            if remainder.count(line) != 1:
+                raise ValueError(
+                    f"{label} ca-certificates bootstrap is missing or duplicated: {line}"
+                )
+            remainder = remainder.replace(line, "", 1)
+        if re.search(r"\bapt-get\s+(?:update|install)\b", remainder):
+            raise ValueError(
+                f"{label} live apt operation lacks an intervening snapshot selector"
+            )
     if not re.search(
         r'--no-deps\s+--repositories-file\s+/dev/null\s+'
         r'--repository\s+"\$ALPINE_MAIN_REPOSITORY"\s+add\b',
@@ -227,6 +253,24 @@ pin_mutations = (
         "added mutable matrix stage",
         script_source,
         matrix_source + "\nFROM ubuntu:24.04\n",
+    ),
+    (
+        "ca-certificates bootstrap widened to a second package",
+        mutate_production(
+            script_source,
+            "apt-get install -qy --no-install-recommends ca-certificates >/dev/null",
+            "apt-get install -qy --no-install-recommends ca-certificates curl >/dev/null",
+        ),
+        matrix_source,
+    ),
+    (
+        "ca-certificates bootstrap removed from the matrix",
+        script_source,
+        matrix_source.replace(
+            "    && apt-get install -y --no-install-recommends ca-certificates \\\n",
+            "",
+            1,
+        ),
     ),
     (
         "wrong linux platform manifest",
@@ -505,6 +549,8 @@ GLIBC_RUN_ID=$(create_owned --name "$GLIBC_RUN" \
     -v "$PWD:/src:ro" \
     -v "$DISCOVER_WORK/glibc-build/release/p11scope-discover:/usr/local/bin/p11scope-discover:ro" \
     "$DISCOVER_GLIBC_RUN_PLATFORM_IMAGE" sh -ec '
+  apt-get update -q >/dev/null
+  apt-get install -qy --no-install-recommends ca-certificates >/dev/null
   apt-get -S "$UBUNTU_APT_SNAPSHOT" update -q >/dev/null
   apt-get -S "$UBUNTU_APT_SNAPSHOT" install -qy gcc jq softhsm2 util-linux >/dev/null
   run_discover() {

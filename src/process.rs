@@ -392,6 +392,10 @@ impl ProcessView {
         self.pin.original_exited()
     }
 
+    pub(crate) fn original_generation_state(&self) -> Result<OriginalGenerationState, String> {
+        self.pin.original_generation_state()
+    }
+
     pub(crate) fn run_while_same<T>(&self, action: impl FnOnce() -> T) -> Result<T, String> {
         run_while_same_with(|| self.still_the_same(), action)
     }
@@ -443,6 +447,44 @@ pub fn stale_view_ids(views: &[ProcessView]) -> Vec<ProcessViewId> {
         .filter(|view| !view.still_the_same())
         .map(ProcessView::id)
         .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn reused_process_view_for_test(
+    id: ProcessViewId,
+    pid: u32,
+) -> Result<ProcessView, String> {
+    let mut view = ProcessView::open(id, pid)?;
+    let retained = process_start_time(pid)
+        .map_err(|error| format!("cannot build reused-pid test view: {error}"))?
+        .wrapping_add(1);
+    view.pin = PidPin {
+        pid,
+        pidfd: None,
+        start_time: Some(retained),
+    };
+    Ok(view)
+}
+
+#[cfg(test)]
+pub(crate) fn unprovable_process_view_for_test(
+    id: ProcessViewId,
+    pid: u32,
+) -> Result<ProcessView, String> {
+    let mut view = ProcessView::open(id, pid)?;
+    view.pin = PidPin {
+        pid,
+        pidfd: None,
+        start_time: None,
+    };
+    Ok(view)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OriginalGenerationState {
+    Current,
+    Exited,
+    Reused,
 }
 
 /// A process identity that survives PID reuse. `pidfd_open` is exact; the
@@ -509,6 +551,19 @@ impl PidPin {
         })
     }
 
+    pub(crate) fn original_generation_state(&self) -> Result<OriginalGenerationState, String> {
+        let pidfd_ready = self.pidfd.as_ref().map(pidfd_ready);
+        original_generation_state_with(pidfd_ready, self.start_time, || {
+            process_start_time(self.pid)
+        })
+        .map_err(|error| {
+            format!(
+                "cannot classify the original generation of pid {}: {error}",
+                self.pid
+            )
+        })
+    }
+
     /// Proves that this pin retained the original pidfd and that the kernel
     /// still grants signal authority for that exact process generation.
     pub(crate) fn probe_signal_authority(&self) -> Result<(), String> {
@@ -559,6 +614,40 @@ fn proc_generation_exited(retained: u64, current: io::Result<u64>) -> io::Result
         Ok(current) => Ok(current != retained),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
         Err(error) => Err(error),
+    }
+}
+
+fn original_generation_state_with(
+    pidfd_ready: Option<io::Result<bool>>,
+    retained_start: Option<u64>,
+    current_start: impl FnOnce() -> io::Result<u64>,
+) -> io::Result<OriginalGenerationState> {
+    let pidfd_exited = match pidfd_ready {
+        Some(Ok(false)) => return Ok(OriginalGenerationState::Current),
+        Some(Ok(true)) => true,
+        Some(Err(error)) => return Err(error),
+        None => false,
+    };
+
+    match current_start() {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Ok(OriginalGenerationState::Exited)
+        }
+        Err(error) => Err(error),
+        Ok(current) => {
+            let retained = retained_start.ok_or_else(|| {
+                io::Error::other(
+                    "cannot distinguish original exit from PID reuse without a start time",
+                )
+            })?;
+            if current != retained {
+                Ok(OriginalGenerationState::Reused)
+            } else if pidfd_exited {
+                Ok(OriginalGenerationState::Exited)
+            } else {
+                Ok(OriginalGenerationState::Current)
+            }
+        }
     }
 }
 
@@ -804,6 +893,73 @@ mod tests {
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::PermissionDenied
+        );
+    }
+
+    /// Mutation caught: classifying a changed `/proc` start time as an exit
+    /// would grant a later process at the reused numeric PID terminal authority.
+    #[test]
+    fn original_generation_state_distinguishes_exit_from_pid_reuse() {
+        let current_reads = Cell::new(0);
+        assert_eq!(
+            original_generation_state_with(Some(Ok(false)), None, || {
+                current_reads.set(current_reads.get() + 1);
+                Ok(10)
+            })
+            .unwrap(),
+            OriginalGenerationState::Current
+        );
+        assert_eq!(
+            current_reads.get(),
+            0,
+            "a live pidfd is already exact generation evidence"
+        );
+
+        assert_eq!(
+            original_generation_state_with(None, Some(10), || Ok(10)).unwrap(),
+            OriginalGenerationState::Current
+        );
+        assert_eq!(
+            original_generation_state_with(None, Some(10), || Ok(11)).unwrap(),
+            OriginalGenerationState::Reused
+        );
+        assert_eq!(
+            original_generation_state_with(None, Some(10), || {
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            })
+            .unwrap(),
+            OriginalGenerationState::Exited
+        );
+        assert_eq!(
+            original_generation_state_with(Some(Ok(true)), Some(10), || Ok(10)).unwrap(),
+            OriginalGenerationState::Exited,
+            "an exited pidfd can still have a same-generation zombie in /proc"
+        );
+
+        assert_eq!(
+            original_generation_state_with(
+                Some(Err(io::Error::from(io::ErrorKind::Interrupted))),
+                Some(10),
+                || Ok(10)
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(
+            original_generation_state_with(None, Some(10), || {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            })
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            original_generation_state_with(None, None, || Ok(10))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Other,
+            "missing retained start time is unknown, never exit"
         );
     }
 

@@ -21,7 +21,7 @@ use crate::discovery::scan::{
     target_layout,
 };
 use crate::manifest_input::{read_manifest, selection_surface_usable, validate_structure};
-use crate::process::{self, ProcessView, ProcessViewId};
+use crate::process::{self, OriginalGenerationState, ProcessView, ProcessViewId};
 use crate::run::OwnedChild;
 use crate::{plan, render};
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -1891,6 +1891,7 @@ struct ScanInput {
 type InventoryScan = (ProcessViewId, Vec<ScannedModule>, PinnedObjects);
 type InventoryScanOutcome = (Vec<InventoryScan>, BTreeSet<u32>, Vec<Skipped>);
 type PendingViewRetirements = BTreeMap<ProcessViewId, RetirementCause>;
+type TerminalSelectionHandoffs = BTreeMap<u16, Vec<DiscoveryRecord>>;
 type DiscoveryCollector<'a> =
     dyn FnMut(&mut dyn EngineSession) -> Result<(Vec<DiscoveryRecord>, u64)> + 'a;
 type SlotCompletion = (u32, Option<u64>);
@@ -2297,6 +2298,10 @@ enum DiscoveryRecordOutcome {
         required_complete: bool,
     },
     Rejected(RecordRejection),
+    TerminalSelectionHandoff {
+        view: ProcessViewId,
+        owner: LoaderContextId,
+    },
 }
 
 impl DiscoveryRecordOutcome {
@@ -2310,7 +2315,7 @@ impl DiscoveryRecordOutcome {
     fn changed(self) -> bool {
         match self {
             Self::Applied { changed, .. } => changed,
-            Self::Rejected(_) => false,
+            Self::Rejected(_) | Self::TerminalSelectionHandoff { .. } => false,
         }
     }
 
@@ -2320,7 +2325,7 @@ impl DiscoveryRecordOutcome {
             Self::Applied {
                 required_complete: true,
                 ..
-            }
+            } | Self::TerminalSelectionHandoff { .. }
         )
     }
 }
@@ -8379,6 +8384,38 @@ impl Engine {
         })
     }
 
+    fn ordinary_selection_view<'a>(
+        &'a self,
+        record: &DiscoveryRecord,
+        binding: &SelectionBindingFact,
+        hook_matches: bool,
+    ) -> Option<&'a ProcessView> {
+        let pid = (record.pid_tgid >> 32) as u32;
+        if !binding.attached
+            || binding.retired
+            || !hook_matches
+            || self.loader_registry.is_tombstoned(binding.context)
+            || self
+                .loader_registry
+                .context(binding.context)
+                .is_none_or(|context| context.spec.view != binding.view)
+        {
+            return None;
+        }
+
+        self.views
+            .iter()
+            .find(|view| view.id() == binding.view && view.pid() == pid)
+    }
+
+    fn reject_selection_attribution(&mut self, binding_id: u64) {
+        self.mark_live_loss(
+            "live interface selection",
+            "a selection record failed binding, context, or process-generation attribution",
+        );
+        self.invalidate_selection_coverage(binding_id);
+    }
+
     #[cfg(test)]
     fn process_selection_record(
         &mut self,
@@ -8437,30 +8474,32 @@ impl Engine {
             abi: binding.abi,
         };
         let pid = (record.pid_tgid >> 32) as u32;
+        let ordinary_generation = queued
+            .terminal_owner
+            .is_none()
+            .then(|| self.ordinary_selection_view(record, &binding, hook_matches))
+            .flatten()
+            .map(|view| (view.id(), view.original_generation_state()));
         let authorized = if let Some(owner) = queued.terminal_owner {
             binding.attached
                 && hook_matches
                 && owner == binding.context
                 && queued.terminal_exports.contains(&identity)
         } else {
-            binding.attached
-                && !binding.retired
-                && hook_matches
-                && !self.loader_registry.is_tombstoned(binding.context)
-                && self
-                    .loader_registry
-                    .context(binding.context)
-                    .is_some_and(|context| context.spec.view == binding.view)
-                && self.views.iter().any(|view| {
-                    view.id() == binding.view && view.pid() == pid && view.still_the_same()
-                })
+            matches!(
+                ordinary_generation.as_ref(),
+                Some((_, Ok(OriginalGenerationState::Current)))
+            )
         };
         if !authorized {
-            self.mark_live_loss(
-                "live interface selection",
-                "a selection record failed binding, context, or process-generation attribution",
-            );
-            self.invalidate_selection_coverage(binding.id);
+            if let Some((view, Ok(OriginalGenerationState::Exited))) = ordinary_generation {
+                return Ok(DiscoveryRecordOutcome::TerminalSelectionHandoff {
+                    view,
+                    owner: binding.context,
+                });
+            }
+
+            self.reject_selection_attribution(binding.id);
             return Ok(DiscoveryRecordOutcome::Rejected(
                 RecordRejection::SelectionUnattributed,
             ));
@@ -9947,6 +9986,36 @@ impl Engine {
         self.terminal_journal.map(|journal| journal.owner)
     }
 
+    fn handoff_precharged_terminal_records(
+        &mut self,
+        owner: LoaderContextId,
+        records: Vec<DiscoveryRecord>,
+    ) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let batch = self
+            .terminal_batch
+            .as_mut()
+            .ok_or_else(|| anyhow!("terminal loader drain batch is missing"))?;
+        if batch.authority.owner != owner {
+            bail!("terminal selection handoff named the wrong loader owner");
+        }
+        batch.extend(records);
+        Ok(())
+    }
+
+    fn reject_terminal_selection_handoffs(
+        &mut self,
+        records: impl IntoIterator<Item = DiscoveryRecord>,
+        closure: &mut PauseClosure,
+    ) {
+        for record in records {
+            self.reject_selection_attribution(record.binding_id);
+            closure.fail();
+        }
+    }
+
     fn retain_terminal_batch(
         &mut self,
         records: impl IntoIterator<Item = DiscoveryRecord>,
@@ -10262,9 +10331,14 @@ impl Engine {
         self.dispatch_terminal_batch(session, additions_allowed, pending_views, closure)
     }
 
+    // One retirement pass owns the whole decision: the view, the terminal
+    // handoffs it may still hand a selection to, and every accumulator the
+    // caller needs back. Splitting it would hand out the same state twice.
+    #[allow(clippy::too_many_arguments)]
     fn retire_loader_contexts(
         &mut self,
         view: ProcessViewId,
+        terminal_selection_handoffs: &mut TerminalSelectionHandoffs,
         session: &mut dyn EngineSession,
         additions_allowed: &mut bool,
         pending_views: &mut PendingViewRetirements,
@@ -10321,7 +10395,17 @@ impl Engine {
                         "a one-shot dynamic detach failed; replacement was blocked for this cycle",
                     );
                 }
-                match self.begin_terminal_drain(context_id, terminal_exports, || collect(session)) {
+                let terminal_drain =
+                    self.begin_terminal_drain(context_id, terminal_exports, || collect(session));
+                if terminal_drain.is_ok()
+                    && let Some(records) = terminal_selection_handoffs.remove(&context_id.get())
+                    && let Err(error) =
+                        self.handoff_precharged_terminal_records(context_id, records.clone())
+                {
+                    self.reject_terminal_selection_handoffs(records, closure);
+                    return Err(error);
+                }
+                match terminal_drain {
                     Ok(Ok((owned, malformed))) => {
                         if malformed != 0 {
                             closure.fail();
@@ -10356,6 +10440,10 @@ impl Engine {
                         return Ok((changed, false));
                     }
                     Err(_) => {
+                        if let Some(records) = terminal_selection_handoffs.remove(&context_id.get())
+                        {
+                            self.reject_terminal_selection_handoffs(records, closure);
+                        }
                         closure.fail();
                         *additions_allowed = false;
                         self.mark_partial(
@@ -10839,6 +10927,7 @@ impl Engine {
         let mut changed = false;
         let mut named_generation_lost = false;
         let mut conservative_replay_attempted = false;
+        let mut terminal_selection_handoffs = TerminalSelectionHandoffs::new();
         for (view, cause) in self.retirement_intents.clone() {
             pending_views
                 .entry(view)
@@ -10849,6 +10938,7 @@ impl Engine {
             let mut exec_refresh_views = BTreeSet::new();
             let mut deferred_mismatches = Vec::new();
             for queued in std::mem::take(records) {
+                let record = queued.record;
                 let origin = (queued.record.pid_tgid >> 32) as u32;
                 match self.dispatch_discovery_record(
                     queued,
@@ -10858,6 +10948,13 @@ impl Engine {
                     &mut exec_refresh_views,
                     &mut deferred_mismatches,
                 ) {
+                    Ok(DiscoveryRecordOutcome::TerminalSelectionHandoff { view, owner }) => {
+                        terminal_selection_handoffs
+                            .entry(owner.get())
+                            .or_default()
+                            .push(record);
+                        self.queue_retirement(view, RetirementCause::GenerationLost, pending_views);
+                    }
                     Ok(outcome) => {
                         changed |= outcome.changed();
                         if !outcome.required_complete() {
@@ -10934,6 +11031,7 @@ impl Engine {
                 }
                 let (retirement_changed, complete) = self.retire_loader_contexts(
                     view,
+                    &mut terminal_selection_handoffs,
                     session,
                     additions_allowed,
                     pending_views,
@@ -10974,6 +11072,11 @@ impl Engine {
                 conservative_replay_attempted = false;
             }
         }
+        let refused_handoffs = std::mem::take(&mut terminal_selection_handoffs)
+            .into_values()
+            .flatten()
+            .collect::<Vec<_>>();
+        self.reject_terminal_selection_handoffs(refused_handoffs, closure);
         self.finalize_expected_target_exit();
         if named_generation_lost {
             bail!("the named process generation changed during live discovery");
@@ -11355,6 +11458,7 @@ impl Engine {
         let mut mutation_started = false;
         let mut failed_retirements = BTreeSet::new();
         let mut context_retirements = BTreeSet::new();
+        let mut no_terminal_selection_handoffs = TerminalSelectionHandoffs::new();
         let retirement_views: BTreeSet<_> = removed.union(&refreshed_ok).copied().collect();
         self.queue_inventory_retirements(&retirement_views, &stale, &departed, pending_views);
         for view in &retirement_views {
@@ -11364,6 +11468,7 @@ impl Engine {
             }
             let (retirement_changed, complete) = self.retire_loader_contexts(
                 *view,
+                &mut no_terminal_selection_handoffs,
                 session,
                 additions_allowed,
                 pending_views,
@@ -11946,6 +12051,7 @@ impl Engine {
         let mut records = Vec::new();
         let mut pending_views = PendingViewRetirements::new();
         let mut closure = PauseClosure::new(true);
+        let mut no_terminal_selection_handoffs = TerminalSelectionHandoffs::new();
         if direct_stable && !self.loader_registry.ids_for_view(view).is_empty() {
             return Ok(DiscoveryBatchOutcome {
                 changed: false,
@@ -11955,6 +12061,7 @@ impl Engine {
         if !self.loader_registry.ids_for_view(view).is_empty() {
             let (_, complete) = self.retire_loader_contexts(
                 view,
+                &mut no_terminal_selection_handoffs,
                 session,
                 &mut additions_allowed,
                 &mut pending_views,
@@ -15579,9 +15686,11 @@ pub(crate) mod tests {
         let mut additions_allowed = true;
         let mut collect = Engine::collect_discovery_records;
         let mut closure = PauseClosure::new(true);
+        let mut no_terminal_selection_handoffs = TerminalSelectionHandoffs::new();
         let (_, complete) = post_engine
             .retire_loader_contexts(
                 ProcessViewId(0),
+                &mut no_terminal_selection_handoffs,
                 &mut post_session,
                 &mut additions_allowed,
                 &mut post_pending,
@@ -21963,6 +22072,25 @@ int main(int argc, char **argv) {
         record
     }
 
+    fn successful_selection_record(
+        pid: u32,
+        binding_id: u64,
+        request_flags: u64,
+    ) -> DiscoveryRecord {
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_INTERFACE_RETURN;
+        record.pid_tgid = u64::from(pid) << 32;
+        record.case_id = DISCOVERY_NAME_EXACT_STANDARD;
+        record.interface_index = DISCOVERY_VERSION_V3_0;
+        record.request_flags = request_flags;
+        record.name_class = DISCOVERY_NAME_EXACT_STANDARD;
+        record.selection_version_class = DISCOVERY_VERSION_V3_0;
+        record.table_ptr = 0x1000;
+        record.binding_id = binding_id;
+        assert!(valid_discovery_record(&record));
+        record
+    }
+
     /// One ordinary non-terminal Engine batch through the real application
     /// route, with the real generic collector.
     fn apply_ordinary_batch(
@@ -21972,6 +22100,306 @@ int main(int argc, char **argv) {
     ) -> Result<DiscoveryBatchOutcome> {
         let mut collect = Engine::collect_discovery_records;
         engine.apply_discovery_batch_with(session, records, 0, true, false, &mut collect, None)
+    }
+
+    /// Mutation caught: rejecting an already-dequeued return solely because
+    /// its original process exited drops a factual interface-selection tuple.
+    #[test]
+    fn ordinary_selection_records_survive_honest_exit_through_exact_terminal_handoff() {
+        const WORK_CEILING: u64 = 16 * 1024 * 1024;
+        let (mut fixture, mut engine, mut session, binding) = attached_selection_route();
+        let identity = DynamicExportIdentity {
+            object: binding.object,
+            file_offset: binding.file_offset,
+            cookie: binding.id,
+            abi: binding.abi,
+        };
+        session.detach_exports = vec![identity];
+        let records = (0..3)
+            .map(|flags| successful_selection_record(fixture.child.id(), binding.id, flags))
+            .collect();
+        engine.budget = CaptureWorkBudget::default();
+        assert!(engine.budget.charge(WORK_CEILING - 3));
+
+        fixture.child.kill().unwrap();
+        fixture.child.wait().unwrap();
+        let outcome = apply_ordinary_batch(&mut engine, &mut session, records).unwrap();
+
+        assert_eq!(engine.capture_facts.history.selections.len(), 3);
+        assert!(engine.capture_facts.history.selections.iter().all(|tuple| {
+            tuple.result.is_some()
+                && tuple.inventory_matches.is_empty()
+                && tuple.authority == SelectionAuthority::None
+                && tuple.count == 1
+        }));
+        assert!(engine.capture_facts.history.losses.values().any(|loss| {
+            loss.reason == "a terminal selection result had no stable live table assessment"
+        }));
+        assert!(engine.selection_claims.is_empty());
+        assert!(engine.selection_tables.is_empty());
+        assert_eq!(session.detached, [binding.context]);
+        assert!(engine.views.is_empty());
+        assert!(engine.terminal_batch.is_none());
+        assert!(engine.terminal_journal.is_none());
+        assert!(
+            engine.budget.charge(0),
+            "the terminal handoff must not charge the three records again"
+        );
+        assert!(
+            !engine.budget.charge(1),
+            "the ordinary dequeue consumed exactly the last three work units"
+        );
+        assert!(!outcome.required_complete);
+    }
+
+    /// Mutation caught: treating a changed retained `/proc` start time as an
+    /// exit would transfer a different process's record into terminal authority.
+    #[test]
+    fn ordinary_selection_record_refuses_pid_reuse_without_terminal_handoff() {
+        let (_fixture, mut engine, mut session, binding) = attached_selection_route();
+        let pid = std::process::id();
+        engine.scope = Scope::Pid(pid);
+        engine.views = vec![
+            crate::process::reused_process_view_for_test(binding.view, pid)
+                .expect("a deterministic reused-pid view"),
+        ];
+        assert!(
+            !engine.views[0].still_the_same(),
+            "the fixture independently retains a different /proc start time"
+        );
+        engine
+            .selection_bindings
+            .get_mut(&binding.id)
+            .unwrap()
+            .coverage = SelectionCoverageState::OwnedOpen(NonZeroU64::new(41).unwrap());
+        let identity = DynamicExportIdentity {
+            object: binding.object,
+            file_offset: binding.file_offset,
+            cookie: binding.id,
+            abi: binding.abi,
+        };
+        session.detach_exports = vec![identity];
+
+        let outcome = apply_ordinary_batch(
+            &mut engine,
+            &mut session,
+            vec![successful_selection_record(pid, binding.id, 0)],
+        )
+        .unwrap();
+
+        assert!(engine.capture_facts.history.selections.is_empty());
+        assert!(engine.terminal_batch.is_none());
+        assert!(engine.terminal_journal.is_none());
+        assert_eq!(
+            engine.selection_bindings[&binding.id].coverage,
+            SelectionCoverageState::Uncovered
+        );
+        assert!(engine.counters.object_skips.iter().any(|skip| {
+            skip.reason
+                == "a selection record failed binding, context, or process-generation attribution"
+        }));
+        assert!(!outcome.required_complete);
+    }
+
+    /// Mutation caught: terminal tagging nominates by cookie and ABI, but the
+    /// reducer must still require the detached snapshot's full exact identity.
+    #[test]
+    fn exited_selection_handoff_refuses_mismatched_detached_identity() {
+        for case in ["object", "file offset", "cookie", "abi"] {
+            let (mut fixture, mut engine, mut session, binding) = attached_selection_route();
+            let mut detached = DynamicExportIdentity {
+                object: binding.object,
+                file_offset: binding.file_offset,
+                cookie: binding.id,
+                abi: binding.abi,
+            };
+            match case {
+                "object" => detached.object = PinnedObjectId(binding.object.0 + 1),
+                "file offset" => detached.file_offset += 1,
+                "cookie" => detached.cookie += 1,
+                "abi" => detached.abi = HookAbi::FunctionList,
+                _ => unreachable!(),
+            }
+            session.detach_exports = vec![detached];
+            let record = successful_selection_record(fixture.child.id(), binding.id, 0);
+
+            fixture.child.kill().unwrap();
+            fixture.child.wait().unwrap();
+            let outcome = apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+
+            assert!(engine.capture_facts.history.selections.is_empty(), "{case}");
+            assert_eq!(session.detached, [binding.context], "{case}");
+            assert!(engine.terminal_batch.is_none(), "{case}");
+            assert!(engine.terminal_journal.is_none(), "{case}");
+            assert!(
+                engine.counters.object_skips.iter().any(|skip| {
+                    skip.reason
+                        == "a selection record failed binding, context, or process-generation attribution"
+                }),
+                "{case}"
+            );
+            assert!(!outcome.required_complete, "{case}");
+        }
+    }
+
+    #[test]
+    fn exited_selection_handoff_requires_every_ordinary_attribution_guard() {
+        for case in [
+            "unknown binding",
+            "unattached binding",
+            "retired binding",
+            "tombstoned context",
+            "context view disagreement",
+            "missing retained view",
+            "wrong record pid",
+            "hook abi mismatch",
+        ] {
+            let (mut fixture, mut engine, _session, binding) = attached_selection_route();
+            let pid = fixture.child.id();
+            let mut record = successful_selection_record(pid, binding.id, 0);
+            match case {
+                "unknown binding" => record.binding_id = binding.id + 1000,
+                "unattached binding" => {
+                    engine
+                        .selection_bindings
+                        .get_mut(&binding.id)
+                        .unwrap()
+                        .attached = false;
+                }
+                "retired binding" => {
+                    engine
+                        .selection_bindings
+                        .get_mut(&binding.id)
+                        .unwrap()
+                        .retired = true;
+                }
+                "tombstoned context" => {
+                    engine.loader_registry.tombstone(binding.context).unwrap();
+                }
+                "context view disagreement" => {
+                    let other = ProcessView::open(ProcessViewId(77), pid).unwrap();
+                    engine.views.push(other);
+                    engine.selection_bindings.get_mut(&binding.id).unwrap().view =
+                        ProcessViewId(77);
+                }
+                "missing retained view" => engine.views.clear(),
+                "wrong record pid" => record.pid_tgid = u64::from(std::process::id()) << 32,
+                "hook abi mismatch" => {
+                    engine.selection_bindings.get_mut(&binding.id).unwrap().abi =
+                        HookAbi::FunctionList;
+                }
+                _ => unreachable!(),
+            }
+
+            fixture.child.kill().unwrap();
+            fixture.child.wait().unwrap();
+            assert_eq!(
+                engine.process_selection_record(&QueuedDiscoveryRecord {
+                    record,
+                    terminal_owner: None,
+                    terminal_exports: Vec::new(),
+                }),
+                DiscoveryRecordOutcome::Rejected(RecordRejection::SelectionUnattributed),
+                "{case}"
+            );
+            assert!(engine.capture_facts.history.selections.is_empty(), "{case}");
+        }
+    }
+
+    #[test]
+    fn terminal_selection_authority_refuses_the_wrong_owner() {
+        let (_fixture, mut engine, _session, binding) = attached_selection_route();
+        let identity = DynamicExportIdentity {
+            object: binding.object,
+            file_offset: binding.file_offset,
+            cookie: binding.id,
+            abi: binding.abi,
+        };
+        let wrong_owner = LoaderContextId::from_case_id(200);
+        assert_ne!(wrong_owner, binding.context);
+        let record = successful_selection_record(engine.views[0].pid(), binding.id, 0);
+
+        assert_eq!(
+            engine
+                .process_selection_record(&tagged_by_authority(wrong_owner, &[identity], record,)),
+            DiscoveryRecordOutcome::Rejected(RecordRejection::SelectionUnattributed)
+        );
+        assert!(engine.capture_facts.history.selections.is_empty());
+    }
+
+    #[test]
+    fn ordinary_selection_record_refuses_an_unprovable_generation() {
+        let (_fixture, mut engine, _session, binding) = attached_selection_route();
+        let pid = std::process::id();
+        engine.views = vec![
+            crate::process::unprovable_process_view_for_test(binding.view, pid)
+                .expect("a view with no retained start time or pidfd"),
+        ];
+        let record = successful_selection_record(pid, binding.id, 0);
+
+        assert_eq!(
+            engine.process_selection_record(&QueuedDiscoveryRecord {
+                record,
+                terminal_owner: None,
+                terminal_exports: Vec::new(),
+            }),
+            DiscoveryRecordOutcome::Rejected(RecordRejection::SelectionUnattributed)
+        );
+        assert!(engine.capture_facts.history.selections.is_empty());
+        assert!(engine.counters.object_skips.iter().any(|skip| {
+            skip.reason
+                == "a selection record failed binding, context, or process-generation attribution"
+        }));
+    }
+
+    #[test]
+    fn exited_selection_handoff_survives_predispatch_retry_without_recharge() {
+        const WORK_CEILING: u64 = 16 * 1024 * 1024;
+        let (mut fixture, mut engine, mut session, binding) = attached_selection_route();
+        let generation = NonZeroU64::new(43).unwrap();
+        engine
+            .selection_bindings
+            .get_mut(&binding.id)
+            .unwrap()
+            .coverage = SelectionCoverageState::OwnedOpen(generation);
+        let identity = DynamicExportIdentity {
+            object: binding.object,
+            file_offset: binding.file_offset,
+            cookie: binding.id,
+            abi: binding.abi,
+        };
+        session.detach_exports = vec![identity];
+        session.fail_counter_reads([false, true]);
+        engine.budget = CaptureWorkBudget::default();
+        assert!(engine.budget.charge(WORK_CEILING - 1));
+        let record = successful_selection_record(fixture.child.id(), binding.id, 0);
+
+        fixture.child.kill().unwrap();
+        fixture.child.wait().unwrap();
+        apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+
+        assert_eq!(session.counter_reads(), 3);
+        assert_eq!(engine.capture_facts.history.selections.len(), 1);
+        assert_eq!(engine.capture_facts.history.selections[0].count, 1);
+        assert!(engine.capture_facts.history.losses.values().any(|loss| {
+            loss.reason == "a terminal selection result had no stable live table assessment"
+        }));
+        assert!(engine.counters.object_skips.iter().any(|skip| {
+            skip.reason
+                == "the post-detach producer snapshot could not be read; the exact terminal batch remains queued"
+        }));
+        assert!(engine.terminal_batch.is_none());
+        assert!(engine.terminal_journal.is_none());
+        assert!(engine.loader_registry.context(binding.context).is_none());
+        assert_eq!(
+            engine.selection_bindings[&binding.id].coverage,
+            SelectionCoverageState::Uncovered
+        );
+        assert!(
+            engine.budget.charge(0),
+            "handoff and retry must not recharge the precharged record"
+        );
+        assert!(!engine.budget.charge(1));
     }
 
     #[test]

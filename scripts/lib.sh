@@ -312,24 +312,47 @@ finalize_root_recorded_process() { finalize_recorded_process root; }
 finalize_user_recorded_process() { finalize_recorded_process user; }
 
 # Generic durable reader: it never acknowledges an unrelated workload record.
-wait_root_process_record() {
-    [ "$#" -eq 3 ] || return 2
-    wrpr_pidfile=$1 wrpr_launcher=$2 wrpr_starttime=$3 wrpr_attempt=0
-    while [ "$wrpr_attempt" -lt 160 ]; do
-        if wrpr_record=$(sudo -n python3 -I "$RECORDED_PROCESS_EXEC" durable-read "$wrpr_pidfile"); then
-            printf '%s\n' "$wrpr_record"
+#
+# The reading PRINCIPAL must match whoever created the record. The custody
+# predicate in recorded-process-exec accepts owners `(0, os.getuid())` and reads
+# no environment at all, so reading a user-created record through `sudo` narrows
+# that set to {root} and refuses a record that is perfectly well formed --
+# SUDO_UID does not help, because nothing consults it. Both wrappers below run
+# the SAME strict predicate; only the principal differs. Do not "fix" a
+# mismatch by widening the privileged reader's accepted ownership: that would
+# let any user-created tuple satisfy a check whose whole purpose is to prove the
+# record came from the privileged recorded process.
+_wait_process_record() {
+    wpr_sudo=$1 wpr_label=$2 wpr_pidfile=$3 wpr_launcher=$4 wpr_starttime=$5
+    wpr_attempt=0
+    while [ "$wpr_attempt" -lt 160 ]; do
+        if wpr_record=$($wpr_sudo python3 -I "$RECORDED_PROCESS_EXEC" durable-read "$wpr_pidfile"); then
+            printf '%s\n' "$wpr_record"
             return 0
-        else wrpr_status=$?; fi
-        [ "$wrpr_status" -eq 3 ] || return 2
-        if recording_launcher_active "$wrpr_launcher" "$wrpr_starttime"; then :; else
-            wrpr_status=$?
-            return "$wrpr_status"
+        else wpr_status=$?; fi
+        [ "$wpr_status" -eq 3 ] || return 2
+        if recording_launcher_active "$wpr_launcher" "$wpr_starttime"; then :; else
+            wpr_status=$?
+            return "$wpr_status"
         fi
-        wrpr_attempt=$((wrpr_attempt + 1))
+        wpr_attempt=$((wpr_attempt + 1))
         sleep 0.05
     done
-    echo "root process identity was not recorded" >&2
+    echo "$wpr_label process identity was not recorded" >&2
     return 1
+}
+
+wait_root_process_record() {
+    [ "$#" -eq 3 ] || return 2
+    _wait_process_record "sudo -n" root "$1" "$2" "$3"
+}
+
+# For a workload the lane deliberately runs as the invoking user -- e.g. a
+# scope created by root but entered with --uid/--gid -- whose record is
+# therefore user-owned.
+wait_user_process_record() {
+    [ "$#" -eq 3 ] || return 2
+    _wait_process_record "" user "$1" "$2" "$3"
 }
 
 process_starttime() {

@@ -948,7 +948,11 @@ WORKLOAD_LAUNCHER_PID=$!
 # has its pid reused cannot be mistaken for one still recording.
 WORKLOAD_LAUNCHER_STARTTIME=$(process_starttime "$WORKLOAD_LAUNCHER_PID") \
     || { echo "freeze workload launcher start time was not readable"; exit 1; }
-workload_record=$(wait_root_process_record \
+# The freeze workload runs as the INVOKING USER inside a root-created scope
+# (--uid/--gid above), so its record is user-owned and must be read as that
+# user. The observer below is a genuinely root-recorded process and keeps the
+# root reader.
+workload_record=$(wait_user_process_record \
     "$WORK/freeze-workload.pid" "$WORKLOAD_LAUNCHER_PID" \
     "$WORKLOAD_LAUNCHER_STARTTIME")
 set -- $workload_record

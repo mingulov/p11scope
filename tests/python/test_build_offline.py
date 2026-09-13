@@ -478,11 +478,21 @@ class BuildOfflineTests(unittest.TestCase):
                             env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                         marker = self.source / "test-record/child-pid"
                         deadline = time.monotonic() + 10
-                        while (not marker.exists() and process.poll() is None
-                               and time.monotonic() < deadline):
+                        # Creating the marker and writing the pid into it are not
+                        # one step, so waiting for mere existence can read the
+                        # empty file in between. Wait for parseable content.
+                        recorded = ""
+                        while True:
+                            try:
+                                recorded = marker.read_text(encoding="ascii").strip()
+                            except FileNotFoundError:
+                                recorded = ""
+                            if (recorded or process.poll() is not None
+                                    or time.monotonic() >= deadline):
+                                break
                             time.sleep(0.02)
-                        self.assertTrue(marker.exists())
-                        child = int(marker.read_text(encoding="ascii"))
+                        self.assertTrue(recorded, "child pid marker never held a pid")
+                        child = int(recorded)
                         child_pidfd = os.pidfd_open(child)
                         process.send_signal(number)
                         process.communicate(timeout=10)

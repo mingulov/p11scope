@@ -96,12 +96,27 @@ int dump_task_storage(struct bpf_iter__task *ctx)
 
     if (!task)
         return 0;
+    /* A bpf_iter program may return only 0 or 1, and the verifier rejects the
+     * whole object otherwise (-EINVAL, "At program exit the register R0 ...
+     * should have been in [0, 1]"). The two values are not success/failure:
+     * 0 keeps this task's written bytes, 1 DISCARDS them and declines the
+     * retry. So 0 is correct on every path here, including the one emit()
+     * reports nonzero.
+     *
+     * emit() only returns nonzero when bpf_seq_write() overflowed, which is
+     * backpressure rather than an error: the kernel drops this task's partial
+     * output and runs the program again for the SAME task on the next read()
+     * (see bpf_seq_write in linux/bpf.h -- "The same object will be tried
+     * again"). Returning early merely stops writing bytes the kernel is
+     * already discarding; returning 1 would turn that retry into permanent
+     * data loss, and returning -1 stopped the object loading at all.
+     */
     if (emit(ctx->meta->seq, task, &TASK_COOKIE, 0, 8))
-        return -1;
+        return 0;
     if (emit(ctx->meta->seq, task, &THREAD_OWNER, 1, 544))
-        return -1;
+        return 0;
     if (emit(ctx->meta->seq, task, &ROOT_AFFILIATION, 2, 8))
-        return -1;
+        return 0;
     return 0;
 }
 

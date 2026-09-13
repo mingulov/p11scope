@@ -34,6 +34,7 @@ COUNTERS = (
     "async_evictions",
     "fork_state_ambiguities",
     "semantic_state_drops",
+    "semantic_history_drops",
     "pending_at_end",
     "malformed_records",
     "orphan_ops",
@@ -58,11 +59,12 @@ COUNTERS = (
 )
 
 # v2-metrics is retained only for historical fixtures and compatibility reads;
-# it predates the task-uprobe link-loss and ABI-refusal evidence added to v3.
+# it predates the task-uprobe link-loss, ABI-refusal, and semantic-history-drop
+# evidence added to v3.
 HISTORICAL_METRICS_SCHEMA = "pkcs11-scope/observed-profile/v2-metrics"
 HISTORICAL_COUNTERS = tuple(
     counter for counter in COUNTERS
-    if counter not in {"abi_refusals", "task_uprobe_link_losses"}
+    if counter not in {"abi_refusals", "task_uprobe_link_losses", "semantic_history_drops"}
 )
 
 # `evidence.loader_discovery` (design §9.2): finite, aggregate, and closed.
@@ -1874,6 +1876,7 @@ def document_fixture(evidence, *, schema=PROFILE_SCHEMA, mode="profile", privacy
         if schema == HISTORICAL_METRICS_SCHEMA:
             evidence.pop("task_uprobe_link_losses", None)
             evidence.pop("abi_refusals", None)
+            evidence.pop("semantic_history_drops", None)
     return {
         "schema": schema,
         "capture": {
@@ -2899,6 +2902,7 @@ def self_test():
         ("in_flight_at_end", 1),
         ("aliased", ["C_Sign"]),
         ("semantic_state_drops", 1),
+        ("semantic_history_drops", 1),
         ("rv_update_failures", 1),
         ("abi_refusals", 1),
     ):

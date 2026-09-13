@@ -765,11 +765,17 @@ cleanup() {
     fi
     [ -z "$WORKLOAD_LAUNCHER_PID" ] \
         || kill -CONT "$WORKLOAD_LAUNCHER_PID" 2>/dev/null || true
+    # Release the workload BEFORE waiting on its launcher. Until the barrier is
+    # written the workload blocks in `read`, so the launcher cannot exit and a
+    # wait here never returns. An early exit before the barrier is written -- any
+    # failure between launching the workload and releasing it -- then hangs the
+    # lane instead of reporting why it failed. Stopping the scope is the
+    # authority; removing the fifo only stops a later reader from blocking.
+    [ -z "$WORKLOAD_UNIT" ] || sudo systemctl stop "${WORKLOAD_UNIT}.scope" >/dev/null 2>&1 || true
+    rm -f "$WORK/freeze-barrier"
     [ -z "$WORKLOAD_LAUNCHER_PID" ] || wait "$WORKLOAD_LAUNCHER_PID" 2>/dev/null || true
     [ -n "$WORKLOAD_LAUNCHER_PID" ] || [ -z "$WPID" ] || wait "$WPID" 2>/dev/null || true
     [ -z "$SPID" ] || wait "$SPID" 2>/dev/null || true
-    [ -z "$WORKLOAD_UNIT" ] || sudo systemctl stop "${WORKLOAD_UNIT}.scope" >/dev/null 2>&1 || true
-    rm -f "$WORK/freeze-barrier"
     exit "$CLEANUP_STATUS"
 }
 . scripts/cleanup-traps.sh
@@ -937,8 +943,14 @@ systemd-run --help 2>&1 | grep -q -- '--expand-environment=' \
          '$WORK_ABS/freeze-ready' '$WORK_ABS/freeze-go'" ) \
     > "$WORK/freeze-workload.log" 2>&1 &
 WORKLOAD_LAUNCHER_PID=$!
+# The launcher generation is pinned the moment it is forked: the reader below
+# refuses a pid whose start time no longer matches, so a launcher that dies and
+# has its pid reused cannot be mistaken for one still recording.
+WORKLOAD_LAUNCHER_STARTTIME=$(process_starttime "$WORKLOAD_LAUNCHER_PID") \
+    || { echo "freeze workload launcher start time was not readable"; exit 1; }
 workload_record=$(wait_root_process_record \
-    "$WORK/freeze-workload.pid" "$WORKLOAD_LAUNCHER_PID")
+    "$WORK/freeze-workload.pid" "$WORKLOAD_LAUNCHER_PID" \
+    "$WORKLOAD_LAUNCHER_STARTTIME")
 set -- $workload_record
 [ "$#" -eq 2 ] || { echo "freeze workload identity was not recorded"; exit 1; }
 WPID=$1

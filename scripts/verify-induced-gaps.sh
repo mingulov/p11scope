@@ -1010,7 +1010,12 @@ reclaim_root_output "$WORK/freeze-observed.json" "$WORK/freeze-observer.pid"
 test -s "$WORK/freeze-observed.json" || { echo "freeze observer produced no output"; exit 1; }
 python3 scripts/check-capture-evidence.py canary feature-unsafe-profile \
     "$WORK/freeze-observed.json"
-python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); n=sum(f["calls"] for f in d["functions"]); assert n == 27, n' \
+# 30, not the 27 frozen on 2026-08-14: the shared workload gained exactly three
+# C_GetInterface calls since then (`get_interface(` appears 0 times at 7774bf6
+# and 3 times now), and the capture reports C_GetInterface 3. The delta is
+# accounted for call-for-call rather than fitted to whatever the lane emitted --
+# this lane could not run between those dates, so the count was never revalidated.
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); n=sum(f["calls"] for f in d["functions"]); assert n == 30, n' \
     "$WORK/freeze-observed.json"
 echo "freeze target identity remained live through exact terminal evidence: OK"
 

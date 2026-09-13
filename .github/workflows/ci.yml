@@ -114,6 +114,7 @@ jobs:
       - run: scripts/verify-capability-tier.sh --self-test
       - run: scripts/verify-live-discovery-preflight.sh --self-test
       - run: scripts/verify-canaries.sh --self-test
+      - run: scripts/verify-provider-matrix.sh --self-test
       - run: scripts/verify-task4-lane02.sh --self-test
       - run: scripts/verify-task4-lane16.sh --self-test
       - run: scripts/attach-pod.sh --self-test

@@ -6931,7 +6931,15 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
                             "sudo"
                                 | "docker"
                                 | "podman"
-                                | "kind"
+                                // `kind` is deliberately absent. It is the only
+                                // English word in this list, so it fires on any
+                                // script that reads a field named "kind" -- the
+                                // PKCS#11 surface vocabulary uses exactly that,
+                                // and the provider matrix lane is unprivileged.
+                                // Nothing is lost: kind is Kubernetes IN Docker
+                                // and cannot run without `docker` or `podman`,
+                                // which both remain, and every lane naming kind
+                                // today also names docker, kubectl or sudo.
                                 | "kubectl"
                                 | "bpftool"
                                 | "capsh"

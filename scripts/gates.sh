@@ -8,6 +8,7 @@ echo "=== gate validator self-tests ==="
 for gate in scripts/verify-inspect-doctor.sh scripts/verify-attach-e2e.sh \
     scripts/verify-induced-gaps.sh scripts/verify-canaries.sh \
     scripts/verify-discover-containers.sh scripts/verify-live-discovery-preflight.sh \
+    scripts/verify-provider-matrix.sh \
     scripts/verify-capability-tier.sh; do
     "$gate" --self-test
 done

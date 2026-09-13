@@ -17,8 +17,8 @@ use crate::discovery::loader::{LoaderContextId, LoaderContextSpec, LoaderRegistr
 use crate::discovery::scan::{
     CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedEntry, ScannedInterface, ScannedModule,
     ScannedTable, Skipped, decode_exact_table, exact_table_addresses, exact_table_bytes,
-    index_maps_or_refuse, read_elf_snapshot, read_maps_or_refuse, scan_process_view, spans_for,
-    target_layout,
+    index_maps_or_refuse, read_elf_snapshot, read_maps_or_refuse, scan_process_view,
+    scan_process_view_without_memory, spans_for, target_layout,
 };
 use crate::manifest_input::{read_manifest, selection_surface_usable, validate_structure};
 use crate::process::{self, OriginalGenerationState, ProcessView, ProcessViewId};
@@ -106,8 +106,11 @@ pub struct Engine {
     /// All identity stays out: only the classification is kept, and it is all
     /// that can be rendered.
     loader_contexts: BTreeMap<(ProcessViewId, LoaderAggregateKey, bool), LoaderContextClass>,
+    pending_loader_scans: BTreeMap<PendingLoaderScanKey, u64>,
     selection_claims: BTreeMap<SelectionClaimKey, SelectionClaim>,
     selection_tables: BTreeMap<SelectionTableKey, SelectionTableFact>,
+    #[cfg(test)]
+    loader_memory_scan_attempts: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +150,30 @@ impl PartialOrd for LoaderAggregateKey {
 struct LoaderContextClass {
     bound: bool,
     initial_set: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingLoaderScanKey {
+    view: ProcessViewId,
+    context: LoaderContextId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoaderScanMode {
+    Memory,
+    MetadataOnly,
+}
+
+impl Ord for PendingLoaderScanKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.view, self.context.get()).cmp(&(other.view, other.context.get()))
+    }
+}
+
+impl PartialOrd for PendingLoaderScanKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3269,6 +3296,23 @@ fn scan_and_pin(
     scan_and_pin_with(view, hints, hooks, budget, counters, scan_process_view)
 }
 
+fn scan_and_pin_without_memory(
+    view: &ProcessView,
+    hints: &[PathBuf],
+    hooks: &HookRegistry,
+    budget: &mut CaptureWorkBudget,
+    counters: &mut DiscoveryCounters,
+) -> Result<(Vec<ScannedModule>, PinnedObjects)> {
+    scan_and_pin_with(
+        view,
+        hints,
+        hooks,
+        budget,
+        counters,
+        scan_process_view_without_memory,
+    )
+}
+
 fn scan_and_pin_with(
     view: &ProcessView,
     hints: &[PathBuf],
@@ -5809,6 +5853,9 @@ impl Engine {
             selection_claims: BTreeMap::new(),
             selection_tables: BTreeMap::new(),
             loader_contexts: BTreeMap::new(),
+            pending_loader_scans: BTreeMap::new(),
+            #[cfg(test)]
+            loader_memory_scan_attempts: 0,
         }
     }
 
@@ -6739,6 +6786,66 @@ impl Engine {
         })
     }
 
+    fn scan_retained_view_without_memory(
+        view: &ProcessView,
+        module_hints: &[PathBuf],
+        hooks: &HookRegistry,
+        budget: &mut CaptureWorkBudget,
+    ) -> (
+        Result<(Vec<ScannedModule>, PinnedObjects)>,
+        DiscoveryCounters,
+    ) {
+        Self::scan_retained_view_with(|counters| {
+            scan_and_pin_without_memory(view, module_hints, hooks, budget, counters)
+        })
+    }
+
+    fn defer_loader_memory_scan(&mut self, key: PendingLoaderScanKey, hook_ts_ns: u64) {
+        if let Some(earliest) = self.pending_loader_scans.get_mut(&key) {
+            *earliest = (*earliest).min(hook_ts_ns);
+            return;
+        }
+        if self.pending_loader_scans.len() == crate::discovery::loader::MAX_LOADER_CONTEXTS {
+            self.record_pending_loader_scan_loss(
+                "a deferred loader memory scan exceeded the bounded loader-context ledger",
+            );
+            return;
+        }
+        self.pending_loader_scans.insert(key, hook_ts_ns);
+    }
+
+    fn record_pending_loader_scan_loss(&mut self, reason: &str) {
+        self.discovery_truncated = self.discovery_truncated.saturating_add(1);
+        self.mark_live_loss("live loader memory discovery", reason);
+    }
+
+    fn settle_pending_loader_scan(&mut self, key: PendingLoaderScanKey, reason: &str) -> bool {
+        if self.pending_loader_scans.remove(&key).is_none() {
+            return false;
+        }
+        self.record_pending_loader_scan_loss(reason);
+        true
+    }
+
+    fn settle_pending_loader_scans_for_view(&mut self, view: ProcessViewId, reason: &str) {
+        let pending: Vec<_> = self
+            .pending_loader_scans
+            .keys()
+            .filter(|key| key.view == view)
+            .copied()
+            .collect();
+        for key in pending {
+            self.settle_pending_loader_scan(key, reason);
+        }
+    }
+
+    fn settle_all_pending_loader_scans(&mut self, reason: &str) {
+        let pending: Vec<_> = self.pending_loader_scans.keys().copied().collect();
+        for key in pending {
+            self.settle_pending_loader_scan(key, reason);
+        }
+    }
+
     fn scan_retained_view_with(
         scan: impl FnOnce(&mut DiscoveryCounters) -> Result<(Vec<ScannedModule>, PinnedObjects)>,
     ) -> (
@@ -6879,6 +6986,10 @@ impl Engine {
             Err(error) => {
                 self.capture_facts.rollback_stage();
                 self.restore_start_publication(snapshot);
+                self.settle_all_pending_loader_scans(
+                    "a deferred loader memory scan was unresolved when capture start was cancelled",
+                );
+                record_object_skips(&mut self.plan, &self.counters.object_skips);
                 Err(error)
             }
         }
@@ -7944,6 +8055,232 @@ impl Engine {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn process_validated_loader_scan(
+        &mut self,
+        position: usize,
+        context_id: LoaderContextId,
+        hook_ts_ns: u64,
+        terminal_owner: Option<LoaderContextId>,
+        terminal_exports: &[DynamicExportIdentity],
+        mode: LoaderScanMode,
+        session: &mut dyn EngineSession,
+        additions_allowed: &mut bool,
+        pending_views: &mut PendingViewRetirements,
+    ) -> Result<DiscoveryRecordOutcome> {
+        #[cfg(test)]
+        if mode == LoaderScanMode::Memory {
+            self.loader_memory_scan_attempts = self.loader_memory_scan_attempts.saturating_add(1);
+        }
+        let (scan_result, scan_counters) = match mode {
+            LoaderScanMode::Memory => Self::scan_retained_view(
+                &self.views[position],
+                &self.module_hints,
+                &self.hooks,
+                &mut self.budget,
+            ),
+            LoaderScanMode::MetadataOnly => Self::scan_retained_view_without_memory(
+                &self.views[position],
+                &self.module_hints,
+                &self.hooks,
+                &mut self.budget,
+            ),
+        };
+        let mut skipped = self.absorb_scan_counters(scan_counters);
+        let (mut found, fresh_pins) = match scan_result {
+            Ok(value) => value,
+            Err(error) => {
+                for skip in skipped {
+                    self.mark_partial(&skip.subject, &skip.reason);
+                }
+                return Err(error);
+            }
+        };
+        if mode == LoaderScanMode::MetadataOnly {
+            for module in &mut found {
+                let Some(current) = self.modules.iter().find(|current| {
+                    current.scanned.view == module.view
+                        && current.scanned.mount_namespace == module.mount_namespace
+                        && current.scanned.key == module.key
+                        && current.scanned.path == module.path
+                        && current.scanned.decoder_abi == module.decoder_abi
+                }) else {
+                    continue;
+                };
+                module.tables = current.scanned.tables.clone();
+                module.interfaces = current.scanned.interfaces.clone();
+            }
+        }
+        let export_modules = found.clone();
+        let loader = self
+            .loader_registry
+            .context(context_id)
+            .map(|context| context.spec.loader)
+            .ok_or_else(|| anyhow!("loader context disappeared after record validation"))?;
+        let mut candidate_pins = self.pinned.clone();
+        skipped.extend(candidate_pins.replace_view_pins(
+            self.views[position].id(),
+            fresh_pins,
+            &[loader],
+        ));
+        let mut raw_modules: Vec<_> = self
+            .modules
+            .iter()
+            .filter(|module| module.scanned.view != self.views[position].id())
+            .map(|module| module.scanned.clone())
+            .collect();
+        for module in found {
+            merge_scanned_module(&mut raw_modules, module);
+        }
+        let mut candidate = self.live_candidate(candidate_pins, raw_modules, skipped)?;
+        candidate.views.insert(self.views[position].id());
+        let observed = candidate_timing_keys(&candidate, &export_modules);
+        self.observe_causal_timing(&observed, hook_ts_ns);
+        let collected = self.collect_dynamic_export_work(
+            context_id,
+            &export_modules,
+            &candidate.pinned,
+            session,
+            terminal_owner.is_some(),
+            terminal_exports,
+        );
+        let mut required_seed_complete = collected.required_seed_complete;
+        for seed in &collected.count_only_seeds {
+            let mut owners = candidate
+                .plan
+                .modules
+                .iter()
+                .filter(|module| module.object == seed.object);
+            let Some(module) = owners.next() else {
+                required_seed_complete = false;
+                self.mark_partial(
+                    "live export hook",
+                    "a C_GetFunctionList seed had no unique candidate module owner",
+                );
+                continue;
+            };
+            if owners.next().is_some() {
+                required_seed_complete = false;
+                self.mark_partial(
+                    "live export hook",
+                    "a C_GetFunctionList seed had no unique candidate module owner",
+                );
+                continue;
+            }
+            match candidate.plan.add_provisional_get_function_list(
+                plan::ProvisionalGetFunctionList {
+                    module: module.id,
+                    object: seed.object,
+                    object_path: seed.object_path.clone(),
+                    file_offset: seed.file_offset,
+                },
+            ) {
+                Ok(Some(slot)) => candidate.delta.new.push(slot),
+                Ok(None) => {}
+                Err(_) => {
+                    required_seed_complete = false;
+                    self.mark_partial(
+                        "live export hook",
+                        "a C_GetFunctionList seed could not be added to the candidate plan",
+                    );
+                }
+            }
+        }
+        let outcome = self.apply_candidate(session, candidate, additions_allowed, false, &[])?;
+        self.record_apply_timing(&outcome);
+        self.queue_apply_outcome(&outcome, pending_views);
+        let changed = outcome.changed;
+        let mut required_complete = required_seed_complete && outcome.required_complete();
+        if terminal_owner.is_none() && outcome.accepted() {
+            let (retire, dynamic_complete) = self.attach_export_work(
+                self.views[position].id(),
+                &collected.dynamic,
+                session,
+                additions_allowed,
+            );
+            if !dynamic_complete {
+                required_complete = false;
+            }
+            if retire {
+                let view = self.views[position].id();
+                self.queue_stale_views(&[view].into_iter().collect(), pending_views);
+            }
+            for work in &collected.dynamic {
+                if let Some(binding) = work.selection_binding
+                    && self
+                        .selection_bindings
+                        .get(&binding.id)
+                        .is_some_and(|binding| binding.attached)
+                {
+                    self.open_owned_selection(binding.id);
+                }
+            }
+        } else {
+            lose_unperformed_dynamic_work(&mut self.timings, &collected.dynamic);
+        }
+        Ok(DiscoveryRecordOutcome::applied(changed, required_complete))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn service_pending_loader_scans(
+        &mut self,
+        due: BTreeSet<PendingLoaderScanKey>,
+        session: &mut dyn EngineSession,
+        additions_allowed: &mut bool,
+        pending_views: &mut PendingViewRetirements,
+    ) -> Result<DiscoveryRecordOutcome> {
+        let mut changed = false;
+        let mut required_complete = true;
+        for key in due {
+            let Some(hook_ts_ns) = self.pending_loader_scans.remove(&key) else {
+                continue;
+            };
+            if let Some(reason) = self.budget.stopped_now() {
+                self.record_pending_loader_scan_loss(&format!(
+                    "a deferred loader memory scan was unresolved at budget exhaustion: {reason}"
+                ));
+                required_complete = false;
+                continue;
+            }
+            let context_current = self
+                .loader_registry
+                .context(key.context)
+                .is_some_and(|context| context.spec.view == key.view)
+                && !self.loader_registry.is_tombstoned(key.context);
+            let position = self.views.iter().position(|view| view.id() == key.view);
+            let Some(position) = position.filter(|_| context_current) else {
+                self.record_pending_loader_scan_loss(
+                    "a deferred loader memory scan was unresolved at loader context retirement",
+                );
+                required_complete = false;
+                continue;
+            };
+            match self.process_validated_loader_scan(
+                position,
+                key.context,
+                hook_ts_ns,
+                None,
+                &[],
+                LoaderScanMode::Memory,
+                session,
+                additions_allowed,
+                pending_views,
+            ) {
+                Ok(outcome) => {
+                    changed |= outcome.changed();
+                    required_complete &= outcome.required_complete();
+                }
+                Err(error) => {
+                    self.record_pending_loader_scan_loss(
+                        "a deferred loader memory scan remained unresolved after its one bounded fallback attempt",
+                    );
+                    return Err(error);
+                }
+            }
+        }
+        Ok(DiscoveryRecordOutcome::applied(changed, required_complete))
+    }
+
     fn process_loader_record(
         &mut self,
         queued: QueuedDiscoveryRecord,
@@ -8079,125 +8416,61 @@ impl Engine {
             ));
         }
 
-        let (scan_result, scan_counters) = Self::scan_retained_view(
-            &self.views[position],
-            &self.module_hints,
-            &self.hooks,
-            &mut self.budget,
-        );
-        let mut skipped = self.absorb_scan_counters(scan_counters);
-        let (found, fresh_pins) = match scan_result {
-            Ok(value) => value,
-            Err(error) => {
-                for skip in skipped {
-                    self.mark_partial(&skip.subject, &skip.reason);
-                }
-                return Err(error);
-            }
+        let key = PendingLoaderScanKey {
+            view: view_id,
+            context: context_id,
         };
-        let export_modules = found.clone();
-        let mut candidate_pins = self.pinned.clone();
-        skipped.extend(candidate_pins.replace_view_pins(
-            self.views[position].id(),
-            fresh_pins,
-            &[loader],
-        ));
-        let mut raw_modules: Vec<_> = self
-            .modules
-            .iter()
-            .filter(|module| module.scanned.view != self.views[position].id())
-            .map(|module| module.scanned.clone())
-            .collect();
-        for module in found {
-            merge_scanned_module(&mut raw_modules, module);
-        }
-        let mut candidate = self.live_candidate(candidate_pins, raw_modules, skipped)?;
-        candidate.views.insert(self.views[position].id());
-        let observed = candidate_timing_keys(&candidate, &export_modules);
-        self.observe_causal_timing(&observed, record.hook_ts_ns);
-        let collected = self.collect_dynamic_export_work(
-            context_id,
-            &export_modules,
-            &candidate.pinned,
-            session,
-            terminal_owner.is_some(),
-            &terminal_exports,
-        );
-        let mut required_seed_complete = collected.required_seed_complete;
-        for seed in &collected.count_only_seeds {
-            let mut owners = candidate
-                .plan
-                .modules
-                .iter()
-                .filter(|module| module.object == seed.object);
-            let Some(module) = owners.next() else {
-                required_seed_complete = false;
-                self.mark_partial(
-                    "live export hook",
-                    "a C_GetFunctionList seed had no unique candidate module owner",
-                );
-                continue;
-            };
-            if owners.next().is_some() {
-                required_seed_complete = false;
-                self.mark_partial(
-                    "live export hook",
-                    "a C_GetFunctionList seed had no unique candidate module owner",
-                );
-                continue;
-            }
-            match candidate.plan.add_provisional_get_function_list(
-                plan::ProvisionalGetFunctionList {
-                    module: module.id,
-                    object: seed.object,
-                    object_path: seed.object_path.clone(),
-                    file_offset: seed.file_offset,
-                },
-            ) {
-                Ok(Some(slot)) => candidate.delta.new.push(slot),
-                Ok(None) => {}
-                Err(_) => {
-                    required_seed_complete = false;
-                    self.mark_partial(
-                        "live export hook",
-                        "a C_GetFunctionList seed could not be added to the candidate plan",
-                    );
-                }
-            }
-        }
-        let outcome = self.apply_candidate(session, candidate, additions_allowed, false, &[])?;
-        self.record_apply_timing(&outcome);
-        self.queue_apply_outcome(&outcome, pending_views);
-        let changed = outcome.changed;
-        let mut required_complete = required_seed_complete && outcome.required_complete();
-        if terminal_owner.is_none() && outcome.accepted() {
-            let (retire, dynamic_complete) = self.attach_export_work(
-                self.views[position].id(),
-                &collected.dynamic,
+        if matches!(record.announced_count, 1 | 2) {
+            self.defer_loader_memory_scan(key, record.hook_ts_ns);
+            let result = self.process_validated_loader_scan(
+                position,
+                context_id,
+                record.hook_ts_ns,
+                terminal_owner,
+                &terminal_exports,
+                LoaderScanMode::MetadataOnly,
                 session,
                 additions_allowed,
+                pending_views,
             );
-            if !dynamic_complete {
-                required_complete = false;
+            if result.is_err() {
+                self.settle_pending_loader_scan(
+                    key,
+                    "a deferred loader memory scan failed during export-hook preparation",
+                );
+            } else if let Some(reason) = self.budget.stopped_now() {
+                self.settle_pending_loader_scan(
+                    key,
+                    &format!(
+                        "a deferred loader memory scan was unresolved at budget exhaustion: {reason}"
+                    ),
+                );
             }
-            if retire {
-                let view = self.views[position].id();
-                self.queue_stale_views(&[view].into_iter().collect(), pending_views);
-            }
-            for work in &collected.dynamic {
-                if let Some(binding) = work.selection_binding
-                    && self
-                        .selection_bindings
-                        .get(&binding.id)
-                        .is_some_and(|binding| binding.attached)
-                {
-                    self.open_owned_selection(binding.id);
-                }
-            }
+            result
         } else {
-            lose_unperformed_dynamic_work(&mut self.timings, &collected.dynamic);
+            let resolving_pending = self.pending_loader_scans.remove(&key).is_some();
+            let result = self.process_validated_loader_scan(
+                position,
+                context_id,
+                record.hook_ts_ns,
+                terminal_owner,
+                &terminal_exports,
+                LoaderScanMode::Memory,
+                session,
+                additions_allowed,
+                pending_views,
+            );
+            if resolving_pending && result.is_err() {
+                self.record_pending_loader_scan_loss(
+                    "a zero-state opportunity did not complete its deferred loader memory scan",
+                );
+            } else if resolving_pending && let Some(reason) = self.budget.stopped_now() {
+                self.record_pending_loader_scan_loss(&format!(
+                    "a deferred loader memory scan was unresolved at budget exhaustion: {reason}"
+                ));
+            }
+            result
         }
-        Ok(DiscoveryRecordOutcome::applied(changed, required_complete))
     }
 
     fn record_selection_occurrences(
@@ -9962,6 +10235,10 @@ impl Engine {
     /// and the empty-scan rule; a journal still pending keeps the record, and
     /// the timing proof this loss already invalidated is not given back.
     pub(crate) fn settle_terminal_drain(&mut self) {
+        self.settle_all_pending_loader_scans(
+            "a deferred loader memory scan was unresolved at capture cancellation or shutdown",
+        );
+        record_object_skips(&mut self.plan, &self.counters.object_skips);
         let pending_views = self.pending_leader_exit_views.clone();
         finalize_pending_leader_exit_views(
             &mut self.pending_leader_exit_views,
@@ -10464,6 +10741,13 @@ impl Engine {
             if self.terminal_owner() == Some(context_id) {
                 return Ok((changed, false));
             }
+            self.settle_pending_loader_scan(
+                PendingLoaderScanKey {
+                    view,
+                    context: context_id,
+                },
+                "a deferred loader memory scan was unresolved at loader context retirement",
+            );
             // A context its own terminal dispatch already removed was removed
             // exactly once; only one still registered can fail to be removed.
             if self.loader_registry.context(context_id).is_some()
@@ -10535,6 +10819,15 @@ impl Engine {
             cause
         };
         let cause = previous.map_or(cause, |current| current.merge(cause));
+        let pending_reason = match cause {
+            RetirementCause::ExpectedRemoval => {
+                "a deferred loader memory scan was unresolved at expected process exit"
+            }
+            RetirementCause::ExecRefresh | RetirementCause::GenerationLost => {
+                "a deferred loader memory scan was unresolved at loader context retirement"
+            }
+        };
+        self.settle_pending_loader_scans_for_view(view, pending_reason);
         if cause != RetirementCause::ExpectedRemoval {
             self.ready_expected_removals.remove(&view);
         }
@@ -11903,6 +12196,7 @@ impl Engine {
                 return Err(error);
             }
         };
+        let fallback_due: BTreeSet<_> = self.pending_loader_scans.keys().copied().collect();
         let mut records = queued;
 
         let retained_pids: BTreeSet<_> = self.views.iter().map(ProcessView::pid).collect();
@@ -11948,6 +12242,26 @@ impl Engine {
             )?
         {
             changed |= terminal_changed;
+        }
+        let fallback = self.service_pending_loader_scans(
+            fallback_due,
+            session,
+            &mut additions_allowed,
+            &mut pending_views,
+        )?;
+        changed |= fallback.changed();
+        if !fallback.required_complete() {
+            closure.fail();
+        }
+        if !pending_views.is_empty() {
+            changed |= self.process_discovery_records(
+                session,
+                &mut Vec::new(),
+                &mut pending_views,
+                &mut additions_allowed,
+                collect,
+                &mut closure,
+            )?;
         }
         if self.pending_retirements.is_empty() && self.pending_rejected_keys.is_empty() {
             changed |= self.refresh_inventory(
@@ -20662,6 +20976,178 @@ int main(int argc, char **argv) {
         assert!(!additions_allowed);
         assert!(pending.contains_key(&view));
         assert!(!closure.required_complete());
+    }
+
+    #[test]
+    fn rt_add_deferral_state_table_keeps_zero_ambiguous_and_defers_add_delete() {
+        for (state, read_failures, expected_pending, expected_memory_scans) in
+            [(0, 0, 0, 1), (0, 1, 0, 1), (1, 0, 1, 0), (2, 0, 1, 0)]
+        {
+            let (_fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
+            record.announced_count = state;
+            session.counters.loader_state_read_failures = read_failures;
+
+            apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+
+            assert_eq!(
+                engine.pending_loader_scans.len(),
+                expected_pending,
+                "r_state={state}, read_failures={read_failures}"
+            );
+            assert_eq!(
+                engine.loader_memory_scan_attempts, expected_memory_scans,
+                "r_state={state}, read_failures={read_failures}"
+            );
+            if state == 0 {
+                let aggregate = engine.loader_discovery();
+                assert_eq!(aggregate.dlopen_timing.qualified_pre_constructor, 0);
+                assert_eq!(aggregate.dlopen_timing.known_pre_relocation, 0);
+                assert_eq!(aggregate.dlopen_timing.unproven, 1);
+                assert_eq!(aggregate.state_read_failures, read_failures);
+            }
+        }
+    }
+
+    /// Mutation caught: scanning before queuing `RT_ADD` races the loader, and
+    /// returning before the rest of the handler fails to arm standard exports.
+    #[test]
+    fn rt_add_deferral_authenticated_add_accounts_and_arms_without_memory_scan() {
+        let (_fixture, mut engine, context, mut record, mut session) = armed_seed_route(1);
+        record.announced_count = 1;
+
+        let outcome = apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+
+        assert!(outcome.required_complete);
+        assert_eq!(engine.loader_records_accepted, 1);
+        assert_eq!(engine.loader_memory_scan_attempts, 0);
+        assert_eq!(session.dynamic_attach_calls.len(), 3);
+        assert_eq!(
+            engine
+                .pending_loader_scans
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            [PendingLoaderScanKey {
+                view: ProcessViewId(0),
+                context,
+            }]
+        );
+        assert!(engine.pending_loader_scans.len() <= crate::discovery::loader::MAX_LOADER_CONTEXTS);
+    }
+
+    /// Mutation caught: replaying the original ADD consumes producer authority
+    /// twice; omitting the independent-tick fallback leaves work pending forever.
+    #[test]
+    fn rt_add_deferral_next_tick_falls_back_once_without_record_replay() {
+        let (_fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
+        record.announced_count = 1;
+        apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+        assert_eq!(engine.pending_loader_scans.len(), 1);
+        assert_eq!(engine.loader_memory_scan_attempts, 0);
+
+        apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+
+        assert!(engine.pending_loader_scans.is_empty());
+        assert_eq!(engine.loader_memory_scan_attempts, 1);
+        assert_eq!(engine.loader_records_accepted, 1);
+    }
+
+    /// Mutation caught: keying pending work by event occurrence instead of the
+    /// exact view/context lets duplicate ADDs grow the bounded ledger.
+    #[test]
+    fn rt_add_deferral_duplicate_adds_coalesce_and_settle_once() {
+        let (_fixture, mut engine, _context, mut record, mut session) = armed_seed_route(2);
+        record.announced_count = 1;
+
+        apply_ordinary_batch(&mut engine, &mut session, vec![record, record]).unwrap();
+
+        assert_eq!(engine.pending_loader_scans.len(), 1);
+        assert_eq!(engine.loader_memory_scan_attempts, 0);
+        assert_eq!(engine.loader_records_accepted, 2);
+        apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+        assert!(engine.pending_loader_scans.is_empty());
+        assert_eq!(engine.loader_memory_scan_attempts, 1);
+        assert_eq!(engine.loader_records_accepted, 2);
+    }
+
+    /// Mutation caught: an expected process exit cannot silently discard a
+    /// deferred memory acquisition that never ran.
+    #[test]
+    fn rt_add_deferral_expected_exit_settles_pending_as_loss() {
+        let (_fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
+        record.announced_count = 1;
+        apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+        let mut pending_views = PendingViewRetirements::new();
+
+        engine.queue_retirement(
+            ProcessViewId(0),
+            RetirementCause::ExpectedRemoval,
+            &mut pending_views,
+        );
+
+        assert!(engine.pending_loader_scans.is_empty());
+        assert!(engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live loader memory discovery"
+                && skip.reason.contains("expected process exit")
+        }));
+    }
+
+    /// Mutation caught: replacing a loader context cannot transfer its pending
+    /// scan authority to the replacement context.
+    #[test]
+    fn rt_add_deferral_context_retirement_settles_pending_as_loss() {
+        let (_fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
+        record.announced_count = 2;
+        apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+        let mut pending_views = PendingViewRetirements::new();
+
+        engine.queue_retirement(
+            ProcessViewId(0),
+            RetirementCause::ExecRefresh,
+            &mut pending_views,
+        );
+
+        assert!(engine.pending_loader_scans.is_empty());
+        assert!(engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live loader memory discovery"
+                && skip.reason.contains("loader context retirement")
+        }));
+    }
+
+    /// Mutation caught: a sticky work-ceiling stop must resolve the pending
+    /// ledger to loss instead of preserving an impossible fallback.
+    #[test]
+    fn rt_add_deferral_budget_exhaustion_settles_pending_as_loss() {
+        let (_fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
+        record.announced_count = 1;
+        apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+        assert!(!engine.budget.charge(u64::MAX));
+
+        apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+
+        assert!(engine.pending_loader_scans.is_empty());
+        assert_eq!(engine.loader_memory_scan_attempts, 0);
+        assert!(engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live loader memory discovery"
+                && skip.reason.contains("budget exhaustion")
+        }));
+    }
+
+    /// Mutation caught: cancellation/shutdown finalization must turn every
+    /// still-pending scan into published loss evidence.
+    #[test]
+    fn rt_add_deferral_cancellation_or_shutdown_settles_pending_as_loss() {
+        let (_fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
+        record.announced_count = 1;
+        apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+
+        engine.settle_terminal_drain();
+
+        assert!(engine.pending_loader_scans.is_empty());
+        assert!(engine.plan.skipped.iter().any(|skip| {
+            skip.subject == "live loader memory discovery"
+                && skip.reason.contains("capture cancellation or shutdown")
+        }));
     }
 
     #[test]

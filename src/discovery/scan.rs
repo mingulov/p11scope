@@ -1592,11 +1592,32 @@ pub fn scan_process_view(
     scan_process_view_with_io(request, view, budget, &mut ProcScanIo)
 }
 
+/// Enumerates and pins the current module/export surface while deliberately
+/// postponing target-memory table reads. The maps-A/maps-B and final-generation
+/// bracket remains authoritative for the inventory returned here.
+pub(crate) fn scan_process_view_without_memory(
+    request: &ScanRequest<'_>,
+    view: &ProcessView,
+    budget: &mut CaptureWorkBudget,
+) -> Result<ScanOutcome, String> {
+    scan_process_view_with_io_mode(request, view, budget, &mut ProcScanIo, false)
+}
+
 fn scan_process_view_with_io(
     request: &ScanRequest<'_>,
     view: &ProcessView,
     budget: &mut CaptureWorkBudget,
     io: &mut impl ScanIo,
+) -> Result<ScanOutcome, String> {
+    scan_process_view_with_io_mode(request, view, budget, io, true)
+}
+
+fn scan_process_view_with_io_mode(
+    request: &ScanRequest<'_>,
+    view: &ProcessView,
+    budget: &mut CaptureWorkBudget,
+    io: &mut impl ScanIo,
+    scan_memory: bool,
 ) -> Result<ScanOutcome, String> {
     if request.pid != view.pid() {
         return Err("scan request pid does not match its process view".into());
@@ -1638,25 +1659,29 @@ fn scan_process_view_with_io(
     // `/proc/<pid>/mem` is gated by PTRACE_MODE_ATTACH and Yama; losing it costs the
     // tables, never the object inventory (spec §4.1 step 3). Only an access refusal is
     // a ptrace refusal — a pid that died mid-scan gets its own label.
-    let mem = match view.run_while_same(|| io.open_mem(view)) {
-        Ok(mem) => mem,
-        Err(reason) => {
-            return Ok(refused_initial(format!(
-                "{SCAN_GENERATION_CHANGED_REASON}: {reason}"
-            )));
-        }
+    let (mem, unavailable) = if scan_memory {
+        let mem = match view.run_while_same(|| io.open_mem(view)) {
+            Ok(mem) => mem,
+            Err(reason) => {
+                return Ok(refused_initial(format!(
+                    "{SCAN_GENERATION_CHANGED_REASON}: {reason}"
+                )));
+            }
+        };
+        let unavailable = mem.as_ref().err().map(|error| {
+            let (class, publishes) = mem_unavailable(error);
+            if publishes {
+                skipped.push(Skipped {
+                    subject: format!("/proc/{pid}/mem"),
+                    reason: error.to_string(),
+                });
+            }
+            class
+        });
+        (mem.ok(), unavailable)
+    } else {
+        (None, None)
     };
-    let unavailable = mem.as_ref().err().map(|error| {
-        let (class, publishes) = mem_unavailable(error);
-        if publishes {
-            skipped.push(Skipped {
-                subject: format!("/proc/{pid}/mem"),
-                reason: error.to_string(),
-            });
-        }
-        class
-    });
-    let mem = mem.ok();
 
     let wanted = request.hooks.names();
     let hint_ids: Vec<Option<(u64, u64)>> =

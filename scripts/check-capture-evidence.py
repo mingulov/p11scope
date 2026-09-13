@@ -1579,13 +1579,28 @@ def validate_canary(lane, document, target_bits=64):
         table_signature(evidence) == wanted_tables,
         f"unexpected discovery tables: {evidence['discovery']}",
     )
+    # An owned lane publishes exactly one discovery skip, and the spec requires
+    # it. `p11scope run` attempts initial-set discovery, and the D3 scope
+    # amendment leaves the compiled-in timing catalog exactly empty, so that
+    # attempt can never be proven and is honestly reported as unproven rather
+    # than claimed. Demanding zero skips here demanded the one state the spec
+    # forbids the product to leave. The count stays exact and the shape is
+    # pinned: a second skip, or any other subject or reason, still fails.
     exact_common(
         evidence,
         aliases=[],
         skipped=[],
         in_flight=0,
+        discovery_skipped=1 if owned_metrics else 0,
         run=owned_metrics,
     )
+    if owned_metrics:
+        require(
+            discovery_skips(evidence) == [
+                {"name": DISCOVERY_SUBJECT, "reason": DISCOVERY_UNAVAILABLE}
+            ],
+            f"unexpected owned discovery skip: {discovery_skips(evidence)}",
+        )
     allowances = dict(
         SAFE_ALLOWANCES if policy == "safe" else UNSAFE_ALLOWANCES if policy == "unsafe" else {}
     )
@@ -2808,6 +2823,11 @@ def self_test():
     owned_aggregate = copy.deepcopy(aggregate)
     owned_aggregate["functions"] = function_items([(["C_GetInterfaceList"], 30)])
     owned_aggregate["evidence"]["child_still_running"] = False
+    # The one skip an owned lane must publish: `p11scope run` attempts
+    # initial-set discovery and the empty timing catalog leaves it unproven.
+    owned_aggregate["evidence"]["skipped"] = [
+        {"name": DISCOVERY_SUBJECT, "reason": DISCOVERY_UNAVAILABLE}
+    ]
     for lane in ("owned-default-metrics", "owned-feature-metrics"):
         validate_canary(lane, owned_aggregate)
         for calls in (28, 29, 31):
@@ -2819,6 +2839,15 @@ def self_test():
             lambda d: d["evidence"].update(child_still_running=True),
             lambda d: d["evidence"].update(
                 pause="sigstop", pause_attempts=1, pause_confirmed=1),
+            # The owned skip is exact, not merely permitted: an owned lane that
+            # published none is not a cleaner run, it is a run whose
+            # initial-set attempt went unreported.
+            lambda d: d["evidence"].update(skipped=[]),
+            lambda d: d["evidence"].update(skipped=[
+                {"name": DISCOVERY_SUBJECT, "reason": TABLE_UNAVAILABLE}]),
+            lambda d: d["evidence"].update(skipped=[
+                {"name": DISCOVERY_SUBJECT, "reason": DISCOVERY_UNAVAILABLE},
+                {"name": DISCOVERY_SUBJECT, "reason": DISCOVERY_UNAVAILABLE}]),
         ):
             bad = copy.deepcopy(owned_aggregate)
             mutate(bad)

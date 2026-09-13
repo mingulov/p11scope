@@ -86,6 +86,14 @@ def owned_metrics_document(bits, calls=30):
         interface_list="ok",
         child_still_running=False,
     )
+    # The one skip an owned lane must publish. `p11scope run` attempts
+    # initial-set discovery and the D3 amendment leaves the timing catalog
+    # exactly empty, so the attempt is reported unproven rather than claimed.
+    # Spelled out rather than taken from `discovery_skipped`, because the
+    # fixture's generic skip carries the table-unavailable reason instead.
+    evidence["skipped"] = [
+        {"name": subject.DISCOVERY_SUBJECT, "reason": subject.DISCOVERY_UNAVAILABLE}
+    ]
     if bits == 64:
         evidence["discovery_conflicts"] = 1
         evidence["discovery"][0]["corroboration"] = ["conflict"]
@@ -1861,7 +1869,8 @@ class StoppedPopulationTests(unittest.TestCase):
         }
         return manifest, receipt, records, controls
 
-    def publish_fixture(self, root, manifest, receipt, records, controls, refusals=()):
+    def publish_fixture(self, root, manifest, receipt, records, controls, refusals=(),
+                        drained=0):
         # Exercise the real framed parser, including valid EOF on empty maps.
         stream = b"".join(TaskStorageReaderTests.frame(
             1, row["map_id"], row["pid"], row["tid"], row["value"]
@@ -1893,6 +1902,11 @@ class StoppedPopulationTests(unittest.TestCase):
             surface = {"id": item["id"], "phase": "stopped",
                        "acquisition_id": "a" * 32, "size": len(content),
                        "sha256": hashlib.sha256(content).hexdigest()}
+            if item["type"] == "ringbuf":
+                subject = load_subject(TARGET_BITS)
+                records_kept = len(content) // subject.RING_RECORD_SIZES[name]
+                surface["positions"] = [
+                    drained, drained + subject.RING_RECORD_STRIDES[name] * records_kept]
             if item["type"] == "task_storage":
                 surface["records"] = [{k: row[k] for k in ("pid", "tid", "generation")}
                                       for row in records if row["map_id"] == item["id"]]
@@ -1907,6 +1921,7 @@ class StoppedPopulationTests(unittest.TestCase):
             "population", manifest, {item["name"] for item in manifest}, str(root / "case"))
 
     def test_exact_external_owned_and_permitted_empty_populations(self):
+        stride = load_subject(TARGET_BITS).RING_RECORD_STRIDES["DISCOVERY"]
         for owned, empty, small in ((False, False, False), (True, False, False),
                                     (False, True, False), (True, False, True)):
             with self.subTest(owned=owned, empty=empty, small=small), tempfile.TemporaryDirectory() as directory:
@@ -1917,7 +1932,9 @@ class StoppedPopulationTests(unittest.TestCase):
                     args[3]["OWNER_CTL"][0] = 65
                     next(m for m in args[0] if m["name"] == "START")["max_entries"] = 1
                 args[1]["after"].reverse()  # roster order is not task identity
-                self.publish_fixture(root, *args)
+                # An owned acquisition files a DISCOVERY ring its own observer
+                # already drained: every record consumed, nothing retained.
+                self.publish_fixture(root, *args, drained=5 * stride if owned else 0)
                 self.assertEqual(len(self.check(root, args[0])), 10)
 
     def test_framed_records_bind_generations_for_future_coordinator(self):
@@ -2189,11 +2206,14 @@ class StoppedPopulationTests(unittest.TestCase):
         for case in ("phase", "acquisition", "hash", "size", "missing-surface", "duplicate-surface",
                      "partial-claim", "unknown-contract", "no-receipt", "record-generation",
                      "duplicate-record", "missing-controls", "malformed-control", "oversized",
-                     "boolean-control-byte", "duplicate-json-field"):
+                     "boolean-control-byte", "duplicate-json-field", "missing-ring-positions",
+                     "malformed-ring-positions", "ring-positions-contradict-bytes"):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 manifest, receipt, records, controls = self.fixture(root)
                 self.publish_fixture(root, manifest, receipt, records, controls)
+                ring = next(surface for surface, item in zip(receipt["surfaces"], manifest)
+                            if item["type"] == "ringbuf")
                 if case in ("phase", "acquisition", "hash", "size", "oversized"):
                     key, value = {"phase": ("phase", "resumed"),
                                   "acquisition": ("acquisition_id", "b" * 32),
@@ -2217,6 +2237,14 @@ class StoppedPopulationTests(unittest.TestCase):
                 elif case == "missing-controls":
                     manifest[:] = [m for m in manifest if m["name"] != "OWNER_CTL"]
                     receipt["surfaces"][:] = [s for s in receipt["surfaces"] if s["id"] != 105]
+                elif case == "missing-ring-positions":
+                    ring.pop("positions")
+                elif case == "malformed-ring-positions":
+                    ring["positions"] = [0, "PRIVATE_RAW_VALUE"]
+                elif case == "ring-positions-contradict-bytes":
+                    # Bytes and counters that cannot both be true: the surface is
+                    # empty, so the tail between the counters must be empty too.
+                    ring["positions"] = [0, load_subject(TARGET_BITS).RING_RECORD_STRIDES["EVENTS"]]
                 elif case != "duplicate-json-field":
                     path = Path(manifest[3]["file"])
                     content = b'[{"key":[0,0,0,0],"value":"PRIVATE_RAW_VALUE"}]'
@@ -2448,7 +2476,9 @@ class StartRingSurfaceIntegrationTests(unittest.TestCase):
                 manifest = self.inventory(subject, root, lane, inventory_name)
 
                 def records(_manifest, name):
-                    return [] if name == "EVENTS" else [discovery]
+                    rows = [] if name == "EVENTS" else [discovery]
+                    stride = subject.RING_RECORD_STRIDES[name]
+                    return rows, (0, stride * len(rows))
 
                 with mock.patch.object(subject, "ring_records", side_effect=records):
                     subject.assert_raw_records(manifest, lane, 0x555, root / lane)
@@ -2485,7 +2515,8 @@ class StartRingSurfaceIntegrationTests(unittest.TestCase):
             manifest = self.inventory(subject, root, "default-safe-start", "SAFE_MAPS")
 
             def records(_manifest, name):
-                return [event_bytes(0)] if name == "EVENTS" else []
+                rows = [event_bytes(0)] if name == "EVENTS" else []
+                return rows, (0, subject.RING_RECORD_STRIDES[name] * len(rows))
 
             with mock.patch.object(subject, "ring_records", side_effect=records):
                 with self.assertRaisesRegex(AssertionError, "blocked START snapshot"):
@@ -2701,10 +2732,12 @@ class RingLayoutTests(unittest.TestCase):
             "EVENTS": [event_bytes(index) for index in range(28)],
             "DISCOVERY": [bytes(subject.DISCOVERY_RECORD_SIZE)],
         }
+        positions = {name: (0, subject.RING_RECORD_STRIDES[name] * len(rows))
+                     for name, rows in retained.items()}
         with mock.patch.object(subject.ctypes, "CDLL",
                                side_effect=AssertionError("live BPF open forbidden")):
             subject.assert_retained_ring_records(
-                retained, "default-safe-profile", 0x555)
+                retained, "default-safe-profile", 0x555, positions)
 
 
 class OwnedMetricsOracleTests(unittest.TestCase):
@@ -2727,6 +2760,19 @@ class OwnedMetricsOracleTests(unittest.TestCase):
                     lambda d: d["evidence"].update(child_still_running=True),
                     lambda d: d["evidence"].update(
                         pause="sigstop", pause_attempts=1, pause_confirmed=1),
+                    # The owned skip is exact in both directions: a lane that
+                    # published none left its initial-set attempt unreported,
+                    # and a second or differently-reasoned skip is a loss
+                    # nothing licensed.
+                    lambda d: d["evidence"].update(skipped=[]),
+                    lambda d: d["evidence"].update(skipped=[{
+                        "name": capture.DISCOVERY_SUBJECT,
+                        "reason": capture.TABLE_UNAVAILABLE}]),
+                    lambda d: d["evidence"].update(skipped=[
+                        {"name": capture.DISCOVERY_SUBJECT,
+                         "reason": capture.DISCOVERY_UNAVAILABLE},
+                        {"name": capture.DISCOVERY_SUBJECT,
+                         "reason": capture.DISCOVERY_UNAVAILABLE}]),
                 ):
                     bad = copy.deepcopy(owned)
                     mutate(bad)
@@ -2735,6 +2781,10 @@ class OwnedMetricsOracleTests(unittest.TestCase):
 
         external = copy.deepcopy(owned)
         external["evidence"].pop("child_still_running")
+        # The initial-set skip belongs to the owned lane alone: an external
+        # `--pid` attach never attempts initial-set discovery, so it has
+        # nothing to leave unproven.
+        external["evidence"]["skipped"] = []
         external["functions"][0]["calls"] = 28
         capture.validate_canary("aggregate-only-metrics", external, TARGET_BITS)
         canary.assert_aggregate_metrics(external)
@@ -2750,20 +2800,54 @@ class OwnedMetricsOracleTests(unittest.TestCase):
             capture.validate_canary(
                 "aggregate-only-metrics", external_owned_evidence, TARGET_BITS)
 
-    def test_owned_metrics_retain_zero_events_and_real_discovery_separately(self):
+    def test_owned_metrics_judge_ring_positions_not_the_drained_residue(self):
+        """The residue is empty on a healthy owned run, so it cannot be the oracle.
+
+        `p11scope run` drains its own DISCOVERY ring on every capture tick,
+        before the readiness frame the canary waits for, so an owned lane
+        retains nothing whether or not it ever published a record. All three
+        vectors below therefore retain exactly nothing, and only the producer
+        positions separate the measured good run from the two bad ones.
+        """
         subject = load_subject(TARGET_BITS)
-        discovery = bytes(subject.DISCOVERY_RECORD_SIZE)
+        stride = subject.RING_RECORD_STRIDES["DISCOVERY"]
+        drained = 5 * stride
+        leaked = 28 * subject.RING_RECORD_STRIDES["EVENTS"]
+        empty = {"EVENTS": [], "DISCOVERY": []}
         for lane in ("owned-default-metrics", "owned-feature-metrics"):
             with self.subTest(lane=lane):
                 subject.assert_retained_ring_records(
-                    {"EVENTS": [], "DISCOVERY": [discovery]}, lane, 0x555)
+                    empty, lane, 0x555,
+                    {"EVENTS": (0, 0), "DISCOVERY": (drained, drained)})
+                for label, expected, positions in (
+                    ("nothing produced", "DISCOVERY produced 0 bytes",
+                     {"EVENTS": (0, 0), "DISCOVERY": (0, 0)}),
+                    ("leaked call events", f"EVENTS produced {leaked} bytes",
+                     {"EVENTS": (leaked, leaked), "DISCOVERY": (drained, drained)}),
+                ):
+                    with self.subTest(vector=label):
+                        with self.assertRaises(AssertionError) as caught:
+                            subject.assert_retained_ring_records(
+                                empty, lane, 0x555, positions)
+                        self.assertIn(expected, str(caught.exception))
+                        self.assertIn(lane, str(caught.exception))
+                # A retained record is still welcome -- the canary can win the
+                # race -- but only while the positions account for it.
+                subject.assert_retained_ring_records(
+                    {"EVENTS": [], "DISCOVERY": [bytes(subject.DISCOVERY_RECORD_SIZE)]},
+                    lane, 0x555,
+                    {"EVENTS": (0, 0), "DISCOVERY": (drained, drained + stride)})
+                with self.assertRaisesRegex(AssertionError, "DISCOVERY retains 1 records"):
+                    subject.assert_retained_ring_records(
+                        {"EVENTS": [], "DISCOVERY": [bytes(subject.DISCOVERY_RECORD_SIZE)]},
+                        lane, 0x555,
+                        {"EVENTS": (0, 0), "DISCOVERY": (drained, drained)})
+                # A call event the lane did retain is still an aggregate leak.
                 with self.assertRaises(AssertionError):
                     subject.assert_retained_ring_records(
-                        {"EVENTS": [event_bytes(0)], "DISCOVERY": [discovery]},
-                        lane, 0x555)
-                with self.assertRaises(AssertionError):
-                    subject.assert_retained_ring_records(
-                        {"EVENTS": [], "DISCOVERY": []}, lane, 0x555)
+                        {"EVENTS": [event_bytes(0)], "DISCOVERY": []}, lane, 0x555,
+                        {"EVENTS": (0, subject.RING_RECORD_STRIDES["EVENTS"]),
+                         "DISCOVERY": (drained, drained)})
 
     def test_owned_final_surface_set_includes_combined_log_maps_manifest_and_receipt(self):
         subject = load_subject(TARGET_BITS)

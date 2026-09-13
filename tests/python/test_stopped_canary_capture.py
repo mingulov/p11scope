@@ -70,17 +70,30 @@ def synthetic_done(config, group, deadline, check):
                                       'pid': config.workload_pid, 'generation': config.generation}))
 
 
+# Five DISCOVERY records published and all five drained: the shape a real
+# owned metrics lane was measured at, and the one its oracle must accept.
+OWNED_DISCOVERY_PRODUCED = 5 * capture.evidence.RING_RECORD_STRIDES['DISCOVERY']
+
+
 class FakeRing:
-    def __init__(self, rows):
+    """Byte positions that track the rows, the way a real ring's counters do.
+
+    `consumed` is what the ring's owner already drained. Keeping the producer
+    position derived rather than fixed is what lets a test move `rows` and still
+    describe a ring the kernel could have produced.
+    """
+
+    def __init__(self, rows, consumed=0, stride=0):
         self.rows, self.closed = rows, False
+        self.consumed, self.stride = consumed, stride
         self.fd = os.open('/dev/null', os.O_RDONLY)
 
     def positions(self):
         assert not self.closed
-        return (0, 0)
+        return (self.consumed, self.consumed + self.stride * len(self.rows))
 
     def read_records(self, positions):
-        assert not self.closed and positions == (0, 0)
+        assert not self.closed and positions == self.positions()
         return self.rows
 
     def close(self):
@@ -197,9 +210,13 @@ class FakeMaps(capture.LiveMaps):
 
     def open_rings(self, maps, deadline):
         for name in ('DISCOVERY', 'EVENTS'):
-            rows = []
+            rows, consumed = [], 0
             if name == 'DISCOVERY' and self.config.lane in capture.OWNED_LANES:
-                rows = [bytes(capture.evidence.RING_RECORD_SIZES[name])]
+                # `p11scope run` drains its own DISCOVERY ring on every capture
+                # tick, before the readiness frame the canary waits for, so a
+                # healthy owned lane retains nothing: the five records it
+                # published survive only in the producer position.
+                consumed = OWNED_DISCOVERY_PRODUCED
             if name == 'EVENTS' and self.config.workload_mode == 'matrix' and self.config.mode != 'metrics':
                 for index in range(28):
                     kwargs = {}
@@ -218,7 +235,7 @@ class FakeMaps(capture.LiveMaps):
                     raw = bytearray(fixtures.event_bytes(index, **kwargs))
                     struct.pack_into('<Q', raw, 16, (self.config.workload_pid << 32) | self.config.workload_pid)
                     rows.append(bytes(raw))
-            reader = FakeRing(rows)
+            reader = FakeRing(rows, consumed, capture.evidence.RING_RECORD_STRIDES[name])
             self.rings[name] = reader
             self.opened_rings.append(reader)
 
@@ -877,6 +894,13 @@ def owned_case(pid, directory, case, program, provider):
             assert 'canary_workload matrix: all calls CKR_OK' in config.observer_log.read_text()
             receipt = json.loads((Path(directory) / f'mapdump_snapshot_{config.lane}.json').read_text())
             assert receipt['lane'] == 'owned-root' and receipt['expected'][0]['root'] is True
+            # The retained DISCOVERY bytes are empty here, as they are on a real
+            # owned run; the receipt still has to carry what the ring produced.
+            names = {item['id']: item['name'] for item in source.maps}
+            produced = {names[row['id']]: row['positions']
+                        for row in receipt['surfaces'] if 'positions' in row}
+            assert produced == {'EVENTS': [0, 0],
+                                'DISCOVERY': [OWNED_DISCOVERY_PRODUCED, OWNED_DISCOVERY_PRODUCED]}, produced
             assert receipt['expected'][0]['cookie'] is False and receipt['expected'][0]['owner'] is False
             for group in owner.groups:
                 if group.role in ('observer', 'workload'):

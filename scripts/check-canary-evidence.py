@@ -135,6 +135,13 @@ DISCOVERY_RECORD_SIZE = 920
 # Keyed by name only because a record layout is per-map; which maps are
 # ringbufs is decided by `type`, from the one checked-in BPF inventory.
 RING_RECORD_SIZES = {"EVENTS": EVENT_SIZE, "DISCOVERY": DISCOVERY_RECORD_SIZE}
+# What one record costs a ring's byte positions: the 8-byte record header
+# plus the payload rounded up to 8, exactly as `parse_ring_records` walks it.
+# `producer_pos` and `consumer_pos` are byte counters, so every claim about
+# how many records a ring carried is a claim about a multiple of this stride.
+RING_RECORD_STRIDES = {
+    name: (8 + size + 7) & ~7 for name, size in RING_RECORD_SIZES.items()
+}
 START_SNAPSHOT_LANES = {
     "default-safe-start", "feature-safe-start", "feature-unsafe-fault",
 }
@@ -810,6 +817,11 @@ class RetainedRingReader:
 
 
 def ring_records(manifest, name="EVENTS"):
+    """Retained records and the `(consumer_pos, producer_pos)` they were read at.
+
+    Both, never just the records: a ring the observer drains itself retains
+    nothing on a healthy run, and only the positions still say what it carried.
+    """
     item = dict(manifest_map(manifest, name))
     item.setdefault("name", name)
     with RetainedRingReader(item) as reader:
@@ -817,7 +829,7 @@ def ring_records(manifest, name="EVENTS"):
         records = reader.read_records(before)
         after = reader.positions()
         assert after == before, f"ring moved during snapshot: {before} -> {after}"
-        return records
+        return records, before
 
 
 def assert_event_records(raw_records, lane, workload_pid):
@@ -871,19 +883,73 @@ def assert_start_event_records(raw_records, lane):
     )
 
 
-def assert_retained_ring_records(retained, lane, workload_pid):
+def ring_position_fault(name, positions, record_count):
+    """Why a ring's retained positions cannot describe its retained bytes.
+
+    `None` when they can. The retained records are exactly the unconsumed tail
+    between the two kernel byte counters, so their count is fixed by the
+    positions and the record stride; anything else means the bytes on disk were
+    not read at the positions filed beside them.
+    """
+    if (not isinstance(positions, (list, tuple)) or len(positions) != 2
+            or any(type(position) is not int or position < 0 for position in positions)):
+        return f"{name} positions are not a (consumer, producer) byte pair"
+    consumer, producer = positions
+    if producer < consumer:
+        return f"{name} producer {producer} precedes consumer {consumer}"
+    stride = RING_RECORD_STRIDES[name]
+    if producer - consumer != stride * record_count:
+        return (f"{name} retains {record_count} records but positions "
+                f"{consumer}..{producer} span {producer - consumer} bytes")
+    return None
+
+
+def owned_metrics_position_fault(positions):
+    """Why an owned metrics lane's ring positions refute the run it claims.
+
+    `None` when they corroborate it. This is the whole ring-shaped claim these
+    lanes can make, because the retained residue cannot carry it: `p11scope
+    run` owns the DISCOVERY ring and drains it on every capture tick
+    (`drain_discovery_tick`, unconditional on the `--pause never` path these
+    lanes use) before it prints the readiness frame the canary waits for, so
+    an empty DISCOVERY residue is the expected result of a *healthy* owned run
+    and a non-empty one only means the canary won a race. `producer_pos` is
+    the kernel's monotonic count of bytes ever published, which the observer's
+    own drain cannot walk back, so it still names the records that existed.
+    """
+    events = positions["EVENTS"][1]
+    if events:
+        return (f"EVENTS produced {events} bytes; aggregate policy must never "
+                "emit a call record")
+    stride = RING_RECORD_STRIDES["DISCOVERY"]
+    produced = positions["DISCOVERY"][1]
+    if produced < stride or produced % stride:
+        return (f"DISCOVERY produced {produced} bytes, not a positive multiple "
+                f"of the {stride}-byte record stride")
+    return None
+
+
+def assert_retained_ring_records(retained, lane, workload_pid, positions):
     """Validate already-retained ring bytes without opening or mapping BPF maps."""
     assert isinstance(retained, dict) and set(retained) == set(RING_RECORD_SIZES), retained
+    assert isinstance(positions, dict) and set(positions) == set(RING_RECORD_SIZES), positions
     for name, expected_size in RING_RECORD_SIZES.items():
         records = retained[name]
         assert isinstance(records, list), (name, type(records).__name__)
         assert all(type(record) is bytes and len(record) == expected_size for record in records), name
+        fault = ring_position_fault(name, positions[name], len(records))
+        assert fault is None, f"{lane}: {fault}"
     if lane in START_SNAPSHOT_LANES:
         assert_start_event_records(retained["EVENTS"], lane)
     else:
         assert_event_records(retained["EVENTS"], lane, workload_pid)
     if lane in OWNED_METRICS_LANES:
-        assert retained["DISCOVERY"], f"{lane}: retained DISCOVERY is empty"
+        # Never `assert retained["DISCOVERY"]` here: see the drain described in
+        # `owned_metrics_position_fault`. That residue is a race outcome, so it
+        # was nondeterministic in the passing direction too; the positions are
+        # what the drain cannot erase.
+        fault = owned_metrics_position_fault(positions)
+        assert fault is None, f"{lane}: {fault}"
 
 
 def assert_raw_records(manifest, lane, workload_pid, prefix):
@@ -893,14 +959,14 @@ def assert_raw_records(manifest, lane, workload_pid, prefix):
     kept for the matrix scan, which is what makes a ringbuf a scanned privacy
     surface rather than a map the dump loop silently walked past.
     """
-    retained = {}
+    retained, positions = {}, {}
     for item in read_json(manifest):
         if item["type"] != "ringbuf":
             continue
-        records = ring_records(manifest, item["name"])
+        records, positions[item["name"]] = ring_records(manifest, item["name"])
         retained[item["name"]] = records
         ring_raw_path(prefix, item["name"]).write_bytes(b"".join(records))
-    assert_retained_ring_records(retained, lane, workload_pid)
+    assert_retained_ring_records(retained, lane, workload_pid, positions)
 
 
 def assert_stopped_snapshot(manifest, prefix):
@@ -996,8 +1062,11 @@ def assert_stopped_snapshot(manifest, prefix):
             context = f"stopped map id={item['id']} name={name}"
             surface = surfaces[item["id"]]
             task_storage = metadata["type"] == "task_storage"
+            ring = metadata["type"] == "ringbuf"
+            require(not ring or name in RING_RECORD_SIZES, "unknown ring surface")
             fields = {"id", "acquisition_id", "phase", "size", "sha256"}
-            require(set(surface) == fields | ({"records"} if task_storage else set()),
+            require(set(surface) == fields | ({"records"} if task_storage else set())
+                    | ({"positions"} if ring else set()),
                     "malformed surface metadata")
             require(surface["acquisition_id"] == acquisition and surface["phase"] == "stopped",
                     "surface acquisition or phase mismatch")
@@ -1022,6 +1091,17 @@ def assert_stopped_snapshot(manifest, prefix):
                 require(item["type"] == "ringbuf" and item["oracle"] == "mmap"
                         and item["key_size"] == item["value_size"] == 0 and "file" not in item,
                         "invalid ring surface metadata")
+                # A drained ring retains nothing, so its bytes alone cannot say
+                # whether it ever carried a record. The positions can, and they
+                # are only evidence while they still account for those bytes.
+                record_size = RING_RECORD_SIZES[name]
+                require(len(raw) % record_size == 0, "ring surface is not whole records")
+                positions = surface["positions"]
+                require(isinstance(positions, list) and len(positions) == 2
+                        and all(uint(position) for position in positions),
+                        "malformed ring positions")
+                require(ring_position_fault(name, positions, len(raw) // record_size) is None,
+                        "ring positions contradict the retained ring bytes")
             if task_storage:
                 maps.append(metadata)
                 identities = surface["records"]
@@ -1711,13 +1791,43 @@ def main(argv=None):
         assert_event_records(safe_events, "default-safe-profile", 0x555)
         assert_event_records([], "aggregate-only-metrics", 0x555)
         discovery_record = bytes(DISCOVERY_RECORD_SIZE)
+        # An owned metrics lane is judged on what its rings produced, because
+        # the observer drains DISCOVERY itself and the residue is a race. These
+        # are the measured vectors: a healthy owned run publishes five DISCOVERY
+        # records and consumes all five, and never publishes a call event; a
+        # broken one either published no discovery record at all or leaked the
+        # 28 aggregate-suppressed calls into EVENTS. The residue is empty in all
+        # three, which is exactly why it cannot be the oracle.
+        discovery_stride = RING_RECORD_STRIDES["DISCOVERY"]
+        event_stride = RING_RECORD_STRIDES["EVENTS"]
+        drained = 5 * discovery_stride
+        leaked = 28 * event_stride
         for lane in OWNED_METRICS_LANES:
             assert_retained_ring_records(
-                {"EVENTS": [], "DISCOVERY": [discovery_record]}, lane, 0x555)
-            reject(f"{lane} ordinary event", lambda lane=lane: assert_retained_ring_records(
-                {"EVENTS": [safe_events[0]], "DISCOVERY": [discovery_record]}, lane, 0x555))
-            reject(f"{lane} empty discovery", lambda lane=lane: assert_retained_ring_records(
-                {"EVENTS": [], "DISCOVERY": []}, lane, 0x555))
+                {"EVENTS": [], "DISCOVERY": []}, lane, 0x555,
+                {"EVENTS": (0, 0), "DISCOVERY": (drained, drained)})
+            # A record the canary happened to win the race for is still fine.
+            assert_retained_ring_records(
+                {"EVENTS": [], "DISCOVERY": [discovery_record]}, lane, 0x555,
+                {"EVENTS": (0, 0), "DISCOVERY": (drained, drained + discovery_stride)})
+            for label, retained, positions in (
+                ("no discovery produced", {"EVENTS": [], "DISCOVERY": []},
+                 {"EVENTS": (0, 0), "DISCOVERY": (0, 0)}),
+                ("leaked call events", {"EVENTS": [], "DISCOVERY": []},
+                 {"EVENTS": (leaked, leaked), "DISCOVERY": (drained, drained)}),
+                ("partial discovery record", {"EVENTS": [], "DISCOVERY": []},
+                 {"EVENTS": (0, 0), "DISCOVERY": (0, discovery_stride - 8)}),
+                ("positions contradict residue",
+                 {"EVENTS": [], "DISCOVERY": [discovery_record]},
+                 {"EVENTS": (0, 0), "DISCOVERY": (drained, drained)}),
+                ("consumer past producer", {"EVENTS": [], "DISCOVERY": []},
+                 {"EVENTS": (0, 0), "DISCOVERY": (drained, 0)}),
+                ("ordinary event", {"EVENTS": [safe_events[0]], "DISCOVERY": []},
+                 {"EVENTS": (0, event_stride), "DISCOVERY": (drained, drained)}),
+            ):
+                reject(f"{lane} {label}",
+                       lambda lane=lane, retained=retained, positions=positions:
+                       assert_retained_ring_records(retained, lane, 0x555, positions))
         reject("raw event count", lambda: assert_event_records(
             safe_events[:-1], "default-safe-profile", 0x555
         ))

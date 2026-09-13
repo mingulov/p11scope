@@ -750,7 +750,7 @@ class Coordinator:
                 cells = [cell for cell in ordinary['EVIDENCE'] if evidence.u32(evidence.bpftool_bytes(cell['key'], 4), 0) == 5]
                 require(len(cells) == 1, 'missing fault evidence cell')
                 evidence.assert_fault_records(starts, evidence.value_total(cells[0].get('values', [])))
-        evidence.assert_retained_ring_records(rings, cfg.lane, cfg.workload_pid)
+        evidence.assert_retained_ring_records(rings, cfg.lane, cfg.workload_pid, positions)
         acquisition = uuid.uuid4().hex
         receipt = {'contract': dumper.STOPPED_SNAPSHOT_CONTRACT, 'acquisition_id': acquisition,
                    'phase': 'stopped', 'lane': receipt_lane, 'small_state': False,
@@ -761,6 +761,13 @@ class Coordinator:
                    'size': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}
             if item['type'] == 'task_storage':
                 row['records'] = bound[item['name']]
+            elif item['type'] == 'ringbuf':
+                # The two kernel byte counters the retained bytes were read
+                # between, re-verified above against a second sample. An
+                # observer that drains its own ring retains nothing on a healthy
+                # run, so the residue alone cannot say what the ring carried and
+                # a replay reading only these files would have no way to ask.
+                row['positions'] = list(positions[item['name']])
             receipt['surfaces'].append(row)
         self.receipt_name = f'mapdump_snapshot_{cfg.lane}.json'
         self.files.write(self.files.stage / self.receipt_name, encoded(receipt))

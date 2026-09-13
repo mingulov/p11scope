@@ -276,9 +276,18 @@ def _query(root: Path, prefix: Path, phase: str, context: str, workspace: str,
         raise EvidenceError(f"{context} metadata query could not execute: {error}") from error
     _write_new(_artifact(prefix, phase, f"{context}.status"), f"{result.returncode}\n".encode("ascii"))
     _write_new(_artifact(prefix, phase, f"{context}.stdout.json"), result.stdout)
-    _write_new(_artifact(prefix, phase, f"{context}.stderr"), result.stderr)
+    stderr_artifact = _artifact(prefix, phase, f"{context}.stderr")
+    _write_new(stderr_artifact, result.stderr)
     if result.returncode != 0:
-        raise EvidenceError(f"{context} metadata query returned status {result.returncode}")
+        # Name the retained stderr artifact, never inline its bytes: this
+        # refusal reaches logs and receipts, and the artifact exists
+        # precisely so the failure text lives somewhere bounded and
+        # reviewable. A bare status once had to be reproduced by hand to
+        # learn what it meant.
+        raise EvidenceError(
+            f"{context} metadata query returned status {result.returncode}; "
+            f"stderr retained at {stderr_artifact}"
+        )
     return _artifact(prefix, phase, f"{context}.stdout.json")
 
 

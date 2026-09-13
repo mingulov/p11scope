@@ -50,6 +50,16 @@ BPF_ATTR_MAP_ELEM = struct.Struct("=IIQQQ")
 BPF_ATTR_OBJ_INFO = struct.Struct("=IIQ")
 BPF_MAP_INFO = struct.Struct("=IIIIII")
 DIAGNOSTIC_LIMIT = 4096
+# A diagnostic keeps a bounded head AND a bounded tail, never a head-only
+# prefix: the children run here (libbpf, cargo, gcc, ld, the native reader)
+# log their identity and inputs first and state the actual failure LAST, so
+# the tail is where the explanation of a failure lives and a head-only cut
+# is guaranteed to discard it. The marker budget reserves room for the
+# dropped-bytes seam so head + marker + tail stays inside DIAGNOSTIC_LIMIT
+# and one elision pass never yields text that needs a second.
+DIAGNOSTIC_MARKER_BUDGET = 64
+DIAGNOSTIC_HEAD = (DIAGNOSTIC_LIMIT - DIAGNOSTIC_MARKER_BUDGET) // 2
+DIAGNOSTIC_TAIL = DIAGNOSTIC_LIMIT - DIAGNOSTIC_MARKER_BUDGET - DIAGNOSTIC_HEAD
 JSON_TIMEOUT_SECONDS = 8
 JSON_OUTPUT_MAX_BYTES = TASK_STORAGE_MAX_BYTES
 
@@ -91,12 +101,20 @@ def checked_json(args, returncode, stdout, stderr, require_list=False, map_ident
     return value
 
 
+def dropped_marker(dropped):
+    """The explicit seam saying how many unread middle bytes were elided."""
+    return f"\n...[{dropped} bytes dropped]...\n"
+
+
 def bounded_diagnostic(value):
     text = value.decode("utf-8", "replace") if isinstance(value, bytes) else str(value)
     text = text.strip()
-    if len(text) > DIAGNOSTIC_LIMIT:
-        return text[:DIAGNOSTIC_LIMIT] + "...[truncated]"
-    return text
+    if len(text) <= DIAGNOSTIC_LIMIT:
+        return text
+    # Elide the middle, not the end: the first lines identify the tool and
+    # its inputs, the last lines say why it failed.
+    dropped = len(text) - DIAGNOSTIC_HEAD - DIAGNOSTIC_TAIL
+    return text[:DIAGNOSTIC_HEAD] + dropped_marker(dropped) + text[-DIAGNOSTIC_TAIL:]
 
 
 def run_json(args, require_list=False, map_identity=None, *,
@@ -133,6 +151,7 @@ def _run_bounded_bytes(args, *, timeout_seconds, max_bytes, label):
         raise RuntimeError(f"{label} requires one main thread and default SIGCHLD")
     output = bytearray()
     diagnostic = bytearray()
+    diagnostic_dropped = 0
     streams = None
     process = None
     pidfd = None
@@ -177,8 +196,20 @@ def _run_bounded_bytes(args, *, timeout_seconds, max_bytes, label):
                     if len(target) > max_bytes:
                         failure = f"{label} exceeded output bound {max_bytes}"
                         break
-                elif len(target) <= DIAGNOSTIC_LIMIT:
-                    target.extend(chunk[:DIAGNOSTIC_LIMIT + 1 - len(target)])
+                else:
+                    # stderr: retain a bounded head and a bounded tail, and
+                    # count the middle as dropped. Stopping at the first
+                    # bound instead is what kept libbpf's ELF/CO-RE chatter
+                    # and threw away the verifier verdict at the end of the
+                    # stream — the only bytes that explained the failure.
+                    # Only the retained window grows with this code, never
+                    # memory: a runaway child's stderr is trimmed on every
+                    # chunk, so a hostile child cannot fill memory either.
+                    target.extend(chunk)
+                    excess = len(target) - DIAGNOSTIC_HEAD - DIAGNOSTIC_TAIL
+                    if excess > 0:
+                        diagnostic_dropped += excess
+                        del target[DIAGNOSTIC_HEAD:len(target) - DIAGNOSTIC_TAIL]
             if failure is not None:
                 break
         if failure is not None:
@@ -242,6 +273,13 @@ def _run_bounded_bytes(args, *, timeout_seconds, max_bytes, label):
         raise primary_error.with_traceback(primary_traceback)
     if cleanup_error is not None:
         raise cleanup_error.with_traceback(cleanup_error.__traceback__)
+    if diagnostic_dropped:
+        # Splice the seam in here, where the head/tail boundary is known;
+        # callers and bounded_diagnostic pass the result through untouched
+        # because it already fits DIAGNOSTIC_LIMIT.
+        diagnostic = (diagnostic[:DIAGNOSTIC_HEAD]
+                      + dropped_marker(diagnostic_dropped).encode("ascii")
+                      + diagnostic[DIAGNOSTIC_HEAD:])
     return returncode, bytes(output), bytes(diagnostic)
 
 

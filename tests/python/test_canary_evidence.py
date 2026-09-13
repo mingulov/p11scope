@@ -616,6 +616,34 @@ class TaskStorageReaderTests(unittest.TestCase):
                     if maximum_records < 4:
                         self.assertEqual(len(actual), maximum_bytes + (maximum_records + 1) * 28)
 
+    def test_task_storage_reader_diagnostic_retains_the_tail_where_the_error_lives(self):
+        dumper = load_dumper()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reader, obj = root / "reader", root / "reader.bpf.o"
+            obj.write_bytes(b"object")
+            # Verbose native tools (libbpf, cargo, gcc, ld) log their chatter
+            # first and state the actual failure LAST, so a head-only stderr
+            # bound retains exactly the bytes nobody needs. The sentinel is
+            # the verifier verdict that ends this session's real failure.
+            sentinel = ("program exit: register R0 has smin=4294967295 "
+                        "smax=4294967295 should have been in [0, 1]")
+            reader.write_text(
+                f"#!{sys.executable}\nimport os,sys\n"
+                f"os.write(2, {b'libbpf: elf section chatter\\n' * 900!r})\n"
+                f"os.write(2, {sentinel.encode() + b'\\n'!r})\n"
+                f"sys.exit(9)\n", encoding="utf-8")
+            reader.chmod(0o700)
+            with self.assertRaisesRegex(RuntimeError, "failed with status 9") as raised:
+                dumper.run_task_storage_reader(
+                    reader, obj, 55, self.MAPS,
+                    timeout_seconds=8, max_records=8, max_bytes=4096)
+            message = str(raised.exception)
+            self.assertIn(sentinel, message)
+            self.assertIn("libbpf: elf section chatter", message)
+            self.assertIn("bytes dropped]", message)
+            self.assertLess(len(message), 4300)
+
     def test_native_main_bounds_collection_and_never_publishes_failed_frames(self):
         dumper = load_dumper()
         real_popen, real_open, real_close = subprocess.Popen, os.pidfd_open, os.close

@@ -189,6 +189,28 @@ class PreparedDependencyEvidenceTests(unittest.TestCase):
                 if context == "root":
                     self.assertFalse(marker.exists())
 
+    def test_query_failure_refusal_names_the_retained_stderr_artifact(self):
+        # A bare `status 101` once had to be reproduced by hand to learn it
+        # meant a missing crate in the offline cargo cache: the stderr was
+        # retained all along, but the refusal never said where. The message
+        # must name the artifact's path — and must not inline its bytes,
+        # because these refusals reach logs and receipts while the artifact
+        # exists precisely so the bytes stay bounded and reviewable.
+        temporary = Path(self.temporary.name) / "stderr-artifact"
+        temporary.mkdir()
+        fixture = EvidenceFixture(temporary)
+        fixture.config["root_status"] = 101
+        fixture.config["root_stderr"] = (
+            "error: failed to download `r-efi v0.0.0` from the offline cargo cache\n"
+        )
+        fixture.write_config()
+        result = fixture.run("capture")
+        stderr_artifact = fixture.artifact(".initial.root.stderr")
+        self.assert_refused(result, "root metadata query returned status 101",
+                            str(stderr_artifact))
+        self.assertIn("r-efi", stderr_artifact.read_text(encoding="utf-8"))
+        self.assertNotIn("r-efi", result.stderr)
+
     def test_recheck_preserves_initial_evidence_and_writes_separate_final_evidence(self):
         self.capture()
         initial = {path: path.read_bytes() for path in self.fixture.prefix.parent.iterdir()}

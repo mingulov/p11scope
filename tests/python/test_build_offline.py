@@ -58,6 +58,13 @@ def _wait_for_descendant_not_live(pid, *, proc_root=Path("/proc"), timeout=10.0)
             raw = stat_path.read_bytes()
         except FileNotFoundError:
             return None
+        except ProcessLookupError:
+            # The pid disappeared BETWEEN the open and the read: procfs answers
+            # ESRCH, not ENOENT, for a task reaped while its stat file is held
+            # open. That is the very condition this function waits for, so it is
+            # a return, not a failure. Must precede the OSError arm below, which
+            # ProcessLookupError is a subclass of.
+            return None
         except OSError as error:
             raise AssertionError(f"cannot inspect descendant {pid}: {error}") from error
         try:

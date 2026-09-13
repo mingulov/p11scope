@@ -203,9 +203,13 @@ DEBUG_STATE_SYMBOL = "_dl_debug_state"
 
 # Frozen campaign parameters. These are declared once here, before the first
 # privileged run, so no lane can invent its own budget or kernel later.
-FROZEN_KERNELS = (("jammy", "5.15."), ("noble", "6.8."))
+FROZEN_KERNELS = (
+    ("jammy", "5.15.", "retained Ubuntu cloud image overlay base"),
+    ("noble", "6.8.", "retained Ubuntu cloud image overlay base"),
+    ("fedora", "6.19.", "retained Fedora cloud image overlay base"),
+)
 FROZEN_CAPS = ("CAP_BPF", "CAP_PERFMON", "CAP_SYS_PTRACE", "CAP_SYS_RESOURCE")
-FROZEN_DEADLINES = {"attempt_seconds": 120, "campaign_seconds": 43200, "pause_poll_ms": 1}
+FROZEN_DEADLINES = {"attempt_seconds": 120, "campaign_seconds": 64800, "pause_poll_ms": 1}
 FROZEN_TOPOLOGY = {"cold_boot": True, "containers": ["docker", "kind"]}
 
 
@@ -710,7 +714,7 @@ def _manifest_content(private_root, root, kernel_bases, fixture_bits=None, *, hi
                 "name": name,
                 "release_prefix": prefix,
                 "base": {
-                    "source": "retained Ubuntu cloud image overlay base (scripts/matrix)",
+                    "source": base_source,
                     "path": str(kernel_bases[name]) if kernel_bases.get(name) else None,
                     # Absent a retained base at freeze time the identity is
                     # pinned by the campaign's own first row and must then stay
@@ -718,7 +722,7 @@ def _manifest_content(private_root, root, kernel_bases, fixture_bits=None, *, hi
                     "sha256": sha256_file(kernel_bases[name]) if kernel_bases.get(name) else None,
                 },
             }
-            for name, prefix in FROZEN_KERNELS
+            for name, prefix, base_source in FROZEN_KERNELS
         ],
         "commands": commands,
         "interpreter": {"path": str(interpreter_path), "libc_version": libc_version},
@@ -1230,15 +1234,15 @@ def bind_manifest(manifest, root):
     names = [kernel.get("name") for kernel in kernels]
     check(
         [
-            (len(kernels) == 2, "the campaign is frozen against exactly two kernels"),
-            (len(set(names)) == 2, "the two frozen kernels do not have distinct names"),
+            (len(kernels) == 3, "the campaign is frozen against exactly three kernels"),
+            (len(set(names)) == 3, "the three frozen kernels do not have distinct names"),
             (
                 all(kernel.get("release_prefix") for kernel in kernels),
                 "a frozen kernel has no release prefix",
             ),
             (
-                len({kernel.get("release_prefix") for kernel in kernels}) == 2,
-                "the two frozen kernels do not have distinct release prefixes",
+                len({kernel.get("release_prefix") for kernel in kernels}) == 3,
+                "the three frozen kernels do not have distinct release prefixes",
             ),
             (
                 all(get(kernel, "base", "source") for kernel in kernels),
@@ -1289,8 +1293,8 @@ def bind_manifest(manifest, root):
                 "frozen children per row differ",
             ),
             (
-                campaign.get("primary_attempts") == 480,
-                "the frozen primary grid is not the amendment's 480 attempts",
+                campaign.get("primary_attempts") == 720,
+                "the frozen primary grid is not the amendment's 720 attempts",
             ),
             (
                 campaign.get("fallback_attempts") == FALLBACK_PER_KERNEL * len(kernels),
@@ -2450,7 +2454,7 @@ def self_test():
                 "frozen marker expectation",
                 _patch(manifest, ["lanes", "zero-modules", "markers"], "maybe"),
             ),
-            ("frozen kernel count", _patch(manifest, ["kernels"], manifest["kernels"][:1])),
+            ("frozen kernel count", _patch(manifest, ["kernels"], manifest["kernels"][:2])),
             (
                 "distinct kernel release prefixes",
                 _patch(manifest, ["kernels", 1, "release_prefix"], "5.15."),
@@ -2886,8 +2890,8 @@ def main(argv=None):
         bases = {}
         for entry in args.kernel_base:
             name, _, path = entry.partition("=")
-            if name not in dict(FROZEN_KERNELS) or not path:
-                fail(f"--kernel-base expects one of {[n for n, _ in FROZEN_KERNELS]}=PATH")
+            if name not in {n for n, _, _ in FROZEN_KERNELS} or not path:
+                fail(f"--kernel-base expects one of {[n for n, _, _ in FROZEN_KERNELS]}=PATH")
             bases[name] = Path(path).resolve(strict=True)
         manifest = write_manifest(args.private_root, root, bases, args.fixture_bits)
         print(f"froze execution manifest {frozen_paths(args.private_root)['manifest']}")

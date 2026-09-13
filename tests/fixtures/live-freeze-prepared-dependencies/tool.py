@@ -10,6 +10,14 @@ import sys
 config = json.loads(Path(os.environ["P11SCOPE_LIVE_FREEZE_FIXTURE"]).read_text())
 name = Path(sys.argv[0]).name
 args = sys.argv[1:]
+if name == "rustup" and args == ["--version"]:
+    # The tool pinning layer identifies its executables by behaviour (it runs
+    # `rustup --version` and requires a `rustup ` banner), so a stub standing
+    # in for rustup must answer as rustup. Answer before the event is
+    # recorded: the probe is a capability check, not a tool selection. The
+    # gcc/ld --version arms below are real tool uses and stay recorded.
+    print("rustup 1.99.0 (p11scope test fixture)")
+    raise SystemExit(0)
 private = Path(config["private"])
 prefix = private / "dependencies" / "prepared"
 with Path(config["events"]).open("a") as stream:

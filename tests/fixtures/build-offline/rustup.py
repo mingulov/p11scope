@@ -9,6 +9,13 @@ import sys
 
 control_path = Path.cwd() / "test-control.json"
 control = json.loads(control_path.read_text(encoding="utf-8")) if control_path.exists() else {}
+if sys.argv[1:] == ["--version"]:
+    # The tool pinning layer identifies its executables by behaviour (it runs
+    # `rustup --version` and requires a `rustup ` banner), so a stub standing
+    # in for rustup must answer as rustup. Answer before the invocation is
+    # recorded: the probe is a capability check, not a toolchain selection.
+    print("rustup 1.99.0 (p11scope test fixture)")
+    raise SystemExit(0)
 record = Path.cwd() / "test-record"
 if record.is_dir():
     with (record / "rustup.jsonl").open("a", encoding="utf-8") as output:

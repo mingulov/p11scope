@@ -1,5 +1,14 @@
 #!/bin/sh
 name=${D2_COMMAND_NAME:-$(basename "$0")}
+# The tool pinning layer identifies its executables by behaviour (it runs
+# `--version` and requires a `rustup `/`Python ` banner), so the stubs
+# standing in for rustup and python3 must answer as the tools they replace.
+# Answer before the call is recorded: the probe is a capability check, not
+# a tool use.
+case "$name:$1" in
+rustup:--version) printf '%s\n' "rustup 1.99.0 (p11scope test fixture)"; exit 0 ;;
+python3:--version) printf 'Python 3.14.0 (p11scope test fixture)\n'; exit 0 ;;
+esac
 work=$(dirname "${KUBECONFIG:-/tmp/none}")
 echo "$name $*" >> "$D2_STATE/calls"
 cluster="p11scope-knative-$P11SCOPE_LANE13_TOKEN"

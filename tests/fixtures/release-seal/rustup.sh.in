@@ -1,4 +1,12 @@
 #!/bin/sh
+# The tool pinning layer identifies its executables by behaviour (it runs
+# `rustup --version` and requires a `rustup ` banner), so a stub standing in
+# for rustup must answer as rustup. The basename guard keeps the cargo/rustc
+# symlinks aimed at this file behaving exactly as before; only the name under
+# which rustup is invoked gets the banner.
+case "${0##*/}:$1" in
+rustup:--version) printf '%s\n' "rustup 1.99.0 (p11scope test fixture)"; exit 0 ;;
+esac
 case "$1 $2 $3" in
 "which --toolchain 1.88"|"which --toolchain nightly-2026-05-20") printf '%s\n' @TOOLCHAIN@; exit 0 ;;
 esac

@@ -40,6 +40,43 @@ _p11scope_prepared_tools_rustup_which() {
         which --toolchain "$1" "$2"
 }
 
+# A multiplexer shim (mise, asdf) installs one binary under many names and
+# dispatches on argv[0], so the shim's canonical path names the multiplexer,
+# not python, and exec'ing that path directly makes it run scripts as the
+# multiplexer rather than as the interpreter. This file pins exact
+# executables; a binary whose behaviour depends on its invocation name is
+# precisely what it must not pin. Ask the binary to identify itself -- a path
+# can be named anything, so behaviour is the only trustworthy witness -- and
+# refuse whatever does not answer as python before anything runs through it.
+# CPython prints its --version banner to stdout on 3.4+ but printed it to
+# stderr on older releases, so capture both streams for the prefix match.
+_p11scope_prepared_tools_python_identifies() {
+    case $(
+        "$_p11scope_prepared_tools_python" --version 2>&1
+    ) in
+        'Python '*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# A multiplexer shim (mise, asdf) installs one binary under many names and
+# dispatches on argv[0], so the shim's canonical path names the multiplexer,
+# not rustup, and exec'ing that path directly makes it answer as the
+# multiplexer. This file pins exact executables; a binary whose behaviour
+# depends on its invocation name is precisely what it must not pin. Ask the
+# binary to identify itself -- a path can be named anything, so behaviour is
+# the only trustworthy witness -- and refuse whatever does not answer as
+# rustup before any tool is selected through it.
+_p11scope_prepared_tools_rustup_identifies() {
+    case $(
+        RUSTUP_AUTO_INSTALL=0 "$_p11scope_prepared_tools_rustup" \
+            --version 2>/dev/null
+    ) in
+        'rustup '*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 _p11scope_prepared_tools_refuse() {
     _p11scope_prepared_tools_clear_results
     _p11scope_prepared_tools_clear_scratch
@@ -72,10 +109,28 @@ p11scope_prepared_tools_select() {
         return $?
     }
 
+    _p11scope_prepared_tools_python_identifies || {
+        _p11scope_prepared_tools_refuse "python $1 canonicalizes to
+$_p11scope_prepared_tools_python, which does not identify as python (its
+--version output does not begin with 'Python '). A shim that dispatches on
+argv[0] cannot be pinned; pass the real python interpreter (for example
+~/.local/share/mise/installs/python/3.14/bin/python3)." 68
+        return $?
+    }
+
     _p11scope_prepared_tools_rustup=$(
         _p11scope_prepared_tools_canonical_executable "$2"
     ) || {
         _p11scope_prepared_tools_refuse 'invalid rustup executable' 65
+        return $?
+    }
+
+    _p11scope_prepared_tools_rustup_identifies || {
+        _p11scope_prepared_tools_refuse "rustup $2 canonicalizes to
+$_p11scope_prepared_tools_rustup, which does not identify as rustup (its
+--version output does not begin with 'rustup '). A shim that dispatches on
+argv[0] cannot be pinned; pass the real rustup (for example
+~/.cargo/bin/rustup)." 67
         return $?
     }
 

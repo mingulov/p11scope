@@ -3,5 +3,6 @@
 //! helper does (spec §4.1 step 5).
 
 pub use p11scope_manifest::maps::{
-    Device, MapEntry, MappedPath, ObjectKey, Resolved, parse_maps, resolve,
+    Device, InvalidMapSnapshot, MapEntry, MapIndex, MappedPath, ObjectKey, Resolved, parse_maps,
+    resolve,
 };

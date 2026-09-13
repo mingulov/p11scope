@@ -691,11 +691,11 @@ fn selection_mapping_bracket(
     mut pin_same: impl FnMut() -> bool,
 ) -> Result<(Option<MapEntry>, Resolved), ()> {
     let maps_a = read_maps()?;
-    let index_a = MapIndex::new(&maps_a).ok_or(())?;
+    let index_a = MapIndex::new(&maps_a).map_err(|_| ())?;
     let mapping_a = index_a.containing(table_ptr).cloned();
     let resolved_a = index_a.resolve(table_ptr);
     let maps_b = read_maps()?;
-    let index_b = MapIndex::new(&maps_b).ok_or(())?;
+    let index_b = MapIndex::new(&maps_b).map_err(|_| ())?;
     let mapping_same = stable_selection_mapping(mapping_a.as_ref(), index_b.containing(table_ptr));
     let view_same = view_same();
     let pin_same = pin_same();
@@ -12663,7 +12663,7 @@ pub(crate) mod tests {
         Acquisition, AliasEntry, AliasGroup, FunctionRecord, InterfaceClassification,
         SurfaceRecord, SurfaceSource, Version, WalkOutcome,
     };
-    use p11scope_manifest::maps::{parse_maps, resolve};
+    use p11scope_manifest::maps::parse_maps;
     use std::cell::Cell;
     use std::io::Write as _;
     use std::path::PathBuf;
@@ -12809,6 +12809,7 @@ pub(crate) mod tests {
         KEYS.get_or_init(|| {
             let view = ProcessView::open(ProcessViewId(99), std::process::id()).unwrap();
             let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+            let map_index = MapIndex::new(&maps).expect("the self maps snapshot is valid");
             let mut keys = Vec::new();
             for mapping in maps
                 .iter()
@@ -12817,7 +12818,7 @@ pub(crate) mod tests {
                 let Resolved::File {
                     path: MappedPath::Usable(path),
                     ..
-                } = resolve(&maps, mapping.start)
+                } = map_index.resolve(mapping.start)
                 else {
                     continue;
                 };
@@ -17181,9 +17182,10 @@ int main(int argc, char **argv) {
             let maps =
                 parse_maps(&std::fs::read(format!("/proc/{}/maps", fixture.child.id())).unwrap())
                     .unwrap();
+            let map_index = MapIndex::new(&maps).expect("the loaded child maps snapshot is valid");
             mapped = maps
                 .iter()
-                .find_map(|mapping| match resolve(&maps, mapping.start) {
+                .find_map(|mapping| match map_index.resolve(mapping.start) {
                     Resolved::File {
                         path: MappedPath::Usable(path),
                         ..
@@ -18154,9 +18156,10 @@ int main(int argc, char **argv) {
         for _ in 0..200 {
             let maps =
                 parse_maps(&std::fs::read(format!("/proc/{peer_pid}/maps")).unwrap()).unwrap();
+            let map_index = MapIndex::new(&maps).expect("the peer maps snapshot is valid");
             mapped = maps.iter().find_map(|mapping| {
                 matches!(
-                    resolve(&maps, mapping.start),
+                    map_index.resolve(mapping.start),
                     Resolved::File {
                         path: MappedPath::Usable(ref path),
                         ..
@@ -19893,12 +19896,13 @@ int main(int argc, char **argv) {
         let pid = engine.views[0].pid();
         let provider = engine.pinned.summary(binding.object).unwrap().key;
         let maps = parse_maps(&std::fs::read(format!("/proc/{pid}/maps")).unwrap()).unwrap();
+        let map_index = MapIndex::new(&maps).expect("the target maps snapshot is valid");
         let address = maps
             .iter()
             .find(|mapping| ObjectKey::of(mapping) == provider)
             .unwrap()
             .start;
-        let table_file_offset = match resolve(&maps, address) {
+        let table_file_offset = match map_index.resolve(address) {
             Resolved::File { file_offset, .. } => file_offset,
             _ => unreachable!(),
         };
@@ -20557,16 +20561,21 @@ int main(int argc, char **argv) {
 
     #[test]
     fn selection_assessment_rejects_remap_view_loss_and_pin_change() {
+        // The bracket's verdict paired with the call order it took: the events
+        // are the point of this test, since a bracket that reaches the right
+        // answer without reading maps twice is not the bracket.
+        type AssessOutcome = (Result<(Option<MapEntry>, Resolved), ()>, Vec<&'static str>);
         fn assess(
+            table_ptr: u64,
             before: Vec<MapEntry>,
             after: Vec<MapEntry>,
             view_same: bool,
             pin_same: bool,
-        ) -> (Result<(), ()>, Vec<&'static str>) {
+        ) -> AssessOutcome {
             let mut snapshots = [before, after].into_iter();
             let events = std::cell::RefCell::new(Vec::new());
             let result = selection_mapping_bracket(
-                0x1000,
+                table_ptr,
                 || {
                     events.borrow_mut().push("maps");
                     snapshots.next().ok_or(())
@@ -20579,8 +20588,7 @@ int main(int argc, char **argv) {
                     events.borrow_mut().push("pin");
                     pin_same
                 },
-            )
-            .map(|_| ());
+            );
             (result, events.into_inner())
         }
 
@@ -20588,15 +20596,51 @@ int main(int argc, char **argv) {
             parse_maps(b"00001000-00002000 r--p 00000000 08:01 9 /opt/provider.so\n").unwrap();
         let remapped =
             parse_maps(b"00001000-00002000 r--p 00001000 08:01 9 /opt/provider.so\n").unwrap();
-        let (result, events) = assess(stable.clone(), remapped, true, true);
+        let (result, events) = assess(0x1000, stable.clone(), remapped, true, true);
         assert!(result.is_err());
         assert_eq!(events, ["maps", "maps", "view", "pin"]);
         assert!(
-            assess(stable.clone(), stable.clone(), false, true)
+            assess(0x1000, stable.clone(), stable.clone(), false, true)
                 .0
                 .is_err()
         );
-        assert!(assess(stable.clone(), stable, true, false).0.is_err());
+        assert!(
+            assess(0x1000, stable.clone(), stable.clone(), true, false)
+                .0
+                .is_err()
+        );
+
+        let (absent, events) = assess(0x3000, stable.clone(), stable.clone(), true, true);
+        assert_eq!(absent, Ok((None, Resolved::Unmapped)));
+        assert_eq!(events, ["maps", "maps", "view", "pin"]);
+
+        let invalid = vec![
+            MapEntry {
+                start: 0x1000,
+                end: 0x3000,
+                file_offset: 0,
+                permissions: *b"r--p",
+                device: Device { major: 8, minor: 1 },
+                inode: 9,
+                raw_path: Some(b"/opt/provider.so".to_vec()),
+            },
+            MapEntry {
+                start: 0x2000,
+                end: 0x4000,
+                file_offset: 0,
+                permissions: *b"rw-p",
+                device: Device { major: 0, minor: 0 },
+                inode: 0,
+                raw_path: None,
+            },
+        ];
+        let (invalid_a, events) = assess(0x1000, invalid.clone(), stable.clone(), true, true);
+        assert!(invalid_a.is_err());
+        assert_eq!(events, ["maps"]);
+
+        let (invalid_b, events) = assess(0x1000, stable, invalid, true, true);
+        assert!(invalid_b.is_err());
+        assert_eq!(events, ["maps", "maps"]);
     }
 
     #[test]
@@ -21332,6 +21376,7 @@ int main(int argc, char **argv) {
         for _ in 0..200 {
             let bytes = std::fs::read(format!("/proc/{}/maps", view.pid())).unwrap();
             let maps = parse_maps(&bytes).unwrap();
+            let map_index = MapIndex::new(&maps).expect("the live child maps snapshot is valid");
             let mut keys = BTreeSet::new();
             let mut modules = Vec::new();
             for mapping in maps
@@ -21341,7 +21386,7 @@ int main(int argc, char **argv) {
                 let Resolved::File {
                     path: MappedPath::Usable(path),
                     ..
-                } = resolve(&maps, mapping.start)
+                } = map_index.resolve(mapping.start)
                 else {
                     continue;
                 };
@@ -23532,11 +23577,12 @@ int main(int argc, char **argv) {
         engine.modules = provider_modules;
 
         let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+        let map_index = MapIndex::new(&maps).expect("the self maps snapshot is valid");
         let executable = std::env::current_exe().unwrap();
         let (loader_mapping, loader_path) = maps
             .iter()
             .filter(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0)
-            .find_map(|mapping| match resolve(&maps, mapping.start) {
+            .find_map(|mapping| match map_index.resolve(mapping.start) {
                 Resolved::File {
                     path: MappedPath::Usable(path),
                     ..
@@ -24511,6 +24557,7 @@ int main(int argc, char **argv) {
         let pid = std::process::id();
         let view = ProcessView::open(id, pid).unwrap();
         let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+        let map_index = MapIndex::new(&maps).expect("the self maps snapshot is valid");
         let executable = std::env::current_exe().unwrap();
         let executable = executable.canonicalize().unwrap_or(executable);
         let owner = maps
@@ -24520,7 +24567,7 @@ int main(int argc, char **argv) {
                     && mapping.permissions[0] == b'r'
                     && mapping.permissions[2] != b'x'
                     && matches!(
-                        resolve(&maps, mapping.start),
+                        map_index.resolve(mapping.start),
                         Resolved::File {
                             path: MappedPath::Usable(ref path),
                             ..
@@ -24706,6 +24753,7 @@ int main(int argc, char **argv) {
 
         let view = ProcessView::open(ProcessViewId(41), std::process::id()).unwrap();
         let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+        let map_index = MapIndex::new(&maps).expect("the self maps snapshot is valid");
         let executable = std::env::current_exe().unwrap();
         let executable = executable.canonicalize().unwrap_or(executable);
         let owner = maps
@@ -24715,7 +24763,7 @@ int main(int argc, char **argv) {
                     && mapping.permissions[0] == b'r'
                     && mapping.permissions[2] != b'x'
                     && matches!(
-                        resolve(&maps, mapping.start),
+                        map_index.resolve(mapping.start),
                         Resolved::File {
                             path: MappedPath::Usable(ref path),
                             ..

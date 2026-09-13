@@ -50,7 +50,9 @@ pub fn discover_with_self_memory(
     let before_maps = maps::parse_maps(
         &std::fs::read("/proc/self/maps").map_err(|e| format!("/proc/self/maps: {e}"))?,
     )?;
-    let before_keys: BTreeSet<ObjectKey> = before_maps.iter().map(ObjectKey::of).collect();
+    let before_index = validated_map_index(&before_maps)?;
+    let before_keys: BTreeSet<ObjectKey> =
+        before_index.entries().iter().map(ObjectKey::of).collect();
 
     let lib = unsafe { Library::new(module_path) }
         .map_err(|e| format!("cannot dlopen {}: {e}", module_path.display()))?;
@@ -67,13 +69,17 @@ pub fn discover_with_self_memory(
     let maps_bytes =
         std::fs::read("/proc/self/maps").map_err(|e| format!("/proc/self/maps: {e}"))?;
     let maps = maps::parse_maps(&maps_bytes)?;
-    let module_map_key = loaded_module_key(raw_exports, &maps, module_file_key, &module_identity)?;
-    let initial_module_mappings: Vec<maps::MapEntry> = maps
+    let map_index = validated_map_index(&maps)?;
+    let module_map_key =
+        loaded_module_key(raw_exports, &map_index, module_file_key, &module_identity)?;
+    let initial_module_mappings: Vec<maps::MapEntry> = map_index
+        .entries()
         .iter()
         .filter(|mapping| ObjectKey::of(mapping) == module_map_key)
         .cloned()
         .collect();
-    let mut approved_keys: BTreeSet<ObjectKey> = maps
+    let mut approved_keys: BTreeSet<ObjectKey> = map_index
+        .entries()
         .iter()
         .map(ObjectKey::of)
         .filter(|key| !before_keys.contains(key))
@@ -88,9 +94,13 @@ pub fn discover_with_self_memory(
     }
 
     let exports = ExportAddresses {
-        get_function_list: module_export(raw_exports.get_function_list, &maps, module_map_key),
-        get_interface_list: module_export(raw_exports.get_interface_list, &maps, module_map_key),
-        get_interface: module_export(raw_exports.get_interface, &maps, module_map_key),
+        get_function_list: module_export(raw_exports.get_function_list, &map_index, module_map_key),
+        get_interface_list: module_export(
+            raw_exports.get_interface_list,
+            &map_index,
+            module_map_key,
+        ),
+        get_interface: module_export(raw_exports.get_interface, &map_index, module_map_key),
     };
     let mut objects = ObjectTable::new(
         module_path.to_path_buf(),
@@ -104,7 +114,7 @@ pub fn discover_with_self_memory(
         raw_exports.get_function_list,
         exports.get_function_list,
         &memory,
-        &maps,
+        &map_index,
         &mut objects,
     );
     let (interface_list, interface_surfaces, vendor_interfaces, interface_ptrs) = interface_records(
@@ -113,7 +123,7 @@ pub fn discover_with_self_memory(
         exports,
         legacy_240.as_deref(),
         &memory,
-        &maps,
+        &map_index,
         &mut objects,
     );
 
@@ -138,19 +148,20 @@ pub fn discover_with_self_memory(
     let final_maps = maps::parse_maps(
         &std::fs::read("/proc/self/maps").map_err(|e| format!("/proc/self/maps: {e}"))?,
     )?;
+    let final_map_index = validated_map_index(&final_maps)?;
     let (final_file_key, final_identity) = identity_and_key(module_path)?;
     if final_file_key != module_file_key
         || final_identity != module_identity
         || !initial_module_mappings
             .iter()
-            .all(|mapping| final_maps.contains(mapping))
+            .all(|mapping| final_map_index.entries().contains(mapping))
     {
         return Err(format!(
             "module {} changed while discovery was running",
             module_path.display()
         ));
     }
-    let provenance_objects = provenance_objects(&final_maps)?;
+    let provenance_objects = provenance_objects(&final_map_index)?;
 
     Ok(Manifest {
         schema: SCHEMA.to_string(),
@@ -165,12 +176,17 @@ pub fn discover_with_self_memory(
     })
 }
 
-fn provenance_objects(mappings: &[maps::MapEntry]) -> Result<Vec<ProvenanceObject>, String> {
+fn validated_map_index(entries: &[maps::MapEntry]) -> Result<maps::MapIndex<'_>, String> {
+    maps::MapIndex::new(entries).map_err(|error| format!("invalid /proc maps snapshot: {error}"))
+}
+
+fn provenance_objects(index: &maps::MapIndex<'_>) -> Result<Vec<ProvenanceObject>, String> {
     let mut by_key: BTreeMap<ObjectKey, ProvenanceObject> = BTreeMap::new();
     let mut opened_paths = BTreeMap::new();
     let mut total_bytes = 0u64;
 
-    for mapping in mappings
+    for mapping in index
+        .entries()
         .iter()
         .filter(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0)
     {
@@ -178,7 +194,7 @@ fn provenance_objects(mappings: &[maps::MapEntry]) -> Result<Vec<ProvenanceObjec
             .raw_path
             .as_deref()
             .ok_or_else(|| "file-backed executable mapping has no pathname".to_string())?;
-        let path = match maps::resolve(mappings, mapping.start) {
+        let path = match index.resolve(mapping.start) {
             maps::Resolved::File {
                 path: MappedPath::Usable(path),
                 ..
@@ -267,10 +283,10 @@ fn symbol_address(lib: &Library, name: &[u8]) -> Option<usize> {
 
 fn module_export(
     address: Option<usize>,
-    maps: &[maps::MapEntry],
+    maps: &maps::MapIndex<'_>,
     module_key: ObjectKey,
 ) -> Option<usize> {
-    address.filter(|address| match maps::resolve(maps, *address as u64) {
+    address.filter(|address| match maps.resolve(*address as u64) {
         maps::Resolved::File { device, inode, .. } => ObjectKey { device, inode } == module_key,
         _ => false,
     })
@@ -278,7 +294,7 @@ fn module_export(
 
 fn loaded_module_key(
     exports: ExportAddresses,
-    maps: &[maps::MapEntry],
+    maps: &maps::MapIndex<'_>,
     module_file_key: ObjectKey,
     module_identity: &ObjectIdentity,
 ) -> Result<ObjectKey, String> {
@@ -291,7 +307,7 @@ fn loaded_module_key(
             device,
             inode,
             ..
-        } = maps::resolve(maps, address as u64)
+        } = maps.resolve(address as u64)
         {
             if (ObjectKey { device, inode }) == module_file_key {
                 if let MappedPath::Usable(path) = path {
@@ -532,7 +548,7 @@ fn legacy_surface(
     raw_export: Option<usize>,
     module_export: Option<usize>,
     memory: &ProcessMemory,
-    maps: &[maps::MapEntry],
+    maps: &maps::MapIndex<'_>,
     objects: &mut ObjectTable,
 ) -> (SurfaceRecord, Option<Vec<usize>>, Option<usize>) {
     let source = SurfaceSource::LegacyFunctionList;
@@ -628,7 +644,7 @@ fn interface_records(
     exports: ExportAddresses,
     legacy_240: Option<&[usize]>,
     memory: &ProcessMemory,
-    maps: &[maps::MapEntry],
+    maps: &maps::MapIndex<'_>,
     objects: &mut ObjectTable,
 ) -> (
     Acquisition,
@@ -806,23 +822,18 @@ fn selection_bracket<T, SnapshotA, Resolve, SnapshotB>(
 ) -> Result<T, SelectionFailure>
 where
     SnapshotA: FnOnce() -> Result<Vec<maps::MapEntry>, ()>,
-    Resolve: FnOnce(&[maps::MapEntry]) -> Result<T, SelectionFailure>,
+    Resolve: FnOnce(&maps::MapIndex<'_>) -> Result<T, SelectionFailure>,
     SnapshotB: FnOnce() -> Result<Vec<maps::MapEntry>, ()>,
 {
-    let maps_a = snapshot_a();
-    let resolved = resolve(maps_a.as_deref().unwrap_or(&[]));
-    let maps_b = snapshot_b();
-    if maps_a.is_err()
-        || maps_b.is_err()
-        || !selection_maps_unchanged(
-            maps_a.as_deref().unwrap_or(&[]),
-            maps_b.as_deref().unwrap_or(&[]),
-        )
-    {
-        Err(SelectionFailure::ProviderChanged)
-    } else {
-        resolved
+    let maps_a = snapshot_a().map_err(|_| SelectionFailure::ProviderChanged)?;
+    let index_a = maps::MapIndex::new(&maps_a).map_err(|_| SelectionFailure::ProviderChanged)?;
+    let resolved = resolve(&index_a);
+    let maps_b = snapshot_b().map_err(|_| SelectionFailure::ProviderChanged)?;
+    let index_b = maps::MapIndex::new(&maps_b).map_err(|_| SelectionFailure::ProviderChanged)?;
+    if !selection_maps_unchanged(index_a.entries(), index_b.entries()) {
+        return Err(SelectionFailure::ProviderChanged);
     }
+    resolved
 }
 
 fn selection_inventory_indices(inventory_tables: &[Option<usize>], pointer: usize) -> Vec<usize> {
@@ -1117,7 +1128,7 @@ fn inventory_version_class(surface: &SurfaceRecord) -> SelectionVersionClass {
 
 fn selection_resolve_values(
     values: Vec<(&'static str, usize)>,
-    maps: &[maps::MapEntry],
+    maps: &maps::MapIndex<'_>,
     objects: &ObjectTable,
 ) -> Result<Vec<FunctionRecord>, SelectionFailure> {
     values
@@ -1126,7 +1137,7 @@ fn selection_resolve_values(
             let resolution = if value == 0 {
                 Resolution::NullPointer
             } else {
-                match maps::resolve(maps, value as u64) {
+                match maps.resolve(value as u64) {
                     maps::Resolved::File {
                         file_offset,
                         device,
@@ -1161,7 +1172,7 @@ fn selection_table_for(
     pointer: usize,
     version: SelectionVersionClass,
     snapshot: Option<&TableSnapshot>,
-    maps: &[maps::MapEntry],
+    maps: &maps::MapIndex<'_>,
     objects: &ObjectTable,
 ) -> Result<(SelectionTable, TableOrigin), SelectionFailure> {
     let version = match version {
@@ -1175,7 +1186,7 @@ fn selection_table_for(
         inode,
         file_offset,
         ..
-    } = maps::resolve(maps, pointer as u64)
+    } = maps.resolve(pointer as u64)
     else {
         return Err(SelectionFailure::OutsideProvider);
     };
@@ -1377,7 +1388,7 @@ fn interface_surface(
     classification: InterfaceClassification,
     force_prefix: bool,
     memory: &ProcessMemory,
-    maps: &[maps::MapEntry],
+    maps: &maps::MapIndex<'_>,
     objects: &mut ObjectTable,
 ) -> SurfaceRecord {
     let Ok(version) = version else {
@@ -1422,7 +1433,7 @@ fn interface_surface_from_snapshot(
     classification: InterfaceClassification,
     snapshot: TableSnapshot,
     force_prefix: bool,
-    maps: &[maps::MapEntry],
+    maps: &maps::MapIndex<'_>,
     objects: &mut ObjectTable,
 ) -> SurfaceRecord {
     let walk = if force_prefix && matches!(&snapshot.walk, WalkOutcome::Full) {
@@ -1512,7 +1523,7 @@ fn table_value(values: &[(&'static str, usize)], name: &str) -> Option<usize> {
 
 fn resolve_values(
     values: Vec<(&'static str, usize)>,
-    maps: &[maps::MapEntry],
+    maps: &maps::MapIndex<'_>,
     objects: &mut ObjectTable,
 ) -> Vec<FunctionRecord> {
     values
@@ -1522,7 +1533,7 @@ fn resolve_values(
             resolution: if value == 0 {
                 Resolution::NullPointer
             } else {
-                match maps::resolve(maps, value as u64) {
+                match maps.resolve(value as u64) {
                     maps::Resolved::File {
                         path,
                         raw_path,
@@ -1729,6 +1740,119 @@ mod tests {
     }
 
     #[test]
+    fn loaded_module_key_reports_invalid_snapshot_before_export_absence() {
+        let module_key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: 7,
+        };
+        let module_identity = identity_and_key(&std::env::current_exe().unwrap())
+            .unwrap()
+            .1;
+        let provider = maps::MapEntry {
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            permissions: *b"r-xp",
+            device: module_key.device,
+            inode: module_key.inode,
+            raw_path: Some(b"/definitely-not-reachable/provider.so".to_vec()),
+        };
+        let valid = vec![provider];
+        let load = |exports, entries: &[maps::MapEntry]| {
+            let index = validated_map_index(entries)?;
+            loaded_module_key(exports, &index, module_key, &module_identity)
+        };
+
+        assert_eq!(
+            load(
+                ExportAddresses {
+                    get_function_list: Some(0x1000),
+                    ..ExportAddresses::default()
+                },
+                &valid,
+            ),
+            Ok(module_key)
+        );
+
+        let absent = load(
+            ExportAddresses {
+                get_function_list: Some(0x9000),
+                ..ExportAddresses::default()
+            },
+            &valid,
+        )
+        .unwrap_err();
+        assert_eq!(
+            absent,
+            "no module acquisition export maps to the requested file identity"
+        );
+
+        let mut invalid = valid;
+        invalid.extend([
+            maps::MapEntry {
+                start: 0x3000,
+                end: 0x4000,
+                file_offset: 0,
+                permissions: *b"rw-p",
+                device: Device { major: 0, minor: 0 },
+                inode: 0,
+                raw_path: None,
+            },
+            maps::MapEntry {
+                start: 0x3800,
+                end: 0x4800,
+                file_offset: 0,
+                permissions: *b"rw-p",
+                device: Device { major: 0, minor: 0 },
+                inode: 0,
+                raw_path: None,
+            },
+        ]);
+        let invalid = load(
+            ExportAddresses {
+                get_function_list: Some(0x1000),
+                ..ExportAddresses::default()
+            },
+            &invalid,
+        )
+        .unwrap_err();
+        assert!(invalid.contains("invalid /proc maps snapshot"), "{invalid}");
+        assert!(
+            !invalid.contains("no module acquisition export"),
+            "{invalid}"
+        );
+
+        let no_exports = load(
+            ExportAddresses::default(),
+            &[
+                maps::MapEntry {
+                    start: 0x1000,
+                    end: 0x3000,
+                    file_offset: 0,
+                    permissions: *b"rw-p",
+                    device: Device { major: 0, minor: 0 },
+                    inode: 0,
+                    raw_path: None,
+                },
+                maps::MapEntry {
+                    start: 0x2000,
+                    end: 0x4000,
+                    file_offset: 0,
+                    permissions: *b"rw-p",
+                    device: Device { major: 0, minor: 0 },
+                    inode: 0,
+                    raw_path: None,
+                },
+            ],
+        )
+        .unwrap_err();
+        assert!(
+            no_exports.contains("invalid /proc maps snapshot"),
+            "{no_exports}"
+        );
+    }
+
+    #[test]
     fn identity_inspection_stays_on_the_opened_inode_after_retarget() {
         let dir = std::env::temp_dir().join(format!(
             "p11scope-discover-retarget-{}-{:?}",
@@ -1785,8 +1909,140 @@ mod tests {
         };
         let mut remapped = first.clone();
         remapped.start = 0x3000;
+        remapped.end = 0x4000;
         let result = selection_bracket(|| Ok(vec![first]), |_| Ok(7u8), || Ok(vec![remapped]));
         assert_eq!(result, Err(SelectionFailure::ProviderChanged));
+    }
+
+    #[test]
+    fn selection_bracket_refuses_invalid_snapshots() {
+        let provider = maps::MapEntry {
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            permissions: *b"r-xp",
+            device: Device { major: 1, minor: 2 },
+            inode: 3,
+            raw_path: Some(b"/provider.so".to_vec()),
+        };
+        let anonymous = maps::MapEntry {
+            start: 0x3000,
+            end: 0x4000,
+            file_offset: 0,
+            permissions: *b"rw-p",
+            device: Device { major: 0, minor: 0 },
+            inode: 0,
+            raw_path: None,
+        };
+        let overlap = maps::MapEntry {
+            start: 0x3800,
+            end: 0x4800,
+            ..anonymous.clone()
+        };
+        let valid = vec![provider, anonymous];
+        let invalid = vec![valid[0].clone(), valid[1].clone(), overlap];
+
+        let reads = std::cell::Cell::new(0);
+        let invalid_a = selection_bracket(
+            || Ok(invalid.clone()),
+            |_| {
+                reads.set(reads.get() + 1);
+                Ok(7u8)
+            },
+            || Ok(valid.clone()),
+        );
+        assert_eq!(invalid_a, Err(SelectionFailure::ProviderChanged));
+        assert_eq!(reads.get(), 0, "invalid A must prevent dependent reads");
+
+        let invalid_b =
+            selection_bracket(|| Ok(valid.clone()), |_| Ok(7u8), || Ok(invalid.clone()));
+        assert_eq!(invalid_b, Err(SelectionFailure::ProviderChanged));
+
+        let both_invalid =
+            selection_bracket(|| Ok(invalid.clone()), |_| Ok(7u8), || Ok(invalid.clone()));
+        assert_eq!(both_invalid, Err(SelectionFailure::ProviderChanged));
+
+        let stable = selection_bracket(|| Ok(valid.clone()), |_| Ok(7u8), || Ok(valid.clone()));
+        assert_eq!(stable, Ok(7));
+    }
+
+    #[test]
+    fn selection_bracket_validation_overrides_absence_classifications() {
+        let module_key = ObjectKey {
+            device: Device { major: 1, minor: 2 },
+            inode: 3,
+        };
+        let provider = maps::MapEntry {
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            permissions: *b"r-xp",
+            device: module_key.device,
+            inode: module_key.inode,
+            raw_path: Some(b"/provider.so".to_vec()),
+        };
+        let anonymous = maps::MapEntry {
+            start: 0x3000,
+            end: 0x4000,
+            file_offset: 0,
+            permissions: *b"rw-p",
+            device: Device { major: 0, minor: 0 },
+            inode: 0,
+            raw_path: None,
+        };
+        let valid = vec![provider, anonymous.clone()];
+        let invalid = vec![
+            valid[0].clone(),
+            anonymous.clone(),
+            maps::MapEntry {
+                start: 0x3800,
+                end: 0x4800,
+                ..anonymous
+            },
+        ];
+        let objects = ObjectTable {
+            module_key,
+            approved: BTreeSet::new(),
+            ids: BTreeMap::new(),
+            records: Vec::new(),
+        };
+
+        let valid_table_absence = selection_bracket(
+            || Ok(valid.clone()),
+            |index| {
+                selection_table_for(0x9000, SelectionVersionClass::V3_0, None, index, &objects)
+                    .map(|_| ())
+            },
+            || Ok(valid.clone()),
+        );
+        assert_eq!(valid_table_absence, Err(SelectionFailure::OutsideProvider));
+
+        let invalid_b_table = selection_bracket(
+            || Ok(valid.clone()),
+            |index| {
+                selection_table_for(0x9000, SelectionVersionClass::V3_0, None, index, &objects)
+                    .map(|_| ())
+            },
+            || Ok(invalid.clone()),
+        );
+        assert_eq!(invalid_b_table, Err(SelectionFailure::ProviderChanged));
+
+        let valid_function_absence = selection_bracket(
+            || Ok(valid.clone()),
+            |index| selection_resolve_values(vec![("C_Test", 0x9000)], index, &objects).map(|_| ()),
+            || Ok(valid.clone()),
+        );
+        assert_eq!(
+            valid_function_absence,
+            Err(SelectionFailure::UnresolvedFunction)
+        );
+
+        let invalid_b_function = selection_bracket(
+            || Ok(valid.clone()),
+            |index| selection_resolve_values(vec![("C_Test", 0x9000)], index, &objects).map(|_| ()),
+            || Ok(invalid.clone()),
+        );
+        assert_eq!(invalid_b_function, Err(SelectionFailure::ProviderChanged));
     }
 
     #[test]

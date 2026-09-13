@@ -1382,7 +1382,7 @@ pub(crate) fn index_maps_or_refuse<'a>(
 ) -> Result<MapIndex<'a>, String> {
     budget.spend(maps.len() as u64).map_err(String::from)?;
     MapIndex::new(maps)
-        .ok_or_else(|| "reversed or overlapping /proc/<pid>/maps intervals".to_string())
+        .map_err(|_| "reversed or overlapping /proc/<pid>/maps intervals".to_string())
 }
 
 pub fn scan_pid(
@@ -2399,6 +2399,16 @@ mod tests {
 
     #[test]
     fn p2_bracket_incomplete_a_never_scans() {
+        let mut control = BracketFixture::new(8, true);
+        assert_eq!(
+            control
+                .run(&mut CaptureWorkBudget::default())
+                .unwrap()
+                .modules()
+                .len(),
+            1
+        );
+
         let mut f = BracketFixture::new(8, true);
         let mut budget = CaptureWorkBudget::new(ScanLimits {
             per_object_bytes: u64::MAX,
@@ -2410,6 +2420,22 @@ mod tests {
         );
         assert!(
             !f.log
+                .borrow()
+                .iter()
+                .any(|event| event.starts_with("memory "))
+        );
+
+        let mut invalid = BracketFixture::new(8, true);
+        invalid
+            .maps_a
+            .push_str("b000-d000 r--p 0 0:0 0 [overlap]\n");
+        invalid.assert_refused(
+            &mut CaptureWorkBudget::default(),
+            "memory scan refused: initial mapping validation unavailable: reversed or overlapping",
+        );
+        assert!(
+            !invalid
+                .log
                 .borrow()
                 .iter()
                 .any(|event| event.starts_with("memory "))

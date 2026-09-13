@@ -723,7 +723,7 @@ fn assess_target_readability(pid: u32) -> Result<usize, &'static str> {
         .and_then(|result| result.map_err(|_| "maps unavailable"));
     let maps = maps_opened.as_ref().map_err(|reason| *reason)?;
     let entries = p11scope_manifest::maps::parse_maps(maps).map_err(|_| "maps invalid")?;
-    let index = MapIndex::new(&entries).ok_or("maps invalid")?;
+    let index = MapIndex::new(&entries).map_err(|_| "maps invalid")?;
     let mem_opened = view
         .run_while_same(|| std::fs::File::open(format!("/proc/{pid}/mem")))
         .map_err(|_| "generation changed")

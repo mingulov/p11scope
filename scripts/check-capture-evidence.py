@@ -842,9 +842,9 @@ def exact_canary_discovery_skips(evidence, *, owned):
 
     Returns the validated skip count for exact_common to pin. Every
     discovery skip must be the one categorical public item, and the count
-    must fit the lane's deterministic floor plus at most one retained scan
-    refusal: owned lanes carry exactly the initial-set skip, optionally plus
-    one refusal; safe lanes carry none, optionally plus one refusal.
+    must fit the lane's deterministic floor plus at most one retained
+    internal loss: owned lanes carry exactly the initial-set skip,
+    optionally plus one; safe lanes carry none, optionally plus one.
 
     Why a bound and not an exact count: the P-2 maps bracket refuses an
     acquisition whose mappings changed mid-read and records it, and the
@@ -859,13 +859,18 @@ def exact_canary_discovery_skips(evidence, *, owned):
     Why the bound is still strong: the initial-set skip is unconditional on
     owned lanes (one initial-set context per owned run, armed or not, and
     the empty timing catalog leaves it unproven by spec amendment), while
-    the initial-set path never runs for profile/trace lanes. The optional
-    additional item is therefore always a retained refusal alongside a scan
-    the lane proves fully elsewhere (exact shape, tables, sources and
-    corroboration in validate_canary, or manifest-only sources that exclude
-    scan data entirely) — refused data contributed nothing to the lane's
-    claims. Which module refused is not a capture-document property by
-    design (the public record must not name paths) and is proven by the
+    the initial-set path never runs for profile/trace lanes. Any additional
+    categorical item is a retained internal loss published through the same
+    finite category — most often a bracket refusal, but whole-outcome scan
+    losses and failed owned-prearm records flatten identically. That stays
+    safe here: whole-outcome losses clear the scanned modules and
+    Unavailable poisons scan_unavailable, so a lane carrying one cannot pass
+    the exact shape, tables, sources and corroboration this validator
+    demands (or the manifest-only sources that exclude scan data entirely).
+    What the bound accepts alongside fully proven claims is therefore honest
+    loss record — refused or unavailable data contributed nothing to the
+    lane's claims. Which module refused is not a capture-document property
+    by design (the public record must not name paths) and is proven by the
     workspace suite instead: the scan.rs bracket fixtures assert the
     refusing subject, and the engine.rs tests assert the refusal survives
     pinning and retention. A third skip, or any non-categorical item, is a
@@ -1636,7 +1641,7 @@ def validate_canary(lane, document, target_bits=64):
     )
     # The discovery-skip bound lives in exact_canary_discovery_skips: the
     # deterministic floor (one initial-set skip on owned lanes, none
-    # elsewhere) plus at most one retained scan refusal. exact_common pins
+    # elsewhere) plus at most one retained internal loss. exact_common pins
     # the validated count against the document.
     skips = exact_canary_discovery_skips(evidence, owned=owned_metrics)
     exact_common(

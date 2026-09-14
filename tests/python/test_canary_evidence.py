@@ -2783,24 +2783,37 @@ class OwnedMetricsOracleTests(unittest.TestCase):
                         capture.validate_canary(lane, bad, TARGET_BITS)
                     with self.assertRaises(AssertionError):
                         canary.assert_owned_aggregate_metrics(bad)
+                # A retained scan refusal publishes byte-identical to the
+                # initial-set skip, so an owned lane may carry two
+                # categorical skips: the deterministic floor plus one.
+                two = copy.deepcopy(owned)
+                two["evidence"]["skipped"] = [
+                    {"name": capture.DISCOVERY_SUBJECT,
+                     "reason": capture.DISCOVERY_UNAVAILABLE}
+                    for _ in range(2)]
+                capture.validate_canary(lane, two, TARGET_BITS)
                 for mutate in (
                     lambda d: d["evidence"].pop("child_still_running"),
                     lambda d: d["evidence"].update(child_still_running=True),
                     lambda d: d["evidence"].update(
                         pause="sigstop", pause_attempts=1, pause_confirmed=1),
-                    # The owned skip is exact in both directions: a lane that
-                    # published none left its initial-set attempt unreported,
-                    # and a second or differently-reasoned skip is a loss
-                    # nothing licensed.
+                    # The owned skip floor is exact: a lane that published
+                    # none left its initial-set attempt unreported. Above
+                    # the ceiling — a third skip, or any non-categorical
+                    # item — still fails.
                     lambda d: d["evidence"].update(skipped=[]),
                     lambda d: d["evidence"].update(skipped=[{
                         "name": capture.DISCOVERY_SUBJECT,
                         "reason": capture.TABLE_UNAVAILABLE}]),
                     lambda d: d["evidence"].update(skipped=[
                         {"name": capture.DISCOVERY_SUBJECT,
+                         "reason": capture.DISCOVERY_UNAVAILABLE}
+                        for _ in range(3)]),
+                    lambda d: d["evidence"].update(skipped=[
+                        {"name": capture.DISCOVERY_SUBJECT,
                          "reason": capture.DISCOVERY_UNAVAILABLE},
                         {"name": capture.DISCOVERY_SUBJECT,
-                         "reason": capture.DISCOVERY_UNAVAILABLE}]),
+                         "reason": capture.TABLE_UNAVAILABLE}]),
                 ):
                     bad = copy.deepcopy(owned)
                     mutate(bad)

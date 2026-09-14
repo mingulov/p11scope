@@ -546,7 +546,11 @@ GLIBC_BUILD_ID=$(create_owned --name "$GLIBC_BUILD" \
     "$DISCOVER_GLIBC_BUILD_PLATFORM_IMAGE" sh -ec '
   export CARGO_HOME=/tmp/cargo
   mkdir -p /tmp/cargo && cp /receipt/vendor/config.container.toml /tmp/cargo/config.toml
-  cargo build --locked --release -p p11scope-discover --offline --target-dir /receipt/glibc-build')
+  cargo build --locked --release -p p11scope-discover --offline --target-dir /receipt/glibc-build
+  # The build runs as container root, so its tree lands root-owned on the
+  # receipt mount. Hand it to the mount owner (the calling user) while still
+  # root, or a mode-strict receipt cannot normalize this work root.
+  chown -R "$(stat -c %u:%g /receipt)" /receipt/glibc-build')
 printf 'container_glibc_build\t%s\n' "$GLIBC_BUILD_ID" >> "$LANE14_FACTS"
 timeout --signal=TERM --kill-after=5s 600s docker start -a "$GLIBC_BUILD_ID"
 GLIBC_RUN_ID=$(create_owned --name "$GLIBC_RUN" \
@@ -594,6 +598,8 @@ MUSL_BUILD_ID=$(create_owned --name "$MUSL_BUILD" \
   mkdir -p /tmp/cargo && cp /receipt/vendor/config.container.toml /tmp/cargo/config.toml
   export RUSTFLAGS="-C target-feature=-crt-static"
   cargo build --locked --release -p p11scope-discover --offline --target-dir /receipt/musl-build
+  # Same root-ownership handover as the glibc build above.
+  chown -R "$(stat -c %u:%g /receipt)" /receipt/musl-build
   file /receipt/musl-build/release/p11scope-discover | grep -q "dynamically linked" \
       || { echo "helper is NOT dynamic"; exit 1; }
   ldd /receipt/musl-build/release/p11scope-discover

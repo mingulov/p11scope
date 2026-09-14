@@ -206,6 +206,13 @@ run_lane() {
         --reader "$TASK_STORAGE_READER" --obj "$TASK_STORAGE_OBJECT" -- "$@"
     reclaim_root_output "$WORK"/mapdump_*_"$lane".json "$WORK"/mapdump_*_"$lane".bin \
         "$WORK/$lane".*.raw "$WORK/$lane.observer.log"
+    # The stopped-canary helper runs under sudo and creates the handshake
+    # files root-owned; hand them back or a mode-strict receipt cannot take
+    # this work root.
+    for handshake in "$WORK/$lane".go "$WORK/$lane".finish; do
+        [ -e "$handshake" ] || [ -L "$handshake" ] || continue
+        reclaim_root_output "$handshake"
+    done
     if wait "$WPID"; then
         WPID=
         WORKLOAD_STARTTIME=
@@ -295,6 +302,12 @@ run_start_lane() {
         --reader "$TASK_STORAGE_READER" --obj "$TASK_STORAGE_OBJECT" -- "$@"
     reclaim_root_output "$WORK"/mapdump_*_"$start_lane".json "$WORK"/mapdump_*_"$start_lane".bin \
         "$WORK/$start_lane".*.raw "$WORK/$start_lane.observer.log"
+    # Same root-owned handshake reclaim as run_lane; START lanes publish no
+    # .finish, so a missing file is skipped, not an error.
+    for handshake in "$WORK/$start_lane".go "$WORK/$start_lane".finish; do
+        [ -e "$handshake" ] || [ -L "$handshake" ] || continue
+        reclaim_root_output "$handshake"
+    done
     if [ "$start_oracle" = --fault-starts ]; then
         assert_lanes "$start_oracle" "$WORK/mapdump_manifest_$start_lane.json" \
             "$start_workload_pid"
@@ -362,6 +375,11 @@ run_owned_lane() {
         --reader "$TASK_STORAGE_READER" --obj "$TASK_STORAGE_OBJECT" -- "$@"
     reclaim_root_output "$WORK"/mapdump_*_"$owned_lane".json "$WORK"/mapdump_*_"$owned_lane".bin \
         "$WORK/$owned_lane".*.raw "$WORK/$owned_lane.observer.log" "$WORK/$owned_lane.output"
+    # Same root-owned handshake reclaim as run_lane.
+    for handshake in "$WORK/$owned_lane".go "$WORK/$owned_lane".finish; do
+        [ -e "$handshake" ] || [ -L "$handshake" ] || continue
+        reclaim_root_output "$handshake"
+    done
     python3 -I scripts/check-capture-evidence.py canary "$owned_lane" "$WORK/$owned_lane.output" \
         "$TARGET_BITS"
 }

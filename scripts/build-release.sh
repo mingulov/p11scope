@@ -1131,7 +1131,9 @@ signal_verified_process CONT "$WPID" "$TARGET_STARTTIME"
 kill -CONT "$LPID" 2>/dev/null || true
 if wait "$LPID"; then LPID=; WPID=; TARGET_STARTTIME=; else status=$?; LPID=; WPID=; TARGET_STARTTIME=; echo "static smoke workload failed: $status"; exit "$status"; fi
 if wait "$SPID"; then SPID=; else status=$?; SPID=; echo "static smoke profiler failed: $status"; cat "$WORK/profile-static-smoke.log" || true; exit "$status"; fi
-reclaim_root_output "$WORK/observed-static-smoke.json"
+# hardened-target.pid is opened by the sudo launcher above and stays
+# root-owned; the receipt's terminal mode walk requires caller ownership.
+reclaim_root_output "$WORK/observed-static-smoke.json" "$WORK/hardened-target.pid"
 
 # Framed checker record (csf_19fb2f): exact argv, the checker's own captured
 # stdout/stderr, and a terminal status line. The frame keeps the record

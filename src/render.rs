@@ -769,171 +769,92 @@ pub fn live(
         ev.skipped.len(),
         ev.in_flight_at_end,
     );
-    let discovery_gaps = ev.discovery.conflicts
-        + ev.discovery.uncorroborated
-        + ev.discovery.module_ambiguous
-        + ev.discovery.modules_skipped.len() as u64;
-    if surface_gaps > 0
-        || discovery_gaps > 0
-        || ev.discovery.modules.is_empty()
-        || ev.discovery.scan_unavailable.is_some()
-        || ev.vendor_interfaces > 0
-        || ev.event_loss > 0
-        || ev.start_insert_failures > 0
-        || ev.unmatched_returns > 0
-        || ev.rv_update_failures > 0
-        || ev.cgroup_scope_failures > 0
-        || ev.semantic_capture_failures > 0
-        || ev.unregistered_mechanisms > 0
-        || ev.template_tail_failures > 0
-        || ev.semantic_unverified_slots > 0
-        || state_gaps > 0
-        || ev.malformed_records > 0
-        || ev.templates_truncated
-        || ev.shape_decode_total_failures > 0
-        || ev.provider_changed
-    {
-        evidence_line.push_str(" ·");
-        // Discovery first: it explains a PARTIAL verdict that has no attach
-        // failure and no skip behind it at all.
-        if ev.discovery.modules.is_empty() {
-            evidence_line.push_str(" no modules discovered");
-        }
-        if let Some(reason) = &ev.discovery.scan_unavailable {
-            evidence_line.push_str(&format!(" scan unavailable ({reason})"));
-        }
-        if ev.discovery.conflicts > 0 {
-            evidence_line.push_str(&format!(" {} discovery conflicts", ev.discovery.conflicts));
-        }
-        if ev.discovery.uncorroborated > 0 {
-            evidence_line.push_str(&format!(
-                " {} uncorroborated modules",
-                ev.discovery.uncorroborated
-            ));
-        }
-        if ev.discovery.module_ambiguous > 0 {
-            evidence_line.push_str(&format!(
-                " {} module-ambiguous slots",
-                ev.discovery.module_ambiguous
-            ));
-        }
-        if !ev.discovery.modules_skipped.is_empty() {
-            evidence_line.push_str(&format!(
-                " {} modules refused",
-                ev.discovery.modules_skipped.len()
-            ));
-        }
-        if surface_gaps > 0 {
-            evidence_line.push_str(&format!(" {surface_gaps} surface gaps"));
-        }
-        if ev.vendor_interfaces > 0 {
-            evidence_line.push_str(&format!(" {} vendor interfaces", ev.vendor_interfaces));
-        }
-        if ev.event_loss > 0 {
-            evidence_line.push_str(&format!(" {} events lost", ev.event_loss));
-        }
-        if ev.start_insert_failures > 0 {
-            evidence_line.push_str(&format!(
-                " {} start inserts failed",
-                ev.start_insert_failures
-            ));
-        }
-        if ev.unmatched_returns > 0 {
-            evidence_line.push_str(&format!(" {} unmatched returns", ev.unmatched_returns));
-        }
-        if ev.rv_update_failures > 0 {
-            evidence_line.push_str(&format!(" {} RV updates failed", ev.rv_update_failures));
-        }
-        if ev.cgroup_scope_failures > 0 {
-            evidence_line.push_str(&format!(
-                " {} cgroup checks failed",
-                ev.cgroup_scope_failures
-            ));
-        }
-        if ev.semantic_capture_failures > 0 {
-            evidence_line.push_str(&format!(
-                " {} semantic captures failed",
-                ev.semantic_capture_failures
-            ));
-        }
-        if ev.unregistered_mechanisms > 0 {
-            evidence_line.push_str(&format!(
-                " {} unregistered mechanisms",
-                ev.unregistered_mechanisms
-            ));
-        }
-        if ev.template_tail_failures > 0 {
-            evidence_line.push_str(&format!(
-                " {} template tail calls failed",
-                ev.template_tail_failures
-            ));
-        }
-        if ev.semantic_unverified_slots > 0 {
-            evidence_line.push_str(&format!(
-                " {} semantics-unverified/count-only slot{}",
-                ev.semantic_unverified_slots,
-                if ev.semantic_unverified_slots == 1 {
-                    ""
-                } else {
-                    "s"
-                }
-            ));
-        }
-        if state_gaps > 0 {
-            evidence_line.push_str(&format!(" {state_gaps} semantic state gaps"));
-        }
-        if ev.malformed_records > 0 {
-            evidence_line.push_str(&format!(" {} malformed records", ev.malformed_records));
-        }
-        if ev.templates_truncated {
-            evidence_line.push_str(" templates truncated");
-        }
-        if ev.shape_decode_total_failures > 0 {
-            evidence_line.push_str(&format!(
-                " {n} mechanisms never decoded",
-                n = ev.shape_decode_total_failures
-            ));
-        }
-        if ev.provider_changed {
-            evidence_line.push_str(" provider changed");
+    // Gap fragments in render order — discovery first, since it explains a
+    // PARTIAL verdict that has no attach failure and no skip behind it. The
+    // gate derives from these same fragments, so a new gap cannot be added
+    // without surfacing.
+    let mut gap_fragments: Vec<String> = Vec::new();
+    if ev.discovery.modules.is_empty() {
+        gap_fragments.push("no modules discovered".to_string());
+    }
+    if let Some(reason) = &ev.discovery.scan_unavailable {
+        gap_fragments.push(format!("scan unavailable ({reason})"));
+    }
+    for (label, count) in [
+        ("discovery conflicts", ev.discovery.conflicts),
+        ("uncorroborated modules", ev.discovery.uncorroborated),
+        ("module-ambiguous slots", ev.discovery.module_ambiguous),
+        ("modules refused", ev.discovery.modules_skipped.len() as u64),
+        ("surface gaps", surface_gaps as u64),
+        ("vendor interfaces", ev.vendor_interfaces as u64),
+        ("events lost", ev.event_loss),
+        ("start inserts failed", ev.start_insert_failures),
+        ("unmatched returns", ev.unmatched_returns),
+        ("RV updates failed", ev.rv_update_failures),
+        ("cgroup checks failed", ev.cgroup_scope_failures),
+        ("semantic captures failed", ev.semantic_capture_failures),
+        ("unregistered mechanisms", ev.unregistered_mechanisms),
+        ("template tail calls failed", ev.template_tail_failures),
+    ] {
+        if count > 0 {
+            gap_fragments.push(format!("{count} {label}"));
         }
     }
-    if ev.orphan_ops > 0
-        || ev.unmatched_closes > 0
-        || ev.shape_decode_failures > 0
-        || ev.process_tracking_fallbacks > 0
-    {
+    if ev.semantic_unverified_slots > 0 {
+        gap_fragments.push(format!(
+            "{} semantics-unverified/count-only slot{}",
+            ev.semantic_unverified_slots,
+            if ev.semantic_unverified_slots == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ));
+    }
+    for (label, count) in [
+        ("semantic state gaps", state_gaps),
+        ("malformed records", ev.malformed_records),
+    ] {
+        if count > 0 {
+            gap_fragments.push(format!("{count} {label}"));
+        }
+    }
+    if ev.templates_truncated {
+        gap_fragments.push("templates truncated".to_string());
+    }
+    if ev.shape_decode_total_failures > 0 {
+        gap_fragments.push(format!(
+            "{} mechanisms never decoded",
+            ev.shape_decode_total_failures
+        ));
+    }
+    if ev.provider_changed {
+        gap_fragments.push("provider changed".to_string());
+    }
+    if !gap_fragments.is_empty() {
+        evidence_line.push_str(" ·");
+        for fragment in &gap_fragments {
+            evidence_line.push(' ');
+            evidence_line.push_str(fragment);
+        }
+    }
+    let mut info_fragments: Vec<String> = Vec::new();
+    for (label, count) in [
+        ("orphan ops", ev.orphan_ops),
+        ("unmatched closes", ev.unmatched_closes),
+        ("shape decode gaps", ev.shape_decode_failures),
+        (
+            "process trackers using /proc",
+            ev.process_tracking_fallbacks,
+        ),
+    ] {
+        if count > 0 {
+            info_fragments.push(format!("ℹ {count} {label}"));
+        }
+    }
+    if !info_fragments.is_empty() {
         evidence_line.push_str(" · ");
-        if ev.orphan_ops > 0 {
-            evidence_line.push_str(&format!(
-                "ℹ {orphan_ops} orphan ops",
-                orphan_ops = ev.orphan_ops
-            ));
-        }
-        if ev.unmatched_closes > 0 {
-            if ev.orphan_ops > 0 {
-                evidence_line.push(' ');
-            }
-            evidence_line.push_str(&format!(
-                "ℹ {unmatched} unmatched closes",
-                unmatched = ev.unmatched_closes
-            ));
-        }
-        if ev.shape_decode_failures > 0 {
-            if ev.orphan_ops > 0 || ev.unmatched_closes > 0 {
-                evidence_line.push(' ');
-            }
-            evidence_line.push_str(&format!(
-                "ℹ {n} shape decode gaps",
-                n = ev.shape_decode_failures
-            ));
-        }
-        if ev.process_tracking_fallbacks > 0 {
-            evidence_line.push_str(&format!(
-                " ℹ {} process trackers using /proc",
-                ev.process_tracking_fallbacks
-            ));
-        }
+        evidence_line.push_str(&info_fragments.join(" "));
     }
     evidence_line.push_str(&format!(" → {}\n", ev.completeness));
     s.push_str(&evidence_line);
@@ -1063,6 +984,8 @@ pub fn json(reports: &[SlotReport], ev: &Evidence, capture: &CaptureMeta<'_>) ->
         "capture": { "start": capture.started, "end": capture.ended, "mode": "metrics",
                      "privacy_mode": capture.policy.privacy_mode(),
                      "kernel": capture.kernel,
+                     "ring_bytes": capture.ring_bytes,
+                     "drain_interval_ms": capture.drain_interval_ms,
                      "modules": capture_modules(ev) },
         "evidence": ev,
         "functions": functions_out(reports, &ev.discovery.modules),
@@ -1327,6 +1250,10 @@ pub struct CaptureMeta<'a> {
     pub ended: &'a str,
     pub kernel: &'a str,
     pub policy: CapturePolicy,
+    /// Effective EVENTS ringbuf size in bytes (`--ring-bytes` or default).
+    pub ring_bytes: u32,
+    /// Effective capture-loop tick in ms (`--drain-interval-ms` or default).
+    pub drain_interval_ms: u64,
 }
 
 /// The v2 `observed-profile.json` document. `functions` comes from the
@@ -1426,6 +1353,8 @@ pub fn profile_json(
             "start": capture.started, "end": capture.ended, "mode": "profile",
             "privacy_mode": capture.policy.privacy_mode(),
             "kernel": capture.kernel,
+            "ring_bytes": capture.ring_bytes,
+            "drain_interval_ms": capture.drain_interval_ms,
             "modules": capture_modules(ev),
         },
         "evidence": versioned_evidence(ev),
@@ -1453,6 +1382,9 @@ pub fn profile_json(
 mod tests {
     use super::*;
     use p11scope_ebpf_common::{LATENCY_BUCKETS, shape};
+
+    /// One evidence mutation for the table-driven gate pins below.
+    type EvidenceMutation = fn(&mut Evidence);
 
     /// Task 11 fix round 2 (csf_b8067e3 sibling): the C1 range — the raw 8-bit
     /// CSI U+009B above all — is escaped exactly like C0 and DEL, and legitimate
@@ -1983,6 +1915,8 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: CapturePolicy::Allowlisted,
+            ring_bytes: p11scope_ebpf_common::RING_BYTES,
+            drain_interval_ms: 1000,
         }
     }
 
@@ -2211,7 +2145,10 @@ mod tests {
             events
                 .iter()
                 .fold(std::collections::BTreeMap::new(), |mut counts, event| {
-                    *counts.entry(event.rv).or_insert(0) += 1;
+                    counts
+                        .entry(event.rv)
+                        .and_modify(|count: &mut u64| *count = count.saturating_add(1))
+                        .or_insert(1);
                     counts
                 });
         assert_eq!(report.rv_counts, observed_rvs);
@@ -2774,6 +2711,184 @@ mod tests {
     }
 
     #[test]
+    fn live_view_gap_fragments_render_in_discovery_first_order() {
+        // MED: the gap block is table-driven; discovery stays first by
+        // documented intent, so pin the relative order, not exact bytes.
+        let mut ev = evidence();
+        ev.discovery.conflicts = 1;
+        ev.event_loss = 2;
+        ev.malformed_records = 3;
+        ev.provider_changed = true;
+        ev.verdict();
+        let out = live(
+            &[],
+            &ev,
+            Duration::ZERO,
+            "/x.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+        );
+        let positions = [
+            out.find("1 discovery conflicts").unwrap(),
+            out.find("2 events lost").unwrap(),
+            out.find("3 malformed records").unwrap(),
+            out.find("provider changed").unwrap(),
+        ];
+        assert!(
+            positions.windows(2).all(|w| w[0] < w[1]),
+            "gap fragments out of order: {out}"
+        );
+    }
+
+    #[test]
+    fn live_view_lone_fallback_fragment_is_single_spaced() {
+        // MED: the fallbacks fragment unconditionally prefixed a space, so a
+        // lone "process trackers" line rendered "·  ℹ" (double space). The
+        // table joins fragments uniformly; pin the single space.
+        let mut ev = evidence();
+        ev.process_tracking_fallbacks = 1;
+        ev.verdict();
+        let out = live(
+            &[],
+            &ev,
+            Duration::ZERO,
+            "/x.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+        );
+        assert!(
+            out.contains("· ℹ 1 process trackers using /proc"),
+            "lone fallback fragment must be single-spaced: {out}"
+        );
+    }
+
+    #[test]
+    fn every_gap_counter_opens_the_evidence_gate_alone() {
+        // MED: the gate used to re-list every gap condition by hand, so a new
+        // fragment without a gate term rendered nothing. The table derives
+        // the gate from the same fragments; each counter alone must surface.
+        let gap_cases: [(&str, EvidenceMutation); 22] = [
+            ("1 discovery conflicts", |e| e.discovery.conflicts = 1),
+            ("1 uncorroborated modules", |e| {
+                e.discovery.uncorroborated = 1;
+            }),
+            ("1 module-ambiguous slots", |e| {
+                e.discovery.module_ambiguous = 1;
+            }),
+            ("1 modules refused", |e| {
+                e.discovery.modules_skipped.push(SkippedOut {
+                    name: "/opt/x.so".into(),
+                    reason: "capacity".into(),
+                });
+            }),
+            ("1 surface gaps", |e| {
+                e.surfaces[0].walk = "known_prefix".into();
+            }),
+            ("1 vendor interfaces", |e| e.vendor_interfaces = 1),
+            ("1 events lost", |e| e.event_loss = 1),
+            ("1 start inserts failed", |e| e.start_insert_failures = 1),
+            ("1 unmatched returns", |e| e.unmatched_returns = 1),
+            ("1 RV updates failed", |e| e.rv_update_failures = 1),
+            ("1 cgroup checks failed", |e| e.cgroup_scope_failures = 1),
+            ("1 semantic captures failed", |e| {
+                e.semantic_capture_failures = 1;
+            }),
+            ("1 unregistered mechanisms", |e| {
+                e.unregistered_mechanisms = 1;
+            }),
+            ("1 template tail calls failed", |e| {
+                e.template_tail_failures = 1;
+            }),
+            ("1 semantics-unverified/count-only slot", |e| {
+                e.semantic_unverified_slots = 1;
+            }),
+            ("2 semantics-unverified/count-only slots", |e| {
+                e.semantic_unverified_slots = 2;
+            }),
+            ("1 malformed records", |e| e.malformed_records = 1),
+            ("templates truncated", |e| e.templates_truncated = true),
+            ("1 mechanisms never decoded", |e| {
+                e.shape_decode_total_failures = 1;
+            }),
+            ("provider changed", |e| e.provider_changed = true),
+            ("no modules discovered", |e| e.discovery.modules.clear()),
+            ("scan unavailable (ptrace)", |e| {
+                e.discovery.scan_unavailable = Some("ptrace".into());
+            }),
+        ];
+        // Every state_gaps summand must feed the aggregate, not just open it.
+        let state_cases: [EvidenceMutation; 14] = [
+            |e| e.process_tracking_failures = 1,
+            |e| e.process_tracking_evictions = 1,
+            |e| e.state_reconciliations = 1,
+            |e| e.session_cancel_ambiguities = 1,
+            |e| e.session_cancel_unknown_flags = 1,
+            |e| e.operation_state_imports = 1,
+            |e| e.auth_state_ambiguities = 1,
+            |e| e.async_target_failures = 1,
+            |e| e.async_orphans = 1,
+            |e| e.async_duplicates = 1,
+            |e| e.async_evictions = 1,
+            |e| e.fork_state_ambiguities = 1,
+            |e| e.semantic_state_drops = 1,
+            |e| e.pending_at_end = 1,
+        ];
+        let info_cases: [(&str, EvidenceMutation); 4] = [
+            ("ℹ 1 orphan ops", |e| e.orphan_ops = 1),
+            ("ℹ 1 unmatched closes", |e| e.unmatched_closes = 1),
+            ("ℹ 1 shape decode gaps", |e| e.shape_decode_failures = 1),
+            ("ℹ 1 process trackers using /proc", |e| {
+                e.process_tracking_fallbacks = 1;
+            }),
+        ];
+        for (fragment, mutate) in gap_cases {
+            let mut ev = evidence();
+            mutate(&mut ev);
+            ev.verdict();
+            let out = live(
+                &[],
+                &ev,
+                Duration::ZERO,
+                "/x.so",
+                "profile",
+                CapturePolicy::Allowlisted,
+            );
+            assert!(out.contains(fragment), "missing {fragment:?}: {out}");
+        }
+        for mutate in state_cases {
+            let mut ev = evidence();
+            mutate(&mut ev);
+            ev.verdict();
+            let out = live(
+                &[],
+                &ev,
+                Duration::ZERO,
+                "/x.so",
+                "profile",
+                CapturePolicy::Allowlisted,
+            );
+            assert!(
+                out.contains("1 semantic state gaps"),
+                "state summand lost from the aggregate: {out}"
+            );
+        }
+        for (fragment, mutate) in info_cases {
+            let mut ev = evidence();
+            mutate(&mut ev);
+            ev.verdict();
+            let out = live(
+                &[],
+                &ev,
+                Duration::ZERO,
+                "/x.so",
+                "profile",
+                CapturePolicy::Allowlisted,
+            );
+            assert!(out.contains(fragment), "missing {fragment:?}: {out}");
+        }
+    }
+
+    #[test]
     fn json_marks_latency_approximate_and_hex_rvs() {
         let mut ev = evidence();
         ev.verdict();
@@ -2784,6 +2899,8 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: crate::attach::CapturePolicy::AggregateOnly,
+            ring_bytes: p11scope_ebpf_common::RING_BYTES,
+            drain_interval_ms: 1000,
         };
         let v = json(&[r], &ev, &capture);
         assert_eq!(v["schema"], "pkcs11-scope/observed-profile/v3-metrics");
@@ -2846,12 +2963,7 @@ mod tests {
             &empty_plan(),
             crate::attach::CapturePolicy::Allowlisted,
         );
-        let capture = CaptureMeta {
-            started: "t0",
-            ended: "t1",
-            kernel: "6.8.0",
-            policy: crate::attach::CapturePolicy::Allowlisted,
-        };
+        let capture = capture_fixture();
         let v = profile_json(&[], &ev, &state, &capture);
 
         assert_eq!(v["schema"], "pkcs11-scope/observed-profile/v3");
@@ -2885,6 +2997,44 @@ mod tests {
     }
 
     #[test]
+    fn profile_json_capture_discloses_ring_bytes_and_drain_interval() {
+        let mut ev = evidence();
+        ev.verdict();
+        let state = crate::semantics::State::with_policy(
+            &empty_plan(),
+            crate::attach::CapturePolicy::Allowlisted,
+        );
+        let capture = CaptureMeta {
+            started: "t0",
+            ended: "t1",
+            kernel: "6.8.0",
+            policy: crate::attach::CapturePolicy::Allowlisted,
+            ring_bytes: 4096,
+            drain_interval_ms: 1000,
+        };
+        let v = profile_json(&[], &ev, &state, &capture);
+        assert_eq!(v["capture"]["ring_bytes"], 4096);
+        assert_eq!(v["capture"]["drain_interval_ms"], 1000);
+    }
+
+    #[test]
+    fn metrics_json_capture_discloses_ring_bytes_and_drain_interval() {
+        let mut ev = evidence();
+        ev.verdict();
+        let capture = CaptureMeta {
+            started: "t0",
+            ended: "t1",
+            kernel: "6.8.0",
+            policy: crate::attach::CapturePolicy::AggregateOnly,
+            ring_bytes: 262_144,
+            drain_interval_ms: 200,
+        };
+        let v = json(&[], &ev, &capture);
+        assert_eq!(v["capture"]["ring_bytes"], 262_144);
+        assert_eq!(v["capture"]["drain_interval_ms"], 200);
+    }
+
+    #[test]
     fn policy_output_safe_params_are_disabled_and_maximum_id_renders() {
         let mut state = crate::semantics::State::with_policy(
             &init_plan(),
@@ -2900,12 +3050,7 @@ mod tests {
 
         let mut ev = evidence();
         ev.verdict();
-        let capture = CaptureMeta {
-            started: "t0",
-            ended: "t1",
-            kernel: "6.8.0",
-            policy: crate::attach::CapturePolicy::Allowlisted,
-        };
+        let capture = capture_fixture();
         let value = profile_json(&[], &ev, &state, &capture);
 
         assert_eq!(value["mechanisms"][0]["mechanism"], u64::MAX);
@@ -2969,12 +3114,7 @@ mod tests {
 
         let mut ev = evidence();
         ev.verdict();
-        let capture = CaptureMeta {
-            started: "t0",
-            ended: "t1",
-            kernel: "6.8.0",
-            policy: CapturePolicy::Allowlisted,
-        };
+        let capture = capture_fixture();
         let v = profile_json(&[], &ev, &state, &capture);
 
         let mech = &v["mechanisms"][0];
@@ -3059,6 +3199,8 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: CapturePolicy::UnsafeUnvalidatedMetadata,
+            ring_bytes: p11scope_ebpf_common::RING_BYTES,
+            drain_interval_ms: 1000,
         };
         let v = profile_json(&[], &ev, &state, &capture);
 
@@ -3097,6 +3239,8 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: CapturePolicy::UnsafeUnvalidatedMetadata,
+            ring_bytes: p11scope_ebpf_common::RING_BYTES,
+            drain_interval_ms: 1000,
         };
         let v = profile_json(&[], &ev, &state, &capture);
 
@@ -3142,6 +3286,8 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: CapturePolicy::UnsafeUnvalidatedMetadata,
+            ring_bytes: p11scope_ebpf_common::RING_BYTES,
+            drain_interval_ms: 1000,
         };
         let v = profile_json(&[], &ev, &state, &capture);
 
@@ -3168,6 +3314,8 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: CapturePolicy::UnsafeUnvalidatedMetadata,
+            ring_bytes: p11scope_ebpf_common::RING_BYTES,
+            drain_interval_ms: 1000,
         };
         let v = profile_json(&[], &ev, &state, &capture);
 
@@ -3203,6 +3351,8 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: CapturePolicy::UnsafeUnvalidatedMetadata,
+            ring_bytes: p11scope_ebpf_common::RING_BYTES,
+            drain_interval_ms: 1000,
         };
         let v = profile_json(&[], &ev, &state, &capture);
         assert_eq!(v["mechanisms"][0]["params"], serde_json::Value::Null);
@@ -3244,6 +3394,8 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: CapturePolicy::UnsafeUnvalidatedMetadata,
+            ring_bytes: p11scope_ebpf_common::RING_BYTES,
+            drain_interval_ms: 1000,
         };
         let v = profile_json(&[], &ev, &state, &capture);
         assert_eq!(v["mechanisms"][0]["params"], serde_json::Value::Null);
@@ -3330,6 +3482,8 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: CapturePolicy::UnsafeUnvalidatedMetadata,
+            ring_bytes: p11scope_ebpf_common::RING_BYTES,
+            drain_interval_ms: 1000,
         };
         let v = profile_json(&[], &ev, &state, &capture);
 
@@ -3395,6 +3549,8 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: CapturePolicy::UnsafeUnvalidatedMetadata,
+            ring_bytes: p11scope_ebpf_common::RING_BYTES,
+            drain_interval_ms: 1000,
         };
         let v = profile_json(&[], &ev, &state, &capture);
         assert_eq!(v["templates"]["operations"][0]["truncated"], true);
@@ -3418,12 +3574,7 @@ mod tests {
 
         let mut ev = evidence();
         ev.verdict();
-        let capture = CaptureMeta {
-            started: "t0",
-            ended: "t1",
-            kernel: "6.8.0",
-            policy: CapturePolicy::Allowlisted,
-        };
+        let capture = capture_fixture();
         let v = profile_json(&[], &ev, &state, &capture);
 
         let cgroups = v["cgroups"].as_array().unwrap();

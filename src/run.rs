@@ -734,6 +734,9 @@ impl OwnedChild {
             return self.wait_blocking();
         }
         self.ensure_active_generation()?;
+        // Same resume-first as the signal path: a stopped child cannot
+        // observe SIGTERM and would burn the grace window into SIGKILL.
+        self.resume_if_stopped();
         signal_group(self.pid, libc::SIGTERM)?;
         if self.pin.wait_ready(Some(grace))? {
             return self.wait_blocking();
@@ -768,6 +771,14 @@ impl OwnedChild {
 
     pub(crate) fn still_running(&self) -> bool {
         !self.reaped && self.pin.still_the_same()
+    }
+
+    /// SIGCONT the owned child through its pidfd, best effort. A child
+    /// held in T cannot observe SIGTERM/SIGINT, so every graceful settle
+    /// path resumes first; on a running child this is a no-op, and on an
+    /// exited child the error is ignored.
+    fn resume_if_stopped(&self) {
+        let _ = self.pin.send_signal(libc::SIGCONT);
     }
 
     pub(crate) fn is_reaped(&self) -> bool {
@@ -1064,7 +1075,7 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
     // Before the attach: a bad `-o` path must fail before any probe is on.
     let out = OutputSink::open(kind, a.out.as_deref())?;
     let mut session = engine
-        .start_session(policy)
+        .start_session(policy, a.ring_bytes)
         .context("starting attach session")?;
     run_loop(
         &mut engine,
@@ -1077,6 +1088,8 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
         out,
         &stop,
         None,
+        a.drain_interval,
+        a.ring_bytes,
     )?;
     // `--pid` cannot read a non-child's exit status, so the honest report is
     // the pairing of two facts we do have: the target went away, and this
@@ -1146,8 +1159,11 @@ fn run_loop(
     out: OutputSink,
     interrupted: &SignalState,
     owned: Option<&mut Owned>,
+    drain_interval: Option<Duration>,
+    ring_bytes: Option<u32>,
 ) -> Result<render::Evidence> {
     report_attach_failures(session);
+    let drain = resolve_drain_cadence(kind, drain_interval);
     match kind {
         Kind::Profile => {
             let out = match out {
@@ -1163,6 +1179,8 @@ fn run_loop(
                 out,
                 interrupted,
                 owned,
+                drain,
+                ring_bytes,
             )
         }
         Kind::Trace => {
@@ -1180,6 +1198,7 @@ fn run_loop(
                 out,
                 interrupted,
                 owned,
+                drain,
             )
         }
     }
@@ -1340,9 +1359,24 @@ fn settle_after_signal_with_grace(
     let signal = signals
         .first_signal()
         .ok_or_else(|| anyhow!("run: signal settlement lost the first signal identity"))?;
-    child
-        .forward_signal(signal)
-        .map_err(|error| anyhow!("run: forwarding signal {signal}: {error}"))?;
+    // A child held in T (pause, or anything else) cannot observe the
+    // forwarded signal; resume it first so SIGTERM can land instead of
+    // pending through both grace windows into SIGKILL. Best effort and a
+    // no-op on a running child.
+    child.resume_if_stopped();
+    if let Err(error) = child.forward_signal(signal) {
+        // A child can exit before the first forwarded signal lands: its pin
+        // then reads "no longer active" even though the exit is clean and
+        // still reaped here. Settle the natural exit like the fallback-T
+        // path below instead of failing the run (and the final JSON).
+        if let ChildOutcome::Exited(code) = child
+            .wait_for(Some(Duration::ZERO), false)
+            .map_err(|reap| anyhow!("run: waiting after signal: {reap}"))?
+        {
+            return Ok(ChildOutcome::Exited(code));
+        }
+        return Err(anyhow!("run: forwarding signal {signal}: {error}"));
+    }
     let mut deadline = Instant::now() + grace;
     let mut second_sigint_forwarded = false;
     let mut fallback_term_forwarded = false;
@@ -1412,10 +1446,14 @@ fn abort_pending_handoff(pending: &mut Option<OwnedChild>) -> Result<()> {
         .map_err(|error| anyhow!("run: aborting pending handoff: {error}"))
 }
 
+fn also_failed(primary: anyhow::Error, secondary: anyhow::Error, what: &str) -> anyhow::Error {
+    primary.context(format!("{what} also failed: {secondary:#}"))
+}
+
 fn combine_handoff_failure(primary: anyhow::Error, abort: Result<()>) -> anyhow::Error {
     match abort {
         Ok(()) => primary,
-        Err(abort) => primary.context(format!("aborting pending handoff also failed: {abort:#}")),
+        Err(abort) => also_failed(primary, abort, "aborting pending handoff"),
     }
 }
 
@@ -1424,7 +1462,7 @@ fn combine_finish_errors(cleanup: Result<()>, settled: Result<()>) -> Result<()>
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
         (Err(cleanup), Err(settled)) => {
-            Err(cleanup.context(format!("owned child settlement also failed: {settled:#}")))
+            Err(also_failed(cleanup, settled, "owned child settlement"))
         }
     }
 }
@@ -1435,12 +1473,10 @@ fn combine_capture_failure(
     detach: Result<()>,
 ) -> anyhow::Error {
     if let Err(error) = finish {
-        capture = capture.context(format!("owned cleanup/settlement also failed: {error:#}"));
+        capture = also_failed(capture, error, "owned cleanup/settlement");
     }
     if let Err(error) = detach {
-        capture = capture.context(format!(
-            "detaching capture producers also failed: {error:#}"
-        ));
+        capture = also_failed(capture, error, "detaching capture producers");
     }
     capture
 }
@@ -1449,9 +1485,9 @@ fn combine_detach<T>(terminal: Result<T>, detach: Result<()>) -> Result<T> {
     match (terminal, detach) {
         (result, Ok(())) => result,
         (Ok(_), Err(detach)) => Err(anyhow!("run: detaching capture producers: {detach:#}")),
-        (Err(terminal), Err(detach)) => Err(terminal.context(format!(
-            "detaching capture producers also failed: {detach:#}"
-        ))),
+        (Err(terminal), Err(detach)) => {
+            Err(also_failed(terminal, detach, "detaching capture producers"))
+        }
     }
 }
 
@@ -1507,19 +1543,40 @@ fn cancelled_by(interrupted: &SignalState) -> impl Fn() -> std::result::Result<b
 /// applies the pause policy, runs live discovery and the capture loop, and
 /// writes the final artifact.
 pub fn run_owned(args: &RunArgs) -> Result<OwnedRunOutcome> {
-    let outcome = run_owned_inner(args);
+    let stop = install_stop_flag()?;
+    let outcome = run_owned_inner(args, stop.clone());
     match (args.pause, outcome) {
         // `always` never falls back to a successful unpaused run: whatever
         // could not be completed, the refusal says pause was required.
-        (cli::PausePolicy::Always, Err(error)) => Err(error.context(
-            "run --pause always: required pause protection could not be completed, so the run \
-             refused rather than capturing unpaused",
-        )),
+        (cli::PausePolicy::Always, Err(error)) => Err(always_wrap(&stop, error)),
         (_, outcome) => outcome,
     }
 }
 
-fn run_owned_inner(args: &RunArgs) -> Result<OwnedRunOutcome> {
+/// Names the `always` failure for what it was: a signalled run was
+/// interrupted mid-capture, only an unsignalled one refused.
+fn always_wrap(interrupted: &SignalState, error: anyhow::Error) -> anyhow::Error {
+    if let Some(signal) = interrupted.first_signal() {
+        return error.context(format!(
+            "run --pause always: interrupted by {} while pause protection was active",
+            stop_signal_name(signal)
+        ));
+    }
+    error.context(
+        "run --pause always: required pause protection could not be completed, so the run \
+         refused rather than capturing unpaused",
+    )
+}
+
+fn stop_signal_name(signal: libc::c_int) -> String {
+    match signal {
+        libc::SIGINT => "SIGINT".to_string(),
+        libc::SIGTERM => "SIGTERM".to_string(),
+        other => format!("signal {other}"),
+    }
+}
+
+fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOutcome> {
     let policy = capture_policy(args.kind, args.metrics, args.unsafe_requested)?;
     warn_unsafe_policy(policy);
     let mut command = args.command.iter().map(OsString::from);
@@ -1548,13 +1605,16 @@ fn run_owned_inner(args: &RunArgs) -> Result<OwnedRunOutcome> {
         duration: args.duration,
         out: args.out.clone(),
         max_events: args.max_events,
+        ring_bytes: args.ring_bytes,
+        drain_interval: args.drain_interval,
         unsafe_requested: args.unsafe_requested,
         allow_confined_uretprobe: args.allow_confined_uretprobe,
     };
     // Initial capture still uses the one `discover_plan` pass and keeps its
     // accepted state inside `Engine`; nothing below rescans or reopens.
     let mut engine = Engine::discover(&capture_args, &scope, Some(view))?;
-    let stop = install_stop_flag()?;
+    // The stop flag arrives from `run_owned`, which keeps its own clone so a
+    // signalled `always` failure can be named an interruption, not a refusal.
     // Before the attach, and before the child crosses its barrier: a bad `-o`
     // path must never cost a released child or a loaded session.
     let out = OutputSink::open(args.kind, args.out.as_deref())?;
@@ -1563,7 +1623,7 @@ fn run_owned_inner(args: &RunArgs) -> Result<OwnedRunOutcome> {
     // barrier when exact PT_INTERP binding is safe, and otherwise leaves
     // `initial_set_capture = none` with sticky `PARTIAL`.
     let mut session = engine
-        .start_owned_session(policy, &mut child)
+        .start_owned_session(policy, &mut child, args.ring_bytes)
         .context("starting attach session")?;
 
     let mut owned = {
@@ -1635,6 +1695,8 @@ fn run_owned_inner(args: &RunArgs) -> Result<OwnedRunOutcome> {
         out,
         &stop,
         Some(&mut owned),
+        args.drain_interval,
+        args.ring_bytes,
     )
     .map_err(|error| {
         combine_handoff_failure(error, abort_pending_handoff(&mut owned.pending_handoff))
@@ -1976,6 +2038,17 @@ fn resolve_trace_max_events(max_events: Option<u64>) -> u64 {
     max_events.unwrap_or(DEFAULT_TRACE_MAX_EVENTS)
 }
 
+fn resolve_drain_cadence(kind: Kind, drain_interval: Option<Duration>) -> Duration {
+    drain_interval.unwrap_or(match kind {
+        Kind::Profile => PROFILE_CADENCE,
+        Kind::Trace => TRACE_CADENCE,
+    })
+}
+
+pub(crate) fn resolve_ring_bytes(ring_bytes: Option<u32>) -> u32 {
+    ring_bytes.unwrap_or(p11scope_ebpf_common::RING_BYTES)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn capture_profile(
     engine: &mut Engine,
@@ -1986,6 +2059,8 @@ fn capture_profile(
     output: Option<AtomicFile>,
     interrupted: &SignalState,
     mut owned: Option<&mut Owned>,
+    drain: Duration,
+    ring_bytes: Option<u32>,
 ) -> Result<render::Evidence> {
     // Opened by the caller before the attach; published by `commit()` only
     // once the final report is written.
@@ -2029,7 +2104,7 @@ fn capture_profile(
     let mut stdout_open = true;
     let wall_start = SystemTime::now();
     let clock = Instant::now();
-    let mut last_frame = Instant::now() - PROFILE_CADENCE;
+    let mut last_frame = Instant::now() - drain;
     #[rustfmt::skip]
     let loop_result = (|| -> Result<CaptureEnd> {
     loop {
@@ -2064,12 +2139,9 @@ fn capture_profile(
         }
         let reports = metrics::read(session, engine.plan())?;
         // 6. Check the retained generations and objects.
-        engine
-            .pinned()
-            .check_unchanged()
-            .map_err(anyhow::Error::msg)?;
+        engine.check_pinned_unchanged()?;
 
-        if last_frame.elapsed() >= PROFILE_CADENCE {
+        if last_frame.elapsed() >= drain {
             last_frame = Instant::now();
             let ev = evidence_for(
                 engine,
@@ -2105,7 +2177,7 @@ fn capture_profile(
                 break Ok(CaptureEnd::Error);
             }
         }
-        tick_sleep(paused, PROFILE_CADENCE);
+        tick_sleep(paused, drain);
     }
     })();
     finish_capture_loop(
@@ -2144,10 +2216,7 @@ fn capture_profile(
     }
     // Last look before the evidence that the final frame and the `-o` report
     // are built from, so an in-place provider change is reflected in both.
-    engine
-        .pinned()
-        .check_unchanged()
-        .map_err(anyhow::Error::msg)?;
+    engine.check_pinned_unchanged()?;
     // A terminal-drain retry the capture proved is not a loss: judged here,
     // at capture end, before the document that would carry the announcement.
     engine.settle_terminal_drain();
@@ -2199,6 +2268,8 @@ fn capture_profile(
             ended: &ended,
             kernel: &kernel,
             policy,
+            ring_bytes: resolve_ring_bytes(ring_bytes),
+            drain_interval_ms: drain.as_millis() as u64,
         };
         let j = if profile {
             render::profile_json(&reports, &ev, &state, &capture)
@@ -2243,6 +2314,7 @@ fn capture_trace(
     out: Option<std::fs::File>,
     interrupted: &SignalState,
     mut owned: Option<&mut Owned>,
+    drain: Duration,
 ) -> Result<render::Evidence> {
     let trace_limit = resolve_trace_max_events(max_events);
     let mut remaining = Some(trace_limit);
@@ -2335,10 +2407,7 @@ fn capture_trace(
             out_file,
         )?;
         // 6. Check the retained generations and objects.
-        engine
-            .pinned()
-            .check_unchanged()
-            .map_err(anyhow::Error::msg)?;
+        engine.check_pinned_unchanged()?;
         flush_stdout(stdout, &mut stdout_open)?;
         if let Some(f) = out_file.as_mut() {
             f.flush().context("flushing trace output file")?;
@@ -2346,7 +2415,7 @@ fn capture_trace(
         if !stdout_open && out_file.is_none() {
             break Ok(CaptureEnd::Error);
         }
-        tick_sleep(paused, TRACE_CADENCE);
+        tick_sleep(paused, drain);
     }
     })();
 
@@ -2387,10 +2456,7 @@ fn capture_trace(
         out_file,
     )?;
     retire_exited(&mut process_tracker, &mut state);
-    engine
-        .pinned()
-        .check_unchanged()
-        .map_err(anyhow::Error::msg)?;
+    engine.check_pinned_unchanged()?;
     report_trace_loss(
         session,
         &mut last_reported_loss,
@@ -2401,10 +2467,7 @@ fn capture_trace(
     let reports = metrics::read(session, engine.plan())?;
     // Last look before the evidence line the trace ends with, so an in-place
     // provider change is reflected in it.
-    engine
-        .pinned()
-        .check_unchanged()
-        .map_err(anyhow::Error::msg)?;
+    engine.check_pinned_unchanged()?;
     engine.settle_terminal_drain();
     let trace_truncated = end == CaptureEnd::LimitReached || remaining == Some(0);
     let mut evidence = evidence_for(
@@ -3015,6 +3078,18 @@ mod tests {
             )
             .is_err()
         );
+        for spoofed in ["", "4294967295", " 1000", "1000 "] {
+            assert!(
+                ChildIdentity::from_ids(
+                    [0; 3],
+                    [0; 3],
+                    Some(OsStr::new(spoofed)),
+                    Some(OsStr::new("1000")),
+                )
+                .is_err(),
+                "spoofed SUDO_UID {spoofed:?} must be refused"
+            );
+        }
         assert!(
             ChildIdentity::from_ids(
                 [1000; 3],
@@ -3412,7 +3487,10 @@ mod tests {
             "a retargeted path must not pre-arm"
         );
 
-        let mut direct = spawn("/bin/sleep", &["1"]);
+        let sleeper_dir = tempfile::tempdir().unwrap();
+        let sleeper = build_sleeper(sleeper_dir.path());
+        let sleeper = sleeper.to_str().unwrap();
+        let mut direct = spawn(sleeper, &[]);
         direct.release().unwrap();
         assert!(direct.revalidate_after_exec().unwrap());
         direct.terminate_and_reap().unwrap();
@@ -3431,9 +3509,38 @@ mod tests {
         chain.terminate_and_reap().unwrap();
     }
 
+    /// Hermetic long-running child: this host's `/bin/sleep` is a uutils
+    /// multicall shim that dispatches on AT_EXECFN, which fd-pinned exec
+    /// (`execveat` + `AT_EMPTY_PATH`) leaves as an fd-based name — so it
+    /// exits 1 with "unknown program" under the harness while GNU sleep
+    /// elsewhere survives. Duration/settle tests need a child that simply
+    /// lives until signalled, independent of host coreutils.
+    fn build_sleeper(dir: &std::path::Path) -> std::path::PathBuf {
+        let source = dir.join("sleeper.c");
+        let binary = dir.join("sleeper");
+        std::fs::write(
+            &source,
+            "#include <unistd.h>\nint main(void) { for (;;) sleep(60); return 0; }\n",
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-O0", "-o"])
+                .arg(&binary)
+                .arg(&source)
+                .status()
+                .unwrap()
+                .success()
+        );
+        binary
+    }
+
     #[test]
     fn duration_and_forwarded_signals_have_one_owned_cleanup_route() {
-        let mut running = spawn("/bin/sleep", &["10"]);
+        let fixture_dir = tempfile::tempdir().unwrap();
+        let sleeper = build_sleeper(fixture_dir.path());
+        let sleeper = sleeper.to_str().unwrap();
+        let mut running = spawn(sleeper, &[]);
         running.release().unwrap();
         assert_eq!(
             running
@@ -3626,6 +3733,37 @@ mod tests {
     }
 
     #[test]
+    fn always_wrap_reports_interruption_not_refusal_when_signalled() {
+        let signals = SignalState::new();
+        signals.observe(libc::SIGTERM);
+        let text = format!(
+            "{:#}",
+            always_wrap(&signals, anyhow!("pause: pause coordination cancelled"))
+        );
+        assert!(
+            text.contains("interrupted by SIGTERM"),
+            "a signalled run must not claim refusal: {text}"
+        );
+        assert!(
+            !text.contains("refused rather than capturing unpaused"),
+            "refusal text on a signal exit is false: {text}"
+        );
+    }
+
+    #[test]
+    fn always_wrap_keeps_refusal_text_without_signal() {
+        let signals = SignalState::new();
+        let text = format!(
+            "{:#}",
+            always_wrap(&signals, anyhow!("pause: something failed"))
+        );
+        assert!(
+            text.contains("refused rather than capturing unpaused"),
+            "genuine refusal text must be unchanged: {text}"
+        );
+    }
+
+    #[test]
     fn signal_settlement_forwards_the_retained_sigterm_identity() {
         let mut child = spawn("/bin/sleep", &["10"]);
         child.release().unwrap();
@@ -3635,6 +3773,67 @@ mod tests {
             settle_after_signal(&mut child, &signals).unwrap(),
             ChildOutcome::Exited(128 + libc::SIGTERM)
         );
+    }
+
+    #[test]
+    fn graceful_termination_resumes_a_stopped_child_before_sigterm() {
+        let fixture_dir = tempfile::tempdir().unwrap();
+        let sleeper = build_sleeper(fixture_dir.path());
+        let sleeper = sleeper.to_str().unwrap();
+        let mut child = spawn(sleeper, &[]);
+        child.release().unwrap();
+        unsafe { libc::kill(child.pid() as libc::pid_t, libc::SIGSTOP) };
+        wait_until(
+            || child_is_stopped(child.pid()),
+            "the fixture child never entered the stopped state",
+        );
+
+        // A stopped child cannot observe SIGTERM: without a resume-first
+        // it burns the whole grace window and dies by SIGKILL (137).
+        assert_eq!(child.terminate_and_reap().unwrap(), 128 + libc::SIGTERM);
+    }
+
+    fn child_is_stopped(pid: u32) -> bool {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        stat.split(' ').nth(2).is_some_and(|state| state == "T")
+    }
+
+    #[test]
+    fn signal_settlement_resumes_a_stopped_child_before_forwarding_sigterm() {
+        let fixture_dir = tempfile::tempdir().unwrap();
+        let sleeper = build_sleeper(fixture_dir.path());
+        let sleeper = sleeper.to_str().unwrap();
+        let mut child = spawn(sleeper, &[]);
+        child.release().unwrap();
+        // The pause path holds the owned child in T (SIGSTOP) while the
+        // observer is signalled; settle must resume it first, because a
+        // stopped child cannot observe the forwarded SIGTERM and would
+        // otherwise burn both grace windows before SIGKILL.
+        unsafe { libc::kill(child.pid() as libc::pid_t, libc::SIGSTOP) };
+        wait_until(
+            || child_is_stopped(child.pid()),
+            "the fixture child never entered the stopped state",
+        );
+
+        let signals = SignalState::new();
+        signals.observe(libc::SIGTERM);
+        assert_eq!(
+            settle_after_signal_with_grace(&mut child, &signals, Duration::from_millis(300))
+                .unwrap(),
+            ChildOutcome::Exited(128 + libc::SIGTERM)
+        );
+    }
+
+    #[test]
+    fn also_failed_keeps_both_causes_in_order() {
+        // WINS: one "also failed" core behind the four combine_* helpers.
+        let chained = also_failed(anyhow!("primary"), anyhow!("secondary"), "cleanup");
+        let rendered = format!("{chained:#}");
+        assert!(
+            rendered.contains("cleanup also failed: secondary"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("primary"), "{rendered}");
     }
 
     #[test]
@@ -3705,6 +3904,25 @@ mod tests {
         }
     }
 
+    /// MED (forward_signal): a child that exited before the first forwarded
+    /// signal settles as Exited, never as a forwarding error — its pin reads
+    /// "no longer active", so settle reaps the natural exit instead.
+    #[test]
+    fn settle_after_signal_reaps_a_child_that_exited_first() {
+        let mut child = spawn("/bin/true", &[]);
+        child.release().unwrap();
+        wait_until(
+            || child.pin.wait_ready(Some(Duration::ZERO)).unwrap(),
+            "the true fixture never exited",
+        );
+        let signals = SignalState::new();
+        signals.observe(libc::SIGTERM);
+        let outcome =
+            settle_after_signal_with_grace(&mut child, &signals, Duration::from_millis(50))
+                .expect("a pre-exited child settles as Exited, not as an error");
+        assert_eq!(outcome, ChildOutcome::Exited(0));
+    }
+
     #[test]
     fn completed_generation_cannot_authorize_a_later_child_action() {
         let mut child = spawn("/bin/true", &[]);
@@ -3729,6 +3947,8 @@ mod tests {
             duration: None,
             out: None,
             max_events: None,
+            ring_bytes: None,
+            drain_interval: None,
             unsafe_requested: false,
             allow_confined_uretprobe: false,
             pause,
@@ -4283,6 +4503,35 @@ mod tests {
     }
 
     #[test]
+    fn capture_loops_keep_guard_parity() {
+        // KISS-1: the profile and trace loops intentionally share their
+        // guard sequence, but each guard is already one shared function —
+        // the residual overlap is sequencing with mode-specific steps
+        // interleaved, so the loops stay separate. Pin the shared order so
+        // a guard added to one loop must be considered for the other.
+        let source = include_str!("run.rs");
+        for function in ["fn capture_profile(", "fn capture_trace("] {
+            let body = source.split_once(function).unwrap().1;
+            let cycle = body.split_once("loop {").unwrap().1;
+            let (cycle, _) = cycle.split_once("})();").unwrap();
+            let mut cursor = 0;
+            for guard in [
+                "drain_discovery_tick(",
+                "state.sync_plan(engine.plan());",
+                "capture_end(",
+                "retire_exited(",
+                "check_pinned_unchanged()",
+                "tick_sleep(paused, drain);",
+            ] {
+                let found = cycle[cursor..].find(guard).unwrap_or_else(|| {
+                    panic!("{function} loop lost guard {guard}");
+                });
+                cursor += found + guard.len();
+            }
+        }
+    }
+
+    #[test]
     fn terminal_discovery_drains_before_each_event_drain() {
         let source = include_str!("run.rs");
         for (function, event_call, consumers) in [
@@ -4461,6 +4710,25 @@ mod tests {
     }
 
     #[test]
+    fn drain_cadence_defaults_to_the_mode_constant() {
+        assert_eq!(resolve_drain_cadence(Kind::Profile, None), PROFILE_CADENCE);
+        assert_eq!(resolve_drain_cadence(Kind::Trace, None), TRACE_CADENCE);
+    }
+
+    #[test]
+    fn drain_cadence_override_wins_on_both_modes() {
+        let custom = Duration::from_millis(50);
+        assert_eq!(resolve_drain_cadence(Kind::Profile, Some(custom)), custom);
+        assert_eq!(resolve_drain_cadence(Kind::Trace, Some(custom)), custom);
+    }
+
+    #[test]
+    fn ring_bytes_default_is_the_bpf_constant() {
+        assert_eq!(resolve_ring_bytes(None), p11scope_ebpf_common::RING_BYTES);
+        assert_eq!(resolve_ring_bytes(Some(1 << 20)), 1 << 20);
+    }
+
+    #[test]
     fn task_8d_attach_mechanism_requires_a_successfully_owned_link() {
         assert!(attach_mechanisms(0, false).is_empty());
         assert_eq!(attach_mechanisms(0, true), ["per-offset"]);
@@ -4503,6 +4771,8 @@ mod tests {
             ended: "t1",
             kernel: "test",
             policy: CapturePolicy::AggregateOnly,
+            ring_bytes: p11scope_ebpf_common::RING_BYTES,
+            drain_interval_ms: 1000,
         };
         let document = render::json(&[], &truncated_metrics, &capture);
         for field in [
@@ -4561,6 +4831,8 @@ mod tests {
             ended: "t1",
             kernel: "test",
             policy: CapturePolicy::Allowlisted,
+            ring_bytes: p11scope_ebpf_common::RING_BYTES,
+            drain_interval_ms: 1000,
         };
         let profile = render::versioned_evidence(&evidence);
         let metrics = render::json(&[], &evidence, &capture)["evidence"].clone();

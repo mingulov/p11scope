@@ -6,8 +6,10 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 
 
@@ -66,13 +68,38 @@ def write_receipt(path, text):
 
     The dumper runs under sudo, but its receipts are audited and normalized by
     the unprivileged finalizer, which cannot chmod a root-owned 0644 file.
+
+    Every step is descriptor- or removal-ordered, never path-retried: a
+    planted symlink is refused loudly (we never create symlinks, so one is
+    always hostile), a stale receipt or planted hardlink is unlinked first so
+    O_EXCL always creates fresh, O_NOFOLLOW backs the check in the
+    check-open race window, and fchown runs on the open fd before any byte
+    is written, so no path swap between write and ownership change can
+    redirect it.
     """
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as handle:
-        handle.write(text)
-    uid, gid = (int(os.environ.get(name, "-1")) for name in ("SUDO_UID", "SUDO_GID"))
-    if os.getuid() == 0 and uid >= 0 and gid >= 0:
-        os.chown(path, uid, gid)
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        pass
+    else:
+        if stat.S_ISLNK(st.st_mode):
+            raise RuntimeError(f"refusing to write receipt through a symlink: {path}")
+        os.unlink(path)
+    fd = os.open(
+        path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
+    )
+    try:
+        uid, gid = (
+            int(os.environ.get(name, "-1")) for name in ("SUDO_UID", "SUDO_GID")
+        )
+        if os.getuid() == 0 and uid >= 0 and gid >= 0:
+            os.fchown(fd, uid, gid)
+        with os.fdopen(fd, "w") as handle:
+            fd = -1
+            handle.write(text)
+    finally:
+        if fd != -1:
+            os.close(fd)
 
 
 def self_test():
@@ -119,6 +146,43 @@ def self_test():
     else:
         raise AssertionError("EVENTS built as a non-ringbuf was accepted")
     print("EVENTS ringbuf build guard: OK")
+    with tempfile.TemporaryDirectory() as tmp:
+        fresh = os.path.join(tmp, "fresh.json")
+        write_receipt(fresh, "{}\n")
+        assert open(fresh).read() == "{}\n"
+        assert oct(os.stat(fresh).st_mode & 0o777) == "0o600", oct(
+            os.stat(fresh).st_mode & 0o777
+        )
+        print("receipt fresh write is 0600: OK")
+
+        victim = os.path.join(tmp, "victim.json")
+        open(victim, "w").write("precious")
+        link = os.path.join(tmp, "link.json")
+        os.symlink(victim, link)
+        try:
+            write_receipt(link, "{}\n")
+        except (OSError, RuntimeError):
+            pass
+        else:
+            raise AssertionError("receipt followed a planted symlink")
+        assert open(victim).read() == "precious", "planted symlink target was clobbered"
+        print("receipt refuses a planted symlink: OK")
+
+        hard_victim = os.path.join(tmp, "hard-victim.json")
+        open(hard_victim, "w").write("precious")
+        hard = os.path.join(tmp, "hard.json")
+        os.link(hard_victim, hard)
+        write_receipt(hard, "{}\n")
+        assert open(hard_victim).read() == "precious", "planted hardlink was followed"
+        assert open(hard).read() == "{}\n"
+        print("receipt breaks a planted hardlink: OK")
+
+        rerun = os.path.join(tmp, "rerun.json")
+        write_receipt(rerun, "stale\n")
+        write_receipt(rerun, "fresh\n")
+        assert open(rerun).read() == "fresh\n"
+        assert oct(os.stat(rerun).st_mode & 0o777) == "0o600"
+        print("receipt re-run overwrites a stale receipt: OK")
     print("dump-owned-bpf-maps self-test: OK")
 
 

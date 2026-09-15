@@ -65,8 +65,82 @@ self_test() {
     for name in "" "-x" "x-" "Upper" "under_score" ".dot" "dot."; do
         if valid_name "$name"; then echo "valid_name accepted $name" >&2; exit 1; fi
     done
+    if [ "$(id -u)" -ne 0 ]; then
+        fetch_self_test
+    fi
     echo "attach-pod argument self-test: OK"
     exit 0
+}
+
+# A container name fetched from the cluster is validated before it reaches
+# the JSONPath filter, exactly like a CLI-provided one: stub kubectl serves
+# one good name and one filter-breaking name, stub timeout/sudo get out of
+# the way, and nothing here needs a cluster.
+fetch_self_test() {
+    stub=$(mktemp -d "${TMPDIR:-/tmp}/p11scope-attach-stub-XXXXXX")
+    trap 'rm -rf "$stub"' EXIT
+    cat > "$stub/timeout" <<'EOF'
+#!/bin/sh
+while [ $# -gt 0 ]; do
+    case $1 in
+        --signal=*|--kill-after=*) shift ;;
+        --signal|--kill-after) shift 2 ;;
+        -*) shift ;;
+        *) break ;;
+    esac
+done
+shift
+exec "$@"
+EOF
+    cat > "$stub/sudo" <<'EOF'
+#!/bin/sh
+if [ "${1-}" = "-n" ] && [ "${2-}" = "true" ]; then exit 0; fi
+[ "${1-}" = "-n" ] && shift
+exec "$@"
+EOF
+    : > "$stub/observer"
+    chmod +x "$stub/timeout" "$stub/sudo" "$stub/observer"
+    cat > "$stub/kubectl" <<'EOF'
+#!/bin/sh
+case " $* " in
+    *"containerStatuses[0].name"*)
+        printf '%s' "$FETCH_NAME" ;;
+    *"containerID"*)
+        printf '%s' "containerd://abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789" ;;
+esac
+EOF
+    chmod +x "$stub/kubectl"
+
+    # Evil cluster: the fetched name must be refused before the filter runs.
+    status=0
+    FETCH_NAME='x"]}.foo' PATH="$stub:$PATH" P11SCOPE_OBSERVER="$stub/observer" \
+        sh "$0" --pod evil --namespace default >"$stub/evil.log" 2>&1 || status=$?
+    [ "$status" -eq 1 ] || {
+        echo "attach-pod exited $status (want 1) for a hostile fetched name" >&2
+        exit 1
+    }
+    grep -q "DNS-1123" "$stub/evil.log" || {
+        echo "hostile fetched name was not refused as a name:" >&2
+        cat "$stub/evil.log" >&2
+        exit 1
+    }
+
+    # Good cluster: fetch and validation pass, and the run fails later, at
+    # the cgroup lookup that genuinely needs the node.
+    status=0
+    FETCH_NAME='good-name' PATH="$stub:$PATH" P11SCOPE_OBSERVER="$stub/observer" \
+        sh "$0" --pod good --namespace default >"$stub/good.log" 2>&1 || status=$?
+    [ "$status" -eq 1 ] || {
+        echo "attach-pod exited $status (want 1) for a good fetched name" >&2
+        exit 1
+    }
+    grep -q "could not locate the container cgroup" "$stub/good.log" || {
+        echo "good fetched name did not reach the cgroup lookup:" >&2
+        cat "$stub/good.log" >&2
+        exit 1
+    }
+    rm -rf "$stub"
+    trap - EXIT
 }
 
 [ "${1-}" != "--self-test" ] || self_test
@@ -109,6 +183,13 @@ echo "=== resolve pod container and cgroup ===" >&2
 if [ -z "$CONTAINER" ]; then
     CONTAINER=$(kube get pod "$POD" -o jsonpath='{.status.containerStatuses[0].name}')
     [ -n "$CONTAINER" ] || { echo "pod $POD has no running container" >&2; exit 1; }
+    # A name from the cluster is no more trusted than one from argv: it is
+    # interpolated into the JSONPath filter below, so it must be a DNS-1123
+    # name before it gets there.
+    valid_name "$CONTAINER" || {
+        echo "pod $POD reported a container name that is not a DNS-1123 name" >&2
+        exit 1
+    }
 fi
 CID_REF=$(kube get pod "$POD" \
     -o jsonpath="{.status.containerStatuses[?(@.name==\"$CONTAINER\")].containerID}")

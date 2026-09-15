@@ -255,7 +255,7 @@ static int run_matrix(void *module, const char *ready, const char *gate)
     unterminated[sizeof(unterminated) - 1] = '\0';
     (void)get_interface((char *)SENT_INTERFACE, &requested, &selected, 0);
     (void)get_interface(unterminated, &requested, &selected, 0);
-    (void)get_interface(strstr(SENT_INTERFACEALIAS, "PKCS 11"), &requested, &selected, 0);
+    (void)get_interface(strstr((char *)SENT_INTERFACEALIAS, "PKCS 11"), &requested, &selected, 0);
 
     int failures = 0;
     CK_ULONG session = 0x101;

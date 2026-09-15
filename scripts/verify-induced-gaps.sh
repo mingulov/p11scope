@@ -6,7 +6,9 @@
 #   2. In-flight    — a call entered but not returned by capture end.
 #   3. Event loss   — a tiny ring buffer overflowed under a call burst,
 #                      but the aggregate maps (the count authority) still
-#                      show the exact right number despite the loss.
+#                      show the exact right number despite the loss. Run both
+#                      ways: the small-ring build (3) and the default build
+#                      with a flag-set ring (3b, `--ring-bytes 4K`).
 #   4. Start loss   — a one-entry START map sees concurrent live calls.
 #   5. RV loss      — a one-entry RV map sees distinct completed slots.
 #   6. Immutability — every published control map rejects a matched valid
@@ -1030,6 +1032,44 @@ reclaim_root_output "$WORK/g3_observed.json"
 tail -n 5 "$WORK/g3_profile.log"
 python3 scripts/check-capture-evidence.py induced G3 "$WORK/g3_observed.json"
 echo "gap 3 exact event-loss/count-authority evidence OK"
+
+##############################################################################
+echo "=== gap 3b/5: event loss via --ring-bytes (default build, flag-set ring) ==="
+##############################################################################
+# Way B: the default build with a load-time `--ring-bytes 4K` must produce the
+# same event-loss evidence as Way A's small-ring build above: the flag is the
+# supported equivalent of the baked-in RING_BYTES override. The capture
+# discloses its effective tuning, which is asserted exactly here.
+N_CALLS=200000
+rm -f "$WORK/g3b_go" "$WORK/g3b_observed.json" "$WORK/g3b_profile.log"
+( while [ ! -f "$WORK/g3b_go" ]; do sleep 0.05; done
+  export P11SCOPE_HOLD=1
+  exec "$WORK/g3_hammer" "$MODULE" "$N_CALLS" ) &
+WPID=$!
+pin_workload
+sudo --preserve-env=SOFTHSM2_CONF "$P11SCOPE" profile \
+    --manifest "$WORK/g3_manifest.json" --pid "$WPID" \
+    --ring-bytes 4K --drain-interval-ms 1000 \
+    --mode profile --duration 15 -o "$WORK/g3b_observed.json" \
+    > "$WORK/g3b_profile.log" 2>&1 &
+SPID=$!
+wait_for_capture_ready "$WORK/g3b_profile.log" allowlisted profile
+touch "$WORK/g3b_go"
+wait_for_workload_stopped
+if wait "$SPID"; then SPID=; else status=$?; SPID=; echo "event-loss profiler failed: $status"; exit "$status"; fi
+resume_and_wait_workload hammer
+reclaim_root_output "$WORK/g3b_observed.json"
+tail -n 5 "$WORK/g3b_profile.log"
+python3 scripts/check-capture-evidence.py induced G3 "$WORK/g3b_observed.json"
+python3 - "$WORK/g3b_observed.json" <<'PY'
+import json
+import sys
+capture = json.load(open(sys.argv[1]))["capture"]
+assert capture["ring_bytes"] == 4096, capture
+assert capture["drain_interval_ms"] == 1000, capture
+print("gap 3b disclosed ring_bytes=4096 drain_interval_ms=1000: OK")
+PY
+echo "gap 3b flag-set ring event-loss/count-authority evidence OK"
 
 ##############################################################################
 echo "=== gap 4/5: START insertion loss (one-entry map, live concurrency) ==="

@@ -8,11 +8,11 @@ use crate::events;
 use crate::plan::{AttachPlan, Slot};
 use crate::run::OwnedChild;
 use anyhow::{Context as _, Result, anyhow, bail};
-use aya::Ebpf;
 use aya::maps::{Array, HashMap, Map, MapError, MapType, PerCpuArray, ProgramArray};
 use aya::programs::trace_point::TracePointLinkId;
 use aya::programs::uprobe::{UProbeAttachLocation, UProbeAttachPoint, UProbeLinkId, UProbeScope};
 use aya::programs::{ProgramError, TracePoint, TracePointError, UProbe};
+use aya::{Ebpf, EbpfLoader};
 use p11scope_ebpf_common::{
     ARG_NONE, CFG_TASK_NEWTASK_OFFSETS, DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES,
     DISCOVERY_COUNTER_EXPORT_STATE_FAILURES, DISCOVERY_COUNTER_LOADER_HITS,
@@ -1234,6 +1234,7 @@ impl Session {
         objects: &PinnedObjects,
         policy: CapturePolicy,
         pause_generation: Option<OwnedPauseGeneration>,
+        ring_bytes: Option<u32>,
     ) -> Result<Self> {
         let pause_key = pause_key_for(scope, pause_generation.as_ref())?;
         if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
@@ -1241,8 +1242,8 @@ impl Session {
                 "a pinned provider object changed before attach; refusing to observe changed bytes"
             );
         }
-        let mut session =
-            Self::start_inner(scope, policy, pause_key).map_err(unsupported_environment_context)?;
+        let mut session = Self::start_inner(scope, policy, pause_key, ring_bytes)
+            .map_err(unsupported_environment_context)?;
         session
             .attach_plan(plan, objects)
             .map_err(unsupported_environment_context)?;
@@ -1259,7 +1260,7 @@ impl Session {
     /// requested scope, process-creation boundary, and exec/exit links. Dropping the local
     /// session detaches every link before this finite result is returned.
     pub(crate) fn preflight(scope: &Scope) -> Result<AttachPreflight> {
-        let session = Self::start_inner(scope, CapturePolicy::Allowlisted, None)?;
+        let session = Self::start_inner(scope, CapturePolicy::Allowlisted, None, None)?;
         Ok(AttachPreflight {
             lifecycle: session.lifecycle_tracking_unavailable.is_none(),
             scope: session.process_creation_tracking_unavailable.is_none(),
@@ -1270,11 +1271,18 @@ impl Session {
         scope: &Scope,
         policy: CapturePolicy,
         pause_key: Option<PauseKey>,
+        ring_bytes: Option<u32>,
     ) -> Result<Self> {
         if policy.uses_unsafe_decoders() && !cfg!(feature = "unsafe-unvalidated-metadata") {
             bail!("unsafe-unvalidated-metadata policy is absent from this eBPF object");
         }
-        let mut ebpf = Ebpf::load(crate::EBPF_OBJECT).context("loading BPF object")?;
+        // `--ring-bytes` resizes the EVENTS ringbuf at load (aya rounds to a
+        // page-sized power of two like libbpf); omission resolves to the
+        // baked-in default, which is a no-op override of the ELF value.
+        let mut ebpf = EbpfLoader::new()
+            .map_max_entries("EVENTS", crate::run::resolve_ring_bytes(ring_bytes))
+            .load(crate::EBPF_OBJECT)
+            .context("loading BPF object")?;
         let object_has_unsafe = cfg!(feature = "unsafe-unvalidated-metadata");
         let unsafe_enabled = object_has_unsafe && policy.uses_unsafe_decoders();
         validate_policy_maps(&ebpf, object_has_unsafe)

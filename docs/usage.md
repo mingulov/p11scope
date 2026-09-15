@@ -140,7 +140,40 @@ sudo p11scope run --module /opt/vendor/lib/pkcs11.so \
 > `/bin/sh /path/to/script`, and use `/usr/bin/env NAME=value command` after
 > `--` for other application variables. The sudo path currently clears
 > supplementary groups; use `profile`/`trace` against an already-running
-> workload when the application needs an HSM/device group.
+> workload when the application needs an HSM/device group. When the observer
+> binary instead carries file capabilities (`setcap
+> 'cap_sys_admin,cap_bpf,cap_perfmon,cap_sys_ptrace,cap_dac_read_search+ep'`),
+> it runs unprivileged with its groups intact: BPF attach succeeds and
+> group-gated providers (e.g. opencryptoki's group-owned shared memory) keep
+> working under observation. Measured 2026-09-15 on Fedora 44 (6.19) and
+> Ubuntu 22.04 (5.15); see
+> [2026-09-15 provider-qual note](notes/2026-09-15-provider-qual-live-capture.md).
+
+### Capture tuning: `--ring-bytes` and `--drain-interval-ms`
+
+Two flags trade burst headroom against drain rate; both accept profile, trace,
+and run, and both are disclosed in every JSON report's `capture` block as
+`ring_bytes` / `drain_interval_ms`, so a report always says what tuning
+produced it.
+
+- `--ring-bytes <n[K|M]>` — the EVENTS ring buffer size: a power of two from
+  4K to 64M (default 256K). A larger ring absorbs call bursts without loss; a
+  smaller ring overflows sooner. Overflow never corrupts counts — the
+  aggregate maps are the count authority — but it is disclosed as `event_loss`
+  with a `PARTIAL` verdict instead of `COMPLETE`.
+- `--drain-interval-ms <n>` — the capture-loop tick: 5 to 60000 ms (defaults:
+  profile 1000 ms, trace 200 ms). A faster tick drains the ring sooner (less
+  loss under bursts, more observer CPU); a slower tick does the opposite.
+
+```bash
+# Burst-heavy workload: bigger ring, faster drain.
+sudo p11scope profile --pid 12345 --ring-bytes 4M --drain-interval-ms 100 \
+  --duration 60 -o observed-profile.json
+```
+
+The induced-gaps gate (`scripts/verify-induced-gaps.sh`, gap 3/3b) proves both
+directions: the small-ring build and the default build with `--ring-bytes 4K`
+produce the same disclosed event-loss evidence with exact counts.
 
 ### Discovery timing and optional offline discovery
 
@@ -159,10 +192,27 @@ semantics-unverified and count-only, but aggregate counts/RVs/latency remain
 available. A helper run after the fact cannot repair a missed capture window,
 and `--manifest` remains the explicit-attestation path for that case.
 
+Attach takes time to land (seconds for hundreds of probes), and the first
+calls after a `dlopen` can fire before their probes exist — a workload that
+exits in milliseconds can be gone before attach completes, even with
+`--pause auto`. Measured 2026-09-15: keep the workload alive past attach
+(a sleep/hold phase, `LD_PRELOAD=<provider.so>` so the initial scan sees
+it, or long-lived daemons via `profile --pid`), and expect the earliest
+post-load calls to be absent from the counts.
+
 `p11scope-discover --module <provider.so> -o manifest.json` is that optional
 offline path. It executes provider code in its own unprivileged process; the
 normal manifest-free path does not execute provider code. `--module` is also
 optional and only narrows the memory scan to named providers.
+`p11scope-discover --module` must be an absolute path — a relative path is
+refused rather than resolved against a surprising directory.
+
+Provider entry points are hooked through five built-ins
+(`C_GetFunctionList`, `C_GetInterfaceList`, `C_GetInterface`,
+`NSC_GetFunctionList`, `FC_GetFunctionList`). `--hook-symbol NAME[:ABI]`
+adds one more symbol to hook; `:ABI` is `functionlist` (the default),
+`interfacelist`, or `interface`, and may be repeated. It is accepted by
+profile, trace, run, and inspect.
 
 `doctor` has no module-specific probe lane. `doctor --module` is rejected as
 unsupported instead of accepting and ignoring operator input; use
@@ -202,7 +252,11 @@ cgroup and every descendant beneath it
 (kernel ≥5.15 due to attach cookies), so pointing it at a container's or pod's
 directory reaches the workload's actual nested cgroup. `--duration` (bare seconds or `30s`/`5m`/`1h`) bounds
 either subcommand; Ctrl-C or SIGTERM also ends a capture cleanly (final frame
-printed, `-o` file written) instead of aborting it.
+printed, `-o` file written) instead of aborting it — unless the observer is
+wedged holding a paused child (observed once 2026-09-15 with `--pause auto`
+over an NSS dependency cascade: SIGTERM ignored, SIGKILL required; see the
+provider-qual note's gaps section). Prefer `--pause never` with `LD_PRELOAD` for
+dependency-heavy targets until that gap is fixed.
 
 For cgroup event captures, `task/task_newtask` records ordinary non-thread
 creation as a semantic hint and may preserve the parent's proven state while
@@ -272,6 +326,34 @@ Immediately before `EVIDENCE`, trace emits one aggregate-only
 `COUNT_EVIDENCE {"stats_entered":…,"stats_returned":…,"raw_calls":…}` line:
 the STATS fields include completed and in-flight calls, while `raw_calls`
 counts every well-formed non-fork event consumed before truncation.
+
+### More capture options
+
+- `--max-events <n>` — trace only (including `run --trace`): end the capture
+  after `<n>` call events instead of running until `--duration`, interrupt, or
+  target exit. Refused with a usage error on profile, which publishes one
+  aggregate document.
+- `run --trace` — stream one line per completed call (trace semantics) for an
+  owned command instead of aggregating a profile.
+- `run --kill-on-timeout` — when `--duration` expires, terminate and reap the
+  owned child. Without it the default is to hand a still-running child back
+  and exit 0.
+- `inspect --json` — print the inspection as JSON instead of the human-readable
+  text table.
+- `--allow-uretprobe-on-confined-target` — accept the uretprobe hazard on a
+  target that confines syscalls instead of refusing to attach. The default
+  refusal is deliberate: on affected kernels a uretprobe on a confined target
+  can kill it. See `p11scope doctor` and `src/uretprobe_hazard.rs`.
+
+### Exit codes
+
+- `0` — success. `--help` also exits 0. `run` exits 0 when its child exits 0,
+  or when a still-running child is handed back (without `--kill-on-timeout`).
+- `1` — a runtime failure: one line on stderr, never a panic. `run` reports
+  the child's nonzero exit code instead. `doctor` exits 1 when any requested
+  lane reports failure; `inspect` exits 1 when the target cannot be read.
+- `2` — a CLI usage error (unknown flag, missing value, mutually exclusive
+  options, removed subcommand).
 
 ## Privileges, per environment
 
@@ -427,6 +509,10 @@ reported as complete. An operator capturing a bursty, high-rate workload
 should expect `PARTIAL` with a real `event_loss` count, and should trust
 the aggregate `functions[]` counts over event-derived
 `mechanisms`/`sessions`/`logins`/`cgroups` and `trace` lines in that case.
+In `--mode metrics` the ring is never drained and `event_loss` is always
+reported as 0 by construction (`run.rs` zeroes the kernel counter); a
+zero there means "not measured", not "nothing lost" — the aggregate
+counts remain the authority in that mode.
 Same finding `scripts/verify-induced-gaps.sh` demonstrates
 deliberately on a lighter workload (`docs/notes/phase2-induced-gaps.md`).
 

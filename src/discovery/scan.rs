@@ -877,7 +877,7 @@ fn read_name(
             Ok(read) => read,
         };
         budget.record_io(read);
-        *operation_bytes += read as u64;
+        *operation_bytes = (*operation_bytes).saturating_add(read as u64);
         if let Some(nul) = chunk[..read].iter().position(|byte| *byte == 0) {
             raw.extend_from_slice(&chunk[..nul]);
             return Ok(Some(raw));
@@ -940,7 +940,7 @@ fn read_mapping(
             Ok(read) => {
                 bytes.truncate(done + read);
                 budget.record_io(read);
-                *operation_bytes += read as u64;
+                *operation_bytes = (*operation_bytes).saturating_add(read as u64);
                 done += read;
             }
         }

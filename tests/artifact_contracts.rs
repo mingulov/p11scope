@@ -251,7 +251,11 @@ fn assert_live_discovery_host_contract(
         ("HashMap<_, u32, u64>", "u64 PID_FILTER value"),
         ("generation_token.unwrap_or(1)", "fixed ordinary PID token"),
         ("FLAG_PAUSE_ENABLED", "pause config bit"),
-        ("File::open(path)", "opened cgroup descriptor"),
+        (
+            "open_cgroup_dir(path)",
+            "opened cgroup descriptor via the no-symlink seam",
+        ),
+        ("RESOLVE_NO_SYMLINKS", "openat2 fast path refuses symlinks"),
         (
             "let id = dir\n        .metadata()",
             "retained cgroup inode identity",
@@ -269,11 +273,11 @@ fn assert_live_discovery_host_contract(
         || run.contains("Session::start(")
         || engine.matches("Session::start(").count() != 1
         || engine
-            .matches("Session::start(plan, scope, pinned, policy, pause_generation.take())")
+            .matches("pause_generation.take(),\n                    ring_bytes,")
             .count()
             != 1
         || engine
-            .matches("self.start_session_with(policy, None, None)")
+            .matches("self.start_session_with(policy, None, None, ring_bytes)")
             .count()
             != 1
         || engine
@@ -4072,6 +4076,7 @@ fn capture_evidence_checker_self_test() {
         "induced G4 exact allowances: OK",
         "induced G5 exact allowances: OK",
         "induced G5 exact 11 calls and 9 RV failures: OK",
+        "induced lanes require disclosed ring_bytes/drain_interval_ms: OK",
         "unrelated evidence gap rejected: OK",
     ] {
         assert!(stdout.contains(marker), "checker self-test misses {marker}");
@@ -4936,7 +4941,7 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_owned_child_only() {
         "the owned capability fields must remain opaque"
     );
     let armed_engine = engine.replacen(
-        "self.start_session_with(policy, None, None)",
+        "self.start_session_with(policy, None, None, ring_bytes)",
         "self.start_owned_session(policy, child)",
         1,
     );
@@ -5591,6 +5596,10 @@ aggregate-only-metrics default metrics"
     );
     assert!(dumper.contains("nonzero valid JSON rejected: OK"));
     assert!(dumper.contains("ordinary dump list validation: OK"));
+    assert!(dumper.contains("receipt fresh write is 0600: OK"));
+    assert!(dumper.contains("receipt refuses a planted symlink: OK"));
+    assert!(dumper.contains("receipt breaks a planted hardlink: OK"));
+    assert!(dumper.contains("receipt re-run overwrites a stale receipt: OK"));
 
     let harness = induced
         .split_once("#define _GNU_SOURCE\n")
@@ -5792,6 +5801,55 @@ fn operator_docs_preserve_semantic_authority_limits() {
         usage.contains("frozen pre-w3 candidate")
             && usage.contains("not been repeated on the w3 tip"),
         "docs/usage.md must distinguish historical evidence from W3 qualification"
+    );
+}
+
+#[test]
+fn daemonset_posture_is_hardened_and_documented() {
+    // MED (DaemonSet privilege posture): node-root-capable by design, so
+    // the manifest ships the cheap hardening (read-only root + scratch
+    // emptyDir) and documents the gated variant + seccomp backlog.
+    let daemonset = read("deploy/k8s/daemonset.yaml");
+    for marker in [
+        "readOnlyRootFilesystem: true",
+        "emptyDir: {}",
+        "mountPath: /tmp",
+        "Gated variant",
+        "allowPrivilegeEscalation: false",
+        "type: RuntimeDefault",
+        "- ALL",
+    ] {
+        assert!(
+            daemonset.contains(marker),
+            "deploy/k8s/daemonset.yaml is missing: {marker}"
+        );
+    }
+    assert!(
+        !daemonset.contains("privileged: true"),
+        "the observer must not run privileged"
+    );
+    let readme = read("deploy/k8s/README.md").to_lowercase();
+    assert!(
+        readme.contains("read-only root") && readme.contains("gated variant"),
+        "deploy/k8s/README.md must document the read-only-root + gated-variant posture"
+    );
+}
+
+#[test]
+fn k8s_entry_hardens_the_scratch_mount() {
+    // K1 regression: kubelet creates the scratch emptyDir 0777 without the
+    // sticky bit, which the observer's output trust check refuses. The entry
+    // script must restore classic /tmp mode before exec, paired with the
+    // manifest's scratch mount at the same path.
+    let entry = read("scripts/k8s-profile-entry.sh");
+    assert!(
+        entry.contains("chmod 1777 /tmp"),
+        "k8s-profile-entry.sh must harden /tmp before exec"
+    );
+    let daemonset = read("deploy/k8s/daemonset.yaml");
+    assert!(
+        daemonset.contains("mountPath: /tmp"),
+        "the hardened path must stay the manifest's scratch mount"
     );
 }
 
@@ -6484,7 +6542,7 @@ fn both_capture_loops_keep_the_one_frozen_per_tick_ordering() {
             ),
             (
                 snapshot,
-                ".check_unchanged()",
+                "check_pinned_unchanged()",
                 "metrics/counter snapshot before the retained generation/object check",
             ),
         ] {
@@ -6706,6 +6764,8 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
             ended: "1970-01-01T00:00:01Z",
             kernel: "6.8.0",
             policy: p11scope::attach::CapturePolicy::AggregateOnly,
+            ring_bytes: p11scope_ebpf_common::RING_BYTES,
+            drain_interval_ms: 1000,
         },
     );
 
@@ -9513,9 +9573,10 @@ fn every_view_retirement_settles_its_leader_exit_assessment_first() {
     let source = read("src/discovery/engine.rs");
     // Not `split("#[cfg(test)]")`: the first one in this file guards a `use`
     // at line 49, which would leave 48 lines of "production" and pass on an
-    // empty search.
+    // empty search. Split on the module declaration itself so both the inline
+    // (`{`) and file-backed (`;` via `#[path]`) test-module forms work.
     let production = source
-        .split_once("#[cfg(test)]\npub(crate) mod tests {")
+        .split_once("pub(crate) mod tests")
         .expect("engine.rs must have a test module")
         .0;
     let sites: Vec<usize> = ["self.views.retain(", "discovered.views.retain("]

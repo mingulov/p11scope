@@ -31,6 +31,10 @@ pub struct CaptureArgs {
     pub duration: Option<Duration>,
     pub out: Option<PathBuf>,
     pub max_events: Option<u64>,
+    /// `--ring-bytes`: EVENTS ringbuf size override; None ⇒ 256 KiB default.
+    pub ring_bytes: Option<u32>,
+    /// `--drain-interval-ms`: capture-loop tick override; None ⇒ per-mode default.
+    pub drain_interval: Option<Duration>,
     pub unsafe_requested: bool,
     /// `--allow-uretprobe-on-confined-target`: attach uretprobes even when this
     /// kernel is measured to kill a seccomp-confined target for doing so.
@@ -62,6 +66,10 @@ pub struct RunArgs {
     pub duration: Option<Duration>,
     pub out: Option<PathBuf>,
     pub max_events: Option<u64>,
+    /// `--ring-bytes`: EVENTS ringbuf size override; None ⇒ 256 KiB default.
+    pub ring_bytes: Option<u32>,
+    /// `--drain-interval-ms`: capture-loop tick override; None ⇒ per-mode default.
+    pub drain_interval: Option<Duration>,
     pub unsafe_requested: bool,
     /// `--allow-uretprobe-on-confined-target`: attach uretprobes even when this
     /// kernel is measured to kill a seccomp-confined target for doing so.
@@ -109,9 +117,12 @@ pub const USAGE: &str = "usage:
                    [--hook-symbol <NAME[:functionlist|interfacelist|interface]>]...
                    [--unsafe-unvalidated-metadata]
                    [--allow-uretprobe-on-confined-target]
+                   [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>]
   p11scope trace   [same scope and discovery options] [--duration <…>] [--max-events <n>] [-o <out.file>]
+                   [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>]
   p11scope run     [same discovery options] [--mode profile|metrics | --trace] [--duration <…>]
-                   [-o <out>] [--pause never|auto|always] [--kill-on-timeout] -- CMD [ARGS...]
+                   [-o <out>] [--pause never|auto|always] [--kill-on-timeout]
+                   [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>] -- CMD [ARGS...]
   p11scope inspect --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--json]
   p11scope doctor  [--pid <n>] [--cgroup <path>]
   p11scope-discover --module <provider.so> [-o <manifest.json>]   (offline helper; executes provider code)
@@ -188,6 +199,8 @@ struct Common {
     duration: Option<Duration>,
     out: Option<PathBuf>,
     max_events: Option<u64>,
+    ring_bytes: Option<u32>,
+    drain_interval: Option<Duration>,
     unsafe_requested: bool,
     allow_confined_uretprobe: bool,
 }
@@ -248,6 +261,23 @@ fn capture_option(
                 return Err(usage_err("--max-events must be greater than zero"));
             }
             common.max_events = Some(value);
+        }
+        "--ring-bytes" => {
+            let v = require_value(args, "--ring-bytes")?;
+            common.ring_bytes = Some(
+                parse_ring_bytes(&v)
+                    .map_err(|e| usage_err(format!("--ring-bytes: invalid value {v:?}: {e}")))?,
+            );
+        }
+        "--drain-interval-ms" => {
+            let v = require_value(args, "--drain-interval-ms")?;
+            let ms = v
+                .parse::<u64>()
+                .map_err(|_| usage_err(format!("--drain-interval-ms: invalid number {v:?}")))?;
+            if !(5..=60000).contains(&ms) {
+                return Err(usage_err("--drain-interval-ms must be between 5 and 60000"));
+            }
+            common.drain_interval = Some(Duration::from_millis(ms));
         }
         "-o" => common.out = Some(require_value(args, "-o")?.into()),
         "--unsafe-unvalidated-metadata" => common.unsafe_requested = true,
@@ -372,6 +402,8 @@ pub fn parse_capture(
         duration: common.duration,
         out: common.out,
         max_events: common.max_events,
+        ring_bytes: common.ring_bytes,
+        drain_interval: common.drain_interval,
         unsafe_requested: common.unsafe_requested,
         allow_confined_uretprobe: common.allow_confined_uretprobe,
     })
@@ -444,6 +476,8 @@ fn parse_run(mut args: impl Iterator<Item = String>) -> Result<RunArgs, CliError
         duration: common.duration,
         out: common.out,
         max_events: common.max_events,
+        ring_bytes: common.ring_bytes,
+        drain_interval: common.drain_interval,
         unsafe_requested: common.unsafe_requested,
         allow_confined_uretprobe: common.allow_confined_uretprobe,
         pause,
@@ -474,6 +508,34 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
         .checked_mul(mult)
         .ok_or_else(|| format!("duration {s:?} overflows"))?;
     Ok(Duration::from_secs(secs))
+}
+
+/// Parses a ring-buffer size given as plain bytes or with a single trailing
+/// `K`/`M` suffix — `"262144"`, `"256K"`, `"1M"`. Must be a power of two
+/// between one page (4096) and 64 MiB; the kernel ringbuf requires both.
+pub fn parse_ring_bytes(s: &str) -> Result<u32, String> {
+    if s.is_empty() {
+        return Err("empty size".to_string());
+    }
+    let (digits, mult) = match s.as_bytes()[s.len() - 1] {
+        b'K' | b'k' => (&s[..s.len() - 1], 1024u64),
+        b'M' | b'm' => (&s[..s.len() - 1], 1024u64 * 1024),
+        _ => (s, 1u64),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("invalid size {s:?}"));
+    }
+    let bytes: u64 = digits.parse().map_err(|_| format!("invalid size {s:?}"))?;
+    let bytes = bytes
+        .checked_mul(mult)
+        .ok_or_else(|| format!("size {s:?} overflows"))?;
+    if !(4096..=67108864).contains(&bytes) {
+        return Err(format!("size {s:?} outside 4K..64M"));
+    }
+    if !bytes.is_power_of_two() {
+        return Err(format!("size {s:?} is not a power of two"));
+    }
+    Ok(bytes as u32)
 }
 
 #[cfg(test)]
@@ -817,6 +879,131 @@ mod tests {
                 USAGE.contains(statement),
                 "missing help statement: {statement}"
             );
+        }
+    }
+
+    #[test]
+    fn ring_bytes_accepts_plain_and_suffixed_powers_of_two() {
+        for (input, want) in [
+            ("4096", 4096u32),
+            ("262144", 262144),
+            ("256K", 262144),
+            ("256k", 262144),
+            ("1M", 1048576),
+            ("64M", 67108864),
+        ] {
+            let Command::Profile(a) =
+                parse(args(&["profile", "--pid", "42", "--ring-bytes", input])).unwrap()
+            else {
+                panic!("expected profile for {input}");
+            };
+            assert_eq!(a.ring_bytes, Some(want), "input {input}");
+        }
+    }
+
+    #[test]
+    fn ring_bytes_rejects_non_power_of_two_and_out_of_range() {
+        for input in [
+            "0", "1000", "1K", "3M", "100K", "128M", "1G", "1.5M", "abc", "",
+        ] {
+            assert!(
+                parse(args(&["profile", "--pid", "42", "--ring-bytes", input])).is_err(),
+                "input {input} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn drain_interval_ms_accepts_bounded_values() {
+        for (input, want_ms) in [("5", 5u64), ("50", 50), ("200", 200), ("60000", 60000)] {
+            let Command::Profile(a) = parse(args(&[
+                "profile",
+                "--pid",
+                "42",
+                "--drain-interval-ms",
+                input,
+            ]))
+            .unwrap() else {
+                panic!("expected profile for {input}");
+            };
+            assert_eq!(
+                a.drain_interval,
+                Some(Duration::from_millis(want_ms)),
+                "input {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn drain_interval_ms_rejects_out_of_range() {
+        for input in [
+            "0",
+            "4",
+            "61000",
+            "99999999999999999999999",
+            "abc",
+            "50ms",
+            "",
+        ] {
+            assert!(
+                parse(args(&[
+                    "profile",
+                    "--pid",
+                    "42",
+                    "--drain-interval-ms",
+                    input
+                ]))
+                .is_err(),
+                "input {input} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn new_capture_flags_default_to_none() {
+        let Command::Profile(a) = parse(args(&["profile", "--pid", "42"])).unwrap() else {
+            panic!("expected profile")
+        };
+        assert_eq!(a.ring_bytes, None);
+        assert_eq!(a.drain_interval, None);
+    }
+
+    #[test]
+    fn run_and_trace_accept_the_new_capture_flags() {
+        let Command::Run(r) = parse(args(&[
+            "run",
+            "--ring-bytes",
+            "1M",
+            "--drain-interval-ms",
+            "100",
+            "--",
+            "true",
+        ]))
+        .unwrap() else {
+            panic!("expected run")
+        };
+        assert_eq!(r.ring_bytes, Some(1048576));
+        assert_eq!(r.drain_interval, Some(Duration::from_millis(100)));
+        let Command::Trace(t) = parse(args(&[
+            "trace",
+            "--pid",
+            "42",
+            "--ring-bytes",
+            "512K",
+            "--drain-interval-ms",
+            "25",
+        ]))
+        .unwrap() else {
+            panic!("expected trace")
+        };
+        assert_eq!(t.ring_bytes, Some(524288));
+        assert_eq!(t.drain_interval, Some(Duration::from_millis(25)));
+    }
+
+    #[test]
+    fn help_documents_the_new_capture_flags() {
+        for statement in ["--ring-bytes", "--drain-interval-ms"] {
+            assert!(USAGE.contains(statement), "missing help text: {statement}");
         }
     }
 }

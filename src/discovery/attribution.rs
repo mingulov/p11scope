@@ -41,11 +41,12 @@ mod imp {
 
     fn record(site: String, skip: &Skipped) {
         let mut ledger = ledger().lock().unwrap_or_else(|e| e.into_inner());
-        *ledger
+        let site_count = ledger
             .entry((skip.subject.clone(), skip.reason.clone()))
             .or_default()
             .entry(site)
-            .or_default() += 1;
+            .or_default();
+        *site_count = site_count.saturating_add(1);
     }
 
     #[track_caller]

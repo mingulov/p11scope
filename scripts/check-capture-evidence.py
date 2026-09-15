@@ -1617,6 +1617,15 @@ def validate_induced(lane, document):
     require(document["capture"]["mode"] == "profile", document["capture"])
     require(document["capture"]["privacy_mode"] == "allowlisted", document["capture"])
     exact_capture_modules(document)
+    ring_bytes = document["capture"].get("ring_bytes")
+    require(
+        isinstance(ring_bytes, int) and not isinstance(ring_bytes, bool)
+        and 4096 <= ring_bytes <= 67108864 and ring_bytes & (ring_bytes - 1) == 0,
+        f"invalid capture.ring_bytes: {ring_bytes!r}",
+    )
+    drain_ms = document["capture"].get("drain_interval_ms")
+    uint(drain_ms, 60000, "capture.drain_interval_ms")
+    require(5 <= drain_ms, f"invalid capture.drain_interval_ms: {drain_ms!r}")
     evidence = document["evidence"]
     sources = [module["sources"] for module in evidence["discovery"]]
     require(sources == [["scan", "manifest"]], f"unexpected discovery sources: {sources}")
@@ -1832,6 +1841,9 @@ def document_fixture(evidence, *, schema=PROFILE_SCHEMA, mode="profile", privacy
         "capture": {
             "mode": mode,
             "privacy_mode": privacy,
+            # Effective capture tuning, disclosed by every real capture.
+            "ring_bytes": 262144,
+            "drain_interval_ms": 1000,
             # v2: one entry per discovered module, projected from the evidence.
             "modules": [
                 {key: module[key] for key in ("path", "dev", "ino", "sha256", "build_id")}
@@ -2771,6 +2783,26 @@ def self_test():
     bad["functions"][0]["calls"] = 12
     rejected(lambda: validate_induced("G5", bad))
     print("induced G5 exact 11 calls and 9 RV failures: OK")
+
+    bad = copy.deepcopy(induced["G3"])
+    del bad["capture"]["ring_bytes"]
+    rejected(lambda: validate_induced("G3", bad))
+    bad = copy.deepcopy(induced["G3"])
+    bad["capture"]["ring_bytes"] = 5000
+    rejected(lambda: validate_induced("G3", bad))
+    bad = copy.deepcopy(induced["G3"])
+    bad["capture"]["ring_bytes"] = 2048
+    rejected(lambda: validate_induced("G3", bad))
+    bad = copy.deepcopy(induced["G3"])
+    del bad["capture"]["drain_interval_ms"]
+    rejected(lambda: validate_induced("G3", bad))
+    bad = copy.deepcopy(induced["G3"])
+    bad["capture"]["drain_interval_ms"] = 0
+    rejected(lambda: validate_induced("G3", bad))
+    bad = copy.deepcopy(induced["G3"])
+    bad["capture"]["drain_interval_ms"] = "1000"
+    rejected(lambda: validate_induced("G3", bad))
+    print("induced lanes require disclosed ring_bytes/drain_interval_ms: OK")
 
     bad = copy.deepcopy(safe)
     bad["evidence"]["operation_state_imports"] = 1

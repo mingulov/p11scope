@@ -184,6 +184,10 @@ pub fn probe(pid: Option<u32>, cgroup: Option<&Path>) -> Vec<Check> {
         Some(pid) => proc_mem_check(pid),
         None => not_applicable("/proc/<pid>/mem", "no --pid"),
     });
+    checks.push(cgroup_version_check_at(
+        Path::new("/sys/fs/cgroup/cgroup.controllers"),
+        Path::new("/proc/self/cgroup"),
+    ));
     checks.push(match cgroup {
         Some(cgroup) => cgroup_check(cgroup),
         None => not_applicable("cgroup path", "no --cgroup"),
@@ -446,7 +450,7 @@ fn capabilities_check() -> Check {
 }
 
 /// `BPF map create` (`Ebpf::load` succeeding) and `uprobe attach` (attaching
-/// `p11_entry` to the observer's own libc, then dropping). Both rows share
+/// `p11_entry` to the observer itself (own libc, else own entry point), then dropping). Both rows share
 /// one `Ebpf` handle, which is local to this function and therefore dropped
 /// — detaching and unloading everything — before it returns.
 fn bpf_checks() -> Vec<Check> {
@@ -469,7 +473,7 @@ fn bpf_checks() -> Vec<Check> {
                 )),
             },
             Check {
-                name: "uprobe attach (own libc)".to_string(),
+                name: "uprobe attach (self)".to_string(),
                 status: Status::Fail("skipped: BPF map create failed".to_string()),
             },
         ],
@@ -513,22 +517,18 @@ fn uprobe_attach_check(ebpf: &mut Ebpf) -> Check {
         Err(e) => Status::Fail(e),
     };
     Check {
-        name: "uprobe attach (own libc)".to_string(),
+        name: "uprobe attach (self)".to_string(),
         status,
     }
 }
 
-/// Finds the observer's own libc via `/proc/self/maps` (reusing the shared
+/// Finds the observer's own libc mapping via `/proc/self/maps` (reusing the shared
 /// maps parser, Task 3), resolves `getpid`'s file offset via
 /// `p11scope_manifest::elf::symbol_file_offset` (Task 4) rather than
 /// hardcoding one, then loads and attaches `p11_entry` there. The link and
 /// the loaded program both live inside `ebpf`, which the caller drops.
 fn attach_self_probe(ebpf: &mut Ebpf) -> Result<(), String> {
-    let libc_path = own_libc_path()?;
-    let file = std::fs::File::open(&libc_path)
-        .map_err(|e| format!("open {}: {e}", libc_path.display()))?;
-    let offset = p11scope_manifest::elf::symbol_file_offset(&file, "getpid")?
-        .ok_or_else(|| format!("getpid not exported by {}", libc_path.display()))?;
+    let (anchor_path, offset) = self_probe_anchor()?;
 
     let prog: &mut UProbe = ebpf
         .program_mut("p11_entry")
@@ -549,7 +549,7 @@ fn attach_self_probe(ebpf: &mut Ebpf) -> Result<(), String> {
         location: UProbeAttachLocation::AbsoluteOffset(offset),
         cookie: None,
     };
-    prog.attach(point, &libc_path, UProbeScope::CallingProcess)
+    prog.attach(point, &anchor_path, UProbeScope::CallingProcess)
         .map_err(|e| {
             format!(
                 "{} — {}",
@@ -664,20 +664,48 @@ fn live_discovery_checks(pid: Option<u32>, capture_lane: bool) -> Vec<Check> {
     ]
 }
 
-fn own_libc_path() -> Result<PathBuf, String> {
-    let bytes = std::fs::read("/proc/self/maps").map_err(|e| format!("/proc/self/maps: {e}"))?;
-    let entries = p11scope_manifest::maps::parse_maps(&bytes)?;
-    entries
-        .into_iter()
-        .find_map(|entry| {
-            if entry.permissions[2] != b'x' {
-                return None;
-            }
-            let raw = entry.raw_path?;
-            let text = String::from_utf8_lossy(&raw).into_owned();
-            text.contains("libc.so").then(|| PathBuf::from(text))
-        })
-        .ok_or_else(|| "no executable libc.so mapping in /proc/self/maps".to_string())
+fn own_libc_path() -> Option<PathBuf> {
+    let bytes = std::fs::read("/proc/self/maps").ok()?;
+    libc_path_in_maps(&bytes)
+}
+
+/// The executable `libc.so` mapping in one maps snapshot, if the observer
+/// maps libc at all. A statically linked observer maps none — that is a
+/// build fact, not a failure, and the self-probe falls back to the entry
+/// point below instead of reporting it as one.
+fn libc_path_in_maps(bytes: &[u8]) -> Option<PathBuf> {
+    let entries = p11scope_manifest::maps::parse_maps(bytes).ok()?;
+    entries.into_iter().find_map(|entry| {
+        if entry.permissions[2] != b'x' {
+            return None;
+        }
+        let raw = entry.raw_path?;
+        let text = String::from_utf8_lossy(&raw).into_owned();
+        text.contains("libc.so").then(|| PathBuf::from(text))
+    })
+}
+
+/// Where the self-probe attaches: the observer's own libc (dynamic builds)
+/// at `getpid`, else the observer's own entry point (static builds, which
+/// map no libc). Either site only proves attach works — the probe is dropped
+/// immediately without ever firing.
+fn self_probe_anchor() -> Result<(PathBuf, u64), String> {
+    if let Some(libc) = own_libc_path() {
+        let file =
+            std::fs::File::open(&libc).map_err(|e| format!("open {}: {e}", libc.display()))?;
+        let offset = p11scope_manifest::elf::symbol_file_offset(&file, "getpid")?
+            .ok_or_else(|| format!("getpid not exported by {}", libc.display()))?;
+        return Ok((libc, offset));
+    }
+    let exe = std::fs::read_link("/proc/self/exe").map_err(|e| format!("/proc/self/exe: {e}"))?;
+    let file = std::fs::File::open(&exe).map_err(|e| format!("open {}: {e}", exe.display()))?;
+    let offset = p11scope_manifest::elf::entry_file_offset(&file)?.ok_or_else(|| {
+        format!(
+            "entry point outside every loaded segment of {}; a stripped static build has no anchor",
+            exe.display()
+        )
+    })?;
+    Ok((exe, offset))
 }
 
 /// Pure seam for the five independent facts behind `R`. Capability bits and
@@ -828,7 +856,45 @@ fn proc_mem_check(pid: u32) -> Check {
     Check { name, status }
 }
 
+/// Unified hierarchy ⟺ the root `cgroup.controllers` file exists (a v2
+/// mount) and our own `/proc/self/cgroup` carries the unified `0::/` entry.
+/// BPF cgroup attach is v2-only at the kernel level, so anything else fails
+/// loudly here instead of surfacing a raw attach error later.
+fn unified_hierarchy(controllers: &Path, self_cgroup: &Path) -> bool {
+    let controllers_present = std::fs::metadata(controllers).is_ok_and(|meta| meta.is_file());
+    let self_unified = std::fs::read_to_string(self_cgroup)
+        .is_ok_and(|content| content.lines().any(|line| line.starts_with("0::/")));
+    controllers_present && self_unified
+}
+
+fn cgroup_version_check_at(controllers: &Path, self_cgroup: &Path) -> Check {
+    let status = if unified_hierarchy(controllers, self_cgroup) {
+        Status::Ok("unified (cgroup v2)".to_string())
+    } else {
+        Status::Fail(
+            "cgroup v2 required: no unified hierarchy (need \
+             /sys/fs/cgroup/cgroup.controllers and a 0::/ self entry)"
+                .to_string(),
+        )
+    };
+    Check {
+        name: "cgroup version".to_string(),
+        status,
+    }
+}
+
 fn cgroup_check(cgroup: &Path) -> Check {
+    if !unified_hierarchy(
+        Path::new("/sys/fs/cgroup/cgroup.controllers"),
+        Path::new("/proc/self/cgroup"),
+    ) {
+        return Check {
+            name: "cgroup path".to_string(),
+            status: Status::Fail(
+                "cgroup v2 required: no unified hierarchy for --cgroup attach".to_string(),
+            ),
+        };
+    }
     let status = match std::fs::metadata(cgroup) {
         Ok(meta) if meta.is_dir() => {
             let procs = cgroup.join("cgroup.procs");
@@ -923,7 +989,7 @@ fn capability_tier(checks: &[Check]) -> CapabilityTierResult {
         // alone. A kernel that genuinely lacks the support fails these three
         // rows, so nothing is lost by trusting them instead.
         host_attach: row_ok("BPF map create")
-            && row_ok("uprobe attach (own libc)")
+            && row_ok("uprobe attach (self)")
             && row_ok("host program preflight"),
         target_readable,
         lifecycle: row_ok("lifecycle preflight"),
@@ -980,6 +1046,16 @@ fn verdict_line(checks: &[Check]) -> String {
             _ => parts.push("cgroup scope available".to_string()),
         }
     }
+    if let Some(check) = checks.iter().find(|c| is_run_capture_row(&c.name)) {
+        match &check.status {
+            Status::NotApplicable(_) => {}
+            Status::Fail(detail) => parts.push(format!("run capture unavailable ({detail})")),
+            // The probe reports Warn("none") while the timing catalog is
+            // empty ("never eligible"): that is not availability.
+            Status::Warn(detail) => parts.push(format!("run capture not eligible ({detail})")),
+            Status::Ok(_) => parts.push("run capture available".to_string()),
+        }
+    }
     format!("verdict: {}", parts.join("; "))
 }
 
@@ -1005,11 +1081,11 @@ pub fn render(checks: &[Check]) -> String {
     out
 }
 
-/// Exit code: 0 when the capture lane (and the scan lane, if `--pid` was
-/// given, and the cgroup lane, if `--cgroup` was given) is available, 1
-/// otherwise. Takes no pid/cgroup parameter: a lane that was not requested
-/// is always recorded `Status::NotApplicable`, never `Fail`, so "any `Fail`
-/// in a requested lane" reduces to "any `Fail` among these fixed row names".
+/// Exit code: 0 when no requested lane reports `Fail` (capture, target,
+/// scan, cgroup, and run initial-set capture rows), 1 otherwise. Takes no
+/// pid/cgroup parameter: a lane that was not requested is always recorded
+/// `Status::NotApplicable`, never `Fail`, so "any `Fail` in a requested
+/// lane" reduces to "any `Fail` among these fixed row names".
 pub fn verdict(checks: &[Check]) -> i32 {
     let gated = checks.iter().any(|c| {
         (is_capture_row(&c.name)
@@ -1064,6 +1140,24 @@ mod tests {
     }
 
     #[test]
+    fn static_maps_without_libc_yield_no_anchor_while_dynamic_maps_do() {
+        let dynamic = "7f0000000000-7f0000001000 r-xp 00000000 00:20 11 /lib64/libc.so.6\n\
+                       7f0000001000-7f0000002000 r--p 00001000 00:20 11 /lib64/libc.so.6\n";
+        assert_eq!(
+            libc_path_in_maps(dynamic.as_bytes()),
+            Some(PathBuf::from("/lib64/libc.so.6"))
+        );
+        // A statically linked observer maps no libc at all — that selects the
+        // entry-point fallback, never a failure.
+        let static_maps = "555555554000-555555555000 r-xp 00000000 00:20 12 /usr/bin/tool\n\
+                           7ffffffff000-7ffffffff010 r--p 00000000 00:00 0 [vdso]\n";
+        assert_eq!(libc_path_in_maps(static_maps.as_bytes()), None);
+        // A non-executable libc mapping alone is not an anchor either.
+        let no_x = "7f0000001000-7f0000002000 r--p 00001000 00:20 11 /lib64/libc.so.6\n";
+        assert_eq!(libc_path_in_maps(no_x.as_bytes()), None);
+    }
+
+    #[test]
     fn a_failed_capture_probe_is_a_nonzero_exit_but_warnings_are_not() {
         let ok = vec![Check {
             name: "uprobe attach".into(),
@@ -1110,7 +1204,7 @@ mod tests {
             ),
             row("BPF map create", Status::Ok("created".into())),
             row(
-                "uprobe attach (own libc)",
+                "uprobe attach (self)",
                 Status::Ok("attached and detached".into()),
             ),
             row("host program preflight", Status::Ok("available".into())),
@@ -1209,7 +1303,7 @@ mod tests {
                 status: Status::Ok(String::new()),
             },
             Check {
-                name: "uprobe attach (own libc)".into(),
+                name: "uprobe attach (self)".into(),
                 status: Status::Ok(String::new()),
             },
             Check {
@@ -1258,7 +1352,7 @@ mod tests {
                 status: Status::Ok(String::new()),
             },
             Check {
-                name: "uprobe attach (own libc)".into(),
+                name: "uprobe attach (self)".into(),
                 status: Status::Ok(String::new()),
             },
             Check {
@@ -1393,8 +1487,9 @@ mod tests {
     #[test]
     fn probe_marks_unrequested_lanes_not_applicable_and_never_fails_them() {
         let checks = probe(None, None);
-        // 12 host/target rows, eight §10.1 rows, and three finite preflight rows.
-        assert_eq!(checks.len(), 23, "{checks:?}");
+        // 12 host/target rows, eight §10.1 rows, three finite preflight rows,
+        // and the cgroup version row.
+        assert_eq!(checks.len(), 24, "{checks:?}");
         let by_name = |name: &str| checks.iter().find(|c| c.name == name).unwrap();
         assert_eq!(
             by_name("/proc/<pid>/maps").status,
@@ -1497,6 +1592,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn verdict_line_names_a_failed_run_capture_lane() {
+        // LOW: verdict() gates the exit code on "run initial-set capture",
+        // so the verdict text must name it too — never "capture available"
+        // beside exit 1.
+        let failed = vec![
+            Check {
+                name: "BPF map create".into(),
+                status: Status::Ok("created".into()),
+            },
+            Check {
+                name: "run initial-set capture".into(),
+                status: Status::Fail("refused".into()),
+            },
+        ];
+        assert_eq!(verdict(&failed), 1);
+        let line = verdict_line(&failed);
+        assert!(
+            line.contains("run capture unavailable (refused)"),
+            "verdict text hides the failing lane: {line}"
+        );
+
+        let available = vec![Check {
+            name: "run initial-set capture".into(),
+            status: Status::Ok("eligible".into()),
+        }];
+        assert_eq!(verdict(&available), 0);
+        let line = verdict_line(&available);
+        assert!(
+            line.contains("run capture available"),
+            "verdict text hides the lane: {line}"
+        );
+
+        // Fable: the probe always emits Warn("none") ("never eligible while
+        // the catalog is empty"), so Warn must not render as "available".
+        let ineligible = vec![Check {
+            name: "run initial-set capture".into(),
+            status: Status::Warn("none".into()),
+        }];
+        assert_eq!(verdict(&ineligible), 0);
+        let line = verdict_line(&ineligible);
+        assert!(
+            line.contains("run capture not eligible (none)"),
+            "verdict text misstates an ineligible lane: {line}"
+        );
+    }
+
     /// A degraded timing value is a warning: it makes complete timing
     /// unavailable without making every capture lane fatal. A requested lane
     /// that is genuinely unavailable stays nonzero.
@@ -1504,7 +1646,7 @@ mod tests {
     fn a_degraded_timing_row_warns_while_a_requested_lane_still_refuses() {
         let degraded = vec![
             Check {
-                name: "uprobe attach (own libc)".into(),
+                name: "uprobe attach (self)".into(),
                 status: Status::Ok("attached and detached".into()),
             },
             Check {
@@ -1523,6 +1665,43 @@ mod tests {
             verdict(&refused),
             1,
             "a requested lane that cannot run is nonzero"
+        );
+    }
+
+    #[test]
+    fn cgroup_version_reports_unified_when_controllers_and_self_entry_agree() {
+        let dir = tempfile::tempdir().unwrap();
+        let controllers = dir.path().join("cgroup.controllers");
+        std::fs::write(&controllers, "cpuset cpu io memory\n").unwrap();
+        let self_cgroup = dir.path().join("cgroup");
+        std::fs::write(&self_cgroup, "0::/user.slice\n").unwrap();
+        let check = cgroup_version_check_at(&controllers, &self_cgroup);
+        assert_eq!(check.name, "cgroup version");
+        assert!(
+            matches!(check.status, Status::Ok(_)),
+            "unified hierarchy must pass: {:?}",
+            check.status
+        );
+    }
+
+    #[test]
+    fn cgroup_version_fails_loudly_without_unified_hierarchy() {
+        let dir = tempfile::tempdir().unwrap();
+        // v1-style self entries and no controllers file at all.
+        let self_cgroup = dir.path().join("cgroup");
+        std::fs::write(
+            &self_cgroup,
+            "2:cpu,cpuacct:/user.slice\n1:name=systemd:/user.slice\n",
+        )
+        .unwrap();
+        let check = cgroup_version_check_at(&dir.path().join("cgroup.controllers"), &self_cgroup);
+        let detail = match check.status {
+            Status::Fail(detail) => detail,
+            status => panic!("a v1 host must fail loudly: {status:?}"),
+        };
+        assert!(
+            detail.contains("cgroup v2"),
+            "the failure must name the requirement: {detail}"
         );
     }
 

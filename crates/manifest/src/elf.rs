@@ -201,3 +201,14 @@ pub fn symbol_file_offset(file: &std::fs::File, name: &str) -> Result<Option<u64
         .defined_symbol(name)?
         .map(|fact| fact.file_offset))
 }
+
+/// File offset of the ELF entry point, or `Ok(None)` when no loaded segment
+/// covers it. Lets a statically linked observer attach its self-probe to its
+/// own entry point when there is no libc mapping to borrow (the entry point
+/// itself never runs during the check — the probe is dropped immediately —
+/// so this only proves attach works, exactly like the libc-anchored probe).
+pub fn entry_file_offset(file: &std::fs::File) -> Result<Option<u64>, String> {
+    let snapshot = ElfSnapshot::read(file)?;
+    let object = parse(&snapshot.data)?;
+    Ok(file_offset(&object, object.entry()))
+}

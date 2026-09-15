@@ -1,0 +1,23 @@
+# Test holder: SoftHSM preloaded into a sleeping pid so the e2e has a stable
+# provider mapping to capture. Mirrors the spike holder shape (LD_PRELOAD,
+# no token traffic needed for discovery). Test-only: not for production.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: p11scope-holder
+  namespace: p11scope
+  labels:
+    app.kubernetes.io/name: p11scope
+    app.kubernetes.io/component: test-holder
+spec:
+  restartPolicy: Always
+  containers:
+    - name: holder
+      image: p11scope-holder:1
+      imagePullPolicy: Never
+      command: ["sleep", "infinity"]
+      env:
+        - name: LD_PRELOAD
+          value: /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so
+        - name: SOFTHSM2_CONF
+          value: /etc/softhsm/softhsm2.conf

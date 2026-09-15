@@ -80,11 +80,12 @@ pub fn read(session: &Session, plan: &AttachPlan) -> Result<Vec<SlotReport>> {
         let (k, per_cpu) = entry?;
         let total: u64 = per_cpu.iter().copied().sum();
         if total > 0 {
-            *rv_by_slot
+            let slot_rv = rv_by_slot
                 .entry(k.slot)
                 .or_default()
                 .entry(k.rv)
-                .or_default() += total;
+                .or_default();
+            *slot_rv = slot_rv.saturating_add(total);
         }
     }
 
@@ -93,13 +94,13 @@ pub fn read(session: &Session, plan: &AttachPlan) -> Result<Vec<SlotReport>> {
         let per_cpu = stats.get(&slot.index, 0)?;
         let mut acc = SlotStats::ZERO;
         for cpu in per_cpu.iter() {
-            acc.entered += cpu.entered;
-            acc.returned += cpu.returned;
-            acc.errors += cpu.errors;
-            acc.total_ns += cpu.total_ns;
+            acc.entered = acc.entered.saturating_add(cpu.entered);
+            acc.returned = acc.returned.saturating_add(cpu.returned);
+            acc.errors = acc.errors.saturating_add(cpu.errors);
+            acc.total_ns = acc.total_ns.saturating_add(cpu.total_ns);
             acc.max_ns = acc.max_ns.max(cpu.max_ns);
             for (i, b) in cpu.buckets.iter().enumerate() {
-                acc.buckets[i] += b;
+                acc.buckets[i] = acc.buckets[i].saturating_add(*b);
             }
         }
         out.push(slot_report(

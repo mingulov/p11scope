@@ -433,7 +433,25 @@ impl PinnedObjects {
             .collect();
         self.raw_to_id.retain(|raw, _| retained_raws.contains(raw));
         let retained_ids: BTreeSet<_> = self.raw_to_id.values().copied().collect();
+        let dropped: BTreeSet<_> = self
+            .by_id
+            .keys()
+            .copied()
+            .filter(|id| !retained_ids.contains(id))
+            .collect();
         self.by_id.retain(|id, _| retained_ids.contains(id));
+        // Dropping entries must not strand their claimants: scrub ownership
+        // claims and owned raws for the dropped ids, mirroring remove_view.
+        // A no-op whenever raw ownership is complete, as production scans
+        // always attach it at pin time.
+        if !dropped.is_empty() {
+            for claims in self.ownership.values_mut() {
+                claims.remove(&dropped);
+            }
+            for raws in self.raw_ownership.values_mut() {
+                raws.retain(|raw| self.raw_to_id.contains_key(raw));
+            }
+        }
         skipped
     }
 
@@ -1523,7 +1541,7 @@ fn pin_scanned_object(
         }
         let read = file.read_at(&mut bytes[..allowed], offset)?;
         budget.record_io(read);
-        operation_bytes += read as u64;
+        operation_bytes = operation_bytes.saturating_add(read as u64);
         Ok(read)
     })?;
     // The pin was taken before the bytes were hashed; a write that lands during the
@@ -2413,6 +2431,106 @@ mod tests {
         assert!(claims.tables.is_empty(), "stale table IDs: {claims:?}");
         assert!(claims.targets.is_empty(), "stale target IDs: {claims:?}");
         assert!(claims.pins.is_empty(), "stale pin IDs: {claims:?}");
+    }
+
+    /// Fixture pins bypass `record_scanned_candidate`, which attaches raw
+    /// ownership at pin time in production. Restore the production shape so
+    /// the cycle below exercises states real scans can reach.
+    fn own_all_raws(pins: &mut PinnedObjects) {
+        let raws: Vec<_> = pins.raw_to_id.keys().cloned().collect();
+        for raw in raws {
+            // Fixture keys encode their view in device.minor (see module()).
+            pins.raw_ownership
+                .entry(ProcessViewId(raw.key.device.minor as u32))
+                .or_default()
+                .insert(raw);
+        }
+    }
+
+    fn assert_pins_consistent(step: &str, pins: &PinnedObjects) {
+        let by_id: BTreeSet<_> = pins.by_id.keys().copied().collect();
+        let mut claimed = BTreeSet::new();
+        for claims in pins.ownership.values() {
+            claimed.extend(claims.tables.iter().copied());
+            claimed.extend(claims.targets.iter().map(|(id, _)| *id));
+            claimed.extend(claims.pins.iter().copied());
+        }
+        for id in &claimed {
+            assert!(
+                by_id.contains(id),
+                "[{step}] claimed id {id:?} missing from by_id"
+            );
+        }
+        for (raw, id) in &pins.raw_to_id {
+            assert!(
+                by_id.contains(id),
+                "raw {raw:?} maps to an id missing from by_id: {id:?}"
+            );
+        }
+        for raws in pins.raw_ownership.values() {
+            for raw in raws {
+                assert!(
+                    pins.raw_to_id.contains_key(raw),
+                    "owned raw {raw:?} missing from raw_to_id"
+                );
+            }
+        }
+        let manifest_backed: BTreeSet<_> = pins
+            .raw_to_id
+            .iter()
+            .filter_map(|(raw, id)| raw.mount_namespace.is_none().then_some(*id))
+            .collect();
+        for id in by_id {
+            assert!(
+                claimed.contains(&id) || manifest_backed.contains(&id),
+                "by_id id {id:?} is neither claimed nor manifest-backed"
+            );
+        }
+    }
+
+    /// MED-4: `replace_view_pins` retains `by_id` by surviving raws, so any
+    /// raw-ownership gap would strand dangling claim ids (and stale owned
+    /// raws). Production scans always attach raw ownership at pin time, but
+    /// the replace path must not trust that: it scrubs both maps for ids its
+    /// retain drops, mirroring `remove_view`.
+    #[test]
+    fn replace_absorb_remove_cycles_keep_claims_and_pins_consistent() {
+        let real = |minor| ObjectKey {
+            device: Device { major: 8, minor },
+            inode: INODE + minor,
+        };
+        let first_module = module(real(1));
+        let mut pins = image_pins(&[(real(1), "aaaaaaaa", 1)]);
+        reconcile_scanned_modules(std::slice::from_ref(&first_module), &mut pins);
+        own_all_raws(&mut pins);
+        assert_pins_consistent("reconcile", &pins);
+
+        let second_module = module(real(17));
+        let mut incoming = image_pins(&[(real(17), "bbbbbbbb", 2)]);
+        reconcile_scanned_modules(std::slice::from_ref(&second_module), &mut incoming);
+        own_all_raws(&mut incoming);
+        pins.absorb(incoming);
+        assert_pins_consistent("absorb", &pins);
+
+        let mut rescan = image_pins(&[(real(1), "aaaaaaaa", 1)]);
+        reconcile_scanned_modules(std::slice::from_ref(&first_module), &mut rescan);
+        own_all_raws(&mut rescan);
+        pins.replace_view_pins(first_module.view, rescan, &[]);
+        assert_pins_consistent("replace", &pins);
+
+        // The gap shape: raw ownership lost while claims survive (never from
+        // production scans, but the replace path must survive it anyway).
+        // View 17 keeps its claims while its id loses every owned raw.
+        pins.raw_ownership.clear();
+        pins.replace_view_pins(first_module.view, PinnedObjects::empty(), &[]);
+        assert_pins_consistent("replace-after-gap", &pins);
+        assert!(
+            pins.by_id.is_empty() && pins.raw_to_id.is_empty(),
+            "unowned pins are collected, not stranded"
+        );
+
+        pins.remove_view(second_module.view);
+        assert_pins_consistent("remove", &pins);
     }
 
     #[test]

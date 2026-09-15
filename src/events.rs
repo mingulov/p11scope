@@ -130,7 +130,7 @@ impl<S: RecordSource> EventDrain<S> {
                         return true;
                     }
                 }
-                None => self.malformed += 1,
+                None => self.malformed = self.malformed.saturating_add(1),
             }
         }
     }
@@ -265,6 +265,16 @@ mod tests {
     fn only_a_fully_detached_ring_is_polled_without_a_quantum() {
         assert_eq!(poll_quantum(false), Some(LIVE_POLL_QUANTUM));
         assert_eq!(poll_quantum(true), None);
+    }
+
+    #[test]
+    fn malformed_counter_saturates_instead_of_wrapping() {
+        // LOW: published counters saturate — a wrap would corrupt evidence
+        // and a debug overflow would abort the capture mid-drain.
+        let mut drain = EventDrain::over(ScriptedRecords::records([vec![0u8; 3]], 1));
+        drain.malformed = u64::MAX;
+        drain.poll(None, |_| ControlFlow::Continue(()));
+        assert_eq!(drain.malformed(), u64::MAX);
     }
 
     /// One record past the quantum, then a record the poll must never take.

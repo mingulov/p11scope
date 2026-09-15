@@ -1,0 +1,10 @@
+# Test holder image: SoftHSM library present so LD_PRELOAD maps a provider
+# into the sleeping pid. No token traffic needed for discovery.
+#   docker build -f p11scope/deploy/Dockerfile.holder -t p11scope-holder:1 p11scope
+# ubuntu:26.04 for the longer support window (test-only image; the observer
+# itself is musl-static on Alpine and has no distro dependency).
+FROM ubuntu:26.04
+RUN apt-get update && apt-get install -y --no-install-recommends softhsm2 \
+    && rm -rf /var/lib/apt/lists/* \
+    && test -f /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so
+CMD ["sleep", "infinity"]

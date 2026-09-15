@@ -33,6 +33,8 @@ fn run_args(command: &[&str]) -> RunArgs {
         duration: None,
         out: None,
         max_events: None,
+        ring_bytes: None,
+        drain_interval: None,
         unsafe_requested: false,
         allow_confined_uretprobe: false,
         pause: PausePolicy::Never,

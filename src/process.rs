@@ -82,7 +82,7 @@ impl Tracker {
             if let Some(evicted) = self.least_recent_pid() {
                 let key = self.records.remove(&evicted).unwrap().key;
                 retired = retired.or(Some(key));
-                self.evidence.evictions += 1;
+                self.evidence.evictions = self.evidence.evictions.saturating_add(1);
             }
         }
 
@@ -92,19 +92,19 @@ impl Tracker {
             match pidfd_open(pid) {
                 Ok(fd) => Mode::PidFd(fd),
                 Err(_) if start_time.is_some() => {
-                    self.evidence.fallbacks += 1;
+                    self.evidence.fallbacks = self.evidence.fallbacks.saturating_add(1);
                     Mode::ProcStat
                 }
                 Err(_) => {
-                    self.evidence.failures += 1;
+                    self.evidence.failures = self.evidence.failures.saturating_add(1);
                     Mode::Untracked
                 }
             }
         } else if start_time.is_some() {
-            self.evidence.fallbacks += 1;
+            self.evidence.fallbacks = self.evidence.fallbacks.saturating_add(1);
             Mode::ProcStat
         } else {
-            self.evidence.failures += 1;
+            self.evidence.failures = self.evidence.failures.saturating_add(1);
             Mode::Untracked
         };
         let generation = start_time.unwrap_or((1u64 << 63) | self.sequence);
@@ -167,7 +167,7 @@ impl Tracker {
             let record = self.records.get_mut(&pid).unwrap();
             if record.start_time.is_some() {
                 record.mode = Mode::ProcStat;
-                self.evidence.fallbacks += 1;
+                self.evidence.fallbacks = self.evidence.fallbacks.saturating_add(1);
             }
         }
     }

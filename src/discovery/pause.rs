@@ -1,5 +1,3 @@
-#![allow(dead_code)] // Task 8 wires this reviewed internal coordinator into the binary loop.
-
 use crate::run::OwnedChild;
 use crate::{
     attach,
@@ -160,6 +158,7 @@ pub(crate) struct PauseCounters {
 }
 
 impl PauseCounters {
+    #[allow(dead_code)] // Test-only constructor; production counts via begin_attempt.
     fn confirmed(attempts: u64) -> Self {
         Self {
             attempts,
@@ -168,6 +167,7 @@ impl PauseCounters {
         }
     }
 
+    #[allow(dead_code)] // Test-only constructor; production counts via begin_attempt.
     fn partial(attempts: u64) -> Self {
         Self {
             attempts,
@@ -1800,18 +1800,22 @@ impl PauseCoordinator {
         self.counters
     }
 
+    #[allow(dead_code)] // Introspection accessor; exercised only by the pause tests.
     pub(crate) fn status(&self) -> PauseStatus {
         self.counters.status()
     }
 
+    #[allow(dead_code)] // Introspection accessor; exercised only by the pause tests.
     pub(crate) fn is_armed(&self) -> bool {
         self.armed
     }
 
+    #[allow(dead_code)] // Introspection accessor; exercised only by the pause tests.
     pub(crate) fn rearming_enabled(&self) -> bool {
         self.rearming_enabled
     }
 
+    #[allow(dead_code)] // Introspection accessor; exercised only by the pause tests.
     pub(crate) fn generation(&self) -> u64 {
         self.generation
     }

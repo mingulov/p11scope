@@ -472,6 +472,139 @@ mod corrective_tests {
         assert_eq!(unsafe_state.semantic_evidence().fork_state_ambiguities, 1);
     }
 
+    /// MED-6 equivalence: pins the full inherited shape across the
+    /// clone-hoist refactor (sessions, ops, ambiguity, counters).
+    #[test]
+    fn fork_inherits_exact_parent_sessions_and_ops() {
+        let p = plan(&["C_OpenSession"]);
+        let mut state = State::new(&p);
+        let parent = ProcessKey {
+            pid: 100,
+            generation: 1,
+        };
+        let child = ProcessKey {
+            pid: 101,
+            generation: 1,
+        };
+        state.open.insert(
+            (parent, sess(7)),
+            SessionInfo {
+                pseudonym: 1,
+                slot: 3,
+                fork_safe: true,
+            },
+        );
+        state.open.insert(
+            (parent, sess(8)),
+            SessionInfo {
+                pseudonym: 2,
+                slot: 3,
+                fork_safe: false,
+            },
+        );
+        state.active_ops.insert(
+            (parent, sess(7), 1),
+            Binding {
+                mechanism: 9,
+                fork_safe: true,
+            },
+        );
+        state.active_ops.insert(
+            (parent, sess(7), 2),
+            Binding {
+                mechanism: 9,
+                fork_safe: false,
+            },
+        );
+        state.active_ops.insert(
+            (parent, sess(8), 1),
+            Binding {
+                mechanism: 9,
+                fork_safe: true,
+            },
+        );
+        state.find_active.insert((parent, sess(7)));
+
+        state.fork_process(parent, child);
+
+        // Safe session inherited with a fresh child pseudonym; the unsafe
+        // session never materializes.
+        let info = state
+            .open
+            .get(&(child, sess(7)))
+            .expect("safe session inherited");
+        assert_eq!((info.slot, info.pseudonym), (3, 1));
+        assert!(!state.open.contains_key(&(child, sess(8))));
+        // Safe op inherited; unsafe op of the safe session marks ambiguity;
+        // the unsafe session's op is never visited.
+        assert_eq!(
+            state
+                .active_ops
+                .get(&(child, sess(7), 1))
+                .unwrap()
+                .mechanism,
+            9
+        );
+        assert!(!state.active_ops.contains_key(&(child, sess(7), 2)));
+        assert!(!state.active_ops.contains_key(&(child, sess(8), 1)));
+        assert!(state.inherited_ambiguous.contains(&(child, sess(7))));
+        assert!(state.inherited_ambiguous.contains(&(child, sess(8))));
+        assert!(state.find_active.contains(&(child, sess(7))));
+        assert_eq!(state.sessions().inherited, 1);
+        // The parent's own maps are untouched by the fork.
+        assert_eq!(state.open.len(), 3);
+        assert_eq!(state.active_ops.len(), 4);
+    }
+
+    /// MED-6: `fork_process` cloned the full `active_ops` map per session
+    /// (sessions x ops). 2000 sessions x 6000 ops = 12M entry copies, which
+    /// stalls the capture loop; the single pre-pass visits each entry once.
+    #[test]
+    fn fork_at_state_cap_completes_without_quadratic_stall() {
+        let p = plan(&["C_OpenSession"]);
+        let mut state = State::new(&p);
+        let parent = ProcessKey {
+            pid: 100,
+            generation: 1,
+        };
+        let child = ProcessKey {
+            pid: 101,
+            generation: 1,
+        };
+        for handle in 0..2000u64 {
+            state.open.insert(
+                (parent, sess(handle)),
+                SessionInfo {
+                    pseudonym: handle,
+                    slot: 0,
+                    fork_safe: true,
+                },
+            );
+            for operation in 0..3u16 {
+                state.active_ops.insert(
+                    (parent, sess(handle), operation),
+                    Binding {
+                        mechanism: 1,
+                        fork_safe: true,
+                    },
+                );
+            }
+        }
+        state.state_keys = state.open.len() + state.active_ops.len();
+        let start = std::time::Instant::now();
+        state.fork_process(parent, child);
+        let elapsed = start.elapsed();
+        assert_eq!(state.open.len(), 4000);
+        assert_eq!(state.active_ops.len(), 12000);
+        // Calibrated for the debug test profile: 12M entry copies take ~2.7s
+        // pre-fix here; the pre-pass fork below is milliseconds, so 2s has a
+        // wide margin in the durable (green) direction on any hardware.
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "fork stalled the loop: {elapsed:?}"
+        );
+    }
+
     /// `close_finalize_pid_reuse_and_fork_copy_only_proven_state` observes
     /// `C_Finalize` as a *reused* pid, so the pid-reuse hook retires the state
     /// before `apply_lifecycle` ever sees the event. This one reaches the
@@ -766,6 +899,45 @@ mod corrective_tests {
 
         state.observe(&complete_final);
         assert_eq!(state.semantic_evidence().async_orphans, 1);
+    }
+
+    /// HI-2: cross-CPU reorder can commit a session close ahead of an
+    /// in-flight async GET_ID; the GET_ID must not destroy the pending op
+    /// because the later completion still applies without `open`.
+    #[test]
+    fn async_get_id_after_close_keeps_the_op_completable() {
+        let p = plan(&[
+            "C_OpenSession",
+            "C_CloseSession",
+            "C_SignFinal",
+            "C_AsyncGetID",
+            "C_AsyncComplete",
+        ]);
+        let mut state = State::new(&p);
+
+        state.observe(&open(&p, 7, 3));
+        state.observe(&event(&p, "C_CloseSession", 7, 0));
+        // Reordered: the op start arrives after the close committed.
+        state.observe(&event(&p, "C_SignFinal", 7, CkRv::PENDING.0));
+        assert_eq!(state.pending_at_end(), 1);
+
+        let mut get_id = event(&p, "C_AsyncGetID", 7, 0);
+        get_id.target_function = crate::kinds::function_id("C_SignFinal").unwrap();
+        get_id.async_value = 42;
+        state.observe(&get_id);
+        assert_eq!(state.semantic_evidence().async_target_failures, 1);
+        assert_eq!(
+            state.pending_at_end(),
+            1,
+            "a GET_ID past close must not strand a completable op"
+        );
+
+        let mut complete = event(&p, "C_AsyncComplete", 7, 0);
+        complete.target_function = crate::kinds::function_id("C_SignFinal").unwrap();
+        complete.async_value = CkRv::OK.0;
+        state.observe(&complete);
+        assert_eq!(state.pending_at_end(), 0);
+        assert_eq!(state.semantic_evidence().async_orphans, 0);
     }
 
     #[test]
@@ -1513,7 +1685,10 @@ impl State {
         self.sessions = SessionStats::default();
         self.orphan_ops = 0;
         self.unmatched_closes = 0;
-        self.evidence.state_reconciliations += u64::from(changed);
+        self.evidence.state_reconciliations = self
+            .evidence
+            .state_reconciliations
+            .saturating_add(u64::from(changed));
     }
 
     // ponytail: admissions are a monotonic per-capture budget. Replace with
@@ -1528,7 +1703,8 @@ impl State {
                 true
             }
             _ => {
-                self.evidence.semantic_state_drops += 1;
+                self.evidence.semantic_state_drops =
+                    self.evidence.semantic_state_drops.saturating_add(1);
                 false
             }
         }
@@ -1615,7 +1791,8 @@ impl State {
                 .inherited_ambiguous
                 .remove(&(process, meta.session(ev.session)))
         {
-            self.evidence.fork_state_ambiguities += 1;
+            self.evidence.fork_state_ambiguities =
+                self.evidence.fork_state_ambiguities.saturating_add(1);
         }
         if matches!(
             meta.semantics.lifecycle,
@@ -1724,7 +1901,8 @@ impl State {
                 MechanismCapture::Null => {
                     self.active_ops.remove(&key);
                     if meta.semantics.semantic_flags & semantic_flags::NULL_MECHANISM_CANCEL == 0 {
-                        self.evidence.semantic_capture_failures += 1;
+                        self.evidence.semantic_capture_failures =
+                            self.evidence.semantic_capture_failures.saturating_add(1);
                     }
                 }
                 MechanismCapture::Unreadable | MechanismCapture::Absent => {
@@ -1797,12 +1975,18 @@ impl State {
                     .find_active
                     .remove(&(process, meta.session(ev.session)));
             }
-            self.evidence.state_reconciliations += u64::from(changed);
+            self.evidence.state_reconciliations = self
+                .evidence
+                .state_reconciliations
+                .saturating_add(u64::from(changed));
             return true;
         }
         if matches!(ev.rv, 0x0000_00b0 | 0x0000_00b3) {
             let changed = self.retire_session(process, meta.session(ev.session));
-            self.evidence.state_reconciliations += u64::from(changed);
+            self.evidence.state_reconciliations = self
+                .evidence
+                .state_reconciliations
+                .saturating_add(u64::from(changed));
             return true;
         }
         if ev.rv == CkRv::CRYPTOKI_NOT_INITIALIZED.0 {
@@ -1812,7 +1996,10 @@ impl State {
             // slot, whose module is `MODULE_UNRESOLVED`, gets to destroy
             // nothing rather than everything.
             let changed = self.retire_scope(process, Some(meta.module)) > 0;
-            self.evidence.state_reconciliations += u64::from(changed);
+            self.evidence.state_reconciliations = self
+                .evidence
+                .state_reconciliations
+                .saturating_add(u64::from(changed));
             return true;
         }
         false
@@ -1823,11 +2010,15 @@ impl State {
         match meta.semantics.lifecycle {
             lifecycle::OPEN_SESSION if ev.rv == CkRv::OK.0 && ev.session != SESSION_NONE => {
                 if self.retire_session(process, session) {
-                    self.evidence.state_reconciliations += 1;
+                    self.evidence.state_reconciliations =
+                        self.evidence.state_reconciliations.saturating_add(1);
                 }
                 let async_session = ev.capture & capture::ASYNC_SESSION != 0;
-                self.sessions.opened += 1;
-                self.sessions.async_opened += u64::from(async_session);
+                self.sessions.opened = self.sessions.opened.saturating_add(1);
+                self.sessions.async_opened = self
+                    .sessions
+                    .async_opened
+                    .saturating_add(u64::from(async_session));
                 let counter_new = !self.next_pseudonym.contains_key(&process);
                 if self.admit(1 + usize::from(counter_new)) {
                     let counter = self.next_pseudonym.entry(process).or_default();
@@ -1881,7 +2072,8 @@ impl State {
             lifecycle::SESSION_CANCEL => self.apply_session_cancel(process, ev, session),
             lifecycle::SET_OPERATION_STATE if ev.rv == CkRv::OK.0 => {
                 self.clear_operations(process, session, u16::MAX);
-                self.evidence.operation_state_imports += 1;
+                self.evidence.operation_state_imports =
+                    self.evidence.operation_state_imports.saturating_add(1);
             }
             _ => {}
         }
@@ -1917,17 +2109,22 @@ impl State {
         for session in sessions {
             changed |= self.clear_session_state(process, session);
         }
-        self.evidence.auth_state_ambiguities += u64::from(changed);
+        self.evidence.auth_state_ambiguities = self
+            .evidence
+            .auth_state_ambiguities
+            .saturating_add(u64::from(changed));
     }
 
     fn apply_session_cancel(&mut self, process: ProcessKey, ev: &Event, session: SessionRef) {
         if ev.flags & !KNOWN_CANCEL_FLAGS != 0 {
-            self.evidence.session_cancel_unknown_flags += 1;
+            self.evidence.session_cancel_unknown_flags =
+                self.evidence.session_cancel_unknown_flags.saturating_add(1);
         }
         let selected = (ev.flags & KNOWN_CANCEL_FLAGS).count_ones();
         if ev.rv == CkRv::OPERATION_CANCEL_FAILED.0 && selected > 1 {
             self.clear_selected(process, session, ev.flags);
-            self.evidence.session_cancel_ambiguities += 1;
+            self.evidence.session_cancel_ambiguities =
+                self.evidence.session_cancel_ambiguities.saturating_add(1);
         } else if ev.rv == CkRv::OK.0 {
             self.clear_selected(process, session, ev.flags);
         }
@@ -1958,11 +2155,13 @@ impl State {
 
     fn observe_async(&mut self, process: ProcessKey, ev: &Event) {
         if ev.target_function == FUNCTION_NONE {
-            self.evidence.async_target_failures += 1;
+            self.evidence.async_target_failures =
+                self.evidence.async_target_failures.saturating_add(1);
             return;
         }
         if ev.capture & capture::ASYNC_VALUE_UNREADABLE != 0 {
-            self.evidence.async_target_failures += 1;
+            self.evidence.async_target_failures =
+                self.evidence.async_target_failures.saturating_add(1);
             return;
         }
         let Some(meta) = self.slots.get(ev.slot as usize).and_then(Clone::clone) else {
@@ -1984,7 +2183,7 @@ impl State {
                     detached_key.and_then(|key| self.detached.remove(&key).map(|d| d.pending))
                 });
                 let Some(pending) = pending else {
-                    self.evidence.async_orphans += 1;
+                    self.evidence.async_orphans = self.evidence.async_orphans.saturating_add(1);
                     return;
                 };
                 let mut completed = pending.event;
@@ -2000,12 +2199,17 @@ impl State {
             }
             lifecycle::ASYNC_GET_ID if ev.rv == CkRv::OK.0 => {
                 let key = (process, session, ev.target_function);
-                let Some(pending) = self.pending.remove(&key) else {
-                    self.evidence.async_orphans += 1;
+                // The `open` check runs before the removal: a close committed
+                // ahead of this GET_ID (no cross-CPU ringbuf order) must not
+                // destroy the pending op, whose later completion still applies
+                // without `open`.
+                let Some(slot) = self.open.get(&(process, session)).map(|info| info.slot) else {
+                    self.evidence.async_target_failures =
+                        self.evidence.async_target_failures.saturating_add(1);
                     return;
                 };
-                let Some(slot) = self.open.get(&(process, session)).map(|info| info.slot) else {
-                    self.evidence.async_target_failures += 1;
+                let Some(pending) = self.pending.remove(&key) else {
+                    self.evidence.async_orphans = self.evidence.async_orphans.saturating_add(1);
                     return;
                 };
                 if self
@@ -2020,12 +2224,14 @@ impl State {
                     )
                     .is_some()
                 {
-                    self.evidence.async_duplicates += 1;
+                    self.evidence.async_duplicates =
+                        self.evidence.async_duplicates.saturating_add(1);
                 }
             }
             lifecycle::ASYNC_JOIN if ev.rv == CkRv::OK.0 => {
                 let Some(slot) = self.open.get(&(process, session)).map(|info| info.slot) else {
-                    self.evidence.async_target_failures += 1;
+                    self.evidence.async_target_failures =
+                        self.evidence.async_target_failures.saturating_add(1);
                     return;
                 };
                 match self.detached.get_mut(&(
@@ -2042,7 +2248,9 @@ impl State {
                         detached.owner = Some((process, session));
                         detached.process = process;
                     }
-                    None => self.evidence.async_orphans += 1,
+                    None => {
+                        self.evidence.async_orphans = self.evidence.async_orphans.saturating_add(1)
+                    }
                 }
             }
             _ => {}
@@ -2051,11 +2259,13 @@ impl State {
 
     fn queue_pending(&mut self, process: ProcessKey, ev: &Event, meta: SlotMeta) {
         let Some(function_id) = meta.function_id else {
-            self.evidence.async_target_failures += 1;
+            self.evidence.async_target_failures =
+                self.evidence.async_target_failures.saturating_add(1);
             return;
         };
         if meta.semantics.lifecycle == lifecycle::OPEN_SESSION && ev.session == SESSION_NONE {
-            self.evidence.async_target_failures += 1;
+            self.evidence.async_target_failures =
+                self.evidence.async_target_failures.saturating_add(1);
             return;
         }
         self.sequence = self.sequence.wrapping_add(1);
@@ -2067,7 +2277,7 @@ impl State {
             sequence: self.sequence,
         };
         if self.pending.insert(key, pending).is_some() {
-            self.evidence.async_duplicates += 1;
+            self.evidence.async_duplicates = self.evidence.async_duplicates.saturating_add(1);
         }
         self.evict_pending_if_needed();
     }
@@ -2102,7 +2312,7 @@ impl State {
             }
             (None, None) => return,
         }
-        self.evidence.async_evictions += 1;
+        self.evidence.async_evictions = self.evidence.async_evictions.saturating_add(1);
     }
 
     fn observe_templates(&mut self, ev: &Event, meta: &SlotMeta) {
@@ -2234,7 +2444,7 @@ impl State {
         let existed = self.open.remove(&(process, session)).is_some();
         self.clear_session_state(process, session);
         if existed {
-            self.sessions.closed += 1;
+            self.sessions.closed = self.sessions.closed.saturating_add(1);
         }
         existed
     }
@@ -2271,7 +2481,7 @@ impl State {
             let existed = self.open.remove(&(process, *session)).is_some();
             self.clear_session_state(process, *session);
             if existed && count_closed {
-                self.sessions.closed += 1;
+                self.sessions.closed = self.sessions.closed.saturating_add(1);
             }
         }
         // Sessions the capture never saw opening leave state behind that no
@@ -2319,6 +2529,16 @@ impl State {
             .filter(|((owner, _), _)| *owner == parent)
             .map(|((_, session), info)| (*session, *info))
             .collect();
+        // The parent's in-flight ops, collected once: the loop below only
+        // reads them (child-keyed inserts never match the parent filter),
+        // so one pre-pass is equivalent to a per-session full-map clone and
+        // turns O(sessions x ops) into O(sessions + ops) per fork.
+        let parent_ops: Vec<((ProcessKey, SessionRef, u16), Binding)> = self
+            .active_ops
+            .iter()
+            .filter(|((owner, _, _), _)| *owner == parent)
+            .map(|(key, binding)| (*key, *binding))
+            .collect();
         for (session, info) in sessions {
             if !info.fork_safe {
                 let key = (child, session);
@@ -2342,13 +2562,13 @@ impl State {
                     ..info
                 },
             );
-            self.sessions.inherited += 1;
-            for ((owner, handle, operation), binding) in self.active_ops.clone() {
-                if owner == parent && handle == session {
+            self.sessions.inherited = self.sessions.inherited.saturating_add(1);
+            for ((_, handle, operation), binding) in &parent_ops {
+                if *handle == session {
                     if binding.fork_safe {
-                        let key = (child, session, operation);
+                        let key = (child, session, *operation);
                         if self.active_ops.contains_key(&key) || self.admit(1) {
-                            self.active_ops.insert(key, binding);
+                            self.active_ops.insert(key, *binding);
                         }
                     } else {
                         let key = (child, session);
@@ -2512,7 +2732,7 @@ fn record_call(stat: &mut MechStat, ev: &Event) {
         stat.errors += 1;
     }
     stat.buckets[bucket_of(ev.duration_ns) as usize] += 1;
-    stat.total_ns += ev.duration_ns;
+    stat.total_ns = stat.total_ns.saturating_add(ev.duration_ns);
     stat.max_ns = stat.max_ns.max(ev.duration_ns);
 }
 

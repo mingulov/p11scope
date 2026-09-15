@@ -1,7 +1,8 @@
 /* Slice 1b-2 production live-discovery provider fixture.
  *
  * Written for this campaign; it adapts the reviewed research behaviour of
- * spike/slice1b2-loader-host/fixture-provider.c and
+ * preserved/2026-09-15-spike-slice1b2/slice1b2-loader-host/fixture-provider.c
+ * (formerly spike/slice1b2-loader-host/) and
  * crates/discover/tests/fixture/version_matrix.c in source form only. No
  * research binary and no historical campaign row is an input here.
  *

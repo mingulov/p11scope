@@ -1,0 +1,100 @@
+# p11scope node observer: one privileged agent pod per node. It idles (sleep)
+# and performs one-shot `profile --cgroup` runs on operator request — see
+# ../../scripts/k8s-profile-entry.sh, executed via `kubectl exec` so every
+# capture keeps an explicit human trigger and its own output file.
+#
+# Privilege rationale (mirrors the node-side attach-pod.sh requirements):
+# - hostPID: resolve container pids and read /proc/<pid>/root + maps.
+# - caps BPF + PERFMON + SYS_ADMIN: uprobe/perf attach. SYS_ADMIN is
+#   required when kernel.perf_event_paranoid >= 3 (doctor says so
+#   explicitly); on paranoid <= 2 hosts SYS_ADMIN can be dropped and the
+#   BPF+PERFMON pair suffices. (Pre-5.8 kernels need SYS_ADMIN too.)
+# - caps SYS_PTRACE + DAC_READ_SEARCH: cross-user /proc + object reads.
+# - /sys/fs/cgroup (ro): locate the target pod cgroup from the node view
+#   (with a cgroup namespace the pod's own /proc/self/cgroup reads "/").
+# - /sys/fs/bpf (rw): pin the observer's own BPF maps/objects.
+# (/proc needs no mount: with hostPID the pod already sees host pids.)
+# No hostNetwork, no privileged:true, no secret/env access. Read-only root
+# filesystem IS set: the only writable path is the `scratch` emptyDir at
+# /tmp, so operator captures must pass `-o /tmp/<name>.json` (Gate K1 does)
+# and then `kubectl cp` the file out (nothing leaves the node otherwise).
+# Kubelet creates that mount 0777 without sticky, which the observer's trust
+# check refuses — the entry script restores 1777 on /tmp before every exec.
+#
+# Gated variant: on kernel.perf_event_paranoid <= 2 hosts (and kernels >=
+# 5.8), drop the SYS_ADMIN cap below — BPF+PERFMON suffice, and
+# scripts/verify-capability-tier.sh proves which tier a node is on. Keep
+# SYS_ADMIN only where the tier gate demands it.
+#
+# Seccomp is RuntimeDefault (K1-proven on kind): the containerd default
+# profile allows bpf(), perf_event_open(), openat2(), pidfd, and the
+# process-inspection syscalls the observer needs, so Unconfined buys
+# nothing. Capabilities drop ALL then add back the five BPF-observation
+# caps; allowPrivilegeEscalation is false (exec needs no setuid).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: p11scope-observer
+  namespace: p11scope
+  labels:
+    app.kubernetes.io/name: p11scope
+    app.kubernetes.io/component: observer
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: p11scope
+      app.kubernetes.io/component: observer
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: p11scope
+        app.kubernetes.io/component: observer
+    spec:
+      serviceAccountName: p11scope-observer
+      hostPID: true
+      containers:
+        - name: observer
+          image: p11scope-observer:1
+          imagePullPolicy: Never
+          command: ["sleep", "infinity"]
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - BPF
+                - PERFMON
+                - SYS_PTRACE
+                - DAC_READ_SEARCH
+                - SYS_ADMIN # perf_event_paranoid >= 3 hosts; drop on <= 2
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: cgroupfs
+              mountPath: /sys/fs/cgroup
+              readOnly: true
+            - name: bpffs
+              mountPath: /sys/fs/bpf
+            - name: scratch
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+      volumes:
+        - name: cgroupfs
+          hostPath:
+            path: /sys/fs/cgroup
+        - name: bpffs
+          hostPath:
+            path: /sys/fs/bpf
+        - name: scratch
+          emptyDir: {}
+      tolerations:
+        # Observe every node, including control-plane-only kind clusters.
+        - operator: Exists

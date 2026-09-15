@@ -30,10 +30,12 @@ jobs:
           UNRUN: scripts/bench-overhead.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/build-release.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/dump-owned-bpf-maps.py (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/k8s-profile-entry.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/verify-canaries.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/verify-capability-tier.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/verify-discover-containers.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/verify-induced-gaps.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/verify-k8s-attach.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/verify-live-discovery-preflight.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/verify-task4-lane02.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/verify-task4-lane16.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
@@ -89,6 +91,8 @@ jobs:
       - run: scripts/verify-task4-lane16.sh --self-test
       - run: scripts/attach-pod.sh --self-test
       - run: scripts/build-release.sh --self-test
+      - run: scripts/k8s-profile-entry.sh --self-test
+      - run: scripts/verify-k8s-attach.sh --self-test
       - run: scripts/matrix/verify-fork-scope.sh --self-test
       - run: scripts/matrix/verify-ia32-compat.sh --self-test
       - run: scripts/matrix/verify-oracle.sh --self-test

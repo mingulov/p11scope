@@ -1,0 +1,20 @@
+# p11scope node-observer image: musl-static binary on Alpine + the
+# in-cluster attach entry script. Built from the repository root context:
+#   docker build -f p11scope/deploy/Dockerfile.observer -t p11scope-observer:1 p11scope
+# Requires the static binary (pure-Rust deps + aya make this work):
+#   CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+#     cargo +1.88 build --locked --release \
+#     --target x86_64-unknown-linux-musl --bin p11scope
+# (musl-tools provides the linker; the target-scoped env var keeps the
+# nested bpfel-unknown-none build inside build.rs on its own linker.)
+# Base rationale (see deploy/k8s/README.md): static-pie needs no libc, so
+# Alpine's musl is fine; sh entrypoint keeps distroless out (no shell).
+FROM alpine:3.24
+RUN apk add --no-cache ca-certificates curl jq
+COPY target/x86_64-unknown-linux-musl/release/p11scope /usr/local/bin/p11scope
+COPY scripts/k8s-profile-entry.sh /usr/local/bin/k8s-profile-entry
+RUN chmod +x /usr/local/bin/k8s-profile-entry \
+    && /usr/local/bin/p11scope --help >/dev/null \
+    && /usr/local/bin/k8s-profile-entry --self-test
+ENTRYPOINT ["/usr/local/bin/k8s-profile-entry"]
+CMD ["--help"]

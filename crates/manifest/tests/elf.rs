@@ -1,5 +1,7 @@
 use object::elf;
-use p11scope_manifest::elf::{ElfSnapshot, exports_matching, symbol_file_offset};
+use p11scope_manifest::elf::{
+    ElfSnapshot, entry_file_offset, exports_matching, symbol_file_offset,
+};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -40,6 +42,21 @@ fn tmp(name: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
+}
+
+/// Hermetic executable with a custom entry point: `-nostdlib` means no libc
+/// is needed at all, so the static variant also builds without a static
+/// toolchain — the shape a statically linked observer has.
+fn cc_entry_exe(dir: &Path, name: &str, extra: &[&str]) -> PathBuf {
+    let c = dir.join(format!("{name}.c"));
+    let exe = dir.join(name);
+    std::fs::write(&c, "void entry_point(void) {}\n").unwrap();
+    let mut cmd = Command::new("gcc");
+    cmd.args(["-nostdlib", "-e", "entry_point", "-o"]);
+    cmd.arg(&exe).arg(&c).args(extra);
+    let ok = cmd.status().unwrap().success();
+    assert!(ok, "gcc failed for {name}");
+    exe
 }
 
 fn le_u16(bytes: &[u8], offset: usize) -> u16 {
@@ -241,6 +258,32 @@ fn only_registry_exports_are_reported_with_usable_offsets() {
             .is_some()
     );
     assert_eq!(symbol_file_offset(&file, "C_NotThere").unwrap(), None);
+}
+
+#[test]
+fn entry_offset_is_the_custom_entry_symbol_in_both_linkages() {
+    // The doctor's static-build fallback anchors its self-probe here; the
+    // entry symbol route (symtab) and the entry header route must agree.
+    for (case, extra) in [("dynamic", &[] as &[&str]), ("static", &["-static"])] {
+        let d = tmp(&format!("elf-entry-{case}"));
+        let exe = cc_entry_exe(&d, "anchored", extra);
+        let file = p11scope_manifest::identity::open_object(&exe).unwrap();
+        let entry = entry_file_offset(&file)
+            .unwrap_or_else(|e| panic!("{case}: entry unreadable: {e}"))
+            .unwrap_or_else(|| panic!("{case}: entry outside every loaded segment"));
+        let symbol = symbol_file_offset(&file, "entry_point")
+            .unwrap()
+            .unwrap_or_else(|| panic!("{case}: entry symbol missing"));
+        assert_eq!(
+            entry, symbol,
+            "{case}: header route and symtab route disagree"
+        );
+        let inspected = p11scope_manifest::identity::inspect_file(&file).unwrap();
+        assert!(
+            inspected.contains_executable_offset(entry),
+            "{case}: entry offset {entry:#x} is outside every executable segment"
+        );
+    }
 }
 
 #[test]

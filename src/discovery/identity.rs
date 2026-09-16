@@ -31,7 +31,7 @@ pub(crate) struct Pin {
     ctime: (i64, i64),
 }
 
-fn pin_of(file: &std::fs::File) -> Result<Pin, String> {
+pub(crate) fn pin_of(file: &std::fs::File) -> Result<Pin, String> {
     let md = file
         .metadata()
         .map_err(|error| format!("fstat failed: {error}"))?;

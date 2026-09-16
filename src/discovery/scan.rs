@@ -6,7 +6,7 @@
 //! authority the offline helper uses — so a scanned offset equals a manifest offset.
 
 use crate::discovery::hooks::HookRegistry;
-use crate::discovery::identity::Pin;
+use crate::discovery::identity::{Pin, pin_of};
 use crate::process::{MountNamespaceId, ProcessView, ProcessViewId};
 use p11scope_manifest::elf::{ElfAbi, ElfSnapshot};
 use p11scope_manifest::identity::{InspectedObject, open_object};
@@ -246,6 +246,15 @@ pub(crate) struct InspectedFileKey {
     pub(crate) pin: Pin,
 }
 
+/// The digest-sized facts one ELF contributes to every scan: its ABI plus the
+/// `(name, file offset)` exports matching the capture's hook names. File-derived
+/// only — safe to share across views the way the raw snapshot never is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ElfExportFacts {
+    pub(crate) abi: ElfAbi,
+    pub(crate) exports: Vec<(String, u64)>,
+}
+
 /// One capture's concrete discovery allowance. Memory snapshots and file hashes
 /// spend the same byte total; cardinality counters stop decoded-record amplification.
 #[derive(Debug)]
@@ -256,6 +265,7 @@ pub struct CaptureWorkBudget {
     decoded_table_entries: usize,
     admitted_tables: BTreeSet<TableIdentity>,
     inspected_files: BTreeMap<InspectedFileKey, InspectedFile>,
+    elf_export_facts: BTreeMap<InspectedFileKey, ElfExportFacts>,
     interface_records: usize,
     table_exhaustion_reported: bool,
     interface_exhaustion_reported: bool,
@@ -280,6 +290,7 @@ impl CaptureWorkBudget {
             decoded_table_entries: 0,
             admitted_tables: BTreeSet::new(),
             inspected_files: BTreeMap::new(),
+            elf_export_facts: BTreeMap::new(),
             interface_records: 0,
             table_exhaustion_reported: false,
             interface_exhaustion_reported: false,
@@ -449,6 +460,14 @@ impl CaptureWorkBudget {
 
     pub(crate) fn note_inspected_file(&mut self, key: InspectedFileKey, value: InspectedFile) {
         self.inspected_files.insert(key, value);
+    }
+
+    pub(crate) fn elf_export_facts_for(&self, key: &InspectedFileKey) -> Option<ElfExportFacts> {
+        self.elf_export_facts.get(key).cloned()
+    }
+
+    pub(crate) fn note_elf_export_facts(&mut self, key: InspectedFileKey, value: ElfExportFacts) {
+        self.elf_export_facts.insert(key, value);
     }
 
     #[cfg(test)]
@@ -1862,21 +1881,77 @@ fn scan_process_view_with_io_mode(
             });
             continue;
         }
-        let object = match read_elf_snapshot(&file, budget) {
-            Ok(object) => object,
+        // A repeat scan of the unchanged file reuses the cached export facts with
+        // zero reads. The key's (device, inode) is the maps identity the guard
+        // above validated against the opened file.
+        let before = match pin_of(&file) {
+            Ok(pin) => pin,
             Err(reason) => {
                 skipped.push(Skipped { subject, reason });
                 continue;
             }
         };
-        let layout = target_layout(object.abi());
-        let exports = match object.exports_matching(&wanted) {
-            Ok(exports) => exports,
-            Err(reason) => {
-                skipped.push(Skipped { subject, reason });
+        if let Some(size) = actual_size {
+            if size > budget.limits().per_object_bytes {
+                let limits = budget.limits();
+                skipped.push(Skipped {
+                    subject,
+                    reason: format!(
+                        "too_large ({size} bytes; per-object cap is {})",
+                        limits.per_object_bytes,
+                    ),
+                });
                 continue;
             }
+        }
+        let cache_key = InspectedFileKey {
+            device: key.device,
+            inode: key.inode,
+            pin: before,
         };
+        // Nothing is read for this hit, but the file may have changed since
+        // `before`; only the still-unchanged file may reuse the cached facts.
+        let cached = budget
+            .elf_export_facts_for(&cache_key)
+            .filter(|_| pin_of(&file).is_ok_and(|after| after == before));
+        let (abi, exports) = match cached {
+            Some(facts) => (facts.abi, facts.exports),
+            None => {
+                let object = match read_elf_snapshot(&file, budget) {
+                    Ok(object) => object,
+                    Err(reason) => {
+                        skipped.push(Skipped { subject, reason });
+                        continue;
+                    }
+                };
+                let exports = match object.exports_matching(&wanted) {
+                    Ok(exports) => exports,
+                    Err(reason) => {
+                        skipped.push(Skipped { subject, reason });
+                        continue;
+                    }
+                };
+                // The pin was taken before the bytes were read; a write that lands
+                // during the read must not become the facts the capture trusts.
+                if pin_of(&file).is_ok_and(|after| after == before) {
+                    budget.note_elf_export_facts(
+                        cache_key,
+                        ElfExportFacts {
+                            abi: object.abi(),
+                            exports: exports.clone(),
+                        },
+                    );
+                    (object.abi(), exports)
+                } else {
+                    skipped.push(Skipped {
+                        subject,
+                        reason: "file changed while it was being scanned — retry".into(),
+                    });
+                    continue;
+                }
+            }
+        };
+        let layout = target_layout(abi);
         if request.hints.is_empty() && exports.is_empty() {
             continue;
         }
@@ -1885,7 +1960,7 @@ fn scan_process_view_with_io_mode(
             mount_namespace: view.mount_namespace(),
             key,
             path,
-            decoder_abi: Some(object.abi()),
+            decoder_abi: Some(abi),
             exports: exports.into_iter().map(|(name, _)| name).collect(),
             tables: Vec::new(),
             interfaces: Vec::new(),
@@ -3903,5 +3978,166 @@ mod tests {
             2,
             "byte-different tables burn again"
         );
+    }
+
+    // Two scans, one file: authored maps reference a real copied binary so the
+    // ELF-snapshot read has real bytes to charge. Executable mapping only: the
+    // group carries code (candidate_groups keeps it) but no readable data
+    // pages, so no target-memory reads pollute the per-scan I/O delta.
+    struct ElfExportFactsFixture {
+        _dir: tempfile::TempDir,
+        path: PathBuf,
+        maps: String,
+        mem: File,
+        next_view: u32,
+    }
+
+    impl ScanIo for ElfExportFactsFixture {
+        type Memory = File;
+        fn open_maps(
+            &mut self,
+            _: &ProcessView,
+            _: &CaptureWorkBudget,
+        ) -> std::io::Result<Box<dyn Read>> {
+            Ok(Box::new(std::io::Cursor::new(
+                self.maps.clone().into_bytes(),
+            )))
+        }
+        fn open_mem(&mut self, _: &ProcessView) -> std::io::Result<File> {
+            self.mem.try_clone()
+        }
+        fn final_generation(&mut self, view: &ProcessView) -> Result<(), String> {
+            view.run_while_same(|| ())
+        }
+    }
+
+    impl ElfExportFactsFixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("provider.so");
+            std::fs::copy("/bin/sh", &path).unwrap();
+            let view = ProcessView::open(ProcessViewId(71), std::process::id()).unwrap();
+            let file = File::open(&path).unwrap();
+            let key = crate::discovery::identity::retained_object_key(
+                &view,
+                &file,
+                &mut CaptureWorkBudget::default(),
+            )
+            .unwrap();
+            let maps = format!(
+                "1000-2000 r-xp 00000000 {:x}:{:x} {} {}\n",
+                key.device.major,
+                key.device.minor,
+                key.inode,
+                path.display(),
+            );
+            let mem = tempfile::tempfile().unwrap();
+            mem.set_len(0x2000).unwrap();
+            Self {
+                _dir: dir,
+                path,
+                maps,
+                mem,
+                next_view: 72,
+            }
+        }
+
+        fn scan(&mut self, budget: &mut CaptureWorkBudget) -> ScanOutcome {
+            let id = self.next_view;
+            self.next_view += 1;
+            let view = ProcessView::open(ProcessViewId(id), std::process::id()).unwrap();
+            let hints = [self.path.clone()];
+            let hooks = HookRegistry::builtin();
+            scan_process_view_with_io(
+                &ScanRequest {
+                    pid: view.pid(),
+                    hints: &hints,
+                    hooks: &hooks,
+                },
+                &view,
+                budget,
+                self,
+            )
+            .unwrap()
+        }
+    }
+
+    #[test]
+    fn second_view_of_same_file_reads_no_elf_bytes() {
+        let mut fixture = ElfExportFactsFixture::new();
+        let file_len = std::fs::metadata(&fixture.path).unwrap().len();
+        assert!(file_len > 0, "the fixture must have bytes worth caching");
+        let mut budget = CaptureWorkBudget::default();
+
+        // First scan reads the whole ELF (plus maps and the mount table).
+        let first = fixture.scan(&mut budget);
+        let charged_first = budget.attempted_io_bytes();
+        assert!(
+            charged_first >= file_len,
+            "first scan charges the ELF read: {charged_first} >= {file_len}"
+        );
+        assert_eq!(first.modules().len(), 1, "skipped: {:?}", first.skipped());
+
+        // Second scan of the same file: maps/mountinfo bytes only, no ELF re-read.
+        let second = fixture.scan(&mut budget);
+        let charged_second = budget.attempted_io_bytes() - charged_first;
+        assert_eq!(second.modules().len(), 1, "skipped: {:?}", second.skipped());
+        assert_eq!(
+            second.modules()[0].decoder_abi,
+            first.modules()[0].decoder_abi,
+            "both scans report the same ABI"
+        );
+        assert_eq!(
+            second.modules()[0].exports,
+            first.modules()[0].exports,
+            "both scans report the same export names"
+        );
+        assert!(
+            charged_second < file_len,
+            "second scan must not re-read {file_len} ELF bytes (charged {charged_second})"
+        );
+    }
+
+    #[test]
+    fn changed_file_rereads_elf() {
+        use std::io::Write as _;
+
+        let mut fixture = ElfExportFactsFixture::new();
+        let mut budget = CaptureWorkBudget::default();
+        let first = fixture.scan(&mut budget);
+        assert_eq!(first.modules().len(), 1, "skipped: {:?}", first.skipped());
+        let charged_first = budget.attempted_io_bytes();
+
+        // A size-changing rewrite between scans (same path and inode).
+        let mut rewritten = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&fixture.path)
+            .unwrap();
+        rewritten.write_all(&[0; 1024]).unwrap();
+        drop(rewritten);
+        let new_len = std::fs::metadata(&fixture.path).unwrap().len();
+
+        // A changed file misses the cache: the ELF bytes are read and charged again.
+        let second = fixture.scan(&mut budget);
+        let charged_second = budget.attempted_io_bytes() - charged_first;
+        assert!(
+            charged_second >= new_len,
+            "changed file is read again: {charged_second} >= {new_len}"
+        );
+        assert_eq!(second.modules().len(), 1, "skipped: {:?}", second.skipped());
+
+        // The reported facts come from the new bytes, not the cached read.
+        let file = File::open(&fixture.path).unwrap();
+        let snapshot = ElfSnapshot::read(&file).unwrap();
+        let hooks = HookRegistry::builtin();
+        let wanted = hooks.names();
+        let expected: Vec<String> = snapshot
+            .exports_matching(&wanted)
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(second.modules()[0].decoder_abi, Some(snapshot.abi()));
+        assert_eq!(second.modules()[0].exports, expected);
     }
 }

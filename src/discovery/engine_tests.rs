@@ -14175,9 +14175,11 @@ fn coordinator_reuses_one_budget_across_process_scans_and_hashes() {
     let elf_snapshot_bytes = hash_bytes;
     // Both complete maps snapshots belong to each scan operation.
     let scan_pass = maps_bytes.len() as u64 * 2 + scan_bytes;
+    // The ELF snapshot is read once per capture: the second scan reuses the first
+    // scan's cached export facts, so only one copy is budgeted here.
     let mut budget = CaptureWorkBudget::new(ScanLimits {
         per_object_bytes: scan_bytes.max(hash_bytes),
-        total_bytes: scan_pass * 2 + elf_snapshot_bytes * 2 + hash_bytes,
+        total_bytes: scan_pass * 2 + elf_snapshot_bytes + hash_bytes,
     });
     let hints = vec![exe];
     let hooks = HookRegistry::builtin();

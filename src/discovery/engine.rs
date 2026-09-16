@@ -69,7 +69,7 @@ pub struct Engine {
     budget: CaptureWorkBudget,
     next_view_id: u32,
     /// `--max-scan-pids`: how many scope members each scan pass covers.
-    pub max_scan_pids: usize,
+    max_scan_pids: usize,
     loader_registry: LoaderRegistry,
     terminal_batch: Option<TerminalBatch>,
     terminal_journal: Option<TerminalJournal>,

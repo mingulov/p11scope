@@ -65,8 +65,18 @@ individuals (unchanged); under-cap input still returns pids ascending
 
 **Controller-verified grounding (verify while implementing):**
 
-- (a) Single production caller: `discover_plan` (~line 3472). No other caller
-  may change behavior.
+- (a) CORRECTED (Step-1 tripwire, controller-verified): TWO production
+  callers — `discover_plan` (~line 3474, initial capture) and
+  `Engine::refresh_inventory` (~line 11718, live-discovery ticks). The
+  refresh caller collects the result into `desired: BTreeSet` (order
+  discarded) and uses it only to narrow which NEW pids get deep-scanned over
+  the cap, where membership is explicitly non-authoritative; retirement via
+  `desired.contains` requires `membership_authoritative`, which holds only
+  under the cap, where selection is the untouched identity path
+  (`inventory_retirement_cause`, engine.rs:5836). The reorder is therefore
+  safe for refresh: deterministic per sweep (no new oscillation class) and
+  biased toward newly-appeared rare providers, which is the live-discovery
+  purpose. No design change; both callers proceed.
 - (b) Group keys are `BTreeSet<ObjectKey>`; `ObjectKey` is `Ord` (it already
   keys a `BTreeMap`) — usable in a `BTreeMap<ObjectKey, usize>` census with
   no new traits.

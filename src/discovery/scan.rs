@@ -9,12 +9,14 @@ use crate::discovery::hooks::HookRegistry;
 use crate::process::{MountNamespaceId, ProcessView, ProcessViewId};
 use p11scope_manifest::elf::{ElfAbi, ElfSnapshot};
 use p11scope_manifest::identity::open_object;
-use p11scope_manifest::maps::{MapEntry, MapIndex, MappedPath, ObjectKey, Resolved, parse_maps};
+use p11scope_manifest::maps::{
+    Device, MapEntry, MapIndex, MappedPath, ObjectKey, Resolved, parse_maps,
+};
 use pkcs11_module::{
     LinuxLayout, Surface, TableSet, TableSpan, function_name, read_function_pointer, read_word_le,
     table_bytes, tables_for,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::io::Read;
 use std::os::unix::fs::{FileExt as _, MetadataExt as _};
@@ -215,6 +217,19 @@ impl Default for ScanLimits {
     }
 }
 
+/// Identity of one decoded provider table: the file holding its version word
+/// plus the word and the decoded extent. Repeats skip the candidate+entry
+/// admission charge but still decode per view — this key is never a decode
+/// cache: runtime addresses stay out because they are generation-local.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct TableIdentity {
+    pub(crate) device: Device,
+    pub(crate) inode: u64,
+    pub(crate) file_offset: u64,
+    pub(crate) version_word: u64,
+    pub(crate) usable: usize,
+}
+
 /// One capture's concrete discovery allowance. Memory snapshots and file hashes
 /// spend the same byte total; cardinality counters stop decoded-record amplification.
 #[derive(Debug)]
@@ -223,6 +238,7 @@ pub struct CaptureWorkBudget {
     attempted_io_bytes: u64,
     table_candidates: usize,
     decoded_table_entries: usize,
+    admitted_tables: BTreeSet<TableIdentity>,
     interface_records: usize,
     table_exhaustion_reported: bool,
     interface_exhaustion_reported: bool,
@@ -245,6 +261,7 @@ impl CaptureWorkBudget {
             attempted_io_bytes: 0,
             table_candidates: 0,
             decoded_table_entries: 0,
+            admitted_tables: BTreeSet::new(),
             interface_records: 0,
             table_exhaustion_reported: false,
             interface_exhaustion_reported: false,
@@ -398,6 +415,19 @@ impl CaptureWorkBudget {
         self.table_candidates += 1;
         self.decoded_table_entries = decoded;
         true
+    }
+
+    pub(crate) fn table_already_admitted(&self, id: &TableIdentity) -> bool {
+        self.admitted_tables.contains(id)
+    }
+
+    pub(crate) fn note_table_admitted(&mut self, id: TableIdentity) {
+        self.admitted_tables.insert(id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn table_candidates_count(&self) -> usize {
+        self.table_candidates
     }
 
     fn tables_exhausted(&self) -> bool {
@@ -654,10 +684,16 @@ fn decode_candidate(
     let Some(address) = base_address.checked_add(offset as u64) else {
         return Ok(None);
     };
-    let file_offset = match maps.resolve(address) {
-        Resolved::File { file_offset, .. } => Some(file_offset),
+    let table_owner = match maps.resolve(address) {
+        Resolved::File {
+            device,
+            inode,
+            file_offset,
+            ..
+        } => Some((device, inode, file_offset)),
         _ => None,
     };
+    let file_offset = table_owner.map(|(_, _, file_offset)| file_offset);
     let Some(bytes) = offset
         .checked_add(len)
         .and_then(|end| snapshot.get(offset..end))
@@ -696,8 +732,28 @@ fn decode_candidate(
         return Ok(None);
     }
     let decoded_entries = spans.iter().map(|span| span.fields().len()).sum();
-    if !budget.admit_table(decoded_entries) {
-        return Err(());
+    // Byte-identical repeats skip the candidate+entry charge but still decode
+    // below; without a stable file owner there is no identity, so charge.
+    let identity =
+        table_owner
+            .filter(|(_, inode, _)| *inode != 0)
+            .map(|(device, inode, file_offset)| TableIdentity {
+                device,
+                inode,
+                file_offset,
+                version_word: word,
+                usable: decoded_entries,
+            });
+    let repeat = identity
+        .as_ref()
+        .is_some_and(|id| budget.table_already_admitted(id));
+    if !repeat {
+        if !budget.admit_table(decoded_entries) {
+            return Err(());
+        }
+        if let Some(id) = identity {
+            budget.note_table_admitted(id);
+        }
     }
 
     let mut entries = Vec::with_capacity(non_null);
@@ -3752,5 +3808,74 @@ mod tests {
             SCAN_DEADLINE_REASON
         );
         assert_eq!(between.requests.len(), 1, "expiry prevents the next chunk");
+    }
+
+    /// Fix A: admission charges each unique table once. Byte-identical
+    /// repeats skip the candidate charge but still decode (per-view results
+    /// are never served from a cache); byte-different tables charge again.
+    #[test]
+    fn repeat_table_bytes_skip_the_candidate_charge_but_still_decode() {
+        fn table_snapshot(version: u64, fields: usize) -> Vec<u8> {
+            let mut snapshot = vec![0u8; 8 + fields * 8];
+            snapshot[..8].copy_from_slice(&version.to_le_bytes());
+            for slot in 0..fields {
+                let at = 8 + slot * 8;
+                snapshot[at..at + 8].copy_from_slice(&0x1500u64.to_le_bytes());
+            }
+            snapshot
+        }
+
+        let maps = parse_maps(
+            b"1000-3000 r-xp 00000000 08:01 7 /lib/provider.so\n\
+              7000-9000 r--p 00001000 08:01 7 /lib/provider.so\n",
+        )
+        .unwrap();
+        let map_index = MapIndex::new(&maps).unwrap();
+        let mut budget = CaptureWorkBudget::default();
+
+        let first_snapshot = table_snapshot(0x0203, 104);
+        let first = decode_exact_table(
+            &first_snapshot,
+            0x7000,
+            LinuxLayout::Lp64,
+            &map_index,
+            &mut budget,
+        )
+        .expect("a valid table decodes")
+        .expect("all slots walkable");
+        assert_eq!(budget.table_candidates_count(), 1);
+
+        let repeat = decode_exact_table(
+            &first_snapshot,
+            0x7000,
+            LinuxLayout::Lp64,
+            &map_index,
+            &mut budget,
+        )
+        .expect("a valid table decodes")
+        .expect("the repeat decodes too, never from a cache");
+        assert_eq!(repeat, first);
+        assert_eq!(
+            budget.table_candidates_count(),
+            1,
+            "byte-identical repeats must not burn another candidate"
+        );
+
+        let other_snapshot = table_snapshot(0x0003, 92);
+        let other = decode_exact_table(
+            &other_snapshot,
+            0x7000,
+            LinuxLayout::Lp64,
+            &map_index,
+            &mut budget,
+        )
+        .expect("a valid table decodes")
+        .expect("different bytes decode");
+        assert_ne!(other.version, first.version);
+        assert_eq!(
+            budget.table_candidates_count(),
+            2,
+            "byte-different tables burn again"
+        );
     }
 }

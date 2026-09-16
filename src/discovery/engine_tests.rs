@@ -15573,3 +15573,34 @@ fn offline_helper_failure_alone_marks_exact_loss_and_partial() {
     evidence.verdict_with_selection(true);
     assert_eq!(evidence.completeness, "PARTIAL");
 }
+
+/// Fix A, engine leg: the same export table in two ordinary batches burns one
+/// candidate. This drives the export-record admit site (engine.rs); the
+/// scan-level test covers the memory-scan site, and both share the budget.
+/// (The loader-route shape from the first draft is vacuous here: probing
+/// showed the seed fixture's memory scan admits zero tables, so 0→0 passes
+/// with or without the fix. The export fixture below admits a real table.)
+#[test]
+fn identical_table_in_two_batches_burns_one_candidate() {
+    let (view, _maps, record) = self_export_fixture(ProcessViewId(0));
+    let mut engine = Engine::empty();
+    engine.next_view_id = 1;
+    engine.views.push(view);
+    // This test binary is larger than the default per-object cap, which
+    // would skip its own pin for an unrelated reason.
+    engine.budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: u64::MAX,
+        total_bytes: u64::MAX,
+    });
+    let mut session = ScriptedSession::default();
+    let first = apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+    let candidates_after_first = engine.budget.table_candidates_count();
+    let second = apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+    assert!(first.required_complete);
+    assert!(second.required_complete);
+    assert_eq!(
+        engine.budget.table_candidates_count(),
+        candidates_after_first,
+        "the second identical table must not burn another candidate"
+    );
+}

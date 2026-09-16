@@ -16,9 +16,9 @@ use crate::discovery::identity::{
 use crate::discovery::loader::{LoaderContextId, LoaderContextSpec, LoaderRegistry};
 use crate::discovery::scan::{
     CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedEntry, ScannedInterface, ScannedModule,
-    ScannedTable, Skipped, decode_exact_table, exact_table_addresses, exact_table_bytes,
-    index_maps_or_refuse, read_elf_snapshot, read_maps_or_refuse, scan_process_view,
-    scan_process_view_without_memory, spans_for, target_layout,
+    ScannedTable, Skipped, TableIdentity, decode_exact_table, exact_table_addresses,
+    exact_table_bytes, index_maps_or_refuse, read_elf_snapshot, read_maps_or_refuse,
+    scan_process_view, scan_process_view_without_memory, spans_for, target_layout,
 };
 use crate::manifest_input::{read_manifest, selection_surface_usable, validate_structure};
 use crate::process::{self, OriginalGenerationState, ProcessView, ProcessViewId};
@@ -4853,11 +4853,25 @@ fn lower_export_record(
     if usable > spans.iter().map(|span| span.fields().len()).sum() {
         return Ok(None);
     }
-    if !budget.admit_table(usable)
-        || (matches!(
-            record.kind,
-            DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN | DISCOVERY_KIND_INTERFACE_RETURN
-        ) && !budget.admit_interface())
+    // Byte-identical repeats skip the table charge but still decode below;
+    // the interface-record charge is per record, not per table, and stays.
+    let identity = TableIdentity {
+        device: owner_device,
+        inode: owner_inode,
+        file_offset: table_file_offset,
+        version_word: word,
+        usable,
+    };
+    if !budget.table_already_admitted(&identity) {
+        if !budget.admit_table(usable) {
+            return Ok(None);
+        }
+        budget.note_table_admitted(identity);
+    }
+    if matches!(
+        record.kind,
+        DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN | DISCOVERY_KIND_INTERFACE_RETURN
+    ) && !budget.admit_interface()
     {
         return Ok(None);
     }

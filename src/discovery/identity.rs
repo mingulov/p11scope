@@ -19,13 +19,13 @@ use p11scope_manifest::manifest::{Manifest, Resolution};
 use p11scope_manifest::maps::{Device, ObjectKey};
 
 use crate::discovery::scan::{
-    CaptureWorkBudget, IO_CEILING_REASON, ScannedModule, Skipped, read_mountinfo,
+    CaptureWorkBudget, IO_CEILING_REASON, InspectedFileKey, ScannedModule, Skipped, read_mountinfo,
 };
 use crate::manifest_input::{MAX_TOTAL_OBJECT_BYTES, validate_structure};
 use crate::process::{MountNamespaceId, ProcessView, ProcessViewId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct Pin {
+pub(crate) struct Pin {
     ino: u64,
     size: u64,
     ctime: (i64, i64),
@@ -1599,6 +1599,21 @@ fn pin_scanned_object(
     }
     #[cfg(test)]
     tests::run_before_hash_test_hook();
+    // A repeat pin of the unchanged file reuses the cached inspection with zero
+    // reads. The key's (device, inode) is the mountinfo-validated identity above.
+    let validated = object_key(found);
+    let cache_key = InspectedFileKey {
+        device: validated.device,
+        inode: validated.inode,
+        pin: before,
+    };
+    if let Some(inspected) = budget.inspected_file(&cache_key) {
+        // Nothing was read for this hit, but the file may have changed since
+        // `before`; only the still-unchanged file may reuse the cached value.
+        if pin_of(&file)? == before {
+            return Entry::new(file, before, raw.path.clone(), &inspected, raw, found);
+        }
+    }
     let mut operation_bytes = 0u64;
     let inspected = inspect_file_with_reader(&file, |file, bytes, offset| {
         if let Some(reason) = budget.check_deadline_now() {
@@ -1618,6 +1633,8 @@ fn pin_scanned_object(
     if pin_of(&file)? != before {
         return Err("file changed while it was being identified — retry".into());
     }
+    // Only the stable read lands here: a file that changed mid-read is never cached.
+    budget.note_inspected_file(cache_key, inspected.clone());
     Entry::new(file, before, raw.path.clone(), &inspected, raw, found)
 }
 
@@ -1863,6 +1880,79 @@ mod tests {
         assert_eq!(
             skipped[0].reason,
             "file changed while it was being identified — retry"
+        );
+    }
+
+    #[test]
+    fn identical_file_bytes_are_read_once_per_capture() {
+        use crate::discovery::scan::ScannedModule;
+        use std::io::Write as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cached-read.so");
+        std::fs::copy("/bin/sh", &path).unwrap();
+        let file = open_object(&path).unwrap();
+        let file_len = file.metadata().unwrap().len();
+        assert!(file_len > 0, "the fixture must have bytes worth caching");
+        let mapping = mapping_file_key(&file).unwrap();
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let module = ScannedModule {
+            view: view.id(),
+            mount_namespace: view.mount_namespace(),
+            key: ObjectKey {
+                device: Device {
+                    major: mapping.device_major,
+                    minor: mapping.device_minor,
+                },
+                inode: mapping.inode,
+            },
+            path: path.display().to_string(),
+            decoder_abi: None,
+            exports: Vec::new(),
+            tables: Vec::new(),
+            interfaces: Vec::new(),
+        };
+        let mut budget = CaptureWorkBudget::default();
+
+        // First pin reads the whole file (plus the mount table).
+        let (pinned, skipped) =
+            pin_scanned_view_objects(&view, std::slice::from_ref(&module), &mut budget).unwrap();
+        assert_eq!(pinned.pinned().count(), 1);
+        assert!(skipped.is_empty());
+        let charged_first = budget.attempted_io_bytes();
+        assert!(
+            charged_first >= file_len,
+            "first pin charges the file read: {charged_first} >= {file_len}"
+        );
+
+        // Repeat pin of the unchanged file: mount-table bytes only, no file re-read.
+        let (pinned, skipped) =
+            pin_scanned_view_objects(&view, std::slice::from_ref(&module), &mut budget).unwrap();
+        assert_eq!(pinned.pinned().count(), 1);
+        assert!(skipped.is_empty());
+        let charged_second = budget.attempted_io_bytes() - charged_first;
+        assert!(
+            charged_second < file_len,
+            "repeat pin must not re-read {file_len} file bytes (charged {charged_second})"
+        );
+
+        // A changed file (new size pin) is read and charged again.
+        let mut changed = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        changed.write_all(&[0]).unwrap();
+        drop(changed);
+        let new_len = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(new_len, file_len + 1);
+        let (pinned, skipped) =
+            pin_scanned_view_objects(&view, std::slice::from_ref(&module), &mut budget).unwrap();
+        assert_eq!(pinned.pinned().count(), 1);
+        assert!(skipped.is_empty());
+        let charged_third = budget.attempted_io_bytes() - charged_first - charged_second;
+        assert!(
+            charged_third >= new_len,
+            "changed file is read again: {charged_third} >= {new_len}"
         );
     }
 

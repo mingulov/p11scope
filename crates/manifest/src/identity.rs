@@ -64,6 +64,7 @@ pub fn identify(path: &Path) -> ObjectIdentity {
 }
 
 #[cfg(feature = "identify")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InspectedObject {
     pub identity: ObjectIdentity,
     pub executable_ranges: Vec<(u64, u64)>,

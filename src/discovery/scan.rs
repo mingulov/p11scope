@@ -6,9 +6,10 @@
 //! authority the offline helper uses — so a scanned offset equals a manifest offset.
 
 use crate::discovery::hooks::HookRegistry;
+use crate::discovery::identity::Pin;
 use crate::process::{MountNamespaceId, ProcessView, ProcessViewId};
 use p11scope_manifest::elf::{ElfAbi, ElfSnapshot};
-use p11scope_manifest::identity::open_object;
+use p11scope_manifest::identity::{InspectedObject, open_object};
 use p11scope_manifest::maps::{
     Device, MapEntry, MapIndex, MappedPath, ObjectKey, Resolved, parse_maps,
 };
@@ -230,6 +231,21 @@ pub(crate) struct TableIdentity {
     pub(crate) usable: usize,
 }
 
+/// The cached inspection of one file: exactly what `inspect_file_with_reader`
+/// returns. Only the digest-sized result is kept, never the file bytes.
+pub(crate) type InspectedFile = InspectedObject;
+
+/// Identity of one inspected file: the maps-comparable (device, inode) plus the
+/// `(ino, size, ctime)` pin the inspection was read under. A repeat pin of the
+/// unchanged file reuses the cached inspection with zero reads; a changed file
+/// misses and is read (and charged) again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct InspectedFileKey {
+    pub(crate) device: Device,
+    pub(crate) inode: u64,
+    pub(crate) pin: Pin,
+}
+
 /// One capture's concrete discovery allowance. Memory snapshots and file hashes
 /// spend the same byte total; cardinality counters stop decoded-record amplification.
 #[derive(Debug)]
@@ -239,6 +255,7 @@ pub struct CaptureWorkBudget {
     table_candidates: usize,
     decoded_table_entries: usize,
     admitted_tables: BTreeSet<TableIdentity>,
+    inspected_files: BTreeMap<InspectedFileKey, InspectedFile>,
     interface_records: usize,
     table_exhaustion_reported: bool,
     interface_exhaustion_reported: bool,
@@ -262,6 +279,7 @@ impl CaptureWorkBudget {
             table_candidates: 0,
             decoded_table_entries: 0,
             admitted_tables: BTreeSet::new(),
+            inspected_files: BTreeMap::new(),
             interface_records: 0,
             table_exhaustion_reported: false,
             interface_exhaustion_reported: false,
@@ -423,6 +441,14 @@ impl CaptureWorkBudget {
 
     pub(crate) fn note_table_admitted(&mut self, id: TableIdentity) {
         self.admitted_tables.insert(id);
+    }
+
+    pub(crate) fn inspected_file(&self, key: &InspectedFileKey) -> Option<InspectedFile> {
+        self.inspected_files.get(key).cloned()
+    }
+
+    pub(crate) fn note_inspected_file(&mut self, key: InspectedFileKey, value: InspectedFile) {
+        self.inspected_files.insert(key, value);
     }
 
     #[cfg(test)]

@@ -12,6 +12,13 @@
 - Keep Rust 1.88, edition 2024, and Linux x86-64-first support.
 - Do not track generated output. Get explicit approval for privileged or container experiments.
 
+## History
+
+- Work must live in commits, not in the working tree: dev branches, worktrees, and task branches always contain the commits for the work done on them — otherwise history is lost.
+- Committing finished, verified work is authorized by default, on any branch.
+- Rewriting history (amend, rebase, reset) and pushing require explicit user agreement.
+- Commit messages follow repo style: `<area>: <imperative summary>` (`fix: …`, `feat: …`, `refactor: …`, `test: …`, `docs: …`).
+
 ## Checks
 
 ```sh

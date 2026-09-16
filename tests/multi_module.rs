@@ -7,7 +7,7 @@ use p11scope::process::{MountNamespaceId, ProcessViewId};
 use p11scope::semantics::{ProcessKey, State};
 use p11scope_ebpf_common::{Event, SESSION_NONE, event_type};
 use p11scope_manifest::maps::{Device, ObjectKey};
-use pkcs11_proxy_ng_types::CkRv;
+use pkcs11_types::CkRv;
 
 fn key(inode: u64) -> ObjectKey {
     ObjectKey {

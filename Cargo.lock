@@ -259,7 +259,7 @@ dependencies = [
  "p11scope-ebpf-common",
  "p11scope-manifest",
  "pkcs11-module",
- "pkcs11-proxy-ng-types",
+ "pkcs11-types",
  "serde",
  "serde_json",
  "sha2",
@@ -306,18 +306,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
-name = "pkcs11-module"
+name = "pkcs11-abi"
 version = "0.2.0"
-source = "git+https://github.com/mingulov/pkcs11-proxy-ng?rev=cbf3d019c43cf424d92a5d2033c6714c9f866f65#cbf3d019c43cf424d92a5d2033c6714c9f866f65"
+source = "git+https://github.com/mingulov/pkcs11-components?rev=d0a47c71d34294466bc41100ae6b5a5a329029d2#d0a47c71d34294466bc41100ae6b5a5a329029d2"
 dependencies = [
  "cryptoki-sys",
- "libloading",
 ]
 
 [[package]]
-name = "pkcs11-proxy-ng-types"
+name = "pkcs11-module"
 version = "0.2.0"
-source = "git+https://github.com/mingulov/pkcs11-proxy-ng?rev=cbf3d019c43cf424d92a5d2033c6714c9f866f65#cbf3d019c43cf424d92a5d2033c6714c9f866f65"
+source = "git+https://github.com/mingulov/pkcs11-components?rev=d0a47c71d34294466bc41100ae6b5a5a329029d2#d0a47c71d34294466bc41100ae6b5a5a329029d2"
+dependencies = [
+ "cryptoki-sys",
+ "libloading",
+ "pkcs11-abi",
+]
+
+[[package]]
+name = "pkcs11-types"
+version = "0.2.0"
+source = "git+https://github.com/mingulov/pkcs11-components?rev=d0a47c71d34294466bc41100ae6b5a5a329029d2#d0a47c71d34294466bc41100ae6b5a5a329029d2"
 dependencies = [
  "serde",
  "toml",

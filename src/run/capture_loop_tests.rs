@@ -33,7 +33,7 @@ fn open_event(session: u64) -> Event {
         slot_id: 3,
         slot: 0,
         capture: capture::MECHANISM_NONE | capture::OUTPUT_NON_NULL,
-        rv: pkcs11_proxy_ng_types::CkRv::OK.0,
+        rv: pkcs11_types::CkRv::OK.0,
         ..Event::default()
     }
 }
@@ -224,8 +224,8 @@ fn terminal_completed_root_reduces_and_retires_before_ordinary_drain_in_both_mod
             plan,
             domain.clone(),
             [
-                root_event(0, pkcs11_proxy_ng_types::CkRv::OK.0),
-                root_event(1, pkcs11_proxy_ng_types::CkRv::PENDING.0),
+                root_event(0, pkcs11_types::CkRv::OK.0),
+                root_event(1, pkcs11_types::CkRv::PENDING.0),
             ],
         );
         context.ordinary = EventDrain::over_domain(
@@ -366,8 +366,8 @@ fn pending_state(
     let mut drain = EventDrain::over_domain(
         ScriptedRecords::events(
             [
-                root_event(0, pkcs11_proxy_ng_types::CkRv::OK.0),
-                root_event(1, pkcs11_proxy_ng_types::CkRv::PENDING.0),
+                root_event(0, pkcs11_types::CkRv::OK.0),
+                root_event(1, pkcs11_types::CkRv::PENDING.0),
             ],
             usize::MAX,
         ),
@@ -456,8 +456,8 @@ fn terminal_deferred_trace_writer_error_retires_then_skips_later_phases() {
         plan,
         domain,
         [
-            root_event(0, pkcs11_proxy_ng_types::CkRv::OK.0),
-            root_event(1, pkcs11_proxy_ng_types::CkRv::PENDING.0),
+            root_event(0, pkcs11_types::CkRv::OK.0),
+            root_event(1, pkcs11_types::CkRv::PENDING.0),
         ],
     );
     context.writer.fail = true;

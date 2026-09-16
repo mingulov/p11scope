@@ -241,7 +241,7 @@ fn history_same_cookie_exec_closes_before_open_and_late_old_never_reduces() {
     let (mut s, mut t, _) = setup(16);
     feed(&mut s, &mut t, [ev(100, 90, 0, 0)]);
     let mut pending = ev(100, 90, 0, 2);
-    pending.rv = pkcs11_proxy_ng_types::CkRv::PENDING.0;
+    pending.rv = pkcs11_types::CkRv::PENDING.0;
     feed(&mut s, &mut t, [pending]);
     assert_eq!(vector(&s), (1, 0, 0, 1, 1, 1));
     feed(&mut s, &mut t, [ev(100, 90, 1, 0)]);
@@ -326,7 +326,7 @@ fn history_old_init_and_detached_state_cannot_enrich_successor_or_late_fork() {
     init.capture = capture::MECHANISM_VALUE;
     init.mechanism = 1;
     let mut pending = ev(100, 90, 0, 2);
-    pending.rv = pkcs11_proxy_ng_types::CkRv::PENDING.0;
+    pending.rv = pkcs11_types::CkRv::PENDING.0;
     let mut get = ev(100, 90, 0, 4);
     get.target_function = crate::kinds::function_id("C_Sign").unwrap();
     get.async_value = 123;
@@ -530,7 +530,7 @@ fn history_authentic_reaped_first_trace_has_semantics_without_raw_identity_outpu
 fn history_terminal_tail_precedes_confirmation_and_late_closed_record_is_loss() {
     let (mut s, mut t, a) = setup(16);
     let mut pending = ev(200, 20, 0, 2);
-    pending.rv = pkcs11_proxy_ng_types::CkRv::PENDING.0;
+    pending.rv = pkcs11_types::CkRv::PENDING.0;
     feed(
         &mut s,
         &mut t,
@@ -621,7 +621,7 @@ fn history_detached_join_cannot_cross_loaded_object_domains() {
     s.observe_process(a, &opened);
     s.observe_process(b, &opened);
     let mut pending = ev(100, 90, 0, 2);
-    pending.rv = pkcs11_proxy_ng_types::CkRv::PENDING.0;
+    pending.rv = pkcs11_types::CkRv::PENDING.0;
     let mut get = ev(100, 90, 0, 4);
     get.target_function = crate::kinds::function_id("C_Sign").unwrap();
     get.async_value = 123;
@@ -679,7 +679,7 @@ fn history_detached_join_changes_exact_custody_before_retirement() {
     let (mut s, mut t, a) = setup(16);
     feed(&mut s, &mut t, [ev(100, 90, 0, 0), ev(200, 20, 0, 0)]);
     let mut pending = ev(100, 90, 0, 2);
-    pending.rv = pkcs11_proxy_ng_types::CkRv::PENDING.0;
+    pending.rv = pkcs11_types::CkRv::PENDING.0;
     let target = crate::kinds::function_id("C_Sign").unwrap();
     let mut get = ev(100, 90, 0, 4);
     get.target_function = target;
@@ -860,7 +860,7 @@ fn root_fence_trace_reduces_parent_only_and_preserves_unknown_pending_and_write_
         positive.root_affiliation = 1;
         let unknown = ev(200, 20, 0, 0);
         let mut pending = ev(200, 20, 0, 2);
-        pending.rv = pkcs11_proxy_ng_types::CkRv::PENDING.0;
+        pending.rv = pkcs11_types::CkRv::PENDING.0;
         let mut fork = ev(100, 10, 0, 0);
         fork.root_affiliation = 1;
         fork.event_type = event_type::FORK;
@@ -1007,9 +1007,9 @@ fn root_cancel_output_case(is_trace: bool, partial: bool) {
         positive.root_affiliation = 1;
         let unknown = ev(200, 20, 0, 0);
         let mut pending_positive = ev(100, 10, 0, 2);
-        pending_positive.rv = pkcs11_proxy_ng_types::CkRv::PENDING.0;
+        pending_positive.rv = pkcs11_types::CkRv::PENDING.0;
         let mut pending_unknown = ev(200, 20, 0, 2);
-        pending_unknown.rv = pkcs11_proxy_ng_types::CkRv::PENDING.0;
+        pending_unknown.rv = pkcs11_types::CkRv::PENDING.0;
         feed(
             &mut state,
             &mut tracker,

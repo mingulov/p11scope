@@ -12,7 +12,7 @@ use std::os::unix::fs::{PermissionsExt, chown};
 use std::os::unix::net::{UnixListener, UnixStream};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
-const PENDING: u64 = pkcs11_proxy_ng_types::CkRv::PENDING.0;
+const PENDING: u64 = pkcs11_types::CkRv::PENDING.0;
 
 /// Socket readiness is protocol coordination only, never process-exit proof.
 fn ready(fd: i32, events: i16, deadline: Instant) -> Result<()> {

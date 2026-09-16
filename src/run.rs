@@ -2377,7 +2377,7 @@ fn format_total_attach_refusal(failed: usize, attempted: usize, first: &str) -> 
 /// Gives unsafe rendering the same diagnostic shape expectations that
 /// `Session::start` published to `MECH_SHAPE`.
 fn load_mech_shapes(state: &mut semantics::State) -> Result<()> {
-    let registry = pkcs11_proxy_ng_types::mechanism_registry::MechanismRegistry::load(None)
+    let registry = pkcs11_types::mechanism_registry::MechanismRegistry::load(None)
         .map_err(|e| anyhow!("loading mechanism registry: {e}"))?;
     state.set_mech_shapes(crate::shapes::expected_shapes(&registry));
     Ok(())
@@ -7154,7 +7154,7 @@ mod correction1_tests {
             let mut c = Consumer::new(trace, true);
             let old = c.adapter.bind(100, 90);
             let mut pending = event(100, 90, 1);
-            pending.rv = pkcs11_proxy_ng_types::CkRv::PENDING.0;
+            pending.rv = pkcs11_types::CkRv::PENDING.0;
             c.feed([event(100, 90, 0), pending]);
             assert_eq!(c.vector(), (1, 0, 0, 1, 1, 1));
             let replacement = c.adapter.bind(100, 4);
@@ -7433,7 +7433,7 @@ mod correction1_tests {
             let mut c = Consumer::new(trace, true);
             let fd = c.adapter.bind(100, 90);
             let mut pending = event(100, 90, 1);
-            pending.rv = pkcs11_proxy_ng_types::CkRv::PENDING.0;
+            pending.rv = pkcs11_types::CkRv::PENDING.0;
             c.feed([event(100, 90, 0), pending]);
             c.adapter.set(&fd, Membership::Exited);
             assert!(c.tracker.poll_exited().is_empty());

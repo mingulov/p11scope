@@ -73,7 +73,7 @@ static DESCRIPTORS: Array<SlotSemantics> =
     Array::with_max_entries(MAX_DESCRIPTORS, BPF_F_RDONLY_PROG);
 
 /// Mechanism id -> parameter shape code, published by userspace from
-/// proxy-ng's registry. An unknown mechanism id looks up empty and is
+/// pkcs11-types' registry. An unknown mechanism id looks up empty and is
 /// treated as `shape::NONE`.
 #[map]
 static MECH_SHAPE: HashMap<u64, u32> =

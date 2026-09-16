@@ -26,7 +26,7 @@ use p11scope_ebpf_common::{
     ThreadOwnerControl, attach_cookie,
 };
 use p11scope_manifest::elf::ElfAbi;
-use pkcs11_proxy_ng_types::mechanism_registry::MechanismRegistry;
+use pkcs11_types::mechanism_registry::MechanismRegistry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::mem::size_of_val;

@@ -13,6 +13,6 @@ cryptoki-sys = "0.5"
 libloading = "0.8"
 libc = "0.2"
 p11scope-manifest = { path = "../manifest", features = ["identify"] }
-pkcs11-module = { git = "https://github.com/mingulov/pkcs11-proxy-ng", rev = "cbf3d019c43cf424d92a5d2033c6714c9f866f65" }
+pkcs11-module = { git = "https://github.com/mingulov/pkcs11-components", rev = "d0a47c71d34294466bc41100ae6b5a5a329029d2" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

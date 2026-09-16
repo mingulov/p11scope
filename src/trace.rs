@@ -35,10 +35,10 @@ fn function_name(slots: &[Option<TraceSlot>], slot: u32) -> String {
 /// A small, honest name table for the two mechanism ids this capture
 /// also decodes parameters for (`render::param_combo_json`'s
 /// `rsa_pkcs_pss`/`gcm` shapes) — sourced from the same
-/// `pkcs11-proxy-ng-types` crate the rest of this codebase already
+/// `pkcs11-types` crate the rest of this codebase already
 /// depends on, not a re-derived literal. No general CKM_* id -> name
 /// registry exists anywhere in this codebase or its dependencies to
-/// reuse (verified: `pkcs11_proxy_ng_types::mechanism_registry` maps ids
+/// reuse (verified: `pkcs11_types::mechanism_registry` maps ids
 /// to *shape* names like `"gcm"`, never to `CKM_*` display names).
 /// Every other mechanism, known or vendor, renders verbatim as `0x…`,
 /// same as the "unknown mechanism" case — honest rather than guessed.
@@ -47,10 +47,8 @@ fn function_name(slots: &[Option<TraceSlot>], slot: u32) -> String {
 /// ever becomes a real ask.
 fn mechanism_name(id: u64) -> Option<&'static str> {
     match id {
-        _ if id == pkcs11_proxy_ng_types::CkMechanismType::RSA_PKCS_PSS.0 => {
-            Some("CKM_RSA_PKCS_PSS")
-        }
-        _ if id == pkcs11_proxy_ng_types::CkMechanismType::AES_GCM.0 => Some("CKM_AES_GCM"),
+        _ if id == pkcs11_types::CkMechanismType::RSA_PKCS_PSS.0 => Some("CKM_RSA_PKCS_PSS"),
+        _ if id == pkcs11_types::CkMechanismType::AES_GCM.0 => Some("CKM_AES_GCM"),
         _ => None,
     }
 }
@@ -69,9 +67,9 @@ fn hash_alg_name(id: u64) -> String {
     match id {
         0x0000_0220 => "SHA1".into(),
         0x0000_0255 => "SHA224".into(),
-        id if id == pkcs11_proxy_ng_types::CkMechanismType::SHA256.0 => "SHA256".into(),
-        id if id == pkcs11_proxy_ng_types::CkMechanismType::SHA384.0 => "SHA384".into(),
-        id if id == pkcs11_proxy_ng_types::CkMechanismType::SHA512.0 => "SHA512".into(),
+        id if id == pkcs11_types::CkMechanismType::SHA256.0 => "SHA256".into(),
+        id if id == pkcs11_types::CkMechanismType::SHA384.0 => "SHA384".into(),
+        id if id == pkcs11_types::CkMechanismType::SHA512.0 => "SHA512".into(),
         _ => format!("0x{id:x}"),
     }
 }
@@ -117,10 +115,10 @@ fn render_mechanism(ev: &Event) -> String {
 }
 
 fn rv_name(rv: u64) -> String {
-    // Reuses proxy-ng's CKR_* name table (`CkRv`'s `Display`) rather than
+    // Reuses pkcs11-types' CKR_* name table (`CkRv`'s `Display`) rather than
     // a second one; its format is "CKR_OK (0x00000000)" — only the name
     // is wanted here, the trace line carries the outcome, not the code.
-    let s = pkcs11_proxy_ng_types::CkRv(rv).to_string();
+    let s = pkcs11_types::CkRv(rv).to_string();
     s.split(" (").next().unwrap_or(&s).to_string()
 }
 
@@ -409,7 +407,7 @@ mod tests {
     #[test]
     fn known_event_renders_the_documented_line_shape() {
         let mut ev = base_event();
-        ev.mechanism = pkcs11_proxy_ng_types::CkMechanismType::RSA_PKCS_PSS.0;
+        ev.mechanism = pkcs11_types::CkMechanismType::RSA_PKCS_PSS.0;
         ev.capture = capture::MECHANISM_VALUE;
         ev.shape = shape::RSA_PKCS_PSS;
         ev.p0 = 0x0000_0250; // CKM_SHA256
@@ -463,7 +461,7 @@ mod tests {
     #[test]
     fn known_mechanism_id_with_no_decoded_shape_still_renders_by_name_only() {
         let mut ev = base_event();
-        ev.mechanism = pkcs11_proxy_ng_types::CkMechanismType::AES_GCM.0;
+        ev.mechanism = pkcs11_types::CkMechanismType::AES_GCM.0;
         ev.capture = capture::MECHANISM_VALUE;
         ev.shape = shape::NONE; // e.g. decode failed this call
 
@@ -771,7 +769,7 @@ mod tests {
         tracer.anchor = Some((0, 0));
         let mut event = open_event(100, 0xdead_beef);
         event.capture = capture::MECHANISM_VALUE;
-        event.mechanism = pkcs11_proxy_ng_types::CkMechanismType::AES_GCM.0;
+        event.mechanism = pkcs11_types::CkMechanismType::AES_GCM.0;
         event.shape = shape::GCM;
         event.p0 = 0xa11c_e000_0000_0001;
         event.p1 = 0xa11c_e000_0000_0002;
@@ -850,7 +848,7 @@ mod tests {
         let mut dynamic = open_event(100, 7);
         dynamic.slot = 2;
         dynamic.capture = capture::MECHANISM_VALUE;
-        dynamic.mechanism = pkcs11_proxy_ng_types::CkMechanismType::AES_GCM.0;
+        dynamic.mechanism = pkcs11_types::CkMechanismType::AES_GCM.0;
         let dynamic_line = tracer.on_event(&dynamic, &mut state);
         assert!(
             dynamic_line.contains(" C_Sign CKM_AES_GCM"),

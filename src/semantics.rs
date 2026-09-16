@@ -12,7 +12,7 @@ use p11scope_ebpf_common::{
     Event, FUNCTION_NONE, LATENCY_BUCKETS, SESSION_NONE, USER_TYPE_NONE, bucket_of, capture,
     direct, event_type, lifecycle, operation, semantic_flags, shape, transition,
 };
-use pkcs11_proxy_ng_types::CkRv;
+use pkcs11_types::CkRv;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Aggregate stats for one mechanism id, kept **verbatim** as `u64` —

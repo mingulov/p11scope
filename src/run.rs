@@ -1825,7 +1825,7 @@ fn format_total_attach_refusal(failed: usize, attempted: usize, first: &str) -> 
 /// Gives unsafe rendering the same diagnostic shape expectations that
 /// `Session::start` published to `MECH_SHAPE`.
 fn load_mech_shapes(state: &mut semantics::State) -> Result<()> {
-    let registry = pkcs11_proxy_ng_types::mechanism_registry::MechanismRegistry::load(None)
+    let registry = pkcs11_types::mechanism_registry::MechanismRegistry::load(None)
         .map_err(|e| anyhow!("loading mechanism registry: {e}"))?;
     state.set_mech_shapes(crate::shapes::expected_shapes(&registry));
     Ok(())

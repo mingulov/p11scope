@@ -22,7 +22,7 @@ use p11scope_ebpf_common::{
     SlotSemantics, TAIL_CALLS_INTERFACE_WORKER_SLOT, TAIL_CALLS_TEMPLATE_SECOND_SLOT,
     attach_cookie, pack_task_newtask_offsets,
 };
-use pkcs11_proxy_ng_types::mechanism_registry::MechanismRegistry;
+use pkcs11_types::mechanism_registry::MechanismRegistry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::mem::size_of_val;

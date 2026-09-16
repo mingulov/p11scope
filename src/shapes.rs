@@ -1,4 +1,4 @@
-//! Bridges proxy-ng's shared mechanism registry to the BPF `MECH_SHAPE`
+//! Bridges pkcs11-types' shared mechanism registry to the BPF `MECH_SHAPE`
 //! map. *Which* mechanisms have decodable parameters comes from the
 //! registry (config), not a hardcoded mechanism-id list (code) — so
 //! scope and proxy speak one dialect and vendor mechanisms are handled
@@ -9,9 +9,7 @@ use anyhow::{Context as _, Result, bail};
 use aya::Ebpf;
 use aya::maps::{HashMap, MapType};
 use p11scope_ebpf_common::{MAX_MECH_SHAPES, shape};
-use pkcs11_proxy_ng_types::{
-    PKCS11_3_2_OFFICIAL_MECHANISMS, mechanism_registry::MechanismRegistry,
-};
+use pkcs11_types::{PKCS11_3_2_OFFICIAL_MECHANISMS, mechanism_registry::MechanismRegistry};
 use std::collections::BTreeMap;
 
 /// Maps the registry's shape string to a BPF shape code. Only shapes
@@ -110,7 +108,7 @@ pub fn publish(ebpf: &mut Ebpf, reg: &MechanismRegistry) -> Result<usize> {
 mod tests {
     use super::*;
     use p11scope_ebpf_common::MAX_MECH_SHAPES;
-    use pkcs11_proxy_ng_types::{DiscoveryMode, PKCS11_3_2_OFFICIAL_MECHANISMS};
+    use pkcs11_types::{DiscoveryMode, PKCS11_3_2_OFFICIAL_MECHANISMS};
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
     #[test]

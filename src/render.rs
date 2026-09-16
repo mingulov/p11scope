@@ -945,7 +945,7 @@ fn functions_out(reports: &[SlotReport], modules: &[DiscoveredModule]) -> Vec<Fu
             errors: r.errors,
             pending_returns: r
                 .rv_counts
-                .get(&pkcs11_proxy_ng_types::CkRv::PENDING.0)
+                .get(&pkcs11_types::CkRv::PENDING.0)
                 .copied()
                 .unwrap_or(0),
             in_flight: r.in_flight,
@@ -2114,9 +2114,9 @@ mod tests {
                     if index < 17 {
                         0
                     } else if index < 20 {
-                        pkcs11_proxy_ng_types::CkRv::GENERAL_ERROR.0
+                        pkcs11_types::CkRv::GENERAL_ERROR.0
                     } else {
-                        pkcs11_proxy_ng_types::CkRv::PENDING.0
+                        pkcs11_types::CkRv::PENDING.0
                     },
                 )
             })
@@ -2137,10 +2137,8 @@ mod tests {
         report.rv_counts.insert(0, 17);
         report
             .rv_counts
-            .insert(pkcs11_proxy_ng_types::CkRv::GENERAL_ERROR.0, 3);
-        report
-            .rv_counts
-            .insert(pkcs11_proxy_ng_types::CkRv::PENDING.0, 5);
+            .insert(pkcs11_types::CkRv::GENERAL_ERROR.0, 3);
+        report.rv_counts.insert(pkcs11_types::CkRv::PENDING.0, 5);
         let observed_rvs =
             events
                 .iter()
@@ -2156,9 +2154,7 @@ mod tests {
             report.errors,
             events
                 .iter()
-                .filter(|event| {
-                    event.rv != 0 && event.rv != pkcs11_proxy_ng_types::CkRv::PENDING.0
-                })
+                .filter(|event| { event.rv != 0 && event.rv != pkcs11_types::CkRv::PENDING.0 })
                 .count() as u64
         );
         assert_eq!(
@@ -2206,10 +2202,8 @@ mod tests {
         for (event, line) in events.iter().zip(&lines) {
             let rv = match event.rv {
                 0 => "CKR_OK",
-                value if value == pkcs11_proxy_ng_types::CkRv::GENERAL_ERROR.0 => {
-                    "CKR_GENERAL_ERROR"
-                }
-                value if value == pkcs11_proxy_ng_types::CkRv::PENDING.0 => "CKR_PENDING",
+                value if value == pkcs11_types::CkRv::GENERAL_ERROR.0 => "CKR_GENERAL_ERROR",
+                value if value == pkcs11_types::CkRv::PENDING.0 => "CKR_PENDING",
                 value => unreachable!("unexpected fixture RV {value:#x}"),
             };
             assert_eq!(

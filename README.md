@@ -250,11 +250,12 @@ capture.
 | --- | --- |
 | [pkcs11-check](https://github.com/mingulov/pkcs11-check) | Actively exercises and validates a provider |
 | **pkcs11-scope** | Passively observes real application behavior |
+| pkcs11-components | Shared PKCS#11 core: name tables, mechanism registry, module-loading FFI |
 | pkcs11-proxy-ng | Controlled interposition, transport, fault injection |
 | pkcs11-lab (planned) | Will combine profiles and test results into migration assessments |
 
 Integration boundary: the versioned `observed-profile.json` schema. The
-userspace side is Rust and reuses pkcs11-proxy-ng's PKCS#11 core (official
+userspace side is Rust and reuses pkcs11-components' PKCS#11 core (official
 name tables, mechanism registry, module-loading FFI) rather than duplicating
 it; the eBPF observer itself is new code.
 

@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
+mod support;
+
 fn serial_guard() -> MutexGuard<'static, ()> {
     static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
     GUARD
@@ -554,10 +556,15 @@ fn a_hinted_object_with_no_table_says_so() {
 /// The readable non-executable bytes the scan would snapshot for `so`, as the scan
 /// itself counts them — used to size a budget that admits exactly one object.
 fn readable_data_bytes(so: &Path) -> u64 {
+    readable_data_bytes_for(std::process::id(), so)
+}
+
+fn readable_data_bytes_for(pid: u32, so: &Path) -> u64 {
     use std::os::unix::fs::MetadataExt as _;
     let inode = std::fs::metadata(so).unwrap().ino();
     let maps =
-        p11scope_manifest::maps::parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+        p11scope_manifest::maps::parse_maps(&std::fs::read(format!("/proc/{pid}/maps")).unwrap())
+            .unwrap();
     maps.iter()
         .filter(|m| m.inode == inode && m.permissions[0] == b'r' && m.permissions[2] != b'x')
         .map(|m| m.end - m.start)
@@ -571,55 +578,126 @@ fn maps_snapshot_bytes() -> u64 {
 
 #[test]
 fn the_per_capture_byte_cap_accumulates_across_objects() {
+    use std::io::Read as _;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
     let _guard = serial_guard();
     let dir = tmp("scan-capture-cap");
     let first = build_fixture(&dir, "budget-a", &["-DMATRIX_INTERFACES=0"]);
     let second = build_fixture(&dir, "budget-b", &["-DMATRIX_INTERFACES=0"]);
-    load_and_populate(&first);
-    load_and_populate(&second);
-    // Room for exactly one of the two: the second object must trip the running total,
-    // not the per-object cap.
-    let total_bytes = maps_snapshot_bytes()
-        .checked_add(readable_data_bytes(&first))
-        .expect("capture byte budget fits in u64");
-    assert_eq!(
-        readable_data_bytes(&first),
-        readable_data_bytes(&second),
-        "fixtures must match"
+    let driver = dir.join("driver");
+    assert!(
+        Command::new("gcc")
+            .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-o"])
+            .arg(&driver)
+            .arg(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/live-discovery-driver.c")
+            )
+            .args(["-ldl", "-pthread"])
+            .status()
+            .unwrap()
+            .success()
     );
+    let mut child = support::ChildGuard::new(
+        Command::new(&driver)
+            .arg("dlopen")
+            .args([&first, &second])
+            .env_clear()
+            .env("P11SCOPE_FIXTURE_INTERFACES", "0")
+            .env("P11SCOPE_FIXTURE_POST_GATE", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let pid = child.child.id();
+    let mut stderr = child.child.stderr.take().unwrap();
+    let mut readiness = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !readiness.ends_with(b"P11SCOPE_FIXTURE driver done\n") {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero() && readiness.len() < 4096);
+        assert!(support::poll_fd(stderr.as_raw_fd(), remaining).unwrap());
+        let mut byte = [0];
+        assert_eq!(
+            stderr.read(&mut byte).unwrap(),
+            1,
+            "fixture exited before ready"
+        );
+        readiness.extend_from_slice(&byte);
+    }
     let hooks = HookRegistry::builtin();
+    let hints = [first.clone(), second.clone()];
+    let request = ScanRequest {
+        pid,
+        hints: &hints,
+        hooks: &hooks,
+    };
+    // The native child blocks with both providers loaded, so test-worker maps
+    // cannot alter acquisition costs between these scans. Measure all identity
+    // work, then remove the final object's data allowance. The replay cannot
+    // finish maps B, so even the earlier object's private result must be refused.
+    let mut calibration_budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: 64 * 1024 * 1024,
+        total_bytes: 512 * 1024 * 1024,
+    });
+    let calibration = scan_pid(&request, &mut calibration_budget).unwrap();
+    let calibrated = calibration.modules();
+    assert_eq!(calibrated.len(), 2);
+    for hint in &hints {
+        assert!(calibrated.iter().any(|m| Path::new(&m.path) == hint));
+    }
+    assert!(
+        calibrated
+            .iter()
+            .all(|m| !m.tables.is_empty() && m.interfaces.is_empty()),
+        "both fixtures must have tables and no auxiliary interface reads"
+    );
+    assert!(
+        calibration.skipped().is_empty(),
+        "{:?}",
+        calibration.skipped()
+    );
+    let last = &calibrated[1];
+    let last_data_bytes = readable_data_bytes_for(pid, Path::new(&last.path));
+    assert!(last_data_bytes > 0);
+    let total_bytes = calibration_budget
+        .attempted_io_bytes()
+        .checked_sub(last_data_bytes)
+        .expect("the completed scan charged the final object's mapped data");
     let mut budget = CaptureWorkBudget::new(ScanLimits {
         per_object_bytes: 64 * 1024 * 1024,
         total_bytes,
     });
     let ScanOutcome::Scanned {
         modules, skipped, ..
-    } = scan_pid(
-        &ScanRequest {
-            pid: std::process::id(),
-            hints: &[first.clone(), second.clone()],
-            hooks: &hooks,
-        },
-        &mut budget,
-    )
-    .unwrap()
+    } = scan_pid(&request, &mut budget).unwrap()
     else {
         panic!("scan must be available")
     };
-    assert_eq!(modules.len(), 2, "both objects are identified: {modules:?}");
-    assert_eq!(
-        modules.iter().filter(|m| !m.tables.is_empty()).count(),
-        1,
-        "the budget admits exactly one object: {modules:?}"
+    assert!(
+        modules.is_empty(),
+        "no object can be published without maps B: {modules:?}"
     );
-    assert_eq!(
+    assert!(
         skipped
             .iter()
-            .filter(|s| s.reason.contains("capture attempted-I/O ceiling"))
-            .count(),
-        1,
-        "the object over the running total must be reported: {skipped:?}"
+            .any(|skip| skip.reason.contains("capture attempted-I/O ceiling")),
+        "{skipped:?}"
     );
+    assert!(
+        skipped.iter().any(|skip| skip
+            .reason
+            .starts_with("memory scan refused: final mapping validation unavailable")),
+        "{skipped:?}"
+    );
+    assert_eq!(budget.attempted_io_bytes(), total_bytes);
+    child
+        .terminate()
+        .expect("reap the blocked native scan fixture");
 }
 
 #[test]
@@ -631,10 +709,16 @@ fn separate_process_scans_cannot_renew_the_capture_byte_budget() {
     load_and_populate(&first);
     load_and_populate(&second);
     let object_bytes = readable_data_bytes(&first);
+    let elf_bytes = std::fs::metadata(&first).unwrap().len();
     assert_eq!(object_bytes, readable_data_bytes(&second));
     let total_bytes = maps_snapshot_bytes()
         .checked_mul(2)
+        .and_then(|bytes| {
+            bytes.checked_add(std::fs::read("/proc/self/mountinfo").unwrap().len() as u64)
+        })
+        .and_then(|bytes| bytes.checked_add(elf_bytes))
         .and_then(|bytes| bytes.checked_add(object_bytes))
+        .and_then(|bytes| bytes.checked_add(1)) // room to establish maps B EOF
         .expect("capture byte budget fits in u64");
     let hooks = HookRegistry::builtin();
     let limits = ScanLimits {
@@ -676,10 +760,27 @@ fn the_per_object_byte_cap_is_enforced_as_a_skip_not_a_truncation() {
     let _guard = serial_guard();
     let dir = tmp("scan-cap");
     let so = build_fixture(&dir, "capped", &["-DMATRIX_INTERFACES=0"]);
+    // Admit earlier mount-table identity work, then refuse this valid ELF at
+    // its exact file-size boundary. Padding before dlopen preserves its image.
+    let mountinfo_bytes = u64::try_from(std::fs::read("/proc/self/mountinfo").unwrap().len())
+        .expect("mountinfo length fits in u64");
+    let per_object_bytes = std::fs::metadata(&so)
+        .unwrap()
+        .len()
+        .max(mountinfo_bytes)
+        .max(64 * 1024);
+    let padded_bytes = per_object_bytes.checked_add(1).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&so)
+        .unwrap()
+        .set_len(padded_bytes)
+        .unwrap();
     load_and_populate(&so);
+    assert!(readable_data_bytes(&so) <= per_object_bytes);
     let hooks = HookRegistry::builtin();
     let mut budget = CaptureWorkBudget::new(ScanLimits {
-        per_object_bytes: 1,
+        per_object_bytes,
         total_bytes: 512 * 1024 * 1024,
     });
     let outcome = scan_pid(
@@ -697,20 +798,37 @@ fn the_per_object_byte_cap_is_enforced_as_a_skip_not_a_truncation() {
     else {
         panic!("scan must be available")
     };
-    // The object is still identified — it is the *decode* that the cap refuses — so
-    // the emptiness assertion below is about a module that really exists.
     assert!(
-        modules.iter().any(|m| m.path.ends_with("capped.so")),
-        "a capped object must be reported, not dropped: {modules:?}"
+        modules.iter().all(|m| !m.path.ends_with("capped.so")),
+        "an unread ELF cannot become module authority: {modules:?}"
     );
     assert!(
-        modules.iter().all(|m| m.tables.is_empty()),
-        "nothing may be decoded from a capped object"
-    );
-    assert!(
-        skipped.iter().any(|s| s.reason.contains("too_large")),
+        skipped.iter().any(|skip| {
+            skip.subject.ends_with("capped.so")
+                && skip.reason
+                    == format!(
+                        "too_large ({padded_bytes} bytes; per-object cap is {per_object_bytes})"
+                    )
+        }),
         "the cap must be reported as too_large: {skipped:?}"
     );
+    let mut exact_budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: padded_bytes,
+        total_bytes: 512 * 1024 * 1024,
+    });
+    let exact = scan_pid(
+        &ScanRequest {
+            pid: std::process::id(),
+            hints: std::slice::from_ref(&so),
+            hooks: &hooks,
+        },
+        &mut exact_budget,
+    )
+    .unwrap();
+    assert!(exact.skipped().is_empty(), "{:?}", exact.skipped());
+    assert_eq!(exact.modules().len(), 1);
+    assert_eq!(Path::new(&exact.modules()[0].path), so);
+    assert!(!exact.modules()[0].tables.is_empty());
 }
 
 #[test]
@@ -719,7 +837,10 @@ fn scan_budget_charges_only_the_prefix_read_before_aggregate_exhaustion() {
     let dir = tmp("scan-prefix-budget");
     let so = build_fixture(&dir, "prefix-capped", &["-DMATRIX_INTERFACES=0"]);
     load_and_populate(&so);
-    let total_bytes = readable_data_bytes(&so) - 1;
+    let total_bytes = maps_snapshot_bytes()
+        .checked_add(std::fs::metadata(&so).unwrap().len())
+        .and_then(|bytes| bytes.checked_add(readable_data_bytes(&so) - 1))
+        .expect("capture byte budget fits in u64");
     let hooks = HookRegistry::builtin();
     let mut budget = CaptureWorkBudget::new(ScanLimits {
         per_object_bytes: 64 * 1024 * 1024,
@@ -740,6 +861,17 @@ fn scan_budget_charges_only_the_prefix_read_before_aggregate_exhaustion() {
         "only the bytes actually read before the next refused read are charged"
     );
     assert!(
+        outcome.modules().is_empty(),
+        "unvalidated ELF/memory inventory must stay private"
+    );
+    assert!(
+        outcome.skipped().iter().any(|skip| skip
+            .reason
+            .starts_with("memory scan refused: final mapping validation unavailable")),
+        "{:?}",
+        outcome.skipped()
+    );
+    assert!(
         outcome
             .skipped()
             .iter()
@@ -755,30 +887,29 @@ fn scan_budget_charges_only_the_prefix_read_before_aggregate_exhaustion() {
 /// configuration rather than assumed, exactly as `proc_access.rs` does.
 #[test]
 fn an_unreadable_proc_mem_is_reported_as_unavailable_not_as_an_error() {
-    let _guard = serial_guard();
-    let mut child = Command::new("setsid")
-        .args(["--fork", "sleep", "27.1828"])
-        .spawn()
-        .expect("spawn setsid sleep");
-    // `setsid --fork` exits as soon as it has forked; reap it so it is not left a zombie.
-    child.wait().expect("reap setsid");
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    let out = Command::new("pgrep")
-        .args(["-f", "sleep 27.1828"])
-        .output()
-        .unwrap();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    // A leftover from an earlier run would match too: use one and clean up all of them,
-    // rather than failing on a condition that says nothing about the code under test.
-    let pids: Vec<u32> = stdout
-        .split_whitespace()
-        .filter_map(|pid| pid.parse().ok())
-        .collect();
-    let Some(&pid) = pids.first() else {
-        panic!("expected a reparented sleep, pgrep found none")
-    };
+    let mut decoy = support::MatchingDecoy::spawn().expect("launch matching-command decoy");
+    let target = support::SameUidNonDescendant::spawn().expect("launch detached target");
+    let pid = target.pid();
 
     let exe = std::fs::read_link(format!("/proc/{pid}/exe")).expect("target exe link");
+    assert!(support::is_sleep(&exe));
+    // The launcher proves exec, which can precede relocation/RELRO. This
+    // inventory control requires sleep to have finished startup and blocked.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        if stat
+            .rsplit_once(") ")
+            .is_some_and(|(_, rest)| rest.starts_with("S "))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "target did not enter sleep"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
     let hooks = HookRegistry::builtin();
     let mut budget = CaptureWorkBudget::default();
     let outcome = scan_pid(
@@ -789,11 +920,11 @@ fn an_unreadable_proc_mem_is_reported_as_unavailable_not_as_an_error() {
         },
         &mut budget,
     );
-    for pid in &pids {
-        let _ = Command::new("kill").arg(pid.to_string()).status();
-    }
-
     let outcome = outcome.expect("an unreadable /proc/<pid>/mem is never fatal");
+    assert!(
+        decoy.is_alive().unwrap(),
+        "scan target cleanup touched decoy"
+    );
     let scope: i32 = std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
         .map(|s| s.trim().parse().unwrap_or(0))
         .unwrap_or(0);
@@ -813,7 +944,7 @@ fn an_unreadable_proc_mem_is_reported_as_unavailable_not_as_an_error() {
         .modules()
         .iter()
         .find(|m| m.path == exe.display().to_string())
-        .unwrap_or_else(|| panic!("{} must still be identified", exe.display()));
+        .unwrap_or_else(|| panic!("{} must still be identified: {outcome:?}", exe.display()));
     if refused {
         assert!(
             module.tables.is_empty() && module.interfaces.is_empty(),

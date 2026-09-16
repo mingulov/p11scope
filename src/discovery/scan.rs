@@ -7,10 +7,13 @@
 
 use crate::discovery::hooks::HookRegistry;
 use crate::process::{MountNamespaceId, ProcessView, ProcessViewId};
-use p11scope_manifest::elf::exports_matching;
+use p11scope_manifest::elf::{ElfAbi, ElfSnapshot};
 use p11scope_manifest::identity::open_object;
 use p11scope_manifest::maps::{MapEntry, MapIndex, MappedPath, ObjectKey, Resolved, parse_maps};
-use pkcs11_module::{Surface, TableSet, TableSpan, read_fn_pointers, tables_for};
+use pkcs11_module::{
+    LinuxLayout, Surface, TableSet, TableSpan, function_name, read_function_pointer, read_word_le,
+    table_bytes, tables_for,
+};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::Read;
@@ -18,9 +21,10 @@ use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-const WORD: usize = 8;
 const INTERFACE_NAME_CAP: usize = 64;
-/// One `CK_INTERFACE`: `{ char *name, void *function_list, CK_FLAGS flags }`.
+#[cfg(test)]
+const WORD: usize = 8;
+#[cfg(test)]
 const INTERFACE_BYTES: usize = 3 * WORD;
 const READ_CHUNK: usize = 1024 * 1024;
 const STANDARD_INTERFACE_NAME: &[u8] = b"PKCS 11";
@@ -29,6 +33,8 @@ const MAX_DECODED_TABLE_ENTRIES: usize = 512 * 104;
 const MAX_INTERFACE_RECORDS: usize = 512;
 const MAX_MAPS_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_MAP_ENTRIES: usize = 1_048_576;
+const MAX_MOUNTINFO_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_MOUNTINFO_ENTRIES: usize = 1_048_576;
 // ponytail: this independent ceiling is the calibration knob if real providers hit it.
 const DEFAULT_WORK_CEILING: u64 = 16 * 1024 * 1024;
 pub(crate) const IO_CEILING_REASON: &str =
@@ -43,6 +49,156 @@ pub(crate) const MAPS_CEILING_REASON: &str =
     "capture /proc maps byte ceiling reached; remaining mappings were not read";
 pub(crate) const MAPS_ENTRY_CEILING_REASON: &str =
     "capture /proc maps entry ceiling reached; remaining mappings were not read";
+pub(crate) const MOUNTINFO_CEILING_REASON: &str =
+    "capture mountinfo byte ceiling reached; the incomplete mount table was refused";
+pub(crate) const MOUNTINFO_ENTRY_CEILING_REASON: &str =
+    "capture mountinfo entry ceiling reached; the incomplete mount table was refused";
+
+pub(crate) fn target_layout(abi: ElfAbi) -> LinuxLayout {
+    match abi {
+        ElfAbi::Lp64 => LinuxLayout::Lp64,
+        ElfAbi::Ilp32 => LinuxLayout::Ilp32,
+    }
+}
+
+pub(crate) fn read_elf_snapshot(
+    file: &File,
+    budget: &mut CaptureWorkBudget,
+) -> Result<ElfSnapshot, String> {
+    read_elf_snapshot_with(
+        file,
+        budget,
+        CaptureWorkBudget::check_deadline_now,
+        |file, bytes, offset| file.read_at(bytes, offset),
+    )
+}
+
+fn read_elf_snapshot_with(
+    file: &File,
+    budget: &mut CaptureWorkBudget,
+    mut deadline: impl FnMut(&mut CaptureWorkBudget) -> Option<&'static str>,
+    mut reader: impl FnMut(&File, &mut [u8], u64) -> std::io::Result<usize>,
+) -> Result<ElfSnapshot, String> {
+    let size = file
+        .metadata()
+        .map_err(|error| format!("metadata failed: {error}"))?
+        .len();
+    if size > budget.limits().per_object_bytes {
+        return Err(format!(
+            "too_large ({size} bytes; per-object cap is {})",
+            budget.limits().per_object_bytes,
+        ));
+    }
+    let mut operation_bytes = 0u64;
+    ElfSnapshot::read_with_reader(file, |file, bytes, offset| {
+        if let Some(reason) = deadline(budget) {
+            return Err(std::io::Error::other(reason));
+        }
+        let allowed = budget.allowed_io(operation_bytes, bytes.len());
+        if allowed == 0 {
+            return Err(std::io::Error::other(IO_CEILING_REASON));
+        }
+        let read = reader(file, &mut bytes[..allowed], offset)?;
+        budget.record_io(read);
+        operation_bytes += read as u64;
+        Ok(read)
+    })
+}
+
+pub(crate) fn read_mountinfo<R: Read>(
+    reader: R,
+    budget: &mut CaptureWorkBudget,
+) -> Result<String, String> {
+    read_mountinfo_with(
+        reader,
+        budget,
+        READ_CHUNK,
+        CaptureWorkBudget::check_deadline_now,
+    )
+}
+
+pub(crate) fn read_mountinfo_with<R: Read>(
+    mut reader: R,
+    budget: &mut CaptureWorkBudget,
+    chunk_size: usize,
+    mut deadline: impl FnMut(&mut CaptureWorkBudget) -> Option<&'static str>,
+) -> Result<String, String> {
+    let table_cap = budget.limits().per_object_bytes.min(MAX_MOUNTINFO_BYTES);
+    if table_cap == 0 {
+        return Err(MOUNTINFO_CEILING_REASON.into());
+    }
+
+    let mut table = Vec::new();
+    let mut observed_lines = 0usize;
+    let mut newline_count = 0usize;
+    let mut chunk = vec![0; chunk_size.max(1)];
+    loop {
+        if let Some(reason) = budget.scan_stop_reason {
+            return Err(reason.into());
+        }
+        if let Some(reason) = deadline(budget) {
+            return Err(reason.into());
+        }
+
+        let capture_left = budget
+            .limits()
+            .total_bytes
+            .saturating_sub(budget.attempted_io_bytes());
+        if capture_left == 0 {
+            return Err(IO_CEILING_REASON.into());
+        }
+        let table_bytes = u64::try_from(table.len()).unwrap_or(u64::MAX);
+        let table_left = table_cap.saturating_sub(table_bytes);
+        let wanted = u64::try_from(chunk.len())
+            .unwrap_or(u64::MAX)
+            .min(capture_left)
+            .min(table_left.saturating_add(1));
+        let wanted = usize::try_from(wanted).unwrap_or(chunk.len());
+        if wanted == 0 {
+            return Err(MOUNTINFO_CEILING_REASON.into());
+        }
+        budget.spend(1).map_err(str::to_string)?;
+
+        let read = match reader.read(&mut chunk[..wanted]) {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(format!("cannot read mount table: {error}")),
+        };
+        budget.record_io(read);
+        if read == 0 {
+            if let Some(reason) = deadline(budget) {
+                return Err(reason.into());
+            }
+            return String::from_utf8(table)
+                .map_err(|error| format!("mount table is not valid UTF-8: {error}"));
+        }
+
+        let next_len = table
+            .len()
+            .checked_add(read)
+            .ok_or_else(|| MOUNTINFO_CEILING_REASON.to_string())?;
+        let newlines = chunk[..read].iter().filter(|byte| **byte == b'\n').count();
+        let next_newline_count = newline_count
+            .checked_add(newlines)
+            .ok_or_else(|| MOUNTINFO_ENTRY_CEILING_REASON.to_string())?;
+        let next_lines = next_newline_count
+            .checked_add(usize::from(chunk[read - 1] != b'\n'))
+            .ok_or_else(|| MOUNTINFO_ENTRY_CEILING_REASON.to_string())?;
+        let added_lines = next_lines.saturating_sub(observed_lines);
+        budget
+            .spend(u64::try_from(added_lines).unwrap_or(u64::MAX))
+            .map_err(str::to_string)?;
+        if u64::try_from(next_len).unwrap_or(u64::MAX) > table_cap {
+            return Err(MOUNTINFO_CEILING_REASON.into());
+        }
+        if next_lines > MAX_MOUNTINFO_ENTRIES {
+            return Err(MOUNTINFO_ENTRY_CEILING_REASON.into());
+        }
+        table.extend_from_slice(&chunk[..read]);
+        newline_count = next_newline_count;
+        observed_lines = next_lines;
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScanLimits {
@@ -361,6 +517,11 @@ pub struct ScannedModule {
     pub mount_namespace: MountNamespaceId,
     pub key: ObjectKey,
     pub path: String,
+    /// ABI used by the userspace memory decoder. Present only when this module
+    /// came from `scan_process_view`; mapping and kernel-record projections do
+    /// not manufacture this provenance.
+    #[doc(hidden)]
+    pub decoder_abi: Option<ElfAbi>,
     pub exports: Vec<String>,
     pub tables: Vec<ScannedTable>,
     pub interfaces: Vec<ScannedInterface>,
@@ -438,37 +599,27 @@ pub(crate) fn spans_for(word: u64) -> Option<((u8, u8), &'static [TableSpan], &'
 }
 
 /// How many bytes a layout occupies, including the version header word.
-fn span_bytes(spans: &[TableSpan]) -> Option<usize> {
-    spans
-        .iter()
-        .flat_map(|span| span.fields())
-        .filter_map(|field| field.offset.checked_add(WORD))
-        .max()
+fn span_bytes(layout: LinuxLayout, spans: &[TableSpan]) -> Option<usize> {
+    table_bytes(layout, spans.iter().map(|span| span.fields().len()).sum()).ok()
 }
 
-pub(crate) fn exact_table_bytes(header: &[u8]) -> Option<usize> {
-    let word = u64::from_ne_bytes(header.get(..WORD)?.try_into().ok()?);
+pub(crate) fn exact_table_bytes(header: &[u8], layout: LinuxLayout) -> Option<usize> {
+    let word = read_word_le(header, layout, 0).ok()?;
     let (_, spans, _) = spans_for(word)?;
-    span_bytes(spans)
+    span_bytes(layout, spans)
 }
 
 /// Returns every non-NULL function pointer in one complete table snapshot.
 /// Addresses are capture-local and are used only to close the maps-A/maps-B
 /// stability bracket; callers must not persist them as identity.
-pub(crate) fn exact_table_addresses(snapshot: &[u8]) -> Option<Vec<u64>> {
-    let word = u64::from_ne_bytes(snapshot.get(..WORD)?.try_into().ok()?);
+pub(crate) fn exact_table_addresses(snapshot: &[u8], layout: LinuxLayout) -> Option<Vec<u64>> {
+    let word = read_word_le(snapshot, layout, 0).ok()?;
     let (_, spans, _) = spans_for(word)?;
     let mut addresses = Vec::new();
-    for span in spans {
-        for field in span.fields() {
-            let raw = field
-                .offset
-                .checked_add(WORD)
-                .and_then(|end| snapshot.get(field.offset..end))?;
-            let address = u64::from_ne_bytes(raw.try_into().ok()?);
-            if address != 0 {
-                addresses.push(address);
-            }
+    for ordinal in 0..spans.iter().map(|span| span.fields().len()).sum() {
+        let address = read_function_pointer(snapshot, layout, ordinal).ok()?;
+        if address != 0 {
+            addresses.push(address);
         }
     }
     Some(addresses)
@@ -479,23 +630,25 @@ pub(crate) fn exact_table_addresses(snapshot: &[u8]) -> Option<Vec<u64>> {
 /// is either NULL or points into a file-backed executable mapping — the criterion
 /// that makes a run of pointers a function table rather than data that looks like one.
 fn decode_candidate(
+    layout: LinuxLayout,
     snapshot: &[u8],
     offset: usize,
     base_address: u64,
     maps: &MapIndex<'_>,
     budget: &mut CaptureWorkBudget,
 ) -> Result<Option<(ScannedTable, usize)>, ()> {
+    let width = layout.word_bytes();
     let Some(raw_word) = offset
-        .checked_add(WORD)
+        .checked_add(width)
         .and_then(|end| snapshot.get(offset..end))
     else {
         return Ok(None);
     };
-    let word = u64::from_ne_bytes(raw_word.try_into().expect("one word"));
+    let word = read_word_le(raw_word, layout, 0).expect("one target word");
     let Some((version, spans, walk)) = spans_for(word) else {
         return Ok(None);
     };
-    let Some(len) = span_bytes(spans) else {
+    let Some(len) = span_bytes(layout, spans) else {
         return Ok(None);
     };
     let Some(address) = base_address.checked_add(offset as u64) else {
@@ -514,36 +667,30 @@ fn decode_candidate(
 
     // Validate the whole candidate before reserving or allocating decoded records.
     let mut non_null = 0usize;
-    for span in spans {
-        for field in span.fields() {
-            if !budget.charge(1) {
-                return Err(());
-            }
-            let Some(raw) = field
-                .offset
-                .checked_add(WORD)
-                .and_then(|end| bytes.get(field.offset..end))
-            else {
-                return Ok(None);
-            };
-            let value = usize::from_ne_bytes(raw.try_into().expect("one pointer"));
-            if value == 0 {
-                continue;
-            }
-            non_null += 1;
-            let Resolved::File {
-                permissions, path, ..
-            } = maps.resolve(value as u64)
-            else {
-                return Ok(None); // anonymous or unmapped ⇒ not a function table
-            };
-            if permissions[2] != b'x' {
-                return Ok(None); // a pointer into data ⇒ not a function table
-            }
-            let MappedPath::Usable(_) = path else {
-                return Ok(None); // deleted/ambiguous pathname ⇒ cannot become an attach target
-            };
+    let field_count = spans.iter().map(|span| span.fields().len()).sum();
+    for ordinal in 0..field_count {
+        if !budget.charge(1) {
+            return Err(());
         }
+        let Ok(value) = read_function_pointer(bytes, layout, ordinal) else {
+            return Ok(None);
+        };
+        if value == 0 {
+            continue;
+        }
+        non_null += 1;
+        let Resolved::File {
+            permissions, path, ..
+        } = maps.resolve(value)
+        else {
+            return Ok(None); // anonymous or unmapped ⇒ not a function table
+        };
+        if permissions[2] != b'x' {
+            return Ok(None); // a pointer into data ⇒ not a function table
+        }
+        let MappedPath::Usable(_) = path else {
+            return Ok(None); // deleted/ambiguous pathname ⇒ cannot become an attach target
+        };
     }
     if non_null == 0 {
         return Ok(None);
@@ -555,32 +702,32 @@ fn decode_candidate(
 
     let mut entries = Vec::with_capacity(non_null);
     let mut null_entries = Vec::with_capacity(decoded_entries - non_null);
-    for span in spans {
-        for (name, value) in read_fn_pointers(bytes, span.fields()).expect("validated above") {
-            if value == 0 {
-                null_entries.push(name);
-                continue;
-            }
-            let Resolved::File {
-                path,
-                file_offset,
-                device,
-                inode,
-                ..
-            } = maps.resolve(value as u64)
-            else {
-                unreachable!("validated above")
-            };
-            let MappedPath::Usable(path) = path else {
-                unreachable!("validated above")
-            };
-            entries.push(ScannedEntry {
-                name,
-                object: ObjectKey { device, inode },
-                object_path: path.display().to_string(),
-                file_offset,
-            });
+    for ordinal in 0..field_count {
+        let name = function_name(ordinal).expect("validated shared field count");
+        let value = read_function_pointer(bytes, layout, ordinal).expect("validated above");
+        if value == 0 {
+            null_entries.push(name);
+            continue;
         }
+        let Resolved::File {
+            path,
+            file_offset,
+            device,
+            inode,
+            ..
+        } = maps.resolve(value)
+        else {
+            unreachable!("validated above")
+        };
+        let MappedPath::Usable(path) = path else {
+            unreachable!("validated above")
+        };
+        entries.push(ScannedEntry {
+            name,
+            object: ObjectKey { device, inode },
+            object_path: path.display().to_string(),
+            file_offset,
+        });
     }
     Ok(Some((
         ScannedTable {
@@ -602,22 +749,35 @@ fn decode_candidate(
 pub(crate) fn decode_exact_table(
     snapshot: &[u8],
     address: u64,
+    layout: LinuxLayout,
     maps: &MapIndex<'_>,
     budget: &mut CaptureWorkBudget,
 ) -> Result<Option<ScannedTable>, ()> {
-    decode_candidate(snapshot, 0, address, maps, budget)
+    decode_candidate(layout, snapshot, 0, address, maps, budget)
         .map(|decoded| decoded.map(|(table, _)| table))
 }
 
 /// Every 8-byte-aligned candidate in one snapshot, longest match kept on overlap.
 /// The second return carries the one bounded exhaustion reason, if decoding stopped.
+#[cfg(test)]
 fn detect_tables(
     snapshot: &[u8],
     base_address: u64,
     maps: &MapIndex<'_>,
     budget: &mut CaptureWorkBudget,
 ) -> (Vec<ScannedTable>, Vec<String>) {
+    detect_tables_for_layout(LinuxLayout::Lp64, snapshot, base_address, maps, budget)
+}
+
+fn detect_tables_for_layout(
+    layout: LinuxLayout,
+    snapshot: &[u8],
+    base_address: u64,
+    maps: &MapIndex<'_>,
+    budget: &mut CaptureWorkBudget,
+) -> (Vec<ScannedTable>, Vec<String>) {
     detect_tables_with_clock(
+        layout,
         snapshot,
         base_address,
         maps,
@@ -627,6 +787,7 @@ fn detect_tables(
 }
 
 fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
+    layout: LinuxLayout,
     snapshot: &[u8],
     base_address: u64,
     maps: &MapIndex<'_>,
@@ -636,8 +797,9 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
     let mut skipped = Vec::new();
     let mut found: Vec<(usize, usize, ScannedTable)> = Vec::new();
     let mut offset = 0usize;
-    while offset + WORD <= snapshot.len() {
-        if (offset / WORD) % 4096 == 0
+    let width = layout.word_bytes();
+    while offset + width <= snapshot.len() {
+        if (offset / width) % 4096 == 0
             && budget.deadline_ns.is_some()
             && budget.check_deadline(now()).is_some()
         {
@@ -658,7 +820,7 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
             }
             break;
         }
-        match decode_candidate(snapshot, offset, base_address, maps, budget) {
+        match decode_candidate(layout, snapshot, offset, base_address, maps, budget) {
             Ok(Some((table, len))) => found.push((offset, len, table)),
             Ok(None) => {}
             Err(()) => {
@@ -670,7 +832,7 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
                 break;
             }
         }
-        offset += WORD;
+        offset += width;
     }
     // Longest first, then drop anything overlapping an already-kept match.
     found.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
@@ -693,9 +855,33 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
 
 /// `CK_INTERFACE` triples in one snapshot that name a table this scan decoded.
 /// The triple's own address is not recorded, so no `base_address` is needed here.
+#[cfg(test)]
 fn scan_interfaces(
     snapshot: &[u8],
-    mem: &File,
+    mem: &impl ScanMemory,
+    tables: &[ScannedTable],
+    maps: &MapIndex<'_>,
+    key: ObjectKey,
+    budget: &mut CaptureWorkBudget,
+    operation_bytes: &mut u64,
+) -> (Vec<ScannedInterface>, Vec<String>) {
+    scan_interfaces_for_layout(
+        LinuxLayout::Lp64,
+        snapshot,
+        mem,
+        tables,
+        maps,
+        key,
+        budget,
+        operation_bytes,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_interfaces_for_layout(
+    layout: LinuxLayout,
+    snapshot: &[u8],
+    mem: &impl ScanMemory,
     tables: &[ScannedTable],
     maps: &MapIndex<'_>,
     key: ObjectKey,
@@ -703,6 +889,7 @@ fn scan_interfaces(
     operation_bytes: &mut u64,
 ) -> (Vec<ScannedInterface>, Vec<String>) {
     scan_interfaces_with_clock(
+        layout,
         snapshot,
         mem,
         tables,
@@ -716,8 +903,9 @@ fn scan_interfaces(
 
 #[allow(clippy::too_many_arguments)]
 fn scan_interfaces_with_clock<F: FnMut() -> Option<u64>>(
+    layout: LinuxLayout,
     snapshot: &[u8],
-    mem: &File,
+    mem: &impl ScanMemory,
     tables: &[ScannedTable],
     maps: &MapIndex<'_>,
     key: ObjectKey,
@@ -725,14 +913,8 @@ fn scan_interfaces_with_clock<F: FnMut() -> Option<u64>>(
     operation_bytes: &mut u64,
     mut now: F,
 ) -> (Vec<ScannedInterface>, Vec<String>) {
-    let word_at = |offset: usize| -> Option<u64> {
-        Some(u64::from_ne_bytes(
-            snapshot
-                .get(offset..offset.checked_add(WORD)?)?
-                .try_into()
-                .ok()?,
-        ))
-    };
+    let word_at = |offset: usize| read_word_le(snapshot, layout, offset).ok();
+    let interface = layout.interface();
     let mut found = Vec::new();
     let mut skipped = Vec::new();
     let mut io_exhausted = false;
@@ -745,8 +927,8 @@ fn scan_interfaces_with_clock<F: FnMut() -> Option<u64>>(
                 by_address
             });
     let mut offset = 0usize;
-    while offset + INTERFACE_BYTES <= snapshot.len() {
-        if (offset / WORD) % 4096 == 0
+    while offset + interface.stride <= snapshot.len() {
+        if (offset / layout.word_bytes()) % 4096 == 0
             && budget.deadline_ns.is_some()
             && budget.check_deadline(now()).is_some()
         {
@@ -768,9 +950,9 @@ fn scan_interfaces_with_clock<F: FnMut() -> Option<u64>>(
             break;
         }
         let scanned = (|| {
-            let name_ptr = word_at(offset)?;
-            let table_ptr = word_at(offset + WORD)?;
-            let flags = word_at(offset + 2 * WORD)?;
+            let name_ptr = word_at(offset + interface.name_offset)?;
+            let table_ptr = word_at(offset + interface.function_list_offset)?;
+            let flags = word_at(offset + interface.flags_offset)?;
             // The function-list pointer is the anchor: without it a triple of words
             // is just data. Requiring a decoded table also keeps the byte budget —
             // only the provider's own mappings are ever read.
@@ -840,7 +1022,7 @@ fn scan_interfaces_with_clock<F: FnMut() -> Option<u64>>(
             );
             break;
         }
-        offset += WORD;
+        offset += layout.word_bytes();
     }
     (found, skipped)
 }
@@ -848,7 +1030,7 @@ fn scan_interfaces_with_clock<F: FnMut() -> Option<u64>>(
 /// A NUL-terminated name of at most `INTERFACE_NAME_CAP` bytes, or `None` when the
 /// target memory could not be read or the name reaches the mapping end or cap.
 fn read_name(
-    mem: &File,
+    mem: &impl ScanMemory,
     address: u64,
     mapping_end: u64,
     budget: &mut CaptureWorkBudget,
@@ -872,7 +1054,7 @@ fn read_name(
         if allowed == 0 {
             return Err(());
         }
-        let read = match mem.read_at(&mut chunk[..allowed], at) {
+        let read = match mem.read_memory_at(&mut chunk[..allowed], at) {
             Ok(0) | Err(_) => return Ok(None),
             Ok(read) => read,
         };
@@ -893,7 +1075,7 @@ fn read_name(
 /// that point went unscanned, and the caller must record that rather than imply it was
 /// examined and found empty.
 fn read_mapping(
-    mem: &File,
+    mem: &impl ScanMemory,
     entry: &MapEntry,
     budget: &mut CaptureWorkBudget,
     operation_bytes: &mut u64,
@@ -923,7 +1105,7 @@ fn read_mapping(
             break;
         };
         bytes.resize(done + want, 0);
-        match mem.read_at(&mut bytes[done..], at) {
+        match mem.read_memory_at(&mut bytes[done..], at) {
             Ok(0) => {
                 bytes.truncate(done);
                 // Addresses stay out of the reason: it is published in the capture
@@ -1029,8 +1211,9 @@ fn opened_file_identity_guard(
     view: &ProcessView,
     file: &File,
     expected: ObjectKey,
+    budget: &mut CaptureWorkBudget,
 ) -> Result<(), String> {
-    let actual = crate::discovery::identity::retained_object_key(view, file)?;
+    let actual = crate::discovery::identity::retained_object_key(view, file, budget)?;
     if actual == expected {
         return Ok(());
     }
@@ -1199,7 +1382,7 @@ pub(crate) fn index_maps_or_refuse<'a>(
 ) -> Result<MapIndex<'a>, String> {
     budget.spend(maps.len() as u64).map_err(String::from)?;
     MapIndex::new(maps)
-        .ok_or_else(|| "reversed or overlapping /proc/<pid>/maps intervals".to_string())
+        .map_err(|_| "reversed or overlapping /proc/<pid>/maps intervals".to_string())
 }
 
 pub fn scan_pid(
@@ -1210,12 +1393,231 @@ pub fn scan_pid(
     scan_process_view(request, &view, budget)
 }
 
+// Private I/O seam: production and mutation tests share the entire acquisition loop.
+trait ScanMemory {
+    fn read_memory_at(&self, bytes: &mut [u8], offset: u64) -> std::io::Result<usize>;
+}
+
+impl ScanMemory for File {
+    fn read_memory_at(&self, bytes: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        std::os::unix::fs::FileExt::read_at(self, bytes, offset)
+    }
+}
+
+trait ScanIo {
+    type Memory: ScanMemory;
+    fn open_maps(
+        &mut self,
+        view: &ProcessView,
+        budget: &CaptureWorkBudget,
+    ) -> std::io::Result<Box<dyn Read>>;
+    fn open_mem(&mut self, view: &ProcessView) -> std::io::Result<Self::Memory>;
+    fn final_generation(&mut self, view: &ProcessView) -> Result<(), String>;
+    fn maps_now(&self) -> Option<u64> {
+        crate::attach::monotonic_ns()
+    }
+}
+
+struct ProcScanIo;
+
+impl ScanIo for ProcScanIo {
+    type Memory = File;
+
+    fn open_maps(
+        &mut self,
+        view: &ProcessView,
+        _: &CaptureWorkBudget,
+    ) -> std::io::Result<Box<dyn Read>> {
+        Ok(Box::new(File::open(format!("/proc/{}/maps", view.pid()))?))
+    }
+
+    fn open_mem(&mut self, view: &ProcessView) -> std::io::Result<File> {
+        File::open(format!("/proc/{}/mem", view.pid()))
+    }
+
+    fn final_generation(&mut self, view: &ProcessView) -> Result<(), String> {
+        view.run_while_same(|| ())
+    }
+}
+
+pub(crate) const MAPPING_CHANGED_REASON: &str =
+    "memory scan refused: mapping changed during acquisition";
+const FINAL_MAPS_UNAVAILABLE_REASON: &str =
+    "memory scan refused: final mapping validation unavailable";
+const INITIAL_MAPS_UNAVAILABLE_REASON: &str =
+    "memory scan refused: initial mapping validation unavailable";
+const SCAN_GENERATION_CHANGED_REASON: &str =
+    "memory scan refused: process generation changed during acquisition";
+
+/// All provider mappings establish inventory authority. They also cover every
+/// searched data snapshot (even empty ones), complete interface descriptors, and
+/// same-object name reads, including their bounded read-ahead. Function targets
+/// can belong to other objects and must be retained separately, from decoded bytes.
+#[derive(Default)]
+struct ScanDependencies<'a> {
+    inventory: Vec<&'a MapEntry>,
+    targets: BTreeMap<u64, &'a MapEntry>,
+    invalid_span: bool,
+}
+
+impl<'a> ScanDependencies<'a> {
+    fn retain_tables(
+        &mut self,
+        tables: &[ScannedTable],
+        snapshot: &[u8],
+        base: u64,
+        layout: LinuxLayout,
+        maps: &MapIndex<'a>,
+        budget: &mut CaptureWorkBudget,
+    ) {
+        for table in tables {
+            let dependency = (|| {
+                let offset = usize::try_from(table.address.checked_sub(base)?).ok()?;
+                let bytes = snapshot.get(offset..)?;
+                let len = exact_table_bytes(bytes, layout)?;
+                let bytes = bytes.get(..len)?;
+                let end = table.address.checked_add(len as u64)?;
+                let mapping = maps.containing(table.address)?;
+                if mapping.permissions[0] != b'r' || end > mapping.end {
+                    return None;
+                }
+                let addresses = exact_table_addresses(bytes, layout)?;
+                for address in addresses {
+                    budget.spend(1).ok()?;
+                    let target = maps.containing(address)?;
+                    self.targets.insert(target.start, target);
+                }
+                Some(())
+            })();
+            if dependency.is_none() {
+                self.invalid_span = true;
+            }
+        }
+    }
+
+    fn validate(
+        &self,
+        module: &ScannedModule,
+        maps_b: &MapIndex<'_>,
+        groups_b: &BTreeMap<ObjectKey, Vec<&MapEntry>>,
+        budget: &mut CaptureWorkBudget,
+    ) -> Result<bool, &'static str> {
+        if self.invalid_span {
+            return Ok(false);
+        }
+        for entry in self
+            .inventory
+            .iter()
+            .copied()
+            .chain(self.targets.values().copied())
+        {
+            // Account for both the lookup and full mapping/path comparison.
+            budget.spend(1 + entry.raw_path.as_ref().map_or(0, |path| path.len() as u64))?;
+            if maps_b.containing(entry.start) != Some(entry) {
+                return Ok(false);
+            }
+        }
+        // Absence of a decoded table is evidence only for the entire searched
+        // provider data set; additions in B must not escape a vacuous table loop.
+        if module.tables.is_empty() {
+            let data =
+                |entry: &&MapEntry| entry.permissions[0] == b'r' && entry.permissions[2] != b'x';
+            let before = self.inventory.iter().copied().filter(data);
+            let after = groups_b
+                .get(&module.key)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(data);
+            let mut before = before;
+            let mut after = after;
+            loop {
+                budget.spend(1)?;
+                match (before.next(), after.next()) {
+                    (None, None) => break,
+                    (Some(a), Some(b)) if a == b => {}
+                    _ => return Ok(false),
+                }
+            }
+        }
+        Ok(true)
+    }
+}
+
+fn acquire_scan_maps(
+    view: &ProcessView,
+    budget: &mut CaptureWorkBudget,
+    io: &mut impl ScanIo,
+) -> Result<Vec<MapEntry>, String> {
+    if let Some(reason) = budget.stopped_now() {
+        return Err(reason.into());
+    }
+    let reader = view
+        .run_while_same(|| io.open_maps(view, budget))?
+        .map_err(|error| error.to_string())?;
+    budget.spend(1).map_err(str::to_owned)?;
+    let (bytes, reasons) = read_maps_with_limits(
+        reader,
+        budget,
+        MAX_MAPS_BYTES,
+        MAX_MAP_ENTRIES,
+        64 * 1024,
+        || io.maps_now(),
+    )
+    .map_err(|error| error.to_string())?;
+    if let Some(reason) = reasons.first().copied().or(budget.stopped_now()) {
+        return Err(reason.into());
+    }
+    if bytes.is_empty() || !bytes.ends_with(b"\n") {
+        return Err("empty or truncated /proc maps snapshot".into());
+    }
+    // Parsing is charged independently of the single charged index construction.
+    budget
+        .spend(bytes.iter().filter(|byte| **byte == b'\n').count() as u64)
+        .map_err(str::to_owned)?;
+    let maps = parse_maps(&bytes)?;
+    if maps.is_empty() {
+        return Err("empty /proc maps snapshot".into());
+    }
+    Ok(maps)
+}
+
 /// Scan through an already accepted process-generation pin. Capture discovery uses
 /// this entry point so one monotonically allocated `ProcessViewId` owns every result.
 pub fn scan_process_view(
     request: &ScanRequest<'_>,
     view: &ProcessView,
     budget: &mut CaptureWorkBudget,
+) -> Result<ScanOutcome, String> {
+    scan_process_view_with_io(request, view, budget, &mut ProcScanIo)
+}
+
+/// Enumerates and pins the current module/export surface while deliberately
+/// postponing target-memory table reads. The maps-A/maps-B and final-generation
+/// bracket remains authoritative for the inventory returned here.
+pub(crate) fn scan_process_view_without_memory(
+    request: &ScanRequest<'_>,
+    view: &ProcessView,
+    budget: &mut CaptureWorkBudget,
+) -> Result<ScanOutcome, String> {
+    scan_process_view_with_io_mode(request, view, budget, &mut ProcScanIo, false)
+}
+
+fn scan_process_view_with_io(
+    request: &ScanRequest<'_>,
+    view: &ProcessView,
+    budget: &mut CaptureWorkBudget,
+    io: &mut impl ScanIo,
+) -> Result<ScanOutcome, String> {
+    scan_process_view_with_io_mode(request, view, budget, io, true)
+}
+
+fn scan_process_view_with_io_mode(
+    request: &ScanRequest<'_>,
+    view: &ProcessView,
+    budget: &mut CaptureWorkBudget,
+    io: &mut impl ScanIo,
+    scan_memory: bool,
 ) -> Result<ScanOutcome, String> {
     if request.pid != view.pid() {
         return Err("scan request pid does not match its process view".into());
@@ -1225,68 +1627,68 @@ pub fn scan_process_view(
     }
     let started = Instant::now();
     let pid = request.pid;
-    let (map_bytes, map_reasons) = view
-        .run_while_same(|| {
-            File::open(format!("/proc/{pid}/maps")).and_then(|maps_file| {
-                read_maps_with_limits(
-                    maps_file,
-                    budget,
-                    MAX_MAPS_BYTES,
-                    MAX_MAP_ENTRIES,
-                    64 * 1024,
-                    crate::attach::monotonic_ns,
-                )
-                .map_err(std::io::Error::other)
-            })
-        })
-        .map_err(|error| format!("/proc/{pid}/maps: {error}"))?
-        .map_err(|error| format!("/proc/{pid}/maps: {error}"))?;
-    let maps = parse_maps(&map_bytes)?;
-    let map_index = MapIndex::new(&maps)
-        .ok_or_else(|| "reversed or overlapping /proc/<pid>/maps intervals".to_string())?;
-    let mut modules = Vec::new();
-    let map_subject = format!("/proc/{pid}/maps");
-    let mut skipped = map_reasons
-        .into_iter()
-        .map(|reason| scan_skip(&map_subject, reason.into()))
-        .collect::<Vec<_>>();
-    // `parse_maps`, `MapIndex::new` and `candidate_groups` are each O(entries)
-    // on a snapshot the target sizes. Charge that preprocessing and answer the
-    // capture's stop here: a dense map cannot defer the first check past it,
-    // and a stop that arrived before this scan is published instead of
-    // breaking the group loop with no reason at all.
-    let scannable = budget.spend(maps.len() as u64).is_ok() && budget.stopped_now().is_none();
-    if !scannable {
-        if let Some(reason) = budget.take_scan_stop_reason() {
-            skipped.push(scan_skip("capture discovery", reason.into()));
+    let refused_initial = |reason: String| {
+        let mut skipped = vec![scan_skip(
+            "capture discovery",
+            format!("{INITIAL_MAPS_UNAVAILABLE_REASON}: {reason}"),
+        )];
+        if capture_scan_reason(&reason) {
+            skipped.push(scan_skip("capture discovery", reason));
         }
+        ScanOutcome::Scanned {
+            modules: Vec::new(),
+            skipped,
+            scan_ms: started.elapsed().as_millis() as u64,
+        }
+    };
+    let maps = match acquire_scan_maps(view, budget, io) {
+        Ok(maps) => maps,
+        Err(reason) => return Ok(refused_initial(reason)),
+    };
+    let map_index = match index_maps_or_refuse(&maps, budget) {
+        Ok(index) => index,
+        Err(reason) => return Ok(refused_initial(reason)),
+    };
+    let mut modules = Vec::new();
+    let mut dependencies = BTreeMap::new();
+    let mut skipped = Vec::new();
+    // Group construction also consumes the capture's existing work allowance.
+    if let Err(reason) = budget.spend(maps.len() as u64) {
+        return Ok(refused_initial(reason.into()));
     }
     // `/proc/<pid>/mem` is gated by PTRACE_MODE_ATTACH and Yama; losing it costs the
     // tables, never the object inventory (spec §4.1 step 3). Only an access refusal is
     // a ptrace refusal — a pid that died mid-scan gets its own label.
-    let mem = view.run_while_same(|| File::open(format!("/proc/{pid}/mem")))?;
-    let unavailable = mem.as_ref().err().map(|error| {
-        let (class, publishes) = mem_unavailable(error);
-        if publishes {
-            skipped.push(Skipped {
-                subject: format!("/proc/{pid}/mem"),
-                reason: error.to_string(),
-            });
-        }
-        class
-    });
-    let mem = mem.ok();
+    let (mem, unavailable) = if scan_memory {
+        let mem = match view.run_while_same(|| io.open_mem(view)) {
+            Ok(mem) => mem,
+            Err(reason) => {
+                return Ok(refused_initial(format!(
+                    "{SCAN_GENERATION_CHANGED_REASON}: {reason}"
+                )));
+            }
+        };
+        let unavailable = mem.as_ref().err().map(|error| {
+            let (class, publishes) = mem_unavailable(error);
+            if publishes {
+                skipped.push(Skipped {
+                    subject: format!("/proc/{pid}/mem"),
+                    reason: error.to_string(),
+                });
+            }
+            class
+        });
+        (mem.ok(), unavailable)
+    } else {
+        (None, None)
+    };
 
     let wanted = request.hooks.names();
     let hint_ids: Vec<Option<(u64, u64)>> =
         request.hints.iter().map(|h| hint_identity(h)).collect();
     let mut hint_matched = vec![false; request.hints.len()];
 
-    let groups = if scannable {
-        candidate_groups(&maps)
-    } else {
-        BTreeMap::new()
-    };
+    let groups = candidate_groups(&maps);
     for (key, group) in groups {
         if budget.scan_stopped() {
             break;
@@ -1354,7 +1756,7 @@ pub fn scan_process_view(
                 continue;
             }
         };
-        if let Err(reason) = opened_file_identity_guard(view, &file, key) {
+        if let Err(reason) = opened_file_identity_guard(view, &file, key, budget) {
             skipped.push(Skipped { subject, reason });
             continue;
         }
@@ -1378,7 +1780,15 @@ pub fn scan_process_view(
             });
             continue;
         }
-        let exports = match exports_matching(&file, &wanted) {
+        let object = match read_elf_snapshot(&file, budget) {
+            Ok(object) => object,
+            Err(reason) => {
+                skipped.push(Skipped { subject, reason });
+                continue;
+            }
+        };
+        let layout = target_layout(object.abi());
+        let exports = match object.exports_matching(&wanted) {
             Ok(exports) => exports,
             Err(reason) => {
                 skipped.push(Skipped { subject, reason });
@@ -1393,10 +1803,15 @@ pub fn scan_process_view(
             mount_namespace: view.mount_namespace(),
             key,
             path,
+            decoder_abi: Some(object.abi()),
             exports: exports.into_iter().map(|(name, _)| name).collect(),
             tables: Vec::new(),
             interfaces: Vec::new(),
         };
+        let dependency = dependencies.entry(key).or_insert_with(|| ScanDependencies {
+            inventory: group.clone(),
+            ..ScanDependencies::default()
+        });
         let Some(mem) = &mem else {
             modules.push(module);
             continue;
@@ -1443,7 +1858,9 @@ pub fn scan_process_view(
             }
         }
         for (base, snapshot) in &snapshots {
-            let (tables, exhausted) = detect_tables(snapshot, *base, &map_index, budget);
+            let (tables, exhausted) =
+                detect_tables_for_layout(layout, snapshot, *base, &map_index, budget);
+            dependency.retain_tables(&tables, snapshot, *base, layout, &map_index, budget);
             module.tables.extend(tables);
             skipped.extend(
                 exhausted
@@ -1459,7 +1876,8 @@ pub fn scan_process_view(
             break;
         }
         for (_, snapshot) in &snapshots {
-            let (interfaces, exhausted) = scan_interfaces(
+            let (interfaces, exhausted) = scan_interfaces_for_layout(
+                layout,
                 snapshot,
                 mem,
                 &module.tables,
@@ -1518,6 +1936,60 @@ pub fn scan_process_view(
         }
     }
 
+    // No pending module escapes until the second complete snapshot, dependency
+    // comparisons and final generation check have all succeeded. A failed bracket
+    // remains an explicit occurrence even when a later scan or manifest attaches.
+    let validation = (|| {
+        let maps_b = acquire_scan_maps(view, budget, io)?;
+        let index_b = index_maps_or_refuse(&maps_b, budget)?;
+        budget.spend(maps_b.len() as u64).map_err(str::to_owned)?;
+        let groups_b = candidate_groups(&maps_b);
+        let mut accepted = Vec::with_capacity(modules.len());
+        for module in &modules {
+            accepted.push(
+                dependencies[&module.key]
+                    .validate(module, &index_b, &groups_b, budget)
+                    .map_err(str::to_owned)?,
+            );
+        }
+        if let Some(reason) = budget.stopped_now() {
+            return Err(reason.into());
+        }
+        Ok::<_, String>(accepted)
+    })();
+    let generation = io.final_generation(view);
+    match (validation, generation) {
+        (Ok(accepted), Ok(())) => {
+            modules = modules
+                .into_iter()
+                .zip(accepted)
+                .filter_map(|(module, accepted)| {
+                    if accepted {
+                        Some(module)
+                    } else {
+                        skipped.push(scan_skip(&module.path, MAPPING_CHANGED_REASON.into()));
+                        None
+                    }
+                })
+                .collect();
+        }
+        (validation, generation) => {
+            if let Err(reason) = validation {
+                skipped.push(scan_skip(
+                    "capture discovery",
+                    format!("{FINAL_MAPS_UNAVAILABLE_REASON}: {reason}"),
+                ));
+            }
+            if let Err(reason) = generation {
+                skipped.push(scan_skip(
+                    "capture discovery",
+                    format!("{SCAN_GENERATION_CHANGED_REASON}: {reason}"),
+                ));
+            }
+            modules.clear();
+        }
+    }
+
     let outcome = match unavailable {
         None => ScanOutcome::Scanned {
             modules,
@@ -1530,13 +2002,624 @@ pub fn scan_process_view(
             skipped,
         },
     };
-    view.run_while_same(|| ())?;
     Ok(outcome)
+}
+
+#[cfg(test)]
+pub(crate) fn bracket_refusal_for_test(
+    view: &ProcessView,
+    budget: &mut CaptureWorkBudget,
+) -> ScanOutcome {
+    tests::bracket_refusal(view, budget)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    pub(super) fn bracket_refusal(
+        view: &ProcessView,
+        budget: &mut CaptureWorkBudget,
+    ) -> ScanOutcome {
+        let mut fixture = BracketFixture::new(8, true);
+        fixture.maps_b = fixture.maps_b.replace("4000-6000", "4000-4810");
+        let hints = [fixture.path.clone()];
+        scan_process_view_with_io(
+            &ScanRequest {
+                pid: view.pid(),
+                hints: &hints,
+                hooks: &HookRegistry::builtin(),
+            },
+            view,
+            budget,
+            &mut fixture,
+        )
+        .unwrap()
+    }
+
+    // Raw maps text is authored independently of candidate_groups/MapIndex. Only
+    // the temporary file identity is interpolated; no production maps builder is used.
+    struct BracketFixture {
+        _dir: tempfile::TempDir,
+        path: PathBuf,
+        view: ProcessView,
+        maps_a: String,
+        maps_b: String,
+        mem: File,
+        log: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        maps_reads: usize,
+        before_b: Option<(u64, u64)>,
+        fail_open_b: bool,
+        fail_read_b: bool,
+        fail_generation: bool,
+        expire_at_b: bool,
+    }
+
+    struct BracketMemory {
+        file: File,
+        log: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    }
+
+    impl ScanMemory for BracketMemory {
+        fn read_memory_at(&self, bytes: &mut [u8], offset: u64) -> std::io::Result<usize> {
+            self.log
+                .borrow_mut()
+                .push(format!("memory {offset:x} {}", bytes.len()));
+            self.file.read_at(bytes, offset)
+        }
+    }
+
+    impl ScanIo for BracketFixture {
+        type Memory = BracketMemory;
+        fn open_maps(
+            &mut self,
+            _: &ProcessView,
+            budget: &CaptureWorkBudget,
+        ) -> std::io::Result<Box<dyn Read>> {
+            self.maps_reads += 1;
+            if self.maps_reads == 2 {
+                self.before_b = Some((budget.attempted_io_bytes(), budget.work_units));
+            }
+            self.log
+                .borrow_mut()
+                .push(format!("maps {}", self.maps_reads));
+            if self.maps_reads == 2 && self.fail_open_b {
+                return Err(std::io::Error::other("injected maps B open failure"));
+            }
+            if self.maps_reads == 2 && self.fail_read_b {
+                struct FailedRead;
+                impl Read for FailedRead {
+                    fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                        Err(std::io::Error::other("injected maps B read failure"))
+                    }
+                }
+                return Ok(Box::new(FailedRead));
+            }
+            Ok(Box::new(std::io::Cursor::new(
+                if self.maps_reads == 1 {
+                    &self.maps_a
+                } else {
+                    &self.maps_b
+                }
+                .as_bytes()
+                .to_vec(),
+            )))
+        }
+        fn open_mem(&mut self, _: &ProcessView) -> std::io::Result<BracketMemory> {
+            Ok(BracketMemory {
+                file: self.mem.try_clone()?,
+                log: self.log.clone(),
+            })
+        }
+        fn maps_now(&self) -> Option<u64> {
+            if self.expire_at_b && self.maps_reads == 2 {
+                Some(u64::MAX)
+            } else {
+                crate::attach::monotonic_ns()
+            }
+        }
+        fn final_generation(&mut self, view: &ProcessView) -> Result<(), String> {
+            self.log.borrow_mut().push("final generation".into());
+            if self.fail_generation {
+                Err("injected generation loss".into())
+            } else {
+                view.run_while_same(|| ())
+            }
+        }
+    }
+
+    impl BracketFixture {
+        fn new(width: usize, populated: bool) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("provider.so");
+            // Minimal independent x86 ELF header; the real ELF reader selects ABI.
+            let mut elf = vec![0u8; 64];
+            elf[..7].copy_from_slice(&[
+                0x7f,
+                b'E',
+                b'L',
+                b'F',
+                if width == 8 { 2 } else { 1 },
+                1,
+                1,
+            ]);
+            elf[16..18].copy_from_slice(&3u16.to_le_bytes());
+            elf[18..20].copy_from_slice(&(if width == 8 { 62u16 } else { 3 }).to_le_bytes());
+            elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+            if width == 8 {
+                elf[52..54].copy_from_slice(&64u16.to_le_bytes());
+                elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+                elf[58..60].copy_from_slice(&64u16.to_le_bytes());
+            } else {
+                elf[40..42].copy_from_slice(&52u16.to_le_bytes());
+                elf[42..44].copy_from_slice(&32u16.to_le_bytes());
+                elf[46..48].copy_from_slice(&40u16.to_le_bytes());
+            }
+            std::fs::write(&path, elf).unwrap();
+            let view = ProcessView::open(ProcessViewId(71), std::process::id()).unwrap();
+            let file = File::open(&path).unwrap();
+            let key = crate::discovery::identity::retained_object_key(
+                &view,
+                &file,
+                &mut CaptureWorkBudget::default(),
+            )
+            .unwrap();
+            let identity = format!(
+                "{:x}:{:x} {} {}",
+                key.device.major,
+                key.device.minor,
+                key.inode,
+                path.display()
+            );
+            let maps_a = format!(
+                "1000-2000 r-xp 00000000 {identity}\n\
+                 4000-6000 rw-p 00002000 {identity}\n\
+                 7000-8000 r--p 00004000 {identity}\n\
+                 9000-a000 r-xp 00000000 08:01 999 /dependency.so\n\
+                 b000-c000 r-xp 00005000 {identity}\n"
+            );
+            let mem = tempfile::tempfile().unwrap();
+            mem.set_len(0xc000).unwrap();
+            if populated {
+                let mut table = vec![0u8; 69 * width];
+                table[..2].copy_from_slice(&[2, 40]);
+                for slot in 0..68 {
+                    // Null slot plus both provider and dependency function targets.
+                    let pointer: u64 = match slot {
+                        0 => 0x1100,
+                        1 => 0,
+                        _ => 0x9100,
+                    };
+                    table[(slot + 1) * width..(slot + 2) * width]
+                        .copy_from_slice(&pointer.to_le_bytes()[..width]);
+                }
+                mem.write_all_at(&table, 0x4800).unwrap();
+                for (slot, value) in [0xb100u64, 0x4800, 0].into_iter().enumerate() {
+                    mem.write_all_at(
+                        &value.to_le_bytes()[..width],
+                        0x7100 + (slot * width) as u64,
+                    )
+                    .unwrap();
+                }
+                mem.write_all_at(b"PKCS 11\0PRIVATE_READ_AHEAD_CANARY", 0xb100)
+                    .unwrap();
+            }
+            Self {
+                _dir: dir,
+                path,
+                view,
+                maps_b: maps_a.clone(),
+                maps_a,
+                mem,
+                log: Default::default(),
+                maps_reads: 0,
+                before_b: None,
+                fail_open_b: false,
+                fail_read_b: false,
+                fail_generation: false,
+                expire_at_b: false,
+            }
+        }
+
+        fn run(&mut self, budget: &mut CaptureWorkBudget) -> Result<ScanOutcome, String> {
+            let view = ProcessView::open(self.view.id(), self.view.pid()).unwrap();
+            let hints = [self.path.clone()];
+            let hooks = HookRegistry::builtin();
+            let outcome = scan_process_view_with_io(
+                &ScanRequest {
+                    pid: view.pid(),
+                    hints: &hints,
+                    hooks: &hooks,
+                },
+                &view,
+                budget,
+                self,
+            );
+            self.log.borrow_mut().push("publication".into());
+            outcome
+        }
+
+        fn assert_refused(&mut self, budget: &mut CaptureWorkBudget, reason: &str) {
+            let outcome = self
+                .run(budget)
+                .expect("refusals must carry evidence, not discard it in Err");
+            assert_eq!(
+                outcome
+                    .modules()
+                    .iter()
+                    .map(|m| m.tables.len() + m.interfaces.len())
+                    .sum::<usize>(),
+                0,
+                "unvalidated tables/interfaces escaped"
+            );
+            assert!(
+                outcome
+                    .skipped()
+                    .iter()
+                    .any(|skip| skip.reason.contains(reason)),
+                "missing explicit {reason:?}: {:?}",
+                outcome.skipped()
+            );
+        }
+    }
+
+    #[test]
+    fn p2_bracket_split_span_with_unchanged_generation() {
+        let mut f = BracketFixture::new(8, true);
+        let original = f
+            .maps_b
+            .lines()
+            .find(|line| line.starts_with("4000-"))
+            .unwrap()
+            .to_owned();
+        let identity = original.split_once("00002000 ").unwrap().1;
+        f.maps_b = f.maps_b.replace(
+            &original,
+            &format!("4000-5000 rw-p 00002000 {identity}\n5000-6000 r--p 00003000 {identity}"),
+        );
+        f.assert_refused(
+            &mut CaptureWorkBudget::default(),
+            "memory scan refused: mapping changed during acquisition",
+        );
+        assert!(f.view.still_the_same());
+    }
+
+    #[test]
+    fn p2_bracket_function_dependency_full_mapping_equality() {
+        for replacement in [
+            "9000-a000 r-xp 00000010 08:01 999 /dependency.so",
+            "9000-a000 r-xp 00000000 08:01 998 /dependency.so",
+            "9000-a000 r-xp 00000000 08:02 999 /dependency.so",
+            "9000-a000 r--p 00000000 08:01 999 /dependency.so",
+            "9000-a000 r-xs 00000000 08:01 999 /dependency.so",
+            "9080-a000 r-xp 00000000 08:01 999 /dependency.so",
+            "9000-a000 r-xp 00000000 08:01 999 /replacement.so",
+        ] {
+            let mut f = BracketFixture::new(8, true);
+            f.maps_b = f.maps_b.replace(
+                "9000-a000 r-xp 00000000 08:01 999 /dependency.so",
+                replacement,
+            );
+            f.assert_refused(
+                &mut CaptureWorkBudget::default(),
+                "mapping changed during acquisition",
+            );
+        }
+    }
+
+    #[test]
+    fn p2_bracket_span_end_both_abis() {
+        for width in [8, 4] {
+            let mut f = BracketFixture::new(width, true);
+            f.maps_b = f.maps_b.replace("4000-6000", "4000-4810");
+            f.assert_refused(
+                &mut CaptureWorkBudget::default(),
+                "mapping changed during acquisition",
+            );
+        }
+    }
+
+    #[test]
+    fn p2_bracket_empty_result_checks_changed_and_added_data() {
+        for added in [false, true] {
+            let mut f = BracketFixture::new(8, false);
+            if added {
+                let identity = f
+                    .maps_a
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_once("00000000 ")
+                    .unwrap()
+                    .1;
+                f.maps_b
+                    .push_str(&format!("d000-e000 rw-p 00006000 {identity}\n"));
+            } else {
+                f.maps_b = f.maps_b.replace("4000-6000", "4000-5000");
+            }
+            f.assert_refused(
+                &mut CaptureWorkBudget::default(),
+                "mapping changed during acquisition",
+            );
+        }
+    }
+
+    #[test]
+    fn p2_bracket_interface_descriptor_and_name_mapping() {
+        for (old, new) in [("7000-8000", "7000-7110"), ("b000-c000", "b000-b110")] {
+            let mut f = BracketFixture::new(8, true);
+            f.maps_b = f.maps_b.replace(old, new);
+            f.assert_refused(
+                &mut CaptureWorkBudget::default(),
+                "mapping changed during acquisition",
+            );
+            let reads = f
+                .log
+                .borrow()
+                .iter()
+                .filter(|event| event.starts_with("memory b100"))
+                .count();
+            assert_eq!(reads, 1, "validation must not dereference names again");
+        }
+    }
+
+    #[test]
+    fn p2_bracket_blank_maps_b_is_unavailable() {
+        let mut f = BracketFixture::new(8, true);
+        f.maps_b = "\n".into();
+        f.assert_refused(
+            &mut CaptureWorkBudget::default(),
+            "final mapping validation unavailable",
+        );
+    }
+
+    #[test]
+    fn p2_bracket_unavailable_b() {
+        for case in [
+            "open",
+            "read",
+            "malformed",
+            "overlap",
+            "truncated",
+            "empty",
+            "bytes",
+            "entries",
+        ] {
+            let mut f = BracketFixture::new(8, true);
+            match case {
+                "open" => f.fail_open_b = true,
+                "read" => f.fail_read_b = true,
+                "malformed" => f.maps_b.push_str("malformed\n"),
+                "overlap" => f.maps_b.push_str("b000-d000 r--p 0 0:0 0\n"),
+                "truncated" => {
+                    f.maps_b.pop();
+                }
+                "empty" => f.maps_b.clear(),
+                "bytes" => f.maps_b.push_str(&format!(
+                    "d000-e000 r--p 0 0:0 0 /{}\n",
+                    "x".repeat(MAX_MAPS_BYTES as usize)
+                )),
+                "entries" => f
+                    .maps_b
+                    .push_str(&"d000-e000 r--p 0 0:0 0\n".repeat(MAX_MAP_ENTRIES + 1)),
+                _ => unreachable!(),
+            }
+            let detail = match case {
+                "open" => "injected maps B open failure",
+                "read" => "injected maps B read failure",
+                "malformed" => "invalid /proc maps line",
+                "overlap" => "reversed or overlapping",
+                "truncated" | "empty" => "empty or truncated",
+                "bytes" => MAPS_CEILING_REASON,
+                "entries" => MAPS_ENTRY_CEILING_REASON,
+                _ => unreachable!(),
+            };
+            f.assert_refused(
+                &mut CaptureWorkBudget::default(),
+                &format!("{FINAL_MAPS_UNAVAILABLE_REASON}: {detail}"),
+            );
+            eprintln!("unavailable B case {case}: refused with {detail}");
+        }
+    }
+
+    #[test]
+    fn p2_bracket_incomplete_a_never_scans() {
+        let mut control = BracketFixture::new(8, true);
+        assert_eq!(
+            control
+                .run(&mut CaptureWorkBudget::default())
+                .unwrap()
+                .modules()
+                .len(),
+            1
+        );
+
+        let mut f = BracketFixture::new(8, true);
+        let mut budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: f.maps_a.len() as u64 - 1,
+        });
+        f.assert_refused(
+            &mut budget,
+            "memory scan refused: initial mapping validation unavailable",
+        );
+        assert!(
+            !f.log
+                .borrow()
+                .iter()
+                .any(|event| event.starts_with("memory "))
+        );
+
+        let mut invalid = BracketFixture::new(8, true);
+        invalid
+            .maps_a
+            .push_str("b000-d000 r--p 0 0:0 0 [overlap]\n");
+        invalid.assert_refused(
+            &mut CaptureWorkBudget::default(),
+            "memory scan refused: initial mapping validation unavailable: reversed or overlapping",
+        );
+        assert!(
+            !invalid
+                .log
+                .borrow()
+                .iter()
+                .any(|event| event.starts_with("memory "))
+        );
+    }
+
+    #[test]
+    fn p2_bracket_generation_loss_keeps_refusal() {
+        let mut f = BracketFixture::new(8, true);
+        f.fail_generation = true;
+        f.assert_refused(
+            &mut CaptureWorkBudget::default(),
+            "memory scan refused: process generation changed during acquisition",
+        );
+    }
+
+    #[test]
+    fn p2_bracket_b_consumes_capture_io_allowance() {
+        let mut control = BracketFixture::new(8, true);
+        let mut measured = CaptureWorkBudget::default();
+        assert_eq!(
+            control.run(&mut measured).unwrap().modules()[0]
+                .tables
+                .len(),
+            1
+        );
+        let mut f = BracketFixture::new(8, true);
+        let mut budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: u64::MAX,
+            // Unfixed A-only cost plus less than one B snapshot.
+            total_bytes: control
+                .before_b
+                .map_or(measured.attempted_io_bytes(), |b| b.0)
+                + f.maps_b.len() as u64 / 2,
+        });
+        f.assert_refused(&mut budget, "final mapping validation unavailable");
+    }
+
+    #[test]
+    fn p2_bracket_b_consumes_work_allowance() {
+        let mut control = BracketFixture::new(8, true);
+        let mut measured = CaptureWorkBudget::default();
+        assert_eq!(
+            control.run(&mut measured).unwrap().modules()[0]
+                .tables
+                .len(),
+            1
+        );
+        let mut f = BracketFixture::new(8, true);
+        let mut budget = CaptureWorkBudget {
+            work_ceiling: control.before_b.map_or(measured.work_units, |b| b.1) + 1,
+            ..CaptureWorkBudget::default()
+        };
+        f.assert_refused(&mut budget, "final mapping validation unavailable");
+    }
+
+    #[test]
+    fn p2_bracket_independent_module_survives_refused_neighbor() {
+        let mut f = BracketFixture::new(8, true);
+        let neighbor = BracketFixture::new(8, true);
+        let extra = neighbor
+            .maps_a
+            .lines()
+            .filter(|line| !line.contains("/dependency.so"))
+            .map(|line| {
+                line.replace("1000-2000", "11000-12000")
+                    .replace("4000-6000", "14000-16000")
+                    .replace("7000-8000", "17000-18000")
+                    .replace("b000-c000", "1b000-1c000")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        f.maps_a.push_str(&extra);
+        f.maps_b = f.maps_a.replacen("4000-6000 rw-p", "4000-4810 rw-p", 1);
+        f.mem.set_len(0x1c000).unwrap();
+        let mut table = [0; 69 * 8];
+        neighbor.mem.read_exact_at(&mut table, 0x4800).unwrap();
+        f.mem.write_all_at(&table, 0x14800).unwrap();
+        let view = ProcessView::open(ProcessViewId(71), std::process::id()).unwrap();
+        let hints = [f.path.clone(), neighbor.path.clone()];
+        let outcome = scan_process_view_with_io(
+            &ScanRequest {
+                pid: view.pid(),
+                hints: &hints,
+                hooks: &HookRegistry::builtin(),
+            },
+            &view,
+            &mut CaptureWorkBudget::default(),
+            &mut f,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.modules().len(),
+            1,
+            "only the independent module should survive"
+        );
+        assert_eq!(
+            outcome.modules()[0].path,
+            neighbor.path.display().to_string()
+        );
+        assert_eq!(outcome.modules()[0].tables.len(), 1);
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.subject == f.path.display().to_string()
+                    && skip.reason == MAPPING_CHANGED_REASON)
+        );
+    }
+
+    #[test]
+    fn p2_bracket_b_checks_deadline() {
+        let mut f = BracketFixture::new(8, true);
+        f.expire_at_b = true;
+        let mut budget = CaptureWorkBudget::default();
+        budget.set_deadline(Some(u64::MAX));
+        f.assert_refused(&mut budget, "final mapping validation unavailable");
+    }
+
+    #[test]
+    fn p2_bracket_stable_and_unrelated_vma_positive_controls() {
+        for width in [8, 4] {
+            for unrelated in [false, true] {
+                let mut f = BracketFixture::new(width, true);
+                if unrelated {
+                    f.maps_a.push_str("d000-e000 rw-p 0 0:0 0 [unrelated]\n");
+                    f.maps_b.push_str("d000-f000 rw-p 0 0:0 0 [unrelated]\n");
+                }
+                let mut budget = CaptureWorkBudget::default();
+                let outcome = f.run(&mut budget).unwrap();
+                assert_eq!(outcome.modules().len(), 1, "{outcome:?}");
+                assert_eq!(outcome.modules()[0].tables.len(), 1, "{outcome:?}");
+                assert_eq!(outcome.modules()[0].tables[0].entries.len(), 67);
+                assert_eq!(outcome.modules()[0].tables[0].null_entries.len(), 1);
+                assert_eq!(outcome.modules()[0].interfaces.len(), 1);
+                assert_eq!(
+                    outcome.modules()[0].interfaces[0].name_lossy.as_deref(),
+                    Some("PKCS 11")
+                );
+                assert!(outcome.skipped().is_empty(), "{outcome:?}");
+                let log = f.log.borrow();
+                assert_eq!(log.first().unwrap(), "maps 1");
+                assert_eq!(
+                    &log[log.len() - 3..],
+                    ["maps 2", "final generation", "publication"]
+                );
+                assert!(
+                    log[1..log.len() - 3]
+                        .iter()
+                        .all(|event| event.starts_with("memory "))
+                );
+                assert!(
+                    budget.attempted_io_bytes()
+                        >= (f.maps_a.len() + f.maps_b.len()) as u64 + 0x3000 + 32 + 64
+                );
+            }
+        }
+    }
 
     #[test]
     fn source_pins_one_index_per_live_snapshot() {
@@ -1663,11 +2746,56 @@ mod tests {
             (0x0203, Some(((3, 2), 8 + 104 * 8))),
         ] {
             let (version, spans, _) = spans_for(word).expect("walkable");
-            assert_eq!(Some((version, span_bytes(spans).unwrap())), expected);
+            assert_eq!(
+                Some((version, span_bytes(LinuxLayout::Lp64, spans).unwrap())),
+                expected
+            );
         }
         // Padding bytes set, implausible minor, unknown major, all-zero word.
         for word in [0x1_2802u64, 0x2902, 0x0304, 0x0004, 0] {
             assert!(spans_for(word).is_none(), "{word:#x} must not be a table");
+        }
+    }
+
+    #[test]
+    fn ilp32_tables_use_four_byte_words_and_ignore_adjacent_poison() {
+        let maps = parse_maps(b"1000-3000 r-xp 00000000 08:01 7 /lib/provider.so\n").unwrap();
+        let map_index = MapIndex::new(&maps).unwrap();
+        for (version, fields) in [(0x0002u32, 67), (0x2802, 68), (0x0003, 92), (0x0203, 104)] {
+            let mut snapshot = vec![0xa5; 4 + fields * 4 + 3];
+            snapshot[..4].copy_from_slice(&version.to_le_bytes());
+            for ordinal in 0..fields {
+                let offset = 4 + ordinal * 4;
+                snapshot[offset..offset + 4].copy_from_slice(&0x1500u32.to_le_bytes());
+            }
+            assert_eq!(
+                exact_table_bytes(&snapshot[..4], LinuxLayout::Ilp32),
+                Some(4 + fields * 4)
+            );
+            let (tables, skipped) = detect_tables_for_layout(
+                LinuxLayout::Ilp32,
+                &snapshot,
+                0x7000,
+                &map_index,
+                &mut CaptureWorkBudget::default(),
+            );
+            assert!(skipped.is_empty(), "{version:#x}: {skipped:?}");
+            assert_eq!(tables.len(), 1, "{version:#x}");
+            assert_eq!(tables[0].entries.len(), fields, "{version:#x}");
+
+            snapshot.truncate(4 + fields * 4 - 1);
+            assert!(
+                detect_tables_for_layout(
+                    LinuxLayout::Ilp32,
+                    &snapshot,
+                    0x7000,
+                    &map_index,
+                    &mut CaptureWorkBudget::default(),
+                )
+                .0
+                .is_empty(),
+                "a truncated final target word is never decoded"
+            );
         }
     }
 
@@ -1972,7 +3100,13 @@ mod tests {
         assert_ne!(captured.inode, replacement_identity.inode);
         let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
         assert!(
-            opened_file_identity_guard(&view, &replacement_file, captured).is_err(),
+            opened_file_identity_guard(
+                &view,
+                &replacement_file,
+                captured,
+                &mut CaptureWorkBudget::default(),
+            )
+            .is_err(),
             "a same-size replacement inode must be refused before hint matching"
         );
 
@@ -1983,7 +3117,8 @@ mod tests {
         let guard = scan_lines
             .iter()
             .position(|line| {
-                *line == "if let Err(reason) = opened_file_identity_guard(view, &file, key) {"
+                *line
+                    == "if let Err(reason) = opened_file_identity_guard(view, &file, key, budget) {"
             })
             .expect("the shared identity guard must run in the scan");
         assert_eq!(
@@ -2011,7 +3146,10 @@ mod tests {
         let guard_body = &include_str!("scan.rs")[include_str!("scan.rs")
             .find("fn opened_file_identity_guard(")
             .expect("identity guard")..];
-        assert!(guard_body.contains("crate::discovery::identity::retained_object_key(view, file)"));
+        assert!(
+            guard_body
+                .contains("crate::discovery::identity::retained_object_key(view, file, budget)")
+        );
         for decision in [
             "if !request.hints.is_empty() && !hinted {\n            continue;\n        }",
             "if hinted && !attributable {",
@@ -2122,7 +3260,10 @@ mod tests {
         snapshot[16..24].copy_from_slice(&0u64.to_ne_bytes());
         snapshot[24..32].copy_from_slice(&0x3330u64.to_ne_bytes());
 
-        assert_eq!(exact_table_addresses(&snapshot).unwrap(), [0x1110, 0x3330]);
+        assert_eq!(
+            exact_table_addresses(&snapshot, LinuxLayout::Lp64).unwrap(),
+            [0x1110, 0x3330]
+        );
     }
 
     #[test]
@@ -2185,11 +3326,17 @@ mod tests {
         let mut budget = CaptureWorkBudget::default();
         budget.set_deadline(Some(10));
         let mut polls = 0;
-        let (tables, skipped) =
-            detect_tables_with_clock(&snapshot, 0x7000, &map_index, &mut budget, || {
+        let (tables, skipped) = detect_tables_with_clock(
+            LinuxLayout::Lp64,
+            &snapshot,
+            0x7000,
+            &map_index,
+            &mut budget,
+            || {
                 polls += 1;
                 Some(if polls == 1 { 0 } else { 10 })
-            });
+            },
+        );
         assert_eq!(polls, 2, "initial and next local 4096-window boundary");
         assert!(
             tables
@@ -2243,6 +3390,76 @@ mod tests {
         assert_eq!(bytes, b"aa\n");
         assert!(reasons.contains(&MAPS_CEILING_REASON));
         assert!(reasons.contains(&MAPS_ENTRY_CEILING_REASON));
+    }
+
+    #[test]
+    fn budgeted_elf_reader_never_overspends_or_reads_after_deadline() {
+        let short = tempfile::tempfile().unwrap();
+        short.set_len(8).unwrap();
+        let mut budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: 8,
+            total_bytes: 7,
+        });
+        let mut requests = Vec::new();
+        let error = read_elf_snapshot_with(
+            &short,
+            &mut budget,
+            |_| None,
+            |file, bytes, offset| {
+                requests.push(bytes.len());
+                file.read_at(bytes, offset)
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains(IO_CEILING_REASON), "{error}");
+        assert_eq!(
+            requests,
+            [7],
+            "the underlying reader sees only admitted bytes"
+        );
+        assert_eq!(budget.attempted_io_bytes(), 7);
+
+        let mut budget = CaptureWorkBudget::default();
+        let mut reads = 0;
+        let error = read_elf_snapshot_with(
+            &short,
+            &mut budget,
+            |_| Some(SCAN_DEADLINE_REASON),
+            |file, bytes, offset| {
+                reads += 1;
+                file.read_at(bytes, offset)
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains(SCAN_DEADLINE_REASON), "{error}");
+        assert_eq!(
+            reads, 0,
+            "an expired deadline refuses before the first read"
+        );
+        assert_eq!(budget.attempted_io_bytes(), 0);
+
+        let long = tempfile::tempfile().unwrap();
+        long.set_len((READ_CHUNK + 1) as u64).unwrap();
+        let mut budget = CaptureWorkBudget::default();
+        let mut polls = 0;
+        let mut reads = 0;
+        let error = read_elf_snapshot_with(
+            &long,
+            &mut budget,
+            |_| {
+                polls += 1;
+                (polls == 2).then_some(SCAN_DEADLINE_REASON)
+            },
+            |file, bytes, offset| {
+                reads += 1;
+                file.read_at(bytes, offset)
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains(SCAN_DEADLINE_REASON), "{error}");
+        assert_eq!(polls, 2);
+        assert_eq!(reads, 1, "expiry between chunks prevents the next read");
+        assert_eq!(budget.attempted_io_bytes(), READ_CHUNK as u64);
     }
 
     #[test]
@@ -2349,5 +3566,191 @@ mod tests {
             u64::try_from(line.len()).unwrap(),
             "a complete snapshot is charged to the capture's I/O total"
         );
+    }
+
+    #[derive(Debug)]
+    enum ReaderStep {
+        Bytes(Vec<u8>),
+        Error(std::io::ErrorKind),
+        Eof,
+    }
+
+    #[derive(Debug)]
+    struct RecordingReader {
+        steps: std::collections::VecDeque<ReaderStep>,
+        requests: Vec<usize>,
+    }
+
+    impl RecordingReader {
+        fn new(steps: impl IntoIterator<Item = ReaderStep>) -> Self {
+            Self {
+                steps: steps.into_iter().collect(),
+                requests: Vec::new(),
+            }
+        }
+    }
+
+    impl Read for &mut RecordingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.requests.push(buffer.len());
+            match self.steps.pop_front().unwrap_or(ReaderStep::Eof) {
+                ReaderStep::Bytes(bytes) => {
+                    assert!(bytes.len() <= buffer.len());
+                    buffer[..bytes.len()].copy_from_slice(&bytes);
+                    Ok(bytes.len())
+                }
+                ReaderStep::Error(kind) => Err(std::io::Error::from(kind)),
+                ReaderStep::Eof => Ok(0),
+            }
+        }
+    }
+
+    #[test]
+    fn mountinfo_reader_proves_eof_at_the_exact_byte_cap_and_refuses_excess() {
+        let mut exact =
+            RecordingReader::new([ReaderStep::Bytes(b"abc\n".to_vec()), ReaderStep::Eof]);
+        let mut budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: 4,
+            total_bytes: 5,
+        });
+        assert_eq!(
+            read_mountinfo_with(&mut exact, &mut budget, 8, |_| None).unwrap(),
+            "abc\n"
+        );
+        assert_eq!(exact.requests, [5, 1], "the final request is EOF lookahead");
+        assert_eq!(budget.attempted_io_bytes(), 4);
+
+        let mut excess = RecordingReader::new([ReaderStep::Bytes(b"abc\nx".to_vec())]);
+        let mut budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: 4,
+            total_bytes: 5,
+        });
+        assert_eq!(
+            read_mountinfo_with(&mut excess, &mut budget, 8, |_| None).unwrap_err(),
+            MOUNTINFO_CEILING_REASON
+        );
+        assert_eq!(excess.requests, [5]);
+        assert_eq!(budget.attempted_io_bytes(), 5, "the excess byte is charged");
+    }
+
+    #[test]
+    fn mountinfo_reader_charges_lines_and_reused_aggregate_budget() {
+        let exact_lines = vec![b'\n'; MAX_MOUNTINFO_ENTRIES];
+        let mut exact = RecordingReader::new([ReaderStep::Bytes(exact_lines), ReaderStep::Eof]);
+        let mut budget = CaptureWorkBudget::default();
+        assert!(read_mountinfo_with(&mut exact, &mut budget, 2 * 1024 * 1024, |_| None).is_ok());
+        let first_bytes = budget.attempted_io_bytes();
+        assert_eq!(exact.requests.len(), 2);
+
+        let mut excess =
+            RecordingReader::new([ReaderStep::Bytes(vec![b'\n'; MAX_MOUNTINFO_ENTRIES + 1])]);
+        assert_eq!(
+            read_mountinfo_with(&mut excess, &mut budget, 2 * 1024 * 1024, |_| None).unwrap_err(),
+            MOUNTINFO_ENTRY_CEILING_REASON
+        );
+        assert_eq!(
+            budget.attempted_io_bytes(),
+            first_bytes + u64::try_from(MAX_MOUNTINFO_ENTRIES + 1).unwrap()
+        );
+    }
+
+    #[test]
+    fn mountinfo_reader_retries_interrupted_reads_but_refuses_other_partial_errors() {
+        let mut interrupted = RecordingReader::new([
+            ReaderStep::Bytes(b"17 ".to_vec()),
+            ReaderStep::Error(std::io::ErrorKind::Interrupted),
+            ReaderStep::Bytes(b"1\n".to_vec()),
+            ReaderStep::Eof,
+        ]);
+        let mut budget = CaptureWorkBudget::default();
+        assert_eq!(
+            read_mountinfo_with(&mut interrupted, &mut budget, 3, |_| None).unwrap(),
+            "17 1\n"
+        );
+        assert_eq!(interrupted.requests.len(), 4, "EINTR and EOF are attempts");
+        assert_eq!(budget.attempted_io_bytes(), 5);
+        assert_eq!(budget.work_units, 5, "four attempts plus one observed line");
+
+        let mut failed = RecordingReader::new([
+            ReaderStep::Bytes(b"17 1 8:1 /".to_vec()),
+            ReaderStep::Error(std::io::ErrorKind::Other),
+        ]);
+        let mut budget = CaptureWorkBudget::default();
+        assert!(read_mountinfo_with(&mut failed, &mut budget, 32, |_| None).is_err());
+        assert_eq!(failed.requests.len(), 2);
+        assert_eq!(budget.attempted_io_bytes(), 10);
+    }
+
+    #[test]
+    fn mountinfo_reader_never_reads_after_exhaustion_and_rechecks_deadline_before_publish() {
+        for mut budget in [
+            CaptureWorkBudget::new(ScanLimits {
+                per_object_bytes: 0,
+                total_bytes: 8,
+            }),
+            CaptureWorkBudget::new(ScanLimits {
+                per_object_bytes: 8,
+                total_bytes: 0,
+            }),
+        ] {
+            let mut reader = RecordingReader::new([ReaderStep::Bytes(b"x".to_vec())]);
+            assert!(read_mountinfo_with(&mut reader, &mut budget, 8, |_| None).is_err());
+            assert!(reader.requests.is_empty());
+        }
+
+        let mut aggregate_exact =
+            RecordingReader::new([ReaderStep::Bytes(b"abc\n".to_vec()), ReaderStep::Eof]);
+        let mut budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: 4,
+            total_bytes: 4,
+        });
+        assert_eq!(
+            read_mountinfo_with(&mut aggregate_exact, &mut budget, 8, |_| None).unwrap_err(),
+            IO_CEILING_REASON
+        );
+        assert_eq!(
+            aggregate_exact.requests,
+            [4],
+            "aggregate exhaustion refuses without an EOF probe"
+        );
+        assert_eq!(budget.attempted_io_bytes(), 4);
+
+        let mut budget = CaptureWorkBudget::default();
+        assert!(!budget.charge(u64::MAX));
+        let mut stopped = RecordingReader::new([ReaderStep::Bytes(b"x".to_vec())]);
+        assert_eq!(
+            read_mountinfo_with(&mut stopped, &mut budget, 8, |_| None).unwrap_err(),
+            WORK_CEILING_REASON
+        );
+        assert!(stopped.requests.is_empty());
+
+        let mut deadline =
+            RecordingReader::new([ReaderStep::Bytes(b"17 1\n".to_vec()), ReaderStep::Eof]);
+        let mut budget = CaptureWorkBudget::default();
+        let mut polls = 0;
+        let error = read_mountinfo_with(&mut deadline, &mut budget, 8, |_| {
+            polls += 1;
+            (polls == 3).then_some(SCAN_DEADLINE_REASON)
+        })
+        .unwrap_err();
+        assert_eq!(error, SCAN_DEADLINE_REASON);
+        assert_eq!(deadline.requests.len(), 2);
+        assert_eq!(polls, 3, "before each read and after EOF publication");
+
+        let mut between = RecordingReader::new([
+            ReaderStep::Bytes(b"17 ".to_vec()),
+            ReaderStep::Bytes(b"1\n".to_vec()),
+        ]);
+        let mut budget = CaptureWorkBudget::default();
+        let mut polls = 0;
+        assert_eq!(
+            read_mountinfo_with(&mut between, &mut budget, 3, |_| {
+                polls += 1;
+                (polls == 2).then_some(SCAN_DEADLINE_REASON)
+            })
+            .unwrap_err(),
+            SCAN_DEADLINE_REASON
+        );
+        assert_eq!(between.requests.len(), 1, "expiry prevents the next chunk");
     }
 }

@@ -2,8 +2,44 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::process::Command;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::sync::Mutex;
+
+#[test]
+fn owner_retry_boundaries_are_the_only_owner_exports_requested_by_the_build() {
+    let source = std::fs::read_to_string("build.rs").expect("read build script");
+    for helper in ["p11_owner_reserve", "p11_owner_refund"] {
+        let export = format!("link-arg=--export={helper}");
+        assert_eq!(
+            source.matches(&export).count(),
+            1,
+            "missing exact {helper} export"
+        );
+    }
+    assert_eq!(
+        source.matches("link-arg=--export=p11_owner_").count(),
+        2,
+        "no pointer-taking owner transaction may be exported"
+    );
+}
+
+#[test]
+fn ia32_argument_reader_is_the_exact_scalar_reader_export_requested_by_the_build() {
+    let source = std::fs::read_to_string("build.rs").expect("read build script");
+    assert_eq!(
+        source
+            .matches("link-arg=--export=p11_read_ia32_arg")
+            .count(),
+        1,
+        "the ia32 scalar reader must be retained as one exported BPF global"
+    );
+    assert_eq!(
+        source.matches("link-arg=--export=p11_read_").count(),
+        1,
+        "no other pointer or reader boundary may cross the global ABI"
+    );
+}
+
+static NATIVE_SUITE_GATE: Mutex<()> = Mutex::new(());
 
 fn read(path: &str) -> String {
     fs::read_to_string(path).unwrap_or_else(|error| panic!("reading {path}: {error}"))
@@ -49,6 +85,302 @@ fn require_before(source: &str, first: &str, second: &str, contract: &str) -> Re
     } else {
         Err(format!("{contract} is out of order"))
     }
+}
+
+fn assert_abi_routing_identity_contract(attach: &str, example: &str) -> Result<(), String> {
+    let wrapper = contract_section(
+        attach,
+        "#[doc(hidden)]\npub fn prepare_qualification_identity(",
+        "\n}\n\nfn validate_policy_map",
+    )?;
+    let direct = "ebpf: &mut Ebpf, pid: NonZeroU32) -> Result<()> {\n    prepare_identity(ebpf, &Scope::Pid(pid.get()), None)";
+    if wrapper != direct {
+        return Err(
+            "qualification identity wrapper must directly return unowned PID-scoped preparation"
+                .into(),
+        );
+    }
+
+    let row = contract_section(
+        example,
+        "fn run_row_body(",
+        "\nfn validate_and_write_observed(",
+    )?;
+    if row.matches("NonZeroU32::new(").count() != 1 {
+        return Err("the retained child PID must be converted exactly once".into());
+    }
+    for marker in [
+        "let child_pid = NonZeroU32::new(child_pid)",
+        "p11scope::attach::prepare_qualification_identity(&mut ebpf, child_pid)\n        .context(\"preparing qualification identity maps\")?;",
+        "let scope = UProbeScope::OneProcess(child_pid);",
+    ] {
+        require_contract_marker(
+            row,
+            marker,
+            "ABI-routing qualification identity preparation",
+        )?;
+    }
+    for later in [
+        "load_program(&mut ebpf, \"p11_return\")",
+        "let return_link = attach_program(",
+        "let entry_link = attach_program(",
+    ] {
+        require_before(
+            row,
+            "p11scope::attach::prepare_qualification_identity(&mut ebpf, child_pid)",
+            later,
+            "identity preparation before ABI-routing program load/attach",
+        )?;
+    }
+    Ok(())
+}
+
+fn assert_start_owner_seam(ebpf: &str, owner: &str) -> Result<(), String> {
+    let wrappers = contract_section(ebpf, "unsafe extern \"C\" {", "fn store_start(")?;
+    for marker in [
+        "p11_owner_start_get(key, 0)",
+        "p11_owner_start_get(key, 1)",
+        "p11_owner_start_remove(key, u32::from(required))",
+    ] {
+        require_contract_marker(wrappers, marker, "native START owner wrapper")?;
+    }
+    let get = contract_section(
+        owner,
+        "p11_owner_start_get(const struct owner_start_key *key, u32 required)",
+        "static __always_inline long remove_start",
+    )?;
+    require_contract_marker(get, "start_key_valid(owner, key)", "START get ownership")?;
+    let retire = contract_section(
+        owner,
+        "static __always_inline long remove_start",
+        "p11_owner_start_remove(const struct owner_start_key *key, u32 required)",
+    )?;
+    require_before(
+        retire,
+        "owner_map_delete(&START, key)",
+        "owner->start_count--;",
+        "START deletion before ownership refund",
+    )?;
+    let remove = contract_section(
+        owner,
+        "p11_owner_start_remove(const struct owner_start_key *key, u32 required)",
+        "p11_owner_start_insert(const struct owner_start_key *key",
+    )?;
+    for marker in [
+        "key->slot >= 512 || key->pad",
+        "start_key_valid(owner, key)",
+        "long rc = remove_start(ctl, owner, key);",
+    ] {
+        require_contract_marker(remove, marker, "native START remove")?;
+    }
+    require_before(
+        remove,
+        "long rc = remove_start(ctl, owner, key);",
+        "release_empty(ctl, owner)",
+        "START retirement before owner release",
+    )?;
+    Ok(())
+}
+
+fn assert_discovery_owner_seam(ebpf: &str, owner: &str) -> Result<(), String> {
+    let wrappers = contract_section(ebpf, "unsafe extern \"C\" {", "fn store_start(")?;
+    for marker in [
+        "p11_owner_discovery_get(key, u32::from(required))",
+        "p11_owner_discovery_insert(key, state, flags)",
+        "p11_owner_discovery_remove(key, u32::from(required))",
+    ] {
+        require_contract_marker(wrappers, marker, "native DISCOVERY_STATE owner wrapper")?;
+    }
+    let get = contract_section(
+        owner,
+        "p11_owner_discovery_get(const struct owner_discovery_key *key, u32 required)",
+        "static __always_inline long remove_discovery",
+    )?;
+    for marker in [
+        "(key->domain != 1 && key->domain != 2)",
+        "discovery_key_valid(owner, key)",
+        "directory_find(owner, key) < 0",
+    ] {
+        require_contract_marker(get, marker, "native DISCOVERY_STATE get")?;
+    }
+    let retire = contract_section(
+        owner,
+        "static __always_inline long remove_discovery",
+        "p11_owner_discovery_remove(const struct owner_discovery_key *key, u32 required)",
+    )?;
+    require_before(
+        retire,
+        "owner_map_delete(&DISCOVERY_STATE, key)",
+        "directory_clear(owner, index)",
+        "discovery deletion before directory retirement",
+    )?;
+    let remove = contract_section(
+        owner,
+        "p11_owner_discovery_remove(const struct owner_discovery_key *key, u32 required)",
+        "p11_owner_discovery_insert(const struct owner_discovery_key *key",
+    )?;
+    for marker in [
+        "(key->domain != 1 && key->domain != 2)",
+        "discovery_key_valid(owner, key)",
+        "long rc = remove_discovery(ctl, owner, key, (u32)index);",
+    ] {
+        require_contract_marker(remove, marker, "native DISCOVERY_STATE remove")?;
+    }
+    require_before(
+        remove,
+        "long rc = remove_discovery(ctl, owner, key, (u32)index);",
+        "release_empty(ctl, owner)",
+        "discovery retirement before owner release",
+    )?;
+    let insert = contract_section(
+        owner,
+        "p11_owner_discovery_insert(const struct owner_discovery_key *key",
+        "/* Called ONLY by the mandatory current-task raw exec/exit hooks.",
+    )?;
+    for marker in [
+        "discovery_key_valid(owner, key)",
+        "(flags != 1 && flags != 2)",
+        "remove_discovery(ctl, owner, key, (u32)index);",
+    ] {
+        require_contract_marker(insert, marker, "native DISCOVERY_STATE insert")?;
+    }
+    let collision = contract_section(
+        insert,
+        "/* An unindexed numeric collision cannot authorize its deletion. */",
+        "release_empty(ctl, owner)",
+    )?;
+    require_before(
+        collision,
+        "if (owner_map_lookup(&DISCOVERY_STATE, key))",
+        "poison(ctl, OWNER_BOOKKEEPING_FAILED);",
+        "unindexed discovery collision poisoning",
+    )?;
+    Ok(())
+}
+
+fn assert_python3_isolated(path: &str, source: &str) -> Result<(), String> {
+    for (line_number, line) in source.lines().enumerate() {
+        let code = line.split_once('#').map_or(line, |(code, _)| code);
+        let trimmed = code.trim();
+        if matches!(
+            trimmed,
+            "command -v python3"
+                | "command -v python3 >/dev/null || { echo \"python3 required\"; exit 1; }"
+                | "LANE14_PYTHON=$(command -v python3) || exit 77"
+        ) {
+            continue;
+        }
+        let mut offset = 0;
+        while let Some(relative) = code[offset..].find("python3") {
+            let start = offset + relative;
+            let end = start + "python3".len();
+            let bytes = code.as_bytes();
+            let token_before =
+                start == 0 || !bytes[start - 1].is_ascii_alphanumeric() && bytes[start - 1] != b'_';
+            let token_after =
+                end == bytes.len() || !bytes[end].is_ascii_alphanumeric() && bytes[end] != b'_';
+            if token_before && token_after {
+                let after = code[end..].trim_start();
+                let rest = after.strip_prefix("-I").ok_or_else(|| {
+                    format!("unisolated executable python3 in {path}:{line_number}: {line:?}")
+                })?;
+                if !rest.is_empty()
+                    && (rest.as_bytes()[0].is_ascii_alphanumeric() || rest.as_bytes()[0] == b'_')
+                {
+                    return Err(format!(
+                        "python3 option is not the isolated -I token in {path}:{line_number}: {line:?}"
+                    ));
+                }
+            }
+            offset = end;
+        }
+    }
+    Ok(())
+}
+
+fn assert_lane14_selected_python_isolated(source: &str) -> Result<(), String> {
+    for operation in ["capture", "recheck"] {
+        require_contract_marker(
+            source,
+            &format!(
+                r#""$LANE14_PYTHON" -I scripts/prepared-dependency-evidence.py {operation} \"#
+            ),
+            "selected Lane 14 isolated Python invocation",
+        )?;
+    }
+    Ok(())
+}
+
+fn assert_hosted_dependency_preparation(ci: &str) -> Result<(), String> {
+    let checks = checks_job(ci);
+    let prepare = "run: python3 -I scripts/prepare-dependencies.py";
+    let root_fetch = "run: cargo +1.88 fetch --locked --manifest-path Cargo.toml";
+    let selection =
+        "p11scope_prepared_tools_select \"$(command -v python3)\" \"$(command -v rustup)\"";
+    let root_metadata = "\"$P11SCOPE_PREPARED_STABLE_CARGO\" metadata --locked --offline --all-features --format-version 1 --manifest-path Cargo.toml";
+    let bpf_metadata = "\"$P11SCOPE_PREPARED_BPF_CARGO\" metadata --locked --offline --all-features --format-version 1 --manifest-path crates/ebpf/Cargo.toml";
+    let checker = "\"$P11SCOPE_PREPARED_PYTHON\" -I scripts/check-prepared-dependencies.py";
+    for (marker, contract) in [
+        (prepare, "dependency reconstruction"),
+        (
+            ". scripts/prepared-dependency-tools.sh",
+            "fixed prepared-tool selection helper",
+        ),
+        (selection, "fixed prepared-tool selection"),
+        (root_metadata, "root offline all-feature metadata"),
+        (bpf_metadata, "BPF offline all-feature metadata"),
+        (checker, "checked prepared-dependency invocation"),
+        (
+            "--metadata \"Cargo.toml=$RUNNER_TEMP/root-metadata.json\"",
+            "root metadata checker input",
+        ),
+        (
+            "--metadata \"crates/ebpf/Cargo.toml=$RUNNER_TEMP/bpf-metadata.json\" --ledger",
+            "BPF metadata checker input and ledger",
+        ),
+    ] {
+        require_contract_marker(checks, marker, contract)?;
+    }
+    require_before(
+        checks,
+        prepare,
+        root_fetch,
+        "dependency reconstruction before project Cargo",
+    )?;
+    for pair in [
+        (selection, root_metadata),
+        (root_metadata, bpf_metadata),
+        (bpf_metadata, checker),
+    ] {
+        require_before(
+            checks,
+            pair.0,
+            pair.1,
+            "prepared dependency verification order",
+        )?;
+    }
+    Ok(())
+}
+
+fn assert_hosted_offline_gates(checks: &str) -> Result<(), String> {
+    for gate in [
+        "fmt --all -- --check",
+        "check --locked --offline --workspace --all-targets",
+        "test --locked --offline --workspace --all-targets",
+        "clippy --locked --offline --workspace --all-targets -- -D warnings",
+    ] {
+        if !checks
+            .lines()
+            .map(str::trim)
+            .filter_map(command_of)
+            .any(|call| call == format!("cargo +1.88 {gate}"))
+        {
+            return Err(format!(
+                "the scope line claims the {gate} gate, which no step runs"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn assert_exact_policy_map_metadata_contract(attach: &str) -> Result<(), String> {
@@ -218,30 +550,36 @@ fn assert_live_discovery_host_contract(
         "Self::start_inner(",
         "owned capability validation before load",
     )?;
-    require_before(
+    let preparation = contract_section(
         attach,
-        "crate::scope::publish(&mut ebpf, scope, policy, generation_token)",
-        "freeze_published_maps(&ebpf)",
-        "scope publication before base freeze",
+        "fn prepare_session_with(",
+        "fn publish_tail_calls_with",
     )?;
-    require_before(
-        attach,
-        "freeze_published_maps(&ebpf)",
-        "for prog_name in programs",
-        "base freeze before program load",
-    )?;
-    require_before(
-        attach,
-        "for prog_name in programs",
-        "if !defers_freeze_until_loaded(name, &meta) || name == TAIL_POLICY_MAP",
-        "all program loads before the deferred freezes",
-    )?;
-    require_before(
-        attach,
-        "publish_and_freeze_tail_calls(&mut ebpf, unsafe_enabled)",
-        ".attach(\"task\", \"task_newtask\")",
-        "tail publication before first producer attach",
-    )?;
+    let ordered_steps = [
+        "ValidatePolicy,",
+        "ValidateRuntime,",
+        "ValidatePrograms,",
+        "PublishScope,",
+        "PrepareIdentity,",
+        "PublishDescriptors,",
+        "PublishAsync,",
+        "PublishShapes,",
+        "PublishAttributes,",
+        "FreezePublished,",
+        "SelectScope,",
+        "operation(LoadProgram(name))?;",
+        "operation(FreezeDeferred(name))?;",
+        "operation(PublishTailCalls)?;",
+        "operation(PrepareEventsDomain)?;",
+    ];
+    for pair in ordered_steps.windows(2) {
+        require_before(
+            preparation,
+            pair[0],
+            pair[1],
+            "session preparation sequence",
+        )?;
+    }
 
     for (marker, contract) in [
         (
@@ -273,7 +611,7 @@ fn assert_live_discovery_host_contract(
         || run.contains("Session::start(")
         || engine.matches("Session::start(").count() != 1
         || engine
-            .matches("pause_generation.take(),\n                    ring_bytes,")
+            .matches("Session::start(\n                    plan,\n                    scope,\n                    pinned,\n                    policy,\n                    pause_generation.take(),\n                    ring_bytes,\n                    owned_child,\n                )")
             .count()
             != 1
         || engine
@@ -320,7 +658,7 @@ fn assert_live_discovery_host_contract(
             "object-feature inventory selection",
         ),
         (
-            "let programs = expected_programs(object_has_unsafe);",
+            "for name in expected_programs(object_has_unsafe)",
             "complete object program load",
         ),
         (
@@ -339,11 +677,91 @@ fn assert_live_discovery_host_contract(
         "fn attach_targets_with(",
         "fn standard_async_catalog",
     )?;
-    if scheduling.contains("interface_list_worker") {
+    if scheduling.contains("attach(\"interface_list_worker\",") {
         return Err("interface-list worker must be loaded but never attached".into());
     }
     let start_inner =
         contract_section(attach, "fn start_inner(", "pub(crate) fn counter_snapshot(")?;
+    for (step, next, operation) in [
+        (
+            "SessionPreparation::ValidatePolicy",
+            "SessionPreparation::ValidateRuntime",
+            "validate_policy_maps(&ebpf",
+        ),
+        (
+            "SessionPreparation::ValidateRuntime",
+            "SessionPreparation::ValidatePrograms",
+            "validate_runtime_maps(&ebpf)",
+        ),
+        (
+            "SessionPreparation::ValidatePrograms",
+            "SessionPreparation::PublishScope",
+            "validate_program_inventory(&ebpf",
+        ),
+        (
+            "SessionPreparation::PublishScope",
+            "SessionPreparation::PrepareIdentity",
+            "crate::scope::publish(&mut ebpf",
+        ),
+        (
+            "SessionPreparation::PrepareIdentity",
+            "SessionPreparation::PublishDescriptors",
+            "prepare_identity(&mut ebpf",
+        ),
+        (
+            "SessionPreparation::PublishDescriptors",
+            "SessionPreparation::PublishAsync",
+            "publish_descriptors(",
+        ),
+        (
+            "SessionPreparation::PublishAsync",
+            "SessionPreparation::PublishShapes",
+            "publish_async_catalog(&mut ebpf)",
+        ),
+        (
+            "SessionPreparation::PublishShapes",
+            "SessionPreparation::PublishAttributes",
+            "crate::shapes::publish(&mut ebpf",
+        ),
+        (
+            "SessionPreparation::PublishAttributes",
+            "SessionPreparation::FreezePublished",
+            "publish_attribute_catalog(&mut ebpf",
+        ),
+        (
+            "SessionPreparation::FreezePublished",
+            "SessionPreparation::SelectScope",
+            "freeze_published_maps(&ebpf)",
+        ),
+        (
+            "SessionPreparation::SelectScope",
+            "SessionPreparation::LoadProgram",
+            "uprobe_scope = match scope",
+        ),
+        (
+            "SessionPreparation::LoadProgram(prog_name)",
+            "SessionPreparation::FreezeDeferred(name)",
+            "prog.load()",
+        ),
+        (
+            "SessionPreparation::FreezeDeferred(name)",
+            "SessionPreparation::PublishTailCalls",
+            "freeze_map(name",
+        ),
+        (
+            "SessionPreparation::PublishTailCalls",
+            "SessionPreparation::PrepareEventsDomain",
+            "publish_and_freeze_tail_calls(&mut ebpf",
+        ),
+        (
+            "SessionPreparation::PrepareEventsDomain",
+            "            }\n            Ok(())",
+            "events::EventsDomain::from_events(&ebpf)",
+        ),
+    ] {
+        let arm = contract_section(start_inner, step, next)?;
+        require_contract_marker(arm, operation, "session preparation operation")?;
+    }
     let dynamic_loader = contract_section(
         attach,
         "pub(crate) fn attach_dynamic_loader(",
@@ -364,19 +782,66 @@ fn assert_live_discovery_host_contract(
             return Err("interface-list worker must never be attached".into());
         }
     }
+    let tail_helper = contract_section(
+        attach,
+        "fn publish_tail_calls_with",
+        "fn publish_and_freeze_tail_calls",
+    )?;
+    for marker in [
+        "if actual_worker != Some(worker_id)",
+        "if actual_second != expected_second",
+    ] {
+        require_contract_marker(tail_helper, marker, "TAIL_CALLS exact readback")?;
+    }
+    for pair in [
+        (
+            "write(state, TAIL_CALLS_INTERFACE_WORKER_SLOT)?;",
+            "write(state, TAIL_CALLS_TEMPLATE_SECOND_SLOT)?;",
+        ),
+        (
+            "write(state, TAIL_CALLS_TEMPLATE_SECOND_SLOT)?;",
+            "read(state, TAIL_CALLS_INTERFACE_WORKER_SLOT)?;",
+        ),
+        (
+            "read(state, TAIL_CALLS_INTERFACE_WORKER_SLOT)?;",
+            "read(state, TAIL_CALLS_TEMPLATE_SECOND_SLOT)?;",
+        ),
+        (
+            "read(state, TAIL_CALLS_TEMPLATE_SECOND_SLOT)?;",
+            "freeze(state)",
+        ),
+    ] {
+        require_before(tail_helper, pair.0, pair.1, "TAIL_CALLS helper sequence")?;
+    }
     let tail_publication = contract_section(
         attach,
         "fn publish_and_freeze_tail_calls(",
         "/// A kernel/environment",
     )?;
+    let fd_selection = contract_section(
+        tail_publication,
+        "let fd = if slot == TAIL_CALLS_INTERFACE_WORKER_SLOT",
+        "let mut tails: ProgramArray<_>",
+    )?;
+    for marker in [
+        "{\n                &worker_fd\n            } else {",
+        "&second.as_ref().expect(\"selected template-second program\").0",
+    ] {
+        require_contract_marker(fd_selection, marker, "TAIL_CALLS slot-to-FD mapping")?;
+    }
+    require_contract_marker(
+        tail_publication,
+        "worker_id,\n        second.as_ref().map(|(_, id)| *id)",
+        "TAIL_CALLS loaded program IDs",
+    )?;
     for marker in [
         ".program(\"interface_list_worker\")",
-        "tails.set(TAIL_CALLS_INTERFACE_WORKER_SLOT",
-        "program_array_id(TAIL_POLICY_MAP, map, TAIL_CALLS_INTERFACE_WORKER_SLOT)",
-        "program_array_id(TAIL_POLICY_MAP, map, TAIL_CALLS_TEMPLATE_SECOND_SLOT)",
-        "tails.set(TAIL_CALLS_TEMPLATE_SECOND_SLOT, second_fd, 0)?;",
-        "if actual_worker != Some(worker_id)",
-        "if actual_second != expected_second",
+        ".program(\"p11_entry_template_second\")",
+        "if slot == TAIL_CALLS_INTERFACE_WORKER_SLOT",
+        "&worker_fd",
+        "&second.as_ref().expect(\"selected template-second program\").0",
+        "tails.set(slot, fd, 0)?;",
+        "program_array_id(TAIL_POLICY_MAP, map, slot)",
         "freeze_map(TAIL_POLICY_MAP, map)",
     ] {
         require_contract_marker(tail_publication, marker, "TAIL_CALLS publication")?;
@@ -464,7 +929,11 @@ fn assert_owned_run_pause_internal_contract(
     )
 }
 
-fn assert_static_descriptor_cookie_contract(attach: &str, ebpf: &str) -> Result<(), String> {
+fn assert_static_descriptor_cookie_contract(
+    attach: &str,
+    ebpf: &str,
+    owner: &str,
+) -> Result<(), String> {
     const COOKIE: &str = "cookie: Some(attach_cookie(slot.index, slot.descriptor_index)),";
 
     let scheduling = contract_section(
@@ -474,7 +943,7 @@ fn assert_static_descriptor_cookie_contract(attach: &str, ebpf: &str) -> Result<
     )?;
     require_contract_marker(
         scheduling,
-        "attach(\"p11_return\", slot)",
+        "attach(\"p11_return\", slot, slot_attach_point(slot))",
         "return-before-entry scheduling",
     )?;
     require_contract_marker(
@@ -484,16 +953,26 @@ fn assert_static_descriptor_cookie_contract(attach: &str, ebpf: &str) -> Result<
     )?;
     require_contract_marker(
         scheduling,
+        "attach(program, slot, slot_attach_point(slot))",
+        "selected-entry shared slot attach point",
+    )?;
+    require_contract_marker(
+        scheduling,
         "!return_attached.contains(&slot.index)",
         "return failure entry suppression",
     )?;
+    let constructor = contract_section(attach, "fn slot_attach_point(", "fn attach_targets_with(")?;
+    if constructor.matches(COOKIE).count() != 1 {
+        return Err("slot attach point must construct exactly one shared descriptor cookie".into());
+    }
     let attach_targets = contract_section(
         attach,
         "pub(crate) fn attach_targets(",
         "pub fn replace_targets",
     )?;
-    require_contract_marker(attach_targets, COOKIE, "shared slot attach cookie")?;
     require_contract_marker(attach_targets, "prog.attach(point", "Aya uprobe attachment")?;
+
+    assert_start_owner_seam(ebpf, owner)?;
 
     let cookie = contract_section(ebpf, "fn slot_of<C>", "/// Decode allowlisted")?;
     require_contract_marker(
@@ -518,17 +997,28 @@ fn assert_static_descriptor_cookie_contract(attach: &str, ebpf: &str) -> Result<
         "pub fn p11_entry_template_second",
     )?;
     for (marker, contract) in [
-        ("p11_entry_impl::<0>(ctx)", "p11_entry descriptor consumer"),
         (
-            "p11_entry_impl::<1>(ctx)",
+            "p11_entry_impl::<0, ENTRY_ABI_MIXED>(ctx)",
+            "default mixed-ABI p11_entry descriptor consumer",
+        ),
+        (
+            "p11_entry_impl::<0, ENTRY_ABI_LP64>(ctx)",
+            "diagnostic p11_entry LP64 descriptor consumer",
+        ),
+        (
+            "p11_entry_impl::<0, ENTRY_ABI_ILP32>(ctx)",
+            "diagnostic p11_entry_ia32 descriptor consumer",
+        ),
+        (
+            "p11_entry_impl::<1, ENTRY_ABI_MIXED>(ctx)",
             "p11_entry_template descriptor consumer",
         ),
         (
-            "p11_entry_impl::<2>(ctx)",
+            "p11_entry_impl::<2, ENTRY_ABI_MIXED>(ctx)",
             "p11_entry_template_types descriptor consumer",
         ),
         (
-            "p11_entry_impl::<3>(ctx)",
+            "p11_entry_impl::<3, ENTRY_ABI_MIXED>(ctx)",
             "p11_entry_template_pair descriptor consumer",
         ),
     ] {
@@ -546,7 +1036,7 @@ fn assert_static_descriptor_cookie_contract(attach: &str, ebpf: &str) -> Result<
             "let key = StartKey {\n        pid_tgid: helpers::bpf_get_current_pid_tgid(),\n        slot,\n        _pad: 0,\n    };",
             "template-second START slot",
         ),
-        ("START.get_ptr_mut(&key)", "template-second START lookup"),
+        ("owned_start_mut(&key)", "template-second START lookup"),
         (
             "let semantics = semantics_of(&ctx);",
             "template-second descriptor consumer",
@@ -557,7 +1047,7 @@ fn assert_static_descriptor_cookie_contract(attach: &str, ebpf: &str) -> Result<
 
     let entry = contract_section(
         ebpf,
-        "fn p11_entry_impl<const TEMPLATE_MODE: u8>(ctx: ProbeContext) -> u32 {",
+        "fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContext) -> u32 {",
         "#[uretprobe]",
     )?;
     for (marker, contract) in [
@@ -578,7 +1068,7 @@ fn assert_static_descriptor_cookie_contract(attach: &str, ebpf: &str) -> Result<
     let returned = contract_section(
         ebpf,
         "pub fn p11_return(ctx: RetProbeContext) -> u32 {",
-        "#[tracepoint(category = \"task\", name = \"task_newtask\")]",
+        "#[unsafe(no_mangle)]\n#[inline(never)]\npub extern \"C\" fn p11_link_fork_allowed",
     )?;
     for (marker, contract) in [
         ("let slot = slot_of(&ctx);", "return low-word slot"),
@@ -586,8 +1076,8 @@ fn assert_static_descriptor_cookie_contract(attach: &str, ebpf: &str) -> Result<
             "let key = StartKey {\n        pid_tgid: helpers::bpf_get_current_pid_tgid(),\n        slot,\n        _pad: 0,\n    };",
             "return START slot",
         ),
-        ("START.get(&key)", "return START lookup"),
-        ("START.remove(&key)", "return START removal"),
+        ("owned_start_get(&key)", "return START lookup"),
+        ("owned_start_remove(&key, true)", "return START removal"),
         ("STATS.get_ptr_mut(slot)", "return STATS slot"),
         (
             "let rk = RvKey { slot, _pad: 0, rv };",
@@ -609,38 +1099,76 @@ fn assert_static_descriptor_cookie_contract(attach: &str, ebpf: &str) -> Result<
     Ok(())
 }
 
-fn assert_descriptor_publication_contract(attach: &str) -> Result<(), String> {
-    let publication =
-        contract_section(attach, "fn publish_descriptors", "fn publish_async_catalog")?;
-    for (marker, contract) in [
-        (
-            "let expected = crate::kinds::DESCRIPTORS.to_vec();",
-            "fixed descriptor inventory",
-        ),
-        (
-            "for (index, value) in expected.iter().copied().enumerate() {",
-            "complete descriptor write loop",
-        ),
-        (
-            "semantics.set(index as u32, value, 0)?;",
-            "descriptor map write",
-        ),
-        (
-            "let actual = semantics.iter().collect::<Result<Vec<_>, _>>()?;",
-            "complete descriptor readback",
-        ),
-        (
-            "if actual != expected {",
-            "exact descriptor readback comparison",
-        ),
-        (
-            "bail!(\"DESCRIPTORS exact readback differs from the fixed inventory\");",
-            "inexact descriptor readback refusal",
-        ),
-    ] {
-        require_contract_marker(publication, marker, contract)?;
-    }
-    Ok(())
+#[test]
+fn ordinary_entry_width_specialization_refuses_before_observation() {
+    let ebpf = read("crates/ebpf/src/main.rs");
+    let entry = between(
+        &ebpf,
+        "fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>",
+        "#[uretprobe]\npub fn p11_return",
+    );
+    let classify = entry
+        .find("let Some(actual_layout) = probe_layout(&ctx)")
+        .unwrap();
+    let lp64 = entry.find("ENTRY_ABI == ENTRY_ABI_LP64").unwrap();
+    let ilp32 = entry.find("ENTRY_ABI == ENTRY_ABI_ILP32").unwrap();
+    let entered = entry.find("STATS.get_ptr_mut(slot)").unwrap();
+    let aggregate = entry.find("FLAG_POLICY_AGGREGATE").unwrap();
+    assert!(classify < lp64 && lp64 < ilp32 && ilp32 < entered && entered < aggregate);
+    assert_eq!(
+        entry[..entered]
+            .matches("owned_start_remove(&key, false)")
+            .count(),
+        3
+    );
+    assert_eq!(
+        entry[..entered]
+            .matches("bump_evidence(EVIDENCE_ABI_REFUSALS)")
+            .count(),
+        3
+    );
+    assert!(entry.contains("let layout = if ENTRY_ABI == ENTRY_ABI_LP64"));
+    assert!(entry.contains("LinuxLayout::Lp64"));
+    assert!(entry.contains("LinuxLayout::Ilp32"));
+
+    let attach = read("src/attach.rs");
+    let scheduling = between(
+        &attach,
+        "fn attach_targets_with(",
+        "fn standard_async_catalog",
+    );
+    let return_attach = "attach(\"p11_return\", slot, slot_attach_point(slot))";
+    require_before(
+        scheduling,
+        "collect::<Result<Vec<_>>>()?",
+        return_attach,
+        "ABI resolution before helper-mediated return attachment",
+    )
+    .unwrap();
+    let direct_return_attach =
+        scheduling.replacen(return_attach, "attach(\"p11_return\", slot, point)", 1);
+    assert!(
+        require_before(
+            &direct_return_attach,
+            "collect::<Result<Vec<_>>>()?",
+            return_attach,
+            "ABI resolution before helper-mediated return attachment",
+        )
+        .is_err(),
+        "the return attachment must retain the shared slot attach point"
+    );
+    assert!(scheduling.contains("entry_program(&slot.semantics, policy, object_has_unsafe, *abi)"));
+    let production = between(
+        &attach,
+        "pub(crate) fn attach_targets(",
+        "pub fn replace_targets",
+    );
+    assert!(production.contains("attach_path_for(slot.object)"));
+    assert!(production.contains("abi_for(slot.object)"));
+    assert!(
+        production.find("collect::<Result<_>>()?").unwrap()
+            < production.find("attach_targets_with(").unwrap()
+    );
 }
 
 fn canary_literals(source: &str) -> std::collections::BTreeSet<String> {
@@ -667,45 +1195,39 @@ fn run_ok(program: &str, args: &[&str]) -> String {
 fn embedded_map_definitions() -> BTreeMap<String, [u32; 7]> {
     let directory = tempfile::tempdir().expect("temporary map-inspection directory");
     let object = directory.path().join("p11scope-ebpf");
-    let maps = directory.path().join("maps.bin");
     fs::write(&object, p11scope::EBPF_OBJECT).expect("write embedded eBPF object");
-
-    let symbols = Command::new("llvm-readelf")
-        .args(["-sW", object.to_str().unwrap()])
-        .output()
-        .expect("run llvm-readelf");
-    assert!(
-        symbols.status.success(),
-        "{}",
-        String::from_utf8_lossy(&symbols.stderr)
+    let output = run_ok(
+        "python3",
+        &[
+            "-I",
+            "scripts/check-bpf-map-defs.py",
+            "--json",
+            object.to_str().unwrap(),
+        ],
     );
-    let dump = format!("maps={}", maps.display());
-    let sections = Command::new("llvm-objcopy")
-        .args(["--dump-section", &dump, object.to_str().unwrap()])
-        .output()
-        .expect("run llvm-objcopy");
-    assert!(
-        sections.status.success(),
-        "{}",
-        String::from_utf8_lossy(&sections.stderr)
-    );
-    let data = fs::read(maps).expect("read legacy map definitions");
-
-    String::from_utf8(symbols.stdout)
-        .expect("UTF-8 symbol table")
-        .lines()
-        .filter_map(|line| {
-            let fields = line.split_whitespace().collect::<Vec<_>>();
-            if fields.len() < 8 || fields[3] != "OBJECT" || fields[6].parse::<u32>().is_err() {
-                return None;
-            }
-            let offset = usize::from_str_radix(fields[1], 16).ok()?;
-            let bytes = data.get(offset..offset + 28)?;
-            let mut definition = [0; 7];
-            for (value, chunk) in definition.iter_mut().zip(bytes.chunks_exact(4)) {
-                *value = u32::from_le_bytes(chunk.try_into().unwrap());
-            }
-            Some((fields[7].to_string(), definition))
+    let inventory: serde_json::Value =
+        serde_json::from_str(&output).expect("actual map inventory JSON");
+    inventory["maps"]
+        .as_object()
+        .expect("map definitions object")
+        .iter()
+        .map(|(name, fields)| {
+            let definition = [
+                "type",
+                "key_size",
+                "value_size",
+                "max_entries",
+                "flags",
+                "id",
+                "pinning",
+            ]
+            .map(|field| {
+                fields[field]
+                    .as_u64()
+                    .and_then(|value| u32::try_from(value).ok())
+                    .unwrap_or_else(|| panic!("invalid map field {name}.{field}"))
+            });
+            (name.clone(), definition)
         })
         .collect()
 }
@@ -742,6 +1264,8 @@ fn official_build_is_safe_only() {
         "CARGO_TARGET_DIR=\"$OFFICIAL_TARGET\" \\",
         "RUSTFLAGS=\"-C target-feature=+crt-static\" \\",
         "RUSTC=\"$T4_TOOLCHAIN_RUSTC\" \\",
+        "P11SCOPE_PREPARED_BPF_CARGO=\"$t4_nightly_cargo\" \\",
+        "P11SCOPE_PREPARED_BPF_RUSTC=\"$t4_nightly_rustc\" \\",
         "    \"$T4_TOOLCHAIN_CARGO\" build --locked --offline --release --no-default-features \\",
         "        --target x86_64-unknown-linux-musl --bin p11scope",
     ]
@@ -855,209 +1379,36 @@ fn task4_receipt_lane14_release_work_is_private_and_single_owner() {
     assert_eq!(fs::read(&sentinel).unwrap(), b"must survive\n");
 }
 
-// A stateful `docker` CLI stub: `names/<name>` maps a mutable name to the
-// immutable id recorded under `ids/<id>`, so a name collision is a real 125
-// refusal and every subcommand the lane reaches is logged verbatim.
-const LANE14_DOCKER_STUB: &str = r#"#!/bin/sh
-set -u
-printf '%s\n' "$*" >> "$STUB_LOG"
-cmd=$1
-shift
-
-resolve() {
-    if [ -f "$STUB_STATE/ids/$1" ]; then
-        printf '%s\n' "$1"
-    elif [ -f "$STUB_STATE/names/$1" ]; then
-        cat "$STUB_STATE/names/$1"
-    else
-        return 1
-    fi
-}
-
-case $cmd in
-pull)
-    exit 0
-    ;;
-create|run)
-    name=
-    prev=
-    for arg in "$@"; do
-        [ "$prev" = --name ] && name=$arg
-        prev=$arg
-    done
-    if [ -n "$name" ] && { [ -n "$STUB_CONFLICT" ] || [ -f "$STUB_STATE/names/$name" ]; }; then
-        echo "docker: Error response from daemon: Conflict. The container name \"/$name\" is already in use." >&2
-        exit 125
-    fi
-    count=$(cat "$STUB_STATE/count")
-    count=$((count + 1))
-    printf '%s' "$count" > "$STUB_STATE/count"
-    id=$(printf '%064d' "$count")
-    : > "$STUB_STATE/ids/$id"
-    [ -z "$name" ] || printf '%s\n' "$id" > "$STUB_STATE/names/$name"
-    [ "$cmd" != create ] || printf '%s\n' "$id"
-    exit 0
-    ;;
-start)
-    target=
-    for arg in "$@"; do
-        case $arg in -*) ;; *) target=$arg ;; esac
-    done
-    resolve "$target" >/dev/null || { echo "No such container: $target" >&2; exit 1; }
-    exit 0
-    ;;
-inspect)
-    fmt=
-    target=
-    while [ $# -gt 0 ]; do
-        case $1 in
-        -f|--format) fmt=$2; shift 2 ;;
-        -*) shift ;;
-        *) target=$1; shift ;;
-        esac
-    done
-    id=$(resolve "$target") || { echo "No such object: $target" >&2; exit 1; }
-    [ -z "$fmt" ] || printf '%s\n' "$id"
-    exit 0
-    ;;
-rm)
-    target=
-    for arg in "$@"; do
-        case $arg in -*) ;; *) target=$arg ;; esac
-    done
-    id=$(resolve "$target") || exit 1
-    rm -f "$STUB_STATE/ids/$id"
-    for entry in "$STUB_STATE"/names/*; do
-        [ -f "$entry" ] || continue
-        [ "$(cat "$entry")" = "$id" ] && rm -f "$entry"
-    done
-    exit 0
-    ;;
-esac
-exit 0
-"#;
-
 #[test]
 fn lane14_container_ownership_follows_creation_not_names() {
-    // csf_610b398 (Task 10 F5) registered the PID-derived `--name` as a cleanup
-    // id *before* `docker run`, so a stale or concurrent foreign container
-    // holding that name failed creation (125) and the EXIT trap `docker rm -f`'d
-    // the foreign object. The ratified resource journal runs the other way:
-    // `requested` precedes creation, `resolved` carries the immutable identity,
-    // and mutable names alone never authorize deletion
-    // (docs/superpowers/reports/2026-08-28-task4-receipt-architecture-decision.md:100-117).
-    let fixture = tempfile::tempdir().expect("create lane 14 docker-stub fixture");
-    let root = fixture.path();
-    let bin = root.join("bin");
-    fs::create_dir(&bin).unwrap();
-    fs::write(bin.join("docker"), LANE14_DOCKER_STUB).unwrap();
-    fs::write(
-        bin.join("cargo"),
-        "#!/bin/sh\nprintf '[source.vendored-sources]\\ndirectory = \"/stub\"\\n'\n",
-    )
-    .unwrap();
-    for tool in ["docker", "cargo"] {
-        fs::set_permissions(bin.join(tool), fs::Permissions::from_mode(0o700)).unwrap();
-    }
-
-    let lane = |phase: &str, conflict: &str| {
-        let work = root.join(phase);
-        let artifacts = work.join("artifacts");
-        let state = work.join("state");
-        fs::create_dir_all(&artifacts).unwrap();
-        fs::create_dir_all(state.join("ids")).unwrap();
-        fs::create_dir_all(state.join("names")).unwrap();
-        fs::write(state.join("count"), b"0").unwrap();
-        fs::set_permissions(&artifacts, fs::Permissions::from_mode(0o700)).unwrap();
-        let log = work.join("docker.log");
-        fs::write(&log, b"").unwrap();
-        let facts = artifacts.join("discover.facts");
-        let output = Command::new("/bin/sh")
-            .arg("scripts/verify-discover-containers.sh")
-            .arg("--lane14-facts")
-            .arg(&facts)
-            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
-            .env("P11SCOPE_TASK4_WORK", &work)
-            .env("STUB_LOG", &log)
-            .env("STUB_STATE", &state)
-            .env("STUB_CONFLICT", conflict)
-            .output()
-            .expect("run lane 14 against the stateful docker stub");
-        (
-            output,
-            fs::read_to_string(&log).unwrap(),
-            fs::read_to_string(&facts).unwrap_or_default(),
-        )
-    };
-
-    // A foreign container already holds the lane's name: refuse, delete nothing.
-    let (collision, collision_log, collision_facts) = lane("collision", "1");
-    assert!(
-        !collision.status.success(),
-        "a name collision must refuse the lane"
+    let output = Command::new("python3")
+        .args([
+            "-I",
+            "tests/python/test_prepared_container_driver.py",
+            "PreparedContainerDriverTests",
+        ])
+        .output()
+        .expect("run the complete native container-driver suite");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert!(
-        !collision_log.lines().any(|line| line.starts_with("rm ")),
-        "the lane removed a container it never created:\n{collision_log}"
-    );
-    assert!(
-        !collision_facts.contains("container_"),
-        "a refused creation was still recorded as an owned container:\n{collision_facts}"
-    );
-
-    // The lane's own containers are created, read back by exact id, recorded,
-    // started, and then removed by that id.
-    let (success, success_log, success_facts) = lane("success", "");
-    assert!(
-        success.status.success(),
-        "stubbed lane failed: {}",
-        String::from_utf8_lossy(&success.stderr)
-    );
-    assert_eq!(
-        success_log
-            .lines()
-            .filter(|line| line.starts_with("create "))
-            .count(),
-        3,
-        "each container must be created before it is owned:\n{success_log}"
-    );
-    assert!(
-        !success_log.lines().any(|line| line.starts_with("run ")),
-        "`docker run` creates and starts in one step, leaving no pre-start id:\n{success_log}"
-    );
-    let removed: Vec<&str> = success_log
+    assert!(output.status.success(), "container-driver suite: {report}");
+    let count = report
         .lines()
-        .filter_map(|line| line.strip_prefix("rm -f "))
-        .collect();
-    assert_eq!(removed.len(), 3, "cleanup log:\n{success_log}");
-    for id in &removed {
-        assert!(
-            id.len() == 64 && id.chars().all(|character| character.is_ascii_hexdigit()),
-            "cleanup removed {id}, which is not an immutable container id"
-        );
-        assert!(
-            success_facts.contains(id),
-            "cleanup removed {id}, which the receipt never recorded as owned"
-        );
-        require_before(
-            &success_log,
-            &format!("inspect -f {{{{.Id}}}} {id}"),
-            &format!("start -a {id}"),
-            "lane 14 exact-id readback",
-        )
-        .unwrap();
-    }
+        .find_map(|line| {
+            line.strip_prefix("Ran ")?
+                .split_whitespace()
+                .next()?
+                .parse::<usize>()
+                .ok()
+        })
+        .unwrap_or(0);
     assert!(
-        !success_facts.contains("p11scope-discover-"),
-        "the receipt records a mutable container name as an identity:\n{success_facts}"
+        count > 0 && !report.contains("skipped="),
+        "container-driver suite must run nonempty without skips: {report}"
     );
-    for fact in [
-        "container_glibc_build",
-        "container_glibc_run",
-        "container_musl_build",
-    ] {
-        assert!(success_facts.contains(fact), "receipt misses {fact}");
-    }
 }
 
 #[test]
@@ -1629,557 +1980,46 @@ fn release_preflight_pins_its_tools_before_the_first_digest() {
     );
 }
 
-/// Every external command the receipt chain reaches, in the exact `LC_ALL=C`
-/// order the driver pins, symlinks into its sealed bin directory, and
-/// self-checks. Derived statically from `scripts/build-release.sh` (including
-/// its `cd`/`dirname` line and `task4_finalize`), `scripts/lib.sh`, the three
-/// nested gate scripts, and `build.rs`'s nightly Cargo invocation plus the
-/// linker drivers rustc reaches through PATH -- then proven by execution
-/// under the seal. Shell builtins are excluded. Commands that run under
-/// `sudo` resolve through sudo's root-owned `secure_path`, and commands
-/// inside a container resolve through the image, so neither is under the
-/// caller's PATH authority and neither is a member.
-const TASK11_TOOL_INVENTORY: &[&str] = &[
-    "as",
-    "awk",
-    "bpf-linker",
-    "bpftool",
-    "cargo",
-    "cat",
-    "cc",
-    "chmod",
-    "cmp",
-    "cp",
-    "date",
-    "dirname",
-    "docker",
-    "env",
-    "file",
-    "find",
-    "flock",
-    "gcc",
-    "git",
-    "grep",
-    "head",
-    "id",
-    "jq",
-    "ld",
-    "ldd",
-    "llvm-objcopy",
-    "llvm-readelf",
-    "ln",
-    "ls",
-    "mkdir",
-    "mktemp",
-    "mv",
-    "python3",
-    "realpath",
-    "rm",
-    "rustup",
-    "sed",
-    "setpriv",
-    "sh",
-    "sha256sum",
-    "sleep",
-    "softhsm2-util",
-    "sort",
-    "stat",
-    "sudo",
-    "sync",
-    "tail",
-    "timeout",
-    "touch",
-    "uname",
-    "xargs",
-];
-
-/// The exact environment name set the sealed child may observe. `env -i`
-/// supplies seven of them; dash itself adds `PWD` and nothing else.
-const TASK11_SEALED_ENVIRONMENT: &[&str] = &[
-    "HOME",
-    "LC_ALL",
-    "OLDPWD",
-    "P11SCOPE_TASK4_CALLER_ARGV0",
-    "P11SCOPE_TASK4_CALLER_PATH",
-    "P11SCOPE_TASK4_SEALED",
-    "P11SCOPE_TASK4_SEALED_BIN",
-    "PATH",
-    "PWD",
-];
-
-struct SealedDriverRun {
-    output: std::process::Output,
-    root: std::path::PathBuf,
-    repo: std::path::PathBuf,
-    facts: String,
-    tripwire_log: std::path::PathBuf,
-    environment_dump: std::path::PathBuf,
-    seal_parent: std::path::PathBuf,
-    _repo: tempfile::TempDir,
-    _fixture: tempfile::TempDir,
-}
-
-impl SealedDriverRun {
-    fn fact(&self, name: &str) -> Option<&str> {
-        self.facts.lines().find_map(|line| {
-            line.strip_prefix(name)
-                .and_then(|rest| rest.strip_prefix('\t'))
-        })
-    }
-
-    fn tripped(&self) -> String {
-        fs::read_to_string(&self.tripwire_log).unwrap_or_default()
-    }
-
-    fn stderr(&self) -> String {
-        String::from_utf8_lossy(&self.output.stderr).into_owned()
-    }
-}
-
-#[derive(Default)]
-struct Task11FixtureOptions {
-    external_rust_src_symlink: bool,
-    internal_rust_src_symlink: bool,
-    cargo_proxy_mismatch: bool,
-    cargo_proxy_regular_mismatch: bool,
-    cargo_home_raw_target_newline: bool,
-    cargo_home_canonical_target_newline: bool,
-    cargo_home_inventory_shadow: bool,
-    missing_musl: bool,
-}
-
-/// Runs the pristine driver until it reaches the pinned `sudo -n true` probe
-/// -- the first external command the receipt chain executes that a test can
-/// own -- with `sudo` replaced by a stub that is the seal's positive control:
-/// it records that it ran, dumps the environment it was handed, and plants a
-/// tripwire named for every inventory member into a directory that is FIRST
-/// in the caller's PATH. Nothing the driver runs afterwards may reach one.
-/// `rustup` is stubbed too so the 1.88 toolchain probe succeeds under the
-/// fixture HOME. Stub paths are baked in, never inherited: the seal drops
-/// every variable a stub could otherwise read.
-fn task11_run_to_the_sudo_probe(
-    extra_env: &[(&str, &str)],
-    options: Task11FixtureOptions,
-) -> SealedDriverRun {
-    let repo = task7_pristine_driver_repo();
-    let fixture = tempfile::tempdir().expect("create sealed release-driver fixture");
-    let fake_bin = fixture.path().join("bin");
-    let tripwire_bin = fixture.path().join("tripwire-bin");
-    let home = fixture.path().join("home");
-    let seal_parent = fixture.path().join("tmp");
-    let campaign = fixture.path().join("campaign");
-    for directory in [&fake_bin, &tripwire_bin, &home, &seal_parent, &campaign] {
-        fs::create_dir(directory).expect("create sealed release-driver fixture directory");
-    }
-    fs::set_permissions(&campaign, fs::Permissions::from_mode(0o700))
-        .expect("make the campaign parent private");
-
-    let tripwire_log = fixture.path().join("tripwire.log");
-    let environment_dump = fixture.path().join("sealed-environment");
-
-    // The nightly closure the eBPF object is actually built from: cargo,
-    // rustc, its sysroot, the `rust-src` tree `-Z build-std=core` consumes,
-    // and the BPF linker. `bpf-linker` lives under the effective cargo home,
-    // which Cargo prepends to the PATH of every rustc it spawns.
-    let sysroot = fixture.path().join("sysroot");
-    let rust_src = sysroot.join("lib/rustlib/src/rust");
-    fs::create_dir_all(rust_src.join("library/core/src")).expect("create rust-src fixture");
-    fs::create_dir_all(sysroot.join("lib/rustlib/x86_64-unknown-linux-musl/lib"))
-        .expect("create stable musl sysroot fixture");
-    fs::write(sysroot.join("lib/librustc_driver.so"), b"rustc-driver\n")
-        .expect("write top-level rustc driver fixture");
-    fs::write(
-        sysroot.join("lib/rustlib/x86_64-unknown-linux-musl/lib/libc.rlib"),
-        b"musl-target\n",
-    )
-    .expect("write stable musl target fixture");
-    if options.missing_musl {
-        fs::remove_dir_all(sysroot.join("lib/rustlib/x86_64-unknown-linux-musl/lib"))
-            .expect("remove stable musl target fixture");
-    }
-    for (name, body) in [
-        ("library/core/src/lib.rs", "#![no_std]\n"),
-        ("library/core/Cargo.toml", "[package]\nname = \"core\"\n"),
-    ] {
-        fs::write(rust_src.join(name), body).expect("write rust-src fixture file");
-    }
-    let cargo_bin = home.join(".cargo/bin");
-    fs::create_dir_all(&cargo_bin).expect("create the fixture cargo home");
-    fs::write(cargo_bin.join("bpf-linker"), b"#!/bin/sh\nexit 0\n").expect("write bpf-linker");
-    fs::set_permissions(
-        cargo_bin.join("bpf-linker"),
-        fs::Permissions::from_mode(0o700),
-    )
-    .expect("make bpf-linker executable");
-    if options.internal_rust_src_symlink {
-        std::os::unix::fs::symlink("lib.rs", rust_src.join("library/core/src/internal-link"))
-            .expect("plant an internal rust-src symlink");
-    }
-    if options.external_rust_src_symlink {
-        std::os::unix::fs::symlink("/etc/passwd", rust_src.join("library/core/planted"))
-            .expect("plant a symlink in the rust-src fixture");
-    }
-
-    let toolchain = fixture.path().join("toolchain-binary");
-    fs::write(
-        &toolchain,
-        format!(
-            "#!/bin/sh\ncase \"$*\" in\n\"--print sysroot\") echo {sysroot} ;;\nesac\nexit 0\n",
-            sysroot = sysroot.display()
-        ),
-    )
-    .expect("write toolchain fixture binary");
-    fs::set_permissions(&toolchain, fs::Permissions::from_mode(0o700))
-        .expect("make the toolchain fixture binary executable");
-
-    let stub = |name: &str, body: String| {
-        let path = fake_bin.join(name);
-        fs::write(&path, body).expect("write sealed release-driver stub");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
-            .expect("make the sealed release-driver stub executable");
-    };
-    stub(
-        "rustup",
-        format!(
-            r#"#!/bin/sh
-case "$1 $2 $3" in
-"which --toolchain 1.88"|"which --toolchain nightly-2026-05-20") echo {toolchain}; exit 0 ;;
-esac
-exit 1
-"#,
-            toolchain = toolchain.display()
-        ),
-    );
-    let proxy_target = fake_bin.join("rustup-proxy-target");
-    fs::write(&proxy_target, b"#!/bin/sh\nexit 0\n").expect("write mismatched cargo proxy");
-    fs::set_permissions(&proxy_target, fs::Permissions::from_mode(0o700))
-        .expect("make mismatched cargo proxy executable");
-    let rustup_target = fake_bin.join("rustup");
-    let cargo_target = if options.cargo_home_canonical_target_newline {
-        let newline_target = fake_bin.join("rustup\n");
-        fs::write(&newline_target, b"#!/bin/sh\nexit 0\n")
-            .expect("write newline-terminated cargo target");
-        fs::set_permissions(&newline_target, fs::Permissions::from_mode(0o700))
-            .expect("make newline-terminated cargo target executable");
-        let intermediate = fake_bin.join("cargo-intermediate");
-        std::os::unix::fs::symlink(&newline_target, &intermediate)
-            .expect("link safe-named cargo intermediate");
-        intermediate
-    } else {
-        rustup_target.clone()
-    };
-    if options.cargo_proxy_regular_mismatch {
-        fs::write(cargo_bin.join("cargo"), b"#!/bin/sh\nexit 0\n")
-            .expect("write regular cargo proxy mismatch");
-        fs::set_permissions(cargo_bin.join("cargo"), fs::Permissions::from_mode(0o700))
-            .expect("make regular cargo proxy mismatch executable");
-    } else {
-        std::os::unix::fs::symlink(
-            if options.cargo_proxy_mismatch {
-                proxy_target.as_path()
-            } else {
-                cargo_target.as_path()
-            },
-            cargo_bin.join("cargo"),
-        )
-        .expect("link cargo proxy");
-    }
-    std::os::unix::fs::symlink(&rustup_target, cargo_bin.join("rustc")).expect("link rustc proxy");
-    std::os::unix::fs::symlink(&rustup_target, cargo_bin.join("rustup"))
-        .expect("link rustup proxy");
-    let third_party = cargo_bin.join("cargo-third-party");
-    fs::write(&third_party, b"#!/bin/sh\nexit 0\n").expect("write third-party cargo command");
-    fs::set_permissions(&third_party, fs::Permissions::from_mode(0o700))
-        .expect("make third-party cargo command executable");
-    fs::write(
-        cargo_bin.join("cargo-third-party-target"),
-        b"#!/bin/sh\nexit 0\n",
-    )
-    .expect("write third-party symlink target");
-    fs::set_permissions(
-        cargo_bin.join("cargo-third-party-target"),
-        fs::Permissions::from_mode(0o700),
-    )
-    .expect("make third-party symlink target executable");
-    let third_party_link_target = if options.cargo_home_raw_target_newline {
-        let external_plain_target = fake_bin.join("third-party-target");
-        fs::write(&external_plain_target, b"#!/bin/sh\nexit 0\n")
-            .expect("write plain symlink target twin");
-        fs::set_permissions(&external_plain_target, fs::Permissions::from_mode(0o700))
-            .expect("make plain symlink target twin executable");
-        let external_target = fake_bin.join("third-party-target\n");
-        fs::write(&external_target, b"#!/bin/sh\nexit 0\n")
-            .expect("write newline-terminated symlink target");
-        fs::set_permissions(&external_target, fs::Permissions::from_mode(0o700))
-            .expect("make newline-terminated symlink target executable");
-        external_target
-    } else {
-        cargo_bin.join("cargo-third-party-target")
-    };
-    std::os::unix::fs::symlink(
-        &third_party_link_target,
-        cargo_bin.join("cargo-third-party-link"),
-    )
-    .expect("link third-party cargo command");
-    if options.cargo_home_inventory_shadow {
-        fs::write(cargo_bin.join("date"), b"#!/bin/sh\nexit 0\n")
-            .expect("write cargo-home inventory shadow");
-        fs::set_permissions(cargo_bin.join("date"), fs::Permissions::from_mode(0o700))
-            .expect("make cargo-home inventory shadow executable");
-    }
-    stub(
-        "sudo",
-        format!(
-            "#!/bin/sh\n\
-             echo \"${{0##*/}}\" >> {log}\n\
-             env > {dump}\n\
-             for name in {inventory}; do\n\
-             \x20   printf '#!/bin/sh\\necho \"${{0##*/}}\" >> {log}\\nexit 97\\n' > \"{bin}/$name\"\n\
-             \x20   chmod 700 \"{bin}/$name\"\n\
-             done\n\
-             exit 1\n",
-            log = tripwire_log.display(),
-            dump = environment_dump.display(),
-            bin = tripwire_bin.display(),
-            inventory = TASK11_TOOL_INVENTORY.join(" "),
-        ),
-    );
-
-    let root = campaign.join("evidence");
-    let caller_path = format!(
-        "{}:{}:{}:/usr/local/sbin:/usr/sbin:/sbin:/usr/local/bin:/usr/bin:/bin",
-        tripwire_bin.display(),
-        fake_bin.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-    let mut command = Command::new("/bin/sh");
-    command
-        .arg(repo.path().join("scripts/build-release.sh"))
-        .arg(&root)
-        .env("PATH", &caller_path)
-        .env("HOME", &home)
-        .env("TMPDIR", &seal_parent);
-    for name in TASK7_BUILD_INPUT_VARIABLES {
-        command.env_remove(name);
-    }
-    for (name, value) in extra_env {
-        command.env(name, value);
-    }
-    let output = command.output().expect("run the sealed release driver");
-    let facts = fs::read_to_string(root.join("facts.log")).unwrap_or_default();
-    SealedDriverRun {
-        output,
-        root,
-        repo: repo.path().to_path_buf(),
-        facts,
-        tripwire_log,
-        environment_dump,
-        seal_parent,
-        _repo: repo,
-        _fixture: fixture,
-    }
+// Shared native expectations preserve the two residual Rust contracts while
+// the complete actual-CLI fixture lives in tests/fixtures/release-seal.
+fn task11_expected_values(name: &str) -> Vec<String> {
+    let mut expected: BTreeMap<String, Vec<String>> =
+        serde_json::from_str(&read("tests/fixtures/release-seal/expected.json"))
+            .expect("read the shared Task11 expectations");
+    expected
+        .remove(name)
+        .unwrap_or_else(|| panic!("missing Task11 expectation: {name}"))
 }
 
 #[test]
 fn release_seal_denies_the_caller_path_to_every_reached_command() {
-    // csf_014eb65 / shadow finding 3: bare PATH-resolved commands establish
-    // HEAD, the source ledger, every digest, and the receipt itself. The
-    // ratified rule (W1 plan line 417) is that no inherited PATH authority
-    // survives anywhere in the receipt chain, so the closure is a sealed
-    // execution environment, not a longer hand-maintained tool list.
-    let run = task11_run_to_the_sudo_probe(&[], Task11FixtureOptions::default());
-    let stderr = run.stderr();
-
-    assert_eq!(
-        run.output.status.code(),
-        Some(77),
-        "the stubbed sudo probe must refuse the run: stderr={stderr:?}"
+    let output = Command::new("python3")
+        .args([
+            "-I",
+            "tests/python/test_release_seal.py",
+            "ReleaseSealTests",
+        ])
+        .output()
+        .expect("run the complete native release-seal suite");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
-    // The positive control proves the tripwire mechanism itself works: the
-    // one command legitimately reached after the seal did write the log.
-    assert_eq!(
-        run.tripped(),
-        "sudo\n",
-        "exactly the positive control may appear in the tripwire log"
-    );
-    assert_eq!(
-        fs::read_to_string(run.root.join("status"))
-            .expect("the refusal still writes its terminal status"),
-        "77\n"
-    );
-
-    let sealed_bin = run
-        .fact("sealed_bin")
-        .expect("the receipt records the sealed bin directory");
-    assert!(
-        !std::path::Path::new(sealed_bin).exists(),
-        "finalization left the sealed bin directory behind: {sealed_bin}"
-    );
-    assert_eq!(
-        fs::read_dir(&run.seal_parent)
-            .expect("read the seal parent")
-            .count(),
-        0,
-        "the seal parent still holds sealed-run residue"
-    );
-    // Every inventory member -- not the nine-name floor -- is recorded with
-    // the path the seal selects, what the caller's PATH resolves it to, and
-    // the pinned binary's digest.
-    for tool in TASK11_TOOL_INVENTORY {
-        let row = run
-            .fact(&format!("tool_{tool}"))
-            .unwrap_or_else(|| panic!("the receipt tool ledger omits {tool}"));
-        let fields: Vec<&str> = row.split(' ').collect();
-        assert_eq!(fields.len(), 3, "malformed tool_{tool} row: {row:?}");
-        assert!(
-            fields[0].starts_with('/') && fields[0] == fields[1],
-            "tool_{tool} must pin one absolute path the caller's PATH still resolves: {row:?}"
-        );
-        assert!(
-            fields[2].len() == 64 && fields[2].bytes().all(|b| b.is_ascii_hexdigit()),
-            "tool_{tool} must carry the pinned binary's digest: {row:?}"
-        );
-    }
-
-    // The nightly eBPF toolchain closure is an effective input of the release
-    // artifact and is bound like one. `cc` is reached through PATH by rustc's
-    // gcc-flavour linker driver, so it is an ordinary inventory member above;
-    // gcc's own collect2/ld/as come from its configured prefix, not PATH
-    // (verified by execve trace on this host).
-    for (row, shape) in [
-        ("toolchain_sysroot", 2usize),
-        ("toolchain_nightly_cargo", 2usize),
-        ("toolchain_nightly_rustc", 2),
-        ("toolchain_nightly_sysroot", 2),
-        ("toolchain_nightly_rust_src", 2),
-        ("toolchain_bpf_linker", 2),
-    ] {
-        let value = run
-            .fact(row)
-            .unwrap_or_else(|| panic!("the receipt omits the {row} closure row"));
-        let fields: Vec<&str> = value.split(' ').collect();
-        assert_eq!(fields.len(), shape, "malformed {row} row: {value:?}");
-        assert!(
-            fields[0].starts_with('/'),
-            "malformed {row} path: {value:?}"
-        );
-        if shape == 2 {
-            let digest = fields[1]
-                .strip_prefix("tree-sha256-v1:")
-                .unwrap_or(fields[1]);
-            assert!(
-                digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()),
-                "{row} must carry a digest: {value:?}"
-            );
-        }
-    }
-    assert!(
-        run.fact("toolchain_bpf_linker")
-            .is_some_and(|row| row.contains("/.cargo/bin/bpf-linker")),
-        "the BPF linker must be bound where rustc actually reaches it"
-    );
-
-    let caller_path = run
-        .fact("caller_path")
-        .expect("the receipt records the caller's PATH");
-    assert!(
-        caller_path
-            .split(':')
-            .any(|entry| entry.ends_with("tripwire-bin")),
-        "the recorded caller PATH is not the PATH the driver was handed: {caller_path}"
-    );
-}
-
-#[test]
-fn release_seal_exports_exactly_the_reviewed_environment() {
-    // Shadow finding 6: RUSTC_WORKSPACE_WRAPPER re-steers the official build,
-    // PYTHONPATH/PYTHONHOME re-steer both Python steps, and the GIT_* family
-    // re-steers the source authority itself -- none of them recorded. The
-    // driver runs under an explicit allowlist instead of a longer denylist.
-    // A real PYTHONPATH carrier, not a placeholder: `sitecustomize` runs on
-    // interpreter start-up, so the driver's own finalizer would execute it.
-    let carrier = tempfile::tempdir().expect("create the PYTHONPATH carrier");
-    let executed = carrier.path().join("sitecustomize-ran");
-    fs::write(
-        carrier.path().join("sitecustomize.py"),
-        format!(
-            "import pathlib\npathlib.Path({executed:?}).write_text('executed')\n",
-            executed = executed.display().to_string()
-        ),
-    )
-    .expect("write the sitecustomize carrier");
-    let carrier_path = carrier.path().display().to_string();
-    let planted = [
-        ("RUSTC_WORKSPACE_WRAPPER", "/task11/wrapper"),
-        ("P11SCOPE_SMALL_RING", "1"),
-        ("PYTHONPATH", carrier_path.as_str()),
-        ("PYTHONHOME", ""),
-        ("GIT_DIR", "/task11/git"),
-        ("GIT_WORK_TREE", "/task11/worktree"),
-        ("GIT_INDEX_FILE", "/task11/index"),
-        ("GIT_CONFIG_GLOBAL", "/task11/gitconfig"),
-        ("DOCKER_HOST", "tcp://task11.invalid:2375"),
-        ("LANG", "en_US.UTF-8"),
-    ];
-    let run = task11_run_to_the_sudo_probe(&planted, Task11FixtureOptions::default());
-    assert_eq!(
-        run.output.status.code(),
-        Some(77),
-        "the stubbed sudo probe must refuse the run: stderr={:?}",
-        run.stderr()
-    );
-
-    let dumped = fs::read_to_string(&run.environment_dump)
-        .expect("the positive control dumped the sealed environment");
-    let mut names: Vec<&str> = dumped
+    assert!(output.status.success(), "release-seal suite: {report}");
+    let count = report
         .lines()
-        .filter_map(|line| line.split_once('='))
-        .map(|(name, _)| name)
-        .collect();
-    names.sort_unstable();
-    assert_eq!(
-        names, TASK11_SEALED_ENVIRONMENT,
-        "the sealed child saw an environment outside its allowlist: {dumped:?}"
-    );
-    for (name, _) in planted {
-        assert!(
-            !dumped.contains(&format!("{name}=")),
-            "planted {name} survived the seal: {dumped:?}"
-        );
-    }
-    let value = |name: &str| {
-        dumped
-            .lines()
-            .find_map(|line| line.strip_prefix(&format!("{name}=")))
-            .unwrap_or_default()
-            .to_string()
-    };
-    assert_eq!(value("LC_ALL"), "C");
-    assert_eq!(value("P11SCOPE_TASK4_SEALED"), "1");
-    assert_eq!(
-        value("PATH"),
-        value("P11SCOPE_TASK4_SEALED_BIN"),
-        "PATH must be exactly the sealed bin directory"
-    );
+        .find_map(|line| {
+            line.strip_prefix("Ran ")?
+                .split_whitespace()
+                .next()?
+                .parse::<usize>()
+                .ok()
+        })
+        .unwrap_or(0);
     assert!(
-        !executed.exists(),
-        "an inherited PYTHONPATH sitecustomize executed inside the release driver"
-    );
-
-    let driver_head = String::from_utf8(
-        Command::new("git")
-            .arg("-C")
-            .arg(&run.repo)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .expect("read the driver repository HEAD")
-            .stdout,
-    )
-    .expect("UTF-8 HEAD");
-    assert_eq!(
-        run.fact("head"),
-        Some(driver_head.trim()),
-        "an inherited GIT_DIR must never decide the recorded HEAD"
+        count > 0 && !report.contains("skipped="),
+        "release-seal suite must run nonempty without skips: {report}"
     );
 }
 
@@ -2202,7 +2042,7 @@ fn release_runs_every_python3_in_isolated_mode() {
         .collect();
     assert_eq!(
         sites.len(),
-        5,
+        8,
         "the pinned-interpreter call sites moved; re-check each one for -I"
     );
     for site in sites {
@@ -2233,190 +2073,30 @@ fn release_runs_every_python3_in_isolated_mode() {
         "scripts/verify-discover-containers.sh",
     ] {
         let source = read(path);
-        for (line_number, line) in source.lines().enumerate() {
-            let code = line.split_once('#').map_or(line, |(code, _)| code);
-            if code.trim_start().starts_with("command -v python3") {
-                continue;
-            }
-            let mut offset = 0;
-            while let Some(relative) = code[offset..].find("python3") {
-                let start = offset + relative;
-                let end = start + "python3".len();
-                let bytes = code.as_bytes();
-                let token_before = start == 0
-                    || !bytes[start - 1].is_ascii_alphanumeric() && bytes[start - 1] != b'_';
-                let token_after =
-                    end == bytes.len() || !bytes[end].is_ascii_alphanumeric() && bytes[end] != b'_';
-                if token_before && token_after {
-                    let after = code[end..].trim_start();
-                    let rest = after.strip_prefix("-I").unwrap_or_else(|| {
-                        panic!("unisolated executable python3 in {path}:{line_number}: {line:?}")
-                    });
-                    assert!(
-                        rest.is_empty()
-                            || (!rest.as_bytes()[0].is_ascii_alphanumeric()
-                                && rest.as_bytes()[0] != b'_'),
-                        "python3 option is not the isolated -I token in {path}:{line_number}: {line:?}"
-                    );
-                }
-                offset = end;
+        assert_python3_isolated(path, &source).unwrap();
+        if path == "scripts/verify-discover-containers.sh" {
+            assert_lane14_selected_python_isolated(&source).unwrap();
+            for invocation in [
+                "\"$LANE14_PYTHON\" -I scripts/prepared-dependency-evidence.py capture \\",
+                "\"$LANE14_PYTHON\" -I scripts/prepared-dependency-evidence.py recheck \\",
+            ] {
+                assert!(
+                    source.contains(invocation),
+                    "selected Lane 14 Python call is not isolated"
+                );
+                let unisolated = source.replacen(invocation, &invocation.replace(" -I", ""), 1);
+                assert!(
+                    assert_lane14_selected_python_isolated(&unisolated).is_err(),
+                    "removing isolation from either selected Lane 14 call must fail"
+                );
             }
         }
     }
-}
-
-#[test]
-fn release_cargo_home_bin_closure_is_complete_and_refuses_shadows() {
-    // The rustup proxy prepends HOME/.cargo/bin to the nightly build's PATH.
-    // Every immediate entry is therefore part of the receipt: regular files,
-    // internal symlinks, and the cargo/rustc/rustup proxy identity alike.
-    let safe = task11_run_to_the_sudo_probe(&[], Task11FixtureOptions::default());
-    assert_eq!(safe.output.status.code(), Some(77));
-    for name in [
-        "cargo",
-        "rustc",
-        "rustup",
-        "bpf-linker",
-        "cargo-third-party",
-        "cargo-third-party-link",
-        "cargo-third-party-target",
-    ] {
-        assert!(
-            safe.fact(&format!("cargo_home_bin_{name}")).is_some(),
-            "the cargo-home ledger omits {name}"
-        );
-    }
+    assert_python3_isolated("lookup", "command -v python3").unwrap();
+    assert_python3_isolated("lookup", "LANE14_PYTHON=$(command -v python3) || exit 77").unwrap();
     assert!(
-        safe.fact("cargo_home_bin_cargo-third-party-link")
-            .is_some_and(|row| row.contains("cargo-third-party-target")),
-        "the cargo-home symlink row must bind its raw target"
-    );
-    assert_eq!(
-        safe.tripped(),
-        "sudo\n",
-        "the safe fixture reaches only the probe"
-    );
-
-    let shadow = task11_run_to_the_sudo_probe(
-        &[],
-        Task11FixtureOptions {
-            cargo_home_inventory_shadow: true,
-            ..Task11FixtureOptions::default()
-        },
-    );
-    assert_eq!(shadow.output.status.code(), Some(77));
-    assert!(
-        shadow.tripped().is_empty(),
-        "an exact inventory-name shadow reached the release body: {}",
-        shadow.tripped()
-    );
-
-    let mismatch = task11_run_to_the_sudo_probe(
-        &[],
-        Task11FixtureOptions {
-            cargo_proxy_mismatch: true,
-            ..Task11FixtureOptions::default()
-        },
-    );
-    assert_eq!(mismatch.output.status.code(), Some(77));
-    assert!(
-        mismatch.tripped().is_empty(),
-        "a cargo proxy mismatch reached the release body: {}",
-        mismatch.tripped()
-    );
-
-    let regular_mismatch = task11_run_to_the_sudo_probe(
-        &[],
-        Task11FixtureOptions {
-            cargo_proxy_regular_mismatch: true,
-            ..Task11FixtureOptions::default()
-        },
-    );
-    assert_eq!(regular_mismatch.output.status.code(), Some(77));
-    assert!(
-        regular_mismatch.tripped().is_empty(),
-        "a regular cargo proxy mismatch reached the release body: {}",
-        regular_mismatch.tripped()
-    );
-
-    let raw_target_newline = task11_run_to_the_sudo_probe(
-        &[],
-        Task11FixtureOptions {
-            cargo_home_raw_target_newline: true,
-            ..Task11FixtureOptions::default()
-        },
-    );
-    assert_eq!(raw_target_newline.output.status.code(), Some(77));
-    assert!(
-        raw_target_newline.tripped().is_empty(),
-        "a newline-terminated raw target reached the release body: {}",
-        raw_target_newline.tripped()
-    );
-
-    let canonical_target_newline = task11_run_to_the_sudo_probe(
-        &[],
-        Task11FixtureOptions {
-            cargo_home_canonical_target_newline: true,
-            ..Task11FixtureOptions::default()
-        },
-    );
-    assert_eq!(canonical_target_newline.output.status.code(), Some(77));
-    assert!(
-        canonical_target_newline.tripped().is_empty(),
-        "a newline-terminated two-hop canonical target reached the release body: {}",
-        canonical_target_newline.tripped()
-    );
-}
-
-#[test]
-fn release_sysroot_closure_is_bound_and_missing_musl_refuses_before_body() {
-    let release = read("scripts/build-release.sh");
-    assert!(
-        release.contains("tree-sha256-v1:"),
-        "sysroot closure does not use the typed tree digest"
-    );
-    assert!(
-        !release.contains("target add"),
-        "the release body may not mutate the stable toolchain"
-    );
-
-    let safe = task11_run_to_the_sudo_probe(
-        &[],
-        Task11FixtureOptions {
-            internal_rust_src_symlink: true,
-            ..Task11FixtureOptions::default()
-        },
-    );
-    assert_eq!(safe.output.status.code(), Some(77));
-    for row in [
-        "toolchain_sysroot",
-        "toolchain_nightly_sysroot",
-        "toolchain_nightly_rust_src",
-    ] {
-        let value = safe.fact(row).unwrap_or_else(|| panic!("missing {row}"));
-        assert!(
-            value.contains("tree-sha256-v1:"),
-            "{row} is not a typed tree digest: {value:?}"
-        );
-    }
-    assert_eq!(safe.tripped(), "sudo\n");
-
-    let missing = task11_run_to_the_sudo_probe(
-        &[],
-        Task11FixtureOptions {
-            missing_musl: true,
-            ..Task11FixtureOptions::default()
-        },
-    );
-    assert_eq!(missing.output.status.code(), Some(77));
-    assert!(
-        missing.tripped().is_empty(),
-        "missing stable musl target reached the body: {}",
-        missing.tripped()
-    );
-    assert!(
-        missing.fact("toolchain_sysroot").is_none(),
-        "missing stable musl target was recorded as a valid sysroot"
+        assert_python3_isolated("compound", "command -v python3; python3 script.py").is_err(),
+        "a lookup must not exempt an unisolated execution on the same line"
     );
 }
 
@@ -2435,49 +2115,6 @@ fn release_root_with_a_real_tab_is_refused_before_creation() {
         "a real tab in the root path must refuse with 77: stderr={stderr:?}"
     );
     assert!(!root.exists(), "the tabbed root was created before refusal");
-}
-
-#[test]
-fn release_refuses_an_external_nightly_rust_src_symlink() {
-    // `-Z build-std=core` compiles the installed `rust-src` tree into the
-    // shipped eBPF object, so the tree is an effective input and is digested
-    // whole. An external symlink is outside the typed tree closure and must
-    // refuse; an internal symlink is covered by the positive case above.
-    let run = task11_run_to_the_sudo_probe(
-        &[],
-        Task11FixtureOptions {
-            external_rust_src_symlink: true,
-            ..Task11FixtureOptions::default()
-        },
-    );
-    let stderr = run.stderr();
-    assert_eq!(
-        run.output.status.code(),
-        Some(77),
-        "a symlinked rust-src tree must refuse: stderr={stderr:?}"
-    );
-    assert!(
-        run.fact("head").is_some(),
-        "the refusal must come from the ledger, after the source facts"
-    );
-    for absent in ["toolchain_nightly_rust_src", "tool_awk", "tool_bpf-linker"] {
-        assert!(
-            run.fact(absent).is_none(),
-            "an unbindable rust-src tree still published the {absent} ledger row"
-        );
-    }
-    assert_eq!(
-        run.tripped(),
-        "",
-        "the refusal ran past the ledger into the body probe"
-    );
-    let sealed_bin = run
-        .fact("sealed_bin")
-        .expect("the receipt records the sealed bin directory");
-    assert!(
-        !std::path::Path::new(sealed_bin).exists(),
-        "finalization left the sealed bin directory behind: {sealed_bin}"
-    );
 }
 
 #[test]
@@ -2523,7 +2160,7 @@ fn release_refuses_a_forged_seal_marker() {
     let forged_bin = campaign.path().join("forged-bin");
     fs::create_dir(&forged_bin).expect("create the forged sealed bin");
     fs::set_permissions(&forged_bin, fs::Permissions::from_mode(0o700)).unwrap();
-    for tool in TASK11_TOOL_INVENTORY {
+    for tool in task11_expected_values("tool_inventory") {
         let resolved = Command::new("/bin/sh")
             .arg("-c")
             .arg(format!("command -v {tool}"))
@@ -2573,25 +2210,27 @@ fn release_refuses_a_forged_seal_marker() {
 #[test]
 fn release_pins_its_reached_command_inventory_and_sealed_environment() {
     let release = read("scripts/build-release.sh");
+    let expected_inventory = task11_expected_values("tool_inventory");
+    let expected_environment = task11_expected_values("sealed_environment");
 
     let inventory: Vec<&str> = between(&release, "\nTASK4_TOOL_INVENTORY='", "'")
         .split_whitespace()
         .collect();
     assert_eq!(
-        inventory, TASK11_TOOL_INVENTORY,
+        inventory, expected_inventory,
         "the driver's reached-command inventory drifted from the contract"
     );
-    let mut ordered = TASK11_TOOL_INVENTORY.to_vec();
+    let mut ordered = expected_inventory.clone();
     ordered.sort_unstable();
     assert_eq!(
-        ordered, TASK11_TOOL_INVENTORY,
+        ordered, expected_inventory,
         "the inventory must stay in LC_ALL=C order: the seal compares it to `ls -A1` directly"
     );
     assert_eq!(
         between(&release, "\nTASK4_SEALED_ENVIRONMENT='", "'")
             .lines()
             .collect::<Vec<_>>(),
-        TASK11_SEALED_ENVIRONMENT,
+        expected_environment,
         "the driver's sealed-environment allowlist drifted from the contract"
     );
 
@@ -2941,6 +2580,143 @@ set -e
         "body signal authorized a reused SID: stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn subset_oracle_requires_independent_calls_and_clean_capture() {
+    run_ok(
+        "python3",
+        &[
+            "-I",
+            "tests/python/test_subset_oracle.py",
+            "SubsetOracleTests",
+        ],
+    );
+}
+
+#[test]
+fn native_helper_suite_recorded_launcher_requires_authenticated_generations_and_bounded_cleanup() {
+    run_native_python_suite(
+        "tests/python/test_root_recorded_launcher.py",
+        "RecordedLauncherTests",
+    );
+}
+
+#[test]
+fn owned_process_group_native_cases_preserve_bounded_authenticated_cleanup() {
+    let cases = ["OwnedProcessGroupTests"];
+    let mut args = vec!["-I", "tests/python/test_owned_process_group.py", "-v"];
+    args.extend(cases);
+    run_ok("python3", &args);
+}
+
+#[test]
+fn native_helper_suite_abi_routing_driver_preserves_runtime_ownership_and_failure_evidence() {
+    let shell = read("tests/shell/test_abi_routing_driver.sh");
+    assert!(
+        !shell.contains("test_prepared_abi_driver.py"),
+        "the ABI shell lifecycle suite must not embed the prepared ABI Python suite"
+    );
+    let _native_suite_guard = NATIVE_SUITE_GATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let output = run_ok(
+        "timeout",
+        &[
+            "--signal=TERM",
+            "--kill-after=2",
+            "40",
+            "sh",
+            "tests/shell/test_abi_routing_driver.sh",
+        ],
+    );
+    assert!(
+        output.lines().any(|line| {
+            line == "PASS: abi-routing production-path driver custody and launcher behavior"
+        }),
+        "the ABI shell lifecycle suite must emit its explicit PASS marker: {output}"
+    );
+}
+
+#[test]
+fn abi_routing_example_prepares_unowned_identity_before_either_attach() {
+    let attach = read("src/attach.rs");
+    let example = read("examples/abi-routing.rs");
+    assert_abi_routing_identity_contract(&attach, &example).unwrap();
+
+    let swallowed = attach.replacen(
+        "    prepare_identity(ebpf, &Scope::Pid(pid.get()), None)\n",
+        "    let _ = prepare_identity(ebpf, &Scope::Pid(pid.get()), None);\n    Ok(())\n",
+        1,
+    );
+    assert_ne!(attach, swallowed, "swallowed-error mutation must apply");
+    assert!(
+        assert_abi_routing_identity_contract(&swallowed, &example).is_err(),
+        "qualification identity wrapper must return preparation failures"
+    );
+
+    let preparation = "    p11scope::attach::prepare_qualification_identity(&mut ebpf, child_pid)\n        .context(\"preparing qualification identity maps\")?;\n";
+    let omitted = example.replacen(preparation, "", 1);
+    assert_ne!(example, omitted, "omitted-preparation mutation must apply");
+    assert!(
+        assert_abi_routing_identity_contract(&attach, &omitted).is_err(),
+        "ABI-routing must prepare identity maps"
+    );
+
+    let late = omitted.replacen(
+        "    runtime.entry_link = Some((spec.entry, entry_link));\n",
+        &format!("    runtime.entry_link = Some((spec.entry, entry_link));\n{preparation}"),
+        1,
+    );
+    assert_ne!(omitted, late, "late-preparation mutation must apply");
+    assert!(
+        assert_abi_routing_identity_contract(&attach, &late).is_err(),
+        "ABI-routing identity preparation must precede both attachments"
+    );
+}
+
+#[test]
+fn native_helper_suite_prepared_abi_driver_binds_admission_build_handoff_and_finalization() {
+    run_native_python_suite(
+        "tests/python/test_prepared_abi_driver.py",
+        "PreparedAbiDriverTests",
+    );
+}
+
+#[test]
+fn ia32_lifecycle_native_cases_preserve_owned_launch_and_cleanup() {
+    run_ok(
+        "python3",
+        &[
+            "-I",
+            "tests/python/test_ia32_lifecycle.py",
+            "Ia32LifecycleTests",
+        ],
+    );
+}
+
+#[test]
+fn oracle_lifecycle_uses_owned_bounded_cleanup_and_failure_receipts() {
+    run_ok(
+        "python3",
+        &[
+            "-I",
+            "tests/python/test_oracle_lifecycle.py",
+            "OracleLifecycleTests",
+        ],
+    );
+}
+
+#[test]
+fn user_process_session_snapshot_only_tolerates_initial_disappearance() {
+    run_ok(
+        "python3",
+        &[
+            "-I",
+            "tests/python/test_process_session_snapshot.py",
+            "ProcessSessionSnapshotTests",
+        ],
     );
 }
 
@@ -4637,13 +4413,28 @@ fn immutable_policy_maps() {
 /// `unsafe-unvalidated-metadata` the embedded object is the diagnostic one.
 #[test]
 fn frozen_policy_inventory_matches_embedded_object() {
+    if cfg!(feature = "unsafe-unvalidated-metadata") {
+        let parsed = aya_obj::Object::parse(p11scope::EBPF_OBJECT)
+            .expect("parse the embedded diagnostic object");
+        let btf = parsed.btf.expect("diagnostic global helpers require BTF");
+        assert!(
+            parsed.btf_ext.is_some(),
+            "diagnostic function info is missing"
+        );
+        for helper in ["p11_decode_params", "p11_walk_template"] {
+            btf.id_by_type_name_kind(helper, aya_obj::btf::BtfKind::Func)
+                .unwrap_or_else(|error| {
+                    panic!("missing diagnostic BTF function {helper}: {error}")
+                });
+        }
+    }
     let directory = tempfile::tempdir().expect("temporary inventory directory");
     let object = directory.path().join("p11scope-ebpf");
     fs::write(&object, p11scope::EBPF_OBJECT).expect("write embedded eBPF object");
     let (variant, maps, programs) = if cfg!(feature = "unsafe-unvalidated-metadata") {
-        ("diagnostic", 17, 17)
+        ("diagnostic", 23, 18)
     } else {
-        ("default", 16, 13)
+        ("default", 22, 13)
     };
     let report = run_ok(
         "python3",
@@ -4691,20 +4482,30 @@ fn frozen_policy_inventory_matches_embedded_object() {
 }
 
 #[test]
-fn descriptor_cookie_and_publication_source_guard_rejects_contract_regressions() {
+fn descriptor_cookie_and_consumers_source_guard_rejects_contract_regressions() {
     let attach = read("src/attach.rs");
     let ebpf = read("crates/ebpf/src/main.rs");
+    let owner = read("crates/ebpf/native/task_owner.c");
 
-    assert_static_descriptor_cookie_contract(&attach, &ebpf).unwrap();
-    assert_descriptor_publication_contract(&attach).unwrap();
-
+    assert_static_descriptor_cookie_contract(&attach, &ebpf, &owner).unwrap();
+    let skipped_start_retirement = owner.replacen(
+        "long rc = remove_start(ctl, owner, key);",
+        "long rc = 0;",
+        1,
+    );
+    assert!(
+        assert_static_descriptor_cookie_contract(&attach, &ebpf, &skipped_start_retirement)
+            .is_err(),
+        "the native START remover must call the ownership-aware retirement helper"
+    );
     let dropped_return_descriptor = attach.replacen(
         "cookie: Some(attach_cookie(slot.index, slot.descriptor_index)),",
         "cookie: Some(attach_cookie(slot.index, 0)),",
         1,
     );
     assert!(
-        assert_static_descriptor_cookie_contract(&dropped_return_descriptor, &ebpf).is_err(),
+        assert_static_descriptor_cookie_contract(&dropped_return_descriptor, &ebpf, &owner)
+            .is_err(),
         "the return attach site must carry the descriptor word"
     );
 
@@ -4714,130 +4515,93 @@ fn descriptor_cookie_and_publication_source_guard_rejects_contract_regressions()
         1,
     );
     assert!(
-        assert_static_descriptor_cookie_contract(&attach, &high_word_stats).is_err(),
+        assert_static_descriptor_cookie_contract(&attach, &high_word_stats, &owner).is_err(),
         "a slot consumer must not use the descriptor word"
     );
 
     let no_count_only_fallback =
         ebpf.replacen(".unwrap_or(SlotSemantics::COUNT_ONLY)", ".unwrap()", 1);
     assert!(
-        assert_static_descriptor_cookie_contract(&attach, &no_count_only_fallback).is_err(),
+        assert_static_descriptor_cookie_contract(&attach, &no_count_only_fallback, &owner).is_err(),
         "a missing descriptor must remain count-only"
     );
 
-    let template_second_high_word_slot = ebpf.replacen(
-        "let key = StartKey {\n        pid_tgid: helpers::bpf_get_current_pid_tgid(),\n        slot,\n        _pad: 0,\n    };\n    let Some(start) = START.get_ptr_mut(&key)",
-        "let key = StartKey {\n        pid_tgid: helpers::bpf_get_current_pid_tgid(),\n        slot: cookie_descriptor(cookie_of(&ctx)),\n        _pad: 0,\n    };\n    let Some(start) = START.get_ptr_mut(&key)",
+    let template_second_start = ebpf
+        .find("pub fn p11_entry_template_second(ctx: ProbeContext) -> u32 {")
+        .expect("template-second entry must exist");
+    let template_second_end = ebpf[template_second_start..]
+        .find("fn store_start(")
+        .map(|offset| template_second_start + offset)
+        .expect("template-second entry must end before store_start");
+    let template_second = &ebpf[template_second_start..template_second_end];
+    let low_word_slot = "        slot,\n        _pad: 0,";
+    assert_eq!(
+        template_second.matches(low_word_slot).count(),
+        1,
+        "the negative control must target exactly the template-second key"
+    );
+    let mutated_template_second = template_second.replacen(
+        low_word_slot,
+        "        slot: cookie_descriptor(cookie_of(&ctx)),\n        _pad: 0,",
         1,
     );
+    assert_ne!(
+        template_second, mutated_template_second,
+        "the template-second negative control must actually change the source"
+    );
+    let template_second_high_word_slot = format!(
+        "{}{}{}",
+        &ebpf[..template_second_start],
+        mutated_template_second,
+        &ebpf[template_second_end..]
+    );
     let bypassed_primary_semantics = ebpf.replacen(
-        "    let semantics = semantics_of(&ctx);\n    let mut start = CallStart {",
-        "    let semantics = SlotSemantics::COUNT_ONLY;\n    let mut start = CallStart {",
+        "    let semantics = semantics_of(&ctx);\n    let mut storage = MaybeUninit::<CallStart>::uninit();",
+        "    let semantics = SlotSemantics::COUNT_ONLY;\n    let mut storage = MaybeUninit::<CallStart>::uninit();",
         1,
     );
     assert_eq!(
         [
-            assert_static_descriptor_cookie_contract(&attach, &template_second_high_word_slot)
+            assert_static_descriptor_cookie_contract(
+                &attach,
+                &template_second_high_word_slot,
+                &owner,
+            )
+            .is_err(),
+            assert_static_descriptor_cookie_contract(&attach, &bypassed_primary_semantics, &owner,)
                 .is_err(),
-            assert_static_descriptor_cookie_contract(&attach, &bypassed_primary_semantics).is_err(),
         ],
         [true, true],
         "the template-tail slot and every descriptor consumer must use the shared cookie path"
     );
-
-    let partial_descriptor_write = attach.replacen(
-        "expected.iter().copied().enumerate()",
-        "expected.iter().copied().take(1).enumerate()",
-        1,
-    );
-    assert!(
-        assert_descriptor_publication_contract(&partial_descriptor_write).is_err(),
-        "publication must write every fixed descriptor"
-    );
-
-    let changed_readback_refusal = attach.replacen(
-        "if actual != expected {\n        bail!(\"DESCRIPTORS exact readback differs",
-        "if false {\n        bail!(\"DESCRIPTORS exact readback differs",
-        1,
-    );
-    assert!(
-        assert_descriptor_publication_contract(&changed_readback_refusal).is_err(),
-        "publication must refuse an inexact descriptor readback"
-    );
 }
 
 #[test]
-fn dynamic_task_newtask_offsets() {
-    let attach = read("src/attach.rs");
-    let common = read("crates/ebpf-common/src/lib.rs");
-    let ebpf = read("crates/ebpf/src/main.rs");
-    let fork = between(
-        &ebpf,
-        "pub fn task_newtask(ctx: TracePointContext)",
-        "#[panic_handler]",
-    );
-    assert_eq!(p11scope_ebpf_common::CFG_TASK_NEWTASK_OFFSETS, 1);
-    assert_eq!(embedded_map_definitions()["CONFIG"][3], 2);
-
-    for marker in [
-        "CFG_TASK_NEWTASK_PID_OFFSET",
-        "CFG_TASK_NEWTASK_CLONE_FLAGS_OFFSET",
-    ] {
-        assert!(
-            common.contains(marker),
-            "shared CONFIG contract misses {marker}"
-        );
-    }
-    for marker in [
-        "parse_task_newtask_format",
-        "pack_task_newtask_offsets",
-        "CFG_TASK_NEWTASK_OFFSETS",
-    ] {
-        assert!(
-            attach.contains(marker),
-            "CONFIG publication misses {marker}"
-        );
-    }
-    for marker in [
-        ".get(CFG_TASK_NEWTASK_OFFSETS)",
-        "CFG_TASK_NEWTASK_OFFSETS",
-        "unpack_task_newtask_offsets",
-    ] {
-        assert!(fork.contains(marker), "fork program misses {marker}");
-    }
-    for root in ["/sys/kernel/tracing", "/sys/kernel/debug/tracing"] {
-        assert!(attach.contains(&format!("{root}/events/task/task_newtask/format")));
-    }
-    assert!(attach.contains("read_task_newtask_format_with(|path| std::fs::read_to_string(path))"));
-    assert!(attach.contains("config.set(CFG_TASK_NEWTASK_OFFSETS"));
-    assert!(!fork.contains("read_at::<u32>(24)"));
-    assert!(!fork.contains("read_at::<u32>(44)"));
-    assert!(fork.contains("scope_auth()"));
-    assert!(fork.contains("FLAG_CGROUP_FILTER"));
-    assert!(fork.contains("read_at::<i32>"));
-    assert!(fork.contains("read_at::<u64>"));
-    assert!(fork.contains("classify_task_newtask"));
-    assert!(fork.find("classify_task_newtask").unwrap() < fork.find("EVENTS.reserve").unwrap());
+fn compiled_birth_and_interface_name_contracts() {
+    let directory = tempfile::tempdir().expect("temporary discovery-flow object");
+    let object = directory.path().join("p11scope-ebpf");
+    fs::write(&object, p11scope::EBPF_OBJECT).expect("write embedded eBPF object");
+    let variant = if cfg!(feature = "unsafe-unvalidated-metadata") {
+        "unsafe"
+    } else {
+        "default"
+    };
+    let output = Command::new("python3")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .args([
+            "-I",
+            "tests/python/test_discovery_flow_object.py",
+            "--object",
+        ])
+        .arg(&object)
+        .args(["--variant", variant])
+        .output()
+        .expect("execute compiled birth and interface-name contracts");
     assert!(
-        fork.contains(
-            ".and_then(unpack_task_newtask_offsets)\n    else {\n        return 0;\n    };"
-        )
-    );
-    assert!(
-        attach.find("crate::scope::publish(&mut ebpf").unwrap()
-            < attach
-                .find("publish_task_newtask_offsets(&mut ebpf)")
-                .unwrap()
-    );
-    assert!(
-        attach
-            .find("publish_task_newtask_offsets(&mut ebpf)")
-            .unwrap()
-            < attach.find("freeze_published_maps(&ebpf)").unwrap()
-    );
-    assert!(
-        attach.find("freeze_published_maps(&ebpf)").unwrap()
-            < attach.find(".attach(\"task\", \"task_newtask\")").unwrap()
+        output.status.success(),
+        "discovery-flow contracts: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
@@ -4870,8 +4634,8 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_owned_child_only() {
         );
     };
     let missing_second_slot_set = attach.replacen(
-        "tails.set(TAIL_CALLS_TEMPLATE_SECOND_SLOT, second_fd, 0)?;",
-        "tails.set(TAIL_CALLS_INTERFACE_WORKER_SLOT, second_fd, 0)?;",
+        "write(state, TAIL_CALLS_TEMPLATE_SECOND_SLOT)?;",
+        "write(state, TAIL_CALLS_INTERFACE_WORKER_SLOT)?;",
         1,
     );
     assert_rejects_attach_mutation(
@@ -4888,13 +4652,39 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_owned_child_only() {
         "TAIL_CALLS worker readback must be required",
     );
     let worker_attach = attach.replacen(
-        "let programs = expected_programs(object_has_unsafe);",
-        "let programs = expected_programs(object_has_unsafe);\n        let _ = ebpf.program_mut(\"interface_list_worker\").attach(...);",
+        "match attach(program, slot, slot_attach_point(slot))",
+        "match attach(\"interface_list_worker\", slot, slot_attach_point(slot))",
         1,
     );
     assert_rejects_attach_mutation(
         &worker_attach,
         "interface-list worker must not gain an attach site",
+    );
+    let benign_worker_comment = attach.replacen(
+        "fn attach_targets_with(",
+        "fn attach_targets_with(/* interface_list_worker remains unattached */",
+        1,
+    );
+    assert!(
+        assert_live_discovery_host_contract(
+            &benign_worker_comment,
+            &scope,
+            &events,
+            &hooks,
+            &engine,
+            &main,
+            &run,
+        )
+        .is_ok(),
+        "a benign worker comment must not count as an attachment"
+    );
+    let fd_mapping = "let fd = if slot == TAIL_CALLS_INTERFACE_WORKER_SLOT {\n                &worker_fd\n            } else {\n                &second.as_ref().expect(\"selected template-second program\").0\n            };";
+    let swapped_fd_mapping = "let fd = if slot == TAIL_CALLS_INTERFACE_WORKER_SLOT {\n                &second.as_ref().expect(\"selected template-second program\").0\n            } else {\n                &worker_fd\n            };";
+    let swapped_tail_fds = attach.replacen(fd_mapping, swapped_fd_mapping, 1);
+    assert_ne!(attach, swapped_tail_fds, "tail FD swap mutation must apply");
+    assert_rejects_attach_mutation(
+        &swapped_tail_fds,
+        "TAIL_CALLS fixed slots must retain their corresponding loaded FDs",
     );
 
     let public_run = library.replacen("pub(crate) mod run;", "pub mod run;", 1);
@@ -5014,7 +4804,9 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_owned_child_only() {
 #[test]
 fn live_discovery_bpf_classification_is_exact_and_output_only() {
     let source = read("crates/ebpf/src/main.rs");
+    let owner = read("crates/ebpf/native/task_owner.c");
     let engine = read("src/discovery/engine.rs");
+    assert_discovery_owner_seam(&source, &owner).unwrap();
     let classifier = between(
         &source,
         "fn classify_direct_interface(",
@@ -5069,7 +4861,7 @@ fn live_discovery_bpf_classification_is_exact_and_output_only() {
         "let active_count = count.min(u64::from(DISCOVERY_INTERFACES));",
         "if active_count == 0",
         "if state.arg0 == 0",
-        "checked_add((active_count - 1) * 24)",
+        "checked_add((active_count - 1) * layout.interface().stride as u64)",
         "interface_continuation_pack(count, 0, symbol_id)",
         "export_symbol_id(entry_key.attach_cookie)",
         "take_export_state(&ctx, scope.is_some())",
@@ -5101,11 +4893,11 @@ fn live_discovery_bpf_classification_is_exact_and_output_only() {
         "pid_tgid: helpers::bpf_get_current_pid_tgid()",
         "attach_cookie: 0",
         "interface_continuation_unpack(state.arg1)",
-        "DISCOVERY_STATE.get(&key)",
+        "owned_discovery_get(&key, true)",
         "DISCOVERY_INTERFACES",
         "(u64::from(symbol_id) << 32)",
         "if active_count == 0",
-        "u64::from(interface_index).checked_mul(24)",
+        "checked_mul(layout.interface().stride as u64)",
         "interface_continuation_next(state.arg1)",
         "BPF_EXIST",
         "TAIL_CALLS.tail_call(&ctx, TAIL_CALLS_INTERFACE_WORKER_SLOT)",
@@ -5129,6 +4921,8 @@ fn live_discovery_bpf_classification_is_exact_and_output_only() {
 fn selection_transport_never_carries_name_bytes() {
     let common = read("crates/ebpf-common/src/lib.rs");
     let source = read("crates/ebpf/src/main.rs");
+    let owner = read("crates/ebpf/native/task_owner.c");
+    assert_discovery_owner_seam(&source, &owner).unwrap();
     for marker in [
         "pub return_rv: u64",
         "pub request_flags: u64",
@@ -5149,7 +4943,7 @@ fn selection_transport_never_carries_name_bytes() {
     for marker in [
         "classify_selection_name",
         "classify_selection_version",
-        "ctx.arg::<u64>(3)",
+        "arg_u64(&ctx, 3, layout)",
         "insert_selection_state",
     ] {
         assert!(entry.contains(marker), "selection entry misses {marker}");
@@ -5158,7 +4952,7 @@ fn selection_transport_never_carries_name_bytes() {
         .find("scope_auth()")
         .expect("selection entry must gate before reading arguments");
     let first_arg = entry
-        .find("ctx.arg::<u64>")
+        .find("arg_u64(&ctx")
         .expect("selection entry must retain only classified scalar arguments");
     assert!(
         gate < first_arg,
@@ -5171,17 +4965,22 @@ fn selection_transport_never_carries_name_bytes() {
         aggregate < first_arg,
         "aggregate policy must precede argument reads"
     );
+    let discovery_initializer = between(
+        &source,
+        "// TASK5_DISCOVERY_INITIALIZER_BEGIN",
+        "// TASK5_DISCOVERY_INITIALIZER_END",
+    );
     assert_eq!(
-        source
+        discovery_initializer
             .matches("core::ptr::write_volatile(words.add(")
             .count(),
         115,
         "the record initializer must use exactly 115 ordered stores"
     );
     assert!(!entry.contains("arg3:"));
-    assert!(entry.contains("arg0: ctx.arg::<u64>(2)"));
+    assert!(entry.contains("arg0: pp_interface"));
     assert!(entry.contains("arg1: selection_request_word"));
-    assert!(entry.contains("arg2: ctx.arg::<u64>(3)"));
+    assert!(entry.contains("arg2: flags"));
     assert!(!entry.contains("bpf_probe_read_user_str"));
     assert!(!entry.contains("name_ptr"));
     let returned = between(
@@ -5197,10 +4996,25 @@ fn selection_transport_never_carries_name_bytes() {
     }
     assert!(returned.contains("classify_indirect_interface"));
     assert!(returned.contains("if rv != 0"));
-    assert!(
-        returned.find("FLAG_POLICY_AGGREGATE").unwrap()
-            < returned.find("take_selection_state").unwrap()
-    );
+    let unscoped_cleanup = returned
+        .find("take_selection_state(&ctx, false)")
+        .expect("out-of-scope return must remove owned selection state");
+    let abi_cleanup = returned
+        .find("discard_export_state(&key)")
+        .expect("unknown-ABI return must remove owned selection state");
+    let aggregate = returned
+        .find("FLAG_POLICY_AGGREGATE")
+        .expect("selection return must gate aggregate policy");
+    let accepted_take = returned
+        .find("let Some((key, state)) = take_selection_state(&ctx, scope.is_some())")
+        .expect("accepted selection return must take its paired state");
+    assert!(unscoped_cleanup < abi_cleanup && abi_cleanup < aggregate);
+    assert!(aggregate < accepted_take);
+    let aggregate_gate = &returned[aggregate..accepted_take];
+    assert!(aggregate_gate.contains("return 0;"));
+    assert!(!aggregate_gate.contains("classify_indirect_interface"));
+    assert!(!aggregate_gate.contains("bpf_probe_read_user"));
+    assert!(!aggregate_gate.contains("take_selection_state"));
     assert!(returned.contains("let scope = scope_auth();"));
     assert!(returned.contains("take_selection_state(&ctx, scope.is_some())"));
     assert!(returned.contains("let Some(scope) = scope else"));
@@ -5214,14 +5028,34 @@ fn selection_transport_never_carries_name_bytes() {
         "fn take_selection_state(",
     );
     assert!(insertion.contains("BPF_NOEXIST"));
-    assert!(insertion.contains("DISCOVERY_STATE.remove(&key)"));
+    assert!(insertion.contains("owned_discovery_insert(&key, &state"));
     assert!(insertion.contains("DISCOVERY_COUNTER_EXPORT_STATE_FAILURES"));
+    let take = between(
+        &source,
+        "fn take_selection_state(",
+        "#[uprobe]\npub fn function_list_entry",
+    );
+    assert!(take.contains("owned_discovery_get(&key, false)"));
+    assert!(take.contains("owned_discovery_remove(&key, state_present)"));
+    let unindexed_collision = owner.replacen(
+        "            poison(ctl, OWNER_BOOKKEEPING_FAILED);\n        release_empty(ctl, owner);",
+        "            count(&ctl->admission_failures);\n        release_empty(ctl, owner);",
+        1,
+    );
+    assert_ne!(
+        owner, unindexed_collision,
+        "unindexed collision poison mutation must apply"
+    );
+    assert!(
+        assert_discovery_owner_seam(&source, &unindexed_collision).is_err(),
+        "an unindexed numeric collision must still poison the owner"
+    );
     let indirect = between(
         &source,
         "fn classify_indirect_interface(",
         "#[inline(never)]\nfn emit_export(",
     );
-    assert!(indirect.contains("address as *const u64"));
+    assert!(indirect.contains("read_word(address, layout)"));
     assert!(indirect.contains("classify_direct_interface"));
     let selection_key = between(
         &source,
@@ -5279,6 +5113,509 @@ fn selection_transport_never_carries_name_bytes() {
         let consumer = read(path);
         assert!(!consumer.contains("request_flags"));
         assert!(!consumer.contains("binding_id"));
+    }
+}
+
+#[test]
+fn image_identity_native_control_refuses_invalid_and_exhausted_tickets() {
+    let directory = tempfile::tempdir().expect("temporary native identity test");
+    let binary = directory.path().join("helper-tests");
+    let compile = Command::new("clang-18")
+        .args([
+            "-O2",
+            "-g",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Wno-unknown-attributes",
+            "-I",
+            "crates/ebpf/native",
+            "tests/fixtures/image-identity/helper_tests.c",
+            "-o",
+        ])
+        .arg(&binary)
+        .output()
+        .expect("execute clang-18 for native identity regression");
+    assert!(
+        compile.status.success(),
+        "native compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(binary)
+        .output()
+        .expect("execute native identity regression");
+    assert!(
+        run.status.success(),
+        "native identity regression failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+#[test]
+fn call_start_initializer_is_straight_line_and_caller_owned() {
+    let source = read("crates/ebpf/src/main.rs");
+    assert!(source.contains("#[inline(always)]\nfn record_aggregate_start("));
+    let initializer = between(
+        &source,
+        "// CALL_START_INITIALIZER_BEGIN",
+        "// CALL_START_INITIALIZER_END",
+    );
+    assert_eq!(
+        initializer
+            .matches("core::ptr::write_volatile(words.add(")
+            .count(),
+        36,
+        "CallStart's full 288 bytes need 36 explicit qword stores"
+    );
+    assert!(
+        !initializer.contains("for "),
+        "initializer must stay loop-free"
+    );
+    for index in 0..36 {
+        assert!(
+            initializer.contains(&format!(
+                "core::ptr::write_volatile(words.add({index}), 0u64);"
+            )),
+            "initializer misses qword {index}"
+        );
+    }
+
+    let aggregate = between(
+        &source,
+        "fn record_aggregate_start(",
+        "#[inline(always)]\nfn p11_entry_impl",
+    );
+    let normal = between(
+        &source,
+        "fn p11_entry_impl<",
+        "#[uretprobe]\npub fn p11_return",
+    );
+    for caller in [aggregate, normal] {
+        assert!(caller.contains("MaybeUninit::<CallStart>::uninit()"));
+        assert!(caller.contains("zero_call_start(&mut storage)"));
+        assert!(caller.contains("storage.assume_init_mut()"));
+        assert!(!caller.contains("CallStart::default()"));
+        assert!(!caller.contains("let mut start = CallStart {"));
+    }
+    for default in [
+        "start.session = SESSION_NONE;",
+        "start.mechanism = MECH_NONE;",
+        "start.user_type = USER_TYPE_NONE;",
+        "start.target_function = FUNCTION_NONE;",
+        "start.capture = capture::MECHANISM_NONE | capture::OUTPUT_NONE;",
+    ] {
+        assert!(normal.contains(default), "normal start misses {default}");
+        assert!(
+            !aggregate.contains(default),
+            "aggregate start gained {default}"
+        );
+    }
+}
+
+#[test]
+fn decode_params_narrows_output_and_reports_failure_once() {
+    let source = read("crates/ebpf/src/main.rs");
+    let output_definition = between(
+        &source,
+        "struct ParamsOutput {",
+        "const PARAMS_DECODE_FAILURE: u32",
+    );
+    for field in ["p0: u64", "p1: u64", "p2: u64"] {
+        assert_eq!(output_definition.matches(field).count(), 1);
+    }
+    assert!(source.contains("const _: [(); 24] = [(); core::mem::size_of::<ParamsOutput>()];"));
+    assert!(
+        source.contains("core::mem::align_of::<ParamsOutput>() == core::mem::align_of::<u64>()")
+    );
+    for assertion in [
+        "core::mem::offset_of!(ParamsOutput, p0) == 0",
+        "core::mem::offset_of!(ParamsOutput, p1) == 8",
+        "core::mem::offset_of!(ParamsOutput, p2) == 16",
+        "core::mem::offset_of!(CallStart, p1) == core::mem::offset_of!(CallStart, p0) + 8",
+        "core::mem::offset_of!(CallStart, p2) == core::mem::offset_of!(CallStart, p0) + 16",
+    ] {
+        assert!(
+            source.contains(assertion),
+            "missing layout assertion: {assertion}"
+        );
+    }
+    assert!(source.contains("const PARAMS_DECODE_FAILURE: u32 = u32::MAX;"));
+
+    let dispatcher = between(
+        &source,
+        "pub unsafe extern \"C\" fn p11_decode_params(",
+        "fn decode_params_impl<",
+    );
+    let exported_decoder = between(
+        &source,
+        "const PARAMS_DECODE_FAILURE: u32",
+        "pub unsafe extern \"C\" fn p11_decode_params(",
+    );
+    assert_eq!(exported_decoder.matches("#[unsafe(no_mangle)]").count(), 1);
+    assert_eq!(exported_decoder.matches("#[inline(never)]").count(), 1);
+    assert!(dispatcher.contains("word_bytes: u32,"));
+    assert!(dispatcher.contains("output: *mut ParamsOutput,"));
+    assert!(!dispatcher.contains("*mut CallStart"));
+    assert!(dispatcher.contains(") -> u32 {"));
+    let null_guard = dispatcher.find("if output.is_null()").unwrap();
+    let width_guard = dispatcher.find("let is_ilp32 = match word_bytes").unwrap();
+    let reference = dispatcher
+        .find("let output = unsafe { &mut *output };")
+        .unwrap();
+    let first_read = dispatcher.find("decode_params_impl::<true>").unwrap();
+    assert!(null_guard < width_guard && width_guard < reference && reference < first_read);
+    assert!(dispatcher.contains("4 => true,"));
+    assert!(dispatcher.contains("8 => false,"));
+    assert!(dispatcher[null_guard..width_guard].contains("PARAMS_DECODE_FAILURE"));
+    assert!(dispatcher[width_guard..reference].contains("PARAMS_DECODE_FAILURE"));
+    assert!(dispatcher.contains("decode_params_impl::<true>(pmech, sh, output)"));
+    assert!(dispatcher.contains("decode_params_impl::<false>(pmech, sh, output)"));
+
+    let decoder = between(
+        &source,
+        "fn decode_params_impl<",
+        "/// Walk at most `MAX_ATTRS` entries",
+    );
+    assert!(source.contains(
+        "#[cfg(feature = \"unsafe-unvalidated-metadata\")]\n#[inline(never)]\nfn decode_params_impl<"
+    ));
+    assert!(decoder.contains("const IS_ILP32: bool"));
+    assert!(!decoder.contains("layout: LinuxLayout"));
+    assert!(
+        decoder.contains("output: &mut ParamsOutput,")
+            || decoder.contains("output: &mut ParamsOutput)")
+    );
+    assert!(decoder.contains(") -> u32 {"));
+    assert!(decoder.contains(
+        "let layout = if IS_ILP32 {\n        LinuxLayout::Ilp32\n    } else {\n        LinuxLayout::Lp64\n    };"
+    ));
+    assert!(!decoder.contains("capture_failure("));
+    assert!(!decoder.contains("start."));
+    assert!(decoder.contains("_ => return shape::NONE,"));
+    assert!(decoder.contains("if pparam == 0 {\n        return shape::NONE;"));
+    assert!(decoder.matches("PARAMS_DECODE_FAILURE").count() >= 6);
+    for read in [
+        "let r0 = read_word(a0, layout);",
+        "let r1 = read_word(a1, layout);",
+        "let r2 = read_word(a2, layout);",
+    ] {
+        assert_eq!(
+            decoder.matches(read).count(),
+            1,
+            "decoder must retain {read}"
+        );
+    }
+    assert!(
+        decoder.find("let r0 = read_word(a0, layout);").unwrap()
+            < decoder.find("let r1 = read_word(a1, layout);").unwrap()
+    );
+    assert!(
+        decoder.find("let r1 = read_word(a1, layout);").unwrap()
+            < decoder.find("let r2 = read_word(a2, layout);").unwrap()
+    );
+    let final_read = decoder.find("let r2 = read_word(a2, layout);").unwrap();
+    for write in ["output.p0 = a;", "output.p1 = b;", "output.p2 = c;"] {
+        assert_eq!(decoder.matches(write).count(), 1);
+        assert!(final_read < decoder.find(write).unwrap());
+    }
+    assert!(decoder.find("output.p0 = a;").unwrap() < decoder.find("output.p1 = b;").unwrap());
+    assert!(decoder.find("output.p1 = b;").unwrap() < decoder.find("output.p2 = c;").unwrap());
+    assert!(decoder.contains("output.p2 = c;\n        out_shape"));
+
+    let caller = between(
+        &source,
+        "let parameter_shape = unsafe { MECH_SHAPE.get(&mechanism) }",
+        "if semantics.output_arg != ARG_NONE",
+    );
+    let decode_call = caller
+        .split_once("                        Err(_) => {")
+        .expect("mechanism read failure branch must follow parameter decoding")
+        .0;
+    assert_eq!(decode_call.matches("p11_decode_params(").count(), 1);
+    assert!(decode_call.contains("layout.word_bytes() as u32"));
+    assert!(decode_call.contains("(start as *mut CallStart)"));
+    assert!(decode_call.contains(".add(core::mem::offset_of!(CallStart, p0))"));
+    assert!(decode_call.contains(".cast::<ParamsOutput>()"));
+    assert!(!decode_call.contains("&mut start.p0"));
+    assert!(!decode_call.contains("MaybeUninit::<ParamsOutput>"));
+    assert!(decode_call.contains("let decoded_shape = unsafe {"));
+    assert!(decode_call.contains("shape::RSA_PKCS_PSS | shape::GCM_V220 | shape::GCM_V240 => {"));
+    assert!(decode_call.contains("start.shape = decoded_shape;"));
+    assert!(decode_call.contains("shape::NONE => {}"));
+    assert!(decode_call.contains("_ => capture_failure(start),"));
+    assert_eq!(decode_call.matches("capture_failure(start)").count(), 1);
+}
+
+#[test]
+fn async_key_initialization_and_copy_are_fixed_and_guarded() {
+    let source = read("crates/ebpf/src/main.rs");
+    assert!(source.contains("const _: [(); 32] = [(); core::mem::size_of::<FunctionNameKey>()];"));
+    assert!(
+        source.contains("const _: () = assert!(core::mem::align_of::<FunctionNameKey>() >= 4);")
+    );
+    let initializer = between(
+        &source,
+        "// ASYNC_KEY_INITIALIZER_BEGIN",
+        "// ASYNC_KEY_INITIALIZER_END",
+    );
+    assert_eq!(
+        initializer
+            .matches("core::ptr::write_volatile(words.add(")
+            .count(),
+        8
+    );
+    assert!(!initializer.contains("for "));
+    for index in 0..8 {
+        assert!(initializer.contains(&format!(
+            "core::ptr::write_volatile(words.add({index}), 0u32);"
+        )));
+    }
+
+    let capture = between(
+        &source,
+        "fn capture_async_target(",
+        "#[uprobe]\npub fn p11_entry",
+    );
+    assert!(source.contains("fn capture_async_target(pointer: u64, start: &mut CallStart)"));
+    assert!(!capture.contains("capture_scalar("));
+    assert_eq!(capture.matches("bpf_probe_read_user_str(").count(), 1);
+    assert!(capture.contains("(FUNCTION_NAME_MAX_BYTES + 2) as u32"));
+    assert!(capture.contains("read <= 0 || read > (FUNCTION_NAME_MAX_BYTES + 1) as _"));
+    assert!(capture.contains("let len = (read - 1) as usize;"));
+    assert!(capture.contains("MaybeUninit::<FunctionNameKey>::uninit()"));
+    assert!(capture.contains("zero_function_name_key(&mut key_storage);"));
+    assert!(capture.contains("key_storage.assume_init_mut()"));
+    assert!(capture.contains("key.len = len as u32;"));
+    assert!(capture.contains("if $offset < len"));
+    assert!(capture.contains("core::ptr::read_volatile(name.add($offset))"));
+    assert!(
+        capture.contains("core::ptr::write_volatile(key.bytes.as_mut_ptr().add($offset), byte)")
+    );
+    assert!(!capture.contains("FunctionNameKey::default()"));
+    assert!(!capture.contains("for offset in"));
+    assert_eq!(capture.matches("copy_name_byte!(").count(), 27);
+    for offset in 0..27 {
+        assert!(capture.contains(&format!("copy_name_byte!({offset});")));
+    }
+    assert!(capture.contains("ASYNC_FUNCTIONS.get(key)"));
+    assert!(capture.contains("Some(id) => start.target_function = id"));
+    assert!(capture.contains("None => capture_failure(start)"));
+}
+
+#[test]
+fn template_walker_uses_narrow_global_output_and_preserves_read_policy() {
+    let source = read("crates/ebpf/src/main.rs");
+    let output = between(
+        &source,
+        "struct TemplateOutput {",
+        "const TEMPLATE_WALK_FAILURE: u32",
+    );
+    for field in [
+        "types: [u64; MAX_ATTRS]",
+        "count: u32",
+        "total: u32",
+        "bools: u32",
+        "seen: u32",
+    ] {
+        assert_eq!(
+            output.matches(field).count(),
+            1,
+            "missing output field {field}"
+        );
+    }
+    for layout in [
+        "size_of::<TemplateOutput>() == 80",
+        "align_of::<TemplateOutput>() == core::mem::align_of::<u64>()",
+        "offset_of!(TemplateOutput, types) == 0",
+        "offset_of!(TemplateOutput, count) == 64",
+        "offset_of!(TemplateOutput, total) == 68",
+        "offset_of!(TemplateOutput, bools) == 72",
+        "offset_of!(TemplateOutput, seen) == 76",
+        "offset_of!(CallStart, attr_types) == 96",
+        "offset_of!(CallStart, attr_types1) == 176",
+        "offset_of!(CallStart, capture) == 256",
+    ] {
+        assert!(source.contains(layout), "missing layout guard {layout}");
+    }
+
+    let exported = between(
+        &source,
+        "pub unsafe extern \"C\" fn p11_walk_template(",
+        "fn walk_template<const TYPES_ONLY: bool, const SECOND: bool>(",
+    );
+    assert!(exported.contains("word_bytes: u32,"));
+    assert!(exported.contains("output: *mut TemplateOutput,"));
+    let null = exported.find("if output.is_null()").unwrap();
+    let width = exported.find("let is_ilp32 = match word_bytes").unwrap();
+    let reference = exported
+        .find("let output = unsafe { &mut *output };")
+        .unwrap();
+    let dispatch = exported.find("walk_template_impl::<true>").unwrap();
+    assert!(null < width && width < reference && reference < dispatch);
+    assert!(exported.contains("walk_template_impl::<false>"));
+
+    let adapter = between(
+        &source,
+        "fn walk_template<const TYPES_ONLY: bool, const SECOND: bool>(",
+        "fn walk_template_types<",
+    );
+    assert!(adapter.contains("assert!(!TYPES_ONLY || !SECOND)"));
+    let types_branch = adapter.find("if TYPES_ONLY {").unwrap();
+    let projection = adapter.find("(start as *mut CallStart)").unwrap();
+    assert!(types_branch < projection);
+    assert!(adapter.contains("walk_template_types::<true>(ptemplate, count, start)"));
+    assert!(adapter.contains("walk_template_types::<false>(ptemplate, count, start)"));
+    assert!(adapter[..projection].contains("return;"));
+    assert!(adapter.contains("(start as *mut CallStart)"));
+    assert!(adapter.contains("offset_of!(CallStart, attr_types1)"));
+    assert!(adapter.contains("offset_of!(CallStart, attr_types)"));
+    assert!(adapter.contains(".cast::<TemplateOutput>()"));
+    assert!(!adapter.contains("MaybeUninit::<TemplateOutput>"));
+    assert!(!adapter.contains("&mut start.attr_types"));
+    assert!(adapter.contains("p11_walk_template("));
+    assert_eq!(adapter.matches("capture_failure(start)").count(), 1);
+
+    let types = between(&source, "fn walk_template_types<", "fn walk_template_impl<");
+    assert!(types.contains("const IS_ILP32: bool"));
+    assert!(types.contains("start: &mut CallStart"));
+    assert!(types.contains("start.attr_total = total;"));
+    assert!(types.contains("start.attr_types[i] = attr_type;"));
+    assert!(types.contains("start.attr_count += 1;"));
+    assert_eq!(types.matches("capture_failure(start);").count(), 2);
+    assert_eq!(types.matches("break;").count(), 3);
+    for forbidden in [
+        "TemplateOutput",
+        "ATTR_BOOL_BITS",
+        "read_word_pair",
+        "pvalue",
+        "len != 1",
+        "attr_bools",
+    ] {
+        assert!(
+            !types.contains(forbidden),
+            "types-only helper gained {forbidden}"
+        );
+    }
+    let types_read = types
+        .find("let Ok(attr_type) = read_word(base, layout)")
+        .unwrap();
+    let types_write = types.find("start.attr_types[i] = attr_type;").unwrap();
+    let types_count = types.find("start.attr_count += 1;").unwrap();
+    assert!(types_read < types_write && types_write < types_count);
+
+    let implementation = between(&source, "fn walk_template_impl<", "fn arg_u64(");
+    assert!(source.contains(
+        "#[cfg(feature = \"unsafe-unvalidated-metadata\")]\n#[inline(never)]\nfn walk_template_impl<"
+    ));
+    assert!(implementation.contains("const IS_ILP32: bool"));
+    assert!(!implementation.contains("const TYPES_ONLY"));
+    assert!(!implementation.contains("const SECOND"));
+    assert!(!implementation.contains("layout: LinuxLayout"));
+    assert!(implementation.contains("output: &mut TemplateOutput"));
+    assert!(implementation.contains(") -> u32"));
+    assert!(implementation.contains(
+        "let layout = if IS_ILP32 {\n        LinuxLayout::Ilp32\n    } else {\n        LinuxLayout::Lp64\n    };"
+    ));
+    assert_eq!(implementation.matches("for i in 0..MAX_ATTRS").count(), 1);
+    assert!(!implementation.contains("if TYPES_ONLY"));
+    for marker in [
+        "let total = count.min(u32::MAX as u64) as u32;",
+        "output.total = total;",
+        "let width = layout.word_bytes() as u64;",
+        "ptemplate.checked_add((i as u64) * width * 3)",
+        "let Ok(t) = read_word(base, layout)",
+        "output.types[i] = attr_type;",
+        "output.count += 1;",
+        "if attr_type > u32::MAX as u64",
+        "ATTR_BOOL_BITS.get(&bool_type)",
+        "let Ok([pvalue, len]) = read_word_pair(value_addr, layout)",
+        "if len != 1",
+        "bpf_probe_read_user(pvalue as *const u8)",
+        "output.seen |= mask;",
+        "output.bools |= mask;",
+    ] {
+        assert!(implementation.contains(marker), "walker misses {marker}");
+    }
+    assert_eq!(
+        implementation
+            .matches("return TEMPLATE_WALK_FAILURE;")
+            .count(),
+        5
+    );
+    assert!(!implementation.contains("capture_failure("));
+    assert!(implementation.trim_end().ends_with("0\n}"));
+    let type_read = implementation
+        .find("let Ok(t) = read_word(base, layout)")
+        .unwrap();
+    let type_write = implementation.find("output.types[i] = attr_type;").unwrap();
+    let count_write = implementation.find("output.count += 1;").unwrap();
+    let high_bit = implementation
+        .find("if attr_type > u32::MAX as u64")
+        .unwrap();
+    assert!(type_read < type_write && type_write < count_write && count_write < high_bit);
+    assert!(
+        high_bit
+            < implementation
+                .find("ATTR_BOOL_BITS.get(&bool_type)")
+                .unwrap()
+    );
+    assert!(
+        implementation
+            .find("ATTR_BOOL_BITS.get(&bool_type)")
+            .unwrap()
+            < implementation
+                .find("let Ok([pvalue, len]) = read_word_pair(value_addr, layout)")
+                .unwrap()
+    );
+    assert!(
+        implementation
+            .find("let Ok([pvalue, len]) = read_word_pair(value_addr, layout)")
+            .unwrap()
+            < implementation.find("if len != 1").unwrap()
+    );
+    assert!(
+        implementation.find("if len != 1").unwrap()
+            < implementation
+                .find("bpf_probe_read_user(pvalue as *const u8)")
+                .unwrap()
+    );
+}
+
+#[test]
+fn failed_export_arguments_invalidate_older_pairing_state() {
+    let source = read("crates/ebpf/src/main.rs");
+    for (start, end, key) in [
+        (
+            "pub fn function_list_entry(ctx: ProbeContext) -> u32 {",
+            "#[uretprobe]\npub fn function_list_return",
+            "export_state_key(&ctx)",
+        ),
+        (
+            "pub fn interface_list_entry(ctx: ProbeContext) -> u32 {",
+            "#[uretprobe]\npub fn interface_list_return",
+            "export_state_key(&ctx)",
+        ),
+        (
+            "pub fn interface_entry(ctx: ProbeContext) -> u32 {",
+            "#[uretprobe]\npub fn interface_return",
+            "selection_state_key(&ctx)",
+        ),
+    ] {
+        let entry = between(&source, start, end);
+        let last_argument = entry.rfind("arg_u64(&ctx").expect("target argument read");
+        let cleanup = entry[last_argument..]
+            .find("discard_export_state(&key)")
+            .map(|offset| last_argument + offset)
+            .expect("argument failure must discard an older pairing");
+        let counter = entry[last_argument..]
+            .find("DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES")
+            .map(|offset| last_argument + offset)
+            .expect("argument failure must remain disclosed");
+        assert!(entry[last_argument..cleanup].contains(key));
+        assert!(
+            cleanup < counter,
+            "pairing cleanup must precede the refusal counter"
+        );
     }
 }
 
@@ -5429,33 +5766,6 @@ fn live_discovery_checker_rejects_mutations_and_noncanonical_source() {
 }
 
 #[test]
-fn descriptors_are_published_read_back_and_frozen_before_probe_attachment() {
-    let source = read("src/attach.rs");
-    let publish = source
-        .find("publish_descriptors(&mut ebpf)")
-        .expect("Session must publish descriptors");
-    let deferred_freeze = source
-        .find("if !defers_freeze_until_loaded(name, &meta) || name == TAIL_POLICY_MAP")
-        .expect("Session must freeze the deferred maps");
-    let tail_publication = source
-        .find("publish_and_freeze_tail_calls(&mut ebpf, unsafe_enabled)")
-        .expect("Session must publish and freeze TAIL_CALLS");
-    let fork_attach = source
-        .find(".attach(\"task\", \"task_newtask\")")
-        .expect("Session must attach the fork probe");
-    let uprobe_attach = source
-        .find("prog.attach(point")
-        .expect("Session must attach uprobes");
-    assert_descriptor_publication_contract(&source).unwrap();
-    assert!(publish < deferred_freeze);
-    assert!(deferred_freeze < tail_publication);
-    assert!(deferred_freeze < fork_attach);
-    assert!(deferred_freeze < uprobe_attach);
-    assert!(tail_publication < fork_attach);
-    assert!(tail_publication < uprobe_attach);
-}
-
-#[test]
 fn policy_specific_ebpf() {
     const KEY_SIZE: usize = 1;
     let definitions = embedded_map_definitions();
@@ -5483,9 +5793,219 @@ fn policy_specific_ebpf() {
     }
 }
 
+/// Assert a Python `unittest` suite ran clean, without pinning an exact count.
+///
+/// Pinning `Ran N tests` made every *added* case a build break, which punished
+/// the one change a suite should always welcome, and the bump that followed
+/// carried no information. The contract those assertions were reaching for is
+/// narrower: coverage must never silently shrink, and no case may be skipped or
+/// tolerated. So require the named class, a run of at least the cases the suite
+/// had when its floor was recorded, and `unittest`'s own bare `OK` verdict — a
+/// qualified `OK (skipped=1)`, `OK (expected failures=1)` or any `FAILED (...)`
+/// is not clean. Adding a case passes; deleting one below the floor does not.
+fn assert_clean_python_suite(report: &str, class: &str, floor: usize) {
+    assert!(report.contains(class), "{class} did not run: {report}");
+    // The verdict line, not the last line: suites may print after unittest does.
+    let mut verdict = None;
+    let mut offset = 0;
+    for raw in report.split_inclusive('\n') {
+        let line = raw.trim();
+        if line == "OK" || line.starts_with("OK (") || line.starts_with("FAILED") {
+            verdict = Some((offset, line));
+        }
+        offset += raw.len();
+    }
+    let (verdict_at, verdict) =
+        verdict.unwrap_or_else(|| panic!("no unittest verdict for {class}: {report}"));
+    // The count of that verdict's own summary, which `unittest` prints just
+    // before it. Taking the last match in the whole report would let a stale
+    // count in trailing chatter decide the floor, in either direction.
+    let ran = report[..verdict_at]
+        .match_indices("Ran ")
+        .filter_map(|(at, _)| report[at + "Ran ".len()..].split_once(" test"))
+        .filter_map(|(count, _)| count.parse::<usize>().ok())
+        // `MatchIndices` is not double-ended, so take the last by reduction.
+        .reduce(|_, last| last)
+        .unwrap_or_else(|| panic!("no unittest summary for {class}: {report}"));
+    assert!(
+        ran >= floor,
+        "{class} coverage shrank below its recorded floor: ran {ran}, floor {floor}: {report}"
+    );
+    assert_eq!(
+        verdict, "OK",
+        "{class} must finish on a clean OK, with no skipped, expected-failure or \
+         unexpected-success case: {report}"
+    );
+}
+
+/// The suite gate is itself a contract, so prove both directions rather than
+/// trusting it: a grown suite passes, and every way coverage can quietly go
+/// missing fails.
+#[test]
+fn clean_python_suite_gate_accepts_growth_and_refuses_loss() {
+    let clean = "test_one (__main__.ExampleTests.test_one) ... ok\n\
+                 ----\nRan 12 tests in 0.4s\n\nOK\n";
+    assert_clean_python_suite(clean, "ExampleTests", 12);
+    // Added cases are the change a suite should welcome, not a build break.
+    assert_clean_python_suite(
+        &clean.replace("Ran 12 tests", "Ran 13 tests"),
+        "ExampleTests",
+        12,
+    );
+    // Trailing chatter after unittest's verdict must not hide it, and a count
+    // inside that chatter is not this verdict's summary in either direction.
+    assert_clean_python_suite(
+        &format!("{clean}observer pid 55: dumped 6 owned maps\n"),
+        "ExampleTests",
+        12,
+    );
+    assert_clean_python_suite(
+        &format!("{clean}replaying: Ran 11 tests in 0.1s\n"),
+        "ExampleTests",
+        12,
+    );
+    // No panic-hook swap: the hook is process-global while tests run in parallel,
+    // and restoring it after the assertions would leave it silenced for the rest
+    // of the binary on exactly the failure this test exists to report. The other
+    // `catch_unwind` sites in this file take the same expected-panic noise.
+    let mut accepted = Vec::new();
+    for (report, reason) in [
+        (
+            clean.replace("Ran 12 tests", "Ran 11 tests"),
+            "deleted case",
+        ),
+        (
+            clean.replace("\nOK\n", "\nOK (skipped=1)\n"),
+            "skipped case",
+        ),
+        (
+            clean.replace("\nOK\n", "\nOK (expected failures=1)\n"),
+            "tolerated failure",
+        ),
+        (
+            clean.replace("\nOK\n", "\nFAILED (failures=1)\n"),
+            "failing case",
+        ),
+        (clean.replace("ExampleTests", "OtherTests"), "wrong suite"),
+        (clean.replace("Ran 12 tests", "no summary"), "no summary"),
+        // Chatter after the verdict may not supply the count either: the
+        // summary that belongs to this verdict is the one that precedes it.
+        (
+            format!(
+                "{}Ran 12 tests in 0.4s\n",
+                clean.replace("Ran 12 tests", "Ran 11 tests")
+            ),
+            "deleted case behind a stale trailing count",
+        ),
+    ] {
+        let caught =
+            std::panic::catch_unwind(|| assert_clean_python_suite(&report, "ExampleTests", 12));
+        if caught.is_ok() {
+            accepted.push(reason);
+        }
+    }
+    assert!(accepted.is_empty(), "the suite gate accepted: {accepted:?}");
+}
+
+#[test]
+fn canary_process_custody_lifecycle() {
+    let output = Command::new("timeout")
+        .args([
+            "--kill-after=2s",
+            "60s",
+            "python3",
+            "-I",
+            "tests/python/test_canary_process_custody.py",
+            "ProcessCustodyTests",
+            "-v",
+        ])
+        .output()
+        .expect("run isolated canary process custody tests");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "canary custody tests failed: {report}"
+    );
+    assert_clean_python_suite(&report, "ProcessCustodyTests", 40);
+}
+
+#[test]
+fn stopped_canary_capture_lifecycle() {
+    let output = Command::new("timeout")
+        .args([
+            "--kill-after=2s",
+            "90s",
+            "python3",
+            "-I",
+            "tests/python/test_stopped_canary_capture.py",
+            "StoppedCanaryCaptureTests",
+            "-v",
+        ])
+        .output()
+        .expect("run isolated stopped canary coordinator tests");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "stopped coordinator tests failed: {report}"
+    );
+    assert_clean_python_suite(&report, "StoppedCanaryCaptureTests", 106);
+}
+
+#[test]
+fn task_storage_canary_seed_lifecycle() {
+    let output = Command::new("timeout")
+        .args([
+            "--kill-after=2s",
+            "60s",
+            "python3",
+            "-I",
+            "tests/python/test_task_storage_canary.py",
+            "TaskStorageCanaryTests",
+            "-v",
+        ])
+        .output()
+        .expect("run isolated task-storage seed qualifier tests");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "task-storage seed qualifier tests failed: {report}"
+    );
+    assert_clean_python_suite(&report, "TaskStorageCanaryTests", 34);
+}
+
 #[test]
 fn metadata_canary_matrix() {
     let canaries = read("scripts/verify-canaries.sh");
+    let checker = read("scripts/check-canary-evidence.py");
+    let assert_lanes = between(
+        &canaries,
+        "assert_lanes() {",
+        "\n}\n\nif [ \"${1-}\" = \"--self-test\" ]",
+    );
+    assert!(
+        !assert_lanes.contains("<<'PY'")
+            && canaries.contains("python3 -I scripts/check-canary-evidence.py")
+            && canaries.contains("python3 -I tests/python/test_canary_evidence.py"),
+        "canary shell gate must delegate to checked-in isolated Python entry points"
+    );
+    assert!(
+        checker.contains("def main(argv=None):")
+            && checker.contains("if __name__ == \"__main__\":")
+            && checker.contains("SCRIPT_DIR = Path(__file__).resolve().parent"),
+        "canary checker must retain an import-safe explicit entry point and source root"
+    );
     let lane_block = canaries
         .split_once("done <<'LANES'\n")
         .expect("canary lane table")
@@ -5514,9 +6034,180 @@ aggregate-only-metrics default metrics"
         blocked_lanes,
         "default-safe-start default\nfeature-safe-start feature"
     );
+    let owned_lanes = canaries
+        .split_once("done <<'OWNED_LANES'\n")
+        .expect("owned metrics lane table")
+        .1
+        .split_once("\nOWNED_LANES")
+        .unwrap()
+        .0;
+    assert_eq!(
+        owned_lanes,
+        "owned-default-metrics default\nowned-feature-metrics feature"
+    );
+    let owned_lane = between(
+        &canaries,
+        "run_owned_lane() {",
+        "\n}\n\nwhile read -r owned_lane owned_build; do",
+    );
+    assert!(
+        owned_lane.contains("--workload-origin owned")
+            && owned_lane.contains("run --manifest \"$WORK/matrix-manifest.json\"")
+            && owned_lane.contains("--mode metrics --pause never --duration 120 --kill-on-timeout")
+            && owned_lane.contains(
+                "--observer-log \"$WORK/$owned_lane.observer.log\" --workload-log \"$WORK/$owned_lane.observer.log\""
+            )
+            && owned_lane.contains("\"$WORK/$owned_lane.done\" \"$WORK/$owned_lane.finish\"")
+            && owned_lane.contains("python3 -I scripts/check-capture-evidence.py canary")
+            && !owned_lane.contains("--workload-pid")
+            && !owned_lane.contains("--generation")
+            && !owned_lane.contains("wait \"$WPID\"")
+            && !owned_lane.contains("signal_verified_process"),
+        "owned metrics lanes must bind run argv and combined logs while preserving observer wait ownership"
+    );
+    let start_lane = between(
+        &canaries,
+        "run_start_lane() {",
+        "\n}\n\necho \"=== live safe START policy",
+    );
+    let raw_start = start_lane
+        .find("sudo python3 -I scripts/capture-stopped-canary.py")
+        .expect("START lanes must acquire retained records through the coordinator");
+    let teardown = start_lane
+        .find("signal_verified_process TERM")
+        .expect("START workload teardown");
+    assert!(
+        raw_start < teardown
+            && start_lane.contains("\"$WORK/$start_lane\".*.raw")
+            && start_lane.contains("reclaim_root_output")
+    );
 
     let induced = read("scripts/verify-induced-gaps.sh");
+    for (name, caller, paths, entrypoint, acquisitions) in [
+        (
+            "canary",
+            canaries.as_str(),
+            "\"$TASK_STORAGE_READER\" --obj \"$TASK_STORAGE_OBJECT\"",
+            "sudo python3 -I scripts/capture-stopped-canary.py",
+            3,
+        ),
+        (
+            "induced-gap",
+            induced.as_str(),
+            "\"$TASK_STORAGE_READER\" \"$TASK_STORAGE_OBJECT\"",
+            "sudo python3 -I scripts/dump-owned-bpf-maps.py",
+            2,
+        ),
+    ] {
+        assert_eq!(
+            caller
+                .matches("scripts/build-task-storage-reader.sh")
+                .count(),
+            1,
+            "{name} caller must build the reader exactly once"
+        );
+        assert_eq!(
+            caller.matches(paths).count(),
+            acquisitions,
+            "{name} caller must pass both explicit native paths to every live acquisition"
+        );
+        assert_eq!(
+            caller.matches(entrypoint).count(),
+            acquisitions,
+            "{name} live acquisitions must ignore ambient Python imports"
+        );
+    }
+    assert!(
+        !canaries.contains("--raw-events")
+            && !canaries.contains("launch_root_recorded_process")
+            && !canaries.contains("signal_verified_root_process")
+            && canaries.contains("\"$WORK/$lane.done\" \"$WORK/$lane.finish\""),
+        "canary lanes must use coordinator custody and the matrix DONE/FINISH handshake"
+    );
     let directory = tempfile::tempdir().unwrap();
+    let reader_build = directory.path().join("task-storage-reader");
+    let reader_build_text = reader_build.to_str().unwrap();
+    run_ok(
+        "sh",
+        &["scripts/build-task-storage-reader.sh", reader_build_text],
+    );
+    let reader = reader_build.join("dump-task-storage");
+    let iterator = reader_build.join("dump-task-storage.bpf.o");
+    assert!(reader.is_file() && iterator.is_file());
+    let reader_test = run_ok(reader.to_str().unwrap(), &["--self-test"]);
+    assert!(reader_test.contains("exact-map mutation self-test: OK"));
+    assert!(reader_test.contains("resource lifecycle mutation self-test: OK"));
+    let iterator_disassembly = run_ok(
+        "llvm-objdump",
+        &["-dr", "--print-imm-hex", iterator.to_str().unwrap()],
+    );
+    assert!(
+        iterator_disassembly.contains("call 0x9c"),
+        "iterator must use non-creating bpf_task_storage_get: {iterator_disassembly}"
+    );
+    assert!(
+        iterator_disassembly.contains("call 0x7f"),
+        "iterator must write values directly with bpf_seq_write: {iterator_disassembly}"
+    );
+    // The D2 seed fixture is a separate x86-64 native binary that reuses this
+    // same iterator object with every program's autoload disabled; it builds
+    // without a second BPF object and never teaches the reader to create maps.
+    let fixture_build = directory.path().join("task-storage-canary");
+    let fixture_build_text = fixture_build.to_str().unwrap();
+    run_ok(
+        "sh",
+        &["scripts/build-task-storage-canary.sh", fixture_build_text],
+    );
+    let fixture = fixture_build.join("task-storage-canary");
+    assert!(
+        fixture.is_file() && !fixture_build.join("dump-task-storage.bpf.o").exists(),
+        "the seed fixture builder must produce only the native fixture"
+    );
+    let fixture_test = run_ok(fixture.to_str().unwrap(), &["--self-test"]);
+    for group in [
+        "exact-map mutation self-test: OK",
+        "seed layout self-test: OK",
+        "READY document self-test: OK",
+        "identity and release self-test: OK",
+        "injected lifecycle self-test: OK",
+    ] {
+        assert!(
+            fixture_test.contains(group),
+            "seed fixture self-test must report {group}: {fixture_test}"
+        );
+    }
+    let fixture_source = read("scripts/native/task-storage-canary.c");
+    assert!(
+        fixture_source.contains("program_set_autoload")
+            && fixture_source.contains("object_next_program")
+            && !fixture_source.contains("BPF_MAP_CREATE")
+            && !fixture_source.contains("program_attach"),
+        "the seed fixture must disable autoload for every program and attach nothing"
+    );
+    let builder = read("scripts/build-task-storage-canary.sh");
+    assert!(
+        !builder.contains("sudo") && !builder.contains("clang"),
+        "the seed fixture builder must stay unprivileged and build no BPF object"
+    );
+    // The seed stage is isolated from every production lane: its own private
+    // out-dir, never the lane work root whose surfaces the final scan reads.
+    assert!(
+        canaries.contains("scripts/build-task-storage-canary.sh \"$WORK/task-storage-canary\"")
+            && canaries.contains("seed_dir=$WORK/task-storage-seed")
+            && canaries.contains("--out-dir \"$seed_dir\"")
+            && canaries.contains("python3 -I tests/python/test_task_storage_canary.py"),
+        "the canary gate must build the fixture unprivileged, isolate the seed \
+         out-dir, and delegate the seed suite to its checked-in entry point"
+    );
+    let seed_build = between(
+        &canaries,
+        "scripts/build-task-storage-canary.sh",
+        "sudo -n true",
+    );
+    assert!(
+        !seed_build.contains("sudo"),
+        "the seed fixture must be built before the gate acquires sudo authorization"
+    );
     let provider = directory.path().join("matrix-provider.so");
     let workload = directory.path().join("canary-workload");
     run_ok(
@@ -5570,7 +6261,16 @@ aggregate-only-metrics default metrics"
     );
     assert!(faults.contains("blocked template faults: all calls CKR_OK"));
 
-    let lanes = run_ok("sh", &["scripts/verify-canaries.sh", "--self-test"]);
+    let lanes = run_ok(
+        "timeout",
+        &[
+            "--kill-after=2s",
+            "60s",
+            "sh",
+            "scripts/verify-canaries.sh",
+            "--self-test",
+        ],
+    );
     assert!(lanes.contains("canary lane assertion self-test: OK"));
     assert!(lanes.contains("raw binary alias scanner self-test: OK"));
     assert!(lanes.contains("unsafe raw template oracle self-test: OK"));
@@ -5578,6 +6278,114 @@ aggregate-only-metrics default metrics"
     assert!(lanes.contains("full CallStart safe defaults self-test: OK"));
     assert!(lanes.contains("scan-only hostile output contract: OK"));
     assert!(lanes.contains("canary matrix 988/104/208 with 16 mixed surfaces: OK"));
+    // The 15 classes below run together as one native lane, so `unittest`
+    // prints a single combined "Ran N tests" summary for all of them, not one
+    // per class. This floor is that combined total, not a per-class count for
+    // `TargetWidthPathTests` alone — keep the name and value paired so a
+    // future reader can't mistake it for the latter.
+    const NATIVE_LANE_15_CLASS_AGGREGATE_FLOOR: usize = 63;
+    for bits in ["32", "64"] {
+        let output = Command::new("timeout")
+            .args([
+                "--kill-after=2s",
+                "60s",
+                "python3",
+                "-I",
+                "tests/python/test_canary_evidence.py",
+                "--target-bits",
+                bits,
+                "HostileStartTests",
+                "FaultStartTests",
+                "RingLayoutTests",
+                "OwnedMetricsOracleTests",
+                "EventLayoutTests",
+                "RawSafeEventTests",
+                "RawDiagnosticEventTests",
+                "ImportSafetyTests",
+                "OwnedMapWrapperTests",
+                "TaskStorageInventoryTests",
+                "TaskStorageReaderTests",
+                "StoppedPopulationTests",
+                "FinalScannerSurfaceTests",
+                "StartRingSurfaceIntegrationTests",
+                "TargetWidthPathTests",
+                "-v",
+            ])
+            .output()
+            .unwrap_or_else(|error| panic!("run native canary tests for {bits}-bit: {error}"));
+        let report = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "native {bits}-bit canary tests failed: {report}"
+        );
+        for family in [
+            "HostileStartTests",
+            "FaultStartTests",
+            "RingLayoutTests",
+            "OwnedMetricsOracleTests",
+            "EventLayoutTests",
+            "RawSafeEventTests",
+            "RawDiagnosticEventTests",
+            "ImportSafetyTests",
+            "OwnedMapWrapperTests",
+            "TaskStorageInventoryTests",
+            "TaskStorageReaderTests",
+            "StoppedPopulationTests",
+            "FinalScannerSurfaceTests",
+            "StartRingSurfaceIntegrationTests",
+            "TargetWidthPathTests",
+        ] {
+            assert!(
+                report.contains(family),
+                "native {bits}-bit suite missed {family}: {report}"
+            );
+        }
+        assert_clean_python_suite(
+            &report,
+            "TargetWidthPathTests",
+            NATIVE_LANE_15_CLASS_AGGREGATE_FLOOR,
+        );
+
+        let workload_output = Command::new("python3")
+            .args([
+                "-I",
+                "tests/python/test_canary_workload.py",
+                "--target-bits",
+                bits,
+                "CanaryWorkloadTests",
+                "-v",
+            ])
+            .output()
+            .unwrap_or_else(|error| panic!("run canary workload tests for {bits}-bit: {error}"));
+        let workload_report = format!(
+            "{}{}",
+            String::from_utf8_lossy(&workload_output.stdout),
+            String::from_utf8_lossy(&workload_output.stderr)
+        );
+        assert!(
+            workload_output.status.success(),
+            "native {bits}-bit workload tests failed: {workload_report}"
+        );
+        assert_clean_python_suite(&workload_report, "CanaryWorkloadTests", 11);
+    }
+    let empty = Command::new("python3")
+        .args([
+            "-I",
+            "tests/python/test_canary_evidence.py",
+            "--target-bits",
+            "64",
+            "RequiredCanaryFamilyThatDoesNotExist",
+        ])
+        .output()
+        .expect("run missing native canary selector");
+    assert!(
+        !empty.status.success(),
+        "missing required native canary family must be nonpass"
+    );
     let mut sentinels = canary_literals(&read("scripts/fixtures/canary_workload.c"));
     sentinels.extend(canary_literals(&read(
         "scripts/fixtures/privacy-stack-workload.c",
@@ -5592,7 +6400,7 @@ aggregate-only-metrics default metrics"
 
     let dumper = run_ok(
         "python3",
-        &["scripts/dump-owned-bpf-maps.py", "--self-test"],
+        &["-I", "scripts/dump-owned-bpf-maps.py", "--self-test"],
     );
     assert!(dumper.contains("nonzero valid JSON rejected: OK"));
     assert!(dumper.contains("ordinary dump list validation: OK"));
@@ -5793,14 +6601,17 @@ fn operator_docs_preserve_semantic_authority_limits() {
         .to_lowercase();
     assert!(
         readme.contains("previous frozen mvp passed")
-            && readme.contains("w3 tip")
-            && readme.contains("remain pending"),
-        "README must distinguish historical MVP evidence from W3 qualification"
+            && readme.contains("current candidate")
+            && readme.contains("exact-tip runtime qualification")
+            && readme.contains("pending"),
+        "README must distinguish historical evidence from current exact-tip qualification"
     );
     assert!(
         usage.contains("frozen pre-w3 candidate")
-            && usage.contains("not been repeated on the w3 tip"),
-        "docs/usage.md must distinguish historical evidence from W3 qualification"
+            && usage.contains("not been repeated on the current candidate")
+            && usage.contains("exact-tip runtime qualification")
+            && usage.contains("pending"),
+        "docs/usage.md must distinguish historical evidence from current exact-tip qualification"
     );
 }
 
@@ -5880,11 +6691,14 @@ fn gate_scripts_pin_the_toolchain() {
 fn production_bpf_toolchain_is_frozen() {
     let toolchain = read("crates/ebpf/rust-toolchain.toml");
     let build = read("build.rs");
+    let tools = read("build_support/bpf_tools.rs");
     let ci = read(".github/workflows/ci.yml");
 
     assert!(toolchain.contains("channel = \"nightly-2026-05-20\""));
-    assert!(build.contains("\"+nightly-2026-05-20\""));
-    assert!(!build.contains("\"+nightly\""));
+    assert!(build.contains("#[path = \"build_support/bpf_tools.rs\"]\nmod bpf_tools;"));
+    assert!(build.contains("bpf_tools::bpf_cargo_command_from_env()"));
+    assert!(tools.contains("\"+nightly-2026-05-20\""));
+    assert!(!tools.contains("\"+nightly\""));
     assert!(ci.contains("toolchain install nightly-2026-05-20 "));
     assert!(!ci.contains("toolchain install nightly "));
 }
@@ -5927,7 +6741,7 @@ fn checks_job(ci: &str) -> &str {
 /// dropped into a new subdirectory would otherwise get no UNRUN line and no
 /// hosted self-test while the block still claims "every privileged script under
 /// scripts/". `__pycache__` is generated, never tracked.
-fn script_dirs() -> Vec<&'static str> {
+fn script_dirs() -> Vec<String> {
     let mut found: Vec<String> = fs::read_dir("scripts")
         .expect("walk scripts")
         .filter_map(Result::ok)
@@ -5938,11 +6752,27 @@ fn script_dirs() -> Vec<&'static str> {
     found.sort();
     assert_eq!(
         found,
-        ["fixtures", "matrix"],
+        ["fixtures", "matrix", "native"],
         "a new directory under scripts/: teach the UNRUN and self-test derivations \
          about it, or a privileged lane there is invisible to both"
     );
-    vec!["scripts", "scripts/matrix"]
+    std::iter::once("scripts".to_string())
+        .chain(
+            found
+                .into_iter()
+                .filter(|name| name != "fixtures")
+                .map(|name| format!("scripts/{name}")),
+        )
+        .collect()
+}
+
+#[test]
+fn every_admitted_script_directory_is_scanned() {
+    assert_eq!(
+        script_dirs(),
+        ["scripts", "scripts/matrix", "scripts/native"],
+        "every admitted non-fixture directory must participate in the lane derivations"
+    );
 }
 
 /// A step's command, with the `- run:` / `run:` shape (a `- name:` label puts the
@@ -5973,13 +6803,14 @@ fn hosted_pipeline_checks_the_diagnostic_inventory() {
         .iter()
         .position(|line| {
             command_of(line).is_some_and(|call| {
-                call == "cargo +1.88 clippy --locked --workspace --all-targets -- -D warnings"
+                call
+                    == "cargo +1.88 clippy --locked --offline --workspace --all-targets -- -D warnings"
             })
         })
         .expect("the checks job must run the clippy gate");
     // `--nocapture` so the inventory report the wave cites as exit evidence
     // actually reaches the hosted log.
-    let prefix = "cargo +1.88 test --locked --features unsafe-unvalidated-metadata --test artifact_contracts -- ";
+    let prefix = "cargo +1.88 test --locked --offline --features unsafe-unvalidated-metadata --test artifact_contracts -- ";
     let command_at = lines
         .iter()
         .position(|line| line.starts_with(prefix))
@@ -6140,6 +6971,7 @@ fn hosted_pipeline_runs_every_unprivileged_self_test() {
 #[test]
 fn hosted_pipeline_names_every_unrun_privileged_lane() {
     let ci = read(".github/workflows/ci.yml");
+    let script_roots = script_dirs();
     // A heuristic in both directions: it reads words, so an unprivileged script
     // whose prose happens to say "kind" is flagged, and a lane needing only
     // `setcap` or `runuser` is not. It errs toward declaring more UNRUN, which is
@@ -6157,7 +6989,15 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
                             "sudo"
                                 | "docker"
                                 | "podman"
-                                | "kind"
+                                // `kind` is deliberately absent. It is the only
+                                // English word in this list, so it fires on any
+                                // script that reads a field named "kind" -- the
+                                // PKCS#11 surface vocabulary uses exactly that,
+                                // and the provider matrix lane is unprivileged.
+                                // Nothing is lost: kind is Kubernetes IN Docker
+                                // and cannot run without `docker` or `podman`,
+                                // which both remain, and every lane naming kind
+                                // today also names docker, kubectl or sudo.
                                 | "kubectl"
                                 | "bpftool"
                                 | "capsh"
@@ -6180,7 +7020,7 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
             return true;
         }
         let file = script.rsplit('/').next().unwrap_or(script).to_string();
-        ["scripts", "scripts/matrix"].iter().any(|dir| {
+        script_roots.iter().any(|dir| {
             fs::read_dir(dir)
                 .expect("walk scripts")
                 .filter_map(Result::ok)
@@ -6215,6 +7055,37 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
         line.split(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, '.' | '/' | '_' | '-'))
             .any(is_lane)
     };
+    let dependency_helpers = [
+        "scripts/prepare-dependencies.py",
+        "scripts/prepared-dependency-tools.sh",
+        "scripts/check-prepared-dependencies.py",
+    ];
+    let named_scripts = |line: &str| {
+        line.split(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, '.' | '/' | '_' | '-'))
+            .filter(|token| is_lane(token))
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    let is_exact_dependency_helper_call = |line: &str| {
+        let line = line.strip_prefix("- ").unwrap_or(line);
+        matches!(
+            line,
+            "run: python3 -I scripts/prepare-dependencies.py"
+                | ". scripts/prepared-dependency-tools.sh"
+                | r#""$P11SCOPE_PREPARED_PYTHON" -I scripts/check-prepared-dependencies.py \"#
+        )
+    };
+    let named_prepare = "run: python3 -I scripts/prepare-dependencies.py";
+    let unnamed_prepare = format!("- {named_prepare}");
+    assert!(is_exact_dependency_helper_call(named_prepare));
+    assert!(is_exact_dependency_helper_call(&unnamed_prepare));
+    let helper_plus_lane = format!("{unnamed_prepare} && scripts/verify-inspect-doctor.sh");
+    assert!(!is_exact_dependency_helper_call(&helper_plus_lane));
+    assert!(
+        named_scripts(&helper_plus_lane)
+            .iter()
+            .any(|script| !dependency_helpers.contains(&script.as_str()))
+    );
     let mut hosted_full: BTreeSet<&str> = BTreeSet::new();
     // Scoped to the checks job: the label says "runs in this job", so a step that
     // exists only in another job must not satisfy it. The full-run sweep below
@@ -6232,8 +7103,13 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
         let line = line
             .split_once(" #")
             .map_or(line, |(code, _)| code.trim_end());
+        let scripts = named_scripts(line);
+        let dependency_only = !scripts.is_empty()
+            && scripts
+                .iter()
+                .all(|script| dependency_helpers.contains(&script.as_str()));
         assert!(
-            line.starts_with('#') || !names_lane(line),
+            line.starts_with('#') || !names_lane(line) || dependency_only,
             "a lane is named outside the checks job: {line:?}. The UNRUN and scope \
              claims are about that job alone; running a lane elsewhere needs the \
              derivation taught about it first"
@@ -6248,6 +7124,18 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
             continue;
         }
         if !names_lane(line) {
+            continue;
+        }
+        let scripts = named_scripts(line);
+        if !scripts.is_empty()
+            && scripts
+                .iter()
+                .all(|script| dependency_helpers.contains(&script.as_str()))
+        {
+            assert!(
+                is_exact_dependency_helper_call(line),
+                "unreadable dependency preparation invocation {line:?}"
+            );
             continue;
         }
         // `- name:` above a step is an ordinary edit, so accept the bare `run:` form.
@@ -6272,7 +7160,7 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
         }
     }
     let mut expected = BTreeSet::new();
-    for dir in script_dirs() {
+    for dir in &script_roots {
         for entry in fs::read_dir(dir).expect("walk scripts") {
             let path = entry.expect("script entry").path();
             let name = path
@@ -6352,19 +7240,36 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
     // The rest of that line is prose, so pin the steps it claims.
     // Full strings: "test --locked" alone was also matched by the diagnostic
     // step, so deleting the workspace test gate left this claim standing.
-    for gate in [
-        "fmt --all -- --check",
-        "check --locked --workspace --all-targets",
-        "test --locked --workspace --all-targets",
-        "clippy --locked --workspace --all-targets -- -D warnings",
+    assert_hosted_offline_gates(checks).unwrap();
+    assert_hosted_dependency_preparation(&ci).unwrap();
+    for marker in [
+        "--metadata \"Cargo.toml=$RUNNER_TEMP/root-metadata.json\"",
+        "--metadata \"crates/ebpf/Cargo.toml=$RUNNER_TEMP/bpf-metadata.json\" --ledger",
     ] {
+        let missing = ci.replacen(marker, "", 1);
         assert!(
-            checks
-                .lines()
-                .map(str::trim)
-                .filter_map(command_of)
-                .any(|call| call == format!("cargo +1.88 {gate}")),
-            "the scope: line claims the {gate} gate, which no step runs"
+            assert_hosted_dependency_preparation(&missing).is_err(),
+            "removing either metadata context must fail preparation activation"
+        );
+    }
+    let prepare = "run: python3 -I scripts/prepare-dependencies.py";
+    let first_project = "run: cargo +1.88 fetch --locked --manifest-path Cargo.toml";
+    let moved = ci.replacen(prepare, "", 1).replacen(
+        first_project,
+        &format!("{first_project}\n        {prepare}"),
+        1,
+    );
+    assert!(
+        assert_hosted_dependency_preparation(&moved).is_err(),
+        "dependency reconstruction after the first project operation must fail"
+    );
+    for gate in ["check", "test", "clippy"] {
+        let offline = format!("{gate} --locked --offline");
+        let online = format!("{gate} --locked");
+        let missing_offline = checks.replacen(&offline, &online, 1);
+        assert!(
+            assert_hosted_offline_gates(&missing_offline).is_err(),
+            "removing --offline from the {gate} gate must fail"
         );
     }
     for path in &expected {
@@ -6473,126 +7378,139 @@ fn hosted_pipeline_retains_the_job_log() {
     }
 }
 
-/// Task 8 Step 2's ordering sentence, frozen where the loops live: "Each tick
-/// drains discovery, lets `Engine` extend `AttachPlan` and apply attachment
-/// deltas, synchronizes immediate semantic/trace invalidations while
-/// preserving unchanged retired decode metadata, drains call events, retires
-/// exited process state, snapshots metrics/counters, and checks retained
-/// generations/objects."
-///
-/// The synchronization step landing before the event drain and the snapshot is
-/// what makes a slot discovered mid-capture visible to metrics and to trace in
-/// the same tick it arrived; the terminal section is what keeps detach ahead of
-/// the final drain and snapshot, with the in-flight honesty boundary intact.
+/// Bind the behavioral capture helpers to production mode-specific callbacks.
+/// Completed-root retirement is covered by terminal behavioral tests; capture
+/// facts and terminal publication retain their separate provenance checks.
 #[test]
-fn both_capture_loops_keep_the_one_frozen_per_tick_ordering() {
+fn both_capture_loops_wire_behavioral_helpers_and_terminal_publication() {
+    // Ordering inside the helpers is exercised by capture_loop_tests, including
+    // compiled mutation controls. This guard binds their real production callers
+    // and the mode-specific publication callbacks that those tests do not invoke.
     let run = read("src/run.rs");
     let profile = between(&run, "fn capture_profile(", "fn write_json_report(");
     let trace = between(&run, "fn capture_trace(", "\n/// Prints (and, if given,");
-
-    for (name, source, tick_end, sync) in [
+    for (name, source, consumer, drain, snapshot) in [
         (
             "profile",
             profile,
-            "    finish_capture_loop(",
-            "state.sync_plan(engine.plan());",
+            "tracer: None,",
+            "drain_events(",
+            "metrics::kernel_evidence(context.1)?",
         ),
         (
             "trace",
             trace,
-            "    finish_capture_loop(",
-            "tracer.sync_plan(engine.plan());",
+            "tracer: Some(&mut tracer),",
+            "drain_trace_events(",
+            "report_trace_loss(",
         ),
     ] {
-        let tick = between(
-            source,
-            "    loop {\n        let elapsed = clock.elapsed();",
-            tick_end,
-        );
-        let drain_events = if name == "profile" {
-            "drain_events(\n                session,"
-        } else {
-            "drain_trace_events(\n            session,"
-        };
-        let snapshot = if name == "profile" {
-            "metrics::kernel_evidence(session)?"
-        } else {
-            "report_trace_loss("
-        };
-        for (first, second, contract) in [
-            (
-                "drain_discovery_tick(engine, session,",
-                sync,
-                "discovery drain before its immediate invalidation sync",
-            ),
-            (
-                sync,
-                drain_events,
-                "invalidation sync before the call-event drain",
-            ),
-            (
-                drain_events,
-                "retire_exited(&mut process_tracker, &mut state);",
-                "call-event drain before exited-process retirement",
-            ),
-            (
-                "retire_exited(&mut process_tracker, &mut state);",
-                snapshot,
-                "exited-process retirement before the metrics/counter snapshot",
-            ),
-            (
-                snapshot,
-                "check_pinned_unchanged()",
-                "metrics/counter snapshot before the retained generation/object check",
-            ),
+        let tick = between(source, "let tick = {", "let mut finish_context =");
+        for marker in [
+            "capture_tick_with(",
+            "drain_discovery_tick(",
+            "Ok((plan_changed, paused, context.0.plan()))",
+            "capture_end(",
+            consumer,
+            drain,
+            snapshot,
+            ".check_unchanged()",
         ] {
-            require_before(tick, first, second, &format!("{name} tick: {contract}")).unwrap();
+            assert!(
+                tick.contains(marker),
+                "{name} live callback missing {marker}"
+            );
         }
-    }
-
-    // Terminal: detach the producers, then drain, then snapshot. A fallible
-    // provider check must not sit between the detach and its drain.
-    require_before(
-        profile,
-        "let detach = session.detach_producers();",
-        "let plan_changed = if detach.is_ok()",
-        "profile terminal detach before the final drain",
-    )
-    .unwrap();
-    require_before(
-        profile,
-        "let detach = session.detach_producers();",
-        "    let reports = metrics::read(session, engine.plan())?;\n    let mut kernel_evidence",
-        "profile terminal detach before the final snapshot",
-    )
-    .unwrap();
-    require_before(
-        trace,
-        "let detach = session.detach_producers();",
-        "    let reports = metrics::read(session, engine.plan())?;",
-        "trace terminal detach before the final snapshot",
-    )
-    .unwrap();
-    // The owned child is settled before any terminal evidence is built, so
-    // `child_still_running` is reported rather than guessed after the fact.
-    for source in [profile, trace] {
+        assert_eq!(tick.matches("capture_tick_with(").count(), 1);
         require_before(
-            source,
-            "finish_capture_loop(",
-            "let detach = session.detach_producers();",
-            "owned-child settlement before terminal evidence",
+            tick,
+            drain,
+            snapshot,
+            &format!("{name} live drain before snapshot"),
+        )
+        .unwrap();
+        require_before(
+            tick,
+            snapshot,
+            ".check_unchanged()",
+            &format!("{name} live snapshot before retained check"),
+        )
+        .unwrap();
+        let terminal = source.split_once("drain_capture_terminal_with(").unwrap().1;
+        assert!(
+            terminal.contains(drain),
+            "{name} terminal event consumer missing"
+        );
+        assert!(terminal.contains("context.0.capture_facts()"));
+        assert!(terminal.contains("context.0.settle_terminal_drain();"));
+    }
+    // Metrics must not consume EVENTS; both live and terminal profile paths gate it.
+    assert!(profile.contains(
+        "if profile {\n                        *consumers.malformed_records += drain_events("
+    ));
+    assert!(profile.contains("if profile {\n                        (\n                            drain_original_root_events("));
+    assert!(profile.contains("if profile {\n                        *consumers.malformed_records +=\n                            drain_events("));
+    let profile_terminal = profile
+        .split_once("drain_capture_terminal_with(")
+        .unwrap()
+        .1;
+    for (first, second) in [
+        ("let reports = metrics::read(", "let mut kernel_evidence ="),
+        ("let mut kernel_evidence =", ".check_unchanged()"),
+        (".check_unchanged()", "context.0.settle_terminal_drain();"),
+        (
+            "context.0.settle_terminal_drain();",
+            "let mut ev = evidence_for(",
+        ),
+        (
+            "ev.mark_terminal_drain_unproven();",
+            "let frame = render::live(",
+        ),
+        ("let frame = render::live(", "write_stdout("),
+    ] {
+        require_before(
+            profile_terminal,
+            first,
+            second,
+            "profile terminal publication",
         )
         .unwrap();
     }
-    // And the honesty boundary the plan says to retain is still there.
-    assert!(
-        profile.contains("ev.mark_terminal_drain_unproven();"),
-        "the profile terminal snapshot must stay explicitly unproven"
+    let trace_terminal = trace.split_once("drain_capture_terminal_with(").unwrap().1;
+    let checks: Vec<_> = trace_terminal
+        .match_indices(".check_unchanged()")
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        checks.len(),
+        2,
+        "trace retains both terminal provider checks"
     );
-    assert!(
-        trace.contains("evidence.mark_terminal_drain_unproven();"),
-        "the trace terminal evidence must stay explicitly unproven"
-    );
+    let loss = trace_terminal.find("report_trace_loss(").unwrap();
+    let reports = trace_terminal.find("let reports = metrics::read(").unwrap();
+    let settle = trace_terminal
+        .find("context.0.settle_terminal_drain();")
+        .unwrap();
+    let late_kernel = trace_terminal
+        .find("metrics::kernel_evidence(context.1)?")
+        .unwrap();
+    assert!(trace_terminal.find("drain_trace_events(").unwrap() < checks[0]);
+    assert!(checks[0] < loss && loss < reports && reports < checks[1]);
+    assert!(checks[1] < settle && settle < late_kernel);
+    require_before(
+        trace_terminal,
+        "evidence.mark_terminal_drain_unproven();",
+        "emit_trace_line(",
+        "trace truncation output honesty",
+    )
+    .unwrap();
+    require_before(
+        trace_terminal,
+        "evidence.mark_terminal_drain_unproven();",
+        "emit_trace_terminal(",
+        "trace terminal output honesty",
+    )
+    .unwrap();
 }
 
 /// CI viability (8.1 review, Important 1): after Task 8 Step 2 the extended
@@ -6664,6 +7582,7 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
         unmatched_returns: 0,
         rv_update_failures: 0,
         cgroup_scope_failures: 0,
+        abi_refusals: 0,
         semantic_capture_failures: 0,
         unregistered_mechanisms: 0,
         template_tail_failures: 0,
@@ -6681,6 +7600,7 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
         async_evictions: 0,
         fork_state_ambiguities: 0,
         semantic_state_drops: 0,
+        semantic_history_drops: 0,
         pending_at_end: 0,
         malformed_records: 0,
         orphan_ops: 0,
@@ -6884,7 +7804,7 @@ fn the_capture_loop_consumer_map_is_frozen() {
 
     // Coordinator fields: only its own finite aggregate, never its identity.
     for marker in [
-        "let pause = owned.map_or_else(Default::default, |owned| owned.coordinator.counters());",
+        "pause: crate::discovery::pause::PauseCounters,",
         "pause_attempts: pause.attempts",
         "pause_confirmed: pause.confirmed",
         "pause_partial: pause.partial",
@@ -6896,6 +7816,40 @@ fn the_capture_loop_consumer_map_is_frozen() {
             !evidence.contains(forbidden),
             "a loader/pause identity reached a render type: {forbidden}"
         );
+    }
+
+    // Each real caller must supply the owned coordinator projection; the
+    // projection's argument type alone would also accept fabricated defaults.
+    for (mode, body, expected_calls) in [
+        (
+            "profile",
+            between(&run, "fn capture_profile(", "fn write_json_report("),
+            2,
+        ),
+        (
+            "trace",
+            between(&run, "fn capture_trace(", "\n/// Prints (and, if given,"),
+            1,
+        ),
+    ] {
+        let calls: Vec<_> = body.split("evidence_for(").skip(1).collect();
+        assert_eq!(calls.len(), expected_calls, "{mode} evidence callers");
+        for call in calls {
+            let args = call
+                .split_once("capture_tracking_degraded,")
+                .expect("bounded evidence arguments")
+                .0;
+            assert!(
+                args.contains(
+                    ".map_or_else(Default::default, |owned| owned.coordinator.counters())"
+                ),
+                "{mode} coordinator counter source"
+            );
+            assert!(
+                args.contains(".as_deref().map(|owned| owned.still_running)"),
+                "{mode} owned disposition source"
+            );
+        }
     }
 
     // Module labels: capture-lifetime facts only. The old active-topology
@@ -6915,10 +7869,10 @@ fn the_capture_loop_consumer_map_is_frozen() {
 
     // Semantic attachment decisions still read the active topology.
     for marker in [
-        "semantics::State::with_policy(engine.plan(), policy)",
-        "state.sync_plan(engine.plan());",
+        "semantics::State::for_capture(engine.plan(), policy, domain.clone())",
+        "consumers.state.sync_plan(plan);",
         "trace::Tracer::new(engine.plan())",
-        "tracer.sync_plan(engine.plan());",
+        "tracer.sync_plan(plan);",
     ] {
         assert!(
             run.contains(marker),
@@ -7228,214 +8182,6 @@ cleanup
 }
 
 #[test]
-fn lane13_pre_runtime_inputs_are_owned_and_release_bytes_stay_local() {
-    // Break caught: accepting a collision, drifting base, remote release bytes,
-    // ambiguous apply facts, or a post-apply mutation would hide unsafe input.
-    let gate = read("scripts/matrix/verify-knative.sh");
-    let canonical_kourier_url = "https://github.com/knative-extensions/net-kourier/releases/download/${KNATIVE_VERSION}/kourier.yaml";
-    assert_eq!(
-        gate.matches(canonical_kourier_url).count(),
-        2,
-        "Kourier canonical owner must be used by both the allowlist and live call"
-    );
-    let obsolete_kourier_url =
-        "https://github.com/knative/net-kourier/releases/download/${KNATIVE_VERSION}/kourier.yaml";
-    assert_eq!(
-        gate.matches(obsolete_kourier_url).count(),
-        0,
-        "obsolete Kourier owner must not remain in production"
-    );
-    let d1 = between(
-        &gate,
-        "lane13_prepare_diagnostics() {",
-        "\nterminate_port_forward() {",
-    );
-    let directory = tempfile::tempdir().expect("temporary lane-13 D1 directory");
-    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
-        .expect("make lane-13 evidence parent private");
-    let script = directory.path().join("d1.sh");
-    let body = format!(
-        "set -eu\nWORK={0}/work\nKUBECONFIG=$WORK/kubeconfig\nIMAGE=kind.local/test:unique\nCLUSTER=test-unique\nEVIDENCE={0}/evidence\nFACTS=$EVIDENCE/facts.log\nLANE13_TEST={0}\nmkdir -m 700 $EVIDENCE; : > $FACTS; chmod 600 $FACTS\nIMAGE_CREATED= CLUSTER_CREATED=\ndocker() {{ printf '%s\\n' \"$*\" >> $LANE13_TEST/docker.calls; case \"$1 $2\" in 'image inspect') [ \"$3\" = \"$IMAGE\" ] && [ -e $LANE13_TEST/image.created ] || [ \"$3\" = ubuntu:24.04 ] || return 1; if [ \"$3\" = ubuntu:24.04 ]; then printf '[{{\"Id\":\"base\",\"RepoDigests\":[\"ubuntu@sha256:base\"],\"RootFS\":{{\"Layers\":[\"a\",\"b\"]}}}}]\\n'; else printf '[{{\"Id\":\"work\",\"RepoDigests\":[\"work@sha256:work\"],\"RootFS\":{{\"Layers\":[\"a\",\"b\",\"c\"]}}}}]\\n'; fi;; pull) : > $LANE13_TEST/base.pulled;; build) printf '%s\\n' \"$*\" | grep -Fq -- --pull=false; : > $LANE13_TEST/image.created;; *) return 9;; esac; }}\nkind() {{ printf '%s\\n' \"$*\" >> $LANE13_TEST/kind.calls; case $1 in get) :;; create) : > $LANE13_TEST/cluster.created;; *) return 9;; esac; }}\ncurl() {{ if [ \"$1\" = --version ]; then printf 'curl 8.4.0\\n'; return; fi; printf '%s\\n' \"$*\" >> $LANE13_TEST/curl.calls; out= url=; while [ \"$#\" -gt 0 ]; do case $1 in --output) out=$2; shift 2;; --write-out) shift 2;; *) url=$1; shift;; esac; done; case $url in https://github.com/*) :;; *) return 9;; esac; printf release > $out; printf '%s' 'https://release-assets.githubusercontent.com/asset?secret=x'; }}\nkubectl() {{ printf '%s\\n' \"$*\" >> $LANE13_TEST/kubectl.calls; [ \"$1\" = apply ] && [ \"$2\" = -f ] && [ -f \"$3\" ] && [ \"$4\" = -o ] && [ \"$5\" = name ]; case $3 in *://*) return 9;; esac; printf 'service/example\\n'; }}\n{1}\nmkdir $WORK\nlane13_preflight\nlane13_record_base_and_build\n[ \"$IMAGE_CREATED\" = 1 ]\nlane13_create_cluster\n[ \"$CLUSTER_CREATED\" = 1 ]\nlane13_fetch_release https://github.com/knative/serving/releases/download/v1.23.0/serving-crds.yaml serving-crds.yaml\n[ ! -e $WORK/releases/serving-crds.yaml ]\ngrep -Fqx service/example $FACTS\ngrep -Fq 'release_effective=https://release-assets.githubusercontent.com/asset' $FACTS\ngrep -Fq input_sha256= $FACTS\ngrep -Fq docker_version= $FACTS\n[ \"$(wc -l < $LANE13_TEST/curl.calls)\" -eq 2 ]\n[ \"$(wc -l < $LANE13_TEST/kubectl.calls)\" -eq 1 ]\ngrep -Fq -- --pull=false $LANE13_TEST/docker.calls\nrm -f $LANE13_TEST/docker.calls $LANE13_TEST/kind.calls\n: > $WORK/collision\nif lane13_preflight; then exit 97; fi\n[ ! -e $LANE13_TEST/docker.calls ]\n[ ! -e $LANE13_TEST/kind.calls ]\n",
-        directory.path().display(),
-        format_args!(
-            "git() {{ case \"$1 ${{2-}}\" in 'diff --quiet'|'diff --cached'|'ls-files --others') return 0;; *) command git \"$@\";; esac; }}\ncargo() {{ printf 'cargo test\\n'; }}\nrustc() {{ printf 'rustc test\\n'; }}\nlane13_fact() {{ printf '%s\\n' \"$1\" >> \"$FACTS\"; }}\nlane13_prepare_diagnostics() {{{d1}"
-        ),
-    )
-    .replace(
-        "\nmkdir $WORK\nlane13_preflight\n",
-        "\nlane13_prepare_diagnostics\nlane13_preflight\nmkdir $WORK\n",
-    )
-    .replace(
-        "IMAGE_CREATED= CLUSTER_CREATED=\n",
-        "IMAGE_CREATED= CLUSTER_CREATED=\ntimeout() { while [ \"$#\" -gt 0 ]; do case $1 in --signal=*|--kill-after=*) shift;; --signal|--kill-after) shift 2;; *s) shift; break;; *) break;; esac; done; \"$@\"; }\n",
-    )
-    .replace(
-        "CLUSTER=test-unique\n",
-        "CLUSTER=test-unique\nKNATIVE_VERSION=knative-v1.23.0\n",
-    )
-    .replace("case \"$1 $2\"", "case \"$1 ${2-}\"")
-    .replace("fi;; pull)", "fi;; pull*)")
-    .replace("pulled;; build)", "pulled;; build*)")
-    .replace(
-        "--pull=false; : > $LANE13_TEST/image.created;;",
-        "--pull=false; : > $LANE13_TEST/image.created; printf work;;",
-    )
-    .replace(
-        "case \"$1 ${2-}\" in 'image inspect')",
-        "case \"$1 ${2-}\" in 'container inspect') printf node-id;; 'image inspect')",
-    )
-    .replace(
-        "case $1 in get) :;; create)",
-        "case \"$1 ${2-}\" in 'get clusters') :;; 'get nodes') printf node\\n;; 'create cluster')",
-    )
-    .replace(
-        "case \"$1 ${2-}\" in 'container inspect') printf node-id;; 'image inspect')",
-        "case \"$1 ${2-}\" in 'version --format') printf docker-test;; 'info --format') printf overlay;; 'container inspect') printf node-id;; 'image inspect')",
-    )
-    .replace(
-        "case \"$1 ${2-}\" in 'version --format') printf docker-test;;",
-        "case \"$1 ${2-}\" in 'version --format') printf docker-test;; 'image ls') [ \"$3\" = --no-trunc ] && [ \"$4\" = --format ] && [ \"$5\" = '{{.Repository}}\\t{{.Tag}}\\t{{.ID}}' ] && [ \"$6\" = \"$IMAGE\" ] || return 1;;",
-    )
-    .replace(
-        "case \"$1 ${2-}\" in 'get clusters') :;; 'get nodes') printf node\\n;; 'create cluster')",
-        "case \"$1 ${2-}\" in 'version ') printf kind-test;; 'get clusters') :;; 'get nodes') printf node\\n;; 'create cluster')",
-    )
-    .replace(
-        "\nFACTS=$EVIDENCE/facts.log\n",
-        "\nP11SCOPE_LANE_EVIDENCE_DIR=$EVIDENCE; export P11SCOPE_LANE_EVIDENCE_DIR\nFACTS=$EVIDENCE/facts.log\n",
-    )
-    .replace(
-        "printf '%s' 'https://release-assets.githubusercontent.com/asset?secret=x'",
-        "printf '%s\\n1' 'https://release-assets.githubusercontent.com/asset?secret=x'",
-    )
-    .replace(
-        "curl() { if [ \"$1\" = --version ]; then printf 'curl 8.4.0\\n'; return; fi; printf '%s\\n' \"$*\" >> $LANE13_TEST/curl.calls;",
-        "curl() { printf '%s\\n' \"$*\" >> $LANE13_TEST/curl.calls; if [ \"$1\" = --version ]; then printf 'curl 8.4.0\\n'; return; fi;",
-    )
-    .replace(
-        ": > $LANE13_TEST/cluster.created;;",
-        ": > $LANE13_TEST/cluster.created; : > $KUBECONFIG;;",
-    )
-    .replace(
-        "kubectl() { printf '%s\\n' \"$*\" >> $LANE13_TEST/kubectl.calls; [ \"$1\" = apply ] && [ \"$2\" = -f ] && [ -f \"$3\" ] && [ \"$4\" = -o ] && [ \"$5\" = name ]",
-        "kubectl() { if [ \"$1\" = version ]; then [ \"$#\" -eq 3 ] && [ \"$2\" = --client ] && [ \"$3\" = --output=yaml ] || return 9; printf '%s\\n' \"$*\" >> $LANE13_TEST/kubectl.calls; printf 'gitVersion: v1.33.0\\n'; return 0; fi; [ \"$1\" = apply ] && [ \"$#\" -eq 5 ] && [ \"$2\" = -f ] && [ -f \"$3\" ] && [ \"$4\" = -o ] && [ \"$5\" = name ] || return 9; case $3 in *://*) return 9;; esac; printf '%s\\n' \"$*\" >> $LANE13_TEST/kubectl.calls; printf '%s\\n' \"$3\" >> $LANE13_TEST/apply.paths; case $3 in *serving-crds.yaml) printf 'service/crds\\n';; *serving-core.yaml) printf 'configmap/core\\nservice/core\\n';; *kourier.yaml) printf 'deployment/kourier\\n';; *) return 9;; esac; if [ \"${MUTATE-}\" = 1 ]; then : > $LANE13_TEST/mutated; printf mutated >> \"$3\"; fi",
-    )
-    .replace(
-        "case $3 in *://*) return 9;; esac; printf 'service/example\\n'; }",
-        "}",
-    )
-    .replace("LANE13_TEST={0}\\n", "LANE13_TEST={0}\\nP11SCOPE_LANE_EVIDENCE_DIR=$EVIDENCE; export P11SCOPE_LANE_EVIDENCE_DIR\\n")
-    .replace("mkdir -m 700 $EVIDENCE; : > $FACTS; chmod 600 $FACTS\n", "")
-    .replace("\ngrep -Fq input_sha256= $FACTS", "")
-    .replace("\ngrep -Fq docker_version= $FACTS", "")
-    .replace(
-        "[ \"$(wc -l < $LANE13_TEST/curl.calls)\" -eq 2 ]",
-        "[ \"$(wc -l < $LANE13_TEST/curl.calls)\" -eq 1 ]",
-    )
-    .replace(
-        "[ \"$(wc -l < $LANE13_TEST/kubectl.calls)\" -eq 1 ]",
-        "[ \"$(wc -l < $LANE13_TEST/kubectl.calls)\" -eq 2 ]",
-    )
-    .replace(
-        "releases/download/v1.23.0/serving-crds.yaml serving-crds.yaml",
-        "releases/download/knative-v1.23.0/serving-crds.yaml serving-crds.yaml",
-    )
-    .replace(
-        "grep -Fqx service/example $FACTS",
-        "MUTATE=1\nset +e\nlane13_fetch_release https://github.com/knative/serving/releases/download/knative-v1.23.0/serving-crds.yaml serving-crds.yaml\nmutation_status=$?\nset -e\n[ \"$mutation_status\" -ne 0 ]\n[ -e $WORK/releases/serving-crds.yaml ]\nrm -f $WORK/releases/serving-crds.yaml\nMUTATE=\nrm -f $LANE13_TEST/curl.calls $LANE13_TEST/kubectl.calls $LANE13_TEST/apply.paths\nlane13_fetch_release https://github.com/knative/serving/releases/download/knative-v1.23.0/serving-crds.yaml serving-crds.yaml\nlane13_fetch_release https://github.com/knative/serving/releases/download/knative-v1.23.0/serving-core.yaml serving-core.yaml\nlane13_fetch_release https://github.com/knative/net-kourier/releases/download/knative-v1.23.0/kourier.yaml kourier.yaml\nfor fact in \\\n    release_apply_serving-crds.yaml=service/crds \\\n    release_apply_serving-core.yaml=configmap/core \\\n    release_apply_serving-core.yaml=service/core \\\n    release_apply_kourier.yaml=deployment/kourier; do grep -Fqx \"$fact\" $FACTS; done\n! grep -Fqx service/crds $FACTS\n! grep -Fqx configmap/core $FACTS\n! grep -Fqx service/core $FACTS\n! grep -Fqx deployment/kourier $FACTS\nfor name in serving-crds.yaml serving-core.yaml kourier.yaml; do [ ! -e $WORK/releases/$name ] && [ ! -L $WORK/releases/$name ]; done\n[ \"$(wc -l < $LANE13_TEST/curl.calls)\" -eq 3 ]\n[ \"$(wc -l < $LANE13_TEST/kubectl.calls)\" -eq 3 ]\n[ \"$(wc -l < $LANE13_TEST/apply.paths)\" -eq 3 ]\n! grep -Fq '://' $LANE13_TEST/apply.paths",
-    )
-    .replace(
-        "grep -Fq 'release_effective=https://release-assets.githubusercontent.com/asset' $FACTS\n[ \"$(wc -l < $LANE13_TEST/curl.calls)\" -eq 1 ]\n[ \"$(wc -l < $LANE13_TEST/kubectl.calls)\" -eq 2 ]\n",
-        "",
-    )
-    .replace(
-        "lane13_preflight\nmkdir $WORK",
-        "lane13_preflight\n[ \"$(wc -l < $LANE13_TEST/curl.calls)\" -eq 1 ]\n[ \"$(wc -l < $LANE13_TEST/kubectl.calls)\" -eq 1 ]\nrm -f $LANE13_TEST/curl.calls $LANE13_TEST/kubectl.calls\nmkdir $WORK",
-    )
-    .replace(
-        "lane13_fetch_release https://github.com/knative/serving/releases/download/knative-v1.23.0/serving-crds.yaml serving-crds.yaml\n[ ! -e $WORK/releases/serving-crds.yaml ]\nMUTATE=1",
-        "MUTATE=1",
-    )
-    .replace(
-        "[ \"$mutation_status\" -ne 0 ]\n[ -e $WORK/releases/serving-crds.yaml ]",
-        "[ \"$mutation_status\" -ne 0 ]\n[ -e $LANE13_TEST/mutated ]\n[ \"$(wc -l < $LANE13_TEST/curl.calls)\" -eq 1 ]\n[ \"$(wc -l < $LANE13_TEST/kubectl.calls)\" -eq 1 ]\n[ -e $WORK/releases/serving-crds.yaml ]",
-    )
-    .replace(
-        "rm -f $WORK/releases/serving-crds.yaml\nMUTATE=\nrm -f $LANE13_TEST/curl.calls",
-        "rm -f $WORK/releases/serving-crds.yaml\nMUTATE=\nrm -f $LANE13_TEST/mutated $LANE13_TEST/curl.calls",
-    )
-    .replace(
-        "[ \"$(wc -l < $LANE13_TEST/curl.calls)\" -eq 3 ]\n[ \"$(wc -l < $LANE13_TEST/kubectl.calls)\" -eq 3 ]",
-        "[ \"$(wc -l < $LANE13_TEST/curl.calls)\" -eq 3 ]\n! grep -Fqx -- --version $LANE13_TEST/curl.calls\ncurl_args='--fail --silent --show-error --retry 0 --connect-timeout 30 --max-time 180 --max-filesize 16777216 --proto =https --proto-redir =https --location --max-redirs 1'\nassert_curl_download() { expected=\"$curl_args --output $WORK/releases/$1 --write-out %{url_effective}\\\\n%{num_redirects} $2\"; grep -Fqx -- \"$expected\" $LANE13_TEST/curl.calls; }\nassert_curl_download serving-crds.yaml https://github.com/knative/serving/releases/download/knative-v1.23.0/serving-crds.yaml\nassert_curl_download serving-core.yaml https://github.com/knative/serving/releases/download/knative-v1.23.0/serving-core.yaml\nassert_curl_download kourier.yaml https://github.com/knative/net-kourier/releases/download/knative-v1.23.0/kourier.yaml\n[ \"$(wc -l < $LANE13_TEST/kubectl.calls)\" -eq 3 ]",
-    )
-    .replace(
-        " || [ \"$3\" = ubuntu:24.04 ] || return 1; if [ \"$3\" = ubuntu:24.04 ]; then ",
-        " || [ \"$3\" = ubuntu:24.04 ] || [ \"$3\" = node-id ] || return 1; if [ \"$3\" = ubuntu:24.04 ]; then ",
-    )
-    .replace(
-        "]; else printf '[{\"Id\":\"work\",\"RepoDigests\":[\"work@sha256:work\"],\"RootFS\":{\"Layers\":[\"a\",\"b\",\"c\"]}}]\\n'; fi;; pull)",
-        "]; elif [ \"$3\" = node-id ]; then printf '[{\"Id\":\"node-id\",\"RepoDigests\":[\"kindest/node@sha256:node\"],\"RootFS\":{\"Layers\":[\"node-layer\"]}}]\\n'; else printf '[{\"Id\":\"work\",\"RepoDigests\":[\"work@sha256:work\"],\"RootFS\":{\"Layers\":[\"a\",\"b\",\"c\"]}}]\\n'; fi;; pull)",
-    )
-    .replace(
-        "'create cluster') : > $LANE13_TEST/cluster.created;;",
-        "'create cluster') : > $LANE13_TEST/cluster.created; chmod 600 $KUBECONFIG;;",
-    )
-    .replace(
-        "rm -f $LANE13_TEST/curl.calls $LANE13_TEST/kubectl.calls\nmkdir $WORK",
-        "rm -f $LANE13_TEST/curl.calls $LANE13_TEST/kubectl.calls\nmkdir $WORK\nobsolete_url=https://github.com/knative/net-kourier/releases/download/knative-v1.23.0/kourier.yaml\ncp $FACTS $LANE13_TEST/obsolete-facts.before\nset +e\nlane13_fetch_release \"$obsolete_url\" kourier.yaml\nobsolete_status=$?\nset -e\n[ \"$obsolete_status\" -ne 0 ]\n[ ! -e $WORK/releases/kourier.yaml ] && [ ! -L $WORK/releases/kourier.yaml ]\n[ ! -e $WORK/releases/.lane13-applied ]\ncmp -s $LANE13_TEST/obsolete-facts.before $FACTS\n[ ! -e $LANE13_TEST/curl.calls ]\n[ ! -e $LANE13_TEST/apply.paths ]",
-    )
-    .replace(
-        "lane13_fetch_release https://github.com/knative/net-kourier/releases/download/knative-v1.23.0/kourier.yaml kourier.yaml",
-        "lane13_fetch_release https://github.com/knative-extensions/net-kourier/releases/download/knative-v1.23.0/kourier.yaml kourier.yaml",
-    )
-    .replace(
-        "assert_curl_download kourier.yaml https://github.com/knative/net-kourier/releases/download/knative-v1.23.0/kourier.yaml",
-        "assert_curl_download kourier.yaml https://github.com/knative-extensions/net-kourier/releases/download/knative-v1.23.0/kourier.yaml",
-    )
-    .replace(
-        "lane13_fetch_release https://github.com/knative-extensions/net-kourier/releases/download/knative-v1.23.0/kourier.yaml kourier.yaml\nfor fact in",
-        "lane13_fetch_release https://github.com/knative-extensions/net-kourier/releases/download/knative-v1.23.0/kourier.yaml kourier.yaml\ngrep -Fqx 'release_redirects=1' $FACTS\nfor fact in",
-    );
-    let obsolete_concrete_url =
-        "https://github.com/knative/net-kourier/releases/download/knative-v1.23.0/kourier.yaml";
-    assert_eq!(
-        body.matches(obsolete_concrete_url).count(),
-        1,
-        "generated fixture must retain exactly one obsolete-owner rejection probe"
-    );
-    assert_eq!(
-        body.matches("lane13_fetch_release \"$obsolete_url\" kourier.yaml")
-            .count(),
-        1,
-        "generated fixture must execute exactly one obsolete-owner probe"
-    );
-    assert_eq!(
-        body.matches(
-            "printf '%s\\n1' 'https://release-assets.githubusercontent.com/asset?secret=x'"
-        )
-        .count(),
-        1,
-        "successful fake release fetch must report one redirect"
-    );
-    assert!(
-        body.contains("grep -Fqx 'release_redirects=1' $FACTS"),
-        "generated fixture must assert one redirect for every successful release"
-    );
-    fs::write(&script, &body).expect("write lane-13 D1 test script");
-    let output = Command::new("sh")
-        .arg(&script)
-        .output()
-        .expect("exercise lane-13 D1 controls");
-    assert!(
-        output.status.success(),
-        "lane-13 D1 controls failed: stdout={} stderr={} script={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-        body
-    );
-}
-
-#[test]
 fn lane13_preflight_and_release_reject_tool_error_redirect_and_cap_before_apply() {
     let gate = read("scripts/matrix/verify-knative.sh");
     let preflight = between(&gate, "lane13_preflight() {", "\nlane13_image_facts() {");
@@ -7479,7 +8225,7 @@ curl() {{
   case ${{CURL_MODE-redirect}} in
     redirect) printf release > "$out"; printf 'https://release-assets.githubusercontent.com:444/asset\n2\n' ;;
     cap) truncate -s 16777217 "$out"; printf 'https://release-assets.githubusercontent.com/asset\n0\n' ;;
-    unsorted|sorted|duplicate|malformed|empty|nofinal|blank|control|nonascii|failure) printf release > "$out"; printf 'https://github.com/knative/serving/releases/download/knative-v1.23.0/serving-crds.yaml\n0\n' ;;
+    unsorted|sorted|duplicate|malformed|empty|nofinal|blank|control|nonascii|failure) /bin/cp -- "$D2_RELEASE_FIXTURES/${{out##*/}}" "$out"; printf 'https://github.com/knative/serving/releases/download/knative-v1.23.0/serving-crds.yaml\n0\n' ;;
   esac
 }}
 kubectl() {{
@@ -7602,6 +8348,11 @@ done
     .expect("write lane-13 negative script");
     let output = Command::new("sh")
         .arg(&script)
+        .env(
+            "D2_RELEASE_FIXTURES",
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/lane13-evidence/releases"),
+        )
         .output()
         .expect("exercise lane-13 negative controls");
     assert!(
@@ -7772,301 +8523,6 @@ exit "$failure"
         String::from_utf8_lossy(&output.stderr),
         fs::read_to_string(&facts).unwrap_or_else(|error| error.to_string())
     );
-}
-
-#[test]
-fn lane13_evidence_finalizes_only_after_owned_cleanup_synthetic_regression() {
-    let gate = read("scripts/matrix/verify-knative.sh");
-    for marker in [
-        "lane13_outer() {",
-        "lane13_record_facts() {",
-        "lane13_preserve_diagnostics() {",
-        "input_ledger_start=",
-        "input_ledger_end=",
-        "status",
-    ] {
-        assert!(gate.contains(marker), "lane-13 D2 marker missing: {marker}");
-    }
-    assert!(
-        !gate.contains("knative scale-from-zero: ALL OK"),
-        "lane-13 must use its decimal status as the only terminal authority"
-    );
-
-    let directory = tempfile::tempdir().expect("temporary lane-13 D2 directory");
-    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
-        .expect("make lane-13 D2 parent private");
-    let script = directory.path().join("d2.sh");
-    let outer = between(&gate, "lane13_outer() {", "\nterminate_port_forward() {");
-    let preserve = between(
-        &gate,
-        "lane13_preserve_diagnostics() {",
-        "\nterminate_port_forward() {",
-    );
-    let inputs = between(
-        &gate,
-        "lane13_record_inputs() {",
-        "\nlane13_record_facts() {",
-    );
-    let facts = between(
-        &gate,
-        "lane13_record_facts() {",
-        "\nlane13_record_file_fact() {",
-    );
-    let compare_inputs = between(
-        &gate,
-        "lane13_compare_input_ledgers() {",
-        "\nlane13_record_file_fact() {",
-    );
-    let validate = between(
-        &gate,
-        "lane13_validate_retained_root() {",
-        "\nlane13_outer() {",
-    );
-    let sha256 = between(
-        &gate,
-        "lane13_sha256() {",
-        "\nlane13_preserve_diagnostics() {",
-    );
-    let canonical = between(
-        &gate,
-        "lane13_canonical_script() {",
-        "\nlane13_authorize_body() {",
-    );
-    let authorize_body = between(
-        &gate,
-        "lane13_authorize_body() {",
-        "\nlane13_signal_body_group() {",
-    );
-    let remove_work = between(
-        &gate,
-        "lane13_remove_owned_work() {",
-        "\nlane13_remove_owned_kubeconfig() {",
-    );
-    let remove_kubeconfig = between(
-        &gate,
-        "lane13_remove_owned_kubeconfig() {",
-        "\nlane13_record_absence_fact() {",
-    );
-    let absence = between(
-        &gate,
-        "lane13_record_absence_fact() {",
-        "\nlane13_validate_retained_root() {",
-    );
-    let cleanup = between(&gate, "cleanup() {", "\n. scripts/cleanup-traps.sh");
-    let body = format!(
-        r#"#!/bin/sh
-set -eu
-. scripts/lib.sh
-EVIDENCE=
-EVIDENCE_OWNED=0
-LANE13_OUTER_EXIT_ARMED=0
-LANE13_OUTER_PENDING_STATUS=
-FACTS=
-TOKEN=test-token
-P11SCOPE_LANE_EVIDENCE_DIR={root}/evidence
-MARKERS={root}/markers
-WORK={root}/work
-PRODUCT=$WORK/product
-KUBECONFIG=$WORK/kubeconfig
-WORK_CREATED=
-KUBECONFIG_CREATED=
-IMAGE_CREATED=
-CLUSTER_CREATED=
-IMAGE_CLEANUP_ARMED=
-CLUSTER_CLEANUP_ARMED=
-IMAGE_ID=
-CLUSTER_NODE=
-CLUSTER_NODE_ID=
-PF_PID= PF_STARTTIME= PF_PGID= PF_SID= PF_GROUP_SNAPSHOT= PF_SESSION_EMPTY=1
-LANE13_BODY_PID= LANE13_BODY_STARTTIME= LANE13_BODY_PGID= LANE13_BODY_SID=
-LANE13_BODY_SIGNAL= LANE13_BODY_SIGNAL_STATUS=0
-SPID= SUPERVISOR_PID= SUPERVISOR_STARTTIME=
-ROOT_LAUNCH_PID= ROOT_PROCESS_PID= ROOT_PROCESS_STARTTIME=
-CLEANUP_STATUS=0
-BODY_STATUS=0
-lane13_fact() {{ printf '%s\n' "$1" >> "$FACTS"; }}
-lane13_record_inputs() {{{inputs}
-lane13_record_facts() {{{facts}
-lane13_compare_input_ledgers() {{{compare_inputs}
-lane13_sha256() {{{sha256}
-lane13_canonical_script() {{{canonical}
-lane13_authorize_body() {{{authorize_body}
-lane13_remove_owned_work() {{{remove_work}
-lane13_remove_owned_kubeconfig() {{{remove_kubeconfig}
-lane13_record_absence_fact() {{{absence}
-cleanup_step() {{ "$@"; cleanup_step_status=$?; [ "$CLEANUP_STATUS" -ne 0 ] || [ "$cleanup_step_status" -eq 0 ] || CLEANUP_STATUS=$cleanup_step_status; return 0; }}
-terminate_port_forward() {{ :; }}
-snapshot_user_process_session() {{
-    [ "${{LANE13_TEST_SNAPSHOT_FAIL-}}" != 1 ] || return 1
-    printf '[]'
-}}
-launch_user_recorded_process_group() {{
-    lurpg_pidfile=$1; lurpg_log=$2; shift 2
-    "$@" >"$lurpg_log" 2>&1 &
-    USER_PROCESS_LAUNCH_PID=$!
-    USER_PROCESS_PID=$!
-    USER_PROCESS_STARTTIME=$(awk '{{ sub(/^[0-9]+ \\(.*\\) /, ""); split($0, tail, " "); print tail[20]; exit }}' "/proc/$!/stat")
-    USER_PROCESS_PGID=$!
-    USER_PROCESS_SID=$!
-    : > "$lurpg_pidfile"
-}}
-lane13_delete_owned_cluster() {{ : > "$MARKERS/cluster-identity-mismatch"; return 1; }}
-lane13_delete_owned_image() {{ : > "$MARKERS/image-cleaned"; return 0; }}
-reclaim_root_output() {{ :; }}
-mkdir -p -m 700 "$MARKERS"
-lane13_preserve_diagnostics() {{{preserve}
-cleanup() {{{cleanup}
-if [ "${{P11SCOPE_LANE13_BODY-}}" = 1 ]; then
-    EVIDENCE=$P11SCOPE_LANE_EVIDENCE_DIR
-    FACTS=$EVIDENCE/facts.log
-    : > "$FACTS"; chmod 600 "$FACTS"
-    printf '%s\n' body-stdout
-    printf '%s\n' body-stderr >&2
-    BODY_STATUS=0
-    mkdir -m 700 "$WORK"; WORK_CREATED=1; WORK_DEV_INO=$(stat -Lc '%d:%i' "$WORK")
-    lane13_record_facts
-    : > "$WORK/observed.json"
-    : > "$WORK/manifest-host.json"
-    : > "$WORK/profile.log"
-    : > "$WORK/portforward.log"
-    : > "$WORK/portforward.group.before.json"
-    : > "$WORK/portforward.group.after.json"
-    : > "$WORK/foreign-unrelated.tmp"
-    : > "$KUBECONFIG"; KUBECONFIG_CREATED=1; KUBECONFIG_DEV_INO=$(stat -Lc '%d:%i' "$KUBECONFIG")
-    CLUSTER_CREATED=1; IMAGE_CREATED=1; IMAGE_CLEANUP_ARMED=1; CLUSTER_CLEANUP_ARMED=1
-    cleanup
-fi
-lane13_validate_retained_root() {{{validate}
-lane13_outer() {{{outer}
-lane13_outer
-"#,
-        root = directory.path().display(),
-        outer = outer,
-        inputs = inputs,
-        facts = facts,
-        compare_inputs = compare_inputs,
-        sha256 = sha256,
-        canonical = canonical,
-        authorize_body = authorize_body,
-        remove_work = remove_work,
-        remove_kubeconfig = remove_kubeconfig,
-        absence = absence,
-        validate = validate,
-        preserve = preserve,
-        cleanup = cleanup,
-    );
-    fs::write(&script, body).expect("write lane-13 D2 test script");
-    let output = Command::new("sh")
-        .arg(&script)
-        .output()
-        .expect("exercise lane-13 D2 transaction");
-    assert_eq!(
-        output.status.code(),
-        Some(1),
-        "identity mismatch must be nonzero: stdout={} stderr={} evidence={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-        fs::read_dir(directory.path().join("evidence"))
-            .map(|entries| entries
-                .filter_map(Result::ok)
-                .map(|entry| entry.file_name())
-                .collect::<Vec<_>>())
-            .map(|entries| format!("{entries:?}"))
-            .unwrap_or_else(|error| error.to_string())
-    );
-    let evidence = directory.path().join("evidence");
-    assert!(
-        evidence.join("stdout.log").is_file(),
-        "outer stdout missing: path={} status={} stdout={} stderr={}",
-        directory.path().display(),
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(evidence.join("stderr.log").is_file());
-    assert!(
-        fs::read_to_string(evidence.join("stdout.log"))
-            .expect("read body stdout")
-            .contains("body-stdout"),
-        "captured stdout missing body output"
-    );
-    assert!(
-        fs::read_to_string(evidence.join("stderr.log"))
-            .expect("read body stderr")
-            .contains("body-stderr")
-    );
-    assert!(evidence.join("facts.log").is_file());
-    let facts = fs::read_to_string(evidence.join("facts.log")).expect("read final facts");
-    assert!(facts.contains("input_ledger_start="));
-    assert!(
-        facts.contains("input_ledger_end="),
-        "missing end ledger: stderr={} facts={}",
-        String::from_utf8_lossy(&output.stderr),
-        facts
-    );
-    assert!(facts.contains("cluster_absent=0"));
-    assert!(facts.contains("workload_tag_absent=1"));
-    assert!(
-        facts.contains("work_absent=0"),
-        "missing retained-work fact: {facts}"
-    );
-    assert!(!facts.contains(".lane13-inputs-"));
-    assert_eq!(
-        fs::read_to_string(evidence.join("status")).expect("read final status"),
-        "1\n"
-    );
-    assert!(directory.path().join("work").is_dir());
-    assert!(
-        directory
-            .path()
-            .join("markers/cluster-identity-mismatch")
-            .exists()
-    );
-    assert!(directory.path().join("markers/image-cleaned").exists());
-    for name in [
-        "observed.json",
-        "manifest-host.json",
-        "profile.log",
-        "portforward.log",
-        "portforward.group.before.json",
-        "portforward.group.after.json",
-    ] {
-        assert!(
-            evidence.join(name).is_file(),
-            "missing retained artifact {name}"
-        );
-    }
-    assert!(!evidence.join("foreign-unrelated.tmp").exists());
-    for entry in fs::read_dir(&evidence).expect("read retained evidence root") {
-        let entry = entry.expect("read retained evidence entry");
-        let metadata = entry.metadata().expect("read retained evidence metadata");
-        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
-    }
-    assert_eq!(
-        fs::metadata(&evidence)
-            .expect("read retained root metadata")
-            .permissions()
-            .mode()
-            & 0o777,
-        0o700
-    );
-
-    fs::remove_dir_all(&evidence).expect("remove first synthetic evidence root");
-    let snapshot_failure = Command::new("sh")
-        .arg(&script)
-        .env("LANE13_TEST_SNAPSHOT_FAIL", "1")
-        .output()
-        .expect("exercise unknown body-group state");
-    assert!(!snapshot_failure.status.success());
-    assert_eq!(
-        fs::read_to_string(evidence.join("status")).expect("read snapshot-failure status"),
-        "1\n"
-    );
-    assert!(
-        evidence.join(".lane13-body.pid").is_file(),
-        "unknown body-group state discarded its durable identity"
-    );
-    assert!(evidence.join(".lane13-body-launch.log").is_file());
 }
 
 #[test]
@@ -8370,1158 +8826,25 @@ fn every_gate_script_self_tests_its_own_validator() {
 
 #[test]
 fn lane13_evidence_finalizes_only_after_owned_cleanup() {
-    let gate = read("scripts/matrix/verify-knative.sh");
-    require_before(
-        &gate,
-        "mkdir -p \"${WORK%/*}\"",
-        "mkdir \"$WORK\"",
-        "lane-13 creates only the fixed parent before exclusively creating its token work root",
-    )
-    .unwrap();
-    assert_eq!(
-        gate.matches("python3 scripts/check-capture-evidence.py lane13-knative-metrics")
-            .count(),
-        1,
-        "the exact lane-13 checker must be invoked once"
-    );
-    for marker in [
-        "P11SCOPE_LANE13_BODY",
-        "P11SCOPE_LANE13_TOKEN",
-        "P11SCOPE_LANE13_TOKEN is private lane state",
-        "LANE13_BODY_STARTTIME",
-        "LANE13_BODY_SIGNAL",
-        "lane13_container_absent",
-        "len(items) != len(set(items))",
-        "for item in sorted(items):",
-        "git diff --cached --quiet",
-        "input_ledger_start=",
-        "input_ledger_end=",
-        "RepoDigests",
-        "diff_ids",
-        "dev_ino",
-    ] {
-        assert!(
-            gate.contains(marker),
-            "lane-13 Fix Round 1 marker missing: {marker}"
-        );
-    }
-    assert!(!gate.contains("knative scale-from-zero: ALL OK"));
-    assert!(!gate.contains("kill \"$launcher\""));
-    let final_status_write = gate
-        .rfind("printf '%s\\n' \"$lane13_outer_status\" > \"$EVIDENCE/status\"")
-        .expect("outer terminal status write");
-    let final_int_trap = gate
-        .rfind("trap 'lane13_outer_signal 1' INT")
-        .expect("final INT trap installation");
-    let final_term_trap = gate
-        .rfind("trap 'lane13_outer_signal 1' TERM")
-        .expect("final TERM trap installation");
-    let final_signal_check = gate
-        .find("[ \"$LANE13_BODY_SIGNAL_STATUS\" -eq 0 ] || lane13_outer_status=1")
-        .expect("final body signal-status check");
-    assert!(final_int_trap < final_signal_check);
-    assert!(final_term_trap < final_signal_check);
-    assert!(final_signal_check < final_status_write);
-    let terminal_failure = between(
-        &gate,
-        "lane13_outer_terminal_failure() {",
-        "\nlane13_outer_signal() {",
-    );
-    let terminal_trap = terminal_failure
-        .find("trap ':' EXIT")
-        .expect("terminal failure keeps EXIT trap controlled");
-    let terminal_failure_write = terminal_failure
-        .find("printf '%s\\n' \"$lane13_terminal_status\" > \"$EVIDENCE/status\"")
-        .expect("terminal failure status write");
-    assert!(terminal_trap < terminal_failure_write);
-    let retained_root_check = gate
-        .rfind("if ! lane13_validate_retained_root; then lane13_outer_status=1; fi")
-        .expect("retained-root validation");
-    assert!(final_status_write > retained_root_check);
-
-    let directory = tempfile::tempdir().expect("temporary lane-13 D2 directory");
-    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
-        .expect("make lane-13 D2 parent private");
-    let fake_bin = directory.path().join("bin");
-    let state = directory.path().join("state");
-    let provider = directory.path().join("provider");
-    fs::create_dir(&fake_bin).expect("create fake command directory");
-    fs::create_dir(&state).expect("create fake state directory");
-    fs::create_dir(&provider).expect("create fake provider directory");
-    fs::write(provider.join("libsofthsm2.so"), b"fake provider bytes\n")
-        .expect("write fake provider");
+    let directory = tempfile::tempdir().expect("temporary lane-13 bridge directory");
     let ebpf_object = directory.path().join("p11scope-ebpf");
     fs::write(&ebpf_object, p11scope::EBPF_OBJECT).expect("write real embedded eBPF object");
-
-    let dispatcher = r###"#!/bin/sh
-name=${D2_COMMAND_NAME:-$(basename "$0")}
-work=$(dirname "${KUBECONFIG:-/tmp/none}")
-echo "$name $*" >> "$D2_STATE/calls"
-cluster="p11scope-knative-$P11SCOPE_LANE13_TOKEN"
-image="kind.local/p11scope-matrix-knative:$P11SCOPE_LANE13_TOKEN"
-case "$name" in
-mkdir)
-    mkdir_target=
-    for argument do
-        case "$argument" in
-            -*) ;;
-            *) mkdir_target=$argument ;;
-        esac
-    done
-    case "$D2_MODE" in
-        mkdir-failure-symlink|mkdir-failure-symlink-signal)
-            /bin/ln -s "$D2_STATE/foreign-symlink-target" "$mkdir_target"
-            if [ "$D2_MODE" = mkdir-failure-symlink-signal ]; then
-                kill -TERM "$PPID"
-            fi
-            exit 1 ;;
-        mkdir-failure-directory|mkdir-failure-directory-signal)
-            /bin/mkdir -m 700 "$mkdir_target"
-            printf '%s\n' foreign-directory-sentinel-a > "$mkdir_target/sentinel-a"
-            printf '%s\n' foreign-directory-sentinel-b > "$mkdir_target/sentinel-b"
-            chmod 640 "$mkdir_target/sentinel-a"
-            chmod 600 "$mkdir_target/sentinel-b"
-            if [ "$D2_MODE" = mkdir-failure-directory-signal ]; then
-                kill -TERM "$PPID"
-            fi
-            exit 1 ;;
-    esac
-    /bin/mkdir "$@"
-    mkdir_status=$?
-    if [ "$D2_MODE" = mkdir-signal ] && [ "$mkdir_status" -eq 0 ] && [ ! -e "$D2_STATE/mkdir-signal" ]; then
-        : > "$D2_STATE/mkdir-signal"
-        kill -TERM "$PPID"
-    fi
-    exit "$mkdir_status" ;;
-git)
-    echo "$*" >> "$D2_STATE/git.calls"
-    if [ "$D2_MODE" = signal-after-root ] && [ "$1" = rev-parse ] && [ "$2" = --show-object-format ] && [ ! -e "$D2_STATE/signal-after-root" ]; then
-        : > "$D2_STATE/signal-after-root"
-        kill -TERM "${P11SCOPE_LANE13_OUTER_PID:?}"
-    fi
-    if [ "$1" = diff ]; then [ ! -e "$D2_STATE/mutate-head" ]; exit $?; fi
-    if [ "$1" = rev-parse ] && [ "$2" = HEAD ]; then
-        if [ -e "$D2_STATE/mutate-head" ]; then printf '%040d\n' 2; else printf '%040d\n' 1; fi; exit 0
-    fi
-    if [ "$1" = rev-parse ] && [ "$2" = 'HEAD^{tree}' ]; then
-        if [ -e "$D2_STATE/mutate-head" ]; then printf '%040d\n' 2; else printf '%040d\n' 1; fi; exit 0
-    fi
-    case " $* " in
-        *" --show-object-format "*) echo sha1; exit 0 ;;
-        *" ls-files "*) exec /usr/bin/git "$@" ;;
-        *" status --porcelain=v1 "*) [ ! -e "$D2_STATE/mutate-head" ] || echo ' M scripts/matrix/verify-knative.sh'; exit 0 ;;
-        *" diff --quiet "*|*" diff --cached --quiet "*) [ ! -e "$D2_STATE/mutate-head" ]; exit $? ;;
-    esac
-    exit 1 ;;
-cargo)
-    if [ "$2" = --version ] || [ "$3" = --version ]; then echo 'cargo 1.88.0 (fake)'; exit 0; fi
-    target=target; previous=
-    for argument do [ "$previous" = --target-dir ] && target=$argument; previous=$argument; done
-    mkdir -p "$target/release/build/p11scope-1/out" "$target/release"
-    /bin/cp "$D2_EBPF_OBJECT" "$target/release/build/p11scope-1/out/p11scope-ebpf"
-    cat > "$target/release/p11scope" <<'SCRIPT'
-#!/bin/sh
-if [ "$1" = profile ]; then
-    case " $* " in *" --duration 1 "*) echo 'cannot inspect the file locator now (Permission denied)' >&2; exit 1 ;; esac
-    output=; previous=
-    for argument do [ "$previous" = -o ] && output=$argument; previous=$argument; done
-    if [ -n "$output" ]; then
-        /usr/bin/python3 - "$output" <<'PY'
-import json
-import pathlib
-import runpy
-import sys
-
-check = runpy.run_path("scripts/check-capture-evidence.py")
-evidence = check["evidence_fixture"](
-    check["LEGACY_SURFACES"], sources=("manifest",), discovery_skipped=0
-)
-evidence["skipped"] = [{
-    "name": check["DISCOVERY_SUBJECT"],
-    "reason": check["SHARED_OVERLAY_UNCERTAINTY"],
-}]
-evidence.update(table_entries=68, slots=68, attached_probes=136)
-document = check["document_fixture"](
-    evidence,
-    schema=check["METRICS_SCHEMA"],
-    mode="metrics",
-    privacy="aggregate-only",
-)
-pairs = [( ["C_GetFunctionList"], 1)]
-for line in pathlib.Path("spike/expected.txt").read_text().splitlines():
-    name, calls = line.split()
-    pairs.append(([name], int(calls)))
-document["functions"] = check["function_items"](pairs)
-pathlib.Path(sys.argv[1]).write_text(json.dumps(document), encoding="utf-8")
-PY
-    fi
-    echo 'capture — privacy=aggregate-only'; exit 0
-fi
-exit 0
-SCRIPT
-    chmod 755 "$target/release/p11scope"
-    cat > "$target/release/p11scope-discover" <<'SCRIPT'
-#!/bin/sh
-module=; output=; previous=
-for argument do [ "$previous" = --module ] && module=$argument; [ "$previous" = -o ] && output=$argument; previous=$argument; done
-printf '{"schema":"p11scope-manifest/5","module_path":"%s","objects":[{"path":"%s"}]}\n' "$module" "$module" > "$output"
-SCRIPT
-    chmod 755 "$target/release/p11scope-discover"
-    [ "$D2_MODE" = sleep-build ] && sleep 30
-    [ "$D2_MODE" = mutate-head ] && : > "$D2_STATE/mutate-head"
-    exit 0 ;;
-rustc) echo 'rustc 1.88.0 (fake)'; exit 0 ;;
-python3)
-    if [ "$1" = scripts/check-capture-evidence.py ]; then
-        printf '%s\n' checker >> "$D2_STATE/checker.calls"
-    fi
-    if [ "$D2_MODE" = terminal-signal ] && [ "$1" = - ] \
-        && [ "${2-}" = "${P11SCOPE_LANE_EVIDENCE_DIR-}" ] \
-        && [ -e "$P11SCOPE_LANE_EVIDENCE_DIR/facts.log" ] \
-        && [ ! -e "$D2_STATE/terminal-signal-ready" ]; then
-        : > "$D2_STATE/terminal-signal-ready"
-        while [ ! -e "$D2_STATE/terminal-signal-go" ]; do sleep 0.01; done
-    fi
-    if [ "$1" = -c ] && printf '%s\n' "$2" | grep -Fq socket.create_connection; then
-        [ -e "$D2_STATE/portforward-ready" ]
-        exit $?
-    fi
-    exec /usr/bin/python3 "$@" ;;
-gcc)
-    if [ "$1" = --version ]; then echo 'gcc (fake) 14.0.0'; exit 0; fi
-    output=; previous=
-    for argument do [ "$previous" = -o ] && output=$argument; previous=$argument; done
-    : > "$output"; chmod 755 "$output"; exit 0 ;;
-curl)
-    if [ "$1" = --version ]; then echo 'curl 8.4.0'; exit 0; fi
-    output=; previous=
-    for argument do [ "$previous" = --output ] && output=$argument; previous=$argument; done
-    [ -n "$output" ] || exit 0
-    echo 'apiVersion: v1' > "$output"; printf '%s\n%s\n' 'https://github.com/knative/serving/releases/download/knative-v1.23.0/fake.yaml' 0; exit 0 ;;
-docker)
-    case " $* " in
-        *" version --format "*) [ "$D2_MODE" = setup-failure ] && exit 1; echo 27.0.0; exit 0 ;;
-        *" info --format "*) echo overlay2; exit 0 ;;
-        *" image ls "*)
-            [ "$D2_MODE" = image-query-failure ] && exit 1
-            [ "$D2_MODE" = cleanup-image-query-failure ] && [ -e "$D2_STATE/image-created" ] && exit 1
-            if [ -e "$D2_STATE/image-created" ] && [ ! -e "$D2_STATE/image-removed" ]; then
-                printf '%s\t%s\tsha256:workload\n' \
-                    kind.local/p11scope-matrix-knative "$P11SCOPE_LANE13_TOKEN"
-            fi
-            exit 0 ;;
-        *" pull "*) exit 0 ;;
-        *" build "*) : > "$D2_STATE/image-created"; echo sha256:workload; exit 0 ;;
-        *" image rm "*) : > "$D2_STATE/image-cleaned"; [ "$D2_MODE" = cleanup-image-failure ] && exit 1; : > "$D2_STATE/image-removed"; exit 0 ;;
-        *" container inspect "*)
-            case " $* " in *" {{.Id}} "*) echo node-id ;; *" {{.Image}} "*) echo sha256:nodeimage ;; *) echo kindest/node:v1.33 ;; esac; exit 0 ;;
-        *" container ls "*)
-            [ "$D2_MODE" = cleanup-node-query-failure ] && [ -e "$D2_STATE/cluster-delete-called" ] && exit 1
-            [ ! -e "$D2_STATE/cluster" ] || printf 'node-id\tfake-node\n'; exit 0 ;;
-        *" image inspect "*)
-            case " $* " in *" --format "*) case " $* " in *"$image"*) echo sha256:workload ;; *) echo sha256:nodeimage ;; esac; exit 0 ;; esac
-            target=; for argument do target=$argument; done
-            [ "$target" = "$image" ] && [ -e "$D2_STATE/image-removed" ] && exit 1
-            if [ "$D2_MODE" = partial-image-creation ] && [ "$target" = "$image" ] \
-                && [ ! -e "$D2_STATE/partial-image-failed" ]; then
-                : > "$D2_STATE/partial-image-failed"; exit 1
-            fi
-            if [ "$D2_MODE" = cluster-replacement ] && [ "$target" = sha256:nodeimage ] \
-                && [ ! -e "$D2_STATE/cluster-replacement-failed" ]; then
-                : > "$D2_STATE/cluster-replacement-failed"; exit 1
-            fi
-            case "$target" in ubuntu:24.04) echo '[{"Id":"sha256:base","RepoDigests":["ubuntu@sha256:base"],"RootFS":{"Layers":["sha256:base"]}}]' ;; sha256:nodeimage) echo '[{"Id":"sha256:nodeimage","RepoDigests":["kindest/node@sha256:node"],"RootFS":{"Layers":["sha256:node-layer-1","sha256:node-layer-2"]}}]' ;; *) echo '[{"Id":"sha256:workload","RepoDigests":["kind.local/p11scope-matrix-knative@sha256:workload"],"RootFS":{"Layers":["sha256:base","sha256:work-layer"]}}]' ;; esac; exit 0 ;;
-    esac
-    exit 1 ;;
-kind)
-    case " $* " in
-        *" version "*) echo kind-v0.25.0; exit 0 ;;
-        *" get clusters "*)
-            [ "$D2_MODE" = cleanup-cluster-query-failure ] && [ -e "$D2_STATE/cluster-delete-called" ] && exit 1
-            [ ! -e "$D2_STATE/cluster" ] || echo "$cluster"; exit 0 ;;
-        *" get nodes "*)
-            if [ "$D2_MODE" = partial-cluster-creation ] \
-                && [ ! -e "$D2_STATE/partial-cluster-failed" ]; then
-                : > "$D2_STATE/partial-cluster-failed"; exit 1
-            fi
-            if [ "$D2_MODE" = cluster-replacement ]; then
-                if [ -e "$D2_STATE/cluster-node-observed" ]; then echo decoy-node; else : > "$D2_STATE/cluster-node-observed"; echo fake-node; fi
-                exit 0
-            fi
-            echo fake-node; exit 0 ;;
-        *" create cluster "*) mkdir -p "$(dirname "$KUBECONFIG")"; : > "$KUBECONFIG"; chmod 600 "$KUBECONFIG"; : > "$D2_STATE/cluster"; exit 0 ;;
-        *" load docker-image "*) exit 0 ;;
-        *" delete cluster "*) : > "$D2_STATE/cluster-delete-called"; [ "$D2_MODE" = cleanup-cluster-failure ] || rm -f "$D2_STATE/cluster"; [ "$D2_MODE" = cleanup-cluster-failure ] && exit 1 || exit 0 ;;
-    esac
-    exit 1 ;;
-kubectl)
-    case " $* " in
-        *" version --client "*) echo gitVersion: v1.33.0; exit 0 ;;
-        *" get deployment "*) exit 1 ;;
-        *" get pods -n knative-serving "*) echo knative-pod; exit 0 ;;
-        *" get pods -n kourier-system "*) echo kourier-pod; exit 0 ;;
-        *" get pods "*" --sort-by=.metadata.creationTimestamp "*) echo fake-cold-pod; exit 0 ;;
-        *" get pods "*" -l "*) exit 0 ;;
-        *" get ksvc "*) echo fake.example; exit 0 ;;
-        *" exec "*" readlink -f "*) echo /usr/lib/softhsm/libsofthsm2.so; exit 0 ;;
-        *" exec "*" tar "*) exec /usr/bin/tar -chC "$D2_PROVIDER" . ;;
-        *" apply "*)
-            file=; previous=
-            for argument do [ "$previous" = -f ] && file=$argument; previous=$argument; done
-            case "$file" in
-                *serving-crds.yaml|*serving-core.yaml|*kourier.yaml) echo configmaps/fake; exit 0 ;;
-                *ksvc.yaml) for name in observed.json manifest-host.json profile.log portforward.log portforward.group.before.json portforward.group.after.json; do : > "$work/$name"; done; : > "$work/foreign-unrelated.tmp"; case "$D2_MODE" in body-success|terminal-signal|cleanup-image-query-failure|cleanup-cluster-query-failure|cleanup-node-query-failure) exit 0 ;; esac; exit 1 ;;
-                *) exit 0 ;;
-            esac ;;
-    esac
-    if [ "$1" = get ] && [ "$2" = pod ]; then
-        pod=$3; namespace=default; pod_query=$*; shift 3
-        while [ "$#" -gt 0 ]; do [ "$1" = -n ] && namespace=$2 && shift; shift; done
-        case " $pod_query " in
-            *creationTimestamp*) /usr/bin/date -u -d '+1 minute' '+%Y-%m-%dT%H:%M:%SZ'; exit 0 ;;
-            *containerID*) echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; exit 0 ;;
-        esac
-        printf '{"metadata":{"namespace":"%s","name":"%s","uid":"uid-%s"},"spec":{"containers":[{"name":"anchor","image":"kind.local/fake:tag"}]},"status":{"containerStatuses":[{"name":"anchor","containerID":"containerd://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","imageID":"sha256:runtime","ready":true,"restartCount":0}]}}\n' "$namespace" "$pod" "$pod"; exit 0
-    fi
-    case " $* " in
-        *" config use-context "*|*" wait "*|*" patch "*|*" set env "*) exit 0 ;;
-        *" port-forward "*) case "$D2_MODE" in body-success|terminal-signal|cleanup-image-query-failure|cleanup-cluster-query-failure|cleanup-node-query-failure) exec "$D2_PORT_FORWARD_HELPER" "$@" ;; *) sleep 30; exit 143 ;; esac ;;
-    esac
-    exit 0 ;;
-sudo)
-    [ "$1" = -n ] && shift
-    if [ "$1" = timeout ]; then
-        shift
-        while [ "$#" -gt 0 ]; do case "$1" in --signal=*|--kill-after=*) shift ;; --signal|--kill-after) shift 2 ;; *s) shift; break ;; *) break ;; esac; done
-        case "$1" in find) echo /sys/fs/cgroup/kubepods.slice/fake.scope; exit 0 ;; awk) echo 4242; exit 0 ;; stat) echo 0:123; exit 0 ;; esac
-    fi
-    case "$1" in
-        stat) case " $* " in *" %s "*) /usr/bin/stat -Lc %s "$D2_PROVIDER/libsofthsm2.so" ;; *) echo 0:123 ;; esac; exit 0 ;;
-        sha256sum) /usr/bin/sha256sum "$D2_PROVIDER/libsofthsm2.so"; exit 0 ;;
-        readelf) echo '    Build ID: deadbeef'; exit 0 ;;
-    esac
-    exec "$@" ;;
-timeout)
-    while [ "$#" -gt 0 ]; do case "$1" in --signal=*|--kill-after=*) shift ;; --signal|--kill-after) shift 2 ;; *s) shift; break ;; *) break ;; esac; done
-    exec "$@" ;;
-readelf)
-    case "$*" in
-        *p11scope-ebpf|*/proc/*/fd/*) exec /usr/bin/readelf "$@" ;;
-        *) echo '    Build ID: deadbeef'; exit 0 ;;
-    esac ;;
-cp) case "$D2_MODE:$*" in copy-failure:*observed.json*) exit 1 ;; esac; exec /bin/cp "$@" ;;
-tar) exec /usr/bin/tar "$@" ;;
-sha256sum) exec /usr/bin/sha256sum "$@" ;;
-*) exec "/usr/bin/$name" "$@" ;;
-esac
-"###;
-    let port_forward_source = directory.path().join("port-forward-helper.c");
-    let port_forward_helper = fake_bin.join("kubectl");
-    fs::write(
-        &port_forward_source,
-        r#"#include <fcntl.h>
-#include <signal.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-extern char **environ;
-static void on_signal(int signal_number) {
-    (void)signal_number;
-    _exit(0);
-}
-int main(int argc, char **argv) {
-    if (argc > 1 && strcmp(argv[1], "port-forward") == 0) {
-        signal(SIGINT, on_signal);
-        signal(SIGTERM, on_signal);
-        char ready[4096];
-        snprintf(ready, sizeof(ready), "%s/portforward-ready", getenv("D2_STATE"));
-        close(creat(ready, 0600));
-        for (;;) pause();
-    }
-    char *dispatch = getenv("D2_DISPATCH_PATH");
-    if (dispatch == 0) {
-        return 127;
-    }
-    setenv("D2_COMMAND_NAME", "kubectl", 1);
-    execve(dispatch, argv, environ);
-    return 127;
-}
-"#,
-    )
-    .expect("write fake port-forward helper");
-    let dispatch_path = fake_bin.join("dispatch");
-    let helper_status = Command::new("/usr/bin/cc")
-        .args(["-O0", "-o"])
-        .arg(fake_bin.join("kubectl"))
-        .arg(&port_forward_source)
-        .status()
-        .expect("compile fake port-forward helper");
-    assert!(
-        helper_status.success(),
-        "fake port-forward helper did not compile"
-    );
-    fs::write(fake_bin.join("dispatch"), dispatcher).expect("write fake dispatcher");
-    fs::set_permissions(fake_bin.join("dispatch"), fs::Permissions::from_mode(0o755))
-        .expect("make fake dispatcher executable");
-    for command in [
-        "git",
-        "cargo",
-        "rustc",
-        "gcc",
-        "curl",
-        "docker",
-        "kind",
-        "sudo",
-        "timeout",
-        "readelf",
-        "cp",
-        "tar",
-        "sha256sum",
-        "python3",
-        "mkdir",
-    ] {
-        std::os::unix::fs::symlink("dispatch", fake_bin.join(command)).unwrap();
-    }
-
-    let run = |mode: &str, evidence: &std::path::Path| {
-        for marker in [
-            "cluster",
-            "cluster-delete-called",
-            "image-created",
-            "image-cleaned",
-            "image-removed",
-            "partial-image-failed",
-            "partial-cluster-failed",
-            "cluster-node-observed",
-            "cluster-replacement-failed",
-            "mutate-head",
-            "signal-after-root",
-            "mkdir-signal",
-            "portforward-ready",
-        ] {
-            let _ = fs::remove_file(state.join(marker));
-        }
-        let _ = fs::remove_file(state.join("checker.calls"));
-        Command::new("sh")
-            .args(["scripts/matrix/verify-knative.sh"])
-            .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
-            .env("D2_STATE", &state)
-            .env("D2_PROVIDER", &provider)
-            .env("D2_EBPF_OBJECT", &ebpf_object)
-            .env("D2_MODE", mode)
-            .env("D2_DISPATCH_PATH", &dispatch_path)
-            .env("D2_PORT_FORWARD_HELPER", &port_forward_helper)
-            .env("P11SCOPE_LANE_EVIDENCE_DIR", evidence)
-            .output()
-            .expect("run real lane-13 script")
-    };
-
-    let injected = directory.path().join("injected");
-    let injection = Command::new("sh")
-        .args(["scripts/matrix/verify-knative.sh", "--lane13-private-body"])
-        .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
-        .env("D2_STATE", &state)
-        .env("D2_PROVIDER", &provider)
-        .env("P11SCOPE_LANE_EVIDENCE_DIR", &injected)
-        .env("P11SCOPE_LANE13_BODY", "1")
-        .env("P11SCOPE_LANE13_TOKEN", "forged")
+    let output = Command::new("python3")
+        .args([
+            "-I",
+            "tests/python/test_lane13_evidence.py",
+            "--ebpf-object",
+        ])
+        .arg(&ebpf_object)
+        .args(["Lane13EvidenceTests", "Lane13InputLedgerTests"])
         .output()
-        .expect("run direct private injection");
-    assert_eq!(
-        injection.status.code(),
-        Some(2),
-        "direct private entry was accepted: stdout={} stderr={}",
-        String::from_utf8_lossy(&injection.stdout),
-        String::from_utf8_lossy(&injection.stderr)
-    );
+        .expect("run native lane-13 evidence cases");
     assert!(
-        !injected.exists(),
-        "direct private injection created evidence"
+        output.status.success(),
+        "native lane-13 cases failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
-    let public_token_evidence = directory.path().join("public-token");
-    let public_token = Command::new("sh")
-        .args(["scripts/matrix/verify-knative.sh"])
-        .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
-        .env("D2_STATE", &state)
-        .env("D2_PROVIDER", &provider)
-        .env("P11SCOPE_LANE_EVIDENCE_DIR", &public_token_evidence)
-        .env("P11SCOPE_LANE13_TOKEN", "caller-controlled")
-        .output()
-        .expect("run public token injection");
-    assert_eq!(public_token.status.code(), Some(2));
-    assert!(!public_token_evidence.exists());
-
-    let mkdir_signal_evidence = directory.path().join("mkdir-signal-evidence");
-    let mkdir_signal = run("mkdir-signal", &mkdir_signal_evidence);
-    assert!(
-        !mkdir_signal.status.success(),
-        "signal during root creation unexpectedly passed: stdout={} stderr={}",
-        String::from_utf8_lossy(&mkdir_signal.stdout),
-        String::from_utf8_lossy(&mkdir_signal.stderr)
-    );
-    let mkdir_signal_calls = fs::read_to_string(state.join("calls")).unwrap_or_default();
-    assert!(
-        !mkdir_signal_calls
-            .lines()
-            .any(|line| line.starts_with("cargo ")),
-        "root-creation signal launched the body: {mkdir_signal_calls}"
-    );
-    assert!(
-        !state.join("checker.calls").exists(),
-        "root-creation signal launched the checker"
-    );
-    assert!(
-        !mkdir_signal_calls.contains("target/matrix-knative/"),
-        "root-creation signal created token WORK: {mkdir_signal_calls}"
-    );
-    if mkdir_signal_evidence.exists() {
-        assert!(mkdir_signal_evidence.is_dir());
-        assert_eq!(
-            fs::metadata(&mkdir_signal_evidence)
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700
-        );
-        let status_path = mkdir_signal_evidence.join("status");
-        assert_eq!(
-            fs::metadata(&status_path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        let status = fs::read_to_string(status_path).expect("retained root has terminal status");
-        let status_line = status
-            .strip_suffix('\n')
-            .expect("terminal status has one newline");
-        assert!(!status_line.contains('\n'));
-        assert!(!status_line.is_empty() && status_line.chars().all(|c| c.is_ascii_digit()));
-        assert_ne!(status_line.parse::<u32>().unwrap(), 0);
-    }
-
-    let foreign_symlink_target = state.join("foreign-symlink-target");
-    fs::create_dir(&foreign_symlink_target).expect("create foreign symlink target");
-    fs::write(
-        foreign_symlink_target.join("sentinel"),
-        b"foreign symlink target\n",
-    )
-    .expect("write foreign symlink sentinel");
-    fs::set_permissions(
-        foreign_symlink_target.join("sentinel"),
-        fs::Permissions::from_mode(0o640),
-    )
-    .expect("make foreign symlink sentinel private");
-    fs::set_permissions(&foreign_symlink_target, fs::Permissions::from_mode(0o700))
-        .expect("make foreign symlink target private");
-    let foreign_symlink_target_mode = fs::metadata(&foreign_symlink_target)
-        .unwrap()
-        .permissions()
-        .mode()
-        & 0o777;
-    let foreign_symlink_bytes = fs::read(foreign_symlink_target.join("sentinel")).unwrap();
-    let foreign_symlink_mode = fs::metadata(foreign_symlink_target.join("sentinel"))
-        .unwrap()
-        .permissions()
-        .mode()
-        & 0o777;
-    let mkdir_symlink_evidence = directory.path().join("mkdir-failure-symlink-evidence");
-    let mkdir_symlink = run("mkdir-failure-symlink-signal", &mkdir_symlink_evidence);
-    assert!(!mkdir_symlink.status.success());
-    assert!(
-        fs::symlink_metadata(&mkdir_symlink_evidence)
-            .unwrap()
-            .file_type()
-            .is_symlink()
-    );
-    assert_eq!(
-        fs::read_link(&mkdir_symlink_evidence).unwrap(),
-        foreign_symlink_target
-    );
-    assert_eq!(
-        fs::read(foreign_symlink_target.join("sentinel")).unwrap(),
-        foreign_symlink_bytes
-    );
-    assert_eq!(
-        fs::metadata(foreign_symlink_target.join("sentinel"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        foreign_symlink_mode
-    );
-    assert_eq!(
-        fs::metadata(&foreign_symlink_target)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        foreign_symlink_target_mode
-    );
-    assert!(!foreign_symlink_target.join("status").exists());
-    assert!(!foreign_symlink_target.join("stdout.log").exists());
-    assert!(!foreign_symlink_target.join("stderr.log").exists());
-    assert!(!foreign_symlink_target.join("facts.log").exists());
-    assert!(!state.join("checker.calls").exists());
-    let symlink_calls = fs::read_to_string(state.join("calls")).unwrap_or_default();
-    assert!(!symlink_calls.contains("cargo "));
-    assert!(!symlink_calls.contains("target/matrix-knative/"));
-    let symlink_entries = fs::read_dir(&foreign_symlink_target)
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name())
-        .collect::<std::collections::HashSet<_>>();
-    assert_eq!(
-        symlink_entries,
-        ["sentinel"]
-            .into_iter()
-            .map(std::ffi::OsString::from)
-            .collect()
-    );
-
-    let mkdir_directory_evidence = directory.path().join("mkdir-failure-directory-evidence");
-    let mkdir_directory = run("mkdir-failure-directory", &mkdir_directory_evidence);
-    assert!(!mkdir_directory.status.success());
-    assert_eq!(
-        fs::metadata(&mkdir_directory_evidence)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o700
-    );
-    for (name, contents, mode) in [
-        (
-            "sentinel-a",
-            b"foreign-directory-sentinel-a\n".as_slice(),
-            0o640,
-        ),
-        (
-            "sentinel-b",
-            b"foreign-directory-sentinel-b\n".as_slice(),
-            0o600,
-        ),
-    ] {
-        let path = mkdir_directory_evidence.join(name);
-        assert_eq!(fs::read(&path).unwrap(), contents);
-        assert_eq!(
-            fs::metadata(path).unwrap().permissions().mode() & 0o777,
-            mode
-        );
-    }
-    assert!(!mkdir_directory_evidence.join("status").exists());
-    assert!(!mkdir_directory_evidence.join("stdout.log").exists());
-    assert!(!mkdir_directory_evidence.join("stderr.log").exists());
-    assert!(!mkdir_directory_evidence.join("facts.log").exists());
-    assert!(!state.join("checker.calls").exists());
-    let directory_calls = fs::read_to_string(state.join("calls")).unwrap_or_default();
-    assert!(!directory_calls.contains("cargo "));
-    assert!(!directory_calls.contains("target/matrix-knative/"));
-    let directory_entries = fs::read_dir(&mkdir_directory_evidence)
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name())
-        .collect::<std::collections::HashSet<_>>();
-    assert_eq!(
-        directory_entries,
-        ["sentinel-a", "sentinel-b"]
-            .into_iter()
-            .map(std::ffi::OsString::from)
-            .collect()
-    );
-
-    let success_evidence = directory.path().join("success-evidence");
-    let success = run("body-success", &success_evidence);
-    assert!(
-        success.status.success(),
-        "full body-success dispatch failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&success.stdout),
-        format_args!(
-            "{} evidence-status={} facts-summary={} evidence-stderr={} calls={}",
-            String::from_utf8_lossy(&success.stderr),
-            fs::read_to_string(success_evidence.join("status")).unwrap_or_default(),
-            fs::read_to_string(success_evidence.join("facts.log"))
-                .unwrap_or_default()
-                .lines()
-                .filter(|line| line.contains("status") || line.contains("absent"))
-                .collect::<Vec<_>>()
-                .join("|"),
-            fs::read_to_string(success_evidence.join("stderr.log")).unwrap_or_default(),
-            fs::read_to_string(state.join("calls")).unwrap_or_default()
-        )
-    );
-    assert_eq!(
-        fs::read_to_string(success_evidence.join("status")).unwrap(),
-        "0\n"
-    );
-    let success_facts = fs::read_to_string(success_evidence.join("facts.log")).unwrap();
-    let success_work = success_facts
-        .lines()
-        .find_map(|line| line.strip_prefix("work="))
-        .expect("success recorded work path");
-    let expected_generated_sha = run_ok("/usr/bin/sha256sum", &[ebpf_object.to_str().unwrap()])
-        .split_whitespace()
-        .next()
-        .unwrap()
-        .to_owned();
-    let expected_generated_facts = [
-        format!(
-            "generated_bpf_path={success_work}/product/release/build/p11scope-1/out/p11scope-ebpf"
-        ),
-        format!("generated_bpf_size={}", p11scope::EBPF_OBJECT.len()),
-        format!("generated_bpf_sha256={expected_generated_sha}"),
-        "generated_bpf_build_id=absent".to_owned(),
-        "generated_bpf_elf_class=ELF64".to_owned(),
-        "generated_bpf_elf_data=LSB".to_owned(),
-        "generated_bpf_elf_type=ET_REL".to_owned(),
-        "generated_bpf_elf_machine=EM_BPF".to_owned(),
-    ];
-    assert_eq!(
-        success_facts
-            .lines()
-            .filter(|line| line.starts_with("generated_bpf_"))
-            .count(),
-        expected_generated_facts.len(),
-        "generated-BPF receipt must contain exactly eight facts"
-    );
-    for expected in expected_generated_facts {
-        assert_eq!(
-            success_facts
-                .lines()
-                .filter(|line| *line == expected)
-                .count(),
-            1,
-            "generated-BPF receipt fact missing or duplicated: {expected}"
-        );
-    }
-    assert!(!std::path::Path::new(success_work).exists());
-    assert!(success_facts.contains("cluster_absent=1"));
-    assert!(success_facts.contains("workload_tag_absent=1"));
-    assert!(success_facts.contains("kubeconfig_absent=1"));
-    assert!(success_facts.contains("work_absent=1"));
-    let success_entries = fs::read_dir(&success_evidence)
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name())
-        .collect::<std::collections::HashSet<_>>();
-    let allowed_entries = [
-        "stdout.log",
-        "stderr.log",
-        "facts.log",
-        "status",
-        "observed.json",
-        "manifest-host.json",
-        "profile.log",
-        "portforward.log",
-        "portforward.group.before.json",
-        "portforward.group.after.json",
-    ]
-    .into_iter()
-    .map(std::ffi::OsString::from)
-    .collect::<std::collections::HashSet<_>>();
-    assert_eq!(success_entries, allowed_entries);
-    assert_eq!(
-        fs::read_to_string(state.join("checker.calls"))
-            .unwrap()
-            .lines()
-            .count(),
-        1,
-        "exact checker must run once"
-    );
-
-    let early_signal_evidence = directory.path().join("early-signal-evidence");
-    let early_signal = run("signal-after-root", &early_signal_evidence);
-    assert!(
-        !early_signal.status.success(),
-        "post-root signal unexpectedly passed: stdout={} stderr={}",
-        String::from_utf8_lossy(&early_signal.stdout),
-        String::from_utf8_lossy(&early_signal.stderr)
-    );
-    let early_signal_status = early_signal
-        .status
-        .code()
-        .expect("post-root signal has a shell exit status");
-    assert!(
-        matches!(early_signal_status, 1 | 143),
-        "post-root signal returned unexpected status {early_signal_status}"
-    );
-    assert_eq!(
-        fs::read_to_string(early_signal_evidence.join("status")).unwrap(),
-        format!("{early_signal_status}\n")
-    );
-    let early_facts_path = early_signal_evidence.join("facts.log");
-    let early_deadline = Instant::now() + Duration::from_secs(5);
-    let mut early_signal_work = None;
-    while Instant::now() < early_deadline {
-        if let Ok(facts) = fs::read_to_string(&early_facts_path) {
-            if let Some(work) = facts.lines().find_map(|line| line.strip_prefix("work=")) {
-                if !std::path::Path::new(work).exists() {
-                    early_signal_work = Some(work.to_owned());
-                    break;
-                }
-            }
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    assert!(
-        early_signal_work.is_some(),
-        "post-root signal did not record and remove WORK"
-    );
-
-    let terminal_signal_evidence = directory.path().join("terminal-signal-evidence");
-    for marker in ["terminal-signal-ready", "terminal-signal-go"] {
-        let _ = fs::remove_file(state.join(marker));
-    }
-    let mut terminal_signal = Command::new("sh")
-        .args(["scripts/matrix/verify-knative.sh"])
-        .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
-        .env("D2_STATE", &state)
-        .env("D2_PROVIDER", &provider)
-        .env("D2_MODE", "terminal-signal")
-        .env("D2_DISPATCH_PATH", &dispatch_path)
-        .env("D2_PORT_FORWARD_HELPER", &port_forward_helper)
-        .env("P11SCOPE_LANE_EVIDENCE_DIR", &terminal_signal_evidence)
-        .spawn()
-        .expect("start terminal-finalization signal scenario");
-    let terminal_deadline = Instant::now() + Duration::from_secs(5);
-    while !state.join("terminal-signal-ready").exists()
-        && Instant::now() < terminal_deadline
-        && terminal_signal.try_wait().unwrap().is_none()
-    {
-        thread::sleep(Duration::from_millis(10));
-    }
-    assert!(
-        state.join("terminal-signal-ready").exists(),
-        "terminal signal boundary was not reached"
-    );
-    let terminal_pid = terminal_signal.id().to_string();
-    let _ = Command::new("kill").args(["-TERM", &terminal_pid]).status();
-    fs::write(state.join("terminal-signal-go"), b"go\n").unwrap();
-    let terminal_status = terminal_signal
-        .wait()
-        .expect("wait terminal signal scenario");
-    assert!(!terminal_status.success());
-    assert_eq!(
-        fs::read_to_string(terminal_signal_evidence.join("status")).unwrap(),
-        "1\n"
-    );
-    assert!(
-        terminal_signal_evidence.join("facts.log").is_file(),
-        "terminal evidence entries: {:?}",
-        fs::read_dir(&terminal_signal_evidence).map(|entries| entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.file_name())
-            .collect::<Vec<_>>())
-    );
-    let terminal_facts = fs::read_to_string(terminal_signal_evidence.join("facts.log")).unwrap();
-    if let Some(terminal_work) = terminal_facts
-        .lines()
-        .find_map(|line| line.strip_prefix("work="))
-    {
-        assert!(!std::path::Path::new(terminal_work).exists());
-    }
-
-    for (mode, absence_fact) in [
-        ("cleanup-image-query-failure", "workload_tag_absent=0"),
-        ("cleanup-cluster-query-failure", "cluster_absent=0"),
-        ("cleanup-node-query-failure", "cluster_absent=0"),
-    ] {
-        let evidence = directory.path().join(mode);
-        let output = run(mode, &evidence);
-        assert!(
-            !output.status.success(),
-            "{mode} unexpectedly passed: stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(fs::read_to_string(evidence.join("status")).unwrap(), "1\n");
-        let facts = fs::read_to_string(evidence.join("facts.log")).unwrap();
-        assert!(
-            facts.contains(absence_fact),
-            "missing {absence_fact}: {facts}"
-        );
-        assert!(!facts.contains(&absence_fact.replace("=0", "=1")));
-    }
-
-    for (mode, cleanup_marker, absence_fact) in [
-        (
-            "partial-image-creation",
-            "image-cleaned",
-            "workload_tag_absent=1",
-        ),
-        (
-            "partial-cluster-creation",
-            "cluster-delete-called",
-            "cluster_absent=1",
-        ),
-    ] {
-        let evidence = directory.path().join(mode);
-        let output = run(mode, &evidence);
-        assert!(!output.status.success(), "{mode} unexpectedly passed");
-        assert!(
-            state.join(cleanup_marker).is_file(),
-            "{mode} skipped cleanup: stdout={} stderr={} calls={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-            fs::read_to_string(state.join("calls")).unwrap_or_default()
-        );
-        let facts = fs::read_to_string(evidence.join("facts.log")).unwrap();
-        assert!(
-            facts.contains(absence_fact),
-            "missing {absence_fact}: {facts}"
-        );
-        let work = facts
-            .lines()
-            .find_map(|line| line.strip_prefix("work="))
-            .expect("partial creation recorded work path");
-        assert!(!std::path::Path::new(work).exists());
-    }
-
-    let replacement_evidence = directory.path().join("cluster-replacement");
-    let replacement = run("cluster-replacement", &replacement_evidence);
-    assert!(!replacement.status.success());
-    assert!(!state.join("cluster-delete-called").exists());
-    let replacement_facts = fs::read_to_string(replacement_evidence.join("facts.log")).unwrap();
-    assert!(replacement_facts.contains("cluster_absent=0"));
-    assert!(replacement_facts.contains("work_absent=0"));
-    let replacement_work = replacement_facts
-        .lines()
-        .find_map(|line| line.strip_prefix("work="))
-        .expect("replacement recorded work path");
-    assert!(std::path::Path::new(replacement_work).is_dir());
-
-    let failure_evidence = directory.path().join("failure-evidence");
-    let failure = run("cleanup-cluster-failure", &failure_evidence);
-    assert!(
-        !failure.status.success(),
-        "body/cleanup failure unexpectedly passed"
-    );
-    assert!(failure_evidence.join("stdout.log").is_file());
-    assert!(failure_evidence.join("stderr.log").is_file());
-    assert!(
-        fs::read_to_string(failure_evidence.join("stdout.log"))
-            .unwrap()
-            .contains("build product"),
-        "failure stdout={} stderr={} outer stdout={} outer stderr={} git={}",
-        fs::read_to_string(failure_evidence.join("stdout.log")).unwrap(),
-        fs::read_to_string(failure_evidence.join("stderr.log")).unwrap(),
-        String::from_utf8_lossy(&failure.stdout),
-        String::from_utf8_lossy(&failure.stderr),
-        fs::read_to_string(state.join("git.calls")).unwrap_or_default()
-    );
-    let facts = fs::read_to_string(failure_evidence.join("facts.log")).expect("read final facts");
-    let work = facts
-        .lines()
-        .find_map(|line| line.strip_prefix("work="))
-        .expect("recorded work path");
-    assert!(std::path::Path::new(work).is_dir());
-    for marker in [
-        "input_ledger_start=",
-        "input_ledger_end=",
-        "image_cluster_node_repo_digests=",
-        "image_cluster_node_diff_ids=",
-        "copied_provider_size=",
-        "manifest_selected_provider_sha256=",
-        "capture_provider_build_id=deadbeef",
-        "cluster_absent=0",
-        "workload_tag_absent=1",
-        "kubeconfig_absent=1",
-        "work_absent=0",
-        "cleanup_status=",
-    ] {
-        assert!(
-            facts.contains(marker),
-            "missing lane-13 fact {marker}: stdout={} stderr={} facts={} calls={}",
-            String::from_utf8_lossy(&failure.stdout),
-            String::from_utf8_lossy(&failure.stderr),
-            facts,
-            fs::read_to_string(state.join("calls")).unwrap_or_default()
-        );
-    }
-    assert_eq!(
-        fs::read_to_string(failure_evidence.join("status")).unwrap(),
-        "1\n"
-    );
-    assert!(state.join("cluster-delete-called").exists());
-    assert!(
-        state.join("cluster").exists(),
-        "foreign cluster refusal was not preserved"
-    );
-    assert!(
-        state.join("image-cleaned").exists(),
-        "cleanup did not continue after cluster refusal"
-    );
-    for name in [
-        "observed.json",
-        "manifest-host.json",
-        "profile.log",
-        "portforward.log",
-        "portforward.group.before.json",
-        "portforward.group.after.json",
-    ] {
-        assert!(
-            failure_evidence.join(name).is_file(),
-            "missing retained artifact {name}"
-        );
-    }
-    assert!(!failure_evidence.join("foreign-unrelated.tmp").exists());
-    assert_eq!(
-        fs::metadata(&failure_evidence)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o700
-    );
-    for entry in fs::read_dir(&failure_evidence).unwrap() {
-        assert_eq!(
-            entry.unwrap().metadata().unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-    }
-
-    let copy_evidence = directory.path().join("copy-evidence");
-    let copy = run("copy-failure", &copy_evidence);
-    assert!(!copy.status.success());
-    assert_eq!(
-        fs::read_to_string(copy_evidence.join("status")).unwrap(),
-        "1\n"
-    );
-    assert!(
-        state.join("image-cleaned").exists(),
-        "cleanup stopped after copy failure"
-    );
-
-    let setup_evidence = directory.path().join("setup-evidence");
-    let setup = run("setup-failure", &setup_evidence);
-    assert!(!setup.status.success());
-    assert_eq!(
-        fs::read_to_string(setup_evidence.join("status")).unwrap(),
-        "1\n"
-    );
-
-    let image_query_evidence = directory.path().join("image-query-evidence");
-    let image_query = run("image-query-failure", &image_query_evidence);
-    assert!(!image_query.status.success());
-    assert_eq!(
-        fs::read_to_string(image_query_evidence.join("status")).unwrap(),
-        "1\n"
-    );
-
-    let mutate_evidence = directory.path().join("mutate-evidence");
-    let mutate = run("mutate-head", &mutate_evidence);
-    assert!(!mutate.status.success());
-    let mutate_facts = fs::read_to_string(mutate_evidence.join("facts.log")).unwrap();
-    for marker in [
-        "git_head_start=",
-        "git_head_end=",
-        "git_tree_start=",
-        "git_tree_end=",
-        "git_status_end=",
-        "input_ledger_start=",
-        "input_ledger_end=",
-    ] {
-        assert!(
-            mutate_facts.contains(marker),
-            "missing mutation fact {marker}"
-        );
-    }
-
-    let signal_evidence = directory.path().join("signal-evidence");
-    let mut child = Command::new("sh")
-        .args(["scripts/matrix/verify-knative.sh"])
-        .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
-        .env("D2_STATE", &state)
-        .env("D2_PROVIDER", &provider)
-        .env("D2_MODE", "sleep-build")
-        .env("P11SCOPE_LANE_EVIDENCE_DIR", &signal_evidence)
-        .spawn()
-        .expect("start signal scenario");
-    let ready_deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < ready_deadline {
-        if fs::read_to_string(signal_evidence.join("facts.log"))
-            .is_ok_and(|facts| facts.lines().any(|line| line.starts_with("work=")))
-        {
-            break;
-        }
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "signal body exited before WORK"
-        );
-        thread::sleep(Duration::from_millis(25));
-    }
-    assert!(
-        fs::read_to_string(signal_evidence.join("facts.log"))
-            .is_ok_and(|facts| facts.lines().any(|line| line.starts_with("work="))),
-        "signal body did not reach WORK"
-    );
-    let pid = child.id().to_string();
-    let _ = Command::new("kill").args(["-TERM", &pid]).status();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if child.try_wait().unwrap().is_some() || Instant::now() >= deadline {
-            break;
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    if child.try_wait().unwrap().is_none() {
-        let _ = child.kill();
-        let _ = child.wait();
-        panic!("outer-only signal orphaned the mutating body");
-    }
-    assert!(
-        signal_evidence.join("status").is_file(),
-        "signal path did not finalize status"
-    );
-    let signal_facts = fs::read_to_string(signal_evidence.join("facts.log")).unwrap();
-    let signal_work = signal_facts
-        .lines()
-        .find_map(|line| line.strip_prefix("work="))
-        .expect("signal recorded work path");
-    assert!(!std::path::Path::new(signal_work).exists());
-}
-
-#[test]
-fn escalated_signal_wiring_is_reap_only_and_bounded() {
-    let run = read("src/run.rs");
-    let forbidden_actions = [
-        "kill_and_reap_tail",
-        "forward_signal",
-        "ensure_active_generation",
-        "signal_group",
-        "terminate_and_reap",
-        "terminate_with_grace",
-    ];
-    let escalated = between(
-        &run,
-        "Ok(ForwardAction::Escalated) => {",
-        "Ok(ForwardAction::Forwarded)",
-    );
-    assert_eq!(
-        escalated.matches(".reap_after_escalation()").count(),
-        1,
-        "the escalated branch must settle its child with reap_after_escalation",
-    );
-    for forbidden in forbidden_actions {
-        assert!(
-            !escalated.contains(forbidden),
-            "escalated branch contains forbidden action {forbidden:?}",
-        );
-    }
-
-    let reap = between(
-        &run,
-        "fn reap_after_escalation(&mut self) -> io::Result<i32> {",
-        "\n    pub(crate) fn still_running",
-    );
-    assert_eq!(
-        reap.matches("self.wait_for(Some(Duration::from_secs(5)), false)?")
-            .count(),
-        1,
-        "reap_after_escalation must use one bounded existing wait_for",
-    );
-    for forbidden in forbidden_actions {
-        assert!(
-            !reap.contains(forbidden),
-            "reap_after_escalation contains forbidden action {forbidden:?}",
-        );
-    }
 }
 
 #[test]
@@ -9654,4 +8977,108 @@ fn the_uretprobe_hazard_row_is_not_a_capability_tier_input() {
         source.contains("\"uretprobe vs seccomp\""),
         "doctor must still report the row"
     );
+}
+
+fn run_native_python_suite(script: &str, class: &str) {
+    let _native_suite_guard = NATIVE_SUITE_GATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let output = Command::new("python3")
+        .args(["-I", script, class])
+        .output()
+        .expect("run the complete native Python suite");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "native suite {script}::{class}: {report}"
+    );
+    let count = report
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("Ran ")?
+                .split_whitespace()
+                .next()?
+                .parse::<usize>()
+                .ok()
+        })
+        .unwrap_or(0);
+    assert!(
+        count > 0 && !report.contains("skipped="),
+        "native suite {script}::{class} must run nonempty without skips: {report}"
+    );
+}
+
+#[test]
+fn prepared_release_drivers_bind_admission_and_finalization() {
+    run_native_python_suite(
+        "tests/python/test_prepared_release_drivers.py",
+        "PreparedReleaseDriverTests",
+    );
+}
+
+#[test]
+fn prepared_four_callers_bind_admission_build_handoff_and_finalization() {
+    run_native_python_suite(
+        "tests/python/test_prepared_four_callers.py",
+        "PreparedFourCallersTests",
+    );
+}
+
+#[test]
+fn product_build_preserves_explicit_build_context() {
+    run_native_python_suite("tests/python/test_product_build.py", "ProductBuildTests");
+}
+
+#[test]
+fn dual_build_callers_preserve_ordinary_and_prepared_contexts() {
+    run_native_python_suite(
+        "tests/python/test_dual_build_callers.py",
+        "DualBuildCallerTests",
+    );
+}
+
+#[test]
+fn ordinary_build_callers_prepare_before_build_and_privilege() {
+    run_native_python_suite(
+        "tests/python/test_ordinary_build_callers.py",
+        "OrdinaryBuildCallerTests",
+    );
+}
+
+#[test]
+fn offline_dependencies_bind_complete_sources_and_final_inputs() {
+    run_native_python_suite(
+        "tests/python/test_offline_dependencies.py",
+        "OfflineDependenciesTests",
+    );
+}
+
+#[test]
+fn capability_driver_binds_prepared_dependencies_after_cleanup() {
+    run_native_python_suite(
+        "tests/python/test_capability_prepared_dependencies.py",
+        "CapabilityPreparedDependenciesTests",
+    );
+}
+
+#[test]
+fn lane02_driver_binds_prepared_dependencies_after_cleanup() {
+    run_native_python_suite(
+        "tests/python/test_lane02_prepared_dependencies.py",
+        "Lane02PreparedDependenciesTests",
+    );
+}
+
+#[test]
+fn export_source_contracts_hold() {
+    run_native_python_suite("tests/python/test_export_source.py", "ExportSourceTests");
+}
+
+#[test]
+fn build_offline_contracts_hold() {
+    run_native_python_suite("tests/python/test_build_offline.py", "BuildOfflineTests");
 }

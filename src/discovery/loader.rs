@@ -70,7 +70,7 @@ pub(crate) struct LoaderContextSpec {
     /// the actual mapping from the first record instead.
     pub(crate) mapping: Option<MapEntry>,
     pub(crate) hook: SymbolFact,
-    pub(crate) state: Option<SymbolFact>,
+    pub(crate) state_address: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,8 +135,8 @@ impl LoaderRegistry {
             .map(|mapping| expected_hook_ip(mapping, spec.hook.file_offset))
             .transpose()?;
         let state_delta = spec
-            .state
-            .map(|state| signed_delta(state.virtual_address, spec.hook.virtual_address))
+            .state_address
+            .map(|state| signed_delta(state, spec.hook.virtual_address))
             .transpose()?;
         let id = LoaderContextId((self.allocated + 1) as u16);
         let cookie = encode_loader_cookie(id.get(), state_delta)?;
@@ -414,10 +414,7 @@ mod tests {
                 virtual_address: 0x2100,
                 file_offset: 0x2100,
             },
-            state: state_vaddr.map(|virtual_address| SymbolFact {
-                virtual_address,
-                file_offset: 0x2800,
-            }),
+            state_address: state_vaddr,
         }
     }
 

@@ -16,3 +16,13 @@ __pycache__/
 /p11scope
 /p11scope-discover
 /.worktrees/
+
+# Reconstructed third-party inputs. Keep sources.json and patch files tracked.
+/third-party/src/aya-0.14.0-p1/
+/third-party/src/aya-obj-0.3.0-p1/
+/third-party/archives/
+/third-party/.prepare-dependencies.lock
+/third-party/.prepare-dependencies-stage-*/
+
+# Generated local ABI qualification logs.
+/abi-qualification/

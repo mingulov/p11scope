@@ -411,14 +411,15 @@ statement, and it forces `PARTIAL` so the count is never read as attributed.
 
 | Field | Meaning |
 | --- | --- |
-| `mechanism`, `mechanism_hex` | Verbatim 64-bit standard or vendor id. |
+| `mechanism`, `mechanism_hex` | 64-bit mechanism id admitted by the capture policy; the default policy permits only finite published registry membership. |
 | `ops` | Operation categories observed for this id. |
 | `calls`, `errors` | Event-derived semantic calls and non-success final results. |
 | `latency_ns` | Same shape as function latency; async semantic latency spans pending entry to completion. |
-| `params` | `null` or distinct allowlisted parameter combinations with counts. |
+| `params` | Always `null` under the default `allowlisted` policy. A separately enabled unsafe diagnostic capture may contain distinct decoded parameter combinations with counts. |
 | `note` | Whether decoding was unavailable, failed totally, or succeeded. |
 
-Allowed parameter objects are:
+The following parameter objects describe the unsafe diagnostic representation;
+they are not emitted by the default release policy:
 
 ```json
 {"shape":"rsa_pkcs_pss","hash_alg":592,"hash_alg_hex":"0x250","mgf":2,"salt_len":32,"count":1}
@@ -540,8 +541,10 @@ revision:
   exactly. A caller that aliases a metadata pointer elsewhere yields no
   decoded value rather than an arbitrary read.
 - Mechanism parameter and template decoding beyond that finite equality is
-  absent from the default eBPF object, so `params: null` is now the normal
-  result for shapes the safe policy does not cover.
+  absent from the default eBPF object. Every emitted mechanism therefore has
+  `params: null`, and `templates.operations` is always empty under `allowlisted`,
+  regardless of the mechanism's diagnostic shape. The policy notes distinguish
+  disabled capture from an observation that no parameters/templates were used.
 
 ### v1.2 → v1.3 (folded into the above; v1.3 was never published)
 

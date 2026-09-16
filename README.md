@@ -10,11 +10,11 @@ table (including stripped providers with no `C_*` symbols), attaches probes by
 file offset, and produces a versioned `observed-profile.json` for migration
 assessment and incident diagnostics.
 
-> **Status: unreleased; the current tree is a W3 engineering candidate.**
+> **Status: unreleased; the current candidate is undergoing release qualification.**
 > Memory-scan discovery, `C_GetInterface`, `inspect`, `doctor`, public `run`,
 > multi-module capture, schema v3, and owned-child live discovery are
 > implemented. A previous frozen MVP passed the Ubuntu 22.04/5.15 and Ubuntu
-> 24.04/6.8 runtime matrix, but those results do not qualify the W3 tip. Fresh
+> 24.04/6.8 runtime matrix, but those results do not qualify the current candidate. Fresh
 > exact-tip runtime qualification, CI, packaging, publication, and release
 > remain pending.
 
@@ -34,32 +34,74 @@ tree, and
 kernel floor, overhead, and the evidence/completeness model — every
 quantitative claim there cites the script that measured it).
 
+## Building from source
+
+The root manifest selects two patched crates reconstructed from
+`third-party/sources.json`; their generated trees are intentionally absent from
+Git. Mise selects the project's Rust 1.88.0 toolchain, and `scripts/cargo.sh`
+prepares the generated sources before executing Cargo:
+
+```sh
+mise install
+mise exec -- ./scripts/cargo.sh +1.88 build --locked
+```
+
+Preparation downloads only the recipe-pinned crates.io archives and verifies
+their hashes, ordered patches, final tree hashes, and receipts. For an offline
+or frozen build, place the exact archives in `third-party/archives/` first, or
+run `python3 -I scripts/prepare-dependencies.py --archive-dir DIRECTORY`, then
+use `mise exec -- ./scripts/cargo.sh +1.88 build --locked --offline`. An
+ordinary fresh checkout therefore needs archive access. Git-based source exports exclude the
+generated trees, their receipts, and the local archive cache while retaining
+the recipe and patches. An offline distribution must add the exact pinned
+archives explicitly. All locked registry packages and the fixed
+`pkcs11-proxy-ng` Git revision are separate Cargo inputs and must already be
+available in the Cargo cache for a fully offline build.
+
+For a self-contained full source export and its fixed unprivileged recipient
+bootstrap, use Python >=3.11, or Python 3.10 with the distro `python3-tomli`
+package installed and verified before disconnection; see [the offline build
+guide](docs/build-offline.md).
+
+See [development setup](docs/development.md) for the Ubuntu 26.04 primary-host
+packages, pinned Rust/BPF tools, canonical checks, and the exact Git dependency
+bootstrap. Ubuntu 26.04 is a development host choice, not a product runtime
+dependency.
+
 ## Why
 
 - **Black-box diagnostics** — "this app intermittently fails against our HSM;
   what is it actually doing?" Calls, return codes, latency distributions,
   concurrency, session lifecycle — with zero app changes.
-- **Migration dependency discovery** — which PKCS#11 subset and parameter
-  combinations does the application *actually* depend on? Feed the observed
-  profile alongside [pkcs11-check](https://github.com/mingulov/pkcs11-check)
-  results to validate a candidate provider against real usage:
+- **Migration workload evidence** — which PKCS#11 functions did the
+  application exercise during this window? With explicitly attested function
+  semantics, the profile also reports admitted mechanism and lifecycle
+  evidence. Compare that observed coverage with
+  [pkcs11-check](https://github.com/mingulov/pkcs11-check) results for a
+  candidate provider. The default capture does not decode mechanism parameter
+  combinations or attribute templates, so it cannot establish parameter-level
+  migration compatibility.
+
+  Start with a passive diagnostic capture. This manifest-free path retains
+  aggregate function counts, return values and latency; scanned slots are
+  semantics-unverified and count-only:
 
   ```bash
   p11scope doctor --pid 12345
   p11scope inspect --pid 12345
-  sudo p11scope profile --pid 12345 -o observed-profile.json
-  pkcs11-check test --module /opt/candidate/lib/pkcs11.so --output json --output-file candidate.json
+  sudo p11scope profile --pid 12345 --duration 60 -o diagnostic-profile.json
   ```
 
-  Combining those two artifacts into a migration assessment is the planned
-  `pkcs11-lab` integration; no `pkcs11-lab assess` command exists yet.
+  For semantic capture, follow the separate
+  [attested workflow](docs/usage.md#attested-semantic-capture). The optional
+  `p11scope-discover` helper executes provider code in its own unprivileged
+  process and must match the provider's ABI/libc. Passing `--manifest` is
+  explicit operator attestation of exact accepted function-name/offset claims;
+  generating a file or matching its hash does not make that decision for you.
 
-  `p11scope-discover` remains available as an optional offline path when a
-  suitable manifest can be prepared for a provider the memory scan cannot
-  read; the normal path does not execute provider code. `--manifest` is explicit
-  operator attestation of exact accepted function-name/offset claims. Scan-only
-  discovery is semantics-unverified and count-only, while aggregate
-  counts/RVs/latency remain available.
+  Automated combination with candidate-provider test results is the planned
+  `pkcs11-lab` integration; no `pkcs11-lab assess` command is delivered here.
+  An unobserved call or missing metadata remains unknown.
 
   Full quickstart, real command output, and `trace` mode:
   [docs/usage.md](docs/usage.md#quickstart).

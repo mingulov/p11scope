@@ -82,14 +82,17 @@ EVIDENCE_OWNED=0
 LANE13_OUTER_EXIT_ARMED=0
 LANE13_OUTER_PENDING_STATUS=
 FACTS=
+LANE13_START_LEDGER_ESTABLISHED=0
+LANE13_ADMISSION_ESTABLISHED=0
 . scripts/lib.sh
+. scripts/prepared-dependency-tools.sh
 require_non_root_caller
 
 lane13_fact() {
     printf '%s\n' "$1" >> "$FACTS"
 }
 
-lane13_prepare_diagnostics() {
+lane13_prepare_local_evidence() {
     [ "$#" -eq 0 ] || { echo "verify-knative.sh takes no arguments" >&2; return 1; }
     case ${P11SCOPE_LANE_EVIDENCE_DIR-} in
         /*) ;;
@@ -151,7 +154,7 @@ PY
     FACTS=$EVIDENCE/facts.log
     : > "$FACTS"
     chmod 600 "$FACTS"
-    lane13_fact "diagnostic_phase=D1-pre-runtime"
+    lane13_fact "diagnostic_phase=D1-local-evidence"
     lane13_fact "start_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     lane13_fact "cwd=$PWD"
     lane13_fact "physical_cwd=$lane13_worktree"
@@ -175,7 +178,8 @@ PY
         echo "lane-13 consumed tracked inputs are dirty" >&2; return 1;
     }
     lane13_untracked=$(git ls-files --others --exclude-standard -- \
-        .cargo src crates scripts spike Cargo.toml Cargo.lock build.rs)
+        .cargo src crates scripts spike third-party build_support Cargo.toml Cargo.lock build.rs \
+        rust-toolchain.toml)
     [ -z "$lane13_untracked" ] || { echo "lane-13 consumed input is untracked" >&2; return 1; }
     lane13_git_status_projection=$(python3 - "$lane13_git_status" <<'PY'
 import sys
@@ -186,12 +190,32 @@ PY
     lane13_fact "git_head=$lane13_git_head"
     lane13_fact "git_tree=$lane13_git_tree"
     lane13_fact "git_status_begin=$lane13_git_status_projection"
+    p11scope_prepared_tools_select "$(command -v python3)" "$(command -v rustup)" || return $?
+    lane13_cargo_stable=$("$P11SCOPE_PREPARED_STABLE_CARGO" --version) || return 1
+    lane13_rustc_stable=$("$P11SCOPE_PREPARED_STABLE_RUSTC" --version) || return 1
+    lane13_cargo_nightly=$("$P11SCOPE_PREPARED_BPF_CARGO" --version) || return 1
+    lane13_rustc_nightly=$("$P11SCOPE_PREPARED_BPF_RUSTC" --version) || return 1
+    lane13_python=$("$P11SCOPE_PREPARED_PYTHON" --version) || return 1
+    "$P11SCOPE_PREPARED_PYTHON" -I scripts/prepared-dependency-evidence.py capture \
+        --prefix "$EVIDENCE/dependencies" \
+        --stable-cargo "$P11SCOPE_PREPARED_STABLE_CARGO" \
+        --stable-rustc "$P11SCOPE_PREPARED_STABLE_RUSTC" \
+        --bpf-cargo "$P11SCOPE_PREPARED_BPF_CARGO" \
+        --bpf-rustc "$P11SCOPE_PREPARED_BPF_RUSTC" || return $?
+    lane13_record_facts start || return $?
+    LANE13_START_LEDGER_ESTABLISHED=1
+    LANE13_ADMISSION_ESTABLISHED=1
+    lane13_fact "prepared_admission=complete"
+    lane13_fact "cargo_stable=$lane13_cargo_stable"
+    lane13_fact "rustc_stable=$lane13_rustc_stable"
+    lane13_fact "cargo_nightly=$lane13_cargo_nightly"
+    lane13_fact "rustc_nightly=$lane13_rustc_nightly"
+    lane13_fact "python=$lane13_python"
+}
+
+lane13_prepare_runtime_diagnostics() {
+    lane13_fact "diagnostic_phase=D2-runtime"
     lane13_kernel=$(uname -sr) || return 1
-    lane13_cargo_stable=$(cargo +1.88 --version) || return 1
-    lane13_rustc_stable=$(rustc +1.88 --version) || return 1
-    lane13_cargo_nightly=$(cargo +nightly --version) || return 1
-    lane13_rustc_nightly=$(rustc +nightly --version) || return 1
-    lane13_python=$(python3 --version) || return 1
     lane13_gcc=$(gcc --version) || return 1
     lane13_docker_version=$(docker version --format '{{.Server.Version}}') || return 1
     lane13_docker_storage=$(docker info --format '{{.Driver}}') || return 1
@@ -206,11 +230,6 @@ PY
         && [ -n "$lane13_python" ] && [ -n "$lane13_gcc" ] && [ -n "$lane13_docker_version" ] \
         && [ -n "$lane13_docker_storage" ] && [ -n "$lane13_kind" ] && [ -n "$lane13_kubectl_version" ] || return 1
     lane13_fact "kernel=$lane13_kernel"
-    lane13_fact "cargo_stable=$lane13_cargo_stable"
-    lane13_fact "rustc_stable=$lane13_rustc_stable"
-    lane13_fact "cargo_nightly=$lane13_cargo_nightly"
-    lane13_fact "rustc_nightly=$lane13_rustc_nightly"
-    lane13_fact "python=$lane13_python"
     lane13_fact "gcc=$(printf '%s\n' "$lane13_gcc" | sed -n '1p')"
     lane13_fact "docker_version=$lane13_docker_version"
     lane13_fact "docker_storage=$lane13_docker_storage"
@@ -230,88 +249,74 @@ PY
 }
 
 lane13_record_inputs() {
-    # The retained facts use fixed input_ledger_start= and input_ledger_end= keys.
     lane13_input_phase=${1:-start}
     case $lane13_input_phase in start|end) ;; *) return 1 ;; esac
-    lane13_input_ledger=$WORK/.lane13-inputs-$lane13_input_phase
-    git ls-files -z -- \
-        Cargo.toml Cargo.lock build.rs \
-        src crates/discover crates/manifest crates/ebpf-common crates/ebpf \
-        scripts/matrix/verify-knative.sh scripts/lib.sh scripts/cleanup-traps.sh \
-        scripts/check-capture-evidence.py spike/expected.txt \
-        scripts/matrix/Dockerfile.knative scripts/matrix/knative-server.py spike/harness.c \
-        > "$WORK/.lane13-inputs-list"
-    python3 - "$FACTS" "$WORK/.lane13-inputs-list" "$lane13_input_ledger" "$lane13_input_phase" <<'PY'
-import hashlib
-import os
-import sys
-
-facts, listing, ledger, phase = sys.argv[1:]
-paths = [path for path in open(listing, "rb").read().split(b"\0") if path]
-if not paths or len(paths) != len(set(paths)):
-    raise SystemExit("invalid consumed-input list")
-with open(ledger, "w", encoding="utf-8") as output:
-    for raw in sorted(paths):
-        path = os.fsdecode(raw)
-        if not os.path.isfile(path) or os.path.islink(path):
-            raise SystemExit(f"invalid consumed input: {path}")
-        digest = hashlib.sha256(open(path, "rb").read()).hexdigest()
-        output.write(f"input_ledger_{phase}={digest} path={path}\n")
-with open(facts, "a", encoding="utf-8") as output:
-    output.write(open(ledger, encoding="utf-8").read())
-PY
-    rm -f -- "$WORK/.lane13-inputs-list"
+    "$P11SCOPE_PREPARED_PYTHON" -I scripts/lane13-input-ledger.py snapshot \
+        --phase "$lane13_input_phase" \
+        --generated-ledger "$EVIDENCE/dependencies.$(
+            [ "$lane13_input_phase" = start ] && printf initial || printf final
+        ).ledger.sha256" \
+        --output "$EVIDENCE/source.$lane13_input_phase.sha256" \
+        --facts "$FACTS"
 }
 
 lane13_record_facts() {
     lane13_facts_phase=${1:-start}
-    lane13_fact "facts_phase=$lane13_facts_phase"
-    lane13_fact "body_status=${BODY_STATUS:-unknown}"
-    lane13_fact "cleanup_status_at_phase_${lane13_facts_phase}=${CLEANUP_STATUS:-unknown}"
-    lane13_fact "work=$WORK"
-    lane13_fact "product=$PRODUCT"
-    lane13_fact "outer_argv=${P11SCOPE_LANE13_OUTER_ARGV:-unknown}"
-    lane13_fact "body_argv=$0"
+    lane13_fact "facts_phase=$lane13_facts_phase" || return 1
+    lane13_fact "body_status=${BODY_STATUS:-unknown}" || return 1
+    lane13_fact "cleanup_status_at_phase_${lane13_facts_phase}=${CLEANUP_STATUS:-unknown}" \
+        || return 1
+    lane13_fact "work=$WORK" || return 1
+    lane13_fact "product=$PRODUCT" || return 1
+    lane13_fact "outer_argv=${P11SCOPE_LANE13_OUTER_ARGV:-unknown}" || return 1
+    lane13_fact "body_argv=$0" || return 1
     lane13_git_phase=$lane13_facts_phase
     lane13_git_phase_head=$(git rev-parse HEAD) || return 1
     lane13_git_phase_tree=$(git rev-parse HEAD^{tree}) || return 1
     lane13_git_phase_status=$(git status --porcelain=v1) || return 1
-    lane13_git_phase_clean=1
-    git diff --quiet || lane13_git_phase_clean=0
-    lane13_git_phase_index_clean=1
-    git diff --cached --quiet || lane13_git_phase_index_clean=0
-    lane13_fact "git_head_${lane13_git_phase}=$lane13_git_phase_head"
-    lane13_fact "git_tree_${lane13_git_phase}=$lane13_git_phase_tree"
-    lane13_git_phase_status_projection=$(printf '%s\n' "$lane13_git_phase_status" | tr '\n' '|')
-    lane13_fact "git_status_${lane13_git_phase}=$lane13_git_phase_status_projection"
-    lane13_fact "git_worktree_clean_${lane13_git_phase}=$lane13_git_phase_clean"
-    lane13_fact "git_index_clean_${lane13_git_phase}=$lane13_git_phase_index_clean"
-    {
-        printf 'head=%s\n' "$lane13_git_phase_head"
-        printf 'tree=%s\n' "$lane13_git_phase_tree"
-        printf 'worktree_clean=%s\n' "$lane13_git_phase_clean"
-        printf 'index_clean=%s\n' "$lane13_git_phase_index_clean"
-        printf 'status_begin\n%s\nstatus_end\n' "$lane13_git_phase_status"
-    } > "$WORK/.lane13-git-$lane13_git_phase"
-    lane13_record_inputs "$lane13_facts_phase"
-}
-
-lane13_compare_input_ledgers() {
-    python3 - "$1" "$2" <<'PY'
-import sys
-
-def projection(path):
-    entries = []
-    for line in open(path, encoding="utf-8"):
-        prefix, separator, value = line.partition("=")
-        if separator != "=" or not prefix.startswith("input_ledger_"):
-            raise SystemExit(f"invalid input ledger entry in {path}")
-        entries.append(value)
-    return entries
-
-if projection(sys.argv[1]) != projection(sys.argv[2]):
-    raise SystemExit("consumed input ledger changed")
-PY
+    if git diff --quiet; then
+        lane13_git_phase_clean=1
+    else
+        lane13_git_diff_status=$?
+        [ "$lane13_git_diff_status" -eq 1 ] || return "$lane13_git_diff_status"
+        lane13_git_phase_clean=0
+    fi
+    if git diff --cached --quiet; then
+        lane13_git_phase_index_clean=1
+    else
+        lane13_git_diff_status=$?
+        [ "$lane13_git_diff_status" -eq 1 ] || return "$lane13_git_diff_status"
+        lane13_git_phase_index_clean=0
+    fi
+    lane13_fact "git_head_${lane13_git_phase}=$lane13_git_phase_head" || return 1
+    lane13_fact "git_tree_${lane13_git_phase}=$lane13_git_phase_tree" || return 1
+    lane13_git_phase_status_input=$EVIDENCE/.lane13-git-status-$lane13_git_phase
+    if printf '%s\n' "$lane13_git_phase_status" > "$lane13_git_phase_status_input"; then
+        :
+    else
+        lane13_git_phase_status_result=$?
+        rm -f -- "$lane13_git_phase_status_input"
+        return "$lane13_git_phase_status_result"
+    fi
+    if lane13_git_phase_status_projection=$(tr '\n' '|' < "$lane13_git_phase_status_input"); then
+        :
+    else
+        lane13_git_phase_status_result=$?
+        rm -f -- "$lane13_git_phase_status_input"
+        return "$lane13_git_phase_status_result"
+    fi
+    rm -f -- "$lane13_git_phase_status_input" || return $?
+    lane13_fact "git_status_${lane13_git_phase}=$lane13_git_phase_status_projection" \
+        || return 1
+    lane13_fact "git_worktree_clean_${lane13_git_phase}=$lane13_git_phase_clean" \
+        || return 1
+    lane13_fact "git_index_clean_${lane13_git_phase}=$lane13_git_phase_index_clean" \
+        || return 1
+    printf 'head=%s\ntree=%s\nworktree_clean=%s\nindex_clean=%s\nstatus_begin\n%s\nstatus_end\n' \
+        "$lane13_git_phase_head" "$lane13_git_phase_tree" \
+        "$lane13_git_phase_clean" "$lane13_git_phase_index_clean" \
+        "$lane13_git_phase_status" > "$EVIDENCE/git.$lane13_git_phase" || return $?
+    lane13_record_inputs "$lane13_facts_phase" || return $?
 }
 
 lane13_record_file_fact() {
@@ -784,9 +789,12 @@ lane13_fetch_release() {
     lane13_url=$1
     lane13_name=$2
     case $lane13_url:$lane13_name in
-        "https://github.com/knative/serving/releases/download/${KNATIVE_VERSION}/serving-crds.yaml:serving-crds.yaml"|\
-        "https://github.com/knative/serving/releases/download/${KNATIVE_VERSION}/serving-core.yaml:serving-core.yaml"|\
-        "https://github.com/knative-extensions/net-kourier/releases/download/${KNATIVE_VERSION}/kourier.yaml:kourier.yaml") ;;
+        "https://github.com/knative/serving/releases/download/${KNATIVE_VERSION}/serving-crds.yaml:serving-crds.yaml")
+            lane13_expected_sha256=b172ff4901ed50f8e4e09ff8616e54d22e264df7086ce8cb74f513a04812fe74 ;;
+        "https://github.com/knative/serving/releases/download/${KNATIVE_VERSION}/serving-core.yaml:serving-core.yaml")
+            lane13_expected_sha256=be3f16c9c0ac9276cc173ef04871aaeac78537f9edb116310caa02f016e9cbc2 ;;
+        "https://github.com/knative-extensions/net-kourier/releases/download/${KNATIVE_VERSION}/kourier.yaml:kourier.yaml")
+            lane13_expected_sha256=cded0c3c1d7669b1aa9f7484234b454ff3940a2b54a27d5ec4825c2d4003d01d ;;
         *) return 1 ;;
     esac
     mkdir -p "$WORK/releases"
@@ -816,6 +824,10 @@ PY
     case $lane13_size in ''|*[!0-9]*) return 1 ;; esac
     [ "$lane13_size" -gt 0 ] && [ "$lane13_size" -le 16777216 ] || return 1
     lane13_before=$(lane13_sha256 "$lane13_release") || return 1
+    if [ "$lane13_before" != "$lane13_expected_sha256" ]; then
+        echo "Knative release SHA256 mismatch: $lane13_name" >&2
+        return 1
+    fi
     lane13_fact "release_declared=$lane13_url"
     lane13_fact "release_effective=$lane13_safe_url"
     lane13_fact "release_redirects=$lane13_redirects"
@@ -828,8 +840,14 @@ PY
     fi
     lane13_after_size=$(stat -Lc %s "$lane13_release") || return 1
     lane13_after=$(lane13_sha256 "$lane13_release") || return 1
-    [ "$lane13_after_size" = "$lane13_size" ] || return 1
-    [ "$lane13_before" = "$lane13_after" ] || return 1
+    [ "$lane13_after_size" = "$lane13_size" ] || {
+        echo "Knative release changed during apply: $lane13_name" >&2
+        return 1
+    }
+    [ "$lane13_before" = "$lane13_after" ] || {
+        echo "Knative release changed during apply: $lane13_name" >&2
+        return 1
+    }
     python3 - "$FACTS" "$lane13_name" "$WORK/releases/.lane13-applied" <<'PY' || return 1
 import re
 import sys
@@ -1023,6 +1041,31 @@ allowed = {
     "stdout.log", "stderr.log", "facts.log", "status",
     "observed.json", "manifest-host.json", "profile.log", "portforward.log",
     "portforward.group.before.json", "portforward.group.after.json",
+    "source.start.sha256", "source.end.sha256", "git.start", "git.end",
+    "dependencies.initial.root.command.json",
+    "dependencies.initial.root.context.json",
+    "dependencies.initial.root.status",
+    "dependencies.initial.root.stdout.json",
+    "dependencies.initial.root.stderr",
+    "dependencies.initial.bpf.command.json",
+    "dependencies.initial.bpf.context.json",
+    "dependencies.initial.bpf.status",
+    "dependencies.initial.bpf.stdout.json",
+    "dependencies.initial.bpf.stderr",
+    "dependencies.initial.ledger.sha256",
+    "dependencies.initial.receipt.json",
+    "dependencies.final.root.command.json",
+    "dependencies.final.root.context.json",
+    "dependencies.final.root.status",
+    "dependencies.final.root.stdout.json",
+    "dependencies.final.root.stderr",
+    "dependencies.final.bpf.command.json",
+    "dependencies.final.bpf.context.json",
+    "dependencies.final.bpf.status",
+    "dependencies.final.bpf.stdout.json",
+    "dependencies.final.bpf.stderr",
+    "dependencies.final.ledger.sha256",
+    "dependencies.final.receipt.json",
 }
 required = {"stdout.log", "stderr.log", "facts.log", "status"}
 if stat.S_IMODE(os.stat(root).st_mode) != 0o700 or os.path.islink(root):
@@ -1035,6 +1078,15 @@ for entry in entries:
         raise SystemExit(f"lane-13 retained root contains {entry.name}")
     if stat.S_IMODE(entry.stat(follow_symlinks=False).st_mode) != 0o600:
         raise SystemExit(f"lane-13 retained file has unsafe mode: {entry.name}")
+facts = open(os.path.join(root, "facts.log"), encoding="utf-8").read().splitlines()
+if "input_ledger_phase=complete" in facts:
+    required_success = allowed - {
+        "observed.json", "manifest-host.json", "profile.log", "portforward.log",
+        "portforward.group.before.json", "portforward.group.after.json",
+    }
+    missing = sorted(required_success - {entry.name for entry in entries})
+    if missing:
+        raise SystemExit(f"lane-13 retained root is missing successful evidence: {missing}")
 PY
 }
 
@@ -1600,17 +1652,11 @@ PY
             cleanup_step lane13_fact kubeconfig_absent=0
         fi
     }
-    [ -z "${EVIDENCE-}" ] || cleanup_step lane13_record_facts end
-    [ -z "${EVIDENCE-}" ] || cleanup_step lane13_compare_input_ledgers \
-        "$WORK/.lane13-inputs-start" "$WORK/.lane13-inputs-end"
-    [ -z "${EVIDENCE-}" ] || cleanup_step cmp "$WORK/.lane13-git-start" "$WORK/.lane13-git-end"
     if [ -n "${WORK_CREATED-}" ] \
         && [ "$PF_SESSION_EMPTY" -eq 1 ] \
         && [ "$CLUSTER_ABSENT" -eq 1 ] \
         && [ "$IMAGE_ABSENT" -eq 1 ] \
         && [ "$KUBECONFIG_ABSENT" -eq 1 ]; then
-        cleanup_step rm -f -- "$WORK/.lane13-inputs-start" "$WORK/.lane13-inputs-end"
-        cleanup_step rm -f -- "$WORK/.lane13-git-start" "$WORK/.lane13-git-end"
         cleanup_step lane13_remove_owned_work
     else
         [ -z "${WORK_CREATED-}" ] || cleanup_step false
@@ -1620,6 +1666,32 @@ PY
     [ -z "${WORK_CREATED-}" ] || {
         [ ! -e "$WORK" ] && [ ! -L "$WORK" ] || cleanup_step false
     }
+    if [ -z "${EVIDENCE-}" ]; then
+        :
+    elif [ "${LANE13_ADMISSION_ESTABLISHED:-0}" -eq 1 ]; then
+        cleanup_step "$P11SCOPE_PREPARED_PYTHON" -I \
+            scripts/prepared-dependency-evidence.py recheck \
+            --prefix "$EVIDENCE/dependencies"
+        lane13_prepared_recheck_status=$cleanup_step_status
+        cleanup_step lane13_fact "prepared_recheck_status=$lane13_prepared_recheck_status"
+        if [ "$lane13_prepared_recheck_status" -eq 0 ] \
+            && [ "${LANE13_START_LEDGER_ESTABLISHED:-0}" -eq 1 ]; then
+            cleanup_step lane13_record_facts end
+            lane13_end_record_status=$cleanup_step_status
+            if [ "$lane13_end_record_status" -eq 0 ]; then
+                cleanup_step cmp "$EVIDENCE/source.start.sha256" "$EVIDENCE/source.end.sha256"
+                cleanup_step cmp "$EVIDENCE/git.start" "$EVIDENCE/git.end"
+                cleanup_step lane13_fact input_ledger_phase=complete
+            else
+                cleanup_step lane13_fact input_ledger_phase=failed-end
+            fi
+        else
+            cleanup_step lane13_fact input_ledger_phase=failed-end
+        fi
+    else
+        cleanup_step lane13_fact input_ledger_phase=unavailable-start
+        [ "$BODY_STATUS" -ne 0 ] || cleanup_step false
+    fi
     [ -z "${EVIDENCE-}" ] || cleanup_step lane13_fact "cleanup_status=$CLEANUP_STATUS"
     exit "$CLEANUP_STATUS"
 }
@@ -1637,11 +1709,12 @@ else
     exit $?
 fi
 
-for command in cargo curl docker gcc kind kubectl python3 tar timeout; do
+for command in curl docker gcc kind kubectl python3 realpath rustup tar timeout; do
     command -v "$command" >/dev/null || { echo "$command required" >&2; exit 1; }
 done
+lane13_prepare_local_evidence "$@"
 sudo -n true 2>/dev/null || { echo "passwordless sudo required" >&2; exit 1; }
-lane13_prepare_diagnostics "$@"
+lane13_prepare_runtime_diagnostics
 lane13_preflight
 IMAGE_CLEANUP_ARMED=1
 CLUSTER_CLEANUP_ARMED=1
@@ -1653,9 +1726,12 @@ WORK_CREATED=1
 WORK_DEV_INO=$(stat -Lc '%d:%i' "$WORK")
 [ "$(stat -Lc %u "$WORK")" = "$(id -u)" ] && [ "$(stat -Lc %a "$WORK")" = 700 ]
 lane13_fact "work_dev_ino=$WORK_DEV_INO"
-lane13_record_facts start
-timeout --signal=TERM --kill-after=5s 600s cargo +1.88 build --locked --release \
-    --workspace --target-dir "$PRODUCT"
+RUSTC="$P11SCOPE_PREPARED_STABLE_RUSTC" \
+    P11SCOPE_PREPARED_BPF_CARGO="$P11SCOPE_PREPARED_BPF_CARGO" \
+    P11SCOPE_PREPARED_BPF_RUSTC="$P11SCOPE_PREPARED_BPF_RUSTC" \
+    timeout --signal=TERM --kill-after=5s 600s \
+    "$P11SCOPE_PREPARED_STABLE_CARGO" build --locked --offline --release \
+        --workspace --target-dir "$PRODUCT"
 lane13_record_file_fact p11scope "$PRODUCT/release/p11scope"
 lane13_record_file_fact p11scope_discover "$PRODUCT/release/p11scope-discover"
 lane13_record_generated_bpf

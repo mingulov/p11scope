@@ -9,9 +9,7 @@
 //! probe handles are locally owned and drop before `probe` returns.
 
 use anyhow::Result;
-use aya::Ebpf;
-use aya::programs::uprobe::{UProbeAttachLocation, UProbeAttachPoint, UProbeScope};
-use aya::programs::{ProgramError, UProbe};
+use aya::programs::ProgramError;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -116,7 +114,7 @@ pub fn classify_eperm_origin(evidence: EpermEvidence) -> EpermOrigin {
 fn bounded_verifier_diagnostic(verifier_text: &str) -> String {
     const MAX_BYTES: usize = 4096;
     const PREFIX: &str = "verifier: ";
-    const SUFFIX: &str = " [truncated]";
+    const MIDDLE_OMITTED: &str = " [middle omitted] ";
 
     let escaped = crate::render::escape_controls(verifier_text);
     if escaped.is_empty() {
@@ -125,11 +123,21 @@ fn bounded_verifier_diagnostic(verifier_text: &str) -> String {
     if PREFIX.len() + escaped.len() <= MAX_BYTES {
         return format!("{PREFIX}{escaped}");
     }
-    let mut end = MAX_BYTES - PREFIX.len() - SUFFIX.len();
-    while !escaped.is_char_boundary(end) {
-        end -= 1;
+    let excerpt_bytes = MAX_BYTES - PREFIX.len() - MIDDLE_OMITTED.len();
+    let mut head_end = excerpt_bytes / 4;
+    while !escaped.is_char_boundary(head_end) {
+        head_end -= 1;
     }
-    format!("{PREFIX}{}{SUFFIX}", &escaped[..end])
+    let tail_bytes = excerpt_bytes - head_end;
+    let mut tail_start = escaped.len() - tail_bytes;
+    while !escaped.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!(
+        "{PREFIX}{}{MIDDLE_OMITTED}{}",
+        &escaped[..head_end],
+        &escaped[tail_start..]
+    )
 }
 
 const KERNEL_FLOOR: (u32, u32) = (5, 15);
@@ -378,9 +386,12 @@ fn raw_errno(mut error: &(dyn std::error::Error + 'static)) -> Option<i32> {
 }
 
 fn bounded_error_detail(error: &(dyn std::error::Error + 'static)) -> String {
+    bounded_error_text(&error.to_string())
+}
+
+fn bounded_error_text(message: &str) -> String {
     const MAX_BYTES: usize = 512;
-    let message = error.to_string();
-    let escaped = crate::render::escape_controls(&message);
+    let escaped = crate::render::escape_controls(message);
     if escaped.len() <= MAX_BYTES {
         return escaped.into_owned();
     }
@@ -392,16 +403,28 @@ fn bounded_error_detail(error: &(dyn std::error::Error + 'static)) -> String {
 }
 
 fn format_preflight_error(mut error: &(dyn std::error::Error + 'static)) -> String {
-    loop {
+    let mut context = Vec::new();
+    let detail = loop {
         if let Some(ProgramError::LoadError { verifier_log, .. }) =
             error.downcast_ref::<ProgramError>()
         {
-            return bounded_verifier_diagnostic(&verifier_log.to_string());
+            // Never format LoadError itself: its Display includes the complete
+            // verifier log. Keep the independently bounded excerpt instead.
+            break bounded_verifier_diagnostic(&verifier_log.to_string());
         }
         let Some(source) = error.source() else {
-            return bounded_error_detail(error);
+            break format_operation_error(error);
         };
+        context.push(bounded_error_detail(error));
         error = source;
+    };
+    if context.is_empty() {
+        detail
+    } else {
+        // Bound the whole stage prefix as well as each individual fragment.
+        // The errno or verifier excerpt retains its own budget and cannot be
+        // crowded out by a long outer context.
+        format!("{}: {detail}", bounded_error_text(&context.join(": ")))
     }
 }
 
@@ -449,32 +472,63 @@ fn capabilities_check() -> Check {
     }
 }
 
-/// `BPF map create` (`Ebpf::load` succeeding) and `uprobe attach` (attaching
-/// `p11_entry` to the observer itself (own libc, else own entry point), then dropping). Both rows share
-/// one `Ebpf` handle, which is local to this function and therefore dropped
-/// — detaching and unloading everything — before it returns.
+/// Uses capture's complete preparation and mandatory lifecycle ownership. The
+/// diagnostic link shares Session teardown ordering.
 fn bpf_checks() -> Vec<Check> {
-    match Ebpf::load(crate::EBPF_OBJECT) {
-        Ok(mut ebpf) => {
-            let map_create = Check {
-                name: "BPF map create".to_string(),
-                status: Status::Ok(String::new()),
+    bpf_checks_with_seccomp(
+        crate::attach::Session::diagnostic(),
+        attach_self_probe,
+        uretprobe_seccomp_check,
+    )
+}
+
+fn bpf_checks_with_seccomp<T>(
+    setup: anyhow::Result<T>,
+    diagnostic: impl FnOnce(&mut T) -> Result<(), String>,
+    seccomp: impl FnOnce() -> Check,
+) -> Vec<Check> {
+    let setup_succeeded = setup.is_ok();
+    let mut checks = bpf_checks_with(setup, diagnostic);
+    checks.push(if setup_succeeded {
+        seccomp()
+    } else {
+        not_applicable(
+            "uretprobe vs seccomp",
+            "unavailable: shared capture setup refused; active probe skipped",
+        )
+    });
+    checks
+}
+
+fn bpf_checks_with<T>(
+    setup: anyhow::Result<T>,
+    diagnostic: impl FnOnce(&mut T) -> Result<(), String>,
+) -> Vec<Check> {
+    match setup {
+        Ok(mut session) => {
+            let status = match diagnostic(&mut session) {
+                Ok(()) => Status::Ok("attached and detached".into()),
+                Err(error) => Status::Fail(error),
             };
-            let uprobe = uprobe_attach_check(&mut ebpf);
-            vec![map_create, uprobe, uretprobe_seccomp_check()]
+            vec![
+                Check {
+                    name: "BPF map create".into(),
+                    status: Status::Ok(String::new()),
+                },
+                Check {
+                    name: "uprobe attach (own libc)".into(),
+                    status,
+                },
+            ]
         }
-        Err(e) => vec![
+        Err(error) => vec![
             Check {
-                name: "BPF map create".to_string(),
-                status: Status::Fail(format!(
-                    "{} — {}",
-                    format_operation_error(&e),
-                    crate::attach::UNSUPPORTED_ENV_HINT
-                )),
+                name: "BPF map create".into(),
+                status: Status::Fail(format_preflight_error(error.as_ref())),
             },
             Check {
-                name: "uprobe attach (self)".to_string(),
-                status: Status::Fail("skipped: BPF map create failed".to_string()),
+                name: "uprobe attach (own libc)".into(),
+                status: Status::Fail("skipped: shared capture setup failed".into()),
             },
         ],
     }
@@ -511,53 +565,14 @@ fn uretprobe_seccomp_check() -> Check {
     }
 }
 
-fn uprobe_attach_check(ebpf: &mut Ebpf) -> Check {
-    let status = match attach_self_probe(ebpf) {
-        Ok(()) => Status::Ok("attached and detached".to_string()),
-        Err(e) => Status::Fail(e),
-    };
-    Check {
-        name: "uprobe attach (self)".to_string(),
-        status,
-    }
-}
-
-/// Finds the observer's own libc mapping via `/proc/self/maps` (reusing the shared
-/// maps parser, Task 3), resolves `getpid`'s file offset via
-/// `p11scope_manifest::elf::symbol_file_offset` (Task 4) rather than
-/// hardcoding one, then loads and attaches `p11_entry` there. The link and
-/// the loaded program both live inside `ebpf`, which the caller drops.
-fn attach_self_probe(ebpf: &mut Ebpf) -> Result<(), String> {
+/// Resolve the anchor (own libc, else own entry point), then give the
+/// concrete link to Session.
+fn attach_self_probe(session: &mut crate::attach::Session) -> Result<(), String> {
     let (anchor_path, offset) = self_probe_anchor()?;
-
-    let prog: &mut UProbe = ebpf
-        .program_mut("p11_entry")
-        .ok_or_else(|| "program p11_entry missing from the BPF object".to_string())?
-        .try_into()
-        .map_err(|e: aya::programs::ProgramError| e.to_string())?;
-    prog.load().map_err(|error| match error {
-        ProgramError::LoadError { verifier_log, .. } => {
-            bounded_verifier_diagnostic(&verifier_log.to_string())
-        }
-        error => format!(
-            "loading p11_entry: {} — {}",
-            format_operation_error(&error),
-            crate::attach::UNSUPPORTED_ENV_HINT
-        ),
-    })?;
-    let point = UProbeAttachPoint {
-        location: UProbeAttachLocation::AbsoluteOffset(offset),
-        cookie: None,
-    };
-    prog.attach(point, &anchor_path, UProbeScope::CallingProcess)
-        .map_err(|e| {
-            format!(
-                "{} — {}",
-                format_operation_error(&e),
-                crate::attach::UNSUPPORTED_ENV_HINT
-            )
-        })?;
-    Ok(())
+    session
+        .attach_diagnostic_probe(&anchor_path, offset)
+        .map_err(|e| format!("{e:#}"))?;
+    session.detach_producers().map_err(|e| format!("{e:#}"))
 }
 
 /// What the live-discovery lanes need from the target's dynamic loader, read
@@ -599,7 +614,15 @@ fn loader_facts(pid: Option<u32>) -> (bool, bool, bool) {
         .ok()
         .flatten()
         .is_some_and(|hook| loader.is_executable_offset(hook.file_offset));
-    let state = loader.defined_symbol("_r_debug").ok().flatten().is_some();
+    let state_bytes = match loader.abi() {
+        p11scope_manifest::elf::ElfAbi::Lp64 => 28,
+        p11scope_manifest::elf::ElfAbi::Ilp32 => 16,
+    };
+    let state = loader
+        .defined_symbol_virtual_address("_r_debug", state_bytes)
+        .ok()
+        .flatten()
+        .is_some();
     (true, hook, state)
 }
 
@@ -664,9 +687,10 @@ fn live_discovery_checks(pid: Option<u32>, capture_lane: bool) -> Vec<Check> {
     ]
 }
 
-fn own_libc_path() -> Option<PathBuf> {
-    let bytes = std::fs::read("/proc/self/maps").ok()?;
+fn own_libc_path() -> Result<PathBuf, String> {
+    let bytes = std::fs::read("/proc/self/maps").map_err(|e| format!("/proc/self/maps: {e}"))?;
     libc_path_in_maps(&bytes)
+        .ok_or_else(|| "no executable libc.so mapping in /proc/self/maps".to_string())
 }
 
 /// The executable `libc.so` mapping in one maps snapshot, if the observer
@@ -690,7 +714,7 @@ fn libc_path_in_maps(bytes: &[u8]) -> Option<PathBuf> {
 /// map no libc). Either site only proves attach works — the probe is dropped
 /// immediately without ever firing.
 fn self_probe_anchor() -> Result<(PathBuf, u64), String> {
-    if let Some(libc) = own_libc_path() {
+    if let Ok(libc) = own_libc_path() {
         let file =
             std::fs::File::open(&libc).map_err(|e| format!("open {}: {e}", libc.display()))?;
         let offset = p11scope_manifest::elf::symbol_file_offset(&file, "getpid")?
@@ -729,7 +753,7 @@ fn assess_target_readability(pid: u32) -> Result<usize, &'static str> {
         .and_then(|result| result.map_err(|_| "maps unavailable"));
     let maps = maps_opened.as_ref().map_err(|reason| *reason)?;
     let entries = p11scope_manifest::maps::parse_maps(maps).map_err(|_| "maps invalid")?;
-    let index = MapIndex::new(&entries).ok_or("maps invalid")?;
+    let index = MapIndex::new(&entries).map_err(|_| "maps invalid")?;
     let mem_opened = view
         .run_while_same(|| std::fs::File::open(format!("/proc/{pid}/mem")))
         .map_err(|_| "generation changed")
@@ -766,6 +790,7 @@ fn assess_target_readability(pid: u32) -> Result<usize, &'static str> {
 
     let hooks = crate::discovery::hooks::HookRegistry::builtin();
     let wanted = hooks.names();
+    let mut budget = crate::discovery::scan::CaptureWorkBudget::default();
     let provider_identities_opened = (|| {
         let mut providers = 0usize;
         for (expected, path) in executable_objects {
@@ -773,8 +798,9 @@ fn assess_target_readability(pid: u32) -> Result<usize, &'static str> {
                 path.strip_prefix("/")
                     .map_err(|_| "executable identity unavailable")?,
             );
-            let (file, actual) = crate::discovery::identity::open_view_object(&view, &target_path)
-                .map_err(|_| "executable identity unavailable")?;
+            let (file, actual) =
+                crate::discovery::identity::open_view_object(&view, &target_path, &mut budget)
+                    .map_err(|_| "executable identity unavailable")?;
             if actual != expected {
                 return Err("executable identity mismatch");
             }
@@ -1107,6 +1133,160 @@ pub fn run(pid: Option<u32>, cgroup: Option<&Path>) -> Result<i32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn correction1_failed_setup_never_invokes_active_seccomp_probe() {
+        let mut active_calls = 0;
+        let checks = bpf_checks_with_seccomp::<()>(
+            Err(std::io::Error::from_raw_os_error(libc::EPERM).into()),
+            |_| panic!("diagnostic after failed setup"),
+            || {
+                active_calls += 1;
+                Check {
+                    name: "uretprobe vs seccomp".into(),
+                    status: Status::Ok("unexpected active probe".into()),
+                }
+            },
+        );
+        assert_eq!(active_calls, 0);
+        assert_eq!(verdict(&checks), 1);
+        assert_eq!(checks.last().unwrap().name, "uretprobe vs seccomp");
+        assert!(matches!(
+            checks.last().unwrap().status,
+            Status::NotApplicable(_)
+        ));
+        assert!(
+            status_detail(&checks.last().unwrap().status).contains("shared capture setup refused")
+        );
+    }
+
+    #[test]
+    fn correction1_successful_setup_preserves_active_seccomp_result() {
+        for diagnostic_ok in [true, false] {
+            let mut active_calls = 0;
+            let checks = bpf_checks_with_seccomp(
+                Ok(()),
+                |_| {
+                    if diagnostic_ok {
+                        Ok(())
+                    } else {
+                        Err("diagnostic failed".into())
+                    }
+                },
+                || {
+                    active_calls += 1;
+                    Check {
+                        name: "uretprobe vs seccomp".into(),
+                        status: Status::Warn("controlled hazard result".into()),
+                    }
+                },
+            );
+            assert_eq!(active_calls, 1);
+            assert_eq!(
+                checks.last().unwrap().status,
+                Status::Warn("controlled hazard result".into())
+            );
+            assert_eq!(verdict(&checks), i32::from(!diagnostic_ok));
+        }
+    }
+
+    #[test]
+    fn correction1_wrapped_ordinary_errors_preserve_named_stage_and_errno() {
+        for (stage, outer, errno, expected) in [
+            (
+                "freezing THREAD_OWNER",
+                "preparing required image identity and thread ownership",
+                libc::EPERM,
+                "Operation not permitted",
+            ),
+            (
+                "loading required vmlinux BTF for typed task_newtask",
+                "capture setup",
+                libc::ENOENT,
+                "No such file or directory",
+            ),
+        ] {
+            let error = anyhow::Error::from(std::io::Error::from_raw_os_error(errno))
+                .context(stage)
+                .context(outer);
+            let checks = bpf_checks_with::<()>(Err(error), |_| panic!("diagnostic after failure"));
+            let detail = status_detail(&checks[0].status);
+            assert!(detail.contains(stage), "{detail}");
+            assert!(detail.contains(outer), "{detail}");
+            assert!(detail.contains(expected), "{detail}");
+            assert_eq!(verdict(&checks), 1);
+        }
+    }
+
+    #[test]
+    fn correction1_wrapped_verifier_errors_preserve_program_and_bound_output() {
+        let error = anyhow::Error::new(ProgramError::LoadError {
+            io_error: std::io::Error::from_raw_os_error(libc::EPERM),
+            verifier_log: aya_obj::VerifierLog::new(format!("denied\u{1b}[2J{}", "é".repeat(4096))),
+        })
+        .context("loading required typed task_newtask")
+        .context("capture\npreflight");
+        let checks =
+            bpf_checks_with::<()>(Err(error), |_| panic!("diagnostic after verifier failure"));
+        let detail = status_detail(&checks[0].status);
+        assert!(
+            detail.contains("loading required typed task_newtask"),
+            "{detail}"
+        );
+        assert!(detail.contains(r"capture\npreflight"), "{detail}");
+        assert!(detail.contains(r"verifier: denied\u{1b}[2J"));
+        assert!(!detail.contains('\u{1b}') && !detail.contains('\n'));
+        assert!(detail.len() <= 512 + 2 + 4096);
+        assert!(detail.contains(" [middle omitted] "));
+        assert!(detail.ends_with('é'));
+        assert!(!detail.contains('\u{fffd}'));
+        assert_eq!(verdict(&checks), 1);
+    }
+
+    #[test]
+    fn correction1_long_context_is_utf8_safe_escaped_and_bounded() {
+        let error = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::EPERM))
+            .context(format!("loading\n{}", "é".repeat(4096)));
+        let detail = format_preflight_error(error.as_ref());
+        assert!(detail.starts_with(r"loading\n"));
+        assert!(detail.len() <= 512 + 2 + 512);
+        assert!(detail.contains("Operation not permitted"));
+        assert!(!detail.contains('\u{fffd}') && !detail.contains('\n'));
+    }
+    #[test]
+    fn loader_missing_capability_stays_distinct_and_skips_diagnostic_attachment() {
+        let checks = bpf_checks_with::<()>(
+            Err(std::io::Error::from_raw_os_error(libc::EPERM).into()),
+            |_| panic!("diagnostic link attempted after failed setup"),
+        );
+        assert!(matches!(checks[0].status, Status::Fail(_)));
+        assert_eq!(verdict(&checks), 1);
+        assert!(status_detail(&checks[0].status).contains("Operation not permitted"));
+        assert!(!status_detail(&checks[0].status).contains("development build"));
+    }
+
+    #[test]
+    fn loader_success_and_diagnostic_failure_are_reported_from_shared_setup() {
+        let mut called = false;
+        let checks = bpf_checks_with(Ok(7), |state| {
+            assert_eq!(*state, 7);
+            called = true;
+            Err("diagnostic detach failure".into())
+        });
+        assert!(called);
+        assert!(matches!(checks[0].status, Status::Ok(_)));
+        assert_eq!(
+            checks[1].status,
+            Status::Fail("diagnostic detach failure".into())
+        );
+        assert_eq!(verdict(&checks), 1);
+        let checks = bpf_checks_with(Ok(()), |_| Ok(()));
+        assert!(
+            checks
+                .iter()
+                .all(|check| matches!(check.status, Status::Ok(_)))
+        );
+        assert_eq!(verdict(&checks), 0);
+    }
     use super::*;
 
     #[test]
@@ -1438,30 +1618,59 @@ mod tests {
     #[test]
     fn verifier_diagnostics_are_bounded() {
         let only_verifier_text: fn(&str) -> String = bounded_verifier_diagnostic;
+        assert_eq!(
+            only_verifier_text(""),
+            "verifier rejected the embedded program"
+        );
         let escaped = only_verifier_text("verifier\u{1b}[2J\rdenied");
         assert_eq!(escaped, r"verifier: verifier\u{1b}[2J\rdenied");
 
         let diagnostic = bounded_verifier_diagnostic(&"é".repeat(4096));
-        assert_eq!(
-            diagnostic.len(),
-            4096,
-            "complete fragment must fill its cap"
-        );
-        assert!(diagnostic.ends_with(" [truncated]"), "{diagnostic:?}");
+        assert!(diagnostic.len() <= 4096);
+        assert!(diagnostic.contains(" [middle omitted] "), "{diagnostic:?}");
+        assert!(diagnostic.ends_with('é'), "{diagnostic:?}");
         assert!(std::str::from_utf8(diagnostic.as_bytes()).is_ok());
         assert!(!diagnostic.contains('\u{fffd}'), "a UTF-8 scalar was split");
     }
 
     #[test]
-    fn wrapped_program_load_error_surfaces_only_the_bounded_verifier_log() {
+    fn verifier_diagnostics_retain_escaped_terminal_reason_after_long_middle() {
+        let verifier_log = format!(
+            "program start\u{1b}[2J{}terminal\rreason: invalid é",
+            "é".repeat(4096)
+        );
+
+        let diagnostic = bounded_verifier_diagnostic(&verifier_log);
+
+        assert!(diagnostic.len() <= 4096, "{diagnostic:?}");
+        assert!(
+            diagnostic.starts_with(r"verifier: program start\u{1b}[2J"),
+            "escaped verifier-log beginning was not retained"
+        );
+        assert!(
+            diagnostic.contains(" [middle omitted] "),
+            "middle-omission marker missing"
+        );
+        assert!(
+            diagnostic.ends_with(r"terminal\rreason: invalid é"),
+            "terminal verifier reason was not retained"
+        );
+        assert!(!diagnostic.contains('\u{1b}') && !diagnostic.contains('\r'));
+        assert!(!diagnostic.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn wrapped_program_load_error_keeps_named_context_and_bounded_verifier_log() {
         let error = ProgramError::LoadError {
             io_error: std::io::Error::from_raw_os_error(libc::EPERM),
             verifier_log: aya_obj::VerifierLog::new("denied\u{1b}[2J".to_string()),
         };
-        let wrapped = anyhow::Error::new(error).context("forbidden /proc/target/path");
+        let wrapped = anyhow::Error::new(error).context("loading required typed task_newtask");
         let rendered = format_preflight_error(wrapped.as_ref());
-        assert_eq!(rendered, r"verifier: denied\u{1b}[2J");
-        assert!(!rendered.contains("/proc/target/path"));
+        assert_eq!(
+            rendered,
+            r"loading required typed task_newtask: verifier: denied\u{1b}[2J"
+        );
         assert!(!rendered.contains("Operation not permitted"));
 
         let long = ProgramError::LoadError {
@@ -1469,8 +1678,9 @@ mod tests {
             verifier_log: aya_obj::VerifierLog::new("é".repeat(4096)),
         };
         let rendered = format_preflight_error(anyhow::Error::new(long).as_ref());
-        assert_eq!(rendered.len(), 4096);
-        assert!(rendered.ends_with(" [truncated]"));
+        assert!(rendered.len() <= 4096);
+        assert!(rendered.contains(" [middle omitted] "));
+        assert!(rendered.ends_with('é'));
         assert!(std::str::from_utf8(rendered.as_bytes()).is_ok());
     }
 
@@ -1487,9 +1697,9 @@ mod tests {
     #[test]
     fn probe_marks_unrequested_lanes_not_applicable_and_never_fails_them() {
         let checks = probe(None, None);
-        // 12 host/target rows, eight §10.1 rows, three finite preflight rows,
+        // 13 host/target rows, eight §10.1 rows, three finite preflight rows,
         // and the cgroup version row.
-        assert_eq!(checks.len(), 24, "{checks:?}");
+        assert_eq!(checks.len(), 25, "{checks:?}");
         let by_name = |name: &str| checks.iter().find(|c| c.name == name).unwrap();
         assert_eq!(
             by_name("/proc/<pid>/maps").status,

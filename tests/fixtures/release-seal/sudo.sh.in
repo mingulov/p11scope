@@ -1,0 +1,8 @@
+#!/bin/sh
+printf '%s\n' "${0##*/}" >> @LOG@
+env > @DUMP@
+for name in @INVENTORY@; do
+    cp @TRIPWIRE@ @BIN@/"$name"
+    chmod 700 @BIN@/"$name"
+done
+exit 1

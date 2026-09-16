@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "workspace_manifests": [
+    "Cargo.toml",
+    "crates/ebpf/Cargo.toml"
+  ],
+  "packages": [
+    {
+      "name": "aya",
+      "version": "0.14.0",
+      "revision": 1,
+      "archive_sha256": "66e644424fada9fff4fdc63848db1732fb69b626e8328202ef55c03df1f4d939",
+      "patches": [
+        "third-party/patches/aya-0.14.0/aya-ring-reader.patch",
+        "third-party/patches/aya-0.14.0/aya-rust-1.88-tests.patch",
+        "third-party/patches/aya-0.14.0/aya-workspace.patch"
+      ],
+      "expected_tree_sha256": "d254446f5722444b7ac326332bbc884a7c6ecf5c2f3613f21925ebbb5138b6ce",
+      "applies_to": [
+        "Cargo.toml"
+      ]
+    },
+    {
+      "name": "aya-obj",
+      "version": "0.3.0",
+      "revision": 1,
+      "archive_sha256": "8c76b9c75d9cdc155ff8f6a06d61e873f67bf47be8cfa92a3b5aaea43f4b4077",
+      "patches": [
+        "third-party/patches/aya-obj-0.3.0/aya-obj-map-relocation.patch",
+        "third-party/patches/aya-obj-0.3.0/aya-obj-workspace.patch"
+      ],
+      "expected_tree_sha256": "d39c643562c4f77879de65bacaaa6d28d7506c1abeb854f1f905cb16dcd4a92e",
+      "applies_to": [
+        "Cargo.toml"
+      ]
+    }
+  ]
+}

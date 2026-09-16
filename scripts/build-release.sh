@@ -172,7 +172,10 @@ supplied={"canary":str(paths["canary"]),"attach":str(paths["attach"])}
 mark(lane[17],all(value.startswith("/") for value in supplied.values())
      and all(not value.startswith("/") for value in legacy_defaults.values()))
 inherited=dict.fromkeys(("RUSTFLAGS","CARGO_ENCODED_RUSTFLAGS","CARGO_TARGET_DIR","CARGO_BUILD_TARGET",
-                         "CARGO_HOME","RUSTUP_HOME","RUSTUP_TOOLCHAIN","RUSTC_WRAPPER","CC","CFLAGS"),"")
+                         "CARGO_HOME","RUSTUP_HOME","RUSTUP_TOOLCHAIN","RUSTC_WRAPPER","CC","CFLAGS",
+                         "P11SCOPE_PRODUCT_BUILD_MODE","P11SCOPE_PREPARED_STABLE_CARGO",
+                         "P11SCOPE_PREPARED_STABLE_RUSTC","P11SCOPE_PREPARED_BPF_CARGO",
+                         "P11SCOPE_PREPARED_BPF_RUSTC"),"")
 def preflight_accepts(status,configs,env):
     return status=="" and not configs and not any(env.values())
 body_ran=False
@@ -297,7 +300,15 @@ task4_prepare_root() {
 }
 
 task4_digest() { "$T4_TOOL_sha256sum" "$1" | awk '{print $1}'; }
-task4_snapshot() { git ls-files -z | sort -z | xargs -0 "$T4_TOOL_sha256sum"; }
+task4_snapshot() {
+    case $1 in initial|final) ;; *) return 1 ;; esac
+    t4_snapshot=$TASK4_ROOT/artifacts/source.$1
+    git ls-files -z > "$t4_snapshot.unsorted0" || return 1
+    sort -z < "$t4_snapshot.unsorted0" > "$t4_snapshot.sorted0" || return 1
+    xargs -0 -r "$T4_TOOL_sha256sum" < "$t4_snapshot.sorted0" > "$t4_snapshot.tracked.sha256" || return 1
+    "$T4_TOOL_python3" -I scripts/merge-checksum-ledgers.py \
+        "$t4_snapshot.tracked.sha256" "$TASK4_PREPARED_PREFIX.$1.ledger.sha256"
+}
 task4_fact() { printf '%s\t%s\n' "$1" "$2" >> "$TASK4_FACTS"; }
 
 # Hash one complete tree as a typed, sorted transcript. NUL-delimited
@@ -513,12 +524,14 @@ task4_sysroot_closure() {
     printf '%s\t%s %s\n' "$t4_row" "$t4_sysroot" "$t4_tree"
 }
 
-# The build inputs Cargo, rustup, and the C toolchain read from the
-# environment. Any non-empty inherited value re-steers the official build away
-# from the recorded source tree without leaving a trace in the receipt, so the
-# driver refuses them outright and supplies only command-local values.
+# Cargo, rustup, the C toolchain, and the product-build handoff read these
+# inputs from the environment. Any non-empty inherited value can re-steer the
+# official build away from the recorded source tree without leaving a trace in
+# the receipt, so the driver refuses them and supplies only command-local values.
 TASK4_BUILD_INPUTS='RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_TARGET_DIR CARGO_BUILD_TARGET
-CARGO_HOME RUSTUP_HOME RUSTUP_TOOLCHAIN RUSTC_WRAPPER CC CFLAGS'
+CARGO_HOME RUSTUP_HOME RUSTUP_TOOLCHAIN RUSTC_WRAPPER CC CFLAGS
+P11SCOPE_PRODUCT_BUILD_MODE P11SCOPE_PREPARED_STABLE_CARGO P11SCOPE_PREPARED_STABLE_RUSTC
+P11SCOPE_PREPARED_BPF_CARGO P11SCOPE_PREPARED_BPF_RUSTC'
 
 # Every external command the receipt chain reaches, in LC_ALL=C order. The
 # chain runs sealed: the unsealed parent resolves each name once through the
@@ -531,7 +544,7 @@ CARGO_HOME RUSTUP_HOME RUSTUP_TOOLCHAIN RUSTC_WRAPPER CC CFLAGS'
 # through the image, so neither is under the caller's PATH authority and
 # neither is a member. An incomplete inventory fails closed as "not found"
 # under the seal; it never falls back to the caller's PATH.
-TASK4_TOOL_INVENTORY='as awk bpf-linker bpftool cargo cat cc chmod cmp cp
+TASK4_TOOL_INVENTORY='as awk bpf-linker bpftool cargo cat cc chmod clang-18 cmp cp
 date dirname docker env file find flock gcc git grep head id jq ld ldd
 llvm-objcopy llvm-readelf ln ls mkdir mktemp mv python3 realpath rm rustup sed
 setpriv sh sha256sum sleep softhsm2-util sort stat sudo sync tail timeout touch
@@ -676,11 +689,11 @@ task4_tool_ledger() {
         printf 'tool_%s\t%s %s %s\n' \
             "$t4_tool" "$t4_pinned" "$t4_now" "$(task4_digest "$t4_pinned")" || return 1
     done
-    t4_found=$("$T4_TOOL_rustup" which --toolchain 1.88 cargo) || return 1
+    t4_found=$(RUSTUP_AUTO_INSTALL=0 "$T4_TOOL_rustup" which --toolchain 1.88 cargo) || return 1
     t4_now=$(realpath -e "$t4_found") || return 1
     printf 'toolchain_cargo\t%s %s %s\n' \
         "$T4_TOOLCHAIN_CARGO" "$t4_now" "$(task4_digest "$T4_TOOLCHAIN_CARGO")" || return 1
-    t4_found=$("$T4_TOOL_rustup" which --toolchain 1.88 rustc) || return 1
+    t4_found=$(RUSTUP_AUTO_INSTALL=0 "$T4_TOOL_rustup" which --toolchain 1.88 rustc) || return 1
     t4_now=$(realpath -e "$t4_found") || return 1
     printf 'toolchain_rustc\t%s %s %s\n' \
         "$T4_TOOLCHAIN_RUSTC" "$t4_now" "$(task4_digest "$T4_TOOLCHAIN_RUSTC")" || return 1
@@ -700,11 +713,11 @@ task4_tool_ledger() {
 # Both sysroot trees are digested whole; internal regular-file symlinks bind
 # their raw target and canonical content, while external or unsafe links refuse.
 task4_nightly_closure() {
-    t4_found=$("$T4_TOOL_rustup" which --toolchain nightly-2026-05-20 cargo) || return 1
+    t4_found=$(RUSTUP_AUTO_INSTALL=0 "$T4_TOOL_rustup" which --toolchain nightly-2026-05-20 cargo) || return 1
     task4_pin_tool "$t4_found" t4_nightly_cargo || return 1
     printf 'toolchain_nightly_cargo\t%s %s\n' \
         "$t4_nightly_cargo" "$(task4_digest "$t4_nightly_cargo")" || return 1
-    t4_found=$("$T4_TOOL_rustup" which --toolchain nightly-2026-05-20 rustc) || return 1
+    t4_found=$(RUSTUP_AUTO_INSTALL=0 "$T4_TOOL_rustup" which --toolchain nightly-2026-05-20 rustc) || return 1
     task4_pin_tool "$t4_found" t4_nightly_rustc || return 1
     printf 'toolchain_nightly_rustc\t%s %s\n' \
         "$t4_nightly_rustc" "$(task4_digest "$t4_nightly_rustc")" || return 1
@@ -760,13 +773,33 @@ task4_finalize() {
             eval "t4_value=\${$t4_var-}"
             [ -z "$t4_value" ] || t4_result=1
         done
-        t4_configs=$(task4_cargo_config_scan 2>/dev/null) || t4_result=1
-        [ -z "$t4_configs" ] || t4_result=1
-        [ "$(task4_tool_ledger 2>/dev/null)" = "$TASK4_TOOLS" ] || t4_result=1
+        t4_recheck_allowed=1
+        t4_configs=$(task4_cargo_config_scan 2>/dev/null) || { t4_result=1; t4_recheck_allowed=0; }
+        if [ -n "$t4_configs" ] || [ "$t4_recheck_allowed" -eq 0 ]; then
+            echo "prepared dependency recheck skipped: Cargo configuration changed or unreadable" >&2
+            t4_result=1; t4_recheck_allowed=0
+        fi
+        if (task4_tool_ledger) > "$TASK4_ROOT/artifacts/tools.final.tsv"; then
+            t4_final_tools=$(cat "$TASK4_ROOT/artifacts/tools.final.tsv") || { t4_result=1; t4_recheck_allowed=0; }
+            [ "$t4_final_tools" = "$TASK4_TOOLS" ] || { t4_result=1; t4_recheck_allowed=0; }
+        else
+            t4_result=1; t4_recheck_allowed=0
+        fi
         [ "$(task4_digest scripts/build-release.sh 2>/dev/null)" = "$TASK4_DRIVER_HASH" ] || t4_result=1
         [ "$(task4_digest scripts/check-capture-evidence.py 2>/dev/null)" = "$TASK4_CHECKER_HASH" ] || t4_result=1
-        task4_snapshot > "$TASK4_ROOT/artifacts/source.end.tsv" || t4_result=1
-        cmp -s "$TASK4_ROOT/artifacts/source.start.tsv" "$TASK4_ROOT/artifacts/source.end.tsv" || t4_result=1
+        if [ "$TASK4_PREPARED_ADMITTED" -eq 1 ] && [ "$t4_recheck_allowed" -eq 1 ]; then
+            if "$T4_TOOL_python3" -I scripts/prepared-dependency-evidence.py recheck \
+                --prefix "$TASK4_PREPARED_PREFIX"; then
+                t4_ledger_hash=$(task4_digest "$TASK4_PREPARED_PREFIX.final.ledger.sha256") \
+                    && task4_fact prepared_final_ledger "release.prepared.final.ledger.sha256 $t4_ledger_hash" || t4_result=1
+                task4_snapshot final > "$TASK4_ROOT/artifacts/source.end.tsv" || t4_result=1
+                cmp -s "$TASK4_ROOT/artifacts/source.start.tsv" "$TASK4_ROOT/artifacts/source.end.tsv" || t4_result=1
+            else
+                t4_result=1
+            fi
+        else
+            t4_result=1
+        fi
         [ -s "$TASK4_ROOT/artifacts/capture.json" ] || t4_result=1
         [ -s "$TASK4_ROOT/artifacts/checker.log" ] || t4_result=1
         [ -n "$TASK4_CHILD_FACTS_ID" ] && [ "$(stat -Lc %d:%i /proc/$$/fd/8 2>/dev/null)" = "$TASK4_CHILD_FACTS_ID" ] || t4_result=1
@@ -816,6 +849,8 @@ task4_receipt_run() {
     TASK4_WORK_ID=$(stat -Lc %d:%i "$TASK4_ROOT/work")
     TASK4_HEAD= TASK4_TREE= TASK4_DRIVER_HASH= TASK4_CHECKER_HASH=
     TASK4_CHILD_FACTS_ID= TASK4_CHILD_FACTS_HASH= TASK4_TOOLS=
+    TASK4_PREPARED_ADMITTED=0
+    TASK4_PREPARED_PREFIX=$TASK4_ROOT/artifacts/release.prepared
     T4_TOOLCHAIN_CARGO= T4_TOOLCHAIN_RUSTC=
     for t4_tool in cargo docker file jq python3 rustup setpriv sudo sha256sum mktemp find sort xargs sh cat grep; do
         eval "T4_TOOL_$t4_tool=\$t4_tool"
@@ -835,8 +870,6 @@ task4_receipt_run() {
         task4_pin_tool "$t4_found" "T4_TOOL_$t4_tool" || exit 77
     done
     TASK4_DRIVER_HASH=$(task4_digest scripts/build-release.sh); TASK4_CHECKER_HASH=$(task4_digest scripts/check-capture-evidence.py)
-    task4_snapshot > "$TASK4_ROOT/artifacts/source.start.tsv" || exit 77
-    TASK4_SOURCE_HASH=$(task4_digest "$TASK4_ROOT/artifacts/source.start.tsv")
     task4_fact started_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     task4_fact argv "$P11SCOPE_TASK4_CALLER_ARGV0 $1"; task4_fact cwd "$(pwd -P)"
     task4_fact sealed_bin "$P11SCOPE_TASK4_SEALED_BIN"
@@ -851,7 +884,6 @@ task4_receipt_run() {
     task4_fact root_identity "$TASK4_ROOT_ID"; task4_fact artifacts_identity "$TASK4_ARTIFACTS_ID"; task4_fact work_identity "$TASK4_WORK_ID"
     task4_fact lock_identity "$TASK4_LOCK_ID"; task4_fact lock_holder "$$:$(process_starttime $$)"
     task4_fact driver_sha256 "$TASK4_DRIVER_HASH"; task4_fact checker_sha256 "$TASK4_CHECKER_HASH"
-    task4_fact source_input_ledger_sha256 "$TASK4_SOURCE_HASH"
     TASK4_CONFIGS=$(task4_cargo_config_scan) \
         || { echo "cannot evaluate the effective cargo home" >&2; exit 77; }
     [ -z "$TASK4_CONFIGS" ] || { echo "untracked cargo config: $TASK4_CONFIGS" >&2; exit 77; }
@@ -860,12 +892,24 @@ task4_receipt_run() {
         [ -z "$t4_value" ] || { echo "refusing inherited $t4_var" >&2; exit 77; }
         task4_fact "inherited_$t4_var" ""
     done
-    t4_found=$("$T4_TOOL_rustup" which --toolchain 1.88 cargo) || exit 77
+    t4_found=$(RUSTUP_AUTO_INSTALL=0 "$T4_TOOL_rustup" which --toolchain 1.88 cargo) || exit 77
     task4_pin_tool "$t4_found" T4_TOOLCHAIN_CARGO || exit 77
-    t4_found=$("$T4_TOOL_rustup" which --toolchain 1.88 rustc) || exit 77
+    t4_found=$(RUSTUP_AUTO_INSTALL=0 "$T4_TOOL_rustup" which --toolchain 1.88 rustc) || exit 77
     task4_pin_tool "$t4_found" T4_TOOLCHAIN_RUSTC || exit 77
-    TASK4_TOOLS=$(task4_tool_ledger) || exit 77
+    # Keep the nightly selections made by the complete ledger in this shell.
+    task4_tool_ledger > "$TASK4_ROOT/artifacts/tools.initial.tsv" || exit 77
+    TASK4_TOOLS=$(cat "$TASK4_ROOT/artifacts/tools.initial.tsv") || exit 77
     printf '%s\n' "$TASK4_TOOLS" >> "$TASK4_FACTS"
+    "$T4_TOOL_python3" -I scripts/prepared-dependency-evidence.py capture \
+        --prefix "$TASK4_PREPARED_PREFIX" \
+        --stable-cargo "$T4_TOOLCHAIN_CARGO" --stable-rustc "$T4_TOOLCHAIN_RUSTC" \
+        --bpf-cargo "$t4_nightly_cargo" --bpf-rustc "$t4_nightly_rustc" || exit 77
+    TASK4_PREPARED_ADMITTED=1
+    t4_ledger_hash=$(task4_digest "$TASK4_PREPARED_PREFIX.initial.ledger.sha256") || exit 77
+    task4_fact prepared_initial_ledger "release.prepared.initial.ledger.sha256 $t4_ledger_hash"
+    task4_snapshot initial > "$TASK4_ROOT/artifacts/source.start.tsv" || exit 77
+    TASK4_SOURCE_HASH=$(task4_digest "$TASK4_ROOT/artifacts/source.start.tsv") || exit 77
+    task4_fact source_input_ledger_sha256 "$TASK4_SOURCE_HASH"
     "$T4_TOOL_sudo" -n true >/dev/null 2>&1 || exit 77
     [ -f "$MODULE" ] || exit 77
     WORK=$TASK4_ROOT/work
@@ -908,9 +952,19 @@ rm -rf "$DIST"
 mkdir -p "$DIST"
 
 echo "=== release privacy gate ==="
+P11SCOPE_PRODUCT_BUILD_MODE=prepared \
+P11SCOPE_PREPARED_STABLE_CARGO="$T4_TOOLCHAIN_CARGO" \
+P11SCOPE_PREPARED_STABLE_RUSTC="$T4_TOOLCHAIN_RUSTC" \
+P11SCOPE_PREPARED_BPF_CARGO="$t4_nightly_cargo" \
+P11SCOPE_PREPARED_BPF_RUSTC="$t4_nightly_rustc" \
 P11SCOPE_TASK4_WORK="$CANARY_WORK" sh scripts/verify-canaries.sh
 
 echo "=== p11scope: dynamic-build attach correctness ==="
+P11SCOPE_PRODUCT_BUILD_MODE=prepared \
+P11SCOPE_PREPARED_STABLE_CARGO="$T4_TOOLCHAIN_CARGO" \
+P11SCOPE_PREPARED_STABLE_RUSTC="$T4_TOOLCHAIN_RUSTC" \
+P11SCOPE_PREPARED_BPF_CARGO="$t4_nightly_cargo" \
+P11SCOPE_PREPARED_BPF_RUSTC="$t4_nightly_rustc" \
 P11SCOPE_TASK4_WORK="$ATTACH_WORK" sh scripts/verify-attach-e2e.sh
 
 echo "=== p11scope: isolated safe-only official static build ==="
@@ -922,6 +976,8 @@ rm -rf "$OFFICIAL_TARGET"
 CARGO_TARGET_DIR="$OFFICIAL_TARGET" \
 RUSTFLAGS="-C target-feature=+crt-static" \
 RUSTC="$T4_TOOLCHAIN_RUSTC" \
+P11SCOPE_PREPARED_BPF_CARGO="$t4_nightly_cargo" \
+P11SCOPE_PREPARED_BPF_RUSTC="$t4_nightly_rustc" \
     "$T4_TOOLCHAIN_CARGO" build --locked --offline --release --no-default-features \
         --target x86_64-unknown-linux-musl --bin p11scope
 P11SCOPE_STATIC=$OFFICIAL_TARGET/x86_64-unknown-linux-musl/release/p11scope
@@ -1075,7 +1131,9 @@ signal_verified_process CONT "$WPID" "$TARGET_STARTTIME"
 kill -CONT "$LPID" 2>/dev/null || true
 if wait "$LPID"; then LPID=; WPID=; TARGET_STARTTIME=; else status=$?; LPID=; WPID=; TARGET_STARTTIME=; echo "static smoke workload failed: $status"; exit "$status"; fi
 if wait "$SPID"; then SPID=; else status=$?; SPID=; echo "static smoke profiler failed: $status"; cat "$WORK/profile-static-smoke.log" || true; exit "$status"; fi
-reclaim_root_output "$WORK/observed-static-smoke.json"
+# hardened-target.pid is opened by the sudo launcher above and stays
+# root-owned; the receipt's terminal mode walk requires caller ownership.
+reclaim_root_output "$WORK/observed-static-smoke.json" "$WORK/hardened-target.pid"
 
 # Framed checker record (csf_19fb2f): exact argv, the checker's own captured
 # stdout/stderr, and a terminal status line. The frame keeps the record

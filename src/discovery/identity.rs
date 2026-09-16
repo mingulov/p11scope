@@ -10,14 +10,17 @@ use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use p11scope_manifest::elf::ElfAbi;
 use p11scope_manifest::identity::{
-    IdentityKind, MappingFileKey, ObjectIdentity, inspect_file, inspect_file_with_reader,
+    IdentityKind, InspectedObject, MappingFileKey, inspect_file, inspect_file_with_reader,
     mapping_file_key, mapping_file_key_in_mountinfo, open_object, open_regular,
 };
 use p11scope_manifest::manifest::{Manifest, Resolution};
 use p11scope_manifest::maps::{Device, ObjectKey};
 
-use crate::discovery::scan::{CaptureWorkBudget, IO_CEILING_REASON, ScannedModule, Skipped};
+use crate::discovery::scan::{
+    CaptureWorkBudget, IO_CEILING_REASON, ScannedModule, Skipped, read_mountinfo,
+};
 use crate::manifest_input::{MAX_TOTAL_OBJECT_BYTES, validate_structure};
 use crate::process::{MountNamespaceId, ProcessView, ProcessViewId};
 
@@ -105,6 +108,7 @@ struct Entry {
     path: String,
     sha256: String,
     build_id: Option<String>,
+    abi: ElfAbi,
     /// Whether this object was opened through overlayfs. This narrows the collapse
     /// heuristic but does not prove that another overlay instance resolves to the
     /// same underlying kernel inode.
@@ -145,7 +149,7 @@ impl Entry {
         file: std::fs::File,
         pin: Pin,
         path: String,
-        identity: &ObjectIdentity,
+        inspected: &InspectedObject,
         raw: RawObjectInstance,
         mapping: MappingFileKey,
     ) -> Result<Self, String> {
@@ -157,11 +161,12 @@ impl Entry {
             pin,
             path,
             // `inspect_file` always records a whole-file digest.
-            sha256: identity.sha256.clone().unwrap_or_default(),
-            build_id: match identity.kind {
-                IdentityKind::GnuBuildId => identity.value.clone(),
+            sha256: inspected.identity.sha256.clone().unwrap_or_default(),
+            build_id: match inspected.identity.kind {
+                IdentityKind::GnuBuildId => inspected.identity.value.clone(),
                 _ => None,
             },
+            abi: inspected.abi,
         })
     }
 }
@@ -373,6 +378,10 @@ impl PinnedObjects {
     /// recomputing the pin's identity digest.
     pub(crate) fn file_for(&self, id: PinnedObjectId) -> Option<&std::fs::File> {
         self.by_id.get(&id).map(|entry| entry.file.as_ref())
+    }
+
+    pub(crate) fn abi_for(&self, id: PinnedObjectId) -> Option<ElfAbi> {
+        self.by_id.get(&id).map(|entry| entry.abi)
     }
 
     /// Replaces the raw ownership for one retained process generation while
@@ -836,20 +845,29 @@ fn identity_of_in_mountinfo(
 pub fn open_view_object(
     view: &ProcessView,
     path: &Path,
+    budget: &mut CaptureWorkBudget,
 ) -> Result<(std::fs::File, ObjectKey), String> {
-    let (file, mountinfo) = view.open_then_mountinfo(|| open_regular(path))?;
+    let (file, mountinfo) = view.open_then_mountinfo(|| open_regular(path), budget)?;
     let key = object_key(identity_of_in_mountinfo(&file, &mountinfo)?);
     Ok((file, key))
 }
 
-pub fn view_object_key(view: &ProcessView, path: &Path) -> Result<ObjectKey, String> {
-    Ok(open_view_object(view, path)?.1)
+pub fn view_object_key(
+    view: &ProcessView,
+    path: &Path,
+    budget: &mut CaptureWorkBudget,
+) -> Result<ObjectKey, String> {
+    Ok(open_view_object(view, path, budget)?.1)
 }
 
 /// The same identity for a descriptor already retained across a pre-exec
 /// barrier, which must not be reopened by path.
-pub fn retained_object_key(view: &ProcessView, file: &std::fs::File) -> Result<ObjectKey, String> {
-    let ((), mountinfo) = view.open_then_mountinfo(|| Ok(()))?;
+pub fn retained_object_key(
+    view: &ProcessView,
+    file: &std::fs::File,
+    budget: &mut CaptureWorkBudget,
+) -> Result<ObjectKey, String> {
+    let ((), mountinfo) = view.open_then_mountinfo(|| Ok(()), budget)?;
     Ok(object_key(identity_of_in_mountinfo(file, &mountinfo)?))
 }
 
@@ -1045,7 +1063,8 @@ fn identity_of_manifest(
 /// mismatch; the caller may ignore either stale class only after a scan-opened
 /// replacement is proven.
 pub fn pin_manifest_objects_deferred(m: &Manifest) -> Result<ManifestPinning, ManifestPinError> {
-    pin_manifest_objects_deferred_in_views(m, &[])
+    let mut budget = CaptureWorkBudget::default();
+    pin_manifest_objects_deferred_in_views_with_budget(m, &[], &mut budget)
 }
 
 /// Pins manifest objects, binding canonical `/proc/<pid>/root/...` locators to the
@@ -1054,6 +1073,15 @@ pub fn pin_manifest_objects_deferred(m: &Manifest) -> Result<ManifestPinning, Ma
 pub fn pin_manifest_objects_deferred_in_views(
     m: &Manifest,
     views: &[ProcessView],
+) -> Result<ManifestPinning, ManifestPinError> {
+    let mut budget = CaptureWorkBudget::default();
+    pin_manifest_objects_deferred_in_views_with_budget(m, views, &mut budget)
+}
+
+pub fn pin_manifest_objects_deferred_in_views_with_budget(
+    m: &Manifest,
+    views: &[ProcessView],
+    budget: &mut CaptureWorkBudget,
 ) -> Result<ManifestPinning, ManifestPinError> {
     let structural = validate_structure(m);
     if !structural.is_empty() {
@@ -1085,7 +1113,9 @@ pub fn pin_manifest_objects_deferred_in_views(
         };
         let (opened, mountinfo) = match retained {
             Some(view) => {
-                match view.open_then_mountinfo(|| Ok::<_, String>(open_manifest_locator(path))) {
+                match view
+                    .open_then_mountinfo(|| Ok::<_, String>(open_manifest_locator(path)), budget)
+                {
                     Ok((opened, mountinfo)) => (opened, Some(mountinfo)),
                     Err(error) => {
                         problems.push(format!("{}: {error}", object.path));
@@ -1112,6 +1142,22 @@ pub fn pin_manifest_objects_deferred_in_views(
             ManifestLocatorOpen::Fatal(error) => {
                 problems.push(error);
                 continue;
+            }
+        };
+        let mountinfo = match mountinfo {
+            Some(mountinfo) => Some(mountinfo),
+            None => {
+                let table = match std::fs::File::open("/proc/self/mountinfo")
+                    .map_err(|error| format!("cannot open observer mount table: {error}"))
+                    .and_then(|table| read_mountinfo(table, budget))
+                {
+                    Ok(table) => table,
+                    Err(error) => {
+                        problems.push(format!("{}: {error}", object.path));
+                        continue;
+                    }
+                };
+                Some(table)
             }
         };
         let pin = match pin_of(&file) {
@@ -1205,14 +1251,7 @@ pub fn pin_manifest_objects_deferred_in_views(
             problems.push(format!("{}: object path cannot be normalized", object.path));
             continue;
         };
-        let entry = match Entry::new(
-            file,
-            pin,
-            object.path.clone(),
-            &inspected.identity,
-            raw,
-            mapping,
-        ) {
+        let entry = match Entry::new(file, pin, object.path.clone(), &inspected, raw, mapping) {
             Ok(entry) => entry,
             Err(error) => {
                 problems.push(format!("{}: {error}", object.path));
@@ -1443,6 +1482,18 @@ pub fn bind_scanned_modules(
             });
             continue;
         };
+        if module.decoder_abi.is_some_and(|decoded| {
+            pinned
+                .abi_for(object)
+                .is_none_or(|inspected| inspected != decoded)
+        }) {
+            lost.push(Skipped {
+                subject: module.path.clone(),
+                reason: "module decoder ABI disagrees with its retained pinned identity; its tables were not attached"
+                    .into(),
+            });
+            continue;
+        }
         let mut scanned = module.clone();
         let mut entry_objects = Vec::with_capacity(scanned.tables.len());
         for table in &mut scanned.tables {
@@ -1450,17 +1501,29 @@ pub fn bind_scanned_modules(
             let mut kept = Vec::with_capacity(table.entries.len());
             for entry in std::mem::take(&mut table.entries) {
                 match pinned.id_for_scanned(module, entry.object, &entry.object_path) {
-                    Some(id) => {
+                    Some(id)
+                        if matches!(
+                            (pinned.abi_for(id), pinned.abi_for(object)),
+                            (Some(target), Some(provider)) if target == provider
+                        ) =>
+                    {
                         ids.push(id);
                         kept.push(entry);
                     }
-                    None => {
+                    candidate => {
                         let skip = Skipped {
                             subject: entry.name.to_string(),
-                            reason: format!(
-                                "{} could not be reconciled to a comparable pinned object; entry was not attached",
-                                entry.object_path
-                            ),
+                            reason: if candidate.is_some() {
+                                format!(
+                                    "{} has a different target ABI from its provider; entry was not attached",
+                                    entry.object_path
+                                )
+                            } else {
+                                format!(
+                                    "{} could not be reconciled to a comparable pinned object; entry was not attached",
+                                    entry.object_path
+                                )
+                            },
                         };
                         table.unpinned.push(skip.clone());
                         lost.push(skip);
@@ -1510,9 +1573,10 @@ fn pin_scanned_object(
     budget: &mut CaptureWorkBudget,
 ) -> Result<Entry, String> {
     // The target's own filesystem view: a container's object is never copied out.
-    let (file, mountinfo) = view.open_then_mountinfo(|| {
-        open_object(Path::new(&format!("/proc/{}/root{}", view.pid(), raw.path)))
-    })?;
+    let (file, mountinfo) = view.open_then_mountinfo(
+        || open_object(Path::new(&format!("/proc/{}/root{}", view.pid(), raw.path))),
+        budget,
+    )?;
     let found = identity_of_in_mountinfo(&file, &mountinfo)?;
     if object_key(found) != raw.key {
         return Err(format!(
@@ -1533,8 +1597,13 @@ fn pin_scanned_object(
             before.size, limits.per_object_bytes,
         ));
     }
+    #[cfg(test)]
+    tests::run_before_hash_test_hook();
     let mut operation_bytes = 0u64;
     let inspected = inspect_file_with_reader(&file, |file, bytes, offset| {
+        if let Some(reason) = budget.check_deadline_now() {
+            return Err(std::io::Error::other(reason));
+        }
         let allowed = budget.allowed_io(operation_bytes, bytes.len());
         if allowed == 0 {
             return Err(std::io::Error::other(IO_CEILING_REASON));
@@ -1549,14 +1618,7 @@ fn pin_scanned_object(
     if pin_of(&file)? != before {
         return Err("file changed while it was being identified — retry".into());
     }
-    Entry::new(
-        file,
-        before,
-        raw.path.clone(),
-        &inspected.identity,
-        raw,
-        found,
-    )
+    Entry::new(file, before, raw.path.clone(), &inspected, raw, found)
 }
 
 #[cfg(test)]
@@ -1586,6 +1648,7 @@ pub(crate) mod test_fixture {
             },
             key,
             path: PATH.into(),
+            decoder_abi: Some(ElfAbi::Lp64),
             exports: vec!["C_GetFunctionList".into()],
             tables: vec![ScannedTable {
                 version: (2, 40),
@@ -1649,6 +1712,7 @@ pub(crate) mod test_fixture {
             path: module.path.clone(),
             sha256: sha256.into(),
             build_id: None,
+            abi: ElfAbi::Lp64,
             overlay,
         };
         let mut pins = PinnedObjects::empty();
@@ -1667,6 +1731,196 @@ mod tests {
         Acquisition, FunctionRecord, ObjectRecord, ProvenanceObject, SurfaceRecord, SurfaceSource,
         Version, WalkOutcome,
     };
+    use std::cell::RefCell;
+
+    thread_local! {
+        static BEFORE_HASH_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    struct BeforeHashHookGuard;
+
+    impl BeforeHashHookGuard {
+        fn install(hook: impl FnOnce() + 'static) -> Self {
+            BEFORE_HASH_HOOK.with(|slot| {
+                assert!(slot.borrow_mut().replace(Box::new(hook)).is_none());
+            });
+            Self
+        }
+    }
+
+    impl Drop for BeforeHashHookGuard {
+        fn drop(&mut self) {
+            BEFORE_HASH_HOOK.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+
+    pub(super) fn run_before_hash_test_hook() {
+        let hook = BEFORE_HASH_HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    fn set_pin_abi(pins: &mut PinnedObjects, key: ObjectKey, abi: ElfAbi) {
+        let entry = pins
+            .by_id
+            .values_mut()
+            .find(|entry| entry.raw.key == key)
+            .expect("fixture pin");
+        entry.abi = abi;
+    }
+
+    #[test]
+    fn open_view_object_refuses_an_identity_matching_mountinfo_prefix() {
+        let temporary = tempfile::NamedTempFile::new().unwrap();
+        let full = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+        let (path, prefix) = [temporary.path(), Path::new("/proc/self/status")]
+            .into_iter()
+            .find_map(|path| {
+                let file = open_regular(path).ok()?;
+                let mut prefix = String::new();
+                for line in full.lines() {
+                    prefix.push_str(line);
+                    prefix.push('\n');
+                    if identity_of_in_mountinfo(&file, &prefix).is_ok() {
+                        return (prefix.len() < full.len()).then_some((path, prefix));
+                    }
+                }
+                None
+            })
+            .expect("a controlled regular file must have a matching non-final mount row");
+        let file = open_regular(path).unwrap();
+        assert!(
+            identity_of_in_mountinfo(&file, &prefix).is_ok(),
+            "the prefix contains this opened fd's matching mount ID"
+        );
+        assert!(
+            !full[prefix.len()..].is_empty(),
+            "a table suffix must exist"
+        );
+
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let mut budget = CaptureWorkBudget::new(crate::discovery::scan::ScanLimits {
+            per_object_bytes: u64::try_from(prefix.len()).unwrap(),
+            total_bytes: u64::try_from(prefix.len() + 1).unwrap(),
+        });
+        let error = open_view_object(&view, path, &mut budget)
+            .expect_err("the real identity caller must return no key from an incomplete table");
+        assert!(error.contains("mountinfo byte ceiling"), "{error}");
+
+        let (opened, key) = open_view_object(&view, path, &mut CaptureWorkBudget::default())
+            .expect("the same caller accepts the EOF-proven complete table");
+        assert_eq!(key, object_key(identity_of(&opened).unwrap()));
+    }
+
+    #[test]
+    fn a_scan_object_changed_after_pinning_is_not_accepted() {
+        use crate::discovery::scan::ScannedModule;
+        use std::io::Write as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("changed-after-pin.so");
+        std::fs::copy("/bin/sh", &path).unwrap();
+        let file = open_object(&path).unwrap();
+        let mapping = mapping_file_key(&file).unwrap();
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let module = ScannedModule {
+            view: view.id(),
+            mount_namespace: view.mount_namespace(),
+            key: ObjectKey {
+                device: Device {
+                    major: mapping.device_major,
+                    minor: mapping.device_minor,
+                },
+                inode: mapping.inode,
+            },
+            path: path.display().to_string(),
+            decoder_abi: None,
+            exports: Vec::new(),
+            tables: Vec::new(),
+            interfaces: Vec::new(),
+        };
+        let changed_path = path.clone();
+        let _hook = BeforeHashHookGuard::install(move || {
+            let mut changed = std::fs::OpenOptions::new()
+                .append(true)
+                .open(changed_path)
+                .unwrap();
+            changed.write_all(&[0]).unwrap();
+        });
+
+        let (pinned, skipped) = pin_scanned_view_objects(
+            &view,
+            std::slice::from_ref(&module),
+            &mut CaptureWorkBudget::default(),
+        )
+        .unwrap();
+
+        assert_eq!(pinned.pinned().count(), 0, "a changed hash has no pin");
+        assert_eq!(skipped.len(), 1, "the changed object is reported once");
+        assert_eq!(
+            skipped[0].reason,
+            "file changed while it was being identified — retry"
+        );
+    }
+
+    #[test]
+    fn decoder_abi_mismatch_refuses_the_module_before_ownership() {
+        let key = overlay(210);
+        let mut scanned = module(key);
+        scanned.decoder_abi = Some(ElfAbi::Ilp32);
+        let mut pinned = view_pin(&scanned, 1, SHA, 1, false);
+
+        let (bound, skipped) = bind_scanned_modules(&[scanned.clone()], &mut pinned);
+
+        assert!(bound.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].subject, scanned.path);
+        assert!(skipped[0].reason.contains("decoder ABI disagrees"));
+        assert!(pinned.ownership.is_empty(), "a refused decode owns nothing");
+    }
+
+    #[test]
+    fn matching_ilp32_decoder_abi_binds_but_a_lp64_dependency_does_not() {
+        let provider = overlay(211);
+        let dependency = ObjectKey {
+            inode: provider.inode + 1,
+            ..provider
+        };
+        let mut scanned = module(provider);
+        scanned.decoder_abi = Some(ElfAbi::Ilp32);
+        scanned.tables[0].entries[0].object = dependency;
+
+        let mut pinned = view_pin(&scanned, 1, SHA, 1, false);
+        set_pin_abi(&mut pinned, provider, ElfAbi::Ilp32);
+        let mut dependency_module = scanned.clone();
+        dependency_module.key = dependency;
+        let dependency_pins = view_pin(&dependency_module, 2, SHA, 1, false);
+        assert!(pinned.absorb(dependency_pins).is_empty());
+
+        set_pin_abi(&mut pinned, dependency, ElfAbi::Ilp32);
+        let mut matching = pinned.clone();
+        let (bound, skipped) = bind_scanned_modules(&[scanned.clone()], &mut matching);
+        assert!(skipped.is_empty());
+        assert_eq!(bound.len(), 1);
+        assert_eq!(bound[0].scanned.tables[0].entries.len(), 1);
+        assert_eq!(bound[0].entry_objects[0].len(), 1);
+        let ownership = matching.ownership.values().next().unwrap();
+        assert_eq!(ownership.tables.len(), 1);
+        assert_eq!(ownership.targets.len(), 1);
+
+        set_pin_abi(&mut pinned, dependency, ElfAbi::Lp64);
+        let (bound, skipped) = bind_scanned_modules(&[scanned], &mut pinned);
+
+        assert_eq!(bound.len(), 1, "matching ILP32 provider is retained");
+        assert!(bound[0].scanned.tables[0].entries.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert!(skipped[0].reason.contains("different target ABI"));
+        assert_eq!(pinned.ownership.values().next().unwrap().tables.len(), 1);
+        assert!(pinned.ownership.values().next().unwrap().targets.is_empty());
+    }
 
     #[test]
     fn retained_view_object_open_rejects_a_fifo_without_data_open() {
@@ -1679,7 +1933,8 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
         let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
 
-        let error = open_view_object(&view, &fifo).expect_err("a FIFO is not a loader object");
+        let error = open_view_object(&view, &fifo, &mut CaptureWorkBudget::default())
+            .expect_err("a FIFO is not a loader object");
         assert!(error.contains("not a regular file"), "{error}");
     }
 

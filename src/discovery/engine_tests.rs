@@ -5,19 +5,21 @@ use crate::discovery::identity::test_fixture::{
     view_pin as overlay_view_pin,
 };
 use crate::discovery::identity::{
-    ManifestPinError, ManifestStaleReason, PinnedObjectId, ReconciledModule, pin_manifest_objects,
-    pin_manifest_objects_deferred, pin_scanned_objects, reconcile_scanned_modules,
+    ManifestPinError, ManifestStaleReason, PinnedObjectId, ReconciledModule, open_view_object,
+    pin_manifest_objects, pin_manifest_objects_deferred, pin_scanned_objects,
+    reconcile_scanned_modules,
 };
 use crate::discovery::loader::LoaderContextSpec;
 use crate::discovery::scan::{
-    SCAN_DEADLINE_REASON, ScanLimits, ScannedEntry, ScannedTable, WORK_CEILING_REASON, scan_pid,
+    IO_CEILING_REASON, SCAN_DEADLINE_REASON, ScanLimits, ScannedEntry, ScannedTable,
+    WORK_CEILING_REASON,
 };
 use crate::{semantics, trace};
 use p11scope_manifest::manifest::{
     Acquisition, AliasEntry, AliasGroup, FunctionRecord, InterfaceClassification, SurfaceRecord,
     SurfaceSource, Version, WalkOutcome,
 };
-use p11scope_manifest::maps::{parse_maps, resolve};
+use p11scope_manifest::maps::parse_maps;
 use std::cell::Cell;
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -163,6 +165,7 @@ fn timing_key(index: usize) -> PinnedTimingKey {
     KEYS.get_or_init(|| {
         let view = ProcessView::open(ProcessViewId(99), std::process::id()).unwrap();
         let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+        let map_index = MapIndex::new(&maps).expect("the self maps snapshot is valid");
         let mut keys = Vec::new();
         for mapping in maps
             .iter()
@@ -171,7 +174,7 @@ fn timing_key(index: usize) -> PinnedTimingKey {
             let Resolved::File {
                 path: MappedPath::Usable(path),
                 ..
-            } = resolve(&maps, mapping.start)
+            } = map_index.resolve(mapping.start)
             else {
                 continue;
             };
@@ -231,10 +234,9 @@ fn unattributed_selection_rejection_marks_loss_and_invalidates_coverage() {
 
 #[test]
 fn pinned_unchanged_check_refreshes_the_sticky_flag() {
-    // WINS: the five pinned().check_unchanged() chains share one helper;
-    // the bool stays discarded here — evidence reads the sticky flag.
+    // The bool stays discarded here — evidence reads the sticky flag.
     let engine = Engine::empty();
-    engine.check_pinned_unchanged().unwrap();
+    engine.pinned().check_unchanged().map(|_| ()).unwrap();
     assert!(!engine.pinned().provider_changed());
 }
 
@@ -696,8 +698,10 @@ fn owned_session_prearms_while_exclusively_borrowing_the_unreleased_child() {
         .unwrap()
         .0;
     assert!(
-        owned_run.find(".start_owned_session(").unwrap() < owned_run.find(".release()").unwrap()
+        owned_run.find(".start_owned_session(").unwrap()
+            < owned_run.find(".release_until(").unwrap()
     );
+    assert!(!owned_entry.contains("child.release_until("));
     let finish = run
         .split_once("    fn finish(\n")
         .unwrap()
@@ -746,7 +750,7 @@ fn prepared_loader_registry() -> (LoaderRegistry, LoaderContextId) {
                 virtual_address: 0x2100,
                 file_offset: 0x2100,
             },
-            state: None,
+            state_address: None,
         })
         .unwrap();
     let context = registry.prepare(prepared).unwrap();
@@ -2885,6 +2889,221 @@ fn an_ordinary_dynamic_target_binds_its_live_loader_context() {
 }
 
 #[test]
+fn loader_budget_refusals_keep_named_causes_and_fail_closed_cleanup() {
+    let (fixture, view, _module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let per_object_bytes = ScanLimits::default().per_object_bytes;
+    let mut sizing_budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes,
+        total_bytes: u64::MAX,
+    });
+    let locator = Engine::loader_locator(&view, &mut sizing_budget)
+        .unwrap()
+        .unwrap();
+    let loader_subject = locator.authority.loader_path.display().to_string();
+    let locator_bytes = sizing_budget.attempted_io_bytes();
+    let loader_target_path = PathBuf::from(format!(
+        "/proc/{pid}/root{}",
+        locator.authority.loader_path.display()
+    ));
+    let mut mount_budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes,
+        total_bytes: u64::MAX,
+    });
+    open_view_object(&view, &loader_target_path, &mut mount_budget).unwrap();
+    let hash_start = locator_bytes
+        .checked_add(mount_budget.attempted_io_bytes())
+        .unwrap();
+    let loader_module = mapped_object(
+        &view,
+        &locator.authority.loader_maps[0],
+        &locator.authority.loader_path,
+    );
+    let (loader_pins, calibration_skips) = pin_scanned_view_objects(
+        &view,
+        std::slice::from_ref(&loader_module),
+        &mut sizing_budget,
+    )
+    .unwrap();
+    assert!(calibration_skips.is_empty(), "{calibration_skips:?}");
+    let loader_id = loader_pins
+        .id_for_scanned(&loader_module, loader_module.key, &loader_module.path)
+        .expect("calibration must pin the exact mapped loader");
+    let loader_snapshot = read_elf_snapshot(
+        loader_pins
+            .file_for(loader_id)
+            .expect("the calibration pin retains its loader file"),
+        &mut sizing_budget,
+    )
+    .unwrap();
+    let hook = loader_snapshot
+        .defined_symbol("_dl_debug_state")
+        .unwrap()
+        .filter(|hook| loader_snapshot.is_executable_offset(hook.file_offset))
+        .expect("the calibration loader must expose its executable hook");
+    assert!(unique_mapping_for_offset(&locator.authority.loader_maps, hook.file_offset).is_ok());
+    let candidate_bytes = sizing_budget.attempted_io_bytes();
+    let revalidated = Engine::loader_locator(&view, &mut sizing_budget)
+        .unwrap()
+        .unwrap();
+    assert_eq!(revalidated.authority, locator.authority);
+    assert!(revalidated.maps.contains(&locator.authority.loader_maps[0]));
+    let revalidation_bytes = sizing_budget.attempted_io_bytes();
+    assert!(
+        locator_bytes < candidate_bytes && candidate_bytes < revalidation_bytes,
+        "L={locator_bytes} C={candidate_bytes} R={revalidation_bytes}"
+    );
+    assert!(
+        locator_bytes < hash_start && hash_start < candidate_bytes,
+        "the calibration must place the hash between L={locator_bytes} and C={candidate_bytes}; H={hash_start}"
+    );
+
+    let arm = |total_bytes| {
+        let view = ProcessView::open(ProcessViewId(0), pid).unwrap();
+        let mut engine = Engine::empty();
+        engine.scope = Scope::Pid(pid);
+        engine.views.push(view);
+        engine.budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes,
+            total_bytes,
+        });
+        let mut session = ScriptedSession::default();
+        let mut pending = PendingViewRetirements::new();
+        let result = engine.arm_loader_or_partial(0, &mut session, &mut true, &mut pending);
+        (engine, pending, session, result)
+    };
+    let assert_named_io_cause = |engine: &Engine| {
+        assert!(
+            engine
+                .counters
+                .object_skips
+                .iter()
+                .any(|skip| skip.reason.contains(IO_CEILING_REASON)),
+            "{:?}",
+            engine.counters.object_skips
+        );
+        assert!(engine.counters.object_skips.iter().all(|skip| {
+            !skip.reason.contains("process generation changed")
+                && !skip.reason.contains("named process generation changed")
+        }));
+    };
+
+    let pin_cut = locator_bytes.checked_add(1).unwrap();
+    let (pin_engine, pin_pending, pin_session, pin_result) = arm(pin_cut);
+    assert!(!pin_result.unwrap());
+    assert_eq!(pin_session.dynamic_loader_attach_calls, 0);
+    assert_eq!(pin_engine.budget.attempted_io_bytes(), pin_cut);
+    assert_eq!(pin_pending.get(&ProcessViewId(0)), None);
+    assert!(
+        pin_engine
+            .loader_registry
+            .ids_for_view(ProcessViewId(0))
+            .is_empty()
+    );
+    let exact_pin_reason = format!("cannot read pid {pid}'s mount table: {IO_CEILING_REASON}");
+    assert!(
+        pin_engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| { skip.subject == loader_subject && skip.reason == exact_pin_reason })
+    );
+    assert_named_io_cause(&pin_engine);
+
+    let snapshot_cut = candidate_bytes.checked_sub(1).unwrap();
+    let (snapshot_engine, snapshot_pending, snapshot_session, snapshot_result) = arm(snapshot_cut);
+    assert!(!snapshot_result.unwrap());
+    assert_eq!(snapshot_session.dynamic_loader_attach_calls, 0);
+    assert_eq!(snapshot_engine.budget.attempted_io_bytes(), snapshot_cut);
+    assert_eq!(snapshot_pending.get(&ProcessViewId(0)), None);
+    assert!(
+        snapshot_engine
+            .loader_registry
+            .ids_for_view(ProcessViewId(0))
+            .is_empty()
+    );
+    assert_named_io_cause(&snapshot_engine);
+
+    let hash_cut = hash_start.checked_add(1).unwrap();
+    let (hash_engine, hash_pending, hash_session, hash_result) = arm(hash_cut);
+    assert!(!hash_result.unwrap());
+    assert_eq!(hash_session.dynamic_loader_attach_calls, 0);
+    assert_eq!(hash_engine.budget.attempted_io_bytes(), hash_cut);
+    assert_eq!(hash_pending.get(&ProcessViewId(0)), None);
+    assert!(
+        hash_engine
+            .loader_registry
+            .ids_for_view(ProcessViewId(0))
+            .is_empty()
+    );
+    assert_named_io_cause(&hash_engine);
+
+    let (pre_engine, pre_pending, pre_session, pre_result) = arm(candidate_bytes);
+    assert!(!pre_result.unwrap());
+    assert_eq!(pre_session.dynamic_loader_attach_calls, 0);
+    assert_eq!(pre_engine.budget.attempted_io_bytes(), candidate_bytes);
+    assert_named_io_cause(&pre_engine);
+    assert_eq!(
+        pre_pending.get(&ProcessViewId(0)),
+        Some(&RetirementCause::ExecRefresh)
+    );
+    assert!(
+        pre_engine
+            .loader_registry
+            .ids_for_view(ProcessViewId(0))
+            .is_empty()
+    );
+
+    // One byte beyond the calibrated precheck admits one byte of the repeated
+    // postcheck snapshot, then refuses it whole after the loader link was added.
+    let postcheck_cut = revalidation_bytes.checked_add(1).unwrap();
+    let (mut post_engine, mut post_pending, mut post_session, post_result) = arm(postcheck_cut);
+    assert!(!post_result.unwrap());
+    assert_eq!(post_session.dynamic_loader_attach_calls, 1);
+    assert_eq!(post_engine.budget.attempted_io_bytes(), postcheck_cut);
+    assert_named_io_cause(&post_engine);
+    assert_eq!(
+        post_pending.get(&ProcessViewId(0)),
+        Some(&RetirementCause::ExecRefresh)
+    );
+    let contexts = post_engine.loader_registry.ids_for_view(ProcessViewId(0));
+    assert_eq!(
+        contexts.len(),
+        1,
+        "L={locator_bytes} C={candidate_bytes} R={revalidation_bytes} attempted={} skips={:?}",
+        post_engine.budget.attempted_io_bytes(),
+        post_engine.counters.object_skips
+    );
+    let context = contexts[0];
+    assert!(
+        post_engine
+            .loader_registry
+            .context(context)
+            .unwrap()
+            .was_attached
+    );
+    let mut additions_allowed = true;
+    let mut collect = Engine::collect_discovery_records;
+    let mut closure = PauseClosure::new(true);
+    let mut no_terminal_selection_handoffs = TerminalSelectionHandoffs::new();
+    let (_, complete) = post_engine
+        .retire_loader_contexts(
+            ProcessViewId(0),
+            &mut no_terminal_selection_handoffs,
+            &mut post_session,
+            &mut additions_allowed,
+            &mut post_pending,
+            &mut collect,
+            &mut closure,
+        )
+        .unwrap();
+    assert!(complete);
+    assert_eq!(post_session.detached, [context]);
+    assert!(post_session.dynamic_loader_links.is_empty());
+    assert!(post_engine.loader_registry.context(context).is_none());
+}
+
+#[test]
 fn two_gib_dynamic_executable_arms_without_hashing_the_executable() {
     struct ChildGuard(std::process::Child);
     impl Drop for ChildGuard {
@@ -2900,6 +3119,7 @@ fn two_gib_dynamic_executable_arms_without_hashing_the_executable() {
     assert!(
         read_bounded_interpreter(&source_file, source_size)
             .unwrap()
+            .0
             .is_some(),
         "the copied source must be a dynamic executable with one PT_INTERP"
     );
@@ -3024,7 +3244,7 @@ fn engine_with_exec_refreshed_loader(
                 file_offset: mapping.file_offset + 0x10,
             },
             mapping: Some(mapping),
-            state: None,
+            state_address: None,
         })
         .expect("a preflighted loader context");
     let context = engine
@@ -3771,7 +3991,7 @@ fn loader_counts_deduplicate_replaced_context_by_stable_bound_tuple() {
             virtual_address: 0x2100,
             file_offset: 0x2100,
         },
-        state: None,
+        state_address: None,
     };
 
     let first = engine.loader_registry.preflight(spec.clone()).unwrap();
@@ -3835,7 +4055,7 @@ fn loader_counts_distinguish_unbound_and_unkeyed_contexts() {
             virtual_address: 0x2100,
             file_offset: 0x2100,
         },
-        state: None,
+        state_address: None,
     };
     let first = engine.loader_registry.preflight(spec.clone()).unwrap();
     let first = engine.loader_registry.prepare(first).unwrap();
@@ -4226,6 +4446,7 @@ fn provider_module(
     offset: u64,
 ) -> ScannedModule {
     let mut module = mapped_object(view, mapping, path);
+    module.decoder_abi = Some(ElfAbi::Lp64);
     module.exports = vec!["C_GetFunctionList".into()];
     module.tables = vec![ScannedTable {
         version: (2, 40),
@@ -4360,9 +4581,10 @@ int main(int argc, char **argv) {
         let maps =
             parse_maps(&std::fs::read(format!("/proc/{}/maps", fixture.child.id())).unwrap())
                 .unwrap();
+        let map_index = MapIndex::new(&maps).expect("the loaded child maps snapshot is valid");
         mapped = maps
             .iter()
-            .find_map(|mapping| match resolve(&maps, mapping.start) {
+            .find_map(|mapping| match map_index.resolve(mapping.start) {
                 Resolved::File {
                     path: MappedPath::Usable(path),
                     ..
@@ -4629,6 +4851,7 @@ fn evidence_verdict(
         start_insert_failures: 0,
         unmatched_returns: 0,
         rv_update_failures: 0,
+        abi_refusals: 0,
         cgroup_scope_failures: 0,
         semantic_capture_failures: 0,
         unregistered_mechanisms: 0,
@@ -4647,6 +4870,7 @@ fn evidence_verdict(
         async_evictions: 0,
         fork_state_ambiguities: 0,
         semantic_state_drops: 0,
+        semantic_history_drops: 0,
         pending_at_end: 0,
         malformed_records: 0,
         orphan_ops: 0,
@@ -5323,9 +5547,10 @@ fn two_view_selection_claims_retire_independently() {
     let mut mapped = None;
     for _ in 0..200 {
         let maps = parse_maps(&std::fs::read(format!("/proc/{peer_pid}/maps")).unwrap()).unwrap();
+        let map_index = MapIndex::new(&maps).expect("the peer maps snapshot is valid");
         mapped = maps.iter().find_map(|mapping| {
             matches!(
-                resolve(&maps, mapping.start),
+                map_index.resolve(mapping.start),
                 Resolved::File {
                     path: MappedPath::Usable(ref path),
                     ..
@@ -5909,6 +6134,28 @@ fn selection_ring_loss_invalidates_silent_coverage() {
         engine.selection_bindings[&binding.id].coverage,
         SelectionCoverageState::Uncovered,
         "loss discovered after closure invalidates the historical proof"
+    );
+}
+
+#[test]
+fn selection_abi_refusal_invalidates_silent_coverage() {
+    let (_fixture, mut engine, mut session, binding) = attached_selection_route();
+    let generation = NonZeroU64::new(10).unwrap();
+    engine.mark_owned_selection_pending(generation);
+    engine.open_owned_selection(binding.id);
+
+    session.counters.abi_refusals = 1;
+    engine.update_counter_snapshot(&session).unwrap();
+    assert_eq!(
+        engine.selection_bindings[&binding.id].coverage,
+        SelectionCoverageState::Uncovered
+    );
+
+    engine.mark_owned_selection_pending(generation);
+    assert_eq!(
+        engine.selection_bindings[&binding.id].coverage,
+        SelectionCoverageState::Uncovered,
+        "an unsupported target ABI cannot mint covered silence"
     );
 }
 
@@ -7028,12 +7275,13 @@ fn c_get_interface_selection_exact_match_keeps_inventory_aliases() {
     let pid = engine.views[0].pid();
     let provider = engine.pinned.summary(binding.object).unwrap().key;
     let maps = parse_maps(&std::fs::read(format!("/proc/{pid}/maps")).unwrap()).unwrap();
+    let map_index = MapIndex::new(&maps).expect("the target maps snapshot is valid");
     let address = maps
         .iter()
         .find(|mapping| ObjectKey::of(mapping) == provider)
         .unwrap()
         .start;
-    let table_file_offset = match resolve(&maps, address) {
+    let table_file_offset = match map_index.resolve(address) {
         Resolved::File { file_offset, .. } => file_offset,
         _ => unreachable!(),
     };
@@ -7684,16 +7932,21 @@ fn selection_inventory_keys_are_canonical_bounded_and_pruned() {
 
 #[test]
 fn selection_assessment_rejects_remap_view_loss_and_pin_change() {
+    // The bracket's verdict paired with the call order it took: the events
+    // are the point of this test, since a bracket that reaches the right
+    // answer without reading maps twice is not the bracket.
+    type AssessOutcome = (Result<(Option<MapEntry>, Resolved), ()>, Vec<&'static str>);
     fn assess(
+        table_ptr: u64,
         before: Vec<MapEntry>,
         after: Vec<MapEntry>,
         view_same: bool,
         pin_same: bool,
-    ) -> (Result<(), ()>, Vec<&'static str>) {
+    ) -> AssessOutcome {
         let mut snapshots = [before, after].into_iter();
         let events = std::cell::RefCell::new(Vec::new());
         let result = selection_mapping_bracket(
-            0x1000,
+            table_ptr,
             || {
                 events.borrow_mut().push("maps");
                 snapshots.next().ok_or(())
@@ -7706,23 +7959,58 @@ fn selection_assessment_rejects_remap_view_loss_and_pin_change() {
                 events.borrow_mut().push("pin");
                 pin_same
             },
-        )
-        .map(|_| ());
+        );
         (result, events.into_inner())
     }
 
     let stable = parse_maps(b"00001000-00002000 r--p 00000000 08:01 9 /opt/provider.so\n").unwrap();
     let remapped =
         parse_maps(b"00001000-00002000 r--p 00001000 08:01 9 /opt/provider.so\n").unwrap();
-    let (result, events) = assess(stable.clone(), remapped, true, true);
+    let (result, events) = assess(0x1000, stable.clone(), remapped, true, true);
     assert!(result.is_err());
     assert_eq!(events, ["maps", "maps", "view", "pin"]);
     assert!(
-        assess(stable.clone(), stable.clone(), false, true)
+        assess(0x1000, stable.clone(), stable.clone(), false, true)
             .0
             .is_err()
     );
-    assert!(assess(stable.clone(), stable, true, false).0.is_err());
+    assert!(
+        assess(0x1000, stable.clone(), stable.clone(), true, false)
+            .0
+            .is_err()
+    );
+
+    let (absent, events) = assess(0x3000, stable.clone(), stable.clone(), true, true);
+    assert_eq!(absent, Ok((None, Resolved::Unmapped)));
+    assert_eq!(events, ["maps", "maps", "view", "pin"]);
+
+    let invalid = vec![
+        MapEntry {
+            start: 0x1000,
+            end: 0x3000,
+            file_offset: 0,
+            permissions: *b"r--p",
+            device: Device { major: 8, minor: 1 },
+            inode: 9,
+            raw_path: Some(b"/opt/provider.so".to_vec()),
+        },
+        MapEntry {
+            start: 0x2000,
+            end: 0x4000,
+            file_offset: 0,
+            permissions: *b"rw-p",
+            device: Device { major: 0, minor: 0 },
+            inode: 0,
+            raw_path: None,
+        },
+    ];
+    let (invalid_a, events) = assess(0x1000, invalid.clone(), stable.clone(), true, true);
+    assert!(invalid_a.is_err());
+    assert_eq!(events, ["maps"]);
+
+    let (invalid_b, events) = assess(0x1000, stable, invalid, true, true);
+    assert!(invalid_b.is_err());
+    assert_eq!(events, ["maps", "maps"]);
 }
 
 #[test]
@@ -7744,6 +8032,177 @@ fn initial_export_generation_loss_queues_retirement_before_readiness() {
     assert!(!additions_allowed);
     assert!(pending.contains_key(&view));
     assert!(!closure.required_complete());
+}
+
+#[test]
+fn rt_add_deferral_state_table_keeps_zero_ambiguous_and_defers_add_delete() {
+    for (state, read_failures, expected_pending, expected_memory_scans) in
+        [(0, 0, 0, 1), (0, 1, 0, 1), (1, 0, 1, 0), (2, 0, 1, 0)]
+    {
+        let (_fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
+        record.announced_count = state;
+        session.counters.loader_state_read_failures = read_failures;
+
+        apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+
+        assert_eq!(
+            engine.pending_loader_scans.len(),
+            expected_pending,
+            "r_state={state}, read_failures={read_failures}"
+        );
+        assert_eq!(
+            engine.loader_memory_scan_attempts, expected_memory_scans,
+            "r_state={state}, read_failures={read_failures}"
+        );
+        if state == 0 {
+            let aggregate = engine.loader_discovery();
+            assert_eq!(aggregate.dlopen_timing.qualified_pre_constructor, 0);
+            assert_eq!(aggregate.dlopen_timing.known_pre_relocation, 0);
+            assert_eq!(aggregate.dlopen_timing.unproven, 1);
+            assert_eq!(aggregate.state_read_failures, read_failures);
+        }
+    }
+}
+
+/// Mutation caught: scanning before queuing `RT_ADD` races the loader, and
+/// returning before the rest of the handler fails to arm standard exports.
+#[test]
+fn rt_add_deferral_authenticated_add_accounts_and_arms_without_memory_scan() {
+    let (_fixture, mut engine, context, mut record, mut session) = armed_seed_route(1);
+    record.announced_count = 1;
+
+    let outcome = apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+
+    assert!(outcome.required_complete);
+    assert_eq!(engine.loader_records_accepted, 1);
+    assert_eq!(engine.loader_memory_scan_attempts, 0);
+    assert_eq!(session.dynamic_attach_calls.len(), 3);
+    assert_eq!(
+        engine
+            .pending_loader_scans
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        [PendingLoaderScanKey {
+            view: ProcessViewId(0),
+            context,
+        }]
+    );
+    assert!(engine.pending_loader_scans.len() <= crate::discovery::loader::MAX_LOADER_CONTEXTS);
+}
+
+/// Mutation caught: replaying the original ADD consumes producer authority
+/// twice; omitting the independent-tick fallback leaves work pending forever.
+#[test]
+fn rt_add_deferral_next_tick_falls_back_once_without_record_replay() {
+    let (_fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
+    record.announced_count = 1;
+    apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+    assert_eq!(engine.pending_loader_scans.len(), 1);
+    assert_eq!(engine.loader_memory_scan_attempts, 0);
+
+    apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+
+    assert!(engine.pending_loader_scans.is_empty());
+    assert_eq!(engine.loader_memory_scan_attempts, 1);
+    assert_eq!(engine.loader_records_accepted, 1);
+}
+
+/// Mutation caught: keying pending work by event occurrence instead of the
+/// exact view/context lets duplicate ADDs grow the bounded ledger.
+#[test]
+fn rt_add_deferral_duplicate_adds_coalesce_and_settle_once() {
+    let (_fixture, mut engine, _context, mut record, mut session) = armed_seed_route(2);
+    record.announced_count = 1;
+
+    apply_ordinary_batch(&mut engine, &mut session, vec![record, record]).unwrap();
+
+    assert_eq!(engine.pending_loader_scans.len(), 1);
+    assert_eq!(engine.loader_memory_scan_attempts, 0);
+    assert_eq!(engine.loader_records_accepted, 2);
+    apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+    assert!(engine.pending_loader_scans.is_empty());
+    assert_eq!(engine.loader_memory_scan_attempts, 1);
+    assert_eq!(engine.loader_records_accepted, 2);
+}
+
+/// Mutation caught: an expected process exit cannot silently discard a
+/// deferred memory acquisition that never ran.
+#[test]
+fn rt_add_deferral_expected_exit_settles_pending_as_loss() {
+    let (_fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
+    record.announced_count = 1;
+    apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+    let mut pending_views = PendingViewRetirements::new();
+
+    engine.queue_retirement(
+        ProcessViewId(0),
+        RetirementCause::ExpectedRemoval,
+        &mut pending_views,
+    );
+
+    assert!(engine.pending_loader_scans.is_empty());
+    assert!(engine.counters.object_skips.iter().any(|skip| {
+        skip.subject == "live loader memory discovery"
+            && skip.reason.contains("expected process exit")
+    }));
+}
+
+/// Mutation caught: replacing a loader context cannot transfer its pending
+/// scan authority to the replacement context.
+#[test]
+fn rt_add_deferral_context_retirement_settles_pending_as_loss() {
+    let (_fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
+    record.announced_count = 2;
+    apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+    let mut pending_views = PendingViewRetirements::new();
+
+    engine.queue_retirement(
+        ProcessViewId(0),
+        RetirementCause::ExecRefresh,
+        &mut pending_views,
+    );
+
+    assert!(engine.pending_loader_scans.is_empty());
+    assert!(engine.counters.object_skips.iter().any(|skip| {
+        skip.subject == "live loader memory discovery"
+            && skip.reason.contains("loader context retirement")
+    }));
+}
+
+/// Mutation caught: a sticky work-ceiling stop must resolve the pending
+/// ledger to loss instead of preserving an impossible fallback.
+#[test]
+fn rt_add_deferral_budget_exhaustion_settles_pending_as_loss() {
+    let (_fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
+    record.announced_count = 1;
+    apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+    assert!(!engine.budget.charge(u64::MAX));
+
+    apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+
+    assert!(engine.pending_loader_scans.is_empty());
+    assert_eq!(engine.loader_memory_scan_attempts, 0);
+    assert!(engine.counters.object_skips.iter().any(|skip| {
+        skip.subject == "live loader memory discovery" && skip.reason.contains("budget exhaustion")
+    }));
+}
+
+/// Mutation caught: cancellation/shutdown finalization must turn every
+/// still-pending scan into published loss evidence.
+#[test]
+fn rt_add_deferral_cancellation_or_shutdown_settles_pending_as_loss() {
+    let (_fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
+    record.announced_count = 1;
+    apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+
+    engine.settle_terminal_drain();
+
+    assert!(engine.pending_loader_scans.is_empty());
+    assert!(engine.plan.skipped.iter().any(|skip| {
+        skip.subject == "live loader memory discovery"
+            && skip.reason.contains("capture cancellation or shutdown")
+    }));
 }
 
 #[test]
@@ -7879,6 +8338,313 @@ fn loader_batch_route_seed_target_failure_deactivates_slot() {
 }
 
 #[test]
+fn failed_detach_blocks_fresh_attachment_in_a_later_loader_batch() {
+    let (_fixture, mut engine, context, record, mut session) = armed_seed_route(2);
+    let loader_identity = *session
+        .dynamic_loader_links
+        .first()
+        .expect("the loader route owns its initial dynamic link");
+    let export_target = (loader_identity.1, loader_identity.2);
+    let export_cookie = u64::MAX;
+    assert!(
+        !session
+            .attach_dynamic_export(
+                context,
+                engine.views[0].pid(),
+                export_target,
+                export_cookie,
+                HookAbi::FunctionList,
+                &engine.pinned,
+            )
+            .unwrap()
+            .0
+    );
+    let detach_calls_before = session.detached_slot_indices.len();
+    session.fail_target_slots([0]);
+    session.fail_slot_detaches([false, true]);
+
+    let first = apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+    assert!(!first.required_complete);
+    assert_eq!(
+        session.detach_failures(),
+        ["scripted one-shot slot detach failed"]
+    );
+    assert!(!engine.plan.is_active(0));
+    let first_target = session
+        .preflight_targets
+        .borrow()
+        .iter()
+        .flatten()
+        .copied()
+        .find(|(slot, _, _)| *slot == 0)
+        .expect("the first batch proposed slot 0");
+    let static_attempts = session
+        .attached_slots
+        .iter()
+        .filter(|count| **count > 0)
+        .count();
+    assert_eq!(
+        static_attempts, 1,
+        "the first batch attempted one nonempty static attachment"
+    );
+    let dynamic_attempts = session.dynamic_attach_calls.len();
+    let cleanup_attempts = session.detached_slot_indices.clone();
+    assert_eq!(
+        cleanup_attempts[detach_calls_before..],
+        [Vec::new(), vec![0]],
+        "the failed detach was the exact cleanup of failed slot 0"
+    );
+
+    let second = apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+
+    assert!(!second.required_complete);
+    let later_target = session
+        .preflight_targets
+        .borrow()
+        .iter()
+        .flatten()
+        .copied()
+        .find(|(slot, _, _)| *slot == 1)
+        .expect("the later batch proposed a fresh slot ID");
+    assert_eq!(
+        (later_target.1, later_target.2),
+        (first_target.1, first_target.2),
+        "the later batch rediscovered the same object and offset"
+    );
+    assert_eq!(
+        session
+            .attached_slots
+            .iter()
+            .filter(|count| **count > 0)
+            .count(),
+        static_attempts,
+        "the persistent failed-detach evidence blocks a later static attach"
+    );
+    assert_eq!(session.dynamic_attach_calls.len(), dynamic_attempts);
+    assert_eq!(session.detached_slot_indices, cleanup_attempts);
+    assert_eq!(
+        session.detach_failures(),
+        ["scripted one-shot slot detach failed"]
+    );
+
+    session.preflight_targets(&[], &engine.pinned).unwrap();
+    session.attach_targets(&[], &engine.pinned).unwrap();
+    assert_eq!(session.attached_slots.last(), Some(&0));
+    assert_eq!(
+        session
+            .attach_dynamic_export(
+                context,
+                engine.views[0].pid(),
+                export_target,
+                export_cookie,
+                HookAbi::FunctionList,
+                &engine.pinned,
+            )
+            .unwrap(),
+        (false, None),
+        "an existing dynamic export remains a no-op after admission closes"
+    );
+    assert!(
+        !session
+            .attach_dynamic_loader(
+                loader_identity.0,
+                engine.views[0].pid(),
+                loader_identity.1,
+                loader_identity.2,
+                loader_identity.3,
+                &engine.pinned,
+            )
+            .unwrap(),
+        "an existing loader link remains a no-op after admission closes"
+    );
+    session.detach_slots(&[]).unwrap();
+    assert_eq!(session.detached_slot_indices.last(), Some(&Vec::new()));
+}
+
+#[test]
+fn scripted_dynamic_retirement_removes_only_the_selected_context_ownership() {
+    let (_fixture, engine, context, _record, mut session) = armed_seed_route(2);
+    let loader_identity = session.dynamic_loader_links[0];
+    let export_target = (loader_identity.1, loader_identity.2);
+    let export_cookie = u64::MAX;
+    let other_context = LoaderContextId::from_case_id(7);
+
+    for owner in [context, other_context] {
+        session
+            .attach_dynamic_export(
+                owner,
+                engine.views[0].pid(),
+                export_target,
+                export_cookie,
+                HookAbi::FunctionList,
+                &engine.pinned,
+            )
+            .unwrap();
+        session
+            .attach_dynamic_loader(
+                owner,
+                engine.views[0].pid(),
+                loader_identity.1,
+                loader_identity.2,
+                loader_identity.3,
+                &engine.pinned,
+            )
+            .unwrap();
+    }
+    let export_attempts = session.dynamic_attach_calls.len();
+    let loader_attempts = session.dynamic_loader_attach_calls;
+
+    assert!(!session.detach_dynamic_context(context).1);
+    assert_eq!(
+        session
+            .attach_dynamic_export(
+                other_context,
+                engine.views[0].pid(),
+                export_target,
+                export_cookie,
+                HookAbi::FunctionList,
+                &engine.pinned,
+            )
+            .unwrap(),
+        (false, None),
+        "another context retains its valid export-link no-op"
+    );
+    assert!(
+        !session
+            .attach_dynamic_loader(
+                other_context,
+                engine.views[0].pid(),
+                loader_identity.1,
+                loader_identity.2,
+                loader_identity.3,
+                &engine.pinned,
+            )
+            .unwrap(),
+        "another context retains its valid loader-link no-op"
+    );
+    assert_eq!(session.dynamic_attach_calls.len(), export_attempts);
+    assert_eq!(session.dynamic_loader_attach_calls, loader_attempts);
+
+    session
+        .attach_dynamic_export(
+            context,
+            engine.views[0].pid(),
+            export_target,
+            export_cookie,
+            HookAbi::FunctionList,
+            &engine.pinned,
+        )
+        .unwrap();
+    session
+        .attach_dynamic_loader(
+            context,
+            engine.views[0].pid(),
+            loader_identity.1,
+            loader_identity.2,
+            loader_identity.3,
+            &engine.pinned,
+        )
+        .unwrap();
+    assert_eq!(session.dynamic_attach_calls.len(), export_attempts + 1);
+    assert_eq!(session.dynamic_loader_attach_calls, loader_attempts + 1);
+}
+
+#[test]
+fn scripted_failed_dynamic_retirement_refuses_retired_identity_but_keeps_other_context() {
+    let (_fixture, engine, context, _record, mut session) = armed_seed_route(2);
+    let loader_identity = session.dynamic_loader_links[0];
+    let export_target = (loader_identity.1, loader_identity.2);
+    let export_cookie = u64::MAX;
+    let other_context = LoaderContextId::from_case_id(7);
+
+    for owner in [context, other_context] {
+        session
+            .attach_dynamic_export(
+                owner,
+                engine.views[0].pid(),
+                export_target,
+                export_cookie,
+                HookAbi::FunctionList,
+                &engine.pinned,
+            )
+            .unwrap();
+        session
+            .attach_dynamic_loader(
+                owner,
+                engine.views[0].pid(),
+                loader_identity.1,
+                loader_identity.2,
+                loader_identity.3,
+                &engine.pinned,
+            )
+            .unwrap();
+    }
+    let export_attempts = session.dynamic_attach_calls.len();
+    let loader_attempts = session.dynamic_loader_attach_calls;
+    session.detach_failed = true;
+
+    assert!(session.detach_dynamic_context(context).1);
+    assert_eq!(
+        session
+            .attach_dynamic_export(
+                context,
+                engine.views[0].pid(),
+                export_target,
+                export_cookie,
+                HookAbi::FunctionList,
+                &engine.pinned,
+            )
+            .unwrap_err()
+            .to_string(),
+        "new producer attachment is refused after a detach bookkeeping failure; start a new session"
+    );
+    match session
+        .attach_dynamic_loader(
+            context,
+            engine.views[0].pid(),
+            loader_identity.1,
+            loader_identity.2,
+            loader_identity.3,
+            &engine.pinned,
+        )
+        .unwrap_err()
+    {
+        DynamicLoaderAttachFailure::Registry(error) => assert_eq!(
+            error.to_string(),
+            "new producer attachment is refused after a detach bookkeeping failure; start a new session"
+        ),
+        error => panic!("retired loader identity had the wrong refusal cause: {error}"),
+    }
+    assert_eq!(
+        session
+            .attach_dynamic_export(
+                other_context,
+                engine.views[0].pid(),
+                export_target,
+                export_cookie,
+                HookAbi::FunctionList,
+                &engine.pinned,
+            )
+            .unwrap(),
+        (false, None)
+    );
+    assert!(
+        !session
+            .attach_dynamic_loader(
+                other_context,
+                engine.views[0].pid(),
+                loader_identity.1,
+                loader_identity.2,
+                loader_identity.3,
+                &engine.pinned,
+            )
+            .unwrap()
+    );
+    assert_eq!(session.dynamic_attach_calls.len(), export_attempts);
+    assert_eq!(session.dynamic_loader_attach_calls, loader_attempts);
+}
+
+#[test]
 fn exact_pinned_executable_export_collects_one_count_only_seed() {
     let (_fixture, view, module, pins) = loaded_seed_provider();
     let mut engine = Engine::empty();
@@ -7929,6 +8695,78 @@ fn exact_pinned_executable_export_collects_one_count_only_seed() {
             .any(|summary| summary.object == object)
     );
     assert_eq!(view.id(), module.view);
+}
+
+#[test]
+fn overflowing_export_cookie_id_refuses_dynamic_work_with_partial_evidence() {
+    let (_fixture, _view, module, pins) = loaded_seed_provider();
+    let mut engine = Engine::empty();
+    engine.hooks = HookRegistry::with_overflowing_export_cookie_id();
+    assert_eq!(engine.hooks.id("C_GetFunctionList"), Some(0x0100_0000));
+    let candidate = engine
+        .live_candidate(pins, vec![module.clone()], Vec::new())
+        .unwrap();
+    let object = candidate
+        .pinned
+        .id_for_scanned(&module, module.key, &module.path)
+        .unwrap();
+    let overflow_subject = "live export hook";
+    let overflow_reason = "an export hook identity did not fit the checked attachment cookie";
+    assert!(
+        !engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| { skip.subject == overflow_subject && skip.reason == overflow_reason })
+    );
+
+    let collected = engine.collect_dynamic_export_work(
+        LoaderContextId::from_case_id(0),
+        std::slice::from_ref(&module),
+        &candidate.pinned,
+        &ScriptedSession::default(),
+        false,
+        &[],
+    );
+
+    assert!(collected.dynamic.is_empty());
+    assert!(!collected.required_seed_complete);
+    assert_eq!(collected.count_only_seeds.len(), 1);
+    assert_eq!(collected.count_only_seeds[0].object, object);
+    assert_eq!(collected.count_only_seeds[0].object_path, module.path);
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| { skip.subject == overflow_subject && skip.reason == overflow_reason })
+    );
+}
+
+#[test]
+fn expired_deadline_names_live_export_snapshot_refusal() {
+    let (_fixture, _view, module, pins) = loaded_seed_provider();
+    let mut engine = Engine::empty();
+    let candidate = engine
+        .live_candidate(pins, vec![module.clone()], Vec::new())
+        .unwrap();
+    engine.budget.set_deadline(Some(0));
+    let collected = engine.collect_dynamic_export_work(
+        LoaderContextId::from_case_id(0),
+        std::slice::from_ref(&module),
+        &candidate.pinned,
+        &ScriptedSession::default(),
+        false,
+        &[],
+    );
+
+    assert!(!collected.required_seed_complete);
+    assert!(collected.count_only_seeds.is_empty());
+    assert!(collected.dynamic.is_empty());
+    assert_eq!(engine.budget.attempted_io_bytes(), 0);
+    assert!(engine.counters.object_skips.iter().any(|skip| {
+        skip.subject == "live export hook" && skip.reason.contains(SCAN_DEADLINE_REASON)
+    }));
 }
 
 #[test]
@@ -8079,6 +8917,7 @@ fn child_provider_modules(view: &ProcessView) -> Vec<ScannedModule> {
     for _ in 0..200 {
         let bytes = std::fs::read(format!("/proc/{}/maps", view.pid())).unwrap();
         let maps = parse_maps(&bytes).unwrap();
+        let map_index = MapIndex::new(&maps).expect("the live child maps snapshot is valid");
         let mut keys = BTreeSet::new();
         let mut modules = Vec::new();
         for mapping in maps
@@ -8088,7 +8927,7 @@ fn child_provider_modules(view: &ProcessView) -> Vec<ScannedModule> {
             let Resolved::File {
                 path: MappedPath::Usable(path),
                 ..
-            } = resolve(&maps, mapping.start)
+            } = map_index.resolve(mapping.start)
             else {
                 continue;
             };
@@ -8819,6 +9658,21 @@ fn loader_record_for(context: LoaderContextId, pid: u32) -> DiscoveryRecord {
     record
 }
 
+fn successful_selection_record(pid: u32, binding_id: u64, request_flags: u64) -> DiscoveryRecord {
+    let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    record.kind = DISCOVERY_KIND_INTERFACE_RETURN;
+    record.pid_tgid = u64::from(pid) << 32;
+    record.case_id = DISCOVERY_NAME_EXACT_STANDARD;
+    record.interface_index = DISCOVERY_VERSION_V3_0;
+    record.request_flags = request_flags;
+    record.name_class = DISCOVERY_NAME_EXACT_STANDARD;
+    record.selection_version_class = DISCOVERY_VERSION_V3_0;
+    record.table_ptr = 0x1000;
+    record.binding_id = binding_id;
+    assert!(valid_discovery_record(&record));
+    record
+}
+
 /// One ordinary non-terminal Engine batch through the real application
 /// route, with the real generic collector.
 fn apply_ordinary_batch(
@@ -8828,6 +9682,303 @@ fn apply_ordinary_batch(
 ) -> Result<DiscoveryBatchOutcome> {
     let mut collect = Engine::collect_discovery_records;
     engine.apply_discovery_batch_with(session, records, 0, true, false, &mut collect, None)
+}
+
+/// Mutation caught: rejecting an already-dequeued return solely because
+/// its original process exited drops a factual interface-selection tuple.
+#[test]
+fn ordinary_selection_records_survive_honest_exit_through_exact_terminal_handoff() {
+    const WORK_CEILING: u64 = 16 * 1024 * 1024;
+    let (mut fixture, mut engine, mut session, binding) = attached_selection_route();
+    let identity = DynamicExportIdentity {
+        object: binding.object,
+        file_offset: binding.file_offset,
+        cookie: binding.id,
+        abi: binding.abi,
+    };
+    session.detach_exports = vec![identity];
+    let records = (0..3)
+        .map(|flags| successful_selection_record(fixture.child.id(), binding.id, flags))
+        .collect();
+    engine.budget = CaptureWorkBudget::default();
+    assert!(engine.budget.charge(WORK_CEILING - 3));
+
+    fixture.child.kill().unwrap();
+    fixture.child.wait().unwrap();
+    let outcome = apply_ordinary_batch(&mut engine, &mut session, records).unwrap();
+
+    assert_eq!(engine.capture_facts.history.selections.len(), 3);
+    assert!(engine.capture_facts.history.selections.iter().all(|tuple| {
+        tuple.result.is_some()
+            && tuple.inventory_matches.is_empty()
+            && tuple.authority == SelectionAuthority::None
+            && tuple.count == 1
+    }));
+    assert!(engine.capture_facts.history.losses.values().any(|loss| {
+        loss.reason == "a terminal selection result had no stable live table assessment"
+    }));
+    assert!(engine.selection_claims.is_empty());
+    assert!(engine.selection_tables.is_empty());
+    assert_eq!(session.detached, [binding.context]);
+    assert!(engine.views.is_empty());
+    assert!(engine.terminal_batch.is_none());
+    assert!(engine.terminal_journal.is_none());
+    assert!(
+        engine.budget.charge(0),
+        "the terminal handoff must not charge the three records again"
+    );
+    assert!(
+        !engine.budget.charge(1),
+        "the ordinary dequeue consumed exactly the last three work units"
+    );
+    assert!(!outcome.required_complete);
+}
+
+/// Mutation caught: treating a changed retained `/proc` start time as an
+/// exit would transfer a different process's record into terminal authority.
+#[test]
+fn ordinary_selection_record_refuses_pid_reuse_without_terminal_handoff() {
+    let (_fixture, mut engine, mut session, binding) = attached_selection_route();
+    let pid = std::process::id();
+    engine.scope = Scope::Pid(pid);
+    engine.views = vec![
+        crate::process::reused_process_view_for_test(binding.view, pid)
+            .expect("a deterministic reused-pid view"),
+    ];
+    assert!(
+        !engine.views[0].still_the_same(),
+        "the fixture independently retains a different /proc start time"
+    );
+    engine
+        .selection_bindings
+        .get_mut(&binding.id)
+        .unwrap()
+        .coverage = SelectionCoverageState::OwnedOpen(NonZeroU64::new(41).unwrap());
+    let identity = DynamicExportIdentity {
+        object: binding.object,
+        file_offset: binding.file_offset,
+        cookie: binding.id,
+        abi: binding.abi,
+    };
+    session.detach_exports = vec![identity];
+
+    let outcome = apply_ordinary_batch(
+        &mut engine,
+        &mut session,
+        vec![successful_selection_record(pid, binding.id, 0)],
+    )
+    .unwrap();
+
+    assert!(engine.capture_facts.history.selections.is_empty());
+    assert!(engine.terminal_batch.is_none());
+    assert!(engine.terminal_journal.is_none());
+    assert_eq!(
+        engine.selection_bindings[&binding.id].coverage,
+        SelectionCoverageState::Uncovered
+    );
+    assert!(engine.counters.object_skips.iter().any(|skip| {
+        skip.reason
+            == "a selection record failed binding, context, or process-generation attribution"
+    }));
+    assert!(!outcome.required_complete);
+}
+
+/// Mutation caught: terminal tagging nominates by cookie and ABI, but the
+/// reducer must still require the detached snapshot's full exact identity.
+#[test]
+fn exited_selection_handoff_refuses_mismatched_detached_identity() {
+    for case in ["object", "file offset", "cookie", "abi"] {
+        let (mut fixture, mut engine, mut session, binding) = attached_selection_route();
+        let mut detached = DynamicExportIdentity {
+            object: binding.object,
+            file_offset: binding.file_offset,
+            cookie: binding.id,
+            abi: binding.abi,
+        };
+        match case {
+            "object" => detached.object = PinnedObjectId(binding.object.0 + 1),
+            "file offset" => detached.file_offset += 1,
+            "cookie" => detached.cookie += 1,
+            "abi" => detached.abi = HookAbi::FunctionList,
+            _ => unreachable!(),
+        }
+        session.detach_exports = vec![detached];
+        let record = successful_selection_record(fixture.child.id(), binding.id, 0);
+
+        fixture.child.kill().unwrap();
+        fixture.child.wait().unwrap();
+        let outcome = apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+
+        assert!(engine.capture_facts.history.selections.is_empty(), "{case}");
+        assert_eq!(session.detached, [binding.context], "{case}");
+        assert!(engine.terminal_batch.is_none(), "{case}");
+        assert!(engine.terminal_journal.is_none(), "{case}");
+        assert!(
+            engine.counters.object_skips.iter().any(|skip| {
+                skip.reason
+                    == "a selection record failed binding, context, or process-generation attribution"
+            }),
+            "{case}"
+        );
+        assert!(!outcome.required_complete, "{case}");
+    }
+}
+
+#[test]
+fn exited_selection_handoff_requires_every_ordinary_attribution_guard() {
+    for case in [
+        "unknown binding",
+        "unattached binding",
+        "retired binding",
+        "tombstoned context",
+        "context view disagreement",
+        "missing retained view",
+        "wrong record pid",
+        "hook abi mismatch",
+    ] {
+        let (mut fixture, mut engine, _session, binding) = attached_selection_route();
+        let pid = fixture.child.id();
+        let mut record = successful_selection_record(pid, binding.id, 0);
+        match case {
+            "unknown binding" => record.binding_id = binding.id + 1000,
+            "unattached binding" => {
+                engine
+                    .selection_bindings
+                    .get_mut(&binding.id)
+                    .unwrap()
+                    .attached = false;
+            }
+            "retired binding" => {
+                engine
+                    .selection_bindings
+                    .get_mut(&binding.id)
+                    .unwrap()
+                    .retired = true;
+            }
+            "tombstoned context" => {
+                engine.loader_registry.tombstone(binding.context).unwrap();
+            }
+            "context view disagreement" => {
+                let other = ProcessView::open(ProcessViewId(77), pid).unwrap();
+                engine.views.push(other);
+                engine.selection_bindings.get_mut(&binding.id).unwrap().view = ProcessViewId(77);
+            }
+            "missing retained view" => engine.views.clear(),
+            "wrong record pid" => record.pid_tgid = u64::from(std::process::id()) << 32,
+            "hook abi mismatch" => {
+                engine.selection_bindings.get_mut(&binding.id).unwrap().abi = HookAbi::FunctionList;
+            }
+            _ => unreachable!(),
+        }
+
+        fixture.child.kill().unwrap();
+        fixture.child.wait().unwrap();
+        assert_eq!(
+            engine.process_selection_record(&QueuedDiscoveryRecord {
+                record,
+                terminal_owner: None,
+                terminal_exports: Vec::new(),
+            }),
+            DiscoveryRecordOutcome::Rejected(RecordRejection::SelectionUnattributed),
+            "{case}"
+        );
+        assert!(engine.capture_facts.history.selections.is_empty(), "{case}");
+    }
+}
+
+#[test]
+fn terminal_selection_authority_refuses_the_wrong_owner() {
+    let (_fixture, mut engine, _session, binding) = attached_selection_route();
+    let identity = DynamicExportIdentity {
+        object: binding.object,
+        file_offset: binding.file_offset,
+        cookie: binding.id,
+        abi: binding.abi,
+    };
+    let wrong_owner = LoaderContextId::from_case_id(200);
+    assert_ne!(wrong_owner, binding.context);
+    let record = successful_selection_record(engine.views[0].pid(), binding.id, 0);
+
+    assert_eq!(
+        engine.process_selection_record(&tagged_by_authority(wrong_owner, &[identity], record,)),
+        DiscoveryRecordOutcome::Rejected(RecordRejection::SelectionUnattributed)
+    );
+    assert!(engine.capture_facts.history.selections.is_empty());
+}
+
+#[test]
+fn ordinary_selection_record_refuses_an_unprovable_generation() {
+    let (_fixture, mut engine, _session, binding) = attached_selection_route();
+    let pid = std::process::id();
+    engine.views = vec![
+        crate::process::unprovable_process_view_for_test(binding.view, pid)
+            .expect("a view with no retained start time or pidfd"),
+    ];
+    let record = successful_selection_record(pid, binding.id, 0);
+
+    assert_eq!(
+        engine.process_selection_record(&QueuedDiscoveryRecord {
+            record,
+            terminal_owner: None,
+            terminal_exports: Vec::new(),
+        }),
+        DiscoveryRecordOutcome::Rejected(RecordRejection::SelectionUnattributed)
+    );
+    assert!(engine.capture_facts.history.selections.is_empty());
+    assert!(engine.counters.object_skips.iter().any(|skip| {
+        skip.reason
+            == "a selection record failed binding, context, or process-generation attribution"
+    }));
+}
+
+#[test]
+fn exited_selection_handoff_survives_predispatch_retry_without_recharge() {
+    const WORK_CEILING: u64 = 16 * 1024 * 1024;
+    let (mut fixture, mut engine, mut session, binding) = attached_selection_route();
+    let generation = NonZeroU64::new(43).unwrap();
+    engine
+        .selection_bindings
+        .get_mut(&binding.id)
+        .unwrap()
+        .coverage = SelectionCoverageState::OwnedOpen(generation);
+    let identity = DynamicExportIdentity {
+        object: binding.object,
+        file_offset: binding.file_offset,
+        cookie: binding.id,
+        abi: binding.abi,
+    };
+    session.detach_exports = vec![identity];
+    session.fail_counter_reads([false, true]);
+    engine.budget = CaptureWorkBudget::default();
+    assert!(engine.budget.charge(WORK_CEILING - 1));
+    let record = successful_selection_record(fixture.child.id(), binding.id, 0);
+
+    fixture.child.kill().unwrap();
+    fixture.child.wait().unwrap();
+    apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+
+    assert_eq!(session.counter_reads(), 3);
+    assert_eq!(engine.capture_facts.history.selections.len(), 1);
+    assert_eq!(engine.capture_facts.history.selections[0].count, 1);
+    assert!(engine.capture_facts.history.losses.values().any(|loss| {
+        loss.reason == "a terminal selection result had no stable live table assessment"
+    }));
+    assert!(engine.counters.object_skips.iter().any(|skip| {
+        skip.reason
+            == "the post-detach producer snapshot could not be read; the exact terminal batch remains queued"
+    }));
+    assert!(engine.terminal_batch.is_none());
+    assert!(engine.terminal_journal.is_none());
+    assert!(engine.loader_registry.context(binding.context).is_none());
+    assert_eq!(
+        engine.selection_bindings[&binding.id].coverage,
+        SelectionCoverageState::Uncovered
+    );
+    assert!(
+        engine.budget.charge(0),
+        "handoff and retry must not recharge the precharged record"
+    );
+    assert!(!engine.budget.charge(1));
 }
 
 #[test]
@@ -9749,7 +10900,24 @@ fn bounded_interpreter(bytes: &[u8]) -> std::result::Result<Option<PathBuf>, Str
     let path = dir.path().join("executable");
     std::fs::write(&path, bytes).unwrap();
     let file = std::fs::File::open(path).unwrap();
-    read_bounded_interpreter(&file, bytes.len() as u64)
+    read_bounded_interpreter(&file, bytes.len() as u64).map(|(path, _)| path)
+}
+
+fn bounded_elf32(interpreter: &[u8]) -> Vec<u8> {
+    let mut bytes = vec![0u8; 52 + 32 + interpreter.len()];
+    bytes[..7].copy_from_slice(b"\x7fELF\x01\x01\x01");
+    bytes[16..18].copy_from_slice(&3u16.to_le_bytes());
+    bytes[18..20].copy_from_slice(&3u16.to_le_bytes());
+    bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+    bytes[28..32].copy_from_slice(&52u32.to_le_bytes());
+    bytes[40..42].copy_from_slice(&52u16.to_le_bytes());
+    bytes[42..44].copy_from_slice(&32u16.to_le_bytes());
+    bytes[44..46].copy_from_slice(&1u16.to_le_bytes());
+    bytes[52..56].copy_from_slice(&3u32.to_le_bytes());
+    bytes[56..60].copy_from_slice(&84u32.to_le_bytes());
+    bytes[68..72].copy_from_slice(&(interpreter.len() as u32).to_le_bytes());
+    bytes[84..].copy_from_slice(interpreter);
+    bytes
 }
 
 #[test]
@@ -9759,6 +10927,10 @@ fn bounded_pt_interp_reader_rejects_malformed_or_unbounded_elf() {
         Ok(Some(PathBuf::from("/lib/ld.so")))
     );
     assert_eq!(bounded_interpreter(&bounded_elf(&[])), Ok(None));
+    assert_eq!(
+        bounded_interpreter(&bounded_elf32(b"/lib/ld-linux.so.2\0")),
+        Ok(Some(PathBuf::from("/lib/ld-linux.so.2")))
+    );
     for interpreter in [
         &b"relative\0"[..],
         &b"/lib/ld.so"[..],
@@ -9935,11 +11107,12 @@ fn exact_loader_pin_is_view_owned_but_not_a_provider_module() {
     engine.modules = provider_modules;
 
     let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+    let map_index = MapIndex::new(&maps).expect("the self maps snapshot is valid");
     let executable = std::env::current_exe().unwrap();
     let (loader_mapping, loader_path) = maps
         .iter()
         .filter(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0)
-        .find_map(|mapping| match resolve(&maps, mapping.start) {
+        .find_map(|mapping| match map_index.resolve(mapping.start) {
             Resolved::File {
                 path: MappedPath::Usable(path),
                 ..
@@ -10123,7 +11296,7 @@ fn loader_collision_candidate_keeps_provider_retirement_without_loader_id() {
             virtual_address: 0x2100,
             file_offset: 0x2100,
         },
-        state: None,
+        state_address: None,
     };
     let prepared = engine
         .loader_registry
@@ -10580,7 +11753,7 @@ fn attached_context_is_processed_and_removed_before_same_view_rearm() {
                 virtual_address: 0x2100,
                 file_offset: 0x2100,
             },
-            state: None,
+            state_address: None,
         })
         .unwrap();
     let context = registry.prepare(prepared).unwrap();
@@ -10690,7 +11863,7 @@ fn attached_context_is_processed_and_removed_before_same_view_rearm() {
                 virtual_address: 0x2100,
                 file_offset: 0x2100,
             },
-            state: None,
+            state_address: None,
         })
         .unwrap();
     let replacement = engine.loader_registry.prepare(prepared).unwrap();
@@ -10727,7 +11900,7 @@ fn serial_terminal_drain_never_claims_another_attached_context() {
                     virtual_address: 0x2100,
                     file_offset: 0x2100,
                 },
-                state: None,
+                state_address: None,
             })
             .unwrap();
         let context = registry.prepare(prepared).unwrap();
@@ -10805,7 +11978,7 @@ fn refresh_continues_second_view_after_first_loader_arm_error() {
             Ok(false)
         };
         match loader_arm_outcome(true, result) {
-            LoaderArmOutcome::OrdinaryFailure => {
+            LoaderArmOutcome::OrdinaryFailure(_) => {
                 partial += 1;
                 Ok(false)
             }
@@ -10846,8 +12019,8 @@ fn refresh_continues_second_view_after_first_loader_arm_error() {
 }
 
 #[test]
-fn merge_scanned_interfaces_retains_the_richer_name() {
-    let module = |name_lossy| ScannedModule {
+fn merge_scanned_modules_retains_names_and_exact_decoder_provenance() {
+    let module = |name_lossy, decoder_abi| ScannedModule {
         view: ProcessViewId(0),
         mount_namespace: crate::process::MountNamespaceId {
             device: 1,
@@ -10858,6 +12031,7 @@ fn merge_scanned_interfaces_retains_the_richer_name() {
             inode: 42,
         },
         path: "/opt/p.so".into(),
+        decoder_abi,
         exports: vec![],
         tables: vec![ScannedTable {
             version: (3, 0),
@@ -10878,13 +12052,25 @@ fn merge_scanned_interfaces_retains_the_richer_name() {
         }],
     };
 
-    let mut merged = vec![module(Some("PKCS 11".into()))];
-    merge_scanned_module(&mut merged, module(None));
+    let mut merged = vec![module(Some("PKCS 11".into()), Some(ElfAbi::Ilp32))];
+    merge_scanned_module(&mut merged, module(None, None));
 
     assert_eq!(merged[0].interfaces.len(), 1);
+    assert_eq!(merged[0].decoder_abi, Some(ElfAbi::Ilp32));
     assert_eq!(
         merged[0].interfaces[0].name_lossy.as_deref(),
         Some("PKCS 11")
+    );
+
+    let mut mapping_first = vec![module(None, None)];
+    merge_scanned_module(&mut mapping_first, module(None, Some(ElfAbi::Ilp32)));
+    assert_eq!(mapping_first[0].decoder_abi, Some(ElfAbi::Ilp32));
+
+    merge_scanned_module(&mut mapping_first, module(None, Some(ElfAbi::Lp64)));
+    assert_eq!(
+        mapping_first.len(),
+        2,
+        "conflicting exact decoder provenance is never merged away"
     );
 }
 
@@ -10900,6 +12086,7 @@ fn self_export_fixture(id: ProcessViewId) -> (ProcessView, Vec<MapEntry>, Discov
     let pid = std::process::id();
     let view = ProcessView::open(id, pid).unwrap();
     let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+    let map_index = MapIndex::new(&maps).expect("the self maps snapshot is valid");
     let executable = std::env::current_exe().unwrap();
     let executable = executable.canonicalize().unwrap_or(executable);
     let owner = maps
@@ -10909,7 +12096,7 @@ fn self_export_fixture(id: ProcessViewId) -> (ProcessView, Vec<MapEntry>, Discov
                 && mapping.permissions[0] == b'r'
                 && mapping.permissions[2] != b'x'
                 && matches!(
-                    resolve(&maps, mapping.start),
+                    map_index.resolve(mapping.start),
                     Resolved::File {
                         path: MappedPath::Usable(ref path),
                         ..
@@ -11094,6 +12281,7 @@ fn engine_lowers_export_table_owner_and_prefix() {
 
     let view = ProcessView::open(ProcessViewId(41), std::process::id()).unwrap();
     let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+    let map_index = MapIndex::new(&maps).expect("the self maps snapshot is valid");
     let executable = std::env::current_exe().unwrap();
     let executable = executable.canonicalize().unwrap_or(executable);
     let owner = maps
@@ -11103,7 +12291,7 @@ fn engine_lowers_export_table_owner_and_prefix() {
                 && mapping.permissions[0] == b'r'
                 && mapping.permissions[2] != b'x'
                 && matches!(
-                    resolve(&maps, mapping.start),
+                    map_index.resolve(mapping.start),
                     Resolved::File {
                         path: MappedPath::Usable(ref path),
                         ..
@@ -11141,6 +12329,10 @@ fn engine_lowers_export_table_owner_and_prefix() {
     let lowered = lower_export_record(&view, &index, &hooks, &record, &mut budget)
         .expect("the structurally valid record lowers")
         .expect("one usable pointer gives one table");
+    assert_eq!(
+        lowered.decoder_abi, None,
+        "a kernel export record does not claim userspace decoder provenance"
+    );
     assert_eq!(lowered.view, view.id());
     assert_eq!(lowered.key, ObjectKey::of(owner));
     assert_eq!(lowered.tables.len(), 1);
@@ -11157,6 +12349,7 @@ fn engine_lowers_export_table_owner_and_prefix() {
     let interface = lower_export_record(&view, &index, &hooks, &interface_record, &mut budget)
         .unwrap()
         .unwrap();
+    assert_eq!(interface.decoder_abi, None);
     let mut merged = vec![lowered.clone()];
     merge_scanned_module(&mut merged, interface);
     assert_eq!(merged[0].interfaces[0].table, Some(1));
@@ -11392,12 +12585,10 @@ fn same_object_scan_and_manifest(
 /// Hermetic stand-in for the old `/bin/sh` + `/bin/ls` copies: host shell
 /// layouts drift (this host's dash has TEXT at file 0x4000, outside the
 /// replacement's X ranges), which broke the stale tests' assumption that
-/// manifest-time offsets stay valid under the replacement file. Both
-/// markers yield the standard `gcc -shared` layout (R-X at file 0x1000)
-/// with distinct bytes, so staleness still triggers by identity change,
-/// never by host layout. Same-length markers keep sizes identical.
+/// manifest-time offsets stay valid under the replacement file. The marker
+/// yields the standard `gcc -shared` layout (R-X at file 0x1000); staleness
+/// triggers by identity change (appended byte), never by host layout.
 const FIXTURE_ORIGINAL: &str = "ORIGINAL-0001";
-const FIXTURE_REPLACED: &str = "REPLACED-0001";
 
 fn build_fixture_so(path: &Path, marker: &str) {
     let source = path.with_extension("c");
@@ -11440,6 +12631,15 @@ fn object_facts(path: &Path) -> (ObjectKey, p11scope_manifest::identity::ObjectI
         inspected.identity,
         inspected.executable_ranges[0].0,
     )
+}
+
+fn replace_fixture_with_changed_elf(path: &Path) {
+    let before = object_facts(path);
+    let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    file.write_all(&[0]).unwrap();
+    let after = object_facts(path);
+    assert_eq!(before.2, after.2, "fixture executable layout changed");
+    assert_ne!(before.1, after.1, "fixture identity did not change");
 }
 
 fn valid_manifest_for(paths: &[PathBuf], targets: &[u32]) -> Manifest {
@@ -11502,6 +12702,7 @@ fn scanned_manifest_replacement(paths: &[PathBuf], targets: &[u32]) -> ScannedMo
         mount_namespace: current_mount_namespace(),
         key: facts[0].0,
         path: paths[0].display().to_string(),
+        decoder_abi: Some(ElfAbi::Lp64),
         exports: vec!["C_GetFunctionList".into()],
         tables: vec![ScannedTable {
             version: (2, 0),
@@ -11620,7 +12821,7 @@ fn discovery_complementary_partial_tables_do_not_cover_one_stale_surface() {
     let paths = vec![provider.clone()];
     let targets = vec![0; 67];
     let manifest = valid_manifest_for(&paths, &targets);
-    build_fixture_so(&provider, FIXTURE_REPLACED);
+    replace_fixture_with_changed_elf(&provider);
     let mut scan = scanned_manifest_replacement(&paths, &targets);
     let mut second = scan.tables[0].clone();
     let midpoint = scan.tables[0].entries.len() / 2;
@@ -11689,7 +12890,7 @@ fn discovery_one_duplicate_table_cannot_prove_two_manifest_surfaces() {
         functions: functions.clone(),
     };
     manifest.surfaces.extend([interface(0), interface(1)]);
-    build_fixture_so(&provider, FIXTURE_REPLACED);
+    replace_fixture_with_changed_elf(&provider);
     let mut scan = scanned_manifest_replacement(&paths, &targets);
     let (key, _, offset) = object_facts(&provider);
     scan.tables[0].version = (3, 0);
@@ -11737,7 +12938,7 @@ fn discovery_stale_module_requires_coverage_for_unresolved_claims() {
     let targets = vec![0; 67];
     let mut manifest = valid_manifest_for(&paths, &targets);
     manifest.surfaces[0].functions[66].resolution = Resolution::NullPointer;
-    build_fixture_so(&provider, FIXTURE_REPLACED);
+    replace_fixture_with_changed_elf(&provider);
     let mut scan = scanned_manifest_replacement(&paths, &targets);
     scan.tables[0].entries.pop();
     let pins = pin_scan(&scan);
@@ -11809,7 +13010,7 @@ fn discovery_mixed_manifest_drops_only_the_stale_dependency_claims() {
         },
     ];
 
-    build_fixture_so(&replaced, FIXTURE_REPLACED);
+    replace_fixture_with_changed_elf(&replaced);
     let mut scan_targets = targets.clone();
     scan_targets[1] = 0;
     scan_targets[2] = 0;
@@ -11919,7 +13120,7 @@ fn discovery_dependency_fallback_rejects_an_unrelated_modules_table() {
     manifest_targets[0] = 1;
     let manifest = valid_manifest_for(&paths, &manifest_targets);
 
-    build_fixture_so(&replaced, FIXTURE_REPLACED);
+    replace_fixture_with_changed_elf(&replaced);
     let owner_scan = scanned_manifest_replacement(&paths, &vec![0; 67]);
     let unrelated_scan = scanned_manifest_replacement(&[unrelated, replaced], &manifest_targets);
     let modules = vec![owner_scan, unrelated_scan];
@@ -11964,7 +13165,7 @@ fn discovery_fallback_fails_when_the_proof_module_is_refused_at_capacity() {
     let mut targets = vec![0; 67];
     targets[0] = 1;
     let manifest = valid_manifest_for(&paths, &targets);
-    build_fixture_so(&replaced, FIXTURE_REPLACED);
+    replace_fixture_with_changed_elf(&replaced);
 
     let mut proof_module = scanned_manifest_replacement(&paths, &targets);
     let (provider_key, _, _) = object_facts(&provider);
@@ -12014,7 +13215,7 @@ fn discovery_fallback_binding_rejects_a_proof_table_lost_during_reconciliation()
     let paths = vec![provider.clone()];
     let targets = vec![0; 67];
     let manifest = valid_manifest_for(&paths, &targets);
-    build_fixture_so(&provider, FIXTURE_REPLACED);
+    replace_fixture_with_changed_elf(&provider);
     let scan = scanned_manifest_replacement(&paths, &targets);
     let mut pins = pin_scan(&scan);
     let input = manifest_input_from_pinning("reconciliation-loss.json", manifest);
@@ -12070,7 +13271,7 @@ fn discovery_mixed_manifest_cannot_hide_a_stale_sole_source_object() {
         &[provider.clone(), replaced.clone(), sole.clone()],
         &targets,
     );
-    build_fixture_so(&replaced, FIXTURE_REPLACED);
+    replace_fixture_with_changed_elf(&replaced);
     std::fs::remove_file(&sole).unwrap();
 
     let mut scan_targets = targets.clone();
@@ -12288,6 +13489,7 @@ fn stale_only_identity_mismatch_becomes_manifest_fallback_for_stable_scope() {
         mount_namespace: current_mount_namespace(),
         key,
         path: path.clone(),
+        decoder_abi: Some(ElfAbi::Lp64),
         exports: vec!["C_GetFunctionList".into()],
         tables: vec![ScannedTable {
             version: (2, 40),
@@ -12511,6 +13713,7 @@ fn corroboration_marks_the_exact_reconciled_object_not_the_raw_key_peer() {
             mount_namespace: current_mount_namespace(),
             key,
             path: path.into(),
+            decoder_abi: Some(ElfAbi::Lp64),
             exports: vec!["C_GetFunctionList".into()],
             tables: vec![ScannedTable {
                 version: (2, 40),
@@ -12591,6 +13794,7 @@ fn pending_fallback_outcome_follows_the_final_overlay_canonical_id_without_autho
             mount_namespace: current_mount_namespace(),
             key,
             path: path.into(),
+            decoder_abi: Some(ElfAbi::Lp64),
             exports: vec!["C_GetFunctionList".into()],
             tables: vec![ScannedTable {
                 version: (2, 40),
@@ -12653,6 +13857,7 @@ fn pending_corroboration_rebuild_resolves_the_current_final_id() {
             mount_namespace: current_mount_namespace(),
             key,
             path: "/stable-view.so".into(),
+            decoder_abi: Some(ElfAbi::Lp64),
             exports: vec!["C_GetFunctionList".into()],
             tables: vec![ScannedTable {
                 version: (2, 40),
@@ -12716,11 +13921,26 @@ fn legacy_manifest_schemas_are_rejected_with_rediscovery_instruction() {
     }
 }
 
-/// Our own executable, scanned and pinned the way a capture pins a provider:
-/// a real `PinnedObjects` with one key in it, with no privileges needed.
+/// Our own executable, represented by empty scan facts and pinned the way a
+/// capture pins a provider: one real `PinnedObjects` key, with no privileges.
 fn pinned_self() -> (Vec<ScannedModule>, PinnedObjects) {
-    let hooks = crate::discovery::hooks::HookRegistry::builtin();
     let exe = std::env::current_exe().unwrap();
+    let key = object_facts(&exe).0;
+    let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+    let modules = vec![ScannedModule {
+        view: view.id(),
+        mount_namespace: view.mount_namespace(),
+        key,
+        path: exe.display().to_string(),
+        decoder_abi: Some(if usize::BITS == 64 {
+            ElfAbi::Lp64
+        } else {
+            ElfAbi::Ilp32
+        }),
+        exports: vec![],
+        tables: vec![],
+        interfaces: vec![],
+    }];
     // Unbounded on purpose: `pin_scanned_object` caps on the whole file size, and
     // this test binary is already at 96% of the 64 MiB default. The byte caps are
     // not what these tests are about, and a silent skip would fail them with
@@ -12730,17 +13950,11 @@ fn pinned_self() -> (Vec<ScannedModule>, PinnedObjects) {
         total_bytes: u64::MAX,
     };
     let mut budget = CaptureWorkBudget::new(limits);
-    let outcome = scan_pid(
-        &ScanRequest {
-            pid: std::process::id(),
-            hints: &[exe],
-            hooks: &hooks,
-        },
-        &mut budget,
-    )
-    .unwrap();
-    let modules = outcome.modules().to_vec();
-    let (pinned, _) = pin_scanned_objects(std::process::id(), &modules, &mut budget).unwrap();
+    let (pinned, skipped) = pin_scanned_view_objects(&view, &modules, &mut budget).unwrap();
+    assert!(
+        skipped.is_empty(),
+        "the executable has no pinning loss: {skipped:?}"
+    );
     assert_eq!(
         pinned.pinned().count(),
         1,
@@ -12763,10 +13977,12 @@ fn coordinator_reuses_one_budget_across_process_scans_and_hashes() {
         .map(|m| m.end - m.start)
         .sum();
     let hash_bytes = std::fs::metadata(&exe).unwrap().len();
-    let scan_pass = maps_bytes.len() as u64 + scan_bytes;
+    let elf_snapshot_bytes = hash_bytes;
+    // Both complete maps snapshots belong to each scan operation.
+    let scan_pass = maps_bytes.len() as u64 * 2 + scan_bytes;
     let mut budget = CaptureWorkBudget::new(ScanLimits {
         per_object_bytes: scan_bytes.max(hash_bytes),
-        total_bytes: scan_pass * 2 + hash_bytes,
+        total_bytes: scan_pass * 2 + elf_snapshot_bytes * 2 + hash_bytes,
     });
     let hints = vec![exe];
     let hooks = HookRegistry::builtin();
@@ -12938,6 +14154,7 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
         start_insert_failures: 0,
         unmatched_returns: 0,
         rv_update_failures: 0,
+        abi_refusals: 0,
         cgroup_scope_failures: 0,
         semantic_capture_failures: 0,
         unregistered_mechanisms: 0,
@@ -12956,6 +14173,7 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
         async_evictions: 0,
         fork_state_ambiguities: 0,
         semantic_state_drops: 0,
+        semantic_history_drops: 0,
         pending_at_end: 0,
         malformed_records: 0,
         orphan_ops: 0,
@@ -13032,20 +14250,169 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
     }
 }
 
-/// An object the scan could not read at all is the loss `discovery[]` cannot
+/// An object the scan could not identify at all is the loss `discovery[]` cannot
 /// show: the module it belonged to contributes no table, so it produces no
 /// entry to skip, no attach to fail and no counter to raise. Printed and
 /// dropped, it leaves a document whose every field says the capture was
 /// clean while a provider went unobserved.
+fn p2_refuse_then_exit(
+    counters: &mut DiscoveryCounters,
+) -> Result<(Vec<ScannedModule>, PinnedObjects)> {
+    let mut child = std::process::Command::new("/bin/cat")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let view = ProcessView::open(ProcessViewId(711), child.id()).unwrap();
+    let result = scan_and_pin_with(
+        &view,
+        &[],
+        &HookRegistry::builtin(),
+        &mut CaptureWorkBudget::default(),
+        counters,
+        |_, view, budget| {
+            let outcome = crate::discovery::scan::bracket_refusal_for_test(view, budget);
+            assert!(outcome.modules().is_empty());
+            assert!(
+                outcome
+                    .skipped()
+                    .iter()
+                    .any(|skip| skip.reason == crate::discovery::scan::MAPPING_CHANGED_REASON)
+            );
+            drop(child.stdin.take());
+            assert!(child.wait().unwrap().success());
+            assert_eq!(view.original_exited(), Ok(true));
+            Ok(outcome)
+        },
+    );
+    assert!(
+        result
+            .as_ref()
+            .unwrap_err()
+            .to_string()
+            .contains("pinning process view")
+    );
+    result
+}
+
+#[test]
+fn p2_refusal_occurrences_survive_history_and_sanitized_duplicates() {
+    let (result, mut counters) = Engine::scan_retained_view_with(p2_refuse_then_exit);
+    assert!(result.is_err());
+    let mut distinct = counters.object_skips[0].clone();
+    distinct.reason = "memory scan refused: final mapping validation unavailable".into();
+    counters.object_skips.push(distinct);
+    assert_eq!(counters.object_skips.len(), 2);
+    let mut facts = CaptureFacts::default();
+    let mut plan = plan::build_from_reconciled_modules(&[]);
+    facts
+        .merge_current(&plan, &PinnedObjects::empty(), &[], &[], &[], &counters)
+        .unwrap();
+    facts
+        .merge_current(
+            &plan,
+            &PinnedObjects::empty(),
+            &[],
+            &[],
+            &[],
+            &DiscoveryCounters::default(),
+        )
+        .unwrap();
+    facts.apply_to_plan(&mut plan);
+    assert_eq!(
+        plan.skipped.len(),
+        2,
+        "retirement must retain both distinct acquisition losses"
+    );
+    let public: Vec<_> = plan
+        .skipped
+        .iter()
+        .map(render::capture_skipped_out)
+        .collect();
+    assert_eq!(
+        serde_json::to_value(public).unwrap(),
+        serde_json::json!([
+            {"name":"discovery subject","reason":"discovery unavailable"},
+            {"name":"discovery subject","reason":"discovery unavailable"}
+        ])
+    );
+}
+
+#[test]
+fn p2_absorbed_refusal_survives_later_inventory_failure() {
+    let (result, counters) = Engine::scan_retained_view_with(p2_refuse_then_exit);
+    assert!(result.is_err());
+    let expected = counters.object_skips[0].clone();
+    let mut engine = Engine::empty();
+    let pending_skips = engine.absorb_scan_counters(counters);
+    assert!(pending_skips.contains(&expected));
+    // Subsequent candidate construction may fail; publishing retained
+    // capture facts must still include the already incurred acquisition loss.
+    engine.publish_current_capture_facts().unwrap();
+    assert!(
+        engine.plan.skipped.contains(&expected),
+        "absorbed acquisition loss depended on candidate success"
+    );
+}
+
+#[test]
+fn p2_refusal_saved_before_pinning_failure() {
+    let mut counters = DiscoveryCounters::default();
+    assert!(p2_refuse_then_exit(&mut counters).is_err());
+    assert!(
+        counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.reason == crate::discovery::scan::MAPPING_CHANGED_REASON),
+        "pinning error lost bracket refusal: {:?}",
+        counters.object_skips
+    );
+}
+
+#[test]
+fn p2_retained_scan_error_keeps_counters_and_survives_attachment() {
+    let (result, counters) = Engine::scan_retained_view_with(p2_refuse_then_exit);
+    assert!(result.is_err());
+    let refusal = counters
+        .object_skips
+        .iter()
+        .find(|skip| skip.reason == crate::discovery::scan::MAPPING_CHANGED_REASON)
+        .expect("retained scan error discarded bracket refusal")
+        .clone();
+    // Normal-exit bookkeeping suppresses only the generic unreadable member.
+    assert!(unreadable_member_skip(711, true, "pin failure").is_none());
+    for source in ["manifest", "scan"] {
+        let mut plan = plan_with(1, 0);
+        plan.modules[0].path = refusal.subject.clone();
+        plan.modules[0].source = source;
+        plan.modules[0].tables.push(plan::TableSummary {
+            version: (2, 40),
+            entries: 68,
+            source,
+        });
+        record_object_skips(&mut plan, std::slice::from_ref(&refusal));
+        record_object_skips(&mut plan, &[]);
+        assert_eq!(
+            plan.skipped,
+            [refusal.clone()],
+            "later {source} erased acquisition loss"
+        );
+        let public = render::capture_skipped_out(&plan.skipped[0]);
+        assert_eq!(
+            serde_json::to_value(public).unwrap(),
+            serde_json::json!({"name":"discovery subject","reason":"discovery unavailable"})
+        );
+    }
+}
+
 #[test]
 fn an_object_the_scan_could_not_read_is_published_not_only_printed() {
     let (modules, _) = pinned_self();
-    // The same objects, pinned under a cap they cannot fit: every one is
-    // skipped, exactly as a memfd, a deleted file or an unreadable mapping
-    // would be — without needing one.
+    // Refuse before the first mount-table read while leaving the per-object
+    // allowance generous: this specifically exercises capture-wide admission.
     let tiny = ScanLimits {
-        per_object_bytes: 1024,
-        total_bytes: 1024,
+        per_object_bytes: ScanLimits::default().per_object_bytes,
+        total_bytes: 0,
     };
     let (mut pinned, skips) = pin_scanned_objects(
         std::process::id(),
@@ -13054,7 +14421,14 @@ fn an_object_the_scan_could_not_read_is_published_not_only_printed() {
     )
     .unwrap();
     assert_eq!(pinned.pinned().count(), 0, "nothing could be pinned");
-    assert!(!skips.is_empty(), "the scan reported the loss");
+    let expected = Skipped {
+        subject: modules[0].path.clone(),
+        reason: format!(
+            "cannot read pid {}'s mount table: {IO_CEILING_REASON}",
+            std::process::id()
+        ),
+    };
+    assert_eq!(skips, [expected.clone()], "the scan reports the exact loss");
 
     let (reconciled, _, _) = reconcile_scanned_modules(&modules, &mut pinned);
     let mut plan = plan::build_from_reconciled_modules(&reconciled);
@@ -13065,11 +14439,9 @@ fn an_object_the_scan_could_not_read_is_published_not_only_printed() {
     );
 
     record_object_skips(&mut plan, &skips);
-    assert_eq!(plan.skipped.len(), skips.len(), "{:?}", plan.skipped);
-    assert!(
-        plan.skipped.iter().any(|s| s.reason.contains("too_large")),
-        "{:?}",
-        plan.skipped
+    assert_eq!(
+        plan.skipped, skips,
+        "the actual skip is transferred exactly"
     );
 
     // A cgroup scans many processes mapping the same provider; one loss is
@@ -13087,8 +14459,7 @@ fn an_object_the_scan_could_not_read_is_published_not_only_printed() {
         .collect();
     let mut plan = plan::build_from_reconciled_modules(&reconciled);
     record_object_skips(&mut plan, &mixed);
-    assert_eq!(plan.skipped.len(), skips.len() + 1, "{:?}", plan.skipped);
-    assert!(plan.skipped.contains(&other), "{:?}", plan.skipped);
+    assert_eq!(plan.skipped, [expected, other]);
 }
 
 fn plan_with(slots: usize, refused: usize) -> plan::AttachPlan {
@@ -13412,6 +14783,7 @@ fn scan_view_does_not_choose_the_first_byte_identical_ordinary_file() {
                 inode: key.inode,
             },
             path: path.display().to_string(),
+            decoder_abi: None,
             exports: vec![],
             tables: vec![],
             interfaces: vec![],
@@ -13489,6 +14861,7 @@ fn byte_identical_distinct_entry_objects_conflict_and_attach_the_union() {
         mount_namespace: current_mount_namespace(),
         key: key(module_mapping),
         path: module_path.display().to_string(),
+        decoder_abi: Some(ElfAbi::Lp64),
         exports: vec!["C_GetFunctionList".into()],
         tables: vec![ScannedTable {
             version: (2, 40),
@@ -13657,6 +15030,7 @@ fn retargeting_only_adopts_the_matched_scanned_object() {
             inode: 7,
         },
         path: "/opt/decoy.so".into(),
+        decoder_abi: None,
         exports: vec![],
         tables: vec![],
         interfaces: vec![],

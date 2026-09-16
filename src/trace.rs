@@ -324,6 +324,26 @@ impl Tracer {
         self.on_event_process(ev, ProcessKey::from_pid(pid_tid(ev.pid_tgid).0), state)
     }
 
+    pub(crate) fn on_rejected_history(&mut self, ev: &Event) -> String {
+        let mut raw = *ev;
+        raw.capture = 0;
+        let wall = self.wall_ns_for(ev.ts_ns);
+        format_line(&raw, wall, &self.qualified_function(ev.slot), None)
+    }
+
+    fn qualified_function(&self, index: u32) -> String {
+        let mut function = function_name(&self.slots, index);
+        if self
+            .slots
+            .get(index as usize)
+            .and_then(Option::as_ref)
+            .is_some_and(|slot| !slot.semantic_authorized)
+        {
+            function.push_str(" [semantics unverified]");
+        }
+        function
+    }
+
     pub fn on_event_process(
         &mut self,
         ev: &Event,
@@ -348,10 +368,7 @@ impl Tracer {
                 .flatten()
         });
         let wall_ns = self.wall_ns_for(ev.ts_ns);
-        let mut function = function_name(&self.slots, ev.slot);
-        if slot.as_ref().is_some_and(|slot| !slot.semantic_authorized) {
-            function.push_str(" [semantics unverified]");
-        }
+        let function = self.qualified_function(ev.slot);
         let mut rendered = *ev;
         if !semantic {
             rendered.capture = 0;
@@ -545,6 +562,7 @@ mod tests {
             unmatched_returns: 0,
             rv_update_failures: 0,
             cgroup_scope_failures: 0,
+            abi_refusals: 0,
             semantic_capture_failures: 0,
             unregistered_mechanisms: 0,
             template_tail_failures: 0,
@@ -562,6 +580,7 @@ mod tests {
             async_evictions: 0,
             fork_state_ambiguities: 0,
             semantic_state_drops: 0,
+            semantic_history_drops: 0,
             pending_at_end: 0,
             malformed_records: 0,
             orphan_ops: 0,

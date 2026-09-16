@@ -1,0 +1,91 @@
+#!/bin/sh
+set -eu
+. @DEFINITIONS@
+cd @REPO@
+umask 077
+ROOT=@ROOT@
+SCENARIO=@SCENARIO@
+LANE=@LANE@
+mkdir -m 700 "$ROOT" "$ROOT/artifacts" "$ROOT/work"
+FACTS=$ROOT/facts.log
+: > "$FACTS"; : > "$ROOT/stdout.log"; : > "$ROOT/stderr.log"
+printf '{}\n' > "$ROOT/artifacts/capture.json"
+printf '{}\n' > "$ROOT/artifacts/observed.json"
+printf 'checked\n' > "$ROOT/artifacts/checker.log"
+printf 'child\n' > "$ROOT/artifacts/child.facts"
+ROOT_ID=$(stat -Lc %d:%i "$ROOT")
+ARTIFACTS_ID=$(stat -Lc %d:%i "$ROOT/artifacts")
+WORK_ID=$(stat -Lc %d:%i "$ROOT/work")
+HEAD_ID=$(git rev-parse HEAD)
+TREE_ID=$(git rev-parse 'HEAD^{tree}')
+. scripts/prepared-dependency-tools.sh
+p11scope_prepared_tools_select "$(command -v python3)" "$(command -v rustup)"
+PREPARED_PREFIX=$ROOT/artifacts/lane16.prepared
+PREPARED_ADMITTED=0
+DRIVER_HASH=$(sha256sum scripts/verify-task4-lane16.sh); DRIVER_HASH=${DRIVER_HASH%% *}
+HAMMER_SOURCE_HASH=$(sha256sum scripts/fixtures/hammer.c); HAMMER_SOURCE_HASH=${HAMMER_SOURCE_HASH%% *}
+CHECKER_SOURCE_HASH=$(sha256sum scripts/check-capture-evidence.py); CHECKER_SOURCE_HASH=${CHECKER_SOURCE_HASH%% *}
+if [ "$LANE" = release ]; then
+    TASK4_ROOT=$ROOT; TASK4_FACTS=$FACTS; TASK4_ROOT_ID=$ROOT_ID
+    TASK4_ARTIFACTS_ID=$ARTIFACTS_ID; TASK4_WORK_ID=$WORK_ID
+    TASK4_HEAD=$HEAD_ID; TASK4_TREE=$TREE_ID
+    TASK4_PREPARED_PREFIX=$ROOT/artifacts/release.prepared
+    TASK4_PREPARED_ADMITTED=0
+    P11SCOPE_TASK4_CALLER_PATH=$PATH
+    P11SCOPE_TASK4_SEALED_BIN=@SEALED_BIN@
+    mkdir -m 700 "$P11SCOPE_TASK4_SEALED_BIN"
+    for tool in $TASK4_TOOL_INVENTORY; do
+        selected=$(realpath -e "$(command -v "$tool")")
+        ln -s "$selected" "$P11SCOPE_TASK4_SEALED_BIN/$tool"
+        case $tool in *-*) ;; *) eval "T4_TOOL_$tool=\$selected" ;; esac
+    done
+    PATH=$P11SCOPE_TASK4_SEALED_BIN
+    T4_TOOLCHAIN_CARGO=$P11SCOPE_PREPARED_STABLE_CARGO
+    T4_TOOLCHAIN_RUSTC=$P11SCOPE_PREPARED_STABLE_RUSTC
+    TASK4_DRIVER_HASH=$(task4_digest scripts/build-release.sh)
+    TASK4_CHECKER_HASH=$(task4_digest scripts/check-capture-evidence.py)
+    exec 8< "$ROOT/artifacts/child.facts"
+    TASK4_CHILD_FACTS_ID=$(stat -Lc %d:%i /proc/$$/fd/8)
+    TASK4_CHILD_FACTS_HASH=$(task4_digest /proc/$$/fd/8)
+    TASK4_TOOLS=
+    PREPARED_PREFIX=$TASK4_PREPARED_PREFIX
+fi
+if [ "$SCENARIO" != admission ]; then
+    "$P11SCOPE_PREPARED_PYTHON" -I scripts/prepared-dependency-evidence.py capture \
+        --prefix "$PREPARED_PREFIX" \
+        --stable-cargo "$P11SCOPE_PREPARED_STABLE_CARGO" --stable-rustc "$P11SCOPE_PREPARED_STABLE_RUSTC" \
+        --bpf-cargo "$P11SCOPE_PREPARED_BPF_CARGO" --bpf-rustc "$P11SCOPE_PREPARED_BPF_RUSTC"
+    if [ "$LANE" = release ]; then
+        unset P11SCOPE_PREPARED_PYTHON P11SCOPE_PREPARED_RUSTUP \
+            P11SCOPE_PREPARED_STABLE_CARGO P11SCOPE_PREPARED_STABLE_RUSTC \
+            P11SCOPE_PREPARED_BPF_CARGO P11SCOPE_PREPARED_BPF_RUSTC
+    fi
+    PREPARED_ADMITTED=1
+    if [ "$LANE" = release ]; then
+        TASK4_PREPARED_ADMITTED=1
+        task4_tool_ledger > "$ROOT/artifacts/tools.initial.tsv"
+        TASK4_TOOLS=$(cat "$ROOT/artifacts/tools.initial.tsv")
+        task4_snapshot initial > "$ROOT/artifacts/source.start.tsv"
+    else
+        source_snapshot initial > "$ROOT/artifacts/source.start.tsv"
+    fi
+fi
+release_body_cleanup() {
+    printf 'cleanup\n' > "$ROOT/artifacts/cleanup.marker"
+    [ "$SCENARIO" != cleanup ]
+}
+if [ "$LANE" = lane16 ]; then
+    find() {
+        if [ "$SCENARIO" = cleanup ] && [ "$1" = "$ROOT" ]; then return 37; fi
+        @FIND@ "$@"
+    }
+fi
+if [ "$LANE" = release ]; then
+    trap task4_finalize EXIT INT TERM HUP
+else
+    printf 'owned run returned\n' > "$ROOT/artifacts/cleanup.marker"
+    trap finalize EXIT INT TERM HUP
+fi
+@PYTHON@ -I @MUTATOR@ "$SCENARIO" @CONFIG@ @PREPARED_SOURCE@ @REPO@
+if [ "$SCENARIO" = admission ] || [ "$SCENARIO" = admitted77 ]; then exit 77; fi
+exit 0

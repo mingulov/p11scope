@@ -15,6 +15,7 @@ fn absolute_provider_path_preserves_origin_and_records_the_executable_closure() 
 
     assert!(
         Command::new("gcc")
+            .arg(format!("-m{}", usize::BITS))
             .args(["-shared", "-fPIC", "-Wl,-soname,lazy-backend.so", "-o"])
             .arg(&backend)
             .arg(source.join("lazy_backend.c"))
@@ -24,6 +25,7 @@ fn absolute_provider_path_preserves_origin_and_records_the_executable_closure() 
     );
     assert!(
         Command::new("gcc")
+            .arg(format!("-m{}", usize::BITS))
             .args(["-shared", "-fPIC", "-o"])
             .arg(&wrapper)
             .arg(source.join("lazy_wrapper.c"))

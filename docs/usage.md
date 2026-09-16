@@ -5,12 +5,12 @@ how to run it, and what its output actually proves. Measured examples below
 name the script that produced them so they can be reproduced; fixed
 implementation limits are code contracts, not measurements.
 
-> **Status: unreleased; the current tree is a W3 engineering candidate.**
+> **Status: unreleased; the current candidate is undergoing release qualification.**
 > Memory-scan discovery, `C_GetInterface`, `inspect`, `doctor`, public `run`,
 > multi-module capture, schema v3, and owned-child live discovery are
 > implemented. The frozen pre-W3 candidate at `ae8494d` passed all six
 > semantic/privacy/cleanup rows on Ubuntu 22.04 kernel 5.15 and Ubuntu 24.04
-> kernel 6.8. Those historical results do not qualify the W3 tip. Fresh
+> kernel 6.8. Those historical results do not qualify the current candidate. Fresh
 > exact-tip runtime qualification, CI, complete packaging, publication, and
 > release remain pending.
 > See the
@@ -112,12 +112,18 @@ p11-kit's fixed closure array exceeds the 512-slot ceiling and is refused
 whole, while the later-fitting SoftHSM2 backend attaches; the report is
 explicitly `PARTIAL`, not a claim that the proxy layer was captured.
 
+The commands below begin with **passive diagnostics**. Without an accepted
+manifest, scanned function slots are count-only: use their aggregate counts,
+return values and latency. Missing mechanism or session evidence does not mean
+the application used none. For those semantics, use the separate
+[attested capture workflow](#attested-semantic-capture).
+
 ```bash
 # 1. What can this host do, and what does the target map?
 p11scope doctor --pid 12345
 p11scope inspect --pid 12345
 
-# 2. Attach and aggregate — no manifest, no helper, no provider code executed.
+# 2. Count-only diagnostics — no helper or observer-initiated provider calls.
 sudo p11scope profile --pid 12345 --duration 60 -o observed-profile.json
 
 # 3. Or stream one line per call.
@@ -138,7 +144,11 @@ sudo p11scope run --module /opt/vendor/lib/pkcs11.so \
 > and `SOFTHSM2_CONF`, and does not inherit unrelated file descriptors. The
 > command is an opened ELF executable; invoke scripts explicitly as
 > `/bin/sh /path/to/script`, and use `/usr/bin/env NAME=value command` after
-> `--` for other application variables. The sudo path currently clears
+> `--` for other application variables. Owned launch requires procfs mounted
+> at `/proc`: the opened executable is invoked through `/proc/self/fd` so a
+> later path replacement cannot change the selected inode. If that descriptor
+> path is unavailable, `run` reports the exec failure and refuses to retry the
+> command's original path. The sudo path currently clears
 > supplementary groups; use `profile`/`trace` against an already-running
 > workload when the application needs an HSM/device group. When the observer
 > binary instead carries file capabilities (`setcap
@@ -175,13 +185,50 @@ The induced-gaps gate (`scripts/verify-induced-gaps.sh`, gap 3/3b) proves both
 directions: the small-ring build and the default build with `--ring-bytes 4K`
 produce the same disclosed event-loss evidence with exact counts.
 
+### Attested semantic capture
+
+This is an explicit trust decision about the provider's function names and
+offsets. Use a helper that can load the exact provider: a 32-bit provider
+requires a 32-bit helper, and its loader/libc must be compatible. The observer
+remains x86-64. Final release artifact/helper combinations are still undergoing
+qualification; a source-build result alone is not a packaged compatibility
+guarantee.
+
+```bash
+# Run as an ordinary user. This helper loads and executes provider code.
+p11scope-discover --module /opt/vendor/lib/pkcs11.so -o provider-manifest.json
+```
+
+Review the generated manifest against the provider you intend to observe.
+Continue only when you accept its exact object, canonical function names and
+offset claims; automatic discovery output is not independent attestation.
+Then supply that manifest explicitly:
+
+```bash
+sudo p11scope profile --pid 12345 --module /opt/vendor/lib/pkcs11.so \
+  --manifest provider-manifest.json --duration 60 -o observed-profile.json
+```
+
+The observer still applies object/table/provenance checks. An incompatible,
+stale or ambiguous claim is not permission to guess semantics; inspect the
+reported discovery evidence rather than treating a successful command exit
+as semantic acceptance. A manifest does not recover calls before attachment.
+
+With accepted semantics, the default `allowlisted` profile can report admitted
+mechanism IDs and lifecycle evidence. **Every emitted mechanism has
+`params: null`, and `templates.operations` is always empty under this policy.**
+Those omissions are deliberate policy limits, not evidence that the application
+used no parameters or templates. Candidate-provider testing and observed
+application coverage remain separate evidence; neither certifies migration
+compatibility for unobserved calls or undecoded parameters.
+
 ### Discovery timing and optional offline discovery
 
 The memory scan builds the initial attach plan. For an owned command,
 `p11scope run` starts capture before releasing the child and can acquire a
 provider loaded later. The frozen pre-W3 candidate at `ae8494d` passed the
 local six-row campaign on kernels 5.15 and 6.8; that campaign has not been
-repeated on the W3 tip. For an already running external process, a provider
+repeated on the current candidate. For an already running external process, a provider
 loaded before attachment can still be
 missed. If a suitable manifest was prepared while the same provider identity
 was available, pass it
@@ -250,9 +297,12 @@ Both `profile` and `trace` require either `--pid` or `--cgroup`; `--module` and
 `--manifest` are repeatable optional discovery inputs. `--cgroup` matches that
 cgroup and every descendant beneath it
 (kernel ≥5.15 due to attach cookies), so pointing it at a container's or pod's
-directory reaches the workload's actual nested cgroup. `--duration` (bare seconds or `30s`/`5m`/`1h`) bounds
-either subcommand; Ctrl-C or SIGTERM also ends a capture cleanly (final frame
-printed, `-o` file written) instead of aborting it — unless the observer is
+directory reaches the workload's actual nested cgroup. `--duration` (bare
+seconds or `30s`/`5m`/`1h`) requests shutdown after the given interval. Probe
+teardown and final reporting follow; with many attached functions, this can
+add seconds, and calls may still be observed while probes are being detached.
+Ctrl-C or SIGTERM also ends a capture cleanly (final frame printed, `-o` file
+written) instead of aborting it — unless the observer is
 wedged holding a paused child (observed once 2026-09-15 with `--pause auto`
 over an NSS dependency cascade: SIGTERM ignored, SIGKILL required; see the
 provider-qual note's gaps section). Prefer `--pause never` with `LD_PRELOAD` for
@@ -579,7 +629,7 @@ pinned object, offset, and canonical function name it attests; stale fallback,
 hash agreement, path identity, and raw `{dev,ino}` never transfer that
 attestation. The owned-child `run` path and capture-history corrections in the
 frozen pre-W3 candidate at `ae8494d` passed the local 5.15/6.8 semantic
-campaign. Those results have not been repeated on the W3 tip. Exact-tip
+campaign. Those results have not been repeated on the current candidate. Exact-tip
 runtime qualification, CI, complete packaging, publication, and release
 remain pending.
 

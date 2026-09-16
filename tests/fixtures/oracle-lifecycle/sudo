@@ -1,0 +1,4 @@
+#!/bin/sh
+[ "$1" = -n ] || exit 2
+shift
+exec "$@"

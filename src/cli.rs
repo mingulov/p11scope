@@ -98,6 +98,7 @@ pub struct DoctorArgs {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
+    Version,
     Profile(CaptureArgs),
     Trace(CaptureArgs),
     Run(RunArgs),
@@ -112,6 +113,7 @@ pub enum CliError {
 }
 
 pub const USAGE: &str = "usage:
+  p11scope --version
   p11scope profile [--pid <n> | --cgroup <path>] [--module <provider.so>]... [--manifest <m.json>]...
                    [--mode profile|metrics] [--duration <30|30s|5m|1h>] [-o <out.json>]
                    [--hook-symbol <NAME[:functionlist|interfacelist|interface]>]...
@@ -291,6 +293,10 @@ fn capture_option(
 /// no process exit; the caller decides how to report `CliError`.
 pub fn parse(mut argv: impl Iterator<Item = String>) -> Result<Command, CliError> {
     match argv.next().as_deref() {
+        Some("--version" | "-V") => match argv.next() {
+            None => Ok(Command::Version),
+            Some(_) => Err(usage_err("--version takes no arguments")),
+        },
         Some("profile") => Ok(Command::Profile(parse_capture(Kind::Profile, argv)?)),
         Some("trace") => Ok(Command::Trace(parse_capture(Kind::Trace, argv)?)),
         Some("run") => Ok(Command::Run(parse_run(argv)?)),

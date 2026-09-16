@@ -8,48 +8,45 @@
 #![allow(internal_features)]
 
 use aya_ebpf::bindings::BPF_F_RDONLY_PROG;
-use aya_ebpf::macros::{map, tracepoint, uprobe, uretprobe};
-use aya_ebpf::maps::ring_buf::RingBufEntry;
+use aya_ebpf::macros::{map, raw_tracepoint, uprobe, uretprobe};
 use aya_ebpf::maps::ProgramArray;
+use aya_ebpf::maps::ring_buf::RingBufEntry;
 use aya_ebpf::maps::{Array, CgroupArray, HashMap, PerCpuArray, PerCpuHashMap, RingBuf};
-use aya_ebpf::programs::{ProbeContext, RetProbeContext, TracePointContext};
-use aya_ebpf::{helpers, EbpfContext as _};
+use aya_ebpf::programs::{ProbeContext, RawTracePointContext, RetProbeContext};
+use aya_ebpf::{EbpfContext as _, helpers};
 use core::mem::MaybeUninit;
 use p11scope_ebpf_common::{
-    bucket_of, capture, cookie_descriptor, cookie_slot, discovery_pause_coalesced,
-    decode_export_attach_cookie, discovery_pause_enabled, discovery_state_take_failed,
-    discovery_state_take_scope_lost, classify_task_newtask, discovery_table_slots,
-    discovery_usable_prefix, event_type, interface_continuation_next,
-    interface_continuation_pack, interface_continuation_unpack, lifecycle,
-    return_allows_mechanism, shape, valid_config, valid_loader_cookie, CallStart, DiscoveryRecord,
-    Event, FunctionNameKey, PauseKey, RvKey, SlotSemantics, SlotStats, StartKey, StartState,
-    StateKey, STATE_DOMAIN_EXPORT, STATE_DOMAIN_SELECTION, ARG_NONE, CFG_FLAGS,
-    CFG_TASK_NEWTASK_OFFSETS,
-    COALESCED_NO_HELPER_RC, DISCOVERY_BYTES,
-    DISCOVERY_COUNTER_CELLS,
-    DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES, DISCOVERY_COUNTER_EXPORT_STATE_FAILURES,
-    DISCOVERY_COUNTER_LOADER_HITS, DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES,
-    DISCOVERY_COUNTER_RING_LOSS, DISCOVERY_KIND_EXEC, DISCOVERY_KIND_FUNCTION_LIST_RETURN,
+    ARG_NONE, CFG_FLAGS, COALESCED_NO_HELPER_RC, CallStart, DISCOVERY_BYTES,
+    DISCOVERY_COUNTER_CELLS, DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES,
+    DISCOVERY_COUNTER_EXPORT_STATE_FAILURES, DISCOVERY_COUNTER_LOADER_HITS,
+    DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES, DISCOVERY_COUNTER_RING_LOSS,
+    DISCOVERY_INTERFACES, DISCOVERY_KIND_EXEC, DISCOVERY_KIND_FUNCTION_LIST_RETURN,
     DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN, DISCOVERY_KIND_INTERFACE_RETURN,
-    DISCOVERY_INTERFACES,
     DISCOVERY_KIND_LEADER_EXIT, DISCOVERY_KIND_LOADER, DISCOVERY_NAME_EXACT_STANDARD,
     DISCOVERY_NAME_NA, DISCOVERY_NAME_NULL, DISCOVERY_NAME_OTHER, DISCOVERY_NAME_UNREADABLE,
-    DISCOVERY_VERSION_NULL, DISCOVERY_VERSION_UNREADABLE, DISCOVERY_VERSION_V3_0,
-    DISCOVERY_VERSION_V3_1, DISCOVERY_VERSION_V3_2,
-    discovery_version_class,
     DISCOVERY_STATUS_COALESCED_NO_HELPER, DISCOVERY_STATUS_LOADER_CONTEXT_INVALID,
-    DISCOVERY_STATUS_READ_FAILURE, EVIDENCE_CELLS, EVIDENCE_CGROUP_SCOPE_FAILURES,
-    EVIDENCE_RING_LOSS, EVIDENCE_RV_UPDATE_FAILURES, EVIDENCE_SEMANTIC_CAPTURE_FAILURES,
+    DISCOVERY_STATUS_READ_FAILURE, DISCOVERY_VERSION_NULL, DISCOVERY_VERSION_UNREADABLE,
+    DISCOVERY_VERSION_V3_0, DISCOVERY_VERSION_V3_1, DISCOVERY_VERSION_V3_2, DiscoveryRecord,
+    EVIDENCE_ABI_REFUSALS, EVIDENCE_CELLS, EVIDENCE_CGROUP_SCOPE_FAILURES, EVIDENCE_RING_LOSS,
+    EVIDENCE_RV_UPDATE_FAILURES, EVIDENCE_SEMANTIC_CAPTURE_FAILURES,
     EVIDENCE_START_INSERT_FAILURES, EVIDENCE_UNMATCHED_RETURNS, EVIDENCE_UNREGISTERED_MECHANISMS,
-    FLAG_CGROUP_FILTER, FLAG_PID_FILTER, FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED,
-    FUNCTION_NAME_MAX_BYTES, FUNCTION_NONE, LOADER_STATE_PRESENT, MAX_ATTRS, MAX_DESCRIPTORS,
-    MAX_MECH_SHAPES, MAX_SLOTS, MECH_NONE, PAUSE_ARMED, PAUSE_REQUESTED, RING_BYTES, RV_ENTRIES,
-    R_STATE_OFFSET, SESSION_NONE, START_ENTRIES, TAIL_CALLS_INTERFACE_WORKER_SLOT,
-    USER_TYPE_NONE, unpack_task_newtask_offsets,
+    Event, FLAG_CGROUP_FILTER, FLAG_PID_FILTER, FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED,
+    FUNCTION_NAME_MAX_BYTES, FUNCTION_NONE, FunctionNameKey, ImageIdentity, LOADER_STATE_PRESENT,
+    LinuxLayout, MAX_DESCRIPTORS, MAX_MECH_SHAPES, MAX_SLOTS, MECH_NONE, PAUSE_ARMED,
+    PAUSE_REQUESTED, PauseKey, RING_BYTES, RV_ENTRIES, RvKey, SESSION_NONE, START_ENTRIES,
+    STATE_DOMAIN_EXPORT, STATE_DOMAIN_SELECTION, SlotSemantics, SlotStats, StartKey, StartState,
+    StateKey, TAIL_CALLS_INTERFACE_WORKER_SLOT, USER_TYPE_NONE, bucket_of, capture,
+    classify_task_newtask, cookie_descriptor, cookie_slot, decode_export_attach_cookie,
+    discovery_pause_coalesced, discovery_pause_enabled, discovery_state_take_failed,
+    discovery_state_take_scope_lost, discovery_table_slots, discovery_usable_prefix,
+    discovery_version_class, event_type, image_pair_matches, interface_continuation_next,
+    interface_continuation_pack, interface_continuation_unpack, lifecycle, normalize_target_word,
+    read_ia32_arg_with, return_allows_mechanism, shape, target_layout_from_cs,
+    target_stack_arg_address, target_word_end, valid_config, valid_loader_cookie,
 };
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 use p11scope_ebpf_common::{
-    EVIDENCE_TEMPLATE_TAIL_FAILURES, FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA,
+    EVIDENCE_TEMPLATE_TAIL_FAILURES, FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA, MAX_ATTRS,
     TAIL_CALLS_TEMPLATE_SECOND_SLOT,
 };
 
@@ -125,6 +122,109 @@ fn bump_evidence(index: u32) {
     }
 }
 
+#[inline(always)]
+fn probe_layout(ctx: &ProbeContext) -> Option<LinuxLayout> {
+    target_layout_from_cs(unsafe { (*ctx.regs).cs as u64 })
+}
+
+#[inline(always)]
+fn ret_probe_layout(ctx: &RetProbeContext) -> Option<LinuxLayout> {
+    target_layout_from_cs(unsafe { (*ctx.regs).cs as u64 })
+}
+
+#[inline(always)]
+fn read_word(address: u64, layout: LinuxLayout) -> Result<u64, ()> {
+    target_word_end(address, layout).ok_or(())?;
+    match layout {
+        LinuxLayout::Lp64 => {
+            unsafe { helpers::bpf_probe_read_user(address as *const u64) }.map_err(|_| ())
+        }
+        LinuxLayout::Ilp32 => unsafe { helpers::bpf_probe_read_user(address as *const u32) }
+            .map(u64::from)
+            .map_err(|_| ()),
+    }
+}
+
+#[inline(always)]
+fn read_interface(address: u64, layout: LinuxLayout) -> Result<[u64; 3], ()> {
+    let last = address
+        .checked_add(layout.word_bytes() as u64 * 2)
+        .ok_or(())?;
+    target_word_end(last, layout).ok_or(())?;
+    match layout {
+        LinuxLayout::Lp64 => {
+            unsafe { helpers::bpf_probe_read_user(address as *const [u64; 3]) }.map_err(|_| ())
+        }
+        LinuxLayout::Ilp32 => unsafe { helpers::bpf_probe_read_user(address as *const [u32; 3]) }
+            .map(|words| words.map(u64::from))
+            .map_err(|_| ()),
+    }
+}
+
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+#[inline(always)]
+fn read_word_pair(address: u64, layout: LinuxLayout) -> Result<[u64; 2], ()> {
+    let second = address.checked_add(layout.word_bytes() as u64).ok_or(())?;
+    target_word_end(second, layout).ok_or(())?;
+    match layout {
+        LinuxLayout::Lp64 => {
+            unsafe { helpers::bpf_probe_read_user(address as *const [u64; 2]) }.map_err(|_| ())
+        }
+        LinuxLayout::Ilp32 => unsafe { helpers::bpf_probe_read_user(address as *const [u32; 2]) }
+            .map(|words| words.map(u64::from))
+            .map_err(|_| ()),
+    }
+}
+
+const _: [(); 288] = [(); core::mem::size_of::<CallStart>()];
+
+#[inline(always)]
+fn zero_call_start(start: &mut MaybeUninit<CallStart>) {
+    let words = start.as_mut_ptr().cast::<u64>();
+    // Keep this straight-line, as with DiscoveryRecord: LLVM otherwise lowers
+    // the full initialization to verifier-hostile memset/memcpy backtracking.
+    unsafe {
+        // CALL_START_INITIALIZER_BEGIN
+        core::ptr::write_volatile(words.add(0), 0u64);
+        core::ptr::write_volatile(words.add(1), 0u64);
+        core::ptr::write_volatile(words.add(2), 0u64);
+        core::ptr::write_volatile(words.add(3), 0u64);
+        core::ptr::write_volatile(words.add(4), 0u64);
+        core::ptr::write_volatile(words.add(5), 0u64);
+        core::ptr::write_volatile(words.add(6), 0u64);
+        core::ptr::write_volatile(words.add(7), 0u64);
+        core::ptr::write_volatile(words.add(8), 0u64);
+        core::ptr::write_volatile(words.add(9), 0u64);
+        core::ptr::write_volatile(words.add(10), 0u64);
+        core::ptr::write_volatile(words.add(11), 0u64);
+        core::ptr::write_volatile(words.add(12), 0u64);
+        core::ptr::write_volatile(words.add(13), 0u64);
+        core::ptr::write_volatile(words.add(14), 0u64);
+        core::ptr::write_volatile(words.add(15), 0u64);
+        core::ptr::write_volatile(words.add(16), 0u64);
+        core::ptr::write_volatile(words.add(17), 0u64);
+        core::ptr::write_volatile(words.add(18), 0u64);
+        core::ptr::write_volatile(words.add(19), 0u64);
+        core::ptr::write_volatile(words.add(20), 0u64);
+        core::ptr::write_volatile(words.add(21), 0u64);
+        core::ptr::write_volatile(words.add(22), 0u64);
+        core::ptr::write_volatile(words.add(23), 0u64);
+        core::ptr::write_volatile(words.add(24), 0u64);
+        core::ptr::write_volatile(words.add(25), 0u64);
+        core::ptr::write_volatile(words.add(26), 0u64);
+        core::ptr::write_volatile(words.add(27), 0u64);
+        core::ptr::write_volatile(words.add(28), 0u64);
+        core::ptr::write_volatile(words.add(29), 0u64);
+        core::ptr::write_volatile(words.add(30), 0u64);
+        core::ptr::write_volatile(words.add(31), 0u64);
+        core::ptr::write_volatile(words.add(32), 0u64);
+        core::ptr::write_volatile(words.add(33), 0u64);
+        core::ptr::write_volatile(words.add(34), 0u64);
+        core::ptr::write_volatile(words.add(35), 0u64);
+        // CALL_START_INITIALIZER_END
+    }
+}
+
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct ScopeAuth {
@@ -141,6 +241,9 @@ const _: [(); 12] = [(); core::mem::offset_of!(ScopeAuth, _pad)];
 const _: [(); 16] = [(); core::mem::offset_of!(ScopeAuth, generation_token)];
 
 fn scope_auth() -> Option<ScopeAuth> {
+    if unsafe { p11_owner_healthy() } == 0 {
+        return None;
+    }
     let flags = CONFIG.get(CFG_FLAGS).copied().unwrap_or(0);
     if !valid_config(flags) {
         return None;
@@ -387,11 +490,8 @@ fn finish_discovery_record(
 }
 // TASK5_PAUSE_WRITER_END
 
-const EXPORT_SOURCE_FUNCTION_LIST: u8 = 1;
-
 struct ExportArgs {
     kind: u8,
-    source: u8,
     interface_index: u8,
     symbol_id: u32,
     announced_count: u32,
@@ -417,27 +517,40 @@ struct SelectionTransport {
     request_name_class: u8,
     request_version_class: u8,
     pause_eligible: bool,
-    _pad: [u8; 5],
+    word_bytes: u8,
+    _pad: [u8; 4],
 }
 
-// Three u64 (24) + three single bytes + five named pad bytes = 32, with no
+// Three u64 (24) + four single bytes + four named pad bytes = 32, with no
 // implicit padding left for a verifier to reject. Naming `_pad` in the
 // assertion is the point: deleting it, reordering the fields or dropping
 // `repr(C)` stops this compiling, instead of failing on somebody's 5.15
 // kernel. A size check alone would not -- implicit padding keeps the size at
 // 32 while leaving those bytes unwritten, which is exactly the bug.
-const _: () = assert!(core::mem::offset_of!(SelectionTransport, _pad) == 27);
+const _: () = assert!(core::mem::offset_of!(SelectionTransport, word_bytes) == 27);
+const _: () = assert!(core::mem::offset_of!(SelectionTransport, _pad) == 28);
 const _: () = assert!(core::mem::size_of::<SelectionTransport>() == 32);
 
-const NO_SELECTION: SelectionTransport = SelectionTransport {
-    _pad: [0; 5],
-    request_name_class: DISCOVERY_NAME_NA,
-    request_version_class: DISCOVERY_VERSION_NULL,
-    request_flags: 0,
-    binding_id: 0,
-    return_rv: 0,
-    pause_eligible: true,
-};
+fn no_selection(layout: LinuxLayout) -> SelectionTransport {
+    SelectionTransport {
+        _pad: [0; 4],
+        request_name_class: DISCOVERY_NAME_NA,
+        request_version_class: DISCOVERY_VERSION_NULL,
+        request_flags: 0,
+        binding_id: 0,
+        return_rv: 0,
+        pause_eligible: true,
+        word_bytes: layout.word_bytes() as u8,
+    }
+}
+
+fn selection_layout(selection: &SelectionTransport) -> Option<LinuxLayout> {
+    match selection.word_bytes {
+        4 => Some(LinuxLayout::Ilp32),
+        8 => Some(LinuxLayout::Lp64),
+        _ => None,
+    }
+}
 
 struct ExportPayload {
     record_meta: u64,
@@ -455,6 +568,10 @@ fn classify_direct_interface(
     scope: &ScopeAuth,
     selection: &SelectionTransport,
 ) {
+    let Some(layout) = selection_layout(selection) else {
+        bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES);
+        return;
+    };
     let mut read_failed = false;
     let mut interface_unreadable = false;
     let mut table_ptr = 0u64;
@@ -466,7 +583,7 @@ fn classify_direct_interface(
         read_failed = true;
         interface_unreadable = true;
     } else {
-        match unsafe { helpers::bpf_probe_read_user(address as *const [u64; 3]) } {
+        match read_interface(address, layout) {
             Ok([name, table, flags]) => {
                 table_ptr = table;
                 interface_flags = flags;
@@ -523,11 +640,15 @@ fn classify_indirect_interface(
     scope: &ScopeAuth,
     selection: &SelectionTransport,
 ) {
+    let Some(layout) = selection_layout(selection) else {
+        bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES);
+        return;
+    };
     let interface_address = if pp_interface == 0 {
         0
     } else {
         let address = pp_interface;
-        match unsafe { helpers::bpf_probe_read_user(address as *const u64) } {
+        match read_word(address, layout) {
             Ok(pointer) => pointer,
             Err(_) => 0,
         }
@@ -543,6 +664,10 @@ fn classify_indirect_interface(
 
 #[inline(never)]
 fn emit_export(payload: &ExportPayload, scope: &ScopeAuth) {
+    let Some(layout) = selection_layout(&payload.selection) else {
+        bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES);
+        return;
+    };
     let Some(mut entry) = reserve_discovery() else {
         return;
     };
@@ -554,8 +679,7 @@ fn emit_export(payload: &ExportPayload, scope: &ScopeAuth) {
     let interface_unreadable = (payload.record_meta >> 25) & 1 != 0;
     let symbol_id = (payload.record_meta >> 32) as u32;
     let selection = payload.selection;
-    let read_table =
-        name_class == DISCOVERY_NAME_NA || name_class == DISCOVERY_NAME_EXACT_STANDARD;
+    let read_table = name_class == DISCOVERY_NAME_NA || name_class == DISCOVERY_NAME_EXACT_STANDARD;
     let mut version_major = 0u8;
     let mut version_minor = 0u8;
     let mut selection_version_class = DISCOVERY_VERSION_NULL;
@@ -613,13 +737,13 @@ fn emit_export(payload: &ExportPayload, scope: &ScopeAuth) {
         attempted += 1;
         let Some(address) = payload
             .table_ptr
-            .checked_add(8)
-            .and_then(|base| base.checked_add(pointer_index as u64 * 8))
+            .checked_add(layout.word_bytes() as u64)
+            .and_then(|base| base.checked_add(pointer_index as u64 * layout.word_bytes() as u64))
         else {
             read_failed = true;
             break;
         };
-        match unsafe { helpers::bpf_probe_read_user(address as *const u64) } {
+        match read_word(address, layout) {
             Ok(pointer) => {
                 // SAFETY: pointer_index is statically bounded below
                 // DISCOVERY_POINTERS and the record is initialized.
@@ -713,43 +837,27 @@ fn emit_export(payload: &ExportPayload, scope: &ScopeAuth) {
 }
 
 #[inline(always)]
-fn classify_export(args: &ExportArgs, scope: &ScopeAuth) {
-    let record_meta = args.kind as u64
-        | ((args.interface_index as u64) << 8)
-        | ((args.symbol_id as u64) << 32);
-    if args.source == EXPORT_SOURCE_FUNCTION_LIST {
-        let mut read_failed = false;
-        let table_ptr = match unsafe { helpers::bpf_probe_read_user(args.address as *const u64) } {
-            Ok(pointer) if pointer != 0 => pointer,
-            _ => {
-                read_failed = true;
-                0
-            }
-        };
-        emit_export(
-            &ExportPayload {
-                record_meta: record_meta | ((read_failed as u64) << 24),
-                announced_count: args.announced_count,
-                table_ptr,
-                interface_flags: 0,
-                selection: NO_SELECTION,
-            },
-            scope,
-        );
-    } else {
-        let interface_address = match unsafe { helpers::bpf_probe_read_user(args.address as *const u64) }
-        {
-            Ok(pointer) => pointer,
-            Err(_) => 0,
-        };
-        classify_direct_interface(
-            record_meta,
-            args.announced_count,
-            interface_address,
-            scope,
-            &NO_SELECTION,
-        );
-    }
+fn classify_export(args: &ExportArgs, scope: &ScopeAuth, layout: LinuxLayout) {
+    let record_meta =
+        args.kind as u64 | ((args.interface_index as u64) << 8) | ((args.symbol_id as u64) << 32);
+    let mut read_failed = false;
+    let table_ptr = match read_word(args.address, layout) {
+        Ok(pointer) if pointer != 0 => pointer,
+        _ => {
+            read_failed = true;
+            0
+        }
+    };
+    emit_export(
+        &ExportPayload {
+            record_meta: record_meta | ((read_failed as u64) << 24),
+            announced_count: args.announced_count,
+            table_ptr,
+            interface_flags: 0,
+            selection: no_selection(layout),
+        },
+        scope,
+    );
 }
 
 fn export_symbol_id(cookie: u64) -> Option<u32> {
@@ -774,20 +882,16 @@ fn insert_export_state(ctx: &ProbeContext, state: StartState) {
     let Some(key) = export_state_key(ctx) else {
         return;
     };
-    if DISCOVERY_STATE
-        .insert(&key, &state, aya_ebpf::bindings::BPF_NOEXIST as u64)
-        .is_err()
-    {
-        let _ = DISCOVERY_STATE.remove(&key);
+    if owned_discovery_insert(&key, &state, aya_ebpf::bindings::BPF_NOEXIST as u64).is_err() {
         bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_STATE_FAILURES);
     }
 }
 
 fn take_export_state(ctx: &RetProbeContext, scoped: bool) -> Option<(StateKey, StartState)> {
     let key = export_state_key(ctx)?;
-    let state = unsafe { DISCOVERY_STATE.get(&key) }.copied();
+    let state = owned_discovery_get(&key, false).copied();
     let state_present = state.is_some();
-    let removed = DISCOVERY_STATE.remove(&key).is_ok();
+    let removed = owned_discovery_remove(&key, state_present).is_ok();
     if discovery_state_take_failed(state_present, removed) {
         if scoped {
             bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_STATE_FAILURES);
@@ -802,17 +906,17 @@ fn take_export_state(ctx: &RetProbeContext, scoped: bool) -> Option<(StateKey, S
 }
 
 fn discard_export_state(key: &StateKey) {
-    let _ = DISCOVERY_STATE.remove(key);
+    let _ = owned_discovery_remove(key, false);
 }
 
 fn fail_export_state(key: &StateKey) {
-    discard_export_state(key);
+    let _ = owned_discovery_remove(key, true);
     bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_STATE_FAILURES);
 }
 
 fn finish_export_state(key: &StateKey) {
-    if DISCOVERY_STATE.remove(key).is_err() {
-        fail_export_state(key);
+    if owned_discovery_remove(key, true).is_err() {
+        bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_STATE_FAILURES);
     }
 }
 
@@ -869,23 +973,16 @@ fn insert_selection_state(ctx: &ProbeContext, state: StartState) {
     let Some(key) = selection_state_key(ctx) else {
         return;
     };
-    if DISCOVERY_STATE
-        .insert(&key, &state, aya_ebpf::bindings::BPF_NOEXIST as u64)
-        .is_err()
-    {
-        let _ = DISCOVERY_STATE.remove(&key);
+    if owned_discovery_insert(&key, &state, aya_ebpf::bindings::BPF_NOEXIST as u64).is_err() {
         bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_STATE_FAILURES);
     }
 }
 
-fn take_selection_state(
-    ctx: &RetProbeContext,
-    scoped: bool,
-) -> Option<(StateKey, StartState)> {
+fn take_selection_state(ctx: &RetProbeContext, scoped: bool) -> Option<(StateKey, StartState)> {
     let key = selection_state_key(ctx)?;
-    let state = unsafe { DISCOVERY_STATE.get(&key) }.copied();
+    let state = owned_discovery_get(&key, false).copied();
     let state_present = state.is_some();
-    let removed = DISCOVERY_STATE.remove(&key).is_ok();
+    let removed = owned_discovery_remove(&key, state_present).is_ok();
     if discovery_state_take_failed(state_present, removed) {
         if scoped {
             bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_STATE_FAILURES);
@@ -901,10 +998,27 @@ fn take_selection_state(
 
 #[uprobe]
 pub fn function_list_entry(ctx: ProbeContext) -> u32 {
+    if scope_auth().is_none() {
+        return 0;
+    }
+    let Some(layout) = probe_layout(&ctx) else {
+        if let Some(key) = export_state_key(&ctx) {
+            discard_export_state(&key);
+        }
+        bump_evidence(EVIDENCE_ABI_REFUSALS);
+        return 0;
+    };
+    let Ok(arg0) = arg_u64(&ctx, 0, layout) else {
+        if let Some(key) = export_state_key(&ctx) {
+            discard_export_state(&key);
+        }
+        bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES);
+        return 0;
+    };
     insert_export_state(
         &ctx,
         StartState {
-            arg0: ctx.arg::<u64>(0).unwrap_or(0),
+            arg0,
             arg1: 0,
             arg2: 0,
         },
@@ -915,13 +1029,24 @@ pub fn function_list_entry(ctx: ProbeContext) -> u32 {
 #[uretprobe]
 pub fn function_list_return(ctx: RetProbeContext) -> u32 {
     let scope = scope_auth();
+    if scope.is_none() {
+        let _ = take_export_state(&ctx, false);
+        return 0;
+    }
+    let Some(layout) = ret_probe_layout(&ctx) else {
+        if let Some(key) = export_state_key(&ctx) {
+            discard_export_state(&key);
+        }
+        bump_evidence(EVIDENCE_ABI_REFUSALS);
+        return 0;
+    };
     let Some((key, state)) = take_export_state(&ctx, scope.is_some()) else {
         return 0;
     };
     let Some(scope) = scope else {
         return 0;
     };
-    let rv: u64 = ctx.ret();
+    let rv = normalize_target_word(ctx.ret(), layout);
     if rv == 0 {
         let Some(symbol_id) = export_symbol_id(key.attach_cookie) else {
             bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_STATE_FAILURES);
@@ -930,13 +1055,13 @@ pub fn function_list_return(ctx: RetProbeContext) -> u32 {
         classify_export(
             &ExportArgs {
                 kind: DISCOVERY_KIND_FUNCTION_LIST_RETURN,
-                source: EXPORT_SOURCE_FUNCTION_LIST,
                 interface_index: 0,
                 symbol_id,
                 announced_count: 0,
                 address: state.arg0,
             },
             &scope,
+            layout,
         );
     }
     0
@@ -944,11 +1069,28 @@ pub fn function_list_return(ctx: RetProbeContext) -> u32 {
 
 #[uprobe]
 pub fn interface_list_entry(ctx: ProbeContext) -> u32 {
+    if scope_auth().is_none() {
+        return 0;
+    }
+    let Some(layout) = probe_layout(&ctx) else {
+        if let Some(key) = export_state_key(&ctx) {
+            discard_export_state(&key);
+        }
+        bump_evidence(EVIDENCE_ABI_REFUSALS);
+        return 0;
+    };
+    let (Ok(arg0), Ok(arg1)) = (arg_u64(&ctx, 0, layout), arg_u64(&ctx, 1, layout)) else {
+        if let Some(key) = export_state_key(&ctx) {
+            discard_export_state(&key);
+        }
+        bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES);
+        return 0;
+    };
     insert_export_state(
         &ctx,
         StartState {
-            arg0: ctx.arg::<u64>(0).unwrap_or(0),
-            arg1: ctx.arg::<u64>(1).unwrap_or(0),
+            arg0,
+            arg1,
             arg2: 0,
         },
     );
@@ -958,17 +1100,28 @@ pub fn interface_list_entry(ctx: ProbeContext) -> u32 {
 #[uretprobe]
 pub fn interface_list_return(ctx: RetProbeContext) -> u32 {
     let scope = scope_auth();
+    if scope.is_none() {
+        let _ = take_export_state(&ctx, false);
+        return 0;
+    }
+    let Some(layout) = ret_probe_layout(&ctx) else {
+        if let Some(key) = export_state_key(&ctx) {
+            discard_export_state(&key);
+        }
+        bump_evidence(EVIDENCE_ABI_REFUSALS);
+        return 0;
+    };
     let Some((entry_key, state)) = take_export_state(&ctx, scope.is_some()) else {
         return 0;
     };
     let Some(_scope) = scope else {
         return 0;
     };
-    let rv: u64 = ctx.ret();
+    let rv = normalize_target_word(ctx.ret(), layout);
     if rv != 0 {
         return 0;
     }
-    let Ok(count) = (unsafe { helpers::bpf_probe_read_user(state.arg1 as *const u64) }) else {
+    let Ok(count) = read_word(state.arg1, layout) else {
         bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES);
         return 0;
     };
@@ -981,7 +1134,11 @@ pub fn interface_list_return(ctx: RetProbeContext) -> u32 {
     }
     if state
         .arg0
-        .checked_add((active_count - 1) * 24)
+        .checked_add((active_count - 1) * layout.interface().stride as u64)
+        .and_then(|address| {
+            address.checked_add(layout.interface().stride as u64 - layout.word_bytes() as u64)
+        })
+        .and_then(|address| target_word_end(address, layout))
         .is_none()
     {
         bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES);
@@ -1005,15 +1162,9 @@ pub fn interface_list_return(ctx: RetProbeContext) -> u32 {
         arg1: packed,
         arg2: 0,
     };
-    if DISCOVERY_STATE
-        .insert(
-            &key,
-            &continuation,
-            aya_ebpf::bindings::BPF_NOEXIST as u64,
-        )
-        .is_err()
+    if owned_discovery_insert(&key, &continuation, aya_ebpf::bindings::BPF_NOEXIST as u64).is_err()
     {
-        fail_export_state(&key);
+        bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_STATE_FAILURES);
         return 0;
     }
     unsafe { TAIL_CALLS.tail_call(&ctx, TAIL_CALLS_INTERFACE_WORKER_SLOT) };
@@ -1029,10 +1180,15 @@ pub fn interface_list_worker(ctx: RetProbeContext) -> u32 {
         domain: STATE_DOMAIN_EXPORT,
     };
     let Some(scope) = scope_auth() else {
-        discard_export_state(&key);
+        let _ = owned_discovery_remove(&key, true);
         return 0;
     };
-    let Some(state) = (unsafe { DISCOVERY_STATE.get(&key) }).copied() else {
+    let Some(layout) = ret_probe_layout(&ctx) else {
+        let _ = owned_discovery_remove(&key, true);
+        bump_evidence(EVIDENCE_ABI_REFUSALS);
+        return 0;
+    };
+    let Some(state) = (owned_discovery_get(&key, true)).copied() else {
         fail_export_state(&key);
         return 0;
     };
@@ -1057,21 +1213,30 @@ pub fn interface_list_worker(ctx: RetProbeContext) -> u32 {
     }
     let Some(last_offset) = active_count
         .checked_sub(1)
-        .and_then(|index| index.checked_mul(24))
+        .and_then(|index| index.checked_mul(layout.interface().stride as u64))
     else {
         fail_export_state(&key);
         return 0;
     };
-    if state.arg0.checked_add(last_offset).is_none() {
+    if state
+        .arg0
+        .checked_add(last_offset)
+        .and_then(|address| {
+            address.checked_add(layout.interface().stride as u64 - layout.word_bytes() as u64)
+        })
+        .and_then(|address| target_word_end(address, layout))
+        .is_none()
+    {
         fail_export_state(&key);
         return 0;
     }
-    let Some(interface_offset) = u64::from(interface_index).checked_mul(24) else {
+    let Some(interface_offset) =
+        u64::from(interface_index).checked_mul(layout.interface().stride as u64)
+    else {
         fail_export_state(&key);
         return 0;
     };
-    let Some(address) = state.arg0.checked_add(interface_offset)
-    else {
+    let Some(address) = state.arg0.checked_add(interface_offset) else {
         fail_export_state(&key);
         return 0;
     };
@@ -1082,7 +1247,7 @@ pub fn interface_list_worker(ctx: RetProbeContext) -> u32 {
         announced_count,
         address,
         &scope,
-        &NO_SELECTION,
+        &no_selection(layout),
     );
 
     let Some(next) = interface_continuation_next(state.arg1) else {
@@ -1094,10 +1259,7 @@ pub fn interface_list_worker(ctx: RetProbeContext) -> u32 {
         arg1: next,
         arg2: 0,
     };
-    if DISCOVERY_STATE
-        .insert(&key, &continuation, aya_ebpf::bindings::BPF_EXIST as u64)
-        .is_err()
-    {
+    if owned_discovery_insert(&key, &continuation, aya_ebpf::bindings::BPF_EXIST as u64).is_err() {
         fail_export_state(&key);
         return 0;
     }
@@ -1111,17 +1273,36 @@ pub fn interface_entry(ctx: ProbeContext) -> u32 {
     let Some(scope) = scope_auth() else {
         return 0;
     };
+    let Some(layout) = probe_layout(&ctx) else {
+        if let Some(key) = selection_state_key(&ctx) {
+            discard_export_state(&key);
+        }
+        bump_evidence(EVIDENCE_ABI_REFUSALS);
+        return 0;
+    };
     if scope.flags & FLAG_POLICY_AGGREGATE != 0 {
         return 0;
     }
-    let request_name_class = classify_selection_name(ctx.arg::<u64>(0).unwrap_or(0));
-    let request_version_class = classify_selection_version(ctx.arg::<u64>(1).unwrap_or(0));
+    let (Ok(name), Ok(version), Ok(pp_interface), Ok(flags)) = (
+        arg_u64(&ctx, 0, layout),
+        arg_u64(&ctx, 1, layout),
+        arg_u64(&ctx, 2, layout),
+        arg_u64(&ctx, 3, layout),
+    ) else {
+        if let Some(key) = selection_state_key(&ctx) {
+            discard_export_state(&key);
+        }
+        bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES);
+        return 0;
+    };
+    let request_name_class = classify_selection_name(name);
+    let request_version_class = classify_selection_version(version);
     insert_selection_state(
         &ctx,
         StartState {
-            arg0: ctx.arg::<u64>(2).unwrap_or(0),
+            arg0: pp_interface,
             arg1: selection_request_word(request_name_class, request_version_class),
-            arg2: ctx.arg::<u64>(3).unwrap_or(0),
+            arg2: flags,
         },
     );
     0
@@ -1130,6 +1311,17 @@ pub fn interface_entry(ctx: ProbeContext) -> u32 {
 #[uretprobe]
 pub fn interface_return(ctx: RetProbeContext) -> u32 {
     let scope = scope_auth();
+    if scope.is_none() {
+        let _ = take_selection_state(&ctx, false);
+        return 0;
+    }
+    let Some(layout) = ret_probe_layout(&ctx) else {
+        if let Some(key) = selection_state_key(&ctx) {
+            discard_export_state(&key);
+        }
+        bump_evidence(EVIDENCE_ABI_REFUSALS);
+        return 0;
+    };
     if scope
         .as_ref()
         .is_some_and(|scope| scope.flags & FLAG_POLICY_AGGREGATE != 0)
@@ -1142,15 +1334,16 @@ pub fn interface_return(ctx: RetProbeContext) -> u32 {
     let Some(scope) = scope else {
         return 0;
     };
-    let rv: u64 = ctx.ret();
+    let rv = normalize_target_word(ctx.ret(), layout);
     let selection = SelectionTransport {
-        _pad: [0; 5],
+        _pad: [0; 4],
         request_name_class: state.arg1 as u8,
         request_version_class: (state.arg1 >> 8) as u8,
         request_flags: state.arg2,
         binding_id: key.attach_cookie,
         return_rv: rv,
         pause_eligible: rv == 0,
+        word_bytes: layout.word_bytes() as u8,
     };
     if rv != 0 {
         emit_export(
@@ -1194,6 +1387,10 @@ pub fn dl_debug_state(ctx: ProbeContext) -> u32 {
     let Some(scope) = scope_auth() else {
         return 0;
     };
+    let Some(layout) = probe_layout(&ctx) else {
+        bump_evidence(EVIDENCE_ABI_REFUSALS);
+        return 0;
+    };
     bump_discovery_counter(DISCOVERY_COUNTER_LOADER_HITS);
     let Some(mut entry) = reserve_discovery() else {
         return 0;
@@ -1217,7 +1414,7 @@ pub fn dl_debug_state(ctx: ProbeContext) -> u32 {
         return 0;
     }
 
-    let hook_ip = loader_runtime_ip(&ctx);
+    let hook_ip = normalize_target_word(loader_runtime_ip(&ctx), layout);
     if hook_ip == 0 {
         bump_discovery_counter(DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES);
         entry.discard(0);
@@ -1226,13 +1423,17 @@ pub fn dl_debug_state(ctx: ProbeContext) -> u32 {
     let mut r_state = 0u32;
     if state_present {
         let delta = (cookie as i64) >> 9;
-        let r_debug = if delta >= 0 {
+        let r_state_address = if delta >= 0 {
             hook_ip.checked_add(delta as u64)
         } else {
             hook_ip.checked_sub(delta.unsigned_abs())
         };
-        let address = r_debug.and_then(|address| address.checked_add(R_STATE_OFFSET));
-        match address {
+        match r_state_address.filter(|address| {
+            layout == LinuxLayout::Lp64
+                || address
+                    .checked_add(core::mem::size_of::<u32>() as u64 - 1)
+                    .is_some_and(|end| end <= u32::MAX as u64)
+        }) {
             Some(address) => match unsafe { helpers::bpf_probe_read_user(address as *const u32) } {
                 Ok(value) => r_state = value,
                 Err(_) => bump_discovery_counter(DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES),
@@ -1268,16 +1469,21 @@ fn emit_lifecycle(kind: u8, scope: ScopeAuth, pause_eligible: bool) {
     finish_discovery_record(entry, scope, pause_eligible, pid_tgid, 0);
 }
 
-#[tracepoint(category = "sched", name = "sched_process_exec")]
-pub fn sched_process_exec(_ctx: TracePointContext) -> u32 {
+#[raw_tracepoint(tracepoint = "sched_process_exec")]
+pub fn sched_process_exec(_ctx: RawTracePointContext) -> u32 {
+    // Mandatory current-physical-task cleanup precedes all capture filters.
+    unsafe { p11_owner_cleanup() };
     if let Some(scope) = scope_auth() {
         emit_lifecycle(DISCOVERY_KIND_EXEC, scope, true);
     }
     0
 }
 
-#[tracepoint(category = "sched", name = "sched_process_exit")]
-pub fn sched_process_exit(_ctx: TracePointContext) -> u32 {
+#[raw_tracepoint(tracepoint = "sched_process_exit")]
+pub fn sched_process_exit(_ctx: RawTracePointContext) -> u32 {
+    // Retained original keys also cover fatal nonleader post-de_thread exit.
+    unsafe { p11_owner_cleanup() };
+    unsafe { p11_root_current_exit() };
     let pid_tgid = helpers::bpf_get_current_pid_tgid();
     if pid_tgid as u32 != (pid_tgid >> 32) as u32 {
         return 0;
@@ -1313,91 +1519,227 @@ where
 }
 
 /// Decode allowlisted `CK_MECHANISM` parameters for `shape` at `pmech`,
-/// writing the result into `start.shape/p0/p1/p2`. Anything unexpected —
+/// writing the result into `output.p0/p1/p2`. Anything unexpected —
 /// an `ulParameterLen` that matches no known layout, null `pParameter`, or
-/// any failed read — leaves `start.shape` at its `shape::NONE` default and
-/// `p0/p1/p2` untouched (they are already zeroed by the caller): partial
-/// decodes are never emitted, and an unrecognized length is never guessed
-/// at.
+/// any failed read — leaves `p0/p1/p2` untouched (they are already zeroed by
+/// the caller): partial decodes are never emitted, and an unrecognized length
+/// is never guessed at. The return value is the decoded shape, `shape::NONE`
+/// when no exact supported parameter layout applies, or
+/// `PARAMS_DECODE_FAILURE` when a required read or boundary check fails.
 ///
 /// PKCS#11 has two incompatible `CK_GCM_PARAMS` layouts in the wild: the
-/// legacy v2.20 one (40 bytes) and the current v2.40/OASIS one (48 bytes,
-/// which inserts `ulIvBits` at offset 16 and pushes the rest out). Reusing
-/// the legacy offsets against a modern 48-byte struct — as this function
+/// legacy v2.20 one (five target words) and the current v2.40/OASIS one (six
+/// target words, which inserts `ulIvBits`). Reusing the legacy offsets against
+/// a modern struct — as this function
 /// used to, guarding only `ulParameterLen >= 40` — reads `CK_GCM_PARAMS.pAAD`
 /// (a userspace pointer) into what the caller believes is `ulAADLen`. The
 /// match below is deliberately an *exact* length match per layout, never
 /// `>=`: a length that fits neither known layout means the field offsets
 /// are unknown, and guessing is exactly what caused that disclosure.
 ///
-/// Reads exactly two `CK_MECHANISM` fields (`ulParameterLen` at offset 16,
-/// `pParameter` at offset 8) plus three shape-specific `u64` scalars at
+/// Reads exactly two `CK_MECHANISM` fields (`ulParameterLen` at word 2,
+/// `pParameter` at word 1) plus three shape-specific target-width scalars at
 /// fixed offsets from `pParameter`. For GCM, `pIv`/`pAAD` — pointers, at
 /// offset 0 always and offset 16 or 24 depending on layout — are never
 /// read; only the three length/count scalars are.
 #[cfg(feature = "unsafe-unvalidated-metadata")]
+#[repr(C)]
+struct ParamsOutput {
+    p0: u64,
+    p1: u64,
+    p2: u64,
+}
+
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+const PARAMS_DECODE_FAILURE: u32 = u32::MAX;
+
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+const _: [(); 24] = [(); core::mem::size_of::<ParamsOutput>()];
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+const _: () = assert!(core::mem::align_of::<ParamsOutput>() == core::mem::align_of::<u64>());
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+const _: () = assert!(core::mem::offset_of!(ParamsOutput, p0) == 0);
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+const _: () = assert!(core::mem::offset_of!(ParamsOutput, p1) == 8);
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+const _: () = assert!(core::mem::offset_of!(ParamsOutput, p2) == 16);
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+const _: () =
+    assert!(core::mem::offset_of!(CallStart, p1) == core::mem::offset_of!(CallStart, p0) + 8);
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+const _: () =
+    assert!(core::mem::offset_of!(CallStart, p2) == core::mem::offset_of!(CallStart, p0) + 16);
+
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+#[unsafe(no_mangle)]
 #[inline(never)]
-fn decode_params(pmech: u64, sh: u32, start: &mut CallStart) {
-    // CK_MECHANISM.ulParameterLen is the third CK_ULONG (offset 16). Read
-    // first: which offsets (if any) apply depends on it.
-    let Some(param_len_addr) = pmech.checked_add(16) else {
-        capture_failure(start);
-        return;
+#[allow(private_interfaces)]
+pub unsafe extern "C" fn p11_decode_params(
+    pmech: u64,
+    sh: u32,
+    word_bytes: u32,
+    output: *mut ParamsOutput,
+) -> u32 {
+    if output.is_null() {
+        return PARAMS_DECODE_FAILURE;
+    }
+    let is_ilp32 = match word_bytes {
+        4 => true,
+        8 => false,
+        _ => return PARAMS_DECODE_FAILURE,
     };
-    let Ok(param_len) = (unsafe { helpers::bpf_probe_read_user(param_len_addr as *const u64) })
-    else {
-        capture_failure(start);
-        return;
+    // SAFETY: null was rejected above; the caller owns this contiguous
+    // three-word output region for the duration of the global function call.
+    let output = unsafe { &mut *output };
+    if is_ilp32 {
+        decode_params_impl::<true>(pmech, sh, output)
+    } else {
+        decode_params_impl::<false>(pmech, sh, output)
+    }
+}
+
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+#[inline(never)]
+fn decode_params_impl<const IS_ILP32: bool>(pmech: u64, sh: u32, output: &mut ParamsOutput) -> u32 {
+    let layout = if IS_ILP32 {
+        LinuxLayout::Ilp32
+    } else {
+        LinuxLayout::Lp64
+    };
+    let width = layout.word_bytes() as u64;
+    // CK_MECHANISM.ulParameterLen is the third target word. Read
+    // first: which offsets (if any) apply depends on it.
+    let Some(param_len_addr) = pmech.checked_add(width * 2) else {
+        return PARAMS_DECODE_FAILURE;
+    };
+    let Ok(param_len) = read_word(param_len_addr, layout) else {
+        return PARAMS_DECODE_FAILURE;
     };
     let (o0, o1, o2, out_shape) = match (sh, param_len) {
-        // CK_RSA_PKCS_PSS_PARAMS { hashAlg, mgf, sLen } — three CK_ULONGs,
-        // 24 bytes, one layout.
-        (shape::RSA_PKCS_PSS, 24) => (0u64, 8u64, 16u64, shape::RSA_PKCS_PSS),
-        // CK_GCM_PARAMS, legacy v2.20 layout (40 bytes):
+        // CK_RSA_PKCS_PSS_PARAMS { hashAlg, mgf, sLen }.
+        (shape::RSA_PKCS_PSS, len) if len == width * 3 => {
+            (0, width, width * 2, shape::RSA_PKCS_PSS)
+        }
+        // CK_GCM_PARAMS, legacy v2.20 layout (20/40 bytes):
         // { pIv, ulIvLen, pAAD, ulAADLen, ulTagBits }.
-        (shape::GCM, 40) => (8u64, 24u64, 32u64, shape::GCM_V220),
-        // CK_GCM_PARAMS, v2.40/OASIS layout (48 bytes):
+        (shape::GCM, len) if len == width * 5 => (width, width * 3, width * 4, shape::GCM_V220),
+        // CK_GCM_PARAMS, v2.40/OASIS layout (24/48 bytes):
         // { pIv, ulIvLen, ulIvBits, pAAD, ulAADLen, ulTagBits }.
-        (shape::GCM, 48) => (8u64, 32u64, 40u64, shape::GCM_V240),
-        _ => return,
+        (shape::GCM, len) if len == width * 6 => (width, width * 4, width * 5, shape::GCM_V240),
+        _ => return shape::NONE,
     };
-    // CK_MECHANISM.pParameter is the second CK_ULONG (offset 8).
-    let Some(pparam_addr) = pmech.checked_add(8) else {
-        capture_failure(start);
-        return;
+    // CK_MECHANISM.pParameter is the second target word.
+    let Some(pparam_addr) = pmech.checked_add(width) else {
+        return PARAMS_DECODE_FAILURE;
     };
-    let Ok(pparam) = (unsafe { helpers::bpf_probe_read_user(pparam_addr as *const u64) }) else {
-        capture_failure(start);
-        return;
+    let Ok(pparam) = read_word(pparam_addr, layout) else {
+        return PARAMS_DECODE_FAILURE;
     };
     if pparam == 0 {
-        return;
+        return shape::NONE;
     }
     let (Some(a0), Some(a1), Some(a2)) = (
         pparam.checked_add(o0),
         pparam.checked_add(o1),
         pparam.checked_add(o2),
     ) else {
-        capture_failure(start);
-        return;
+        return PARAMS_DECODE_FAILURE;
     };
-    let r0 = unsafe { helpers::bpf_probe_read_user(a0 as *const u64) };
-    let r1 = unsafe { helpers::bpf_probe_read_user(a1 as *const u64) };
-    let r2 = unsafe { helpers::bpf_probe_read_user(a2 as *const u64) };
+    let r0 = read_word(a0, layout);
+    let r1 = read_word(a1, layout);
+    let r2 = read_word(a2, layout);
     if let (Ok(a), Ok(b), Ok(c)) = (r0, r1, r2) {
-        start.shape = out_shape;
-        start.p0 = a;
-        start.p1 = b;
-        start.p2 = c;
+        output.p0 = a;
+        output.p1 = b;
+        output.p2 = c;
+        out_shape
     } else {
-        capture_failure(start);
+        PARAMS_DECODE_FAILURE
+    }
+}
+
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+#[repr(C)]
+struct TemplateOutput {
+    types: [u64; MAX_ATTRS],
+    count: u32,
+    total: u32,
+    bools: u32,
+    seen: u32,
+}
+
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+const TEMPLATE_WALK_FAILURE: u32 = 1;
+
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+const _: () = assert!(core::mem::size_of::<TemplateOutput>() == 80);
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+const _: () = assert!(core::mem::align_of::<TemplateOutput>() == core::mem::align_of::<u64>());
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+const _: () = assert!(core::mem::offset_of!(TemplateOutput, types) == 0);
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+const _: () = assert!(core::mem::offset_of!(TemplateOutput, count) == 64);
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+const _: () = assert!(core::mem::offset_of!(TemplateOutput, total) == 68);
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+const _: () = assert!(core::mem::offset_of!(TemplateOutput, bools) == 72);
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+const _: () = assert!(core::mem::offset_of!(TemplateOutput, seen) == 76);
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+const _: () = assert!(core::mem::offset_of!(CallStart, attr_types) == 96);
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+const _: () = assert!(core::mem::offset_of!(CallStart, attr_count) == 160);
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+const _: () = assert!(core::mem::offset_of!(CallStart, attr_total) == 164);
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+const _: () = assert!(core::mem::offset_of!(CallStart, attr_bools) == 168);
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+const _: () = assert!(core::mem::offset_of!(CallStart, attr_bools_seen) == 172);
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+const _: () = assert!(core::mem::offset_of!(CallStart, attr_types1) == 176);
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+const _: () = assert!(core::mem::offset_of!(CallStart, attr_count1) == 240);
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+const _: () = assert!(core::mem::offset_of!(CallStart, attr_total1) == 244);
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+const _: () = assert!(core::mem::offset_of!(CallStart, attr_bools1) == 248);
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+const _: () = assert!(core::mem::offset_of!(CallStart, attr_bools_seen1) == 252);
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+const _: () = assert!(core::mem::offset_of!(CallStart, capture) == 256);
+
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+#[unsafe(no_mangle)]
+#[inline(never)]
+#[allow(private_interfaces)]
+pub unsafe extern "C" fn p11_walk_template(
+    ptemplate: u64,
+    count: u64,
+    word_bytes: u32,
+    output: *mut TemplateOutput,
+) -> u32 {
+    if output.is_null() {
+        return TEMPLATE_WALK_FAILURE;
+    }
+    let is_ilp32 = match word_bytes {
+        4 => true,
+        8 => false,
+        _ => return TEMPLATE_WALK_FAILURE,
+    };
+    // SAFETY: null was rejected above. The caller owns exactly one contiguous
+    // template-output region for the duration of this global call.
+    let output = unsafe { &mut *output };
+    if is_ilp32 {
+        walk_template_impl::<true>(ptemplate, count, output)
+    } else {
+        walk_template_impl::<false>(ptemplate, count, output)
     }
 }
 
 /// Walk at most `MAX_ATTRS` entries of `pTemplate`, recording each entry's
-/// *type* only into `start.attr_types` — `pValue` is never read except for
+/// *type* only into `output.types` — `pValue` is never read except for
 /// the policy-boolean allowlist under the `ulValueLen == 1` gate below.
-/// `attr_total` is always set from `count`, so a template longer than the
+/// `output.total` is always set from `count`, so a template longer than the
 /// cap (or one abandoned early by a read failure) stays visible as
 /// truncation evidence rather than being silently trimmed.
 ///
@@ -1406,53 +1748,107 @@ fn decode_params(pmech: u64, sh: u32, start: &mut CallStart) {
 /// stops early for shorter templates. Any read failure for an entry —
 /// including a bad `pTemplate` itself — stops the walk immediately;
 /// entries already captured are kept, nothing is skipped ahead or guessed.
-#[inline(never)]
 #[cfg(feature = "unsafe-unvalidated-metadata")]
+#[inline(always)]
 fn walk_template<const TYPES_ONLY: bool, const SECOND: bool>(
     ptemplate: u64,
     count: u64,
+    layout: LinuxLayout,
     start: &mut CallStart,
 ) {
-    let total = count.min(u32::MAX as u64) as u32;
-    if SECOND {
-        start.attr_total1 = total;
-    } else {
-        start.attr_total = total;
+    const {
+        assert!(!TYPES_ONLY || !SECOND);
     }
+    if TYPES_ONLY {
+        match layout {
+            LinuxLayout::Ilp32 => walk_template_types::<true>(ptemplate, count, start),
+            LinuxLayout::Lp64 => walk_template_types::<false>(ptemplate, count, start),
+        }
+        return;
+    }
+    let offset = if SECOND {
+        core::mem::offset_of!(CallStart, attr_types1)
+    } else {
+        core::mem::offset_of!(CallStart, attr_types)
+    };
+    let output = unsafe {
+        (start as *mut CallStart)
+            .cast::<u8>()
+            .add(offset)
+            .cast::<TemplateOutput>()
+    };
+    let status = unsafe { p11_walk_template(ptemplate, count, layout.word_bytes() as u32, output) };
+    if status != 0 {
+        capture_failure(start);
+    }
+}
+
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+#[inline(never)]
+fn walk_template_types<const IS_ILP32: bool>(ptemplate: u64, count: u64, start: &mut CallStart) {
+    let layout = if IS_ILP32 {
+        LinuxLayout::Ilp32
+    } else {
+        LinuxLayout::Lp64
+    };
+    let total = count.min(u32::MAX as u64) as u32;
+    start.attr_total = total;
+    for i in 0..MAX_ATTRS {
+        if (i as u64) >= count {
+            break;
+        }
+        let width = layout.word_bytes() as u64;
+        let Some(base) = ptemplate.checked_add((i as u64) * width * 3) else {
+            capture_failure(start);
+            break;
+        };
+        let Ok(attr_type) = read_word(base, layout) else {
+            capture_failure(start);
+            break;
+        };
+        start.attr_types[i] = attr_type;
+        start.attr_count += 1;
+    }
+}
+
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+#[inline(never)]
+fn walk_template_impl<const IS_ILP32: bool>(
+    ptemplate: u64,
+    count: u64,
+    output: &mut TemplateOutput,
+) -> u32 {
+    let layout = if IS_ILP32 {
+        LinuxLayout::Ilp32
+    } else {
+        LinuxLayout::Lp64
+    };
+    let total = count.min(u32::MAX as u64) as u32;
+    output.total = total;
     for i in 0..MAX_ATTRS {
         if (i as u64) >= count {
             break;
         }
         // CK_ATTRIBUTE { CK_ATTRIBUTE_TYPE type; CK_VOID_PTR pValue;
-        // CK_ULONG ulValueLen; } — 24 bytes; all three fields are
-        // CK_ULONG-sized (8 bytes) on LP64. `type` is read first and is
+        // CK_ULONG ulValueLen; } — three target words. `type` is read first and is
         // the only field ever read for a non-allowlisted attribute.
-        let Some(base) = ptemplate.checked_add((i as u64) * 24) else {
-            capture_failure(start);
-            break;
+        let width = layout.word_bytes() as u64;
+        let Some(base) = ptemplate.checked_add((i as u64) * width * 3) else {
+            return TEMPLATE_WALK_FAILURE;
         };
-        let Ok(t) = (unsafe { helpers::bpf_probe_read_user(base as *const u64) }) else {
-            capture_failure(start);
-            break;
+        let Ok(t) = read_word(base, layout) else {
+            return TEMPLATE_WALK_FAILURE;
         };
         let attr_type = t;
-        if SECOND {
-            start.attr_types1[i] = attr_type;
-            start.attr_count1 += 1;
-        } else {
-            start.attr_types[i] = attr_type;
-            start.attr_count += 1;
-        }
+        output.types[i] = attr_type;
+        output.count += 1;
 
-        // Policy-boolean allowlist only: read ulValueLen (offset 16) next,
+        // Policy-boolean allowlist only: read ulValueLen (word 2) next,
         // and only when it is exactly 1 read the single CK_BBOOL byte at
-        // pValue (offset 8). This length gate is load-bearing: it is what
+        // pValue (word 1). This length gate is load-bearing: it is what
         // keeps a CKA_VALUE or CKA_LABEL from ever being read even if a
         // type were mis-listed on the allowlist. Type checked first, then
         // length, then the single byte — in that order, always.
-        if TYPES_ONLY {
-            continue;
-        }
         // CK_ATTRIBUTE_TYPE is full-width on LP64 and remains so in the
         // event. Only standard low-width values can enter the boolean
         // allowlist; a vendor type with matching low bits must not alias it.
@@ -1466,38 +1862,32 @@ fn walk_template<const TYPES_ONLY: bool, const SECOND: bool>(
         // Read the two remaining CK_ATTRIBUTE fields together only after
         // the type allowlist matched. This preserves the privacy order while
         // keeping the verifier from exploring two independent read failures.
-        let Some(value_addr) = base.checked_add(8) else {
-            capture_failure(start);
-            break;
+        let Some(value_addr) = base.checked_add(width) else {
+            return TEMPLATE_WALK_FAILURE;
         };
-        let Ok([pvalue, len]) =
-            (unsafe { helpers::bpf_probe_read_user(value_addr as *const [u64; 2]) })
-        else {
-            capture_failure(start);
-            break;
+        let Ok([pvalue, len]) = read_word_pair(value_addr, layout) else {
+            return TEMPLATE_WALK_FAILURE;
         };
         if len != 1 {
             continue;
         }
         let Ok(b) = (unsafe { helpers::bpf_probe_read_user(pvalue as *const u8) }) else {
-            capture_failure(start);
-            break;
+            return TEMPLATE_WALK_FAILURE;
         };
-        if SECOND {
-            start.attr_bools_seen1 |= mask;
-            if b != 0 {
-                start.attr_bools1 |= mask;
-            }
-        } else {
-            start.attr_bools_seen |= mask;
-            if b != 0 {
-                start.attr_bools |= mask;
-            }
+        output.seen |= mask;
+        if b != 0 {
+            output.bools |= mask;
         }
     }
+    0
 }
 
-fn arg_u64(ctx: &ProbeContext, index: u8) -> Result<u64, ()> {
+fn arg_u64(ctx: &ProbeContext, index: u8, layout: LinuxLayout) -> Result<u64, ()> {
+    if layout == LinuxLayout::Ilp32 {
+        let rsp = unsafe { (*ctx.regs).rsp as u64 };
+        let value = p11_read_ia32_arg(rsp, index as u32);
+        return (value <= u32::MAX as u64).then_some(value).ok_or(());
+    }
     match index {
         // Keep every register index a compile-time constant. A dynamic
         // `ctx.arg(index)` becomes variable pointer arithmetic on pt_regs,
@@ -1510,16 +1900,19 @@ fn arg_u64(ctx: &ProbeContext, index: u8) -> Result<u64, ()> {
         5 => ctx.arg::<u64>(5).ok_or(()),
         6 => {
             let rsp = unsafe { (*ctx.regs).rsp as u64 };
-            let Some(address) = rsp.checked_add(8) else {
-                return Err(());
-            };
-            match unsafe { helpers::bpf_probe_read_user(address as *const u64) } {
-                Ok(value) => Ok(value),
-                Err(_) => Err(()),
-            }
+            let address = target_stack_arg_address(rsp, index, layout).ok_or(())?;
+            read_word(address, layout)
         }
         _ => Err(()),
     }
+}
+
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn p11_read_ia32_arg(stack_pointer: u64, index: u32) -> u64 {
+    read_ia32_arg_with(stack_pointer, index, |address| unsafe {
+        helpers::bpf_probe_read_user(address as *const u32).map_err(|_| ())
+    })
 }
 
 fn capture_failure(start: &mut CallStart) {
@@ -1527,11 +1920,16 @@ fn capture_failure(start: &mut CallStart) {
     bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
 }
 
-fn capture_scalar(ctx: &ProbeContext, index: u8, start: &mut CallStart) -> Option<u64> {
+fn capture_scalar(
+    ctx: &ProbeContext,
+    index: u8,
+    layout: LinuxLayout,
+    start: &mut CallStart,
+) -> Option<u64> {
     if index == ARG_NONE {
         return None;
     }
-    match arg_u64(ctx, index) {
+    match arg_u64(ctx, index, layout) {
         Ok(value) => Some(value),
         Err(()) => {
             capture_failure(start);
@@ -1540,10 +1938,27 @@ fn capture_scalar(ctx: &ProbeContext, index: u8, start: &mut CallStart) -> Optio
     }
 }
 
-fn capture_async_target(ctx: &ProbeContext, index: u8, start: &mut CallStart) {
-    let Some(pointer) = capture_scalar(ctx, index, start) else {
-        return;
-    };
+const _: [(); 32] = [(); core::mem::size_of::<FunctionNameKey>()];
+const _: () = assert!(core::mem::align_of::<FunctionNameKey>() >= 4);
+
+#[inline(always)]
+fn zero_function_name_key(key: &mut MaybeUninit<FunctionNameKey>) {
+    let words = key.as_mut_ptr().cast::<u32>();
+    unsafe {
+        // ASYNC_KEY_INITIALIZER_BEGIN
+        core::ptr::write_volatile(words.add(0), 0u32);
+        core::ptr::write_volatile(words.add(1), 0u32);
+        core::ptr::write_volatile(words.add(2), 0u32);
+        core::ptr::write_volatile(words.add(3), 0u32);
+        core::ptr::write_volatile(words.add(4), 0u32);
+        core::ptr::write_volatile(words.add(5), 0u32);
+        core::ptr::write_volatile(words.add(6), 0u32);
+        core::ptr::write_volatile(words.add(7), 0u32);
+        // ASYNC_KEY_INITIALIZER_END
+    }
+}
+
+fn capture_async_target(pointer: u64, start: &mut CallStart) {
     if pointer == 0 {
         capture_failure(start);
         return;
@@ -1565,43 +1980,91 @@ fn capture_async_target(ctx: &ProbeContext, index: u8, start: &mut CallStart) {
     }
     let len = (read - 1) as usize;
     let name = name.as_ptr().cast::<u8>();
-    let mut key = FunctionNameKey {
-        len: len as u32,
-        ..FunctionNameKey::default()
-    };
-    for offset in 0..FUNCTION_NAME_MAX_BYTES {
-        if offset >= len {
-            break;
-        }
-        key.bytes[offset] = unsafe { name.add(offset).read() };
+    let mut key_storage = MaybeUninit::<FunctionNameKey>::uninit();
+    zero_function_name_key(&mut key_storage);
+    // SAFETY: zero_function_name_key initialized every byte of the key.
+    let key = unsafe { key_storage.assume_init_mut() };
+    key.len = len as u32;
+    // Keep every condition and address offset constant. Volatile accesses
+    // prevent LLVM from recovering a variable-length memcpy, while each
+    // source byte remains guarded by the helper-initialized `len`.
+    macro_rules! copy_name_byte {
+        ($offset:literal) => {
+            if $offset < len {
+                let byte = unsafe { core::ptr::read_volatile(name.add($offset)) };
+                unsafe {
+                    core::ptr::write_volatile(key.bytes.as_mut_ptr().add($offset), byte);
+                }
+            }
+        };
     }
-    match unsafe { ASYNC_FUNCTIONS.get(&key) }.copied() {
+    copy_name_byte!(0);
+    copy_name_byte!(1);
+    copy_name_byte!(2);
+    copy_name_byte!(3);
+    copy_name_byte!(4);
+    copy_name_byte!(5);
+    copy_name_byte!(6);
+    copy_name_byte!(7);
+    copy_name_byte!(8);
+    copy_name_byte!(9);
+    copy_name_byte!(10);
+    copy_name_byte!(11);
+    copy_name_byte!(12);
+    copy_name_byte!(13);
+    copy_name_byte!(14);
+    copy_name_byte!(15);
+    copy_name_byte!(16);
+    copy_name_byte!(17);
+    copy_name_byte!(18);
+    copy_name_byte!(19);
+    copy_name_byte!(20);
+    copy_name_byte!(21);
+    copy_name_byte!(22);
+    copy_name_byte!(23);
+    copy_name_byte!(24);
+    copy_name_byte!(25);
+    copy_name_byte!(26);
+    match unsafe { ASYNC_FUNCTIONS.get(key) }.copied() {
         Some(id) => start.target_function = id,
         None => capture_failure(start),
     }
 }
 
+const ENTRY_ABI_MIXED: u8 = 0;
+const ENTRY_ABI_LP64: u8 = 1;
+const ENTRY_ABI_ILP32: u8 = 2;
+
 #[uprobe]
 pub fn p11_entry(ctx: ProbeContext) -> u32 {
-    p11_entry_impl::<0>(ctx)
+    #[cfg(not(feature = "unsafe-unvalidated-metadata"))]
+    return p11_entry_impl::<0, ENTRY_ABI_MIXED>(ctx);
+    #[cfg(feature = "unsafe-unvalidated-metadata")]
+    return p11_entry_impl::<0, ENTRY_ABI_LP64>(ctx);
+}
+
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+#[uprobe]
+pub fn p11_entry_ia32(ctx: ProbeContext) -> u32 {
+    p11_entry_impl::<0, ENTRY_ABI_ILP32>(ctx)
 }
 
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 #[uprobe]
 pub fn p11_entry_template(ctx: ProbeContext) -> u32 {
-    p11_entry_impl::<1>(ctx)
+    p11_entry_impl::<1, ENTRY_ABI_MIXED>(ctx)
 }
 
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 #[uprobe]
 pub fn p11_entry_template_types(ctx: ProbeContext) -> u32 {
-    p11_entry_impl::<2>(ctx)
+    p11_entry_impl::<2, ENTRY_ABI_MIXED>(ctx)
 }
 
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 #[uprobe]
 pub fn p11_entry_template_pair(ctx: ProbeContext) -> u32 {
-    p11_entry_impl::<3>(ctx)
+    p11_entry_impl::<3, ENTRY_ABI_MIXED>(ctx)
 }
 
 #[cfg(feature = "unsafe-unvalidated-metadata")]
@@ -1619,7 +2082,12 @@ pub fn p11_entry_template_second(ctx: ProbeContext) -> u32 {
         slot,
         _pad: 0,
     };
-    let Some(start) = START.get_ptr_mut(&key) else {
+    let Some(layout) = probe_layout(&ctx) else {
+        let _ = owned_start_remove(&key, false);
+        bump_evidence(EVIDENCE_ABI_REFUSALS);
+        return 0;
+    };
+    let Some(start) = owned_start_mut(&key) else {
         bump_evidence(EVIDENCE_TEMPLATE_TAIL_FAILURES);
         return 0;
     };
@@ -1627,39 +2095,95 @@ pub fn p11_entry_template_second(ctx: ProbeContext) -> u32 {
     // SAFETY: START owns this per-thread/per-slot value until the return
     // probe removes it; the primary entry program has already inserted it.
     let start = unsafe { &mut *start };
-    if let Some(template) = capture_scalar(&ctx, semantics.template1_arg, start) {
-        if let Some(count) = capture_scalar(&ctx, semantics.template_count1_arg, start) {
-            walk_template::<false, true>(template, count, start);
+    if let Some(template) = capture_scalar(&ctx, semantics.template1_arg, layout, start) {
+        if let Some(count) = capture_scalar(&ctx, semantics.template_count1_arg, layout, start) {
+            walk_template::<false, true>(template, count, layout, start);
         }
     }
     0
 }
 
+unsafe extern "C" {
+    fn p11_root_current_tag() -> u64;
+    fn p11_root_current_exit();
+    fn p11_link_current_identity(out: *mut ImageIdentity) -> u32;
+    fn p11_owner_healthy() -> u32;
+    fn p11_owner_cleanup();
+    fn p11_owner_start_get(key: *const StartKey, required: u32) -> *mut CallStart;
+    fn p11_owner_start_insert(key: *const StartKey, value: *const CallStart) -> i64;
+    fn p11_owner_start_remove(key: *const StartKey, required: u32) -> i64;
+    fn p11_owner_discovery_get(key: *const StateKey, required: u32) -> *mut StartState;
+    fn p11_owner_discovery_insert(
+        key: *const StateKey,
+        value: *const StartState,
+        flags: u64,
+    ) -> i64;
+    fn p11_owner_discovery_remove(key: *const StateKey, required: u32) -> i64;
+}
+
+// All pairing map access is mediated by the native current-task owner. These
+// thin wrappers retain the existing callers' success/failure behavior.
+#[inline(always)]
+fn owned_start_get(key: &StartKey) -> Option<&'static CallStart> {
+    unsafe { p11_owner_start_get(key, 0).as_ref() }
+}
+
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+#[inline(always)]
+fn owned_start_mut(key: &StartKey) -> Option<*mut CallStart> {
+    let pointer = unsafe { p11_owner_start_get(key, 1) };
+    (!pointer.is_null()).then_some(pointer)
+}
+
+#[inline(always)]
+fn owned_start_remove(key: &StartKey, required: bool) -> Result<(), ()> {
+    (unsafe { p11_owner_start_remove(key, u32::from(required)) } == 0)
+        .then_some(())
+        .ok_or(())
+}
+
+#[inline(always)]
+fn owned_discovery_get(key: &StateKey, required: bool) -> Option<&'static StartState> {
+    unsafe { p11_owner_discovery_get(key, u32::from(required)).as_ref() }
+}
+
+#[inline(always)]
+fn owned_discovery_insert(key: &StateKey, state: &StartState, flags: u64) -> Result<(), ()> {
+    (unsafe { p11_owner_discovery_insert(key, state, flags) } == 0)
+        .then_some(())
+        .ok_or(())
+}
+
+#[inline(always)]
+fn owned_discovery_remove(key: &StateKey, required: bool) -> Result<(), ()> {
+    (unsafe { p11_owner_discovery_remove(key, u32::from(required)) } == 0)
+        .then_some(())
+        .ok_or(())
+}
+
+#[inline(always)]
 fn store_start(key: &StartKey, start: &CallStart) -> bool {
-    if START
-        .insert(key, start, aya_ebpf::bindings::BPF_NOEXIST as u64)
-        .is_ok()
-    {
+    if unsafe { p11_owner_start_insert(key, start) } == 0 {
         return true;
     }
-    // A same-thread/same-slot ambiguous nested call makes both returns
-    // untrustworthy. Invalidate the outer record so neither return can
-    // combine entry state from one invocation with the other.
-    let _ = START.remove(key);
+    // Native NOEXIST handling invalidates the ambiguous invocation and settles
+    // its count/index before reporting failure. Never delete by numeric key here.
     bump_evidence(EVIDENCE_START_INSERT_FAILURES);
     false
 }
 
+#[inline(always)]
 fn record_aggregate_start(key: &StartKey) {
-    let start = CallStart {
-        ts_ns: unsafe { helpers::bpf_ktime_get_ns() },
-        ..CallStart::default()
-    };
-    let _ = store_start(key, &start);
+    let mut storage = MaybeUninit::<CallStart>::uninit();
+    zero_call_start(&mut storage);
+    // SAFETY: zero_call_start initialized every byte, including padding.
+    let start = unsafe { storage.assume_init_mut() };
+    start.ts_ns = unsafe { helpers::bpf_ktime_get_ns() };
+    let _ = store_start(key, start);
 }
 
 #[inline(always)]
-fn p11_entry_impl<const TEMPLATE_MODE: u8>(ctx: ProbeContext) -> u32 {
+fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContext) -> u32 {
     let slot = slot_of(&ctx);
     if slot >= MAX_SLOTS {
         return 0;
@@ -1667,68 +2191,80 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8>(ctx: ProbeContext) -> u32 {
     let Some(flags) = scope_flags() else {
         return 0;
     };
-    if let Some(stats) = STATS.get_ptr_mut(slot) {
-        // SAFETY: PerCpuArray gives this CPU exclusive access to its own
-        // copy; there is no cross-CPU aliasing to race with.
-        unsafe { (*stats).entered += 1 };
-    }
     let key = StartKey {
         pid_tgid: helpers::bpf_get_current_pid_tgid(),
         slot,
         _pad: 0,
     };
+    let Some(actual_layout) = probe_layout(&ctx) else {
+        let _ = owned_start_remove(&key, false);
+        bump_evidence(EVIDENCE_ABI_REFUSALS);
+        return 0;
+    };
+    let layout = if ENTRY_ABI == ENTRY_ABI_LP64 {
+        if !matches!(actual_layout, LinuxLayout::Lp64) {
+            let _ = owned_start_remove(&key, false);
+            bump_evidence(EVIDENCE_ABI_REFUSALS);
+            return 0;
+        }
+        LinuxLayout::Lp64
+    } else if ENTRY_ABI == ENTRY_ABI_ILP32 {
+        if !matches!(actual_layout, LinuxLayout::Ilp32) {
+            let _ = owned_start_remove(&key, false);
+            bump_evidence(EVIDENCE_ABI_REFUSALS);
+            return 0;
+        }
+        LinuxLayout::Ilp32
+    } else {
+        actual_layout
+    };
+    if let Some(stats) = STATS.get_ptr_mut(slot) {
+        // SAFETY: PerCpuArray gives this CPU exclusive access to its own
+        // copy; there is no cross-CPU aliasing to race with.
+        unsafe { (*stats).entered += 1 };
+    }
     if flags & FLAG_POLICY_AGGREGATE != 0 {
         record_aggregate_start(&key);
         return 0;
     }
     let semantics = semantics_of(&ctx);
-    let mut start = CallStart {
-        ts_ns: unsafe { helpers::bpf_ktime_get_ns() },
-        session: SESSION_NONE,
-        slot_id: 0,
-        mechanism: MECH_NONE,
-        mechanism_ptr: 0,
-        flags: 0,
-        out_ptr: 0,
-        user_type: USER_TYPE_NONE,
-        shape: shape::NONE,
-        p0: 0,
-        p1: 0,
-        p2: 0,
-        async_value: 0,
-        attr_types: [0; MAX_ATTRS],
-        attr_count: 0,
-        attr_total: 0,
-        attr_bools: 0,
-        attr_bools_seen: 0,
-        attr_types1: [0; MAX_ATTRS],
-        attr_count1: 0,
-        attr_total1: 0,
-        attr_bools1: 0,
-        attr_bools_seen1: 0,
-        capture: capture::MECHANISM_NONE | capture::OUTPUT_NONE,
-        target_function: FUNCTION_NONE,
-        _pad: 0,
-    };
+    let mut storage = MaybeUninit::<CallStart>::uninit();
+    zero_call_start(&mut storage);
+    // SAFETY: zero_call_start initialized every byte, including padding.
+    let start = unsafe { storage.assume_init_mut() };
+    start.ts_ns = unsafe { helpers::bpf_ktime_get_ns() };
+    // Write into caller-owned initialized storage: a second live identity
+    // temporary would increase diagnostic entry call-chain stack usage.
+    if unsafe { p11_link_current_identity(&mut start.image) } != 1 || start.image.task_cookie == 0 {
+        let _ = owned_start_remove(&key, false);
+        bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
+        return 0;
+    }
+    start.session = SESSION_NONE;
+    start.mechanism = MECH_NONE;
+    start.user_type = USER_TYPE_NONE;
+    start.shape = shape::NONE;
+    start.capture = capture::MECHANISM_NONE | capture::OUTPUT_NONE;
+    start.target_function = FUNCTION_NONE;
 
-    if let Some(value) = capture_scalar(&ctx, semantics.session_arg, &mut start) {
+    if let Some(value) = capture_scalar(&ctx, semantics.session_arg, layout, start) {
         start.session = value;
     }
-    if let Some(value) = capture_scalar(&ctx, semantics.slot_arg, &mut start) {
+    if let Some(value) = capture_scalar(&ctx, semantics.slot_arg, layout, start) {
         start.slot_id = value;
     }
-    if let Some(value) = capture_scalar(&ctx, semantics.flags_arg, &mut start) {
+    if let Some(value) = capture_scalar(&ctx, semantics.flags_arg, layout, start) {
         start.flags = value;
         if semantics.lifecycle == lifecycle::OPEN_SESSION && value & 0x8 != 0 {
             start.capture |= capture::ASYNC_SESSION;
         }
     }
-    if let Some(value) = capture_scalar(&ctx, semantics.user_type_arg, &mut start) {
+    if let Some(value) = capture_scalar(&ctx, semantics.user_type_arg, layout, start) {
         start.user_type = value as u32;
     }
 
     if semantics.mechanism_arg != ARG_NONE {
-        match capture_scalar(&ctx, semantics.mechanism_arg, &mut start) {
+        match capture_scalar(&ctx, semantics.mechanism_arg, layout, start) {
             None => {
                 start.capture =
                     (start.capture & !capture::MECHANISM_MASK) | capture::MECHANISM_UNREADABLE;
@@ -1741,7 +2277,7 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8>(ctx: ProbeContext) -> u32 {
                 start.mechanism_ptr = pointer;
                 #[cfg(feature = "unsafe-unvalidated-metadata")]
                 if flags & FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA != 0 {
-                    match unsafe { helpers::bpf_probe_read_user(pointer as *const u64) } {
+                    match read_word(pointer, layout) {
                         Ok(mechanism) => {
                             start.mechanism = mechanism;
                             start.capture = (start.capture & !capture::MECHANISM_MASK)
@@ -1750,13 +2286,37 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8>(ctx: ProbeContext) -> u32 {
                                 .copied()
                                 .unwrap_or(shape::NONE);
                             if parameter_shape != shape::NONE {
-                                decode_params(pointer, parameter_shape, &mut start);
+                                // Project the narrow output from the whole
+                                // CallStart pointer. No additional stack object
+                                // is introduced, and the global helper's BTF
+                                // contract covers only p0/p1/p2.
+                                let output = unsafe {
+                                    (start as *mut CallStart)
+                                        .cast::<u8>()
+                                        .add(core::mem::offset_of!(CallStart, p0))
+                                        .cast::<ParamsOutput>()
+                                };
+                                let decoded_shape = unsafe {
+                                    p11_decode_params(
+                                        pointer,
+                                        parameter_shape,
+                                        layout.word_bytes() as u32,
+                                        output,
+                                    )
+                                };
+                                match decoded_shape {
+                                    shape::RSA_PKCS_PSS | shape::GCM_V220 | shape::GCM_V240 => {
+                                        start.shape = decoded_shape;
+                                    }
+                                    shape::NONE => {}
+                                    _ => capture_failure(start),
+                                }
                             }
                         }
                         Err(_) => {
                             start.capture = (start.capture & !capture::MECHANISM_MASK)
                                 | capture::MECHANISM_UNREADABLE;
-                            capture_failure(&mut start);
+                            capture_failure(start);
                         }
                     }
                 }
@@ -1765,7 +2325,7 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8>(ctx: ProbeContext) -> u32 {
     }
 
     if semantics.output_arg != ARG_NONE {
-        match capture_scalar(&ctx, semantics.output_arg, &mut start) {
+        match capture_scalar(&ctx, semantics.output_arg, layout, start) {
             None => {
                 start.capture =
                     (start.capture & !capture::OUTPUT_MASK) | capture::OUTPUT_UNREADABLE;
@@ -1791,28 +2351,34 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8>(ctx: ProbeContext) -> u32 {
             // second helper call makes LLVM spill an uninitialized `None`
             // payload, which the BPF verifier rejects even though Rust would
             // test both discriminants before use.
-            if let Some(template) = capture_scalar(&ctx, semantics.template0_arg, &mut start) {
-                if let Some(count) = capture_scalar(&ctx, semantics.template_count0_arg, &mut start)
+            if let Some(template) = capture_scalar(&ctx, semantics.template0_arg, layout, start) {
+                if let Some(count) =
+                    capture_scalar(&ctx, semantics.template_count0_arg, layout, start)
                 {
                     if TEMPLATE_MODE == 2 {
-                        walk_template::<true, false>(template, count, &mut start);
+                        walk_template::<true, false>(template, count, layout, start);
                     } else {
-                        walk_template::<false, false>(template, count, &mut start);
+                        walk_template::<false, false>(template, count, layout, start);
                     }
                 }
             }
         }
     }
     if TEMPLATE_MODE == 0 && semantics.async_name_arg != ARG_NONE {
-        capture_async_target(&ctx, semantics.async_name_arg, &mut start);
+        if let Some(pointer) = capture_scalar(&ctx, semantics.async_name_arg, layout, start) {
+            capture_async_target(pointer, start);
+        }
         match semantics.lifecycle {
             lifecycle::ASYNC_JOIN => {
-                if let Some(value) = capture_scalar(&ctx, semantics.async_value_arg, &mut start) {
+                if let Some(value) = capture_scalar(&ctx, semantics.async_value_arg, layout, start)
+                {
                     start.async_value = value;
                 }
             }
             lifecycle::ASYNC_GET_ID => {
-                if let Some(pointer) = capture_scalar(&ctx, semantics.async_value_arg, &mut start) {
+                if let Some(pointer) =
+                    capture_scalar(&ctx, semantics.async_value_arg, layout, start)
+                {
                     start.out_ptr = pointer;
                 }
             }
@@ -1820,7 +2386,7 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8>(ctx: ProbeContext) -> u32 {
         }
     }
 
-    if !store_start(&key, &start) {
+    if !store_start(&key, start) {
         return 0;
     }
     #[cfg(feature = "unsafe-unvalidated-metadata")]
@@ -1848,25 +2414,30 @@ pub fn p11_return(ctx: RetProbeContext) -> u32 {
         // Entry-time scope owns this pairing record. If a task migrates out
         // of a selected cgroup mid-call, clean it up without emitting an
         // out-of-scope event and disclose the lost completion.
-        if START.remove(&key).is_ok() {
+        if owned_start_remove(&key, false).is_ok() {
             bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
         }
+        return 0;
+    };
+    let Some(layout) = ret_probe_layout(&ctx) else {
+        let _ = owned_start_remove(&key, false);
+        bump_evidence(EVIDENCE_ABI_REFUSALS);
         return 0;
     };
     // No start entry means the entry probe filtered this call out (or the
     // process was already inside the function at attach time). Either way
     // there is nothing to attribute.
-    let Some(&start) = (unsafe { START.get(&key) }) else {
+    let Some(&start) = owned_start_get(&key) else {
         return 0;
     };
-    if START.remove(&key).is_err() {
+    if owned_start_remove(&key, true).is_err() {
         bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
         return 0;
     }
 
     let now = unsafe { helpers::bpf_ktime_get_ns() };
     let delta = now.saturating_sub(start.ts_ns);
-    let rv: u64 = ctx.ret();
+    let rv = normalize_target_word(ctx.ret(), layout);
 
     if let Some(stats) = STATS.get_ptr_mut(slot) {
         // SAFETY: as in p11_entry — per-CPU storage, no aliasing.
@@ -1896,6 +2467,16 @@ pub fn p11_return(ctx: RetProbeContext) -> u32 {
         return 0;
     }
 
+    // Physical ownership and successful settlement above guard aggregate pairing.
+    // Image equality additionally guards retained semantic pointer reads.
+    let mut image = ImageIdentity::default();
+    if unsafe { p11_link_current_identity(&mut image) } != 1
+        || !image_pair_matches(start.image, image)
+    {
+        bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
+        return 0;
+    }
+
     let semantics = semantics_of(&ctx);
     let mut mechanism = start.mechanism;
     let mut capture_flags = start.capture;
@@ -1903,7 +2484,7 @@ pub fn p11_return(ctx: RetProbeContext) -> u32 {
         && return_allows_mechanism(rv)
         && start.mechanism_ptr != 0
     {
-        match unsafe { helpers::bpf_probe_read_user(start.mechanism_ptr as *const u64) } {
+        match read_word(start.mechanism_ptr, layout) {
             Ok(value) if unsafe { MECH_SHAPE.get(&value) }.is_some() => {
                 mechanism = value;
                 capture_flags =
@@ -1924,14 +2505,14 @@ pub fn p11_return(ctx: RetProbeContext) -> u32 {
         && (rv == 0 || rv == 0x204)
     {
         // C_OpenSession wrote the handle by now. Only trust it on success.
-        match unsafe { helpers::bpf_probe_read_user(start.out_ptr as *const u64) } {
+        match read_word(start.out_ptr, layout) {
             Ok(value) => session = value,
             Err(_) => bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES),
         }
     }
     let mut async_value = start.async_value;
     if rv == 0 && start.out_ptr != 0 && semantics.lifecycle == lifecycle::ASYNC_GET_ID {
-        match unsafe { helpers::bpf_probe_read_user(start.out_ptr as *const u64) } {
+        match read_word(start.out_ptr, layout) {
             Ok(value) => async_value = value,
             Err(_) => {
                 capture_flags |= capture::ASYNC_VALUE_UNREADABLE;
@@ -1970,6 +2551,9 @@ pub fn p11_return(ctx: RetProbeContext) -> u32 {
         attr_bools_seen1: start.attr_bools_seen1,
         capture: capture_flags,
         event_type: event_type::CALL,
+        image: start.image,
+        child_image: ImageIdentity::default(),
+        root_affiliation: unsafe { p11_root_current_tag() },
     };
     match EVENTS.reserve::<Event>(0) {
         Some(mut e) => {
@@ -1983,36 +2567,35 @@ pub fn p11_return(ctx: RetProbeContext) -> u32 {
     0
 }
 
-#[tracepoint(category = "task", name = "task_newtask")]
-pub fn task_newtask(ctx: TracePointContext) -> u32 {
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn p11_link_fork_allowed() -> u32 {
     let Some(scope) = scope_auth() else {
         return 0;
     };
     if scope.flags & FLAG_CGROUP_FILTER == 0 {
         return 0;
     }
-    let flags = scope.flags;
-    if flags & FLAG_POLICY_AGGREGATE != 0 {
+    u32::from(scope.flags & FLAG_POLICY_AGGREGATE == 0)
+}
+
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub unsafe extern "C" fn p11_link_emit_fork(
+    child_pid: u32,
+    clone_flags: u64,
+    parent: *const ImageIdentity,
+    child: *const ImageIdentity,
+) -> u32 {
+    // C calls synchronously with initialized stack pairs; no pointer escapes.
+    if parent.is_null() || child.is_null() {
         return 0;
     }
-    let Some((pid_offset, clone_flags_offset)) = CONFIG
-        .get(CFG_TASK_NEWTASK_OFFSETS)
-        .copied()
-        .and_then(unpack_task_newtask_offsets)
-    else {
+    let image = unsafe { *parent };
+    let child_image = unsafe { *child };
+    if image.task_cookie == 0 || child_image.task_cookie == 0 {
         return 0;
-    };
-    // SAFETY: userspace parsed and checked both offsets from this tracepoint's
-    // live tracefs format before freezing CONFIG and attaching this program.
-    let Ok(pid) = (unsafe { ctx.read_at::<i32>(pid_offset) }) else {
-        return 0;
-    };
-    let Ok(clone_flags) = (unsafe { ctx.read_at::<u64>(clone_flags_offset) }) else {
-        return 0;
-    };
-    let Ok(child_pid) = u32::try_from(pid) else {
-        return 0;
-    };
+    }
     let Some(event_type) = classify_task_newtask(clone_flags) else {
         return 0;
     };
@@ -2021,6 +2604,9 @@ pub fn task_newtask(ctx: TracePointContext) -> u32 {
     }
     let creator_tgid = helpers::bpf_get_current_pid_tgid() >> 32;
     let ev = Event {
+        image,
+        child_image,
+        root_affiliation: unsafe { p11_root_current_tag() },
         pid_tgid: creator_tgid << 32,
         session: child_pid as u64,
         event_type,

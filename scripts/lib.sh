@@ -51,81 +51,308 @@ capped_container_tar() {
     }
 }
 
-recording_launcher_active() {
-    rla_pid=$1
-    kill -0 "$rla_pid" 2>/dev/null || return 1
-    ! awk '{ sub(/^[0-9]+ \(.*\) /, ""); exit(substr($0, 1, 1) == "Z" ? 0 : 1) }' \
-        "/proc/$rla_pid/stat" 2>/dev/null
+# Gate scripts source this library from the repository root. Capture that
+# location before a caller changes cwd; the helper never consumes command stdin.
+RECORDED_PROCESS_EXEC=$(pwd -P)/scripts/recorded-process-exec.py
+
+recorded_process_control() {
+    python3 -I "$RECORDED_PROCESS_EXEC" "$@"
 }
 
-terminate_recording_launcher() {
-    trl_pid=$1
-    case $trl_pid in ''|*[!0-9]*) return 1 ;; esac
-    kill "$trl_pid" 2>/dev/null || true
-    trl_attempt=0
-    while recording_launcher_active "$trl_pid" && [ "$trl_attempt" -lt 100 ]; do
-        trl_attempt=$((trl_attempt + 1))
-        sleep 0.05
-    done
-    if recording_launcher_active "$trl_pid"; then
-        kill -KILL "$trl_pid" 2>/dev/null || return 1
-        trl_attempt=0
-        while recording_launcher_active "$trl_pid" && [ "$trl_attempt" -lt 100 ]; do
-            trl_attempt=$((trl_attempt + 1))
-            sleep 0.05
-        done
+# Read the coordinator's own Linux identity without forking, changing caller
+# positional parameters, or retaining a modified IFS.
+recorded_process_coordinator_identity() {
+    RECORDED_COORDINATOR_PID=
+    RECORDED_COORDINATOR_STARTTIME=
+    if ! IFS= read -r _rp_coordinator_stat </proc/self/stat; then
+        unset _rp_coordinator_stat
+        return 1
     fi
-    recording_launcher_active "$trl_pid" && return 1
-    wait "$trl_pid" 2>/dev/null || true
+    _rp_coordinator_pid=${_rp_coordinator_stat%% *}
+    _rp_coordinator_tail=${_rp_coordinator_stat##*) }
+    if [ "$_rp_coordinator_tail" = "$_rp_coordinator_stat" ]; then
+        unset _rp_coordinator_stat _rp_coordinator_pid _rp_coordinator_tail
+        return 1
+    fi
+    if ! IFS=' ' read -r _rp_coordinator_state _rp_coordinator_ppid _rp_coordinator_pgrp \
+        _rp_coordinator_session _rp_coordinator_tty _rp_coordinator_tpgid _rp_coordinator_flags \
+        _rp_coordinator_minflt _rp_coordinator_cminflt _rp_coordinator_majflt \
+        _rp_coordinator_cmajflt _rp_coordinator_utime _rp_coordinator_stime \
+        _rp_coordinator_cutime _rp_coordinator_cstime _rp_coordinator_priority \
+        _rp_coordinator_nice _rp_coordinator_threads _rp_coordinator_itrealvalue \
+        _rp_coordinator_starttime _rp_coordinator_rest <<EOF
+$_rp_coordinator_tail
+EOF
+    then
+        unset _rp_coordinator_stat _rp_coordinator_pid _rp_coordinator_tail \
+            _rp_coordinator_state _rp_coordinator_ppid _rp_coordinator_pgrp \
+            _rp_coordinator_session _rp_coordinator_tty _rp_coordinator_tpgid \
+            _rp_coordinator_flags _rp_coordinator_minflt _rp_coordinator_cminflt \
+            _rp_coordinator_majflt _rp_coordinator_cmajflt _rp_coordinator_utime \
+            _rp_coordinator_stime _rp_coordinator_cutime _rp_coordinator_cstime \
+            _rp_coordinator_priority _rp_coordinator_nice _rp_coordinator_threads \
+            _rp_coordinator_itrealvalue _rp_coordinator_starttime _rp_coordinator_rest
+        return 1
+    fi
+    case $_rp_coordinator_pid:$_rp_coordinator_starttime in
+        ''|*[!0-9:]*|0:*|*:0)
+            unset _rp_coordinator_stat _rp_coordinator_pid _rp_coordinator_tail \
+                _rp_coordinator_state _rp_coordinator_ppid _rp_coordinator_pgrp \
+                _rp_coordinator_session _rp_coordinator_tty _rp_coordinator_tpgid \
+                _rp_coordinator_flags _rp_coordinator_minflt _rp_coordinator_cminflt \
+                _rp_coordinator_majflt _rp_coordinator_cmajflt _rp_coordinator_utime \
+                _rp_coordinator_stime _rp_coordinator_cutime _rp_coordinator_cstime \
+                _rp_coordinator_priority _rp_coordinator_nice _rp_coordinator_threads \
+                _rp_coordinator_itrealvalue _rp_coordinator_starttime _rp_coordinator_rest
+            return 1
+            ;;
+    esac
+    RECORDED_COORDINATOR_PID=$_rp_coordinator_pid
+    RECORDED_COORDINATOR_STARTTIME=$_rp_coordinator_starttime
+    unset _rp_coordinator_stat _rp_coordinator_pid _rp_coordinator_tail \
+        _rp_coordinator_state _rp_coordinator_ppid _rp_coordinator_pgrp \
+        _rp_coordinator_session _rp_coordinator_tty _rp_coordinator_tpgid \
+        _rp_coordinator_flags _rp_coordinator_minflt _rp_coordinator_cminflt \
+        _rp_coordinator_majflt _rp_coordinator_cmajflt _rp_coordinator_utime \
+        _rp_coordinator_stime _rp_coordinator_cutime _rp_coordinator_cstime \
+        _rp_coordinator_priority _rp_coordinator_nice _rp_coordinator_threads \
+        _rp_coordinator_itrealvalue _rp_coordinator_starttime _rp_coordinator_rest
+}
+
+# 0: exact generation live; 1: gone/replaced/zombie; 2: observation unknown.
+recording_launcher_active() {
+    RECORDED_LAUNCHER_STATE=unknown
+    [ "$#" -eq 2 ] || return 2
+    if rla_state=$(recorded_process_control active "$1" "$2"); then rla_status=0; else rla_status=$?; fi
+    case $rla_status:$rla_state in
+        0:live|1:gone|1:zombie|1:replaced) RECORDED_LAUNCHER_STATE=$rla_state; return "$rla_status" ;;
+        *) return 2 ;;
+    esac
+}
+
+# Successful termination proves the original generation ended. Reaping remains
+# the owning caller's job; a numeric wait here could wait on a reused child PID.
+terminate_recording_launcher() {
+    [ "$#" -ge 2 ] && [ "$#" -le 3 ] || return 2
+    trl_pid=$1
+    trl_starttime=$2
+    trl_privilege=${3:-user}
+    case $trl_privilege in user|root) ;; *) return 2 ;; esac
+    if recording_launcher_active "$trl_pid" "$trl_starttime"; then
+        trl_state=0
+    else
+        trl_state=$?
+    fi
+    case $trl_state in 1) return 0 ;; 0) ;; *) return 2 ;; esac
+    for trl_signal in TERM KILL; do
+        if ! signal_pinned_process "$trl_privilege" "$trl_signal" "$trl_pid" "$trl_starttime"; then
+            if recording_launcher_active "$trl_pid" "$trl_starttime"; then return 1; else trl_state=$?; fi
+            [ "$trl_state" -eq 1 ] && return 0
+            return 2
+        fi
+        if recorded_process_control wait-gone "$trl_pid" "$trl_starttime" >/dev/null; then
+            trl_state=0
+        else
+            trl_state=$?
+        fi
+        case $trl_state in 1) return 0 ;; 0) ;; *) return 2 ;; esac
+    done
+    return 1
+}
+
+# Publish every field in the calling shell before issuing the matching ACK.
+# ROOT/USER_RECORD_IDENTITY contains the full pinned context (including the
+# absolute monotonic deadline); CONTROL is its path and PHASE is trap-visible.
+publish_recorded_process_fields() {
+    if [ "$_rp_mode" = root ]; then
+        ROOT_RECORD_CONTROL=$_rp_path ROOT_RECORD_IDENTITY=$_rp_context ROOT_RECORD_PHASE=$_rp_phase
+        ROOT_LAUNCH_PID=$_rp_launcher ROOT_LAUNCH_STARTTIME=$_rp_launch_start
+        ROOT_PROCESS_PID=$_rp_process ROOT_PROCESS_STARTTIME=$_rp_process_start
+        export ROOT_RECORD_CONTROL ROOT_RECORD_IDENTITY ROOT_RECORD_PHASE ROOT_LAUNCH_PID \
+            ROOT_LAUNCH_STARTTIME ROOT_PROCESS_PID ROOT_PROCESS_STARTTIME
+    else
+        USER_RECORD_CONTROL=$_rp_path USER_RECORD_IDENTITY=$_rp_context USER_RECORD_PHASE=$_rp_phase
+        USER_PROCESS_LAUNCH_PID=$_rp_launcher USER_PROCESS_LAUNCH_STARTTIME=$_rp_launch_start
+        USER_PROCESS_PID=$_rp_process USER_PROCESS_STARTTIME=$_rp_process_start
+        export USER_RECORD_CONTROL USER_RECORD_IDENTITY USER_RECORD_PHASE USER_PROCESS_LAUNCH_PID \
+            USER_PROCESS_LAUNCH_STARTTIME USER_PROCESS_PID USER_PROCESS_STARTTIME
+    fi
+}
+
+recorded_process_launch_failed() {
+    recorded_process_control cancel "$_rp_context" || return 1
+    # No tuple is erased on failure. A caller trap owns bounded finalization.
+    return 1
+}
+
+launch_recorded_process() {
+    _rp_mode=$1 _rp_pidfile=$2 _rp_log=$3 _rp_stderr=$4
+    shift 4
+    [ "$#" -gt 0 ] || return 1
+    if [ "$_rp_mode" = root ]; then
+        [ -z "${ROOT_RECORD_CONTROL:-}" ] || return 1
+    else
+        [ -z "${USER_RECORD_CONTROL:-}" ] || return 1
+    fi
+    _rp_prepared=$(recorded_process_control prepare "$_rp_pidfile" 8) || return 1
+    { IFS= read -r _rp_path; IFS= read -r _rp_context; } <<EOF
+$_rp_prepared
+EOF
+    _rp_launcher= _rp_launch_start= _rp_process= _rp_process_start= _rp_phase=prepared
+    publish_recorded_process_fields
+    if ! recorded_process_coordinator_identity \
+        || ! recorded_process_control bind-coordinator "$_rp_context" \
+            "$RECORDED_COORDINATOR_PID" "$RECORDED_COORDINATOR_STARTTIME"; then
+        recorded_process_control cleanup "$_rp_context" || return 1
+        _rp_path= _rp_context= _rp_phase=finalized
+        publish_recorded_process_fields
+        return 1
+    fi
+    # Async POSIX shells otherwise replace inherited stdin with /dev/null.
+    # Explicit duplication preserves it, without using it as a control channel.
+    if [ "$_rp_mode" = root ]; then
+        set -- python3 -I "$RECORDED_PROCESS_EXEC" exec "$_rp_context" launcher - \
+            sudo -n python3 -I "$RECORDED_PROCESS_EXEC" exec "$_rp_context" root "$_rp_pidfile" "$@"
+    else
+        set -- python3 -I "$RECORDED_PROCESS_EXEC" exec "$_rp_context" user "$_rp_pidfile" "$@"
+    fi
+    if [ -n "$_rp_stderr" ]; then
+        "$@" <&9 9<&- > "$_rp_log" 2> "$_rp_stderr" &
+    else
+        "$@" <&9 9<&- > "$_rp_log" 2>&1 &
+    fi
+    _rp_launcher=$!
+    _rp_phase=spawned
+    publish_recorded_process_fields
+    if [ "$_rp_mode" = root ]; then _rp_self_phase=launcher; else _rp_self_phase=user; fi
+    _rp_record=$(recorded_process_control read "$_rp_context" "$_rp_self_phase" self "$_rp_launcher" 0) \
+        || { recorded_process_launch_failed; return 1; }
+    # Strict native parsing has already required exactly these two integers.
+    _rp_launch_start=${_rp_record#* }
+    if [ "$_rp_mode" = user ]; then _rp_process=$_rp_launcher; _rp_process_start=$_rp_launch_start; fi
+    # ACK publication itself can be interrupted. This phase conservatively
+    # means execution may be authorized, even before the ACK helper returns.
+    _rp_phase=$_rp_self_phase-acknowledging
+    publish_recorded_process_fields
+    recorded_process_control ack "$_rp_context" "$_rp_self_phase" "$_rp_launcher" "$_rp_launch_start" \
+        || { recorded_process_launch_failed; return 1; }
+    _rp_phase=$_rp_self_phase-acknowledged
+    publish_recorded_process_fields
+    if [ "$_rp_mode" = root ]; then
+        _rp_record=$(recorded_process_control read "$_rp_context" root self 0 0) \
+            || { recorded_process_launch_failed; return 1; }
+        _rp_process=${_rp_record% *} _rp_process_start=${_rp_record#* } _rp_phase=root-acknowledging
+        publish_recorded_process_fields
+        recorded_process_control ack "$_rp_context" root "$_rp_process" "$_rp_process_start" \
+            || { recorded_process_launch_failed; return 1; }
+        _rp_phase=root-acknowledged
+        publish_recorded_process_fields
+    fi
+    recorded_process_control read "$_rp_context" "$_rp_mode" committed "$_rp_process" "$_rp_process_start" >/dev/null \
+        || { recorded_process_launch_failed; return 1; }
+    recorded_process_control cleanup "$_rp_context" || return 1
+    # A successful launch transfers its tuples to the caller. Only pending
+    # attempts block the next launch; finalizers must not kill transferred roles.
+    _rp_phase=committed _rp_path= _rp_context=
+    publish_recorded_process_fields
 }
 
 launch_root_recorded_process() {
-    lrrp_pidfile=$1
-    lrrp_log=$2
+    [ "$#" -ge 3 ] || return 1
+    _lrrp_pidfile=$1 _lrrp_log=$2
     shift 2
-    sudo -n sh -c '
-        umask 077
-        starttime=$(awk '\''{ sub(/^[0-9]+ \(.*\) /, ""); split($0, tail, " "); print tail[20]; exit }'\'' "/proc/$$/stat") || exit 1
-        set -C
-        printf "%s %s\n" "$$" "$starttime" > "$1" || exit 1
-        shift
-        exec "$@"
-    ' sh "$lrrp_pidfile" "$@" > "$lrrp_log" 2>&1 &
-    ROOT_LAUNCH_PID=$!
-    lrrp_record=$(wait_root_process_record "$lrrp_pidfile" "$ROOT_LAUNCH_PID") || {
-        lrrp_status=$?
-        if terminate_recording_launcher "$ROOT_LAUNCH_PID"; then
-            ROOT_LAUNCH_PID=
-            return "$lrrp_status"
+    launch_recorded_process root "$_lrrp_pidfile" "$_lrrp_log" "" "$@" 9<&0
+}
+
+launch_root_recorded_process_split() {
+    [ "$#" -ge 4 ] && [ -n "$3" ] || return 1
+    _lrrps_pidfile=$1 _lrrps_stdout=$2 _lrrps_stderr=$3
+    shift 3
+    launch_recorded_process root "$_lrrps_pidfile" "$_lrrps_stdout" "$_lrrps_stderr" "$@" 9<&0
+}
+
+launch_user_recorded_process() {
+    [ "$#" -ge 3 ] || return 1
+    _lurp_pidfile=$1 _lurp_log=$2
+    shift 2
+    launch_recorded_process user "$_lurp_pidfile" "$_lurp_log" "" "$@" 9<&0
+}
+
+finalize_recorded_process() {
+    frp_mode=$1
+    if [ "$frp_mode" = root ]; then
+        frp_context=${ROOT_RECORD_IDENTITY:-} frp_launcher=${ROOT_LAUNCH_PID:-}
+        frp_start=${ROOT_LAUNCH_STARTTIME:-} frp_pid=${ROOT_PROCESS_PID:-} frp_pstart=${ROOT_PROCESS_STARTTIME:-}
+    else
+        frp_context=${USER_RECORD_IDENTITY:-} frp_launcher=${USER_PROCESS_LAUNCH_PID:-}
+        frp_start=${USER_PROCESS_LAUNCH_STARTTIME:-} frp_pid=${USER_PROCESS_PID:-} frp_pstart=${USER_PROCESS_STARTTIME:-}
+    fi
+    [ -n "$frp_context" ] || return 0
+    recorded_process_control cancel "$frp_context" || return 1
+    # The shell may have been interrupted between backgrounding and storing
+    # $!. Even an empty tentative PID is not evidence that no wrapper exists.
+    [ -n "$frp_launcher" ] && [ -n "$frp_start" ] || return 1
+    if [ -n "$frp_pid" ]; then terminate_recording_launcher "$frp_pid" "$frp_pstart" "$frp_mode" || return 1; fi
+    if [ -n "$frp_launcher" ]; then
+        # Tentative $! alone never authorizes a signal, wait, or clearing custody.
+        [ -n "$frp_start" ] || return 1
+        terminate_recording_launcher "$frp_launcher" "$frp_start" "$frp_mode" || return 1
+    fi
+    recorded_process_control cleanup "$frp_context" || return 1
+    if [ "$frp_mode" = root ]; then
+        ROOT_RECORD_CONTROL= ROOT_RECORD_IDENTITY= ROOT_RECORD_PHASE=finalized
+        ROOT_LAUNCH_PID= ROOT_LAUNCH_STARTTIME= ROOT_PROCESS_PID= ROOT_PROCESS_STARTTIME=
+    else
+        USER_RECORD_CONTROL= USER_RECORD_IDENTITY= USER_RECORD_PHASE=finalized
+        USER_PROCESS_LAUNCH_PID= USER_PROCESS_LAUNCH_STARTTIME= USER_PROCESS_PID= USER_PROCESS_STARTTIME=
+    fi
+}
+
+finalize_root_recorded_process() { finalize_recorded_process root; }
+finalize_user_recorded_process() { finalize_recorded_process user; }
+
+# Generic durable reader: it never acknowledges an unrelated workload record.
+#
+# The reading PRINCIPAL must match whoever created the record. The custody
+# predicate in recorded-process-exec accepts owners `(0, os.getuid())` and reads
+# no environment at all, so reading a user-created record through `sudo` narrows
+# that set to {root} and refuses a record that is perfectly well formed --
+# SUDO_UID does not help, because nothing consults it. Both wrappers below run
+# the SAME strict predicate; only the principal differs. Do not "fix" a
+# mismatch by widening the privileged reader's accepted ownership: that would
+# let any user-created tuple satisfy a check whose whole purpose is to prove the
+# record came from the privileged recorded process.
+_wait_process_record() {
+    wpr_sudo=$1 wpr_label=$2 wpr_pidfile=$3 wpr_launcher=$4 wpr_starttime=$5
+    wpr_attempt=0
+    while [ "$wpr_attempt" -lt 160 ]; do
+        if wpr_record=$($wpr_sudo python3 -I "$RECORDED_PROCESS_EXEC" durable-read "$wpr_pidfile"); then
+            printf '%s\n' "$wpr_record"
+            return 0
+        else wpr_status=$?; fi
+        [ "$wpr_status" -eq 3 ] || return 2
+        if recording_launcher_active "$wpr_launcher" "$wpr_starttime"; then :; else
+            wpr_status=$?
+            return "$wpr_status"
         fi
-        return 1
-    }
-    set -- $lrrp_record
-    [ "$#" -eq 2 ] || return 1
-    ROOT_PROCESS_PID=$1
-    ROOT_PROCESS_STARTTIME=$2
+        wpr_attempt=$((wpr_attempt + 1))
+        sleep 0.05
+    done
+    echo "$wpr_label process identity was not recorded" >&2
+    return 1
 }
 
 wait_root_process_record() {
-    wrpr_pidfile=$1
-    wrpr_launcher=$2
-    wrpr_attempt=0
-    while ! sudo -n test -s "$wrpr_pidfile" && [ "$wrpr_attempt" -lt 160 ]; do
-        recording_launcher_active "$wrpr_launcher" || {
-            echo "root process exited before recording its identity" >&2
-            return 1
-        }
-        wrpr_attempt=$((wrpr_attempt + 1))
-        sleep 0.05
-    done
-    sudo -n test -s "$wrpr_pidfile" || {
-        echo "root process identity was not recorded" >&2
-        return 1
-    }
-    set -- $(sudo -n cat "$wrpr_pidfile")
-    [ "$#" -eq 2 ] || return 1
-    case $1:$2 in *[!0-9:]*) return 1 ;; esac
-    printf '%s %s\n' "$1" "$2"
+    [ "$#" -eq 3 ] || return 2
+    _wait_process_record "sudo -n" root "$1" "$2" "$3"
+}
+
+# For a workload the lane deliberately runs as the invoking user -- e.g. a
+# scope created by root but entered with --uid/--gid -- whose record is
+# therefore user-owned.
+wait_user_process_record() {
+    [ "$#" -eq 3 ] || return 2
+    _wait_process_record "" user "$1" "$2" "$3"
 }
 
 process_starttime() {
@@ -395,7 +622,7 @@ for path in glob.glob("/proc/[0-9]*"):
     pid = int(path.rsplit("/", 1)[1])
     try:
         starttime, ppid, actual_pgid, actual_sid = stat(pid)
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         # No membership can be established for a process that vanished before
         # its first stat read. Once the target group is identified below, any
         # later disappearance is a hard error.

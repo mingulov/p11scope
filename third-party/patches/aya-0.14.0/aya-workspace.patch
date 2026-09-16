@@ -1,0 +1,11 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index b8122c3..49a474c 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -387,3 +387,6 @@ unused_import_braces = "warn"
+ unused_lifetimes = "warn"
+ unused_macro_rules = "warn"
+ unused_qualifications = "warn"
++
++# Standalone tests must not join an ancestor checkout workspace.
++[workspace]

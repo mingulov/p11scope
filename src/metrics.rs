@@ -8,10 +8,10 @@ use crate::plan::{AttachPlan, ModuleId};
 use anyhow::{Context as _, Result};
 use aya::maps::{PerCpuArray, PerCpuHashMap};
 use p11scope_ebpf_common::{
-    EVIDENCE_CGROUP_SCOPE_FAILURES, EVIDENCE_RING_LOSS, EVIDENCE_RV_UPDATE_FAILURES,
-    EVIDENCE_SEMANTIC_CAPTURE_FAILURES, EVIDENCE_START_INSERT_FAILURES,
-    EVIDENCE_TEMPLATE_TAIL_FAILURES, EVIDENCE_UNMATCHED_RETURNS, EVIDENCE_UNREGISTERED_MECHANISMS,
-    LATENCY_BUCKETS, RvKey, SlotStats,
+    EVIDENCE_ABI_REFUSALS, EVIDENCE_CGROUP_SCOPE_FAILURES, EVIDENCE_RING_LOSS,
+    EVIDENCE_RV_UPDATE_FAILURES, EVIDENCE_SEMANTIC_CAPTURE_FAILURES,
+    EVIDENCE_START_INSERT_FAILURES, EVIDENCE_TEMPLATE_TAIL_FAILURES, EVIDENCE_UNMATCHED_RETURNS,
+    EVIDENCE_UNREGISTERED_MECHANISMS, LATENCY_BUCKETS, RvKey, SlotStats,
 };
 use std::collections::BTreeMap;
 
@@ -131,6 +131,7 @@ pub struct KernelEvidence {
     pub semantic_capture_failures: u64,
     pub template_tail_failures: u64,
     pub unregistered_mechanisms: u64,
+    pub abi_refusals: u64,
 }
 
 pub fn kernel_evidence(session: &Session) -> Result<KernelEvidence> {
@@ -146,6 +147,7 @@ pub fn kernel_evidence(session: &Session) -> Result<KernelEvidence> {
         semantic_capture_failures: read(EVIDENCE_SEMANTIC_CAPTURE_FAILURES)?,
         template_tail_failures: read(EVIDENCE_TEMPLATE_TAIL_FAILURES)?,
         unregistered_mechanisms: read(EVIDENCE_UNREGISTERED_MECHANISMS)?,
+        abi_refusals: read(EVIDENCE_ABI_REFUSALS)?,
     })
 }
 

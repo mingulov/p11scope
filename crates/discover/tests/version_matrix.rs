@@ -10,6 +10,7 @@ fn build(name: &str, defines: &[&str]) -> PathBuf {
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture/version_matrix.c");
     let mut command = Command::new("gcc");
     command
+        .arg(format!("-m{}", usize::BITS))
         .args(["-shared", "-fPIC", "-o"])
         .arg(&output)
         .arg(source);

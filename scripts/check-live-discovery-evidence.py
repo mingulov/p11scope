@@ -9,8 +9,9 @@ candidate sources in this worktree or recomputed from the frozen bytes under
 the private root - nothing is trusted because the manifest said so.
 
 Modes:
-  --write-manifest --private-root ROOT   build the frozen fixtures and freeze
-                                         one execution manifest
+  --write-manifest --private-root ROOT [--fixture-bits 32|64]
+                                         publish v2 from built fixtures and
+                                         completed prepared dependency receipts
   --preflight FILE --manifest FILE       validate one preflight report
   --campaign ROOT --manifest FILE        validate the campaign under ROOT
   --self-test                            nonprivileged mutation self-test
@@ -29,7 +30,8 @@ import subprocess
 import sys
 import tempfile
 
-MANIFEST_SCHEMA = "p11scope-live-discovery-execution/v1"
+MANIFEST_SCHEMA = "p11scope-live-discovery-execution/v2"
+HISTORICAL_MANIFEST_SCHEMA = "p11scope-live-discovery-execution/v1"
 PREFLIGHT_SCHEMA = "p11scope-live-discovery-preflight/v1"
 CAMPAIGN_SCHEMA = "p11scope-live-discovery-campaign/v1"
 ROW_SCHEMA = "p11scope-live-discovery-row/v1"
@@ -44,10 +46,19 @@ FIXTURE_SOURCES = (
     "tests/fixtures/live-discovery-provider.c",
     "tests/fixtures/live-discovery-driver.c",
 )
-VALIDATORS = (
+HISTORICAL_VALIDATORS = (
     "scripts/check-live-discovery-evidence.py",
     "scripts/check-live-discovery-object.py",
     "scripts/verify-live-discovery-preflight.sh",
+)
+VALIDATORS = HISTORICAL_VALIDATORS + (
+    "scripts/prepared-dependency-tools.sh",
+    "scripts/prepared-dependency-snapshot.sh",
+    "scripts/product-build.sh",
+    "scripts/merge-checksum-ledgers.py",
+    "scripts/prepared-dependency-evidence.py",
+    "scripts/check-prepared-dependencies.py",
+    "scripts/prepare-dependencies.py",
 )
 PROVIDERS = {"exported": "provider-exported.so", "hidden": "provider-hidden.so"}
 DRIVERS = {
@@ -192,9 +203,13 @@ DEBUG_STATE_SYMBOL = "_dl_debug_state"
 
 # Frozen campaign parameters. These are declared once here, before the first
 # privileged run, so no lane can invent its own budget or kernel later.
-FROZEN_KERNELS = (("jammy", "5.15."), ("noble", "6.8."))
+FROZEN_KERNELS = (
+    ("jammy", "5.15.", "retained Ubuntu cloud image overlay base"),
+    ("noble", "6.8.", "retained Ubuntu cloud image overlay base"),
+    ("fedora", "6.19.", "retained Fedora cloud image overlay base"),
+)
 FROZEN_CAPS = ("CAP_BPF", "CAP_PERFMON", "CAP_SYS_PTRACE", "CAP_SYS_RESOURCE")
-FROZEN_DEADLINES = {"attempt_seconds": 120, "campaign_seconds": 43200, "pause_poll_ms": 1}
+FROZEN_DEADLINES = {"attempt_seconds": 120, "campaign_seconds": 64800, "pause_poll_ms": 1}
 FROZEN_TOPOLOGY = {"cold_boot": True, "containers": ["docker", "kind"]}
 
 
@@ -253,14 +268,47 @@ def rust_const(text, name, path):
     return int(eval(expression, {"__builtins__": {}}, {}))  # noqa: S307
 
 
-def source_constants(root):
+def loader_state_offsets(source, path):
+    marker = "fn loader_state_address("
+    start = source.find(marker)
+    if start == -1:
+        fail(f"{path}: loader_state_address is missing")
+    opening = source.find("{", start + len(marker))
+    if opening == -1:
+        fail(f"{path}: loader_state_address body is malformed")
+    depth = 0
+    end = None
+    for cursor in range(opening, len(source)):
+        if source[cursor] == "{":
+            depth += 1
+        elif source[cursor] == "}":
+            depth -= 1
+            if depth == 0:
+                end = cursor
+                break
+    if end is None:
+        fail(f"{path}: loader_state_address body is malformed")
+    body = source[opening + 1 : end]
+    offsets = {}
+    for variant, abi in [("Lp64", "linux-lp64"), ("Ilp32", "linux-ilp32")]:
+        matches = re.findall(rf"ElfAbi::{variant}\s*=>\s*([0-9_]+)", body)
+        if len(matches) != 1:
+            fail(f"{path}: loader_state_address needs one {variant} offset arm")
+        offsets[abi] = int(matches[0].replace("_", ""))
+    return offsets
+
+
+def source_constants(root, engine_source=None):
     common_path = root / "crates/ebpf-common/src/lib.rs"
     loader_path = root / "src/discovery/loader.rs"
     ebpf_path = root / "crates/ebpf/src/main.rs"
+    engine_path = root / "src/discovery/engine.rs"
     common = common_path.read_text()
     loader = loader_path.read_text()
     ebpf = ebpf_path.read_text()
+    engine = engine_path.read_text() if engine_source is None else engine_source
     payload_mask = rust_const(common, "LOADER_STATE_PAYLOAD_MASK", common_path)
+    r_state_offsets = loader_state_offsets(engine, engine_path)
     facts = {
         "context_ids": rust_const(common, "LOADER_CONTEXT_ID_MASK", common_path) + 1,
         "present_bit": rust_const(common, "LOADER_STATE_PRESENT", common_path),
@@ -270,7 +318,7 @@ def source_constants(root):
         "delta_min": rust_const(loader, "MIN_STATE_DELTA", loader_path),
         "delta_max": rust_const(loader, "MAX_STATE_DELTA", loader_path),
         "max_contexts": rust_const(loader, "MAX_LOADER_CONTEXTS", loader_path),
-        "r_state_offset": rust_const(common, "R_STATE_OFFSET", common_path),
+        "r_state_offsets": r_state_offsets,
         "function_ip_helper": "bpf_get_func_ip",
         "function_ip_fallback": "pt_regs.rip",
     }
@@ -292,6 +340,14 @@ def source_constants(root):
             (
                 "(*ctx.regs).rip" in ebpf,
                 "the product no longer carries the x86-64 pt_regs.rip fallback",
+            ),
+            (
+                r_state_offsets["linux-lp64"] == ELF_ABIS[(2, 62)][1],
+                "the product LP64 r_state offset differs from the ELF ABI oracle",
+            ),
+            (
+                r_state_offsets["linux-ilp32"] == ELF_ABIS[(1, 3)][1],
+                "the product ILP32 r_state offset differs from the ELF ABI oracle",
             ),
         ]
     )
@@ -315,39 +371,137 @@ def production_inventory(root):
 # adding a dependency or trusting an external tool's formatting.
 # --------------------------------------------------------------------------
 
+ELF_ABIS = {
+    # (EI_CLASS, e_machine): (name, r_debug.r_state offset)
+    (1, 3): ("linux-ilp32", 12),  # ELF32, EM_386
+    (2, 62): ("linux-lp64", 24),  # ELF64, EM_X86_64
+}
+
+
+def _elf_unpack(fmt, blob, offset, path, label):
+    size = struct.calcsize(fmt)
+    if offset < 0 or offset + size > len(blob):
+        fail(f"{path}: truncated {label}")
+    return struct.unpack_from(fmt, blob, offset)
+
 
 def elf_facts(path, symbols=()):
     blob = Path(path).read_bytes()
-    if blob[:4] != b"\x7fELF" or blob[4] != 2 or blob[5] != 1:
-        fail(f"{path}: not a little-endian ELF64 object")
-    (_, _, _, _, phoff, shoff, _, _, phentsize, phnum, shentsize, shnum, _) = (
-        struct.unpack_from("<HHIQQQIHHHHHH", blob, 16)
+    if len(blob) < 16 or blob[:4] != b"\x7fELF" or blob[5] != 1:
+        fail(f"{path}: not a little-endian ELF object")
+    elf_class = blob[4]
+    if elf_class == 2:
+        header_fmt = "<HHIQQQIHHHHHH"
+        program_fmt = "<IIQQQQQQ"
+        section_fmt = "<IIQQQQIIQQ"
+        symbol_fmt = "<IBBHQQ"
+    elif elf_class == 1:
+        header_fmt = "<HHIIIIIHHHHHH"
+        program_fmt = "<IIIIIIII"
+        section_fmt = "<IIIIIIIIII"
+        symbol_fmt = "<IIIBBH"
+    else:
+        fail(f"{path}: unsupported ELF class {elf_class}")
+    (elf_type, machine, _, _, phoff, shoff, _, ehsize, phentsize, phnum, shentsize, shnum, _) = (
+        _elf_unpack(header_fmt, blob, 16, path, "ELF header")
     )
+    abi = ELF_ABIS.get((elf_class, machine))
+    if abi is None:
+        fail(f"{path}: unsupported ELF class/machine pair {elf_class}/{machine}")
+    if elf_type not in (2, 3):
+        fail(f"{path}: unsupported ELF type {elf_type}")
+    expected_header = 52 if elf_class == 1 else 64
+    if ehsize != expected_header:
+        fail(f"{path}: malformed ELF header size {ehsize}")
+    if phnum and phentsize < struct.calcsize(program_fmt):
+        fail(f"{path}: malformed program-header entry size {phentsize}")
+    if shnum and shentsize < struct.calcsize(section_fmt):
+        fail(f"{path}: malformed section-header entry size {shentsize}")
     loads = []
     interpreter = None
     for index in range(phnum):
-        kind, _, offset, vaddr, _, filesz, memsz, _ = struct.unpack_from(
-            "<IIQQQQQQ", blob, phoff + index * phentsize
+        program = _elf_unpack(
+            program_fmt, blob, phoff + index * phentsize, path, f"program header {index}"
         )
+        if elf_class == 2:
+            kind, _, offset, vaddr, _, filesz, memsz, _ = program
+        else:
+            kind, offset, vaddr, _, filesz, memsz, _, _ = program
         if kind == 1:
+            if filesz > memsz:
+                fail(f"{path}: PT_LOAD file size exceeds memory size")
+            if offset + filesz > len(blob):
+                fail(f"{path}: PT_LOAD file range is out of bounds")
             loads.append({"offset": offset, "vaddr": vaddr, "filesz": filesz, "memsz": memsz})
         elif kind == 3:
-            interpreter = blob[offset : offset + filesz].rstrip(b"\0").decode()
+            end = offset + filesz
+            if filesz < 2 or end > len(blob):
+                fail(f"{path}: truncated PT_INTERP")
+            raw_interpreter = blob[offset:end]
+            if not raw_interpreter.endswith(b"\0") or b"\0" in raw_interpreter[:-1]:
+                fail(f"{path}: PT_INTERP is not terminated by one trailing NUL")
+            interpreter = raw_interpreter[:-1].decode()
+            if not interpreter.startswith("/"):
+                fail(f"{path}: PT_INTERP is not one nonempty absolute path")
     sections = [
-        struct.unpack_from("<IIQQQQIIQQ", blob, shoff + index * shentsize)
+        _elf_unpack(
+            section_fmt, blob, shoff + index * shentsize, path, f"section header {index}"
+        )
         for index in range(shnum)
     ]
+    version_tables = {}
+    for version in sections:
+        if version[1] != 0x6FFFFFFF:  # SHT_GNU_versym
+            continue
+        linked = version[6]
+        if linked >= len(sections) or sections[linked][1] != 11:
+            fail(f"{path}: symbol versions have invalid dynamic-symbol association")
+        if linked in version_tables:
+            fail(f"{path}: duplicate symbol-version table")
+        dynamic = sections[linked]
+        if dynamic[9] < struct.calcsize(symbol_fmt) or dynamic[5] % dynamic[9]:
+            fail(f"{path}: malformed versioned dynamic-symbol table")
+        if dynamic[4] + dynamic[5] > len(blob):
+            fail(f"{path}: versioned dynamic-symbol table is out of bounds")
+        if (
+            version[9] != 2
+            or version[5] % 2
+            or version[5] < 2 * (dynamic[5] // dynamic[9])
+            or version[4] + version[5] > len(blob)
+        ):
+            fail(f"{path}: malformed or truncated symbol-version table")
+        version_tables[linked] = version
     resolved = {}
     for symbol in symbols:
         found = []
-        for section in sections:
+        for section_index, section in enumerate(sections):
             if section[1] not in (2, 11):  # SHT_SYMTAB, SHT_DYNSYM
                 continue
+            if section[6] >= len(sections):
+                fail(f"{path}: symbol table has invalid string-table index")
             strings = sections[section[6]]
             strtab = blob[strings[4] : strings[4] + strings[5]]
+            if section[9] < struct.calcsize(symbol_fmt):
+                fail(f"{path}: malformed symbol-table entry size {section[9]}")
+            versions = version_tables.get(section_index)
             for cursor in range(section[4], section[4] + section[5], section[9]):
-                name_offset, _, _, _, value, size = struct.unpack_from("<IBBHQQ", blob, cursor)
+                ordinal = (cursor - section[4]) // section[9]
+                if versions is not None:
+                    version = _elf_unpack(
+                        "<H", blob, versions[4] + ordinal * 2, path, "symbol version"
+                    )[0]
+                    if version & 0x8000:
+                        continue
+                symbol_entry = _elf_unpack(symbol_fmt, blob, cursor, path, "symbol table entry")
+                if elf_class == 2:
+                    name_offset, _, _, _, value, size = symbol_entry
+                else:
+                    name_offset, value, size, _, _, _ = symbol_entry
+                if name_offset >= len(strtab):
+                    fail(f"{path}: symbol name is outside its string table")
                 end = strtab.find(b"\0", name_offset)
+                if end == -1:
+                    fail(f"{path}: unterminated symbol name")
                 if strtab[name_offset:end].decode("utf-8", "replace") == symbol:
                     found.append((value, size))
         unique = sorted(set(found))
@@ -368,6 +522,10 @@ def elf_facts(path, symbols=()):
     return {
         "path": str(path),
         "sha256": sha256_bytes(blob),
+        "elf_class": elf_class,
+        "machine": machine,
+        "abi": abi[0],
+        "r_state_offset": abi[1],
         "interpreter": interpreter,
         "loads": loads,
         "symbols": resolved,
@@ -398,7 +556,77 @@ def frozen_paths(private_root):
         "fixtures": frozen / "fixtures",
         "campaign": private_root / "campaign",
         "manifest": private_root / "execution-manifest.json",
+        "dependencies": private_root / "dependencies",
     }
+
+
+def prepared_binding(private_root, root):
+    """Bind retained shared evidence without querying Cargo or selecting tools.
+
+    The private shared helper calls below deliberately remain a narrow adapter:
+    it owns metadata projection, prepared input admission and receipt identities.
+    This checker owns only their exact frozen layout and manifest binding.
+    """
+    directory = frozen_paths(private_root)["dependencies"]
+    check([(directory.is_dir() and not directory.is_symlink(),
+            "prepared dependency directory is missing or symlinked")])
+    evidence = runpy.run_path(str(root / "scripts/prepared-dependency-evidence.py"))
+    load = evidence["_load_module"]
+    checker = load(root / "scripts/check-prepared-dependencies.py", "live_prepared_checker")
+    preparer = load(root / "scripts/prepare-dependencies.py", "live_preparer")
+    ledger = runpy.run_path(str(root / "scripts/merge-checksum-ledgers.py"))
+    try:
+        return _bind_prepared_receipts(directory, root, evidence, checker, preparer, ledger)
+    except (evidence["EvidenceError"], checker.MetadataError,
+            preparer.PreparationError, ledger["LedgerError"]) as error:
+        fail(f"prepared dependencies: {error}")
+
+
+def _bind_prepared_receipts(directory, root, evidence, checker, preparer, ledger):
+    prefix = directory / "prepared"
+    initial = evidence["_read_initial"](prefix, root, checker, preparer)
+    final = evidence["_read_json_artifact"](Path(str(prefix) + ".final.receipt.json"), "final receipt")
+    check([(isinstance(final, dict) and set(final) == set(initial),
+            "prepared final receipt fields differ")])
+    check([(final.get("phase") == "final", "prepared final receipt phase differs")])
+    for field in set(initial) - {"phase", "artifacts"}:
+        check([(final.get(field) == initial[field], f"prepared final {field} differs")])
+    check([(final["artifacts"] == evidence["_artifact_identities"](prefix, "final"),
+            "prepared final retained artifact identities differ")])
+    # Reuse the metadata verifier and projection; never implement a resolver here.
+    metadata = [
+        f"{workspace}={prefix}.final.{context}.stdout.json"
+        for context, workspace, _ in evidence["WORKSPACES"]
+    ]
+    projection = evidence["_projection"](
+        checker.verify_details(root, root / "third-party/sources.json", metadata)
+    )
+    for field, value in projection.items():
+        check([(final[field] == value, f"prepared final {field} projection differs")])
+    for context, _, _ in evidence["WORKSPACES"]:
+        for suffix in ("command.json", "context.json", "status"):
+            check([(Path(f"{prefix}.initial.{context}.{suffix}").read_bytes()
+                    == Path(f"{prefix}.final.{context}.{suffix}").read_bytes(),
+                    f"prepared final {context} {suffix} differs")])
+    artifacts = {
+        f"{phase}.{suffix}": evidence["_identity"](
+            Path(f"{prefix}.{phase}.{suffix}"), f"prepared {phase} {suffix}"
+        )
+        for phase in ("initial", "final")
+        for suffix in evidence["_phase_suffixes"](phase)
+    }
+    snapshots = {
+        phase: evidence["_identity"](directory / f"source.{phase}.sha256", f"{phase} snapshot")
+        for phase in ("initial", "final")
+    }
+    check([(snapshots["initial"]["sha256"] == snapshots["final"]["sha256"],
+            "prepared source snapshots differ")])
+    rows = ledger["merge_ledgers"]([directory / "source.final.sha256"])
+    check([(bool(rows), "prepared source snapshot is empty")])
+    for relative, digest in rows:
+        check([(sha256_file(root / relative) == digest, f"prepared source changed: {relative}")])
+    return {"artifacts": artifacts, "snapshots": snapshots,
+            "selected_tools": initial["tools"], "selected_inputs": initial["inputs"]}
 
 
 def tool_line(argv):
@@ -424,7 +652,7 @@ def companion_libc_path(driver):
     fail(f"{driver}: no libc.so.6 in its resolved dependencies")
 
 
-def build_manifest(private_root, root, kernel_bases):
+def _manifest_content(private_root, root, kernel_bases, fixture_bits=None, *, historical_fixture=False):
     """Build the frozen fixtures, then freeze one execution manifest.
 
     Every digest, ELF identity, toolchain identity and source-bound boundary
@@ -432,10 +660,11 @@ def build_manifest(private_root, root, kernel_bases):
     because a caller passed it in.
     """
     paths = frozen_paths(private_root)
+    dependencies = None if historical_fixture else prepared_binding(private_root, root)
     constants = source_constants(root)
     inventory = production_inventory(root)
     fixtures = paths["fixtures"]
-    commands = build_fixtures(root, fixtures)
+    commands = build_fixtures(root, fixtures, fixture_bits, execute=historical_fixture)
     toolchain = {
         "cc": "gcc",
         "cc_version": tool_line(["gcc", "--version"]),
@@ -445,12 +674,36 @@ def build_manifest(private_root, root, kernel_bases):
         "driver_ldflags": DRIVER_LDFLAGS,
     }
 
-    driver = elf_facts(fixtures / "driver-needed-exported")
-    provider = elf_facts(fixtures / "provider-exported.so", symbols=("C_GetFunctionList",))
+    fixture_elfs = {
+        name: elf_facts(
+            fixtures / name,
+            symbols=("C_GetFunctionList",) if name == "provider-exported.so" else (),
+        )
+        for name in FIXTURE_OUTPUTS
+    }
+    driver = fixture_elfs["driver-needed-exported"]
+    provider = fixture_elfs["provider-exported.so"]
     interpreter_path = Path(driver["interpreter"])
     interpreter = elf_facts(interpreter_path, symbols=(DEBUG_STATE_SYMBOL,))
     companion_path = companion_libc_path(fixtures / "driver-dlopen")
     companion = elf_facts(companion_path, symbols=(FALLBACK_SYMBOL,))
+    check(
+        [
+            (
+                len(
+                    {facts["abi"] for facts in fixture_elfs.values()}
+                    | {interpreter["abi"], companion["abi"]}
+                )
+                == 1,
+                "the frozen fixtures, interpreter, and companion libc ABIs differ",
+            ),
+            (
+                constants["r_state_offsets"].get(interpreter["abi"])
+                == interpreter["r_state_offset"],
+                "the interpreter r_state layout is not source-bound",
+            ),
+        ]
+    )
     libc_version = host_glibc_version()
     inputs = {
         "caps": list(FROZEN_CAPS),
@@ -461,7 +714,7 @@ def build_manifest(private_root, root, kernel_bases):
                 "name": name,
                 "release_prefix": prefix,
                 "base": {
-                    "source": "retained Ubuntu cloud image overlay base (scripts/matrix)",
+                    "source": base_source,
                     "path": str(kernel_bases[name]) if kernel_bases.get(name) else None,
                     # Absent a retained base at freeze time the identity is
                     # pinned by the campaign's own first row and must then stay
@@ -469,7 +722,7 @@ def build_manifest(private_root, root, kernel_bases):
                     "sha256": sha256_file(kernel_bases[name]) if kernel_bases.get(name) else None,
                 },
             }
-            for name, prefix in FROZEN_KERNELS
+            for name, prefix, base_source in FROZEN_KERNELS
         ],
         "commands": commands,
         "interpreter": {"path": str(interpreter_path), "libc_version": libc_version},
@@ -483,7 +736,7 @@ def build_manifest(private_root, root, kernel_bases):
     }
 
     manifest = {
-        "schema": MANIFEST_SCHEMA,
+        "schema": HISTORICAL_MANIFEST_SCHEMA if historical_fixture else MANIFEST_SCHEMA,
         "private_root": str(paths["private_root"]),
         "bpf_source": {
             "canonical_path": str((root / "crates/ebpf/src/main.rs").resolve(strict=True)),
@@ -495,7 +748,10 @@ def build_manifest(private_root, root, kernel_bases):
             "sha256": sha256_file(paths["bpf_inventory"]),
         },
         "runner": {"path": str(paths["runner"]), "sha256": sha256_file(paths["runner"])},
-        "validators": {name: sha256_file(root / name) for name in VALIDATORS},
+        "validators": {
+            name: sha256_file(root / name)
+            for name in (HISTORICAL_VALIDATORS if historical_fixture else VALIDATORS)
+        },
         "inventory": inventory,
         "cookie": {
             "context_ids": constants["context_ids"],
@@ -509,7 +765,7 @@ def build_manifest(private_root, root, kernel_bases):
             "helper": constants["function_ip_helper"],
             "fallback": constants["function_ip_fallback"],
         },
-        "r_state_offset": constants["r_state_offset"],
+        "r_state_offset": interpreter["r_state_offset"],
         "ab_four_map_oracle": list(AB_FOUR_MAP_ORACLE),
         "privacy": {
             "allowlist": "docs/privacy/allowlist-v1.md",
@@ -551,6 +807,9 @@ def build_manifest(private_root, root, kernel_bases):
             "interpreter": {
                 "path": str(interpreter_path),
                 "sha256": interpreter["sha256"],
+                "elf_class": interpreter["elf_class"],
+                "machine": interpreter["machine"],
+                "abi": interpreter["abi"],
                 "dt_needed_driver_interp": driver["interpreter"],
                 "libc_version": inputs["interpreter"]["libc_version"],
                 "rtld_audit_31986_fixed": glibc_release(inputs["interpreter"]["libc_version"])
@@ -593,14 +852,41 @@ def build_manifest(private_root, root, kernel_bases):
         },
         "lanes": copy.deepcopy(LANES),
     }
+    if dependencies is not None:
+        manifest["prepared_dependencies"] = dependencies
     return manifest
 
 
-def write_manifest(private_root, root, kernel_bases=None):
+def build_manifest(private_root, root, kernel_bases, fixture_bits=None):
+    return _manifest_content(private_root, root, kernel_bases, fixture_bits)
+
+
+def _historical_fixture_manifest(private_root, root, kernel_bases, fixture_bits=None):
+    """Only the historical v1 mutation self-test constructs unprepared fixtures."""
+    return _manifest_content(private_root, root, kernel_bases, fixture_bits, historical_fixture=True)
+
+
+def write_manifest(private_root, root, kernel_bases=None, fixture_bits=None):
     paths = frozen_paths(private_root)
-    manifest = build_manifest(private_root, root, kernel_bases or {})
+    check([(not paths["manifest"].exists() and not paths["manifest"].is_symlink(),
+            "execution manifest already exists")])
+    manifest = build_manifest(private_root, root, kernel_bases or {}, fixture_bits)
     bind_manifest(manifest, root)
-    paths["manifest"].write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    serialized = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+    # The manifest admits execution: publish it only after required state exists.
+    (paths["campaign"] / "state.json").write_text(json.dumps({
+        "schema": CAMPAIGN_SCHEMA,
+        "manifest_sha256": hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
+        "state": "frozen", "row_count": 0,
+    }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    stream = paths["manifest"].open("x", encoding="utf-8")
+    try:
+        with stream:
+            stream.write(serialized)
+    except OSError:
+        # Exclusive creation succeeded; only this newly created file is ours.
+        paths["manifest"].unlink()
+        raise
     return manifest
 
 
@@ -614,7 +900,11 @@ def bind_manifest(manifest, root):
     constants = source_constants(root)
     inventory = production_inventory(root)
     paths = frozen_paths(get(manifest, "private_root", default=""))
-    check([(manifest.get("schema") == MANIFEST_SCHEMA, "execution manifest schema differs")])
+    check([(manifest.get("schema") in (MANIFEST_SCHEMA, HISTORICAL_MANIFEST_SCHEMA),
+            "execution manifest schema differs")])
+    if manifest["schema"] == MANIFEST_SCHEMA:
+        check([(manifest.get("prepared_dependencies") == prepared_binding(paths["private_root"], root),
+                "frozen prepared dependency binding differs")])
 
     source_path = Path(get(manifest, "bpf_source", "canonical_path", default=""))
     canonical = (root / "crates/ebpf/src/main.rs").resolve(strict=True)
@@ -666,7 +956,11 @@ def bind_manifest(manifest, root):
     check(
         [
             (
-                manifest.get("validators") == {name: sha256_file(root / name) for name in VALIDATORS},
+                manifest.get("validators") == {
+                    name: sha256_file(root / name)
+                    for name in (VALIDATORS if manifest["schema"] == MANIFEST_SCHEMA
+                                 else HISTORICAL_VALIDATORS)
+                },
                 "a frozen validator changed after the freeze",
             ),
             (
@@ -704,8 +998,11 @@ def bind_manifest(manifest, root):
                 "frozen x86-64 function-IP fallback differs from the product source",
             ),
             (
-                manifest.get("r_state_offset") == constants["r_state_offset"],
-                "frozen r_state offset differs from the product source",
+                manifest.get("r_state_offset")
+                == constants["r_state_offsets"].get(
+                    get(manifest, "loader", "interpreter", "abi")
+                ),
+                "frozen r_state offset differs from the pinned interpreter ABI",
             ),
             (
                 manifest.get("ab_four_map_oracle") == list(AB_FOUR_MAP_ORACLE),
@@ -747,7 +1044,11 @@ def bind_manifest(manifest, root):
             ),
         ]
     )
+    command_widths = set()
     for name, output in fixtures["outputs"].items():
+        command_widths.add(
+            tuple(arg for arg in fixtures["commands"][name] if arg in ("-m32", "-m64"))
+        )
         command = " ".join(fixtures["commands"][name])
         needed = SHARED_LDFLAGS if name.endswith(".so") else DRIVER_LDFLAGS
         check(
@@ -764,6 +1065,15 @@ def bind_manifest(manifest, root):
                 (needed in command, f"fixture {name} was not linked with the frozen link flags"),
             ]
         )
+    check(
+        [
+            (
+                len(command_widths) == 1
+                and next(iter(command_widths)) in ((), ("-m32",), ("-m64",)),
+                "frozen fixture compiler widths differ",
+            )
+        ]
+    )
     exported = fixtures["outputs"][PROVIDERS["exported"]]["sha256"]
     hidden = fixtures["outputs"][PROVIDERS["hidden"]]["sha256"]
     check(
@@ -777,13 +1087,29 @@ def bind_manifest(manifest, root):
     loader = manifest.get("loader", {})
     interpreter = loader.get("interpreter", {})
     companion = loader.get("companion_libc", {})
-    driver_elf = elf_facts(paths["fixtures"] / "driver-needed-exported")
+    fixture_elfs = {
+        name: elf_facts(
+            paths["fixtures"] / name,
+            symbols=("C_GetFunctionList",) if name == "provider-exported.so" else (),
+        )
+        for name in FIXTURE_OUTPUTS
+    }
+    width_flags = next(iter(command_widths))
+    if width_flags:
+        expected_abi = "linux-ilp32" if width_flags == ("-m32",) else "linux-lp64"
+        check(
+            [
+                (
+                    {facts["abi"] for facts in fixture_elfs.values()} == {expected_abi},
+                    "frozen fixture bytes differ from their compiler width",
+                )
+            ]
+        )
+    driver_elf = fixture_elfs["driver-needed-exported"]
     interpreter_elf = elf_facts(
         interpreter.get("path", ""), symbols=(get(manifest, "hooks", "debug_state", "symbol"),)
     )
-    provider_elf = elf_facts(
-        paths["fixtures"] / PROVIDERS["exported"], symbols=("C_GetFunctionList",)
-    )
+    provider_elf = fixture_elfs[PROVIDERS["exported"]]
     check(
         [
             (
@@ -797,6 +1123,21 @@ def bind_manifest(manifest, root):
             (
                 interpreter.get("sha256") == interpreter_elf["sha256"],
                 "the pinned interpreter bytes changed after the freeze",
+            ),
+            (
+                (
+                    interpreter.get("elf_class"),
+                    interpreter.get("machine"),
+                    interpreter.get("abi"),
+                    manifest.get("r_state_offset"),
+                )
+                == (
+                    interpreter_elf["elf_class"],
+                    interpreter_elf["machine"],
+                    interpreter_elf["abi"],
+                    interpreter_elf["r_state_offset"],
+                ),
+                "the pinned interpreter ABI or r_state layout changed after the freeze",
             ),
             (
                 interpreter.get("rtld_audit_31986_fixed")
@@ -821,6 +1162,17 @@ def bind_manifest(manifest, root):
                 "the reviewed dlopen_return fallback offset is not the pinned companion libc's",
             ),
             (bool(loader.get("provenance")), "loader identity source/tool provenance is missing"),
+            (
+                len(
+                    {
+                        *(facts["abi"] for facts in fixture_elfs.values()),
+                        interpreter_elf["abi"],
+                        elf_facts(companion.get("path", ""))["abi"],
+                    }
+                )
+                == 1,
+                "the frozen driver, provider, interpreter, and companion libc ABIs differ",
+            ),
         ]
     )
 
@@ -882,15 +1234,15 @@ def bind_manifest(manifest, root):
     names = [kernel.get("name") for kernel in kernels]
     check(
         [
-            (len(kernels) == 2, "the campaign is frozen against exactly two kernels"),
-            (len(set(names)) == 2, "the two frozen kernels do not have distinct names"),
+            (len(kernels) == 3, "the campaign is frozen against exactly three kernels"),
+            (len(set(names)) == 3, "the three frozen kernels do not have distinct names"),
             (
                 all(kernel.get("release_prefix") for kernel in kernels),
                 "a frozen kernel has no release prefix",
             ),
             (
-                len({kernel.get("release_prefix") for kernel in kernels}) == 2,
-                "the two frozen kernels do not have distinct release prefixes",
+                len({kernel.get("release_prefix") for kernel in kernels}) == 3,
+                "the three frozen kernels do not have distinct release prefixes",
             ),
             (
                 all(get(kernel, "base", "source") for kernel in kernels),
@@ -941,8 +1293,8 @@ def bind_manifest(manifest, root):
                 "frozen children per row differ",
             ),
             (
-                campaign.get("primary_attempts") == 480,
-                "the frozen primary grid is not the amendment's 480 attempts",
+                campaign.get("primary_attempts") == 720,
+                "the frozen primary grid is not the amendment's 720 attempts",
             ),
             (
                 campaign.get("fallback_attempts") == FALLBACK_PER_KERNEL * len(kernels),
@@ -1065,7 +1417,7 @@ def validate_preflight(report, manifest):
             ),
             (
                 get(report, "load_bias", "r_state_offset") == manifest["r_state_offset"],
-                "the preflight r_state offset is not the product's +24",
+                "the preflight r_state offset is not the pinned interpreter ABI's loader layout",
             ),
             (
                 get(report, "lifecycle", "tombstoned") == get(report, "lifecycle", "attached")
@@ -1490,7 +1842,7 @@ class _Drop:
 _DROP = _Drop()
 
 
-def build_fixtures(root, fixtures):
+def build_fixtures(root, fixtures, fixture_bits=None, *, execute=True):
     """Build the frozen fixtures with the exact frozen commands.
 
     One implementation, used by both the freeze and the self-test, so the
@@ -1498,10 +1850,11 @@ def build_fixtures(root, fixtures):
     fixtures.mkdir(parents=True, exist_ok=True)
     provider = str(root / FIXTURE_SOURCES[0])
     driver = str(root / FIXTURE_SOURCES[1])
+    compiler = ["gcc"] + ([] if fixture_bits is None else [f"-m{fixture_bits}"])
     commands = {}
     for tables, name in PROVIDERS.items():
         commands[name] = (
-            ["gcc"]
+            compiler
             + CFLAGS.split()
             + [f"-DP11SCOPE_EXPORT_TABLES={1 if tables == 'exported' else 0}"]
             + SHARED_LDFLAGS.split()
@@ -1509,21 +1862,33 @@ def build_fixtures(root, fixtures):
         )
     for tables, name in PROVIDERS.items():
         commands[f"driver-needed-{tables}"] = (
-            ["gcc"]
+            compiler
             + CFLAGS.split()
             + ["-DP11SCOPE_DRIVER_NEEDED=1", "-o", str(fixtures / f"driver-needed-{tables}"), driver]
             + [str(fixtures / name)]
             + DRIVER_LDFLAGS.split()
         )
     commands["driver-dlopen"] = (
-        ["gcc"]
+        compiler
         + CFLAGS.split()
         + ["-o", str(fixtures / "driver-dlopen"), driver]
         + DRIVER_LDFLAGS.split()
     )
-    for name in FIXTURE_OUTPUTS:
-        subprocess.run(commands[name], check=True)
+    if execute:
+        for name in FIXTURE_OUTPUTS:
+            subprocess.run(commands[name], check=True)
     return commands
+
+
+def create_private_root(private_root):
+    paths = frozen_paths(private_root)
+    check([(paths["private_root"].is_absolute(), "private root must be absolute")])
+    paths["private_root"].mkdir(mode=0o700, parents=True)
+    paths["frozen"].mkdir(mode=0o700)
+    paths["dependencies"].mkdir(mode=0o700)
+    (paths["campaign"] / "rows").mkdir(mode=0o700, parents=True)
+    (paths["campaign"] / "preflight").mkdir(mode=0o700)
+    return paths
 
 
 def prepare_private_root(root, private_root, bpf_object=None, runner=None):
@@ -1533,11 +1898,7 @@ def prepare_private_root(root, private_root, bpf_object=None, runner=None):
     build produces; the real freeze passes the built object and runner. Both
     are bound by digest only, so both paths exercise the same code.
     """
-    paths = frozen_paths(private_root)
-    paths["private_root"].mkdir(mode=0o700, parents=True)
-    paths["frozen"].mkdir(mode=0o700)
-    (paths["campaign"] / "rows").mkdir(mode=0o700, parents=True)
-    (paths["campaign"] / "preflight").mkdir(mode=0o700)
+    paths = create_private_root(private_root)
     if bpf_object is None:
         paths["bpf_object"].write_bytes(b"self-test stand-in for the product BPF object\n")
         paths["runner"].write_bytes(b"self-test stand-in for the product runner\n")
@@ -1716,16 +2077,201 @@ def _write_campaign(paths, manifest, state):
 
 
 def self_test():
+    # Current publication/admission is exercised with selected controlled tools.
+    # The original ELF/campaign mutation cases below retain explicit historical
+    # v1 fixture documents; no normal writer or --run admits those documents.
+    subprocess.run([
+        sys.executable, "-m", "unittest", "discover",
+        "-s", str(repo_root() / "tests/python"),
+        "-p", "test_live_freeze_prepared_dependencies.py",
+    ], check=True)
     root = repo_root()
     if shutil.which("gcc") is None:
         fail("--self-test builds the frozen fixtures and needs gcc")
+    engine_source = (root / "src/discovery/engine.rs").read_text()
+    for label, mutation in [
+        ("LP64 loader state offset", engine_source.replace("ElfAbi::Lp64 => 24", "ElfAbi::Lp64 => 16", 1)),
+        (
+            "ILP32 loader state offset",
+            engine_source.replace("ElfAbi::Ilp32 => 12", "ElfAbi::Ilp32 => 16", 1),
+        ),
+    ]:
+        _reject(lambda mutation=mutation: source_constants(root, mutation), label)
     with tempfile.TemporaryDirectory(prefix="p11scope-live-discovery-selftest-") as temporary:
+        elf32_source = Path(temporary) / "elf32.c"
+        elf32_path = Path(temporary) / "elf32"
+        elf32_source.write_text("int main(void) { return 0; }\n")
+        subprocess.run(
+            ["gcc", "-m32", "-o", str(elf32_path), str(elf32_source)],
+            check=True,
+        )
+        elf32 = elf_facts(elf32_path)
+        if (elf32["elf_class"], elf32["machine"], elf32["abi"], elf32["r_state_offset"]) != (
+            1,
+            3,
+            "linux-ilp32",
+            12,
+        ):
+            raise AssertionError(f"unexpected ELF32 facts: {elf32}")
+        libc32_bytes = companion_libc_path(elf32_path).read_bytes()
+        libc32_header = struct.unpack_from("<HHIIIIIHHHHHH", libc32_bytes, 16)
+        shoff, shentsize, shnum = libc32_header[5], libc32_header[10], libc32_header[11]
+        libc32_sections = [
+            struct.unpack_from("<IIIIIIIIII", libc32_bytes, shoff + index * shentsize)
+            for index in range(shnum)
+        ]
+        version_index = next(
+            index for index, section in enumerate(libc32_sections) if section[1] == 0x6FFFFFFF
+        )
+        version = libc32_sections[version_index]
+        malformed_version = Path(temporary) / "malformed-versym"
+        for label, field, value in (
+            ("truncated symbol versions", 5, 2),
+            ("odd symbol-version size", 5, version[5] - 1),
+            ("wrong symbol-version entry size", 9, 4),
+            ("out-of-file symbol versions", 4, len(libc32_bytes)),
+            ("invalid symbol-version association", 6, shnum),
+            ("non-dynamic symbol-version association", 6, 0),
+        ):
+            changed = bytearray(libc32_bytes)
+            fields = list(version)
+            fields[field] = value
+            struct.pack_into("<IIIIIIIIII", changed, shoff + version_index * shentsize, *fields)
+            malformed_version.write_bytes(changed)
+            _reject(lambda: elf_facts(malformed_version, ("dlopen",)), label)
+        changed = bytearray(libc32_bytes)
+        duplicate_index = next(
+            index for index, section in enumerate(libc32_sections) if section[1] == 7
+        )
+        struct.pack_into("<IIIIIIIIII", changed, shoff + duplicate_index * shentsize, *version)
+        malformed_version.write_bytes(changed)
+        _reject(lambda: elf_facts(malformed_version, ("dlopen",)), "duplicate symbol versions")
+        print("ELF32 symbol-version bounds and unique dynamic-symbol association: OK")
+
+        malformed = Path(temporary) / "malformed-elf32"
+        malformed.write_bytes(elf32_path.read_bytes()[:20])
+        _reject(lambda: elf_facts(malformed), "truncated ELF32 header")
+        elf32_bytes = bytearray(elf32_path.read_bytes())
+        header = struct.unpack_from("<HHIIIIIHHHHHH", elf32_bytes, 16)
+        phoff, phentsize, phnum = header[4], header[8], header[9]
+        programs = [
+            list(struct.unpack_from("<IIIIIIII", elf32_bytes, phoff + index * phentsize))
+            for index in range(phnum)
+        ]
+        load_index = next(index for index, program in enumerate(programs) if program[0] == 1)
+        interp_index = next(index for index, program in enumerate(programs) if program[0] == 3)
+
+        oversized = Path(temporary) / "oversized-load"
+        oversized_bytes = bytearray(elf32_bytes)
+        load = programs[load_index]
+        load[4] = load[5] + 1
+        struct.pack_into("<IIIIIIII", oversized_bytes, phoff + load_index * phentsize, *load)
+        oversized.write_bytes(oversized_bytes)
+        _reject(lambda: elf_facts(oversized), "PT_LOAD file size exceeds memory size")
+
+        out_of_bounds = Path(temporary) / "out-of-bounds-load"
+        out_of_bounds_bytes = bytearray(elf32_bytes)
+        load = programs[load_index]
+        load[1], load[4], load[5] = len(out_of_bounds_bytes), 1, max(load[5], 1)
+        struct.pack_into("<IIIIIIII", out_of_bounds_bytes, phoff + load_index * phentsize, *load)
+        out_of_bounds.write_bytes(out_of_bounds_bytes)
+        _reject(lambda: elf_facts(out_of_bounds), "PT_LOAD file range beyond EOF")
+
+        loader_path = Path(elf32["interpreter"])
+        loader_bytes = bytearray(loader_path.read_bytes())
+        loader_header = struct.unpack_from("<HHIIIIIHHHHHH", loader_bytes, 16)
+        loader_phoff, loader_phentsize, loader_phnum = (
+            loader_header[4],
+            loader_header[8],
+            loader_header[9],
+        )
+        loader_programs = [
+            list(
+                struct.unpack_from(
+                    "<IIIIIIII", loader_bytes, loader_phoff + index * loader_phentsize
+                )
+            )
+            for index in range(loader_phnum)
+        ]
+        loader_load_index = next(
+            index for index, program in enumerate(loader_programs) if program[0] == 1
+        )
+        loader_load = loader_programs[loader_load_index]
+        loader_load[4] = len(loader_bytes) - loader_load[1] + 1
+        loader_load[5] = max(loader_load[5], loader_load[4])
+        struct.pack_into(
+            "<IIIIIIII",
+            loader_bytes,
+            loader_phoff + loader_load_index * loader_phentsize,
+            *loader_load,
+        )
+        malformed_loader = Path(temporary) / "loader-filesz-beyond-eof"
+        malformed_loader.write_bytes(loader_bytes)
+        _reject(
+            lambda: elf_facts(malformed_loader, symbols=(DEBUG_STATE_SYMBOL,)),
+            "real ELF32 loader PT_LOAD file range beyond EOF",
+        )
+
+        unterminated = Path(temporary) / "unterminated-interpreter"
+        unterminated_bytes = bytearray(elf32_bytes)
+        interp = programs[interp_index]
+        unterminated_bytes[interp[1] + interp[4] - 1] = ord("X")
+        unterminated.write_bytes(unterminated_bytes)
+        _reject(lambda: elf_facts(unterminated), "PT_INTERP missing trailing NUL")
+        x32 = Path(temporary) / "x32-elf"
+        x32_bytes = bytearray(elf32_path.read_bytes())
+        struct.pack_into("<H", x32_bytes, 18, 62)
+        x32.write_bytes(x32_bytes)
+        _reject(lambda: elf_facts(x32), "ELF32 with EM_X86_64")
+        foreign = Path(temporary) / "foreign-elf"
+        foreign_bytes = bytearray(elf32_path.read_bytes())
+        struct.pack_into("<H", foreign_bytes, 18, 40)
+        foreign.write_bytes(foreign_bytes)
+        _reject(lambda: elf_facts(foreign), "foreign ELF machine")
+        print("ELF32 layout, source offsets, and malformed/x32/foreign refusals: OK")
+
+        width_manifests = {}
+        for bits, abi in ((32, "linux-ilp32"), (64, "linux-lp64")):
+            width_root = Path(temporary) / f"private-{bits}"
+            width_paths = prepare_private_root(root, width_root)
+            width_paths["manifest"].write_text(json.dumps(
+                _historical_fixture_manifest(width_root, root, {}, bits)
+            ))
+            width_manifest = load_manifest(width_paths["manifest"])
+            bind_manifest(width_manifest, root)
+            fixture_abis = {
+                elf_facts(output["path"])["abi"]
+                for output in width_manifest["fixtures"]["outputs"].values()
+            }
+            if fixture_abis != {abi}:
+                raise AssertionError(f"unexpected {bits}-bit fixture ABIs: {fixture_abis}")
+            width_manifests[bits] = width_manifest
+
+        wrong_width_command = copy.deepcopy(width_manifests[32])
+        command = wrong_width_command["fixtures"]["commands"]["provider-hidden.so"]
+        command[command.index("-m32")] = "-m64"
+        _reject(
+            lambda: bind_manifest(wrong_width_command, root),
+            "mixed fixture compiler widths",
+        )
+
+        mixed = copy.deepcopy(width_manifests[32])
+        mixed_output = mixed["fixtures"]["outputs"]["provider-hidden.so"]
+        source = Path(width_manifests[64]["fixtures"]["outputs"]["provider-hidden.so"]["path"])
+        destination = Path(mixed_output["path"])
+        shutil.copyfile(source, destination)
+        mixed_output["sha256"] = sha256_file(destination)
+        _reject(lambda: bind_manifest(mixed, root), "mixed fixture ABIs")
+        print("explicit 32/64-bit fixture freezes and mixed-ABI refusal: OK")
+
         private_root = Path(temporary) / "private"
         paths = prepare_private_root(root, private_root)
-        write_manifest(private_root, root)
+        paths["manifest"].write_text(json.dumps(
+            _historical_fixture_manifest(private_root, root, {})
+        ))
         manifest = load_manifest(paths["manifest"])
         bind_manifest(manifest, root)
-        print("frozen manifest binding: OK")
+        print("historical v1 frozen manifest binding: OK")
 
         outputs = manifest["fixtures"]["outputs"]
         if outputs["provider-exported.so"]["sha256"] == outputs["provider-hidden.so"]["sha256"]:
@@ -1810,6 +2356,10 @@ def self_test():
             (
                 "interpreter identity",
                 _patch(manifest, ["loader", "interpreter", "sha256"], "0" * 64),
+            ),
+            (
+                "interpreter ABI",
+                _patch(manifest, ["loader", "interpreter", "abi"], "linux-ilp32"),
             ),
             (
                 "interpreter is the driver's PT_INTERP",
@@ -1904,7 +2454,7 @@ def self_test():
                 "frozen marker expectation",
                 _patch(manifest, ["lanes", "zero-modules", "markers"], "maybe"),
             ),
-            ("frozen kernel count", _patch(manifest, ["kernels"], manifest["kernels"][:1])),
+            ("frozen kernel count", _patch(manifest, ["kernels"], manifest["kernels"][:2])),
             (
                 "distinct kernel release prefixes",
                 _patch(manifest, ["kernels", 1, "release_prefix"], "5.15."),
@@ -2240,7 +2790,7 @@ def self_test():
             ),
             ("PT_INTERP", _patch(preflight, ["load_bias", "pt_interp"], "/lib64/other.so")),
             ("load bias", _patch(preflight, ["load_bias", "base"], 0)),
-            ("r_state +24", _patch(preflight, ["load_bias", "r_state_offset"], 16)),
+            ("target r_state field", _patch(preflight, ["load_bias", "r_state_offset"], 16)),
             ("preflight tombstone", _patch(preflight, ["lifecycle", "tombstoned"], 2)),
             ("preflight drain", _patch(preflight, ["lifecycle", "drained"], 2)),
             ("preflight residual context", _patch(preflight, ["lifecycle", "residual"], 1)),
@@ -2264,7 +2814,14 @@ def parse_args(argv):
     parser = argparse.ArgumentParser()
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--write-manifest", action="store_true")
+    parser.add_argument("--create-root", action="store_true")
+    parser.add_argument("--populate-root", action="store_true")
+    parser.add_argument("--build-fixtures", action="store_true")
+    parser.add_argument("--bpf-object", type=Path)
+    parser.add_argument("--runner", type=Path)
+    parser.add_argument("--require-prepared-dependencies", action="store_true")
     parser.add_argument("--private-root", type=Path)
+    parser.add_argument("--fixture-bits", type=int, choices=(32, 64))
     parser.add_argument(
         "--kernel-base",
         action="append",
@@ -2281,10 +2838,42 @@ def parse_args(argv):
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     root = repo_root()
+    check([(not args.require_prepared_dependencies or args.manifest is not None,
+            "--require-prepared-dependencies requires --manifest")])
+    setup = [args.create_root, args.populate_root, args.build_fixtures]
+    if any(setup):
+        check([(sum(setup) == 1 and args.private_root is not None
+                and not any((args.self_test, args.write_manifest, args.manifest,
+                             args.campaign, args.preflight, args.kernel_base,
+                             args.require_prepared_dependencies)),
+                "private root setup takes exactly one mode and --private-root")])
+        check([(args.populate_root or (args.bpf_object is None and args.runner is None),
+                "--bpf-object and --runner require --populate-root"),
+               (args.build_fixtures or args.fixture_bits is None,
+                "--fixture-bits requires --build-fixtures or --write-manifest")])
+        paths = frozen_paths(args.private_root)
+        if args.create_root:
+            create_private_root(args.private_root)
+        elif args.populate_root:
+            check([(args.bpf_object is not None and args.runner is not None,
+                    "populate-root requires --bpf-object and --runner")])
+            shutil.copyfile(args.bpf_object, paths["bpf_object"])
+            shutil.copyfile(args.runner, paths["runner"])
+        else:
+            build_fixtures(root, paths["fixtures"], args.fixture_bits)
+        return
+    check([(args.bpf_object is None and args.runner is None,
+            "--bpf-object and --runner require --populate-root")])
     if args.self_test:
         if args.write_manifest or args.kernel_base or any(
             value is not None
-            for value in (args.private_root, args.campaign, args.preflight, args.manifest)
+            for value in (
+                args.private_root,
+                args.fixture_bits,
+                args.campaign,
+                args.preflight,
+                args.manifest,
+            )
         ):
             fail("--self-test accepts no other arguments")
         self_test()
@@ -2294,14 +2883,17 @@ def main(argv=None):
         if args.private_root is None or any(
             value is not None for value in (args.campaign, args.preflight, args.manifest)
         ):
-            fail("manifest mode requires exactly --write-manifest --private-root")
+            fail(
+                "manifest mode requires --write-manifest --private-root "
+                "with optional --fixture-bits"
+            )
         bases = {}
         for entry in args.kernel_base:
             name, _, path = entry.partition("=")
-            if name not in dict(FROZEN_KERNELS) or not path:
-                fail(f"--kernel-base expects one of {[n for n, _ in FROZEN_KERNELS]}=PATH")
+            if name not in {n for n, _, _ in FROZEN_KERNELS} or not path:
+                fail(f"--kernel-base expects one of {[n for n, _, _ in FROZEN_KERNELS]}=PATH")
             bases[name] = Path(path).resolve(strict=True)
-        manifest = write_manifest(args.private_root, root, bases)
+        manifest = write_manifest(args.private_root, root, bases, args.fixture_bits)
         print(f"froze execution manifest {frozen_paths(args.private_root)['manifest']}")
         print(
             f"  {manifest['campaign']['primary_attempts']} primary + "
@@ -2309,11 +2901,22 @@ def main(argv=None):
         )
         return
 
-    if args.manifest is None or args.private_root is not None or args.kernel_base:
+    if (
+        args.manifest is None
+        or args.private_root is not None
+        or args.fixture_bits is not None
+        or args.kernel_base
+    ):
         fail("check mode requires --manifest with at most one of --campaign/--preflight")
     if args.campaign is not None and args.preflight is not None:
         fail("check mode takes --campaign or --preflight, not both")
     manifest = load_manifest(args.manifest)
+    if args.require_prepared_dependencies:
+        check([(manifest.get("schema") == MANIFEST_SCHEMA,
+                "prepared v2 execution manifest required; historical v1 cannot run")])
+        check([(args.manifest.is_absolute()
+                and args.manifest == frozen_paths(get(manifest, "private_root", default=""))["manifest"],
+                "requested execution manifest path differs from its frozen private root")])
     bind_manifest(manifest, root)
     if args.campaign is None and args.preflight is None:
         # Bind-only: every frozen input still matches, before anything runs.

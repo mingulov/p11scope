@@ -543,11 +543,20 @@ contract. Every scoped debug-state hit is submitted and handled. Neither
 package name suppresses a hit.
 
 For every accepted hit, userspace revalidates the process generation and exact
-loader context, refreshes mappings, pins new candidate objects, attaches exact
-standard export symbols available from the pinned ELF, and runs the bounded
-memory scan when `/proc/<pid>/mem` is available. An empty scan is evidence, not
-relocation proof. When memory scan is unavailable, live export hooks remain the
-table-read path; the loader event alone is not called a table scan.
+loader context, refreshes mappings, pins new candidate objects, and attaches
+exact standard export symbols available from the pinned ELF. A reported
+`RT_ADD` or `RT_DELETE` (`r_state` 1 or 2) marks bounded memory discovery
+pending for that exact process view and loader context; it defers only the
+bounded memory scan, not hit accounting or export-hook arming. A zero state is
+only another opportunity for the bracketed scan, because absent state and a
+failed state read are also encoded as zero; it is never relocation-ready or
+completeness proof. If no later completion opportunity arrives, userspace makes
+one fallback attempt on the next independent discovery tick with fresh maps and
+the existing capture budget. Exit, context retirement, cancellation, budget
+exhaustion, and shutdown settle any remaining pending work as explicit loss.
+An empty scan is evidence, not relocation proof. When memory scan is
+unavailable, live export hooks remain the table-read path; the loader event
+alone is not called a table scan.
 
 Duplicate exact `{pinned object identity, offset}` targets remain deduplicated.
 Scope filtering occurs before every target-memory read. A stale generation,

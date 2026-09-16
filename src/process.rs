@@ -1,9 +1,10 @@
 //! Bounded Linux process identity tracking for node-wide captures.
 
+use crate::discovery::scan::{CaptureWorkBudget, read_mountinfo};
 use crate::semantics::ProcessKey;
 use std::collections::BTreeMap;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
 const MAX_TRACKED: usize = 16_384;
 const RESERVED_FDS: usize = 64;
@@ -34,6 +35,9 @@ struct Record {
 }
 
 pub struct Tracker {
+    history: crate::history::Registry,
+    // Optional control provenance; producer event admission never calls it.
+    _control_adapter: Option<Box<dyn crate::history::TaskMembership>>,
     records: BTreeMap<u32, Record>,
     pidfd_limit: usize,
     process_limit: usize,
@@ -52,12 +56,70 @@ impl Tracker {
 
     pub fn with_limits(pidfd_limit: usize, process_limit: usize) -> Self {
         Self {
+            history: crate::history::Registry::disabled(),
+            _control_adapter: None,
             records: BTreeMap::new(),
             pidfd_limit: pidfd_limit.min(process_limit),
             process_limit,
             sequence: 0,
             evidence: TrackingEvidence::default(),
         }
+    }
+
+    /// One private consumer context owns one retained EVENTS map. Its domain
+    /// is supplied by that context; it grants historical semantics only.
+    pub(crate) fn for_producer(domain: crate::events::EventsDomain, limit: usize) -> Self {
+        let mut tracker = Self::with_limits(0, 0);
+        tracker.history = crate::history::Registry::new(domain, limit);
+        tracker
+    }
+    /// Existing proof harness constructor: optional control adapter is retained
+    /// separately, with no event-driven candidate lookup or liveness sampling.
+    #[cfg(test)]
+    pub(crate) fn with_membership(
+        domain: u64,
+        limit: usize,
+        _fd_limit: usize,
+        adapter: Box<dyn crate::history::TaskMembership>,
+    ) -> Self {
+        let mut tracker =
+            Self::for_producer(crate::events::EventsDomain::test_standin(domain), limit);
+        tracker._control_adapter = Some(adapter);
+        tracker
+    }
+    #[cfg(test)]
+    pub(crate) fn producer_domain(&self) -> u64 {
+        self.history.domain()
+    }
+    pub(crate) fn admit_history(
+        &mut self,
+        domain: u64,
+        pid: u32,
+        image: p11scope_ebpf_common::ImageIdentity,
+    ) -> (Option<ProcessKey>, Vec<ProcessKey>) {
+        self.history.admit(domain, pid, image)
+    }
+    pub(crate) fn history_call(&mut self, key: ProcessKey) {
+        self.history.mark_call(key);
+    }
+    pub(crate) fn history_root(&mut self, key: ProcessKey, affiliation: u64) {
+        self.history.mark_root(key, affiliation);
+    }
+    pub(crate) fn check_root_event(&self, domain: u64, affiliation: u64) -> anyhow::Result<()> {
+        self.history.check_root(domain, affiliation)
+    }
+    pub(crate) fn complete_root(
+        &mut self,
+        tail: &crate::events::ConsumedOriginalRootTail,
+    ) -> anyhow::Result<Vec<ProcessKey>> {
+        self.history.complete_root(tail)
+    }
+    pub(crate) fn history_birth(&mut self, parent: ProcessKey, child: ProcessKey) -> bool {
+        self.history.birth(parent, child)
+    }
+    #[cfg(test)]
+    pub(crate) fn confirm_history_retirement(&mut self, key: ProcessKey) -> Option<ProcessKey> {
+        self.history.confirm_retirement(key)
     }
 
     pub fn identify(&mut self, pid: u32) -> Identified {
@@ -108,7 +170,12 @@ impl Tracker {
             Mode::Untracked
         };
         let generation = start_time.unwrap_or((1u64 << 63) | self.sequence);
-        let key = ProcessKey { pid, generation };
+        let key = ProcessKey {
+            pid,
+            generation,
+            domain: 0,
+            exec_id: 0,
+        };
         self.records.insert(
             pid,
             Record {
@@ -325,6 +392,10 @@ impl ProcessView {
         self.pin.original_exited()
     }
 
+    pub(crate) fn original_generation_state(&self) -> Result<OriginalGenerationState, String> {
+        self.pin.original_generation_state()
+    }
+
     pub(crate) fn run_while_same<T>(&self, action: impl FnOnce() -> T) -> Result<T, String> {
         run_while_same_with(|| self.still_the_same(), action)
     }
@@ -352,14 +423,19 @@ impl ProcessView {
     pub(crate) fn open_then_mountinfo<T>(
         &self,
         open: impl FnOnce() -> Result<T, String>,
+        budget: &mut CaptureWorkBudget,
     ) -> Result<(T, String), String> {
         open_then_mountinfo_checked(
             || self.ensure_retained(),
             open,
             || {
-                std::fs::read_to_string(format!("/proc/{}/mountinfo", self.pid())).map_err(
-                    |error| format!("cannot read pid {}'s mount table: {error}", self.pid()),
-                )
+                let table = std::fs::File::open(format!("/proc/{}/mountinfo", self.pid()))
+                    .map_err(|error| {
+                        format!("cannot open pid {}'s mount table: {error}", self.pid())
+                    })?;
+                read_mountinfo(table, budget).map_err(|error| {
+                    format!("cannot read pid {}'s mount table: {error}", self.pid())
+                })
             },
         )
     }
@@ -371,6 +447,44 @@ pub fn stale_view_ids(views: &[ProcessView]) -> Vec<ProcessViewId> {
         .filter(|view| !view.still_the_same())
         .map(ProcessView::id)
         .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn reused_process_view_for_test(
+    id: ProcessViewId,
+    pid: u32,
+) -> Result<ProcessView, String> {
+    let mut view = ProcessView::open(id, pid)?;
+    let retained = process_start_time(pid)
+        .map_err(|error| format!("cannot build reused-pid test view: {error}"))?
+        .wrapping_add(1);
+    view.pin = PidPin {
+        pid,
+        pidfd: None,
+        start_time: Some(retained),
+    };
+    Ok(view)
+}
+
+#[cfg(test)]
+pub(crate) fn unprovable_process_view_for_test(
+    id: ProcessViewId,
+    pid: u32,
+) -> Result<ProcessView, String> {
+    let mut view = ProcessView::open(id, pid)?;
+    view.pin = PidPin {
+        pid,
+        pidfd: None,
+        start_time: None,
+    };
+    Ok(view)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OriginalGenerationState {
+    Current,
+    Exited,
+    Reused,
 }
 
 /// A process identity that survives PID reuse. `pidfd_open` is exact; the
@@ -397,6 +511,15 @@ impl PidPin {
             pidfd,
             start_time,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_proc_only(pid: u32) -> Self {
+        Self {
+            pid,
+            pidfd: None,
+            start_time: Some(1),
+        }
     }
 
     pub fn pid(&self) -> u32 {
@@ -428,10 +551,30 @@ impl PidPin {
         })
     }
 
+    pub(crate) fn original_generation_state(&self) -> Result<OriginalGenerationState, String> {
+        let pidfd_ready = self.pidfd.as_ref().map(pidfd_ready);
+        original_generation_state_with(pidfd_ready, self.start_time, || {
+            process_start_time(self.pid)
+        })
+        .map_err(|error| {
+            format!(
+                "cannot classify the original generation of pid {}: {error}",
+                self.pid
+            )
+        })
+    }
+
     /// Proves that this pin retained the original pidfd and that the kernel
     /// still grants signal authority for that exact process generation.
     pub(crate) fn probe_signal_authority(&self) -> Result<(), String> {
         self.send_signal(0)
+    }
+
+    pub(crate) fn pidfd(&self) -> io::Result<BorrowedFd<'_>> {
+        self.pidfd
+            .as_ref()
+            .map(AsFd::as_fd)
+            .ok_or_else(|| io::Error::other("process pin has no original pidfd"))
     }
 
     /// Sends through the retained original pidfd. A `/proc` fallback pin is
@@ -471,6 +614,40 @@ fn proc_generation_exited(retained: u64, current: io::Result<u64>) -> io::Result
         Ok(current) => Ok(current != retained),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
         Err(error) => Err(error),
+    }
+}
+
+fn original_generation_state_with(
+    pidfd_ready: Option<io::Result<bool>>,
+    retained_start: Option<u64>,
+    current_start: impl FnOnce() -> io::Result<u64>,
+) -> io::Result<OriginalGenerationState> {
+    let pidfd_exited = match pidfd_ready {
+        Some(Ok(false)) => return Ok(OriginalGenerationState::Current),
+        Some(Ok(true)) => true,
+        Some(Err(error)) => return Err(error),
+        None => false,
+    };
+
+    match current_start() {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Ok(OriginalGenerationState::Exited)
+        }
+        Err(error) => Err(error),
+        Ok(current) => {
+            let retained = retained_start.ok_or_else(|| {
+                io::Error::other(
+                    "cannot distinguish original exit from PID reuse without a start time",
+                )
+            })?;
+            if current != retained {
+                Ok(OriginalGenerationState::Reused)
+            } else if pidfd_exited {
+                Ok(OriginalGenerationState::Exited)
+            } else {
+                Ok(OriginalGenerationState::Current)
+            }
+        }
     }
 }
 
@@ -521,6 +698,11 @@ fn pidfd_ready_with_timeout(fd: &OwnedFd, timeout_ms: i32) -> io::Result<bool> {
     let result = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
     if result < 0 {
         Err(io::Error::last_os_error())
+    } else if pollfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+        Err(io::Error::other(format!(
+            "original pidfd poll failed: revents={:#x}",
+            pollfd.revents
+        )))
     } else {
         Ok(result > 0 && pollfd.revents & libc::POLLIN != 0)
     }
@@ -682,6 +864,15 @@ mod tests {
     }
 
     #[test]
+    fn root_fence_owned_poll_error_is_not_a_timeout() {
+        // Own both pipe ends: dropping the reader makes poll report POLLERR.
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let fd: OwnedFd = writer.into();
+        assert!(pidfd_ready_with_timeout(&fd, 0).is_err());
+    }
+
+    #[test]
     fn original_exit_probe_distinguishes_exit_from_transport_failure() {
         assert!(!pidfd_exited_with(|| Ok(false)).unwrap());
         assert!(pidfd_exited_with(|| Ok(true)).unwrap());
@@ -705,11 +896,82 @@ mod tests {
         );
     }
 
+    /// Mutation caught: classifying a changed `/proc` start time as an exit
+    /// would grant a later process at the reused numeric PID terminal authority.
+    #[test]
+    fn original_generation_state_distinguishes_exit_from_pid_reuse() {
+        let current_reads = Cell::new(0);
+        assert_eq!(
+            original_generation_state_with(Some(Ok(false)), None, || {
+                current_reads.set(current_reads.get() + 1);
+                Ok(10)
+            })
+            .unwrap(),
+            OriginalGenerationState::Current
+        );
+        assert_eq!(
+            current_reads.get(),
+            0,
+            "a live pidfd is already exact generation evidence"
+        );
+
+        assert_eq!(
+            original_generation_state_with(None, Some(10), || Ok(10)).unwrap(),
+            OriginalGenerationState::Current
+        );
+        assert_eq!(
+            original_generation_state_with(None, Some(10), || Ok(11)).unwrap(),
+            OriginalGenerationState::Reused
+        );
+        assert_eq!(
+            original_generation_state_with(None, Some(10), || {
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            })
+            .unwrap(),
+            OriginalGenerationState::Exited
+        );
+        assert_eq!(
+            original_generation_state_with(Some(Ok(true)), Some(10), || Ok(10)).unwrap(),
+            OriginalGenerationState::Exited,
+            "an exited pidfd can still have a same-generation zombie in /proc"
+        );
+
+        assert_eq!(
+            original_generation_state_with(
+                Some(Err(io::Error::from(io::ErrorKind::Interrupted))),
+                Some(10),
+                || Ok(10)
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(
+            original_generation_state_with(None, Some(10), || {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            })
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            original_generation_state_with(None, None, || Ok(10))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Other,
+            "missing retained start time is unknown, never exit"
+        );
+    }
+
     #[test]
     fn original_pidfd_is_the_only_signal_authority() {
         let mut child = Command::new("sleep").arg("10").spawn().unwrap();
         let pin = PidPin::open(child.id()).unwrap();
         pin.probe_signal_authority().unwrap();
+        assert_eq!(
+            pin.pidfd().unwrap().as_raw_fd(),
+            pin.pidfd.as_ref().unwrap().as_raw_fd()
+        );
         pin.send_signal(libc::SIGTERM).unwrap();
         let status = child.wait().unwrap();
         assert_eq!(status.signal(), Some(libc::SIGTERM));
@@ -720,6 +982,7 @@ mod tests {
             start_time: process_start_time(std::process::id()).ok(),
         };
         assert!(fallback.probe_signal_authority().is_err());
+        assert_eq!(fallback.pidfd().unwrap_err().kind(), io::ErrorKind::Other);
         assert!(fallback.send_signal(0).is_err());
     }
 

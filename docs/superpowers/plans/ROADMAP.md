@@ -646,7 +646,7 @@ founding rule).
 | W7 | ia32 targets on x86-64 hosts | [charter](2026-09-01-release-wave-charters.md#w7) |
 | W5 | Container/K8s requalification (provisional; W8 re-runs on the final tip) + seccomp/SELinux artifacts | [charter](2026-09-01-release-wave-charters.md#w5) |
 | W6 | Multi-distro/kernel matrix; support restated "5.15.x, tested on ⟨list⟩"; load-only CI matrix; run the supported-rate/loss and fork-exec-loader-unload product oracles on the per-offset path | [charter](2026-09-01-release-wave-charters.md#w6) |
-| W8 | Release assembly: receipt, docs truth pass, final review-to-zero, repeat both product oracles on the exact release tip, ready-to-publish bundle | [charter](2026-09-01-release-wave-charters.md#w8) |
+| W8 | W8-A final architecture and maintainability closure, including justified redesign; then final-tip qualification, receipt, docs truth pass, review-to-zero and ready-to-publish bundle | [charter](2026-09-01-release-wave-charters.md#w8) |
 
 Publication (push, tag, release) is NOT a wave — it is an explicit owner
 decision after W8.
@@ -659,6 +659,51 @@ provisional. CI runs locally; privileged testing is authorized; no tagging,
 pushing or publication. Final-candidate review, runtime evidence, receipt and
 bundle verification remain required. See the
 [ia32 implementation plan](2026-09-07-ia32-compatibility.md).
+
+**ABI matrix follow-up (2026-09-07):** After the current W7 verifier closure,
+carry native64 and ia32 through the W6 kernel matrix, including explicit
+incompatibility/refusal controls. Both ABIs are required on every testable
+x86-64 kernel/configuration row, including optional rows when run; missing
+IA32 prerequisites and expected refusal are recorded separately from positive
+qualification. The
+[qualification amendment](2026-09-07-ia32-compatibility.md#later-kernel-and-incompatibility-qualification-owner-request-2026-09-07)
+sets priorities and evidence boundaries; it does not claim those runs passed
+or change the W7 → W5 → W6 → W8 sequence.
+
+**Final architecture gate (owner amendment, 2026-09-07):** W8 starts with
+**W8-A, architecture and maintainability closure**, covering BPF, Rust
+userspace, supporting scripts and tests. Begin the Astra xhigh analysis and
+verified corrections during W7; perform a final integrated design/gap review
+before W8 qualification and assembly. Redesign is in scope where it resolves
+demonstrated problems. Preserve KISS/DRY, independent behavioral/artifact
+oracles, source custody, privacy and process ownership. See the
+[architecture design](../specs/2026-09-07-final-architecture-and-test-design.md).
+Every affected runtime gate must be repeated after its final code change;
+neither an architecture verdict nor older runtime evidence closes that gate.
+The W7 → W5 → W6 → W8 order and publication boundary remain in force.
+
+**Dependency refresh (owner amendment, 2026-09-07):** Include a release task
+to inventory and update feasible supply-chain dependencies: Rust lockfiles,
+Git pins/forks, Python tooling, CI actions and pinned build/container inputs.
+Preserve Rust 1.88, required kernel support and necessary downstream fixes;
+record compatibility reasons for retained pins. Apply updates before final
+integrated qualification and rebuild/retest affected artifacts. See Task 8b
+in the [architecture closure plan](2026-09-07-architecture-closure.md).
+
+**Broad release-gap review (2026-09-08):** Four independent review lanes and
+a synthesis challenge support completing the approved observer with targeted
+corrections. New source-supported generation-attribution, owned-exec
+cancellation and mountinfo-budget findings require regressions and correction
+or refutation. Abandoned BPF state needs a measured release disposition.
+Actual required-lane admission, clean dependency acquisition, truthful first-use
+guidance and helper ABI/libc delivery are explicit closure tasks. The shared
+Git pin currently fails fresh public acquisition; a cached local build is not
+a clean-source rebuild. See Tasks 8b–8d in the
+[architecture closure plan](2026-09-07-architecture-closure.md).
+No wholesale redesign or automated migration-assessment platform is required.
+Manual comparison is recommended but optional; existing native64/ia32, kernel,
+container and Fedora SELinux gates remain required. This review neither
+qualifies the candidate nor changes W7 → W5 → W6 → W8.
 
 **W3 engineering gate: CLOSED AND LOCALLY INTEGRATED 2026-09-03.** The final production tip
 `ec5e0ae` passed the four Rust 1.88 gates with 1,072 tests and independent

@@ -102,24 +102,13 @@ self_test() {
 
 [ "${1-}" != "--self-test" ] || { [ "$#" -eq 1 ] || exit 2; self_test; exit 0; }
 [ "$#" -eq 0 ] || { echo "usage: $0 [--self-test]" >&2; exit 2; }
-command -v cargo >/dev/null || { echo "UNRUN: cargo unavailable"; exit 0; }
 command -v gcc >/dev/null || { echo "UNRUN: gcc unavailable"; exit 0; }
 command -v capsh >/dev/null || { echo "UNRUN: capsh unavailable"; exit 0; }
-sudo -n true 2>/dev/null || { echo "UNRUN: passwordless sudo unavailable"; exit 0; }
-
-PERF_EVENT_PARANOID=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || true)
-[ "$PERF_EVENT_PARANOID" = 4 ] || {
-    echo "UNRUN: kernel.perf_event_paranoid must be 4 (got ${PERF_EVENT_PARANOID:-unavailable})"
-    exit 0
-}
-PTRACE_SCOPE=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || true)
-[ "$PTRACE_SCOPE" = 1 ] || {
-    echo "UNRUN: kernel.yama.ptrace_scope must be 1 (got ${PTRACE_SCOPE:-unavailable})"
-    exit 0
-}
+for tool in python3 rustup git sort xargs sha256sum; do
+    command -v "$tool" >/dev/null || { echo "UNRUN: $tool unavailable"; exit 0; }
+done
 
 MODULE=${P11SCOPE_PKCS11_MODULE:-/usr/lib/softhsm/libsofthsm2.so}
-[ -f "$MODULE" ] || { echo "UNRUN: SoftHSM2 unavailable at configured module path"; exit 0; }
 # See verify-canaries.sh: the observer refuses an output directory with a
 # group/world-writable non-sticky ancestor, which this checkout has. This lane
 # has no work-path override, so the private 0700 root is its only work root.
@@ -127,10 +116,47 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/p11scope-verify-XXXXXX")/target/capability-tie
 echo "work root: $WORK"
 BIN="$PWD/target/release/p11scope"
 HARNESS="$WORK/harness"
+CAPABILITY_PREPARED_PREFIX="$WORK/dependencies"
+CAPABILITY_PREPARED_ADMITTED=0
 TARGET_PID=
 CURRENT_ROW=
 
+dependency_digest() {
+    [ "$#" -eq 2 ] || return 2
+    capability_digest_output=$(sha256sum "$2") || {
+        echo "capability-tier: cannot hash $1" >&2
+        unset capability_digest_output capability_digest_value
+        return 1
+    }
+    capability_digest_value=${capability_digest_output%% *}
+    if [ "${#capability_digest_value}" -ne 64 ]; then
+        echo "capability-tier: malformed checksum for $1" >&2
+        unset capability_digest_output capability_digest_value
+        return 1
+    fi
+    case $capability_digest_value in
+        *[!0123456789abcdef]*)
+            echo "capability-tier: malformed checksum for $1" >&2
+            unset capability_digest_output capability_digest_value
+            return 1
+            ;;
+    esac
+    printf '%s\n' "$capability_digest_value" || {
+        set -- $?
+        unset capability_digest_output capability_digest_value
+        return "$1"
+    }
+    unset capability_digest_output capability_digest_value
+}
+
 record_metadata() {
+    CAPABILITY_INITIAL_RECEIPT_DIGEST=$(dependency_digest \
+        'initial dependency receipt' "$CAPABILITY_PREPARED_PREFIX.initial.receipt.json") || return 1
+    CAPABILITY_INITIAL_SNAPSHOT_DIGEST=$(dependency_digest \
+        'initial source snapshot' "$WORK/source.start.tsv") || {
+        unset CAPABILITY_INITIAL_RECEIPT_DIGEST
+        return 1
+    }
     {
         printf 'head='; git rev-parse HEAD
         printf 'binary_sha256='; sha256sum "$BIN" | awk '{print $1}'
@@ -140,6 +166,12 @@ record_metadata() {
         printf 'kernel='; uname -a
         printf 'perf_event_paranoid='; cat /proc/sys/kernel/perf_event_paranoid
         printf 'ptrace_scope='; cat /proc/sys/kernel/yama/ptrace_scope
+        printf 'prepared_initial_receipt_sha256=%s\n' "$CAPABILITY_INITIAL_RECEIPT_DIGEST"
+        printf 'prepared_initial_snapshot_sha256=%s\n' "$CAPABILITY_INITIAL_SNAPSHOT_DIGEST"
+        printf 'prepared_stable_cargo=%s\n' "$P11SCOPE_PREPARED_STABLE_CARGO"
+        printf 'prepared_stable_rustc=%s\n' "$P11SCOPE_PREPARED_STABLE_RUSTC"
+        printf 'prepared_bpf_cargo=%s\n' "$P11SCOPE_PREPARED_BPF_CARGO"
+        printf 'prepared_bpf_rustc=%s\n' "$P11SCOPE_PREPARED_BPF_RUSTC"
         printf 'tracefs_mounts\n'; grep -E 'tracefs|debugfs' /proc/mounts || true
         for path in /sys/kernel/tracing /sys/kernel/debug/tracing \
             /sys/kernel/tracing/events/sched/sched_process_exec/id \
@@ -151,9 +183,45 @@ record_metadata() {
                 printf 'readable %s=no\n' "$path"
             fi
         done
-    } >"$WORK/metadata.txt"
+    } >"$WORK/metadata.txt" || {
+        set -- $?
+        unset CAPABILITY_INITIAL_RECEIPT_DIGEST CAPABILITY_INITIAL_SNAPSHOT_DIGEST
+        return "$1"
+    }
+    unset CAPABILITY_INITIAL_RECEIPT_DIGEST CAPABILITY_INITIAL_SNAPSHOT_DIGEST
 }
 row_metadata() { printf '%s\n' "$2" >>"$WORK/$1.metadata"; }
+
+dependency_snapshot() {
+    p11scope_prepared_snapshot "$P11SCOPE_PREPARED_PYTHON" \
+        "$WORK/source.$1" "$CAPABILITY_PREPARED_PREFIX.$1.ledger.sha256"
+}
+
+finalize_dependencies() {
+    "$P11SCOPE_PREPARED_PYTHON" -I scripts/prepared-dependency-evidence.py \
+        recheck --prefix "$CAPABILITY_PREPARED_PREFIX" || return 1
+    dependency_snapshot final >"$WORK/source.end.tsv" || return 1
+    cmp -s "$WORK/source.start.tsv" "$WORK/source.end.tsv" || {
+        echo "capability-tier: prepared dependency source snapshot changed" >&2
+        return 1
+    }
+    CAPABILITY_FINAL_RECEIPT_DIGEST=$(dependency_digest \
+        'final dependency receipt' "$CAPABILITY_PREPARED_PREFIX.final.receipt.json") || return 1
+    CAPABILITY_FINAL_SNAPSHOT_DIGEST=$(dependency_digest \
+        'final source snapshot' "$WORK/source.end.tsv") || {
+        unset CAPABILITY_FINAL_RECEIPT_DIGEST
+        return 1
+    }
+    {
+        printf 'prepared_final_receipt_sha256=%s\n' "$CAPABILITY_FINAL_RECEIPT_DIGEST"
+        printf 'prepared_final_snapshot_sha256=%s\n' "$CAPABILITY_FINAL_SNAPSHOT_DIGEST"
+    } >>"$WORK/metadata.txt" || {
+        set -- $?
+        unset CAPABILITY_FINAL_RECEIPT_DIGEST CAPABILITY_FINAL_SNAPSHOT_DIGEST
+        return "$1"
+    }
+    unset CAPABILITY_FINAL_RECEIPT_DIGEST CAPABILITY_FINAL_SNAPSHOT_DIGEST
+}
 
 stop_target() {
     [ -n "$TARGET_PID" ] || return 0
@@ -179,17 +247,54 @@ cleanup() {
 on_exit() {
     status=$?
     trap - EXIT
-    if ! cleanup && [ "$status" -eq 0 ]; then status=1; fi
+    cleanup_status=0
+    cleanup || cleanup_status=$?
+    if [ "$cleanup_status" -ne 0 ]; then
+        [ "$status" -ne 0 ] || status=$cleanup_status
+    elif [ "$CAPABILITY_PREPARED_ADMITTED" -eq 1 ]; then
+        if ! finalize_dependencies && [ "$status" -eq 0 ]; then status=1; fi
+    fi
     exit "$status"
 }
-on_signal() { status=$1; trap - EXIT INT TERM; cleanup || :; exit "$status"; }
+on_signal() {
+    status=$1
+    trap - EXIT INT TERM
+    if cleanup && [ "$CAPABILITY_PREPARED_ADMITTED" -eq 1 ]; then finalize_dependencies || :; fi
+    exit "$status"
+}
 trap on_exit EXIT
 trap 'on_signal 130' INT
 trap 'on_signal 143' TERM
 
-cargo +1.88 build --locked --release --workspace
 (umask 077; mkdir -p "$WORK")
+. scripts/prepared-dependency-tools.sh
+. scripts/prepared-dependency-snapshot.sh
+. scripts/product-build.sh
+p11scope_prepared_tools_select "$(command -v python3)" "$(command -v rustup)"
+"$P11SCOPE_PREPARED_PYTHON" -I scripts/prepare-dependencies.py --offline
+"$P11SCOPE_PREPARED_PYTHON" -I scripts/prepared-dependency-evidence.py capture \
+    --prefix "$CAPABILITY_PREPARED_PREFIX" \
+    --stable-cargo "$P11SCOPE_PREPARED_STABLE_CARGO" \
+    --stable-rustc "$P11SCOPE_PREPARED_STABLE_RUSTC" \
+    --bpf-cargo "$P11SCOPE_PREPARED_BPF_CARGO" \
+    --bpf-rustc "$P11SCOPE_PREPARED_BPF_RUSTC"
+CAPABILITY_PREPARED_ADMITTED=1
+dependency_snapshot initial >"$WORK/source.start.tsv"
+p11scope_product_build prepared --release --workspace
 record_metadata
+sudo -n true 2>/dev/null || { echo "UNRUN: passwordless sudo unavailable"; exit 0; }
+
+PERF_EVENT_PARANOID=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || true)
+[ "$PERF_EVENT_PARANOID" = 4 ] || {
+    echo "UNRUN: kernel.perf_event_paranoid must be 4 (got ${PERF_EVENT_PARANOID:-unavailable})"
+    exit 0
+}
+PTRACE_SCOPE=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || true)
+[ "$PTRACE_SCOPE" = 1 ] || {
+    echo "UNRUN: kernel.yama.ptrace_scope must be 1 (got ${PTRACE_SCOPE:-unavailable})"
+    exit 0
+}
+[ -f "$MODULE" ] || { echo "UNRUN: SoftHSM2 unavailable at configured module path"; exit 0; }
 gcc -O2 -o "$HARNESS" spike/harness.c -ldl
 
 wait_for_mapping() {

@@ -1,0 +1,21 @@
+#!/bin/sh
+set -eu
+[ "$#" -eq 7 ] || exit 2
+launcher_command=$1
+P11SCOPE_ABI_BUILD_RECORD=$2
+P11SCOPE_PREPARED_STABLE_CARGO=$3
+P11SCOPE_PREPARED_STABLE_RUSTC=$4
+P11SCOPE_PREPARED_BPF_CARGO=$5
+P11SCOPE_PREPARED_BPF_RUSTC=$6
+omit=$7
+export P11SCOPE_ABI_BUILD_RECORD
+case "$omit" in
+    none) ;;
+    *) unset "$omit" ;;
+esac
+DEFAULT_TARGET=${launcher_command%/*}/default\ target
+DIAGNOSTIC_TARGET=${launcher_command%/*}/diagnostic\ target
+EVIDENCE=${launcher_command%/*}/evidence
+mkdir -p "$EVIDENCE"
+abi_result() { printf '%s\n' "$*" >&2; }
+. "$launcher_command"

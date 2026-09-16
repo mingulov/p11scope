@@ -1,21 +1,321 @@
 #!/bin/sh
 # Kernel feasibility gate for x86-64 hosts observing native x86-64 and ia32
 # uprobes. This does not exercise Aya or qualify p11scope's producer/verifier.
-set -eu
-cd "$(dirname "$0")/../.."
+if [ "${P11SCOPE_IA32_SOURCE_ONLY:-0}" != 1 ]; then
+    set -eu
+    cd "$(dirname "$0")/../.."
+fi
 . scripts/lib.sh
 
 current_status_log=
 fixture_status_record=UNRUN
+fixture_completion_record=UNRUN
 bystander_status_record=UNRUN
 trace_status_record=UNRUN
+fixture_pid=
+fixture_starttime=
+fixture_launch_pid=
+fixture_launch_starttime=
+fixture_acquisition=idle
+trace_pid=
+trace_starttime=
+trace_root_pid=
+trace_root_starttime=
+trace_guard_pid=
+trace_guard_starttime=
+trace_acquisition=idle
+CLEANUP_STATUS=0
 write_status() {
     [ -n "$current_status_log" ] || return 0
     {
         echo "fixture_status=$fixture_status_record"
+        echo "fixture_completion=$fixture_completion_record"
         echo "bystander_status=$bystander_status_record"
         echo "tracer_status=$trace_status_record"
     } >"$current_status_log"
+}
+
+ia32_committed_transfer_hook() { :; }
+
+ia32_adopt_committed_transfers() {
+    case ${fixture_acquisition:-idle} in
+        launching|committed)
+            if [ -n "${USER_PROCESS_LAUNCH_PID:-}" ] \
+                && [ -n "${USER_PROCESS_LAUNCH_STARTTIME:-}" ] \
+                && [ -n "${USER_PROCESS_PID:-}" ] \
+                && [ -n "${USER_PROCESS_STARTTIME:-}" ] \
+                && [ -z "${USER_RECORD_IDENTITY:-}" ]; then
+                fixture_launch_pid=$USER_PROCESS_LAUNCH_PID \
+                    fixture_launch_starttime=$USER_PROCESS_LAUNCH_STARTTIME \
+                    fixture_pid=$USER_PROCESS_PID fixture_starttime=$USER_PROCESS_STARTTIME
+                fixture_acquisition=idle
+            fi
+            ;;
+    esac
+    case ${trace_acquisition:-idle} in
+        launching|committed)
+            if [ -n "${ROOT_LAUNCH_PID:-}" ] && [ -n "${ROOT_LAUNCH_STARTTIME:-}" ] \
+                && [ -n "${ROOT_PROCESS_PID:-}" ] && [ -n "${ROOT_PROCESS_STARTTIME:-}" ] \
+                && [ -z "${ROOT_RECORD_IDENTITY:-}" ]; then
+                trace_pid=$ROOT_LAUNCH_PID trace_starttime=$ROOT_LAUNCH_STARTTIME \
+                    trace_root_pid=$ROOT_PROCESS_PID trace_root_starttime=$ROOT_PROCESS_STARTTIME
+                trace_acquisition=idle
+            fi
+            ;;
+    esac
+}
+
+# Classify and reap only an authenticated direct shell child. Replaced and
+# unknown identities never authorize a numeric wait or signal.
+ia32_wait_owned_child() {
+    iwoc_pid=$1 iwoc_starttime=$2 iwoc_attempts=$3 iwoc_delay=$4
+    IA32_WAIT_STATE=unknown IA32_WAIT_STATUS=
+    while [ "$iwoc_attempts" -gt 0 ]; do
+        if recording_launcher_active "$iwoc_pid" "$iwoc_starttime"; then
+            iwoc_state=live
+        else
+            iwoc_result=$? iwoc_state=$RECORDED_LAUNCHER_STATE
+            case $iwoc_result:$iwoc_state in
+                1:gone|1:zombie)
+                    if wait "$iwoc_pid"; then IA32_WAIT_STATUS=0; else IA32_WAIT_STATUS=$?; fi
+                    IA32_WAIT_STATE=$iwoc_state
+                    return 0
+                    ;;
+                1:replaced|2:unknown)
+                    IA32_WAIT_STATE=$iwoc_state
+                    return 2
+                    ;;
+                *) IA32_WAIT_STATE=unknown; return 2 ;;
+            esac
+        fi
+        iwoc_attempts=$((iwoc_attempts - 1))
+        [ "$iwoc_attempts" -eq 0 ] || sleep "$iwoc_delay"
+    done
+    IA32_WAIT_STATE=$iwoc_state
+    return 1
+}
+
+ia32_wait_for_stopped() {
+    iwfs_pid=$1 iwfs_starttime=$2 iwfs_attempts=$3 iwfs_delay=$4
+    while [ "$iwfs_attempts" -gt 0 ]; do
+        iwfs_record=$(awk '{ sub(/^[0-9]+ \(.*\) /, ""); split($0, tail, " "); print tail[1], tail[20]; exit }' \
+            "/proc/$iwfs_pid/stat" 2>/dev/null) || return 2
+        iwfs_state=${iwfs_record%% *} iwfs_current=${iwfs_record#* }
+        [ "$iwfs_current" = "$iwfs_starttime" ] || return 2
+        case $iwfs_state in T|t) return 0 ;; esac
+        iwfs_attempts=$((iwfs_attempts - 1))
+        [ "$iwfs_attempts" -eq 0 ] || sleep "$iwfs_delay"
+    done
+    return 1
+}
+
+ia32_terminate_user_child() {
+    ituc_pid=$1 ituc_starttime=$2
+    if recording_launcher_active "$ituc_pid" "$ituc_starttime"; then
+        terminate_recording_launcher "$ituc_pid" "$ituc_starttime" user || return $?
+    else
+        ituc_result=$?
+        case $ituc_result:$RECORDED_LAUNCHER_STATE in
+            1:gone|1:zombie) ;;
+            *) IA32_WAIT_STATE=$RECORDED_LAUNCHER_STATE; IA32_WAIT_STATUS=; return 2 ;;
+        esac
+    fi
+    ia32_wait_owned_child "$ituc_pid" "$ituc_starttime" 1 0
+}
+
+ia32_launch_fixture() {
+    ilf_pidfile=$1 ilf_log=$2
+    shift 2
+    [ "${fixture_acquisition:-idle}" = idle ] \
+        && [ -z "${fixture_launch_pid:-}${fixture_launch_starttime:-}${fixture_pid:-}${fixture_starttime:-}" ] \
+        || return 2
+    fixture_acquisition=launching
+    if ! launch_user_recorded_process "$ilf_pidfile" "$ilf_log" "$@"; then
+        fixture_status_record=STARTUP_FAILED
+        return 1
+    fi
+    fixture_acquisition=committed
+    fixture_status_record=STARTED
+    ia32_committed_transfer_hook user
+    ia32_adopt_committed_transfers
+    [ "$fixture_acquisition" = idle ] || { fixture_status_record=OWNERSHIP_UNRESOLVED; return 2; }
+}
+
+ia32_launch_trace() {
+    ilt_pidfile=$1 ilt_log=$2
+    shift 2
+    [ "${trace_acquisition:-idle}" = idle ] \
+        && [ -z "${trace_pid:-}${trace_starttime:-}${trace_root_pid:-}${trace_root_starttime:-}" ] \
+        || return 2
+    trace_acquisition=launching
+    if ! launch_root_recorded_process "$ilt_pidfile" "$ilt_log" "$@"; then
+        trace_status_record=STARTUP_FAILED
+        return 1
+    fi
+    trace_acquisition=committed
+    trace_status_record=STARTED
+    ia32_committed_transfer_hook root
+    ia32_adopt_committed_transfers
+    [ "$trace_acquisition" = idle ] || { trace_status_record=OWNERSHIP_UNRESOLVED; return 2; }
+}
+
+ia32_complete_fixture() {
+    icf_attempts=$1 icf_delay=$2
+    fixture_completion_record=WAITING
+    if ia32_wait_owned_child "$fixture_launch_pid" "$fixture_launch_starttime" \
+        "$icf_attempts" "$icf_delay"; then
+        fixture_status_record=$IA32_WAIT_STATUS
+        fixture_completion_record=COMPLETE
+        fixture_pid= fixture_starttime= fixture_launch_pid= fixture_launch_starttime=
+        return 0
+    else
+        icf_wait_result=$?
+    fi
+    case $icf_wait_result:$IA32_WAIT_STATE in
+        1:*) fixture_completion_record=DEADLINE_EXPIRED ;;
+        *) fixture_completion_record=IDENTITY_UNRESOLVED ;;
+    esac
+    if ia32_terminate_user_child "$fixture_launch_pid" "$fixture_launch_starttime"; then
+        fixture_status_record=$IA32_WAIT_STATUS
+        fixture_pid= fixture_starttime= fixture_launch_pid= fixture_launch_starttime=
+    else
+        fixture_status_record=UNKNOWN
+    fi
+    return 1
+}
+
+ia32_finalize_pending_attempts() {
+    : "${IA32_CLEANUP_STATUS:=0}"
+    IA32_PENDING_USER_PID= IA32_PENDING_USER_STARTTIME=
+    IA32_PENDING_ROOT_PID= IA32_PENDING_ROOT_STARTTIME=
+    if [ -n "${USER_RECORD_IDENTITY:-}" ]; then
+        IA32_PENDING_USER_PID=${USER_PROCESS_LAUNCH_PID:-}
+        IA32_PENDING_USER_STARTTIME=${USER_PROCESS_LAUNCH_STARTTIME:-}
+    fi
+    if [ -n "${ROOT_RECORD_IDENTITY:-}" ]; then
+        IA32_PENDING_ROOT_PID=${ROOT_LAUNCH_PID:-}
+        IA32_PENDING_ROOT_STARTTIME=${ROOT_LAUNCH_STARTTIME:-}
+    fi
+    finalize_user_recorded_process || IA32_CLEANUP_STATUS=1
+    finalize_root_recorded_process || IA32_CLEANUP_STATUS=1
+    return 0
+}
+
+IA32_CLEANUP_ENTERED=0
+ia32_begin_cleanup() {
+    [ "$IA32_CLEANUP_ENTERED" -eq 0 ] || return 1
+    IA32_CLEANUP_ENTERED=1
+    IA32_ORIGINAL_STATUS=$1
+    trap - EXIT HUP INT TERM
+    trap '' HUP INT TERM
+    set +e
+}
+
+ia32_cleanup() {
+    ia32_begin_cleanup "$1" || return 1
+    CLEANUP_STATUS=0
+    ia32_adopt_committed_transfers
+    [ "${fixture_acquisition:-idle}" = idle ] || CLEANUP_STATUS=1
+    [ "${trace_acquisition:-idle}" = idle ] || CLEANUP_STATUS=1
+    if [ -n "$fixture_launch_pid" ] && [ -n "$fixture_launch_starttime" ]; then
+        if ia32_terminate_user_child "$fixture_launch_pid" "$fixture_launch_starttime"; then
+            fixture_status_record=$IA32_WAIT_STATUS
+            fixture_pid= fixture_starttime= fixture_launch_pid= fixture_launch_starttime=
+        else
+            CLEANUP_STATUS=1
+            fixture_status_record=UNKNOWN
+        fi
+    fi
+    if [ -n "$trace_guard_pid" ] && [ -n "$trace_guard_starttime" ]; then
+        guard_cleanup_status=0
+        terminate_recording_launcher "$trace_guard_pid" "$trace_guard_starttime" root \
+            || guard_cleanup_status=1
+        if [ "$guard_cleanup_status" -eq 0 ]; then
+            if recording_launcher_active "$trace_guard_pid" "$trace_guard_starttime"; then
+                guard_cleanup_status=1
+            else
+                cleanup_state=$?
+                case $cleanup_state:$RECORDED_LAUNCHER_STATE in
+                    1:gone|1:zombie) trace_guard_pid= trace_guard_starttime= ;;
+                    *) guard_cleanup_status=1 ;;
+                esac
+            fi
+        fi
+        [ "$guard_cleanup_status" -eq 0 ] || CLEANUP_STATUS=1
+    fi
+    if [ -n "$trace_root_pid" ] && [ -n "$trace_root_starttime" ]; then
+        timeout_cleanup_status=0
+        if recording_launcher_active "$trace_root_pid" "$trace_root_starttime"; then
+            signal_verified_root_process CONT "$trace_root_pid" "$trace_root_starttime" \
+                >/dev/null 2>&1 || timeout_cleanup_status=1
+        else
+            cleanup_state=$?
+            case $cleanup_state:$RECORDED_LAUNCHER_STATE in
+                1:gone|1:zombie) ;;
+                *) timeout_cleanup_status=1 ;;
+            esac
+        fi
+        if terminate_recording_launcher "$trace_root_pid" "$trace_root_starttime" root; then
+            if recording_launcher_active "$trace_root_pid" "$trace_root_starttime"; then
+                timeout_cleanup_status=1
+            else
+                cleanup_state=$?
+                case $cleanup_state:$RECORDED_LAUNCHER_STATE in
+                    1:gone|1:zombie) trace_root_pid= trace_root_starttime= ;;
+                    *) timeout_cleanup_status=1 ;;
+                esac
+            fi
+        else
+            timeout_cleanup_status=1
+        fi
+        [ "$timeout_cleanup_status" -eq 0 ] || CLEANUP_STATUS=1
+    fi
+    if [ -n "$trace_pid" ] && [ -n "$trace_starttime" ]; then
+        if ia32_wait_owned_child "$trace_pid" "$trace_starttime" 120 0.05; then
+            trace_status_record=$IA32_WAIT_STATUS
+            trace_pid= trace_starttime=
+        else
+            CLEANUP_STATUS=1
+            trace_status_record=UNKNOWN
+        fi
+    elif [ "$trace_status_record" = STARTED ]; then
+        trace_status_record=UNKNOWN
+        CLEANUP_STATUS=1
+    fi
+    IA32_CLEANUP_STATUS=$CLEANUP_STATUS
+    ia32_finalize_pending_attempts
+    CLEANUP_STATUS=$IA32_CLEANUP_STATUS
+    if [ -n "$IA32_PENDING_USER_PID" ] && [ -n "$IA32_PENDING_USER_STARTTIME" ] \
+        && [ -z "${USER_RECORD_IDENTITY:-}" ]; then
+        ia32_wait_owned_child "$IA32_PENDING_USER_PID" "$IA32_PENDING_USER_STARTTIME" 120 0.05 \
+            || CLEANUP_STATUS=1
+    fi
+    if [ -n "$IA32_PENDING_ROOT_PID" ] && [ -n "$IA32_PENDING_ROOT_STARTTIME" ] \
+        && [ -z "${ROOT_RECORD_IDENTITY:-}" ]; then
+        ia32_wait_owned_child "$IA32_PENDING_ROOT_PID" "$IA32_PENDING_ROOT_STARTTIME" 120 0.05 \
+            || CLEANUP_STATUS=1
+    fi
+    write_status || CLEANUP_STATUS=1
+    if [ -n "${EVIDENCE:-}" ]; then
+        printf 'cleanup_status=%s\n' "$CLEANUP_STATUS" >"$EVIDENCE/cleanup.status" \
+            || CLEANUP_STATUS=1
+    else
+        CLEANUP_STATUS=1
+    fi
+    final_status=$IA32_ORIGINAL_STATUS
+    [ "$final_status" -ne 0 ] || final_status=$CLEANUP_STATUS
+    if [ "$CLEANUP_STATUS" -eq 0 ]; then
+        echo "CLEANUP_RESULT=PASS status=$final_status"
+    else
+        echo "CLEANUP_RESULT=NONPASS status=$final_status"
+    fi
+    return "$final_status"
+}
+
+cleanup() {
+    original_status=$?
+    ia32_cleanup "$original_status"
+    exit $?
 }
 
 check_log() {
@@ -52,7 +352,20 @@ check_invalid_read_log() {
 
 self_test() {
     work=$(mktemp -d)
-    trap 'rm -rf "$work"' EXIT HUP INT TERM
+    EVIDENCE=$work/evidence
+    mkdir "$EVIDENCE"
+    IA32_CLEANUP_ENTERED=0
+    self_test_cleanup() {
+        self_test_status=$?
+        ia32_cleanup "$self_test_status"
+        self_test_status=$?
+        rm -rf "$work"
+        exit "$self_test_status"
+    }
+    trap self_test_cleanup EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     good=$work/good
     cat >"$good" <<'EOF'
 PROBE_READY abi=32
@@ -90,9 +403,14 @@ EOF
     check_invalid_read_log "$work/invalid-read-new"
     sed 's/probe_read_user/probe_read_kernel/' "$work/invalid-read-new" >"$work/wrong-helper"
     if check_invalid_read_log "$work/wrong-helper"; then return 1; fi
-    sh -c 'kill -STOP $$' & stopped=$!
-    terminate_recording_launcher "$stopped"
-    if recording_launcher_active "$stopped"; then return 1; fi
+    fixture_pid= fixture_starttime= fixture_launch_pid= fixture_launch_starttime=
+    fixture_status_record=UNRUN
+    fixture_completion_record=UNRUN
+    ia32_launch_fixture "$work/stopped.pid" "$work/stopped.log" \
+        sh -c 'kill -STOP "$$"; exec sleep 300' || return 1
+    ia32_wait_for_stopped "$fixture_pid" "$fixture_starttime" 100 0.01 || return 1
+    ia32_terminate_user_child "$fixture_launch_pid" "$fixture_launch_starttime" || return 1
+    fixture_pid= fixture_starttime= fixture_launch_pid= fixture_launch_starttime=
     status=0
     timeout --kill-after=1 -s INT 1 sh -c 'trap "" INT TERM; while :; do :; done' \
         >/dev/null 2>&1 || status=$?
@@ -102,13 +420,15 @@ EOF
     bystander_status_record=UNRUN
     trace_status_record=UNRUN
     write_status || return 1
-    sh -c 'echo injected-launch-error >&2; exit 9' >"$work/injected.log" 2>&1 &
-    injected=$!
+    fixture_pid= fixture_starttime= fixture_launch_pid= fixture_launch_starttime=
+    ia32_launch_fixture "$work/injected.pid" "$work/injected.log" \
+        sh -c 'echo injected-launch-error >&2; exit 9' || return 1
     trace_status_record=STARTED
     write_status || return 1
     grep -q '^tracer_status=STARTED$' "$current_status_log"
-    status=0
-    wait "$injected" || status=$?
+    ia32_wait_owned_child "$fixture_launch_pid" "$fixture_launch_starttime" 100 0.01 || return 1
+    status=$IA32_WAIT_STATUS
+    fixture_pid= fixture_starttime= fixture_launch_pid= fixture_launch_starttime=
     trace_status_record=$status
     write_status || return 1
     grep -q '^tracer_status=9$' "$current_status_log"
@@ -118,6 +438,7 @@ EOF
     echo "SELF_TEST_UPPER32_POISON=SYNTHETIC_ONLY"
 }
 
+if [ "${P11SCOPE_IA32_SOURCE_ONLY:-0}" = 1 ]; then return 0 2>/dev/null || exit 0; fi
 if [ "${1-}" = --self-test ]; then self_test; exit 0; fi
 
 require_non_root_caller
@@ -135,67 +456,8 @@ mkdir -m 700 "$EVIDENCE"
 WORK=$EVIDENCE/work
 mkdir -m 700 "$WORK"
 SRC=scripts/matrix/ia32-compat-harness.c
-fixture_pid=
-fixture_starttime=
-trace_pid=
-trace_root_pid=
-trace_root_starttime=
-CLEANUP_STATUS=0
-cleanup() {
-    original_status=$?
-    CLEANUP_STATUS=0
-    if [ -n "$fixture_pid" ] && process_matches_starttime "$fixture_pid" "$fixture_starttime" \
-        && recording_launcher_active "$fixture_pid"; then
-        cleanup_step signal_verified_process CONT "$fixture_pid" "$fixture_starttime"
-        if terminate_recording_launcher "$fixture_pid"; then
-            if [ "$fixture_status_record" = STARTUP_FAILED ]; then
-                fixture_status_record=STARTUP_FAILED_TERMINATED
-            else
-                fixture_status_record=TERMINATED
-            fi
-        else
-            CLEANUP_STATUS=1
-            fixture_status_record=UNKNOWN
-        fi
-    elif [ -n "$fixture_pid" ]; then
-        terminate_recording_launcher "$fixture_pid" || CLEANUP_STATUS=1
-        fixture_status_record=UNKNOWN
-    fi
-    if [ -n "$trace_root_pid" ] && root_process_matches_starttime "$trace_root_pid" "$trace_root_starttime"; then
-        cleanup_step signal_verified_root_process TERM "$trace_root_pid" "$trace_root_starttime"
-        cleanup_wait=0
-        while root_process_matches_starttime "$trace_root_pid" "$trace_root_starttime" \
-            && [ "$cleanup_wait" -lt 40 ]; do
-            cleanup_wait=$((cleanup_wait + 1)); sleep 0.05
-        done
-        if root_process_matches_starttime "$trace_root_pid" "$trace_root_starttime"; then
-            cleanup_step signal_verified_root_process KILL "$trace_root_pid" "$trace_root_starttime"
-        fi
-    fi
-    if [ -n "$trace_pid" ]; then
-        trace_was_active=0
-        recording_launcher_active "$trace_pid" && trace_was_active=1
-        if terminate_recording_launcher "$trace_pid" && [ "$trace_was_active" -eq 1 ]; then
-            if [ "$trace_status_record" = STARTUP_FAILED ]; then
-                trace_status_record=STARTUP_FAILED_TERMINATED
-            else
-                trace_status_record=TERMINATED
-            fi
-        elif [ "$trace_was_active" -eq 0 ]; then
-            trace_status_record=UNKNOWN
-        else
-            CLEANUP_STATUS=1
-            trace_status_record=UNKNOWN
-        fi
-    elif [ "$trace_status_record" = STARTED ]; then
-        trace_status_record=UNKNOWN
-    fi
-    write_status || CLEANUP_STATUS=1
-    printf 'cleanup_status=%s\n' "$CLEANUP_STATUS" >"$EVIDENCE/cleanup.status"
-    [ "$CLEANUP_STATUS" -eq 0 ] || exit "$CLEANUP_STATUS"
-    return "$original_status"
-}
 . scripts/cleanup-traps.sh
+trap 'exit 129' HUP
 
 {
     echo "kernel_release=$(uname -r)"
@@ -203,7 +465,11 @@ cleanup() {
     echo "gcc_version=$(gcc -dumpfullversion -dumpversion)"
     echo "bpftrace_version=$(bpftrace --version | sed 's/^bpftrace v//')"
 } >"$EVIDENCE/environment.status"
-sha256sum "$SRC" scripts/matrix/verify-ia32-compat.sh >"$EVIDENCE/source.sha256"
+TRACE_GUARD_SRC=scripts/matrix/ia32-compat-trace-exec.c
+TRACE_GUARD_BIN=$WORK/ia32-compat-trace-exec
+sha256sum "$SRC" scripts/matrix/verify-ia32-compat.sh scripts/lib.sh \
+    scripts/recorded-process-exec.py scripts/cleanup-traps.sh "$TRACE_GUARD_SRC" \
+    >"$EVIDENCE/source.sha256"
 
 build_abi() {
     abi=$1
@@ -213,6 +479,10 @@ build_abi() {
         $cfi -rdynamic -o "$WORK/harness-$abi" "$SRC" -ldl || return
     gcc "-m$abi" -O1 -g -Wall -Wextra -Werror -fPIC -shared \
         -DIA32_COMPAT_DSO -o "$WORK/second-$abi.so" "$SRC" || return
+}
+build_trace_guard() {
+    gcc -O2 -Wall -Wextra -Werror -o "$TRACE_GUARD_BIN" "$TRACE_GUARD_SRC" || return
+    sha256sum "$TRACE_GUARD_BIN" >>"$EVIDENCE/source.sha256"
 }
 loader_path() { readelf -l "$1" | sed -n 's/.*Requesting program interpreter: \([^]]*\)].*/\1/p'; }
 symbol_value() { readelf -Ws "$1" | awk -v name="$2" '$8 ~ ("^" name "(@@.*)?$") { print "0x" $2; exit }'; }
@@ -229,8 +499,11 @@ run_abi() {
     status_log=$EVIDENCE/$tag.status
     program=$EVIDENCE/$tag.bt
     root_pidfile=$EVIDENCE/$tag-tracer.pid
+    fixture_pidfile=$EVIDENCE/$tag-fixture.pid
+    guard_pidfile=$EVIDENCE/$tag-guard.pid
     current_status_log=$status_log
     fixture_status_record=UNRUN
+    fixture_completion_record=UNRUN
     bystander_status_record=UNRUN
     trace_status_record=UNRUN
     write_status || return 1
@@ -247,22 +520,23 @@ run_abi() {
         args='reg("di"), reg("si"), reg("dx"), reg("cx"), reg("r8"), reg("r9"), *(uint64 *)(reg("sp") + 8)'
         offset=24 abi_flag=
     fi
-    if [ "$mode" = xol ]; then setarch i386 -R "$bin" "$so" >"$fixture_log" 2>&1 &
-    else "$bin" "$so" >"$fixture_log" 2>&1 & fi
-    fixture_pid=$!
-    fixture_status_record=STARTED
+    if [ "$mode" = xol ]; then
+        ia32_launch_fixture "$fixture_pidfile" "$fixture_log" setarch i386 -R "$bin" "$so" || return 1
+    else
+        ia32_launch_fixture "$fixture_pidfile" "$fixture_log" "$bin" "$so" || return 1
+    fi
     write_status || return 1
-    fixture_starttime=$(process_starttime "$fixture_pid") || {
+    i=0
+    while ! grep -q "^FIXTURE_READY=$abi\$" "$fixture_log" && [ "$i" -lt 100 ]; do
+        if recording_launcher_active "$fixture_launch_pid" "$fixture_launch_starttime"; then :; else break; fi
+        i=$((i + 1)); sleep 0.05
+    done
+    grep -q "^FIXTURE_READY=$abi\$" "$fixture_log" || {
         fixture_status_record=STARTUP_FAILED
         write_status || return 1
         return 1
     }
-    i=0
-    while ! grep -q "^FIXTURE_READY=$abi\$" "$fixture_log" && [ "$i" -lt 100 ]; do
-        recording_launcher_active "$fixture_pid" || break
-        i=$((i + 1)); sleep 0.05
-    done
-    grep -q "^FIXTURE_READY=$abi\$" "$fixture_log" || {
+    ia32_wait_for_stopped "$fixture_pid" "$fixture_starttime" 100 0.05 || {
         fixture_status_record=STARTUP_FAILED
         write_status || return 1
         return 1
@@ -297,25 +571,22 @@ EOF
     fi
     # Predicates scope every probe. On the qualified Jammy bpftrace 0.14,
     # adding -p loses loader hits; our own timeout and cleanup bound lifetime.
-    launch_root_recorded_process "$root_pidfile" "$trace_log" \
-        timeout --kill-after=2 --foreground -s INT 20 bpftrace -kk -q -B line \
-        "$program" || {
-            trace_pid=${ROOT_LAUNCH_PID:-}
-            trace_root_pid=${ROOT_PROCESS_PID:-}
-            trace_root_starttime=${ROOT_PROCESS_STARTTIME:-}
-            trace_status_record=STARTUP_FAILED
+    bpftrace_path=$(command -v bpftrace) || return 1
+    bpftrace_path=$(readlink -f "$bpftrace_path") || return 1
+    ia32_launch_trace "$root_pidfile" "$trace_log" \
+        timeout --kill-after=2 -s INT 20 "$TRACE_GUARD_BIN" \
+        "$root_pidfile" "$guard_pidfile" "$bpftrace_path" "$program" || {
             write_status || return 1
             return 1
-        }
-    trace_pid=$ROOT_LAUNCH_PID
-    trace_root_pid=$ROOT_PROCESS_PID
-    trace_root_starttime=$ROOT_PROCESS_STARTTIME
-    trace_status_record=STARTED
+    }
     write_status || return 1
-    reclaim_root_output "$root_pidfile" || return 1
+    guard_record=$(wait_root_process_record "$guard_pidfile" "$trace_pid" "$trace_starttime") || return 1
+    trace_guard_pid=${guard_record% *}
+    trace_guard_starttime=${guard_record#* }
     i=0
     while ! grep -q "^PROBE_READY abi=$abi\$" "$trace_log" && [ "$i" -lt 200 ]; do
-        recording_launcher_active "$trace_pid" || break
+        if recording_launcher_active "$trace_guard_pid" "$trace_guard_starttime" \
+            && recording_launcher_active "$trace_pid" "$trace_starttime"; then :; else break; fi
         i=$((i + 1)); sleep 0.05
     done
     grep -q "^PROBE_READY abi=$abi\$" "$trace_log" || {
@@ -323,6 +594,8 @@ EOF
         write_status || return 1
         return 1
     }
+    [ -s "$guard_pidfile.exec" ] || return 1
+    reclaim_root_output "$root_pidfile" "$guard_pidfile" "$guard_pidfile.exec" || return 1
     bystander_status_record=STARTED
     write_status || return 1
     bystander_status=0
@@ -330,26 +603,33 @@ EOF
     bystander_status_record=$bystander_status
     write_status || return 1
     [ "$bystander_status" -eq 0 ] && grep -q "^FIXTURE_DONE=$abi\$" "$bystander_log" || return 1
-    recording_launcher_active "$fixture_pid" && recording_launcher_active "$trace_pid" || return 1
+    recording_launcher_active "$fixture_launch_pid" "$fixture_launch_starttime" \
+        && recording_launcher_active "$trace_pid" "$trace_starttime" || return 1
+    ia32_wait_for_stopped "$fixture_pid" "$fixture_starttime" 1 0 || return 1
     signal_verified_process CONT "$fixture_pid" "$fixture_starttime" || return 1
-    i=0
-    while recording_launcher_active "$fixture_pid" && [ "$i" -lt 100 ]; do
-        i=$((i + 1)); sleep 0.05
-    done
-    fixture_status=0
-    if recording_launcher_active "$fixture_pid"; then
-        fixture_status=124
-        terminate_recording_launcher "$fixture_pid" || fixture_status=125
-    else
-        wait "$fixture_pid" || fixture_status=$?
-    fi
-    fixture_pid=
-    fixture_status_record=$fixture_status
+    fixture_completion_failed=0
+    ia32_complete_fixture 100 0.05 || fixture_completion_failed=1
+    fixture_status=$fixture_status_record
     write_status || return 1
-    trace_status=0; wait "$trace_pid" || trace_status=$?; trace_pid=
+    [ "$fixture_completion_failed" -eq 0 ] || return 1
+    ia32_wait_owned_child "$trace_pid" "$trace_starttime" 500 0.05 || return 1
+    trace_status=$IA32_WAIT_STATUS
+    trace_pid= trace_starttime=
     trace_status_record=$trace_status
-    trace_root_pid=
-    trace_root_starttime=
+    if recording_launcher_active "$trace_guard_pid" "$trace_guard_starttime"; then return 1; else
+        trace_ended=$?
+        case $trace_ended:$RECORDED_LAUNCHER_STATE in
+            1:gone|1:zombie) trace_guard_pid= trace_guard_starttime= ;;
+            *) return 1 ;;
+        esac
+    fi
+    if recording_launcher_active "$trace_root_pid" "$trace_root_starttime"; then return 1; else
+        trace_ended=$?
+        case $trace_ended:$RECORDED_LAUNCHER_STATE in
+            1:gone|1:zombie) trace_root_pid= trace_root_starttime= ;;
+            *) return 1 ;;
+        esac
+    fi
     write_status || return 1
     [ "$fixture_status" -eq 0 ] && [ "$trace_status" -eq 0 ] || return 1
     grep -q "^FIXTURE_DONE=$abi\$" "$fixture_log" || return 1
@@ -364,6 +644,7 @@ EOF
 
 build_abi 64 || { echo "RESULT=SKIP reason=abi_64_toolchain_unavailable"; exit 77; }
 build_abi 32 || { echo "RESULT=SKIP reason=abi_32_toolchain_unavailable"; exit 77; }
+build_trace_guard || { echo "RESULT=SKIP reason=trace_guard_toolchain_unavailable"; exit 77; }
 run_abi 64 core || { status=$?; echo "RESULT=NONPASS abi=64 mode=core status=$status"; exit 1; }
 run_abi 64 invalid-read || { status=$?; echo "INVALID_READ_RESULT=NONPASS abi=64 status=$status"; exit 1; }
 run_abi 32 core || { status=$?; echo "RESULT=NONPASS abi=32 mode=core status=$status"; exit 1; }

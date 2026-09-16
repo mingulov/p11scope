@@ -417,6 +417,9 @@ pub struct Evidence {
     pub unmatched_returns: u64,
     pub rv_update_failures: u64,
     pub cgroup_scope_failures: u64,
+    /// Scoped probe hits whose exact x86 execution-mode selector was neither
+    /// conventional LP64 nor ia32. No ABI-dependent read was attempted.
+    pub abi_refusals: u64,
     pub semantic_capture_failures: u64,
     pub unregistered_mechanisms: u64,
     pub template_tail_failures: u64,
@@ -434,6 +437,7 @@ pub struct Evidence {
     pub async_evictions: u64,
     pub fork_state_ambiguities: u64,
     pub semantic_state_drops: u64,
+    pub semantic_history_drops: u64,
     pub pending_at_end: u64,
     /// Ring-buffer records rejected by the size check (`events::Drain`).
     /// A nonzero count means the writer/reader layout drifted mid-capture.
@@ -630,6 +634,7 @@ impl Evidence {
             && self.unmatched_returns == 0
             && self.rv_update_failures == 0
             && self.cgroup_scope_failures == 0
+            && self.abi_refusals == 0
             && self.semantic_capture_failures == 0
             && self.unregistered_mechanisms == 0
             && self.template_tail_failures == 0
@@ -646,6 +651,7 @@ impl Evidence {
             && self.async_evictions == 0
             && self.fork_state_ambiguities == 0
             && self.semantic_state_drops == 0
+            && self.semantic_history_drops == 0
             && self.pending_at_end == 0
             && self.malformed_records == 0
             && !self.templates_truncated
@@ -769,6 +775,12 @@ pub fn live(
         ev.skipped.len(),
         ev.in_flight_at_end,
     );
+    if ev.semantic_history_drops > 0 {
+        evidence_line.push_str(&format!(
+            " · semantic_history_drops={}",
+            ev.semantic_history_drops
+        ));
+    }
     // Gap fragments in render order — discovery first, since it explains a
     // PARTIAL verdict that has no attach failure and no skip behind it. The
     // gate derives from these same fragments, so a new gap cannot be added
@@ -792,6 +804,7 @@ pub fn live(
         ("unmatched returns", ev.unmatched_returns),
         ("RV updates failed", ev.rv_update_failures),
         ("cgroup checks failed", ev.cgroup_scope_failures),
+        ("ABI probe hits refused", ev.abi_refusals),
         ("semantic captures failed", ev.semantic_capture_failures),
         ("unregistered mechanisms", ev.unregistered_mechanisms),
         ("template tail calls failed", ev.template_tail_failures),
@@ -1181,7 +1194,7 @@ struct SessionsOut {
     closed: u64,
     async_opened: u64,
     peak_concurrent: u64,
-    /// `opened + inherited - closed`: sessions still live at capture end.
+    /// `opened + inherited - closed`: tracked arithmetic balance at capture end.
     balance: u64,
 }
 
@@ -1447,6 +1460,7 @@ mod tests {
             unmatched_returns: 0,
             rv_update_failures: 0,
             cgroup_scope_failures: 0,
+            abi_refusals: 0,
             semantic_capture_failures: 0,
             unregistered_mechanisms: 0,
             template_tail_failures: 0,
@@ -1464,6 +1478,7 @@ mod tests {
             async_evictions: 0,
             fork_state_ambiguities: 0,
             semantic_state_drops: 0,
+            semantic_history_drops: 0,
             pending_at_end: 0,
             malformed_records: 0,
             orphan_ops: 0,
@@ -2062,6 +2077,7 @@ mod tests {
                 },
                 key,
                 path: "/opt/p11.so".into(),
+                decoder_abi: Some(p11scope_manifest::elf::ElfAbi::Lp64),
                 exports: vec!["C_GetFunctionList".into()],
                 tables: vec![ScannedTable {
                     version: (2, 40),
@@ -2380,6 +2396,45 @@ mod tests {
     }
 
     #[test]
+    fn p2_bracket_refusals_remain_distinct_finite_partial_evidence() {
+        let mut ev = evidence();
+        let reasons = [
+            crate::discovery::scan::MAPPING_CHANGED_REASON,
+            "memory scan refused: final mapping validation unavailable: PRIVATE_DETAIL",
+        ];
+        ev.skipped = reasons
+            .iter()
+            .map(|reason| {
+                capture_skipped_out(&crate::discovery::scan::Skipped {
+                    subject: "/PRIVATE_PROVIDER_PATH".into(),
+                    reason: (*reason).into(),
+                })
+            })
+            .collect();
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        for document in [
+            profile_json(
+                &reports_fixture(),
+                &ev,
+                &state_fixture(),
+                &capture_fixture(),
+            ),
+            json(&reports_fixture(), &ev, &capture_fixture()),
+        ] {
+            assert_eq!(document["evidence"]["completeness"], "PARTIAL");
+            assert_eq!(
+                document["evidence"]["skipped"],
+                serde_json::json!([
+                    {"name":"discovery subject","reason":"discovery unavailable"},
+                    {"name":"discovery subject","reason":"discovery unavailable"}
+                ])
+            );
+            assert!(!document.to_string().contains("PRIVATE_"));
+        }
+    }
+
+    #[test]
     fn bounded_decode_omissions_render_finite_partial_evidence() {
         use crate::discovery::scan::{Skipped, WORK_CEILING_REASON};
 
@@ -2571,6 +2626,55 @@ mod tests {
     }
 
     #[test]
+    fn history_loss_reaches_profile_json_trace_and_stderr_with_zero_pending() {
+        let mut state = crate::semantics::State::new(&init_plan());
+        state.reject_history(&init_event(0, 1, 0, 0, 0, 0));
+        let mut ev = evidence();
+        ev.semantic_history_drops = state.semantic_evidence().semantic_history_drops;
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        assert_eq!(state.pending_at_end(), 0);
+        let capture = CaptureMeta {
+            started: "t0",
+            ended: "t1",
+            kernel: "6.8.0",
+            policy: CapturePolicy::Allowlisted,
+            ring_bytes: p11scope_ebpf_common::RING_BYTES,
+            drain_interval_ms: 1000,
+        };
+        let value = profile_json(&[], &ev, &state, &capture);
+        assert_eq!(value["evidence"]["semantic_history_drops"], 1);
+        assert_eq!(value["evidence"]["completeness"], "PARTIAL");
+        assert!(
+            crate::trace::evidence_line(&ev, CapturePolicy::Allowlisted, false)
+                .contains("\"semantic_history_drops\":1")
+        );
+        assert!(
+            live(
+                &[],
+                &ev,
+                Duration::ZERO,
+                "/x.so",
+                "profile",
+                CapturePolicy::Allowlisted
+            )
+            .contains("semantic_history_drops=1")
+        );
+        let text = value.to_string();
+        assert!(!text.contains("task_cookie"));
+        assert!(!text.contains("exec_id"));
+        ev.semantic_history_drops = u64::MAX;
+        let _ = live(
+            &[],
+            &ev,
+            Duration::ZERO,
+            "/x.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+        );
+    }
+
+    #[test]
     fn any_gap_forces_partial() {
         for mutate in [
             (|e: &mut Evidence| e.attach_failures.push("boom".into())) as fn(&mut Evidence),
@@ -2591,6 +2695,7 @@ mod tests {
             |e: &mut Evidence| e.unmatched_returns = 1,
             |e: &mut Evidence| e.rv_update_failures = 1,
             |e: &mut Evidence| e.cgroup_scope_failures = 1,
+            |e: &mut Evidence| e.abi_refusals = 1,
             |e: &mut Evidence| e.semantic_capture_failures = 1,
             |e: &mut Evidence| e.unregistered_mechanisms = 1,
             |e: &mut Evidence| e.template_tail_failures = 1,
@@ -2607,6 +2712,7 @@ mod tests {
             |e: &mut Evidence| e.async_evictions = 1,
             |e: &mut Evidence| e.fork_state_ambiguities = 1,
             |e: &mut Evidence| e.semantic_state_drops = 1,
+            |e: &mut Evidence| e.semantic_history_drops = 1,
             |e: &mut Evidence| e.pending_at_end = 1,
             |e: &mut Evidence| e.malformed_records = 1,
             |e: &mut Evidence| e.templates_truncated = true,

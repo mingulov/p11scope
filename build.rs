@@ -19,13 +19,23 @@
 //!
 use std::{env, path::PathBuf, process::Command};
 
+#[path = "build_support/bpf_tools.rs"]
+mod bpf_tools;
+
 fn main() {
     println!("cargo:rerun-if-changed=crates/ebpf/src");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity.c");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity.h");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/task_owner.c");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/task_owner.h");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/root_affiliation.c");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/root_affiliation.h");
     println!("cargo:rerun-if-changed=crates/ebpf/Cargo.toml");
     println!("cargo:rerun-if-changed=crates/ebpf/Cargo.lock");
     println!("cargo:rerun-if-changed=crates/ebpf/rust-toolchain.toml");
     println!("cargo:rerun-if-changed=crates/ebpf-common/src");
     println!("cargo:rerun-if-changed=crates/ebpf-common/Cargo.toml");
+    println!("cargo:rerun-if-changed=build_support/bpf_tools.rs");
     // Gate G2 induced-gap test (Task 7): forces a tiny RING_BYTES so a high
     // call rate overflows the ring buffer deliberately. Unset (the default)
     // leaves the build byte-for-byte identical to before this flag existed.
@@ -33,6 +43,9 @@ fn main() {
     println!("cargo:rerun-if-env-changed=P11SCOPE_SMALL_STATE_MAPS");
     println!("cargo:rerun-if-env-changed=P11SCOPE_SMALL_DISCOVERY_RING");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA");
+    println!("cargo:rerun-if-env-changed=P11SCOPE_PREPARED_BPF_CARGO");
+    println!("cargo:rerun-if-env-changed=P11SCOPE_PREPARED_BPF_RUSTC");
+    println!("cargo:rerun-if-env-changed=LD_LIBRARY_PATH");
     let small_ring = matches!(
         env::var("P11SCOPE_SMALL_RING").as_deref(),
         Ok("1") | Ok("true")
@@ -54,12 +67,74 @@ fn main() {
         Ok("big") => "bpfeb-unknown-none",
         _ => "bpfel-unknown-none",
     };
+    let mut cmd = bpf_tools::bpf_cargo_command_from_env()
+        .unwrap_or_else(|error| panic!("selecting BPF Cargo and rustc: {error}"));
+
+    let native_bitcode = out_dir.join("image_identity.bc");
+    let status = Command::new("clang-18")
+        .args([
+            "-target",
+            if target.starts_with("bpfeb") {
+                "bpfeb"
+            } else {
+                "bpfel"
+            },
+            "-O2",
+            "-g",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-emit-llvm",
+            "-c",
+        ])
+        .arg(manifest_dir.join("crates/ebpf/native/image_identity.c"))
+        .arg("-o")
+        .arg(&native_bitcode)
+        .status()
+        .expect("failed to spawn clang-18 for image identity");
+    assert!(
+        status.success(),
+        "building native image identity failed: {status}"
+    );
+
+    let owner_bitcode = out_dir.join("task_owner.bc");
+    let root_bitcode = out_dir.join("root_affiliation.bc");
+    for (unit, bitcode) in [
+        ("task_owner", &owner_bitcode),
+        ("root_affiliation", &root_bitcode),
+    ] {
+        let mut compile = Command::new("clang-18");
+        compile
+            .args([
+                "-target",
+                if target.starts_with("bpfeb") {
+                    "bpfeb"
+                } else {
+                    "bpfel"
+                },
+                "-O2",
+                "-g",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-emit-llvm",
+                "-c",
+            ])
+            .arg(manifest_dir.join(format!("crates/ebpf/native/{unit}.c")))
+            .arg("-o")
+            .arg(bitcode);
+        if small_state_maps {
+            compile.arg("-DP11SCOPE_SMALL_STATE_MAPS");
+        }
+        let status = compile
+            .status()
+            .expect("failed to spawn clang-18 for native state");
+        assert!(status.success(), "building native {unit} failed: {status}");
+    }
 
     let ebpf_manifest = manifest_dir.join("crates/ebpf/Cargo.toml");
     let target_dir = out_dir.join("ebpf-target");
-    let mut cmd = Command::new("cargo");
     cmd.args([
-        "+nightly-2026-05-20",
         "build",
         "--locked",
         "--release",
@@ -82,20 +157,67 @@ fn main() {
     if small_discovery_ring {
         features.push("small-discovery-ring");
     }
+    let mut flags = env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default();
+    let mut append_flag = |flag: &str| {
+        if !flags.is_empty() {
+            flags.push('\u{1f}');
+        }
+        flags.push_str(flag);
+    };
+    // Native task storage and typed tracepoint require BTF/CO-RE in every build.
+    for flag in [
+        "-C",
+        "linker=bpf-linker",
+        "-C",
+        "debuginfo=2",
+        "-C",
+        "link-arg=--btf",
+        "-C",
+        "link-arg=--export=p11_link_current_identity",
+        "-C",
+        "link-arg=--export=p11_link_fork_allowed",
+        "-C",
+        "link-arg=--export=p11_link_emit_fork",
+        "-C",
+        "link-arg=--export=task_newtask",
+        "-C",
+        "link-arg=--export=p11_owner_reserve",
+        "-C",
+        "link-arg=--export=p11_owner_refund",
+        "-C",
+        "link-arg=--export=p11_read_ia32_arg",
+    ] {
+        append_flag(flag);
+    }
+    append_flag("-C");
+    append_flag(&format!("link-arg={}", native_bitcode.display()));
+    append_flag("-C");
+    append_flag(&format!("link-arg={}", owner_bitcode.display()));
+    append_flag("-C");
+    append_flag(&format!("link-arg={}", root_bitcode.display()));
+    for symbol in ["START", "DISCOVERY_STATE"] {
+        append_flag("-C");
+        append_flag(&format!("link-arg=--export={symbol}"));
+    }
     if env::var_os("CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA").is_some() {
         features.push("unsafe-unvalidated-metadata");
+        // Preserve separately verified diagnostic helpers and their BTF signatures.
+        for flag in [
+            "-C",
+            "link-arg=--export=p11_decode_params",
+            "-C",
+            "link-arg=--export=p11_walk_template",
+        ] {
+            append_flag(flag);
+        }
     }
+    cmd.env("CARGO_ENCODED_RUSTFLAGS", flags);
     if !features.is_empty() {
         cmd.arg("--features").arg(features.join(","));
     }
     let status = cmd
-        // Cargo sets these for build-script subprocesses to point at the
-        // *outer* (stable) toolchain; left alone they'd override `+nightly-2026-05-20`
-        // on the inner cargo invocation. Same workaround as `aya-build`.
-        .env_remove("RUSTC")
-        .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .status()
-        .expect("failed to spawn `cargo +nightly-2026-05-20 build` for crates/ebpf");
+        .expect("failed to spawn selected Cargo for crates/ebpf");
     assert!(status.success(), "building crates/ebpf failed: {status}");
 
     let built = target_dir.join(target).join("release/p11scope-ebpf");

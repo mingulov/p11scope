@@ -16,6 +16,7 @@ COUNTERS = (
     "unmatched_returns",
     "rv_update_failures",
     "cgroup_scope_failures",
+    "abi_refusals",
     "semantic_capture_failures",
     "unregistered_mechanisms",
     "template_tail_failures",
@@ -33,6 +34,7 @@ COUNTERS = (
     "async_evictions",
     "fork_state_ambiguities",
     "semantic_state_drops",
+    "semantic_history_drops",
     "pending_at_end",
     "malformed_records",
     "orphan_ops",
@@ -57,10 +59,12 @@ COUNTERS = (
 )
 
 # v2-metrics is retained only for historical fixtures and compatibility reads;
-# it predates the task-uprobe link-loss evidence added to v3-metrics.
+# it predates the task-uprobe link-loss, ABI-refusal, and semantic-history-drop
+# evidence added to v3.
 HISTORICAL_METRICS_SCHEMA = "pkcs11-scope/observed-profile/v2-metrics"
 HISTORICAL_COUNTERS = tuple(
-    counter for counter in COUNTERS if counter != "task_uprobe_link_losses"
+    counter for counter in COUNTERS
+    if counter not in {"abi_refusals", "task_uprobe_link_losses", "semantic_history_drops"}
 )
 
 # `evidence.loader_discovery` (design §9.2): finite, aggregate, and closed.
@@ -160,22 +164,33 @@ VERSION_SURFACES = Counter(
     }
 )
 # SCANNED — the canary workload maps the provider *before* attach, so both
-# sources describe it. Only three of the provider's thirteen tables live in the
-# object's file-backed data; the other ten are built at run time in .bss. The
-# scan decoded a nonempty file-backed subset, so the runtime-only tables are not
-# object-level scan failures. The differing source sets are recorded by one
-# `discovery_conflict` and exact per-source table records.
+# sources describe it. LP64 scans three file-backed tables and reports one
+# conflict; ILP32 also scans the 3.1 and 3.2 tables and agrees with the manifest.
+# Tables built at run time in .bss are not object-level scan failures. Every
+# scanned table remains an exact per-source record.
 #
 # What the union does *not* change is the attach plan: 104 slots and 208 probes,
 # exactly as before, because a slot is one {object, file offset} however many
-# sources named it. `surfaces` keeps the per-source records, so the three scan
-# tables add three surfaces (13 -> 16). `table_entries` counts exact target
-# occurrences across sources, so this scan subset does not add another 228.
+# sources named it. `surfaces` keeps the per-source records, so the scan adds
+# three LP64 surfaces (13 -> 16) or five ILP32 surfaces (13 -> 18).
+# `table_entries` counts exact target occurrences across sources, so neither
+# scan subset changes the 988-entry union.
 VERSION_SURFACES_SCANNED = VERSION_SURFACES + Counter(
     {("full", 68): 2, ("full", 92): 1}
 )
+VERSION_SURFACES_SCANNED_IA32 = VERSION_SURFACES_SCANNED + Counter(
+    {("full", 92): 1, ("full", 104): 1}
+)
 VERSION_SHAPE_MANIFEST_ONLY = (988, 104, 208, VERSION_SURFACES, 1, "ok")
 VERSION_SHAPE_SCANNED = (988, 104, 208, VERSION_SURFACES_SCANNED, 1, "ok")
+VERSION_SHAPE_SCANNED_IA32 = (
+    988,
+    104,
+    208,
+    VERSION_SURFACES_SCANNED_IA32,
+    1,
+    "ok",
+)
 VERSION_TABLES_MANIFEST_ONLY = Counter(
     {
         ("manifest", (0, 0), 0): 1,
@@ -189,6 +204,9 @@ VERSION_TABLES_MANIFEST_ONLY = Counter(
 )
 VERSION_TABLES_SCANNED = VERSION_TABLES_MANIFEST_ONLY + Counter(
     {("scan", (2, 40), 68): 2, ("scan", (3, 0), 92): 1}
+)
+VERSION_TABLES_SCANNED_IA32 = VERSION_TABLES_SCANNED + Counter(
+    {("scan", (3, 1), 92): 1, ("scan", (3, 2), 104): 1}
 )
 DISCOVERY_SUBJECT = "discovery subject"
 DISCOVERY_UNAVAILABLE = "discovery unavailable"
@@ -817,6 +835,66 @@ def discovery_skips(evidence):
     for item in evidence["skipped"]:
         bounded_skip(item)
     return [item for item in evidence["skipped"] if item["name"] == DISCOVERY_SUBJECT]
+
+
+def exact_canary_discovery_skips(evidence, *, owned):
+    """Property-based discovery-skip contract for canary lanes.
+
+    Returns the validated skip count for exact_common to pin. Every
+    discovery skip must be the one categorical public item, and the count
+    must fit the lane's deterministic floor plus at most one retained
+    internal loss: owned lanes carry exactly the initial-set skip,
+    optionally plus one; safe lanes carry none, optionally plus one.
+
+    Why a bound and not an exact count: the P-2 maps bracket refuses an
+    acquisition whose mappings changed mid-read and records it, and the
+    engine deliberately retains that record even when a later scan succeeds
+    and attaches (scan_gap_this_capture_attached tombstones only not-mapped
+    and file-backed-data losses). The render layer then flattens the refusal
+    to the categorical item above — byte-identical to the spec-mandated
+    initial-set skip — so no exact count can name which is which. The canary
+    workload mmaps/munmaps while running, so the refusal fires
+    intermittently in any lane.
+
+    Why the bound is still strong: the initial-set skip is unconditional on
+    owned lanes (one initial-set context per owned run, armed or not, and
+    the empty timing catalog leaves it unproven by spec amendment), while
+    the initial-set path never runs for profile/trace lanes. Any additional
+    categorical item is a retained internal loss published through the same
+    finite category — most often a bracket refusal, but whole-outcome scan
+    losses and failed owned-prearm records flatten identically. That stays
+    safe here: whole-outcome losses clear the scanned modules and
+    Unavailable poisons scan_unavailable, so a lane carrying one cannot pass
+    the exact shape, tables, sources and corroboration this validator
+    demands (or the manifest-only sources that exclude scan data entirely).
+    What the bound accepts alongside fully proven claims is therefore honest
+    loss record — refused or unavailable data contributed nothing to the
+    lane's claims. Which module refused is not a capture-document property
+    by design (the public record must not name paths) and is proven by the
+    workspace suite instead: the scan.rs bracket fixtures assert the
+    refusing subject, and the engine.rs tests assert the refusal survives
+    pinning and retention. A third skip, or any non-categorical item, is a
+    new phenomenon and fails closed.
+    """
+    skips = discovery_skips(evidence)
+    for item in skips:
+        require(
+            item == CANARY_DISCOVERY_SKIP,
+            f"non-categorical canary discovery skip: {item}",
+        )
+    if owned:
+        require(
+            len(skips) in (1, 2),
+            "owned canary discovery skips: want the categorical initial-set "
+            f"skip plus at most one retained refusal, got {skips}",
+        )
+    else:
+        require(
+            len(skips) in (0, 1),
+            "safe canary discovery skips: want none or one retained refusal, "
+            f"got {skips}",
+        )
+    return len(skips)
 
 
 # The closed loader/pause namespace. PID/TID and task sets are permitted only
@@ -1510,14 +1588,14 @@ def validate_lane13_knative_metrics(document, expected):
     )
 
 
-def validate_canary(lane, document):
+def validate_canary(lane, document, target_bits=64):
     """A canary lane: the version-matrix provider, exact in shape and policy.
 
     The third element of each row is how discovery saw the provider. The canary
     workload maps it before attach, so both sources describe it (`scanned`).
     Since 1d3837b the initial provider export hooks attach before readiness, so
     a workload released only after attach is still observed live: its bootstrap
-    calls trigger the scan, which corroborates the manifest mid-capture. The
+    calls trigger the scan, which compares with the manifest mid-capture. The
     live freeze lane therefore measures the scanned row exactly, and
     verify-induced-gaps.sh validates its capture as `feature-unsafe-profile`.
     The `freeze-unsafe-profile` row keeps the manifest-only expectation — still
@@ -1534,43 +1612,68 @@ def validate_canary(lane, document):
         "feature-unsafe-profile": ("unsafe", "profile", "scanned"),
         "feature-unsafe-trace": ("unsafe", "trace", "scanned"),
         "aggregate-only-metrics": ("aggregate", "metrics", "scanned"),
+        "owned-default-metrics": ("aggregate", "metrics", "scanned"),
+        "owned-feature-metrics": ("aggregate", "metrics", "scanned"),
         "freeze-unsafe-profile": ("unsafe", "profile", "manifest-only"),
     }
     require(lane in lanes, f"unknown canary lane: {lane}")
+    require(target_bits in (32, 64), f"invalid canary target width: {target_bits!r}")
     policy, kind, discovery = lanes[lane]
+    owned_metrics = lane in {"owned-default-metrics", "owned-feature-metrics"}
     trace = kind == "trace"
     evidence = document if trace else document["evidence"]
     if kind == "metrics":
         require(document["schema"] == METRICS_SCHEMA, document["schema"])
-        exact_metrics_schema(document)
+        exact_metrics_schema(document, run=owned_metrics)
     else:
         exact_profile_v3_selection(document, terminal=trace)
 
     scanned = discovery == "scanned"
-    exact_shape(
-        evidence, *(VERSION_SHAPE_SCANNED if scanned else VERSION_SHAPE_MANIFEST_ONLY)
+    scanned_shape = VERSION_SHAPE_SCANNED_IA32 if target_bits == 32 else VERSION_SHAPE_SCANNED
+    exact_shape(evidence, *(scanned_shape if scanned else VERSION_SHAPE_MANIFEST_ONLY))
+    scanned_tables = (
+        VERSION_TABLES_SCANNED_IA32 if target_bits == 32 else VERSION_TABLES_SCANNED
     )
-    wanted_tables = VERSION_TABLES_SCANNED if scanned else VERSION_TABLES_MANIFEST_ONLY
+    wanted_tables = scanned_tables if scanned else VERSION_TABLES_MANIFEST_ONLY
     require(
         table_signature(evidence) == wanted_tables,
         f"unexpected discovery tables: {evidence['discovery']}",
     )
+    # The discovery-skip bound lives in exact_canary_discovery_skips: the
+    # deterministic floor (one initial-set skip on owned lanes, none
+    # elsewhere) plus at most one retained internal loss. exact_common pins
+    # the validated count against the document.
+    skips = exact_canary_discovery_skips(evidence, owned=owned_metrics)
     exact_common(
         evidence,
         aliases=[],
         skipped=[],
         in_flight=0,
+        discovery_skipped=skips,
+        run=owned_metrics,
     )
     allowances = dict(
         SAFE_ALLOWANCES if policy == "safe" else UNSAFE_ALLOWANCES if policy == "unsafe" else {}
     )
-    allowances["discovery_conflicts" if scanned else "discovery_uncorroborated"] = 1
+    if scanned and target_bits == 64:
+        allowances["discovery_conflicts"] = 1
+    elif not scanned:
+        allowances["discovery_uncorroborated"] = 1
     exact_counters(evidence, allowances)
     sources = [module["sources"] for module in evidence["discovery"]]
     require(
         sources == ([["scan", "manifest"]] if scanned else [["manifest"]]),
         f"unexpected discovery sources: {sources}",
     )
+    outcomes = [module["corroboration"] for module in evidence["discovery"]]
+    wanted_outcomes = (
+        [["agreed"]]
+        if scanned and target_bits == 32
+        else [["conflict"]]
+        if scanned
+        else [["uncorroborated"]]
+    )
+    require(outcomes == wanted_outcomes, f"unexpected corroboration: {outcomes}")
 
     privacy = {
         "safe": "allowlisted",
@@ -1590,7 +1693,18 @@ def validate_canary(lane, document):
         exact_capture_modules(document)
     if policy == "aggregate":
         calls = sum(item["calls"] for item in document["functions"])
-        require(calls == 28, f"aggregate calls: want 28, got {calls}")
+        wanted_calls = 30 if owned_metrics else 28
+        require(calls == wanted_calls,
+                f"aggregate calls: want {wanted_calls}, got {calls}")
+        if owned_metrics:
+            require(evidence["child_still_running"] is False,
+                    f"owned child still running: {evidence['child_still_running']!r}")
+            require(
+                (evidence["pause"], evidence["pause_attempts"],
+                 evidence["pause_confirmed"], evidence["pause_partial"])
+                == ("none", 0, 0, 0),
+                "owned metrics requires exact never-pause evidence",
+            )
 
 
 # Every induced-gap lane holds its workload behind a go-file, so nothing has
@@ -1758,6 +1872,14 @@ DISCOVERY_SKIP = {
     "name": DISCOVERY_SUBJECT,
     "reason": TABLE_UNAVAILABLE,
 }
+# The one categorical discovery-skip item a canary lane may publish. The
+# render layer flattens every internal object loss to a finite public reason,
+# so a retained P-2 bracket refusal publishes byte-identical to the
+# spec-mandated initial-set skip.
+CANARY_DISCOVERY_SKIP = {
+    "name": DISCOVERY_SUBJECT,
+    "reason": DISCOVERY_UNAVAILABLE,
+}
 
 
 def loader_discovery_fixture(**overrides):
@@ -1836,6 +1958,8 @@ def document_fixture(evidence, *, schema=PROFILE_SCHEMA, mode="profile", privacy
             evidence.pop(field, None)
         if schema == HISTORICAL_METRICS_SCHEMA:
             evidence.pop("task_uprobe_link_losses", None)
+            evidence.pop("abi_refusals", None)
+            evidence.pop("semantic_history_drops", None)
     return {
         "schema": schema,
         "capture": {
@@ -2316,6 +2440,51 @@ def self_test():
     safe = document_fixture(copy.deepcopy(version))
     safe["evidence"].update(SAFE_ALLOWANCES)
     validate_canary("default-safe-profile", safe)
+
+    safe32 = copy.deepcopy(safe)
+    safe32["evidence"]["surfaces"].extend(
+        [
+            {
+                "walk": "full",
+                "functions": functions,
+                "acquisition": "ok",
+                "source": f"/opt/p11.so table {major}.{minor}",
+            }
+            for major, minor, functions in ((3, 1, 92), (3, 2, 104))
+        ]
+    )
+    safe32["evidence"]["discovery"][0]["tables"].extend(
+        [
+            {"source": "scan", "version": [3, 1], "entries": 92},
+            {"source": "scan", "version": [3, 2], "entries": 104},
+        ]
+    )
+    safe32["evidence"]["discovery"][0].update(
+        corroborated=True,
+        corroboration=["agreed"],
+    )
+    safe32["evidence"]["discovery_conflicts"] = 0
+    validate_canary("default-safe-profile", safe32, 32)
+    rejected(lambda: validate_canary("default-safe-profile", safe32, 64))
+    rejected(lambda: validate_canary("default-safe-profile", safe, 32))
+    for label, mutate in (
+        ("missing ia32 scan table", lambda d: d["evidence"]["discovery"][0]["tables"].pop()),
+        (
+            "extra ia32 scan table",
+            lambda d: d["evidence"]["discovery"][0]["tables"].append(
+                {"source": "scan", "version": [3, 9], "entries": 104}
+            ),
+        ),
+        (
+            "relabeled ia32 scan table",
+            lambda d: d["evidence"]["discovery"][0]["tables"][-1].update(source="manifest"),
+        ),
+    ):
+        bad = copy.deepcopy(safe32)
+        mutate(bad)
+        rejected(lambda bad=bad: validate_canary("default-safe-profile", bad, 32))
+    print("canary ABI-specific scan shapes and cross-width refusals: OK")
+
     for mutate in (
         lambda d: d["evidence"].pop("interface_selection"),
         lambda d: d["evidence"].update(attach_mechanisms=["secret-canary"]),
@@ -2722,6 +2891,72 @@ def self_test():
     rejected(lambda: validate_canary("aggregate-only-metrics", bad))
     print("canary aggregate exact baseline: OK")
 
+    owned_aggregate = copy.deepcopy(aggregate)
+    owned_aggregate["functions"] = function_items([(["C_GetInterfaceList"], 30)])
+    owned_aggregate["evidence"]["child_still_running"] = False
+    # The one skip an owned lane must publish: `p11scope run` attempts
+    # initial-set discovery and the empty timing catalog leaves it unproven.
+    owned_aggregate["evidence"]["skipped"] = [
+        {"name": DISCOVERY_SUBJECT, "reason": DISCOVERY_UNAVAILABLE}
+    ]
+    for lane in ("owned-default-metrics", "owned-feature-metrics"):
+        validate_canary(lane, owned_aggregate)
+        for calls in (28, 29, 31):
+            bad = copy.deepcopy(owned_aggregate)
+            bad["functions"][0]["calls"] = calls
+            rejected(lambda bad=bad, lane=lane: validate_canary(lane, bad))
+        for mutate in (
+            lambda d: d["evidence"].pop("child_still_running"),
+            lambda d: d["evidence"].update(child_still_running=True),
+            lambda d: d["evidence"].update(
+                pause="sigstop", pause_attempts=1, pause_confirmed=1),
+            # The owned skip floor is exact, not merely permitted: an owned
+            # lane that published none is not a cleaner run, it is a run
+            # whose initial-set attempt went unreported. (The ceiling —
+            # floor plus at most one retained refusal — is covered below.)
+            lambda d: d["evidence"].update(skipped=[]),
+            lambda d: d["evidence"].update(skipped=[
+                {"name": DISCOVERY_SUBJECT, "reason": TABLE_UNAVAILABLE}]),
+        ):
+            bad = copy.deepcopy(owned_aggregate)
+            mutate(bad)
+            rejected(lambda bad=bad, lane=lane: validate_canary(lane, bad))
+    external_owned = copy.deepcopy(aggregate)
+    external_owned["evidence"]["child_still_running"] = False
+    rejected(lambda: validate_canary("aggregate-only-metrics", external_owned))
+    print("canary owned aggregate exact30 run contract: OK")
+
+    # A retained P-2 bracket refusal publishes byte-identical to the
+    # initial-set skip: an owned lane may carry two categorical skips and a
+    # safe lane one. Anything else — a third skip on owned, a second on
+    # safe, or any non-categorical item — still fails.
+    two_skips = copy.deepcopy(owned_aggregate)
+    two_skips["evidence"]["skipped"] = [
+        dict(CANARY_DISCOVERY_SKIP) for _ in range(2)
+    ]
+    for lane in ("owned-default-metrics", "owned-feature-metrics"):
+        validate_canary(lane, two_skips)
+    safe_refusal = copy.deepcopy(safe)
+    safe_refusal["evidence"]["skipped"] = [dict(CANARY_DISCOVERY_SKIP)]
+    validate_canary("default-safe-profile", safe_refusal)
+    for lane, doc, extras in (
+        ("owned-default-metrics", owned_aggregate, 3),
+        ("default-safe-profile", safe, 2),
+    ):
+        for mutate in (
+            lambda d, n=extras: d["evidence"].update(skipped=[
+                dict(CANARY_DISCOVERY_SKIP) for _ in range(n)]),
+            lambda d: d["evidence"].update(skipped=[
+                dict(CANARY_DISCOVERY_SKIP), dict(DISCOVERY_SKIP)]),
+        ):
+            bad = copy.deepcopy(doc)
+            mutate(bad)
+            rejected(lambda bad=bad, lane=lane: validate_canary(lane, bad))
+    bad = copy.deepcopy(safe)
+    bad["evidence"]["skipped"] = [dict(DISCOVERY_SKIP)]
+    rejected(lambda: validate_canary("default-safe-profile", bad))
+    print("canary retained-refusal skip shapes: OK")
+
     induced = {}
     g1 = evidence_fixture(G1_SURFACES, sources=("scan", "manifest"))
     g1.update(
@@ -2816,7 +3051,9 @@ def self_test():
         ("in_flight_at_end", 1),
         ("aliased", ["C_Sign"]),
         ("semantic_state_drops", 1),
+        ("semantic_history_drops", 1),
         ("rv_update_failures", 1),
+        ("abi_refusals", 1),
     ):
         bad = copy.deepcopy(clean["evidence"])
         bad[field] = value
@@ -3257,9 +3494,10 @@ def main(argv):
             multiplier,
             discovery=discovery,
         )
-    elif argv[0] == "canary" and len(argv) == 3:
+    elif argv[0] == "canary" and len(argv) in (3, 4):
         trace = argv[1].endswith("-trace")
-        validate_canary(argv[1], load_canary(argv[2], trace))
+        target_bits = 64 if len(argv) == 3 else int(argv[3])
+        validate_canary(argv[1], load_canary(argv[2], trace), target_bits)
     elif argv[0] == "induced" and len(argv) == 3:
         validate_induced(argv[1], load_json(argv[2]))
     else:
@@ -3269,7 +3507,7 @@ def main(argv):
             "shared-layer-metrics OUTPUT EXPECTED [MULTIPLIER] | "
             "lane13-knative-metrics OUTPUT EXPECTED | "
             "lane02-owned-run-metrics OUTPUT EXPECTED POLICY | "
-            "canary LANE OUTPUT | induced G[1-5] OUTPUT | --self-test"
+            "canary LANE OUTPUT [32|64] | induced G[1-5] OUTPUT | --self-test"
         )
 
 

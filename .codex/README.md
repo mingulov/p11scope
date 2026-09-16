@@ -11,7 +11,8 @@ not select the custom reviewer role's model.
 Start a **new session** in this checkout to load the renamed roles and policy:
 
 ```sh
-codex --strict-config -C /home/user/src/m/pkcs11-scope
+repo_root=$(git rev-parse --show-toplevel)
+codex --strict-config -C "$repo_root"
 ```
 
 Existing conversations retain their already-loaded instructions and tool
@@ -42,7 +43,8 @@ establish that Astra Medium/High is better than the earlier routing.
 For a lower-resource session while retaining the new flexible roles:
 
 ```sh
-codex --strict-config -C /home/user/src/m/pkcs11-scope \
+repo_root=$(git rev-parse --show-toplevel)
+codex --strict-config -C "$repo_root" \
   -m gpt-5.6-sol -c 'model_reasoning_effort="medium"' \
   -c 'agents.max_concurrent_threads_per_session=2' \
   'Use Sol and Luna only for this session, with at most two concurrent children. Choose effort per task; do not escalate to Astra.'

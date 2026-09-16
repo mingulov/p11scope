@@ -2,6 +2,7 @@
 
 use crate::identity::MappingFileKey;
 use std::collections::BTreeSet;
+use std::fmt;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -179,6 +180,35 @@ pub enum Resolved {
     Unmapped,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidMapSnapshot {
+    InvalidRange { index: usize },
+    UnsortedOrOverlapping { left: usize, right: usize },
+    FileOffsetOverflow { index: usize },
+}
+
+impl fmt::Display for InvalidMapSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRange { index } => {
+                write!(formatter, "mapping {index} has an empty or inverted range")
+            }
+            Self::UnsortedOrOverlapping { left, right } => write!(
+                formatter,
+                "mappings {left} and {right} are unsorted or overlapping"
+            ),
+            Self::FileOffsetOverflow { index } => {
+                write!(
+                    formatter,
+                    "mapping {index} file offset is not representable"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for InvalidMapSnapshot {}
+
 /// Address lookup over one kernel-ordered `/proc/<pid>/maps` snapshot.
 /// Intervals are half-open and must be sorted and non-overlapping.
 #[derive(Debug, Clone, Copy)]
@@ -187,13 +217,32 @@ pub struct MapIndex<'a> {
 }
 
 impl<'a> MapIndex<'a> {
-    pub fn new(entries: &'a [MapEntry]) -> Option<Self> {
-        if entries.iter().any(|entry| entry.start >= entry.end)
-            || entries.windows(2).any(|pair| pair[0].end > pair[1].start)
-        {
-            return None;
+    pub fn new(entries: &'a [MapEntry]) -> Result<Self, InvalidMapSnapshot> {
+        for (index, entry) in entries.iter().enumerate() {
+            if entry.start >= entry.end {
+                return Err(InvalidMapSnapshot::InvalidRange { index });
+            }
+            if entry
+                .raw_path
+                .as_deref()
+                .is_some_and(|raw_path| raw_path.starts_with(b"/"))
+                && entry
+                    .file_offset
+                    .checked_add(entry.end - entry.start - 1)
+                    .is_none()
+            {
+                return Err(InvalidMapSnapshot::FileOffsetOverflow { index });
+            }
         }
-        Some(Self { entries })
+        for (left, pair) in entries.windows(2).enumerate() {
+            if pair[0].end > pair[1].start {
+                return Err(InvalidMapSnapshot::UnsortedOrOverlapping {
+                    left,
+                    right: left + 1,
+                });
+            }
+        }
+        Ok(Self { entries })
     }
 
     /// The validated snapshot behind this index. Live consumers iterate it
@@ -241,9 +290,10 @@ fn resolved_for(entry: Option<&MapEntry>, vaddr: u64) -> Resolved {
         None => Resolved::Unmapped,
         Some(m) => match &m.raw_path {
             Some(raw_path) if raw_path.starts_with(b"/") => {
-                let Some(file_offset) = m.file_offset.checked_add(vaddr - m.start) else {
-                    return Resolved::Unmapped;
-                };
+                let file_offset = m
+                    .file_offset
+                    .checked_add(vaddr - m.start)
+                    .expect("MapIndex validated the absolute-file offset range");
                 Resolved::File {
                     path: mapped_path(raw_path),
                     raw_path: raw_path.clone(),
@@ -258,8 +308,8 @@ fn resolved_for(entry: Option<&MapEntry>, vaddr: u64) -> Resolved {
     }
 }
 
-pub fn resolve(maps: &[MapEntry], vaddr: u64) -> Resolved {
-    MapIndex::new(maps).map_or(Resolved::Unmapped, |index| index.resolve(vaddr))
+pub fn resolve(maps: &[MapEntry], vaddr: u64) -> Result<Resolved, InvalidMapSnapshot> {
+    Ok(MapIndex::new(maps)?.resolve(vaddr))
 }
 
 #[cfg(test)]
@@ -307,35 +357,35 @@ mod tests {
         let m = sorted_fixture();
         assert_eq!(
             resolve(&m, 0x7f2b40000abc),
-            Resolved::File {
+            Ok(Resolved::File {
                 path: MappedPath::Usable(PathBuf::from("/opt/with space/lib.so")),
                 raw_path: b"/opt/with space/lib.so".to_vec(),
                 file_offset: 0x21abc,
                 device: Device { major: 8, minor: 1 },
                 inode: 999,
                 permissions: *b"r-xp",
-            }
+            })
         );
         assert_eq!(
             resolve(&m, 0x400010),
-            Resolved::File {
+            Ok(Resolved::File {
                 path: MappedPath::Usable(PathBuf::from("/usr/bin/dbus-daemon")),
                 raw_path: b"/usr/bin/dbus-daemon".to_vec(),
                 file_offset: 0x10,
                 device: Device { major: 8, minor: 2 },
                 inode: 173521,
                 permissions: *b"r-xp",
-            }
+            })
         );
     }
 
     #[test]
     fn classifies_anonymous_and_unmapped() {
         let m = sorted_fixture();
-        assert_eq!(resolve(&m, 0x7f8a1c000500), Resolved::Anonymous);
-        assert_eq!(resolve(&m, 0x7ffc55555100), Resolved::Anonymous); // [stack]
-        assert_eq!(resolve(&m, 0x1), Resolved::Unmapped);
-        assert_eq!(resolve(&m, 0x00452000), Resolved::Unmapped); // end is exclusive
+        assert_eq!(resolve(&m, 0x7f8a1c000500), Ok(Resolved::Anonymous));
+        assert_eq!(resolve(&m, 0x7ffc55555100), Ok(Resolved::Anonymous)); // [stack]
+        assert_eq!(resolve(&m, 0x1), Ok(Resolved::Unmapped));
+        assert_eq!(resolve(&m, 0x00452000), Ok(Resolved::Unmapped)); // end is exclusive
     }
 
     #[test]
@@ -351,10 +401,10 @@ mod tests {
             (0x2000, "ambiguous \\012"),
             (0x3000, "deleted"),
         ] {
-            let Resolved::File {
+            let Ok(Resolved::File {
                 path: MappedPath::Unusable { reason },
                 ..
-            } = resolve(&maps, addr)
+            }) = resolve(&maps, addr)
             else {
                 panic!("address {addr:#x} was not preserved as unusable file evidence");
             };
@@ -378,7 +428,10 @@ mod tests {
     fn map_index_requires_sorted_non_overlapping_intervals() {
         let mut maps = sorted_fixture();
         maps.swap(0, 1);
-        assert!(MapIndex::new(&maps).is_none());
+        assert!(matches!(
+            MapIndex::new(&maps),
+            Err(InvalidMapSnapshot::UnsortedOrOverlapping { left: 0, right: 1 })
+        ));
 
         let overlapping = vec![
             MapEntry {
@@ -392,7 +445,133 @@ mod tests {
                 ..maps[0].clone()
             },
         ];
-        assert!(MapIndex::new(&overlapping).is_none());
+        assert!(matches!(
+            MapIndex::new(&overlapping),
+            Err(InvalidMapSnapshot::UnsortedOrOverlapping { left: 0, right: 1 })
+        ));
+
+        let descending_disjoint = vec![
+            MapEntry {
+                start: 0x3000,
+                end: 0x4000,
+                ..maps[0].clone()
+            },
+            MapEntry {
+                start: 0x1000,
+                end: 0x2000,
+                ..maps[0].clone()
+            },
+        ];
+        assert!(matches!(
+            MapIndex::new(&descending_disjoint),
+            Err(InvalidMapSnapshot::UnsortedOrOverlapping { .. })
+        ));
+
+        let equal_starts = vec![
+            MapEntry {
+                start: 0x1000,
+                end: 0x2000,
+                ..maps[0].clone()
+            },
+            MapEntry {
+                start: 0x1000,
+                end: 0x3000,
+                ..maps[0].clone()
+            },
+        ];
+        assert!(matches!(
+            MapIndex::new(&equal_starts),
+            Err(InvalidMapSnapshot::UnsortedOrOverlapping { .. })
+        ));
+
+        for (start, end) in [(0x1000, 0x1000), (0x2000, 0x1000)] {
+            let invalid_range = vec![MapEntry {
+                start,
+                end,
+                ..maps[0].clone()
+            }];
+            assert!(matches!(
+                MapIndex::new(&invalid_range),
+                Err(InvalidMapSnapshot::InvalidRange { index: 0 })
+            ));
+        }
+    }
+
+    #[test]
+    fn invalid_snapshot_is_distinguishable_from_valid_absence() {
+        let file = MapEntry {
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            permissions: *b"r-xp",
+            device: Device { major: 8, minor: 1 },
+            inode: 7,
+            raw_path: Some(b"/opt/provider.so".to_vec()),
+        };
+        let anonymous = MapEntry {
+            start: 0x3000,
+            end: 0x4000,
+            file_offset: 0,
+            permissions: *b"rw-p",
+            device: Device { major: 0, minor: 0 },
+            inode: 0,
+            raw_path: None,
+        };
+        let valid = vec![file.clone(), anonymous.clone()];
+        let invalid = vec![
+            file,
+            anonymous,
+            MapEntry {
+                start: 0x3800,
+                end: 0x4800,
+                file_offset: 0,
+                permissions: *b"rw-p",
+                device: Device { major: 0, minor: 0 },
+                inode: 0,
+                raw_path: None,
+            },
+        ];
+
+        assert!(matches!(
+            resolve(&invalid, 0x1000),
+            Err(InvalidMapSnapshot::UnsortedOrOverlapping { .. })
+        ));
+        assert!(matches!(
+            resolve(&invalid, 0x9000),
+            Err(InvalidMapSnapshot::UnsortedOrOverlapping { .. })
+        ));
+        assert!(matches!(resolve(&valid, 0x1000), Ok(Resolved::File { .. })));
+        assert_eq!(resolve(&valid, 0x9000), Ok(Resolved::Unmapped));
+    }
+
+    #[test]
+    fn map_index_rejects_file_offset_overflow() {
+        let overflowing = vec![MapEntry {
+            start: 0x1000,
+            end: 0x1002,
+            file_offset: u64::MAX,
+            permissions: *b"r-xp",
+            device: Device { major: 8, minor: 1 },
+            inode: 7,
+            raw_path: Some(b"/opt/provider.so".to_vec()),
+        }];
+        assert!(matches!(
+            MapIndex::new(&overflowing),
+            Err(InvalidMapSnapshot::FileOffsetOverflow { index: 0 })
+        ));
+
+        let representable = vec![MapEntry {
+            file_offset: u64::MAX - 1,
+            ..overflowing[0].clone()
+        }];
+        let index = MapIndex::new(&representable).unwrap();
+        assert!(matches!(
+            index.resolve(0x1001),
+            Resolved::File {
+                file_offset: u64::MAX,
+                ..
+            }
+        ));
     }
 
     #[test]

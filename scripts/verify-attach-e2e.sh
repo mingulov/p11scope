@@ -106,6 +106,9 @@ if [ "${1-}" = "--self-test" ]; then
     exit 0
 fi
 
+P11SCOPE_PRODUCT_BUILD_MODE=${P11SCOPE_PRODUCT_BUILD_MODE:-ordinary}
+. scripts/product-build.sh
+
 MODULE=${P11SCOPE_PKCS11_MODULE:-/usr/lib/softhsm/libsofthsm2.so}
 WORK=${P11SCOPE_TASK4_WORK-target/e2e}
 if [ "${P11SCOPE_TASK4_WORK+set}" = set ]; then
@@ -141,7 +144,8 @@ test -f "$MODULE" || { echo "SoftHSM2 not installed at $MODULE"; exit 1; }
 
 echo "=== build ==="
 rm -rf "$WORK/build"
-cargo +1.88 build --locked --release --workspace --target-dir "$WORK/build"
+p11scope_product_build "$P11SCOPE_PRODUCT_BUILD_MODE" \
+    --release --workspace --target-dir "$WORK/build"
 gcc -O0 -o "$WORK/harness" spike/harness.c -ldl
 
 echo "=== softhsm token ==="

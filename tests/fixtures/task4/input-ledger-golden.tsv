@@ -1,0 +1,7 @@
+input-v1	0	dynamic	read	present	0644	4	0eb9e3089dc8479fdc76d897a20c1555c51505d9f13cc97a868af3ef5988dc87	external:/opt/rust/lib/libstd-abc.so
+input-v1	1	symlink	probe	present	0777	13	730e2269528728efaabfdf0c18dd9a8326657e93b7a6e6af6bada4f5ffa8c405	external:/opt/rust/lib/libstd.so
+input-v1	2	directory	enumerate	present	0755	41	d08775a2943728a4c3148c1a8262ae8ccb22c59789ef3f1efb1bc52e9fae8027	repo:/
+input-v1	3	repo	read	present	0644	5	d8c9f2728aa278ebcd33ccedf3ad309a866870ad5fb93a03526b4b7655c9e911	repo:/Cargo.lock
+input-v1	4	repo	read	present	0644	10	8a3cd5a81b3f9a621aa493d90c45f42ab571d4e42b8ae5aff351cb0a02d06d82	repo:/Cargo.toml
+input-v1	5	absent	probe	ENOENT	-	-	-	repo:/missing.cfg
+input-v1	6	vendor	read	present	0644	14	16c2fca9e371936458d01576b4ca311c22d166a45539ccbc9104823d0b10db47	vendor:/serde/src/lib.rs

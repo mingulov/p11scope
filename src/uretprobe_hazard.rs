@@ -223,7 +223,11 @@ fn probe_kernel_inner() -> Result<KernelVerdict> {
 
 #[cfg(target_arch = "x86_64")]
 fn probe_kernel_inner() -> Result<KernelVerdict> {
-    let mut ebpf = Ebpf::load(crate::EBPF_OBJECT).context("loading the BPF object")?;
+    // The production object uses task storage without an Aya typed wrapper.
+    let mut ebpf = aya::EbpfLoader::new()
+        .allow_unsupported_maps()
+        .load(crate::EBPF_OBJECT)
+        .context("loading the BPF object")?;
     {
         let program: &mut UProbe = ebpf
             .program_mut("p11_return")

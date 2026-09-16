@@ -23,6 +23,10 @@ fn main() {
 
 fn run() -> Result<i32> {
     match cli::parse(std::env::args().skip(1)) {
+        Ok(Command::Version) => {
+            println!("p11scope {}", env!("CARGO_PKG_VERSION"));
+            Ok(0)
+        }
         // `kind` travels inside the arguments, so both capture subcommands share
         // one arm as well as one parser.
         Ok(Command::Profile(a) | Command::Trace(a)) => capture(&a).map(|()| 0),

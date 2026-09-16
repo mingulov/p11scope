@@ -10,17 +10,18 @@ use crate::discovery::hooks::{HookAbi, HookRegistry};
 use crate::discovery::identity::{
     ManifestStaleReason, PinnedObjectId, PinnedObjects, PinnedTimingKey, ReconciledModule,
     StaleManifestObject, bind_scanned_modules, canonicalize_scanned_overlays, open_view_object,
-    pin_manifest_objects_deferred_in_views, pin_scanned_view_objects, retained_object_key,
-    target_paths_equal, view_object_key,
+    pin_manifest_objects_deferred_in_views_with_budget, pin_scanned_view_objects,
+    retained_object_key, target_paths_equal, view_object_key,
 };
 use crate::discovery::loader::{LoaderContextId, LoaderContextSpec, LoaderRegistry};
 use crate::discovery::scan::{
     CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedEntry, ScannedInterface, ScannedModule,
     ScannedTable, Skipped, decode_exact_table, exact_table_addresses, exact_table_bytes,
-    index_maps_or_refuse, read_maps_or_refuse, scan_process_view, spans_for,
+    index_maps_or_refuse, read_elf_snapshot, read_maps_or_refuse, scan_process_view,
+    scan_process_view_without_memory, spans_for, target_layout,
 };
 use crate::manifest_input::{read_manifest, selection_surface_usable, validate_structure};
-use crate::process::{self, ProcessView, ProcessViewId};
+use crate::process::{self, OriginalGenerationState, ProcessView, ProcessViewId};
 use crate::run::OwnedChild;
 use crate::{plan, render};
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -34,12 +35,13 @@ use p11scope_ebpf_common::{
     DISCOVERY_VERSION_V3_1, DISCOVERY_VERSION_V3_2, DiscoveryRecord, export_attach_cookie,
     valid_discovery_record,
 };
-use p11scope_manifest::elf::ElfSnapshot;
+use p11scope_manifest::elf::{ElfAbi, ElfSnapshot};
 use p11scope_manifest::manifest::{
     Acquisition, Manifest, Resolution, SCHEMA, SelectionAcquisition, SelectionAuthority,
     SelectionNameClass, SelectionRequest, SelectionVersionClass, SurfaceSource, WalkOutcome,
 };
 use p11scope_manifest::maps::{Device, MapEntry, MapIndex, MappedPath, ObjectKey, Resolved};
+use pkcs11_module::LinuxLayout;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::num::NonZeroU64;
@@ -104,8 +106,11 @@ pub struct Engine {
     /// All identity stays out: only the classification is kept, and it is all
     /// that can be rendered.
     loader_contexts: BTreeMap<(ProcessViewId, LoaderAggregateKey, bool), LoaderContextClass>,
+    pending_loader_scans: BTreeMap<PendingLoaderScanKey, u64>,
     selection_claims: BTreeMap<SelectionClaimKey, SelectionClaim>,
     selection_tables: BTreeMap<SelectionTableKey, SelectionTableFact>,
+    #[cfg(test)]
+    loader_memory_scan_attempts: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +150,30 @@ impl PartialOrd for LoaderAggregateKey {
 struct LoaderContextClass {
     bound: bool,
     initial_set: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingLoaderScanKey {
+    view: ProcessViewId,
+    context: LoaderContextId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoaderScanMode {
+    Memory,
+    MetadataOnly,
+}
+
+impl Ord for PendingLoaderScanKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.view, self.context.get()).cmp(&(other.view, other.context.get()))
+    }
+}
+
+impl PartialOrd for PendingLoaderScanKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -689,11 +718,11 @@ fn selection_mapping_bracket(
     mut pin_same: impl FnMut() -> bool,
 ) -> Result<(Option<MapEntry>, Resolved), ()> {
     let maps_a = read_maps()?;
-    let index_a = MapIndex::new(&maps_a).ok_or(())?;
+    let index_a = MapIndex::new(&maps_a).map_err(|_| ())?;
     let mapping_a = index_a.containing(table_ptr).cloned();
     let resolved_a = index_a.resolve(table_ptr);
     let maps_b = read_maps()?;
-    let index_b = MapIndex::new(&maps_b).ok_or(())?;
+    let index_b = MapIndex::new(&maps_b).map_err(|_| ())?;
     let mapping_same = stable_selection_mapping(mapping_a.as_ref(), index_b.containing(table_ptr));
     let view_same = view_same();
     let pin_same = pin_same();
@@ -1889,6 +1918,7 @@ struct ScanInput {
 type InventoryScan = (ProcessViewId, Vec<ScannedModule>, PinnedObjects);
 type InventoryScanOutcome = (Vec<InventoryScan>, BTreeSet<u32>, Vec<Skipped>);
 type PendingViewRetirements = BTreeMap<ProcessViewId, RetirementCause>;
+type TerminalSelectionHandoffs = BTreeMap<u16, Vec<DiscoveryRecord>>;
 type DiscoveryCollector<'a> =
     dyn FnMut(&mut dyn EngineSession) -> Result<(Vec<DiscoveryRecord>, u64)> + 'a;
 type SlotCompletion = (u32, Option<u64>);
@@ -1908,6 +1938,7 @@ pub(crate) trait EngineSession {
         &mut self,
         view: &ProcessView,
         address: u64,
+        layout: LinuxLayout,
         budget: &mut CaptureWorkBudget,
     ) -> std::result::Result<(MapEntry, ScannedTable), ()>;
     fn detach_failures(&self) -> &[String];
@@ -1981,9 +2012,10 @@ impl EngineSession for Session {
         &mut self,
         view: &ProcessView,
         address: u64,
+        layout: LinuxLayout,
         budget: &mut CaptureWorkBudget,
     ) -> std::result::Result<(MapEntry, ScannedTable), ()> {
-        Engine::read_selection_table(view, address, budget)
+        Engine::read_selection_table(view, address, layout, budget)
     }
 
     fn detach_failures(&self) -> &[String] {
@@ -2293,6 +2325,10 @@ enum DiscoveryRecordOutcome {
         required_complete: bool,
     },
     Rejected(RecordRejection),
+    TerminalSelectionHandoff {
+        view: ProcessViewId,
+        owner: LoaderContextId,
+    },
 }
 
 impl DiscoveryRecordOutcome {
@@ -2306,7 +2342,7 @@ impl DiscoveryRecordOutcome {
     fn changed(self) -> bool {
         match self {
             Self::Applied { changed, .. } => changed,
-            Self::Rejected(_) => false,
+            Self::Rejected(_) | Self::TerminalSelectionHandoff { .. } => false,
         }
     }
 
@@ -2316,7 +2352,7 @@ impl DiscoveryRecordOutcome {
             Self::Applied {
                 required_complete: true,
                 ..
-            }
+            } | Self::TerminalSelectionHandoff { .. }
         )
     }
 }
@@ -3255,7 +3291,39 @@ fn scan_and_pin(
     budget: &mut CaptureWorkBudget,
     counters: &mut DiscoveryCounters,
 ) -> Result<(Vec<ScannedModule>, PinnedObjects)> {
-    let outcome = scan_process_view(
+    scan_and_pin_with(view, hints, hooks, budget, counters, scan_process_view)
+}
+
+fn scan_and_pin_without_memory(
+    view: &ProcessView,
+    hints: &[PathBuf],
+    hooks: &HookRegistry,
+    budget: &mut CaptureWorkBudget,
+    counters: &mut DiscoveryCounters,
+) -> Result<(Vec<ScannedModule>, PinnedObjects)> {
+    scan_and_pin_with(
+        view,
+        hints,
+        hooks,
+        budget,
+        counters,
+        scan_process_view_without_memory,
+    )
+}
+
+fn scan_and_pin_with(
+    view: &ProcessView,
+    hints: &[PathBuf],
+    hooks: &HookRegistry,
+    budget: &mut CaptureWorkBudget,
+    counters: &mut DiscoveryCounters,
+    scan: impl FnOnce(
+        &ScanRequest<'_>,
+        &ProcessView,
+        &mut CaptureWorkBudget,
+    ) -> std::result::Result<ScanOutcome, String>,
+) -> Result<(Vec<ScannedModule>, PinnedObjects)> {
+    let outcome = scan(
         &ScanRequest {
             pid: view.pid(),
             hints,
@@ -3266,12 +3334,8 @@ fn scan_and_pin(
     )
     .map_err(|error| anyhow!("scanning process view {:?}: {error}", view.id()))?;
     counters.scan_unavailable = counters.scan_unavailable.or(outcome.unavailable_reason());
-    let (pinned, pin_skips) = pin_scanned_view_objects(view, outcome.modules(), budget)
-        .map_err(|error| anyhow!("pinning process view {:?}: {error}", view.id()))?;
-    // Printed *and* kept: an object discovery could not read is a provider that
-    // may never have been observed, and a report that only prints it leaves the
-    // document claiming a clean capture.
-    for skipped in outcome.skipped().iter().chain(&pin_skips) {
+    // Retain acquisition losses before pinning can fail on an exited generation.
+    for skipped in outcome.skipped() {
         eprintln!(
             "{}",
             format_discovery_skip(&skipped.subject, &skipped.reason)
@@ -3279,14 +3343,21 @@ fn scan_and_pin(
         attribution::note(skipped);
         counters.object_skips.push(skipped.clone());
     }
+    if let ScanOutcome::Scanned { scan_ms, .. } = &outcome {
+        counters.scan_ms = counters.scan_ms.saturating_add(*scan_ms);
+    }
+    let (pinned, pin_skips) = pin_scanned_view_objects(view, outcome.modules(), budget)
+        .map_err(|error| anyhow!("pinning process view {:?}: {error}", view.id()))?;
+    for skipped in pin_skips {
+        eprintln!(
+            "{}",
+            format_discovery_skip(&skipped.subject, &skipped.reason)
+        );
+        attribution::note(&skipped);
+        counters.object_skips.push(skipped);
+    }
     let modules = match outcome {
-        ScanOutcome::Scanned {
-            modules, scan_ms, ..
-        } => {
-            counters.scan_ms = counters.scan_ms.saturating_add(scan_ms);
-            modules
-        }
-        ScanOutcome::Unavailable { modules, .. } => modules,
+        ScanOutcome::Scanned { modules, .. } | ScanOutcome::Unavailable { modules, .. } => modules,
     };
     Ok((modules, pinned))
 }
@@ -3399,17 +3470,21 @@ fn discover_plan(
     for path in &a.manifests {
         let manifest =
             read_manifest_file(path).inspect_err(|_| discovered.base_counters.report_notes())?;
-        let pinning = pin_manifest_objects_deferred_in_views(&manifest, &discovered.views)
-            .map_err(|error| {
-                discovered.base_counters.report_notes();
-                for problem in error.problems() {
-                    eprintln!("p11scope: {problem}");
-                }
-                anyhow!(
-                    "manifest {} is not a usable trusted input; refusing to attach",
-                    path.display()
-                )
-            })?;
+        let pinning = pin_manifest_objects_deferred_in_views_with_budget(
+            &manifest,
+            &discovered.views,
+            &mut discovered.budget,
+        )
+        .map_err(|error| {
+            discovered.base_counters.report_notes();
+            for problem in error.problems() {
+                eprintln!("p11scope: {problem}");
+            }
+            anyhow!(
+                "manifest {} is not a usable trusted input; refusing to attach",
+                path.display()
+            )
+        })?;
         discovered.manifest_inputs.push(ManifestInput {
             path: path.clone(),
             manifest,
@@ -4846,6 +4921,7 @@ fn lower_export_record(
             inode: owner_inode,
         },
         path: owner_path.display().to_string(),
+        decoder_abi: None,
         exports: vec![hook_name.to_string()],
         tables: vec![ScannedTable {
             version,
@@ -4865,7 +4941,7 @@ fn lower_export_record(
 }
 
 fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedModule) {
-    let Some(existing) = modules.iter_mut().find(|module| {
+    let Some(position) = modules.iter().position(|module| {
         module.view == incoming.view
             && module.mount_namespace == incoming.mount_namespace
             && module.key == incoming.key
@@ -4874,6 +4950,17 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
         modules.push(incoming);
         return;
     };
+    if matches!(
+        (modules[position].decoder_abi, incoming.decoder_abi),
+        (Some(existing), Some(incoming)) if existing != incoming
+    ) {
+        modules.push(incoming);
+        return;
+    }
+    let existing = &mut modules[position];
+    if existing.decoder_abi.is_none() {
+        existing.decoder_abi = incoming.decoder_abi;
+    }
     for export in incoming.exports.drain(..) {
         if !existing.exports.contains(&export) {
             existing.exports.push(export);
@@ -4931,7 +5018,9 @@ fn exact_executable_mapping<'a>(
         .find_map(|mapping| usable_path(maps, mapping).map(|path| (mapping, path)))
 }
 
+#[cfg(test)]
 const ELF_HEADER_BYTES: usize = 64;
+#[cfg(test)]
 const ELF_PROGRAM_HEADER_BYTES: usize = 56;
 const MAX_PROGRAM_HEADER_TABLE_BYTES: usize = 64 * 1024;
 const MAX_INTERPRETER_BYTES: usize = 4096;
@@ -4999,28 +5088,40 @@ fn little_u64(bytes: &[u8]) -> u64 {
 fn read_bounded_interpreter(
     file: &std::fs::File,
     size: u64,
-) -> std::result::Result<Option<PathBuf>, String> {
-    let mut header = [0u8; ELF_HEADER_BYTES];
+) -> std::result::Result<(Option<PathBuf>, ElfAbi), String> {
+    let mut ident = [0u8; 16];
+    read_exact_at(file, &mut ident, 0)?;
+    let (abi, header_bytes, program_bytes, machine) = match ident[4] {
+        1 => (ElfAbi::Ilp32, 52, 32, 3),
+        2 => (ElfAbi::Lp64, 64, 56, 62),
+        _ => return Err("retained executable has an unsupported ELF class".into()),
+    };
+    let mut header = vec![0u8; header_bytes];
     read_exact_at(file, &mut header, 0)?;
     if &header[..4] != b"\x7fELF"
-        || header[4] != 2
         || header[5] != 1
         || header[6] != 1
         || !matches!(little_u16(&header[16..18]), 2 | 3)
-        || little_u16(&header[18..20]) != 62
+        || little_u16(&header[18..20]) != machine
         || little_u32(&header[20..24]) != 1
-        || little_u16(&header[52..54]) as usize != ELF_HEADER_BYTES
-        || little_u16(&header[54..56]) as usize != ELF_PROGRAM_HEADER_BYTES
     {
-        return Err("retained executable is not a supported x86-64 ELF".into());
+        return Err("retained executable is not a supported conventional x86 ELF".into());
     }
-    let table_offset = little_u64(&header[32..40]);
-    let count = little_u16(&header[56..58]);
+    let (table_offset, ehsize_at, phentsize_at, phnum_at) = match abi {
+        ElfAbi::Lp64 => (little_u64(&header[32..40]), 52, 54, 56),
+        ElfAbi::Ilp32 => (u64::from(little_u32(&header[28..32])), 40, 42, 44),
+    };
+    if little_u16(&header[ehsize_at..ehsize_at + 2]) as usize != header_bytes
+        || little_u16(&header[phentsize_at..phentsize_at + 2]) as usize != program_bytes
+    {
+        return Err("retained executable has a noncanonical program-header layout".into());
+    }
+    let count = little_u16(&header[phnum_at..phnum_at + 2]);
     if count == 0 || count == 0xffff {
         return Err("retained executable has no bounded ordinary program-header table".into());
     }
     let table_len = usize::from(count)
-        .checked_mul(ELF_PROGRAM_HEADER_BYTES)
+        .checked_mul(program_bytes)
         .filter(|length| *length <= MAX_PROGRAM_HEADER_TABLE_BYTES)
         .ok_or_else(|| "retained executable program-header table is too large".to_string())?;
     table_offset
@@ -5031,17 +5132,25 @@ fn read_bounded_interpreter(
     read_exact_at(file, &mut table, table_offset)?;
 
     let mut interpreter = None;
-    for program in table.chunks_exact(ELF_PROGRAM_HEADER_BYTES) {
+    for program in table.chunks_exact(program_bytes) {
         if little_u32(&program[..4]) != 3 {
             continue;
         }
         if interpreter.is_some() {
             return Err("retained executable has more than one PT_INTERP".into());
         }
-        let offset = little_u64(&program[8..16]);
-        let length: usize = little_u64(&program[32..40])
-            .try_into()
-            .map_err(|_| "PT_INTERP length does not fit usize".to_string())?;
+        let (offset, length) = match abi {
+            ElfAbi::Lp64 => (
+                little_u64(&program[8..16]),
+                little_u64(&program[32..40])
+                    .try_into()
+                    .map_err(|_| "PT_INTERP length does not fit usize".to_string())?,
+            ),
+            ElfAbi::Ilp32 => (
+                u64::from(little_u32(&program[4..8])),
+                little_u32(&program[16..20]) as usize,
+            ),
+        };
         if !(2..=MAX_INTERPRETER_BYTES).contains(&length) {
             return Err("PT_INTERP length is outside the bounded range".into());
         }
@@ -5059,7 +5168,22 @@ fn read_bounded_interpreter(
         }
         interpreter = Some(PathBuf::from(std::ffi::OsStr::from_bytes(path)));
     }
-    Ok(interpreter)
+    Ok((interpreter, abi))
+}
+
+fn loader_state_address(snapshot: &ElfSnapshot) -> std::result::Result<Option<u64>, String> {
+    let offset = match snapshot.abi() {
+        ElfAbi::Lp64 => 24,
+        ElfAbi::Ilp32 => 12,
+    };
+    snapshot
+        .defined_symbol_virtual_address("_r_debug", offset + 4)?
+        .map(|address| {
+            address
+                .checked_add(offset as u64)
+                .ok_or_else(|| "loader r_state address overflows u64".to_string())
+        })
+        .transpose()
 }
 
 fn executable_map_snapshot(
@@ -5132,6 +5256,7 @@ struct LoaderAuthority {
     executable_file: FileSnapshot,
     executable_key: ObjectKey,
     executable_maps: Vec<(MapEntry, PathBuf)>,
+    executable_abi: ElfAbi,
     interpreter: PathBuf,
     interpreter_file: FileSnapshot,
     loader_key: ObjectKey,
@@ -5447,7 +5572,7 @@ fn begin_owned_prearm_retirement_with<T>(
 
 enum LoaderArmOutcome {
     Changed(bool),
-    OrdinaryFailure,
+    OrdinaryFailure(anyhow::Error),
     GenerationLost {
         changed: bool,
         failure: Option<LoaderArmFailure>,
@@ -5467,7 +5592,7 @@ fn loader_arm_outcome(
     }
     match result {
         Ok(changed) => LoaderArmOutcome::Changed(changed),
-        Err(LoaderArmFailure::Ordinary(_)) => LoaderArmOutcome::OrdinaryFailure,
+        Err(LoaderArmFailure::Ordinary(error)) => LoaderArmOutcome::OrdinaryFailure(error),
         Err(LoaderArmFailure::Invariant(error)) => LoaderArmOutcome::Invariant(error),
     }
 }
@@ -5673,6 +5798,7 @@ fn mapped_object(view: &ProcessView, mapping: &MapEntry, path: &Path) -> Scanned
         mount_namespace: view.mount_namespace(),
         key: ObjectKey::of(mapping),
         path: path.display().to_string(),
+        decoder_abi: None,
         exports: Vec::new(),
         tables: Vec::new(),
         interfaces: Vec::new(),
@@ -5728,6 +5854,9 @@ impl Engine {
             selection_claims: BTreeMap::new(),
             selection_tables: BTreeMap::new(),
             loader_contexts: BTreeMap::new(),
+            pending_loader_scans: BTreeMap::new(),
+            #[cfg(test)]
+            loader_memory_scan_attempts: 0,
         }
     }
 
@@ -6243,6 +6372,7 @@ impl Engine {
         let transport_loss = self.counter_snapshot.ring_loss > 0
             || self.counter_snapshot.export_state_failures > 0
             || self.counter_snapshot.export_bounded_read_failures > 0
+            || self.counter_snapshot.abi_refusals > 0
             || self.malformed_discovery > 0;
         for binding in self.selection_bindings.values_mut() {
             if binding.attached && !binding.retired {
@@ -6512,19 +6642,19 @@ impl Engine {
         let before_maps = Self::read_maps(view, budget)?;
         let executable_path = PathBuf::from(format!("/proc/{pid}/exe"));
         let before_executable =
-            view_object_key(view, &executable_path).map_err(anyhow::Error::msg)?;
+            view_object_key(view, &executable_path, budget).map_err(anyhow::Error::msg)?;
         let executable = view
             .run_while_same(|| std::fs::File::open(&executable_path))
             .map_err(anyhow::Error::msg)??;
         let before_file = FileSnapshot::read(&executable).map_err(anyhow::Error::msg)?;
-        let interpreter =
+        let (interpreter, executable_abi) =
             read_bounded_interpreter(&executable, before_file.size).map_err(anyhow::Error::msg)?;
         let after_file = FileSnapshot::read(&executable).map_err(anyhow::Error::msg)?;
         if before_file != after_file {
             bail!("retained executable changed during bounded PT_INTERP discovery");
         }
         let retained_executable =
-            retained_object_key(view, &executable).map_err(anyhow::Error::msg)?;
+            retained_object_key(view, &executable, budget).map_err(anyhow::Error::msg)?;
 
         let interpreter_file = if let Some(interpreter) = &interpreter {
             let path = PathBuf::from(format!("/proc/{pid}/root")).join(
@@ -6532,7 +6662,11 @@ impl Engine {
                     .strip_prefix("/")
                     .expect("bounded PT_INTERP paths are absolute"),
             );
-            let (file, key) = open_view_object(view, &path).map_err(anyhow::Error::msg)?;
+            let (file, key) = open_view_object(view, &path, budget).map_err(anyhow::Error::msg)?;
+            let object = read_elf_snapshot(&file, budget).map_err(anyhow::Error::msg)?;
+            if object.abi() != executable_abi {
+                bail!("retained executable and PT_INTERP have different target ABIs");
+            }
             let snapshot = FileSnapshot::read(&file).map_err(anyhow::Error::msg)?;
             Some((snapshot, key))
         } else {
@@ -6541,7 +6675,7 @@ impl Engine {
 
         let after_maps = Self::read_maps(view, budget)?;
         let after_executable =
-            view_object_key(view, &executable_path).map_err(anyhow::Error::msg)?;
+            view_object_key(view, &executable_path, budget).map_err(anyhow::Error::msg)?;
         if before_executable != retained_executable || retained_executable != after_executable {
             bail!("retained executable identity changed during PT_INTERP discovery");
         }
@@ -6574,6 +6708,7 @@ impl Engine {
                 executable_file: before_file,
                 executable_key: retained_executable,
                 executable_maps: after_executable_maps,
+                executable_abi,
                 interpreter,
                 interpreter_file,
                 loader_key,
@@ -6651,16 +6786,97 @@ impl Engine {
         module_hints: &[PathBuf],
         hooks: &HookRegistry,
         budget: &mut CaptureWorkBudget,
-    ) -> Result<(Vec<ScannedModule>, PinnedObjects, DiscoveryCounters)> {
+    ) -> (
+        Result<(Vec<ScannedModule>, PinnedObjects)>,
+        DiscoveryCounters,
+    ) {
+        Self::scan_retained_view_with(|counters| {
+            scan_and_pin(view, module_hints, hooks, budget, counters)
+        })
+    }
+
+    fn scan_retained_view_without_memory(
+        view: &ProcessView,
+        module_hints: &[PathBuf],
+        hooks: &HookRegistry,
+        budget: &mut CaptureWorkBudget,
+    ) -> (
+        Result<(Vec<ScannedModule>, PinnedObjects)>,
+        DiscoveryCounters,
+    ) {
+        Self::scan_retained_view_with(|counters| {
+            scan_and_pin_without_memory(view, module_hints, hooks, budget, counters)
+        })
+    }
+
+    fn defer_loader_memory_scan(&mut self, key: PendingLoaderScanKey, hook_ts_ns: u64) {
+        if let Some(earliest) = self.pending_loader_scans.get_mut(&key) {
+            *earliest = (*earliest).min(hook_ts_ns);
+            return;
+        }
+        if self.pending_loader_scans.len() == crate::discovery::loader::MAX_LOADER_CONTEXTS {
+            self.record_pending_loader_scan_loss(
+                "a deferred loader memory scan exceeded the bounded loader-context ledger",
+            );
+            return;
+        }
+        self.pending_loader_scans.insert(key, hook_ts_ns);
+    }
+
+    fn record_pending_loader_scan_loss(&mut self, reason: &str) {
+        self.discovery_truncated = self.discovery_truncated.saturating_add(1);
+        self.mark_live_loss("live loader memory discovery", reason);
+    }
+
+    fn settle_pending_loader_scan(&mut self, key: PendingLoaderScanKey, reason: &str) -> bool {
+        if self.pending_loader_scans.remove(&key).is_none() {
+            return false;
+        }
+        self.record_pending_loader_scan_loss(reason);
+        true
+    }
+
+    fn settle_pending_loader_scans_for_view(&mut self, view: ProcessViewId, reason: &str) {
+        let pending: Vec<_> = self
+            .pending_loader_scans
+            .keys()
+            .filter(|key| key.view == view)
+            .copied()
+            .collect();
+        for key in pending {
+            self.settle_pending_loader_scan(key, reason);
+        }
+    }
+
+    fn settle_all_pending_loader_scans(&mut self, reason: &str) {
+        let pending: Vec<_> = self.pending_loader_scans.keys().copied().collect();
+        for key in pending {
+            self.settle_pending_loader_scan(key, reason);
+        }
+    }
+
+    fn scan_retained_view_with(
+        scan: impl FnOnce(&mut DiscoveryCounters) -> Result<(Vec<ScannedModule>, PinnedObjects)>,
+    ) -> (
+        Result<(Vec<ScannedModule>, PinnedObjects)>,
+        DiscoveryCounters,
+    ) {
         let mut counters = DiscoveryCounters::default();
-        let (modules, pins) = scan_and_pin(view, module_hints, hooks, budget, &mut counters)?;
-        Ok((modules, pins, counters))
+        let result = scan(&mut counters);
+        (result, counters)
     }
 
     fn absorb_scan_counters(&mut self, counters: DiscoveryCounters) -> Vec<Skipped> {
         self.counters.scan_unavailable =
             self.counters.scan_unavailable.or(counters.scan_unavailable);
         self.counters.scan_ms = self.counters.scan_ms.saturating_add(counters.scan_ms);
+        // An acquisition failure has already happened. Keep it even if later
+        // inventory construction fails or normal exit suppresses a generic gap.
+        for skipped in &counters.object_skips {
+            if skipped.reason.starts_with("memory scan refused: ") {
+                self.mark_partial(&skipped.subject, &skipped.reason);
+            }
+        }
         counters.object_skips
     }
 
@@ -6779,6 +6995,10 @@ impl Engine {
             Err(error) => {
                 self.capture_facts.rollback_stage();
                 self.restore_start_publication(snapshot);
+                self.settle_all_pending_loader_scans(
+                    "a deferred loader memory scan was unresolved when capture start was cancelled",
+                );
+                record_object_skips(&mut self.plan, &self.counters.object_skips);
                 Err(error)
             }
         }
@@ -7756,12 +7976,13 @@ impl Engine {
         }
         if self.counter_snapshot.export_state_failures > 0
             || self.counter_snapshot.export_bounded_read_failures > 0
+            || self.counter_snapshot.abi_refusals > 0
         {
             self.invalidate_silent_selection_coverage();
             self.invalidate_causal_timing();
             self.mark_partial(
                 "live export discovery",
-                "the kernel reported export state or bounded-read failures",
+                "the kernel reported export state, bounded-read, or target ABI failures",
             );
         }
         if self.counter_snapshot.loader_state_read_failures > 0 {
@@ -7841,6 +8062,232 @@ impl Engine {
             outcome.changed,
             outcome.required_complete(),
         ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn process_validated_loader_scan(
+        &mut self,
+        position: usize,
+        context_id: LoaderContextId,
+        hook_ts_ns: u64,
+        terminal_owner: Option<LoaderContextId>,
+        terminal_exports: &[DynamicExportIdentity],
+        mode: LoaderScanMode,
+        session: &mut dyn EngineSession,
+        additions_allowed: &mut bool,
+        pending_views: &mut PendingViewRetirements,
+    ) -> Result<DiscoveryRecordOutcome> {
+        #[cfg(test)]
+        if mode == LoaderScanMode::Memory {
+            self.loader_memory_scan_attempts = self.loader_memory_scan_attempts.saturating_add(1);
+        }
+        let (scan_result, scan_counters) = match mode {
+            LoaderScanMode::Memory => Self::scan_retained_view(
+                &self.views[position],
+                &self.module_hints,
+                &self.hooks,
+                &mut self.budget,
+            ),
+            LoaderScanMode::MetadataOnly => Self::scan_retained_view_without_memory(
+                &self.views[position],
+                &self.module_hints,
+                &self.hooks,
+                &mut self.budget,
+            ),
+        };
+        let mut skipped = self.absorb_scan_counters(scan_counters);
+        let (mut found, fresh_pins) = match scan_result {
+            Ok(value) => value,
+            Err(error) => {
+                for skip in skipped {
+                    self.mark_partial(&skip.subject, &skip.reason);
+                }
+                return Err(error);
+            }
+        };
+        if mode == LoaderScanMode::MetadataOnly {
+            for module in &mut found {
+                let Some(current) = self.modules.iter().find(|current| {
+                    current.scanned.view == module.view
+                        && current.scanned.mount_namespace == module.mount_namespace
+                        && current.scanned.key == module.key
+                        && current.scanned.path == module.path
+                        && current.scanned.decoder_abi == module.decoder_abi
+                }) else {
+                    continue;
+                };
+                module.tables = current.scanned.tables.clone();
+                module.interfaces = current.scanned.interfaces.clone();
+            }
+        }
+        let export_modules = found.clone();
+        let loader = self
+            .loader_registry
+            .context(context_id)
+            .map(|context| context.spec.loader)
+            .ok_or_else(|| anyhow!("loader context disappeared after record validation"))?;
+        let mut candidate_pins = self.pinned.clone();
+        skipped.extend(candidate_pins.replace_view_pins(
+            self.views[position].id(),
+            fresh_pins,
+            &[loader],
+        ));
+        let mut raw_modules: Vec<_> = self
+            .modules
+            .iter()
+            .filter(|module| module.scanned.view != self.views[position].id())
+            .map(|module| module.scanned.clone())
+            .collect();
+        for module in found {
+            merge_scanned_module(&mut raw_modules, module);
+        }
+        let mut candidate = self.live_candidate(candidate_pins, raw_modules, skipped)?;
+        candidate.views.insert(self.views[position].id());
+        let observed = candidate_timing_keys(&candidate, &export_modules);
+        self.observe_causal_timing(&observed, hook_ts_ns);
+        let collected = self.collect_dynamic_export_work(
+            context_id,
+            &export_modules,
+            &candidate.pinned,
+            session,
+            terminal_owner.is_some(),
+            terminal_exports,
+        );
+        let mut required_seed_complete = collected.required_seed_complete;
+        for seed in &collected.count_only_seeds {
+            let mut owners = candidate
+                .plan
+                .modules
+                .iter()
+                .filter(|module| module.object == seed.object);
+            let Some(module) = owners.next() else {
+                required_seed_complete = false;
+                self.mark_partial(
+                    "live export hook",
+                    "a C_GetFunctionList seed had no unique candidate module owner",
+                );
+                continue;
+            };
+            if owners.next().is_some() {
+                required_seed_complete = false;
+                self.mark_partial(
+                    "live export hook",
+                    "a C_GetFunctionList seed had no unique candidate module owner",
+                );
+                continue;
+            }
+            match candidate.plan.add_provisional_get_function_list(
+                plan::ProvisionalGetFunctionList {
+                    module: module.id,
+                    object: seed.object,
+                    object_path: seed.object_path.clone(),
+                    file_offset: seed.file_offset,
+                },
+            ) {
+                Ok(Some(slot)) => candidate.delta.new.push(slot),
+                Ok(None) => {}
+                Err(_) => {
+                    required_seed_complete = false;
+                    self.mark_partial(
+                        "live export hook",
+                        "a C_GetFunctionList seed could not be added to the candidate plan",
+                    );
+                }
+            }
+        }
+        let outcome = self.apply_candidate(session, candidate, additions_allowed, false, &[])?;
+        self.record_apply_timing(&outcome);
+        self.queue_apply_outcome(&outcome, pending_views);
+        let changed = outcome.changed;
+        let mut required_complete = required_seed_complete && outcome.required_complete();
+        if terminal_owner.is_none() && outcome.accepted() {
+            let (retire, dynamic_complete) = self.attach_export_work(
+                self.views[position].id(),
+                &collected.dynamic,
+                session,
+                additions_allowed,
+            );
+            if !dynamic_complete {
+                required_complete = false;
+            }
+            if retire {
+                let view = self.views[position].id();
+                self.queue_stale_views(&[view].into_iter().collect(), pending_views);
+            }
+            for work in &collected.dynamic {
+                if let Some(binding) = work.selection_binding
+                    && self
+                        .selection_bindings
+                        .get(&binding.id)
+                        .is_some_and(|binding| binding.attached)
+                {
+                    self.open_owned_selection(binding.id);
+                }
+            }
+        } else {
+            lose_unperformed_dynamic_work(&mut self.timings, &collected.dynamic);
+        }
+        Ok(DiscoveryRecordOutcome::applied(changed, required_complete))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn service_pending_loader_scans(
+        &mut self,
+        due: BTreeSet<PendingLoaderScanKey>,
+        session: &mut dyn EngineSession,
+        additions_allowed: &mut bool,
+        pending_views: &mut PendingViewRetirements,
+    ) -> Result<DiscoveryRecordOutcome> {
+        let mut changed = false;
+        let mut required_complete = true;
+        for key in due {
+            let Some(hook_ts_ns) = self.pending_loader_scans.remove(&key) else {
+                continue;
+            };
+            if let Some(reason) = self.budget.stopped_now() {
+                self.record_pending_loader_scan_loss(&format!(
+                    "a deferred loader memory scan was unresolved at budget exhaustion: {reason}"
+                ));
+                required_complete = false;
+                continue;
+            }
+            let context_current = self
+                .loader_registry
+                .context(key.context)
+                .is_some_and(|context| context.spec.view == key.view)
+                && !self.loader_registry.is_tombstoned(key.context);
+            let position = self.views.iter().position(|view| view.id() == key.view);
+            let Some(position) = position.filter(|_| context_current) else {
+                self.record_pending_loader_scan_loss(
+                    "a deferred loader memory scan was unresolved at loader context retirement",
+                );
+                required_complete = false;
+                continue;
+            };
+            match self.process_validated_loader_scan(
+                position,
+                key.context,
+                hook_ts_ns,
+                None,
+                &[],
+                LoaderScanMode::Memory,
+                session,
+                additions_allowed,
+                pending_views,
+            ) {
+                Ok(outcome) => {
+                    changed |= outcome.changed();
+                    required_complete &= outcome.required_complete();
+                }
+                Err(error) => {
+                    self.record_pending_loader_scan_loss(
+                        "a deferred loader memory scan remained unresolved after its one bounded fallback attempt",
+                    );
+                    return Err(error);
+                }
+            }
+        }
+        Ok(DiscoveryRecordOutcome::applied(changed, required_complete))
     }
 
     fn process_loader_record(
@@ -7978,116 +8425,61 @@ impl Engine {
             ));
         }
 
-        let (found, fresh_pins, scan_counters) = Self::scan_retained_view(
-            &self.views[position],
-            &self.module_hints,
-            &self.hooks,
-            &mut self.budget,
-        )?;
-        let mut skipped = self.absorb_scan_counters(scan_counters);
-        let export_modules = found.clone();
-        let mut candidate_pins = self.pinned.clone();
-        skipped.extend(candidate_pins.replace_view_pins(
-            self.views[position].id(),
-            fresh_pins,
-            &[loader],
-        ));
-        let mut raw_modules: Vec<_> = self
-            .modules
-            .iter()
-            .filter(|module| module.scanned.view != self.views[position].id())
-            .map(|module| module.scanned.clone())
-            .collect();
-        for module in found {
-            merge_scanned_module(&mut raw_modules, module);
-        }
-        let mut candidate = self.live_candidate(candidate_pins, raw_modules, skipped)?;
-        candidate.views.insert(self.views[position].id());
-        let observed = candidate_timing_keys(&candidate, &export_modules);
-        self.observe_causal_timing(&observed, record.hook_ts_ns);
-        let collected = self.collect_dynamic_export_work(
-            context_id,
-            &export_modules,
-            &candidate.pinned,
-            session,
-            terminal_owner.is_some(),
-            &terminal_exports,
-        );
-        let mut required_seed_complete = collected.required_seed_complete;
-        for seed in &collected.count_only_seeds {
-            let mut owners = candidate
-                .plan
-                .modules
-                .iter()
-                .filter(|module| module.object == seed.object);
-            let Some(module) = owners.next() else {
-                required_seed_complete = false;
-                self.mark_partial(
-                    "live export hook",
-                    "a C_GetFunctionList seed had no unique candidate module owner",
-                );
-                continue;
-            };
-            if owners.next().is_some() {
-                required_seed_complete = false;
-                self.mark_partial(
-                    "live export hook",
-                    "a C_GetFunctionList seed had no unique candidate module owner",
-                );
-                continue;
-            }
-            match candidate.plan.add_provisional_get_function_list(
-                plan::ProvisionalGetFunctionList {
-                    module: module.id,
-                    object: seed.object,
-                    object_path: seed.object_path.clone(),
-                    file_offset: seed.file_offset,
-                },
-            ) {
-                Ok(Some(slot)) => candidate.delta.new.push(slot),
-                Ok(None) => {}
-                Err(_) => {
-                    required_seed_complete = false;
-                    self.mark_partial(
-                        "live export hook",
-                        "a C_GetFunctionList seed could not be added to the candidate plan",
-                    );
-                }
-            }
-        }
-        let outcome = self.apply_candidate(session, candidate, additions_allowed, false, &[])?;
-        self.record_apply_timing(&outcome);
-        self.queue_apply_outcome(&outcome, pending_views);
-        let changed = outcome.changed;
-        let mut required_complete = required_seed_complete && outcome.required_complete();
-        if terminal_owner.is_none() && outcome.accepted() {
-            let (retire, dynamic_complete) = self.attach_export_work(
-                self.views[position].id(),
-                &collected.dynamic,
+        let key = PendingLoaderScanKey {
+            view: view_id,
+            context: context_id,
+        };
+        if matches!(record.announced_count, 1 | 2) {
+            self.defer_loader_memory_scan(key, record.hook_ts_ns);
+            let result = self.process_validated_loader_scan(
+                position,
+                context_id,
+                record.hook_ts_ns,
+                terminal_owner,
+                &terminal_exports,
+                LoaderScanMode::MetadataOnly,
                 session,
                 additions_allowed,
+                pending_views,
             );
-            if !dynamic_complete {
-                required_complete = false;
+            if result.is_err() {
+                self.settle_pending_loader_scan(
+                    key,
+                    "a deferred loader memory scan failed during export-hook preparation",
+                );
+            } else if let Some(reason) = self.budget.stopped_now() {
+                self.settle_pending_loader_scan(
+                    key,
+                    &format!(
+                        "a deferred loader memory scan was unresolved at budget exhaustion: {reason}"
+                    ),
+                );
             }
-            if retire {
-                let view = self.views[position].id();
-                self.queue_stale_views(&[view].into_iter().collect(), pending_views);
-            }
-            for work in &collected.dynamic {
-                if let Some(binding) = work.selection_binding
-                    && self
-                        .selection_bindings
-                        .get(&binding.id)
-                        .is_some_and(|binding| binding.attached)
-                {
-                    self.open_owned_selection(binding.id);
-                }
-            }
+            result
         } else {
-            lose_unperformed_dynamic_work(&mut self.timings, &collected.dynamic);
+            let resolving_pending = self.pending_loader_scans.remove(&key).is_some();
+            let result = self.process_validated_loader_scan(
+                position,
+                context_id,
+                record.hook_ts_ns,
+                terminal_owner,
+                &terminal_exports,
+                LoaderScanMode::Memory,
+                session,
+                additions_allowed,
+                pending_views,
+            );
+            if resolving_pending && result.is_err() {
+                self.record_pending_loader_scan_loss(
+                    "a zero-state opportunity did not complete its deferred loader memory scan",
+                );
+            } else if resolving_pending && let Some(reason) = self.budget.stopped_now() {
+                self.record_pending_loader_scan_loss(&format!(
+                    "a deferred loader memory scan was unresolved at budget exhaustion: {reason}"
+                ));
+            }
+            result
         }
-        Ok(DiscoveryRecordOutcome::applied(changed, required_complete))
     }
 
     fn record_selection_occurrences(
@@ -8274,6 +8666,38 @@ impl Engine {
         })
     }
 
+    fn ordinary_selection_view<'a>(
+        &'a self,
+        record: &DiscoveryRecord,
+        binding: &SelectionBindingFact,
+        hook_matches: bool,
+    ) -> Option<&'a ProcessView> {
+        let pid = (record.pid_tgid >> 32) as u32;
+        if !binding.attached
+            || binding.retired
+            || !hook_matches
+            || self.loader_registry.is_tombstoned(binding.context)
+            || self
+                .loader_registry
+                .context(binding.context)
+                .is_none_or(|context| context.spec.view != binding.view)
+        {
+            return None;
+        }
+
+        self.views
+            .iter()
+            .find(|view| view.id() == binding.view && view.pid() == pid)
+    }
+
+    fn reject_selection_attribution(&mut self, binding_id: u64) {
+        self.mark_live_loss(
+            "live interface selection",
+            "a selection record failed binding, context, or process-generation attribution",
+        );
+        self.invalidate_selection_coverage(binding_id);
+    }
+
     #[cfg(test)]
     fn process_selection_record(
         &mut self,
@@ -8332,28 +8756,34 @@ impl Engine {
             abi: binding.abi,
         };
         let pid = (record.pid_tgid >> 32) as u32;
+        let ordinary_generation = queued
+            .terminal_owner
+            .is_none()
+            .then(|| self.ordinary_selection_view(record, &binding, hook_matches))
+            .flatten()
+            .map(|view| (view.id(), view.original_generation_state()));
         let authorized = if let Some(owner) = queued.terminal_owner {
             binding.attached
                 && hook_matches
                 && owner == binding.context
                 && queued.terminal_exports.contains(&identity)
         } else {
-            binding.attached
-                && !binding.retired
-                && hook_matches
-                && !self.loader_registry.is_tombstoned(binding.context)
-                && self
-                    .loader_registry
-                    .context(binding.context)
-                    .is_some_and(|context| context.spec.view == binding.view)
-                && self.views.iter().any(|view| {
-                    view.id() == binding.view && view.pid() == pid && view.still_the_same()
-                })
+            matches!(
+                ordinary_generation.as_ref(),
+                Some((_, Ok(OriginalGenerationState::Current)))
+            )
         };
         if !authorized {
-            return Ok(self.reject_unattributed_selection(
-                binding.id,
-                "a selection record failed binding, context, or process-generation attribution",
+            if let Some((view, Ok(OriginalGenerationState::Exited))) = ordinary_generation {
+                return Ok(DiscoveryRecordOutcome::TerminalSelectionHandoff {
+                    view,
+                    owner: binding.context,
+                });
+            }
+
+            self.reject_selection_attribution(binding.id);
+            return Ok(DiscoveryRecordOutcome::Rejected(
+                RecordRejection::SelectionUnattributed,
             ));
         }
 
@@ -8535,10 +8965,25 @@ impl Engine {
                     if !self.pinned.check_unchanged().unwrap_or(false) {
                         return Err(());
                     }
+                    let layout = self
+                        .pinned
+                        .abi_for(binding.object)
+                        .map(target_layout)
+                        .ok_or(())?;
                     let (mapping, table) = if let Some((session, _, _)) = transaction.as_mut() {
-                        session.read_selection_table(view, record.table_ptr, &mut self.budget)?
+                        session.read_selection_table(
+                            view,
+                            record.table_ptr,
+                            layout,
+                            &mut self.budget,
+                        )?
                     } else {
-                        Self::read_selection_table(view, record.table_ptr, &mut self.budget)?
+                        Self::read_selection_table(
+                            view,
+                            record.table_ptr,
+                            layout,
+                            &mut self.budget,
+                        )?
                     };
                     if !self.pinned.check_unchanged().unwrap_or(false) {
                         return Err(());
@@ -8585,6 +9030,7 @@ impl Engine {
             && self.counter_snapshot.ring_loss == 0
             && self.counter_snapshot.export_state_failures == 0
             && self.counter_snapshot.export_bounded_read_failures == 0
+            && self.counter_snapshot.abi_refusals == 0
             && !self.capture_facts.visible_history().selection_truncated
             && authority_shape
             && result.as_ref().is_some_and(|result| {
@@ -8686,6 +9132,7 @@ impl Engine {
     fn read_selection_table(
         view: &ProcessView,
         address: u64,
+        layout: LinuxLayout,
         budget: &mut CaptureWorkBudget,
     ) -> std::result::Result<(MapEntry, ScannedTable), ()> {
         let maps_a = Self::read_maps(view, budget).map_err(|_| ())?;
@@ -8698,7 +9145,8 @@ impl Engine {
             .run_while_same(|| File::open(format!("/proc/{}/mem", view.pid())))
             .map_err(|_| ())?
             .map_err(|_| ())?;
-        let mut bytes = vec![0; std::mem::size_of::<u64>()];
+        let width = layout.word_bytes();
+        let mut bytes = vec![0; width];
         let mut operation_bytes = 0u64;
         let mut read_exact = |bytes: &mut [u8], base: u64| -> Result<(), ()> {
             let mut done = 0usize;
@@ -8724,21 +9172,19 @@ impl Engine {
             Ok(())
         };
         read_exact(&mut bytes, address)?;
-        let table_bytes = exact_table_bytes(&bytes).ok_or(())?;
+        let table_bytes = exact_table_bytes(&bytes, layout).ok_or(())?;
         let table_end = address.checked_add(table_bytes as u64).ok_or(())?;
         if table_end > mapping_a.end {
             return Err(());
         }
         bytes.resize(table_bytes, 0);
-        if table_bytes > std::mem::size_of::<u64>() {
+        if table_bytes > width {
             read_exact(
-                &mut bytes[std::mem::size_of::<u64>()..],
-                address
-                    .checked_add(std::mem::size_of::<u64>() as u64)
-                    .ok_or(())?,
+                &mut bytes[width..],
+                address.checked_add(width as u64).ok_or(())?,
             )?;
         }
-        let raw_addresses = exact_table_addresses(&bytes).ok_or(())?;
+        let raw_addresses = exact_table_addresses(&bytes, layout).ok_or(())?;
         let mut addresses = Vec::with_capacity(raw_addresses.len() + 1);
         addresses.push(address);
         addresses.extend(raw_addresses);
@@ -8746,7 +9192,7 @@ impl Engine {
             .iter()
             .map(|address| index_a.containing(*address).cloned().ok_or(()))
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let table = decode_exact_table(&bytes, address, &index_a, budget)
+        let table = decode_exact_table(&bytes, address, layout, &index_a, budget)
             .map_err(|_| ())?
             .ok_or(())?;
         let maps_b = Self::read_maps(view, budget).map_err(|_| ())?;
@@ -8803,9 +9249,17 @@ impl Engine {
                 continue;
             };
             let timing_key = pinned.owned_timing_key(object);
-            let snapshot = pinned
-                .file_for(object)
-                .and_then(|file| ElfSnapshot::read(file).ok());
+            let snapshot = match pinned.file_for(object) {
+                Some(file) => match read_elf_snapshot(file, &mut self.budget) {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(reason) => {
+                        collected.required_seed_complete = false;
+                        self.mark_partial("live export hook", &reason);
+                        None
+                    }
+                },
+                None => None,
+            };
             if requires_seed {
                 let seed = snapshot.as_ref().and_then(|snapshot| {
                     snapshot
@@ -9190,6 +9644,9 @@ impl Engine {
         )
         .map_err(anyhow::Error::msg)?;
         let skipped = loader_skips;
+        for skip in &skipped {
+            self.mark_partial(&skip.subject, &skip.reason);
+        }
         let Some(local_loader_id) =
             loader_pins.id_for_scanned(&loader_module, loader_module.key, &loader_module.path)
         else {
@@ -9199,10 +9656,11 @@ impl Engine {
             );
             return Ok(false);
         };
-        let loader_snapshot = ElfSnapshot::read(
+        let loader_snapshot = read_elf_snapshot(
             loader_pins
                 .file_for(local_loader_id)
                 .expect("the just-pinned loader has its retained file"),
+            &mut self.budget,
         )
         .map_err(anyhow::Error::msg)?;
         let pinned_loader_file = FileSnapshot::read(
@@ -9211,7 +9669,9 @@ impl Engine {
                 .expect("the just-pinned loader has its retained file"),
         )
         .map_err(anyhow::Error::msg)?;
-        if pinned_loader_file != locator.authority.interpreter_file {
+        if pinned_loader_file != locator.authority.interpreter_file
+            || loader_snapshot.abi() != locator.authority.executable_abi
+        {
             self.mark_partial(
                 "live loader arming",
                 "the mapped loader did not match the retained PT_INTERP target",
@@ -9237,9 +9697,7 @@ impl Engine {
                     return Ok(false);
                 }
             };
-        let state = loader_snapshot
-            .defined_symbol("_r_debug")
-            .map_err(anyhow::Error::msg)?;
+        let state_address = loader_state_address(&loader_snapshot).map_err(anyhow::Error::msg)?;
 
         let (candidate, loader) = self
             .loader_candidate(
@@ -9266,7 +9724,7 @@ impl Engine {
             loader,
             mapping: Some(loader_mapping.clone()),
             hook,
-            state,
+            state_address,
         }) {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -9287,18 +9745,33 @@ impl Engine {
             .loader_registry
             .prepare(prepared)
             .map_err(|error| LoaderArmFailure::invariant(anyhow!(error)))?;
+        let mut revalidation_error = None;
         let attach = generation_checked_mutation(
             || {
-                self.views[position].still_the_same()
-                    && self.pinned.check_unchanged().unwrap_or(false)
-                    && Self::loader_locator(&self.views[position], &mut self.budget).is_ok_and(
-                        |current| {
-                            current.is_some_and(|current| {
-                                current.authority == locator.authority
-                                    && current.maps.contains(&loader_mapping)
-                            })
-                        },
-                    )
+                if !self.views[position].still_the_same() {
+                    return false;
+                }
+                match self.pinned.check_unchanged() {
+                    Ok(true) => {}
+                    Ok(false) => return false,
+                    Err(error) => {
+                        revalidation_error = Some(
+                            anyhow!(error).context("retained object revalidation unavailable"),
+                        );
+                        return false;
+                    }
+                }
+                match Self::loader_locator(&self.views[position], &mut self.budget) {
+                    Ok(Some(current)) => {
+                        current.authority == locator.authority
+                            && current.maps.contains(&loader_mapping)
+                    }
+                    Ok(None) => false,
+                    Err(error) => {
+                        revalidation_error = Some(error.context("loader revalidation unavailable"));
+                        false
+                    }
+                }
             },
             || {
                 session.attach_dynamic_loader(
@@ -9372,12 +9845,16 @@ impl Engine {
             }
         };
         if generation_lost {
+            if let Some(error) = revalidation_error {
+                self.queue_retirement(view_id, RetirementCause::ExecRefresh, pending_views);
+                return Err(LoaderArmFailure::ordinary(error));
+            }
+            self.queue_stale_views(&[view_id].into_iter().collect(), pending_views);
             self.mark_generation_change(
                 view_id,
                 "live loader arming",
                 "loader generation, mapping, or pinned identity changed during attach",
             );
-            self.queue_stale_views(&[view_id].into_iter().collect(), pending_views);
             if matches!(self.scope, Scope::Pid(_)) {
                 return Err(LoaderArmFailure::ordinary(anyhow!(
                     "the named process generation changed during loader attachment"
@@ -9417,6 +9894,7 @@ impl Engine {
         let loader_identity = retained_object_key(
             &self.views[position],
             prepared_executable.interpreter_file(),
+            &mut self.budget,
         )
         .map_err(anyhow::Error::msg)?;
         let loader_module = ScannedModule {
@@ -9424,6 +9902,7 @@ impl Engine {
             mount_namespace: self.views[position].mount_namespace(),
             key: loader_identity,
             path: prepared_executable.interpreter().display().to_string(),
+            decoder_abi: None,
             exports: Vec::new(),
             tables: Vec::new(),
             interfaces: Vec::new(),
@@ -9434,6 +9913,9 @@ impl Engine {
             &mut self.budget,
         )
         .map_err(anyhow::Error::msg)?;
+        for skip in &skipped {
+            self.mark_partial(&skip.subject, &skip.reason);
+        }
         let Some(local_loader) =
             loader_pins.id_for_scanned(&loader_module, loader_module.key, &loader_module.path)
         else {
@@ -9443,12 +9925,16 @@ impl Engine {
             );
             return Ok(OwnedLoaderPrearmOutcome::Unavailable);
         };
-        let loader_snapshot = ElfSnapshot::read(
+        let loader_snapshot = read_elf_snapshot(
             loader_pins
                 .file_for(local_loader)
                 .expect("the just-pinned pre-exec loader has its retained file"),
+            &mut self.budget,
         )
         .map_err(anyhow::Error::msg)?;
+        if loader_snapshot.abi() != prepared_executable.abi() {
+            bail!("the owned executable and PT_INTERP have different target ABIs");
+        }
         let Some(hook) = loader_snapshot
             .defined_symbol("_dl_debug_state")
             .map_err(anyhow::Error::msg)?
@@ -9460,9 +9946,7 @@ impl Engine {
             );
             return Ok(OwnedLoaderPrearmOutcome::Unavailable);
         };
-        let state = loader_snapshot
-            .defined_symbol("_r_debug")
-            .map_err(anyhow::Error::msg)?;
+        let state_address = loader_state_address(&loader_snapshot).map_err(anyhow::Error::msg)?;
         let (candidate, loader) =
             self.loader_candidate(view_id, &loader_module, &loader_pins, local_loader, skipped)?;
         let Some(loader) = loader else {
@@ -9473,7 +9957,7 @@ impl Engine {
             loader,
             mapping: None,
             hook,
-            state,
+            state_address,
         }) {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -9671,12 +10155,9 @@ impl Engine {
         self.record_loader_arm(view_id, false);
         match loader_arm_outcome(generation_valid, result) {
             LoaderArmOutcome::Changed(changed) => Ok(changed),
-            LoaderArmOutcome::OrdinaryFailure => {
+            LoaderArmOutcome::OrdinaryFailure(error) => {
                 self.invalidate_causal_timing();
-                self.mark_partial(
-                    "live loader arming",
-                    "an existing retained view could not be armed exactly",
-                );
+                self.mark_partial("live loader arming", &format!("{error:#}"));
                 Ok(false)
             }
             LoaderArmOutcome::Invariant(error) => Err(error),
@@ -9743,6 +10224,10 @@ impl Engine {
     /// and the empty-scan rule; a journal still pending keeps the record, and
     /// the timing proof this loss already invalidated is not given back.
     pub(crate) fn settle_terminal_drain(&mut self) {
+        self.settle_all_pending_loader_scans(
+            "a deferred loader memory scan was unresolved at capture cancellation or shutdown",
+        );
+        record_object_skips(&mut self.plan, &self.counters.object_skips);
         let pending_views = self.pending_leader_exit_views.clone();
         finalize_pending_leader_exit_views(
             &mut self.pending_leader_exit_views,
@@ -9765,6 +10250,36 @@ impl Engine {
 
     fn terminal_owner(&self) -> Option<LoaderContextId> {
         self.terminal_journal.map(|journal| journal.owner)
+    }
+
+    fn handoff_precharged_terminal_records(
+        &mut self,
+        owner: LoaderContextId,
+        records: Vec<DiscoveryRecord>,
+    ) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let batch = self
+            .terminal_batch
+            .as_mut()
+            .ok_or_else(|| anyhow!("terminal loader drain batch is missing"))?;
+        if batch.authority.owner != owner {
+            bail!("terminal selection handoff named the wrong loader owner");
+        }
+        batch.extend(records);
+        Ok(())
+    }
+
+    fn reject_terminal_selection_handoffs(
+        &mut self,
+        records: impl IntoIterator<Item = DiscoveryRecord>,
+        closure: &mut PauseClosure,
+    ) {
+        for record in records {
+            self.reject_selection_attribution(record.binding_id);
+            closure.fail();
+        }
     }
 
     fn retain_terminal_batch(
@@ -10082,9 +10597,14 @@ impl Engine {
         self.dispatch_terminal_batch(session, additions_allowed, pending_views, closure)
     }
 
+    // One retirement pass owns the whole decision: the view, the terminal
+    // handoffs it may still hand a selection to, and every accumulator the
+    // caller needs back. Splitting it would hand out the same state twice.
+    #[allow(clippy::too_many_arguments)]
     fn retire_loader_contexts(
         &mut self,
         view: ProcessViewId,
+        terminal_selection_handoffs: &mut TerminalSelectionHandoffs,
         session: &mut dyn EngineSession,
         additions_allowed: &mut bool,
         pending_views: &mut PendingViewRetirements,
@@ -10141,7 +10661,17 @@ impl Engine {
                         "a one-shot dynamic detach failed; replacement was blocked for this cycle",
                     );
                 }
-                match self.begin_terminal_drain(context_id, terminal_exports, || collect(session)) {
+                let terminal_drain =
+                    self.begin_terminal_drain(context_id, terminal_exports, || collect(session));
+                if terminal_drain.is_ok()
+                    && let Some(records) = terminal_selection_handoffs.remove(&context_id.get())
+                    && let Err(error) =
+                        self.handoff_precharged_terminal_records(context_id, records.clone())
+                {
+                    self.reject_terminal_selection_handoffs(records, closure);
+                    return Err(error);
+                }
+                match terminal_drain {
                     Ok(Ok((owned, malformed))) => {
                         if malformed != 0 {
                             closure.fail();
@@ -10176,6 +10706,10 @@ impl Engine {
                         return Ok((changed, false));
                     }
                     Err(_) => {
+                        if let Some(records) = terminal_selection_handoffs.remove(&context_id.get())
+                        {
+                            self.reject_terminal_selection_handoffs(records, closure);
+                        }
                         closure.fail();
                         *additions_allowed = false;
                         self.mark_partial(
@@ -10196,6 +10730,13 @@ impl Engine {
             if self.terminal_owner() == Some(context_id) {
                 return Ok((changed, false));
             }
+            self.settle_pending_loader_scan(
+                PendingLoaderScanKey {
+                    view,
+                    context: context_id,
+                },
+                "a deferred loader memory scan was unresolved at loader context retirement",
+            );
             // A context its own terminal dispatch already removed was removed
             // exactly once; only one still registered can fail to be removed.
             if self.loader_registry.context(context_id).is_some()
@@ -10267,6 +10808,15 @@ impl Engine {
             cause
         };
         let cause = previous.map_or(cause, |current| current.merge(cause));
+        let pending_reason = match cause {
+            RetirementCause::ExpectedRemoval => {
+                "a deferred loader memory scan was unresolved at expected process exit"
+            }
+            RetirementCause::ExecRefresh | RetirementCause::GenerationLost => {
+                "a deferred loader memory scan was unresolved at loader context retirement"
+            }
+        };
+        self.settle_pending_loader_scans_for_view(view, pending_reason);
         if cause != RetirementCause::ExpectedRemoval {
             self.ready_expected_removals.remove(&view);
         }
@@ -10659,6 +11209,7 @@ impl Engine {
         let mut changed = false;
         let mut named_generation_lost = false;
         let mut conservative_replay_attempted = false;
+        let mut terminal_selection_handoffs = TerminalSelectionHandoffs::new();
         for (view, cause) in self.retirement_intents.clone() {
             pending_views
                 .entry(view)
@@ -10669,6 +11220,7 @@ impl Engine {
             let mut exec_refresh_views = BTreeSet::new();
             let mut deferred_mismatches = Vec::new();
             for queued in std::mem::take(records) {
+                let record = queued.record;
                 let origin = (queued.record.pid_tgid >> 32) as u32;
                 match self.dispatch_discovery_record(
                     queued,
@@ -10678,6 +11230,13 @@ impl Engine {
                     &mut exec_refresh_views,
                     &mut deferred_mismatches,
                 ) {
+                    Ok(DiscoveryRecordOutcome::TerminalSelectionHandoff { view, owner }) => {
+                        terminal_selection_handoffs
+                            .entry(owner.get())
+                            .or_default()
+                            .push(record);
+                        self.queue_retirement(view, RetirementCause::GenerationLost, pending_views);
+                    }
                     Ok(outcome) => {
                         changed |= outcome.changed();
                         if !outcome.required_complete() {
@@ -10754,6 +11313,7 @@ impl Engine {
                 }
                 let (retirement_changed, complete) = self.retire_loader_contexts(
                     view,
+                    &mut terminal_selection_handoffs,
                     session,
                     additions_allowed,
                     pending_views,
@@ -10794,6 +11354,11 @@ impl Engine {
                 conservative_replay_attempted = false;
             }
         }
+        let refused_handoffs = std::mem::take(&mut terminal_selection_handoffs)
+            .into_values()
+            .flatten()
+            .collect::<Vec<_>>();
+        self.reject_terminal_selection_handoffs(refused_handoffs, closure);
         self.finalize_expected_target_exit();
         if named_generation_lost {
             bail!("the named process generation changed during live discovery");
@@ -10822,14 +11387,15 @@ impl Engine {
                 skipped.push(skip);
                 continue;
             };
-            match Self::scan_retained_view(
+            let (scan_result, counters) = Self::scan_retained_view(
                 &self.views[position],
                 &self.module_hints,
                 &self.hooks,
                 &mut self.budget,
-            ) {
-                Ok((modules, pins, counters)) => {
-                    skipped.extend(self.absorb_scan_counters(counters));
+            );
+            skipped.extend(self.absorb_scan_counters(counters));
+            match scan_result {
+                Ok((modules, pins)) => {
                     scans.push((*view_id, modules, pins));
                 }
                 Err(error) => {
@@ -11079,10 +11645,11 @@ impl Engine {
                     continue;
                 }
             };
-            match Self::scan_retained_view(&view, &self.module_hints, &self.hooks, &mut self.budget)
-            {
-                Ok((modules, pins, counters)) => {
-                    skipped.extend(self.absorb_scan_counters(counters));
+            let (scan_result, counters) =
+                Self::scan_retained_view(&view, &self.module_hints, &self.hooks, &mut self.budget);
+            skipped.extend(self.absorb_scan_counters(counters));
+            match scan_result {
+                Ok((modules, pins)) => {
                     new_views.push((view, modules, pins));
                 }
                 Err(error) => {
@@ -11180,6 +11747,7 @@ impl Engine {
         let mut mutation_started = false;
         let mut failed_retirements = BTreeSet::new();
         let mut context_retirements = BTreeSet::new();
+        let mut no_terminal_selection_handoffs = TerminalSelectionHandoffs::new();
         let retirement_views: BTreeSet<_> = removed.union(&refreshed_ok).copied().collect();
         self.queue_inventory_retirements(&retirement_views, &stale, &departed, pending_views);
         for view in &retirement_views {
@@ -11189,6 +11757,7 @@ impl Engine {
             }
             let (retirement_changed, complete) = self.retire_loader_contexts(
                 *view,
+                &mut no_terminal_selection_handoffs,
                 session,
                 additions_allowed,
                 pending_views,
@@ -11623,6 +12192,7 @@ impl Engine {
                 return Err(error);
             }
         };
+        let fallback_due: BTreeSet<_> = self.pending_loader_scans.keys().copied().collect();
         let mut records = queued;
 
         let retained_pids: BTreeSet<_> = self.views.iter().map(ProcessView::pid).collect();
@@ -11669,6 +12239,26 @@ impl Engine {
         {
             changed |= terminal_changed;
         }
+        let fallback = self.service_pending_loader_scans(
+            fallback_due,
+            session,
+            &mut additions_allowed,
+            &mut pending_views,
+        )?;
+        changed |= fallback.changed();
+        if !fallback.required_complete() {
+            closure.fail();
+        }
+        if !pending_views.is_empty() {
+            changed |= self.process_discovery_records(
+                session,
+                &mut Vec::new(),
+                &mut pending_views,
+                &mut additions_allowed,
+                collect,
+                &mut closure,
+            )?;
+        }
         if self.pending_retirements.is_empty() && self.pending_rejected_keys.is_empty() {
             changed |= self.refresh_inventory(
                 session,
@@ -11712,16 +12302,6 @@ impl Engine {
 
     pub fn pinned(&self) -> &PinnedObjects {
         &self.pinned
-    }
-
-    /// Refresh the sticky pin-change flag; the per-call bool is consumed at
-    /// evidence time via `provider_changed`, so only an `fstat` failure
-    /// surfaces here.
-    pub(crate) fn check_pinned_unchanged(&self) -> anyhow::Result<()> {
-        self.pinned()
-            .check_unchanged()
-            .map(|_| ())
-            .map_err(anyhow::Error::msg)
     }
 
     pub fn discovery(&self) -> &render::DiscoveryEvidence {
@@ -11784,6 +12364,7 @@ impl Engine {
         let mut records = Vec::new();
         let mut pending_views = PendingViewRetirements::new();
         let mut closure = PauseClosure::new(true);
+        let mut no_terminal_selection_handoffs = TerminalSelectionHandoffs::new();
         if direct_stable && !self.loader_registry.ids_for_view(view).is_empty() {
             return Ok(DiscoveryBatchOutcome {
                 changed: false,
@@ -11793,6 +12374,7 @@ impl Engine {
         if !self.loader_registry.ids_for_view(view).is_empty() {
             let (_, complete) = self.retire_loader_contexts(
                 view,
+                &mut no_terminal_selection_handoffs,
                 session,
                 &mut additions_allowed,
                 &mut pending_views,
@@ -11854,6 +12436,7 @@ impl Engine {
                     policy,
                     pause_generation.take(),
                     ring_bytes,
+                    owned_child,
                 )
             }) {
                 Ok(session) => session,
@@ -11951,6 +12534,7 @@ impl Engine {
 #[cfg(test)]
 pub(crate) mod session_fixture {
     use super::*;
+    use crate::attach::attachment_admission;
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
 
@@ -11964,6 +12548,7 @@ pub(crate) mod session_fixture {
         counter_reads: Cell<u64>,
         pub(crate) detach_exports: Vec<DynamicExportIdentity>,
         pub(crate) detach_failed: bool,
+        detach_failures: Vec<String>,
         pub(crate) lifecycle_tracking_unavailable: Option<&'static str>,
         pub(crate) process_creation_tracking_unavailable: Option<&'static str>,
         pub(crate) detached: Vec<LoaderContextId>,
@@ -11979,7 +12564,10 @@ pub(crate) mod session_fixture {
         pub(crate) attached_slots: Vec<usize>,
         /// Dynamic exports requested by the Engine, in order.
         pub(crate) dynamic_attach_calls: Vec<DynamicExportIdentity>,
+        dynamic_export_links: Vec<(LoaderContextId, PinnedObjectId, u64, u64, HookAbi)>,
         pub(crate) dynamic_attach_reports_added: bool,
+        pub(crate) dynamic_loader_attach_calls: usize,
+        pub(crate) dynamic_loader_links: Vec<(LoaderContextId, PinnedObjectId, u64, u64)>,
         pub(crate) selection_table_read: Option<(MapEntry, ScannedTable)>,
         /// Killed and reaped from inside `attach_targets`, i.e. exactly between
         /// a generation precheck and its postcheck.
@@ -11989,6 +12577,7 @@ pub(crate) mod session_fixture {
         kill_on_dynamic_attach: Option<u32>,
         /// Refuses every `preflight_targets`, i.e. a pure preflight refusal.
         refuse_preflight: bool,
+        pub(crate) preflight_targets: RefCell<Vec<Vec<(u32, PinnedObjectId, u64)>>>,
     }
 
     /// SIGKILL plus `waitpid`, so the retained generation is provably gone
@@ -12090,15 +12679,17 @@ pub(crate) mod session_fixture {
             &mut self,
             view: &ProcessView,
             address: u64,
+            layout: LinuxLayout,
             budget: &mut CaptureWorkBudget,
         ) -> std::result::Result<(MapEntry, ScannedTable), ()> {
-            self.selection_table_read
-                .take()
-                .map_or_else(|| Engine::read_selection_table(view, address, budget), Ok)
+            self.selection_table_read.take().map_or_else(
+                || Engine::read_selection_table(view, address, layout, budget),
+                Ok,
+            )
         }
 
         fn detach_failures(&self) -> &[String] {
-            &[]
+            &self.detach_failures
         }
 
         fn lifecycle_tracking_unavailable(&self) -> Option<&str> {
@@ -12109,7 +12700,14 @@ pub(crate) mod session_fixture {
             self.process_creation_tracking_unavailable
         }
 
-        fn preflight_targets(&self, _: &[plan::Slot], _: &PinnedObjects) -> Result<()> {
+        fn preflight_targets(&self, targets: &[plan::Slot], _: &PinnedObjects) -> Result<()> {
+            self.preflight_targets.borrow_mut().push(
+                targets
+                    .iter()
+                    .map(|slot| (slot.index, slot.object, slot.file_offset))
+                    .collect(),
+            );
+            attachment_admission(&self.detach_failures, !targets.is_empty())?;
             if self.refuse_preflight {
                 bail!("scripted target preflight refused the candidate");
             }
@@ -12121,6 +12719,7 @@ pub(crate) mod session_fixture {
             slots: &[plan::Slot],
             _: &PinnedObjects,
         ) -> Result<TargetAttachResult> {
+            attachment_admission(&self.detach_failures, !slots.is_empty())?;
             self.attached_slots.push(slots.len());
             if let Some(pid) = self.kill_on_attach.take() {
                 kill_and_reap(pid);
@@ -12138,9 +12737,10 @@ pub(crate) mod session_fixture {
         fn replace_targets(
             &mut self,
             _: &mut plan::AttachPlan,
-            _: &[plan::Slot],
+            slots: &[plan::Slot],
             _: &PinnedObjects,
         ) -> Result<ReplacementAttachResult> {
+            attachment_admission(&self.detach_failures, !slots.is_empty())?;
             Ok((Vec::new(), false))
         }
 
@@ -12149,6 +12749,8 @@ pub(crate) mod session_fixture {
             self.detached_slot_indices
                 .push(slots.iter().map(|slot| slot.index).collect());
             if self.detach_slot_script.pop_front().unwrap_or(false) {
+                self.detach_failures
+                    .push("scripted one-shot slot detach failed".into());
                 bail!("scripted one-shot slot detach failed");
             }
             Ok(())
@@ -12156,28 +12758,30 @@ pub(crate) mod session_fixture {
 
         fn has_dynamic_export(
             &self,
-            _: LoaderContextId,
+            context: LoaderContextId,
             target: (PinnedObjectId, u64),
             cookie: u64,
             abi: HookAbi,
         ) -> bool {
-            self.dynamic_attach_calls.iter().any(|export| {
-                export.object == target.0
-                    && export.file_offset == target.1
-                    && export.cookie == cookie
-                    && export.abi == abi
-            })
+            self.dynamic_export_links
+                .contains(&(context, target.0, target.1, cookie, abi))
         }
 
         fn attach_dynamic_export(
             &mut self,
-            _: LoaderContextId,
+            context: LoaderContextId,
             pid: u32,
             target: (PinnedObjectId, u64),
             cookie: u64,
             abi: HookAbi,
             _: &PinnedObjects,
         ) -> Result<(bool, Option<u64>)> {
+            if self.has_dynamic_export(context, target, cookie, abi) {
+                return Ok((false, None));
+            }
+            attachment_admission(&self.detach_failures, true)?;
+            self.dynamic_export_links
+                .push((context, target.0, target.1, cookie, abi));
             self.dynamic_attach_calls.push(DynamicExportIdentity {
                 object: target.0,
                 file_offset: target.1,
@@ -12192,13 +12796,21 @@ pub(crate) mod session_fixture {
 
         fn attach_dynamic_loader(
             &mut self,
-            _: LoaderContextId,
+            context: LoaderContextId,
             _: u32,
-            _: PinnedObjectId,
-            _: u64,
-            _: u64,
+            object: PinnedObjectId,
+            file_offset: u64,
+            cookie: u64,
             _: &PinnedObjects,
         ) -> std::result::Result<bool, DynamicLoaderAttachFailure> {
+            let identity = (context, object, file_offset, cookie);
+            if self.dynamic_loader_links.contains(&identity) {
+                return Ok(false);
+            }
+            attachment_admission(&self.detach_failures, true)
+                .map_err(DynamicLoaderAttachFailure::Registry)?;
+            self.dynamic_loader_links.push(identity);
+            self.dynamic_loader_attach_calls += 1;
             Ok(false)
         }
 
@@ -12207,6 +12819,14 @@ pub(crate) mod session_fixture {
             context: LoaderContextId,
         ) -> (Vec<DynamicExportIdentity>, bool) {
             self.detached.push(context);
+            self.dynamic_export_links
+                .retain(|identity| identity.0 != context);
+            self.dynamic_loader_links
+                .retain(|identity| identity.0 != context);
+            if self.detach_failed {
+                self.detach_failures
+                    .push("scripted dynamic detach failed".into());
+            }
             (self.detach_exports.clone(), self.detach_failed)
         }
 
@@ -12255,7 +12875,7 @@ impl Engine {
                     virtual_address: 0x2100,
                     file_offset: 0x2100,
                 },
-                state: None,
+                state_address: None,
             })
             .expect("a preflighted loader context");
         let context = engine

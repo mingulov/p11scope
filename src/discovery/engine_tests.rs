@@ -3757,6 +3757,7 @@ fn capture_start_members_that_ended_are_not_losses() {
         max_events: None,
         ring_bytes: None,
         drain_interval: None,
+        max_scan_pids: None,
         unsafe_requested: false,
         allow_confined_uretprobe: false,
     };
@@ -3769,6 +3770,82 @@ fn capture_start_members_that_ended_are_not_losses() {
         "three members that ended before capture start are not three losses: {:?}",
         engine.plan().skipped
     );
+}
+
+/// Task 2 (cgroup-256 B1): the multi-process scan cap is a CLI-settable Engine
+/// field, not a hardcoded constant. Five live members with the cap at two: the
+/// initial pass scans exactly the first two and publishes a skip naming the
+/// effective value, and one refresh tick keeps exactly those two and
+/// republishes the bound.
+#[test]
+fn max_scan_pids_bounds_initial_scan_and_refresh() {
+    let mut children: Vec<_> = (0..5)
+        .map(|_| {
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    let pids: Vec<_> = children.iter().map(|child| child.id()).collect();
+    let dir = tempfile::tempdir().expect("a scope directory");
+    let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
+    std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
+    let args = CaptureArgs {
+        kind: crate::cli::Kind::Profile,
+        modules: vec![],
+        manifests: vec![],
+        hooks: HookRegistry::builtin(),
+        scope: crate::cli::ScopeArg::Cgroup(dir.path().to_path_buf()),
+        metrics: false,
+        duration: None,
+        out: None,
+        max_events: None,
+        ring_bytes: None,
+        drain_interval: None,
+        max_scan_pids: Some(2),
+        unsafe_requested: false,
+        allow_confined_uretprobe: false,
+    };
+    let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
+
+    let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
+    assert_eq!(engine.max_scan_pids, 2);
+    assert_eq!(
+        engine.views.len(),
+        2,
+        "the initial scan covers exactly the first two members"
+    );
+    assert!(
+        engine
+            .base_counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.reason.contains("scanned the first 2")),
+        "the initial skip names the effective value: {:?}",
+        engine.base_counters.object_skips
+    );
+
+    refresh_inventory_once(&mut engine);
+    assert_eq!(
+        engine.views.len(),
+        2,
+        "one refresh tick keeps exactly the capped set"
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.reason.contains("scanned the first 2")),
+        "the refresh skip names the effective value: {:?}",
+        engine.counters.object_skips
+    );
+
+    for child in &mut children {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
 }
 
 /// Task 9.2b defect D, second half. A discovery record can only be resolved

@@ -56,6 +56,7 @@ fn engine_initial_discovery_preserves_plan() {
         duration: None,
         out: None,
         max_events: None,
+        max_scan_pids: None,
         ring_bytes: None,
         drain_interval: None,
         unsafe_requested: false,

@@ -308,6 +308,13 @@ over an NSS dependency cascade: SIGTERM ignored, SIGKILL required; see the
 provider-qual note's gaps section). Prefer `--pause never` with `LD_PRELOAD` for
 dependency-heavy targets until that gap is fixed.
 
+A `--cgroup` capture scans at most 256 members per pass, lowest PIDs first;
+past that, the first 256 are scanned and the capture publishes a skip naming
+the bound (a provider mapped only past the cap is never discovered).
+`--max-scan-pids <n>` sets the cap:
+
+sudo p11scope profile --cgroup /sys/fs/cgroup/... --max-scan-pids 512 --duration 60 -o observed-profile.json
+
 For cgroup event captures, `task/task_newtask` records ordinary non-thread
 creation as a semantic hint and may preserve the parent's proven state while
 the child is refreshed; the creator event itself does not increment
@@ -585,8 +592,9 @@ objects. Separately, one capture-wide 512 MiB attempted-I/O budget covers
 memory scanning and scan-sourced file hashing across every selected process,
 retry, and failed pin, with 64 MiB per scan/hash operation. Decoding stops at
 512 accepted table candidates, 53,248 table entries, and 512 interface records;
-cgroup discovery considers at most 256 members and planning has 512 attach
-slots. Every bounded omission forces `PARTIAL`; no retry renews a budget.
+cgroup discovery considers at most 256 members by default (`--max-scan-pids`)
+and planning has 512 attach slots. Every bounded omission forces `PARTIAL`;
+no retry renews a budget.
 
 An optional manifest's missing or identity-mismatched object is ignored only
 after one exact scan-opened table for that object covers every dropped claim

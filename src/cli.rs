@@ -31,6 +31,8 @@ pub struct CaptureArgs {
     pub duration: Option<Duration>,
     pub out: Option<PathBuf>,
     pub max_events: Option<u64>,
+    /// `--max-scan-pids`: cgroup members scanned per pass; None ⇒ 256 default.
+    pub max_scan_pids: Option<usize>,
     /// `--ring-bytes`: EVENTS ringbuf size override; None ⇒ 256 KiB default.
     pub ring_bytes: Option<u32>,
     /// `--drain-interval-ms`: capture-loop tick override; None ⇒ per-mode default.
@@ -66,6 +68,8 @@ pub struct RunArgs {
     pub duration: Option<Duration>,
     pub out: Option<PathBuf>,
     pub max_events: Option<u64>,
+    /// `--max-scan-pids`: cgroup members scanned per pass; None ⇒ 256 default.
+    pub max_scan_pids: Option<usize>,
     /// `--ring-bytes`: EVENTS ringbuf size override; None ⇒ 256 KiB default.
     pub ring_bytes: Option<u32>,
     /// `--drain-interval-ms`: capture-loop tick override; None ⇒ per-mode default.
@@ -120,6 +124,7 @@ pub const USAGE: &str = "usage:
                    [--unsafe-unvalidated-metadata]
                    [--allow-uretprobe-on-confined-target]
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>]
+                   [--max-scan-pids <n>]
   p11scope trace   [same scope and discovery options] [--duration <…>] [--max-events <n>] [-o <out.file>]
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>]
   p11scope run     [same discovery options] [--mode profile|metrics | --trace] [--duration <…>]
@@ -201,6 +206,7 @@ struct Common {
     duration: Option<Duration>,
     out: Option<PathBuf>,
     max_events: Option<u64>,
+    max_scan_pids: Option<usize>,
     ring_bytes: Option<u32>,
     drain_interval: Option<Duration>,
     unsafe_requested: bool,
@@ -263,6 +269,16 @@ fn capture_option(
                 return Err(usage_err("--max-events must be greater than zero"));
             }
             common.max_events = Some(value);
+        }
+        "--max-scan-pids" => {
+            let v = require_value(args, "--max-scan-pids")?;
+            let value = v
+                .parse::<usize>()
+                .map_err(|_| usage_err(format!("--max-scan-pids: invalid number {v:?}")))?;
+            if value == 0 {
+                return Err(usage_err("--max-scan-pids must be greater than zero"));
+            }
+            common.max_scan_pids = Some(value);
         }
         "--ring-bytes" => {
             let v = require_value(args, "--ring-bytes")?;
@@ -408,6 +424,7 @@ pub fn parse_capture(
         duration: common.duration,
         out: common.out,
         max_events: common.max_events,
+        max_scan_pids: common.max_scan_pids,
         ring_bytes: common.ring_bytes,
         drain_interval: common.drain_interval,
         unsafe_requested: common.unsafe_requested,
@@ -482,6 +499,7 @@ fn parse_run(mut args: impl Iterator<Item = String>) -> Result<RunArgs, CliError
         duration: common.duration,
         out: common.out,
         max_events: common.max_events,
+        max_scan_pids: common.max_scan_pids,
         ring_bytes: common.ring_bytes,
         drain_interval: common.drain_interval,
         unsafe_requested: common.unsafe_requested,
@@ -734,6 +752,49 @@ mod tests {
             parse_capture(Kind::Trace, args(&["--pid", "1", "--max-events", "0"])),
             Err(CliError::Usage(m)) if m.contains("must be greater than zero")
         ));
+    }
+
+    #[test]
+    fn max_scan_pids_is_an_optional_shared_capture_bound() {
+        let Command::Profile(a) = parse(args(&[
+            "profile",
+            "--cgroup",
+            "/x",
+            "--max-scan-pids",
+            "64",
+        ]))
+        .unwrap() else {
+            panic!("expected profile")
+        };
+        assert_eq!(a.max_scan_pids, Some(64));
+        let Command::Profile(bare) = parse(args(&["profile", "--cgroup", "/x"])).unwrap() else {
+            panic!("expected profile")
+        };
+        assert_eq!(bare.max_scan_pids, None);
+        // A shared capture option, like --ring-bytes: trace and run take it too.
+        let Command::Trace(t) =
+            parse(args(&["trace", "--pid", "42", "--max-scan-pids", "64"])).unwrap()
+        else {
+            panic!("expected trace")
+        };
+        assert_eq!(t.max_scan_pids, Some(64));
+        let Command::Run(r) = parse(args(&["run", "--max-scan-pids", "64", "--", "true"])).unwrap()
+        else {
+            panic!("expected run")
+        };
+        assert_eq!(r.max_scan_pids, Some(64));
+        assert!(matches!(
+            parse(args(&["profile", "--pid", "42", "--max-scan-pids", "x"])),
+            Err(CliError::Usage(m)) if m.contains("invalid number")
+        ));
+        assert!(matches!(
+            parse(args(&["profile", "--pid", "42", "--max-scan-pids", "0"])),
+            Err(CliError::Usage(m)) if m.contains("must be greater than zero")
+        ));
+        assert!(
+            USAGE.contains("--max-scan-pids"),
+            "help names the scan cap flag"
+        );
     }
 
     #[test]

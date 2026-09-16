@@ -68,6 +68,8 @@ pub struct Engine {
     base_counters: DiscoveryCounters,
     budget: CaptureWorkBudget,
     next_view_id: u32,
+    /// `--max-scan-pids`: how many scope members each scan pass covers.
+    pub max_scan_pids: usize,
     loader_registry: LoaderRegistry,
     terminal_batch: Option<TerminalBatch>,
     terminal_journal: Option<TerminalJournal>,
@@ -3373,19 +3375,21 @@ fn discover_plan(
     discovered.scope = scope.clone();
     discovered.hooks = a.hooks.clone();
     discovered.module_hints = a.modules.clone();
+    discovered.max_scan_pids = a.max_scan_pids.unwrap_or(MAX_SCAN_PIDS);
     let (pids, unlisted) = scope_pids(scope);
     attribution::note_all(&unlisted);
     discovered.base_counters.object_skips.extend(unlisted);
     // The pid the operator named is the capture; a cgroup's processes are many,
     // however few happen to be in it right now.
     let named = matches!(scope, Scope::Pid(_));
-    if pids.len() > MAX_SCAN_PIDS {
+    let max_scan_pids = discovered.max_scan_pids;
+    if pids.len() > max_scan_pids {
         // Published, not just noted: a provider mapped only by a process past the
         // cap is undiscovered, unprobed, and has nothing else to show for it.
         let skipped = Skipped {
             subject: scope_label(scope),
             reason: format!(
-                "{} processes in scope; discovery scanned the first {MAX_SCAN_PIDS} — a \
+                "{} processes in scope; discovery scanned the first {max_scan_pids} — a \
                  provider mapped only by one of the rest was never discovered",
                 pids.len()
             ),
@@ -3393,7 +3397,7 @@ fn discover_plan(
         attribution::note(&skipped);
         discovered.base_counters.object_skips.push(skipped);
     }
-    for pid in pids.iter().take(MAX_SCAN_PIDS) {
+    for pid in pids.iter().take(max_scan_pids) {
         let opened = if named {
             named_view
                 .take()
@@ -5837,6 +5841,7 @@ impl Engine {
             base_counters: DiscoveryCounters::default(),
             budget: CaptureWorkBudget::default(),
             next_view_id: 0,
+            max_scan_pids: MAX_SCAN_PIDS,
             loader_registry: LoaderRegistry::default(),
             terminal_batch: None,
             terminal_journal: None,
@@ -11569,17 +11574,18 @@ impl Engine {
             }
         }
         let (pids, mut skipped) = scope_pids(&self.scope);
-        let membership_complete = skipped.is_empty() && pids.len() <= MAX_SCAN_PIDS;
-        if pids.len() > MAX_SCAN_PIDS {
+        let max_scan_pids = self.max_scan_pids;
+        let membership_complete = skipped.is_empty() && pids.len() <= max_scan_pids;
+        if pids.len() > max_scan_pids {
             skipped.push(Skipped {
                 subject: scope_label(&self.scope),
                 reason: format!(
-                    "{} processes in scope; live discovery scanned the first {MAX_SCAN_PIDS}",
+                    "{} processes in scope; live discovery scanned the first {max_scan_pids}",
                     pids.len()
                 ),
             });
         }
-        let desired: BTreeSet<_> = pids.into_iter().take(MAX_SCAN_PIDS).collect();
+        let desired: BTreeSet<_> = pids.into_iter().take(max_scan_pids).collect();
         let membership_authoritative =
             membership_complete && matches!(self.scope, Scope::Cgroup { .. });
         let retirement_causes: BTreeMap<_, _> = self

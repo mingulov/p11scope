@@ -27,6 +27,7 @@ fn paused_run(pause: PausePolicy, marker: &Path) -> RunArgs {
         duration: None,
         out: None,
         max_events: None,
+        max_scan_pids: None,
         ring_bytes: None,
         drain_interval: None,
         unsafe_requested: false,

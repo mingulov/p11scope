@@ -12564,6 +12564,17 @@ fn scope_refresh_uses_engine_owned_scope_and_monotonic_view_ids() {
     assert_eq!(engine.next_view_id, MAX_SCAN_PIDS as u32);
 }
 
+#[test]
+fn retired_view_ids_are_reused_for_new_generations() {
+    let mut engine = Engine::empty();
+    engine.next_view_id = MAX_SCAN_PIDS as u32;
+    assert!(engine.allocate_view_id().is_err());
+    engine.release_view_id(ProcessViewId(7));
+    let reused = engine.allocate_view_id().unwrap();
+    assert_eq!(reused, ProcessViewId(7));
+    assert!(engine.allocate_view_id().is_err());
+}
+
 fn current_mount_namespace() -> crate::process::MountNamespaceId {
     let metadata = std::fs::metadata("/proc/self/ns/mnt").unwrap();
     crate::process::MountNamespaceId {

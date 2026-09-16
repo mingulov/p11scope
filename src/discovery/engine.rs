@@ -68,6 +68,9 @@ pub struct Engine {
     base_counters: DiscoveryCounters,
     budget: CaptureWorkBudget,
     next_view_id: u32,
+    /// Retired live-view IDs available for reuse. Allocation pops before
+    /// minting, so only simultaneously live views count against the ceiling.
+    retired_view_ids: Vec<u32>,
     /// `--max-scan-pids`: how many scope members each scan pass covers.
     max_scan_pids: usize,
     loader_registry: LoaderRegistry,
@@ -4723,6 +4726,7 @@ fn remove_stale_views(discovered: &mut Engine, stale: &[ProcessViewId]) -> Resul
         bail!("lifecycle check did not identify an accepted process view");
     }
     for view in stale {
+        discovered.release_view_id(view);
         discovered.scan_inputs.remove(&view);
         let skipped = Skipped {
             subject: "process view".into(),
@@ -5424,6 +5428,7 @@ fn commit_cleaned_candidate_identity(
 ) {
     candidate.pinned = pinned;
     candidate.modules = modules;
+    // No release_view_id here: candidate.views is scratch; the live views stay retained by the engine.
     candidate.views.retain(|view| !stale_views.contains(view));
     let module_objects: BTreeSet<_> = candidate
         .plan
@@ -5841,6 +5846,7 @@ impl Engine {
             base_counters: DiscoveryCounters::default(),
             budget: CaptureWorkBudget::default(),
             next_view_id: 0,
+            retired_view_ids: Vec::new(),
             max_scan_pids: MAX_SCAN_PIDS,
             loader_registry: LoaderRegistry::default(),
             terminal_batch: None,
@@ -6321,6 +6327,9 @@ impl Engine {
     }
 
     fn allocate_view_id(&mut self) -> Result<ProcessViewId> {
+        if let Some(reused) = self.retired_view_ids.pop() {
+            return Ok(ProcessViewId(reused));
+        }
         if self.next_view_id as usize >= MAX_SCAN_PIDS {
             bail!("capture process-view capacity {MAX_SCAN_PIDS} is exhausted");
         }
@@ -6330,6 +6339,15 @@ impl Engine {
             .checked_add(1)
             .ok_or_else(|| anyhow!("process view ID space exhausted"))?;
         Ok(id)
+    }
+
+    fn release_view_id(&mut self, id: ProcessViewId) {
+        debug_assert!(
+            !self.retired_view_ids.contains(&id.0),
+            "process view ID {} released twice",
+            id.0
+        );
+        self.retired_view_ids.push(id.0);
     }
 
     fn retain_view_id(&mut self, id: ProcessViewId) -> Result<()> {
@@ -11366,7 +11384,11 @@ impl Engine {
                 if cause == RetirementCause::ExpectedRemoval {
                     self.close_cgroup_admission_at_removal(view);
                     self.settle_leader_exits_at_removal([view]);
+                    let retained = self.views.len();
                     self.views.retain(|candidate| candidate.id() != view);
+                    if self.views.len() != retained {
+                        self.release_view_id(view);
+                    }
                     self.scan_inputs.remove(&view);
                     self.arm_expected_target_exit(view);
                 }
@@ -11885,7 +11907,16 @@ impl Engine {
             }
             self.close_cgroup_admissions_at_removal(&removed);
             self.settle_leader_exits_at_removal(removed.iter().copied());
+            let released: Vec<_> = self
+                .views
+                .iter()
+                .map(ProcessView::id)
+                .filter(|id| removed.contains(id))
+                .collect();
             self.views.retain(|view| !removed.contains(&view.id()));
+            for id in released {
+                self.release_view_id(id);
+            }
             for view in removed.iter().chain(&refreshed_ok) {
                 self.scan_inputs.remove(view);
             }
@@ -11958,7 +11989,16 @@ impl Engine {
             .retain(|pid| failed_refresh_pids.contains(pid));
         self.close_cgroup_admissions_at_removal(&removed);
         self.settle_leader_exits_at_removal(removed.iter().copied());
+        let released: Vec<_> = self
+            .views
+            .iter()
+            .map(ProcessView::id)
+            .filter(|id| removed.contains(id))
+            .collect();
         self.views.retain(|view| !removed.contains(&view.id()));
+        for id in released {
+            self.release_view_id(id);
+        }
         for view in removed.iter().chain(&refreshed_ok) {
             self.scan_inputs.remove(view);
         }

@@ -3774,9 +3774,11 @@ fn capture_start_members_that_ended_are_not_losses() {
 
 /// Task 2 (cgroup-256 B1): the multi-process scan cap is a CLI-settable Engine
 /// field, not a hardcoded constant. Five live members with the cap at two: the
-/// initial pass scans exactly the first two and publishes a skip naming the
-/// effective value, and one refresh tick keeps exactly those two and
-/// republishes the bound.
+/// initial pass scans at most two and publishes a skip naming the effective
+/// value, and one refresh tick keeps exactly that selected set and
+/// republishes the bound. (Task 4: identical members share one provider
+/// group, so five `sleep`s deep-scan as one representative — the bound is an
+/// upper bound now, not a pid-order head-take.)
 #[test]
 fn max_scan_pids_bounds_initial_scan_and_refresh() {
     let mut children: Vec<_> = (0..5)
@@ -3811,10 +3813,10 @@ fn max_scan_pids_bounds_initial_scan_and_refresh() {
 
     let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
     assert_eq!(engine.max_scan_pids, 2);
-    assert_eq!(
-        engine.views.len(),
-        2,
-        "the initial scan covers exactly the first two members"
+    assert!(
+        (1..=2).contains(&engine.views.len()),
+        "the initial scan covers at most the capped count (identical members share one representative): {}",
+        engine.views.len()
     );
     assert!(
         engine
@@ -3826,11 +3828,12 @@ fn max_scan_pids_bounds_initial_scan_and_refresh() {
         engine.base_counters.object_skips
     );
 
+    let initial: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
     refresh_inventory_once(&mut engine);
+    let kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
     assert_eq!(
-        engine.views.len(),
-        2,
-        "one refresh tick keeps exactly the capped set"
+        kept, initial,
+        "one refresh tick keeps exactly the selected set"
     );
     assert!(
         engine
@@ -15691,4 +15694,30 @@ fn identical_table_in_two_batches_burns_one_candidate() {
         candidates_after_first,
         "the second identical table must not burn another candidate"
     );
+}
+
+/// Fix C: phase-1 selection prefers rare providers over pid order, so a
+/// just-started high-pid provider is deep-scanned instead of truncated away.
+/// Under the cap the selection is the identity (today's exact order).
+#[test]
+fn candidate_selection_prefers_rare_providers_over_pid_order() {
+    fn map_entry(path: &str, inode: u64) -> MapEntry {
+        MapEntry {
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            permissions: *b"r-xp",
+            device: Device { major: 8, minor: 1 },
+            inode,
+            raw_path: Some(path.as_bytes().to_vec()),
+        }
+    }
+    let sweep: Vec<(u32, Vec<MapEntry>)> = vec![
+        (7, vec![map_entry("/usr/lib/libp11-kit.so", 9)]),
+        (8, vec![map_entry("/usr/lib/libp11-kit.so", 9)]),
+        (9001, vec![map_entry("/tmp/uniq-p11.so", 10)]),
+    ];
+    assert_eq!(select_deep_scan_candidates(&sweep, 1), vec![9001]);
+    assert_eq!(select_deep_scan_candidates(&sweep, 2), vec![9001, 7]);
+    assert_eq!(select_deep_scan_candidates(&sweep, 3), vec![7, 8, 9001]);
 }

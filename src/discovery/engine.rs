@@ -3367,6 +3367,72 @@ fn scan_and_pin_with(
     Ok((modules, pinned))
 }
 
+/// A mapping that can carry a PKCS#11 provider: a mapped file whose path
+/// names a shared object. Pure so phase-1 selection can group pids without
+/// decoding anything.
+fn is_provider_mapping(entry: &MapEntry) -> bool {
+    entry.inode != 0
+        && entry
+            .raw_path
+            .as_ref()
+            .is_some_and(|path| path.windows(3).any(|window| window == b".so"))
+}
+
+/// Phase 2 of the two-phase scan: choose which swept pids earn a deep scan.
+/// Under the cap this is the identity (all pids ascending — today's exact
+/// order); over the cap each provider group sends its lowest pid, rarest
+/// providers first, and pids with no provider mapping trail as individuals.
+fn select_deep_scan_candidates(sweep: &[(u32, Vec<MapEntry>)], max_pids: usize) -> Vec<u32> {
+    if sweep.len() <= max_pids {
+        let mut pids: Vec<u32> = sweep.iter().map(|(pid, _)| *pid).collect();
+        pids.sort_unstable();
+        return pids;
+    }
+    let mut groups: BTreeMap<BTreeSet<ObjectKey>, Vec<u32>> = BTreeMap::new();
+    let mut unmapped: Vec<u32> = Vec::new();
+    for (pid, entries) in sweep {
+        let key: BTreeSet<ObjectKey> = entries
+            .iter()
+            .filter(|entry| is_provider_mapping(entry))
+            .map(ObjectKey::of)
+            .collect();
+        if key.is_empty() {
+            unmapped.push(*pid);
+        } else {
+            groups.entry(key).or_default().push(*pid);
+        }
+    }
+    let mut ordered: Vec<Vec<u32>> = groups.into_values().collect();
+    for members in &mut ordered {
+        members.sort_unstable();
+    }
+    ordered.sort_by_key(|members| (members.len(), members[0]));
+    unmapped.sort_unstable();
+    ordered
+        .into_iter()
+        .map(|members| members[0])
+        .chain(unmapped)
+        .take(max_pids)
+        .collect()
+}
+
+/// Phase 1 of the two-phase scan: read every in-scope pid's maps snapshot.
+/// Cheap by construction — bounded read plus parse only, no decode, no view
+/// allocation. A pid whose maps cannot be read keeps its place with an empty
+/// entry list, so selection still sees every in-scope pid and the deep path
+/// publishes the loss exactly as today.
+fn sweep_process_maps(pids: &[u32], budget: &mut CaptureWorkBudget) -> Vec<(u32, Vec<MapEntry>)> {
+    pids.iter()
+        .map(|&pid| {
+            let entries = std::fs::File::open(format!("/proc/{pid}/maps"))
+                .map_err(|error| error.to_string())
+                .and_then(|maps| read_maps_or_refuse(maps, budget, crate::attach::monotonic_ns))
+                .unwrap_or_default();
+            (pid, entries)
+        })
+        .collect()
+}
+
 /// Discovery for one capture: scan the scope, read and corroborate any manifests,
 /// merge into one plan, pin every object, and record how all of it was found.
 fn discover_plan(
@@ -3400,7 +3466,16 @@ fn discover_plan(
         attribution::note(&skipped);
         discovered.base_counters.object_skips.push(skipped);
     }
-    for pid in pids.iter().take(max_scan_pids) {
+    // Two-phase scan: phase 1 sweeps every in-scope pid's maps, phase 2
+    // deep-scans the selected candidates only. Under the cap selection is
+    // the identity, so the sweep (and its budget charge) is skipped there.
+    let selected = if pids.len() > max_scan_pids {
+        let sweep = sweep_process_maps(&pids, &mut discovered.budget);
+        select_deep_scan_candidates(&sweep, max_scan_pids)
+    } else {
+        pids.clone()
+    };
+    for pid in selected.iter() {
         let opened = if named {
             named_view
                 .take()
@@ -11607,7 +11682,19 @@ impl Engine {
                 ),
             });
         }
-        let desired: BTreeSet<_> = pids.into_iter().take(max_scan_pids).collect();
+        // Two-phase scan: phase 1 sweeps every in-scope pid's maps, phase 2
+        // deep-scans the selected candidates only. Under the cap selection is
+        // the identity, so the sweep (and its per-tick budget charge) is
+        // skipped there; over the cap membership is not authoritative, so
+        // narrowing `desired` only narrows which new pids get deep-scanned.
+        let desired: BTreeSet<_> = if pids.len() > max_scan_pids {
+            let sweep = sweep_process_maps(&pids, &mut self.budget);
+            select_deep_scan_candidates(&sweep, max_scan_pids)
+                .into_iter()
+                .collect()
+        } else {
+            pids.into_iter().collect()
+        };
         let membership_authoritative =
             membership_complete && matches!(self.scope, Scope::Cgroup { .. });
         let retirement_causes: BTreeMap<_, _> = self

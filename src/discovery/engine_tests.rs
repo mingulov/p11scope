@@ -3851,6 +3851,100 @@ fn max_scan_pids_bounds_initial_scan_and_refresh() {
     }
 }
 
+/// Task 3 (cgroup-256 A2): with an exhausted view-ID space, allocation
+/// failure degrades to evidence, never fatal. Two members admitted at cap
+/// two, then a third member arrives: the refresh tick returns `Ok`, keeps
+/// the admitted views, and publishes the standard skip naming the effective
+/// value. (The initial-scan path is unreachable post-Task-2 — fresh engine
+/// plus a matching ceiling — so the refresh tick carries the behavioral
+/// coverage; the shape test below pins the defensive initial-scan sites.)
+#[test]
+fn id_exhaustion_publishes_skip_instead_of_failing() {
+    let mut children: Vec<_> = (0..2)
+        .map(|_| {
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    let mut pids: Vec<_> = children.iter().map(|child| child.id()).collect();
+    let dir = tempfile::tempdir().expect("a scope directory");
+    let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
+    std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
+    let args = CaptureArgs {
+        kind: crate::cli::Kind::Profile,
+        modules: vec![],
+        manifests: vec![],
+        hooks: HookRegistry::builtin(),
+        scope: crate::cli::ScopeArg::Cgroup(dir.path().to_path_buf()),
+        metrics: false,
+        duration: None,
+        out: None,
+        max_events: None,
+        ring_bytes: None,
+        drain_interval: None,
+        max_scan_pids: Some(2),
+        unsafe_requested: false,
+        allow_confined_uretprobe: false,
+    };
+    let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
+
+    let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
+    assert_eq!(engine.views.len(), 2, "both members admitted at cap two");
+    let admitted: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
+
+    // A third member arrives after admission: its provider group differs
+    // from the sleeps', so selection names it a candidate and allocation —
+    // with both IDs spent — exhausts.
+    pids.push(std::process::id());
+    let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
+    std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
+    refresh_inventory_once(&mut engine);
+
+    let kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
+    assert_eq!(kept, admitted, "exhaustion keeps the admitted views");
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "process view"
+                && skip.reason
+                    == "capture process-view capacity 2 was exhausted; remaining generations were not scanned"
+        }),
+        "exhaustion publishes the standard skip with the effective value: {:?}",
+        engine.counters.object_skips
+    );
+
+    for child in &mut children {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+}
+
+/// Task 3 (cgroup-256 A2): `discover_plan` must not fatally propagate
+/// view-ID allocation failure. The two `?` sites are defensive (unreachable
+/// post-Task-2: fresh engine, matching ceiling); this pins them as
+/// skip+break so a future ceiling drift degrades instead of killing the
+/// capture.
+#[test]
+fn discover_plan_has_no_fatal_allocation() {
+    let source = include_str!("engine.rs");
+    let plan = source
+        .split_once("fn discover_plan(")
+        .unwrap()
+        .1
+        .split_once("fn build_current_plan(")
+        .unwrap()
+        .0;
+    assert!(
+        !plan.contains("allocate_view_id()?"),
+        "discover_plan must degrade allocation failure to a skip, not `?`"
+    );
+    assert!(
+        !plan.contains("retain_view_id(view.id())?"),
+        "discover_plan must degrade retain failure to a skip, not `?`"
+    );
+}
+
 /// Task 9.2b defect D, second half. A discovery record can only be resolved
 /// against the address space it came from, and a `--cgroup` capture's
 /// forked children make their calls and exit while their records are still

@@ -3482,7 +3482,21 @@ fn discover_plan(
                 .filter(|view| view.pid() == *pid)
                 .ok_or_else(|| "named process view was not retained from scope resolution".into())
         } else {
-            ProcessView::open(discovered.allocate_view_id()?, *pid)
+            let id = match discovered.allocate_view_id() {
+                Ok(id) => id,
+                Err(_) => {
+                    let skipped = Skipped {
+                        subject: "process view".into(),
+                        reason: format!(
+                            "capture process-view capacity {max_scan_pids} was exhausted; remaining generations were not scanned"
+                        ),
+                    };
+                    attribution::note(&skipped);
+                    discovered.base_counters.object_skips.push(skipped);
+                    break;
+                }
+            };
+            ProcessView::open(id, *pid)
         };
         let view = match opened {
             Ok(view) => view,
@@ -3499,7 +3513,17 @@ fn discover_plan(
                 continue;
             }
         };
-        discovered.retain_view_id(view.id())?;
+        if discovered.retain_view_id(view.id()).is_err() {
+            let skipped = Skipped {
+                subject: "process view".into(),
+                reason: format!(
+                    "capture process-view capacity {max_scan_pids} was exhausted; remaining generations were not scanned"
+                ),
+            };
+            attribution::note(&skipped);
+            discovered.base_counters.object_skips.push(skipped);
+            break;
+        }
         let mut counters = DiscoveryCounters::default();
         match scan_and_pin(
             &view,
@@ -11758,7 +11782,7 @@ impl Engine {
                     skipped.push(Skipped {
                         subject: "process view".into(),
                         reason: format!(
-                            "capture process-view capacity {MAX_SCAN_PIDS} was exhausted; remaining generations were not scanned"
+                            "capture process-view capacity {max_scan_pids} was exhausted; remaining generations were not scanned"
                         ),
                     });
                     break;

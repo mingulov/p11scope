@@ -3402,15 +3402,31 @@ fn select_deep_scan_candidates(sweep: &[(u32, Vec<MapEntry>)], max_pids: usize) 
             groups.entry(key).or_default().push(*pid);
         }
     }
-    let mut ordered: Vec<Vec<u32>> = groups.into_values().collect();
-    for members in &mut ordered {
+    // File-level rarity: over the whole sweep, how many pids map each file.
+    // Each group member maps the group's whole key set, so every member adds
+    // one to each of its keys.
+    let mut census: BTreeMap<ObjectKey, usize> = BTreeMap::new();
+    for (key, members) in &groups {
+        for file in key {
+            *census.entry(*file).or_default() += members.len();
+        }
+    }
+    let mut ordered: Vec<(BTreeSet<ObjectKey>, Vec<u32>)> = groups.into_iter().collect();
+    for (_, members) in &mut ordered {
         members.sort_unstable();
     }
-    ordered.sort_by_key(|members| (members.len(), members[0]));
+    ordered.sort_by_key(|(key, members)| {
+        let min_global = key
+            .iter()
+            .map(|file| census[file])
+            .min()
+            .unwrap_or(usize::MAX);
+        (min_global, members.len(), members[0])
+    });
     unmapped.sort_unstable();
     ordered
         .into_iter()
-        .map(|members| members[0])
+        .map(|(_, members)| members[0])
         .chain(unmapped)
         .take(max_pids)
         .collect()

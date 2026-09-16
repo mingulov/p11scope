@@ -15827,3 +15827,98 @@ fn candidate_selection_prefers_rare_providers_over_pid_order() {
     assert_eq!(select_deep_scan_candidates(&sweep, 2), vec![9001, 7]);
     assert_eq!(select_deep_scan_candidates(&sweep, 3), vec![7, 8, 9001]);
 }
+
+/// A4 Task 1: file-level rarity beats pid order — a high-pid singleton mapping
+/// a globally-unique file sorts before a low-pid singleton whose files are all
+/// widely mapped. (Set-level rarity ties both at len 1 and the low pid wins.)
+#[test]
+fn globally_rare_file_sorts_before_common_singletons() {
+    fn map_entry(path: &str, inode: u64) -> MapEntry {
+        MapEntry {
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            permissions: *b"r-xp",
+            device: Device { major: 8, minor: 1 },
+            inode,
+            raw_path: Some(path.as_bytes().to_vec()),
+        }
+    }
+    let mut sweep: Vec<(u32, Vec<MapEntry>)> = Vec::new();
+    // 200 pids mapping only the widely-shared provider A.
+    for pid in 100..300u32 {
+        sweep.push((pid, vec![map_entry("/usr/lib/common-a.so", 1)]));
+    }
+    // 55 pids mapping only the widely-shared provider B.
+    for pid in 300..355u32 {
+        sweep.push((pid, vec![map_entry("/usr/lib/common-b.so", 2)]));
+    }
+    // Low-pid singleton whose set is unique but every file is widely mapped
+    // (A: 201 pids, B: 56 pids).
+    sweep.push((
+        7,
+        vec![
+            map_entry("/usr/lib/common-a.so", 1),
+            map_entry("/usr/lib/common-b.so", 2),
+        ],
+    ));
+    // High-pid singleton mapping one globally-unique file.
+    sweep.push((9001, vec![map_entry("/tmp/uniq-p11.so", 3)]));
+    assert_eq!(sweep.len(), 257);
+    let selected = select_deep_scan_candidates(&sweep, 256);
+    assert_eq!(&selected[..2], &[9001, 7]);
+}
+
+/// A4 Task 1: equal file-rarity keeps today's (group len, lowest pid) order.
+#[test]
+fn tie_break_stays_len_then_lowest_pid() {
+    fn map_entry(path: &str, inode: u64) -> MapEntry {
+        MapEntry {
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            permissions: *b"r-xp",
+            device: Device { major: 8, minor: 1 },
+            inode,
+            raw_path: Some(path.as_bytes().to_vec()),
+        }
+    }
+    // Every file is mapped by exactly 2 pids, so every group has
+    // min-global-count 2 and the order falls through to (len, lowest pid).
+    let sweep: Vec<(u32, Vec<MapEntry>)> = vec![
+        (30, vec![map_entry("/usr/lib/liba.so", 11)]),
+        (31, vec![map_entry("/usr/lib/liba.so", 11)]),
+        (40, vec![map_entry("/usr/lib/libb.so", 12)]),
+        (
+            41,
+            vec![
+                map_entry("/usr/lib/libb.so", 12),
+                map_entry("/usr/lib/libc.so", 13),
+            ],
+        ),
+        (42, vec![map_entry("/usr/lib/libc.so", 13)]),
+    ];
+    assert_eq!(select_deep_scan_candidates(&sweep, 4), vec![40, 41, 42, 30]);
+}
+
+/// A4 Task 1: the under-cap identity path is untouched — pids ascending.
+#[test]
+fn under_cap_order_unchanged() {
+    fn map_entry(path: &str, inode: u64) -> MapEntry {
+        MapEntry {
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            permissions: *b"r-xp",
+            device: Device { major: 8, minor: 1 },
+            inode,
+            raw_path: Some(path.as_bytes().to_vec()),
+        }
+    }
+    let sweep: Vec<(u32, Vec<MapEntry>)> = vec![
+        (9001, vec![map_entry("/tmp/uniq-p11.so", 10)]),
+        (7, vec![map_entry("/usr/lib/libp11-kit.so", 9)]),
+    ];
+    assert_eq!(select_deep_scan_candidates(&sweep, 2), vec![7, 9001]);
+    assert_eq!(select_deep_scan_candidates(&sweep, 256), vec![7, 9001]);
+}

@@ -6405,8 +6405,9 @@ impl Engine {
         if let Some(reused) = self.retired_view_ids.pop() {
             return Ok(ProcessViewId(reused));
         }
-        if self.next_view_id as usize >= MAX_SCAN_PIDS {
-            bail!("capture process-view capacity {MAX_SCAN_PIDS} is exhausted");
+        if self.next_view_id as usize >= self.max_scan_pids {
+            let max_scan_pids = self.max_scan_pids;
+            bail!("capture process-view capacity {max_scan_pids} is exhausted");
         }
         let id = ProcessViewId(self.next_view_id);
         self.next_view_id = self
@@ -6426,8 +6427,9 @@ impl Engine {
     }
 
     fn retain_view_id(&mut self, id: ProcessViewId) -> Result<()> {
-        if id.0 as usize >= MAX_SCAN_PIDS {
-            bail!("capture process-view capacity {MAX_SCAN_PIDS} is exhausted");
+        if id.0 as usize >= self.max_scan_pids {
+            let max_scan_pids = self.max_scan_pids;
+            bail!("capture process-view capacity {max_scan_pids} is exhausted");
         }
         let next =
             id.0.checked_add(1)

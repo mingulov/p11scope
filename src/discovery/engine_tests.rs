@@ -12578,6 +12578,16 @@ fn retired_view_ids_are_reused_for_new_generations() {
     assert!(engine.allocate_view_id().is_err());
 }
 
+#[test]
+fn view_id_ceiling_follows_max_scan_pids() {
+    let mut engine = Engine::empty();
+    engine.max_scan_pids = 300;
+    engine.next_view_id = 256;
+    assert!(engine.allocate_view_id().is_ok());
+    engine.max_scan_pids = 256;
+    assert!(engine.allocate_view_id().is_err());
+}
+
 fn current_mount_namespace() -> crate::process::MountNamespaceId {
     let metadata = std::fs::metadata("/proc/self/ns/mnt").unwrap();
     crate::process::MountNamespaceId {

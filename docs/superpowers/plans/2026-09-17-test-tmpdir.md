@@ -2,7 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** All Rust test temp I/O lands under `/home/user/src/m/p11scope-ws/tmp` (132G free) instead of tmpfs `/tmp` (2.7G, 80% full), so the loader-filter tests stop failing with `EDQUOT Disk quota exceeded`.
+**Amendment 2026-09-17 (Task 2 onward):** TMPDIR is `/var/tmp/p11scope-ws-tmp` (0700, pre-created), NOT the workspace `tmp/` below. Reason: `output.rs:401` trusts an ancestor only if non-group/world-writable or sticky; `/home/user/src` is group-writable (user's shared tree — not ours to chmod), which fails 10 output-trust tests under the workspace path (proven pre-existing on BASE). `/var/tmp` is sticky + 126G free; probe GREEN. Task 1 ran under the original value (history — its pin test holds under any TMPDIR). Every `TMPDIR=...` below now means the `/var/tmp` value.
+
+**Goal:** All Rust test temp I/O lands under a big-disk trusted TMPDIR instead of tmpfs `/tmp` (2.7G, 80% full), so the loader-filter tests stop failing with `EDQUOT Disk quota exceeded`.
 
 **Architecture:** Two minimal changes, no production-code change: (1) the one test-support call site that pins `/tmp` (`tempfile::tempdir_in("/tmp")`) honors `TMPDIR` like every other test-temp call site; (2) the repo's documented test invocations set `TMPDIR` to the workspace tmp dir. Recon (release-discovery 2026-09-17, inlined as spec): every other test-temp site already uses `tempfile::tempdir()` / `TempDir` / `CARGO_TARGET_TMPDIR` (all `TMPDIR`-respecting, all `#[cfg(test)]`); zero production-code `/tmp` use; the EDQUOT failures copy/compile into `tempfile::tempdir()` at `engine_tests.rs:11612-11614` and `:4881-4937`.
 
@@ -66,16 +68,16 @@ fn control_directory_honors_the_process_temp_dir() {
 **Interfaces:**
 - The `test` line of the `Checks` block becomes exactly:
 ```sh
-TMPDIR=/home/user/src/m/p11scope-ws/tmp mise exec -- ./scripts/cargo.sh +1.88 test --locked --workspace --all-targets
+TMPDIR=/var/tmp/p11scope-ws-tmp mise exec -- ./scripts/cargo.sh +1.88 test --locked --workspace --all-targets
 ```
-- One line above the block (exact text): `Test temp I/O goes to the workspace tmp dir (132G), never tmpfs /tmp (EDQUOT at scale): prefix test runs with TMPDIR as below.`
+- One line above the block (exact text): `Test temp I/O goes to /var/tmp/p11scope-ws-tmp (big disk, sticky-trusted; create 0700 if missing), never tmpfs /tmp (EDQUOT at scale): prefix test runs with TMPDIR as below.`
 - All other lines byte-identical.
 
 - [ ] **Step 1: RED — prove the prefix matters.** Run `cargo +1.88 test --locked --offline -p p11scope --lib loader` WITHOUT any TMPDIR prefix. Expected: the 3 known EDQUOT failures (`loader_collision_candidate_keeps_provider_retirement_without_loader_id` panics `Disk quota exceeded`; the two `:4937` gcc-fixture tests fail). Record the exact count.
 - [ ] **Step 2: Apply the AGENTS.md edit** per Interfaces (edit + nothing else).
-- [ ] **Step 3: GREEN — loader filter under the documented prefix.** Run `TMPDIR=/home/user/src/m/p11scope-ws/tmp cargo +1.88 test --locked --offline -p p11scope --lib loader`. Expected: 29/29 PASS, 0 failed. On any failure: stop — either /tmp pressure moved (check `df -h /tmp`) or a test bypasses TMPDIR (grep the failure for `/tmp`), report which.
-- [ ] **Step 4: Gates.** `cargo +1.88 fmt --all -- --check` clean (docs-only diff; clippy unaffected but run it per constraints). No full suite re-run needed beyond Task 1's (docs-only change; state this in the report).
-- [ ] **Step 5: Commit.** `git add` only `AGENTS.md`; message `docs: route test temp I/O to the workspace tmp dir` + body citing the 29/29 proof.
+- [ ] **Step 3: GREEN — loader filter under the documented prefix.** Run `TMPDIR=/var/tmp/p11scope-ws-tmp cargo +1.88 test --locked --offline -p p11scope --lib loader`. Expected: 29/29 PASS, 0 failed. On any failure: stop — either /tmp pressure moved (check `df -h /tmp`) or a test bypasses TMPDIR (grep the failure for `/tmp`), report which.
+- [ ] **Step 4: Gates + full-suite proof.** `cargo +1.88 fmt --all -- --check` clean; `cargo +1.88 clippy --locked --offline --workspace --all-targets -- -D warnings` clean. Then the FULL suite with the new prefix: `TMPDIR=/var/tmp/p11scope-ws-tmp cargo +1.88 test --locked --offline --workspace --all-targets`. Expected: 0 failures everywhere including the 10 output-trust tests (the new path is sticky-trusted — this run establishes the true green baseline Task 1 could not).
+- [ ] **Step 5: Commit.** `git add` only `AGENTS.md`; message `docs: route test temp I/O to the workspace tmp dir` + body citing the 29/29 proof and the full-suite result.
 
 ## Self-review (controller, against the spec)
 

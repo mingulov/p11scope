@@ -3515,7 +3515,10 @@ fn discover_plan(
                     break;
                 }
             };
-            ProcessView::open(id, *pid)
+            // Allocated but never admitted: a member that ended before
+            // discovery reached it fails open below, and its ID returns
+            // to the pool instead of burning for the capture lifetime.
+            ProcessView::open(id, *pid).inspect_err(|_| discovered.release_view_id(id))
         };
         let view = match opened {
             Ok(view) => view,
@@ -3567,6 +3570,9 @@ fn discover_plan(
             // legitimate, but still a process whose providers went unexamined.
             Err(error) if named => return Err(error),
             Err(error) => {
+                // Allocated but never admitted: the failed scan drops
+                // this view, so its ID returns to the pool.
+                discovered.release_view_id(view.id());
                 discovered.base_counters.scan_unavailable = discovered
                     .base_counters
                     .scan_unavailable
@@ -11852,6 +11858,9 @@ impl Engine {
             let view = match ProcessView::open(id, pid) {
                 Ok(view) => view,
                 Err(error) => {
+                    // Allocated but never admitted: the ID returns to
+                    // the pool instead of burning for the capture lifetime.
+                    self.release_view_id(id);
                     failed_refresh_pids.insert(pid);
                     skipped.extend(unreadable_member_skip(
                         pid,
@@ -11869,6 +11878,9 @@ impl Engine {
                     new_views.push((view, modules, pins));
                 }
                 Err(error) => {
+                    // Allocated but never admitted: the failed scan drops
+                    // this view, so its ID returns to the pool.
+                    self.release_view_id(view.id());
                     failed_refresh_pids.insert(pid);
                     skipped.extend(unreadable_member_skip(
                         pid,

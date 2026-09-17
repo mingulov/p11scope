@@ -13186,6 +13186,136 @@ fn released_view_ids_are_reused_end_to_end() {
     assert_eq!(reused, first);
 }
 
+/// Task 5 (ABC carry-forward), initial pass. Members that ended before
+/// capture start are each allocated a view ID whose open then fails; the
+/// ID was dropped without release — one burn per dead member, so a
+/// churning cgroup could still exhaust the pool. The drop returns the ID
+/// to the retired pool: minted == admitted + retired balances, and the
+/// next allocation reuses a released value.
+#[test]
+fn capture_start_releases_view_ids_for_members_that_ended_before_scan() {
+    let pids: Vec<_> = (0..3)
+        .map(|_| {
+            let mut child = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            child.kill().unwrap();
+            child.wait().unwrap();
+            pid
+        })
+        .collect();
+    let dir = tempfile::tempdir().expect("a scope directory");
+    let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
+    std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
+    let args = CaptureArgs {
+        kind: crate::cli::Kind::Profile,
+        modules: vec![],
+        manifests: vec![],
+        hooks: HookRegistry::builtin(),
+        scope: crate::cli::ScopeArg::Cgroup(dir.path().to_path_buf()),
+        metrics: false,
+        duration: None,
+        out: None,
+        max_events: None,
+        ring_bytes: None,
+        drain_interval: None,
+        max_scan_pids: None,
+        unsafe_requested: false,
+        allow_confined_uretprobe: false,
+    };
+    let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
+
+    let mut engine = Engine::discover(&args, &scope, None).expect("an empty cgroup still captures");
+
+    assert!(
+        engine.views.is_empty(),
+        "no ended member is admitted: {:?}",
+        engine
+            .views
+            .iter()
+            .map(ProcessView::pid)
+            .collect::<Vec<_>>()
+    );
+    // Pop-before-mint reuses the released ID within the pass, so three
+    // ended members burn exactly one mint between them.
+    assert_eq!(
+        engine.retired_view_ids,
+        vec![0],
+        "each allocated-but-never-admitted ID returns to the pool"
+    );
+    assert_eq!(
+        engine.next_view_id, 1,
+        "ended members do not advance the mint counter past the recycled ID"
+    );
+    assert_eq!(
+        engine.next_view_id as usize,
+        engine.views.len() + engine.retired_view_ids.len(),
+        "minted IDs balance: admitted + retired"
+    );
+    assert_eq!(
+        engine.allocate_view_id().unwrap(),
+        ProcessViewId(0),
+        "the next allocation reuses the released ID"
+    );
+}
+
+/// Task 5 (ABC carry-forward), live tick. Same drop as the initial pass
+/// but in the refresh `new_views` loop; a second tick pins the churn
+/// steady state — re-allocated from the pool and released again, the
+/// pool neither grows (duplicates) nor drains.
+#[test]
+fn refresh_releases_view_ids_for_members_that_ended_before_scan() {
+    let pids: Vec<_> = (0..3)
+        .map(|_| {
+            let mut child = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            child.kill().unwrap();
+            child.wait().unwrap();
+            pid
+        })
+        .collect();
+    let (mut engine, _dir) = engine_over_cgroup_naming(&pids);
+
+    // Pop-before-mint reuses the released ID within the pass, so three
+    // ended members burn exactly one mint between them.
+    refresh_inventory_once(&mut engine);
+    assert_eq!(
+        engine.retired_view_ids,
+        vec![0],
+        "tick 1: each allocated-but-never-admitted ID returns to the pool"
+    );
+    assert_eq!(
+        engine.next_view_id, 1,
+        "tick 1: ended members do not advance the mint counter"
+    );
+    assert_eq!(
+        engine.next_view_id as usize,
+        engine.views.len() + engine.retired_view_ids.len(),
+        "tick 1: minted IDs balance: admitted + retired"
+    );
+
+    refresh_inventory_once(&mut engine);
+    assert_eq!(
+        engine.retired_view_ids,
+        vec![0],
+        "tick 2: re-allocated from the pool and released again, no duplicates"
+    );
+    assert_eq!(
+        engine.next_view_id, 1,
+        "tick 2: churn steady state holds the mint counter at one"
+    );
+    assert_eq!(
+        engine.next_view_id as usize,
+        engine.views.len() + engine.retired_view_ids.len(),
+        "tick 2: minted IDs balance: admitted + retired"
+    );
+}
+
 #[test]
 fn view_id_ceiling_follows_max_scan_pids() {
     let mut engine = Engine::empty();

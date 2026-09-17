@@ -794,10 +794,35 @@ fn ambiguous_identity_skip() -> Skipped {
 }
 
 fn ordinary_identity_equal(left: &Entry, right: &Entry) -> bool {
-    left.mapping == right.mapping
+    if left.mapping == right.mapping
         && left.pin == right.pin
         && !left.sha256.is_empty()
         && left.sha256 == right.sha256
+    {
+        return true;
+    }
+    same_open_file(left, right)
+}
+
+/// Same-open-file escape (cgroup-256 D): the same provider file observed
+/// through two mount namespaces (a container bind-mounting the host's provider)
+/// carries a different `mount_id` per mount table while remaining one attach
+/// target. Merge only on proof — same key, equal pin, equal non-empty digest,
+/// and equal fstat `(st_dev, st_ino)` on the two retained fds. `mount_id` is
+/// not consulted here; anything unproven fails closed.
+fn same_open_file(left: &Entry, right: &Entry) -> bool {
+    left.raw.key == right.raw.key
+        && left.pin == right.pin
+        && !left.sha256.is_empty()
+        && left.sha256 == right.sha256
+        && same_kernel_file(&left.file, &right.file)
+}
+
+fn same_kernel_file(left: &std::fs::File, right: &std::fs::File) -> bool {
+    match (left.metadata(), right.metadata()) {
+        (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
+        _ => false,
+    }
 }
 
 fn overlay_identity_equal(left: &Entry, right: &Entry) -> bool {
@@ -1736,11 +1761,32 @@ pub(crate) mod test_fixture {
         pins.insert_entry(entry, &mut Vec::new());
         pins
     }
+
+    /// A real file on a real filesystem for backing fixtures. Each name is a
+    /// distinct kernel file; every file carries identical bytes (the
+    /// btrfs-clone shape), so only the kernel file separates same-key fixtures.
+    pub(crate) fn backing_file(dir: &tempfile::TempDir, name: &str) -> Arc<std::fs::File> {
+        let path = dir.path().join(name);
+        std::fs::write(&path, "p11scope-fixture:shared-provider-bytes").unwrap();
+        Arc::new(std::fs::File::open(&path).unwrap())
+    }
+
+    /// Re-backs every entry in `pins` with `file`, keeping the forged
+    /// pin/mapping/sha. Fixtures sharing `/dev/null` are one kernel file; tests
+    /// forging a genuine collision or a distinct overlay instance must re-back
+    /// with distinct real files instead.
+    pub(crate) fn reback(pins: &mut PinnedObjects, file: &Arc<std::fs::File>) {
+        for entry in pins.by_id.values_mut() {
+            entry.file = Arc::clone(file);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::test_fixture::{INODE, PATH, SHA, module, overlay, pin_set, pins, view_pin};
+    use super::test_fixture::{
+        INODE, PATH, SHA, backing_file, module, overlay, pin_set, pins, reback, view_pin,
+    };
     use super::*;
     use crate::discovery::scan::ScannedEntry;
     use p11scope_manifest::identity::{IdentityKind, ObjectIdentity};
@@ -2184,14 +2230,62 @@ mod tests {
     }
 
     #[test]
-    fn absorbing_incomparable_same_key_candidates_rejects_the_collision_group() {
+    fn absorbing_same_open_file_once_rejected_as_incomparable_merges() {
+        // Both fixtures open /dev/null: one kernel file seen through two mount
+        // tables is the cross-namespace shape, so it merges. The genuine
+        // collision assertions this test used to carry moved to
+        // absorbing_same_key_distinct_files_still_rejects_the_collision_group.
         let key = ObjectKey {
             device: Device { major: 8, minor: 1 },
             inode: INODE,
         };
         let mut first = image_pins(&[(key, "aaaaaaaa", 1)]);
+        let mut second = image_pins(&[(key, "aaaaaaaa", 1)]);
+        second.by_id.values_mut().next().unwrap().mapping.mount_id += 1;
+
+        let skipped = first.absorb(second);
+
+        assert_eq!(first.pinned().count(), 1, "{skipped:?}");
+        assert!(skipped.is_empty(), "{skipped:?}");
+    }
+
+    #[test]
+    fn absorbing_same_open_file_across_mount_namespaces_merges() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        // Two mount tables, one kernel file: each view opened the same path.
+        let first_file = backing_file(&dir, "provider.so");
+        let second_file = Arc::new(std::fs::File::open(dir.path().join("provider.so")).unwrap());
+        let mut first = image_pins(&[(key, "aaaaaaaa", 1)]);
+        reback(&mut first, &first_file);
+        let mut second = image_pins(&[(key, "aaaaaaaa", 1)]);
+        reback(&mut second, &second_file);
+        second.by_id.values_mut().next().unwrap().mapping.mount_id += 1;
+
+        let skipped = first.absorb(second);
+
+        assert_eq!(first.pinned().count(), 1, "{skipped:?}");
+        assert!(skipped.is_empty(), "{skipped:?}");
+    }
+
+    #[test]
+    fn absorbing_same_key_distinct_files_still_rejects_the_collision_group() {
+        // The btrfs-clone shape: identical bytes, forged same key, equal
+        // pin+sha — but two kernel files, so the collision group still rejects.
+        // (Reject assertions moved here from the rewritten merge test above.)
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut first = image_pins(&[(key, "aaaaaaaa", 1)]);
+        reback(&mut first, &backing_file(&dir, "first.so"));
         let committed = first.clone();
         let mut second = image_pins(&[(key, "aaaaaaaa", 1)]);
+        reback(&mut second, &backing_file(&dir, "second.so"));
         second.by_id.values_mut().next().unwrap().mapping.mount_id += 1;
 
         let skipped = first.absorb(second);
@@ -2211,6 +2305,28 @@ mod tests {
         assert!(replay.rejects(key));
         assert_eq!(replay.pinned().count(), 0);
         assert_eq!(ambiguity_count(&replay_skips), 1, "{replay_skips:?}");
+    }
+
+    #[test]
+    fn absorbing_same_key_unavailable_digest_still_rejects() {
+        // One kernel file both sides — but one side never hashed, so the bytes
+        // are unproven and the group still rejects.
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let mut first = image_pins(&[(key, "aaaaaaaa", 1)]);
+        reback(&mut first, &file);
+        let mut second = image_pins(&[(key, "", 1)]);
+        reback(&mut second, &file);
+        second.by_id.values_mut().next().unwrap().mapping.mount_id += 1;
+
+        let skipped = first.absorb(second);
+
+        assert_eq!(first.pinned().count(), 0);
+        assert_eq!(ambiguity_count(&skipped), 1, "{skipped:?}");
     }
 
     #[test]
@@ -2268,8 +2384,12 @@ mod tests {
         let mut stale_module = stable_module.clone();
         stale_module.view = ProcessViewId(2);
         stale_module.mount_namespace.inode = 2;
-        let stable = view_pin(&stable_module, 11, "aaaaaaaa", 1, false);
-        let stale = view_pin(&stale_module, 12, "aaaaaaaa", 1, false);
+        // A stale view disagreeing on one key is a genuine collision: two files.
+        let dir = tempfile::tempdir().unwrap();
+        let mut stable = view_pin(&stable_module, 11, "aaaaaaaa", 1, false);
+        reback(&mut stable, &backing_file(&dir, "stable.so"));
+        let mut stale = view_pin(&stale_module, 12, "aaaaaaaa", 1, false);
+        reback(&mut stale, &backing_file(&dir, "stale.so"));
         let original = stable
             .attach_path_for(stable.pinned().next().unwrap().id)
             .unwrap();
@@ -2312,9 +2432,17 @@ mod tests {
             module.mount_namespace.inode = u64::from(view);
             view_pin(&module, mapping_mount_id, "aaaaaaaa", 1, false)
         };
-        let stable = source(1, 11);
-        let stale = source(2, 12);
-        let remaining_collision = source(3, 13);
+        // Views colliding on one key are genuinely distinct files.
+        let dir = tempfile::tempdir().unwrap();
+        let mut stable = source(1, 11);
+        reback(&mut stable, &backing_file(&dir, "stable.so"));
+        let mut stale = source(2, 12);
+        reback(&mut stale, &backing_file(&dir, "stale.so"));
+        let mut remaining_collision = source(3, 13);
+        reback(
+            &mut remaining_collision,
+            &backing_file(&dir, "remaining.so"),
+        );
 
         let (_, initial) = PinnedObjects::aggregate_views([&stable, &stale]);
         assert_eq!(ambiguity_count(&initial), 1, "{initial:?}");
@@ -2568,8 +2696,13 @@ mod tests {
             },
             inode: INODE,
         };
+        // Two overlay instances are two files; one file would take the
+        // same-open-file path instead of the overlay exception below.
+        let dir = tempfile::tempdir().unwrap();
         let mut first = pins(&[(key, SHA, 1)]);
+        reback(&mut first, &backing_file(&dir, "first.so"));
         let mut second = pins(&[(key, SHA, 1)]);
+        reback(&mut second, &backing_file(&dir, "second.so"));
         second.by_id.values_mut().next().unwrap().mapping.mount_id += 1;
 
         let skipped = first.absorb(second);
@@ -2630,9 +2763,16 @@ mod tests {
     #[test]
     fn same_raw_key_overlay_exception_never_crosses_sources_in_either_absorb_order() {
         let key = overlay(102);
+        // Two sources observing one key through different tables are two files;
+        // one file would merge instead of exercising the cross-source reject.
+        let dir = tempfile::tempdir().unwrap();
+        let scan_file = backing_file(&dir, "scan.so");
+        let manifest_file = backing_file(&dir, "manifest.so");
         for manifest_first in [false, true] {
-            let scan = pins(&[(key, SHA, 1)]);
+            let mut scan = pins(&[(key, SHA, 1)]);
+            reback(&mut scan, &scan_file);
             let mut manifest = manifest_pins(key, SHA, 1);
+            reback(&mut manifest, &manifest_file);
             manifest
                 .by_id
                 .values_mut()
@@ -2660,7 +2800,11 @@ mod tests {
     #[test]
     fn overlay_merge_rejects_a_scan_peer_when_the_candidate_has_a_manifest_alias() {
         let key = overlay(102);
+        // The peer from another mount table is another file; the same file
+        // would merge instead of exercising the mixed-group reject.
+        let dir = tempfile::tempdir().unwrap();
         let mut pinned = pins(&[(key, SHA, 1)]);
+        reback(&mut pinned, &backing_file(&dir, "candidate.so"));
         assert!(pinned.absorb(manifest_pins(key, SHA, 1)).is_empty());
         let id = pinned
             .id_for_scanned(&module(key), key, PATH)
@@ -2668,6 +2812,7 @@ mod tests {
         assert_eq!(pinned.sources(id), ["scan", "manifest"]);
 
         let mut peer = pins(&[(key, SHA, 1)]);
+        reback(&mut peer, &backing_file(&dir, "peer.so"));
         peer.by_id
             .values_mut()
             .next()
@@ -2687,8 +2832,14 @@ mod tests {
     #[test]
     fn overlay_merge_rejects_a_mixed_incoming_group() {
         let key = overlay(102);
+        // The incoming group observes the key through another table: another
+        // file than the receiver's, so the join must reject.
+        let dir = tempfile::tempdir().unwrap();
         let mut receiver = pins(&[(key, SHA, 1)]);
+        reback(&mut receiver, &backing_file(&dir, "receiver.so"));
         let mut incoming = pins(&[(key, SHA, 1)]);
+        let incoming_file = backing_file(&dir, "incoming.so");
+        reback(&mut incoming, &incoming_file);
         incoming
             .by_id
             .values_mut()
@@ -2697,6 +2848,7 @@ mod tests {
             .mapping
             .mount_id += 1;
         let mut incoming_manifest = manifest_pins(key, SHA, 1);
+        reback(&mut incoming_manifest, &incoming_file);
         incoming_manifest
             .by_id
             .values_mut()
@@ -2757,10 +2909,14 @@ mod tests {
             inode: INODE,
         };
         let first_module = module(key);
+        // A late collision is a genuinely different file disagreeing on one key.
+        let dir = tempfile::tempdir().unwrap();
         let mut first = image_pins(&[(key, "aaaaaaaa", 1)]);
+        reback(&mut first, &backing_file(&dir, "first.so"));
         reconcile_scanned_modules(std::slice::from_ref(&first_module), &mut first);
 
         let mut collision = image_pins(&[(key, "aaaaaaaa", 1)]);
+        reback(&mut collision, &backing_file(&dir, "collision.so"));
         collision
             .by_id
             .values_mut()

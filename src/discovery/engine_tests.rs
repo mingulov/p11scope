@@ -1,7 +1,8 @@
 use super::session_fixture::ScriptedSession;
 use super::*;
 use crate::discovery::identity::test_fixture::{
-    SHA as OVERLAY_SHA, module as overlay_module, overlay as overlay_key, pins as overlay_pins,
+    SHA as OVERLAY_SHA, backing_file as overlay_backing_file, module as overlay_module,
+    overlay as overlay_key, pins as overlay_pins, reback as overlay_reback,
     view_pin as overlay_view_pin,
 };
 use crate::discovery::identity::{
@@ -1797,7 +1798,11 @@ fn same_key_overlay_uncertainty_keeps_causal_timing_null() {
     engine.timings.complete(&kept_timing, 20);
     assert_eq!(engine.timings.gap_ns(&kept_timing), Some(10));
 
-    let incoming = overlay_view_pin(&module, 999, OVERLAY_SHA, 1, true);
+    // The peer from another mount table is another overlay instance (another
+    // file); the same file would take the same-open-file path with no skip.
+    let dir = tempfile::tempdir().unwrap();
+    let mut incoming = overlay_view_pin(&module, 999, OVERLAY_SHA, 1, true);
+    overlay_reback(&mut incoming, &overlay_backing_file(&dir, "peer.so"));
     let incoming_object = incoming
         .id_for_scanned(&module, module.key, &module.path)
         .unwrap();

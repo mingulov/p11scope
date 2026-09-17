@@ -3995,19 +3995,31 @@ fn capture_start_members_that_ended_are_not_losses() {
 /// upper bound now, not a pid-order head-take.)
 #[test]
 fn max_scan_pids_bounds_initial_scan_and_refresh() {
-    let mut children: Vec<_> = (0..5)
-        .map(|_| {
-            std::process::Command::new("sleep")
-                .arg("30")
-                .spawn()
-                .unwrap()
-        })
-        .collect();
-    let pids: Vec<_> = children.iter().map(|child| child.id()).collect();
+    struct ChildrenGuard(Vec<std::process::Child>);
+    impl Drop for ChildrenGuard {
+        fn drop(&mut self) {
+            for child in &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    let mut children = ChildrenGuard(
+        (0..5)
+            .map(|_| {
+                std::process::Command::new("sleep")
+                    .arg("30")
+                    .spawn()
+                    .unwrap()
+            })
+            .collect(),
+    );
+    let pids: Vec<_> = children.0.iter().map(|child| child.id()).collect();
     let dir = tempfile::tempdir().expect("a scope directory");
     let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
-    let args = CaptureArgs {
+    let mut args = CaptureArgs {
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
@@ -4025,7 +4037,43 @@ fn max_scan_pids_bounds_initial_scan_and_refresh() {
     };
     let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
 
-    let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
+    // Readiness (same idiom as the id-exhaustion sibling): a pre-exec child
+    // still maps this test binary, which would split the provider groups and
+    // move the representatives. Discover only once every child execed sleep.
+    let self_exe = std::env::current_exe().unwrap();
+    for child in &children.0 {
+        let pid = child.id();
+        let exe = format!("/proc/{pid}/exe");
+        let mut execed = false;
+        for _ in 0..500 {
+            if std::fs::read_link(&exe).is_ok_and(|target| target != self_exe) {
+                execed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(execed, "sleep child {pid} never execed");
+    }
+
+    // The sweep can transiently degrade under parallel load (one maps read
+    // fails, that pid trails as an individual, and the representatives move),
+    // so retry for an agreeing discovery. A deterministically broken selection
+    // never agrees and still fails on the last attempt (Task-2 retry idiom).
+    let mut lowest_first = pids.clone();
+    lowest_first.sort_unstable();
+    let mut agreed = None;
+    for _ in 0..50 {
+        let candidate =
+            Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
+        let view_pids: Vec<u32> = candidate.views.iter().map(|view| view.pid()).collect();
+        let agrees = view_pids.as_slice() == &lowest_first[..view_pids.len()];
+        agreed = Some(candidate);
+        if agrees {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let mut engine = agreed.unwrap();
     assert_eq!(engine.max_scan_pids, 2);
     assert!(
         (1..=2).contains(&engine.views.len()),
@@ -4043,6 +4091,11 @@ fn max_scan_pids_bounds_initial_scan_and_refresh() {
     );
 
     let initial: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
+    assert_eq!(
+        initial.as_slice(),
+        &lowest_first[..initial.len()],
+        "the retained views are the lowest-pid members (one representative per provider group, lowest pid first, in every environment)"
+    );
     refresh_inventory_once(&mut engine);
     let kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
     assert_eq!(
@@ -4059,7 +4112,45 @@ fn max_scan_pids_bounds_initial_scan_and_refresh() {
         engine.counters.object_skips
     );
 
-    for child in &mut children {
+    // ABC-T4 coverage: at every cap the selected set is minimal — exactly
+    // min(cap, available candidates), never a redundant member more. The
+    // discovery's internal sweep and this probe sweep are independent samples
+    // that can disagree transiently under parallel load, so retry for an
+    // agreeing pair and fail on the last attempt (same idiom as above).
+    for cap in 1..=4usize {
+        args.max_scan_pids = Some(cap);
+        let mut attempt = None;
+        for _ in 0..50 {
+            let capped =
+                Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
+            let mut sweep_budget = CaptureWorkBudget::default();
+            let sweep = sweep_process_maps(&pids, &mut sweep_budget);
+            // Probe one below the sweep length so selection takes the grouped
+            // path: `usize::MAX` would return the under-cap identity (all pids),
+            // not the representative-plus-individual candidate count.
+            let candidates =
+                select_deep_scan_candidates(&sweep, sweep.len().saturating_sub(1)).len();
+            let agrees = capped.views.len() == cap.min(candidates);
+            attempt = Some((capped, candidates));
+            if agrees {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let (capped, candidates) = attempt.unwrap();
+        assert!(
+            (1..=4).contains(&capped.views.len()),
+            "cap {cap} covers at most the capped count: {}",
+            capped.views.len()
+        );
+        assert_eq!(
+            capped.views.len(),
+            cap.min(candidates),
+            "cap {cap} selects exactly the minimal set"
+        );
+    }
+
+    for child in &mut children.0 {
         child.kill().unwrap();
         child.wait().unwrap();
     }
@@ -12905,6 +12996,32 @@ fn retired_view_ids_are_reused_for_new_generations() {
     assert!(engine.allocate_view_id().is_err());
 }
 
+/// ABC-T3 coverage: removal-to-reuse end to end. Two views are admitted
+/// through the real ID lifecycle, one is released via `release_view_id`,
+/// and the next admission reuses the exact released ID value — not just a
+/// count, the value itself.
+#[test]
+fn released_view_ids_are_reused_end_to_end() {
+    let mut engine = Engine::empty();
+    let first = engine.allocate_view_id().unwrap();
+    engine.retain_view_id(first).unwrap();
+    engine
+        .views
+        .push(ProcessView::open(first, std::process::id()).unwrap());
+    let second = engine.allocate_view_id().unwrap();
+    engine.retain_view_id(second).unwrap();
+    engine
+        .views
+        .push(ProcessView::open(second, std::process::id()).unwrap());
+    assert_eq!((first, second), (ProcessViewId(0), ProcessViewId(1)));
+
+    engine.release_view_id(first);
+    engine.views.retain(|view| view.id() != first);
+
+    let reused = engine.allocate_view_id().unwrap();
+    assert_eq!(reused, first);
+}
+
 #[test]
 fn view_id_ceiling_follows_max_scan_pids() {
     let mut engine = Engine::empty();
@@ -12913,6 +13030,23 @@ fn view_id_ceiling_follows_max_scan_pids() {
     assert!(engine.allocate_view_id().is_ok());
     engine.max_scan_pids = 256;
     assert!(engine.allocate_view_id().is_err());
+}
+
+/// A2-T2 coverage: the `retain_view_id` path pins the retained ID value
+/// (the allocator floor advances past it) and the interpolated ceiling
+/// message names the effective value byte-exactly.
+#[test]
+fn retain_view_id_advances_the_floor_and_names_the_ceiling() {
+    let mut engine = Engine::empty();
+    engine.max_scan_pids = 2;
+    engine.retain_view_id(ProcessViewId(1)).unwrap();
+    assert_eq!(engine.next_view_id, 2);
+    assert!(engine.allocate_view_id().is_err());
+    let error = engine.retain_view_id(ProcessViewId(2)).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "capture process-view capacity 2 is exhausted"
+    );
 }
 
 fn current_mount_namespace() -> crate::process::MountNamespaceId {
@@ -16038,6 +16172,7 @@ fn identical_table_in_two_batches_burns_one_candidate() {
     let mut session = ScriptedSession::default();
     let first = apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
     let candidates_after_first = engine.budget.table_candidates_count();
+    assert_eq!(candidates_after_first, 1);
     let second = apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
     assert!(first.required_complete);
     assert!(second.required_complete);
@@ -16072,6 +16207,50 @@ fn candidate_selection_prefers_rare_providers_over_pid_order() {
     assert_eq!(select_deep_scan_candidates(&sweep, 1), vec![9001]);
     assert_eq!(select_deep_scan_candidates(&sweep, 2), vec![9001, 7]);
     assert_eq!(select_deep_scan_candidates(&sweep, 3), vec![7, 8, 9001]);
+}
+
+/// ABC-T4 coverage: the pure selection edges — equal-rarity tie-break goes
+/// to the lowest pid, pids with no provider mapping trail as individuals,
+/// and an under-cap sweep keeps today's ascending identity order.
+#[test]
+fn selection_edges_tie_break_empty_key_under_cap() {
+    fn map_entry(path: &str, inode: u64) -> MapEntry {
+        MapEntry {
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            permissions: *b"r-xp",
+            device: Device { major: 8, minor: 1 },
+            inode,
+            raw_path: Some(path.as_bytes().to_vec()),
+        }
+    }
+    // Tie-break: both files are mapped by exactly 2 pids and both groups
+    // have 2 members, so the order falls through to lowest pid.
+    let tied: Vec<(u32, Vec<MapEntry>)> = vec![
+        (30, vec![map_entry("/usr/lib/liba.so", 11)]),
+        (31, vec![map_entry("/usr/lib/liba.so", 11)]),
+        (40, vec![map_entry("/usr/lib/libb.so", 12)]),
+        (41, vec![map_entry("/usr/lib/libb.so", 12)]),
+    ];
+    assert_eq!(select_deep_scan_candidates(&tied, 2), vec![30, 40]);
+    // Empty key: pids with no provider mapping (no entries at all, or an
+    // anonymous mapping) trail as individuals behind the representatives.
+    let keyed: Vec<(u32, Vec<MapEntry>)> = vec![
+        (7, vec![map_entry("/tmp/uniq-p11.so", 10)]),
+        (100, vec![]),
+        (101, vec![map_entry("/usr/lib/liba.so", 0)]),
+    ];
+    assert_eq!(select_deep_scan_candidates(&keyed, 2), vec![7, 100]);
+    assert_eq!(select_deep_scan_candidates(&keyed, 3), vec![7, 100, 101]);
+    // Under cap: the sweep length fits, so the selection is the identity —
+    // all pids ascending however unsorted the input.
+    let under: Vec<(u32, Vec<MapEntry>)> = vec![
+        (50, vec![map_entry("/usr/lib/liba.so", 11)]),
+        (9, vec![]),
+        (30, vec![map_entry("/tmp/uniq-p11.so", 10)]),
+    ];
+    assert_eq!(select_deep_scan_candidates(&under, 3), vec![9, 30, 50]);
 }
 
 /// A4 Task 1: file-level rarity beats pid order — a high-pid singleton mapping

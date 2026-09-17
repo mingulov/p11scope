@@ -2147,6 +2147,76 @@ mod tests {
     }
 
     #[test]
+    fn same_size_content_rewrite_rotates_the_pin_and_rereads() {
+        use crate::discovery::scan::ScannedModule;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("same-size.so");
+        std::fs::copy("/bin/sh", &path).unwrap();
+        let file = open_object(&path).unwrap();
+        let file_len = file.metadata().unwrap().len();
+        assert!(file_len > 0, "the fixture must have bytes worth caching");
+        let mapping = mapping_file_key(&file).unwrap();
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let module = ScannedModule {
+            view: view.id(),
+            mount_namespace: view.mount_namespace(),
+            key: ObjectKey {
+                device: Device {
+                    major: mapping.device_major,
+                    minor: mapping.device_minor,
+                },
+                inode: mapping.inode,
+            },
+            path: path.display().to_string(),
+            decoder_abi: None,
+            exports: Vec::new(),
+            tables: Vec::new(),
+            interfaces: Vec::new(),
+        };
+        let mut budget = CaptureWorkBudget::default();
+
+        let (pinned, skipped) =
+            pin_scanned_view_objects(&view, std::slice::from_ref(&module), &mut budget).unwrap();
+        assert_eq!(pinned.pinned().count(), 1);
+        assert!(skipped.is_empty());
+        let charged_first = budget.attempted_io_bytes();
+        let old_pin = pin_of(&open_object(&path).unwrap()).unwrap();
+
+        // Rewrite the content without changing the size: the pin must rotate
+        // on ctime alone. The loop only absorbs coarse-timestamp filesystems;
+        // a pin that ignored ctime would never rotate and still fail below.
+        let mut bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.len() > 1024, "the fixture must cover both edits");
+        let mut new_pin = None;
+        for _ in 0..500 {
+            bytes[64] = bytes[64].wrapping_add(1);
+            bytes[1024] = bytes[1024].wrapping_add(1);
+            std::fs::write(&path, &bytes).unwrap();
+            let candidate = pin_of(&open_object(&path).unwrap()).unwrap();
+            assert_eq!(candidate.size, file_len, "the rewrite keeps the size");
+            if candidate != old_pin {
+                new_pin = Some(candidate);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let new_pin = new_pin.expect("the same-size rewrite rotates the pin");
+        assert_ne!(new_pin, old_pin);
+
+        // The rescan accepts the rotated file and charges the re-read.
+        let (pinned, skipped) =
+            pin_scanned_view_objects(&view, std::slice::from_ref(&module), &mut budget).unwrap();
+        assert_eq!(pinned.pinned().count(), 1);
+        assert!(skipped.is_empty());
+        let charged_second = budget.attempted_io_bytes() - charged_first;
+        assert!(
+            charged_second >= file_len,
+            "rotated file is read again: {charged_second} >= {file_len}"
+        );
+    }
+
+    #[test]
     fn decoder_abi_mismatch_refuses_the_module_before_ownership() {
         let key = overlay(210);
         let mut scanned = module(key);

@@ -308,9 +308,11 @@ over an NSS dependency cascade: SIGTERM ignored, SIGKILL required; see the
 provider-qual note's gaps section). Prefer `--pause never` with `LD_PRELOAD` for
 dependency-heavy targets until that gap is fixed.
 
-A `--cgroup` capture scans at most 256 members per pass, lowest PIDs first;
-past that, the first 256 are scanned and the capture publishes a skip naming
-the bound (a provider mapped only past the cap is never discovered).
+A `--cgroup` capture sweeps every member's mappings, then deep-scans at most
+256 members per pass, rarest providers first; past the cap the capture
+publishes a skip naming the bound. The default stays 256 by measurement
+(2026-09-17, ~550-process scope: a 600-member run discovered the same
+4 modules as the default run at +32% scan time, so the raise buys nothing).
 `--max-scan-pids <n>` sets the cap:
 
 sudo p11scope profile --cgroup /sys/fs/cgroup/... --max-scan-pids 512 --duration 60 -o observed-profile.json
@@ -590,7 +592,10 @@ refused on a mismatch — and during capture, where a change sets
 manifest, 256 MiB per manifest object, and 512 MiB across one manifest's
 objects. Separately, one capture-wide 512 MiB attempted-I/O budget covers
 memory scanning and scan-sourced file hashing across every selected process,
-retry, and failed pin, with 64 MiB per scan/hash operation. Provider export
+retry, and failed pin, with 256 MiB per scan/hash operation (measured
+2026-09-17 against libxul.so at 183 MB on disk / 61 MiB readable data, the
+largest known real-world object; matches the manifest per-object cap).
+Provider export
 checks read only the object's ELF tables via demand paging (bounded), so a
 large provider costs kilobytes of table reads; the per-object gate no longer
 applies to that check, though it still guards memory snapshots and identity

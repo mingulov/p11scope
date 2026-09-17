@@ -235,7 +235,14 @@ pub struct ScanLimits {
 impl Default for ScanLimits {
     fn default() -> Self {
         Self {
-            per_object_bytes: 64 * 1024 * 1024,
+            // Measured (cgroup-256 Task 5, 2026-09-17): libxul.so is
+            // 183,575,264 bytes on disk with 63,639,548 readable data bytes,
+            // so the old 64 MiB cap refused its snapshots and held its data
+            // at a 5% margin. 256 MiB covers the largest known real-world
+            // object with headroom, matches the manifest per-object cap
+            // (`MAX_OBJECT_BYTES`), and still refuses absurd files; the
+            // unchanged 512 MiB total keeps bounding the worst case.
+            per_object_bytes: 256 * 1024 * 1024,
             total_bytes: 512 * 1024 * 1024,
         }
     }
@@ -4190,11 +4197,13 @@ mod tests {
 
     #[test]
     fn oversize_file_exports_are_checked_sparsely() {
-        // A hook-exporting provider sparsely extended past the per-object cap
-        // (the libxul shape): the export check still reports facts, charging
-        // tables rather than the file.
+        // A hook-exporting provider sparsely extended past the scan
+        // per-object cap (the libxul shape): the export check still reports
+        // facts, charging tables rather than the file. Explicit small limits:
+        // the default cap now equals the manifest pin gate, so sizing past
+        // the default would trip a different gate than the one tested here.
         let mut fixture = ElfExportFactsFixture::new_provider();
-        let oversize = ScanLimits::default().per_object_bytes + 1024 * 1024;
+        let oversize = 2 * 1024 * 1024;
         std::fs::OpenOptions::new()
             .write(true)
             .open(&fixture.path)
@@ -4202,9 +4211,13 @@ mod tests {
             .set_len(oversize)
             .unwrap();
         let file_len = std::fs::metadata(&fixture.path).unwrap().len();
-        assert!(file_len > ScanLimits::default().per_object_bytes);
+        let limits = ScanLimits {
+            per_object_bytes: 1024 * 1024,
+            total_bytes: u64::MAX,
+        };
+        assert!(file_len > limits.per_object_bytes);
 
-        let mut budget = CaptureWorkBudget::default();
+        let mut budget = CaptureWorkBudget::new(limits);
         let outcome = fixture.scan(&mut budget);
         assert_eq!(
             outcome.modules().len(),

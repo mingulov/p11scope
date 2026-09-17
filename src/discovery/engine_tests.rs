@@ -14137,7 +14137,7 @@ fn pinned_self() -> (Vec<ScannedModule>, PinnedObjects) {
         interfaces: vec![],
     }];
     // Unbounded on purpose: `pin_scanned_object` caps on the whole file size, and
-    // this test binary is already at 96% of the 64 MiB default. The byte caps are
+    // this test binary is already past 60% of the 256 MiB default. The byte caps are
     // not what these tests are about, and a silent skip would fail them with
     // "the hinted executable is pinned", which names the symptom, not the cause.
     let limits = ScanLimits {

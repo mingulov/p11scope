@@ -296,8 +296,10 @@ fn exports_matching_in_object(object: &object::File<'_>, wanted: &[&str]) -> Vec
 /// Structural bytes the export query logically consumed: the ELF header, the
 /// program- and section-header tables, and the dynamic-symbol, dynamic-string
 /// and dynamic tables as present. Computed from the parsed tables — an honest
-/// lower bound any correct implementation must move.
-fn export_table_bytes(object: &object::File<'_>) -> u64 {
+/// lower bound any correct implementation must move — clamped to the mapped
+/// length so a corrupt section header claiming a larger-than-file table
+/// cannot inflate the charge past what could physically have moved.
+fn export_table_bytes(object: &object::File<'_>, mmap_len: u64) -> u64 {
     macro_rules! tables {
         ($elf:expr) => {{
             let elf = $elf;
@@ -329,8 +331,8 @@ fn export_table_bytes(object: &object::File<'_>) -> u64 {
         }};
     }
     match object {
-        object::File::Elf32(object) => tables!(object),
-        object::File::Elf64(object) => tables!(object),
+        object::File::Elf32(object) => tables!(object).min(mmap_len),
+        object::File::Elf64(object) => tables!(object).min(mmap_len),
         // Only reachable without the `classified_object` gate, which the one
         // caller applies; no ELF tables exist to charge.
         _ => 0,
@@ -351,11 +353,21 @@ pub fn read_export_facts(
 ) -> Result<(ElfAbi, Vec<(String, u64)>, u64 /* charged_bytes */), String> {
     // SAFETY: a read-only shared mapping of the file; the bytes are only read
     // through the parser's checked accessors, never written or retained.
+    // This relies on memmap2's no-concurrent-modification contract: the file
+    // must not be modified while mapped. A truncation landing mid-parse
+    // raises SIGBUS and aborts the process rather than surfacing a catchable
+    // error. The window is microseconds (parse, walk, and charge touch table
+    // pages only); torn reads are fenced by the pin-before/after discipline
+    // on the scan path (`src/discovery/scan.rs`: pin at 1910-1929, recheck
+    // at 1942, facts cached only when the pins agree), upgrades replace
+    // files by rename rather than in-place truncation, and the residual
+    // exposure is the plan-accepted ld.so-class risk every consumer of a
+    // mapped executable shares.
     let mmap =
         unsafe { memmap2::Mmap::map(file) }.map_err(|error| format!("read failed: {error}"))?;
     let (object, abi) = classified_object(&mmap)?;
     let exports = exports_matching_in_object(&object, wanted);
-    Ok((abi, exports, export_table_bytes(&object)))
+    Ok((abi, exports, export_table_bytes(&object, mmap.len() as u64)))
 }
 
 /// Names from `wanted` that the object exports in .dynsym, with their file offsets.

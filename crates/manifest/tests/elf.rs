@@ -759,6 +759,45 @@ fn export_facts_tolerate_an_unreadable_dynstr_exactly_like_snapshot() {
 }
 
 #[test]
+fn export_facts_clamp_a_lying_dynstr_size_to_the_file() {
+    // I-1 regression: the dynstr charge term must not trust the raw `sh_size`
+    // u64. A corrupt file claiming a ~281 TB string table still parses (the
+    // lazy walk skips unreadable names), so without a clamp one 15 KB file
+    // would saturate the whole capture budget. Facts must stay correct —
+    // success with empty exports, exactly like the snapshot oracle — while
+    // the charge stays within the bytes that could physically have moved.
+    let d = tmp("elf-export-facts-lying-dynstr");
+    let provider = cc_so(&d, "provider", provider_source());
+    let original = std::fs::read(&provider).unwrap();
+    let mut bytes = original.clone();
+    let (_, link) = section_offset_mut(&mut bytes, elf::SHT_DYNSYM).unwrap();
+    let (start, size, _) = section_table(&bytes);
+    let dynstr = start + link as usize * size;
+    bytes[dynstr + 32..dynstr + 40].copy_from_slice(&0xFFFF_FFFF_FFFF_u64.to_le_bytes());
+    assert_ne!(bytes, original);
+    let path = d.join("lying-dynstr.so");
+    std::fs::write(&path, &bytes).unwrap();
+
+    let file_len = std::fs::metadata(&path).unwrap().len();
+    let (abi, exports, charged) = sparse_result(&path, REGISTRY)
+        .unwrap_or_else(|error| panic!("a lying dynstr size must skip names, not refuse: {error}"));
+    assert!(
+        exports.is_empty(),
+        "unreadable names must skip: {exports:?}"
+    );
+    assert!(
+        charged <= file_len,
+        "charge must be bounded by the file: {charged} of {file_len}"
+    );
+    let (oracle_abi, oracle_exports) = oracle_facts(&path, REGISTRY).unwrap();
+    assert_eq!(
+        (abi, exports),
+        (oracle_abi, oracle_exports),
+        "facts must equal the snapshot oracle"
+    );
+}
+
+#[test]
 fn export_facts_refuse_an_empty_file_exactly_like_snapshot() {
     // Mapping a 0-length file derefs to an empty slice (memmap2 documents
     // this), so the shared parser refuses it with today's exact snapshot

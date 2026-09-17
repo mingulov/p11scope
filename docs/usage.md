@@ -317,6 +317,11 @@ publishes a skip naming the bound. The default stays 256 by measurement
 
 sudo p11scope profile --cgroup /sys/fs/cgroup/... --max-scan-pids 512 --duration 60 -o observed-profile.json
 
+Views without an executable (kernel threads) and static executables are not
+loader-arming candidates and no longer count as `unavailable`: arming returns
+a silent NotArmable outcome, retried next tick like any unarmed view, while
+genuine arm failures still mark and record as before.
+
 For cgroup event captures, `task/task_newtask` records ordinary non-thread
 creation as a semantic hint and may preserve the parent's proven state while
 the child is refreshed; the creator event itself does not increment

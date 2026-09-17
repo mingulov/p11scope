@@ -1743,6 +1743,18 @@ fn scan_process_view_with_io(
     scan_process_view_with_io_mode(request, view, budget, io, true)
 }
 
+/// Post-read pin check: the export facts read after `before` are trusted only
+/// when a fresh pin still matches it. A mismatch refuses with the changed-file
+/// retry message; a failed re-pin refuses with the pin's own I/O message so a
+/// non-change error is never misdescribed as a change. Fail-safe either way.
+fn check_pin_after_read(after: Result<Pin, String>, before: &Pin) -> Result<(), String> {
+    match after {
+        Ok(pin) if pin == *before => Ok(()),
+        Ok(_) => Err("file changed while it was being scanned — retry".into()),
+        Err(error) => Err(error),
+    }
+}
+
 fn scan_process_view_with_io_mode(
     request: &ScanRequest<'_>,
     view: &ProcessView,
@@ -1946,21 +1958,21 @@ fn scan_process_view_with_io_mode(
                 };
                 // The pin was taken before the bytes were read; a write that lands
                 // during the read must not become the facts the capture trusts.
-                if pin_of(&file).is_ok_and(|after| after == before) {
-                    budget.note_elf_export_facts(
-                        cache_key,
-                        ElfExportFacts {
-                            abi,
-                            exports: exports.clone(),
-                        },
-                    );
-                    (abi, exports)
-                } else {
-                    skipped.push(Skipped {
-                        subject,
-                        reason: "file changed while it was being scanned — retry".into(),
-                    });
-                    continue;
+                match check_pin_after_read(pin_of(&file), &before) {
+                    Ok(()) => {
+                        budget.note_elf_export_facts(
+                            cache_key,
+                            ElfExportFacts {
+                                abi,
+                                exports: exports.clone(),
+                            },
+                        );
+                        (abi, exports)
+                    }
+                    Err(reason) => {
+                        skipped.push(Skipped { subject, reason });
+                        continue;
+                    }
                 }
             }
         };
@@ -4308,5 +4320,40 @@ mod tests {
         let snapshot = ElfSnapshot::read(&file).unwrap();
         assert_eq!(abi, snapshot.abi());
         assert_eq!(exports, snapshot.exports_matching(&wanted).unwrap());
+    }
+
+    /// A3-M1 hardening: a failed post-read re-pin refuses with the pin's own
+    /// I/O message — never folded into the changed-file retry. `before` and
+    /// the mismatching pin are real `pin_of` values from two files (distinct
+    /// inodes, so deterministically unequal); the I/O error carries `pin_of`'s
+    /// verbatim `fstat failed` shape. (An end-to-end injection would need an
+    /// fd-closing hook — racy under parallel tests — or a `pin_of` seam, so
+    /// the decision itself is pinned here; the call-site wiring is enforced
+    /// by the dead-code lint denying an uncalled helper.)
+    #[test]
+    fn post_read_pin_io_error_reports_its_own_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.so");
+        let second = dir.path().join("second.so");
+        std::fs::copy("/bin/sh", &first).unwrap();
+        std::fs::copy("/bin/sh", &second).unwrap();
+        let before = pin_of(&File::open(&first).unwrap()).unwrap();
+        let other = pin_of(&File::open(&second).unwrap()).unwrap();
+        assert_ne!(other, before, "distinct files pin distinctly");
+
+        // The I/O arm: a failed re-pin reports its own message, still refused.
+        let io = "fstat failed: simulated I/O failure".to_string();
+        assert_eq!(
+            check_pin_after_read(Err(io.clone()), &before),
+            Err(io),
+            "a pin I/O error must not be misdescribed as a change"
+        );
+        // The refusal arm: a changed file keeps the retry message.
+        assert_eq!(
+            check_pin_after_read(Ok(other), &before),
+            Err("file changed while it was being scanned — retry".to_string())
+        );
+        // The stable arm: an unchanged file passes with no refusal.
+        assert_eq!(check_pin_after_read(Ok(before), &before), Ok(()));
     }
 }

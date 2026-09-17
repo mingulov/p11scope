@@ -4156,6 +4156,147 @@ fn max_scan_pids_bounds_initial_scan_and_refresh() {
     }
 }
 
+/// ABC-T2 hardening: `Some(0)` via direct `CaptureArgs` construction clamps
+/// to the default, exactly like `None` — `take(0)` is unreachable. An empty
+/// cgroup needs no live members, so the clamp pins down without fixtures.
+#[test]
+fn some_zero_max_scan_pids_clamps_to_default_like_none() {
+    let dir = tempfile::tempdir().expect("a scope directory");
+    std::fs::write(dir.path().join("cgroup.procs"), "").expect("a cgroup.procs");
+    let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
+    let args_with = |max_scan_pids| CaptureArgs {
+        kind: crate::cli::Kind::Profile,
+        modules: vec![],
+        manifests: vec![],
+        hooks: HookRegistry::builtin(),
+        scope: crate::cli::ScopeArg::Cgroup(dir.path().to_path_buf()),
+        metrics: false,
+        duration: None,
+        out: None,
+        max_events: None,
+        ring_bytes: None,
+        drain_interval: None,
+        max_scan_pids,
+        unsafe_requested: false,
+        allow_confined_uretprobe: false,
+    };
+    let zero = Engine::discover(&args_with(Some(0)), &scope, None)
+        .expect("a zero-capped cgroup still captures");
+    let unset = Engine::discover(&args_with(None), &scope, None)
+        .expect("an uncapped cgroup still captures");
+    assert_eq!(
+        zero.max_scan_pids, unset.max_scan_pids,
+        "`Some(0)` behaves identically to `None`"
+    );
+    assert_eq!(
+        zero.max_scan_pids, MAX_SCAN_PIDS,
+        "`Some(0)` clamps to the default"
+    );
+    assert!(
+        zero.views.is_empty() && unset.views.is_empty(),
+        "an empty cgroup admits no views either way"
+    );
+}
+
+/// ABC-T4 hardening: a zero cap short-circuits the refresh sweep to empty —
+/// no maps reads, zero budget charge — while the bound skip still publishes.
+/// (`discover_plan` can no longer see a zero cap after the `Some(0)` clamp,
+/// so the refresh tick is the live carrier of this edge.)
+#[test]
+fn zero_cap_refresh_short_circuits_the_sweep_to_empty() {
+    struct ChildrenGuard(Vec<std::process::Child>);
+    impl Drop for ChildrenGuard {
+        fn drop(&mut self) {
+            for child in &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    let mut children = ChildrenGuard(
+        (0..5)
+            .map(|_| {
+                std::process::Command::new("sleep")
+                    .arg("30")
+                    .spawn()
+                    .unwrap()
+            })
+            .collect(),
+    );
+    let pids: Vec<_> = children.0.iter().map(|child| child.id()).collect();
+    let dir = tempfile::tempdir().expect("a scope directory");
+    let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
+    std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
+    let args = CaptureArgs {
+        kind: crate::cli::Kind::Profile,
+        modules: vec![],
+        manifests: vec![],
+        hooks: HookRegistry::builtin(),
+        scope: crate::cli::ScopeArg::Cgroup(dir.path().to_path_buf()),
+        metrics: false,
+        duration: None,
+        out: None,
+        max_events: None,
+        ring_bytes: None,
+        drain_interval: None,
+        max_scan_pids: None,
+        unsafe_requested: false,
+        allow_confined_uretprobe: false,
+    };
+    let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
+
+    // Readiness (same idiom as the cap sibling): discover only once every
+    // child execed sleep, so no maps read races a fork-exec transition.
+    let self_exe = std::env::current_exe().unwrap();
+    for child in &children.0 {
+        let pid = child.id();
+        let exe = format!("/proc/{pid}/exe");
+        let mut execed = false;
+        for _ in 0..500 {
+            if std::fs::read_link(&exe).is_ok_and(|target| target != self_exe) {
+                execed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(execed, "sleep child {pid} never execed");
+    }
+
+    let mut engine = Engine::discover(&args, &scope, None).expect("an uncapped cgroup captures");
+    let before: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
+
+    engine.max_scan_pids = 0;
+    let budget_before = engine.budget.attempted_io_bytes();
+    refresh_inventory_once(&mut engine);
+    let budget_after = engine.budget.attempted_io_bytes();
+
+    assert_eq!(
+        budget_after - budget_before,
+        0,
+        "a zero cap performs no scan reads on refresh"
+    );
+    let kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
+    assert_eq!(
+        kept, before,
+        "the tick selects nothing new and retires nothing"
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.reason.contains("scanned the first 0")),
+        "the refresh skip still names the effective value: {:?}",
+        engine.counters.object_skips
+    );
+
+    for child in &mut children.0 {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+}
+
 /// Task 3 (cgroup-256 A2): with an exhausted view-ID space, allocation
 /// failure degrades to evidence, never fatal. Two members admitted at cap
 /// two, then a third member arrives: the refresh tick returns `Ok`, keeps
@@ -12994,6 +13135,29 @@ fn retired_view_ids_are_reused_for_new_generations() {
     let reused = engine.allocate_view_id().unwrap();
     assert_eq!(reused, ProcessViewId(7));
     assert!(engine.allocate_view_id().is_err());
+}
+
+/// ABC-T3 hardening: a double release is a silent no-op — the retired pool
+/// holds the ID once, so the next admissions reuse it exactly once and the
+/// ID sequence stays consistent after.
+#[test]
+fn release_view_id_double_release_is_a_silent_noop() {
+    let mut engine = Engine::empty();
+    let first = engine.allocate_view_id().unwrap();
+    let second = engine.allocate_view_id().unwrap();
+    assert_eq!((first, second), (ProcessViewId(0), ProcessViewId(1)));
+    engine.release_view_id(first);
+    engine.release_view_id(first);
+    assert_eq!(
+        engine.allocate_view_id().unwrap(),
+        first,
+        "the released ID is reused exactly once"
+    );
+    assert_eq!(
+        engine.allocate_view_id().unwrap(),
+        ProcessViewId(2),
+        "no duplicate retired entry mints the ID to a second live view"
+    );
 }
 
 /// ABC-T3 coverage: removal-to-reuse end to end. Two views are admitted

@@ -3460,7 +3460,10 @@ fn discover_plan(
     discovered.scope = scope.clone();
     discovered.hooks = a.hooks.clone();
     discovered.module_hints = a.modules.clone();
-    discovered.max_scan_pids = a.max_scan_pids.unwrap_or(MAX_SCAN_PIDS);
+    discovered.max_scan_pids = a
+        .max_scan_pids
+        .filter(|cap| *cap > 0)
+        .unwrap_or(MAX_SCAN_PIDS);
     let (pids, unlisted) = scope_pids(scope);
     attribution::note_all(&unlisted);
     discovered.base_counters.object_skips.extend(unlisted);
@@ -6465,12 +6468,12 @@ impl Engine {
     }
 
     fn release_view_id(&mut self, id: ProcessViewId) {
-        debug_assert!(
-            !self.retired_view_ids.contains(&id.0),
-            "process view ID {} released twice",
-            id.0
-        );
-        self.retired_view_ids.push(id.0);
+        // Skip-if-present: a duplicate retired entry would mint one ID to
+        // two live views, so a double release is a silent no-op rather than
+        // a debug-only abort.
+        if !self.retired_view_ids.contains(&id.0) {
+            self.retired_view_ids.push(id.0);
+        }
     }
 
     fn retain_view_id(&mut self, id: ProcessViewId) -> Result<()> {
@@ -11767,7 +11770,11 @@ impl Engine {
         // the identity, so the sweep (and its per-tick budget charge) is
         // skipped there; over the cap membership is not authoritative, so
         // narrowing `desired` only narrows which new pids get deep-scanned.
-        let desired: BTreeSet<_> = if pids.len() > max_scan_pids {
+        // A zero cap short-circuits to empty: selection could only ever take
+        // nothing, so the sweep reads are skipped outright.
+        let desired: BTreeSet<_> = if max_scan_pids == 0 {
+            BTreeSet::new()
+        } else if pids.len() > max_scan_pids {
             let sweep = sweep_process_maps(&pids, &mut self.budget);
             select_deep_scan_candidates(&sweep, max_scan_pids)
                 .into_iter()

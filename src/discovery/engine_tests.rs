@@ -3005,11 +3005,19 @@ fn arming_a_static_executable_is_not_armable_not_partial() {
     let mut engine = Engine::empty();
     engine.views.push(view);
     let mut session = ScriptedSession::default();
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "the static child is alive entering the arm"
+    );
     let armed = engine.arm_loader_or_partial(
         0,
         &mut session,
         &mut true,
         &mut PendingViewRetirements::new(),
+    );
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "a NotArmable arm leaves the child alive"
     );
     child.0.kill().unwrap();
     child.0.wait().unwrap();
@@ -3080,7 +3088,9 @@ fn genuine_arm_failures_still_mark_partial() {
 
     assert!(
         engine.counters.object_skips.iter().any(|skip| {
-            skip.subject == "live loader arming" && skip.reason == IO_CEILING_REASON
+            skip.subject == "live loader arming"
+                && skip.reason
+                    == "capture attempted-I/O ceiling reached; remaining provider bytes were not read"
         }),
         "today's mark text is kept byte-for-byte: {:?}",
         engine.counters.object_skips

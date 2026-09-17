@@ -1975,6 +1975,32 @@ mod tests {
     }
 
     #[test]
+    fn failed_re_read_keeps_the_first_error() {
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let observer = mapping_file_key(&file).unwrap();
+        assert_ne!(
+            observer.mount_id, 999999,
+            "fixture assumes the fd's mount row is absent from the stale table"
+        );
+        let stale = "999999 1 8:1 / /other rw - ext4 /dev/other rw\n";
+        let rereads = RefCell::new(0usize);
+        let error = identity_of_in_mountinfo_with_reread(&file, stale, || {
+            *rereads.borrow_mut() += 1;
+            Err("stale".into())
+        })
+        .expect_err("a failed re-read must keep the first missing-mount error");
+        assert_eq!(*rereads.borrow(), 1, "the table is re-read exactly once");
+        assert_eq!(
+            error,
+            format!(
+                "mapping identity unavailable: fd mount {} is missing from the mount table",
+                observer.mount_id
+            ),
+            "a failed re-read keeps the first error text byte-for-byte"
+        );
+    }
+
+    #[test]
     fn other_resolution_errors_do_not_re_read_the_table() {
         let file = open_regular(Path::new("/bin/sh")).unwrap();
         let observer = mapping_file_key(&file).unwrap();

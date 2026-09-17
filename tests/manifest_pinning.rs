@@ -1991,7 +1991,20 @@ fn an_object_over_the_byte_budget_is_skipped_naming_the_cap() {
 fn hash_budget_charges_the_prefix_read_before_aggregate_exhaustion() {
     use p11scope::discovery::scan::ScanLimits;
 
-    let (exe, modules) = scan_self();
+    // Flake hardening: a transient empty /proc/self/maps snapshot scans 0
+    // modules under parallel load. Retry bounded; a deterministically
+    // broken scan still fails the assertions below on the last scan.
+    let (exe, modules) = {
+        let mut scan = scan_self();
+        for _ in 0..49 {
+            if !scan.1.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            scan = scan_self();
+        }
+        scan
+    };
     let len = std::fs::metadata(exe).unwrap().len();
     let total_bytes = len - 1;
     let mut budget = CaptureWorkBudget::new(ScanLimits {
@@ -2024,7 +2037,20 @@ fn hash_budget_charges_the_prefix_read_before_aggregate_exhaustion() {
 
 #[test]
 fn expired_deadline_refuses_pin_hash_before_reading() {
-    let (_, modules) = scan_self();
+    // Flake hardening: a transient empty /proc/self/maps snapshot scans 0
+    // modules under parallel load. Retry bounded; a deterministically
+    // broken scan still fails the assertions below on the last scan.
+    let (_, modules) = {
+        let mut scan = scan_self();
+        for _ in 0..49 {
+            if !scan.1.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            scan = scan_self();
+        }
+        scan
+    };
     let mut budget = self_binary_budget();
     budget.set_deadline(Some(0));
     let (pinned, skipped) = p11scope::discovery::identity::pin_scanned_objects(

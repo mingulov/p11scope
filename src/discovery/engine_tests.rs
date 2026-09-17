@@ -4104,6 +4104,25 @@ fn id_exhaustion_publishes_skip_instead_of_failing() {
     };
     let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
 
+    // Readiness (flake hardening): pre-exec a child is a fork of this
+    // dynamic test binary, and its exe link already resolves then (to our
+    // own image) — so only discover once no child's exe link still points
+    // at us. Identical sleep groups keep selection deterministic.
+    let self_exe = std::env::current_exe().unwrap();
+    for child in &children {
+        let pid = child.id();
+        let exe = format!("/proc/{pid}/exe");
+        let mut execed = false;
+        for _ in 0..500 {
+            if std::fs::read_link(&exe).is_ok_and(|target| target != self_exe) {
+                execed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(execed, "sleep child {pid} never execed");
+    }
+
     let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
     assert_eq!(engine.views.len(), 2, "both members admitted at cap two");
     let admitted: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();

@@ -590,7 +590,11 @@ refused on a mismatch — and during capture, where a change sets
 manifest, 256 MiB per manifest object, and 512 MiB across one manifest's
 objects. Separately, one capture-wide 512 MiB attempted-I/O budget covers
 memory scanning and scan-sourced file hashing across every selected process,
-retry, and failed pin, with 64 MiB per scan/hash operation. Decoding stops at
+retry, and failed pin, with 64 MiB per scan/hash operation. Provider export
+checks read only the object's ELF tables via demand paging (bounded), so a
+large provider costs kilobytes of table reads; the per-object gate no longer
+applies to that check, though it still guards memory snapshots and identity
+hashing. Decoding stops at
 512 accepted table candidates, 53,248 table entries, and 512 interface records;
 cgroup discovery considers at most 256 members by default (`--max-scan-pids`)
 and planning has 512 attach slots. Every bounded omission forces `PARTIAL`;

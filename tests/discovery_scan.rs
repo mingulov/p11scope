@@ -576,6 +576,17 @@ fn maps_snapshot_bytes() -> u64 {
         .expect("/proc/self/maps length fits in u64")
 }
 
+/// The ELF-table bytes one export check charges for `so`, as the scan itself
+/// counts them — used to size a budget that admits exactly one object.
+fn elf_table_bytes(so: &Path) -> u64 {
+    let file = std::fs::File::open(so).unwrap();
+    let hooks = HookRegistry::builtin();
+    let wanted = hooks.names();
+    p11scope_manifest::elf::read_export_facts(&file, &wanted)
+        .unwrap()
+        .2
+}
+
 #[test]
 fn the_per_capture_byte_cap_accumulates_across_objects() {
     use std::io::Read as _;
@@ -709,7 +720,8 @@ fn separate_process_scans_cannot_renew_the_capture_byte_budget() {
     load_and_populate(&first);
     load_and_populate(&second);
     let object_bytes = readable_data_bytes(&first);
-    let elf_bytes = std::fs::metadata(&first).unwrap().len();
+    let elf_bytes = elf_table_bytes(&first).max(elf_table_bytes(&second));
+    assert!(elf_bytes < std::fs::metadata(&first).unwrap().len());
     assert_eq!(object_bytes, readable_data_bytes(&second));
     let total_bytes = maps_snapshot_bytes()
         .checked_mul(2)
@@ -755,29 +767,54 @@ fn separate_process_scans_cannot_renew_the_capture_byte_budget() {
     );
 }
 
+/// The version-matrix fixture plus a 256 KiB *initialized* data tail, so the
+/// readable file-backed data exceeds the per-object cap under test. BSS would
+/// not do: uninitialized pages are anonymous, not attributed to the object.
+fn build_padded_fixture(dir: &Path, name: &str) -> PathBuf {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("crates/discover/tests/fixture/version_matrix.c");
+    let pad = dir.join(format!("{name}-pad.c"));
+    std::fs::write(&pad, "char a5_sparse_pad[256 * 1024] = { 1 };\n").unwrap();
+    let so = dir.join(format!("{name}.so"));
+    let ok = Command::new("gcc")
+        .args(["-shared", "-fPIC", "-o"])
+        .arg(&so)
+        .arg(&source)
+        .arg(&pad)
+        .arg("-DMATRIX_INTERFACES=0")
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "gcc failed for {name}");
+    so
+}
+
 #[test]
 fn the_per_object_byte_cap_is_enforced_as_a_skip_not_a_truncation() {
     let _guard = serial_guard();
     let dir = tmp("scan-cap");
-    let so = build_fixture(&dir, "capped", &["-DMATRIX_INTERFACES=0"]);
-    // Admit earlier mount-table identity work, then refuse this valid ELF at
-    // its exact file-size boundary. Padding before dlopen preserves its image.
+    let so = build_padded_fixture(&dir, "capped");
+    load_and_populate(&so);
+    // Admit earlier mount-table identity work, then refuse the memory
+    // snapshot at its exact data-size boundary. The sparse export check
+    // itself is ungated, so the module is still identified by its exports.
     let mountinfo_bytes = u64::try_from(std::fs::read("/proc/self/mountinfo").unwrap().len())
         .expect("mountinfo length fits in u64");
-    let per_object_bytes = std::fs::metadata(&so)
+    let file_bytes = std::fs::metadata(&so).unwrap().len();
+    let data_bytes = readable_data_bytes(&so);
+    assert!(
+        data_bytes > 64 * 1024,
+        "the pad must dominate: {data_bytes}"
+    );
+    let per_object_bytes = file_bytes
+        .min(data_bytes)
+        .checked_sub(1)
         .unwrap()
-        .len()
-        .max(mountinfo_bytes)
-        .max(64 * 1024);
-    let padded_bytes = per_object_bytes.checked_add(1).unwrap();
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(&so)
-        .unwrap()
-        .set_len(padded_bytes)
-        .unwrap();
-    load_and_populate(&so);
-    assert!(readable_data_bytes(&so) <= per_object_bytes);
+        .max(mountinfo_bytes);
+    assert!(
+        per_object_bytes < data_bytes,
+        "the cap must bite the data snapshot: {per_object_bytes} < {data_bytes}"
+    );
     let hooks = HookRegistry::builtin();
     let mut budget = CaptureWorkBudget::new(ScanLimits {
         per_object_bytes,
@@ -799,21 +836,29 @@ fn the_per_object_byte_cap_is_enforced_as_a_skip_not_a_truncation() {
         panic!("scan must be available")
     };
     assert!(
-        modules.iter().all(|m| !m.path.ends_with("capped.so")),
-        "an unread ELF cannot become module authority: {modules:?}"
+        modules.iter().any(|m| m.path.ends_with("capped.so")),
+        "the export check passes, so the module is identified: {modules:?}"
+    );
+    assert!(
+        modules
+            .iter()
+            .filter(|m| m.path.ends_with("capped.so"))
+            .all(|m| m.tables.is_empty()),
+        "an unread snapshot cannot yield tables: {modules:?}"
     );
     assert!(
         skipped.iter().any(|skip| {
             skip.subject.ends_with("capped.so")
                 && skip.reason
                     == format!(
-                        "too_large ({padded_bytes} bytes; per-object cap is {per_object_bytes})"
+                        "too_large ({data_bytes} readable data bytes; per-object cap is \
+                         {per_object_bytes})"
                     )
         }),
         "the cap must be reported as too_large: {skipped:?}"
     );
     let mut exact_budget = CaptureWorkBudget::new(ScanLimits {
-        per_object_bytes: padded_bytes,
+        per_object_bytes: data_bytes,
         total_bytes: 512 * 1024 * 1024,
     });
     let exact = scan_pid(
@@ -838,7 +883,7 @@ fn scan_budget_charges_only_the_prefix_read_before_aggregate_exhaustion() {
     let so = build_fixture(&dir, "prefix-capped", &["-DMATRIX_INTERFACES=0"]);
     load_and_populate(&so);
     let total_bytes = maps_snapshot_bytes()
-        .checked_add(std::fs::metadata(&so).unwrap().len())
+        .checked_add(elf_table_bytes(&so))
         .and_then(|bytes| bytes.checked_add(readable_data_bytes(&so) - 1))
         .expect("capture byte budget fits in u64");
     let hooks = HookRegistry::builtin();

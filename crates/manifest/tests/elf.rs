@@ -1,6 +1,6 @@
 use object::elf;
 use p11scope_manifest::elf::{
-    ElfAbi, ElfSnapshot, entry_file_offset, exports_matching, symbol_file_offset,
+    ElfAbi, ElfSnapshot, entry_file_offset, exports_matching, read_export_facts, symbol_file_offset,
 };
 use std::os::unix::fs::FileExt as _;
 use std::path::{Path, PathBuf};
@@ -523,4 +523,252 @@ fn non_elf_and_foreign_class_are_refused_with_a_named_reason() {
         exports_matching(&file, REGISTRY).unwrap()[0].0,
         "C_GetFunctionList"
     );
+}
+
+// --- A5: demand-paged export facts (mmap + the existing object parser) ---
+
+/// Whole-file oracle: `(abi, exports)` from a retained snapshot.
+fn oracle_facts(path: &Path, wanted: &[&str]) -> Result<(ElfAbi, Vec<(String, u64)>), String> {
+    let file = p11scope_manifest::identity::open_object(path).unwrap();
+    let snapshot = ElfSnapshot::read(&file)?;
+    Ok((snapshot.abi(), snapshot.exports_matching(wanted)?))
+}
+
+// Mirrors the frozen `read_export_facts` return shape.
+#[allow(clippy::type_complexity)]
+fn sparse_result(
+    path: &Path,
+    wanted: &[&str],
+) -> Result<(ElfAbi, Vec<(String, u64)>, u64), String> {
+    let file = p11scope_manifest::identity::open_object(path).unwrap();
+    read_export_facts(&file, wanted)
+}
+
+/// The sparse facts must equal the whole-file oracle exactly — same ABI, same
+/// exports in the same order with the same offsets, or byte-identical errors.
+/// Returns the charged bytes on success.
+fn assert_sparse_matches_oracle(path: &Path, wanted: &[&str]) -> u64 {
+    match (oracle_facts(path, wanted), sparse_result(path, wanted)) {
+        (Ok((abi, exports)), Ok((sparse_abi, sparse_exports, charged))) => {
+            assert_eq!(
+                (sparse_abi, sparse_exports),
+                (abi, exports),
+                "facts for {}",
+                path.display()
+            );
+            assert!(charged > 0, "charge must be nonzero for {}", path.display());
+            charged
+        }
+        (Err(expected), Err(actual)) => {
+            assert_eq!(actual, expected, "error for {}", path.display());
+            0
+        }
+        (oracle, sparse) => panic!(
+            "oracle/sparse disposition differs for {}: {oracle:?} vs {sparse:?}",
+            path.display()
+        ),
+    }
+}
+
+fn assert_bounded_charge(path: &Path, charged: u64) {
+    let file_len = std::fs::metadata(path).unwrap().len();
+    assert!(
+        charged < 1024 * 1024,
+        "charge for {} must be tables, not the file: {charged} of {file_len}",
+        path.display()
+    );
+    assert!(
+        charged < file_len,
+        "charge for {} must be below the whole file: {charged} of {file_len}",
+        path.display()
+    );
+}
+
+fn provider_source() -> &'static str {
+    "unsigned long C_GetFunctionList(void **p){(void)p;return 0;}\n\
+     unsigned long NSC_GetFunctionList(void **p){(void)p;return 0;}\n"
+}
+
+#[test]
+fn export_facts_match_snapshot_on_provider_and_system_objects() {
+    let d = tmp("elf-export-facts-oracle");
+    let provider = cc_so(&d, "provider", provider_source());
+    let charged = assert_sparse_matches_oracle(&provider, REGISTRY);
+    assert_bounded_charge(&provider, charged);
+    let (_, exports) = oracle_facts(&provider, REGISTRY).unwrap();
+    assert!(
+        !exports.is_empty(),
+        "the provider fixture must export hooks, or the offsets are unpinned"
+    );
+
+    // A real shell: table-less for the registry, but the ABI and the (empty)
+    // export list must still agree exactly.
+    let sh = Path::new("/bin/sh");
+    let charged = assert_sparse_matches_oracle(sh, REGISTRY);
+    assert_bounded_charge(sh, charged);
+
+    // The system libc exports no registry hooks, so pin it with its own names.
+    let mut saw_libc = false;
+    for candidate in [
+        "/lib/x86_64-linux-gnu/libc.so.6",
+        "/lib64/libc.so.6",
+        "/usr/lib/libc.so.6",
+    ] {
+        if !Path::new(candidate).exists() {
+            continue;
+        }
+        saw_libc = true;
+        let wanted = ["malloc", "printf", "calloc"];
+        let charged = assert_sparse_matches_oracle(Path::new(candidate), &wanted);
+        assert_bounded_charge(Path::new(candidate), charged);
+        let (_, exports) = oracle_facts(Path::new(candidate), &wanted).unwrap();
+        assert!(!exports.is_empty(), "libc must export malloc/printf");
+    }
+    assert!(saw_libc, "the test environment must provide a libc");
+
+    // Installed providers exercise real-world table shapes (GNU_HASH-only
+    // softhsm, p11-kit-trust); absent ones are skipped, never failed.
+    for optional in [
+        "/usr/lib/softhsm/libsofthsm2.so",
+        "/usr/lib/x86_64-linux-gnu/pkcs11/p11-kit-trust.so",
+    ] {
+        if !Path::new(optional).exists() {
+            eprintln!("SKIP: {optional} not installed");
+            continue;
+        }
+        let charged = assert_sparse_matches_oracle(Path::new(optional), REGISTRY);
+        assert_bounded_charge(Path::new(optional), charged);
+    }
+}
+
+#[test]
+fn export_facts_match_snapshot_on_ilp32_provider() {
+    let d = tmp("elf-export-facts-ilp32");
+    let ilp32 = d.join("provider32.so");
+    let ok = Command::new("gcc")
+        .args(["-m32", "-shared", "-fPIC", "-o"])
+        .arg(&ilp32)
+        .arg("-x")
+        .arg("c")
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write as _;
+            child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(provider_source().as_bytes())?;
+            child.wait()
+        })
+        .map(|status| status.success())
+        .unwrap_or(false);
+    assert!(ok, "the W7 test environment requires gcc -m32");
+    let charged = assert_sparse_matches_oracle(&ilp32, REGISTRY);
+    assert_bounded_charge(&ilp32, charged);
+    let (abi, exports) = oracle_facts(&ilp32, REGISTRY).unwrap();
+    assert_eq!(abi, ElfAbi::Ilp32);
+    assert!(!exports.is_empty(), "the ilp32 provider must export hooks");
+}
+
+/// `(shoff, entsize, count)` of the ELF64 section-header table.
+fn section_table(bytes: &[u8]) -> (usize, usize, usize) {
+    assert_eq!(&bytes[..4], b"\x7fELF");
+    assert_eq!(bytes[4], 2, "fixture must be ELF64");
+    (
+        le_u64(bytes, 0x28).try_into().unwrap(),
+        usize::from(le_u16(bytes, 0x3A)),
+        usize::from(le_u16(bytes, 0x3C)),
+    )
+}
+
+fn section_offset_mut(bytes: &mut [u8], kind: u32) -> Option<(usize, u32)> {
+    let (start, size, count) = section_table(bytes);
+    (0..count)
+        .map(|index| start + index * size)
+        .find(|offset| {
+            u32::from_le_bytes(bytes[*offset + 4..*offset + 8].try_into().unwrap()) == kind
+        })
+        .map(|offset| {
+            let link = u32::from_le_bytes(bytes[offset + 40..offset + 44].try_into().unwrap());
+            (offset, link)
+        })
+}
+
+#[test]
+fn export_facts_refuse_corrupt_tables_exactly_like_snapshot() {
+    let d = tmp("elf-export-facts-corrupt");
+    let provider = cc_so(&d, "provider", provider_source());
+    let original = std::fs::read(&provider).unwrap();
+
+    // Every corruption below fails inside `classified_object` (the shared
+    // parse core), so the sparse error must be byte-identical to the oracle.
+    let mut bad_magic = original.clone();
+    bad_magic[0..4].copy_from_slice(b"NOPE");
+    let mut big_endian = original.clone();
+    big_endian[5] = 2;
+    // (0xFFFF is PN_XNUM — extended numbering, not a huge count — so a
+    // truncated header table is pinned via e_phoff past EOF instead.)
+    let mut phoff_past_eof = original.clone();
+    phoff_past_eof[0x20..0x28].copy_from_slice(&(original.len() as u64 + 0x1000).to_le_bytes());
+    let mut bad_dynsym = original.clone();
+    let (dynsym, _) = section_offset_mut(&mut bad_dynsym, elf::SHT_DYNSYM).unwrap();
+    bad_dynsym[dynsym + 24..dynsym + 32]
+        .copy_from_slice(&(original.len() as u64 + 0x1000).to_le_bytes());
+    let mut dynsym_overflow = original.clone();
+    let (dynsym, _) = section_offset_mut(&mut dynsym_overflow, elf::SHT_DYNSYM).unwrap();
+    dynsym_overflow[dynsym + 24..dynsym + 32].copy_from_slice(&u64::MAX.to_le_bytes());
+
+    for (case, bytes) in [
+        ("bad-magic", bad_magic),
+        ("short", original[..32].to_vec()),
+        ("text", b"#!/bin/sh\necho hi\n".to_vec()),
+        ("big-endian", big_endian),
+        ("phoff-past-eof", phoff_past_eof),
+        ("dynsym-past-eof", bad_dynsym),
+        ("dynsym-offset-overflow", dynsym_overflow),
+    ] {
+        let path = d.join(case);
+        std::fs::write(&path, bytes).unwrap();
+        assert!(
+            sparse_result(&path, REGISTRY).is_err(),
+            "{case} must error, never answer or panic"
+        );
+        assert_sparse_matches_oracle(&path, REGISTRY);
+    }
+}
+
+#[test]
+fn export_facts_tolerate_an_unreadable_dynstr_exactly_like_snapshot() {
+    // The dynamic-strings table is read lazily per symbol: a past-EOF offset
+    // (non-overflowing, so the eager range check passes) skips names rather
+    // than refusing the file — whatever the oracle does, sparse must match.
+    let d = tmp("elf-export-facts-dynstr");
+    let provider = cc_so(&d, "provider", provider_source());
+    let original = std::fs::read(&provider).unwrap();
+    let mut bytes = original.clone();
+    let (_, link) = section_offset_mut(&mut bytes, elf::SHT_DYNSYM).unwrap();
+    let (start, size, _) = section_table(&bytes);
+    let dynstr = start + link as usize * size;
+    bytes[dynstr + 24..dynstr + 32]
+        .copy_from_slice(&(original.len() as u64 + 0x1000).to_le_bytes());
+    let path = d.join("dynstr-past-eof.so");
+    std::fs::write(&path, &bytes).unwrap();
+    assert_sparse_matches_oracle(&path, REGISTRY);
+}
+
+#[test]
+fn export_facts_refuse_an_empty_file_exactly_like_snapshot() {
+    // Mapping a 0-length file derefs to an empty slice (memmap2 documents
+    // this), so the shared parser refuses it with today's exact snapshot
+    // string — a skip, never a panic and never facts.
+    let d = tmp("elf-export-facts-empty");
+    let empty = d.join("empty.so");
+    std::fs::write(&empty, b"").unwrap();
+    assert!(
+        sparse_result(&empty, REGISTRY).is_err(),
+        "an empty file must error, never answer or panic"
+    );
+    assert_sparse_matches_oracle(&empty, REGISTRY);
 }

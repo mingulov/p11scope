@@ -108,6 +108,29 @@ fn read_elf_snapshot_with(
     })
 }
 
+/// Demand-paged export facts for the scan path: the ELF tables are queried
+/// through a mapping instead of a whole-file snapshot, so no whole-size gate
+/// applies here. The table charge posts to the capture budget all-or-nothing:
+/// when the remaining capture allowance cannot cover it, the path reports the
+/// identical ceiling skip a mid-read abort produces, and the budget saturates.
+fn read_export_facts_budgeted(
+    file: &File,
+    wanted: &[&str],
+    budget: &mut CaptureWorkBudget,
+) -> Result<(ElfAbi, Vec<(String, u64)>), String> {
+    let (abi, exports, charged) = p11scope_manifest::elf::read_export_facts(file, wanted)?;
+    let remaining = budget
+        .limits()
+        .total_bytes
+        .saturating_sub(budget.attempted_io_bytes());
+    if charged > remaining {
+        budget.record_io(usize::try_from(remaining).unwrap_or(usize::MAX));
+        return Err(format!("read failed: {IO_CEILING_REASON}"));
+    }
+    budget.record_io(usize::try_from(charged).unwrap_or(usize::MAX));
+    Ok((abi, exports))
+}
+
 pub(crate) fn read_mountinfo<R: Read>(
     reader: R,
     budget: &mut CaptureWorkBudget,
@@ -1891,19 +1914,9 @@ fn scan_process_view_with_io_mode(
                 continue;
             }
         };
-        if let Some(size) = actual_size {
-            if size > budget.limits().per_object_bytes {
-                let limits = budget.limits();
-                skipped.push(Skipped {
-                    subject,
-                    reason: format!(
-                        "too_large ({size} bytes; per-object cap is {})",
-                        limits.per_object_bytes,
-                    ),
-                });
-                continue;
-            }
-        }
+        // No whole-size gate on the export check: the tables are demand-paged,
+        // so cost follows touched pages rather than file size. `actual_size`
+        // stays above for hint attribution.
         let cache_key = InspectedFileKey {
             device: key.device,
             inode: key.inode,
@@ -1917,15 +1930,8 @@ fn scan_process_view_with_io_mode(
         let (abi, exports) = match cached {
             Some(facts) => (facts.abi, facts.exports),
             None => {
-                let object = match read_elf_snapshot(&file, budget) {
-                    Ok(object) => object,
-                    Err(reason) => {
-                        skipped.push(Skipped { subject, reason });
-                        continue;
-                    }
-                };
-                let exports = match object.exports_matching(&wanted) {
-                    Ok(exports) => exports,
+                let (abi, exports) = match read_export_facts_budgeted(&file, &wanted, budget) {
+                    Ok(facts) => facts,
                     Err(reason) => {
                         skipped.push(Skipped { subject, reason });
                         continue;
@@ -1937,11 +1943,11 @@ fn scan_process_view_with_io_mode(
                     budget.note_elf_export_facts(
                         cache_key,
                         ElfExportFacts {
-                            abi: object.abi(),
+                            abi,
                             exports: exports.clone(),
                         },
                     );
-                    (object.abi(), exports)
+                    (abi, exports)
                 } else {
                     skipped.push(Skipped {
                         subject,
@@ -4016,6 +4022,33 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("provider.so");
             std::fs::copy("/bin/sh", &path).unwrap();
+            Self::wrap(dir, path)
+        }
+
+        /// A real hook-exporting provider, so sparse tests pin facts — not
+        /// just the absence of facts — on files the whole-size gate refused.
+        fn new_provider() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let c = dir.path().join("provider.c");
+            let path = dir.path().join("provider.so");
+            std::fs::write(
+                &c,
+                "unsigned long C_GetFunctionList(void **p){(void)p;return 0;}\n\
+                 unsigned long NSC_GetFunctionList(void **p){(void)p;return 0;}\n",
+            )
+            .unwrap();
+            let ok = std::process::Command::new("gcc")
+                .args(["-shared", "-fPIC", "-o"])
+                .arg(&path)
+                .arg(&c)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "gcc failed for the provider fixture");
+            Self::wrap(dir, path)
+        }
+
+        fn wrap(dir: tempfile::TempDir, path: PathBuf) -> Self {
             let view = ProcessView::open(ProcessViewId(71), std::process::id()).unwrap();
             let file = File::open(&path).unwrap();
             let key = crate::discovery::identity::retained_object_key(
@@ -4069,12 +4102,13 @@ mod tests {
         assert!(file_len > 0, "the fixture must have bytes worth caching");
         let mut budget = CaptureWorkBudget::default();
 
-        // First scan reads the whole ELF (plus maps and the mount table).
+        // First scan reads the sparse ELF tables (plus maps and the mount table).
         let first = fixture.scan(&mut budget);
         let charged_first = budget.attempted_io_bytes();
         assert!(
-            charged_first >= file_len,
-            "first scan charges the ELF read: {charged_first} >= {file_len}"
+            charged_first < file_len,
+            "first scan charges sparse ELF tables, not the whole file: \
+             {charged_first} < {file_len}"
         );
         assert_eq!(first.modules().len(), 1, "skipped: {:?}", first.skipped());
 
@@ -4095,6 +4129,10 @@ mod tests {
         assert!(
             charged_second < file_len,
             "second scan must not re-read {file_len} ELF bytes (charged {charged_second})"
+        );
+        assert!(
+            charged_second < charged_first,
+            "the cache hit charges no ELF bytes: {charged_second} < {charged_first}"
         );
     }
 
@@ -4117,14 +4155,23 @@ mod tests {
         drop(rewritten);
         let new_len = std::fs::metadata(&fixture.path).unwrap().len();
 
-        // A changed file misses the cache: the ELF bytes are read and charged again.
+        // A changed file misses the cache: the ELF tables are read and charged again.
         let second = fixture.scan(&mut budget);
         let charged_second = budget.attempted_io_bytes() - charged_first;
         assert!(
-            charged_second >= new_len,
-            "changed file is read again: {charged_second} >= {new_len}"
+            charged_second < new_len,
+            "changed file is re-read sparsely: {charged_second} < {new_len}"
         );
         assert_eq!(second.modules().len(), 1, "skipped: {:?}", second.skipped());
+
+        // A third scan hits the new pin: strictly fewer bytes than the re-read.
+        let third = fixture.scan(&mut budget);
+        let charged_third = budget.attempted_io_bytes() - charged_first - charged_second;
+        assert_eq!(third.modules().len(), 1, "skipped: {:?}", third.skipped());
+        assert!(
+            charged_third < charged_second,
+            "the re-read tables are cached again: {charged_third} < {charged_second}"
+        );
 
         // The reported facts come from the new bytes, not the cached read.
         let file = File::open(&fixture.path).unwrap();
@@ -4139,5 +4186,114 @@ mod tests {
             .collect();
         assert_eq!(second.modules()[0].decoder_abi, Some(snapshot.abi()));
         assert_eq!(second.modules()[0].exports, expected);
+    }
+
+    #[test]
+    fn oversize_file_exports_are_checked_sparsely() {
+        // A hook-exporting provider sparsely extended past the per-object cap
+        // (the libxul shape): the export check still reports facts, charging
+        // tables rather than the file.
+        let mut fixture = ElfExportFactsFixture::new_provider();
+        let oversize = ScanLimits::default().per_object_bytes + 1024 * 1024;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fixture.path)
+            .unwrap()
+            .set_len(oversize)
+            .unwrap();
+        let file_len = std::fs::metadata(&fixture.path).unwrap().len();
+        assert!(file_len > ScanLimits::default().per_object_bytes);
+
+        let mut budget = CaptureWorkBudget::default();
+        let outcome = fixture.scan(&mut budget);
+        assert_eq!(
+            outcome.modules().len(),
+            1,
+            "skipped: {:?}",
+            outcome.skipped()
+        );
+        assert!(
+            !outcome.modules()[0].exports.is_empty(),
+            "hook exports must be reported past the per-object cap"
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .all(|skip| !skip.reason.contains("too_large")),
+            "no whole-size gate on the export check: {:?}",
+            outcome.skipped()
+        );
+        assert!(
+            budget.attempted_io_bytes() < file_len,
+            "charged bytes must be tables, not the {file_len}-byte file: {}",
+            budget.attempted_io_bytes()
+        );
+    }
+
+    #[test]
+    fn sparse_read_charges_bounded_bytes() {
+        // A 2 MiB provider: a whole-file read would charge megabytes, while
+        // the export tables cost kilobytes.
+        let mut fixture = ElfExportFactsFixture::new_provider();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fixture.path)
+            .unwrap()
+            .set_len(2 * 1024 * 1024)
+            .unwrap();
+
+        let mut budget = CaptureWorkBudget::default();
+        let outcome = fixture.scan(&mut budget);
+        assert_eq!(
+            outcome.modules().len(),
+            1,
+            "skipped: {:?}",
+            outcome.skipped()
+        );
+        assert!(
+            !outcome.modules()[0].exports.is_empty(),
+            "hook exports must be reported"
+        );
+        assert!(
+            budget.attempted_io_bytes() < 1024 * 1024,
+            "first scan must charge ELF tables, not the 2 MiB file: {}",
+            budget.attempted_io_bytes()
+        );
+    }
+
+    #[test]
+    fn sparse_export_charge_applies_capture_ceiling_post_hoc() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provider.so");
+        std::fs::copy("/bin/sh", &path).unwrap();
+        let file = File::open(&path).unwrap();
+        let hooks = HookRegistry::builtin();
+        let wanted = hooks.names();
+
+        // No room for even the ELF header: the identical ceiling skip today's
+        // mid-read abort produces, with the budget saturated as today.
+        let mut budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: 10,
+        });
+        let error = read_export_facts_budgeted(&file, &wanted, &mut budget).unwrap_err();
+        assert_eq!(error, format!("read failed: {IO_CEILING_REASON}"));
+        assert_eq!(budget.attempted_io_bytes(), 10);
+
+        // Room for the tables: bounded bytes charged, facts equal the oracle.
+        let mut budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        });
+        let (abi, exports) = read_export_facts_budgeted(&file, &wanted, &mut budget).unwrap();
+        let charged = budget.attempted_io_bytes();
+        assert!(
+            charged > 0 && charged < 1024 * 1024,
+            "the tables must cost bounded bytes: {charged}"
+        );
+        let snapshot = ElfSnapshot::read(&file).unwrap();
+        assert_eq!(abi, snapshot.abi());
+        assert_eq!(exports, snapshot.exports_matching(&wanted).unwrap());
     }
 }

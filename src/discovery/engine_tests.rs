@@ -14172,7 +14172,20 @@ fn coordinator_reuses_one_budget_across_process_scans_and_hashes() {
         .map(|m| m.end - m.start)
         .sum();
     let hash_bytes = std::fs::metadata(&exe).unwrap().len();
-    let elf_snapshot_bytes = hash_bytes;
+    // The scan path charges only the ELF tables it queries, not the whole file.
+    let elf_snapshot_bytes = {
+        let file = std::fs::File::open(&exe).unwrap();
+        let hooks = HookRegistry::builtin();
+        let wanted = hooks.names();
+        let tables = p11scope_manifest::elf::read_export_facts(&file, &wanted)
+            .unwrap()
+            .2;
+        assert!(
+            tables < hash_bytes,
+            "the tables must cost less than the {hash_bytes}-byte executable: {tables}"
+        );
+        tables
+    };
     // Both complete maps snapshots belong to each scan operation.
     let scan_pass = maps_bytes.len() as u64 * 2 + scan_bytes;
     // The ELF snapshot is read once per capture: the second scan reuses the first

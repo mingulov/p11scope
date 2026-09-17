@@ -7,6 +7,7 @@ use std::ops::Range;
 
 use crate::identity::{read_object_bytes, read_object_bytes_with};
 use object::read::elf::ProgramHeader as _;
+use object::read::elf::SectionHeader as _;
 use object::{Architecture, BinaryFormat, Object as _, ObjectSegment as _, ObjectSymbol as _, elf};
 
 const MAX_INTERPRETER_BYTES: usize = 4096;
@@ -271,18 +272,90 @@ impl ElfSnapshot {
 
     pub fn exports_matching(&self, wanted: &[&str]) -> Result<Vec<(String, u64)>, String> {
         let object = parse(&self.data)?;
-        let mut found = Vec::new();
-        for symbol in object.dynamic_symbols() {
-            let Ok(name) = symbol.name() else { continue };
-            if !wanted.contains(&name) || !symbol.is_definition() {
-                continue;
-            }
-            if let Some(offset) = file_offset(&object, symbol.address()) {
-                found.push((name.to_string(), offset));
-            }
-        }
-        Ok(found)
+        Ok(exports_matching_in_object(&object, wanted))
     }
+}
+
+/// The shared exports walk: names from `wanted` that the image exports in
+/// `.dynsym`, in dynsym order with their file offsets. Per-symbol faults skip
+/// the symbol; the walk itself cannot fail.
+fn exports_matching_in_object(object: &object::File<'_>, wanted: &[&str]) -> Vec<(String, u64)> {
+    let mut found = Vec::new();
+    for symbol in object.dynamic_symbols() {
+        let Ok(name) = symbol.name() else { continue };
+        if !wanted.contains(&name) || !symbol.is_definition() {
+            continue;
+        }
+        if let Some(offset) = file_offset(object, symbol.address()) {
+            found.push((name.to_string(), offset));
+        }
+    }
+    found
+}
+
+/// Structural bytes the export query logically consumed: the ELF header, the
+/// program- and section-header tables, and the dynamic-symbol, dynamic-string
+/// and dynamic tables as present. Computed from the parsed tables — an honest
+/// lower bound any correct implementation must move.
+fn export_table_bytes(object: &object::File<'_>) -> u64 {
+    macro_rules! tables {
+        ($elf:expr) => {{
+            let elf = $elf;
+            let endian = elf.endian();
+            let mut bytes = std::mem::size_of_val(elf.elf_header()) as u64;
+            bytes = bytes.saturating_add(std::mem::size_of_val(elf.elf_program_headers()) as u64);
+            let sections = elf.elf_section_table();
+            let shdr = sections
+                .iter()
+                .next()
+                .map(|header| {
+                    (sections.len() as u64).saturating_mul(std::mem::size_of_val(header) as u64)
+                })
+                .unwrap_or(0);
+            bytes = bytes.saturating_add(shdr);
+            let dynsym = elf.elf_dynamic_symbol_table();
+            bytes = bytes.saturating_add(std::mem::size_of_val(dynsym.symbols()) as u64);
+            let strings = dynsym.string_section();
+            if strings.0 != 0 {
+                if let Ok(header) = sections.section(strings) {
+                    let size: u64 = header.sh_size(endian).into();
+                    bytes = bytes.saturating_add(size);
+                }
+            }
+            if let Ok(dynamic) = elf.elf_dynamic_table() {
+                bytes = bytes.saturating_add(std::mem::size_of_val(dynamic.dynamics()) as u64);
+            }
+            bytes
+        }};
+    }
+    match object {
+        object::File::Elf32(object) => tables!(object),
+        object::File::Elf64(object) => tables!(object),
+        // Only reachable without the `classified_object` gate, which the one
+        // caller applies; no ELF tables exist to charge.
+        _ => 0,
+    }
+}
+
+/// `(abi, exports)` for `wanted` without reading the whole file: the image is
+/// demand-paged through a shared mapping and queried with the same
+/// `object`-based core as [`ElfSnapshot`], so facts and refusals agree
+/// exactly with the snapshot oracle. Returns the structural table bytes the
+/// query logically consumed, for budget charging. Every mapping failure takes
+/// the read-failure skip shape; parsed bytes are never retained.
+// The tuple return is the frozen A5 API; no alias without a new public type.
+#[allow(clippy::type_complexity)]
+pub fn read_export_facts(
+    file: &std::fs::File,
+    wanted: &[&str],
+) -> Result<(ElfAbi, Vec<(String, u64)>, u64 /* charged_bytes */), String> {
+    // SAFETY: a read-only shared mapping of the file; the bytes are only read
+    // through the parser's checked accessors, never written or retained.
+    let mmap =
+        unsafe { memmap2::Mmap::map(file) }.map_err(|error| format!("read failed: {error}"))?;
+    let (object, abi) = classified_object(&mmap)?;
+    let exports = exports_matching_in_object(&object, wanted);
+    Ok((abi, exports, export_table_bytes(&object)))
 }
 
 /// Names from `wanted` that the object exports in .dynsym, with their file offsets.

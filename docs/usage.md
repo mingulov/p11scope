@@ -348,9 +348,11 @@ bounded `PARTIAL` evidence: only that retained view's claims are removed, and
 the plan is rebuilt from stable already-opened inputs without reopening files,
 rehashing, or renewing discovery budgets. Ordinary-file candidates merge only
 after comparable opened-file identity and digest agree; an incomparable
-collision group fails closed. The existing overlay-only byte-identical collapse
-is the sole heuristic exception and publishes uncertainty that forces
-`PARTIAL`.
+collision group fails closed. The same file observed through two mount
+namespaces (a container sharing the host's provider) merges by open-file
+identity plus digest instead of failing the group. The existing overlay-only
+byte-identical collapse is the sole heuristic exception and publishes
+uncertainty that forces `PARTIAL`.
 
 **Historical pre-terminal-drain output**, `profile --mode metrics` against a
 SoftHSM2 workload (`scripts/verify-attach-e2e.sh`). Current written captures

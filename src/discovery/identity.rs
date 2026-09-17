@@ -3,6 +3,13 @@
 //! detection via `(ino, size, ctime)`; it is not a security boundary — the leased,
 //! provenance-checked verification path it replaces was removed by
 //! Productization Slice 1a (formerly `src/verify.rs`, restorable from history).
+//!
+//! Mount-table churn tolerance: view-local identity resolution re-reads the
+//! view's `/proc/<pid>/mountinfo` exactly once when the fd's mount row is
+//! missing from the first read, then re-resolves in the fresh table. Any other
+//! resolution failure — or a mount still missing after the re-read — fails
+//! with today's error text unchanged, so the retry only ever converts churn
+//! flakes into successes and never masks a genuine failure.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::{AsRawFd as _, RawFd};
@@ -13,7 +20,8 @@ use std::sync::Arc;
 use p11scope_manifest::elf::ElfAbi;
 use p11scope_manifest::identity::{
     IdentityKind, InspectedObject, MappingFileKey, inspect_file, inspect_file_with_reader,
-    mapping_file_key, mapping_file_key_in_mountinfo, open_object, open_regular,
+    is_missing_mount_id_error, mapping_file_key, mapping_file_key_in_mountinfo, open_object,
+    open_regular,
 };
 use p11scope_manifest::manifest::{Manifest, Resolution};
 use p11scope_manifest::maps::{Device, ObjectKey};
@@ -861,6 +869,27 @@ fn identity_of_in_mountinfo(
         .map_err(|error| format!("mapping identity unavailable: {error}"))
 }
 
+/// Resolves `file` in this view's mount table, re-reading the table once when
+/// the fd's mount row is missing (mount-table churn races the first read).
+/// The fd stays open across the retry, so its mount cannot be detached
+/// underneath the re-resolution, and the re-read runs under the same retained
+/// view checks as the first read. The retry is purely opportunistic: success
+/// returns the key, while persistent absence — or a failed re-read — returns
+/// today's error text unchanged. No other error retries.
+fn identity_of_in_mountinfo_with_reread(
+    file: &std::fs::File,
+    mountinfo: &str,
+    reread: impl FnOnce() -> Result<String, String>,
+) -> Result<MappingFileKey, String> {
+    match identity_of_in_mountinfo(file, mountinfo) {
+        Err(error) if is_missing_mount_id_error(&error) => match reread() {
+            Ok(fresh) => identity_of_in_mountinfo(file, &fresh),
+            Err(_) => Err(error),
+        },
+        outcome => outcome,
+    }
+}
+
 /// The `/proc/<pid>/maps`-comparable identity of one object reached through a
 /// retained process view. Live loader arming finds the executable and its
 /// PT_INTERP by matching this against `ObjectKey::of(mapping)`, so it has to be
@@ -873,7 +902,11 @@ pub fn open_view_object(
     budget: &mut CaptureWorkBudget,
 ) -> Result<(std::fs::File, ObjectKey), String> {
     let (file, mountinfo) = view.open_then_mountinfo(|| open_regular(path), budget)?;
-    let key = object_key(identity_of_in_mountinfo(&file, &mountinfo)?);
+    let key = object_key(identity_of_in_mountinfo_with_reread(
+        &file,
+        &mountinfo,
+        || Ok(view.open_then_mountinfo(|| Ok(()), budget)?.1),
+    )?);
     Ok((file, key))
 }
 
@@ -893,7 +926,11 @@ pub fn retained_object_key(
     budget: &mut CaptureWorkBudget,
 ) -> Result<ObjectKey, String> {
     let ((), mountinfo) = view.open_then_mountinfo(|| Ok(()), budget)?;
-    Ok(object_key(identity_of_in_mountinfo(file, &mountinfo)?))
+    Ok(object_key(identity_of_in_mountinfo_with_reread(
+        file,
+        &mountinfo,
+        || Ok(view.open_then_mountinfo(|| Ok(()), budget)?.1),
+    )?))
 }
 
 fn object_key(mapping: MappingFileKey) -> ObjectKey {
@@ -1602,7 +1639,9 @@ fn pin_scanned_object(
         || open_object(Path::new(&format!("/proc/{}/root{}", view.pid(), raw.path))),
         budget,
     )?;
-    let found = identity_of_in_mountinfo(&file, &mountinfo)?;
+    let found = identity_of_in_mountinfo_with_reread(&file, &mountinfo, || {
+        Ok(view.open_then_mountinfo(|| Ok(()), budget)?.1)
+    })?;
     if object_key(found) != raw.key {
         return Err(format!(
             "identity_mismatch: the mapping is {:?} but {} now opens as {:?} \
@@ -1876,6 +1915,85 @@ mod tests {
         let (opened, key) = open_view_object(&view, path, &mut CaptureWorkBudget::default())
             .expect("the same caller accepts the EOF-proven complete table");
         assert_eq!(key, object_key(identity_of(&opened).unwrap()));
+    }
+
+    #[test]
+    fn a_missing_mount_id_re_reads_the_table_once_before_failing() {
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let observer = mapping_file_key(&file).unwrap();
+        // A table that names every mount except this fd's own: the resolver
+        // reports the mount missing, exactly as under mount-table churn.
+        assert_ne!(
+            observer.mount_id, 999999,
+            "fixture assumes the fd's mount row is absent from the stale table"
+        );
+        let stale = "999999 1 8:1 / /other rw - ext4 /dev/other rw\n";
+        let fresh = format!(
+            "{} 1 9:9 / /target rw - ext4 /dev/target rw\n",
+            observer.mount_id
+        );
+        let rereads = RefCell::new(0usize);
+        let found = identity_of_in_mountinfo_with_reread(&file, stale, || {
+            *rereads.borrow_mut() += 1;
+            Ok(fresh.clone())
+        })
+        .expect("one re-read must heal a churned mount row");
+        assert_eq!(*rereads.borrow(), 1, "the table is re-read exactly once");
+        assert_eq!(found.mount_id, observer.mount_id);
+        assert_eq!(
+            (found.device_major, found.device_minor),
+            (9, 9),
+            "the key must resolve in the re-read table, not the stale one"
+        );
+        assert_eq!(found.inode, observer.inode, "inode still comes from fstat");
+    }
+
+    #[test]
+    fn a_persistently_missing_mount_id_keeps_todays_error() {
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let observer = mapping_file_key(&file).unwrap();
+        assert_ne!(
+            observer.mount_id, 999999,
+            "fixture assumes the fd's mount row is absent from the stale table"
+        );
+        let stale = "999999 1 8:1 / /other rw - ext4 /dev/other rw\n";
+        let rereads = RefCell::new(0usize);
+        let error = identity_of_in_mountinfo_with_reread(&file, stale, || {
+            *rereads.borrow_mut() += 1;
+            Ok(stale.to_string())
+        })
+        .expect_err("a mount missing from both reads must still fail");
+        assert_eq!(*rereads.borrow(), 1, "the table is re-read exactly once");
+        assert_eq!(
+            error,
+            format!(
+                "mapping identity unavailable: fd mount {} is missing from the mount table",
+                observer.mount_id
+            ),
+            "persistent absence keeps today's error text byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn other_resolution_errors_do_not_re_read_the_table() {
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let observer = mapping_file_key(&file).unwrap();
+        // The mount row is present but corrupt: no re-read can heal it.
+        let corrupt = format!(
+            "{} 1 not-a-device / /target rw - ext4 /dev/target rw\n",
+            observer.mount_id
+        );
+        let rereads = RefCell::new(0usize);
+        let error = identity_of_in_mountinfo_with_reread(&file, &corrupt, || {
+            *rereads.borrow_mut() += 1;
+            Ok(corrupt.clone())
+        })
+        .expect_err("an invalid mount device must still fail");
+        assert_eq!(*rereads.borrow(), 0, "only a missing mount id retries");
+        assert!(
+            error.contains("invalid mount device"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

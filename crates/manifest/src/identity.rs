@@ -151,6 +151,16 @@ pub fn mapping_file_key_in_mountinfo(
     })
 }
 
+/// True when `error` is the missing-mount-id failure from
+/// [`mapping_file_key_in_mountinfo`] — the only resolution failure a
+/// mount-table re-read can heal (mount churn races the first read). Matches
+/// the wrapped form too (`mapping identity unavailable: ...`); no other
+/// constructor emits the substring.
+#[cfg(feature = "identify")]
+pub fn is_missing_mount_id_error(error: &str) -> bool {
+    error.contains("is missing from the mount table")
+}
+
 /// Pins the pathname without invoking device/FIFO open semantics, verifies
 /// the pinned inode is regular, then obtains a readable descriptor for that
 /// same inode. Normal provider symlinks remain supported safely.
@@ -322,6 +332,27 @@ mod tests {
             mapping_file_key_in_mountinfo(&file, "999999 1 8:1 / /other rw - ext4 /dev/other rw\n")
                 .expect_err("an absent view-local mount ID must remain incomparable");
         assert!(error.contains("is missing from the mount table"), "{error}");
+    }
+
+    #[test]
+    fn the_missing_mount_classifier_matches_only_the_missing_mount_error() {
+        let file = open_object(Path::new("/bin/sh")).unwrap();
+        let missing =
+            mapping_file_key_in_mountinfo(&file, "999999 1 8:1 / /other rw - ext4 /dev/other rw\n")
+                .expect_err("fixture table lacks the fd's mount");
+        assert!(is_missing_mount_id_error(&missing));
+        assert!(is_missing_mount_id_error(&format!(
+            "mapping identity unavailable: {missing}"
+        )));
+        for other in [
+            "metadata failed: stale",
+            "reading fd mount identity failed: stale",
+            "fd mount identity is missing",
+            "invalid fd mount identity \"x\"",
+            "invalid mount device \"8\"",
+        ] {
+            assert!(!is_missing_mount_id_error(other), "{other}");
+        }
     }
 
     #[test]

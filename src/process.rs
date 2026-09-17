@@ -480,6 +480,27 @@ pub(crate) fn unprovable_process_view_for_test(
     Ok(view)
 }
 
+/// A view pinned by `/proc` start time only, for the no-executable loader
+/// test: the child is killed into a zombie AFTER this opens, so
+/// `/proc/PID/exe` readlinks ENOENT while the retained start time still
+/// matches and `still_the_same()` stays true (the kthread shape — a live
+/// generation with no executable — without needing a kernel thread).
+#[cfg(test)]
+pub(crate) fn start_time_pinned_process_view_for_test(
+    id: ProcessViewId,
+    pid: u32,
+) -> Result<ProcessView, String> {
+    let mut view = ProcessView::open(id, pid)?;
+    let retained = process_start_time(pid)
+        .map_err(|error| format!("cannot build start-time-pinned test view: {error}"))?;
+    view.pin = PidPin {
+        pid,
+        pidfd: None,
+        start_time: Some(retained),
+    };
+    Ok(view)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OriginalGenerationState {
     Current,

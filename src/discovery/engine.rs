@@ -5641,6 +5641,11 @@ fn classify_owned_prearm_attach(
 enum LoaderArmFailure {
     Ordinary(anyhow::Error),
     Invariant(anyhow::Error),
+    /// The view was never an arming candidate: no executable (exe readlink
+    /// ENOENT) or a static executable (locator None). Silent `Ok(false)`,
+    /// no mark, no loader-registry record — retried next tick like any
+    /// unarmed view.
+    NotArmable,
 }
 
 impl LoaderArmFailure {
@@ -5716,6 +5721,7 @@ enum LoaderArmOutcome {
         failure: Option<LoaderArmFailure>,
     },
     Invariant(anyhow::Error),
+    NotArmable,
 }
 
 fn loader_arm_outcome(
@@ -5732,6 +5738,7 @@ fn loader_arm_outcome(
         Ok(changed) => LoaderArmOutcome::Changed(changed),
         Err(LoaderArmFailure::Ordinary(error)) => LoaderArmOutcome::OrdinaryFailure(error),
         Err(LoaderArmFailure::Invariant(error)) => LoaderArmOutcome::Invariant(error),
+        Err(LoaderArmFailure::NotArmable) => LoaderArmOutcome::NotArmable,
     }
 }
 
@@ -9770,6 +9777,19 @@ impl Engine {
         }
     }
 
+    /// True only when `/proc/PID/exe` provably has no target — `read_link`
+    /// fails with `NotFound` (kernel thread, zombie, already-exited). A
+    /// target, or any other error (permissions etc.), falls through to the
+    /// normal locator path, which reports today's failure unchanged.
+    /// Maps-emptiness is never consulted: transient-empty maps must never
+    /// classify a live process.
+    fn loader_exe_is_gone(pid: u32) -> bool {
+        matches!(
+            std::fs::read_link(format!("/proc/{pid}/exe")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        )
+    }
+
     fn arm_loader_for_view(
         &mut self,
         position: usize,
@@ -9782,8 +9802,11 @@ impl Engine {
             return Ok(false);
         }
         let pid = self.views[position].pid();
+        if Self::loader_exe_is_gone(pid) {
+            return Err(LoaderArmFailure::NotArmable);
+        }
         let Some(locator) = Self::loader_locator(&self.views[position], &mut self.budget)? else {
-            return Ok(false);
+            return Err(LoaderArmFailure::NotArmable);
         };
         let loader_path = locator.authority.loader_path.clone();
         let loader_module = mapped_object(
@@ -10306,8 +10329,23 @@ impl Engine {
             .views
             .get(position)
             .is_some_and(|view| view.id() == view_id && view.still_the_same());
-        self.record_loader_arm(view_id, false);
-        match loader_arm_outcome(generation_valid, result) {
+        let outcome = loader_arm_outcome(generation_valid, result);
+        // NotArmable views stay out of the loader aggregate entirely: no
+        // record, so they never inflate the `unavailable` count. Every
+        // other outcome records exactly as today.
+        let not_armable = matches!(
+            outcome,
+            LoaderArmOutcome::NotArmable
+                | LoaderArmOutcome::GenerationLost {
+                    failure: Some(LoaderArmFailure::NotArmable),
+                    ..
+                }
+        );
+        if !not_armable {
+            self.record_loader_arm(view_id, false);
+        }
+        match outcome {
+            LoaderArmOutcome::NotArmable => Ok(false),
             LoaderArmOutcome::Changed(changed) => Ok(changed),
             LoaderArmOutcome::OrdinaryFailure(error) => {
                 self.invalidate_causal_timing();

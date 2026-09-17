@@ -2893,6 +2893,205 @@ fn an_ordinary_dynamic_target_binds_its_live_loader_context() {
     );
 }
 
+/// Task E1: a view whose `/proc/PID/exe` readlinks ENOENT (the kthread
+/// shape — a live generation with no executable) is NotArmable, not
+/// partial: silent `Ok(false)`, no mark, no loader record. The zombie
+/// child below is that shape without needing a kernel thread; the
+/// start-time pin keeps `still_the_same()` true across the kill.
+#[test]
+fn arming_a_view_without_an_executable_is_not_armable_not_partial() {
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let mut child = ChildGuard(
+        std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap(),
+    );
+    let pid = child.0.id();
+    let view =
+        crate::process::start_time_pinned_process_view_for_test(ProcessViewId(0), pid).unwrap();
+    child.0.kill().unwrap();
+    // The unwaited child is now a zombie: its exe link is gone while its
+    // start time still matches the retained pin. Never `wait` here — that
+    // would reap it and change the fixture.
+    let exe = format!("/proc/{pid}/exe");
+    let mut spins = 0;
+    while std::fs::read_link(&exe).is_ok() {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        spins += 1;
+        assert!(spins < 10_000, "SIGKILLed child never became a zombie");
+    }
+    assert_eq!(
+        std::fs::read_link(&exe).map_err(|error| error.kind()),
+        Err(std::io::ErrorKind::NotFound),
+        "the zombie fixture must present exe-ENOENT"
+    );
+    assert!(
+        view.still_the_same(),
+        "the zombie keeps its start-time generation"
+    );
+
+    let mut engine = Engine::empty();
+    engine.views.push(view);
+    let mut session = ScriptedSession::default();
+    let armed = engine.arm_loader_or_partial(
+        0,
+        &mut session,
+        &mut true,
+        &mut PendingViewRetirements::new(),
+    );
+    assert!(!armed.unwrap(), "a view without an executable never arms");
+
+    assert!(
+        engine.counters.object_skips.is_empty(),
+        "NotArmable marks nothing: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine.loader_contexts.is_empty(),
+        "NotArmable records no loader context"
+    );
+    assert!(
+        engine
+            .loader_registry
+            .ids_for_view(ProcessViewId(0))
+            .is_empty()
+    );
+    assert_eq!(engine.loader_discovery().strategies.unavailable, 0);
+}
+
+/// Task E1: a static executable (no PT_INTERP, so the locator returns
+/// `None`) is NotArmable, not partial: silent `Ok(false)`, no mark, no
+/// loader record, no `unavailable` growth.
+#[test]
+fn arming_a_static_executable_is_not_armable_not_partial() {
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    // Canonicalized: the kernel may report the exe link through a
+    // merged-/usr alias (e.g. /usr/bin/busybox for /bin/busybox).
+    let busybox = std::fs::canonicalize("/bin/busybox").unwrap();
+    let mut child = ChildGuard(
+        std::process::Command::new(&busybox)
+            .args(["sleep", "60"])
+            .spawn()
+            .unwrap(),
+    );
+    let pid = child.0.id();
+    // Readiness: pre-exec the child is a fork of this dynamic test binary,
+    // so only open the view once its exe link is the static busybox image.
+    let exe = format!("/proc/{pid}/exe");
+    let mut spins = 0;
+    let execed = || std::fs::read_link(&exe).is_ok_and(|target| target == busybox);
+    while !execed() {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        spins += 1;
+        assert!(spins < 10_000, "busybox child never execed");
+    }
+    let view = ProcessView::open(ProcessViewId(0), pid).unwrap();
+
+    let mut engine = Engine::empty();
+    engine.views.push(view);
+    let mut session = ScriptedSession::default();
+    let armed = engine.arm_loader_or_partial(
+        0,
+        &mut session,
+        &mut true,
+        &mut PendingViewRetirements::new(),
+    );
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    assert!(!armed.unwrap(), "a static executable never arms");
+
+    assert!(
+        engine.counters.object_skips.is_empty(),
+        "NotArmable marks nothing: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine.loader_contexts.is_empty(),
+        "NotArmable records no loader context"
+    );
+    assert!(
+        engine
+            .loader_registry
+            .ids_for_view(ProcessViewId(0))
+            .is_empty()
+    );
+    let aggregate = engine.loader_discovery();
+    assert_eq!(aggregate.strategies.unavailable, 0);
+    assert_eq!(aggregate.dlopen_timing.none, 0);
+}
+
+/// Task E1 pin: a genuine arm failure on a dynamic executable keeps
+/// today's mark text byte-for-byte AND still records (unlike NotArmable).
+/// The starved capture budget refuses the very first maps read.
+#[test]
+fn genuine_arm_failures_still_mark_partial() {
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let mut child = ChildGuard(
+        std::process::Command::new("sh")
+            .args(["-c", "printf R; kill -STOP $$"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut ready = [0_u8; 1];
+    std::io::Read::read_exact(child.0.stdout.as_mut().unwrap(), &mut ready).unwrap();
+    assert_eq!(ready, *b"R");
+    let pid = child.0.id();
+    let view = ProcessView::open(ProcessViewId(0), pid).unwrap();
+    let mut engine = Engine::empty();
+    engine.views.push(view);
+    engine.budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: ScanLimits::default().per_object_bytes,
+        total_bytes: 0,
+    });
+
+    let mut session = ScriptedSession::default();
+    let armed = engine.arm_loader_or_partial(
+        0,
+        &mut session,
+        &mut true,
+        &mut PendingViewRetirements::new(),
+    );
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    assert!(!armed.unwrap(), "a refused arm reports no change");
+
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live loader arming" && skip.reason == IO_CEILING_REASON
+        }),
+        "today's mark text is kept byte-for-byte: {:?}",
+        engine.counters.object_skips
+    );
+    assert_eq!(
+        engine.loader_discovery().strategies.unavailable,
+        1,
+        "a genuine failure still records its context"
+    );
+}
+
 #[test]
 fn loader_budget_refusals_keep_named_causes_and_fail_closed_cleanup() {
     let (fixture, view, _module, _pins) = loaded_seed_provider();

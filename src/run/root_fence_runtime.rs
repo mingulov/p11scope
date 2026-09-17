@@ -580,12 +580,13 @@ fn scenario(
     Ok(())
 }
 
+// TMPDIR-honoring: test temp lives under the workspace tmp dir (see AGENTS.md); the 108-byte control-socket guard below still fails loudly if a TMPDIR is ever too long.
+fn control_dir() -> std::io::Result<tempfile::TempDir> {
+    tempfile::Builder::new().prefix("p11root-").tempdir()
+}
+
 fn run_mode(stage: &Path, kind: Kind) -> Result<()> {
-    // Short pathname for sockaddr_un; do not put control sockets in the long
-    // evidence stage. Transfer this private directory to the actual child UID.
-    let directory = tempfile::Builder::new()
-        .prefix("p11root-")
-        .tempdir_in("/tmp")?;
+    let directory = control_dir()?;
     let mut owner = None;
     let mut active = None;
     let result = (|| {
@@ -643,4 +644,14 @@ fn actual_original_exit_delayed_first_admission_retires_pending() -> Result<()> 
     // Separate owned process, session, map, reducer state, and consumed token.
     run_mode(&stage, Kind::Profile)?;
     run_mode(&stage, Kind::Trace)
+}
+
+#[test]
+fn control_directory_honors_the_process_temp_dir() {
+    let directory = control_dir().expect("control dir must create");
+    assert_eq!(
+        directory.path().parent(),
+        Some(std::env::temp_dir().as_path()),
+        "staging must live under TMPDIR, not /tmp"
+    );
 }

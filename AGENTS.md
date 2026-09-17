@@ -21,9 +21,10 @@
 
 ## Checks
 
+Test temp I/O goes to /var/tmp/p11scope-ws-tmp (big disk, sticky-trusted; create 0700 if missing), never tmpfs /tmp (EDQUOT at scale): prefix test runs with TMPDIR as below.
 ```sh
 mise exec -- ./scripts/cargo.sh +1.88 fmt --all -- --check
 mise exec -- ./scripts/cargo.sh +1.88 check --locked --workspace --all-targets
-mise exec -- ./scripts/cargo.sh +1.88 test --locked --workspace --all-targets
+TMPDIR=/var/tmp/p11scope-ws-tmp mise exec -- ./scripts/cargo.sh +1.88 test --locked --workspace --all-targets
 mise exec -- ./scripts/cargo.sh +1.88 clippy --locked --workspace --all-targets -- -D warnings
 ```

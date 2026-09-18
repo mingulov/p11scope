@@ -5,13 +5,16 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib.util
 import json
 import os
 from pathlib import Path
 import stat
 import subprocess
 import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.dont_write_bytecode = True
+from _loader import load_path
 
 
 SCHEMA_VERSION = 1
@@ -34,12 +37,7 @@ class EvidenceError(Exception):
 
 
 def _load_module(path: Path, name: str):
-    spec = importlib.util.spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        raise EvidenceError(f"cannot load {path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return load_path(path, name)
 
 
 def _json_bytes(value: object) -> bytes:

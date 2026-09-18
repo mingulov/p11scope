@@ -47,7 +47,7 @@ class PreparedReleaseDriverTests(unittest.TestCase):
             environment.pop(name, None)
         overrides = {"PATH": str(fixture.fake_bin) + ":" + os.environ["PATH"], "HOME": str(fixture.home)}
         environment.update(overrides)
-        return fixture.command(["/bin/sh", str(fixture.repo / "scripts/verify-task4-lane16.sh"), str(fixture.root), mode],
+        return fixture.command(["/bin/sh", str(fixture.repo / "scripts/verify-receipt-lane16.sh"), str(fixture.root), mode],
                                environment=environment, overrides=overrides, removed=SEAL["BUILD_INPUT_VARIABLES"])
 
     def events(self, fixture):
@@ -136,7 +136,7 @@ class PreparedReleaseDriverTests(unittest.TestCase):
     def test_lane16_build_uses_selected_cargo_rustc_and_offline_flags(self):
         fixture = self.fixture("lane16", "build paths with spaces")
         fixture.root.mkdir()
-        source = (fixture.repo / "scripts/verify-task4-lane16.sh").read_text()
+        source = (fixture.repo / "scripts/verify-receipt-lane16.sh").read_text()
         start = 'CARGO_TARGET_DIR="$ROOT/work/target" \\\n'
         end = 'gcc -O0 -o "$ROOT/work/hammer"'
         self.assertEqual(source.count(start), 1)
@@ -183,7 +183,10 @@ class PreparedReleaseDriverTests(unittest.TestCase):
                     if path.name not in (".git", "scripts"):
                         shutil.rmtree(path) if path.is_dir() else path.unlink()
                 for path in (fixture.repo / "scripts").iterdir():
-                    if path.name not in ("build-release.sh", "lib.sh", "check-capture-evidence.py"):
+                    # The finalizer fragment is the driver's own relocated code,
+                    # not a new helper: scenarios that reach finalization execute it.
+                    if path.name not in ("build-release.sh", "lib.sh", "check-capture-evidence.py",
+                                         "lane-build-release-oracle-3.py"):
                         shutil.rmtree(path) if path.is_dir() else path.unlink()
                 for args in (["add", "-A"], ["-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "minimal early-refusal fixture"]):
                     result = fixture.command(["git", "-C", str(fixture.repo), *args])
@@ -199,7 +202,7 @@ class PreparedReleaseDriverTests(unittest.TestCase):
                     extra["HOME"] = ""
                     expected = "cannot evaluate the effective cargo home"
                 elif scenario == "forged":
-                    extra["P11SCOPE_TASK4_SEALED"] = "1"
+                    extra["P11SCOPE_RECEIPT_SEALED"] = "1"
                     expected = "unsealed or forged"
                 else:
                     fixture.root = fixture.root.with_name("evidence\troot")

@@ -8,7 +8,6 @@ pass. Branches whose acquisition boundary or fixture is a stand-in carry
 takes no target-width argument.
 """
 import errno
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -23,12 +22,13 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 
+sys.path.insert(0, str(ROOT / "scripts"))
+sys.dont_write_bytecode = True
+from _loader import load_path
+
 
 def load(name, relative):
-    spec = importlib.util.spec_from_file_location(name, ROOT / relative)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return load_path(ROOT / relative, name)
 
 
 qualifier = load('qualifier', 'scripts/qualify-task-storage-canary.py')

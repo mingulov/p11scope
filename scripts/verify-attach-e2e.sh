@@ -13,90 +13,7 @@ cd "$(dirname "$0")/.."
 # The lane oracle, in one place. `--self-test` runs it over synthetic evidence
 # and requires every claimed field to refuse a mutation, unprivileged.
 assert_lane_evidence() {
-    python3 -I - "$@" <<'PY'
-import copy
-import json
-import sys
-
-
-def oracle(document, lane):
-    evidence = document["evidence"]
-    discovery = evidence["discovery"]
-    assert evidence["authority"] == "hash-pinned", evidence["authority"]
-    assert document["capture"]["modules"][0]["path"].endswith("libsofthsm2.so"), document["capture"]
-    if lane == "scan":
-        assert [m["sources"] for m in discovery] == [["scan"]], discovery
-        assert [m["corroborated"] for m in discovery] == [False], discovery
-        assert [m["corroboration"] for m in discovery] == [["single_source"]], discovery
-    else:
-        assert [m["sources"] for m in discovery] == [["scan", "manifest"]], discovery
-        assert [m["corroborated"] for m in discovery] == [True], discovery
-        assert [m["corroboration"] for m in discovery] == [["agreed"]], discovery
-        assert evidence["discovery_conflicts"] == 0, evidence["discovery_conflicts"]
-        assert evidence["discovery_uncorroborated"] == 0, evidence["discovery_uncorroborated"]
-
-
-def good(lane):
-    corroborated = lane != "scan"
-    return {
-        "evidence": {
-            "authority": "hash-pinned",
-            "discovery": [
-                {
-                    "sources": ["scan", "manifest"] if corroborated else ["scan"],
-                    "corroborated": corroborated,
-                    "corroboration": ["agreed"] if corroborated else ["single_source"],
-                }
-            ],
-            "discovery_conflicts": 0,
-            "discovery_uncorroborated": 0,
-        },
-        "capture": {"modules": [{"path": "/usr/lib/softhsm/libsofthsm2.so"}]},
-    }
-
-
-def mutate(document, path, value):
-    mutated = copy.deepcopy(document)
-    cursor = mutated
-    for key in path[:-1]:
-        cursor = cursor[key]
-    cursor[path[-1]] = value
-    return mutated
-
-
-if sys.argv[1] == "--self-test":
-    lanes = {
-        "scan": [
-            ("authority", ["evidence", "authority"], "unpinned"),
-            ("scan-only sources", ["evidence", "discovery", 0, "sources"], ["scan", "manifest"]),
-            ("uncorroborated flag", ["evidence", "discovery", 0, "corroborated"], True),
-            ("single-source label", ["evidence", "discovery", 0, "corroboration"], ["agreed"]),
-            ("captured module", ["capture", "modules", 0, "path"], "/tmp/other.so"),
-        ],
-        "manifest": [
-            ("authority", ["evidence", "authority"], "unpinned"),
-            ("corroborated sources", ["evidence", "discovery", 0, "sources"], ["scan"]),
-            ("corroborated flag", ["evidence", "discovery", 0, "corroborated"], False),
-            ("agreement label", ["evidence", "discovery", 0, "corroboration"], ["single_source"]),
-            ("discovery conflicts", ["evidence", "discovery_conflicts"], 1),
-            ("uncorroborated count", ["evidence", "discovery_uncorroborated"], 1),
-        ],
-    }
-    for lane, mutations in lanes.items():
-        oracle(good(lane), lane)
-        for label, path, value in mutations:
-            try:
-                oracle(mutate(good(lane), path, value), lane)
-            except (AssertionError, KeyError, IndexError):
-                continue
-            raise SystemExit(f"mutation accepted: {lane} {label}")
-    print("attach-e2e lane oracle mutations rejected: OK")
-    raise SystemExit(0)
-
-lane, path = sys.argv[1], sys.argv[2]
-oracle(json.load(open(path)), lane)
-print(f"{lane} lane: OK")
-PY
+    python3 -I scripts/lane-attach-e2e-oracle.py "$@"
 }
 
 if [ "${1-}" = "--self-test" ]; then
@@ -110,9 +27,9 @@ P11SCOPE_PRODUCT_BUILD_MODE=${P11SCOPE_PRODUCT_BUILD_MODE:-ordinary}
 . scripts/product-build.sh
 
 MODULE=${P11SCOPE_PKCS11_MODULE:-/usr/lib/softhsm/libsofthsm2.so}
-WORK=${P11SCOPE_TASK4_WORK-target/e2e}
-if [ "${P11SCOPE_TASK4_WORK+set}" = set ]; then
-    case $WORK in /*) ;; *) echo "P11SCOPE_TASK4_WORK must be absolute" >&2; exit 2 ;; esac
+WORK=${P11SCOPE_RECEIPT_WORK-target/e2e}
+if [ "${P11SCOPE_RECEIPT_WORK+set}" = set ]; then
+    case $WORK in /*) ;; *) echo "P11SCOPE_RECEIPT_WORK must be absolute" >&2; exit 2 ;; esac
 fi
 WPID=
 SPID=
@@ -120,7 +37,7 @@ SPID=
 require_non_root_caller
 # See verify-canaries.sh: the observer refuses an output directory with a
 # group/world-writable non-sticky ancestor, which this checkout has.
-[ "${P11SCOPE_TASK4_WORK+set}" = set ] || {
+[ "${P11SCOPE_RECEIPT_WORK+set}" = set ] || {
     WORK=$(mktemp -d "${TMPDIR:-/tmp}/p11scope-verify-XXXXXX")/$WORK
     echo "work root: $WORK"
 }

@@ -54,7 +54,7 @@ PKCS11_CHECK_DIR=${PKCS11_CHECK_DIR:-$HOME/src/m/pkcs11-check-ws/pkcs11-check}
 # the target cgroup for the full run. `uv sync` has already been run in
 # $PKCS11_CHECK_DIR (its .venv exists) -- this script only ever reads it.
 PKCS11_CHECK_BIN="$PKCS11_CHECK_DIR/.venv/bin/pkcs11-check"
-WORK=${P11SCOPE_TASK4_WORK:-target/matrix-oracle}
+WORK=${P11SCOPE_RECEIPT_WORK:-target/matrix-oracle}
 PRODUCT=$WORK/target
 ORACLE_WORKLOAD=$(pwd -P)/scripts/matrix/oracle-workload.sh
 ORACLE_CGROUP_HELPER=$(pwd -P)/scripts/matrix/oracle-cgroup-cleanup.py
@@ -192,16 +192,16 @@ oracle_authenticate_scope() {
 }
 
 oracle_record_scope_facts() {
-    task4_fact authenticated_scope_path "$CGROUP_PATH"
-    task4_fact authenticated_cgroup_identity "$ORACLE_CGROUP_DEVICE:$ORACLE_CGROUP_INODE"
-    task4_fact authenticated_workload_generation "$WORKLOAD_PID:$WORKLOAD_STARTTIME"
-    task4_fact authenticated_invocation_tuple "${UNIT}.scope:$CONTROL_GROUP:$ORACLE_INVOCATION"
+    receipt_fact authenticated_scope_path "$CGROUP_PATH"
+    receipt_fact authenticated_cgroup_identity "$ORACLE_CGROUP_DEVICE:$ORACLE_CGROUP_INODE"
+    receipt_fact authenticated_workload_generation "$WORKLOAD_PID:$WORKLOAD_STARTTIME"
+    receipt_fact authenticated_invocation_tuple "${UNIT}.scope:$CONTROL_GROUP:$ORACLE_INVOCATION"
 }
 
 oracle_kill_cgroup() {
     [ "${ORACLE_CGROUP_PINNED-0}" = 1 ] || return 1
     timeout --signal=KILL 12s sudo -n python3 -I "$ORACLE_CGROUP_HELPER" kill \
-        "$$" "$TASK4_RECEIPT_STARTTIME" 7 \
+        "$$" "$RECEIPT_RECEIPT_STARTTIME" 7 \
         "$ORACLE_CGROUP_DEVICE" "$ORACLE_CGROUP_INODE" 8
     okc_status=$?
     exec 7<&-
@@ -280,10 +280,10 @@ oracle_reclaim_owned_artifacts() {
     ora_state=${STATE_FILE_ID:--}
     ora_policy=${STATE_POLICY_FILE_ID:--}
     timeout --signal=KILL 20s sudo -n python3 -I "$ORACLE_CGROUP_HELPER" reclaim \
-        "$$" "$TASK4_RECEIPT_STARTTIME" 8 \
-        "${TASK4_WORK_ID%%:*}" "${TASK4_WORK_ID#*:}" 6 \
+        "$$" "$RECEIPT_RECEIPT_STARTTIME" 8 \
+        "${RECEIPT_WORK_ID%%:*}" "${RECEIPT_WORK_ID#*:}" 6 \
         "${PKCS11_CHECK_DIR_ID%%:*}" "${PKCS11_CHECK_DIR_ID#*:}" \
-        "$TASK4_RECEIPT_UID" "$TASK4_RECEIPT_GID" \
+        "$RECEIPT_RECEIPT_UID" "$RECEIPT_RECEIPT_GID" \
         .pkcs11-check-isolation-state.json "$ora_state" \
         .pkcs11-check-isolation-state-policy.json "$ora_policy" || return 1
     ORACLE_ARTIFACTS_RECLAIMED=1
@@ -316,7 +316,7 @@ oracle_cleanup() {
     return "$oc_result"
 }
 
-task4_prepare_root() {
+receipt_prepare_root() {
     t4_candidate=$1
     case $t4_candidate in /*) ;; *) return 1 ;; esac
     case $t4_candidate in *'/../'*|*/..|*"\t"*|*"\n"*) return 1 ;; esac
@@ -333,36 +333,36 @@ task4_prepare_root() {
     [ "$(stat -Lc %u:%a "$t4_parent")" = "$(id -u):700" ] || return 1
     [ ! -e "$t4_candidate" ] && [ ! -L "$t4_candidate" ] || return 1
     umask 077; mkdir -m 700 "$t4_candidate" || return 1
-    TASK4_ROOT=$t4_candidate; TASK4_CAMPAIGN=$t4_parent
-    TASK4_ROOT_ID=$(stat -Lc %d:%i "$TASK4_ROOT") || return 1
+    RECEIPT_ROOT=$t4_candidate; RECEIPT_CAMPAIGN=$t4_parent
+    RECEIPT_ROOT_ID=$(stat -Lc %d:%i "$RECEIPT_ROOT") || return 1
 }
 
-task4_digest() { sha256sum "$1" | awk '{print $1}'; }
-task4_snapshot() {
+receipt_digest() { sha256sum "$1" | awk '{print $1}'; }
+receipt_snapshot() {
     [ "$#" -eq 1 ] || return 2
     case $1 in initial|final) ;; *) return 2 ;; esac
     p11scope_prepared_snapshot "$P11SCOPE_PREPARED_PYTHON" \
-        "$TASK4_ROOT/artifacts/oracle.source.$1" \
-        "$TASK4_PREPARED_PREFIX.$1.ledger.sha256"
+        "$RECEIPT_ROOT/artifacts/oracle.source.$1" \
+        "$RECEIPT_PREPARED_PREFIX.$1.ledger.sha256"
 }
-task4_fact() { printf '%s\t%s\n' "$1" "$2" >> "$TASK4_FACTS"; }
+receipt_fact() { printf '%s\t%s\n' "$1" "$2" >> "$RECEIPT_FACTS"; }
 
-task4_sibling_snapshot() {
+receipt_sibling_snapshot() {
     {
         git -C "$PKCS11_CHECK_DIR" rev-parse HEAD
         git -C "$PKCS11_CHECK_DIR" rev-parse 'HEAD^{tree}'
         git -C "$PKCS11_CHECK_DIR" status --porcelain=v1 --untracked-files=no
-        task4_digest "$PKCS11_CHECK_BIN"
+        receipt_digest "$PKCS11_CHECK_BIN"
         "$PKCS11_CHECK_DIR/.venv/bin/python" -m pip freeze
     }
 }
 
-task4_terminal_checks() {
+receipt_terminal_checks() {
     ttc_result=0
-    if [ "${TASK4_SIBLING_BASELINE-0}" = 1 ]; then
-        task4_sibling_snapshot > "$TASK4_ROOT/artifacts/sibling.end.tsv" || ttc_result=1
-        cmp -s "$TASK4_ROOT/artifacts/sibling.start.tsv" \
-            "$TASK4_ROOT/artifacts/sibling.end.tsv" || ttc_result=1
+    if [ "${RECEIPT_SIBLING_BASELINE-0}" = 1 ]; then
+        receipt_sibling_snapshot > "$RECEIPT_ROOT/artifacts/sibling.end.tsv" || ttc_result=1
+        cmp -s "$RECEIPT_ROOT/artifacts/sibling.start.tsv" \
+            "$RECEIPT_ROOT/artifacts/sibling.end.tsv" || ttc_result=1
     fi
     [ ! -e "$PKCS11_CHECK_DIR/.pkcs11-check-isolation-state.json" ] \
         && [ ! -L "$PKCS11_CHECK_DIR/.pkcs11-check-isolation-state.json" ] || ttc_result=1
@@ -372,47 +372,47 @@ task4_terminal_checks() {
         [ -s "$WORK/observed.json" ] || ttc_result=1
         [ -s "$WORK/reports/report.jsonl" ] || ttc_result=1
         if [ "$ttc_result" -eq 0 ]; then
-            cp "$WORK/observed.json" "$TASK4_ROOT/artifacts/capture.json" || ttc_result=1
-            cp "$TASK4_ROOT/stdout.log" "$TASK4_ROOT/artifacts/checker.log" || ttc_result=1
+            cp "$WORK/observed.json" "$RECEIPT_ROOT/artifacts/capture.json" || ttc_result=1
+            cp "$RECEIPT_ROOT/stdout.log" "$RECEIPT_ROOT/artifacts/checker.log" || ttc_result=1
         fi
     fi
     return "$ttc_result"
 }
 
-task4_validate_receipt() {
+receipt_validate_receipt() {
     tvr_result=0
-    [ "$(stat -Lc %d:%i "$TASK4_ROOT" 2>/dev/null)" = "$TASK4_ROOT_ID" ] || tvr_result=1
-    [ "$(stat -Lc %d:%i "$TASK4_ROOT/artifacts" 2>/dev/null)" = "$TASK4_ARTIFACTS_ID" ] || tvr_result=1
-    [ "$(stat -Lc %d:%i "$TASK4_ROOT/work" 2>/dev/null)" = "$TASK4_WORK_ID" ] || tvr_result=1
-    if [ "${TASK4_INITIAL_STATUS-1}" -ne 77 ]; then
-        [ "$(git rev-parse HEAD 2>/dev/null)" = "$TASK4_HEAD" ] || tvr_result=1
-        [ "$(git rev-parse 'HEAD^{tree}' 2>/dev/null)" = "$TASK4_TREE" ] || tvr_result=1
+    [ "$(stat -Lc %d:%i "$RECEIPT_ROOT" 2>/dev/null)" = "$RECEIPT_ROOT_ID" ] || tvr_result=1
+    [ "$(stat -Lc %d:%i "$RECEIPT_ROOT/artifacts" 2>/dev/null)" = "$RECEIPT_ARTIFACTS_ID" ] || tvr_result=1
+    [ "$(stat -Lc %d:%i "$RECEIPT_ROOT/work" 2>/dev/null)" = "$RECEIPT_WORK_ID" ] || tvr_result=1
+    if [ "${RECEIPT_INITIAL_STATUS-1}" -ne 77 ]; then
+        [ "$(git rev-parse HEAD 2>/dev/null)" = "$RECEIPT_HEAD" ] || tvr_result=1
+        [ "$(git rev-parse 'HEAD^{tree}' 2>/dev/null)" = "$RECEIPT_TREE" ] || tvr_result=1
         [ -z "$(git status --porcelain=v1 --untracked-files=all 2>/dev/null)" ] || tvr_result=1
-        [ "$(task4_digest scripts/matrix/verify-oracle.sh 2>/dev/null)" = "$TASK4_DRIVER_HASH" ] || tvr_result=1
-        [ "$(task4_digest scripts/check-capture-evidence.py 2>/dev/null)" = "$TASK4_CHECKER_HASH" ] || tvr_result=1
-        [ "$(task4_digest scripts/check-subset-oracle.py 2>/dev/null)" = "$TASK4_SUBSET_HASH" ] || tvr_result=1
-        [ "$(task4_digest "$ORACLE_WORKLOAD" 2>/dev/null)" = "$TASK4_WORKLOAD_HASH" ] || tvr_result=1
-        [ "$(task4_digest "$ORACLE_CGROUP_HELPER" 2>/dev/null)" = "$TASK4_CGROUP_HELPER_HASH" ] || tvr_result=1
-        [ "$(task4_digest "$ORACLE_LIFECYCLE_FIXTURE" 2>/dev/null)" = "$TASK4_LIFECYCLE_FIXTURE_HASH" ] || tvr_result=1
-        [ "$(task4_digest "$ORACLE_SUDO_FIXTURE" 2>/dev/null)" = "$TASK4_SUDO_FIXTURE_HASH" ] || tvr_result=1
-        if [ "${TASK4_PREPARED_ADMITTED-0}" -eq 1 ]; then
+        [ "$(receipt_digest scripts/matrix/verify-oracle.sh 2>/dev/null)" = "$RECEIPT_DRIVER_HASH" ] || tvr_result=1
+        [ "$(receipt_digest scripts/check-capture-evidence.py 2>/dev/null)" = "$RECEIPT_CHECKER_HASH" ] || tvr_result=1
+        [ "$(receipt_digest scripts/check-subset-oracle.py 2>/dev/null)" = "$RECEIPT_SUBSET_HASH" ] || tvr_result=1
+        [ "$(receipt_digest "$ORACLE_WORKLOAD" 2>/dev/null)" = "$RECEIPT_WORKLOAD_HASH" ] || tvr_result=1
+        [ "$(receipt_digest "$ORACLE_CGROUP_HELPER" 2>/dev/null)" = "$RECEIPT_CGROUP_HELPER_HASH" ] || tvr_result=1
+        [ "$(receipt_digest "$ORACLE_LIFECYCLE_FIXTURE" 2>/dev/null)" = "$RECEIPT_LIFECYCLE_FIXTURE_HASH" ] || tvr_result=1
+        [ "$(receipt_digest "$ORACLE_SUDO_FIXTURE" 2>/dev/null)" = "$RECEIPT_SUDO_FIXTURE_HASH" ] || tvr_result=1
+        if [ "${RECEIPT_PREPARED_ADMITTED-0}" -eq 1 ]; then
             if "$P11SCOPE_PREPARED_PYTHON" -I scripts/prepared-dependency-evidence.py \
-                recheck --prefix "$TASK4_PREPARED_PREFIX"; then
-                task4_snapshot final > "$TASK4_ROOT/artifacts/source.end.tsv" || tvr_result=1
-                cmp -s "$TASK4_ROOT/artifacts/source.start.tsv" \
-                    "$TASK4_ROOT/artifacts/source.end.tsv" || tvr_result=1
+                recheck --prefix "$RECEIPT_PREPARED_PREFIX"; then
+                receipt_snapshot final > "$RECEIPT_ROOT/artifacts/source.end.tsv" || tvr_result=1
+                cmp -s "$RECEIPT_ROOT/artifacts/source.start.tsv" \
+                    "$RECEIPT_ROOT/artifacts/source.end.tsv" || tvr_result=1
             else
                 tvr_result=1
             fi
         else
             tvr_result=1
         fi
-        [ -s "$TASK4_ROOT/artifacts/capture.json" ] || tvr_result=1
-        [ -s "$TASK4_ROOT/artifacts/checker.log" ] || tvr_result=1
+        [ -s "$RECEIPT_ROOT/artifacts/capture.json" ] || tvr_result=1
+        [ -s "$RECEIPT_ROOT/artifacts/checker.log" ] || tvr_result=1
     fi
-    find "$TASK4_ROOT" -type d -exec chmod 700 {} + 2>/dev/null || tvr_result=1
-    find "$TASK4_ROOT" -type f -exec chmod 600 {} + 2>/dev/null || tvr_result=1
-    python3 - "$TASK4_ROOT" <<'PY' || tvr_result=1
+    find "$RECEIPT_ROOT" -type d -exec chmod 700 {} + 2>/dev/null || tvr_result=1
+    find "$RECEIPT_ROOT" -type f -exec chmod 600 {} + 2>/dev/null || tvr_result=1
+    python3 - "$RECEIPT_ROOT" <<'PY' || tvr_result=1
 import os, stat, sys
 root=sys.argv[1]
 if set(os.listdir(root)) != {"facts.log","stdout.log","stderr.log","artifacts","work"}: raise SystemExit("foreign root entry")
@@ -424,77 +424,77 @@ for directory, dirs, files in os.walk(root,followlinks=False):
         mode=os.lstat(os.path.join(directory,name)).st_mode
         if not stat.S_ISREG(mode) or stat.S_IMODE(mode)!=0o600: raise SystemExit("file mode")
 PY
-    task4_fact ended_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)" || tvr_result=1
-    sync -f "$TASK4_FACTS" "$TASK4_ROOT/stdout.log" "$TASK4_ROOT/stderr.log" 2>/dev/null || tvr_result=1
+    receipt_fact ended_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)" || tvr_result=1
+    sync -f "$RECEIPT_FACTS" "$RECEIPT_ROOT/stdout.log" "$RECEIPT_ROOT/stderr.log" 2>/dev/null || tvr_result=1
     return "$tvr_result"
 }
 
-task4_publish_status() {
+receipt_publish_status() {
     tps_result=$1
-    tps_pending=$TASK4_ROOT/.status.pending
-    [ ! -e "$TASK4_ROOT/status" ] && [ ! -L "$TASK4_ROOT/status" ] \
+    tps_pending=$RECEIPT_ROOT/.status.pending
+    [ ! -e "$RECEIPT_ROOT/status" ] && [ ! -L "$RECEIPT_ROOT/status" ] \
         && [ ! -e "$tps_pending" ] && [ ! -L "$tps_pending" ] || return 1
     ( set -C; umask 077; printf '%s\n' "$tps_result" > "$tps_pending" ) || return 1
     chmod 600 "$tps_pending" || { rm -f -- "$tps_pending"; return 1; }
     sync -f "$tps_pending" 2>/dev/null || { rm -f -- "$tps_pending"; return 1; }
-    task4_fact terminal_status "$tps_result" || {
+    receipt_fact terminal_status "$tps_result" || {
         rm -f -- "$tps_pending"
         return 1
     }
-    sync -f "$TASK4_FACTS" 2>/dev/null || {
+    sync -f "$RECEIPT_FACTS" 2>/dev/null || {
         rm -f -- "$tps_pending"
         return 1
     }
-    mv "$tps_pending" "$TASK4_ROOT/status" || { rm -f -- "$tps_pending"; return 1; }
-    sync -f "$TASK4_ROOT/status" "$TASK4_ROOT" 2>/dev/null || {
-        rm -f -- "$TASK4_ROOT/status" "$tps_pending"
+    mv "$tps_pending" "$RECEIPT_ROOT/status" || { rm -f -- "$tps_pending"; return 1; }
+    sync -f "$RECEIPT_ROOT/status" "$RECEIPT_ROOT" 2>/dev/null || {
+        rm -f -- "$RECEIPT_ROOT/status" "$tps_pending"
         return 1
     }
 }
 
-task4_finalize() {
+receipt_finalize() {
     t4_result=$?
-    TASK4_INITIAL_STATUS=$t4_result
+    RECEIPT_INITIAL_STATUS=$t4_result
     trap - EXIT
     trap '' INT TERM HUP
     set +e
     oracle_cleanup || t4_result=1
-    task4_terminal_checks || t4_result=1
-    task4_validate_receipt || t4_result=1
-    if ! task4_publish_status "$t4_result"; then
-        if [ -n "${TASK4_ROOT-}" ]; then
-            rm -f -- "$TASK4_ROOT/status" "$TASK4_ROOT/.status.pending" 2>/dev/null
+    receipt_terminal_checks || t4_result=1
+    receipt_validate_receipt || t4_result=1
+    if ! receipt_publish_status "$t4_result"; then
+        if [ -n "${RECEIPT_ROOT-}" ]; then
+            rm -f -- "$RECEIPT_ROOT/status" "$RECEIPT_ROOT/.status.pending" 2>/dev/null
         fi
         t4_result=1
     fi
     exit "$t4_result"
 }
 
-task4_install_traps() {
-    trap task4_finalize EXIT
+receipt_install_traps() {
+    trap receipt_finalize EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
     trap 'exit 129' HUP
 }
 
-task4_receipt_run() {
+receipt_receipt_run() {
     [ "$#" -eq 1 ] || { echo "usage: $0 --self-test | ABSENT_EVIDENCE_ROOT" >&2; exit 2; }
-    task4_prepare_root "$1" || { echo "invalid Task 4 evidence root" >&2; exit 77; }
-    TASK4_FACTS=$TASK4_ROOT/facts.log
-    : > "$TASK4_FACTS"; : > "$TASK4_ROOT/stdout.log"; : > "$TASK4_ROOT/stderr.log"
-    chmod 600 "$TASK4_FACTS" "$TASK4_ROOT/stdout.log" "$TASK4_ROOT/stderr.log"
-    mkdir -m 700 "$TASK4_ROOT/artifacts" "$TASK4_ROOT/work"
-    TASK4_ARTIFACTS_ID=$(stat -Lc %d:%i "$TASK4_ROOT/artifacts")
-    TASK4_WORK_ID=$(stat -Lc %d:%i "$TASK4_ROOT/work")
-    WORK=$TASK4_ROOT/work
+    receipt_prepare_root "$1" || { echo "invalid Task 4 evidence root" >&2; exit 77; }
+    RECEIPT_FACTS=$RECEIPT_ROOT/facts.log
+    : > "$RECEIPT_FACTS"; : > "$RECEIPT_ROOT/stdout.log"; : > "$RECEIPT_ROOT/stderr.log"
+    chmod 600 "$RECEIPT_FACTS" "$RECEIPT_ROOT/stdout.log" "$RECEIPT_ROOT/stderr.log"
+    mkdir -m 700 "$RECEIPT_ROOT/artifacts" "$RECEIPT_ROOT/work"
+    RECEIPT_ARTIFACTS_ID=$(stat -Lc %d:%i "$RECEIPT_ROOT/artifacts")
+    RECEIPT_WORK_ID=$(stat -Lc %d:%i "$RECEIPT_ROOT/work")
+    WORK=$RECEIPT_ROOT/work
     PRODUCT=$WORK/target
-    TASK4_HEAD= TASK4_TREE= TASK4_DRIVER_HASH= TASK4_CHECKER_HASH=
-    TASK4_SUBSET_HASH= TASK4_WORKLOAD_HASH= TASK4_CGROUP_HELPER_HASH=
-    TASK4_LIFECYCLE_FIXTURE_HASH= TASK4_SUDO_FIXTURE_HASH=
-    TASK4_LOCK_ID= TASK4_SIBLING_BASELINE=0
-    TASK4_PREPARED_ADMITTED=0
-    TASK4_PREPARED_PREFIX=$TASK4_ROOT/artifacts/oracle.prepared
-    TASK4_RECEIPT_STARTTIME=$(process_starttime $$) || exit 77
+    RECEIPT_HEAD= RECEIPT_TREE= RECEIPT_DRIVER_HASH= RECEIPT_CHECKER_HASH=
+    RECEIPT_SUBSET_HASH= RECEIPT_WORKLOAD_HASH= RECEIPT_CGROUP_HELPER_HASH=
+    RECEIPT_LIFECYCLE_FIXTURE_HASH= RECEIPT_SUDO_FIXTURE_HASH=
+    RECEIPT_LOCK_ID= RECEIPT_SIBLING_BASELINE=0
+    RECEIPT_PREPARED_ADMITTED=0
+    RECEIPT_PREPARED_PREFIX=$RECEIPT_ROOT/artifacts/oracle.prepared
+    RECEIPT_RECEIPT_STARTTIME=$(process_starttime $$) || exit 77
     ORACLE_BODY_COMPLETE=0 ORACLE_LAUNCH_ATTEMPTED=0 ORACLE_CGROUP_PINNED=0
     ORACLE_PRODUCERS_QUIESCENT=0 ORACLE_ARTIFACTS_RECLAIMED=0
     ORACLE_CGROUP_DEVICE= ORACLE_CGROUP_INODE= ORACLE_INVOCATION=
@@ -504,7 +504,7 @@ task4_receipt_run() {
     STATE_FILE=$PKCS11_CHECK_DIR/.pkcs11-check-isolation-state.json
     STATE_POLICY_FILE=$PKCS11_CHECK_DIR/.pkcs11-check-isolation-state-policy.json
     STATE_FILE_ID= STATE_POLICY_FILE_ID=
-    task4_install_traps
+    receipt_install_traps
     require_non_root_caller || exit 77
     PKCS11_CHECK_DIR=$(cd "$PKCS11_CHECK_DIR" && pwd -P) || exit 77
     PKCS11_CHECK_BIN=$PKCS11_CHECK_DIR/.venv/bin/pkcs11-check
@@ -514,64 +514,64 @@ task4_receipt_run() {
     PKCS11_CHECK_DIR_ID=$(stat -Lc %d:%i /proc/$$/fd/6) || exit 77
     [ "$PKCS11_CHECK_DIR_ID" = "$(stat -Lc %d:%i "$PKCS11_CHECK_DIR")" ] || exit 77
     exec 8< "$WORK" || exit 77
-    [ "$TASK4_WORK_ID" = "$(stat -Lc %d:%i /proc/$$/fd/8)" ] || exit 77
-    TASK4_RECEIPT_UID=$(id -u)
-    TASK4_RECEIPT_GID=$(id -g)
-    [ ! -L "$TASK4_CAMPAIGN/.task4.lock" ] || exit 77
-    exec 9>>"$TASK4_CAMPAIGN/.task4.lock"; chmod 600 "$TASK4_CAMPAIGN/.task4.lock"
-    [ "$(stat -Lc %d:%i:%u:%a:%h /proc/$$/fd/9)" = "$(stat -Lc %d:%i:%u:%a:%h "$TASK4_CAMPAIGN/.task4.lock")" ] || exit 77
+    [ "$RECEIPT_WORK_ID" = "$(stat -Lc %d:%i /proc/$$/fd/8)" ] || exit 77
+    RECEIPT_RECEIPT_UID=$(id -u)
+    RECEIPT_RECEIPT_GID=$(id -g)
+    [ ! -L "$RECEIPT_CAMPAIGN/.receipt.lock" ] || exit 77
+    exec 9>>"$RECEIPT_CAMPAIGN/.receipt.lock"; chmod 600 "$RECEIPT_CAMPAIGN/.receipt.lock"
+    [ "$(stat -Lc %d:%i:%u:%a:%h /proc/$$/fd/9)" = "$(stat -Lc %d:%i:%u:%a:%h "$RECEIPT_CAMPAIGN/.receipt.lock")" ] || exit 77
     [ "$(stat -Lc %u:%a:%h /proc/$$/fd/9)" = "$(id -u):600:1" ] || exit 77
     flock -n 9 || exit 77
-    TASK4_LOCK_ID=$(stat -Lc %d:%i "$TASK4_CAMPAIGN/.task4.lock")
-    TASK4_HEAD=$(git rev-parse HEAD) || exit 77; TASK4_TREE=$(git rev-parse 'HEAD^{tree}') || exit 77
+    RECEIPT_LOCK_ID=$(stat -Lc %d:%i "$RECEIPT_CAMPAIGN/.receipt.lock")
+    RECEIPT_HEAD=$(git rev-parse HEAD) || exit 77; RECEIPT_TREE=$(git rev-parse 'HEAD^{tree}') || exit 77
     [ -z "$(git status --porcelain=v1 --untracked-files=all)" ] || exit 77
-    TASK4_DRIVER_HASH=$(task4_digest scripts/matrix/verify-oracle.sh)
-    TASK4_CHECKER_HASH=$(task4_digest scripts/check-capture-evidence.py)
-    TASK4_SUBSET_HASH=$(task4_digest scripts/check-subset-oracle.py)
-    TASK4_WORKLOAD_HASH=$(task4_digest "$ORACLE_WORKLOAD")
-    TASK4_CGROUP_HELPER_HASH=$(task4_digest "$ORACLE_CGROUP_HELPER")
-    TASK4_LIFECYCLE_FIXTURE_HASH=$(task4_digest "$ORACLE_LIFECYCLE_FIXTURE")
-    TASK4_SUDO_FIXTURE_HASH=$(task4_digest "$ORACLE_SUDO_FIXTURE")
-    task4_fact started_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; task4_fact argv "$0 $1"; task4_fact cwd "$(pwd -P)"
-    task4_fact uid_gid "$(id -u):$(id -g)"; task4_fact kernel "$(uname -srmo)"; task4_fact head "$TASK4_HEAD"; task4_fact tree "$TASK4_TREE"
-    task4_fact root_identity "$TASK4_ROOT_ID"; task4_fact artifacts_identity "$TASK4_ARTIFACTS_ID"; task4_fact work_identity "$TASK4_WORK_ID"
-    task4_fact lock_identity "$TASK4_LOCK_ID"; task4_fact lock_holder "$$:$(process_starttime $$)"
-    task4_fact driver_sha256 "$TASK4_DRIVER_HASH"; task4_fact checker_sha256 "$TASK4_CHECKER_HASH"
-    task4_fact subset_oracle_sha256 "$TASK4_SUBSET_HASH"
-    task4_fact workload_sha256 "$TASK4_WORKLOAD_HASH"
-    task4_fact cgroup_helper_sha256 "$TASK4_CGROUP_HELPER_HASH"
-    task4_fact lifecycle_fixture_sha256 "$TASK4_LIFECYCLE_FIXTURE_HASH"
-    task4_fact sudo_fixture_sha256 "$TASK4_SUDO_FIXTURE_HASH"
+    RECEIPT_DRIVER_HASH=$(receipt_digest scripts/matrix/verify-oracle.sh)
+    RECEIPT_CHECKER_HASH=$(receipt_digest scripts/check-capture-evidence.py)
+    RECEIPT_SUBSET_HASH=$(receipt_digest scripts/check-subset-oracle.py)
+    RECEIPT_WORKLOAD_HASH=$(receipt_digest "$ORACLE_WORKLOAD")
+    RECEIPT_CGROUP_HELPER_HASH=$(receipt_digest "$ORACLE_CGROUP_HELPER")
+    RECEIPT_LIFECYCLE_FIXTURE_HASH=$(receipt_digest "$ORACLE_LIFECYCLE_FIXTURE")
+    RECEIPT_SUDO_FIXTURE_HASH=$(receipt_digest "$ORACLE_SUDO_FIXTURE")
+    receipt_fact started_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; receipt_fact argv "$0 $1"; receipt_fact cwd "$(pwd -P)"
+    receipt_fact uid_gid "$(id -u):$(id -g)"; receipt_fact kernel "$(uname -srmo)"; receipt_fact head "$RECEIPT_HEAD"; receipt_fact tree "$RECEIPT_TREE"
+    receipt_fact root_identity "$RECEIPT_ROOT_ID"; receipt_fact artifacts_identity "$RECEIPT_ARTIFACTS_ID"; receipt_fact work_identity "$RECEIPT_WORK_ID"
+    receipt_fact lock_identity "$RECEIPT_LOCK_ID"; receipt_fact lock_holder "$$:$(process_starttime $$)"
+    receipt_fact driver_sha256 "$RECEIPT_DRIVER_HASH"; receipt_fact checker_sha256 "$RECEIPT_CHECKER_HASH"
+    receipt_fact subset_oracle_sha256 "$RECEIPT_SUBSET_HASH"
+    receipt_fact workload_sha256 "$RECEIPT_WORKLOAD_HASH"
+    receipt_fact cgroup_helper_sha256 "$RECEIPT_CGROUP_HELPER_HASH"
+    receipt_fact lifecycle_fixture_sha256 "$RECEIPT_LIFECYCLE_FIXTURE_HASH"
+    receipt_fact sudo_fixture_sha256 "$RECEIPT_SUDO_FIXTURE_HASH"
     for tool in python3 rustup systemd-run systemctl sudo sha256sum timeout git sort xargs; do command -v "$tool" >/dev/null || exit 77; done
     . scripts/prepared-dependency-tools.sh
     . scripts/prepared-dependency-snapshot.sh
     p11scope_prepared_tools_select "$(command -v python3)" "$(command -v rustup)" || exit 77
     "$P11SCOPE_PREPARED_PYTHON" -I scripts/prepared-dependency-evidence.py capture \
-        --prefix "$TASK4_PREPARED_PREFIX" \
+        --prefix "$RECEIPT_PREPARED_PREFIX" \
         --stable-cargo "$P11SCOPE_PREPARED_STABLE_CARGO" \
         --stable-rustc "$P11SCOPE_PREPARED_STABLE_RUSTC" \
         --bpf-cargo "$P11SCOPE_PREPARED_BPF_CARGO" \
         --bpf-rustc "$P11SCOPE_PREPARED_BPF_RUSTC" || exit 77
-    TASK4_PREPARED_ADMITTED=1
-    task4_snapshot initial > "$TASK4_ROOT/artifacts/source.start.tsv" || exit 77
-    TASK4_SOURCE_HASH=$(task4_digest "$TASK4_ROOT/artifacts/source.start.tsv")
-    task4_fact source_input_ledger_sha256 "$TASK4_SOURCE_HASH"
+    RECEIPT_PREPARED_ADMITTED=1
+    receipt_snapshot initial > "$RECEIPT_ROOT/artifacts/source.start.tsv" || exit 77
+    RECEIPT_SOURCE_HASH=$(receipt_digest "$RECEIPT_ROOT/artifacts/source.start.tsv")
+    receipt_fact source_input_ledger_sha256 "$RECEIPT_SOURCE_HASH"
     sudo -n true >/dev/null 2>&1 || exit 77
     [ -f "$MODULE" ] || exit 77
     [ ! -e "$PKCS11_CHECK_DIR/.pkcs11-check-isolation-state.json" ] \
         && [ ! -L "$PKCS11_CHECK_DIR/.pkcs11-check-isolation-state.json" ] || exit 77
     [ ! -e "$PKCS11_CHECK_DIR/.pkcs11-check-isolation-state-policy.json" ] \
         && [ ! -L "$PKCS11_CHECK_DIR/.pkcs11-check-isolation-state-policy.json" ] || exit 77
-    task4_sibling_snapshot > "$TASK4_ROOT/artifacts/sibling.start.tsv" || exit 77
-    TASK4_SIBLING_BASELINE=1
-    oracle_body > "$TASK4_ROOT/stdout.log" 2> "$TASK4_ROOT/stderr.log"
+    receipt_sibling_snapshot > "$RECEIPT_ROOT/artifacts/sibling.start.tsv" || exit 77
+    RECEIPT_SIBLING_BASELINE=1
+    oracle_body > "$RECEIPT_ROOT/stdout.log" 2> "$RECEIPT_ROOT/stderr.log"
 }
 
 
-task4_receipt_self_test() {
+receipt_receipt_self_test() {
     [ "$#" -eq 0 ] || exit 2
-    REPORT=${P11SCOPE_TASK4_SELF_TEST_REPORT-}
-    if [ -z "$REPORT" ]; then TASK4_SELF_TMP=$(mktemp -d); trap 'rm -rf "$TASK4_SELF_TMP"' EXIT INT TERM; REPORT=$TASK4_SELF_TMP/report.tsv; fi
+    REPORT=${P11SCOPE_RECEIPT_SELF_TEST_REPORT-}
+    if [ -z "$REPORT" ]; then RECEIPT_SELF_TMP=$(mktemp -d); trap 'rm -rf "$RECEIPT_SELF_TMP"' EXIT INT TERM; REPORT=$RECEIPT_SELF_TMP/report.tsv; fi
     umask 077
     python3 - "$REPORT" <<'PY'
 import copy, fcntl, os, stat, sys, tempfile
@@ -640,7 +640,7 @@ with tempfile.TemporaryDirectory() as raw:
     x=dict(state);x["head"]="x";mark(common[19],not valid(s=x));x=dict(state);x["input"]="x";mark(common[20],not valid(s=x))
     extra=art/"foreign";extra.write_text("x");mark(common[21],not valid());extra.unlink();(art/"observed.json").unlink();mark(common[22],not valid());(art/"observed.json").write_text("evidence\n");(art/"observed.json").chmod(0o600)
     (art/"checker.log").unlink();mark(common[23],not valid());(art/"checker.log").write_text("evidence\n");(art/"checker.log").chmod(0o600);mark(common[24],not (work/"cargo-ran").exists())
-    lock=parent/".task4.lock";lock.touch(mode=0o600);a=open(lock,"r+");b=open(lock,"r+");fcntl.flock(a,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    lock=parent/".receipt.lock";lock.touch(mode=0o600);a=open(lock,"r+");b=open(lock,"r+");fcntl.flock(a,fcntl.LOCK_EX|fcntl.LOCK_NB)
     try: fcntl.flock(b,fcntl.LOCK_EX|fcntl.LOCK_NB);blocked=False
     except BlockingIOError: blocked=True
     mark(common[25],blocked and not (work/"runtime-ran").exists());a.close();fcntl.flock(b,fcntl.LOCK_EX|fcntl.LOCK_NB);mark(common[26],valid());mark(common[27],stat.S_IMODE(os.fstat(b.fileno()).st_mode)==0o600);b.close()
@@ -675,7 +675,7 @@ PY
 }
 if [ "${1-}" = --self-test ]; then
     shift
-    task4_receipt_self_test "$@"
+    receipt_receipt_self_test "$@"
     exit 0
 fi
 
@@ -787,7 +787,7 @@ oracle_wait_ready() {
 
 oracle_probe_cgroup() {
     timeout --signal=KILL 10s sudo -n python3 -I "$ORACLE_CGROUP_HELPER" probe \
-        "$$" "$TASK4_RECEIPT_STARTTIME" 7 \
+        "$$" "$RECEIPT_RECEIPT_STARTTIME" 7 \
         "$ORACLE_CGROUP_DEVICE" "$ORACLE_CGROUP_INODE" 5
 }
 
@@ -875,4 +875,4 @@ if [ -n "${P11SCOPE_ORACLE_SOURCE_ONLY-}" ]; then
     return 0
 fi
 
-task4_receipt_run "$@"
+receipt_receipt_run "$@"

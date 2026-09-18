@@ -518,14 +518,38 @@ pub struct PidPin {
     start_time: Option<u64>,
 }
 
+/// The kernel's current pid ceiling: a pid above it never named a process.
+/// `None` when the sysctl is unreadable — the failure text then falls back
+/// to the in-range wording, which stays true either way.
+fn max_pid() -> Option<u32> {
+    std::fs::read_to_string("/proc/sys/kernel/pid_max")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Explains why `pid` could not be pinned without naming the `pidfd`/`/proc`
+/// plumbing: an above-maximum pid is a typo, while an in-range pid with no
+/// live process either exited before attach or is an in-range typo — each
+/// names the check to run next.
+fn pin_failure(pid: u32) -> String {
+    match max_pid() {
+        Some(max) if pid > max => format!(
+            "cannot pin pid {pid}: no such pid (above this host's maximum {max}); check for a typo"
+        ),
+        _ => format!(
+            "cannot pin pid {pid}: no live process with that pid (it exited, or the pid is a typo); check with `ps -p {pid}`"
+        ),
+    }
+}
+
 impl PidPin {
     pub fn open(pid: u32) -> Result<Self, String> {
         let start_time = process_start_time(pid).ok();
         let pidfd = pidfd_open(pid).ok();
         if pidfd.is_none() && start_time.is_none() {
-            return Err(format!(
-                "cannot pin pid {pid}: no pidfd and no /proc/{pid}/stat"
-            ));
+            return Err(pin_failure(pid));
         }
         Ok(Self {
             pid,

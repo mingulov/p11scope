@@ -48,7 +48,9 @@ mise exec -- ./scripts/cargo.sh +1.88 build --locked
 
 Preparation downloads only the recipe-pinned crates.io archives and verifies
 their hashes, ordered patches, final tree hashes, and receipts. For an offline
-or frozen build, place the exact archives in `third-party/archives/` first, or
+or frozen build, place the exact archives (`aya-0.14.0.crate` and
+`aya-obj-0.3.0.crate`, per `third-party/sources.json`) in
+`third-party/archives/` first, or
 run `python3 -I scripts/prepare-dependencies.py --archive-dir DIRECTORY`, then
 use `mise exec -- ./scripts/cargo.sh +1.88 build --locked --offline`. An
 ordinary fresh checkout therefore needs archive access. Git-based source exports exclude the

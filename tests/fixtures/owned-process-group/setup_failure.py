@@ -1,6 +1,5 @@
 """Inject only OS capability acquisition failures; real child/exec/settlement."""
 
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -13,9 +12,11 @@ from unittest import mock
 
 
 path = Path(__file__).resolve().parents[2] / "support/owned_process_group.py"
-spec = importlib.util.spec_from_file_location("owned_group_failure_subject", path)
-subject = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(subject)
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
+sys.dont_write_bytecode = True
+from _loader import load_path
+
+subject = load_path(path, "owned_group_failure_subject")
 mode = sys.argv.pop(1)
 control = Path(os.environ.get("OWNED_GROUP_CONTROL", "/nonexistent-owned-group-control"))
 if mode == "contained_diagnostic":

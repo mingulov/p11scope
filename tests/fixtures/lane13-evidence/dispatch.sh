@@ -154,7 +154,7 @@ rustup)
 python3)
     if [ "$D2_MODE" = outer-final-snapshot-unknown ] \
         && [ -z "${P11SCOPE_LANE13_BODY-}" ] \
-        && [ "$#" -eq 3 ] && [ "$1" = -I ] && [ "$2" = - ]; then
+        && [ "$#" -eq 3 ] && [ "$1" = -I ] && [ "$2" = scripts/lane-lib-oracle-5.py ]; then
         exit 75
     fi
     if [ "$1" = -I ] && [ "$2" = scripts/lane13-input-ledger.py ] \

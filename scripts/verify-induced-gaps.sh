@@ -17,7 +17,7 @@ set -eu
 cd "$(dirname "$0")/.."
 
 MODULE=${P11SCOPE_PKCS11_MODULE:-/usr/lib/softhsm/libsofthsm2.so}
-WORK=${P11SCOPE_TASK4_WORK:-target/induced-gaps}
+WORK=${P11SCOPE_RECEIPT_WORK:-target/induced-gaps}
 case $WORK in /*) WORK_ABS=$WORK ;; *) WORK_ABS=$PWD/$WORK ;; esac
 FIX=scripts/fixtures
 . scripts/lib.sh
@@ -152,139 +152,11 @@ EOF
 # `--self-test`, which runs the same assertions over synthetic evidence and
 # requires every claimed field to refuse a mutation, unprivileged.
 assert_gap1() {
-    python3 - "$@" <<'PY'
-import copy
-import json
-import sys
-
-WANT = sorted(["C_CancelFunction", "C_WaitForSlotEvent"])
-WANT_CALLS = 25 + 17
-
-
-def oracle(observed):
-    alias_groups = observed["evidence"]["aliased"]
-    matches = [group for group in alias_groups if sorted(group) == WANT]
-    assert matches, f"no alias group == {WANT} in evidence.aliased: {alias_groups}"
-    assert len(matches) == 1, f"expected exactly one matching alias group, got {matches}"
-
-    reports = [f for f in observed["functions"] if sorted(f["names"]) == WANT]
-    assert len(reports) == 1, f"expected exactly one function report for {WANT}, got {reports}"
-    report = reports[0]
-    assert report["aliased"] is True, "aliased slot must be flagged aliased=true"
-    assert report["calls"] == WANT_CALLS, (
-        f"aliased group calls: want {WANT_CALLS}, got {report['calls']}"
-    )
-    return report["calls"]
-
-
-GOOD = {
-    "evidence": {"aliased": [list(WANT)]},
-    "functions": [
-        {"names": list(WANT), "aliased": True, "calls": WANT_CALLS},
-        {"names": ["C_GetInfo"], "aliased": False, "calls": 1},
-    ],
-}
-
-
-def mutate(path, value):
-    document = copy.deepcopy(GOOD)
-    cursor = document
-    for key in path[:-1]:
-        cursor = cursor[key]
-    cursor[path[-1]] = value
-    return document
-
-
-if sys.argv[1] == "--self-test":
-    oracle(GOOD)
-    for label, document in [
-        ("alias group present", mutate(["evidence", "aliased"], [["C_GetInfo"]])),
-        ("one alias group", mutate(["evidence", "aliased"], [list(WANT), list(WANT)])),
-        ("one function report", mutate(["functions"], GOOD["functions"] + [GOOD["functions"][0]])),
-        ("aliased flag", mutate(["functions", 0, "aliased"], False)),
-        ("aliased group calls", mutate(["functions", 0, "calls"], WANT_CALLS - 1)),
-    ]:
-        try:
-            oracle(document)
-        except (AssertionError, KeyError, IndexError):
-            continue
-        raise SystemExit(f"mutation accepted: gap 1 {label}")
-    print("gap 1 alias oracle mutations rejected: OK")
-    raise SystemExit(0)
-
-calls = oracle(json.load(open(sys.argv[1])))
-print(f"gap 1 OK: alias group {WANT} calls={calls} (want {WANT_CALLS})")
-PY
+    python3 -I scripts/lane-induced-gaps-oracle-1.py "$@"
 }
 
 assert_gap2() {
-    python3 - "$@" <<'PY'
-import copy
-import json
-import sys
-
-
-def oracle(observed):
-    in_flight = observed["evidence"]["in_flight_at_end"]
-    reports = [f for f in observed["functions"] if "C_WaitForSlotEvent" in f["names"]]
-    assert len(reports) == 1, (
-        f"expected exactly one function report naming C_WaitForSlotEvent, got {reports}"
-    )
-    report = reports[0]
-    assert report["in_flight"] >= 1, f"slot in_flight: want >= 1, got {report['in_flight']}"
-    assert report["calls"] == 0, f"stranded call must not count as completed: {report['calls']}"
-    assert report["latency_ns"]["p50"] is None, (
-        "stranded call must be excluded from latency percentiles"
-    )
-    assert report["latency_ns"]["p95"] is None
-    assert report["latency_ns"]["p99"] is None
-    return in_flight
-
-
-GOOD = {
-    "evidence": {"in_flight_at_end": 1},
-    "functions": [
-        {
-            "names": ["C_WaitForSlotEvent"],
-            "in_flight": 1,
-            "calls": 0,
-            "latency_ns": {"p50": None, "p95": None, "p99": None},
-        }
-    ],
-}
-
-
-def mutate(path, value):
-    document = copy.deepcopy(GOOD)
-    cursor = document
-    for key in path[:-1]:
-        cursor = cursor[key]
-    cursor[path[-1]] = value
-    return document
-
-
-if sys.argv[1] == "--self-test":
-    oracle(GOOD)
-    for label, document in [
-        ("one stranded report", mutate(["functions"], GOOD["functions"] * 2)),
-        ("named report", mutate(["functions", 0, "names"], ["C_GetInfo"])),
-        ("in-flight count", mutate(["functions", 0, "in_flight"], 0)),
-        ("completed calls", mutate(["functions", 0, "calls"], 1)),
-        ("p50 exclusion", mutate(["functions", 0, "latency_ns"], {"p50": 1, "p95": None, "p99": None})),
-        ("p95 exclusion", mutate(["functions", 0, "latency_ns"], {"p50": None, "p95": 1, "p99": None})),
-        ("p99 exclusion", mutate(["functions", 0, "latency_ns"], {"p50": None, "p95": None, "p99": 1})),
-    ]:
-        try:
-            oracle(document)
-        except (AssertionError, KeyError, IndexError):
-            continue
-        raise SystemExit(f"mutation accepted: gap 2 {label}")
-    print("gap 2 in-flight oracle mutations rejected: OK")
-    raise SystemExit(0)
-
-in_flight = oracle(json.load(open(sys.argv[1])))
-print(f"gap 2 OK: in_flight_at_end={in_flight}, stranded call excluded from percentiles")
-PY
+    python3 -I scripts/lane-induced-gaps-oracle-2.py "$@"
 }
 
 policy_map_ids() {
@@ -293,41 +165,7 @@ policy_map_ids() {
         --self-test) pmi_python=python3 ;;
         *) pmi_python="sudo python3" ;;
     esac
-    $pmi_python - "$@" <<'PY'
-import json, os, sys
-expected = {"CONFIG", "PID_FILTER", "CGROUP_FILTER", "DESCRIPTORS",
-            "ASYNC_FUNCTIONS", "MECH_SHAPE", "ATTR_BOOL_BITS", "TAIL_CALLS"}
-
-
-def oracle(items, output_path):
-    assert set(items) >= expected, (set(items), expected)
-    with open(output_path, "w", encoding="utf-8") as output:
-        os.chmod(output_path, 0o600)
-        for name in sorted(expected):
-            print(f"{name}={items[name]}", file=output)
-
-
-if sys.argv[1] == "--self-test":
-    work = sys.argv[2]
-    good = {name: index for index, name in enumerate(sorted(expected), start=1)}
-    oracle(good, f"{work}/ids")
-    written = dict(line.split("=") for line in open(f"{work}/ids").read().splitlines())
-    assert sorted(written) == sorted(expected), written
-    assert oct(os.stat(f"{work}/ids").st_mode)[-3:] == "600", "policy-map id file must be 0600"
-    for label, items in [
-        ("missing published policy map", {k: v for k, v in good.items() if k != "DESCRIPTORS"}),
-        ("empty inventory", {}),
-    ]:
-        try:
-            oracle(items, f"{work}/ids")
-        except AssertionError:
-            continue
-        raise SystemExit(f"mutation accepted: {label}")
-    print("policy-map id oracle mutations rejected: OK")
-    raise SystemExit(0)
-
-oracle({item["name"]: item["id"] for item in json.load(open(sys.argv[1]))}, sys.argv[2])
-PY
+    $pmi_python -I scripts/lane-induced-gaps-oracle-3.py "$@"
 }
 
 assert_dynamic_maps_advanced() {
@@ -336,103 +174,10 @@ assert_dynamic_maps_advanced() {
         --self-test) adma_python=python3 ;;
         *) adma_python="sudo python3" ;;
     esac
-    $adma_python - "$1" "$2" <<'PY'
-import json, os, struct, sys
-
-
-def identity(before, after):
-    assert before["EVENTS"]["oracle"] == after["EVENTS"]["oracle"] == "mmap"
-    assert "file" not in before["EVENTS"] and "file" not in after["EVENTS"]
-    assert {name: item["id"] for name, item in before.items()} == {
-        name: item["id"] for name, item in after.items()
-    }, "observer-owned map ids changed during freeze lane"
-
-
-def total(path):
-    doc = json.load(open(path))
-    cells = []
-
-    def walk(value):
-        if isinstance(value, dict):
-            encoded = value.get("value")
-            if isinstance(encoded, list) and all(isinstance(item, str) for item in encoded):
-                raw = bytes(int(item, 16) for item in encoded)
-                assert len(raw) % 8 == 0, (path, len(raw))
-                cells.extend(struct.unpack(f"<{len(raw) // 8}Q", raw))
-            else:
-                for child in value.values(): walk(child)
-        elif isinstance(value, list):
-            for child in value: walk(child)
-
-    walk(doc)
-    return sum(cells)
-
-
-DYNAMIC = ("STATS", "RV_COUNTS", "EVIDENCE")
-
-
-def advanced(before, after):
-    identity(before, after)
-    for name in DYNAMIC:
-        previous, current = total(before[name]["file"]), total(after[name]["file"])
-        assert current > previous, f"dynamic {name} did not advance: {previous} -> {current}"
-        print(f"dynamic {name} exact id={before[name]['id']} advanced: {previous} -> {current}")
-
-
-if sys.argv[1] == "--self-test":
-    work = sys.argv[2]
-
-    def dump(name, cells):
-        path = os.path.join(work, f"{name}.json")
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(
-                [{"value": [f"0x{byte:02x}" for byte in struct.pack("<Q", cell)]} for cell in cells],
-                handle,
-            )
-        return path
-
-    def side(suffix, counts):
-        maps = {"EVENTS": {"id": 1, "oracle": "mmap"}}
-        for index, name in enumerate(DYNAMIC, start=2):
-            maps[name] = {"id": index, "file": dump(f"{name}-{suffix}", [counts])}
-        return maps
-
-    good_before, good_after = side("before", 1), side("after", 2)
-    advanced(good_before, good_after)
-    mutations = [
-        ("EVENTS ring oracle", good_before, {**good_after, "EVENTS": {"id": 1, "oracle": "file"}}),
-        (
-            "EVENTS dumped to a file",
-            good_before,
-            {**good_after, "EVENTS": {"id": 1, "oracle": "mmap", "file": "/dev/null"}},
-        ),
-        (
-            "observer-owned map ids",
-            good_before,
-            {**good_after, "STATS": {**good_after["STATS"], "id": 99}},
-        ),
-        ("STATS advanced", good_before, {**good_after, "STATS": good_before["STATS"]}),
-        ("RV_COUNTS advanced", good_before, {**good_after, "RV_COUNTS": good_before["RV_COUNTS"]}),
-        ("EVIDENCE advanced", good_before, {**good_after, "EVIDENCE": good_before["EVIDENCE"]}),
-    ]
-    for label, before_side, after_side in mutations:
-        try:
-            advanced(before_side, after_side)
-        except (AssertionError, KeyError):
-            continue
-        raise SystemExit(f"mutation accepted: {label}")
-    print(f"dynamic policy-map oracle mutations rejected: OK ({len(mutations)} lanes)")
-    raise SystemExit(0)
-
-before_path, after_path = sys.argv[1:3]
-advanced(
-    {item["name"]: item for item in json.load(open(before_path))},
-    {item["name"]: item for item in json.load(open(after_path))},
-)
-PY
+    $adma_python -I scripts/lane-induced-gaps-oracle-4.py "$1" "$2"
 }
 
-task4_prepare_root() {
+receipt_prepare_root() {
     t4_candidate=$1
     case $t4_candidate in /*) ;; *) return 1 ;; esac
     case $t4_candidate in *'/../'*|*/..|*"\t"*|*"\n"*) return 1 ;; esac
@@ -449,126 +194,115 @@ task4_prepare_root() {
     [ "$(stat -Lc %u:%a "$t4_parent")" = "$(id -u):700" ] || return 1
     [ ! -e "$t4_candidate" ] && [ ! -L "$t4_candidate" ] || return 1
     umask 077; mkdir -m 700 "$t4_candidate" || return 1
-    TASK4_ROOT=$t4_candidate; TASK4_CAMPAIGN=$t4_parent
-    TASK4_ROOT_ID=$(stat -Lc %d:%i "$TASK4_ROOT") || return 1
+    RECEIPT_ROOT=$t4_candidate; RECEIPT_CAMPAIGN=$t4_parent
+    RECEIPT_ROOT_ID=$(stat -Lc %d:%i "$RECEIPT_ROOT") || return 1
 }
 
-task4_digest() { sha256sum "$1" | awk '{print $1}'; }
-task4_snapshot() {
+receipt_digest() { sha256sum "$1" | awk '{print $1}'; }
+receipt_snapshot() {
     [ "$#" -eq 1 ] || return 2
     case $1 in initial|final) ;; *) return 2 ;; esac
     p11scope_prepared_snapshot "$P11SCOPE_PREPARED_PYTHON" \
-        "$TASK4_ROOT/artifacts/induced.source.$1" \
-        "$TASK4_PREPARED_PREFIX.$1.ledger.sha256"
+        "$RECEIPT_ROOT/artifacts/induced.source.$1" \
+        "$RECEIPT_PREPARED_PREFIX.$1.ledger.sha256"
 }
-task4_fact() { printf '%s\t%s\n' "$1" "$2" >> "$TASK4_FACTS"; }
+receipt_fact() { printf '%s\t%s\n' "$1" "$2" >> "$RECEIPT_FACTS"; }
 
-task4_finalize() {
+receipt_finalize() {
     t4_result=$?
     trap - EXIT INT TERM HUP
     set +e
-    [ "$(stat -Lc %d:%i "$TASK4_ROOT" 2>/dev/null)" = "$TASK4_ROOT_ID" ] || t4_result=1
-    [ "$(stat -Lc %d:%i "$TASK4_ROOT/artifacts" 2>/dev/null)" = "$TASK4_ARTIFACTS_ID" ] || t4_result=1
-    [ "$(stat -Lc %d:%i "$TASK4_ROOT/work" 2>/dev/null)" = "$TASK4_WORK_ID" ] || t4_result=1
+    [ "$(stat -Lc %d:%i "$RECEIPT_ROOT" 2>/dev/null)" = "$RECEIPT_ROOT_ID" ] || t4_result=1
+    [ "$(stat -Lc %d:%i "$RECEIPT_ROOT/artifacts" 2>/dev/null)" = "$RECEIPT_ARTIFACTS_ID" ] || t4_result=1
+    [ "$(stat -Lc %d:%i "$RECEIPT_ROOT/work" 2>/dev/null)" = "$RECEIPT_WORK_ID" ] || t4_result=1
     if [ "$t4_result" -ne 77 ]; then
-        [ "$(git rev-parse HEAD 2>/dev/null)" = "$TASK4_HEAD" ] || t4_result=1
-        [ "$(git rev-parse 'HEAD^{tree}' 2>/dev/null)" = "$TASK4_TREE" ] || t4_result=1
+        [ "$(git rev-parse HEAD 2>/dev/null)" = "$RECEIPT_HEAD" ] || t4_result=1
+        [ "$(git rev-parse 'HEAD^{tree}' 2>/dev/null)" = "$RECEIPT_TREE" ] || t4_result=1
         git diff --quiet && git diff --cached --quiet || t4_result=1
-        [ "$(task4_digest scripts/verify-induced-gaps.sh 2>/dev/null)" = "$TASK4_DRIVER_HASH" ] || t4_result=1
-        [ "$(task4_digest scripts/check-capture-evidence.py 2>/dev/null)" = "$TASK4_CHECKER_HASH" ] || t4_result=1
-        if [ "${TASK4_PREPARED_ADMITTED-0}" -eq 1 ]; then
+        [ "$(receipt_digest scripts/verify-induced-gaps.sh 2>/dev/null)" = "$RECEIPT_DRIVER_HASH" ] || t4_result=1
+        [ "$(receipt_digest scripts/check-capture-evidence.py 2>/dev/null)" = "$RECEIPT_CHECKER_HASH" ] || t4_result=1
+        if [ "${RECEIPT_PREPARED_ADMITTED-0}" -eq 1 ]; then
             if "$P11SCOPE_PREPARED_PYTHON" -I scripts/prepared-dependency-evidence.py \
-                recheck --prefix "$TASK4_PREPARED_PREFIX"; then
-                task4_snapshot final > "$TASK4_ROOT/artifacts/source.end.tsv" || t4_result=1
-                cmp -s "$TASK4_ROOT/artifacts/source.start.tsv" \
-                    "$TASK4_ROOT/artifacts/source.end.tsv" || t4_result=1
+                recheck --prefix "$RECEIPT_PREPARED_PREFIX"; then
+                receipt_snapshot final > "$RECEIPT_ROOT/artifacts/source.end.tsv" || t4_result=1
+                cmp -s "$RECEIPT_ROOT/artifacts/source.start.tsv" \
+                    "$RECEIPT_ROOT/artifacts/source.end.tsv" || t4_result=1
             else
                 t4_result=1
             fi
         else
             t4_result=1
         fi
-        [ -s "$TASK4_ROOT/artifacts/capture.json" ] || t4_result=1
-        [ -s "$TASK4_ROOT/artifacts/checker.log" ] || t4_result=1
+        [ -s "$RECEIPT_ROOT/artifacts/capture.json" ] || t4_result=1
+        [ -s "$RECEIPT_ROOT/artifacts/checker.log" ] || t4_result=1
     fi
-    find "$TASK4_ROOT" -type d -exec chmod 700 {} + 2>/dev/null || t4_result=1
-    find "$TASK4_ROOT" -type f -exec chmod 600 {} + 2>/dev/null || t4_result=1
-    python3 - "$TASK4_ROOT" <<'PY' || t4_result=1
-import os, stat, sys
-root=sys.argv[1]
-if set(os.listdir(root)) != {"facts.log","stdout.log","stderr.log","artifacts","work"}: raise SystemExit("foreign root entry")
-for directory, dirs, files in os.walk(root,followlinks=False):
-    if stat.S_IMODE(os.lstat(directory).st_mode)!=0o700: raise SystemExit("directory mode")
-    for name in dirs+files:
-        if stat.S_ISLNK(os.lstat(os.path.join(directory,name)).st_mode): raise SystemExit("symlink")
-    for name in files:
-        mode=os.lstat(os.path.join(directory,name)).st_mode
-        if not stat.S_ISREG(mode) or stat.S_IMODE(mode)!=0o600: raise SystemExit("file mode")
-PY
-    task4_fact ended_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)" || t4_result=1
-    task4_fact terminal_status "$t4_result" || t4_result=1
-    sync -f "$TASK4_FACTS" "$TASK4_ROOT/stdout.log" "$TASK4_ROOT/stderr.log" 2>/dev/null || t4_result=1
-    if [ ! -e "$TASK4_ROOT/status" ] && [ ! -L "$TASK4_ROOT/status" ]; then
-        printf '%s\n' "$t4_result" > "$TASK4_ROOT/status"; chmod 600 "$TASK4_ROOT/status"; sync -f "$TASK4_ROOT/status" 2>/dev/null || t4_result=1
+    find "$RECEIPT_ROOT" -type d -exec chmod 700 {} + 2>/dev/null || t4_result=1
+    find "$RECEIPT_ROOT" -type f -exec chmod 600 {} + 2>/dev/null || t4_result=1
+    python3 -I scripts/lane-induced-gaps-oracle-5.py "$RECEIPT_ROOT" || t4_result=1
+    receipt_fact ended_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)" || t4_result=1
+    receipt_fact terminal_status "$t4_result" || t4_result=1
+    sync -f "$RECEIPT_FACTS" "$RECEIPT_ROOT/stdout.log" "$RECEIPT_ROOT/stderr.log" 2>/dev/null || t4_result=1
+    if [ ! -e "$RECEIPT_ROOT/status" ] && [ ! -L "$RECEIPT_ROOT/status" ]; then
+        printf '%s\n' "$t4_result" > "$RECEIPT_ROOT/status"; chmod 600 "$RECEIPT_ROOT/status"; sync -f "$RECEIPT_ROOT/status" 2>/dev/null || t4_result=1
     else
         t4_result=1
     fi
     exit "$t4_result"
 }
 
-task4_receipt_run() {
+receipt_receipt_run() {
     [ "$#" -eq 1 ] || { echo "usage: $0 --self-test | ABSENT_EVIDENCE_ROOT" >&2; exit 2; }
-    task4_prepare_root "$1" || { echo "invalid Task 4 evidence root" >&2; exit 77; }
-    TASK4_FACTS=$TASK4_ROOT/facts.log
-    : > "$TASK4_FACTS"; : > "$TASK4_ROOT/stdout.log"; : > "$TASK4_ROOT/stderr.log"
-    chmod 600 "$TASK4_FACTS" "$TASK4_ROOT/stdout.log" "$TASK4_ROOT/stderr.log"
-    mkdir -m 700 "$TASK4_ROOT/artifacts" "$TASK4_ROOT/work"
-    TASK4_ARTIFACTS_ID=$(stat -Lc %d:%i "$TASK4_ROOT/artifacts")
-    TASK4_WORK_ID=$(stat -Lc %d:%i "$TASK4_ROOT/work")
-    TASK4_HEAD= TASK4_TREE= TASK4_DRIVER_HASH= TASK4_CHECKER_HASH=
-    TASK4_PREPARED_ADMITTED=0
-    TASK4_PREPARED_PREFIX=$TASK4_ROOT/artifacts/induced.prepared
-    trap task4_finalize EXIT INT TERM HUP
-    [ ! -L "$TASK4_CAMPAIGN/.task4.lock" ] || exit 77
-    exec 9>>"$TASK4_CAMPAIGN/.task4.lock"; chmod 600 "$TASK4_CAMPAIGN/.task4.lock"
-    [ "$(stat -Lc %d:%i:%u:%a:%h /proc/$$/fd/9)" = "$(stat -Lc %d:%i:%u:%a:%h "$TASK4_CAMPAIGN/.task4.lock")" ] || exit 77
+    receipt_prepare_root "$1" || { echo "invalid Task 4 evidence root" >&2; exit 77; }
+    RECEIPT_FACTS=$RECEIPT_ROOT/facts.log
+    : > "$RECEIPT_FACTS"; : > "$RECEIPT_ROOT/stdout.log"; : > "$RECEIPT_ROOT/stderr.log"
+    chmod 600 "$RECEIPT_FACTS" "$RECEIPT_ROOT/stdout.log" "$RECEIPT_ROOT/stderr.log"
+    mkdir -m 700 "$RECEIPT_ROOT/artifacts" "$RECEIPT_ROOT/work"
+    RECEIPT_ARTIFACTS_ID=$(stat -Lc %d:%i "$RECEIPT_ROOT/artifacts")
+    RECEIPT_WORK_ID=$(stat -Lc %d:%i "$RECEIPT_ROOT/work")
+    RECEIPT_HEAD= RECEIPT_TREE= RECEIPT_DRIVER_HASH= RECEIPT_CHECKER_HASH=
+    RECEIPT_PREPARED_ADMITTED=0
+    RECEIPT_PREPARED_PREFIX=$RECEIPT_ROOT/artifacts/induced.prepared
+    trap receipt_finalize EXIT INT TERM HUP
+    [ ! -L "$RECEIPT_CAMPAIGN/.receipt.lock" ] || exit 77
+    exec 9>>"$RECEIPT_CAMPAIGN/.receipt.lock"; chmod 600 "$RECEIPT_CAMPAIGN/.receipt.lock"
+    [ "$(stat -Lc %d:%i:%u:%a:%h /proc/$$/fd/9)" = "$(stat -Lc %d:%i:%u:%a:%h "$RECEIPT_CAMPAIGN/.receipt.lock")" ] || exit 77
     [ "$(stat -Lc %u:%a:%h /proc/$$/fd/9)" = "$(id -u):600:1" ] || exit 77
     flock -n 9 || exit 77
-    TASK4_LOCK_ID=$(stat -Lc %d:%i "$TASK4_CAMPAIGN/.task4.lock")
-    TASK4_HEAD=$(git rev-parse HEAD) || exit 77; TASK4_TREE=$(git rev-parse 'HEAD^{tree}') || exit 77
+    RECEIPT_LOCK_ID=$(stat -Lc %d:%i "$RECEIPT_CAMPAIGN/.receipt.lock")
+    RECEIPT_HEAD=$(git rev-parse HEAD) || exit 77; RECEIPT_TREE=$(git rev-parse 'HEAD^{tree}') || exit 77
     git diff --quiet && git diff --cached --quiet || exit 77
-    TASK4_DRIVER_HASH=$(task4_digest scripts/verify-induced-gaps.sh); TASK4_CHECKER_HASH=$(task4_digest scripts/check-capture-evidence.py)
-    task4_fact started_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; task4_fact argv "$0 $1"; task4_fact cwd "$(pwd -P)"
-    task4_fact uid_gid "$(id -u):$(id -g)"; task4_fact kernel "$(uname -srmo)"; task4_fact head "$TASK4_HEAD"; task4_fact tree "$TASK4_TREE"
-    task4_fact root_identity "$TASK4_ROOT_ID"; task4_fact artifacts_identity "$TASK4_ARTIFACTS_ID"; task4_fact work_identity "$TASK4_WORK_ID"
-    task4_fact lock_identity "$TASK4_LOCK_ID"; task4_fact lock_holder "$$:$(process_starttime $$)"
-    task4_fact driver_sha256 "$TASK4_DRIVER_HASH"; task4_fact checker_sha256 "$TASK4_CHECKER_HASH"
+    RECEIPT_DRIVER_HASH=$(receipt_digest scripts/verify-induced-gaps.sh); RECEIPT_CHECKER_HASH=$(receipt_digest scripts/check-capture-evidence.py)
+    receipt_fact started_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; receipt_fact argv "$0 $1"; receipt_fact cwd "$(pwd -P)"
+    receipt_fact uid_gid "$(id -u):$(id -g)"; receipt_fact kernel "$(uname -srmo)"; receipt_fact head "$RECEIPT_HEAD"; receipt_fact tree "$RECEIPT_TREE"
+    receipt_fact root_identity "$RECEIPT_ROOT_ID"; receipt_fact artifacts_identity "$RECEIPT_ARTIFACTS_ID"; receipt_fact work_identity "$RECEIPT_WORK_ID"
+    receipt_fact lock_identity "$RECEIPT_LOCK_ID"; receipt_fact lock_holder "$$:$(process_starttime $$)"
+    receipt_fact driver_sha256 "$RECEIPT_DRIVER_HASH"; receipt_fact checker_sha256 "$RECEIPT_CHECKER_HASH"
     for tool in gcc python3 rustup bpftool systemd-run sudo sha256sum git sort xargs; do command -v "$tool" >/dev/null || exit 77; done
     . scripts/prepared-dependency-tools.sh
     . scripts/prepared-dependency-snapshot.sh
     p11scope_prepared_tools_select "$(command -v python3)" "$(command -v rustup)" || exit 77
     "$P11SCOPE_PREPARED_PYTHON" -I scripts/prepared-dependency-evidence.py capture \
-        --prefix "$TASK4_PREPARED_PREFIX" \
+        --prefix "$RECEIPT_PREPARED_PREFIX" \
         --stable-cargo "$P11SCOPE_PREPARED_STABLE_CARGO" \
         --stable-rustc "$P11SCOPE_PREPARED_STABLE_RUSTC" \
         --bpf-cargo "$P11SCOPE_PREPARED_BPF_CARGO" \
         --bpf-rustc "$P11SCOPE_PREPARED_BPF_RUSTC" || exit 77
-    TASK4_PREPARED_ADMITTED=1
-    task4_snapshot initial > "$TASK4_ROOT/artifacts/source.start.tsv" || exit 77
-    TASK4_SOURCE_HASH=$(task4_digest "$TASK4_ROOT/artifacts/source.start.tsv")
-    task4_fact source_input_ledger_sha256 "$TASK4_SOURCE_HASH"
+    RECEIPT_PREPARED_ADMITTED=1
+    receipt_snapshot initial > "$RECEIPT_ROOT/artifacts/source.start.tsv" || exit 77
+    RECEIPT_SOURCE_HASH=$(receipt_digest "$RECEIPT_ROOT/artifacts/source.start.tsv")
+    receipt_fact source_input_ledger_sha256 "$RECEIPT_SOURCE_HASH"
     sudo -n true >/dev/null 2>&1 || exit 77
     [ -f "$MODULE" ] || exit 77
-    P11SCOPE_TASK4_BODY=1 P11SCOPE_TASK4_WORK="$TASK4_ROOT/work" \
+    P11SCOPE_RECEIPT_BODY=1 P11SCOPE_RECEIPT_WORK="$RECEIPT_ROOT/work" \
         P11SCOPE_PREPARED_STABLE_CARGO="$P11SCOPE_PREPARED_STABLE_CARGO" \
         P11SCOPE_PREPARED_STABLE_RUSTC="$P11SCOPE_PREPARED_STABLE_RUSTC" \
         P11SCOPE_PREPARED_BPF_CARGO="$P11SCOPE_PREPARED_BPF_CARGO" \
         P11SCOPE_PREPARED_BPF_RUSTC="$P11SCOPE_PREPARED_BPF_RUSTC" \
-        /bin/sh "$0" > "$TASK4_ROOT/stdout.log" 2> "$TASK4_ROOT/stderr.log"
-    t4_capture=$(find "$TASK4_ROOT/work" -type f -name '*observed*.json' -print | sort | head -n 1)
+        /bin/sh "$0" > "$RECEIPT_ROOT/stdout.log" 2> "$RECEIPT_ROOT/stderr.log"
+    t4_capture=$(find "$RECEIPT_ROOT/work" -type f -name '*observed*.json' -print | sort | head -n 1)
     [ -n "$t4_capture" ] || exit 1
-    cp "$t4_capture" "$TASK4_ROOT/artifacts/capture.json"
-    cp "$TASK4_ROOT/stdout.log" "$TASK4_ROOT/artifacts/checker.log"
+    cp "$t4_capture" "$RECEIPT_ROOT/artifacts/capture.json"
+    cp "$RECEIPT_ROOT/stdout.log" "$RECEIPT_ROOT/artifacts/checker.log"
 }
 
 if [ "${1-}" = "--self-test" ]; then
@@ -589,133 +323,13 @@ if [ "${1-}" = "--self-test" ]; then
     gcc -std=c11 -O2 -Wall -Wextra -Werror -o "$SELF_TEST_WORK/freeze-policy-maps" \
         "$SELF_TEST_WORK/freeze-policy-maps.c"
     "$SELF_TEST_WORK/freeze-policy-maps" --self-test
-    REPORT=${P11SCOPE_TASK4_SELF_TEST_REPORT:-$SELF_TEST_WORK/report.tsv}
-    python3 - "$REPORT" <<'PY'
-import copy, fcntl, os, stat, sys, tempfile
-from pathlib import Path
-
-report = Path(sys.argv[1]); rows = []
-common = """complete-success-status-0-last-once
-input-mutation-rejected-nonzero-status-last-once
-cleanup-query-failure-rejected-nonzero-status-last-once
-existing-root-rejected-status-77-no-touch-before-body
-nonprivate-parent-rejected-status-77-no-touch-before-body
-symlink-root-rejected-status-77-no-touch-before-body
-foreign-root-rejected-status-77-no-touch-before-body
-canonical-caller-owned-0700-parent-and-absent-root-required
-campaign-is-canonical-root-dirname-not-env-override
-missing-ephemeral-identity-rejected-nonzero-status-last-once
-root-artifacts-work-device-inode-mutation-rejected
-exact-root-tree-and-0700-directory-modes-accepted
-unexpected-top-level-entry-rejected
-0600-evidence-config-and-retained-executables-validated
-0700-private-executable-only-while-run-validated
-status-0-written-once-last
-missing-status-rejected
-early-status-rejected
-duplicate-status-rejected
-changed-head-rejected
-changed-input-ledger-rejected
-foreign-terminal-artifact-rejected
-missing-capture-evidence-rejected
-missing-checker-evidence-rejected
-root-preflight-blocks-body-cargo-runtime
-lock-contention-status-77-blocks-body-cargo-runtime
-released-exact-lock-success-status-0
-0600-lock-identity-held-through-status-validated
-retained-fixture-tree-validated
-retained-status-sequence-validated
-retained-source-input-ledgers-validated""".splitlines()
-lane = """freeze-CONFIG-PID_FILTER-CGROUP_FILTER-DESCRIPTORS-ASYNC_FUNCTIONS-MECH_SHAPE-ATTR_BOOL_BITS-TEMPLATE_TAIL-exact-accepted
-freeze-missing-rejected
-freeze-duplicate-rejected
-freeze-inventory-mutation-rejected
-g1-161-93-186-exact-accepted
-g1-missing-rejected
-g1-duplicate-rejected
-g1-cardinality-mutation-rejected
-g2-68-2-4-exact-accepted
-g2-missing-rejected
-g2-duplicate-rejected
-g2-cardinality-mutation-rejected
-g3-68-68-136-C_GenerateRandom-200000-exact-accepted
-g3-missing-rejected
-g3-duplicate-rejected
-g3-cardinality-mutation-rejected
-g3-call-mutation-rejected
-g4-988-104-208-inflight-9-start-failures-8-exact-accepted
-g4-missing-rejected
-g4-duplicate-rejected
-g4-cardinality-mutation-rejected
-g4-counter-mutation-rejected
-g5-988-104-208-calls-11-rv-failures-9-unregistered-6-async-orphans-1-exact-accepted
-g5-missing-rejected
-g5-duplicate-rejected
-g5-cardinality-mutation-rejected
-g5-counter-mutation-rejected""".splitlines()
-
-def mark(name, value):
-    if not value: raise AssertionError(name)
-    rows.append(name + "\tOK")
-
-with tempfile.TemporaryDirectory() as raw:
-    base=Path(raw); parent=base/"campaign"; parent.mkdir(mode=0o700)
-    root=parent/"lane"; root.mkdir(mode=0o700); art=root/"artifacts"; art.mkdir(mode=0o700); work=root/"work"; work.mkdir(mode=0o700)
-    for p in (root/"facts.log",root/"stdout.log",root/"stderr.log",art/"observed.json",art/"checker.log",work/"fixture"):
-        p.write_text("evidence\n"); p.chmod(0o600)
-    ids={str(p):(p.stat().st_dev,p.stat().st_ino) for p in (root,art,work)}
-    state={"head":"h","input":"i","ephemeral":"pid:start","cleanup":True}; seq=["facts","capture","checker","cleanup","status"]
-    def valid(s=state,q=seq,expected=ids):
-        if s != state or q != seq: return False
-        if set(x.name for x in root.iterdir()) != {"facts.log","stdout.log","stderr.log","artifacts","work"}: return False
-        if set(x.name for x in art.iterdir()) != {"observed.json","checker.log"} or set(x.name for x in work.iterdir()) != {"fixture"}: return False
-        if any((p.stat().st_dev,p.stat().st_ino)!=expected.get(str(p)) or stat.S_IMODE(p.stat().st_mode)!=0o700 for p in (root,art,work)): return False
-        files=(root/"facts.log",root/"stdout.log",root/"stderr.log",art/"observed.json",art/"checker.log",work/"fixture")
-        return bool(s["ephemeral"] and s["cleanup"] and all(p.is_file() and not p.is_symlink() and stat.S_IMODE(p.stat().st_mode)==0o600 for p in files))
-    mark(common[0],valid()); x=dict(state);x["input"]="x";mark(common[1],not valid(s=x));x=dict(state);x["cleanup"]=False;mark(common[2],not valid(s=x))
-    occupied=parent/"occupied";occupied.mkdir();mark(common[3],occupied.exists() and not (occupied/"body").exists())
-    public=base/"public";public.mkdir();public.chmod(0o755);mark(common[4],stat.S_IMODE(public.stat().st_mode)!=0o700 and not (public/"lane").exists())
-    link=base/"link";link.symlink_to(parent);mark(common[5],link.is_symlink() and not (parent/"link-body").exists())
-    mark(common[6],os.getuid()!=-1 and not (root/"foreign-body").exists());mark(common[7],parent.resolve()==parent and stat.S_IMODE(parent.stat().st_mode)==0o700)
-    os.environ["CAMPAIGN"]=str(base/"wrong");mark(common[8],root.parent.resolve()==parent and root.parent!=Path(os.environ["CAMPAIGN"]))
-    x=dict(state);x["ephemeral"]="";mark(common[9],not valid(s=x));x=dict(ids);x[str(art)]=(-1,-1);mark(common[10],not valid(expected=x));mark(common[11],valid())
-    extra=root/"extra";extra.write_text("x");mark(common[12],not valid());extra.unlink();(work/"fixture").chmod(0o644);mark(common[13],not valid());(work/"fixture").chmod(0o600)
-    (work/"fixture").chmod(0o700);ran=os.access(work/"fixture",os.X_OK);(work/"fixture").chmod(0o600);mark(common[14],ran and valid())
-    mark(common[15],seq[-1]=="status" and seq.count("status")==1);mark(common[16],not valid(q=seq[:-1]));mark(common[17],not valid(q=["status"]+seq[:-1]));mark(common[18],not valid(q=seq+["status"]))
-    x=dict(state);x["head"]="x";mark(common[19],not valid(s=x));x=dict(state);x["input"]="x";mark(common[20],not valid(s=x))
-    extra=art/"foreign";extra.write_text("x");mark(common[21],not valid());extra.unlink();(art/"observed.json").unlink();mark(common[22],not valid());(art/"observed.json").write_text("evidence\n");(art/"observed.json").chmod(0o600)
-    (art/"checker.log").unlink();mark(common[23],not valid());(art/"checker.log").write_text("evidence\n");(art/"checker.log").chmod(0o600);mark(common[24],not (work/"cargo-ran").exists())
-    lock=parent/".task4.lock";lock.touch(mode=0o600);a=open(lock,"r+");b=open(lock,"r+");fcntl.flock(a,fcntl.LOCK_EX|fcntl.LOCK_NB)
-    try: fcntl.flock(b,fcntl.LOCK_EX|fcntl.LOCK_NB);blocked=False
-    except BlockingIOError: blocked=True
-    mark(common[25],blocked and not (work/"runtime-ran").exists());a.close();fcntl.flock(b,fcntl.LOCK_EX|fcntl.LOCK_NB);mark(common[26],valid());mark(common[27],stat.S_IMODE(os.fstat(b.fileno()).st_mode)==0o600);b.close()
-    mark(common[28],(work/"fixture").read_text()=="evidence\n");mark(common[29],seq==["facts","capture","checker","cleanup","status"]);mark(common[30],state=={"head":"h","input":"i","ephemeral":"pid:start","cleanup":True})
-
-policy=["CONFIG","PID_FILTER","CGROUP_FILTER","DESCRIPTORS","ASYNC_FUNCTIONS","MECH_SHAPE","ATTR_BOOL_BITS","TEMPLATE_TAIL"]
-good={"freeze":policy,"g1":[(161,93,186)],"g2":[(68,2,4)],"g3":[(68,68,136,200000)],"g4":[(988,104,208,9,8)],"g5":[(988,104,208,11,9,6,1)]}
-def lane_valid(d):
-    return d.get("freeze")==policy and all(len(d.get(k,[]))==1 and d[k][0]==good[k][0] for k in ("g1","g2","g3","g4","g5"))
-mark(lane[0],lane_valid(good))
-for index,name in enumerate(lane[1:],1):
-    d=copy.deepcopy(good)
-    group="freeze" if name.startswith("freeze-") else name.split("-",1)[0]
-    if "missing" in name: d[group]=[]
-    elif "duplicate" in name: d[group]=d[group]*2
-    elif group=="freeze": d[group][0]="CHANGED"
-    elif "call-mutation" in name or "counter-mutation" in name: d[group][0]=d[group][0][:-1]+(d[group][0][-1]+1,)
-    else: d[group][0]=(d[group][0][0]+1,)+d[group][0][1:]
-    mark(name,not lane_valid(d))
-
-if len(rows)!=len(common)+len(lane) or len(rows)!=len(set(rows)): raise SystemExit("row coverage")
-report.parent.mkdir(parents=True,exist_ok=True);fd=os.open(report,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
-with os.fdopen(fd,"w") as out: out.write("\n".join(rows)+"\n");out.flush();os.fsync(out.fileno())
-if os.stat(report).st_nlink!=1 or stat.S_IMODE(os.stat(report).st_mode)!=0o600: raise SystemExit("unsafe report")
-PY
+    REPORT=${P11SCOPE_RECEIPT_SELF_TEST_REPORT:-$SELF_TEST_WORK/report.tsv}
+    python3 -I scripts/lane-induced-gaps-oracle-6.py "$REPORT"
     echo "verify-induced-gaps Task 4 receipt self-test: OK"
     exit 0
 fi
-if [ -z "${P11SCOPE_TASK4_BODY-}" ]; then
-    task4_receipt_run "$@"
+if [ -z "${P11SCOPE_RECEIPT_BODY-}" ]; then
+    receipt_receipt_run "$@"
     exit 0
 fi
 [ "$#" -eq 0 ] || exit 2
@@ -1162,14 +776,7 @@ resume_and_wait_workload hammer
 reclaim_root_output "$WORK/g3b_observed.json"
 tail -n 5 "$WORK/g3b_profile.log"
 python3 scripts/check-capture-evidence.py induced G3 "$WORK/g3b_observed.json"
-python3 - "$WORK/g3b_observed.json" <<'PY'
-import json
-import sys
-capture = json.load(open(sys.argv[1]))["capture"]
-assert capture["ring_bytes"] == 4096, capture
-assert capture["drain_interval_ms"] == 1000, capture
-print("gap 3b disclosed ring_bytes=4096 drain_interval_ms=1000: OK")
-PY
+python3 -I scripts/lane-induced-gaps-oracle-7.py "$WORK/g3b_observed.json"
 echo "gap 3b flag-set ring event-loss/count-authority evidence OK"
 
 ##############################################################################

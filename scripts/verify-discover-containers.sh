@@ -9,7 +9,7 @@
 # Both --target-dir paths below are under the private receipt mount (/receipt),
 # not the container's own /tmp, so the built artifacts survive the container's
 # --rm and are reused as-is by scripts/build-release.sh, which supplies its own
-# P11SCOPE_TASK4_WORK base, instead of building them a second time.
+# P11SCOPE_RECEIPT_WORK base, instead of building them a second time.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -418,9 +418,9 @@ printf 'facts_identity\t%s\nstarted_utc\t%s\n' "$LANE14_FACTS_ID" \
 # supplied base is required to be absolute (the sibling gates' contract) and the
 # standalone default is rooted in a private 0700 directory on sticky /tmp rather
 # than in the checkout, which root-owned container build output must not litter.
-if [ -n "${P11SCOPE_TASK4_WORK:-}" ]; then
-    case $P11SCOPE_TASK4_WORK in /*) ;; *) echo "P11SCOPE_TASK4_WORK must be absolute" >&2; exit 2 ;; esac
-    DISCOVER_WORK=$P11SCOPE_TASK4_WORK/discover
+if [ -n "${P11SCOPE_RECEIPT_WORK:-}" ]; then
+    case $P11SCOPE_RECEIPT_WORK in /*) ;; *) echo "P11SCOPE_RECEIPT_WORK must be absolute" >&2; exit 2 ;; esac
+    DISCOVER_WORK=$P11SCOPE_RECEIPT_WORK/discover
 else
     DISCOVER_WORK=$(mktemp -d "${TMPDIR:-/tmp}/p11scope-verify-XXXXXX")/target/discover
     echo "work root: $DISCOVER_WORK"
@@ -436,7 +436,7 @@ MUSL_BUILD="p11scope-discover-musl-build-$TOKEN"
 # container exists is still removed by the trap (Task 10 F5), while a name
 # collision fails creation with nothing recorded and the trap deletes nothing:
 # mutable names alone never authorize deletion
-# (docs/superpowers/reports/2026-08-28-task4-receipt-architecture-decision.md).
+# (docs/superpowers/reports/2026-08-28-receipt-receipt-architecture-decision.md).
 GLIBC_BUILD_ID=
 GLIBC_RUN_ID=
 MUSL_BUILD_ID=

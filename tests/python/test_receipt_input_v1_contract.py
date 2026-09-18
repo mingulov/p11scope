@@ -7,7 +7,6 @@ import contextlib
 import errno
 import fcntl
 import hashlib
-import importlib.util
 import io
 import os
 import resource
@@ -20,10 +19,14 @@ import unittest
 
 
 REPO = Path(__file__).resolve().parents[2]
-SCRIPT_PATH = REPO / "scripts/task4-build-subject.py"
-GOLDEN_PATH = REPO / "tests/fixtures/task4/input-ledger-golden.tsv"
-_MODULE_NAME = "task4_build_subject"
+SCRIPT_PATH = REPO / "scripts/receipt-build-subject.py"
+GOLDEN_PATH = REPO / "tests/fixtures/receipt/input-ledger-golden.tsv"
+_MODULE_NAME = "receipt_build_subject"
 _ABSENT = object()
+
+sys.path.insert(0, str(REPO / "scripts"))
+sys.dont_write_bytecode = True
+from _loader import load_path
 
 
 def run_input_v1_contract(subject_path, golden):
@@ -37,13 +40,12 @@ def run_input_v1_contract(subject_path, golden):
     previous_environment = dict(os.environ)
     try:
         sys.dont_write_bytecode = True
-        os.environ["TASK4_GOLDEN"] = golden.decode("ascii")
-        spec = importlib.util.spec_from_file_location("task4_build_subject", subject_path)
-        if spec is None or spec.loader is None:
-            raise SystemExit("could not import task4 build-subject script")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
+        os.environ["RECEIPT_GOLDEN"] = golden.decode("ascii")
+        try:
+            module = load_path(subject_path, "receipt_build_subject")
+        except FileNotFoundError:
+            raise SystemExit("could not import receipt build-subject script")
+        sys.modules[module.__name__] = module
 
         runner = getattr(module, "run_reconciled_build", None)
 
@@ -151,7 +153,7 @@ def run_input_v1_contract(subject_path, golden):
                 os.mkdir(path, 0o755)
             os.mkdir(parent_root, 0o700)
             make_file(parent_root, "marker", b"parent-marker", 0o600)
-            ledger_path = make_file(fixture, "ledger", os.environ["TASK4_GOLDEN"].encode("ascii"))
+            ledger_path = make_file(fixture, "ledger", os.environ["RECEIPT_GOLDEN"].encode("ascii"))
             ledger_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
             parent_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
             ledger_fd = os.open(ledger_path, ledger_flags)
@@ -4946,7 +4948,7 @@ def run_input_v1_contract(subject_path, golden):
                             "a1_final_private_events": [],
                             "a1_final_borrowed_events": [],
                             "a1_safe_failure_attempted": None,
-                            "a1_private_expected_bytes": os.environ["TASK4_GOLDEN"].encode("ascii"),
+                            "a1_private_expected_bytes": os.environ["RECEIPT_GOLDEN"].encode("ascii"),
                             "a1_private_pread_cursor": 0,
                             "a1_private_pread_chunks": [],
                             "a1_fp_pread_attempted": False,
@@ -4987,8 +4989,8 @@ def run_input_v1_contract(subject_path, golden):
                             "a2_preimages": [],
                             "a2_row_stats": {},
                             "a2_row_lineage": {},
-                            "a2_supplied_rows": stage3_a2_supplied_rows(os.environ["TASK4_GOLDEN"]),
-                            "a3_supplied_absence_rows": stage3_a3_supplied_absence_rows(os.environ["TASK4_GOLDEN"]),
+                            "a2_supplied_rows": stage3_a2_supplied_rows(os.environ["RECEIPT_GOLDEN"]),
+                            "a3_supplied_absence_rows": stage3_a3_supplied_absence_rows(os.environ["RECEIPT_GOLDEN"]),
                             "a2_cross_scan": False,
                             "a2_first_body_failure": None,
                             "a2_original_interrupt": None,
@@ -5193,7 +5195,7 @@ def run_input_v1_contract(subject_path, golden):
                 valid,
                 roots,
                 base_borrowed,
-                os.environ["TASK4_GOLDEN"],
+                os.environ["RECEIPT_GOLDEN"],
             )
 
             stage2_positive = {
@@ -5341,7 +5343,7 @@ def run_input_v1_contract(subject_path, golden):
                     size = 3
                 if offset != stage2_positive["pread_cursor"]:
                     raise SystemExit("stage2 private ledger pread was not contiguous")
-                if stage2_positive["pread_cursor"] >= len(os.environ["TASK4_GOLDEN"].encode("ascii")):
+                if stage2_positive["pread_cursor"] >= len(os.environ["RECEIPT_GOLDEN"].encode("ascii")):
                     raise SystemExit("stage2 extended a terminal private-ledger pread")
                 stage2_positive["events"].append("L-pread")
                 value = real_pread(fd, size, offset)
@@ -5428,7 +5430,7 @@ def run_input_v1_contract(subject_path, golden):
                     raise SystemExit(
                         f"stage2 positive trace drifted: {stage2_positive['events']!r}"
                     )
-                ledger_size = len(os.environ["TASK4_GOLDEN"].encode("ascii"))
+                ledger_size = len(os.environ["RECEIPT_GOLDEN"].encode("ascii"))
                 if stage2_positive["pread_cursor"] != ledger_size or len(stage2_positive["pread_calls"]) < 2:
                     raise SystemExit("stage2 private ledger pread was not one multi-chunk complete pass")
                 if len(stage2_positive["private_fstat_values"]) != 2:
@@ -5452,7 +5454,7 @@ def run_input_v1_contract(subject_path, golden):
                     raise SystemExit("stage2 private descriptor metadata was not exact")
                 if (
                     identity(stage2_positive["private_fstat_values"][0]) != identity(stage2_positive["private_fstat_values"][1])
-                    or b"".join(stage2_positive["pread_bytes"]) != os.environ["TASK4_GOLDEN"].encode("ascii")
+                    or b"".join(stage2_positive["pread_bytes"]) != os.environ["RECEIPT_GOLDEN"].encode("ascii")
                 ):
                     raise SystemExit("stage2 private ledger identity or bytes drifted")
                 cursor = 0
@@ -5875,7 +5877,7 @@ def run_input_v1_contract(subject_path, golden):
                     cursor = state["pread_cursors"].get(fd, 0)
                     if state["pread_states"].get(fd) in {"failed", "complete"}:
                         raise SystemExit("stage2 retried or extended a terminal ledger pread")
-                    if offset != cursor or cursor >= len(os.environ["TASK4_GOLDEN"].encode("ascii")):
+                    if offset != cursor or cursor >= len(os.environ["RECEIPT_GOLDEN"].encode("ascii")):
                         raise SystemExit("stage2 used an extra or non-contiguous ledger pread")
                     state["events"].append(operation)
                     operation_variant = failure_variant_for(operation)
@@ -5895,7 +5897,7 @@ def run_input_v1_contract(subject_path, golden):
                     value = real_pread(fd, size, offset)
                     if type(value) is bytes and value:
                         state["pread_cursors"][fd] = cursor + len(value)
-                        if state["pread_cursors"][fd] == len(os.environ["TASK4_GOLDEN"].encode("ascii")):
+                        if state["pread_cursors"][fd] == len(os.environ["RECEIPT_GOLDEN"].encode("ascii")):
                             state["pread_states"][fd] = "complete"
                     if operation_variant == "complete-bytes-mismatch":
                         if value:
@@ -6372,7 +6374,7 @@ def run_input_v1_contract(subject_path, golden):
                 offsets = partial_state["offsets"]
                 lengths = partial_state["lengths"]
                 passes = partial_state["passes"]
-                ledger_size = len(os.environ["TASK4_GOLDEN"].encode("ascii"))
+                ledger_size = len(os.environ["RECEIPT_GOLDEN"].encode("ascii"))
                 if partial_state["calls"] < 4 or not lengths or any(length <= 0 for length in lengths):
                     raise SystemExit("positive partial pread did not cover both complete passes")
                 if len(offsets) != len(lengths) or len(offsets) != len(passes):
@@ -6511,7 +6513,7 @@ def run_input_v1_contract(subject_path, golden):
                 ) or (_ for _ in ()).throw(SystemExit("short pread shim was not reached")),
             )
 
-            mutated_bytes = os.environ["TASK4_GOLDEN"].encode("ascii").replace(b"libstd-abc.so", b"libstd-abX.so", 1)
+            mutated_bytes = os.environ["RECEIPT_GOLDEN"].encode("ascii").replace(b"libstd-abc.so", b"libstd-abX.so", 1)
             byte_state = {"fsync": 0, "injected": False}
             original_fsync = os.fsync
             original_pread = os.pread
@@ -6645,7 +6647,7 @@ def run_input_v1_contract(subject_path, golden):
                 ) or (_ for _ in ()).throw(SystemExit("parent F_GETFD mutation shim was not reached")),
             )
 
-            ledger_bytes = os.environ["TASK4_GOLDEN"].encode("ascii")
+            ledger_bytes = os.environ["RECEIPT_GOLDEN"].encode("ascii")
             mutated_ledger_bytes = ledger_bytes.replace(b"libstd-abc.so", b"libstd-abX.so", 1)
 
             def fsync_error_case(label, error_number, expected, mutation=None, partial=False):
@@ -8719,7 +8721,7 @@ def run_input_v1_contract(subject_path, golden):
                         ],
                         synthetic_context[-1],
                     )
-                    os.environ["TASK4_GOLDEN"] = stage3_ledger_bytes.decode("ascii")
+                    os.environ["RECEIPT_GOLDEN"] = stage3_ledger_bytes.decode("ascii")
                     stage3_ready = True
 
                     def run_stage3_a3(label, expected, options, ledger_kind, stage3_case):
@@ -8781,8 +8783,8 @@ def run_input_v1_contract(subject_path, golden):
                         stage3_file(case_path, ledger, 0o600)
                         case_fd = os.open(case_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
                         case_offset = os.lseek(case_fd, 11, os.SEEK_SET)
-                        original_golden = os.environ["TASK4_GOLDEN"]
-                        os.environ["TASK4_GOLDEN"] = ledger.decode("ascii")
+                        original_golden = os.environ["RECEIPT_GOLDEN"]
+                        os.environ["RECEIPT_GOLDEN"] = ledger.decode("ascii")
                         unreviewed_link_before = (
                             identity(os.lstat(unreviewed_link_path)),
                             os.readlink(unreviewed_link_path),
@@ -8806,7 +8808,7 @@ def run_input_v1_contract(subject_path, golden):
                                 stage3_case=stage3_case,
                             )
                         finally:
-                            os.environ["TASK4_GOLDEN"] = original_golden
+                            os.environ["RECEIPT_GOLDEN"] = original_golden
                             os.close(case_fd)
                             if ledger_kind == "disjoint-symlink-roots":
                                 if not os.path.lexists(stage3_link_b_path):
@@ -8911,8 +8913,8 @@ def run_input_v1_contract(subject_path, golden):
                                     (case_ledger_fd, case_offset),
                                     (parent_fd, parent_offset),
                                 ]
-                                case_golden = os.environ["TASK4_GOLDEN"]
-                                os.environ["TASK4_GOLDEN"] = stage3_no_symlink_ledger.decode("ascii")
+                                case_golden = os.environ["RECEIPT_GOLDEN"]
+                                os.environ["RECEIPT_GOLDEN"] = stage3_no_symlink_ledger.decode("ascii")
                             try:
                                 run_case(
                                     f"stage3a0-{case[0]}",
@@ -8924,7 +8926,7 @@ def run_input_v1_contract(subject_path, golden):
                                 )
                             finally:
                                 if case_golden is not None:
-                                    os.environ["TASK4_GOLDEN"] = case_golden
+                                    os.environ["RECEIPT_GOLDEN"] = case_golden
                                 if case_ledger_fd is not None:
                                     os.close(case_ledger_fd)
                         for site, variant in stage3_a1_failure_matrix:
@@ -9038,8 +9040,8 @@ def run_input_v1_contract(subject_path, golden):
                             os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
                         )
                         no_symlink_offset = os.lseek(no_symlink_fd, 11, os.SEEK_SET)
-                        symlink_golden = os.environ["TASK4_GOLDEN"]
-                        os.environ["TASK4_GOLDEN"] = stage3_no_symlink_ledger.decode("ascii")
+                        symlink_golden = os.environ["RECEIPT_GOLDEN"]
+                        os.environ["RECEIPT_GOLDEN"] = stage3_no_symlink_ledger.decode("ascii")
                         try:
                             run_case(
                                 "stage3a1-private-P-getfl-opath-no-symlink",
@@ -9058,7 +9060,7 @@ def run_input_v1_contract(subject_path, golden):
                                 ),
                             )
                         finally:
-                            os.environ["TASK4_GOLDEN"] = symlink_golden
+                            os.environ["RECEIPT_GOLDEN"] = symlink_golden
                             os.close(no_symlink_fd)
                         for family, tokens in (
                             (
@@ -9207,8 +9209,8 @@ def run_input_v1_contract(subject_path, golden):
                                 os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
                             )
                             mutation_offset = os.lseek(mutation_fd, 11, os.SEEK_SET)
-                            original_golden = os.environ["TASK4_GOLDEN"]
-                            os.environ["TASK4_GOLDEN"] = mutated.decode("ascii")
+                            original_golden = os.environ["RECEIPT_GOLDEN"]
+                            os.environ["RECEIPT_GOLDEN"] = mutated.decode("ascii")
                             try:
                                 stage3_case = ("stage3a2-fault", token, variant)
                                 if case_options:
@@ -9227,7 +9229,7 @@ def run_input_v1_contract(subject_path, golden):
                                     stage3_case=stage3_case,
                                 )
                             finally:
-                                os.environ["TASK4_GOLDEN"] = original_golden
+                                os.environ["RECEIPT_GOLDEN"] = original_golden
                                 os.close(mutation_fd)
                         for label, expected, case in stage3_a2_cases:
                             if case[2] in {
@@ -9278,7 +9280,7 @@ def run_input_v1_contract(subject_path, golden):
                             base_borrowed,
                             synthetic_golden,
                         ) = synthetic_context
-                        os.environ["TASK4_GOLDEN"] = synthetic_golden
+                        os.environ["RECEIPT_GOLDEN"] = synthetic_golden
                 finally:
                     os.close(stage3_parent_fd)
                     os.close(stage3_ledger_fd)
@@ -9298,7 +9300,7 @@ def run_input_v1_contract(subject_path, golden):
 
 class InputV1ContractTests(unittest.TestCase):
     def test_complete_candidate_only_contract(self):
-        supplied_golden = os.environ.get("TASK4_GOLDEN")
+        supplied_golden = os.environ.get("RECEIPT_GOLDEN")
         golden = (
             GOLDEN_PATH.read_bytes()
             if supplied_golden is None

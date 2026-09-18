@@ -110,10 +110,44 @@ pub enum Command {
     Doctor(DoctorArgs),
 }
 
+/// Which help text `--help` asked for: the global usage or one subcommand's
+/// scoped section plus the shared notes footer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelpTopic {
+    Global,
+    Profile,
+    Trace,
+    Run,
+    Inspect,
+    Doctor,
+}
+
+impl HelpTopic {
+    pub fn text(self) -> &'static str {
+        match self {
+            HelpTopic::Global => USAGE,
+            HelpTopic::Profile => PROFILE_HELP,
+            HelpTopic::Trace => TRACE_HELP,
+            HelpTopic::Run => RUN_HELP,
+            HelpTopic::Inspect => INSPECT_HELP,
+            HelpTopic::Doctor => DOCTOR_HELP,
+        }
+    }
+}
+
+impl Kind {
+    fn help_topic(self) -> HelpTopic {
+        match self {
+            Kind::Profile => HelpTopic::Profile,
+            Kind::Trace => HelpTopic::Trace,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum CliError {
     Usage(String),
-    Help,
+    Help(HelpTopic),
 }
 
 pub const USAGE: &str = "usage:
@@ -133,6 +167,109 @@ pub const USAGE: &str = "usage:
   p11scope inspect --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--json]
   p11scope doctor  [--pid <n>] [--cgroup <path>]
   p11scope-discover --module <provider.so> [-o <manifest.json>]   (offline helper; executes provider code)
+
+notes: discovery scans the target's mapped memory — no manifest and no helper are required.
+--module narrows the scan to named providers. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
+scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
+run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup. --pause
+selects what run may do to its own child while it observes loading: never (default) touches
+nothing, auto only when the child would otherwise load unobserved, always on every load.
+--kill-on-timeout ends the child when --duration expires instead of leaving it running.
+--mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
+ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
+every descendant (kernel >= 5.15). Provider identity is pinned by SHA-256 at attach and
+checked for in-place change during capture (evidence.provider_changed).
+";
+/// `p11scope profile --help`: that subcommand's usage section plus the
+/// shared notes footer. Every line is verbatim from [`USAGE`]; update
+/// both together when the CLI changes.
+const PROFILE_HELP: &str = "usage:
+  p11scope profile [--pid <n> | --cgroup <path>] [--module <provider.so>]... [--manifest <m.json>]...
+                   [--mode profile|metrics] [--duration <30|30s|5m|1h>] [-o <out.json>]
+                   [--hook-symbol <NAME[:functionlist|interfacelist|interface]>]...
+                   [--unsafe-unvalidated-metadata]
+                   [--allow-uretprobe-on-confined-target]
+                   [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>]
+                   [--max-scan-pids <n>]
+
+notes: discovery scans the target's mapped memory — no manifest and no helper are required.
+--module narrows the scan to named providers. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
+scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
+run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup. --pause
+selects what run may do to its own child while it observes loading: never (default) touches
+nothing, auto only when the child would otherwise load unobserved, always on every load.
+--kill-on-timeout ends the child when --duration expires instead of leaving it running.
+--mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
+ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
+every descendant (kernel >= 5.15). Provider identity is pinned by SHA-256 at attach and
+checked for in-place change during capture (evidence.provider_changed).
+";
+
+/// `p11scope trace --help`: that subcommand's usage section plus the
+/// shared notes footer. Every line is verbatim from [`USAGE`]; update
+/// both together when the CLI changes.
+const TRACE_HELP: &str = "usage:
+  p11scope trace   [same scope and discovery options] [--duration <…>] [--max-events <n>] [-o <out.file>]
+                   [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>]
+
+notes: discovery scans the target's mapped memory — no manifest and no helper are required.
+--module narrows the scan to named providers. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
+scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
+run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup. --pause
+selects what run may do to its own child while it observes loading: never (default) touches
+nothing, auto only when the child would otherwise load unobserved, always on every load.
+--kill-on-timeout ends the child when --duration expires instead of leaving it running.
+--mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
+ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
+every descendant (kernel >= 5.15). Provider identity is pinned by SHA-256 at attach and
+checked for in-place change during capture (evidence.provider_changed).
+";
+
+/// `p11scope run --help`: that subcommand's usage section plus the
+/// shared notes footer. Every line is verbatim from [`USAGE`]; update
+/// both together when the CLI changes.
+const RUN_HELP: &str = "usage:
+  p11scope run     [same discovery options] [--mode profile|metrics | --trace] [--duration <…>]
+                   [-o <out>] [--pause never|auto|always] [--kill-on-timeout]
+                   [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>] -- CMD [ARGS...]
+
+notes: discovery scans the target's mapped memory — no manifest and no helper are required.
+--module narrows the scan to named providers. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
+scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
+run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup. --pause
+selects what run may do to its own child while it observes loading: never (default) touches
+nothing, auto only when the child would otherwise load unobserved, always on every load.
+--kill-on-timeout ends the child when --duration expires instead of leaving it running.
+--mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
+ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
+every descendant (kernel >= 5.15). Provider identity is pinned by SHA-256 at attach and
+checked for in-place change during capture (evidence.provider_changed).
+";
+
+/// `p11scope inspect --help`: that subcommand's usage section plus the
+/// shared notes footer. Every line is verbatim from [`USAGE`]; update
+/// both together when the CLI changes.
+const INSPECT_HELP: &str = "usage:
+  p11scope inspect --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--json]
+
+notes: discovery scans the target's mapped memory — no manifest and no helper are required.
+--module narrows the scan to named providers. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
+scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
+run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup. --pause
+selects what run may do to its own child while it observes loading: never (default) touches
+nothing, auto only when the child would otherwise load unobserved, always on every load.
+--kill-on-timeout ends the child when --duration expires instead of leaving it running.
+--mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
+ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
+every descendant (kernel >= 5.15). Provider identity is pinned by SHA-256 at attach and
+checked for in-place change during capture (evidence.provider_changed).
+";
+
+/// `p11scope doctor --help`: that subcommand's usage section plus the
+/// shared notes footer. Every line is verbatim from [`USAGE`]; update
+/// both together when the CLI changes.
+const DOCTOR_HELP: &str = "usage:
+  p11scope doctor  [--pid <n>] [--cgroup <path>]
 
 notes: discovery scans the target's mapped memory — no manifest and no helper are required.
 --module narrows the scan to named providers. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
@@ -189,6 +326,19 @@ fn unknown_arg(arg: &str) -> CliError {
              paused",
         ),
         other => usage_err(format!("unknown argument: {other}")),
+    }
+}
+
+/// `run`'s unrecognised argument: a bare word is the command typed without
+/// its `--` separator, so the refusal names the separator and the concrete
+/// next command; a mistyped flag keeps the generic message.
+fn run_unknown_arg(arg: &str) -> CliError {
+    if arg.starts_with('-') || arg.is_empty() {
+        unknown_arg(arg)
+    } else {
+        usage_err(format!(
+            "unknown argument: {arg} (run takes its command after `--`: `p11scope run -- {arg}`)"
+        ))
     }
 }
 
@@ -250,7 +400,11 @@ fn capture_option(
                          not --mode trace",
                     ));
                 }
-                other => return Err(usage_err(format!("--mode: invalid value {other:?}"))),
+                other => {
+                    return Err(usage_err(format!(
+                        "--mode: invalid value {other:?} (expected profile|metrics)"
+                    )));
+                }
             });
         }
         "--duration" => {
@@ -318,7 +472,7 @@ pub fn parse(mut argv: impl Iterator<Item = String>) -> Result<Command, CliError
         Some("run") => Ok(Command::Run(parse_run(argv)?)),
         Some("inspect") => Ok(Command::Inspect(parse_inspect(argv)?)),
         Some("doctor") => Ok(Command::Doctor(parse_doctor(argv)?)),
-        Some("--help" | "-h") => Err(CliError::Help),
+        Some("--help" | "-h") => Err(CliError::Help(HelpTopic::Global)),
         Some("discover") => Err(usage_err(
             "`p11scope discover` was removed: run `p11scope-discover --module <provider.so> \
              -o <manifest.json>` (offline helper; executes provider code)",
@@ -337,7 +491,7 @@ fn parse_inspect(mut args: impl Iterator<Item = String>) -> Result<InspectArgs, 
     let mut json = false;
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--help" | "-h" => return Err(CliError::Help),
+            "--help" | "-h" => return Err(CliError::Help(HelpTopic::Inspect)),
             "--pid" => pid = Some(require_pid(&mut args)?),
             "--module" => modules.push(require_value(&mut args, "--module")?.into()),
             "--hook-symbol" => add_hook(&mut hooks, &mut args)?,
@@ -362,7 +516,7 @@ fn parse_doctor(mut args: impl Iterator<Item = String>) -> Result<DoctorArgs, Cl
     };
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--help" | "-h" => return Err(CliError::Help),
+            "--help" | "-h" => return Err(CliError::Help(HelpTopic::Doctor)),
             "--pid" => doctor.pid = Some(require_pid(&mut args)?),
             "--cgroup" => doctor.cgroup = Some(require_value(&mut args, "--cgroup")?.into()),
             "--module" => {
@@ -393,7 +547,7 @@ pub fn parse_capture(
             continue;
         }
         match a.as_str() {
-            "--help" | "-h" => return Err(CliError::Help),
+            "--help" | "-h" => return Err(CliError::Help(kind.help_topic())),
             "--pid" => pid = Some(require_pid(&mut args)?),
             "--cgroup" => cgroup = Some(require_value(&mut args, "--cgroup")?.into()),
             other => return Err(unknown_arg(other)),
@@ -447,7 +601,7 @@ fn parse_run(mut args: impl Iterator<Item = String>) -> Result<RunArgs, CliError
             continue;
         }
         match a.as_str() {
-            "--help" | "-h" => return Err(CliError::Help),
+            "--help" | "-h" => return Err(CliError::Help(HelpTopic::Run)),
             "--trace" => trace = true,
             "--pause" => {
                 let v = require_value(&mut args, "--pause")?;
@@ -472,7 +626,7 @@ fn parse_run(mut args: impl Iterator<Item = String>) -> Result<RunArgs, CliError
                 command.extend(args.by_ref());
                 break;
             }
-            other => return Err(unknown_arg(other)),
+            other => return Err(run_unknown_arg(other)),
         }
     }
 
@@ -893,7 +1047,10 @@ mod tests {
             parse(args(&["run", "--pause"])),
             Err(CliError::Usage(m)) if m.contains("--pause requires a value")
         ));
-        assert_eq!(parse(args(&["run", "--help"])).unwrap_err(), CliError::Help);
+        assert_eq!(
+            parse(args(&["run", "--help"])).unwrap_err(),
+            CliError::Help(HelpTopic::Run)
+        );
     }
 
     #[test]
@@ -931,8 +1088,81 @@ mod tests {
     fn help_is_not_an_error() {
         assert_eq!(
             parse_capture(Kind::Profile, args(&["--help"])).unwrap_err(),
-            CliError::Help
+            CliError::Help(HelpTopic::Profile)
         );
+    }
+
+    #[test]
+    fn subcommand_help_is_scoped_to_that_subcommand() {
+        // `profile --help` shows its own scope, never another subcommand's
+        // usage; `doctor --help` likewise.
+        let profile = HelpTopic::Profile.text();
+        assert!(profile.contains("[--pid"), "{profile}");
+        assert!(!profile.contains("p11scope trace"), "{profile}");
+        let doctor = HelpTopic::Doctor.text();
+        assert!(doctor.contains("p11scope doctor"), "{doctor}");
+        assert!(!doctor.contains("p11scope profile"), "{doctor}");
+        assert!(!doctor.contains("p11scope trace"), "{doctor}");
+        // Every `--help` routes to its own topic.
+        for (argv, topic) in [
+            (vec!["profile", "--help"], HelpTopic::Profile),
+            (vec!["trace", "--help"], HelpTopic::Trace),
+            (vec!["run", "--help"], HelpTopic::Run),
+            (vec!["inspect", "--help"], HelpTopic::Inspect),
+            (vec!["doctor", "--help"], HelpTopic::Doctor),
+            (vec!["--help"], HelpTopic::Global),
+            (vec!["-h"], HelpTopic::Global),
+        ] {
+            assert_eq!(
+                parse(args(&argv)).unwrap_err(),
+                CliError::Help(topic),
+                "{argv:?}"
+            );
+        }
+        // Every scoped help carries the shared notes footer and nothing else.
+        for topic in [
+            HelpTopic::Profile,
+            HelpTopic::Trace,
+            HelpTopic::Run,
+            HelpTopic::Inspect,
+            HelpTopic::Doctor,
+        ] {
+            let text = topic.text();
+            assert!(text.contains("notes: discovery scans"), "{topic:?}");
+            assert!(!text.contains("p11scope-discover"), "{topic:?}");
+        }
+    }
+
+    #[test]
+    fn scoped_help_lines_are_verbatim_from_global_usage() {
+        let global: Vec<&str> = USAGE.lines().collect();
+        for topic in [
+            HelpTopic::Profile,
+            HelpTopic::Trace,
+            HelpTopic::Run,
+            HelpTopic::Inspect,
+            HelpTopic::Doctor,
+        ] {
+            for line in topic.text().lines() {
+                assert!(
+                    global.contains(&line),
+                    "{topic:?}: {line:?} is not verbatim from USAGE"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn global_help_text_is_pinned_byte_for_byte() {
+        // FNV-1a over the UTF-8 bytes, so USAGE cannot drift silently.
+        let mut hash: u64 = 14695981039346656037;
+        for byte in USAGE.bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(1099511628211);
+        }
+        assert_eq!(USAGE.len(), 2371);
+        assert_eq!(hash, 0xa0e8bebd_f7040108);
+        assert_eq!(HelpTopic::Global.text(), USAGE);
     }
 
     #[test]

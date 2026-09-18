@@ -25,249 +25,17 @@
 set -eu
 cd "$(dirname "$0")/.."
 
-task4_receipt_self_test() {
+receipt_receipt_self_test() {
     [ "$#" -eq 0 ] || exit 2
-    REPORT=${P11SCOPE_TASK4_SELF_TEST_REPORT-}
-    if [ -z "$REPORT" ]; then TASK4_SELF_TMP=$(mktemp -d); trap 'rm -rf "$TASK4_SELF_TMP"' EXIT INT TERM; REPORT=$TASK4_SELF_TMP/report.tsv; fi
+    REPORT=${P11SCOPE_RECEIPT_SELF_TEST_REPORT-}
+    if [ -z "$REPORT" ]; then RECEIPT_SELF_TMP=$(mktemp -d); trap 'rm -rf "$RECEIPT_SELF_TMP"' EXIT INT TERM; REPORT=$RECEIPT_SELF_TMP/report.tsv; fi
     umask 077
-    python3 -I - "$REPORT" <<'PY'
-import copy, fcntl, os, stat, sys, tempfile
-from pathlib import Path
-
-report = Path(sys.argv[1]); rows = []
-common = """complete-success-status-0-last-once
-input-mutation-rejected-nonzero-status-last-once
-cleanup-query-failure-rejected-nonzero-status-last-once
-existing-root-rejected-status-77-no-touch-before-body
-nonprivate-parent-rejected-status-77-no-touch-before-body
-symlink-root-rejected-status-77-no-touch-before-body
-foreign-root-rejected-status-77-no-touch-before-body
-canonical-caller-owned-0700-parent-and-absent-root-required
-campaign-is-canonical-root-dirname-not-env-override
-missing-ephemeral-identity-rejected-nonzero-status-last-once
-root-artifacts-work-device-inode-mutation-rejected
-exact-root-tree-and-0700-directory-modes-accepted
-unexpected-top-level-entry-rejected
-0600-evidence-config-and-retained-executables-validated
-0700-private-executable-only-while-run-validated
-status-0-written-once-last
-missing-status-rejected
-early-status-rejected
-duplicate-status-rejected
-changed-head-rejected
-changed-input-ledger-rejected
-foreign-terminal-artifact-rejected
-missing-capture-evidence-rejected
-missing-checker-evidence-rejected
-root-preflight-blocks-body-cargo-runtime
-lock-contention-status-77-blocks-body-cargo-runtime
-released-exact-lock-success-status-0
-0600-lock-identity-held-through-status-validated
-retained-fixture-tree-validated
-retained-status-sequence-validated
-retained-source-input-ledgers-validated""".splitlines()
-def mark(name, value):
-    if not value: raise AssertionError(name)
-    rows.append(name + "\tOK")
-
-with tempfile.TemporaryDirectory() as raw:
-    base=Path(raw); parent=base/"campaign"; parent.mkdir(mode=0o700)
-    root=parent/"lane"; root.mkdir(mode=0o700); art=root/"artifacts"; art.mkdir(mode=0o700); work=root/"work"; work.mkdir(mode=0o700)
-    for p in (root/"facts.log",root/"stdout.log",root/"stderr.log",art/"observed.json",art/"checker.log",work/"fixture"):
-        p.write_text("evidence\n"); p.chmod(0o600)
-    ids={str(p):(p.stat().st_dev,p.stat().st_ino) for p in (root,art,work)}
-    state={"head":"h","input":"i","ephemeral":"pid:start","cleanup":True}; seq=["facts","capture","checker","cleanup","status"]
-    def valid(s=state,q=seq,expected=ids):
-        if s != state or q != seq: return False
-        if set(x.name for x in root.iterdir()) != {"facts.log","stdout.log","stderr.log","artifacts","work"}: return False
-        if set(x.name for x in art.iterdir()) != {"observed.json","checker.log"} or set(x.name for x in work.iterdir()) != {"fixture"}: return False
-        if any((p.stat().st_dev,p.stat().st_ino)!=expected.get(str(p)) or stat.S_IMODE(p.stat().st_mode)!=0o700 for p in (root,art,work)): return False
-        files=(root/"facts.log",root/"stdout.log",root/"stderr.log",art/"observed.json",art/"checker.log",work/"fixture")
-        return bool(s["ephemeral"] and s["cleanup"] and all(p.is_file() and not p.is_symlink() and stat.S_IMODE(p.stat().st_mode)==0o600 for p in files))
-    mark(common[0],valid()); x=dict(state);x["input"]="x";mark(common[1],not valid(s=x));x=dict(state);x["cleanup"]=False;mark(common[2],not valid(s=x))
-    occupied=parent/"occupied";occupied.mkdir();mark(common[3],occupied.exists() and not (occupied/"body").exists())
-    public=base/"public";public.mkdir();public.chmod(0o755);mark(common[4],stat.S_IMODE(public.stat().st_mode)!=0o700 and not (public/"lane").exists())
-    link=base/"link";link.symlink_to(parent);mark(common[5],link.is_symlink() and not (parent/"link-body").exists())
-    mark(common[6],os.getuid()!=-1 and not (root/"foreign-body").exists());mark(common[7],parent.resolve()==parent and stat.S_IMODE(parent.stat().st_mode)==0o700)
-    os.environ["CAMPAIGN"]=str(base/"wrong");mark(common[8],root.parent.resolve()==parent and root.parent!=Path(os.environ["CAMPAIGN"]))
-    x=dict(state);x["ephemeral"]="";mark(common[9],not valid(s=x));x=dict(ids);x[str(art)]=(-1,-1);mark(common[10],not valid(expected=x));mark(common[11],valid())
-    extra=root/"extra";extra.write_text("x");mark(common[12],not valid());extra.unlink();(work/"fixture").chmod(0o644);mark(common[13],not valid());(work/"fixture").chmod(0o600)
-    (work/"fixture").chmod(0o700);ran=os.access(work/"fixture",os.X_OK);(work/"fixture").chmod(0o600);mark(common[14],ran and valid())
-    mark(common[15],seq[-1]=="status" and seq.count("status")==1);mark(common[16],not valid(q=seq[:-1]));mark(common[17],not valid(q=["status"]+seq[:-1]));mark(common[18],not valid(q=seq+["status"]))
-    x=dict(state);x["head"]="x";mark(common[19],not valid(s=x));x=dict(state);x["input"]="x";mark(common[20],not valid(s=x))
-    extra=art/"foreign";extra.write_text("x");mark(common[21],not valid());extra.unlink();(art/"observed.json").unlink();mark(common[22],not valid());(art/"observed.json").write_text("evidence\n");(art/"observed.json").chmod(0o600)
-    (art/"checker.log").unlink();mark(common[23],not valid());(art/"checker.log").write_text("evidence\n");(art/"checker.log").chmod(0o600);mark(common[24],not (work/"cargo-ran").exists())
-    lock=parent/".task4.lock";lock.touch(mode=0o600);a=open(lock,"r+");b=open(lock,"r+");fcntl.flock(a,fcntl.LOCK_EX|fcntl.LOCK_NB)
-    try: fcntl.flock(b,fcntl.LOCK_EX|fcntl.LOCK_NB);blocked=False
-    except BlockingIOError: blocked=True
-    mark(common[25],blocked and not (work/"runtime-ran").exists());a.close();fcntl.flock(b,fcntl.LOCK_EX|fcntl.LOCK_NB);mark(common[26],valid());mark(common[27],stat.S_IMODE(os.fstat(b.fileno()).st_mode)==0o600);b.close()
-    mark(common[28],(work/"fixture").read_text()=="evidence\n");mark(common[29],seq==["facts","capture","checker","cleanup","status"]);mark(common[30],state=={"head":"h","input":"i","ephemeral":"pid:start","cleanup":True})
-lane = """single-terminal-owner-and-bound-child-facts-exact-accepted
-nested-lane14-facts-interface-without-second-status-exact-accepted
-second-terminal-owner-rejected
-missing-nested-facts-rejected
-replaced-nested-facts-rejected
-p11scope-p11scope-discover-p11scope-discover-glibc-p11scope-discover-musl-exact-accepted
-executable-inventory-mutation-rejected
-softhsm-record-count-68-exact-accepted
-softhsm-record-count-mutation-rejected
-fixture-68-92-104-exact-accepted
-fixture-cardinality-mutation-rejected
-static-smoke-68-68-136-exact-accepted
-static-smoke-cardinality-mutation-rejected
-fixed-private-work-descendants-exact-accepted
-caller-path-overrides-rejected-before-mutation
-same-shell-single-finalizer-exact-accepted
-cleanup-failure-upgrades-one-status-written-last
-absolute-nested-work-and-legacy-defaults-exact-accepted
-untracked-build-input-rejected-status-77-no-touch-before-body
-recorded-tool-replaced-between-preflight-and-finalization-rejected
-path-change-resolving-a-different-binary-rejected
-literal-static-smoke-capture-path-exact-accepted
-decoy-observed-json-under-work-rejected
-aggregate-stdout-as-checker-evidence-rejected
-sealed-command-inventory-pinned-before-root-and-git-decisions
-sealed-environment-allowlist-exact-accepted
-forged-seal-marker-rejected
-inventory-wide-tool-ledger-exact-accepted
-sealed-bin-removed-after-terminal-status
-nightly-toolchain-closure-exact-accepted
-isolated-python-invocations-exact-accepted
-tab-or-newline-root-rejected-status-77""".splitlines()
-
-good={"owners":1,"child_status":False,"facts":["43:99","hash"],"executables":["p11scope","p11scope-discover","p11scope-discover-glibc","p11scope-discover-musl"],"softhsm":68,"fixture":[68,92,104],"static":[68,68,136]}
-def lane_valid(d):
-    return d["owners"]==1 and d["child_status"] is False and d["facts"]==["43:99","hash"] and d["executables"]==good["executables"] and d["softhsm"]==68 and d["fixture"]==[68,92,104] and d["static"]==[68,68,136]
-mark(lane[0],lane_valid(good));mark(lane[1],good["child_status"] is False and len(good["facts"])==2)
-d=copy.deepcopy(good);d["owners"]=2;mark(lane[2],not lane_valid(d))
-d=copy.deepcopy(good);d["facts"]=[];mark(lane[3],not lane_valid(d))
-d=copy.deepcopy(good);d["facts"][0]="43:replacement";mark(lane[4],not lane_valid(d))
-mark(lane[5],lane_valid(good))
-d=copy.deepcopy(good);d["executables"].pop();mark(lane[6],not lane_valid(d))
-mark(lane[7],lane_valid(good));d=copy.deepcopy(good);d["softhsm"]=67;mark(lane[8],not lane_valid(d))
-mark(lane[9],lane_valid(good));d=copy.deepcopy(good);d["fixture"][1]=91;mark(lane[10],not lane_valid(d))
-mark(lane[11],lane_valid(good));d=copy.deepcopy(good);d["static"][2]=135;mark(lane[12],not lane_valid(d))
-private_work=root/"work"
-paths={
-    "work":private_work,"dist":private_work/"dist",
-    "official":private_work/"release-official","canary":private_work/"canaries",
-    "attach":private_work,"discover_base":private_work,
-    "discover":private_work/"discover",
-}
-mark(lane[13],paths=={
-    "work":private_work,"dist":private_work/"dist",
-    "official":private_work/"release-official","canary":private_work/"canaries",
-    "attach":private_work,"discover_base":private_work,
-    "discover":private_work/"discover",
-} and all(path==private_work or private_work in path.parents for path in paths.values()))
-poisoned_values=(base/"poison-dist",base/"poison-official")
-mark(lane[14],all(value not in paths.values() for value in poisoned_values))
-owner_pid=os.getpid();body_pid=os.getpid();finalizer_owners=1
-mark(lane[15],body_pid==owner_pid and finalizer_owners==1)
-cleanup_sequence=["body","cleanup","facts","status"]
-body_status=0;cleanup_status=1;terminal_status=cleanup_status if body_status==0 else body_status
-mark(lane[16],terminal_status!=0 and cleanup_sequence[-1]=="status" and cleanup_sequence.count("status")==1)
-legacy_defaults={"canary":"target/canaries","attach":"target/e2e"}
-supplied={"canary":str(paths["canary"]),"attach":str(paths["attach"])}
-mark(lane[17],all(value.startswith("/") for value in supplied.values())
-     and all(not value.startswith("/") for value in legacy_defaults.values()))
-inherited=dict.fromkeys(("RUSTFLAGS","CARGO_ENCODED_RUSTFLAGS","CARGO_TARGET_DIR","CARGO_BUILD_TARGET",
-                         "CARGO_HOME","RUSTUP_HOME","RUSTUP_TOOLCHAIN","RUSTC_WRAPPER","CC","CFLAGS",
-                         "P11SCOPE_PRODUCT_BUILD_MODE","P11SCOPE_PREPARED_STABLE_CARGO",
-                         "P11SCOPE_PREPARED_STABLE_RUSTC","P11SCOPE_PREPARED_BPF_CARGO",
-                         "P11SCOPE_PREPARED_BPF_RUSTC"),"")
-def preflight_accepts(status,configs,env):
-    return status=="" and not configs and not any(env.values())
-body_ran=False
-mark(lane[18],preflight_accepts("",[],inherited)
-     and not preflight_accepts("?? .cargo/config.toml",[],inherited)
-     and not preflight_accepts("",[str(private_work/".cargo/config.toml")],inherited)
-     and all(not preflight_accepts("",[],dict(inherited,**{name:"/poisoned"})) for name in inherited)
-     and not body_ran)
-recorded={"cargo":("/usr/lib/toolchain/cargo","sha-a"),"sudo":("/usr/bin/sudo","sha-b")}
-def tools_unchanged(observed): return observed==recorded
-replaced=dict(recorded,cargo=("/usr/lib/toolchain/cargo","sha-c"))
-repathed=dict(recorded,sudo=("/tmp/shadow/sudo","sha-b"))
-mark(lane[19],tools_unchanged(dict(recorded)) and not tools_unchanged(replaced))
-mark(lane[20],not tools_unchanged(repathed))
-# csf_19fb2f: the capture binding names its source literally. Selection by
-# sorted-glob order would pick observed-scan.json ('-'<'.', 'c'<'t'), never
-# the release's own static-smoke output; any population other than the exact
-# three known names refuses instead of choosing.
-work_entries=["canaries","discover","dist","harness","manifest.json","observed-scan.json",
-              "observed-static-smoke.json","observed.json","release-manifest.json","softhsm2.conf"]
-def observed_names(entries): return sorted(n for n in entries if "observed" in n and n.endswith(".json"))
-def capture_binding(entries):
-    if observed_names(entries)!=["observed-scan.json","observed-static-smoke.json","observed.json"]:
-        raise SystemExit("unexpected observed capture set")
-    return "observed-static-smoke.json"
-mark(lane[21],capture_binding(work_entries)=="observed-static-smoke.json"
-     and observed_names(work_entries)[0]!="observed-static-smoke.json")
-try: capture_binding(work_entries+["observed-decoy.json"]); decoy_rejected=False
-except SystemExit: decoy_rejected=True
-mark(lane[22],decoy_rejected)
-framed="argv\tpython3 -I scripts/check-capture-evidence.py clean-metrics-manifest-only observed-static-smoke.json spike/expected.txt\nstatus\t0"
-aggregate="=== release privacy gate ===\n=== build-release: ALL OK ==="
-def checker_evidence_framed(text):
-    lines=text.splitlines()
-    return (len(lines)>=2 and lines[0].startswith("argv\t") and "check-capture-evidence.py" in lines[0]
-            and lines[-1].startswith("status\t") and lines[-1].split("\t",1)[1].isdigit())
-mark(lane[23],checker_evidence_framed(framed) and not checker_evidence_framed(aggregate))
-# csf_014eb65 / shadow findings 3+6: the receipt chain runs sealed. The ten
-# inherited build inputs are refused by name first, then the whole reached
-# command inventory is pinned and re-exec'd under an exact environment
-# allowlist -- all before any root, git, tool, or body decision.
-seal_steps=["refuse-inherited-build-inputs","pin-reached-command-inventory","seal","verify-seal",
-            "prepare-root","git-head","pin-tools","tool-ledger","body"]
-def seal_before(a,b): return seal_steps.index(a)<seal_steps.index(b)
-mark(lane[24],all(seal_before("refuse-inherited-build-inputs",step) for step in ("seal","prepare-root","git-head"))
-     and all(seal_before("seal",step) for step in ("verify-seal","prepare-root","git-head","pin-tools","body")))
-sealed_environment={"HOME","LC_ALL","OLDPWD","P11SCOPE_TASK4_CALLER_ARGV0","P11SCOPE_TASK4_CALLER_PATH",
-                    "P11SCOPE_TASK4_SEALED","P11SCOPE_TASK4_SEALED_BIN","PATH","PWD"}
-steering={"RUSTC_WORKSPACE_WRAPPER","P11SCOPE_SMALL_RING","PYTHONPATH","PYTHONHOME","GIT_DIR",
-          "GIT_WORK_TREE","GIT_INDEX_FILE","GIT_CONFIG_GLOBAL","DOCKER_HOST","TMPDIR","LANG"}
-def seal_accepts(names): return names==sealed_environment
-mark(lane[25],seal_accepts(set(sealed_environment)) and not seal_accepts(sealed_environment|steering)
-     and not sealed_environment&steering)
-mark(lane[26],not seal_accepts({"P11SCOPE_TASK4_SEALED"}|steering)
-     and "prepare-root" not in seal_steps[:seal_steps.index("verify-seal")])
-reached={"git","awk","sort","xargs","realpath","find","cp","sh","stat","id","mkdir","flock","cmp",
-         "chmod","date","sync","rm","grep","ldd","cat","ls","cc","gcc","env","ln","mktemp"}
-floor={"cargo","docker","file","jq","python3","rustup","setpriv","sudo","sha256sum"}
-mark(lane[27],not reached<=floor and bool(reached-floor) and reached<=reached|floor)
-finalization=["body","evidence-checks","terminal-status","remove-sealed-bin"]
-mark(lane[28],finalization.index("terminal-status")<finalization.index("remove-sealed-bin")
-     and finalization[-1]=="remove-sealed-bin")
-# The shipped observer embeds an eBPF object built by a second toolchain, so
-# the recorded 1.88 pair is not the effective build closure on its own.
-stable_closure={"toolchain_cargo","toolchain_rustc"}
-nightly_closure={"toolchain_nightly_cargo","toolchain_nightly_rustc","toolchain_nightly_sysroot",
-                 "toolchain_nightly_rust_src","toolchain_bpf_linker"}
-def closure_bound(rows): return stable_closure|nightly_closure<=rows
-mark(lane[29],closure_bound(stable_closure|nightly_closure) and not closure_bound(stable_closure)
-     and not closure_bound((stable_closure|nightly_closure)-{"toolchain_nightly_rust_src"}))
-# `sitecustomize`/PYTHONHOME run before the first line of a checker. The seal
-# drops those variables and `-I` refuses them again for any invocation that
-# ever runs outside it, so both the isolation flag and the framed argv that
-# names it have to be present at every python3 call site.
-python_sites=["self-test-model","finalizer-heredoc","check-bpf-map-defs","check-capture-evidence"]
-def isolated(flagged): return set(flagged)==set(python_sites)
-mark(lane[30],isolated(python_sites) and not isolated(python_sites[:-1])
-     and framed.startswith("argv\tpython3 -I "))
-root_with_controls = "/tmp/evidence\troot"
-root_with_newline = "/tmp/evidence\nroot"
-mark(lane[31], "\t" in root_with_controls and "\n" in root_with_newline)
-
-if len(rows)!=len(common)+len(lane) or len(rows)!=len(set(rows)): raise SystemExit("row coverage")
-report.parent.mkdir(parents=True,exist_ok=True);fd=os.open(report,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
-with os.fdopen(fd,"w") as out: out.write("\n".join(rows)+"\n");out.flush();os.fsync(out.fileno())
-if os.stat(report).st_nlink!=1 or stat.S_IMODE(os.stat(report).st_mode)!=0o600: raise SystemExit("unsafe report")
-PY
+    python3 -I scripts/lane-build-release-oracle-1.py "$REPORT"
     echo "build-release Task 4 receipt self-test: OK"
 }
 if [ "${1-}" = --self-test ]; then
     shift
-    task4_receipt_self_test "$@"
+    receipt_receipt_self_test "$@"
     exit 0
 fi
 
@@ -277,7 +45,7 @@ TARGET_STARTTIME=
 LPID=
 SPID=
 . scripts/lib.sh
-task4_prepare_root() {
+receipt_prepare_root() {
     t4_candidate=$1
     case $t4_candidate in /*) ;; *) return 1 ;; esac
     t4_tab=$(printf '\t'); t4_nl=$(printf '\nx'); t4_nl=${t4_nl%x}
@@ -295,26 +63,26 @@ task4_prepare_root() {
     [ "$(stat -Lc %u:%a "$t4_parent")" = "$(id -u):700" ] || return 1
     [ ! -e "$t4_candidate" ] && [ ! -L "$t4_candidate" ] || return 1
     umask 077; mkdir -m 700 "$t4_candidate" || return 1
-    TASK4_ROOT=$t4_candidate; TASK4_CAMPAIGN=$t4_parent
-    TASK4_ROOT_ID=$(stat -Lc %d:%i "$TASK4_ROOT") || return 1
+    RECEIPT_ROOT=$t4_candidate; RECEIPT_CAMPAIGN=$t4_parent
+    RECEIPT_ROOT_ID=$(stat -Lc %d:%i "$RECEIPT_ROOT") || return 1
 }
 
-task4_digest() { "$T4_TOOL_sha256sum" "$1" | awk '{print $1}'; }
-task4_snapshot() {
+receipt_digest() { "$T4_TOOL_sha256sum" "$1" | awk '{print $1}'; }
+receipt_snapshot() {
     case $1 in initial|final) ;; *) return 1 ;; esac
-    t4_snapshot=$TASK4_ROOT/artifacts/source.$1
+    t4_snapshot=$RECEIPT_ROOT/artifacts/source.$1
     git ls-files -z > "$t4_snapshot.unsorted0" || return 1
     sort -z < "$t4_snapshot.unsorted0" > "$t4_snapshot.sorted0" || return 1
     xargs -0 -r "$T4_TOOL_sha256sum" < "$t4_snapshot.sorted0" > "$t4_snapshot.tracked.sha256" || return 1
     "$T4_TOOL_python3" -I scripts/merge-checksum-ledgers.py \
-        "$t4_snapshot.tracked.sha256" "$TASK4_PREPARED_PREFIX.$1.ledger.sha256"
+        "$t4_snapshot.tracked.sha256" "$RECEIPT_PREPARED_PREFIX.$1.ledger.sha256"
 }
-task4_fact() { printf '%s\t%s\n' "$1" "$2" >> "$TASK4_FACTS"; }
+receipt_fact() { printf '%s\t%s\n' "$1" "$2" >> "$RECEIPT_FACTS"; }
 
 # Hash one complete tree as a typed, sorted transcript. NUL-delimited
 # enumeration keeps hostile names unambiguous; names and symlink targets still
 # refuse tabs/newlines before they can enter the transcript or receipt.
-task4_tree_digest() {
+receipt_tree_digest() {
     t4_tree=$1
     [ -d "$t4_tree" ] && [ ! -L "$t4_tree" ] || return 1
     t4_list=$("$T4_TOOL_mktemp") || return 1
@@ -355,56 +123,7 @@ task4_tree_digest() {
         rm -f "$t4_list" "$t4_sorted" "$t4_files" "$t4_sorted_files" "$t4_hashes" "$t4_transcript"
         return 1
     }
-    "$T4_TOOL_python3" -I - "$t4_tree" "$t4_sorted" "$t4_hashes" > "$t4_transcript" <<'PY' || {
-import os
-import stat
-import sys
-
-root = os.path.realpath(os.fsencode(sys.argv[1]))
-with open(sys.argv[2], "rb") as source:
-    paths = [path for path in source.read().split(b"\0") if path]
-with open(sys.argv[3], "rb") as source:
-    hashes = {}
-    for record in source.read().split(b"\0"):
-        if not record:
-            continue
-        if len(record) < 67 or record[64:66] != b"  ":
-            raise SystemExit(1)
-        hashes[record[66:]] = record[:64]
-
-def reject_text(value):
-    if b"\t" in value or b"\n" in value:
-        raise SystemExit(1)
-
-for path in paths:
-    relative = os.path.relpath(path, root)
-    reject_text(relative)
-    if os.path.islink(path):
-        raw = os.readlink(path)
-        reject_text(raw)
-        canonical = os.path.realpath(path)
-        reject_text(canonical)
-        if os.path.commonpath((root, canonical)) != root:
-            raise SystemExit(1)
-        try:
-            mode = os.stat(canonical, follow_symlinks=False).st_mode
-        except OSError:
-            raise SystemExit(1)
-        if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
-            raise SystemExit(1)
-        target = hashes.get(canonical, b"directory" if stat.S_ISDIR(mode) else b"")
-        if not target:
-            raise SystemExit(1)
-        sys.stdout.buffer.write(b"L\0" + relative + b"\0" + raw + b"\0" + target + b"\0")
-    elif os.path.isfile(path):
-        if path not in hashes:
-            raise SystemExit(1)
-        sys.stdout.buffer.write(b"F\0" + relative + b"\0" + hashes[path] + b"\0")
-    elif os.path.isdir(path):
-        sys.stdout.buffer.write(b"D\0" + relative + b"\0")
-    else:
-        raise SystemExit(1)
-PY
+    "$T4_TOOL_python3" -I scripts/lane-build-release-oracle-2.py "$t4_tree" "$t4_sorted" "$t4_hashes" > "$t4_transcript" || {
         rm -f "$t4_list" "$t4_sorted" "$t4_files" "$t4_sorted_files" "$t4_hashes" "$t4_transcript"
         return 1
     }
@@ -425,7 +144,7 @@ PY
 # Cargo and rustc are rustup proxies in the effective cargo-home bin. Bind the
 # entire immediate directory, while rejecting an inventory-name shadow and
 # requiring both proxies to resolve to the sealed rustup executable.
-task4_cargo_home_bin_ledger() {
+receipt_cargo_home_bin_ledger() {
     t4_cargo_bin=${CARGO_HOME:-$HOME/.cargo}/bin
     [ -d "$t4_cargo_bin" ] && [ ! -L "$t4_cargo_bin" ] || return 1
     t4_list=$("$T4_TOOL_mktemp") || return 1
@@ -486,7 +205,7 @@ task4_cargo_home_bin_ledger() {
                 exit 1
             fi
         done
-    ' _ "$t4_cargo_bin" "$T4_TOOL_rustup" "$TASK4_TOOL_INVENTORY" \
+    ' _ "$t4_cargo_bin" "$T4_TOOL_rustup" "$RECEIPT_TOOL_INVENTORY" \
         < "$t4_sorted" > "$t4_rows" || {
         rm -f "$t4_list" "$t4_sorted" "$t4_rows"
         return 1
@@ -507,7 +226,7 @@ task4_cargo_home_bin_ledger() {
     return "$t4_result"
 }
 
-task4_sysroot_closure() {
+receipt_sysroot_closure() {
     t4_compiler=$1; t4_row=$2
     t4_sysroot=$("$t4_compiler" --print sysroot) || return 1
     case $t4_sysroot in /*) ;; *) return 1 ;; esac
@@ -520,7 +239,7 @@ task4_sysroot_closure() {
     [ -n "$t4_driver" ] || return 1
     t4_tab=$(printf '\t'); t4_nl=$(printf '\nx'); t4_nl=${t4_nl%x}
     case $t4_sysroot:$t4_driver in *"$t4_tab"*|*"$t4_nl"*) return 1 ;; esac
-    t4_tree=$(task4_tree_digest "$t4_lib") || return 1
+    t4_tree=$(receipt_tree_digest "$t4_lib") || return 1
     printf '%s\t%s %s\n' "$t4_row" "$t4_sysroot" "$t4_tree"
 }
 
@@ -528,7 +247,7 @@ task4_sysroot_closure() {
 # inputs from the environment. Any non-empty inherited value can re-steer the
 # official build away from the recorded source tree without leaving a trace in
 # the receipt, so the driver refuses them and supplies only command-local values.
-TASK4_BUILD_INPUTS='RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_TARGET_DIR CARGO_BUILD_TARGET
+RECEIPT_BUILD_INPUTS='RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_TARGET_DIR CARGO_BUILD_TARGET
 CARGO_HOME RUSTUP_HOME RUSTUP_TOOLCHAIN RUSTC_WRAPPER CC CFLAGS
 P11SCOPE_PRODUCT_BUILD_MODE P11SCOPE_PREPARED_STABLE_CARGO P11SCOPE_PREPARED_STABLE_RUSTC
 P11SCOPE_PREPARED_BPF_CARGO P11SCOPE_PREPARED_BPF_RUSTC'
@@ -544,7 +263,7 @@ P11SCOPE_PREPARED_BPF_CARGO P11SCOPE_PREPARED_BPF_RUSTC'
 # through the image, so neither is under the caller's PATH authority and
 # neither is a member. An incomplete inventory fails closed as "not found"
 # under the seal; it never falls back to the caller's PATH.
-TASK4_TOOL_INVENTORY='as awk bpf-linker bpftool cargo cat cc chmod clang-18 cmp cp
+RECEIPT_TOOL_INVENTORY='as awk bpf-linker bpftool cargo cat cc chmod clang-18 cmp cp
 date dirname docker env file find flock gcc git grep head id jq ld ldd
 llvm-objcopy llvm-readelf ln ls mkdir mktemp mv python3 realpath rm rustup sed
 setpriv sh sha256sum sleep softhsm2-util sort stat sudo sync tail timeout touch
@@ -553,15 +272,15 @@ uname xargs'
 # The exact environment the sealed child may observe. `env -i` supplies seven
 # of these; dash itself adds PWD and, because line 26 `cd`s, OLDPWD. Nothing
 # else survives -- the set was pinned by observation, not by assumption. The
-# comparison is exact, so a P11SCOPE_TASK4_SEALED forged by the caller refuses
+# comparison is exact, so a P11SCOPE_RECEIPT_SEALED forged by the caller refuses
 # on the variables it also inherited instead of skipping the seal.
-TASK4_SEALED_ENVIRONMENT='HOME
+RECEIPT_SEALED_ENVIRONMENT='HOME
 LC_ALL
 OLDPWD
-P11SCOPE_TASK4_CALLER_ARGV0
-P11SCOPE_TASK4_CALLER_PATH
-P11SCOPE_TASK4_SEALED
-P11SCOPE_TASK4_SEALED_BIN
+P11SCOPE_RECEIPT_CALLER_ARGV0
+P11SCOPE_RECEIPT_CALLER_PATH
+P11SCOPE_RECEIPT_SEALED
+P11SCOPE_RECEIPT_SEALED_BIN
 PATH
 PWD'
 
@@ -574,7 +293,7 @@ PWD'
 # planted there mid-run is overridden by none of the command-local values.
 # Without HOME the effective cargo home cannot be named, while Cargo can still
 # reach one through the passwd database, so that is a refusal too.
-task4_cargo_config_scan() {
+receipt_cargo_config_scan() {
     [ -n "${HOME-}" ] || return 1
     t4_dir=$(pwd -P) || return 1
     while :; do
@@ -592,7 +311,7 @@ task4_cargo_config_scan() {
 
 # Resolve one command to a single absolute non-symlink executable and pin it to
 # the named variable, so the recorded receipt and the invocation cannot diverge.
-task4_pin_tool() {
+receipt_pin_tool() {
     t4_path=$(realpath -e "$1") || return 1
     case $t4_path in /*) ;; *) return 1 ;; esac
     [ -f "$t4_path" ] && [ ! -L "$t4_path" ] && [ -x "$t4_path" ] || return 1
@@ -601,9 +320,9 @@ task4_pin_tool() {
 
 # Resolve one inventory name through the CALLER's PATH and print its pinned
 # absolute path. Used only by the unsealed bootstrap.
-task4_seal_pin() {
+receipt_seal_pin() {
     t4_found=$(command -v "$1") || return 1
-    task4_pin_tool "$t4_found" t4_seal_pinned || return 1
+    receipt_pin_tool "$t4_found" t4_seal_pinned || return 1
     printf '%s\n' "$t4_seal_pinned"
 }
 
@@ -614,8 +333,8 @@ task4_seal_pin() {
 # resolves a command, or reads a variable, that the caller still controls.
 # A HOME, PATH, or argv[0] carrying a tab or newline cannot be recorded as one
 # TSV fact row, so it is a refusal rather than a corrupted receipt.
-task4_seal_and_reexec() {
-    for t4_var in $TASK4_BUILD_INPUTS; do
+receipt_seal_and_reexec() {
+    for t4_var in $RECEIPT_BUILD_INPUTS; do
         eval "t4_value=\${$t4_var-}"
         [ -z "$t4_value" ] || { echo "refusing inherited $t4_var" >&2; exit 77; }
     done
@@ -628,15 +347,15 @@ task4_seal_and_reexec() {
     done
     t4_driver=$(pwd -P)/scripts/build-release.sh
     for t4_tool in mktemp ln env sh rm; do
-        t4_pinned=$(task4_seal_pin "$t4_tool") \
+        t4_pinned=$(receipt_seal_pin "$t4_tool") \
             || { echo "release tool not usable: $t4_tool" >&2; exit 77; }
         eval "t4_seal_$t4_tool=\$t4_pinned"
     done
     umask 077
-    t4_seal_bin=$("$t4_seal_mktemp" -d "${TMPDIR:-/tmp}/p11scope-task4-seal-XXXXXX") \
+    t4_seal_bin=$("$t4_seal_mktemp" -d "${TMPDIR:-/tmp}/p11scope-receipt-seal-XXXXXX") \
         || { echo "cannot create the sealed release bin directory" >&2; exit 77; }
-    for t4_tool in $TASK4_TOOL_INVENTORY; do
-        t4_pinned=$(task4_seal_pin "$t4_tool") \
+    for t4_tool in $RECEIPT_TOOL_INVENTORY; do
+        t4_pinned=$(receipt_seal_pin "$t4_tool") \
             && "$t4_seal_ln" -s "$t4_pinned" "$t4_seal_bin/$t4_tool" \
             || { "$t4_seal_rm" -rf "$t4_seal_bin" || :
                  echo "release tool not usable: $t4_tool" >&2; exit 77; }
@@ -645,10 +364,10 @@ task4_seal_and_reexec() {
         PATH="$t4_seal_bin" \
         HOME="${HOME-}" \
         LC_ALL=C \
-        P11SCOPE_TASK4_SEALED=1 \
-        P11SCOPE_TASK4_SEALED_BIN="$t4_seal_bin" \
-        P11SCOPE_TASK4_CALLER_PATH="$PATH" \
-        P11SCOPE_TASK4_CALLER_ARGV0="$0" \
+        P11SCOPE_RECEIPT_SEALED=1 \
+        P11SCOPE_RECEIPT_SEALED_BIN="$t4_seal_bin" \
+        P11SCOPE_RECEIPT_CALLER_PATH="$PATH" \
+        P11SCOPE_RECEIPT_CALLER_ARGV0="$0" \
         "$t4_seal_sh" "$t4_driver" "$1"
     "$t4_seal_rm" -rf "$t4_seal_bin" || :
     echo "cannot enter the sealed release environment" >&2
@@ -658,18 +377,18 @@ task4_seal_and_reexec() {
 # The sealed child's own check, before it takes any authority: the exported
 # name set, the PATH, and the sealed directory's ownership, mode and exact
 # contents all have to be what the bootstrap built.
-task4_verify_seal() {
-    [ "${P11SCOPE_TASK4_SEALED-}" = 1 ] || return 1
-    t4_bin=${P11SCOPE_TASK4_SEALED_BIN-}
+receipt_verify_seal() {
+    [ "${P11SCOPE_RECEIPT_SEALED-}" = 1 ] || return 1
+    t4_bin=${P11SCOPE_RECEIPT_SEALED_BIN-}
     case $t4_bin in /*) ;; *) return 1 ;; esac
     [ "$PATH" = "$t4_bin" ] || return 1
     [ "${LC_ALL-}" = C ] || return 1
     [ ! -L "$t4_bin" ] && [ -d "$t4_bin" ] || return 1
     [ "$(env | awk -F= '/^[A-Za-z_][A-Za-z0-9_]*=/ { print $1 }' | LC_ALL=C sort)" \
-        = "$TASK4_SEALED_ENVIRONMENT" ] || return 1
+        = "$RECEIPT_SEALED_ENVIRONMENT" ] || return 1
     [ "$(stat -Lc %u:%a "$t4_bin")" = "$(id -u):700" ] || return 1
-    [ "$(ls -A1 "$t4_bin")" = "$(printf '%s\n' $TASK4_TOOL_INVENTORY)" ] || return 1
-    for t4_tool in $TASK4_TOOL_INVENTORY; do
+    [ "$(ls -A1 "$t4_bin")" = "$(printf '%s\n' $RECEIPT_TOOL_INVENTORY)" ] || return 1
+    for t4_tool in $RECEIPT_TOOL_INVENTORY; do
         [ -L "$t4_bin/$t4_tool" ] && [ -x "$t4_bin/$t4_tool" ] || return 1
     done
 }
@@ -678,27 +397,27 @@ task4_verify_seal() {
 # the CALLER's PATH resolves that same name to now, and the pinned binary's
 # digest. Re-running this at finalization catches an in-place replacement and
 # a caller PATH that resolves a different binary alike -- both refuse, neither
-# warns. `task4_digest` pipes the pinned sha256sum through `awk`, itself a
+# warns. `receipt_digest` pipes the pinned sha256sum through `awk`, itself a
 # sealed inventory member, so no unrecorded executable can decide a recorded
 # digest.
-task4_tool_ledger() {
-    for t4_tool in $TASK4_TOOL_INVENTORY; do
-        t4_pinned=$(realpath -e "$P11SCOPE_TASK4_SEALED_BIN/$t4_tool") || return 1
-        t4_found=$(PATH="$P11SCOPE_TASK4_CALLER_PATH" command -v "$t4_tool") || return 1
+receipt_tool_ledger() {
+    for t4_tool in $RECEIPT_TOOL_INVENTORY; do
+        t4_pinned=$(realpath -e "$P11SCOPE_RECEIPT_SEALED_BIN/$t4_tool") || return 1
+        t4_found=$(PATH="$P11SCOPE_RECEIPT_CALLER_PATH" command -v "$t4_tool") || return 1
         t4_now=$(realpath -e "$t4_found") || return 1
         printf 'tool_%s\t%s %s %s\n' \
-            "$t4_tool" "$t4_pinned" "$t4_now" "$(task4_digest "$t4_pinned")" || return 1
+            "$t4_tool" "$t4_pinned" "$t4_now" "$(receipt_digest "$t4_pinned")" || return 1
     done
     t4_found=$(RUSTUP_AUTO_INSTALL=0 "$T4_TOOL_rustup" which --toolchain 1.88 cargo) || return 1
     t4_now=$(realpath -e "$t4_found") || return 1
     printf 'toolchain_cargo\t%s %s %s\n' \
-        "$T4_TOOLCHAIN_CARGO" "$t4_now" "$(task4_digest "$T4_TOOLCHAIN_CARGO")" || return 1
+        "$T4_TOOLCHAIN_CARGO" "$t4_now" "$(receipt_digest "$T4_TOOLCHAIN_CARGO")" || return 1
     t4_found=$(RUSTUP_AUTO_INSTALL=0 "$T4_TOOL_rustup" which --toolchain 1.88 rustc) || return 1
     t4_now=$(realpath -e "$t4_found") || return 1
     printf 'toolchain_rustc\t%s %s %s\n' \
-        "$T4_TOOLCHAIN_RUSTC" "$t4_now" "$(task4_digest "$T4_TOOLCHAIN_RUSTC")" || return 1
-    task4_sysroot_closure "$T4_TOOLCHAIN_RUSTC" toolchain_sysroot || return 1
-    task4_nightly_closure || return 1
+        "$T4_TOOLCHAIN_RUSTC" "$t4_now" "$(receipt_digest "$T4_TOOLCHAIN_RUSTC")" || return 1
+    receipt_sysroot_closure "$T4_TOOLCHAIN_RUSTC" toolchain_sysroot || return 1
+    receipt_nightly_closure || return 1
 }
 
 # The shipped observer embeds an eBPF object that `build.rs` builds with a
@@ -712,15 +431,15 @@ task4_tool_ledger() {
 # the bundled rust-lld (rust-lld serves the host build-script links). The
 # Both sysroot trees are digested whole; internal regular-file symlinks bind
 # their raw target and canonical content, while external or unsafe links refuse.
-task4_nightly_closure() {
+receipt_nightly_closure() {
     t4_found=$(RUSTUP_AUTO_INSTALL=0 "$T4_TOOL_rustup" which --toolchain nightly-2026-05-20 cargo) || return 1
-    task4_pin_tool "$t4_found" t4_nightly_cargo || return 1
+    receipt_pin_tool "$t4_found" t4_nightly_cargo || return 1
     printf 'toolchain_nightly_cargo\t%s %s\n' \
-        "$t4_nightly_cargo" "$(task4_digest "$t4_nightly_cargo")" || return 1
+        "$t4_nightly_cargo" "$(receipt_digest "$t4_nightly_cargo")" || return 1
     t4_found=$(RUSTUP_AUTO_INSTALL=0 "$T4_TOOL_rustup" which --toolchain nightly-2026-05-20 rustc) || return 1
-    task4_pin_tool "$t4_found" t4_nightly_rustc || return 1
+    receipt_pin_tool "$t4_found" t4_nightly_rustc || return 1
     printf 'toolchain_nightly_rustc\t%s %s\n' \
-        "$t4_nightly_rustc" "$(task4_digest "$t4_nightly_rustc")" || return 1
+        "$t4_nightly_rustc" "$(receipt_digest "$t4_nightly_rustc")" || return 1
     t4_sysroot=$("$t4_nightly_rustc" --print sysroot) || return 1
     case $t4_sysroot in /*) ;; *) return 1 ;; esac
     t4_lib=$t4_sysroot/lib
@@ -728,17 +447,17 @@ task4_nightly_closure() {
     t4_driver=$("$T4_TOOL_find" "$t4_lib" -mindepth 1 -maxdepth 1 \
         -name 'librustc_driver*.so' -print -quit) || return 1
     [ -n "$t4_driver" ] || return 1
-    t4_sysroot_tree=$(task4_tree_digest "$t4_lib") || return 1
+    t4_sysroot_tree=$(receipt_tree_digest "$t4_lib") || return 1
     printf 'toolchain_nightly_sysroot\t%s %s\n' \
         "$t4_sysroot" "$t4_sysroot_tree" || return 1
     t4_src=$t4_sysroot/lib/rustlib/src/rust
     [ -d "$t4_src" ] && [ ! -L "$t4_src" ] || return 1
-    t4_src_digest=$(task4_tree_digest "$t4_src") || return 1
+    t4_src_digest=$(receipt_tree_digest "$t4_src") || return 1
     printf 'toolchain_nightly_rust_src\t%s %s\n' "$t4_src" "$t4_src_digest" || return 1
-    task4_cargo_home_bin_ledger || return 1
-    task4_pin_tool "${CARGO_HOME:-$HOME/.cargo}/bin/bpf-linker" t4_bpf_linker || return 1
+    receipt_cargo_home_bin_ledger || return 1
+    receipt_pin_tool "${CARGO_HOME:-$HOME/.cargo}/bin/bpf-linker" t4_bpf_linker || return 1
     printf 'toolchain_bpf_linker\t%s %s\n' \
-        "$t4_bpf_linker" "$(task4_digest "$t4_bpf_linker")" || return 1
+        "$t4_bpf_linker" "$(receipt_digest "$t4_bpf_linker")" || return 1
 }
 
 release_body_cleanup() {
@@ -756,194 +475,183 @@ release_body_cleanup() {
     return "$release_cleanup_status"
 }
 
-task4_finalize() {
+receipt_finalize() {
     t4_result=$?
     trap - EXIT INT TERM HUP
     set +e
     release_body_cleanup || [ "$t4_result" -ne 0 ] || t4_result=1
-    [ "$(stat -Lc %d:%i "$TASK4_ROOT" 2>/dev/null)" = "$TASK4_ROOT_ID" ] || t4_result=1
-    [ "$(stat -Lc %d:%i "$TASK4_ROOT/artifacts" 2>/dev/null)" = "$TASK4_ARTIFACTS_ID" ] || t4_result=1
-    [ "$(stat -Lc %d:%i "$TASK4_ROOT/work" 2>/dev/null)" = "$TASK4_WORK_ID" ] || t4_result=1
+    [ "$(stat -Lc %d:%i "$RECEIPT_ROOT" 2>/dev/null)" = "$RECEIPT_ROOT_ID" ] || t4_result=1
+    [ "$(stat -Lc %d:%i "$RECEIPT_ROOT/artifacts" 2>/dev/null)" = "$RECEIPT_ARTIFACTS_ID" ] || t4_result=1
+    [ "$(stat -Lc %d:%i "$RECEIPT_ROOT/work" 2>/dev/null)" = "$RECEIPT_WORK_ID" ] || t4_result=1
     if [ "$t4_result" -ne 77 ]; then
-        [ "$(git rev-parse HEAD 2>/dev/null)" = "$TASK4_HEAD" ] || t4_result=1
-        [ "$(git rev-parse 'HEAD^{tree}' 2>/dev/null)" = "$TASK4_TREE" ] || t4_result=1
+        [ "$(git rev-parse HEAD 2>/dev/null)" = "$RECEIPT_HEAD" ] || t4_result=1
+        [ "$(git rev-parse 'HEAD^{tree}' 2>/dev/null)" = "$RECEIPT_TREE" ] || t4_result=1
         t4_status=$(git status --porcelain=v1 --untracked-files=all 2>/dev/null) || t4_result=1
         [ -z "$t4_status" ] || t4_result=1
-        for t4_var in $TASK4_BUILD_INPUTS; do
+        for t4_var in $RECEIPT_BUILD_INPUTS; do
             eval "t4_value=\${$t4_var-}"
             [ -z "$t4_value" ] || t4_result=1
         done
         t4_recheck_allowed=1
-        t4_configs=$(task4_cargo_config_scan 2>/dev/null) || { t4_result=1; t4_recheck_allowed=0; }
+        t4_configs=$(receipt_cargo_config_scan 2>/dev/null) || { t4_result=1; t4_recheck_allowed=0; }
         if [ -n "$t4_configs" ] || [ "$t4_recheck_allowed" -eq 0 ]; then
             echo "prepared dependency recheck skipped: Cargo configuration changed or unreadable" >&2
             t4_result=1; t4_recheck_allowed=0
         fi
-        if (task4_tool_ledger) > "$TASK4_ROOT/artifacts/tools.final.tsv"; then
-            t4_final_tools=$(cat "$TASK4_ROOT/artifacts/tools.final.tsv") || { t4_result=1; t4_recheck_allowed=0; }
-            [ "$t4_final_tools" = "$TASK4_TOOLS" ] || { t4_result=1; t4_recheck_allowed=0; }
+        if (receipt_tool_ledger) > "$RECEIPT_ROOT/artifacts/tools.final.tsv"; then
+            t4_final_tools=$(cat "$RECEIPT_ROOT/artifacts/tools.final.tsv") || { t4_result=1; t4_recheck_allowed=0; }
+            [ "$t4_final_tools" = "$RECEIPT_TOOLS" ] || { t4_result=1; t4_recheck_allowed=0; }
         else
             t4_result=1; t4_recheck_allowed=0
         fi
-        [ "$(task4_digest scripts/build-release.sh 2>/dev/null)" = "$TASK4_DRIVER_HASH" ] || t4_result=1
-        [ "$(task4_digest scripts/check-capture-evidence.py 2>/dev/null)" = "$TASK4_CHECKER_HASH" ] || t4_result=1
-        if [ "$TASK4_PREPARED_ADMITTED" -eq 1 ] && [ "$t4_recheck_allowed" -eq 1 ]; then
+        [ "$(receipt_digest scripts/build-release.sh 2>/dev/null)" = "$RECEIPT_DRIVER_HASH" ] || t4_result=1
+        [ "$(receipt_digest scripts/check-capture-evidence.py 2>/dev/null)" = "$RECEIPT_CHECKER_HASH" ] || t4_result=1
+        if [ "$RECEIPT_PREPARED_ADMITTED" -eq 1 ] && [ "$t4_recheck_allowed" -eq 1 ]; then
             if "$T4_TOOL_python3" -I scripts/prepared-dependency-evidence.py recheck \
-                --prefix "$TASK4_PREPARED_PREFIX"; then
-                t4_ledger_hash=$(task4_digest "$TASK4_PREPARED_PREFIX.final.ledger.sha256") \
-                    && task4_fact prepared_final_ledger "release.prepared.final.ledger.sha256 $t4_ledger_hash" || t4_result=1
-                task4_snapshot final > "$TASK4_ROOT/artifacts/source.end.tsv" || t4_result=1
-                cmp -s "$TASK4_ROOT/artifacts/source.start.tsv" "$TASK4_ROOT/artifacts/source.end.tsv" || t4_result=1
+                --prefix "$RECEIPT_PREPARED_PREFIX"; then
+                t4_ledger_hash=$(receipt_digest "$RECEIPT_PREPARED_PREFIX.final.ledger.sha256") \
+                    && receipt_fact prepared_final_ledger "release.prepared.final.ledger.sha256 $t4_ledger_hash" || t4_result=1
+                receipt_snapshot final > "$RECEIPT_ROOT/artifacts/source.end.tsv" || t4_result=1
+                cmp -s "$RECEIPT_ROOT/artifacts/source.start.tsv" "$RECEIPT_ROOT/artifacts/source.end.tsv" || t4_result=1
             else
                 t4_result=1
             fi
         else
             t4_result=1
         fi
-        [ -s "$TASK4_ROOT/artifacts/capture.json" ] || t4_result=1
-        [ -s "$TASK4_ROOT/artifacts/checker.log" ] || t4_result=1
-        [ -n "$TASK4_CHILD_FACTS_ID" ] && [ "$(stat -Lc %d:%i /proc/$$/fd/8 2>/dev/null)" = "$TASK4_CHILD_FACTS_ID" ] || t4_result=1
-        [ -n "$TASK4_CHILD_FACTS_HASH" ] && [ "$(task4_digest /proc/$$/fd/8 2>/dev/null)" = "$TASK4_CHILD_FACTS_HASH" ] || t4_result=1
+        [ -s "$RECEIPT_ROOT/artifacts/capture.json" ] || t4_result=1
+        [ -s "$RECEIPT_ROOT/artifacts/checker.log" ] || t4_result=1
+        [ -n "$RECEIPT_CHILD_FACTS_ID" ] && [ "$(stat -Lc %d:%i /proc/$$/fd/8 2>/dev/null)" = "$RECEIPT_CHILD_FACTS_ID" ] || t4_result=1
+        [ -n "$RECEIPT_CHILD_FACTS_HASH" ] && [ "$(receipt_digest /proc/$$/fd/8 2>/dev/null)" = "$RECEIPT_CHILD_FACTS_HASH" ] || t4_result=1
     fi
-    find "$TASK4_ROOT" -type d -exec chmod 700 {} + 2>/dev/null || t4_result=1
-    find "$TASK4_ROOT" -type f -exec chmod 600 {} + 2>/dev/null || t4_result=1
-    "$T4_TOOL_python3" -I - "$TASK4_ROOT" <<'PY' || t4_result=1
-import os, stat, sys
-root=sys.argv[1]
-if set(os.listdir(root)) != {"facts.log","stdout.log","stderr.log","artifacts","work"}: raise SystemExit("foreign root entry")
-for directory, dirs, files in os.walk(root,followlinks=False):
-    if stat.S_IMODE(os.lstat(directory).st_mode)!=0o700: raise SystemExit("directory mode")
-    for name in dirs+files:
-        if stat.S_ISLNK(os.lstat(os.path.join(directory,name)).st_mode): raise SystemExit("symlink")
-    for name in files:
-        mode=os.lstat(os.path.join(directory,name)).st_mode
-        if not stat.S_ISREG(mode) or stat.S_IMODE(mode)!=0o600: raise SystemExit("file mode")
-PY
-    task4_fact ended_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)" || t4_result=1
-    task4_fact terminal_status "$t4_result" || t4_result=1
-    sync -f "$TASK4_FACTS" "$TASK4_ROOT/stdout.log" "$TASK4_ROOT/stderr.log" 2>/dev/null || t4_result=1
-    if [ ! -e "$TASK4_ROOT/status" ] && [ ! -L "$TASK4_ROOT/status" ]; then
-        printf '%s\n' "$t4_result" > "$TASK4_ROOT/status"; chmod 600 "$TASK4_ROOT/status"; sync -f "$TASK4_ROOT/status" 2>/dev/null || t4_result=1
+    find "$RECEIPT_ROOT" -type d -exec chmod 700 {} + 2>/dev/null || t4_result=1
+    find "$RECEIPT_ROOT" -type f -exec chmod 600 {} + 2>/dev/null || t4_result=1
+    "$T4_TOOL_python3" -I scripts/lane-build-release-oracle-3.py "$RECEIPT_ROOT" || t4_result=1
+    receipt_fact ended_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)" || t4_result=1
+    receipt_fact terminal_status "$t4_result" || t4_result=1
+    sync -f "$RECEIPT_FACTS" "$RECEIPT_ROOT/stdout.log" "$RECEIPT_ROOT/stderr.log" 2>/dev/null || t4_result=1
+    if [ ! -e "$RECEIPT_ROOT/status" ] && [ ! -L "$RECEIPT_ROOT/status" ]; then
+        printf '%s\n' "$t4_result" > "$RECEIPT_ROOT/status"; chmod 600 "$RECEIPT_ROOT/status"; sync -f "$RECEIPT_ROOT/status" 2>/dev/null || t4_result=1
     else
         t4_result=1
     fi
     # The sealed directory is the receipt's own tool evidence: it stays until
     # the terminal status exists, never earlier.
-    rm -rf "$P11SCOPE_TASK4_SEALED_BIN"
+    rm -rf "$P11SCOPE_RECEIPT_SEALED_BIN"
     exit "$t4_result"
 }
 
-task4_receipt_run() {
+receipt_receipt_run() {
     [ "$#" -eq 1 ] || { echo "usage: $0 --self-test | ABSENT_EVIDENCE_ROOT" >&2; exit 2; }
-    if [ -z "${P11SCOPE_TASK4_SEALED-}" ]; then task4_seal_and_reexec "$1"; fi
-    task4_verify_seal \
+    if [ -z "${P11SCOPE_RECEIPT_SEALED-}" ]; then receipt_seal_and_reexec "$1"; fi
+    receipt_verify_seal \
         || { echo "refusing an unsealed or forged release environment" >&2; exit 77; }
-    task4_prepare_root "$1" \
-        || { rm -rf "$P11SCOPE_TASK4_SEALED_BIN" || :
+    receipt_prepare_root "$1" \
+        || { rm -rf "$P11SCOPE_RECEIPT_SEALED_BIN" || :
              echo "invalid Task 4 evidence root" >&2; exit 77; }
-    TASK4_FACTS=$TASK4_ROOT/facts.log
-    : > "$TASK4_FACTS"; : > "$TASK4_ROOT/stdout.log"; : > "$TASK4_ROOT/stderr.log"
-    chmod 600 "$TASK4_FACTS" "$TASK4_ROOT/stdout.log" "$TASK4_ROOT/stderr.log"
-    mkdir -m 700 "$TASK4_ROOT/artifacts" "$TASK4_ROOT/work"
-    TASK4_ARTIFACTS_ID=$(stat -Lc %d:%i "$TASK4_ROOT/artifacts")
-    TASK4_WORK_ID=$(stat -Lc %d:%i "$TASK4_ROOT/work")
-    TASK4_HEAD= TASK4_TREE= TASK4_DRIVER_HASH= TASK4_CHECKER_HASH=
-    TASK4_CHILD_FACTS_ID= TASK4_CHILD_FACTS_HASH= TASK4_TOOLS=
-    TASK4_PREPARED_ADMITTED=0
-    TASK4_PREPARED_PREFIX=$TASK4_ROOT/artifacts/release.prepared
+    RECEIPT_FACTS=$RECEIPT_ROOT/facts.log
+    : > "$RECEIPT_FACTS"; : > "$RECEIPT_ROOT/stdout.log"; : > "$RECEIPT_ROOT/stderr.log"
+    chmod 600 "$RECEIPT_FACTS" "$RECEIPT_ROOT/stdout.log" "$RECEIPT_ROOT/stderr.log"
+    mkdir -m 700 "$RECEIPT_ROOT/artifacts" "$RECEIPT_ROOT/work"
+    RECEIPT_ARTIFACTS_ID=$(stat -Lc %d:%i "$RECEIPT_ROOT/artifacts")
+    RECEIPT_WORK_ID=$(stat -Lc %d:%i "$RECEIPT_ROOT/work")
+    RECEIPT_HEAD= RECEIPT_TREE= RECEIPT_DRIVER_HASH= RECEIPT_CHECKER_HASH=
+    RECEIPT_CHILD_FACTS_ID= RECEIPT_CHILD_FACTS_HASH= RECEIPT_TOOLS=
+    RECEIPT_PREPARED_ADMITTED=0
+    RECEIPT_PREPARED_PREFIX=$RECEIPT_ROOT/artifacts/release.prepared
     T4_TOOLCHAIN_CARGO= T4_TOOLCHAIN_RUSTC=
     for t4_tool in cargo docker file jq python3 rustup setpriv sudo sha256sum mktemp find sort xargs sh cat grep; do
         eval "T4_TOOL_$t4_tool=\$t4_tool"
     done
-    trap task4_finalize EXIT INT TERM HUP
-    [ ! -L "$TASK4_CAMPAIGN/.task4.lock" ] || exit 77
-    exec 9>>"$TASK4_CAMPAIGN/.task4.lock"; chmod 600 "$TASK4_CAMPAIGN/.task4.lock"
-    [ "$(stat -Lc %d:%i:%u:%a:%h /proc/$$/fd/9)" = "$(stat -Lc %d:%i:%u:%a:%h "$TASK4_CAMPAIGN/.task4.lock")" ] || exit 77
+    trap receipt_finalize EXIT INT TERM HUP
+    [ ! -L "$RECEIPT_CAMPAIGN/.receipt.lock" ] || exit 77
+    exec 9>>"$RECEIPT_CAMPAIGN/.receipt.lock"; chmod 600 "$RECEIPT_CAMPAIGN/.receipt.lock"
+    [ "$(stat -Lc %d:%i:%u:%a:%h /proc/$$/fd/9)" = "$(stat -Lc %d:%i:%u:%a:%h "$RECEIPT_CAMPAIGN/.receipt.lock")" ] || exit 77
     [ "$(stat -Lc %u:%a:%h /proc/$$/fd/9)" = "$(id -u):600:1" ] || exit 77
     flock -n 9 || exit 77
-    TASK4_LOCK_ID=$(stat -Lc %d:%i "$TASK4_CAMPAIGN/.task4.lock")
-    TASK4_HEAD=$(git rev-parse HEAD) || exit 77; TASK4_TREE=$(git rev-parse 'HEAD^{tree}') || exit 77
-    TASK4_STATUS=$(git status --porcelain=v1 --untracked-files=all) || exit 77
-    [ -z "$TASK4_STATUS" ] || { echo "worktree must be clean, untracked files included" >&2; exit 77; }
+    RECEIPT_LOCK_ID=$(stat -Lc %d:%i "$RECEIPT_CAMPAIGN/.receipt.lock")
+    RECEIPT_HEAD=$(git rev-parse HEAD) || exit 77; RECEIPT_TREE=$(git rev-parse 'HEAD^{tree}') || exit 77
+    RECEIPT_STATUS=$(git status --porcelain=v1 --untracked-files=all) || exit 77
+    [ -z "$RECEIPT_STATUS" ] || { echo "worktree must be clean, untracked files included" >&2; exit 77; }
     for t4_tool in cargo docker file jq python3 rustup setpriv sudo sha256sum; do
         t4_found=$(command -v "$t4_tool") || exit 77
-        task4_pin_tool "$t4_found" "T4_TOOL_$t4_tool" || exit 77
+        receipt_pin_tool "$t4_found" "T4_TOOL_$t4_tool" || exit 77
     done
-    TASK4_DRIVER_HASH=$(task4_digest scripts/build-release.sh); TASK4_CHECKER_HASH=$(task4_digest scripts/check-capture-evidence.py)
-    task4_fact started_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    task4_fact argv "$P11SCOPE_TASK4_CALLER_ARGV0 $1"; task4_fact cwd "$(pwd -P)"
-    task4_fact sealed_bin "$P11SCOPE_TASK4_SEALED_BIN"
-    task4_fact sealed_bin_identity "$(stat -Lc %d:%i "$P11SCOPE_TASK4_SEALED_BIN")"
-    task4_fact sealed_environment "$(echo $TASK4_SEALED_ENVIRONMENT)"
-    for t4_var in $TASK4_SEALED_ENVIRONMENT; do
+    RECEIPT_DRIVER_HASH=$(receipt_digest scripts/build-release.sh); RECEIPT_CHECKER_HASH=$(receipt_digest scripts/check-capture-evidence.py)
+    receipt_fact started_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    receipt_fact argv "$P11SCOPE_RECEIPT_CALLER_ARGV0 $1"; receipt_fact cwd "$(pwd -P)"
+    receipt_fact sealed_bin "$P11SCOPE_RECEIPT_SEALED_BIN"
+    receipt_fact sealed_bin_identity "$(stat -Lc %d:%i "$P11SCOPE_RECEIPT_SEALED_BIN")"
+    receipt_fact sealed_environment "$(echo $RECEIPT_SEALED_ENVIRONMENT)"
+    for t4_var in $RECEIPT_SEALED_ENVIRONMENT; do
         eval "t4_value=\${$t4_var-}"
-        task4_fact "sealed_env_$t4_var" "$t4_value"
+        receipt_fact "sealed_env_$t4_var" "$t4_value"
     done
-    task4_fact caller_path "$P11SCOPE_TASK4_CALLER_PATH"
-    task4_fact uid_gid "$(id -u):$(id -g)"; task4_fact kernel "$(uname -srmo)"; task4_fact head "$TASK4_HEAD"; task4_fact tree "$TASK4_TREE"
-    task4_fact root_identity "$TASK4_ROOT_ID"; task4_fact artifacts_identity "$TASK4_ARTIFACTS_ID"; task4_fact work_identity "$TASK4_WORK_ID"
-    task4_fact lock_identity "$TASK4_LOCK_ID"; task4_fact lock_holder "$$:$(process_starttime $$)"
-    task4_fact driver_sha256 "$TASK4_DRIVER_HASH"; task4_fact checker_sha256 "$TASK4_CHECKER_HASH"
-    TASK4_CONFIGS=$(task4_cargo_config_scan) \
+    receipt_fact caller_path "$P11SCOPE_RECEIPT_CALLER_PATH"
+    receipt_fact uid_gid "$(id -u):$(id -g)"; receipt_fact kernel "$(uname -srmo)"; receipt_fact head "$RECEIPT_HEAD"; receipt_fact tree "$RECEIPT_TREE"
+    receipt_fact root_identity "$RECEIPT_ROOT_ID"; receipt_fact artifacts_identity "$RECEIPT_ARTIFACTS_ID"; receipt_fact work_identity "$RECEIPT_WORK_ID"
+    receipt_fact lock_identity "$RECEIPT_LOCK_ID"; receipt_fact lock_holder "$$:$(process_starttime $$)"
+    receipt_fact driver_sha256 "$RECEIPT_DRIVER_HASH"; receipt_fact checker_sha256 "$RECEIPT_CHECKER_HASH"
+    RECEIPT_CONFIGS=$(receipt_cargo_config_scan) \
         || { echo "cannot evaluate the effective cargo home" >&2; exit 77; }
-    [ -z "$TASK4_CONFIGS" ] || { echo "untracked cargo config: $TASK4_CONFIGS" >&2; exit 77; }
-    for t4_var in $TASK4_BUILD_INPUTS; do
+    [ -z "$RECEIPT_CONFIGS" ] || { echo "untracked cargo config: $RECEIPT_CONFIGS" >&2; exit 77; }
+    for t4_var in $RECEIPT_BUILD_INPUTS; do
         eval "t4_value=\${$t4_var-}"
         [ -z "$t4_value" ] || { echo "refusing inherited $t4_var" >&2; exit 77; }
-        task4_fact "inherited_$t4_var" ""
+        receipt_fact "inherited_$t4_var" ""
     done
     t4_found=$(RUSTUP_AUTO_INSTALL=0 "$T4_TOOL_rustup" which --toolchain 1.88 cargo) || exit 77
-    task4_pin_tool "$t4_found" T4_TOOLCHAIN_CARGO || exit 77
+    receipt_pin_tool "$t4_found" T4_TOOLCHAIN_CARGO || exit 77
     t4_found=$(RUSTUP_AUTO_INSTALL=0 "$T4_TOOL_rustup" which --toolchain 1.88 rustc) || exit 77
-    task4_pin_tool "$t4_found" T4_TOOLCHAIN_RUSTC || exit 77
+    receipt_pin_tool "$t4_found" T4_TOOLCHAIN_RUSTC || exit 77
     # Keep the nightly selections made by the complete ledger in this shell.
-    task4_tool_ledger > "$TASK4_ROOT/artifacts/tools.initial.tsv" || exit 77
-    TASK4_TOOLS=$(cat "$TASK4_ROOT/artifacts/tools.initial.tsv") || exit 77
-    printf '%s\n' "$TASK4_TOOLS" >> "$TASK4_FACTS"
+    receipt_tool_ledger > "$RECEIPT_ROOT/artifacts/tools.initial.tsv" || exit 77
+    RECEIPT_TOOLS=$(cat "$RECEIPT_ROOT/artifacts/tools.initial.tsv") || exit 77
+    printf '%s\n' "$RECEIPT_TOOLS" >> "$RECEIPT_FACTS"
     "$T4_TOOL_python3" -I scripts/prepared-dependency-evidence.py capture \
-        --prefix "$TASK4_PREPARED_PREFIX" \
+        --prefix "$RECEIPT_PREPARED_PREFIX" \
         --stable-cargo "$T4_TOOLCHAIN_CARGO" --stable-rustc "$T4_TOOLCHAIN_RUSTC" \
         --bpf-cargo "$t4_nightly_cargo" --bpf-rustc "$t4_nightly_rustc" || exit 77
-    TASK4_PREPARED_ADMITTED=1
-    t4_ledger_hash=$(task4_digest "$TASK4_PREPARED_PREFIX.initial.ledger.sha256") || exit 77
-    task4_fact prepared_initial_ledger "release.prepared.initial.ledger.sha256 $t4_ledger_hash"
-    task4_snapshot initial > "$TASK4_ROOT/artifacts/source.start.tsv" || exit 77
-    TASK4_SOURCE_HASH=$(task4_digest "$TASK4_ROOT/artifacts/source.start.tsv") || exit 77
-    task4_fact source_input_ledger_sha256 "$TASK4_SOURCE_HASH"
+    RECEIPT_PREPARED_ADMITTED=1
+    t4_ledger_hash=$(receipt_digest "$RECEIPT_PREPARED_PREFIX.initial.ledger.sha256") || exit 77
+    receipt_fact prepared_initial_ledger "release.prepared.initial.ledger.sha256 $t4_ledger_hash"
+    receipt_snapshot initial > "$RECEIPT_ROOT/artifacts/source.start.tsv" || exit 77
+    RECEIPT_SOURCE_HASH=$(receipt_digest "$RECEIPT_ROOT/artifacts/source.start.tsv") || exit 77
+    receipt_fact source_input_ledger_sha256 "$RECEIPT_SOURCE_HASH"
     "$T4_TOOL_sudo" -n true >/dev/null 2>&1 || exit 77
     [ -f "$MODULE" ] || exit 77
-    WORK=$TASK4_ROOT/work
+    WORK=$RECEIPT_ROOT/work
     DIST="$WORK/dist"
     OFFICIAL_TARGET="$WORK/release-official"
     CANARY_WORK="$WORK/canaries"
     ATTACH_WORK=$WORK
     DISCOVER_BASE=$WORK
     DISCOVER_WORK="$DISCOVER_BASE/discover"
-    release_body > "$TASK4_ROOT/stdout.log" 2> "$TASK4_ROOT/stderr.log"
-    exec 8< "$TASK4_ROOT/artifacts/discover.facts"
-    TASK4_CHILD_FACTS_ID=$(stat -Lc %d:%i /proc/$$/fd/8) || exit 1
-    [ "$TASK4_CHILD_FACTS_ID" = "$(awk -F '\t' '$1=="facts_identity"{print $2; exit}' /proc/$$/fd/8)" ] || exit 1
+    release_body > "$RECEIPT_ROOT/stdout.log" 2> "$RECEIPT_ROOT/stderr.log"
+    exec 8< "$RECEIPT_ROOT/artifacts/discover.facts"
+    RECEIPT_CHILD_FACTS_ID=$(stat -Lc %d:%i /proc/$$/fd/8) || exit 1
+    [ "$RECEIPT_CHILD_FACTS_ID" = "$(awk -F '\t' '$1=="facts_identity"{print $2; exit}' /proc/$$/fd/8)" ] || exit 1
     [ "$(stat -Lc %u:%a:%h /proc/$$/fd/8)" = "$(id -u):600:1" ] || exit 1
-    TASK4_CHILD_FACTS_HASH=$(task4_digest /proc/$$/fd/8) || exit 1
-    task4_fact child_facts_identity "$TASK4_CHILD_FACTS_ID"
-    task4_fact child_facts_sha256 "$TASK4_CHILD_FACTS_HASH"
+    RECEIPT_CHILD_FACTS_HASH=$(receipt_digest /proc/$$/fd/8) || exit 1
+    receipt_fact child_facts_identity "$RECEIPT_CHILD_FACTS_ID"
+    receipt_fact child_facts_sha256 "$RECEIPT_CHILD_FACTS_HASH"
     # csf_19fb2f: the receipt capture is bound to the literal path the static
     # smoke wrote; find remains only as a guard that the observed-capture
     # population under work/ is exactly the three known files (two attach-e2e
     # lanes plus the static smoke), so a planted decoy refuses instead of
     # being silently ranked. checker.log is the framed checker record from
     # release_body, never the whole-body stdout.
-    t4_observed=$(find "$TASK4_ROOT/work" -type f -name '*observed*.json' -print | LC_ALL=C sort)
+    t4_observed=$(find "$RECEIPT_ROOT/work" -type f -name '*observed*.json' -print | LC_ALL=C sort)
     [ "$t4_observed" = "$(printf '%s\n' \
-        "$TASK4_ROOT/work/observed-scan.json" \
-        "$TASK4_ROOT/work/observed-static-smoke.json" \
-        "$TASK4_ROOT/work/observed.json")" ] \
+        "$RECEIPT_ROOT/work/observed-scan.json" \
+        "$RECEIPT_ROOT/work/observed-static-smoke.json" \
+        "$RECEIPT_ROOT/work/observed.json")" ] \
         || { echo "unexpected observed capture set under work: $t4_observed" >&2; exit 1; }
-    cp "$WORK/observed-static-smoke.json" "$TASK4_ROOT/artifacts/capture.json"
-    cp "$WORK/checker.log" "$TASK4_ROOT/artifacts/checker.log"
-    task4_fact checker_argv "$t4_checker_argv"
-    task4_fact checker_status "$t4_checker_status"
-    task4_fact checker_log_sha256 "$(task4_digest "$TASK4_ROOT/artifacts/checker.log")"
+    cp "$WORK/observed-static-smoke.json" "$RECEIPT_ROOT/artifacts/capture.json"
+    cp "$WORK/checker.log" "$RECEIPT_ROOT/artifacts/checker.log"
+    receipt_fact checker_argv "$t4_checker_argv"
+    receipt_fact checker_status "$t4_checker_status"
+    receipt_fact checker_log_sha256 "$(receipt_digest "$RECEIPT_ROOT/artifacts/checker.log")"
 }
 
 release_body() {
@@ -957,7 +665,7 @@ P11SCOPE_PREPARED_STABLE_CARGO="$T4_TOOLCHAIN_CARGO" \
 P11SCOPE_PREPARED_STABLE_RUSTC="$T4_TOOLCHAIN_RUSTC" \
 P11SCOPE_PREPARED_BPF_CARGO="$t4_nightly_cargo" \
 P11SCOPE_PREPARED_BPF_RUSTC="$t4_nightly_rustc" \
-P11SCOPE_TASK4_WORK="$CANARY_WORK" sh scripts/verify-canaries.sh
+P11SCOPE_RECEIPT_WORK="$CANARY_WORK" sh scripts/verify-canaries.sh
 
 echo "=== p11scope: dynamic-build attach correctness ==="
 P11SCOPE_PRODUCT_BUILD_MODE=prepared \
@@ -965,7 +673,7 @@ P11SCOPE_PREPARED_STABLE_CARGO="$T4_TOOLCHAIN_CARGO" \
 P11SCOPE_PREPARED_STABLE_RUSTC="$T4_TOOLCHAIN_RUSTC" \
 P11SCOPE_PREPARED_BPF_CARGO="$t4_nightly_cargo" \
 P11SCOPE_PREPARED_BPF_RUSTC="$t4_nightly_rustc" \
-P11SCOPE_TASK4_WORK="$ATTACH_WORK" sh scripts/verify-attach-e2e.sh
+P11SCOPE_RECEIPT_WORK="$ATTACH_WORK" sh scripts/verify-attach-e2e.sh
 
 echo "=== p11scope: isolated safe-only official static build ==="
 rm -rf "$OFFICIAL_TARGET"
@@ -1012,9 +720,9 @@ ldd "$P11SCOPE_STATIC" || true   # diagnostic only; file(1) above is the enforce
 cp "$P11SCOPE_STATIC" "$DIST/p11scope"
 
 echo "=== p11scope-discover: dynamic glibc + dynamic musl builds ==="
-P11SCOPE_TASK4_WORK="$DISCOVER_BASE" \
+P11SCOPE_RECEIPT_WORK="$DISCOVER_BASE" \
     sh scripts/verify-discover-containers.sh \
-    --lane14-facts "$TASK4_ROOT/artifacts/discover.facts"
+    --lane14-facts "$RECEIPT_ROOT/artifacts/discover.facts"
 GLIBC_DISCOVER=$DISCOVER_WORK/glibc-build/release/p11scope-discover
 MUSL_DISCOVER=$DISCOVER_WORK/musl-build/release/p11scope-discover
 
@@ -1157,4 +865,4 @@ ls -la "$DIST"
 echo "=== build-release: ALL OK ==="
 }
 
-task4_receipt_run "$@"
+receipt_receipt_run "$@"

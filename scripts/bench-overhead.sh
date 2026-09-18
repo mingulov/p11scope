@@ -193,18 +193,7 @@ verify_trace_bound() {
         return 1
     }
     reclaim_root_output "$WORK/trace_bound.txt"
-    python3 - "$WORK/trace_bound.txt" <<'PY'
-import json, sys
-
-lines = [line.rstrip("\n") for line in open(sys.argv[1])]
-events = [line for line in lines if line and not line.startswith(("CAPTURE ", "TRUNCATED ", "EVIDENCE ", "LOST "))]
-assert any(line.startswith("CAPTURE ") for line in lines), lines
-assert len(events) <= 1, events
-assert sum(line.startswith("TRUNCATED at 1 events (--max-events)") for line in lines) == 1, lines
-evidence = [line.removeprefix("EVIDENCE ") for line in lines if line.startswith("EVIDENCE ")]
-assert len(evidence) == 1, evidence
-assert json.loads(evidence[0])["trace_truncated"] is True, evidence[0]
-PY
+    python3 -I scripts/lane-bench-overhead-oracle-1.py "$WORK/trace_bound.txt"
 }
 
 echo "=== unobserved ==="
@@ -241,39 +230,6 @@ done
 verify_trace_bound
 
 echo "=== results ==="
-python3 - "$WORK" "$N_CALLS" "$KERNEL" "$CPU" <<'PY'
-import statistics, sys
-
-work, n_calls, kernel, cpu = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
-
-conditions = [
-    ("unobserved", "unobserved.times"),
-    ("profile --mode metrics", "metrics.times"),
-    ("profile --mode profile", "profile.times"),
-    ("trace", "trace.times"),
-]
-
-print(f"kernel: {kernel}")
-print(f"cpu: {cpu}")
-print(f"calls per run: {n_calls}")
-print()
-
-rows = []
-baseline_percall_median = None
-for label, fname in conditions:
-    ns = [int(x) for x in open(f"{work}/{fname}") if x.strip()]
-    ms = [x / 1e6 for x in ns]
-    percall = [x / n_calls for x in ns]
-    med_ms = statistics.median(ms)
-    med_percall = statistics.median(percall)
-    if label == "unobserved":
-        baseline_percall_median = med_percall
-    rows.append((label, ms, med_ms, percall, med_percall))
-
-print(f"{'condition':<26} {'median ms':>10} {'min..max ms':>18} {'median ns/call':>15} {'overhead ns/call':>18}")
-for label, ms, med_ms, percall, med_percall in rows:
-    overhead = med_percall - baseline_percall_median
-    print(f"{label:<26} {med_ms:>10.1f} {min(ms):>7.1f}..{max(ms):<8.1f} {med_percall:>15.1f} {overhead:>18.1f}")
-PY
+python3 -I scripts/lane-bench-overhead-oracle-2.py "$WORK" "$N_CALLS" "$KERNEL" "$CPU"
 
 echo "=== bench-overhead: DONE ==="

@@ -9128,30 +9128,59 @@ fn build_offline_contracts_hold() {
 /// is fully extracted (zero heredocs).
 const SCRIPTS_TREE_HEREDOC_CAP: usize = 540;
 
+/// Recursively collect `*.{extension}` files under `dir`. `fixtures/` and
+/// `__pycache__/` subtrees are skipped so the walk stays aligned with the
+/// admitted tree ([`script_dirs`] excludes `fixtures/`); callers iterate
+/// [`script_dirs`] and dedupe, so overlaps between the roots are harmless
+/// and a file nested under a future subdirectory is covered, never missed.
+fn collect_scripts_files(
+    dir: &std::path::Path,
+    extension: &str,
+    out: &mut Vec<std::path::PathBuf>,
+) {
+    for entry in fs::read_dir(dir).expect("walk scripts") {
+        let path = entry.expect("script entry").path();
+        if path.is_dir() {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            if name == "fixtures" || name == "__pycache__" {
+                continue;
+            }
+            collect_scripts_files(&path, extension, out);
+        } else if path.extension().is_some_and(|found| found == extension) {
+            out.push(path);
+        }
+    }
+}
+
 /// Stage every admitted `scripts/**/*.py` under `stage` for compilation. The
 /// walk reuses [`script_dirs`], which fails on any new scripts subdirectory,
-/// so coverage cannot silently drift. `py_compile` writes `__pycache__` next
-/// to its inputs (`PYTHONPYCACHEPREFIX` does not redirect it — verified), so
-/// the check compiles copies, never the tree; the directory is folded into
-/// the copy name so a failure still names its source
+/// and recurses below each admitted directory, so coverage cannot silently
+/// drift. `py_compile` writes `__pycache__` next to its inputs
+/// (`PYTHONPYCACHEPREFIX` does not redirect it — verified), so the check
+/// compiles copies, never the tree; the directory is folded into the copy
+/// name so a failure still names its source
 /// (`matrix__knative-server.py`).
 fn stage_scripts_python(stage: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut staged = Vec::new();
+    let mut found = Vec::new();
     for dir in script_dirs() {
-        for entry in fs::read_dir(&dir).expect("walk scripts") {
-            let path = entry.expect("script entry").path();
-            if path.extension().is_some_and(|extension| extension == "py") {
-                let relative = path
-                    .strip_prefix("scripts")
-                    .expect("script under scripts/")
-                    .to_str()
-                    .expect("utf-8 script path")
-                    .replace('/', "__");
-                let copy = stage.join(relative);
-                fs::copy(&path, &copy).expect("stage python file");
-                staged.push(copy);
-            }
-        }
+        collect_scripts_files(std::path::Path::new(&dir), "py", &mut found);
+    }
+    found.sort();
+    found.dedup();
+    let mut staged = Vec::new();
+    for path in &found {
+        let relative = path
+            .strip_prefix("scripts")
+            .expect("script under scripts/")
+            .to_str()
+            .expect("utf-8 script path")
+            .replace('/', "__");
+        let copy = stage.join(relative);
+        fs::copy(path, &copy).expect("stage python file");
+        staged.push(copy);
     }
     staged.sort();
     staged
@@ -9241,6 +9270,18 @@ fn scripts_tree_shape_python_files_compile() {
         "the failure names its file: {failure}"
     );
 
+    // Recursion proof: a nested file must be collected, never missed.
+    let nested_dir = fixture.path().join("sub");
+    fs::create_dir(&nested_dir).expect("create nested fixture dir");
+    let nested = nested_dir.join("nested.py");
+    fs::write(&nested, "VALUE = 1\n").expect("write nested fixture");
+    let mut collected = Vec::new();
+    collect_scripts_files(fixture.path(), "py", &mut collected);
+    assert!(
+        collected.contains(&nested),
+        "the walk recurses into subdirectories"
+    );
+
     // The real tree: every admitted scripts/**/*.py compiles.
     let stage = tempfile::tempdir().expect("stage scripts python");
     let files = stage_scripts_python(stage.path());
@@ -9281,13 +9322,26 @@ fn scripts_tree_shape_heredocs_capped() {
     fs::write(&exact, body).expect("write boundary fixture");
     assert_heredocs_capped(&exact, SCRIPTS_TREE_HEREDOC_CAP).unwrap();
 
+    // Recursion proof: a nested shell file must be collected, never missed.
+    let nested_dir = fixture.path().join("sub");
+    fs::create_dir(&nested_dir).expect("create nested fixture dir");
+    let nested = nested_dir.join("nested.sh");
+    fs::write(&nested, "true\n").expect("write nested fixture");
+    let mut collected = Vec::new();
+    collect_scripts_files(fixture.path(), "sh", &mut collected);
+    assert!(
+        collected.contains(&nested),
+        "the walk recurses into subdirectories"
+    );
+
     // The real tree: no shell heredoc exceeds the cap.
+    let mut found = Vec::new();
     for dir in script_dirs() {
-        for entry in fs::read_dir(&dir).expect("walk scripts") {
-            let path = entry.expect("script entry").path();
-            if path.extension().is_some_and(|extension| extension == "sh") {
-                assert_heredocs_capped(&path, SCRIPTS_TREE_HEREDOC_CAP).unwrap();
-            }
-        }
+        collect_scripts_files(std::path::Path::new(&dir), "sh", &mut found);
+    }
+    found.sort();
+    found.dedup();
+    for path in &found {
+        assert_heredocs_capped(path, SCRIPTS_TREE_HEREDOC_CAP).unwrap();
     }
 }

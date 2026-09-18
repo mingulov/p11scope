@@ -8,16 +8,21 @@ logic breaks.
 
 Log pointers in `$TMPDIR` (`/var/tmp/p11scope-ws-tmp/`, uncommitted
 scratch from the usability, refactor-queue, and shebang-gate plans) are
-named per file so a future triager can match signatures; the committed
+named per file so a future triager can match signatures; the
 profiling-fixes Task 2 gate logs
-(`.superpowers/sdd/2026-09-17-profiling-fixes/gates-task2/`) carry entries
-5–6 plus fresh isolation evidence for entries 1–3.
+(`.superpowers/sdd/2026-09-17-profiling-fixes/gates-task2/`, gitignored
+worktree scratch — `/.superpowers/` is gitignored, so like the `$TMPDIR`
+logs these will not survive worktree retirement) are likewise named per
+file and carry entries 5–6 plus fresh isolation evidence for entries
+1–3. The Task 4 suite logs in the same directory (likewise gitignored
+worktree scratch) carry entry 7. Match on the recorded signatures and
+durable facts, not the log paths.
 
 ## Triage protocol (every entry)
 
 1. **Isolate** — re-run the single test alone:
    `TMPDIR=/var/tmp/p11scope-ws-tmp cargo +1.88 test --locked --offline
-   --test artifact_contracts -- <name>` (`--lib` for entry 5). Green ⇒
+   --test artifact_contracts -- <name>` (`--lib` for entries 5 and 7). Green ⇒
    load flake; record the log.
 2. **Pristine-base compare** — if isolation is red or ambiguous, run the
    same filter on a pristine `git archive HEAD` tree (+ gitignored
@@ -95,7 +100,8 @@ profiling-fixes Task 2 gate logs
 - **Signature:** 100 ms timing budget exceeded under parallel load:
   `assertion failed: Instant::now() < reap_deadline +
   Duration::from_millis(100)` at `src/run.rs:4455`.
-- **Evidence (committed):**
+- **Evidence (worktree scratch — gitignored, will not survive worktree
+  retirement; durable facts recorded here):**
   `gates-task2/full-suite.log` (Task 2 run 1 only),
   `gates-task2/isolate-handoff.log` (PASS, 0.01 s),
   `gates-task2/base-handoff.log` (pristine-base PASS).
@@ -107,7 +113,24 @@ profiling-fixes Task 2 gate logs
   `FileNotFoundError: .../p11scope-release-seal-*/case/sealed-environment`,
   `AssertionError: '' != 'sudo\n'`, plus cargo-home-closure and
   sysroot-closure subtests in the same run.
-- **Evidence (committed):**
+- **Evidence (worktree scratch — gitignored, will not survive worktree
+  retirement; durable facts recorded here):**
   `gates-task2/full-suite-retry.log` (Task 2 run 2 only),
   `gates-task2/isolate-release-seal.log` (PASS, 55 s),
   `gates-task2/base-release-seal.log` (pristine-base PASS).
+
+## 7. `run::tests::signal_settlement_observes_second_sigint_during_fallback_term_grace` (lib; new in Task 4)
+
+- **Signature:** signal-timing — SIGINT/SIGTERM settlement across
+  threads with a deadline-bounded wait: `unwrap()` on `Err(Deadline)`
+  at `src/run.rs:5482`. Same timing-signature family as entry 5.
+- **Evidence (worktree scratch — gitignored, will not survive worktree
+  retirement; durable facts recorded here):**
+  `task-4-suite-run2.log` (Task 4 run 2 only: FAILED at line 1063,
+  panic detail lines 1074–1084, `test result: FAILED. 1054 passed; 1
+  failed`; fail-fast stop after lib), `task-4-isolate-signal.log`
+  (PASS in isolation, 0.12 s), `task-4-suite-run1.log` (line 937 ok)
+  + `task-4-suite-run2-retry.log` (line 936 ok). No pristine-base
+  compare: the branch touches zero `src/` files, so no mechanism
+  connects it to this lib signal-timing test — isolation-green + no
+  mechanism + green on both complete runs closes the triage.

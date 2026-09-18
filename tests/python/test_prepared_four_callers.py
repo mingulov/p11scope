@@ -73,6 +73,9 @@ class FinalizerFixture:
                 "tests/fixtures/oracle-lifecycle/scenarios.sh",
                 "tests/fixtures/oracle-lifecycle/sudo",
             ]
+        if caller == CALLERS[0]:
+            # The sourced task4_finalize section shells out to this oracle.
+            inputs += ["scripts/lane-induced-gaps-oracle-5.py"]
         for relative in inputs:
             destination = self.root / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -346,6 +349,9 @@ class PreparedFourCallersTests(unittest.TestCase):
                 )
                 relative_caller = caller.relative_to(REPOSITORY).as_posix()
                 extra = ()
+                if caller == CALLERS[0]:
+                    # The sourced task4_finalize section shells out to this oracle.
+                    extra = ("scripts/lane-induced-gaps-oracle-5.py",)
                 if caller == CALLERS[1]:
                     extra = (
                         "scripts/check-subset-oracle.py", "scripts/matrix/oracle-workload.sh",

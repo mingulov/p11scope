@@ -19,13 +19,13 @@ Inputs: Task 1 re-measured matrix (`docs/notes/phase4-privileges.md`,
   (task-2-report.md §H2). Never quote without the bug.
 - H3 paranoid interaction: **REFUTED** — paranoid 2, 1, 0, -1 all leave
   bpf+perfmon at 0/136 (task-2-report.md §H3).
-- H4 helper seccomp posture: **PROVEN on tested paths only (28/37 lane
+- H4 helper seccomp posture: **PROVEN on tested paths only (29/37 lane
   scripts `--help`-parity only)** — 61-syscall allowlist, full success-path
-  parity for 9 helpers; not full-function proof for the other 28
+  parity for 9 helpers; not full-function proof for the other 29
   (task-2-report.md §H4). Never quote a bare PROVEN.
 - H5 root-only lanes: **PROVEN (classification)** — 21/21 lanes run: 5 pass
-  with host root, 4 pass without it, 3 blocked by script bugs, 4 failing on
-  drift, 4 env-blocked at `-o` write, 1 env-unrunnable; needs partly
+  with host root, 4 pass without it, 3 blocked by script bugs, 3 version-drift +
+  1 unpriv-by-design (lane16), 4 env-blocked at `-o` write, 1 env-unrunnable; needs partly
   inferred from lane privilege gates + Task 1 unpriv baselines
   (task-2-report.md §H5). Never quote without the inference scope.
 - Task 1 caveats carried forward: kernel moved 7.0.0-28 → 7.0.0-31 and kind
@@ -113,12 +113,12 @@ Fedora 6.19 five-cap set may still be minimal there (task-2-report.md:397-400).
   full success-path parity (exit 0 + byte-identical output) for 9 helpers
   (discover + tier oracle on real args, 7 oracles on `--self-test`);
   socket→EPERM negative control proves the filter live
-  (task-2-report.md:186-231). Qualification restated: the other 28 lane
+  (task-2-report.md:186-231). Qualification restated: the other 29 lane
   scripts have `--help`-parity only — not full-function proof.
-- What could regress: untested paths in those 28 oracles (full input
+- What could regress: untested paths in those 29 oracles (full input
   matrices) could break under the filter; the v1→v2 tempfile miss
   (`getpid`/`unlink`/`mkdir`/…) is the shape of that risk.
-- Suggested verification: extend success-path coverage to the remaining 28
+- Suggested verification: extend success-path coverage to the remaining 29
   oracles' full input matrices (open work per task-2-report.md:225-227);
   enforce only when every helper has a real-args byte-identical pair.
   (Incidental: discover itself already calls `capset`/`setresuid` — it
@@ -138,7 +138,7 @@ Fedora 6.19 five-cap set may still be minimal there (task-2-report.md:397-400).
 - Measured proof: H5 lane table with verbatim failures per lane
   (task-2-report.md:249-271); counts (task-2-report.md:273-283). All three
   script bugs fail identically with or without root.
-- What could regress: laneEevidence goldens that captured the buggy
+- What could regress: lane evidence goldens that captured the buggy
   behavior (e.g. tier expectations) need updating alongside; the `-o`
   trust check itself (`src/output.rs:401`, `mode & 0o022 && !sticky`) is
   working as designed — changing the checkout, not the check, is the fix.

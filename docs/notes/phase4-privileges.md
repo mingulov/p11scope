@@ -152,3 +152,62 @@ capability-vs-full-root distinction measured above does not depend on
 (Part 2's first table) *is* automated with real numeric assertions inside
 `verify-fork-scope.sh`, since it needs no extra infrastructure beyond
 what that script already builds.
+
+## Re-measurement 2026-09-18 at `main@08756b9` (branch `fix/privmin-research@873d5c3`)
+
+Host: Ubuntu 24.04.4, kernel **7.0.0-31-generic** (historical rows:
+7.0.0-28-generic — kernel moved, the rest did not),
+`kernel.perf_event_paranoid = 4`, Yama `ptrace_scope = 1` (both unchanged),
+lockdown `integrity`, BTF present (`/sys/kernel/btf/vmlinux`),
+tracefs `/sys/kernel/tracing` mode 0700 root:root — unreadable unprivileged
+(`events/sched/sched_process_{exec,exit}/id` stat reads fail with
+`Permission denied`). Observer capabilities: none (`CapEff: 0`,
+`capsh --print: Current: =`).
+
+Protocol: `scripts/matrix/verify-fork-scope.sh` (usage:
+`verify-fork-scope.sh --self-test | ABSENT_EVIDENCE_ROOT` — a bare
+`--help` is rejected with `invalid Task 4 evidence root`, exit 77) and
+`scripts/verify-capability-tier.sh` (usage:
+`verify-capability-tier.sh [--self-test]`). Both `--self-test`s pass
+unprivileged (`capability-tier self-test: OK`,
+`verify-fork-scope Task 4 receipt self-test: OK`). The full scripts gate on
+`sudo -n true` plus a `sudo capsh` ladder; no privileged run was approved
+this session (AGENTS.md gate + standing no-sudo session constraint), so
+every privileged cell below is UNRUN with its exact command. (`sudo -n
+true` itself exits 0 on this host; the blocker is approval, not
+availability.) Binary: release workspace build at 873d5c3, whose product
+code is identical to 08756b9 (`git diff 08756b9 HEAD` touches only the
+research plan doc).
+
+### Host (`--pid`, same-uid target) — re-measured 2026-09-18
+
+Target: `spike/harness.c` build with SoftHSM2 mapped, same-uid
+non-descendant, go-file gated; mapping confirmed in `/proc/<pid>/maps`
+before each cell. Failing attach cells produce no document, so
+attached/total, completeness, and skips are n/a (failure precedes evidence).
+
+| Privilege | Result | Actual error text / evidence |
+| --- | --- | --- |
+| unprivileged, manifest-free | **Measured FAIL**, exit 1 | Scan half: `p11scope: discovery skipped /proc/<pid>/mem — Permission denied (os error 13)` + `p11scope: the memory scan could not read the target (ptrace); any --manifest offsets are attached uncorroborated`. Attach half: `p11scope: starting attach session: hint: ...: loading BPF object with required task storage: map error: failed to create map \`DESCRIPTORS\`: failed to create map \`DESCRIPTORS\`: Operation not permitted (os error 1)`. Command: `target/release/p11scope profile --pid <pid> --mode metrics --duration 1`. |
+| unprivileged, `--manifest` | **Measured FAIL**, exit 1 | Discovery: `1 module(s), 68 attach slot(s), scan 0ms, conflicts 0, uncorroborated 1` (scan still EACCES, same two ptrace lines as above); attach fails at `failed to create map \`COUNTERS\`: failed to create map \`COUNTERS\`: Operation not permitted (os error 1)`. Manifest via `target/release/p11scope-discover --module /usr/lib/softhsm/libsofthsm2.so -o manifest.json` (exit 0). Note: `-o` requires a 0700-private output dir — a writable ancestor is refused (`output directory ancestor ... is untrusted: writable`). |
+| unprivileged `doctor --pid` | **Measured**, exit 1, tier **T0 offline (target assessed)** | `BPF map create FAIL ... failed to create map \`PID_FILTER\`: ... Operation not permitted (os error 1)`; `/proc/<pid>/mem FAIL EACCES`; `target readability FAIL mem unavailable`; `host program preflight FAIL ... failed to create map \`STATS\` ...`. Oracle `python3 -I scripts/lane-capability-tier-oracle.py T0 assessed 1 1 <doctor-doc>` accepts (`assessed: T0 offline`). Bare `doctor`: exit 1, T0 offline (target unassessed). |
+| unprivileged live-discovery signal | **Measured via doctor** | `live export reads: warn unavailable`; `loader timing (initial_set): warn unproven`; `loader timing (dlopen): warn unproven`; `lifecycle preflight: warn unavailable`; `run initial-set capture: warn none`. |
+| unprivileged owned `run` | **Measured FAIL**, exit 1 | `p11scope: discovery: 0 module(s), 0 attach slot(s), scan 3ms, conflicts 0, uncorroborated 0`, then `... loading BPF object with required task storage: map error: failed to create map \`MECH_SHAPE\`: failed to create map \`MECH_SHAPE\`: Operation not permitted (os error 1)`. Command: `target/release/p11scope run --mode metrics --duration 1 -o <private-dir>/run-out.json -- /bin/true`. |
+| `CAP_BPF` + `CAP_PERFMON`, manifest | UNRUN | Exact command (from `verify-fork-scope.sh measure_privileges`): `sudo capsh --caps="cap_bpf,cap_perfmon+eip cap_setpcap,cap_setuid,cap_setgid+ep" --keep=1 --user="$(whoami)" --addamb=cap_bpf --addamb=cap_perfmon -- -c "'<bin>' profile --manifest <m.json> --pid <pid> --mode metrics --duration 1 -o '<out>'"`. UNRUN: needs sudo/capsh-as-privileged; not approved (AGENTS.md gate + no-sudo session constraint). |
+| `CAP_SYS_ADMIN`, manifest | UNRUN | `sudo capsh --caps="cap_sys_admin+eip cap_setpcap,cap_setuid,cap_setgid+ep" --keep=1 --user="$(whoami)" --addamb=cap_sys_admin -- -c "'<bin>' profile --manifest <m.json> --pid <pid> --mode metrics --duration 1 -o '<out>'"`. Same blocker. |
+| `CAP_SYS_ADMIN`, scan | UNRUN | Same ladder as above, manifest-free (`--manifest` omitted). Same blocker. |
+| `CAP_SYS_ADMIN` + `CAP_SYS_PTRACE`, scan | UNRUN | `sudo capsh --caps="cap_sys_admin,cap_sys_ptrace+eip cap_setpcap,cap_setuid,cap_setgid+ep" --keep=1 --user="$(whoami)" --addamb=cap_sys_admin --addamb=cap_sys_ptrace -- -c "'<bin>' profile --pid <pid> --mode metrics --duration 1 -o '<out>'"`. Same blocker. |
+| Part 1 fork-scope (`--cgroup`) | UNRUN | Needs `sudo systemd-run --scope --unit=<unit> -- sh -c "read ...; exec ... fork-harness ..."` plus `sudo <bin> profile --manifest <m.json> --cgroup /sys/fs/cgroup/system.slice/<unit>.scope --mode metrics --duration 20 -o <out>` (`verify-fork-scope.sh` Part 1). Same blocker. |
+| Tier rows (`doctor` under caps) | UNRUN | Full `scripts/verify-capability-tier.sh` gates on `sudo -n true`, then per row `sudo capsh --caps="<row-caps>" --keep=1 --user="$(id -un)" <row-ambient> -- -c "{ id/capsh metadata...; } exec '<bin>' doctor --pid '<pid>'"` with sysadmin row (`cap_sys_admin+eip cap_setpcap,cap_setuid,cap_setgid+ep`, `--addamb=cap_sys_admin`, expects T1) and bpf-perfmon row (`cap_bpf,cap_perfmon+eip cap_setpcap,cap_setuid,cap_setgid+ep`, `--addamb=cap_bpf --addamb=cap_perfmon`, expects T0). Same blocker; `--self-test` passes (see above). |
+
+### Docker / kind — 2026-09-18: UNRUN (recon only)
+
+Recon: `scripts/matrix/verify-docker.sh` and `scripts/matrix/verify-kind-pod.sh`
+present; docker 29.8.1 reachable; `kind version 0.33.0` installed (historical
+row measured kind v0.29.0 / Kubernetes v1.33.1 — toolchain moved). All five
+docker cells and the kind re-measurement need a live container/pod **plus**
+the `sudo capsh` ladder (`CAP_SYS_PTRACE` / `CAP_SYS_ADMIN` shapes per the
+historical table), so all are UNRUN this session: not approved (AGENTS.md
+gate + no-sudo session constraint). The live-discovery capability output
+(above, :131) stays UNRUN for the same reason; the only live-discovery
+signal measured this session is the host unprivileged doctor row above.

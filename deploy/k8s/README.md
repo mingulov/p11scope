@@ -59,6 +59,9 @@ through `/proc/<pid>/root`, exactly like `scripts/attach-pod.sh`.
 
 ## Manual flow
 
+Run the commands below from the parent of the checkout, so the
+`p11scope/...` paths resolve (from the repo root itself they do not exist).
+
 ```sh
 # images (needs target/release/p11scope)
 docker build -f p11scope/deploy/Dockerfile.observer -t p11scope-observer:1 p11scope

@@ -229,10 +229,10 @@ fn b7_run_refuses_without_capture_lane() {
             "{}",
             refused.stderr
         );
-        // F7: the attach hint lists five possible causes on one line but
-        // never points at `p11scope doctor`, which knows the actual cause.
+        // F7 fixed (Task 3): the attach hint keeps its cause list and now
+        // points at `p11scope doctor`, which knows the actual cause.
         assert!(
-            !refused.stderr.contains("p11scope doctor"),
+            refused.stderr.contains("p11scope doctor"),
             "{}",
             refused.stderr
         );
@@ -544,6 +544,32 @@ fn t3_f6_typo_and_exited_pids_read_differently() {
         normalize(&missing.stderr, "99999999"),
         normalize(&raced.stderr, &dead),
     );
+}
+
+#[test]
+fn t3_f7_attach_refusal_points_at_doctor() {
+    // F7 fixed (Task 3): the attach hint keeps its cause list and doc
+    // pointer, and now names `p11scope doctor` as the command that knows
+    // which cause applies. Exit 1 unchanged.
+    if !capture_available() {
+        let refused = run(&["run", "--", "/bin/true"]);
+        assert_eq!(refused.code, Some(1));
+        assert!(
+            refused.stderr.contains("starting attach session"),
+            "{}",
+            refused.stderr
+        );
+        assert!(
+            refused.stderr.contains("p11scope doctor"),
+            "{}",
+            refused.stderr
+        );
+        assert!(
+            refused.stderr.contains("phase5-unsupported.md"),
+            "{}",
+            refused.stderr
+        );
+    }
 }
 
 #[test]

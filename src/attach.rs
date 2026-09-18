@@ -1601,7 +1601,8 @@ pub(crate) const UNSUPPORTED_ENV_HINT: &str = "hint: this usually means the envi
 attach BPF programs at all — missing CAP_BPF and/or CAP_SYS_ADMIN (or root), a kernel \
 lockdown mode, a kernel below the supported floor (>= 5.15), missing BTF \
 (/sys/kernel/btf/vmlinux), or a restrictive kernel.perf_event_paranoid sysctl. See \
-docs/notes/phase5-unsupported.md for what each looks like when observed.";
+docs/notes/phase5-unsupported.md for what each looks like when observed. Run \
+`p11scope doctor` to see which cause applies on this host.";
 
 fn unsupported_environment_context(error: anyhow::Error) -> anyhow::Error {
     error.context(UNSUPPORTED_ENV_HINT)

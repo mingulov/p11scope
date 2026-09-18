@@ -14,10 +14,10 @@ import sys
 
 SCHEMA = "p11scope-live-discovery-object/v1"
 VARIANTS = ("default", "unsafe", "small-ring", "small-discovery-ring")
-INITIALIZER_BEGIN = "// TASK5_DISCOVERY_INITIALIZER_BEGIN"
-INITIALIZER_END = "// TASK5_DISCOVERY_INITIALIZER_END"
-PAUSE_BEGIN = "// TASK5_PAUSE_WRITER_BEGIN"
-PAUSE_END = "// TASK5_PAUSE_WRITER_END"
+INITIALIZER_BEGIN = "// DISCOVERY_INITIALIZER_BEGIN"
+INITIALIZER_END = "// DISCOVERY_INITIALIZER_END"
+PAUSE_BEGIN = "// PAUSE_WRITER_BEGIN"
+PAUSE_END = "// PAUSE_WRITER_END"
 STORE = re.compile(r"core::ptr::write_volatile\(words\.add\((\d+)\), 0u64\);")
 OBJECT_STORE = re.compile(
     r"\*\(u64 \*\)\(r(?P<base>\d+) \+ 0x(?P<offset>[0-9a-f]+)\) = r(?P<zero>\d+)"

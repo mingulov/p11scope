@@ -46,10 +46,10 @@ finalizer)
         mark cleanup-finished
         return "${CLEANUP_RC-0}"
     }
-    task4_terminal_checks() { mark terminal-checks; return 0; }
-    task4_validate_receipt() { mark validate; return 0; }
-    task4_publish_status() { mark "publish:$1"; return "${PUBLISH_RC-0}"; }
-    task4_install_traps
+    receipt_terminal_checks() { mark terminal-checks; return 0; }
+    receipt_validate_receipt() { mark validate; return 0; }
+    receipt_publish_status() { mark "publish:$1"; return "${PUBLISH_RC-0}"; }
+    receipt_install_traps
     case $action in
     success) : ;;
     failure) false ;;
@@ -60,11 +60,11 @@ finalizer)
     esac
     ;;
 publication)
-    TASK4_ROOT=$1
-    TASK4_FACTS=$TASK4_ROOT/facts.log
-    : > "$TASK4_FACTS"
-    mkdir "$TASK4_ROOT/.status.pending"
-    if task4_publish_status 0; then exit 0; else exit $?; fi
+    RECEIPT_ROOT=$1
+    RECEIPT_FACTS=$RECEIPT_ROOT/facts.log
+    : > "$RECEIPT_FACTS"
+    mkdir "$RECEIPT_ROOT/.status.pending"
+    if receipt_publish_status 0; then exit 0; else exit $?; fi
     ;;
 cleanup)
     events=$1
@@ -190,7 +190,7 @@ authentication)
     oracle_authenticate_scope
     ;;
 scope-facts)
-    TASK4_FACTS=$1
+    RECEIPT_FACTS=$1
     CGROUP_PATH=/sys/fs/cgroup/system.slice/p11scope-oracle.scope
     ORACLE_CGROUP_DEVICE=42
     ORACLE_CGROUP_INODE=99
@@ -204,11 +204,11 @@ scope-facts)
 reclaim)
     WORK=$1
     PKCS11_CHECK_DIR=$2
-    TASK4_WORK_ID=$(stat -Lc %d:%i "$WORK")
+    RECEIPT_WORK_ID=$(stat -Lc %d:%i "$WORK")
     PKCS11_CHECK_DIR_ID=$(stat -Lc %d:%i "$PKCS11_CHECK_DIR")
-    TASK4_RECEIPT_STARTTIME=$(process_starttime $$)
-    TASK4_RECEIPT_UID=$(id -u)
-    TASK4_RECEIPT_GID=$(id -g)
+    RECEIPT_RECEIPT_STARTTIME=$(process_starttime $$)
+    RECEIPT_RECEIPT_UID=$(id -u)
+    RECEIPT_RECEIPT_GID=$(id -g)
     STATE_FILE_ID=
     STATE_POLICY_FILE_ID=
     ORACLE_ARTIFACTS_RECLAIMED=0

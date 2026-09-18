@@ -12,11 +12,9 @@ from unittest.mock import patch
 class ProcessSessionSnapshotTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        # Execute the production heredoc; do not duplicate its snapshot logic.
-        shell = (Path(__file__).resolve().parents[2] / "scripts/lib.sh").read_text()
-        function = shell.split("snapshot_user_process_session() {", 1)[1]
-        source = function.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
-        cls.source = compile(source, "scripts/lib.sh:snapshot", "exec")
+        # Execute the production oracle; do not duplicate its snapshot logic.
+        source = (Path(__file__).resolve().parents[2] / "scripts/lane-lib-oracle-5.py").read_text()
+        cls.source = compile(source, "scripts/lane-lib-oracle-5:oracle", "exec")
 
     def snapshot(self, failure_read=0, error=None):
         fields = ["S", "1", "41", "41"] + ["0"] * 15 + ["100"]

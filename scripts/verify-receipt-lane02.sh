@@ -35,35 +35,17 @@ prepare_evidence_root() {
     [ "$per_input" = "$per_parent/$per_leaf" ] || return 1
     per_worktree=$(pwd -P)
     case $per_input in "$per_worktree"|"$per_worktree"/*) return 1 ;; esac
-    python3 - "$per_parent" <<'PY' || return 1
-import os, stat, sys
-s = os.stat(sys.argv[1])
-if s.st_uid != os.getuid() or stat.S_IMODE(s.st_mode) & 0o077:
-    raise SystemExit("evidence parent must be caller-owned and private")
-PY
+    python3 -I scripts/lane-receipt-lane02-oracle-1.py "$per_parent" || return 1
     [ ! -e "$per_input" ] && [ ! -L "$per_input" ] || return 1
     umask 077
     mkdir -m 700 "$per_input" || return 1
     ROOT=$per_input
-    ROOT_ID=$(python3 - "$ROOT" <<'PY'
-import os, stat, sys
-s = os.lstat(sys.argv[1])
-if not stat.S_ISDIR(s.st_mode) or s.st_uid != os.getuid() or stat.S_IMODE(s.st_mode) != 0o700:
-    raise SystemExit("evidence root must be a caller-owned mode-0700 directory")
-print(f"{s.st_dev}:{s.st_ino}")
-PY
+    ROOT_ID=$(python3 -I scripts/lane-receipt-lane02-oracle-2.py "$ROOT"
     ) || return 1
 }
 
 validate_root() {
-    python3 - "$ROOT" "$ROOT_ID" <<'PY'
-import os, stat, sys
-s = os.lstat(sys.argv[1])
-if (not stat.S_ISDIR(s.st_mode) or s.st_uid != os.getuid()
-        or stat.S_IMODE(s.st_mode) != 0o700
-        or f"{s.st_dev}:{s.st_ino}" != sys.argv[2]):
-    raise SystemExit("evidence root identity changed")
-PY
+    python3 -I scripts/lane-receipt-lane02-oracle-3.py "$ROOT" "$ROOT_ID"
 }
 
 validate_terminal_tree() {
@@ -133,13 +115,7 @@ observer_alive() {
 }
 
 count_byte_token() {
-    python3 - "$1" "$2" <<'PY'
-import sys
-if len(sys.argv) != 3 or not sys.argv[2]:
-    raise SystemExit("count_byte_token: expected path and non-empty token")
-with open(sys.argv[1], "rb") as stream:
-    print(stream.read().count(sys.argv[2].encode()))
-PY
+    python3 -I scripts/lane-receipt-lane02-oracle-4.py "$1" "$2"
 }
 
 # The child can emit the marker after iteration N drained discovery but before
@@ -158,28 +134,7 @@ wait_mapped_and_drained() {
         wmd_rejected=HARNESS_PROVIDER_INITIAL_SET
     fi
     while :; do
-        wmd_state=$(python3 - "$wmd_log" "$wmd_expected" "$wmd_rejected" <<'PY'
-import sys
-path, expected, rejected = sys.argv[1:]
-marker = b"HARNESS_PROVIDER_MAPPED"
-expected = expected.encode()
-rejected = rejected.encode()
-with open(sys.argv[1], "rb") as stream:
-    snapshot = stream.read()
-marker_count = snapshot.count(marker)
-expected_count = snapshot.count(expected)
-rejected_count = snapshot.count(rejected)
-if marker_count > 1 or expected_count > 1 or rejected_count:
-    print("invalid 0")
-elif marker_count == 1 and expected_count == 1:
-    offset = snapshot.index(marker) + len(marker)
-    lines = snapshot[offset:].splitlines(keepends=True)
-    frames = sum(line.endswith(b"\n") and b"p11scope" in line
-                 and b"privacy=aggregate-only" in line for line in lines)
-    print(("ready" if frames >= 2 else "pending"), frames)
-else:
-    print("pending 0")
-PY
+        wmd_state=$(python3 -I scripts/lane-receipt-lane02-oracle-5.py "$wmd_log" "$wmd_expected" "$wmd_rejected"
         ) || return 1
         wmd_status=${wmd_state%% *}
         wmd_frames=${wmd_state#* }
@@ -426,7 +381,7 @@ C
     # oracle pass green without the refusal ever being reached. Assert the
     # refusal itself. Known ceiling: on a host where every prerequisite IS
     # present this cannot see the loops swapped back, because the refusal is
-    # reached either way. `task4_receipt_drivers_execute_behavioral_self_tests`
+    # reached either way. `receipt_receipt_drivers_execute_behavioral_self_tests`
     # covers that case: it runs this script under a PATH that excludes
     # ~/.cargo/bin, so the swapped order surfaces as
     # "refusal not reached; early run said: rustc required".
@@ -453,7 +408,7 @@ C
         exit 1
     fi
     python3 scripts/check-capture-evidence.py --self-test >/dev/null
-    echo "verify-task4-lane02 self-test: OK"
+    echo "verify-receipt-lane02 self-test: OK"
 }
 
 [ "$#" -eq 1 ] || usage
@@ -497,74 +452,15 @@ durable() {
 }
 
 harness_absent() {
-    sudo -n python3 - "$HARNESS" "$HARNESS_INITIAL" <<'PY'
-import os, sys
-wanted = {os.fsencode(path) for path in sys.argv[1:]}
-for name in os.listdir('/proc'):
-    if not name.isdigit():
-        continue
-    try:
-        argv = open(f'/proc/{name}/cmdline', 'rb').read().split(b'\0')
-        exe = os.path.realpath(f'/proc/{name}/exe')
-    except OSError:
-        continue
-    if argv and argv[0] in wanted and os.fsencode(exe) == argv[0]:
-        raise SystemExit(f"owned harness still running as pid {name}")
-PY
+    sudo -n python3 -I scripts/lane-receipt-lane02-oracle-6.py "$HARNESS" "$HARNESS_INITIAL"
 }
 
 terminate_owned_harness() {
-    sudo -n python3 - "$HARNESS" "$HARNESS_INITIAL" <<'PY'
-import os, select, signal, sys
-wanted = {os.fsencode(path) for path in sys.argv[1:]}
-
-def owned():
-    result = []
-    for name in os.listdir('/proc'):
-        if not name.isdigit():
-            continue
-        try:
-            fd = os.pidfd_open(int(name))
-            argv = open(f'/proc/{name}/cmdline', 'rb').read().split(b'\0')
-            exe = os.path.realpath(f'/proc/{name}/exe')
-        except OSError:
-            continue
-        if argv and argv[0] in wanted and os.fsencode(exe) == argv[0]:
-            result.append((int(name), fd))
-    return result
-
-targets = owned()
-for pid, fd in targets:
-    poller = select.poll(); poller.register(fd, select.POLLIN)
-    try:
-        signal.pidfd_send_signal(fd, signal.SIGTERM, None, 0)
-    except ProcessLookupError:
-        continue
-    if not poller.poll(5000):
-        signal.pidfd_send_signal(fd, signal.SIGKILL, None, 0)
-        if not poller.poll(5000):
-            raise SystemExit(f"owned harness {pid} did not exit")
-if owned():
-    raise SystemExit("owned harness remains after termination")
-print(len(targets))
-PY
+    sudo -n python3 -I scripts/lane-receipt-lane02-oracle-7.py "$HARNESS" "$HARNESS_INITIAL"
 }
 
 wait_root_exit() {
-    sudo -n python3 - "$1" "$2" "$3" <<'PY'
-import os, select, sys
-pid, expected, timeout = map(int, sys.argv[1:])
-try:
-    fd = os.pidfd_open(pid)
-    raw = open(f"/proc/{pid}/stat", "rb").read().rsplit(b") ", 1)[1].split()
-except (FileNotFoundError, ProcessLookupError):
-    raise SystemExit(0)
-if len(raw) < 20 or int(raw[19]) != expected:
-    raise SystemExit("root observer identity changed")
-poller = select.poll(); poller.register(fd, select.POLLIN)
-if not poller.poll(timeout * 1000):
-    raise SystemExit(1)
-PY
+    sudo -n python3 -I scripts/lane-receipt-lane02-oracle-8.py "$1" "$2" "$3"
 }
 
 stop_observer() {
@@ -585,13 +481,7 @@ stop_observer() {
 }
 
 row_identity() {
-    python3 - "$1" <<'PY'
-import os, stat, sys
-s = os.lstat(sys.argv[1])
-if not stat.S_ISDIR(s.st_mode) or s.st_uid != os.getuid() or stat.S_IMODE(s.st_mode) != 0o700:
-    raise SystemExit("row directory is not caller-owned mode 0700")
-print(f"{s.st_dev}:{s.st_ino}")
-PY
+    python3 -I scripts/lane-receipt-lane02-oracle-9.py "$1"
 }
 
 validate_row() {
@@ -599,47 +489,15 @@ validate_row() {
 }
 
 reclaim_verified_output() {
-    sudo -n python3 - "$1" "$2" "$3" "$(id -u)" "$(id -g)" <<'PY'
-import os, stat, sys
-directory, identity, name, uid, gid = sys.argv[1:]
-fd_dir = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-s = os.fstat(fd_dir)
-if f"{s.st_dev}:{s.st_ino}" != identity:
-    raise SystemExit("row directory identity changed")
-fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd_dir)
-s = os.fstat(fd)
-if not stat.S_ISREG(s.st_mode) or s.st_uid != 0 or stat.S_IMODE(s.st_mode) & 0o077:
-    raise SystemExit("observer output is not a private root-owned regular file")
-os.fchown(fd, int(uid), int(gid))
-PY
+    sudo -n python3 -I scripts/lane-receipt-lane02-oracle-10.py "$1" "$2" "$3" "$(id -u)" "$(id -g)"
 }
 
 remove_verified_pidfile() {
-    sudo -n python3 - "$1" "$2" "$3" <<'PY'
-import os, sys
-directory, identity, name = sys.argv[1:]
-fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-s = os.fstat(fd)
-if f"{s.st_dev}:{s.st_ino}" != identity:
-    raise SystemExit("row directory identity changed")
-try:
-    os.unlink(name, dir_fd=fd)
-except FileNotFoundError:
-    pass
-PY
+    sudo -n python3 -I scripts/lane-receipt-lane02-oracle-11.py "$1" "$2" "$3"
 }
 
 no_atomic_temps() {
-    sudo -n python3 - "$1" "$2" <<'PY'
-import os, sys
-directory, identity = sys.argv[1:]
-fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-s = os.fstat(fd)
-if f"{s.st_dev}:{s.st_ino}" != identity:
-    raise SystemExit("row directory identity changed")
-if any(name.startswith('.p11scope.') and name.endswith('.tmp') for name in os.listdir(fd)):
-    raise SystemExit("row retained an atomic temporary file")
-PY
+    sudo -n python3 -I scripts/lane-receipt-lane02-oracle-12.py "$1" "$2"
 }
 
 cleanup() {
@@ -726,7 +584,7 @@ TRACKED_STATUS=$(git status --porcelain=v1 --untracked-files=no) || exit 77
     echo "tracked worktree must be clean" >&2
     exit 77
 }
-for source in scripts/verify-task4-lane02.sh scripts/check-capture-evidence.py \
+for source in scripts/verify-receipt-lane02.sh scripts/check-capture-evidence.py \
     scripts/lib.sh scripts/cleanup-traps.sh scripts/lane02-inputs.py \
     scripts/prepared-dependency-tools.sh scripts/prepared-dependency-snapshot.sh \
     scripts/prepared-dependency-evidence.py scripts/product-build.sh \
@@ -782,7 +640,7 @@ MODULE_HASH=$(digest "$MODULE")
 MODULE_NOTES=$(readelf -n "$MODULE") || exit 77
 MODULE_BUILD_ID=$(printf '%s\n' "$MODULE_NOTES" \
     | awk '/Build ID:/{print $3; exit}') || exit 77
-DRIVER_HASH=$(digest scripts/verify-task4-lane02.sh)
+DRIVER_HASH=$(digest scripts/verify-receipt-lane02.sh)
 CHECKER_HASH=$(digest scripts/check-capture-evidence.py)
 LIB_HASH=$(digest scripts/lib.sh)
 CLEANUP_HASH=$(digest scripts/cleanup-traps.sh)
@@ -848,7 +706,7 @@ slots.removable = false
 slots.mechanisms = ALL
 library.reset_on_fork = false
 EOF
-SOFTHSM2_CONF=$CONF softhsm2-util --init-token --free --label task4-lane02 \
+SOFTHSM2_CONF=$CONF softhsm2-util --init-token --free --label receipt-lane02 \
     --so-pin 1234 --pin 1234 >/dev/null || exit 1
 CONFIG_HASH=$(digest "$CONF")
 fact config_sha256 "$CONFIG_HASH"
@@ -989,7 +847,7 @@ run_row 06-dlopen-always dlopen always
 [ "$(git rev-parse 'HEAD^{tree}')" = "$(awk -F '\t' '$1=="tree"{print $2}' "$FACTS")" ] || exit 1
 TRACKED_STATUS=$(git status --porcelain=v1 --untracked-files=no) || exit 1
 [ -z "$TRACKED_STATUS" ] || exit 1
-[ "$(digest scripts/verify-task4-lane02.sh)" = "$DRIVER_HASH" ] || exit 1
+[ "$(digest scripts/verify-receipt-lane02.sh)" = "$DRIVER_HASH" ] || exit 1
 [ "$(digest scripts/check-capture-evidence.py)" = "$CHECKER_HASH" ] || exit 1
 [ "$(digest scripts/lib.sh)" = "$LIB_HASH" ] || exit 1
 [ "$(digest scripts/cleanup-traps.sh)" = "$CLEANUP_HASH" ] || exit 1

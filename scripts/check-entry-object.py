@@ -11,23 +11,19 @@ module cannot silently replace the complete source guards.
 
 import argparse
 from collections import Counter, deque
-import importlib.util
 import json
 from pathlib import Path
 import re
 import subprocess
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.dont_write_bytecode = True
+from _loader import load_sibling
 
 
-_spec = importlib.util.spec_from_file_location(
-    "entry_discovery_primitives", Path(__file__).with_name("check-live-discovery-object.py")
-)
-D = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(D)
-_span_spec = importlib.util.spec_from_file_location(
-    "entry_span_primitives", Path(__file__).with_name("check-bpf-map-defs.py")
-)
-SPAN = importlib.util.module_from_spec(_span_spec)
-_span_spec.loader.exec_module(SPAN)
+D = load_sibling("check-live-discovery-object.py")
+SPAN = load_sibling("check-bpf-map-defs.py")
 SCHEMA = "p11scope-entry-object/v1"
 BASE_FIELDS = {3, 6, 7, 8, 9, 10, 11}
 LOAD = re.compile(r"([rw]\d+) = \*\(u(8|16|32|64) \*\)\(r(\d+) ([+-]) 0x([0-9a-f]+)\)")

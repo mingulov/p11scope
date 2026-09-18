@@ -5,9 +5,9 @@
 set -eu
 cd "$(dirname "$0")/.."
 
-WORK=${P11SCOPE_TASK4_WORK-target/canaries}
-if [ "${P11SCOPE_TASK4_WORK+set}" = set ]; then
-    case $WORK in /*) ;; *) echo "P11SCOPE_TASK4_WORK must be absolute" >&2; exit 2 ;; esac
+WORK=${P11SCOPE_RECEIPT_WORK-target/canaries}
+if [ "${P11SCOPE_RECEIPT_WORK+set}" = set ]; then
+    case $WORK in /*) ;; *) echo "P11SCOPE_RECEIPT_WORK must be absolute" >&2; exit 2 ;; esac
 fi
 # The observer stays x86-64; this selects the workload, providers, helper, and
 # their native-width scalar oracle together.
@@ -44,7 +44,7 @@ require_non_root_caller
 # non-sticky ancestor (src/output.rs), and a checkout under a shared source root
 # has one, so the standalone default cannot live in the tree. Root it in a private
 # 0700 directory on sticky /tmp; a supplied path stays the caller's to keep private.
-[ "${P11SCOPE_TASK4_WORK+set}" = set ] || {
+[ "${P11SCOPE_RECEIPT_WORK+set}" = set ] || {
     WORK=$(mktemp -d "${TMPDIR:-/tmp}/p11scope-verify-XXXXXX")/$WORK
     echo "work root: $WORK"
 }

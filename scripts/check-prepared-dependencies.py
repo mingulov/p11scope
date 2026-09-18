@@ -4,10 +4,13 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 from pathlib import Path
 import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.dont_write_bytecode = True
+from _loader import load_path
 
 
 class MetadataError(Exception):
@@ -16,12 +19,7 @@ class MetadataError(Exception):
 
 def _load_preparer(root: Path):
     path = root / "scripts" / "prepare-dependencies.py"
-    spec = importlib.util.spec_from_file_location("p11scope_prepare_dependencies", path)
-    if spec is None or spec.loader is None:
-        raise MetadataError(f"cannot load preparation verifier {path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return load_path(path, "p11scope_prepare_dependencies")
 
 
 def _read_metadata(path: Path, workspace: str) -> dict:

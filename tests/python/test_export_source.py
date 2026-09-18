@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import builtins
 import hashlib
-import importlib.util
 import inspect
 import io
 import json
@@ -21,7 +20,13 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
+
+sys.path.insert(0, str(ROOT / "scripts"))
+sys.dont_write_bytecode = True
+from _loader import load_path
+
 EXPORTER = ROOT / "scripts/export-source.py"
+LOADER = ROOT / "scripts/_loader.py"
 PREPARER = ROOT / "scripts/prepare-dependencies.py"
 EXPORT_MANIFEST = ".p11scope-source-export.json"
 OFFLINE_TESTS = ROOT / "tests/python/test_offline_dependencies.py"
@@ -38,16 +43,7 @@ def extract_archive(archive: Path, destination: Path) -> subprocess.CompletedPro
 
 
 def load_module(path: Path, name: str):
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    previous = sys.dont_write_bytecode
-    sys.dont_write_bytecode = True
-    try:
-        spec.loader.exec_module(module)
-    finally:
-        sys.dont_write_bytecode = previous
-    return module
+    return load_path(path, name)
 
 
 PREPARE = load_module(PREPARER, "export_test_preparer")
@@ -67,6 +63,7 @@ class ExportFixture:
         self.outputs.mkdir(parents=True)
         shutil.copy2(EXPORTER, self.root / "scripts/export-source.py")
         shutil.copy2(PREPARER, self.root / "scripts/prepare-dependencies.py")
+        shutil.copy2(LOADER, self.root / "scripts/_loader.py")
         (self.root / "Cargo.toml").write_text("[workspace]\nmembers = []\n")
         (self.root / "README.md").write_text("committed source\n")
         (self.root / ".gitignore").write_text("ignored.out\nthird-party/archives/\nthird-party/src/\n")

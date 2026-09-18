@@ -9,7 +9,6 @@ No Python result alone qualifies a live kernel, BPF build or target ABI.
 import argparse
 import ctypes
 import hashlib
-import importlib.util
 import json
 import math
 import os
@@ -23,18 +22,15 @@ import tempfile
 import time
 import uuid
 
-
-def sibling(filename):
-    spec = importlib.util.spec_from_file_location(filename, Path(__file__).with_name(filename))
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.dont_write_bytecode = True
+from _loader import load_sibling
 
 
-custody = sibling('canary_process_custody.py')
-dumper = sibling('dump-owned-bpf-maps.py')
-evidence = sibling('check-canary-evidence.py')
-definitions = sibling('check-bpf-map-defs.py')
+custody = load_sibling('canary_process_custody.py')
+dumper = load_sibling('dump-owned-bpf-maps.py')
+evidence = load_sibling('check-canary-evidence.py')
+definitions = load_sibling('check-bpf-map-defs.py')
 LANES = {
     'default-safe-profile': ('default', 'profile', 'allowlisted', 'matrix'),
     'default-safe-trace': ('default', 'trace', 'allowlisted', 'matrix'),

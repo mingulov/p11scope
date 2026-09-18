@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import hashlib
-import importlib.util
 import io
 import json
 import os
@@ -21,13 +20,13 @@ import unittest
 
 SOURCE_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "prepare-dependencies.py"
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+sys.dont_write_bytecode = True
+from _loader import load_path
+
 
 def load_module(path: Path):
-    spec = importlib.util.spec_from_file_location("prepare_dependencies", path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
+    return load_path(path, "prepare_dependencies")
 
 
 class Fixture:

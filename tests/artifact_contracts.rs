@@ -3948,14 +3948,26 @@ fn lane02_initial_set_uses_a_direct_needed_harness() {
 fn lane02_cleanup_covers_both_harness_executables() {
     let driver = read("scripts/verify-task4-lane02.sh");
     assert_eq!(
-        driver
-            .matches("python3 - \"$HARNESS\" \"$HARNESS_INITIAL\"")
-            .count(),
+        driver.matches("\"$HARNESS\" \"$HARNESS_INITIAL\"").count(),
         2,
         "absence and termination must inspect both exact harness paths"
     );
-    assert!(driver.contains("argv[0] in wanted"));
-    assert!(driver.contains("os.fsencode(exe) == argv[0]"));
+    for site in [
+        "sudo -n python3 -I scripts/lane-task4-lane02-oracle-6.py \"$HARNESS\" \"$HARNESS_INITIAL\"",
+        "sudo -n python3 -I scripts/lane-task4-lane02-oracle-7.py \"$HARNESS\" \"$HARNESS_INITIAL\"",
+    ] {
+        assert!(
+            driver.contains(site),
+            "missing isolated harness oracle call site: {site}"
+        );
+    }
+    for oracle in [
+        read("scripts/lane-task4-lane02-oracle-6.py"),
+        read("scripts/lane-task4-lane02-oracle-7.py"),
+    ] {
+        assert!(oracle.contains("argv[0] in wanted"));
+        assert!(oracle.contains("os.fsencode(exe) == argv[0]"));
+    }
     // The oracle's refusal check: without it, `exit 77` alone is ambiguous
     // between the env-hygiene refusal and a missing prerequisite, and reordering
     // the two loops would silently restore that masking.

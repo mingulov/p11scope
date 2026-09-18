@@ -32,6 +32,17 @@ class Lane02Fixture:
             "scripts/product-build.sh", "scripts/merge-checksum-ledgers.py",
             "scripts/check-prepared-dependencies.py", "scripts/prepare-dependencies.py",
             "spike/harness.c", "spike/expected.txt",
+            # The lane's and lib's extracted oracle fragments are runtime files
+            # of the copied lane: the fixture runs its main flow.
+            "scripts/lane-task4-lane02-oracle-1.py", "scripts/lane-task4-lane02-oracle-2.py",
+            "scripts/lane-task4-lane02-oracle-3.py", "scripts/lane-task4-lane02-oracle-4.py",
+            "scripts/lane-task4-lane02-oracle-5.py", "scripts/lane-task4-lane02-oracle-6.py",
+            "scripts/lane-task4-lane02-oracle-7.py", "scripts/lane-task4-lane02-oracle-8.py",
+            "scripts/lane-task4-lane02-oracle-9.py", "scripts/lane-task4-lane02-oracle-10.py",
+            "scripts/lane-task4-lane02-oracle-11.py", "scripts/lane-task4-lane02-oracle-12.py",
+            "scripts/lane-lib-oracle-1.py", "scripts/lane-lib-oracle-2.py",
+            "scripts/lane-lib-oracle-3.py", "scripts/lane-lib-oracle-4.py",
+            "scripts/lane-lib-oracle-5.py", "scripts/lane-lib-oracle-6.py",
         )
         for relative in copied:
             destination = self.root / relative

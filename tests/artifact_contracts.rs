@@ -2822,7 +2822,7 @@ real_python=$(command -v python3)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 python3() {
-    if [ "$1" = -I ] && [ "$2" = - ]; then
+    if [ "$1" = -I ] && [ "$2" = scripts/lane-lib-oracle-3.py ]; then
         case ${4-} in
             ''|*[!0-9]*) command "$real_python" "$@"; return ;;
         esac
@@ -3328,7 +3328,7 @@ fn port_forward_term_during_launch_reaps_the_trap_visible_generation() {
     fs::write(
         &python_wrapper,
         r#"#!/bin/sh
-if [ "$1" = -I ] && [ "$2" = - ] && [ "$#" -gt 6 ]; then
+if [ "$1" = -I ] && [ "$2" = scripts/lane-lib-oracle-3.py ] && [ "$#" -gt 6 ]; then
     case ${4-} in
         ''|*[!0-9]*) ;;
         *)
@@ -3466,7 +3466,7 @@ fn mutated_process_group_record_never_signals_the_live_decoy_or_unvalidated_owne
     fs::write(
         &python_wrapper,
         r#"#!/bin/sh
-if [ "$1" = -I ] && [ "$2" = - ] && [ "$#" -gt 6 ]; then
+if [ "$1" = -I ] && [ "$2" = scripts/lane-lib-oracle-3.py ] && [ "$#" -gt 6 ]; then
     case ${4-} in
         ''|*[!0-9]*) ;;
         *) [ -e "$PF_TEST_WORK/mutated" ||

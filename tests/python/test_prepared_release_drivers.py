@@ -183,7 +183,10 @@ class PreparedReleaseDriverTests(unittest.TestCase):
                     if path.name not in (".git", "scripts"):
                         shutil.rmtree(path) if path.is_dir() else path.unlink()
                 for path in (fixture.repo / "scripts").iterdir():
-                    if path.name not in ("build-release.sh", "lib.sh", "check-capture-evidence.py"):
+                    # The finalizer fragment is the driver's own relocated code,
+                    # not a new helper: scenarios that reach finalization execute it.
+                    if path.name not in ("build-release.sh", "lib.sh", "check-capture-evidence.py",
+                                         "lane-build-release-oracle-3.py"):
                         shutil.rmtree(path) if path.is_dir() else path.unlink()
                 for args in (["add", "-A"], ["-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "minimal early-refusal fixture"]):
                     result = fixture.command(["git", "-C", str(fixture.repo), *args])

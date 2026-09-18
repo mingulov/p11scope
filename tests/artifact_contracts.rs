@@ -1675,7 +1675,14 @@ const TASK7_BUILD_INPUT_VARIABLES: &[&str] = &[
 fn task7_pristine_driver_repo() -> tempfile::TempDir {
     let repo = tempfile::tempdir().expect("create pristine release-driver repository");
     fs::create_dir(repo.path().join("scripts")).expect("create pristine scripts directory");
-    for name in ["build-release.sh", "lib.sh", "check-capture-evidence.py"] {
+    for name in [
+        "build-release.sh",
+        "lib.sh",
+        "check-capture-evidence.py",
+        "lane-build-release-oracle-1.py",
+        "lane-build-release-oracle-2.py",
+        "lane-build-release-oracle-3.py",
+    ] {
         fs::copy(
             format!("scripts/{name}"),
             repo.path().join("scripts").join(name),
@@ -1921,7 +1928,7 @@ fn release_finalizer_rechecks_cargo_configs_with_pinned_tools() {
     // dropped mid-run must never be the binary that decides, or writes, it --
     // it runs even once the ledger recheck has already failed the run.
     assert!(
-        finalize.contains("\"$T4_TOOL_python3\" -I - \"$TASK4_ROOT\""),
+        finalize.contains("\"$T4_TOOL_python3\" -I scripts/lane-build-release-oracle-3.py \"$TASK4_ROOT\""),
         "finalizer validates the evidence root through an unpinned or unisolated interpreter"
     );
     for tool in [
@@ -2033,7 +2040,7 @@ fn release_runs_every_python3_in_isolated_mode() {
     // site directory and the script directory from sys.path as well.
     let release = read("scripts/build-release.sh");
     assert!(
-        release.contains("    python3 -I - \"$REPORT\" <<'PY'"),
+        release.contains("    python3 -I scripts/lane-build-release-oracle-1.py \"$REPORT\""),
         "the --self-test model runner is not isolated"
     );
     let sites: Vec<&str> = release

@@ -1041,10 +1041,17 @@ class TaskStorageReaderTests(unittest.TestCase):
         dumper = load_dumper()
         with tempfile.TemporaryDirectory() as directory:
             pidfile = Path(directory) / "eof-child.pid"
-            command = [sys.executable, "-c",
-                       "import os,pathlib,time; "
-                       f"pathlib.Path({str(pidfile)!r}).write_text(str(os.getpid())); "
-                       "os.write(1, b'[]'); os.close(1); os.close(2); time.sleep(0.7)"]
+            # Load hardening: the 50ms budget must cover the fixture child's
+            # startup before it can EOF the pipes. A python child starts in
+            # ~10ms idle but 50-200ms+ under host load, so the deadline kills
+            # it before the pidfile write and the post-acquisition read finds
+            # nothing (the child is already dead then, so no post-hoc wait can
+            # recover it). A sh child starts in ~2ms with identical
+            # EOF-then-linger semantics: same pidfile pid across the exec,
+            # same two output bytes, same 0.7s linger past the deadline.
+            command = ["/bin/sh", "-c",
+                       "echo $$ > \"$1\"; printf '[]'; exec 1>&- 2>&-; exec /bin/sleep 0.7",
+                       "sh", str(pidfile)]
             previous = signal.signal(
                 signal.SIGALRM,
                 lambda _signal, _frame: (_ for _ in ()).throw(

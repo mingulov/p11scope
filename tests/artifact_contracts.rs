@@ -1431,7 +1431,8 @@ fn receipt_receipt_lane14_capture_binding_is_literal_and_checker_evidence_framed
         "path-order authority still selects a receipt artifact"
     );
     assert!(
-        !release.contains("cp \"$RECEIPT_ROOT/stdout.log\" \"$RECEIPT_ROOT/artifacts/checker.log\""),
+        !release
+            .contains("cp \"$RECEIPT_ROOT/stdout.log\" \"$RECEIPT_ROOT/artifacts/checker.log\""),
         "aggregate body stdout still stands in for checker evidence"
     );
 
@@ -1922,7 +1923,11 @@ fn release_preflight_refuses_an_unevaluable_cargo_home() {
 #[test]
 fn release_finalizer_rechecks_cargo_configs_with_pinned_tools() {
     let release = read("scripts/build-release.sh");
-    let finalize = between(&release, "\nreceipt_finalize() {", "\nreceipt_receipt_run() {");
+    let finalize = between(
+        &release,
+        "\nreceipt_finalize() {",
+        "\nreceipt_receipt_run() {",
+    );
 
     // The finalizer writes the terminal receipt. A PATH-priority shadow
     // dropped mid-run must never be the binary that decides, or writes, it --
@@ -2317,7 +2322,11 @@ fn release_pins_its_reached_command_inventory_and_sealed_environment() {
     );
 
     // The sealed bin directory is evidence until the receipt status exists.
-    let finalize = between(&release, "\nreceipt_finalize() {", "\nreceipt_receipt_run() {");
+    let finalize = between(
+        &release,
+        "\nreceipt_finalize() {",
+        "\nreceipt_receipt_run() {",
+    );
     let status = finalize
         .find("printf '%s\\n' \"$t4_result\" > \"$RECEIPT_ROOT/status\"")
         .expect("finalization writes the terminal status");

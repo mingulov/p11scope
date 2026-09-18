@@ -9112,3 +9112,182 @@ fn export_source_contracts_hold() {
 fn build_offline_contracts_hold() {
     run_native_python_suite("tests/python/test_build_offline.py", "BuildOfflineTests");
 }
+
+/// Refactor-queue Task 4: the oracle extraction (Task 1) and renames (Task 3)
+/// reshaped `scripts/`; these meta-tests pin the new shape so a later edit
+/// cannot silently re-embed a giant oracle or break a sibling script.
+///
+/// Measured 2026-09-18 on `fix/refactor-queue` @ 37b26bb: 42 `<<'PY'`
+/// heredocs across 11 shell files, largest 450 body lines
+/// (`scripts/verify-provider-matrix.sh` self-test oracle), next 347
+/// (`scripts/verify-discover-containers.sh`). Both are pre-existing oracles in
+/// files outside Task 1's extraction list — the cap pins them, it does not
+/// bless new ones. Cap = 450 + 20%, rounded: 540. The one retained
+/// non-execution heredoc is the `target.py` fixture writer in
+/// `scripts/verify-inspect-doctor.sh` (14 lines); `verify-receipt-lane16.sh`
+/// is fully extracted (zero heredocs).
+const SCRIPTS_TREE_HEREDOC_CAP: usize = 540;
+
+/// Stage every admitted `scripts/**/*.py` under `stage` for compilation. The
+/// walk reuses [`script_dirs`], which fails on any new scripts subdirectory,
+/// so coverage cannot silently drift. `py_compile` writes `__pycache__` next
+/// to its inputs (`PYTHONPYCACHEPREFIX` does not redirect it — verified), so
+/// the check compiles copies, never the tree; the directory is folded into
+/// the copy name so a failure still names its source
+/// (`matrix__knative-server.py`).
+fn stage_scripts_python(stage: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut staged = Vec::new();
+    for dir in script_dirs() {
+        for entry in fs::read_dir(&dir).expect("walk scripts") {
+            let path = entry.expect("script entry").path();
+            if path.extension().is_some_and(|extension| extension == "py") {
+                let relative = path
+                    .strip_prefix("scripts")
+                    .expect("script under scripts/")
+                    .to_str()
+                    .expect("utf-8 script path")
+                    .replace('/', "__");
+                let copy = stage.join(relative);
+                fs::copy(&path, &copy).expect("stage python file");
+                staged.push(copy);
+            }
+        }
+    }
+    staged.sort();
+    staged
+}
+
+fn assert_python_files_compile(files: &[std::path::PathBuf]) -> Result<(), String> {
+    if files.is_empty() {
+        return Err("no scripts/**/*.py found; the tree-shape walk is broken".into());
+    }
+    let output = Command::new("python3")
+        .arg("-I")
+        .arg("-m")
+        .arg("py_compile")
+        .args(files)
+        .output()
+        .map_err(|error| format!("running py_compile: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "py_compile failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
+
+/// Body lengths of every `<<'PY'` heredoc in `source`: (1-based opener line,
+/// body line count). The terminator is the next line whose trimmed text is
+/// exactly `PY`; an unterminated opener is reported, never skipped — a
+/// scanner that skipped it would let a truncated oracle pass.
+fn py_heredoc_bodies(source: &str) -> Result<Vec<(usize, usize)>, String> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut bodies = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        if lines[index].contains("<<'PY'") {
+            let opener = index + 1;
+            let mut end = index + 1;
+            while end < lines.len() && lines[end].trim() != "PY" {
+                end += 1;
+            }
+            if end >= lines.len() {
+                return Err(format!(
+                    "unterminated <<'PY' heredoc opened at line {opener}"
+                ));
+            }
+            bodies.push((opener, end - index - 1));
+            index = end + 1;
+        } else {
+            index += 1;
+        }
+    }
+    Ok(bodies)
+}
+
+fn assert_heredocs_capped(path: &std::path::Path, cap: usize) -> Result<(), String> {
+    let source =
+        fs::read_to_string(path).map_err(|error| format!("reading {}: {error}", path.display()))?;
+    let bodies =
+        py_heredoc_bodies(&source).map_err(|error| format!("{}: {error}", path.display()))?;
+    let violations: Vec<String> = bodies
+        .iter()
+        .filter(|(_, length)| *length > cap)
+        .map(|(opener, length)| format!("line {opener}: {length} lines (cap {cap})"))
+        .collect();
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} has over-cap heredocs:\n{}",
+            path.display(),
+            violations.join("\n")
+        ))
+    }
+}
+
+#[test]
+fn scripts_tree_shape_python_files_compile() {
+    // Failing-first: a syntactically broken fixture must fail the check.
+    let fixture = tempfile::tempdir().expect("create py_compile fixture");
+    let broken = fixture.path().join("broken.py");
+    fs::write(&broken, "def broken(:\n").expect("write broken fixture");
+    let failure = assert_python_files_compile(std::slice::from_ref(&broken))
+        .expect_err("a syntactically broken .py must fail py_compile");
+    assert!(
+        failure.contains("broken.py"),
+        "the failure names its file: {failure}"
+    );
+
+    // The real tree: every admitted scripts/**/*.py compiles.
+    let stage = tempfile::tempdir().expect("stage scripts python");
+    let files = stage_scripts_python(stage.path());
+    assert_python_files_compile(&files).unwrap();
+}
+
+#[test]
+fn scripts_tree_shape_heredocs_capped() {
+    // Failing-first: an over-cap heredoc fixture must fail the check.
+    let fixture = tempfile::tempdir().expect("create heredoc fixture");
+    let over = fixture.path().join("over.sh");
+    let mut body = String::from("python3 -I - <<'PY'\n");
+    for line in 0..=SCRIPTS_TREE_HEREDOC_CAP {
+        body.push_str(&format!("print({line})\n"));
+    }
+    body.push_str("PY\n");
+    fs::write(&over, body).expect("write over-cap fixture");
+    let failure = assert_heredocs_capped(&over, SCRIPTS_TREE_HEREDOC_CAP)
+        .expect_err("an over-cap heredoc must fail the cap check");
+    assert!(
+        failure.contains(&(SCRIPTS_TREE_HEREDOC_CAP + 1).to_string()),
+        "the failure names the body length: {failure}"
+    );
+
+    // An unterminated opener must fail loudly, not scan as clean.
+    let truncated = fixture.path().join("truncated.sh");
+    fs::write(&truncated, "python3 -I - <<'PY'\nprint(1)\n").expect("write truncated fixture");
+    assert_heredocs_capped(&truncated, SCRIPTS_TREE_HEREDOC_CAP)
+        .expect_err("an unterminated heredoc must fail the cap check");
+
+    // Boundary: exactly the cap passes.
+    let exact = fixture.path().join("exact.sh");
+    let mut body = String::from("python3 -I - <<'PY'\n");
+    for line in 0..SCRIPTS_TREE_HEREDOC_CAP {
+        body.push_str(&format!("print({line})\n"));
+    }
+    body.push_str("PY\n");
+    fs::write(&exact, body).expect("write boundary fixture");
+    assert_heredocs_capped(&exact, SCRIPTS_TREE_HEREDOC_CAP).unwrap();
+
+    // The real tree: no shell heredoc exceeds the cap.
+    for dir in script_dirs() {
+        for entry in fs::read_dir(&dir).expect("walk scripts") {
+            let path = entry.expect("script entry").path();
+            if path.extension().is_some_and(|extension| extension == "sh") {
+                assert_heredocs_capped(&path, SCRIPTS_TREE_HEREDOC_CAP).unwrap();
+            }
+        }
+    }
+}

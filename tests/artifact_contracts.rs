@@ -1928,7 +1928,9 @@ fn release_finalizer_rechecks_cargo_configs_with_pinned_tools() {
     // dropped mid-run must never be the binary that decides, or writes, it --
     // it runs even once the ledger recheck has already failed the run.
     assert!(
-        finalize.contains("\"$T4_TOOL_python3\" -I scripts/lane-build-release-oracle-3.py \"$TASK4_ROOT\""),
+        finalize.contains(
+            "\"$T4_TOOL_python3\" -I scripts/lane-build-release-oracle-3.py \"$TASK4_ROOT\""
+        ),
         "finalizer validates the evidence root through an unpinned or unisolated interpreter"
     );
     for tool in [

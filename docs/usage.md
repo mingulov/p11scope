@@ -185,6 +185,15 @@ The induced-gaps gate (`scripts/verify-induced-gaps.sh`, gap 3/3b) proves both
 directions: the small-ring build and the default build with `--ring-bytes 4K`
 produce the same disclosed event-loss evidence with exact counts.
 
+Measured loss rates — the only bench-measured tuning data points, from the
+`scripts/bench-overhead.sh` run in "Overhead (measured)" (1M back-to-back
+calls/sec, default 256K ring): `profile` (1s drain) lost 991,290-991,350
+of 1,000,000 events (99.1%+); `trace` (200ms drain) wrote only
+122,348-145,383 lines. A faster drain cadence meaningfully reduces loss
+but does not eliminate it at that call rate. No larger `--ring-bytes`
+value and no other `--drain-interval-ms` value has been bench-measured;
+tuning beyond these two points is unmeasured, not tuned-down.
+
 ### Attested semantic capture
 
 This is an explicit trust decision about the provider's function names and
@@ -534,6 +543,15 @@ overhead as a far smaller *relative* one. Read the numbers below as "the
 cost on this workload," not "the cost everywhere." Full method and raw
 per-run numbers: `docs/notes/phase5-overhead.md`.
 
+> **Staleness: this table predates policy-specific capture.** It was
+> measured before `4f59ff6` ("feat: enforce policy-specific eBPF capture",
+> 2026-08-13), which made the eBPF program skip ring submission in
+> `metrics` mode. The `metrics` row below no longer describes this tree
+> (its cost is expected to be lower, by an unmeasured amount); the
+> `profile`/`trace` rows and the event-loss figures remain the best
+> measured numbers until the re-bench below is run. Details:
+> `docs/notes/phase5-overhead.md` ("Staleness note").
+
 Machine: kernel `7.0.0-28-generic`, CPU `AMD Ryzen AI 9 HX PRO 370 w/
 Radeon 890M`. Workload: `scripts/fixtures/hammer.c`, 1,000,000 back-to-back
 `C_GenerateRandom` calls, 5 runs/condition (median and min..max spread,
@@ -559,7 +577,10 @@ different amounts of userspace work — the eBPF program pays for the
 uprobe/uretprobe trap, the map updates, and a ring-buffer submission
 attempt unconditionally, regardless of which userspace mode is running or
 whether it ever reads the ring buffer at all. At this call rate that
-unconditional in-kernel cost dominates.
+unconditional in-kernel cost dominates. (Pre-policy-capture finding — see
+the staleness note above. Since `4f59ff6`, `metrics` no longer pays the
+ring-submission half of that cost, so the three-way convergence no longer
+holds as stated; the re-bench below will show what replaced it.)
 
 **Event loss at high call rates.** At 1,000,000 calls/sec with the
 default ring buffer, `profile` and `trace` both lose the overwhelming
@@ -581,6 +602,19 @@ zero there means "not measured", not "nothing lost" — the aggregate
 counts remain the authority in that mode.
 Same finding `scripts/verify-induced-gaps.sh` demonstrates
 deliberately on a lighter workload (`docs/notes/phase2-induced-gaps.md`).
+
+**Post-fix re-bench: UNRUN.** Re-measuring after `4f59ff6` needs the
+privileged bench (owner-gated; never run by automation): exactly
+`scripts/bench-overhead.sh` (defaults: `RUNS=5`, 1,000,000 calls per
+condition, same 4 conditions as the table above). Prerequisites: run as a
+non-root user with passwordless `sudo` (the script attaches via
+`sudo --preserve-env=SOFTHSM2_CONF` and chowns root-owned reports back);
+`gcc`, `softhsm2-util`, and `python3` on `PATH`; SoftHSM2 installed at
+`/usr/lib/softhsm/libsofthsm2.so`; offline Rust toolchains as pinned
+(the script builds release via `scripts/cargo.sh +1.88 build --locked
+--release --workspace` first). Until it runs, no updated metrics-mode
+number may be quoted — "unresolved, needs owner re-bench" is the honest
+state.
 
 ## The evidence/completeness model
 

@@ -117,3 +117,26 @@ event stream in that case.
   (roughly 1-2% of the median for observed conditions, up to ~5% for
   unobserved) is a lower bound on real-world variance, not a rigorous
   isolated-benchmark figure.
+
+## Staleness note (2026-09-18; profiling-fixes Task 3)
+
+The Results table and the "why the modes converge" finding above are
+**pre-policy-capture**: they were measured at `eb75c73` ("bench: measured
+overhead across capture modes", 2026-08-12), whose
+`crates/ebpf/src/main.rs` contains zero `FLAG_POLICY_AGGREGATE`
+references — the eBPF program then unconditionally submitted ring events
+in every mode, which is exactly what the table shows.
+
+One day later, `4f59ff6` ("feat: enforce policy-specific eBPF capture",
+2026-08-13) made capture policy-aware: under `FLAG_POLICY_AGGREGATE`
+(`profile --mode metrics`) the entry/return programs return before any
+`EVENTS` reserve, and fork-emit is skipped via
+`p11_link_fork_allowed()`. The metrics-mode row above (+3253.4 ns)
+therefore no longer describes this tree — metrics-mode per-call cost is
+expected to be lower, but by an **unmeasured** amount: the post-fix
+re-bench (`scripts/bench-overhead.sh`, owner-gated, privileged) is UNRUN
+as of this writing. No number in this note replaces a bench run; see
+`docs/usage.md` "Overhead (measured)" for the recorded re-bench command.
+
+History preserved verbatim: the table, raws, and findings above are
+unchanged; only this note is new.

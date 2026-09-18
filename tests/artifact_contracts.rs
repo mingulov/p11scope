@@ -9347,3 +9347,70 @@ fn scripts_tree_shape_heredocs_capped() {
         assert_heredocs_capped(path, SCRIPTS_TREE_HEREDOC_CAP).unwrap();
     }
 }
+
+#[test]
+fn aggregate_policy_returns_before_both_events_reserves() {
+    // Metrics mode maps to CapturePolicy::AggregateOnly (see the attach
+    // policy-matrix tests), so the BPF side must submit zero EVENTS ring
+    // events under FLAG_POLICY_AGGREGATE. This pin fails if a reserve is
+    // added, if the return-path gate moves below its reserve, or if the
+    // fork path stops honoring the policy.
+    let ebpf = read("crates/ebpf/src/main.rs");
+    assert_eq!(
+        ebpf.matches("EVENTS.reserve::<Event>(0)").count(),
+        2,
+        "a new EVENTS submit site must be gated for aggregate policy too"
+    );
+
+    let returned = between(
+        &ebpf,
+        "pub fn p11_return(ctx: RetProbeContext) -> u32 {",
+        "#[unsafe(no_mangle)]\n#[inline(never)]\npub extern \"C\" fn p11_link_fork_allowed",
+    );
+    assert_eq!(
+        returned.matches("EVENTS.reserve::<Event>(0)").count(),
+        1,
+        "the return path must hold exactly one EVENTS reserve"
+    );
+    let gate = returned
+        .find("if flags & FLAG_POLICY_AGGREGATE != 0")
+        .expect("return path must gate aggregate policy");
+    let reserve = returned
+        .find("EVENTS.reserve::<Event>(0)")
+        .expect("return path must hold its EVENTS reserve");
+    assert!(
+        gate < reserve,
+        "aggregate gate must precede the return-path EVENTS reserve"
+    );
+    assert!(
+        returned.contains("if flags & FLAG_POLICY_AGGREGATE != 0 {\n        return 0;\n    }"),
+        "aggregate gate must return before any submit"
+    );
+
+    let allowed = between(
+        &ebpf,
+        "pub extern \"C\" fn p11_link_fork_allowed() -> u32 {",
+        "pub unsafe extern \"C\" fn p11_link_emit_fork",
+    );
+    assert!(
+        allowed.contains("scope.flags & FLAG_POLICY_AGGREGATE == 0"),
+        "fork capture must stay disabled under aggregate policy"
+    );
+
+    let native = read("crates/ebpf/native/image_identity.c");
+    assert_eq!(
+        native.matches("p11_link_emit_fork(").count(),
+        2,
+        "one fork-emit declaration plus one call site, no more"
+    );
+    let check = native
+        .find("if (!p11_link_fork_allowed())")
+        .expect("native fork path must consult the allow gate");
+    let emit = native
+        .find("p11_link_emit_fork(child_tgid, clone_flags, &parent_identity, &child_identity)")
+        .expect("native fork path must hold the fork emit call");
+    assert!(
+        check < emit,
+        "native fork path must check the allow gate before emitting"
+    );
+}

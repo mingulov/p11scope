@@ -10,7 +10,7 @@ use std::process::Command;
 use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const INPUT_LEDGER_GOLDEN: &str = include_str!("fixtures/task4/input-ledger-golden.tsv");
+const INPUT_LEDGER_GOLDEN: &str = include_str!("fixtures/receipt/input-ledger-golden.tsv");
 
 fn snapshot_tree(root: &Path) -> BTreeSet<(PathBuf, &'static str)> {
     fn visit(root: &Path, current: &Path, entries: &mut BTreeSet<(PathBuf, &'static str)>) {
@@ -102,7 +102,7 @@ fn snapshot_exact_tree(root: &Path) -> BTreeSet<ExactTreeEntry> {
 #[test]
 fn input_v1_ledger_round_trip_and_encoder_rejects_invalid_vectors() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let test = repo.join("tests/python/test_task4_ledger.py");
+    let test = repo.join("tests/python/test_receipt_ledger.py");
     let output = Command::new("/usr/bin/python3")
         .args([
             "-I",
@@ -115,7 +115,7 @@ fn input_v1_ledger_round_trip_and_encoder_rejects_invalid_vectors() {
         .env_clear()
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .output()
-        .expect("run task4 ledger tests through /usr/bin/python3");
+        .expect("run receipt ledger tests through /usr/bin/python3");
     assert!(
         output.status.success(),
         "input-v1 ledger contract failed: stdout={} stderr={}",
@@ -135,27 +135,27 @@ fn input_v1_discovery_api_is_candidate_only() {
     }
 
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let script = repo.join("scripts/task4-build-subject.py");
+    let script = repo.join("scripts/receipt-build-subject.py");
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock before Unix epoch")
         .as_nanos();
     let project = std::env::temp_dir().join(format!(
-        "p11scope-task4-produce-{}-{nonce}",
+        "p11scope-receipt-produce-{}-{nonce}",
         std::process::id()
     ));
     fs::create_dir(&project).expect("create isolated project");
     let _cleanup = Cleanup(project.clone());
     let scripts = project.join("scripts");
     fs::create_dir(&scripts).expect("create isolated project scripts directory");
-    let isolated_script = scripts.join("task4-build-subject.py");
-    fs::copy(&script, &isolated_script).expect("copy task4 build-subject script");
+    let isolated_script = scripts.join("receipt-build-subject.py");
+    fs::copy(&script, &isolated_script).expect("copy receipt build-subject script");
     let script_mode = fs::symlink_metadata(&script)
-        .expect("read task4 build-subject script metadata")
+        .expect("read receipt build-subject script metadata")
         .permissions()
         .mode();
     fs::set_permissions(&isolated_script, fs::Permissions::from_mode(script_mode))
-        .expect("copy task4 build-subject script mode");
+        .expect("copy receipt build-subject script mode");
     let project_before = snapshot_exact_tree(&project);
     for argv in [None, Some("produce"), Some("arbitrary")] {
         let mut command = Command::new("/usr/bin/python3");
@@ -165,15 +165,15 @@ fn input_v1_discovery_api_is_candidate_only() {
             .env("PYTHONDONTWRITEBYTECODE", "1");
         match argv {
             None => {
-                command.args(["scripts/task4-build-subject.py"]);
+                command.args(["scripts/receipt-build-subject.py"]);
             }
             Some(value) => {
-                command.args(["scripts/task4-build-subject.py", value]);
+                command.args(["scripts/receipt-build-subject.py", value]);
             }
         }
         let output = command
             .output()
-            .expect("run deferred task4 build-subject argv");
+            .expect("run deferred receipt build-subject argv");
         assert_eq!(output.status.code(), Some(77), "argv must remain deferred");
         assert!(output.stdout.is_empty(), "deferred argv wrote to stdout");
         assert!(output.stderr.is_empty(), "deferred argv wrote to stderr");
@@ -183,7 +183,7 @@ fn input_v1_discovery_api_is_candidate_only() {
             "deferred argv changed the isolated project tree"
         );
     }
-    let api_test = repo.join("tests/python/test_task4_discovery_api.py");
+    let api_test = repo.join("tests/python/test_receipt_discovery_api.py");
     let api_output = Command::new("/usr/bin/python3")
         .args([
             "-I",
@@ -194,14 +194,14 @@ fn input_v1_discovery_api_is_candidate_only() {
         .env_clear()
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .output()
-        .expect("run task4 discovery API test through /usr/bin/python3");
+        .expect("run receipt discovery API test through /usr/bin/python3");
     assert!(
         api_output.status.success(),
         "input-v1 discovery API contract failed: stdout={} stderr={}",
         String::from_utf8_lossy(&api_output.stdout),
         String::from_utf8_lossy(&api_output.stderr)
     );
-    let borrowed_test = repo.join("tests/python/test_task4_borrowed_descriptor_admission.py");
+    let borrowed_test = repo.join("tests/python/test_receipt_borrowed_descriptor_admission.py");
     let borrowed_output = Command::new("/usr/bin/python3")
         .args([
             "-I",
@@ -241,14 +241,14 @@ fn input_v1_discovery_api_is_candidate_only() {
         .env_clear()
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .output()
-        .expect("run task4 borrowed descriptor tests through /usr/bin/python3");
+        .expect("run receipt borrowed descriptor tests through /usr/bin/python3");
     assert!(
         borrowed_output.status.success(),
         "borrowed descriptor admission contract failed: stdout={} stderr={}",
         String::from_utf8_lossy(&borrowed_output.stdout),
         String::from_utf8_lossy(&borrowed_output.stderr)
     );
-    let contract_test = repo.join("tests/python/test_task4_input_v1_contract.py");
+    let contract_test = repo.join("tests/python/test_receipt_input_v1_contract.py");
     let output = Command::new("/usr/bin/python3")
         .args([
             "-I",
@@ -260,9 +260,9 @@ fn input_v1_discovery_api_is_candidate_only() {
         .current_dir(repo)
         .env_clear()
         .env("PYTHONDONTWRITEBYTECODE", "1")
-        .env("TASK4_GOLDEN", INPUT_LEDGER_GOLDEN)
+        .env("RECEIPT_GOLDEN", INPUT_LEDGER_GOLDEN)
         .output()
-        .expect("run task4 input-v1 contract through /usr/bin/python3");
+        .expect("run receipt input-v1 contract through /usr/bin/python3");
     assert!(
         output.status.success(),
         "input-v1 discovery API contract failed: stdout={} stderr={}",
@@ -287,7 +287,7 @@ fn discover_input_v1_candidate_only_discovers_complete_live_input() {
         .expect("system clock before Unix epoch")
         .as_nanos();
     let root = std::env::temp_dir().join(format!(
-        "p11scope-task4-discover-{}-{nonce}",
+        "p11scope-receipt-discover-{}-{nonce}",
         std::process::id()
     ));
     fs::create_dir(&root).expect("create discovery fixture");
@@ -397,20 +397,20 @@ import os
 import stat
 import sys
 
-spec = importlib.util.spec_from_file_location("task4_build_subject", sys.argv[1])
+spec = importlib.util.spec_from_file_location("receipt_build_subject", sys.argv[1])
 if spec is None or spec.loader is None:
-    raise SystemExit("could not import task4 build-subject script")
+    raise SystemExit("could not import receipt build-subject script")
 module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 
-trace = os.environ["TASK4_TRACE"].encode("ascii")
-fixture_root = os.environ["TASK4_ROOT"]
-repo_root = os.environ["TASK4_REPO_ROOT"]
-build_root = os.environ["TASK4_BUILD_ROOT"]
-stable_root = os.environ["TASK4_STABLE_ROOT"]
-nightly_root = os.environ["TASK4_NIGHTLY_ROOT"]
-tool_root = os.environ["TASK4_TOOL_ROOT"]
+trace = os.environ["RECEIPT_TRACE"].encode("ascii")
+fixture_root = os.environ["RECEIPT_ROOT"]
+repo_root = os.environ["RECEIPT_REPO_ROOT"]
+build_root = os.environ["RECEIPT_BUILD_ROOT"]
+stable_root = os.environ["RECEIPT_STABLE_ROOT"]
+nightly_root = os.environ["RECEIPT_NIGHTLY_ROOT"]
+tool_root = os.environ["RECEIPT_TOOL_ROOT"]
 
 def snapshot(root):
     entries = []
@@ -530,22 +530,22 @@ print("input-v1-discover-ok")
             "-c",
             driver,
             project
-                .join("scripts/task4-build-subject.py")
+                .join("scripts/receipt-build-subject.py")
                 .to_str()
                 .expect("script path is UTF-8"),
         ])
         .current_dir(project)
         .env_clear()
         .env("PYTHONDONTWRITEBYTECODE", "1")
-        .env("TASK4_ROOT", &root)
-        .env("TASK4_TRACE", trace)
-        .env("TASK4_REPO_ROOT", &repo)
-        .env("TASK4_BUILD_ROOT", &build)
-        .env("TASK4_STABLE_ROOT", &stable)
-        .env("TASK4_NIGHTLY_ROOT", &nightly)
-        .env("TASK4_TOOL_ROOT", &tool)
+        .env("RECEIPT_ROOT", &root)
+        .env("RECEIPT_TRACE", trace)
+        .env("RECEIPT_REPO_ROOT", &repo)
+        .env("RECEIPT_BUILD_ROOT", &build)
+        .env("RECEIPT_STABLE_ROOT", &stable)
+        .env("RECEIPT_NIGHTLY_ROOT", &nightly)
+        .env("RECEIPT_TOOL_ROOT", &tool)
         .output()
-        .expect("import task4 build-subject script through /usr/bin/python3");
+        .expect("import receipt build-subject script through /usr/bin/python3");
     assert!(
         output.status.success(),
         "input-v1 discovery contract failed: {}",
@@ -566,7 +566,7 @@ print("input-v1-discover-ok")
 #[test]
 fn discover_input_v1_candidate_only_rejects_relation_and_trace_mutation() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let script = repo.join("scripts/task4-build-subject.py");
+    let script = repo.join("scripts/receipt-build-subject.py");
     let driver = r#"
 import importlib.util
 import os
@@ -574,9 +574,9 @@ import stat
 import sys
 import tempfile
 
-spec = importlib.util.spec_from_file_location("task4_build_subject", sys.argv[1])
+spec = importlib.util.spec_from_file_location("receipt_build_subject", sys.argv[1])
 if spec is None or spec.loader is None:
-    raise SystemExit("could not import task4 build-subject script")
+    raise SystemExit("could not import receipt build-subject script")
 module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
@@ -712,7 +712,7 @@ def assert_unchanged(paths, before):
 
 
 def baseline():
-    with tempfile.TemporaryDirectory(prefix="task4-bs2a-c1-") as root:
+    with tempfile.TemporaryDirectory(prefix="receipt-bs2a-c1-") as root:
         paths = fixture(root)
         before = anchors(paths)
         result = discover(module, paths, trace_for(paths))
@@ -740,7 +740,7 @@ def rejected(
     escape_vendor=False,
     absolute_vendor=False,
 ):
-    with tempfile.TemporaryDirectory(prefix=f"task4-bs2a-c1-{name}-") as root:
+    with tempfile.TemporaryDirectory(prefix=f"receipt-bs2a-c1-{name}-") as root:
         paths = fixture(root)
         if escape_vendor:
             os.rmdir(paths["vendor"])
@@ -816,7 +816,7 @@ print("bs2a-c1-ok")
         .env_clear()
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .output()
-        .expect("import task4 build-subject script through /usr/bin/python3");
+        .expect("import receipt build-subject script through /usr/bin/python3");
     assert!(
         output.status.success(),
         "candidate mutation contract failed: {}",
@@ -832,7 +832,7 @@ print("bs2a-c1-ok")
 #[test]
 fn discover_input_v1_candidate_only_detects_two_pass_collection_mutation() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let script = repo.join("scripts/task4-build-subject.py");
+    let script = repo.join("scripts/receipt-build-subject.py");
     let driver = r#"
 import importlib.util
 import os
@@ -840,9 +840,9 @@ import stat
 import sys
 import tempfile
 
-spec = importlib.util.spec_from_file_location("task4_build_subject", sys.argv[1])
+spec = importlib.util.spec_from_file_location("receipt_build_subject", sys.argv[1])
 if spec is None or spec.loader is None:
-    raise SystemExit("could not import task4 build-subject script")
+    raise SystemExit("could not import receipt build-subject script")
 module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
@@ -985,7 +985,7 @@ expected = (
 ).encode("ascii")
 
 
-with tempfile.TemporaryDirectory(prefix="task4-bs2a-c2-baseline-") as root:
+with tempfile.TemporaryDirectory(prefix="receipt-bs2a-c2-baseline-") as root:
     paths = fixture(root)
     before = anchors(paths)
     if discover(paths, trace_for(paths)) != expected:
@@ -993,7 +993,7 @@ with tempfile.TemporaryDirectory(prefix="task4-bs2a-c2-baseline-") as root:
     assert_unchanged(paths, before)
 
 
-with tempfile.TemporaryDirectory(prefix="task4-bs2a-c2-collection-") as root:
+with tempfile.TemporaryDirectory(prefix="receipt-bs2a-c2-collection-") as root:
     paths = fixture(root)
     before = anchors(paths)
     real_scandir = os.scandir
@@ -1177,7 +1177,7 @@ with tempfile.TemporaryDirectory(prefix="task4-bs2a-c2-collection-") as root:
     assert_unchanged(paths, before)
 
 
-with tempfile.TemporaryDirectory(prefix="task4-bs2a-c2-symlink-") as root:
+with tempfile.TemporaryDirectory(prefix="receipt-bs2a-c2-symlink-") as root:
     paths = fixture(root)
     before = anchors(paths)
     real_readlink = os.readlink
@@ -1243,7 +1243,7 @@ print("bs2a-c2-ok")
         .env_clear()
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .output()
-        .expect("import task4 build-subject script through /usr/bin/python3");
+        .expect("import receipt build-subject script through /usr/bin/python3");
     assert!(
         output.status.success(),
         "candidate two-pass mutation contract failed: {}",
@@ -1262,7 +1262,7 @@ print("bs2a-c2-ok")
 #[test]
 fn discover_input_v1_candidate_only_rejects_confirmed_green_gaps() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let script = repo.join("scripts/task4-build-subject.py");
+    let script = repo.join("scripts/receipt-build-subject.py");
     let driver = r##"
 import importlib.util
 import os
@@ -1271,9 +1271,9 @@ import stat
 import sys
 import tempfile
 
-spec = importlib.util.spec_from_file_location("task4_build_subject", sys.argv[1])
+spec = importlib.util.spec_from_file_location("receipt_build_subject", sys.argv[1])
 if spec is None or spec.loader is None:
-    raise SystemExit("could not import task4 build-subject script")
+    raise SystemExit("could not import receipt build-subject script")
 module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
@@ -1433,7 +1433,7 @@ def path_is_beneath(path, root):
 
 def anchor_replacement_case(anchor):
     name = f"held-{anchor}-replacement"
-    with tempfile.TemporaryDirectory(prefix=f"task4-bs2a-{name}-") as root:
+    with tempfile.TemporaryDirectory(prefix=f"receipt-bs2a-{name}-") as root:
         paths = fixture(root)
         before = state(root)
         target = paths[anchor]
@@ -1573,7 +1573,7 @@ def anchor_replacement_case(anchor):
 
 def symlink_replacement_case():
     name = "held-symlink-replacement"
-    with tempfile.TemporaryDirectory(prefix=f"task4-bs2a-{name}-") as root:
+    with tempfile.TemporaryDirectory(prefix=f"receipt-bs2a-{name}-") as root:
         paths = fixture(root)
         before = state(root)
         repo_id = (os.lstat(paths["repo"]).st_dev, os.lstat(paths["repo"]).st_ino)
@@ -1642,7 +1642,7 @@ def symlink_replacement_case():
 
 def regular_replacement_case():
     name = "held-regular-replacement"
-    with tempfile.TemporaryDirectory(prefix=f"task4-bs2a-{name}-") as root:
+    with tempfile.TemporaryDirectory(prefix=f"receipt-bs2a-{name}-") as root:
         paths = fixture(root)
         before = state(root)
         target = paths["input"]
@@ -1796,7 +1796,7 @@ regular_replacement_case()
 
 
 for name, link_count in (("self-cycle", 1), ("long-chain", 41)):
-    with tempfile.TemporaryDirectory(prefix=f"task4-bs2a-{name}-") as root:
+    with tempfile.TemporaryDirectory(prefix=f"receipt-bs2a-{name}-") as root:
         paths = fixture(root)
         if name == "self-cycle":
             os.symlink("cycle", os.path.join(paths["repo"], "cycle"))
@@ -1845,7 +1845,7 @@ for name, link_count in (("self-cycle", 1), ("long-chain", 41)):
             failures.append(f"{name}: fixture changed")
 
 
-with tempfile.TemporaryDirectory(prefix="task4-bs2a-access-") as root:
+with tempfile.TemporaryDirectory(prefix="receipt-bs2a-access-") as root:
     paths = fixture(root)
     nested = os.path.join(paths["stable"], "nested")
     os.mkdir(nested)
@@ -1925,7 +1925,7 @@ with tempfile.TemporaryDirectory(prefix="task4-bs2a-access-") as root:
         failures.append("access fixture changed")
 
 
-with tempfile.TemporaryDirectory(prefix="task4-bs2a-state-") as root:
+with tempfile.TemporaryDirectory(prefix="receipt-bs2a-state-") as root:
     paths = fixture(root)
     trace_before = state(root)
     valid = (
@@ -2043,7 +2043,7 @@ with tempfile.TemporaryDirectory(prefix="task4-bs2a-state-") as root:
         failures.append("trace-state: fixture snapshot comparison failed")
 
 
-with tempfile.TemporaryDirectory(prefix="task4-bs2a-relations-") as root:
+with tempfile.TemporaryDirectory(prefix="receipt-bs2a-relations-") as root:
     paths = fixture(root, many=True)
     before_absent = state(root)
     absent_trace = (
@@ -2269,7 +2269,7 @@ print("bs2a-confirmed-gaps-red-ok")
 #[test]
 fn discover_input_v1_candidate_only_rejects_reset_gaps() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let script = repo.join("scripts/task4-build-subject.py");
+    let script = repo.join("scripts/receipt-build-subject.py");
     let driver = r##"
 import importlib.util
 import ctypes
@@ -2284,9 +2284,9 @@ import tempfile
 import time
 import types
 
-spec = importlib.util.spec_from_file_location("task4_build_subject", sys.argv[1])
+spec = importlib.util.spec_from_file_location("receipt_build_subject", sys.argv[1])
 if spec is None or spec.loader is None:
-    raise SystemExit("could not import task4 build-subject script")
+    raise SystemExit("could not import receipt build-subject script")
 module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
@@ -2528,7 +2528,7 @@ with tempfile.TemporaryDirectory(prefix="x-") as root:
     ).encode("ascii")
     watched_paths = {
         os.path.realpath(sys.argv[1]),
-        os.path.realpath(os.path.join(os.getcwd(), "tests", "task4_build_subjects.rs")),
+        os.path.realpath(os.path.join(os.getcwd(), "tests", "receipt_build_subjects.rs")),
     }
     read_fd, write_fd = os.pipe()
     child = os.fork()
@@ -3207,7 +3207,7 @@ print("bs2a-reset-red-ok")
 #[test]
 fn discover_input_v1_candidate_only_rejects_final_review_gaps() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let script = repo.join("scripts/task4-build-subject.py");
+    let script = repo.join("scripts/receipt-build-subject.py");
     let driver = r##"
 import hashlib
 import importlib.util
@@ -3216,9 +3216,9 @@ import stat
 import sys
 import tempfile
 
-spec = importlib.util.spec_from_file_location("task4_build_subject", sys.argv[1])
+spec = importlib.util.spec_from_file_location("receipt_build_subject", sys.argv[1])
 if spec is None or spec.loader is None:
-    raise SystemExit("could not import task4 build-subject script")
+    raise SystemExit("could not import receipt build-subject script")
 module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
@@ -3449,7 +3449,7 @@ def write_trace(paths, payload, count, result=None):
 
 
 def run_trace(label, build_trace, *, expected=None, expected_error=None, **overrides):
-    with tempfile.TemporaryDirectory(prefix=f"task4-bs2a-final-{label}-") as root:
+    with tempfile.TemporaryDirectory(prefix=f"receipt-bs2a-final-{label}-") as root:
         paths = fixture(root)
         before = tree(root)
         try:
@@ -3469,7 +3469,7 @@ def run_trace(label, build_trace, *, expected=None, expected_error=None, **overr
 
 
 def run_operation(label, operation, *, expected_error):
-    with tempfile.TemporaryDirectory(prefix=f"task4-bs2a-final-{label}-") as root:
+    with tempfile.TemporaryDirectory(prefix=f"receipt-bs2a-final-{label}-") as root:
         paths = fixture(root)
         before = tree(root)
         try:
@@ -3506,7 +3506,7 @@ def map_alias_expected(paths):
     ])
 
 
-with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-alias-map-") as root:
+with tempfile.TemporaryDirectory(prefix="receipt-bs2a-final-alias-map-") as root:
     paths = fixture(root)
     alias = os.path.join(paths["repo"], "map-link")
     os.symlink(paths["dynamic"], alias)
@@ -3541,7 +3541,7 @@ def exec_alias_trace(paths):
     ).encode("ascii")
 
 
-with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-alias-exec-") as root:
+with tempfile.TemporaryDirectory(prefix="receipt-bs2a-final-alias-exec-") as root:
     paths = fixture(root)
     alias = os.path.join(paths["repo"], "exec-link")
     os.symlink(paths["tool"], alias)
@@ -3634,7 +3634,7 @@ def read_expected_for(paths):
 
 
 def run_read_success(label, payload, count):
-    with tempfile.TemporaryDirectory(prefix=f"task4-bs2a-final-{label}-") as root:
+    with tempfile.TemporaryDirectory(prefix=f"receipt-bs2a-final-{label}-") as root:
         paths = fixture(root)
         before = tree(root)
         try:
@@ -3663,7 +3663,7 @@ for label, payload, count in (
     ("write-empty-payload", b"", 0),
     ("write-valid-escape-control", b"\\x01\\x1f", 2),
 ):
-    with tempfile.TemporaryDirectory(prefix=f"task4-bs2a-final-{label}-") as root:
+    with tempfile.TemporaryDirectory(prefix=f"receipt-bs2a-final-{label}-") as root:
         paths = fixture(root)
         before = tree(root)
         try:
@@ -3725,7 +3725,7 @@ def mode_expected(paths):
 
 
 def run_mode_success(label, syscall):
-    with tempfile.TemporaryDirectory(prefix=f"task4-bs2a-final-{label}-") as root:
+    with tempfile.TemporaryDirectory(prefix=f"receipt-bs2a-final-{label}-") as root:
         paths = fixture(root)
         before = tree(root)
         try:
@@ -3758,7 +3758,7 @@ for syscall in ("open", "openat", "openat2"):
 # Sibling churn changes structural-directory metadata without replacing its
 # edge. Exercise it once between lstat and open, and once before the final edge
 # walk; a valid external read still has a literal one-row ledger.
-with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-structural-ancestor-sibling-churn-") as root:
+with tempfile.TemporaryDirectory(prefix="receipt-bs2a-final-structural-ancestor-sibling-churn-") as root:
     paths = fixture(root)
     expected = ledger([regular_row(paths["dynamic"], "tool", "read", "external")])
     markers = [
@@ -3815,7 +3815,7 @@ with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-structural-ancestor-si
 # The vendor anchor is structural-only until its exact directory probe. A
 # create/remove cycle after anchor custody but before trace evidence must not
 # make that valid empty-directory probe fail.
-with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-vendor-anchor-pre-evidence-churn-") as root:
+with tempfile.TemporaryDirectory(prefix="receipt-bs2a-final-vendor-anchor-pre-evidence-churn-") as root:
     paths = fixture(root)
     expected = ledger([("directory", "probe", "present", "0755", "0", digest(b""), "vendor:/")])
     marker = os.path.join(paths["vendor"], "pre-evidence-churn")
@@ -3864,7 +3864,7 @@ with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-vendor-anchor-pre-evid
 
 # An unobserved repo sibling must not become an input row. The audit hook fires
 # while the observed input is being acquired, after all named anchors are held.
-with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-unobserved-anchor-sibling-churn-") as root:
+with tempfile.TemporaryDirectory(prefix="receipt-bs2a-final-unobserved-anchor-sibling-churn-") as root:
     paths = fixture(root)
     expected = ledger([regular_row(paths["input"], "repo", "read", "repo")])
     marker = os.path.join(paths["repo"], "unobserved-sibling")
@@ -3908,7 +3908,7 @@ with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-unobserved-anchor-sibl
 
 # A create/remove cycle leaves the build root empty and must not be rejected by
 # directory timestamp changes used as an emptiness proxy.
-with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-build-root-ephemeral-churn-") as root:
+with tempfile.TemporaryDirectory(prefix="receipt-bs2a-final-build-root-ephemeral-churn-") as root:
     paths = fixture(root)
     expected = ledger([regular_row(paths["dynamic"], "tool", "read", "external")])
     marker = os.path.join(paths["build"], "ephemeral-entry")
@@ -3956,7 +3956,7 @@ with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-build-root-ephemeral-c
 # A provisional build-root ENOENT is suppressed by the later exact output
 # create. Churn immediately before the semantic final listdir must not reject
 # the otherwise empty build root.
-with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-build-provisional-enoent-ephemeral-churn-") as root:
+with tempfile.TemporaryDirectory(prefix="receipt-bs2a-final-build-provisional-enoent-ephemeral-churn-") as root:
     paths = fixture(root)
     expected = ledger([regular_row(paths["input"], "repo", "read", "repo")])
     marker = os.path.join(paths["build"], "provisional-ephemeral-entry")
@@ -4032,7 +4032,7 @@ with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-build-provisional-enoe
 
 # The build root is checked empty once, then an unrelated late entry must be
 # rejected by a direct final emptiness check and cleaned up by this test.
-with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-build-root-final-nonempty-") as root:
+with tempfile.TemporaryDirectory(prefix="receipt-bs2a-final-build-root-final-nonempty-") as root:
     paths = fixture(root)
     marker = os.path.join(paths["build"], "late-entry")
     seam = [False]
@@ -4080,7 +4080,7 @@ with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-build-root-final-nonem
 # preserves ENOENT and the canonical locator, so boundary identity must also
 # be reproduced by the final absent replay.
 def absent_final_case(label, requested_tail, first_missing):
-    with tempfile.TemporaryDirectory(prefix=f"task4-bs2a-final-{label}-") as root:
+    with tempfile.TemporaryDirectory(prefix=f"receipt-bs2a-final-{label}-") as root:
         paths = fixture(root)
         marker = os.path.join(paths["repo"], first_missing)
         state = {
@@ -4166,7 +4166,7 @@ absent_final_case(
 
 # Mutation caught: replacing the cached ENOTDIR blocker after the production
 # final-edge loop must invalidate the final absent replay.
-with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-cached-enotdir-") as root:
+with tempfile.TemporaryDirectory(prefix="receipt-bs2a-final-cached-enotdir-") as root:
     paths = fixture(root)
     blocker = os.path.join(paths["repo"], "blocker")
     backup = blocker + ".held"
@@ -4262,7 +4262,7 @@ with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-cached-enotdir-") as r
 
 # Mutation caught: replacing the cached nearest existing ENOENT parent after
 # its final edge stat/fstat observation must invalidate absent replay.
-with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-cached-enoent-") as root:
+with tempfile.TemporaryDirectory(prefix="receipt-bs2a-final-cached-enoent-") as root:
     paths = fixture(root)
     parent = os.path.join(paths["repo"], "missing-parent")
     backup = parent + ".held"
@@ -4351,7 +4351,7 @@ with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-cached-enoent-") as ro
 
 # Mutation caught: replaying an absent path through one symlink must reuse its
 # first target observation, producing exactly two total target reads.
-with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-absent-symlink-") as root:
+with tempfile.TemporaryDirectory(prefix="receipt-bs2a-final-absent-symlink-") as root:
     paths = fixture(root)
     link = os.path.join(paths["repo"], "absent-link")
     os.symlink("missing-target", link)
@@ -4402,7 +4402,7 @@ with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-absent-symlink-") as r
 
 # Mutation caught: a symlink metadata-only change at final listdir must fail
 # before final replay reads the cached target again.
-with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-absent-symlink-metadata-") as root:
+with tempfile.TemporaryDirectory(prefix="receipt-bs2a-final-absent-symlink-metadata-") as root:
     paths = fixture(root)
     link = os.path.join(paths["repo"], "absent-link")
     os.symlink("missing-target", link)
@@ -4479,7 +4479,7 @@ with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-absent-symlink-metadat
 # Mutation caught: an ENOENT observation of exact build/generated is ignored
 # only when the later exclusive create proves it was a logical output.
 def build_enoent_case(label, *, after_create):
-    with tempfile.TemporaryDirectory(prefix=f"task4-bs2a-final-{label}-") as root:
+    with tempfile.TemporaryDirectory(prefix=f"receipt-bs2a-final-{label}-") as root:
         paths = fixture(root)
         before = tree(root)
         missing = f'{paths["build"]}/generated'
@@ -4523,7 +4523,7 @@ build_enoent_case("build-enoent-after-create", after_create=True)
 
 # Mutation caught: present-regular metadata changed at the second held
 # build-root listdir must be rejected by final binding validation.
-with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-present-regular-metadata-") as root:
+with tempfile.TemporaryDirectory(prefix="receipt-bs2a-final-present-regular-metadata-") as root:
     paths = fixture(root)
     target = paths["dynamic"]
     original = os.stat(target, follow_symlinks=False)
@@ -4583,7 +4583,7 @@ with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-present-regular-metada
 
 # Mutation caught: a successful probe of a physically present but unowned
 # build-root input must be rejected before it can become a ledger row.
-with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-build-success-probe-") as root:
+with tempfile.TemporaryDirectory(prefix="receipt-bs2a-final-build-success-probe-") as root:
     paths = fixture(root)
     target = os.path.join(paths["build"], "unowned")
     build_identity = os.stat(paths["build"], follow_symlinks=False)
@@ -4638,7 +4638,7 @@ with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-build-success-probe-")
 
 # Mutation caught: a successful probe of a logically created build output is
 # evidence of the output event, not an emitted absent or build-root row.
-with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-created-output-probe-") as root:
+with tempfile.TemporaryDirectory(prefix="receipt-bs2a-final-created-output-probe-") as root:
     paths = fixture(root)
     before = tree(root)
     target = os.path.join(paths["build"], "generated")
@@ -4671,7 +4671,7 @@ with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-created-output-probe-"
 
 # Mutation caught: distinct hardlinked symlink locators in one resolution
 # chain must not be mistaken for an inode cycle.
-with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-hardlinked-symlink-") as root:
+with tempfile.TemporaryDirectory(prefix="receipt-bs2a-final-hardlinked-symlink-") as root:
     paths = fixture(root)
     directory_a = os.path.join(paths["repo"], "a")
     directory_b = os.path.join(directory_a, "b")
@@ -4752,7 +4752,7 @@ with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-hardlinked-symlink-") 
 
 # Mutation caught: repeated traversal of one symlink locator is not an inode
 # cycle; the target may be read again while the symlink row stays singular.
-with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-same-locator-") as root:
+with tempfile.TemporaryDirectory(prefix="receipt-bs2a-final-same-locator-") as root:
     paths = fixture(root)
     link = os.path.join(paths["repo"], "again")
     os.symlink(".", link)
@@ -4804,7 +4804,7 @@ with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-same-locator-") as roo
 
 # Mutation caught: the depth boundary permits exactly forty distinct symlink
 # links, while the existing forty-one-link case remains a rejection.
-with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-depth-40-") as root:
+with tempfile.TemporaryDirectory(prefix="receipt-bs2a-final-depth-40-") as root:
     paths = fixture(root)
     names = [f"chain{index}" for index in range(40)]
     for index, name in enumerate(names):
@@ -4858,7 +4858,7 @@ with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-depth-40-") as root:
 # Mutation caught: an ENOENT suffix must remain below its missing floor;
 # missing/.. must not be normalized into the existing repo anchor.
 def absent_dotdot_case(label, requested_tail, errno, setup, expected_rows=None, expect_error=None):
-    with tempfile.TemporaryDirectory(prefix=f"task4-bs2a-final-{label}-") as root:
+    with tempfile.TemporaryDirectory(prefix=f"receipt-bs2a-final-{label}-") as root:
         paths = fixture(root)
         setup(paths)
         before = tree(root)
@@ -4947,7 +4947,7 @@ absent_dotdot_case(
 
 # Mutation caught: mutating a resolved regular object's full identity after
 # its first held-fd observation must be rejected, not baseline-captured later.
-with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-event-time-baseline-") as root:
+with tempfile.TemporaryDirectory(prefix="receipt-bs2a-final-event-time-baseline-") as root:
     paths = fixture(root)
     target = paths["dynamic"]
     original = os.stat(target, follow_symlinks=False)
@@ -5042,7 +5042,7 @@ ledger_size_case("ledger-directory-size-4194305", "directory", 4194305, 0o755, "
 
 # Mutation caught: a final root full-identity-only change must invalidate an
 # emitted external:/ ENOENT-parent directory evidence row.
-with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-root-identity-") as root:
+with tempfile.TemporaryDirectory(prefix="receipt-bs2a-final-root-identity-") as root:
     paths = fixture(root)
     before = tree(root)
     real_fstat = os.fstat
@@ -5108,7 +5108,7 @@ with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-root-identity-") as ro
 
 # Mutation caught: a symlink must resolve before a later dotdot component;
 # lexically collapsing hop/.. would consume the repo decoy instead.
-with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-symlink-dotdot-") as root:
+with tempfile.TemporaryDirectory(prefix="receipt-bs2a-final-symlink-dotdot-") as root:
     paths = fixture(root)
     outside = os.path.join(root, "outside")
     outside_dir = os.path.join(outside, "dir")
@@ -5154,7 +5154,7 @@ with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-symlink-dotdot-") as r
 
 # Mutation caught: a directory symlink held as a dirfd must anchor both
 # relative openat and post-fchdir AT_FDCWD paths at its resolved target.
-with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-dirfd-fchdir-") as root:
+with tempfile.TemporaryDirectory(prefix="receipt-bs2a-final-dirfd-fchdir-") as root:
     paths = fixture(root)
     left = os.path.join(paths["repo"], "left")
     right = os.path.join(paths["repo"], "right")
@@ -5211,7 +5211,7 @@ with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-dirfd-fchdir-") as roo
 
 # Mutation caught: an open/close-only descriptor is a probe, while a positive
 # read is read access; open-time readability must not invent a read event.
-with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-open-only-probe-") as root:
+with tempfile.TemporaryDirectory(prefix="receipt-bs2a-final-open-only-probe-") as root:
     paths = fixture(root)
     probe = os.path.join(paths["repo"], "probe")
     readable = os.path.join(paths["repo"], "read")
@@ -5252,7 +5252,7 @@ with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-open-only-probe-") as 
 
 # A relation that changes between the initial lstat and the one authorized
 # open must be rejected; a stable replacement must not become a retry target.
-with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-relation-open-") as root:
+with tempfile.TemporaryDirectory(prefix="receipt-bs2a-final-relation-open-") as root:
     paths = fixture(root)
     original = paths["dynamic"]
     held = original + ".original"
@@ -5327,7 +5327,7 @@ print("bs2a-final-gap-red-ok")
 #[test]
 fn semantic_trace_v1_private_state_topology_contracts() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let test = repo.join("tests/python/test_task4_semantic_topology.py");
+    let test = repo.join("tests/python/test_receipt_semantic_topology.py");
     let output = Command::new("/usr/bin/python3")
         .args([
             "-I",
@@ -5341,7 +5341,7 @@ fn semantic_trace_v1_private_state_topology_contracts() {
         .env_clear()
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .output()
-        .expect("run task4 semantic topology tests through /usr/bin/python3");
+        .expect("run receipt semantic topology tests through /usr/bin/python3");
     assert!(
         output.status.success(),
         "BS2b semantic state topology contract failed: stdout={} stderr={}",
@@ -5353,7 +5353,7 @@ fn semantic_trace_v1_private_state_topology_contracts() {
 #[test]
 fn semantic_trace_v1_private_exec_event_contracts() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let test = repo.join("tests/python/test_task4_semantic_exec.py");
+    let test = repo.join("tests/python/test_receipt_semantic_exec.py");
     let output = Command::new("/usr/bin/python3")
         .args([
             "-I",
@@ -5371,7 +5371,7 @@ fn semantic_trace_v1_private_exec_event_contracts() {
         .env_clear()
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .output()
-        .expect("run task4 semantic exec tests through /usr/bin/python3");
+        .expect("run receipt semantic exec tests through /usr/bin/python3");
     assert!(
         output.status.success(),
         "BS2b semantic exec-event contract failed: stdout={} stderr={}",
@@ -5383,7 +5383,7 @@ fn semantic_trace_v1_private_exec_event_contracts() {
 #[test]
 fn semantic_trace_v1_private_syscall_lifecycle_contracts() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let test = repo.join("tests/python/test_task4_semantic_syscall.py");
+    let test = repo.join("tests/python/test_receipt_semantic_syscall.py");
     let output = Command::new("/usr/bin/python3")
         .args([
             "-I",
@@ -5403,7 +5403,7 @@ fn semantic_trace_v1_private_syscall_lifecycle_contracts() {
         .env_clear()
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .output()
-        .expect("run task4 semantic syscall lifecycle tests through /usr/bin/python3");
+        .expect("run receipt semantic syscall lifecycle tests through /usr/bin/python3");
     assert!(
         output.status.success(),
         "BS2b semantic syscall lifecycle contract failed: stdout={} stderr={}",
@@ -5414,7 +5414,7 @@ fn semantic_trace_v1_private_syscall_lifecycle_contracts() {
 #[test]
 fn semantic_trace_v1_private_open_description_contracts() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let test = repo.join("tests/python/test_task4_semantic_open_description.py");
+    let test = repo.join("tests/python/test_receipt_semantic_open_description.py");
     let selectors = [
         "SemanticTraceOpenDescriptionTests.test_open_alias_exec_close_identity",
         "SemanticTraceOpenDescriptionTests.test_local_pair_topology_and_io",
@@ -5446,7 +5446,7 @@ fn semantic_trace_v1_private_open_description_contracts() {
         .env_clear()
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .output()
-        .expect("run task4 semantic open-description tests through /usr/bin/python3");
+        .expect("run receipt semantic open-description tests through /usr/bin/python3");
     assert!(
         output.status.success(),
         "BS2b semantic open-description contract failed: stdout={} stderr={}",
@@ -5467,7 +5467,7 @@ fn semantic_trace_v1_private_open_description_contracts() {
 #[test]
 fn semantic_trace_v1_private_dup2_outcome_contracts() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let test = repo.join("tests/python/test_task4_semantic_dup2.py");
+    let test = repo.join("tests/python/test_receipt_semantic_dup2.py");
     let output = Command::new("/usr/bin/python3")
         .args([
             "-I",
@@ -5484,7 +5484,7 @@ fn semantic_trace_v1_private_dup2_outcome_contracts() {
         .env_clear()
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .output()
-        .expect("run task4 semantic dup2 outcome tests through /usr/bin/python3");
+        .expect("run receipt semantic dup2 outcome tests through /usr/bin/python3");
     assert!(
         output.status.success(),
         "BS2b semantic dup2 outcome contract failed: stdout={} stderr={}",
@@ -5496,7 +5496,7 @@ fn semantic_trace_v1_private_dup2_outcome_contracts() {
 #[test]
 fn semantic_trace_v1_private_dup_outcome_contracts() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let test = repo.join("tests/python/test_task4_semantic_dup.py");
+    let test = repo.join("tests/python/test_receipt_semantic_dup.py");
     let selectors = [
         "SemanticTraceDupTests.test_success_failure_and_restart_outcomes",
         "SemanticTraceDupTests.test_result_and_pending_validation",
@@ -5530,7 +5530,7 @@ fn semantic_trace_v1_private_dup_outcome_contracts() {
 #[test]
 fn semantic_trace_v1_private_fd_table_mutator_admission_contracts() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let test = repo.join("tests/python/test_task4_semantic_fd_table_mutator.py");
+    let test = repo.join("tests/python/test_receipt_semantic_fd_table_mutator.py");
     let selectors = [
         "SemanticTraceFdTableMutatorTests.test_first_valid_admission",
         "SemanticTraceFdTableMutatorTests.test_retry_contention_and_copied_table",
@@ -5563,7 +5563,7 @@ fn semantic_trace_v1_private_fd_table_mutator_admission_contracts() {
         .env_clear()
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .output()
-        .expect("run task4 FD-table-mutator tests through /usr/bin/python3");
+        .expect("run receipt FD-table-mutator tests through /usr/bin/python3");
     assert!(
         output.status.success(),
         "BS2b FD-table-mutator contract failed: stdout={} stderr={}",
@@ -5584,7 +5584,7 @@ fn semantic_trace_v1_private_fd_table_mutator_admission_contracts() {
 #[test]
 fn semantic_trace_v1_private_close_outcome_contracts() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let test = repo.join("tests/python/test_task4_semantic_close.py");
+    let test = repo.join("tests/python/test_receipt_semantic_close.py");
     let output = Command::new("/usr/bin/python3")
         .args([
             "-I",
@@ -5602,7 +5602,7 @@ fn semantic_trace_v1_private_close_outcome_contracts() {
         .env_clear()
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .output()
-        .expect("run task4 semantic close outcome tests through /usr/bin/python3");
+        .expect("run receipt semantic close outcome tests through /usr/bin/python3");
     assert!(
         output.status.success(),
         "BS2b semantic close outcome contract failed: stdout={} stderr={}",
@@ -5614,10 +5614,10 @@ fn semantic_trace_v1_private_close_outcome_contracts() {
 #[test]
 fn bs2b_s9_fcntl_experiment_normalization_privacy_contracts() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let script = repo.join("scripts/task4-fcntl-experiment.py");
+    let script = repo.join("scripts/receipt-fcntl-experiment.py");
     assert!(
         script.is_file(),
-        "RED1 missing scripts/task4-fcntl-experiment.py"
+        "RED1 missing scripts/receipt-fcntl-experiment.py"
     );
 
     fn record(seq: u64, kind: u16) -> [u8; 128] {
@@ -6657,9 +6657,9 @@ import os
 import sys
 import tempfile
 
-spec = importlib.util.spec_from_file_location("task4_s9_fcntl_experiment", sys.argv[1])
+spec = importlib.util.spec_from_file_location("receipt_s9_fcntl_experiment", sys.argv[1])
 if spec is None or spec.loader is None:
-    raise SystemExit("could not import task4 fcntl experiment")
+    raise SystemExit("could not import receipt fcntl experiment")
 module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
@@ -6680,7 +6680,7 @@ def expect_invalid(label, invoke):
         fail(label, "accepted invalid input")
 
 def with_raw(raw, invoke):
-    fd, path = tempfile.mkstemp(prefix="task4-s9-", dir=os.environ.get("TMPDIR"))
+    fd, path = tempfile.mkstemp(prefix="receipt-s9-", dir=os.environ.get("TMPDIR"))
     try:
         os.fchmod(fd, 0o600)
         os.ftruncate(fd, len(raw))
@@ -6692,16 +6692,16 @@ def with_raw(raw, invoke):
         os.close(fd)
         os.unlink(path)
 
-expected_bytes = os.environ["TASK4_EXPECTED_JSON"].encode("ascii")
+expected_bytes = os.environ["RECEIPT_EXPECTED_JSON"].encode("ascii")
 expected = json.loads(expected_bytes)
 expected_rows = {
     (row["command"], row["argument"], row["result"], row["errno"]): row["count"]
     for row in expected["rows"]
 }
-if module._encode_aggregate({}) != os.environ["TASK4_EMPTY_JSON"].encode("ascii"):
+if module._encode_aggregate({}) != os.environ["RECEIPT_EMPTY_JSON"].encode("ascii"):
     fail("empty aggregate", "canonical empty bytes differ")
-module._privacy_scan_aggregate(os.environ["TASK4_EMPTY_JSON"].encode("ascii"))
-golden = bytes.fromhex(os.environ["TASK4_RAW_GOLDEN"])
+module._privacy_scan_aggregate(os.environ["RECEIPT_EMPTY_JSON"].encode("ascii"))
+golden = bytes.fromhex(os.environ["RECEIPT_RAW_GOLDEN"])
 
 def parse_golden(fd):
     before = os.lseek(fd, 0, os.SEEK_CUR)
@@ -6716,8 +6716,8 @@ if module._encode_aggregate(expected_rows) != expected_bytes:
     fail("all-kinds golden", "canonical bytes differ")
 module._privacy_scan_aggregate(expected_bytes)
 
-duplicate_raw = bytes.fromhex(os.environ["TASK4_DUPLICATE_RAW"])
-duplicate_expected = json.loads(os.environ["TASK4_DUPLICATE_JSON"])
+duplicate_raw = bytes.fromhex(os.environ["RECEIPT_DUPLICATE_RAW"])
+duplicate_expected = json.loads(os.environ["RECEIPT_DUPLICATE_JSON"])
 duplicate_rows = {
     (row["command"], row["argument"], row["result"], row["errno"]): row["count"]
     for row in duplicate_expected["rows"]
@@ -6727,7 +6727,7 @@ def parse_duplicate(fd):
         fail("duplicate raw", "rows did not merge")
 with_raw(duplicate_raw, parse_duplicate)
 
-clone_exitless = bytes.fromhex(os.environ["TASK4_CLONE_EXITLESS_RAW"])
+clone_exitless = bytes.fromhex(os.environ["RECEIPT_CLONE_EXITLESS_RAW"])
 def parse_clone_exitless(fd):
     try:
         rows = module._parse_raw(fd)
@@ -6737,15 +6737,15 @@ def parse_clone_exitless(fd):
         fail("clone-exitless-positive", f"expected empty rows, got {rows!r}")
 with_raw(clone_exitless, parse_clone_exitless)
 
-for item in filter(None, os.environ["TASK4_CLONE_EXITLESS_NEGATIVE_CASES"].split("\x1e")):
+for item in filter(None, os.environ["RECEIPT_CLONE_EXITLESS_NEGATIVE_CASES"].split("\x1e")):
     label, encoded = item.split("\x1f", 1)
     expect_invalid(label, lambda encoded=encoded: with_raw(bytes.fromhex(encoded), module._parse_raw))
 
-for item in filter(None, os.environ["TASK4_RAW_CASES"].split("\x1e")):
+for item in filter(None, os.environ["RECEIPT_RAW_CASES"].split("\x1e")):
     label, encoded = item.split("\x1f", 1)
     expect_invalid(label, lambda encoded=encoded: with_raw(bytes.fromhex(encoded), module._parse_raw))
 
-fd, path = tempfile.mkstemp(prefix="task4-s9-cap-", dir=os.environ.get("TMPDIR"))
+fd, path = tempfile.mkstemp(prefix="receipt-s9-cap-", dir=os.environ.get("TMPDIR"))
 try:
     os.fchmod(fd, 0o600)
     os.ftruncate(fd, 128 * 1024 * 1024 + 128)
@@ -6759,7 +6759,7 @@ finally:
     os.close(fd)
     os.unlink(path)
 
-for item in os.environ["TASK4_NORMALIZATION_CASES"].split("\x1e"):
+for item in os.environ["RECEIPT_NORMALIZATION_CASES"].split("\x1e"):
     label, command, argument, result, wanted = item.split("\x1f")
     values = (int(command), int(argument), int(result))
     if wanted == "invalid":
@@ -6794,7 +6794,7 @@ for label, values in (
 ):
     expect_invalid(label, lambda values=values: module._normalize(*values))
 
-for item in os.environ["TASK4_AGGREGATE_CASES"].split("\x1e"):
+for item in os.environ["RECEIPT_AGGREGATE_CASES"].split("\x1e"):
     label, encoded = item.split("\x1f", 1)
     expect_invalid(label, lambda encoded=encoded: module._privacy_scan_aggregate(encoded.encode("ascii")))
 expect_invalid(
@@ -6825,7 +6825,7 @@ for argv in ([], ["produce"], ["capture"], ["check"], ["--help"], ["unknown"]):
     if code != 77 or out or err:
         fail("refusal-" + "-".join(argv or ["empty"]), f"unexpected result {code!r}, {out!r}, {err!r}")
 
-held_case = os.environ.get("TASK4_HELD_CASE")
+held_case = os.environ.get("RECEIPT_HELD_CASE")
 if held_case is None:
     print("bs2b-s9-fcntl-experiment-normalization-privacy-ok")
     raise SystemExit(0)
@@ -6975,19 +6975,19 @@ raise SystemExit(0)
             .current_dir(repo)
             .env_clear()
             .env("PYTHONDONTWRITEBYTECODE", "1")
-            .env("TASK4_RAW_GOLDEN", hex(&raw_golden))
-            .env("TASK4_EMPTY_JSON", empty_json)
-            .env("TASK4_EXPECTED_JSON", expected_json)
-            .env("TASK4_DUPLICATE_RAW", hex(&duplicate_raw))
-            .env("TASK4_DUPLICATE_JSON", duplicate_json)
-            .env("TASK4_CLONE_EXITLESS_RAW", hex(&clone_exitless_positive))
+            .env("RECEIPT_RAW_GOLDEN", hex(&raw_golden))
+            .env("RECEIPT_EMPTY_JSON", empty_json)
+            .env("RECEIPT_EXPECTED_JSON", expected_json)
+            .env("RECEIPT_DUPLICATE_RAW", hex(&duplicate_raw))
+            .env("RECEIPT_DUPLICATE_JSON", duplicate_json)
+            .env("RECEIPT_CLONE_EXITLESS_RAW", hex(&clone_exitless_positive))
             .env(
-                "TASK4_CLONE_EXITLESS_NEGATIVE_CASES",
+                "RECEIPT_CLONE_EXITLESS_NEGATIVE_CASES",
                 &clone_exitless_negative_cases,
             )
-            .env("TASK4_RAW_CASES", serialize_cases(chunk))
-            .env("TASK4_NORMALIZATION_CASES", &normalization_cases)
-            .env("TASK4_AGGREGATE_CASES", &aggregate_cases)
+            .env("RECEIPT_RAW_CASES", serialize_cases(chunk))
+            .env("RECEIPT_NORMALIZATION_CASES", &normalization_cases)
+            .env("RECEIPT_AGGREGATE_CASES", &aggregate_cases)
             .output()
             .expect("run BS2b-S9 normalization/privacy contract");
         assert!(
@@ -7039,20 +7039,20 @@ raise SystemExit(0)
             .current_dir(repo)
             .env_clear()
             .env("PYTHONDONTWRITEBYTECODE", "1")
-            .env("TASK4_RAW_GOLDEN", hex(&raw_golden))
-            .env("TASK4_EMPTY_JSON", empty_json)
-            .env("TASK4_EXPECTED_JSON", expected_json)
-            .env("TASK4_DUPLICATE_RAW", hex(&duplicate_raw))
-            .env("TASK4_DUPLICATE_JSON", duplicate_json)
-            .env("TASK4_CLONE_EXITLESS_RAW", hex(&clone_exitless_positive))
+            .env("RECEIPT_RAW_GOLDEN", hex(&raw_golden))
+            .env("RECEIPT_EMPTY_JSON", empty_json)
+            .env("RECEIPT_EXPECTED_JSON", expected_json)
+            .env("RECEIPT_DUPLICATE_RAW", hex(&duplicate_raw))
+            .env("RECEIPT_DUPLICATE_JSON", duplicate_json)
+            .env("RECEIPT_CLONE_EXITLESS_RAW", hex(&clone_exitless_positive))
             .env(
-                "TASK4_CLONE_EXITLESS_NEGATIVE_CASES",
+                "RECEIPT_CLONE_EXITLESS_NEGATIVE_CASES",
                 &clone_exitless_negative_cases,
             )
-            .env("TASK4_RAW_CASES", "")
-            .env("TASK4_NORMALIZATION_CASES", &normalization_cases)
-            .env("TASK4_AGGREGATE_CASES", &aggregate_cases)
-            .env("TASK4_HELD_CASE", case)
+            .env("RECEIPT_RAW_CASES", "")
+            .env("RECEIPT_NORMALIZATION_CASES", &normalization_cases)
+            .env("RECEIPT_AGGREGATE_CASES", &aggregate_cases)
+            .env("RECEIPT_HELD_CASE", case)
             .stdin(raw)
             .stdout(Stdio::from(output))
             .stderr(Stdio::piped())
@@ -7250,10 +7250,10 @@ raise SystemExit(0)
 #[test]
 fn bs2b_s9_native_ptrace_lifecycle_contracts() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let collector = repo.join("scripts/fixtures/task4-fcntl-trace.c");
+    let collector = repo.join("scripts/fixtures/receipt-fcntl-trace.c");
     assert!(
         collector.is_file(),
-        "RED2 missing scripts/fixtures/task4-fcntl-trace.c"
+        "RED2 missing scripts/fixtures/receipt-fcntl-trace.c"
     );
     const HEADER: u16 = 0x01;
     const ROOT: u16 = 0x10;
@@ -7270,9 +7270,9 @@ fn bs2b_s9_native_ptrace_lifecycle_contracts() {
     const FCNTL_ENTRY: u16 = 0x20;
     const FCNTL_EXIT: u16 = 0x21;
 
-    let experiment = repo.join("scripts/task4-fcntl-experiment.py");
+    let experiment = repo.join("scripts/receipt-fcntl-experiment.py");
     assert!(experiment.is_file(), "RED2 missing Python parser");
-    let test_file = repo.join("tests/task4_build_subjects.rs");
+    let test_file = repo.join("tests/receipt_build_subjects.rs");
     let input_paths = [&test_file, &experiment, &collector];
     let snapshot_input = |path: &Path| {
         let metadata = fs::metadata(path).expect("snapshot RED2 input metadata");
@@ -7318,7 +7318,7 @@ fn bs2b_s9_native_ptrace_lifecycle_contracts() {
     let _temp_guard = TempGuard(temp_root.clone());
     fs::set_permissions(&temp_root, fs::Permissions::from_mode(0o700))
         .expect("set RED2 temporary directory mode");
-    let binary = temp_root.join("task4-fcntl-trace");
+    let binary = temp_root.join("receipt-fcntl-trace");
     let compile = Command::new("/usr/bin/cc")
         .args([
             "-std=c11",
@@ -7368,7 +7368,7 @@ import time
 
 binary, experiment, evidence = sys.argv[1:]
 
-spec = importlib.util.spec_from_file_location("task4_s9_experiment", experiment)
+spec = importlib.util.spec_from_file_location("receipt_s9_experiment", experiment)
 if spec is None or spec.loader is None:
     raise SystemExit("RED2 could not import Python parser")
 module = importlib.util.module_from_spec(spec)

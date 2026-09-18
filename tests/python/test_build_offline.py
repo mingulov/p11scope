@@ -2,7 +2,6 @@
 """Native tests for the fixed offline recipient coordinator."""
 
 import json
-import importlib.util
 import os
 from pathlib import Path
 import select
@@ -21,6 +20,10 @@ REPOSITORY = Path(__file__).resolve().parents[2]
 FIXTURES = REPOSITORY / "tests/fixtures/build-offline"
 OFFLINE_TESTS = REPOSITORY / "tests/python/test_offline_dependencies.py"
 
+sys.path.insert(0, str(REPOSITORY / "scripts"))
+sys.dont_write_bytecode = True
+from _loader import load_path
+
 
 def extract_archive(archive: Path, destination: Path) -> subprocess.CompletedProcess[str]:
     destination.mkdir(parents=True, exist_ok=True)
@@ -31,16 +34,8 @@ def extract_archive(archive: Path, destination: Path) -> subprocess.CompletedPro
     )
 
 
-def load_module(path, name):
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
-
-
-OFFLINE_FIXTURES = load_module(OFFLINE_TESTS, "build_offline_real_fixture")
-BUILD_MODULE = load_module(REPOSITORY / "scripts/build-offline.py", "build_offline_module")
+OFFLINE_FIXTURES = load_path(OFFLINE_TESTS, "build_offline_real_fixture")
+BUILD_MODULE = load_path(REPOSITORY / "scripts/build-offline.py", "build_offline_module")
 
 
 def restrictive_child_umask():
@@ -125,6 +120,7 @@ class BuildOfflineTests(unittest.TestCase):
         (self.source / "test-record").mkdir()
         copies = {
             REPOSITORY / "scripts/build-offline.py": self.source / "scripts/build-offline.py",
+            REPOSITORY / "scripts/_loader.py": self.source / "scripts/_loader.py",
             REPOSITORY / "scripts/build-offline.sh": self.source / "scripts/build-offline.sh",
             REPOSITORY / "scripts/prepared-dependency-tools.sh":
                 self.source / "scripts/prepared-dependency-tools.sh",

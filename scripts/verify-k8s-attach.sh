@@ -16,60 +16,7 @@ WORK=${P11SCOPE_K8S_WORK:-target/k8s-e2e}
 KEEP=0
 
 assert_k8s_evidence() {
-    python3 -I - "$@" <<'PY'
-import copy
-import json
-import sys
-
-
-def oracle(document):
-    evidence = document["evidence"]
-    assert evidence["authority"] == "hash-pinned", evidence["authority"]
-    assert evidence["attached_probes"] > 0, evidence["attached_probes"]
-    assert evidence["slots"] > 0, evidence["slots"]
-    paths = [m["path"] for m in document["capture"]["modules"]]
-    assert any(p.endswith("libsofthsm2.so") for p in paths), paths
-
-
-def good():
-    return {
-        "evidence": {
-            "authority": "hash-pinned",
-            "attached_probes": 136,
-            "slots": 68,
-        },
-        "capture": {"modules": [{"path": "/usr/lib/softhsm/libsofthsm2.so"}]},
-    }
-
-
-def mutate(document, path, value):
-    mutated = copy.deepcopy(document)
-    cursor = mutated
-    for key in path[:-1]:
-        cursor = cursor[key]
-    cursor[path[-1]] = value
-    return mutated
-
-
-if sys.argv[1] == "--self-test":
-    oracle(good())
-    for label, path, value in [
-        ("authority", ["evidence", "authority"], "unpinned"),
-        ("attached", ["evidence", "attached_probes"], 0),
-        ("slots", ["evidence", "slots"], 0),
-        ("captured module", ["capture", "modules"], []),
-    ]:
-        try:
-            oracle(mutate(good(), path, value))
-        except (AssertionError, KeyError, IndexError):
-            continue
-        raise SystemExit(f"mutation accepted: {label}")
-    print("k8s-e2e oracle mutations rejected: OK")
-    raise SystemExit(0)
-
-oracle(json.load(open(sys.argv[1])))
-print("k8s capture: OK")
-PY
+    python3 -I scripts/lane-k8s-attach-oracle.py "$@"
 }
 
 usage() {

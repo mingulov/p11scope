@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import hashlib
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -17,16 +16,18 @@ import unittest
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
+
+sys.path.insert(0, str(REPOSITORY / "scripts"))
+sys.dont_write_bytecode = True
+from _loader import load_path
+
 CHECKER = REPOSITORY / "scripts" / "check-prepared-dependencies.py"
 PREPARER = REPOSITORY / "scripts" / "prepare-dependencies.py"
+LOADER = REPOSITORY / "scripts" / "_loader.py"
 
 
 def load_module(path: Path, name: str):
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
+    return load_path(path, name)
 
 
 class Fixture:
@@ -35,6 +36,7 @@ class Fixture:
         (self.root / "scripts").mkdir(parents=True)
         shutil.copy2(CHECKER, self.root / "scripts" / CHECKER.name)
         shutil.copy2(PREPARER, self.root / "scripts" / PREPARER.name)
+        shutil.copy2(LOADER, self.root / "scripts" / LOADER.name)
         (self.root / "third-party/patches/demo-1.0.0").mkdir(parents=True)
         (self.root / "Cargo.toml").write_text("[workspace]\n", encoding="utf-8")
         (self.root / "crates/ebpf").mkdir(parents=True)

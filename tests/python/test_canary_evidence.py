@@ -9,7 +9,6 @@ import argparse
 import copy
 import ctypes
 import hashlib
-import importlib.util
 import inspect
 import json
 import mmap
@@ -32,20 +31,19 @@ SUBJECT = ROOT / "scripts" / "check-canary-evidence.py"
 DUMPER = ROOT / "scripts" / "dump-owned-bpf-maps.py"
 CAPTURE_CHECKER = ROOT / "scripts" / "check-capture-evidence.py"
 
+sys.path.insert(0, str(ROOT / "scripts"))
+sys.dont_write_bytecode = True
+from _loader import load_path
+
 
 def load_subject(bits):
-    spec = importlib.util.spec_from_file_location(f"canary_evidence_{bits}", SUBJECT)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    module = load_path(SUBJECT, f"canary_evidence_{bits}")
     module.initialize(bits)
     return module
 
 
 def load_dumper():
-    spec = importlib.util.spec_from_file_location("owned_bpf_maps", DUMPER)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return load_path(DUMPER, "owned_bpf_maps")
 
 
 def refusal_cells(item, errno=524):
@@ -60,10 +58,7 @@ def refusal_cells(item, errno=524):
 
 
 def load_capture_checker():
-    spec = importlib.util.spec_from_file_location("capture_evidence", CAPTURE_CHECKER)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return load_path(CAPTURE_CHECKER, "capture_evidence")
 
 
 def owned_metrics_document(bits, calls=30):
@@ -1046,10 +1041,17 @@ class TaskStorageReaderTests(unittest.TestCase):
         dumper = load_dumper()
         with tempfile.TemporaryDirectory() as directory:
             pidfile = Path(directory) / "eof-child.pid"
-            command = [sys.executable, "-c",
-                       "import os,pathlib,time; "
-                       f"pathlib.Path({str(pidfile)!r}).write_text(str(os.getpid())); "
-                       "os.write(1, b'[]'); os.close(1); os.close(2); time.sleep(0.7)"]
+            # Load hardening: the 50ms budget must cover the fixture child's
+            # startup before it can EOF the pipes. A python child starts in
+            # ~10ms idle but 50-200ms+ under host load, so the deadline kills
+            # it before the pidfile write and the post-acquisition read finds
+            # nothing (the child is already dead then, so no post-hoc wait can
+            # recover it). A sh child starts in ~2ms with identical
+            # EOF-then-linger semantics: same pidfile pid across the exec,
+            # same two output bytes, same 0.7s linger past the deadline.
+            command = ["/bin/sh", "-c",
+                       "echo $$ > \"$1\"; printf '[]'; exec 1>&- 2>&-; exec /bin/sleep 0.7",
+                       "sh", str(pidfile)]
             previous = signal.signal(
                 signal.SIGALRM,
                 lambda _signal, _frame: (_ for _ in ()).throw(

@@ -412,32 +412,7 @@ signal_pinned_process() {
         root) spp_python='sudo -n python3 -I' ;;
         *) return 1 ;;
     esac
-    $spp_python - "$@" <<'PY'
-import os
-import signal
-import sys
-
-signals = {
-    "CONT": signal.SIGCONT,
-    "INT": signal.SIGINT,
-    "KILL": signal.SIGKILL,
-    "STOP": signal.SIGSTOP,
-    "TERM": signal.SIGTERM,
-}
-if len(sys.argv) not in (4, 5) or sys.argv[1] not in signals:
-    raise SystemExit("usage: SIGNAL PID STARTTIME [SID]")
-
-pid, expected = int(sys.argv[2]), int(sys.argv[3])
-expected_sid = int(sys.argv[4]) if len(sys.argv) == 5 else None
-fd = os.pidfd_open(pid)
-raw = open(f"/proc/{pid}/stat", "rb").read()
-tail = raw.rsplit(b") ", 1)[1].split()
-if len(tail) < 20 or int(tail[19]) != expected:
-    raise SystemExit(f"refusing changed process identity {pid}")
-if expected_sid is not None and int(tail[3]) != expected_sid:
-    raise SystemExit(f"refusing changed process session {pid}")
-signal.pidfd_send_signal(fd, signals[sys.argv[1]], None, 0)
-PY
+    $spp_python scripts/lane-lib-oracle-1.py "$@"
 }
 
 signal_verified_process() {
@@ -462,52 +437,7 @@ launch_user_recorded_process_group() {
     umask 077
     USER_PROCESS_SID=
     export USER_PROCESS_SID
-    python3 -I - "$lurpg_pidfile" "$@" > "$lurpg_log" 2>&1 <<'PY' &
-import json
-import os
-import sys
-
-
-def stat(pid):
-    raw = open(f"/proc/{pid}/stat", "rb").read()
-    _, separator, tail = raw.rpartition(b") ")
-    if not separator:
-        raise ValueError("malformed proc stat")
-    fields = tail.split()
-    if len(fields) < 20:
-        raise ValueError("short proc stat")
-    return int(fields[19]), int(fields[2]), int(fields[3])
-
-
-pidfile, command = sys.argv[1], sys.argv[2:]
-if not command:
-    raise SystemExit("missing command")
-os.umask(0o077)
-os.setsid()
-pid = os.getpid()
-starttime, pgid, sid = stat(pid)
-if pid != pgid or pid != sid:
-    raise SystemExit("new session leader does not lead its session and process group")
-record = json.dumps(
-    {"pid": pid, "starttime": starttime, "pgid": pgid, "sid": sid, "argv": command},
-    separators=(",", ":"),
-).encode() + b"\n"
-flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-if hasattr(os, "O_NOFOLLOW"):
-    flags |= os.O_NOFOLLOW
-fd = os.open(pidfile, flags, 0o600)
-try:
-    os.write(fd, record)
-    os.fsync(fd)
-finally:
-    os.close(fd)
-directory = os.open(os.path.dirname(os.path.abspath(pidfile)) or ".", os.O_RDONLY)
-try:
-    os.fsync(directory)
-finally:
-    os.close(directory)
-os.execvp(command[0], command)
-PY
+    python3 -I scripts/lane-lib-oracle-2.py "$lurpg_pidfile" "$@" > "$lurpg_log" 2>&1 &
     USER_PROCESS_LAUNCH_PID=$!
     # This direct child identity is trap-visible before the durable group
     # record appears. It is never refreshed after launch failure.
@@ -530,28 +460,8 @@ PY
         echo "user process group identity was not recorded" >&2
         return 1
     }
-    lurpg_record=$(python3 -I - "$lurpg_pidfile" "$USER_PROCESS_LAUNCH_PID" \
-        "$USER_PROCESS_INITIAL_STARTTIME" "$@" <<'PY'
-import json
-import sys
-
-
-record = json.load(open(sys.argv[1], encoding="utf-8"))
-launcher = int(sys.argv[2])
-initial_starttime = int(sys.argv[3])
-expected_argv = sys.argv[4:]
-if set(record) != {"pid", "starttime", "pgid", "sid", "argv"}:
-    raise SystemExit("malformed user process-group identity")
-if not all(isinstance(record[name], int) and record[name] > 0 for name in ("pid", "starttime", "pgid", "sid")):
-    raise SystemExit("malformed user process-group identity")
-if not isinstance(record["argv"], list) or not all(isinstance(item, str) for item in record["argv"]):
-    raise SystemExit("malformed user process-group argv")
-if record["pid"] != launcher or record["starttime"] != initial_starttime:
-    raise SystemExit("user process-group identity does not match launch")
-if record["pid"] != record["pgid"] or record["pid"] != record["sid"] or record["argv"] != expected_argv:
-    raise SystemExit("user process-group identity does not match launch")
-print(record["pid"], record["starttime"], record["pgid"], record["sid"])
-PY
+    lurpg_record=$(python3 -I scripts/lane-lib-oracle-3.py "$lurpg_pidfile" "$USER_PROCESS_LAUNCH_PID" \
+        "$USER_PROCESS_INITIAL_STARTTIME" "$@"
 ) || {
         lurpg_status=$?
         return "$lurpg_status"
@@ -564,26 +474,7 @@ PY
     USER_PROCESS_SID=$4
     export USER_PROCESS_SID
 
-    python3 -I - "$USER_PROCESS_PID" "$USER_PROCESS_STARTTIME" "$USER_PROCESS_PGID" "$USER_PROCESS_SID" <<'PY'
-import sys
-
-
-def stat(pid):
-    raw = open(f"/proc/{pid}/stat", "rb").read()
-    _, separator, tail = raw.rpartition(b") ")
-    if not separator:
-        raise ValueError("malformed proc stat")
-    fields = tail.split()
-    if len(fields) < 20:
-        raise ValueError("short proc stat")
-    return int(fields[19]), int(fields[2]), int(fields[3])
-
-
-pid, starttime, pgid, sid = map(int, sys.argv[1:5])
-actual_starttime, actual_pgid, actual_sid = stat(pid)
-if actual_starttime != starttime or actual_pgid != pgid or actual_sid != sid or pid != pgid or pid != sid:
-    raise SystemExit("user process-session identity changed before use")
-PY
+    python3 -I scripts/lane-lib-oracle-4.py "$USER_PROCESS_PID" "$USER_PROCESS_STARTTIME" "$USER_PROCESS_PGID" "$USER_PROCESS_SID"
     lurpg_status=$?
     [ "$lurpg_status" -eq 0 ] || {
         return "$lurpg_status"
@@ -595,79 +486,7 @@ PY
 snapshot_user_process_session() {
     sups_sid=$1
     case $sups_sid in ''|*[!0-9]*) return 1 ;; esac
-    python3 -I - "$sups_sid" <<'PY'
-import glob
-import hashlib
-import json
-import os
-import sys
-
-
-def stat(pid):
-    raw = open(f"/proc/{pid}/stat", "rb").read()
-    _, separator, tail = raw.rpartition(b") ")
-    if not separator:
-        raise ValueError("malformed proc stat")
-    fields = tail.split()
-    if len(fields) < 20:
-        raise ValueError("short proc stat")
-    return int(fields[19]), int(fields[1]), int(fields[2]), int(fields[3])
-
-
-sids = int(sys.argv[1])
-if sids <= 0:
-    raise SystemExit("invalid process session")
-members = []
-for path in glob.glob("/proc/[0-9]*"):
-    pid = int(path.rsplit("/", 1)[1])
-    try:
-        starttime, ppid, actual_pgid, actual_sid = stat(pid)
-    except (FileNotFoundError, ProcessLookupError):
-        # No membership can be established for a process that vanished before
-        # its first stat read. Once the target group is identified below, any
-        # later disappearance is a hard error.
-        continue
-    except (OSError, ValueError) as error:
-        raise SystemExit(f"cannot inspect process {pid}: {error}")
-    if actual_sid != sids:
-        continue
-    try:
-        def projection():
-            digest = hashlib.sha256()
-            with open(f"/proc/{pid}/exe", "rb") as source:
-                for block in iter(lambda: source.read(131072), b""):
-                    digest.update(block)
-            raw_argv = open(f"/proc/{pid}/cmdline", "rb").read()
-            if not raw_argv or not raw_argv.endswith(b"\0"):
-                raise ValueError("malformed argv")
-            argv = [item.decode("utf-8", "strict") for item in raw_argv[:-1].split(b"\0")]
-            if not argv or not argv[0]:
-                raise ValueError("empty argv")
-            return digest.hexdigest(), argv
-
-        digest, argv = projection()
-        middle = stat(pid)
-        final_digest, final_argv = projection()
-        final = stat(pid)
-    except (FileNotFoundError, OSError, UnicodeError, ValueError) as error:
-        raise SystemExit(f"cannot close process-group member {pid}: {error}")
-    if middle != (starttime, ppid, actual_pgid, actual_sid) or final != middle:
-        raise SystemExit(f"process-session member {pid} changed during snapshot")
-    if (final_digest, final_argv) != (digest, argv):
-        raise SystemExit(f"process-group member {pid} execed during snapshot")
-    members.append(
-        {
-            "pid": pid,
-            "starttime": starttime,
-            "ppid": ppid,
-            "pgid": actual_pgid,
-            "sid": actual_sid,
-            "exe_sha256": digest,
-            "argv": argv,
-        }
-    )
-print(json.dumps(sorted(members, key=lambda member: member["pid"]), separators=(",", ":")))
-PY
+    python3 -I scripts/lane-lib-oracle-5.py "$sups_sid"
 }
 
 snapshot_user_process_group() {
@@ -768,37 +587,5 @@ discover_copied_provider() {
 # and every attach object at the same file inside the container's mount
 # namespace, refusing any object that escapes the copied directory.
 rewrite_container_manifest() {
-    timeout --signal=TERM --kill-after=5s 60s python3 -I - "$@" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-source, destination, safe_root, target_root = sys.argv[1:5]
-safe_root = Path(safe_root).resolve(strict=True)
-target_root = Path(target_root)
-if not target_root.is_absolute():
-    raise SystemExit(f"target root is not absolute: {target_root}")
-manifest = json.loads(Path(source).read_text(encoding="utf-8"))
-if manifest.get("schema") != "p11scope-manifest/5":
-    raise SystemExit(f"container manifest is not schema v5: {manifest.get('schema')!r}")
-if not manifest.get("objects"):
-    raise SystemExit("container manifest has no attach objects")
-
-
-def target(path):
-    resolved = Path(path).resolve(strict=True)
-    try:
-        relative = resolved.relative_to(safe_root)
-    except ValueError:
-        raise SystemExit(f"attach object escapes the copied directory: {resolved}")
-    return str(target_root / relative)
-
-
-manifest["module_path"] = target(manifest["module_path"])
-for item in manifest["objects"]:
-    item["path"] = target(item["path"])
-if manifest["objects"][0]["path"] != manifest["module_path"]:
-    raise SystemExit("object zero is not the module")
-Path(destination).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-PY
+    timeout --signal=TERM --kill-after=5s 60s python3 -I scripts/lane-lib-oracle-6.py "$@"
 }

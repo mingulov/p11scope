@@ -111,13 +111,13 @@ reclaim_root_output "$WORK/observed.json"
 
 echo "=== verify: the proxy stack's two providers, kept apart ==="
 python3 - "$WORK/observed.json" "$(readlink -f "$MODULE")" <<'PY'
-import importlib.util, json, sys
+import json, sys
 
-spec = importlib.util.spec_from_file_location(
-    "check_capture_evidence", "scripts/check-capture-evidence.py"
-)
-oracle = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(oracle)
+sys.path.insert(0, "scripts")
+sys.dont_write_bytecode = True
+from _loader import load_sibling
+
+oracle = load_sibling("check-capture-evidence.py")
 
 doc = json.load(open(sys.argv[1]))
 ev = doc["evidence"]
@@ -181,12 +181,14 @@ WPID=
 reclaim_root_output "$NESTED/observed.json" "$NESTED/observer.pid"
 grep -q '^NESTED_EXPORTS_DONE function_lists=2 interface_lists=2$' "$NESTED/workload.log"
 python3 - "$NESTED/observed.json" "$NESTED" <<'PY'
-import copy, importlib.util, json, sys
+import copy, json, sys
 from collections import Counter
 
-spec = importlib.util.spec_from_file_location("oracle", "scripts/check-capture-evidence.py")
-oracle = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(oracle)
+sys.path.insert(0, "scripts")
+sys.dont_write_bytecode = True
+from _loader import load_sibling
+
+oracle = load_sibling("check-capture-evidence.py")
 paths = {f"{sys.argv[2]}/provider-{index}.so" for index in (1, 2)}
 
 def validate(doc):

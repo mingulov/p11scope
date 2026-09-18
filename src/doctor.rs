@@ -1103,7 +1103,7 @@ pub fn render(checks: &[Check]) -> String {
         out.push('\n');
     }
     let _ = writeln!(out, "{}", capability_tier_line(capability_tier(checks)));
-    let _ = write!(out, "{}", verdict_line(checks));
+    let _ = writeln!(out, "{}", verdict_line(checks));
     out
 }
 

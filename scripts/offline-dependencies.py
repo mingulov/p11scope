@@ -7,7 +7,6 @@ import argparse
 import contextlib
 import fcntl
 import hashlib
-import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -18,6 +17,10 @@ import subprocess
 import sys
 import tempfile
 from urllib.parse import parse_qs, urlsplit, urlunsplit
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.dont_write_bytecode = True
+from _loader import load_path
 
 
 SCHEMA_VERSION = 1
@@ -106,19 +109,10 @@ def _read_json(path: Path, label: str) -> object:
 
 
 def _load_module(path: Path, name: str):
-    spec = importlib.util.spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        raise OfflineDependencyError(f"cannot load required helper {path}")
-    module = importlib.util.module_from_spec(spec)
-    previous = sys.dont_write_bytecode
-    sys.dont_write_bytecode = True
     try:
-        spec.loader.exec_module(module)
+        return load_path(path, name)
     except (OSError, ImportError) as error:
         raise OfflineDependencyError(f"cannot load required helper {path}: {error}") from error
-    finally:
-        sys.dont_write_bytecode = previous
-    return module
 
 
 def _safe_relative(value: object, label: str) -> PurePosixPath:

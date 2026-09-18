@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Unprivileged coordinator probes with injected BPF acquisition boundaries."""
-import importlib.util
 import copy
 import contextlib
 import io
@@ -21,13 +20,13 @@ from unittest.mock import patch
 from contextlib import ExitStack
 
 ROOT = Path(__file__).resolve().parents[2]
-spec = importlib.util.spec_from_file_location('capture', ROOT / 'scripts/capture-stopped-canary.py')
-capture = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(capture)
+sys.path.insert(0, str(ROOT / "scripts"))
+sys.dont_write_bytecode = True
+from _loader import load_path
+
+capture = load_path(ROOT / 'scripts/capture-stopped-canary.py', 'capture')
 c = capture.custody
-fixture_spec = importlib.util.spec_from_file_location('canary_fixtures', ROOT / 'tests/python/test_canary_evidence.py')
-fixtures = importlib.util.module_from_spec(fixture_spec)
-fixture_spec.loader.exec_module(fixtures)
+fixtures = load_path(ROOT / 'tests/python/test_canary_evidence.py', 'canary_fixtures')
 
 
 def generation(pid):

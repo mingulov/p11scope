@@ -44,6 +44,10 @@ READINESS_DIAGNOSTIC_FIELD_BYTES = 1024
 READINESS_DIAGNOSTIC_MAX_BYTES = 8192
 READINESS_DIAGNOSTIC_TRUNCATION = "; diagnostic_truncated=1"
 TERMINAL_READINESS_TIMEOUT_SECONDS = 20
+# Cleanup keeps the original 2s settle slices but retries them to this total
+# bound: under host load a SIGKILLed child can miss one slice without being
+# wedged. A child unsettled past the bound still fails the same way.
+CLEANUP_SETTLE_SECONDS = 10
 
 
 class Lane13InputLedgerTests(unittest.TestCase):
@@ -58,7 +62,7 @@ class Lane13InputLedgerTests(unittest.TestCase):
         self.bin = self.base / "bin"
         self.bin.mkdir()
         (self.project / "scripts").mkdir()
-        for name in ("lane13-input-ledger.py", "merge-checksum-ledgers.py"):
+        for name in ("lane13-input-ledger.py", "merge-checksum-ledgers.py", "_loader.py"):
             source = ROOT / "scripts" / name
             if source.exists():
                 shutil.copy2(source, self.project / "scripts" / name)
@@ -479,7 +483,21 @@ class Lane13EvidenceTests(unittest.TestCase):
     def close_owned_child(process):
         if process.poll() is None:
             process.kill()
-        process.wait(timeout=2)
+        deadline = time.monotonic() + CLEANUP_SETTLE_SECONDS
+        while True:
+            try:
+                process.wait(timeout=2)
+                return
+            except subprocess.TimeoutExpired:
+                if process.poll() is not None:
+                    process.wait(timeout=0)
+                    return
+                if time.monotonic() >= deadline:
+                    raise
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
 
     def start_decoy(self):
         process = subprocess.Popen(["/bin/sleep", "20"], start_new_session=True)
@@ -493,8 +511,14 @@ class Lane13EvidenceTests(unittest.TestCase):
                     signal.pidfd_send_signal(descriptor, signal.SIGKILL, None, 0)
                 except ProcessLookupError:
                     pass
-                if not select.select([descriptor], [], [], 2)[0]:
-                    raise RuntimeError("controlled original handle did not settle")
+                deadline = time.monotonic() + CLEANUP_SETTLE_SECONDS
+                while not select.select([descriptor], [], [], 2)[0]:
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("controlled original handle did not settle")
+                    try:
+                        signal.pidfd_send_signal(descriptor, signal.SIGKILL, None, 0)
+                    except ProcessLookupError:
+                        pass
         finally:
             os.close(descriptor)
 

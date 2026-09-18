@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import hashlib
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -13,6 +12,10 @@ import signal
 import stat
 import subprocess
 import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.dont_write_bytecode = True
+from _loader import load_path
 
 
 class Refusal(Exception):
@@ -322,19 +325,10 @@ class Coordinator:
 
     def load_exporter(self):
         path = self.source / "scripts/export-source.py"
-        spec = importlib.util.spec_from_file_location("p11scope_build_exporter", path)
-        if spec is None or spec.loader is None:
-            raise Refusal("cannot load extracted source validator")
-        module = importlib.util.module_from_spec(spec)
-        previous = sys.dont_write_bytecode
-        sys.dont_write_bytecode = True
         try:
-            spec.loader.exec_module(module)
+            return load_path(path, "p11scope_build_exporter")
         except (OSError, ImportError) as error:
             raise Refusal(f"cannot load extracted source validator: {error}") from error
-        finally:
-            sys.dont_write_bytecode = previous
-        return module
 
     def validate(self, exporter, prepared: str) -> tuple[dict, dict]:
         prior = os.environ.copy()

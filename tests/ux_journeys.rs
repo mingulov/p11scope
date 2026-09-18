@@ -307,7 +307,7 @@ fn j2_unprivileged_inspect_succeeds_with_guidance() {
 }
 
 #[test]
-fn j3_nonexistent_and_exited_pids_share_one_pin_message() {
+fn j3_nonexistent_and_exited_pids_no_longer_share_one_pin_message() {
     let missing = run(&["profile", "--pid", "99999999", "--duration", "1"]);
     assert_eq!(missing.code, Some(1));
     assert!(
@@ -325,10 +325,10 @@ fn j3_nonexistent_and_exited_pids_share_one_pin_message() {
         raced.stderr
     );
 
-    // F6: a typo'd pid and a raced exit read identically, so the user
-    // cannot tell which happened.
+    // F6 fixed (Task 3): a typo'd pid and a raced exit no longer read
+    // identically — each names its own cause and next check.
     let normalize = |text: &str, pid: &str| text.replace(pid, "<pid>");
-    assert_eq!(
+    assert_ne!(
         normalize(&missing.stderr, "99999999"),
         normalize(&raced.stderr, &dead),
     );
@@ -505,6 +505,44 @@ fn t3_f5_mode_error_lists_valid_values_inline() {
     assert_eq!(
         first,
         "--mode: invalid value \"frobnicate\" (expected profile|metrics)"
+    );
+}
+
+#[test]
+fn t3_f6_typo_and_exited_pids_read_differently() {
+    // F6 fixed (Task 3): a pid above the kernel maximum never named a
+    // process (a typo), while an in-range pid with no live process exited
+    // or is an in-range typo — each names its own next check. Exit 1.
+    let missing = run(&["profile", "--pid", "99999999", "--duration", "1"]);
+    assert_eq!(missing.code, Some(1));
+    assert!(
+        missing.stderr.contains("cannot pin pid 99999999"),
+        "{}",
+        missing.stderr
+    );
+    assert!(missing.stderr.contains("no such pid"), "{}", missing.stderr);
+    assert!(missing.stderr.contains("typo"), "{}", missing.stderr);
+
+    let dead = exited_pid();
+    let raced = run(&["profile", "--pid", &dead, "--duration", "1"]);
+    assert_eq!(raced.code, Some(1));
+    assert!(
+        raced.stderr.contains(&format!("cannot pin pid {dead}")),
+        "{}",
+        raced.stderr
+    );
+    assert!(raced.stderr.contains("exited"), "{}", raced.stderr);
+    assert!(
+        raced.stderr.contains(&format!("ps -p {dead}")),
+        "{}",
+        raced.stderr
+    );
+
+    // The two failures no longer read identically.
+    let normalize = |text: &str, pid: &str| text.replace(pid, "<pid>");
+    assert_ne!(
+        normalize(&missing.stderr, "99999999"),
+        normalize(&raced.stderr, &dead),
     );
 }
 

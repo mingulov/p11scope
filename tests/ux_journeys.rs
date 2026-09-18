@@ -436,10 +436,10 @@ fn j5_offline_build_doc_path_pins() {
         "offline archive path"
     );
     assert!(readme.contains("--offline"), "offline build flag");
-    // F8: the README tells the user to "place the exact archives" but never
-    // names them; the names below are the ones the trial derived from
-    // third-party/sources.json.
-    assert!(!readme.contains("aya-0.14.0.crate"), "archive names");
+    // F8 fixed (Task 4): the README names the exact archives the trial
+    // previously had to derive from third-party/sources.json.
+    assert!(readme.contains("aya-0.14.0.crate"), "archive names");
+    assert!(readme.contains("aya-obj-0.3.0.crate"), "archive names");
     let guide = repo_file("docs/build-offline.md");
     assert!(
         guide.contains("scripts/build-offline.sh"),
@@ -580,6 +580,11 @@ fn j6_k8s_doc_pins() {
     assert!(
         readme.contains("p11scope/deploy/Dockerfile.observer"),
         "manual flow paths"
+    );
+    // F9/J6 fix: the manual flow now states the required cwd explicitly.
+    assert!(
+        readme.contains("from the parent of the checkout"),
+        "k8s manual flow states required cwd"
     );
     for referenced in [
         "deploy/Dockerfile.observer",

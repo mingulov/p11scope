@@ -40,8 +40,9 @@ fn run() -> Result<i32> {
         Ok(Command::Inspect(a)) => inspect::run(a.pid, &a.modules, &a.hooks, a.json)
             .with_context(|| format!("inspect --pid {}", a.pid)),
         Ok(Command::Doctor(a)) => doctor::run(a.pid, a.cgroup.as_deref()),
-        Err(CliError::Help) => {
-            eprintln!("{}", cli::USAGE);
+        Err(CliError::Help(topic)) => {
+            // Exit-0 help goes to stdout, so `p11scope --help | grep …` works.
+            println!("{}", topic.text());
             Ok(0)
         }
         Err(CliError::Usage(msg)) => {

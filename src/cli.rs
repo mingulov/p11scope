@@ -329,6 +329,19 @@ fn unknown_arg(arg: &str) -> CliError {
     }
 }
 
+/// `run`'s unrecognised argument: a bare word is the command typed without
+/// its `--` separator, so the refusal names the separator and the concrete
+/// next command; a mistyped flag keeps the generic message.
+fn run_unknown_arg(arg: &str) -> CliError {
+    if arg.starts_with('-') || arg.is_empty() {
+        unknown_arg(arg)
+    } else {
+        usage_err(format!(
+            "unknown argument: {arg} (run takes its command after `--`: `p11scope run -- {arg}`)"
+        ))
+    }
+}
+
 /// The discovery and capture options every capturing subcommand shares.
 /// `metrics` stays `None` until `--mode` is given so `--trace`/`trace` can
 /// refuse a mode whichever order the two were typed in.
@@ -609,7 +622,7 @@ fn parse_run(mut args: impl Iterator<Item = String>) -> Result<RunArgs, CliError
                 command.extend(args.by_ref());
                 break;
             }
-            other => return Err(unknown_arg(other)),
+            other => return Err(run_unknown_arg(other)),
         }
     }
 

@@ -407,12 +407,19 @@ fn j4_bad_flag_values_name_flag_exit_2() {
 }
 
 #[test]
-fn j4_run_without_separator_reports_argument_not_separator() {
+fn j4_run_without_separator_names_the_separator() {
     let usage = run(&["run", "/bin/true"]);
     assert_eq!(usage.code, Some(2));
-    // F4: the fix is the missing `--` separator, which the message never names.
+    // F4 fixed (Task 3): the refusal names the missing `--` separator and
+    // the concrete next command.
     assert!(
         usage.stderr.contains("unknown argument: /bin/true"),
+        "{}",
+        usage.stderr
+    );
+    assert!(usage.stderr.contains("after `--`"), "{}", usage.stderr);
+    assert!(
+        usage.stderr.contains("p11scope run -- /bin/true"),
         "{}",
         usage.stderr
     );
@@ -453,6 +460,35 @@ fn t3_f3_doctor_verdict_ends_with_newline() {
     } else {
         assert_eq!(doctor.code, Some(1));
     }
+}
+
+#[test]
+fn t3_f4_run_without_separator_names_separator_fix() {
+    // F4 fixed (Task 3): a bare word after `run` is the command typed
+    // without its `--` separator, so the refusal names the separator and
+    // the concrete next command. Exit 2 unchanged.
+    let usage = run(&["run", "/bin/true"]);
+    assert_eq!(usage.code, Some(2));
+    assert!(
+        usage.stderr.contains("unknown argument: /bin/true"),
+        "{}",
+        usage.stderr
+    );
+    assert!(usage.stderr.contains("after `--`"), "{}", usage.stderr);
+    assert!(
+        usage.stderr.contains("p11scope run -- /bin/true"),
+        "{}",
+        usage.stderr
+    );
+    // A mistyped flag is not a missing separator: no `--` guidance there.
+    let flag = run(&["run", "--frobnicate"]);
+    assert_eq!(flag.code, Some(2));
+    assert!(
+        flag.stderr.contains("unknown argument: --frobnicate"),
+        "{}",
+        flag.stderr
+    );
+    assert!(!flag.stderr.contains("after `--`"), "{}", flag.stderr);
 }
 
 #[test]

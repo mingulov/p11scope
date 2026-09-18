@@ -200,9 +200,9 @@ fn b6_doctor_reports_rows_and_verdict() {
     for row in ["kernel release", "lockdown", "cgroup version"] {
         assert!(doctor.stdout.contains(row), "{}", doctor.stdout);
     }
-    // F3: the verdict line currently lacks its trailing newline, so the
-    // shell prompt lands on the verdict line.
-    assert!(!doctor.stdout.ends_with('\n'), "{:?}", doctor.stdout);
+    // F3 fixed (Task 3): the verdict line ends with `\n`, so the shell
+    // prompt no longer lands on the verdict line.
+    assert!(doctor.stdout.ends_with('\n'), "{:?}", doctor.stdout);
     if capture_available() {
         assert!(
             matches!(doctor.code, Some(0) | Some(1)),
@@ -435,6 +435,24 @@ fn j5_offline_build_doc_path_pins() {
         guide.contains("scripts/build-offline.sh"),
         "export bootstrap"
     );
+}
+
+#[test]
+fn t3_f3_doctor_verdict_ends_with_newline() {
+    // F3 fixed (Task 3): the verdict line ends with `\n`, so the shell
+    // prompt no longer lands on the verdict line. Exit codes unchanged.
+    let doctor = run(&["doctor"]);
+    assert!(doctor.stdout.contains("verdict:"), "{}", doctor.stdout);
+    assert!(doctor.stdout.ends_with('\n'), "{:?}", doctor.stdout);
+    if capture_available() {
+        assert!(
+            matches!(doctor.code, Some(0) | Some(1)),
+            "{:?}",
+            doctor.code
+        );
+    } else {
+        assert_eq!(doctor.code, Some(1));
+    }
 }
 
 #[test]

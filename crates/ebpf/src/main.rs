@@ -306,7 +306,7 @@ fn reserve_discovery() -> Option<RingBufEntry<DiscoveryRecord>> {
     // SAFETY: the reservation owns exactly one aligned 920-byte record. These
     // straight-line volatile stores cover word indices 0..=114 exactly once.
     unsafe {
-        // TASK5_DISCOVERY_INITIALIZER_BEGIN
+        // DISCOVERY_INITIALIZER_BEGIN
         core::ptr::write_volatile(words.add(0), 0u64);
         core::ptr::write_volatile(words.add(1), 0u64);
         core::ptr::write_volatile(words.add(2), 0u64);
@@ -422,13 +422,13 @@ fn reserve_discovery() -> Option<RingBufEntry<DiscoveryRecord>> {
         core::ptr::write_volatile(words.add(112), 0u64);
         core::ptr::write_volatile(words.add(113), 0u64);
         core::ptr::write_volatile(words.add(114), 0u64);
-        // TASK5_DISCOVERY_INITIALIZER_END
+        // DISCOVERY_INITIALIZER_END
     }
     Some(entry)
 }
 
 #[inline(always)]
-// TASK5_PAUSE_WRITER_BEGIN
+// PAUSE_WRITER_BEGIN
 fn finish_discovery_record(
     mut entry: RingBufEntry<DiscoveryRecord>,
     scope: ScopeAuth,
@@ -488,7 +488,7 @@ fn finish_discovery_record(
     }
     entry.submit(0);
 }
-// TASK5_PAUSE_WRITER_END
+// PAUSE_WRITER_END
 
 struct ExportArgs {
     kind: u8,

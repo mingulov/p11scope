@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Isolated Linux process-custody probes; every probe has an external watchdog."""
 import ctypes
-import importlib.util
 import os
 from pathlib import Path
 import select
@@ -15,9 +14,11 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
-spec = importlib.util.spec_from_file_location('custody', ROOT / 'scripts/canary_process_custody.py')
-c = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(c)
+sys.path.insert(0, str(ROOT / "scripts"))
+sys.dont_write_bytecode = True
+from _loader import load_path
+
+c = load_path(ROOT / 'scripts/canary_process_custody.py', 'custody')
 
 
 def identity(pid):

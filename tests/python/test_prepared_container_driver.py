@@ -66,7 +66,7 @@ class DriverFixture:
         environment = dict(os.environ)
         environment.update(PATH=str(self.bin) + ":/usr/bin:/bin",
                            P11SCOPE_CONTAINER_FIXTURE=str(self.config_path),
-                           P11SCOPE_TASK4_WORK=str(self.work if work is None else work))
+                           P11SCOPE_RECEIPT_WORK=str(self.work if work is None else work))
         return subprocess.run(
             ["/bin/sh", str(self.root / "scripts/verify-discover-containers.sh"),
              *(arguments if arguments is not None else ["--lane14-facts", str(self.facts_path)])],

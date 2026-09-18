@@ -2,16 +2,17 @@
 """Decoded production-object mutation tests; objects must be supplied explicitly."""
 import argparse
 import copy
-import importlib.util
 from pathlib import Path
 import re
 import sys
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
-SPEC = importlib.util.spec_from_file_location('flow_contract', ROOT / 'scripts/check-discovery-flow-object.py')
-C = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(C)
+sys.path.insert(0, str(ROOT / "scripts"))
+sys.dont_write_bytecode = True
+from _loader import load_path
+
+C = load_path(ROOT / 'scripts/check-discovery-flow-object.py', 'flow_contract')
 OBJECTS = []
 
 

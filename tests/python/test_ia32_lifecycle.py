@@ -392,7 +392,7 @@ class Ia32LifecycleTests(unittest.TestCase):
             and fields[3] == "exec"
             for fields in call_fields
         ), sudo_calls)
-        self.assertTrue(any(fields[:4] == ["python3", "-I", "-", "CONT"]
+        self.assertTrue(any(fields[:4] == ["python3", "-I", "scripts/lane-lib-oracle-1.py", "CONT"]
                             for fields in call_fields), sudo_calls)
         self.assertEqual(int(status["tracer_status"]), 128 + signal.SIGTERM)
 

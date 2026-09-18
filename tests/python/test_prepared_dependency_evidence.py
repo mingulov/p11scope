@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import hashlib
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -16,17 +15,18 @@ import unittest
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
+
+sys.path.insert(0, str(REPOSITORY / "scripts"))
+sys.dont_write_bytecode = True
+from _loader import load_path
+
 HELPER = REPOSITORY / "scripts/prepared-dependency-evidence.py"
 METADATA_TEST = REPOSITORY / "tests/python/test_prepared_dependency_metadata.py"
 FIXTURES = REPOSITORY / "tests/fixtures/prepared-dependency-evidence"
 
 
 def load_module(path: Path, name: str):
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
+    return load_path(path, name)
 
 
 metadata_test = load_module(METADATA_TEST, "prepared_metadata_test_fixture")

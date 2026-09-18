@@ -26,7 +26,8 @@ class CapabilityFixture:
         self.evidence = EvidenceFixture(base / "source")
         self.repo = self.evidence.root
         for relative in (
-            "scripts/verify-capability-tier.sh", "scripts/prepared-dependency-tools.sh",
+            "scripts/verify-capability-tier.sh", "scripts/lane-capability-tier-oracle.py",
+            "scripts/prepared-dependency-tools.sh",
             "scripts/prepared-dependency-snapshot.sh", "scripts/product-build.sh",
             "scripts/merge-checksum-ledgers.py",
         ):

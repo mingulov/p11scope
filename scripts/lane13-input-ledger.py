@@ -5,13 +5,16 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib.util
 import os
 from pathlib import Path
 import stat
 import subprocess
 import sys
 import tempfile
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.dont_write_bytecode = True
+from _loader import load_path
 
 
 PATHSPECS = (
@@ -35,12 +38,7 @@ class SnapshotError(Exception):
 
 def _load_merger(root: Path):
     path = root / "scripts/merge-checksum-ledgers.py"
-    spec = importlib.util.spec_from_file_location("lane13_checksum_merger", path)
-    if spec is None or spec.loader is None:
-        raise SnapshotError(f"cannot load checksum-ledger merger: {path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return load_path(path, "lane13_checksum_merger")
 
 
 def _absolute(path: Path, label: str) -> Path:

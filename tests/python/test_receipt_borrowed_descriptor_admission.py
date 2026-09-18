@@ -2,7 +2,6 @@
 
 import contextlib
 import fcntl
-import importlib.util
 import io
 import os
 from pathlib import Path
@@ -13,11 +12,15 @@ import unittest
 
 
 REPO = Path(__file__).resolve().parents[2]
-SCRIPT_PATH = Path(os.environ.get("TASK4_SUBJECT_PATH", REPO / "scripts/task4-build-subject.py"))
-GOLDEN = (REPO / "tests/fixtures/task4/input-ledger-golden.tsv").read_bytes()
+SCRIPT_PATH = Path(os.environ.get("RECEIPT_SUBJECT_PATH", REPO / "scripts/receipt-build-subject.py"))
+GOLDEN = (REPO / "tests/fixtures/receipt/input-ledger-golden.tsv").read_bytes()
 MAX_FIXTURE_LEDGER_BYTES = 4 * 1024 * 1024 + 1
-MODULE_NAME = "task4_build_subject_borrowed_descriptor_test"
+MODULE_NAME = "receipt_build_subject_borrowed_descriptor_test"
 MISSING = object()
+
+sys.path.insert(0, str(REPO / "scripts"))
+sys.dont_write_bytecode = True
+from _loader import load_path
 
 
 class IntSubclass(int):
@@ -37,12 +40,11 @@ def load_subject(test):
 
     sys.dont_write_bytecode = True
     test.addCleanup(restore)
-    spec = importlib.util.spec_from_file_location(MODULE_NAME, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        test.fail("could not import task4 build-subject script")
-    module = importlib.util.module_from_spec(spec)
+    try:
+        module = load_path(SCRIPT_PATH, MODULE_NAME)
+    except FileNotFoundError:
+        test.fail("could not import receipt build-subject script")
     sys.modules[MODULE_NAME] = module
-    spec.loader.exec_module(module)
     return module
 
 

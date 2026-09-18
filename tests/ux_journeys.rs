@@ -86,25 +86,52 @@ fn repo_file(relative: &str) -> String {
 fn b1_global_help_exits_zero_with_full_usage() {
     let help = run(&["--help"]);
     assert_eq!(help.code, Some(0));
-    assert!(help.stderr.contains("usage:"), "{}", help.stderr);
+    // F2 fixed (Task 2): exit-0 help goes to stdout, so
+    // `p11scope --help | grep …` works.
+    assert!(help.stderr.is_empty(), "stderr: {:?}", help.stderr);
+    assert!(help.stdout.contains("usage:"), "{}", help.stdout);
     for subcommand in ["p11scope profile", "p11scope trace", "p11scope run"] {
-        assert!(help.stderr.contains(subcommand), "{}", help.stderr);
+        assert!(help.stdout.contains(subcommand), "{}", help.stdout);
     }
-    // F2: exit-0 help currently goes entirely to stderr, so
-    // `p11scope --help | grep …` sees nothing.
-    assert!(help.stdout.is_empty(), "stdout: {:?}", help.stdout);
+    // Global help text is byte-for-byte stable: exactly USAGE plus println!'s newline.
+    assert_eq!(help.stdout, format!("{}\n", p11scope::cli::USAGE));
 }
 
 #[test]
-fn b2_subcommand_help_currently_prints_global_usage() {
+fn b2_subcommand_help_is_scoped_to_that_subcommand() {
     let global = run(&["--help"]);
+    assert_eq!(global.code, Some(0));
     for subcommand in ["profile", "trace", "run", "inspect", "doctor"] {
         let scoped = run(&[subcommand, "--help"]);
         assert_eq!(scoped.code, Some(0), "{subcommand} --help");
-        // F1: no per-subcommand section exists yet; every `<sub> --help`
-        // prints the global usage byte-for-byte.
-        assert_eq!(scoped.stderr, global.stderr, "{subcommand} --help");
-        assert!(scoped.stdout.is_empty(), "{subcommand} --help");
+        // F1 fixed (Task 2): scoped help carries only that subcommand's
+        // section plus the shared notes footer — never another subcommand.
+        assert!(
+            scoped.stderr.is_empty(),
+            "{subcommand} --help: {:?}",
+            scoped.stderr
+        );
+        let own = format!("p11scope {subcommand}");
+        assert!(
+            scoped.stdout.contains(&own),
+            "{subcommand} --help: {}",
+            scoped.stdout
+        );
+        for other in ["profile", "trace", "run", "inspect", "doctor"] {
+            if other != subcommand {
+                assert!(
+                    !scoped.stdout.contains(&format!("p11scope {other}")),
+                    "{subcommand} --help leaks {other}: {}",
+                    scoped.stdout
+                );
+            }
+        }
+        assert_ne!(scoped.stdout, global.stdout, "{subcommand} --help");
+        assert!(
+            scoped.stdout.contains("notes: discovery scans"),
+            "{subcommand} --help: {}",
+            scoped.stdout
+        );
     }
 }
 
@@ -216,25 +243,35 @@ fn b7_run_refuses_without_capture_lane() {
 }
 
 #[test]
-fn j1_fresh_eyes_cannot_learn_one_subcommand() {
-    // F1 from the learner's angle: asking for one subcommand's help still
-    // shows every other subcommand.
+fn j1_fresh_eyes_learn_one_subcommand() {
+    // F1 fixed (Task 2), from the learner's angle: asking for one
+    // subcommand's help no longer shows every other subcommand.
     let profile_help = run(&["profile", "--help"]);
     assert!(
-        profile_help.stderr.contains("p11scope trace"),
+        profile_help.stdout.contains("[--pid"),
         "{}",
-        profile_help.stderr
+        profile_help.stdout
     );
     assert!(
-        profile_help.stderr.contains("p11scope inspect"),
+        !profile_help.stdout.contains("p11scope trace"),
         "{}",
-        profile_help.stderr
+        profile_help.stdout
+    );
+    assert!(
+        !profile_help.stdout.contains("p11scope inspect"),
+        "{}",
+        profile_help.stdout
     );
     let doctor_help = run(&["doctor", "--help"]);
     assert!(
-        doctor_help.stderr.contains("p11scope profile"),
+        doctor_help.stdout.contains("p11scope doctor"),
         "{}",
-        doctor_help.stderr
+        doctor_help.stdout
+    );
+    assert!(
+        !doctor_help.stdout.contains("p11scope profile"),
+        "{}",
+        doctor_help.stdout
     );
 }
 

@@ -6477,7 +6477,9 @@ fn usage_documents_every_subcommand_and_capture_needs_no_manifest() {
         .output()
         .expect("run --help");
     assert_eq!(help.status.code(), Some(0));
-    assert!(String::from_utf8_lossy(&help.stderr).contains("p11scope inspect"));
+    // Exit-0 help goes to stdout (F2, fixed by the usability pass Task 2).
+    assert!(String::from_utf8_lossy(&help.stdout).contains("p11scope inspect"));
+    assert!(help.stderr.is_empty());
 
     let no_pid = Command::new(bin)
         .arg("inspect")

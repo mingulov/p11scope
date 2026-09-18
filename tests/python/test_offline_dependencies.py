@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import hashlib
-import importlib.util
 import io
 import json
 import os
@@ -21,9 +20,15 @@ from types import SimpleNamespace
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
+
+sys.path.insert(0, str(REPOSITORY / "scripts"))
+sys.dont_write_bytecode = True
+from _loader import load_path
+
 HELPER = REPOSITORY / "scripts/offline-dependencies.py"
 PREPARER = REPOSITORY / "scripts/prepare-dependencies.py"
 CHECKER = REPOSITORY / "scripts/check-prepared-dependencies.py"
+LOADER = REPOSITORY / "scripts/_loader.py"
 FIXTURES = REPOSITORY / "tests/fixtures/offline-dependencies"
 
 
@@ -130,11 +135,7 @@ raise SystemExit("malformed TOML was accepted")
 
 
 def load_module(path: Path, name: str):
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
+    return load_path(path, name)
 
 
 def digest(value: bytes) -> str:
@@ -147,7 +148,7 @@ class OfflineFixture:
         (self.root / "scripts").mkdir(parents=True)
         (self.root / "third-party/patches/demo-1.0.0").mkdir(parents=True)
         (self.root / "crates/ebpf").mkdir(parents=True)
-        for source in (HELPER, PREPARER, CHECKER):
+        for source in (HELPER, PREPARER, CHECKER, LOADER):
             shutil.copy2(source, self.root / "scripts" / source.name)
         self.preparer = load_module(self.root / "scripts/prepare-dependencies.py", "fixture_preparer")
 

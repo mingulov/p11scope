@@ -58,7 +58,7 @@ class Lane13InputLedgerTests(unittest.TestCase):
         self.bin = self.base / "bin"
         self.bin.mkdir()
         (self.project / "scripts").mkdir()
-        for name in ("lane13-input-ledger.py", "merge-checksum-ledgers.py"):
+        for name in ("lane13-input-ledger.py", "merge-checksum-ledgers.py", "_loader.py"):
             source = ROOT / "scripts" / name
             if source.exists():
                 shutil.copy2(source, self.project / "scripts" / name)

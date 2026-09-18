@@ -1,6 +1,5 @@
 """Semantic trace private open-description contracts."""
 
-import importlib.util
 from pathlib import Path
 import sys
 import unittest
@@ -10,6 +9,10 @@ REPO = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = REPO / "scripts/task4-build-subject.py"
 MODULE_NAME = "task4_build_subject_semantic_open_description_test"
 MISSING = object()
+
+sys.path.insert(0, str(REPO / "scripts"))
+sys.dont_write_bytecode = True
+from _loader import load_path
 module = None
 _ACTIVE_TEST = None
 REJECTION_COUNT = 0
@@ -28,12 +31,11 @@ def load_subject(test):
 
     sys.dont_write_bytecode = True
     test.addCleanup(restore)
-    spec = importlib.util.spec_from_file_location(MODULE_NAME, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
+    try:
+        loaded = load_path(SCRIPT_PATH, MODULE_NAME)
+    except FileNotFoundError:
         test.fail("could not import task4 build-subject script")
-    loaded = importlib.util.module_from_spec(spec)
     sys.modules[MODULE_NAME] = loaded
-    spec.loader.exec_module(loaded)
     return loaded
 
 

@@ -13,7 +13,6 @@ import argparse
 import ctypes
 import errno
 import hashlib
-import importlib.util
 import os
 from pathlib import Path
 import stat
@@ -22,15 +21,12 @@ import sys
 import time
 from types import SimpleNamespace
 
-
-def sibling(filename):
-    spec = importlib.util.spec_from_file_location(filename, Path(__file__).with_name(filename))
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.dont_write_bytecode = True
+from _loader import load_sibling
 
 
-coordinator = sibling('capture-stopped-canary.py')
+coordinator = load_sibling('capture-stopped-canary.py')
 custody = coordinator.custody
 dumper = coordinator.dumper
 evidence = coordinator.evidence

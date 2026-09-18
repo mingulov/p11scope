@@ -1,6 +1,5 @@
 """Compiled ELF fixtures exercise the production map inventory decoder."""
 import argparse
-import importlib.util
 import io
 import json
 import os
@@ -12,9 +11,11 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
-spec = importlib.util.spec_from_file_location("map_checker", ROOT / "scripts/check-bpf-map-defs.py")
-checker = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(checker)
+sys.path.insert(0, str(ROOT / "scripts"))
+sys.dont_write_bytecode = True
+from _loader import load_path
+
+checker = load_path(ROOT / "scripts/check-bpf-map-defs.py", "map_checker")
 
 class MapDefsTests(unittest.TestCase):
     @classmethod

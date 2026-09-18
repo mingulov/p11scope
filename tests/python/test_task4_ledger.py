@@ -1,7 +1,6 @@
 """Task-4 input-v1 ledger contract tests."""
 
 import hashlib
-import importlib.util
 from pathlib import Path
 import sys
 import unittest
@@ -12,6 +11,10 @@ GOLDEN_PATH = REPO / "tests/fixtures/task4/input-ledger-golden.tsv"
 SCRIPT_PATH = REPO / "scripts/task4-build-subject.py"
 MODULE_NAME = "task4_build_subject_ledger_test"
 MISSING = object()
+
+sys.path.insert(0, str(REPO / "scripts"))
+sys.dont_write_bytecode = True
+from _loader import load_path
 
 LARGE_SIZE = (
     b"input-v1\t0\ttool\tread\tpresent\t0644\t2159017984\t"
@@ -115,12 +118,11 @@ class InputLedgerTests(unittest.TestCase):
         sys.dont_write_bytecode = True
         self.addCleanup(self._restore_import_state)
 
-        spec = importlib.util.spec_from_file_location(MODULE_NAME, SCRIPT_PATH)
-        if spec is None or spec.loader is None:
+        try:
+            self.module = load_path(SCRIPT_PATH, MODULE_NAME)
+        except FileNotFoundError:
             self.fail("could not import task4 build-subject script")
-        self.module = importlib.util.module_from_spec(spec)
         sys.modules[MODULE_NAME] = self.module
-        spec.loader.exec_module(self.module)
         self.golden = GOLDEN_PATH.read_bytes()
         self.digest = hashlib.sha256(b"abc").hexdigest()
 

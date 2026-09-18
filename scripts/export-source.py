@@ -8,7 +8,6 @@ import contextlib
 import fcntl
 import gzip
 import hashlib
-import importlib.util
 import io
 import json
 import os
@@ -20,6 +19,10 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.dont_write_bytecode = True
+from _loader import load_path
 
 
 ARCHIVE_ROOT = "pkcs11-scope-source"
@@ -59,36 +62,18 @@ class ExportError(Exception):
 
 def _load_preparer(root: Path):
     path = root / "scripts/prepare-dependencies.py"
-    spec = importlib.util.spec_from_file_location("p11scope_export_preparer", path)
-    if spec is None or spec.loader is None:
-        raise ExportError(f"cannot load dependency preparer {path}")
-    module = importlib.util.module_from_spec(spec)
-    previous = sys.dont_write_bytecode
-    sys.dont_write_bytecode = True
     try:
-        spec.loader.exec_module(module)
+        return load_path(path, "p11scope_export_preparer")
     except (OSError, ImportError) as error:
         raise ExportError(f"cannot load dependency preparer {path}: {error}") from error
-    finally:
-        sys.dont_write_bytecode = previous
-    return module
 
 
 def _load_offline_helper(root: Path):
     path = root / "scripts/offline-dependencies.py"
-    spec = importlib.util.spec_from_file_location("p11scope_export_offline", path)
-    if spec is None or spec.loader is None:
-        raise ExportError(f"cannot load offline dependency helper {path}")
-    module = importlib.util.module_from_spec(spec)
-    previous = sys.dont_write_bytecode
-    sys.dont_write_bytecode = True
     try:
-        spec.loader.exec_module(module)
+        return load_path(path, "p11scope_export_offline")
     except (OSError, ImportError) as error:
         raise ExportError(f"cannot load offline dependency helper {path}: {error}") from error
-    finally:
-        sys.dont_write_bytecode = previous
-    return module
 
 
 def _git_environment(root: Path) -> dict[str, str]:

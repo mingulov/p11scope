@@ -7,7 +7,6 @@ import contextlib
 import errno
 import fcntl
 import hashlib
-import importlib.util
 import io
 import os
 import resource
@@ -25,6 +24,10 @@ GOLDEN_PATH = REPO / "tests/fixtures/task4/input-ledger-golden.tsv"
 _MODULE_NAME = "task4_build_subject"
 _ABSENT = object()
 
+sys.path.insert(0, str(REPO / "scripts"))
+sys.dont_write_bytecode = True
+from _loader import load_path
+
 
 def run_input_v1_contract(subject_path, golden):
     """Run the ordered original contract with a fresh subject and golden bytes.
@@ -38,12 +41,11 @@ def run_input_v1_contract(subject_path, golden):
     try:
         sys.dont_write_bytecode = True
         os.environ["TASK4_GOLDEN"] = golden.decode("ascii")
-        spec = importlib.util.spec_from_file_location("task4_build_subject", subject_path)
-        if spec is None or spec.loader is None:
+        try:
+            module = load_path(subject_path, "task4_build_subject")
+        except FileNotFoundError:
             raise SystemExit("could not import task4 build-subject script")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
+        sys.modules[module.__name__] = module
 
         runner = getattr(module, "run_reconciled_build", None)
 

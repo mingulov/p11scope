@@ -1,6 +1,5 @@
 """Candidate-only discovery API contracts."""
 
-import importlib.util
 import inspect
 from pathlib import Path
 import sys
@@ -11,6 +10,10 @@ REPO = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = REPO / "scripts/task4-build-subject.py"
 MODULE_NAME = "task4_build_subject_discovery_api_test"
 MISSING = object()
+
+sys.path.insert(0, str(REPO / "scripts"))
+sys.dont_write_bytecode = True
+from _loader import load_path
 
 
 def load_subject(test):
@@ -26,12 +29,11 @@ def load_subject(test):
 
     sys.dont_write_bytecode = True
     test.addCleanup(restore)
-    spec = importlib.util.spec_from_file_location(MODULE_NAME, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
+    try:
+        module = load_path(SCRIPT_PATH, MODULE_NAME)
+    except FileNotFoundError:
         test.fail("could not import task4 build-subject script")
-    module = importlib.util.module_from_spec(spec)
     sys.modules[MODULE_NAME] = module
-    spec.loader.exec_module(module)
     return module
 
 

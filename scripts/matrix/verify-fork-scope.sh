@@ -404,14 +404,13 @@ import json, sys
 
 def evidence_oracle():
     """Load the canonical evidence oracle so gap counters live in one place."""
-    import importlib.util
+    import sys
 
-    spec = importlib.util.spec_from_file_location(
-        "check_capture_evidence", "scripts/check-capture-evidence.py"
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    sys.path.insert(0, "scripts")
+    sys.dont_write_bytecode = True
+    from _loader import load_sibling
+
+    return load_sibling("check-capture-evidence.py")
 
 
 obs = json.load(open(sys.argv[1]))

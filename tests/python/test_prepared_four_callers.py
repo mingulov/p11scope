@@ -74,7 +74,7 @@ class FinalizerFixture:
                 "tests/fixtures/oracle-lifecycle/sudo",
             ]
         if caller == CALLERS[0]:
-            # The sourced task4_finalize section shells out to this oracle.
+            # The sourced receipt_finalize section shells out to this oracle.
             inputs += ["scripts/lane-induced-gaps-oracle-5.py"]
         for relative in inputs:
             destination = self.root / relative
@@ -137,8 +137,8 @@ class FinalizerFixture:
         self.functions = temporary / "actual-finalizer-functions.sh"
         if not self.oracle:
             self.functions.write_text(
-                source_section(caller, "task4_snapshot() {", "task4_fact()")
-                + source_section(caller, "task4_finalize() {", "task4_receipt_run()"),
+                source_section(caller, "receipt_snapshot() {", "receipt_fact()")
+                + source_section(caller, "receipt_finalize() {", "receipt_receipt_run()"),
                 encoding="utf-8",
             )
 
@@ -206,13 +206,13 @@ class FinalizerFixture:
         tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=self.root, text=True).strip()
         caller_relative = self.caller.relative_to(REPOSITORY)
         variables = {
-            "TASK4_ROOT": str(self.receipt), "TASK4_FACTS": str(self.receipt / "facts.log"),
-            "TASK4_ROOT_ID": self.identity(self.receipt),
-            "TASK4_ARTIFACTS_ID": self.identity(self.artifacts),
-            "TASK4_WORK_ID": self.identity(self.work), "TASK4_HEAD": head, "TASK4_TREE": tree,
-            "TASK4_DRIVER_HASH": hashlib.sha256((self.root / caller_relative).read_bytes()).hexdigest(),
-            "TASK4_CHECKER_HASH": hashlib.sha256((self.root / "scripts/check-capture-evidence.py").read_bytes()).hexdigest(),
-            "TASK4_PREPARED_ADMITTED": str(admitted), "TASK4_PREPARED_PREFIX": str(self.prefix),
+            "RECEIPT_ROOT": str(self.receipt), "RECEIPT_FACTS": str(self.receipt / "facts.log"),
+            "RECEIPT_ROOT_ID": self.identity(self.receipt),
+            "RECEIPT_ARTIFACTS_ID": self.identity(self.artifacts),
+            "RECEIPT_WORK_ID": self.identity(self.work), "RECEIPT_HEAD": head, "RECEIPT_TREE": tree,
+            "RECEIPT_DRIVER_HASH": hashlib.sha256((self.root / caller_relative).read_bytes()).hexdigest(),
+            "RECEIPT_CHECKER_HASH": hashlib.sha256((self.root / "scripts/check-capture-evidence.py").read_bytes()).hexdigest(),
+            "RECEIPT_PREPARED_ADMITTED": str(admitted), "RECEIPT_PREPARED_PREFIX": str(self.prefix),
             "P11SCOPE_PREPARED_PYTHON": str(self.python),
             "P11SCOPE_FINALIZER_FUNCTIONS": str(self.functions),
             "P11SCOPE_FINALIZER_SOURCE": str(self.root / caller_relative),
@@ -223,11 +223,11 @@ class FinalizerFixture:
         }
         if self.oracle:
             oracle_inputs = {
-                "TASK4_SUBSET_HASH": "scripts/check-subset-oracle.py",
-                "TASK4_WORKLOAD_HASH": "scripts/matrix/oracle-workload.sh",
-                "TASK4_CGROUP_HELPER_HASH": "scripts/matrix/oracle-cgroup-cleanup.py",
-                "TASK4_LIFECYCLE_FIXTURE_HASH": "tests/fixtures/oracle-lifecycle/scenarios.sh",
-                "TASK4_SUDO_FIXTURE_HASH": "tests/fixtures/oracle-lifecycle/sudo",
+                "RECEIPT_SUBSET_HASH": "scripts/check-subset-oracle.py",
+                "RECEIPT_WORKLOAD_HASH": "scripts/matrix/oracle-workload.sh",
+                "RECEIPT_CGROUP_HELPER_HASH": "scripts/matrix/oracle-cgroup-cleanup.py",
+                "RECEIPT_LIFECYCLE_FIXTURE_HASH": "tests/fixtures/oracle-lifecycle/scenarios.sh",
+                "RECEIPT_SUDO_FIXTURE_HASH": "tests/fixtures/oracle-lifecycle/sudo",
             }
             for variable, relative in oracle_inputs.items():
                 variables[variable] = hashlib.sha256((self.root / relative).read_bytes()).hexdigest()
@@ -236,7 +236,7 @@ class FinalizerFixture:
                 ORACLE_CGROUP_HELPER=str(self.root / "scripts/matrix/oracle-cgroup-cleanup.py"),
                 ORACLE_LIFECYCLE_FIXTURE=str(self.root / "tests/fixtures/oracle-lifecycle/scenarios.sh"),
                 ORACLE_SUDO_FIXTURE=str(self.root / "tests/fixtures/oracle-lifecycle/sudo"),
-                TASK4_SIBLING_BASELINE="0", ORACLE_BODY_COMPLETE="0",
+                RECEIPT_SIBLING_BASELINE="0", ORACLE_BODY_COMPLETE="0",
             )
         environment.update(variables)
         return subprocess.run(
@@ -350,7 +350,7 @@ class PreparedFourCallersTests(unittest.TestCase):
                 relative_caller = caller.relative_to(REPOSITORY).as_posix()
                 extra = ()
                 if caller == CALLERS[0]:
-                    # The sourced task4_finalize section shells out to this oracle.
+                    # The sourced receipt_finalize section shells out to this oracle.
                     extra = ("scripts/lane-induced-gaps-oracle-5.py",)
                 if caller == CALLERS[1]:
                     extra = (
@@ -729,7 +729,7 @@ class PreparedFourCallersTests(unittest.TestCase):
     def test_executes_each_exact_parent_child_handoff_block(self):
         for caller in CHILD_CALLERS:
             commands = [command for command in logical_commands(caller)
-                        if command.lstrip().startswith("P11SCOPE_TASK4_BODY=1")]
+                        if command.lstrip().startswith("P11SCOPE_RECEIPT_BODY=1")]
             self.assertEqual(len(commands), 1)
             with self.subTest(caller=caller.name), tempfile.TemporaryDirectory() as raw:
                 base = Path(raw)
@@ -752,7 +752,7 @@ class PreparedFourCallersTests(unittest.TestCase):
                 ):
                     environment.pop(name, None)
                 environment.update(
-                    TASK4_ROOT=str(base),
+                    RECEIPT_ROOT=str(base),
                     P11SCOPE_HANDOFF_RECORD=str(record),
                 )
                 result = subprocess.run(
@@ -779,7 +779,7 @@ class PreparedFourCallersTests(unittest.TestCase):
             for mask in range(15):
                 with self.subTest(caller=caller.name, mask=mask):
                     environment = os.environ.copy()
-                    environment["P11SCOPE_TASK4_BODY"] = "1"
+                    environment["P11SCOPE_RECEIPT_BODY"] = "1"
                     values = ("/stable/cargo", "/stable/rustc", "/bpf/cargo", "/bpf/rustc")
                     for index, name in enumerate((
                         "P11SCOPE_PREPARED_STABLE_CARGO", "P11SCOPE_PREPARED_STABLE_RUSTC",

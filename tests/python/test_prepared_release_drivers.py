@@ -47,7 +47,7 @@ class PreparedReleaseDriverTests(unittest.TestCase):
             environment.pop(name, None)
         overrides = {"PATH": str(fixture.fake_bin) + ":" + os.environ["PATH"], "HOME": str(fixture.home)}
         environment.update(overrides)
-        return fixture.command(["/bin/sh", str(fixture.repo / "scripts/verify-task4-lane16.sh"), str(fixture.root), mode],
+        return fixture.command(["/bin/sh", str(fixture.repo / "scripts/verify-receipt-lane16.sh"), str(fixture.root), mode],
                                environment=environment, overrides=overrides, removed=SEAL["BUILD_INPUT_VARIABLES"])
 
     def events(self, fixture):
@@ -136,7 +136,7 @@ class PreparedReleaseDriverTests(unittest.TestCase):
     def test_lane16_build_uses_selected_cargo_rustc_and_offline_flags(self):
         fixture = self.fixture("lane16", "build paths with spaces")
         fixture.root.mkdir()
-        source = (fixture.repo / "scripts/verify-task4-lane16.sh").read_text()
+        source = (fixture.repo / "scripts/verify-receipt-lane16.sh").read_text()
         start = 'CARGO_TARGET_DIR="$ROOT/work/target" \\\n'
         end = 'gcc -O0 -o "$ROOT/work/hammer"'
         self.assertEqual(source.count(start), 1)
@@ -202,7 +202,7 @@ class PreparedReleaseDriverTests(unittest.TestCase):
                     extra["HOME"] = ""
                     expected = "cannot evaluate the effective cargo home"
                 elif scenario == "forged":
-                    extra["P11SCOPE_TASK4_SEALED"] = "1"
+                    extra["P11SCOPE_RECEIPT_SEALED"] = "1"
                     expected = "unsealed or forged"
                 else:
                     fixture.root = fixture.root.with_name("evidence\troot")

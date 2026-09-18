@@ -35,17 +35,17 @@ prepare_evidence_root() {
     [ "$per_input" = "$per_parent/$per_leaf" ] || return 1
     per_worktree=$(pwd -P)
     case $per_input in "$per_worktree"|"$per_worktree"/*) return 1 ;; esac
-    python3 -I scripts/lane-task4-lane02-oracle-1.py "$per_parent" || return 1
+    python3 -I scripts/lane-receipt-lane02-oracle-1.py "$per_parent" || return 1
     [ ! -e "$per_input" ] && [ ! -L "$per_input" ] || return 1
     umask 077
     mkdir -m 700 "$per_input" || return 1
     ROOT=$per_input
-    ROOT_ID=$(python3 -I scripts/lane-task4-lane02-oracle-2.py "$ROOT"
+    ROOT_ID=$(python3 -I scripts/lane-receipt-lane02-oracle-2.py "$ROOT"
     ) || return 1
 }
 
 validate_root() {
-    python3 -I scripts/lane-task4-lane02-oracle-3.py "$ROOT" "$ROOT_ID"
+    python3 -I scripts/lane-receipt-lane02-oracle-3.py "$ROOT" "$ROOT_ID"
 }
 
 validate_terminal_tree() {
@@ -115,7 +115,7 @@ observer_alive() {
 }
 
 count_byte_token() {
-    python3 -I scripts/lane-task4-lane02-oracle-4.py "$1" "$2"
+    python3 -I scripts/lane-receipt-lane02-oracle-4.py "$1" "$2"
 }
 
 # The child can emit the marker after iteration N drained discovery but before
@@ -134,7 +134,7 @@ wait_mapped_and_drained() {
         wmd_rejected=HARNESS_PROVIDER_INITIAL_SET
     fi
     while :; do
-        wmd_state=$(python3 -I scripts/lane-task4-lane02-oracle-5.py "$wmd_log" "$wmd_expected" "$wmd_rejected"
+        wmd_state=$(python3 -I scripts/lane-receipt-lane02-oracle-5.py "$wmd_log" "$wmd_expected" "$wmd_rejected"
         ) || return 1
         wmd_status=${wmd_state%% *}
         wmd_frames=${wmd_state#* }
@@ -381,7 +381,7 @@ C
     # oracle pass green without the refusal ever being reached. Assert the
     # refusal itself. Known ceiling: on a host where every prerequisite IS
     # present this cannot see the loops swapped back, because the refusal is
-    # reached either way. `task4_receipt_drivers_execute_behavioral_self_tests`
+    # reached either way. `receipt_receipt_drivers_execute_behavioral_self_tests`
     # covers that case: it runs this script under a PATH that excludes
     # ~/.cargo/bin, so the swapped order surfaces as
     # "refusal not reached; early run said: rustc required".
@@ -408,7 +408,7 @@ C
         exit 1
     fi
     python3 scripts/check-capture-evidence.py --self-test >/dev/null
-    echo "verify-task4-lane02 self-test: OK"
+    echo "verify-receipt-lane02 self-test: OK"
 }
 
 [ "$#" -eq 1 ] || usage
@@ -452,15 +452,15 @@ durable() {
 }
 
 harness_absent() {
-    sudo -n python3 -I scripts/lane-task4-lane02-oracle-6.py "$HARNESS" "$HARNESS_INITIAL"
+    sudo -n python3 -I scripts/lane-receipt-lane02-oracle-6.py "$HARNESS" "$HARNESS_INITIAL"
 }
 
 terminate_owned_harness() {
-    sudo -n python3 -I scripts/lane-task4-lane02-oracle-7.py "$HARNESS" "$HARNESS_INITIAL"
+    sudo -n python3 -I scripts/lane-receipt-lane02-oracle-7.py "$HARNESS" "$HARNESS_INITIAL"
 }
 
 wait_root_exit() {
-    sudo -n python3 -I scripts/lane-task4-lane02-oracle-8.py "$1" "$2" "$3"
+    sudo -n python3 -I scripts/lane-receipt-lane02-oracle-8.py "$1" "$2" "$3"
 }
 
 stop_observer() {
@@ -481,7 +481,7 @@ stop_observer() {
 }
 
 row_identity() {
-    python3 -I scripts/lane-task4-lane02-oracle-9.py "$1"
+    python3 -I scripts/lane-receipt-lane02-oracle-9.py "$1"
 }
 
 validate_row() {
@@ -489,15 +489,15 @@ validate_row() {
 }
 
 reclaim_verified_output() {
-    sudo -n python3 -I scripts/lane-task4-lane02-oracle-10.py "$1" "$2" "$3" "$(id -u)" "$(id -g)"
+    sudo -n python3 -I scripts/lane-receipt-lane02-oracle-10.py "$1" "$2" "$3" "$(id -u)" "$(id -g)"
 }
 
 remove_verified_pidfile() {
-    sudo -n python3 -I scripts/lane-task4-lane02-oracle-11.py "$1" "$2" "$3"
+    sudo -n python3 -I scripts/lane-receipt-lane02-oracle-11.py "$1" "$2" "$3"
 }
 
 no_atomic_temps() {
-    sudo -n python3 -I scripts/lane-task4-lane02-oracle-12.py "$1" "$2"
+    sudo -n python3 -I scripts/lane-receipt-lane02-oracle-12.py "$1" "$2"
 }
 
 cleanup() {
@@ -584,7 +584,7 @@ TRACKED_STATUS=$(git status --porcelain=v1 --untracked-files=no) || exit 77
     echo "tracked worktree must be clean" >&2
     exit 77
 }
-for source in scripts/verify-task4-lane02.sh scripts/check-capture-evidence.py \
+for source in scripts/verify-receipt-lane02.sh scripts/check-capture-evidence.py \
     scripts/lib.sh scripts/cleanup-traps.sh scripts/lane02-inputs.py \
     scripts/prepared-dependency-tools.sh scripts/prepared-dependency-snapshot.sh \
     scripts/prepared-dependency-evidence.py scripts/product-build.sh \
@@ -640,7 +640,7 @@ MODULE_HASH=$(digest "$MODULE")
 MODULE_NOTES=$(readelf -n "$MODULE") || exit 77
 MODULE_BUILD_ID=$(printf '%s\n' "$MODULE_NOTES" \
     | awk '/Build ID:/{print $3; exit}') || exit 77
-DRIVER_HASH=$(digest scripts/verify-task4-lane02.sh)
+DRIVER_HASH=$(digest scripts/verify-receipt-lane02.sh)
 CHECKER_HASH=$(digest scripts/check-capture-evidence.py)
 LIB_HASH=$(digest scripts/lib.sh)
 CLEANUP_HASH=$(digest scripts/cleanup-traps.sh)
@@ -706,7 +706,7 @@ slots.removable = false
 slots.mechanisms = ALL
 library.reset_on_fork = false
 EOF
-SOFTHSM2_CONF=$CONF softhsm2-util --init-token --free --label task4-lane02 \
+SOFTHSM2_CONF=$CONF softhsm2-util --init-token --free --label receipt-lane02 \
     --so-pin 1234 --pin 1234 >/dev/null || exit 1
 CONFIG_HASH=$(digest "$CONF")
 fact config_sha256 "$CONFIG_HASH"
@@ -847,7 +847,7 @@ run_row 06-dlopen-always dlopen always
 [ "$(git rev-parse 'HEAD^{tree}')" = "$(awk -F '\t' '$1=="tree"{print $2}' "$FACTS")" ] || exit 1
 TRACKED_STATUS=$(git status --porcelain=v1 --untracked-files=no) || exit 1
 [ -z "$TRACKED_STATUS" ] || exit 1
-[ "$(digest scripts/verify-task4-lane02.sh)" = "$DRIVER_HASH" ] || exit 1
+[ "$(digest scripts/verify-receipt-lane02.sh)" = "$DRIVER_HASH" ] || exit 1
 [ "$(digest scripts/check-capture-evidence.py)" = "$CHECKER_HASH" ] || exit 1
 [ "$(digest scripts/lib.sh)" = "$LIB_HASH" ] || exit 1
 [ "$(digest scripts/cleanup-traps.sh)" = "$CLEANUP_HASH" ] || exit 1

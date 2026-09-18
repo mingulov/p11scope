@@ -27,9 +27,9 @@ P11SCOPE_PRODUCT_BUILD_MODE=${P11SCOPE_PRODUCT_BUILD_MODE:-ordinary}
 . scripts/product-build.sh
 
 MODULE=${P11SCOPE_PKCS11_MODULE:-/usr/lib/softhsm/libsofthsm2.so}
-WORK=${P11SCOPE_TASK4_WORK-target/e2e}
-if [ "${P11SCOPE_TASK4_WORK+set}" = set ]; then
-    case $WORK in /*) ;; *) echo "P11SCOPE_TASK4_WORK must be absolute" >&2; exit 2 ;; esac
+WORK=${P11SCOPE_RECEIPT_WORK-target/e2e}
+if [ "${P11SCOPE_RECEIPT_WORK+set}" = set ]; then
+    case $WORK in /*) ;; *) echo "P11SCOPE_RECEIPT_WORK must be absolute" >&2; exit 2 ;; esac
 fi
 WPID=
 SPID=
@@ -37,7 +37,7 @@ SPID=
 require_non_root_caller
 # See verify-canaries.sh: the observer refuses an output directory with a
 # group/world-writable non-sticky ancestor, which this checkout has.
-[ "${P11SCOPE_TASK4_WORK+set}" = set ] || {
+[ "${P11SCOPE_RECEIPT_WORK+set}" = set ] || {
     WORK=$(mktemp -d "${TMPDIR:-/tmp}/p11scope-verify-XXXXXX")/$WORK
     echo "work root: $WORK"
 }

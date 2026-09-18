@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Task 4 lane 02 row_identity oracle: require a caller-owned mode-0700 row directory and print its device and inode. Oracle extracted from scripts/verify-task4-lane02.sh (lines 589-593)."""
+"""Task 4 lane 02 row_identity oracle: require a caller-owned mode-0700 row directory and print its device and inode. Oracle extracted from scripts/verify-receipt-lane02.sh (lines 589-593)."""
 import argparse
 import sys
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Task 4 lane 16 receipt model oracle: evaluate the shared receipt-case matrix plus lane16 cases over synthetic evidence. Oracle extracted from scripts/verify-task4-lane16.sh (lines 20-210)."""
+"""Task 4 lane 16 receipt model oracle: evaluate the shared receipt-case matrix plus lane16 cases over synthetic evidence. Oracle extracted from scripts/verify-receipt-lane16.sh (lines 20-210)."""
 import argparse
 import sys
 
@@ -137,7 +137,7 @@ with tempfile.TemporaryDirectory() as raw:
     capture.unlink(); mark(common[22], not valid()); capture.write_text("{}\n"); capture.chmod(0o600)
     checker.unlink(); mark(common[23], not valid()); checker.write_text("OK\n"); checker.chmod(0o600)
     mark(common[24], not (public / "cargo-ran").exists())
-    lock = parent / ".task4.lock"; lock.touch(mode=0o600); held = open(lock, "r+")
+    lock = parent / ".receipt.lock"; lock.touch(mode=0o600); held = open(lock, "r+")
     fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
     contender = open(lock, "r+")
     try:

@@ -13,11 +13,11 @@ usage() {
 
 self_test() {
     [ "$#" -eq 0 ] || usage
-    report=${P11SCOPE_TASK4_SELF_TEST_REPORT-}
+    report=${P11SCOPE_RECEIPT_SELF_TEST_REPORT-}
     if [ -z "$report" ]; then self_tmp=$(mktemp -d); trap 'rm -rf "$self_tmp"' EXIT INT TERM; report=$self_tmp/report.tsv; fi
     umask 077
-    python3 -I scripts/lane-task4-lane16-oracle-1.py "$report" lane16
-    echo "verify-task4-lane16 Task 4 receipt self-test: OK"
+    python3 -I scripts/lane-receipt-lane16-oracle-1.py "$report" lane16
+    echo "verify-receipt-lane16 Task 4 receipt self-test: OK"
 }
 
 prepare_root() {
@@ -66,7 +66,7 @@ finalize() {
         [ "$(git rev-parse HEAD 2>/dev/null)" = "$HEAD_ID" ] || result=1
         [ "$(git rev-parse 'HEAD^{tree}' 2>/dev/null)" = "$TREE_ID" ] || result=1
         git diff --quiet && git diff --cached --quiet || result=1
-        [ "$(digest scripts/verify-task4-lane16.sh 2>/dev/null)" = "$DRIVER_HASH" ] || result=1
+        [ "$(digest scripts/verify-receipt-lane16.sh 2>/dev/null)" = "$DRIVER_HASH" ] || result=1
         [ "$(digest scripts/fixtures/hammer.c 2>/dev/null)" = "$HAMMER_SOURCE_HASH" ] || result=1
         [ "$(digest scripts/check-capture-evidence.py 2>/dev/null)" = "$CHECKER_SOURCE_HASH" ] || result=1
         if [ "$PREPARED_ADMITTED" -eq 1 ]; then
@@ -87,7 +87,7 @@ finalize() {
     fi
     find "$ROOT" -type d -exec chmod 700 {} + 2>/dev/null || result=1
     find "$ROOT" -type f -exec chmod 600 {} + 2>/dev/null || result=1
-    python3 -I scripts/lane-task4-lane16-oracle-2.py "$ROOT" || result=1
+    python3 -I scripts/lane-receipt-lane16-oracle-2.py "$ROOT" || result=1
     fact ended_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)" || result=1
     fact terminal_status "$result" || result=1
     sync -f "$FACTS" "$ROOT/stdout.log" "$ROOT/stderr.log" 2>/dev/null || result=1
@@ -123,7 +123,7 @@ PREPARED_ADMITTED=0
 PREPARED_PREFIX=$ROOT/artifacts/lane16.prepared
 trap finalize EXIT INT TERM HUP
 
-LOCK=$CAMPAIGN/.task4.lock
+LOCK=$CAMPAIGN/.receipt.lock
 [ ! -L "$LOCK" ] || exit 77
 exec 9>>"$LOCK"
 chmod 600 "$LOCK"
@@ -134,7 +134,7 @@ LOCK_ID=$(stat -Lc %d:%i "$LOCK")
 HEAD_ID=$(git rev-parse HEAD) || exit 77
 TREE_ID=$(git rev-parse 'HEAD^{tree}') || exit 77
 git diff --quiet && git diff --cached --quiet || exit 77
-DRIVER_HASH=$(digest scripts/verify-task4-lane16.sh)
+DRIVER_HASH=$(digest scripts/verify-receipt-lane16.sh)
 HAMMER_SOURCE_HASH=$(digest scripts/fixtures/hammer.c)
 CHECKER_SOURCE_HASH=$(digest scripts/check-capture-evidence.py)
 fact started_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -190,7 +190,7 @@ library.reset_on_fork = false
 EOF
 chmod 600 "$ROOT/work/softhsm2.conf"
 SOFTHSM2_CONF="$ROOT/work/softhsm2.conf" softhsm2-util --init-token --free \
-    --label task4-lane16 --so-pin 1234 --pin 1234 >/dev/null
+    --label receipt-lane16 --so-pin 1234 --pin 1234 >/dev/null
 CARGO_TARGET_DIR="$ROOT/work/target" \
     RUSTC="$P11SCOPE_PREPARED_STABLE_RUSTC" \
     P11SCOPE_PREPARED_BPF_CARGO="$P11SCOPE_PREPARED_BPF_CARGO" \
@@ -216,7 +216,7 @@ set +e
 body_status=$?
 set -e
 [ "$body_status" -eq 0 ] || exit "$body_status"
-python3 -I scripts/lane-task4-lane16-oracle-3.py "$ROOT/artifacts/observed.json" "$MODE" \
+python3 -I scripts/lane-receipt-lane16-oracle-3.py "$ROOT/artifacts/observed.json" "$MODE" \
     > "$ROOT/artifacts/checker.log" 2>&1
 chmod 600 "$ROOT/artifacts/observed.json" "$ROOT/artifacts/checker.log"
 exit 0

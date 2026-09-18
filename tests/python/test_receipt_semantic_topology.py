@@ -7,8 +7,8 @@ import unittest
 
 
 REPO = Path(__file__).resolve().parents[2]
-SCRIPT_PATH = REPO / "scripts/task4-build-subject.py"
-MODULE_NAME = "task4_build_subject_semantic_topology_test"
+SCRIPT_PATH = REPO / "scripts/receipt-build-subject.py"
+MODULE_NAME = "receipt_build_subject_semantic_topology_test"
 MISSING = object()
 
 sys.path.insert(0, str(REPO / "scripts"))
@@ -71,7 +71,7 @@ class SemanticTraceTopologyTests(unittest.TestCase):
         try:
             self.module = load_path(SCRIPT_PATH, MODULE_NAME)
         except FileNotFoundError:
-            self.fail("could not import task4 build-subject script")
+            self.fail("could not import receipt build-subject script")
         sys.modules[MODULE_NAME] = self.module
 
     def _restore_import_state(self):

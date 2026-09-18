@@ -11,9 +11,9 @@ NATIVE = Path(__file__).resolve().parent
 
 def run_finalizer(fixture, scenario):
     lane = fixture.lane
-    source = (fixture.repo / "scripts" / ("build-release.sh" if lane == "release" else "verify-task4-lane16.sh")).read_text()
+    source = (fixture.repo / "scripts" / ("build-release.sh" if lane == "release" else "verify-receipt-lane16.sh")).read_text()
     start = "MODULE=/usr/lib/softhsm/libsofthsm2.so\n" if lane == "release" else "prepare_root() {\n"
-    end = "task4_receipt_run() {\n" if lane == "release" else '[ "$#" -ge 1 ] || usage\n'
+    end = "receipt_receipt_run() {\n" if lane == "release" else '[ "$#" -ge 1 ] || usage\n'
     if source.count(start) != 1 or source.count(end) != 1:
         raise AssertionError("actual finalizer definition boundary changed")
     definitions = fixture.base / "definitions.sh"

@@ -31,11 +31,11 @@ cd "$(dirname "$0")/../.."
 . scripts/lib.sh
 
 MODULE=/usr/lib/softhsm/libsofthsm2.so
-WORK=${P11SCOPE_TASK4_WORK:-target/matrix-fork}
+WORK=${P11SCOPE_RECEIPT_WORK:-target/matrix-fork}
 EXPECTED=scripts/matrix/fork-expected.txt
 PRODUCT=$WORK/target
 
-task4_prepare_root() {
+receipt_prepare_root() {
     t4_candidate=$1
     case $t4_candidate in /*) ;; *) return 1 ;; esac
     case $t4_candidate in *'/../'*|*/..|*"\t"*|*"\n"*) return 1 ;; esac
@@ -52,51 +52,51 @@ task4_prepare_root() {
     [ "$(stat -Lc %u:%a "$t4_parent")" = "$(id -u):700" ] || return 1
     [ ! -e "$t4_candidate" ] && [ ! -L "$t4_candidate" ] || return 1
     umask 077; mkdir -m 700 "$t4_candidate" || return 1
-    TASK4_ROOT=$t4_candidate; TASK4_CAMPAIGN=$t4_parent
-    TASK4_ROOT_ID=$(stat -Lc %d:%i "$TASK4_ROOT") || return 1
+    RECEIPT_ROOT=$t4_candidate; RECEIPT_CAMPAIGN=$t4_parent
+    RECEIPT_ROOT_ID=$(stat -Lc %d:%i "$RECEIPT_ROOT") || return 1
 }
 
-task4_digest() { sha256sum "$1" | awk '{print $1}'; }
-task4_snapshot() {
+receipt_digest() { sha256sum "$1" | awk '{print $1}'; }
+receipt_snapshot() {
     [ "$#" -eq 1 ] || return 2
     case $1 in initial|final) ;; *) return 2 ;; esac
     p11scope_prepared_snapshot "$P11SCOPE_PREPARED_PYTHON" \
-        "$TASK4_ROOT/artifacts/fork.source.$1" \
-        "$TASK4_PREPARED_PREFIX.$1.ledger.sha256"
+        "$RECEIPT_ROOT/artifacts/fork.source.$1" \
+        "$RECEIPT_PREPARED_PREFIX.$1.ledger.sha256"
 }
-task4_fact() { printf '%s\t%s\n' "$1" "$2" >> "$TASK4_FACTS"; }
+receipt_fact() { printf '%s\t%s\n' "$1" "$2" >> "$RECEIPT_FACTS"; }
 
-task4_finalize() {
+receipt_finalize() {
     t4_result=$?
     trap - EXIT INT TERM HUP
     set +e
-    [ "$(stat -Lc %d:%i "$TASK4_ROOT" 2>/dev/null)" = "$TASK4_ROOT_ID" ] || t4_result=1
-    [ "$(stat -Lc %d:%i "$TASK4_ROOT/artifacts" 2>/dev/null)" = "$TASK4_ARTIFACTS_ID" ] || t4_result=1
-    [ "$(stat -Lc %d:%i "$TASK4_ROOT/work" 2>/dev/null)" = "$TASK4_WORK_ID" ] || t4_result=1
+    [ "$(stat -Lc %d:%i "$RECEIPT_ROOT" 2>/dev/null)" = "$RECEIPT_ROOT_ID" ] || t4_result=1
+    [ "$(stat -Lc %d:%i "$RECEIPT_ROOT/artifacts" 2>/dev/null)" = "$RECEIPT_ARTIFACTS_ID" ] || t4_result=1
+    [ "$(stat -Lc %d:%i "$RECEIPT_ROOT/work" 2>/dev/null)" = "$RECEIPT_WORK_ID" ] || t4_result=1
     if [ "$t4_result" -ne 77 ]; then
-        [ "$(git rev-parse HEAD 2>/dev/null)" = "$TASK4_HEAD" ] || t4_result=1
-        [ "$(git rev-parse 'HEAD^{tree}' 2>/dev/null)" = "$TASK4_TREE" ] || t4_result=1
+        [ "$(git rev-parse HEAD 2>/dev/null)" = "$RECEIPT_HEAD" ] || t4_result=1
+        [ "$(git rev-parse 'HEAD^{tree}' 2>/dev/null)" = "$RECEIPT_TREE" ] || t4_result=1
         git diff --quiet && git diff --cached --quiet || t4_result=1
-        [ "$(task4_digest scripts/matrix/verify-fork-scope.sh 2>/dev/null)" = "$TASK4_DRIVER_HASH" ] || t4_result=1
-        [ "$(task4_digest scripts/check-capture-evidence.py 2>/dev/null)" = "$TASK4_CHECKER_HASH" ] || t4_result=1
-        if [ "${TASK4_PREPARED_ADMITTED-0}" -eq 1 ]; then
+        [ "$(receipt_digest scripts/matrix/verify-fork-scope.sh 2>/dev/null)" = "$RECEIPT_DRIVER_HASH" ] || t4_result=1
+        [ "$(receipt_digest scripts/check-capture-evidence.py 2>/dev/null)" = "$RECEIPT_CHECKER_HASH" ] || t4_result=1
+        if [ "${RECEIPT_PREPARED_ADMITTED-0}" -eq 1 ]; then
             if "$P11SCOPE_PREPARED_PYTHON" -I scripts/prepared-dependency-evidence.py \
-                recheck --prefix "$TASK4_PREPARED_PREFIX"; then
-                task4_snapshot final > "$TASK4_ROOT/artifacts/source.end.tsv" || t4_result=1
-                cmp -s "$TASK4_ROOT/artifacts/source.start.tsv" \
-                    "$TASK4_ROOT/artifacts/source.end.tsv" || t4_result=1
+                recheck --prefix "$RECEIPT_PREPARED_PREFIX"; then
+                receipt_snapshot final > "$RECEIPT_ROOT/artifacts/source.end.tsv" || t4_result=1
+                cmp -s "$RECEIPT_ROOT/artifacts/source.start.tsv" \
+                    "$RECEIPT_ROOT/artifacts/source.end.tsv" || t4_result=1
             else
                 t4_result=1
             fi
         else
             t4_result=1
         fi
-        [ -s "$TASK4_ROOT/artifacts/capture.json" ] || t4_result=1
-        [ -s "$TASK4_ROOT/artifacts/checker.log" ] || t4_result=1
+        [ -s "$RECEIPT_ROOT/artifacts/capture.json" ] || t4_result=1
+        [ -s "$RECEIPT_ROOT/artifacts/checker.log" ] || t4_result=1
     fi
-    find "$TASK4_ROOT" -type d -exec chmod 700 {} + 2>/dev/null || t4_result=1
-    find "$TASK4_ROOT" -type f -exec chmod 600 {} + 2>/dev/null || t4_result=1
-    python3 - "$TASK4_ROOT" <<'PY' || t4_result=1
+    find "$RECEIPT_ROOT" -type d -exec chmod 700 {} + 2>/dev/null || t4_result=1
+    find "$RECEIPT_ROOT" -type f -exec chmod 600 {} + 2>/dev/null || t4_result=1
+    python3 - "$RECEIPT_ROOT" <<'PY' || t4_result=1
 import os, stat, sys
 root=sys.argv[1]
 if set(os.listdir(root)) != {"facts.log","stdout.log","stderr.log","artifacts","work"}: raise SystemExit("foreign root entry")
@@ -108,77 +108,77 @@ for directory, dirs, files in os.walk(root,followlinks=False):
         mode=os.lstat(os.path.join(directory,name)).st_mode
         if not stat.S_ISREG(mode) or stat.S_IMODE(mode)!=0o600: raise SystemExit("file mode")
 PY
-    task4_fact ended_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)" || t4_result=1
-    task4_fact terminal_status "$t4_result" || t4_result=1
-    sync -f "$TASK4_FACTS" "$TASK4_ROOT/stdout.log" "$TASK4_ROOT/stderr.log" 2>/dev/null || t4_result=1
-    if [ ! -e "$TASK4_ROOT/status" ] && [ ! -L "$TASK4_ROOT/status" ]; then
-        printf '%s\n' "$t4_result" > "$TASK4_ROOT/status"; chmod 600 "$TASK4_ROOT/status"; sync -f "$TASK4_ROOT/status" 2>/dev/null || t4_result=1
+    receipt_fact ended_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)" || t4_result=1
+    receipt_fact terminal_status "$t4_result" || t4_result=1
+    sync -f "$RECEIPT_FACTS" "$RECEIPT_ROOT/stdout.log" "$RECEIPT_ROOT/stderr.log" 2>/dev/null || t4_result=1
+    if [ ! -e "$RECEIPT_ROOT/status" ] && [ ! -L "$RECEIPT_ROOT/status" ]; then
+        printf '%s\n' "$t4_result" > "$RECEIPT_ROOT/status"; chmod 600 "$RECEIPT_ROOT/status"; sync -f "$RECEIPT_ROOT/status" 2>/dev/null || t4_result=1
     else
         t4_result=1
     fi
     exit "$t4_result"
 }
 
-task4_receipt_run() {
+receipt_receipt_run() {
     [ "$#" -eq 1 ] || { echo "usage: $0 --self-test | ABSENT_EVIDENCE_ROOT" >&2; exit 2; }
-    task4_prepare_root "$1" || { echo "invalid Task 4 evidence root" >&2; exit 77; }
-    TASK4_FACTS=$TASK4_ROOT/facts.log
-    : > "$TASK4_FACTS"; : > "$TASK4_ROOT/stdout.log"; : > "$TASK4_ROOT/stderr.log"
-    chmod 600 "$TASK4_FACTS" "$TASK4_ROOT/stdout.log" "$TASK4_ROOT/stderr.log"
-    mkdir -m 700 "$TASK4_ROOT/artifacts" "$TASK4_ROOT/work"
-    TASK4_ARTIFACTS_ID=$(stat -Lc %d:%i "$TASK4_ROOT/artifacts")
-    TASK4_WORK_ID=$(stat -Lc %d:%i "$TASK4_ROOT/work")
-    TASK4_HEAD= TASK4_TREE= TASK4_DRIVER_HASH= TASK4_CHECKER_HASH=
-    TASK4_PREPARED_ADMITTED=0
-    TASK4_PREPARED_PREFIX=$TASK4_ROOT/artifacts/fork.prepared
-    trap task4_finalize EXIT INT TERM HUP
-    [ ! -L "$TASK4_CAMPAIGN/.task4.lock" ] || exit 77
-    exec 9>>"$TASK4_CAMPAIGN/.task4.lock"; chmod 600 "$TASK4_CAMPAIGN/.task4.lock"
-    [ "$(stat -Lc %d:%i:%u:%a:%h /proc/$$/fd/9)" = "$(stat -Lc %d:%i:%u:%a:%h "$TASK4_CAMPAIGN/.task4.lock")" ] || exit 77
+    receipt_prepare_root "$1" || { echo "invalid Task 4 evidence root" >&2; exit 77; }
+    RECEIPT_FACTS=$RECEIPT_ROOT/facts.log
+    : > "$RECEIPT_FACTS"; : > "$RECEIPT_ROOT/stdout.log"; : > "$RECEIPT_ROOT/stderr.log"
+    chmod 600 "$RECEIPT_FACTS" "$RECEIPT_ROOT/stdout.log" "$RECEIPT_ROOT/stderr.log"
+    mkdir -m 700 "$RECEIPT_ROOT/artifacts" "$RECEIPT_ROOT/work"
+    RECEIPT_ARTIFACTS_ID=$(stat -Lc %d:%i "$RECEIPT_ROOT/artifacts")
+    RECEIPT_WORK_ID=$(stat -Lc %d:%i "$RECEIPT_ROOT/work")
+    RECEIPT_HEAD= RECEIPT_TREE= RECEIPT_DRIVER_HASH= RECEIPT_CHECKER_HASH=
+    RECEIPT_PREPARED_ADMITTED=0
+    RECEIPT_PREPARED_PREFIX=$RECEIPT_ROOT/artifacts/fork.prepared
+    trap receipt_finalize EXIT INT TERM HUP
+    [ ! -L "$RECEIPT_CAMPAIGN/.receipt.lock" ] || exit 77
+    exec 9>>"$RECEIPT_CAMPAIGN/.receipt.lock"; chmod 600 "$RECEIPT_CAMPAIGN/.receipt.lock"
+    [ "$(stat -Lc %d:%i:%u:%a:%h /proc/$$/fd/9)" = "$(stat -Lc %d:%i:%u:%a:%h "$RECEIPT_CAMPAIGN/.receipt.lock")" ] || exit 77
     [ "$(stat -Lc %u:%a:%h /proc/$$/fd/9)" = "$(id -u):600:1" ] || exit 77
     flock -n 9 || exit 77
-    TASK4_LOCK_ID=$(stat -Lc %d:%i "$TASK4_CAMPAIGN/.task4.lock")
-    TASK4_HEAD=$(git rev-parse HEAD) || exit 77; TASK4_TREE=$(git rev-parse 'HEAD^{tree}') || exit 77
+    RECEIPT_LOCK_ID=$(stat -Lc %d:%i "$RECEIPT_CAMPAIGN/.receipt.lock")
+    RECEIPT_HEAD=$(git rev-parse HEAD) || exit 77; RECEIPT_TREE=$(git rev-parse 'HEAD^{tree}') || exit 77
     git diff --quiet && git diff --cached --quiet || exit 77
-    TASK4_DRIVER_HASH=$(task4_digest scripts/matrix/verify-fork-scope.sh); TASK4_CHECKER_HASH=$(task4_digest scripts/check-capture-evidence.py)
-    task4_fact started_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; task4_fact argv "$0 $1"; task4_fact cwd "$(pwd -P)"
-    task4_fact uid_gid "$(id -u):$(id -g)"; task4_fact kernel "$(uname -srmo)"; task4_fact head "$TASK4_HEAD"; task4_fact tree "$TASK4_TREE"
-    task4_fact root_identity "$TASK4_ROOT_ID"; task4_fact artifacts_identity "$TASK4_ARTIFACTS_ID"; task4_fact work_identity "$TASK4_WORK_ID"
-    task4_fact lock_identity "$TASK4_LOCK_ID"; task4_fact lock_holder "$$:$(process_starttime $$)"
-    task4_fact driver_sha256 "$TASK4_DRIVER_HASH"; task4_fact checker_sha256 "$TASK4_CHECKER_HASH"
+    RECEIPT_DRIVER_HASH=$(receipt_digest scripts/matrix/verify-fork-scope.sh); RECEIPT_CHECKER_HASH=$(receipt_digest scripts/check-capture-evidence.py)
+    receipt_fact started_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; receipt_fact argv "$0 $1"; receipt_fact cwd "$(pwd -P)"
+    receipt_fact uid_gid "$(id -u):$(id -g)"; receipt_fact kernel "$(uname -srmo)"; receipt_fact head "$RECEIPT_HEAD"; receipt_fact tree "$RECEIPT_TREE"
+    receipt_fact root_identity "$RECEIPT_ROOT_ID"; receipt_fact artifacts_identity "$RECEIPT_ARTIFACTS_ID"; receipt_fact work_identity "$RECEIPT_WORK_ID"
+    receipt_fact lock_identity "$RECEIPT_LOCK_ID"; receipt_fact lock_holder "$$:$(process_starttime $$)"
+    receipt_fact driver_sha256 "$RECEIPT_DRIVER_HASH"; receipt_fact checker_sha256 "$RECEIPT_CHECKER_HASH"
     for tool in gcc python3 rustup capsh systemd-run sudo sha256sum git sort xargs; do command -v "$tool" >/dev/null || exit 77; done
     . scripts/prepared-dependency-tools.sh
     . scripts/prepared-dependency-snapshot.sh
     p11scope_prepared_tools_select "$(command -v python3)" "$(command -v rustup)" || exit 77
     "$P11SCOPE_PREPARED_PYTHON" -I scripts/prepared-dependency-evidence.py capture \
-        --prefix "$TASK4_PREPARED_PREFIX" \
+        --prefix "$RECEIPT_PREPARED_PREFIX" \
         --stable-cargo "$P11SCOPE_PREPARED_STABLE_CARGO" \
         --stable-rustc "$P11SCOPE_PREPARED_STABLE_RUSTC" \
         --bpf-cargo "$P11SCOPE_PREPARED_BPF_CARGO" \
         --bpf-rustc "$P11SCOPE_PREPARED_BPF_RUSTC" || exit 77
-    TASK4_PREPARED_ADMITTED=1
-    task4_snapshot initial > "$TASK4_ROOT/artifacts/source.start.tsv" || exit 77
-    TASK4_SOURCE_HASH=$(task4_digest "$TASK4_ROOT/artifacts/source.start.tsv")
-    task4_fact source_input_ledger_sha256 "$TASK4_SOURCE_HASH"
+    RECEIPT_PREPARED_ADMITTED=1
+    receipt_snapshot initial > "$RECEIPT_ROOT/artifacts/source.start.tsv" || exit 77
+    RECEIPT_SOURCE_HASH=$(receipt_digest "$RECEIPT_ROOT/artifacts/source.start.tsv")
+    receipt_fact source_input_ledger_sha256 "$RECEIPT_SOURCE_HASH"
     sudo -n true >/dev/null 2>&1 || exit 77
     [ -f "$MODULE" ] || exit 77
-    P11SCOPE_TASK4_BODY=1 P11SCOPE_TASK4_WORK="$TASK4_ROOT/work" \
+    P11SCOPE_RECEIPT_BODY=1 P11SCOPE_RECEIPT_WORK="$RECEIPT_ROOT/work" \
         P11SCOPE_PREPARED_STABLE_CARGO="$P11SCOPE_PREPARED_STABLE_CARGO" \
         P11SCOPE_PREPARED_STABLE_RUSTC="$P11SCOPE_PREPARED_STABLE_RUSTC" \
         P11SCOPE_PREPARED_BPF_CARGO="$P11SCOPE_PREPARED_BPF_CARGO" \
         P11SCOPE_PREPARED_BPF_RUSTC="$P11SCOPE_PREPARED_BPF_RUSTC" \
-        /bin/sh "$0" > "$TASK4_ROOT/stdout.log" 2> "$TASK4_ROOT/stderr.log"
-    t4_capture=$(find "$TASK4_ROOT/work" -type f -name '*observed*.json' -print | sort | head -n 1)
+        /bin/sh "$0" > "$RECEIPT_ROOT/stdout.log" 2> "$RECEIPT_ROOT/stderr.log"
+    t4_capture=$(find "$RECEIPT_ROOT/work" -type f -name '*observed*.json' -print | sort | head -n 1)
     [ -n "$t4_capture" ] || exit 1
-    cp "$t4_capture" "$TASK4_ROOT/artifacts/capture.json"
-    cp "$TASK4_ROOT/stdout.log" "$TASK4_ROOT/artifacts/checker.log"
+    cp "$t4_capture" "$RECEIPT_ROOT/artifacts/capture.json"
+    cp "$RECEIPT_ROOT/stdout.log" "$RECEIPT_ROOT/artifacts/checker.log"
 }
 
 
-task4_receipt_self_test() {
+receipt_receipt_self_test() {
     [ "$#" -eq 0 ] || exit 2
-    REPORT=${P11SCOPE_TASK4_SELF_TEST_REPORT-}
-    if [ -z "$REPORT" ]; then TASK4_SELF_TMP=$(mktemp -d); trap 'rm -rf "$TASK4_SELF_TMP"' EXIT INT TERM; REPORT=$TASK4_SELF_TMP/report.tsv; fi
+    REPORT=${P11SCOPE_RECEIPT_SELF_TEST_REPORT-}
+    if [ -z "$REPORT" ]; then RECEIPT_SELF_TMP=$(mktemp -d); trap 'rm -rf "$RECEIPT_SELF_TMP"' EXIT INT TERM; REPORT=$RECEIPT_SELF_TMP/report.tsv; fi
     umask 077
     python3 - "$REPORT" <<'PY'
 import copy, fcntl, os, stat, sys, tempfile
@@ -247,7 +247,7 @@ with tempfile.TemporaryDirectory() as raw:
     x=dict(state);x["head"]="x";mark(common[19],not valid(s=x));x=dict(state);x["input"]="x";mark(common[20],not valid(s=x))
     extra=art/"foreign";extra.write_text("x");mark(common[21],not valid());extra.unlink();(art/"observed.json").unlink();mark(common[22],not valid());(art/"observed.json").write_text("evidence\n");(art/"observed.json").chmod(0o600)
     (art/"checker.log").unlink();mark(common[23],not valid());(art/"checker.log").write_text("evidence\n");(art/"checker.log").chmod(0o600);mark(common[24],not (work/"cargo-ran").exists())
-    lock=parent/".task4.lock";lock.touch(mode=0o600);a=open(lock,"r+");b=open(lock,"r+");fcntl.flock(a,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    lock=parent/".receipt.lock";lock.touch(mode=0o600);a=open(lock,"r+");b=open(lock,"r+");fcntl.flock(a,fcntl.LOCK_EX|fcntl.LOCK_NB)
     try: fcntl.flock(b,fcntl.LOCK_EX|fcntl.LOCK_NB);blocked=False
     except BlockingIOError: blocked=True
     mark(common[25],blocked and not (work/"runtime-ran").exists());a.close();fcntl.flock(b,fcntl.LOCK_EX|fcntl.LOCK_NB);mark(common[26],valid());mark(common[27],stat.S_IMODE(os.fstat(b.fileno()).st_mode)==0o600);b.close()
@@ -281,12 +281,12 @@ PY
 }
 if [ "${1-}" = --self-test ]; then
     shift
-    task4_receipt_self_test "$@"
+    receipt_receipt_self_test "$@"
     exit 0
 fi
 
-if [ -z "${P11SCOPE_TASK4_BODY-}" ]; then
-    task4_receipt_run "$@"
+if [ -z "${P11SCOPE_RECEIPT_BODY-}" ]; then
+    receipt_receipt_run "$@"
     exit 0
 fi
 [ "$#" -eq 0 ] || exit 2

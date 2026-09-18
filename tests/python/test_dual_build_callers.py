@@ -66,7 +66,7 @@ class DualBuildCallerTests(unittest.TestCase):
         self.environment.update(PATH=f"{self.bin}:/usr/bin:/bin",
                                 P11SCOPE_DUAL_BUILD_CONFIG=str(self.config),
                                 P11SCOPE_PKCS11_MODULE=str(self.module),
-                                P11SCOPE_TASK4_WORK=str(self.work))
+                                P11SCOPE_RECEIPT_WORK=str(self.work))
 
     def make_inert(self, name):
         path = self.tools / name

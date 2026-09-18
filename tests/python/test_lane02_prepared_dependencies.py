@@ -26,7 +26,7 @@ class Lane02Fixture:
         self.prepared = EvidenceFixture(temporary)
         self.root = self.prepared.root
         copied = (
-            "scripts/verify-task4-lane02.sh", "scripts/lib.sh", "scripts/cleanup-traps.sh",
+            "scripts/verify-receipt-lane02.sh", "scripts/lib.sh", "scripts/cleanup-traps.sh",
             "scripts/check-capture-evidence.py", "scripts/lane02-inputs.py",
             "scripts/prepared-dependency-tools.sh", "scripts/prepared-dependency-snapshot.sh",
             "scripts/product-build.sh", "scripts/merge-checksum-ledgers.py",
@@ -34,12 +34,12 @@ class Lane02Fixture:
             "spike/harness.c", "spike/expected.txt",
             # The lane's and lib's extracted oracle fragments are runtime files
             # of the copied lane: the fixture runs its main flow.
-            "scripts/lane-task4-lane02-oracle-1.py", "scripts/lane-task4-lane02-oracle-2.py",
-            "scripts/lane-task4-lane02-oracle-3.py", "scripts/lane-task4-lane02-oracle-4.py",
-            "scripts/lane-task4-lane02-oracle-5.py", "scripts/lane-task4-lane02-oracle-6.py",
-            "scripts/lane-task4-lane02-oracle-7.py", "scripts/lane-task4-lane02-oracle-8.py",
-            "scripts/lane-task4-lane02-oracle-9.py", "scripts/lane-task4-lane02-oracle-10.py",
-            "scripts/lane-task4-lane02-oracle-11.py", "scripts/lane-task4-lane02-oracle-12.py",
+            "scripts/lane-receipt-lane02-oracle-1.py", "scripts/lane-receipt-lane02-oracle-2.py",
+            "scripts/lane-receipt-lane02-oracle-3.py", "scripts/lane-receipt-lane02-oracle-4.py",
+            "scripts/lane-receipt-lane02-oracle-5.py", "scripts/lane-receipt-lane02-oracle-6.py",
+            "scripts/lane-receipt-lane02-oracle-7.py", "scripts/lane-receipt-lane02-oracle-8.py",
+            "scripts/lane-receipt-lane02-oracle-9.py", "scripts/lane-receipt-lane02-oracle-10.py",
+            "scripts/lane-receipt-lane02-oracle-11.py", "scripts/lane-receipt-lane02-oracle-12.py",
             "scripts/lane-lib-oracle-1.py", "scripts/lane-lib-oracle-2.py",
             "scripts/lane-lib-oracle-3.py", "scripts/lane-lib-oracle-4.py",
             "scripts/lane-lib-oracle-5.py", "scripts/lane-lib-oracle-6.py",
@@ -50,7 +50,7 @@ class Lane02Fixture:
             shutil.copy2(REPOSITORY / relative, destination)
         self.module = temporary / "fixture module.so"
         self.module.write_bytes(b"controlled module\n")
-        driver = self.root / "scripts/verify-task4-lane02.sh"
+        driver = self.root / "scripts/verify-receipt-lane02.sh"
         source = driver.read_text(encoding="utf-8")
         source = source.replace(
             "MODULE=/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so",
@@ -143,7 +143,7 @@ class Lane02Fixture:
 
     def run(self):
         return subprocess.run(
-            ["sh", str(self.root / "scripts/verify-task4-lane02.sh"), str(self.evidence)],
+            ["sh", str(self.root / "scripts/verify-receipt-lane02.sh"), str(self.evidence)],
             cwd=self.root.parent, env=self.environment(), text=True,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
@@ -198,7 +198,7 @@ class Lane02Fixture:
         (self.evidence / "build/private").mkdir(parents=True)
         (self.evidence / "build/private/output").write_text("owned build\n")
 
-        driver = (self.root / "scripts/verify-task4-lane02.sh").read_text()
+        driver = (self.root / "scripts/verify-receipt-lane02.sh").read_text()
         functions = self.root.parent / "lane02 finalizer functions.sh"
         functions.write_text(
             driver[driver.index("validate_terminal_tree() {"):driver.index("cargo_config_line() {")]
@@ -244,7 +244,7 @@ class Lane02PreparedDependenciesTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def test_driver_orders_admission_build_cleanup_and_terminal_acceptance(self):
-        source = (REPOSITORY / "scripts/verify-task4-lane02.sh").read_text()
+        source = (REPOSITORY / "scripts/verify-receipt-lane02.sh").read_text()
         capture = source.index("scripts/prepared-dependency-evidence.py capture")
         first_sudo = source.index('sudo -n true || { echo "passwordless sudo required"')
         build = source.index("p11scope_product_build prepared --release --workspace")

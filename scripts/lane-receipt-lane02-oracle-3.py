@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Task 4 lane 02 validate_root oracle: refuse when the evidence-root identity changed. Oracle extracted from scripts/verify-task4-lane02.sh (lines 60-65)."""
+"""Task 4 lane 02 validate_root oracle: refuse when the evidence-root identity changed. Oracle extracted from scripts/verify-receipt-lane02.sh (lines 60-65)."""
 import argparse
 import sys
 

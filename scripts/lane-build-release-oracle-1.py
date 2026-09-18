@@ -73,7 +73,7 @@ with tempfile.TemporaryDirectory() as raw:
     x=dict(state);x["head"]="x";mark(common[19],not valid(s=x));x=dict(state);x["input"]="x";mark(common[20],not valid(s=x))
     extra=art/"foreign";extra.write_text("x");mark(common[21],not valid());extra.unlink();(art/"observed.json").unlink();mark(common[22],not valid());(art/"observed.json").write_text("evidence\n");(art/"observed.json").chmod(0o600)
     (art/"checker.log").unlink();mark(common[23],not valid());(art/"checker.log").write_text("evidence\n");(art/"checker.log").chmod(0o600);mark(common[24],not (work/"cargo-ran").exists())
-    lock=parent/".task4.lock";lock.touch(mode=0o600);a=open(lock,"r+");b=open(lock,"r+");fcntl.flock(a,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    lock=parent/".receipt.lock";lock.touch(mode=0o600);a=open(lock,"r+");b=open(lock,"r+");fcntl.flock(a,fcntl.LOCK_EX|fcntl.LOCK_NB)
     try: fcntl.flock(b,fcntl.LOCK_EX|fcntl.LOCK_NB);blocked=False
     except BlockingIOError: blocked=True
     mark(common[25],blocked and not (work/"runtime-ran").exists());a.close();fcntl.flock(b,fcntl.LOCK_EX|fcntl.LOCK_NB);mark(common[26],valid());mark(common[27],stat.S_IMODE(os.fstat(b.fileno()).st_mode)==0o600);b.close()
@@ -198,14 +198,14 @@ seal_steps=["refuse-inherited-build-inputs","pin-reached-command-inventory","sea
 def seal_before(a,b): return seal_steps.index(a)<seal_steps.index(b)
 mark(lane[24],all(seal_before("refuse-inherited-build-inputs",step) for step in ("seal","prepare-root","git-head"))
      and all(seal_before("seal",step) for step in ("verify-seal","prepare-root","git-head","pin-tools","body")))
-sealed_environment={"HOME","LC_ALL","OLDPWD","P11SCOPE_TASK4_CALLER_ARGV0","P11SCOPE_TASK4_CALLER_PATH",
-                    "P11SCOPE_TASK4_SEALED","P11SCOPE_TASK4_SEALED_BIN","PATH","PWD"}
+sealed_environment={"HOME","LC_ALL","OLDPWD","P11SCOPE_RECEIPT_CALLER_ARGV0","P11SCOPE_RECEIPT_CALLER_PATH",
+                    "P11SCOPE_RECEIPT_SEALED","P11SCOPE_RECEIPT_SEALED_BIN","PATH","PWD"}
 steering={"RUSTC_WORKSPACE_WRAPPER","P11SCOPE_SMALL_RING","PYTHONPATH","PYTHONHOME","GIT_DIR",
           "GIT_WORK_TREE","GIT_INDEX_FILE","GIT_CONFIG_GLOBAL","DOCKER_HOST","TMPDIR","LANG"}
 def seal_accepts(names): return names==sealed_environment
 mark(lane[25],seal_accepts(set(sealed_environment)) and not seal_accepts(sealed_environment|steering)
      and not sealed_environment&steering)
-mark(lane[26],not seal_accepts({"P11SCOPE_TASK4_SEALED"}|steering)
+mark(lane[26],not seal_accepts({"P11SCOPE_RECEIPT_SEALED"}|steering)
      and "prepare-root" not in seal_steps[:seal_steps.index("verify-seal")])
 reached={"git","awk","sort","xargs","realpath","find","cp","sh","stat","id","mkdir","flock","cmp",
          "chmod","date","sync","rm","grep","ldd","cat","ls","cc","gcc","env","ln","mktemp"}

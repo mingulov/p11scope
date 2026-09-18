@@ -67,8 +67,8 @@ class ReleaseSealFixture:
         for name in ("build-release.sh", "lib.sh", "check-capture-evidence.py",
                      "lane-build-release-oracle-1.py", "lane-build-release-oracle-2.py",
                      "lane-build-release-oracle-3.py",
-                     "verify-task4-lane16.sh", "lane-task4-lane16-oracle-1.py",
-                     "lane-task4-lane16-oracle-2.py", "lane-task4-lane16-oracle-3.py",
+                     "verify-receipt-lane16.sh", "lane-receipt-lane16-oracle-1.py",
+                     "lane-receipt-lane16-oracle-2.py", "lane-receipt-lane16-oracle-3.py",
                      "merge-checksum-ledgers.py", "prepared-dependency-tools.sh"):
             shutil.copy2(ROOT / "scripts" / name, self.repo / "scripts" / name)
         (self.repo / "scripts/fixtures").mkdir()

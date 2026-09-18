@@ -1284,15 +1284,15 @@ fn official_build_is_safe_only() {
 }
 
 #[test]
-fn task4_receipt_lane14_release_work_is_private_and_single_owner() {
+fn receipt_receipt_lane14_release_work_is_private_and_single_owner() {
     let release = read("scripts/build-release.sh");
     let canaries = read("scripts/verify-canaries.sh");
     let attach = read("scripts/verify-attach-e2e.sh");
 
     for public_override in [
-        "P11SCOPE_TASK4_BODY",
-        "P11SCOPE_TASK4_DIST",
-        "P11SCOPE_TASK4_OFFICIAL_TARGET",
+        "P11SCOPE_RECEIPT_BODY",
+        "P11SCOPE_RECEIPT_DIST",
+        "P11SCOPE_RECEIPT_OFFICIAL_TARGET",
     ] {
         assert!(
             !release.contains(public_override),
@@ -1300,7 +1300,7 @@ fn task4_receipt_lane14_release_work_is_private_and_single_owner() {
         );
     }
     for relationship in [
-        "WORK=$TASK4_ROOT/work",
+        "WORK=$RECEIPT_ROOT/work",
         "DIST=\"$WORK/dist\"",
         "OFFICIAL_TARGET=\"$WORK/release-official\"",
         "CANARY_WORK=\"$WORK/canaries\"",
@@ -1314,9 +1314,9 @@ fn task4_receipt_lane14_release_work_is_private_and_single_owner() {
         );
     }
     for invocation in [
-        "P11SCOPE_TASK4_WORK=\"$CANARY_WORK\" sh scripts/verify-canaries.sh",
-        "P11SCOPE_TASK4_WORK=\"$ATTACH_WORK\" sh scripts/verify-attach-e2e.sh",
-        "P11SCOPE_TASK4_WORK=\"$DISCOVER_BASE\" \\\n    sh scripts/verify-discover-containers.sh",
+        "P11SCOPE_RECEIPT_WORK=\"$CANARY_WORK\" sh scripts/verify-canaries.sh",
+        "P11SCOPE_RECEIPT_WORK=\"$ATTACH_WORK\" sh scripts/verify-attach-e2e.sh",
+        "P11SCOPE_RECEIPT_WORK=\"$DISCOVER_BASE\" \\\n    sh scripts/verify-discover-containers.sh",
         "\"$CANARY_WORK\"/feature-build/release/build/p11scope-*/out/p11scope-ebpf",
     ] {
         assert!(
@@ -1324,7 +1324,7 @@ fn task4_receipt_lane14_release_work_is_private_and_single_owner() {
             "release misses private nested invocation {invocation}"
         );
     }
-    assert_eq!(release.matches("trap task4_finalize EXIT").count(), 1);
+    assert_eq!(release.matches("trap receipt_finalize EXIT").count(), 1);
     assert_eq!(release.matches("release_body_cleanup").count(), 2);
     assert!(!release.contains(". scripts/cleanup-traps.sh"));
     assert!(!release.contains("$PWD/$WORK"));
@@ -1334,7 +1334,7 @@ fn task4_receipt_lane14_release_work_is_private_and_single_owner() {
         ("verify-attach-e2e", attach, "target/e2e"),
     ] {
         assert!(
-            source.contains(&format!("WORK=${{P11SCOPE_TASK4_WORK-{default}}}")),
+            source.contains(&format!("WORK=${{P11SCOPE_RECEIPT_WORK-{default}}}")),
             "{script} lost its standalone default"
         );
         assert!(
@@ -1357,18 +1357,18 @@ fn task4_receipt_lane14_release_work_is_private_and_single_owner() {
     fs::write(&sentinel, b"must survive\n").unwrap();
     fs::write(
         bin.join("rm"),
-        b"#!/bin/sh\nprintf '%s\\n' rm >> \"$P11SCOPE_TASK4_TRIPWIRE_LOG\"\nexit 97\n",
+        b"#!/bin/sh\nprintf '%s\\n' rm >> \"$P11SCOPE_RECEIPT_TRIPWIRE_LOG\"\nexit 97\n",
     )
     .unwrap();
     fs::set_permissions(bin.join("rm"), fs::Permissions::from_mode(0o700)).unwrap();
     let output = Command::new("/bin/sh")
         .arg("scripts/build-release.sh")
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
-        .env("P11SCOPE_TASK4_BODY", "1")
-        .env("P11SCOPE_TASK4_WORK", protected.join("work"))
-        .env("P11SCOPE_TASK4_DIST", &protected)
-        .env("P11SCOPE_TASK4_OFFICIAL_TARGET", &protected)
-        .env("P11SCOPE_TASK4_TRIPWIRE_LOG", &tripwire)
+        .env("P11SCOPE_RECEIPT_BODY", "1")
+        .env("P11SCOPE_RECEIPT_WORK", protected.join("work"))
+        .env("P11SCOPE_RECEIPT_DIST", &protected)
+        .env("P11SCOPE_RECEIPT_OFFICIAL_TARGET", &protected)
+        .env("P11SCOPE_RECEIPT_TRIPWIRE_LOG", &tripwire)
         .output()
         .expect("run Lane 14 with poisoned public re-entry environment");
     assert_eq!(output.status.code(), Some(2));
@@ -1412,7 +1412,7 @@ fn lane14_container_ownership_follows_creation_not_names() {
 }
 
 #[test]
-fn task4_receipt_lane14_capture_binding_is_literal_and_checker_evidence_framed() {
+fn receipt_receipt_lane14_capture_binding_is_literal_and_checker_evidence_framed() {
     let release = read("scripts/build-release.sh");
 
     // csf_19fb2f: `find … '*observed*.json' | sort | head -n 1` always chose
@@ -1422,7 +1422,7 @@ fn task4_receipt_lane14_capture_binding_is_literal_and_checker_evidence_framed()
     // forbids glob, find|head, path-order authority, and stdout-as-capture.
     assert!(
         release.contains(
-            "cp \"$WORK/observed-static-smoke.json\" \"$TASK4_ROOT/artifacts/capture.json\""
+            "cp \"$WORK/observed-static-smoke.json\" \"$RECEIPT_ROOT/artifacts/capture.json\""
         ),
         "capture.json is not bound to the literal static-smoke output path"
     );
@@ -1431,7 +1431,7 @@ fn task4_receipt_lane14_capture_binding_is_literal_and_checker_evidence_framed()
         "path-order authority still selects a receipt artifact"
     );
     assert!(
-        !release.contains("cp \"$TASK4_ROOT/stdout.log\" \"$TASK4_ROOT/artifacts/checker.log\""),
+        !release.contains("cp \"$RECEIPT_ROOT/stdout.log\" \"$RECEIPT_ROOT/artifacts/checker.log\""),
         "aggregate body stdout still stands in for checker evidence"
     );
 
@@ -1440,13 +1440,13 @@ fn task4_receipt_lane14_capture_binding_is_literal_and_checker_evidence_framed()
     // facts rows, and the observed-set guard both exists and collates in C
     // so a healthy run cannot false-refuse under a UTF-8 ambient locale.
     assert!(
-        release.contains("cp \"$WORK/checker.log\" \"$TASK4_ROOT/artifacts/checker.log\""),
+        release.contains("cp \"$WORK/checker.log\" \"$RECEIPT_ROOT/artifacts/checker.log\""),
         "the framed checker record is not retained as the receipt's checker.log"
     );
     for fact in [
-        "task4_fact checker_argv \"$t4_checker_argv\"",
-        "task4_fact checker_status \"$t4_checker_status\"",
-        "task4_fact checker_log_sha256 \"$(task4_digest \"$TASK4_ROOT/artifacts/checker.log\")\"",
+        "receipt_fact checker_argv \"$t4_checker_argv\"",
+        "receipt_fact checker_status \"$t4_checker_status\"",
+        "receipt_fact checker_log_sha256 \"$(receipt_digest \"$RECEIPT_ROOT/artifacts/checker.log\")\"",
     ] {
         assert!(release.contains(fact), "receipt misses facts row {fact:?}");
     }
@@ -1578,8 +1578,8 @@ fn task4_receipt_lane14_capture_binding_is_literal_and_checker_evidence_framed()
 }
 
 #[test]
-fn task4_receipt_lane14_observed_set_guard_refuses_decoys_in_any_locale() {
-    // Execute the real observed-set guard block from task4_receipt_run.
+fn receipt_receipt_lane14_observed_set_guard_refuses_decoys_in_any_locale() {
+    // Execute the real observed-set guard block from receipt_receipt_run.
     // UTF-8 collation orders observed.json BEFORE observed-scan.json (the
     // hyphen is ignored at the primary level), so a guard sorting in the
     // ambient locale false-refuses a healthy release; the guard must accept
@@ -1601,7 +1601,7 @@ fn task4_receipt_lane14_observed_set_guard_refuses_decoys_in_any_locale() {
     fs::write(
         &runner,
         format!(
-            "#!/bin/sh\nset -eu\nTASK4_ROOT={root}\n{guard}\necho guard-ok\n",
+            "#!/bin/sh\nset -eu\nRECEIPT_ROOT={root}\n{guard}\necho guard-ok\n",
             root = fixture.path().display(),
         ),
     )
@@ -1740,7 +1740,7 @@ fn task7_tripwire_bin(log: &std::path::Path) -> tempfile::TempDir {
     bin
 }
 
-/// The one command a sealed refusal does legitimately reach: `task4_finalize`
+/// The one command a sealed refusal does legitimately reach: `receipt_finalize`
 /// removes the sealed bin directory once the terminal status exists. Any other
 /// name in the log is a command that escaped the refusal.
 const TASK7_EXPECTED_TRIPWIRES: &str = "rm\n";
@@ -1922,14 +1922,14 @@ fn release_preflight_refuses_an_unevaluable_cargo_home() {
 #[test]
 fn release_finalizer_rechecks_cargo_configs_with_pinned_tools() {
     let release = read("scripts/build-release.sh");
-    let finalize = between(&release, "\ntask4_finalize() {", "\ntask4_receipt_run() {");
+    let finalize = between(&release, "\nreceipt_finalize() {", "\nreceipt_receipt_run() {");
 
     // The finalizer writes the terminal receipt. A PATH-priority shadow
     // dropped mid-run must never be the binary that decides, or writes, it --
     // it runs even once the ledger recheck has already failed the run.
     assert!(
         finalize.contains(
-            "\"$T4_TOOL_python3\" -I scripts/lane-build-release-oracle-3.py \"$TASK4_ROOT\""
+            "\"$T4_TOOL_python3\" -I scripts/lane-build-release-oracle-3.py \"$RECEIPT_ROOT\""
         ),
         "finalizer validates the evidence root through an unpinned or unisolated interpreter"
     );
@@ -1947,7 +1947,7 @@ fn release_finalizer_rechecks_cargo_configs_with_pinned_tools() {
         for indent in ["\n    ", "\n        "] {
             assert!(
                 !finalize.contains(&format!("{indent}{tool} ")),
-                "task4_finalize invokes bare {tool} instead of its pinned path"
+                "receipt_finalize invokes bare {tool} instead of its pinned path"
             );
         }
     }
@@ -1958,15 +1958,15 @@ fn release_finalizer_rechecks_cargo_configs_with_pinned_tools() {
     // pinned cargo and overridden by none of the command-local values, so
     // the scan has to run again before the receipt is published.
     assert!(
-        finalize.contains("task4_cargo_config_scan"),
+        finalize.contains("receipt_cargo_config_scan"),
         "finalizer never re-scans for cargo configs planted during the body"
     );
     assert!(
-        !release.contains("task4_refuse_cargo_config"),
+        !release.contains("receipt_refuse_cargo_config"),
         "cargo-config check still exits from inside its helper, so finalization cannot reuse it"
     );
     assert_eq!(
-        release.matches("task4_cargo_config_scan").count(),
+        release.matches("receipt_cargo_config_scan").count(),
         3,
         "cargo-config scan must be one definition with a preflight and a finalization call site"
     );
@@ -1978,10 +1978,10 @@ fn release_preflight_pins_its_tools_before_the_first_digest() {
     // the driver/checker hashes and the source input ledger.
     let release = read("scripts/build-release.sh");
     let pinned = release
-        .find("task4_pin_tool \"$t4_found\" \"T4_TOOL_$t4_tool\"")
+        .find("receipt_pin_tool \"$t4_found\" \"T4_TOOL_$t4_tool\"")
         .expect("preflight pins the nine recorded tools");
     let first_digest = release
-        .find("TASK4_DRIVER_HASH=$(task4_digest")
+        .find("RECEIPT_DRIVER_HASH=$(receipt_digest")
         .expect("preflight digests the driver");
     assert!(
         pinned < first_digest,
@@ -2139,7 +2139,7 @@ fn release_refuses_a_forged_seal_marker() {
         .arg(repo.path().join("scripts/build-release.sh"))
         .arg(&root)
         .env("HOME", home.path())
-        .env("P11SCOPE_TASK4_SEALED", "1");
+        .env("P11SCOPE_RECEIPT_SEALED", "1");
     for name in TASK7_BUILD_INPUT_VARIABLES {
         command.env_remove(name);
     }
@@ -2193,10 +2193,10 @@ fn release_refuses_a_forged_seal_marker() {
         .env("PATH", &forged_bin)
         .env("HOME", home.path())
         .env("LC_ALL", "C")
-        .env("P11SCOPE_TASK4_SEALED", "1")
-        .env("P11SCOPE_TASK4_SEALED_BIN", &forged_bin)
-        .env("P11SCOPE_TASK4_CALLER_PATH", "/forged")
-        .env("P11SCOPE_TASK4_CALLER_ARGV0", "forged")
+        .env("P11SCOPE_RECEIPT_SEALED", "1")
+        .env("P11SCOPE_RECEIPT_SEALED_BIN", &forged_bin)
+        .env("P11SCOPE_RECEIPT_CALLER_PATH", "/forged")
+        .env("P11SCOPE_RECEIPT_CALLER_ARGV0", "forged")
         .env("PYTHONPATH", "/task11/forged-python")
         .output()
         .expect("run the driver with a reproduced seal plus one extra variable");
@@ -2222,7 +2222,7 @@ fn release_pins_its_reached_command_inventory_and_sealed_environment() {
     let expected_inventory = task11_expected_values("tool_inventory");
     let expected_environment = task11_expected_values("sealed_environment");
 
-    let inventory: Vec<&str> = between(&release, "\nTASK4_TOOL_INVENTORY='", "'")
+    let inventory: Vec<&str> = between(&release, "\nRECEIPT_TOOL_INVENTORY='", "'")
         .split_whitespace()
         .collect();
     assert_eq!(
@@ -2236,7 +2236,7 @@ fn release_pins_its_reached_command_inventory_and_sealed_environment() {
         "the inventory must stay in LC_ALL=C order: the seal compares it to `ls -A1` directly"
     );
     assert_eq!(
-        between(&release, "\nTASK4_SEALED_ENVIRONMENT='", "'")
+        between(&release, "\nRECEIPT_SEALED_ENVIRONMENT='", "'")
             .lines()
             .collect::<Vec<_>>(),
         expected_environment,
@@ -2246,7 +2246,7 @@ fn release_pins_its_reached_command_inventory_and_sealed_environment() {
     // The seal is built in the unsealed parent, before any root, lock, git,
     // tool, or cargo-config decision -- and after the ten explicit refusals,
     // which stay recognisable named signals rather than becoming a silent drop.
-    let bootstrap = between(&release, "\ntask4_seal_and_reexec() {", "\n}\n");
+    let bootstrap = between(&release, "\nreceipt_seal_and_reexec() {", "\n}\n");
     let refusal = bootstrap
         .find("echo \"refusing inherited $t4_var\" >&2; exit 77;")
         .expect("the bootstrap refuses each inherited build input by name");
@@ -2258,12 +2258,12 @@ fn release_pins_its_reached_command_inventory_and_sealed_environment() {
         "the inherited-build-input refusals must precede the re-exec"
     );
     let seal = release
-        .find("task4_seal_and_reexec \"$1\"")
+        .find("receipt_seal_and_reexec \"$1\"")
         .expect("the driver seals its environment before the receipt chain");
     for later in [
-        "\n    task4_prepare_root \"$1\"",
-        "TASK4_HEAD=$(git rev-parse HEAD)",
-        "TASK4_CONFIGS=$(task4_cargo_config_scan)",
+        "\n    receipt_prepare_root \"$1\"",
+        "RECEIPT_HEAD=$(git rev-parse HEAD)",
+        "RECEIPT_CONFIGS=$(receipt_cargo_config_scan)",
         "\"$T4_TOOL_sudo\" -n true",
     ] {
         assert!(
@@ -2276,21 +2276,21 @@ fn release_pins_its_reached_command_inventory_and_sealed_environment() {
 
     // The ledger covers every inventory member, not the nine-name floor.
     assert!(
-        release.contains("for t4_tool in $TASK4_TOOL_INVENTORY; do"),
+        release.contains("for t4_tool in $RECEIPT_TOOL_INVENTORY; do"),
         "the tool ledger still walks a hand-maintained name list"
     );
     assert!(
-        release.contains("PATH=\"$P11SCOPE_TASK4_CALLER_PATH\" command -v"),
+        release.contains("PATH=\"$P11SCOPE_RECEIPT_CALLER_PATH\" command -v"),
         "the ledger never re-resolves the caller's PATH, so a divergence cannot refuse"
     );
     // The nightly closure is rechecked at finalization, so it lives in the
     // ledger the finalizer compares, not in a one-shot preflight block.
-    let ledger = between(&release, "\ntask4_tool_ledger() {", "\n}\n");
+    let ledger = between(&release, "\nreceipt_tool_ledger() {", "\n}\n");
     assert!(
-        ledger.contains("task4_nightly_closure || return 1"),
+        ledger.contains("receipt_nightly_closure || return 1"),
         "the rechecked tool ledger does not bind the nightly closure"
     );
-    let ledger = between(&release, "\ntask4_nightly_closure() {", "\n}\n");
+    let ledger = between(&release, "\nreceipt_nightly_closure() {", "\n}\n");
     for row in [
         "toolchain_nightly_cargo",
         "toolchain_nightly_rustc",
@@ -2308,7 +2308,7 @@ fn release_pins_its_reached_command_inventory_and_sealed_environment() {
         "the ledger does not name the pinned nightly toolchain"
     );
     assert!(
-        ledger.contains("task4_tree_digest \"$t4_src\""),
+        ledger.contains("receipt_tree_digest \"$t4_src\""),
         "the rust-src closure does not use the typed tree digest"
     );
     assert!(
@@ -2317,12 +2317,12 @@ fn release_pins_its_reached_command_inventory_and_sealed_environment() {
     );
 
     // The sealed bin directory is evidence until the receipt status exists.
-    let finalize = between(&release, "\ntask4_finalize() {", "\ntask4_receipt_run() {");
+    let finalize = between(&release, "\nreceipt_finalize() {", "\nreceipt_receipt_run() {");
     let status = finalize
-        .find("printf '%s\\n' \"$t4_result\" > \"$TASK4_ROOT/status\"")
+        .find("printf '%s\\n' \"$t4_result\" > \"$RECEIPT_ROOT/status\"")
         .expect("finalization writes the terminal status");
     let removal = finalize
-        .find("rm -rf \"$P11SCOPE_TASK4_SEALED_BIN\"")
+        .find("rm -rf \"$P11SCOPE_RECEIPT_SEALED_BIN\"")
         .expect("finalization removes the sealed bin directory");
     assert!(
         status < removal,
@@ -3920,7 +3920,7 @@ fn every_script_parses_with_sh_n() {
         "scripts/verify-induced-gaps.sh",
         "scripts/verify-discover-containers.sh",
         "scripts/verify-capability-tier.sh",
-        "scripts/verify-task4-lane02.sh",
+        "scripts/verify-receipt-lane02.sh",
         "scripts/matrix/verify-docker.sh",
         "scripts/matrix/verify-fork-scope.sh",
         "scripts/matrix/verify-oracle.sh",
@@ -3939,7 +3939,7 @@ fn every_script_parses_with_sh_n() {
 
 #[test]
 fn lane02_initial_set_uses_a_direct_needed_harness() {
-    let driver = read("scripts/verify-task4-lane02.sh");
+    let driver = read("scripts/verify-receipt-lane02.sh");
     assert!(driver.contains("HARNESS_INITIAL=$ROOT/bin/harness-initial"));
     assert!(driver.contains("-Wl,--no-as-needed"));
     assert!(driver.contains("set -- \"$@\" \"$HARNESS_INITIAL\" \"$MODULE\" \"$go\""));
@@ -3948,15 +3948,15 @@ fn lane02_initial_set_uses_a_direct_needed_harness() {
 
 #[test]
 fn lane02_cleanup_covers_both_harness_executables() {
-    let driver = read("scripts/verify-task4-lane02.sh");
+    let driver = read("scripts/verify-receipt-lane02.sh");
     assert_eq!(
         driver.matches("\"$HARNESS\" \"$HARNESS_INITIAL\"").count(),
         2,
         "absence and termination must inspect both exact harness paths"
     );
     for site in [
-        "sudo -n python3 -I scripts/lane-task4-lane02-oracle-6.py \"$HARNESS\" \"$HARNESS_INITIAL\"",
-        "sudo -n python3 -I scripts/lane-task4-lane02-oracle-7.py \"$HARNESS\" \"$HARNESS_INITIAL\"",
+        "sudo -n python3 -I scripts/lane-receipt-lane02-oracle-6.py \"$HARNESS\" \"$HARNESS_INITIAL\"",
+        "sudo -n python3 -I scripts/lane-receipt-lane02-oracle-7.py \"$HARNESS\" \"$HARNESS_INITIAL\"",
     ] {
         assert!(
             driver.contains(site),
@@ -3964,8 +3964,8 @@ fn lane02_cleanup_covers_both_harness_executables() {
         );
     }
     for oracle in [
-        read("scripts/lane-task4-lane02-oracle-6.py"),
-        read("scripts/lane-task4-lane02-oracle-7.py"),
+        read("scripts/lane-receipt-lane02-oracle-6.py"),
+        read("scripts/lane-receipt-lane02-oracle-7.py"),
     ] {
         assert!(oracle.contains("argv[0] in wanted"));
         assert!(oracle.contains("os.fsencode(exe) == argv[0]"));
@@ -3989,15 +3989,15 @@ fn lane02_checker_and_driver_self_tests_execute() {
         checker.contains("lane02 owned-run metrics self-test: OK"),
         "checker self-test misses Lane02 marker: {checker}"
     );
-    let driver = run_ok("sh", &["scripts/verify-task4-lane02.sh", "--self-test"]);
+    let driver = run_ok("sh", &["scripts/verify-receipt-lane02.sh", "--self-test"]);
     assert!(
-        driver.contains("verify-task4-lane02 self-test: OK"),
+        driver.contains("verify-receipt-lane02 self-test: OK"),
         "driver self-test misses marker: {driver}"
     );
 }
 
 #[test]
-fn task4_receipt_drivers_execute_behavioral_self_tests() {
+fn receipt_receipt_drivers_execute_behavioral_self_tests() {
     const COMMON_CASES: &[&str] = &[
         "complete-success-status-0-last-once",
         "input-mutation-rejected-nonzero-status-last-once",
@@ -4141,8 +4141,8 @@ fn task4_receipt_drivers_execute_behavioral_self_tests() {
     let drivers = [
         (
             "lane02",
-            "scripts/verify-task4-lane02.sh",
-            "verify-task4-lane02 self-test: OK",
+            "scripts/verify-receipt-lane02.sh",
+            "verify-receipt-lane02 self-test: OK",
             None,
         ),
         (
@@ -4177,8 +4177,8 @@ fn task4_receipt_drivers_execute_behavioral_self_tests() {
         ),
         (
             "lane16",
-            "scripts/verify-task4-lane16.sh",
-            "verify-task4-lane16 Task 4 receipt self-test: OK",
+            "scripts/verify-receipt-lane16.sh",
+            "verify-receipt-lane16 Task 4 receipt self-test: OK",
             Some(LANE16_CASES),
         ),
     ];
@@ -4201,7 +4201,7 @@ fn task4_receipt_drivers_execute_behavioral_self_tests() {
         let path = guard.path().join(command);
         fs::write(
             &path,
-            b"#!/bin/sh\nprintf '%s\\n' \"${0##*/}\" >> \"$P11SCOPE_TASK4_TRIPWIRE_LOG\"\nexit 97\n",
+            b"#!/bin/sh\nprintf '%s\\n' \"${0##*/}\" >> \"$P11SCOPE_RECEIPT_TRIPWIRE_LOG\"\nexit 97\n",
         )
         .expect("write Task 4 command tripwire");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
@@ -4211,7 +4211,7 @@ fn task4_receipt_drivers_execute_behavioral_self_tests() {
     let lane14_rm = lane14_guard.path().join("rm");
     fs::write(
         &lane14_rm,
-        b"#!/bin/sh\nprintf '%s\\n' \"${0##*/}\" >> \"$P11SCOPE_TASK4_TRIPWIRE_LOG\"\nexit 97\n",
+        b"#!/bin/sh\nprintf '%s\\n' \"${0##*/}\" >> \"$P11SCOPE_RECEIPT_TRIPWIRE_LOG\"\nexit 97\n",
     )
     .expect("write Lane 14 rm tripwire");
     fs::set_permissions(&lane14_rm, fs::Permissions::from_mode(0o700))
@@ -4229,7 +4229,7 @@ fn task4_receipt_drivers_execute_behavioral_self_tests() {
     fs::write(&sentinel, b"must survive byte-identical\n").expect("write protected sentinel");
     fs::write(
         &bypass_script,
-        b"#!/bin/sh\nset -eu\n# --self-test\n[ \"${1-}\" = --unreachable ] && exit 0\nrm -rf \"$P11SCOPE_TASK4_PROTECTED\"\ncargo build\np11scope run\n",
+        b"#!/bin/sh\nset -eu\n# --self-test\n[ \"${1-}\" = --unreachable ] && exit 0\nrm -rf \"$P11SCOPE_RECEIPT_PROTECTED\"\ncargo build\np11scope run\n",
     )
     .expect("write unreachable-dispatch fixture");
     let bypass_output = Command::new("/bin/sh")
@@ -4243,8 +4243,8 @@ fn task4_receipt_drivers_execute_behavioral_self_tests() {
                 guard.path().display()
             ),
         )
-        .env("P11SCOPE_TASK4_TRIPWIRE_LOG", &bypass_log)
-        .env("P11SCOPE_TASK4_PROTECTED", &protected)
+        .env("P11SCOPE_RECEIPT_TRIPWIRE_LOG", &bypass_log)
+        .env("P11SCOPE_RECEIPT_PROTECTED", &protected)
         .output()
         .expect("run unreachable-dispatch fixture");
     assert_eq!(bypass_output.status.code(), Some(97));
@@ -4271,8 +4271,8 @@ fn task4_receipt_drivers_execute_behavioral_self_tests() {
         };
         command
             .env("PATH", path)
-            .env("P11SCOPE_TASK4_TRIPWIRE_LOG", &tripwire_log)
-            .env("P11SCOPE_TASK4_SELF_TEST_REPORT", &report)
+            .env("P11SCOPE_RECEIPT_TRIPWIRE_LOG", &tripwire_log)
+            .env("P11SCOPE_RECEIPT_SELF_TEST_REPORT", &report)
             .env("CARGO", guard.path().join("cargo"))
             .env("DOCKER", guard.path().join("docker"))
             .env("RUSTUP", guard.path().join("rustup"))
@@ -6921,8 +6921,8 @@ fn hosted_pipeline_checks_the_diagnostic_inventory() {
 /// mechanical rule rather than an enumerated list, so a lane cannot be added
 /// without its hosted self-test. The rule keys on the literal `--self-test`, so
 /// a validator spelling its flag any other way is invisible to it — the one that
-/// does (`task4-fcntl-experiment.py`, positional `self-test`) is covered inside
-/// the ordinary `cargo test` gate by `tests/task4_build_subjects.rs`. `scripts/gates.sh` is the local entry point
+/// does (`receipt-fcntl-experiment.py`, positional `self-test`) is covered inside
+/// the ordinary `cargo test` gate by `tests/receipt_build_subjects.rs`. `scripts/gates.sh` is the local entry point
 /// that only invokes the others; `lib.sh`, `cleanup-traps.sh` and `fixtures/`
 /// are not validators.
 #[test]

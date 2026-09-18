@@ -5,8 +5,8 @@ import sys
 import unittest
 
 REPO = Path(__file__).resolve().parents[2]
-SCRIPT_PATH = REPO / "scripts/task4-build-subject.py"
-MODULE_NAME = "task4_build_subject_semantic_fd_mutator_test"
+SCRIPT_PATH = REPO / "scripts/receipt-build-subject.py"
+MODULE_NAME = "receipt_build_subject_semantic_fd_mutator_test"
 MISSING = object()
 
 sys.path.insert(0, str(REPO / "scripts"))
@@ -31,7 +31,7 @@ def load_subject(test):
     try:
         loaded = load_path(SCRIPT_PATH, MODULE_NAME)
     except FileNotFoundError:
-        test.fail("could not import task4 build-subject script")
+        test.fail("could not import receipt build-subject script")
     sys.modules[MODULE_NAME] = loaded
     return loaded
 

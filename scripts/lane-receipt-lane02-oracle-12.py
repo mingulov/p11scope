@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Task 4 lane 02 no_atomic_temps oracle: refuse a row that retained an atomic temporary file. Oracle extracted from scripts/verify-task4-lane02.sh (lines 634-641)."""
+"""Task 4 lane 02 no_atomic_temps oracle: refuse a row that retained an atomic temporary file. Oracle extracted from scripts/verify-receipt-lane02.sh (lines 634-641)."""
 import argparse
 import sys
 

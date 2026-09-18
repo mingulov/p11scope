@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Task 4 lane 02 owned-harness termination oracle: SIGTERM then SIGKILL owned harnesses via pidfds and refuse survivors. Oracle extracted from scripts/verify-task4-lane02.sh (lines 518-549)."""
+"""Task 4 lane 02 owned-harness termination oracle: SIGTERM then SIGKILL owned harnesses via pidfds and refuse survivors. Oracle extracted from scripts/verify-receipt-lane02.sh (lines 518-549)."""
 import argparse
 import sys
 

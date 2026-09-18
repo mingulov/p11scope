@@ -4988,8 +4988,8 @@ fn selection_transport_never_carries_name_bytes() {
     );
     let discovery_initializer = between(
         &source,
-        "// TASK5_DISCOVERY_INITIALIZER_BEGIN",
-        "// TASK5_DISCOVERY_INITIALIZER_END",
+        "// DISCOVERY_INITIALIZER_BEGIN",
+        "// DISCOVERY_INITIALIZER_END",
     );
     assert_eq!(
         discovery_initializer

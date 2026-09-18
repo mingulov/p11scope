@@ -393,12 +393,15 @@ fn j4_bad_flag_values_name_flag_exit_2() {
         );
         assert!(usage.stderr.contains("usage:"), "{flag} {value}");
     }
-    // F5: unlike --ring-bytes (whose error line prints its 4K..64M range),
-    // the --mode error line never lists its valid values; they appear only
-    // in the appended usage dump.
+    // F5 fixed (Task 3): like --ring-bytes (whose error line prints its
+    // 4K..64M range) and --pause, the --mode error line lists its valid
+    // values inline.
     let mode = run(&["profile", "--pid", &pid, "--mode", "frobnicate"]);
     let first = mode.stderr.lines().next().unwrap_or("");
-    assert_eq!(first, "--mode: invalid value \"frobnicate\"");
+    assert_eq!(
+        first,
+        "--mode: invalid value \"frobnicate\" (expected profile|metrics)"
+    );
     assert!(
         mode.stderr.contains("[--mode profile|metrics]"),
         "{}",
@@ -489,6 +492,20 @@ fn t3_f4_run_without_separator_names_separator_fix() {
         flag.stderr
     );
     assert!(!flag.stderr.contains("after `--`"), "{}", flag.stderr);
+}
+
+#[test]
+fn t3_f5_mode_error_lists_valid_values_inline() {
+    // F5 fixed (Task 3): like `--pause`, the `--mode` error line lists its
+    // valid values inline instead of only in the appended usage. Exit 2.
+    let target = SleepTarget::spawn();
+    let mode = run(&["profile", "--pid", &target.pid(), "--mode", "frobnicate"]);
+    assert_eq!(mode.code, Some(2));
+    let first = mode.stderr.lines().next().unwrap_or("");
+    assert_eq!(
+        first,
+        "--mode: invalid value \"frobnicate\" (expected profile|metrics)"
+    );
 }
 
 #[test]

@@ -400,7 +400,11 @@ fn capture_option(
                          not --mode trace",
                     ));
                 }
-                other => return Err(usage_err(format!("--mode: invalid value {other:?}"))),
+                other => {
+                    return Err(usage_err(format!(
+                        "--mode: invalid value {other:?} (expected profile|metrics)"
+                    )));
+                }
             });
         }
         "--duration" => {

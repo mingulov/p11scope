@@ -17329,3 +17329,502 @@ fn linked_candidate_table_sorts_before_unlinked_lookalike() {
         "the interface-linked table sorts before the unlinked lookalike"
     );
 }
+
+/// Task 1.2 fixture: the sysprobe 64-table replica as a checked-in synthetic
+/// module for the resource-bound test. `docs/sysprobe-2026-09-19/replicate_scan.py`
+/// proved one `libp11-kit.so.0.4.8` instance decodes as 64 consecutive 840-byte
+/// 3.2 closure templates (file `0x1caf20 + k*840`), each with 104 non-null
+/// pointers into `.text` — 6656 entry records that refuse the whole module at
+/// the 512 ceiling today. Entry offsets are all distinct (the replica's real
+/// duplicates are pointer-value accidents, not structure), so the pre-fix
+/// wanted set is 6656 and the module refuses; the resource bound must admit 4
+/// tables' worth of slots and spill 60 candidates as evidence instead.
+///
+/// The single interface triple links the LAST table (index 63): evidence
+/// order must admit it despite discovery-last position, while the other
+/// three admitted tables stay unlinked — linkage is preferred, never gated,
+/// so scan-only capture of never-called legacy providers keeps working. The
+/// linked table bypasses the per-object heuristic cap; the global resource
+/// bound still limits the total to 4 tables (416 slots).
+fn p11kit_like_64_table_module() -> ScannedModule {
+    const TABLES: u64 = 64;
+    const ENTRIES: u64 = 104;
+    const NAMES: [&str; 8] = [
+        "C_Initialize",
+        "C_Finalize",
+        "C_GetInfo",
+        "C_GetFunctionList",
+        "C_GetSlotList",
+        "C_GetSlotInfo",
+        "C_GetTokenInfo",
+        "C_Sign",
+    ];
+    let mut raw = overlay_module(overlay_key(57));
+    raw.tables = (0..TABLES)
+        .map(|table| ScannedTable {
+            version: (3, 2),
+            walk: "full",
+            entries: (0..ENTRIES)
+                .map(|entry| {
+                    let ordinal = table * ENTRIES + entry;
+                    ScannedEntry {
+                        name: NAMES[(ordinal % NAMES.len() as u64) as usize],
+                        object: raw.key,
+                        object_path: raw.path.clone(),
+                        file_offset: 0x10000 + ordinal * 8,
+                    }
+                })
+                .collect(),
+            null_entries: vec![],
+            unpinned: vec![],
+            address: 0x7f00_0000 + table * 840,
+            file_offset: Some(0x1caf20 + table * 840),
+        })
+        .collect();
+    raw.interfaces = vec![ScannedInterface {
+        index: 0,
+        name_class: "exact_standard",
+        name_lossy: None,
+        name_private: Some(b"PKCS 11".to_vec()),
+        flags: 0,
+        table: Some(63),
+    }];
+    raw
+}
+
+/// Task 1.2 resource-bound test: ordered admission with a per-object cap.
+/// The 64-table replica must NOT refuse the module: the 4 strongest-evidence
+/// tables (the linked one first, bypassing the heuristic cap) become 416
+/// slots under the global resource bound, and the 60-table heuristic spill
+/// becomes `uncorroborated_candidates` evidence, never slots.
+#[test]
+fn ordered_admission_resource_bound_caps_heuristic_tables_per_object() {
+    let raw = p11kit_like_64_table_module();
+    let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1)]);
+    let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&raw), &mut pins);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let plan = plan::build_from_reconciled_modules(&modules);
+
+    assert!(
+        plan.modules_skipped.is_empty(),
+        "the 64-table module stays admitted under the resource bound, not refused: {:?}",
+        plan.modules_skipped
+    );
+    assert_eq!(
+        plan.slots.len(),
+        416,
+        "4 admitted tables x 104 entries become slots under the resource bound"
+    );
+    assert_eq!(
+        plan.uncorroborated_candidates, 60,
+        "the 60-table resource-bound spill is counted, never slotted"
+    );
+    assert_eq!(
+        plan.entries_seen, 6656,
+        "seen counts every decoded record under the resource bound, admitted or spilled"
+    );
+
+    // Evidence order, not discovery order: the linked table (index 63,
+    // decoded last) is admitted via the published bypass, the first three
+    // unlinked tables fill the resource bound, and tables 3..63 spill.
+    let attached: BTreeSet<u64> = plan.slots.iter().map(|slot| slot.file_offset).collect();
+    for table in 0..64u64 {
+        let first_entry = 0x10000 + table * 104 * 8;
+        assert_eq!(
+            attached.contains(&first_entry),
+            table < 3 || table == 63,
+            "table {table} admission follows evidence order under the resource bound"
+        );
+    }
+
+    // The spill reaches discovery evidence through the publish path, beside
+    // the admitted module — never silence, never a refusal.
+    let mut engine = Engine::empty();
+    engine.plan = plan;
+    engine.pinned = pins;
+    engine.modules = modules;
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    engine.publish_current_capture_facts().unwrap();
+    assert_eq!(engine.discovery.modules.len(), 1);
+    assert!(engine.discovery.modules_skipped.is_empty());
+    assert_eq!(
+        engine.discovery.uncorroborated_candidates, 60,
+        "published evidence carries the resource-bound spill count"
+    );
+}
+
+/// Task 1.2 (a): five disjoint published 2.40 tables bypass the per-object
+/// heuristic cap. Each table is interface-linked (published), so K=4 does not
+/// apply; with sufficient global budget all 340 slots admit and nothing spills.
+#[test]
+fn published_tables_bypass_heuristic_cap_with_sufficient_budget() {
+    const TABLES: u64 = 5;
+    const ENTRIES: u64 = 68;
+    const NAMES: [&str; 8] = [
+        "C_Initialize",
+        "C_Finalize",
+        "C_GetInfo",
+        "C_GetFunctionList",
+        "C_GetSlotList",
+        "C_GetSlotInfo",
+        "C_GetTokenInfo",
+        "C_Sign",
+    ];
+    let mut raw = overlay_module(overlay_key(57));
+    raw.tables = (0..TABLES)
+        .map(|table| ScannedTable {
+            version: (2, 40),
+            walk: "full",
+            entries: (0..ENTRIES)
+                .map(|entry| {
+                    let ordinal = table * ENTRIES + entry;
+                    ScannedEntry {
+                        name: NAMES[(ordinal % NAMES.len() as u64) as usize],
+                        object: raw.key,
+                        object_path: raw.path.clone(),
+                        file_offset: 0x30000 + ordinal * 8,
+                    }
+                })
+                .collect(),
+            null_entries: vec![],
+            unpinned: vec![],
+            address: 0x7f10_0000 + table * 0x1000,
+            file_offset: Some(0x20000 + table * 0x1000),
+        })
+        .collect();
+    raw.interfaces = (0..TABLES as usize)
+        .map(|index| ScannedInterface {
+            index,
+            name_class: "exact_standard",
+            name_lossy: None,
+            name_private: Some(b"PKCS 11".to_vec()),
+            flags: 0,
+            table: Some(index),
+        })
+        .collect();
+
+    let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1)]);
+    let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&raw), &mut pins);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let plan = plan::build_from_reconciled_modules(&modules);
+
+    assert!(
+        plan.modules_skipped.is_empty(),
+        "five published tables fit the global budget and must admit: {:?}",
+        plan.modules_skipped
+    );
+    assert_eq!(
+        plan.slots.len(),
+        340,
+        "5 published tables x 68 entries all admit past the heuristic cap"
+    );
+    assert_eq!(
+        plan.uncorroborated_candidates, 0,
+        "published tables never spill as uncorroborated"
+    );
+    assert_eq!(plan.entries_seen, 340, "seen counts every published record");
+    assert_eq!(plan.modules.len(), 1);
+    assert_eq!(
+        plan.modules[0].interfaces, 5,
+        "all five published interfaces stay visible"
+    );
+
+    // Every table admitted: the first entry of each is slotted.
+    let attached: BTreeSet<u64> = plan.slots.iter().map(|slot| slot.file_offset).collect();
+    for table in 0..TABLES {
+        let first_entry = 0x30000 + table * ENTRIES * 8;
+        assert!(
+            attached.contains(&first_entry),
+            "published table {table} admits despite the heuristic cap"
+        );
+    }
+}
+
+/// Task 1.2 (b): the global budget still refuses atomically. With 400 slots
+/// already admitted, a module needing 136 new targets (top table 136 > 112
+/// remaining) is refused whole — no prefix — and a later small module still
+/// fits in the remaining budget.
+#[test]
+fn global_budget_refuses_oversized_module_atomically_and_admits_later_small_module() {
+    fn heuristic_module(
+        minor: u64,
+        tables: usize,
+        entries_per_table: usize,
+        entry_base: u64,
+    ) -> ScannedModule {
+        const NAMES: [&str; 8] = [
+            "C_Initialize",
+            "C_Finalize",
+            "C_GetInfo",
+            "C_GetFunctionList",
+            "C_GetSlotList",
+            "C_GetSlotInfo",
+            "C_GetTokenInfo",
+            "C_Sign",
+        ];
+        let mut raw = overlay_module(overlay_key(minor));
+        raw.tables = (0..tables)
+            .map(|table| ScannedTable {
+                version: (3, 2),
+                walk: "full",
+                entries: (0..entries_per_table)
+                    .map(|entry| {
+                        let ordinal = (table * entries_per_table + entry) as u64;
+                        ScannedEntry {
+                            name: NAMES[(ordinal % NAMES.len() as u64) as usize],
+                            object: raw.key,
+                            object_path: raw.path.clone(),
+                            file_offset: entry_base + ordinal * 8,
+                        }
+                    })
+                    .collect(),
+                null_entries: vec![],
+                unpinned: vec![],
+                address: 0x7f00_0000 + minor * 0x100000 + table as u64 * 0x1000,
+                file_offset: Some(0x50000 + minor * 0x10000 + table as u64 * 0x1000),
+            })
+            .collect();
+        raw.interfaces = vec![];
+        raw
+    }
+
+    // Filler: 4 heuristic tables x 100 entries = 400 slots (within K=4).
+    let filler = heuristic_module(57, 4, 100, 0x100000);
+    // Oversized: 1 heuristic table x 136 entries; 136 > 112 remaining.
+    let oversized = heuristic_module(58, 1, 136, 0x200000);
+    // Small: 1 heuristic table x 2 entries; fits after the refusal.
+    let small = heuristic_module(59, 1, 2, 0x300000);
+
+    let mut pins = overlay_pins(&[
+        (filler.key, OVERLAY_SHA, 1),
+        (oversized.key, OVERLAY_SHA, 1),
+        (small.key, OVERLAY_SHA, 1),
+    ]);
+    let raws = [filler, oversized, small];
+    let (modules, skipped) = bind_scanned_modules(&raws, &mut pins);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    assert_eq!(modules.len(), 3);
+    let plan = plan::build_from_reconciled_modules(&modules);
+
+    assert_eq!(
+        plan.slots.len(),
+        402,
+        "filler 400 + small 2 admit; the oversized 136 leave no prefix"
+    );
+    assert_eq!(
+        plan.modules.len(),
+        2,
+        "only the filler and the small module admit"
+    );
+    assert_eq!(
+        plan.modules_skipped.len(),
+        1,
+        "the oversized module is refused whole: {:?}",
+        plan.modules_skipped
+    );
+    assert!(
+        plan.modules_skipped[0].reason.contains("136")
+            && plan.modules_skipped[0].reason.contains("400 are in use"),
+        "refusal names the need and the budget: {:?}",
+        plan.modules_skipped[0]
+    );
+    assert_eq!(
+        plan.uncorroborated_candidates, 0,
+        "refusal is atomic, not a spill"
+    );
+    assert_eq!(
+        plan.entries_seen, 538,
+        "seen counts filler 400 + oversized 136 + small 2 despite refusal"
+    );
+
+    let attached: BTreeSet<u64> = plan.slots.iter().map(|slot| slot.file_offset).collect();
+    assert!(
+        attached.contains(&0x100000),
+        "filler admits its first entry"
+    );
+    assert!(
+        attached.contains(&0x300000),
+        "the later small module still fits after the refusal"
+    );
+    for offset in (0..136u64).map(|i| 0x200000 + i * 8) {
+        assert!(
+            !attached.contains(&offset),
+            "refused module leaves no prefix at offset {offset:#x}"
+        );
+    }
+}
+
+/// Task 1.2 (c): two ASLR/process views of one provider share ONE per-object
+/// cap. Both views decode the same 6 tables (same file offsets, different
+/// runtime addresses); distinct tables admit once, scored by the strongest
+/// instance, so linkage seen in any view counts. Entry bindings, interface
+/// indexes, and exact target pins are preserved per view.
+#[test]
+fn two_views_share_one_per_object_cap_preserving_pins_and_interfaces() {
+    const TABLES: u64 = 6;
+    const ENTRIES: u64 = 10;
+    const NAMES: [&str; 8] = [
+        "C_Initialize",
+        "C_Finalize",
+        "C_GetInfo",
+        "C_GetFunctionList",
+        "C_GetSlotList",
+        "C_GetSlotInfo",
+        "C_GetTokenInfo",
+        "C_Sign",
+    ];
+    let key = overlay_key(57);
+    let template = overlay_module(key);
+
+    // View 1 links the last table; view 2 links nothing, proving linkage
+    // observed from any view corroborates the distinct table.
+    let mut view1 = template.clone();
+    view1.view = ProcessViewId(100);
+    view1.tables = (0..TABLES)
+        .map(|table| ScannedTable {
+            version: (3, 2),
+            walk: "full",
+            entries: (0..ENTRIES)
+                .map(|entry| {
+                    let ordinal = table * ENTRIES + entry;
+                    ScannedEntry {
+                        name: NAMES[(ordinal % NAMES.len() as u64) as usize],
+                        object: key,
+                        object_path: view1.path.clone(),
+                        file_offset: 0x20000 + ordinal * 8,
+                    }
+                })
+                .collect(),
+            null_entries: vec![],
+            unpinned: vec![],
+            address: 0x7f00_0000 + table * 840,
+            file_offset: Some(0x1caf20 + table * 840),
+        })
+        .collect();
+    view1.interfaces = vec![ScannedInterface {
+        index: 0,
+        name_class: "exact_standard",
+        name_lossy: None,
+        name_private: Some(b"PKCS 11".to_vec()),
+        flags: 0,
+        table: Some(5),
+    }];
+
+    let mut view2 = template.clone();
+    view2.view = ProcessViewId(101);
+    view2.tables = (0..TABLES)
+        .map(|table| ScannedTable {
+            version: (3, 2),
+            walk: "full",
+            entries: (0..ENTRIES)
+                .map(|entry| {
+                    let ordinal = table * ENTRIES + entry;
+                    ScannedEntry {
+                        name: NAMES[(ordinal % NAMES.len() as u64) as usize],
+                        object: key,
+                        object_path: view2.path.clone(),
+                        file_offset: 0x20000 + ordinal * 8,
+                    }
+                })
+                .collect(),
+            null_entries: vec![],
+            unpinned: vec![],
+            address: 0x7f80_0000 + table * 840,
+            file_offset: Some(0x1caf20 + table * 840),
+        })
+        .collect();
+    view2.interfaces = vec![];
+
+    let mut pins = overlay_pins(&[(key, OVERLAY_SHA, 1)]);
+    let (modules, skipped) = bind_scanned_modules(&[view1, view2], &mut pins);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    assert_eq!(modules.len(), 2);
+    assert_eq!(
+        modules[0].object, modules[1].object,
+        "two views of one provider bind one pinned object"
+    );
+    let object = modules[0].object;
+
+    // Entry bindings preserved per view: 6 tables x 10 entries, same object.
+    for (view, module) in modules.iter().enumerate() {
+        assert_eq!(
+            module.entry_objects.len(),
+            6,
+            "view {view} keeps 6 tables of entry bindings"
+        );
+        for (table, ids) in module.entry_objects.iter().enumerate() {
+            assert_eq!(ids.len(), 10, "view {view} table {table} keeps 10 bindings");
+            for id in ids {
+                assert_eq!(*id, object, "view {view} table {table} pins the provider");
+            }
+        }
+    }
+    // Interface indexes preserved: view 1 links table 5 at index 0.
+    assert_eq!(modules[0].scanned.interfaces.len(), 1);
+    assert_eq!(modules[0].scanned.interfaces[0].index, 0);
+    assert_eq!(modules[0].scanned.interfaces[0].table, Some(5));
+    assert!(modules[1].scanned.interfaces.is_empty());
+    // ASLR: same file offsets, different runtime addresses.
+    assert_eq!(
+        modules[0].scanned.tables[0].file_offset, modules[1].scanned.tables[0].file_offset,
+        "same provider, same table file offsets"
+    );
+    assert_ne!(
+        modules[0].scanned.tables[0].address, modules[1].scanned.tables[0].address,
+        "ASLR remaps runtime addresses across views"
+    );
+
+    let plan = plan::build_from_reconciled_modules(&modules);
+
+    assert_eq!(plan.modules.len(), 1, "one object is one module");
+    assert!(
+        plan.modules_skipped.is_empty(),
+        "shared cap admits, never refuses: {:?}",
+        plan.modules_skipped
+    );
+    assert_eq!(
+        plan.slots.len(),
+        50,
+        "1 published x 10 + 4 heuristic x 10 admit under the shared cap"
+    );
+    assert_eq!(
+        plan.uncorroborated_candidates, 1,
+        "6 distinct tables (1 published + 5 heuristic) spill 1 under one shared cap, not per-view"
+    );
+    assert_eq!(
+        plan.entries_seen, 60,
+        "seen counts distinct records once across views"
+    );
+    assert_eq!(
+        plan.modules[0].interfaces, 1,
+        "interfaces take the max across views, never the sum"
+    );
+    assert!(
+        plan.surfaces
+            .iter()
+            .any(|surface| surface.source == "interface[0] exact_standard"),
+        "interface index 0 survives the shared-cap admission: {:?}",
+        plan.surfaces
+    );
+
+    // Admitted: tables 0,1,2,3 (heuristic prefix) + 5 (published via any-view
+    // linkage). Spilled: table 4.
+    let attached: BTreeSet<u64> = plan.slots.iter().map(|slot| slot.file_offset).collect();
+    for table in 0..TABLES {
+        let first_entry = 0x20000 + table * ENTRIES * 8;
+        assert_eq!(
+            attached.contains(&first_entry),
+            table != 4,
+            "table {table} admission follows the shared evidence order"
+        );
+    }
+    for slot in &plan.slots {
+        assert_eq!(
+            slot.object, object,
+            "every slot pins the exact provider object"
+        );
+    }
+}

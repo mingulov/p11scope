@@ -138,6 +138,10 @@ BASE_EVIDENCE_KEYS = set(COUNTERS) | {
     "vendor_interfaces", "interface_list", "attach_gap_ms", "pause",
     *PAUSE_COUNTERS, "loader_discovery", "templates_truncated", "provider_changed",
     "completeness",
+    # Informational, not a COUNTER: spilling heuristic lookalikes past the
+    # per-object cap is correct admission, not a coverage gap, so it never
+    # forces PARTIAL and needs no lane allowance or mutation.
+    "discovery_uncorroborated_candidates",
 }
 TRACE_TERMINAL_KEYS = {
     "privacy_mode", "capture_aborted", "final_drain", "counters_available",
@@ -1959,6 +1963,7 @@ def evidence_fixture(surfaces, sources=("scan",), discovery_skipped=0):
         # A fixture is self-consistent: a module only the manifest described is
         # uncorroborated, by definition of the word.
         "discovery_uncorroborated": 1 if list(sources) == ["manifest"] else 0,
+        "discovery_uncorroborated_candidates": 0,
         "templates_truncated": False,
         "provider_changed": False,
         "completeness": "PARTIAL",

@@ -130,6 +130,9 @@ sudo p11scope profile --pid 12345 --duration 60 -o observed-profile.json
 # 3. Or stream one line per call.
 sudo p11scope trace --cgroup /sys/fs/cgroup/... --duration 15
 
+# 3b. Or capture the whole machine with no PID or cgroup path.
+sudo p11scope profile --system --duration 60 -o system-profile.json
+
 # 4. Or start capture before releasing a command that loads the provider.
 sudo p11scope run --module /opt/vendor/lib/pkcs11.so \
   -o observed-profile.json --pause auto -- /opt/application/bin/workload

@@ -33,7 +33,7 @@ pub struct CaptureArgs {
     pub duration: Option<Duration>,
     pub out: Option<PathBuf>,
     pub max_events: Option<u64>,
-    /// `--max-scan-pids`: cgroup members scanned per pass; None ⇒ 256 default.
+    /// `--max-scan-pids`: scope members scanned per pass; None ⇒ 256 default.
     pub max_scan_pids: Option<usize>,
     /// `--ring-bytes`: EVENTS ringbuf size override; None ⇒ 256 KiB default.
     pub ring_bytes: Option<u32>,
@@ -70,7 +70,7 @@ pub struct RunArgs {
     pub duration: Option<Duration>,
     pub out: Option<PathBuf>,
     pub max_events: Option<u64>,
-    /// `--max-scan-pids`: cgroup members scanned per pass; None ⇒ 256 default.
+    /// `--max-scan-pids`: scope members scanned per pass; None ⇒ 256 default.
     pub max_scan_pids: Option<usize>,
     /// `--ring-bytes`: EVENTS ringbuf size override; None ⇒ 256 KiB default.
     pub ring_bytes: Option<u32>,
@@ -173,13 +173,13 @@ pub const USAGE: &str = "usage:
 notes: discovery scans the target's mapped memory — no manifest and no helper are required.
 --module narrows the scan to named providers. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
 scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
-run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup. --pause
+run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup/--system. --pause
 selects what run may do to its own child while it observes loading: never (default) touches
 nothing, auto only when the child would otherwise load unobserved, always on every load.
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
 ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
-every descendant (kernel >= 5.15). --system captures every process on the machine with
+every descendant (kernel >= 5.15). --system requests whole-machine capture with
 no cgroup path; per-process and per-module attribution is still recorded. Provider
 identity is pinned by SHA-256 at attach and
 checked for in-place change during capture (evidence.provider_changed).
@@ -199,13 +199,13 @@ const PROFILE_HELP: &str = "usage:
 notes: discovery scans the target's mapped memory — no manifest and no helper are required.
 --module narrows the scan to named providers. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
 scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
-run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup. --pause
+run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup/--system. --pause
 selects what run may do to its own child while it observes loading: never (default) touches
 nothing, auto only when the child would otherwise load unobserved, always on every load.
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
 ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
-every descendant (kernel >= 5.15). --system captures every process on the machine with
+every descendant (kernel >= 5.15). --system requests whole-machine capture with
 no cgroup path; per-process and per-module attribution is still recorded. Provider
 identity is pinned by SHA-256 at attach and
 checked for in-place change during capture (evidence.provider_changed).
@@ -221,13 +221,13 @@ const TRACE_HELP: &str = "usage:
 notes: discovery scans the target's mapped memory — no manifest and no helper are required.
 --module narrows the scan to named providers. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
 scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
-run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup. --pause
+run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup/--system. --pause
 selects what run may do to its own child while it observes loading: never (default) touches
 nothing, auto only when the child would otherwise load unobserved, always on every load.
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
 ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
-every descendant (kernel >= 5.15). --system captures every process on the machine with
+every descendant (kernel >= 5.15). --system requests whole-machine capture with
 no cgroup path; per-process and per-module attribution is still recorded. Provider
 identity is pinned by SHA-256 at attach and
 checked for in-place change during capture (evidence.provider_changed).
@@ -244,13 +244,13 @@ const RUN_HELP: &str = "usage:
 notes: discovery scans the target's mapped memory — no manifest and no helper are required.
 --module narrows the scan to named providers. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
 scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
-run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup. --pause
+run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup/--system. --pause
 selects what run may do to its own child while it observes loading: never (default) touches
 nothing, auto only when the child would otherwise load unobserved, always on every load.
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
 ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
-every descendant (kernel >= 5.15). --system captures every process on the machine with
+every descendant (kernel >= 5.15). --system requests whole-machine capture with
 no cgroup path; per-process and per-module attribution is still recorded. Provider
 identity is pinned by SHA-256 at attach and
 checked for in-place change during capture (evidence.provider_changed).
@@ -265,13 +265,13 @@ const INSPECT_HELP: &str = "usage:
 notes: discovery scans the target's mapped memory — no manifest and no helper are required.
 --module narrows the scan to named providers. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
 scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
-run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup. --pause
+run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup/--system. --pause
 selects what run may do to its own child while it observes loading: never (default) touches
 nothing, auto only when the child would otherwise load unobserved, always on every load.
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
 ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
-every descendant (kernel >= 5.15). --system captures every process on the machine with
+every descendant (kernel >= 5.15). --system requests whole-machine capture with
 no cgroup path; per-process and per-module attribution is still recorded. Provider
 identity is pinned by SHA-256 at attach and
 checked for in-place change during capture (evidence.provider_changed).
@@ -286,13 +286,13 @@ const DOCTOR_HELP: &str = "usage:
 notes: discovery scans the target's mapped memory — no manifest and no helper are required.
 --module narrows the scan to named providers. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
 scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
-run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup. --pause
+run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup/--system. --pause
 selects what run may do to its own child while it observes loading: never (default) touches
 nothing, auto only when the child would otherwise load unobserved, always on every load.
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
 ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
-every descendant (kernel >= 5.15). --system captures every process on the machine with
+every descendant (kernel >= 5.15). --system requests whole-machine capture with
 no cgroup path; per-process and per-module attribution is still recorded. Provider
 identity is pinned by SHA-256 at attach and
 checked for in-place change during capture (evidence.provider_changed).
@@ -537,6 +537,12 @@ fn parse_doctor(mut args: impl Iterator<Item = String>) -> Result<DoctorArgs, Cl
                 return Err(usage_err(
                     "doctor --module is not supported; use inspect --pid <n> --module \
                      <provider.so> for module-specific discovery",
+                ));
+            }
+            "--system" => {
+                return Err(usage_err(
+                    "doctor --system is not supported; doctor checks this host \
+                     and takes no capture scope",
                 ));
             }
             other => return Err(unknown_arg(other)),
@@ -800,6 +806,14 @@ mod tests {
         assert!(matches!(
             parse(args(&["doctor", "--module", "/opt/provider.so"])),
             Err(CliError::Usage(m)) if m.contains("doctor --module is not supported")
+        ));
+    }
+
+    #[test]
+    fn doctor_rejects_system_scope_with_a_named_reason() {
+        assert!(matches!(
+            parse(args(&["doctor", "--system"])),
+            Err(CliError::Usage(m)) if m.contains("doctor --system is not supported")
         ));
     }
 
@@ -1219,8 +1233,8 @@ mod tests {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(1099511628211);
         }
-        assert_eq!(USAGE.len(), 2508);
-        assert_eq!(hash, 0x690b2a9f_a9d9137c);
+        assert_eq!(USAGE.len(), 2510);
+        assert_eq!(hash, 0x4bf3078c_379924ef);
         assert_eq!(HelpTopic::Global.text(), USAGE);
     }
 

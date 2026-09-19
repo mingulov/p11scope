@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.dont_write_bytecode = True
 from _loader import load_sibling
 
-DECODER_SHA256 = '73994dec1ea7a025f5114b3d1186bc8813e358822702b613ff2cce0155766db0'
+DECODER_SHA256 = 'b7e4069bf4134c0b48fcba748bb3ab5e6f1d41e405459f19c3e4d3097b731e2d'
 _decoder = Path(__file__).with_name('check-live-discovery-object.py')
 if hashlib.sha256(_decoder.read_bytes()).hexdigest() != DECODER_SHA256:
     raise RuntimeError('discovery decoder source hash changed; review required')

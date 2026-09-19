@@ -308,11 +308,14 @@ Both `profile` and `trace` require exactly one of `--pid`, `--cgroup`, or
 inputs. `--cgroup` matches that
 cgroup and every descendant beneath it
 (kernel ≥5.15 due to attach cookies), so pointing it at a container's or pod's
-directory reaches the workload's actual nested cgroup. `--system` captures
-every process on the machine with no cgroup path: the BPF scope gate passes
-all tasks after the owner-health and config checks, and userspace discovery
-sweeps `/proc` under the same `--max-scan-pids` cap (default 256, rarest
-providers first). Per-process and per-module attribution is still recorded —
+directory reaches the workload's actual nested cgroup. `--system` requests
+whole-machine capture with no cgroup path: the BPF scope gate admits
+all tasks subject to the owner-health and config checks, and userspace
+discovery sweeps `/proc` under the same `--max-scan-pids` cap (default 256,
+rarest providers first). Scope admission does not promise that every process
+or call is captured, and live exact-tip qualification for the system lane is
+still pending: earlier receipts from other scopes do not qualify it.
+Per-process and per-module attribution is still recorded —
 each retained generation keeps its own view and pins — and `capture.scope`
 in the JSON report reads `"system"`. Fork children are admitted without a
 destination check, and short-lived processes that exit between refreshes

@@ -2475,6 +2475,67 @@ fn cgroup_unmatched_exit_overflow_latches_one_lower_bound() {
 }
 
 #[test]
+fn system_scope_admits_new_generations_and_counts_unmatched_exits() {
+    let first = ProcessView::open(ProcessViewId(41), std::process::id()).unwrap();
+    let pid = first.pid();
+    let admitted = first.admitted_ns();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.views.push(first);
+    engine.seed_initial_cgroup_views();
+    assert_eq!(engine.pid_descendant_gaps(), 0);
+
+    // A newly admitted generation counts exactly once, as in cgroup scope.
+    let second = ProcessView::open(ProcessViewId(42), pid).unwrap();
+    engine.views.push(second);
+    engine.record_cgroup_view_admissions([ProcessViewId(42)]);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+
+    // An exit that matches no admitted generation counts once however often
+    // it is replayed; admission needs no cgroup check in system scope.
+    let mut short_lived: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    short_lived.kind = DISCOVERY_KIND_LEADER_EXIT;
+    short_lived.pid_tgid = u64::from(pid.saturating_add(1)) << 32;
+    short_lived.hook_ts_ns = admitted;
+    let mut pending = PendingViewRetirements::new();
+    engine.dispatch_lifecycle_record(&short_lived, &mut pending);
+    engine.dispatch_lifecycle_record(&short_lived, &mut pending);
+    assert_eq!(engine.pid_descendant_gaps(), 2);
+}
+
+#[test]
+fn system_scope_ledger_overflow_latches_partial_with_system_subject() {
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    let mut pending = PendingViewRetirements::new();
+    for index in 0..=MAX_SCAN_PIDS {
+        let mut exit: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        exit.kind = DISCOVERY_KIND_LEADER_EXIT;
+        exit.pid_tgid = (index as u64 + 1) << 32;
+        exit.hook_ts_ns = index as u64 + 1;
+        engine.dispatch_lifecycle_record(&exit, &mut pending);
+    }
+    let after_overflow = engine.pid_descendant_gaps();
+    let mut further: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    further.kind = DISCOVERY_KIND_LEADER_EXIT;
+    further.pid_tgid = (MAX_SCAN_PIDS as u64 + 2) << 32;
+    further.hook_ts_ns = MAX_SCAN_PIDS as u64 + 2;
+    engine.dispatch_lifecycle_record(&further, &mut pending);
+    assert_eq!(after_overflow, MAX_SCAN_PIDS as u64 + 1);
+    assert_eq!(engine.pid_descendant_gaps(), after_overflow);
+    assert!(engine.cgroup_ingress_overflow);
+    assert_eq!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .filter(|skip| skip.subject == "system ingress tracking")
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn leader_exit_loss_closes_only_the_owned_selection_view() {
     let view = ProcessView::open(ProcessViewId(25), std::process::id()).unwrap();
     let mut engine = Engine::empty();
@@ -15081,6 +15142,7 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
         ended: "t1",
         kernel: "test",
         policy: CapturePolicy::Allowlisted,
+        scope: "pid",
         ring_bytes: p11scope_ebpf_common::RING_BYTES,
         drain_interval_ms: 1000,
     };
@@ -16124,6 +16186,23 @@ fn cgroup_scope_collects_pids_from_every_descendant() {
             && lost.iter().any(|s| s.reason.contains("never discovered")),
         "{lost:?}"
     );
+}
+
+#[test]
+fn system_scope_sweeps_proc_for_sorted_unique_tgids() {
+    // No cgroup path is consulted: the whole machine is the membership.
+    let (pids, lost) = scope_pids(&Scope::System);
+    assert_eq!(lost, vec![], "a listable /proc loses nothing: {lost:?}");
+    assert!(
+        pids.contains(&std::process::id()),
+        "the sweep must see its own observer"
+    );
+    assert!(pids.contains(&1), "pid 1 always exists");
+    let mut sorted = pids.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(pids, sorted, "sorted and deduplicated");
+    assert_eq!(scope_label(&Scope::System), "system");
 }
 
 fn merged_object(sources: Vec<&'static str>) -> render::ObjectSummary {

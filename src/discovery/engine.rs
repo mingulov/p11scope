@@ -3184,12 +3184,52 @@ fn corroboration_corroborates(outcome: Corroboration) -> bool {
 }
 
 fn scope_pids(scope: &Scope) -> (Vec<u32>, Vec<Skipped>) {
+    // Whole-machine scope: every numeric /proc entry is a thread-group ID
+    // (threads live under /proc/<pid>/task, never top-level). No cgroup path
+    // is consulted; the caller's scan cap still bounds discovery.
+    if matches!(scope, Scope::System) {
+        let mut pids = Vec::new();
+        let mut lost = Vec::new();
+        match std::fs::read_dir("/proc") {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = match entry {
+                        Ok(entry) => entry,
+                        Err(error) => {
+                            lost.push(Skipped {
+                                subject: scope_label(scope),
+                                reason: format!(
+                                    "a /proc entry could not be read ({error}); membership absence is not authoritative"
+                                ),
+                            });
+                            continue;
+                        }
+                    };
+                    if let Some(pid) = entry
+                        .file_name()
+                        .to_str()
+                        .and_then(|name| name.parse::<u32>().ok())
+                    {
+                        pids.push(pid);
+                    }
+                }
+            }
+            Err(error) => lost.push(Skipped {
+                subject: scope_label(scope),
+                reason: format!("/proc could not be listed ({error}); no process was discovered"),
+            }),
+        }
+        pids.sort_unstable();
+        pids.dedup();
+        return (pids, lost);
+    }
     let (path, io_root) = match scope {
         Scope::Pid(pid) => return (vec![*pid], Vec::new()),
         Scope::Cgroup { path, dir, .. } => (
             path.as_path(),
             PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd())),
         ),
+        Scope::System => unreachable!("system scope returns above"),
     };
     let mut pids = Vec::new();
     let mut lost = Vec::new();
@@ -3261,11 +3301,13 @@ fn scope_pids(scope: &Scope) -> (Vec<u32>, Vec<Skipped>) {
     (pids, lost)
 }
 
-/// What a scope-wide loss is filed under: the cgroup path, or the pid.
+/// What a scope-wide loss is filed under: the cgroup path, the pid, or the
+/// whole machine.
 fn scope_label(scope: &Scope) -> String {
     match scope {
         Scope::Pid(pid) => format!("pid {pid}"),
         Scope::Cgroup { path, .. } => path.display().to_string(),
+        Scope::System => "system".to_string(),
     }
 }
 
@@ -6118,15 +6160,39 @@ impl Engine {
     }
 
     pub(crate) fn pid_descendant_gaps(&self) -> u64 {
-        if matches!(self.scope, Scope::Cgroup { .. }) {
+        if self.admits_generations() {
             self.pid_descendant_gaps
         } else {
             0
         }
     }
 
+    /// Scopes that admit process generations over time: cgroup membership and
+    /// the whole machine both track an admission ledger and count descendant
+    /// gaps. PID scope names one exact generation and never admits another.
+    fn admits_generations(&self) -> bool {
+        matches!(self.scope, Scope::Cgroup { .. } | Scope::System)
+    }
+
+    /// What an admission-ledger loss is filed under: the cgroup subject, or
+    /// the system subject for whole-machine scope.
+    fn ingress_subject(&self) -> &'static str {
+        match self.scope {
+            Scope::System => "system ingress tracking",
+            _ => "cgroup ingress tracking",
+        }
+    }
+
+    /// What an admission-removal loss is filed under.
+    fn admission_removal_subject(&self) -> &'static str {
+        match self.scope {
+            Scope::System => "system admission removal",
+            _ => "cgroup admission removal",
+        }
+    }
+
     fn seed_initial_cgroup_views(&mut self) {
-        if matches!(self.scope, Scope::Cgroup { .. }) {
+        if self.admits_generations() {
             self.admitted_cgroup_views
                 .extend(self.views.iter().map(|view| {
                     (
@@ -6142,7 +6208,7 @@ impl Engine {
     }
 
     fn record_cgroup_view_admissions(&mut self, views: impl IntoIterator<Item = ProcessViewId>) {
-        if !matches!(self.scope, Scope::Cgroup { .. }) {
+        if !self.admits_generations() {
             return;
         }
         for view in views {
@@ -6165,7 +6231,7 @@ impl Engine {
     }
 
     fn record_unmatched_cgroup_leader_exit(&mut self, record: &DiscoveryRecord) {
-        if !matches!(self.scope, Scope::Cgroup { .. }) {
+        if !self.admits_generations() {
             return;
         }
         let pid = (record.pid_tgid >> 32) as u32;
@@ -6184,8 +6250,9 @@ impl Engine {
             if !self.cgroup_ingress_overflow {
                 self.cgroup_ingress_overflow = true;
                 self.pid_descendant_gaps = self.pid_descendant_gaps.saturating_add(1);
+                let subject = self.ingress_subject();
                 self.mark_partial(
-                    "cgroup ingress tracking",
+                    subject,
                     "the bounded unmatched-exit ledger overflowed; the gap count is a lower bound",
                 );
             }
@@ -6208,7 +6275,7 @@ impl Engine {
         views: &BTreeSet<ProcessViewId>,
         closed_ns: Option<u64>,
     ) {
-        if !matches!(self.scope, Scope::Cgroup { .. }) {
+        if !self.admits_generations() {
             return;
         }
         if let Some(closed_ns) = closed_ns {
@@ -6224,7 +6291,7 @@ impl Engine {
             return;
         }
         let skipped = Skipped {
-            subject: "cgroup admission removal".into(),
+            subject: self.admission_removal_subject().into(),
             reason: "the monotonic removal boundary was unavailable; the descendant gap count is a lower bound".into(),
         };
         if !self.base_counters.object_skips.contains(&skipped) {
@@ -6270,8 +6337,9 @@ impl Engine {
                         .insert((pid, record.hook_ts_ns));
                 } else {
                     self.cgroup_ingress_overflow = true;
+                    let subject = self.ingress_subject();
                     self.mark_partial(
-                        "cgroup ingress tracking",
+                        subject,
                         "the bounded unmatched-exit ledger overflowed; the gap count is a lower bound",
                     );
                 }
@@ -6664,7 +6732,7 @@ impl Engine {
 
     fn record_session_lifecycle_tracking(&mut self, session: &impl EngineSession) {
         self.record_lifecycle_tracking_unavailable(session.lifecycle_tracking_unavailable());
-        if matches!(self.scope, Scope::Cgroup { .. })
+        if self.admits_generations()
             && session.capture_policy().uses_events()
             && (session.process_creation_tracking_unavailable().is_some()
                 || session.lifecycle_tracking_unavailable().is_some())
@@ -6672,10 +6740,13 @@ impl Engine {
             if self.pid_descendant_gaps == 0 {
                 self.pid_descendant_gaps = 1;
             }
-            self.mark_partial(
-                "live lifecycle tracking",
-                "a required cgroup creation or lifecycle boundary was unavailable",
-            );
+            let boundary = match self.scope {
+                Scope::System => {
+                    "a required process-creation or lifecycle boundary was unavailable"
+                }
+                _ => "a required cgroup creation or lifecycle boundary was unavailable",
+            };
+            self.mark_partial("live lifecycle tracking", boundary);
         }
     }
 
@@ -11185,6 +11256,10 @@ impl Engine {
         pending_views: &mut PendingViewRetirements,
     ) -> Option<ProcessViewId> {
         let pid = (record.pid_tgid >> 32) as u32;
+        // Only cgroup scope filters lifecycle records through the admission
+        // ledger: system scope admits every pid without a membership check
+        // (the whole machine is in scope), while the ledger still counts
+        // unmatched exits as descendant gaps below.
         if let Some((view, cause)) =
             lifecycle_retirement(&self.views, pid, record.hook_ts_ns, record.kind).filter(
                 |(view, _)| {
@@ -11789,8 +11864,11 @@ impl Engine {
         } else {
             pids.into_iter().collect()
         };
-        let membership_authoritative =
-            membership_complete && matches!(self.scope, Scope::Cgroup { .. });
+        // A complete /proc sweep is authoritative membership for system scope
+        // exactly as a complete cgroup walk is for cgroup scope: a retained
+        // view whose pid is absent has departed. Over the cap or with skips,
+        // neither scope claims authority.
+        let membership_authoritative = membership_complete && self.admits_generations();
         let retirement_causes: BTreeMap<_, _> = self
             .views
             .iter()
@@ -12444,7 +12522,7 @@ impl Engine {
 
         let retained_pids: BTreeSet<_> = self.views.iter().map(ProcessView::pid).collect();
         let mut deferred_exits = Vec::new();
-        if matches!(self.scope, Scope::Cgroup { .. }) {
+        if self.admits_generations() {
             records.retain(|queued| {
                 let record = &queued.record;
                 let defer = record.kind == DISCOVERY_KIND_LEADER_EXIT

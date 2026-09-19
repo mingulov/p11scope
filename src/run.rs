@@ -1464,6 +1464,8 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
             (Scope::Pid(*p), Some(view))
         }
         ScopeArg::Cgroup(c) => (scope::cgroup(c)?, None),
+        // No named view and no cgroup path: discovery sweeps /proc itself.
+        ScopeArg::System => (Scope::System, None),
     };
     if kind == Kind::Trace && a.duration.is_none() {
         eprintln!(
@@ -1475,7 +1477,7 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
     let accepted = preflight_uretprobe_hazard(
         match &a.scope {
             ScopeArg::Pid(pid) => Some(*pid),
-            ScopeArg::Cgroup(_) => None,
+            ScopeArg::Cgroup(_) | ScopeArg::System => None,
         },
         a.allow_confined_uretprobe,
     )?;
@@ -2319,6 +2321,10 @@ fn no_modules_hint(scope: &ScopeArg) -> String {
              `p11scope doctor --cgroup {0}` to see why",
             path.display()
         ),
+        ScopeArg::System => "p11scope: no PKCS#11 modules discovered system-wide; run \
+             `p11scope inspect --pid <n>` for a process using PKCS#11 or \
+             `p11scope doctor` to see why"
+            .to_string(),
     }
 }
 
@@ -2570,9 +2576,10 @@ fn observe_fork(
     ) {
         return false;
     }
-    if ev.root_affiliation == 0
-        && (ev.event_type == event_type::FORK_INTO_CGROUP || !matches!(scope, Scope::Cgroup { .. }))
-    {
+    // System scope admits fork children exactly like cgroup scope: the whole
+    // machine is in scope, so no destination check can fail.
+    let multi_scope = matches!(scope, Scope::Cgroup { .. } | Scope::System);
+    if ev.root_affiliation == 0 && (ev.event_type == event_type::FORK_INTO_CGROUP || !multi_scope) {
         return true;
     }
     let parent_pid = (ev.pid_tgid >> 32) as u32;
@@ -2595,7 +2602,7 @@ fn observe_fork(
     if let Some(parent) = parent {
         tracker.history_root(parent, ev.root_affiliation);
     }
-    if ev.event_type == event_type::FORK_INTO_CGROUP || !matches!(scope, Scope::Cgroup { .. }) {
+    if ev.event_type == event_type::FORK_INTO_CGROUP || !multi_scope {
         return true;
     }
     let (child, retired) = tracker.admit_history(domain, ev.session as u32, ev.child_image);
@@ -2619,7 +2626,7 @@ fn initial_tracking_evidence(
 ) -> bool {
     match scope {
         Scope::Pid(_) => lifecycle_tracking_unavailable,
-        Scope::Cgroup { .. } => {
+        Scope::Cgroup { .. } | Scope::System => {
             process_creation_tracking_unavailable || lifecycle_tracking_unavailable
         }
     }
@@ -3195,6 +3202,7 @@ fn capture_profile(
                             ended: &ended,
                             kernel: &kernel,
                             policy,
+                            scope: scope.kind(),
                             ring_bytes: resolve_ring_bytes(ring_bytes),
                             drain_interval_ms: drain.as_millis() as u64,
                         };
@@ -6604,6 +6612,7 @@ mod tests {
             ended: "t1",
             kernel: "test",
             policy: CapturePolicy::AggregateOnly,
+            scope: "pid",
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
@@ -6692,6 +6701,7 @@ mod tests {
                         ended: "t1",
                         kernel: "test",
                         policy: CapturePolicy::AggregateOnly,
+                        scope: "pid",
                         ring_bytes: p11scope_ebpf_common::RING_BYTES,
                         drain_interval_ms: 1000,
                     },
@@ -6751,6 +6761,7 @@ mod tests {
             ended: "t1",
             kernel: "test",
             policy: CapturePolicy::Allowlisted,
+            scope: "pid",
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
@@ -6856,6 +6867,31 @@ mod tests {
     }
 
     #[test]
+    fn system_scope_counts_creation_and_lifecycle_tracking_like_cgroup_scope() {
+        assert!(initial_tracking_evidence(&Scope::System, true, false));
+        assert!(initial_tracking_evidence(&Scope::System, false, true));
+        assert!(!initial_tracking_evidence(&Scope::System, false, false));
+    }
+
+    #[test]
+    fn system_scope_admits_fork_children_without_a_destination_check() {
+        let plan = crate::plan::build_from_reconciled_modules(&[]);
+        let mut state = semantics::State::new(&plan);
+        let mut tracker = process::Tracker::with_limits(0, 16);
+        let mut event: p11scope_ebpf_common::Event = unsafe { std::mem::zeroed() };
+        event.event_type = p11scope_ebpf_common::event_type::FORK;
+        event.pid_tgid = u64::from(std::process::id()) << 32;
+        event.session = u64::from(std::process::id());
+        assert!(observe_fork(
+            tracker.producer_domain(),
+            &mut tracker,
+            &mut state,
+            &Scope::System,
+            &event,
+        ));
+    }
+
+    #[test]
     fn signal_state_retains_first_identity_and_saturates_sigint_deliveries() {
         let state = SignalState::new();
         state.observe(libc::SIGTERM);
@@ -6885,6 +6921,10 @@ mod tests {
             hint.contains("p11scope doctor --cgroup /sys/fs/cgroup/x"),
             "{hint}"
         );
+        let hint = no_modules_hint(&ScopeArg::System);
+        assert!(hint.contains("system-wide"), "{hint}");
+        assert!(hint.contains("p11scope inspect --pid"), "{hint}");
+        assert!(hint.contains("p11scope doctor"), "{hint}");
     }
 
     /// `inspect` propagates a hard error for a pid that names nothing; it must reach

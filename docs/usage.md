@@ -303,11 +303,24 @@ therefore be readable/writable by the invoking unprivileged identity (or the
 restores Linux dumpability only to perform bounded reads through
 `/proc/self/mem`; it does not restore groups, IDs, or capabilities.
 
-Both `profile` and `trace` require either `--pid` or `--cgroup`; `--module` and
-`--manifest` are repeatable optional discovery inputs. `--cgroup` matches that
+Both `profile` and `trace` require exactly one of `--pid`, `--cgroup`, or
+`--system`; `--module` and `--manifest` are repeatable optional discovery
+inputs. `--cgroup` matches that
 cgroup and every descendant beneath it
 (kernel ≥5.15 due to attach cookies), so pointing it at a container's or pod's
-directory reaches the workload's actual nested cgroup. `--duration` (bare
+directory reaches the workload's actual nested cgroup. `--system` captures
+every process on the machine with no cgroup path: the BPF scope gate passes
+all tasks after the owner-health and config checks, and userspace discovery
+sweeps `/proc` under the same `--max-scan-pids` cap (default 256, rarest
+providers first). Per-process and per-module attribution is still recorded —
+each retained generation keeps its own view and pins — and `capture.scope`
+in the JSON report reads `"system"`. Fork children are admitted without a
+destination check, and short-lived processes that exit between refreshes
+count `pid_descendant_gaps` through the same bounded unmatched-exit ledger
+as cgroup scope (overflow latches one lower-bound increment and `PARTIAL`).
+`p11scope doctor` needs no scope flags for a system capture: its host
+program preflight already covers the whole-machine lane.
+`--duration` (bare
 seconds or `30s`/`5m`/`1h`) requests shutdown after the given interval. Probe
 teardown and final reporting follow; with many attached functions, this can
 add seconds, and calls may still be observed while probes are being detached.

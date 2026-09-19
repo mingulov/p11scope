@@ -997,6 +997,7 @@ pub fn json(reports: &[SlotReport], ev: &Evidence, capture: &CaptureMeta<'_>) ->
         "schema": "p11scope/observed-profile/v3-metrics",
         "capture": { "start": capture.started, "end": capture.ended, "mode": "metrics",
                      "privacy_mode": capture.policy.privacy_mode(),
+                     "scope": capture.scope,
                      "kernel": capture.kernel,
                      "ring_bytes": capture.ring_bytes,
                      "drain_interval_ms": capture.drain_interval_ms,
@@ -1264,6 +1265,8 @@ pub struct CaptureMeta<'a> {
     pub ended: &'a str,
     pub kernel: &'a str,
     pub policy: CapturePolicy,
+    /// Capture scope kind: `pid`, `cgroup`, or `system` (`Scope::kind`).
+    pub scope: &'static str,
     /// Effective EVENTS ringbuf size in bytes (`--ring-bytes` or default).
     pub ring_bytes: u32,
     /// Effective capture-loop tick in ms (`--drain-interval-ms` or default).
@@ -1366,6 +1369,7 @@ pub fn profile_json(
         "capture": {
             "start": capture.started, "end": capture.ended, "mode": "profile",
             "privacy_mode": capture.policy.privacy_mode(),
+            "scope": capture.scope,
             "kernel": capture.kernel,
             "ring_bytes": capture.ring_bytes,
             "drain_interval_ms": capture.drain_interval_ms,
@@ -1928,6 +1932,7 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: CapturePolicy::Allowlisted,
+            scope: "pid",
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         }
@@ -2631,6 +2636,7 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: CapturePolicy::Allowlisted,
+            scope: "pid",
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
@@ -2997,6 +3003,7 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: crate::attach::CapturePolicy::AggregateOnly,
+            scope: "pid",
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
@@ -3107,12 +3114,38 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: crate::attach::CapturePolicy::Allowlisted,
+            scope: "pid",
             ring_bytes: 4096,
             drain_interval_ms: 1000,
         };
         let v = profile_json(&[], &ev, &state, &capture);
         assert_eq!(v["capture"]["ring_bytes"], 4096);
         assert_eq!(v["capture"]["drain_interval_ms"], 1000);
+    }
+
+    #[test]
+    fn profile_and_metrics_json_disclose_the_scope_kind() {
+        let mut ev = evidence();
+        ev.verdict();
+        let state = crate::semantics::State::with_policy(
+            &empty_plan(),
+            crate::attach::CapturePolicy::Allowlisted,
+        );
+        for scope in ["pid", "cgroup", "system"] {
+            let capture = CaptureMeta {
+                started: "t0",
+                ended: "t1",
+                kernel: "6.8.0",
+                policy: crate::attach::CapturePolicy::Allowlisted,
+                scope,
+                ring_bytes: 4096,
+                drain_interval_ms: 1000,
+            };
+            let profile = profile_json(&[], &ev, &state, &capture);
+            assert_eq!(profile["capture"]["scope"], scope);
+            let metrics = json(&[], &ev, &capture);
+            assert_eq!(metrics["capture"]["scope"], scope);
+        }
     }
 
     #[test]
@@ -3124,6 +3157,7 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: crate::attach::CapturePolicy::AggregateOnly,
+            scope: "pid",
             ring_bytes: 262_144,
             drain_interval_ms: 200,
         };
@@ -3297,6 +3331,7 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: CapturePolicy::UnsafeUnvalidatedMetadata,
+            scope: "pid",
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
@@ -3337,6 +3372,7 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: CapturePolicy::UnsafeUnvalidatedMetadata,
+            scope: "pid",
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
@@ -3384,6 +3420,7 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: CapturePolicy::UnsafeUnvalidatedMetadata,
+            scope: "pid",
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
@@ -3412,6 +3449,7 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: CapturePolicy::UnsafeUnvalidatedMetadata,
+            scope: "pid",
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
@@ -3449,6 +3487,7 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: CapturePolicy::UnsafeUnvalidatedMetadata,
+            scope: "pid",
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
@@ -3492,6 +3531,7 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: CapturePolicy::UnsafeUnvalidatedMetadata,
+            scope: "pid",
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
@@ -3580,6 +3620,7 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: CapturePolicy::UnsafeUnvalidatedMetadata,
+            scope: "pid",
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
@@ -3647,6 +3688,7 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: CapturePolicy::UnsafeUnvalidatedMetadata,
+            scope: "pid",
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };

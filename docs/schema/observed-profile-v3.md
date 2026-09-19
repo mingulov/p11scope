@@ -110,6 +110,13 @@ an uncompleted call, with no fabricated return value. The field is always
 present in v3 profile, metrics and terminal trace evidence; nonzero forces
 `PARTIAL`.
 
+## Added `capture` fields
+
+`capture.scope` is exactly `pid`, `cgroup`, or `system`, naming which scope
+selected the capture (`--pid`, `--cgroup`, or `--system`). It carries no PID
+number or cgroup path. The evidence object keeps its closed exact key set;
+this addition touches the `capture` section only.
+
 ## Completeness and terminal trace
 
 Any truncation, uncovered provider, export status other than `present` or

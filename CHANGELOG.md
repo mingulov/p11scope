@@ -48,6 +48,12 @@ pending.
   child and tracks later provider loads with the loader/export path. Existing
   external processes still use the initial memory scan or a suitable
   pre-existing, hash-matched manifest.
+- **System scope**: `profile` and `trace` accept `--system` for whole-machine
+  capture — no `--pid` or `--cgroup` needed. The BPF scope gate passes all
+  tasks, discovery sweeps `/proc` under the same scan cap, per-process and
+  per-module attribution is still recorded, fork children are admitted
+  without a destination check, and `capture.scope` in the JSON report reads
+  `"system"`.
 - **Corrective work bounds**: one 512 MiB attempted-I/O budget covers all
   memory scans and scan-sourced hashes in a capture (64 MiB per operation),
   with ceilings of 512 accepted tables, 53,248 decoded entries, 512 interfaces,

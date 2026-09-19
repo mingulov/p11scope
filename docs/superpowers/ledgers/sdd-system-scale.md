@@ -150,3 +150,20 @@ Build env: TMPDIR=/var/tmp/p11scope-ws-tmp cargo +1.88 --locked --offline.
   pattern; verified no worker cargo process was alive at kill time (only
   my gate). Cost if wrong: a worker gate died silently and re-runs;
   use PID-targeted kills next time.
+- Combined gate on the 1.2+fixture tree (1b6058c): lib 1075/0 green;
+  artifact_contracts 124 passed + 2 failed (metadata_canary_matrix,
+  lane13_evidence_finalizes_only_after_owned_cleanup), 883s, RC=101.
+  Root cause (systematic-debugging, flushed panics): all three inner
+  failures are wall-clock timeouts under load-30-on-12-cores — canary
+  `timeout 60s` killed verify-canaries.sh mid-suite (67+11 inner
+  suites OK until the kill), lane13 body-success outer exit 124,
+  lane13 port-forward 12s readiness deadline missed. Merges
+  6b536ed/85c0f9e touch none of these paths. Isolation re-runs on
+  this tree GREEN: canary 133.5s, lane13 210.7s (worker saw the same
+  pair green at 98.8s/280.2s on its base). Recorded as contention
+  flakes (3.3 precedent); no test edits — the timeout values are
+  load-bearing process-test contracts. Note: my own isolation probe
+  overlapped the gate and contributed load; no parallel probes
+  during future gates. Cost if wrong: a real canary/lane13
+  regression hides until the next full gate on an idle box;
+  mitigated by isolation-green on the exact merged tree.

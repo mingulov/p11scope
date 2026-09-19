@@ -110,3 +110,19 @@ Build env: TMPDIR=/var/tmp/p11scope-ws-tmp cargo +1.88 --locked --offline.
   loaders AND establishes multi-vs-singles numbers; Task 1.6 decides scope;
   both feed an explicit adopt/defer call. Cost if wrong: delayed multi work
   if it was obviously right — accepted, measurement is the point.
+- Task 1.2: complete (54d78c8, merged 6b536ed, inline review clean).
+  Evidence-ordered admission with K=4 heuristic cap/object, published
+  bypass (atomic vs global budget), spill as `uncorroborated_candidates`
+  evidence; cross-view dedup by (file_offset, version); top-1-exceeds
+  refusal preserved. Worker gate: lib 1075/0, system_scope 6/6,
+  artifact_contracts 123/3 — license failure verified pre-existing on
+  worker base bb2314a (header fix already on integration), canary+lane13
+  isolation-green contention flakes re-proven by worker (98.8s/280.2s).
+  Review package: .superpowers/sdd/2026-09-19-system-scale/review-bb2314a..54d78c8.diff.
+- Task 1.2: minor (deferred to final review): Step-4 review gate asked for
+  the 0-interface degenerate order asserted explicitly; worker asserted
+  tie→discovery-order among 63 unlinked tables instead (same code path,
+  same outcome class). Ruling: accept as covered — a fresh-worker round
+  trip for a same-path variant assertion buys no behavior risk reduction.
+  Cost if wrong: a tie-order regression slips past tests; mitigated by
+  the existing per-table admission-map assertion (tables 0,1,2+63).

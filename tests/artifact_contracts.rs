@@ -7593,6 +7593,8 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
             version: (2, 40),
             entries: 68,
             source: "scan",
+            file_offset: None,
+            linkage: "heuristic",
         }],
         interfaces: 0,
         skipped: vec![],

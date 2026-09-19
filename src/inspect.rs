@@ -428,6 +428,8 @@ mod tests {
                     unpinned: vec![],
                     address: 0x7f0000001000,
                     file_offset: Some(0),
+                    live_return: false,
+                    manifest_supported: false,
                 }],
                 interfaces: vec![ScannedInterface {
                     index: 0,

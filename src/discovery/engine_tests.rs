@@ -14,7 +14,7 @@ use crate::discovery::identity::{
 use crate::discovery::loader::LoaderContextSpec;
 use crate::discovery::scan::{
     IO_CEILING_REASON, SCAN_DEADLINE_REASON, ScanLimits, ScannedEntry, ScannedTable,
-    WORK_CEILING_REASON,
+    WORK_CEILING_REASON, order_tables_by_evidence,
 };
 use crate::{semantics, trace};
 use p11scope_manifest::manifest::{
@@ -17284,5 +17284,48 @@ fn system_scope_refresh_admits_later_generation_in_same_engine() {
         system_scope_slots_for(&engine, "refresh-first.so"),
         slots_a,
         "the first child's attributed slots remain after the reap"
+    );
+}
+
+/// Task 1.1: publication evidence orders candidate tables — a table named by
+/// an interface triple sorts before an unlinked lookalike, even when the
+/// lookalike was discovered first. Synthetic tables only; no live processes.
+#[test]
+fn linked_candidate_table_sorts_before_unlinked_lookalike() {
+    let tables = [
+        ScannedTable {
+            version: (2, 40),
+            walk: "full",
+            entries: Vec::new(),
+            null_entries: Vec::new(),
+            unpinned: Vec::new(),
+            address: 0x7000,
+            file_offset: Some(0x1000),
+        },
+        ScannedTable {
+            version: (2, 40),
+            walk: "full",
+            entries: Vec::new(),
+            null_entries: Vec::new(),
+            unpinned: Vec::new(),
+            address: 0x7800,
+            file_offset: Some(0x1800),
+        },
+    ];
+    let interfaces = [ScannedInterface {
+        index: 0,
+        name_class: "exact_standard",
+        name_lossy: None,
+        name_private: Some(b"PKCS 11".to_vec()),
+        flags: 0,
+        table: Some(1),
+    }];
+
+    let order = order_tables_by_evidence(&tables, &interfaces, &[], &[]);
+
+    assert_eq!(
+        order,
+        vec![1, 0],
+        "the interface-linked table sorts before the unlinked lookalike"
     );
 }

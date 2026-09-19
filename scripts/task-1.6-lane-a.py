@@ -897,13 +897,12 @@ def run_cell(args):
                   flush=True)
 
         # Mid-capture activation of the dormant pre-published wrappers.
+        # Stages stay alive until the observer exits: closing them early
+        # ends a per-PID capture before --duration (observed once), which
+        # would confound the detach comparison. The idle tail also proves
+        # dormant attached targets emit no records.
         calls = drive_calls(stages_kept, args.n_per_ordinal, fwd, fail)
         print(f"calls driven: {calls}", flush=True)
-        for stage in stages:
-            stage.close()
-        stages = []
-        sampler.stop()
-        sampler.join(timeout=10)
 
         if not wait_gone(observer_proc, args.duration + 600):
             print("observer hung; interrupting", flush=True)
@@ -912,6 +911,11 @@ def run_cell(args):
                 signal_proc_tree(observer_proc, signal.SIGKILL)
         obs_rc = observer_proc.wait()
         t_exit = time.monotonic_ns()
+        for stage in stages:
+            stage.close()
+        stages = []
+        sampler.stop()
+        sampler.join(timeout=10)
         stdout_file.close()
         stderr_fifo.close()
         # Closing our RDWR handle lets ts.py see EOF now that the

@@ -3683,6 +3683,8 @@ fn an_empty_scan_pass_is_not_a_loss_once_the_capture_attaches_that_table() {
             version: (2, 40),
             entries: 68,
             source: "scan",
+            file_offset: None,
+            linkage: "heuristic",
         }],
         interfaces: 0,
         source: "scan",
@@ -5160,6 +5162,8 @@ fn provider_module(
         unpinned: vec![],
         address: 0x7000,
         file_offset: Some(0),
+        live_return: false,
+        manifest_supported: false,
     }];
     module
 }
@@ -5414,6 +5418,8 @@ fn selection_only_table(
         unpinned: Vec::new(),
         address: 0,
         file_offset: Some(table_file_offset),
+        live_return: false,
+        manifest_supported: false,
     }
 }
 
@@ -5622,6 +5628,8 @@ fn manifest_selection_tables_enter_the_attach_transaction() {
         unpinned: Vec::new(),
         address: 0,
         file_offset: Some(base),
+        live_return: false,
+        manifest_supported: false,
     });
 
     let mut manifest = valid_manifest_for(&[PathBuf::from(&path)], &[0; 67]);
@@ -7992,6 +8000,8 @@ fn c_get_interface_selection_exact_match_keeps_inventory_aliases() {
         unpinned: Vec::new(),
         address,
         file_offset: Some(table_file_offset),
+        live_return: false,
+        manifest_supported: false,
     });
     engine.modules[0].entry_objects.push(Vec::new());
     engine.modules[0].scanned.interfaces.extend([
@@ -8309,6 +8319,8 @@ fn selection_occurrences_keep_canonical_null_and_alias_ordinals() {
         unpinned: Vec::new(),
         address: 0,
         file_offset: Some(0x20),
+        live_return: false,
+        manifest_supported: false,
     };
 
     engine.record_selection_occurrences(plan::ModuleId(7), provider, &table);
@@ -11970,6 +11982,8 @@ fn loader_collision_candidate_keeps_provider_retirement_without_loader_id() {
         unpinned: Vec::new(),
         address: 0x7000,
         file_offset: Some(0),
+        live_return: false,
+        manifest_supported: false,
     });
     let mut provider_pins = pin_test_module(&view, &provider);
     let provider_modules = reconcile_for_test(std::slice::from_ref(&provider), &mut provider_pins);
@@ -12740,6 +12754,8 @@ fn merge_scanned_modules_retains_names_and_exact_decoder_provenance() {
             unpinned: vec![],
             address: 0x1000,
             file_offset: Some(0),
+            live_return: false,
+            manifest_supported: false,
         }],
         interfaces: vec![ScannedInterface {
             index: 0,
@@ -13482,6 +13498,8 @@ fn same_object_scan_and_manifest(
         unpinned: vec![],
         address: 0x7000,
         file_offset: Some(0),
+        live_return: false,
+        manifest_supported: false,
     });
     let manifest = manifest_naming(&path, Some(sha256));
     let input = ManifestInput {
@@ -13637,6 +13655,8 @@ fn scanned_manifest_replacement(paths: &[PathBuf], targets: &[u32]) -> ScannedMo
             unpinned: vec![],
             address: 0x7000,
             file_offset: Some(0),
+            live_return: false,
+            manifest_supported: false,
         }],
         interfaces: vec![],
     }
@@ -14420,6 +14440,8 @@ fn stale_only_identity_mismatch_becomes_manifest_fallback_for_stable_scope() {
             unpinned: vec![],
             address: 0x7000,
             file_offset: Some(0),
+            live_return: false,
+            manifest_supported: false,
         }],
         interfaces: vec![],
     };
@@ -14644,6 +14666,8 @@ fn corroboration_marks_the_exact_reconciled_object_not_the_raw_key_peer() {
                 unpinned: vec![],
                 address: 0x7000 + offset,
                 file_offset: Some(offset),
+                live_return: false,
+                manifest_supported: false,
             }],
             interfaces: vec![],
         },
@@ -14725,6 +14749,8 @@ fn pending_fallback_outcome_follows_the_final_overlay_canonical_id_without_autho
                 unpinned: vec![],
                 address: 0x7000,
                 file_offset: Some(0),
+                live_return: false,
+                manifest_supported: false,
             }],
             interfaces: vec![],
         },
@@ -14788,6 +14814,8 @@ fn pending_corroboration_rebuild_resolves_the_current_final_id() {
                 unpinned: vec![],
                 address: 0x7000,
                 file_offset: Some(0),
+                live_return: false,
+                manifest_supported: false,
             }],
             interfaces: vec![],
         },
@@ -15001,6 +15029,8 @@ fn a_table_entry_whose_object_was_not_pinned_never_becomes_a_slot() {
             unpinned: vec![],
             address: 0x7000,
             file_offset: Some(0),
+            live_return: false,
+            manifest_supported: false,
         });
     modules[0].tables.last_mut().unwrap().entries[0].object_path = modules[0].path.clone();
 
@@ -15028,7 +15058,9 @@ fn a_table_entry_whose_object_was_not_pinned_never_becomes_a_slot() {
     // the same way a NULL entry is, and attributed to its own module.
     assert_eq!(plan.entries_seen, 2, "the dropped entry stays counted");
     assert_eq!(plan.skipped.len(), 1, "{:?}", plan.skipped);
-    assert_eq!(plan.skipped[0].subject, "C_Verify");
+    // Task 1.3: reconciliation keeps the ordinal label internally (above),
+    // but the plan presents the unlinked table's entry as `unknown`.
+    assert_eq!(plan.skipped[0].subject, "unknown");
     assert_eq!(plan.modules[0].skipped, plan.skipped);
     // The reason the drop is recorded on the table rather than added to the
     // total afterwards: per-surface counts and the total stay one number.
@@ -15058,11 +15090,19 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
             unpinned: vec![raw.clone()],
             address: 0x7000,
             file_offset: Some(0),
+            live_return: false,
+            manifest_supported: false,
         });
     let reconciled = reconcile_for_test(&modules, &mut pinned);
     let plan = plan::build_from_reconciled_modules(&reconciled);
-    assert_eq!(plan.skipped, vec![raw.clone()]);
-    assert_eq!(plan.modules[0].skipped, vec![raw]);
+    // Task 1.3: the injected table is unlinked, so its ordinal subject is
+    // gated to `unknown` at plan lowering; the bounded reason is unchanged.
+    let gated = Skipped {
+        subject: "unknown".into(),
+        reason: raw.reason.clone(),
+    };
+    assert_eq!(plan.skipped, vec![gated.clone()]);
+    assert_eq!(plan.modules[0].skipped, vec![gated]);
 
     let discovery = discovery_evidence(&plan, &pinned, &DiscoveryCounters::default());
     let mut evidence = render::Evidence {
@@ -15175,8 +15215,8 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
         assert_eq!(
             document["evidence"]["skipped"][0],
             serde_json::json!({
-                "name": "C_Sign",
-                "reason": "function entry unavailable",
+                "name": "discovery subject",
+                "reason": "discovery unavailable",
             })
         );
     }
@@ -15321,6 +15361,12 @@ fn p2_retained_scan_error_keeps_counters_and_survives_attachment() {
             version: (2, 40),
             entries: 68,
             source,
+            file_offset: None,
+            linkage: if source == "manifest" {
+                "manifest"
+            } else {
+                "heuristic"
+            },
         });
         record_object_skips(&mut plan, std::slice::from_ref(&refusal));
         record_object_skips(&mut plan, &[]);
@@ -15808,6 +15854,8 @@ fn byte_identical_distinct_entry_objects_conflict_and_attach_the_union() {
             unpinned: vec![],
             address: 0x7000,
             file_offset: Some(0),
+            live_return: false,
+            manifest_supported: false,
         }],
         interfaces: vec![],
     };
@@ -17301,6 +17349,8 @@ fn linked_candidate_table_sorts_before_unlinked_lookalike() {
             unpinned: Vec::new(),
             address: 0x7000,
             file_offset: Some(0x1000),
+            live_return: false,
+            manifest_supported: false,
         },
         ScannedTable {
             version: (2, 40),
@@ -17310,6 +17360,8 @@ fn linked_candidate_table_sorts_before_unlinked_lookalike() {
             unpinned: Vec::new(),
             address: 0x7800,
             file_offset: Some(0x1800),
+            live_return: false,
+            manifest_supported: false,
         },
     ];
     let interfaces = [ScannedInterface {
@@ -17379,6 +17431,8 @@ fn p11kit_like_64_table_module() -> ScannedModule {
             unpinned: vec![],
             address: 0x7f00_0000 + table * 840,
             file_offset: Some(0x1caf20 + table * 840),
+            live_return: false,
+            manifest_supported: false,
         })
         .collect();
     raw.interfaces = vec![ScannedInterface {
@@ -17456,6 +17510,158 @@ fn ordered_admission_resource_bound_caps_heuristic_tables_per_object() {
     );
 }
 
+/// Task 1.3 mislabel guard on the 64-table replica: the three admitted
+/// unlinked tables' slots are named `unknown` — never the ordinal PKCS#11
+/// labels — while the linked table keeps its names. Every table carries
+/// (file_offset, entry count, linkage kind) into published evidence.
+#[test]
+fn admitted_heuristic_tables_are_unknown_with_provenance() {
+    let raw = p11kit_like_64_table_module();
+    let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1)]);
+    let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&raw), &mut pins);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let plan = plan::build_from_reconciled_modules(&modules);
+
+    // All 312 slots of the three admitted unlinked tables, not just the
+    // first entries: no ordinal label may survive on an unlinked table.
+    let unknown: BTreeSet<u64> = plan
+        .slots
+        .iter()
+        .filter(|slot| slot.names == ["unknown"])
+        .map(|slot| slot.file_offset)
+        .collect();
+    for table in [0u64, 1, 2] {
+        for entry in 0..104u64 {
+            let offset = 0x10000 + (table * 104 + entry) * 8;
+            assert!(
+                unknown.contains(&offset),
+                "table {table} entry {entry} must be unknown, never an ordinal label"
+            );
+        }
+    }
+    assert_eq!(unknown.len(), 3 * 104);
+    assert_eq!(plan.slots.len(), 416);
+
+    // Table 63 is interface-linked: ordinal 63*104 % 8 == 0 keeps C_Initialize.
+    let linked = plan
+        .slots
+        .iter()
+        .find(|slot| slot.file_offset == 0x10000 + 63 * 104 * 8)
+        .unwrap();
+    assert_eq!(linked.names, ["C_Initialize"]);
+
+    let tables = &plan.modules[0].tables;
+    assert_eq!(tables.len(), 64);
+    for (index, table) in tables.iter().enumerate() {
+        assert_eq!(
+            table.file_offset,
+            Some(0x1caf20 + index as u64 * 840),
+            "table {index} carries its version-word file offset"
+        );
+        assert_eq!(table.entries, 104);
+        assert_eq!(
+            table.linkage,
+            if index == 63 {
+                "interface"
+            } else {
+                "heuristic"
+            },
+            "table {index} carries its linkage kind"
+        );
+    }
+
+    // The provenance reaches discovery evidence through the publish path.
+    let mut engine = Engine::empty();
+    engine.plan = plan;
+    engine.pinned = pins;
+    engine.modules = modules;
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    engine.publish_current_capture_facts().unwrap();
+    let published = &engine.discovery.modules[0].tables;
+    assert_eq!(published.len(), 64);
+    for (index, table) in published.iter().enumerate() {
+        assert_eq!(table.file_offset, Some(0x1caf20 + index as u64 * 840));
+        assert_eq!(
+            table.linkage,
+            if index == 63 {
+                "interface"
+            } else {
+                "heuristic"
+            }
+        );
+    }
+}
+
+/// Task 1.3: a table returned by a live provider export carries publication
+/// evidence — it keeps its ordinal names and bypasses the unresolved-heuristic
+/// cap exactly like an interface-linked table.
+#[test]
+fn live_return_tables_keep_names_and_bypass_the_heuristic_cap() {
+    const TABLES: usize = 6;
+    const ENTRIES: usize = 4;
+    let mut raw = overlay_module(overlay_key(61));
+    raw.tables = (0..TABLES)
+        .map(|table| ScannedTable {
+            version: (2, 40),
+            walk: "full",
+            entries: (0..ENTRIES)
+                .map(|entry| {
+                    let ordinal = (table * ENTRIES + entry) as u64;
+                    ScannedEntry {
+                        name: "C_Sign",
+                        object: raw.key,
+                        object_path: raw.path.clone(),
+                        file_offset: 0x40000 + ordinal * 8,
+                    }
+                })
+                .collect(),
+            null_entries: vec![],
+            unpinned: vec![],
+            address: 0x7f00_1000 + table as u64 * 0x1000,
+            file_offset: Some(0x90000 + table as u64 * 0x1000),
+            live_return: table == 5,
+            manifest_supported: false,
+        })
+        .collect();
+    raw.interfaces = vec![];
+    let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1)]);
+    let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&raw), &mut pins);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let plan = plan::build_from_reconciled_modules(&modules);
+
+    // Four heuristic tables fill K=4, the live-return table bypasses it, and
+    // the fifth heuristic table spills as evidence.
+    assert!(
+        plan.modules_skipped.is_empty(),
+        "{:?}",
+        plan.modules_skipped
+    );
+    assert_eq!(plan.slots.len(), 5 * ENTRIES);
+    assert_eq!(plan.uncorroborated_candidates, 1);
+    let names_of = |table: usize| {
+        plan.slots
+            .iter()
+            .find(|slot| slot.file_offset == 0x40000 + (table * ENTRIES) as u64 * 8)
+            .unwrap()
+            .names
+            .clone()
+    };
+    for table in 0..4 {
+        assert_eq!(names_of(table), ["unknown"]);
+    }
+    assert_eq!(names_of(5), ["C_Sign"]);
+    let tables = &plan.modules[0].tables;
+    assert_eq!(tables.len(), 6);
+    assert_eq!(tables[5].linkage, "live_return");
+    assert!(
+        tables[..5].iter().all(|table| table.linkage == "heuristic"),
+        "{tables:?}"
+    );
+}
+
 /// Task 1.2 (a): five disjoint published 2.40 tables bypass the per-object
 /// heuristic cap. Each table is interface-linked (published), so K=4 does not
 /// apply; with sufficient global budget all 340 slots admit and nothing spills.
@@ -17493,6 +17699,8 @@ fn published_tables_bypass_heuristic_cap_with_sufficient_budget() {
             unpinned: vec![],
             address: 0x7f10_0000 + table * 0x1000,
             file_offset: Some(0x20000 + table * 0x1000),
+            live_return: false,
+            manifest_supported: false,
         })
         .collect();
     raw.interfaces = (0..TABLES as usize)
@@ -17585,6 +17793,8 @@ fn global_budget_refuses_oversized_module_atomically_and_admits_later_small_modu
                 unpinned: vec![],
                 address: 0x7f00_0000 + minor * 0x100000 + table as u64 * 0x1000,
                 file_offset: Some(0x50000 + minor * 0x10000 + table as u64 * 0x1000),
+                live_return: false,
+                manifest_supported: false,
             })
             .collect();
         raw.interfaces = vec![];
@@ -17702,6 +17912,8 @@ fn two_views_share_one_per_object_cap_preserving_pins_and_interfaces() {
             unpinned: vec![],
             address: 0x7f00_0000 + table * 840,
             file_offset: Some(0x1caf20 + table * 840),
+            live_return: false,
+            manifest_supported: false,
         })
         .collect();
     view1.interfaces = vec![ScannedInterface {
@@ -17734,6 +17946,8 @@ fn two_views_share_one_per_object_cap_preserving_pins_and_interfaces() {
             unpinned: vec![],
             address: 0x7f80_0000 + table * 840,
             file_offset: Some(0x1caf20 + table * 840),
+            live_return: false,
+            manifest_supported: false,
         })
         .collect();
     view2.interfaces = vec![];

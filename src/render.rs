@@ -561,12 +561,18 @@ const PHYSICAL_IDENTITY_AMBIGUITY: &str =
 /// completeness honest.
 pub fn capture_skipped_out(s: &Skipped) -> SkippedOut {
     let function = kinds::function_id(&s.subject).is_some();
+    // A gated null fact: the mislabel guard renamed an unlinked table's null
+    // slot to `unknown`, and the nullness itself is still evidence worth
+    // keeping — without claiming which function was null.
+    let gated_null = s.subject == crate::plan::UNKNOWN_FUNCTION_NAME && s.reason == "null pointer";
     let reason = if function {
         if s.reason == "null pointer" {
             "null pointer"
         } else {
             ENTRY_UNAVAILABLE
         }
+    } else if gated_null {
+        "null pointer"
     } else if s
         .reason
         .contains("cannot prove physical identity across overlay instances")
@@ -585,7 +591,7 @@ pub fn capture_skipped_out(s: &Skipped) -> SkippedOut {
         DISCOVERY_UNAVAILABLE
     };
     SkippedOut {
-        name: if function {
+        name: if function || gated_null {
             s.subject.clone()
         } else {
             DISCOVERY_SUBJECT.into()
@@ -1899,6 +1905,8 @@ mod tests {
                 version: (2, 40),
                 entries: 68,
                 source: "scan",
+                file_offset: None,
+                linkage: "heuristic",
             }],
             interfaces: 1,
             skipped: vec![],
@@ -2064,6 +2072,120 @@ mod tests {
         );
     }
 
+    /// Task 1.3 mislabel guard: an admitted scan table carries (file_offset,
+    /// entry count, linkage kind) from plan into evidence, and a heuristic
+    /// table with no linkage is named `unknown` — never the PKCS#11 label its
+    /// ordinals suggest. Only a linkage-or-manifest-authorized table keeps
+    /// `function_name` names.
+    #[test]
+    fn admitted_tables_carry_provenance_and_unlinked_tables_are_unknown() {
+        use crate::discovery::identity::ReconciledModule;
+        use crate::discovery::scan::{ScannedEntry, ScannedInterface, ScannedModule, ScannedTable};
+        use crate::process::{MountNamespaceId, ProcessViewId};
+        use p11scope_manifest::maps::{Device, ObjectKey};
+
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: 42,
+        };
+        let entry = |name: &'static str, file_offset: u64| ScannedEntry {
+            name,
+            object: key,
+            object_path: "/opt/p11.so".into(),
+            file_offset,
+        };
+        let object = crate::plan::TEST_PINNED_OBJECT;
+        let plan = crate::plan::build_from_reconciled_modules(&[ReconciledModule {
+            object,
+            entry_objects: vec![vec![object, object], vec![object]],
+            scanned: ScannedModule {
+                view: ProcessViewId(0),
+                mount_namespace: MountNamespaceId {
+                    device: 1,
+                    inode: 1,
+                },
+                key,
+                path: "/opt/p11.so".into(),
+                decoder_abi: Some(p11scope_manifest::elf::ElfAbi::Lp64),
+                exports: vec!["C_GetFunctionList".into()],
+                tables: vec![
+                    ScannedTable {
+                        version: (2, 40),
+                        walk: "full",
+                        entries: vec![entry("C_Sign", 0x10), entry("C_Verify", 0x18)],
+                        null_entries: vec!["C_GetFunctionStatus"],
+                        unpinned: vec![],
+                        address: 0x7000,
+                        file_offset: Some(0x100),
+                        live_return: false,
+                        manifest_supported: false,
+                    },
+                    ScannedTable {
+                        version: (2, 40),
+                        walk: "full",
+                        entries: vec![entry("C_Encrypt", 0x20)],
+                        null_entries: vec![],
+                        unpinned: vec![],
+                        address: 0x8000,
+                        file_offset: Some(0x200),
+                        live_return: false,
+                        manifest_supported: false,
+                    },
+                ],
+                interfaces: vec![ScannedInterface {
+                    index: 0,
+                    name_class: "exact_standard",
+                    name_lossy: None,
+                    name_private: Some(b"PKCS 11".to_vec()),
+                    flags: 0,
+                    table: Some(1),
+                }],
+            },
+        }]);
+
+        assert_eq!(plan.slots.len(), 3);
+        let names_of = |offset: u64| {
+            plan.slots
+                .iter()
+                .find(|slot| slot.file_offset == offset)
+                .unwrap()
+                .names
+                .clone()
+        };
+        assert_eq!(names_of(0x10), ["unknown"]);
+        assert_eq!(names_of(0x18), ["unknown"]);
+        assert_eq!(names_of(0x20), ["C_Encrypt"]);
+
+        let tables = &plan.modules[0].tables;
+        assert_eq!(tables.len(), 2);
+        assert_eq!(tables[0].file_offset, Some(0x100));
+        assert_eq!(tables[0].entries, 2);
+        assert_eq!(tables[0].linkage, "heuristic");
+        assert_eq!(tables[1].file_offset, Some(0x200));
+        assert_eq!(tables[1].entries, 1);
+        assert_eq!(tables[1].linkage, "interface");
+
+        // The null slot of the unlinked table stays a null fact without
+        // claiming which function was null.
+        assert!(
+            plan.skipped
+                .iter()
+                .any(|skip| skip.subject == "unknown" && skip.reason == "null pointer"),
+            "{:?}",
+            plan.skipped
+        );
+
+        // Provenance reaches rendered evidence as JSON keys, not comments.
+        let mut discovered = discovered_fixture();
+        discovered.tables = tables.clone();
+        let value = serde_json::to_value(&discovered).unwrap();
+        assert_eq!(value["tables"][0]["file_offset"], 0x100);
+        assert_eq!(value["tables"][0]["entries"], 2);
+        assert_eq!(value["tables"][0]["linkage"], "heuristic");
+        assert_eq!(value["tables"][1]["file_offset"], 0x200);
+        assert_eq!(value["tables"][1]["linkage"], "interface");
+    }
+
     #[test]
     fn scan_only_count_only_event_keeps_aggregate_output_and_no_semantic_payload() {
         use crate::discovery::identity::ReconciledModule;
@@ -2102,6 +2224,8 @@ mod tests {
                     unpinned: vec![],
                     address: 0x7000,
                     file_offset: Some(0),
+                    live_return: false,
+                    manifest_supported: false,
                 }],
                 interfaces: vec![],
             },
@@ -2232,9 +2356,11 @@ mod tests {
                 value if value == pkcs11_types::CkRv::PENDING.0 => "CKR_PENDING",
                 value => unreachable!("unexpected fixture RV {value:#x}"),
             };
+            // Task 1.3: the scan-only table is unlinked, so the trace names
+            // the slot `unknown` — the counts and RVs are retained unchanged.
             assert_eq!(
                 &line[15..],
-                format!(" pid 100 tid 1 C_OpenSession [semantics unverified] → {rv} 100ns"),
+                format!(" pid 100 tid 1 unknown [semantics unverified] → {rv} 100ns"),
                 "the generated trace must retain every aggregate RV without semantic payload"
             );
         }

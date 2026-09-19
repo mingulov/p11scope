@@ -570,7 +570,7 @@ pub struct ScannedEntry {
     pub file_offset: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ScannedTable {
     pub version: (u8, u8),
     /// "full" or "known_prefix" — the `WalkOutcome` label the manifest uses.
@@ -588,7 +588,39 @@ pub struct ScannedTable {
     /// Exact object-relative location of that version word. Runtime addresses
     /// are generation-local and never identify a table across remaps.
     pub file_offset: Option<u64>,
+    /// True only when a live provider export returned this table: the address
+    /// came from an observed `C_GetFunctionList`/`C_GetInterfaceList` return,
+    /// not from heuristic memory decode. Recorded at lowering time, when the
+    /// process generation brackets the address — never reconstructed later
+    /// from a retained address, which would be generation-local garbage.
+    pub live_return: bool,
+    /// True once a manifest structurally agreed with this table: a fallback
+    /// proof verified version, name claims, and exact targets, so the table
+    /// inherits the manifest's name authority. Derived per rebuild by the
+    /// engine, which re-binds every fallback proof from current inputs —
+    /// never decoded, never retained across input changes (a retired module
+    /// takes its marks with it).
+    pub manifest_supported: bool,
 }
+
+impl PartialEq for ScannedTable {
+    fn eq(&self, other: &Self) -> bool {
+        // Publication evidence is monotonic observation, not identity: a
+        // heuristic instance and a live-returned instance of one table are
+        // the same table, and `merge_scanned_module` unions their flags.
+        // Comparing flags here would duplicate one table into rival
+        // admissions whenever two sources decoded it.
+        self.version == other.version
+            && self.walk == other.walk
+            && self.entries == other.entries
+            && self.null_entries == other.null_entries
+            && self.unpinned == other.unpinned
+            && self.address == other.address
+            && self.file_offset == other.file_offset
+    }
+}
+
+impl Eq for ScannedTable {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScannedInterface {
@@ -702,11 +734,40 @@ pub(crate) fn table_evidence_score(
         linked: interfaces
             .iter()
             .any(|interface| interface.table == Some(index)),
-        live_return: live_return_addresses.contains(&table.address),
-        manifest: table
-            .file_offset
-            .is_some_and(|offset| manifest_offsets.contains(&offset)),
+        // Either the export lowering recorded a live return at decode time, or
+        // a caller-held generation-safe address matches this table instance.
+        live_return: table.live_return || live_return_addresses.contains(&table.address),
+        // Either a bound fallback proof recorded manifest agreement, or a
+        // caller-held manifest table offset matches this table instance.
+        manifest: table.manifest_supported
+            || table
+                .file_offset
+                .is_some_and(|offset| manifest_offsets.contains(&offset)),
         full_walk: table.walk == "full",
+    }
+}
+
+/// Whether a score authorizes presenting the table's ordinal names as PKCS#11
+/// names: some publication evidence (linkage, live return, manifest) said this
+/// table is the provider's — bare size/version plausibility never does. This
+/// is the single authorization predicate: admission bypass and name gating
+/// both read it, so a table cannot be published-but-unnamed or named-but-heuristic.
+pub(crate) fn table_name_authorized(score: &TableEvidenceScore) -> bool {
+    score.linked || score.live_return || score.manifest
+}
+
+/// Linkage kind for evidence: the strongest publication evidence behind the
+/// score, or `"heuristic"` when the table is bare decode with no linkage.
+/// Priority mirrors `TableEvidenceScore` field order.
+pub(crate) fn table_linkage(score: &TableEvidenceScore) -> &'static str {
+    if score.linked {
+        "interface"
+    } else if score.live_return {
+        "live_return"
+    } else if score.manifest {
+        "manifest"
+    } else {
+        "heuristic"
     }
 }
 
@@ -893,6 +954,12 @@ fn decode_candidate(
     let mut entries = Vec::with_capacity(non_null);
     let mut null_entries = Vec::with_capacity(decoded_entries - non_null);
     for ordinal in 0..field_count {
+        // Provisional ABI-positional label, not an attribution: presenting it
+        // as the provider's function name requires linkage-or-manifest
+        // authorization, applied where the table's evidence is complete (plan
+        // lowering), where an unauthorized table is named `unknown`. Internal
+        // same-ordinal matching (fallback proofs) keeps using these labels;
+        // only the presented names are gated.
         let name = function_name(ordinal).expect("validated shared field count");
         let value = read_function_pointer(bytes, layout, ordinal).expect("validated above");
         if value == 0 {
@@ -928,6 +995,11 @@ fn decode_candidate(
             unpinned: Vec::new(),
             address,
             file_offset,
+            // Heuristic memory decode: publication evidence (interface
+            // linkage, a live return, manifest agreement) is attached by the
+            // caller that owns it, never manufactured here.
+            live_return: false,
+            manifest_supported: false,
         },
         len,
     )))
@@ -3172,6 +3244,8 @@ mod tests {
                 unpinned: Vec::new(),
                 address: 0x7000,
                 file_offset: Some(0),
+                live_return: false,
+                manifest_supported: false,
             },
             ScannedTable {
                 version: (3, 2),
@@ -3181,6 +3255,8 @@ mod tests {
                 unpinned: Vec::new(),
                 address: 0x7000,
                 file_offset: Some(0),
+                live_return: false,
+                manifest_supported: false,
             },
         ];
         let mut snapshot = vec![0u8; INTERFACE_BYTES];
@@ -3219,6 +3295,8 @@ mod tests {
             unpinned: vec![],
             address: 0x7000,
             file_offset: Some(0),
+            live_return: false,
+            manifest_supported: false,
         };
         let mut snapshot = vec![0u8; INTERFACE_BYTES];
         snapshot[..WORD].copy_from_slice(&1u64.to_ne_bytes());
@@ -3263,6 +3341,8 @@ mod tests {
             unpinned: Vec::new(),
             address: 0x7000,
             file_offset: Some(0),
+            live_return: false,
+            manifest_supported: false,
         };
         let mut snapshot = vec![0u8; INTERFACE_BYTES];
         snapshot[..WORD].copy_from_slice(&1u64.to_ne_bytes());

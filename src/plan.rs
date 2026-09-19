@@ -21,7 +21,7 @@ use crate::discovery::identity::{PinnedObjectId, PinnedObjects, ReconciledModule
 pub use crate::discovery::scan::Skipped;
 use crate::discovery::scan::{
     ScannedInterface, ScannedTable, TableEvidenceScore, order_tables_by_evidence,
-    table_evidence_score,
+    table_evidence_score, table_linkage, table_name_authorized,
 };
 use p11scope_ebpf_common::{MAX_SLOTS, SlotSemantics};
 use p11scope_manifest::manifest::{
@@ -92,6 +92,21 @@ pub struct Slot {
     pub module_ids: Vec<ModuleId>,
 }
 
+/// The presented name for a slot no authorized source named: an unlinked
+/// heuristic table's ordinal labels are positional guesses, never attributions.
+/// Transparent in a slot's claim set — an authorized name always wins over it —
+/// never a rival claim and never semantic authority.
+pub(crate) const UNKNOWN_FUNCTION_NAME: &str = "unknown";
+
+/// `unknown` is the absence of a name claim: it never survives beside a real
+/// name. Applied everywhere slot names union (merge drops it from the claim
+/// map before collecting; extend and selection drop it from the vec).
+fn drop_transparent_unknown(names: &mut Vec<String>) {
+    if names.len() > 1 {
+        names.retain(|name| name != UNKNOWN_FUNCTION_NAME);
+    }
+}
+
 /// One function table a module published.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct TableSummary {
@@ -101,6 +116,16 @@ pub struct TableSummary {
     pub entries: usize,
     /// "scan" | "manifest".
     pub source: &'static str,
+    /// Exact object-relative location of the table's version word, when the
+    /// table was decoded from mapped bytes. `None` for manifest tables (the
+    /// manifest records entry offsets, not table locations) and for tables
+    /// decoded where no file owner could be proven.
+    pub file_offset: Option<u64>,
+    /// Strongest publication evidence behind this table: "interface" (named by
+    /// an interface triple), "live_return" (returned by a live provider
+    /// export), "manifest" (operator-authoritative), or "heuristic" (bare
+    /// decode with no linkage — its names are presented as `unknown`).
+    pub linkage: &'static str,
 }
 
 /// One module that contributed targets to this plan.
@@ -505,6 +530,9 @@ impl AttachPlan {
                 slot.names.extend(names.into_iter().map(str::to_string));
                 slot.names.sort();
                 slot.names.dedup();
+                // Selection names are interface-selected and authorized: they
+                // displace a prior `unknown`, never alias with it.
+                drop_transparent_unknown(&mut slot.names);
                 slot.aliased |= slot.names.len() >= 2;
                 continue;
             }
@@ -700,10 +728,17 @@ impl AttachPlan {
                     updated.names.extend(old.names);
                     updated.names.sort();
                     updated.names.dedup();
+                    drop_transparent_unknown(&mut updated.names);
                     updated.aliased |= old.aliased || updated.names.len() >= 2;
                     if old.descriptor_index == 0 || updated.descriptor_index == 0 {
                         updated.semantic_ambiguous = true;
                     }
+                } else if updated.names == [UNKNOWN_FUNCTION_NAME] {
+                    // A rebuild that learned nothing new about names must not
+                    // clobber the last authorized name (an export-derived
+                    // provisional seed, an earlier linkage) with `unknown`.
+                    updated.names.clone_from(&old.names);
+                    updated.aliased = old.aliased;
                 }
                 if old.descriptor_index != updated.descriptor_index {
                     if old.descriptor_index == 0 {
@@ -1049,12 +1084,19 @@ pub(crate) const TEST_PINNED_OBJECT: PinnedObjectId = PinnedObjectId(42);
 
 /// One attachable target as discovery reported it.
 struct Target<'a> {
+    /// The ordinal/operator label as decoded. Occurrence counting keys on this
+    /// verbatim label, so the mislabel guard must NOT rewrite it here — the
+    /// presented name is decided at slot building from `name_authorized`.
     name: &'a str,
     object: PinnedObjectId,
     object_path: &'a str,
     file_offset: u64,
     fork_safe: bool,
     semantic_authorized: bool,
+    /// Whether `name` may be presented as a PKCS#11 name: manifest targets are
+    /// operator-authoritative, scan targets need linkage-or-manifest
+    /// authorization for their table.
+    name_authorized: bool,
     /// Index into the scan piece's `tables` this target was decoded from.
     /// `None` for manifest targets, which are authoritative and never capped.
     table: Option<usize>,
@@ -1272,8 +1314,7 @@ fn merge(
             !positions.contains_key(&(key.object, key.file_offset))
                 && !existing_slots.contains_key(key)
         };
-        let is_published =
-            |score: &TableEvidenceScore| score.linked || score.live_return || score.manifest;
+        let is_published = table_name_authorized;
         // All-or-nothing refusal survives only here: when even the strongest
         // table exceeds the remaining global budget, the module — scan and
         // manifest parts alike — is refused whole. A manifest subset must not
@@ -1445,7 +1486,7 @@ fn merge(
                     slot.module_ids.push(id);
                 }
                 slot.name_authority
-                    .entry(target.name.to_string())
+                    .entry(presented_name(target.name_authorized, target.name).to_string())
                     .and_modify(|authorized| *authorized |= target.semantic_authorized)
                     .or_insert(target.semantic_authorized);
                 slot.fork_safe &= target.fork_safe;
@@ -1511,7 +1552,13 @@ fn merge(
     let slots: Vec<Slot> = building
         .into_iter()
         .enumerate()
-        .map(|(index, slot)| {
+        .map(|(index, mut slot)| {
+            // `unknown` is the absence of a name claim, not a rival one: an
+            // authorized name (manifest, linked table) always wins over it,
+            // so a corroborated slot is never "C_Sign|unknown (aliased)".
+            if slot.name_authority.len() > 1 {
+                slot.name_authority.remove(UNKNOWN_FUNCTION_NAME);
+            }
             let names: Vec<_> = slot.name_authority.keys().cloned().collect();
             let semantic_authorized = slot.name_authority.values().all(|value| *value);
             let (descriptor_index, semantic_ambiguous) = crate::kinds::descriptor_index(&names);
@@ -1636,6 +1683,18 @@ fn build_from_test_sources(scanned: &[ReconciledModule], manifests: &[Manifest])
     )
 }
 
+/// Mislabel guard: an unlinked heuristic table's ordinal label is a positional
+/// guess — its slots are named `unknown`, never e.g. `C_Sign`. Only
+/// linkage-or-manifest authorization presents PKCS#11 names. Admission is
+/// untouched: linkage is preferred, never gated.
+fn presented_name(authorized: bool, name: &str) -> &str {
+    if authorized {
+        name
+    } else {
+        UNKNOWN_FUNCTION_NAME
+    }
+}
+
 fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
     let scanned = &module.scanned;
     let mut tables = Vec::new();
@@ -1656,10 +1715,16 @@ fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
         // or `slots` vs `table_entries` stops reading as attached vs seen.
         let published = table.entries.len() + table.null_entries.len() + table.unpinned.len();
         entries_seen += published;
+        // Same score inputs `merge` admits by, so provenance, the heuristic
+        // cap, and name authorization can never disagree about one table.
+        let score = table_evidence_score(index, &scanned.tables, &scanned.interfaces, &[], &[]);
+        let authorized = table_name_authorized(&score);
         tables.push(TableSummary {
             version: table.version,
             entries: table.entries.len(),
             source: "scan",
+            file_offset: table.file_offset,
+            linkage: table_linkage(&score),
         });
         surfaces.push(SurfaceSummary {
             source: format!(
@@ -1691,14 +1756,20 @@ fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
                 file_offset: entry.file_offset,
                 fork_safe,
                 semantic_authorized: false,
+                name_authorized: authorized,
                 table: Some(index),
             },
         ));
         skipped.extend(table.null_entries.iter().map(|name| Skipped {
-            subject: (*name).to_string(),
+            subject: presented_name(authorized, name).to_string(),
             reason: "null pointer".into(),
         }));
-        skipped.extend(table.unpinned.iter().cloned());
+        // Unpinned subjects are the same ordinal labels (reconciliation records
+        // them verbatim), so the same gate applies; the reasons keep the facts.
+        skipped.extend(table.unpinned.iter().map(|skip| Skipped {
+            subject: presented_name(authorized, &skip.subject).to_string(),
+            reason: skip.reason.clone(),
+        }));
     }
     Discovered {
         object: module.object,
@@ -1804,6 +1875,8 @@ fn lower_manifest(
                 .map_or((0, 0), |version| (version.major, version.minor)),
             entries: surface.functions.len(),
             source: "manifest",
+            file_offset: None,
+            linkage: "manifest",
         });
         let fork_safe = matches!(
             &surface.source,
@@ -1863,6 +1936,7 @@ fn lower_manifest(
                         file_offset: *file_offset,
                         fork_safe,
                         semantic_authorized: true,
+                        name_authorized: true,
                     });
                 }
                 Resolution::NullPointer => skip("null pointer".into()),
@@ -2017,6 +2091,8 @@ mod tests {
                     unpinned: vec![],
                     address: 0x7000,
                     file_offset: Some(0),
+                    live_return: false,
+                    manifest_supported: false,
                 }],
                 interfaces: vec![],
             },
@@ -2098,12 +2174,14 @@ mod tests {
 
         assert_eq!(plan.slots.len(), 1);
         assert_eq!(plan.entries_seen, 1);
-        assert_eq!(plan.slots[0].names, ["C_Sign"]);
+        // Task 1.3 mislabel guard: the unlinked table's ordinal label is a
+        // positional guess, never presented as a PKCS#11 name.
+        assert_eq!(plan.slots[0].names, ["unknown"]);
         assert_eq!(plan.slots[0].semantics, SlotSemantics::COUNT_ONLY);
         assert!(!plan.slots[0].semantic_authorized);
         assert!(
-            !plan.slots[0].semantic_ambiguous,
-            "missing semantic authority is not alias or module ambiguity"
+            plan.slots[0].semantic_ambiguous,
+            "an unnamed slot cannot resolve one descriptor"
         );
     }
 
@@ -2129,8 +2207,44 @@ mod tests {
     }
 
     #[test]
-    fn manifest_cannot_authorize_a_different_name_at_the_same_target() {
+    fn unlinked_scan_label_is_not_a_rival_claim_against_the_manifest() {
+        // Task 1.3: an unlinked table's ordinal label carries no information,
+        // so it cannot dispute the manifest's operator-authoritative name —
+        // `unknown` is transparent, never a rival claim.
         let scanned = scanned_with(TEST_OBJECT, "/opt/p11.so", [0x10]);
+        let manifest = manifest_with(vec![resolved("C_Login", 0x10)]);
+
+        let plan = build_from_test_sources(
+            std::slice::from_ref(&scanned),
+            std::slice::from_ref(&manifest),
+        );
+
+        assert_eq!(plan.slots.len(), 1);
+        assert_eq!(plan.slots[0].names, ["C_Login"]);
+        assert!(plan.slots[0].semantic_authorized);
+        assert_eq!(
+            plan.slots[0].semantics,
+            crate::kinds::descriptor("C_Login").unwrap()
+        );
+        assert!(!plan.slots[0].semantic_ambiguous);
+    }
+
+    #[test]
+    fn linked_scan_label_disputing_the_manifest_stays_count_only() {
+        // The safety property the unlinked case retires survives where it has
+        // teeth: two AUTHORIZED names disagreeing about one target stay
+        // unresolvable, counted but never attributed.
+        use crate::discovery::scan::ScannedInterface;
+
+        let mut scanned = scanned_with(TEST_OBJECT, "/opt/p11.so", [0x10]);
+        scanned.scanned.interfaces.push(ScannedInterface {
+            index: 0,
+            name_class: "exact_standard",
+            name_lossy: None,
+            name_private: Some(b"PKCS 11".to_vec()),
+            flags: 0,
+            table: Some(0),
+        });
         let manifest = manifest_with(vec![resolved("C_Login", 0x10)]);
 
         let plan = build_from_test_sources(
@@ -2171,7 +2285,10 @@ mod tests {
             .unwrap();
         assert_eq!(scan_slot.semantics, SlotSemantics::COUNT_ONLY);
         assert!(!scan_slot.semantic_authorized);
-        assert!(!scan_slot.semantic_ambiguous);
+        // Task 1.3: the unlinked scan slot is unnamed, and an unnamed slot
+        // cannot resolve one descriptor.
+        assert_eq!(scan_slot.names, ["unknown"]);
+        assert!(scan_slot.semantic_ambiguous);
         let manifest_slot = plan
             .slots
             .iter()
@@ -3041,6 +3158,7 @@ mod tests {
                 file_offset,
                 fork_safe: false,
                 semantic_authorized: true,
+                name_authorized: true,
                 table: None,
             })
             .collect();

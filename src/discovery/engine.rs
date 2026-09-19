@@ -19,7 +19,8 @@ use crate::discovery::scan::{
     CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedEntry, ScannedInterface, ScannedModule,
     ScannedTable, Skipped, TableIdentity, decode_exact_table, exact_table_addresses,
     exact_table_bytes, index_maps_or_refuse, read_elf_snapshot, read_maps_or_refuse,
-    scan_process_view, scan_process_view_without_memory, spans_for, target_layout,
+    scan_process_view, scan_process_view_without_memory, spans_for, table_evidence_score,
+    table_linkage, target_layout,
 };
 use crate::manifest_input::{read_manifest, selection_surface_usable, validate_structure};
 use crate::process::{self, OriginalGenerationState, ProcessView, ProcessViewId};
@@ -1491,6 +1492,13 @@ impl CaptureFacts {
                 }
                 let table_fact = (table.version, table.entries.len());
                 let table_occurrence = tables.entry(table_fact).or_insert(0usize);
+                let table_score = table_evidence_score(
+                    table_index,
+                    &module.scanned.tables,
+                    &module.scanned.interfaces,
+                    &[],
+                    &[],
+                );
                 history
                     .tables
                     .entry(TableOccurrence::Scan {
@@ -1503,6 +1511,8 @@ impl CaptureFacts {
                         version: table_fact.0,
                         entries: table_fact.1,
                         source: "scan",
+                        file_offset: table.file_offset,
+                        linkage: table_linkage(&table_score),
                     });
                 *table_occurrence += 1;
                 *surface_occurrence += 1;
@@ -1640,6 +1650,8 @@ impl CaptureFacts {
                             .map_or((0, 0), |version| (version.major, version.minor)),
                         entries: surface.functions.len(),
                         source: "manifest",
+                        file_offset: None,
+                        linkage: "manifest",
                     });
                 for (function_index, function) in surface.functions.iter().enumerate() {
                     let key = DecodedOccurrence::ManifestFunction {
@@ -4815,7 +4827,7 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
         }
     }
 
-    let (modules, differed) = bind_scanned_modules(&scan_modules, &mut pinned);
+    let (mut modules, differed) = bind_scanned_modules(&scan_modules, &mut pinned);
     attribution::note_all(&differed);
     counters.object_skips.extend(differed);
     let corroborated =
@@ -4830,6 +4842,26 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
                 pending.object
             );
         };
+        // The manifest structurally agreed with these scan tables — the proof
+        // verified version, name claims, and exact targets — so they inherit
+        // the manifest's name authority ("or-manifest" authorization). Without
+        // this, the mislabel guard would present the replacement's ordinal
+        // labels as `unknown` and the proof could never complete in the plan.
+        for module in modules.iter_mut().filter(|module| {
+            module.scanned.view == pending.candidate.module_view
+                && module.scanned.key == pending.candidate.module_key
+                && module.scanned.path == pending.candidate.module_path
+        }) {
+            for table in module.scanned.tables.iter_mut() {
+                if proof
+                    .tables
+                    .iter()
+                    .any(|bound| bound.address == table.address)
+                {
+                    table.manifest_supported = true;
+                }
+            }
+        }
         if !replacements.insert(replacement) {
             bail!(
                 "more than one stale manifest object maps to the same canonical scanned replacement"
@@ -5141,6 +5173,12 @@ fn lower_export_record(
             unpinned: Vec::new(),
             address: record.table_ptr,
             file_offset: Some(table_file_offset),
+            // The provider returned this table through a live export: its
+            // ordinal names carry publication evidence, unlike heuristic decode.
+            live_return: true,
+            // Manifest agreement is derived per rebuild by fallback binding,
+            // never at lowering time.
+            manifest_supported: false,
         }],
         interfaces,
     };
@@ -5179,10 +5217,19 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
     let mut table_indices = Vec::new();
     for table in incoming.tables.drain(..) {
         let index = existing.tables.iter().position(|known| *known == table);
-        table_indices.push(index.unwrap_or_else(|| {
-            existing.tables.push(table);
-            existing.tables.len() - 1
-        }));
+        table_indices.push(match index {
+            Some(index) => {
+                // Same table seen twice: publication evidence unions —
+                // whichever instance observed it, the table was observed.
+                existing.tables[index].live_return |= table.live_return;
+                existing.tables[index].manifest_supported |= table.manifest_supported;
+                index
+            }
+            None => {
+                existing.tables.push(table);
+                existing.tables.len() - 1
+            }
+        });
     }
     for mut interface in incoming.interfaces.drain(..) {
         interface.table = interface

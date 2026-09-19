@@ -860,6 +860,8 @@ fn retiring_one_shared_namespace_view_keeps_only_the_stable_views_claims() {
             unpinned: vec![],
             address: 0x1000,
             file_offset: Some(0),
+            live_return: false,
+            manifest_supported: false,
         }],
         interfaces: vec![],
     };
@@ -898,7 +900,9 @@ fn retiring_one_shared_namespace_view_keeps_only_the_stable_views_claims() {
     assert!(pinned.attach_path_for(stale_target).is_err());
     assert!(pinned.attach_path_for(stable_target).is_ok());
     assert_eq!(plan.slots.len(), 1, "the stable view remains eligible");
-    assert_eq!(plan.slots[0].names, ["C_Verify"]);
+    // Task 1.3: the stable view's table is unlinked, so its ordinal label is
+    // gated to `unknown` — eligibility (the point of this test) is unchanged.
+    assert_eq!(plan.slots[0].names, ["unknown"]);
     assert_eq!(plan.slots[0].object, stable_target);
 }
 
@@ -945,6 +949,8 @@ fn retiring_a_rejected_provider_view_removes_its_unplanned_pins_and_raw_aliases(
             unpinned: vec![],
             address: 0x1000,
             file_offset: Some(0),
+            live_return: false,
+            manifest_supported: false,
         }],
         interfaces: vec![],
     };

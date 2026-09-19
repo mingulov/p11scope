@@ -1327,10 +1327,18 @@ def validate_proxy_capacity_fallback(document, module_path=None):
     require(discovery[0]["corroboration"] == ["single_source"], discovery)
     require(discovery[0]["interfaces"] == 0, discovery)
     require(discovery[0]["skipped"] == [], discovery)
+    tables = discovery[0]["tables"]
+    require(len(tables) == 1, discovery)
     require(
-        discovery[0]["tables"] == [{"version": [2, 40], "entries": 68, "source": "scan"}],
+        {key: tables[0][key] for key in ("version", "entries", "source")}
+        == {"version": [2, 40], "entries": 68, "source": "scan"},
         discovery,
     )
+    # Task 1.3 provenance: the admitted table carries its version-word file
+    # offset and linkage kind. Zero interfaces means heuristic decode, so its
+    # slots are named `unknown`, never ordinal PKCS#11 labels.
+    require(tables[0]["linkage"] == "heuristic", discovery)
+    require(u64(tables[0]["file_offset"]), discovery)
     objects = discovery[0]["objects"]
     require(len(objects) == 1, objects)
     target = objects[0]
@@ -1884,7 +1892,13 @@ def discovery_fixture(sources=("scan",)):
             corroborated=corroborated,
             corroboration=[outcome],
             tables=[
-                {"version": [2, 40], "entries": 68, "source": source}
+                {
+                    "version": [2, 40],
+                    "entries": 68,
+                    "source": source,
+                    "file_offset": 0x1000 if source == "scan" else None,
+                    "linkage": "heuristic" if source == "scan" else "manifest",
+                }
                 for source in sources
             ],
             interfaces=0,

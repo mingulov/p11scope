@@ -46,6 +46,8 @@ fn module(
             unpinned: vec![],
             address: 0x1000 + inode,
             file_offset: Some(0),
+            live_return: false,
+            manifest_supported: false,
         }],
         interfaces: vec![],
     }
@@ -79,7 +81,28 @@ fn build_from_modules(modules: &[p11scope::discovery::scan::ScannedModule]) -> A
 fn build_authorized_from_modules(
     modules: &[p11scope::discovery::scan::ScannedModule],
 ) -> AttachPlan {
-    let mut plan = build_from_modules(modules);
+    // Task 1.3: the semantic inputs below need authorized names, and only
+    // linkage-or-manifest authorization presents PKCS#11 names — so model
+    // published tables. Each fixture module carries exactly one table.
+    let linked: Vec<_> = modules
+        .iter()
+        .cloned()
+        .map(|mut scanned| {
+            assert_eq!(scanned.tables.len(), 1);
+            scanned
+                .interfaces
+                .push(p11scope::discovery::scan::ScannedInterface {
+                    index: 0,
+                    name_class: "exact_standard",
+                    name_lossy: None,
+                    name_private: Some(b"PKCS 11".to_vec()),
+                    flags: 0,
+                    table: Some(0),
+                });
+            scanned
+        })
+        .collect();
+    let mut plan = build_from_modules(&linked);
     for slot in &mut plan.slots {
         slot.semantic_authorized = true;
         let (descriptor_index, _) = p11scope::kinds::descriptor_index(&slot.names);
@@ -155,12 +178,14 @@ fn one_exact_pinned_object_keeps_every_views_nonempty_target_union() {
         2,
         "neither process view's target set is first-wins"
     );
+    // Task 1.3: the views' tables are unlinked, so their ordinal labels are
+    // gated to `unknown` — the union (the point of this test) is unchanged.
     assert_eq!(
         plan.slots
             .iter()
             .flat_map(|slot| &slot.names)
             .collect::<Vec<_>>(),
-        vec![&"C_Initialize".to_string(), &"C_Sign".to_string()]
+        vec![&"unknown".to_string(), &"unknown".to_string()]
     );
 }
 

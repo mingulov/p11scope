@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Actual container-driver admission and custody tests using native fake tools."""
 
 import hashlib

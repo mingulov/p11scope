@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Initial and incremental provider discovery ownership.
 
 use crate::attach::{

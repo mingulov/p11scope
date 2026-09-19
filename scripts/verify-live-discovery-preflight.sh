@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Task 9 production live-discovery preflight gate.
 #
 # This script owns environment setup and cleanup only: it creates the one

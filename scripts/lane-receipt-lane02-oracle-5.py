@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Task 4 lane 02 workload-mapping oracle: classify the harness provider mapping state as invalid, ready, or pending. Oracle extracted from scripts/verify-receipt-lane02.sh (lines 162-181)."""
 import argparse
 import sys

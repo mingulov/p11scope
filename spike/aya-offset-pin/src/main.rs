@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Attach the `pin` uprobe at a caller-supplied offset, run the target once,
 //! print the hit count. Exit 0 iff hits == expected. Exit 3 on attach error.
 

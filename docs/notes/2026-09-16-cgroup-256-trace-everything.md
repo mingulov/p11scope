@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Cgroup 256 discovery limit + trace-everything use case — research record
 
 Date: 2026-09-16. Status: research + measurements complete, implementation

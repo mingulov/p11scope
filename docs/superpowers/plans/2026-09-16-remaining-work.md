@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Remaining work plan — green suite, signal-exit message, Kryoptic churn (2026-09-16)
 
 ## Goal

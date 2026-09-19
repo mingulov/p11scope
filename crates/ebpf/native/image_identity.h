@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef P11SCOPE_IMAGE_IDENTITY_H
 #define P11SCOPE_IMAGE_IDENTITY_H
 

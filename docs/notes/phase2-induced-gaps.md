@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Phase 2 — Gate G2 induced-gap verification
 
 `scripts/verify-induced-gaps.sh` proves the tool degrades **honestly**:

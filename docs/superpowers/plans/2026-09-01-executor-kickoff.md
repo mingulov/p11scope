@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Executor kickoff — p11scope v0.1.0 release program
 
 Hand this file to any agent executing the release program. It is the entry

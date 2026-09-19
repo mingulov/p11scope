@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Slice 1b-2 fixed 500 ms owned-pause amendment
 
 **Date:** 2026-08-27

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* spike/harness.c — deterministic PKCS#11 workload with exact call counts.
  * Calls go through the module's own CK_FUNCTION_LIST (indirect calls), like a
  * real application. Digest + random only: no token objects, no login, no PIN.

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Fixed native finalizer fixture mutations, applied after actual capture."""
 
 import json

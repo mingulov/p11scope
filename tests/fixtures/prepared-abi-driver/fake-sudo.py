@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Record the harmless ABI resource sentinel and refuse without executing it."""
 
 from pathlib import Path

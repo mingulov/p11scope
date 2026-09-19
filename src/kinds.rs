@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Function name → semantic kind. Drives which arguments the BPF programs
 //! may read. Anything unrecognized is OTHER (no argument capture), and an
 //! aliased slot whose names disagree degrades to OTHER: reading the wrong

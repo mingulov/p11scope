@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Task 1 report: journey trials (2026-09-17 usability pass)
 
 Plan: `docs/superpowers/plans/2026-09-17-usability-pass.md`, Task 1.

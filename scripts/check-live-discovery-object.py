@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Source-bound static gate for the four production discovery BPF objects."""
 
 import argparse

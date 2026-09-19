@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Data-driven Cargo metadata stand-in for native evidence-helper tests."""
 
 import json

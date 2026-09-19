@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Phase 5 Task 3: measured overhead of each capture mode against
 # unobserved SoftHSM2, deliberately the worst case for this measurement
 # — its C_GenerateRandom calls are microsecond-scale software crypto, so

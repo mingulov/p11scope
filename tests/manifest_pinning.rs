@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 use p11scope::discovery::scan::{CaptureWorkBudget, ScanLimits};
 use p11scope::manifest_input::{MAX_MANIFEST_BYTES, read_manifest};
 use p11scope::process::{MountNamespaceId, ProcessView, ProcessViewId};

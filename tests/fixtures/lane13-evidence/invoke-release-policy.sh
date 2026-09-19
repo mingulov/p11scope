@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 set -eu
 
 [ "$#" -eq 6 ] || { echo "usage: invoke-release-policy.sh FUNCTION WORK FACTS CALLS URL NAME" >&2; exit 64; }

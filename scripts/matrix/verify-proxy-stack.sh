@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Two PKCS#11 providers in one process: p11-kit's proxy module, with SoftHSM2
 # configured behind it. No manifest — the memory scan finds both, and the point
 # of the lane is that one capture keeps them apart.

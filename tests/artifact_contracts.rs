@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -9413,4 +9414,530 @@ fn aggregate_policy_returns_before_both_events_reserves() {
         check < emit,
         "native fork path must check the allow gate before emitting"
     );
+}
+
+// ---- License meta-test (relicense Task 4) ----
+//
+// In-scope: every tracked *.rs/*.py/*.sh/*.md (Task 2) plus every tracked
+// non-fixture *.c/*.h (Task 4 folded scope). Each in-scope file must carry
+// its exact SPDX header line:
+//
+// - Rust: `//! SPDX-License-Identifier: GPL-3.0-or-later` first line, except
+//   `crates/ebpf/src/main.rs` which carries `GPL-2.0-only`.
+// - Python/Shell: `# SPDX-License-Identifier: GPL-3.0-or-later` after the
+//   shebang, else first line.
+// - Markdown: `<!-- SPDX-License-Identifier: GPL-3.0-or-later -->` first line.
+// - C/C header: `/* SPDX-License-Identifier: ... */` first line,
+//   `GPL-2.0-only` under `crates/ebpf/native/` (matches the crates/ebpf
+//   manifest) and in `scripts/native/dump-task-storage.bpf.c` (Task 2
+//   ruling), `GPL-3.0-or-later` elsewhere.
+//
+// Documented exemptions (each pinned below so it cannot silently rot):
+// (a) `CLAUDE.md` is a symlink to the headered `AGENTS.md`;
+// (b) the relicense plan quotes the header formats verbatim, so a
+//     first-line header would be ambiguous (Task 2 idempotency skip);
+// (c) the 24 C fixtures below are test INPUT (parsed/copied/compiled by
+//     tests at runtime) and stay headerless;
+// (d) `preserved/` and `third-party/src/` hold zero tracked files;
+// (e) three historical plan docs still name the pre-relicense texts.
+
+// The relicense plan (exemption (b)): quotes the Rust, Python/Shell, and
+// Markdown header formats verbatim (plan lines 18-21; Python and Shell
+// share one `#` spelling, BPF reuse is prose, not a fourth literal).
+const LICENSE_PLAN_EXEMPTION: &str = "docs/superpowers/plans/2026-09-17-relicense-gpl.md";
+
+// Test-input C fixtures (exemption (c)): each is consumed by the test named
+// in the comment (location rule: tests/fixtures, scripts/fixtures,
+// crates/discover/tests/fixture stay exempt).
+const LICENSE_C_FIXTURES: &[&str] = &[
+    // crates/discover/tests/fixture/* (compiled/linked by the discover tests)
+    "crates/discover/tests/fixture/fd_env_canary.c", // crates/discover/tests/cli.rs
+    "crates/discover/tests/fixture/helper.c",        // crates/discover/tests/fixture_provider.rs
+    "crates/discover/tests/fixture/lazy_backend.c",  // crates/discover/tests/lazy_dependency.rs
+    "crates/discover/tests/fixture/lazy_wrapper.c",  // crates/discover/tests/lazy_dependency.rs
+    "crates/discover/tests/fixture/provider.c",      // crates/discover/tests/fixture_provider.rs
+    "crates/discover/tests/fixture/version_matrix.c", // crates/discover/tests/version_matrix.rs
+    // scripts/fixtures/* (compiled/run by canary and gap suites)
+    "scripts/fixtures/alias_workload.c", // scripts/verify-induced-gaps.sh
+    "scripts/fixtures/blocking_provider.c", // scripts/verify-induced-gaps.sh
+    "scripts/fixtures/blocking_workload.c", // scripts/verify-induced-gaps.sh
+    "scripts/fixtures/canary_workload.c", // tests/python/test_canary_workload.py
+    "scripts/fixtures/hammer.c", // scripts/verify-receipt-lane16.sh (+verify-induced-gaps.sh:727, bench-overhead.sh:52)
+    "scripts/fixtures/privacy-stack-workload.c", // scripts/check-canary-evidence.py
+    "scripts/fixtures/receipt-fcntl-trace.c", // tests/receipt_build_subjects.rs
+    // tests/fixtures/* (copied/compiled/parsed per test at runtime)
+    "tests/fixtures/bpf-map-defs/mixed.c", // tests/python/test_bpf_map_defs.py (read as text)
+    "tests/fixtures/ia32-lifecycle/capability-xattr.c", // tests/python/test_ia32_lifecycle.py
+    "tests/fixtures/ia32-lifecycle/guard-target.c", // tests/python/test_ia32_lifecycle.py
+    "tests/fixtures/image-identity/helper_tests.c", // tests/artifact_contracts.rs (image_identity_native_control_*)
+    "tests/fixtures/lane13-evidence/port-forward.c", // tests/python/test_lane13_evidence.py
+    "tests/fixtures/live-discovery-driver.c",       // tests/discovery_scan.rs
+    "tests/fixtures/live-discovery-provider.c", // tests/python/test_live_freeze_prepared_dependencies.py
+    "tests/fixtures/root-affiliation/birth_hook_tests.c", // tests/python/test_root_affiliation.py
+    "tests/fixtures/root-affiliation/helper_tests.c", // tests/python/test_root_affiliation.py
+    "tests/fixtures/root-fence-runtime.c",      // orphan fixture (no consumer); exempt by location
+    "tests/fixtures/task-owner/helper_tests.c", // tests/task_owner_contracts.rs (also included by root-affiliation/helper_tests.c)
+];
+
+// Historical plan prose that still names the pre-relicense texts
+// (exemption (e), Task 1 ruling: history is not rewritten).
+const LICENSE_LEGACY_TEXT_EXEMPTIONS: &[&str] = &[
+    "docs/superpowers/plans/2026-08-11-phase1a-discover.md",
+    "docs/superpowers/plans/2026-08-11-phase1b-attach-engine.md",
+    "docs/superpowers/plans/2026-09-17-relicense-gpl.md",
+];
+
+// Pre-relicense markers. Spelled via concat! so this very file (which the
+// scan below reads) never contains them contiguously.
+const LICENSE_REMOVED_TEXTS: &[&str] = &[concat!("LICENSE-", "MIT"), concat!("LICENSE-", "APACHE")];
+const LICENSE_LEGACY_MARKERS: &[&str] = &[
+    concat!("LICENSE-", "MIT"),
+    concat!("LICENSE-", "APACHE"),
+    concat!("MIT OR ", "Apache"),
+];
+
+const LICENSE_MANIFESTS: &[(&str, &str)] = &[
+    ("Cargo.toml", "GPL-3.0-or-later"),
+    ("crates/discover/Cargo.toml", "GPL-3.0-or-later"),
+    ("crates/ebpf-common/Cargo.toml", "GPL-3.0-or-later"),
+    ("crates/ebpf/Cargo.toml", "GPL-2.0-only"),
+    ("crates/manifest/Cargo.toml", "GPL-3.0-or-later"),
+];
+
+fn license_expected_header(path: &str) -> Option<&'static str> {
+    if path == "CLAUDE.md" || path == LICENSE_PLAN_EXEMPTION {
+        return None;
+    }
+    if path.ends_with(".c") || path.ends_with(".h") {
+        if LICENSE_C_FIXTURES.contains(&path) {
+            return None;
+        }
+        if path.starts_with("crates/ebpf/native/")
+            || path == "scripts/native/dump-task-storage.bpf.c"
+        {
+            return Some("/* SPDX-License-Identifier: GPL-2.0-only */");
+        }
+        return Some("/* SPDX-License-Identifier: GPL-3.0-or-later */");
+    }
+    if path.ends_with(".rs") {
+        if path == "crates/ebpf/src/main.rs" {
+            return Some("//! SPDX-License-Identifier: GPL-2.0-only");
+        }
+        return Some("//! SPDX-License-Identifier: GPL-3.0-or-later");
+    }
+    if path.ends_with(".py") || path.ends_with(".sh") {
+        return Some("# SPDX-License-Identifier: GPL-3.0-or-later");
+    }
+    if path.ends_with(".md") {
+        return Some("<!-- SPDX-License-Identifier: GPL-3.0-or-later -->");
+    }
+    None
+}
+
+// The header violation for one file, or None when it carries its expected
+// header (or is out of scope / exempt). Bytes-based: placement is decided
+// on the first line (second after a shebang), tolerating the repo's two
+// BOM-prefixed .md files and stray carriage returns, exactly as the
+// Task 2 insertion script left them.
+fn license_header_error(path: &str, content: &[u8]) -> Option<String> {
+    let expected = license_expected_header(path)?;
+    let mut lines = content.split(|byte| *byte == b'\n');
+    let mut first = lines.next().unwrap_or(b"");
+    if first.starts_with(b"\xef\xbb\xbf") {
+        first = &first[3..];
+    }
+    let mut line_no = 1;
+    if (path.ends_with(".py") || path.ends_with(".sh")) && first.starts_with(b"#!") {
+        first = lines.next().unwrap_or(b"");
+        line_no = 2;
+    }
+    if first.last() == Some(&b'\r') {
+        first = &first[..first.len() - 1];
+    }
+    if first == expected.as_bytes() {
+        return None;
+    }
+    Some(format!("line {line_no} must be exactly `{expected}`"))
+}
+
+// Applies `license_header_error` to every `path` under `root`, skipping
+// symlinks (pinned separately on the tree; fixtures have none).
+fn license_check_files(root: &std::path::Path, paths: &[String]) -> Vec<String> {
+    let mut violations = Vec::new();
+    for path in paths {
+        let full = root.join(path);
+        if full
+            .symlink_metadata()
+            .is_ok_and(|meta| meta.file_type().is_symlink())
+        {
+            continue;
+        }
+        match fs::read(&full) {
+            Ok(content) => {
+                if let Some(reason) = license_header_error(path, &content) {
+                    violations.push(format!("{path}: {reason}"));
+                }
+            }
+            Err(error) => violations.push(format!("{path}: unreadable: {error}")),
+        }
+    }
+    violations
+}
+
+fn license_tracked_files() -> Vec<String> {
+    let output = Command::new("git")
+        .args(["ls-files", "-z"])
+        .output()
+        .expect("git ls-files must run from the package root");
+    assert!(
+        output.status.success(),
+        "git ls-files failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|chunk| !chunk.is_empty())
+        .map(|chunk| String::from_utf8(chunk.to_vec()).expect("tracked paths must be UTF-8"))
+        .collect()
+}
+
+fn license_legal_surface_errors(root: &std::path::Path, tracked: &[String]) -> Vec<String> {
+    let mut errors = Vec::new();
+    let is_tree = root.as_os_str() == ".";
+    for (name, marker) in [
+        ("LICENSE", "Version 3, 29 June 2007"),
+        ("LICENSES/GPL-2.0-only.txt", "Version 2, June 1991"),
+    ] {
+        match fs::read_to_string(root.join(name)) {
+            Ok(text) if text.contains(marker) => {}
+            Ok(_) => errors.push(format!("{name} lacks its canonical version marker")),
+            Err(error) => errors.push(format!("{name} unreadable: {error}")),
+        }
+        if is_tree && !tracked.iter().any(|path| path == name) {
+            errors.push(format!("{name} is not tracked"));
+        }
+    }
+    for removed in LICENSE_REMOVED_TEXTS {
+        if tracked.iter().any(|path| path == removed) {
+            errors.push(format!("{removed} is still tracked"));
+        }
+        if root.join(removed).exists() {
+            errors.push(format!("{removed} still exists on disk"));
+        }
+    }
+    for (manifest, expected) in LICENSE_MANIFESTS {
+        match fs::read_to_string(root.join(manifest)) {
+            Ok(text) => {
+                let licenses: Vec<&str> = text
+                    .lines()
+                    .filter_map(|line| {
+                        let (key, value) = line.split_once('=')?;
+                        (key.trim() == "license").then_some(value.trim())
+                    })
+                    .collect();
+                let want = format!("\"{expected}\"");
+                if licenses.as_slice() != [want.as_str()] {
+                    errors.push(format!(
+                        "{manifest} must declare exactly `license = \"{expected}\"`"
+                    ));
+                }
+            }
+            Err(error) => errors.push(format!("{manifest} unreadable: {error}")),
+        }
+    }
+    for path in tracked {
+        if LICENSE_LEGACY_TEXT_EXEMPTIONS.contains(&path.as_str()) {
+            continue;
+        }
+        let full = root.join(path);
+        if full
+            .symlink_metadata()
+            .is_ok_and(|meta| meta.file_type().is_symlink())
+        {
+            continue;
+        }
+        match fs::read(&full) {
+            Ok(content) => {
+                let text = String::from_utf8_lossy(&content);
+                if LICENSE_LEGACY_MARKERS
+                    .iter()
+                    .any(|marker| text.contains(marker))
+                {
+                    errors.push(format!("{path} names a pre-relicense text"));
+                }
+            }
+            Err(error) => errors.push(format!("{path} unreadable: {error}")),
+        }
+    }
+    errors
+}
+
+#[test]
+fn license_headers_cover_every_tracked_source_file() {
+    let tracked = license_tracked_files();
+    let violations = license_check_files(std::path::Path::new("."), &tracked);
+    assert!(
+        violations.is_empty(),
+        "files missing their exact SPDX header:\n{}",
+        violations.join("\n")
+    );
+
+    // Pin exemption (a): CLAUDE.md is the only in-scope symlink, and it
+    // stays a symlink to the headered AGENTS.md.
+    let symlinks: Vec<&str> = tracked
+        .iter()
+        .filter(|path| {
+            [".rs", ".py", ".sh", ".md", ".c", ".h"]
+                .iter()
+                .any(|ext| path.ends_with(ext))
+                && std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+        })
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        symlinks,
+        ["CLAUDE.md"],
+        "only CLAUDE.md may be an in-scope symlink"
+    );
+    assert_eq!(
+        std::fs::read_link("CLAUDE.md").expect("read CLAUDE.md link"),
+        std::path::PathBuf::from("AGENTS.md"),
+        "CLAUDE.md must keep pointing at the headered AGENTS.md"
+    );
+
+    // Pin exemption (b): the plan still has no first-line header (that is
+    // why it is exempt) and still quotes the formats (that is why a
+    // first-line header would be ambiguous).
+    let plan = read(LICENSE_PLAN_EXEMPTION);
+    assert_ne!(
+        plan.lines().next().unwrap_or(""),
+        "<!-- SPDX-License-Identifier: GPL-3.0-or-later -->",
+        "the plan gained a first-line header; drop its exemption"
+    );
+    for quoted in [
+        "//! SPDX-License-Identifier: GPL-3.0-or-later",
+        "# SPDX-License-Identifier: GPL-3.0-or-later",
+        "<!-- SPDX-License-Identifier: GPL-3.0-or-later -->",
+    ] {
+        assert!(
+            plan.contains(quoted),
+            "the plan no longer quotes {quoted}; re-check its exemption"
+        );
+    }
+
+    // Pin exemption (c): every C fixture is still tracked (stale entries
+    // fail) and still headerless (a headed fixture moves in scope).
+    for fixture in LICENSE_C_FIXTURES {
+        assert!(
+            tracked.iter().any(|path| path == fixture),
+            "exempt fixture {fixture} is no longer tracked; drop its exemption"
+        );
+        let first = read(fixture).lines().next().unwrap_or("").to_string();
+        assert!(
+            !first.contains("SPDX-License-Identifier"),
+            "exempt fixture {fixture} gained a header; move it in scope"
+        );
+    }
+
+    // Pin exemption (d): the empty dirs stay empty of tracked files.
+    for empty in ["preserved/", "third-party/src/"] {
+        assert!(
+            tracked.iter().all(|path| !path.starts_with(empty)),
+            "{empty} gained tracked files; extend the in-scope definition"
+        );
+    }
+}
+
+#[test]
+fn license_legal_surface_matches_policy() {
+    let tracked = license_tracked_files();
+    let errors = license_legal_surface_errors(std::path::Path::new("."), &tracked);
+    assert!(
+        errors.is_empty(),
+        "legal-surface violations:\n{}",
+        errors.join("\n")
+    );
+
+    // Pin exemption (e): each historical plan still needs its exemption.
+    for exempt in LICENSE_LEGACY_TEXT_EXEMPTIONS {
+        assert!(
+            tracked.iter().any(|path| path == exempt),
+            "exempt plan {exempt} is no longer tracked; drop its exemption"
+        );
+        let text = read(exempt);
+        assert!(
+            LICENSE_LEGACY_MARKERS
+                .iter()
+                .any(|marker| text.contains(marker)),
+            "exempt plan {exempt} no longer names a pre-relicense text; drop its exemption"
+        );
+    }
+}
+
+fn license_write_fixture(root: &std::path::Path, path: &str, content: &[u8]) {
+    let full = root.join(path);
+    if let Some(parent) = full.parent() {
+        fs::create_dir_all(parent).expect("create fixture parent");
+    }
+    fs::write(&full, content).expect("write fixture");
+}
+
+#[test]
+fn license_header_checker_rejects_bad_fixtures() {
+    let good_root = tempfile::TempDir::new().expect("tempdir");
+    let good: &[(&str, &[u8])] = &[
+        (
+            "good.rs",
+            b"//! SPDX-License-Identifier: GPL-3.0-or-later\nfn f() {}\n",
+        ),
+        (
+            "crates/ebpf/src/main.rs",
+            b"//! SPDX-License-Identifier: GPL-2.0-only\n#![no_std]\n",
+        ),
+        (
+            "shebang.py",
+            b"#!/usr/bin/env python3\n# SPDX-License-Identifier: GPL-3.0-or-later\n",
+        ),
+        ("plain.py", b"# SPDX-License-Identifier: GPL-3.0-or-later\n"),
+        (
+            "script.sh",
+            b"#!/bin/sh\n# SPDX-License-Identifier: GPL-3.0-or-later\n",
+        ),
+        (
+            "doc.md",
+            b"<!-- SPDX-License-Identifier: GPL-3.0-or-later -->\n",
+        ),
+        (
+            "bom.md",
+            b"\xef\xbb\xbf<!-- SPDX-License-Identifier: GPL-3.0-or-later -->\n",
+        ),
+        (
+            "crlf.md",
+            b"<!-- SPDX-License-Identifier: GPL-3.0-or-later -->\r\n",
+        ),
+        (
+            "crates/ebpf/native/fake.c",
+            b"/* SPDX-License-Identifier: GPL-2.0-only */\n",
+        ),
+        (
+            "scripts/native/fake.c",
+            b"/* SPDX-License-Identifier: GPL-3.0-or-later */\n",
+        ),
+        ("notes.txt", b"no header needed out of scope\n"),
+        // Exempt shapes are accepted even without headers.
+        (
+            "docs/superpowers/plans/2026-09-17-relicense-gpl.md",
+            b"# plan prose without a first-line header\n",
+        ),
+        (
+            "tests/fixtures/bpf-map-defs/mixed.c",
+            b"int probe(void *ctx) { return 0; }\n",
+        ),
+    ];
+    let good_paths: Vec<String> = good
+        .iter()
+        .map(|(path, content)| {
+            license_write_fixture(good_root.path(), path, content);
+            path.to_string()
+        })
+        .collect();
+    let accepted = license_check_files(good_root.path(), &good_paths);
+    assert!(
+        accepted.is_empty(),
+        "good fixtures must be accepted:\n{}",
+        accepted.join("\n")
+    );
+
+    let bad_root = tempfile::TempDir::new().expect("tempdir");
+    let bad: &[(&str, &[u8])] = &[
+        ("missing.rs", b"fn f() {}\n"),
+        (
+            "wrong-id.rs",
+            b"//! SPDX-License-Identifier: GPL-2.0-only\n",
+        ),
+        (
+            "crates/ebpf/src/main.rs",
+            b"//! SPDX-License-Identifier: GPL-3.0-or-later\n",
+        ),
+        (
+            "late.py",
+            b"#!/usr/bin/env python3\n# comment\n# SPDX-License-Identifier: GPL-3.0-or-later\n",
+        ),
+        ("no-header.py", b"#!/usr/bin/env python3\nprint(1)\n"),
+        ("plain.sh", b"echo hi\n"),
+        ("bad.md", b"# Title without a header\n"),
+        (
+            "crates/ebpf/native/fake.c",
+            b"/* SPDX-License-Identifier: GPL-3.0-or-later */\n",
+        ),
+        (
+            "scripts/native/dump-task-storage.bpf.c",
+            b"/* SPDX-License-Identifier: GPL-3.0-or-later */\n",
+        ),
+        (
+            "spike/fake.c",
+            b"/* SPDX-License-Identifier: GPL-2.0-only */\n",
+        ),
+        ("scripts/native/fake.c", b"#define X 1\n"),
+    ];
+    let bad_paths: Vec<String> = bad
+        .iter()
+        .map(|(path, content)| {
+            license_write_fixture(bad_root.path(), path, content);
+            path.to_string()
+        })
+        .collect();
+    let reported = license_check_files(bad_root.path(), &bad_paths);
+    assert_eq!(
+        reported.len(),
+        bad.len(),
+        "every bad fixture must be reported exactly once: {reported:?}"
+    );
+    for (path, _) in bad {
+        assert!(
+            reported.iter().any(|line| line.starts_with(path)),
+            "bad fixture {path} was not reported: {reported:?}"
+        );
+    }
+}
+
+#[test]
+fn license_legal_surface_checker_rejects_bad_fixtures() {
+    // A stub tree missing LICENSE, carrying a wrong manifest license, an
+    // on-disk removed text, and a file naming a pre-relicense text.
+    let root = tempfile::TempDir::new().expect("tempdir");
+    license_write_fixture(
+        root.path(),
+        "LICENSES/GPL-2.0-only.txt",
+        b"Version 2, June 1991\n",
+    );
+    license_write_fixture(root.path(), "Cargo.toml", b"[package]\nlicense = \"MIT\"\n");
+    for (manifest, _) in LICENSE_MANIFESTS.iter().skip(1) {
+        license_write_fixture(root.path(), manifest, b"[package]\n");
+    }
+    let removed = LICENSE_REMOVED_TEXTS[0].to_string();
+    license_write_fixture(root.path(), &removed, b"old text\n");
+    let marker = LICENSE_LEGACY_MARKERS[2].to_string();
+    license_write_fixture(root.path(), "notes.md", marker.as_bytes());
+    let tracked = vec![
+        "LICENSES/GPL-2.0-only.txt".to_string(),
+        "Cargo.toml".to_string(),
+        removed.clone(),
+        "notes.md".to_string(),
+    ];
+    let errors = license_legal_surface_errors(root.path(), &tracked);
+    for want in [
+        "LICENSE unreadable",
+        "Cargo.toml must declare exactly",
+        &format!("{removed} is still tracked"),
+        &format!("{removed} still exists on disk"),
+        "notes.md names a pre-relicense text",
+        "crates/discover/Cargo.toml must declare exactly",
+    ] {
+        assert!(
+            errors.iter().any(|line| line.contains(want)),
+            "missing error {want:?}: {errors:?}"
+        );
+    }
 }

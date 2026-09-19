@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Slice 1b-2 Live Discovery and `run` — Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: use

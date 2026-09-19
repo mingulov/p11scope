@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 set -eu
 
 start=$(cut -d ' ' -f 22 "/proc/$$/stat")

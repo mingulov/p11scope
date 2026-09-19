@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Complete coupled input-v1 discovery contract, preserved in execution order.
 
 This first extraction intentionally retains the shared state and deferred A2

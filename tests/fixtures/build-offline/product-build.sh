@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 
 p11scope_product_build() {
     [ "$1" = prepared ] || return 64

@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # `C_GetInterface` selection-evidence design
 
 **Date:** 2026-09-02 (Europe/Helsinki)

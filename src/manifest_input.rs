@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Manifest input hygiene: bounded read and structural validation of
 //! `p11scope-manifest/5` documents. Trusted operator input, validated before use.
 

@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Phase 4 environment matrix — results
 
 Ground truth for every row: `spike/harness.c`, oracle `spike/expected.txt`

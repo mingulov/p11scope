@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Kernel and config test matrix
 
 Written 2026-09-05. Every result in §2 was measured that day in local QEMU/KVM

@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Productization evidence index
 
 Updated: 2026-08-31

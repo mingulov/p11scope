@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! p11scope — non-interposing PKCS#11 observer (eBPF uprobes).
 
 pub mod attach;

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Real unprivileged supervisor checks; runnable from any cwd with Python -I."""
 
 import base64

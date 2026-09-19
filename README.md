@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # pkcs11-scope
 
 Observe the real PKCS#11 dependency surface of a running Linux application —
@@ -305,5 +306,12 @@ it; the eBPF observer itself is new code.
 
 ## License
 
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at
-your option.
+Public license: GPL-3.0-or-later — see [LICENSE](LICENSE).
+BPF sources: GPL-2.0-only — see
+[LICENSES/GPL-2.0-only.txt](LICENSES/GPL-2.0-only.txt).
+
+Per-file SPDX tags (`GPL-3.0-or-later` for userspace, docs, and scripts;
+`GPL-2.0-only` for BPF programs) remove any ambiguity.
+
+Contributions require a CLA granting broad sublicensing/relicensing rights;
+see [CONTRIBUTING.md](CONTRIBUTING.md).

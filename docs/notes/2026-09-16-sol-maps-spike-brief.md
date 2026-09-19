@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Implement: an invalid maps snapshot must not read as an absent mapping
 
 Repo: this worktree. Work only here. Read

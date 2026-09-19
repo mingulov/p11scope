@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Task-4 input-v1 ledger contract tests."""
 
 import hashlib

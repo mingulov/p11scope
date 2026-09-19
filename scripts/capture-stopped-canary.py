@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """One retained, stopped acquisition for the closed canary lanes.
 
 The shell owns external workload waits; an owned run observer waits its child.

@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Phase 0 spike findings — 2026-08-10
 
 Executed on: Linux 7.0.0-28-generic x86-64, bpftrace v0.20.2, SoftHSM2 2.6.1,

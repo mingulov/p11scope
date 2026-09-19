@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 use p11scope::attach::Scope;
 use p11scope::cli::{CaptureArgs, Kind, ScopeArg};
 use p11scope::discovery::engine::Engine;

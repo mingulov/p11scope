@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Discovered modules → one attach plan. The eBPF side has a single fixed-size
 //! slot array, so every module a capture found shares one slot space: one slot per
 //! unique {object, file_offset} across all of them. A target two modules both hand

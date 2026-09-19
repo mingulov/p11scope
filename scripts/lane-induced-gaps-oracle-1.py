@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Gate G2 induced-gaps lane oracle assert_gap1: validate the aliasing gap where two names share one address and counts belong to the group. Oracle extracted from scripts/verify-induced-gaps.sh (lines 156-216)."""
 import argparse
 import sys

@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Manifest Provenance Implementation Plan
 
 > **Status (2026-08-15): removed by Productization Slice 1a** (this commit; spec

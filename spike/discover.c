@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* spike/discover.c — dlopen a PKCS#11 module, resolve its CK_FUNCTION_LIST
  * pointers to file offsets via /proc/self/maps. Spike quality: x86-64,
  * PKCS#11 v2.x table only, no 3.x interfaces, no ELF parsing.

@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Probe-manifest schema v5. Offsets are ELF object-file byte offsets —
 //! aya 0.14 `UProbeAttachLocation::AbsoluteOffset` semantics, pinned in
 //! docs/notes/aya-offset-semantics.md. Evidence (NULL entries, vendor

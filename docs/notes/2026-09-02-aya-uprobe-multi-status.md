@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Aya `uprobe_multi` status and p11scope integration
 
 **Checked:** 2026-09-02  

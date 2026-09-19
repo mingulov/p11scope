@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 if [ "$1" = profile ]; then
     case " $* " in *" --duration 1 "*) echo 'cannot inspect the file locator now (Permission denied)' >&2; exit 1 ;; esac
     output=; previous=

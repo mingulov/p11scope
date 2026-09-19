@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Cargo/rustc/linker stand-in with explicit mutation controls."""
 
 import json

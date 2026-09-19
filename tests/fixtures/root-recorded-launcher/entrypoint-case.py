@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Exercise the real direct entrypoint with a mandatory skip or empty loader."""
 
 import runpy

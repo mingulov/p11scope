@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Wave 2 — Storage Consolidation Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Follow the Agent execution protocol in `ROADMAP.md` §"Release program" — Task 0 re-verified and corrected the anchors on 2026-09-02 at merged `main` `c26371f`; recheck them again immediately before each task.

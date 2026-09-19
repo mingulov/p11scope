@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Controlled rustc stand-in that exposes one fixed sysroot."""
 
 import json

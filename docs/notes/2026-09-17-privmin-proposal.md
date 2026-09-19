@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Privilege-minimization proposal (ranked) — 2026-09-19
 
 Branch `fix/privmin-research`. Research-only: this note proposes; it changes

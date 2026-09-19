@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Bench-overhead report oracle: render the per-condition median overhead table from work times files. Oracle extracted from scripts/bench-overhead.sh (lines 245-276)."""
 import argparse
 import sys

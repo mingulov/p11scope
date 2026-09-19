@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Shared event and configuration support for ABI actual-CLI fixtures."""
 
 import json

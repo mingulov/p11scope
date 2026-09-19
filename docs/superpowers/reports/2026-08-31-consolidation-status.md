@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Consolidation and release status
 
 Updated: 2026-09-01

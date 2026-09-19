@@ -1,4 +1,5 @@
 #!/bin/sh -eu
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Gate G1: p11scope-discover runs against SoftHSM2 and the deterministic
 # 68/92/104 table fixture in ubuntu (glibc) and alpine (musl). Both helper
 # builds are DYNAMIC (a static helper cannot dlopen providers sanely).

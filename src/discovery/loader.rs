@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 #[cfg(test)]
 use p11scope_ebpf_common::{LOADER_CONTEXT_ID_MASK, valid_loader_cookie};
 use p11scope_ebpf_common::{

@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Lane 02 Pause-Epoch Diagnostic Plan
 
 > **For agentic workers:** use `superpowers:subagent-driven-development` and TDD. This plan diagnoses; it does not select a production timeout.

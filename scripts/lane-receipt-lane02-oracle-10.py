@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Task 4 lane 02 reclaim_verified_output oracle: chown a private root-owned observer output after verifying directory identity. Oracle extracted from scripts/verify-receipt-lane02.sh (lines 603-613)."""
 import argparse
 import sys

@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Capture scope. The BPF side observes nothing until a filter is
 //! installed — there is no implicit system-wide capture.
 

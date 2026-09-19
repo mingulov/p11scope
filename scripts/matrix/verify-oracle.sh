@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Phase 4 Task 7: pkcs11-check oracle diff. Every other script in this repo
 # checks p11scope's capture against a workload WE wrote (spike/harness.c +
 # spike/expected.txt). This is the first check against an INDEPENDENT

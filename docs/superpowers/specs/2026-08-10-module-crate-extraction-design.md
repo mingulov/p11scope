@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Shared PKCS#11 module-loading crate — extraction design
 
 **Date:** 2026-08-10

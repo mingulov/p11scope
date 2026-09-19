@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Productization slice 1 — discovery and trust — design
 
 **Date:** 2026-08-15

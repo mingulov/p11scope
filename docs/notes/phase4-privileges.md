@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Phase 4 Task 8 — fork scoping and measured privileges
 
 > Historical measurement note: the pre-2026-08-25 results below predate later

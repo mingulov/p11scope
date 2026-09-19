@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Release Wave 3 — Correctness Engineering Closure
 
 ## Outcome

@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Phase 1b — end-to-end attach verification (Gate G1)
 
 `scripts/verify-attach-e2e.sh` runs the whole pipeline against a real

@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Explicit privileged checks over real maps and the production self-probe.
 //!
 //! Build with ordinary Cargo, then run the resulting test executable with

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 set -eu
 
 if [ "$#" -ne 6 ]; then

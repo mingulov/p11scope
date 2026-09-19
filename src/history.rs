@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Producer-owned historical state. Control/liveness is a separate authority.
 use crate::semantics::ProcessKey;
 use p11scope_ebpf_common::ImageIdentity;

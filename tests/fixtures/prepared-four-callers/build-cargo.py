@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Serve fixed metadata, then record and refuse a caller build."""
 
 from pathlib import Path

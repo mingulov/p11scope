@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Safe and unvalidated metadata capture — design
 
 **Date:** 2026-08-13

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """One-shot Linux supervisor for trusted commands that never escape their group.
 
 Run as a dedicated process, not inside a process that owns other children.

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Compiled ELF fixtures exercise the production map inventory decoder."""
 import argparse
 import io

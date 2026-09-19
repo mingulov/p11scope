@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Task 4 Lane 02: six owned-run SoftHSM2 load-kind/pause rows.
 set -eu
 cd "$(dirname "$0")/.."

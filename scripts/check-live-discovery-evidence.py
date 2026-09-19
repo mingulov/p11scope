@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Frozen execution manifest, preflight, and campaign validator for the
 Slice 1b-2 production live-discovery gates.
 

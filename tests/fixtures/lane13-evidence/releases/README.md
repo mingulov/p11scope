@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Knative v1.23.0 release fixtures
 
 These are unmodified Apache-2.0 Knative release manifests retained as ordinary

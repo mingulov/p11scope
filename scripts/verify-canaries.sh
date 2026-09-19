@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Gate G3: hostile pointer aliases across the complete capture-policy matrix.
 # Live BPF work is approval-gated; this file is kept syntactically and
 # statically testable even when the gate remains UNRUN.

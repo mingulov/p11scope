@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Task 4 lane 02 owned-harness absence oracle: refuse when an owned harness is still running. Oracle extracted from scripts/verify-receipt-lane02.sh (lines 501-512)."""
 import argparse
 import sys

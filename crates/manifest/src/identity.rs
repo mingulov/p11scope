@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Per-object identity for manifest-reuse decisions. A manifest may only be
 //! reused against a file whose identity matches (Gate G1: reuse refused on
 //! content mismatch). Whole-file SHA-256 is authoritative; a GNU build ID is

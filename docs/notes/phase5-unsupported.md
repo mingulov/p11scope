@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Phase 5 Task 4 — unsupported-environment behavior
 
 The docs will state a kernel floor of >= 5.15 and describe lockdown/

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Task 6: attach before a Knative scale-from-zero pod exists.
 set -eu
 cd "$(dirname "$0")/../.."

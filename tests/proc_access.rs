@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Measures the /proc access rules the scan depends on (spec §4.9, §6.6). Each test
 //! asserts the outcome the documented rules require for the observed configuration
 //! (root vs non-root, `ptrace_scope` value, filesystem identity resolution) instead of

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Assemble and verify the finite offline dependency payload."""
 
 from __future__ import annotations
@@ -36,7 +37,10 @@ METADATA_ARGUMENTS = ("metadata", "--locked", "--offline", "--all-features",
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 REVISION_RE = re.compile(r"[0-9a-f]{40}\Z")
 PAYLOAD_TOP = {"vendor", "archives", "provenance"}
-SHARED_FILES = {"source.bundle", "LICENSE-MIT", "LICENSE-APACHE", "packages.json"}
+SHARED_FILES = {"source.bundle", "LICENSE", "LICENSES", "packages.json"}
+SHARED_LICENSES = ("LICENSE", "LICENSES/GPL-2.0-only.txt")
+SHARED_LICENSES_DIR = "LICENSES"
+SHARED_LICENSES_DIR_FILES = ("GPL-2.0-only.txt",)
 NIGHTLY_FILES = {"sysroot-Cargo.toml", "Cargo.lock"}
 SOURCE_EXPORT_V1_FIELDS = {"schema_version", "revision", "source_entries", "archives"}
 SOURCE_EXPORT_V2_FIELDS = SOURCE_EXPORT_V1_FIELDS | {"offline_dependencies"}
@@ -545,15 +549,40 @@ def _validate_vendor(vendor: Path, expected: dict[str, dict]) -> list[dict]:
     return shared_packages
 
 
+def _shared_license_digests(shared_dir: Path) -> dict[str, str]:
+    return {name: _sha256_file(shared_dir / name) for name in SHARED_LICENSES}
+
+
+def _shared_licenses_entries(shared_dir: Path, label: str) -> set[str]:
+    try:
+        return {path.name for path in (shared_dir / SHARED_LICENSES_DIR).iterdir()}
+    except OSError as error:
+        raise OfflineDependencyError(f"cannot read {label}: {error}") from error
+
+
+def _check_payload_licenses(shared_dir: Path) -> None:
+    names = _shared_licenses_entries(shared_dir, "shared provenance licenses")
+    expected = set(SHARED_LICENSES_DIR_FILES)
+    if names != expected:
+        missing, extra = sorted(expected - names), sorted(names - expected)
+        phrase = "missing payload entry" if missing else "unexpected payload entry"
+        raise OfflineDependencyError(f"{phrase} in shared provenance: missing={missing}, extra={extra}")
+
+
 def _shared_provenance(shared_dir: Path, shared: dict, packages: list[dict]) -> dict:
-    expected = {"source.bundle", "LICENSE-MIT", "LICENSE-APACHE"}
+    expected = {"source.bundle", "LICENSE", "LICENSES"}
     try:
         actual = {entry.name for entry in shared_dir.iterdir()}
     except OSError as error:
         raise OfflineDependencyError(f"cannot read supplied shared source: {error}") from error
     if actual != expected:
         raise OfflineDependencyError(f"shared source entries mismatch: expected={sorted(expected)}, got={sorted(actual)}")
-    for name in expected:
+    license_names = _shared_licenses_entries(shared_dir, "supplied shared licenses")
+    if license_names != set(SHARED_LICENSES_DIR_FILES):
+        raise OfflineDependencyError(
+            f"shared source entries mismatch: expected={sorted(SHARED_LICENSES_DIR_FILES)}, "
+            f"got={sorted(license_names)}")
+    for name in ("source.bundle", *SHARED_LICENSES):
         _regular(shared_dir / name, f"shared source {name}", executable=False)
     revision = _bundle_revision(shared_dir / "source.bundle")
     if revision != shared["revision"]:
@@ -564,8 +593,7 @@ def _shared_provenance(shared_dir: Path, shared: dict, packages: list[dict]) -> 
         "schema_version": 1,
         "source": {"url": shared["url"], "revision": revision,
                    "bundle_sha256": _sha256_file(shared_dir / "source.bundle")},
-        "licenses": {name: _sha256_file(shared_dir / name)
-                     for name in ("LICENSE-MIT", "LICENSE-APACHE")},
+        "licenses": _shared_license_digests(shared_dir),
         "packages": sorted(packages, key=lambda item: (item["name"], item["version"])),
     }
 
@@ -617,6 +645,7 @@ def _payload_structure(payload: Path, manifest: dict, expected_vendor: dict[str,
         missing, extra = sorted(SHARED_FILES - shared_names), sorted(shared_names - SHARED_FILES)
         phrase = "missing payload entry" if missing else "unexpected payload entry"
         raise OfflineDependencyError(f"{phrase} in shared provenance: missing={missing}, extra={extra}")
+    _check_payload_licenses(shared_dir)
     nightly_names = {path.name for path in nightly_dir.iterdir()}
     if nightly_names != NIGHTLY_FILES:
         missing, extra = sorted(NIGHTLY_FILES - nightly_names), sorted(nightly_names - NIGHTLY_FILES)
@@ -644,8 +673,7 @@ def _payload_structure(payload: Path, manifest: dict, expected_vendor: dict[str,
         "schema_version": 1,
         "source": {"url": expected_shared["source"]["url"], "revision": revision,
                    "bundle_sha256": _sha256_file(shared_dir / "source.bundle")},
-        "licenses": {name: _sha256_file(shared_dir / name)
-                     for name in ("LICENSE-MIT", "LICENSE-APACHE")},
+        "licenses": _shared_license_digests(shared_dir),
         "packages": shared_packages,
     }
     expected = dict(expected_shared)
@@ -932,8 +960,11 @@ def assemble(root: Path, options, preparer, checker) -> None:
             _normalize_payload(payload / "vendor")
             packages = _validate_vendor(payload / "vendor", expected_vendor)
             provenance = _shared_provenance(options.shared_source, shared, packages)
-            for name in ("source.bundle", "LICENSE-MIT", "LICENSE-APACHE"):
+            for name in ("source.bundle", "LICENSE"):
                 _copy_regular(options.shared_source / name, shared_output / name)
+            (shared_output / "LICENSES").mkdir(mode=0o755)
+            _copy_regular(options.shared_source / "LICENSES/GPL-2.0-only.txt",
+                          shared_output / "LICENSES/GPL-2.0-only.txt")
             (shared_output / "packages.json").write_bytes(_canonical_json(provenance) + b"\n")
             os.chmod(shared_output / "packages.json", 0o644)
             for name, expected in _required_archives(manifest).items():
@@ -1037,12 +1068,12 @@ def verify(root: Path, options, preparer, *, reconstruct: bool = True) -> dict:
         missing, extra = sorted(SHARED_FILES - shared_names), sorted(shared_names - SHARED_FILES)
         phrase = "missing payload entry" if missing else "unexpected payload entry"
         raise OfflineDependencyError(f"{phrase} in shared provenance: missing={missing}, extra={extra}")
+    _check_payload_licenses(shared_dir)
     expected_shared = {
         "schema_version": 1,
         "source": {"url": shared["url"], "revision": shared["revision"],
                    "bundle_sha256": _sha256_file(shared_dir / "source.bundle")},
-        "licenses": {name: _sha256_file(shared_dir / name)
-                     for name in ("LICENSE-MIT", "LICENSE-APACHE")},
+        "licenses": _shared_license_digests(shared_dir),
         "packages": [],
     }
     _payload_structure(options.payload, manifest, expected_vendor, expected_shared)

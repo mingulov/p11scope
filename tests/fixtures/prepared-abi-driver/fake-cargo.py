@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Serve fixed Cargo metadata without invoking Cargo or rustc."""
 
 import sys

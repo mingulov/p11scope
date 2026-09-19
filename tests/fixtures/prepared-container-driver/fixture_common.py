@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Shared data and event recording for the native container-driver fixtures."""
 
 import json

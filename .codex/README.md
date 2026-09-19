@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Agent configuration
 
 The default is Astra High for the primary, with three responsibility-based

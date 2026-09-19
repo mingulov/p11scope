@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 name=${D2_COMMAND_NAME:-$(basename "$0")}
 # The tool pinning layer identifies its executables by behaviour (it runs
 # `--version` and requires a `rustup `/`Python ` banner), so the stubs

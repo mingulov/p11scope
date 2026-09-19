@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Shared lib signal oracle signal_pinned_process: verify pidfd and starttime identity, then deliver the named signal. Oracle extracted from scripts/lib.sh (lines 416-439)."""
 import argparse
 import sys

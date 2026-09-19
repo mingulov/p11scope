@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Gate G1 attach-e2e lane oracle assert_lane_evidence: validate scan/manifest capture evidence and refuse mutations. Oracle extracted from scripts/verify-attach-e2e.sh (lines 17-98)."""
 import argparse
 import sys

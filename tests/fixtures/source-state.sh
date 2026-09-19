@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 
 [ "$#" -eq 3 ] || exit 64
 before="$(pwd)|$(umask)|$-|$(export -p)"

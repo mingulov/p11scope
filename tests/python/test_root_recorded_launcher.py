@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Native real-helper tests with authenticated pidfd custody and bounded teardown."""
 
 import ctypes

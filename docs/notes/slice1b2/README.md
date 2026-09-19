@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Slice 1b-2 private evidence root — layout and pinned digests
 
 Raw and generated evidence for the Slice 1b-2 gates is **never tracked in

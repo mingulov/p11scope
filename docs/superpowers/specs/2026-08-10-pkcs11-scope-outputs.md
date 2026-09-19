@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # pkcs11-scope — What you will see
 
 **Date:** 2026-08-10 · **Status:** Draft, companion to the

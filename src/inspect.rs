@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! `p11scope inspect --pid N`: renders a completed memory scan as text or JSON.
 //! No BPF, no pause, no capture, and zero PKCS #11 calls (spec §4.6) — reads
 //! `/proc` and nothing else, so

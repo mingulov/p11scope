@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Decoded production-object mutation tests; objects must be supplied explicitly."""
 import argparse
 import copy

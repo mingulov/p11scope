@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Loading and attaching. One selected entry uprobe + one uretprobe serve
 //! each slot; the attach cookie carries the slot index.
 

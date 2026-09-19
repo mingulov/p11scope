@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Initial-release recovery checkpoint
 
 This local checkpoint preserves the accumulated release source, native test

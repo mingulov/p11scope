@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Observe preparation arguments and forbid network in missing-archive tests."""
 
 import json

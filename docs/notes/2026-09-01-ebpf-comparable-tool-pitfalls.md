@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Comparable eBPF tool failure modes — research for release hardening
 
 **Date:** 2026-09-01

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Native borrowed-descriptor admission contracts for ``run_reconciled_build``."""
 
 import contextlib

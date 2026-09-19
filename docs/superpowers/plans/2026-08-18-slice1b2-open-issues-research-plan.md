@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Slice 1b-2 Open Issues — Research and Improvement Plan (rev 3, after two reviews)
 
 > **Historical execution plan (2026-08-19):** Tasks 0–8 and 10 ran, but the

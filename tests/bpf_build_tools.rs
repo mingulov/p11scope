@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 #[allow(dead_code)]
 #[path = "../build_support/bpf_tools.rs"]
 mod bpf_tools;

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Inject only OS capability acquisition failures; real child/exec/settlement."""
 
 import json

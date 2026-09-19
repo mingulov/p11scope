@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Actual-CLI prepared dependency tests for the ABI routing driver."""
 
 import json

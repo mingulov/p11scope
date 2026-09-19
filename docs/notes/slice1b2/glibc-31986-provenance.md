@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # glibc 31986 fix provenance — released-package controls (Slice 1b-2, Task 6)
 
 This note records why the two new container lanes count as **fixed-glibc controls** for

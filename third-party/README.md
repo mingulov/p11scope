@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Local dependency corrections
 
 `sources.json` is the source of truth for reconstructed packages. From a fresh

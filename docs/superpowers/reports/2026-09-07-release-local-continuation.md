@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Initial release continuation — local qualification
 
 The owner resumed the initial-release goal on 2026-09-07, authorizing execution,

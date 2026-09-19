@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Aya uprobe offset semantics — pinned (Phase 1a, Task 3)
 
 **Fact:** aya 0.14.0 `UProbeAttachLocation::AbsoluteOffset(u64)` is an ELF

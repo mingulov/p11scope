@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Known environmental test flakes (created 2026-09-18, profiling-fixes Task 3)
 
 Full-workspace runs fail ~1 test/run; each entry below is green in

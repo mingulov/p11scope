@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Task 4 lane 02 evidence-root oracle ROOT_ID: require a caller-owned mode-0700 directory and print its device and inode. Oracle extracted from scripts/verify-receipt-lane02.sh (lines 49-53)."""
 import argparse
 import sys

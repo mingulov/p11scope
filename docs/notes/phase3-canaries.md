@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Phase 3 — Gate G3 secret-canary suite
 
 `scripts/verify-canaries.sh` is the release gate that decides whether the

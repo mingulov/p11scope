@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Native lane-13 evidence ownership and cleanup tests."""
 
 import argparse

@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! `trace` renderer: one line per completed call, in arrival order — the
 //! per-investigation counterpart to `profile`'s aggregate report
 //! (`docs/superpowers/specs/2026-08-10-pkcs11-scope-outputs.md`, "Trace

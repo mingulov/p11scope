@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Native tests for prepared-dependency integration in four receipt callers."""
 
 from __future__ import annotations

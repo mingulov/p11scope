@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Gate G1: p11scope attaches at discovered offsets and counts a
 # deterministic workload exactly. Oracle: spike/expected.txt, the ground
 # truth for spike/harness.c.

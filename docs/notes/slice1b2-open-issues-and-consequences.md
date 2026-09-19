@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Slice 1b-2 open issues, consequences, and next evidence
 
 Date: 2026-08-18

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Task 6: capture a deterministic SoftHSM workload in one kind pod.
 #
 # Manifest-free: nothing is copied out of the pod. The observer runs on the node,

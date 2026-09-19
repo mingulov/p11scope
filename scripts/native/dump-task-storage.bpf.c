@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Test-only read-only task-storage iterator. */
 typedef unsigned int u32;
 typedef unsigned long long u64;

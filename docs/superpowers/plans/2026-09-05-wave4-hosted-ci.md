@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Wave 4 — Hosted CI Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: use

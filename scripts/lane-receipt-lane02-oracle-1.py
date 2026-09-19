@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Task 4 lane 02 evidence-root oracle: require the parent to be caller-owned and private. Oracle extracted from scripts/verify-receipt-lane02.sh (lines 39-42)."""
 import argparse
 import sys

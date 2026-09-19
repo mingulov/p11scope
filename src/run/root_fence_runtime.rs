@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Compile-only by default. Execution needs separately reviewed runtime custody.
 //! Regresses premature retirement on reap/first dequeue: pending state must
 //! survive both reductions and token construction until explicit retirement.

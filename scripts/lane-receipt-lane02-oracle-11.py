@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Task 4 lane 02 remove_verified_pidfile oracle: unlink a pidfile after verifying directory identity. Oracle extracted from scripts/verify-receipt-lane02.sh (lines 619-628)."""
 import argparse
 import sys

@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # pkcs11-scope — architecture review and gap analysis
 
 **Date:** 2026-08-15 · **Tree:** `main` @ `f35c04e` (clean) · **Scope:** internal

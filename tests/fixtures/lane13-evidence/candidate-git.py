@@ -1,4 +1,5 @@
 #!/usr/bin/python3 -I
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Synthetic tracked-name input for the owned lane-13 candidate fixture."""
 
 import json

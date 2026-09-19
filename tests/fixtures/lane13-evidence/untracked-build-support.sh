@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 if [ "$D2_MODE" = untracked-consumed-input ]; then
     case " $* " in
         *" build_support "*) printf '%s\n' build_support/bpf_tools.rs ;;

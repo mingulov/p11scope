@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Tripwire for an inherited PYTHONPATH reaching an unisolated interpreter."""
 
 from pathlib import Path

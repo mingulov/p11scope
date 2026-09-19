@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Own a guard child until the suite acknowledges its exact pidfd identity."""
 
 import ctypes

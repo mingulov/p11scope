@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # RT_ADD deferral implementation report
 
 ## 2026-09-13 — governing review and initial state

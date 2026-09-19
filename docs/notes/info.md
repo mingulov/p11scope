@@ -1,4 +1,5 @@
-﻿# My reassessment: yes, but it should not be merely a “PKCS#11 tracer”
+﻿<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+# My reassessment: yes, but it should not be merely a “PKCS#11 tracer”
 
 > Historical product exploration, not a current security contract. The
 > authoritative pointer-derived metadata and attach-authorization boundaries

@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 use super::session_fixture::ScriptedSession;
 use super::*;
 use crate::discovery::identity::test_fixture::{

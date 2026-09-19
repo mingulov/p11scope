@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Supply adjacent configuration to the accepted native Cargo metadata fixture."""
 
 import json

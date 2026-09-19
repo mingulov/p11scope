@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Deep gap analysis — p11scope (2026-09-15)
 
 Sources: 12-agent workflow (guest `event_loss` audit + remaining-work sweep,

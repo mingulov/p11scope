@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Stateful Docker stand-in; container command bodies are never evaluated."""
 
 import json

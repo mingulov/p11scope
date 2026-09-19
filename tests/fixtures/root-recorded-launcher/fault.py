@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Inject an OS primitive failure while executing the actual helper source."""
 
 import os

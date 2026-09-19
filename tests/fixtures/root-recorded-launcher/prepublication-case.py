@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Hold the actual one-shot fixture at its ownership-record publication."""
 
 import json

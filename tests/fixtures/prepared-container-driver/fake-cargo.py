@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Serve fixed metadata and vendor config without running Cargo or rustc."""
 
 from pathlib import Path

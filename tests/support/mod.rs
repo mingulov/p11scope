@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 use std::io::{self, BufRead as _, BufReader, Write as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::path::Path;

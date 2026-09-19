@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # One local entry point for the root gates (requires passwordless sudo, softhsm2, gcc, python3).
 set -eu
 cd "$(dirname "$0")/.."

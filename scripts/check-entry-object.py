@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Partial compiled entry/return cookie, descriptor and ABI-routing contract.
 
 This is a caller-wiring analysis, not a BPF interpreter or a native owner proof.

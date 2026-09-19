@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Dump only BPF maps whose fds are owned by one observer process."""
 
 import ctypes

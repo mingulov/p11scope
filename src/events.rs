@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Draining the EVENTS ring buffer into typed `Event` values. Every
 //! record is size-checked before it is treated as an `Event`: a record of
 //! the wrong length means the writer and reader have drifted, and that

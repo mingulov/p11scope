@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Implement the RT_ADD deferral so the scan stops racing the loader
 
 Repo: this worktree. Read `.superpowers/sdd/w7-continuation-2026-09-12/HOUSE-RULES.md`

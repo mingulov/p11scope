@@ -167,3 +167,21 @@ Build env: TMPDIR=/var/tmp/p11scope-ws-tmp cargo +1.88 --locked --offline.
   during future gates. Cost if wrong: a real canary/lane13
   regression hides until the next full gate on an idle box;
   mitigated by isolation-green on the exact merged tree.
+- Task 1.3: implementer DONE (2162716, `feat: table provenance and
+  mislabel guard`). Provenance (file_offset, linkage) plan→evidence;
+  single `table_name_authorized` predicate gates function_name labels,
+  unlinked→`unknown`; also fulfills 1.2's live-return cap bypass.
+  Worker gate: lib 1079/0, contracts 126/126, clippy+fmt clean.
+- Task 1.3: task review: spec ✅, quality Needs fixes. 1 Important
+  (bounded_skip rejects the new public ("unknown","null pointer")
+  skip — verified correct against render.rs:563 vs checker:839;
+  enters fix loop round 1), 2 Minor (deferred): stale authorized
+  name restored on rebuild (plan.rs:736); manifest_supported cap
+  bypass untested (plan.rs:1231+engine.rs:4849) — final review
+  triages. Reviewer ⚠️ items resolved by controller: TDD red-run
+  accepted on report (tests present in diff); suite numbers
+  provisional pending merge gate; consumer-grep closed (render uses
+  gated plan names; DecodedOccurrence internal-only, no consumers
+  outside engine/scan/tests).
+- Task 1.3: fix round 1/5 dispatched (bounded_skip alignment +
+  self-test pair); FIX_BASE 2162716.

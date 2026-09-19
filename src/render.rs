@@ -3149,6 +3149,39 @@ mod tests {
     }
 
     #[test]
+    fn cap_skip_forces_partial_in_profile_and_metrics() {
+        // A scan-cap skip alone flips a clean evidence to PARTIAL, and the
+        // public record stays categorical: no pid, path, or count details.
+        let mut ev = evidence();
+        ev.skipped = vec![capture_skipped_out(&Skipped {
+            subject: "system".into(),
+            reason: "3 processes in scope; discovery selected 1 for deep scanning by provider rarity (limit 1); unselected processes may contain undiscovered providers".into(),
+        })];
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        let expected = serde_json::json!({
+            "name": "discovery subject",
+            "reason": "discovery unavailable",
+        });
+        let profile = profile_json(
+            &reports_fixture(),
+            &ev,
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        assert_eq!(profile["evidence"]["completeness"], "PARTIAL");
+        assert_eq!(profile["evidence"]["skipped"][0], expected);
+        assert!(
+            !profile["evidence"]["skipped"][0]
+                .to_string()
+                .contains("processes in scope")
+        );
+        let metrics = json(&[], &ev, &capture_fixture());
+        assert_eq!(metrics["evidence"]["completeness"], "PARTIAL");
+        assert_eq!(metrics["evidence"]["skipped"][0], expected);
+    }
+
+    #[test]
     fn metrics_json_capture_discloses_ring_bytes_and_drain_interval() {
         let mut ev = evidence();
         ev.verdict();

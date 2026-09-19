@@ -3475,6 +3475,28 @@ fn select_deep_scan_candidates(sweep: &[(u32, Vec<MapEntry>)], max_pids: usize) 
         .collect()
 }
 
+/// Categorical over-cap diagnostic: the actual selected count out of the
+/// enumerated count, the cap, and the selection method. Selection is
+/// provider-rarity order, not a pid prefix, so the message must never say
+/// "first N". Never names pids or paths. Refresh passes only new candidates
+/// (known views excluded); it must not claim successful scans.
+fn scan_cap_reason(total: usize, selected: usize, cap: usize, live: bool) -> String {
+    if live {
+        let noun = if selected == 1 {
+            "new candidate"
+        } else {
+            "new candidates"
+        };
+        format!(
+            "{total} processes in scope; live discovery selected {selected} {noun} for deep scanning by provider rarity (limit {cap})"
+        )
+    } else {
+        format!(
+            "{total} processes in scope; discovery selected {selected} for deep scanning by provider rarity (limit {cap}); unselected processes may contain undiscovered providers"
+        )
+    }
+}
+
 /// Phase 1 of the two-phase scan: read every in-scope pid's maps snapshot.
 /// Cheap by construction — bounded read plus parse only, no decode, no view
 /// allocation. A pid whose maps cannot be read keeps its place with an empty
@@ -3514,20 +3536,6 @@ fn discover_plan(
     // however few happen to be in it right now.
     let named = matches!(scope, Scope::Pid(_));
     let max_scan_pids = discovered.max_scan_pids;
-    if pids.len() > max_scan_pids {
-        // Published, not just noted: a provider mapped only by a process past the
-        // cap is undiscovered, unprobed, and has nothing else to show for it.
-        let skipped = Skipped {
-            subject: scope_label(scope),
-            reason: format!(
-                "{} processes in scope; discovery scanned the first {max_scan_pids} — a \
-                 provider mapped only by one of the rest was never discovered",
-                pids.len()
-            ),
-        };
-        attribution::note(&skipped);
-        discovered.base_counters.object_skips.push(skipped);
-    }
     // Two-phase scan: phase 1 sweeps every in-scope pid's maps, phase 2
     // deep-scans the selected candidates only. Under the cap selection is
     // the identity, so the sweep (and its budget charge) is skipped there.
@@ -3537,6 +3545,17 @@ fn discover_plan(
     } else {
         pids.clone()
     };
+    if pids.len() > max_scan_pids {
+        // Published, not just noted: a provider mapped only by a process past the
+        // cap is undiscovered, unprobed, and has nothing else to show for it.
+        // Formed after selection so the counts describe the actual set.
+        let skipped = Skipped {
+            subject: scope_label(scope),
+            reason: scan_cap_reason(pids.len(), selected.len(), max_scan_pids, false),
+        };
+        attribution::note(&skipped);
+        discovered.base_counters.object_skips.push(skipped);
+    }
     for pid in selected.iter() {
         let opened = if named {
             named_view
@@ -11838,15 +11857,8 @@ impl Engine {
         let (pids, mut skipped) = scope_pids(&self.scope);
         let max_scan_pids = self.max_scan_pids;
         let membership_complete = skipped.is_empty() && pids.len() <= max_scan_pids;
-        if pids.len() > max_scan_pids {
-            skipped.push(Skipped {
-                subject: scope_label(&self.scope),
-                reason: format!(
-                    "{} processes in scope; live discovery scanned the first {max_scan_pids}",
-                    pids.len()
-                ),
-            });
-        }
+        let enumerated = pids.len();
+        let over_cap = enumerated > max_scan_pids;
         // Two-phase scan: phase 1 sweeps every in-scope pid's maps, phase 2
         // deep-scans the selected candidates only. Under the cap selection is
         // the identity, so the sweep (and its per-tick budget charge) is
@@ -11864,6 +11876,16 @@ impl Engine {
         } else {
             pids.into_iter().collect()
         };
+        // Formed after selection so the counts describe the actual set.
+        // Only new candidates count: known views are retained, not selected.
+        if over_cap {
+            let known: BTreeSet<u32> = self.views.iter().map(|view| view.pid()).collect();
+            let fresh = desired.iter().filter(|pid| !known.contains(pid)).count();
+            skipped.push(Skipped {
+                subject: scope_label(&self.scope),
+                reason: scan_cap_reason(enumerated, fresh, max_scan_pids, true),
+            });
+        }
         // A complete /proc sweep is authoritative membership for system scope
         // exactly as a complete cgroup walk is for cgroup scope: a retained
         // view whose pid is absent has departed. Over the cap or with skips,

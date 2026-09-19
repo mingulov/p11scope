@@ -246,7 +246,9 @@ fn system_scope_over_the_scan_cap_records_the_bound() {
     )
     .unwrap();
     let cap = engine.plan().skipped.iter().find(|skip| {
-        skip.subject == "system" && skip.reason.contains("discovery scanned the first 1")
+        skip.subject == "system"
+            && skip.reason.contains("selected 1 for deep scanning")
+            && skip.reason.contains("by provider rarity")
     });
     assert!(
         cap.is_some(),

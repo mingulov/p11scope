@@ -4143,12 +4143,11 @@ fn max_scan_pids_bounds_initial_scan_and_refresh() {
         engine.views.len()
     );
     assert!(
-        engine
-            .base_counters
-            .object_skips
-            .iter()
-            .any(|skip| skip.reason.contains("scanned the first 2")),
-        "the initial skip names the effective value: {:?}",
+        engine.base_counters.object_skips.iter().any(|skip| {
+            skip.reason.contains("; discovery selected")
+                && skip.reason.contains("for deep scanning by provider rarity")
+        }),
+        "the initial skip names the actual selected set: {:?}",
         engine.base_counters.object_skips
     );
 
@@ -4165,12 +4164,11 @@ fn max_scan_pids_bounds_initial_scan_and_refresh() {
         "one refresh tick keeps exactly the selected set"
     );
     assert!(
-        engine
-            .counters
-            .object_skips
-            .iter()
-            .any(|skip| skip.reason.contains("scanned the first 2")),
-        "the refresh skip names the effective value: {:?}",
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.reason.contains("live discovery selected")
+                && skip.reason.contains("for deep scanning by provider rarity")
+        }),
+        "the refresh skip names the actual selected set: {:?}",
         engine.counters.object_skips
     );
 
@@ -4344,11 +4342,11 @@ fn zero_cap_refresh_short_circuits_the_sweep_to_empty() {
         "the tick selects nothing new and retires nothing"
     );
     assert!(
-        engine
-            .counters
-            .object_skips
-            .iter()
-            .any(|skip| skip.reason.contains("scanned the first 0")),
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.reason
+                .contains("live discovery selected 0 new candidates")
+                && skip.reason.contains("for deep scanning by provider rarity")
+        }),
         "the refresh skip still names the effective value: {:?}",
         engine.counters.object_skips
     );
@@ -16581,6 +16579,38 @@ fn candidate_selection_prefers_rare_providers_over_pid_order() {
     assert_eq!(select_deep_scan_candidates(&sweep, 1), vec![9001]);
     assert_eq!(select_deep_scan_candidates(&sweep, 2), vec![9001, 7]);
     assert_eq!(select_deep_scan_candidates(&sweep, 3), vec![7, 8, 9001]);
+}
+
+/// F2: the published over-cap diagnostic agrees with the actual selected
+/// set — real counts, the cap, and the rarity method, never a "first N"
+/// prefix claim and never a pid. Refresh counts new candidates only.
+#[test]
+fn scan_cap_diagnostic_reports_actual_selection() {
+    // Rare provider lives at the highest pid: selection is [9001], not [7].
+    assert_eq!(
+        scan_cap_reason(3, 1, 1, false),
+        "3 processes in scope; discovery selected 1 for deep scanning by provider rarity (limit 1); unselected processes may contain undiscovered providers"
+    );
+    // Grouped case: cap 2 yields one representative.
+    assert_eq!(
+        scan_cap_reason(4, 1, 2, false),
+        "4 processes in scope; discovery selected 1 for deep scanning by provider rarity (limit 2); unselected processes may contain undiscovered providers"
+    );
+    assert_eq!(
+        scan_cap_reason(3, 1, 2, true),
+        "3 processes in scope; live discovery selected 1 new candidate for deep scanning by provider rarity (limit 2)"
+    );
+    assert_eq!(
+        scan_cap_reason(5, 0, 0, true),
+        "5 processes in scope; live discovery selected 0 new candidates for deep scanning by provider rarity (limit 0)"
+    );
+    for reason in [
+        scan_cap_reason(3, 1, 1, false),
+        scan_cap_reason(3, 1, 2, true),
+    ] {
+        assert!(!reason.contains("first"), "no prefix claim: {reason}");
+        assert!(!reason.contains("9001"), "no pid leaks: {reason}");
+    }
 }
 
 /// ABC-T4 coverage: the pure selection edges — equal-rarity tie-break goes

@@ -68,7 +68,7 @@ version = "0.0.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/mingulov/pkcs11-scope"
+repository = "https://github.com/mingulov/p11scope"
 description = "PKCS#11 discovery helper: dlopen a provider, map its function tables to ELF file offsets"
 publish = false
 

@@ -57,7 +57,7 @@ version = "0.0.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/mingulov/pkcs11-scope"
+repository = "https://github.com/mingulov/p11scope"
 description = "Probe-manifest schema shared by p11scope-discover and p11scope"
 publish = false
 

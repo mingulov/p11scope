@@ -441,7 +441,7 @@ boundaries.
   0, metrics 3366.6, profile 3754.4, trace 4127.8 (5 runs/condition, 1M calls each,
   kernel 7.0.0-28-generic; consistent with the documented ~3.3µs). CI e2e: PASS — first
   push, run
-  [31935749796](https://github.com/mingulov/pkcs11-scope/actions/runs/31935749796)
+  [31935749796](https://github.com/mingulov/p11scope/actions/runs/31935749796)
   (2026-08-16, `checks-and-e2e` success). Follow-ups noted for 1b: rerun the post-fix6 `--cgroup`
   capability matrix, one privileged `--cgroup` smoke after
   the `_cgroup_file` removal, prune the now-unused root `p11scope-discover` dev-dependency.**

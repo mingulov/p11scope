@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/mingulov/pkcs11-scope"
+repository = "https://github.com/mingulov/p11scope"
 description = "Non-interposing PKCS#11 observer on eBPF uprobes"
 publish = false
 

@@ -166,7 +166,7 @@ fn system_scope_is_one_of_three_and_mutually_exclusive() {
     }
     assert!(matches!(
         parse(argv(&["run", "--system", "--", "/bin/true"])),
-        Err(CliError::Usage(message)) if message.contains("run has no --pid or --cgroup")
+        Err(CliError::Usage(message)) if message.contains("run has no --pid, --cgroup, or --system")
     ));
 }
 

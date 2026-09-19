@@ -644,7 +644,7 @@ fn parse_run(mut args: impl Iterator<Item = String>) -> Result<RunArgs, CliError
             "--kill-on-timeout" => kill_on_timeout = true,
             "--pid" | "--cgroup" | "--system" => {
                 return Err(usage_err(
-                    "run has no --pid or --cgroup: it captures exactly the command it starts",
+                    "run has no --pid, --cgroup, or --system: it captures exactly the command it starts",
                 ));
             }
             "--" => {
@@ -1083,7 +1083,7 @@ mod tests {
             vec!["run", "--system", "--", "/bin/true"],
         ] {
             assert!(
-                matches!(parse(args(&scoped)), Err(CliError::Usage(m)) if m.contains("run has no --pid or --cgroup")),
+                matches!(parse(args(&scoped)), Err(CliError::Usage(m)) if m.contains("run has no --pid, --cgroup, or --system")),
                 "{scoped:?}"
             );
         }

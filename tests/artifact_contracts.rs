@@ -6527,7 +6527,11 @@ fn usage_documents_every_subcommand_and_capture_needs_no_manifest() {
         (vec!["run", "--", ""], "-- CMD [ARGS...]"),
         (
             vec!["run", "--pid", "1", "--", "/bin/true"],
-            "run has no --pid or --cgroup",
+            "run has no --pid, --cgroup, or --system",
+        ),
+        (
+            vec!["run", "--system", "--", "/bin/true"],
+            "run has no --pid, --cgroup, or --system",
         ),
         (
             vec!["run", "--pause", "sometimes", "--", "/bin/true"],

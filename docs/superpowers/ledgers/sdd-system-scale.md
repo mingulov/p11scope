@@ -82,6 +82,16 @@ Build env: TMPDIR=/var/tmp/p11scope-ws-tmp cargo +1.88 --locked --offline.
   target/ cache). If the ghost delivers late, reconcile by diff, not by
   double-merge. New worker brief requires BLOCKED-with-WIP-commit over
   silence. 6/7 slots nominally used (ghost may not be real).
+- Task 2.1: complete (ae4cf7f, review clean, merged 5f86e24). Decision: narrow
+  Aya backport (PR #1417 verified merged 2026-07-31); raw loader rejected for
+  BTF objects (gate run against real objects); 68x fd + ~12-14x attach ms,
+  identical 204/204 events, 0 fd leaks. Fixup b8494c7 for SPDX `//!` style
+  (worker terminal, resume rejected).
+- Ruling: fixed the 1-line SPDX header myself on the integration branch —
+  worker terminal so SDD resume impossible, 3-char deterministic fix verdict
+  by the license test (green). Cost if wrong: nil, test decides.
+- Task 2.1: minor (deferred to 2.2): empty-offsets `assert!` should become a
+  returned error at wiring time; add bisect_attach unit tests when wired.
 - Ruling (SUPERSEDED 2026-09-19): goal pre-commits to multi-uprobe; plan's
   Task 2.1 comparison is reframed as WHICH loader (Aya backport vs raw
   helper), not WHETHER multi. Task 1.6 still decides SCOPE (broad vs

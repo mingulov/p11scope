@@ -1464,6 +1464,8 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
             (Scope::Pid(*p), Some(view))
         }
         ScopeArg::Cgroup(c) => (scope::cgroup(c)?, None),
+        // No named view and no cgroup path: discovery sweeps /proc itself.
+        ScopeArg::System => (Scope::System, None),
     };
     if kind == Kind::Trace && a.duration.is_none() {
         eprintln!(
@@ -1475,7 +1477,7 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
     let accepted = preflight_uretprobe_hazard(
         match &a.scope {
             ScopeArg::Pid(pid) => Some(*pid),
-            ScopeArg::Cgroup(_) => None,
+            ScopeArg::Cgroup(_) | ScopeArg::System => None,
         },
         a.allow_confined_uretprobe,
     )?;
@@ -2319,6 +2321,10 @@ fn no_modules_hint(scope: &ScopeArg) -> String {
              `p11scope doctor --cgroup {0}` to see why",
             path.display()
         ),
+        ScopeArg::System => "p11scope: no PKCS#11 modules discovered system-wide; run \
+             `p11scope inspect --pid <n>` for a process using PKCS#11 or \
+             `p11scope doctor` to see why"
+            .to_string(),
     }
 }
 
@@ -2570,9 +2576,10 @@ fn observe_fork(
     ) {
         return false;
     }
-    if ev.root_affiliation == 0
-        && (ev.event_type == event_type::FORK_INTO_CGROUP || !matches!(scope, Scope::Cgroup { .. }))
-    {
+    // System scope admits fork children exactly like cgroup scope: the whole
+    // machine is in scope, so no destination check can fail.
+    let multi_scope = matches!(scope, Scope::Cgroup { .. } | Scope::System);
+    if ev.root_affiliation == 0 && (ev.event_type == event_type::FORK_INTO_CGROUP || !multi_scope) {
         return true;
     }
     let parent_pid = (ev.pid_tgid >> 32) as u32;
@@ -2595,7 +2602,7 @@ fn observe_fork(
     if let Some(parent) = parent {
         tracker.history_root(parent, ev.root_affiliation);
     }
-    if ev.event_type == event_type::FORK_INTO_CGROUP || !matches!(scope, Scope::Cgroup { .. }) {
+    if ev.event_type == event_type::FORK_INTO_CGROUP || !multi_scope {
         return true;
     }
     let (child, retired) = tracker.admit_history(domain, ev.session as u32, ev.child_image);
@@ -2619,7 +2626,7 @@ fn initial_tracking_evidence(
 ) -> bool {
     match scope {
         Scope::Pid(_) => lifecycle_tracking_unavailable,
-        Scope::Cgroup { .. } => {
+        Scope::Cgroup { .. } | Scope::System => {
             process_creation_tracking_unavailable || lifecycle_tracking_unavailable
         }
     }
@@ -3195,6 +3202,7 @@ fn capture_profile(
                             ended: &ended,
                             kernel: &kernel,
                             policy,
+                            scope: scope.kind(),
                             ring_bytes: resolve_ring_bytes(ring_bytes),
                             drain_interval_ms: drain.as_millis() as u64,
                         };
@@ -6604,6 +6612,7 @@ mod tests {
             ended: "t1",
             kernel: "test",
             policy: CapturePolicy::AggregateOnly,
+            scope: "pid",
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
@@ -6692,6 +6701,7 @@ mod tests {
                         ended: "t1",
                         kernel: "test",
                         policy: CapturePolicy::AggregateOnly,
+                        scope: "pid",
                         ring_bytes: p11scope_ebpf_common::RING_BYTES,
                         drain_interval_ms: 1000,
                     },
@@ -6751,6 +6761,7 @@ mod tests {
             ended: "t1",
             kernel: "test",
             policy: CapturePolicy::Allowlisted,
+            scope: "pid",
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
@@ -6856,6 +6867,110 @@ mod tests {
     }
 
     #[test]
+    fn system_scope_counts_creation_and_lifecycle_tracking_like_cgroup_scope() {
+        assert!(initial_tracking_evidence(&Scope::System, true, false));
+        assert!(initial_tracking_evidence(&Scope::System, false, true));
+        assert!(!initial_tracking_evidence(&Scope::System, false, false));
+    }
+
+    #[test]
+    fn system_scope_admits_fork_children_without_a_destination_check() {
+        // One fork-safe C_OpenSession slot so the parent can hold an open
+        // session the child must inherit.
+        let names = vec!["C_OpenSession".to_string()];
+        let (descriptor_index, semantic_ambiguous) = crate::kinds::descriptor_index(&names);
+        let plan = crate::plan::AttachPlan::from_slots(vec![crate::plan::Slot {
+            index: 0,
+            descriptor_index,
+            object: crate::plan::TEST_PINNED_OBJECT,
+            object_path: "/opt/p11.so".into(),
+            file_offset: 0,
+            names,
+            aliased: false,
+            semantics: crate::kinds::DESCRIPTORS[descriptor_index as usize],
+            semantic_authorized: true,
+            semantic_ambiguous,
+            fork_safe: true,
+            module_ids: vec![crate::plan::ModuleId(0)],
+        }]);
+        let mut state = semantics::State::new(&plan);
+        let mut tracker =
+            process::Tracker::for_producer(crate::events::EventsDomain::test_standin(1), 16);
+        let domain = tracker.producer_domain();
+        let parent_image = p11scope_ebpf_common::ImageIdentity {
+            task_cookie: 90,
+            exec_id: 0,
+        };
+        let (parent, _) = tracker.admit_history(domain, 100, parent_image);
+        let parent = parent.expect("parent generation admits");
+        // Parent opens one session before forking.
+        let mut call: p11scope_ebpf_common::Event = unsafe { std::mem::zeroed() };
+        call.event_type = p11scope_ebpf_common::event_type::CALL;
+        call.pid_tgid = 100u64 << 32;
+        call.session = 7;
+        call.slot = 0;
+        call.rv = 0;
+        call.image = parent_image;
+        state.observe_process(parent, &call);
+        assert_eq!(state.sessions().opened, 1);
+        // Genuine birth: distinct child pid and distinct nonzero cookies.
+        let mut fork: p11scope_ebpf_common::Event = unsafe { std::mem::zeroed() };
+        fork.event_type = p11scope_ebpf_common::event_type::FORK;
+        fork.pid_tgid = 100u64 << 32;
+        fork.session = 200;
+        fork.image = parent_image;
+        fork.child_image = p11scope_ebpf_common::ImageIdentity {
+            task_cookie: 20,
+            exec_id: 0,
+        };
+        assert!(observe_fork(
+            domain,
+            &mut tracker,
+            &mut state,
+            &Scope::System,
+            &fork
+        ));
+        assert_eq!(
+            state.semantic_evidence().semantic_history_drops,
+            0,
+            "genuine fork must admit without history rejection"
+        );
+        assert_eq!(
+            state.sessions().inherited,
+            1,
+            "child must inherit the parent open session"
+        );
+        // Birth is one-shot: replaying it must not duplicate the inheritance.
+        assert!(observe_fork(
+            domain,
+            &mut tracker,
+            &mut state,
+            &Scope::System,
+            &fork
+        ));
+        assert_eq!(state.sessions().inherited, 1);
+        // Negative control: the old malformed shape (same pid, zero cookies)
+        // is handled but records a rejection.
+        let drops_before = state.semantic_evidence().semantic_history_drops;
+        let mut malformed: p11scope_ebpf_common::Event = unsafe { std::mem::zeroed() };
+        malformed.event_type = p11scope_ebpf_common::event_type::FORK;
+        malformed.pid_tgid = 100u64 << 32;
+        malformed.session = 100;
+        assert!(observe_fork(
+            domain,
+            &mut tracker,
+            &mut state,
+            &Scope::System,
+            &malformed
+        ));
+        assert_eq!(
+            state.semantic_evidence().semantic_history_drops,
+            drops_before + 1,
+            "malformed fork must record a rejection"
+        );
+    }
+
+    #[test]
     fn signal_state_retains_first_identity_and_saturates_sigint_deliveries() {
         let state = SignalState::new();
         state.observe(libc::SIGTERM);
@@ -6885,6 +7000,10 @@ mod tests {
             hint.contains("p11scope doctor --cgroup /sys/fs/cgroup/x"),
             "{hint}"
         );
+        let hint = no_modules_hint(&ScopeArg::System);
+        assert!(hint.contains("system-wide"), "{hint}");
+        assert!(hint.contains("p11scope inspect --pid"), "{hint}");
+        assert!(hint.contains("p11scope doctor"), "{hint}");
     }
 
     /// `inspect` propagates a hard error for a pid that names nothing; it must reach

@@ -32,6 +32,7 @@ use p11scope_ebpf_common::{
     EVIDENCE_RV_UPDATE_FAILURES, EVIDENCE_SEMANTIC_CAPTURE_FAILURES,
     EVIDENCE_START_INSERT_FAILURES, EVIDENCE_UNMATCHED_RETURNS, EVIDENCE_UNREGISTERED_MECHANISMS,
     Event, FLAG_CGROUP_FILTER, FLAG_PID_FILTER, FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED,
+    FLAG_SYSTEM_FILTER,
     FUNCTION_NAME_MAX_BYTES, FUNCTION_NONE, FunctionNameKey, ImageIdentity, LOADER_STATE_PRESENT,
     LinuxLayout, MAX_DESCRIPTORS, MAX_MECH_SHAPES, MAX_SLOTS, MECH_NONE, PAUSE_ARMED,
     PAUSE_REQUESTED, PauseKey, RING_BYTES, RV_ENTRIES, RvKey, SESSION_NONE, START_ENTRIES,
@@ -115,8 +116,8 @@ static COUNTERS: PerCpuArray<u64> = PerCpuArray::with_max_entries(DISCOVERY_COUN
 static PAUSE_PIDS: HashMap<PauseKey, u64> = HashMap::with_max_entries(1, 0);
 
 /// Does this call belong to the capture scope? With no filter configured
-/// nothing is observed — scope is always explicit (design spec: no
-/// magical system-wide capture).
+/// nothing is observed — scope is always explicit, and system-wide capture
+/// requires the explicit system scope bit (never a missing filter).
 fn bump_evidence(index: u32) {
     if let Some(value) = EVIDENCE.get_ptr_mut(index) {
         unsafe { *value += 1 };
@@ -278,6 +279,18 @@ fn scope_auth() -> Option<ScopeAuth> {
                 return None;
             }
         }
+    }
+    // `valid_config` above guarantees exactly one scope bit, so reaching here
+    // with the system bit set means PID and cgroup bits are both clear: every
+    // task passes after the owner-health and config gates. No pause token —
+    // pause stays PID-scoped (`valid_config` refuses the combination).
+    if flags & FLAG_SYSTEM_FILTER != 0 {
+        return Some(ScopeAuth {
+            flags,
+            tgid,
+            _pad: 0,
+            generation_token: 0,
+        });
     }
     None
 }
@@ -2574,7 +2587,9 @@ pub extern "C" fn p11_link_fork_allowed() -> u32 {
     let Some(scope) = scope_auth() else {
         return 0;
     };
-    if scope.flags & FLAG_CGROUP_FILTER == 0 {
+    // Fork birth records flow under cgroup and system scope alike; PID scope
+    // tracks a single process and never needs them.
+    if scope.flags & (FLAG_CGROUP_FILTER | FLAG_SYSTEM_FILTER) == 0 {
         return 0;
     }
     u32::from(scope.flags & FLAG_POLICY_AGGREGATE == 0)

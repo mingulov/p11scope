@@ -240,6 +240,7 @@ fn document(
             ended: &fmt_rfc3339(SystemTime::now()),
             kernel: kernel_release.trim(),
             policy: session.capture_policy(),
+            scope: scope.kind(),
             ring_bytes: resolve_ring_bytes(None),
             drain_interval_ms: PROFILE_CADENCE.as_millis() as u64,
         },

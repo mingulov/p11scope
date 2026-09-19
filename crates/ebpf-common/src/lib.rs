@@ -301,6 +301,7 @@ pub const fn unpack_task_newtask_offsets(value: u64) -> Option<(usize, usize)> {
 /// CONFIG flag bits.
 pub const FLAG_PID_FILTER: u64 = 1 << 0;
 pub const FLAG_CGROUP_FILTER: u64 = 1 << 1;
+pub const FLAG_SYSTEM_FILTER: u64 = 1 << 6;
 pub const FLAG_POLICY_ALLOWLISTED: u64 = 1 << 2;
 pub const FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA: u64 = 1 << 3;
 pub const FLAG_POLICY_AGGREGATE: u64 = 1 << 4;
@@ -309,25 +310,25 @@ pub const FLAG_PAUSE_ENABLED: u64 = 1 << 5;
 /// A loaded program may observe only an explicitly selected scope under one
 /// immutable capture policy. Unknown and multi-bit configurations fail closed.
 pub const fn valid_config(flags: u64) -> bool {
-    let scope = flags & (FLAG_PID_FILTER | FLAG_CGROUP_FILTER);
+    let scope = flags & (FLAG_PID_FILTER | FLAG_CGROUP_FILTER | FLAG_SYSTEM_FILTER);
     let policy = flags
         & (FLAG_POLICY_ALLOWLISTED
             | FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA
             | FLAG_POLICY_AGGREGATE);
     let known = FLAG_PID_FILTER
         | FLAG_CGROUP_FILTER
+        | FLAG_SYSTEM_FILTER
         | FLAG_POLICY_ALLOWLISTED
         | FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA
         | FLAG_POLICY_AGGREGATE
         | FLAG_PAUSE_ENABLED;
-    matches!(scope, FLAG_PID_FILTER | FLAG_CGROUP_FILTER)
-        && matches!(
-            policy,
-            FLAG_POLICY_ALLOWLISTED
-                | FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA
-                | FLAG_POLICY_AGGREGATE
-        )
-        && flags & !known == 0
+    matches!(
+        scope,
+        FLAG_PID_FILTER | FLAG_CGROUP_FILTER | FLAG_SYSTEM_FILTER
+    ) && matches!(
+        policy,
+        FLAG_POLICY_ALLOWLISTED | FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA | FLAG_POLICY_AGGREGATE
+    ) && flags & !known == 0
         && (flags & FLAG_PAUSE_ENABLED == 0 || scope == FLAG_PID_FILTER)
 }
 
@@ -2348,6 +2349,47 @@ mod safe_capture {
                 .map(|x| x.1),
             None
         );
+    }
+
+    #[test]
+    fn valid_config_accepts_exactly_one_of_three_scopes_with_one_policy() {
+        for scope in [FLAG_PID_FILTER, FLAG_CGROUP_FILTER, FLAG_SYSTEM_FILTER] {
+            for policy in [
+                FLAG_POLICY_ALLOWLISTED,
+                FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA,
+                FLAG_POLICY_AGGREGATE,
+            ] {
+                assert!(valid_config(scope | policy), "scope {scope:#x}");
+            }
+        }
+        for invalid in [
+            0,
+            FLAG_SYSTEM_FILTER,
+            FLAG_POLICY_ALLOWLISTED,
+            FLAG_PID_FILTER | FLAG_SYSTEM_FILTER | FLAG_POLICY_ALLOWLISTED,
+            FLAG_CGROUP_FILTER | FLAG_SYSTEM_FILTER | FLAG_POLICY_ALLOWLISTED,
+            FLAG_PID_FILTER | FLAG_CGROUP_FILTER | FLAG_SYSTEM_FILTER | FLAG_POLICY_ALLOWLISTED,
+            FLAG_SYSTEM_FILTER | FLAG_POLICY_ALLOWLISTED | FLAG_POLICY_AGGREGATE,
+            FLAG_SYSTEM_FILTER | FLAG_POLICY_ALLOWLISTED | (1 << 63),
+        ] {
+            assert!(
+                !valid_config(invalid),
+                "accepted invalid CONFIG {invalid:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn pause_stays_pid_only_when_system_scope_is_selected() {
+        assert!(valid_config(
+            FLAG_PID_FILTER | FLAG_POLICY_ALLOWLISTED | FLAG_PAUSE_ENABLED
+        ));
+        assert!(!valid_config(
+            FLAG_SYSTEM_FILTER | FLAG_POLICY_ALLOWLISTED | FLAG_PAUSE_ENABLED
+        ));
+        assert!(!valid_config(
+            FLAG_CGROUP_FILTER | FLAG_POLICY_ALLOWLISTED | FLAG_PAUSE_ENABLED
+        ));
     }
 
     #[test]

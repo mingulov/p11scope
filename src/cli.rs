@@ -16,6 +16,7 @@ pub enum Kind {
 pub enum ScopeArg {
     Pid(u32),
     Cgroup(PathBuf),
+    System,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,7 +154,7 @@ pub enum CliError {
 
 pub const USAGE: &str = "usage:
   p11scope --version
-  p11scope profile [--pid <n> | --cgroup <path>] [--module <provider.so>]... [--manifest <m.json>]...
+  p11scope profile [--pid <n> | --cgroup <path> | --system] [--module <provider.so>]... [--manifest <m.json>]...
                    [--mode profile|metrics] [--duration <30|30s|5m|1h>] [-o <out.json>]
                    [--hook-symbol <NAME[:functionlist|interfacelist|interface]>]...
                    [--unsafe-unvalidated-metadata]
@@ -178,14 +179,16 @@ nothing, auto only when the child would otherwise load unobserved, always on eve
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
 ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
-every descendant (kernel >= 5.15). Provider identity is pinned by SHA-256 at attach and
+every descendant (kernel >= 5.15). --system captures every process on the machine with
+no cgroup path; per-process and per-module attribution is still recorded. Provider
+identity is pinned by SHA-256 at attach and
 checked for in-place change during capture (evidence.provider_changed).
 ";
 /// `p11scope profile --help`: that subcommand's usage section plus the
 /// shared notes footer. Every line is verbatim from [`USAGE`]; update
 /// both together when the CLI changes.
 const PROFILE_HELP: &str = "usage:
-  p11scope profile [--pid <n> | --cgroup <path>] [--module <provider.so>]... [--manifest <m.json>]...
+  p11scope profile [--pid <n> | --cgroup <path> | --system] [--module <provider.so>]... [--manifest <m.json>]...
                    [--mode profile|metrics] [--duration <30|30s|5m|1h>] [-o <out.json>]
                    [--hook-symbol <NAME[:functionlist|interfacelist|interface]>]...
                    [--unsafe-unvalidated-metadata]
@@ -202,7 +205,9 @@ nothing, auto only when the child would otherwise load unobserved, always on eve
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
 ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
-every descendant (kernel >= 5.15). Provider identity is pinned by SHA-256 at attach and
+every descendant (kernel >= 5.15). --system captures every process on the machine with
+no cgroup path; per-process and per-module attribution is still recorded. Provider
+identity is pinned by SHA-256 at attach and
 checked for in-place change during capture (evidence.provider_changed).
 ";
 
@@ -222,7 +227,9 @@ nothing, auto only when the child would otherwise load unobserved, always on eve
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
 ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
-every descendant (kernel >= 5.15). Provider identity is pinned by SHA-256 at attach and
+every descendant (kernel >= 5.15). --system captures every process on the machine with
+no cgroup path; per-process and per-module attribution is still recorded. Provider
+identity is pinned by SHA-256 at attach and
 checked for in-place change during capture (evidence.provider_changed).
 ";
 
@@ -243,7 +250,9 @@ nothing, auto only when the child would otherwise load unobserved, always on eve
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
 ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
-every descendant (kernel >= 5.15). Provider identity is pinned by SHA-256 at attach and
+every descendant (kernel >= 5.15). --system captures every process on the machine with
+no cgroup path; per-process and per-module attribution is still recorded. Provider
+identity is pinned by SHA-256 at attach and
 checked for in-place change during capture (evidence.provider_changed).
 ";
 
@@ -262,7 +271,9 @@ nothing, auto only when the child would otherwise load unobserved, always on eve
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
 ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
-every descendant (kernel >= 5.15). Provider identity is pinned by SHA-256 at attach and
+every descendant (kernel >= 5.15). --system captures every process on the machine with
+no cgroup path; per-process and per-module attribution is still recorded. Provider
+identity is pinned by SHA-256 at attach and
 checked for in-place change during capture (evidence.provider_changed).
 ";
 
@@ -281,7 +292,9 @@ nothing, auto only when the child would otherwise load unobserved, always on eve
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
 ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
-every descendant (kernel >= 5.15). Provider identity is pinned by SHA-256 at attach and
+every descendant (kernel >= 5.15). --system captures every process on the machine with
+no cgroup path; per-process and per-module attribution is still recorded. Provider
+identity is pinned by SHA-256 at attach and
 checked for in-place change during capture (evidence.provider_changed).
 ";
 
@@ -542,6 +555,7 @@ pub fn parse_capture(
     let mut common = Common::default();
     let mut pid: Option<u32> = None;
     let mut cgroup: Option<PathBuf> = None;
+    let mut system = false;
 
     while let Some(a) = args.next() {
         if capture_option(&mut common, a.as_str(), &mut args)? {
@@ -551,15 +565,25 @@ pub fn parse_capture(
             "--help" | "-h" => return Err(CliError::Help(kind.help_topic())),
             "--pid" => pid = Some(require_pid(&mut args)?),
             "--cgroup" => cgroup = Some(require_value(&mut args, "--cgroup")?.into()),
+            "--system" => system = true,
             other => return Err(unknown_arg(other)),
         }
     }
 
-    let scope = match (pid, cgroup) {
-        (Some(p), None) => ScopeArg::Pid(p),
-        (None, Some(c)) => ScopeArg::Cgroup(c),
-        (None, None) => return Err(usage_err("exactly one of --pid or --cgroup is required")),
-        (Some(_), Some(_)) => return Err(usage_err("--pid and --cgroup are mutually exclusive")),
+    let scope = match (pid, cgroup, system) {
+        (Some(p), None, false) => ScopeArg::Pid(p),
+        (None, Some(c), false) => ScopeArg::Cgroup(c),
+        (None, None, true) => ScopeArg::System,
+        (None, None, false) => {
+            return Err(usage_err(
+                "exactly one of --pid, --cgroup, or --system is required",
+            ));
+        }
+        _ => {
+            return Err(usage_err(
+                "--pid, --cgroup, and --system are mutually exclusive",
+            ));
+        }
     };
 
     if kind == Kind::Profile && common.max_events.is_some() {
@@ -618,9 +642,9 @@ fn parse_run(mut args: impl Iterator<Item = String>) -> Result<RunArgs, CliError
                 };
             }
             "--kill-on-timeout" => kill_on_timeout = true,
-            "--pid" | "--cgroup" => {
+            "--pid" | "--cgroup" | "--system" => {
                 return Err(usage_err(
-                    "run has no --pid or --cgroup: it captures exactly the command it starts",
+                    "run has no --pid, --cgroup, or --system: it captures exactly the command it starts",
                 ));
             }
             "--" => {
@@ -795,6 +819,39 @@ mod tests {
     }
 
     #[test]
+    fn system_scope_selects_the_whole_machine_with_no_path() {
+        let Command::Profile(a) = parse(args(&["profile", "--system"])).unwrap() else {
+            panic!("expected profile")
+        };
+        assert_eq!(a.scope, ScopeArg::System);
+        let Command::Trace(t) = parse(args(&["trace", "--system", "--max-events", "10"])).unwrap()
+        else {
+            panic!("expected trace")
+        };
+        assert_eq!(t.scope, ScopeArg::System);
+        assert_eq!(t.max_events, Some(10));
+    }
+
+    #[test]
+    fn system_scope_is_mutually_exclusive_with_pid_and_cgroup() {
+        for extra in [
+            vec!["--pid", "1"],
+            vec!["--cgroup", "/sys/fs/cgroup/x"],
+            vec!["--pid", "1", "--cgroup", "/sys/fs/cgroup/x"],
+        ] {
+            let mut argv = vec!["profile", "--system"];
+            argv.extend(extra);
+            assert!(
+                matches!(parse(args(&argv)), Err(CliError::Usage(m)) if m.contains("mutually exclusive")),
+                "{argv:?}"
+            );
+        }
+        assert!(
+            matches!(parse(args(&["profile"])), Err(CliError::Usage(m)) if m.contains("--system"))
+        );
+    }
+
+    #[test]
     fn a_malformed_hook_symbol_is_a_usage_error_naming_the_spec() {
         assert!(matches!(
             parse(args(&["profile", "--pid", "1", "--hook-symbol", "X:bogus"])),
@@ -842,7 +899,7 @@ mod tests {
             matches!(parse_capture(Kind::Profile, args(&["--manifest", "m", "--pid", "1", "--cgroup", "/sys/fs/cgroup/x"])), Err(CliError::Usage(m)) if m.contains("mutually exclusive"))
         );
         assert!(
-            matches!(parse_capture(Kind::Profile, args(&["--manifest", "m"])), Err(CliError::Usage(m)) if m.contains("exactly one of --pid or --cgroup"))
+            matches!(parse_capture(Kind::Profile, args(&["--manifest", "m"])), Err(CliError::Usage(m)) if m.contains("exactly one of --pid, --cgroup, or --system"))
         );
     }
 
@@ -1023,9 +1080,10 @@ mod tests {
         for scoped in [
             vec!["run", "--pid", "1", "--", "/bin/true"],
             vec!["run", "--cgroup", "/sys/fs/cgroup/x", "--", "/bin/true"],
+            vec!["run", "--system", "--", "/bin/true"],
         ] {
             assert!(
-                matches!(parse(args(&scoped)), Err(CliError::Usage(m)) if m.contains("run has no --pid or --cgroup")),
+                matches!(parse(args(&scoped)), Err(CliError::Usage(m)) if m.contains("run has no --pid, --cgroup, or --system")),
                 "{scoped:?}"
             );
         }
@@ -1161,8 +1219,8 @@ mod tests {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(1099511628211);
         }
-        assert_eq!(USAGE.len(), 2371);
-        assert_eq!(hash, 0xa0e8bebd_f7040108);
+        assert_eq!(USAGE.len(), 2508);
+        assert_eq!(hash, 0x690b2a9f_a9d9137c);
         assert_eq!(HelpTopic::Global.text(), USAGE);
     }
 

@@ -5681,13 +5681,13 @@ fn scope_auth_layout_and_padding_are_explicit_and_initialized() {
         let constructors = between(source, "fn scope_auth()", "fn scope_flags()");
         assert_eq!(
             constructors.matches("ScopeAuth {").count(),
-            2,
-            "scope_auth must retain both constructors"
+            3,
+            "scope_auth must retain all three scope constructors"
         );
         assert_eq!(
             constructors.matches("_pad: 0").count(),
-            2,
-            "both ScopeAuth constructors must initialize padding"
+            3,
+            "every ScopeAuth constructor must initialize padding"
         );
     };
     assert_contract(&source);
@@ -6527,7 +6527,11 @@ fn usage_documents_every_subcommand_and_capture_needs_no_manifest() {
         (vec!["run", "--", ""], "-- CMD [ARGS...]"),
         (
             vec!["run", "--pid", "1", "--", "/bin/true"],
-            "run has no --pid or --cgroup",
+            "run has no --pid, --cgroup, or --system",
+        ),
+        (
+            vec!["run", "--system", "--", "/bin/true"],
+            "run has no --pid, --cgroup, or --system",
         ),
         (
             vec!["run", "--pause", "sometimes", "--", "/bin/true"],
@@ -7717,6 +7721,7 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
             ended: "1970-01-01T00:00:01Z",
             kernel: "6.8.0",
             policy: p11scope::attach::CapturePolicy::AggregateOnly,
+            scope: "pid",
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         },

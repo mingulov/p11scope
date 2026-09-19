@@ -656,6 +656,23 @@ pub enum Scope {
         path: PathBuf,
         dir: Arc<File>,
     },
+    /// Whole-machine capture: every process passes the BPF scope gate. No
+    /// PID list and no cgroup descriptor are published; userspace discovery
+    /// sweeps `/proc` under the same scan cap as cgroup scope.
+    System,
+}
+
+impl Scope {
+    /// Stable scope kind for the JSON `capture` section (`pid`, `cgroup`,
+    /// `system`). No PID number or cgroup path is published — identity stays
+    /// in diagnostics, never in the report.
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Pid(_) => "pid",
+            Self::Cgroup { .. } => "cgroup",
+            Self::System => "system",
+        }
+    }
 }
 
 /// Immutable capture behavior selected by userspace before attachment.
@@ -742,7 +759,9 @@ fn pause_key_for(
             "owned pause generation PID {} does not match selected PID {pid}",
             capability.tgid
         ),
-        (Scope::Cgroup { .. }, Some(_)) => bail!("owned pause generation requires PID scope"),
+        (Scope::Cgroup { .. } | Scope::System, Some(_)) => {
+            bail!("owned pause generation requires PID scope")
+        }
     }
 }
 
@@ -1746,9 +1765,9 @@ impl Session {
                         Scope::Pid(pid) => UProbeScope::OneProcess(
                             std::num::NonZeroU32::new(*pid).context("pid must be non-zero")?,
                         ),
-                        // Cgroup scoping is enforced in BPF, so the probe itself is
-                        // process-wide and the filter map decides.
-                        Scope::Cgroup { .. } => UProbeScope::AllProcesses,
+                        // Cgroup and system scoping are enforced in BPF, so the
+                        // probe itself is process-wide and the CONFIG bit decides.
+                        Scope::Cgroup { .. } | Scope::System => UProbeScope::AllProcesses,
                     };
                 }
                 SessionPreparation::LoadProgram(prog_name) => {
@@ -4447,6 +4466,7 @@ mod tests {
         let cgroup_dir = tempfile::tempdir().unwrap();
         let cgroup = crate::scope::cgroup(cgroup_dir.path()).unwrap();
         assert!(pause_key_for(&cgroup, Some(&capability)).is_err());
+        assert!(pause_key_for(&Scope::System, Some(&capability)).is_err());
 
         let key = pause_key_for(&Scope::Pid(42), Some(&capability))
             .unwrap()
@@ -4455,5 +4475,14 @@ mod tests {
         assert_eq!(key.pad, 0);
         assert_eq!(key.generation_token, 99);
         assert!(pause_key_for(&Scope::Pid(42), None).unwrap().is_none());
+    }
+
+    #[test]
+    fn scope_kind_reports_the_stable_json_label() {
+        assert_eq!(Scope::Pid(7).kind(), "pid");
+        let cgroup_dir = tempfile::tempdir().unwrap();
+        let cgroup = crate::scope::cgroup(cgroup_dir.path()).unwrap();
+        assert_eq!(cgroup.kind(), "cgroup");
+        assert_eq!(Scope::System.kind(), "system");
     }
 }

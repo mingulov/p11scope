@@ -997,6 +997,7 @@ pub fn json(reports: &[SlotReport], ev: &Evidence, capture: &CaptureMeta<'_>) ->
         "schema": "p11scope/observed-profile/v3-metrics",
         "capture": { "start": capture.started, "end": capture.ended, "mode": "metrics",
                      "privacy_mode": capture.policy.privacy_mode(),
+                     "scope": capture.scope,
                      "kernel": capture.kernel,
                      "ring_bytes": capture.ring_bytes,
                      "drain_interval_ms": capture.drain_interval_ms,
@@ -1264,6 +1265,8 @@ pub struct CaptureMeta<'a> {
     pub ended: &'a str,
     pub kernel: &'a str,
     pub policy: CapturePolicy,
+    /// Capture scope kind: `pid`, `cgroup`, or `system` (`Scope::kind`).
+    pub scope: &'static str,
     /// Effective EVENTS ringbuf size in bytes (`--ring-bytes` or default).
     pub ring_bytes: u32,
     /// Effective capture-loop tick in ms (`--drain-interval-ms` or default).
@@ -1366,6 +1369,7 @@ pub fn profile_json(
         "capture": {
             "start": capture.started, "end": capture.ended, "mode": "profile",
             "privacy_mode": capture.policy.privacy_mode(),
+            "scope": capture.scope,
             "kernel": capture.kernel,
             "ring_bytes": capture.ring_bytes,
             "drain_interval_ms": capture.drain_interval_ms,
@@ -1928,6 +1932,7 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: CapturePolicy::Allowlisted,
+            scope: "pid",
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         }
@@ -2631,6 +2636,7 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: CapturePolicy::Allowlisted,
+            scope: "pid",
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
@@ -2997,6 +3003,7 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: crate::attach::CapturePolicy::AggregateOnly,
+            scope: "pid",
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
@@ -3107,12 +3114,71 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: crate::attach::CapturePolicy::Allowlisted,
+            scope: "pid",
             ring_bytes: 4096,
             drain_interval_ms: 1000,
         };
         let v = profile_json(&[], &ev, &state, &capture);
         assert_eq!(v["capture"]["ring_bytes"], 4096);
         assert_eq!(v["capture"]["drain_interval_ms"], 1000);
+    }
+
+    #[test]
+    fn profile_and_metrics_json_disclose_the_scope_kind() {
+        let mut ev = evidence();
+        ev.verdict();
+        let state = crate::semantics::State::with_policy(
+            &empty_plan(),
+            crate::attach::CapturePolicy::Allowlisted,
+        );
+        for scope in ["pid", "cgroup", "system"] {
+            let capture = CaptureMeta {
+                started: "t0",
+                ended: "t1",
+                kernel: "6.8.0",
+                policy: crate::attach::CapturePolicy::Allowlisted,
+                scope,
+                ring_bytes: 4096,
+                drain_interval_ms: 1000,
+            };
+            let profile = profile_json(&[], &ev, &state, &capture);
+            assert_eq!(profile["capture"]["scope"], scope);
+            let metrics = json(&[], &ev, &capture);
+            assert_eq!(metrics["capture"]["scope"], scope);
+        }
+    }
+
+    #[test]
+    fn cap_skip_forces_partial_in_profile_and_metrics() {
+        // A scan-cap skip alone flips a clean evidence to PARTIAL, and the
+        // public record stays categorical: no pid, path, or count details.
+        let mut ev = evidence();
+        ev.skipped = vec![capture_skipped_out(&Skipped {
+            subject: "system".into(),
+            reason: "3 processes in scope; discovery selected 1 for deep scanning by provider rarity (limit 1); unselected processes may contain undiscovered providers".into(),
+        })];
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        let expected = serde_json::json!({
+            "name": "discovery subject",
+            "reason": "discovery unavailable",
+        });
+        let profile = profile_json(
+            &reports_fixture(),
+            &ev,
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        assert_eq!(profile["evidence"]["completeness"], "PARTIAL");
+        assert_eq!(profile["evidence"]["skipped"][0], expected);
+        assert!(
+            !profile["evidence"]["skipped"][0]
+                .to_string()
+                .contains("processes in scope")
+        );
+        let metrics = json(&[], &ev, &capture_fixture());
+        assert_eq!(metrics["evidence"]["completeness"], "PARTIAL");
+        assert_eq!(metrics["evidence"]["skipped"][0], expected);
     }
 
     #[test]
@@ -3124,6 +3190,7 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: crate::attach::CapturePolicy::AggregateOnly,
+            scope: "pid",
             ring_bytes: 262_144,
             drain_interval_ms: 200,
         };
@@ -3297,6 +3364,7 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: CapturePolicy::UnsafeUnvalidatedMetadata,
+            scope: "pid",
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
@@ -3337,6 +3405,7 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: CapturePolicy::UnsafeUnvalidatedMetadata,
+            scope: "pid",
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
@@ -3384,6 +3453,7 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: CapturePolicy::UnsafeUnvalidatedMetadata,
+            scope: "pid",
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
@@ -3412,6 +3482,7 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: CapturePolicy::UnsafeUnvalidatedMetadata,
+            scope: "pid",
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
@@ -3449,6 +3520,7 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: CapturePolicy::UnsafeUnvalidatedMetadata,
+            scope: "pid",
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
@@ -3492,6 +3564,7 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: CapturePolicy::UnsafeUnvalidatedMetadata,
+            scope: "pid",
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
@@ -3580,6 +3653,7 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: CapturePolicy::UnsafeUnvalidatedMetadata,
+            scope: "pid",
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
@@ -3647,6 +3721,7 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: CapturePolicy::UnsafeUnvalidatedMetadata,
+            scope: "pid",
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };

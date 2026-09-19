@@ -1,13 +1,15 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Capture scope. The BPF side observes nothing until a filter is
-//! installed — there is no implicit system-wide capture.
+//! installed — scope is always explicit, and system-wide capture requires
+//! the explicit system scope, never a missing filter.
 
 use crate::attach::{CapturePolicy, Scope};
 use anyhow::{Context as _, Result, bail};
 use aya::Ebpf;
 use aya::maps::{Array, CgroupArray, HashMap};
 use p11scope_ebpf_common::{
-    CFG_FLAGS, FLAG_CGROUP_FILTER, FLAG_PAUSE_ENABLED, FLAG_PID_FILTER, valid_config,
+    CFG_FLAGS, FLAG_CGROUP_FILTER, FLAG_PAUSE_ENABLED, FLAG_PID_FILTER, FLAG_SYSTEM_FILTER,
+    valid_config,
 };
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -173,6 +175,7 @@ pub(crate) fn publish(
     let scope_flag = match scope {
         Scope::Pid(_) => FLAG_PID_FILTER,
         Scope::Cgroup { .. } => FLAG_CGROUP_FILTER,
+        Scope::System => FLAG_SYSTEM_FILTER,
     };
     let pause_flag = generation_token.map_or(0, |_| FLAG_PAUSE_ENABLED);
     let config = scope_flag | policy.config_bit() | pause_flag;
@@ -202,6 +205,10 @@ pub(crate) fn publish(
                 Ok(())
             })?;
         }
+        // System scope publishes no PID list and no cgroup descriptor: the
+        // CONFIG bit alone authorizes every task. The empty-PID readback
+        // below proves nothing was written.
+        Scope::System => {}
     }
 
     let pids: HashMap<_, u32, u64> =
@@ -227,12 +234,12 @@ mod tests {
     use super::*;
     use p11scope_ebpf_common::{
         FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED, FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA,
-        valid_config,
+        FLAG_SYSTEM_FILTER, valid_config,
     };
 
     #[test]
     fn config_requires_exactly_one_scope_and_one_policy() {
-        for scope in [FLAG_PID_FILTER, FLAG_CGROUP_FILTER] {
+        for scope in [FLAG_PID_FILTER, FLAG_CGROUP_FILTER, FLAG_SYSTEM_FILTER] {
             for policy in [
                 FLAG_POLICY_ALLOWLISTED,
                 FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA,
@@ -245,8 +252,11 @@ mod tests {
         for invalid in [
             0,
             FLAG_PID_FILTER,
+            FLAG_SYSTEM_FILTER,
             FLAG_POLICY_ALLOWLISTED,
             FLAG_PID_FILTER | FLAG_CGROUP_FILTER | FLAG_POLICY_ALLOWLISTED,
+            FLAG_PID_FILTER | FLAG_SYSTEM_FILTER | FLAG_POLICY_ALLOWLISTED,
+            FLAG_CGROUP_FILTER | FLAG_SYSTEM_FILTER | FLAG_POLICY_ALLOWLISTED,
             FLAG_PID_FILTER | FLAG_POLICY_ALLOWLISTED | FLAG_POLICY_AGGREGATE,
             FLAG_PID_FILTER | FLAG_POLICY_ALLOWLISTED | FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA,
             FLAG_PID_FILTER | FLAG_POLICY_ALLOWLISTED | (1 << 63),

@@ -185,3 +185,10 @@ Build env: TMPDIR=/var/tmp/p11scope-ws-tmp cargo +1.88 --locked --offline.
   outside engine/scan/tests).
 - Task 1.3: fix round 1/5 dispatched (bounded_skip alignment +
   self-test pair); FIX_BASE 2162716.
+- Task 1.3: fix round 1/5 (1 addressed, 0 open — bounded_skip
+  accepts ("unknown","null pointer") via entry_skips + self-test
+  pair; commits 2162716..5d78628). Re-review: all findings
+  addressed, no breakage. Merge gate on 681784e: checker self-test
+  OK, lib 1079/0.
+- Task 1.3: complete (commits 246f575..5d78628, review clean after
+  1 fix round; 2 minors deferred to final review).

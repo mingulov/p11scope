@@ -242,3 +242,14 @@ Build env: TMPDIR=/var/tmp/p11scope-ws-tmp cargo +1.88 --locked --offline.
   all heap publication flows through single
   lower_heap_export_record + shared read_exact_table_bracketed —
   no bypass, constraint intent satisfied structurally.
+- Task 1.5: complete (commits ab3863b..ed2c557 + pin hotfix
+  75d3432; review clean, 8 minors deferred; merged 3d91366).
+  Merge pre-step on idle box: contracts 125/126 — the 1 failure
+  was 1.4 fallout (19c6296 renamed the bootstrap self-test
+  marker without updating the Rust pin; 1.4's gate never ran
+  the wrapper). Controller hotfix: pin synced + new ordinal
+  marker pinned (strengthening); targeted test green 0.59s on
+  branch, 0.58s on merged tree. Lesson: oracle rewrites must
+  run the wrapper tests that pin their markers — add to future
+  dispatch gates. Canary + lane13 passed on the idle box,
+  confirming the contention-flake diagnosis.

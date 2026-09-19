@@ -92,6 +92,14 @@ Build env: TMPDIR=/var/tmp/p11scope-ws-tmp cargo +1.88 --locked --offline.
   by the license test (green). Cost if wrong: nil, test decides.
 - Task 2.1: minor (deferred to 2.2): empty-offsets `assert!` should become a
   returned error at wiring time; add bisect_attach unit tests when wired.
+- Task 3.3: complete (c806234, merged 400b655). Sink-open moved above
+  Engine::discover; ordering test RED-proven (fails on old run.rs) + GREEN;
+  fmt clean; clippy delta-zero (3 known pre-existing). Merged-tree full
+  suite: 1070/1071 lib pass; 1 failure in
+  actual_handoff_helpers_preserve_errno (pure helper unit test, never calls
+  capture()/sink-open — provably disjoint from the 7-line diff; green in
+  isolation 0.01s; worker's own suite green) = contention flake under 3
+  parallel suites, not a regression. Recorded, not re-run.
 - Ruling (SUPERSEDED 2026-09-19): goal pre-commits to multi-uprobe; plan's
   Task 2.1 comparison is reframed as WHICH loader (Aya backport vs raw
   helper), not WHETHER multi. Task 1.6 still decides SCOPE (broad vs

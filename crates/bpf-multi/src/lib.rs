@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Minimal multi-uprobe link helper (Task 2.1 spike vendor, UNWIRED).
 //!
 //! Provenance: `link_create` UAPI layout is borrowed from `ossl-bpf-sys`

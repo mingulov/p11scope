@@ -74,6 +74,14 @@ Build env: TMPDIR=/var/tmp/p11scope-ws-tmp cargo +1.88 --locked --offline.
   Running alongside 1.2 (admission files). 4/7 slots used.
 - Wave +1 (2026-09-19): measurement-harness worker (scripts/+docs/notes new
   files only) for 1.4/1.6/3.1 baselines. 5/7 slots used.
+- 1.2 worker replacement (2026-09-19): original worker went silent (no file
+  activity 30+ min, no processes, status nudge ignored, followup
+  undeliverable: 'no exact live child mapping'; cancel also failed on task
+  link storage). WIP preserved as 7c6f0da on task-1.2/ordered-admission;
+  fresh worker dispatched on the same worktree to continue from HEAD (keeps
+  target/ cache). If the ghost delivers late, reconcile by diff, not by
+  double-merge. New worker brief requires BLOCKED-with-WIP-commit over
+  silence. 6/7 slots nominally used (ghost may not be real).
 - Ruling (SUPERSEDED 2026-09-19): goal pre-commits to multi-uprobe; plan's
   Task 2.1 comparison is reframed as WHICH loader (Aya backport vs raw
   helper), not WHETHER multi. Task 1.6 still decides SCOPE (broad vs

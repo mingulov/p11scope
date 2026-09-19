@@ -225,3 +225,20 @@ Build env: TMPDIR=/var/tmp/p11scope-ws-tmp cargo +1.88 --locked --offline.
 - Follow-up OPEN (from 1.4): map-resize/epoch capacity task, sized
   after 1.6. Must record refused (dev,ino) (currently name+reason
   only — audit gap).
+- Task 1.5: implementer DONE (ed2c557, `feat: publication-driven
+  admission for heap wrappers`). Nine TDD cases (exact sets +
+  workload counts), heap lowering via shared bracketed reader,
+  RuntimeTableIdentity accounting, full-lifetime costing asserted
+  per case. Worker gate: lib 1088/0, publication 9/9, broad
+  integration suites green; contracts skipped (loaded box).
+- Task 1.5: task review: spec ✅, quality Approved, no
+  Critical/Important. Guards extended-not-removed verified by
+  symbol+hunk absence; nine cases exact-set; linkage/naming
+  contract intact. 8 minors deferred (t6/t8/t4 gap-size pins,
+  cross-record bracket sharing, untested refusal/proxy arms,
+  preamble duplication, plan.rs spill extra, evidence noise) —
+  final review triages. Controller ⚠️ closed:
+  `publication_consumed` has no code symbol (plan-concept name);
+  all heap publication flows through single
+  lower_heap_export_record + shared read_exact_table_bracketed —
+  no bypass, constraint intent satisfied structurally.

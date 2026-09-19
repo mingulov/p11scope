@@ -192,3 +192,36 @@ Build env: TMPDIR=/var/tmp/p11scope-ws-tmp cargo +1.88 --locked --offline.
   OK, lib 1079/0.
 - Task 1.3: complete (commits 246f575..5d78628, review clean after
   1 fix round; 2 minors deferred to final review).
+- Task 1.4: implementer DONE (19c6296 oracle re-baseline + b9bc42a
+  baseline note; numbers in commit message). Baseline: pid cells
+  20006/20006 exact per-name both modes; system cells 20002→0 TRUE
+  MISS (K=4 spends 410 slots on dormant p11-kit templates,
+  whole-refuses the active provider; stable 4/4). Capacity: honest
+  union 774 > 512 → keep 512 + honest refusal for Phase 1, open
+  map-resize/epoch follow-up (sized after 1.6). Routed items done:
+  scan-only `unknown` re-baselined (e2e green), proxy validator
+  rewritten to K=4 shape. Per-PID attach false positive does NOT
+  reproduce on this tree.
+- Task 1.4: task review: spec ✅, quality Approved, no
+  Critical/Important. Oracle edits verified strengthening. 6 minors
+  deferred (M1 load folded note; M2 name-the-five sentence; M3
+  binary sha256; M4 Δ4 truth note; M5 p11-kit shape brittleness;
+  M6 green-log archiving) — final review triages. Controller ⚠️
+  closed: W1 records carry full 38-counter universe, zero nulls,
+  five mapped explicit (event_loss 0/19226/0/201,
+  discovery_ring_loss 0/0/4082/4239; no bare ring_loss key); W2
+  numbers in b9bc42a body; W3 follow-up opened here (map-resize/
+  epoch, sized after 1.6, must record refused (dev,ino)).
+- Task 1.4: complete (commits 681784e..b9bc42a, review clean;
+  merged ab3863b). Merge gate: checker self-test OK. Note: proxy
+  lane live self-test RC=1 is pre-existing environmental
+  (hardcoded WORK=target/matrix-proxy vs fails-closed ancestor
+  check on writable /home/user/src; 1.4 untouched that code) —
+  not a merge blocker; lane workdir policy is a follow-up, not
+  1.4 scope. Cost if wrong: a 1.4 oracle regression hides behind
+  the environmental failure; mitigated by checker self-test OK
+  (covers rewritten proxy mutations) + reviewer-verified
+  strengthening.
+- Follow-up OPEN (from 1.4): map-resize/epoch capacity task, sized
+  after 1.6. Must record refused (dev,ino) (currently name+reason
+  only — audit gap).

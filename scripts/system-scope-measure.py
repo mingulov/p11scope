@@ -326,6 +326,8 @@ def build_summary(record):
         f"  tables admitted={ev['tables_admitted']} "
         f"refused={ev['tables_refused']} "
         f"(entries seen={ev['table_entries']})",
+        f"  K=4 spill (uncorroborated candidates)"
+        f"={ev['spill_uncorroborated_candidates']}",
         f"  slots allocated={ev['slots_allocated']} "
         f"active_derived={ev['slots_active_derived']} "
         f"(attached_probes={ev['attached_probes']})",
@@ -488,6 +490,13 @@ def main(argv):
             "modules_skipped": evidence.get("modules_skipped", []),
             "tables_admitted": tables_admitted,
             "tables_refused": tables_refused,
+            "spill_uncorroborated_candidates": evidence.get(
+                "discovery_uncorroborated_candidates"
+            ),
+            "spill_note": "K=4 per-object heuristic spill: decoded but "
+            "unadmitted tables. Informational in check-capture-evidence.py "
+            "(not a COUNTER), recorded here because capacity analysis "
+            "needs it.",
             "surfaces_total": len(surfaces),
             "in_flight_at_end": evidence.get("in_flight_at_end"),
             "attach_mechanisms": evidence.get("attach_mechanisms"),
@@ -512,8 +521,9 @@ def main(argv):
             "BPF load is folded into attach_s (no external marker).",
             "Observer CPU/RSS are wall-window samples; noisy under concurrent "
             "build load (sibling workers) — see the design note.",
-            "counts_match for pid scope requires exact equality; for system "
-            "scope it requires observed >= truth per function.",
+            "counts_match for pid scope requires exact per-name equality; "
+            "for system scope (scan-only, unknown names) it requires "
+            "observed total >= truth total.",
         ],
     }
     Path(args.out).write_text(json.dumps(record, indent=2) + "\n",

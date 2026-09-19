@@ -225,8 +225,10 @@ class OfflineFixture:
             ["git", "bundle", "create", str(self.shared / "source.bundle"), "HEAD"],
             cwd=REPOSITORY, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
-        (self.shared / "LICENSE-MIT").write_text("fixture MIT license\n", encoding="utf-8")
-        (self.shared / "LICENSE-APACHE").write_text("fixture Apache license\n", encoding="utf-8")
+        (self.shared / "LICENSE").write_text("fixture GPL-3.0 license\n", encoding="utf-8")
+        (self.shared / "LICENSES").mkdir()
+        (self.shared / "LICENSES/GPL-2.0-only.txt").write_text(
+            "fixture GPL-2.0 license\n", encoding="utf-8")
 
         self.vendor_template = temporary / "Cargo vendor result"
         self.vendor_template.mkdir()
@@ -728,7 +730,9 @@ class OfflineDependenciesTests(unittest.TestCase):
         pristine = Path(self.temporary.name) / "pristine"
         shutil.copytree(self.fixture.output, pristine)
         mutations = (
-            ("missing license", lambda p: (p / "provenance/shared/LICENSE-MIT").unlink(), "missing payload entry"),
+            ("missing license", lambda p: (p / "provenance/shared/LICENSE").unlink(), "missing payload entry"),
+            ("missing nested license", lambda p: (p / "provenance/shared/LICENSES/GPL-2.0-only.txt").unlink(),
+             "missing payload entry"),
             ("missing archive", lambda p: (p / "archives/demo-1.0.0.crate").unlink(), "archive set mismatch"),
             ("extra entry", lambda p: ((p / "extra").write_text("extra"), (p / "extra").chmod(0o644)),
              "unexpected payload entry"),

@@ -395,8 +395,18 @@ partial). Slice-by-slice evidence including every deferred Minor is under
 
 AArch64 → first item after v1. Raw tracepoint lifecycle migration is post-v1.
 Then, unordered and only on demonstrated need: live-discovery fallback mode,
-syscall/network correlation, DaemonSet/operator packaging, system-wide module
-discovery, security-findings layer, GUI.
+syscall/network correlation, DaemonSet/operator packaging,
+security-findings layer, GUI.
+
+Historical note (2026-09-19): this list previously deferred system-wide
+module discovery. That deferral is superseded: `--system` whole-machine
+capture exists on the `feat/system-scope` lane (see [the system-scope
+review report](../reports/2026-09-19-project-deep-review.md) and [the
+review-fix plan](2026-09-19-system-scope-review-fixes.md)). The lane is
+not qualified: live exact-tip qualification, the W7 → W5 → W6 → W8
+sequence, and the publication boundary (publication only by explicit
+owner decision after W8) remain in force, and earlier receipts do not
+qualify it.
 
 ## Productization (2026-08-15 →)
 

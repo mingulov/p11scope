@@ -321,6 +321,9 @@ def exact_profile_v3_selection(document, *, terminal=False, run=False):
     """Validate the closed, bounded profile-v3 selection/privacy extension."""
     if not terminal:
         require(document["schema"] == PROFILE_SCHEMA, document["schema"])
+        # The terminal trace carries no `capture` header, so only live
+        # profile documents state their selecting scope here.
+        exact_capture_scope(document)
         evidence = document["evidence"]
     else:
         evidence = document
@@ -522,10 +525,27 @@ def selection_matrix_rows(document):
     return rows
 
 
+def exact_capture_scope(document):
+    """`capture.scope` names which scope selected the capture, nothing more.
+
+    Exactly `pid`, `cgroup`, or `system` (observed-profile-v3 § capture):
+    the kind, never a PID number or cgroup path. The message stays finite
+    and non-echoing so an invalid value is rejected, never repeated.
+    """
+    capture = document.get("capture")
+    require(isinstance(capture, dict), "capture must be an object")
+    scope = capture.get("scope")
+    require(
+        isinstance(scope, str) and scope in ("pid", "cgroup", "system"),
+        "capture.scope must be exactly pid, cgroup, or system",
+    )
+
+
 def exact_metrics_schema(document, *, run=False):
     require(document["schema"] == METRICS_SCHEMA, document["schema"])
     require(document["capture"]["mode"] == "metrics", document["capture"])
     require(document["capture"]["privacy_mode"] == "aggregate-only", document["capture"])
+    exact_capture_scope(document)
     exact_evidence_keys(document["evidence"], profile=False, child=run)
     exact_task_uprobe_link_losses(document["evidence"])
 
@@ -1199,6 +1219,7 @@ def exact_capture_modules(document):
     must carry the identity the probes were authorized against, never just a
     pathname (which for a scanned module is the target's, not the observer's).
     """
+    exact_capture_scope(document)
     exact_manifest_object_fallbacks(document["evidence"])
     exact_module_ownership(document)
     modules = document["capture"]["modules"]
@@ -1961,20 +1982,25 @@ def document_fixture(evidence, *, schema=PROFILE_SCHEMA, mode="profile", privacy
             evidence.pop("task_uprobe_link_losses", None)
             evidence.pop("abi_refusals", None)
             evidence.pop("semantic_history_drops", None)
+    capture = {
+        "mode": mode,
+        "privacy_mode": privacy,
+        # Effective capture tuning, disclosed by every real capture.
+        "ring_bytes": 262144,
+        "drain_interval_ms": 1000,
+        # v2: one entry per discovered module, projected from the evidence.
+        "modules": [
+            {key: module[key] for key in ("path", "dev", "ino", "sha256", "build_id")}
+            for module in evidence["discovery"]
+        ],
+    }
+    if schema != HISTORICAL_METRICS_SCHEMA:
+        # Current v3 profile/metrics captures disclose which scope selected
+        # them; the retained v2-metrics shape predates the field.
+        capture["scope"] = "pid"
     return {
         "schema": schema,
-        "capture": {
-            "mode": mode,
-            "privacy_mode": privacy,
-            # Effective capture tuning, disclosed by every real capture.
-            "ring_bytes": 262144,
-            "drain_interval_ms": 1000,
-            # v2: one entry per discovered module, projected from the evidence.
-            "modules": [
-                {key: module[key] for key in ("path", "dev", "ino", "sha256", "build_id")}
-                for module in evidence["discovery"]
-            ],
-        },
+        "capture": capture,
         "evidence": evidence,
         "functions": [],
     }
@@ -2530,6 +2556,27 @@ def self_test():
         bad["evidence"].update(task_uprobe_link_losses=1, completeness="COMPLETE")
         rejected(lambda bad=bad, validator=validator: validator(bad))
     print("live profile-v3 and metrics-v3 task-uprobe loss typing and verdict gate are exact: OK")
+    for validator, live_document in (
+        (exact_metrics_schema, clean),
+        (exact_capture_modules, clean),
+        (exact_profile_v3_selection, selection_doc),
+        (exact_capture_modules, selection_doc),
+    ):
+        for scope in ("pid", "cgroup", "system"):
+            candidate = copy.deepcopy(live_document)
+            candidate["capture"]["scope"] = scope
+            validator(candidate)
+        for invalid in (
+            None, False, 4242, ["pid"], {"scope": "pid"}, "",
+            "unknown", "pid:424242991", "/sys/fs/cgroup/private.scope",
+        ):
+            bad = copy.deepcopy(live_document)
+            bad["capture"]["scope"] = invalid
+            rejected(lambda bad=bad, validator=validator: validator(bad))
+        missing = copy.deepcopy(live_document)
+        del missing["capture"]["scope"]
+        rejected(lambda validator=validator: validator(missing))
+    print("capture.scope is exactly pid, cgroup, or system on current profile and metrics: OK")
     run_profile = copy.deepcopy(selection_doc)
     run_profile["evidence"]["child_still_running"] = False
     exact_profile_v3_selection(run_profile, run=True)

@@ -38,3 +38,18 @@ Build env: TMPDIR=/var/tmp/p11scope-ws-tmp cargo +1.88 --locked --offline.
   contract (confidence/admission/authorization), 1.2+1.3 one release unit,
   Task 1.4 oracle+baseline, Phase 2 gated on 1.4+3.1, loader comparison
   (Aya PR #1417 = lead to verify), group-rebuild decision, acceptance matrix.
+- Plan v3 delta (deep-review follow-up §1.5, all claims verified: virtual.c
+  first-free alloc + NULL-on-release + lookup_fall_through substitution +
+  shared short_C_* markers; engine.rs:5026-5036, :9252-9255, :9393-9469):
+  new Task 1.5 publication-driven admission (option A, 9-case acceptance set);
+  Task 1.2 confirmed as option C interim (no new redirect needed); option B
+  occupancy adapter explicitly deferred with hard constraints.
+- Reviewer-gap probe (all checked, 2026-09-19): (1) REAL GAP — ordering
+  degeneracy unstated: scan_interfaces finds 0 interfaces for the 64
+  templates, so all score components tie and 1.2 admits first-4-discovered;
+  recorded as 1.2 review gate. (2) REAL GAP — option A uncosted against
+  discovery I/O + work budgets; added as 1.5 acceptance item. (3) SUSPICION
+  REFUTED — 104-name catalog matches p11-kit 0.26.2 pkcs11.h member-for-member
+  in order (Digest group genuinely absent, 3.2 extension block matches);
+  no 3.x mislabel vector. (4) COSMETIC — review's scan.rs:838 citation drifted
+  (now :896; def in external pkcs11-module crate).

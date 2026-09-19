@@ -227,6 +227,11 @@ DISCOVERY_REASONS = {
     SHARED_OVERLAY_UNCERTAINTY,
 }
 ENTRY_REASONS = {"null pointer", ENTRY_UNAVAILABLE}
+# The one gated entry-like skip whose subject is not a standard function: a
+# null slot in an unlinked table, renamed `unknown` by the mislabel guard
+# (render.rs `capture_skipped_out` gated_null branch). Entry-granularity, so
+# it joins `entry_skips` as a lane-oracle item — never `discovery_skips`.
+UNKNOWN_NULL_SKIP = {"name": "unknown", "reason": "null pointer"}
 # Both walks publish the provider's two tables, so every walked surface is
 # doubled; the unwalked one is a single scan-side record.
 G1_SURFACES = Counter({("full", 68): 2, ("full", 92): 2, ("not_walked", 0): 1})
@@ -832,8 +837,16 @@ def entry_skips(evidence):
     Only the first kind is an oracle a lane can state exactly — the second kind
     depends on what else the scan walked, which for a `--cgroup` lane is every
     process in that cgroup.
+    The one exception is the gated null of an unlinked table's null slot: its
+    subject is `unknown`, not a function, but the loss is still
+    entry-granularity and the pair is fully specified, so a lane states it
+    here exactly like any entry skip.
     """
-    return [item for item in evidence["skipped"] if item["name"].startswith("C_")]
+    return [
+        item
+        for item in evidence["skipped"]
+        if item["name"].startswith("C_") or item == UNKNOWN_NULL_SKIP
+    ]
 
 
 def bounded_skip(item):
@@ -846,13 +859,14 @@ def bounded_skip(item):
         f"invalid capture skip: {item!r}",
     )
     entry = item["name"].startswith("C_")
+    gated_null = item == UNKNOWN_NULL_SKIP
     require(
-        entry or item["name"] == DISCOVERY_SUBJECT,
+        entry or gated_null or item["name"] == DISCOVERY_SUBJECT,
         f"unbounded capture skip subject: {item}",
     )
-    allowed = ENTRY_REASONS if entry else DISCOVERY_REASONS
+    allowed = ENTRY_REASONS if (entry or gated_null) else DISCOVERY_REASONS
     require(item["reason"] in allowed, f"unbounded capture skip reason: {item}")
-    return entry
+    return entry or gated_null
 
 
 def discovery_skips(evidence):
@@ -2882,6 +2896,21 @@ def self_test():
     ):
         bad = copy.deepcopy(bounded_skips)
         bad["skipped"][0]["reason"] = leaked_reason
+        rejected(lambda bad=bad: discovery_skips(bad))
+    gated_null = copy.deepcopy(bounded_skips)
+    gated_null["skipped"] = [dict(UNKNOWN_NULL_SKIP)]
+    discovery_skips(gated_null)
+    require(
+        entry_skips(gated_null) == [dict(UNKNOWN_NULL_SKIP)],
+        f"gated null is not an entry oracle item: {entry_skips(gated_null)}",
+    )
+    require(
+        discovery_skips(gated_null) == [],
+        f"gated null leaks into discovery skips: {discovery_skips(gated_null)}",
+    )
+    for wrong_reason in (DISCOVERY_UNAVAILABLE, TABLE_UNAVAILABLE, ENTRY_UNAVAILABLE):
+        bad = copy.deepcopy(bounded_skips)
+        bad["skipped"] = [{"name": "unknown", "reason": wrong_reason}]
         rejected(lambda bad=bad: discovery_skips(bad))
     print("capture skip names and reasons are bounded before JSON output: OK")
     bad = copy.deepcopy(safe)

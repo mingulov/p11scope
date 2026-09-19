@@ -774,6 +774,10 @@ impl AttachPlan {
 
         self.slots = slots;
         self.modules = rebuilt.modules;
+        // The spill count is current-state evidence like `entries_seen`,
+        // not a high-water mark (capture history keeps those separately):
+        // a live merge that bypasses a spilled table resolves the spill.
+        self.uncorroborated_candidates = rebuilt.uncorroborated_candidates;
         self.skipped = rebuilt.skipped;
         self.modules_skipped = rebuilt.modules_skipped;
         self.refused_module_objects = rebuilt.refused_module_objects;

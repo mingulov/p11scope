@@ -43,7 +43,7 @@ use p11scope_manifest::manifest::{
     SelectionNameClass, SelectionRequest, SelectionVersionClass, SurfaceSource, WalkOutcome,
 };
 use p11scope_manifest::maps::{Device, MapEntry, MapIndex, MappedPath, ObjectKey, Resolved};
-use pkcs11_module::LinuxLayout;
+use pkcs11_module::{LinuxLayout, read_function_pointer};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::num::NonZeroU64;
@@ -5017,6 +5017,87 @@ fn name_class(class: u8) -> &'static str {
     }
 }
 
+/// Outcome of heap-wrapper export lowering: an admitted module, or an
+/// explicit refusal the caller publishes as live loss. Refusals degrade
+/// confidence — they never claim the table is absent.
+enum HeapLowerOutcome {
+    Admitted(ScannedModule),
+    Refused(&'static str),
+}
+
+/// Why one bounded exact-address validation failed. The selection path
+/// collapses these to its historical unit loss; heap-wrapper lowering
+/// publishes each as a distinct live loss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExactReadRefusal {
+    /// No readable mapping contains the table address.
+    Unreadable,
+    /// The bytes at the address are not a function table.
+    Undecodable,
+    /// The mappings moved, or the generation changed, under the read.
+    Unstable,
+    /// A decode budget ceiling stopped the validation.
+    Budget,
+}
+
+/// Attributes a heap/anonymous published table to the provider that
+/// returned it. The table's own mapping names no file, so ownership is
+/// resolved from the factory that published it plus the exact validated
+/// entries: candidates are the scanned modules in this view exporting the
+/// hook symbol, and the winner must also hold entry targets — except the
+/// proxy shape, where the sole factory exporter owns a table pointing
+/// elsewhere. Anything ambiguous refuses: attribution is exact or absent.
+fn resolve_heap_table_owner(
+    hook: &str,
+    view: ProcessViewId,
+    entries: &[ScannedEntry],
+    modules: &[ReconciledModule],
+) -> Option<(ObjectKey, String)> {
+    let exporters: Vec<&ScannedModule> = modules
+        .iter()
+        .map(|module| &module.scanned)
+        .filter(|module| module.view == view && module.exports.iter().any(|name| name == hook))
+        .collect();
+    if exporters.is_empty() {
+        return None;
+    }
+    let holders: Vec<&&ScannedModule> = exporters
+        .iter()
+        .filter(|module| entries.iter().any(|entry| entry.object == module.key))
+        .collect();
+    if holders.len() == 1 {
+        let winner = holders[0];
+        return Some((winner.key, winner.path.clone()));
+    }
+    if holders.is_empty() && exporters.len() == 1 {
+        let winner = exporters[0];
+        return Some((winner.key, winner.path.clone()));
+    }
+    None
+}
+
+/// Decoder layouts for one heap-table exact read, strongest first: the
+/// scanned hook exporters' ABI when they agree, both widths otherwise.
+/// At most two bounded reads; a wrong width fails fast on the version word.
+fn heap_table_layouts(
+    hook: &str,
+    view: ProcessViewId,
+    modules: &[ReconciledModule],
+) -> Vec<LinuxLayout> {
+    let mut abis = BTreeSet::new();
+    for module in modules.iter().map(|module| &module.scanned) {
+        if module.view == view && module.exports.iter().any(|name| name == hook) {
+            if let Some(abi) = module.decoder_abi {
+                abis.insert(abi);
+            }
+        }
+    }
+    if let Some(abi) = abis.iter().next().filter(|_| abis.len() == 1) {
+        return vec![target_layout(*abi)];
+    }
+    vec![LinuxLayout::Lp64, LinuxLayout::Ilp32]
+}
+
 /// Lowers one already-decoded export record through the same table-layout and
 /// mapping authority as the memory scanner. Runtime addresses and custom hook
 /// names remain private inputs to the candidate transaction.
@@ -5186,6 +5267,200 @@ fn lower_export_record(
         return Err("process generation changed during export lowering".into());
     }
     Ok(Some(module))
+}
+
+/// Lowers a published table the file-backed prefix path could not own:
+/// heap/anonymous tables (wrapper `&live->bound`, anonymous-BSS legacy)
+/// and list-element records, which carry the table address but no prefix
+/// by transport contract. Validates the exact returned table through the
+/// same bounded exact-address reader as the selection path (maps-A
+/// membership, one bounded mem read, same-decoder decode, maps-B
+/// stability bracket, generation check), cross-checks a carried prefix
+/// when the record has one, and attributes anonymous tables to the
+/// publishing provider via the ownership contract. File-backed tables
+/// keep their mapping's own owner, so a live element over a swept table
+/// merges onto the scan instance instead of duplicating it.
+///
+/// The lowered interface stays unlinked (`table: None`): the live-return
+/// flag on the table carries the publication evidence, while linkage
+/// stays the sweep's own decoded triples — a live list position never
+/// widens into interface linkage.
+fn lower_heap_export_record(
+    view: &ProcessView,
+    index_a: &MapIndex<'_>,
+    hooks: &HookRegistry,
+    record: &DiscoveryRecord,
+    modules: &[ReconciledModule],
+    budget: &mut CaptureWorkBudget,
+) -> Result<HeapLowerOutcome, String> {
+    // Mirror the file-backed path's validation: this runs only after it
+    // returned None, but a record is never trusted twice — re-derive.
+    if record.kind == DISCOVERY_KIND_INTERFACE_RETURN {
+        return Err("selection record reached export lowering".into());
+    }
+    if !valid_discovery_record(record) {
+        return Err("malformed discovery record reached export lowering".into());
+    }
+    let Some(expected_abi) = export_abi(record.kind) else {
+        return Err("non-export discovery record reached export lowering".into());
+    };
+    let Some((hook_name, abi)) = hooks.by_id(record.symbol_id) else {
+        return Err("export record names an unknown private hook ID".into());
+    };
+    if abi != expected_abi {
+        return Err("export record kind disagrees with its private hook ABI".into());
+    }
+    if !view.still_the_same() {
+        return Err("process generation changed before export lowering".into());
+    }
+    if let Some(reason) = budget.stopped_now() {
+        return Err(reason.into());
+    }
+    budget.spend(1)?;
+
+    // Strongest layout first, at most two bounded reads; the wrong width
+    // fails fast on the version word.
+    let mut refusals = Vec::new();
+    let mut validated = None;
+    for layout in heap_table_layouts(hook_name, view.id(), modules) {
+        match Engine::read_exact_table_bracketed(view, record.table_ptr, layout, index_a, budget) {
+            Ok(valid) => {
+                validated = Some((layout, valid));
+                break;
+            }
+            Err(refusal) => refusals.push(refusal),
+        }
+    }
+    let Some((layout, (_, mut table, bytes))) = validated else {
+        // The most actionable refusal first: a capture stop, then
+        // instability (the world moved mid-read), then undecodability.
+        let refusal = refusals
+            .iter()
+            .find(|refusal| **refusal == ExactReadRefusal::Budget)
+            .or_else(|| {
+                refusals
+                    .iter()
+                    .find(|refusal| **refusal == ExactReadRefusal::Unstable)
+            })
+            .or(refusals.first());
+        return Ok(HeapLowerOutcome::Refused(match refusal {
+            Some(ExactReadRefusal::Budget) => {
+                "a published table validation stopped at a decode budget ceiling"
+            }
+            Some(ExactReadRefusal::Unstable) => {
+                "a published table moved or the process generation changed during validation"
+            }
+            Some(ExactReadRefusal::Unreadable) => {
+                "a published table address was unreadable when validated"
+            }
+            _ => "a published table's bytes did not decode as a function table",
+        }));
+    };
+
+    // A carried prefix is the probe's observation; the mem read above is
+    // the validator's. Both name the same table, or the table changed
+    // under us — refuse, never blend.
+    let usable = usize::from(record.usable_n);
+    if usable > 0 {
+        if (record.version_major, record.version_minor) != table.version {
+            return Ok(HeapLowerOutcome::Refused(
+                "a published table changed between the probe capture and validation",
+            ));
+        }
+        let mut matches = true;
+        for (ordinal, expected) in record.pointers.iter().take(usable).enumerate() {
+            match read_function_pointer(&bytes, layout, ordinal) {
+                Ok(actual) if actual == *expected => {}
+                _ => {
+                    matches = false;
+                    break;
+                }
+            }
+        }
+        if !matches {
+            return Ok(HeapLowerOutcome::Refused(
+                "a published table changed between the probe capture and validation",
+            ));
+        }
+    }
+
+    // Ownership: a file-backed table names its own file; an anonymous one
+    // is attributed to its publishing provider — exact or absent.
+    let file_owner = match index_a.resolve(record.table_ptr) {
+        Resolved::File {
+            path: MappedPath::Usable(path),
+            device,
+            inode,
+            file_offset,
+            ..
+        } if inode != 0 => Some((
+            ObjectKey { device, inode },
+            path.display().to_string(),
+            file_offset,
+        )),
+        _ => None,
+    };
+    let (key, path) = match file_owner {
+        Some((key, path, file_offset)) => {
+            table.file_offset = Some(file_offset);
+            (key, path)
+        }
+        None => {
+            table.file_offset = None;
+            match resolve_heap_table_owner(hook_name, view.id(), &table.entries, modules) {
+                Some(owner) => owner,
+                None => {
+                    return Ok(HeapLowerOutcome::Refused(
+                        "a published heap table could not be attributed to exactly one provider",
+                    ));
+                }
+            }
+        }
+    };
+
+    // The provider returned this table through a live export: its ordinal
+    // names carry publication evidence, unlike heuristic decode. Manifest
+    // agreement is derived per rebuild by fallback binding, never here.
+    table.live_return = true;
+    table.manifest_supported = false;
+    if matches!(
+        record.kind,
+        DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN | DISCOVERY_KIND_INTERFACE_RETURN
+    ) && !budget.admit_interface()
+    {
+        return Ok(HeapLowerOutcome::Refused(
+            "the interface-record ceiling refused a published list element",
+        ));
+    }
+
+    let interfaces = match record.kind {
+        DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN | DISCOVERY_KIND_INTERFACE_RETURN => {
+            vec![ScannedInterface {
+                index: usize::from(record.interface_index),
+                name_class: name_class(record.name_class),
+                name_lossy: None,
+                name_private: None,
+                flags: record.interface_flags,
+                // Unlinked by contract (see above): no widening.
+                table: None,
+            }]
+        }
+        _ => Vec::new(),
+    };
+    let module = ScannedModule {
+        view: view.id(),
+        mount_namespace: view.mount_namespace(),
+        key,
+        path,
+        decoder_abi: None,
+        exports: vec![hook_name.to_string()],
+        tables: vec![table],
+        interfaces,
+    };
+    if !view.still_the_same() {
+        return Err("process generation changed during export lowering".into());
+    }
+    Ok(HeapLowerOutcome::Admitted(module))
 }
 
 fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedModule) {
@@ -8335,16 +8610,31 @@ impl Engine {
             let maps = Self::read_maps(view, &mut self.budget)?;
             let index =
                 index_maps_or_refuse(&maps, &mut self.budget).map_err(|error| anyhow!(error))?;
-            lower_export_record(view, &index, &self.hooks, record, &mut self.budget)
-        };
-        let Some(lowered) = lowered.map_err(|error| anyhow!(error))? else {
-            self.mark_live_loss(
-                "live export discovery",
-                "an export table had no usable exact file-backed owner and prefix",
-            );
-            return Ok(DiscoveryRecordOutcome::Rejected(
-                RecordRejection::ExportNoLowerableOwner,
-            ));
+            match lower_export_record(view, &index, &self.hooks, record, &mut self.budget) {
+                Err(error) => return Err(anyhow!(error)),
+                Ok(Some(module)) => module,
+                // The prefix path owns file-backed tables only; anything a
+                // factory published that it cannot own — heap wrappers,
+                // anonymous-BSS tables, bare list-element addresses —
+                // validates through the heap contract instead.
+                Ok(None) => match lower_heap_export_record(
+                    view,
+                    &index,
+                    &self.hooks,
+                    record,
+                    &self.modules,
+                    &mut self.budget,
+                ) {
+                    Err(error) => return Err(anyhow!(error)),
+                    Ok(HeapLowerOutcome::Admitted(module)) => module,
+                    Ok(HeapLowerOutcome::Refused(reason)) => {
+                        self.mark_live_loss("live export discovery", reason);
+                        return Ok(DiscoveryRecordOutcome::Rejected(
+                            RecordRejection::ExportNoLowerableOwner,
+                        ));
+                    }
+                },
+            }
         };
         let (pins, pin_skips) = {
             let view = &self.views[position];
@@ -9447,75 +9737,113 @@ impl Engine {
     ) -> std::result::Result<(MapEntry, ScannedTable), ()> {
         let maps_a = Self::read_maps(view, budget).map_err(|_| ())?;
         let index_a = index_maps_or_refuse(&maps_a, budget).map_err(|_| ())?;
-        let mapping_a = index_a.containing(address).cloned().ok_or(())?;
+        Self::read_exact_table_bracketed(view, address, layout, &index_a, budget)
+            .map(|(mapping, table, _)| (mapping, table))
+            .map_err(|_| ())
+    }
+
+    /// Bounded exact-address table validation, shared by the selection path
+    /// and heap-wrapper export lowering: maps-A membership, one bounded mem
+    /// read (version word first, then the exact table extent), same-decoder
+    /// decode against index A, then the maps-B stability bracket plus the
+    /// generation check. Returns the containing mapping, the decoded table,
+    /// and the raw table bytes (publication cross-checks need them).
+    fn read_exact_table_bracketed(
+        view: &ProcessView,
+        address: u64,
+        layout: LinuxLayout,
+        index_a: &MapIndex,
+        budget: &mut CaptureWorkBudget,
+    ) -> std::result::Result<(MapEntry, ScannedTable, Vec<u8>), ExactReadRefusal> {
+        let mapping_a = index_a
+            .containing(address)
+            .cloned()
+            .ok_or(ExactReadRefusal::Unreadable)?;
         if mapping_a.permissions[0] != b'r' {
-            return Err(());
+            return Err(ExactReadRefusal::Unreadable);
         }
         let mem = view
             .run_while_same(|| File::open(format!("/proc/{}/mem", view.pid())))
-            .map_err(|_| ())?
-            .map_err(|_| ())?;
+            .map_err(|_| ExactReadRefusal::Unreadable)?
+            .map_err(|_| ExactReadRefusal::Unreadable)?;
         let width = layout.word_bytes();
         let mut bytes = vec![0; width];
         let mut operation_bytes = 0u64;
-        let mut read_exact = |bytes: &mut [u8], base: u64| -> Result<(), ()> {
-            let mut done = 0usize;
-            while done < bytes.len() {
-                if budget.check_deadline_now().is_some() {
-                    return Err(());
+        let mut read_exact =
+            |bytes: &mut [u8], base: u64| -> std::result::Result<(), ExactReadRefusal> {
+                let mut done = 0usize;
+                while done < bytes.len() {
+                    if budget.check_deadline_now().is_some() {
+                        return Err(ExactReadRefusal::Budget);
+                    }
+                    let allowed = budget.allowed_io(operation_bytes, bytes.len() - done);
+                    if allowed == 0 {
+                        return Err(ExactReadRefusal::Budget);
+                    }
+                    let at = base
+                        .checked_add(done as u64)
+                        .ok_or(ExactReadRefusal::Unstable)?;
+                    let read = mem
+                        .read_at(&mut bytes[done..done + allowed], at)
+                        .map_err(|_| ExactReadRefusal::Unstable)?;
+                    if read == 0 {
+                        return Err(ExactReadRefusal::Unstable);
+                    }
+                    budget.record_io(read);
+                    operation_bytes = operation_bytes.saturating_add(read as u64);
+                    done += read;
                 }
-                let allowed = budget.allowed_io(operation_bytes, bytes.len() - done);
-                if allowed == 0 {
-                    return Err(());
-                }
-                let at = base.checked_add(done as u64).ok_or(())?;
-                let read = mem
-                    .read_at(&mut bytes[done..done + allowed], at)
-                    .map_err(|_| ())?;
-                if read == 0 {
-                    return Err(());
-                }
-                budget.record_io(read);
-                operation_bytes = operation_bytes.saturating_add(read as u64);
-                done += read;
-            }
-            Ok(())
-        };
+                Ok(())
+            };
         read_exact(&mut bytes, address)?;
-        let table_bytes = exact_table_bytes(&bytes, layout).ok_or(())?;
-        let table_end = address.checked_add(table_bytes as u64).ok_or(())?;
+        let table_bytes = exact_table_bytes(&bytes, layout).ok_or(ExactReadRefusal::Undecodable)?;
+        let table_end = address
+            .checked_add(table_bytes as u64)
+            .ok_or(ExactReadRefusal::Undecodable)?;
         if table_end > mapping_a.end {
-            return Err(());
+            return Err(ExactReadRefusal::Undecodable);
         }
         bytes.resize(table_bytes, 0);
         if table_bytes > width {
             read_exact(
                 &mut bytes[width..],
-                address.checked_add(width as u64).ok_or(())?,
+                address
+                    .checked_add(width as u64)
+                    .ok_or(ExactReadRefusal::Unstable)?,
             )?;
         }
-        let raw_addresses = exact_table_addresses(&bytes, layout).ok_or(())?;
+        let raw_addresses =
+            exact_table_addresses(&bytes, layout).ok_or(ExactReadRefusal::Undecodable)?;
         let mut addresses = Vec::with_capacity(raw_addresses.len() + 1);
         addresses.push(address);
         addresses.extend(raw_addresses);
         let mappings_a: Vec<_> = addresses
             .iter()
-            .map(|address| index_a.containing(*address).cloned().ok_or(()))
+            .map(|address| {
+                index_a
+                    .containing(*address)
+                    .cloned()
+                    .ok_or(ExactReadRefusal::Undecodable)
+            })
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let table = decode_exact_table(&bytes, address, layout, &index_a, budget)
-            .map_err(|_| ())?
-            .ok_or(())?;
-        let maps_b = Self::read_maps(view, budget).map_err(|_| ())?;
-        let index_b = index_maps_or_refuse(&maps_b, budget).map_err(|_| ())?;
+        let table =
+            match decode_exact_table(&bytes, address, layout, index_a, budget, Some(view.id())) {
+                Err(()) => return Err(ExactReadRefusal::Budget),
+                Ok(None) => return Err(ExactReadRefusal::Undecodable),
+                Ok(Some(table)) => table,
+            };
+        let maps_b = Self::read_maps(view, budget).map_err(|_| ExactReadRefusal::Unstable)?;
+        let index_b =
+            index_maps_or_refuse(&maps_b, budget).map_err(|_| ExactReadRefusal::Unstable)?;
         if !mappings_a
             .iter()
             .zip(&addresses)
             .all(|(mapping, address)| index_b.containing(*address) == Some(mapping))
             || !view.still_the_same()
         {
-            return Err(());
+            return Err(ExactReadRefusal::Unstable);
         }
-        Ok((mapping_a, table))
+        Ok((mapping_a, table, bytes))
     }
 
     fn collect_dynamic_export_work(
@@ -13354,3 +13682,7 @@ impl Engine {
 #[cfg(test)]
 #[path = "engine_tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(test)]
+#[path = "publication_tests.rs"]
+pub(crate) mod publication_tests;

@@ -13,9 +13,13 @@
  *   two shared implementations; every other entry shares one stub.
  * - Published wrappers are heap tables whose entries point at the fixed
  *   closures, at backend.so directly (forwarding), or at failing closures.
+ *   The standard factories publish the heap tables (`&live[idx]->bound`),
+ *   never the templates.
  * - One never-called legacy {2,40} static table via C_GetFunctionList.
- * - STRIPPED_VARIANT=1 renames/hides the pool and packs occupancy as a
- *   bitmap instead of a byte array: same workload behavior, unknown layout.
+ * - STRIPPED_VARIANT=1 renames/hides the pool, packs occupancy as a
+ *   bitmap instead of a byte array, and hides every dynamic symbol except
+ *   the factories and control entry points: same workload behavior,
+ *   unknown layout.
  *
  * Build (provider links backend.so by absolute path, DT_NEEDED):
  *   gcc -std=c11 -O2 -Wall -Wextra -Werror -fPIC -shared -Wl,-z,defs \
@@ -70,6 +74,19 @@ CK_RV mw_backend_18(CK_ULONG idx, CK_ULONG via);
 CK_RV mw_backend_43(CK_ULONG idx, CK_ULONG via);
 CK_RV mw_backend_44(CK_ULONG idx, CK_ULONG via);
 
+#ifdef STRIPPED_VARIANT
+/* The unknown-layout build hides every dynamic symbol defined below except
+ * the factories and the workload's control entry points (MW_PUBLIC): dladdr
+ * on a published entry resolves nothing, like the installed stripped
+ * p11-kit (strip alone keeps .dynsym, so visibility does the hiding). The
+ * backend imports above stay default: hidden visibility on an undefined
+ * reference does not link. */
+#pragma GCC visibility push(hidden)
+#define MW_PUBLIC __attribute__((visibility("default")))
+#else
+#define MW_PUBLIC
+#endif
+
 static EntryFn back_fn(int ex)
 {
     static EntryFn table[NEX] = {
@@ -104,8 +121,10 @@ static CK_RV closure_call(int ex, int idx)
     return back_fn(ex)((CK_ULONG)idx, 1);
 }
 
+/* Global (not static) so the stage driver resolves every published entry
+ * to its defining symbol via dladdr; behavior is unchanged. */
 #define DECL_CLOSURE(o, ex, i)                                              \
-    static CK_RV mw_closure_##o##_##i(CK_ULONG p0, CK_ULONG p1)             \
+    CK_RV mw_closure_##o##_##i(CK_ULONG p0, CK_ULONG p1)                    \
     {                                                                      \
         (void)p0;                                                          \
         (void)p1;                                                          \
@@ -178,7 +197,7 @@ static EntryFn closure_fn(int ex, int idx)
     }
 }
 
-static CK_RV mw_shared(CK_ULONG p0, CK_ULONG p1)
+CK_RV mw_shared(CK_ULONG p0, CK_ULONG p1)
 {
     (void)p0;
     (void)p1;
@@ -186,7 +205,7 @@ static CK_RV mw_shared(CK_ULONG p0, CK_ULONG p1)
     return CKR_OK;
 }
 
-static CK_RV mw_shared_status(CK_ULONG p0, CK_ULONG p1)
+CK_RV mw_shared_status(CK_ULONG p0, CK_ULONG p1)
 {
     (void)p0;
     (void)p1;
@@ -194,7 +213,7 @@ static CK_RV mw_shared_status(CK_ULONG p0, CK_ULONG p1)
     return CKR_OK;
 }
 
-static CK_RV mw_shared_cancel(CK_ULONG p0, CK_ULONG p1)
+CK_RV mw_shared_cancel(CK_ULONG p0, CK_ULONG p1)
 {
     (void)p0;
     (void)p1;
@@ -202,7 +221,7 @@ static CK_RV mw_shared_cancel(CK_ULONG p0, CK_ULONG p1)
     return CKR_OK;
 }
 
-static CK_RV mw_legacy(CK_ULONG p0, CK_ULONG p1)
+CK_RV mw_legacy(CK_ULONG p0, CK_ULONG p1)
 {
     (void)p0;
     (void)p1;
@@ -298,7 +317,13 @@ typedef struct {
     Table bound;
 } Wrapper;
 
-void *mw_alloc(int fwd_mask, int fail_arg)
+/* Live wrappers by pool index, NULL when free. The standard factories
+ * publish `&live[idx]->bound` (heap tables, like upstream p11-kit
+ * `&wrapper->bound`); the template pool stays the dormant decoy the
+ * memory sweep finds. */
+static Wrapper *live_wrappers[NWRAP];
+
+MW_PUBLIC void *mw_alloc(int fwd_mask, int fail_arg)
 {
     int idx = first_free();
     if (idx < 0) {
@@ -327,10 +352,11 @@ void *mw_alloc(int fwd_mask, int fail_arg)
     }
     pool_set(idx, 1);
     fail_ord[idx] = fail_arg;
+    live_wrappers[idx] = w;
     return w;
 }
 
-void mw_free(void *handle)
+MW_PUBLIC void mw_free(void *handle)
 {
     Wrapper *w = handle;
     if (w == NULL) {
@@ -338,22 +364,23 @@ void mw_free(void *handle)
     }
     pool_set(w->index, 0);
     fail_ord[w->index] = -1;
+    live_wrappers[w->index] = NULL;
     free(w);
 }
 
-int mw_index(void *handle)
+MW_PUBLIC int mw_index(void *handle)
 {
     const Wrapper *w = handle;
     return w == NULL ? -1 : w->index;
 }
 
-void *mw_table(void *handle)
+MW_PUBLIC void *mw_table(void *handle)
 {
     Wrapper *w = handle;
     return w == NULL ? NULL : &w->bound;
 }
 
-int mw_occupied(int idx)
+MW_PUBLIC int mw_occupied(int idx)
 {
     if (idx < 0 || idx >= NWRAP) {
         return 0;
@@ -361,7 +388,7 @@ int mw_occupied(int idx)
     return pool_occupied(idx);
 }
 
-CK_RV C_GetFunctionList(void **list)
+MW_PUBLIC CK_RV C_GetFunctionList(void **list)
 {
     if (list == NULL) {
         return CKR_ARGUMENTS_BAD;
@@ -381,7 +408,7 @@ static CK_ULONG interface_count(void)
     return n;
 }
 
-CK_RV C_GetInterfaceList(CK_INTERFACE *list, CK_ULONG *count)
+MW_PUBLIC CK_RV C_GetInterfaceList(CK_INTERFACE *list, CK_ULONG *count)
 {
     if (count == NULL) {
         return CKR_ARGUMENTS_BAD;
@@ -399,7 +426,7 @@ CK_RV C_GetInterfaceList(CK_INTERFACE *list, CK_ULONG *count)
     for (int idx = 0; idx < NWRAP; idx++) {
         if (pool_occupied(idx)) {
             list[at].pInterfaceName = iface_names[idx];
-            list[at].pFunctionList = pool_at(idx);
+            list[at].pFunctionList = &live_wrappers[idx]->bound;
             list[at].flags = 0;
             at++;
         }
@@ -411,7 +438,7 @@ CK_RV C_GetInterfaceList(CK_INTERFACE *list, CK_ULONG *count)
     return CKR_OK;
 }
 
-CK_RV C_GetInterface(void *name, void *version, void **out, CK_FLAGS flags)
+MW_PUBLIC CK_RV C_GetInterface(void *name, void *version, void **out, CK_FLAGS flags)
 {
     (void)version;
     (void)flags;
@@ -432,7 +459,7 @@ CK_RV C_GetInterface(void *name, void *version, void **out, CK_FLAGS flags)
                 return CKR_ARGUMENTS_BAD;
             }
             found.pInterfaceName = iface_names[idx];
-            found.pFunctionList = pool_at(idx);
+            found.pFunctionList = &live_wrappers[idx]->bound;
             found.flags = 0;
             *out = &found;
             return CKR_OK;
@@ -440,3 +467,7 @@ CK_RV C_GetInterface(void *name, void *version, void **out, CK_FLAGS flags)
     }
     return CKR_ARGUMENTS_BAD;
 }
+
+#ifdef STRIPPED_VARIANT
+#pragma GCC visibility pop
+#endif

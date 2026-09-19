@@ -5,7 +5,7 @@
  *
  * Usage: workload <provider.so> <scenario> <seed> <logpath> <oraclepath>
  *
- * Scenarios: five | holes | reuse | pair_a | pair_b | forward | fail | legacy
+ * Scenarios: five | holes | reuse | pair_a | pair_b | forward | fail | legacy | stage
  *   five    alloc 5 wrappers (indices 0..4, so index 4 > 3 is active)
  *   holes   alloc 18, free 0..16, call only via 17 (0..3 free at call time)
  *   reuse   holes setup, then one more alloc must reuse index 0
@@ -14,6 +14,17 @@
  *   forward one wrapper with ordinals 5,43 forwarded straight to backend.so
  *   fail    one wrapper whose ordinal 43 fails wrapper-only (no backend)
  *   legacy  publish only: C_GetFunctionList + interface list, zero calls
+ *   stage   stdin REPL driving alloc/free/publish for capture tests; the
+ *           log/oracle paths are unused (no calls are made, no oracle is
+ *           written). Commands (one per line, stdout flushed per reply):
+ *             A <fwd> <fail>  alloc; replies ALLOC idx=<i> table=0x...
+ *             F <idx>         free; replies FREED idx=<i>
+ *             P               publish via the real standard factories and
+ *                             print every published table with all entries
+ *             T               print the template pool (or TEMPLATE unknown
+ *                             when the pool symbol is hidden)
+ *             B               print the six backend entry addresses
+ *             X               exit 0
  *
  * The log path is exported as P11SCOPE_MW_LOG for the provider/backend
  * stubs. The oracle JSON carries the exact expected log lines (this process
@@ -166,6 +177,7 @@ typedef void *(*table_fn)(void *handle);
 typedef int (*occupied_fn)(int idx);
 typedef CK_RV (*gfl_fn)(void **list);
 typedef CK_RV (*gil_fn)(CK_INTERFACE *list, CK_ULONG *count);
+typedef CK_RV (*gi_fn)(void *name, void *version, void **out, CK_FLAGS flags);
 
 typedef struct {
     int index;
@@ -278,6 +290,204 @@ static void snapshot_occupancy(occupied_fn occ, int *free_list, size_t *nfree, i
     }
 }
 
+#define STAGE_NWRAP 64
+#define STAGE_NENTRY 104
+#define STAGE_LEGACY_NENTRY 68
+
+typedef struct {
+    alloc_fn do_alloc;
+    free_fn do_free;
+    index_fn do_index;
+    table_fn do_table;
+    gfl_fn gfl;
+    gil_fn gil;
+    gi_fn gi;
+    void *handles[STAGE_NWRAP];
+} Stage;
+
+static const char *stage_sym(void *addr)
+{
+    Dl_info info;
+    if (addr == NULL || dladdr(addr, &info) == 0 || info.dli_sname == NULL) {
+        return "-";
+    }
+    return info.dli_sname;
+}
+
+/* Print one table exactly as the observer's probe would capture it: the
+ * version word plus every entry pointer. Index -1 marks the legacy table. */
+static void stage_print_table(int idx, const void *table, int nentry)
+{
+    const unsigned char *bytes = table;
+    printf("TABLE index=%d addr=%p major=%u minor=%u nentry=%d\n", idx, table, bytes[0],
+        bytes[1], nentry);
+    const void *const *funcs = (const void *const *)((const char *)table + 8);
+    for (int o = 0; o < nentry; o++) {
+        printf("E ord=%d addr=%p sym=%s\n", o, funcs[o], stage_sym((void *)funcs[o]));
+    }
+}
+
+static int stage_publish(Stage *s)
+{
+    void *legacy = NULL;
+    if (s->gfl(&legacy) != CKR_OK || legacy == NULL) {
+        printf("ERROR C_GetFunctionList failed\n");
+        return -1;
+    }
+    CK_ULONG count = 0;
+    if (s->gil(NULL, &count) != CKR_OK || count < 1 || count > STAGE_NWRAP + 1) {
+        printf("ERROR C_GetInterfaceList count failed\n");
+        return -1;
+    }
+    CK_INTERFACE *list = calloc(count, sizeof *list);
+    if (list == NULL) {
+        printf("ERROR out of memory\n");
+        return -1;
+    }
+    CK_ULONG want = count;
+    CK_RV rv = s->gil(list, &want);
+    if (rv != CKR_OK || want != count) {
+        printf("ERROR C_GetInterfaceList failed\n");
+        free(list);
+        return -1;
+    }
+    printf("PUBLISH begin count=%lu\n", count);
+    stage_print_table(-1, legacy, STAGE_LEGACY_NENTRY);
+    for (CK_ULONG k = 0; k < count; k++) {
+        int idx = -1;
+        if (sscanf(list[k].pInterfaceName, "P11Scope-MW-%d", &idx) != 1) {
+            idx = -1;
+        }
+        /* Every list element is independently re-published through
+         * C_GetInterface: the two factories must agree exactly. */
+        void *found = NULL;
+        if (s->gi(list[k].pInterfaceName, NULL, &found, 0) != CKR_OK || found == NULL
+            || ((const CK_INTERFACE *)found)->pFunctionList != list[k].pFunctionList) {
+            printf("ERROR C_GetInterface disagrees on %s\n", list[k].pInterfaceName);
+            free(list);
+            return -1;
+        }
+        stage_print_table(idx, list[k].pFunctionList,
+            idx < 0 ? STAGE_LEGACY_NENTRY : STAGE_NENTRY);
+    }
+    printf("PUBLISH end\n");
+    free(list);
+    return 0;
+}
+
+static int stage_templates(void *handle)
+{
+    dlerror();
+    Table *pool = dlsym(handle, "p11scope_fixed");
+    if (dlerror() != NULL || pool == NULL) {
+        printf("TEMPLATE unknown\n");
+        fflush(stdout);
+        return 0;
+    }
+    for (int idx = 0; idx < STAGE_NWRAP; idx++) {
+        stage_print_table(idx, &pool[idx], STAGE_NENTRY);
+    }
+    printf("TEMPLATE end\n");
+    return 0;
+}
+
+static int run_stage(void *handle)
+{
+    Stage s;
+    memset(&s, 0, sizeof s);
+    s.do_alloc = need_sym(handle, "mw_alloc");
+    s.do_free = need_sym(handle, "mw_free");
+    s.do_index = need_sym(handle, "mw_index");
+    s.do_table = need_sym(handle, "mw_table");
+    s.gfl = need_sym(handle, "C_GetFunctionList");
+    s.gil = need_sym(handle, "C_GetInterfaceList");
+    s.gi = need_sym(handle, "C_GetInterface");
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    printf("STAGE pid=%d\n", (int)getpid());
+    char *line = NULL;
+    size_t cap = 0;
+    for (;;) {
+        fflush(stdout);
+        ssize_t len = getline(&line, &cap, stdin);
+        if (len < 0) {
+            break;
+        }
+        if (line[0] == 'X') {
+            printf("BYE\n");
+            free(line);
+            return 0;
+        }
+        if (line[0] == 'P') {
+            if (stage_publish(&s) != 0) {
+                free(line);
+                return EXIT_SCENARIO;
+            }
+            continue;
+        }
+        if (line[0] == 'T') {
+            if (stage_templates(handle) != 0) {
+                free(line);
+                return EXIT_SCENARIO;
+            }
+            continue;
+        }
+        if (line[0] == 'B') {
+            static const int back_ords[NEX] = { 0, 5, 13, 18, 43, 44 };
+            for (int k = 0; k < NEX; k++) {
+                char name[32];
+                snprintf(name, sizeof name, "mw_backend_%d", back_ords[k]);
+                dlerror();
+                void *sym = dlsym(handle, name);
+                if (dlerror() != NULL || sym == NULL) {
+                    printf("ERROR backend %s missing\n", name);
+                    free(line);
+                    return EXIT_SCENARIO;
+                }
+                printf("BACKEND ord=%d addr=%p\n", back_ords[k], sym);
+            }
+            printf("BACKEND end\n");
+            continue;
+        }
+        if (line[0] == 'A') {
+            int fwd = 0;
+            int fail = -1;
+            if (sscanf(line + 1, "%d %d", &fwd, &fail) != 2) {
+                printf("ERROR bad alloc\n");
+                free(line);
+                return EXIT_SCENARIO;
+            }
+            void *w = s.do_alloc(fwd, fail);
+            if (w == NULL) {
+                printf("ERROR alloc failed\n");
+                free(line);
+                return EXIT_SCENARIO;
+            }
+            int idx = s.do_index(w);
+            s.handles[idx] = w;
+            printf("ALLOC idx=%d table=%p\n", idx, s.do_table(w));
+            continue;
+        }
+        if (line[0] == 'F') {
+            int idx = -1;
+            if (sscanf(line + 1, "%d", &idx) != 1 || idx < 0 || idx >= STAGE_NWRAP
+                || s.handles[idx] == NULL) {
+                printf("ERROR bad free\n");
+                free(line);
+                return EXIT_SCENARIO;
+            }
+            s.do_free(s.handles[idx]);
+            s.handles[idx] = NULL;
+            printf("FREED idx=%d\n", idx);
+            continue;
+        }
+        printf("ERROR unknown command\n");
+        free(line);
+        return EXIT_SCENARIO;
+    }
+    free(line);
+    return EXIT_SCENARIO;
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 6) {
@@ -303,6 +513,11 @@ int main(int argc, char **argv)
     if (handle == NULL) {
         fprintf(stderr, "workload: dlopen failed: %s\n", dlerror());
         return EXIT_LOAD;
+    }
+    if (strcmp(scenario, "stage") == 0) {
+        int rc = run_stage(handle);
+        dlclose(handle);
+        return rc;
     }
     alloc_fn do_alloc = need_sym(handle, "mw_alloc");
     free_fn do_free = need_sym(handle, "mw_free");

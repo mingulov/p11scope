@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # p11scope — owner requirements and goal (release hardening)
 
 **Date:** 2026-09-01

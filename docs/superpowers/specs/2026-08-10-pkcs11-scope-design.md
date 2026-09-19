@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # pkcs11-scope — Design
 
 **Date:** 2026-08-10

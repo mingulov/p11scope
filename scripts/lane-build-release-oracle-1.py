@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Release Task 4 receipt model oracle: evaluate the shared receipt-case matrix plus release-lane cases over synthetic evidence. Oracle extracted from scripts/build-release.sh (lines 34-264)."""
 import argparse
 import sys

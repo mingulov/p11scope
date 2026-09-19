@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 use object::elf;
 use p11scope_manifest::elf::{
     ElfAbi, ElfSnapshot, entry_file_offset, exports_matching, read_export_facts, symbol_file_offset,

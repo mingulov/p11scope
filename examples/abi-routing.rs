@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Privileged, explicit qualification for ordinary entry-probe ABI routing.
 //!
 //! This example is compiled by the normal all-targets gate, but it is never

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Gate G2 induced-gaps Task 4 receipt model oracle: evaluate the shared receipt-case matrix over synthetic evidence. Oracle extracted from scripts/verify-induced-gaps.sh (lines 594-712)."""
 import argparse
 import sys

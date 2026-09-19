@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Final architecture and test maintainability design
 
 Owner-approved scope, 2026-09-07: fix the identified test architecture and

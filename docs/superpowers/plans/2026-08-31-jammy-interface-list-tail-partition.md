@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Jammy interface-list verifier partition
 
 Status: implementation plan. This narrowly supersedes the no-tail-call and

@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # pkcs11-scope Roadmap — phases and review gates
 
 Source of truth for *what* each phase delivers and *which review gates it must

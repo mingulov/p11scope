@@ -1,4 +1,5 @@
 #!/usr/bin/python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Coordinate a fixed, unprivileged build from a full offline source export."""
 
 from __future__ import annotations

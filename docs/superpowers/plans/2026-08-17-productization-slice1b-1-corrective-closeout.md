@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Productization Slice 1b-1 Corrective Closeout — Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: use `superpowers:subagent-driven-development` to execute this plan one task at a time. Every production change starts with a witnessed failing regression, receives a task-specific review, and is committed only after the reviewer accepts it.

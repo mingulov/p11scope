@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! The native suite compiles real ELF fixtures and exercises the shared decoder.
 use std::process::Command;
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Unprivileged seed-qualifier probes with injected BPF acquisition boundaries.
 
 Every genuinely privileged step - real task-storage map creation, seeding,

@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # cgroup-256 A3: identity-deduped ELF export facts (Task 5 blocker)
 
 ## Why this plan exists

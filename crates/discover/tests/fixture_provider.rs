@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 use p11scope_discover::discover::discover;
 use p11scope_discover::manifest::*;
 use std::path::{Path, PathBuf};

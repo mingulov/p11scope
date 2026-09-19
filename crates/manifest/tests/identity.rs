@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 use p11scope_manifest::elf::ElfAbi;
 use p11scope_manifest::identity::{
     IdentityKind, MappingFileKey, identify, inspect_file, open_object,

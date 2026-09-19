@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Trusted native fixture: descendants never leave their inherited group."""
 
 import json

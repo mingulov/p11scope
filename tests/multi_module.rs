@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! One attach plan over many modules: distinct slots per module, one slot for a
 //! target two modules share, and a capacity ceiling that refuses whole modules.
 

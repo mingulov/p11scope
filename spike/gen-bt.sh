@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # gen-bt.sh <manifest> [path-prefix]  — emit a bpftrace program on stdout.
 # Uses column $4. For SoftHSM2 the file-offset ($3) and vaddr ($4) columns are
 # numerically EQUAL (its executable LOAD segment has p_offset == p_vaddr), so

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Subset-oracle behavior: python3 -I tests/python/test_subset_oracle.py."""
 
 import contextlib

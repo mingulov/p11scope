@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Loader artifact harness (Task 7). The A/B artifact's run.sh is NOT modified
 # (Task 5 freeze boundary): the VM lane functions here are copied from it with
 # loader-specific bundle inventory, validator, and build steps.

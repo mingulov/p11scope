@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Isolated Linux process-custody probes; every probe has an external watchdog."""
 import ctypes
 import os

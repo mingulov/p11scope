@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # v0.1.0 release build.
 #
 # Produces the two artifact shapes the design calls for:

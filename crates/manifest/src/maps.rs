@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Strict lexical facts from Linux `/proc/<pid>/maps`.
 
 use crate::identity::MappingFileKey;

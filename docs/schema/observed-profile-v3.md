@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # `observed-profile.json` schema v3
 
 Current exact schema identifiers:

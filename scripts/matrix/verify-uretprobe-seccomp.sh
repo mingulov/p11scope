@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Does attaching a uretprobe kill a seccomp-hardened target on THIS kernel?
 #
 # Linux 6.11 made a returning uretprobe issue __NR_uretprobe (x86-64 nr 335)

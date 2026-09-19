@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Require pkcs11-check's independent CK_RV trace to be a capture subset."""
 
 import json

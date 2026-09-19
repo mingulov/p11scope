@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 
 P11SCOPE_VM_BASES=${P11SCOPE_VM_BASES:-$HOME/src/m/p11scope-ws/vm-bases}
 

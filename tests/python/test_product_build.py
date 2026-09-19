@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Native tests for the shared ordinary/prepared product build launcher."""
 
 import json

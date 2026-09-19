@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Exact offline curl responder for lane-13 release downloads."""
 
 import os

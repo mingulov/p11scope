@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Gate G2: five induced gaps plus one policy-map immutability control.
 # Every capture must disclose its exact gap rather than overclaiming.
 #

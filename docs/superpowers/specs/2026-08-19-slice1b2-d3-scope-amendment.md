@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Slice 1b-2 D3 scope amendment
 
 **Status:** Accepted conservative implementation of the recorded owner decision

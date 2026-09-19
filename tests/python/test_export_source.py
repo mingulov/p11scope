@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Native source-export tests with isolated synthetic Git repositories."""
 
 from __future__ import annotations

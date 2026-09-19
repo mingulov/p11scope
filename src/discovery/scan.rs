@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Finding PKCS#11 function tables by reading the target's mapped memory. No provider
 //! code is executed and nothing is copied: `/proc/<pid>/maps` says what is mapped,
 //! `.dynsym` says which objects could hand out a table, and the target's own

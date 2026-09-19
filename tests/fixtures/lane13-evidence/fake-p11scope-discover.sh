@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 module=; output=; previous=
 for argument do
     [ "$previous" = --module ] && module=$argument

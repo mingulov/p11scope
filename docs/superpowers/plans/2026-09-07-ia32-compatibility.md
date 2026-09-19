@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Proper ia32 compatibility implementation plan
 
 > Use executing-plans, systematic-debugging when a gate fails, and

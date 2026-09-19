@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Task 4 Receipt Architecture Decision
 
 **Status:** unanimously accepted by independent Sol, Terra, and Luna review on

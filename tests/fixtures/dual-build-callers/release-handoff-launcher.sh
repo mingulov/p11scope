@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 set -eu
 [ "$#" -eq 5 ] || exit 2
 launcher_command=$1

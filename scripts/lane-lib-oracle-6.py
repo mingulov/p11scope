@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Shared lib container manifest oracle rewrite_container_manifest: rewrite a v5 manifest from the safe root to the target root. Oracle extracted from scripts/lib.sh (lines 772-802)."""
 import argparse
 import sys

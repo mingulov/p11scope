@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # cgroup-256 A5: demand-paged ELF export-facts reads (Task 5 blocker)
 
 ## Why this plan exists

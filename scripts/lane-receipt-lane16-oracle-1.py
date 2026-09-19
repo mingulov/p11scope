@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Task 4 lane 16 receipt model oracle: evaluate the shared receipt-case matrix plus lane16 cases over synthetic evidence. Oracle extracted from scripts/verify-receipt-lane16.sh (lines 20-210)."""
 import argparse
 import sys

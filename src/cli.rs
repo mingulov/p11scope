@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Command-line parsing for every subcommand: one parser body for profile and
 //! trace, durations with suffixes, hints for removed flags.
 

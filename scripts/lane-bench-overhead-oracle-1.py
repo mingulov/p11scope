@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Bench-overhead bounded-trace oracle: assert the --max-events truncation evidence shape of trace_bound.txt. Oracle extracted from scripts/bench-overhead.sh (lines 197-206)."""
 import argparse
 import sys

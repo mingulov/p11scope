@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Reproducible dependency patch series
 
 Status: selected architecture; implementation and migration checks remain pending.

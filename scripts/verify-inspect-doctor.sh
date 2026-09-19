@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Unprivileged contract lane: inspect finds a provider the target loaded, and
 # doctor's verdict matches what this host can actually do. No sudo, no BPF.
 #

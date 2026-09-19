@@ -1,4 +1,5 @@
 #!/usr/bin/python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Private, refusal-only S9 normalization experiment."""
 
 import hashlib

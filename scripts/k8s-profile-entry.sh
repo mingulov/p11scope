@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # In-cluster twin of scripts/attach-pod.sh: run INSIDE the p11scope-observer
 # DaemonSet pod (via `kubectl exec`) to profile a target pod's cgroup.
 # Resolves pod -> container id through the in-cluster API under the bound

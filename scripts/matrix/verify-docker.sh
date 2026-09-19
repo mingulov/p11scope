@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Task 6: one Docker container, manifest-free discovery, and exact capture.
 #
 # Nothing is copied into or out of the container. The observer runs on the host,

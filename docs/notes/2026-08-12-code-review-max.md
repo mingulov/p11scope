@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Full-repo code review (`/code-review max`) — 2026-08-12
 
 **Scope:** everything in the repo at `349cb39` (v0.1.0, 87 commits, 109 tests).

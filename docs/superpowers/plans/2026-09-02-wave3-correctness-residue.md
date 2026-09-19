@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Wave 3 — Correctness Residue Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: use

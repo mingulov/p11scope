@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Lane 02 pause-phase diagnostic plan
 
 Date: 2026-08-27

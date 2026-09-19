@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Actual native root helper tests and narrow production hook contracts."""
 from pathlib import Path
 import argparse

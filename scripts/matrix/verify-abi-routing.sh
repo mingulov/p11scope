@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Native qualification gate for actual p11scope ordinary-entry ABI routing.
 
 ABI_ROUTING_REPO=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd -P)

@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Semantic state machine: turns a stream of completed `Event`s into
 //! meaning — mechanisms, session lifecycle, logins, per-function counts —
 //! while pseudonymizing every session handle as it is consumed. Raw

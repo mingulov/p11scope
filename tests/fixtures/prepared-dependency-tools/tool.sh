@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 
 # The tool pinning layer identifies its executables by behaviour (it runs
 # `python --version` and requires a `Python ` banner), so a stub standing in

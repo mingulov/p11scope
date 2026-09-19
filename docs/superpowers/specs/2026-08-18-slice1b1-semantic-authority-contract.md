@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Slice 1b-1 Semantic Authority Contract
 
 **Status:** owner-approved on 2026-08-18; implementation and evidence remain OPEN.

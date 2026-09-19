@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Minimal Knative-servable HTTP handler: each GET request runs the
 deterministic PKCS#11 workload (spike/harness.c) once against SoftHSM2 and
 returns its stdout. This is the whole "application" for the scale-from-zero

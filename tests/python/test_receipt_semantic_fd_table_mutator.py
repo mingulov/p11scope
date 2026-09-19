@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Semantic trace private FD-table-mutator admission contracts."""
 
 from pathlib import Path

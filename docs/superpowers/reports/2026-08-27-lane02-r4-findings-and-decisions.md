@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Lane 02 r4 findings and decisions
 
 Date: 2026-08-27

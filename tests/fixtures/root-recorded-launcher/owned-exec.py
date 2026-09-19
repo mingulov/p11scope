@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Record fixture custody, then exec in-place; no production ACK or supervisor."""
 
 import json

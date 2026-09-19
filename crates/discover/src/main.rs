@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! p11scope-discover — unprivileged short-lived discovery helper.
 //! Design: v1 behavior when discovery fails is report-and-exit-nonzero;
 //! never silently proceed (design spec, Architecture).

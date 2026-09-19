@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # p11scope product lessons for osslscope
 
 **Date:** 2026-08-27

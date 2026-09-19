@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Slice 1b-2 third-kernel amendment
 
 **Status:** Accepted on owner instruction to cover additional kernels and

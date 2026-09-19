@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! The owned-child lifecycle and the capture loops the binary runs.
 //!
 //! There is exactly one profile loop and one trace loop here, shared by

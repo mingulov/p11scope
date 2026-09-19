@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Whether attaching a uretprobe would kill the process being observed.
 //!
 //! Linux 6.11 moved uretprobes to a syscall trampoline: when a probed function

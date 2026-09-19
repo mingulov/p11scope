@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-2.0-only
 //! p11scope BPF programs. A lightweight or template-aware entry program
 //! plus one return program serve every attach point. The attach cookie
 //! carries the slot and descriptor indices, so 68+ probes share a small fixed program set

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 set -eu
 
 wrapper_root=$(CDPATH= cd -P "$(dirname "$0")/.." && pwd)

@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 // Task 7 host side: §7.3 cookie round-trip, 256-entry monotonic registry, and
 // the ptrace-free pre-exec loader attach (`loader-hit`), plus the §8.1 no-cookie
 // negative and the Task 2-style STATS diagnostic. The A/B artifact's

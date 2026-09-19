@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Ubuntu 26.04 Primary Development Host Plan
 
 **Goal:** Restore a clean development baseline on the transferred Ubuntu 26.04

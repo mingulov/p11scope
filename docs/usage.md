@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Using p11scope
 
 This is the operator's guide: what the tool does, what it refuses to do,

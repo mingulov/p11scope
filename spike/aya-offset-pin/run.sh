@@ -1,4 +1,5 @@
 #!/bin/sh -eu
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Regression pin for aya's uprobe offset semantics (Gate G0 carry-over).
 set -eu
 cd "$(dirname "$0")"

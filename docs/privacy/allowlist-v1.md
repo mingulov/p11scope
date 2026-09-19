@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Privacy allowlist v1 — decoder inventory
 
 This inventories the bounded metadata decoders. There is no arbitrary-buffer

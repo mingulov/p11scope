@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Inspect exact map/program policy inventory in a freshly built BPF ELF."""
 
 from pathlib import Path

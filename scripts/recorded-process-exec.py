@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """One-shot SELF/ACK/exec gates and bounded, identity-checked control I/O.
 
 No child is forked here. Control descriptors are close-on-exec and command

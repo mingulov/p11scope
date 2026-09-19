@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Gate K1 k8s-attach lane oracle assert_k8s_evidence: validate DaemonSet capture evidence and refuse mutations. Oracle extracted from scripts/verify-k8s-attach.sh (lines 20-71)."""
 import argparse
 import sys

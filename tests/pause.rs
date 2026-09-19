@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! `--pause never|auto|always` as an operator sees it, through the same one
 //! public facade (`p11scope::run_owned`). The coordinator itself — its clock,
 //! its maps, its drains, its owner guard and its injected actions — is

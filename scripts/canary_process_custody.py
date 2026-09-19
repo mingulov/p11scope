@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Linux custody for a dedicated, single-threaded canary coordinator.
 
 The caller owns signal/wait policy throughout the scope and must survive cleanup.

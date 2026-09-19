@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Wave 4 closure — hosted CI
 
 Closed 2026-09-05 at `141a94e`, merged to `main` and pushed to the

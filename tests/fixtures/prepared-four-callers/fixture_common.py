@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Event/configuration support for four-caller native fixtures."""
 
 import json

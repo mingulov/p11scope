@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Load uniquely delimited actual function definitions for native EXIT tests."""
 
 import json

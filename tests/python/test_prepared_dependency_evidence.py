@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Native behavior tests for prepared dependency capture and recheck evidence."""
 
 from __future__ import annotations

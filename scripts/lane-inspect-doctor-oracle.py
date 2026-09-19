@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Unprivileged inspect-doctor lane oracle assert_inspect_doctor: validate inspect documents against doctor verdicts and refuse mutations. Oracle extracted from scripts/verify-inspect-doctor.sh (lines 23-204)."""
 import argparse
 import sys

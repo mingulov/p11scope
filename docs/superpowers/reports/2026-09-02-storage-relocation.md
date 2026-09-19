@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Storage relocation record
 
 Date: 2026-09-02 (Europe/Helsinki)

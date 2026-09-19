@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Record lane-13 tracked and prepared-source checksum snapshots."""
 
 from __future__ import annotations

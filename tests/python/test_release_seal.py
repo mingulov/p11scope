@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Task11 release seal contracts exercised through the actual driver CLI."""
 
 import os

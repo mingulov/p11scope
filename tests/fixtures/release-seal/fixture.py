@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Native setup for the actual release seal CLI, ending at a harmless probe."""
 
 from dataclasses import dataclass

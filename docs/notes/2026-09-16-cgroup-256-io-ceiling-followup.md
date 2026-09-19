@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Cgroup-256 follow-up: the I/O byte ceiling binds first (plain builds)
 
 Date: 2026-09-16. Follows `2026-09-16-cgroup-256-trace-everything.md`, whose

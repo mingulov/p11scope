@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Private acceptance tests: actual reducers/drains, only task membership injected.
 use super::*;
 use crate::events::{EventDrain, ScriptedRecords};

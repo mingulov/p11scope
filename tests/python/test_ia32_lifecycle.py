@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Native ia32 caller and exec-guard ownership tests."""
 
 import ctypes

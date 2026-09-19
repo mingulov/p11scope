@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Gate K1: the DaemonSet node observer captures a provider mapped in another
 # pod, end to end, through the committed deploy/k8s manifests. Oracle: the
 # capture JSON names libsofthsm2.so with attached probes and slots.

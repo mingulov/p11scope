@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
 use crate::events::{EventDrain, LIVE_POLL_QUANTUM, ScriptedRecords};
 use p11scope_ebpf_common::{Event, capture, event_type};

@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 **1. THE FIX — bracket acquisition, decoding, and publication**
 
 **Recommendation:** add the maps-A/maps-B bracket to `scan_process_view`, reject unvalidated memory results, and record the refusal as discovery loss. This is the primary correctness fix.

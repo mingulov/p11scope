@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Lane 02 fixed 500 ms availability implementation plan
 
 **Date:** 2026-08-27

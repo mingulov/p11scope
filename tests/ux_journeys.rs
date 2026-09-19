@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Usability journey baseline pins (Task 1 of the 2026-09-17 usability pass).
 //!
 //! Each test scripts one baseline probe (B1–B7) or journey step (J1–J6) as a

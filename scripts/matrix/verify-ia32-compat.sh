@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Kernel feasibility gate for x86-64 hosts observing native x86-64 and ia32
 # uprobes. This does not exercise Aya or qualify p11scope's producer/verifier.
 if [ "${P11SCOPE_IA32_SOURCE_ONLY:-0}" != 1 ]; then

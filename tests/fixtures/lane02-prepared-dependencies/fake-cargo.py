@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Controlled Cargo for Lane02 prepared-dependency integration tests."""
 
 import json

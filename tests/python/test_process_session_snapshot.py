@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Process-session snapshot races: python3 -I tests/python/test_process_session_snapshot.py."""
 
 import contextlib

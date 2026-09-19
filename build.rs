@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Builds the BPF object with the nightly toolchain and hands cargo the
 //! path via OUT_DIR, so `p11scope` ships one self-contained binary.
 //!

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Task 4 lane 16 receipt finalizer oracle: enforce the exact receipt tree shape with 0700 dirs and 0600 files. Oracle extracted from scripts/verify-receipt-lane16.sh (lines 283-297)."""
 import argparse
 import sys

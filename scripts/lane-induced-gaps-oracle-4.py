@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Gate G2 induced-gaps lane oracle assert_dynamic_maps_advanced: require stable observer-owned map ids and advanced counters across the freeze lane. Oracle extracted from scripts/verify-induced-gaps.sh (lines 340-431)."""
 import argparse
 import sys

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Task 4 Lane 16: one fixed owned-run structural row (never or auto).
 set -eu
 cd "$(dirname "$0")/.."

@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Build a full source export offline
 
 The full source export contains the complete Cargo dependency payload but does

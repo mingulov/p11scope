@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Native wrapper tests with real preparation and a synthetic Cargo executable."""
 
 import json

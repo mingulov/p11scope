@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 set -u
 P11SCOPE_IA32_SOURCE_ONLY=1
 export P11SCOPE_IA32_SOURCE_ONLY

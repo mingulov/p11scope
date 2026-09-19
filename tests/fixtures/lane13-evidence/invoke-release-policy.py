@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Invoke the maintained lane-13 release admission function with fixed stubs."""
 
 import argparse

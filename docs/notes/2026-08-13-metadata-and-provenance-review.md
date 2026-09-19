@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Review + gap analysis — safe-metadata design and manifest-provenance plan
 
 **Date:** 2026-08-13

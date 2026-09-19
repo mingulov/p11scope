@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Capability-tier lane oracle check_row: validate one finite doctor capability tier row against its expected exit and label. Oracle extracted from scripts/verify-capability-tier.sh (lines 9-44)."""
 import argparse
 import sys

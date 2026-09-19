@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Task 4 lane 02 wait_root_exit oracle: poll the pinned root observer pidfd for exit with identity check. Oracle extracted from scripts/verify-receipt-lane02.sh (lines 555-566)."""
 import argparse
 import sys

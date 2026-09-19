@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Semantic trace private open-description contracts."""
 
 from pathlib import Path

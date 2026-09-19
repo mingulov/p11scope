@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # p11scope on Kubernetes
 
 Node-side observer as a DaemonSet: one agent pod per node that idles and

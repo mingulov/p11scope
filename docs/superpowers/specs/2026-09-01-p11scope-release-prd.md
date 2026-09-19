@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # p11scope v0.1.0 — Product Requirements (release PRD)
 
 **Date:** 2026-09-01

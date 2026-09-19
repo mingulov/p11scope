@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Controlled external tools; never compile or execute a frozen artifact."""
 import json
 import os

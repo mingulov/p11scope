@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Task 4 Contract Closure Decision
 
 **Status:** accepted through commit `61ee78a`; the design-complete clarification

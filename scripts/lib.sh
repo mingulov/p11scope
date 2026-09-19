@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Shared helpers for the gate scripts: non-root caller check, cleanup traps,
 # container tar cap, root process pinning/signalling, capture-ready wait.
 

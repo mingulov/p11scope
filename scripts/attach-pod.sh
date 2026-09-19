@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Attach to a Kubernetes pod's cgroup and profile whatever PKCS#11 providers its
 # processes have mapped. Nothing is copied into or out of the container: the
 # observer reads the pod's memory and opens its provider through /proc/<pid>/root.

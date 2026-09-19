@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # W5 runtime baseline plan
 
 > **For agentic workers:** Use superpowers:executing-plans for the serial runtime

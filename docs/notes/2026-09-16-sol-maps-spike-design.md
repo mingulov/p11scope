@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 **VERIFIED:** Read-only audit of `961a65c`. No repository files changed; no Cargo commands or Rust tests ran. `VERIFIED` below means source inspected or a check executed; `INFERRED` marks conclusions and proposed changes.
 
 **1. Every caller**

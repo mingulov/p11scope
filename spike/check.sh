@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # check.sh <expected.txt> <bpftrace-output> — assert exact call counts.
 if [ "$#" -ne 2 ]; then
     echo "usage: $0 <expected.txt> <bpftrace-output>" >&2

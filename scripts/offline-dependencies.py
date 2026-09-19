@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Assemble and verify the finite offline dependency payload."""
 
 from __future__ import annotations

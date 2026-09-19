@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Invalid maps snapshot implementation report
 
 ## Baseline and governing instructions

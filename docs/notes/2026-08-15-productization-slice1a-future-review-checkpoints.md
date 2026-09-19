@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Productization Slice 1a — future review checkpoints
 
 Use this after Slice 1a execution. It records review checks, not additional scope or an

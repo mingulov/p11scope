@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Attach-first protection versus loader timing catalogs
 
 Date: 2026-08-19

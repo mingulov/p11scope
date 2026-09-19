@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Minimal product Cargo stand-in for the real-helper integration test."""
 
 from pathlib import Path

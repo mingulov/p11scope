@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Task 4 Build-Subject and Blueprint Correction
 
 **Status:** accepted after independent Sol, Terra, and Luna review on

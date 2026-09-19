@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # p11scope deferred feature slices (Slice 2, Slice 3, parked items)
 
 **Date:** 2026-09-01

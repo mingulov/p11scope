@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Release wave charters — W3–W8
 
 **Date:** 2026-09-01. Charters, not plans: each fixes a wave's scope, inputs,

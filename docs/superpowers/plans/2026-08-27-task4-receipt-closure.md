@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Task 4 Remaining-Lane Receipt Closure Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use

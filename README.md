@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # pkcs11-scope
 
 Observe the real PKCS#11 dependency surface of a running Linux application —

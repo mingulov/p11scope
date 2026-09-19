@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Provider qualification: live capture on Fedora 44 guest (6.19.10-300.fc44)
 
 Date: 2026-09-15. Guest: Fedora 44 cloud image, kernel 6.19.10-300.fc44.x86_64,

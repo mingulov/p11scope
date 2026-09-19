@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 
 # The tool pinning layer identifies its executables by behaviour (it runs
 # `rustup --version` and requires a `rustup ` banner), so a stub standing in

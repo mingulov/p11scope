@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Unprivileged lane-13 body; explicit original-handle handoff before holding."""
 
 import argparse

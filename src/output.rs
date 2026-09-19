@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Atomic output publication: private temp file beside the target, identity
 //! re-verified, fsync, rename.
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Release Task 4 receipt finalizer oracle: enforce the exact evidence-root tree shape with 0700 dirs and 0600 files. Oracle extracted from scripts/build-release.sh (lines 811-820)."""
 import argparse
 import sys

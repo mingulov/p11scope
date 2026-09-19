@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Task-storage canary oracle design
 
 Owner-approved 2026-09-09 as part of W7 release preparation. The privacy

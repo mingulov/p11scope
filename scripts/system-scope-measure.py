@@ -418,9 +418,22 @@ def main(argv):
         if extras:
             counts_match = False
     else:
-        counts_match = all(observed.get(k, 0) >= v for k, v in truth.items())
-        match_note = ("system scope: observed must cover workload truth "
-                      "(other processes may add calls)")
+        if set(observed) <= {"unknown"}:
+            # System runs are scan-only: since the 1.3 mislabel guard,
+            # unlinked heuristic tables carry no ordinal labels, so
+            # per-function matching is impossible and coverage is compared
+            # on totals (foreign processes may still add calls).
+            truth_total = sum(truth.values())
+            observed_total = sum(observed.values())
+            counts_match = observed_total >= truth_total
+            match_note = (
+                "system scan-only: names unavailable (unknown); "
+                f"total coverage {observed_total} >= {truth_total}"
+            )
+        else:
+            counts_match = all(observed.get(k, 0) >= v for k, v in truth.items())
+            match_note = ("system scope: observed must cover workload truth "
+                          "(other processes may add calls)")
 
     phases, discovery_line = derive_phases(
         samples, stderr_rows,

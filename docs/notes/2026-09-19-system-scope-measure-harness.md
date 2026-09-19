@@ -152,6 +152,12 @@ despite `event_loss=19226`: aggregate-map counts stay exact while the ring
 overflows — the harness reports both, proving why one counter alone never
 establishes completeness.
 
+Validated pre-1.3; re-baselined for 1.3+ trees in Task 1.4
+(`docs/notes/2026-09-19-task-1.4-baseline.md`): system cells are scan-only,
+so every slot is `unknown` (mislabel guard) and `counts_match` compares
+totals instead of per-function names. Pid cells keep exact per-name
+equality via the manifest.
+
 ## Handoff: ci.yml UNRUN update (needs a writer allowed past new-files-only)
 
 `hosted_pipeline_names_every_unrun_privileged_lane` pins the exact set of
@@ -191,8 +197,9 @@ scan-path view/pin handling across `start_retained_with`).
   comparisons need an idle box; run noisy perf experiments separately from
   correctness gates per the plan.
 - `counts_match` for pid scope requires exact equality including the
-  loader-observed `C_GetFunctionList`; for system scope it requires
-  observed ≥ truth per function (other processes may add calls).
+  loader-observed `C_GetFunctionList`; for system scope (scan-only, every
+  slot `unknown` since the 1.3 mislabel guard) it requires observed total
+  ≥ truth total (other processes may add calls).
 - Metrics-mode reports lack `attach_mechanisms` (profile-only field);
   recorded as null, honestly.
 - Trace mode is not supported yet (text-stream evidence needs its own

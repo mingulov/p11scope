@@ -5,12 +5,14 @@
 # of the lane is that one capture keeps them apart.
 #
 # Kept apart here means the plan's capacity semantics, which is what a real
-# libp11-kit forces: it maps 64 static CK_FUNCTION_LIST_3_0 closures (92 entries
-# each) into its own image, so discovery decodes thousands of entries against a
-# frozen 512-slot ceiling and the proxy module is refused *whole* — its decode
-# retained in history, zero slots taken — while SoftHSM2 attaches directly
-# within the budget and a target both providers publish is attached exactly
-# once through it. Completeness stays PARTIAL.
+# libp11-kit forces: it maps 64 static CK_FUNCTION_LIST_3_2 closure templates
+# (104 entries each, 6530 distinct targets) into its own image, so discovery
+# decodes thousands of entries against a frozen 512-slot ceiling. Since Task
+# 1.2 the K=4 per-object heuristic cap admits 4 tables (410 distinct targets)
+# and records the other 60 as `discovery_uncorroborated_candidates` — spill is
+# evidence, never slots — so the proxy module is NOT refused whole: both
+# providers attach (478 slots, nothing skipped) and a target both providers
+# publish is attached exactly once. Completeness stays PARTIAL.
 #
 # p11-kit loads its backends lazily, at C_Initialize, after the observer has
 # attached. LD_PRELOAD maps SoftHSM2 at exec instead, so both providers are
@@ -124,26 +126,25 @@ doc = json.load(open(sys.argv[1]))
 ev = doc["evidence"]
 
 # The plan's capacity semantics are this lane's expected outcome, not a
-# fallback. A real libp11-kit maps 64 static CK_FUNCTION_LIST_3_0 closures into
-# the scanned image — thousands of decoded entries against the frozen 512-slot
-# ceiling — so the proxy module is always discovered and always refused whole:
-# its decode stays in history and it takes zero slots, while SoftHSM2 attaches
-# directly within the budget and a target both providers publish is attached
-# exactly once through it (plan:1120-1136, Task 6E refusal rules). No p11-kit
-# module-directory scoping can change that: the closures are part of the
-# mapped image, not of any backend it loads. `exact_capture_modules`, every
-# count's attribution, the retained refused decode, and the sticky PARTIAL are
-# all inside the oracle, where they have mutation lanes.
+# fallback. A real libp11-kit maps 64 static CK_FUNCTION_LIST_3_2 closure
+# templates into the scanned image — thousands of decoded entries against the
+# frozen 512-slot ceiling — so the K=4 per-object heuristic cap admits 4
+# tables and spills 60 as candidates: both providers attach, nothing is
+# refused whole, and a target both providers publish is attached exactly
+# once. No p11-kit module-directory scoping can change that: the closures
+# are part of the mapped image, not of any backend it loads.
+# `exact_capture_modules`, every count's attribution, the retained decode,
+# the exact spill, and the sticky PARTIAL are all inside the oracle, where
+# they have mutation lanes.
 oracle.validate_proxy_capacity_fallback(doc, module_path=sys.argv[2])
 
-module = doc["capture"]["modules"][0]
-refused = ev["modules_skipped"][0]
 called = sum(item["calls"] for item in doc["functions"])
-print("proxy stack capacity refusal: OK")
-print("  attached:", module["path"])
+print("proxy stack bounded admission: OK")
+for module in doc["capture"]["modules"]:
+    print("  attached:", module["path"])
 print("  slots:", ev["slots"], "probes:", ev["attached_probes"], "calls:", called)
 print("  decoded entries:", ev["table_entries"], "over", len(ev["surfaces"]), "surfaces")
-print("  refused whole:", refused)
+print("  K=4 spill (uncorroborated candidates):", ev["discovery_uncorroborated_candidates"])
 PY
 
 echo "=== nested function-list and interface-list exports ==="
@@ -205,7 +206,15 @@ def validate(doc):
     assert len(ev["discovery"]) == 2
     for module in ev["discovery"]:
         assert module["path"] in paths and module["interfaces"] == 1
-        assert module["tables"] == [{"entries": 68, "source": "scan", "version": [2, 40]}]
+        tables = module["tables"]
+        assert len(tables) == 1
+        assert {key: tables[0][key] for key in ("entries", "source", "version")} == {
+            "entries": 68,
+            "source": "scan",
+            "version": [2, 40],
+        }
+        assert tables[0]["linkage"] == "heuristic"
+        assert isinstance(tables[0]["file_offset"], int) and tables[0]["file_offset"] >= 0
         assert len(module["objects"]) == 1
         target = module["objects"][0]
         assert all(target[key] == module[key] for key in ("path", "dev", "ino", "sha256"))
@@ -226,6 +235,7 @@ validate(doc)
 for mutate in (
     lambda d: d["evidence"].update(discovery_state_failures=3),
     lambda d: d["evidence"]["discovery"][1].update(interfaces=0),
+    lambda d: d["evidence"]["discovery"][0]["tables"][0].update(linkage="manifest"),
     lambda d: d["evidence"]["surfaces"].pop(),
     lambda d: d["evidence"]["discovery"][0].update(objects=[]),
     lambda d: d["evidence"]["discovery"][0].update(objects=d["evidence"]["discovery"][1]["objects"]),

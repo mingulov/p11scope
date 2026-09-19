@@ -74,7 +74,13 @@ Build env: TMPDIR=/var/tmp/p11scope-ws-tmp cargo +1.88 --locked --offline.
   Running alongside 1.2 (admission files). 4/7 slots used.
 - Wave +1 (2026-09-19): measurement-harness worker (scripts/+docs/notes new
   files only) for 1.4/1.6/3.1 baselines. 5/7 slots used.
-- Ruling: goal pre-commits to multi-uprobe; plan's Task 2.1 comparison is
-  reframed as WHICH loader (Aya backport vs raw helper), not WHETHER multi.
-  Task 1.6 still decides SCOPE (broad vs selective) by measurement. Cost if
-  wrong: loader rework if the comparison winner contradicts the directive.
+- Ruling (SUPERSEDED 2026-09-19): goal pre-commits to multi-uprobe; plan's
+  Task 2.1 comparison is reframed as WHICH loader (Aya backport vs raw
+  helper), not WHETHER multi. Task 1.6 still decides SCOPE (broad vs
+  selective) by measurement. Cost if wrong: loader rework if the comparison
+  winner contradicts the directive.
+- Ruling: per user refinement, uprobe_multi is an experiment-gated idea, not
+  a directive — adopt iff measurements show it helps. Task 2.1 compares
+  loaders AND establishes multi-vs-singles numbers; Task 1.6 decides scope;
+  both feed an explicit adopt/defer call. Cost if wrong: delayed multi work
+  if it was obviously right — accepted, measurement is the point.

@@ -1482,6 +1482,11 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
         a.allow_confined_uretprobe,
     )?;
     let accepted_uretprobe_risk = accepted;
+    // Before the discovery scan: a bad `-o` path must fail fast (F-Scale-6)
+    // instead of after a scan — and still before any probe is on. The profile
+    // sink stays an atomically-published temp file; opening it early only
+    // moves the trust failure earlier.
+    let out = OutputSink::open(kind, a.out.as_deref())?;
     let mut engine = Engine::discover(a, &scope, named_view)?;
     // Zero modules is not an error (spec §4.10): the capture still runs, still
     // writes its report, and says here how to find out why it found nothing.
@@ -1489,8 +1494,6 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
         eprintln!("{}", no_modules_hint(&a.scope));
     }
     let stop = install_stop_flag()?;
-    // Before the attach: a bad `-o` path must fail before any probe is on.
-    let out = OutputSink::open(kind, a.out.as_deref())?;
     let mut session = engine
         .start_session(policy, a.ring_bytes)
         .context("starting attach session")?;

@@ -53,3 +53,14 @@ Build env: TMPDIR=/var/tmp/p11scope-ws-tmp cargo +1.88 --locked --offline.
   in order (Digest group genuinely absent, 3.2 extension block matches);
   no 3.x mislabel vector. (4) COSMETIC — review's scan.rs:838 citation drifted
   (now :896; def in external pkcs11-module crate).
+- Plan v3.2 (deep-review §10+§11): new heap-allowance hazard VERIFIED in
+  source (scan.rs:868-891 documents "without a stable file owner there is no
+  identity, so charge"; ceilings 512/53,248 at :35-36) — added as Task 1.5
+  Step 5 runtime-table accounting design. Reviewer's costing correction
+  ACCEPTED (indexed lookups off snapshots, not per-target file reads) —
+  Task 1.5 Step 4 rewritten as full-lifetime costing. §10 storage figures
+  all verified exact (SlotStats 296 B, 9.25/117.97 MiB, RV 4096, START 16384,
+  dense PerCpuArray). New Task 1.6 coverage-architecture experiment (broad vs
+  publication-selected, two lanes, measured decision); open question (7);
+  matrix gains wrapper-only failure + nested wrapper→backend. Catalog closed
+  for p11-kit 0.26.2 header (scoped). Task 1.2 untouched by this delta.

@@ -701,7 +701,7 @@ fn original_generation_state_with(
     }
 }
 
-fn raise_nofile() -> io::Result<usize> {
+pub(crate) fn raise_nofile() -> io::Result<usize> {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,

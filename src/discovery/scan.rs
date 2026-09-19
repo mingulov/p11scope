@@ -673,6 +673,64 @@ impl ScanOutcome {
     }
 }
 
+/// Publication evidence for one candidate table, strongest first: a table
+/// named by an interface triple outranks a live-return address match, which
+/// outranks a manifest offset match, which outranks bare size/version
+/// plausibility. Field order is the priority — the derived `Ord` sorts the
+/// strongest score last, so admission ordering reverses it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct TableEvidenceScore {
+    pub(crate) linked: bool,
+    pub(crate) live_return: bool,
+    pub(crate) manifest: bool,
+    pub(crate) full_walk: bool,
+}
+
+/// Pure evidence score for the candidate at `index`: interface linkage (via
+/// `ScannedInterface.table`) first, then live-return identity, then manifest
+/// offset, then walk plausibility. No I/O — every input is already-decoded
+/// scan data or caller-held evidence.
+pub(crate) fn table_evidence_score(
+    index: usize,
+    tables: &[ScannedTable],
+    interfaces: &[ScannedInterface],
+    live_return_addresses: &[u64],
+    manifest_offsets: &[u64],
+) -> TableEvidenceScore {
+    let table = &tables[index];
+    TableEvidenceScore {
+        linked: interfaces
+            .iter()
+            .any(|interface| interface.table == Some(index)),
+        live_return: live_return_addresses.contains(&table.address),
+        manifest: table
+            .file_offset
+            .is_some_and(|offset| manifest_offsets.contains(&offset)),
+        full_walk: table.walk == "full",
+    }
+}
+
+/// Indices of `tables` strongest-evidence first. Stable: equal evidence keeps
+/// discovery order, so scoring never reorders what it cannot distinguish.
+pub(crate) fn order_tables_by_evidence(
+    tables: &[ScannedTable],
+    interfaces: &[ScannedInterface],
+    live_return_addresses: &[u64],
+    manifest_offsets: &[u64],
+) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..tables.len()).collect();
+    order.sort_by_cached_key(|&index| {
+        std::cmp::Reverse(table_evidence_score(
+            index,
+            tables,
+            interfaces,
+            live_return_addresses,
+            manifest_offsets,
+        ))
+    });
+    order
+}
+
 /// Version word → the field spans that describe that layout. Returns `None` when the
 /// word is not a plausible `CK_VERSION` header or the layout is one we refuse to walk.
 pub(crate) fn spans_for(word: u64) -> Option<((u8, u8), &'static [TableSpan], &'static str)> {

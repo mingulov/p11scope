@@ -116,6 +116,10 @@ pub struct Engine {
     pending_loader_scans: BTreeMap<PendingLoaderScanKey, u64>,
     selection_claims: BTreeMap<SelectionClaimKey, SelectionClaim>,
     selection_tables: BTreeMap<SelectionTableKey, SelectionTableFact>,
+    /// Task 1.6 experiment: broad admission. Set once from
+    /// `P11SCOPE_BROAD_ADMIT=1` in `discover_plan` (production) or directly
+    /// by broad tests; `false` preserves selected admission everywhere.
+    broad_admit: bool,
     #[cfg(test)]
     loader_memory_scan_attempts: usize,
 }
@@ -3351,8 +3355,17 @@ fn scan_and_pin(
     hooks: &HookRegistry,
     budget: &mut CaptureWorkBudget,
     counters: &mut DiscoveryCounters,
+    broad_admit: bool,
 ) -> Result<(Vec<ScannedModule>, PinnedObjects)> {
-    scan_and_pin_with(view, hints, hooks, budget, counters, scan_process_view)
+    scan_and_pin_with(
+        view,
+        hints,
+        hooks,
+        budget,
+        counters,
+        broad_admit,
+        scan_process_view,
+    )
 }
 
 fn scan_and_pin_without_memory(
@@ -3361,6 +3374,7 @@ fn scan_and_pin_without_memory(
     hooks: &HookRegistry,
     budget: &mut CaptureWorkBudget,
     counters: &mut DiscoveryCounters,
+    broad_admit: bool,
 ) -> Result<(Vec<ScannedModule>, PinnedObjects)> {
     scan_and_pin_with(
         view,
@@ -3368,6 +3382,7 @@ fn scan_and_pin_without_memory(
         hooks,
         budget,
         counters,
+        broad_admit,
         scan_process_view_without_memory,
     )
 }
@@ -3378,6 +3393,7 @@ fn scan_and_pin_with(
     hooks: &HookRegistry,
     budget: &mut CaptureWorkBudget,
     counters: &mut DiscoveryCounters,
+    broad_admit: bool,
     scan: impl FnOnce(
         &ScanRequest<'_>,
         &ProcessView,
@@ -3407,7 +3423,15 @@ fn scan_and_pin_with(
     if let ScanOutcome::Scanned { scan_ms, .. } = &outcome {
         counters.scan_ms = counters.scan_ms.saturating_add(*scan_ms);
     }
-    let (pinned, pin_skips) = pin_scanned_view_objects(view, outcome.modules(), budget)
+    let mut modules = match outcome {
+        ScanOutcome::Scanned { modules, .. } | ScanOutcome::Unavailable { modules, .. } => modules,
+    };
+    // Broad (Task 1.6) augments swept modules with validated fixed-family
+    // tables before pinning, so pinning covers the union with one call.
+    if broad_admit {
+        broad_fixed_pool_pass(view, &mut modules, budget, counters);
+    }
+    let (pinned, pin_skips) = pin_scanned_view_objects(view, &modules, budget)
         .map_err(|error| anyhow!("pinning process view {:?}: {error}", view.id()))?;
     for skipped in pin_skips {
         eprintln!(
@@ -3417,10 +3441,308 @@ fn scan_and_pin_with(
         attribution::note(&skipped);
         counters.object_skips.push(skipped);
     }
-    let modules = match outcome {
-        ScanOutcome::Scanned { modules, .. } | ScanOutcome::Unavailable { modules, .. } => modules,
-    };
     Ok((modules, pinned))
+}
+
+/// Task 1.6 experiment: recognized fixed-family pool layout.
+///
+/// Recognition is name + geometry + per-table decode validation, in that
+/// order: an object exporting `p11scope_fixed` whose 53,760 bytes hold 64
+/// contiguous 840-byte `{3,2}` tables (the owned fixture's contract in
+/// `tests/fixtures/multi-wrapper/provider.c`). Every table validates through
+/// the same bracketed exact-table reader as 1.5 heap publication (maps-A
+/// membership, one bounded mem read, same-decoder decode, maps-B stability,
+/// generation check); a table that fails any of those is refused loudly,
+/// never attached. The symbol lookup intentionally accepts BSS: the pool is
+/// filled by the provider constructor at load, so file bytes never carry it.
+///
+/// What broad does NOT do: unknown-layout builds (no symbol, e.g. the
+/// stripped fixture) stay publication-driven; the sweep's file-backed tables
+/// are never re-read (a pool table the sweep already decoded is skipped as
+/// covered after an entry-equality check); names stay unauthorized (pool
+/// tables are unlinked heuristic evidence — the 1.3 mislabel guard is
+/// untouched). Costs charge through the shared budget like any other read.
+const BROAD_POOL_SYMBOL: &str = "p11scope_fixed";
+const BROAD_POOL_TABLES: usize = 64;
+const BROAD_POOL_TABLE_BYTES: usize = 840;
+const BROAD_POOL_BYTES: usize = BROAD_POOL_TABLES * BROAD_POOL_TABLE_BYTES;
+const BROAD_POOL_VERSION: (u8, u8) = (3, 2);
+
+fn broad_fixed_pool_pass(
+    view: &ProcessView,
+    modules: &mut [ScannedModule],
+    budget: &mut CaptureWorkBudget,
+    counters: &mut DiscoveryCounters,
+) {
+    if !view.still_the_same() {
+        return;
+    }
+    let maps = match Engine::read_maps(view, budget) {
+        Ok(maps) => maps,
+        Err(_) => {
+            broad_note(
+                counters,
+                "broad fixed-family",
+                "the process maps could not be re-read; no fixed-family tables were added",
+            );
+            return;
+        }
+    };
+    let index = match index_maps_or_refuse(&maps, budget) {
+        Ok(index) => index,
+        Err(_) => {
+            broad_note(
+                counters,
+                "broad fixed-family",
+                "the process maps snapshot was refused; no fixed-family tables were added",
+            );
+            return;
+        }
+    };
+    for module in modules.iter_mut() {
+        broad_fixed_pool_module(view, module, &index, budget, counters);
+    }
+}
+
+fn broad_note(counters: &mut DiscoveryCounters, subject: &str, reason: &str) {
+    let skipped = Skipped {
+        subject: subject.to_string(),
+        reason: reason.to_string(),
+    };
+    eprintln!(
+        "{}",
+        format_discovery_skip(&skipped.subject, &skipped.reason)
+    );
+    attribution::note(&skipped);
+    counters.object_skips.push(skipped);
+}
+
+fn broad_fixed_pool_module(
+    view: &ProcessView,
+    module: &mut ScannedModule,
+    index: &MapIndex<'_>,
+    budget: &mut CaptureWorkBudget,
+    counters: &mut DiscoveryCounters,
+) {
+    let Some(abi) = module.decoder_abi else {
+        return;
+    };
+    let layout = target_layout(abi);
+    let relative = match module.path.strip_prefix('/') {
+        Some(relative) => relative,
+        None => return,
+    };
+    let rooted = PathBuf::from(format!("/proc/{}/root", view.pid())).join(relative);
+    let (file, key) = match open_view_object(view, &rooted, budget) {
+        Ok(opened) => opened,
+        Err(_) => return,
+    };
+    if key != module.key {
+        broad_note(
+            counters,
+            &module.path,
+            "broad fixed-family: the object file identity changed under the scan; \
+             no fixed-family tables were added",
+        );
+        return;
+    }
+    let snapshot = match read_elf_snapshot(&file, budget) {
+        Ok(snapshot) => snapshot,
+        Err(_) => return,
+    };
+    let pool_vaddr =
+        match snapshot.defined_symbol_virtual_address(BROAD_POOL_SYMBOL, BROAD_POOL_BYTES) {
+            Ok(Some(vaddr)) => vaddr,
+            // Not a recognized fixed-family build: silence is correct — selected
+            // admission already covered whatever the sweep decoded.
+            Ok(None) => return,
+            Err(reason) => {
+                broad_note(
+                    counters,
+                    &module.path,
+                    &format!("broad fixed-family: {reason}"),
+                );
+                return;
+            }
+        };
+    let bias = match index
+        .entries()
+        .iter()
+        .find(|entry| entry.device == module.key.device && entry.inode == module.key.inode)
+        .and_then(|entry| entry.start.checked_sub(entry.file_offset))
+    {
+        Some(bias) => bias,
+        None => {
+            broad_note(
+                counters,
+                &module.path,
+                "broad fixed-family: no mapping of the object remains; \
+                 no fixed-family tables were added",
+            );
+            return;
+        }
+    };
+    let Some(pool) = bias.checked_add(pool_vaddr) else {
+        broad_note(
+            counters,
+            &module.path,
+            "broad fixed-family: the pool address overflows; \
+             no fixed-family tables were added",
+        );
+        return;
+    };
+    let owned = index.containing(pool).is_some_and(|mapping| {
+        mapping.device == module.key.device && mapping.inode == module.key.inode
+    });
+    if !owned {
+        broad_note(
+            counters,
+            &module.path,
+            "broad fixed-family: the pool address is not mapped by the object; \
+             no fixed-family tables were added",
+        );
+        return;
+    }
+    // Table 0 establishes the stride: without it, stepping is blind.
+    let mut tallies = BroadTallies::default();
+    let mut refused = 0usize;
+    let mut first_reason = None;
+    let stride = match broad_pool_table(view, module, index, budget, pool, layout, &mut tallies) {
+        Ok(stride) => stride,
+        Err(reason) => {
+            broad_note(
+                counters,
+                &module.path,
+                &format!(
+                    "broad fixed-family: pool table 0 refused ({reason}); the pool layout \
+                 is unverified, so no fixed-family tables were added"
+                ),
+            );
+            return;
+        }
+    };
+    if stride != BROAD_POOL_TABLE_BYTES {
+        broad_note(
+            counters,
+            &module.path,
+            &format!(
+                "broad fixed-family: pool table 0 decoded {stride} bytes, not the \
+             {BROAD_POOL_TABLE_BYTES}-byte recipe; no fixed-family tables were added"
+            ),
+        );
+        // Table 0 may already have been added above; drop it — a pool whose
+        // stride is unverified contributes nothing.
+        module.tables.retain(|table| table.address != pool);
+        return;
+    }
+    let mut refused_ordinals = Vec::new();
+    for ordinal in 1..BROAD_POOL_TABLES {
+        let offset = (ordinal as u64).saturating_mul(stride as u64);
+        let Some(address) = pool.checked_add(offset) else {
+            refused += 1;
+            refused_ordinals.push(ordinal);
+            if first_reason.is_none() {
+                first_reason = Some("the pool address overflows".to_string());
+            }
+            continue;
+        };
+        if let Err(reason) =
+            broad_pool_table(view, module, index, budget, address, layout, &mut tallies)
+        {
+            refused += 1;
+            refused_ordinals.push(ordinal);
+            if first_reason.is_none() {
+                first_reason = Some(reason);
+            }
+        }
+    }
+    let first_reason = first_reason.unwrap_or_else(|| "unknown".to_string());
+    eprintln!(
+        "p11scope: discovery: broad fixed-family: {}: {} table(s) added, {} \
+         already covered, {refused} refused at {refused_ordinals:?} \
+         (first reason: {first_reason})",
+        module.path, tallies.added, tallies.covered,
+    );
+    if refused > 0 {
+        counters.notes.push(format!(
+            "broad fixed-family: {} refused {refused} pool table(s) at {refused_ordinals:?}; \
+             first reason: {first_reason}",
+            module.path,
+        ));
+    }
+}
+
+#[derive(Default)]
+struct BroadTallies {
+    covered: usize,
+    added: usize,
+}
+
+/// Validates one pool table through the shared bracketed reader and appends
+/// it unless the sweep already decoded the same bytes. Returns the decoded
+/// table size (the pool stride) on success.
+fn broad_pool_table(
+    view: &ProcessView,
+    module: &mut ScannedModule,
+    index: &MapIndex<'_>,
+    budget: &mut CaptureWorkBudget,
+    address: u64,
+    layout: LinuxLayout,
+    tallies: &mut BroadTallies,
+) -> std::result::Result<usize, String> {
+    let (_, mut table, bytes) = Engine::read_exact_table_bracketed(
+        view, address, layout, index, budget, true,
+    )
+    .map_err(|refusal| match refusal {
+        ExactReadRefusal::Budget => "a decode budget ceiling stopped the validation".to_string(),
+        ExactReadRefusal::Unstable => {
+            "the mappings moved or the generation changed during validation".to_string()
+        }
+        ExactReadRefusal::Unreadable => {
+            "the pool address was unreadable when validated".to_string()
+        }
+        ExactReadRefusal::Undecodable => {
+            "the pool bytes did not decode as a function table".to_string()
+        }
+    })?;
+    if table.version != BROAD_POOL_VERSION {
+        return Err(format!(
+            "pool table version is {:?}, not the {:?} recipe",
+            table.version, BROAD_POOL_VERSION
+        ));
+    }
+    table.file_offset = match index.resolve(address) {
+        Resolved::File {
+            file_offset, inode, ..
+        } if inode != 0 => Some(file_offset),
+        _ => None,
+    };
+    // Pool tables carry no publication evidence: unlinked, no live return,
+    // no manifest support — heuristic evidence with unauthorized names.
+    table.live_return = false;
+    table.manifest_supported = false;
+    if let Some(offset) = table.file_offset {
+        if let Some(known) = module
+            .tables
+            .iter()
+            .find(|known| known.file_offset == Some(offset) && known.version == table.version)
+        {
+            if known.entries == table.entries {
+                tallies.covered += 1;
+                return Ok(bytes.len());
+            }
+            // Same version-word location, different entries: memory is the
+            // live truth, so the pool instance admits alongside — loudly.
+            eprintln!(
+                "p11scope: discovery: broad fixed-family: {}: pool table at file offset \
+                 {offset:#x} diverges from the swept instance; admitting the live bytes",
+                module.path,
+            );
+        }
+    }
+    module.tables.push(table);
+    tallies.added += 1;
+    Ok(bytes.len())
 }
 
 /// A mapping that can carry a PKCS#11 provider: a mapped file whose path
@@ -3529,12 +3851,19 @@ fn sweep_process_maps(pids: &[u32], budget: &mut CaptureWorkBudget) -> Vec<(u32,
 
 /// Discovery for one capture: scan the scope, read and corroborate any manifests,
 /// merge into one plan, pin every object, and record how all of it was found.
+/// Task 1.6 experiment switch, read once per discovery (read-only, so
+/// parallel tests without the variable set always observe `false`).
+fn broad_admit_from_env() -> bool {
+    std::env::var_os("P11SCOPE_BROAD_ADMIT").is_some_and(|value| value == "1")
+}
+
 fn discover_plan(
     a: &CaptureArgs,
     scope: &Scope,
     mut named_view: Option<ProcessView>,
 ) -> Result<Engine> {
     let mut discovered = Engine::empty();
+    discovered.broad_admit = broad_admit_from_env();
     discovered.scope = scope.clone();
     discovered.hooks = a.hooks.clone();
     discovered.module_hints = a.modules.clone();
@@ -3622,12 +3951,14 @@ fn discover_plan(
             break;
         }
         let mut counters = DiscoveryCounters::default();
+        let broad_admit = discovered.broad_admit;
         match scan_and_pin(
             &view,
             &a.modules,
             &a.hooks,
             &mut discovered.budget,
             &mut counters,
+            broad_admit,
         ) {
             Ok((found, pins)) => {
                 discovered.scan_inputs.insert(
@@ -3711,6 +4042,7 @@ fn discover_plan(
     Ok(discovered)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_current_plan(
     modules: &[ReconciledModule],
     manifests: &[Manifest],
@@ -3719,10 +4051,11 @@ fn build_current_plan(
     corroborated: &BTreeSet<PinnedObjectId>,
     identity_mismatches: usize,
     manifest_fallbacks: usize,
+    broad_admit: bool,
 ) -> Result<plan::AttachPlan> {
     // Every plan reference is a capture-local pinned ID. Raw mapping keys remain
     // evidence only and cannot select an attach fd.
-    let mut plan = plan::build_from_sources(modules, manifests, pinned);
+    let mut plan = plan::build_from_sources_broad(modules, manifests, pinned, broad_admit);
     record_object_skips(&mut plan, &counters.object_skips);
     for object in corroborated {
         if let Some(summary) = plan
@@ -4876,6 +5209,7 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
         });
     }
     let manifest_fallbacks = counters.manifest_fallbacks.len();
+    let broad_admit = discovered.broad_admit;
     let mut plan = build_current_plan(
         &modules,
         &accepted,
@@ -4884,6 +5218,7 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
         &corroborated,
         identity_mismatches,
         manifest_fallbacks,
+        broad_admit,
     )
     .inspect_err(|_| counters.report_notes())?;
     discovered
@@ -5323,7 +5658,14 @@ fn lower_heap_export_record(
     let mut refusals = Vec::new();
     let mut validated = None;
     for layout in heap_table_layouts(hook_name, view.id(), modules) {
-        match Engine::read_exact_table_bracketed(view, record.table_ptr, layout, index_a, budget) {
+        match Engine::read_exact_table_bracketed(
+            view,
+            record.table_ptr,
+            layout,
+            index_a,
+            budget,
+            false,
+        ) {
             Ok(valid) => {
                 validated = Some((layout, valid));
                 break;
@@ -6397,6 +6739,7 @@ impl Engine {
             selection_tables: BTreeMap::new(),
             loader_contexts: BTreeMap::new(),
             pending_loader_scans: BTreeMap::new(),
+            broad_admit: false,
             #[cfg(test)]
             loader_memory_scan_attempts: 0,
         }
@@ -7371,12 +7714,13 @@ impl Engine {
         module_hints: &[PathBuf],
         hooks: &HookRegistry,
         budget: &mut CaptureWorkBudget,
+        broad_admit: bool,
     ) -> (
         Result<(Vec<ScannedModule>, PinnedObjects)>,
         DiscoveryCounters,
     ) {
         Self::scan_retained_view_with(|counters| {
-            scan_and_pin(view, module_hints, hooks, budget, counters)
+            scan_and_pin(view, module_hints, hooks, budget, counters, broad_admit)
         })
     }
 
@@ -7385,12 +7729,13 @@ impl Engine {
         module_hints: &[PathBuf],
         hooks: &HookRegistry,
         budget: &mut CaptureWorkBudget,
+        broad_admit: bool,
     ) -> (
         Result<(Vec<ScannedModule>, PinnedObjects)>,
         DiscoveryCounters,
     ) {
         Self::scan_retained_view_with(|counters| {
-            scan_and_pin_without_memory(view, module_hints, hooks, budget, counters)
+            scan_and_pin_without_memory(view, module_hints, hooks, budget, counters, broad_admit)
         })
     }
 
@@ -7634,9 +7979,10 @@ impl Engine {
                 self.counters.object_skips.push(skip);
             }
         }
-        let mut rebuilt = self
-            .plan
-            .rebuild_from_sources(&modules, &self.manifests, &pinned);
+        let broad_admit = self.broad_admit;
+        let mut rebuilt =
+            self.plan
+                .rebuild_from_sources_broad(&modules, &self.manifests, &pinned, broad_admit);
         self.capture_facts.bind_plan_module_ids(
             &mut rebuilt,
             &modules,
@@ -8483,9 +8829,13 @@ impl Engine {
                     file_offset: target.file_offset,
                 })
                 .collect();
-        let inventory_plan =
-            self.plan
-                .rebuild_from_sources(&cleaned_modules, &self.manifests, &cleaned_pins);
+        let broad_admit = self.broad_admit;
+        let inventory_plan = self.plan.rebuild_from_sources_broad(
+            &cleaned_modules,
+            &self.manifests,
+            &cleaned_pins,
+            broad_admit,
+        );
         let inventory_keys: BTreeSet<_> = inventory_plan
             .slots
             .iter()
@@ -8681,18 +9031,21 @@ impl Engine {
         if mode == LoaderScanMode::Memory {
             self.loader_memory_scan_attempts = self.loader_memory_scan_attempts.saturating_add(1);
         }
+        let broad_admit = self.broad_admit;
         let (scan_result, scan_counters) = match mode {
             LoaderScanMode::Memory => Self::scan_retained_view(
                 &self.views[position],
                 &self.module_hints,
                 &self.hooks,
                 &mut self.budget,
+                broad_admit,
             ),
             LoaderScanMode::MetadataOnly => Self::scan_retained_view_without_memory(
                 &self.views[position],
                 &self.module_hints,
                 &self.hooks,
                 &mut self.budget,
+                broad_admit,
             ),
         };
         let mut skipped = self.absorb_scan_counters(scan_counters);
@@ -9737,7 +10090,7 @@ impl Engine {
     ) -> std::result::Result<(MapEntry, ScannedTable), ()> {
         let maps_a = Self::read_maps(view, budget).map_err(|_| ())?;
         let index_a = index_maps_or_refuse(&maps_a, budget).map_err(|_| ())?;
-        Self::read_exact_table_bracketed(view, address, layout, &index_a, budget)
+        Self::read_exact_table_bracketed(view, address, layout, &index_a, budget, false)
             .map(|(mapping, table, _)| (mapping, table))
             .map_err(|_| ())
     }
@@ -9748,12 +10101,20 @@ impl Engine {
     /// decode against index A, then the maps-B stability bracket plus the
     /// generation check. Returns the containing mapping, the decoded table,
     /// and the raw table bytes (publication cross-checks need them).
+    ///
+    /// `allow_span` (broad fixed-family only) permits the table extent to
+    /// cover a run of contiguous readable mappings instead of one: a fixed
+    /// pool legitimately crosses the file-tail/anonymous-BSS split. The run
+    /// is contiguity-checked mapping by mapping, fully decoded (104
+    /// executable entries stay the content anchor), and every touched
+    /// mapping is stability-bracketed — same contract, wider extent.
     fn read_exact_table_bracketed(
         view: &ProcessView,
         address: u64,
         layout: LinuxLayout,
         index_a: &MapIndex,
         budget: &mut CaptureWorkBudget,
+        allow_span: bool,
     ) -> std::result::Result<(MapEntry, ScannedTable, Vec<u8>), ExactReadRefusal> {
         let mapping_a = index_a
             .containing(address)
@@ -9800,8 +10161,28 @@ impl Engine {
         let table_end = address
             .checked_add(table_bytes as u64)
             .ok_or(ExactReadRefusal::Undecodable)?;
+        // Mappings the table extent touches: one, or a contiguous readable
+        // run when the caller allows a span. Every touched mapping joins
+        // the maps-B stability check below.
+        let mut span = vec![mapping_a.clone()];
         if table_end > mapping_a.end {
-            return Err(ExactReadRefusal::Undecodable);
+            if !allow_span {
+                return Err(ExactReadRefusal::Undecodable);
+            }
+            let mut cursor = mapping_a.end;
+            while cursor < table_end {
+                let Some(next) = index_a.containing(cursor).cloned() else {
+                    return Err(ExactReadRefusal::Undecodable);
+                };
+                if next.start != cursor || next.permissions[0] != b'r' {
+                    return Err(ExactReadRefusal::Undecodable);
+                }
+                cursor = next.end;
+                span.push(next);
+                if span.len() > index_a.entries().len() {
+                    return Err(ExactReadRefusal::Undecodable);
+                }
+            }
         }
         bytes.resize(table_bytes, 0);
         if table_bytes > width {
@@ -9839,6 +10220,9 @@ impl Engine {
             .iter()
             .zip(&addresses)
             .all(|(mapping, address)| index_b.containing(*address) == Some(mapping))
+            || !span
+                .iter()
+                .all(|mapping| index_b.containing(mapping.start) == Some(mapping))
             || !view.still_the_same()
         {
             return Err(ExactReadRefusal::Unstable);
@@ -12064,11 +12448,13 @@ impl Engine {
                 skipped.push(skip);
                 continue;
             };
+            let broad_admit = self.broad_admit;
             let (scan_result, counters) = Self::scan_retained_view(
                 &self.views[position],
                 &self.module_hints,
                 &self.hooks,
                 &mut self.budget,
+                broad_admit,
             );
             skipped.extend(self.absorb_scan_counters(counters));
             match scan_result {
@@ -12348,8 +12734,14 @@ impl Engine {
                     continue;
                 }
             };
-            let (scan_result, counters) =
-                Self::scan_retained_view(&view, &self.module_hints, &self.hooks, &mut self.budget);
+            let broad_admit = self.broad_admit;
+            let (scan_result, counters) = Self::scan_retained_view(
+                &view,
+                &self.module_hints,
+                &self.hooks,
+                &mut self.budget,
+                broad_admit,
+            );
             skipped.extend(self.absorb_scan_counters(counters));
             match scan_result {
                 Ok((modules, pins)) => {

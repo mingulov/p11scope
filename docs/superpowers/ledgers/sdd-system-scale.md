@@ -25,3 +25,16 @@ Build env: TMPDIR=/var/tmp/p11scope-ws-tmp cargo +1.88 --locked --offline.
 - Branch: task-1.2/ordered-admission (from bb2314a).
 - Brief: wire order_tables_by_evidence into engine admission; per-object K cap;
   first acceptance step clears the 3 dead_code clippy errors above.
+- SPEC CORRECTION sent mid-flight (deep review 2026-09-19, claims verified:
+  upstream gen-fixed-closures.py defaults to 64, replica cross-check 2 shared
+  @ ordinals 65/66, 64x102+2=6530, plan.rs:1437/:1270-1283/:758-780,
+  events.rs:64): the 64 tables are deliberate p11_virtual_fixed templates, not
+  proven false positives. K=4 now caps UNRESOLVED HEURISTIC tables only;
+  corroborated tables bypass K under global budget + atomic refusal; 64-table
+  test reframed as resource-bound; added five-published-table, atomic-refusal,
+  and two-views-one-cap tests. Followup message queued; acknowledgment pending
+  at commit time — confirm at Task 1.2 review.
+- Plan v2 committed alongside: F-Scale-1 correction, three-decision admission
+  contract (confidence/admission/authorization), 1.2+1.3 one release unit,
+  Task 1.4 oracle+baseline, Phase 2 gated on 1.4+3.1, loader comparison
+  (Aya PR #1417 = lead to verify), group-rebuild decision, acceptance matrix.

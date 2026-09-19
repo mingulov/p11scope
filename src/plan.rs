@@ -4,8 +4,14 @@
 //! unique {object, file_offset} across all of them. A target two modules both hand
 //! out is attached once (attaching twice would double-count every call through it),
 //! and because its counts then belong to neither module its semantics degrade to
-//! COUNT_ONLY (spec §4.7). Capacity is refused whole modules at a time, never
-//! truncated: a partially attached module silently under-reports a provider.
+//! COUNT_ONLY (spec §4.7). Manifest modules are refused whole when they exceed
+//! the remaining budget, never truncated: a partially attached module silently
+//! under-reports a provider. Scan tables admit in publication-evidence order:
+//! corroborated/published tables bypass the per-object cap (global budget
+//! only, atomic refusal), unresolved heuristic tables admit until the
+//! per-object cap, and the heuristic spill is reported as
+//! `uncorroborated_candidates` — whole-module refusal stays only for the case
+//! where even the strongest table exceeds the remaining budget.
 //!
 //! Both discovery sources — the memory scan and a manifest — lower into `Discovered`
 //! and go through the same `merge`, so there is exactly one implementation of the
@@ -13,6 +19,10 @@
 
 use crate::discovery::identity::{PinnedObjectId, PinnedObjects, ReconciledModule};
 pub use crate::discovery::scan::Skipped;
+use crate::discovery::scan::{
+    ScannedInterface, ScannedTable, TableEvidenceScore, order_tables_by_evidence,
+    table_evidence_score,
+};
 use p11scope_ebpf_common::{MAX_SLOTS, SlotSemantics};
 use p11scope_manifest::manifest::{
     Acquisition, InterfaceClassification, Manifest, ObjectRecord, Resolution, SurfaceSource,
@@ -173,10 +183,26 @@ fn acquisition_label(a: &Acquisition) -> String {
     }
 }
 
+/// Unresolved heuristic (scan-decoded, uncorroborated) tables admitted per
+/// object, strongest publication evidence first. The scan admits any plausible
+/// version word, so one object can decode dozens of lookalike tables (p11-kit
+/// decodes 64 closure templates); the cap bounds one object's unresolved
+/// slots to `MAX_TABLES_PER_OBJECT * 104 = 416`, inside the 512 slot ceiling,
+/// while the spill is reported as `uncorroborated_candidates` instead of
+/// refusing the module. Corroborated/published scan tables (interface-linked,
+/// manifest/live-return supported) bypass this cap, subject only to the global
+/// budget with atomic whole-module refusal. Manifest tables are
+/// operator-authoritative and never capped.
+pub(crate) const MAX_TABLES_PER_OBJECT: usize = 4;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct AttachPlan {
     pub slots: Vec<Slot>,
     pub modules: Vec<ModuleSummary>,
+    /// Heuristic tables decoded but not admitted: past the per-object cap or
+    /// past the remaining global budget. Evidence, never slots — the module
+    /// they were decoded from is still admitted on its strongest tables.
+    pub uncorroborated_candidates: u64,
     pub skipped: Vec<Skipped>,
     /// Modules refused whole because the slot ceiling was reached.
     pub modules_skipped: Vec<Skipped>,
@@ -267,6 +293,7 @@ impl AttachPlan {
         Self {
             slots,
             modules: vec![],
+            uncorroborated_candidates: 0,
             skipped: vec![],
             modules_skipped: vec![],
             refused_module_objects: vec![],
@@ -1028,6 +1055,43 @@ struct Target<'a> {
     file_offset: u64,
     fork_safe: bool,
     semantic_authorized: bool,
+    /// Index into the scan piece's `tables` this target was decoded from.
+    /// `None` for manifest targets, which are authoritative and never capped.
+    table: Option<usize>,
+}
+
+/// Borrowed scan decode behind one scan piece, for evidence-ordered table
+/// admission in `merge`. Manifest pieces carry `None`: their tables are
+/// operator-authoritative, admitted whole or refused whole as before.
+struct ScanEvidence<'a> {
+    tables: &'a [ScannedTable],
+    interfaces: &'a [ScannedInterface],
+}
+
+/// Identity of one heuristic table for cross-view dedup: one object seen
+/// from several processes decodes the same tables repeatedly, and the
+/// per-object cap counts distinct tables, not decode instances.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum TableKey {
+    /// Version-word file offset plus decoded version: the same table however
+    /// many views decoded it.
+    Located { file_offset: u64, version: (u8, u8) },
+    /// No file offset, so sameness is unprovable (runtime addresses are
+    /// generation-local): each instance admits alone.
+    Unlocated { piece: usize, table: usize },
+}
+
+fn table_key(piece: usize, index: usize, table: &ScannedTable) -> TableKey {
+    match table.file_offset {
+        Some(file_offset) => TableKey::Located {
+            file_offset,
+            version: table.version,
+        },
+        None => TableKey::Unlocated {
+            piece,
+            table: index,
+        },
+    }
 }
 
 /// One module lowered for `merge`.
@@ -1043,6 +1107,7 @@ struct Discovered<'a> {
     entries_seen: usize,
     targets: Vec<Target<'a>>,
     skipped: Vec<Skipped>,
+    scan_evidence: Option<ScanEvidence<'a>>,
 }
 
 /// A slot under construction: the names and modules claiming one target.
@@ -1108,15 +1173,19 @@ fn merge(
     let mut skipped = Vec::new();
     let mut surfaces = Vec::new();
     let mut entries_seen = 0usize;
+    let mut uncorroborated_candidates = 0u64;
     let mut allocated_slots = allocated_slots;
-    for group in groups {
+    'groups: for group in groups {
         let key = group[0].key;
         let object = group[0].object;
         let path = group[0].path;
         let source = group[0].source;
         entries_seen += decoded_occurrence_count(&group);
-        let wanted: BTreeSet<AttachKey> = group
+        // Manifest targets are operator-authoritative: admitted whole, and the
+        // module is refused whole when even they exceed the remaining budget.
+        let manifest_wanted: BTreeSet<AttachKey> = group
             .iter()
+            .filter(|module| module.scan_evidence.is_none())
             .flat_map(|module| &module.targets)
             .map(|target| AttachKey {
                 object: target.object,
@@ -1127,13 +1196,13 @@ fn merge(
                     && !existing_slots.contains_key(target)
             })
             .collect();
-        if allocated_slots + wanted.len() > capacity {
+        if allocated_slots + manifest_wanted.len() > capacity {
             let skipped = Skipped {
                 subject: path.to_string(),
                 reason: format!(
                     "module needs {} more of the {MAX_SLOTS} attach slots; {} are in use \
                      — refusing to attach a prefix",
-                    wanted.len(),
+                    manifest_wanted.len(),
                     allocated_slots
                 ),
             };
@@ -1141,7 +1210,182 @@ fn merge(
             modules_skipped.push(skipped);
             continue;
         }
-        allocated_slots += wanted.len();
+        // Scan tables admit in publication-evidence order. Corroborated tables
+        // (interface-linked, manifest/live-return supported) bypass the
+        // per-object cap, subject only to the global budget with atomic
+        // whole-module refusal; unresolved heuristic tables admit until the
+        // per-object cap, and their spill is counted, never slotted. Linkage
+        // is preferred, never gated: unlinked tables still admit in turn, so
+        // scan-only capture of never-called legacy providers keeps working.
+        // One object seen from several views decodes the same tables
+        // repeatedly: distinct tables admit once, scored by the strongest
+        // instance, so linkage observed from any view counts.
+        let mut distinct: BTreeMap<TableKey, (TableEvidenceScore, usize)> = BTreeMap::new();
+        let mut sequence = 0usize;
+        for (piece, module) in group.iter().enumerate() {
+            let Some(evidence) = &module.scan_evidence else {
+                continue;
+            };
+            for index in order_tables_by_evidence(evidence.tables, evidence.interfaces, &[], &[]) {
+                let score =
+                    table_evidence_score(index, evidence.tables, evidence.interfaces, &[], &[]);
+                let key = table_key(piece, index, &evidence.tables[index]);
+                distinct
+                    .entry(key)
+                    .and_modify(|slot| slot.0 = slot.0.max(score))
+                    .or_insert_with(|| {
+                        let slot = (score, sequence);
+                        sequence += 1;
+                        slot
+                    });
+            }
+        }
+        let mut ordered: Vec<(TableKey, TableEvidenceScore, usize)> = distinct
+            .into_iter()
+            .map(|(key, (score, sequence))| (key, score, sequence))
+            .collect();
+        // Strongest evidence first; ties keep first-seen order, so scoring
+        // never reorders what it cannot distinguish.
+        ordered.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.2.cmp(&right.2)));
+        // Every scan target of this group, by distinct table, for marginal
+        // budget accounting across views of one object.
+        let mut keys_of: BTreeMap<TableKey, BTreeSet<AttachKey>> = BTreeMap::new();
+        for (piece, module) in group.iter().enumerate() {
+            let Some(evidence) = &module.scan_evidence else {
+                continue;
+            };
+            for target in &module.targets {
+                let Some(index) = target.table else { continue };
+                let Some(table) = evidence.tables.get(index) else {
+                    continue;
+                };
+                keys_of
+                    .entry(table_key(piece, index, table))
+                    .or_default()
+                    .insert(AttachKey {
+                        object: target.object,
+                        file_offset: target.file_offset,
+                    });
+            }
+        }
+        let is_fresh = |key: &AttachKey| {
+            !positions.contains_key(&(key.object, key.file_offset))
+                && !existing_slots.contains_key(key)
+        };
+        let is_published =
+            |score: &TableEvidenceScore| score.linked || score.live_return || score.manifest;
+        // All-or-nothing refusal survives only here: when even the strongest
+        // table exceeds the remaining global budget, the module — scan and
+        // manifest parts alike — is refused whole. A manifest subset must not
+        // reattach an oversized scan as a prefix.
+        if let Some((top, _, _)) = ordered.first() {
+            let top_marginal = keys_of
+                .get(top)
+                .map_or(0, |keys| keys.iter().filter(|key| is_fresh(key)).count());
+            if allocated_slots + top_marginal > capacity {
+                let skipped = Skipped {
+                    subject: path.to_string(),
+                    reason: format!(
+                        "module needs {top_marginal} more of the {MAX_SLOTS} attach slots; \
+                         {allocated_slots} are in use — refusing to attach a prefix"
+                    ),
+                };
+                refused_module_objects.push((object, skipped.clone()));
+                modules_skipped.push(skipped);
+                continue 'groups;
+            }
+        }
+        // Published tables bypass the per-object cap but stay atomic: their
+        // union with the manifest subset must fit the remaining global budget,
+        // else the whole module is refused. A published spill would be neither
+        // an honest refusal nor an honest uncorroborated count, so it never
+        // spills — it refuses.
+        let mut fresh: BTreeSet<AttachKey> = manifest_wanted;
+        let mut admitted: BTreeSet<TableKey> = BTreeSet::new();
+        let published: Vec<TableKey> = ordered
+            .iter()
+            .filter(|(_, score, _)| is_published(score))
+            .map(|(key, _, _)| *key)
+            .collect();
+        let mut published_union = fresh.clone();
+        for key in &published {
+            if let Some(keys) = keys_of.get(key) {
+                published_union.extend(keys.iter().filter(|key| is_fresh(key)).copied());
+            }
+        }
+        if allocated_slots + published_union.len() > capacity {
+            let skipped = Skipped {
+                subject: path.to_string(),
+                reason: format!(
+                    "module needs {} more of the {MAX_SLOTS} attach slots; {} are in use \
+                     — refusing to attach a prefix",
+                    published_union.len(),
+                    allocated_slots
+                ),
+            };
+            refused_module_objects.push((object, skipped.clone()));
+            modules_skipped.push(skipped);
+            continue 'groups;
+        }
+        fresh = published_union;
+        // Empty published tables cost nothing: admitted, never spilled, never
+        // counted — they are corroborated, not uncorroborated.
+        admitted.extend(published.iter().copied());
+        // Unresolved heuristic tables admit strongest-first until the
+        // per-object cap or the remaining global budget; the spill is
+        // uncorroborated evidence, never slots.
+        let mut heuristic_admitted = 0usize;
+        let mut spent = false;
+        for (key, score, _) in &ordered {
+            if is_published(score) {
+                continue;
+            }
+            // A heuristic table with no attachable target costs nothing either
+            // way: counted as spill, never consuming the cap.
+            if keys_of.get(key).is_none_or(|keys| keys.is_empty()) {
+                uncorroborated_candidates += 1;
+                continue;
+            }
+            if spent || heuristic_admitted >= MAX_TABLES_PER_OBJECT {
+                uncorroborated_candidates += 1;
+                continue;
+            }
+            let marginal = keys_of.get(key).map_or(0, |keys| {
+                keys.iter()
+                    .filter(|key| is_fresh(key) && !fresh.contains(key))
+                    .count()
+            });
+            if allocated_slots + fresh.len() + marginal > capacity {
+                // The budget is spent: this table and every weaker one spill.
+                // Admission stays a strongest-evidence prefix — a strong
+                // table is never skipped to admit a weaker one.
+                uncorroborated_candidates += 1;
+                spent = true;
+                continue;
+            }
+            if let Some(keys) = keys_of.get(key) {
+                fresh.extend(keys.iter().filter(|key| is_fresh(key)).copied());
+            }
+            admitted.insert(*key);
+            heuristic_admitted += 1;
+        }
+        allocated_slots += fresh.len();
+        // Per scan piece, per table index: admitted above. Manifest pieces
+        // carry `None` and admit every target.
+        let admitted_instance: Vec<Option<Vec<bool>>> = group
+            .iter()
+            .enumerate()
+            .map(|(piece, module)| {
+                module.scan_evidence.as_ref().map(|evidence| {
+                    evidence
+                        .tables
+                        .iter()
+                        .enumerate()
+                        .map(|(index, table)| admitted.contains(&table_key(piece, index, table)))
+                        .collect()
+                })
+            })
+            .collect();
 
         // One object is one module however many sources described it. A manifest
         // corroborating a scanned module must not read as two rivals claiming the same
@@ -1164,12 +1408,23 @@ fn merge(
         let mut seen_surfaces = Vec::new();
         let mut group_surfaces = Vec::new();
         let mut group_skips = Vec::new();
-        for module in group {
+        for (piece, module) in group.into_iter().enumerate() {
             debug_assert_eq!(
                 module.entries_seen,
                 module.targets.len() + module.skipped.len()
             );
             for target in &module.targets {
+                if let Some(admit) = admitted_instance.get(piece).and_then(|slot| slot.as_ref()) {
+                    // Spilled heuristic tables are evidence, never slots. A
+                    // scan target naming no admitted table fails closed.
+                    let admitted_table = target
+                        .table
+                        .and_then(|index| admit.get(index).copied())
+                        .unwrap_or(false);
+                    if !admitted_table {
+                        continue;
+                    }
+                }
                 let position = *positions
                     .entry((target.object, target.file_offset))
                     .or_insert_with(|| {
@@ -1291,6 +1546,7 @@ fn merge(
         .collect();
     let mut plan = AttachPlan::from_slots(slots);
     plan.modules = modules;
+    plan.uncorroborated_candidates = uncorroborated_candidates;
     plan.skipped = skipped;
     plan.modules_skipped = modules_skipped;
     plan.refused_module_objects = refused_module_objects;
@@ -1435,6 +1691,7 @@ fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
                 file_offset: entry.file_offset,
                 fork_safe,
                 semantic_authorized: false,
+                table: Some(index),
             },
         ));
         skipped.extend(table.null_entries.iter().map(|name| Skipped {
@@ -1454,6 +1711,10 @@ fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
         entries_seen,
         targets,
         skipped,
+        scan_evidence: Some(ScanEvidence {
+            tables: &scanned.tables,
+            interfaces: &scanned.interfaces,
+        }),
     }
 }
 
@@ -1596,6 +1857,7 @@ fn lower_manifest(
                     }
                     targets.push(Target {
                         name: &f.name,
+                        table: None,
                         object,
                         object_path: &record.path,
                         file_offset: *file_offset,
@@ -1644,6 +1906,7 @@ fn lower_manifest(
             entries_seen,
             targets,
             skipped,
+            scan_evidence: None,
         }),
         Vec::new(),
     )
@@ -2778,6 +3041,7 @@ mod tests {
                 file_offset,
                 fork_safe: false,
                 semantic_authorized: true,
+                table: None,
             })
             .collect();
         Discovered {
@@ -2794,6 +3058,7 @@ mod tests {
             entries_seen: targets.len(),
             targets,
             skipped: vec![],
+            scan_evidence: None,
         }
     }
 

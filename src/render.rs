@@ -268,6 +268,12 @@ pub struct DiscoveryEvidence {
     /// could not run, or the scan decoded no table in them.
     #[serde(rename = "discovery_uncorroborated")]
     pub uncorroborated: u64,
+    /// Heuristic tables decoded but not admitted: past the per-object
+    /// evidence-ordered cap or past the remaining global budget. Informational
+    /// — spilling lookalikes is correct admission, not a coverage gap — so it
+    /// does not affect `completeness` on its own.
+    #[serde(rename = "discovery_uncorroborated_candidates")]
+    pub uncorroborated_candidates: u64,
     /// Attach slots two modules both publish: counted, never attributed.
     pub module_ambiguous: u64,
     /// Modules refused whole at the slot ceiling — never attached in part.
@@ -288,6 +294,7 @@ impl Default for DiscoveryEvidence {
             modules: Vec::new(),
             conflicts: 0,
             uncorroborated: 0,
+            uncorroborated_candidates: 0,
             module_ambiguous: 0,
             modules_skipped: Vec::new(),
             manifest_object_fallbacks: Vec::new(),

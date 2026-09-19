@@ -1834,6 +1834,7 @@ impl CaptureFacts {
                 .saturating_sub(derived_corroborated)
                 .saturating_add(history.uncorroborated_tombstones),
             module_ambiguous: plan.module_ambiguous as u64,
+            uncorroborated_candidates: plan.uncorroborated_candidates,
             modules_skipped: history.refusals.values().map(skipped_out).collect(),
             manifest_object_fallbacks: history.fallbacks.values().cloned().collect(),
             scan_unavailable: history.scan_unavailable.clone(),
@@ -3896,6 +3897,7 @@ fn discovery_evidence(
         conflicts: counters.conflicts,
         uncorroborated: counters.uncorroborated,
         module_ambiguous: plan.module_ambiguous as u64,
+        uncorroborated_candidates: plan.uncorroborated_candidates,
         modules_skipped: plan.modules_skipped.iter().map(skipped_out).collect(),
         manifest_object_fallbacks,
         scan_unavailable: counters.scan_unavailable.map(str::to_string),

@@ -95,6 +95,12 @@ dependency.
   sudo p11scope profile --pid 12345 --duration 60 -o diagnostic-profile.json
   ```
 
+  Whole-machine capture needs no PID or cgroup path:
+
+  ```bash
+  sudo p11scope profile --system --duration 60 -o system-profile.json
+  ```
+
   For semantic capture, follow the separate
   [attested workflow](docs/usage.md#attested-semantic-capture). The optional
   `p11scope-discover` helper executes provider code in its own unprivileged

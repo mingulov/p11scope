@@ -653,6 +653,14 @@ fn engine_over_pids(pids: &[u32]) -> Engine {
 /// Task 1.6: same scan with broad admission enabled — the pool pass runs at
 /// scan time and the merge lifts the heuristic cap with fit-or-refuse-whole.
 fn engine_over_pids_broad(pids: &[u32], broad_admit: bool) -> Engine {
+    let mut engine = scan_engine_over_pids(pids, broad_admit);
+    rebuild_discovered(&mut engine).expect("rebuild after scan");
+    engine
+}
+
+/// Scan without the rebuild, so the A2 probe can observe a broad total
+/// refusal as evidence instead of an expect panic.
+fn scan_engine_over_pids(pids: &[u32], broad_admit: bool) -> Engine {
     let hooks = HookRegistry::builtin();
     let mut engine = Engine::empty();
     engine.hooks = hooks.clone();
@@ -676,7 +684,6 @@ fn engine_over_pids_broad(pids: &[u32], broad_admit: bool) -> Engine {
         );
         engine.views.push(view);
     }
-    rebuild_discovered(&mut engine).expect("rebuild after scan");
     engine
 }
 
@@ -3064,4 +3071,91 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
     assert_eq!(mixed.uncorroborated_candidates, 0, "broad never spills");
     assert_eq!(mixed.modules_skipped.len(), 1);
     assert_eq!(mixed.modules_skipped[0].subject, "/pool.so");
+}
+
+/// Case 13 (Task 1.6, manual A2 probe): real-p11-kit admission
+/// arithmetic. Holds the host libp11-kit mapped-but-dormant in a
+/// descendant (python3 + ctypes, no calls) and prints selected-vs-broad
+/// admission for the report. Run filtered, alone in the process:
+/// `cargo test -p p11scope --lib broad_p11kit -- --ignored --nocapture`.
+/// Asserts only host-robust invariants (broad never spills; a total
+/// refusal carries the whole-module shape); the exact printed numbers
+/// are recorded by hand into the Task 1.6 report.
+#[test]
+#[ignore = "manual: needs host libp11-kit + python3; run filtered with --ignored --nocapture"]
+fn broad_p11kit_admission_arithmetic() {
+    let mut child = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(
+            "import ctypes, time; \
+             ctypes.CDLL('libp11-kit.so.0'); \
+             print('READY', flush=True); \
+             time.sleep(180)",
+        )
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("python3 holds libp11-kit");
+    let mut ready = String::new();
+    std::io::BufRead::read_line(
+        &mut std::io::BufReader::new(child.stdout.as_mut().expect("child stdout")),
+        &mut ready,
+    )
+    .expect("READY line");
+    assert_eq!(ready.trim(), "READY");
+    let pid = child.id();
+
+    let selected = engine_over_pids(std::slice::from_ref(&pid));
+    let selected_tables: usize = selected
+        .modules
+        .iter()
+        .map(|module| module.scanned.tables.len())
+        .sum();
+    println!(
+        "A2 selected: {} module(s) {} table(s) {} slot(s) spill={} refused={}",
+        selected.modules.len(),
+        selected_tables,
+        selected.plan().slots.len(),
+        selected.plan().uncorroborated_candidates,
+        selected.plan().modules_skipped.len(),
+    );
+    assert!(
+        !selected.plan().slots.is_empty(),
+        "selected admits something on a real provider"
+    );
+
+    let mut broad = scan_engine_over_pids(std::slice::from_ref(&pid), true);
+    match rebuild_discovered(&mut broad) {
+        Ok(()) => {
+            let broad_tables: usize = broad
+                .modules
+                .iter()
+                .map(|module| module.scanned.tables.len())
+                .sum();
+            println!(
+                "A2 broad: {} module(s) {} table(s) {} slot(s) spill={} refused={}",
+                broad.modules.len(),
+                broad_tables,
+                broad.plan().slots.len(),
+                broad.plan().uncorroborated_candidates,
+                broad.plan().modules_skipped.len(),
+            );
+            assert_eq!(
+                broad.plan().uncorroborated_candidates,
+                0,
+                "broad never spills"
+            );
+        }
+        Err(error) => {
+            let text = format!("{error:?}");
+            println!("A2 broad: total refusal: {text}");
+            assert!(
+                text.contains("refusing to attach a prefix"),
+                "a broad total refusal carries the whole-module shape: {text}"
+            );
+        }
+    }
+
+    child.kill().expect("reap the holder");
+    child.wait().expect("reap the holder");
 }

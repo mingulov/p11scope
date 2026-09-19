@@ -72,6 +72,8 @@ Build env: TMPDIR=/var/tmp/p11scope-ws-tmp cargo +1.88 --locked --offline.
   1.4-fixture (new files only), 3.3-preflight (run.rs+tests only), 2.1-loader
   (survey+/tmp spike+note, vendor unwired — Cargo wiring deferred to 2.2).
   Running alongside 1.2 (admission files). 4/7 slots used.
+- Wave +1 (2026-09-19): measurement-harness worker (scripts/+docs/notes new
+  files only) for 1.4/1.6/3.1 baselines. 5/7 slots used.
 - Ruling: goal pre-commits to multi-uprobe; plan's Task 2.1 comparison is
   reframed as WHICH loader (Aya backport vs raw helper), not WHETHER multi.
   Task 1.6 still decides SCOPE (broad vs selective) by measurement. Cost if

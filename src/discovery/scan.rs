@@ -262,6 +262,65 @@ pub(crate) struct TableIdentity {
     pub(crate) usable: usize,
 }
 
+/// Cardinality identity for one runtime (heap/anonymous) table decode: the
+/// capture-local view plus the address plus a content hash over the
+/// normalized entries. `TableIdentity` deliberately excludes runtime
+/// addresses as generation-local; this key includes them *because* it is
+/// scoped to one process generation, and the content hash is what keeps
+/// address reuse honest — a freed slot reallocated with different entries
+/// is a different table and charges again. Like `TableIdentity` this is
+/// never a decode cache: repeats still decode, still spend I/O and work,
+/// and still re-resolve ownership; only the candidate+entry cardinality
+/// charge is deduplicated. The set grows only on charged admissions, so
+/// it stays within the same 512-candidate ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct RuntimeTableIdentity {
+    pub(crate) view: ProcessViewId,
+    pub(crate) address: u64,
+    pub(crate) version_word: u64,
+    pub(crate) usable: usize,
+    pub(crate) content: u64,
+}
+
+/// FNV-1a over the normalized table content: version word, usable slot
+/// count, then per ordinal a null marker or the entry's (device, inode,
+/// file offset). Paths stay out — identity is by file, not spelling —
+/// and addresses stay out — identity is generation-scoped already.
+fn runtime_content_hash(
+    version_word: u64,
+    usable: usize,
+    slots: &[Option<(Device, u64, u64)>],
+) -> u64 {
+    const BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x100_0000_01b3;
+    let mut hash = BASIS;
+    for word in [version_word, usable as u64] {
+        for byte in word.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+    }
+    for slot in slots {
+        match slot {
+            None => {
+                hash ^= 0x00;
+                hash = hash.wrapping_mul(PRIME);
+            }
+            Some((device, inode, file_offset)) => {
+                hash ^= 0x01;
+                hash = hash.wrapping_mul(PRIME);
+                for word in [device.major, device.minor, *inode, *file_offset] {
+                    for byte in word.to_le_bytes() {
+                        hash ^= u64::from(byte);
+                        hash = hash.wrapping_mul(PRIME);
+                    }
+                }
+            }
+        }
+    }
+    hash
+}
+
 /// The cached inspection of one file: exactly what `inspect_file_with_reader`
 /// returns. Only the digest-sized result is kept, never the file bytes.
 pub(crate) type InspectedFile = InspectedObject;
@@ -295,6 +354,7 @@ pub struct CaptureWorkBudget {
     table_candidates: usize,
     decoded_table_entries: usize,
     admitted_tables: BTreeSet<TableIdentity>,
+    admitted_runtime_tables: BTreeSet<RuntimeTableIdentity>,
     inspected_files: BTreeMap<InspectedFileKey, InspectedFile>,
     elf_export_facts: BTreeMap<InspectedFileKey, ElfExportFacts>,
     interface_records: usize,
@@ -320,6 +380,7 @@ impl CaptureWorkBudget {
             table_candidates: 0,
             decoded_table_entries: 0,
             admitted_tables: BTreeSet::new(),
+            admitted_runtime_tables: BTreeSet::new(),
             inspected_files: BTreeMap::new(),
             elf_export_facts: BTreeMap::new(),
             interface_records: 0,
@@ -485,6 +546,14 @@ impl CaptureWorkBudget {
         self.admitted_tables.insert(id);
     }
 
+    pub(crate) fn runtime_table_already_admitted(&self, id: &RuntimeTableIdentity) -> bool {
+        self.admitted_runtime_tables.contains(id)
+    }
+
+    pub(crate) fn note_runtime_table_admitted(&mut self, id: RuntimeTableIdentity) {
+        self.admitted_runtime_tables.insert(id);
+    }
+
     pub(crate) fn inspected_file(&self, key: &InspectedFileKey) -> Option<InspectedFile> {
         self.inspected_files.get(key).cloned()
     }
@@ -504,6 +573,21 @@ impl CaptureWorkBudget {
     #[cfg(test)]
     pub(crate) fn table_candidates_count(&self) -> usize {
         self.table_candidates
+    }
+
+    #[cfg(test)]
+    pub(crate) fn decoded_table_entries_count(&self) -> usize {
+        self.decoded_table_entries
+    }
+
+    #[cfg(test)]
+    pub(crate) fn interface_records_count(&self) -> usize {
+        self.interface_records
+    }
+
+    #[cfg(test)]
+    pub(crate) fn work_units_count(&self) -> u64 {
+        self.work_units
     }
 
     fn tables_exhausted(&self) -> bool {
@@ -854,6 +938,9 @@ pub(crate) fn exact_table_addresses(snapshot: &[u8], layout: LinuxLayout) -> Opt
 /// `base_address` in the target). Returns the table only when every published slot
 /// is either NULL or points into a file-backed executable mapping — the criterion
 /// that makes a run of pointers a function table rather than data that looks like one.
+/// `runtime_view` scopes the cardinality identity for tables without a stable
+/// file owner (heap/anonymous exact reads): `None` keeps the memory sweep's
+/// file-identity-only charging bit for bit.
 fn decode_candidate(
     layout: LinuxLayout,
     snapshot: &[u8],
@@ -861,6 +948,7 @@ fn decode_candidate(
     base_address: u64,
     maps: &MapIndex<'_>,
     budget: &mut CaptureWorkBudget,
+    runtime_view: Option<ProcessViewId>,
 ) -> Result<Option<(ScannedTable, usize)>, ()> {
     let width = layout.word_bytes();
     let Some(raw_word) = offset
@@ -897,8 +985,12 @@ fn decode_candidate(
     };
 
     // Validate the whole candidate before reserving or allocating decoded records.
+    // Each validated slot is retained: file-backed entries as their normalized
+    // (device, inode, file offset), NULLs as holes. The entry builder below
+    // consumes this instead of re-resolving, and the runtime identity hashes it.
     let mut non_null = 0usize;
     let field_count = spans.iter().map(|span| span.fields().len()).sum();
+    let mut slots: Vec<Option<(String, Device, u64, u64)>> = Vec::with_capacity(field_count);
     for ordinal in 0..field_count {
         if !budget.charge(1) {
             return Err(());
@@ -907,11 +999,17 @@ fn decode_candidate(
             return Ok(None);
         };
         if value == 0 {
+            slots.push(None);
             continue;
         }
         non_null += 1;
         let Resolved::File {
-            permissions, path, ..
+            permissions,
+            path,
+            device,
+            inode,
+            file_offset,
+            ..
         } = maps.resolve(value)
         else {
             return Ok(None); // anonymous or unmapped ⇒ not a function table
@@ -919,16 +1017,25 @@ fn decode_candidate(
         if permissions[2] != b'x' {
             return Ok(None); // a pointer into data ⇒ not a function table
         }
-        let MappedPath::Usable(_) = path else {
+        let MappedPath::Usable(path) = path else {
             return Ok(None); // deleted/ambiguous pathname ⇒ cannot become an attach target
         };
+        slots.push(Some((
+            path.display().to_string(),
+            device,
+            inode,
+            file_offset,
+        )));
     }
     if non_null == 0 {
         return Ok(None);
     }
     let decoded_entries = spans.iter().map(|span| span.fields().len()).sum();
     // Byte-identical repeats skip the candidate+entry charge but still decode
-    // below; without a stable file owner there is no identity, so charge.
+    // below. Without a stable file owner there is no file identity; a
+    // view-scoped caller instead identifies the table by (view, address,
+    // content), so a freed slot reallocated with different entries charges
+    // again while a genuine repeat does not.
     let identity =
         table_owner
             .filter(|(_, inode, _)| *inode != 0)
@@ -939,9 +1046,33 @@ fn decode_candidate(
                 version_word: word,
                 usable: decoded_entries,
             });
+    let runtime_identity = if identity.is_none() {
+        runtime_view.map(|view| RuntimeTableIdentity {
+            view,
+            address,
+            version_word: word,
+            usable: decoded_entries,
+            content: runtime_content_hash(
+                word,
+                decoded_entries,
+                &slots
+                    .iter()
+                    .map(|slot| {
+                        slot.as_ref()
+                            .map(|(_, device, inode, file_offset)| (*device, *inode, *file_offset))
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+        })
+    } else {
+        None
+    };
     let repeat = identity
         .as_ref()
-        .is_some_and(|id| budget.table_already_admitted(id));
+        .is_some_and(|id| budget.table_already_admitted(id))
+        || runtime_identity
+            .as_ref()
+            .is_some_and(|id| budget.runtime_table_already_admitted(id));
     if !repeat {
         if !budget.admit_table(decoded_entries) {
             return Err(());
@@ -949,11 +1080,14 @@ fn decode_candidate(
         if let Some(id) = identity {
             budget.note_table_admitted(id);
         }
+        if let Some(id) = runtime_identity {
+            budget.note_runtime_table_admitted(id);
+        }
     }
 
     let mut entries = Vec::with_capacity(non_null);
     let mut null_entries = Vec::with_capacity(decoded_entries - non_null);
-    for ordinal in 0..field_count {
+    for (ordinal, slot) in slots.iter().enumerate() {
         // Provisional ABI-positional label, not an attribution: presenting it
         // as the provider's function name requires linkage-or-manifest
         // authorization, applied where the table's evidence is complete (plan
@@ -961,29 +1095,18 @@ fn decode_candidate(
         // same-ordinal matching (fallback proofs) keeps using these labels;
         // only the presented names are gated.
         let name = function_name(ordinal).expect("validated shared field count");
-        let value = read_function_pointer(bytes, layout, ordinal).expect("validated above");
-        if value == 0 {
+        let Some((object_path, device, inode, file_offset)) = slot else {
             null_entries.push(name);
             continue;
-        }
-        let Resolved::File {
-            path,
-            file_offset,
-            device,
-            inode,
-            ..
-        } = maps.resolve(value)
-        else {
-            unreachable!("validated above")
-        };
-        let MappedPath::Usable(path) = path else {
-            unreachable!("validated above")
         };
         entries.push(ScannedEntry {
             name,
-            object: ObjectKey { device, inode },
-            object_path: path.display().to_string(),
-            file_offset,
+            object: ObjectKey {
+                device: *device,
+                inode: *inode,
+            },
+            object_path: object_path.clone(),
+            file_offset: *file_offset,
         });
     }
     Ok(Some((
@@ -1008,14 +1131,18 @@ fn decode_candidate(
 /// Decode one table whose first byte is at `address`, using the same bounded
 /// layout decoder as heuristic memory discovery.  Callers own the bounded
 /// `/proc/<pid>/mem` read; this helper only accepts a complete table snapshot.
+/// `runtime_view` scopes the cardinality identity for tables without a stable
+/// file owner; pass the reading view for exact-address validation, `None`
+/// only where no view exists (unit fixtures).
 pub(crate) fn decode_exact_table(
     snapshot: &[u8],
     address: u64,
     layout: LinuxLayout,
     maps: &MapIndex<'_>,
     budget: &mut CaptureWorkBudget,
+    runtime_view: Option<ProcessViewId>,
 ) -> Result<Option<ScannedTable>, ()> {
-    decode_candidate(layout, snapshot, 0, address, maps, budget)
+    decode_candidate(layout, snapshot, 0, address, maps, budget, runtime_view)
         .map(|decoded| decoded.map(|(table, _)| table))
 }
 
@@ -1082,7 +1209,7 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
             }
             break;
         }
-        match decode_candidate(layout, snapshot, offset, base_address, maps, budget) {
+        match decode_candidate(layout, snapshot, offset, base_address, maps, budget, None) {
             Ok(Some((table, len))) => found.push((offset, len, table)),
             Ok(None) => {}
             Err(()) => {
@@ -4105,6 +4232,7 @@ mod tests {
             LinuxLayout::Lp64,
             &map_index,
             &mut budget,
+            None,
         )
         .expect("a valid table decodes")
         .expect("all slots walkable");
@@ -4116,6 +4244,7 @@ mod tests {
             LinuxLayout::Lp64,
             &map_index,
             &mut budget,
+            None,
         )
         .expect("a valid table decodes")
         .expect("the repeat decodes too, never from a cache");
@@ -4133,6 +4262,7 @@ mod tests {
             LinuxLayout::Lp64,
             &map_index,
             &mut budget,
+            None,
         )
         .expect("a valid table decodes")
         .expect("different bytes decode");

@@ -64,3 +64,15 @@ Build env: TMPDIR=/var/tmp/p11scope-ws-tmp cargo +1.88 --locked --offline.
   publication-selected, two lanes, measured decision); open question (7);
   matrix gains wrapper-only failure + nested wrapper→backend. Catalog closed
   for p11-kit 0.26.2 header (scoped). Task 1.2 untouched by this delta.
+- Ruling: user authorized 5-7 parallel subagents, overriding SDD's
+  never-parallel rule — accepted with file-disjoint domains + separate
+  worktrees/branches + sequential merges as the conflict control. Cost if
+  wrong: merge conflicts and contended full-suite runs; merges stay
+  one-at-a-time with gates re-run on the merged tree. Fanned out 2026-09-19:
+  1.4-fixture (new files only), 3.3-preflight (run.rs+tests only), 2.1-loader
+  (survey+/tmp spike+note, vendor unwired — Cargo wiring deferred to 2.2).
+  Running alongside 1.2 (admission files). 4/7 slots used.
+- Ruling: goal pre-commits to multi-uprobe; plan's Task 2.1 comparison is
+  reframed as WHICH loader (Aya backport vs raw helper), not WHETHER multi.
+  Task 1.6 still decides SCOPE (broad vs selective) by measurement. Cost if
+  wrong: loader rework if the comparison winner contradicts the directive.

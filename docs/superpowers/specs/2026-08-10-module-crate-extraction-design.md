@@ -10,7 +10,7 @@ selection) from `pkcs11-proxy-ng` into a lean crate that both the proxy and
 `p11scope-discover` consume, plus latent-bug fixes in the proxy's loading
 path that the reviews surfaced. It does **not** cover the eBPF observer, the
 manifest schema, or anything else in Phase 1.
-**Parent docs:** [pkcs11-scope design](2026-08-10-pkcs11-scope-design.md)
+**Parent docs:** [p11scope design](2026-08-10-p11scope-design.md)
 ("Shared decode core" decision row), ROADMAP Phase 1,
 `pkcs11-proxy-ng/doc/adr/ADR-0011` (ABI axes).
 
@@ -363,7 +363,7 @@ Commit order per umbrella rules: submodule first, then pointer bump.
 ## 10. How `p11scope-discover` consumes it (context, not part of this change)
 
 ```toml
-# pkcs11-scope/Cargo.toml (Phase 1, later change)
+# p11scope/Cargo.toml (Phase 1, later change)
 [dependencies]
 pkcs11-module         = { git = "https://github.com/mingulov/pkcs11-proxy-ng", rev = "<pinned>" }
 pkcs11-proxy-ng-types = { git = "https://github.com/mingulov/pkcs11-proxy-ng", rev = "<pinned>" }
@@ -419,7 +419,7 @@ the ~10-line bootstrap dlsym that `function_list()` already is.
 
 ## 13. Placement decision (products stay separate; crate stays in-workspace)
 
-Recorded owner intent: `pkcs11-scope` and `pkcs11-proxy-ng` remain separate
+Recorded owner intent: `p11scope` and `pkcs11-proxy-ng` remain separate
 products (internal for now), with a preference for keeping them separated.
 This is **compatible with the crate living in the proxy workspace**: a
 pinned git rev already gives scope full release independence — it upgrades

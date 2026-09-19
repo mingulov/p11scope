@@ -106,7 +106,7 @@ pinned nightly). `actions/checkout@v4` already; add `actions/upload-artifact@v4`
   `README.md:239`, `docs/usage.md:496-498`, `CHANGELOG.md:10`,
   `ROADMAP.md:411` and `:466-467` — i.e. Task 7 rewrites sentences this test
   pins, so it reruns the test before its canonical gates.
-- Durable output only in `pkcs11-scope` and `p11scope-ws`; hosted-run evidence
+- Durable output only in `p11scope` and `p11scope-ws`; hosted-run evidence
   (text) is committed in `p11scope-ws`.
 
 ## Task 0: Verified anchors (pass 2 over this plan)
@@ -166,7 +166,7 @@ as `mingulov`):
   are not ignored (blob `cd3d946…` "p11scope" entered history in `c495caa`,
   2026-08-10). `.codex/` is tracked (agent role configs) — leave it.
   `Cargo.toml:7`, `crates/manifest/Cargo.toml:7`, `crates/discover/Cargo.toml:7`
-  say `repository = ".../pkcs11-scope"`; the remote is `.../p11scope.git`.
+  say `repository = ".../p11scope"`; the remote is `.../p11scope.git`.
 
 - [ ] Dispatch independent read-only verifiers over every file:line and
   behavioral claim above and in Tasks 1–7; adjudicate; fold corrections into
@@ -201,7 +201,7 @@ publishable by a repo rule that does not travel with the repo.
   `/.superpowers/sdd/` line unless a test pins it (`grep -rn superpowers tests/`
   first). Do not touch `.git/info/exclude`.
 - [ ] Do **not** change `Cargo.toml:7` in this task. Record the
-  `pkcs11-scope` vs `p11scope.git` mismatch as an OWNER QUESTION in the wave
+  `p11scope` vs `p11scope.git` mismatch as an OWNER QUESTION in the wave
   report (Task 7): fix all three `repository` fields only if the owner
   confirms the public repository name; GitHub redirects renamed repos, which
   cannot be verified offline.
@@ -434,7 +434,7 @@ Commit: `ci: retain the hosted job log as a run artifact`
 
 ## Task 6: Review-to-zero, merge, the branch push, the hosted run, exit evidence
 
-**OWNER-GATED throughout.** No commit in `pkcs11-scope` from this task; its
+**OWNER-GATED throughout.** No commit in `p11scope` from this task; its
 output is the evidence directory in `p11scope-ws` and the inputs to Task 7.
 
 **Files:**

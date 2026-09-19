@@ -42,11 +42,11 @@ Rev 2 review (2026-08-18) returned NEEDS FIXES with seven items; rev 3 resolves 
 ## Global Constraints
 
 - Rust 1.88, edition 2024, Linux x86-64-first; the spike BPF object builds with the frozen nightly (`rustc 1.97.0-nightly (e50aa6fba 2026-05-19)`, `-Z build-std=core`, `bpfel-unknown-none`); no new dependencies.
-- **Do not work inside `/home/user/src/m/pkcs11-scope-codex-slice1b-1`** — a worker commits there live (`906753a` landed during this analysis). Base: `codex/slice1b-1-recovery` at execution-time tip; this plan touches only `spike/`, `docs/notes/slice1b2*`, and `docs/superpowers/plans/ROADMAP.md` (status line). Second executor: worktree `.claude/worktrees/slice1b2-gates`, branch `spike/slice1b2-gates`; the recovery-branch worker: its own branch.
+- **Do not work inside `/home/user/src/m/p11scope-codex-slice1b-1`** — a worker commits there live (`906753a` landed during this analysis). Base: `codex/slice1b-1-recovery` at execution-time tip; this plan touches only `spike/`, `docs/notes/slice1b2*`, and `docs/superpowers/plans/ROADMAP.md` (status line). Second executor: worktree `.claude/worktrees/slice1b2-gates`, branch `spike/slice1b2-gates`; the recovery-branch worker: its own branch.
 - All four repo checks stay green at every commit (`cargo +1.88 fmt --all -- --check`, `check --locked`, `test --locked`, `clippy --locked -- -D warnings`); also `cargo test` and `cargo clippy -- -D warnings` inside `spike/slice1b2-kernel` after every runner change; `bash -n spike/slice1b2-kernel/run.sh` after every script change.
 - **Privileged experiments need explicit owner approval, split by concrete lane** (`CLAUDE.md`): (a) VM lanes with `sudo` inside the retained guests — Tasks 2, 3, 5, 7; (b) diagnostic root runs on the host kernel `7.0.0-28-generic` (not an endpoint) — Tasks 2, 7, 8; (c) Docker lanes with `--cap-add=SYS_PTRACE --security-opt seccomp=unconfined` — Task 6; (d) the one-time KVM enablement — Task 1; (e) Task 8's `loader-protect` runs (host root + guests); Task 9 asks separately when its steps are written. Record UNRUN for any lane not approved.
 - Frozen-gate discipline (§3, §4.3, §6.2): the tracked Gate A/B oracles, 120 s inner bound, 8 MiB/16 MiB caps, `VERBOSE | STATS`, literal `< 104` / `< 16`, four maps, `BPF_NOEXIST`, submit-after-init do **not** change. Diagnostic lanes are labelled diagnostic and are never promoted; a PASS is claimed only from the unchanged frozen gate on the final frozen A/B bytes (Task 5). Any A/B BPF/runner/fixture/validator change creates a new campaign identity.
-- Privacy: no raw verifier log, PID/TID, task set, runtime address, cookie, delta, context ID or guest path in tracked files; raw evidence stays outside git under `~/src/m/pkcs11-scope-evidence/slice1b2/` (mode 0700) with a SHA-256 manifest; tracked docs carry digests and finite facts only. Do not track generated output (BPF objects, binaries, qcow2, tarballs, transcripts).
+- Privacy: no raw verifier log, PID/TID, task set, runtime address, cookie, delta, context ID or guest path in tracked files; raw evidence stays outside git under `~/src/m/p11scope-evidence/slice1b2/` (mode 0700) with a SHA-256 manifest; tracked docs carry digests and finite facts only. Do not track generated output (BPF objects, binaries, qcow2, tarballs, transcripts).
 - §5, §7 invariants: hooks never call provider/loader code; a BPF read failure is finite evidence, never a silent procfs fallback; only the observer's owned `run` child is ever stopped; reservation precedes authorization consumption; one original-pidfd resume.
 
 ---
@@ -76,7 +76,7 @@ Task 6 (containers) runs in parallel with 2–5 (VMs). Do not add kernels (note 
 **Files:**
 - Create: `spike/slice1b2-loader/{dso.c,fixture.c,rdebug-layout.c,elf_meta.py,gdb-direct-witness.py,inside.sh,run-lanes.sh,CANONICAL-EVIDENCE.md}` (tracked; ≈460 lines, no evidence)
 - Create: `docs/notes/slice1b2/README.md` (tracked; digests, pointers, finite facts only)
-- Create outside git: `~/src/m/pkcs11-scope-evidence/slice1b2/{analyses,gate-a,gate-b,loader,bundles}/…` + `MANIFEST.sha256`
+- Create outside git: `~/src/m/p11scope-evidence/slice1b2/{analyses,gate-a,gate-b,loader,bundles}/…` + `MANIFEST.sha256`
 - Modify: `docs/notes/slice1b2-open-issues-and-consequences.md` § "Authoritative evidence pointers"
 
 **Interfaces:**
@@ -93,7 +93,7 @@ sha256sum /tmp/slice1b2-gatea-corrective-analysis.md /tmp/slice1b2-gateb-varianc
 - [ ] **Step 2: Copy only the small, canonical items — no run/provision directories, no qcow2, no analyses into git**
 
 ```bash
-E=~/src/m/pkcs11-scope-evidence/slice1b2; install -d -m 0700 "$E"/{analyses,gate-a,gate-b,loader,bundles}
+E=~/src/m/p11scope-evidence/slice1b2; install -d -m 0700 "$E"/{analyses,gate-a,gate-b,loader,bundles}
 cp /tmp/slice1b2-*.md "$E/analyses/"                                    # analyses: outside git (raw addresses/paths)
 cp -a /tmp/p11scope-slice1b2-task2-fd98a02-gatea-*-evidence* "$E/gate-a/" # six-file inventories + .sha256 (16 KiB each)
 cp -a /tmp/p11scope-slice1b2-task2-fd98a02-diagnostic-*-evidence* "$E/gate-a/" 2>/dev/null || true
@@ -116,7 +116,7 @@ Replace the two hard-coded paths at the top of `spike/slice1b2-loader/run-lanes.
 ```bash
 repo=$(cd "$(dirname "$0")/../.." && pwd)
 root=$(cd "$(dirname "$0")" && pwd)
-evidence=${P11SCOPE_LOADER_EVIDENCE:-$HOME/src/m/pkcs11-scope-evidence/slice1b2/loader}
+evidence=${P11SCOPE_LOADER_EVIDENCE:-$HOME/src/m/p11scope-evidence/slice1b2/loader}
 install -d -m 0700 "$evidence/round2/artifacts"
 cp "$root"/{dso.c,fixture.c,rdebug-layout.c,elf_meta.py,gdb-direct-witness.py,inside.sh} "$evidence/round2/"
 filter=${1:-}   # empty = all lanes; otherwise a lane-name substring
@@ -125,7 +125,7 @@ change every `-v /tmp/p11scope-slice1b2-loader-spikes:/evidence` to `-v "$eviden
 
 - [ ] **Step 4: Write `docs/notes/slice1b2/README.md`, repoint the note, commit**
 
-README content: the four pinned digests, the evidence root layout, `MANIFEST.sha256` digest, and a two-line status per gate (copied from the note). In the note § "Authoritative evidence pointers", replace `/tmp/...` paths with `~/src/m/pkcs11-scope-evidence/slice1b2/<dir>` and add `spike/slice1b2-loader/` for the harness.
+README content: the four pinned digests, the evidence root layout, `MANIFEST.sha256` digest, and a two-line status per gate (copied from the note). In the note § "Authoritative evidence pointers", replace `/tmp/...` paths with `~/src/m/p11scope-evidence/slice1b2/<dir>` and add `spike/slice1b2-loader/` for the harness.
 
 ```bash
 git add spike/slice1b2-loader docs/notes/slice1b2 docs/notes/slice1b2-open-issues-and-consequences.md
@@ -282,8 +282,8 @@ One cleanup path (`private_cleanup_lane`, `private_disarm_lane_traps`) on every 
 
 ```bash
 # bundle = the retained Task 4 bundle (BPF d405edee…) re-frozen with the new runner via `run.sh freeze-execution …`
-run.sh diag-lane jammy "$BUNDLE" ~/src/m/pkcs11-scope-evidence/slice1b2/gate-a/diag-jammy-$(date +%Y%m%dT%H%M%S)
-run.sh diag-lane noble "$BUNDLE" ~/src/m/pkcs11-scope-evidence/slice1b2/gate-a/diag-noble-$(date +%Y%m%dT%H%M%S)
+run.sh diag-lane jammy "$BUNDLE" ~/src/m/p11scope-evidence/slice1b2/gate-a/diag-jammy-$(date +%Y%m%dT%H%M%S)
+run.sh diag-lane noble "$BUNDLE" ~/src/m/p11scope-evidence/slice1b2/gate-a/diag-noble-$(date +%Y%m%dT%H%M%S)
 # host 7.0.0-28 (not an endpoint; approval): sudo target/release/slice1b2-runner gate-a-diag "$BUNDLE/slice1b2-kernel-ebpf" …/gate-a/diag-host
 ```
 Expected: three `accepted=true` lines with `verified_insns` (6.8/7.0; `null` on 5.15) and one line for `interface_list_return` with a real `errno` (likely `7`/E2BIG "BPF program is too large. Processed 1000001 insn", or `13`/EACCES with a specific complaint) and a `log_tail` ≤ 2 KiB — in seconds under KVM, minutes under TCG. Append to the manifest; quote errno / insns / peak_states in `docs/notes/slice1b2/README.md` under "diagnostic". Commit script.
@@ -422,7 +422,7 @@ Run on the retained final object:
 ```bash
 rustup component add llvm-tools --toolchain nightly
 OBJDUMP=$(rustc +nightly --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-objdump
-python3 spike/slice1b2-kernel/check-init-shape.py ~/src/m/pkcs11-scope-evidence/slice1b2/bundles/task4-37c5b41-bundle/slice1b2-kernel-ebpf "$OBJDUMP"
+python3 spike/slice1b2-kernel/check-init-shape.py ~/src/m/p11scope-evidence/slice1b2/bundles/task4-37c5b41-bundle/slice1b2-kernel-ebpf "$OBJDUMP"
 ```
 Expected: `FAIL: memset relocation inside the initializer region` (retained disassembly: insns 10-13 `call -0x1` + `R_BPF_64_32 memset` right after `call 0x83`).
 

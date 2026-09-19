@@ -26,7 +26,7 @@ sys.dont_write_bytecode = True
 from _loader import load_path
 
 
-ARCHIVE_ROOT = "pkcs11-scope-source"
+ARCHIVE_ROOT = "p11scope-source"
 EXPORT_MANIFEST = ".p11scope-source-export.json"
 SCHEMA_VERSION = 1
 FULL_SCHEMA_VERSION = 2

@@ -1079,7 +1079,7 @@ fn inspect_renders_a_scanned_fixture_end_to_end() {
     assert!(text.contains("inspected.so"), "{text}");
     assert!(text.contains("2.40"), "{text}");
     let json = p11scope::inspect::render_json(std::process::id(), &outcome, &pinned);
-    assert_eq!(json["schema"], "pkcs11-scope/inspect/v1");
+    assert_eq!(json["schema"], "p11scope/inspect/v1");
     assert!(
         json["modules"][0]["identity"]["sha256"]
             .as_str()

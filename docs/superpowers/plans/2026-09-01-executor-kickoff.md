@@ -10,7 +10,7 @@ point; everything else is pointed at, not restated.
 x86-64. Goal: a real, publishable v0.1.0 — correct first, locally tested
 second, breadth (CI/containers/distros/ABIs) third.
 
-**Two directories only:** `/home/user/src/m/pkcs11-scope` (public repo, git)
+**Two directories only:** `/home/user/src/m/p11scope` (public repo, git)
 and `/home/user/src/m/p11scope-ws` (non-public workspace: evidence, VM bases,
 preserved artifacts). Nothing durable anywhere else.
 

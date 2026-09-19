@@ -1,12 +1,12 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
-# pkcs11-scope Roadmap — phases and review gates
+# p11scope Roadmap — phases and review gates
 
 Source of truth for *what* each phase delivers and *which review gates it must
 pass*. Each phase gets its own detailed implementation plan (same directory,
 same format as the Phase 0 plan) written **after** the previous phase's gate —
 detailed plans written before their inputs exist would be fiction.
 
-Spec: [2026-08-10-pkcs11-scope-design.md](../specs/2026-08-10-pkcs11-scope-design.md)
+Spec: [2026-08-10-p11scope-design.md](../specs/2026-08-10-p11scope-design.md)
 
 ## Phase 0 — Feasibility spike ([plan](2026-08-10-phase0-feasibility-spike.md))
 
@@ -263,7 +263,7 @@ cross-checked against measured reality; canary suite still green.
      code (`rg p11-kit src/ crates/` finds nothing); the false claim was
      deleted from both files.
    - The original outputs-spec draft
-     (`docs/superpowers/specs/2026-08-10-pkcs11-scope-outputs.md`) said
+     (`docs/superpowers/specs/2026-08-10-p11scope-outputs.md`) said
      Labels/`CKA_ID` would be available "behind an explicit opt-in flag"
      — the shipped tool is stricter (refused outright, no such flag
      exists); corrected to match, since README and `docs/usage.md` both

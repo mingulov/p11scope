@@ -476,16 +476,16 @@ and inventory-separation invariant above with positive and mutation tests.
 ### 9.2 Capture output
 
 Profile output advances from the current
-`pkcs11-scope/observed-profile/v2` contract to
-`pkcs11-scope/observed-profile/v3`. The change is intentionally breaking for
+`p11scope/observed-profile/v2` contract to
+`p11scope/observed-profile/v3`. The change is intentionally breaking for
 exact-dispatch consumers: all v2 fields keep their names and meanings, while
 v3 adds `evidence.interface_selection`; consumers must dispatch on v3 before
 reading it. Repository scripts, fixtures, examples, docs, and schema pins move
 in the same implementation task. There is no claim that v2 was unpublished.
 
-Metrics output is now `pkcs11-scope/observed-profile/v3-metrics`; it retains the
+Metrics output is now `p11scope/observed-profile/v3-metrics`; it retains the
 no-argument-read contract and adds the typed task-uprobe link-loss counter.
-The historical `pkcs11-scope/observed-profile/v2-metrics` shape remains a
+The historical `p11scope/observed-profile/v2-metrics` shape remains a
 compatibility-read fixture and is not emitted. Profile and terminal trace
 evidence add `evidence.interface_selection`:
 

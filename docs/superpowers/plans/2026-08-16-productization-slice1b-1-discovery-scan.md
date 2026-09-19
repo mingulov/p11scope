@@ -37,7 +37,7 @@
   require explicit owner approval; anything not run is recorded `UNRUN`/`PENDING`, never as
   green. Every script change is verified with `sh -n` and its `--self-test` where it has one.
 - Manifest schema stays `p11scope-manifest/4`. Profile schema becomes
-  `pkcs11-scope/observed-profile/v2` and `pkcs11-scope/observed-profile/v2-metrics`
+  `p11scope/observed-profile/v2` and `p11scope/observed-profile/v2-metrics`
   (breaking: `capture.module` → `capture.modules[]`).
 - Scan bounds are hard: 64 MiB per object, 512 MiB per capture; anything larger is
   `skipped: too_large`, never truncated silently.
@@ -1995,7 +1995,7 @@ works unprivileged against a same-uid target and is the answer to "which provide
 process actually use". Interface **names** are shown here — `inspect` is a discovery tool,
 not capture output (spec §4.3).
 
-JSON document id: `pkcs11-scope/inspect/v1`.
+JSON document id: `p11scope/inspect/v1`.
 
 - [ ] **Step 1: Write the failing rendering tests**
 
@@ -2079,7 +2079,7 @@ mod tests {
     #[test]
     fn json_is_stable_and_carries_the_document_id() {
         let value = render_json(4242, &sample(), &PinnedObjects::empty());
-        assert_eq!(value["schema"], "pkcs11-scope/inspect/v1");
+        assert_eq!(value["schema"], "p11scope/inspect/v1");
         assert_eq!(value["pid"], 4242);
         assert_eq!(value["modules"][0]["path"], "/usr/lib/softhsm/libsofthsm2.so");
         assert_eq!(value["modules"][0]["tables"][0]["version"], "2.40");
@@ -2151,7 +2151,7 @@ fn inspect_renders_a_scanned_fixture_end_to_end() {
     assert!(text.contains("inspected.so"), "{text}");
     assert!(text.contains("2.40"), "{text}");
     let json = p11scope::inspect::render_json(std::process::id(), &outcome, &pinned);
-    assert_eq!(json["schema"], "pkcs11-scope/inspect/v1");
+    assert_eq!(json["schema"], "p11scope/inspect/v1");
     assert!(json["modules"][0]["identity"]["sha256"].as_str().unwrap().len() == 64);
 }
 ```
@@ -2533,7 +2533,7 @@ pub struct DiscoveredModule {
 }
 ```
 
-**Schema v2** (`pkcs11-scope/observed-profile/v2`, `…/v2-metrics`):
+**Schema v2** (`p11scope/observed-profile/v2`, `…/v2-metrics`):
 
 - `capture.module` → `capture.modules[]`, each `{path, dev, ino, sha256, build_id}`.
 - `functions[]` items gain `module: {dev, ino, sha256}`.
@@ -2584,7 +2584,7 @@ fn discovery_gaps_each_force_partial() {
 #[test]
 fn v2_json_publishes_modules_and_per_function_module_identity() {
     let v = profile_json(&reports_fixture(), &evidence_fixture(), &state_fixture(), &capture_fixture());
-    assert_eq!(v["schema"], "pkcs11-scope/observed-profile/v2");
+    assert_eq!(v["schema"], "p11scope/observed-profile/v2");
     assert_eq!(v["capture"]["modules"][0]["path"], "/opt/p11.so");
     assert_eq!(v["capture"]["modules"][0]["sha256"].as_str().unwrap().len(), 64);
     assert!(v["capture"]["module"].is_null(), "v1's singular field is gone");
@@ -2648,7 +2648,7 @@ absent rather than null: this slice has no live discovery to report on.
 
 - [ ] **Step 5: Update the evidence checker**
 
-In `scripts/check-capture-evidence.py`: schema strings → `pkcs11-scope/observed-profile/v2`
+In `scripts/check-capture-evidence.py`: schema strings → `p11scope/observed-profile/v2`
 and `…/v2-metrics`; `document["capture"]["module"]` → `document["capture"]["modules"][0]`;
 add `authority == "hash-pinned"` and `discovery` presence to `exact_common`; add
 `discovery_conflicts`/`discovery_uncorroborated`/`module_ambiguous` to the exact-zero counter
@@ -2735,7 +2735,7 @@ sleep 0.3
 python3 - "$WORK/inspect.json" <<'PY'
 import json, sys
 doc = json.load(open(sys.argv[1]))
-assert doc["schema"] == "pkcs11-scope/inspect/v1", doc["schema"]
+assert doc["schema"] == "p11scope/inspect/v1", doc["schema"]
 paths = [m["path"] for m in doc["modules"]]
 assert any(p.endswith("libsofthsm2.so") for p in paths), paths
 print("inspect: OK", paths)

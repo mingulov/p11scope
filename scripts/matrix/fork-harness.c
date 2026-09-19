@@ -58,7 +58,7 @@ static void child_work(int idx)
           ((fn_open)fns[I_OpenSession])(slots[0], CKF_SERIAL_SESSION, NULL, NULL, &sess));
 
     CK_MECHANISM sha256 = { CKM_SHA256, NULL, 0 };
-    unsigned char data[] = "pkcs11-scope fork-harness", out[64];
+    unsigned char data[] = "p11scope fork-harness", out[64];
     for (int i = 0; i < M_DIGESTS; i++) {
         CK_ULONG outlen = sizeof out;
         CHECK(who, "C_DigestInit", ((fn_diginit)fns[I_DigestInit])(sess, &sha256));

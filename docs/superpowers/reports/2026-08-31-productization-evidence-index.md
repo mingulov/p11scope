@@ -191,7 +191,7 @@ The historical `main` history through
 `90a03acbbbaff6de39fe56d3eb4de8b8add27e43` and its then-current evidence set
 remain packaged at:
 
-`/home/user/src/m/p11scope-ws/preserved/portable/pkcs11-scope-portable-90a03ac.tar.zst` (originally under `~/.local/state/p11scope/`, relocated 2026-09-02)
+`/home/user/src/m/p11scope-ws/preserved/portable/p11scope-portable-90a03ac.tar.zst` (originally under `~/.local/state/p11scope/`, relocated 2026-09-02)
 
 - archive SHA-256:
   `e4d6cf6294d7717c5b89cd38bec3a608e1fc8d8696a3f86f074a6bbcb4c2d6cf`

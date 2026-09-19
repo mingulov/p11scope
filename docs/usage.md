@@ -68,7 +68,7 @@ cannot enable code absent from the shipped eBPF object, `metrics` refuses the
 flag, and the observer prints a warning naming the exposure when it is active.
 The official release artifact is built `--no-default-features`, and packaging
 fails if the unsafe path is reachable. See
-[docs/superpowers/specs/2026-08-10-pkcs11-scope-outputs.md](superpowers/specs/2026-08-10-pkcs11-scope-outputs.md#what-you-will-not-see-by-design-in-every-mode)
+[docs/superpowers/specs/2026-08-10-p11scope-outputs.md](superpowers/specs/2026-08-10-p11scope-outputs.md#what-you-will-not-see-by-design-in-every-mode)
 for the design commitment and
 [docs/privacy/allowlist-v2.md](privacy/allowlist-v2.md) for the field-by-field
 enforcement (what is captured, why, and how each read is gated — structural
@@ -751,7 +751,7 @@ What this tool proves, and what it deliberately does not claim to:
   hostile-pointer canary coverage.
 - [`docs/schema/observed-profile-v3.md`](schema/observed-profile-v3.md) —
   the versioned `observed-profile.json` schema (current:
-  `pkcs11-scope/observed-profile/v3`), the integration boundary
+  `p11scope/observed-profile/v3`), the integration boundary
   `pkcs11-lab` reads.
-- [`docs/superpowers/specs/2026-08-10-pkcs11-scope-outputs.md`](superpowers/specs/2026-08-10-pkcs11-scope-outputs.md)
+- [`docs/superpowers/specs/2026-08-10-p11scope-outputs.md`](superpowers/specs/2026-08-10-p11scope-outputs.md)
   — the original "what you will see" design commitment.

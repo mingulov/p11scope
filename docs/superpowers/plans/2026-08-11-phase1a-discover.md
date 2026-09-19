@@ -9,7 +9,7 @@
 
 **Tech Stack:** Rust edition 2024; `pkcs11-module` (proxy-ng shared crate, git+rev); `libloading` 0.8; `cryptoki-sys` 0.5; `object` 0.39 (read-only); `sha2`; `serde`/`serde_json`; aya 0.14.0 + aya-ebpf 0.2.1 (spike only); gcc fixtures; docker (ubuntu 24.04 / alpine).
 
-Spec inputs: [design spec](../specs/2026-08-10-pkcs11-scope-design.md) (Architecture, v1 scope), [outputs spec](../specs/2026-08-10-pkcs11-scope-outputs.md) (CLI), [ROADMAP Phase 1](ROADMAP.md), [extraction design §10](../specs/2026-08-10-module-crate-extraction-design.md) (dependency contract), review corrections recorded in this plan's design session (2026-08-11).
+Spec inputs: [design spec](../specs/2026-08-10-p11scope-design.md) (Architecture, v1 scope), [outputs spec](../specs/2026-08-10-p11scope-outputs.md) (CLI), [ROADMAP Phase 1](ROADMAP.md), [extraction design §10](../specs/2026-08-10-module-crate-extraction-design.md) (dependency contract), review corrections recorded in this plan's design session (2026-08-11).
 
 ## Global Constraints
 

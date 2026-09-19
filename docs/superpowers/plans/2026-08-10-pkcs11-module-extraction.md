@@ -92,7 +92,7 @@ cryptoki-sys.workspace = true
 //! quirks) lives in the proxy backend; evidence policy (pointer→offset
 //! mapping, provenance/alias analysis) lives in p11scope-discover. This
 //! crate never calls `C_Initialize`. Design of record: the extraction spec
-//! in the pkcs11-scope repository
+//! in the p11scope repository
 //! (`docs/superpowers/specs/2026-08-10-module-crate-extraction-design.md`).
 
 pub mod tables;
@@ -1283,7 +1283,7 @@ Add one bullet after the **FFI backend** entry:
   module-FFI *facts* — raw `C_GetFunctionList`/`C_GetInterfaceList`
   acquisition, function-list field-offset tables, provenance/version →
   table selection (`tables_for`), unaligned-safe readers. No proto/tonic
-  dependencies; also consumed externally (pkcs11-scope's discover helper)
+  dependencies; also consumed externally (p11scope's discover helper)
   via git dependency. Interface-*selection* policy stays in the backend.
 ```
 
@@ -1373,7 +1373,7 @@ git commit -m "chore: advance proxy for the pkcs11-module extraction"
 
 - [x] **Step 3: Mark the spec's status**
 
-In the **pkcs11-scope repo**, edit
+In the **p11scope repo**, edit
 `docs/superpowers/specs/2026-08-10-module-crate-extraction-design.md`
 status line from "Proposed — revision 4 …" to
 "Implemented — revision 4 approved by external review; extraction landed

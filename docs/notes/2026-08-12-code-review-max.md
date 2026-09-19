@@ -294,7 +294,7 @@ are probed but their mechanism is never captured.
 Run any app that calls `C_GenerateKey`: `functions[]` shows the calls,
 `Event.mechanism` stays `MECH_NONE`, and `mechanisms[]` can never contain
 `CKM_AES_KEY_GEN` — while
-`docs/superpowers/specs/2026-08-10-pkcs11-scope-outputs.md:41` and `:100-103`
+`docs/superpowers/specs/2026-08-10-p11scope-outputs.md:41` and `:100-103`
 specify exactly that record. The `SESSION_ARG0` members are worse: a
 `C_WrapKey` is attributed to whatever `*Init` mechanism is still bound on that
 session (see A1), never to its own wrapping mechanism.

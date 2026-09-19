@@ -304,7 +304,7 @@ def exact_role_counts(description):
     }, description
 
 
-def profile_terminal(doc, schema="pkcs11-scope/observed-profile/v3"):
+def profile_terminal(doc, schema="p11scope/observed-profile/v3"):
     assert doc["schema"] == schema, doc["schema"]
     ev = doc["evidence"]
     assert "secret_selection_payload" not in ev, ev
@@ -312,7 +312,7 @@ def profile_terminal(doc, schema="pkcs11-scope/observed-profile/v3"):
     assert isinstance(ev["task_uprobe_link_losses"], int) and not isinstance(
         ev["task_uprobe_link_losses"], bool
     ) and 0 <= ev["task_uprobe_link_losses"] <= (1 << 64) - 1, ev
-    if schema == "pkcs11-scope/observed-profile/v3":
+    if schema == "p11scope/observed-profile/v3":
         selection_terminal(ev)
 
 
@@ -452,11 +452,11 @@ def assert_unsafe_trace(text):
 
 def _assert_aggregate_metrics(doc, expected_calls):
     assert set(doc) == {"schema", "capture", "evidence", "functions"}, doc
-    assert doc["schema"] == "pkcs11-scope/observed-profile/v3-metrics"
+    assert doc["schema"] == "p11scope/observed-profile/v3-metrics"
     assert doc["capture"]["mode"] == "metrics"
     assert doc["capture"]["privacy_mode"] == "aggregate-only"
     assert "secret_selection_payload" not in doc["evidence"], doc["evidence"]
-    profile_terminal(doc, "pkcs11-scope/observed-profile/v3-metrics")
+    profile_terminal(doc, "p11scope/observed-profile/v3-metrics")
     assert sum(item["calls"] for item in doc["functions"]) == expected_calls, doc["functions"]
 
 
@@ -1391,7 +1391,7 @@ def main(argv=None):
             }) + "\n"
 
         safe = {
-            "schema": "pkcs11-scope/observed-profile/v3",
+            "schema": "p11scope/observed-profile/v3",
             "capture": {"mode": "profile", "privacy_mode": "allowlisted"},
             "evidence": {**full_fixture, **selection_fixture,
                          "completeness": "PARTIAL", "unregistered_mechanisms": 2,
@@ -1423,7 +1423,7 @@ def main(argv=None):
         secret_v3["evidence"]["attach_mechanisms"] = ["secret-canary"]
         reject("v3 secret canary", lambda: assert_safe_profile(secret_v3))
         stale_v2 = json.loads(json.dumps(v3))
-        stale_v2["schema"] = "pkcs11-scope/observed-profile/v2"
+        stale_v2["schema"] = "p11scope/observed-profile/v2"
         reject("stale live profile v2", lambda: assert_safe_profile(stale_v2))
         extra_evidence = json.loads(json.dumps(v3))
         extra_evidence["evidence"]["secret_selection_payload"] = "CANARY"
@@ -1471,7 +1471,7 @@ def main(argv=None):
              "aad_len": ALIASES["gcm240_aad"], "tag_bits": ALIASES["gcm240_tag"]},
         ]
         unsafe = {
-            "schema": "pkcs11-scope/observed-profile/v3",
+            "schema": "p11scope/observed-profile/v3",
             "capture": {"mode": "profile", "privacy_mode": "unsafe-unvalidated-metadata"},
             "evidence": {**terminal("unsafe-unvalidated-metadata", 7),
                          "templates_truncated": False},
@@ -1541,7 +1541,7 @@ def main(argv=None):
                trace_abort_terminal("EVIDENCE " + json.dumps(mutated), "allowlisted"))
 
         aggregate = {
-            "schema": "pkcs11-scope/observed-profile/v3-metrics",
+            "schema": "p11scope/observed-profile/v3-metrics",
             "capture": {"mode": "metrics", "privacy_mode": "aggregate-only"},
             "evidence": {
                 **full_fixture,
@@ -1576,7 +1576,7 @@ def main(argv=None):
         ]
         scan_module = {"dev": [8, 1], "ino": 42, "sha256": "11" * 32}
         scan_only = {
-            "schema": "pkcs11-scope/observed-profile/v3",
+            "schema": "p11scope/observed-profile/v3",
             "capture": {
                 "start": "t0", "end": "t1", "mode": "profile",
                 "privacy_mode": "allowlisted", "kernel": "6.8.0",

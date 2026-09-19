@@ -1,7 +1,7 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! `trace` renderer: one line per completed call, in arrival order — the
 //! per-investigation counterpart to `profile`'s aggregate report
-//! (`docs/superpowers/specs/2026-08-10-pkcs11-scope-outputs.md`, "Trace
+//! (`docs/superpowers/specs/2026-08-10-p11scope-outputs.md`, "Trace
 //! mode"). Reuses `render::param_combo_json` for parameter decoding so
 //! the same privacy allowlist governs both renderers by construction,
 //! not by two independently-maintained implementations, and reuses

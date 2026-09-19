@@ -358,7 +358,7 @@ Under `#[cfg(test)] mod policy_output`, pin early refusal before `load_plan` for
 ```rust
 assert_eq!(CapturePolicy::from_cli("profile", false, false)?, CapturePolicy::Allowlisted);
 assert!(CapturePolicy::from_cli("metrics", true, true).is_err());
-assert_eq!(value["schema"], "pkcs11-scope/observed-profile/v1.4");
+assert_eq!(value["schema"], "p11scope/observed-profile/v1.4");
 assert_eq!(value["capture"]["privacy_mode"], "allowlisted");
 ```
 
@@ -387,7 +387,7 @@ Make safe semantics bind a mechanism only from successful/pending approved event
 
 - [x] **Step 4: Advance schemas and implement terminal evidence**
 
-Use profile `pkcs11-scope/observed-profile/v1.4` and metrics `pkcs11-scope/observed-profile/v1.1-metrics`. Add `capture.privacy_mode`, `evidence.unregistered_mechanisms`, the policy to every live frame header, and `CAPTURE privacy=<mode>` before the first trace call. Normal terminal trace evidence carries `privacy_mode`, `capture_aborted: null`, `final_drain: true`, and `counters_available: true`. Implement the supervisor-safe abort serializer without BPF state:
+Use profile `p11scope/observed-profile/v1.4` and metrics `p11scope/observed-profile/v1.1-metrics`. Add `capture.privacy_mode`, `evidence.unregistered_mechanisms`, the policy to every live frame header, and `CAPTURE privacy=<mode>` before the first trace call. Normal terminal trace evidence carries `privacy_mode`, `capture_aborted: null`, `final_drain: true`, and `counters_available: true`. Implement the supervisor-safe abort serializer without BPF state:
 
 ```rust
 pub fn abort_evidence_line(policy: CapturePolicy, reason: &'static str) -> String {

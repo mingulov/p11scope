@@ -6915,13 +6915,13 @@ mod tests {
         std::fs::set_permissions(dir.path(), permissions).unwrap();
         let path = dir.path().join("observed.json");
         std::fs::write(&path, b"stale trailing bytes that must disappear").unwrap();
-        let j = serde_json::json!({"schema": "pkcs11-scope/observed-profile/v3", "evidence": {}});
+        let j = serde_json::json!({"schema": "p11scope/observed-profile/v3", "evidence": {}});
         let mut out = AtomicFile::create(&path).unwrap();
         write_json_report(out.file(), &j).expect("shutdown finalization must write the report");
         out.commit().unwrap();
         let parsed: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(parsed["schema"], "pkcs11-scope/observed-profile/v3");
+        assert_eq!(parsed["schema"], "p11scope/observed-profile/v3");
     }
 
     /// The unsafe policy is refused by `CapturePolicy::from_cli` on the parsed

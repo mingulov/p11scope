@@ -319,10 +319,10 @@ valid completion record and pidfd-confirmed normal worker exit, the supervisor
 releases the leases and atomically publishes it. A lease-broken or abnormal
 worker never leaves a valid profile document.
 
-Profile advances from `pkcs11-scope/observed-profile/v1.3` to
-`pkcs11-scope/observed-profile/v1.4`. Metrics advances from
-`pkcs11-scope/observed-profile/v1-metrics` to
-`pkcs11-scope/observed-profile/v1.1-metrics`; consumers dispatch on the exact
+Profile advances from `p11scope/observed-profile/v1.3` to
+`p11scope/observed-profile/v1.4`. Metrics advances from
+`p11scope/observed-profile/v1-metrics` to
+`p11scope/observed-profile/v1.1-metrics`; consumers dispatch on the exact
 schema string.
 
 The v1.4 profile representation is explicit:

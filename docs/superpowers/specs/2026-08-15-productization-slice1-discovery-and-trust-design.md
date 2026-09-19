@@ -13,7 +13,7 @@ approved for planning; Slice 1b pending reviewer confirmation of the third pass
 `docs/superpowers/plans/2026-08-13-manifest-provenance.md` (the lease/provenance/hardened
 lane is removed by this design), the discovery/attach parts of
 `2026-08-12-v0.1-corrective-release-design.md`, and the "Architecture" section of
-`2026-08-10-pkcs11-scope-design.md`. The privacy model
+`2026-08-10-p11scope-design.md`. The privacy model
 (`2026-08-13-safe-and-unvalidated-metadata-design.md`) is unchanged by this slice; its
 extension (safe params) is slice 2.
 **Follow-on slices:** 2 = capture quality (ring/epoll, budgets, safe params, per-module
@@ -65,7 +65,7 @@ cgroup-freezer pause, manifest catalog tooling.
 | Old authorization lane | removed now (leases, provenance rediscovery, hardened oracle, glibc staging, supervisor fork, `--provenance-module`, `--trusted-workload`, helper ownership rules, `suid_dumpable`, `/run/p11scope`, exit 78) — restorable from git; commit message says so |
 | Kernel | upstream 5.15 feature baseline; runtime probes authoritative; newer features (uprobe_multi 6.6, bounded-spin pause) feature-probed later, never required |
 | CI | GitHub Actions: unprivileged checks on every push + `sudo` BPF e2e job on `ubuntu-24.04`; root gates also runnable locally by one command; text-grep contract tests deleted with the lane |
-| Schema | `pkcs11-scope/observed-profile/v2` (nothing published yet) |
+| Schema | `p11scope/observed-profile/v2` (nothing published yet) |
 | Slicing | one spec (this), two plans: **1a** trust simplification, **1b** discovery engine + commands |
 
 ## 3. Architecture
@@ -397,7 +397,7 @@ Additions to the evidence object (both profile and metrics documents; trace `EVI
 
 `functions[]` items gain `module: {dev, ino, sha256}` (the stable module identity; `path`
 lives in `discovery[]`). `capture.module` becomes `capture.modules[]`.
-Schema ids: `pkcs11-scope/observed-profile/v2` and `pkcs11-scope/observed-profile/v2-metrics`.
+Schema ids: `p11scope/observed-profile/v2` and `p11scope/observed-profile/v2-metrics`.
 `docs/schema/observed-profile-v1.md` → `-v2.md` with a migration section; v1.4 → v2 is a
 breaking rename of `capture.module` and the evidence additions; the removed evidence fields
 are those tied to the deleted lane (none of the capture-quality counters change).

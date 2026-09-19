@@ -3,8 +3,8 @@
 
 Current exact schema identifiers:
 
-- profile: `pkcs11-scope/observed-profile/v3`
-- metrics: `pkcs11-scope/observed-profile/v3-metrics`
+- profile: `p11scope/observed-profile/v3`
+- metrics: `p11scope/observed-profile/v3-metrics`
 
 Schema identifiers are opaque dispatch keys. A v3 profile is not accepted as
 v2, and the historical v2-metrics document is not accepted as a v3
@@ -127,11 +127,11 @@ documents retain their old closed key set and do not contain the new counter.
 ## Migration
 
 Consumers must migrate live profile dispatch from
-`pkcs11-scope/observed-profile/v2` to
-`pkcs11-scope/observed-profile/v3` and validate the closed shapes, bounds,
+`p11scope/observed-profile/v2` to
+`p11scope/observed-profile/v3` and validate the closed shapes, bounds,
 enums, ordering, references, and result/authority relations above. Historical
 v2 profiles remain historical. Metrics consumers must dispatch live output on
-`pkcs11-scope/observed-profile/v3-metrics`; historical
-`pkcs11-scope/observed-profile/v2-metrics` documents remain readable as a
+`p11scope/observed-profile/v3-metrics`; historical
+`p11scope/observed-profile/v2-metrics` documents remain readable as a
 separate compatibility shape and contain neither `task_uprobe_link_losses`
 nor `abi_refusals`.

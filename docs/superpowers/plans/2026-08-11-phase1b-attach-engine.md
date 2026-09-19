@@ -1284,7 +1284,7 @@ pub fn json(
         })
         .collect();
     serde_json::json!({
-        "schema": "pkcs11-scope/observed-profile/v0-metrics",
+        "schema": "p11scope/observed-profile/v0-metrics",
         "capture": { "start": started, "end": ended, "mode": "metrics",
                      "kernel": kernel, "module": module },
         "evidence": ev,

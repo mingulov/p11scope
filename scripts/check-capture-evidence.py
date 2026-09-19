@@ -62,7 +62,7 @@ COUNTERS = (
 # v2-metrics is retained only for historical fixtures and compatibility reads;
 # it predates the task-uprobe link-loss, ABI-refusal, and semantic-history-drop
 # evidence added to v3.
-HISTORICAL_METRICS_SCHEMA = "pkcs11-scope/observed-profile/v2-metrics"
+HISTORICAL_METRICS_SCHEMA = "p11scope/observed-profile/v2-metrics"
 HISTORICAL_COUNTERS = tuple(
     counter for counter in COUNTERS
     if counter not in {"abi_refusals", "task_uprobe_link_losses", "semantic_history_drops"}
@@ -109,8 +109,8 @@ COMPARABLE_CORROBORATION = {"agreed", "conflict"}
 U64_MAX = (1 << 64) - 1
 U32_MAX = (1 << 32) - 1
 U16_MAX = (1 << 16) - 1
-PROFILE_SCHEMA = "pkcs11-scope/observed-profile/v3"
-METRICS_SCHEMA = "pkcs11-scope/observed-profile/v3-metrics"
+PROFILE_SCHEMA = "p11scope/observed-profile/v3"
+METRICS_SCHEMA = "p11scope/observed-profile/v3-metrics"
 SELECTION_KEYS = {
     "providers", "standard_exports", "inventory_surfaces", "tuples",
     "selection_truncated",
@@ -2190,7 +2190,7 @@ def self_test():
         lambda d: d["evidence"]["discovery"][0]["objects"][0].update(build_id="a"),
         lambda d: d["evidence"]["discovery"][0]["objects"][0].pop("build_id"),
         lambda d: d["capture"]["modules"][0].update(build_id="AABB"),
-        lambda d: d.update(schema="pkcs11-scope/observed-profile/v2"),
+        lambda d: d.update(schema="p11scope/observed-profile/v2"),
         lambda d: d["capture"].update(mode="profile"),
         lambda d: d["capture"].update(privacy_mode="allowlisted"),
     ):
@@ -2489,7 +2489,7 @@ def self_test():
     for mutate in (
         lambda d: d["evidence"].pop("interface_selection"),
         lambda d: d["evidence"].update(attach_mechanisms=["secret-canary"]),
-        lambda d: d.update(schema="pkcs11-scope/observed-profile/v2"),
+        lambda d: d.update(schema="p11scope/observed-profile/v2"),
     ):
         bad = copy.deepcopy(safe)
         mutate(bad)

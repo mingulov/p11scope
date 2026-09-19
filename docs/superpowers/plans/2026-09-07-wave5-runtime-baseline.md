@@ -54,7 +54,7 @@ Kubernetes, Knative, SoftHSM2 and p11-kit.
 umask 077
 campaign_root=$(mktemp -d /tmp/p11scope-release-local-XXXXXX)
 git clone --no-hardlinks --single-branch --branch hardening/release-local \
-  /home/user/src/m/pkcs11-scope "$campaign_root/source"
+  /home/user/src/m/p11scope "$campaign_root/source"
 git -C "$campaign_root/source" status --porcelain
 git -C "$campaign_root/source" rev-parse HEAD 'HEAD^{tree}'
 uname -r

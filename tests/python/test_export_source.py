@@ -256,7 +256,7 @@ class ExportSourceTests(unittest.TestCase):
         extracted.mkdir()
         unpacked = extract_archive(archive, extracted)
         self.assertEqual(unpacked.returncode, 0, unpacked.stderr)
-        return extracted / "pkcs11-scope-source"
+        return extracted / "p11scope-source"
 
     @staticmethod
     def update_source_row(source: Path, relative: str):
@@ -321,14 +321,14 @@ class ExportSourceTests(unittest.TestCase):
         self.assertFalse(any(name.endswith("/ignored.out") for name in names))
         self.assertFalse(any("/third-party/src/" in f"/{name}/" for name in names))
         roots = {name.split("/", 1)[0] for name in names}
-        self.assertEqual(roots, {"pkcs11-scope-source"})
+        self.assertEqual(roots, {"p11scope-source"})
         revision = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=fixture.root, env=fixture.git_env,
             text=True, check=True, stdout=subprocess.PIPE,
         ).stdout.strip()
         shutil.rmtree(fixture.root)
         shutil.rmtree(fixture.archives)
-        source = extracted / "pkcs11-scope-source"
+        source = extracted / "p11scope-source"
         self.assertEqual((source / "README.md").read_text(), "committed source\n")
         self.assertTrue((source / "CLAUDE.md").is_symlink())
         self.assertEqual(os.readlink(source / "CLAUDE.md"), "AGENTS.md")
@@ -336,7 +336,7 @@ class ExportSourceTests(unittest.TestCase):
         self.assertTrue((source / "docs/GUIDE.md").is_symlink())
         self.assertEqual(os.readlink(source / "docs/GUIDE.md"), "../AGENTS.md")
         self.assertEqual((source / "docs/GUIDE.md").read_text(), "repository instructions\n")
-        ordinary_source = ordinary / "pkcs11-scope-source"
+        ordinary_source = ordinary / "p11scope-source"
         self.assertEqual(os.readlink(ordinary_source / "NORMALIZED.md"),
                          "docs/../README.md")
         self.assertEqual((ordinary_source / "NORMALIZED.md").read_text(), "committed source\n")
@@ -551,13 +551,13 @@ class ExportSourceTests(unittest.TestCase):
         extracted = self.base / "relocated export with spaces"
         with tarfile.open(first, "r:gz") as archive:
             self.assertEqual(
-                archive.getmember("pkcs11-scope-source/third-party/offline").mode,
+                archive.getmember("p11scope-source/third-party/offline").mode,
                 0o755,
             )
         extracted.mkdir()
         unpacked = extract_archive(first, extracted)
         self.assertEqual(unpacked.returncode, 0, unpacked.stderr)
-        source = extracted / "pkcs11-scope-source"
+        source = extracted / "p11scope-source"
         manifest = json.loads((source / EXPORT_MANIFEST).read_text())
         self.assertEqual(set(manifest), {
             "schema_version", "revision", "source_entries", "archives",
@@ -814,7 +814,7 @@ class ExportSourceTests(unittest.TestCase):
         pristine.mkdir()
         unpacked = extract_archive(archive, pristine)
         self.assertEqual(unpacked.returncode, 0, unpacked.stderr)
-        pristine_source = pristine / "pkcs11-scope-source"
+        pristine_source = pristine / "p11scope-source"
         cargo_home = self.base / "validator cargo home"
         cargo_home.mkdir(mode=0o700)
         mutations = (
@@ -848,7 +848,7 @@ class ExportSourceTests(unittest.TestCase):
         extracted.mkdir()
         unpacked = extract_archive(archive, extracted)
         self.assertEqual(unpacked.returncode, 0, unpacked.stderr)
-        source = extracted / "pkcs11-scope-source"
+        source = extracted / "p11scope-source"
         cargo_home = self.base / "custody cargo home"
         cargo_home.mkdir(mode=0o700)
 

@@ -1,5 +1,5 @@
 name = "p11scope_implementer"
-description = "Implementation worker for one bounded pkcs11-scope patch with explicit file ownership."
+description = "Implementation worker for one bounded p11scope patch with explicit file ownership."
 # Select model and effort explicitly at spawn; do not pin them here.
 sandbox_mode = "workspace-write"
 developer_instructions = """

@@ -60,7 +60,7 @@ or procfs/mmap/eBPF fallback behavior.
 
 ## Global Constraints
 
-- Work only in `/home/user/src/m/pkcs11-scope/.claude/worktrees/slice1b2-finish`.
+- Work only in `/home/user/src/m/p11scope/.claude/worktrees/slice1b2-finish`.
 - Preserve unrelated tracked edits, `.codex/`, `docs/privacy/allowlist-v1.md`, historical r2 evidence, and generated-output boundaries.
 - Do not update the public README status until the later Task 10 closeout and exact-tip CI evidence.
 - Do not touch production Rust, BPF, privacy policy, schema, or allowlist files during the gate round.

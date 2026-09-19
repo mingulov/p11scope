@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Stand-in for a seccomp-hardened process hosting a PKCS#11 provider.
  *
  * Linux 6.11 moved uretprobes to a syscall-based trampoline: when a probed

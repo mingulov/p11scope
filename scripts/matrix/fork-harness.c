@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* scripts/matrix/fork-harness.c — prefork-server-shape workload for Phase 4
  * Task 8 (fork scoping). Loads the module, then forks N children BEFORE any
  * PKCS#11 call is made by anyone (parent included) — the whole point is that

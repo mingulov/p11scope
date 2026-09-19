@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Two real provider objects nest both export acquisition ABIs on one thread.
  * Build twice as a DSO with PROVIDER_ID=1/2, and once with NESTING_DRIVER.
  * All values are fixture constants; table layout follows the compiler's ABI.

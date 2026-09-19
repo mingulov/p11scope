@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Test-only single-task task-storage seed fixture: creates the isolated three
  * map surface the unchanged reader dumps. It loads the existing iterator object
  * with every program's autoload disabled, so no program, link, attachment or

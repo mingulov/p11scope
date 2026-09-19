@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # SDD Ledger — system-scale capture (feat/system-scale)
 
 Plan: docs/superpowers/plans/2026-09-19-system-scale.md

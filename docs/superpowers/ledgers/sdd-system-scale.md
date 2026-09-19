@@ -126,3 +126,27 @@ Build env: TMPDIR=/var/tmp/p11scope-ws-tmp cargo +1.88 --locked --offline.
   trip for a same-path variant assertion buys no behavior risk reduction.
   Cost if wrong: a tie-order regression slips past tests; mitigated by
   the existing per-table admission-map assertion (tables 0,1,2+63).
+- 1.2 merged-tree gate #1: lib 1074/1 failed in
+  system_scope_refresh_admits_later_generation_in_same_engine
+  (`session.attached_slots` did not grow; earlier asserts incl. slots_b
+  all passed). Isolation re-run GREEN 1.05s; failing run's stdout shows
+  OS-level EPERM + truncated /proc maps snapshots under 3 parallel
+  suites. Recorded as contention flake (3.3 precedent); full-suite
+  re-run folded into the post-fixture combined gate instead of a
+  standalone re-run. Cost if wrong: a real refresh-path regression
+  hides until the next full gate; mitigated by the combined gate + the
+  test's pre-existing coverage on all three branches.
+- Task 1.4 fixture: complete (3d1f355, merged 85c0f9e, inline review
+  clean). 5 new-only files: multi-wrapper provider/backend/workload C
+  fixtures + 10-test workload oracle (exact log==oracle bytes, nesting
+  1:1, pinned goldens) + README with per-task consumption map. Worker
+  gate: fmt clean, oracle 10/10, lib green on its base; lifecycle
+  serially green (parallel-only timeouts). SPDX headers verified on all
+  5 files; no existing file touched.
+- Ruling: killed merged-tree gate #2 (1.2-only tree) after the fixture
+  merge and reaped its orphaned cargo child, folding validation into one
+  combined gate on the 1.2+fixture tree — fixture is new-only so any lib
+  failure there still attributes to the 1.2 tree. pkill used a broad
+  pattern; verified no worker cargo process was alive at kill time (only
+  my gate). Cost if wrong: a worker gate died silently and re-runs;
+  use PID-targeted kills next time.

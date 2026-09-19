@@ -3847,7 +3847,8 @@ fn capture_evidence_checker_self_test() {
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 checker output");
     for marker in [
         "unexpected positive function rejected: OK",
-        "bootstrap function exact count required: OK",
+        "scan-only ordinal label rejected: OK",
+        "scan-only total exact count required: OK",
         "clean metrics multiplier is exact: OK",
         "clean metrics discovery source is exact in all three lanes: OK",
         "lane13 manifest-only shared overlay is exact: OK",

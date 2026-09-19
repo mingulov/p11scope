@@ -70,6 +70,10 @@ impl Tracker {
     /// One private consumer context owns one retained EVENTS map. Its domain
     /// is supplied by that context; it grants historical semantics only.
     pub(crate) fn for_producer(domain: crate::events::EventsDomain, limit: usize) -> Self {
+        // Every return/entry link pair burns fds against RLIMIT_NOFILE, and
+        // the capture path never ran through Tracker::new, so raise here:
+        // a 1024 soft limit dies near slot 256 otherwise.
+        let _ = raise_nofile();
         let mut tracker = Self::with_limits(0, 0);
         tracker.history = crate::history::Registry::new(domain, limit);
         tracker
@@ -1030,6 +1034,32 @@ mod tests {
         assert!(fallback.probe_signal_authority().is_err());
         assert_eq!(fallback.pidfd().unwrap_err().kind(), io::ErrorKind::Other);
         assert!(fallback.send_signal(0).is_err());
+    }
+
+    #[test]
+    fn nofile_raise_is_monotonic_and_reports_a_usable_budget() {
+        fn soft_limit() -> libc::rlim_t {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: same valid-pointer pattern as raise_nofile.
+            assert_eq!(
+                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+                0
+            );
+            limit.rlim_cur
+        }
+        let before = soft_limit();
+        let budget = raise_nofile().expect("raise reports a budget");
+        assert!(
+            soft_limit() >= before,
+            "raise must never shrink the soft limit"
+        );
+        assert!(
+            budget >= RESERVED_FDS,
+            "budget must cover reserved fds: {budget}"
+        );
     }
 
     #[test]

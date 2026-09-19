@@ -30,6 +30,7 @@ use p11scope_manifest::elf::ElfAbi;
 use pkcs11_types::mechanism_registry::MechanismRegistry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
+use std::io;
 use std::mem::size_of_val;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd};
@@ -1222,6 +1223,17 @@ fn slot_attach_point(slot: &Slot) -> UProbeAttachPoint<'static> {
     }
 }
 
+/// True when the attach error chain bottoms out at EMFILE: the fd table is
+/// full, so every further link would fail identically.
+fn is_fd_exhaustion(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<io::Error>(),
+            Some(io) if io.raw_os_error() == Some(libc::EMFILE)
+        )
+    })
+}
+
 fn attach_targets_with(
     slots: &[Slot],
     policy: CapturePolicy,
@@ -1240,6 +1252,19 @@ fn attach_targets_with(
     let mut failures = Vec::new();
     let mut completed = Vec::new();
     let mut return_attached = BTreeSet::new();
+    // EMFILE ends the run with one summary: links are retained, so no later
+    // slot could succeed once the table is full.
+    let exhausted = |slot: &Slot, successful: &BTreeSet<(u32, ProbeSide)>| {
+        (
+            slot.index,
+            format!(
+                "fd table exhausted attaching slot {} ({} links attached); \
+                 raise RLIMIT_NOFILE (ulimit -n) and retry",
+                slot.index,
+                successful.len()
+            ),
+        )
+    };
     for (slot, _) in &targets {
         match attach("p11_return", slot, slot_attach_point(slot)) {
             Ok(()) => {
@@ -1249,7 +1274,17 @@ fn attach_targets_with(
                 );
                 return_attached.insert(slot.index);
             }
-            Err(error) => failures.push((slot.index, format!("{error:#}"))),
+            Err(error) => {
+                if is_fd_exhaustion(&error) {
+                    failures.push(exhausted(slot, &successful));
+                    return Ok(AttachOutcome {
+                        successful,
+                        failures,
+                        completed,
+                    });
+                }
+                failures.push((slot.index, format!("{error:#}")));
+            }
         }
     }
 
@@ -1279,7 +1314,17 @@ fn attach_targets_with(
                     );
                     completed.push((slot.index, completed_at(slot)));
                 }
-                Err(error) => failures.push((slot.index, format!("{error:#}"))),
+                Err(error) => {
+                    if is_fd_exhaustion(&error) {
+                        failures.push(exhausted(slot, &successful));
+                        return Ok(AttachOutcome {
+                            successful,
+                            failures,
+                            completed,
+                        });
+                    }
+                    failures.push((slot.index, format!("{error:#}")));
+                }
             }
         }
     }
@@ -3975,6 +4020,44 @@ mod tests {
                 [("p11_return", 0), ("p11_return", 1), (expected_entry, 1),]
             );
         }
+    }
+
+    #[test]
+    fn fd_exhaustion_stops_further_attach_with_one_summary() {
+        let slots = [test_slot(0), test_slot(1), test_slot(2)];
+        let mut attempted = Vec::new();
+        let outcome = attach_targets_with(
+            &slots,
+            CapturePolicy::Allowlisted,
+            false,
+            |_| Ok(ElfAbi::Lp64),
+            |program, slot, _| {
+                attempted.push((program, slot.index));
+                if slot.index == 1 {
+                    let exhausted = std::io::Error::from_raw_os_error(libc::EMFILE);
+                    return Err(anyhow::Error::new(exhausted).context("bpf_link_create failed"));
+                }
+                Ok(())
+            },
+            |_| Some(10),
+        )
+        .unwrap();
+
+        assert_eq!(attempted, [("p11_return", 0), ("p11_return", 1)]);
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(outcome.failures[0].0, 1);
+        assert!(
+            outcome.failures[0]
+                .1
+                .contains("fd table exhausted attaching slot 1"),
+            "unexpected summary: {}",
+            outcome.failures[0].1
+        );
+        assert!(
+            outcome.failures[0].1.contains("ulimit -n"),
+            "summary must name the remedy: {}",
+            outcome.failures[0].1
+        );
     }
 
     #[test]

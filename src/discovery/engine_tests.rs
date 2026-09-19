@@ -16751,3 +16751,538 @@ fn under_cap_order_unchanged() {
     assert_eq!(select_deep_scan_candidates(&sweep, 2), vec![7, 9001]);
     assert_eq!(select_deep_scan_candidates(&sweep, 256), vec![7, 9001]);
 }
+
+/// Task 3 (F3) helpers: the same C-fixture bodies as `tests/system_scope.rs`
+/// (`build_fixture`, `build_driver`, `spawn_loaded`), duplicated here
+/// because a `--lib` unit test cannot import `tests/support`. Two owned
+/// children load distinct `.so` files, so each provider keeps its own
+/// identity and slots.
+fn system_scope_build_fixture(dir: &Path, name: &str) -> PathBuf {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("crates/discover/tests/fixture/version_matrix.c");
+    let library = dir.join(format!("{name}.so"));
+    assert!(
+        std::process::Command::new("gcc")
+            .args(["-shared", "-fPIC", "-DMATRIX_INTERFACES=0", "-o"])
+            .arg(&library)
+            .arg(source)
+            .status()
+            .unwrap()
+            .success()
+    );
+    library
+}
+
+fn system_scope_build_driver(dir: &Path) -> PathBuf {
+    let driver = dir.join("driver");
+    assert!(
+        std::process::Command::new("gcc")
+            .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-o"])
+            .arg(&driver)
+            .arg(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/live-discovery-driver.c")
+            )
+            .args(["-ldl", "-pthread"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    driver
+}
+
+/// A native child with one provider dlopened, held until the guard drops.
+/// `reap` kills and blocks in `wait`: the returned status — never PID
+/// disappearance alone — proves this owned generation ended.
+struct SystemScopeChildGuard {
+    child: std::process::Child,
+    live: bool,
+}
+
+impl SystemScopeChildGuard {
+    fn new(child: std::process::Child) -> Self {
+        Self { child, live: true }
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn reap(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let _ = self.child.kill();
+        let status = self.child.wait()?;
+        self.live = false;
+        Ok(status)
+    }
+}
+
+impl Drop for SystemScopeChildGuard {
+    fn drop(&mut self) {
+        if self.live {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+fn system_scope_poll_fd(fd: i32, timeout: std::time::Duration) -> std::io::Result<bool> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let timeout_ms = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: pollfd names one initialized descriptor for this process.
+        let result = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+        if result > 0 {
+            return Ok(true);
+        }
+        if result == 0 {
+            return Ok(false);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+    }
+}
+
+fn system_scope_spawn_loaded(driver: &Path, provider: &Path) -> SystemScopeChildGuard {
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd as _;
+    let mut child = SystemScopeChildGuard::new(
+        std::process::Command::new(driver)
+            .arg("dlopen")
+            .arg(provider)
+            .env_clear()
+            .env("P11SCOPE_FIXTURE_INTERFACES", "0")
+            .env("P11SCOPE_FIXTURE_POST_GATE", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut stderr = child.child.stderr.take().unwrap();
+    let mut readiness = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !readiness.ends_with(b"P11SCOPE_FIXTURE driver done\n") {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(!remaining.is_zero() && readiness.len() < 4096);
+        assert!(system_scope_poll_fd(stderr.as_raw_fd(), remaining).unwrap());
+        let mut byte = [0];
+        assert_eq!(
+            stderr.read(&mut byte).unwrap(),
+            1,
+            "fixture exited before ready"
+        );
+        readiness.extend_from_slice(&byte);
+    }
+    child
+}
+
+fn system_args(hints: Vec<PathBuf>, max_scan_pids: Option<usize>) -> CaptureArgs {
+    CaptureArgs {
+        kind: crate::cli::Kind::Profile,
+        modules: hints,
+        manifests: vec![],
+        hooks: HookRegistry::builtin(),
+        scope: crate::cli::ScopeArg::System,
+        metrics: false,
+        duration: None,
+        out: None,
+        max_events: None,
+        max_scan_pids,
+        ring_bytes: None,
+        drain_interval: None,
+        unsafe_requested: false,
+        allow_confined_uretprobe: false,
+    }
+}
+
+/// Slots solely attributed to the plan module with this path suffix, as
+/// stable `(path, offset, names)` keys. The module ID is re-resolved by
+/// path on every call because a plan rebuild may reassign IDs; the keys
+/// themselves survive rebuilds, so tick-to-tick comparison is exact.
+fn system_scope_slots_for(
+    engine: &Engine,
+    provider_suffix: &str,
+) -> Vec<(String, u64, Vec<String>)> {
+    let module_id = engine
+        .plan()
+        .modules
+        .iter()
+        .find(|module| module.path.ends_with(provider_suffix))
+        .unwrap_or_else(|| panic!("the plan names {provider_suffix}"))
+        .id;
+    let mut slots: Vec<(String, u64, Vec<String>)> = engine
+        .plan()
+        .slots
+        .iter()
+        .filter(|slot| slot.module_ids.as_slice() == [module_id])
+        .map(|slot| {
+            (
+                slot.object_path.clone(),
+                slot.file_offset,
+                slot.names.clone(),
+            )
+        })
+        .collect();
+    slots.sort();
+    slots
+}
+
+fn system_scope_live_process_count() -> usize {
+    std::fs::read_dir("/proc")
+        .expect("enumerate /proc for the under-cap ceiling")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry.file_name().to_str().is_some_and(|name| {
+                !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        })
+        .count()
+}
+
+/// Task 3 (F3): one system-scope engine admits a later process generation
+/// on refresh. Child A is discovered by the single `Engine::discover`
+/// pass; child B spawns afterward and must enter the SAME engine through
+/// the real `refresh_inventory` reconciliation — a new view ID, its own
+/// provider/slot attribution, pinned claims, and a requested attachment —
+/// while A keeps its view ID and ownership and the capture-wide budget
+/// never resets. A quiet tick then holds every ID and slot steady, and
+/// reaping B through its owned guard retires B while A remains.
+#[test]
+fn system_scope_refresh_admits_later_generation_in_same_engine() {
+    let dir = tempfile::tempdir().expect("a fixture directory");
+    let first = system_scope_build_fixture(dir.path(), "refresh-first");
+    let second = system_scope_build_fixture(dir.path(), "refresh-second");
+    let driver = system_scope_build_driver(dir.path());
+    // Under-cap ceiling with headroom: selection is the identity, so the
+    // one discover pass admits every live process and the refresh still
+    // has view-ID room for the later child.
+    let cap = system_scope_live_process_count() + 256;
+
+    let child_a = system_scope_spawn_loaded(&driver, &first);
+    let pid_a = child_a.pid();
+    let mut engine = Engine::discover(
+        &system_args(vec![first.clone(), second.clone()], Some(cap)),
+        &Scope::System,
+        None,
+    )
+    .expect("system scope discovers the first child");
+
+    let views_a: Vec<_> = engine
+        .views
+        .iter()
+        .filter(|view| view.pid() == pid_a)
+        .collect();
+    assert_eq!(views_a.len(), 1, "the first child is admitted exactly once");
+    let id_a = views_a[0].id();
+    assert!(
+        views_a[0].still_the_same(),
+        "the first child's retained generation is current"
+    );
+    let scan_a = engine
+        .scan_inputs
+        .get(&id_a)
+        .expect("the first child's scan input is retained");
+    assert!(
+        scan_a
+            .modules
+            .iter()
+            .any(|module| module.path.ends_with("refresh-first.so")),
+        "the first child's scan names its provider: {:?}",
+        scan_a
+            .modules
+            .iter()
+            .map(|module| &module.path)
+            .collect::<Vec<_>>()
+    );
+    let claims_a = engine
+        .pinned()
+        .view_claims(id_a)
+        .expect("the first child owns pinned claims");
+    assert!(
+        !claims_a.pins.is_empty(),
+        "the first child's claims pin objects"
+    );
+    assert!(
+        engine.modules.iter().any(|module| {
+            module.scanned.view == id_a && module.scanned.path.ends_with("refresh-first.so")
+        }),
+        "the first child's provider is attributed to its view"
+    );
+    let module_a_id = engine
+        .plan()
+        .modules
+        .iter()
+        .find(|module| module.path.ends_with("refresh-first.so"))
+        .expect("the plan names the first child's provider")
+        .id;
+    let slots_a = system_scope_slots_for(&engine, "refresh-first.so");
+    assert!(
+        !slots_a.is_empty(),
+        "the first child's provider contributes attachable slots"
+    );
+    assert!(
+        engine
+            .plan()
+            .modules
+            .iter()
+            .all(|module| !module.path.ends_with("refresh-second.so")),
+        "nothing maps the second provider before the later child spawns"
+    );
+    let budget_before = engine.budget.attempted_io_bytes();
+
+    // The later child spawns after the one discover pass; the same engine
+    // must pick it up through real reconciliation, copying the exact
+    // `refresh_inventory_once` argument pattern with a retained session.
+    let mut child_b = system_scope_spawn_loaded(&driver, &second);
+    let pid_b = child_b.pid();
+    let mut session = ScriptedSession::with_records([], 0);
+    let attached_before = session.attached_slots.len();
+    // A foreign provider-mapping process that exits mid-preflight makes
+    // this tick report `Ok` without admitting anything (generation-stale
+    // preflight), so retry for the agreeing tick like the capped-selection
+    // sibling does. A deterministically broken admission never agrees and
+    // still fails the assertions below.
+    for _ in 0..25 {
+        let mut collect: Box<DiscoveryCollector<'_>> = Box::new(Engine::collect_discovery_records);
+        engine
+            .refresh_inventory(
+                &mut session,
+                &mut true,
+                &mut Vec::new(),
+                &mut PendingViewRetirements::new(),
+                &mut *collect,
+                &mut PauseClosure::new(true),
+            )
+            .expect("the refresh tick applies");
+        if engine.views.iter().any(|view| view.pid() == pid_b) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let views_a: Vec<_> = engine
+        .views
+        .iter()
+        .filter(|view| view.pid() == pid_a)
+        .collect();
+    assert_eq!(
+        views_a.len(),
+        1,
+        "the refresh retires nothing of the first child"
+    );
+    assert_eq!(
+        views_a[0].id(),
+        id_a,
+        "the first child retains its original view ID"
+    );
+    assert!(
+        views_a[0].still_the_same(),
+        "the first child's retained generation is still current"
+    );
+    assert!(
+        engine.scan_inputs.get(&id_a).is_some_and(|scan| {
+            scan.modules
+                .iter()
+                .any(|module| module.path.ends_with("refresh-first.so"))
+        }),
+        "the first child's scan input survives the refresh"
+    );
+    assert!(
+        engine
+            .pinned()
+            .view_claims(id_a)
+            .is_some_and(|claims| !claims.pins.is_empty()),
+        "the first child retains its ownership and pinned claims"
+    );
+    assert_eq!(
+        system_scope_slots_for(&engine, "refresh-first.so"),
+        slots_a,
+        "the refresh keeps the first child's attributed slots"
+    );
+    let views_b: Vec<_> = engine
+        .views
+        .iter()
+        .filter(|view| view.pid() == pid_b)
+        .collect();
+    assert_eq!(
+        views_b.len(),
+        1,
+        "the refresh admits exactly one view for the later child"
+    );
+    let id_b = views_b[0].id();
+    assert_ne!(
+        id_b, id_a,
+        "the later child gets a distinct view ID, not the first child's"
+    );
+    assert!(
+        views_b[0].still_the_same(),
+        "the later child's retained generation is current"
+    );
+    assert!(
+        engine.modules.iter().any(|module| {
+            module.scanned.view == id_b && module.scanned.path.ends_with("refresh-second.so")
+        }),
+        "the later child's provider is attributed to its own view"
+    );
+    let claims_b = engine
+        .pinned()
+        .view_claims(id_b)
+        .expect("the later child owns pinned claims");
+    assert!(
+        !claims_b.pins.is_empty(),
+        "the later child's claims pin objects"
+    );
+    let module_b_id = engine
+        .plan()
+        .modules
+        .iter()
+        .find(|module| module.path.ends_with("refresh-second.so"))
+        .expect("the plan names the later child's provider")
+        .id;
+    assert_ne!(
+        module_b_id, module_a_id,
+        "each provider keeps its own plan identity"
+    );
+    let slots_b = system_scope_slots_for(&engine, "refresh-second.so");
+    assert!(
+        !slots_b.is_empty(),
+        "the later child's provider contributes its own attachable slots"
+    );
+    assert!(
+        session.attached_slots.len() > attached_before,
+        "admitting the later generation requests attachment: {:?}",
+        session.attached_slots
+    );
+    let budget_after = engine.budget.attempted_io_bytes();
+    assert!(
+        budget_after >= budget_before,
+        "capture-wide attempted I/O is monotonic across the refresh: {budget_before} -> {budget_after}"
+    );
+
+    // A quiet tick: no child changed, so every view ID and every
+    // attributed slot holds steady and the later child is not attached
+    // a second time.
+    let mut collect: Box<DiscoveryCollector<'_>> = Box::new(Engine::collect_discovery_records);
+    engine
+        .refresh_inventory(
+            &mut session,
+            &mut true,
+            &mut Vec::new(),
+            &mut PendingViewRetirements::new(),
+            &mut *collect,
+            &mut PauseClosure::new(true),
+        )
+        .expect("a quiet refresh tick applies");
+    let views_a: Vec<_> = engine
+        .views
+        .iter()
+        .filter(|view| view.pid() == pid_a)
+        .collect();
+    assert_eq!(views_a.len(), 1, "the quiet tick keeps the first child");
+    assert_eq!(
+        views_a[0].id(),
+        id_a,
+        "the quiet tick holds the first child's view ID steady"
+    );
+    let views_b: Vec<_> = engine
+        .views
+        .iter()
+        .filter(|view| view.pid() == pid_b)
+        .collect();
+    assert_eq!(views_b.len(), 1, "the quiet tick keeps the later child");
+    assert_eq!(
+        views_b[0].id(),
+        id_b,
+        "the quiet tick holds the later child's view ID steady"
+    );
+    assert_eq!(
+        system_scope_slots_for(&engine, "refresh-second.so"),
+        slots_b,
+        "the quiet tick attaches no duplicate later-child slot"
+    );
+    assert_eq!(
+        system_scope_slots_for(&engine, "refresh-first.so"),
+        slots_a,
+        "the quiet tick keeps the first child's attributed slots"
+    );
+
+    // Reap the later child through its owned guard — `wait` proves the
+    // owned generation ended — then the next refresh retires B while A
+    // remains fully intact.
+    let status_b = child_b
+        .reap()
+        .expect("reap the later child through its owned guard");
+    assert!(
+        !status_b.success(),
+        "the owned later generation ended by signal, not by silent exit: {status_b:?}"
+    );
+    // Same transient-preflight retry as the admission tick: repeat the
+    // refresh until the reaped generation's view is gone.
+    for _ in 0..25 {
+        let mut collect: Box<DiscoveryCollector<'_>> = Box::new(Engine::collect_discovery_records);
+        engine
+            .refresh_inventory(
+                &mut session,
+                &mut true,
+                &mut Vec::new(),
+                &mut PendingViewRetirements::new(),
+                &mut *collect,
+                &mut PauseClosure::new(true),
+            )
+            .expect("the refresh after the owned reap applies");
+        if engine.views.iter().all(|view| view.id() != id_b) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        engine.views.iter().all(|view| view.id() != id_b),
+        "the reaped generation's view is retired, not retained"
+    );
+    let views_a: Vec<_> = engine
+        .views
+        .iter()
+        .filter(|view| view.pid() == pid_a)
+        .collect();
+    assert_eq!(views_a.len(), 1, "the first child remains after the reap");
+    assert_eq!(
+        views_a[0].id(),
+        id_a,
+        "the first child keeps its view ID after the reap"
+    );
+    assert!(
+        views_a[0].still_the_same(),
+        "the first child's generation is still current after the reap"
+    );
+    assert!(
+        engine.scan_inputs.get(&id_a).is_some_and(|scan| {
+            scan.modules
+                .iter()
+                .any(|module| module.path.ends_with("refresh-first.so"))
+        }),
+        "the first child's scan input remains after the reap"
+    );
+    assert!(
+        engine
+            .pinned()
+            .view_claims(id_a)
+            .is_some_and(|claims| !claims.pins.is_empty()),
+        "the first child keeps its ownership and pinned claims after the reap"
+    );
+    assert_eq!(
+        system_scope_slots_for(&engine, "refresh-first.so"),
+        slots_a,
+        "the first child's attributed slots remain after the reap"
+    );
+}

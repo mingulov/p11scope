@@ -170,11 +170,14 @@ fn system_scope_is_one_of_three_and_mutually_exclusive() {
     ));
 }
 
-/// Two children loading distinct providers are both discovered and
-/// attributed to their own modules; a child spawned after the first pass is
-/// picked up by the next sweep. No cgroup path is involved anywhere.
+/// Two independent engines snapshot the machine: the first sees only the
+/// first child, and a second engine constructed after the later child
+/// starts sees both providers. Same-engine refresh coverage lives in
+/// `system_scope_refresh_admits_later_generation_in_same_engine`; this
+/// test keeps the provider-module smoke assertions for separate snapshots.
+/// No cgroup path is involved anywhere.
 #[test]
-fn system_scope_observes_two_processes_and_picks_up_a_new_child() {
+fn system_scope_separate_snapshots_discover_later_process() {
     let dir = tmp(&format!("system-scope-two-proc-{}", std::process::id()));
     let first = build_fixture(&dir, "system-first");
     let second = build_fixture(&dir, "system-second");

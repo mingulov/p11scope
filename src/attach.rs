@@ -1687,6 +1687,10 @@ impl Session {
         ring_bytes: Option<u32>,
         owned_child: Option<&OwnedChild>,
     ) -> Result<Self> {
+        // Raise before the first link: every return/entry pair burns fds
+        // against RLIMIT_NOFILE, and no tracker (the previous raise site)
+        // exists yet at attach time. A 1024 soft limit dies near slot 256.
+        let _ = crate::process::raise_nofile();
         let pause_key = pause_key_for(scope, pause_generation.as_ref())?;
         if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
             bail!(

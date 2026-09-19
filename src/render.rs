@@ -994,7 +994,7 @@ fn capture_modules(ev: &Evidence) -> Vec<serde_json::Value> {
 
 pub fn json(reports: &[SlotReport], ev: &Evidence, capture: &CaptureMeta<'_>) -> serde_json::Value {
     serde_json::json!({
-        "schema": "pkcs11-scope/observed-profile/v3-metrics",
+        "schema": "p11scope/observed-profile/v3-metrics",
         "capture": { "start": capture.started, "end": capture.ended, "mode": "metrics",
                      "privacy_mode": capture.policy.privacy_mode(),
                      "kernel": capture.kernel,
@@ -1362,7 +1362,7 @@ pub fn profile_json(
     };
 
     serde_json::json!({
-        "schema": "pkcs11-scope/observed-profile/v3",
+        "schema": "p11scope/observed-profile/v3",
         "capture": {
             "start": capture.started, "end": capture.ended, "mode": "profile",
             "privacy_mode": capture.policy.privacy_mode(),
@@ -1542,7 +1542,7 @@ mod tests {
             &capture_fixture(),
         );
 
-        assert_eq!(profile["schema"], "pkcs11-scope/observed-profile/v3");
+        assert_eq!(profile["schema"], "p11scope/observed-profile/v3");
         assert_eq!(
             profile["evidence"]["interface_selection"],
             serde_json::json!({
@@ -1561,10 +1561,7 @@ mod tests {
         assert_eq!(profile["evidence"]["multi_rebuild_gaps"], 0);
 
         let metrics = json(&reports_fixture(), &ev, &capture_fixture());
-        assert_eq!(
-            metrics["schema"],
-            "pkcs11-scope/observed-profile/v3-metrics"
-        );
+        assert_eq!(metrics["schema"], "p11scope/observed-profile/v3-metrics");
         for field in [
             "interface_selection",
             "attach_mechanisms",
@@ -2474,7 +2471,7 @@ mod tests {
             &state_fixture(),
             &capture_fixture(),
         );
-        assert_eq!(v["schema"], "pkcs11-scope/observed-profile/v3");
+        assert_eq!(v["schema"], "p11scope/observed-profile/v3");
         assert_eq!(v["capture"]["modules"][0]["path"], "/opt/p11.so");
         assert_eq!(
             v["capture"]["modules"][0]["sha256"].as_str().unwrap().len(),
@@ -3004,7 +3001,7 @@ mod tests {
             drain_interval_ms: 1000,
         };
         let v = json(&[r], &ev, &capture);
-        assert_eq!(v["schema"], "pkcs11-scope/observed-profile/v3-metrics");
+        assert_eq!(v["schema"], "p11scope/observed-profile/v3-metrics");
         assert_eq!(v["capture"]["privacy_mode"], "aggregate-only");
         assert_eq!(v["functions"][0]["latency_ns"]["approximate"], true);
         assert_eq!(v["functions"][0]["rv_counts"]["0x0000000000000000"], 1);
@@ -3067,7 +3064,7 @@ mod tests {
         let capture = capture_fixture();
         let v = profile_json(&[], &ev, &state, &capture);
 
-        assert_eq!(v["schema"], "pkcs11-scope/observed-profile/v3");
+        assert_eq!(v["schema"], "p11scope/observed-profile/v3");
         assert_eq!(v["capture"]["privacy_mode"], "allowlisted");
         for section in [
             "capture",

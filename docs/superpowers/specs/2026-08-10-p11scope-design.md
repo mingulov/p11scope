@@ -1,5 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
-# pkcs11-scope — Design
+# p11scope — Design
 
 **Date:** 2026-08-10
 **Status:** Draft — pending owner review. **Phase 0 spike PASSED 2026-08-10**
@@ -7,7 +7,7 @@
 attach-before-run capture, and cross-container inode sharing all confirmed.
 Product implementation not started.
 **Extended rationale:** [docs/notes/info.md](../../notes/info.md) — this spec records the decisions; the notes record the full reasoning.
-**Companion:** [what you will see](2026-08-10-pkcs11-scope-outputs.md) — CLI surface, live/trace output, and the `observed-profile.json` shape.
+**Companion:** [what you will see](2026-08-10-p11scope-outputs.md) — CLI surface, live/trace output, and the `observed-profile.json` shape.
 
 **Superseded details:** This historical product draft does not define the
 current attach-provenance or pointer-derived metadata boundary. Use
@@ -34,13 +34,13 @@ require elevated privileges, and are visible to host administrators.
 
 | Decision | Choice | Rationale |
 | --- | --- | --- |
-| Repo / product name | `pkcs11-scope` | Chosen by owner; "p11scope" reads like "periscope" — apt for a passive observer |
+| Repo / product name | `p11scope` | Chosen by owner; "p11scope" reads like "periscope" — apt for a passive observer |
 | Binary names | `p11scope` (observer), `p11scope-discover` (helper) | Short CLI name; helper is a separately copyable artifact (see Architecture) |
 | Primary target | **External third-party applications** | The product exists for apps we do not control. `pkcs11-check` (developed locally) is the dev-time workload generator and ground-truth oracle, not the product focus |
 | Observer language | Rust + `aya` (BPF side: aya-ebpf or clang-built C; `libbpf-rs` as fallback if aya hits a wall) | The family already has a large Rust PKCS#11 core in `pkcs11-proxy-ng` (official mechanism/CKR/attribute name tables, TOML mechanism registry, 2.x/3.x FFI). The observer never dlopens providers, so it can still be a fully static musl binary. Go rejected: a third language in the family, and it would rebuild tables that already exist (miekg/pkcs11 is 2.x-era — no 3.x interfaces, no vendor registry) |
-| Shared decode core | **Improve `pkcs11-proxy-ng`**, don't duplicate: extract its module-FFI **facts** (raw `function_list()`/`interface_list()` primitives + `CK_FUNCTION_LIST`/`_3_0`/`_3_2` field-offset tables + unaligned-safe pointer reader) from `crates/backend` into a lean crate `pkcs11-module` (libloading + cryptoki-sys only); interface-selection policy, host-ABI introspection, and interface-caps reporting stay proxy-side; pkcs11-scope consumes it and `pkcs11-proxy-ng-types` via git deps | Verified: `types` is dependency-lean (serde/toml/tracing/zeroize); the FFI code exists but is entangled with `proto` (tonic) via `backend` — extraction is a genuine proxy-ng improvement (thinner backend, independently testable loading). The proto/convert marshalling layer stays proxy-only (tonic-coupled); the observer's raw-bytes decoding is new but driven by the same mechanism registry. A standalone shared repo is deferred until publishing pressure exists |
+| Shared decode core | **Improve `pkcs11-proxy-ng`**, don't duplicate: extract its module-FFI **facts** (raw `function_list()`/`interface_list()` primitives + `CK_FUNCTION_LIST`/`_3_0`/`_3_2` field-offset tables + unaligned-safe pointer reader) from `crates/backend` into a lean crate `pkcs11-module` (libloading + cryptoki-sys only); interface-selection policy, host-ABI introspection, and interface-caps reporting stay proxy-side; p11scope consumes it and `pkcs11-proxy-ng-types` via git deps | Verified: `types` is dependency-lean (serde/toml/tracing/zeroize); the FFI code exists but is entangled with `proto` (tonic) via `backend` — extraction is a genuine proxy-ng improvement (thinner backend, independently testable loading). The proto/convert marshalling layer stays proxy-only (tonic-coupled); the observer's raw-bytes decoding is new but driven by the same mechanism registry. A standalone shared repo is deferred until publishing pressure exists |
 | Discovery helper | Rust bin on the shared crates; shipped as glibc **and** musl *dynamic* builds | dlopen is not viable from a fully static binary (musl static returns failure; glibc static is deprecated and needs the exact matching shared libc at runtime), so the helper ships per-libc *dynamic* builds, copyable into target containers (`docker cp`/`kubectl cp` then `exec`); manifests stay reusable across machines via ELF build-ID. Emits manifest JSON on stdout; no eBPF, no privileges |
-| License | Dual MIT / Apache-2.0 | Matches `pkcs11-check` |
+| License | Dual MIT / Apache-2.0 (pre-relicense history; current: GPL-3.0-or-later, see LICENSE) | Matches `pkcs11-check` |
 | Repository | `github.com/mingulov/pkcs11-scope` | Matches sibling repos (this is the git URL, not a Rust module path) |
 | Platform floor | Linux x86-64, kernel ≥ 5.15 | ringbuf needs 5.8+; 5.15 = oldest mainstream LTS in target fleets. AArch64 next, no 32-bit |
 | Integration boundary | Versioned JSON schema (`observed-profile.json`) | `pkcs11-check` is Python — no shared code; `pkcs11-lab` consumes both tools' JSON |
@@ -276,7 +276,7 @@ GUI, raw-buffer capture, opinionated security findings, AArch64 (next after
 v1), 32-bit (never until proven needed).
 
 **CLI, live output, and the profile shape** are specified in the companion
-[outputs spec](2026-08-10-pkcs11-scope-outputs.md) — subcommands
+[outputs spec](2026-08-10-p11scope-outputs.md) — subcommands
 (`discover`/`profile`/`trace`), key flags (`--module`, `--pid`/`--cmd`/`--cgroup`,
 `--manifest`, `-o`, `--duration`, `--mode`, and the labels/`CKA_ID` opt-in),
 and an illustrative `observed-profile.json`.

@@ -1,5 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
-# pkcs11-scope
+# p11scope
 
 Observe the real PKCS#11 dependency surface of a running Linux application —
 functions, mechanisms, errors, latency and safe policy metadata — **without
@@ -138,7 +138,7 @@ artifact and every observer-owned BPF map for leaks — including hostile-alias
 lanes, secret/unterminated/hostile-alias `C_GetInterface` names, and the
 transient raw `pMechanism` address the return probe needs.
 
-See [what you will see](docs/superpowers/specs/2026-08-10-pkcs11-scope-outputs.md)
+See [what you will see](docs/superpowers/specs/2026-08-10-p11scope-outputs.md)
 for the CLI, live output, trace lines, and an example `observed-profile.json`.
 
 ## Honest claims
@@ -215,8 +215,8 @@ for the CLI, live output, trace lines, and an example `observed-profile.json`.
   ambiguous by construction; requested attributes are what the app asked for,
   not the key's effective policy. Full honest-claims section:
   [docs/usage.md](docs/usage.md#honest-claims).
-- The schema is `pkcs11-scope/observed-profile/v3` for `profile` and
-  `pkcs11-scope/observed-profile/v3-metrics` for `metrics`, with optional
+- The schema is `p11scope/observed-profile/v3` for `profile` and
+  `p11scope/observed-profile/v3-metrics` for `metrics`, with optional
   discovery input at `p11scope-manifest/5`, documented at
   [docs/schema/observed-profile-v3.md](docs/schema/observed-profile-v3.md).
   Schema ids are opaque exact dispatch keys; the major/minor spelling grants
@@ -294,7 +294,7 @@ capture.
 | Component | Responsibility |
 | --- | --- |
 | [pkcs11-check](https://github.com/mingulov/pkcs11-check) | Actively exercises and validates a provider |
-| **pkcs11-scope** | Passively observes real application behavior |
+| **p11scope** | Passively observes real application behavior |
 | pkcs11-components | Shared PKCS#11 core: name tables, mechanism registry, module-loading FFI |
 | pkcs11-proxy-ng | Controlled interposition, transport, fault injection |
 | pkcs11-lab (planned) | Will combine profiles and test results into migration assessments |

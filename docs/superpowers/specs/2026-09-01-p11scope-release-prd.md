@@ -235,7 +235,7 @@ The requirements spec §6 definition of done, plus, in PRD terms:
 4. Container/K8s qualification rerun on the release tip; multi-distro/kernel
    results recorded honestly, including qualified ia32-target support.
 5. Proxy-stack lane qualified.
-6. All durable state in the two directories (`pkcs11-scope`, `p11scope-ws`);
+6. All durable state in the two directories (`p11scope`, `p11scope-ws`);
    no tracked **executable or live-navigation** path depends on
    `~/.local/state`, `~/p11scope-vm-bases`, or `/tmp` roots (W2). Historical
    run records keep their original paths verbatim — rewriting them would

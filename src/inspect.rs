@@ -16,7 +16,7 @@ use anyhow::Result;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
-const DOC_ID: &str = "pkcs11-scope/inspect/v1";
+const DOC_ID: &str = "p11scope/inspect/v1";
 
 /// Renders a completed scan. Pure: takes the scan result and the pinned identities,
 /// returns the text — so the layout is unit-testable without a target process.
@@ -157,7 +157,7 @@ fn render_module(out: &mut String, module: &ScannedModule, pinned: &PinnedObject
     }
 }
 
-/// Renders a completed scan as JSON. Document id: `pkcs11-scope/inspect/v1`.
+/// Renders a completed scan as JSON. Document id: `p11scope/inspect/v1`.
 pub fn render_json(pid: u32, outcome: &ScanOutcome, pinned: &PinnedObjects) -> serde_json::Value {
     let scan = match outcome {
         ScanOutcome::Scanned { scan_ms, .. } => {
@@ -540,7 +540,7 @@ mod tests {
     #[test]
     fn json_is_stable_and_carries_the_document_id() {
         let value = render_json(4242, &sample(), &PinnedObjects::empty());
-        assert_eq!(value["schema"], "pkcs11-scope/inspect/v1");
+        assert_eq!(value["schema"], "p11scope/inspect/v1");
         assert_eq!(value["pid"], 4242);
         assert_eq!(
             value["modules"][0]["path"],

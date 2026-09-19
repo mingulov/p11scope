@@ -104,7 +104,7 @@ int main(int argc, char **argv)
               ((fn_open)fns[I_OpenSession])(slots[0], CKF_SERIAL_SESSION, NULL, NULL, &sess[i]));
 
     CK_MECHANISM sha256 = { CKM_SHA256, NULL, 0 };
-    unsigned char data[] = "pkcs11-scope spike", out[64];
+    unsigned char data[] = "p11scope spike", out[64];
     for (int i = 0; i < 50; i++) {
         CK_ULONG outlen = sizeof out;
         CHECK("C_DigestInit", ((fn_diginit)fns[I_DigestInit])(sess[0], &sha256));

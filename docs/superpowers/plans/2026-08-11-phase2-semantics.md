@@ -515,7 +515,7 @@ git commit -m "scope: semantic state machine with pseudonymized handles"
 - Create: `docs/schema/observed-profile-v1.md`
 
 **Interfaces:**
-- Produces: `render::profile_json(...) -> serde_json::Value` emitting `"schema": "pkcs11-scope/observed-profile/v1"`.
+- Produces: `render::profile_json(...) -> serde_json::Value` emitting `"schema": "p11scope/observed-profile/v1"`.
 
 Sections, per the outputs spec and the Gate G2 acceptance table: `capture` (start/end/mode/kernel/module incl. build-id from the manifest), `evidence` (Phase 1b's widened `Evidence` **plus** `event_loss`, `malformed_records`, `orphan_ops`, `unmatched_closes`), `functions` (per name: calls, errors, rv distribution, latency), `mechanisms` (verbatim id, hex rendering, ops, calls, errors, latency; `params: null` with a note that parameter decoding is Phase 3), `sessions` (opened, closed, peak concurrent, balance), `logins` (user-type counts).
 

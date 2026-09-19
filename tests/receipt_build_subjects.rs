@@ -7011,10 +7011,8 @@ raise SystemExit(0)
         .duration_since(UNIX_EPOCH)
         .expect("system clock is after epoch")
         .as_nanos();
-    let temp_root = std::env::temp_dir().join(format!(
-        "pkcs11-scope-bs2b-s9-{}-{nonce}",
-        std::process::id()
-    ));
+    let temp_root =
+        std::env::temp_dir().join(format!("p11scope-bs2b-s9-{}-{nonce}", std::process::id()));
     fs::create_dir(&temp_root).expect("create BS2b-S9 temporary directory");
     fs::set_permissions(&temp_root, fs::Permissions::from_mode(0o700))
         .expect("set BS2b-S9 temporary directory mode");
@@ -7306,7 +7304,7 @@ fn bs2b_s9_native_ptrace_lifecycle_contracts() {
         .expect("system clock is after epoch")
         .as_nanos();
     let temp_root = std::env::temp_dir().join(format!(
-        "pkcs11-scope-bs2b-s9-red2-{}-{nonce}",
+        "p11scope-bs2b-s9-red2-{}-{nonce}",
         std::process::id()
     ));
     fs::create_dir(&temp_root).expect("create RED2 temporary directory");

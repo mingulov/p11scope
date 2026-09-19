@@ -1,8 +1,8 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
-# pkcs11-scope — What you will see
+# p11scope — What you will see
 
 **Date:** 2026-08-10 · **Status:** Draft, companion to the
-[design spec](2026-08-10-pkcs11-scope-design.md). Examples are illustrative
+[design spec](2026-08-10-p11scope-design.md). Examples are illustrative
 mock-ups of v1 output; exact formatting will evolve, the *content* is the
 commitment.
 
@@ -78,7 +78,7 @@ Abbreviated but structurally faithful example:
 
 ```json
 {
-  "schema": "pkcs11-scope/observed-profile/v1",
+  "schema": "p11scope/observed-profile/v1",
   "capture": {
     "start": "2026-08-10T12:00:00Z", "end": "2026-08-10T13:00:00Z",
     "mode": "profile", "kernel": "6.8.0-45-generic",

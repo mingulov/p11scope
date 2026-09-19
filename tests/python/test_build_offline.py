@@ -550,7 +550,7 @@ class BuildOfflineTests(unittest.TestCase):
         extraction.mkdir()
         unpack = extract_archive(archive, extraction)
         self.assertEqual(unpack.returncode, 0, unpack.stderr)
-        source = extraction / "pkcs11-scope-source"
+        source = extraction / "p11scope-source"
         tools = base / "recipient tools"
         tools.mkdir()
         shutil.copy2(FIXTURES / "rustup.py", tools / "rustup")

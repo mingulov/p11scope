@@ -1,5 +1,5 @@
 name = "p11scope_reviewer"
-description = "High-rigor architecture planner, failure investigator, and final reviewer for pkcs11-scope."
+description = "High-rigor architecture planner, failure investigator, and final reviewer for p11scope."
 # Select model and effort explicitly at spawn; do not pin them here.
 sandbox_mode = "read-only"
 developer_instructions = """

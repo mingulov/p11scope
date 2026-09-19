@@ -13,7 +13,7 @@
 
 ## Global constraints
 
-- Work only in `/home/user/src/m/pkcs11-scope-codex-slice1b-1` on `codex/slice1b-1-recovery`.
+- Work only in `/home/user/src/m/p11scope-codex-slice1b-1` on `codex/slice1b-1-recovery`.
 - Preserve unrelated work and `docs/privacy/allowlist-v1.md`; do not broaden capture.
 - The exact starting point is `8784aa0c89bb1142da5552cd2cc492aa7bfb18aa` with 297 tests passing.
 - Do not implement Slice 1b-2 loader/export hooks, pause/resume, `run --`, or dynamic attach here.

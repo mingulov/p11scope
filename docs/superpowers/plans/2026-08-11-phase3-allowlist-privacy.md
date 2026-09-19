@@ -30,7 +30,7 @@ This phase is the release-blocking privacy gate (G3). These are not style rules.
 
 ## Inherited facts (verified — do not re-derive)
 
-- Phase 2 HEAD `b78d815`; 69 tests green; profile schema `pkcs11-scope/observed-profile/v1` emits `params: null` with a Phase-3 note.
+- Phase 2 HEAD `b78d815`; 69 tests green; profile schema `p11scope/observed-profile/v1` emits `params: null` with a Phase-3 note.
 - `SLOT_KIND` publish-before-attach is in `Session::start`, right after `scope::apply`. `MECH_SHAPE` follows the same placement and reasoning.
 - `crates/ebpf/src/main.rs` currently performs exactly two `bpf_probe_read_user` calls (mechanism type, `phSession`), both typed `u64`. A whole-branch privacy review enumerated them; keep that property auditable — every new read must be equally enumerable.
 - `aya-ebpf 0.2.1`: `bpf_probe_read_user<T>(src: *const T) -> Result<T, i32>` (typed, reads `size_of::<T>()` bytes). `ProbeContext::arg::<T>(n) -> Option<T>`.
@@ -136,7 +136,7 @@ Add a `templates` section: per operation, the attribute *types* requested (numer
 
 Truncation and any shape whose decode failed must surface in evidence, and `completeness` gains a `templates_truncated` gap condition.
 
-Bump the schema string to `pkcs11-scope/observed-profile/v1.1` and document the delta (additive only). Update the Gate G2 mapping in the schema doc: the OBSERVED AND VALIDATED / CANDIDATE DIFFERED rows can now claim full parameter combos for the two decoded shapes, and must still disclose that other shapes remain id-only.
+Bump the schema string to `p11scope/observed-profile/v1.1` and document the delta (additive only). Update the Gate G2 mapping in the schema doc: the OBSERVED AND VALIDATED / CANDIDATE DIFFERED rows can now claim full parameter combos for the two decoded shapes, and must still disclose that other shapes remain id-only.
 
 Commit: `scope: emit allowlisted parameters and template attribute types`
 

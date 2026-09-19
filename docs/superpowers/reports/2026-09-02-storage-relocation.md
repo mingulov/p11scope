@@ -7,7 +7,7 @@ Date: 2026-09-02 (Europe/Helsinki)
 
 Durable p11scope state now lives under exactly two roots:
 
-- `/home/user/src/m/pkcs11-scope` — public project source and tracked public
+- `/home/user/src/m/p11scope` — public project source and tracked public
   documentation.
 - `/home/user/src/m/p11scope-ws` — private evidence, VM inputs, archives,
   custody metadata, and workspace Git history.
@@ -29,7 +29,7 @@ eight adjacent typed manifests. No large migrated payload was added to Git.
 | --- | --- | --- |
 | Three evidence-index semantic roots under `/home/user/.local/state/p11scope/` | `/home/user/src/m/p11scope-ws/preserved/evidence-roots/<original-name>/` | Exact copy and typed readback |
 | Lane 13 `task4-lane13-a2fd9ee-20260826T2135EEST/facts.log` | `/home/user/src/m/p11scope-ws/preserved/evidence-roots/task4-lane13-a2fd9ee-20260826T2135EEST/facts.log` | Exact file copy; mode and pinned hash verified |
-| `pkcs11-scope-portable-{3d3ba05,90a03ac,b86d4d5}.tar.zst{,.sha256}` | `/home/user/src/m/p11scope-ws/preserved/portable/` | One exact six-file transaction |
+| `p11scope-portable-{3d3ba05,90a03ac,b86d4d5}.tar.zst{,.sha256}` | `/home/user/src/m/p11scope-ws/preserved/portable/` | One exact six-file transaction |
 | `/home/user/.local/state/p11scope/security-scan-3e10be9/` | `/home/user/src/m/p11scope-ws/preserved/security-scan-3e10be9/` | Approved subset completion to eight source files plus the existing custody manifest |
 | Task 4 SDD subtree inside `retired-generated-slice1b2-finish` | `/home/user/src/m/p11scope-ws/preserved/sdd/2026-08-27-task4-receipt-closure/` | Existing byte-identical W1 custody copy accepted as a 0700/0600 no-op |
 | `/home/user/p11scope-vm-bases/` | `/home/user/src/m/p11scope-ws/vm-bases/` | Complete 12-directory/127-file legacy tree copied |
@@ -44,10 +44,10 @@ the deletion decision below; no live authority pointer depends on them.
 Both approved compatibility shims already resolve wholly inside the two roots
 and remain unchanged:
 
-- `/home/user/src/m/pkcs11-scope-evidence` →
+- `/home/user/src/m/p11scope-evidence` →
   `/home/user/src/m/p11scope-ws/evidence`
 - `/home/user/src/m/p11scope-ws/source` →
-  `/home/user/src/m/pkcs11-scope`
+  `/home/user/src/m/p11scope`
 
 ## Policy decisions pending owner ratification
 

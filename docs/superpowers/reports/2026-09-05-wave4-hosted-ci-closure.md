@@ -220,9 +220,9 @@ reports `losses = 0` on `7.0.0-30-generic` and on `6.17.0-1022-azure` in the VM.
 ## 7. Carried forward
 
 - §5, the ENOTSUPP attach failure.
-- `repository = ".../pkcs11-scope"` in `Cargo.toml` and both crate manifests;
+- `repository = ".../p11scope"` in `Cargo.toml` and both crate manifests;
   the remote is `.../p11scope`. Owner confirmed the rename 2026-09-05.
-- Schema ids still read `pkcs11-scope/observed-profile/v3`. Owner asked for
+- Schema ids still read `p11scope/observed-profile/v3`. Owner asked for
   `p11scope/...` and questioned the version; recommendation is
   `p11scope/observed-profile/v1` for a first release, since nothing has shipped
   and the version numbers describe a history no consumer experienced.

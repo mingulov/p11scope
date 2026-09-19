@@ -86,15 +86,15 @@ Standing requirements carried in from earlier decisions (still binding):
 ## 4. Storage and repository layout (owner requirement, 2026-09-01)
 
 > Now it is in multiple folders. Use `/home/user/src/m/p11scope-ws` and
-> `/home/user/src/m/pkcs11-scope` — only. Do not use all other subfolders, too many
+> `/home/user/src/m/p11scope` — only. Do not use all other subfolders, too many
 > of them — and `.local` will definitely be lost on the movement to another PC, for
 > example. So use `p11scope-ws` for some non-public data etc if needed (I initialized
-> git there), and `/home/user/src/m/pkcs11-scope` as public project etc. So 'ws' —
+> git there), and `/home/user/src/m/p11scope` as public project etc. So 'ws' —
 > workspace.
 
 **Binding rules:**
 
-1. **Exactly two directories.** `/home/user/src/m/pkcs11-scope` = the public project
+1. **Exactly two directories.** `/home/user/src/m/p11scope` = the public project
    (git, published). `/home/user/src/m/p11scope-ws` = the workspace for everything
    non-public (git-initialized by the owner; had no commits as of 2026-09-01).
 2. **Nothing durable may live anywhere else.** In particular
@@ -108,7 +108,7 @@ Standing requirements carried in from earlier decisions (still binding):
 4. Non-public material (raw captures, VM artifacts, campaign evidence, anything
    carrying PIDs/addresses barred from tracked files) belongs in `p11scope-ws`, not
    in the public repo.
-5. The `pkcs11-scope-evidence` symlink and the `p11scope-ws/source` symlink are
+5. The `p11scope-evidence` symlink and the `p11scope-ws/source` symlink are
    compatibility shims; keep them working or remove them deliberately along with the
    tracked references that use them (e.g. `spike/slice1b2-loader/run-lanes.sh`).
 

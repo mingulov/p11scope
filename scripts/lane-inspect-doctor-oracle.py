@@ -14,7 +14,7 @@ import sys
 
 
 def oracle(document, doctor):
-    assert document["schema"] == "pkcs11-scope/inspect/v1", document["schema"]
+    assert document["schema"] == "p11scope/inspect/v1", document["schema"]
     paths = [module["path"] for module in document["modules"]]
     # Listing the provider needs only /proc/<pid>/maps and .dynsym, so it must
     # hold on both targets whether or not the memory scan could run.
@@ -69,7 +69,7 @@ def mutate(document, path, value):
 
 
 SCANNED = {
-    "schema": "pkcs11-scope/inspect/v1",
+    "schema": "p11scope/inspect/v1",
     "scan": {"status": "scanned", "reason": None},
     "modules": [
         {
@@ -79,7 +79,7 @@ SCANNED = {
     ],
 }
 SCANNED_TABLELESS = {
-    "schema": "pkcs11-scope/inspect/v1",
+    "schema": "p11scope/inspect/v1",
     "scan": {"status": "scanned", "reason": None},
     "modules": [
         {
@@ -95,7 +95,7 @@ SCANNED_TABLELESS = {
     ],
 }
 REFUSED = {
-    "schema": "pkcs11-scope/inspect/v1",
+    "schema": "p11scope/inspect/v1",
     "scan": {"status": "refused", "reason": "ptrace_scope"},
     "modules": [{"path": "/usr/lib/softhsm/libsofthsm2.so", "tables": []}],
 }

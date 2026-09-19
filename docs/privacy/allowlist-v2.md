@@ -41,8 +41,8 @@ overflow marks `PARTIAL` without another increment. Replays and further
 unremembered keys do not increment again.
 
 Metrics remains `aggregate-only`, reads no selection arguments, and uses the
-exact `pkcs11-scope/observed-profile/v3-metrics` shape. Historical
-`pkcs11-scope/observed-profile/v2-metrics` documents retain their old shape.
+exact `p11scope/observed-profile/v3-metrics` shape. Historical
+`p11scope/observed-profile/v2-metrics` documents retain their old shape.
 Individual trace lines likewise gain no selection fields. All selection loss is
 reduced to the bounded aggregate and `PARTIAL` verdict.
 

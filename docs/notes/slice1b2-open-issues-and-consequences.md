@@ -417,36 +417,36 @@ semantic authority. Landing that recovery-line implementation remains separate.
 
 ## Authoritative evidence pointers
 
-- Final evidence inventory: `~/src/m/pkcs11-scope-evidence/slice1b2/MANIFEST.sha256`
+- Final evidence inventory: `~/src/m/p11scope-evidence/slice1b2/MANIFEST.sha256`
   (`dee02a5418bea166aa22eaaebd1bc13cd68d6fd9822f27c53fa7970835954d86`)
 - Final Gate A/B bundles and campaigns:
-  `~/src/m/pkcs11-scope-evidence/slice1b2/{bundles/final-a227dab-bundle,gate-a/final-a227dab-kvm-*,gate-b/final-a227dab-kvm-*}`
+  `~/src/m/p11scope-evidence/slice1b2/{bundles/final-a227dab-bundle,gate-a/final-a227dab-kvm-*,gate-b/final-a227dab-kvm-*}`
 - Final loader event campaigns:
-  `~/src/m/pkcs11-scope-evidence/slice1b2/loader-artifact/{jammy,noble}-a227dab`
-- Final attach-first experiment: `~/src/m/pkcs11-scope-evidence/slice1b2/task8/`
+  `~/src/m/p11scope-evidence/slice1b2/loader-artifact/{jammy,noble}-a227dab`
+- Final attach-first experiment: `~/src/m/p11scope-evidence/slice1b2/task8/`
   and `docs/notes/slice1b2/attach-first-vs-timing-catalog.md`
 
 Historical design and negative evidence remain at:
 
 - Kernel Gate A report:
-  `/home/user/src/m/pkcs11-scope-codex-slice1b-1/.superpowers/sdd/slice1b2-kernel-spike-design/task-2-report.md`
+  `/home/user/src/m/p11scope-codex-slice1b-1/.superpowers/sdd/slice1b2-kernel-spike-design/task-2-report.md`
 - Independent Gate A review:
-  `/home/user/src/m/pkcs11-scope-codex-slice1b-1/.superpowers/sdd/slice1b2-kernel-spike-design/task-2-review.md`
+  `/home/user/src/m/p11scope-codex-slice1b-1/.superpowers/sdd/slice1b2-kernel-spike-design/task-2-review.md`
 - Gate B report/review:
-  `/home/user/src/m/pkcs11-scope-codex-slice1b-1/.superpowers/sdd/slice1b2-kernel-spike-design/task-3-{report,review}.md`
+  `/home/user/src/m/p11scope-codex-slice1b-1/.superpowers/sdd/slice1b2-kernel-spike-design/task-3-{report,review}.md`
 - Loader/libc report:
-  `~/src/m/pkcs11-scope-evidence/slice1b2/analyses/slice1b2-loader-spikes.md`
+  `~/src/m/p11scope-evidence/slice1b2/analyses/slice1b2-loader-spikes.md`
 - Loader corrective analysis:
-  `~/src/m/pkcs11-scope-evidence/slice1b2/analyses/slice1b2-loader-corrective-analysis.md`
+  `~/src/m/p11scope-evidence/slice1b2/analyses/slice1b2-loader-corrective-analysis.md`
 - Slice 1b-1 semantic-authority contract:
-  `/home/user/src/m/pkcs11-scope-codex-slice1b-1/docs/superpowers/specs/2026-08-18-slice1b1-semantic-authority-contract.md`
+  `/home/user/src/m/p11scope-codex-slice1b-1/docs/superpowers/specs/2026-08-18-slice1b1-semantic-authority-contract.md`
 - Approved corrective design:
-  `/home/user/src/m/pkcs11-scope-codex-slice1b-1/docs/superpowers/specs/2026-08-18-slice1b2-corrective-live-discovery-design.md`
+  `/home/user/src/m/p11scope-codex-slice1b-1/docs/superpowers/specs/2026-08-18-slice1b2-corrective-live-discovery-design.md`
 - Final corrective-design review:
-  `~/src/m/pkcs11-scope-evidence/slice1b2/analyses/slice1b2-corrective-spec-review.md`
+  `~/src/m/p11scope-evidence/slice1b2/analyses/slice1b2-corrective-spec-review.md`
 - Raw Gate A evidence:
-  `~/src/m/pkcs11-scope-evidence/slice1b2/gate-a/p11scope-slice1b2-task2-fd98a02-gatea-{jammy,noble}-evidence`
+  `~/src/m/p11scope-evidence/slice1b2/gate-a/p11scope-slice1b2-task2-fd98a02-gatea-{jammy,noble}-evidence`
 - Raw longer diagnostics:
-  `~/src/m/pkcs11-scope-evidence/slice1b2/gate-a/p11scope-slice1b2-task2-fd98a02-diagnostic-*`
+  `~/src/m/p11scope-evidence/slice1b2/gate-a/p11scope-slice1b2-task2-fd98a02-diagnostic-*`
 - Tracked loader witness harness: `spike/slice1b2-loader/`
   (evidence-root layout and pinned digests: `docs/notes/slice1b2/README.md`)

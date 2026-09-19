@@ -43,7 +43,7 @@ workflow runs the unprivileged checks and the e2e gate.
   `attach.rs`/`crates/ebpf` unchanged.
 - No new dependencies. No `clap`.
 - Manifest schema stays `p11scope-manifest/4`; profile schema stays
-  `pkcs11-scope/observed-profile/v1.4` / `v1.1-metrics` in this slice (the additive evidence
+  `p11scope/observed-profile/v1.4` / `v1.1-metrics` in this slice (the additive evidence
   field `provider_changed` is documented as a v1.4 addendum; the v2 bump is Slice 1b).
 - The deletion commit message must record that the lane existed and was removed
   deliberately (spec §4.11).
@@ -654,12 +654,12 @@ fn shutdown_path_publishes_valid_json_over_a_stale_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("observed.json");
     std::fs::write(&path, b"stale trailing bytes that must disappear").unwrap();
-    let j = serde_json::json!({"schema": "pkcs11-scope/observed-profile/v1.4", "evidence": {}});
+    let j = serde_json::json!({"schema": "p11scope/observed-profile/v1.4", "evidence": {}});
     let mut out = AtomicFile::create(&path).unwrap();
     write_json_report(out.file(), &j).expect("shutdown finalization must write the report");
     out.commit().unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    assert_eq!(parsed["schema"], "pkcs11-scope/observed-profile/v1.4");
+    assert_eq!(parsed["schema"], "p11scope/observed-profile/v1.4");
 }
 
 /// A real SIGTERM (raised in-process after the handler is installed) sets the same stop

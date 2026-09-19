@@ -3,7 +3,7 @@
 
 Raw and generated evidence for the Slice 1b-2 gates is **never tracked in
 git**. It lives outside the tree under
-`~/src/m/pkcs11-scope-evidence/slice1b2/` (mode `0700`), is enumerated by a
+`~/src/m/p11scope-evidence/slice1b2/` (mode `0700`), is enumerated by a
 SHA-256 manifest, and this file carries only digests, pointers, and finite
 facts. Nothing under that root is release output; private spike bundles are
 separately permissioned (corrective design §9.4).
@@ -78,7 +78,7 @@ evidence from later frozen artifacts.
 
 ## Evidence root layout
 
-| Path (under `~/src/m/pkcs11-scope-evidence/slice1b2/`) | Contents |
+| Path (under `~/src/m/p11scope-evidence/slice1b2/`) | Contents |
 | --- | --- |
 | `analyses/` | The four design-pinned corrective analyses plus every other retained `slice1b2-*.md` analysis/report from `/tmp` (raw addresses and paths inside; private) |
 | `gate-a/` | Retained Gate A six-file evidence exports and `.sha256` inventories (jammy, noble), the retained longer-diagnostic exports, and the D2 diagnostic lane run dirs (`diag-*`; disposable `runtime.qcow2` overlays deleted after each verified clean shutdown — retained bases were hash-pinned before/after in `retained.*.sha256`) |

@@ -253,7 +253,7 @@ int main(int argc, char **argv)
               ((fn_open)fns[I_OpenSession])(slots[0], CKF_SERIAL_SESSION, NULL, NULL, &sess[i]));
 
     CK_MECHANISM sha256 = { CKM_SHA256, NULL, 0 };
-    unsigned char data[] = "pkcs11-scope spike", out[64];
+    unsigned char data[] = "p11scope spike", out[64];
     for (int i = 0; i < 50; i++) {
         CK_ULONG outlen = sizeof out;
         CHECK("C_DigestInit", ((fn_diginit)fns[I_DigestInit])(sess[0], &sha256));
@@ -532,7 +532,7 @@ git commit -m "spike: cross-mount-namespace and shared-image-layer capture verif
 - [ ] **Step 2: Amend the design spec if any result contradicts it** (e.g. inode sharing), commit both:
 
 ```bash
-git add docs/notes/spike-findings.md docs/superpowers/specs/2026-08-10-pkcs11-scope-design.md
+git add docs/notes/spike-findings.md docs/superpowers/specs/2026-08-10-p11scope-design.md
 git commit -m "spike: record Phase 0 findings and go/no-go decision"
 ```
 

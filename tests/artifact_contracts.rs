@@ -9824,6 +9824,10 @@ fn license_header_checker_rejects_bad_fixtures() {
             "scripts/native/fake.c",
             b"/* SPDX-License-Identifier: GPL-3.0-or-later */\n",
         ),
+        (
+            "scripts/native/dump-task-storage.bpf.c",
+            b"/* SPDX-License-Identifier: GPL-2.0-only */\n",
+        ),
         ("notes.txt", b"no header needed out of scope\n"),
         // Exempt shapes are accepted even without headers.
         (

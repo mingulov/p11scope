@@ -3,8 +3,8 @@
 
 Current schema identifiers:
 
-- profile: `pkcs11-scope/observed-profile/v2`
-- metrics: `pkcs11-scope/observed-profile/v2-metrics`
+- profile: `p11scope/observed-profile/v2`
+- metrics: `p11scope/observed-profile/v2-metrics`
 
 The safe-policy implementation landed before publication, so `v1.3` and
 `v1-metrics` were internal corrective-tree waypoints that no consumer ever
@@ -93,7 +93,7 @@ Profile mode always emits:
 
 ```json
 {
-  "schema": "pkcs11-scope/observed-profile/v2",
+  "schema": "p11scope/observed-profile/v2",
   "capture": {},
   "evidence": {},
   "functions": [],
@@ -521,7 +521,7 @@ above is always present, all-zero (or `null`, for the deliberately nullable
 
 ## v0-metrics → v1.1-metrics migration
 
-`pkcs11-scope/observed-profile/v1.1-metrics` replaces the experimental
+`p11scope/observed-profile/v1.1-metrics` replaces the experimental
 `v0-metrics`. This is intentionally a major schema change: `capture.module`
 is now `{path, build_id}`, function return codes are full-width, and the
 expanded evidence object carries independent loss classes. It additionally

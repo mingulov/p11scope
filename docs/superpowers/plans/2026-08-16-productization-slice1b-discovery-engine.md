@@ -65,7 +65,7 @@ oracle in Task 6; the "prune" follow-up is resolved by use, recorded in Task 22)
   update `Cargo.lock`, commit the lock with that task, and confirm no version changed
   (`git diff Cargo.lock` shows only the new edge).
 - Manifest schema stays `p11scope-manifest/4`. Profile schema becomes
-  `pkcs11-scope/observed-profile/v2` and `…/v2-metrics` (Task 15) — nothing v1.x is published.
+  `p11scope/observed-profile/v2` and `…/v2-metrics` (Task 15) — nothing v1.x is published.
 - No new BPF program may read process memory outside the bounded reads in Task 10; every table
   read is `bpf_probe_read_user`/`_buf` with a compile-time bound (104 pointers, 16 interfaces,
   8-byte name prefix).
@@ -271,7 +271,7 @@ impl Tracer { pub fn new(table: &SlotTable) -> Self; pub fn sync_slots(&mut self
 
 **Interfaces:** none (a research task). Consumes spec §6.
 
-- [ ] **Step 1: Spike 1 — musl `_dl_debug_state`.** Without root or docker: `mkdir -p /tmp/claude-1000/-home-user-src-m-pkcs11-scope/*/scratchpad/musl 2>/dev/null; cd <scratchpad>/musl && apt-get download musl && dpkg -x musl_*.deb x && llvm-readelf --dyn-syms x/usr/lib/x86_64-linux-musl/libc.so | grep -E '_dl_debug_state|__dl_debug_state'`. Expected: `_dl_debug_state` present as a defined `FUNC` (musl `ldso/dynlink.c`: `void __dl_debug_state(void) {}` + `weak_alias(__dl_debug_state, _dl_debug_state)`). Record symbol name, binding, and that musl's dynamic loader *is* `libc.so` (so `PT_INTERP` = `/lib/ld-musl-x86_64.so.1`, a symlink to `libc.so`). If absent, record the fallback (`dlopen` return in libc) as the required path.
+- [ ] **Step 1: Spike 1 — musl `_dl_debug_state`.** Without root or docker: `mkdir -p /tmp/claude-1000/-home-user-src-m-p11scope/*/scratchpad/musl 2>/dev/null; cd <scratchpad>/musl && apt-get download musl && dpkg -x musl_*.deb x && llvm-readelf --dyn-syms x/usr/lib/x86_64-linux-musl/libc.so | grep -E '_dl_debug_state|__dl_debug_state'`. Expected: `_dl_debug_state` present as a defined `FUNC` (musl `ldso/dynlink.c`: `void __dl_debug_state(void) {}` + `weak_alias(__dl_debug_state, _dl_debug_state)`). Record symbol name, binding, and that musl's dynamic loader *is* `libc.so` (so `PT_INTERP` = `/lib/ld-musl-x86_64.so.1`, a symlink to `libc.so`). If absent, record the fallback (`dlopen` return in libc) as the required path.
 
 - [ ] **Step 2: Spike 2 — glibc ordering.** Confirm from the pinned glibc versions (2.35, 2.39) that `RT_CONSISTENT` + `_dl_debug_state()` runs after relocation and before constructors, for both the initial link set (`elf/rtld.c`, `dl_main`: `r->r_state = RT_CONSISTENT; _dl_debug_state ();` precedes `_dl_init`) and `dlopen` (`elf/dl-open.c`, `dl_open_worker`: "Notify the debugger all new objects have been relocated" precedes `_dl_init (new, …)`). Sources: `apt-get source glibc` if `deb-src` is enabled, else `curl -sL https://sourceware.org/git/?p=glibc.git;a=blob_plain;f=elf/dl-open.c;hb=refs/tags/glibc-2.39`. Then confirm empirically with gdb on this host (`gdb -batch -ex 'break _dl_debug_state' -ex run -ex 'print _r_debug.r_state' -ex 'print done_ctor' -ex continue … --args ./dlopen-fixture`) using a tiny fixture whose constructor sets a global `done_ctor = 1`: at the `RT_CONSISTENT` hit for the fixture, `done_ctor` must still be 0. Record the observed sequence (RT_ADD, RT_CONSISTENT, then constructor).
 

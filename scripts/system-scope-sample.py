@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Sample a privileged observer's CPU/RSS/fds from /proc at a fixed cadence.
+
+The observer runs under sudo, so this sampler runs under sudo too (reading
+another root process's /proc/PID/fd needs it). Takes the sudo parent PID,
+resolves the real child via the children file, and writes one JSON object
+per line: monotonic + wall timestamps, utime/stime ticks, RSS bytes, fd
+count, thread count. Exits when the target (and its parent) are gone.
+
+Stdlib only. No arguments are echoed; the output path is the only write.
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+
+CLK_TCK = os.sysconf("SC_CLK_TCK")
+PAGE_BYTES = os.sysconf("SC_PAGE_SIZE")
+
+
+def read_text(path):
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        return handle.read()
+
+
+def resolve_children(ppid):
+    """Return live child PIDs of the sudo parent (oldest first)."""
+    try:
+        tasks = sorted(os.listdir(f"/proc/{ppid}/task"))
+    except OSError:
+        return []
+    kids = []
+    for task in tasks:
+        try:
+            found = read_text(f"/proc/{ppid}/task/{task}/children").split()
+        except OSError:
+            continue
+        kids.extend(int(kid) for kid in found if kid.isdigit())
+    return kids
+
+
+def pick_child(ppid):
+    """Pick the observed child: sudo may interpose a short-lived monitor
+    also named sudo, so prefer a non-sudo child and fall back to any."""
+    kids = resolve_children(ppid)
+    if not kids:
+        return None
+    for kid in sorted(kids):
+        try:
+            comm = read_text(f"/proc/{kid}/comm").strip()
+        except OSError:
+            continue
+        if comm != "sudo":
+            return kid
+    return sorted(kids)[0]
+
+
+def sample(pid):
+    """Return a sample dict, or None if the process is gone."""
+    try:
+        stat = read_text(f"/proc/{pid}/stat")
+        statm = read_text(f"/proc/{pid}/statm").split()
+        fds = len(os.listdir(f"/proc/{pid}/fd"))
+    except (OSError, ValueError):
+        return None
+    # comm may contain spaces/parens; fields 14/15/20 follow the last ')'.
+    tail = stat.rsplit(")", 1)[1].split()
+    try:
+        utime = int(tail[11])
+        stime = int(tail[12])
+        threads = int(tail[17])
+        rss_bytes = int(statm[1]) * PAGE_BYTES
+    except (IndexError, ValueError):
+        return None
+    return {
+        "t_mono_ns": time.monotonic_ns(),
+        "t_wall_ns": time.time_ns(),
+        "pid": pid,
+        "utime_ticks": utime,
+        "stime_ticks": stime,
+        "rss_bytes": rss_bytes,
+        "fds": fds,
+        "threads": threads,
+        "clk_tck": CLK_TCK,
+    }
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--ppid", type=int, required=True)
+    parser.add_argument("--out", required=True)
+    parser.add_argument("--interval", type=float, default=0.05)
+    parser.add_argument("--settle-s", type=float, default=30.0)
+    args = parser.parse_args(argv)
+    if not 0.005 <= args.interval <= 5.0:
+        raise SystemExit("interval must be within [0.005, 5.0] seconds")
+
+    deadline = time.monotonic() + args.settle_s
+    target = None
+    while time.monotonic() < deadline:
+        target = pick_child(args.ppid)
+        if target is not None and sample(target) is not None:
+            break
+        target = None
+        # Parent gone before any child appeared: nothing to sample.
+        if not os.path.isdir(f"/proc/{args.ppid}"):
+            break
+        time.sleep(min(args.interval, 0.05))
+    if target is None:
+        raise SystemExit(f"no live child of {args.ppid} appeared within settle window")
+
+    misses = 0
+    # Line-buffered: the harness tails this file live while waiting for the
+    # attach ramp to plateau.
+    with open(args.out, "w", encoding="utf-8", buffering=1) as handle:
+        while True:
+            row = sample(target)
+            if row is None:
+                # The latched child may have been a transient sudo helper:
+                # re-resolve and follow a live replacement before giving up.
+                replacement = pick_child(args.ppid)
+                if replacement is not None and replacement != target:
+                    probe = sample(replacement)
+                    if probe is not None:
+                        target = replacement
+                        misses = 0
+                        handle.write(json.dumps(probe) + "\n")
+                        time.sleep(args.interval)
+                        continue
+                misses += 1
+                # Two consecutive misses with a dead parent: target is gone.
+                if misses >= 2 and not os.path.isdir(f"/proc/{args.ppid}"):
+                    return 0
+                if misses >= 40:  # ~2 s of misses: stop anyway, never hang.
+                    return 0
+            else:
+                misses = 0
+                handle.write(json.dumps(row) + "\n")
+            # Sleep in small slices so exit latency stays low on short runs.
+            time.sleep(args.interval)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

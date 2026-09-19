@@ -6875,20 +6875,99 @@ mod tests {
 
     #[test]
     fn system_scope_admits_fork_children_without_a_destination_check() {
-        let plan = crate::plan::build_from_reconciled_modules(&[]);
+        // One fork-safe C_OpenSession slot so the parent can hold an open
+        // session the child must inherit.
+        let names = vec!["C_OpenSession".to_string()];
+        let (descriptor_index, semantic_ambiguous) = crate::kinds::descriptor_index(&names);
+        let plan = crate::plan::AttachPlan::from_slots(vec![crate::plan::Slot {
+            index: 0,
+            descriptor_index,
+            object: crate::plan::TEST_PINNED_OBJECT,
+            object_path: "/opt/p11.so".into(),
+            file_offset: 0,
+            names,
+            aliased: false,
+            semantics: crate::kinds::DESCRIPTORS[descriptor_index as usize],
+            semantic_authorized: true,
+            semantic_ambiguous,
+            fork_safe: true,
+            module_ids: vec![crate::plan::ModuleId(0)],
+        }]);
         let mut state = semantics::State::new(&plan);
-        let mut tracker = process::Tracker::with_limits(0, 16);
-        let mut event: p11scope_ebpf_common::Event = unsafe { std::mem::zeroed() };
-        event.event_type = p11scope_ebpf_common::event_type::FORK;
-        event.pid_tgid = u64::from(std::process::id()) << 32;
-        event.session = u64::from(std::process::id());
+        let mut tracker =
+            process::Tracker::for_producer(crate::events::EventsDomain::test_standin(1), 16);
+        let domain = tracker.producer_domain();
+        let parent_image = p11scope_ebpf_common::ImageIdentity {
+            task_cookie: 90,
+            exec_id: 0,
+        };
+        let (parent, _) = tracker.admit_history(domain, 100, parent_image);
+        let parent = parent.expect("parent generation admits");
+        // Parent opens one session before forking.
+        let mut call: p11scope_ebpf_common::Event = unsafe { std::mem::zeroed() };
+        call.event_type = p11scope_ebpf_common::event_type::CALL;
+        call.pid_tgid = 100u64 << 32;
+        call.session = 7;
+        call.slot = 0;
+        call.rv = 0;
+        call.image = parent_image;
+        state.observe_process(parent, &call);
+        assert_eq!(state.sessions().opened, 1);
+        // Genuine birth: distinct child pid and distinct nonzero cookies.
+        let mut fork: p11scope_ebpf_common::Event = unsafe { std::mem::zeroed() };
+        fork.event_type = p11scope_ebpf_common::event_type::FORK;
+        fork.pid_tgid = 100u64 << 32;
+        fork.session = 200;
+        fork.image = parent_image;
+        fork.child_image = p11scope_ebpf_common::ImageIdentity {
+            task_cookie: 20,
+            exec_id: 0,
+        };
         assert!(observe_fork(
-            tracker.producer_domain(),
+            domain,
             &mut tracker,
             &mut state,
             &Scope::System,
-            &event,
+            &fork
         ));
+        assert_eq!(
+            state.semantic_evidence().semantic_history_drops,
+            0,
+            "genuine fork must admit without history rejection"
+        );
+        assert_eq!(
+            state.sessions().inherited,
+            1,
+            "child must inherit the parent open session"
+        );
+        // Birth is one-shot: replaying it must not duplicate the inheritance.
+        assert!(observe_fork(
+            domain,
+            &mut tracker,
+            &mut state,
+            &Scope::System,
+            &fork
+        ));
+        assert_eq!(state.sessions().inherited, 1);
+        // Negative control: the old malformed shape (same pid, zero cookies)
+        // is handled but records a rejection.
+        let drops_before = state.semantic_evidence().semantic_history_drops;
+        let mut malformed: p11scope_ebpf_common::Event = unsafe { std::mem::zeroed() };
+        malformed.event_type = p11scope_ebpf_common::event_type::FORK;
+        malformed.pid_tgid = 100u64 << 32;
+        malformed.session = 100;
+        assert!(observe_fork(
+            domain,
+            &mut tracker,
+            &mut state,
+            &Scope::System,
+            &malformed
+        ));
+        assert_eq!(
+            state.semantic_evidence().semantic_history_drops,
+            drops_before + 1,
+            "malformed fork must record a rejection"
+        );
     }
 
     #[test]

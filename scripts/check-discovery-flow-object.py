@@ -157,7 +157,7 @@ def typed_birth(elf, secs):
         r0 = 0x0
         r1 = *(u64 *)(r10 - 0x18)
         r2 = r1
-        r2 &= 0x2
+        r2 &= 0x42
         if r2 == 0x0 goto @done
         r1 &= 0x10
         r0 = 0x1

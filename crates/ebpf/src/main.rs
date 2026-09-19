@@ -2587,7 +2587,9 @@ pub extern "C" fn p11_link_fork_allowed() -> u32 {
     let Some(scope) = scope_auth() else {
         return 0;
     };
-    if scope.flags & FLAG_CGROUP_FILTER == 0 {
+    // Fork birth records flow under cgroup and system scope alike; PID scope
+    // tracks a single process and never needs them.
+    if scope.flags & (FLAG_CGROUP_FILTER | FLAG_SYSTEM_FILTER) == 0 {
         return 0;
     }
     u32::from(scope.flags & FLAG_POLICY_AGGREGATE == 0)

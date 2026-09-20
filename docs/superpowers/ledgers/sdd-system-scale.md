@@ -21,7 +21,7 @@ Build env: TMPDIR=/var/tmp/p11scope-ws-tmp cargo +1.88 --locked --offline.
   with repo-local worktree, verified identity first. Child's "clippy clean"
   claim was false — always re-run gates on the merged tree.
 
-## Task 1.2 — ordered admission + per-object cap (IN PROGRESS)
+## Task 1.2 — ordered admission + per-object cap (DONE)
 - Branch: task-1.2/ordered-admission (from bb2314a).
 - Brief: wire order_tables_by_evidence into engine admission; per-object K cap;
   first acceptance step clears the 3 dead_code clippy errors above.
@@ -321,6 +321,20 @@ Build env: TMPDIR=/var/tmp/p11scope-ws-tmp cargo +1.88 --locked --offline.
   (733s). Repair envelope E-burst…E-discovery + conditional
   loss(R) system points + handoff + named gaps recorded in
   docs/notes/2026-09-20-task-3.1-loss-shares.md.
+- Task 3.1-repair: DONE, merged cb66d3b (backfilled 2026-09-21; evidence
+  pre-exists in the merge message + notes). cc38be6: readiness draining,
+  bounded-wait-drop sink, split capture/detach attribution, frame-gated
+  discovery. Task-reviewed; final review APPROVED-TO-MERGE; gates green
+  at 6c7bcfc. Notes: docs/notes/2026-09-20-task-3.1-repair.md,
+  docs/notes/2026-09-20-task-3.1-integrated.md.
+- Audit F1/F2/F3/F4/F6/F9: DONE, merged cb66d3b (backfilled 2026-09-21;
+  evidence pre-exists in the merge message + notes). F1 ringbuf-fd
+  readiness wait + 4M default ring (8f658e4); F2/F6/F9 oracle
+  attribution (48420da); F3/F4 terminal accounting + cancel-aware
+  flush (462ca0d). Task-reviewed; final review APPROVED-TO-MERGE.
+  Notes: docs/notes/2026-09-20-task-3.1-audit-f1.md,
+  docs/notes/2026-09-20-task-3.1-audit-oracle.md,
+  docs/notes/2026-09-20-task-3.1-audit-sink-cancel.md.
 - Task 2.2: implementer DONE (bb62412 tip; 17 commits from
   29f7432 section-pin RED through 48d663c scratch-loader fix,
   467b94e 11-lane note, 2bc41a4 guard marker, bb62412
@@ -460,6 +474,8 @@ Build env: TMPDIR=/var/tmp/p11scope-ws-tmp cargo +1.88 --locked --offline.
   contention flake; isolation re-run green 0.85s on this tree, next
   full gate green. No test edits — the timeouts/parallelism are
   load-bearing process-test contracts.
+- Task 3.1b: complete, merged (FF c4c59c9). Review APPROVE (10/10,
+  no fix list); merged-tree gates covered by the 3.2 post-merge run.
 - Task 3.2: implementer DONE (branch task-3.1b/discovery-scheduling,
   on top of 3.1b c4c59c9). Discovery-noise aggregation (S1): new
   `src/discovery/noise.rs` with `DiscoveryNoiseClass` (6 categorical
@@ -500,7 +516,17 @@ Build env: TMPDIR=/var/tmp/p11scope-ws-tmp cargo +1.88 --locked --offline.
   `system_scope_refresh_admits_later_generation_in_same_engine`
   (byte-identical to the recorded 1.2/3.1b EPERM contention flake;
   isolation green 0.85s); (b) canary 60s-timeout kill mid-suite,
-  stopped-canary owned-case custody-vs-deadline race (1/112 inner),
+  stopped-canary owned-case custody-vs-deadline race (1/112 inner,
+  mechanism inferred, isolation-log paths not preserved),
   lane13 port-forward/body-success pair (all three isolation-green:
   96s/65s/187s). No test edits — the timeouts/parallelism are
   load-bearing process-test contracts.
+- Task 3.2: complete, merged (FF 4531f2f). Review APPROVE (8/8, no
+  fix list). Merged-tree quiet gates green 1491/0/4 (21 targets),
+  fmt + clippy clean (/tmp/gates-final-4531f2f-r2.log); r1 single
+  lib Deadline flake dispositioned (full-run-only, logs preserved).
+- Final whole-branch review: APPROVE (goal complete). Report:
+  .superpowers/sdd/2026-09-19-system-scale/task-final-review.md
+  (untracked working note). Required ledger backfill done here:
+  3.1-repair + F1/F2/F3/F4/F6/F9 DONE entries, 3.1b/3.2 merged
+  lines, 1.2 heading fixed, canary wording marked inferred.

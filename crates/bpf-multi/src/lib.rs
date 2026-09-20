@@ -270,10 +270,10 @@ fn split_error(error: &io::Error) -> io::Error {
 /// (which become per-slot attach failures). Generic over the link
 /// handle so the isolation logic unit-tests without caps or fds;
 /// production passes [`attach_group`].
-pub type TryAttach<'a, T> = dyn Fn(&[(u64, u64)]) -> io::Result<T> + 'a;
+pub type TryAttach<'a, T> = dyn FnMut(&[(u64, u64)]) -> io::Result<T> + 'a;
 
 pub fn bisect_attach<T>(
-    attach: &TryAttach<'_, T>,
+    attach: &mut TryAttach<'_, T>,
     sites: &[(u64, u64)],
 ) -> Result<(Vec<T>, Vec<RefusedSite>), GroupHalt> {
     let mut links = Vec::new();
@@ -381,7 +381,7 @@ mod tests {
         let sites: Vec<(u64, u64)> = (0..8).map(|i| (i, 100 + i)).collect();
         let calls = Cell::new(0);
         let (links, refused) = bisect_attach(
-            &|slice| {
+            &mut |slice| {
                 calls.set(calls.get() + 1);
                 Ok(slice.to_vec())
             },
@@ -396,7 +396,7 @@ mod tests {
 
     #[test]
     fn bisect_empty_sites_is_a_vacuous_success() {
-        let (links, refused) = bisect_attach(&|slice| Ok(slice.to_vec()), &[]).unwrap();
+        let (links, refused) = bisect_attach(&mut |slice| Ok(slice.to_vec()), &[]).unwrap();
         assert!(links.is_empty());
         assert!(refused.is_empty());
     }
@@ -409,7 +409,7 @@ mod tests {
             .collect();
         let calls = Cell::new(0);
         let (links, refused) = bisect_attach(
-            &|slice: &[(u64, u64)]| {
+            &mut |slice: &[(u64, u64)]| {
                 calls.set(calls.get() + 1);
                 if slice.iter().any(|&(offset, _)| offset == POISON) {
                     Err(os_error(libc::EINVAL))
@@ -436,7 +436,7 @@ mod tests {
         let sites: Vec<(u64, u64)> = (0..8).map(|i| (i, i)).collect();
         let calls = Cell::new(0);
         let (links, refused) = bisect_attach(
-            &|_| {
+            &mut |_| {
                 calls.set(calls.get() + 1);
                 Err::<Vec<(u64, u64)>, _>(os_error(libc::EPERM))
             },
@@ -459,7 +459,7 @@ mod tests {
         let sites: Vec<(u64, u64)> = (0..4).map(|i| (i, i)).collect();
         let calls = Cell::new(0);
         let halted = bisect_attach(
-            &|_| {
+            &mut |_| {
                 calls.set(calls.get() + 1);
                 Err::<Vec<(u64, u64)>, _>(os_error(libc::EMFILE))
             },
@@ -472,7 +472,7 @@ mod tests {
             "fd table exhausted: Too many open files (os error 24)"
         );
         let halted = bisect_attach(
-            &|_| {
+            &mut |_| {
                 calls.set(calls.get() + 1);
                 Err::<Vec<(u64, u64)>, _>(os_error(libc::ENOTSUP))
             },

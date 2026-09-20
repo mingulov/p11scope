@@ -15,6 +15,7 @@ use aya::programs::tp_btf::BtfTracePointLinkId;
 use aya::programs::uprobe::{UProbeAttachLocation, UProbeAttachPoint, UProbeLinkId, UProbeScope};
 use aya::programs::{BtfTracePoint, RawTracePoint, UProbe};
 use aya::{Btf, Ebpf, EbpfLoader};
+use p11scope_bpf_multi::{GroupHalt, bisect_attach};
 use p11scope_ebpf_common::{
     ARG_NONE, DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES,
     DISCOVERY_COUNTER_EXPORT_STATE_FAILURES, DISCOVERY_COUNTER_LOADER_HITS,
@@ -755,6 +756,36 @@ impl BackendSelection {
     }
 }
 
+/// A multi link attempt proved the kernel lacks multi support. The
+/// session retries on singles (auto) or surfaces this as a hard error
+/// (forced multi).
+#[derive(Debug)]
+pub(crate) struct BackendFallbackRequired {
+    error: io::Error,
+}
+
+impl BackendFallbackRequired {
+    fn unsupported(error: io::Error) -> Self {
+        Self { error }
+    }
+}
+
+impl std::fmt::Display for BackendFallbackRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "multi-uprobe unsupported by the running kernel: {}",
+            self.error
+        )
+    }
+}
+
+impl std::error::Error for BackendFallbackRequired {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
 /// First backend attempted for a session. `Auto` stays singles until the
 /// regrouped multi attach lands; the policy flip (multi on 6.9+ with a
 /// singles fallback) follows with it.
@@ -1313,6 +1344,185 @@ fn group_static_slots(
             }
         })
         .collect()
+}
+
+/// One attached group side: the program, its member slots, and the live
+/// links (one per bisect leaf). Generic over the link handle so the
+/// orchestration unit-tests without fds; production uses `OwnedFd`.
+#[derive(Debug)]
+struct MultiLinkBundle<T> {
+    program: &'static str,
+    slots: Vec<u32>,
+    links: Vec<T>,
+}
+
+fn exhausted_multi(slot: u32, endpoints: usize, links: usize) -> (u32, String) {
+    (
+        slot,
+        format!(
+            "fd table exhausted attaching slot {slot} ({endpoints} endpoints across {links} links); \
+             raise RLIMIT_NOFILE (ulimit -n) and retry"
+        ),
+    )
+}
+
+/// Attaches regrouped static slots: per group, the return link(s) first,
+/// then the entry link(s) over the return-paired members only, so an
+/// entry is never attempted without its return. Kernel-rejected offsets
+/// bisect into per-slot failures; permission errors fail the side and
+/// the loop continues with the next group; fd exhaustion ends the run
+/// with one summary like singles; an unsupported kernel aborts with
+/// [`BackendFallbackRequired`]. Returns the live links (one bundle per
+/// attached side) plus the singles-shaped [`AttachOutcome`].
+fn attach_target_groups_with<T>(
+    groups: &[StaticGroup],
+    mut completed_at: impl FnMut(&Slot) -> Option<u64>,
+    mut attach_link: impl FnMut(&'static str, &Path, &[(u64, u64)], bool) -> io::Result<T>,
+) -> Result<(Vec<MultiLinkBundle<T>>, AttachOutcome), BackendFallbackRequired> {
+    let mut successful = BTreeSet::new();
+    let mut failures = Vec::new();
+    let mut completed = Vec::new();
+    let mut bundles = Vec::new();
+    let mut links_attached = 0usize;
+    for group in groups {
+        let sites: Vec<(u64, u64)> = group
+            .members
+            .iter()
+            .map(|member| (member.offset, member.cookie))
+            .collect();
+        let (return_links, return_refused) = match bisect_attach(
+            &mut |slice| attach_link("p11_return", &group.path, slice, true),
+            &sites,
+        ) {
+            Ok(ok) => ok,
+            Err(GroupHalt::Unsupported(error)) => {
+                return Err(BackendFallbackRequired::unsupported(error));
+            }
+            Err(GroupHalt::Exhausted(_)) => {
+                let first = group.members.first().expect("groups are never empty");
+                failures.push(exhausted_multi(
+                    first.slot.index,
+                    successful.len(),
+                    links_attached,
+                ));
+                return Ok((
+                    bundles,
+                    AttachOutcome {
+                        successful,
+                        failures,
+                        completed,
+                    },
+                ));
+            }
+        };
+        links_attached += return_links.len();
+        let refused: BTreeSet<usize> = return_refused.iter().map(|site| site.index).collect();
+        for site in &return_refused {
+            let member = &group.members[site.index];
+            failures.push((
+                member.slot.index,
+                format!(
+                    "p11_return at {}+{:#x}: {}",
+                    group.path.display(),
+                    member.offset,
+                    error_chain(&site.error)
+                ),
+            ));
+        }
+        let paired: Vec<&StaticGroupMember> = group
+            .members
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !refused.contains(index))
+            .map(|(_, member)| member)
+            .collect();
+        for member in &paired {
+            successful.insert(
+                static_endpoint("p11_return", member.slot.index)
+                    .expect("p11_return is a static endpoint"),
+            );
+        }
+        if !return_links.is_empty() {
+            bundles.push(MultiLinkBundle {
+                program: "p11_return",
+                slots: paired.iter().map(|member| member.slot.index).collect(),
+                links: return_links,
+            });
+        }
+        if paired.is_empty() {
+            continue;
+        }
+        let entry_sites: Vec<(u64, u64)> = paired
+            .iter()
+            .map(|member| (member.offset, member.cookie))
+            .collect();
+        let (entry_links, entry_refused) = match bisect_attach(
+            &mut |slice| attach_link(group.entry_program, &group.path, slice, false),
+            &entry_sites,
+        ) {
+            Ok(ok) => ok,
+            Err(GroupHalt::Unsupported(error)) => {
+                return Err(BackendFallbackRequired::unsupported(error));
+            }
+            Err(GroupHalt::Exhausted(_)) => {
+                failures.push(exhausted_multi(
+                    paired[0].slot.index,
+                    successful.len(),
+                    links_attached,
+                ));
+                return Ok((
+                    bundles,
+                    AttachOutcome {
+                        successful,
+                        failures,
+                        completed,
+                    },
+                ));
+            }
+        };
+        links_attached += entry_links.len();
+        let refused: BTreeSet<usize> = entry_refused.iter().map(|site| site.index).collect();
+        for site in &entry_refused {
+            let member = paired[site.index];
+            failures.push((
+                member.slot.index,
+                format!(
+                    "{} at {}+{:#x}: {}",
+                    group.entry_program,
+                    group.path.display(),
+                    member.offset,
+                    error_chain(&site.error)
+                ),
+            ));
+        }
+        let mut entry_slots = Vec::new();
+        for (index, member) in paired.iter().enumerate() {
+            if refused.contains(&index) {
+                continue;
+            }
+            successful.insert(
+                static_endpoint(group.entry_program, member.slot.index)
+                    .expect("selected entry program is a static endpoint"),
+            );
+            completed.push((member.slot.index, completed_at(&member.slot)));
+            entry_slots.push(member.slot.index);
+        }
+        if !entry_links.is_empty() {
+            bundles.push(MultiLinkBundle {
+                program: group.entry_program,
+                slots: entry_slots,
+                links: entry_links,
+            });
+        }
+    }
+    Ok((
+        bundles,
+        AttachOutcome {
+            successful,
+            failures,
+            completed,
+        },
+    ))
 }
 
 pub(crate) fn monotonic_ns() -> Option<u64> {
@@ -4225,6 +4435,274 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert_eq!(group_member_indices(&groups[0]), vec![0, 1]);
         assert_eq!(group_member_indices(&groups[1]), vec![2, 3]);
+    }
+
+    type MockLink = Vec<(u64, u64)>;
+
+    struct MockGroup {
+        calls: std::cell::RefCell<Vec<(String, bool, Vec<(u64, u64)>)>>,
+        fail: Box<dyn Fn(&str, &[(u64, u64)], bool) -> Option<io::Error>>,
+    }
+
+    impl MockGroup {
+        fn leaf(
+            &self,
+        ) -> impl FnMut(&'static str, &Path, &[(u64, u64)], bool) -> io::Result<MockLink> + '_
+        {
+            |program, path, sites, is_return| {
+                self.calls
+                    .borrow_mut()
+                    .push((program.to_string(), is_return, sites.to_vec()));
+                if let Some(error) = (self.fail)(path.to_str().unwrap(), sites, is_return) {
+                    return Err(error);
+                }
+                Ok(sites.to_vec())
+            }
+        }
+
+        fn programs_called(&self) -> Vec<(String, bool)> {
+            self.calls
+                .borrow()
+                .iter()
+                .map(|(program, is_return, _)| (program.clone(), *is_return))
+                .collect()
+        }
+    }
+
+    fn two_groups() -> (Vec<crate::plan::Slot>, BTreeMap<u32, (PathBuf, ElfAbi)>) {
+        let slots = vec![
+            group_slot(0, 1, SlotSemantics::COUNT_ONLY),
+            group_slot(1, 1, SlotSemantics::COUNT_ONLY),
+            group_slot(2, 2, SlotSemantics::COUNT_ONLY),
+            group_slot(3, 2, SlotSemantics::COUNT_ONLY),
+        ];
+        let targets = group_targets(&[
+            (0, "/a.so", ElfAbi::Lp64),
+            (1, "/a.so", ElfAbi::Lp64),
+            (2, "/b.so", ElfAbi::Lp64),
+            (3, "/b.so", ElfAbi::Lp64),
+        ]);
+        (slots, targets)
+    }
+
+    #[test]
+    fn multi_all_good_links_return_before_entry_per_group() {
+        let (slots, targets) = two_groups();
+        let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
+        assert_eq!(groups.len(), 2);
+        let mock = MockGroup {
+            calls: std::cell::RefCell::new(Vec::new()),
+            fail: Box::new(|_, _, _| None),
+        };
+        let (bundles, outcome) =
+            attach_target_groups_with(&groups, |_| Some(7), mock.leaf()).unwrap();
+        assert_eq!(bundles.len(), 4);
+        for bundle in &bundles {
+            assert_eq!(bundle.links.len(), 1);
+            assert_eq!(bundle.slots.len(), 2);
+        }
+        assert_eq!(bundles[0].program, "p11_return");
+        assert_eq!(bundles[1].program, "p11_entry");
+        assert_eq!(bundles[2].program, "p11_return");
+        assert_eq!(bundles[3].program, "p11_entry");
+        assert_eq!(outcome.successful.len(), 8);
+        assert!(outcome.failures.is_empty());
+        assert_eq!(outcome.completed.len(), 4);
+        assert!(
+            outcome.completed.iter().all(|(_, at)| *at == Some(7)),
+            "completed carries the clock"
+        );
+        assert_eq!(mock.calls.borrow().len(), 4);
+        let called: Vec<(String, bool)> = mock.programs_called();
+        let called: Vec<(&str, bool)> = called.iter().map(|(p, r)| (p.as_str(), *r)).collect();
+        assert_eq!(
+            called,
+            vec![
+                ("p11_return", true),
+                ("p11_entry", false),
+                ("p11_return", true),
+                ("p11_entry", false),
+            ]
+        );
+    }
+
+    #[test]
+    fn multi_poison_return_refusal_skips_entry_for_that_member() {
+        let (slots, targets) = two_groups();
+        let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
+        let poison = 0x10 + 1 * 8;
+        let mock = MockGroup {
+            calls: std::cell::RefCell::new(Vec::new()),
+            fail: Box::new(move |_, sites, is_return| {
+                if is_return && sites.iter().any(|(offset, _)| *offset == poison) {
+                    Some(io::Error::from_raw_os_error(libc::EINVAL))
+                } else {
+                    None
+                }
+            }),
+        };
+        let (bundles, outcome) =
+            attach_target_groups_with(&groups, |_| Some(7), mock.leaf()).unwrap();
+        assert_eq!(outcome.successful.len(), 6);
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(outcome.failures[0].0, 1);
+        assert!(
+            outcome.failures[0]
+                .1
+                .starts_with("p11_return at /a.so+0x18: ")
+        );
+        assert_eq!(outcome.completed.len(), 3);
+        // Entry never saw the refused member's offset.
+        for (program, is_return, sites) in mock.calls.borrow().iter() {
+            if program == "p11_entry" && !is_return {
+                assert!(
+                    sites.iter().all(|(offset, _)| *offset != poison),
+                    "entry must exclude return-refused members"
+                );
+            }
+        }
+        let return_a = bundles.iter().find(|b| b.program == "p11_return").unwrap();
+        assert_eq!(return_a.slots, vec![0]);
+    }
+
+    #[test]
+    fn multi_entry_poison_leaves_return_and_records_entry_failure() {
+        let (slots, targets) = two_groups();
+        let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
+        let poison = 0x10 + 3 * 8;
+        let mock = MockGroup {
+            calls: std::cell::RefCell::new(Vec::new()),
+            fail: Box::new(move |_, sites, is_return| {
+                if !is_return && sites.iter().any(|(offset, _)| *offset == poison) {
+                    Some(io::Error::from_raw_os_error(libc::EINVAL))
+                } else {
+                    None
+                }
+            }),
+        };
+        let (bundles, outcome) =
+            attach_target_groups_with(&groups, |_| Some(7), mock.leaf()).unwrap();
+        assert_eq!(outcome.successful.len(), 7);
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(outcome.failures[0].0, 3);
+        assert!(
+            outcome.failures[0]
+                .1
+                .starts_with("p11_entry at /b.so+0x28: ")
+        );
+        assert_eq!(outcome.completed.len(), 3);
+        // The return endpoint stays successful without its entry.
+        assert!(outcome.successful.contains(&(3, ProbeSide::Return)));
+        assert!(!outcome.successful.contains(&(3, ProbeSide::Entry)));
+        assert_eq!(bundles.len(), 4);
+    }
+
+    #[test]
+    fn multi_permission_error_fails_the_side_and_continues() {
+        let (slots, targets) = two_groups();
+        let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
+        let mock = MockGroup {
+            calls: std::cell::RefCell::new(Vec::new()),
+            fail: Box::new(|path, _, _| {
+                if path == "/a.so" {
+                    Some(io::Error::from_raw_os_error(libc::EPERM))
+                } else {
+                    None
+                }
+            }),
+        };
+        let (bundles, outcome) =
+            attach_target_groups_with(&groups, |_| Some(7), mock.leaf()).unwrap();
+        // Group /a.so refused wholesale (one fail-fast attempt, no entry
+        // attempts); group /b.so attached fully.
+        let calls = mock.calls.borrow();
+        assert_eq!(calls.len(), 3);
+        for (program, _, sites) in calls.iter() {
+            if program == "p11_entry" {
+                assert!(
+                    sites.iter().all(|(offset, _)| *offset >= 0x20),
+                    "no entry attempts for the refused group"
+                );
+            }
+        }
+        assert_eq!(outcome.successful.len(), 4);
+        assert_eq!(outcome.failures.len(), 2);
+        assert_eq!(bundles.len(), 2);
+        assert!(bundles.iter().all(|b| b.slots == vec![2, 3]));
+    }
+
+    #[test]
+    fn multi_exhaustion_ends_the_run_with_a_summary() {
+        let (slots, targets) = two_groups();
+        let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
+        let mock = MockGroup {
+            calls: std::cell::RefCell::new(Vec::new()),
+            fail: Box::new(|_, _, is_return| {
+                if !is_return {
+                    Some(io::Error::from_raw_os_error(libc::EMFILE))
+                } else {
+                    None
+                }
+            }),
+        };
+        let (bundles, outcome) =
+            attach_target_groups_with(&groups, |_| Some(7), mock.leaf()).unwrap();
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(outcome.failures[0].0, 0);
+        assert_eq!(
+            outcome.failures[0].1,
+            "fd table exhausted attaching slot 0 (2 endpoints across 1 links); \
+             raise RLIMIT_NOFILE (ulimit -n) and retry"
+        );
+        // Partial links are kept; later groups are never attempted.
+        assert_eq!(bundles.len(), 1);
+        assert_eq!(bundles[0].program, "p11_return");
+        assert!(
+            mock.calls
+                .borrow()
+                .iter()
+                .all(|(_, _, sites)| sites.len() <= 2)
+        );
+        assert_eq!(outcome.successful.len(), 2);
+        assert!(outcome.completed.is_empty());
+    }
+
+    #[test]
+    fn multi_unsupported_aborts_with_the_fallback_sentinel() {
+        let (slots, targets) = two_groups();
+        let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
+        for errno in [libc::ENOTSUP, libc::EOPNOTSUPP] {
+            let mock = MockGroup {
+                calls: std::cell::RefCell::new(Vec::new()),
+                fail: Box::new(move |_, _, _| Some(io::Error::from_raw_os_error(errno))),
+            };
+            let error = attach_target_groups_with(&groups, |_| Some(7), mock.leaf()).unwrap_err();
+            assert!(
+                format!("{error}").contains("multi-uprobe unsupported"),
+                "unexpected sentinel text: {error}"
+            );
+            assert_eq!(mock.calls.borrow().len(), 1);
+        }
+    }
+
+    #[test]
+    fn multi_unsupported_on_entry_side_still_aborts() {
+        let (slots, targets) = two_groups();
+        let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
+        let mock = MockGroup {
+            calls: std::cell::RefCell::new(Vec::new()),
+            fail: Box::new(|_, _, is_return| {
+                if !is_return {
+                    Some(io::Error::from_raw_os_error(libc::ENOTSUP))
+                } else {
+                    None
+                }
+            }),
+        };
+        let error = attach_target_groups_with(&groups, |_| Some(7), mock.leaf()).unwrap_err();
+        assert!(format!("{error}").contains("multi-uprobe unsupported"));
+        // Return linked, then the entry side proved the kernel lacks multi.
+        assert_eq!(mock.calls.borrow().len(), 2);
     }
 
     #[test]

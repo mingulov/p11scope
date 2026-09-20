@@ -1514,6 +1514,7 @@ impl CaptureFacts {
                     &[],
                     &[],
                 );
+                let linkage = table_linkage(&table_score);
                 history
                     .tables
                     .entry(TableOccurrence::Scan {
@@ -1522,12 +1523,21 @@ impl CaptureFacts {
                         entries: table_fact.1,
                         occurrence: *table_occurrence,
                     })
+                    .and_modify(|known| {
+                        // Publication proof is monotonic: a live return
+                        // upgrades the initial heuristic linkage, but a later
+                        // less-informed reading — a view retired with its
+                        // proof — never downgrades a corroborated one.
+                        if known.linkage == "heuristic" && linkage != "heuristic" {
+                            known.linkage = linkage;
+                        }
+                    })
                     .or_insert(plan::TableSummary {
                         version: table_fact.0,
                         entries: table_fact.1,
                         source: "scan",
                         file_offset: table.file_offset,
-                        linkage: table_linkage(&table_score),
+                        linkage,
                     });
                 *table_occurrence += 1;
                 *surface_occurrence += 1;

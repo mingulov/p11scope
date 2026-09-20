@@ -18417,3 +18417,71 @@ fn spill_history_retains_earlier_omission_after_live_merge() {
         "earlier omitted table disappeared from lifetime evidence"
     );
 }
+
+/// Audit F7: public table provenance follows a later live publication. The
+/// fifth table is first seen heuristic, then corroborated by a live return:
+/// the published history must upgrade to `live_return`, not keep whichever
+/// linkage was inserted first.
+#[test]
+fn public_linkage_reflects_later_live_publication() {
+    let (mut engine, raw) = spill_history_engine();
+    let offset = raw.tables[4].file_offset;
+    publish_fifth_table_live(&mut engine, raw);
+    let current = engine.plan.modules[0]
+        .tables
+        .iter()
+        .find(|table| table.file_offset == offset)
+        .unwrap();
+    let public = engine.discovery.modules[0]
+        .tables
+        .iter()
+        .find(|table| table.file_offset == offset)
+        .unwrap();
+    assert_eq!(current.linkage, "live_return");
+    assert_eq!(
+        public.linkage, "live_return",
+        "current publication proof is hidden by initial heuristic history"
+    );
+}
+
+/// Audit F7 converse: provenance never downgrades. A third publication that
+/// no longer carries the live proof (a view retired with it) leaves the
+/// corroborated public linkage in place.
+#[test]
+fn public_linkage_never_downgrades_after_proof_retires() {
+    let (mut engine, raw) = spill_history_engine();
+    let offset = raw.tables[4].file_offset;
+    publish_fifth_table_live(&mut engine, raw.clone());
+    let public = engine.discovery.modules[0]
+        .tables
+        .iter()
+        .find(|table| table.file_offset == offset)
+        .unwrap();
+    assert_eq!(public.linkage, "live_return");
+    republish_all_heuristic(&mut engine, raw);
+    let public = engine.discovery.modules[0]
+        .tables
+        .iter()
+        .find(|table| table.file_offset == offset)
+        .unwrap();
+    assert_eq!(
+        public.linkage, "live_return",
+        "a less-informed later reading revoked observed publication proof"
+    );
+}
+
+fn republish_all_heuristic(engine: &mut Engine, raw: ScannedModule) {
+    let (modules, skipped) = bind_scanned_modules(&[raw], &mut engine.pinned);
+    assert!(skipped.is_empty());
+    let mut rebuilt = plan::build_from_reconciled_modules(&modules);
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut rebuilt, &modules, &[], &engine.pinned)
+        .unwrap();
+    engine
+        .plan
+        .extend_exact_with_stable_module_ids(rebuilt)
+        .unwrap();
+    engine.modules = modules;
+    engine.publish_current_capture_facts().unwrap();
+}

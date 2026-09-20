@@ -2789,6 +2789,13 @@ fn ready_sleep_duration(paused: bool, backlog: bool, frame_due_in: Duration) -> 
 /// single ring consumer: polling observes readiness without consuming
 /// anything, and tick order (discovery before semantic consumption)
 /// is unchanged.
+/// `poll` takes whole milliseconds; round a nonzero timeout up so a
+/// sub-millisecond idle waits 1 ms instead of truncating to `poll(0)`
+/// (return immediately, spinning the loop until the frame lands).
+fn poll_timeout_ms(timeout: Duration) -> i32 {
+    timeout.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32
+}
+
 fn wait_until_ready(fd: BorrowedFd<'_>, timeout: Duration) {
     if timeout.is_zero() {
         return;
@@ -2798,7 +2805,7 @@ fn wait_until_ready(fd: BorrowedFd<'_>, timeout: Duration) {
         events: libc::POLLIN,
         revents: 0,
     };
-    let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+    let timeout_ms = poll_timeout_ms(timeout);
     // SAFETY: one initialized pollfd; the fd is the capture's EVENTS
     // map, open for the whole capture.
     if unsafe { libc::poll(&mut pollfd, 1, timeout_ms) } >= 0 {
@@ -6997,6 +7004,21 @@ mod tests {
             elapsed < Duration::from_secs(10),
             "readiness wait overran its timeout: {elapsed:?}"
         );
+    }
+
+    /// The poll timeout rounds up: exact milliseconds pass through, a
+    /// nonzero sub-millisecond timeout waits 1 ms rather than
+    /// truncating to `poll(0)`, and only zero maps to zero (which
+    /// `wait_until_ready` short-circuits before polling anyway).
+    #[test]
+    fn poll_timeout_rounds_sub_millisecond_up() {
+        assert_eq!(poll_timeout_ms(Duration::ZERO), 0);
+        assert_eq!(poll_timeout_ms(Duration::from_nanos(1)), 1);
+        assert_eq!(poll_timeout_ms(Duration::from_micros(500)), 1);
+        assert_eq!(poll_timeout_ms(Duration::from_millis(1)), 1);
+        assert_eq!(poll_timeout_ms(Duration::from_millis(200)), 200);
+        assert_eq!(poll_timeout_ms(Duration::from_secs(30)), 30_000);
+        assert_eq!(poll_timeout_ms(Duration::MAX), i32::MAX);
     }
 
     /// Zero timeout never blocks, even on an empty fd: the backlog path

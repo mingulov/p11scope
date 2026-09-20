@@ -5363,6 +5363,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn affected_group_count_covers_disturbed_bundles_once() {
+        let links = vec![
+            multi_link("p11_return", vec![0, 1, 2]),
+            multi_link("p11_entry", vec![0, 1]),
+            multi_link("p11_return", vec![5, 6]),
+            multi_link("p11_entry", vec![5, 6]),
+        ];
+        assert_eq!(
+            affected_group_count(&links, &BTreeSet::from([0, 1, 2])),
+            1,
+            "both sides of one group count once"
+        );
+        assert_eq!(
+            affected_group_count(&links, &BTreeSet::from([1, 5])),
+            2,
+            "members from two groups count both"
+        );
+        assert_eq!(
+            affected_group_count(&links, &BTreeSet::from([9])),
+            0,
+            "unlinked members disturb no group"
+        );
+    }
+
     fn rebuild_drops() -> (
         std::rc::Rc<std::cell::RefCell<Vec<Vec<String>>>>,
         impl FnMut(Vec<MultiLinkBundle<MockLink>>),

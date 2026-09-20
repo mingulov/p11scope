@@ -208,6 +208,9 @@ scan-path view/pin handling across `start_retained_with`).
   loader-observed `C_GetFunctionList`; for system scope (scan-only, every
   slot `unknown` since the 1.3 mislabel guard) it requires observed total
   ≥ truth total (other processes may add calls).
+  (Superseded: owned-workload coverage now requires owned attribution —
+  see `docs/notes/2026-09-20-task-3.1-audit-oracle.md`; unattributed
+  unknown/foreign sums no longer validate the window.)
 - Metrics-mode reports lack `attach_mechanisms` (profile-only field);
   recorded as null, honestly.
 - Trace mode is supported (`--mode trace|all`): the `-o` stream file is

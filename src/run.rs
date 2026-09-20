@@ -3861,7 +3861,7 @@ fn resolve_terminal_sink_total(
 /// too. The stdout copy keeps the pre-flush count — stdout under loss is
 /// best-effort, and a record cannot report its own delivery fate — while
 /// the file copy resolves the exact file/stdout byte difference. Without
-/// drops both copies are identical.
+/// drops both copies report identical drop counts.
 #[allow(clippy::too_many_arguments)]
 fn emit_trace_terminal_accounted<W: Write>(
     evidence: &mut render::Evidence,

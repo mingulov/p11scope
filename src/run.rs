@@ -2821,7 +2821,7 @@ type TraceTickContext<
     &'loss mut u64,
     &'stdout_ref mut (dyn Write + 'stdout_object),
     &'stdout_open mut bool,
-    &'out_file mut Option<std::fs::File>,
+    &'out_file mut Option<std::io::BufWriter<std::fs::File>>,
 );
 
 #[derive(Debug)]
@@ -2936,7 +2936,7 @@ fn capture_profile(
     // Opened by the caller before the attach; published by `commit()` only
     // once the final report is written.
     let has_output = output.is_some();
-    let mut stdout_sink = std::io::stdout().lock();
+    let mut stdout_sink = buffered_sink(std::io::stdout().lock());
     let stdout: &mut dyn Write = &mut stdout_sink;
     let profile = policy.uses_events();
     let mode = if profile { "profile" } else { "metrics" };
@@ -3343,9 +3343,9 @@ fn capture_trace(
     let mut remaining = Some(trace_limit);
     // A line stream, not a published artifact: opened by the caller before the
     // attach, then appended to as lines arrive.
-    let mut out_sink = out;
+    let mut out_sink = out.map(buffered_sink);
     let out_file = &mut out_sink;
-    let mut stdout_sink = std::io::stdout().lock();
+    let mut stdout_sink = buffered_sink(std::io::stdout().lock());
     let stdout: &mut dyn Write = &mut stdout_sink;
 
     let domain = session.events_domain();
@@ -3738,6 +3738,15 @@ fn write_stdout(writer: &mut dyn Write, open: &mut bool, bytes: &[u8]) -> Result
         }
         Err(error) => Err(error).context("writing stdout"),
     }
+}
+
+/// Sink buffer size: one 64 KiB batch per tick instead of a syscall per
+/// line. Ticks flush, so the first frame and trace lines still land
+/// promptly; buffering only coalesces the writes between flushes.
+pub(crate) const SINK_BUFFER_BYTES: usize = 65536;
+
+fn buffered_sink<W: Write>(writer: W) -> std::io::BufWriter<W> {
+    std::io::BufWriter::with_capacity(SINK_BUFFER_BYTES, writer)
 }
 
 fn flush_stdout(writer: &mut dyn Write, open: &mut bool) -> Result<()> {
@@ -7111,6 +7120,20 @@ mod tests {
             Duration::from_secs(4),
             Some(Duration::from_secs(5))
         ));
+    }
+
+    /// Buffering is transparent: bytes through a buffered sink flush out
+    /// verbatim, so batching trace writes cannot garble the stream.
+    #[test]
+    fn buffered_sink_preserves_bytes_verbatim() {
+        let mut direct = Vec::new();
+        let mut buffered = buffered_sink(Vec::new());
+        for line in ["CAPTURE privacy=allowlisted\n", "LOST 3 events\n"] {
+            direct.write_all(line.as_bytes()).unwrap();
+            buffered.write_all(line.as_bytes()).unwrap();
+        }
+        buffered.flush().unwrap();
+        assert_eq!(buffered.into_inner().unwrap(), direct);
     }
 
     /// A real SIGTERM (raised in-process after the handler is installed) sets

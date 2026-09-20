@@ -971,7 +971,14 @@ fn assert_static_descriptor_cookie_contract(
         "pub(crate) fn attach_targets(",
         "pub fn replace_targets",
     )?;
-    require_contract_marker(attach_targets, "prog.attach(point", "Aya uprobe attachment")?;
+    // Multi-point call shape since the vendored Aya p2 backport
+    // (`UProbe::attach(points, ..)`); the guarded property — the Aya
+    // uprobe attachment lives in `attach_targets` — is unchanged.
+    require_contract_marker(
+        attach_targets,
+        "prog.attach([point]",
+        "Aya uprobe attachment",
+    )?;
 
     assert_start_owner_seam(ebpf, owner)?;
 

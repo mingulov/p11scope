@@ -256,10 +256,10 @@ class WindowValidityTests(unittest.TestCase):
 
 
 class RingBytesTests(unittest.TestCase):
-    def test_default_is_256kib(self):
+    def test_default_is_4mib(self):
         resolve = MEASURE["resolve_ring_bytes"]
-        self.assertEqual(resolve("default"), 256 * 1024)
-        self.assertEqual(resolve(None), 256 * 1024)
+        self.assertEqual(resolve("default"), 4 * 1024 * 1024)
+        self.assertEqual(resolve(None), 4 * 1024 * 1024)
 
     def test_suffixes_and_bare_ints(self):
         resolve = MEASURE["resolve_ring_bytes"]
@@ -318,6 +318,161 @@ class LoadavgTests(unittest.TestCase):
     def test_missing_or_malformed_loadavg_is_none(self):
         self.assertIsNone(MEASURE["parse_loadavg"](None))
         self.assertIsNone(MEASURE["parse_loadavg"]("bogus"))
+
+
+def scheduling_fixture(**overrides):
+    """A valid scheduling sub-object, idle unless overridden."""
+    fixture = {
+        "drain_repolls": 0,
+        "drain_budget_exhaustions": 0,
+        "capture_event_loss": 0,
+        "detach_event_loss": 0,
+        "capture_discovery_loss": 0,
+        "detach_discovery_loss": 0,
+        "terminal_drain_bound": 65536,
+        "terminal_drain_truncated": False,
+        "sink_policy": "bounded-wait-drop",
+        "sink_stall_ms": 0,
+        "sink_timeouts": 0,
+        "sink_dropped_bytes": 0,
+        "phase_ms": {
+            "discovery": 0, "discovery_terminal": 0, "drain": 0,
+            "maps": 0, "render": 0, "detach": 0,
+        },
+        "max_inter_drain_gap_ms": 0,
+    }
+    fixture.update(overrides)
+    return fixture
+
+
+class SchedulingEvidenceCheckTests(unittest.TestCase):
+    def test_valid_scheduling_passes(self):
+        evidence = {"event_loss": 10, "discovery_ring_loss": 0,
+                    "scheduling": scheduling_fixture(
+                        capture_event_loss=6, detach_event_loss=4)}
+        ok, _ = MEASURE["check_scheduling_evidence"](evidence)
+        self.assertTrue(ok)
+
+    def test_missing_scheduling_fails_closed(self):
+        ok, detail = MEASURE["check_scheduling_evidence"](
+            {"event_loss": 0, "discovery_ring_loss": 0})
+        self.assertFalse(ok)
+        self.assertIn("missing", detail)
+
+    def test_split_mismatch_fails(self):
+        evidence = {"event_loss": 10, "discovery_ring_loss": 0,
+                    "scheduling": scheduling_fixture(
+                        capture_event_loss=6, detach_event_loss=5)}
+        ok, detail = MEASURE["check_scheduling_evidence"](evidence)
+        self.assertFalse(ok)
+        self.assertIn("split", detail)
+
+    def test_wrong_policy_fails(self):
+        evidence = {"event_loss": 0, "discovery_ring_loss": 0,
+                    "scheduling": scheduling_fixture(sink_policy="drop-all")}
+        ok, _ = MEASURE["check_scheduling_evidence"](evidence)
+        self.assertFalse(ok)
+
+
+class LossAttributionTests(unittest.TestCase):
+    def test_zero_loss_is_lossless(self):
+        result = MEASURE["attribute_loss"](
+            truth_calls=20000, ring_capacity=780, event_loss=0,
+            semantic_failures=0, scheduling=scheduling_fixture())
+        self.assertEqual(result["status"], "lossless")
+
+    def test_unthrottled_small_loss_is_capacity(self):
+        result = MEASURE["attribute_loss"](
+            truth_calls=20000, ring_capacity=780, event_loss=700,
+            semantic_failures=0, scheduling=scheduling_fixture())
+        self.assertEqual(result["status"], "attributed")
+        self.assertIn("ring-capacity-vs-production", result["bounds"])
+
+    def test_budget_exhaustion_names_the_tick_budget(self):
+        result = MEASURE["attribute_loss"](
+            truth_calls=20000, ring_capacity=780, event_loss=700,
+            semantic_failures=0,
+            scheduling=scheduling_fixture(drain_budget_exhaustions=3))
+        self.assertEqual(result["status"], "attributed")
+        self.assertIn("drain-tick-budget", result["bounds"])
+        self.assertNotIn("ring-capacity-vs-production", result["bounds"])
+
+    def test_detach_share_names_the_detach_window(self):
+        result = MEASURE["attribute_loss"](
+            truth_calls=20000, ring_capacity=780, event_loss=700,
+            semantic_failures=0,
+            scheduling=scheduling_fixture(
+                capture_event_loss=690, detach_event_loss=10))
+        self.assertEqual(result["status"], "attributed")
+        self.assertIn("detach-window", result["bounds"])
+
+    def test_terminal_truncation_names_the_terminal_bound(self):
+        result = MEASURE["attribute_loss"](
+            truth_calls=100000, ring_capacity=780, event_loss=65000,
+            semantic_failures=0,
+            scheduling=scheduling_fixture(terminal_drain_truncated=True))
+        self.assertEqual(result["status"], "attributed")
+        self.assertIn("terminal-drain-bound", result["bounds"])
+
+    def test_sink_drops_name_the_slow_sink(self):
+        result = MEASURE["attribute_loss"](
+            truth_calls=20000, ring_capacity=780, event_loss=3,
+            semantic_failures=0,
+            scheduling=scheduling_fixture(
+                sink_timeouts=2, sink_dropped_bytes=4096))
+        self.assertEqual(result["status"], "attributed")
+        self.assertIn("slow-sink", result["bounds"])
+
+    def test_semantic_skips_guard_attribution(self):
+        result = MEASURE["attribute_loss"](
+            truth_calls=20000, ring_capacity=780, event_loss=5,
+            semantic_failures=1, scheduling=scheduling_fixture())
+        self.assertEqual(result["status"], "guarded")
+
+    def test_unexplained_loss_fails_closed(self):
+        # Loss past burst physics with no bound fired: unattributed,
+        # never silently absorbed.
+        result = MEASURE["attribute_loss"](
+            truth_calls=20000, ring_capacity=780, event_loss=19900,
+            semantic_failures=0, scheduling=scheduling_fixture())
+        self.assertEqual(result["status"], "UNATTRIBUTED")
+
+    def test_missing_scheduling_cannot_claim_repair_credit(self):
+        result = MEASURE["attribute_loss"](
+            truth_calls=20000, ring_capacity=780, event_loss=0,
+            semantic_failures=0, scheduling=None)
+        self.assertEqual(result["status"], "lossless-unverified")
+        result = MEASURE["attribute_loss"](
+            truth_calls=20000, ring_capacity=780, event_loss=5,
+            semantic_failures=0, scheduling=None)
+        self.assertEqual(result["status"], "UNATTRIBUTED")
+
+
+class CancelProbeTests(unittest.TestCase):
+    MARKER = ("p11scope: cancel: loop exited on signal 2 "
+              "after 137 ticks")
+
+    def test_marker_parses(self):
+        row = {"ts_ns": 1720000000000000000, "stream": "stderr",
+               "line": self.MARKER}
+        found = MEASURE["find_cancel_marker"]([row])
+        self.assertEqual(
+            found, (1720000000000000000, 2, 137))
+
+    def test_garbage_and_missing_markers_are_none(self):
+        self.assertIsNone(MEASURE["find_cancel_marker"]([]))
+        self.assertIsNone(MEASURE["find_cancel_marker"](
+            [{"ts_ns": 1, "stream": "stderr", "line": "noise"}]))
+        self.assertIsNone(MEASURE["find_cancel_marker"](
+            [{"ts_ns": 1, "stream": "stdout", "line": self.MARKER}]))
+
+    def test_latency_verdict_edges(self):
+        verdict = MEASURE["cancel_probe_verdict"]
+        self.assertTrue(verdict(0, 99_999_999)["pass"])
+        self.assertFalse(verdict(0, 100_000_001)["pass"])
+        missed = MEASURE["cancel_probe_verdict"](0, None)
+        self.assertFalse(missed["pass"])
+        self.assertIn("marker", missed["detail"])
 
 
 if __name__ == "__main__":

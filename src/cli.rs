@@ -35,7 +35,7 @@ pub struct CaptureArgs {
     pub max_events: Option<u64>,
     /// `--max-scan-pids`: scope members scanned per pass; None ⇒ 256 default.
     pub max_scan_pids: Option<usize>,
-    /// `--ring-bytes`: EVENTS ringbuf size override; None ⇒ 256 KiB default.
+    /// `--ring-bytes`: EVENTS ringbuf size override; None ⇒ 4 MiB default.
     pub ring_bytes: Option<u32>,
     /// `--drain-interval-ms`: capture-loop tick override; None ⇒ per-mode default.
     pub drain_interval: Option<Duration>,
@@ -72,7 +72,7 @@ pub struct RunArgs {
     pub max_events: Option<u64>,
     /// `--max-scan-pids`: scope members scanned per pass; None ⇒ 256 default.
     pub max_scan_pids: Option<usize>,
-    /// `--ring-bytes`: EVENTS ringbuf size override; None ⇒ 256 KiB default.
+    /// `--ring-bytes`: EVENTS ringbuf size override; None ⇒ 4 MiB default.
     pub ring_bytes: Option<u32>,
     /// `--drain-interval-ms`: capture-loop tick override; None ⇒ per-mode default.
     pub drain_interval: Option<Duration>,

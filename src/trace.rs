@@ -606,6 +606,7 @@ mod tests {
             unprotected_live_windows: 0,
             module_unresolved_slots: 0,
             provider_changed: false,
+            scheduling: render::SchedulingEvidence::default(),
             completeness: "COMPLETE",
         }
     }

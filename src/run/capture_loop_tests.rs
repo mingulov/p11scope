@@ -236,18 +236,20 @@ fn terminal_completed_root_reduces_and_retires_before_ordinary_drain_in_both_mod
         let mut diagnostics = Vec::new();
 
         let snapshot = {
+            let mut scheduling = SchedulingAccumulator::default();
             let mut consumers = CaptureConsumers {
                 state: &mut state,
                 tracker: &mut tracker,
                 tracer: trace_mode.then_some(&mut tracer),
                 malformed_records: &mut malformed_records,
+                scheduling: &mut scheduling,
             };
             drain_capture_terminal_with(
                 &mut context,
                 &mut consumers,
                 true,
                 &mut diagnostics,
-                |context: &mut TerminalContext, detached| {
+                |context: &mut TerminalContext, _, detached| {
                     assert!(detached);
                     context.phases.push("discovery");
                     Ok((false, &context.plan))
@@ -306,7 +308,7 @@ fn terminal_completed_root_reduces_and_retires_before_ordinary_drain_in_both_mod
                     assert_eq!(consumers.state.pending_at_end(), 0);
                     if let Some(tracer) = consumers.tracer.as_deref_mut() {
                         let mut out_file: Option<Vec<u8>> = None;
-                        *consumers.malformed_records += drain_trace_events_from(
+                        let (malformed, _) = drain_trace_events_from(
                             &mut context.ordinary,
                             &mut context.remaining,
                             consumers.state,
@@ -318,14 +320,16 @@ fn terminal_completed_root_reduces_and_retires_before_ordinary_drain_in_both_mod
                             &mut out_file,
                             None,
                         )?;
+                        *consumers.malformed_records += malformed;
                     } else {
-                        *consumers.malformed_records += drain_profile_events(
+                        let (malformed, _) = drain_profile_events(
                             &mut context.ordinary,
                             consumers.state,
                             consumers.tracker,
                             &Scope::Pid(std::process::id()),
                             None,
                         )?;
+                        *consumers.malformed_records += malformed;
                     }
                     Ok(())
                 },
@@ -395,18 +399,20 @@ fn terminal_absent_and_cancelled_roots_retain_pending_state() {
         let mut context = context(plan, []);
         let mut diagnostics = Vec::new();
         let snapshot = {
+            let mut scheduling = SchedulingAccumulator::default();
             let mut consumers = CaptureConsumers {
                 state: &mut state,
                 tracker: &mut tracker,
                 tracer: None,
                 malformed_records: &mut malformed_records,
+                scheduling: &mut scheduling,
             };
             drain_capture_terminal_with(
                 &mut context,
                 &mut consumers,
                 true,
                 &mut diagnostics,
-                |context: &mut TickContext, _| Ok((false, &context.plan)),
+                |context: &mut TickContext, _, _| Ok((false, &context.plan)),
                 |_, _| {
                     (
                         Ok(if cancelled {
@@ -464,18 +470,20 @@ fn terminal_deferred_trace_writer_error_retires_then_skips_later_phases() {
     context.writer.fail = true;
     let mut diagnostics = Vec::new();
     let result = {
+        let mut scheduling = SchedulingAccumulator::default();
         let mut consumers = CaptureConsumers {
             state: &mut state,
             tracker: &mut tracker,
             tracer: Some(&mut tracer),
             malformed_records: &mut malformed_records,
+            scheduling: &mut scheduling,
         };
         drain_capture_terminal_with(
             &mut context,
             &mut consumers,
             true,
             &mut diagnostics,
-            |context: &mut TerminalContext, _| {
+            |context: &mut TerminalContext, _, _| {
                 context.phases.push("discovery");
                 Ok((false, &context.plan))
             },
@@ -535,18 +543,20 @@ fn terminal_errors_stop_at_the_current_attempt_boundary() {
         let phases = std::cell::RefCell::new(Vec::new());
         let mut diagnostics = Vec::new();
         let result = {
+            let mut scheduling = SchedulingAccumulator::default();
             let mut consumers = CaptureConsumers {
                 state: &mut state,
                 tracker: &mut tracker,
                 tracer: None,
                 malformed_records: &mut malformed_records,
+                scheduling: &mut scheduling,
             };
             drain_capture_terminal_with(
                 &mut context,
                 &mut consumers,
                 false,
                 &mut diagnostics,
-                |context: &mut TickContext, detached| {
+                |context: &mut TickContext, _, detached| {
                     phases.borrow_mut().push("discovery");
                     assert!(!detached);
                     if failure == "discovery" {
@@ -601,18 +611,20 @@ fn terminal_errors_stop_at_the_current_attempt_boundary() {
         bytes: Vec::new(),
     };
     let error = {
+        let mut scheduling = SchedulingAccumulator::default();
         let mut consumers = CaptureConsumers {
             state: &mut state,
             tracker: &mut tracker,
             tracer: None,
             malformed_records: &mut malformed_records,
+            scheduling: &mut scheduling,
         };
         drain_capture_terminal_with(
             &mut context,
             &mut consumers,
             true,
             &mut diagnostics,
-            |context: &mut TickContext, _| Ok((false, &context.plan)),
+            |context: &mut TickContext, _, _| Ok((false, &context.plan)),
             |_, _| {
                 (
                     Ok(OriginalRootDrain::Cancelled {
@@ -646,18 +658,20 @@ fn terminal_discovery_syncs_new_and_downgraded_slots_for_both_consumers() {
     let mut context = context(open_plan(), [open_event(11)]);
     let mut diagnostics = Vec::new();
     {
+        let mut scheduling = SchedulingAccumulator::default();
         let mut consumers = CaptureConsumers {
             state: &mut state,
             tracker: &mut tracker,
             tracer: Some(&mut tracer),
             malformed_records: &mut malformed_records,
+            scheduling: &mut scheduling,
         };
         let snapshot = drain_capture_terminal_with(
             &mut context,
             &mut consumers,
             true,
             &mut diagnostics,
-            |context: &mut TickContext, _| Ok((true, &context.plan)),
+            |context: &mut TickContext, _, _| Ok((true, &context.plan)),
             |_, _| (Ok(OriginalRootDrain::Absent), None),
             |context, consumers| drain_tick(context, consumers),
             |_, consumers| Ok(consumers.state.sessions().opened),
@@ -674,18 +688,20 @@ fn terminal_discovery_syncs_new_and_downgraded_slots_for_both_consumers() {
         EventDrain::over_test_domain(ScriptedRecords::events([open_event(12)], usize::MAX), 1);
     context.stdout.clear();
     {
+        let mut scheduling = SchedulingAccumulator::default();
         let mut consumers = CaptureConsumers {
             state: &mut state,
             tracker: &mut tracker,
             tracer: Some(&mut tracer),
             malformed_records: &mut malformed_records,
+            scheduling: &mut scheduling,
         };
         let snapshot = drain_capture_terminal_with(
             &mut context,
             &mut consumers,
             true,
             &mut diagnostics,
-            |context: &mut TickContext, _| Ok((true, &context.plan)),
+            |context: &mut TickContext, _, _| Ok((true, &context.plan)),
             |_, _| (Ok(OriginalRootDrain::Absent), None),
             |context, consumers| drain_tick(context, consumers),
             |_, consumers| Ok(consumers.state.sessions().opened),
@@ -717,7 +733,7 @@ fn context(plan: crate::plan::AttachPlan, events: impl IntoIterator<Item = Event
 }
 
 fn drain_tick(context: &mut TickContext, consumers: &mut CaptureConsumers<'_>) -> Result<()> {
-    let malformed = if let Some(tracer) = consumers.tracer.as_deref_mut() {
+    let (malformed, _) = if let Some(tracer) = consumers.tracer.as_deref_mut() {
         drain_trace_events_from(
             &mut context.drain,
             &mut context.remaining,
@@ -754,16 +770,18 @@ fn capture_tick_syncs_new_and_downgraded_slots_before_reduction() {
         let mut context = context(open_plan(), [open_event(11)]);
 
         {
+            let mut scheduling = SchedulingAccumulator::default();
             let mut consumers = CaptureConsumers {
                 state: &mut state,
                 tracker: &mut tracker,
                 tracer: trace_mode.then_some(&mut tracer),
                 malformed_records: &mut malformed_records,
+                scheduling: &mut scheduling,
             };
             let tick = capture_tick_with(
                 &mut context,
                 &mut consumers,
-                |context: &mut TickContext| Ok((true, true, &context.plan)),
+                |context: &mut TickContext, _| Ok((true, true, &context.plan)),
                 |_| Ok(None),
                 |context, consumers| {
                     drain_tick(context, consumers)?;
@@ -787,16 +805,18 @@ fn capture_tick_syncs_new_and_downgraded_slots_before_reduction() {
             EventDrain::over_test_domain(ScriptedRecords::events([open_event(12)], usize::MAX), 1);
         context.stdout.clear();
         {
+            let mut scheduling = SchedulingAccumulator::default();
             let mut consumers = CaptureConsumers {
                 state: &mut state,
                 tracker: &mut tracker,
                 tracer: trace_mode.then_some(&mut tracer),
                 malformed_records: &mut malformed_records,
+                scheduling: &mut scheduling,
             };
             let tick = capture_tick_with(
                 &mut context,
                 &mut consumers,
-                |context: &mut TickContext| Ok((true, true, &context.plan)),
+                |context: &mut TickContext, _| Ok((true, true, &context.plan)),
                 |_| Ok(None),
                 |context, consumers| {
                     drain_tick(context, consumers)?;
@@ -842,16 +862,18 @@ fn capture_tick_limit_skips_live_snapshot_and_check_but_terminal_reduces_remaind
     let check_called = std::cell::Cell::new(false);
 
     let tick = {
+        let mut scheduling = SchedulingAccumulator::default();
         let mut consumers = CaptureConsumers {
             state: &mut state,
             tracker: &mut tracker,
             tracer: Some(&mut tracer),
             malformed_records: &mut malformed_records,
+            scheduling: &mut scheduling,
         };
         capture_tick_with(
             &mut context,
             &mut consumers,
-            |context: &mut TickContext| Ok((false, false, &context.plan)),
+            |context: &mut TickContext, _| Ok((false, false, &context.plan)),
             |_| Ok(None),
             |context, consumers| {
                 drain_tick(context, consumers)?;
@@ -878,24 +900,26 @@ fn capture_tick_limit_skips_live_snapshot_and_check_but_terminal_reduces_remaind
 
     let mut diagnostics = Vec::new();
     let terminal_opened = {
+        let mut scheduling = SchedulingAccumulator::default();
         let mut consumers = CaptureConsumers {
             state: &mut state,
             tracker: &mut tracker,
             tracer: Some(&mut tracer),
             malformed_records: &mut malformed_records,
+            scheduling: &mut scheduling,
         };
         drain_capture_terminal_with(
             &mut context,
             &mut consumers,
             true,
             &mut diagnostics,
-            |context: &mut TickContext, detached| {
+            |context: &mut TickContext, _, detached| {
                 assert!(detached);
                 Ok((false, &context.plan))
             },
             |_, _| (Ok(OriginalRootDrain::Absent), None),
             |context, consumers| {
-                *consumers.malformed_records += drain_trace_events_from(
+                let (malformed, _) = drain_trace_events_from(
                     &mut context.drain,
                     &mut context.remaining,
                     consumers.state,
@@ -907,6 +931,7 @@ fn capture_tick_limit_skips_live_snapshot_and_check_but_terminal_reduces_remaind
                     &mut context.out_file,
                     None,
                 )?;
+                *consumers.malformed_records += malformed;
                 Ok(())
             },
             |_, consumers| Ok(consumers.state.sessions().opened),
@@ -933,16 +958,18 @@ fn capture_tick_snapshots_reduced_state_before_retained_check_failure() {
     let mut context = context(plan, [open_event(11)]);
     let observed_opened = std::cell::Cell::new(0);
     let error = {
+        let mut scheduling = SchedulingAccumulator::default();
         let mut consumers = CaptureConsumers {
             state: &mut state,
             tracker: &mut tracker,
             tracer: None,
             malformed_records: &mut malformed_records,
+            scheduling: &mut scheduling,
         };
         capture_tick_with(
             &mut context,
             &mut consumers,
-            |context: &mut TickContext| Ok((false, false, &context.plan)),
+            |context: &mut TickContext, _| Ok((false, false, &context.plan)),
             |_| Ok(None),
             |context, consumers| {
                 drain_tick(context, consumers)?;
@@ -979,16 +1006,18 @@ fn capture_tick_short_circuits_end_and_errors_after_required_sync() {
         let mut context = context(plan.clone(), [event]);
         let phases = std::cell::RefCell::new(Vec::new());
         let result = {
+            let mut scheduling = SchedulingAccumulator::default();
             let mut consumers = CaptureConsumers {
                 state: &mut state,
                 tracker: &mut tracker,
                 tracer: Some(&mut tracer),
                 malformed_records: &mut malformed_records,
+                scheduling: &mut scheduling,
             };
             capture_tick_with(
                 &mut context,
                 &mut consumers,
-                |context: &mut TickContext| {
+                |context: &mut TickContext, _| {
                     phases.borrow_mut().push("discovery");
                     if failure == "discovery" {
                         Err(anyhow::anyhow!("discovery failure"))
@@ -1037,16 +1066,18 @@ fn capture_tick_short_circuits_end_and_errors_after_required_sync() {
     let mut context = context(plan, []);
     let later_phase = std::cell::Cell::new(false);
     let result = {
+        let mut scheduling = SchedulingAccumulator::default();
         let mut consumers = CaptureConsumers {
             state: &mut state,
             tracker: &mut tracker,
             tracer: Some(&mut tracer),
             malformed_records: &mut malformed_records,
+            scheduling: &mut scheduling,
         };
         capture_tick_with(
             &mut context,
             &mut consumers,
-            |context: &mut TickContext| Ok((true, true, &context.plan)),
+            |context: &mut TickContext, _| Ok((true, true, &context.plan)),
             |_| Ok(Some(CaptureEnd::Signal)),
             |_, _| {
                 later_phase.set(true);

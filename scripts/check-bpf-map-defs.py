@@ -978,7 +978,10 @@ SAFE_MAPS = {
         "COUNTERS": (6, 4, 8, 5),
         "DISCOVERY": (27, 0, 0, 65_536),
         "DISCOVERY_STATE": (1, 24, 24, 64),
-        "EVENTS": (27, 0, 0, 262_144),
+        # 4 MiB since the F1 repair (was 262144): the default ring must
+        # absorb scheduling jitter at unpaced burst rates. Tracks
+        # ebpf-common RING_BYTES; change both together.
+        "EVENTS": (27, 0, 0, 4_194_304),
         "EVIDENCE": (6, 4, 8, 9),
         "MECH_SHAPE": (1, 8, 4, 1_024, 128),
         "PAUSE_PIDS": (1, 16, 8, 1),

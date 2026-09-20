@@ -84,6 +84,30 @@ LOADER_DISCOVERY_GROUPS = {
     "initial_set_capture": ("eligible", "none"),
 }
 LOADER_DISCOVERY_COUNTERS = ("hits", "state_read_failures")
+# Consumer-scheduling evidence (Task 3.1 repair): one nested object, closed
+# keys, exact loss-split identities. The terminal drain bound is a source
+# constant (events.rs TERMINAL_DRAIN_BOUND); pinning its value here forces
+# the oracle and the producer to change together.
+SCHEDULING_SINK_POLICY = "bounded-wait-drop"
+SCHEDULING_TERMINAL_DRAIN_BOUND = 65536
+SCHEDULING_U64_KEYS = (
+    "drain_repolls",
+    "drain_budget_exhaustions",
+    "capture_event_loss",
+    "detach_event_loss",
+    "capture_discovery_loss",
+    "detach_discovery_loss",
+    "terminal_drain_bound",
+    "sink_stall_ms",
+    "sink_timeouts",
+    "sink_dropped_bytes",
+    "max_inter_drain_gap_ms",
+)
+SCHEDULING_KEYS = set(SCHEDULING_U64_KEYS) | {
+    "terminal_drain_truncated", "sink_policy", "phase_ms",
+}
+SCHEDULING_PHASE_KEYS = ("discovery", "discovery_terminal", "drain",
+                           "maps", "render", "detach")
 PAUSE_VALUES = ("none", "sigstop", "partial")
 PAUSE_COUNTERS = ("pause_attempts", "pause_confirmed", "pause_partial")
 DISCOVERY_LOSS_COUNTERS = (
@@ -137,6 +161,7 @@ BASE_EVIDENCE_KEYS = set(COUNTERS) | {
     "attach_failures", "aliased", "skipped", "in_flight_at_end", "surfaces",
     "vendor_interfaces", "interface_list", "attach_gap_ms", "pause",
     *PAUSE_COUNTERS, "loader_discovery", "templates_truncated", "provider_changed",
+    "scheduling",
     "completeness",
     # Informational, not a COUNTER: spilling heuristic lookalikes past the
     # per-object cap is correct admission, not a coverage gap, so it never
@@ -341,6 +366,7 @@ def exact_profile_v3_selection(document, *, terminal=False, run=False):
     else:
         evidence = document
     exact_evidence_keys(evidence, profile=True, terminal=terminal, child=run)
+    exact_scheduling_evidence(evidence)
     exact_task_uprobe_link_losses(evidence)
     missing = {
         "interface_selection", "attach_mechanisms", "pid_descendant_gaps",
@@ -486,6 +512,10 @@ def exact_role_counts(description):
 def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, historical=False):
     counter_keys = set(HISTORICAL_COUNTERS if historical else COUNTERS)
     wanted = (BASE_EVIDENCE_KEYS - set(COUNTERS)) | counter_keys
+    if historical:
+        # Retained v2-metrics documents predate scheduling evidence, like
+        # the newer counters HISTORICAL_COUNTERS already excludes.
+        wanted.discard("scheduling")
     wanted |= PROFILE_V3_FIELDS if profile else set()
     if terminal:
         wanted |= TRACE_TERMINAL_KEYS
@@ -560,6 +590,7 @@ def exact_metrics_schema(document, *, run=False):
     require(document["capture"]["privacy_mode"] == "aggregate-only", document["capture"])
     exact_capture_scope(document)
     exact_evidence_keys(document["evidence"], profile=False, child=run)
+    exact_scheduling_evidence(document["evidence"])
     exact_task_uprobe_link_losses(document["evidence"])
 
 
@@ -570,6 +601,62 @@ def exact_historical_metrics_schema(document, *, run=False):
     require(document["capture"]["privacy_mode"] == "aggregate-only", document["capture"])
     exact_evidence_keys(
         document["evidence"], profile=False, child=run, historical=True
+    )
+
+
+def exact_scheduling_evidence(evidence):
+    """Closed scheduling shape plus the loss-split identities.
+
+    The splits are checked against the published loss counters, not just
+    for shape: a capture/detach attribution that does not sum to the
+    counter it claims to decompose is a misattribution, not evidence.
+    """
+    scheduling = evidence.get("scheduling")
+    require(isinstance(scheduling, dict), "scheduling evidence must be an object")
+    actual = set(scheduling)
+    require(
+        actual == SCHEDULING_KEYS,
+        f"unexpected scheduling keys: missing={sorted(SCHEDULING_KEYS - actual)}, "
+        f"extra={sorted(actual - SCHEDULING_KEYS)}",
+    )
+    for name in SCHEDULING_U64_KEYS:
+        require(u64(scheduling[name]), f"scheduling.{name}: invalid counter {scheduling[name]!r}")
+    require(
+        scheduling["terminal_drain_bound"] == SCHEDULING_TERMINAL_DRAIN_BOUND,
+        f"scheduling.terminal_drain_bound: want {SCHEDULING_TERMINAL_DRAIN_BOUND}, "
+        f"got {scheduling['terminal_drain_bound']}",
+    )
+    require(
+        scheduling["terminal_drain_truncated"] is False
+        or scheduling["terminal_drain_truncated"] is True,
+        f"scheduling.terminal_drain_truncated: invalid bool "
+        f"{scheduling['terminal_drain_truncated']!r}",
+    )
+    require(
+        scheduling["sink_policy"] == SCHEDULING_SINK_POLICY,
+        f"scheduling.sink_policy: want {SCHEDULING_SINK_POLICY!r}, "
+        f"got {scheduling['sink_policy']!r}",
+    )
+    phases = scheduling["phase_ms"]
+    require(isinstance(phases, dict), "scheduling.phase_ms must be an object")
+    require(
+        set(phases) == set(SCHEDULING_PHASE_KEYS),
+        f"unexpected phase_ms keys: {sorted(phases)}",
+    )
+    for name in SCHEDULING_PHASE_KEYS:
+        require(u64(phases[name]), f"scheduling.phase_ms.{name}: invalid counter {phases[name]!r}")
+    event_split = scheduling["capture_event_loss"] + scheduling["detach_event_loss"]
+    require(
+        event_split == evidence["event_loss"],
+        f"scheduling event split {event_split} != event_loss {evidence['event_loss']}",
+    )
+    discovery_split = (
+        scheduling["capture_discovery_loss"] + scheduling["detach_discovery_loss"]
+    )
+    require(
+        discovery_split == evidence["discovery_ring_loss"],
+        f"scheduling discovery split {discovery_split} != discovery_ring_loss "
+        f"{evidence['discovery_ring_loss']}",
     )
 
 
@@ -1443,7 +1530,8 @@ def validate_proxy_capacity_fallback(document, module_path=None):
     functions = document["functions"]
     require(len(functions) == evidence["slots"], len(functions))
     attributed = Counter()
-    called = 0
+    called_soft = 0
+    called_proxy = 0
     for item in functions:
         require(item["names"] == ["unknown"], f"scan-only function must be unnamed: {item}")
         require(item["aliased"] is False, item)
@@ -1451,12 +1539,19 @@ def validate_proxy_capacity_fallback(document, module_path=None):
         require(item["module"] in (soft_id, proxy_id), item)
         attributed["soft" if item["module"] == soft_id else "proxy"] += 1
         require(isinstance(item["calls"], int) and item["calls"] >= 0, item)
-        called += item["calls"]
+        if item["module"] == soft_id:
+            called_soft += item["calls"]
+        else:
+            called_proxy += item["calls"]
     require(
         dict(attributed) == {"soft": 68, "proxy": PROXY_ADMITTED_SLOTS},
         f"per-module function split: {dict(attributed)}",
     )
-    require(called > 0, "the proxy stack handled no calls")
+    # A green lane claims two-provider call coverage (audit F6): one global
+    # positive count lets complete loss on either provider pass, so each
+    # provider must have handled at least one call.
+    require(called_soft > 0, "SoftHSM2 handled no calls: single-provider, not proxy-stack coverage")
+    require(called_proxy > 0, "the proxy handled no calls: complete proxy-call loss is not two-provider coverage")
 
 
 def load_json(path):
@@ -2013,6 +2108,22 @@ def loader_discovery_fixture(**overrides):
     return aggregate
 
 
+def scheduling_fixture(**overrides):
+    """Closed scheduling shape, idle. Overrides state the exercised counts."""
+    fixture = {name: 0 for name in SCHEDULING_U64_KEYS}
+    fixture["terminal_drain_bound"] = SCHEDULING_TERMINAL_DRAIN_BOUND
+    fixture["terminal_drain_truncated"] = False
+    fixture["sink_policy"] = SCHEDULING_SINK_POLICY
+    fixture["phase_ms"] = {name: 0 for name in SCHEDULING_PHASE_KEYS}
+    for name, value in overrides.items():
+        require(
+            name in SCHEDULING_KEYS,
+            f"unknown scheduling fixture override: {name}",
+        )
+        fixture[name] = value
+    return fixture
+
+
 def evidence_fixture(surfaces, sources=("scan",), discovery_skipped=0):
     return {
         "authority": "hash-pinned",
@@ -2054,6 +2165,7 @@ def evidence_fixture(surfaces, sources=("scan",), discovery_skipped=0):
         "discovery_uncorroborated_candidates": 0,
         "templates_truncated": False,
         "provider_changed": False,
+        "scheduling": scheduling_fixture(),
         "completeness": "PARTIAL",
     }
 
@@ -2075,6 +2187,7 @@ def document_fixture(evidence, *, schema=PROFILE_SCHEMA, mode="profile", privacy
             evidence.pop("task_uprobe_link_losses", None)
             evidence.pop("abi_refusals", None)
             evidence.pop("semantic_history_drops", None)
+            evidence.pop("scheduling", None)
     capture = {
         "mode": mode,
         "privacy_mode": privacy,
@@ -2535,6 +2648,10 @@ def self_test():
         lambda d: d["evidence"].update(completeness="COMPLETE"),
         lambda d: d["evidence"].update(slots=68 + PROXY_ADMITTED_SLOTS - 1),
         lambda d: [item.update(calls=0) for item in d["functions"]],
+        # Audit F6: complete call loss on one provider is not two-provider
+        # coverage, even with the other provider's call still present.
+        lambda d: [item.update(calls=0) for item in d["functions"][68:]],
+        lambda d: d["functions"][0].update(calls=0),
         # The K=4 spill is exact in both directions.
         lambda d: d["evidence"].update(discovery_uncorroborated_candidates=PROXY_SPILL - 1),
         lambda d: d["evidence"].update(discovery_uncorroborated_candidates=PROXY_SPILL + 1),
@@ -3170,6 +3287,9 @@ def self_test():
         attached_probes=136,
         event_loss=1,
         unmatched_closes=1,
+        # The one lost event dropped while the capture loop ran, before the
+        # detach window opened.
+        scheduling=scheduling_fixture(capture_event_loss=1),
     )
     induced["G3"] = document_fixture(g3)
     induced["G3"]["functions"] = function_items(
@@ -3644,6 +3764,41 @@ def self_test():
         mutate(bad)
         rejected(lambda bad=bad: exact_active_to_empty(bad))
     print("active-to-empty keeps its history and declares every owner: OK")
+
+    # ---- consumer scheduling (Task 3.1 repair) --------------------------
+    # The loss splits are identities: capture + detach shares always sum to
+    # the published loss counter, so a repair that misattributes fails here.
+    scheduled = copy.deepcopy(clean)
+    scheduled["evidence"]["event_loss"] = 10
+    scheduled["evidence"]["scheduling"] = scheduling_fixture(
+        capture_event_loss=6, detach_event_loss=4,
+        drain_repolls=3, sink_dropped_bytes=0,
+    )
+    exact_scheduling_evidence(scheduled["evidence"])
+    for mutate in (
+        lambda d: d["evidence"].pop("scheduling"),
+        lambda d: d["evidence"]["scheduling"].pop("sink_policy"),
+        lambda d: d["evidence"]["scheduling"].update(sink_policy="drop-all"),
+        lambda d: d["evidence"]["scheduling"].update(drain_repolls=-1),
+        lambda d: d["evidence"]["scheduling"].update(drain_repolls=True),
+        lambda d: d["evidence"]["scheduling"].update(
+            terminal_drain_truncated="no"),
+        lambda d: d["evidence"]["scheduling"].update(terminal_drain_bound=0),
+        lambda d: d["evidence"]["scheduling"]["phase_ms"].pop("detach"),
+        lambda d: d["evidence"]["scheduling"]["phase_ms"].update(
+            discovery="fast"),
+        lambda d: d["evidence"]["scheduling"]["phase_ms"].update(
+            discovery_terminal="slow"),
+        lambda d: d["evidence"]["scheduling"].update(extra_key=1),
+        # Split identities: the shares must sum to the published counters.
+        lambda d: d["evidence"]["scheduling"].update(detach_event_loss=5),
+        lambda d: d["evidence"]["scheduling"].update(detach_discovery_loss=1),
+        lambda d: d["evidence"].update(event_loss=11),
+    ):
+        bad = copy.deepcopy(scheduled)
+        mutate(bad)
+        rejected(lambda bad=bad: exact_scheduling_evidence(bad["evidence"]))
+    print("scheduling evidence is exact and its loss splits are identities: OK")
     print("self-test: OK")
 
 

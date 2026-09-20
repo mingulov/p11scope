@@ -168,9 +168,14 @@ def predicted_burst_loss(generated, capacity_records):
 
 
 def resolve_ring_bytes(value):
-    """Ring bytes from a condition value: default/None, int, or n[K|M]."""
+    """Ring bytes from a condition value: default/None, int, or n[K|M].
+
+    The default tracks the binary's RING_BYTES (4 MiB since the F1
+    repair); profile/metrics records carry the authoritative capture
+    block, this only stands in for trace streams and mismatch notes.
+    """
     if value is None or value == "default":
-        return 256 * 1024
+        return 4 * 1024 * 1024
     if isinstance(value, int):
         return value
     text = str(value).strip()
@@ -276,14 +281,24 @@ def parse_trace_stream(lines):
     }
 
 
-def trace_counts_match(scope, truth, stats_returned):
+def trace_counts_match(scope, truth, stats_returned, *, owned_admitted=True,
+                       owned_note=""):
     """Window-validity rule for trace: kernel aggregate totals.
 
     Trace lines are delivered (lossy), so per-name line matching cannot
     validate the window; the ring-independent aggregate total can: exact
-    equality per-PID (no foreign calls), coverage on --system.
+    equality per-PID (no foreign calls), coverage on --system. On system
+    scope the aggregate cannot attribute calls to the owned workload, so
+    coverage additionally requires the owned module to be admitted (audit
+    F2): a refused owned workload is never satisfied by foreign totals.
     """
     truth_total = sum(truth.values())
+    if scope != "pid" and not owned_admitted:
+        note = ("trace system: owned workload module not admitted; kernel "
+                f"aggregate total ({stats_returned}) cannot prove owned "
+                f"coverage of truth ({truth_total})"
+                + ("" if not owned_note else f" ({owned_note})"))
+        return False, note
     if scope == "pid":
         match = stats_returned == truth_total
         note = ("trace pid: kernel aggregate total must equal workload "
@@ -365,18 +380,163 @@ def build_event_path(*, mode, generated, kernel_observed, event_loss,
     return path
 
 
+CANCEL_MARKER_RE = re.compile(
+    r"p11scope: cancel: loop exited on signal (-?\d+) after (\d+) ticks")
+CANCEL_LATENCY_BUDGET_NS = 100_000_000
+
+
+def check_scheduling_evidence(evidence):
+    """Consistency of the repair's scheduling sub-object.
+
+    Returns (ok, detail). Fail-closed: a missing sub-object, a split that
+    does not sum to its published counter, or a sink policy other than the
+    declared bounded-wait-drop all fail — the harness must assert the
+    policy's evidence, never assume it.
+    """
+    scheduling = evidence.get("scheduling")
+    if not isinstance(scheduling, dict):
+        return (False, "scheduling evidence missing (pre-repair schema?); "
+                       "repair credit unverifiable")
+    for key in ("capture_event_loss", "detach_event_loss",
+                "capture_discovery_loss", "detach_discovery_loss",
+                "sink_policy"):
+        if scheduling.get(key) is None:
+            return (False, f"scheduling evidence incomplete: missing {key}")
+    event_loss = evidence.get("event_loss")
+    if event_loss is None:
+        return (False, "event_loss counter missing; split unverifiable")
+    capture = scheduling["capture_event_loss"]
+    detach = scheduling["detach_event_loss"]
+    if capture + detach != event_loss:
+        return (False, f"event-loss split mismatch: capture {capture} + "
+                       f"detach {detach} != event_loss {event_loss}")
+    cap_disc = scheduling["capture_discovery_loss"]
+    det_disc = scheduling["detach_discovery_loss"]
+    disc_loss = evidence.get("discovery_ring_loss")
+    if disc_loss is not None and cap_disc + det_disc != disc_loss:
+        return (False, f"discovery-loss split mismatch: capture {cap_disc} "
+                       f"+ detach {det_disc} != discovery_ring_loss "
+                       f"{disc_loss}")
+    if scheduling["sink_policy"] != "bounded-wait-drop":
+        return (False, f"sink_policy {scheduling['sink_policy']!r}: want "
+                       "'bounded-wait-drop' (undeclared slow-sink behavior)")
+    return (True, "scheduling evidence consistent: splits sum to their "
+                  "counters, sink policy bounded-wait-drop")
+
+
+def attribute_loss(*, truth_calls, ring_capacity, event_loss,
+                   semantic_failures, scheduling):
+    """Name which bound broke: the envelope's outside-loss evidence.
+
+    Returns {"status", "bounds", "detail"}. Statuses: lossless (zero loss
+    with evidence), attributed (every share names a bound), guarded
+    (semantic skips make delivered bounded, not exact), lossless-unverified
+    (zero loss but no scheduling evidence), UNATTRIBUTED (loss past burst
+    physics with no bound fired — never silently absorbed).
+    """
+    if scheduling is None:
+        if event_loss == 0:
+            return {"status": "lossless-unverified", "bounds": [],
+                    "detail": "zero loss but no scheduling evidence: "
+                              "repair credit unverifiable"}
+        return {"status": "UNATTRIBUTED", "bounds": [],
+                "detail": f"event_loss={event_loss} with no scheduling "
+                          "evidence"}
+    if semantic_failures:
+        return {"status": "guarded", "bounds": [],
+                "detail": f"semantic_capture_failures={semantic_failures}: "
+                          "delivered is bounded, not exact"}
+    if event_loss == 0:
+        return {"status": "lossless", "bounds": [],
+                "detail": "event_loss=0 with consistent scheduling evidence"}
+    bounds = []
+    detach = scheduling.get("detach_event_loss") or 0
+    truncated = scheduling.get("terminal_drain_truncated", False)
+    exhausted = scheduling.get("drain_budget_exhaustions") or 0
+    if exhausted:
+        bounds.append("drain-tick-budget")
+    if detach:
+        bounds.append("detach-window")
+    if truncated:
+        bounds.append("terminal-drain-bound")
+    if scheduling.get("sink_timeouts") or scheduling.get("sink_dropped_bytes"):
+        bounds.append("slow-sink")
+    if not bounds:
+        if event_loss <= predicted_burst_loss(truth_calls, ring_capacity):
+            bounds.append("ring-capacity-vs-production")
+        else:
+            return {"status": "UNATTRIBUTED", "bounds": [],
+                    "detail": f"event_loss={event_loss} past burst physics "
+                              f"({truth_calls} calls vs {ring_capacity} "
+                              "records) with no bound fired"}
+    elif not (exhausted or truncated):
+        # A fired scheduling bound explains the path it meters; any capture
+        # residue past burst physics is still unattributed.
+        residue = event_loss - detach
+        if residue > 0:
+            if residue <= predicted_burst_loss(truth_calls, ring_capacity):
+                bounds.append("ring-capacity-vs-production")
+            else:
+                return {"status": "UNATTRIBUTED", "bounds": list(bounds),
+                        "detail": f"capture residue {residue} past burst "
+                                  f"physics; {bounds} explain only part"}
+    return {"status": "attributed", "bounds": bounds,
+            "detail": f"event_loss={event_loss} attributed to "
+                      f"{', '.join(bounds)}"}
+
+
+def find_cancel_marker(stderr_rows):
+    """(ts_ns, signal, ticks) of the loop-exit cancel marker, else None.
+
+    Accepts harness stderr-ts rows (t_mono_ns, stderr-only) and the
+    stream-tagged shape: rows tagged a non-stderr stream never match.
+    """
+    for row in stderr_rows:
+        if row.get("stream", "stderr") != "stderr":
+            continue
+        match = CANCEL_MARKER_RE.search(row.get("line", ""))
+        if match is None:
+            continue
+        ts = row.get("ts_ns", row.get("t_mono_ns"))
+        if ts is None:
+            continue
+        return (int(ts), int(match.group(1)), int(match.group(2)))
+    return None
+
+
+def cancel_probe_verdict(t0_ns, t_marker_ns):
+    """Control-latency verdict: ack within the 100ms budget. Fail-closed."""
+    if t_marker_ns is None:
+        return {"pass": False,
+                "detail": "cancel marker missing: the loop never "
+                          "acknowledged the signal"}
+    latency = t_marker_ns - t0_ns
+    if latency <= CANCEL_LATENCY_BUDGET_NS:
+        return {"pass": True,
+                "detail": f"cancel acknowledged in {latency} ns "
+                          "(budget 100ms)"}
+    return {"pass": False,
+            "detail": f"cancel latency {latency} ns exceeded the 100ms "
+                      "budget"}
+
+
 def assess_window(*, gate, scope, counts_match, collapsed,
-                  attached_probes, trace_crosscheck):
+                  attached_probes, trace_crosscheck, coverage_detail=None):
     """Post-hoc window validity, decisive for weak (non-frame) gates.
 
     The frame gate is an in-observer attach-end signal; marker+settle
     gates are not, so they stand or fall on post-hoc evidence. The
     aggregate counts are ring-independent, which makes counts_match a
-    window proof rather than a loss statement.
+    window proof rather than a loss statement. `coverage_detail`, when
+    given, names the exact coverage failure (e.g. unattributable owned
+    traffic) instead of the generic missed-window text.
     """
     problems = []
     if not counts_match:
-        problems.append("counts_match=False (window missed workload calls)")
+        if coverage_detail is None:
+            problems.append("counts_match=False (window missed workload calls)")
+        else:
+            problems.append(f"counts_match=False ({coverage_detail})")
     if collapsed:
         problems.append("COLLAPSED WINDOW (setup exceeded the duration)")
     if attached_probes <= 0:
@@ -419,8 +579,96 @@ def aggregate_functions(report):
     return observed
 
 
+def owned_module_candidates(meta):
+    """Argv entries that may name the owned workload provider module.
+
+    The harness runs the workload as [workload, MODULE, N, PACE, MAP_EARLY],
+    so argv[1] is the owned module; a single-entry argv (synthetic inputs)
+    names it directly.
+    """
+    argv = (meta.get("condition", {}).get("workload_argv") or [])
+    if len(argv) > 1:
+        return [str(argv[1])]
+    return [str(entry) for entry in argv]
+
+
+def _module_identity(ref):
+    """(dev, ino, sha256) identity of a module ref, or None when absent.
+
+    Real reports carry dev/ino/sha256 on both functions[].module and
+    evidence.discovery[]; synthetic inputs may carry a bare path instead.
+    """
+    if not isinstance(ref, dict):
+        return None
+    if "ino" not in ref or "dev" not in ref:
+        return None
+    dev = ref["dev"]
+    if isinstance(dev, (list, tuple)):
+        dev = tuple(dev)
+    return (dev, ref.get("ino"), ref.get("sha256"))
+
+
+def assess_owned_coverage(functions, discovery, refused, owned_paths):
+    """Owned-workload attribution for system-scope coverage (audit F2).
+
+    Scan-only system captures name every slot `unknown`, so unknown-name
+    totals cannot tell owned workload calls from foreign traffic: coverage
+    must come from calls attributed to the owned workload module, never
+    from global sums. Returns {"owned_admitted", "owned_calls",
+    "total_calls", "note"}.
+    """
+    discovery = discovery or []
+    refused_paths = {str(row.get("path")) for row in (refused or [])
+                     if isinstance(row, dict) and row.get("path")}
+    owned_entries = [entry for entry in discovery
+                     if isinstance(entry, dict)
+                     and str(entry.get("path")) in owned_paths]
+    owned_identities = {_module_identity(entry) for entry in owned_entries}
+    owned_identities.discard(None)
+    owned_refused = [path for path in owned_paths if path in refused_paths]
+    owned_admitted = bool(owned_entries) and not owned_refused
+    owned_calls = 0
+    total_calls = 0
+    for entry in functions or []:
+        calls = int(entry.get("calls", 0))
+        total_calls += calls
+        ref = entry.get("module")
+        if _module_identity(ref) is not None:
+            if _module_identity(ref) in owned_identities:
+                owned_calls += calls
+        elif isinstance(ref, dict) and str(ref.get("path")) in owned_paths:
+            owned_calls += calls
+    if not owned_entries:
+        admitted = sorted(str(entry.get("path")) for entry in discovery
+                          if isinstance(entry, dict)) or ["none"]
+        note = (f"owned workload module {owned_paths} not admitted "
+                f"(admitted: {admitted}"
+                + ("" if not refused_paths else
+                   f"; refused: {sorted(refused_paths)}") + ")")
+    elif owned_refused:
+        note = (f"owned workload module {owned_refused} refused; "
+                "unknown-name totals cannot prove owned coverage")
+    else:
+        note = (f"owned-attributed {owned_calls} of {total_calls} observed "
+                f"calls (module {owned_paths})")
+    return {"owned_admitted": owned_admitted, "owned_calls": owned_calls,
+            "total_calls": total_calls, "note": note}
+
+
+def _observer_phase_s(phase_ms, key):
+    """In-observer phase timer as seconds, or None when absent/unusable."""
+    if not isinstance(phase_ms, dict):
+        return None
+    value = phase_ms.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value < 0:
+        return None
+    return float(value) / 1000.0
+
+
 def derive_phases(samples, stderr_rows, duration_s, t_spawn_ns, t_exit_ns,
-                  t_go_ns=None):
+                  t_go_ns=None, phase_ms=None):
     """Split wall time into phases from external traces.
 
     t_discovery: timestamped `p11scope: discovery:` stderr marker (the
@@ -436,6 +684,14 @@ def derive_phases(samples, stderr_rows, duration_s, t_spawn_ns, t_exit_ns,
     publish = detach end -> exit (report write + teardown).
     BPF program/map load has no external marker: it is folded into attach
     and reported as load_s=null with this reason.
+    `phase_ms`: the observer's own phase timers
+      (evidence.scheduling.phase_ms), when the report carries them. The
+      fd-trace estimator assumes the target lives until the computed
+      expiry; a target that exits early leaves no taper, so the estimate
+      reports detach_s=0.0 while the observer measured a real tail
+      (audit F9). The in-observer detach timer is authoritative in that
+      case; an estimated 0.0 without one is unconfirmed, never proof of
+      instant teardown.
     """
     method_warnings = []
     t_discovery = None
@@ -534,6 +790,19 @@ def derive_phases(samples, stderr_rows, duration_s, t_spawn_ns, t_exit_ns,
     phases["drain_s"] = drain
     phases["detach_s"] = max(0.0, (detach_end - detach_start) / 1e9)
     phases["publish_s"] = max(0.0, (t_exit_ns - detach_end) / 1e9)
+    observer_detach_s = _observer_phase_s(phase_ms, "detach")
+    if observer_detach_s is not None:
+        if phases["detach_s"] == 0.0 and observer_detach_s > 0:
+            method_warnings.append(
+                "fd-trace detach estimate 0.0s contradicts the in-observer "
+                f"detach timer ({observer_detach_s:.3f}s); using the "
+                "in-observer value")
+            phases["detach_s"] = observer_detach_s
+    elif phases["detach_s"] == 0.0:
+        method_warnings.append(
+            "detach_s=0.0 is an fd-trace estimate with no in-observer "
+            "timer to confirm it; an early target exit hides the detach "
+            "tail (audit F9)")
     return phases, discovery_line
 
 
@@ -764,10 +1033,21 @@ def main(argv):
 
     kernel_observed = None
     crosscheck_holds, crosscheck_detail = True, "n/a (not a trace run)"
+    window_coverage_detail = None
+    # System-scope coverage requires owned attribution (audit F2): the
+    # owned workload module resolves via workload_argv against admitted
+    # discovery. Trace streams carry no functions[]; the admission half
+    # of this assessment still applies to them.
+    owned = assess_owned_coverage(
+        report.get("functions", []), evidence.get("discovery", []),
+        refused, owned_module_candidates(meta))
     if is_trace:
         kernel_observed = int(stream["count_evidence"]["stats_returned"])
         counts_match, match_note = trace_counts_match(
-            scope, truth, kernel_observed)
+            scope, truth, kernel_observed,
+            owned_admitted=owned["owned_admitted"], owned_note=owned["note"])
+        if scope != "pid" and not counts_match:
+            window_coverage_detail = match_note
         crosscheck_holds, crosscheck_detail = trace_crosscheck(
             lost_total=stream["lost_total"],
             event_loss=int(evidence.get("event_loss", 0)),
@@ -788,26 +1068,45 @@ def main(argv):
         if set(observed) <= {"unknown"}:
             # System runs are scan-only: since the 1.3 mislabel guard,
             # unlinked heuristic tables carry no ordinal labels, so
-            # per-function matching is impossible and coverage is compared
-            # on totals (foreign processes may still add calls).
+            # per-name matching is impossible. Unknown-name totals cannot
+            # tell owned workload calls from foreign traffic, so coverage
+            # requires owned-module attribution (audit F2): foreign-only
+            # sums never satisfy the assertion, even when they are large.
             truth_total = sum(truth.values())
-            observed_total = sum(observed.values())
-            counts_match = observed_total >= truth_total
-            match_note = (
-                "system scan-only: names unavailable (unknown); "
-                f"total coverage {observed_total} >= {truth_total}"
-            )
+            if not owned["owned_admitted"]:
+                counts_match = False
+                match_note = ("system scan-only: names unavailable "
+                              f"(unknown); {owned['note']}; total coverage "
+                              "unprovable")
+            else:
+                counts_match = owned["owned_calls"] >= truth_total
+                match_note = (
+                    "system scan-only: names unavailable (unknown); "
+                    "owned-attributed coverage "
+                    f"{owned['owned_calls']} vs truth {truth_total} "
+                    f"({owned['note']})"
+                )
+            window_coverage_detail = match_note
+        elif not owned["owned_admitted"]:
+            counts_match = False
+            match_note = ("system scope: named coverage requires the owned "
+                          f"workload module; {owned['note']}")
+            window_coverage_detail = match_note
         else:
             counts_match = all(observed.get(k, 0) >= v for k, v in truth.items())
             match_note = ("system scope: observed must cover workload truth "
                           "(other processes may add calls)")
 
+    scheduling_timers = evidence.get("scheduling")
+    observer_phase_ms = (scheduling_timers.get("phase_ms")
+                         if isinstance(scheduling_timers, dict) else None)
     phases, discovery_line = derive_phases(
         samples, stderr_rows,
         float(meta["condition"]["duration_s"]),
         int(meta["timing"]["t_spawn_mono_ns"]),
         int(meta["timing"]["t_exit_mono_ns"]),
         int(meta["timing"]["t_go_mono_ns"]),
+        phase_ms=observer_phase_ms,
     )
     if missing_counters:
         phases["method_warnings"].append(
@@ -853,7 +1152,61 @@ def main(argv):
         gate=meta["condition"].get("gate", "frame"), scope=scope,
         counts_match=counts_match, collapsed=collapsed,
         attached_probes=attached_probes,
-        trace_crosscheck=crosscheck_holds)
+        trace_crosscheck=crosscheck_holds,
+        coverage_detail=window_coverage_detail)
+
+    # Task 3.1 repair: scheduling consistency + which-bound-broke
+    # attribution + the cancel control-latency probe. A missing scheduling
+    # sub-object is recorded in-section (pre-repair schema); only a present
+    # but inconsistent one warns globally, so old fixtures stay clean.
+    sched_evidence = evidence.get("scheduling")
+    sched_ok, sched_detail = check_scheduling_evidence({
+        "event_loss": event_loss,
+        "discovery_ring_loss": counters.get("discovery_ring_loss"),
+        "scheduling": sched_evidence,
+    })
+    if sched_evidence is not None and not sched_ok:
+        phases["method_warnings"].append(
+            f"scheduling evidence inconsistent: {sched_detail}")
+    if (event_loss is None or semantic_failures is None
+            or not isinstance(event_path, dict)
+            or "ring_capacity_records" not in event_path):
+        attribution = {"status": "guarded", "bounds": [],
+                       "detail": "loss counters missing; no attribution "
+                                 "possible"}
+    else:
+        attribution = attribute_loss(
+            truth_calls=generated,
+            ring_capacity=event_path["ring_capacity_records"],
+            event_loss=event_loss, semantic_failures=semantic_failures,
+            scheduling=sched_evidence)
+    if (sched_evidence is not None
+            and attribution["status"] == "UNATTRIBUTED"):
+        phases["method_warnings"].append(
+            f"loss unattributed: {attribution['detail']}")
+    cancel_request = meta["condition"].get("cancel_probe") or {}
+    marker = find_cancel_marker(stderr_rows)
+    if marker is None and not cancel_request:
+        cancel_probe = None
+    else:
+        t_ref = cancel_request.get(
+            "sent_mono_ns", int(meta["timing"]["t_go_mono_ns"]))
+        cancel_probe = {"marker": None, "verdict": None}
+        if marker is not None:
+            ts, sig, ticks = marker
+            cancel_probe["marker"] = {"ts_ns": ts, "signal": sig,
+                                      "ticks": ticks}
+            cancel_probe["verdict"] = cancel_probe_verdict(t_ref, ts)
+        else:
+            cancel_probe["verdict"] = cancel_probe_verdict(t_ref, None)
+        if not cancel_request:
+            cancel_probe["note"] = (
+                "unsolicited marker (no cancel_probe condition); latency "
+                "vs t_go is informational")
+        elif not cancel_probe["verdict"]["pass"]:
+            phases["method_warnings"].append(
+                "cancel probe failed: "
+                f"{cancel_probe['verdict']['detail']}")
 
     host = dict(meta["host"])
     loadavg = parse_loadavg(host.get("loadavg"))
@@ -880,6 +1233,12 @@ def main(argv):
         "discovery_line": discovery_line,
         "window": window,
         "event_path": event_path,
+        "scheduling": {
+            "check": {"ok": sched_ok, "detail": sched_detail},
+            "attribution": attribution,
+            "evidence": sched_evidence,
+        },
+        "cancel_probe": cancel_probe,
         "evidence": {
             "scan_ms": evidence.get("scan_ms"),
             "counters_source": counters_source,
@@ -950,8 +1309,10 @@ def main(argv):
             "Observer CPU/RSS are wall-window samples; noisy under concurrent "
             "build load (sibling workers) — see the design note.",
             "counts_match for pid scope requires exact per-name equality; "
-            "for system scope (scan-only, unknown names) it requires "
-            "observed total >= truth total.",
+            "for system scope it requires the owned workload module to be "
+            "admitted, and for scan-only (unknown names) owned-attributed "
+            "calls must cover truth (foreign/unknown totals alone never "
+            "satisfy coverage).",
         ],
     }
     Path(args.out).write_text(json.dumps(record, indent=2) + "\n",

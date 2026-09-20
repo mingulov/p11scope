@@ -376,6 +376,80 @@ fn the_live_drain_applies_the_quantum_prefix_and_leaves_the_backlog_queued() {
     assert!(session.dequeues.is_empty());
 }
 
+/// The shallow predicate is the exact deferral contract: a quiet
+/// non-pid engine may skip the inventory sweep, while pending work, a
+/// refresh request, staged facts, or pid scope always forces the full
+/// pass. Pid scope never defers: its per-tick sweep is the generation
+/// authority and already cheap.
+#[test]
+fn shallow_idle_predicate_covers_pending_refresh_staged_and_scope() {
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
+    assert!(engine.discovery_shallow_idle());
+
+    engine.pending_retirements.insert(ProcessViewId(7));
+    assert!(!engine.discovery_shallow_idle());
+    engine.pending_retirements.clear();
+
+    engine.refresh_requested.insert(std::process::id());
+    assert!(!engine.discovery_shallow_idle());
+    engine.refresh_requested.clear();
+
+    engine.capture_facts.staged = Some(engine.capture_facts.history.clone());
+    assert!(!engine.discovery_shallow_idle());
+    engine.capture_facts.staged = None;
+
+    engine.scope = Scope::Pid(std::process::id());
+    assert!(!engine.discovery_shallow_idle());
+
+    assert!(engine.pending_loader_scans.is_empty());
+    assert!(engine.pending_rejected_keys.is_empty());
+    assert!(engine.pending_leader_exit_views.is_empty());
+    assert!(engine.expected_target_exit_pending.is_none());
+    assert!(engine.ready_expected_removals.is_empty());
+    assert!(engine.pending_discovery_records.is_empty());
+}
+
+/// Loader events are never delayed by shallow frames: a ring with
+/// records upgrades to the full pass and applies them same-frame.
+#[test]
+fn shallow_drain_applies_ring_records_like_a_full_pass() {
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
+    let mut session = ScriptedSession::default();
+    session.dequeues.extend(malformed_dequeues(3));
+
+    assert!(
+        !engine
+            .drain_discovery_shallow_from(&mut session, false)
+            .expect("records upgrade, never fail")
+    );
+
+    assert_eq!(engine.malformed_discovery, 3);
+    assert!(session.dequeues.is_empty());
+}
+
+/// A quiet frame applies nothing and changes nothing: no plan change,
+/// no counter movement, no queued work.
+#[test]
+fn shallow_drain_skips_quiet_frames_without_side_effects() {
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
+    let mut session = ScriptedSession::default();
+
+    assert!(
+        !engine
+            .drain_discovery_shallow_from(&mut session, false)
+            .unwrap()
+    );
+    assert!(
+        !engine
+            .drain_discovery_shallow_from(&mut session, true)
+            .expect("a forced full pass over quiet state still applies nothing")
+    );
+
+    assert_eq!(engine.malformed_discovery, 0);
+    assert!(engine.pending_discovery_records.is_empty());
+    assert!(engine.pending_retirements.is_empty());
+}
+
 #[test]
 fn terminal_drain_consumes_all_discovery_quanta_and_refreshes_counters() {
     let (mut engine, _scope) = engine_over_cgroup_naming(&[]);
@@ -5604,6 +5678,7 @@ fn evidence_verdict(
         module_unresolved_slots: 0,
         provider_changed: false,
         discovery: discovery_evidence(plan, pinned, counters),
+        scheduling: render::SchedulingEvidence::default(),
         completeness: "UNKNOWN",
     };
     evidence.verdict();
@@ -15189,6 +15264,7 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
         module_unresolved_slots: 0,
         provider_changed: false,
         discovery,
+        scheduling: render::SchedulingEvidence::default(),
         completeness: "UNKNOWN",
     };
     evidence.verdict();

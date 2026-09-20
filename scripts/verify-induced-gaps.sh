@@ -408,7 +408,7 @@ DISCOVER="$WORK/default-build/release/p11scope-discover"
 
 echo "=== build small-ring p11scope (Gap 3 only; default build untouched) ==="
 # RING_BYTES override mechanism: crates/ebpf-common's `small-ring` Cargo
-# feature (off by default) shrinks RING_BYTES 256KiB -> 4KiB; build.rs
+# feature (off by default) shrinks RING_BYTES 4MiB -> 4KiB; build.rs
 # forwards it to the eBPF crate's build only when P11SCOPE_SMALL_RING is
 # set. A separate --target-dir keeps this build fully out of target/release
 # so scripts/verify-attach-e2e.sh's binary is never touched by this script.
@@ -447,9 +447,9 @@ STATE_BPF=$1
 set -- "$WORK"/freeze-build/release/build/p11scope-*/out/p11scope-ebpf
 [ "$#" -eq 1 ] && [ -f "$1" ] || { echo "feature BPF object is not unique"; exit 1; }
 FREEZE_BPF=$1
-python3 scripts/check-bpf-map-defs.py "$DEFAULT_BPF" EVENTS=262144 START=16384 RV_COUNTS=4096
+python3 scripts/check-bpf-map-defs.py "$DEFAULT_BPF" EVENTS=4194304 START=16384 RV_COUNTS=4096
 python3 scripts/check-bpf-map-defs.py "$RING_BPF" EVENTS=4096 START=16384 RV_COUNTS=4096
-python3 scripts/check-bpf-map-defs.py "$STATE_BPF" EVENTS=262144 START=1 RV_COUNTS=1
+python3 scripts/check-bpf-map-defs.py "$STATE_BPF" EVENTS=4194304 START=1 RV_COUNTS=1
 python3 scripts/check-bpf-map-defs.py --policy-inventory "$DEFAULT_BPF" "$FREEZE_BPF"
 
 pin_workload() {

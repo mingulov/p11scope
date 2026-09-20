@@ -726,7 +726,7 @@ fn domain_boundary_malformed_affiliation_has_no_reducer_effects() {
     let mut drain = EventDrain::over_test_domain(ScriptedRecords::records(records, 3), 1);
     assert_eq!(
         drain_profile_events(&mut drain, &mut s, &mut t, &scope(), None).unwrap(),
-        3
+        (3, false)
     );
     assert_eq!(s.sessions().opened, 0);
     assert_eq!(s.semantic_evidence().semantic_history_drops, 0);
@@ -796,7 +796,7 @@ fn domain_boundary_malformed_trace_never_counts_or_emits_or_reduces() {
             None
         )
         .unwrap(),
-        2
+        (2, false)
     );
     assert_eq!(tracer.raw_calls(), 0);
     assert!(output.is_empty());

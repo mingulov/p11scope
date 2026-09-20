@@ -4766,6 +4766,7 @@ mod tests {
         assert_eq!(bundles[3].program, "p11_entry");
         assert_eq!(outcome.successful.len(), 8);
         assert!(outcome.failures.is_empty());
+        assert!(!outcome.exhausted);
         assert_eq!(outcome.completed.len(), 4);
         assert!(
             outcome.completed.iter().all(|(_, at)| *at == Some(7)),
@@ -4906,6 +4907,7 @@ mod tests {
         };
         let (bundles, outcome) =
             attach_target_groups_with(&groups, |_| Some(7), mock.leaf()).unwrap();
+        assert!(outcome.exhausted);
         assert_eq!(outcome.failures.len(), 1);
         assert_eq!(outcome.failures[0].0, 0);
         assert_eq!(
@@ -5012,6 +5014,378 @@ mod tests {
         assert!(links_cover_slot(&links, 7));
         assert!(!links_cover_slot(&links, 9));
         assert!(!links_cover_slot(&[], 7));
+    }
+
+    #[test]
+    fn rebuild_closure_collects_every_affected_member() {
+        let links = vec![
+            multi_link("p11_return", vec![0, 1, 2]),
+            multi_link("p11_entry", vec![0, 1, 2]),
+            multi_link("p11_return", vec![5, 6]),
+            multi_link("p11_entry", vec![5, 6]),
+        ];
+        assert_eq!(
+            plan_group_rebuild(&links, &BTreeSet::from([1])),
+            Some(BTreeSet::from([0, 1, 2])),
+            "a partially retired group rebuilds every member, survivors included"
+        );
+        assert_eq!(
+            plan_group_rebuild(&links, &BTreeSet::from([0, 1, 2])),
+            None,
+            "a wholly retired bundle detaches with no rebuild"
+        );
+        assert_eq!(
+            plan_group_rebuild(&links, &BTreeSet::from([9])),
+            None,
+            "an unlinked slot never triggers a rebuild"
+        );
+        assert_eq!(
+            plan_group_rebuild(&links, &BTreeSet::new()),
+            None,
+            "an empty retirement never triggers a rebuild"
+        );
+        assert_eq!(
+            plan_group_rebuild(&[], &BTreeSet::from([1])),
+            None,
+            "no links means no groups to rebuild"
+        );
+    }
+
+    #[test]
+    fn rebuild_closure_follows_entry_subset_bundles() {
+        // An entry-refused member left the return bundle wider than the
+        // entry bundle; retiring the refused member still rebuilds the
+        // entry side that shares its surviving sibling.
+        let links = vec![
+            multi_link("p11_return", vec![0, 1]),
+            multi_link("p11_entry", vec![0]),
+        ];
+        assert_eq!(
+            plan_group_rebuild(&links, &BTreeSet::from([1])),
+            Some(BTreeSet::from([0, 1]))
+        );
+    }
+
+    #[test]
+    fn rebuild_closure_is_transitive_over_overlapping_bundles() {
+        let links = vec![
+            multi_link("p11_return", vec![0, 1]),
+            multi_link("p11_return", vec![1, 2]),
+        ];
+        assert_eq!(
+            plan_group_rebuild(&links, &BTreeSet::from([0])),
+            Some(BTreeSet::from([0, 1, 2]))
+        );
+    }
+
+    fn rebuild_drops() -> (
+        std::rc::Rc<std::cell::RefCell<Vec<Vec<String>>>>,
+        impl FnMut(Vec<MultiLinkBundle<MockLink>>),
+    ) {
+        let drops = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let record = {
+            let drops = std::rc::Rc::clone(&drops);
+            move |bundles: Vec<MultiLinkBundle<MockLink>>| {
+                drops.borrow_mut().push(
+                    bundles
+                        .iter()
+                        .map(|bundle| bundle.program.to_string())
+                        .collect(),
+                );
+            }
+        };
+        (drops, record)
+    }
+
+    #[test]
+    fn reattach_all_good_returns_before_entries_with_completions() {
+        let (slots, targets) = two_groups();
+        let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
+        let mock = MockGroup {
+            calls: std::cell::RefCell::new(Vec::new()),
+            fail: Box::new(|_, _, _| None),
+        };
+        let (drops, record) = rebuild_drops();
+        let (bundles, outcome) =
+            reattach_rebuilt_groups_with(&groups, |_| Some(9), mock.leaf(), record);
+        assert_eq!(bundles.len(), 4);
+        assert_eq!(outcome.successful.len(), 8);
+        assert!(outcome.failures.is_empty());
+        assert_eq!(outcome.completed.len(), 4);
+        assert!(
+            outcome.completed.iter().all(|(_, at)| *at == Some(9)),
+            "reactivation carries the clock"
+        );
+        assert!(drops.borrow().is_empty(), "no rollback without a partial");
+        assert_eq!(mock.calls.borrow().len(), 4);
+    }
+
+    #[test]
+    fn reattach_entry_partial_drops_member_and_reattaches_the_rest() {
+        let (slots, targets) = two_groups();
+        let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
+        let poison = grouped_offset(&groups, 1);
+        let mock = MockGroup {
+            calls: std::cell::RefCell::new(Vec::new()),
+            fail: Box::new(move |_, sites, is_return| {
+                if !is_return && sites.iter().any(|(offset, _)| *offset == poison) {
+                    Some(io::Error::from_raw_os_error(libc::EINVAL))
+                } else {
+                    None
+                }
+            }),
+        };
+        let (drops, record) = rebuild_drops();
+        let (bundles, outcome) =
+            reattach_rebuilt_groups_with(&groups, |_| Some(9), mock.leaf(), record);
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(outcome.failures[0].0, 1);
+        assert!(
+            outcome.failures[0]
+                .1
+                .starts_with("p11_entry at /a.so+0x18: "),
+            "unexpected failure: {}",
+            outcome.failures[0].1
+        );
+        let completed: BTreeSet<u32> =
+            outcome.completed.iter().map(|(slot, _)| *slot).collect();
+        assert_eq!(completed, BTreeSet::from([0, 2, 3]));
+        // The dirty round's bundles drop entries-first; the clean group is
+        // never detached and the failed member leaves no link behind.
+        assert_eq!(drops.borrow().len(), 1);
+        assert_eq!(
+            drops.borrow()[0],
+            vec!["p11_entry".to_string(), "p11_return".to_string()],
+            "one rollback round, entries before returns"
+        );
+        assert_eq!(bundles.len(), 4);
+        for bundle in &bundles {
+            assert!(
+                !bundle.slots.contains(&1),
+                "slot 1 keeps no rebuilt link: {bundle:?}"
+            );
+        }
+        let group_b: Vec<_> = bundles
+            .iter()
+            .filter(|bundle| bundle.slots == vec![2, 3])
+            .collect();
+        assert_eq!(group_b.len(), 2, "group B attaches once and is kept");
+        assert!(
+            !outcome.successful.contains(&(1, ProbeSide::Return)),
+            "the dropped return endpoint is not reported successful"
+        );
+        let returns = mock
+            .calls
+            .borrow()
+            .iter()
+            .filter(|(_, is_return, _)| *is_return)
+            .count();
+        assert_eq!(
+            returns, 3,
+            "group A retries its return once, group B attaches once"
+        );
+    }
+
+    #[test]
+    fn reattach_return_poison_fails_member_without_entry_attempt() {
+        let (slots, targets) = two_groups();
+        let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
+        let poison = grouped_offset(&groups, 3);
+        let mock = MockGroup {
+            calls: std::cell::RefCell::new(Vec::new()),
+            fail: Box::new(move |_, sites, is_return| {
+                if is_return && sites.iter().any(|(offset, _)| *offset == poison) {
+                    Some(io::Error::from_raw_os_error(libc::EINVAL))
+                } else {
+                    None
+                }
+            }),
+        };
+        let (drops, record) = rebuild_drops();
+        let (bundles, outcome) =
+            reattach_rebuilt_groups_with(&groups, |_| Some(9), mock.leaf(), record);
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(outcome.failures[0].0, 3);
+        assert!(
+            outcome.failures[0]
+                .1
+                .starts_with("p11_return at /b.so+0x28: "),
+            "unexpected failure: {}",
+            outcome.failures[0].1
+        );
+        let completed: BTreeSet<u32> =
+            outcome.completed.iter().map(|(slot, _)| *slot).collect();
+        assert_eq!(completed, BTreeSet::from([0, 1, 2]));
+        assert!(
+            drops.borrow().is_empty(),
+            "a return refusal leaves no partial link to roll back"
+        );
+        assert!(
+            bundles
+                .iter()
+                .any(|b| b.program == "p11_return" && b.slots == vec![2]),
+            "group B return narrows to its survivor: {bundles:?}"
+        );
+    }
+
+    #[test]
+    fn reattach_persistent_entry_poison_terminates_with_no_links() {
+        let (slots, targets) = two_groups();
+        let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
+        let mock = MockGroup {
+            calls: std::cell::RefCell::new(Vec::new()),
+            fail: Box::new(|_, _, is_return| {
+                if !is_return {
+                    Some(io::Error::from_raw_os_error(libc::EINVAL))
+                } else {
+                    None
+                }
+            }),
+        };
+        let (drops, record) = rebuild_drops();
+        let (bundles, outcome) =
+            reattach_rebuilt_groups_with(&groups, |_| Some(9), mock.leaf(), record);
+        assert_eq!(outcome.failures.len(), 4);
+        assert!(outcome.completed.is_empty());
+        assert!(outcome.successful.is_empty());
+        assert!(bundles.is_empty(), "no member keeps a partial link");
+        assert_eq!(drops.borrow().len(), 2, "one rollback round per group");
+        let returns = mock
+            .calls
+            .borrow()
+            .iter()
+            .filter(|(_, is_return, _)| *is_return)
+            .count();
+        assert_eq!(
+            returns, 2,
+            "a fully poisoned group never retries its return"
+        );
+    }
+
+    #[test]
+    fn reattach_exhaustion_stops_with_explicit_remainder() {
+        let (slots, targets) = two_groups();
+        let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
+        let mock = MockGroup {
+            calls: std::cell::RefCell::new(Vec::new()),
+            fail: Box::new(|_, _, is_return| {
+                if !is_return {
+                    Some(io::Error::from_raw_os_error(libc::EMFILE))
+                } else {
+                    None
+                }
+            }),
+        };
+        let (drops, record) = rebuild_drops();
+        let (bundles, outcome) =
+            reattach_rebuilt_groups_with(&groups, |_| Some(9), mock.leaf(), record);
+        assert_eq!(outcome.failures.len(), 4);
+        assert_eq!(outcome.failures[0].0, 0);
+        assert!(
+            outcome.failures[0].1.contains("fd table exhausted"),
+            "first failure keeps the shared summary: {}",
+            outcome.failures[0].1
+        );
+        for (slot, reason) in outcome.failures.iter().skip(1) {
+            assert!(
+                reason.contains("was not reattached"),
+                "slot {slot} is explicitly unattempted, never silent: {reason}"
+            );
+        }
+        assert!(outcome.completed.is_empty());
+        assert!(bundles.is_empty(), "the exhausted round keeps no links");
+        assert_eq!(drops.borrow().len(), 1);
+        assert!(
+            mock.calls
+                .borrow()
+                .iter()
+                .all(|(_, _, sites)| sites.iter().all(|(offset, _)| *offset < 0x20)),
+            "group B is never attempted after exhaustion"
+        );
+    }
+
+    #[test]
+    fn reattach_unsupported_aborts_every_remaining_member() {
+        let (slots, targets) = two_groups();
+        let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
+        let mock = MockGroup {
+            calls: std::cell::RefCell::new(Vec::new()),
+            fail: Box::new(|_, _, _| Some(io::Error::from_raw_os_error(libc::ENOTSUP))),
+        };
+        let (drops, record) = rebuild_drops();
+        let (bundles, outcome) =
+            reattach_rebuilt_groups_with(&groups, |_| Some(9), mock.leaf(), record);
+        assert_eq!(outcome.failures.len(), 4);
+        for (slot, reason) in &outcome.failures {
+            assert!(
+                reason.contains("multi-uprobe unsupported"),
+                "slot {slot} names the abort: {reason}"
+            );
+        }
+        assert!(outcome.completed.is_empty());
+        assert!(bundles.is_empty());
+        assert!(drops.borrow().is_empty());
+        assert_eq!(mock.calls.borrow().len(), 1);
+    }
+
+    fn retained_target(index: u32, path: &str) -> RetainedStaticTarget {
+        let slot = group_slot(index, 1, SlotSemantics::COUNT_ONLY);
+        let targets = group_targets(&[(index, path, ElfAbi::Lp64)]);
+        let (path, abi) = targets.get(&index).cloned().unwrap();
+        RetainedStaticTarget { slot, path, abi }
+    }
+
+    #[test]
+    fn retention_keeps_exact_facts_for_linked_slots_only() {
+        let slots = vec![
+            group_slot(0, 1, SlotSemantics::COUNT_ONLY),
+            group_slot(1, 1, SlotSemantics::COUNT_ONLY),
+            group_slot(2, 1, SlotSemantics::COUNT_ONLY),
+        ];
+        let targets = group_targets(&[
+            (0, "/a.so", ElfAbi::Lp64),
+            (1, "/a.so", ElfAbi::Lp64),
+            (2, "/a.so", ElfAbi::Lp64),
+        ]);
+        let successful = BTreeSet::from([(0, ProbeSide::Return), (0, ProbeSide::Entry)]);
+        let mut retained = BTreeMap::new();
+        retain_from_successful(&mut retained, &slots, &targets, &successful);
+        assert_eq!(retained.keys().copied().collect::<Vec<_>>(), vec![0]);
+        let kept = retained.get(&0).unwrap();
+        assert_eq!(kept.slot, slots[0]);
+        assert_eq!(kept.path, PathBuf::from("/a.so"));
+        assert_eq!(kept.abi, ElfAbi::Lp64);
+    }
+
+    #[test]
+    fn retention_overwrites_stale_descriptors_on_reattach() {
+        let slots = vec![group_slot(0, 1, SlotSemantics::COUNT_ONLY)];
+        let targets = group_targets(&[(0, "/a.so", ElfAbi::Lp64)]);
+        let mut retained = BTreeMap::from([(0, retained_target(0, "/a.so"))]);
+        retained.get_mut(&0).unwrap().slot.descriptor_index = 5;
+        let successful = BTreeSet::from([(0, ProbeSide::Return), (0, ProbeSide::Entry)]);
+        retain_from_successful(&mut retained, &slots, &targets, &successful);
+        assert_eq!(
+            retained.get(&0).unwrap().slot.descriptor_index,
+            slots[0].descriptor_index,
+            "reattach replaces the frozen descriptor it superseded"
+        );
+    }
+
+    #[test]
+    fn prune_drops_facts_for_linkless_slots() {
+        let mut retained = BTreeMap::from([
+            (0, retained_target(0, "/a.so")),
+            (1, retained_target(1, "/a.so")),
+            (2, retained_target(2, "/a.so")),
+        ]);
+        let links = vec![multi_link("p11_return", vec![0, 1])];
+        prune_linkless_retained(&mut retained, &links);
+        assert_eq!(
+            retained.keys().copied().collect::<Vec<_>>(),
+            vec![0, 1],
+            "facts survive exactly while a link does"
+        );
     }
 
     #[test]
@@ -5253,6 +5627,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(attempted, [("p11_return", 0), ("p11_return", 1)]);
+        assert!(outcome.exhausted);
         assert_eq!(outcome.failures.len(), 1);
         assert_eq!(outcome.failures[0].0, 1);
         assert!(

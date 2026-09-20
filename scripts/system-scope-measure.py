@@ -168,9 +168,14 @@ def predicted_burst_loss(generated, capacity_records):
 
 
 def resolve_ring_bytes(value):
-    """Ring bytes from a condition value: default/None, int, or n[K|M]."""
+    """Ring bytes from a condition value: default/None, int, or n[K|M].
+
+    The default tracks the binary's RING_BYTES (4 MiB since the F1
+    repair); profile/metrics records carry the authoritative capture
+    block, this only stands in for trace streams and mismatch notes.
+    """
     if value is None or value == "default":
-        return 256 * 1024
+        return 4 * 1024 * 1024
     if isinstance(value, int):
         return value
     text = str(value).strip()

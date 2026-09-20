@@ -256,10 +256,10 @@ class WindowValidityTests(unittest.TestCase):
 
 
 class RingBytesTests(unittest.TestCase):
-    def test_default_is_256kib(self):
+    def test_default_is_4mib(self):
         resolve = MEASURE["resolve_ring_bytes"]
-        self.assertEqual(resolve("default"), 256 * 1024)
-        self.assertEqual(resolve(None), 256 * 1024)
+        self.assertEqual(resolve("default"), 4 * 1024 * 1024)
+        self.assertEqual(resolve(None), 4 * 1024 * 1024)
 
     def test_suffixes_and_bare_ints(self):
         resolve = MEASURE["resolve_ring_bytes"]

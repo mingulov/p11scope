@@ -1013,12 +1013,15 @@ pub mod capture {
 }
 
 /// Ring buffer capacity in bytes. Must be a power of two and page-aligned.
-/// 256 KiB holds roughly 900 current 288-byte events. The `small-ring` feature
-/// (off by default; the default build is unaffected) shrinks this to one page
-/// so the induced-gap test (Task 7, `scripts/verify-induced-gaps.sh`) can force
-/// ring-buffer loss deliberately with a high call rate.
+/// 4 MiB holds 12483 current 328-byte events (+8 header bytes each). The
+/// 256 KiB default held 780, which an unpaced burst overruns in ~6 ms —
+/// inside routine scheduling jitter under contention (audit F1). The
+/// `small-ring` feature (off by default; the default build is unaffected)
+/// shrinks this to one page so the induced-gap test (Task 7,
+/// `scripts/verify-induced-gaps.sh`) can force ring-buffer loss
+/// deliberately with a high call rate.
 #[cfg(not(feature = "small-ring"))]
-pub const RING_BYTES: u32 = 256 * 1024;
+pub const RING_BYTES: u32 = 4 * 1024 * 1024;
 #[cfg(feature = "small-ring")]
 pub const RING_BYTES: u32 = 4096;
 
@@ -1614,11 +1617,11 @@ mod tests {
     }
 
     #[test]
-    fn default_ring_bytes_is_256kib() {
+    fn default_ring_bytes_is_4mib() {
         // Pins the default so the small-ring override (Cargo feature,
         // opt-in only) can never change it silently.
         #[cfg(not(feature = "small-ring"))]
-        assert_eq!(RING_BYTES, 256 * 1024);
+        assert_eq!(RING_BYTES, 4 * 1024 * 1024);
     }
 
     #[test]
@@ -2290,7 +2293,7 @@ mod tests {
         #[cfg(feature = "small-discovery-ring")]
         {
             assert_eq!(DISCOVERY_BYTES, 4_096);
-            assert_eq!(RING_BYTES, 262_144);
+            assert_eq!(RING_BYTES, 4 * 1024 * 1024);
         }
     }
 }

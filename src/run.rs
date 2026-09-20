@@ -27,7 +27,7 @@ use std::io;
 use std::io::{Seek as _, SeekFrom, Write};
 use std::num::NonZeroU64;
 use std::ops::ControlFlow;
-use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
@@ -2659,8 +2659,9 @@ fn initial_tracking_evidence(
 ///
 /// Each drain owns its taken map handle for the duration of the call and
 /// returns it before the caller does anything else: there is never a second
-/// simultaneous ring reader, and no thread, channel, epoll, or async runtime
-/// is involved.
+/// simultaneous ring reader, and no thread, channel, or async runtime is
+/// involved. The idle wait observes EVENTS readability with `poll` (wake on
+/// data or timeout), which consumes nothing and adds no second reader.
 fn drain_discovery_tick(
     engine: &mut Engine,
     session: &mut Session,
@@ -2751,13 +2752,15 @@ fn capture_end(
 /// How long to wait before the next tick. An open pause owner replaces the
 /// ordinary refresh cadence with the coordinator's own bounded cycle, so a
 /// stopped child is serviced in milliseconds instead of waiting out a frame.
-/// Idle readiness re-poll: with no backlog and no frame due, the loop
-/// re-polls this often instead of idling out the frame, so the
-/// inter-drain gap stays far under the ring capacity at envelope rates.
-/// Derived: one sleep at the fastest measured unpaced burst (A2b,
-/// 127648/s) must fit inside the default 780-record ring —
-/// 2 ms admits 256 records (3x margin). At 10 ms the E-burst point
-/// lost 7813 (drain ceiling 78k/s < 117k/s burst).
+/// Idle readiness timeout: with no backlog and no frame due, the loop
+/// waits on EVENTS readability up to this long instead of idling out
+/// the frame, so a burst landing mid-wait is drained on arrival rather
+/// than after a full sleep (audit F1). The timeout also keeps the
+/// frame, duration and signal cadence bounded when nothing arrives.
+/// Margin: one full timeout at the fastest measured unpaced burst
+/// (A2b, 127648/s) admits 256 records, far under the default
+/// 12483-record ring — but that bounds the REQUESTED wait only, never
+/// the OS scheduling delay, which the ring must also absorb.
 pub(crate) const READY_IDLE_POLL: Duration = Duration::from_millis(2);
 
 /// Discovery frames between forced full inventory sweeps: shallow frames
@@ -2785,6 +2788,50 @@ fn ready_sleep_duration(paused: bool, backlog: bool, frame_due_in: Duration) -> 
     } else {
         frame_due_in.min(READY_IDLE_POLL)
     }
+}
+
+/// Idle wait with ring readiness: block until the EVENTS ring is
+/// readable or `timeout` elapses, whichever comes first. A fixed sleep
+/// is a requested wait, not a scheduling bound — a burst landing
+/// mid-sleep waits out the whole sleep even though data is already
+/// queued (audit F1). `poll` wakes on the first submitted record
+/// instead (the eBPF side submits with flags 0, so every commit wakes
+/// waiters), while the timeout preserves the frame, duration and
+/// signal cadence of the old sleep. Still single-threaded with a
+/// single ring consumer: polling observes readiness without consuming
+/// anything, and tick order (discovery before semantic consumption)
+/// is unchanged.
+/// `poll` takes whole milliseconds; round a nonzero timeout up so a
+/// sub-millisecond idle waits 1 ms instead of truncating to `poll(0)`
+/// (return immediately, spinning the loop until the frame lands).
+fn poll_timeout_ms(timeout: Duration) -> i32 {
+    timeout.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32
+}
+
+fn wait_until_ready(fd: BorrowedFd<'_>, timeout: Duration) {
+    if timeout.is_zero() {
+        return;
+    }
+    let mut pollfd = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout_ms = poll_timeout_ms(timeout);
+    // SAFETY: one initialized pollfd; the fd is the capture's EVENTS
+    // map, open for the whole capture.
+    if unsafe { libc::poll(&mut pollfd, 1, timeout_ms) } >= 0 {
+        return;
+    }
+    if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+        // A signal is pending; the next tick's checks observe it sooner
+        // than the old full sleep would have allowed.
+        return;
+    }
+    // Unreachable in practice (the map fd cannot fail while the capture
+    // owns it): preserve the old sleep exactly rather than spin or
+    // abort the capture on an unexpected error.
+    std::thread::sleep(timeout);
 }
 
 /// The control-latency signal printed on stderr the moment a signalled
@@ -3181,11 +3228,14 @@ fn capture_profile(
             &mut last_sink_note,
             Instant::now(),
         );
-        std::thread::sleep(ready_sleep_duration(
-            paused,
-            scheduling.last_drain_had_backlog(),
-            drain.saturating_sub(last_frame.elapsed()),
-        ));
+        wait_until_ready(
+            session.events_readiness_fd(),
+            ready_sleep_duration(
+                paused,
+                scheduling.last_drain_had_backlog(),
+                drain.saturating_sub(last_frame.elapsed()),
+            ),
+        );
     }
     })();
     if matches!(loop_result, Ok(CaptureEnd::Signal)) {
@@ -3606,11 +3656,14 @@ fn capture_trace(
             &mut last_sink_note,
             Instant::now(),
         );
-        std::thread::sleep(ready_sleep_duration(
-            paused,
-            scheduling.last_drain_had_backlog(),
-            drain.saturating_sub(last_frame.elapsed()),
-        ));
+        wait_until_ready(
+            session.events_readiness_fd(),
+            ready_sleep_duration(
+                paused,
+                scheduling.last_drain_had_backlog(),
+                drain.saturating_sub(last_frame.elapsed()),
+            ),
+        );
     }
     })();
     if matches!(loop_result, Ok(CaptureEnd::Signal)) {
@@ -6939,19 +6992,161 @@ mod tests {
         );
     }
 
-    /// The idle poll absorbs the fastest envelope burst: at A2b's
-    /// measured 127648/s, one full idle sleep must fit inside the
-    /// default 780-record ring, so an unpaced burst landing mid-sleep
-    /// loses nothing before the next drain (E-burst → 0).
+    /// Both capture loops idle on ring readiness, not on a fixed sleep: a
+    /// revert of either loop body to `thread::sleep` keeps every
+    /// behavioral unit test green (the loops only run live), so pin the
+    /// call sites statically, sliced like
+    /// `terminal_capture_modes_wire_shared_finish_and_drain_helpers`.
     #[test]
-    fn ready_idle_poll_absorbs_fastest_envelope_burst() {
+    fn capture_loops_idle_on_readiness() {
+        let source = include_str!("run.rs");
+        let profile = source
+            .split_once("fn capture_profile(")
+            .unwrap()
+            .1
+            .split_once("fn write_json_report")
+            .unwrap()
+            .0;
+        let trace = source
+            .split_once("fn capture_trace(")
+            .unwrap()
+            .1
+            .split_once("fn terminal_trace_count_line")
+            .unwrap()
+            .0;
+        for (function, body) in [("capture_profile", profile), ("capture_trace", trace)] {
+            assert_eq!(
+                body.matches("wait_until_ready(").count(),
+                1,
+                "{function} must idle on exactly one ring-readiness wait"
+            );
+            assert!(
+                !body.contains("thread::sleep"),
+                "{function} idles on a fixed sleep instead of ring readiness"
+            );
+        }
+    }
+
+    /// Requested-wait margin at the default ring: one full idle timeout
+    /// admits 2 ms x 128k/s = 256 records, far under the default ring.
+    /// This bounds the REQUESTED wait only — it is not a scheduling
+    /// proof (audit F1: the OS may deschedule past the timeout, and no
+    /// arithmetic here observes that). The scheduling claim rests on the
+    /// requalification campaign, not this bound.
+    #[test]
+    fn ready_idle_timeout_margin_at_default_ring() {
         const FASTEST_BURST_PER_S: u128 = 128_000;
-        const DEFAULT_RING_CAPACITY: u128 = 780;
+        const RECORD_BYTES: u128 =
+            (core::mem::size_of::<p11scope_ebpf_common::Event>() + 8) as u128;
+        let capacity = u128::from(p11scope_ebpf_common::RING_BYTES) / RECORD_BYTES;
         let worst_case = READY_IDLE_POLL.as_millis() * FASTEST_BURST_PER_S / 1000;
         assert!(
-            worst_case < DEFAULT_RING_CAPACITY,
-            "idle sleep admits {worst_case} records at {FASTEST_BURST_PER_S}/s, \
-             over the {DEFAULT_RING_CAPACITY}-record ring"
+            worst_case * 2 < capacity,
+            "idle timeout admits {worst_case} records at {FASTEST_BURST_PER_S}/s, \
+             without 2x margin under the {capacity}-record default ring"
+        );
+    }
+
+    /// A pipe pair for readiness-wait tests: readable end borrowed, write
+    /// end owned, both closed on drop.
+    fn readiness_pipe() -> (OwnedFd, OwnedFd) {
+        let mut fds = [-1; 2];
+        // SAFETY: fds points to two writable integers; pipe initializes both.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: successful pipe returned two distinct owned descriptors.
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+    }
+
+    fn write_byte(writer: &OwnedFd) {
+        // SAFETY: one initialized byte; the write end is open.
+        assert_eq!(
+            unsafe { libc::write(writer.as_raw_fd(), [7u8].as_ptr().cast(), 1) },
+            1
+        );
+    }
+
+    /// The readiness wait wakes on data, not on the timeout: a readable
+    /// fd with a huge timeout returns immediately. A sleep-the-timeout
+    /// implementation fails this (it would wait out the full timeout),
+    /// which is exactly the audit F1 mutant this pins against.
+    #[test]
+    fn ready_wait_returns_early_on_readable_fd() {
+        use std::os::fd::AsFd as _;
+        let (reader, writer) = readiness_pipe();
+        write_byte(&writer);
+        let start = Instant::now();
+        wait_until_ready(reader.as_fd(), Duration::from_secs(30));
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "readiness wait sat out the timeout on a readable fd"
+        );
+    }
+
+    /// Data arriving mid-wait wakes the wait: a writer after ~100 ms with
+    /// a 30 s timeout returns in well under the timeout.
+    #[test]
+    fn ready_wait_wakes_on_mid_wait_data() {
+        use std::os::fd::AsFd as _;
+        let (reader, writer) = readiness_pipe();
+        let delayed = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            write_byte(&writer);
+        });
+        let start = Instant::now();
+        wait_until_ready(reader.as_fd(), Duration::from_secs(30));
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "readiness wait missed data that arrived mid-wait"
+        );
+        delayed.join().unwrap();
+    }
+
+    /// An empty fd waits out (approximately) the timeout and returns, so
+    /// the idle cadence is preserved when nothing arrives — and the wait
+    /// never spins: it blocks for most of the timeout.
+    #[test]
+    fn ready_wait_empty_fd_times_out() {
+        use std::os::fd::AsFd as _;
+        let (reader, _writer) = readiness_pipe();
+        let start = Instant::now();
+        wait_until_ready(reader.as_fd(), Duration::from_millis(200));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "readiness wait returned without blocking on an empty fd: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "readiness wait overran its timeout: {elapsed:?}"
+        );
+    }
+
+    /// The poll timeout rounds up: exact milliseconds pass through, a
+    /// nonzero sub-millisecond timeout waits 1 ms rather than
+    /// truncating to `poll(0)`, and only zero maps to zero (which
+    /// `wait_until_ready` short-circuits before polling anyway).
+    #[test]
+    fn poll_timeout_rounds_sub_millisecond_up() {
+        assert_eq!(poll_timeout_ms(Duration::ZERO), 0);
+        assert_eq!(poll_timeout_ms(Duration::from_nanos(1)), 1);
+        assert_eq!(poll_timeout_ms(Duration::from_micros(500)), 1);
+        assert_eq!(poll_timeout_ms(Duration::from_millis(1)), 1);
+        assert_eq!(poll_timeout_ms(Duration::from_millis(200)), 200);
+        assert_eq!(poll_timeout_ms(Duration::from_secs(30)), 30_000);
+        assert_eq!(poll_timeout_ms(Duration::MAX), i32::MAX);
+    }
+
+    /// Zero timeout never blocks, even on an empty fd: the backlog path
+    /// keeps its no-sleep contract exactly.
+    #[test]
+    fn ready_wait_zero_timeout_never_blocks() {
+        use std::os::fd::AsFd as _;
+        let (reader, _writer) = readiness_pipe();
+        let start = Instant::now();
+        wait_until_ready(reader.as_fd(), Duration::ZERO);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "zero readiness wait blocked"
         );
     }
 

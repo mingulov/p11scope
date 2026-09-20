@@ -1162,6 +1162,40 @@ fn find_partial_multi_member(links: &[RegisteredLink], slots: &BTreeSet<u32>) ->
     })
 }
 
+/// Every slot sharing a multi group link with `requested`, transitively:
+/// partially covered bundles pull in their survivors, and bundles
+/// overlapping those survivors join too (a return bundle widened by an
+/// entry-refused member shares its sibling's entry bundle). Returns `None`
+/// when no multi bundle is partially covered, i.e. the plain detach path
+/// applies: whole bundles, singles, and unlinked slots.
+fn plan_group_rebuild(
+    links: &[RegisteredLink],
+    requested: &BTreeSet<u32>,
+) -> Option<BTreeSet<u32>> {
+    if find_partial_multi_member(links, requested).is_none() {
+        return None;
+    }
+    let mut affected: BTreeSet<u32> = requested.clone();
+    loop {
+        let mut grown = false;
+        for link in links {
+            let RegisteredLink::MultiUProbe { slots: members, .. } = link else {
+                continue;
+            };
+            if members.iter().any(|member| affected.contains(member))
+                && members.iter().any(|member| !affected.contains(member))
+            {
+                affected.extend(members.iter().copied());
+                grown = true;
+            }
+        }
+        if !grown {
+            break;
+        }
+    }
+    Some(affected)
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct CounterSnapshot {
     pub(crate) ring_loss: u64,
@@ -1313,6 +1347,10 @@ struct AttachOutcome {
     successful: BTreeSet<StaticEndpoint>,
     failures: Vec<(u32, String)>,
     completed: Vec<SlotCompletion>,
+    /// The run stopped early on fd exhaustion: members without a success
+    /// or failure entry were never attempted. Fresh attach reports the one
+    /// shared summary; the group rebuild records every remainder explicitly.
+    exhausted: bool,
 }
 
 type SlotCompletion = (u32, Option<u64>);
@@ -1360,6 +1398,55 @@ struct StaticGroup {
     path: PathBuf,
     entry_program: &'static str,
     members: Vec<StaticGroupMember>,
+}
+
+/// One statically attached slot's exact reattach facts: the descriptor the
+/// attach used plus the pinned path/ABI it resolved. Retained so a
+/// multi-group rebuild can reattach surviving siblings without re-deriving
+/// identity; facts survive exactly while a link does.
+#[derive(Debug, Clone)]
+struct RetainedStaticTarget {
+    slot: Slot,
+    path: PathBuf,
+    abi: ElfAbi,
+}
+
+/// Retains exact reattach facts for every requested slot that gained a
+/// link. Reattach overwrites: a replacement's new descriptor supersedes
+/// the frozen one the rebuild pruned.
+fn retain_from_successful(
+    retained: &mut BTreeMap<u32, RetainedStaticTarget>,
+    targets: &[Slot],
+    attach_targets: &BTreeMap<u32, (PathBuf, ElfAbi)>,
+    successful: &BTreeSet<StaticEndpoint>,
+) {
+    let linked: BTreeSet<u32> = successful.iter().map(|(slot, _)| *slot).collect();
+    for slot in targets {
+        if !linked.contains(&slot.index) {
+            continue;
+        }
+        let (path, abi) = attach_targets
+            .get(&slot.index)
+            .expect("every selected target has retained pinned facts");
+        retained.insert(
+            slot.index,
+            RetainedStaticTarget {
+                slot: slot.clone(),
+                path: path.clone(),
+                abi: *abi,
+            },
+        );
+    }
+}
+
+/// Drops retained facts for slots with no remaining link. The rebuild
+/// consults facts only for link-carrying survivors, so pruning is what
+/// keeps a detached slot's descriptor from ever reattaching stale.
+fn prune_linkless_retained(
+    retained: &mut BTreeMap<u32, RetainedStaticTarget>,
+    links: &[RegisteredLink],
+) {
+    retained.retain(|slot, _| links_cover_slot(links, *slot));
 }
 
 fn group_static_slots(
@@ -1468,6 +1555,7 @@ fn attach_target_groups_with<T>(
                         successful,
                         failures,
                         completed,
+                        exhausted: true,
                     },
                 ));
             }
@@ -1533,6 +1621,7 @@ fn attach_target_groups_with<T>(
                         successful,
                         failures,
                         completed,
+                        exhausted: true,
                     },
                 ));
             }
@@ -1578,8 +1667,165 @@ fn attach_target_groups_with<T>(
             successful,
             failures,
             completed,
+            exhausted: false,
         },
     ))
+}
+
+/// Records every survivor a halted rebuild never attempted. A silent
+/// link-less survivor would violate the rebuild's exact-evidence rule,
+/// so each one carries the halt reason explicitly.
+fn fail_unreattached(
+    failures: &mut Vec<(u32, String)>,
+    slots: impl IntoIterator<Item = u32>,
+    reason: &str,
+) {
+    for slot in slots {
+        failures.push((slot, format!("slot {slot} was not reattached: {reason}")));
+    }
+}
+
+/// Drops one dirty round's bundles entries-first, mirroring the detach
+/// order [`detach_selected_with`] applies to live links: no return outlives
+/// the entry it pairs with.
+fn detach_rebuild_round<T>(
+    detach_bundles: &mut impl FnMut(Vec<MultiLinkBundle<T>>),
+    mut bundles: Vec<MultiLinkBundle<T>>,
+) {
+    bundles.sort_by_key(|bundle| match static_probe_side(bundle.program) {
+        Some(ProbeSide::Entry) => 0,
+        Some(ProbeSide::Return) => 1,
+        None => 2,
+    });
+    detach_bundles(bundles);
+}
+
+/// Reattaches regrouped rebuild survivors to fixpoint, one group at a
+/// time: returns before entries per group (via
+/// [`attach_target_groups_with`]), so an entry-partial survivor (return
+/// live, entry refused) drops with its exact failure and the round's
+/// bundles detach entries-first before the remainder reattaches. A clean
+/// group's bundles are never detached for another group's partial. Only
+/// kept links contribute successes or completions; fd exhaustion and an
+/// unsupported kernel stop the run with every remainder recorded
+/// explicitly. Terminates: every dirty round strictly shrinks its group.
+fn reattach_rebuilt_groups_with<T>(
+    groups: &[StaticGroup],
+    mut completed_at: impl FnMut(&Slot) -> Option<u64>,
+    mut attach_link: impl FnMut(&'static str, &Path, &[(u64, u64)], bool) -> io::Result<T>,
+    mut detach_bundles: impl FnMut(Vec<MultiLinkBundle<T>>),
+) -> (Vec<MultiLinkBundle<T>>, AttachOutcome) {
+    let mut kept = Vec::new();
+    let mut successful = BTreeSet::new();
+    let mut failures = Vec::new();
+    let mut completed = Vec::new();
+    let mut exhausted = false;
+    for (position, group) in groups.iter().enumerate() {
+        let later = || {
+            groups[position + 1..]
+                .iter()
+                .flat_map(|later| later.members.iter().map(|member| member.slot.index))
+        };
+        let mut remaining: Vec<StaticGroupMember> = group.members.clone();
+        while !remaining.is_empty() {
+            let round = StaticGroup {
+                path: group.path.clone(),
+                entry_program: group.entry_program,
+                members: std::mem::take(&mut remaining),
+            };
+            let (bundles, outcome) = match attach_target_groups_with(
+                std::slice::from_ref(&round),
+                &mut completed_at,
+                &mut attach_link,
+            ) {
+                Ok(ok) => ok,
+                Err(sentinel) => {
+                    fail_unreattached(
+                        &mut failures,
+                        round
+                            .members
+                            .iter()
+                            .map(|member| member.slot.index)
+                            .chain(later()),
+                        &format!("{sentinel:#}"),
+                    );
+                    return (
+                        kept,
+                        AttachOutcome {
+                            successful,
+                            failures,
+                            completed,
+                            exhausted,
+                        },
+                    );
+                }
+            };
+            if outcome.exhausted {
+                // The fd table is full: nothing more can attach. The round's
+                // bundles drop — a kept return without its entry would strand
+                // a partial link — and every member without an entry is
+                // recorded explicitly instead of staying silently link-less.
+                exhausted = true;
+                let failed: BTreeSet<u32> =
+                    outcome.failures.iter().map(|(slot, _)| *slot).collect();
+                failures.extend(outcome.failures);
+                detach_rebuild_round(&mut detach_bundles, bundles);
+                fail_unreattached(
+                    &mut failures,
+                    round
+                        .members
+                        .iter()
+                        .map(|member| member.slot.index)
+                        .filter(|slot| !failed.contains(slot))
+                        .chain(later()),
+                    "fd table exhausted; raise RLIMIT_NOFILE (ulimit -n) and retry",
+                );
+                return (
+                    kept,
+                    AttachOutcome {
+                        successful,
+                        failures,
+                        completed,
+                        exhausted,
+                    },
+                );
+            }
+            let partials: BTreeSet<u32> = round
+                .members
+                .iter()
+                .map(|member| member.slot.index)
+                .filter(|slot| {
+                    outcome.successful.contains(&(*slot, ProbeSide::Return))
+                        && !outcome.successful.contains(&(*slot, ProbeSide::Entry))
+                })
+                .collect();
+            failures.extend(outcome.failures);
+            if partials.is_empty() {
+                successful.extend(outcome.successful);
+                completed.extend(outcome.completed);
+                kept.extend(bundles);
+            } else {
+                // The round's links all drop, so none of its successes or
+                // completions describe a kept link; the remainder re-rounds
+                // and re-completes with its final reactivation time.
+                detach_rebuild_round(&mut detach_bundles, bundles);
+                remaining = round
+                    .members
+                    .into_iter()
+                    .filter(|member| !partials.contains(&member.slot.index))
+                    .collect();
+            }
+        }
+    }
+    (
+        kept,
+        AttachOutcome {
+            successful,
+            failures,
+            completed,
+            exhausted,
+        },
+    )
 }
 
 /// Raw fd of a loaded static twin for the multi `link_create` leaf:
@@ -1690,6 +1936,7 @@ fn attach_targets_with(
                         successful,
                         failures,
                         completed,
+                        exhausted: true,
                     });
                 }
                 failures.push((slot.index, format!("{error:#}")));
@@ -1730,6 +1977,7 @@ fn attach_targets_with(
                             successful,
                             failures,
                             completed,
+                            exhausted: true,
                         });
                     }
                     failures.push((slot.index, format!("{error:#}")));
@@ -1741,6 +1989,7 @@ fn attach_targets_with(
         successful,
         failures,
         completed,
+        exhausted: false,
     })
 }
 
@@ -2747,6 +2996,7 @@ impl Session {
             successful,
             failures,
             completed,
+            exhausted: _,
         } = outcome;
         self.successful_static.extend(successful);
         let failed: Vec<_> = failures.iter().map(|(slot, _)| *slot).collect();
@@ -5147,9 +5397,13 @@ mod tests {
             "unexpected failure: {}",
             outcome.failures[0].1
         );
-        let completed: BTreeSet<u32> =
-            outcome.completed.iter().map(|(slot, _)| *slot).collect();
+        let completed: BTreeSet<u32> = outcome.completed.iter().map(|(slot, _)| *slot).collect();
         assert_eq!(completed, BTreeSet::from([0, 2, 3]));
+        assert_eq!(
+            outcome.successful.len(),
+            6,
+            "only kept links count as successful"
+        );
         // The dirty round's bundles drop entries-first; the clean group is
         // never detached and the failed member leaves no link behind.
         assert_eq!(drops.borrow().len(), 1);
@@ -5213,8 +5467,7 @@ mod tests {
             "unexpected failure: {}",
             outcome.failures[0].1
         );
-        let completed: BTreeSet<u32> =
-            outcome.completed.iter().map(|(slot, _)| *slot).collect();
+        let completed: BTreeSet<u32> = outcome.completed.iter().map(|(slot, _)| *slot).collect();
         assert_eq!(completed, BTreeSet::from([0, 1, 2]));
         assert!(
             drops.borrow().is_empty(),

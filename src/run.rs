@@ -3811,10 +3811,6 @@ fn terminal_trace_count_line(reports: &[metrics::SlotReport], tracer: &trace::Tr
     trace::count_evidence_line(reports, tracer.raw_calls())
 }
 
-/// Test-only now: production terminal emission goes through
-/// `emit_trace_terminal_accounted`, which finalizes the file's EVIDENCE
-/// record after the terminal flush instead of before it.
-#[cfg(test)]
 fn emit_trace_terminal<W: Write>(
     reports: &[metrics::SlotReport],
     tracer: &trace::Tracer,
@@ -3887,16 +3883,30 @@ fn emit_trace_terminal_accounted<W: Write>(
             out_file,
         )?;
     }
-    emit_trace_line(
-        &terminal_trace_count_line(reports, tracer),
-        stdout,
-        stdout_open,
-        out_file,
-    )?;
-    // The stdout EVIDENCE copy: best-effort under loss (see above).
+    // The stdout terminal records (COUNT plus the pre-flush EVIDENCE
+    // copy) go through the shared terminal emitter, best-effort under
+    // loss; the file receives COUNT now and its finalized EVIDENCE
+    // record after the terminal flush below.
     let stdout_line = trace::evidence_line(evidence, policy, trace_truncated);
     let stdout_line_len = stdout_line.len() + 1; // trailing newline
-    write_stdout(stdout, stdout_open, format!("{stdout_line}\n").as_bytes())?;
+    emit_trace_terminal(
+        reports,
+        tracer,
+        &stdout_line,
+        stdout,
+        stdout_open,
+        &mut None::<std::io::Sink>,
+    )?;
+    {
+        let mut discard = std::io::sink();
+        let mut discard_open = true;
+        emit_trace_line(
+            &terminal_trace_count_line(reports, tracer),
+            &mut discard,
+            &mut discard_open,
+            out_file,
+        )?;
+    }
     // Fresh budget for the terminal records: the pre-terminal flush may
     // have spent the tick's. Bounded like every flush (and prompt under
     // cancellation), so the records still get a delivery chance.

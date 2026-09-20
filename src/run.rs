@@ -32,7 +32,7 @@ use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
@@ -1378,18 +1378,30 @@ const STOP_SIGNALS: [libc::c_int; 2] = [libc::SIGINT, libc::SIGTERM];
 /// `signal_hook::low_level::register` is used instead of a hand-rolled
 /// `libc::signal` handler: the callback is the signal-safe minimum, while the
 /// capture loop retains the first identity and counts repeated Ctrl-C.
+/// The sink watches the same observation through `cancel_flag`, so a
+/// slow-stdout flush sheds promptly instead of waiting out its budget.
 struct SignalState {
     state: AtomicU64,
+    cancel: Arc<AtomicBool>,
 }
 
 impl SignalState {
     fn new() -> Self {
         Self {
             state: AtomicU64::new(0),
+            cancel: Arc::new(AtomicBool::new(false)),
         }
     }
 
+    /// The flag the stdout sink watches: set on the first observed stop
+    /// signal, alongside the identity above. Signal-safe to share; the
+    /// sink only loads it.
+    fn cancel_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancel)
+    }
+
     fn observe(&self, signal: libc::c_int) {
+        self.cancel.store(true, Ordering::SeqCst);
         let _ = self
             .state
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
@@ -2968,6 +2980,7 @@ fn capture_profile(
     // once the final report is written.
     let has_output = output.is_some();
     let mut stdout_sink = crate::sink::stdout_sink()?;
+    stdout_sink.set_cancel_flag(interrupted.cancel_flag());
     let stdout: &mut crate::sink::SinkWriter<std::fs::File> = &mut stdout_sink;
     let profile = policy.uses_events();
     let mode = if profile { "profile" } else { "metrics" };
@@ -3416,6 +3429,7 @@ fn capture_trace(
     let mut out_sink = out.map(buffered_sink);
     let out_file = &mut out_sink;
     let mut stdout_sink = crate::sink::stdout_sink()?;
+    stdout_sink.set_cancel_flag(interrupted.cancel_flag());
     let stdout: &mut crate::sink::SinkWriter<std::fs::File> = &mut stdout_sink;
 
     let domain = session.events_domain();
@@ -6848,6 +6862,18 @@ mod tests {
             cancel_marker(Some(2), 42),
             "p11scope: cancel: loop exited on signal 2 after 42 ticks"
         );
+    }
+
+    /// The sink watches the same observation the loop polls: the first
+    /// observed stop signal raises the shared cancel flag (F4 wiring).
+    #[test]
+    fn observed_stop_signal_raises_the_shared_cancel_flag() {
+        let interrupted = SignalState::new();
+        let cancel = interrupted.cancel_flag();
+        assert!(!cancel.load(Ordering::SeqCst));
+        interrupted.observe(libc::SIGINT);
+        assert!(cancel.load(Ordering::SeqCst));
+        assert!(interrupted.interrupted());
     }
 
     /// End to end through the profile single-quantum step: two quanta of

@@ -648,8 +648,22 @@ def assess_owned_coverage(functions, discovery, refused, owned_paths):
                 f"calls (module {owned_paths})")
     return {"owned_admitted": owned_admitted, "owned_calls": owned_calls,
             "total_calls": total_calls, "note": note}
+
+
+def _observer_phase_s(phase_ms, key):
+    """In-observer phase timer as seconds, or None when absent/unusable."""
+    if not isinstance(phase_ms, dict):
+        return None
+    value = phase_ms.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value < 0:
+        return None
+    return float(value) / 1000.0
+
+
 def derive_phases(samples, stderr_rows, duration_s, t_spawn_ns, t_exit_ns,
-                  t_go_ns=None):
+                  t_go_ns=None, phase_ms=None):
     """Split wall time into phases from external traces.
 
     t_discovery: timestamped `p11scope: discovery:` stderr marker (the
@@ -665,6 +679,14 @@ def derive_phases(samples, stderr_rows, duration_s, t_spawn_ns, t_exit_ns,
     publish = detach end -> exit (report write + teardown).
     BPF program/map load has no external marker: it is folded into attach
     and reported as load_s=null with this reason.
+    `phase_ms`: the observer's own phase timers
+      (evidence.scheduling.phase_ms), when the report carries them. The
+      fd-trace estimator assumes the target lives until the computed
+      expiry; a target that exits early leaves no taper, so the estimate
+      reports detach_s=0.0 while the observer measured a real tail
+      (audit F9). The in-observer detach timer is authoritative in that
+      case; an estimated 0.0 without one is unconfirmed, never proof of
+      instant teardown.
     """
     method_warnings = []
     t_discovery = None
@@ -763,6 +785,19 @@ def derive_phases(samples, stderr_rows, duration_s, t_spawn_ns, t_exit_ns,
     phases["drain_s"] = drain
     phases["detach_s"] = max(0.0, (detach_end - detach_start) / 1e9)
     phases["publish_s"] = max(0.0, (t_exit_ns - detach_end) / 1e9)
+    observer_detach_s = _observer_phase_s(phase_ms, "detach")
+    if observer_detach_s is not None:
+        if phases["detach_s"] == 0.0 and observer_detach_s > 0:
+            method_warnings.append(
+                "fd-trace detach estimate 0.0s contradicts the in-observer "
+                f"detach timer ({observer_detach_s:.3f}s); using the "
+                "in-observer value")
+            phases["detach_s"] = observer_detach_s
+    elif phases["detach_s"] == 0.0:
+        method_warnings.append(
+            "detach_s=0.0 is an fd-trace estimate with no in-observer "
+            "timer to confirm it; an early target exit hides the detach "
+            "tail (audit F9)")
     return phases, discovery_line
 
 
@@ -1057,12 +1092,16 @@ def main(argv):
             match_note = ("system scope: observed must cover workload truth "
                           "(other processes may add calls)")
 
+    scheduling_timers = evidence.get("scheduling")
+    observer_phase_ms = (scheduling_timers.get("phase_ms")
+                         if isinstance(scheduling_timers, dict) else None)
     phases, discovery_line = derive_phases(
         samples, stderr_rows,
         float(meta["condition"]["duration_s"]),
         int(meta["timing"]["t_spawn_mono_ns"]),
         int(meta["timing"]["t_exit_mono_ns"]),
         int(meta["timing"]["t_go_mono_ns"]),
+        phase_ms=observer_phase_ms,
     )
     if missing_counters:
         phases["method_warnings"].append(

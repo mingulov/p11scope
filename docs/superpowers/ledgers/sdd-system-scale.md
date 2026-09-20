@@ -294,3 +294,30 @@ Build env: TMPDIR=/var/tmp/p11scope-ws-tmp cargo +1.88 --locked --offline.
   EVIDENCE cell); detach fix or Phase 2 multi (1.6: ~11min at
   6530); lane workdir policy (from 1.4); 1.5/1.6 deferred
   minors for final review.
+- Task 3.1-measure: implementer DONE (8973935 harness +
+  fa6a1cc loss-shares note). 35 live runs rc=0, every count
+  attributed: ring-vs-burst digit-exact 7/7, cadence 8303@1s→
+  0@200ms, trace slow-sink 0→17191 file→4KB/s pipe, detach
+  window 55%, may-remain/quantum 0 at default ring, discovery
+  ×1.69 gap inflation on system, profile sink/mode 0. Oracle
+  36/36 RED→GREEN, contracts 127/127. Delivery stall: worker
+  session terminal but envelope stuck not_ready ~20min —
+  recovered verbatim DONE from session log, cancelled stuck
+  child (flushed delivery), proceeded from on-disk deliverables.
+- Task 3.1-measure: review Spec ✅ / Approved, 1 Important +
+  3 minors. Reviewer re-verified numbers from records,
+  probed oracle falsifiability both ways, confirmed envelope
+  supported with system-call regime honestly conditional.
+  I1 (G4m-1 artifacts wiped by tsprobe rm -rf): fix round 1
+  (fresh implementer — original cancelled) proved re-run
+  impossible as specified, annotated row single-source with
+  wipe stated + G4m-2 pointer, committed tsprobe.sh with
+  per-cell workdirs + self-test + CI wiring (4fe53b6);
+  re-review I1 ADDRESSED, no new breakage. Minors deferred
+  (M1 metrics-comparator gap, M2 unused helper, M3 log-vs-
+  record repro wording) — final review triages.
+- Task 3.1-measure: complete, merged (FF to 4fe53b6).
+  Merged-tree verification: artifact_contracts 127/127 green
+  (733s). Repair envelope E-burst…E-discovery + conditional
+  loss(R) system points + handoff + named gaps recorded in
+  docs/notes/2026-09-20-task-3.1-loss-shares.md.

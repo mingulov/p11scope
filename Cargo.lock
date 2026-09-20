@@ -264,6 +264,7 @@ dependencies = [
  "aya-obj",
  "cryptoki-sys",
  "libc",
+ "p11scope-bpf-multi",
  "p11scope-discover",
  "p11scope-ebpf-common",
  "p11scope-manifest",
@@ -274,6 +275,13 @@ dependencies = [
  "sha2",
  "signal-hook",
  "tempfile",
+]
+
+[[package]]
+name = "p11scope-bpf-multi"
+version = "0.0.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

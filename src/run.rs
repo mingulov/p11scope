@@ -2790,14 +2790,13 @@ type ProfileTerminalContext<
     'owned_ref,
     'owned,
     'stdout_ref,
-    'stdout_object,
     'stdout_open,
     'output,
 > = (
     &'engine mut Engine,
     &'session mut Session,
     &'owned_ref mut Option<&'owned mut Owned>,
-    &'stdout_ref mut (dyn Write + 'stdout_object),
+    &'stdout_ref mut crate::sink::SinkWriter<std::io::StdoutLock<'static>>,
     &'stdout_open mut bool,
     &'output mut Option<AtomicFile>,
 );
@@ -2810,7 +2809,6 @@ type TraceTickContext<
     'remaining,
     'loss,
     'stdout_ref,
-    'stdout_object,
     'stdout_open,
     'out_file,
 > = (
@@ -2819,7 +2817,7 @@ type TraceTickContext<
     &'owned_ref mut Option<&'owned mut Owned>,
     &'remaining mut Option<u64>,
     &'loss mut u64,
-    &'stdout_ref mut (dyn Write + 'stdout_object),
+    &'stdout_ref mut crate::sink::SinkWriter<std::io::StdoutLock<'static>>,
     &'stdout_open mut bool,
     &'out_file mut Option<std::io::BufWriter<std::fs::File>>,
 );
@@ -2936,8 +2934,8 @@ fn capture_profile(
     // Opened by the caller before the attach; published by `commit()` only
     // once the final report is written.
     let has_output = output.is_some();
-    let mut stdout_sink = buffered_sink(std::io::stdout().lock());
-    let stdout: &mut dyn Write = &mut stdout_sink;
+    let mut stdout_sink = crate::sink::SinkWriter::new(std::io::stdout().lock());
+    let stdout: &mut crate::sink::SinkWriter<std::io::StdoutLock<'static>> = &mut stdout_sink;
     let profile = policy.uses_events();
     let mode = if profile { "profile" } else { "metrics" };
 
@@ -2996,10 +2994,12 @@ fn capture_profile(
     let mut stdout_open = true;
     let wall_start = SystemTime::now();
     let mut scheduling = SchedulingAccumulator::default();
+    let mut last_sink_note = None;
     let mut last_frame = Instant::now() - drain;
     #[rustfmt::skip]
     let loop_result = (|| -> Result<CaptureEnd> {
     loop {
+        stdout.begin_tick(crate::sink::SINK_TICK_BUDGET);
         let elapsed = clock.elapsed();
         let tick = {
             let mut context = (&mut *engine, &mut *session, &mut owned);
@@ -3013,7 +3013,7 @@ fn capture_profile(
             capture_tick_with(
                 &mut context,
                 &mut consumers,
-                |context: &mut ProfileTickContext<'_, '_>, consumers| {
+                |context: &mut ProfileTickContext<'_, '_>, consumers: &mut CaptureConsumers<'_>| {
                     let phase_start = Instant::now();
                     let (plan_changed, paused) = drain_discovery_tick(
                         context.0,
@@ -3111,6 +3111,12 @@ fn capture_profile(
                 break Ok(CaptureEnd::Error);
             }
         }
+        collect_sink_drops(
+            stdout,
+            &mut scheduling,
+            &mut last_sink_note,
+            Instant::now(),
+        );
         std::thread::sleep(ready_sleep_duration(
             paused,
             scheduling.last_drain_had_backlog(),
@@ -3161,8 +3167,8 @@ fn capture_profile(
                 &mut consumers,
                 detached,
                 &mut std::io::stderr(),
-                |context: &mut ProfileTerminalContext<'_, '_, '_, '_, '_, '_, '_, '_>,
-                 consumers,
+                |context: &mut ProfileTerminalContext<'_, '_, '_, '_, '_, '_, '_>,
+                 consumers: &mut CaptureConsumers<'_>,
                  detached| {
                     let phase_start = Instant::now();
                     let plan_changed = if detached {
@@ -3199,6 +3205,7 @@ fn capture_profile(
                     }
                 },
                 |context, consumers| {
+                    context.3.begin_tick(crate::sink::SINK_TICK_BUDGET);
                     if profile {
                         *consumers.malformed_records += drain_events(
                             context.1,
@@ -3207,9 +3214,11 @@ fn capture_profile(
                             consumers.scheduling,
                         )?;
                     }
+                    collect_sink_drops(context.3, consumers.scheduling, &mut None, Instant::now());
                     Ok(())
                 },
                 |context, consumers| {
+                    context.3.begin_tick(crate::sink::SINK_TICK_BUDGET);
                     let maps_start = Instant::now();
                     let reports = metrics::read(context.1, context.0.plan())?;
                     let mut kernel_evidence = metrics::kernel_evidence(context.1)?;
@@ -3276,6 +3285,10 @@ fn capture_profile(
                     consumers
                         .scheduling
                         .add_phase(SchedulingPhase::Render, render_start.elapsed());
+                    collect_sink_drops(context.3, consumers.scheduling, &mut None, Instant::now());
+                    ev.scheduling = consumers
+                        .scheduling
+                        .snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64);
 
                     if let Some(mut out_file) = context.5.take() {
                         let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
@@ -3345,8 +3358,8 @@ fn capture_trace(
     // attach, then appended to as lines arrive.
     let mut out_sink = out.map(buffered_sink);
     let out_file = &mut out_sink;
-    let mut stdout_sink = buffered_sink(std::io::stdout().lock());
-    let stdout: &mut dyn Write = &mut stdout_sink;
+    let mut stdout_sink = crate::sink::SinkWriter::new(std::io::stdout().lock());
+    let stdout: &mut crate::sink::SinkWriter<std::io::StdoutLock<'static>> = &mut stdout_sink;
 
     let domain = session.events_domain();
     let mut state = semantics::State::for_capture(engine.plan(), policy, domain.clone());
@@ -3373,6 +3386,7 @@ fn capture_trace(
     );
     let mut last_reported_loss: u64 = 0;
     let mut scheduling = SchedulingAccumulator::default();
+    let mut last_sink_note = None;
     if let Err(error) = emit_trace_line(
         &trace::capture_line(policy),
         stdout,
@@ -3391,6 +3405,7 @@ fn capture_trace(
     #[rustfmt::skip]
     let loop_result = (|| -> Result<CaptureEnd> {
     loop {
+        stdout.begin_tick(crate::sink::SINK_TICK_BUDGET);
         let elapsed = clock.elapsed();
         let tick = {
             let mut context = (
@@ -3423,9 +3438,8 @@ fn capture_trace(
                     '_,
                     '_,
                     '_,
-                    '_,
                 >,
-                    consumers,
+                    consumers: &mut CaptureConsumers<'_>,
                 | {
                     let phase_start = Instant::now();
                     let (plan_changed, paused) = drain_discovery_tick(
@@ -3500,6 +3514,12 @@ fn capture_trace(
         if !stdout_open && out_file.is_none() {
             break Ok(CaptureEnd::Error);
         }
+        collect_sink_drops(
+            stdout,
+            &mut scheduling,
+            &mut last_sink_note,
+            Instant::now(),
+        );
         std::thread::sleep(ready_sleep_duration(
             paused,
             scheduling.last_drain_had_backlog(),
@@ -3549,8 +3569,8 @@ fn capture_trace(
                 &mut consumers,
                 detached,
                 &mut std::io::stderr(),
-                |context: &mut TraceTickContext<'_, '_, '_, '_, '_, '_, '_, '_, '_, '_>,
-                 consumers,
+                |context: &mut TraceTickContext<'_, '_, '_, '_, '_, '_, '_, '_, '_>,
+                 consumers: &mut CaptureConsumers<'_>,
                  detached| {
                     let phase_start = Instant::now();
                     let plan_changed = if detached {
@@ -3564,6 +3584,7 @@ fn capture_trace(
                     Ok((plan_changed, context.0.plan()))
                 },
                 |context, consumers| {
+                    context.5.begin_tick(crate::sink::SINK_TICK_BUDGET);
                     let mut root_write_error = None;
                     let root_result = drain_original_root_events(
                         context.1,
@@ -3585,9 +3606,11 @@ fn capture_trace(
                             )
                         },
                     );
+                    collect_sink_drops(context.5, consumers.scheduling, &mut None, Instant::now());
                     (root_result, root_write_error)
                 },
                 |context, consumers| {
+                    context.5.begin_tick(crate::sink::SINK_TICK_BUDGET);
                     *consumers.malformed_records += drain_trace_events(
                         context.1,
                         context.3,
@@ -3601,9 +3624,11 @@ fn capture_trace(
                         consumers.scheduling,
                         &mut || false,
                     )?;
+                    collect_sink_drops(context.5, consumers.scheduling, &mut None, Instant::now());
                     Ok(())
                 },
                 |context, consumers| {
+                    context.5.begin_tick(crate::sink::SINK_TICK_BUDGET);
                     context
                         .0
                         .pinned()
@@ -3684,6 +3709,11 @@ fn capture_trace(
                     if let Some(file) = context.7.as_mut() {
                         file.flush().context("flushing trace output file")?;
                     }
+                    // Explicit: terminal lines must not depend on drop-flush.
+                    // Drops here trail the emitted EVIDENCE line by one
+                    // window; the stderr note carries the true totals.
+                    flush_stdout(context.5, context.6)?;
+                    collect_sink_drops(context.5, consumers.scheduling, &mut None, Instant::now());
                     Ok(evidence)
                 },
             )
@@ -3740,13 +3770,38 @@ fn write_stdout(writer: &mut dyn Write, open: &mut bool, bytes: &[u8]) -> Result
     }
 }
 
-/// Sink buffer size: one 64 KiB batch per tick instead of a syscall per
-/// line. Ticks flush, so the first frame and trace lines still land
-/// promptly; buffering only coalesces the writes between flushes.
-pub(crate) const SINK_BUFFER_BYTES: usize = 65536;
-
 fn buffered_sink<W: Write>(writer: W) -> std::io::BufWriter<W> {
-    std::io::BufWriter::with_capacity(SINK_BUFFER_BYTES, writer)
+    std::io::BufWriter::with_capacity(crate::sink::SINK_BUFFER_BYTES, writer)
+}
+
+/// A stall note is due when this window dropped bytes and no note fired in
+/// the last five seconds.
+fn sink_note_due(drops: &crate::sink::SinkDrops, last_note: Option<Instant>, now: Instant) -> bool {
+    drops.timeouts > 0
+        && last_note
+            .is_none_or(|noted| now.saturating_duration_since(noted) >= Duration::from_secs(5))
+}
+
+/// Drains a tick's sink drops into the accumulator and notes sustained
+/// stalls on stderr (throttled): stdout's own evidence line is
+/// best-effort under backpressure, so the note is the fallback record.
+fn collect_sink_drops(
+    sink: &mut crate::sink::SinkWriter<std::io::StdoutLock<'static>>,
+    acc: &mut SchedulingAccumulator,
+    last_note: &mut Option<Instant>,
+    now: Instant,
+) {
+    let drops = sink.take_drops();
+    acc.note_sink_drops(&drops);
+    if sink_note_due(&drops, *last_note, now) {
+        *last_note = Some(now);
+        eprintln!(
+            "p11scope: stdout stalled; dropped {} bytes in {} flush timeouts (policy {})",
+            drops.dropped_bytes,
+            drops.timeouts,
+            crate::render::SINK_POLICY_BOUNDED_WAIT_DROP,
+        );
+    }
 }
 
 fn flush_stdout(writer: &mut dyn Write, open: &mut bool) -> Result<()> {
@@ -3923,6 +3978,12 @@ impl SchedulingAccumulator {
     pub(crate) fn note_terminal_drain(&mut self, may_remain: bool) {
         self.terminal_drain_truncated = may_remain;
         self.last_backlog = false;
+    }
+
+    pub(crate) fn note_sink_drops(&mut self, drops: &crate::sink::SinkDrops) {
+        self.sink_stall_ms = self.sink_stall_ms.saturating_add(drops.stall_ms);
+        self.sink_timeouts = self.sink_timeouts.saturating_add(drops.timeouts);
+        self.sink_dropped_bytes = self.sink_dropped_bytes.saturating_add(drops.dropped_bytes);
     }
 
     pub(crate) fn note_drain_at(&mut self, now: Instant) {
@@ -7119,6 +7180,31 @@ mod tests {
             &interrupted,
             Duration::from_secs(4),
             Some(Duration::from_secs(5))
+        ));
+    }
+
+    /// Stall notes fire on drops, then stay quiet for five seconds so a
+    /// sustained stall does not flood stderr.
+    #[test]
+    fn sink_notes_fire_once_per_quiet_window() {
+        let drops = crate::sink::SinkDrops {
+            timeouts: 1,
+            dropped_bytes: 10,
+            stall_ms: 250,
+        };
+        let idle = crate::sink::SinkDrops::default();
+        let noted = Instant::now();
+        assert!(sink_note_due(&drops, None, noted));
+        assert!(!sink_note_due(&idle, None, noted));
+        assert!(!sink_note_due(
+            &drops,
+            Some(noted),
+            noted + Duration::from_secs(1)
+        ));
+        assert!(sink_note_due(
+            &drops,
+            Some(noted),
+            noted + Duration::from_secs(5)
         ));
     }
 

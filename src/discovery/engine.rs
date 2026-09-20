@@ -13114,6 +13114,57 @@ impl Engine {
         self.drain_discovery_from(session)
     }
 
+    /// Whether a frame may skip the inventory sweep: no queued work, no
+    /// refresh request, no staged facts, and a sweep-driven scope. Pid
+    /// scope never defers — its per-tick sweep is the generation
+    /// authority and already cheap — and anything queued forces the full
+    /// pass. The `/proc` sweep itself is the only deferred work, bounded
+    /// by the run loop's periodic forced full frame.
+    fn discovery_shallow_idle(&self) -> bool {
+        !matches!(self.scope, Scope::Pid(_))
+            && self.pending_discovery_records.is_empty()
+            && self.pending_loader_scans.is_empty()
+            && self.pending_retirements.is_empty()
+            && self.pending_rejected_keys.is_empty()
+            && self.ready_expected_removals.is_empty()
+            && self.expected_target_exit_pending.is_none()
+            && self.pending_leader_exit_views.is_empty()
+            && self.refresh_requested.is_empty()
+            && self.capture_facts.staged.is_none()
+    }
+
+    /// A framed discovery pass: the ring always drains, and any records,
+    /// malformed items, queued work, or pid scope upgrades to the full
+    /// pass same-frame — loader events are never delayed. Only a quiet
+    /// sweep-driven frame skips the inventory, unless `force_full`
+    /// (the run loop's periodic full frame) says otherwise.
+    pub fn drain_discovery_shallow(
+        &mut self,
+        session: &mut Session,
+        force_full: bool,
+    ) -> Result<bool> {
+        self.drain_discovery_shallow_from(session, force_full)
+    }
+
+    pub(crate) fn drain_discovery_shallow_from(
+        &mut self,
+        session: &mut dyn EngineSession,
+        force_full: bool,
+    ) -> Result<bool> {
+        let (records, malformed) = match Self::collect_discovery_records(session) {
+            Ok(drained) => drained,
+            Err(error) => match error.downcast::<IncompleteTerminalDrain>() {
+                Ok(incomplete) if incomplete.backlog => (incomplete.records, incomplete.malformed),
+                Ok(incomplete) => return Err(Self::generic_drain_error(incomplete.into())),
+                Err(error) => return Err(error),
+            },
+        };
+        if force_full || !records.is_empty() || malformed != 0 || !self.discovery_shallow_idle() {
+            return self.apply_discovery_batch(session, records, malformed);
+        }
+        Ok(false)
+    }
+
     /// Drains the detached discovery ring to an observed empty read. Every
     /// quantum is applied before collecting the next one, so each exact prefix
     /// remains accounted for and producer counters are refreshed per batch.

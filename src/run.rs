@@ -2654,12 +2654,13 @@ fn drain_discovery_tick(
     session: &mut Session,
     owned: Option<&mut Owned>,
     interrupted: &SignalState,
+    force_full: bool,
 ) -> Result<(bool, bool)> {
     let Some(owned) = owned else {
-        return Ok((engine.drain_discovery(session)?, false));
+        return Ok((engine.drain_discovery_shallow(session, force_full)?, false));
     };
     if owned.policy == cli::PausePolicy::Never {
-        return Ok((engine.drain_discovery(session)?, false));
+        return Ok((engine.drain_discovery_shallow(session, force_full)?, false));
     }
     let serviced = {
         let marker = marker_never_seen();
@@ -2738,17 +2739,36 @@ fn capture_end(
 /// How long to wait before the next tick. An open pause owner replaces the
 /// ordinary refresh cadence with the coordinator's own bounded cycle, so a
 /// stopped child is serviced in milliseconds instead of waiting out a frame.
-/// How long a tick sleeps: the pause slice still wins, but a drain that
-/// stopped with backlog queued sleeps nothing — the next tick drains
-/// again immediately instead of idling out the cadence.
-fn ready_sleep_duration(paused: bool, backlog: bool, idle: Duration) -> Duration {
+/// Idle readiness re-poll: with no backlog and no frame due, the loop
+/// re-polls this often instead of idling out the frame, so the
+/// inter-drain gap stays far under the ring capacity at envelope rates.
+pub(crate) const READY_IDLE_POLL: Duration = Duration::from_millis(10);
+
+/// Discovery frames between forced full inventory sweeps: shallow frames
+/// skip a quiet sweep, and every Nth frame sweeps regardless, bounding
+/// any deferral to N frame intervals.
+pub(crate) const FULL_DISCOVERY_EVERY_N_FRAMES: u64 = 5;
+
+/// How long a tick sleeps: the pause slice still wins, a drain that
+/// stopped with backlog queued sleeps nothing, and an idle tick waits
+/// only until the next frame or readiness re-poll, whichever is first.
+fn ready_sleep_duration(paused: bool, backlog: bool, frame_due_in: Duration) -> Duration {
     if paused {
         Duration::from_millis(1)
     } else if backlog {
         Duration::ZERO
     } else {
-        idle
+        frame_due_in.min(READY_IDLE_POLL)
     }
+}
+
+/// The control-latency signal printed on stderr the moment a signalled
+/// loop exits, before detach work: the harness timestamps its arrival.
+fn cancel_marker(signal: Option<libc::c_int>, ticks: u64) -> String {
+    format!(
+        "p11scope: cancel: loop exited on signal {} after {ticks} ticks",
+        signal.unwrap_or(-1)
+    )
 }
 
 const PROFILE_CADENCE: Duration = Duration::from_secs(1);
@@ -2996,10 +3016,14 @@ fn capture_profile(
     let mut scheduling = SchedulingAccumulator::default();
     let mut last_sink_note = None;
     let mut last_frame = Instant::now() - drain;
+    let mut frames = 0u64;
+    let mut ticks = 0u64;
+    let mut last_snapshot: Option<(Vec<metrics::SlotReport>, metrics::KernelEvidence)> = None;
     #[rustfmt::skip]
     let loop_result = (|| -> Result<CaptureEnd> {
     loop {
         stdout.begin_tick(crate::sink::SINK_TICK_BUDGET);
+        ticks += 1;
         let elapsed = clock.elapsed();
         let tick = {
             let mut context = (&mut *engine, &mut *session, &mut owned);
@@ -3010,16 +3034,24 @@ fn capture_profile(
                 malformed_records: &mut malformed_records,
                 scheduling: &mut scheduling,
             };
+            let frame_tick = &mut frames;
+            let snapshot_cache = &mut last_snapshot;
             capture_tick_with(
                 &mut context,
                 &mut consumers,
                 |context: &mut ProfileTickContext<'_, '_>, consumers: &mut CaptureConsumers<'_>| {
+                    if last_frame.elapsed() < drain {
+                        return Ok((false, false, context.0.plan()));
+                    }
+                    *frame_tick += 1;
+                    let force_full = *frame_tick % FULL_DISCOVERY_EVERY_N_FRAMES == 1;
                     let phase_start = Instant::now();
                     let (plan_changed, paused) = drain_discovery_tick(
                         context.0,
                         context.1,
                         context.2.as_deref_mut(),
                         interrupted,
+                        force_full,
                     )?;
                     consumers
                         .scheduling
@@ -3045,6 +3077,11 @@ fn capture_profile(
                     Ok(None)
                 },
                 |context, consumers| {
+                    if last_frame.elapsed() < drain {
+                        if let Some((reports, kernel_evidence)) = snapshot_cache.as_ref() {
+                            return Ok((reports.clone(), *kernel_evidence));
+                        }
+                    }
                     let phase_start = Instant::now();
                     let mut kernel_evidence = metrics::kernel_evidence(context.1)?;
                     if !profile {
@@ -3054,6 +3091,7 @@ fn capture_profile(
                     consumers
                         .scheduling
                         .add_phase(SchedulingPhase::Maps, phase_start.elapsed());
+                    *snapshot_cache = Some((reports.clone(), kernel_evidence));
                     Ok((reports, kernel_evidence))
                 },
                 |context| {
@@ -3120,10 +3158,13 @@ fn capture_profile(
         std::thread::sleep(ready_sleep_duration(
             paused,
             scheduling.last_drain_had_backlog(),
-            drain,
+            drain.saturating_sub(last_frame.elapsed()),
         ));
     }
     })();
+    if matches!(loop_result, Ok(CaptureEnd::Signal)) {
+        eprintln!("{}", cancel_marker(interrupted.first_signal(), ticks));
+    }
     if profile {
         scheduling.note_loop_end(
             metrics::lost_events(session).unwrap_or(0),
@@ -3387,6 +3428,9 @@ fn capture_trace(
     let mut last_reported_loss: u64 = 0;
     let mut scheduling = SchedulingAccumulator::default();
     let mut last_sink_note = None;
+    let mut last_frame = Instant::now() - drain;
+    let mut frames = 0u64;
+    let mut ticks = 0u64;
     if let Err(error) = emit_trace_line(
         &trace::capture_line(policy),
         stdout,
@@ -3406,6 +3450,7 @@ fn capture_trace(
     let loop_result = (|| -> Result<CaptureEnd> {
     loop {
         stdout.begin_tick(crate::sink::SINK_TICK_BUDGET);
+        ticks += 1;
         let elapsed = clock.elapsed();
         let tick = {
             let mut context = (
@@ -3425,6 +3470,8 @@ fn capture_trace(
                 malformed_records: &mut malformed_records,
                 scheduling: &mut scheduling,
             };
+            let frame_tick = &mut frames;
+            let frame_clock = &mut last_frame;
             capture_tick_with(
                 &mut context,
                 &mut consumers,
@@ -3441,12 +3488,21 @@ fn capture_trace(
                 >,
                     consumers: &mut CaptureConsumers<'_>,
                 | {
+                    if frame_clock.elapsed() < drain {
+                        return Ok((false, false, context.0.plan()));
+                    }
+                    // Trace has no render block: the discovery pass itself
+                    // advances the frame clock.
+                    *frame_clock = Instant::now();
+                    *frame_tick += 1;
+                    let force_full = *frame_tick % FULL_DISCOVERY_EVERY_N_FRAMES == 1;
                     let phase_start = Instant::now();
                     let (plan_changed, paused) = drain_discovery_tick(
                         context.0,
                         context.1,
                         context.2.as_deref_mut(),
                         interrupted,
+                        force_full,
                     )?;
                     consumers
                         .scheduling
@@ -3523,10 +3579,13 @@ fn capture_trace(
         std::thread::sleep(ready_sleep_duration(
             paused,
             scheduling.last_drain_had_backlog(),
-            drain,
+            drain.saturating_sub(last_frame.elapsed()),
         ));
     }
     })();
+    if matches!(loop_result, Ok(CaptureEnd::Signal)) {
+        eprintln!("{}", cancel_marker(interrupted.first_signal(), ticks));
+    }
 
     scheduling.note_loop_end(
         metrics::lost_events(session).unwrap_or(0),
@@ -6656,19 +6715,39 @@ mod tests {
     }
 
     /// No sleeps while backlog exists; the pause slice still wins; an
-    /// idle tick waits out its cadence.
+    /// idle tick re-polls for readiness instead of idling out the frame.
     #[test]
     fn ready_sleep_skips_only_on_backlog() {
-        let cadence = Duration::from_secs(1);
+        let frame_due_in = Duration::from_secs(1);
         assert_eq!(
-            ready_sleep_duration(true, true, cadence),
+            ready_sleep_duration(true, true, frame_due_in),
             Duration::from_millis(1)
         );
-        assert_eq!(ready_sleep_duration(false, true, cadence), Duration::ZERO);
-        assert_eq!(ready_sleep_duration(false, false, cadence), cadence);
         assert_eq!(
-            ready_sleep_duration(true, false, cadence),
+            ready_sleep_duration(false, true, frame_due_in),
+            Duration::ZERO
+        );
+        assert_eq!(
+            ready_sleep_duration(false, false, frame_due_in),
+            READY_IDLE_POLL
+        );
+        assert_eq!(
+            ready_sleep_duration(false, false, Duration::from_millis(5)),
+            Duration::from_millis(5)
+        );
+        assert_eq!(
+            ready_sleep_duration(true, false, frame_due_in),
             Duration::from_millis(1)
+        );
+    }
+
+    /// The cancel marker is the harness's control-latency signal: exact
+    /// text, signal number, and tick count, printed before detach work.
+    #[test]
+    fn cancel_marker_names_the_signal_and_tick_count() {
+        assert_eq!(
+            cancel_marker(Some(2), 42),
+            "p11scope: cancel: loop exited on signal 2 after 42 ticks"
         );
     }
 

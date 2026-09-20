@@ -3944,6 +3944,7 @@ fn every_script_parses_with_sh_n() {
         "scripts/bench-overhead.sh",
         "scripts/build-release.sh",
         "scripts/attach-pod.sh",
+        "scripts/tsprobe.sh",
         "scripts/verify-attach-e2e.sh",
         "scripts/verify-inspect-doctor.sh",
         "scripts/verify-canaries.sh",

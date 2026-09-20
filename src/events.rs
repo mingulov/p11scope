@@ -63,6 +63,13 @@ impl EventsDomain {
 /// `LOST n events` / `ring_loss` like any other.
 pub const LIVE_POLL_QUANTUM: usize = 4096;
 
+/// Explicit record bound of the post-detach terminal `EVENTS` drain: the
+/// terminal poll takes at most this many records, and backlog past it is
+/// reported as truncation, never silently absorbed. Sixteen live quanta —
+/// several ringfuls at the largest supported ring — so a bound stop is a
+/// real detach-window backlog, not a calibration miss.
+pub const TERMINAL_DRAIN_BOUND: usize = 65536;
+
 /// The bound one poll of the `EVENTS` ring gets: the quantum while producers
 /// can still refill it, none once they are all detached and the drain is
 /// finite. A partially failed detach keeps the ring live, so it keeps the bound.
@@ -657,6 +664,12 @@ mod tests {
     fn only_a_fully_detached_ring_is_polled_without_a_quantum() {
         assert_eq!(poll_quantum(false), Some(LIVE_POLL_QUANTUM));
         assert_eq!(poll_quantum(true), None);
+    }
+
+    #[test]
+    fn terminal_drain_bound_is_sixteen_live_quanta() {
+        assert_eq!(TERMINAL_DRAIN_BOUND, 16 * LIVE_POLL_QUANTUM);
+        assert_eq!(TERMINAL_DRAIN_BOUND, 65536);
     }
 
     #[test]

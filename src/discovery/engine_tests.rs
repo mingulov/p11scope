@@ -5604,6 +5604,7 @@ fn evidence_verdict(
         module_unresolved_slots: 0,
         provider_changed: false,
         discovery: discovery_evidence(plan, pinned, counters),
+        scheduling: render::SchedulingEvidence::default(),
         completeness: "UNKNOWN",
     };
     evidence.verdict();
@@ -15189,6 +15190,7 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
         module_unresolved_slots: 0,
         provider_changed: false,
         discovery,
+        scheduling: render::SchedulingEvidence::default(),
         completeness: "UNKNOWN",
     };
     evidence.verdict();

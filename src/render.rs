@@ -538,6 +538,8 @@ pub struct Evidence {
     /// Everything discovery learned, flattened into this object.
     #[serde(flatten)]
     pub discovery: DiscoveryEvidence,
+    /// Consumer-scheduling evidence: which bound broke, and phase timings.
+    pub scheduling: SchedulingEvidence,
     pub completeness: &'static str,
 }
 
@@ -545,6 +547,83 @@ pub struct Evidence {
 pub struct SkippedOut {
     pub name: String,
     pub reason: String,
+}
+
+/// The declared slow-sink policy: a stalled stdout flush waits at most the
+/// per-tick budget, then its pending bytes are dropped with counters, never
+/// held unboundedly. The capture continues; the evidence says what left
+/// through the sink and what did not.
+pub const SINK_POLICY_BOUNDED_WAIT_DROP: &str = "bounded-wait-drop";
+
+/// In-observer per-phase wall time in milliseconds, cumulative over the
+/// capture. Discovery is measured directly here (Task 3.1 G-discovery-
+/// tick-slice), not as a residual of totals.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub struct SchedulingPhaseMs {
+    pub discovery: u64,
+    pub drain: u64,
+    pub maps: u64,
+    pub render: u64,
+    pub detach: u64,
+}
+
+/// Consumer-scheduling evidence (Task 3.1 repair): which bound broke when
+/// the event path lost data, and how the capture loop spent its time.
+/// The loss splits are identities, not estimates: capture + detach shares
+/// always sum to the published loss counter.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SchedulingEvidence {
+    /// Extra event-ring polls after a quantum stopped with backlog queued.
+    pub drain_repolls: u64,
+    /// Ticks that stopped draining with backlog left under the per-tick
+    /// record/wall budget.
+    pub drain_budget_exhaustions: u64,
+    /// Ring loss sampled at capture-loop end, before producer detach.
+    pub capture_event_loss: u64,
+    /// Ring loss accrued during the detach window (post-detach minus
+    /// capture-phase).
+    pub detach_event_loss: u64,
+    /// Discovery-ring loss at capture-loop end, before producer detach.
+    pub capture_discovery_loss: u64,
+    /// Discovery-ring loss accrued during the detach window.
+    pub detach_discovery_loss: u64,
+    /// Explicit record bound of the post-detach terminal event drain.
+    pub terminal_drain_bound: u64,
+    /// The terminal drain stopped at its bound with backlog still queued.
+    pub terminal_drain_truncated: bool,
+    /// Declared slow-sink policy; always [`SINK_POLICY_BOUNDED_WAIT_DROP`].
+    pub sink_policy: &'static str,
+    /// Total milliseconds stdout flushes stalled under backpressure.
+    pub sink_stall_ms: u64,
+    /// Flushes that exceeded the per-tick stall budget and dropped bytes.
+    pub sink_timeouts: u64,
+    /// Stdout bytes discarded by the slow-sink policy.
+    pub sink_dropped_bytes: u64,
+    /// Cumulative per-phase wall time.
+    pub phase_ms: SchedulingPhaseMs,
+    /// Largest observed gap between consecutive event drains.
+    pub max_inter_drain_gap_ms: u64,
+}
+
+impl Default for SchedulingEvidence {
+    fn default() -> Self {
+        Self {
+            drain_repolls: 0,
+            drain_budget_exhaustions: 0,
+            capture_event_loss: 0,
+            detach_event_loss: 0,
+            capture_discovery_loss: 0,
+            detach_discovery_loss: 0,
+            terminal_drain_bound: 0,
+            terminal_drain_truncated: false,
+            sink_policy: SINK_POLICY_BOUNDED_WAIT_DROP,
+            sink_stall_ms: 0,
+            sink_timeouts: 0,
+            sink_dropped_bytes: 0,
+            phase_ms: SchedulingPhaseMs::default(),
+            max_inter_drain_gap_ms: 0,
+        }
+    }
 }
 
 const DISCOVERY_SUBJECT: &str = "discovery subject";
@@ -683,6 +762,8 @@ impl Evidence {
             && self.discovery_truncated == 0
             && self.task_uprobe_link_losses == 0
             && self.pause_partial == 0
+            && !self.scheduling.terminal_drain_truncated
+            && self.scheduling.sink_dropped_bytes == 0
             && self.loader_discovery.complete()
             && (!include_selection
                 || self.interface_selection.complete()
@@ -1527,6 +1608,7 @@ mod tests {
                 modules: vec![discovered_fixture()],
                 ..DiscoveryEvidence::default()
             },
+            scheduling: SchedulingEvidence::default(),
             completeness: "UNKNOWN",
         }
     }
@@ -2753,6 +2835,69 @@ mod tests {
         assert_eq!(ev.malformed_records, 0);
         let value = serde_json::to_value(&ev).unwrap();
         assert!(value.get("terminal_drain_unproven").is_none());
+    }
+
+    #[test]
+    fn sink_drops_force_partial_with_stated_counts() {
+        let mut ev = evidence();
+        ev.verdict();
+        assert_eq!(ev.completeness, "COMPLETE");
+
+        ev.scheduling.sink_dropped_bytes = 1024;
+        ev.scheduling.sink_timeouts = 1;
+        ev.verdict();
+
+        assert_eq!(ev.completeness, "PARTIAL");
+        assert_eq!(ev.scheduling.sink_dropped_bytes, 1024);
+        assert_eq!(ev.scheduling.sink_timeouts, 1);
+    }
+
+    #[test]
+    fn terminal_drain_truncation_forces_partial() {
+        let mut ev = evidence();
+        ev.verdict();
+        assert_eq!(ev.completeness, "COMPLETE");
+
+        ev.scheduling.terminal_drain_truncated = true;
+        ev.verdict();
+
+        assert_eq!(ev.completeness, "PARTIAL");
+    }
+
+    #[test]
+    fn scheduling_evidence_serializes_with_declared_policy() {
+        let value = serde_json::to_value(evidence()).unwrap();
+        let scheduling = value
+            .get("scheduling")
+            .expect("scheduling evidence is serialized");
+        assert_eq!(scheduling["sink_policy"], "bounded-wait-drop");
+        for key in [
+            "drain_repolls",
+            "drain_budget_exhaustions",
+            "capture_event_loss",
+            "detach_event_loss",
+            "capture_discovery_loss",
+            "detach_discovery_loss",
+            "terminal_drain_bound",
+            "terminal_drain_truncated",
+            "sink_policy",
+            "sink_stall_ms",
+            "sink_timeouts",
+            "sink_dropped_bytes",
+            "phase_ms",
+            "max_inter_drain_gap_ms",
+        ] {
+            assert!(
+                scheduling.get(key).is_some(),
+                "scheduling evidence lacks {key}"
+            );
+        }
+        for key in ["discovery", "drain", "maps", "render", "detach"] {
+            assert!(
+                scheduling["phase_ms"].get(key).is_some(),
+                "phase timers lack {key}"
+            );
+        }
     }
 
     #[test]

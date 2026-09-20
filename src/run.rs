@@ -2738,12 +2738,17 @@ fn capture_end(
 /// How long to wait before the next tick. An open pause owner replaces the
 /// ordinary refresh cadence with the coordinator's own bounded cycle, so a
 /// stopped child is serviced in milliseconds instead of waiting out a frame.
-fn tick_sleep(paused: bool, cadence: Duration) {
-    std::thread::sleep(if paused {
+/// How long a tick sleeps: the pause slice still wins, but a drain that
+/// stopped with backlog queued sleeps nothing — the next tick drains
+/// again immediately instead of idling out the cadence.
+fn ready_sleep_duration(paused: bool, backlog: bool, idle: Duration) -> Duration {
+    if paused {
         Duration::from_millis(1)
+    } else if backlog {
+        Duration::ZERO
     } else {
-        cadence
-    });
+        idle
+    }
 }
 
 const PROFILE_CADENCE: Duration = Duration::from_secs(1);
@@ -2770,6 +2775,7 @@ struct CaptureConsumers<'state> {
     tracker: &'state mut process::Tracker,
     tracer: Option<&'state mut trace::Tracer>,
     malformed_records: &'state mut u64,
+    scheduling: &'state mut SchedulingAccumulator,
 }
 
 type ProfileTickContext<'tick, 'owned> = (
@@ -2829,14 +2835,15 @@ fn capture_tick_with<'state, C, T>(
     consumers: &mut CaptureConsumers<'state>,
     discovery: impl for<'tick> FnOnce(
         &'tick mut C,
+        &mut CaptureConsumers<'state>,
     ) -> Result<(bool, bool, &'tick crate::plan::AttachPlan)>,
     end: impl FnOnce(&mut C) -> Result<Option<CaptureEnd>>,
     drain: impl FnOnce(&mut C, &mut CaptureConsumers<'state>) -> Result<Option<CaptureEnd>>,
-    snapshot: impl FnOnce(&mut C, &CaptureConsumers<'state>) -> Result<T>,
+    snapshot: impl FnOnce(&mut C, &mut CaptureConsumers<'state>) -> Result<T>,
     check: impl FnOnce(&mut C) -> Result<()>,
 ) -> Result<CaptureTick<T>> {
     let paused = {
-        let (plan_changed, paused, plan) = discovery(context)?;
+        let (plan_changed, paused, plan) = discovery(context, consumers)?;
         if plan_changed {
             consumers.state.sync_plan(plan);
             if let Some(tracer) = consumers.tracer.as_deref_mut() {
@@ -2878,6 +2885,7 @@ fn drain_capture_terminal_with<'state, C, T>(
     diagnostics: &mut dyn Write,
     discovery: impl for<'phase> FnOnce(
         &'phase mut C,
+        &mut CaptureConsumers<'state>,
         bool,
     ) -> Result<(bool, &'phase crate::plan::AttachPlan)>,
     root: impl FnOnce(
@@ -2885,10 +2893,10 @@ fn drain_capture_terminal_with<'state, C, T>(
         &mut CaptureConsumers<'state>,
     ) -> (Result<OriginalRootDrain>, Option<anyhow::Error>),
     drain: impl FnOnce(&mut C, &mut CaptureConsumers<'state>) -> Result<()>,
-    snapshot_and_publish: impl FnOnce(&mut C, &CaptureConsumers<'state>) -> Result<T>,
+    snapshot_and_publish: impl FnOnce(&mut C, &mut CaptureConsumers<'state>) -> Result<T>,
 ) -> Result<T> {
     {
-        let (plan_changed, plan) = discovery(context, detached)?;
+        let (plan_changed, plan) = discovery(context, consumers, detached)?;
         if plan_changed {
             consumers.state.sync_plan(plan);
             if let Some(tracer) = consumers.tracer.as_deref_mut() {
@@ -2949,14 +2957,35 @@ fn capture_profile(
             ));
         }
     }
+    let clock = Instant::now();
     let drain_events = |session: &mut Session,
                         state: &mut semantics::State,
-                        tracker: &mut process::Tracker|
+                        tracker: &mut process::Tracker,
+                        acc: &mut SchedulingAccumulator|
      -> Result<u64> {
-        select_and_drain_events(session, Session::live_poll_quantum, |session, quantum| {
-            let mut drain = session.event_drain()?;
-            drain_profile_events(&mut drain, state, tracker, scope, quantum)
-        })
+        let terminal = session.producers_detached();
+        let budget = ReadyBudget::tick();
+        let phase_start = Instant::now();
+        let outcome = poll_ready(
+            terminal,
+            &budget,
+            crate::events::LIVE_POLL_QUANTUM,
+            &mut || interrupted.interrupted() || duration.is_some_and(|d| clock.elapsed() >= d),
+            || {
+                select_and_drain_events(session, Session::live_poll_quantum, |session, quantum| {
+                    let mut drain = session.event_drain()?;
+                    drain_profile_events(&mut drain, state, tracker, scope, quantum)
+                })
+            },
+        )?;
+        acc.add_phase(SchedulingPhase::Drain, phase_start.elapsed());
+        acc.note_drain_at(Instant::now());
+        if terminal {
+            acc.note_terminal_drain(outcome.may_remain);
+        } else {
+            acc.note_live_drain(&outcome);
+        }
+        Ok(outcome.malformed)
     };
     let mut malformed_records: u64 = 0;
     let capture_tracking_degraded = initial_tracking_evidence(
@@ -2966,7 +2995,7 @@ fn capture_profile(
     );
     let mut stdout_open = true;
     let wall_start = SystemTime::now();
-    let clock = Instant::now();
+    let mut scheduling = SchedulingAccumulator::default();
     let mut last_frame = Instant::now() - drain;
     #[rustfmt::skip]
     let loop_result = (|| -> Result<CaptureEnd> {
@@ -2979,17 +3008,22 @@ fn capture_profile(
                 tracker: &mut process_tracker,
                 tracer: None,
                 malformed_records: &mut malformed_records,
+                scheduling: &mut scheduling,
             };
             capture_tick_with(
                 &mut context,
                 &mut consumers,
-                |context: &mut ProfileTickContext<'_, '_>| {
+                |context: &mut ProfileTickContext<'_, '_>, consumers| {
+                    let phase_start = Instant::now();
                     let (plan_changed, paused) = drain_discovery_tick(
                         context.0,
                         context.1,
                         context.2.as_deref_mut(),
                         interrupted,
                     )?;
+                    consumers
+                        .scheduling
+                        .add_phase(SchedulingPhase::Discovery, phase_start.elapsed());
                     Ok((plan_changed, paused, context.0.plan()))
                 },
                 |context| capture_end(
@@ -3005,16 +3039,21 @@ fn capture_profile(
                             context.1,
                             consumers.state,
                             consumers.tracker,
+                            consumers.scheduling,
                         )?;
                     }
                     Ok(None)
                 },
-                |context, _| {
+                |context, consumers| {
+                    let phase_start = Instant::now();
                     let mut kernel_evidence = metrics::kernel_evidence(context.1)?;
                     if !profile {
                         kernel_evidence.ring_loss = 0;
                     }
                     let reports = metrics::read(context.1, context.0.plan())?;
+                    consumers
+                        .scheduling
+                        .add_phase(SchedulingPhase::Maps, phase_start.elapsed());
                     Ok((reports, kernel_evidence))
                 },
                 |context| {
@@ -3034,6 +3073,7 @@ fn capture_profile(
 
         if last_frame.elapsed() >= drain {
             last_frame = Instant::now();
+            let render_start = Instant::now();
             let ev = evidence_for(
                 engine,
                 engine.capture_facts(),
@@ -3050,6 +3090,7 @@ fn capture_profile(
                 owned.as_deref().map_or_else(Default::default, |owned| owned.coordinator.counters()),
                 owned.as_deref().map(|owned| owned.still_running),
                 capture_tracking_degraded,
+                scheduling.snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64),
             );
             let frame = render::live(
                 &reports,
@@ -3065,13 +3106,26 @@ fn capture_profile(
                 format!("\x1b[2J\x1b[H{frame}").as_bytes(),
             )?;
             flush_stdout(stdout, &mut stdout_open)?;
+            scheduling.add_phase(SchedulingPhase::Render, render_start.elapsed());
             if !stdout_open && !has_output {
                 break Ok(CaptureEnd::Error);
             }
         }
-        tick_sleep(paused, drain);
+        std::thread::sleep(ready_sleep_duration(
+            paused,
+            scheduling.last_drain_had_backlog(),
+            drain,
+        ));
     }
     })();
+    if profile {
+        scheduling.note_loop_end(
+            metrics::lost_events(session).unwrap_or(0),
+            engine.capture_facts().discovery_losses()[0],
+        );
+    } else {
+        scheduling.note_loop_end(0, engine.capture_facts().discovery_losses()[0]);
+    }
     let mut finish_context = (&mut *engine, &mut *session, &mut owned);
     finish_capture_with(
         &mut finish_context,
@@ -3100,18 +3154,25 @@ fn capture_profile(
                 tracker: &mut process_tracker,
                 tracer: None,
                 malformed_records: &mut malformed_records,
+                scheduling: &mut scheduling,
             };
             drain_capture_terminal_with(
                 &mut terminal_context,
                 &mut consumers,
                 detached,
                 &mut std::io::stderr(),
-                |context: &mut ProfileTerminalContext<'_, '_, '_, '_, '_, '_, '_, '_>, detached| {
+                |context: &mut ProfileTerminalContext<'_, '_, '_, '_, '_, '_, '_, '_>,
+                 consumers,
+                 detached| {
+                    let phase_start = Instant::now();
                     let plan_changed = if detached {
                         context.0.drain_discovery_terminal(context.1)?
                     } else {
                         context.0.drain_discovery_terminal_bounded_from(context.1)?
                     };
+                    consumers
+                        .scheduling
+                        .add_phase(SchedulingPhase::Discovery, phase_start.elapsed());
                     Ok((plan_changed, context.0.plan()))
                 },
                 |context, consumers| {
@@ -3139,23 +3200,36 @@ fn capture_profile(
                 },
                 |context, consumers| {
                     if profile {
-                        *consumers.malformed_records +=
-                            drain_events(context.1, consumers.state, consumers.tracker)?;
+                        *consumers.malformed_records += drain_events(
+                            context.1,
+                            consumers.state,
+                            consumers.tracker,
+                            consumers.scheduling,
+                        )?;
                     }
                     Ok(())
                 },
                 |context, consumers| {
+                    let maps_start = Instant::now();
                     let reports = metrics::read(context.1, context.0.plan())?;
                     let mut kernel_evidence = metrics::kernel_evidence(context.1)?;
                     if !profile {
                         kernel_evidence.ring_loss = 0;
                     }
+                    consumers
+                        .scheduling
+                        .add_phase(SchedulingPhase::Maps, maps_start.elapsed());
                     context
                         .0
                         .pinned()
                         .check_unchanged()
                         .map_err(anyhow::Error::msg)?;
                     context.0.settle_terminal_drain();
+                    consumers.scheduling.note_terminal(
+                        kernel_evidence.ring_loss,
+                        context.0.capture_facts().discovery_losses()[0],
+                    );
+                    let render_start = Instant::now();
                     let mut ev = evidence_for(
                         context.0,
                         context.0.capture_facts(),
@@ -3175,6 +3249,9 @@ fn capture_profile(
                             .map_or_else(Default::default, |owned| owned.coordinator.counters()),
                         context.2.as_deref().map(|owned| owned.still_running),
                         capture_tracking_degraded,
+                        consumers
+                            .scheduling
+                            .snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64),
                     );
                     ev.mark_terminal_drain_unproven();
                     let facts = context.0.capture_facts();
@@ -3192,6 +3269,9 @@ fn capture_profile(
                         format!("\x1b[2J\x1b[H{frame}").as_bytes(),
                     )?;
                     flush_stdout(context.3, context.4)?;
+                    consumers
+                        .scheduling
+                        .add_phase(SchedulingPhase::Render, render_start.elapsed());
 
                     if let Some(mut out_file) = context.5.take() {
                         let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
@@ -3288,6 +3368,7 @@ fn capture_trace(
         session.lifecycle_tracking_unavailable().is_some(),
     );
     let mut last_reported_loss: u64 = 0;
+    let mut scheduling = SchedulingAccumulator::default();
     if let Err(error) = emit_trace_line(
         &trace::capture_line(policy),
         stdout,
@@ -3323,6 +3404,7 @@ fn capture_trace(
                 tracker: &mut process_tracker,
                 tracer: Some(&mut tracer),
                 malformed_records: &mut malformed_records,
+                scheduling: &mut scheduling,
             };
             capture_tick_with(
                 &mut context,
@@ -3338,13 +3420,19 @@ fn capture_trace(
                     '_,
                     '_,
                     '_,
-                >| {
+                >,
+                    consumers,
+                | {
+                    let phase_start = Instant::now();
                     let (plan_changed, paused) = drain_discovery_tick(
                         context.0,
                         context.1,
                         context.2.as_deref_mut(),
                         interrupted,
                     )?;
+                    consumers
+                        .scheduling
+                        .add_phase(SchedulingPhase::Discovery, phase_start.elapsed());
                     Ok((plan_changed, paused, context.0.plan()))
                 },
                 |context| capture_end(
@@ -3365,17 +3453,27 @@ fn capture_trace(
                         context.5,
                         context.6,
                         context.7,
+                        consumers.scheduling,
+                        &mut || {
+                            interrupted.interrupted()
+                                || duration.is_some_and(|d| clock.elapsed() >= d)
+                        },
                     )?;
                     Ok((*context.3 == Some(0)).then_some(CaptureEnd::LimitReached))
                 },
-                |context, _| {
-                    report_trace_loss(
+                |context, consumers| {
+                    let phase_start = Instant::now();
+                    let outcome = report_trace_loss(
                         context.1,
                         context.4,
                         context.5,
                         context.6,
                         context.7,
-                    )
+                    );
+                    consumers
+                        .scheduling
+                        .add_phase(SchedulingPhase::Maps, phase_start.elapsed());
+                    outcome
                 },
                 |context| {
                     context
@@ -3398,10 +3496,18 @@ fn capture_trace(
         if !stdout_open && out_file.is_none() {
             break Ok(CaptureEnd::Error);
         }
-        tick_sleep(paused, drain);
+        std::thread::sleep(ready_sleep_duration(
+            paused,
+            scheduling.last_drain_had_backlog(),
+            drain,
+        ));
     }
     })();
 
+    scheduling.note_loop_end(
+        metrics::lost_events(session).unwrap_or(0),
+        engine.capture_facts().discovery_losses()[0],
+    );
     let mut finish_context = (&mut *engine, &mut *session, &mut owned);
     finish_capture_with(
         &mut finish_context,
@@ -3432,6 +3538,7 @@ fn capture_trace(
                 tracker: &mut process_tracker,
                 tracer: Some(&mut tracer),
                 malformed_records: &mut malformed_records,
+                scheduling: &mut scheduling,
             };
             drain_capture_terminal_with(
                 &mut terminal_context,
@@ -3439,12 +3546,17 @@ fn capture_trace(
                 detached,
                 &mut std::io::stderr(),
                 |context: &mut TraceTickContext<'_, '_, '_, '_, '_, '_, '_, '_, '_, '_>,
+                 consumers,
                  detached| {
+                    let phase_start = Instant::now();
                     let plan_changed = if detached {
                         context.0.drain_discovery_terminal(context.1)?
                     } else {
                         context.0.drain_discovery_terminal_bounded_from(context.1)?
                     };
+                    consumers
+                        .scheduling
+                        .add_phase(SchedulingPhase::Discovery, phase_start.elapsed());
                     Ok((plan_changed, context.0.plan()))
                 },
                 |context, consumers| {
@@ -3482,6 +3594,8 @@ fn capture_trace(
                         context.5,
                         context.6,
                         context.7,
+                        consumers.scheduling,
+                        &mut || false,
                     )?;
                     Ok(())
                 },
@@ -3492,7 +3606,11 @@ fn capture_trace(
                         .check_unchanged()
                         .map_err(anyhow::Error::msg)?;
                     report_trace_loss(context.1, context.4, context.5, context.6, context.7)?;
+                    let maps_start = Instant::now();
                     let reports = metrics::read(context.1, context.0.plan())?;
+                    consumers
+                        .scheduling
+                        .add_phase(SchedulingPhase::Maps, maps_start.elapsed());
                     context
                         .0
                         .pinned()
@@ -3500,6 +3618,15 @@ fn capture_trace(
                         .map_err(anyhow::Error::msg)?;
                     context.0.settle_terminal_drain();
                     let trace_truncated = end == CaptureEnd::LimitReached || *context.3 == Some(0);
+                    let maps_start = Instant::now();
+                    let terminal_kernel = metrics::kernel_evidence(context.1)?;
+                    consumers
+                        .scheduling
+                        .add_phase(SchedulingPhase::Maps, maps_start.elapsed());
+                    consumers.scheduling.note_terminal(
+                        terminal_kernel.ring_loss,
+                        context.0.capture_facts().discovery_losses()[0],
+                    );
                     let mut evidence = evidence_for(
                         context.0,
                         context.0.capture_facts(),
@@ -3507,7 +3634,7 @@ fn capture_trace(
                         context.1.dynamic_per_offset_attached(),
                         context.1.attach_failures(),
                         &reports,
-                        metrics::kernel_evidence(context.1)?,
+                        terminal_kernel,
                         consumers.tracker.evidence(),
                         *consumers.malformed_records,
                         consumers.state,
@@ -3519,6 +3646,9 @@ fn capture_trace(
                             .map_or_else(Default::default, |owned| owned.coordinator.counters()),
                         context.2.as_deref().map(|owned| owned.still_running),
                         capture_tracking_degraded,
+                        consumers
+                            .scheduling
+                            .snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64),
                     );
                     evidence.mark_terminal_drain_unproven();
                     if trace_truncated {
@@ -3648,6 +3778,198 @@ fn select_and_drain_events<C, T>(
     drain(context, quantum)
 }
 
+/// Per-tick readiness budgets (Task 3.1 repair): finite records plus wall
+/// time, so a hot ring yields to duration/signal checks, discovery, maps,
+/// and frames instead of draining unboundedly.
+pub(crate) const DRAIN_TICK_MAX_RECORDS: usize = 16384;
+pub(crate) const DRAIN_TICK_WALL: Duration = Duration::from_millis(50);
+
+/// One readiness drain: the single-quantum steps below, re-polled while
+/// backlog remains. `may_remain` is live scheduling truth — the line
+/// limit reports none, since the terminal drain owns what is still queued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct ReadyOutcome {
+    pub(crate) malformed: u64,
+    pub(crate) repolls: u64,
+    pub(crate) budget_exhausted: bool,
+    pub(crate) may_remain: bool,
+}
+
+pub(crate) struct ReadyBudget {
+    max_records: usize,
+    wall: Duration,
+    start: Instant,
+}
+
+impl ReadyBudget {
+    fn tick() -> Self {
+        Self {
+            max_records: DRAIN_TICK_MAX_RECORDS,
+            wall: DRAIN_TICK_WALL,
+            start: Instant::now(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(max_records: usize, wall: Duration) -> Self {
+        Self {
+            max_records,
+            wall,
+            start: Instant::now(),
+        }
+    }
+
+    fn exhausted(&self, taken: usize) -> bool {
+        taken >= self.max_records || self.start.elapsed() >= self.wall
+    }
+}
+
+/// Readiness loop over one-quantum steps: re-poll while backlog remains,
+/// yield between quanta for interrupts/duration, stop at the per-tick
+/// budget with the backlog flagged. The terminal drain takes exactly one
+/// poll — its bound is explicit, and backlog past it is truncation.
+/// The first poll always runs, so a tick always makes progress.
+fn poll_ready(
+    terminal: bool,
+    budget: &ReadyBudget,
+    quantum_records: usize,
+    should_yield: &mut impl FnMut() -> bool,
+    mut step: impl FnMut() -> Result<(u64, bool)>,
+) -> Result<ReadyOutcome> {
+    let mut outcome = ReadyOutcome::default();
+    let mut taken = 0usize;
+    loop {
+        let (malformed, may_remain) = step()?;
+        outcome.malformed = outcome.malformed.saturating_add(malformed);
+        if !may_remain {
+            outcome.may_remain = false;
+            return Ok(outcome);
+        }
+        outcome.may_remain = true;
+        if terminal {
+            return Ok(outcome);
+        }
+        taken = taken.saturating_add(quantum_records);
+        if should_yield() {
+            return Ok(outcome);
+        }
+        if budget.exhausted(taken) {
+            outcome.budget_exhausted = true;
+            return Ok(outcome);
+        }
+        outcome.repolls = outcome.repolls.saturating_add(1);
+    }
+}
+
+// Detach timing joins in the detach step (Session times its own link
+// teardown); until then the detach phase reports zero.
+pub(crate) enum SchedulingPhase {
+    Discovery,
+    Drain,
+    Maps,
+    Render,
+}
+
+/// Capture-lifetime consumer-scheduling counters. The loss splits are
+/// sampled at loop end (capture phase) and at terminal start (detach
+/// window); everything else accumulates per tick.
+#[derive(Debug, Default)]
+pub(crate) struct SchedulingAccumulator {
+    drain_repolls: u64,
+    drain_budget_exhaustions: u64,
+    last_backlog: bool,
+    last_drain_end: Option<Instant>,
+    max_inter_drain_gap_ms: u64,
+    phase_discovery_ms: u64,
+    phase_drain_ms: u64,
+    phase_maps_ms: u64,
+    phase_render_ms: u64,
+    phase_detach_ms: u64,
+    capture_event_loss: u64,
+    detach_event_loss: u64,
+    capture_discovery_loss: u64,
+    detach_discovery_loss: u64,
+    terminal_drain_truncated: bool,
+    sink_stall_ms: u64,
+    sink_timeouts: u64,
+    sink_dropped_bytes: u64,
+}
+
+impl SchedulingAccumulator {
+    pub(crate) fn note_live_drain(&mut self, outcome: &ReadyOutcome) {
+        self.drain_repolls = self.drain_repolls.saturating_add(outcome.repolls);
+        if outcome.budget_exhausted {
+            self.drain_budget_exhaustions = self.drain_budget_exhaustions.saturating_add(1);
+        }
+        self.last_backlog = outcome.may_remain;
+    }
+
+    pub(crate) fn note_terminal_drain(&mut self, may_remain: bool) {
+        self.terminal_drain_truncated = may_remain;
+        self.last_backlog = false;
+    }
+
+    pub(crate) fn note_drain_at(&mut self, now: Instant) {
+        if let Some(last) = self.last_drain_end {
+            let gap_ms = now.saturating_duration_since(last).as_millis();
+            self.max_inter_drain_gap_ms = self
+                .max_inter_drain_gap_ms
+                .max(gap_ms.min(u128::from(u64::MAX)) as u64);
+        }
+        self.last_drain_end = Some(now);
+    }
+
+    pub(crate) fn add_phase(&mut self, phase: SchedulingPhase, elapsed: Duration) {
+        let ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+        let slot = match phase {
+            SchedulingPhase::Discovery => &mut self.phase_discovery_ms,
+            SchedulingPhase::Drain => &mut self.phase_drain_ms,
+            SchedulingPhase::Maps => &mut self.phase_maps_ms,
+            SchedulingPhase::Render => &mut self.phase_render_ms,
+        };
+        *slot = slot.saturating_add(ms);
+    }
+
+    pub(crate) fn note_loop_end(&mut self, event_loss: u64, discovery_loss: u64) {
+        self.capture_event_loss = event_loss;
+        self.capture_discovery_loss = discovery_loss;
+    }
+
+    pub(crate) fn note_terminal(&mut self, event_loss: u64, discovery_loss: u64) {
+        self.detach_event_loss = event_loss.saturating_sub(self.capture_event_loss);
+        self.detach_discovery_loss = discovery_loss.saturating_sub(self.capture_discovery_loss);
+    }
+
+    pub(crate) fn last_drain_had_backlog(&self) -> bool {
+        self.last_backlog
+    }
+
+    pub(crate) fn snapshot(&self, terminal_bound: u64) -> render::SchedulingEvidence {
+        render::SchedulingEvidence {
+            drain_repolls: self.drain_repolls,
+            drain_budget_exhaustions: self.drain_budget_exhaustions,
+            capture_event_loss: self.capture_event_loss,
+            detach_event_loss: self.detach_event_loss,
+            capture_discovery_loss: self.capture_discovery_loss,
+            detach_discovery_loss: self.detach_discovery_loss,
+            terminal_drain_bound: terminal_bound,
+            terminal_drain_truncated: self.terminal_drain_truncated,
+            sink_policy: render::SINK_POLICY_BOUNDED_WAIT_DROP,
+            sink_stall_ms: self.sink_stall_ms,
+            sink_timeouts: self.sink_timeouts,
+            sink_dropped_bytes: self.sink_dropped_bytes,
+            phase_ms: render::SchedulingPhaseMs {
+                discovery: self.phase_discovery_ms,
+                drain: self.phase_drain_ms,
+                maps: self.phase_maps_ms,
+                render: self.phase_render_ms,
+                detach: self.phase_detach_ms,
+            },
+            max_inter_drain_gap_ms: self.max_inter_drain_gap_ms,
+        }
+    }
+}
+
 fn reduce_profile_event(
     domain: u64,
     tracker: &mut process::Tracker,
@@ -3670,10 +3992,10 @@ fn drain_profile_events<S: crate::events::RecordSource>(
     tracker: &mut process::Tracker,
     scope: &Scope,
     quantum: Option<usize>,
-) -> Result<u64> {
+) -> Result<(u64, bool)> {
     let domain = drain.domain_id();
     let mut failure = None;
-    drain.poll(quantum, |ev| {
+    let may_remain = drain.poll(quantum, |ev| {
         if let Err(error) = reduce_profile_event(domain, tracker, state, scope, ev) {
             failure = Some(error);
             ControlFlow::Break(())
@@ -3684,7 +4006,7 @@ fn drain_profile_events<S: crate::events::RecordSource>(
     if let Some(error) = failure {
         return Err(error);
     }
-    Ok(drain.malformed())
+    Ok((drain.malformed(), may_remain))
 }
 
 /// Drains what the ring buffer currently holds — one quantum on the live
@@ -3702,22 +4024,43 @@ fn drain_trace_events<W: Write>(
     stdout: &mut dyn Write,
     stdout_open: &mut bool,
     out_file: &mut Option<W>,
+    acc: &mut SchedulingAccumulator,
+    should_yield: &mut impl FnMut() -> bool,
 ) -> Result<u64> {
-    select_and_drain_events(session, Session::live_poll_quantum, |session, quantum| {
-        let mut drain = session.event_drain()?;
-        drain_trace_events_from(
-            &mut drain,
-            remaining,
-            state,
-            tracker,
-            scope,
-            tracer,
-            stdout,
-            stdout_open,
-            out_file,
-            quantum,
-        )
-    })
+    let terminal = session.producers_detached();
+    let budget = ReadyBudget::tick();
+    let phase_start = Instant::now();
+    let outcome = poll_ready(
+        terminal,
+        &budget,
+        crate::events::LIVE_POLL_QUANTUM,
+        should_yield,
+        || {
+            select_and_drain_events(session, Session::live_poll_quantum, |session, quantum| {
+                let mut drain = session.event_drain()?;
+                drain_trace_events_from(
+                    &mut drain,
+                    remaining,
+                    state,
+                    tracker,
+                    scope,
+                    tracer,
+                    stdout,
+                    stdout_open,
+                    out_file,
+                    quantum,
+                )
+            })
+        },
+    )?;
+    acc.add_phase(SchedulingPhase::Drain, phase_start.elapsed());
+    acc.note_drain_at(Instant::now());
+    if terminal {
+        acc.note_terminal_drain(outcome.may_remain);
+    } else {
+        acc.note_live_drain(&outcome);
+    }
+    Ok(outcome.malformed)
 }
 
 fn combine_trace_errors(reduction: Result<()>, write_error: Option<anyhow::Error>) -> Result<()> {
@@ -3787,11 +4130,11 @@ fn drain_trace_events_from<S: crate::events::RecordSource, W: Write>(
     stdout_open: &mut bool,
     out_file: &mut Option<W>,
     quantum: Option<usize>,
-) -> Result<u64> {
+) -> Result<(u64, bool)> {
     let mut write_error = None;
     let mut reduction_error = None;
     let domain = drain.domain_id();
-    drain.poll(quantum, |ev| {
+    let may_remain = drain.poll(quantum, |ev| {
         if let Err(error) = reduce_trace_event(
             domain,
             remaining,
@@ -3818,7 +4161,10 @@ fn drain_trace_events_from<S: crate::events::RecordSource, W: Write>(
         }
     });
     combine_trace_errors(reduction_error.map_or(Ok(()), Err), write_error)?;
-    Ok(drain.malformed())
+    // A reached live limit owns no more live work: the readiness loop must
+    // not re-poll past it, and the terminal drain owns the remainder.
+    let live_limited = quantum.is_some() && matches!(*remaining, Some(0));
+    Ok((drain.malformed(), may_remain && !live_limited))
 }
 
 /// Emits `LOST n events` when the ring buffer's loss counter has grown
@@ -3863,6 +4209,7 @@ fn evidence_for(
     pause: crate::discovery::pause::PauseCounters,
     child_still_running: Option<bool>,
     capture_tracking_degraded: bool,
+    scheduling: render::SchedulingEvidence,
 ) -> render::Evidence {
     let semantic = state.semantic_evidence();
     // The frozen consumer map (plan Task 8 Step 2), in one place:
@@ -3991,6 +4338,7 @@ fn evidence_for(
             .filter(|report| report.module_unresolved)
             .count(),
         discovery: facts.discovery().clone(),
+        scheduling,
         completeness: "UNKNOWN",
     };
     ev.verdict_with_selection(include_selection);
@@ -5885,7 +6233,7 @@ mod tests {
         let mut drain =
             EventDrain::over_test_domain(ScriptedRecords::events(events, LIVE_POLL_QUANTUM), 1);
 
-        let malformed = drain_profile_events(
+        let (malformed, may_remain) = drain_profile_events(
             &mut drain,
             &mut state,
             &mut tracker,
@@ -5895,6 +6243,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(malformed, 0);
+        assert!(may_remain, "the quantum stop reports its backlog");
         assert_eq!(drain.source().remaining(), 1);
     }
 
@@ -5973,7 +6322,7 @@ mod tests {
 
         assert_eq!(
             drain_profile_events(&mut drain, &mut state, &mut tracker, &scope, None,).unwrap(),
-            0
+            (0, false)
         );
         assert!(
             state.pid_has_process_state(42),
@@ -5991,7 +6340,7 @@ mod tests {
             EventDrain::over_test_domain(ScriptedRecords::events([into_event], usize::MAX), 1);
         assert_eq!(
             drain_profile_events(&mut drain, &mut state, &mut tracker, &scope, None,).unwrap(),
-            0
+            (0, false)
         );
         assert!(
             !state.pid_has_process_state(43),
@@ -6022,7 +6371,7 @@ mod tests {
         let events = (0..5).map(|_| call_event());
         let mut drain = EventDrain::over_test_domain(ScriptedRecords::events(events, 2), 1);
 
-        let malformed = drain_trace_events_from(
+        let (malformed, may_remain) = drain_trace_events_from(
             &mut drain,
             &mut remaining,
             &mut state,
@@ -6037,6 +6386,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(malformed, 0);
+        assert!(
+            !may_remain,
+            "a reached limit owns no more live work for the readiness loop"
+        );
         assert_eq!(remaining, Some(0));
         assert_eq!(stdout.iter().filter(|byte| **byte == b'\n').count(), 2);
         assert_eq!(
@@ -6075,6 +6428,220 @@ mod tests {
 
         assert_eq!(drain.source().remaining(), 1);
         assert_eq!(remaining, Some(u64::MAX - LIVE_POLL_QUANTUM as u64));
+    }
+
+    /// May-remain re-poll: while the ring still has backlog and no bound
+    /// binds, the readiness loop polls again instead of sleeping.
+    #[test]
+    fn readiness_poll_repolls_until_the_ring_reads_empty() {
+        let script = std::cell::RefCell::new(vec![true, true, false].into_iter());
+        let calls = std::cell::Cell::new(0);
+        let budget = ReadyBudget::for_test(usize::MAX, Duration::from_secs(60));
+        let outcome = poll_ready(false, &budget, 4096, &mut || false, || {
+            calls.set(calls.get() + 1);
+            Ok((1, script.borrow_mut().next().unwrap()))
+        })
+        .unwrap();
+
+        assert_eq!(calls.get(), 3);
+        assert_eq!(
+            outcome,
+            ReadyOutcome {
+                malformed: 3,
+                repolls: 2,
+                budget_exhausted: false,
+                may_remain: false,
+            }
+        );
+    }
+
+    /// Finite quanta: the per-tick record budget stops the loop with the
+    /// backlog explicitly flagged, never an unbounded drain.
+    #[test]
+    fn readiness_poll_stops_at_its_record_budget_with_backlog_flagged() {
+        let calls = std::cell::Cell::new(0);
+        let budget = ReadyBudget::for_test(8192, Duration::from_secs(60));
+        let outcome = poll_ready(false, &budget, 4096, &mut || false, || {
+            calls.set(calls.get() + 1);
+            Ok((0, true))
+        })
+        .unwrap();
+
+        assert_eq!(calls.get(), 2);
+        assert!(outcome.may_remain);
+        assert!(outcome.budget_exhausted);
+        assert_eq!(outcome.repolls, 1);
+    }
+
+    /// Fairness: an interrupt or elapsed duration stops the loop between
+    /// quanta, and that yield is not a budget exhaustion.
+    #[test]
+    fn readiness_poll_yields_between_quanta_without_calling_it_exhaustion() {
+        let calls = std::cell::Cell::new(0);
+        let budget = ReadyBudget::for_test(usize::MAX, Duration::from_secs(60));
+        let outcome = poll_ready(false, &budget, 4096, &mut || calls.get() >= 1, || {
+            calls.set(calls.get() + 1);
+            Ok((0, true))
+        })
+        .unwrap();
+
+        assert_eq!(calls.get(), 1);
+        assert!(outcome.may_remain);
+        assert!(!outcome.budget_exhausted);
+        assert_eq!(outcome.repolls, 0);
+    }
+
+    /// The terminal drain takes exactly one poll: its bound is explicit,
+    /// and backlog past it is truncation, not a re-poll.
+    #[test]
+    fn readiness_poll_terminal_takes_one_poll_and_reports_truncation() {
+        let calls = std::cell::Cell::new(0);
+        let budget = ReadyBudget::for_test(usize::MAX, Duration::from_secs(60));
+        let outcome = poll_ready(true, &budget, 65536, &mut || false, || {
+            calls.set(calls.get() + 1);
+            Ok((0, true))
+        })
+        .unwrap();
+
+        assert_eq!(calls.get(), 1);
+        assert!(outcome.may_remain);
+        assert!(!outcome.budget_exhausted);
+        assert_eq!(outcome.repolls, 0);
+    }
+
+    /// Wall-time budget: a hot ring stops the tick even when the record
+    /// budget would allow more.
+    #[test]
+    fn readiness_poll_wall_budget_stops_a_hot_ring() {
+        let calls = std::cell::Cell::new(0);
+        let budget = ReadyBudget::for_test(usize::MAX, Duration::ZERO);
+        let outcome = poll_ready(false, &budget, 4096, &mut || false, || {
+            calls.set(calls.get() + 1);
+            Ok((0, true))
+        })
+        .unwrap();
+
+        assert_eq!(calls.get(), 1);
+        assert!(outcome.may_remain);
+        assert!(outcome.budget_exhausted);
+    }
+
+    /// The accumulator snapshot carries every scheduling counter, split,
+    /// and phase timer into the published evidence shape.
+    #[test]
+    fn scheduling_snapshot_maps_counters_splits_and_phases() {
+        let mut acc = SchedulingAccumulator::default();
+        acc.note_live_drain(&ReadyOutcome {
+            malformed: 0,
+            repolls: 2,
+            budget_exhausted: true,
+            may_remain: true,
+        });
+        acc.add_phase(SchedulingPhase::Discovery, Duration::from_millis(7));
+        acc.add_phase(SchedulingPhase::Drain, Duration::from_millis(3));
+        acc.note_loop_end(10, 3);
+        acc.note_terminal(14, 3);
+        let before = Instant::now();
+        acc.note_drain_at(before);
+        acc.note_drain_at(before + Duration::from_millis(40));
+
+        let ev = acc.snapshot(65536);
+
+        assert_eq!(ev.drain_repolls, 2);
+        assert_eq!(ev.drain_budget_exhaustions, 1);
+        assert!(acc.last_drain_had_backlog());
+        assert_eq!(ev.capture_event_loss, 10);
+        assert_eq!(ev.detach_event_loss, 4);
+        assert_eq!(ev.capture_discovery_loss, 3);
+        assert_eq!(ev.detach_discovery_loss, 0);
+        assert_eq!(ev.terminal_drain_bound, 65536);
+        assert!(!ev.terminal_drain_truncated);
+        assert_eq!(ev.phase_ms.discovery, 7);
+        assert_eq!(ev.phase_ms.drain, 3);
+        assert_eq!(ev.max_inter_drain_gap_ms, 40);
+    }
+
+    /// No sleeps while backlog exists; the pause slice still wins; an
+    /// idle tick waits out its cadence.
+    #[test]
+    fn ready_sleep_skips_only_on_backlog() {
+        let cadence = Duration::from_secs(1);
+        assert_eq!(
+            ready_sleep_duration(true, true, cadence),
+            Duration::from_millis(1)
+        );
+        assert_eq!(ready_sleep_duration(false, true, cadence), Duration::ZERO);
+        assert_eq!(ready_sleep_duration(false, false, cadence), cadence);
+        assert_eq!(
+            ready_sleep_duration(true, false, cadence),
+            Duration::from_millis(1)
+        );
+    }
+
+    /// End to end through the profile single-quantum step: two quanta of
+    /// scripted backlog drain in one readiness tick with re-polls counted.
+    #[test]
+    fn live_profile_ready_loop_drains_two_quanta_of_backlog() {
+        use crate::events::{EventDrain, LIVE_POLL_QUANTUM, ScriptedRecords};
+        let plan = crate::plan::AttachPlan::from_slots(vec![]);
+        let mut state = semantics::State::new(&plan);
+        let mut tracker = process::Tracker::new();
+        let events = (0..2 * LIVE_POLL_QUANTUM).map(|_| call_event());
+        let mut drain =
+            EventDrain::over_test_domain(ScriptedRecords::events(events, usize::MAX), 1);
+        let budget = ReadyBudget::for_test(usize::MAX, Duration::from_secs(60));
+
+        let outcome = poll_ready(false, &budget, LIVE_POLL_QUANTUM, &mut || false, || {
+            drain_profile_events(
+                &mut drain,
+                &mut state,
+                &mut tracker,
+                &Scope::Pid(std::process::id()),
+                Some(LIVE_POLL_QUANTUM),
+            )
+        })
+        .unwrap();
+
+        assert_eq!(drain.source().remaining(), 0);
+        assert_eq!(outcome.repolls, 2);
+        assert!(!outcome.may_remain);
+        assert!(!outcome.budget_exhausted);
+    }
+
+    /// The line limit still ends live draining: reaching it reports no
+    /// live backlog, so the readiness loop does not re-poll past it.
+    #[test]
+    fn live_trace_ready_loop_stops_at_the_line_limit() {
+        use crate::events::{EventDrain, LIVE_POLL_QUANTUM, ScriptedRecords};
+        let (mut state, mut tracker, mut tracer) = trace_fixture();
+        let mut remaining = Some(2);
+        let mut stdout = Vec::new();
+        let mut stdout_open = true;
+        let mut out_file: Option<Vec<u8>> = None;
+        let events = (0..LIVE_POLL_QUANTUM + 3).map(|_| call_event());
+        let mut drain =
+            EventDrain::over_test_domain(ScriptedRecords::events(events, usize::MAX), 1);
+        let budget = ReadyBudget::for_test(usize::MAX, Duration::from_secs(60));
+
+        let outcome = poll_ready(false, &budget, LIVE_POLL_QUANTUM, &mut || false, || {
+            drain_trace_events_from(
+                &mut drain,
+                &mut remaining,
+                &mut state,
+                &mut tracker,
+                &Scope::Pid(std::process::id()),
+                &mut tracer,
+                &mut stdout,
+                &mut stdout_open,
+                &mut out_file,
+                Some(LIVE_POLL_QUANTUM),
+            )
+        })
+        .unwrap();
+
+        assert_eq!(remaining, Some(0));
+        assert_eq!(outcome.repolls, 0);
+        assert!(!outcome.may_remain);
     }
 
     /// After detach the drain is finite and reads the ring whole: past the
@@ -6600,6 +7167,7 @@ mod tests {
                 Default::default(),
                 None,
                 false,
+                render::SchedulingEvidence::default(),
             )
         };
 
@@ -6691,6 +7259,7 @@ mod tests {
                     pause,
                     child_still_running,
                     false,
+                    render::SchedulingEvidence::default(),
                 );
                 assert_eq!(evidence.pause, status);
                 assert_eq!(evidence.unprotected_live_windows, unprotected);
@@ -6758,6 +7327,7 @@ mod tests {
             Default::default(),
             None,
             false,
+            render::SchedulingEvidence::default(),
         );
         let capture = render::CaptureMeta {
             started: "t0",
@@ -6806,6 +7376,7 @@ mod tests {
             Default::default(),
             None,
             true,
+            render::SchedulingEvidence::default(),
         );
 
         assert_eq!(evidence.pid_descendant_gaps, 0);

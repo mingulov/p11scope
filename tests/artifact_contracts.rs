@@ -7503,11 +7503,24 @@ fn both_capture_loops_wire_behavioral_helpers_and_terminal_publication() {
         assert!(terminal.contains("context.0.settle_terminal_drain();"));
     }
     // Metrics must not consume EVENTS; both live and terminal profile paths gate it.
-    assert!(profile.contains(
-        "if profile {\n                        *consumers.malformed_records += drain_events("
-    ));
+    // The live and terminal call shapes are identical since the readiness
+    // drain, so each region is checked separately: one gated consumer in
+    // the live tick, one in the terminal drain.
+    let (profile_tick, profile_after_loop) = profile
+        .split_once("let mut finish_context =")
+        .expect("profile live/terminal boundary");
+    for (region, source) in [("live", profile_tick), ("terminal", profile_after_loop)] {
+        assert_eq!(
+            source
+                .matches(
+                    "if profile {\n                        *consumers.malformed_records += drain_events(",
+                )
+                .count(),
+            1,
+            "profile {region} gated EVENTS consumer"
+        );
+    }
     assert!(profile.contains("if profile {\n                        (\n                            drain_original_root_events("));
-    assert!(profile.contains("if profile {\n                        *consumers.malformed_records +=\n                            drain_events("));
     let profile_terminal = profile
         .split_once("drain_capture_terminal_with(")
         .unwrap()
@@ -7706,6 +7719,10 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
             modules: vec![module],
             ..DiscoveryEvidence::default()
         },
+        scheduling: p11scope::render::SchedulingEvidence {
+            terminal_drain_bound: 65536,
+            ..Default::default()
+        },
         completeness: "UNKNOWN",
     };
     evidence.verdict();
@@ -7767,6 +7784,7 @@ checker.exact_live_discovery_evidence(document["evidence"])
 checker.exact_module_ownership(document)
 checker.exact_active_to_empty(document)
 checker.exact_capture_modules(document)
+checker.exact_scheduling_evidence(document["evidence"])
 print("accepted")
 "#;
     let accepted = std::process::Command::new("python3")
@@ -7797,6 +7815,29 @@ print("accepted")
     assert!(
         !rejected.status.success(),
         "the checker accepted a document with no loader_discovery"
+    );
+
+    // Same for the scheduling evidence: a document whose loss splits are
+    // missing is not checker-viable either.
+    let mut unscheduled = document.clone();
+    unscheduled["evidence"]
+        .as_object_mut()
+        .unwrap()
+        .remove("scheduling");
+    let unscheduled_path = dir.join("unscheduled.json");
+    fs::write(
+        &unscheduled_path,
+        serde_json::to_vec_pretty(&unscheduled).unwrap(),
+    )
+    .unwrap();
+    let unscheduled_rejected = std::process::Command::new("python3")
+        .args(["-c", driver])
+        .arg(&unscheduled_path)
+        .output()
+        .expect("running python3");
+    assert!(
+        !unscheduled_rejected.status.success(),
+        "the checker accepted a document with no scheduling evidence"
     );
 
     // The unowned row is accepted because it states its reason, not because the

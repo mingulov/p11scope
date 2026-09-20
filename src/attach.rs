@@ -2342,6 +2342,12 @@ impl Session {
         events::poll_quantum(self.producers_detached)
     }
 
+    /// Whether every producer detached: live drains re-poll within the
+    /// tick budget, the terminal drain takes one explicitly bounded poll.
+    pub(crate) fn producers_detached(&self) -> bool {
+        self.producers_detached
+    }
+
     pub(crate) fn take_root_seed(&mut self) -> Option<RootSeed> {
         self.root_seed.take()
     }

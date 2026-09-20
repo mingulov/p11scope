@@ -2694,6 +2694,26 @@ mod policy_output {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn backport_multi_sections_parse_for_uprobe_twins() {
+        use std::str::FromStr as _;
+        for section in [
+            "uprobe/p11_entry",
+            "uprobe.s/p11_entry",
+            "uprobe.multi/p11_entry",
+            "uprobe.multi.s/p11_entry",
+            "uretprobe/p11_return",
+            "uretprobe.s/p11_return",
+            "uretprobe.multi/p11_return",
+            "uretprobe.multi.s/p11_return",
+        ] {
+            assert!(
+                aya_obj::ProgramSection::from_str(section).is_ok(),
+                "{section} must parse"
+            );
+        }
+    }
+
+    #[test]
     fn detach_wall_time_is_measured_in_whole_milliseconds() {
         let now = std::time::Instant::now();
         assert_eq!(super::detach_wall_ms_since(now), 0);

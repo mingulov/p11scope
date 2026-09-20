@@ -612,11 +612,11 @@ fn assert_live_discovery_host_contract(
         || run.contains("Session::start(")
         || engine.matches("Session::start(").count() != 1
         || engine
-            .matches("Session::start(\n                    plan,\n                    scope,\n                    pinned,\n                    policy,\n                    pause_generation.take(),\n                    ring_bytes,\n                    owned_child,\n                )")
+            .matches("Session::start(\n                    plan,\n                    scope,\n                    pinned,\n                    policy,\n                    pause_generation.take(),\n                    ring_bytes,\n                    owned_child,\n                    backend,\n                )")
             .count()
             != 1
         || engine
-            .matches("self.start_session_with(policy, None, None, ring_bytes)")
+            .matches("self.start_session_with(policy, None, None, ring_bytes, backend)")
             .count()
             != 1
         || engine
@@ -4800,8 +4800,8 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_owned_child_only() {
         "the owned capability fields must remain opaque"
     );
     let armed_engine = engine.replacen(
-        "self.start_session_with(policy, None, None, ring_bytes)",
-        "self.start_owned_session(policy, child)",
+        "self.start_session_with(policy, None, None, ring_bytes, backend)",
+        "self.start_owned_session(policy, child, backend)",
         1,
     );
     assert!(

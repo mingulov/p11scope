@@ -358,6 +358,7 @@ fn scenario(
         None,
         None,
         owner.as_ref(),
+        BackendSelection::Auto,
     )?);
     let session = active.as_mut().context("capture session")?;
     ensure!(

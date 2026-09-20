@@ -9,7 +9,7 @@
 //! child, the pause coordinator, its clocks, maps, drains, guards and injected
 //! actions stay crate-private.
 
-use crate::attach::{CapturePolicy, Scope, Session};
+use crate::attach::{BackendSelection, CapturePolicy, Scope, Session};
 use crate::cli::{self, CaptureArgs, Kind, RunArgs, ScopeArg};
 use crate::discovery::attribution;
 use crate::discovery::engine::Engine;
@@ -1507,7 +1507,7 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
     }
     let stop = install_stop_flag()?;
     let mut session = engine
-        .start_session(policy, a.ring_bytes)
+        .start_session(policy, a.ring_bytes, BackendSelection::Auto)
         .context("starting attach session")?;
     run_loop(
         &mut engine,
@@ -2158,7 +2158,7 @@ fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOut
     // barrier when exact PT_INTERP binding is safe, and otherwise leaves
     // `initial_set_capture = none` with sticky `PARTIAL`.
     let mut session = engine
-        .start_owned_session(policy, &mut child, args.ring_bytes)
+        .start_owned_session(policy, &mut child, args.ring_bytes, BackendSelection::Auto)
         .context("starting attach session")
         .map_err(|error| combine_setup_failure(error, &mut child))?;
 

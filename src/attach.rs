@@ -725,6 +725,54 @@ impl CapturePolicy {
     }
 }
 
+/// Resolved static attach backend: one multi link per (attach path, entry
+/// program) group, or today's one-per-endpoint singles. Dynamic
+/// loader/export probes stay singles under both backends.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum AttachBackend {
+    Multi,
+    Singles,
+}
+
+/// Operator's `--attach-backend` request: `auto` follows the backend
+/// policy (multi on 6.9+, singles below), `multi`/`singles` force one.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+pub enum BackendSelection {
+    #[default]
+    Auto,
+    Multi,
+    Singles,
+}
+
+impl BackendSelection {
+    pub fn from_cli(value: &str) -> Result<Self> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "multi" => Ok(Self::Multi),
+            "singles" => Ok(Self::Singles),
+            _ => bail!("--attach-backend: invalid value {value:?} (expected auto|multi|singles)"),
+        }
+    }
+}
+
+/// First backend attempted for a session. `Auto` stays singles until the
+/// regrouped multi attach lands; the policy flip (multi on 6.9+ with a
+/// singles fallback) follows with it.
+pub(crate) fn resolve_initial_backend(selection: BackendSelection) -> AttachBackend {
+    match selection {
+        BackendSelection::Auto | BackendSelection::Singles => AttachBackend::Singles,
+        BackendSelection::Multi => AttachBackend::Multi,
+    }
+}
+
+/// The static endpoint twins (every program `static_probe_side` routes)
+/// load with `expected_attach_type=48` under multi so one program can own
+/// the group's return/entry links; everything else (dynamic, diagnostic,
+/// lifecycle, tail-call targets) loads plain under both backends.
+pub(crate) fn loads_with_multi_flag(backend: AttachBackend, program: &str) -> bool {
+    backend == AttachBackend::Multi && static_probe_side(program).is_some()
+}
+
 fn process_creation_capture_enabled(scope: &Scope, policy: CapturePolicy) -> bool {
     let _ = (scope, policy);
     true
@@ -1191,16 +1239,20 @@ fn export_programs(abi: HookAbi) -> (&'static str, &'static str) {
     }
 }
 
-fn static_endpoint(program: &str, slot: u32) -> Option<StaticEndpoint> {
+fn static_probe_side(program: &str) -> Option<ProbeSide> {
     match program {
-        "p11_return" => Some((slot, ProbeSide::Return)),
+        "p11_return" => Some(ProbeSide::Return),
         "p11_entry"
         | "p11_entry_ia32"
         | "p11_entry_template"
         | "p11_entry_template_types"
-        | "p11_entry_template_pair" => Some((slot, ProbeSide::Entry)),
+        | "p11_entry_template_pair" => Some(ProbeSide::Entry),
         _ => None,
     }
+}
+
+fn static_endpoint(program: &str, slot: u32) -> Option<StaticEndpoint> {
+    static_probe_side(program).map(|side| (slot, side))
 }
 
 pub(crate) fn monotonic_ns() -> Option<u64> {
@@ -1682,6 +1734,7 @@ impl Session {
         self.policy
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn start(
         plan: &AttachPlan,
         scope: &Scope,
@@ -1690,6 +1743,7 @@ impl Session {
         pause_generation: Option<OwnedPauseGeneration>,
         ring_bytes: Option<u32>,
         owned_child: Option<&OwnedChild>,
+        backend: BackendSelection,
     ) -> Result<Self> {
         // Raise before the first link: every return/entry pair burns fds
         // against RLIMIT_NOFILE, and no tracker (the previous raise site)
@@ -1701,8 +1755,10 @@ impl Session {
                 "a pinned provider object changed before attach; refusing to observe changed bytes"
             );
         }
-        let mut session = Self::start_inner(scope, policy, pause_key, ring_bytes, owned_child)
-            .map_err(unsupported_environment_context)?;
+        let backend = resolve_initial_backend(backend);
+        let mut session =
+            Self::start_inner(scope, policy, pause_key, ring_bytes, owned_child, backend)
+                .map_err(unsupported_environment_context)?;
         session
             .attach_plan(plan, objects)
             .map_err(unsupported_environment_context)?;
@@ -1719,7 +1775,14 @@ impl Session {
     /// requested scope, process-creation boundary, and exec/exit links. Dropping the local
     /// session detaches every link before this finite result is returned.
     pub(crate) fn preflight(scope: &Scope) -> Result<AttachPreflight> {
-        let session = Self::start_inner(scope, CapturePolicy::Allowlisted, None, None, None)?;
+        let session = Self::start_inner(
+            scope,
+            CapturePolicy::Allowlisted,
+            None,
+            None,
+            None,
+            AttachBackend::Singles,
+        )?;
         Ok(AttachPreflight {
             lifecycle: session.lifecycle_tracking_unavailable.is_none(),
             scope: session.process_creation_tracking_unavailable.is_none(),
@@ -1732,6 +1795,7 @@ impl Session {
         pause_key: Option<PauseKey>,
         ring_bytes: Option<u32>,
         owned_child: Option<&OwnedChild>,
+        backend: AttachBackend,
     ) -> Result<Self> {
         if policy.uses_unsafe_decoders() && !cfg!(feature = "unsafe-unvalidated-metadata") {
             bail!("unsafe-unvalidated-metadata policy is absent from this eBPF object");
@@ -1843,8 +1907,13 @@ impl Session {
                             .program_mut(prog_name)
                             .with_context(|| format!("program {prog_name} missing from object"))?
                             .try_into()?;
-                        prog.load()
-                            .with_context(|| format!("loading {prog_name}"))?;
+                        if loads_with_multi_flag(backend, prog_name) {
+                            prog.load_multi()
+                                .with_context(|| format!("loading {prog_name} for multi attach"))?;
+                        } else {
+                            prog.load()
+                                .with_context(|| format!("loading {prog_name}"))?;
+                        }
                     }
                 }
                 SessionPreparation::FreezeDeferred(name) => {
@@ -2409,6 +2478,7 @@ impl Session {
             None,
             None,
             None,
+            AttachBackend::Singles,
         )
     }
 
@@ -2743,6 +2813,103 @@ mod tests {
                 "{section}"
             );
         }
+    }
+
+    #[test]
+    fn backend_selection_parses_the_three_documented_values() {
+        use super::BackendSelection;
+        assert_eq!(
+            BackendSelection::from_cli("auto").unwrap(),
+            BackendSelection::Auto
+        );
+        assert_eq!(
+            BackendSelection::from_cli("multi").unwrap(),
+            BackendSelection::Multi
+        );
+        assert_eq!(
+            BackendSelection::from_cli("singles").unwrap(),
+            BackendSelection::Singles
+        );
+        assert_eq!(BackendSelection::default(), BackendSelection::Auto);
+        for bad in ["", "MULTI", "uprobe-multi", "per-offset", "multi "] {
+            assert!(
+                BackendSelection::from_cli(bad).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn only_static_endpoint_twins_take_the_multi_load_flag() {
+        use super::AttachBackend;
+        use super::loads_with_multi_flag;
+        for program in [
+            "p11_return",
+            "p11_entry",
+            "p11_entry_ia32",
+            "p11_entry_template",
+            "p11_entry_template_types",
+            "p11_entry_template_pair",
+        ] {
+            assert!(
+                loads_with_multi_flag(AttachBackend::Multi, program),
+                "{program} must load with the multi flag"
+            );
+            assert!(
+                !loads_with_multi_flag(AttachBackend::Singles, program),
+                "{program} must load plain under singles"
+            );
+        }
+        for program in [
+            "dl_debug_state",
+            "function_list_entry",
+            "sched_process_exec",
+            "task_newtask",
+            "interface_list_worker",
+            "p11_entry_template_second",
+            "no_such_program",
+        ] {
+            assert!(
+                !loads_with_multi_flag(AttachBackend::Multi, program),
+                "{program} must stay on singles (dynamic/diag/lifecycle)"
+            );
+        }
+    }
+
+    #[test]
+    fn static_probe_side_routes_entry_variants_and_return() {
+        use super::ProbeSide;
+        use super::static_probe_side;
+        assert_eq!(static_probe_side("p11_return"), Some(ProbeSide::Return));
+        for program in [
+            "p11_entry",
+            "p11_entry_ia32",
+            "p11_entry_template",
+            "p11_entry_template_types",
+            "p11_entry_template_pair",
+        ] {
+            assert_eq!(static_probe_side(program), Some(ProbeSide::Entry));
+        }
+        assert_eq!(static_probe_side("task_newtask"), None);
+    }
+
+    #[test]
+    fn auto_resolves_to_singles_until_the_regroup_flip() {
+        use super::AttachBackend;
+        use super::BackendSelection;
+        use super::resolve_initial_backend;
+        assert_eq!(
+            resolve_initial_backend(BackendSelection::Auto),
+            AttachBackend::Singles
+        );
+        assert_eq!(
+            resolve_initial_backend(BackendSelection::Multi),
+            AttachBackend::Multi
+        );
+        assert_eq!(
+            resolve_initial_backend(BackendSelection::Singles),
+            AttachBackend::Singles
+        );
     }
 
     #[test]

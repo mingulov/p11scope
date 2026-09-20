@@ -2,8 +2,8 @@
 //! Initial and incremental provider discovery ownership.
 
 use crate::attach::{
-    CapturePolicy, CounterSnapshot, DynamicExportIdentity, DynamicLoaderAttachFailure,
-    OwnedPauseGeneration, Scope, Session,
+    BackendSelection, CapturePolicy, CounterSnapshot, DynamicExportIdentity,
+    DynamicLoaderAttachFailure, OwnedPauseGeneration, Scope, Session,
 };
 use crate::cli::CaptureArgs;
 use crate::discovery::attribution;
@@ -13487,8 +13487,9 @@ impl Engine {
         &mut self,
         policy: CapturePolicy,
         ring_bytes: Option<u32>,
+        backend: BackendSelection,
     ) -> Result<Session> {
-        self.start_session_with(policy, None, None, ring_bytes)
+        self.start_session_with(policy, None, None, ring_bytes, backend)
     }
 
     pub(crate) fn start_owned_session(
@@ -13496,9 +13497,10 @@ impl Engine {
         policy: CapturePolicy,
         child: &mut OwnedChild,
         ring_bytes: Option<u32>,
+        backend: BackendSelection,
     ) -> Result<Session> {
         let generation = OwnedPauseGeneration::from_owned_child(child);
-        self.start_session_with(policy, Some(generation), Some(child), ring_bytes)
+        self.start_session_with(policy, Some(generation), Some(child), ring_bytes, backend)
     }
 
     /// Task 8 calls this only after its coordinator armed the pause epoch and
@@ -13588,6 +13590,7 @@ impl Engine {
         mut pause_generation: Option<OwnedPauseGeneration>,
         owned_child: Option<&OwnedChild>,
         ring_bytes: Option<u32>,
+        backend: BackendSelection,
     ) -> Result<Session> {
         self.seed_initial_cgroup_views();
         let snapshot = self.begin_start_capture_attempt()?;
@@ -13604,6 +13607,7 @@ impl Engine {
                     pause_generation.take(),
                     ring_bytes,
                     owned_child,
+                    backend,
                 )
             }) {
                 Ok(session) => session,

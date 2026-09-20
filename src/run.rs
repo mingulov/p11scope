@@ -6870,6 +6870,41 @@ mod tests {
         );
     }
 
+    /// Both capture loops idle on ring readiness, not on a fixed sleep: a
+    /// revert of either loop body to `thread::sleep` keeps every
+    /// behavioral unit test green (the loops only run live), so pin the
+    /// call sites statically, sliced like
+    /// `terminal_capture_modes_wire_shared_finish_and_drain_helpers`.
+    #[test]
+    fn capture_loops_idle_on_readiness() {
+        let source = include_str!("run.rs");
+        let profile = source
+            .split_once("fn capture_profile(")
+            .unwrap()
+            .1
+            .split_once("fn write_json_report")
+            .unwrap()
+            .0;
+        let trace = source
+            .split_once("fn capture_trace(")
+            .unwrap()
+            .1
+            .split_once("fn terminal_trace_count_line")
+            .unwrap()
+            .0;
+        for (function, body) in [("capture_profile", profile), ("capture_trace", trace)] {
+            assert_eq!(
+                body.matches("wait_until_ready(").count(),
+                1,
+                "{function} must idle on exactly one ring-readiness wait"
+            );
+            assert!(
+                !body.contains("thread::sleep"),
+                "{function} idles on a fixed sleep instead of ring readiness"
+            );
+        }
+    }
+
     /// Requested-wait margin at the default ring: one full idle timeout
     /// admits 2 ms x 128k/s = 256 records, far under the default ring.
     /// This bounds the REQUESTED wait only — it is not a scheduling

@@ -811,6 +811,7 @@ impl RootSeed {
 ///         attach_failures: panic!("compile-only placeholder"),
 ///         detach_failures: panic!("compile-only placeholder"),
 ///         producers_detached: panic!("compile-only placeholder"),
+///         detach_wall_ms: panic!("compile-only placeholder"),
 ///         successful_static: panic!("compile-only placeholder"),
 ///         dynamic_attach_evidence: panic!("compile-only placeholder"),
 ///         policy: panic!("compile-only placeholder"),
@@ -851,6 +852,9 @@ pub struct Session {
     /// This permits the existing best-effort terminal poll, not callback
     /// settlement or exact root retirement.
     producers_detached: bool,
+    /// Wall time the producer detach took, in whole milliseconds; zero
+    /// until `detach_producers` runs.
+    detach_wall_ms: u64,
     successful_static: BTreeSet<StaticEndpoint>,
     dynamic_attach_evidence: DynamicAttachEvidence,
     policy: CapturePolicy,
@@ -1899,6 +1903,7 @@ impl Session {
             attach_failures: vec![],
             detach_failures: vec![],
             producers_detached: false,
+            detach_wall_ms: 0,
             successful_static: BTreeSet::new(),
             dynamic_attach_evidence: DynamicAttachEvidence::default(),
             policy,
@@ -2329,12 +2334,20 @@ impl Session {
     /// removed last. Kernel detach does not wait for callbacks already running
     /// on another CPU; callers must not claim that the terminal drain is final.
     pub fn detach_producers(&mut self) -> Result<()> {
+        let start = std::time::Instant::now();
         let detached = self.detach_links(|_| true);
+        self.detach_wall_ms = detach_wall_ms_since(start);
         finish_producer_detach(
             &mut self.producers_detached,
             &self.detach_failures,
             detached,
         )
+    }
+
+    /// Wall time the producer detach took, in whole milliseconds; zero
+    /// when detach never ran.
+    pub(crate) fn detach_wall_ms(&self) -> u64 {
+        self.detach_wall_ms
     }
 
     /// The bound the next `EVENTS` poll gets — see `events::poll_quantum`.
@@ -2572,6 +2585,10 @@ fn detach_registered_link(ebpf: &mut Ebpf, link: RegisteredLink) -> Result<()> {
     }
 }
 
+fn detach_wall_ms_since(start: std::time::Instant) -> u64 {
+    start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
 fn finish_producer_detach(
     detached: &mut bool,
     failures: &[String],
@@ -2669,6 +2686,14 @@ mod policy_output {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn detach_wall_time_is_measured_in_whole_milliseconds() {
+        let now = std::time::Instant::now();
+        assert_eq!(super::detach_wall_ms_since(now), 0);
+        let past = now - std::time::Duration::from_millis(61_234);
+        assert_eq!(super::detach_wall_ms_since(past), 61_234);
+    }
+
     #[test]
     fn owner_limit_uses_exact_loaded_start_shape() {
         for (capacity, limit) in [(16_384, 16_448), (1, 65)] {
@@ -3180,7 +3205,7 @@ mod tests {
         );
         let mut clean = false;
         finish_producer_detach(&mut clean, &[], Ok(())).unwrap();
-        assert_eq!(events::poll_quantum(clean), None);
+        assert_eq!(events::poll_quantum(clean), Some(events::TERMINAL_DRAIN_BOUND));
         assert!(attachment_admission(&failures, true).is_err());
         attachment_admission(&failures, false).unwrap();
     }

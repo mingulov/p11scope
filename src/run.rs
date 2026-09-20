@@ -3229,6 +3229,10 @@ fn capture_profile(
                         kernel_evidence.ring_loss,
                         context.0.capture_facts().discovery_losses()[0],
                     );
+                    consumers.scheduling.add_phase(
+                        SchedulingPhase::Detach,
+                        Duration::from_millis(context.1.detach_wall_ms()),
+                    );
                     let render_start = Instant::now();
                     let mut ev = evidence_for(
                         context.0,
@@ -3627,6 +3631,10 @@ fn capture_trace(
                         terminal_kernel.ring_loss,
                         context.0.capture_facts().discovery_losses()[0],
                     );
+                    consumers.scheduling.add_phase(
+                        SchedulingPhase::Detach,
+                        Duration::from_millis(context.1.detach_wall_ms()),
+                    );
                     let mut evidence = evidence_for(
                         context.0,
                         context.0.capture_facts(),
@@ -3861,13 +3869,12 @@ fn poll_ready(
     }
 }
 
-// Detach timing joins in the detach step (Session times its own link
-// teardown); until then the detach phase reports zero.
 pub(crate) enum SchedulingPhase {
     Discovery,
     Drain,
     Maps,
     Render,
+    Detach,
 }
 
 /// Capture-lifetime consumer-scheduling counters. The loss splits are
@@ -3926,6 +3933,7 @@ impl SchedulingAccumulator {
             SchedulingPhase::Drain => &mut self.phase_drain_ms,
             SchedulingPhase::Maps => &mut self.phase_maps_ms,
             SchedulingPhase::Render => &mut self.phase_render_ms,
+            SchedulingPhase::Detach => &mut self.phase_detach_ms,
         };
         *slot = slot.saturating_add(ms);
     }
@@ -6539,6 +6547,7 @@ mod tests {
         });
         acc.add_phase(SchedulingPhase::Discovery, Duration::from_millis(7));
         acc.add_phase(SchedulingPhase::Drain, Duration::from_millis(3));
+        acc.add_phase(SchedulingPhase::Detach, Duration::from_secs(61));
         acc.note_loop_end(10, 3);
         acc.note_terminal(14, 3);
         let before = Instant::now();
@@ -6558,7 +6567,22 @@ mod tests {
         assert!(!ev.terminal_drain_truncated);
         assert_eq!(ev.phase_ms.discovery, 7);
         assert_eq!(ev.phase_ms.drain, 3);
+        assert_eq!(ev.phase_ms.detach, 61_000);
         assert_eq!(ev.max_inter_drain_gap_ms, 40);
+    }
+
+    /// A terminal drain that stops at its bound reports truncation into
+    /// the published evidence.
+    #[test]
+    fn terminal_truncation_reaches_the_scheduling_snapshot() {
+        let mut acc = SchedulingAccumulator::default();
+        acc.note_terminal_drain(true);
+
+        let ev = acc.snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64);
+
+        assert!(ev.terminal_drain_truncated);
+        assert_eq!(ev.terminal_drain_bound, 65_536);
+        assert!(!acc.last_drain_had_backlog());
     }
 
     /// No sleeps while backlog exists; the pause slice still wins; an
@@ -6863,9 +6887,10 @@ mod tests {
     }
 
     /// Both loops take their poll bound from the session — the quantum while
-    /// the producers are live, whole only once `detach_producers` detached
-    /// them all — so duration, signal and the line limit are checked between
-    /// quanta and the terminal drain still reads the detached ring whole.
+    /// the producers are live, the explicit terminal bound once
+    /// `detach_producers` detached them all — so duration, signal and the
+    /// line limit are checked between quanta and the terminal drain reads
+    /// the detached ring within its explicit bound.
     #[test]
     fn every_events_poll_takes_its_bound_from_the_session() {
         use crate::events::{EventDrain, LIVE_POLL_QUANTUM, ScriptedRecords};

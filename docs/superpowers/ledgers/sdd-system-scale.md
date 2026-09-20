@@ -384,3 +384,40 @@ Build env: TMPDIR=/var/tmp/p11scope-ws-tmp cargo +1.88 --locked --offline.
   one stale test name updated (refusal→detection, same asserts).
   Late-joiner coalescing stays future work (rebuild covers
   retirement/replacement only).
+- Audit F5 (P2): implementer DONE (branch task-audit/f5f7f8).
+  Omission history: `CaptureHistory` now latches the high-water mark
+  of `plan.uncorroborated_candidates` every merge, and `discovery()`
+  publishes the latch (never below the current plan, so merge-
+  skipping projection paths cannot hide present spill). The plan
+  counter stays current-state and still resolves on a live merge —
+  the "history keeps those separately" promise in plan.rs is now
+  actually kept. Test: `spill_history_retains_earlier_omission_-
+  after_live_merge` pins both halves (plan 1→0, published stays 1).
+  RED was the audit's pinned repro, byte-identical output.
+- Audit F7 (P3): implementer DONE (branch task-audit/f5f7f8).
+  Public provenance: the scan-table history merge ratchets linkage
+  from `heuristic` to a corroborated linkage on later publication
+  (live_return wins, per the finding) and never downgrades — a
+  retiring view is less informed, not counter-evidence. No
+  `supersedes` field exists on TableSummary (finding text named one);
+  linkage-only change. Tests: upgrade pinned plus a no-downgrade
+  converse (proof-less republication keeps live_return). RED was the
+  audit's pinned repro, byte-identical output.
+- Audit F8 (P3): implementer DONE (branch task-audit/f5f7f8).
+  Proxy pin portability: new `ADMITTED_PROXY_TABLE_SHAPES` admits the
+  version-matrix-declared 3.x families — 3.0/92, 3.1/92 (362 slots),
+  3.2/104 (410 slots) — and the validator derives that shape's slot,
+  surface, and split pins from the observed tables. Still exact per
+  shape: one shared shape across all 64 tables, exact K=4 spill,
+  per-provider calls (F6 guard untouched). Self-test: older-family
+  fixtures accepted; mixed builds, wrong entry counts, undeclared
+  versions, wrong slots, malformed versions rejected. The audit's
+  exact 3.0 variant now fails only on its zeroed proxy calls (F6),
+  never on shape. Suite (all three findings): full `cargo +1.88
+  test --locked --offline` green 1473/0 (4 ignored, contracts
+  129/129), clippy -D warnings clean, fmt clean, all 15 CI python
+  self-tests + audit/subset oracle unittests green. 3 tests added
+  (1 F5 + 2 F7), 0 removed; no test weakened. Flake note: one
+  `arming_a_static_executable` failure and one unattributed 2-fail
+  run mid-task, both green in isolation and in the final full run
+  (live-process/timing class, code untouched by this branch).

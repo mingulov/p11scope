@@ -1622,6 +1622,7 @@ fn capture_facts_keep_a_manifest_only_capacity_refusal() {
         &BTreeSet::new(),
         0,
         0,
+        false,
     )
     .unwrap();
     engine.counters = counters;
@@ -14684,6 +14685,7 @@ fn corroboration_marks_the_exact_reconciled_object_not_the_raw_key_peer() {
         &[PinnedObjectId(200)].into_iter().collect(),
         0,
         0,
+        false,
     )
     .unwrap();
 
@@ -14947,10 +14949,25 @@ fn coordinator_reuses_one_budget_across_process_scans_and_hashes() {
     let hooks = HookRegistry::builtin();
     let mut counters = DiscoveryCounters::default();
     let first_view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
-    let (_, first) = scan_and_pin(&first_view, &hints, &hooks, &mut budget, &mut counters).unwrap();
+    let (_, first) = scan_and_pin(
+        &first_view,
+        &hints,
+        &hooks,
+        &mut budget,
+        &mut counters,
+        false,
+    )
+    .unwrap();
     let second_view = ProcessView::open(ProcessViewId(1), std::process::id()).unwrap();
-    let (_, second) =
-        scan_and_pin(&second_view, &hints, &hooks, &mut budget, &mut counters).unwrap();
+    let (_, second) = scan_and_pin(
+        &second_view,
+        &hints,
+        &hooks,
+        &mut budget,
+        &mut counters,
+        false,
+    )
+    .unwrap();
     assert_eq!(first.pinned().count(), 1);
     assert_eq!(
         second.pinned().count(),
@@ -15242,6 +15259,7 @@ fn p2_refuse_then_exit(
         &HookRegistry::builtin(),
         &mut CaptureWorkBudget::default(),
         counters,
+        false,
         |_, view, budget| {
             let outcome = crate::discovery::scan::bracket_refusal_for_test(view, budget);
             assert!(outcome.modules().is_empty());

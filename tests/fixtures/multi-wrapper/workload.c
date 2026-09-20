@@ -14,11 +14,19 @@
  *   forward one wrapper with ordinals 5,43 forwarded straight to backend.so
  *   fail    one wrapper whose ordinal 43 fails wrapper-only (no backend)
  *   legacy  publish only: C_GetFunctionList + interface list, zero calls
- *   stage   stdin REPL driving alloc/free/publish for capture tests; the
- *           log/oracle paths are unused (no calls are made, no oracle is
+ *   stage   stdin REPL driving alloc/free/call/publish for capture tests;
+ *           the log path feeds P11SCOPE_MW_LOG (C-command calls are
+ *           recorded there); the oracle path is unused (no oracle is
  *           written). Commands (one per line, stdout flushed per reply):
  *             A <fwd> <fail>  alloc; replies ALLOC idx=<i> table=0x...
  *             F <idx>         free; replies FREED idx=<i>
+ *             C <idx> <ord> <n>
+ *                             call entry <ord> on wrapper <idx> <n> times
+ *                             (mid-capture activation for Task 1.6 lanes);
+ *                             replies CALLED idx=<i> ord=<o> n=<n> rv=<rv>;
+ *                             every call is recorded via mw_log exactly
+ *                             like scenario calls (P11SCOPE_MW_LOG comes
+ *                             from argv[4] as usual)
  *             P               publish via the real standard factories and
  *                             print every published table with all entries
  *             T               print the template pool (or TEMPLATE unknown
@@ -478,6 +486,28 @@ static int run_stage(void *handle)
             s.do_free(s.handles[idx]);
             s.handles[idx] = NULL;
             printf("FREED idx=%d\n", idx);
+            continue;
+        }
+        if (line[0] == 'C') {
+            int idx = -1;
+            int ord = -1;
+            int n = -1;
+            if (sscanf(line + 1, "%d %d %d", &idx, &ord, &n) != 3 || idx < 0
+                || idx >= STAGE_NWRAP || s.handles[idx] == NULL || ord < 0
+                || ord >= STAGE_NENTRY || n < 0) {
+                printf("ERROR bad call\n");
+                free(line);
+                return EXIT_SCENARIO;
+            }
+            /* The driver calls through the published heap table (never the
+             * templates), like every scenario: mw_table gives &bound. */
+            Table *t = s.do_table(s.handles[idx]);
+            EntryFn fn = t->funcs[ord];
+            CK_RV rv = CKR_OK;
+            for (int k = 0; k < n; k++) {
+                rv = fn((CK_ULONG)idx, 0);
+            }
+            printf("CALLED idx=%d ord=%d n=%d rv=%lu\n", idx, ord, n, rv);
             continue;
         }
         printf("ERROR unknown command\n");

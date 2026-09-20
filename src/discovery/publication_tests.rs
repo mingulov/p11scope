@@ -22,6 +22,13 @@
 //! coverage. Cases 7 and 9 are guards that also pass pre-fix (honest
 //! refusal must survive the fix); the rest fail until heap-wrapper
 //! lowering lands.
+//!
+//! Task 1.6 appends the broad-admission experiment cases, reusing the same
+//! stage driver and oracles:
+//!
+//! 10. `broad_fixed_pool_admits_all_validated_templates`
+//! 11. `broad_stripped_build_adds_nothing_beyond_selected`
+//! 12. `broad_refuses_whole_when_validated_set_exceeds_budget`
 use super::session_fixture::ScriptedSession;
 use super::*;
 use crate::discovery::identity::{ManifestStaleReason, pin_manifest_objects_deferred};
@@ -640,16 +647,33 @@ fn publish_records(pid: u32, publish: &PublishBlock, hooks: &HookRegistry) -> Ve
 
 /// A real scan of the live children, no manifests: initial discovery.
 fn engine_over_pids(pids: &[u32]) -> Engine {
+    engine_over_pids_broad(pids, false)
+}
+
+/// Task 1.6: same scan with broad admission enabled — the pool pass runs at
+/// scan time and the merge lifts the heuristic cap with fit-or-refuse-whole.
+fn engine_over_pids_broad(pids: &[u32], broad_admit: bool) -> Engine {
+    let mut engine = scan_engine_over_pids(pids, broad_admit);
+    rebuild_discovered(&mut engine).expect("rebuild after scan");
+    engine
+}
+
+/// Scan without the rebuild, so the A2 probe can observe a broad total
+/// refusal as evidence instead of an expect panic.
+fn scan_engine_over_pids(pids: &[u32], broad_admit: bool) -> Engine {
     let hooks = HookRegistry::builtin();
     let mut engine = Engine::empty();
     engine.hooks = hooks.clone();
+    engine.broad_admit = broad_admit;
     for pid in pids {
         let id = engine.allocate_view_id().expect("view id");
         let view = ProcessView::open(id, *pid).expect("retain child view");
         engine.retain_view_id(id).expect("retain view id");
         let mut counters = DiscoveryCounters::default();
-        let (found, pins) = scan_and_pin(&view, &[], &hooks, &mut engine.budget, &mut counters)
-            .expect("scan live child");
+        let broad = engine.broad_admit;
+        let (found, pins) =
+            scan_and_pin(&view, &[], &hooks, &mut engine.budget, &mut counters, broad)
+                .expect("scan live child");
         engine.scan_inputs.insert(
             view.id(),
             ScanInput {
@@ -660,7 +684,6 @@ fn engine_over_pids(pids: &[u32]) -> Engine {
         );
         engine.views.push(view);
     }
-    rebuild_discovered(&mut engine).expect("rebuild after scan");
     engine
 }
 
@@ -2744,4 +2767,395 @@ fn legacy_static_table_scan_manifest_and_live() {
     assert_costing(&engine_c, wall, "t9-ls");
 
     holder.release();
+}
+
+/// Case 10 (Task 1.6): broad admission on the recognized fixed-family
+/// build. Same pre-capture setup as case 7 — five wrappers published
+/// before the capture, no live records observed — but broad attaches
+/// every validated fixed-family target: the sweep's 4 file-backed
+/// templates stay covered, and the 60 anonymous pool tables validate
+/// through the shared bracketed reader and admit. Index 4's closures
+/// (case 7's honest miss) are admitted here; names stay unauthorized
+/// except the sweep's own template[0] interface link.
+#[test]
+fn broad_fixed_pool_admits_all_validated_templates() {
+    let build = pub_build();
+    let mut stage = StageChild::spawn(&build.workload, &build.provider);
+    for want in 0..5 {
+        let (idx, _) = stage.alloc(0, -1);
+        assert_eq!(idx, want);
+    }
+    // Publication happens BEFORE the capture starts.
+    let maps = MapLite::snapshot(stage.pid);
+    let templates = stage.templates().expect("normal build shows its pool");
+    assert_eq!(templates.len(), 64);
+    let publish = stage.publish();
+    assert_eq!(
+        publish
+            .elements
+            .iter()
+            .filter(|table| table.index >= 0)
+            .count(),
+        5,
+        "five heap tables really were published"
+    );
+
+    // The capture starts now and observes no live records at all.
+    let started = Instant::now();
+    let engine = engine_over_pids_broad(&[stage.pid], true);
+    let wall = started.elapsed();
+
+    assert_eq!(engine.modules.len(), 1);
+    let scanned = &engine.modules[0].scanned;
+    assert_eq!(
+        scanned.tables.len(),
+        64,
+        "4 swept templates + 60 validated pool tables"
+    );
+    assert!(
+        scanned.tables.iter().all(|table| table.version == (3, 2)),
+        "every instance is a fixed-family table"
+    );
+    // Identity shape (pinned loudly like t8's link order): the pool
+    // crosses the file-tail/anonymous-BSS VMA split inside table 4, so
+    // tables 0-4 resolve a file identity (0-3 swept, 4 spanning-read)
+    // while tables 5-63 are honestly anonymous (cross-view dedup falls
+    // back to slot-level union, exact all the same).
+    for (index, printed) in templates.iter().enumerate() {
+        if index < 5 {
+            let (_, expected_offset, _) = MapLite::file_target(&maps, printed.addr);
+            let found = scanned
+                .tables
+                .iter()
+                .find(|table| {
+                    table.address == printed.addr || table.file_offset == Some(expected_offset)
+                })
+                .unwrap_or_else(|| panic!("pool table {index} was validated"));
+            assert!(
+                found.file_offset.is_some(),
+                "pool table {index} resolves a file identity"
+            );
+        } else {
+            let found = scanned
+                .tables
+                .iter()
+                .find(|table| table.address == printed.addr)
+                .unwrap_or_else(|| panic!("pool table {index} was validated"));
+            assert!(
+                found.file_offset.is_none(),
+                "pool table {index} is honestly anonymous"
+            );
+        }
+    }
+    assert!(
+        scanned.tables.iter().all(|table| !table.live_return),
+        "no live returns were observed"
+    );
+    // Distinct physical targets: 6 exercised ordinals x 64 per-index
+    // closures, plus the 3 implementations every table shares.
+    assert_eq!(slot_targets(&engine), printed_targets(&maps, &templates));
+    assert_eq!(engine.plan().slots.len(), 384 + 3);
+    assert_eq!(engine.plan().uncorroborated_candidates, 0);
+    assert_eq!(engine.plan().entries_seen, 64 * 104);
+    // Case 7's miss is admitted here: every published heap wrapper's
+    // exercised closures resolve to admitted slots.
+    for table in publish.elements.iter().filter(|table| table.index >= 0) {
+        for ord in EX_ORDS {
+            let (path, offset, _) = MapLite::file_target(&maps, table.entries[ord as usize].0);
+            assert!(
+                slot_targets(&engine).contains(&(path, offset)),
+                "heap {} ord{ord} admits under broad",
+                table.index,
+            );
+        }
+    }
+    // Names: only the sweep's own template[0] interface link authorizes;
+    // the 60 pool tables are unlinked heuristic evidence (`unknown`).
+    let claimants: Vec<(&TablePrint, bool)> = templates
+        .iter()
+        .enumerate()
+        .map(|(index, table)| (table, index == 0))
+        .collect();
+    assert_eq!(
+        actual_slot_names(&engine),
+        expected_slot_names(&maps, &claimants)
+    );
+    assert_count_only(&engine);
+    assert_costing(&engine, wall, "t10-broad");
+}
+
+/// Case 11 (Task 1.6): the unknown-layout build is broad's composition
+/// boundary. The stripped provider hides `p11scope_fixed`, so the pool
+/// pass recognizes nothing and broad admits exactly the selected set —
+/// no more, no less. Publication (case 8) stays the only path in.
+#[test]
+fn broad_stripped_build_adds_nothing_beyond_selected() {
+    let build = pub_build();
+    let mut stage = StageChild::spawn(&build.workload, &build.stripped);
+    for want in 0..5 {
+        let (idx, _) = stage.alloc(0, -1);
+        assert_eq!(idx, want);
+    }
+    let publish = stage.publish();
+    assert_eq!(
+        publish
+            .elements
+            .iter()
+            .filter(|table| table.index >= 0)
+            .count(),
+        5,
+        "five heap tables really were published"
+    );
+    assert!(
+        stage.templates().is_none(),
+        "stripped build hides its layout"
+    );
+
+    let started = Instant::now();
+    let broad = engine_over_pids_broad(&[stage.pid], true);
+    let wall = started.elapsed();
+    let selected = engine_over_pids(&[stage.pid]);
+
+    assert_eq!(broad.modules.len(), 1);
+    assert_eq!(
+        broad.modules[0].scanned.tables.len(),
+        selected.modules[0].scanned.tables.len(),
+        "broad recognizes no pool without the symbol"
+    );
+    assert_eq!(slot_targets(&broad), slot_targets(&selected));
+    assert_eq!(
+        broad.plan().slots.len(),
+        selected.plan().slots.len(),
+        "broad admits exactly the selected set on unknown layouts"
+    );
+    assert_count_only(&broad);
+    assert_costing(&broad, wall, "t11-broad-stripped");
+}
+
+/// Case 12 (Task 1.6): broad is fit-or-refuse-whole. Six validated
+/// heuristic tables x 100 distinct targets exceed the 512 slot ceiling:
+/// selected admission takes the strongest-evidence prefix (4 tables) and
+/// spills 2; broad refuses the module whole with zero spill — a prefix
+/// would break the dormant-activation promise without forcing PARTIAL.
+#[test]
+fn broad_refuses_whole_when_validated_set_exceeds_budget() {
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = std::fs::metadata("/proc/self/ns/mnt").expect("mount namespace");
+    let namespace = crate::process::MountNamespaceId {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    };
+    let key = ObjectKey {
+        device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+        inode: 42,
+    };
+    let object = PinnedObjectId(7);
+    let tables: Vec<ScannedTable> = (0..6u32)
+        .map(|table| ScannedTable {
+            version: (3, 2),
+            walk: "full",
+            entries: (0..100u32)
+                .map(|entry| ScannedEntry {
+                    name: "C_Sign",
+                    object: key,
+                    object_path: "/pool.so".into(),
+                    file_offset: u64::from(table * 100 + entry),
+                })
+                .collect(),
+            null_entries: vec![],
+            unpinned: vec![],
+            address: 0x7000 + u64::from(table),
+            file_offset: Some(0x3000 + u64::from(table) * 0x400),
+            live_return: false,
+            manifest_supported: false,
+        })
+        .collect();
+    let module = ReconciledModule {
+        scanned: ScannedModule {
+            view: ProcessViewId(0),
+            mount_namespace: namespace,
+            key,
+            path: "/pool.so".into(),
+            decoder_abi: Some(ElfAbi::Lp64),
+            exports: vec!["C_GetFunctionList".into()],
+            tables,
+            interfaces: vec![],
+        },
+        object,
+        entry_objects: vec![vec![object; 100]; 6],
+    };
+    let mut selected_counters = DiscoveryCounters::default();
+    let selected = build_current_plan(
+        std::slice::from_ref(&module),
+        &[],
+        &PinnedObjects::empty(),
+        &mut selected_counters,
+        &BTreeSet::new(),
+        0,
+        0,
+        false,
+    )
+    .expect("selected plan builds");
+    assert_eq!(selected.slots.len(), 400);
+    assert_eq!(selected.uncorroborated_candidates, 2);
+    assert!(selected.modules_skipped.is_empty());
+
+    // Alone, the oversized module refuses everything: the plan fails
+    // closed with the whole-module refusal verbatim.
+    let mut broad_counters = DiscoveryCounters::default();
+    let error = build_current_plan(
+        std::slice::from_ref(&module),
+        &[],
+        &PinnedObjects::empty(),
+        &mut broad_counters,
+        &BTreeSet::new(),
+        0,
+        0,
+        true,
+    )
+    .expect_err("broad refuses the oversized module whole");
+    let text = format!("{error:?}");
+    assert!(
+        text.contains("/pool.so") && text.contains("refusing to attach a prefix"),
+        "total refusal carries the honest whole-module shape: {text}"
+    );
+
+    // Alongside a fitting module, the plan builds: the fitting module
+    // admits, the oversized one is skipped whole, and broad spills
+    // nothing — never a silent prefix.
+    let small_object = PinnedObjectId(8);
+    let small = ReconciledModule {
+        scanned: ScannedModule {
+            view: ProcessViewId(0),
+            mount_namespace: namespace,
+            key,
+            path: "/small.so".into(),
+            decoder_abi: Some(ElfAbi::Lp64),
+            exports: vec!["C_GetFunctionList".into()],
+            tables: vec![ScannedTable {
+                version: (2, 40),
+                walk: "full",
+                entries: (0..10u32)
+                    .map(|entry| ScannedEntry {
+                        name: "C_Sign",
+                        object: key,
+                        object_path: "/small.so".into(),
+                        file_offset: 0x8000 + u64::from(entry),
+                    })
+                    .collect(),
+                null_entries: vec![],
+                unpinned: vec![],
+                address: 0x9000,
+                file_offset: Some(0x9000),
+                live_return: false,
+                manifest_supported: false,
+            }],
+            interfaces: vec![],
+        },
+        object: small_object,
+        entry_objects: vec![vec![small_object; 10]],
+    };
+    let mut mixed_counters = DiscoveryCounters::default();
+    let mixed = build_current_plan(
+        &[module, small],
+        &[],
+        &PinnedObjects::empty(),
+        &mut mixed_counters,
+        &BTreeSet::new(),
+        0,
+        0,
+        true,
+    )
+    .expect("broad plan builds around the refusal");
+    assert_eq!(mixed.slots.len(), 10);
+    assert_eq!(mixed.uncorroborated_candidates, 0, "broad never spills");
+    assert_eq!(mixed.modules_skipped.len(), 1);
+    assert_eq!(mixed.modules_skipped[0].subject, "/pool.so");
+}
+
+/// Case 13 (Task 1.6, manual A2 probe): real-p11-kit admission
+/// arithmetic. Holds the host libp11-kit mapped-but-dormant in a
+/// descendant (python3 + ctypes, no calls) and prints selected-vs-broad
+/// admission for the report. Run filtered, alone in the process:
+/// `cargo test -p p11scope --lib broad_p11kit -- --ignored --nocapture`.
+/// Asserts only host-robust invariants (broad never spills; a total
+/// refusal carries the whole-module shape); the exact printed numbers
+/// are recorded by hand into the Task 1.6 report.
+#[test]
+#[ignore = "manual: needs host libp11-kit + python3; run filtered with --ignored --nocapture"]
+fn broad_p11kit_admission_arithmetic() {
+    let mut child = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(
+            "import ctypes, time; \
+             ctypes.CDLL('libp11-kit.so.0'); \
+             print('READY', flush=True); \
+             time.sleep(180)",
+        )
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("python3 holds libp11-kit");
+    let mut ready = String::new();
+    std::io::BufRead::read_line(
+        &mut std::io::BufReader::new(child.stdout.as_mut().expect("child stdout")),
+        &mut ready,
+    )
+    .expect("READY line");
+    assert_eq!(ready.trim(), "READY");
+    let pid = child.id();
+
+    let selected = engine_over_pids(std::slice::from_ref(&pid));
+    let selected_tables: usize = selected
+        .modules
+        .iter()
+        .map(|module| module.scanned.tables.len())
+        .sum();
+    println!(
+        "A2 selected: {} module(s) {} table(s) {} slot(s) spill={} refused={}",
+        selected.modules.len(),
+        selected_tables,
+        selected.plan().slots.len(),
+        selected.plan().uncorroborated_candidates,
+        selected.plan().modules_skipped.len(),
+    );
+    assert!(
+        !selected.plan().slots.is_empty(),
+        "selected admits something on a real provider"
+    );
+
+    let mut broad = scan_engine_over_pids(std::slice::from_ref(&pid), true);
+    match rebuild_discovered(&mut broad) {
+        Ok(()) => {
+            let broad_tables: usize = broad
+                .modules
+                .iter()
+                .map(|module| module.scanned.tables.len())
+                .sum();
+            println!(
+                "A2 broad: {} module(s) {} table(s) {} slot(s) spill={} refused={}",
+                broad.modules.len(),
+                broad_tables,
+                broad.plan().slots.len(),
+                broad.plan().uncorroborated_candidates,
+                broad.plan().modules_skipped.len(),
+            );
+            assert_eq!(
+                broad.plan().uncorroborated_candidates,
+                0,
+                "broad never spills"
+            );
+        }
+        Err(error) => {
+            let text = format!("{error:?}");
+            println!("A2 broad: total refusal: {text}");
+            assert!(
+                text.contains("refusing to attach a prefix"),
+                "a broad total refusal carries the whole-module shape: {text}"
+            );
+        }
+    }
+
+    child.kill().expect("reap the holder");
+    child.wait().expect("reap the holder");
 }

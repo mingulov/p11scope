@@ -218,6 +218,12 @@ fn acquisition_label(a: &Acquisition) -> String {
 /// manifest/live-return supported) bypass this cap, subject only to the global
 /// budget with atomic whole-module refusal. Manifest tables are
 /// operator-authoritative and never capped.
+///
+/// Task 1.6 experiment: broad admission (`P11SCOPE_BROAD_ADMIT=1`) lifts this
+/// cap for validated tables — every validated table admits until the global
+/// budget, and the first table that does not fit refuses the module whole
+/// (the `spent` arm below). Validation is unchanged: only decoder-accepted
+/// tables reach `merge`, broad or not.
 pub(crate) const MAX_TABLES_PER_OBJECT: usize = 4;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -346,6 +352,19 @@ impl AttachPlan {
         manifests: &[Manifest],
         pinned: &PinnedObjects,
     ) -> AttachPlan {
+        self.rebuild_from_sources_broad(scanned, manifests, pinned, false)
+    }
+
+    /// Task 1.6 experiment: `broad_admit` lifts the per-object heuristic cap
+    /// and refuses a module whole unless every validated table fits. Only the
+    /// engine's broad pass sets this; every other caller keeps `false`.
+    pub fn rebuild_from_sources_broad(
+        &self,
+        scanned: &[ReconciledModule],
+        manifests: &[Manifest],
+        pinned: &PinnedObjects,
+        broad_admit: bool,
+    ) -> AttachPlan {
         self.rebuild_from_sources_with(
             scanned,
             manifests,
@@ -356,6 +375,7 @@ impl AttachPlan {
                     (Some(provider), Some(target)) if provider == target
                 )
             },
+            broad_admit,
         )
     }
 
@@ -365,6 +385,7 @@ impl AttachPlan {
         manifests: &[Manifest],
         pinned_id: impl FnMut(ObjectKey, &str) -> Option<PinnedObjectId>,
         compatible: impl FnMut(PinnedObjectId, PinnedObjectId) -> bool,
+        broad_admit: bool,
     ) -> AttachPlan {
         let mut rebuilt = build_from_sources_with(
             scanned,
@@ -373,6 +394,7 @@ impl AttachPlan {
             compatible,
             self.slots.len(),
             &self.slot_by_key,
+            broad_admit,
         );
         for (key, object) in &self.provisional_get_function_list {
             if key.object != *object || rebuilt.slot_by_key.contains_key(key) {
@@ -1198,6 +1220,7 @@ fn merge(
     interface_list: String,
     allocated_slots: usize,
     existing_slots: &BTreeMap<AttachKey, usize>,
+    broad_admit: bool,
 ) -> AttachPlan {
     let capacity = MAX_SLOTS as usize;
     let mut groups: Vec<Vec<Discovered<'_>>> = Vec::new();
@@ -1379,40 +1402,73 @@ fn merge(
         // Unresolved heuristic tables admit strongest-first until the
         // per-object cap or the remaining global budget; the spill is
         // uncorroborated evidence, never slots.
-        let mut heuristic_admitted = 0usize;
-        let mut spent = false;
-        for (key, score, _) in &ordered {
-            if is_published(score) {
-                continue;
+        //
+        // Broad (Task 1.6 experiment) instead demands the complete validated
+        // set: every table's targets must fit the remaining global budget or
+        // the module refuses whole, like a published over-budget module. A
+        // strongest-prefix plus spill would break the dormant-activation
+        // promise (spill is informational, never PARTIAL), so broad never
+        // spills — it refuses, loudly, with the same shape. Empty tables cost
+        // nothing either way and admit, never spilling.
+        if broad_admit {
+            let mut scan_union = fresh.clone();
+            for (key, _, _) in &ordered {
+                if let Some(keys) = keys_of.get(key) {
+                    scan_union.extend(keys.iter().filter(|key| is_fresh(key)).copied());
+                }
             }
-            // A heuristic table with no attachable target costs nothing either
-            // way: counted as spill, never consuming the cap.
-            if keys_of.get(key).is_none_or(|keys| keys.is_empty()) {
-                uncorroborated_candidates += 1;
-                continue;
+            if allocated_slots + scan_union.len() > capacity {
+                let skipped = Skipped {
+                    subject: path.to_string(),
+                    reason: format!(
+                        "module needs {} more of the {MAX_SLOTS} attach slots; {} are in use \
+                         — refusing to attach a prefix",
+                        scan_union.len(),
+                        allocated_slots
+                    ),
+                };
+                refused_module_objects.push((object, skipped.clone()));
+                modules_skipped.push(skipped);
+                continue 'groups;
             }
-            if spent || heuristic_admitted >= MAX_TABLES_PER_OBJECT {
-                uncorroborated_candidates += 1;
-                continue;
+            fresh = scan_union;
+            admitted.extend(ordered.iter().map(|(key, _, _)| *key));
+        } else {
+            let mut heuristic_admitted = 0usize;
+            let mut spent = false;
+            for (key, score, _) in &ordered {
+                if is_published(score) {
+                    continue;
+                }
+                // A heuristic table with no attachable target costs nothing either
+                // way: counted as spill, never consuming the cap.
+                if keys_of.get(key).is_none_or(|keys| keys.is_empty()) {
+                    uncorroborated_candidates += 1;
+                    continue;
+                }
+                if spent || heuristic_admitted >= MAX_TABLES_PER_OBJECT {
+                    uncorroborated_candidates += 1;
+                    continue;
+                }
+                let marginal = keys_of.get(key).map_or(0, |keys| {
+                    keys.iter()
+                        .filter(|key| is_fresh(key) && !fresh.contains(key))
+                        .count()
+                });
+                if allocated_slots + fresh.len() + marginal > capacity {
+                    // The budget is spent: this table and every weaker one spill.
+                    // Admission stays a strongest-evidence prefix — a strong
+                    // table is never skipped to admit a weaker one.
+                    uncorroborated_candidates += 1;
+                    spent = true;
+                    continue;
+                }
+                if let Some(keys) = keys_of.get(key) {
+                    fresh.extend(keys.iter().filter(|key| is_fresh(key)).copied());
+                }
+                admitted.insert(*key);
+                heuristic_admitted += 1;
             }
-            let marginal = keys_of.get(key).map_or(0, |keys| {
-                keys.iter()
-                    .filter(|key| is_fresh(key) && !fresh.contains(key))
-                    .count()
-            });
-            if allocated_slots + fresh.len() + marginal > capacity {
-                // The budget is spent: this table and every weaker one spill.
-                // Admission stays a strongest-evidence prefix — a strong
-                // table is never skipped to admit a weaker one.
-                uncorroborated_candidates += 1;
-                spent = true;
-                continue;
-            }
-            if let Some(keys) = keys_of.get(key) {
-                fresh.extend(keys.iter().filter(|key| is_fresh(key)).copied());
-            }
-            admitted.insert(*key);
-            heuristic_admitted += 1;
         }
         allocated_slots += fresh.len();
         // Per scan piece, per table index: admitted above. Manifest pieces
@@ -1616,6 +1672,7 @@ pub fn build_from_reconciled_modules(modules: &[ReconciledModule]) -> AttachPlan
         "absent".into(),
         0,
         &BTreeMap::new(),
+        false,
     )
 }
 
@@ -1627,6 +1684,18 @@ pub fn build_from_sources(
     scanned: &[ReconciledModule],
     manifests: &[Manifest],
     pinned: &PinnedObjects,
+) -> AttachPlan {
+    build_from_sources_broad(scanned, manifests, pinned, false)
+}
+
+/// Task 1.6 experiment: `broad_admit` lifts the per-object heuristic cap
+/// and refuses a module whole unless every validated table fits. Only the
+/// engine's broad pass sets this; every other caller keeps `false`.
+pub fn build_from_sources_broad(
+    scanned: &[ReconciledModule],
+    manifests: &[Manifest],
+    pinned: &PinnedObjects,
+    broad_admit: bool,
 ) -> AttachPlan {
     build_from_sources_with(
         scanned,
@@ -1640,6 +1709,7 @@ pub fn build_from_sources(
         },
         0,
         &BTreeMap::new(),
+        broad_admit,
     )
 }
 
@@ -1650,6 +1720,7 @@ fn build_from_sources_with(
     mut compatible: impl FnMut(PinnedObjectId, PinnedObjectId) -> bool,
     allocated_slots: usize,
     existing_slots: &BTreeMap<AttachKey, usize>,
+    broad_admit: bool,
 ) -> AttachPlan {
     let mut discovered: Vec<Discovered<'_>> = scanned.iter().map(lower_scanned).collect();
     let mut orphaned = Vec::new();
@@ -1670,6 +1741,7 @@ fn build_from_sources_with(
         ),
         allocated_slots,
         existing_slots,
+        broad_admit,
     );
     plan.skipped.extend(orphaned);
     plan
@@ -1684,6 +1756,7 @@ fn build_from_test_sources(scanned: &[ReconciledModule], manifests: &[Manifest])
         |_, _| true,
         0,
         &BTreeMap::new(),
+        false,
     )
 }
 
@@ -1850,6 +1923,7 @@ fn build(m: &Manifest) -> AttachPlan {
         acquisition_label(&m.interface_list),
         0,
         &BTreeMap::new(),
+        false,
     );
     plan.skipped.extend(orphaned);
     plan
@@ -2279,6 +2353,7 @@ mod tests {
             |_, _| true,
             0,
             &BTreeMap::new(),
+            false,
         );
 
         assert_eq!(plan.slots.len(), 2, "distinct pinned objects stay distinct");
@@ -2315,6 +2390,7 @@ mod tests {
             |_, _| false,
             0,
             &BTreeMap::new(),
+            false,
         );
         assert!(plan.slots.is_empty());
         assert_eq!(plan.entries_seen, 1);
@@ -3639,6 +3715,7 @@ mod tests {
             "absent".into(),
             plan.slots.len(),
             &plan.slot_by_key,
+            false,
         );
 
         assert_eq!(rebuilt.modules.len(), 1);

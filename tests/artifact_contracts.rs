@@ -2637,6 +2637,20 @@ fn loss_share_measure_oracle_pins_trace_burst_capacity_and_window() {
 }
 
 #[test]
+fn audit_oracle_regressions_pin_owned_coverage_and_phase_timers() {
+    run_ok(
+        "python3",
+        &[
+            "-I",
+            "tests/python/test_audit_oracle.py",
+            "-v",
+            "OwnedCoverageTests",
+            "PhaseTimerTests",
+        ],
+    );
+}
+
+#[test]
 fn native_helper_suite_recorded_launcher_requires_authenticated_generations_and_bounded_cleanup() {
     run_native_python_suite(
         "tests/python/test_root_recorded_launcher.py",

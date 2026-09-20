@@ -1530,7 +1530,8 @@ def validate_proxy_capacity_fallback(document, module_path=None):
     functions = document["functions"]
     require(len(functions) == evidence["slots"], len(functions))
     attributed = Counter()
-    called = 0
+    called_soft = 0
+    called_proxy = 0
     for item in functions:
         require(item["names"] == ["unknown"], f"scan-only function must be unnamed: {item}")
         require(item["aliased"] is False, item)
@@ -1538,12 +1539,19 @@ def validate_proxy_capacity_fallback(document, module_path=None):
         require(item["module"] in (soft_id, proxy_id), item)
         attributed["soft" if item["module"] == soft_id else "proxy"] += 1
         require(isinstance(item["calls"], int) and item["calls"] >= 0, item)
-        called += item["calls"]
+        if item["module"] == soft_id:
+            called_soft += item["calls"]
+        else:
+            called_proxy += item["calls"]
     require(
         dict(attributed) == {"soft": 68, "proxy": PROXY_ADMITTED_SLOTS},
         f"per-module function split: {dict(attributed)}",
     )
-    require(called > 0, "the proxy stack handled no calls")
+    # A green lane claims two-provider call coverage (audit F6): one global
+    # positive count lets complete loss on either provider pass, so each
+    # provider must have handled at least one call.
+    require(called_soft > 0, "SoftHSM2 handled no calls: single-provider, not proxy-stack coverage")
+    require(called_proxy > 0, "the proxy handled no calls: complete proxy-call loss is not two-provider coverage")
 
 
 def load_json(path):
@@ -2640,6 +2648,10 @@ def self_test():
         lambda d: d["evidence"].update(completeness="COMPLETE"),
         lambda d: d["evidence"].update(slots=68 + PROXY_ADMITTED_SLOTS - 1),
         lambda d: [item.update(calls=0) for item in d["functions"]],
+        # Audit F6: complete call loss on one provider is not two-provider
+        # coverage, even with the other provider's call still present.
+        lambda d: [item.update(calls=0) for item in d["functions"][68:]],
+        lambda d: d["functions"][0].update(calls=0),
         # The K=4 spill is exact in both directions.
         lambda d: d["evidence"].update(discovery_uncorroborated_candidates=PROXY_SPILL - 1),
         lambda d: d["evidence"].update(discovery_uncorroborated_candidates=PROXY_SPILL + 1),

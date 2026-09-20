@@ -325,7 +325,7 @@ fn probe_parent(
         std::num::NonZeroU32::new(child).context("the self-probe child pid must be non-zero")?,
     );
     let link = program
-        .attach(point, "/proc/self/exe", scope)
+        .attach([point], "/proc/self/exe", scope)
         .context("attaching the uretprobe self-probe")?;
 
     drop(release_write); // the child's blocking read returns 0 -> it proceeds

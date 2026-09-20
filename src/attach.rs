@@ -1996,7 +1996,7 @@ impl Session {
             std::num::NonZeroU32::new(pid).ok_or(DynamicLoaderAttachFailure::InvalidPid)?,
         );
         match record_dynamic_attach_with(probe, &mut self.dynamic_attach_evidence, |probe| {
-            probe.attach(point, &path, scope)
+            probe.attach([point], &path, scope)
         }) {
             Ok(id) => {
                 self.links.push(RegisteredLink::DynamicUProbe {
@@ -2065,7 +2065,7 @@ impl Session {
                     .program_mut(program)
                     .with_context(|| format!("program {program} missing from object"))?
                     .try_into()?;
-                probe.attach(point(), &path, scope).map_err(|error| {
+                probe.attach([point()], &path, scope).map_err(|error| {
                     anyhow!(
                         "{program} at object {:?}+{file_offset:#x}: {}",
                         object,
@@ -2250,7 +2250,7 @@ impl Session {
                     .program_mut(program)
                     .with_context(|| format!("program {program} missing from object"))?
                     .try_into()?;
-                match prog.attach(point, path, scope) {
+                match prog.attach([point], path, scope) {
                     Ok(id) => {
                         links.push(RegisteredLink::UProbe {
                             program,
@@ -2420,10 +2420,10 @@ impl Session {
             .context("diagnostic p11_entry program")?
             .try_into()?;
         let id = probe.attach(
-            UProbeAttachPoint {
+            [UProbeAttachPoint {
                 location: UProbeAttachLocation::AbsoluteOffset(offset),
                 cookie: None,
-            },
+            }],
             path,
             UProbeScope::CallingProcess,
         )?;
@@ -2709,6 +2709,38 @@ mod tests {
             assert!(
                 aya_obj::ProgramSection::from_str(section).is_ok(),
                 "{section} must parse"
+            );
+        }
+    }
+
+    #[test]
+    fn backport_multi_flag_set_only_for_multi_sections() {
+        use aya_obj::ProgramSection;
+        use std::str::FromStr as _;
+        for (section, sleepable, multi, ret) in [
+            ("uprobe/p11_entry", false, false, false),
+            ("uprobe.s/p11_entry", true, false, false),
+            ("uprobe.multi/p11_entry", false, true, false),
+            ("uprobe.multi.s/p11_entry", true, true, false),
+            ("uretprobe/p11_return", false, false, true),
+            ("uretprobe.s/p11_return", true, false, true),
+            ("uretprobe.multi/p11_return", false, true, true),
+            ("uretprobe.multi.s/p11_return", true, true, true),
+        ] {
+            let parsed = ProgramSection::from_str(section).unwrap();
+            let (actual_sleepable, actual_multi, actual_ret) = match parsed {
+                ProgramSection::UProbe {
+                    sleepable, multi, ..
+                } => (sleepable, multi, false),
+                ProgramSection::URetProbe {
+                    sleepable, multi, ..
+                } => (sleepable, multi, true),
+                _ => panic!("{section} parsed as {parsed:?}"),
+            };
+            assert_eq!(
+                (actual_sleepable, actual_multi, actual_ret),
+                (sleepable, multi, ret),
+                "{section}"
             );
         }
     }

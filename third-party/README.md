@@ -10,7 +10,7 @@ all files under `patches/` remain tracked.
 
 ## Aya 0.14.0
 
-`src/aya-0.14.0-p1/` is reconstructed from the published `aya` 0.14.0 package
+`src/aya-0.14.0-p2/` is reconstructed from the published `aya` 0.14.0 package
 and the ordered patches in `patches/aya-0.14.0/`, then selected by the root
 `[patch.crates-io]` while the dependency remains `aya = "=0.14.0"`. Its original
 MIT and Apache-2.0 license files, upstream attribution, and registry dependency
@@ -58,6 +58,24 @@ lockfile retains all dependency versions and checksums except Aya's registry
 source/checksum, replaced by this local path selection. Package metadata and
 the resolved dependency graph must be compared when refreshing this patch.
 
+Revision 2 adds a narrow backport of upstream Aya PR #1417 ("aya: add
+multi-uprobe attach support", by `swananan`, merged 2026-07-31 as
+`5c1a79e0bdc36e77`), minus symbol batching: `AttachMode`
+(Single/Multi/Unknown) selected from the ELF section kind, program load
+with `BPF_TRACE_UPROBE_MULTI` (48) for multi sections, raw
+`bpf_link_create_uprobe_multi`, per-point cookies, `ProbeLinkInner`
+one/many links, pid mapping (AllProcesses to 0, CallingProcess to the
+real pid, OneProcess to its pid), and Unknown-mode fallback (multi
+first, singles on `MultiLinkNotSupported`/EINVAL). Multi-point symbol
+resolution stays sequential through the existing single-symbol path;
+p11scope attaches `AbsoluteOffset` only. One p11scope-only extension:
+`UProbe::load_multi`, which selects the multi load flag explicitly —
+p11scope keeps plain `uprobe`/`uretprobe` sections and chooses the
+backend at runtime behind a functional probe. Upstream's MIT/Apache-2.0
+terms still apply to the backported lines; no new dependency is added
+(the upstream `rstest` test dependency is deliberately not vendored, so
+the new behavior is pinned by the application's own tests instead).
+
 CI reconstructs and validates both dependency graphs before the root workspace
 gates, then runs this explicit dependency gate because the root workspace
 excludes Aya. Developers can run the same command from the repository root;
@@ -65,7 +83,7 @@ the target directory remains outside the immutable generated package. The
 `--offline` form assumes the locked Cargo dependencies are already cached:
 
 ```sh
-CARGO_PROFILE_TEST_OVERFLOW_CHECKS=true cargo +1.88 test --locked --offline --manifest-path third-party/src/aya-0.14.0-p1/Cargo.toml --target-dir target/aya-tests --lib
+CARGO_PROFILE_TEST_OVERFLOW_CHECKS=true cargo +1.88 test --locked --offline --manifest-path third-party/src/aya-0.14.0-p2/Cargo.toml --target-dir target/aya-tests --lib
 ```
 
 When validating changes to this patch, also repeat the focused `maps::ring_buf::tests`
@@ -74,7 +92,10 @@ release. Repository release gates and supported-kernel runtime qualification
 remain separate. Source exports omit generated trees and must retain
 `sources.json`, every named patch, and the exact archives when the export must
 reconstruct without network access. The generated `aya-obj` package is
-`src/aya-obj-0.3.0-p1/`; its standalone test target is `target/aya-obj-tests`.
+`src/aya-obj-0.3.0-p2/`; its standalone test target is `target/aya-obj-tests`.
+Its revision 2 carries the matching `ProgramSection` half of the Aya PR #1417
+backport: the `multi` flag plus the `uprobe.multi`, `uprobe.multi.s`,
+`uretprobe.multi`, and `uretprobe.multi.s` section spellings.
 
 When replacing this copy with an upstream release, verify both production
 corrections and the same reader regressions before removing the patch. Do not

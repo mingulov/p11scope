@@ -18,8 +18,8 @@ __pycache__/
 /.worktrees/
 
 # Reconstructed third-party inputs. Keep sources.json and patch files tracked.
-/third-party/src/aya-0.14.0-p1/
-/third-party/src/aya-obj-0.3.0-p1/
+/third-party/src/aya-0.14.0-p2/
+/third-party/src/aya-obj-0.3.0-p2/
 /third-party/archives/
 /third-party/.prepare-dependencies.lock
 /third-party/.prepare-dependencies-stage-*/

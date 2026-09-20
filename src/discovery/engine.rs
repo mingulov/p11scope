@@ -7555,6 +7555,65 @@ impl Engine {
         }
     }
 
+    /// Applies one multi-group rebuild report with the existing conservative
+    /// rules: recompleted survivors record fresh completions through the
+    /// same records fresh attach uses, failed survivors deactivate and
+    /// record failures exactly like failed fresh targets, and every rebuilt
+    /// group counts a published gap window. Detach proves no callback
+    /// quiescence and the task+slot pairing key carries no attachment
+    /// generation, so every rebuild also publishes pairing uncertainty for
+    /// calls in flight across the window; the next call on the task+slot
+    /// pairs fresh once the stale start is consumed. A report member the
+    /// plan cannot resolve is never applied silently.
+    fn apply_group_rebuild(
+        &mut self,
+        plan: &mut plan::AttachPlan,
+        owners: &BTreeMap<plan::ModuleId, PinnedTimingKey>,
+        report: DetachOutcome,
+        outcome: &mut ApplyOutcome,
+    ) {
+        let DetachOutcome {
+            recompleted,
+            rebuild_failures,
+            rebuilt_groups,
+        } = report;
+        if rebuilt_groups == 0 && recompleted.is_empty() && rebuild_failures.is_empty() {
+            return;
+        }
+        for index in recompleted
+            .iter()
+            .map(|(index, _)| index)
+            .chain(rebuild_failures.iter().map(|(index, _)| index))
+        {
+            if !plan.slots.iter().any(|slot| slot.index == *index) {
+                self.mark_partial(
+                    "multi group rebuild",
+                    "a rebuilt slot has no plan entry; its reactivation is unrecorded",
+                );
+            }
+        }
+        outcome.record_completions(&plan.slots, owners, recompleted);
+        for (index, _) in &rebuild_failures {
+            if let Some(slot) = plan.slots.iter().find(|slot| slot.index == *index).cloned() {
+                outcome
+                    .static_failures
+                    .extend(slot_timing_keys(&slot, owners));
+                plan.deactivate(*index);
+            }
+        }
+        self.multi_rebuild_gaps = self.multi_rebuild_gaps.saturating_add(rebuilt_groups);
+        if !rebuild_failures.is_empty() {
+            self.mark_partial(
+                "multi group rebuild",
+                "rebuilt-group survivors failed to reattach and were deactivated",
+            );
+        }
+        self.mark_partial(
+            "multi group rebuild",
+            "one or more groups rebuilt; calls in flight across the rebuild window may pair entry and return across attachment generations",
+        );
+    }
+
     /// The live path's `/proc/<pid>/maps` snapshot: the scan path's bounded
     /// reader, refused whole when any ceiling or the batch deadline cuts it
     /// (`read_maps_or_refuse`). Every caller turns `Err` into a refused

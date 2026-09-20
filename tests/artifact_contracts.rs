@@ -2629,6 +2629,9 @@ fn loss_share_measure_oracle_pins_trace_burst_capacity_and_window() {
             "TraceMatchTests",
             "WindowValidityTests",
             "LoadavgTests",
+            "SchedulingEvidenceCheckTests",
+            "LossAttributionTests",
+            "CancelProbeTests",
         ],
     );
 }

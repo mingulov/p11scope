@@ -4667,7 +4667,7 @@ fn evidence_for(
             Vec::new()
         },
         pid_descendant_gaps,
-        multi_rebuild_gaps: 0,
+        multi_rebuild_gaps: engine.multi_rebuild_gaps(),
         // Design §5.7: a live-learned attach key is protected only inside a
         // confirmed pause owner's window. A nonzero debug-state hit counter is
         // what says a live window happened at all; the design forbids
@@ -8129,6 +8129,7 @@ mod tests {
             "absent_covered"
         );
         assert_eq!(gap_profile.pid_descendant_gaps, 0);
+        assert_eq!(gap_profile.multi_rebuild_gaps, 0);
     }
 
     #[test]
@@ -8301,13 +8302,16 @@ mod tests {
         );
 
         assert_eq!(evidence.pid_descendant_gaps, 0);
+        assert_eq!(evidence.multi_rebuild_gaps, 0);
         assert_eq!(evidence.process_tracking_failures, 1);
         assert_eq!(evidence.completeness, "PARTIAL");
         let profile = render::versioned_evidence(&evidence);
         assert_eq!(profile["pid_descendant_gaps"], 0);
+        assert_eq!(profile["multi_rebuild_gaps"], 0);
         assert_eq!(profile["process_tracking_failures"], 1);
         let terminal = trace::evidence_line(&evidence, CapturePolicy::Allowlisted, false);
         assert!(terminal.contains("\"pid_descendant_gaps\":0"), "{terminal}");
+        assert!(terminal.contains("\"multi_rebuild_gaps\":0"), "{terminal}");
         assert!(
             terminal.contains("\"completeness\":\"PARTIAL\""),
             "{terminal}"

@@ -8405,7 +8405,13 @@ impl Engine {
             .chain(&candidate.delta.replace)
             .cloned()
             .collect();
-        let detach_failed = session.detach_slots(&selected).is_err();
+        let detach_failed = match session.detach_slots(&selected) {
+            Ok(report) => {
+                self.apply_group_rebuild(&mut candidate.plan, &timing_owners, report, &mut outcome);
+                false
+            }
+            Err(_) => true,
+        };
         if detach_failed {
             *additions_allowed = false;
             outcome
@@ -8450,12 +8456,20 @@ impl Engine {
                             .filter(|slot| failed.contains(&slot.index))
                             .cloned()
                             .collect();
-                        if session.detach_slots(&failed_slots).is_err() {
-                            *additions_allowed = false;
-                            self.mark_partial(
-                                "live discovery detach",
-                                "a partial new-slot detach failed once and was not retried",
-                            );
+                        match session.detach_slots(&failed_slots) {
+                            Ok(report) => self.apply_group_rebuild(
+                                &mut candidate.plan,
+                                &timing_owners,
+                                report,
+                                &mut outcome,
+                            ),
+                            Err(_) => {
+                                *additions_allowed = false;
+                                self.mark_partial(
+                                    "live discovery detach",
+                                    "a partial new-slot detach failed once and was not retried",
+                                );
+                            }
                         }
                         for slot in failed_slots {
                             outcome
@@ -8501,12 +8515,18 @@ impl Engine {
                         let ReplacementOutcome {
                             completed,
                             failed_detach,
-                            ..
+                            rebuild,
                         } = replacement;
                         outcome.record_completions(
                             &candidate.delta.replace,
                             &timing_owners,
                             completed,
+                        );
+                        self.apply_group_rebuild(
+                            &mut candidate.plan,
+                            &timing_owners,
+                            rebuild,
+                            &mut outcome,
                         );
                         if failed_detach {
                             *additions_allowed = false;
@@ -8603,7 +8623,13 @@ impl Engine {
         if retired {
             *additions_allowed = false;
             outcome.static_failures.extend(target_modules);
-            self.retire_stale_candidate_sources(session, &mut candidate, &outcome.stale_views);
+            let stale_views = outcome.stale_views.clone();
+            self.retire_stale_candidate_sources(
+                session,
+                &mut candidate,
+                &stale_views,
+                &mut *outcome,
+            );
             self.mark_partial(
                 "live discovery generation",
                 "a process generation changed after link mutation; its targets were retired before context cleanup",
@@ -8682,11 +8708,22 @@ impl Engine {
                     })
                     .cloned()
                     .collect();
-                if session.detach_slots(&detach).is_err() {
-                    self.mark_partial(
-                        "live interface selection",
-                        "a refused selection table could not detach one-shot additions",
-                    );
+                match session.detach_slots(&detach) {
+                    Ok(report) => {
+                        let owners = candidate_timing_owners(&candidate);
+                        self.apply_group_rebuild(
+                            &mut candidate.plan,
+                            &owners,
+                            report,
+                            &mut *outcome,
+                        );
+                    }
+                    Err(_) => {
+                        self.mark_partial(
+                            "live interface selection",
+                            "a refused selection table could not detach one-shot additions",
+                        );
+                    }
                 }
                 for slot in detach {
                     candidate.plan.deactivate(slot.index);
@@ -8798,11 +8835,17 @@ impl Engine {
                 })
                 .cloned()
                 .collect();
-            if session.detach_slots(&rollback).is_err() {
-                self.mark_partial(
-                    "offline interface selection",
-                    "a failed manifest selection table could not detach its successful prefix",
-                );
+            match session.detach_slots(&rollback) {
+                Ok(report) => {
+                    let owners = candidate_timing_owners(&candidate);
+                    self.apply_group_rebuild(&mut candidate.plan, &owners, report, &mut *outcome);
+                }
+                Err(_) => {
+                    self.mark_partial(
+                        "offline interface selection",
+                        "a failed manifest selection table could not detach its successful prefix",
+                    );
+                }
             }
             for slot in rollback {
                 candidate.plan.deactivate(slot.index);
@@ -8856,6 +8899,7 @@ impl Engine {
         session: &mut dyn EngineSession,
         candidate: &mut LiveCandidate,
         stale_views: &BTreeSet<ProcessViewId>,
+        outcome: &mut ApplyOutcome,
     ) {
         // A binding belongs to one process view even when its physical target is
         // shared with another view. Retire the binding itself before dropping
@@ -8933,11 +8977,19 @@ impl Engine {
             })
             .cloned()
             .collect();
-        if !orphaned_selection.is_empty() && session.detach_slots(&orphaned_selection).is_err() {
-            self.mark_partial(
-                "live discovery detach",
-                "stale selection claims lost their final owner but one link detach failed",
-            );
+        if !orphaned_selection.is_empty() {
+            match session.detach_slots(&orphaned_selection) {
+                Ok(report) => {
+                    let owners = candidate_timing_owners(candidate);
+                    self.apply_group_rebuild(&mut candidate.plan, &owners, report, &mut *outcome);
+                }
+                Err(_) => {
+                    self.mark_partial(
+                        "live discovery detach",
+                        "stale selection claims lost their final owner but one link detach failed",
+                    );
+                }
+            }
         }
         for slot in orphaned_selection {
             candidate.plan.deactivate(slot.index);
@@ -8945,11 +8997,17 @@ impl Engine {
         let retired = candidate
             .plan
             .retire_unpinned_targets(&cleaned_pins, self.plan.slots.len());
-        if session.detach_slots(&retired).is_err() {
-            self.mark_partial(
-                "live discovery detach",
-                "generation loss cleanup had a one-shot detach failure",
-            );
+        match session.detach_slots(&retired) {
+            Ok(report) => {
+                let owners = candidate_timing_owners(candidate);
+                self.apply_group_rebuild(&mut candidate.plan, &owners, report, &mut *outcome);
+            }
+            Err(_) => {
+                self.mark_partial(
+                    "live discovery detach",
+                    "generation loss cleanup had a one-shot detach failure",
+                );
+            }
         }
         commit_cleaned_candidate_identity(candidate, cleaned_pins, cleaned_modules, stale_views);
     }

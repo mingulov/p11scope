@@ -922,6 +922,7 @@ impl RootSeed {
 ///         pause_key: panic!("compile-only placeholder"),
 ///         lifecycle_tracking_unavailable: panic!("compile-only placeholder"),
 ///         process_creation_tracking_unavailable: panic!("compile-only placeholder"),
+///         retained_static: panic!("compile-only placeholder"),
 ///         links: panic!("compile-only placeholder"),
 ///     }
 /// }
@@ -969,6 +970,10 @@ pub struct Session {
     pause_key: Option<PauseKey>,
     lifecycle_tracking_unavailable: Option<String>,
     process_creation_tracking_unavailable: Option<String>,
+    /// Exact reattach facts per statically attached slot, retained so a
+    /// multi-group rebuild can reattach surviving siblings; pruned as the
+    /// slot's last link detaches (see [`RetainedStaticTarget`]).
+    retained_static: BTreeMap<u32, RetainedStaticTarget>,
     links: Vec<RegisteredLink>,
 }
 
@@ -1149,9 +1154,9 @@ fn links_cover_slot(links: &[RegisteredLink], slot: u32) -> bool {
 
 /// The smallest requested slot that shares a multi group link with a
 /// slot outside the request, if any. Group links are immutable: a
-/// bundle drops only when every member is requested, so partially
-/// covered members are refused (explicit group rebuild follows in
-/// Task 2.3) while fully covered bundles still detach.
+/// bundle drops only when every member is requested, so a partially
+/// covered member triggers the explicit group rebuild while fully
+/// covered bundles still detach outright.
 fn find_partial_multi_member(links: &[RegisteredLink], slots: &BTreeSet<u32>) -> Option<u32> {
     slots.iter().copied().find(|slot| {
         links.iter().any(|link| {
@@ -1172,9 +1177,7 @@ fn plan_group_rebuild(
     links: &[RegisteredLink],
     requested: &BTreeSet<u32>,
 ) -> Option<BTreeSet<u32>> {
-    if find_partial_multi_member(links, requested).is_none() {
-        return None;
-    }
+    find_partial_multi_member(links, requested)?;
     let mut affected: BTreeSet<u32> = requested.clone();
     loop {
         let mut grown = false;
@@ -1194,6 +1197,33 @@ fn plan_group_rebuild(
         }
     }
     Some(affected)
+}
+
+/// How many live multi groups one rebuild disturbs: bundles sharing a
+/// member are sides of one group (a return bundle widened by refusals
+/// still shares its sibling's entry bundle), disjoint bundles are
+/// distinct groups. Each disturbed group is one published gap window.
+fn affected_group_count(links: &[RegisteredLink], affected: &BTreeSet<u32>) -> u64 {
+    let mut components: Vec<BTreeSet<u32>> = Vec::new();
+    for link in links {
+        let RegisteredLink::MultiUProbe { slots: members, .. } = link else {
+            continue;
+        };
+        if !members.iter().any(|member| affected.contains(member)) {
+            continue;
+        }
+        let mut merged: BTreeSet<u32> = members.iter().copied().collect();
+        components.retain(|component| {
+            if component.intersection(&merged).next().is_none() {
+                true
+            } else {
+                merged.extend(component.iter().copied());
+                false
+            }
+        });
+        components.push(merged);
+    }
+    components.len() as u64
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2656,6 +2686,7 @@ impl Session {
             pause_key,
             lifecycle_tracking_unavailable: None,
             process_creation_tracking_unavailable: None,
+            retained_static: BTreeMap::new(),
             links,
         })
     }
@@ -3025,6 +3056,12 @@ impl Session {
             completed,
             exhausted: _,
         } = outcome;
+        retain_from_successful(
+            &mut self.retained_static,
+            targets,
+            &attach_targets,
+            &successful,
+        );
         self.successful_static.extend(successful);
         let failed: Vec<_> = failures.iter().map(|(slot, _)| *slot).collect();
         self.attach_failures.extend(failures);
@@ -3036,8 +3073,9 @@ impl Session {
     /// entry link per group over the 48-loaded twins, pid-wide with the
     /// existing in-BPF scope filter (see [`multi_link_pid`]). Late
     /// joiners (live discovery) form their own groups and attach as
-    /// additional links; coalescing them into existing links is the
-    /// Task 2.3 rebuild. A kernel without multi support aborts with
+    /// additional links; the Task 2.3 rebuild covers retirement and
+    /// replacement, not coalescing live groups. A kernel without multi
+    /// support aborts with
     /// [`BackendFallbackRequired`] (downcastable through anyhow) so
     /// `start` can rebuild the session on singles.
     fn attach_targets_multi(
@@ -3131,25 +3169,120 @@ impl Session {
     }
 
     /// Detaches all slot links selected by a finite retirement/replacement
-    /// delta. Each attempt is made even if an earlier Aya detach failed.
+    /// delta, rebuilding partially covered multi groups. Each detach attempt
+    /// is made even if an earlier one failed; the report carries per-member
+    /// rebuild evidence for the caller to apply.
     pub fn detach_slots(&mut self, slots: &[Slot]) -> Result<DetachOutcome> {
         let requested: BTreeSet<_> = slots.iter().map(|slot| slot.index).collect();
-        let partial = find_partial_multi_member(&self.links, &requested);
-        let detached = self.detach_links(|link| match link {
-            // A group link drops only with all its members; partially
-            // covered bundles keep their shared links (see `partial`).
+        let Some(affected) = plan_group_rebuild(&self.links, &requested) else {
+            let detached = self.detach_links(|link| match link {
+                // A group link drops only with all its members.
+                RegisteredLink::MultiUProbe { slots, .. } => {
+                    !slots.is_empty() && slots.iter().all(|slot| requested.contains(slot))
+                }
+                _ => link.slots().iter().any(|slot| requested.contains(slot)),
+            });
+            prune_linkless_retained(&mut self.retained_static, &self.links);
+            return detached.map(|()| DetachOutcome::default());
+        };
+        self.rebuild_affected_groups(&requested, &affected)
+    }
+
+    /// Explicit multi-group rebuild for a partially covered retirement:
+    /// determine every affected member from retained facts, detach old
+    /// entries before returns, then reattach surviving siblings returns
+    /// before entries. A detach failure aborts before any reattach — a
+    /// maybe-live old link must never overlap a replacement, and the
+    /// ownership uncertainty blocks additions through the existing
+    /// [`attachment_admission`] refusal. Reattach evidence is per member:
+    /// only fully paired survivors count as multi-attached.
+    fn rebuild_affected_groups(
+        &mut self,
+        requested: &BTreeSet<u32>,
+        affected: &BTreeSet<u32>,
+    ) -> Result<DetachOutcome> {
+        let mut survivors = Vec::new();
+        let mut missing = Vec::new();
+        for member in affected.difference(requested) {
+            match self.retained_static.get(member) {
+                Some(target) => survivors.push(target.clone()),
+                None => missing.push(*member),
+            }
+        }
+        // Regroup and resolve program fds before the first link mutation:
+        // a failure here leaves every old link untouched.
+        let regrouped: Vec<Slot> = survivors.iter().map(|target| target.slot.clone()).collect();
+        let targets: BTreeMap<u32, (PathBuf, ElfAbi)> = survivors
+            .iter()
+            .map(|target| (target.slot.index, (target.path.clone(), target.abi)))
+            .collect();
+        let groups = group_static_slots(
+            &regrouped,
+            self.policy,
+            cfg!(feature = "unsafe-unvalidated-metadata"),
+            &targets,
+        );
+        let rebuilt_groups = affected_group_count(&self.links, affected);
+        let mut programs: BTreeSet<&'static str> =
+            groups.iter().map(|group| group.entry_program).collect();
+        programs.insert("p11_return");
+        let mut prog_fds = BTreeMap::new();
+        for program in programs {
+            prog_fds.insert(program, multi_prog_fd(&mut self.ebpf, program)?);
+        }
+        self.detach_links(|link| match link {
             RegisteredLink::MultiUProbe { slots, .. } => {
-                !slots.is_empty() && slots.iter().all(|slot| requested.contains(slot))
+                slots.iter().any(|slot| affected.contains(slot))
             }
             _ => link.slots().iter().any(|slot| requested.contains(slot)),
-        });
-        if let Some(member) = partial {
-            bail!(
-                "slot {member} shares a multi group link with live slots; \
-                 per-slot retirement needs an explicit group rebuild"
-            );
+        })?;
+        prune_linkless_retained(&mut self.retained_static, &self.links);
+        let pid = multi_link_pid();
+        let (bundles, outcome) = reattach_rebuilt_groups_with(
+            &groups,
+            |_| monotonic_ns(),
+            |program, path, slice, is_return| {
+                let prog_fd = prog_fds
+                    .get(program)
+                    .copied()
+                    .expect("every rebuilt side pre-resolved its program fd");
+                let (offsets, cookies): (Vec<u64>, Vec<u64>) = slice.iter().copied().unzip();
+                attach_group(prog_fd, pid, path, &offsets, &cookies, is_return)
+            },
+            // Closing the owned fds detaches the rolled-back links.
+            drop,
+        );
+        for bundle in bundles {
+            self.links.push(RegisteredLink::MultiUProbe {
+                program: bundle.program,
+                slots: bundle.slots,
+                fds: bundle.links,
+            });
         }
-        detached.map(|()| DetachOutcome::default())
+        let AttachOutcome {
+            successful,
+            failures: mut rebuild_failures,
+            completed: recompleted,
+            exhausted: _,
+        } = outcome;
+        self.successful_static.extend(successful);
+        for member in missing {
+            rebuild_failures.push((
+                member,
+                format!(
+                    "slot {member} was not reattached: \
+                     no retained attach facts for a live group member"
+                ),
+            ));
+        }
+        self.attach_failures
+            .extend(rebuild_failures.iter().cloned());
+        prune_linkless_retained(&mut self.retained_static, &self.links);
+        Ok(DetachOutcome {
+            recompleted,
+            rebuild_failures,
+            rebuilt_groups,
+        })
     }
 
     /// Detach every event/map producer while keeping the maps and ring reader
@@ -5388,10 +5521,9 @@ mod tests {
         );
     }
 
-    fn rebuild_drops() -> (
-        std::rc::Rc<std::cell::RefCell<Vec<Vec<String>>>>,
-        impl FnMut(Vec<MultiLinkBundle<MockLink>>),
-    ) {
+    type DropRecord = std::rc::Rc<std::cell::RefCell<Vec<Vec<String>>>>;
+
+    fn rebuild_drops() -> (DropRecord, impl FnMut(Vec<MultiLinkBundle<MockLink>>)) {
         let drops = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let record = {
             let drops = std::rc::Rc::clone(&drops);

@@ -2753,6 +2753,15 @@ pub(crate) const READY_IDLE_POLL: Duration = Duration::from_millis(2);
 /// any deferral to N frame intervals.
 pub(crate) const FULL_DISCOVERY_EVERY_N_FRAMES: u64 = 5;
 
+/// Whether a frame forces a full inventory sweep: every Nth frame, with
+/// the first forced sweep deferred past attach. Attach just completed a
+/// full discovery, so forcing frame 1 re-sweeps cold seconds-old state
+/// and blocks the drain path ~2.5s (the system max-gap spike); frame N
+/// re-verifies warm instead.
+fn force_full_frame(frame_tick: u64) -> bool {
+    frame_tick % FULL_DISCOVERY_EVERY_N_FRAMES == 0
+}
+
 /// How long a tick sleeps: the pause slice still wins, a drain that
 /// stopped with backlog queued sleeps nothing, and an idle tick waits
 /// only until the next frame or readiness re-poll, whichever is first.
@@ -3048,7 +3057,7 @@ fn capture_profile(
                         return Ok((false, false, context.0.plan()));
                     }
                     *frame_tick += 1;
-                    let force_full = *frame_tick % FULL_DISCOVERY_EVERY_N_FRAMES == 1;
+                    let force_full = force_full_frame(*frame_tick);
                     let phase_start = Instant::now();
                     let (plan_changed, paused) = drain_discovery_tick(
                         context.0,
@@ -3502,7 +3511,7 @@ fn capture_trace(
                     // advances the frame clock.
                     *frame_clock = Instant::now();
                     *frame_tick += 1;
-                    let force_full = *frame_tick % FULL_DISCOVERY_EVERY_N_FRAMES == 1;
+                    let force_full = force_full_frame(*frame_tick);
                     let phase_start = Instant::now();
                     let (plan_changed, paused) = drain_discovery_tick(
                         context.0,
@@ -6758,6 +6767,20 @@ mod tests {
 
         assert_eq!(ev.phase_ms.discovery, 57);
         assert_eq!(ev.phase_ms.discovery_terminal, 50);
+    }
+
+    /// The first forced full sweep defers past attach: attach just
+    /// completed a full discovery, so forcing frame 1 re-sweeps cold
+    /// seconds-old state and blocks the drain path ~2.5s (the system
+    /// max-gap spike, every run at +1.8s). Steady-state frequency is
+    /// unchanged (every Nth frame still sweeps).
+    #[test]
+    fn first_forced_sweep_defers_past_attach() {
+        assert!(!force_full_frame(1));
+        assert!(!force_full_frame(4));
+        assert!(force_full_frame(5));
+        assert!(!force_full_frame(6));
+        assert!(force_full_frame(10));
     }
 
     /// A terminal drain that stops at its bound reports truncation into

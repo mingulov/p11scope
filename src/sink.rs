@@ -24,12 +24,12 @@ pub(crate) const SINK_TICK_BUDGET: Duration = Duration::from_millis(250);
 
 /// Longest one `poll` wait inside a bounded flush. The tick budget is
 /// unchanged — slices of at most this draw from it — but cancellation
-/// is consulted between slices, so a pending cancel aborts the wait
-/// within about one slice instead of riding out the whole budget
-/// (F4: a single 250ms poll held 232ms past SIGINT; the process
-/// handlers run with SA_RESTART, so no EINTR arrives to consult).
-/// Sized so one slice plus the loop-exit marker stays well under the
-/// 100ms cancel budget.
+/// is consulted on every interruption and between slices, so a pending
+/// cancel sheds promptly instead of riding out the whole budget (F4: a
+/// single 250ms poll held 232ms past SIGINT by retrying the
+/// interruption without consulting cancellation). Sized so one slice
+/// plus the loop-exit marker stays well under the 100ms cancel budget
+/// even where the wait runs to its slice end.
 pub(crate) const SINK_POLL_SLICE: Duration = Duration::from_millis(25);
 
 /// What the bounded-wait-drop window discarded.
@@ -483,8 +483,9 @@ mod tests {
     #[test]
     fn cancel_flag_aborts_a_stalled_flush_promptly_with_counters() {
         // F4: SIGINT during a slow-sink flush held 232ms past the signal
-        // (one 250ms poll; SA_RESTART handlers yield no EINTR). With the
-        // flag watched, the flush sheds within about one poll slice.
+        // (one 250ms poll retried past the interruption). With the flag
+        // watched, the flush sheds on the interruption, or at worst at
+        // the next slice end.
         let cancel = Arc::new(AtomicBool::new(false));
         let (mut sink, _reader, payload) =
             stalled_sink_with(Duration::from_millis(250), Some(Arc::clone(&cancel)));

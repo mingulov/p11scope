@@ -3205,7 +3205,10 @@ mod tests {
         );
         let mut clean = false;
         finish_producer_detach(&mut clean, &[], Ok(())).unwrap();
-        assert_eq!(events::poll_quantum(clean), Some(events::TERMINAL_DRAIN_BOUND));
+        assert_eq!(
+            events::poll_quantum(clean),
+            Some(events::TERMINAL_DRAIN_BOUND)
+        );
         assert!(attachment_admission(&failures, true).is_err());
         attachment_admission(&failures, false).unwrap();
     }

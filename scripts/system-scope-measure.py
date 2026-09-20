@@ -365,6 +365,146 @@ def build_event_path(*, mode, generated, kernel_observed, event_loss,
     return path
 
 
+CANCEL_MARKER_RE = re.compile(
+    r"p11scope: cancel: loop exited on signal (-?\d+) after (\d+) ticks")
+CANCEL_LATENCY_BUDGET_NS = 100_000_000
+
+
+def check_scheduling_evidence(evidence):
+    """Consistency of the repair's scheduling sub-object.
+
+    Returns (ok, detail). Fail-closed: a missing sub-object, a split that
+    does not sum to its published counter, or a sink policy other than the
+    declared bounded-wait-drop all fail — the harness must assert the
+    policy's evidence, never assume it.
+    """
+    scheduling = evidence.get("scheduling")
+    if not isinstance(scheduling, dict):
+        return (False, "scheduling evidence missing (pre-repair schema?); "
+                       "repair credit unverifiable")
+    for key in ("capture_event_loss", "detach_event_loss",
+                "capture_discovery_loss", "detach_discovery_loss",
+                "sink_policy"):
+        if scheduling.get(key) is None:
+            return (False, f"scheduling evidence incomplete: missing {key}")
+    event_loss = evidence.get("event_loss")
+    if event_loss is None:
+        return (False, "event_loss counter missing; split unverifiable")
+    capture = scheduling["capture_event_loss"]
+    detach = scheduling["detach_event_loss"]
+    if capture + detach != event_loss:
+        return (False, f"event-loss split mismatch: capture {capture} + "
+                       f"detach {detach} != event_loss {event_loss}")
+    cap_disc = scheduling["capture_discovery_loss"]
+    det_disc = scheduling["detach_discovery_loss"]
+    disc_loss = evidence.get("discovery_ring_loss")
+    if disc_loss is not None and cap_disc + det_disc != disc_loss:
+        return (False, f"discovery-loss split mismatch: capture {cap_disc} "
+                       f"+ detach {det_disc} != discovery_ring_loss "
+                       f"{disc_loss}")
+    if scheduling["sink_policy"] != "bounded-wait-drop":
+        return (False, f"sink_policy {scheduling['sink_policy']!r}: want "
+                       "'bounded-wait-drop' (undeclared slow-sink behavior)")
+    return (True, "scheduling evidence consistent: splits sum to their "
+                  "counters, sink policy bounded-wait-drop")
+
+
+def attribute_loss(*, truth_calls, ring_capacity, event_loss,
+                   semantic_failures, scheduling):
+    """Name which bound broke: the envelope's outside-loss evidence.
+
+    Returns {"status", "bounds", "detail"}. Statuses: lossless (zero loss
+    with evidence), attributed (every share names a bound), guarded
+    (semantic skips make delivered bounded, not exact), lossless-unverified
+    (zero loss but no scheduling evidence), UNATTRIBUTED (loss past burst
+    physics with no bound fired — never silently absorbed).
+    """
+    if scheduling is None:
+        if event_loss == 0:
+            return {"status": "lossless-unverified", "bounds": [],
+                    "detail": "zero loss but no scheduling evidence: "
+                              "repair credit unverifiable"}
+        return {"status": "UNATTRIBUTED", "bounds": [],
+                "detail": f"event_loss={event_loss} with no scheduling "
+                          "evidence"}
+    if semantic_failures:
+        return {"status": "guarded", "bounds": [],
+                "detail": f"semantic_capture_failures={semantic_failures}: "
+                          "delivered is bounded, not exact"}
+    if event_loss == 0:
+        return {"status": "lossless", "bounds": [],
+                "detail": "event_loss=0 with consistent scheduling evidence"}
+    bounds = []
+    detach = scheduling.get("detach_event_loss") or 0
+    truncated = scheduling.get("terminal_drain_truncated", False)
+    exhausted = scheduling.get("drain_budget_exhaustions") or 0
+    if exhausted:
+        bounds.append("drain-tick-budget")
+    if detach:
+        bounds.append("detach-window")
+    if truncated:
+        bounds.append("terminal-drain-bound")
+    if scheduling.get("sink_timeouts") or scheduling.get("sink_dropped_bytes"):
+        bounds.append("slow-sink")
+    if not bounds:
+        if event_loss <= predicted_burst_loss(truth_calls, ring_capacity):
+            bounds.append("ring-capacity-vs-production")
+        else:
+            return {"status": "UNATTRIBUTED", "bounds": [],
+                    "detail": f"event_loss={event_loss} past burst physics "
+                              f"({truth_calls} calls vs {ring_capacity} "
+                              "records) with no bound fired"}
+    elif not (exhausted or truncated):
+        # A fired scheduling bound explains the path it meters; any capture
+        # residue past burst physics is still unattributed.
+        residue = event_loss - detach
+        if residue > 0:
+            if residue <= predicted_burst_loss(truth_calls, ring_capacity):
+                bounds.append("ring-capacity-vs-production")
+            else:
+                return {"status": "UNATTRIBUTED", "bounds": list(bounds),
+                        "detail": f"capture residue {residue} past burst "
+                                  f"physics; {bounds} explain only part"}
+    return {"status": "attributed", "bounds": bounds,
+            "detail": f"event_loss={event_loss} attributed to "
+                      f"{', '.join(bounds)}"}
+
+
+def find_cancel_marker(stderr_rows):
+    """(ts_ns, signal, ticks) of the loop-exit cancel marker, else None.
+
+    Accepts harness stderr-ts rows (t_mono_ns, stderr-only) and the
+    stream-tagged shape: rows tagged a non-stderr stream never match.
+    """
+    for row in stderr_rows:
+        if row.get("stream", "stderr") != "stderr":
+            continue
+        match = CANCEL_MARKER_RE.search(row.get("line", ""))
+        if match is None:
+            continue
+        ts = row.get("ts_ns", row.get("t_mono_ns"))
+        if ts is None:
+            continue
+        return (int(ts), int(match.group(1)), int(match.group(2)))
+    return None
+
+
+def cancel_probe_verdict(t0_ns, t_marker_ns):
+    """Control-latency verdict: ack within the 100ms budget. Fail-closed."""
+    if t_marker_ns is None:
+        return {"pass": False,
+                "detail": "cancel marker missing: the loop never "
+                          "acknowledged the signal"}
+    latency = t_marker_ns - t0_ns
+    if latency <= CANCEL_LATENCY_BUDGET_NS:
+        return {"pass": True,
+                "detail": f"cancel acknowledged in {latency} ns "
+                          "(budget 100ms)"}
+    return {"pass": False,
+            "detail": f"cancel latency {latency} ns exceeded the 100ms "
+                      "budget"}
+
+
 def assess_window(*, gate, scope, counts_match, collapsed,
                   attached_probes, trace_crosscheck):
     """Post-hoc window validity, decisive for weak (non-frame) gates.
@@ -855,6 +995,59 @@ def main(argv):
         attached_probes=attached_probes,
         trace_crosscheck=crosscheck_holds)
 
+    # Task 3.1 repair: scheduling consistency + which-bound-broke
+    # attribution + the cancel control-latency probe. A missing scheduling
+    # sub-object is recorded in-section (pre-repair schema); only a present
+    # but inconsistent one warns globally, so old fixtures stay clean.
+    sched_evidence = evidence.get("scheduling")
+    sched_ok, sched_detail = check_scheduling_evidence({
+        "event_loss": event_loss,
+        "discovery_ring_loss": counters.get("discovery_ring_loss"),
+        "scheduling": sched_evidence,
+    })
+    if sched_evidence is not None and not sched_ok:
+        phases["method_warnings"].append(
+            f"scheduling evidence inconsistent: {sched_detail}")
+    if (event_loss is None or semantic_failures is None
+            or not isinstance(event_path, dict)
+            or "ring_capacity_records" not in event_path):
+        attribution = {"status": "guarded", "bounds": [],
+                       "detail": "loss counters missing; no attribution "
+                                 "possible"}
+    else:
+        attribution = attribute_loss(
+            truth_calls=generated,
+            ring_capacity=event_path["ring_capacity_records"],
+            event_loss=event_loss, semantic_failures=semantic_failures,
+            scheduling=sched_evidence)
+    if (sched_evidence is not None
+            and attribution["status"] == "UNATTRIBUTED"):
+        phases["method_warnings"].append(
+            f"loss unattributed: {attribution['detail']}")
+    cancel_request = meta["condition"].get("cancel_probe") or {}
+    marker = find_cancel_marker(stderr_rows)
+    if marker is None and not cancel_request:
+        cancel_probe = None
+    else:
+        t_ref = cancel_request.get(
+            "sent_mono_ns", int(meta["timing"]["t_go_mono_ns"]))
+        cancel_probe = {"marker": None, "verdict": None}
+        if marker is not None:
+            ts, sig, ticks = marker
+            cancel_probe["marker"] = {"ts_ns": ts, "signal": sig,
+                                      "ticks": ticks}
+            cancel_probe["verdict"] = cancel_probe_verdict(t_ref, ts)
+        else:
+            cancel_probe["verdict"] = cancel_probe_verdict(t_ref, None)
+        if not cancel_request:
+            cancel_probe["note"] = (
+                "unsolicited marker (no cancel_probe condition); latency "
+                "vs t_go is informational")
+        elif not cancel_probe["verdict"]["pass"]:
+            phases["method_warnings"].append(
+                "cancel probe failed: "
+                f"{cancel_probe['verdict']['detail']}")
+
     host = dict(meta["host"])
     loadavg = parse_loadavg(host.get("loadavg"))
     host["loadavg_1m"] = loadavg[0] if loadavg else None
@@ -880,6 +1073,12 @@ def main(argv):
         "discovery_line": discovery_line,
         "window": window,
         "event_path": event_path,
+        "scheduling": {
+            "check": {"ok": sched_ok, "detail": sched_detail},
+            "attribution": attribution,
+            "evidence": sched_evidence,
+        },
+        "cancel_probe": cancel_probe,
         "evidence": {
             "scan_ms": evidence.get("scan_ms"),
             "counters_source": counters_source,

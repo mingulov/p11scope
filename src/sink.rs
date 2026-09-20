@@ -6,6 +6,10 @@
 
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 /// Sink buffer size: one 64 KiB batch per tick instead of a syscall per
@@ -17,6 +21,16 @@ pub(crate) const SINK_BUFFER_BYTES: usize = 65536;
 /// past this drops the pending bytes with counters instead of holding
 /// the capture loop.
 pub(crate) const SINK_TICK_BUDGET: Duration = Duration::from_millis(250);
+
+/// Longest one `poll` wait inside a bounded flush. The tick budget is
+/// unchanged — slices of at most this draw from it — but cancellation
+/// is consulted on every interruption and between slices, so a pending
+/// cancel sheds promptly instead of riding out the whole budget (F4: a
+/// single 250ms poll held 232ms past SIGINT by retrying the
+/// interruption without consulting cancellation). Sized so one slice
+/// plus the loop-exit marker stays well under the 100ms cancel budget
+/// even where the wait runs to its slice end.
+pub(crate) const SINK_POLL_SLICE: Duration = Duration::from_millis(25);
 
 /// What the bounded-wait-drop window discarded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -40,6 +54,7 @@ pub(crate) struct SinkWriter<W: Write + AsRawFd> {
     buf: Vec<u8>,
     tick_budget: Duration,
     drops: SinkDrops,
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 /// Production's stdout sink: a dup'd raw fd, unbuffered, so every byte
@@ -80,6 +95,7 @@ impl<W: Write + AsRawFd> SinkWriter<W> {
             buf: Vec::with_capacity(SINK_BUFFER_BYTES),
             tick_budget: Duration::ZERO,
             drops: SinkDrops::default(),
+            cancel: None,
         })
     }
 
@@ -88,6 +104,20 @@ impl<W: Write + AsRawFd> SinkWriter<W> {
     /// total before bytes start dropping with counters.
     pub(crate) fn begin_tick(&mut self, budget: Duration) {
         self.tick_budget = budget;
+    }
+
+    /// Watches the capture's cancellation flag: a flush that sees it set
+    /// stops waiting and sheds promptly (F4) instead of riding out the
+    /// tick budget. Unset (unit-test default), flushes keep the legacy
+    /// wait-out-the-budget behavior.
+    pub(crate) fn set_cancel_flag(&mut self, cancel: Arc<AtomicBool>) {
+        self.cancel = Some(cancel);
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel
+            .as_deref()
+            .is_some_and(|cancel| cancel.load(Ordering::SeqCst))
     }
 
     /// Drains the drop counters accumulated since the last call.
@@ -107,9 +137,50 @@ impl<W: Write + AsRawFd> SinkWriter<W> {
         self.tick_budget = Duration::ZERO;
     }
 
+    /// Prompt cancel shed: no waiting at all — nonblocking writes take
+    /// whatever room the reader already offers, then whatever remains is
+    /// dropped with the standard counters. Every pending byte is either
+    /// delivered or counted; none is silently held, and the flush
+    /// returns without consulting the tick budget. Only transport
+    /// errors propagate, as in the bounded path.
+    fn abort_wait(&mut self) -> io::Result<()> {
+        while !self.buf.is_empty() {
+            match self.inner.write(&self.buf) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "sink wrote zero bytes with a non-empty buffer",
+                    ));
+                }
+                Ok(wrote) => {
+                    self.buf.drain(..wrote);
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    // No room right now (or a stray signal): shed the
+                    // rest with counters rather than waiting for room.
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if !self.buf.is_empty() {
+            self.drop_pending();
+        }
+        Ok(())
+    }
+
     fn flush_bounded(&mut self) -> io::Result<()> {
         let start = Instant::now();
         while !self.buf.is_empty() {
+            if self.cancelled() {
+                self.abort_wait()?;
+                break;
+            }
             let remaining = self.tick_budget.saturating_sub(start.elapsed());
             if remaining.is_zero() {
                 // Budget spent: a trickling reader would otherwise keep
@@ -123,20 +194,29 @@ impl<W: Write + AsRawFd> SinkWriter<W> {
                 events: libc::POLLOUT,
                 revents: 0,
             };
-            let timeout_ms = remaining.as_millis().min(u128::from(i32::MAX as u32)) as i32;
+            // Sliced, not one wait: cancellation is consulted between
+            // slices (see SINK_POLL_SLICE). Slices draw from the same
+            // tick budget, so the drop policy is unchanged.
+            let slice = remaining.min(SINK_POLL_SLICE);
+            let timeout_ms = slice.as_millis().min(u128::from(i32::MAX as u32)) as i32;
             // SAFETY: `poll` on one valid stack `pollfd` writes only its
             // `revents`; the fd is borrowed, never owned or closed here.
             let ready = unsafe { libc::poll(&mut waiting, 1, timeout_ms) };
             if ready < 0 {
                 let error = io::Error::last_os_error();
                 if error.kind() == io::ErrorKind::Interrupted {
+                    // A signal cut the slice short: the top of the loop
+                    // consults cancellation before re-polling, so an
+                    // interrupting cancel sheds instead of retrying.
                     continue;
                 }
                 return Err(error);
             }
             if ready == 0 {
-                self.drop_pending();
-                break;
+                // One slice spent, not the budget: re-check cancellation
+                // and the remaining budget at the top of the loop. Only
+                // a spent budget drops.
+                continue;
             }
             // Ready, hung up, or errored: attempt the write and propagate
             // its truth, so a dead peer still surfaces as broken pipe.
@@ -356,6 +436,98 @@ mod tests {
         let mut sink = stdout_sink().unwrap();
         assert_raw_file(&sink);
         assert_eq!(sink.take_drops(), SinkDrops::default());
+    }
+
+    /// Fills the socket buffer behind `writer`'s back, so the sink's
+    /// flush finds no room and must wait out its budget (or abort on
+    /// cancellation). Returns the payload the test offered the sink.
+    fn stalled_sink_with(
+        budget: Duration,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> (SinkWriter<UnixStream>, UnixStream, Vec<u8>) {
+        let (writer, reader) = pair();
+        let mut filler = writer.try_clone().unwrap();
+        filler.set_nonblocking(true).unwrap();
+        let chunk = vec![7u8; 65536];
+        while filler.write(&chunk).is_ok() {}
+        drop(filler);
+        let mut sink = SinkWriter::new(writer).unwrap();
+        if let Some(cancel) = cancel {
+            sink.set_cancel_flag(cancel);
+        }
+        sink.begin_tick(budget);
+        let payload = vec![8u8; 4096];
+        sink.write_all(&payload).unwrap();
+        (sink, reader, payload)
+    }
+
+    #[test]
+    fn stalled_flush_without_cancel_waits_out_its_budget() {
+        // Control for the cancel test below: unwatched, the same stalled
+        // flush rides out the whole budget before dropping. (Sliced
+        // polls draw from the same budget, so the drop policy is
+        // unchanged.)
+        let (mut sink, _reader, payload) = stalled_sink_with(Duration::from_millis(250), None);
+        let start = Instant::now();
+        sink.flush().unwrap();
+        let elapsed = start.elapsed();
+        let drops = sink.take_drops();
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "fixture did not stall: flush returned in {elapsed:?}"
+        );
+        assert_eq!(drops.timeouts, 1);
+        assert_eq!(drops.dropped_bytes, payload.len() as u64);
+    }
+
+    #[test]
+    fn cancel_flag_aborts_a_stalled_flush_promptly_with_counters() {
+        // F4: SIGINT during a slow-sink flush held 232ms past the signal
+        // (one 250ms poll retried past the interruption). With the flag
+        // watched, the flush sheds on the interruption, or at worst at
+        // the next slice end.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (mut sink, _reader, payload) =
+            stalled_sink_with(Duration::from_millis(250), Some(Arc::clone(&cancel)));
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            let set = Instant::now();
+            cancel.store(true, Ordering::SeqCst);
+            set
+        });
+        sink.flush().unwrap();
+        let returned = Instant::now();
+        let set = setter.join().unwrap();
+        // Saturating: if the setter thread itself stalls past the flush,
+        // the bound holds trivially instead of flaking.
+        let after_set = returned.saturating_duration_since(set);
+        assert!(
+            after_set < Duration::from_millis(150),
+            "cancel abort took {after_set:?} after the flag (budget 250ms)"
+        );
+        let drops = sink.take_drops();
+        assert_eq!(drops.timeouts, 1);
+        assert_eq!(drops.dropped_bytes, payload.len() as u64);
+    }
+
+    #[test]
+    fn cancel_with_room_available_delivers_instead_of_dropping() {
+        // The prompt shed is not a blind drop: bytes the reader already
+        // has room for still leave, so a fast-sink cancel stays lossless.
+        let (writer, mut reader) = pair();
+        let cancel = Arc::new(AtomicBool::new(true));
+        let mut sink = SinkWriter::new(writer).unwrap();
+        sink.set_cancel_flag(cancel);
+        sink.begin_tick(Duration::from_millis(250));
+        sink.write_all(b"late trace bytes\n").unwrap();
+        sink.flush().unwrap();
+        assert_eq!(sink.take_drops(), SinkDrops::default());
+        reader
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut got = vec![0u8; b"late trace bytes\n".len()];
+        reader.read_exact(&mut got).unwrap();
+        assert_eq!(got, b"late trace bytes\n");
     }
 
     #[test]

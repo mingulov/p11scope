@@ -32,7 +32,7 @@ use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
@@ -1378,18 +1378,30 @@ const STOP_SIGNALS: [libc::c_int; 2] = [libc::SIGINT, libc::SIGTERM];
 /// `signal_hook::low_level::register` is used instead of a hand-rolled
 /// `libc::signal` handler: the callback is the signal-safe minimum, while the
 /// capture loop retains the first identity and counts repeated Ctrl-C.
+/// The sink watches the same observation through `cancel_flag`, so a
+/// slow-stdout flush sheds promptly instead of waiting out its budget.
 struct SignalState {
     state: AtomicU64,
+    cancel: Arc<AtomicBool>,
 }
 
 impl SignalState {
     fn new() -> Self {
         Self {
             state: AtomicU64::new(0),
+            cancel: Arc::new(AtomicBool::new(false)),
         }
     }
 
+    /// The flag the stdout sink watches: set on the first observed stop
+    /// signal, alongside the identity above. Signal-safe to share; the
+    /// sink only loads it.
+    fn cancel_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancel)
+    }
+
     fn observe(&self, signal: libc::c_int) {
+        self.cancel.store(true, Ordering::SeqCst);
         let _ = self
             .state
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
@@ -2968,6 +2980,7 @@ fn capture_profile(
     // once the final report is written.
     let has_output = output.is_some();
     let mut stdout_sink = crate::sink::stdout_sink()?;
+    stdout_sink.set_cancel_flag(interrupted.cancel_flag());
     let stdout: &mut crate::sink::SinkWriter<std::fs::File> = &mut stdout_sink;
     let profile = policy.uses_events();
     let mode = if profile { "profile" } else { "metrics" };
@@ -3416,6 +3429,7 @@ fn capture_trace(
     let mut out_sink = out.map(buffered_sink);
     let out_file = &mut out_sink;
     let mut stdout_sink = crate::sink::stdout_sink()?;
+    stdout_sink.set_cancel_flag(interrupted.cancel_flag());
     let stdout: &mut crate::sink::SinkWriter<std::fs::File> = &mut stdout_sink;
 
     let domain = session.events_domain();
@@ -3738,6 +3752,12 @@ fn capture_trace(
                         SchedulingPhase::Detach,
                         Duration::from_millis(context.1.detach_wall_ms()),
                     );
+                    // Flush every pre-terminal byte BEFORE snapshotting, so
+                    // the terminal records account all drops so far (F3:
+                    // snapshotting first stranded the terminal flush's drops
+                    // outside the emitted EVIDENCE).
+                    flush_stdout(context.5, context.6)?;
+                    collect_sink_drops(context.5, consumers.scheduling, &mut None, Instant::now());
                     let mut evidence = evidence_for(
                         context.0,
                         context.0.capture_facts(),
@@ -3762,36 +3782,24 @@ fn capture_trace(
                             .snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64),
                     );
                     evidence.mark_terminal_drain_unproven();
-                    if trace_truncated {
-                        emit_trace_line(
-                            &trace::truncated_line(trace_limit),
-                            context.5,
-                            context.6,
-                            context.7,
-                        )?;
-                    }
-                    emit_trace_terminal(
-                        &reports,
-                        consumers.tracer.as_deref().expect("trace consumer"),
-                        &trace::evidence_line(&evidence, policy, trace_truncated),
-                        context.5,
-                        context.6,
-                        context.7,
-                    )?;
                     if *consumers.malformed_records > 0 {
                         eprintln!(
                             "p11scope: {} malformed ring-buffer records discarded this capture",
                             *consumers.malformed_records
                         );
                     }
-                    if let Some(file) = context.7.as_mut() {
-                        file.flush().context("flushing trace output file")?;
-                    }
-                    // Explicit: terminal lines must not depend on drop-flush.
-                    // Drops here trail the emitted EVIDENCE line by one
-                    // window; the stderr note carries the true totals.
-                    flush_stdout(context.5, context.6)?;
-                    collect_sink_drops(context.5, consumers.scheduling, &mut None, Instant::now());
+                    emit_trace_terminal_accounted(
+                        &mut evidence,
+                        policy,
+                        trace_truncated,
+                        trace_limit,
+                        &reports,
+                        consumers.tracer.as_deref().expect("trace consumer"),
+                        consumers.scheduling,
+                        context.5,
+                        context.6,
+                        context.7,
+                    )?;
                     Ok(evidence)
                 },
             )
@@ -3818,6 +3826,113 @@ fn emit_trace_terminal<W: Write>(
         out_file,
     )?;
     emit_trace_line(evidence_line, stdout, stdout_open, out_file)
+}
+
+/// Byte-exact terminal sink total: the `-o` file's EVIDENCE record must
+/// report exactly the bytes the file holds that stdout lacks. That is the
+/// counted sink drops, plus the file/stdout EVIDENCE-record length delta
+/// (the two records can differ by the terminal flush's own drops, which
+/// shifts the digit width at a decimal boundary). `file_line_len` renders
+/// the file record's length for a candidate total; the iteration only ever
+/// grows (record length never shrinks as the total grows) within a range
+/// bounded by the digit width, so it settles in a couple of rounds.
+fn resolve_terminal_sink_total(
+    counted: u64,
+    stdout_line_len: usize,
+    mut file_line_len: impl FnMut(u64) -> usize,
+) -> u64 {
+    let mut total = counted;
+    for _ in 0..64 {
+        let file_len = file_line_len(total);
+        let next = counted.saturating_add((file_len as u64).saturating_sub(stdout_line_len as u64));
+        if next == total {
+            break;
+        }
+        total = next;
+    }
+    total
+}
+
+/// Terminal trace records with byte-exact sink accounting (F3). The
+/// evidence snapshot the caller took already counts every pre-terminal
+/// drop (the terminal closure flushes before snapshotting); this emits
+/// the terminal records, flushes them, and finalizes the `-o` file's
+/// EVIDENCE record AFTER that flush, so it accounts the terminal drops
+/// too. The stdout copy keeps the pre-flush count — stdout under loss is
+/// best-effort, and a record cannot report its own delivery fate — while
+/// the file copy resolves the exact file/stdout byte difference. Without
+/// drops both copies are identical.
+#[allow(clippy::too_many_arguments)]
+fn emit_trace_terminal_accounted<W: Write>(
+    evidence: &mut render::Evidence,
+    policy: CapturePolicy,
+    trace_truncated: bool,
+    trace_limit: u64,
+    reports: &[metrics::SlotReport],
+    tracer: &trace::Tracer,
+    scheduling: &mut SchedulingAccumulator,
+    stdout: &mut crate::sink::SinkWriter<std::fs::File>,
+    stdout_open: &mut bool,
+    out_file: &mut Option<W>,
+) -> Result<()> {
+    if trace_truncated {
+        emit_trace_line(
+            &trace::truncated_line(trace_limit),
+            stdout,
+            stdout_open,
+            out_file,
+        )?;
+    }
+    // The stdout terminal records (COUNT plus the pre-flush EVIDENCE
+    // copy) go through the shared terminal emitter, best-effort under
+    // loss; the file receives COUNT now and its finalized EVIDENCE
+    // record after the terminal flush below.
+    let stdout_line = trace::evidence_line(evidence, policy, trace_truncated);
+    let stdout_line_len = stdout_line.len() + 1; // trailing newline
+    emit_trace_terminal(
+        reports,
+        tracer,
+        &stdout_line,
+        stdout,
+        stdout_open,
+        &mut None::<std::io::Sink>,
+    )?;
+    {
+        let mut discard = std::io::sink();
+        let mut discard_open = true;
+        emit_trace_line(
+            &terminal_trace_count_line(reports, tracer),
+            &mut discard,
+            &mut discard_open,
+            out_file,
+        )?;
+    }
+    // Fresh budget for the terminal records: the pre-terminal flush may
+    // have spent the tick's. Bounded like every flush (and prompt under
+    // cancellation), so the records still get a delivery chance.
+    stdout.begin_tick(crate::sink::SINK_TICK_BUDGET);
+    flush_stdout(stdout, stdout_open)?;
+    collect_sink_drops(stdout, scheduling, &mut None, Instant::now());
+    // Refresh from the accumulator — the profile terminal does the same —
+    // then resolve the file record's exact total: counted drops plus any
+    // file/stdout record-length delta from the terminal flush's own drops.
+    evidence.scheduling = scheduling.snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64);
+    let counted = evidence.scheduling.sink_dropped_bytes;
+    let total = resolve_terminal_sink_total(counted, stdout_line_len, |candidate| {
+        evidence.scheduling.sink_dropped_bytes = candidate;
+        trace::evidence_line(evidence, policy, trace_truncated).len() + 1
+    });
+    evidence.scheduling.sink_dropped_bytes = total;
+    if let Some(file) = out_file.as_mut() {
+        writeln!(
+            file,
+            "{}",
+            trace::evidence_line(evidence, policy, trace_truncated)
+        )
+        .context("writing trace output file")?;
+        file.flush().context("flushing trace output file")?;
+    }
+    Ok(())
 }
 
 /// Prints (and, if given, appends to the `-o` file) every rendered line.
@@ -6850,6 +6965,18 @@ mod tests {
         );
     }
 
+    /// The sink watches the same observation the loop polls: the first
+    /// observed stop signal raises the shared cancel flag (F4 wiring).
+    #[test]
+    fn observed_stop_signal_raises_the_shared_cancel_flag() {
+        let interrupted = SignalState::new();
+        let cancel = interrupted.cancel_flag();
+        assert!(!cancel.load(Ordering::SeqCst));
+        interrupted.observe(libc::SIGINT);
+        assert!(cancel.load(Ordering::SeqCst));
+        assert!(interrupted.interrupted());
+    }
+
     /// End to end through the profile single-quantum step: two quanta of
     /// scripted backlog drain in one readiness tick with re-polls counted.
     #[test]
@@ -7090,6 +7217,260 @@ mod tests {
                 "stats_returned": 5,
                 "raw_calls": 1,
             })
+        );
+    }
+
+    fn pipe_pair() -> (File, File) {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: `pipe` succeeded, so both ends are open and owned here.
+        unsafe {
+            (
+                std::os::fd::FromRawFd::from_raw_fd(fds[0]),
+                std::os::fd::FromRawFd::from_raw_fd(fds[1]),
+            )
+        }
+    }
+
+    /// A slow sink with a bounded appetite: 1KB reads at ~20KB/s up to
+    /// 4KB total, then parked until `done`, then a fast drain to EOF.
+    /// The cap bounds what any test-thread stall can drain (the pipe
+    /// stays lossy); the `parked` flag bounds what any reader-thread
+    /// stall can drain during the terminal phase. Returns every byte the
+    /// pipe delivered, so file/stdout subtraction is valid.
+    fn spawn_slow_sink_reader(
+        mut reader: File,
+        parked: Arc<AtomicBool>,
+        done: Arc<AtomicBool>,
+    ) -> std::thread::JoinHandle<u64> {
+        use std::io::Read as _;
+        std::thread::spawn(move || {
+            let mut delivered = 0u64;
+            let mut taken = 0u64;
+            let mut chunk = vec![0u8; 1024];
+            loop {
+                if done.load(Ordering::SeqCst) {
+                    loop {
+                        match reader.read(&mut chunk) {
+                            Ok(0) => return delivered,
+                            Ok(n) => delivered += n as u64,
+                            Err(error) => panic!("slow-sink reader failed: {error}"),
+                        }
+                    }
+                }
+                if parked.load(Ordering::SeqCst) || taken >= 4096 {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                match reader.read(&mut chunk) {
+                    Ok(0) => return delivered,
+                    Ok(n) => {
+                        delivered += n as u64;
+                        taken += n as u64;
+                    }
+                    Err(error) => panic!("slow-sink reader failed: {error}"),
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        })
+    }
+
+    fn emit_pre_terminal_lines(
+        stdout: &mut dyn Write,
+        stdout_open: &mut bool,
+        out_file: &mut Option<Vec<u8>>,
+        lines: usize,
+        line_len: usize,
+    ) {
+        for _ in 0..lines {
+            emit_trace_line(&"A".repeat(line_len), stdout, stdout_open, out_file).unwrap();
+        }
+    }
+
+    fn terminal_evidence_for(scheduling: render::SchedulingEvidence) -> render::Evidence {
+        let (engine, _) = crate::discovery::engine::tests::selection_output_engines();
+        let state = semantics::State::new(engine.plan());
+        let mut evidence = evidence_for(
+            &engine,
+            engine.capture_facts(),
+            0,
+            false,
+            &[],
+            &[],
+            metrics::KernelEvidence::default(),
+            process::TrackingEvidence::default(),
+            0,
+            &state,
+            false,
+            true,
+            Default::default(),
+            None,
+            false,
+            scheduling,
+        );
+        evidence.mark_terminal_drain_unproven();
+        evidence
+    }
+
+    fn parse_terminal_records(file: &[u8]) -> serde_json::Value {
+        let text = String::from_utf8(file.to_vec()).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let count_pos = lines
+            .iter()
+            .position(|line| line.starts_with("COUNT_EVIDENCE "));
+        let evidence_pos = lines.iter().position(|line| line.starts_with("EVIDENCE "));
+        let (Some(count_pos), Some(evidence_pos)) = (count_pos, evidence_pos) else {
+            panic!("terminal records missing from {} lines", lines.len());
+        };
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("EVIDENCE "))
+                .count(),
+            1,
+            "expected exactly one EVIDENCE record"
+        );
+        assert_eq!(
+            count_pos + 1,
+            evidence_pos,
+            "COUNT must immediately precede EVIDENCE"
+        );
+        serde_json::from_str(lines[evidence_pos].strip_prefix("EVIDENCE ").unwrap()).unwrap()
+    }
+
+    /// F3: the file's EVIDENCE record accounts every terminal drop,
+    /// byte-exact against trace-file/stdout comparison. Production order
+    /// (pre-terminal flush, snapshot, accounted emission) over a slow
+    /// sink that drops in every phase: the reported total equals the
+    /// actual missing bytes.
+    #[test]
+    fn terminal_trace_evidence_accounts_every_terminal_drop_byte_exact() {
+        let (reader, writer) = pipe_pair();
+        let mut sink = crate::sink::SinkWriter::new(writer).unwrap();
+        let mut stdout_open = true;
+        let mut file = Some(Vec::new());
+        let mut scheduling = SchedulingAccumulator::default();
+        sink.begin_tick(crate::sink::SINK_TICK_BUDGET);
+        // 100KB past a 64KB pipe with no reader yet: the mid-write
+        // auto-flush delivers a pipeful and drops the rest.
+        emit_pre_terminal_lines(&mut sink, &mut stdout_open, &mut file, 100, 1000);
+        let parked = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let reader = spawn_slow_sink_reader(reader, Arc::clone(&parked), Arc::clone(&done));
+        // Production order: flush every pre-terminal byte, collect, and
+        // only then snapshot.
+        flush_stdout(&mut sink, &mut stdout_open).unwrap();
+        collect_sink_drops(&mut sink, &mut scheduling, &mut None, Instant::now());
+        parked.store(true, Ordering::SeqCst);
+        let mut evidence =
+            terminal_evidence_for(scheduling.snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64));
+        let (_, _, tracer) = trace_fixture();
+        emit_trace_terminal_accounted(
+            &mut evidence,
+            CapturePolicy::AggregateOnly,
+            false,
+            DEFAULT_TRACE_MAX_EVENTS,
+            &[],
+            &tracer,
+            &mut scheduling,
+            &mut sink,
+            &mut stdout_open,
+            &mut file,
+        )
+        .unwrap();
+        done.store(true, Ordering::SeqCst);
+        drop(sink);
+        let stdout_bytes = reader.join().unwrap();
+        let file = file.unwrap();
+
+        let record = parse_terminal_records(&file);
+        let reported = record["scheduling"]["sink_dropped_bytes"].as_u64().unwrap();
+        let timeouts = record["scheduling"]["sink_timeouts"].as_u64().unwrap();
+        let missing = file.len() as u64 - stdout_bytes;
+        assert_eq!(
+            reported, missing,
+            "EVIDENCE sink_dropped_bytes ({reported}) != actual missing bytes ({missing})"
+        );
+        assert!(reported > 0, "fixture dropped nothing: test is vacuous");
+        assert_eq!(timeouts, 3, "expected a drop in every phase");
+        assert_eq!(
+            record["scheduling"]["sink_policy"].as_str().unwrap(),
+            render::SINK_POLICY_BOUNDED_WAIT_DROP,
+        );
+    }
+
+    /// Sensitivity guard for the byte-exact test above: the OLD order
+    /// (snapshot, emit, then flush) strands the final flush's drops
+    /// outside the emitted EVIDENCE — the F3 defect shape. Production
+    /// must not do this; uses only pre-existing fns.
+    #[test]
+    fn terminal_trace_old_order_strands_terminal_drops_outside_evidence() {
+        let (reader, writer) = pipe_pair();
+        let mut sink = crate::sink::SinkWriter::new(writer).unwrap();
+        let mut stdout_open = true;
+        let mut file = Some(Vec::new());
+        let mut scheduling = SchedulingAccumulator::default();
+        sink.begin_tick(crate::sink::SINK_TICK_BUDGET);
+        emit_pre_terminal_lines(&mut sink, &mut stdout_open, &mut file, 100, 1000);
+        // Old order: snapshot first (the accumulator is still empty —
+        // the auto-flush drops sit in the sink, uncollected), emit, and
+        // only then flush.
+        let evidence =
+            terminal_evidence_for(scheduling.snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64));
+        let (_, _, tracer) = trace_fixture();
+        emit_trace_terminal(
+            &[],
+            &tracer,
+            &trace::evidence_line(&evidence, CapturePolicy::AggregateOnly, false),
+            &mut sink,
+            &mut stdout_open,
+            &mut file,
+        )
+        .unwrap();
+        let parked = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let reader = spawn_slow_sink_reader(reader, parked, Arc::clone(&done));
+        flush_stdout(&mut sink, &mut stdout_open).unwrap();
+        collect_sink_drops(&mut sink, &mut scheduling, &mut None, Instant::now());
+        done.store(true, Ordering::SeqCst);
+        drop(sink);
+        let stdout_bytes = reader.join().unwrap();
+        let file = file.unwrap();
+
+        let record = parse_terminal_records(&file);
+        let reported = record["scheduling"]["sink_dropped_bytes"].as_u64().unwrap();
+        let missing = file.len() as u64 - stdout_bytes;
+        assert_eq!(reported, 0, "old order must snapshot before any collect");
+        assert!(
+            missing - reported > 20_000,
+            "fixture strands nothing: sensitivity guard is vacuous"
+        );
+    }
+
+    /// The terminal-total fixpoint: the file record's own length feeds
+    /// back into the total it reports, settling across digit boundaries.
+    #[test]
+    fn resolve_terminal_sink_total_crosses_digit_boundaries() {
+        // Record length = 90 fixed bytes + decimal digits of the total.
+        fn fake_len(total: u64) -> usize {
+            90 + total.to_string().len()
+        }
+        // No width change: the counted total stands.
+        assert_eq!(resolve_terminal_sink_total(5, fake_len(5), fake_len), 5);
+        assert_eq!(
+            resolve_terminal_sink_total(100_005, fake_len(100_000), fake_len),
+            100_005
+        );
+        // Terminal drops cross 99999 -> 100000: the file record grows one
+        // byte, which is itself a missing byte.
+        assert_eq!(
+            resolve_terminal_sink_total(100_000, fake_len(99_999), fake_len),
+            100_001
+        );
+        // Two widths up from the stdout copy: settles after two rounds.
+        assert_eq!(
+            resolve_terminal_sink_total(99_999, fake_len(9_999), fake_len),
+            100_001
         );
     }
 

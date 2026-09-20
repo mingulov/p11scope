@@ -48,7 +48,7 @@ use std::path::Path;
 
 pub const BPF_LINK_CREATE: u32 = 28;
 pub const BPF_PROG_LOAD: u32 = 5;
-pub const BPF_PROG_TYPE_KPROBE: u32 = 4;
+pub const BPF_PROG_TYPE_KPROBE: u32 = 2;
 pub const BPF_TRACE_UPROBE_MULTI: u32 = 48;
 /// uprobe_multi link flag for return probes (`linux/bpf.h`:
 /// `BPF_F_UPROBE_MULTI_RETURN = (1U << 0)`). Lives in the member flags
@@ -93,9 +93,12 @@ fn zeroed<T>() -> T {
     unsafe { std::mem::zeroed() }
 }
 
-/// `BPF_PROG_LOAD` attr head through `expected_attach_type` (offsets
-/// verified against `linux/bpf.h`); trailing fields default to zero,
-/// which is what a mapless BTF-less scratch program wants.
+/// `BPF_PROG_LOAD` attr through `fd_array_cnt` (offsets verified
+/// against `linux/bpf.h`; same 152-byte shape as `ossl-bpf-sys` and
+/// Aya 0.14's bindgen union). Full width is conventional, not
+/// load-bearing: a 72-byte head loads fine too (measured on 7.0).
+/// Everything past `expected_attach_type` stays zero, which is what
+/// a mapless BTF-less scratch program wants.
 #[repr(C)]
 struct ProgAttr {
     prog_type: u32,
@@ -110,17 +113,40 @@ struct ProgAttr {
     prog_name: [u8; 16],
     prog_ifindex: u32,
     expected_attach_type: u32,
+    prog_btf_fd: u32,
+    func_info_rec_size: u32,
+    func_info: u64,
+    func_info_cnt: u32,
+    line_info_rec_size: u32,
+    line_info: u64,
+    line_info_cnt: u32,
+    attach_btf_id: u32,
+    attach_prog_fd: u32,
+    core_relo_cnt: u32,
+    fd_array: u64,
+    core_relos: u64,
+    core_relo_rec_size: u32,
+    log_true_size: u32,
+    prog_token_fd: i32,
+    fd_array_cnt: u32,
 }
 
 /// Scratch program bytecode: `r0 = 0; exit` (MOV64_IMM + EXIT, 8-byte
 /// stride). Cannot fail verification; safe even if a self-link fired.
-const SCRATCH_INSNS: [u8; 16] = [
+/// `static`, not `const`: the loader hands the kernel a pointer that
+/// must outlive the `bpf()` call, and a `const` use would borrow a
+/// statement-temporary instead.
+static SCRATCH_INSNS: [u8; 16] = [
     0xb7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
     0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
 ];
 
 /// Kernel-visible name of the scratch program (bpftool inventory).
-const SCRATCH_PROG_NAME: &str = "p11scope-multi";
+/// Underscore, not dash: the kernel rejects `-` in object names with
+/// a logless EINVAL (measured: `p11scope-multi` fails, `p11scope_multi`
+/// and `p11scope.multi` load). Stays in `[A-Za-z0-9_.]`; the shape
+/// test below pins that charset.
+const SCRATCH_PROG_NAME: &str = "p11scope_multi";
 
 /// Load the mapless no-op scratch program typed for multi attach
 /// (`BPF_PROG_TYPE_KPROBE` + `expected_attach_type=48`). Doctor
@@ -128,9 +154,10 @@ const SCRATCH_PROG_NAME: &str = "p11scope-multi";
 /// No verifier log: two instructions cannot fail verification, so the
 /// load errno alone diagnoses the failure (EPERM, ENOSYS, ...).
 pub fn prog_load_scratch_multi() -> io::Result<OwnedFd> {
-    debug_assert_eq!(size_of::<ProgAttr>(), 72);
+    debug_assert_eq!(size_of::<ProgAttr>(), 152);
     debug_assert_eq!(std::mem::offset_of!(ProgAttr, prog_name), 48);
     debug_assert_eq!(std::mem::offset_of!(ProgAttr, expected_attach_type), 68);
+    debug_assert_eq!(std::mem::offset_of!(ProgAttr, prog_btf_fd), 72);
     debug_assert_eq!(SCRATCH_INSNS.len() % 8, 0);
     debug_assert!(SCRATCH_PROG_NAME.len() < 16);
     let mut attr: ProgAttr = zeroed();
@@ -398,8 +425,20 @@ mod tests {
         assert_eq!(SCRATCH_INSNS[0], 0xb7, "MOV64_IMM r0, 0");
         assert_eq!(SCRATCH_INSNS[8], 0x95, "EXIT");
         assert!(SCRATCH_PROG_NAME.len() < 16);
-        assert_eq!(size_of::<ProgAttr>(), 72);
+        // Kernel object-name charset: a `-` EINVALs the load with no
+        // verifier log (measured on 7.0), so pin `[A-Za-z0-9_.]`.
+        assert!(
+            SCRATCH_PROG_NAME
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'.')
+        );
+        assert_eq!(size_of::<ProgAttr>(), 152);
         assert_eq!(std::mem::offset_of!(ProgAttr, expected_attach_type), 68);
+        assert_eq!(std::mem::offset_of!(ProgAttr, prog_btf_fd), 72);
+        // UAPI numbers (`linux/bpf.h`; KPROBE is 2, not SCHED_ACT's 4).
+        assert_eq!(BPF_PROG_LOAD, 5);
+        assert_eq!(BPF_PROG_TYPE_KPROBE, 2);
+        assert_eq!(BPF_TRACE_UPROBE_MULTI, 48);
     }
 
     #[test]

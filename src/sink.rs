@@ -42,6 +42,22 @@ pub(crate) struct SinkWriter<W: Write + AsRawFd> {
     drops: SinkDrops,
 }
 
+/// Production's stdout sink: a dup'd raw fd, unbuffered, so every byte
+/// passes through the poll bound. (A buffered inner would park bytes
+/// past the poll loop and its EAGAIN would escape as a hard error.)
+/// The dup shares the open file description with fd 1, so fd 1 itself
+/// becomes nonblocking too; nothing else in the observer writes
+/// stdout directly (diagnostics use stderr).
+pub(crate) fn stdout_sink() -> io::Result<SinkWriter<std::fs::File>> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let fd = unsafe { libc::dup(std::io::stdout().as_raw_fd()) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `dup` succeeded, so the new fd is open and owned here.
+    SinkWriter::new(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
 impl<W: Write + AsRawFd> SinkWriter<W> {
     /// Marks the fd nonblocking, so the poll bound actually binds: a
     /// blocking write past a poll-ready notification would trickle an
@@ -326,6 +342,20 @@ mod tests {
             flags | libc::O_NONBLOCK
         };
         assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFL, flags) }, 0);
+    }
+
+    #[test]
+    fn stdout_sink_is_unbuffered_by_construction() {
+        // The poll bound can only meter bytes it can see: a buffered
+        // inner (StdoutLock's LineWriter) parks bytes past the poll
+        // loop, and its EAGAIN escapes as a hard error that kills the
+        // observer (E-slow-sink rerun: "flushing stdout: Resource
+        // temporarily unavailable"). Production's constructor returns
+        // a raw File, unbuffered; this pins the type at compile time.
+        fn assert_raw_file(_: &SinkWriter<std::fs::File>) {}
+        let mut sink = stdout_sink().unwrap();
+        assert_raw_file(&sink);
+        assert_eq!(sink.take_drops(), SinkDrops::default());
     }
 
     #[test]

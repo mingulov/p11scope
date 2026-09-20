@@ -2820,7 +2820,7 @@ type ProfileTerminalContext<
     &'engine mut Engine,
     &'session mut Session,
     &'owned_ref mut Option<&'owned mut Owned>,
-    &'stdout_ref mut crate::sink::SinkWriter<std::io::StdoutLock<'static>>,
+    &'stdout_ref mut crate::sink::SinkWriter<std::fs::File>,
     &'stdout_open mut bool,
     &'output mut Option<AtomicFile>,
 );
@@ -2841,7 +2841,7 @@ type TraceTickContext<
     &'owned_ref mut Option<&'owned mut Owned>,
     &'remaining mut Option<u64>,
     &'loss mut u64,
-    &'stdout_ref mut crate::sink::SinkWriter<std::io::StdoutLock<'static>>,
+    &'stdout_ref mut crate::sink::SinkWriter<std::fs::File>,
     &'stdout_open mut bool,
     &'out_file mut Option<std::io::BufWriter<std::fs::File>>,
 );
@@ -2958,8 +2958,8 @@ fn capture_profile(
     // Opened by the caller before the attach; published by `commit()` only
     // once the final report is written.
     let has_output = output.is_some();
-    let mut stdout_sink = crate::sink::SinkWriter::new(std::io::stdout().lock())?;
-    let stdout: &mut crate::sink::SinkWriter<std::io::StdoutLock<'static>> = &mut stdout_sink;
+    let mut stdout_sink = crate::sink::stdout_sink()?;
+    let stdout: &mut crate::sink::SinkWriter<std::fs::File> = &mut stdout_sink;
     let profile = policy.uses_events();
     let mode = if profile { "profile" } else { "metrics" };
 
@@ -3403,8 +3403,8 @@ fn capture_trace(
     // attach, then appended to as lines arrive.
     let mut out_sink = out.map(buffered_sink);
     let out_file = &mut out_sink;
-    let mut stdout_sink = crate::sink::SinkWriter::new(std::io::stdout().lock())?;
-    let stdout: &mut crate::sink::SinkWriter<std::io::StdoutLock<'static>> = &mut stdout_sink;
+    let mut stdout_sink = crate::sink::stdout_sink()?;
+    let stdout: &mut crate::sink::SinkWriter<std::fs::File> = &mut stdout_sink;
 
     let domain = session.events_domain();
     let mut state = semantics::State::for_capture(engine.plan(), policy, domain.clone());
@@ -3849,7 +3849,7 @@ fn sink_note_due(drops: &crate::sink::SinkDrops, last_note: Option<Instant>, now
 /// stalls on stderr (throttled): stdout's own evidence line is
 /// best-effort under backpressure, so the note is the fallback record.
 fn collect_sink_drops(
-    sink: &mut crate::sink::SinkWriter<std::io::StdoutLock<'static>>,
+    sink: &mut crate::sink::SinkWriter<std::fs::File>,
     acc: &mut SchedulingAccumulator,
     last_note: &mut Option<Instant>,
     now: Instant,

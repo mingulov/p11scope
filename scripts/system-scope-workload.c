@@ -10,7 +10,9 @@
  * The generated-call truth is identical either way.
  *
  * Prints `TRUTH_PREGO {...}` at READY (calls already made, outside the
- * capture window) and one `TRUTH {...}` JSON line at the end with the exact
+ * capture window), one `BURST go_ns=... end_ns=...` line bounding the
+ * post-go window on CLOCK_MONOTONIC (the harness derives the ring input
+ * rate from it), and one `TRUTH {...}` JSON line at the end with the exact
  * post-go generated-call counts (the harness's workload oracle), and exits
  * 0. Same dlopen/table convention as scripts/fixtures/hammer.c.
  */
@@ -74,6 +76,13 @@ static int phase_setup(const char *module, CK_SESSION_HANDLE *sess)
     return 0;
 }
 
+static unsigned long long now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000000ULL + (unsigned long long)ts.tv_nsec;
+}
+
 static int signal_ready(const char *ready_file)
 {
     FILE *rf = fopen(ready_file, "w");
@@ -103,6 +112,7 @@ int main(int argc, char **argv)
     }
 
     CK_SESSION_HANDLE sess = 0;
+    unsigned long long go_ns = 0;
     if (early) {
         if (phase_setup(argv[1], &sess) != 0)
             return 1;
@@ -117,6 +127,7 @@ int main(int argc, char **argv)
          * never give up first and waste a slow-but-moving attach. */
         if (wait_for_file(go_file, 660) != 0)
             return 1;
+        go_ns = now_ns();
     } else {
         printf("TRUTH_PREGO {}\n");
         fflush(stdout);
@@ -124,6 +135,7 @@ int main(int argc, char **argv)
             return 1;
         if (wait_for_file(go_file, 660) != 0)
             return 1;
+        go_ns = now_ns();
         if (phase_setup(argv[1], &sess) != 0)
             return 1;
     }
@@ -137,6 +149,10 @@ int main(int argc, char **argv)
 
     CHECK("C_CloseSession", ((fn_close)fns[I_CloseSession])(sess));
     CHECK("C_Finalize", ((fn_gen)fns[I_Finalize])(NULL));
+    /* BURST bounds the TRUTH window on CLOCK_MONOTONIC: go observed to
+     * last post-go call. The harness derives the ring input rate from it. */
+    printf("BURST go_ns=%llu end_ns=%llu\n", go_ns, now_ns());
+    fflush(stdout);
 
     /* TRUTH covers post-go calls only (the capture window). With early=0
      * the setup calls happen post-go and are included; with early=1 they

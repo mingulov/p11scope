@@ -2615,6 +2615,25 @@ fn subset_oracle_requires_independent_calls_and_clean_capture() {
 }
 
 #[test]
+fn loss_share_measure_oracle_pins_trace_burst_capacity_and_window() {
+    run_ok(
+        "python3",
+        &[
+            "-I",
+            "tests/python/test_loss_share_measure.py",
+            "-v",
+            "TraceStreamTests",
+            "BurstParseTests",
+            "EventPathTests",
+            "RingBytesTests",
+            "TraceMatchTests",
+            "WindowValidityTests",
+            "LoadavgTests",
+        ],
+    );
+}
+
+#[test]
 fn native_helper_suite_recorded_launcher_requires_authenticated_generations_and_bounded_cleanup() {
     run_native_python_suite(
         "tests/python/test_root_recorded_launcher.py",

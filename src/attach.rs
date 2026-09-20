@@ -2442,6 +2442,13 @@ impl Session {
         events::Drain::new(&mut self.ebpf, self.events_domain.clone())
     }
 
+    /// Borrow the EVENTS map descriptor for readiness waits. The idle
+    /// wait polls this fd (wake on data or timeout); draining still
+    /// goes through `event_drain`, the single consumer.
+    pub(crate) fn events_readiness_fd(&self) -> BorrowedFd<'_> {
+        self.events_domain.as_fd()
+    }
+
     pub(crate) fn discovery_dequeue(&mut self) -> Result<Option<events::DiscoveryItem>> {
         let mut drain = events::DiscoveryDrain::new(&mut self.ebpf)?;
         Ok(drain.dequeue())

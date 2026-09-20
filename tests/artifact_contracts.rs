@@ -9098,6 +9098,27 @@ fn the_uretprobe_hazard_row_is_not_a_capability_tier_input() {
     );
 }
 
+/// Multi is optional with a whole-session singles fallback, so the
+/// self-link row is informational: it must never feed the tier (which
+/// would offline capable-but-old kernels) nor the exit code.
+#[test]
+fn the_multi_self_link_row_is_not_a_capability_tier_input() {
+    let source = read("src/doctor.rs");
+    let tier = source
+        .split_once("fn capability_tier(")
+        .expect("doctor.rs must define capability_tier")
+        .1;
+    let tier = tier.split_once("\nfn ").map_or(tier, |(body, _)| body);
+    assert!(
+        !tier.contains("uprobe-multi"),
+        "capability_tier must not read the multi row: an old kernel is fully capable on singles"
+    );
+    assert!(
+        source.contains("\"uprobe-multi attach (own libc)\""),
+        "doctor must still report the row"
+    );
+}
+
 fn run_native_python_suite(script: &str, class: &str) {
     let _native_suite_guard = NATIVE_SUITE_GATE
         .lock()

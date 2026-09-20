@@ -29,6 +29,9 @@
 //! uprobe/uretprobe-only sections, while the real p11scope objects carry
 //! BTF, `.maps` task storage, `raw_tp`/`tp_btf` programs, and two
 //! tail-call targets (spike: both objects rejected with zero fd leak).
+//! The one exception is [`prog_load_scratch_multi`]: a mapless
+//! two-instruction no-op for the doctor functional probe only — no ELF,
+//! BTF, maps, or relocation, so none of the rejection rationale applies.
 //!
 //! Raw-UAPI pid semantics (NOT libbpf's): `pid==0` means NO task filter
 //! (all processes). Aya PR #1417 maps `UProbeScope::AllProcesses` to 0,
@@ -44,6 +47,8 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
 
 pub const BPF_LINK_CREATE: u32 = 28;
+pub const BPF_PROG_LOAD: u32 = 5;
+pub const BPF_PROG_TYPE_KPROBE: u32 = 4;
 pub const BPF_TRACE_UPROBE_MULTI: u32 = 48;
 /// uprobe_multi link flag for return probes (`linux/bpf.h`:
 /// `BPF_F_UPROBE_MULTI_RETURN = (1U << 0)`). Lives in the member flags
@@ -86,6 +91,63 @@ fn bpf(cmd: u32, attr: *mut std::ffi::c_void, size: usize) -> io::Result<i32> {
 fn zeroed<T>() -> T {
     // SAFETY: all attr structs are plain-old-data (ints/arrays).
     unsafe { std::mem::zeroed() }
+}
+
+/// `BPF_PROG_LOAD` attr head through `expected_attach_type` (offsets
+/// verified against `linux/bpf.h`); trailing fields default to zero,
+/// which is what a mapless BTF-less scratch program wants.
+#[repr(C)]
+struct ProgAttr {
+    prog_type: u32,
+    insn_cnt: u32,
+    insns: u64,
+    license: u64,
+    log_level: u32,
+    log_size: u32,
+    log_buf: u64,
+    kern_version: u32,
+    prog_flags: u32,
+    prog_name: [u8; 16],
+    prog_ifindex: u32,
+    expected_attach_type: u32,
+}
+
+/// Scratch program bytecode: `r0 = 0; exit` (MOV64_IMM + EXIT, 8-byte
+/// stride). Cannot fail verification; safe even if a self-link fired.
+const SCRATCH_INSNS: [u8; 16] = [
+    0xb7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+    0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+];
+
+/// Kernel-visible name of the scratch program (bpftool inventory).
+const SCRATCH_PROG_NAME: &str = "p11scope-multi";
+
+/// Load the mapless no-op scratch program typed for multi attach
+/// (`BPF_PROG_TYPE_KPROBE` + `expected_attach_type=48`). Doctor
+/// functional probe ONLY: production programs load through Aya.
+/// No verifier log: two instructions cannot fail verification, so the
+/// load errno alone diagnoses the failure (EPERM, ENOSYS, ...).
+pub fn prog_load_scratch_multi() -> io::Result<OwnedFd> {
+    debug_assert_eq!(size_of::<ProgAttr>(), 72);
+    debug_assert_eq!(std::mem::offset_of!(ProgAttr, prog_name), 48);
+    debug_assert_eq!(std::mem::offset_of!(ProgAttr, expected_attach_type), 68);
+    debug_assert_eq!(SCRATCH_INSNS.len() % 8, 0);
+    debug_assert!(SCRATCH_PROG_NAME.len() < 16);
+    let mut attr: ProgAttr = zeroed();
+    attr.prog_type = BPF_PROG_TYPE_KPROBE;
+    attr.insn_cnt = (SCRATCH_INSNS.len() / 8) as u32;
+    attr.insns = SCRATCH_INSNS.as_ptr() as u64;
+    attr.license = c"GPL".as_ptr() as u64;
+    let name = SCRATCH_PROG_NAME.as_bytes();
+    attr.prog_name[..name.len()].copy_from_slice(name);
+    attr.expected_attach_type = BPF_TRACE_UPROBE_MULTI;
+    let fd = bpf(
+        BPF_PROG_LOAD,
+        std::ptr::addr_of_mut!(attr).cast(),
+        size_of::<ProgAttr>(),
+    )?;
+    // SAFETY: bpf() returned a fresh owned fd.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 /// One uprobe_multi link: `offsets[i]` fires with `cookies[i]`.
@@ -328,6 +390,30 @@ mod tests {
 
     fn os_error(errno: i32) -> io::Error {
         io::Error::from_raw_os_error(errno)
+    }
+
+    #[test]
+    fn scratch_program_shape_is_two_verifier_trivial_insns() {
+        assert_eq!(SCRATCH_INSNS.len(), 16);
+        assert_eq!(SCRATCH_INSNS[0], 0xb7, "MOV64_IMM r0, 0");
+        assert_eq!(SCRATCH_INSNS[8], 0x95, "EXIT");
+        assert!(SCRATCH_PROG_NAME.len() < 16);
+        assert_eq!(size_of::<ProgAttr>(), 72);
+        assert_eq!(std::mem::offset_of!(ProgAttr, expected_attach_type), 68);
+    }
+
+    #[test]
+    fn scratch_loader_reaches_the_kernel() {
+        // Privileged lane: loads and drops. Anywhere else the kernel
+        // still answers (EPERM/ENOSYS/...); only local validation
+        // would surface a non-OS error, and there is none on this path.
+        match prog_load_scratch_multi() {
+            Ok(_) => {}
+            Err(error) => assert!(
+                error.raw_os_error().is_some(),
+                "scratch load must reach the kernel: {error}"
+            ),
+        }
     }
 
     #[test]

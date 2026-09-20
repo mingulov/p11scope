@@ -214,6 +214,7 @@ fn document(
         engine.capture_facts(),
         session.attached_probes(),
         session.dynamic_per_offset_attached(),
+        session.static_multi_attached(),
         session.attach_failures(),
         &reports,
         kernel,

@@ -1597,14 +1597,15 @@ fn multi_prog_fd(ebpf: &mut Ebpf, program: &'static str) -> Result<RawFd> {
     Ok(fd.as_fd().as_raw_fd())
 }
 
-/// PID filter for the multi `link_create`: the raw-UAPI spelling of the
-/// session's uprobe scope (`pid==0` attaches to all processes).
-fn multi_pid_for_scope(scope: UProbeScope) -> u32 {
-    match scope {
-        UProbeScope::AllProcesses => 0,
-        UProbeScope::OneProcess(pid) => pid.get(),
-        UProbeScope::CallingProcess => std::process::id(),
-    }
+/// PID filter for the multi `link_create`: always 0 (all processes).
+/// The 6.9.x kernel pid filter misses threads (osslscope-proven), so
+/// `Scope::Pid` under multi relies on the existing in-BPF `PID_FILTER`
+/// tgid guard, which every static probe already consults via
+/// `scope_auth`; Cgroup/System scopes are BPF-enforced under singles
+/// too. Out-of-scope tasks run the probe prologue and return 0, so
+/// captured events are identical to kernel-filtered singles.
+fn multi_link_pid() -> u32 {
+    0
 }
 
 pub(crate) fn monotonic_ns() -> Option<u64> {
@@ -2699,7 +2700,7 @@ impl Session {
             .collect::<Result<_>>()?;
         let scope = self.uprobe_scope;
         let outcome = if self.backend == AttachBackend::Multi {
-            self.attach_targets_multi(targets, &attach_targets, scope)?
+            self.attach_targets_multi(targets, &attach_targets)?
         } else {
             let ebpf = &mut self.ebpf;
             let links = &mut self.links;
@@ -2755,17 +2756,17 @@ impl Session {
 
     /// Multi half of [`Session::attach_targets`]: regroups the targets by
     /// (attach path, entry program) and attaches one return link plus one
-    /// entry link per group over the 48-loaded twins. Late joiners (live
-    /// discovery) form their own groups and attach as additional links;
-    /// coalescing them into existing links is the Task 2.3 rebuild. A
-    /// kernel without multi support aborts with
+    /// entry link per group over the 48-loaded twins, pid-wide with the
+    /// existing in-BPF scope filter (see [`multi_link_pid`]). Late
+    /// joiners (live discovery) form their own groups and attach as
+    /// additional links; coalescing them into existing links is the
+    /// Task 2.3 rebuild. A kernel without multi support aborts with
     /// [`BackendFallbackRequired`] (downcastable through anyhow) so
     /// `start` can rebuild the session on singles.
     fn attach_targets_multi(
         &mut self,
         targets: &[Slot],
         attach_targets: &BTreeMap<u32, (PathBuf, ElfAbi)>,
-        scope: UProbeScope,
     ) -> Result<AttachOutcome> {
         let groups = group_static_slots(
             targets,
@@ -2780,7 +2781,7 @@ impl Session {
         for program in programs {
             prog_fds.insert(program, multi_prog_fd(&mut self.ebpf, program)?);
         }
-        let pid = multi_pid_for_scope(scope);
+        let pid = multi_link_pid();
         let (bundles, outcome) = attach_target_groups_with(
             &groups,
             |_| monotonic_ns(),
@@ -3084,6 +3085,13 @@ impl Session {
         self.successful_static.len()
     }
 
+    /// True when static endpoints attached through multi group links.
+    /// The backend is fixed at load, so this is exact: every static
+    /// endpoint in the session shares it.
+    pub fn static_multi_attached(&self) -> bool {
+        self.backend == AttachBackend::Multi && !self.successful_static.is_empty()
+    }
+
     pub(crate) fn dynamic_per_offset_attached(&self) -> bool {
         self.dynamic_attach_evidence.successful()
     }
@@ -3335,6 +3343,14 @@ mod tests {
                 "{release:?} must conservatively stay singles"
             );
         }
+    }
+
+    #[test]
+    fn multi_links_attach_pid_wide_and_filter_in_bpf() {
+        // Pin the sketch step-6 decision: the kernel pid filter is never
+        // used for multi links (6.9.x misses threads); Scope::Pid rides
+        // on the in-BPF PID_FILTER tgid guard every static probe checks.
+        assert_eq!(super::multi_link_pid(), 0);
     }
 
     #[test]

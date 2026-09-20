@@ -3191,6 +3191,7 @@ fn capture_profile(
                 engine.capture_facts(),
                 session.attached_probes(),
                 session.dynamic_per_offset_attached(),
+                session.static_multi_attached(),
                 session.attach_failures(),
                 &reports,
                 kernel_evidence,
@@ -3369,6 +3370,7 @@ fn capture_profile(
                         context.0.capture_facts(),
                         context.1.attached_probes(),
                         context.1.dynamic_per_offset_attached(),
+                        context.1.static_multi_attached(),
                         context.1.attach_failures(),
                         &reports,
                         kernel_evidence,
@@ -3817,6 +3819,7 @@ fn capture_trace(
                         context.0.capture_facts(),
                         context.1.attached_probes(),
                         context.1.dynamic_per_offset_attached(),
+                        context.1.static_multi_attached(),
                         context.1.attach_failures(),
                         &reports,
                         terminal_kernel,
@@ -4532,6 +4535,7 @@ fn evidence_for(
     facts: render::CaptureFacts,
     attached_probes: usize,
     dynamic_per_offset_attached: bool,
+    static_multi_attached: bool,
     attach_failures: &[(u32, String)],
     reports: &[metrics::SlotReport],
     kernel_evidence: metrics::KernelEvidence,
@@ -4654,7 +4658,11 @@ fn evidence_for(
         loader_discovery: facts.loader_discovery(),
         interface_selection,
         attach_mechanisms: if include_selection {
-            attach_mechanisms(attached_probes, dynamic_per_offset_attached)
+            attach_mechanisms(
+                attached_probes,
+                dynamic_per_offset_attached,
+                static_multi_attached,
+            )
         } else {
             Vec::new()
         },
@@ -4682,12 +4690,19 @@ fn evidence_for(
 fn attach_mechanisms(
     attached_probes: usize,
     dynamic_per_offset_attached: bool,
+    static_multi_attached: bool,
 ) -> Vec<&'static str> {
-    if attached_probes == 0 && !dynamic_per_offset_attached {
-        Vec::new()
-    } else {
-        vec!["per-offset"]
+    // Sorted to match the capture oracle (`mechanisms == sorted(set)`):
+    // static singles and dynamic loader/export probes report
+    // "per-offset", static multi group links report "uprobe-multi".
+    let mut mechanisms = Vec::new();
+    if (attached_probes > 0 && !static_multi_attached) || dynamic_per_offset_attached {
+        mechanisms.push("per-offset");
     }
+    if static_multi_attached {
+        mechanisms.push("uprobe-multi");
+    }
+    mechanisms
 }
 
 /// `SystemTime` → an RFC3339-ish UTC timestamp, no `chrono` dependency.
@@ -7493,6 +7508,7 @@ mod tests {
             engine.capture_facts(),
             0,
             false,
+            false,
             &[],
             &[],
             metrics::KernelEvidence::default(),
@@ -8031,9 +8047,19 @@ mod tests {
 
     #[test]
     fn task_8d_attach_mechanism_requires_a_successfully_owned_link() {
-        assert!(attach_mechanisms(0, false).is_empty());
-        assert_eq!(attach_mechanisms(0, true), ["per-offset"]);
-        assert_eq!(attach_mechanisms(2, false), ["per-offset"]);
+        assert!(attach_mechanisms(0, false, false).is_empty());
+        assert_eq!(attach_mechanisms(0, true, false), ["per-offset"]);
+        assert_eq!(attach_mechanisms(2, false, false), ["per-offset"]);
+    }
+
+    #[test]
+    fn attach_mechanism_reports_multi_for_group_links_sorted_with_dynamic() {
+        assert_eq!(attach_mechanisms(2, false, true), ["uprobe-multi"]);
+        assert_eq!(
+            attach_mechanisms(2, true, true),
+            ["per-offset", "uprobe-multi"]
+        );
+        assert_eq!(attach_mechanisms(2, true, false), ["per-offset"]);
     }
 
     #[test]
@@ -8046,6 +8072,7 @@ mod tests {
                 engine,
                 engine.capture_facts(),
                 0,
+                false,
                 false,
                 &[],
                 &[],
@@ -8139,6 +8166,7 @@ mod tests {
                     facts.clone(),
                     0,
                     false,
+                    false,
                     &[],
                     &[],
                     metrics::KernelEvidence::default(),
@@ -8207,6 +8235,7 @@ mod tests {
             facts,
             0,
             false,
+            false,
             &[],
             &[],
             metrics::KernelEvidence::default(),
@@ -8255,6 +8284,7 @@ mod tests {
             &engine,
             engine.capture_facts(),
             0,
+            false,
             false,
             &[],
             &[],

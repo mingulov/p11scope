@@ -2958,7 +2958,7 @@ fn capture_profile(
     // Opened by the caller before the attach; published by `commit()` only
     // once the final report is written.
     let has_output = output.is_some();
-    let mut stdout_sink = crate::sink::SinkWriter::new(std::io::stdout().lock());
+    let mut stdout_sink = crate::sink::SinkWriter::new(std::io::stdout().lock())?;
     let stdout: &mut crate::sink::SinkWriter<std::io::StdoutLock<'static>> = &mut stdout_sink;
     let profile = policy.uses_events();
     let mode = if profile { "profile" } else { "metrics" };
@@ -3403,7 +3403,7 @@ fn capture_trace(
     // attach, then appended to as lines arrive.
     let mut out_sink = out.map(buffered_sink);
     let out_file = &mut out_sink;
-    let mut stdout_sink = crate::sink::SinkWriter::new(std::io::stdout().lock());
+    let mut stdout_sink = crate::sink::SinkWriter::new(std::io::stdout().lock())?;
     let stdout: &mut crate::sink::SinkWriter<std::io::StdoutLock<'static>> = &mut stdout_sink;
 
     let domain = session.events_domain();

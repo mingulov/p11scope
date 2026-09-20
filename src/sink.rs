@@ -43,13 +43,28 @@ pub(crate) struct SinkWriter<W: Write + AsRawFd> {
 }
 
 impl<W: Write + AsRawFd> SinkWriter<W> {
-    pub(crate) fn new(inner: W) -> Self {
-        Self {
+    /// Marks the fd nonblocking, so the poll bound actually binds: a
+    /// blocking write past a poll-ready notification would trickle an
+    /// unbounded stall (E-slow-sink: one flush held the drain thread
+    /// 28.7s and bled 13707 ring records). Regular files and /dev/null
+    /// ignore the flag. Fails closed: without the flag the tick budget
+    /// cannot be honored.
+    pub(crate) fn new(inner: W) -> io::Result<Self> {
+        // SAFETY: fcntl flag reads/writes touch only the fd's own flags.
+        let flags = unsafe { libc::fcntl(inner.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: same fd; OR-ing O_NONBLOCK preserves the other flags.
+        if unsafe { libc::fcntl(inner.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
             inner,
             buf: Vec::with_capacity(SINK_BUFFER_BYTES),
             tick_budget: Duration::ZERO,
             drops: SinkDrops::default(),
-        }
+        })
     }
 
     /// Opens the flush budget for a tick. Every flush of the tick draws
@@ -64,10 +79,29 @@ impl<W: Write + AsRawFd> SinkWriter<W> {
         std::mem::take(&mut self.drops)
     }
 
+    /// Drops the pending buffer with counters: the slow-sink policy's
+    /// explicit shed, never a silent stall.
+    fn drop_pending(&mut self) {
+        self.drops.timeouts = self.drops.timeouts.saturating_add(1);
+        self.drops.dropped_bytes = self
+            .drops
+            .dropped_bytes
+            .saturating_add(self.buf.len() as u64);
+        self.buf.clear();
+        self.tick_budget = Duration::ZERO;
+    }
+
     fn flush_bounded(&mut self) -> io::Result<()> {
         let start = Instant::now();
         while !self.buf.is_empty() {
             let remaining = self.tick_budget.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                // Budget spent: a trickling reader would otherwise keep
+                // re-arming poll(0) on each freed page, stretching this
+                // flush reader-paced instead of budget-paced. Drop.
+                self.drop_pending();
+                break;
+            }
             let mut waiting = libc::pollfd {
                 fd: self.inner.as_raw_fd(),
                 events: libc::POLLOUT,
@@ -85,13 +119,7 @@ impl<W: Write + AsRawFd> SinkWriter<W> {
                 return Err(error);
             }
             if ready == 0 {
-                self.drops.timeouts = self.drops.timeouts.saturating_add(1);
-                self.drops.dropped_bytes = self
-                    .drops
-                    .dropped_bytes
-                    .saturating_add(self.buf.len() as u64);
-                self.buf.clear();
-                self.tick_budget = Duration::ZERO;
+                self.drop_pending();
                 break;
             }
             // Ready, hung up, or errored: attempt the write and propagate
@@ -155,7 +183,7 @@ mod tests {
     #[test]
     fn flush_delivers_bytes_to_a_live_reader() {
         let (writer, mut reader) = pair();
-        let mut sink = SinkWriter::new(writer);
+        let mut sink = SinkWriter::new(writer).unwrap();
         sink.begin_tick(Duration::from_millis(250));
 
         sink.write_all(b"LOST 3 events\n").unwrap();
@@ -179,7 +207,7 @@ mod tests {
         filler.set_nonblocking(true).unwrap();
         let chunk = vec![7u8; 65536];
         while filler.write(&chunk).is_ok() {}
-        let mut sink = SinkWriter::new(writer);
+        let mut sink = SinkWriter::new(writer).unwrap();
         sink.begin_tick(Duration::ZERO);
 
         sink.write_all(b"stalled frame\n").unwrap();
@@ -196,7 +224,7 @@ mod tests {
     fn writes_past_the_cap_flush_through_a_live_reader() {
         let (writer, mut reader) = pair();
         reader.set_nonblocking(true).unwrap();
-        let mut sink = SinkWriter::new(writer);
+        let mut sink = SinkWriter::new(writer).unwrap();
         sink.begin_tick(Duration::from_secs(30));
 
         let chunk = vec![9u8; SINK_BUFFER_BYTES * 3];
@@ -222,10 +250,89 @@ mod tests {
     }
 
     #[test]
+    fn partial_space_does_not_block_past_the_budget() {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        // A pipe, like the slow-pipe sink: POLLOUT fires on ANY free
+        // space (unix sockets wait for a substantially drained buffer,
+        // which would only re-test the timeout path). Fill it, free a
+        // single trickle, then flush a full buffer against a reader
+        // that only trickles: every freed byte re-arms poll and a
+        // blocking write trickles the whole buffer. The bounded flush
+        // must time out and drop instead (E-slow-sink: trickle-flushes
+        // stalled 28.7s past the budget and bled 13707 ring records).
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: `pipe` succeeded, so both fds are open and owned here.
+        let mut reader = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        // SAFETY: same pipe; the write end is open and owned here.
+        let mut writer = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        set_blocking(writer.as_raw_fd(), false);
+        let chunk = vec![7u8; 65536];
+        while writer.write(&chunk).is_ok() {}
+        set_blocking(writer.as_raw_fd(), true);
+        // Free a whole page: pipes gate POLLOUT on page slots, not
+        // bytes, so poll fires and a blocking write proceeds into the
+        // trickle instead of timing out up front.
+        let mut trickle = vec![0u8; 4096];
+        reader.read_exact(&mut trickle).unwrap();
+        // A continuously trickling reader, like the 4 KB/s slow-pipe:
+        // every freed byte re-arms poll, so a bound-defying flush
+        // trickles the whole buffer instead of timing out.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_reader = stop.clone();
+        let reader_thread = std::thread::spawn(move || {
+            use std::os::fd::AsRawFd as _;
+            set_blocking(reader.as_raw_fd(), false);
+            let mut buf = vec![0u8; 100];
+            while !stop_reader.load(std::sync::atomic::Ordering::Relaxed) {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => std::thread::sleep(Duration::from_millis(10)),
+                    Err(_) => std::thread::sleep(Duration::from_millis(1)),
+                }
+            }
+        });
+
+        let mut sink = SinkWriter::new(writer).unwrap();
+        sink.begin_tick(Duration::from_millis(20));
+        sink.write_all(&vec![8u8; SINK_BUFFER_BYTES]).unwrap();
+        let start = Instant::now();
+        sink.flush().unwrap();
+        let elapsed = start.elapsed();
+        let drops = sink.take_drops();
+        drop(sink);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        reader_thread.join().unwrap();
+
+        assert_eq!(
+            drops.timeouts, 1,
+            "flush waited out the stall instead of dropping"
+        );
+        assert!(drops.dropped_bytes > 0, "stall dropped no bytes");
+        assert!(
+            elapsed < Duration::from_millis(150),
+            "flush blocked {elapsed:?} past its 20ms budget"
+        );
+    }
+
+    #[cfg(test)]
+    fn set_blocking(fd: std::os::fd::RawFd, blocking: bool) {
+        // SAFETY: fd is an open pipe end owned by the test.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(flags >= 0);
+        let flags = if blocking {
+            flags & !libc::O_NONBLOCK
+        } else {
+            flags | libc::O_NONBLOCK
+        };
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFL, flags) }, 0);
+    }
+
+    #[test]
     fn broken_pipe_is_an_error_not_a_drop() {
         let (writer, reader) = pair();
         drop(reader);
-        let mut sink = SinkWriter::new(writer);
+        let mut sink = SinkWriter::new(writer).unwrap();
         sink.begin_tick(Duration::from_millis(250));
 
         sink.write_all(b"no one listens\n").unwrap();

@@ -276,14 +276,24 @@ def parse_trace_stream(lines):
     }
 
 
-def trace_counts_match(scope, truth, stats_returned):
+def trace_counts_match(scope, truth, stats_returned, *, owned_admitted=True,
+                       owned_note=""):
     """Window-validity rule for trace: kernel aggregate totals.
 
     Trace lines are delivered (lossy), so per-name line matching cannot
     validate the window; the ring-independent aggregate total can: exact
-    equality per-PID (no foreign calls), coverage on --system.
+    equality per-PID (no foreign calls), coverage on --system. On system
+    scope the aggregate cannot attribute calls to the owned workload, so
+    coverage additionally requires the owned module to be admitted (audit
+    F2): a refused owned workload is never satisfied by foreign totals.
     """
     truth_total = sum(truth.values())
+    if scope != "pid" and not owned_admitted:
+        note = ("trace system: owned workload module not admitted; kernel "
+                f"aggregate total ({stats_returned}) cannot prove owned "
+                f"coverage of truth ({truth_total})"
+                + ("" if not owned_note else f" ({owned_note})"))
+        return False, note
     if scope == "pid":
         match = stats_returned == truth_total
         note = ("trace pid: kernel aggregate total must equal workload "
@@ -506,17 +516,22 @@ def cancel_probe_verdict(t0_ns, t_marker_ns):
 
 
 def assess_window(*, gate, scope, counts_match, collapsed,
-                  attached_probes, trace_crosscheck):
+                  attached_probes, trace_crosscheck, coverage_detail=None):
     """Post-hoc window validity, decisive for weak (non-frame) gates.
 
     The frame gate is an in-observer attach-end signal; marker+settle
     gates are not, so they stand or fall on post-hoc evidence. The
     aggregate counts are ring-independent, which makes counts_match a
-    window proof rather than a loss statement.
+    window proof rather than a loss statement. `coverage_detail`, when
+    given, names the exact coverage failure (e.g. unattributable owned
+    traffic) instead of the generic missed-window text.
     """
     problems = []
     if not counts_match:
-        problems.append("counts_match=False (window missed workload calls)")
+        if coverage_detail is None:
+            problems.append("counts_match=False (window missed workload calls)")
+        else:
+            problems.append(f"counts_match=False ({coverage_detail})")
     if collapsed:
         problems.append("COLLAPSED WINDOW (setup exceeded the duration)")
     if attached_probes <= 0:
@@ -559,6 +574,80 @@ def aggregate_functions(report):
     return observed
 
 
+def owned_module_candidates(meta):
+    """Argv entries that may name the owned workload provider module.
+
+    The harness runs the workload as [workload, MODULE, N, PACE, MAP_EARLY],
+    so argv[1] is the owned module; a single-entry argv (synthetic inputs)
+    names it directly.
+    """
+    argv = (meta.get("condition", {}).get("workload_argv") or [])
+    if len(argv) > 1:
+        return [str(argv[1])]
+    return [str(entry) for entry in argv]
+
+
+def _module_identity(ref):
+    """(dev, ino, sha256) identity of a module ref, or None when absent.
+
+    Real reports carry dev/ino/sha256 on both functions[].module and
+    evidence.discovery[]; synthetic inputs may carry a bare path instead.
+    """
+    if not isinstance(ref, dict):
+        return None
+    if "ino" not in ref or "dev" not in ref:
+        return None
+    dev = ref["dev"]
+    if isinstance(dev, (list, tuple)):
+        dev = tuple(dev)
+    return (dev, ref.get("ino"), ref.get("sha256"))
+
+
+def assess_owned_coverage(functions, discovery, refused, owned_paths):
+    """Owned-workload attribution for system-scope coverage (audit F2).
+
+    Scan-only system captures name every slot `unknown`, so unknown-name
+    totals cannot tell owned workload calls from foreign traffic: coverage
+    must come from calls attributed to the owned workload module, never
+    from global sums. Returns {"owned_admitted", "owned_calls",
+    "total_calls", "note"}.
+    """
+    discovery = discovery or []
+    refused_paths = {str(row.get("path")) for row in (refused or [])
+                     if isinstance(row, dict) and row.get("path")}
+    owned_entries = [entry for entry in discovery
+                     if isinstance(entry, dict)
+                     and str(entry.get("path")) in owned_paths]
+    owned_identities = {_module_identity(entry) for entry in owned_entries}
+    owned_identities.discard(None)
+    owned_refused = [path for path in owned_paths if path in refused_paths]
+    owned_admitted = bool(owned_entries) and not owned_refused
+    owned_calls = 0
+    total_calls = 0
+    for entry in functions or []:
+        calls = int(entry.get("calls", 0))
+        total_calls += calls
+        ref = entry.get("module")
+        if _module_identity(ref) is not None:
+            if _module_identity(ref) in owned_identities:
+                owned_calls += calls
+        elif isinstance(ref, dict) and str(ref.get("path")) in owned_paths:
+            owned_calls += calls
+    if not owned_entries:
+        admitted = sorted(str(entry.get("path")) for entry in discovery
+                          if isinstance(entry, dict)) or ["none"]
+        note = (f"owned workload module {owned_paths} not admitted "
+                f"(admitted: {admitted}"
+                + ("" if not refused_paths else
+                   f"; refused: {sorted(refused_paths)}") + ")")
+    elif owned_refused:
+        note = (f"owned workload module {owned_refused} refused; "
+                "unknown-name totals cannot prove owned coverage")
+    else:
+        note = (f"owned-attributed {owned_calls} of {total_calls} observed "
+                f"calls (module {owned_paths})")
+    return {"owned_admitted": owned_admitted, "owned_calls": owned_calls,
+            "total_calls": total_calls, "note": note}
 def derive_phases(samples, stderr_rows, duration_s, t_spawn_ns, t_exit_ns,
                   t_go_ns=None):
     """Split wall time into phases from external traces.
@@ -904,10 +993,21 @@ def main(argv):
 
     kernel_observed = None
     crosscheck_holds, crosscheck_detail = True, "n/a (not a trace run)"
+    window_coverage_detail = None
+    # System-scope coverage requires owned attribution (audit F2): the
+    # owned workload module resolves via workload_argv against admitted
+    # discovery. Trace streams carry no functions[]; the admission half
+    # of this assessment still applies to them.
+    owned = assess_owned_coverage(
+        report.get("functions", []), evidence.get("discovery", []),
+        refused, owned_module_candidates(meta))
     if is_trace:
         kernel_observed = int(stream["count_evidence"]["stats_returned"])
         counts_match, match_note = trace_counts_match(
-            scope, truth, kernel_observed)
+            scope, truth, kernel_observed,
+            owned_admitted=owned["owned_admitted"], owned_note=owned["note"])
+        if scope != "pid" and not counts_match:
+            window_coverage_detail = match_note
         crosscheck_holds, crosscheck_detail = trace_crosscheck(
             lost_total=stream["lost_total"],
             event_loss=int(evidence.get("event_loss", 0)),
@@ -928,15 +1028,30 @@ def main(argv):
         if set(observed) <= {"unknown"}:
             # System runs are scan-only: since the 1.3 mislabel guard,
             # unlinked heuristic tables carry no ordinal labels, so
-            # per-function matching is impossible and coverage is compared
-            # on totals (foreign processes may still add calls).
+            # per-name matching is impossible. Unknown-name totals cannot
+            # tell owned workload calls from foreign traffic, so coverage
+            # requires owned-module attribution (audit F2): foreign-only
+            # sums never satisfy the assertion, even when they are large.
             truth_total = sum(truth.values())
-            observed_total = sum(observed.values())
-            counts_match = observed_total >= truth_total
-            match_note = (
-                "system scan-only: names unavailable (unknown); "
-                f"total coverage {observed_total} >= {truth_total}"
-            )
+            if not owned["owned_admitted"]:
+                counts_match = False
+                match_note = ("system scan-only: names unavailable "
+                              f"(unknown); {owned['note']}; total coverage "
+                              "unprovable")
+            else:
+                counts_match = owned["owned_calls"] >= truth_total
+                match_note = (
+                    "system scan-only: names unavailable (unknown); "
+                    "owned-attributed coverage "
+                    f"{owned['owned_calls']} vs truth {truth_total} "
+                    f"({owned['note']})"
+                )
+            window_coverage_detail = match_note
+        elif not owned["owned_admitted"]:
+            counts_match = False
+            match_note = ("system scope: named coverage requires the owned "
+                          f"workload module; {owned['note']}")
+            window_coverage_detail = match_note
         else:
             counts_match = all(observed.get(k, 0) >= v for k, v in truth.items())
             match_note = ("system scope: observed must cover workload truth "
@@ -993,7 +1108,8 @@ def main(argv):
         gate=meta["condition"].get("gate", "frame"), scope=scope,
         counts_match=counts_match, collapsed=collapsed,
         attached_probes=attached_probes,
-        trace_crosscheck=crosscheck_holds)
+        trace_crosscheck=crosscheck_holds,
+        coverage_detail=window_coverage_detail)
 
     # Task 3.1 repair: scheduling consistency + which-bound-broke
     # attribution + the cancel control-latency probe. A missing scheduling
@@ -1149,8 +1265,10 @@ def main(argv):
             "Observer CPU/RSS are wall-window samples; noisy under concurrent "
             "build load (sibling workers) — see the design note.",
             "counts_match for pid scope requires exact per-name equality; "
-            "for system scope (scan-only, unknown names) it requires "
-            "observed total >= truth total.",
+            "for system scope it requires the owned workload module to be "
+            "admitted, and for scan-only (unknown names) owned-attributed "
+            "calls must cover truth (foreign/unknown totals alone never "
+            "satisfy coverage).",
         ],
     }
     Path(args.out).write_text(json.dumps(record, indent=2) + "\n",

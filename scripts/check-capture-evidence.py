@@ -106,7 +106,8 @@ SCHEDULING_U64_KEYS = (
 SCHEDULING_KEYS = set(SCHEDULING_U64_KEYS) | {
     "terminal_drain_truncated", "sink_policy", "phase_ms",
 }
-SCHEDULING_PHASE_KEYS = ("discovery", "drain", "maps", "render", "detach")
+SCHEDULING_PHASE_KEYS = ("discovery", "discovery_terminal", "drain",
+                           "maps", "render", "detach")
 PAUSE_VALUES = ("none", "sigstop", "partial")
 PAUSE_COUNTERS = ("pause_attempts", "pause_confirmed", "pause_partial")
 DISCOVERY_LOSS_COUNTERS = (
@@ -3774,6 +3775,8 @@ def self_test():
         lambda d: d["evidence"]["scheduling"]["phase_ms"].pop("detach"),
         lambda d: d["evidence"]["scheduling"]["phase_ms"].update(
             discovery="fast"),
+        lambda d: d["evidence"]["scheduling"]["phase_ms"].update(
+            discovery_terminal="slow"),
         lambda d: d["evidence"]["scheduling"].update(extra_key=1),
         # Split identities: the shares must sum to the published counters.
         lambda d: d["evidence"]["scheduling"].update(detach_event_loss=5),

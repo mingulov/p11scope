@@ -336,8 +336,8 @@ def scheduling_fixture(**overrides):
         "sink_timeouts": 0,
         "sink_dropped_bytes": 0,
         "phase_ms": {
-            "discovery": 0, "drain": 0, "maps": 0, "render": 0,
-            "detach": 0,
+            "discovery": 0, "discovery_terminal": 0, "drain": 0,
+            "maps": 0, "render": 0, "detach": 0,
         },
         "max_inter_drain_gap_ms": 0,
     }

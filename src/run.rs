@@ -3224,6 +3224,9 @@ fn capture_profile(
                     consumers
                         .scheduling
                         .add_phase(SchedulingPhase::Discovery, phase_start.elapsed());
+                    consumers
+                        .scheduling
+                        .add_phase(SchedulingPhase::DiscoveryTerminal, phase_start.elapsed());
                     Ok((plan_changed, context.0.plan()))
                 },
                 |context, consumers| {
@@ -3644,6 +3647,9 @@ fn capture_trace(
                     consumers
                         .scheduling
                         .add_phase(SchedulingPhase::Discovery, phase_start.elapsed());
+                    consumers
+                        .scheduling
+                        .add_phase(SchedulingPhase::DiscoveryTerminal, phase_start.elapsed());
                     Ok((plan_changed, context.0.plan()))
                 },
                 |context, consumers| {
@@ -3998,6 +4004,7 @@ fn poll_ready(
 
 pub(crate) enum SchedulingPhase {
     Discovery,
+    DiscoveryTerminal,
     Drain,
     Maps,
     Render,
@@ -4013,8 +4020,10 @@ pub(crate) struct SchedulingAccumulator {
     drain_budget_exhaustions: u64,
     last_backlog: bool,
     last_drain_end: Option<Instant>,
+    loop_ended: bool,
     max_inter_drain_gap_ms: u64,
     phase_discovery_ms: u64,
+    phase_discovery_terminal_ms: u64,
     phase_drain_ms: u64,
     phase_maps_ms: u64,
     phase_render_ms: u64,
@@ -4050,6 +4059,9 @@ impl SchedulingAccumulator {
     }
 
     pub(crate) fn note_drain_at(&mut self, now: Instant) {
+        if self.loop_ended {
+            return;
+        }
         if let Some(last) = self.last_drain_end {
             let gap_ms = now.saturating_duration_since(last).as_millis();
             self.max_inter_drain_gap_ms = self
@@ -4063,6 +4075,7 @@ impl SchedulingAccumulator {
         let ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
         let slot = match phase {
             SchedulingPhase::Discovery => &mut self.phase_discovery_ms,
+            SchedulingPhase::DiscoveryTerminal => &mut self.phase_discovery_terminal_ms,
             SchedulingPhase::Drain => &mut self.phase_drain_ms,
             SchedulingPhase::Maps => &mut self.phase_maps_ms,
             SchedulingPhase::Render => &mut self.phase_render_ms,
@@ -4074,6 +4087,7 @@ impl SchedulingAccumulator {
     pub(crate) fn note_loop_end(&mut self, event_loss: u64, discovery_loss: u64) {
         self.capture_event_loss = event_loss;
         self.capture_discovery_loss = discovery_loss;
+        self.loop_ended = true;
     }
 
     pub(crate) fn note_terminal(&mut self, event_loss: u64, discovery_loss: u64) {
@@ -4101,6 +4115,7 @@ impl SchedulingAccumulator {
             sink_dropped_bytes: self.sink_dropped_bytes,
             phase_ms: render::SchedulingPhaseMs {
                 discovery: self.phase_discovery_ms,
+                discovery_terminal: self.phase_discovery_terminal_ms,
                 drain: self.phase_drain_ms,
                 maps: self.phase_maps_ms,
                 render: self.phase_render_ms,
@@ -6681,11 +6696,11 @@ mod tests {
         acc.add_phase(SchedulingPhase::Discovery, Duration::from_millis(7));
         acc.add_phase(SchedulingPhase::Drain, Duration::from_millis(3));
         acc.add_phase(SchedulingPhase::Detach, Duration::from_secs(61));
-        acc.note_loop_end(10, 3);
-        acc.note_terminal(14, 3);
         let before = Instant::now();
         acc.note_drain_at(before);
         acc.note_drain_at(before + Duration::from_millis(40));
+        acc.note_loop_end(10, 3);
+        acc.note_terminal(14, 3);
 
         let ev = acc.snapshot(65536);
 
@@ -6702,6 +6717,47 @@ mod tests {
         assert_eq!(ev.phase_ms.drain, 3);
         assert_eq!(ev.phase_ms.detach, 61_000);
         assert_eq!(ev.max_inter_drain_gap_ms, 40);
+    }
+
+    /// The inter-drain gap is a capture-loop quantity: drains after
+    /// loop end (the undrained detach window, then the terminal drain)
+    /// must not extend it — the detach window is separately counted
+    /// (split) and timed (detach phase), and mixing it into the gap
+    /// misleads the E-system-tick acceptance (57 s of detach reads as
+    /// a 57 s drain stall).
+    #[test]
+    fn inter_drain_gap_freezes_at_loop_end() {
+        let mut acc = SchedulingAccumulator::default();
+        let before = Instant::now();
+        acc.note_drain_at(before);
+        acc.note_drain_at(before + Duration::from_millis(40));
+        acc.note_loop_end(0, 0);
+        acc.note_drain_at(before + Duration::from_secs(60));
+
+        let ev = acc.snapshot(65536);
+
+        assert_eq!(ev.max_inter_drain_gap_ms, 40);
+    }
+
+    /// Terminal discovery work meters separately from tick discovery:
+    /// the post-detach terminal drain can dominate the cumulative
+    /// timer on system runs, hiding the per-frame tick slice the
+    /// G-discovery-tick-slice confirmation needs. The cumulative
+    /// Discovery timer keeps counting both (no semantic break).
+    #[test]
+    fn terminal_discovery_meters_separately_from_tick_discovery() {
+        let mut acc = SchedulingAccumulator::default();
+        acc.add_phase(SchedulingPhase::Discovery, Duration::from_millis(7));
+        acc.add_phase(
+            SchedulingPhase::DiscoveryTerminal,
+            Duration::from_millis(50),
+        );
+        acc.add_phase(SchedulingPhase::Discovery, Duration::from_millis(50));
+
+        let ev = acc.snapshot(65536);
+
+        assert_eq!(ev.phase_ms.discovery, 57);
+        assert_eq!(ev.phase_ms.discovery_terminal, 50);
     }
 
     /// A terminal drain that stops at its bound reports truncation into

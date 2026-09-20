@@ -557,10 +557,14 @@ pub const SINK_POLICY_BOUNDED_WAIT_DROP: &str = "bounded-wait-drop";
 
 /// In-observer per-phase wall time in milliseconds, cumulative over the
 /// capture. Discovery is measured directly here (Task 3.1 G-discovery-
-/// tick-slice), not as a residual of totals.
+/// tick-slice), not as a residual of totals; `discovery` covers every
+/// discovery drain (tick + terminal), while `discovery_terminal` covers
+/// only the post-detach terminal drain, so the per-frame tick slice is
+/// `discovery - discovery_terminal`.
 #[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
 pub struct SchedulingPhaseMs {
     pub discovery: u64,
+    pub discovery_terminal: u64,
     pub drain: u64,
     pub maps: u64,
     pub render: u64,
@@ -601,7 +605,10 @@ pub struct SchedulingEvidence {
     pub sink_dropped_bytes: u64,
     /// Cumulative per-phase wall time.
     pub phase_ms: SchedulingPhaseMs,
-    /// Largest observed gap between consecutive event drains.
+    /// Largest gap between consecutive event drains during the capture
+    /// loop. The undrained detach window and terminal drain never extend
+    /// it (frozen at loop end): the detach window is separately counted
+    /// (capture/detach split) and timed (detach phase).
     pub max_inter_drain_gap_ms: u64,
 }
 

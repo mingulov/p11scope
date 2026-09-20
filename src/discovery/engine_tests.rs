@@ -18353,3 +18353,67 @@ fn two_views_share_one_per_object_cap_preserving_pins_and_interfaces() {
         );
     }
 }
+
+// Audit F5/F7 spill-then-settle publication pair: five distinct one-target
+// heuristic tables, four admitted under K=4, one omitted; the second
+// publication corroborates the fifth table with a live return and rebuilds
+// through the same stable-ID extension path the engine uses.
+fn spill_history_engine() -> (Engine, ScannedModule) {
+    let mut raw = p11kit_like_64_table_module();
+    raw.tables.truncate(5);
+    for table in &mut raw.tables {
+        table.entries.truncate(1);
+    }
+    raw.interfaces.clear();
+    let mut engine = Engine::empty();
+    engine.pinned = overlay_pins(&[(raw.key, OVERLAY_SHA, 1)]);
+    let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&raw), &mut engine.pinned);
+    assert!(skipped.is_empty());
+    engine.plan = plan::build_from_reconciled_modules(&modules);
+    engine.modules = modules;
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    engine.publish_current_capture_facts().unwrap();
+    (engine, raw)
+}
+
+fn publish_fifth_table_live(engine: &mut Engine, mut raw: ScannedModule) {
+    raw.tables[4].live_return = true;
+    let (modules, skipped) = bind_scanned_modules(&[raw], &mut engine.pinned);
+    assert!(skipped.is_empty());
+    let mut rebuilt = plan::build_from_reconciled_modules(&modules);
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut rebuilt, &modules, &[], &engine.pinned)
+        .unwrap();
+    engine
+        .plan
+        .extend_exact_with_stable_module_ids(rebuilt)
+        .unwrap();
+    engine.modules = modules;
+    engine.publish_current_capture_facts().unwrap();
+}
+
+/// Audit F5: published spill evidence is capture-lifetime, the plan counter
+/// stays current-state. The fifth table spills past K=4, then a live return
+/// bypasses it and the rebuild settles: the plan resolves to 0 while the
+/// published evidence still reports the earlier omission.
+#[test]
+fn spill_history_retains_earlier_omission_after_live_merge() {
+    let (mut engine, raw) = spill_history_engine();
+    assert_eq!(engine.plan.uncorroborated_candidates, 1);
+    assert_eq!(engine.discovery.uncorroborated_candidates, 1);
+    assert_eq!(engine.plan.slots.len(), 4);
+    publish_fifth_table_live(&mut engine, raw);
+    assert_eq!(engine.plan.slots.len(), 5);
+    assert_eq!(
+        engine.plan.uncorroborated_candidates, 0,
+        "the live merge resolves the current-inventory spill"
+    );
+    assert_eq!(
+        engine.discovery.uncorroborated_candidates, 1,
+        "earlier omitted table disappeared from lifetime evidence"
+    );
+}

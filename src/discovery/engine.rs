@@ -334,6 +334,13 @@ struct CaptureHistory {
     /// base above never counted, so it is additive and permanent — mixing it
     /// into the base would let another module's re-derivation subtract it away.
     uncorroborated_tombstones: u64,
+    /// The high-water mark of `plan.uncorroborated_candidates`. The plan's
+    /// counter is current-state — a live merge that bypasses a spilled table
+    /// resolves it — but omission exposure is capture-lifetime evidence: a
+    /// run that spilled and then settled must still report the earlier
+    /// omission, so every merge latches the maximum and `discovery`
+    /// publishes it. Nothing here ever decreases.
+    uncorroborated_candidates: u64,
     scan_unavailable: Option<String>,
     scan_ms: u64,
     vendor_interfaces: usize,
@@ -1779,13 +1786,18 @@ impl CaptureFacts {
                 history.fallbacks.entry(key).or_insert(fallback);
             }
         }
-        // Both stay pure high-water marks of what the plan reports. What the
-        // capture-end re-derivation adds or removes is held in
+        // All three stay pure high-water marks of what the plan reports.
+        // What the capture-end re-derivation adds or removes is held in
         // `recorroborated`, and `discovery` combines the two once — a latch
         // that could drop below `current` would let one module's re-derivation
-        // absorb another module's tombstone gap.
+        // absorb another module's tombstone gap. The spill latch below is the
+        // separately-kept history `plan.rs` promises: the plan's counter
+        // resolves on a live merge, this one never does.
         history.conflicts = history.conflicts.max(current.conflicts);
         history.uncorroborated = history.uncorroborated.max(current.uncorroborated);
+        history.uncorroborated_candidates = history
+            .uncorroborated_candidates
+            .max(plan.uncorroborated_candidates);
         history.scan_unavailable = history.scan_unavailable.take().or(current.scan_unavailable);
         history.scan_ms = history.scan_ms.max(current.scan_ms);
         history.vendor_interfaces = history.vendor_interfaces.max(plan.vendor_interfaces);
@@ -1854,7 +1866,12 @@ impl CaptureFacts {
                 .saturating_sub(derived_corroborated)
                 .saturating_add(history.uncorroborated_tombstones),
             module_ambiguous: plan.module_ambiguous as u64,
-            uncorroborated_candidates: plan.uncorroborated_candidates,
+            // Lifetime spill exposure: the latched maximum, never below the
+            // current plan — projection paths that skip a merge (restore,
+            // invalidation) must not hide what the engine holds right now.
+            uncorroborated_candidates: history
+                .uncorroborated_candidates
+                .max(plan.uncorroborated_candidates),
             modules_skipped: history.refusals.values().map(skipped_out).collect(),
             manifest_object_fallbacks: history.fallbacks.values().cloned().collect(),
             scan_unavailable: history.scan_unavailable.clone(),

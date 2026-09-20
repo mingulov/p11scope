@@ -271,7 +271,10 @@ pub struct DiscoveryEvidence {
     /// Heuristic tables decoded but not admitted: past the per-object
     /// evidence-ordered cap or past the remaining global budget. Informational
     /// — spilling lookalikes is correct admission, not a coverage gap — so it
-    /// does not affect `completeness` on its own.
+    /// does not affect `completeness` on its own. Capture-lifetime evidence:
+    /// the high-water mark across publications, so a spill a later live merge
+    /// resolves stays reported (the plan's own counter is the current-state
+    /// one that resolves).
     #[serde(rename = "discovery_uncorroborated_candidates")]
     pub uncorroborated_candidates: u64,
     /// Attach slots two modules both publish: counted, never attributed.

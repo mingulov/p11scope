@@ -2742,7 +2742,11 @@ fn capture_end(
 /// Idle readiness re-poll: with no backlog and no frame due, the loop
 /// re-polls this often instead of idling out the frame, so the
 /// inter-drain gap stays far under the ring capacity at envelope rates.
-pub(crate) const READY_IDLE_POLL: Duration = Duration::from_millis(10);
+/// Derived: one sleep at the fastest measured unpaced burst (A2b,
+/// 127648/s) must fit inside the default 780-record ring —
+/// 2 ms admits 256 records (3x margin). At 10 ms the E-burst point
+/// lost 7813 (drain ceiling 78k/s < 117k/s burst).
+pub(crate) const READY_IDLE_POLL: Duration = Duration::from_millis(2);
 
 /// Discovery frames between forced full inventory sweeps: shallow frames
 /// skip a quiet sweep, and every Nth frame sweeps regardless, bounding
@@ -6732,12 +6736,28 @@ mod tests {
             READY_IDLE_POLL
         );
         assert_eq!(
-            ready_sleep_duration(false, false, Duration::from_millis(5)),
-            Duration::from_millis(5)
+            ready_sleep_duration(false, false, Duration::from_millis(1)),
+            Duration::from_millis(1)
         );
         assert_eq!(
             ready_sleep_duration(true, false, frame_due_in),
             Duration::from_millis(1)
+        );
+    }
+
+    /// The idle poll absorbs the fastest envelope burst: at A2b's
+    /// measured 127648/s, one full idle sleep must fit inside the
+    /// default 780-record ring, so an unpaced burst landing mid-sleep
+    /// loses nothing before the next drain (E-burst → 0).
+    #[test]
+    fn ready_idle_poll_absorbs_fastest_envelope_burst() {
+        const FASTEST_BURST_PER_S: u128 = 128_000;
+        const DEFAULT_RING_CAPACITY: u128 = 780;
+        let worst_case = READY_IDLE_POLL.as_millis() * FASTEST_BURST_PER_S / 1000;
+        assert!(
+            worst_case < DEFAULT_RING_CAPACITY,
+            "idle sleep admits {worst_case} records at {FASTEST_BURST_PER_S}/s, \
+             over the {DEFAULT_RING_CAPACITY}-record ring"
         );
     }
 

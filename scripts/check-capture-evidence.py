@@ -270,10 +270,23 @@ MAX_SLOTS = 512
 # targets). The K=4 per-object heuristic cap admits 4 tables (any 4 share
 # exactly the 2 family targets: 4*102+2 = 410 distinct, 0 nulls); the other
 # 60 spill as `discovery_uncorroborated_candidates` — evidence, never slots.
+#
+# Admitted p11-kit template families (audit F8): the 3.x (version, entries)
+# combinations the version matrix declares — 92-entry 3.0/3.1, 104-entry
+# 3.2 — each with the distinct targets K=4 admits from 4 tables sharing the
+# 2 family targets (4*(entries-2)+2). The lane qualifies whichever build is
+# installed instead of pinning one provider version; every table in one
+# capture must still share exactly one shape.
+ADMITTED_PROXY_TABLE_SHAPES = {
+    (3, 0): {"entries": 92, "admitted_slots": 362},
+    (3, 1): {"entries": 92, "admitted_slots": 362},
+    (3, 2): {"entries": 104, "admitted_slots": 410},
+}
 PROXY_TABLES = 64
-PROXY_TABLE_ENTRIES = 104
+# The installed build's shape, which the self-test fixture pins exactly.
+PROXY_TABLE_ENTRIES = ADMITTED_PROXY_TABLE_SHAPES[(3, 2)]["entries"]
 PROXY_ADMITTED_TABLES = 4
-PROXY_ADMITTED_SLOTS = 410
+PROXY_ADMITTED_SLOTS = ADMITTED_PROXY_TABLE_SHAPES[(3, 2)]["admitted_slots"]
 PROXY_SPILL = PROXY_TABLES - PROXY_ADMITTED_TABLES
 PROXY_DECODED_ENTRIES = PROXY_TABLES * PROXY_TABLE_ENTRIES
 
@@ -1395,15 +1408,17 @@ def validate_proxy_capacity_fallback(document, module_path=None):
     """The exact p11-kit-bounded/SoftHSM2-attached live shape.
 
     This is the p11-kit proxy lane's *expected* outcome, not a fallback. The
-    installed libp11-kit maps 64 static 3.2 closure templates (104 entries
-    each, 6530 distinct targets) into the scanned image. Since Task 1.2 the
-    K=4 per-object heuristic cap admits 4 tables (410 distinct targets) and
-    records the other 60 as `discovery_uncorroborated_candidates` — spill is
-    evidence, never slots — so the proxy module is NOT refused whole: both
-    providers attach (478 slots), nothing is skipped, and every slot is
-    scan-only `unknown` (1.3 mislabel guard). `module_path`, when the caller
-    controls it, pins the directly-attached SoftHSM2 module by the exact path
-    the lane configured rather than by a substring.
+    installed libp11-kit maps 64 static 3.x closure templates into the
+    scanned image — one of ADMITTED_PROXY_TABLE_SHAPES, e.g. 3.2/104-entry
+    (6530 distinct targets) on the lane host. Since Task 1.2 the K=4
+    per-object heuristic cap admits 4 tables (410 distinct targets at
+    3.2/104) and records the other 60 as
+    `discovery_uncorroborated_candidates` — spill is evidence, never slots
+    — so the proxy module is NOT refused whole: both providers attach (478
+    slots at 3.2/104), nothing is skipped, and every slot is scan-only
+    `unknown` (1.3 mislabel guard). `module_path`, when the caller controls
+    it, pins the directly-attached SoftHSM2 module by the exact path the
+    lane configured rather than by a substring.
     """
     exact_metrics_schema(document)
     exact_capture_modules(document)
@@ -1472,20 +1487,32 @@ def validate_proxy_capacity_fallback(document, module_path=None):
     proxy_tables = by_path[proxy["path"]]["tables"]
     require(len(proxy_tables) == PROXY_TABLES, len(proxy_tables))
     offsets = set()
+    shape = None
     for table in proxy_tables:
+        version = table["version"]
         require(
-            {key: table[key] for key in ("version", "entries", "source")}
-            == {
-                "version": [3, 2],
-                "entries": PROXY_TABLE_ENTRIES,
-                "source": "scan",
-            },
+            isinstance(version, list)
+            and len(version) == 2
+            and all(isinstance(value, int) for value in version),
+            f"proxy table version is not a [major, minor] pair: {table}",
+        )
+        key = tuple(version)
+        require(
+            key in ADMITTED_PROXY_TABLE_SHAPES
+            and table["entries"] == ADMITTED_PROXY_TABLE_SHAPES[key]["entries"]
+            and table["source"] == "scan",
             table,
         )
+        if shape is None:
+            shape = key
+        require(key == shape, f"proxy tables mix provider builds: {shape} vs {key}")
         require(table["linkage"] == "heuristic", table)
         require(u64(table["file_offset"]), table)
         offsets.add(table["file_offset"])
     require(len(offsets) == PROXY_TABLES, "proxy tables share a file offset")
+    admitted = ADMITTED_PROXY_TABLE_SHAPES[shape]
+    table_entries = admitted["entries"]
+    admitted_slots = admitted["admitted_slots"]
     # K=4 spill: 64 decoded, 4 admitted, 60 recorded as candidates.
     require(
         evidence["discovery_uncorroborated_candidates"] == PROXY_SPILL,
@@ -1511,17 +1538,18 @@ def validate_proxy_capacity_fallback(document, module_path=None):
         f"unexpected SoftHSM2 surfaces: {dict(soft_surfaces)}",
     )
     require(
-        proxy_surfaces == Counter({("full", PROXY_TABLE_ENTRIES): PROXY_TABLES}),
+        proxy_surfaces == Counter({("full", table_entries): PROXY_TABLES}),
         f"unexpected proxy surfaces: {dict(proxy_surfaces)}",
     )
-    # One slot per {object, offset} and two probes per slot. The 410 proxy
-    # slots are the distinct targets across 4 admitted tables of the installed
-    # build (4*102+2: ordinals 65/66 shared, byte-verified, 0 nulls); a target
-    # both providers publish is attached exactly once.
+    # One slot per {object, offset} and two probes per slot. The admitted
+    # proxy slots are the distinct targets across 4 admitted tables of the
+    # observed shape (410 at 3.2/104: 4*102+2, ordinals 65/66 shared,
+    # byte-verified, 0 nulls); a target both providers publish is attached
+    # exactly once.
     for name, wanted in (
-        ("table_entries", 68 + PROXY_DECODED_ENTRIES),
-        ("slots", 68 + PROXY_ADMITTED_SLOTS),
-        ("attached_probes", 2 * (68 + PROXY_ADMITTED_SLOTS)),
+        ("table_entries", 68 + PROXY_TABLES * table_entries),
+        ("slots", 68 + admitted_slots),
+        ("attached_probes", 2 * (68 + admitted_slots)),
         ("vendor_interfaces", 0),
         ("interface_list", "absent"),
     ):
@@ -1544,7 +1572,7 @@ def validate_proxy_capacity_fallback(document, module_path=None):
         else:
             called_proxy += item["calls"]
     require(
-        dict(attributed) == {"soft": 68, "proxy": PROXY_ADMITTED_SLOTS},
+        dict(attributed) == {"soft": 68, "proxy": admitted_slots},
         f"per-module function split: {dict(attributed)}",
     )
     # A green lane claims two-provider call coverage (audit F6): one global
@@ -2682,6 +2710,42 @@ def self_test():
         bad = copy.deepcopy(proxy)
         mutate(bad)
         rejected(lambda bad=bad: validate_proxy_capacity_fallback(bad))
+    # Audit F8: every other admitted 3.x family is accepted when it is
+    # internally consistent — same table count, one shape, K=4 spill, and
+    # the slot/surface/call counts that shape implies.
+    for shape in ((3, 0), (3, 1)):
+        entries = ADMITTED_PROXY_TABLE_SHAPES[shape]["entries"]
+        admitted = ADMITTED_PROXY_TABLE_SHAPES[shape]["admitted_slots"]
+        older = copy.deepcopy(proxy)
+        for table in older["evidence"]["discovery"][1]["tables"]:
+            table["version"] = list(shape)
+            table["entries"] = entries
+        for surface in older["evidence"]["surfaces"][1:]:
+            surface["functions"] = entries
+            surface["source"] = surface["source"].replace("table 3.2", f"table {shape[0]}.{shape[1]}")
+        older["evidence"].update(
+            table_entries=68 + PROXY_TABLES * entries,
+            slots=68 + admitted,
+            attached_probes=2 * (68 + admitted),
+        )
+        older["functions"] = older["functions"][: 68 + admitted]
+        validate_proxy_capacity_fallback(older)
+        # ... but the pin stays exact per shape: a mixed build, a version
+        # with the wrong entry count, an undeclared version, the wrong
+        # admitted slots for the shape, and a malformed version all fail.
+        mixed = copy.deepcopy(older)
+        mixed["evidence"]["discovery"][1]["tables"][0]["version"] = [3, 2]
+        mixed["evidence"]["discovery"][1]["tables"][0]["entries"] = PROXY_TABLE_ENTRIES
+        rejected(lambda mixed=mixed: validate_proxy_capacity_fallback(mixed))
+        for mutate in (
+            lambda d: d["evidence"]["discovery"][1]["tables"][0].update(entries=PROXY_TABLE_ENTRIES),
+            lambda d: [table.update(version=[3, 9]) for table in d["evidence"]["discovery"][1]["tables"]],
+            lambda d: d["evidence"].update(slots=68 + PROXY_ADMITTED_SLOTS),
+            lambda d: d["evidence"]["discovery"][1]["tables"][0].update(version="3.0"),
+        ):
+            bad = copy.deepcopy(older)
+            mutate(bad)
+            rejected(lambda bad=bad: validate_proxy_capacity_fallback(bad))
     print("proxy capacity fallback accepts only its exact evidence shape: OK")
 
     version = evidence_fixture(

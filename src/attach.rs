@@ -5409,7 +5409,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_multi_member_retirement_is_refused_whole_bundle_is_not() {
+    fn partial_multi_member_detected_whole_bundle_is_not() {
         let links = vec![multi_link("p11_return", vec![3, 7])];
         assert_eq!(
             find_partial_multi_member(&links, &BTreeSet::from([7, 9])),

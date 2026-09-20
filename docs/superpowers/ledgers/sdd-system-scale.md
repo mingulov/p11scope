@@ -358,3 +358,29 @@ Build env: TMPDIR=/var/tmp/p11scope-ws-tmp cargo +1.88 --locked --offline.
   doctor self-link Ok measured privileged. No new breakage;
   third-party backport accepted by measurement (section test +
   e2e link census), not by line review.
+- Task 2.3: implementer DONE (branch task-2.3/group-rebuild).
+  Explicit multi-group rebuild transaction: `Session::detach_slots`
+  replaces the partial-retirement refusal with determine-affected
+  (transitive closure over group links) → entries-before-returns
+  detach with abort-before-reattach on any failure → regrouped
+  survivors reattached returns-before-entries to fixpoint (entry-
+  partial rollback, exhaustion/fallback explicit remainders) →
+  per-member success/failure + reactivation evidence. Retained
+  per-slot pinned facts (pruned with links); only fully paired
+  survivors count as multi-attached; no overlapping make-before-
+  break. Engine applies every report at all six detach sites + the
+  replacement site through the existing rules (completions, timing
+  loss, deactivation, PARTIAL); `Engine::multi_rebuild_gaps`
+  counts disturbed groups into evidence (run.rs was hardcoded 0).
+  Measurement (note docs/notes/2026-09-20-task-2.3-rebuild.md):
+  5 live lanes (aliasing-downgrade trigger: live second provider
+  sharing one manifest-attested slot) — every leg reports exactly
+  the 160 ground-truth calls, 0 loss; multi profile legs show
+  gaps=1 + uprobe-multi, singles gaps=0 + per-offset; C_Sign
+  module-ambiguous on every leg (downgrade proof); stale-start
+  counters zero. Suite: full `cargo +1.88 test --locked
+  --offline` green 1469/0 (4 ignored, contracts 129/129),
+  clippy -D warnings clean, fmt clean. 19 tests added, 0 removed;
+  one stale test name updated (refusal→detection, same asserts).
+  Late-joiner coalescing stays future work (rebuild covers
+  retirement/replacement only).

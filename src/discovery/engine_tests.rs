@@ -3856,9 +3856,10 @@ fn a_scope_member_that_ended_before_discovery_reached_it_is_not_a_loss() {
 /// oracle proved complete.
 #[test]
 fn unreadable_scope_members_stay_loud_as_one_deduplicated_record() {
+    let mut noise = crate::discovery::noise::DiscoveryNoiseAggregator::default();
     let published: Vec<_> = [7u32, 9, 4242]
         .into_iter()
-        .filter_map(|pid| unreadable_member_skip(pid, false, "scripted, unproven"))
+        .filter_map(|pid| unreadable_member_skip(pid, false, "scripted, unproven", &mut noise))
         .collect();
     assert_eq!(published.len(), 3, "an unproven fate is never silent");
 
@@ -3877,7 +3878,7 @@ fn unreadable_scope_members_stay_loud_as_one_deduplicated_record() {
         "discovery unavailable"
     );
     assert!(
-        unreadable_member_skip(11, true, "scripted, proven gone").is_none(),
+        unreadable_member_skip(11, true, "scripted, proven gone", &mut noise).is_none(),
         "a generation that is provably gone is the ordinary end of a process"
     );
 }
@@ -16467,7 +16468,8 @@ fn p2_retained_scan_error_keeps_counters_and_survives_attachment() {
         .expect("retained scan error discarded bracket refusal")
         .clone();
     // Normal-exit bookkeeping suppresses only the generic unreadable member.
-    assert!(unreadable_member_skip(711, true, "pin failure").is_none());
+    let mut noise = crate::discovery::noise::DiscoveryNoiseAggregator::default();
+    assert!(unreadable_member_skip(711, true, "pin failure", &mut noise).is_none());
     for source in ["manifest", "scan"] {
         let mut plan = plan_with(1, 0);
         plan.modules[0].path = refusal.subject.clone();

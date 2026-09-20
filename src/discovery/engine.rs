@@ -15,6 +15,7 @@ use crate::discovery::identity::{
     retained_object_key, target_paths_equal, view_object_key,
 };
 use crate::discovery::loader::{LoaderContextId, LoaderContextSpec, LoaderRegistry};
+use crate::discovery::noise::DiscoveryNoiseAggregator;
 use crate::discovery::scan::{
     CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedEntry, ScannedInterface, ScannedModule,
     ScannedTable, Skipped, TableIdentity, decode_exact_table, exact_table_addresses,
@@ -2899,6 +2900,10 @@ struct DiscoveryCounters {
     corroboration: Vec<(BTreeSet<PinnedObjectId>, &'static str)>,
     /// Stale manifest objects replaced only by exact scan-opened objects.
     manifest_fallbacks: Vec<ManifestFallback>,
+    /// Task 3.2 (S1): per-class stderr-noise accumulator. Buffered during the
+    /// scan, reported once as summaries, then cleared so live accumulation
+    /// starts fresh.
+    noise: DiscoveryNoiseAggregator,
 }
 
 impl DiscoveryCounters {
@@ -3445,10 +3450,7 @@ fn scan_and_pin_with(
     counters.scan_unavailable = counters.scan_unavailable.or(outcome.unavailable_reason());
     // Retain acquisition losses before pinning can fail on an exited generation.
     for skipped in outcome.skipped() {
-        eprintln!(
-            "{}",
-            format_discovery_skip(&skipped.subject, &skipped.reason)
-        );
+        counters.noise.note_skip(&skipped.subject, &skipped.reason);
         attribution::note(skipped);
         counters.object_skips.push(skipped.clone());
     }
@@ -3466,10 +3468,7 @@ fn scan_and_pin_with(
     let (pinned, pin_skips) = pin_scanned_view_objects(view, &modules, budget)
         .map_err(|error| anyhow!("pinning process view {:?}: {error}", view.id()))?;
     for skipped in pin_skips {
-        eprintln!(
-            "{}",
-            format_discovery_skip(&skipped.subject, &skipped.reason)
-        );
+        counters.noise.note_skip(&skipped.subject, &skipped.reason);
         attribution::note(&skipped);
         counters.object_skips.push(skipped);
     }
@@ -3541,10 +3540,7 @@ fn broad_note(counters: &mut DiscoveryCounters, subject: &str, reason: &str) {
         subject: subject.to_string(),
         reason: reason.to_string(),
     };
-    eprintln!(
-        "{}",
-        format_discovery_skip(&skipped.subject, &skipped.reason)
-    );
+    counters.noise.note_skip(&skipped.subject, &skipped.reason);
     attribution::note(&skipped);
     counters.object_skips.push(skipped);
 }
@@ -3964,6 +3960,7 @@ fn discover_plan(
                     *pid,
                     process::generation_gone(*pid),
                     &format!("the process generation could not be pinned: {error}"),
+                    &mut discovered.base_counters.noise,
                 ) {
                     attribution::note(&skipped);
                     discovered.base_counters.object_skips.push(skipped);
@@ -4023,10 +4020,12 @@ fn discover_plan(
                     .base_counters
                     .object_skips
                     .extend(counters.object_skips);
+                discovered.base_counters.noise.merge(&counters.noise);
                 if let Some(skipped) = unreadable_member_skip(
                     *pid,
                     view.original_exited() == Ok(true),
                     &format!("the process could not be scanned: {error:#}"),
+                    &mut discovered.base_counters.noise,
                 ) {
                     attribution::note(&skipped);
                     discovered.base_counters.object_skips.push(skipped);
@@ -4064,6 +4063,15 @@ fn discover_plan(
 
     rebuild_discovered(&mut discovered)?;
     discovered.counters.report_notes();
+    // Task 3.2 (S1): one categorical summary per noise class instead of one
+    // line per skipped view. Cleared here so live accumulation starts fresh
+    // and a later rebuild cannot re-merge initial noise.
+    discovered.counters.noise.report();
+    discovered.counters.noise.clear();
+    discovered.base_counters.noise.clear();
+    for input in discovered.scan_inputs.values_mut() {
+        input.counters.noise.clear();
+    }
     for refused in &discovered.plan.modules_skipped {
         eprintln!(
             "{}",
@@ -4441,6 +4449,10 @@ const UNREADABLE_MEMBER_SUBJECT: &str = "process view";
 const UNREADABLE_MEMBER_REASON: &str = "a process in scope could not be retained or scanned before it changed; a provider \
      only that generation mapped was never discovered";
 
+/// Pinned by `scan_pin_diagnostics_escape_target_controls`. Production stderr
+/// now aggregates through `DiscoveryNoiseAggregator` (Task 3.2); this format
+/// survives only as the oracle for the escaping contract.
+#[cfg(test)]
 fn format_discovery_skip(subject: &str, reason: &str) -> String {
     format!(
         "p11scope: discovery skipped {} — {}",
@@ -4449,6 +4461,9 @@ fn format_discovery_skip(subject: &str, reason: &str) -> String {
     )
 }
 
+/// Pinned by `unreadable_member_diagnostics_escape_target_controls`.
+/// Production no longer prints per-pid lines (Task 3.2 aggregates scrubbed).
+#[cfg(test)]
 fn format_unreadable_member(pid: u32, detail: &str) -> String {
     format!(
         "p11scope: discovery skipped pid {pid}: {}",
@@ -4468,12 +4483,18 @@ fn format_module_refusal(subject: &str, reason: &str) -> String {
 /// generation is *provably* gone — the ordinary end of a process, on the same
 /// authority `queue_retirement` and the live-record rule already use, and
 /// nothing a capture that keeps running can still observe. Loss stays loss,
-/// and loud, whenever the end cannot be proven.
-fn unreadable_member_skip(pid: u32, gone: bool, detail: &str) -> Option<Skipped> {
+/// and loud, whenever the end cannot be proven. Loud means aggregated (Task
+/// 3.2): the detail is noted to `noise` scrubbed of PIDs, never printed raw.
+fn unreadable_member_skip(
+    pid: u32,
+    gone: bool,
+    detail: &str,
+    noise: &mut DiscoveryNoiseAggregator,
+) -> Option<Skipped> {
     if gone {
         return None;
     }
-    eprintln!("{}", format_unreadable_member(pid, detail));
+    noise.note_unreadable(pid, detail);
     Some(Skipped {
         subject: UNREADABLE_MEMBER_SUBJECT.into(),
         reason: UNREADABLE_MEMBER_REASON.into(),
@@ -4989,6 +5010,7 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
         counters
             .object_skips
             .extend(input.counters.object_skips.clone());
+        counters.noise.merge(&input.counters.noise);
         scan_modules.extend(input.modules.clone());
     }
     let (mut pinned, aggregation_skips) =
@@ -5319,11 +5341,23 @@ fn remove_stale_views(discovered: &mut Engine, stale: &[ProcessViewId]) -> Resul
             subject: "process view".into(),
             reason: STALE_VIEW_REASON.into(),
         };
+        discovered
+            .base_counters
+            .noise
+            .note_skip(&skipped.subject, &skipped.reason);
         attribution::note(&skipped);
         discovered.base_counters.object_skips.push(skipped);
-        eprintln!("p11scope: discovery skipped process view — {STALE_VIEW_REASON}");
     }
     rebuild_discovered(discovered)?;
+    // Stale removals happen during attach preparation, after the initial
+    // report: flush their summaries now so the operator sees them before the
+    // capture starts, and live accumulation starts fresh.
+    discovered.counters.noise.report();
+    discovered.counters.noise.clear();
+    discovered.base_counters.noise.clear();
+    for input in discovered.scan_inputs.values_mut() {
+        input.counters.noise.clear();
+    }
     Ok(removed)
 }
 
@@ -7916,6 +7950,7 @@ impl Engine {
         self.counters.scan_unavailable =
             self.counters.scan_unavailable.or(counters.scan_unavailable);
         self.counters.scan_ms = self.counters.scan_ms.saturating_add(counters.scan_ms);
+        self.counters.noise.merge(&counters.noise);
         // An acquisition failure has already happened. Keep it even if later
         // inventory construction fails or normal exit suppresses a generic gap.
         for skipped in &counters.object_skips {
@@ -12641,12 +12676,15 @@ impl Engine {
                     scans.push((*view_id, modules, pins));
                 }
                 Err(error) => {
-                    let view = &self.views[position];
-                    failed_pids.insert(view.pid());
+                    let pid = self.views[position].pid();
+                    let gone = self.views[position].original_exited() == Ok(true);
+                    failed_pids.insert(pid);
+                    let detail = format!("{failure}: {error:#}");
                     skipped.extend(unreadable_member_skip(
-                        view.pid(),
-                        view.original_exited() == Ok(true),
-                        &format!("{failure}: {error:#}"),
+                        pid,
+                        gone,
+                        &detail,
+                        &mut self.counters.noise,
                     ));
                 }
             }
@@ -13050,6 +13088,7 @@ impl Engine {
                         pid,
                         process::generation_gone(pid),
                         &format!("the process generation could not be retained: {error}"),
+                        &mut self.counters.noise,
                     ));
                     continue;
                 }
@@ -13076,6 +13115,7 @@ impl Engine {
                         pid,
                         view.original_exited() == Ok(true),
                         &format!("the process generation could not be scanned: {error:#}"),
+                        &mut self.counters.noise,
                     ));
                 }
             }
@@ -13801,6 +13841,14 @@ impl Engine {
             self.loader_registry.discovery_truncated(),
             self.loader_registry.context_failures(),
         )
+    }
+
+    /// Task 3.2 (S1): flush live-accumulated discovery noise as per-class
+    /// summaries. Called once at capture end; initial noise was already
+    /// reported and cleared by `discover_plan`, so this covers live only.
+    pub fn report_discovery_noise(&mut self) {
+        self.counters.noise.report();
+        self.counters.noise.clear();
     }
 
     pub fn start_session(

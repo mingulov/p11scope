@@ -6,6 +6,7 @@ pub mod engine;
 pub mod hooks;
 pub mod identity;
 pub(crate) mod loader;
+pub mod noise;
 pub(crate) mod pause;
 pub mod scan;
 pub(crate) mod scheduler;

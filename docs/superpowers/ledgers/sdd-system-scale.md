@@ -460,3 +460,47 @@ Build env: TMPDIR=/var/tmp/p11scope-ws-tmp cargo +1.88 --locked --offline.
   contention flake; isolation re-run green 0.85s on this tree, next
   full gate green. No test edits — the timeouts/parallelism are
   load-bearing process-test contracts.
+- Task 3.2: implementer DONE (branch task-3.1b/discovery-scheduling,
+  on top of 3.1b c4c59c9). Discovery-noise aggregation (S1): new
+  `src/discovery/noise.rs` with `DiscoveryNoiseClass` (6 categorical
+  labels), `classify_discovery_noise`, `scrub_discovery_noise_text`
+  (`/proc/<pid>`, `pid <n>`, `0x<addr>`), and
+  `DiscoveryNoiseAggregator` (exact per-class counts + first full
+  sample, `merge` keeps earliest). `lines()` renders one summary per
+  class: lone samples bare, repeats as `first sample … ×N` with the
+  exact count. Wired through `DiscoveryCounters.noise`: per-object
+  skips, unreadable members (now aggregated via `noise` param instead
+  of per-pid eprintln; `format_discovery_skip`/`format_unreadable_member`
+  kept as cfg(test) escaping oracles), and stale views all note to the
+  aggregator; initial noise reported once after `rebuild_discovered`
+  then cleared at all three accumulators (counters/base/inputs) so
+  live starts fresh and rebuilds cannot re-merge; stale removals flush
+  at attach time; live noise flushed once by
+  `Engine::report_discovery_noise` at `run_loop` end. Module refusals,
+  overlay, broad, and attach diagnostics untouched (low volume).
+  Measurement (deterministic collapse count, not wall time — no perf
+  claim): `aggregates_live_reference_classes_with_exact_counts` feeds
+  the FULL-live.md reference mix (231 ESRCH + 122 maps-snapshot + 20
+  ENOENT = 373 skips) and asserts 3 summary lines with exact counts
+  `… ×231/×122/×20` plus first samples; live production proof in a
+  flaky-run capture: 598 skipped views rendered as 3 summaries
+  (maps-snapshot ×333, object-missing ×2, other ×263) with
+  `/proc/<pid>` scrubbed. Command:
+  `TMPDIR=/var/tmp/p11scope-ws-tmp cargo +1.88 test --locked
+  --offline -p p11scope --lib discovery::noise`.
+  Suite: full `cargo +1.88 test --locked --offline` green 0 failures
+  on the idle box (lib 1201/0 + 4 ignored, contracts 129/129, every
+  other binary green, CARGO_EXIT:0), fmt clean, clippy
+  `--workspace --all-targets -D warnings` clean. Tests: 5 added
+  (noise unit: exact-counts, no-PID-leak, single-no-suffix,
+  merge-earliest, categorical-stable), 3 existing call sites updated
+  for the new `noise` param (assertions unchanged), 0 removed, none
+  weakened. TDD: 5/5 RED on stub, then GREEN. Flake note: two loaded-
+  box full runs failed on known signatures — (a)
+  `system_scope_refresh_admits_later_generation_in_same_engine`
+  (byte-identical to the recorded 1.2/3.1b EPERM contention flake;
+  isolation green 0.85s); (b) canary 60s-timeout kill mid-suite,
+  stopped-canary owned-case custody-vs-deadline race (1/112 inner),
+  lane13 port-forward/body-success pair (all three isolation-green:
+  96s/65s/187s). No test edits — the timeouts/parallelism are
+  load-bearing process-test contracts.

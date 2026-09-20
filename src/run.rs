@@ -1596,7 +1596,7 @@ fn run_loop(
 ) -> Result<render::Evidence> {
     report_attach_failures(session);
     let drain = resolve_drain_cadence(kind, drain_interval);
-    match kind {
+    let evidence = match kind {
         Kind::Profile => {
             let out = match out {
                 OutputSink::Profile(file) => Some(*file),
@@ -1613,7 +1613,7 @@ fn run_loop(
                 owned,
                 drain,
                 ring_bytes,
-            )
+            )?
         }
         Kind::Trace => {
             let out = match out {
@@ -1631,9 +1631,11 @@ fn run_loop(
                 interrupted,
                 owned,
                 drain,
-            )
+            )?
         }
-    }
+    };
+    engine.report_discovery_noise();
+    Ok(evidence)
 }
 
 /// What `run` reports back to its caller. `evidence` is the exact finalized

@@ -5,6 +5,7 @@
 //! crate-private and is never reached from here; these tests only assert the
 //! published lattice (design §5.1, §5.6) and the refusal contract.
 
+use p11scope::attach::BackendSelection;
 use p11scope::cli::{Kind, PausePolicy, RunArgs};
 use p11scope::discovery::hooks::HookRegistry;
 use p11scope::run_owned;
@@ -34,6 +35,7 @@ fn paused_run(pause: PausePolicy, marker: &Path) -> RunArgs {
         unsafe_requested: false,
         allow_confined_uretprobe: false,
         pause,
+        attach_backend: BackendSelection::default(),
         kill_on_timeout: false,
         command: vec![
             "/bin/sh".into(),

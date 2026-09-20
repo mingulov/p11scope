@@ -307,6 +307,7 @@ fn scenario(
         drain_interval: None,
         unsafe_requested: false,
         allow_confined_uretprobe: false,
+        attach_backend: BackendSelection::default(),
     };
     let view = ProcessView::open(ProcessViewId(0), pid).map_err(anyhow::Error::msg)?;
     let engine = Engine::discover(&args, &scope, Some(view))?;

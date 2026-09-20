@@ -4113,6 +4113,7 @@ fn capture_start_members_that_ended_are_not_losses() {
         max_scan_pids: None,
         unsafe_requested: false,
         allow_confined_uretprobe: false,
+        attach_backend: BackendSelection::default(),
     };
     let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
 
@@ -4173,6 +4174,7 @@ fn max_scan_pids_bounds_initial_scan_and_refresh() {
         max_scan_pids: Some(2),
         unsafe_requested: false,
         allow_confined_uretprobe: false,
+        attach_backend: BackendSelection::default(),
     };
     let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
 
@@ -4316,6 +4318,7 @@ fn some_zero_max_scan_pids_clamps_to_default_like_none() {
         max_scan_pids,
         unsafe_requested: false,
         allow_confined_uretprobe: false,
+        attach_backend: BackendSelection::default(),
     };
     let zero = Engine::discover(&args_with(Some(0)), &scope, None)
         .expect("a zero-capped cgroup still captures");
@@ -4380,6 +4383,7 @@ fn zero_cap_refresh_short_circuits_the_sweep_to_empty() {
         max_scan_pids: None,
         unsafe_requested: false,
         allow_confined_uretprobe: false,
+        attach_backend: BackendSelection::default(),
     };
     let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
 
@@ -4470,6 +4474,7 @@ fn id_exhaustion_publishes_skip_instead_of_failing() {
         max_scan_pids: Some(2),
         unsafe_requested: false,
         allow_confined_uretprobe: false,
+        attach_backend: BackendSelection::default(),
     };
     let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
 
@@ -13376,6 +13381,7 @@ fn capture_start_releases_view_ids_for_members_that_ended_before_scan() {
         max_scan_pids: None,
         unsafe_requested: false,
         allow_confined_uretprobe: false,
+        attach_backend: BackendSelection::default(),
     };
     let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
 
@@ -17045,6 +17051,7 @@ fn system_args(hints: Vec<PathBuf>, max_scan_pids: Option<usize>) -> CaptureArgs
         drain_interval: None,
         unsafe_requested: false,
         allow_confined_uretprobe: false,
+        attach_backend: BackendSelection::default(),
     }
 }
 

@@ -3,7 +3,7 @@
 //! path, per-process/module attribution, and cap-driven PARTIAL. All
 //! discovery here is unprivileged userspace (`Engine::discover`); no BPF
 //! object is loaded.
-use p11scope::attach::Scope;
+use p11scope::attach::{BackendSelection, Scope};
 use p11scope::cli::{CaptureArgs, CliError, Kind, ScopeArg, parse};
 use p11scope::discovery::engine::Engine;
 use p11scope::discovery::hooks::HookRegistry;
@@ -106,6 +106,7 @@ fn system_args(hints: Vec<PathBuf>, max_scan_pids: Option<usize>) -> CaptureArgs
         drain_interval: None,
         unsafe_requested: false,
         allow_confined_uretprobe: false,
+        attach_backend: BackendSelection::default(),
     }
 }
 

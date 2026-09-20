@@ -1,5 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
-use p11scope::attach::Scope;
+use p11scope::attach::{BackendSelection, Scope};
 use p11scope::cli::{CaptureArgs, Kind, ScopeArg};
 use p11scope::discovery::engine::Engine;
 use p11scope::discovery::hooks::HookRegistry;
@@ -62,6 +62,7 @@ fn engine_initial_discovery_preserves_plan() {
         drain_interval: None,
         unsafe_requested: false,
         allow_confined_uretprobe: false,
+        attach_backend: BackendSelection::default(),
     };
     let scope = Scope::Pid(pid);
     let view = ProcessView::open(ProcessViewId(0), pid).unwrap();

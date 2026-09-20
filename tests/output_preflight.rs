@@ -2,6 +2,7 @@
 //! Task 3.3 (F-Scale-6): the output sink is trust-validated before the
 //! discovery scan, so a bad `-o` path fails fast instead of after a scan.
 
+use p11scope::attach::BackendSelection;
 use p11scope::capture;
 use p11scope::cli::{CaptureArgs, Kind, ScopeArg};
 use p11scope::discovery::hooks::HookRegistry;
@@ -35,6 +36,7 @@ fn untrusted_output_is_refused_before_the_discovery_scan() {
         drain_interval: None,
         unsafe_requested: false,
         allow_confined_uretprobe: false,
+        attach_backend: BackendSelection::default(),
     };
     let error = capture(&args).expect_err("untrusted output must fail the capture");
     let text = format!("{error:#}");

@@ -2142,6 +2142,7 @@ fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOut
         drain_interval: args.drain_interval,
         unsafe_requested: args.unsafe_requested,
         allow_confined_uretprobe: args.allow_confined_uretprobe,
+        attach_backend: args.attach_backend,
     };
     // Initial capture still uses the one `discover_plan` pass and keeps its
     // accepted state inside `Engine`; nothing below rescans or reopens.
@@ -6422,6 +6423,7 @@ mod tests {
             unsafe_requested: false,
             allow_confined_uretprobe: false,
             pause,
+            attach_backend: BackendSelection::default(),
             kill_on_timeout: false,
             command: command.iter().map(|a| a.to_string()).collect(),
         }

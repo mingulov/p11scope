@@ -2,6 +2,7 @@
 //! Command-line parsing for every subcommand: one parser body for profile and
 //! trace, durations with suffixes, hints for removed flags.
 
+use crate::attach::BackendSelection;
 use crate::discovery::hooks::HookRegistry;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -43,6 +44,8 @@ pub struct CaptureArgs {
     /// `--allow-uretprobe-on-confined-target`: attach uretprobes even when this
     /// kernel is measured to kill a seccomp-confined target for doing so.
     pub allow_confined_uretprobe: bool,
+    /// `--attach-backend`: static attach backend; Auto follows the policy.
+    pub attach_backend: BackendSelection,
 }
 
 /// What `run` is allowed to do to its own child to keep loader discovery from
@@ -81,6 +84,8 @@ pub struct RunArgs {
     /// kernel is measured to kill a seccomp-confined target for doing so.
     pub allow_confined_uretprobe: bool,
     pub pause: PausePolicy,
+    /// `--attach-backend`: static attach backend; Auto follows the policy.
+    pub attach_backend: BackendSelection,
     /// `--kill-on-timeout`: `--duration` expiry ends the child too, instead of
     /// handing it back still running.
     pub kill_on_timeout: bool,
@@ -375,6 +380,7 @@ struct Common {
     drain_interval: Option<Duration>,
     unsafe_requested: bool,
     allow_confined_uretprobe: bool,
+    attach_backend: BackendSelection,
 }
 
 impl Common {
@@ -614,6 +620,7 @@ pub fn parse_capture(
         drain_interval: common.drain_interval,
         unsafe_requested: common.unsafe_requested,
         allow_confined_uretprobe: common.allow_confined_uretprobe,
+        attach_backend: common.attach_backend,
     })
 }
 
@@ -690,6 +697,7 @@ fn parse_run(mut args: impl Iterator<Item = String>) -> Result<RunArgs, CliError
         unsafe_requested: common.unsafe_requested,
         allow_confined_uretprobe: common.allow_confined_uretprobe,
         pause,
+        attach_backend: common.attach_backend,
         kill_on_timeout,
         command,
     })
@@ -1020,6 +1028,49 @@ mod tests {
         assert!(
             USAGE.contains("--max-scan-pids"),
             "help names the scan cap flag"
+        );
+    }
+
+    #[test]
+    fn attach_backend_flag_selects_the_static_backend_on_every_capture_surface() {
+        let Command::Profile(a) = parse(args(&[
+            "profile",
+            "--pid",
+            "42",
+            "--attach-backend",
+            "multi",
+        ]))
+        .unwrap() else {
+            panic!("expected profile")
+        };
+        assert_eq!(a.attach_backend, BackendSelection::Multi);
+        let Command::Trace(a) = parse(args(&[
+            "trace",
+            "--pid",
+            "42",
+            "--attach-backend",
+            "singles",
+        ]))
+        .unwrap() else {
+            panic!("expected trace")
+        };
+        assert_eq!(a.attach_backend, BackendSelection::Singles);
+        let Command::Run(a) = parse(args(&["run", "--attach-backend", "multi", "--", "true"]))
+            .unwrap() else {
+            panic!("expected run")
+        };
+        assert_eq!(a.attach_backend, BackendSelection::Multi);
+        let Command::Profile(a) = parse(args(&["profile", "--pid", "42"])).unwrap() else {
+            panic!("expected profile")
+        };
+        assert_eq!(a.attach_backend, BackendSelection::Auto);
+        assert!(matches!(
+            parse(args(&["profile", "--pid", "42", "--attach-backend", "uprobe-multi"])),
+            Err(CliError::Usage(m)) if m.contains("--attach-backend: invalid value")
+        ));
+        assert!(
+            USAGE.contains("--attach-backend"),
+            "help names the backend flag"
         );
     }
 

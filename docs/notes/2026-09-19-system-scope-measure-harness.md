@@ -5,7 +5,8 @@ Runner: `scripts/system-scope-measure.sh` (+ `system-scope-workload.c`,
 `system-scope-sample.py`, `system-scope-ts.py`, `system-scope-measure.py`).
 Built for the system-scale plan (`docs/superpowers/plans/2026-09-19-system-scale.md`):
 Task 1.4 Step 2 (post-fix baseline), Task 1.6 (coverage-architecture
-experiment), Task 3.1 (consumer-scheduling loss shares).
+experiment), Task 3.1 (consumer-scheduling loss shares; trace mode, sink
+axis, BURST timing, and weak gates added by the 3.1-measure task).
 
 ## What it does
 
@@ -35,11 +36,18 @@ and emits per condition BOTH a JSON record (`record.json`, schema
   two-phase SoftHSM2 client. READY/go files let the observer attach between
   setup and the measured burst of exactly N `C_GenerateRandom` calls
   (optionally paced with `--pace-us`). Prints `TRUTH_PREGO {...}` at READY
-  (setup calls already made, outside the window) and one `TRUTH {...}` line
-  at the end with the exact post-go counts — the counting oracle
+  (setup calls already made, outside the window), one `BURST
+  go_ns=... end_ns=...` line bounding the post-go window on
+  CLOCK_MONOTONIC (the harness derives the ring input rate from it —
+  required, fail closed), and one `TRUTH {...}` line at the end with the
+  exact post-go counts — the counting oracle
   (late-map: all 7 call kinds incl. `C_GetFunctionList:1` via dlsym, seen
   by loader/export probes; early-map: `C_GenerateRandom:N`,
   `C_CloseSession:1`, `C_Finalize:1`).
+  `--pace-us` is nominal: `usleep` oversleeps ~200 µs on the reference
+  box, so pace 500/2000/125/10 yield ~1378/440/3023/4905 calls/s —
+  always read the effective rate from the record's `event_path`
+  block, never from the pace flag.
 - Mapping time differs by scope (recorded as `map_early`): per-PID runs map
   late, bench-style, with `--manifest`; `--system` runs map early (no
   manifest) so the scan corroborates the workload provider. The generated
@@ -202,8 +210,37 @@ scan-path view/pin handling across `start_retained_with`).
   ≥ truth total (other processes may add calls).
 - Metrics-mode reports lack `attach_mechanisms` (profile-only field);
   recorded as null, honestly.
-- Trace mode is not supported yet (text-stream evidence needs its own
-  parser); metrics + profile only.
+- Trace mode is supported (`--mode trace|all`): the `-o` stream file is
+  the record source, parsed strictly (`parse_trace_stream`: CAPTURE /
+  call lines / cumulative LOST / TRUNCATED / COUNT_EVIDENCE / EVIDENCE;
+  anything else fails the run). Trace window validity uses kernel
+  aggregate totals (`stats_returned`), never the lossy lines, and every
+  trace run carries the loss-identity cross-check
+  (`stats_returned - raw_calls == event_loss == last LOST`).
+- `--sink file|discard|slow-pipe` selects the observer's stdout
+  destination (file default; slow-pipe is a throttled FIFO reader at
+  `--sink-rate-kbps`, default 4). Profile frame volume is far below the
+  64 KiB pipe buffer, so slow-pipe backpressure bites trace streams,
+  not short profile runs — by measurement, not assumption.
+- Non-frame attach gates (trace mode has no live frames; discard keeps
+  nothing) use marker+settle (pid: 10 s) or marker+fd-plateau+settle
+  (system: plateau + 20 s). The gate is recorded per condition and
+  validated post-hoc (`window` block); weak-gate runs need duration
+  headroom over setup + burst (pid ≥ setup ~12 s + burst; system ≥
+  ~90 s + burst) or the window collapses and the record says INVALID.
+- Per-PID captures end when the named target exits (discovery retires
+  the dead workload → `TargetExit`), so burst runs show exactly 2
+  frames (tick 0 + terminal) and the terminal drain (unbounded, after
+  the ~8 s detach taper) does most delivery. `--duration` only bounds
+  runs whose workload outlives it. Detach takes ~60 ms per link
+  (strace-measured) — ~8 s pid, ~61 s system — during which the ring
+  is undrained; production there overflows into `event_loss`.
+- Every record now carries an `event_path` block (generated /
+  kernel-observed / kernel-loss / delivered-or-gap / ring capacity /
+  burst rate / burst-model prediction), a `window` block (gate
+  strength + validity), and go-time loadavg. Oracle suite:
+  `tests/python/test_loss_share_measure.py` (hosted by
+  `artifact_contracts`).
 - Under concurrent full-suite load (load 24 on 12 cores) a `--system`
   observer needed a 52 s scan and ~19 min wind-down; system-scope
   baselines must run on an idle box. The harness signals the real

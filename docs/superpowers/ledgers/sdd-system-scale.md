@@ -253,3 +253,44 @@ Build env: TMPDIR=/var/tmp/p11scope-ws-tmp cargo +1.88 --locked --offline.
   run the wrapper tests that pin their markers — add to future
   dispatch gates. Canary + lane13 passed on the idle box,
   confirming the contention-flake diagnosis.
+- Task 1.6: implementer DONE (d0904f0 Lane A apparatus +
+  9d30d57 stage-hold fix + 7a2ed86 Lane B model/A2 probe/decision
+  note). Lane A 6/6 cells exact (broad 387 slots/gap=0 vs
+  selected 27 slots/gap=300/120 at beyond-K=4; attach +0.15s;
+  detach ~20 probes/s ~38s vs ~3s; all loss counters zero); A2
+  real p11-kit selected 410+spill-60 vs broad whole-refusal
+  (6530>512); Lane B sparse C=8192 0.19MB vs 1.82MB dense at
+  fixture residency, ~+3% at full 6530. Decision: sequenced
+  composition — selected-512 now, sparse+detach next, broad
+  after. Records: /var/tmp/p11scope-task16-matrix/.
+- Task 1.6: review APPROVED, no blockers, 4 minors (2 fixed at
+  merge, 2 deferred). Reviewer re-checked all 6 cells from
+  record.json, reproduced A2 unprivileged, confirmed
+  userspace-only default-off (single env read, pre-existing
+  call sites pass false). Fixed: detach projection corrected
+  ~5.5min → ~11min (13,060 probes at ~20/s); follow-up sketch
+  now lists task_owner.c slot ceilings (slot<512 x3,
+  start_count cap, 0..512 scrub). Deferred: t10 VMA-split index
+  could derive from live MapLite; t13 python-holder Drop guard
+  (#[ignore] manual test). Report-only: worker's drain sentence
+  ("one unexplained outlier") is inaccurate — records show a
+  systematic ~1.5s lane-correlated pair delta (1.69–1.96s broad
+  vs 0.17–0.27s selected); worker report file was never
+  committed, so no on-branch correction exists — noted here.
+- Task 1.6: complete (commits d0904f0..7a2ed86 + integrator
+  fixup 2027693; merged cfa3650). Merge pre-step found 4 REAL
+  failures, not flakes: SPDX header on lanes note + hosted-CI
+  registration for both lane drivers (UNRUN line for
+  sudo-invoked lane-a, --self-test steps 6/6 + 7/7 green
+  unprivileged). lane13 failed in-suite but isolation-green
+  (181s), same contention signature; full re-run after fixup:
+  126/126 green. Lesson: experiment drivers with --self-test
+  or sudo argv trip hosted-pipeline contracts — dispatch gates
+  must run artifact_contracts (or at least hosted_pipeline +
+  license_headers) on the branch before DONE.
+- Phase 1 admission truthfulness COMPLETE (1.1–1.6 merged).
+  Open follow-ups: map-resize/epoch capacity (from 1.4, now
+  sized by 1.6: sparse C=8192 + task_owner.c ceilings +
+  EVIDENCE cell); detach fix or Phase 2 multi (1.6: ~11min at
+  6530); lane workdir policy (from 1.4); 1.5/1.6 deferred
+  minors for final review.

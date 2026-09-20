@@ -1255,6 +1255,66 @@ fn static_endpoint(program: &str, slot: u32) -> Option<StaticEndpoint> {
     static_probe_side(program).map(|side| (slot, side))
 }
 
+/// One member of a static attach group: the slot plus its resolved
+/// multi-link site (file offset + attach cookie).
+#[derive(Debug, Clone)]
+struct StaticGroupMember {
+    slot: Slot,
+    offset: u64,
+    cookie: u64,
+}
+
+/// One multi-attach unit: all slots sharing an attach path AND an entry
+/// program take one return link plus one entry link. Members are sorted
+/// by slot so link order is deterministic.
+#[derive(Debug)]
+struct StaticGroup {
+    path: PathBuf,
+    entry_program: &'static str,
+    members: Vec<StaticGroupMember>,
+}
+
+fn group_static_slots(
+    slots: &[Slot],
+    policy: CapturePolicy,
+    object_has_unsafe: bool,
+    attach_targets: &BTreeMap<u32, (PathBuf, ElfAbi)>,
+) -> Vec<StaticGroup> {
+    let mut by_key: BTreeMap<(PathBuf, &'static str), Vec<StaticGroupMember>> = BTreeMap::new();
+    for slot in slots {
+        let (path, abi) = attach_targets
+            .get(&slot.index)
+            .expect("every selected target has retained pinned facts");
+        let UProbeAttachPoint {
+            location: UProbeAttachLocation::AbsoluteOffset(offset),
+            cookie: Some(cookie),
+        } = slot_attach_point(slot)
+        else {
+            unreachable!("static attach points are absolute with cookies");
+        };
+        let program = entry_program(&slot.semantics, policy, object_has_unsafe, *abi);
+        by_key
+            .entry((path.clone(), program))
+            .or_default()
+            .push(StaticGroupMember {
+                slot: slot.clone(),
+                offset,
+                cookie,
+            });
+    }
+    by_key
+        .into_iter()
+        .map(|((path, entry_program), mut members)| {
+            members.sort_by_key(|member| member.slot.index);
+            StaticGroup {
+                path,
+                entry_program,
+                members,
+            }
+        })
+        .collect()
+}
+
 pub(crate) fn monotonic_ns() -> Option<u64> {
     let mut timestamp = std::mem::MaybeUninit::<libc::timespec>::uninit();
     // SAFETY: `clock_gettime` initializes `timestamp` on success.
@@ -4091,6 +4151,104 @@ mod tests {
             fork_safe: false,
             module_ids: vec![crate::plan::ModuleId(0)],
         }
+    }
+
+    fn group_slot(index: u32, object: u32, semantics: SlotSemantics) -> crate::plan::Slot {
+        let mut slot = test_slot(index);
+        slot.object = PinnedObjectId(object);
+        slot.semantics = semantics;
+        slot
+    }
+
+    fn group_targets(entries: &[(u32, &str, ElfAbi)]) -> BTreeMap<u32, (PathBuf, ElfAbi)> {
+        entries
+            .iter()
+            .map(|(index, path, abi)| (*index, (PathBuf::from(path), *abi)))
+            .collect()
+    }
+
+    fn group_member_indices(group: &StaticGroup) -> Vec<u32> {
+        group.members.iter().map(|m| m.slot.index).collect()
+    }
+
+    #[test]
+    fn groups_split_by_attach_path_and_entry_program() {
+        let slots = vec![
+            group_slot(0, 1, SlotSemantics::COUNT_ONLY),
+            group_slot(1, 1, SlotSemantics::COUNT_ONLY),
+            group_slot(2, 2, SlotSemantics::COUNT_ONLY),
+            group_slot(3, 2, SlotSemantics::COUNT_ONLY),
+        ];
+        let targets = group_targets(&[
+            (0, "/a.so", ElfAbi::Lp64),
+            (1, "/a.so", ElfAbi::Lp64),
+            (2, "/b.so", ElfAbi::Lp64),
+            (3, "/b.so", ElfAbi::Ilp32),
+        ]);
+        let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, true, &targets);
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].path, PathBuf::from("/a.so"));
+        assert_eq!(groups[0].entry_program, "p11_entry");
+        assert_eq!(group_member_indices(&groups[0]), vec![0, 1]);
+        assert_eq!(groups[1].path, PathBuf::from("/b.so"));
+        assert_eq!(groups[1].entry_program, "p11_entry");
+        assert_eq!(group_member_indices(&groups[1]), vec![2]);
+        assert_eq!(groups[2].path, PathBuf::from("/b.so"));
+        assert_eq!(groups[2].entry_program, "p11_entry_ia32");
+        assert_eq!(group_member_indices(&groups[2]), vec![3]);
+        for group in &groups {
+            for member in &group.members {
+                assert_eq!(member.offset, member.slot.file_offset);
+                assert_eq!(
+                    member.cookie,
+                    attach_cookie(member.slot.index, member.slot.descriptor_index)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn groups_sort_scrambled_members_deterministically() {
+        let slots = vec![
+            group_slot(3, 2, SlotSemantics::COUNT_ONLY),
+            group_slot(0, 1, SlotSemantics::COUNT_ONLY),
+            group_slot(2, 2, SlotSemantics::COUNT_ONLY),
+            group_slot(1, 1, SlotSemantics::COUNT_ONLY),
+        ];
+        let targets = group_targets(&[
+            (0, "/a.so", ElfAbi::Lp64),
+            (1, "/a.so", ElfAbi::Lp64),
+            (2, "/b.so", ElfAbi::Lp64),
+            (3, "/b.so", ElfAbi::Lp64),
+        ]);
+        let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(group_member_indices(&groups[0]), vec![0, 1]);
+        assert_eq!(group_member_indices(&groups[1]), vec![2, 3]);
+    }
+
+    #[test]
+    fn template_semantics_route_to_their_template_group() {
+        let template = SlotSemantics {
+            template0_arg: 1,
+            ..SlotSemantics::COUNT_ONLY
+        };
+        let slots = vec![
+            group_slot(0, 1, SlotSemantics::COUNT_ONLY),
+            group_slot(1, 1, template),
+        ];
+        let targets = group_targets(&[(0, "/a.so", ElfAbi::Lp64), (1, "/a.so", ElfAbi::Lp64)]);
+        let groups = group_static_slots(
+            &slots,
+            CapturePolicy::UnsafeUnvalidatedMetadata,
+            false,
+            &targets,
+        );
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].entry_program, "p11_entry");
+        assert_eq!(group_member_indices(&groups[0]), vec![0]);
+        assert_eq!(groups[1].entry_program, "p11_entry_template");
+        assert_eq!(group_member_indices(&groups[1]), vec![1]);
     }
 
     #[test]

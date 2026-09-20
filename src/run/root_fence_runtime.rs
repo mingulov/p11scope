@@ -4,6 +4,7 @@
 //! survive both reductions and token construction until explicit retirement.
 
 use super::*;
+use crate::attach::BackendSelection;
 use crate::events::{OwnedRootTail, RootTailProgress};
 use anyhow::ensure;
 use p11scope_ebpf_common::{Event, SESSION_NONE, capture, event_type};

@@ -9833,6 +9833,216 @@ fn post_mutation_generation_loss_never_owns_the_cell_it_allocated() {
     assert!(!outcome.required_complete());
 }
 
+fn rebuild_timing_owners(
+    pins: &PinnedObjects,
+    plan: &plan::AttachPlan,
+) -> BTreeMap<plan::ModuleId, PinnedTimingKey> {
+    plan.modules
+        .iter()
+        .filter_map(|module| {
+            pins.owned_timing_key(module.object)
+                .map(|key| (module.id, key))
+        })
+        .collect()
+}
+
+#[test]
+fn rebuild_report_recompletions_record_reactivation_for_siblings() {
+    let (mut plan, pins) = plan_with_pins(2, 0);
+    let owners = rebuild_timing_owners(&pins, &plan);
+    let key = owners.get(&plan::ModuleId(0)).cloned().unwrap();
+    let mut engine = Engine::empty();
+    let mut outcome = ApplyOutcome::default();
+
+    engine.apply_group_rebuild(
+        &mut plan,
+        &owners,
+        DetachOutcome {
+            recompleted: vec![(1, Some(50))],
+            rebuild_failures: Vec::new(),
+            rebuilt_groups: 1,
+        },
+        &mut outcome,
+    );
+
+    assert!(plan.is_active(0));
+    assert!(plan.is_active(1));
+    assert_eq!(outcome.static_completions.len(), 1);
+    assert_eq!(
+        outcome.static_completions[0],
+        (BTreeSet::from([key]), Some(50))
+    );
+    assert!(outcome.static_failures.is_empty());
+    assert_eq!(engine.multi_rebuild_gaps(), 1);
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| skip.subject
+            == "multi group rebuild"
+            && skip.reason
+                == "one or more groups rebuilt; calls in flight across the rebuild window may pair entry and return across attachment generations"),
+        "the rebuild window publishes pairing uncertainty: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+#[test]
+fn rebuild_report_failures_deactivate_and_record_loss() {
+    let (mut plan, pins) = plan_with_pins(2, 0);
+    let owners = rebuild_timing_owners(&pins, &plan);
+    let key = owners.get(&plan::ModuleId(0)).cloned().unwrap();
+    let mut engine = Engine::empty();
+    let mut outcome = ApplyOutcome::default();
+
+    engine.apply_group_rebuild(
+        &mut plan,
+        &owners,
+        DetachOutcome {
+            recompleted: Vec::new(),
+            rebuild_failures: vec![(1, "p11_return refused".into())],
+            rebuilt_groups: 1,
+        },
+        &mut outcome,
+    );
+
+    assert!(plan.is_active(0));
+    assert!(!plan.is_active(1));
+    assert!(outcome.static_completions.is_empty());
+    assert_eq!(outcome.static_failures, BTreeSet::from([key]));
+    assert_eq!(engine.multi_rebuild_gaps(), 1);
+    assert!(
+        engine.counters.object_skips.iter().any(
+            |skip| skip.subject == "multi group rebuild" && skip.reason.contains("deactivated")
+        ),
+        "failed survivors deactivate with a published reason: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+#[test]
+fn rebuild_report_for_unknown_slot_publishes_defensive_partial() {
+    let (mut plan, pins) = plan_with_pins(2, 0);
+    let owners = rebuild_timing_owners(&pins, &plan);
+    let mut engine = Engine::empty();
+    let mut outcome = ApplyOutcome::default();
+
+    engine.apply_group_rebuild(
+        &mut plan,
+        &owners,
+        DetachOutcome {
+            recompleted: vec![(99, Some(7))],
+            rebuild_failures: vec![(98, "gone".into())],
+            rebuilt_groups: 1,
+        },
+        &mut outcome,
+    );
+
+    assert!(plan.is_active(0));
+    assert!(plan.is_active(1));
+    assert!(outcome.static_completions.is_empty());
+    assert!(outcome.static_failures.is_empty());
+    assert_eq!(engine.multi_rebuild_gaps(), 1);
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.reason.contains("no plan entry")),
+        "an unrecordable reactivation is never silent: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+#[test]
+fn empty_rebuild_report_is_a_no_op() {
+    let (mut plan, pins) = plan_with_pins(2, 0);
+    let owners = rebuild_timing_owners(&pins, &plan);
+    let mut engine = Engine::empty();
+    let mut outcome = ApplyOutcome::default();
+
+    engine.apply_group_rebuild(&mut plan, &owners, DetachOutcome::default(), &mut outcome);
+
+    assert!(outcome.static_completions.is_empty());
+    assert!(outcome.static_failures.is_empty());
+    assert_eq!(engine.multi_rebuild_gaps(), 0);
+    assert!(engine.counters.object_skips.is_empty());
+    assert!(plan.is_active(0) && plan.is_active(1));
+}
+
+#[test]
+fn failed_attach_rebuild_report_reactivates_surviving_sibling() {
+    let (_child, mut engine, modules) = engine_with_one_accepted_provider();
+    let candidate = peer_candidate(&mut engine, &modules);
+    let sibling = candidate.plan.slots[0].index;
+    let failing = candidate.delta.new[0].index;
+    let mut session = ScriptedSession::default();
+    session.fail_target_slots([failing]);
+    session.report_slot_rebuilds([
+        DetachOutcome::default(),
+        DetachOutcome {
+            recompleted: vec![(sibling, Some(77))],
+            rebuild_failures: Vec::new(),
+            rebuilt_groups: 1,
+        },
+    ]);
+    let mut additions = true;
+
+    let outcome = engine
+        .apply_candidate(&mut session, candidate, &mut additions, false, &[])
+        .unwrap();
+
+    assert_eq!(session.detached_slots, vec![0, 1]);
+    assert!(engine.plan.is_active(sibling));
+    assert!(!engine.plan.is_active(failing));
+    assert!(
+        outcome
+            .static_completions
+            .iter()
+            .any(|(_, at)| *at == Some(77)),
+        "the sibling reactivation time is recorded"
+    );
+    assert_eq!(engine.multi_rebuild_gaps(), 1);
+    assert!(additions, "a clean rebuild blocks no additions");
+}
+
+#[test]
+fn retired_slot_rebuild_report_reactivates_surviving_sibling() {
+    let (_child, mut engine, modules) = engine_with_one_accepted_provider();
+    let peer = peer_candidate(&mut engine, &modules);
+    let mut session = ScriptedSession::default();
+    let mut additions = true;
+    engine
+        .apply_candidate(&mut session, peer, &mut additions, false, &[])
+        .unwrap();
+    assert!(engine.plan.is_active(0));
+    assert!(engine.plan.is_active(1));
+    // A candidate without the peer retires slot 1; the detach reports the
+    // group rebuild that reattached slot 0.
+    let candidate = engine
+        .live_candidate(engine.pinned.clone(), modules[..1].to_vec(), Vec::new())
+        .unwrap();
+    assert_eq!(candidate.delta.retire.len(), 1);
+    let mut session = ScriptedSession::default();
+    session.report_slot_rebuilds([DetachOutcome {
+        recompleted: vec![(0, Some(88))],
+        rebuild_failures: Vec::new(),
+        rebuilt_groups: 1,
+    }]);
+    let mut additions = true;
+    let outcome = engine
+        .apply_candidate(&mut session, candidate, &mut additions, false, &[])
+        .unwrap();
+
+    assert!(engine.plan.is_active(0));
+    assert!(!engine.plan.is_active(1));
+    assert!(
+        outcome
+            .static_completions
+            .iter()
+            .any(|(_, at)| *at == Some(88)),
+        "the sibling reactivation time is recorded"
+    );
+    assert_eq!(engine.multi_rebuild_gaps(), 1);
+}
+
 #[test]
 fn generation_loss_cleanup_finishes_after_one_failed_detach() {
     let (child, mut engine, modules) = engine_with_one_accepted_provider();

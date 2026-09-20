@@ -2,8 +2,8 @@
 //! Initial and incremental provider discovery ownership.
 
 use crate::attach::{
-    BackendSelection, CapturePolicy, CounterSnapshot, DynamicExportIdentity,
-    DynamicLoaderAttachFailure, OwnedPauseGeneration, Scope, Session,
+    BackendSelection, CapturePolicy, CounterSnapshot, DetachOutcome, DynamicExportIdentity,
+    DynamicLoaderAttachFailure, OwnedPauseGeneration, ReplacementOutcome, Scope, Session,
 };
 use crate::cli::CaptureArgs;
 use crate::discovery::attribution;
@@ -97,6 +97,10 @@ pub struct Engine {
     pending_leader_exit_views: BTreeSet<ProcessViewId>,
     counted_leader_exit_views: BTreeSet<ProcessViewId>,
     pid_descendant_gaps: u64,
+    /// Multi-group rebuild windows this capture published: one per rebuilt
+    /// group per rebuild transaction. Ungated by scope — a rebuild blinds
+    /// its members wherever the capture runs.
+    multi_rebuild_gaps: u64,
     // Both ledgers are capture-local and bounded by the process-view ceiling;
     // only the scalar crosses the render boundary.
     admitted_cgroup_views: BTreeMap<ProcessViewId, CgroupAdmission>,
@@ -1946,7 +1950,6 @@ type DiscoveryCollector<'a> =
     dyn FnMut(&mut dyn EngineSession) -> Result<(Vec<DiscoveryRecord>, u64)> + 'a;
 type SlotCompletion = (u32, Option<u64>);
 type TargetAttachResult = (Vec<u32>, Vec<SlotCompletion>);
-type ReplacementAttachResult = (Vec<SlotCompletion>, bool);
 
 /// Exactly the `Session` surface the discovery/pause path already uses. It
 /// exists so the Engine/coordinator lifecycle can be driven without loading a
@@ -1977,8 +1980,8 @@ pub(crate) trait EngineSession {
         plan: &mut plan::AttachPlan,
         replace: &[plan::Slot],
         objects: &PinnedObjects,
-    ) -> Result<ReplacementAttachResult>;
-    fn detach_slots(&mut self, slots: &[plan::Slot]) -> Result<()>;
+    ) -> Result<ReplacementOutcome>;
+    fn detach_slots(&mut self, slots: &[plan::Slot]) -> Result<DetachOutcome>;
     fn has_dynamic_export(
         &self,
         context: LoaderContextId,
@@ -2066,11 +2069,11 @@ impl EngineSession for Session {
         plan: &mut plan::AttachPlan,
         replace: &[plan::Slot],
         objects: &PinnedObjects,
-    ) -> Result<ReplacementAttachResult> {
+    ) -> Result<ReplacementOutcome> {
         Session::replace_targets(self, plan, replace, objects)
     }
 
-    fn detach_slots(&mut self, slots: &[plan::Slot]) -> Result<()> {
+    fn detach_slots(&mut self, slots: &[plan::Slot]) -> Result<DetachOutcome> {
         Session::detach_slots(self, slots)
     }
 
@@ -6729,6 +6732,7 @@ impl Engine {
             pending_leader_exit_views: BTreeSet::new(),
             counted_leader_exit_views: BTreeSet::new(),
             pid_descendant_gaps: 0,
+            multi_rebuild_gaps: 0,
             admitted_cgroup_views: BTreeMap::new(),
             unmatched_leader_exit_events: BTreeSet::new(),
             cgroup_ingress_overflow: false,
@@ -6851,6 +6855,10 @@ impl Engine {
         } else {
             0
         }
+    }
+
+    pub(crate) fn multi_rebuild_gaps(&self) -> u64 {
+        self.multi_rebuild_gaps
     }
 
     /// Scopes that admit process generations over time: cgroup membership and
@@ -8430,7 +8438,12 @@ impl Engine {
                 };
                 generation_lost |= replacement_stale;
                 match replacement {
-                    Some(Ok((completed, failed_detach))) => {
+                    Some(Ok(replacement)) => {
+                        let ReplacementOutcome {
+                            completed,
+                            failed_detach,
+                            ..
+                        } = replacement;
                         outcome.record_completions(
                             &candidate.delta.replace,
                             &timing_owners,
@@ -13729,6 +13742,9 @@ pub(crate) mod session_fixture {
         pub(crate) detached_slot_indices: Vec<Vec<u32>>,
         /// One entry per upcoming `detach_slots` call; `true` fails it.
         detach_slot_script: VecDeque<bool>,
+        /// One rebuild report per upcoming `detach_slots` call; later calls
+        /// report no rebuild.
+        detach_rebuild_script: VecDeque<DetachOutcome>,
         /// Static target slot indices that the next attach reports as failed.
         fail_target_slots: BTreeSet<u32>,
         /// Slot counts of every `attach_targets` call, in order.
@@ -13812,6 +13828,15 @@ pub(crate) mod session_fixture {
         /// fails that call. Later calls succeed.
         pub(crate) fn fail_slot_detaches(&mut self, script: impl IntoIterator<Item = bool>) {
             self.detach_slot_script = script.into_iter().collect();
+        }
+
+        /// Schedules one rebuild report per upcoming `detach_slots` call.
+        /// Later calls report no rebuild.
+        pub(crate) fn report_slot_rebuilds(
+            &mut self,
+            script: impl IntoIterator<Item = DetachOutcome>,
+        ) {
+            self.detach_rebuild_script = script.into_iter().collect();
         }
 
         pub(crate) fn fail_target_slots(&mut self, slots: impl IntoIterator<Item = u32>) {
@@ -13910,12 +13935,12 @@ pub(crate) mod session_fixture {
             _: &mut plan::AttachPlan,
             slots: &[plan::Slot],
             _: &PinnedObjects,
-        ) -> Result<ReplacementAttachResult> {
+        ) -> Result<ReplacementOutcome> {
             attachment_admission(&self.detach_failures, !slots.is_empty())?;
-            Ok((Vec::new(), false))
+            Ok(ReplacementOutcome::default())
         }
 
-        fn detach_slots(&mut self, slots: &[plan::Slot]) -> Result<()> {
+        fn detach_slots(&mut self, slots: &[plan::Slot]) -> Result<DetachOutcome> {
             self.detached_slots.push(slots.len());
             self.detached_slot_indices
                 .push(slots.iter().map(|slot| slot.index).collect());
@@ -13924,7 +13949,7 @@ pub(crate) mod session_fixture {
                     .push("scripted one-shot slot detach failed".into());
                 bail!("scripted one-shot slot detach failed");
             }
-            Ok(())
+            Ok(self.detach_rebuild_script.pop_front().unwrap_or_default())
         }
 
         fn has_dynamic_export(

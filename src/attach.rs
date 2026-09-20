@@ -1355,7 +1355,34 @@ struct AttachOutcome {
 
 type SlotCompletion = (u32, Option<u64>);
 type TargetAttachResult = (Vec<u32>, Vec<SlotCompletion>);
-type ReplacementAttachResult = (Vec<SlotCompletion>, bool);
+
+/// What one [`Session::replace_targets`] call attached: the replacements
+/// that completed, whether their cleanup detach failed, and any group
+/// rebuilds that cleanup triggered.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReplacementOutcome {
+    /// (slot, attach timestamp) for every replacement fully attached.
+    pub completed: Vec<(u32, Option<u64>)>,
+    /// A partial replacement detach failed once; the caller blocks additions.
+    pub failed_detach: bool,
+    /// Group rebuilds the replacement's cleanup detaches triggered.
+    pub rebuild: DetachOutcome,
+}
+
+/// What one [`Session::detach_slots`] call rebuilt, if anything: per-member
+/// evidence for multi-group survivors plus the gap count. Empty when no
+/// group needed a rebuild (singles detach, whole-bundle detach).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DetachOutcome {
+    /// (slot, reactivation timestamp) for every survivor fully reattached,
+    /// including unchanged siblings.
+    pub recompleted: Vec<(u32, Option<u64>)>,
+    /// (slot, reason) for every survivor that lost its links; the caller
+    /// deactivates these in the plan exactly like failed fresh targets.
+    pub rebuild_failures: Vec<(u32, String)>,
+    /// How many groups dropped and rebuilt: one published gap window each.
+    pub rebuilt_groups: u64,
+}
 
 fn export_programs(abi: HookAbi) -> (&'static str, &'static str) {
     match abi {
@@ -3062,7 +3089,7 @@ impl Session {
         plan: &mut AttachPlan,
         replace: &[Slot],
         objects: &PinnedObjects,
-    ) -> Result<ReplacementAttachResult> {
+    ) -> Result<ReplacementOutcome> {
         if let Some(slot) = replace.iter().find(|slot| self.has_slot_link(slot.index)) {
             bail!(
                 "replacement slot {} still has an old link; detach and synchronize it before reattach",
@@ -3092,12 +3119,20 @@ impl Session {
         for slot in &failed_slots {
             plan.deactivate(slot.index);
         }
-        Ok((completed, detach.is_err()))
+        let (failed_detach, rebuild) = match detach {
+            Ok(rebuild) => (false, rebuild),
+            Err(_) => (true, DetachOutcome::default()),
+        };
+        Ok(ReplacementOutcome {
+            completed,
+            failed_detach,
+            rebuild,
+        })
     }
 
     /// Detaches all slot links selected by a finite retirement/replacement
     /// delta. Each attempt is made even if an earlier Aya detach failed.
-    pub fn detach_slots(&mut self, slots: &[Slot]) -> Result<()> {
+    pub fn detach_slots(&mut self, slots: &[Slot]) -> Result<DetachOutcome> {
         let requested: BTreeSet<_> = slots.iter().map(|slot| slot.index).collect();
         let partial = find_partial_multi_member(&self.links, &requested);
         let detached = self.detach_links(|link| match link {
@@ -3114,7 +3149,7 @@ impl Session {
                  per-slot retirement needs an explicit group rebuild"
             );
         }
-        detached
+        detached.map(|()| DetachOutcome::default())
     }
 
     /// Detach every event/map producer while keeping the maps and ring reader

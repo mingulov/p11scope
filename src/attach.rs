@@ -15,7 +15,7 @@ use aya::programs::tp_btf::BtfTracePointLinkId;
 use aya::programs::uprobe::{UProbeAttachLocation, UProbeAttachPoint, UProbeLinkId, UProbeScope};
 use aya::programs::{BtfTracePoint, RawTracePoint, UProbe};
 use aya::{Btf, Ebpf, EbpfLoader};
-use p11scope_bpf_multi::{GroupHalt, bisect_attach};
+use p11scope_bpf_multi::{GroupHalt, attach_group, bisect_attach};
 use p11scope_ebpf_common::{
     ARG_NONE, DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES,
     DISCOVERY_COUNTER_EXPORT_STATE_FAILURES, DISCOVERY_COUNTER_LOADER_HITS,
@@ -34,7 +34,7 @@ use std::fs::File;
 use std::io;
 use std::mem::size_of_val;
 use std::num::{NonZeroU32, NonZeroU64};
-use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd};
+use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -786,11 +786,35 @@ impl std::error::Error for BackendFallbackRequired {
     }
 }
 
-/// First backend attempted for a session. `Auto` stays singles until the
-/// regrouped multi attach lands; the policy flip (multi on 6.9+ with a
-/// singles fallback) follows with it.
+/// Kernel floor for the multi backend: `uprobe_multi` landed in 6.6,
+/// but the session only attempts multi on 6.9+, where the link UAPI the
+/// backport targets is settled. Below the floor `Auto` is singles; an
+/// `ENOTSUP`/`EOPNOTSUPP` link error still falls back at runtime.
+pub(crate) const MULTI_KERNEL_FLOOR: (u32, u32) = (6, 9);
+
+/// Pure policy predicate over a `/proc/sys/kernel/osrelease` release
+/// string: multi is attempted at or above [`MULTI_KERNEL_FLOOR`], and
+/// an unparseable release conservatively resolves to singles.
+pub(crate) fn multi_allowed_on(release: &str) -> bool {
+    crate::doctor::parse_major_minor(release).is_some_and(|version| version >= MULTI_KERNEL_FLOOR)
+}
+
+/// Live policy probe: multi is attempted when the running kernel is at
+/// or above [`MULTI_KERNEL_FLOOR`]. An unreadable release resolves to
+/// singles; forced multi still attempts regardless (see `start`).
+pub(crate) fn kernel_supports_multi() -> bool {
+    std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .map(|release| multi_allowed_on(release.trim()))
+        .unwrap_or(false)
+}
+
+/// First backend attempted for a session. `Auto` follows the kernel
+/// policy (multi on 6.9+, singles below); `Multi`/`Singles` force one.
+/// An auto multi attempt that the kernel refuses is rebuilt on singles
+/// at session granularity; forced multi surfaces the refusal instead.
 pub(crate) fn resolve_initial_backend(selection: BackendSelection) -> AttachBackend {
     match selection {
+        BackendSelection::Auto if kernel_supports_multi() => AttachBackend::Multi,
         BackendSelection::Auto | BackendSelection::Singles => AttachBackend::Singles,
         BackendSelection::Multi => AttachBackend::Multi,
     }
@@ -937,6 +961,9 @@ pub struct Session {
     successful_static: BTreeSet<StaticEndpoint>,
     dynamic_attach_evidence: DynamicAttachEvidence,
     policy: CapturePolicy,
+    /// Load-time backend: static endpoint twins load with attach type 48
+    /// under multi, so the attach path must match the load decision.
+    backend: AttachBackend,
     uprobe_scope: UProbeScope,
     #[allow(dead_code)] // Task 8 drives the Task 7 pause coordinator.
     pause_key: Option<PauseKey>,
@@ -1022,6 +1049,14 @@ enum RegisteredLink {
         slot: u32,
         id: UProbeLinkId,
     },
+    /// One attached multi group side outside Aya's link table: the
+    /// program, its member slots, and the live link fds (one per bisect
+    /// leaf). Detach is drop: closing the fds detaches the links.
+    MultiUProbe {
+        program: &'static str,
+        slots: Vec<u32>,
+        fds: Vec<OwnedFd>,
+    },
     RawTracePoint {
         program: &'static str,
         id: RawTracePointLinkId,
@@ -1077,6 +1112,7 @@ impl RegisteredLink {
     fn producer(&self) -> ProducerProgram {
         match self {
             Self::UProbe { program, .. }
+            | Self::MultiUProbe { program, .. }
             | Self::DynamicUProbe { program, .. }
             | Self::DiagnosticUProbe { program, .. } => ProducerProgram::UProbe(program),
             Self::RawTracePoint { program, .. } => ProducerProgram::RawTracePoint(program),
@@ -1084,13 +1120,14 @@ impl RegisteredLink {
         }
     }
 
-    fn slot(&self) -> Option<u32> {
+    fn slots(&self) -> &[u32] {
         match self {
-            Self::UProbe { slot, .. } => Some(*slot),
+            Self::UProbe { slot, .. } => std::slice::from_ref(slot),
+            Self::MultiUProbe { slots, .. } => slots,
             Self::RawTracePoint { .. }
             | Self::BtfTracePoint { .. }
             | Self::DiagnosticUProbe { .. }
-            | Self::DynamicUProbe { .. } => None,
+            | Self::DynamicUProbe { .. } => &[],
         }
     }
 
@@ -1098,11 +1135,31 @@ impl RegisteredLink {
         match self {
             Self::DynamicUProbe { context, .. } => Some(*context),
             Self::UProbe { .. }
+            | Self::MultiUProbe { .. }
             | Self::RawTracePoint { .. }
             | Self::BtfTracePoint { .. }
             | Self::DiagnosticUProbe { .. } => None,
         }
     }
+}
+
+fn links_cover_slot(links: &[RegisteredLink], slot: u32) -> bool {
+    links.iter().any(|link| link.slots().contains(&slot))
+}
+
+/// The smallest requested slot that shares a multi group link with a
+/// slot outside the request, if any. Group links are immutable: a
+/// bundle drops only when every member is requested, so partially
+/// covered members are refused (explicit group rebuild follows in
+/// Task 2.3) while fully covered bundles still detach.
+fn find_partial_multi_member(links: &[RegisteredLink], slots: &BTreeSet<u32>) -> Option<u32> {
+    slots.iter().copied().find(|slot| {
+        links.iter().any(|link| {
+            matches!(link, RegisteredLink::MultiUProbe { slots: members, .. }
+                if members.contains(slot)
+                    && members.iter().any(|member| !slots.contains(member)))
+        })
+    })
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1523,6 +1580,31 @@ fn attach_target_groups_with<T>(
             completed,
         },
     ))
+}
+
+/// Raw fd of a loaded static twin for the multi `link_create` leaf:
+/// resolved once per program before the first group link so a missing
+/// program fails fast instead of bisecting into per-slot refusals. The
+/// fd stays owned by `ebpf` for the whole attach.
+fn multi_prog_fd(ebpf: &mut Ebpf, program: &'static str) -> Result<RawFd> {
+    let probe: &mut UProbe = ebpf
+        .program_mut(program)
+        .with_context(|| format!("program {program} missing from object"))?
+        .try_into()?;
+    let fd = probe
+        .fd()
+        .with_context(|| format!("program {program} has no loaded fd"))?;
+    Ok(fd.as_fd().as_raw_fd())
+}
+
+/// PID filter for the multi `link_create`: the raw-UAPI spelling of the
+/// session's uprobe scope (`pid==0` attaches to all processes).
+fn multi_pid_for_scope(scope: UProbeScope) -> u32 {
+    match scope {
+        UProbeScope::AllProcesses => 0,
+        UProbeScope::OneProcess(pid) => pid.get(),
+        UProbeScope::CallingProcess => std::process::id(),
+    }
 }
 
 pub(crate) fn monotonic_ns() -> Option<u64> {
@@ -2013,19 +2095,65 @@ impl Session {
         pause_generation: Option<OwnedPauseGeneration>,
         ring_bytes: Option<u32>,
         owned_child: Option<&OwnedChild>,
-        backend: BackendSelection,
+        selection: BackendSelection,
     ) -> Result<Self> {
         // Raise before the first link: every return/entry pair burns fds
         // against RLIMIT_NOFILE, and no tracker (the previous raise site)
         // exists yet at attach time. A 1024 soft limit dies near slot 256.
         let _ = crate::process::raise_nofile();
         let pause_key = pause_key_for(scope, pause_generation.as_ref())?;
+        let backend = resolve_initial_backend(selection);
+        match Self::start_on_backend(
+            plan,
+            scope,
+            objects,
+            policy,
+            pause_key,
+            ring_bytes,
+            owned_child,
+            backend,
+        ) {
+            Ok(session) => Ok(session),
+            Err(error)
+                if selection == BackendSelection::Auto
+                    && backend == AttachBackend::Multi
+                    && error.downcast_ref::<BackendFallbackRequired>().is_some() =>
+            {
+                // 48-loaded programs cannot single-attach, so an auto multi
+                // attempt the kernel refuses is rebuilt on singles at
+                // session granularity; the dropped session detaches every
+                // probe it created. Forced multi surfaces the refusal.
+                Self::start_on_backend(
+                    plan,
+                    scope,
+                    objects,
+                    policy,
+                    pause_key,
+                    ring_bytes,
+                    owned_child,
+                    AttachBackend::Singles,
+                )
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_on_backend(
+        plan: &AttachPlan,
+        scope: &Scope,
+        objects: &PinnedObjects,
+        policy: CapturePolicy,
+        pause_key: Option<PauseKey>,
+        ring_bytes: Option<u32>,
+        owned_child: Option<&OwnedChild>,
+        backend: AttachBackend,
+    ) -> Result<Self> {
         if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
             bail!(
                 "a pinned provider object changed before attach; refusing to observe changed bytes"
             );
         }
-        let backend = resolve_initial_backend(backend);
         let mut session =
             Self::start_inner(scope, policy, pause_key, ring_bytes, owned_child, backend)
                 .map_err(unsupported_environment_context)?;
@@ -2246,6 +2374,7 @@ impl Session {
             successful_static: BTreeSet::new(),
             dynamic_attach_evidence: DynamicAttachEvidence::default(),
             policy,
+            backend,
             uprobe_scope,
             pause_key,
             lifecycle_tracking_unavailable: None,
@@ -2505,6 +2634,7 @@ impl Session {
                 }),
             ),
             RegisteredLink::UProbe { .. }
+            | RegisteredLink::MultiUProbe { .. }
             | RegisteredLink::RawTracePoint { .. }
             | RegisteredLink::BtfTracePoint { .. }
             | RegisteredLink::DiagnosticUProbe { .. } => (context, None),
@@ -2568,46 +2698,50 @@ impl Session {
             })
             .collect::<Result<_>>()?;
         let scope = self.uprobe_scope;
-        let ebpf = &mut self.ebpf;
-        let links = &mut self.links;
-        let outcome = attach_targets_with(
-            targets,
-            self.policy,
-            cfg!(feature = "unsafe-unvalidated-metadata"),
-            |slot| {
-                Ok(attach_targets
-                    .get(&slot.index)
-                    .expect("every selected target has retained pinned facts")
-                    .1)
-            },
-            |program, slot, point| {
-                let path = &attach_targets
-                    .get(&slot.index)
-                    .expect("every selected target has retained pinned facts")
-                    .0;
-                let prog: &mut UProbe = ebpf
-                    .program_mut(program)
-                    .with_context(|| format!("program {program} missing from object"))?
-                    .try_into()?;
-                match prog.attach([point], path, scope) {
-                    Ok(id) => {
-                        links.push(RegisteredLink::UProbe {
-                            program,
-                            slot: slot.index,
-                            id,
-                        });
-                        Ok(())
+        let outcome = if self.backend == AttachBackend::Multi {
+            self.attach_targets_multi(targets, &attach_targets, scope)?
+        } else {
+            let ebpf = &mut self.ebpf;
+            let links = &mut self.links;
+            attach_targets_with(
+                targets,
+                self.policy,
+                cfg!(feature = "unsafe-unvalidated-metadata"),
+                |slot| {
+                    Ok(attach_targets
+                        .get(&slot.index)
+                        .expect("every selected target has retained pinned facts")
+                        .1)
+                },
+                |program, slot, point| {
+                    let path = &attach_targets
+                        .get(&slot.index)
+                        .expect("every selected target has retained pinned facts")
+                        .0;
+                    let prog: &mut UProbe = ebpf
+                        .program_mut(program)
+                        .with_context(|| format!("program {program} missing from object"))?
+                        .try_into()?;
+                    match prog.attach([point], path, scope) {
+                        Ok(id) => {
+                            links.push(RegisteredLink::UProbe {
+                                program,
+                                slot: slot.index,
+                                id,
+                            });
+                            Ok(())
+                        }
+                        Err(error) => Err(anyhow!(
+                            "{program} at {}+{:#x}: {}",
+                            slot.object_path,
+                            slot.file_offset,
+                            error_chain(&error)
+                        )),
                     }
-                    Err(error) => Err(anyhow!(
-                        "{program} at {}+{:#x}: {}",
-                        slot.object_path,
-                        slot.file_offset,
-                        error_chain(&error)
-                    )),
-                }
-            },
-            |_| monotonic_ns(),
-        )?;
+                },
+                |_| monotonic_ns(),
+            )?
+        };
         let AttachOutcome {
             successful,
             failures,
@@ -2617,6 +2751,56 @@ impl Session {
         let failed: Vec<_> = failures.iter().map(|(slot, _)| *slot).collect();
         self.attach_failures.extend(failures);
         Ok((failed, completed))
+    }
+
+    /// Multi half of [`Session::attach_targets`]: regroups the targets by
+    /// (attach path, entry program) and attaches one return link plus one
+    /// entry link per group over the 48-loaded twins. Late joiners (live
+    /// discovery) form their own groups and attach as additional links;
+    /// coalescing them into existing links is the Task 2.3 rebuild. A
+    /// kernel without multi support aborts with
+    /// [`BackendFallbackRequired`] (downcastable through anyhow) so
+    /// `start` can rebuild the session on singles.
+    fn attach_targets_multi(
+        &mut self,
+        targets: &[Slot],
+        attach_targets: &BTreeMap<u32, (PathBuf, ElfAbi)>,
+        scope: UProbeScope,
+    ) -> Result<AttachOutcome> {
+        let groups = group_static_slots(
+            targets,
+            self.policy,
+            cfg!(feature = "unsafe-unvalidated-metadata"),
+            attach_targets,
+        );
+        let mut programs: BTreeSet<&'static str> =
+            groups.iter().map(|group| group.entry_program).collect();
+        programs.insert("p11_return");
+        let mut prog_fds = BTreeMap::new();
+        for program in programs {
+            prog_fds.insert(program, multi_prog_fd(&mut self.ebpf, program)?);
+        }
+        let pid = multi_pid_for_scope(scope);
+        let (bundles, outcome) = attach_target_groups_with(
+            &groups,
+            |_| monotonic_ns(),
+            |program, path, slice, is_return| {
+                let prog_fd = prog_fds
+                    .get(program)
+                    .copied()
+                    .expect("every group side pre-resolved its program fd");
+                let (offsets, cookies): (Vec<u64>, Vec<u64>) = slice.iter().copied().unzip();
+                attach_group(prog_fd, pid, path, &offsets, &cookies, is_return)
+            },
+        )?;
+        for bundle in bundles {
+            self.links.push(RegisteredLink::MultiUProbe {
+                program: bundle.program,
+                slots: bundle.slots,
+                fds: bundle.links,
+            });
+        }
+        Ok(outcome)
     }
 
     /// Applies the attachment half of a descriptor downgrade after the caller
@@ -2663,8 +2847,23 @@ impl Session {
     /// Detaches all slot links selected by a finite retirement/replacement
     /// delta. Each attempt is made even if an earlier Aya detach failed.
     pub fn detach_slots(&mut self, slots: &[Slot]) -> Result<()> {
-        let slots: BTreeSet<_> = slots.iter().map(|slot| slot.index).collect();
-        self.detach_links(|link| link.slot().is_some_and(|slot| slots.contains(&slot)))
+        let requested: BTreeSet<_> = slots.iter().map(|slot| slot.index).collect();
+        let partial = find_partial_multi_member(&self.links, &requested);
+        let detached = self.detach_links(|link| match link {
+            // A group link drops only with all its members; partially
+            // covered bundles keep their shared links (see `partial`).
+            RegisteredLink::MultiUProbe { slots, .. } => {
+                !slots.is_empty() && slots.iter().all(|slot| requested.contains(slot))
+            }
+            _ => link.slots().iter().any(|slot| requested.contains(slot)),
+        });
+        if let Some(member) = partial {
+            bail!(
+                "slot {member} shares a multi group link with live slots; \
+                 per-slot retirement needs an explicit group rebuild"
+            );
+        }
+        detached
     }
 
     /// Detach every event/map producer while keeping the maps and ring reader
@@ -2705,7 +2904,7 @@ impl Session {
     }
 
     fn has_slot_link(&self, slot: u32) -> bool {
-        self.links.iter().any(|link| link.slot() == Some(slot))
+        links_cover_slot(&self.links, slot)
     }
 
     fn detach_links(&mut self, mut select: impl FnMut(&RegisteredLink) -> bool) -> Result<()> {
@@ -2892,6 +3091,12 @@ impl Session {
 
 fn detach_registered_link(ebpf: &mut Ebpf, link: RegisteredLink) -> Result<()> {
     match link {
+        // Detach is drop: closing the last link fd detaches the kernel
+        // link, so moving the fds out here releases every leaf.
+        RegisteredLink::MultiUProbe { fds, .. } => {
+            drop(fds);
+            Ok(())
+        }
         RegisteredLink::UProbe { program, id, .. }
         | RegisteredLink::DiagnosticUProbe { program, id } => (|| {
             let probe: &mut UProbe = ebpf
@@ -3110,6 +3315,29 @@ mod tests {
     }
 
     #[test]
+    fn multi_policy_follows_the_6_9_floor_and_rejects_garbage() {
+        use super::multi_allowed_on;
+        for release in [
+            "6.9.0",
+            "6.9.12-1-generic",
+            "6.10.0",
+            "6.15.0-100-generic",
+            "7.0.0",
+        ] {
+            assert!(multi_allowed_on(release), "{release} must allow multi");
+        }
+        for release in ["6.8.0", "6.6.0", "6.5.0-15-generic", "5.15.0", "4.19.0", ""] {
+            assert!(!multi_allowed_on(release), "{release:?} must stay singles");
+        }
+        for release in ["not-a-release", "6", "6.x", "v6.9.0-"] {
+            assert!(
+                !multi_allowed_on(release),
+                "{release:?} must conservatively stay singles"
+            );
+        }
+    }
+
+    #[test]
     fn only_static_endpoint_twins_take_the_multi_load_flag() {
         use super::AttachBackend;
         use super::loads_with_multi_flag;
@@ -3164,14 +3392,11 @@ mod tests {
     }
 
     #[test]
-    fn auto_resolves_to_singles_until_the_regroup_flip() {
+    fn backend_resolution_forces_directly_and_auto_follows_the_kernel() {
         use super::AttachBackend;
         use super::BackendSelection;
+        use super::kernel_supports_multi;
         use super::resolve_initial_backend;
-        assert_eq!(
-            resolve_initial_backend(BackendSelection::Auto),
-            AttachBackend::Singles
-        );
         assert_eq!(
             resolve_initial_backend(BackendSelection::Multi),
             AttachBackend::Multi
@@ -3180,6 +3405,12 @@ mod tests {
             resolve_initial_backend(BackendSelection::Singles),
             AttachBackend::Singles
         );
+        let expected = if kernel_supports_multi() {
+            AttachBackend::Multi
+        } else {
+            AttachBackend::Singles
+        };
+        assert_eq!(resolve_initial_backend(BackendSelection::Auto), expected);
     }
 
     #[test]
@@ -4381,6 +4612,15 @@ mod tests {
         group.members.iter().map(|m| m.slot.index).collect()
     }
 
+    fn grouped_offset(groups: &[StaticGroup], index: u32) -> u64 {
+        groups
+            .iter()
+            .flat_map(|group| &group.members)
+            .find(|member| member.slot.index == index)
+            .unwrap_or_else(|| panic!("slot {index} is grouped"))
+            .offset
+    }
+
     #[test]
     fn groups_split_by_attach_path_and_entry_program() {
         let slots = vec![
@@ -4439,9 +4679,12 @@ mod tests {
 
     type MockLink = Vec<(u64, u64)>;
 
+    type MockCall = (String, bool, Vec<(u64, u64)>);
+    type MockFail = dyn Fn(&str, &[(u64, u64)], bool) -> Option<io::Error>;
+
     struct MockGroup {
-        calls: std::cell::RefCell<Vec<(String, bool, Vec<(u64, u64)>)>>,
-        fail: Box<dyn Fn(&str, &[(u64, u64)], bool) -> Option<io::Error>>,
+        calls: std::cell::RefCell<Vec<MockCall>>,
+        fail: Box<MockFail>,
     }
 
     impl MockGroup {
@@ -4530,7 +4773,7 @@ mod tests {
     fn multi_poison_return_refusal_skips_entry_for_that_member() {
         let (slots, targets) = two_groups();
         let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
-        let poison = 0x10 + 1 * 8;
+        let poison = grouped_offset(&groups, 1);
         let mock = MockGroup {
             calls: std::cell::RefCell::new(Vec::new()),
             fail: Box::new(move |_, sites, is_return| {
@@ -4569,7 +4812,7 @@ mod tests {
     fn multi_entry_poison_leaves_return_and_records_entry_failure() {
         let (slots, targets) = two_groups();
         let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
-        let poison = 0x10 + 3 * 8;
+        let poison = grouped_offset(&groups, 3);
         let mock = MockGroup {
             calls: std::cell::RefCell::new(Vec::new()),
             fail: Box::new(move |_, sites, is_return| {
@@ -4703,6 +4946,56 @@ mod tests {
         assert!(format!("{error}").contains("multi-uprobe unsupported"));
         // Return linked, then the entry side proved the kernel lacks multi.
         assert_eq!(mock.calls.borrow().len(), 2);
+    }
+
+    fn multi_link(program: &'static str, slots: Vec<u32>) -> RegisteredLink {
+        RegisteredLink::MultiUProbe {
+            program,
+            slots,
+            fds: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn multi_link_registry_reports_members_program_and_no_context() {
+        let link = multi_link("p11_entry", vec![3, 7]);
+        assert_eq!(link.slots(), &[3, 7]);
+        assert!(matches!(
+            link.producer(),
+            ProducerProgram::UProbe("p11_entry")
+        ));
+        assert_eq!(link.context(), None);
+        let link = multi_link("p11_return", vec![9]);
+        assert!(matches!(
+            link.producer(),
+            ProducerProgram::UProbe("p11_return")
+        ));
+    }
+
+    #[test]
+    fn partial_multi_member_retirement_is_refused_whole_bundle_is_not() {
+        let links = vec![multi_link("p11_return", vec![3, 7])];
+        assert_eq!(
+            find_partial_multi_member(&links, &BTreeSet::from([7, 9])),
+            Some(7)
+        );
+        assert_eq!(
+            find_partial_multi_member(&links, &BTreeSet::from([3, 7])),
+            None
+        );
+        assert_eq!(
+            find_partial_multi_member(&links, &BTreeSet::from([9])),
+            None
+        );
+        assert_eq!(find_partial_multi_member(&[], &BTreeSet::from([7])), None);
+    }
+
+    #[test]
+    fn slot_coverage_sees_multi_members() {
+        let links = vec![multi_link("p11_return", vec![3, 7])];
+        assert!(links_cover_slot(&links, 7));
+        assert!(!links_cover_slot(&links, 9));
+        assert!(!links_cover_slot(&[], 7));
     }
 
     #[test]

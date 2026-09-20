@@ -266,7 +266,7 @@ fn not_applicable(name: &str, reason: &str) -> Check {
     }
 }
 
-fn parse_major_minor(release: &str) -> Option<(u32, u32)> {
+pub(crate) fn parse_major_minor(release: &str) -> Option<(u32, u32)> {
     let mut parts = release.split(|c: char| !c.is_ascii_digit());
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;

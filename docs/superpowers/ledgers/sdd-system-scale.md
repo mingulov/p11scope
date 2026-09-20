@@ -321,3 +321,40 @@ Build env: TMPDIR=/var/tmp/p11scope-ws-tmp cargo +1.88 --locked --offline.
   (733s). Repair envelope E-burst…E-discovery + conditional
   loss(R) system points + handoff + named gaps recorded in
   docs/notes/2026-09-20-task-3.1-loss-shares.md.
+- Task 2.2: implementer DONE (bb62412 tip; 17 commits from
+  29f7432 section-pin RED through 48d663c scratch-loader fix,
+  467b94e 11-lane note, 2bc41a4 guard marker, bb62412
+  corroboration). Mixed loading + regrouped multi attach:
+  vendored Aya p2 multi backport (USE for link creation, singles
+  path kept), `--attach-backend auto|multi|singles` on every
+  capture surface, regroup by (path, entry program), return-first
+  grouped orchestration with bisect + fallback sentinel, pid-0
+  multi scope, uprobe-multi evidence + doctor self-link row.
+  Measurement (note docs/notes/2026-09-20-task-2.2-multi.md):
+  11 live lanes (SoftHSM2, 68 slots/136 endpoints) — 136/136 on
+  2 multi links vs 136 perf links, 54 vs 188 observer fds,
+  identical 227-call distribution, oracle PASS every metrics run;
+  reviewer corroboration (104 slots/208 endpoints, 100
+  deterministic table calls): singles/multi/auto capture
+  identical 100/100 with 0 loss, bpftool census 218 → 12 links,
+  setup <1 s, detach 1–2 ms both backends. EINVAL root cause on
+  the way: kernel rejects `-` in BPF object names (logless);
+  scratch prog renamed, charset pinned by test. Suite: full
+  `cargo +1.88 test --locked --offline` green 1451/0 (4 ignored),
+  contracts 129/129, fmt clean. Flake history (all disclosed):
+  one real stale-marker guard failure (fixed 2bc41a4, property
+  preserved); timing singles (history Deadline, root_fence
+  Deadline, 2 preexec under a throttled run, lane13 k8s
+  port-forward timeout) each green in isolation and in other
+  full runs, all in code untouched by this branch, box load
+  ~7–12 throughout (siblings + lane VMs).
+- Task 2.2: review (self, inline — worker cancelled after its
+  note landed): Spec ✅ / Approved. Re-verified: regroup key +
+  deterministic order, return-first/entry-paired orchestration
+  with failure-path parity to singles, auto session-granularity
+  rebuild on BackendFallbackRequired, partial-group retirement
+  refuses fail-closed with the Task 2.3 pointer, mechanism labels
+  match the oracle rule, CLI on all three capture surfaces,
+  doctor self-link Ok measured privileged. No new breakage;
+  third-party backport accepted by measurement (section test +
+  e2e link census), not by line review.

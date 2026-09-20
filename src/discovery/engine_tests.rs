@@ -16,6 +16,7 @@ use crate::discovery::scan::{
     IO_CEILING_REASON, SCAN_DEADLINE_REASON, ScanLimits, ScannedEntry, ScannedTable,
     WORK_CEILING_REASON, order_tables_by_evidence,
 };
+use crate::discovery::scheduler::MAX_PENDING_REFRESH;
 use crate::{semantics, trace};
 use p11scope_manifest::manifest::{
     Acquisition, AliasEntry, AliasGroup, FunctionRecord, InterfaceClassification, SurfaceRecord,
@@ -4129,10 +4130,12 @@ fn capture_start_members_that_ended_are_not_losses() {
 /// Task 2 (cgroup-256 B1): the multi-process scan cap is a CLI-settable Engine
 /// field, not a hardcoded constant. Five live members with the cap at two: the
 /// initial pass scans at most two and publishes a skip naming the effective
-/// value, and one refresh tick keeps exactly that selected set and
-/// republishes the bound. (Task 4: identical members share one provider
-/// group, so five `sleep`s deep-scan as one representative — the bound is an
-/// upper bound now, not a pid-order head-take.)
+/// value, ordinary refresh ticks keep the retained set (filling a free slot
+/// by rotation, never past the cap) and republish the bound as a deferral
+/// gap, and the reconciliation pass republishes it as a rarity selection.
+/// (Task 4: identical members share one provider group, so five `sleep`s
+/// deep-scan as one representative — the bound is an upper bound now, not a
+/// pid-order head-take.)
 #[test]
 fn max_scan_pids_bounds_initial_scan_and_refresh() {
     struct ChildrenGuard(Vec<std::process::Child>);
@@ -4238,16 +4241,39 @@ fn max_scan_pids_bounds_initial_scan_and_refresh() {
     );
     refresh_inventory_once(&mut engine);
     let kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
-    assert_eq!(
-        kept, initial,
-        "one refresh tick keeps exactly the selected set"
+    assert!(
+        initial.iter().all(|pid| kept.contains(pid)),
+        "an ordinary tick displaces nothing: {initial:?} -> {kept:?}"
     );
+    assert!(
+        kept.len() <= 2,
+        "rotation never admits past the cap: {kept:?}"
+    );
+    if initial.len() == 1 {
+        assert_eq!(
+            kept.len(),
+            2,
+            "one free slot admits exactly one rotation candidate"
+        );
+    }
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.reason.contains("live discovery deferred")
+                && skip.reason.contains("to the periodic reconciliation sweep")
+        }),
+        "the ordinary refresh skip names the deferral gap: {:?}",
+        engine.counters.object_skips
+    );
+    // The reconciliation pass republishes the bound as a rarity selection.
+    refresh_inventory_once(&mut engine);
+    refresh_inventory_once(&mut engine);
+    refresh_inventory_once(&mut engine);
     assert!(
         engine.counters.object_skips.iter().any(|skip| {
             skip.reason.contains("live discovery selected")
                 && skip.reason.contains("for deep scanning by provider rarity")
         }),
-        "the refresh skip names the actual selected set: {:?}",
+        "the reconcile skip names the actual selected set: {:?}",
         engine.counters.object_skips
     );
 
@@ -4438,13 +4464,769 @@ fn zero_cap_refresh_short_circuits_the_sweep_to_empty() {
     }
 }
 
+/// Task 3.1b: an ordinary over-cap refresh tick performs no maps sweep.
+/// Five retained views under a cap of two leave nothing to select, so the
+/// tick must charge zero budget bytes and publish no rarity selection —
+/// the full sweep belongs to the slower reconciliation pass, not to every
+/// tick against the lifetime budget.
+#[test]
+fn ordinary_over_cap_refresh_performs_no_maps_sweep() {
+    struct ChildrenGuard(Vec<std::process::Child>);
+    impl Drop for ChildrenGuard {
+        fn drop(&mut self) {
+            for child in &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    let mut children = ChildrenGuard(
+        (0..5)
+            .map(|_| {
+                std::process::Command::new("sleep")
+                    .arg("30")
+                    .spawn()
+                    .unwrap()
+            })
+            .collect(),
+    );
+    let pids: Vec<_> = children.0.iter().map(|child| child.id()).collect();
+    let dir = tempfile::tempdir().expect("a scope directory");
+    let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
+    std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
+    let args = CaptureArgs {
+        kind: crate::cli::Kind::Profile,
+        modules: vec![],
+        manifests: vec![],
+        hooks: HookRegistry::builtin(),
+        scope: crate::cli::ScopeArg::Cgroup(dir.path().to_path_buf()),
+        metrics: false,
+        duration: None,
+        out: None,
+        max_events: None,
+        ring_bytes: None,
+        drain_interval: None,
+        max_scan_pids: None,
+        unsafe_requested: false,
+        allow_confined_uretprobe: false,
+        attach_backend: BackendSelection::default(),
+    };
+    let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
+
+    let self_exe = std::env::current_exe().unwrap();
+    for child in &children.0 {
+        let pid = child.id();
+        let exe = format!("/proc/{pid}/exe");
+        let mut execed = false;
+        for _ in 0..500 {
+            if std::fs::read_link(&exe).is_ok_and(|target| target != self_exe) {
+                execed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(execed, "sleep child {pid} never execed");
+    }
+
+    let mut engine = Engine::discover(&args, &scope, None).expect("an uncapped cgroup captures");
+    assert_eq!(engine.views.len(), 5, "all five members are retained");
+    engine.max_scan_pids = 2;
+
+    let budget_before = engine.budget.attempted_io_bytes();
+    refresh_inventory_once(&mut engine);
+    let budget_after = engine.budget.attempted_io_bytes();
+
+    assert_eq!(
+        budget_after - budget_before,
+        0,
+        "an ordinary over-cap tick reads no maps"
+    );
+    assert!(
+        !engine.counters.object_skips.iter().any(|skip| {
+            skip.reason.contains("live discovery selected")
+                && skip.reason.contains("for deep scanning by provider rarity")
+        }),
+        "no rarity selection runs on an ordinary tick: {:?}",
+        engine.counters.object_skips
+    );
+    let kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
+    assert_eq!(kept.len(), 5, "the tick retires nothing");
+
+    for child in &mut children.0 {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+}
+
+/// Task 3.1b: lifecycle/loader refresh requests enqueue bounded work. Past
+/// the cap, excess requests are dropped with explicit truncation evidence —
+/// never an unbounded userspace queue — while a re-request for an already
+/// queued pid stays free.
+#[test]
+fn refresh_request_queue_is_bounded_with_explicit_overflow() {
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
+    for pid in 1..=(MAX_PENDING_REFRESH as u32 + 44) {
+        engine.request_refresh(pid);
+    }
+    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    assert_eq!(engine.discovery_truncated, 44);
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.subject == "live discovery refresh"
+                && skip
+                    .reason
+                    .contains("refresh requests exceeded the bounded pending queue")),
+        "overflow publishes explicit loss: {:?}",
+        engine.counters.object_skips
+    );
+    // Re-requesting a queued pid is a no-op, not more overflow.
+    engine.request_refresh(1);
+    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    assert_eq!(engine.discovery_truncated, 44);
+}
+
+/// Task 3.1b: the loader half of the bounded-work contract. Deferred loader
+/// memory scans already cap at the loader-context ledger; past it, the
+/// excess scan is dropped with the same explicit truncation evidence.
+#[test]
+fn loader_deferral_bound_drops_with_explicit_loss() {
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
+    let context = crate::discovery::loader::LoaderContextId::from_case_id(0);
+    for index in 0..=(crate::discovery::loader::MAX_LOADER_CONTEXTS as u32) {
+        engine.defer_loader_memory_scan(
+            PendingLoaderScanKey {
+                view: ProcessViewId(index),
+                context,
+            },
+            7,
+        );
+    }
+    assert_eq!(
+        engine.pending_loader_scans.len(),
+        crate::discovery::loader::MAX_LOADER_CONTEXTS
+    );
+    assert_eq!(engine.discovery_truncated, 1);
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live loader memory discovery"
+                && skip
+                    .reason
+                    .contains("exceeded the bounded loader-context ledger")
+        }),
+        "loader overflow publishes explicit loss: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// Task 3.1b: ordinary rotation admits unscanned views into free slots and
+/// never displaces a retained view. Five members under a cap of two: the
+/// first ordinary pass fills the free slot (if any) with the lowest
+/// unscanned pid, later passes keep the admitted set, and the deferral gap
+/// names exact counts without naming any pid.
+#[test]
+fn retained_views_survive_ordinary_rotation_passes() {
+    struct ChildrenGuard(Vec<std::process::Child>);
+    impl Drop for ChildrenGuard {
+        fn drop(&mut self) {
+            for child in &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    let mut children = ChildrenGuard(
+        (0..5)
+            .map(|_| {
+                std::process::Command::new("sleep")
+                    .arg("30")
+                    .spawn()
+                    .unwrap()
+            })
+            .collect(),
+    );
+    let mut pids: Vec<_> = children.0.iter().map(|child| child.id()).collect();
+    pids.sort_unstable();
+    let dir = tempfile::tempdir().expect("a scope directory");
+    let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
+    std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
+    let args = CaptureArgs {
+        kind: crate::cli::Kind::Profile,
+        modules: vec![],
+        manifests: vec![],
+        hooks: HookRegistry::builtin(),
+        scope: crate::cli::ScopeArg::Cgroup(dir.path().to_path_buf()),
+        metrics: false,
+        duration: None,
+        out: None,
+        max_events: None,
+        ring_bytes: None,
+        drain_interval: None,
+        max_scan_pids: Some(2),
+        unsafe_requested: false,
+        allow_confined_uretprobe: false,
+        attach_backend: BackendSelection::default(),
+    };
+    let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
+
+    let self_exe = std::env::current_exe().unwrap();
+    for child in &children.0 {
+        let pid = child.id();
+        let exe = format!("/proc/{pid}/exe");
+        let mut execed = false;
+        for _ in 0..500 {
+            if std::fs::read_link(&exe).is_ok_and(|target| target != self_exe) {
+                execed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(execed, "sleep child {pid} never execed");
+    }
+
+    let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
+    let initial: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
+    assert!(
+        (1..=2).contains(&initial.len()),
+        "identical members share representatives: {}",
+        initial.len()
+    );
+
+    refresh_inventory_once(&mut engine);
+    let after_first: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
+    assert!(
+        initial.iter().all(|pid| after_first.contains(pid)),
+        "rotation displaces nothing: {initial:?} -> {after_first:?}"
+    );
+    if initial.len() == 1 {
+        // One free slot: rotation admits the lowest unscanned pid.
+        let lowest_unknown = pids.iter().find(|pid| !initial.contains(pid)).unwrap();
+        assert_eq!(after_first.len(), 2);
+        assert!(
+            after_first.contains(lowest_unknown),
+            "rotation admits the lowest unscanned pid: {after_first:?}"
+        );
+    } else {
+        assert_eq!(after_first, initial, "a full cap admits nothing");
+    }
+    // The deferral gap is exact and categorical: counts only, no pids.
+    let deferred = engine
+        .counters
+        .object_skips
+        .iter()
+        .find(|skip| skip.reason.contains("periodic reconciliation sweep"));
+    assert_eq!(
+        deferred.map(|skip| skip.reason.as_str()),
+        Some(
+            "5 processes in scope; live discovery deferred 3 unscanned processes to the periodic reconciliation sweep (limit 2)"
+        ),
+        "deferral gap names exact counts: {:?}",
+        engine.counters.object_skips
+    );
+
+    refresh_inventory_once(&mut engine);
+    refresh_inventory_once(&mut engine);
+    let kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
+    assert!(
+        after_first.iter().all(|pid| kept.contains(pid)),
+        "later ordinary passes displace nothing: {after_first:?} -> {kept:?}"
+    );
+    assert_eq!(kept.len(), 2, "the cap stays full without churn");
+
+    for child in &mut children.0 {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+}
+
+/// Task 3.1b: the reconciliation pass re-reads maps (never from a cache),
+/// keeps rarity-ordered admission for what its slice covers, and parks the
+/// cursor at the last pid read. Ordinary passes around it charge nothing.
+#[test]
+fn reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor() {
+    struct ChildrenGuard(Vec<std::process::Child>);
+    impl Drop for ChildrenGuard {
+        fn drop(&mut self) {
+            for child in &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    let mut children = ChildrenGuard(
+        (0..5)
+            .map(|_| {
+                std::process::Command::new("sleep")
+                    .arg("30")
+                    .spawn()
+                    .unwrap()
+            })
+            .collect(),
+    );
+    let mut pids: Vec<_> = children.0.iter().map(|child| child.id()).collect();
+    pids.sort_unstable();
+    let dir = tempfile::tempdir().expect("a scope directory");
+    let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
+    std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
+    let args = CaptureArgs {
+        kind: crate::cli::Kind::Profile,
+        modules: vec![],
+        manifests: vec![],
+        hooks: HookRegistry::builtin(),
+        scope: crate::cli::ScopeArg::Cgroup(dir.path().to_path_buf()),
+        metrics: false,
+        duration: None,
+        out: None,
+        max_events: None,
+        ring_bytes: None,
+        drain_interval: None,
+        max_scan_pids: Some(2),
+        unsafe_requested: false,
+        allow_confined_uretprobe: false,
+        attach_backend: BackendSelection::default(),
+    };
+    let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
+
+    let self_exe = std::env::current_exe().unwrap();
+    for child in &children.0 {
+        let pid = child.id();
+        let exe = format!("/proc/{pid}/exe");
+        let mut execed = false;
+        for _ in 0..500 {
+            if std::fs::read_link(&exe).is_ok_and(|target| target != self_exe) {
+                execed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(execed, "sleep child {pid} never execed");
+    }
+
+    let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
+    let initial_len = engine.views.len();
+    engine.scheduler.set_quantum_ns_for_test(u64::MAX);
+
+    // Passes 1-3 are ordinary: only a rotation admission charges.
+    let before = engine.budget.attempted_io_bytes();
+    refresh_inventory_once(&mut engine);
+    let pass1 = engine.budget.attempted_io_bytes() - before;
+    if initial_len == 1 {
+        assert!(pass1 > 0, "the rotation admission deep-scans its one view");
+        assert_eq!(engine.views.len(), 2);
+    } else {
+        assert_eq!(pass1, 0, "a full cap charges nothing on ordinary ticks");
+    }
+    for pass in 2..=3 {
+        let before = engine.budget.attempted_io_bytes();
+        refresh_inventory_once(&mut engine);
+        assert_eq!(
+            engine.budget.attempted_io_bytes() - before,
+            0,
+            "ordinary pass {pass} charges nothing"
+        );
+    }
+
+    // Pass 4 reconciles: the slice re-reads every enumerated maps file,
+    // rarity selection runs over the slice, and the cursor parks at the end.
+    let before = engine.budget.attempted_io_bytes();
+    refresh_inventory_once(&mut engine);
+    let pass4 = engine.budget.attempted_io_bytes() - before;
+    assert!(pass4 > 0, "the reconcile slice reads maps, never cached");
+    assert_eq!(engine.scheduler.cursor_for_test(), Some(pids[4]));
+    let rarity = engine
+        .counters
+        .object_skips
+        .iter()
+        .find(|skip| skip.reason.contains("live discovery selected"));
+    assert_eq!(
+        rarity.map(|skip| skip.reason.as_str()),
+        Some(
+            "5 processes in scope; live discovery selected 0 new candidates for deep scanning by provider rarity (limit 2)"
+        ),
+        "reconcile keeps rarity admission: {:?}",
+        engine.counters.object_skips
+    );
+
+    // Passes 5-7 are ordinary again; pass 8 reconciles and re-reads —
+    // maps bytes are never served from a cache.
+    for pass in 5..=7 {
+        let before = engine.budget.attempted_io_bytes();
+        refresh_inventory_once(&mut engine);
+        assert_eq!(
+            engine.budget.attempted_io_bytes() - before,
+            0,
+            "ordinary pass {pass} charges nothing"
+        );
+    }
+    let before = engine.budget.attempted_io_bytes();
+    refresh_inventory_once(&mut engine);
+    assert!(
+        engine.budget.attempted_io_bytes() - before > 0,
+        "the next reconcile re-reads maps too"
+    );
+
+    for child in &mut children.0 {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+}
+
+/// Task 3.1b: the reconcile cursor is incremental — each sweep covers the
+/// next slice and wraps — and each incomplete slice publishes its exact
+/// coverage plus its generation-revalidation count as a categorical gap.
+#[test]
+fn reconcile_cursor_advances_incrementally_and_wraps() {
+    struct ChildrenGuard(Vec<std::process::Child>);
+    impl Drop for ChildrenGuard {
+        fn drop(&mut self) {
+            for child in &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    let mut children = ChildrenGuard(
+        (0..5)
+            .map(|_| {
+                std::process::Command::new("sleep")
+                    .arg("30")
+                    .spawn()
+                    .unwrap()
+            })
+            .collect(),
+    );
+    let mut pids: Vec<_> = children.0.iter().map(|child| child.id()).collect();
+    pids.sort_unstable();
+    let dir = tempfile::tempdir().expect("a scope directory");
+    let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
+    std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
+    let args = CaptureArgs {
+        kind: crate::cli::Kind::Profile,
+        modules: vec![],
+        manifests: vec![],
+        hooks: HookRegistry::builtin(),
+        scope: crate::cli::ScopeArg::Cgroup(dir.path().to_path_buf()),
+        metrics: false,
+        duration: None,
+        out: None,
+        max_events: None,
+        ring_bytes: None,
+        drain_interval: None,
+        max_scan_pids: Some(2),
+        unsafe_requested: false,
+        allow_confined_uretprobe: false,
+        attach_backend: BackendSelection::default(),
+    };
+    let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
+
+    let self_exe = std::env::current_exe().unwrap();
+    for child in &children.0 {
+        let pid = child.id();
+        let exe = format!("/proc/{pid}/exe");
+        let mut execed = false;
+        for _ in 0..500 {
+            if std::fs::read_link(&exe).is_ok_and(|target| target != self_exe) {
+                execed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(execed, "sleep child {pid} never execed");
+    }
+
+    // The initial sweep can transiently degrade under parallel load (one maps
+    // read fails, that pid trails as an individual, and the representatives
+    // move), so retry for an agreeing lowest-first discovery. A
+    // deterministically broken selection never agrees and still fails on the
+    // last attempt (Task-2 retry idiom).
+    let mut agreed = None;
+    for _ in 0..50 {
+        let candidate =
+            Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
+        let view_pids: Vec<u32> = candidate.views.iter().map(|view| view.pid()).collect();
+        let agrees = view_pids.as_slice() == &pids[..view_pids.len()];
+        agreed = Some(candidate);
+        if agrees {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let mut engine = agreed.unwrap();
+    let initial: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
+    assert_eq!(
+        initial.as_slice(),
+        &pids[..initial.len()],
+        "the retained views are the lowest-pid members"
+    );
+    engine.scheduler.set_quantum_ns_for_test(u64::MAX);
+    engine.scheduler.set_slice_pids_for_test(2);
+
+    for _ in 0..3 {
+        refresh_inventory_once(&mut engine);
+    }
+    // The cap is full with the two lowest pids after the ordinary passes.
+    let mut kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
+    kept.sort_unstable();
+    assert_eq!(kept, pids[..2]);
+
+    // Pass 4: first slice covers the two lowest pids, both retained.
+    refresh_inventory_once(&mut engine);
+    assert_eq!(engine.scheduler.cursor_for_test(), Some(pids[1]));
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.reason
+                == "reconciliation sweep covered 2 of 5 observed processes and revalidated 2 retained generations; 3 deferred to the next sweep"
+        }),
+        "first slice gap is exact: {:?}",
+        engine.counters.object_skips
+    );
+
+    // Pass 8: next slice covers the following two pids, neither retained.
+    for _ in 0..3 {
+        refresh_inventory_once(&mut engine);
+    }
+    refresh_inventory_once(&mut engine);
+    assert_eq!(engine.scheduler.cursor_for_test(), Some(pids[3]));
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.reason
+                == "reconciliation sweep covered 2 of 5 observed processes and revalidated 0 retained generations; 3 deferred to the next sweep"
+        }),
+        "second slice gap is exact: {:?}",
+        engine.counters.object_skips
+    );
+
+    // Pass 12: the slice wraps past the end to the lowest pid.
+    for _ in 0..3 {
+        refresh_inventory_once(&mut engine);
+    }
+    refresh_inventory_once(&mut engine);
+    assert_eq!(engine.scheduler.cursor_for_test(), Some(pids[0]));
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.reason
+                == "reconciliation sweep covered 2 of 5 observed processes and revalidated 1 retained generations; 3 deferred to the next sweep"
+        }),
+        "wrapped slice gap is exact: {:?}",
+        engine.counters.object_skips
+    );
+
+    for child in &mut children.0 {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+}
+
+/// Task 3.1b: a zero wall-time quantum stops the reconcile slice before its
+/// first read — the whole slice defers explicitly and the cursor holds.
+#[test]
+fn reconcile_quantum_zero_defers_the_whole_slice() {
+    struct ChildrenGuard(Vec<std::process::Child>);
+    impl Drop for ChildrenGuard {
+        fn drop(&mut self) {
+            for child in &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    let mut children = ChildrenGuard(
+        (0..3)
+            .map(|_| {
+                std::process::Command::new("sleep")
+                    .arg("30")
+                    .spawn()
+                    .unwrap()
+            })
+            .collect(),
+    );
+    let pids: Vec<_> = children.0.iter().map(|child| child.id()).collect();
+    let dir = tempfile::tempdir().expect("a scope directory");
+    let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
+    std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
+    let args = CaptureArgs {
+        kind: crate::cli::Kind::Profile,
+        modules: vec![],
+        manifests: vec![],
+        hooks: HookRegistry::builtin(),
+        scope: crate::cli::ScopeArg::Cgroup(dir.path().to_path_buf()),
+        metrics: false,
+        duration: None,
+        out: None,
+        max_events: None,
+        ring_bytes: None,
+        drain_interval: None,
+        max_scan_pids: Some(1),
+        unsafe_requested: false,
+        allow_confined_uretprobe: false,
+        attach_backend: BackendSelection::default(),
+    };
+    let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
+
+    let self_exe = std::env::current_exe().unwrap();
+    for child in &children.0 {
+        let pid = child.id();
+        let exe = format!("/proc/{pid}/exe");
+        let mut execed = false;
+        for _ in 0..500 {
+            if std::fs::read_link(&exe).is_ok_and(|target| target != self_exe) {
+                execed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(execed, "sleep child {pid} never execed");
+    }
+
+    let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
+    engine.scheduler.set_quantum_ns_for_test(0);
+
+    for _ in 0..3 {
+        refresh_inventory_once(&mut engine);
+    }
+    assert_eq!(engine.scheduler.cursor_for_test(), None);
+    let before = engine.budget.attempted_io_bytes();
+    refresh_inventory_once(&mut engine);
+    assert_eq!(
+        engine.budget.attempted_io_bytes() - before,
+        0,
+        "a zero quantum reads nothing"
+    );
+    assert_eq!(
+        engine.scheduler.cursor_for_test(),
+        None,
+        "an unread slice advances nothing"
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.reason.contains("covered 0 of 3 observed processes")
+                && skip.reason.contains("deferred to the next sweep")
+        }),
+        "the deferred slice is explicit: {:?}",
+        engine.counters.object_skips
+    );
+
+    for child in &mut children.0 {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+}
+
+/// Task 3.1b: event-driven refresh requests survive allocation exhaustion.
+/// Three retained views under a cap of two leave no free slot, and two
+/// further members arrive with queued lifecycle refreshes: an ordinary pass
+/// admits nothing, keeps both queued requests for a later pass, and
+/// publishes the standard capacity skip instead of dropping the work.
+#[test]
+fn refresh_requests_survive_allocation_exhaustion() {
+    struct ChildrenGuard(Vec<std::process::Child>);
+    impl Drop for ChildrenGuard {
+        fn drop(&mut self) {
+            for child in &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    let mut children = ChildrenGuard(
+        (0..5)
+            .map(|_| {
+                std::process::Command::new("sleep")
+                    .arg("30")
+                    .spawn()
+                    .unwrap()
+            })
+            .collect(),
+    );
+    let mut pids: Vec<_> = children.0.iter().map(|child| child.id()).collect();
+    pids.sort_unstable();
+    let dir = tempfile::tempdir().expect("a scope directory");
+    let listing: String = pids[..3].iter().map(|pid| format!("{pid}\n")).collect();
+    std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
+    let args = CaptureArgs {
+        kind: crate::cli::Kind::Profile,
+        modules: vec![],
+        manifests: vec![],
+        hooks: HookRegistry::builtin(),
+        scope: crate::cli::ScopeArg::Cgroup(dir.path().to_path_buf()),
+        metrics: false,
+        duration: None,
+        out: None,
+        max_events: None,
+        ring_bytes: None,
+        drain_interval: None,
+        max_scan_pids: None,
+        unsafe_requested: false,
+        allow_confined_uretprobe: false,
+        attach_backend: BackendSelection::default(),
+    };
+    let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
+
+    let self_exe = std::env::current_exe().unwrap();
+    for child in &children.0 {
+        let pid = child.id();
+        let exe = format!("/proc/{pid}/exe");
+        let mut execed = false;
+        for _ in 0..500 {
+            if std::fs::read_link(&exe).is_ok_and(|target| target != self_exe) {
+                execed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(execed, "sleep child {pid} never execed");
+    }
+
+    let mut engine = Engine::discover(&args, &scope, None).expect("an uncapped cgroup captures");
+    assert_eq!(engine.views.len(), 3, "three members are retained");
+    // Two further members arrive; the cap drops below the retained count.
+    let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
+    std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
+    engine.max_scan_pids = 2;
+    // Queue event-driven refreshes for the two unknown members.
+    engine.refresh_requested.insert(pids[3]);
+    engine.refresh_requested.insert(pids[4]);
+
+    refresh_inventory_once(&mut engine);
+
+    assert!(
+        engine.refresh_requested.contains(&pids[3]) && engine.refresh_requested.contains(&pids[4]),
+        "exhaustion retains the queued work: {:?}",
+        engine.refresh_requested
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.reason
+                .contains("capture process-view capacity 2 was exhausted")
+        }),
+        "exhaustion publishes the standard skip: {:?}",
+        engine.counters.object_skips
+    );
+
+    for child in &mut children.0 {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+}
+
 /// Task 3 (cgroup-256 A2): with an exhausted view-ID space, allocation
 /// failure degrades to evidence, never fatal. Two members admitted at cap
-/// two, then a third member arrives: the refresh tick returns `Ok`, keeps
-/// the admitted views, and publishes the standard skip naming the effective
-/// value. (The initial-scan path is unreachable post-Task-2 — fresh engine
-/// plus a matching ceiling — so the refresh tick carries the behavioral
-/// coverage; the shape test below pins the defensive initial-scan sites.)
+/// two, then a third member arrives: the ordinary tick returns `Ok`, keeps
+/// the admitted views, and defers the newcomer with an exact gap (rotation
+/// only fills free slots, so no allocation is attempted); a queued
+/// lifecycle refresh for the newcomer then attempts admission, exhausts,
+/// and publishes the standard skip naming the effective value. (The
+/// initial-scan path is unreachable post-Task-2 — fresh engine plus a
+/// matching ceiling — so the refresh tick carries the behavioral coverage;
+/// the shape test below pins the defensive initial-scan sites.)
 #[test]
 fn id_exhaustion_publishes_skip_instead_of_failing() {
     let mut children: Vec<_> = (0..2)
@@ -4501,12 +5283,30 @@ fn id_exhaustion_publishes_skip_instead_of_failing() {
     assert_eq!(engine.views.len(), 2, "both members admitted at cap two");
     let admitted: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
 
-    // A third member arrives after admission: its provider group differs
-    // from the sleeps', so selection names it a candidate and allocation —
-    // with both IDs spent — exhausts.
-    pids.push(std::process::id());
+    // A third member arrives after admission with no lifecycle event: the
+    // ordinary tick keeps the admitted views and defers the newcomer with
+    // an exact gap instead of attempting an allocation it cannot fill.
+    let newcomer = std::process::id();
+    pids.push(newcomer);
     let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
+    refresh_inventory_once(&mut engine);
+
+    let kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
+    assert_eq!(kept, admitted, "deferral keeps the admitted views");
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.reason
+                == "3 processes in scope; live discovery deferred 1 unscanned processes to the periodic reconciliation sweep (limit 2)"
+        }),
+        "arrival without an event publishes the exact deferral gap: {:?}",
+        engine.counters.object_skips
+    );
+
+    // A queued lifecycle refresh for the newcomer attempts admission and
+    // exhausts: the standard skip names the effective value, the request
+    // stays queued for a later pass, and nothing is displaced.
+    engine.request_refresh(newcomer);
     refresh_inventory_once(&mut engine);
 
     let kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
@@ -4519,6 +5319,11 @@ fn id_exhaustion_publishes_skip_instead_of_failing() {
         }),
         "exhaustion publishes the standard skip with the effective value: {:?}",
         engine.counters.object_skips
+    );
+    assert!(
+        engine.refresh_requested.contains(&newcomer),
+        "exhaustion retains the queued refresh: {:?}",
+        engine.refresh_requested
     );
 
     for child in &mut children {

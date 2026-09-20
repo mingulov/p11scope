@@ -421,3 +421,42 @@ Build env: TMPDIR=/var/tmp/p11scope-ws-tmp cargo +1.88 --locked --offline.
   `arming_a_static_executable` failure and one unattributed 2-fail
   run mid-task, both green in isolation and in the final full run
   (live-process/timing class, code untouched by this branch).
+- Task 3.1b: implementer DONE (branch task-3.1b/discovery-scheduling).
+  Bounded discovery scheduling: lifecycle/loader refresh requests go
+  through `request_refresh` (cap 256 = view ceiling, overflow into
+  `discovery_truncated` + stable loss skip; loader deferral was already
+  bounded at 256, now pinned by test); over-cap inventory passes are
+  ordinary (queued requests + lowest-first rotation window sized to free
+  slots, zero maps reads, exact deferred gap) or reconcile (every 4th
+  pass: ≤64-pid slice after an incremental wrapping cursor, 50 ms
+  wall-time quantum, generation revalidation counted per slice,
+  rarity-ordered admission inside the slice, exact coverage gap).
+  Initial discovery keeps its full sweep; under-cap and zero-cap paths
+  are behavior-identical. Exhaustion retains unprocessed queued pids
+  (bounded) instead of dropping them. No maps/heap caching added (slice
+  bytes re-read every sweep, pinned by test); file-fact caches stay
+  pin-keyed (existing `changed_file_rereads_elf` + hit tests). No
+  schema/checker change: all gaps flatten via `capture_skipped_out` to
+  the existing categorical vocabulary. Tick order untouched
+  (discovery-before-semantic-consumption preserved).
+  Measurement (deterministic work-count, not wall time — no perf claim):
+  `ordinary_over_cap_refresh_performs_no_maps_sweep` RED on base
+  cb6337d charged 24,270 budget bytes (5 maps reads) on one ordinary
+  over-cap tick, GREEN at tip charges 0. Command:
+  `TMPDIR=/var/tmp/p11scope-ws-tmp cargo +1.88 test --locked
+  --offline -p p11scope --lib -- ordinary_over_cap_refresh_performs_no_maps_sweep`.
+  Live tick-latency validation against 3.1-repair's 1895 ms forced-sweep
+  max is left for the reviewer/integration lane (noisy shared box).
+  Suite: full `cargo +1.88 test --locked --offline` green 0 failures
+  (lib 1196/0 + 4 ignored, contracts 129/129), fmt clean, clippy
+  `--workspace --all-targets -D warnings` clean. Tests: 14 added (6
+  scheduler unit + 8 engine), 2 updated for the behavior change
+  (cap-sibling: ordinary deferral + reconcile rarity; id-exhaustion:
+  arrival deferral + pending-driven exhaustion), 0 removed, none
+  weakened. Flake note: one full-gate run failed in
+  `system_scope_refresh_admits_later_generation_in_same_engine`
+  (attached_slots shortfall, admission asserts all green) with EPERM +
+  truncated-maps stdout — byte-identical signature to the recorded 1.2
+  contention flake; isolation re-run green 0.85s on this tree, next
+  full gate green. No test edits — the timeouts/parallelism are
+  load-bearing process-test contracts.

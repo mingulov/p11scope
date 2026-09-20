@@ -22,6 +22,7 @@ use crate::discovery::scan::{
     scan_process_view, scan_process_view_without_memory, spans_for, table_evidence_score,
     table_linkage, target_layout,
 };
+use crate::discovery::scheduler::{DiscoveryScheduler, InventoryCadence, MAX_PENDING_REFRESH};
 use crate::manifest_input::{read_manifest, selection_surface_usable, validate_structure};
 use crate::process::{self, OriginalGenerationState, ProcessView, ProcessViewId};
 use crate::run::OwnedChild;
@@ -85,6 +86,7 @@ pub struct Engine {
     counter_snapshot: CounterSnapshot,
     malformed_discovery: u64,
     refresh_requested: BTreeSet<u32>,
+    scheduler: DiscoveryScheduler,
     loader_records_accepted: u64,
     timings: CausalTimings,
     discovery_truncated: u64,
@@ -6747,6 +6749,7 @@ impl Engine {
             counter_snapshot: CounterSnapshot::default(),
             malformed_discovery: 0,
             refresh_requested: BTreeSet::new(),
+            scheduler: DiscoveryScheduler::new(),
             loader_records_accepted: 0,
             timings: CausalTimings::default(),
             discovery_truncated: 0,
@@ -7831,6 +7834,25 @@ impl Engine {
         Self::scan_retained_view_with(|counters| {
             scan_and_pin_without_memory(view, module_hints, hooks, budget, counters, broad_admit)
         })
+    }
+
+    /// Enqueues one lifecycle/loader refresh request on the bounded pending
+    /// queue (Task 3.1b). Past the cap the excess request is dropped with
+    /// explicit truncation evidence — the queue never grows unbounded.
+    /// Re-requesting an already-queued pid is free.
+    fn request_refresh(&mut self, pid: u32) {
+        if self.refresh_requested.contains(&pid) {
+            return;
+        }
+        if self.refresh_requested.len() >= MAX_PENDING_REFRESH {
+            self.discovery_truncated = self.discovery_truncated.saturating_add(1);
+            self.mark_live_loss(
+                "live discovery refresh",
+                "refresh requests exceeded the bounded pending queue; excess requests were dropped",
+            );
+            return;
+        }
+        self.refresh_requested.insert(pid);
     }
 
     fn defer_loader_memory_scan(&mut self, key: PendingLoaderScanKey, hook_ts_ns: u64) {
@@ -9103,7 +9125,7 @@ impl Engine {
         }
         let pid = (record.pid_tgid >> 32) as u32;
         let Some(position) = self.views.iter().position(|view| view.pid() == pid) else {
-            self.refresh_requested.insert(pid);
+            self.request_refresh(pid);
             self.mark_live_loss(
                 "live export discovery",
                 "an export record had no retained process generation",
@@ -9434,7 +9456,7 @@ impl Engine {
         }
         let pid = (record.pid_tgid >> 32) as u32;
         let Some(position) = self.views.iter().position(|view| view.pid() == pid) else {
-            self.refresh_requested.insert(pid);
+            self.request_refresh(pid);
             self.reject_loader_record("a loader hit had no retained process generation");
             return Ok(DiscoveryRecordOutcome::Rejected(
                 RecordRejection::LoaderNoRetainedView,
@@ -12047,7 +12069,7 @@ impl Engine {
                     self.refresh_requested.remove(&pid);
                 }
                 RetirementCause::ExecRefresh | RetirementCause::GenerationLost => {
-                    self.refresh_requested.insert(pid);
+                    self.request_refresh(pid);
                 }
             }
         }
@@ -12237,7 +12259,7 @@ impl Engine {
         } else if record.kind == DISCOVERY_KIND_EXEC
             && unmatched_exec_requests_refresh(&self.views, pid)
         {
-            self.refresh_requested.insert(pid);
+            self.request_refresh(pid);
             None
         } else {
             if record.kind == DISCOVERY_KIND_LEADER_EXIT {
@@ -12708,6 +12730,144 @@ impl Engine {
         )
     }
 
+    /// Over-cap candidate selection without a full maps sweep (Task 3.1b).
+    /// Ordinary passes serve event-driven refresh requests plus a
+    /// fairness-rotation window over unscanned pids — no maps reads, so no
+    /// budget charge — and defer the rest to the reconciliation sweep with
+    /// an exact categorical gap. Every Nth over-cap pass reconciles: one
+    /// bounded maps slice after the cursor (wall-time quantum, generation
+    /// revalidation of covered retained views) with rarity-ordered
+    /// admission inside the slice. Retained views are always desired and
+    /// never displaced; rotation only fills free view slots.
+    fn select_over_cap_desired(&mut self, pids: &[u32]) -> BTreeSet<u32> {
+        let known: BTreeSet<u32> = self.views.iter().map(|view| view.pid()).collect();
+        let enumerated: BTreeSet<u32> = pids.iter().copied().collect();
+        let pending: BTreeSet<u32> = self
+            .refresh_requested
+            .intersection(&enumerated)
+            .copied()
+            .collect();
+        let mut desired = known.clone();
+        desired.extend(pending.iter().copied());
+        let max_scan_pids = self.max_scan_pids;
+        let subject = scope_label(&self.scope);
+        match self.scheduler.begin_over_cap_pass() {
+            InventoryCadence::Ordinary => {
+                let exclude: BTreeSet<u32> = known.union(&pending).copied().collect();
+                let free_slots = max_scan_pids.saturating_sub(self.views.len());
+                let window = DiscoveryScheduler::rotation_window(pids, &exclude, free_slots);
+                desired.extend(window.iter().copied());
+                let fresh = desired.iter().filter(|pid| !known.contains(pid)).count();
+                let retained = known.intersection(&enumerated).count();
+                let deferred = enumerated
+                    .len()
+                    .saturating_sub(retained)
+                    .saturating_sub(fresh);
+                if deferred > 0 {
+                    self.mark_partial(
+                        &subject,
+                        &format!(
+                            "{} processes in scope; live discovery deferred {deferred} unscanned processes to the periodic reconciliation sweep (limit {max_scan_pids})",
+                            enumerated.len()
+                        ),
+                    );
+                }
+                desired
+            }
+            InventoryCadence::Reconcile => {
+                let free_slots = max_scan_pids.saturating_sub(self.views.len());
+                let selected = self.reconcile_slice(pids, &known, free_slots);
+                desired.extend(selected.iter().copied());
+                let fresh = desired.iter().filter(|pid| !known.contains(pid)).count();
+                self.mark_partial(
+                    &subject,
+                    &scan_cap_reason(enumerated.len(), fresh, max_scan_pids, true),
+                );
+                desired
+            }
+        }
+    }
+
+    /// One bounded reconciliation slice: re-read maps for the next slice of
+    /// pids after the cursor (wrapping), stopping at the wall-time quantum.
+    /// Retained views covered by the slice are generation-revalidated;
+    /// unscanned slice pids are rarity-ordered into the free view slots.
+    /// Returns the selected new pids. The cursor advances past the last pid
+    /// read; an incomplete slice publishes its exact coverage gap. Slice
+    /// maps bytes are re-read every sweep, never served from a cache: only
+    /// stable file-derived facts (pin-keyed ELF/inspection entries) are
+    /// cached, never mappings or heap content.
+    fn reconcile_slice(
+        &mut self,
+        pids: &[u32],
+        known: &BTreeSet<u32>,
+        free_slots: usize,
+    ) -> Vec<u32> {
+        let quantum_ns = self.scheduler.quantum_ns();
+        let slice_pids = self.scheduler.slice_pids();
+        let order = DiscoveryScheduler::rotated_after(pids, self.scheduler.cursor());
+        let start = crate::attach::monotonic_ns();
+        let mut slice: Vec<(u32, Vec<MapEntry>)> = Vec::new();
+        let mut revalidated = 0u64;
+        let mut quantum_stopped = false;
+        let mut clock_failed = start.is_none();
+        for pid in order.into_iter().take(slice_pids) {
+            let elapsed = match (start, crate::attach::monotonic_ns()) {
+                (Some(start), Some(now)) => now.saturating_sub(start),
+                // No clock, no unbounded slice: defer rather than run blind.
+                _ => {
+                    clock_failed = true;
+                    quantum_ns
+                }
+            };
+            if elapsed >= quantum_ns {
+                quantum_stopped = true;
+                break;
+            }
+            if known.contains(&pid)
+                && self
+                    .views
+                    .iter()
+                    .filter(|view| view.pid() == pid)
+                    .all(|view| view.still_the_same())
+            {
+                revalidated = revalidated.saturating_add(1);
+            }
+            let entries = std::fs::File::open(format!("/proc/{pid}/maps"))
+                .map_err(|error| error.to_string())
+                .and_then(|maps| {
+                    read_maps_or_refuse(maps, &mut self.budget, crate::attach::monotonic_ns)
+                })
+                .unwrap_or_default();
+            slice.push((pid, entries));
+            self.scheduler.advance_cursor(pid);
+        }
+        let read = slice.len();
+        let enumerated = pids.len();
+        if read < enumerated {
+            let left = enumerated.saturating_sub(read);
+            let tail = if clock_failed {
+                format!("wall clock unavailable, {left} deferred to the next sweep")
+            } else if quantum_stopped {
+                format!("wall-time quantum exhausted, {left} deferred to the next sweep")
+            } else {
+                format!("{left} deferred to the next sweep")
+            };
+            let subject = scope_label(&self.scope);
+            self.mark_partial(
+                &subject,
+                &format!(
+                    "reconciliation sweep covered {read} of {enumerated} observed processes and revalidated {revalidated} retained generations; {tail}"
+                ),
+            );
+        }
+        let pool: Vec<(u32, Vec<MapEntry>)> = slice
+            .into_iter()
+            .filter(|(pid, _)| !known.contains(pid))
+            .collect();
+        select_deep_scan_candidates(&pool, free_slots)
+    }
+
     fn refresh_inventory(
         &mut self,
         session: &mut dyn EngineSession,
@@ -12779,31 +12939,28 @@ impl Engine {
         let membership_complete = skipped.is_empty() && pids.len() <= max_scan_pids;
         let enumerated = pids.len();
         let over_cap = enumerated > max_scan_pids;
-        // Two-phase scan: phase 1 sweeps every in-scope pid's maps, phase 2
-        // deep-scans the selected candidates only. Under the cap selection is
-        // the identity, so the sweep (and its per-tick budget charge) is
-        // skipped there; over the cap membership is not authoritative, so
-        // narrowing `desired` only narrows which new pids get deep-scanned.
-        // A zero cap short-circuits to empty: selection could only ever take
-        // nothing, so the sweep reads are skipped outright.
+        // Ordinary ticks never sweep maps: over the cap the scheduler serves
+        // queued event-driven work plus a fairness-rotation window, and only
+        // the slower reconciliation pass re-reads one bounded slice (Task
+        // 3.1b). Under the cap selection is the identity, so no sweep runs
+        // there; over the cap membership is not authoritative, so narrowing
+        // `desired` only narrows which new pids get deep-scanned. A zero cap
+        // short-circuits to empty: selection could only ever take nothing,
+        // so the sweep reads are skipped outright.
         let desired: BTreeSet<_> = if max_scan_pids == 0 {
             BTreeSet::new()
         } else if pids.len() > max_scan_pids {
-            let sweep = sweep_process_maps(&pids, &mut self.budget);
-            select_deep_scan_candidates(&sweep, max_scan_pids)
-                .into_iter()
-                .collect()
+            self.select_over_cap_desired(&pids)
         } else {
             pids.into_iter().collect()
         };
-        // Formed after selection so the counts describe the actual set.
         // Only new candidates count: known views are retained, not selected.
-        if over_cap {
-            let known: BTreeSet<u32> = self.views.iter().map(|view| view.pid()).collect();
-            let fresh = desired.iter().filter(|pid| !known.contains(pid)).count();
+        // The zero-cap short-circuit keeps its exact historical skip; the
+        // scheduler publishes the ordinary/reconcile gaps itself.
+        if over_cap && max_scan_pids == 0 {
             skipped.push(Skipped {
                 subject: scope_label(&self.scope),
-                reason: scan_cap_reason(enumerated, fresh, max_scan_pids, true),
+                reason: scan_cap_reason(enumerated, 0, max_scan_pids, true),
             });
         }
         // A complete /proc sweep is authoritative membership for system scope
@@ -12863,7 +13020,8 @@ impl Engine {
         skipped.extend(refresh_skips);
 
         let mut new_views = Vec::new();
-        for pid in new_pids {
+        let mut unprocessed = new_pids.into_iter();
+        while let Some(pid) = unprocessed.next() {
             let id = match self.allocate_view_id() {
                 Ok(id) => id,
                 Err(_) => {
@@ -12873,6 +13031,11 @@ impl Engine {
                             "capture process-view capacity {max_scan_pids} was exhausted; remaining generations were not scanned"
                         ),
                     });
+                    // Exhaustion drops nothing: the unprocessed pids stay
+                    // queued (bounded) so a later pass with a free slot
+                    // serves them instead of losing event-driven work.
+                    failed_refresh_pids.insert(pid);
+                    failed_refresh_pids.extend(unprocessed);
                     break;
                 }
             };
@@ -12947,7 +13110,7 @@ impl Engine {
             self.queue_stale_views(&retained_stale, pending_views);
             for (view, _, _) in &new_views {
                 if admission.stale_views.contains(&view.id()) {
-                    self.refresh_requested.insert(view.pid());
+                    self.request_refresh(view.pid());
                     failed_refresh_pids.insert(view.pid());
                 }
             }
@@ -12995,7 +13158,7 @@ impl Engine {
                 .find(|candidate| candidate.id() == view)
                 .map(ProcessView::pid)
             {
-                self.refresh_requested.insert(pid);
+                self.request_refresh(pid);
             }
         }
 
@@ -13030,7 +13193,7 @@ impl Engine {
                     .map(ProcessView::pid)
                 {
                     failed_refresh_pids.insert(pid);
-                    self.refresh_requested.insert(pid);
+                    self.request_refresh(pid);
                 }
             }
         }
@@ -13091,7 +13254,7 @@ impl Engine {
                 .collect();
             for (view, _, _) in &new_views {
                 if admission.stale_views.contains(&view.id()) {
-                    self.refresh_requested.insert(view.pid());
+                    self.request_refresh(view.pid());
                     failed_refresh_pids.insert(view.pid());
                 }
             }
@@ -13165,7 +13328,7 @@ impl Engine {
                 .find(|(candidate, _, _)| candidate.id() == *view)
                 .map(|(view, _, _)| view.pid())
             {
-                self.refresh_requested.insert(pid);
+                self.request_refresh(pid);
             }
         }
         if outcome.accepted() && !conservative_only {

@@ -40,6 +40,8 @@
 use std::ffi::{CStr, CString};
 use std::io;
 use std::os::fd::{FromRawFd as _, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt as _;
+use std::path::Path;
 
 pub const BPF_LINK_CREATE: u32 = 28;
 pub const BPF_TRACE_UPROBE_MULTI: u32 = 48;
@@ -164,15 +166,17 @@ fn link_create_multi(
 
 /// One multi link over `path` (production `bisect_attach` leaf).
 /// `is_return` selects the uretprobe_multi member flag; entry otherwise.
+/// Takes the path as bytes like the singles path: only NUL is rejected,
+/// non-UTF8 provider paths reach the kernel unchanged.
 pub fn attach_group(
     prog_fd: RawFd,
     pid: u32,
-    path: &str,
+    path: &Path,
     offsets: &[u64],
     cookies: &[u64],
     is_return: bool,
 ) -> io::Result<OwnedFd> {
-    let cpath = CString::new(path)
+    let cpath = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in link path"))?;
     if is_return {
         link_create_uretprobe_multi(prog_fd, &cpath, offsets, cookies, pid)
@@ -357,8 +361,19 @@ mod tests {
 
     #[test]
     fn attach_group_rejects_nul_paths() {
-        let error = attach_group(-1, 0, "a\0b", &[1], &[1], false).unwrap_err();
+        use std::os::unix::ffi::OsStrExt as _;
+        let nul = std::ffi::OsStr::from_bytes(b"a\0b");
+        let error = attach_group(-1, 0, Path::new(nul), &[1], &[1], false).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn attach_group_accepts_non_utf8_paths_up_to_the_syscall() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let raw = std::ffi::OsStr::from_bytes(b"/no/such/\xff.so");
+        let error = attach_group(-1, 0, Path::new(raw), &[1], &[1], true).unwrap_err();
+        // Validation passed (only NUL is rejected); the kernel answered.
+        assert!(error.raw_os_error().is_some());
     }
 
     #[test]

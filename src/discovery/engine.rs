@@ -3968,9 +3968,8 @@ fn select_rotation_candidates(
     });
     unmapped.sort_unstable();
     // `partition` preserves the sorted order within each tier.
-    let (fresh_unmapped, stale_unmapped): (Vec<u32>, Vec<u32>) = unmapped
-        .into_iter()
-        .partition(|pid| !stale.contains(pid));
+    let (fresh_unmapped, stale_unmapped): (Vec<u32>, Vec<u32>) =
+        unmapped.into_iter().partition(|pid| !stale.contains(pid));
     ordered
         .into_iter()
         .map(|(_, members)| {
@@ -11673,7 +11672,8 @@ impl Engine {
                 .any(|module| module.scanned.view == view_id)
             && self.pinned.view_claims(view_id).is_none_or(|claims| {
                 claims.tables.is_empty() && claims.targets.is_empty() && claims.pins.is_empty()
-            }) {
+            })
+        {
             return Ok(false);
         }
         self.loader_arms = self.loader_arms.saturating_add(1);
@@ -13108,11 +13108,7 @@ impl Engine {
         if self.exploratory_dirty.contains(&id) {
             return false;
         }
-        if self
-            .modules
-            .iter()
-            .any(|module| module.scanned.view == id)
-        {
+        if self.modules.iter().any(|module| module.scanned.view == id) {
             return false;
         }
         if !self.loader_registry.ids_for_view(id).is_empty() {
@@ -13136,11 +13132,7 @@ impl Engine {
         {
             return false;
         }
-        if self
-            .pending_loader_scans
-            .keys()
-            .any(|key| key.view == id)
-        {
+        if self.pending_loader_scans.keys().any(|key| key.view == id) {
             return false;
         }
         let pid = view.pid();
@@ -13162,14 +13154,8 @@ impl Engine {
         if self.expected_target_exit_pending == Some(id) {
             return false;
         }
-        if self
-            .selection_claims
-            .keys()
-            .any(|key| key.view == id)
-            || self
-                .selection_tables
-                .keys()
-                .any(|key| key.view == id)
+        if self.selection_claims.keys().any(|key| key.view == id)
+            || self.selection_tables.keys().any(|key| key.view == id)
             || self
                 .selection_bindings
                 .values()
@@ -13286,11 +13272,7 @@ impl Engine {
             .exploratory_evictions
             .saturating_add(victims.len() as u64);
         let max_scan_pids = self.max_scan_pids;
-        let noun = if victims.len() == 1 {
-            "view"
-        } else {
-            "views"
-        };
+        let noun = if victims.len() == 1 { "view" } else { "views" };
         self.mark_partial(
             "live discovery rotation",
             &format!(
@@ -13364,13 +13346,10 @@ impl Engine {
                 // outside reconciliation still displace nothing.
                 let free_slots = max_scan_pids.saturating_sub(self.views.len());
                 let evictable = self.exploratory_evictable_views();
-                let evict_budget = evictable
-                    .len()
-                    .min(self.scheduler.max_evictions_per_pass());
+                let evict_budget = evictable.len().min(self.scheduler.max_evictions_per_pass());
                 let selected = self.reconcile_slice(pids, &known, free_slots + evict_budget);
                 let need = selected.len().saturating_sub(free_slots);
-                let victims: BTreeSet<ProcessViewId> =
-                    evictable.into_iter().take(need).collect();
+                let victims: BTreeSet<ProcessViewId> = evictable.into_iter().take(need).collect();
                 // Evicted pids leave the desired set with their views: they
                 // were desired as retained views, and re-selecting them as
                 // newcomers in the same tick would evict-and-readmit

@@ -4833,7 +4833,11 @@ fn reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor() {
     }
     let mut engine = agreed.unwrap();
     assert_eq!(
-        engine.views.iter().map(|view| view.pid()).collect::<Vec<_>>(),
+        engine
+            .views
+            .iter()
+            .map(|view| view.pid())
+            .collect::<Vec<_>>(),
         vec![pids[0]],
         "the retained view is the lowest-pid member"
     );
@@ -4932,11 +4936,7 @@ fn reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor() {
         );
         let mut kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
         kept.sort_unstable();
-        assert_eq!(
-            kept,
-            pass4_views,
-            "ordinary pass {pass} displaces nothing"
-        );
+        assert_eq!(kept, pass4_views, "ordinary pass {pass} displaces nothing");
     }
     let before = engine.budget.attempted_io_bytes();
     refresh_inventory_once(&mut engine);
@@ -18224,10 +18224,7 @@ fn system_scope_spawn_loaded(driver: &Path, provider: &Path) -> SystemScopeChild
 
 /// Package C variant mapping several providers in one process: the driver
 /// loops `drive_dlopened` over every argument and prints one `done`.
-fn system_scope_spawn_loaded_multi(
-    driver: &Path,
-    providers: &[PathBuf],
-) -> SystemScopeChildGuard {
+fn system_scope_spawn_loaded_multi(driver: &Path, providers: &[PathBuf]) -> SystemScopeChildGuard {
     use std::io::Read as _;
     use std::os::fd::AsRawFd as _;
     let mut child = SystemScopeChildGuard::new(
@@ -20632,9 +20629,12 @@ fn e06_unique_provider_reached_within_bounded_frames() {
     let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
     let args = e06_cgroup_args(scope_dir.path(), vec![provider.clone()], Some(2));
 
-    let mut engine =
-        Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
-    assert_eq!(engine.views.len(), 2, "both provider-free views are retained");
+    let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
+    assert_eq!(
+        engine.views.len(),
+        2,
+        "both provider-free views are retained"
+    );
     assert!(
         engine.plan.modules.is_empty(),
         "no provider is mapped yet: {:?}",
@@ -20665,20 +20665,20 @@ fn e06_unique_provider_reached_within_bounded_frames() {
             first_seen = Some(frame);
         }
     }
-    let first_seen = first_seen.expect(
-        "the unique provider is discovered within eight reconciliation frames",
-    );
+    let first_seen =
+        first_seen.expect("the unique provider is discovered within eight reconciliation frames");
     assert!(
         first_seen <= 4,
         "one reconcile reaches it: first seen at frame {first_seen}"
     );
     assert!(
+        engine.views.iter().any(|view| view.pid() == newcomer),
+        "the newcomer generation is retained: {:?}",
         engine
             .views
             .iter()
-            .any(|view| view.pid() == newcomer),
-        "the newcomer generation is retained: {:?}",
-        engine.views.iter().map(|view| view.pid()).collect::<Vec<_>>()
+            .map(|view| view.pid())
+            .collect::<Vec<_>>()
     );
     assert!(
         !system_scope_slots_for(&engine, "e06-unique.so").is_empty(),
@@ -20706,8 +20706,7 @@ fn e06_shared_inode_control_stays_covered_across_rotation() {
     let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
     let args = e06_cgroup_args(scope_dir.path(), vec![provider.clone()], Some(2));
 
-    let mut engine =
-        Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
+    let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
     assert_eq!(engine.views.len(), 2);
 
     let child_a = system_scope_spawn_loaded(&driver, &provider);
@@ -20771,8 +20770,7 @@ fn exploratory_rotation_never_evicts_owned_views() {
     let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
     let args = e06_cgroup_args(scope_dir.path(), vec![provider.clone()], Some(2));
 
-    let mut engine =
-        Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
+    let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
     assert_eq!(engine.views.len(), 2);
     let provider_view = engine
         .views
@@ -20881,8 +20879,7 @@ fn exploratory_eviction_never_recycles_dirty_identities() {
     let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
     let args = e06_cgroup_args(scope_dir.path(), vec![provider.clone()], Some(2));
 
-    let mut engine =
-        Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
+    let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
     let provider_view = engine
         .views
         .iter()
@@ -20937,7 +20934,8 @@ fn exploratory_eviction_never_recycles_dirty_identities() {
     );
     assert!(
         engine.counters.object_skips.iter().any(|skip| {
-            skip.reason.contains("live discovery selected 0 new candidates")
+            skip.reason
+                .contains("live discovery selected 0 new candidates")
         }),
         "starvation stays explicit: {:?}",
         engine.counters.object_skips
@@ -20957,8 +20955,7 @@ fn refresh_tick_bounds_new_admissions_with_explicit_deferral() {
     let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
     let args = e06_cgroup_args(scope_dir.path(), vec![], None);
 
-    let mut engine =
-        Engine::discover(&args, &scope, None).expect("an uncapped cgroup captures");
+    let mut engine = Engine::discover(&args, &scope, None).expect("an uncapped cgroup captures");
     assert_eq!(engine.views.len(), 1);
     engine.scheduler.set_max_new_views_for_test(2);
 
@@ -21019,8 +21016,7 @@ fn refresh_tick_deep_scan_quantum_defers_with_evidence() {
     let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
     let args = e06_cgroup_args(scope_dir.path(), vec![], None);
 
-    let mut engine =
-        Engine::discover(&args, &scope, None).expect("an uncapped cgroup captures");
+    let mut engine = Engine::discover(&args, &scope, None).expect("an uncapped cgroup captures");
     let rest = e06_spawn_sleeps(2);
     let more: Vec<u32> = rest.iter().map(|guard| guard.pid()).collect();
     e06_write_listing(scope_dir.path(), &[kept_pid, more[0], more[1]]);
@@ -21087,8 +21083,7 @@ fn refresh_tick_cancellation_defers_new_work_with_evidence() {
     let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
     let args = e06_cgroup_args(scope_dir.path(), vec![provider.clone()], Some(2));
 
-    let mut engine =
-        Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
+    let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
     let child = system_scope_spawn_loaded(&driver, &provider);
     let newcomer = child.pid();
     let mut pids = sleep_pids.clone();
@@ -21129,9 +21124,11 @@ fn refresh_tick_cancellation_defers_new_work_with_evidence() {
         "cancellation charges no bytes"
     );
     assert!(
-        engine.counters.object_skips.iter().any(|skip| {
-            skip.reason.contains("deadline")
-        }),
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| { skip.reason.contains("deadline") }),
         "the deadline is named in evidence: {:?}",
         engine.counters.object_skips
     );
@@ -21198,8 +21195,7 @@ fn per_tick_accounting_measures_deep_scans_hooks_and_maps_separately() {
     let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
     let args = e06_cgroup_args(scope_dir.path(), vec![provider.clone()], Some(2));
 
-    let mut engine =
-        Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
+    let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
     // Discovery scans but never arms: arming needs the session/refresh path.
     assert_eq!(engine.deep_scans, 2, "both initial views were deep-scanned");
     assert_eq!(engine.loader_arms, 0, "discovery alone arms nothing");
@@ -21446,8 +21442,7 @@ fn polling_rescan_upgrades_retained_view_that_gains_a_provider() {
     let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
     let args = e06_cgroup_args(scope_dir.path(), vec![provider.clone()], Some(2));
 
-    let mut engine =
-        Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
+    let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
     assert_eq!(engine.views.len(), 2);
     assert!(engine.plan.modules.is_empty());
     let loader_view = engine
@@ -21488,10 +21483,7 @@ fn polling_rescan_upgrades_retained_view_that_gains_a_provider() {
         "the upgraded view is owned, no longer exploratory"
     );
     assert!(
-        !engine
-            .loader_registry
-            .ids_for_view(loader_view)
-            .is_empty(),
+        !engine.loader_registry.ids_for_view(loader_view).is_empty(),
         "the upgrade arms loader tracking"
     );
     assert!(
@@ -21500,8 +21492,7 @@ fn polling_rescan_upgrades_retained_view_that_gains_a_provider() {
     );
     assert!(
         engine.counters.object_skips.iter().any(|skip| {
-            skip.subject == "live discovery rotation"
-                && skip.reason.contains("for polling rescan")
+            skip.subject == "live discovery rotation" && skip.reason.contains("for polling rescan")
         }),
         "polling evidence is published: {:?}",
         engine.counters.object_skips
@@ -21527,8 +21518,7 @@ fn unloaded_provider_view_stays_pinned_by_dirty_history() {
     let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
     let args = e06_cgroup_args(scope_dir.path(), vec![provider.clone()], Some(2));
 
-    let mut engine =
-        Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
+    let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
     let loader_view = engine
         .views
         .iter()
@@ -21552,10 +21542,7 @@ fn unloaded_provider_view_stays_pinned_by_dirty_history() {
     );
     assert!(engine.exploratory_dirty.contains(&loader_view));
     assert!(
-        !engine
-            .loader_registry
-            .ids_for_view(loader_view)
-            .is_empty(),
+        !engine.loader_registry.ids_for_view(loader_view).is_empty(),
         "phase 1 arms the upgraded view"
     );
     assert_eq!(engine.loader_arms, 1, "exactly one arm attempt so far");
@@ -21657,8 +21644,7 @@ fn exploratory_rotation_respects_per_pass_eviction_bound() {
     let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
     let args = e06_cgroup_args(scope_dir.path(), vec![], Some(3));
 
-    let mut engine =
-        Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
+    let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
     assert_eq!(engine.views.len(), 3);
     engine.scheduler.set_max_evictions_for_test(1);
 
@@ -21702,8 +21688,7 @@ fn rotation_covers_every_pid_within_a_finite_bound() {
     let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
     let args = e06_cgroup_args(scope_dir.path(), vec![], Some(2));
 
-    let mut engine =
-        Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
+    let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
     let mut seen: BTreeSet<u32> = engine.views.iter().map(|view| view.pid()).collect();
     for _ in 1..=24 {
         refresh_inventory_once(&mut engine);
@@ -21770,9 +21755,12 @@ fn e05_cross_module_admission_at_256_and_above_cap() {
     let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
     let args = e06_cgroup_args(scope_dir.path(), hints, None);
 
-    let mut engine =
-        Engine::discover(&args, &scope, None).expect("the at-cap capture succeeds");
-    assert_eq!(engine.views.len(), 256, "every member is admitted at the cap");
+    let mut engine = Engine::discover(&args, &scope, None).expect("the at-cap capture succeeds");
+    assert_eq!(
+        engine.views.len(),
+        256,
+        "every member is admitted at the cap"
+    );
     assert_eq!(
         engine.deep_scans, 256,
         "every member is deep-scanned exactly once"
@@ -21900,8 +21888,7 @@ fn e06_e14_rotation_and_lifecycle_recovery_at_scale() {
     let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
     let args = e06_cgroup_args(scope_dir.path(), hints, None);
 
-    let mut engine =
-        Engine::discover(&args, &scope, None).expect("the at-cap capture succeeds");
+    let mut engine = Engine::discover(&args, &scope, None).expect("the at-cap capture succeeds");
     assert_eq!(engine.views.len(), 256);
 
     // E06 at scale: the unique provider has the highest pid, so slice

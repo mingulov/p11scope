@@ -435,13 +435,7 @@ fn system_scope_provider_matrix_shared_copied_variant_and_multi() {
         .plan()
         .modules
         .iter()
-        .map(|module| {
-            module
-                .path
-                .rsplit('/')
-                .next()
-                .unwrap_or_default()
-        })
+        .map(|module| module.path.rsplit('/').next().unwrap_or_default())
         .collect();
     names.sort_unstable();
     assert_eq!(
@@ -487,7 +481,9 @@ fn sudo_as_nobody_available() -> bool {
 #[test]
 fn system_scope_restricted_procfs_cross_uid_cell() {
     if !sudo_as_nobody_available() {
-        eprintln!("SKIP system_scope_restricted_procfs_cross_uid_cell: no passwordless sudo for -u nobody");
+        eprintln!(
+            "SKIP system_scope_restricted_procfs_cross_uid_cell: no passwordless sudo for -u nobody"
+        );
         return;
     }
     // Staged outside the worktree: the checkout path above is not

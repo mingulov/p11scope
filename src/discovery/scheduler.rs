@@ -227,9 +227,8 @@ impl DiscoveryScheduler {
     /// already-expired deadline: with no clock there is no bounded phase,
     /// so new scan work defers rather than running blind.
     pub(crate) fn begin_deep_scan_tick(&mut self, now_ns: Option<u64>) {
-        self.tick_deadline_ns = Some(now_ns.map_or(0, |now| {
-            now.saturating_add(self.tick_quantum_ns)
-        }));
+        self.tick_deadline_ns =
+            Some(now_ns.map_or(0, |now| now.saturating_add(self.tick_quantum_ns)));
     }
 
     /// Whether the tick's deep-scan phase must stop before another scan. A
@@ -511,10 +510,7 @@ mod tests {
         );
         assert!(scheduler.cooling_for_test().is_empty());
         scheduler.note_admitted(7);
-        assert!(
-            !scheduler.is_stale(7),
-            "re-admission clears staleness"
-        );
+        assert!(!scheduler.is_stale(7), "re-admission clears staleness");
     }
 
     /// The staleness map stays bounded by the live enumerated set: entries

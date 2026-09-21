@@ -434,7 +434,10 @@ counts every well-formed non-fork event consumed before truncation.
   owned child. Without it the default is to hand a still-running child back
   and exit 0.
 - `inspect --json` — print the inspection as JSON instead of the human-readable
-  text table.
+  text table. A scan that fails soft (the target changed mid-scan) still
+  prints JSON: the success schema with `scan.status` failed and the
+  reason, exit 1. A target that cannot be read at all stays a hard
+  error: one stderr line, empty stdout, exit 1.
 - `--allow-uretprobe-on-confined-target` — accept the uretprobe hazard on a
   target that confines syscalls instead of refusing to attach. The default
   refusal is deliberate: on affected kernels a uretprobe on a confined target

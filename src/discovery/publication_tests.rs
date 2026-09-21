@@ -242,6 +242,14 @@ fn parse_hex_addr(text: &str) -> u64 {
     u64::from_str_radix(digits, 16).expect("hex address")
 }
 
+fn parse_table_addr(text: &str) -> u64 {
+    if text == "(nil)" {
+        // A poked NULL hole (Package F): the entry is genuinely absent.
+        return 0;
+    }
+    parse_hex_addr(text)
+}
+
 fn parse_keyed(line: &str, key: &str) -> String {
     line.split_whitespace()
         .find_map(|field| field.strip_prefix(key))
@@ -264,7 +272,7 @@ fn read_table_print(lines: &mut impl Iterator<Item = String>) -> TablePrint {
         let got: usize = parse_keyed(&line, "ord=").parse().expect("ord");
         assert_eq!(got, ord, "entries print in ordinal order");
         entries.push((
-            parse_hex_addr(&parse_keyed(&line, "addr=")),
+            parse_table_addr(&parse_keyed(&line, "addr=")),
             parse_keyed(&line, "sym="),
         ));
     }
@@ -3535,10 +3543,14 @@ fn f_e08_named_gi_heap_matches_list_element() {
             element_engine.budget.interface_records_count(),
             "{variant}: one bounded interface charge per publication record"
         );
+        // The normal sweep contributes its linked triple; the stripped
+        // sweep decodes no triples (unknown layout). Either way the one
+        // live record charges exactly one.
+        let sweep_triples = if variant == "normal" { 1 } else { 0 };
         assert_eq!(
             gi_engine.budget.interface_records_count(),
-            2,
-            "{variant}: the sweep triple plus one live record"
+            sweep_triples + 1,
+            "{variant}: the sweep triples plus one live record"
         );
         assert_eq!(
             gi_session.attached_slots.iter().sum::<usize>(),

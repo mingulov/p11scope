@@ -450,7 +450,7 @@ pub struct Evidence {
     pub semantic_state_drops: u64,
     pub semantic_history_drops: u64,
     pub pending_at_end: u64,
-    /// Ring-buffer records rejected by the size check (`events::Drain`).
+    /// Ring-buffer records rejected by the size check (`events::OwnedDrain`/`EventDrain`).
     /// A nonzero count means the writer/reader layout drifted mid-capture.
     pub malformed_records: u64,
     /// Operational calls (`C_Sign`, `C_Encrypt`, ...) observed with no

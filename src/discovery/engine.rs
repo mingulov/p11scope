@@ -5549,8 +5549,27 @@ fn export_abi(kind: u8) -> Option<HookAbi> {
     match kind {
         DISCOVERY_KIND_FUNCTION_LIST_RETURN => Some(HookAbi::FunctionList),
         DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN => Some(HookAbi::InterfaceList),
+        DISCOVERY_KIND_INTERFACE_RETURN => Some(HookAbi::Interface),
         _ => None,
     }
+}
+
+/// The table version a record's carried prefix claims, when it claims
+/// one. Export records carry the raw word; selection records carry the
+/// probe's version class instead (their raw word fields stay zero by
+/// transport contract). An unknown class claims nothing: the prefix is
+/// unusable and the table must re-validate from memory alone.
+fn record_prefix_version(record: &DiscoveryRecord) -> Option<(u8, u8)> {
+    if record.kind == DISCOVERY_KIND_INTERFACE_RETURN {
+        return match record.selection_version_class {
+            DISCOVERY_VERSION_V2_40 => Some((2, 40)),
+            DISCOVERY_VERSION_V3_0 => Some((3, 0)),
+            DISCOVERY_VERSION_V3_1 => Some((3, 1)),
+            DISCOVERY_VERSION_V3_2 => Some((3, 2)),
+            _ => None,
+        };
+    }
+    Some((record.version_major, record.version_minor))
 }
 
 fn interface_list_is_truncated(record: &DiscoveryRecord) -> bool {
@@ -5662,14 +5681,42 @@ fn lower_export_record(
     if record.kind == DISCOVERY_KIND_INTERFACE_RETURN {
         return Err("selection record reached export lowering".into());
     }
+    lower_publication_record(view, maps, hooks, record, budget, None)
+}
+
+/// The shared file-backed lowering behind export records and supported
+/// `C_GetInterface` results (Package F): a selection record carries no
+/// symbol ID — the transport binds it to a capture-local hook instead —
+/// so its caller passes that hook as `gi_hook`. Selection results lower
+/// exactly like list elements, except their interface stays unlinked: a
+/// selection result has no list position, so none may widen into linkage.
+fn lower_publication_record(
+    view: &ProcessView,
+    maps: &MapIndex<'_>,
+    hooks: &HookRegistry,
+    record: &DiscoveryRecord,
+    budget: &mut CaptureWorkBudget,
+    gi_hook: Option<(&str, HookAbi)>,
+) -> Result<Option<ScannedModule>, String> {
     if !valid_discovery_record(record) {
         return Err("malformed discovery record reached export lowering".into());
     }
     let Some(expected_abi) = export_abi(record.kind) else {
         return Err("non-export discovery record reached export lowering".into());
     };
-    let Some((hook_name, abi)) = hooks.by_id(record.symbol_id) else {
-        return Err("export record names an unknown private hook ID".into());
+    let (hook_name, abi) = match record.kind {
+        DISCOVERY_KIND_INTERFACE_RETURN => {
+            gi_hook.ok_or("selection record reached export lowering without its bound hook")?
+        }
+        _ => {
+            if gi_hook.is_some() {
+                return Err("export record reached export lowering with a selection hook".into());
+            }
+            let Some(resolved) = hooks.by_id(record.symbol_id) else {
+                return Err("export record names an unknown private hook ID".into());
+            };
+            resolved
+        }
     };
     if abi != expected_abi {
         return Err("export record kind disagrees with its private hook ABI".into());
@@ -5705,7 +5752,10 @@ fn lower_export_record(
         return Ok(None);
     }
 
-    let word = u64::from(record.version_major) | (u64::from(record.version_minor) << 8);
+    let Some((prefix_major, prefix_minor)) = record_prefix_version(record) else {
+        return Ok(None);
+    };
+    let word = u64::from(prefix_major) | (u64::from(prefix_minor) << 8);
     let Some((version, spans, walk)) = spans_for(word) else {
         return Ok(None);
     };
@@ -5775,16 +5825,24 @@ fn lower_export_record(
     }
 
     let interfaces = match record.kind {
-        DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN | DISCOVERY_KIND_INTERFACE_RETURN => {
-            vec![ScannedInterface {
-                index: usize::from(record.interface_index),
-                name_class: name_class(record.name_class),
-                name_lossy: None,
-                name_private: None,
-                flags: record.interface_flags,
-                table: Some(0),
-            }]
-        }
+        DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN => vec![ScannedInterface {
+            index: usize::from(record.interface_index),
+            name_class: name_class(record.name_class),
+            name_lossy: None,
+            name_private: None,
+            flags: record.interface_flags,
+            table: Some(0),
+        }],
+        DISCOVERY_KIND_INTERFACE_RETURN => vec![ScannedInterface {
+            index: usize::from(record.interface_index),
+            name_class: name_class(record.name_class),
+            name_lossy: None,
+            name_private: None,
+            flags: record.interface_flags,
+            // Unlinked (see the heap arm below): the echoed index is the
+            // request version class, not a list position.
+            table: None,
+        }],
         _ => Vec::new(),
     };
     let module = ScannedModule {
@@ -5835,28 +5893,39 @@ fn lower_export_record(
 /// The lowered interface stays unlinked (`table: None`): the live-return
 /// flag on the table carries the publication evidence, while linkage
 /// stays the sweep's own decoded triples — a live list position never
-/// widens into interface linkage.
-fn lower_heap_export_record(
+/// widens into interface linkage. Selection results lower here under
+/// the same contract (their echoed index is a request class, not a
+/// position at all).
+fn lower_heap_publication_record(
     view: &ProcessView,
     index_a: &MapIndex<'_>,
     hooks: &HookRegistry,
     record: &DiscoveryRecord,
     modules: &[ReconciledModule],
     budget: &mut CaptureWorkBudget,
+    gi_hook: Option<(&str, HookAbi)>,
 ) -> Result<HeapLowerOutcome, String> {
     // Mirror the file-backed path's validation: this runs only after it
     // returned None, but a record is never trusted twice — re-derive.
-    if record.kind == DISCOVERY_KIND_INTERFACE_RETURN {
-        return Err("selection record reached export lowering".into());
-    }
     if !valid_discovery_record(record) {
         return Err("malformed discovery record reached export lowering".into());
     }
     let Some(expected_abi) = export_abi(record.kind) else {
         return Err("non-export discovery record reached export lowering".into());
     };
-    let Some((hook_name, abi)) = hooks.by_id(record.symbol_id) else {
-        return Err("export record names an unknown private hook ID".into());
+    let (hook_name, abi) = match record.kind {
+        DISCOVERY_KIND_INTERFACE_RETURN => {
+            gi_hook.ok_or("selection record reached export lowering without its bound hook")?
+        }
+        _ => {
+            if gi_hook.is_some() {
+                return Err("export record reached export lowering with a selection hook".into());
+            }
+            let Some(resolved) = hooks.by_id(record.symbol_id) else {
+                return Err("export record names an unknown private hook ID".into());
+            };
+            resolved
+        }
     };
     if abi != expected_abi {
         return Err("export record kind disagrees with its private hook ABI".into());
@@ -5920,7 +5989,12 @@ fn lower_heap_export_record(
     // under us — refuse, never blend.
     let usable = usize::from(record.usable_n);
     if usable > 0 {
-        if (record.version_major, record.version_minor) != table.version {
+        let Some(prefix_version) = record_prefix_version(record) else {
+            return Ok(HeapLowerOutcome::Refused(
+                "a published selection result carried a table prefix with an unknown version class",
+            ));
+        };
+        if prefix_version != table.version {
             return Ok(HeapLowerOutcome::Refused(
                 "a published table changed between the probe capture and validation",
             ));
@@ -9369,13 +9443,14 @@ impl Engine {
                 // factory published that it cannot own — heap wrappers,
                 // anonymous-BSS tables, bare list-element addresses —
                 // validates through the heap contract instead.
-                Ok(None) => match lower_heap_export_record(
+                Ok(None) => match lower_heap_publication_record(
                     view,
                     &index,
                     &self.hooks,
                     record,
                     &self.modules,
                     &mut self.budget,
+                    None,
                 ) {
                     Err(error) => return Err(anyhow!(error)),
                     Ok(HeapLowerOutcome::Admitted(module)) => module,
@@ -9388,6 +9463,29 @@ impl Engine {
                 },
             }
         };
+        self.apply_lowered_module(
+            lowered,
+            position,
+            record.hook_ts_ns,
+            session,
+            additions_allowed,
+            pending_views,
+        )
+    }
+
+    /// Pins, merges and applies one lowered publication module — the
+    /// shared tail of export-record and selection-result lowering, so
+    /// equivalent factory forms admit through one ownership-validation
+    /// path and one causal-timing observation.
+    fn apply_lowered_module(
+        &mut self,
+        lowered: ScannedModule,
+        position: usize,
+        hook_ts_ns: u64,
+        session: &mut dyn EngineSession,
+        additions_allowed: &mut bool,
+        pending_views: &mut PendingViewRetirements,
+    ) -> Result<DiscoveryRecordOutcome> {
         let (pins, pin_skips) = {
             let view = &self.views[position];
             pin_scanned_view_objects(view, std::slice::from_ref(&lowered), &mut self.budget)
@@ -9407,7 +9505,7 @@ impl Engine {
         let mut candidate = self.live_candidate(candidate_pins, raw_modules, skipped)?;
         candidate.views.insert(self.views[position].id());
         let observed = candidate_timing_keys(&candidate, std::slice::from_ref(&observed_module));
-        self.observe_causal_timing(&observed, record.hook_ts_ns);
+        self.observe_causal_timing(&observed, hook_ts_ns);
         let outcome = self.apply_candidate(session, candidate, additions_allowed, false, &[])?;
         self.record_apply_timing(&outcome);
         self.queue_apply_outcome(&outcome, pending_views);
@@ -9415,6 +9513,88 @@ impl Engine {
             outcome.changed,
             outcome.required_complete(),
         ))
+    }
+
+    /// Lowers a supported `C_GetInterface` result through the shared
+    /// export-lowering path (Package F, E08). Runs only after the
+    /// selection path attributed the record: the binding supplies the
+    /// hook and the exact view, so no PID-only resolution is trusted
+    /// here. Decode refusals publish the same explicit omission as the
+    /// equivalent list element; the selection tuple is already recorded,
+    /// so a refused lowering is complete handling, not an incomplete
+    /// record.
+    fn process_selection_lowering(
+        &mut self,
+        record: &DiscoveryRecord,
+        session: &mut dyn EngineSession,
+        additions_allowed: &mut bool,
+        pending_views: &mut PendingViewRetirements,
+    ) -> Result<DiscoveryRecordOutcome> {
+        let (binding_view, hook_name) = self
+            .selection_bindings
+            .get(&record.binding_id)
+            .and_then(|binding| {
+                self.hooks
+                    .by_id(binding.hook_id)
+                    .filter(|(_, abi)| *abi == HookAbi::Interface)
+                    .map(|(name, _)| (binding.view, name.to_string()))
+            })
+            .ok_or_else(|| anyhow!("selection lowering lost its attributed binding"))?;
+        let pid = (record.pid_tgid >> 32) as u32;
+        let Some(position) = self.views.iter().position(|view| {
+            view.id() == binding_view && view.pid() == pid && view.still_the_same()
+        }) else {
+            self.request_refresh(pid);
+            self.mark_live_loss(
+                "live interface selection",
+                "a selection result had no retained process generation when its table was validated",
+            );
+            return Ok(DiscoveryRecordOutcome::Rejected(
+                RecordRejection::SelectionUnattributed,
+            ));
+        };
+        let lowered = {
+            let view = &self.views[position];
+            let maps = Self::read_maps(view, &mut self.budget)?;
+            let index =
+                index_maps_or_refuse(&maps, &mut self.budget).map_err(|error| anyhow!(error))?;
+            let gi_hook = Some((hook_name.as_str(), HookAbi::Interface));
+            match lower_publication_record(
+                view,
+                &index,
+                &self.hooks,
+                record,
+                &mut self.budget,
+                gi_hook,
+            ) {
+                Err(error) => return Err(anyhow!(error)),
+                Ok(Some(module)) => module,
+                Ok(None) => match lower_heap_publication_record(
+                    view,
+                    &index,
+                    &self.hooks,
+                    record,
+                    &self.modules,
+                    &mut self.budget,
+                    gi_hook,
+                ) {
+                    Err(error) => return Err(anyhow!(error)),
+                    Ok(HeapLowerOutcome::Admitted(module)) => module,
+                    Ok(HeapLowerOutcome::Refused(reason)) => {
+                        self.mark_live_loss("live interface selection", reason);
+                        return Ok(DiscoveryRecordOutcome::applied(false, true));
+                    }
+                },
+            }
+        };
+        self.apply_lowered_module(
+            lowered,
+            position,
+            record.hook_ts_ns,
+            session,
+            additions_allowed,
+            pending_views,
+        )
     }
 
     /// Whether every object this view owns still has the pin it was pinned
@@ -12716,12 +12896,53 @@ impl Engine {
             DISCOVERY_KIND_FUNCTION_LIST_RETURN | DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN => {
                 self.process_export_record(&record, session, additions_allowed, pending_views)
             }
-            DISCOVERY_KIND_INTERFACE_RETURN => self.process_selection_record_with_session(
-                &queued,
-                session,
-                additions_allowed,
-                pending_views,
-            ),
+            DISCOVERY_KIND_INTERFACE_RETURN => {
+                let outcome = self.process_selection_record_with_session(
+                    &queued,
+                    session,
+                    additions_allowed,
+                    pending_views,
+                )?;
+                // Package F: an attributed live result also lowers through
+                // the shared publication path, so equivalent factory forms
+                // admit the same endpoint set. Selection runs first and
+                // unchanged: its attribution decides whether lowering may
+                // trust this record at all, and terminal (post-exit)
+                // records never validate live memory.
+                let lower = matches!(outcome, DiscoveryRecordOutcome::Applied { .. })
+                    && queued.terminal_owner.is_none()
+                    && queued.record.return_rv == 0
+                    && queued.record.table_ptr != 0;
+                let lowering = if lower {
+                    Some(self.process_selection_lowering(
+                        &queued.record,
+                        session,
+                        additions_allowed,
+                        pending_views,
+                    )?)
+                } else {
+                    None
+                };
+                Ok(match (outcome, lowering) {
+                    (
+                        DiscoveryRecordOutcome::Applied {
+                            changed: first,
+                            required_complete: first_complete,
+                        },
+                        Some(DiscoveryRecordOutcome::Applied {
+                            changed: second,
+                            required_complete: second_complete,
+                        }),
+                    ) => DiscoveryRecordOutcome::applied(
+                        first || second,
+                        first_complete && second_complete,
+                    ),
+                    (DiscoveryRecordOutcome::Applied { changed, .. }, Some(_)) => {
+                        DiscoveryRecordOutcome::applied(changed, false)
+                    }
+                    (outcome, _) => outcome,
+                })
+            }
             DISCOVERY_KIND_LOADER => self.process_loader_record(
                 queued,
                 session,

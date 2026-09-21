@@ -26,16 +26,27 @@ fn inventory_names_every_resource_with_its_exact_limit() {
             .unwrap_or_else(|| panic!("inventory must name {name}"))
             .limit
     };
-    for entry in &table {
-        assert!(entry.limit > 0, "resource {} needs a positive limit", entry.name);
-        assert!(!entry.occupancy_source.is_empty(), "resource {} needs an occupancy source", entry.name);
+    for entry in table {
+        assert!(
+            entry.limit > 0,
+            "resource {} needs a positive limit",
+            entry.name
+        );
+        assert!(
+            !entry.occupancy_source.is_empty(),
+            "resource {} needs an occupancy source",
+            entry.name
+        );
     }
     assert_eq!(limit_of("stats_slots"), u64::from(MAX_SLOTS));
     assert_eq!(limit_of("start_inflight"), u64::from(START_ENTRIES));
     assert_eq!(limit_of("rv_keys"), u64::from(RV_ENTRIES));
     assert_eq!(limit_of("descriptors"), u64::from(MAX_DESCRIPTORS));
     assert_eq!(limit_of("task_owners"), THREAD_OWNER_LIMIT);
-    assert_eq!(limit_of("image_identity_tickets"), IMAGE_IDENTITY_TICKET_LIMIT);
+    assert_eq!(
+        limit_of("image_identity_tickets"),
+        IMAGE_IDENTITY_TICKET_LIMIT
+    );
     assert_eq!(limit_of("root_affiliations"), ROOT_AFFILIATION_LIMIT);
     assert_eq!(limit_of("ring_bytes"), u64::from(RING_BYTES));
     for name in [
@@ -46,7 +57,10 @@ fn inventory_names_every_resource_with_its_exact_limit() {
         "links",
         "rings",
     ] {
-        assert!(table.iter().any(|entry| entry.name == name), "inventory must name {name}");
+        assert!(
+            table.iter().any(|entry| entry.name == name),
+            "inventory must name {name}"
+        );
     }
 }
 
@@ -71,7 +85,12 @@ fn storage_comparison_covers_tiers_and_residency_without_sufficiency_claim() {
                 .iter()
                 .find(|row| row.cpus == cpus && row.residency == residency)
                 .unwrap_or_else(|| panic!("comparison must cover {cpus} CPUs at {residency}"));
-            assert!(row.dense_bytes > 0 && row.sparse_bytes > 0);
+            assert!(row.dense_bytes > 0);
+            if residency == "idle" {
+                assert_eq!(row.sparse_bytes, 0, "idle sparse storage holds no entries");
+            } else {
+                assert!(row.sparse_bytes > 0);
+            }
             assert!(
                 row.sparse_bounded_non_evicting,
                 "sparse storage must stay bounded and non-evicting"
@@ -107,7 +126,10 @@ fn first_touch_under_concurrency_has_exactly_one_initializer_and_counted_failure
         }
     });
     let snapshot = ledger.snapshot();
-    assert_eq!(snapshot.initializations, 1, "exactly one thread initializes key 7");
+    assert_eq!(
+        snapshot.initializations, 1,
+        "exactly one thread initializes key 7"
+    );
     assert_eq!(snapshot.initializations + snapshot.relookups, 8_000);
     assert_eq!(snapshot.insert_failures, 0);
     assert_eq!(snapshot.relookup_failures, 0);
@@ -131,7 +153,10 @@ fn native_slot_checks_counts_and_cleanup_share_one_bound() {
         "owner->start_count > 512",
         "start.slot = i",
     ] {
-        assert!(source.contains(site), "native site must stay pinned: {site}");
+        assert!(
+            source.contains(site),
+            "native site must stay pinned: {site}"
+        );
     }
     assert!(
         source.matches("key->slot >= 512").count() >= 2,
@@ -144,13 +169,21 @@ fn native_slot_checks_counts_and_cleanup_share_one_bound() {
 fn historical_identity_is_append_only_and_never_recycles() {
     assert_eq!(reclamation_policy(), ReclamationPolicy::AppendOnly);
     let mut allocator = SlotIdentityAllocator::new(4);
-    let ids: Vec<u32> = (0..4).map(|_| allocator.allocate().expect("in-budget")).collect();
+    let ids: Vec<u32> = (0..4)
+        .map(|_| allocator.allocate().expect("in-budget"))
+        .collect();
     assert_eq!(ids, vec![0, 1, 2, 3]);
     allocator.retire(1);
-    assert!(allocator.resolve(1).is_retired(), "retired ids stay tombstoned");
+    assert!(
+        allocator.resolve(1).is_retired(),
+        "retired ids stay tombstoned"
+    );
     let next = allocator.allocate().expect("lifetime budget remains");
     assert_eq!(next, 4, "allocation never reuses retired slot 1");
-    assert!(allocator.resolve(1).is_retired(), "old evidence still sees the tombstone");
+    assert!(
+        allocator.resolve(1).is_retired(),
+        "old evidence still sees the tombstone"
+    );
     let err = allocator.allocate().unwrap_err();
     assert!(matches!(err, SlotIdentityError::Exhausted { .. }));
     assert!(
@@ -166,7 +199,10 @@ fn attach_program_load_teardown_and_links_are_accounted_separately() {
     assert_eq!(cost.links, 10);
     assert!(cost.program_loads >= 1);
     assert!(!cost.map_value_sharing_removes_link_cost);
-    assert!(cost.teardown_steps >= cost.links, "teardown walks every link");
+    assert!(
+        cost.teardown_steps >= cost.links,
+        "teardown walks every link"
+    );
     let empty = AttachCost::for_endpoints(0);
     assert_eq!(empty.links, 0);
     assert_eq!(empty.teardown_steps, 0);
@@ -177,7 +213,10 @@ fn attach_program_load_teardown_and_links_are_accounted_separately() {
 fn admission_envelope_publishes_limits_and_qualification_state() {
     let envelope = admission_envelope();
     assert!(envelope.contains("stats_slots=512"), "envelope: {envelope}");
-    assert!(envelope.contains("start_inflight=16384"), "envelope: {envelope}");
+    assert!(
+        envelope.contains("start_inflight=16384"),
+        "envelope: {envelope}"
+    );
     assert!(envelope.contains("rv_keys=4096"), "envelope: {envelope}");
     assert!(
         envelope.contains("broader_admission=unqualified"),

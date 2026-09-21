@@ -34,7 +34,8 @@ use p11scope_ebpf_common::{
     Event, FLAG_CGROUP_FILTER, FLAG_PID_FILTER, FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED,
     FLAG_SYSTEM_FILTER,
     FUNCTION_NAME_MAX_BYTES, FUNCTION_NONE, FunctionNameKey, ImageIdentity, LOADER_STATE_PRESENT,
-    LinuxLayout, MAX_DESCRIPTORS, MAX_MECH_SHAPES, MAX_SLOTS, MECH_NONE, PAUSE_ARMED,
+    LinuxLayout, MAX_DESCRIPTORS, MAX_MECH_SHAPES, MAX_SLOTS, MECH_NONE,
+    NATIVE_OWNER_SLOT_BOUND, PAUSE_ARMED,
     PAUSE_REQUESTED, PauseKey, RING_BYTES, RV_ENTRIES, RvKey, SESSION_NONE, START_ENTRIES,
     STATE_DOMAIN_EXPORT, STATE_DOMAIN_SELECTION, SlotSemantics, SlotStats, StartKey, StartState,
     StateKey, TAIL_CALLS_INTERFACE_WORKER_SLOT, USER_TYPE_NONE, bucket_of, capture,
@@ -51,6 +52,10 @@ use p11scope_ebpf_common::{
     EVIDENCE_TEMPLATE_TAIL_FAILURES, FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA, MAX_ATTRS,
     TAIL_CALLS_TEMPLATE_SECOND_SLOT,
 };
+
+// Package G: the BPF slot universe and the native task-owner bound are one
+// literal. Changing either without the other corrupts START ownership.
+const _: () = assert!(MAX_SLOTS == NATIVE_OWNER_SLOT_BOUND);
 
 #[map]
 static CONFIG: Array<u64> = Array::with_max_entries(2, BPF_F_RDONLY_PROG);

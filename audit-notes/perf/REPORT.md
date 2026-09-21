@@ -166,6 +166,12 @@ cleanup does not need to block a measured performance fix once its safety
 and coverage gates pass. Optimizing only the event consumer cannot fix the
 observed system miss.
 
+The multi-user follow-up also identified F-75's conditional cross-process
+async-state collision in the semantic reducer. Validate and isolate that
+state in E20 before optimizing its indexes; the current live matrix did not
+exercise this path. The high-level roadmap and full issue routing now lead
+[SYSTEM-PLAN.md](SYSTEM-PLAN.md).
+
 ### Evidence custody and limitations
 
 Raw artifacts (not tracked): `/var/tmp/p11scope-review-20260921-r{1,2,3}/`

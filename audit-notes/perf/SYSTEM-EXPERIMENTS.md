@@ -137,6 +137,14 @@ Sweep 1/4/16 modules and 128/256/512/1,024/6,530 unique endpoints, including
 duplicate files, bind mounts, same path/different bytes, same bytes/different
 inodes and five-plus wrapper instances. Keep exact alias and forwarding truth.
 
+Start with two owned test UIDs, two processes per UID and two distinguishable
+providers. Cross the same physical file, equal-byte copies on distinct inodes,
+different provider versions, and multiple providers in one process. Preserve
+each workload's private expected-call ledger; use distinct expected sequences
+or controlled isolated invocation intervals where public aggregates cannot
+attribute simultaneous traffic. Repeat with deliberate same-value identifiers
+in E20. These cross-user cells were not executed in the current review.
+
 **Measure:** demand/admission/active/lifetime slots by provider, first-call
 coverage, setup, detach, memory and FDs. **Pass:** every requested endpoint is
 admitted within the declared envelope; over-envelope omissions name the
@@ -250,6 +258,12 @@ Exercise short-lived children, PID reuse, exec without PID change, loader-event
 loss, dlmopen namespaces, deleted/memfd providers, bind/overlay paths, cgroup
 entry/exit and mount namespaces. Use owned fixtures and exact process epochs.
 
+Include credential changes, an owned device-group-dependent workload, and
+restricted-procfs/PID-namespace cells in isolated lanes. Check actual target
+visibility and access errors; a root host process or equal path label alone
+does not establish namespace access or workload identity. Exercise independent
+loader instances of the same provider where the platform supports them.
+
 **Pass:** no cross-generation attribution; reconciliation recovers supported
 missed changes within a stated bound; otherwise explicit degraded coverage.
 Measure rescan bytes, owner leases and retained historical records after exit.
@@ -315,6 +329,23 @@ optimization is a separate diagnostic-only cell.
 Cross 100/500/2,000 sessions with 1–3 operations/session, fork, close-all,
 login/logout, finalize, pending saturation and detached joins. Then run many
 serial open/close and process generations at low peak concurrency.
+
+Deliberately reuse identical session handles and async IDs across two processes
+sharing one provider, and across two providers in one process. Include different
+test UIDs, opposite completion order, detached joins, one owner's finalize or
+exit while another remains active, and reuse after exec. The private per-owner
+ledger must expose overwrite, cross-owner completion and accidental sweeping;
+summed totals alone are insufficient. Also test independently loaded instances
+when their process/module identity can be validated; otherwise require an
+explicit semantic-ambiguity boundary.
+
+F-75's first regression uses one EVENTS domain and distinct task cookies,
+the same module/slot/function/async ID, and different pending mechanisms.
+Check the second GetID, a successful join by the first owner, completion and
+the other owner's finalize. The current different-domain test is a control,
+not this reproduction. Run this isolation subset in early Package E0; confirm
+provider/standard async-namespace rules and retain valid cross-process transfer
+tests. A duplicate counter/PARTIAL verdict cannot authorize wrong attribution.
 
 **Pass:** operation-visit counts establish the intended scaling, not only a
 loose wall-time assertion; unrelated state stays intact; eviction indexes
@@ -399,7 +430,8 @@ FD count to link count. This is distinct from O-1's event-consumer remapping.
 
 1. E23 safety and E17 child-stdout subsets, then E01–E03: safe execution,
    correct baseline and measurement contracts.
-2. E06/E07/E09: small deterministic discovery regressions before optimization.
+2. E06/E07/E09 and E20's isolation subset: small deterministic discovery and
+   ownership regressions before optimization.
 3. E04 and E25: independent consumer/startup measurements, then E19 allocations.
 4. E05/E08/E10/E11/E13: choose and qualify broader admission/storage.
 5. E12/E14/E15/E16/E17/E20: lifecycle, supported surfaces, privacy and

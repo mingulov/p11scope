@@ -43,6 +43,97 @@ plan's checked/unchecked boxes are not a fresh implementation status oracle.
 - Preserve unrelated work, use disjoint writer ownership, one Cargo-heavy
   command per shared target directory and one privileged measurement lane.
 
+## High-level roadmap: reliable system capture
+
+This is the main plan for the requested multi-user, multi-provider system
+work. Read this overview for priorities; use Packages A–H below for delivery
+ownership and [SYSTEM-EXPERIMENTS.md](SYSTEM-EXPERIMENTS.md) for test details.
+The stages are proposed work, not completed fixes. The reviewed production
+baseline still misses the controlled system workload.
+
+**Target outcome:** one privileged `--system` observer covers supported
+PKCS#11 calls across multiple OS users and processes, including several
+providers in one process and the same provider loaded independently in many
+processes. It keeps correct ownership during process/provider churn and
+reports any permission, unsupported-shape, capacity or timing gap explicitly.
+Provider filters may narrow an operator's request; they are not needed to
+make the system acceptance tests pass.
+
+| Order | What improves | Gate before claiming the improvement | Delivery |
+|---|---|---|---|
+| 1 | Safe capture and trustworthy measurements: fix F-01/F-11, then doctor, evidence validation and benchmark boundaries | Owned targets survive supported safety cases; stdout behavior is preserved; intentionally missed calls fail coverage acceptance | A; E01–E03 plus E17/E23 safety subsets |
+| 2 | Reliable coverage and ownership across users/processes: prevent scan-cap starvation, preserve valid providers after incomplete rescans, fix repeat accounting and isolate async state | The small multi-user/provider matrix below is covered within a stated discovery bound; late arrivals are reached; identical handles/IDs never cause collision-induced cross-owner attribution | B/C and early E0; E05–E07/E09/E14/E20 |
+| 3 | Faster startup and continuous draining: reduce repeated history/plan rebuilding and retain one EVENTS consumer | Separate before/after measurements show lower cost with identical coverage, loss accounting and cleanup | B performance patch/D; E25/E04 |
+| 4 | Broader provider support: normalize supported factory forms, heap tables, forwarded targets and default interface requests | Equivalent supported publications yield the same physical endpoint set; first-call gaps and unsupported surfaces remain measured | F; E08/E13/E15/E16 |
+| 5 | Practical capacity and long captures: design the whole resource budget and admission behavior, including history and in-flight calls | Shared files, copied files and many providers fit the published envelope; overflow is explicit; serial churn does not silently consume the whole capture lifetime | G with E; E05/E10–E12/E18/E20 |
+| 6 | Lower steady-state overhead: optimize measured allocations, map snapshots, session scans and fork work | Exact results and ownership survive load; observer cost and target slowdown improve beyond measurement noise | E; E17–E20 |
+| 7 | Recurring system qualification and usable operator evidence | Exact-build host/VM, backend, ABI, privacy, failure-injection and soak results support a published operating envelope | H; E12/E14–E17/E21–E24 |
+
+The first deliverable is a safe, measurable small system workload, then
+reliable discovery and coverage at that size. Capacity is increased against
+the same truth ledger. Stages 3–6 can overlap only after their correctness
+dependencies pass and shared source files have one writer. Keep the
+individual startup, draining and capacity results independently reviewable.
+
+### Required multi-user and provider matrix
+
+Start with two owned test UIDs, two processes per UID and two distinguishable
+fixture providers at a low call rate. Add background provider-free processes
+to exercise exploration fairly. Use fresh VM/fixture credentials and private
+artifacts; do not modify or borrow unrelated users' workloads. Grow one axis
+at a time after this small matrix passes.
+
+| Scenario | Required behavior | Experiments |
+|---|---|---|
+| Different users/processes map the same provider inode | Reuse validated physical attachment where possible; count every process's calls without duplicate probes or unproven cross-process state joins | E05/E12/E20 |
+| Equal provider bytes are copied to different inodes or installed at different paths/versions | Preserve independently validated physical objects; filename, function name or hash equality alone cannot collapse observations | E05/E14 |
+| One process loads several providers or repeated loader instances | Preserve module/instance ownership even when session/async identifiers are numerically equal; ambiguous semantics remain count-only | E08/E14/E20 |
+| Different users/processes deliberately reuse identical session handles and async IDs | No collision lets an operation, login, async join, close or finalize consume an independent owner's state; permit separately validated intentional custody transfers; foreign traffic cannot satisfy another workload's oracle | E12/E20 |
+| A provider appears after capture starts or after exploration capacity is occupied | Reach it within the documented discovery bound; keep already validated providers covered through incomplete scans | E06/E07/E09/E13 |
+| A process exits, execs, changes credentials/cgroups, or unmaps a provider while others continue | Retire only invalidated ownership; shared live endpoints remain covered and reused PIDs/addresses do not inherit old state | E10/E12/E14 |
+| Mount/PID namespaces, restricted procfs, privilege differences or device-group access affect visibility | Observe the supported accessible target or report the precise coverage limitation; never turn unreadable memory into authoritative absence | E05/E14/E15/E23 |
+
+**Identity rule:** attachment identity and application-state identity serve
+different purposes. Stable physical endpoints may share probe work; process
+generation, executable instance, module and invocation ownership must remain
+distinct for correlation. Provider publication/occupancy can differ in two
+processes mapping the same file. Validate process and provider isolation with
+deliberate handle collisions, not just distinct happy-path identifiers.
+E20 must distinguish independent equal-ID collisions from proven intentional
+cross-process custody transfers; neither rejecting all such transfers nor
+accepting all numerically matching IDs satisfies this contract.
+
+For the initial milestones, multi-user support means correct capture across
+OS users. The current privacy contract keeps raw PID/TID internal in
+metrics/profile and exposes them only in bounded trace. UID/username reports
+are not assumed by this plan; any new public identity fields require a
+separate schema/privacy decision. Test oracles may retain private ownership
+receipts to verify aggregate output without widening product output.
+
+### Where every audit item goes
+
+This routes all F-01–F-75 and O-1–O-18 items; it does not convert historical,
+accepted or refuted claims into bugs. Recheck each candidate on the selected
+implementation revision, record its reproduction/control, then fix, retain
+as a tested boundary, or close it with evidence. Split compound findings
+such as F-58 into independently verifiable tasks before assigning a writer.
+
+| Workstream | Findings/opportunities | Order and treatment |
+|---|---|---|
+| Safety, interference and output ownership | F-01, F-11, F-25, F-48, F-53, F-55–F-58, F-69 | F-01/F-11 first in A. Recheck the others before broader qualification; accepted structural risks need an explicit design decision, not an automatic rewrite |
+| Evidence, contracts and operator usability | F-02, F-08, F-09, F-12, F-13, F-20–F-22, F-42, F-45, F-47, F-49, F-50, F-59, F-60, F-64, F-68, F-74 | A/H: repair test-oracle blockers early, prove settlement before changing terminal completeness, then schema/CLI/runbook polish |
+| Discovery, identity and provider coverage | F-14, F-23, F-24, F-26, F-34, F-35, F-67, F-70–F-73, F-75 | B/C/F/G and early E0, with H regression gates; preserve mitigations and distinguish unsupported shapes from exploitable bugs |
+| Performance and resource behavior | F-17, F-29, F-37, F-61; O-1–O-14, O-16–O-18 | B/D/E/G: measured startup/drain costs first, then active/lifetime budgets and reducer work. O-7 is diagnostic-only; O-8/O-9/O-12 need fresh test-harness comparisons |
+| Security tests, dependencies and release qualification | F-03–F-05, F-10, F-27, F-28, F-31–F-33, F-40, F-41, F-43, F-46, F-54, F-62, F-63 | A/H support track: align shipped dependency tests, run owned hostile/parser/privacy cases and make relevant gates recurring; investigate helper isolation separately from the non-executing observer |
+| API and maintainability | F-06, F-07, F-15, F-18, F-19, F-30, F-36, F-39, F-44, F-51, F-52, F-65, F-66 | Separate small owned patches after current-path validation. Resolve lifecycle/API defects that affect the selected use case; defer broad module/parser rewrites until they have a concrete need |
+| Corrected or non-finding claims | F-16, F-38; O-15; R-01–R-06 | Preserve regression controls and current dispositions. Do not implement the refuted per-call optimization or treat catalog equality as runtime conformance |
+
+The primary owns this routing and promotes an item when new evidence changes
+its impact. Each supporting task needs exact files, an acceptance check and
+a stopped previous writer before implementation. Low-impact cleanup may run
+alongside the roadmap; confirmed target harm, cross-owner attribution or
+privacy violations stop the affected qualification path immediately.
+
 ## Requirements and design choices
 
 R1. **Breadth:** a finite fair exploration policy must eventually examine each
@@ -75,6 +166,12 @@ children stopped. Measure target overhead independently from observer cost.
 R7. **Compatibility and safety:** qualify ABI, loader, backend, kernel,
 seccomp and privacy boundaries on actual fixtures; historical green lanes do
 not qualify the next commit.
+
+R8. **Multiple users and provider instances:** preserve exact coverage and
+correlation across OS users, process/image generations and module instances,
+including shared file mappings and equal numeric handles/async IDs. Reusing
+physical attachment must not reuse another owner's semantic state. Unreadable
+or ambiguous instances produce a bounded named gap under the privacy policy.
 
 | Approach | Benefits | Coverage/cost trade-off | Decision |
 |---|---|---|---|
@@ -187,6 +284,9 @@ repeat accounting. This package exclusively owns engine.rs while it runs.
 - [ ] Run E05/E06/E14 at 256 and above-cap process counts. State the resulting
   bound in frames/time and its assumptions; never claim universal instantaneous
   discovery of arbitrary short-lived processes.
+- [ ] Run the small multi-user/provider matrix with exact private workload
+  identity before increasing endpoints. Cover shared-inode, copied-inode and
+  restricted-procfs cases; require explicit discovery evidence for each cell.
 
 ## Package D — Retain the EVENTS consumer
 
@@ -205,12 +305,32 @@ repeat accounting. This package exclusively owns engine.rs while it runs.
   setup/steady CPU separately, loss and exact output. Review lifecycle changes
   independently before merging.
 
-## Package E — Reduce measured reducer/map work
+## Package E — Preserve semantic ownership, then reduce reducer/map work
 
-**Own after D:** `src/semantics.rs`, `src/history.rs`, `src/trace.rs`,
-`src/metrics.rs`; `src/run.rs` only after D's writer stops.
+**Own:** early E0 owns `src/semantics.rs` and `src/history_tests.rs` for the
+isolation gate below. E's subsequent performance work follows D and owns
+`src/semantics.rs`, `src/history.rs`, `src/trace.rs`, `src/metrics.rs`;
+`src/run.rs` only after D's writer stops. E0 does not edit D's run/attach/event
+files and must finish before another writer changes semantic key structures.
 **Consumes:** stable event/metadata identity and correct delivery accounting.
-**Produces:** equivalent reduction with fewer allocations/traversals.
+**Produces:** a validated semantic isolation contract, followed by equivalent
+reduction with fewer allocations/traversals.
+
+**Early E0 — multi-process isolation, alongside B/C:**
+
+- [ ] Reproduce F-75 with E20's same-EVENTS-domain, distinct-task-cookie
+  pair using equal module/slot/async IDs and different pending mechanisms.
+  Confirm the provider/standard namespace assumptions independently.
+- [ ] Require independent ownership or conservative ambiguity refusal.
+  Evaluate a bounded collision tombstone that refuses ambiguous joins;
+  richer instance keys require proven provider identity. Keep valid supported
+  cross-process transfers as a separate countercontrol; adding PID alone is
+  not an acceptable substitute for that contract.
+- [ ] Check cancellation, finalize, exit and late completion after collision.
+  No wrong mechanism/state binding may be published even when PARTIAL is set.
+  Obtain independent lifecycle review before semantic optimization begins.
+
+**Subsequent performance work, after E0/D:**
 
 - [ ] Use E19 to select the first measured hotspot. Preserve immutable
   pending SlotMeta snapshots; shared immutable metadata is safer than naked
@@ -219,6 +339,9 @@ repeat accounting. This package exclusively owns engine.rs while it runs.
   admission-before-insertion and stable output ordering.
 - [ ] Group parent operations by session during fork; add visit-count scaling
   tests to supplement the existing `<2s` test (E20).
+- [ ] Use E20's deliberate cross-process/cross-module handle and async-ID
+  collisions before changing key/index structures. Check return pairing,
+  close/finalize and delayed joins against each workload's own state ledger.
 - [ ] Evaluate ordered-key range processing before adding session indexes;
   any eviction index must be bounded under overwrite/join/purge.
 - [ ] Measure E18 before adopting batch map reads or changed frame snapshots;
@@ -274,6 +397,9 @@ separately reviewed schema/privacy change.
 - [ ] Run E23's forced-backend/kernel matrix using owned fresh overlays and
   verified tool-equipped bases; include seccomp/cleanup and group rebuild.
 - [ ] Run E12/E14/E15/E17 and privacy canaries on the exact candidate bytes.
+- [ ] Repeat the multi-user/provider matrix across the chosen capacity tiers,
+  including independent processes using identical provider bytes and handles.
+  A foreign provider's traffic must not mask a refused owned workload.
 - [ ] Own E16's supported/unsupported execution-surface fixtures and publish
   their coverage boundaries before accepting E24's final envelope.
 - [ ] Publish measured coverage dimensions and remaining gaps; keep terminal
@@ -288,10 +414,12 @@ separately reviewed schema/privacy change.
 
 A's safety/output patches precede D's ownership of run.rs; its oracle
 corrections precede trusted timing conclusions. B and C precede a promise of
-stable eventual discovery. D may be developed independently of B/C in an
+stable eventual discovery. E0's isolation gate precedes multi-process semantic
+qualification and may run alongside B/C with disjoint ownership. D may be
+developed independently of B/C in an
 isolated checkout after A releases the shared files, but shared run/attach
-code must have one writer and timing cells must be serialized. E follows
-D's measurement. F follows B/C; G is selected
+code must have one writer and timing cells must be serialized. E's performance
+work follows E0 and D's measurement. F follows B/C; G is selected
 from capacity experiments, not inferred from a single provider. H qualifies
 the actual resulting combination.
 
@@ -303,7 +431,8 @@ the proposed design, update this plan before implementing the affected package.
 
 **Fix priority:** first F-01/F-11 safety and interference, then the
 doctor/validator/measurement contracts and B/C's coverage preservation and
-fair exploration. These scale defects are correctness work. Lower-impact
+fair exploration plus E0's semantic isolation. These scale defects are
+correctness work. Lower-impact
 JSON/CI/cleanup patches can proceed separately; completing every historical
 finding is not a prerequisite to performance work.
 

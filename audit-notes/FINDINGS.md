@@ -185,13 +185,49 @@ not physical identity, and a derived delivered count is not a separate
 consumer oracle. **Next:** E03; direct phase boundaries and exact workload
 identity, with synthetic long-setup/short-capture and early-exit countercontrols.
 
+#### F-75 — Independent processes can collide in detached async semantic state
+
+**Medium; source-confirmed conditional reducer path; dedicated replay/live
+provider reproduction pending.** The user's multi-process requirement led
+to a bounded follow-up review. Detached state is keyed by module, PKCS#11
+slot, target function, async ID and `process.domain` (`semantics.rs:1600,2333`).
+That domain is the retained EVENTS map ID (`events.rs:20–41`), shared by
+processes in a capture; it is not a provider-instance namespace.
+
+If independent processes sharing these fields issue the same ID, the second
+`C_AsyncGetID` replaces the first pending record (`semantics.rs:2332–2349`).
+A later successful `C_AsyncJoin` uses that tuple without checking the original
+process or collision ambiguity and transfers the surviving record (`:2358–2371`).
+Completion applies its saved event under the joining process (`:2304–2312`).
+With different pending initialization mechanisms, that path can attribute
+one process's mechanism to another. The exact provider/standard identifier
+namespace and successful-join premise need E20 fixture validation; no claim
+that every provider allocates colliding IDs is made.
+
+Counterevidence: replacement increments `async_duplicates` and forces PARTIAL
+(`render.rs:753`); count-only slots bypass semantics (`semantics.rs:1900`).
+Ordinary cancel/finalize/retirement uses process ownership, and intentional
+cross-process join is explicitly tested (`semantics.rs:738`). Those controls
+do not quarantine a collided key. The similarly named loaded-object-domain
+test (`history_tests.rs:617`) uses different EVENTS domains, so it does not
+cover independent processes sharing this capture domain.
+
+**Next:** E20 with one domain, distinct task cookies, the same module/slot/ID,
+different mechanisms and opposite join/completion order. Require independent
+state or conservative ambiguity refusal, while retaining proven legitimate
+transfers. Consider bounded collision tombstones before a richer validated
+provider-instance namespace; blindly adding PID would break existing transfer
+semantics. This is an early correctness gate in Package E0, before performance
+changes to semantic keys or indexes.
+
 ### Recommended next work and retained evidence
 
 First address F-01's unsafe unknown verdict and F-11's shared-stdout
 interference, with owned safety reproductions and explicit acceptance gates.
 Fix trust/oracle vocabulary and F-71's incomplete-rescan contract; specify
 and test F-70/F-73 fairness/lifetime behavior. Coverage-breaking scale limits
-belong in this correctness stage. Treat O-13 history rebuilding
+and F-75's multi-process async isolation belong in this correctness stage.
+Treat O-13 history rebuilding
 and O-1 persistent consumption as distinct startup/steady-state performance
 work. Broader factory handling and capacity redesign require exact physical
 identity, privacy and lifecycle acceptance gates. Do not raise one map limit

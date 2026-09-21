@@ -21755,6 +21755,13 @@ fn e05_cross_module_admission_at_256_and_above_cap() {
     let args = e06_cgroup_args(scope_dir.path(), hints, None);
 
     let mut engine = Engine::discover(&args, &scope, None).expect("the at-cap capture succeeds");
+    // Deterministic paging: the wall-time quanta are covered by their own
+    // tests, so pin them here — the five-sweep bound below measures
+    // rotation/paging arithmetic, not scheduler wall time under parallel
+    // load (a quantum-cut slice or deferred admission scan otherwise slips
+    // late-pid coverage a sweep with correct explicit evidence).
+    engine.scheduler.set_quantum_ns_for_test(u64::MAX);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
     assert_eq!(
         engine.views.len(),
         256,
@@ -21888,6 +21895,12 @@ fn e06_e14_rotation_and_lifecycle_recovery_at_scale() {
     let args = e06_cgroup_args(scope_dir.path(), hints, None);
 
     let mut engine = Engine::discover(&args, &scope, None).expect("the at-cap capture succeeds");
+    // Deterministic paging (same confound as the E05 scale twin): the
+    // wall-time quanta are covered by their own tests, so pin them — the
+    // five-sweep bound measures rotation/paging arithmetic, not scheduler
+    // wall time under parallel load.
+    engine.scheduler.set_quantum_ns_for_test(u64::MAX);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
     assert_eq!(engine.views.len(), 256);
 
     // E06 at scale: the unique provider has the highest pid, so slice

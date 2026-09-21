@@ -78,7 +78,12 @@ jobs:
       # Network acquisition is explicit and precedes every offline validation.
       - run: cargo +1.88 fetch --locked --manifest-path Cargo.toml
       - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
-      - run: cargo +1.88 fetch --locked --manifest-path third-party/src/aya-0.14.0-p2/Cargo.toml
+      # The aya-p2 tree resolves its aya-obj dependency to the sibling p2
+      # tree: its multi-backport needs fields only aya-obj-p2 has, so the
+      # vendored upstream lock (crates.io aya-obj) cannot build it. Both
+      # standalone steps inject that patch and resolve unlocked; the
+      # shipped combination stays locked by the root workspace steps.
+      - run: cargo +1.88 fetch --config 'patch.crates-io.aya-obj.path="third-party/src/aya-obj-0.3.0-p2"' --manifest-path third-party/src/aya-0.14.0-p2/Cargo.toml
       - run: cargo +1.88 fetch --locked --manifest-path third-party/src/aya-obj-0.3.0-p2/Cargo.toml
       - name: Verify prepared dependency selection
         shell: bash
@@ -99,7 +104,7 @@ jobs:
       - name: Aya dependency unit tests
         env:
           CARGO_PROFILE_TEST_OVERFLOW_CHECKS: "true"
-        run: cargo +1.88 test --locked --offline --manifest-path third-party/src/aya-0.14.0-p2/Cargo.toml --target-dir target/aya-tests --lib
+        run: cargo +1.88 test --offline --config 'patch.crates-io.aya-obj.path="third-party/src/aya-obj-0.3.0-p2"' --manifest-path third-party/src/aya-0.14.0-p2/Cargo.toml --target-dir target/aya-tests --lib
       - run: cargo +1.88 test --locked --offline --manifest-path third-party/src/aya-obj-0.3.0-p2/Cargo.toml --target-dir target/aya-obj-tests --lib
       - run: cargo +1.88 clippy --locked --offline --workspace --all-targets -- -D warnings
       # libtest exits 0 when a filter matches nothing, so this step proves a test

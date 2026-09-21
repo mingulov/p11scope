@@ -45,15 +45,15 @@ def patch_paths():
     )
 
 
-def ci_manifest_dirs():
-    """Every third-party --manifest-path dir named by hosted CI steps."""
-    return [
-        match.group(1).rsplit("/", 1)[0]
-        for match in re.finditer(
-            r"--manifest-path (third-party/src/\S+/Cargo\.toml)",
-            CI_YML.read_text(encoding="utf-8"),
-        )
-    ]
+def ci_manifest_steps():
+    """(line, tree dir) for every third-party --manifest-path CI step."""
+    steps = []
+    for line in CI_YML.read_text(encoding="utf-8").splitlines():
+        match = re.search(r"--manifest-path (third-party/src/\S+/Cargo\.toml)",
+                          line)
+        if match:
+            steps.append((line, match.group(1).rsplit("/", 1)[0]))
+    return steps
 
 
 class DependencySelectionTests(unittest.TestCase):
@@ -66,10 +66,11 @@ class DependencySelectionTests(unittest.TestCase):
 
     def test_standalone_ci_tests_use_recipe_selected_trees(self):
         trees = recipe_trees()
-        dirs = ci_manifest_dirs()
-        # Both fetch and standalone-test steps, both packages: four paths.
-        self.assertEqual(len(dirs), 4, dirs)
-        for path in dirs:
+        steps = ci_manifest_steps()
+        # Both fetch and standalone-test steps, both packages: four steps.
+        self.assertEqual(len(steps), 4, steps)
+        by_name = {}
+        for line, path in steps:
             # Longest name first: "aya" is a string prefix of "aya-obj".
             name = next(
                 candidate
@@ -77,6 +78,19 @@ class DependencySelectionTests(unittest.TestCase):
                 if path.startswith(f"third-party/src/{candidate}-")
             )
             self.assertEqual(path, trees[name], path)
+            by_name.setdefault(name, []).append(line)
+        # The aya tree's multi-backport needs fields only the sibling
+        # aya-obj tree has, so its standalone steps inject that patch;
+        # --locked would pin the crates.io aya-obj its own lockfile
+        # names, which cannot build it. aya-obj stands alone, locked.
+        injected = ('patch.crates-io.aya-obj.path="%s"'
+                    % trees["aya-obj"])
+        for line in by_name["aya"]:
+            self.assertIn(injected, line)
+            self.assertNotIn("--locked", line)
+        for line in by_name["aya-obj"]:
+            self.assertIn("--locked", line)
+            self.assertNotIn("patch.crates-io", line)
 
     def test_root_workspace_compilation_and_recipe_audit_retained(self):
         ci = CI_YML.read_text(encoding="utf-8")

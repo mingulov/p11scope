@@ -9,7 +9,7 @@
 //! what the slice covers. Every queue is bounded with explicit overflow;
 //! every deferral is published as a categorical coverage gap.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Bound for the lifecycle/loader refresh-request queue: one entry per
 /// process-view slot, so queued work can never exceed what the capture
@@ -31,6 +31,40 @@ pub(crate) const RECONCILE_SLICE_PIDS: usize = 64;
 /// next sweep with explicit evidence. Provisional — ratify by measurement.
 pub(crate) const RECONCILE_QUANTUM_NS: u64 = 50_000_000;
 
+/// Exploratory rotation: at most this many provider-free views are evicted
+/// per reconcile pass to make room for rarity-selected newcomers. Ordinary
+/// passes never evict, so steady-state ticks displace nothing.
+/// Provisional — ratify by measurement.
+pub(crate) const MAX_EXPLORATORY_EVICTIONS_PER_PASS: usize = 8;
+
+/// Eviction cooldown: a pid evicted as exploratory is ineligible for
+/// re-selection for this many reconcile sweeps, so rotation walks forward
+/// through the unscanned set instead of churning between two same-rarity
+/// subsets. Event-driven refresh requests bypass the cooldown.
+/// Provisional — ratify by measurement.
+pub(crate) const RECONCILE_EVICTION_COOLDOWN_SWEEPS: u64 = 2;
+
+/// Per-tick admission bound: at most this many new process views are
+/// deep-scanned on one inventory tick, under or over the cap. Excess
+/// newcomers defer to the next tick with explicit evidence; queued
+/// event-driven work for them is retained, never dropped.
+/// Provisional — ratify by measurement.
+pub(crate) const MAX_NEW_VIEWS_PER_TICK: usize = 64;
+
+/// Polling rescans per reconcile sweep: at most this many covered retained
+/// exploratory views are queued for a same-tick refresh rescan, so a
+/// retained process that gains a provider is re-examined within a finite
+/// number of sweeps even though it carries no loader context. The cursor
+/// round-robins them; the tick quantum still bounds the rescan phase.
+/// Provisional — ratify by measurement.
+pub(crate) const MAX_POLLING_RESCANS_PER_SWEEP: usize = 8;
+
+/// Wall-time quantum for one tick's deep-scan phase, in nanoseconds:
+/// refreshed-view rescans plus new-view admissions. The phase stops before
+/// a scan that would exceed it; the remainder defers to the next tick with
+/// explicit evidence. Provisional — ratify by measurement.
+pub(crate) const TICK_DEEP_SCAN_QUANTUM_NS: u64 = 200_000_000;
+
 /// Which over-cap selection ran on an inventory pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InventoryCadence {
@@ -49,6 +83,20 @@ pub(crate) struct DiscoveryScheduler {
     cursor: Option<u32>,
     quantum_ns: u64,
     slice_pids: usize,
+    reconcile_sweeps: u64,
+    /// Pids evicted as exploratory, each with the reconcile-sweep sequence
+    /// number of its eviction. Bounded: entries expire after
+    /// `cooldown_sweeps` sweeps and are pruned on every reconcile pass, so
+    /// at most `max_evictions * cooldown_sweeps` entries are ever held.
+    cooling: BTreeMap<u32, u64>,
+    max_evictions: usize,
+    cooldown_sweeps: u64,
+    max_new_views: usize,
+    tick_quantum_ns: u64,
+    /// Wall-time deadline for the current tick's deep-scan phase, installed
+    /// by `begin_deep_scan_tick`. `None` outside a tick means unbounded —
+    /// direct scan calls (and unit tests driving them) are not ticks.
+    tick_deadline_ns: Option<u64>,
 }
 
 impl DiscoveryScheduler {
@@ -58,20 +106,106 @@ impl DiscoveryScheduler {
             cursor: None,
             quantum_ns: RECONCILE_QUANTUM_NS,
             slice_pids: RECONCILE_SLICE_PIDS,
+            reconcile_sweeps: 0,
+            cooling: BTreeMap::new(),
+            max_evictions: MAX_EXPLORATORY_EVICTIONS_PER_PASS,
+            cooldown_sweeps: RECONCILE_EVICTION_COOLDOWN_SWEEPS,
+            max_new_views: MAX_NEW_VIEWS_PER_TICK,
+            tick_quantum_ns: TICK_DEEP_SCAN_QUANTUM_NS,
+            tick_deadline_ns: None,
         }
     }
 
     /// Opens one over-cap inventory pass: counts it and reports whether
     /// this pass reconciles. The first pass after discovery is always
     /// ordinary — discovery just swept everything, so there is nothing
-    /// to re-sweep yet.
+    /// to re-sweep yet. A reconcile pass also advances the sweep sequence
+    /// and expires cooling entries, so the cooldown map stays bounded.
     pub(crate) fn begin_over_cap_pass(&mut self) -> InventoryCadence {
         self.over_cap_passes = self.over_cap_passes.saturating_add(1);
         if self.over_cap_passes % RECONCILE_EVERY_N_OVER_CAP_PASSES == 0 {
+            self.reconcile_sweeps = self.reconcile_sweeps.saturating_add(1);
+            let sweeps = self.reconcile_sweeps;
+            let cooldown = self.cooldown_sweeps;
+            self.cooling
+                .retain(|_, evicted_at| sweeps.saturating_sub(*evicted_at) < cooldown);
             InventoryCadence::Reconcile
         } else {
             InventoryCadence::Ordinary
         }
+    }
+
+    /// Records one exploratory eviction at the current sweep sequence, so
+    /// the pid sits out re-selection until its cooldown expires.
+    pub(crate) fn note_evicted(&mut self, pid: u32) {
+        self.cooling.insert(pid, self.reconcile_sweeps);
+    }
+
+    /// Whether the pid is cooling down after an exploratory eviction and
+    /// must sit out ordinary rotation and reconcile selection. Queued
+    /// event-driven refresh requests bypass this test at the call site.
+    pub(crate) fn cooling_down(&self, pid: u32) -> bool {
+        self.cooling.get(&pid).is_some_and(|evicted_at| {
+            self.reconcile_sweeps.saturating_sub(*evicted_at) < self.cooldown_sweeps
+        })
+    }
+
+    /// How many pids are currently cooling down (categorical evidence only;
+    /// the pids themselves are never published).
+    pub(crate) fn cooling_len(&self) -> usize {
+        let sweeps = self.reconcile_sweeps;
+        let cooldown = self.cooldown_sweeps;
+        self.cooling
+            .values()
+            .filter(|evicted_at| sweeps.saturating_sub(**evicted_at) < cooldown)
+            .count()
+    }
+
+    pub(crate) fn max_evictions_per_pass(&self) -> usize {
+        self.max_evictions
+    }
+
+    pub(crate) fn max_new_views_per_tick(&self) -> usize {
+        self.max_new_views
+    }
+
+    /// Installs the current tick's deep-scan deadline from the caller's
+    /// clock poll plus the tick quantum. A failed clock installs an
+    /// already-expired deadline: with no clock there is no bounded phase,
+    /// so new scan work defers rather than running blind.
+    pub(crate) fn begin_deep_scan_tick(&mut self, now_ns: Option<u64>) {
+        self.tick_deadline_ns = Some(now_ns.map_or(0, |now| {
+            now.saturating_add(self.tick_quantum_ns)
+        }));
+    }
+
+    /// Whether the tick's deep-scan phase must stop before another scan. A
+    /// failed clock poll also stops the phase, for the same reason as above.
+    pub(crate) fn tick_expired(&self, now_ns: Option<u64>) -> bool {
+        match (self.tick_deadline_ns, now_ns) {
+            (Some(deadline), Some(now)) => now >= deadline,
+            (Some(_), None) => true,
+            (None, _) => false,
+        }
+    }
+
+    /// The finite exploration bound: over-cap frames needed for rotation to
+    /// admit `unscanned` pids at `slots_per_sweep` admissions per reconcile
+    /// sweep. Pure arithmetic for the stated envelope — measurement tests
+    /// supply observed slot counts and the report states the slice-coverage
+    /// assumption alongside. Zero slots means no rotation capacity: the
+    /// bound is infinite (`u64::MAX`), never a silent zero. Test-only: the
+    /// product publishes the underlying counts, not the derived bound.
+    #[cfg(test)]
+    pub(crate) fn exploration_bound_frames(unscanned: usize, slots_per_sweep: usize) -> u64 {
+        if unscanned == 0 {
+            return 0;
+        }
+        if slots_per_sweep == 0 {
+            return u64::MAX;
+        }
+        let sweeps = unscanned.div_ceil(slots_per_sweep) as u64;
+        sweeps.saturating_mul(RECONCILE_EVERY_N_OVER_CAP_PASSES)
     }
 
     #[cfg(test)]
@@ -109,6 +243,42 @@ impl DiscoveryScheduler {
     #[cfg(test)]
     pub(crate) fn set_slice_pids_for_test(&mut self, slice_pids: usize) {
         self.slice_pids = slice_pids;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_max_evictions_for_test(&mut self, max_evictions: usize) {
+        self.max_evictions = max_evictions;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_cooldown_sweeps_for_test(&mut self, cooldown_sweeps: u64) {
+        self.cooldown_sweeps = cooldown_sweeps;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_max_new_views_for_test(&mut self, max_new_views: usize) {
+        self.max_new_views = max_new_views;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_tick_quantum_ns_for_test(&mut self, tick_quantum_ns: u64) {
+        self.tick_quantum_ns = tick_quantum_ns;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reconcile_sweeps_for_test(&self) -> u64 {
+        self.reconcile_sweeps
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cooling_for_test(&self) -> Vec<u32> {
+        let sweeps = self.reconcile_sweeps;
+        let cooldown = self.cooldown_sweeps;
+        self.cooling
+            .iter()
+            .filter(|(_, evicted_at)| sweeps.saturating_sub(**evicted_at) < cooldown)
+            .map(|(pid, _)| *pid)
+            .collect()
     }
 
     /// The ordinary fairness-rotation window: the lowest `slots` pids
@@ -241,5 +411,102 @@ mod tests {
             vec![20, 30, 10]
         );
         assert!(DiscoveryScheduler::rotated_after(&[], Some(15)).is_empty());
+    }
+
+    /// Evicted pids cool down for exactly the configured sweeps: recorded
+    /// at the current sweep, ineligible until the sequence advances past
+    /// the cooldown, then eligible again. Ordinary passes never advance
+    /// the sweep count, so only reconcile passes age the cooldown.
+    #[test]
+    fn eviction_cooldown_expires_after_configured_sweeps() {
+        let mut scheduler = DiscoveryScheduler::new();
+        scheduler.set_cooldown_sweeps_for_test(2);
+        for _ in 0..4 {
+            scheduler.begin_over_cap_pass();
+        }
+        assert_eq!(scheduler.reconcile_sweeps_for_test(), 1);
+        scheduler.note_evicted(7);
+        assert!(scheduler.cooling_down(7));
+        assert_eq!(scheduler.cooling_for_test(), vec![7]);
+        assert_eq!(scheduler.cooling_len(), 1);
+        for _ in 0..3 {
+            scheduler.begin_over_cap_pass();
+        }
+        assert!(scheduler.cooling_down(7), "ordinary passes age nothing");
+        for _ in 0..4 {
+            scheduler.begin_over_cap_pass();
+        }
+        assert_eq!(scheduler.reconcile_sweeps_for_test(), 2);
+        assert!(
+            scheduler.cooling_down(7),
+            "one elapsed sweep is still cooling"
+        );
+        for _ in 0..4 {
+            scheduler.begin_over_cap_pass();
+        }
+        assert_eq!(scheduler.reconcile_sweeps_for_test(), 3);
+        assert!(
+            !scheduler.cooling_down(7),
+            "two elapsed sweeps rejoin selection"
+        );
+        assert!(scheduler.cooling_for_test().is_empty());
+    }
+
+    /// The cooldown map stays bounded: reconcile passes prune expired
+    /// entries, so a long capture cannot grow it past
+    /// `max_evictions * cooldown_sweeps`.
+    #[test]
+    fn reconcile_passes_prune_expired_cooling_entries() {
+        let mut scheduler = DiscoveryScheduler::new();
+        scheduler.set_cooldown_sweeps_for_test(1);
+        for _ in 0..4 {
+            scheduler.begin_over_cap_pass();
+        }
+        for pid in 100..140 {
+            scheduler.note_evicted(pid);
+        }
+        assert_eq!(scheduler.cooling_len(), 40);
+        for _ in 0..4 {
+            scheduler.begin_over_cap_pass();
+        }
+        assert!(scheduler.cooling_for_test().is_empty());
+        assert_eq!(scheduler.cooling_len(), 0);
+    }
+
+    /// Outside a tick there is no deep-scan deadline; inside one the phase
+    /// stops exactly at the quantum. A failed clock at either end stops
+    /// the phase rather than running it unbounded.
+    #[test]
+    fn tick_deadline_bounds_only_the_installed_phase() {
+        let mut scheduler = DiscoveryScheduler::new();
+        assert!(!scheduler.tick_expired(Some(1_000)));
+        scheduler.set_tick_quantum_ns_for_test(100);
+        scheduler.begin_deep_scan_tick(Some(1_000));
+        assert!(!scheduler.tick_expired(Some(1_000)));
+        assert!(!scheduler.tick_expired(Some(1_099)));
+        assert!(scheduler.tick_expired(Some(1_100)));
+        assert!(scheduler.tick_expired(None), "no clock, no unbounded phase");
+        scheduler.begin_deep_scan_tick(None);
+        assert!(
+            scheduler.tick_expired(Some(u64::MAX)),
+            "a clock failure at install defers the whole phase"
+        );
+    }
+
+    /// The exploration bound is exact small arithmetic: nothing unscanned
+    /// needs no frames, no rotation capacity is infinite rather than zero,
+    /// and anything else rounds up to whole sweeps times the cadence.
+    #[test]
+    fn exploration_bound_frames_round_up_whole_sweeps() {
+        assert_eq!(DiscoveryScheduler::exploration_bound_frames(0, 8), 0);
+        assert_eq!(DiscoveryScheduler::exploration_bound_frames(5, 0), u64::MAX);
+        assert_eq!(DiscoveryScheduler::exploration_bound_frames(1, 8), 4);
+        assert_eq!(DiscoveryScheduler::exploration_bound_frames(8, 8), 4);
+        assert_eq!(DiscoveryScheduler::exploration_bound_frames(9, 8), 8);
+        assert_eq!(
+            DiscoveryScheduler::exploration_bound_frames(44, 8),
+            24,
+            "six sweeps at the four-frame cadence"
+        );
     }
 }

@@ -4747,6 +4747,11 @@ fn retained_views_survive_ordinary_rotation_passes() {
 /// Task 3.1b: the reconciliation pass re-reads maps (never from a cache),
 /// keeps rarity-ordered admission for what its slice covers, and parks the
 /// cursor at the last pid read. Ordinary passes around it charge nothing.
+/// Package C: with the cap full of exploratory views, the reconcile pass
+/// rotates one out for the rarity-selected newcomer (ordinary passes still
+/// displace nothing); the second reconcile admits forward, never churning
+/// the cooling evictee back in.
+/// (Mandated semantic change: pass 4 used to select 0 into zero free slots.)
 #[test]
 fn reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor() {
     struct ChildrenGuard(Vec<std::process::Child>);
@@ -4847,14 +4852,53 @@ fn reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor() {
     assert_eq!(
         rarity.map(|skip| skip.reason.as_str()),
         Some(
-            "5 processes in scope; live discovery selected 0 new candidates for deep scanning by provider rarity (limit 2)"
+            "5 processes in scope; live discovery selected 1 new candidate for deep scanning by provider rarity (limit 2)"
         ),
         "reconcile keeps rarity admission: {:?}",
         engine.counters.object_skips
     );
+    // Package C: the three unknowns share one provider group and exceed the
+    // two slots, so the grouped path takes the group representative (lowest
+    // pid) and rotation evicts the lowest retained pid for it. Both evidence
+    // records are categorical counts.
+    let mut pass4_views: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
+    pass4_views.sort_unstable();
+    assert_eq!(
+        pass4_views,
+        vec![pids[1], pids[2]],
+        "pass 4 rotates the lowest retained pid out for the group representative"
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live discovery rotation"
+                && skip.reason
+                    == "exploratory rotation evicted 1 provider-free process view to reach unscanned processes (limit 2)"
+        }),
+        "rotation publishes its exact evidence: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live discovery rotation"
+                && skip.reason == "1 unscanned process is cooling down after exploratory rotation"
+        }),
+        "the cooldown publishes its exact evidence: {:?}",
+        engine.counters.object_skips
+    );
+    // The surviving retained exploratory view was covered too, so it polls
+    // same-tick (a rescan, not a displacement — the view set above proves it).
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live discovery rotation"
+                && skip.reason == "queued 1 retained exploratory view for polling rescan"
+        }),
+        "the surviving retained view polls: {:?}",
+        engine.counters.object_skips
+    );
 
-    // Passes 5-7 are ordinary again; pass 8 reconciles and re-reads —
-    // maps bytes are never served from a cache.
+    // Passes 5-7 are ordinary again: they charge nothing and displace
+    // nothing; pass 8 reconciles and re-reads — maps bytes are never
+    // served from a cache.
     for pass in 5..=7 {
         let before = engine.budget.attempted_io_bytes();
         refresh_inventory_once(&mut engine);
@@ -4863,12 +4907,29 @@ fn reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor() {
             0,
             "ordinary pass {pass} charges nothing"
         );
+        let mut kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
+        kept.sort_unstable();
+        assert_eq!(
+            kept,
+            pass4_views,
+            "ordinary pass {pass} displaces nothing"
+        );
     }
     let before = engine.budget.attempted_io_bytes();
     refresh_inventory_once(&mut engine);
     assert!(
         engine.budget.attempted_io_bytes() - before > 0,
         "the next reconcile re-reads maps too"
+    );
+    // The second sweep admits forward: the cooled-out evictee sits out, so
+    // the remaining two unknowns fit the two slots exactly (identity, not
+    // grouping) and both rotate in — neither is the just-evicted lowest pid.
+    let mut pass8_views: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
+    pass8_views.sort_unstable();
+    assert_eq!(
+        pass8_views,
+        vec![pids[3], pids[4]],
+        "pass 8 walks forward past the cooling evictee"
     );
 
     for child in &mut children.0 {
@@ -4880,6 +4941,11 @@ fn reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor() {
 /// Task 3.1b: the reconcile cursor is incremental — each sweep covers the
 /// next slice and wraps — and each incomplete slice publishes its exact
 /// coverage plus its generation-revalidation count as a categorical gap.
+/// Package C: sweeps covering only retained pids rotate nothing; the first
+/// sweep reaching unknowns rotates one exploratory view out per selected
+/// newcomer, and the wrapped sweep revalidates only what is still retained.
+/// (Mandated semantic change: the wrapped slice used to revalidate a view
+/// that rotation has since moved on from.)
 #[test]
 fn reconcile_cursor_advances_incrementally_and_wraps() {
     struct ChildrenGuard(Vec<std::process::Child>);
@@ -4987,6 +5053,28 @@ fn reconcile_cursor_advances_incrementally_and_wraps() {
         "first slice gap is exact: {:?}",
         engine.counters.object_skips
     );
+    // Nothing unknown in the slice, so nothing rotates — but both covered
+    // retained exploratory views are queued for a polling rescan, since
+    // unarmed views otherwise never re-examine their process.
+    let mut kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
+    kept.sort_unstable();
+    assert_eq!(kept, pids[..2]);
+    assert!(
+        !engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.reason.contains("evicted")),
+        "a slice over retained pids only evicts nothing"
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live discovery rotation"
+                && skip.reason == "queued 2 retained exploratory views for polling rescan"
+        }),
+        "covered retained exploratory views poll: {:?}",
+        engine.counters.object_skips
+    );
 
     // Pass 8: next slice covers the following two pids, neither retained.
     for _ in 0..3 {
@@ -5002,8 +5090,18 @@ fn reconcile_cursor_advances_incrementally_and_wraps() {
         "second slice gap is exact: {:?}",
         engine.counters.object_skips
     );
+    // The two unknowns fit the two slots exactly (identity, not grouping),
+    // so both rotate in and both lowest retained pids rotate out.
+    let mut kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
+    kept.sort_unstable();
+    assert_eq!(
+        kept,
+        vec![pids[2], pids[3]],
+        "pass 8 rotates both unknowns in for both lowest retained pids"
+    );
 
-    // Pass 12: the slice wraps past the end to the lowest pid.
+    // Pass 12: the slice wraps past the end to the lowest pid — which
+    // rotation moved on from at pass 8, so nothing there revalidates.
     for _ in 0..3 {
         refresh_inventory_once(&mut engine);
     }
@@ -5012,7 +5110,7 @@ fn reconcile_cursor_advances_incrementally_and_wraps() {
     assert!(
         engine.counters.object_skips.iter().any(|skip| {
             skip.reason
-                == "reconciliation sweep covered 2 of 5 observed processes and revalidated 1 retained generations; 3 deferred to the next sweep"
+                == "reconciliation sweep covered 2 of 5 observed processes and revalidated 0 retained generations; 3 deferred to the next sweep"
         }),
         "wrapped slice gap is exact: {:?}",
         engine.counters.object_skips

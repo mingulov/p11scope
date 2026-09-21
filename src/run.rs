@@ -6503,15 +6503,34 @@ mod tests {
         // it never replaces it, and it never attaches to an unrelated failure.
         let capture_available = crate::doctor::verdict(&crate::doctor::probe(None, None)) == 0;
         if !capture_available {
+            // The hazard preflight refuses first: without BPF the kernel
+            // cannot be proven to exempt the trampoline, so an owned
+            // child is refused before anything is forked (F-01).
             let never = format!(
                 "{:#}",
                 run_owned(&run_args(cli::PausePolicy::Never, &["/bin/true"]))
                     .expect_err("an unavailable capture lane must refuse")
             );
-            assert!(never.contains("attach session"), "{never}");
+            assert!(never.contains("refusing to attach"), "{never}");
             assert!(
                 !never.contains("pause"),
                 "an environment failure is not a pause failure: {never}"
+            );
+            // Behind the override, the environment failure keeps its own
+            // category: the session still cannot start without BPF.
+            let mut overridden = run_args(cli::PausePolicy::Never, &["/bin/true"]);
+            overridden.allow_confined_uretprobe = true;
+            let behind_override = format!(
+                "{:#}",
+                run_owned(&overridden).expect_err("an unavailable capture lane must refuse")
+            );
+            assert!(
+                behind_override.contains("attach session"),
+                "{behind_override}"
+            );
+            assert!(
+                !behind_override.contains("pause"),
+                "an environment failure is not a pause failure: {behind_override}"
             );
             let always = format!(
                 "{:#}",
@@ -6520,7 +6539,7 @@ mod tests {
             );
             assert!(always.contains("pause"), "{always}");
             assert!(
-                always.contains("attach session"),
+                always.contains("refusing to attach"),
                 "the required-pause category must not hide the real cause: {always}"
             );
         }

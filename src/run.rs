@@ -2852,6 +2852,13 @@ fn cancel_marker(signal: Option<libc::c_int>, ticks: u64) -> String {
     )
 }
 
+/// The loop-end marker for a target that exited mid-capture: the
+/// measurement harness timestamps this stderr line as the actual
+/// early-exit boundary (F-74), instead of assuming the full window.
+fn target_exit_marker(ticks: u64) -> String {
+    format!("p11scope: capture ended: target exited after {ticks} ticks")
+}
+
 const PROFILE_CADENCE: Duration = Duration::from_secs(1);
 const TRACE_CADENCE: Duration = Duration::from_millis(200);
 const DEFAULT_TRACE_MAX_EVENTS: u64 = 10_000_000;
@@ -3250,6 +3257,9 @@ fn capture_profile(
     })();
     if matches!(loop_result, Ok(CaptureEnd::Signal)) {
         eprintln!("{}", cancel_marker(interrupted.first_signal(), ticks));
+    }
+    if matches!(loop_result, Ok(CaptureEnd::TargetExit)) {
+        eprintln!("{}", target_exit_marker(ticks));
     }
     if profile {
         scheduling.note_loop_end(
@@ -3679,6 +3689,9 @@ fn capture_trace(
     })();
     if matches!(loop_result, Ok(CaptureEnd::Signal)) {
         eprintln!("{}", cancel_marker(interrupted.first_signal(), ticks));
+    }
+    if matches!(loop_result, Ok(CaptureEnd::TargetExit)) {
+        eprintln!("{}", target_exit_marker(ticks));
     }
 
     scheduling.note_loop_end(
@@ -7202,6 +7215,14 @@ mod tests {
         assert_eq!(
             cancel_marker(Some(2), 42),
             "p11scope: cancel: loop exited on signal 2 after 42 ticks"
+        );
+    }
+
+    #[test]
+    fn target_exit_marker_names_the_tick_count() {
+        assert_eq!(
+            target_exit_marker(12),
+            "p11scope: capture ended: target exited after 12 ticks"
         );
     }
 

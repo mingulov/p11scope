@@ -397,6 +397,38 @@ fn resolve_program(program: &OsStr) -> io::Result<PathBuf> {
     Err(io::Error::from(io::ErrorKind::NotFound))
 }
 
+/// The launch-file checks: a regular executable file, and ELF (scripts
+/// must go through an interpreter). Shared by the fail-fast pre-fork
+/// refusal and `OwnedChild::spawn`'s own guard, so the early refusal
+/// never weakens the guard at the fork.
+fn check_launch_file(launch_file: &File) -> io::Result<()> {
+    let metadata = launch_file.metadata()?;
+    if !metadata.is_file() || metadata.mode() & 0o111 == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "owned command must be a regular executable file",
+        ));
+    }
+    if let Err(error) = ElfSnapshot::read(launch_file) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "owned command must be an ELF executable: {error}; invoke scripts through an interpreter"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses a command that cannot run as an owned target by name, before
+/// anything is forked. Name errors precede hazard errors: a script is
+/// told about its interpreter before any kernel verdict is consulted.
+fn check_owned_target_runnable(program: &OsStr) -> io::Result<()> {
+    let resolved = resolve_program(program)?;
+    let launch_file = File::open(&resolved)?;
+    check_launch_file(&launch_file)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ChildIdentity {
     uid: libc::uid_t,
@@ -680,21 +712,7 @@ impl OwnedChild {
         let identity = ChildIdentity::for_invoker()?;
         let resolved = resolve_program(&program)?;
         let launch_file = File::open(&resolved)?;
-        let metadata = launch_file.metadata()?;
-        if !metadata.is_file() || metadata.mode() & 0o111 == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "owned command must be a regular executable file",
-            ));
-        }
-        if let Err(error) = ElfSnapshot::read(&launch_file) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "owned command must be an ELF executable: {error}; invoke scripts through an interpreter"
-                ),
-            ));
-        }
+        check_launch_file(&launch_file)?;
         let prepared = PreparedExecutable::resolve(resolved.as_os_str())
             .ok()
             .flatten();
@@ -2121,6 +2139,11 @@ fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOut
     // anything is forked, attached, or released past its barrier.
     resolve_program(&program)
         .map_err(|error| anyhow!("run: exec {}: {error}", Path::new(&program).display()))?;
+    // Name errors precede hazard errors: a script (or a non-executable)
+    // is refused with its interpreter fix before any kernel verdict is
+    // consulted, exactly as `spawn` would refuse it at the fork.
+    check_owned_target_runnable(&program)
+        .map_err(|error| anyhow!("run: starting the owned child: {error}"))?;
     // Before the fork: the owned child can install a seccomp filter after
     // attach, so no startup /proc reading can qualify it — only a kernel
     // proven to exempt the trampoline proceeds by default (F-01). An
@@ -6443,6 +6466,25 @@ mod tests {
     }
 
     // ---- Slice 1b-2 error taxonomy (design §10.3) -----------------------
+
+    /// Name errors precede hazard errors: the fail-fast target check
+    /// refuses a script with its interpreter fix before any kernel
+    /// verdict is consulted, exactly as `spawn` would at the fork.
+    #[test]
+    fn unrunnable_targets_are_refused_by_name_before_the_preflight() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("hello.sh");
+        std::fs::write(&script, "#!/bin/sh\necho hello\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = check_owned_target_runnable(script.as_os_str()).unwrap_err();
+        let text = format!("{error}");
+        assert!(text.contains("must be an ELF executable"), "{text}");
+        assert!(
+            text.contains("invoke scripts through an interpreter"),
+            "{text}"
+        );
+        assert!(check_owned_target_runnable(std::ffi::OsStr::new("/bin/true")).is_ok());
+    }
 
     fn run_args(pause: cli::PausePolicy, command: &[&str]) -> RunArgs {
         RunArgs {

@@ -86,9 +86,13 @@ pub(crate) struct DiscoveryScheduler {
     slice_pids: usize,
     reconcile_sweeps: u64,
     /// Pids evicted as exploratory, each with the reconcile-sweep sequence
-    /// number of its eviction. Bounded: entries expire after
-    /// `cooldown_sweeps` sweeps and are pruned on every reconcile pass, so
-    /// at most `max_evictions * cooldown_sweeps` entries are ever held.
+    /// number of its eviction. Two predicates read it: `cooling_down` (hard
+    /// exclusion for `cooldown_sweeps` sweeps, the anti-churn window) and
+    /// `is_stale` (soft deprioritization behind never-evicted pids, the
+    /// fairness tier). Entries never expire by time — a cooled pid that
+    /// rejoined too eagerly would starve higher never-scanned pids — and
+    /// clear only on re-admission or departure, so the map holds at most
+    /// the live enumerated pids.
     cooling: BTreeMap<u32, u64>,
     max_evictions: usize,
     cooldown_sweeps: u64,
@@ -125,15 +129,12 @@ impl DiscoveryScheduler {
     /// this pass reconciles. The first pass after discovery is always
     /// ordinary — discovery just swept everything, so there is nothing
     /// to re-sweep yet. A reconcile pass also advances the sweep sequence
-    /// and expires cooling entries, so the cooldown map stays bounded.
+    /// that ages the hard cooldown window; the staleness map itself is
+    /// sticky (see `cooling`) and pruned by enumeration, not by time.
     pub(crate) fn begin_over_cap_pass(&mut self) -> InventoryCadence {
         self.over_cap_passes = self.over_cap_passes.saturating_add(1);
         if self.over_cap_passes % RECONCILE_EVERY_N_OVER_CAP_PASSES == 0 {
             self.reconcile_sweeps = self.reconcile_sweeps.saturating_add(1);
-            let sweeps = self.reconcile_sweeps;
-            let cooldown = self.cooldown_sweeps;
-            self.cooling
-                .retain(|_, evicted_at| sweeps.saturating_sub(*evicted_at) < cooldown);
             InventoryCadence::Reconcile
         } else {
             InventoryCadence::Ordinary
@@ -141,9 +142,22 @@ impl DiscoveryScheduler {
     }
 
     /// Records one exploratory eviction at the current sweep sequence, so
-    /// the pid sits out re-selection until its cooldown expires.
+    /// the pid sits out re-selection until its cooldown expires and stays
+    /// fairness-stale until re-admission or departure.
     pub(crate) fn note_evicted(&mut self, pid: u32) {
         self.cooling.insert(pid, self.reconcile_sweeps);
+    }
+
+    /// Clears staleness on (re-)admission: a retained pid competes no more.
+    pub(crate) fn note_admitted(&mut self, pid: u32) {
+        self.cooling.remove(&pid);
+    }
+
+    /// Drops entries for pids no longer enumerated (departed — or PID reuse,
+    /// whose new generation is correctly fresh). This is what bounds the
+    /// map: at most the live enumerated pids.
+    pub(crate) fn prune_stale_to_enumerated(&mut self, enumerated: &BTreeSet<u32>) {
+        self.cooling.retain(|pid, _| enumerated.contains(pid));
     }
 
     /// Whether the pid is cooling down after an exploratory eviction and
@@ -153,6 +167,19 @@ impl DiscoveryScheduler {
         self.cooling.get(&pid).is_some_and(|evicted_at| {
             self.reconcile_sweeps.saturating_sub(*evicted_at) < self.cooldown_sweeps
         })
+    }
+
+    /// Whether the pid was evicted and not since re-admitted (whether or
+    /// not its hard window expired). Stale pids stay selectable but sort
+    /// behind never-evicted pids within their rarity class, so rotation
+    /// covers every pid instead of churning the lowest ones.
+    pub(crate) fn is_stale(&self, pid: u32) -> bool {
+        self.cooling.contains_key(&pid)
+    }
+
+    /// All currently stale pids, for fairness-tiered selection.
+    pub(crate) fn stale_pids(&self) -> Vec<u32> {
+        self.cooling.keys().copied().collect()
     }
 
     /// How many pids are currently cooling down (categorical evidence only;
@@ -441,8 +468,10 @@ mod tests {
 
     /// Evicted pids cool down for exactly the configured sweeps: recorded
     /// at the current sweep, ineligible until the sequence advances past
-    /// the cooldown, then eligible again. Ordinary passes never advance
-    /// the sweep count, so only reconcile passes age the cooldown.
+    /// the cooldown, then eligible again — but still fairness-stale until
+    /// re-admission, so they sort behind never-evicted pids instead of
+    /// churning back ahead of them. Ordinary passes never advance the
+    /// sweep count, so only reconcile passes age the cooldown.
     #[test]
     fn eviction_cooldown_expires_after_configured_sweeps() {
         let mut scheduler = DiscoveryScheduler::new();
@@ -453,6 +482,7 @@ mod tests {
         assert_eq!(scheduler.reconcile_sweeps_for_test(), 1);
         scheduler.note_evicted(7);
         assert!(scheduler.cooling_down(7));
+        assert!(scheduler.is_stale(7));
         assert_eq!(scheduler.cooling_for_test(), vec![7]);
         assert_eq!(scheduler.cooling_len(), 1);
         for _ in 0..3 {
@@ -475,14 +505,24 @@ mod tests {
             !scheduler.cooling_down(7),
             "two elapsed sweeps rejoin selection"
         );
+        assert!(
+            scheduler.is_stale(7),
+            "rejoining selection does not clear fairness staleness"
+        );
         assert!(scheduler.cooling_for_test().is_empty());
+        scheduler.note_admitted(7);
+        assert!(
+            !scheduler.is_stale(7),
+            "re-admission clears staleness"
+        );
     }
 
-    /// The cooldown map stays bounded: reconcile passes prune expired
-    /// entries, so a long capture cannot grow it past
-    /// `max_evictions * cooldown_sweeps`.
+    /// The staleness map stays bounded by the live enumerated set: entries
+    /// for departed pids prune on every tick, so a long churning capture
+    /// cannot grow it past the live scope — while live evictees stay
+    /// sticky-stale no matter how many sweeps elapse.
     #[test]
-    fn reconcile_passes_prune_expired_cooling_entries() {
+    fn stale_entries_prune_to_the_live_enumerated_set() {
         let mut scheduler = DiscoveryScheduler::new();
         scheduler.set_cooldown_sweeps_for_test(1);
         for _ in 0..4 {
@@ -497,6 +537,15 @@ mod tests {
         }
         assert!(scheduler.cooling_for_test().is_empty());
         assert_eq!(scheduler.cooling_len(), 0);
+        assert!(
+            scheduler.is_stale(100),
+            "sweeps age the window, never the staleness"
+        );
+        assert_eq!(scheduler.stale_pids().len(), 40);
+        let enumerated: BTreeSet<u32> = [100, 101].into_iter().collect();
+        scheduler.prune_stale_to_enumerated(&enumerated);
+        assert_eq!(scheduler.stale_pids(), vec![100, 101]);
+        assert!(!scheduler.is_stale(102), "departed pids prune away");
     }
 
     /// Outside a tick there is no deep-scan deadline; inside one the phase

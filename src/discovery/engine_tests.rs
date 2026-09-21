@@ -17959,6 +17959,69 @@ fn selection_edges_tie_break_empty_key_under_cap() {
     assert_eq!(select_deep_scan_candidates(&under, 3), vec![9, 30, 50]);
 }
 
+/// Package C: rotation's fairness tier agrees with plain selection when
+/// nothing is stale, prefers never-evicted members within each rarity
+/// class, and still lets global rarity beat pid order across groups.
+#[test]
+fn rotation_selection_tiers_fresh_before_stale_within_rarity() {
+    fn map_entry(path: &str, inode: u64) -> MapEntry {
+        MapEntry {
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            permissions: *b"r-xp",
+            device: Device { major: 8, minor: 1 },
+            inode,
+            raw_path: Some(path.as_bytes().to_vec()),
+        }
+    }
+    let sweep: Vec<(u32, Vec<MapEntry>)> = vec![
+        (30, vec![map_entry("/usr/lib/liba.so", 11)]),
+        (31, vec![map_entry("/usr/lib/liba.so", 11)]),
+        (32, vec![map_entry("/usr/lib/liba.so", 11)]),
+        (40, vec![map_entry("/usr/lib/libb.so", 12)]),
+        (41, vec![map_entry("/usr/lib/libb.so", 12)]),
+        (90, vec![]),
+        (91, vec![]),
+    ];
+    let empty: BTreeSet<u32> = BTreeSet::new();
+    // No stale pids: exact agreement with plain selection.
+    assert_eq!(
+        select_rotation_candidates(&sweep, 3, &empty),
+        select_deep_scan_candidates(&sweep, 3),
+        "fresh-only rotation matches plain rarity selection"
+    );
+    // One class's lowest member is stale: the representative moves to the
+    // lowest fresh member, and unmapped staleness sorts behind fresh. The
+    // rarer libb group still leads liba: rarity orders groups, freshness
+    // only members.
+    let stale: BTreeSet<u32> = [30, 40, 90].into_iter().collect();
+    assert_eq!(
+        select_rotation_candidates(&sweep, 2, &stale),
+        vec![41, 31],
+        "group representatives skip stale members for fresh ones"
+    );
+    assert_eq!(
+        select_rotation_candidates(&sweep, 4, &stale),
+        vec![41, 31, 91, 90],
+        "unmapped pids trail fresh-first, then stale"
+    );
+    // A stale rare singleton still beats fresh commons: rarity is global,
+    // freshness only orders within a class.
+    let rare: Vec<(u32, Vec<MapEntry>)> = vec![
+        (7, vec![map_entry("/tmp/uniq-p11.so", 10)]),
+        (100, vec![map_entry("/usr/lib/liba.so", 11)]),
+        (101, vec![map_entry("/usr/lib/liba.so", 11)]),
+        (102, vec![map_entry("/usr/lib/liba.so", 11)]),
+    ];
+    let stale_rare: BTreeSet<u32> = [7].into_iter().collect();
+    assert_eq!(
+        select_rotation_candidates(&rare, 1, &stale_rare),
+        vec![7],
+        "global rarity beats freshness across groups"
+    );
+}
+
 /// A4 Task 1: file-level rarity beats pid order — a high-pid singleton mapping
 /// a globally-unique file sorts before a low-pid singleton whose files are all
 /// widely mapped. (Set-level rarity ties both at len 1 and the low pid wins.)
@@ -18156,12 +18219,21 @@ fn system_scope_poll_fd(fd: i32, timeout: std::time::Duration) -> std::io::Resul
 }
 
 fn system_scope_spawn_loaded(driver: &Path, provider: &Path) -> SystemScopeChildGuard {
+    system_scope_spawn_loaded_multi(driver, &[provider.to_path_buf()])
+}
+
+/// Package C variant mapping several providers in one process: the driver
+/// loops `drive_dlopened` over every argument and prints one `done`.
+fn system_scope_spawn_loaded_multi(
+    driver: &Path,
+    providers: &[PathBuf],
+) -> SystemScopeChildGuard {
     use std::io::Read as _;
     use std::os::fd::AsRawFd as _;
     let mut child = SystemScopeChildGuard::new(
         std::process::Command::new(driver)
             .arg("dlopen")
-            .arg(provider)
+            .args(providers)
             .env_clear()
             .env("P11SCOPE_FIXTURE_INTERFACES", "0")
             .env("P11SCOPE_FIXTURE_POST_GATE", "1")
@@ -21549,5 +21621,368 @@ fn unloaded_provider_view_stays_pinned_by_dirty_history() {
     assert!(
         engine.exploratory_dirty.contains(&loader_view),
         "still pinned at the end"
+    );
+}
+
+/// Package C fixture variant with distinct bytes but the identical driven
+/// surface: `-O2` codegen instead of the default flags, same
+/// `MATRIX_INTERFACES=0` (a nonzero interface count is undrivable — the
+/// matrix reports 13, which matches no driver expectation — so byte
+/// variance, not surface variance, distinguishes the build).
+fn system_scope_build_fixture_variant(dir: &Path, name: &str) -> PathBuf {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("crates/discover/tests/fixture/version_matrix.c");
+    let library = dir.join(format!("{name}.so"));
+    assert!(
+        std::process::Command::new("gcc")
+            .args(["-shared", "-fPIC", "-O2", "-DMATRIX_INTERFACES=0", "-o"])
+            .arg(&library)
+            .arg(source)
+            .status()
+            .unwrap()
+            .success()
+    );
+    library
+}
+
+/// Package C: rotation evicts at most the per-pass bound however many
+/// newcomers wait, and still converges — three unknowns behind a bound of
+/// one drain over three sweeps while no single reconcile evicts twice.
+#[test]
+fn exploratory_rotation_respects_per_pass_eviction_bound() {
+    let sleeps = e06_spawn_sleeps(3);
+    let sleep_pids: Vec<u32> = sleeps.iter().map(|guard| guard.pid()).collect();
+    let scope_dir = tempfile::tempdir().expect("a scope directory");
+    e06_write_listing(scope_dir.path(), &sleep_pids);
+    let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
+    let args = e06_cgroup_args(scope_dir.path(), vec![], Some(3));
+
+    let mut engine =
+        Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
+    assert_eq!(engine.views.len(), 3);
+    engine.scheduler.set_max_evictions_for_test(1);
+
+    let newcomers = e06_spawn_sleeps(3);
+    let fresh: Vec<u32> = newcomers.iter().map(|guard| guard.pid()).collect();
+    let mut pids = sleep_pids.clone();
+    pids.extend(fresh.iter().copied());
+    e06_write_listing(scope_dir.path(), &pids);
+
+    let mut seen: BTreeSet<u32> = BTreeSet::new();
+    for _ in 1..=16 {
+        let evictions_before = engine.exploratory_evictions;
+        refresh_inventory_once(&mut engine);
+        assert!(
+            engine.exploratory_evictions - evictions_before <= 1,
+            "no tick evicts past the bound of one"
+        );
+        assert_eq!(engine.views.len(), 3, "the cap binds throughout");
+        seen.extend(engine.views.iter().map(|view| view.pid()));
+    }
+    for pid in &fresh {
+        assert!(
+            seen.contains(pid),
+            "newcomer {pid} is covered within three sweeps: {seen:?}"
+        );
+    }
+}
+
+/// Package C: same-rarity rotation covers every pid within a finite bound —
+/// six identical sleeps behind a cap of two, no providers anywhere. The
+/// fairness tier keeps cooled evictees behind never-scanned pids, so each
+/// sweep admits forward and the whole set is covered within six sweeps
+/// (one representative per sweep for a single group).
+#[test]
+fn rotation_covers_every_pid_within_a_finite_bound() {
+    let sleeps = e06_spawn_sleeps(6);
+    let mut pids: Vec<u32> = sleeps.iter().map(|guard| guard.pid()).collect();
+    pids.sort_unstable();
+    let scope_dir = tempfile::tempdir().expect("a scope directory");
+    e06_write_listing(scope_dir.path(), &pids);
+    let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
+    let args = e06_cgroup_args(scope_dir.path(), vec![], Some(2));
+
+    let mut engine =
+        Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
+    let mut seen: BTreeSet<u32> = engine.views.iter().map(|view| view.pid()).collect();
+    for _ in 1..=24 {
+        refresh_inventory_once(&mut engine);
+        assert_eq!(engine.views.len(), 2, "the cap binds throughout");
+        seen.extend(engine.views.iter().map(|view| view.pid()));
+    }
+    for pid in &pids {
+        assert!(
+            seen.contains(pid),
+            "pid {pid} is covered within six sweeps: {seen:?}"
+        );
+    }
+    assert!(
+        engine.exploratory_evictions >= 4,
+        "rotation walked the whole set: {}",
+        engine.exploratory_evictions
+    );
+}
+
+/// Package C, E05 at 256 and above the cap: 251 sleeps plus five provider
+/// children (two sharing file A, one with B = A's equal bytes on a distinct
+/// inode, one with C = distinct bytes on a distinct inode, one multi child
+/// mapping A and C together) discover at the cap — every member
+/// deep-scanned exactly once, the three physical providers distinct, each
+/// shared file pinned once across all its generations. Then nine more
+/// members (eight sleeps, one unique provider D) push past the cap:
+/// rotation reaches D within the slice-coverage bound while the owned
+/// providers never drop.
+#[test]
+fn e05_cross_module_admission_at_256_and_above_cap() {
+    let dir = tempfile::tempdir().expect("a fixture directory");
+    let provider_a = system_scope_build_fixture(dir.path(), "scale-a");
+    let provider_b = dir.path().join("scale-b.so");
+    std::fs::copy(&provider_a, &provider_b).expect("an equal-bytes copy");
+    let provider_c = system_scope_build_fixture_variant(dir.path(), "scale-c");
+    let provider_d = system_scope_build_fixture(dir.path(), "scale-d");
+    let driver = system_scope_build_driver(dir.path());
+    let hints = vec![
+        provider_a.clone(),
+        provider_b.clone(),
+        provider_c.clone(),
+        provider_d.clone(),
+    ];
+
+    let mut provider_children: Vec<SystemScopeChildGuard> = [
+        provider_a.clone(),
+        provider_a.clone(),
+        provider_b.clone(),
+        provider_c.clone(),
+    ]
+    .into_iter()
+    .map(|provider| system_scope_spawn_loaded(&driver, &provider))
+    .collect();
+    provider_children.push(system_scope_spawn_loaded_multi(
+        &driver,
+        &[provider_a.clone(), provider_c.clone()],
+    ));
+    let guards = e06_spawn_sleeps(251);
+    let mut pids: Vec<u32> = provider_children.iter().map(|guard| guard.pid()).collect();
+    pids.extend(guards.iter().map(|guard| guard.pid()));
+    assert_eq!(pids.len(), 256);
+    let scope_dir = tempfile::tempdir().expect("a scope directory");
+    e06_write_listing(scope_dir.path(), &pids);
+    let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
+    let args = e06_cgroup_args(scope_dir.path(), hints, None);
+
+    let mut engine =
+        Engine::discover(&args, &scope, None).expect("the at-cap capture succeeds");
+    assert_eq!(engine.views.len(), 256, "every member is admitted at the cap");
+    assert_eq!(
+        engine.deep_scans, 256,
+        "every member is deep-scanned exactly once"
+    );
+    assert_eq!(engine.loader_arms, 0, "discovery alone arms nothing");
+    let mut objects = BTreeMap::new();
+    for name in ["scale-a.so", "scale-b.so", "scale-c.so"] {
+        let modules: Vec<_> = engine
+            .modules
+            .iter()
+            .filter(|module| module.scanned.path.ends_with(name))
+            .collect();
+        // A: two single children plus the multi child; C: one single plus
+        // the multi child; B: its one copy child.
+        let expected = if name == "scale-a.so" {
+            3
+        } else if name == "scale-c.so" {
+            2
+        } else {
+            1
+        };
+        assert_eq!(
+            modules.len(),
+            expected,
+            "{name}: one scanned module per mapping generation"
+        );
+        let object = modules[0].object;
+        assert!(
+            modules.iter().all(|module| module.object == object),
+            "{name}: its generations share one pin"
+        );
+        objects.insert(name, object);
+        assert!(
+            !system_scope_slots_for(&engine, name).is_empty(),
+            "{name} admits attachable slots"
+        );
+    }
+    assert_ne!(
+        objects["scale-a.so"], objects["scale-b.so"],
+        "equal bytes on distinct inodes are distinct providers, never merged"
+    );
+    assert_ne!(
+        objects["scale-a.so"], objects["scale-c.so"],
+        "distinct bytes on distinct inodes are distinct providers"
+    );
+    assert_ne!(
+        objects["scale-b.so"], objects["scale-c.so"],
+        "the copy and the variant are distinct from each other"
+    );
+
+    // Above the cap: eight more sleeps and one unique provider. D has the
+    // highest pid, so slice paging covers it no later than the fifth sweep.
+    let extra_sleeps = e06_spawn_sleeps(8);
+    let child_d = system_scope_spawn_loaded(&driver, &provider_d);
+    pids.extend(extra_sleeps.iter().map(|guard| guard.pid()));
+    pids.push(child_d.pid());
+    assert_eq!(pids.len(), 265);
+    e06_write_listing(scope_dir.path(), &pids);
+
+    let mut first_seen = None;
+    for frame in 1..=24 {
+        refresh_inventory_once(&mut engine);
+        assert_eq!(engine.views.len(), 256, "frame {frame}: the cap binds");
+        if first_seen.is_none()
+            && engine
+                .plan
+                .modules
+                .iter()
+                .any(|module| module.path.ends_with("scale-d.so"))
+        {
+            first_seen = Some(frame);
+        }
+    }
+    let first_seen = first_seen.expect("rotation reaches D above the cap");
+    assert!(
+        first_seen <= 20,
+        "slice paging covers D within five sweeps: frame {first_seen}"
+    );
+    assert!(
+        !system_scope_slots_for(&engine, "scale-d.so").is_empty(),
+        "D admits attachable slots"
+    );
+    for name in ["scale-a.so", "scale-b.so", "scale-c.so"] {
+        assert!(
+            engine
+                .plan
+                .modules
+                .iter()
+                .any(|module| module.path.ends_with(name)),
+            "{name} survives above-cap rotation"
+        );
+    }
+    assert!(
+        engine.exploratory_evictions > 0,
+        "rotation evicted to make room"
+    );
+    assert!(
+        engine.deep_scans > 256,
+        "rotation deep-scanned past discovery"
+    );
+    drop(provider_children);
+    drop(child_d);
+    drop(guards);
+    drop(extra_sleeps);
+}
+
+/// Package C, E06 plus E14 at scale: 256 provider-free views at the cap, a
+/// unique provider arriving later, then lifecycle churn (ten exits, ten
+/// replacements with a second provider). Rotation reaches each provider
+/// within the slice-coverage bound; exits settle within one reconcile;
+/// reused view IDs always map to live generations with their providers
+/// intact.
+#[test]
+fn e06_e14_rotation_and_lifecycle_recovery_at_scale() {
+    let dir = tempfile::tempdir().expect("a fixture directory");
+    let provider_e = system_scope_build_fixture(dir.path(), "scale-e");
+    let provider_f = system_scope_build_fixture_variant(dir.path(), "scale-f");
+    let driver = system_scope_build_driver(dir.path());
+    let hints = vec![provider_e.clone(), provider_f.clone()];
+
+    let mut guards = e06_spawn_sleeps(256);
+    let mut pids: Vec<u32> = guards.iter().map(|guard| guard.pid()).collect();
+    let scope_dir = tempfile::tempdir().expect("a scope directory");
+    e06_write_listing(scope_dir.path(), &pids);
+    let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
+    let args = e06_cgroup_args(scope_dir.path(), hints, None);
+
+    let mut engine =
+        Engine::discover(&args, &scope, None).expect("the at-cap capture succeeds");
+    assert_eq!(engine.views.len(), 256);
+
+    // E06 at scale: the unique provider has the highest pid, so slice
+    // paging covers it no later than the fifth sweep.
+    let child_e = system_scope_spawn_loaded(&driver, &provider_e);
+    pids.push(child_e.pid());
+    e06_write_listing(scope_dir.path(), &pids);
+    let mut first_seen = None;
+    for frame in 1..=24 {
+        refresh_inventory_once(&mut engine);
+        assert_eq!(engine.views.len(), 256, "frame {frame}: the cap binds");
+        if first_seen.is_none()
+            && engine
+                .plan
+                .modules
+                .iter()
+                .any(|module| module.path.ends_with("scale-e.so"))
+        {
+            first_seen = Some(frame);
+        }
+    }
+    let first_seen = first_seen.expect("rotation reaches E at scale");
+    assert!(
+        first_seen <= 20,
+        "slice paging covers E within five sweeps: frame {first_seen}"
+    );
+
+    // E14 at scale: ten exits plus ten replacements (one with provider F).
+    // Back at 256 enumerated the capture is under-cap again, so departures
+    // are authoritative immediately and F admits on the first tick.
+    let dead: Vec<u32> = guards.drain(0..10).map(|guard| guard.pid()).collect();
+    let replacements = e06_spawn_sleeps(9);
+    let child_f = system_scope_spawn_loaded(&driver, &provider_f);
+    pids.retain(|pid| !dead.contains(pid));
+    pids.extend(replacements.iter().map(|guard| guard.pid()));
+    pids.push(child_f.pid());
+    e06_write_listing(scope_dir.path(), &pids);
+    let mut f_seen = None;
+    for frame in 1..=24 {
+        refresh_inventory_once(&mut engine);
+        let kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
+        if frame >= 4 {
+            for pid in &dead {
+                assert!(
+                    !kept.contains(pid),
+                    "frame {frame}: exited pid {pid} settled"
+                );
+            }
+        }
+        if f_seen.is_none()
+            && engine
+                .plan
+                .modules
+                .iter()
+                .any(|module| module.path.ends_with("scale-f.so"))
+        {
+            f_seen = Some(frame);
+        }
+    }
+    let live: BTreeSet<u32> = pids.iter().copied().collect();
+    for view in &engine.views {
+        assert!(
+            live.contains(&view.pid()),
+            "every retained view maps a live generation: {}",
+            view.pid()
+        );
+        assert!(view.still_the_same(), "no stale generation is retained");
+    }
+    for name in ["scale-e.so", "scale-f.so"] {
+        assert!(
+            engine
+                .plan
+                .modules
+                .iter()
+                .any(|module| module.path.ends_with(name)),
+            "{name} is covered after churn"
+        );
+    }
+    let f_seen = f_seen.expect("rotation reaches F after churn");
+    assert!(
+        f_seen <= 20,
+        "under-cap admission covers F at once: frame {f_seen}"
     );
 }

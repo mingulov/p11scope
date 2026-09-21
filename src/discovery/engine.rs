@@ -3915,6 +3915,77 @@ fn select_deep_scan_candidates(sweep: &[(u32, Vec<MapEntry>)], max_pids: usize) 
         .collect()
 }
 
+/// Rotation's fairness-tiered variant of the selection above: identical
+/// grouping, global rarity census, and group order — but within each group
+/// the representative is the lowest never-evicted member (falling back to
+/// the lowest stale one), and unmapped pids trail fresh-first, pid order
+/// within each tier. Rarity still beats pid order across groups, so a rare
+/// provider is always reached first; within a class, never-scanned pids
+/// beat re-scans, so rotation covers every pid instead of churning the
+/// lowest evictees back ahead of higher never-scanned ones. With no stale
+/// pids this agrees with `select_deep_scan_candidates` exactly.
+fn select_rotation_candidates(
+    sweep: &[(u32, Vec<MapEntry>)],
+    max_pids: usize,
+    stale: &BTreeSet<u32>,
+) -> Vec<u32> {
+    if sweep.len() <= max_pids {
+        let mut pids: Vec<u32> = sweep.iter().map(|(pid, _)| *pid).collect();
+        pids.sort_unstable();
+        return pids;
+    }
+    let mut groups: BTreeMap<BTreeSet<ObjectKey>, Vec<u32>> = BTreeMap::new();
+    let mut unmapped: Vec<u32> = Vec::new();
+    for (pid, entries) in sweep {
+        let key: BTreeSet<ObjectKey> = entries
+            .iter()
+            .filter(|entry| is_provider_mapping(entry))
+            .map(ObjectKey::of)
+            .collect();
+        if key.is_empty() {
+            unmapped.push(*pid);
+        } else {
+            groups.entry(key).or_default().push(*pid);
+        }
+    }
+    let mut census: BTreeMap<ObjectKey, usize> = BTreeMap::new();
+    for (key, members) in &groups {
+        for file in key {
+            *census.entry(*file).or_default() += members.len();
+        }
+    }
+    let mut ordered: Vec<(BTreeSet<ObjectKey>, Vec<u32>)> = groups.into_iter().collect();
+    for (_, members) in &mut ordered {
+        members.sort_unstable();
+    }
+    ordered.sort_by_key(|(key, members)| {
+        let min_global = key
+            .iter()
+            .map(|file| census[file])
+            .min()
+            .unwrap_or(usize::MAX);
+        (min_global, members.len(), members[0])
+    });
+    unmapped.sort_unstable();
+    // `partition` preserves the sorted order within each tier.
+    let (fresh_unmapped, stale_unmapped): (Vec<u32>, Vec<u32>) = unmapped
+        .into_iter()
+        .partition(|pid| !stale.contains(pid));
+    ordered
+        .into_iter()
+        .map(|(_, members)| {
+            members
+                .iter()
+                .copied()
+                .find(|pid| !stale.contains(pid))
+                .unwrap_or(members[0])
+        })
+        .chain(fresh_unmapped)
+        .chain(stale_unmapped)
+        .take(max_pids)
+        .collect()
+}
+
 /// Categorical over-cap diagnostic: the actual selected count out of the
 /// enumerated count, the cap, and the selection method. Selection is
 /// provider-rarity order, not a pid prefix, so the message must never say
@@ -13422,12 +13493,15 @@ impl Engine {
         // Cooling pids were read (and revalidated when retained) but sit
         // out selection until their cooldown expires, so rotation walks
         // forward instead of churning. Queued refresh requests for them
-        // rejoin through the pending set in the caller.
+        // rejoin through the pending set in the caller. Cooled-but-stale
+        // pids stay in the pool and sort behind never-evicted pids within
+        // their rarity class (fairness tier), so every pid is covered.
         let pool: Vec<(u32, Vec<MapEntry>)> = slice
             .into_iter()
             .filter(|(pid, _)| !known.contains(pid) && !self.scheduler.cooling_down(*pid))
             .collect();
-        select_deep_scan_candidates(&pool, free_slots)
+        let stale: BTreeSet<u32> = self.scheduler.stale_pids().into_iter().collect();
+        select_rotation_candidates(&pool, free_slots, &stale)
     }
 
     fn refresh_inventory(
@@ -13501,6 +13575,11 @@ impl Engine {
         let membership_complete = skipped.is_empty() && pids.len() <= max_scan_pids;
         let enumerated = pids.len();
         let over_cap = enumerated > max_scan_pids;
+        // Staleness tracks the live scope: departed pids prune every tick,
+        // which is what bounds the map (a reappearing pid is PID reuse, a
+        // new generation, correctly fresh).
+        let live: BTreeSet<u32> = pids.iter().copied().collect();
+        self.scheduler.prune_stale_to_enumerated(&live);
         // Ordinary ticks never sweep maps: over the cap the scheduler serves
         // queued event-driven work plus a fairness-rotation window, and only
         // the slower reconciliation pass re-reads one bounded slice (Task
@@ -13679,6 +13758,7 @@ impl Engine {
                 // attaches what it verified with the skips as evidence.
                 Ok((modules, pins, _complete)) => {
                     self.note_scan_observed(view.id(), &modules);
+                    self.scheduler.note_admitted(pid);
                     new_views.push((view, modules, pins));
                 }
                 Err(error) => {

@@ -5,7 +5,8 @@
 //! left through the sink and what did not.
 
 use std::io::{self, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd as _, IntoRawFd as _, OwnedFd, RawFd};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -57,29 +58,167 @@ pub(crate) struct SinkWriter<W: Write + AsRawFd> {
     cancel: Option<Arc<AtomicBool>>,
 }
 
-/// Production's stdout sink: a dup'd raw fd, unbuffered, so every byte
-/// passes through the poll bound. (A buffered inner would park bytes
-/// past the poll loop and its EAGAIN would escape as a hard error.)
-/// The dup shares the open file description with fd 1, so fd 1 itself
-/// becomes nonblocking too; nothing else in the observer writes
-/// stdout directly (diagnostics use stderr).
-pub(crate) fn stdout_sink() -> io::Result<SinkWriter<std::fs::File>> {
-    use std::os::fd::{AsRawFd, FromRawFd};
-    let fd = unsafe { libc::dup(std::io::stdout().as_raw_fd()) };
-    if fd < 0 {
+/// What `stdout_sink` writes through: unbuffered, so every byte passes
+/// through the poll bound. (A buffered inner would park bytes past the
+/// poll loop and its EAGAIN would escape as a hard error.)
+///
+/// Every variant leaves the shared open file description's status flags
+/// alone (F-11): the owned child inherits fd 1's description, so a sink
+/// that flips `O_NONBLOCK` on it flips the child's writes to EAGAIN
+/// under backpressure — and a second `dup` cannot provide isolation,
+/// because `dup` aliases the description.
+pub(crate) enum StdoutInner {
+    /// A pipe or terminal reopened as a private description (whose own
+    /// flags the sink may set), or a shared regular file or block device
+    /// (whose writes never block, so no flag is set at all).
+    File(std::fs::File),
+    /// A shared socket, written with per-call `MSG_DONTWAIT`, so no flag
+    /// change is needed either.
+    Socket(SocketWriter),
+}
+
+impl Write for StdoutInner {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        match self {
+            StdoutInner::File(file) => file.write(bytes),
+            StdoutInner::Socket(socket) => socket.write(bytes),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            StdoutInner::File(file) => file.flush(),
+            StdoutInner::Socket(socket) => socket.flush(),
+        }
+    }
+}
+
+impl AsRawFd for StdoutInner {
+    fn as_raw_fd(&self) -> RawFd {
+        match self {
+            StdoutInner::File(file) => file.as_raw_fd(),
+            StdoutInner::Socket(socket) => socket.as_raw_fd(),
+        }
+    }
+}
+
+/// A socket stdout that never changes shared status flags: every write
+/// is one `send` with `MSG_DONTWAIT`, giving the bounded flush its
+/// nonblocking writes without touching the description the owned child
+/// shares. `MSG_NOSIGNAL` keeps a dead peer as EPIPE, not SIGPIPE.
+pub(crate) struct SocketWriter {
+    fd: OwnedFd,
+}
+
+impl SocketWriter {
+    fn new(fd: OwnedFd) -> Self {
+        Self { fd }
+    }
+}
+
+impl Write for SocketWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        // SAFETY: `send` reads `bytes` only; the fd is owned and open.
+        let sent = unsafe {
+            libc::send(
+                self.fd.as_raw_fd(),
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            )
+        };
+        if sent < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(sent as usize)
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl AsRawFd for SocketWriter {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+}
+
+/// Production's stdout sink: [`stdout_sink_from`] on fd 1.
+pub(crate) fn stdout_sink() -> io::Result<SinkWriter<StdoutInner>> {
+    stdout_sink_from(std::io::stdout().as_raw_fd())
+}
+
+/// Builds the stdout sink for any writer fd (production passes fd 1),
+/// dispatching on file type so the shared description's status flags
+/// are never changed: pipes and terminals are reopened as private
+/// descriptions, sockets use per-call nonblocking sends, and regular
+/// files are shared without any flag change (their writes never block,
+/// and sharing keeps the observer's and the child's file offsets
+/// advancing together).
+fn stdout_sink_from(fd: RawFd) -> io::Result<SinkWriter<StdoutInner>> {
+    // SAFETY: `fstat` only reads the fd's metadata.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &raw mut stat) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: `dup` succeeded, so the new fd is open and owned here.
-    SinkWriter::new(unsafe { std::fs::File::from_raw_fd(fd) })
+    match stat.st_mode & libc::S_IFMT {
+        libc::S_IFIFO | libc::S_IFCHR => {
+            // A fresh description with its own flags: opening
+            // `/proc/self/fd/N` re-opens the pipe or device instead of
+            // aliasing the description the way `dup` does.
+            // `O_NONBLOCK` at open so a readerless FIFO fails instead of
+            // blocking the observer here.
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(format!("/proc/self/fd/{fd}"))?;
+            SinkWriter::new(StdoutInner::File(file))
+        }
+        libc::S_IFSOCK => {
+            let duped = dup_cloexec(fd)?;
+            Ok(SinkWriter::without_flag_change(StdoutInner::Socket(
+                SocketWriter::new(duped),
+            )))
+        }
+        libc::S_IFREG | libc::S_IFBLK => {
+            use std::os::fd::FromRawFd as _;
+            let file = unsafe { std::fs::File::from_raw_fd(dup_cloexec(fd)?.into_raw_fd()) };
+            Ok(SinkWriter::without_flag_change(StdoutInner::File(file)))
+        }
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "stdout has unsupported file type {other:#o}; refusing to risk blocking the \
+                 capture or changing shared open-file status flags"
+            ),
+        )),
+    }
+}
+
+/// `dup` with `CLOEXEC`: the sink fd must not leak into owned children.
+fn dup_cloexec(fd: RawFd) -> io::Result<OwnedFd> {
+    // SAFETY: `F_DUPFD_CLOEXEC` returns a fresh owned fd, or -1.
+    let duped = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if duped < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fcntl` returned a fresh owned descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(duped) })
 }
 
 impl<W: Write + AsRawFd> SinkWriter<W> {
     /// Marks the fd nonblocking, so the poll bound actually binds: a
     /// blocking write past a poll-ready notification would trickle an
     /// unbounded stall (E-slow-sink: one flush held the drain thread
-    /// 28.7s and bled 13707 ring records). Regular files and /dev/null
-    /// ignore the flag. Fails closed: without the flag the tick budget
-    /// cannot be honored.
+    /// 28.7s and bled 13707 ring records). Fails closed: without the
+    /// flag the tick budget cannot be honored. The caller grants flag
+    /// ownership: never call this on a description whose flags are
+    /// shared (F-11) — use [`without_flag_change`](Self::without_flag_change).
     pub(crate) fn new(inner: W) -> io::Result<Self> {
         // SAFETY: fcntl flag reads/writes touch only the fd's own flags.
         let flags = unsafe { libc::fcntl(inner.as_raw_fd(), libc::F_GETFL) };
@@ -90,13 +229,21 @@ impl<W: Write + AsRawFd> SinkWriter<W> {
         if unsafe { libc::fcntl(inner.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self {
+        Ok(Self::without_flag_change(inner))
+    }
+
+    /// Wraps an fd whose writes already cannot block — a socket using
+    /// per-call flags, or a regular file — without touching its status
+    /// flags. (Regular files ignore `O_NONBLOCK` in the kernel, so
+    /// sharing their description changes nothing.)
+    pub(crate) fn without_flag_change(inner: W) -> Self {
+        Self {
             inner,
             buf: Vec::with_capacity(SINK_BUFFER_BYTES),
             tick_budget: Duration::ZERO,
             drops: SinkDrops::default(),
             cancel: None,
-        })
+        }
     }
 
     /// Opens the flush budget for a tick. Every flush of the tick draws
@@ -424,6 +571,94 @@ mod tests {
         assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFL, flags) }, 0);
     }
 
+    /// F-11: the owned child inherits fd 1's open file description, so a
+    /// sink that flips O_NONBLOCK on the shared description flips the
+    /// child's writes to EAGAIN under backpressure — and a second `dup`
+    /// cannot provide isolation, because `dup` aliases the description.
+    /// The sink must leave the shared description's status flags alone.
+    fn description_flags(fd: std::os::fd::RawFd) -> libc::c_int {
+        // SAFETY: the test owns every fd it reads here.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(flags >= 0, "fcntl F_GETFL failed");
+        flags
+    }
+
+    fn pipe_files() -> (std::fs::File, std::fs::File) {
+        use std::os::fd::FromRawFd as _;
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: `pipe` succeeded, so both fds are open and owned here.
+        unsafe {
+            (
+                std::fs::File::from_raw_fd(fds[0]),
+                std::fs::File::from_raw_fd(fds[1]),
+            )
+        }
+    }
+
+    #[test]
+    fn stdout_sink_from_a_pipe_leaves_the_shared_description_blocking() {
+        let (mut reader, writer) = pipe_files();
+        // The sibling shares the description the way an owned child's
+        // inherited fd 1 does.
+        let sibling = writer.try_clone().unwrap();
+        let mut sink = stdout_sink_from(writer.as_raw_fd()).unwrap();
+        assert_eq!(
+            description_flags(sibling.as_raw_fd()) & libc::O_NONBLOCK,
+            0,
+            "the sink changed the shared description's status flags"
+        );
+        // The sink itself still delivers through the poll bound.
+        sink.begin_tick(Duration::from_millis(250));
+        sink.write_all(b"pipe bytes\n").unwrap();
+        sink.flush().unwrap();
+        let mut got = vec![0u8; b"pipe bytes\n".len()];
+        reader.read_exact(&mut got).unwrap();
+        assert_eq!(got, b"pipe bytes\n");
+        assert_eq!(sink.take_drops(), SinkDrops::default());
+    }
+
+    #[test]
+    fn stdout_sink_from_a_socket_leaves_the_shared_description_blocking() {
+        let (writer, mut reader) = pair();
+        let sibling = writer.try_clone().unwrap();
+        let mut sink = stdout_sink_from(writer.as_raw_fd()).unwrap();
+        assert_eq!(
+            description_flags(sibling.as_raw_fd()) & libc::O_NONBLOCK,
+            0,
+            "the sink changed the shared description's status flags"
+        );
+        sink.begin_tick(Duration::from_millis(250));
+        sink.write_all(b"socket bytes\n").unwrap();
+        sink.flush().unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut got = vec![0u8; b"socket bytes\n".len()];
+        reader.read_exact(&mut got).unwrap();
+        assert_eq!(got, b"socket bytes\n");
+        assert_eq!(sink.take_drops(), SinkDrops::default());
+    }
+
+    #[test]
+    fn stdout_sink_from_a_file_leaves_the_shared_description_alone() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let sibling = file.as_file().try_clone().unwrap();
+        let before = description_flags(sibling.as_raw_fd());
+        let mut sink = stdout_sink_from(file.as_raw_fd()).unwrap();
+        assert_eq!(
+            description_flags(sibling.as_raw_fd()),
+            before,
+            "the sink changed the shared description's status flags"
+        );
+        sink.begin_tick(Duration::from_millis(250));
+        sink.write_all(b"file bytes\n").unwrap();
+        sink.flush().unwrap();
+        assert_eq!(sink.take_drops(), SinkDrops::default());
+        let landed = std::fs::read(file.path()).unwrap();
+        assert_eq!(landed, b"file bytes\n");
+    }
+
     #[test]
     fn stdout_sink_is_unbuffered_by_construction() {
         // The poll bound can only meter bytes it can see: a buffered
@@ -431,10 +666,61 @@ mod tests {
         // loop, and its EAGAIN escapes as a hard error that kills the
         // observer (E-slow-sink rerun: "flushing stdout: Resource
         // temporarily unavailable"). Production's constructor returns
-        // a raw File, unbuffered; this pins the type at compile time.
-        fn assert_raw_file(_: &SinkWriter<std::fs::File>) {}
+        // the raw-fd enum, unbuffered; this pins the type at compile time.
+        fn assert_raw_inner(_: &SinkWriter<StdoutInner>) {}
         let mut sink = stdout_sink().unwrap();
-        assert_raw_file(&sink);
+        assert_raw_inner(&sink);
+        assert_eq!(sink.take_drops(), SinkDrops::default());
+    }
+
+    #[test]
+    fn the_reopened_pipe_sink_binds_its_own_private_description() {
+        // The other half of the F-11 contract: the sink's own pipe fd
+        // carries O_NONBLOCK (the poll bound binds), while the shared
+        // description it was reopened from stays blocking.
+        let (_reader, writer) = pipe_files();
+        let sibling = writer.try_clone().unwrap();
+        let sink = stdout_sink_from(writer.as_raw_fd()).unwrap();
+        assert_ne!(
+            description_flags(sink.inner.as_raw_fd()) & libc::O_NONBLOCK,
+            0,
+            "the sink's private description must be nonblocking"
+        );
+        assert_eq!(
+            description_flags(sibling.as_raw_fd()) & libc::O_NONBLOCK,
+            0,
+            "the shared description must stay blocking"
+        );
+    }
+
+    #[test]
+    fn the_socket_sink_uses_per_call_flags_not_fd_flags() {
+        // Documents the socket design: neither the sink's dup nor the
+        // shared description carries O_NONBLOCK, because every write is
+        // a MSG_DONTWAIT send.
+        let (writer, _reader) = pair();
+        let sibling = writer.try_clone().unwrap();
+        let sink = stdout_sink_from(writer.as_raw_fd()).unwrap();
+        assert!(matches!(sink.inner, StdoutInner::Socket(_)));
+        assert_eq!(
+            description_flags(sink.inner.as_raw_fd()) & libc::O_NONBLOCK,
+            0
+        );
+        assert_eq!(description_flags(sibling.as_raw_fd()) & libc::O_NONBLOCK, 0);
+    }
+
+    #[test]
+    fn a_dead_socket_peer_is_an_error_not_a_drop() {
+        // The socket path keeps broken-pipe semantics: MSG_NOSIGNAL
+        // turns the dead peer into EPIPE, which propagates instead of
+        // counting as a drop.
+        let (writer, reader) = pair();
+        drop(reader);
+        let mut sink = stdout_sink_from(writer.as_raw_fd()).unwrap();
+        sink.begin_tick(Duration::from_millis(250));
+        sink.write_all(b"no one listens\n").unwrap();
+        let error = sink.flush().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
         assert_eq!(sink.take_drops(), SinkDrops::default());
     }
 

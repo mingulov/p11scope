@@ -2897,7 +2897,7 @@ type ProfileTerminalContext<
     &'engine mut Engine,
     &'session mut Session,
     &'owned_ref mut Option<&'owned mut Owned>,
-    &'stdout_ref mut crate::sink::SinkWriter<std::fs::File>,
+    &'stdout_ref mut crate::sink::SinkWriter<crate::sink::StdoutInner>,
     &'stdout_open mut bool,
     &'output mut Option<AtomicFile>,
 );
@@ -2918,7 +2918,7 @@ type TraceTickContext<
     &'owned_ref mut Option<&'owned mut Owned>,
     &'remaining mut Option<u64>,
     &'loss mut u64,
-    &'stdout_ref mut crate::sink::SinkWriter<std::fs::File>,
+    &'stdout_ref mut crate::sink::SinkWriter<crate::sink::StdoutInner>,
     &'stdout_open mut bool,
     &'out_file mut Option<std::io::BufWriter<std::fs::File>>,
 );
@@ -3037,7 +3037,7 @@ fn capture_profile(
     let has_output = output.is_some();
     let mut stdout_sink = crate::sink::stdout_sink()?;
     stdout_sink.set_cancel_flag(interrupted.cancel_flag());
-    let stdout: &mut crate::sink::SinkWriter<std::fs::File> = &mut stdout_sink;
+    let stdout: &mut crate::sink::SinkWriter<crate::sink::StdoutInner> = &mut stdout_sink;
     let profile = policy.uses_events();
     let mode = if profile { "profile" } else { "metrics" };
 
@@ -3491,7 +3491,7 @@ fn capture_trace(
     let out_file = &mut out_sink;
     let mut stdout_sink = crate::sink::stdout_sink()?;
     stdout_sink.set_cancel_flag(interrupted.cancel_flag());
-    let stdout: &mut crate::sink::SinkWriter<std::fs::File> = &mut stdout_sink;
+    let stdout: &mut crate::sink::SinkWriter<crate::sink::StdoutInner> = &mut stdout_sink;
 
     let domain = session.events_domain();
     let mut state = semantics::State::for_capture(engine.plan(), policy, domain.clone());
@@ -3936,7 +3936,7 @@ fn emit_trace_terminal_accounted<W: Write>(
     reports: &[metrics::SlotReport],
     tracer: &trace::Tracer,
     scheduling: &mut SchedulingAccumulator,
-    stdout: &mut crate::sink::SinkWriter<std::fs::File>,
+    stdout: &mut crate::sink::SinkWriter<crate::sink::StdoutInner>,
     stdout_open: &mut bool,
     out_file: &mut Option<W>,
 ) -> Result<()> {
@@ -4044,7 +4044,7 @@ fn sink_note_due(drops: &crate::sink::SinkDrops, last_note: Option<Instant>, now
 /// stalls on stderr (throttled): stdout's own evidence line is
 /// best-effort under backpressure, so the note is the fallback record.
 fn collect_sink_drops(
-    sink: &mut crate::sink::SinkWriter<std::fs::File>,
+    sink: &mut crate::sink::SinkWriter<crate::sink::StdoutInner>,
     acc: &mut SchedulingAccumulator,
     last_note: &mut Option<Instant>,
     now: Instant,
@@ -7587,7 +7587,8 @@ mod tests {
     #[test]
     fn terminal_trace_evidence_accounts_every_terminal_drop_byte_exact() {
         let (reader, writer) = pipe_pair();
-        let mut sink = crate::sink::SinkWriter::new(writer).unwrap();
+        let mut sink =
+            crate::sink::SinkWriter::new(crate::sink::StdoutInner::File(writer)).unwrap();
         let mut stdout_open = true;
         let mut file = Some(Vec::new());
         let mut scheduling = SchedulingAccumulator::default();
@@ -7647,7 +7648,8 @@ mod tests {
     #[test]
     fn terminal_trace_old_order_strands_terminal_drops_outside_evidence() {
         let (reader, writer) = pipe_pair();
-        let mut sink = crate::sink::SinkWriter::new(writer).unwrap();
+        let mut sink =
+            crate::sink::SinkWriter::new(crate::sink::StdoutInner::File(writer)).unwrap();
         let mut stdout_open = true;
         let mut file = Some(Vec::new());
         let mut scheduling = SchedulingAccumulator::default();

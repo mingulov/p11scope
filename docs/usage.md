@@ -438,7 +438,11 @@ counts every well-formed non-fork event consumed before truncation.
 - `--allow-uretprobe-on-confined-target` — accept the uretprobe hazard on a
   target that confines syscalls instead of refusing to attach. The default
   refusal is deliberate: on affected kernels a uretprobe on a confined target
-  can kill it. See `p11scope doctor` and `src/uretprobe_hazard.rs`.
+  can kill it. An unproven kernel (the self-probe could not reach a verdict)
+  refuses the same way wherever the target cannot be shown unconfined —
+  unreadable targets, `--cgroup`/`--system` scopes, and `run` children,
+  which may confine themselves after attach. See `p11scope doctor` and
+  `src/uretprobe_hazard.rs`.
 
 ### Exit codes
 

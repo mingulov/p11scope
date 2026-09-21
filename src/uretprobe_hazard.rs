@@ -193,7 +193,8 @@ fn needs_kernel_probe(mode: Option<SeccompMode>) -> bool {
 /// `target` is the single pid a `--pid` capture probes. `None` means the scope
 /// installs probes process-wide (`--cgroup` attaches `AllProcesses` and filters
 /// in BPF), so the set of processes that would run the trampoline cannot be
-/// enumerated and must be treated as possibly confined.
+/// enumerated and must be treated as possibly confined — or an owned `run`
+/// child, which may confine itself after attach.
 pub(crate) fn evaluate(target: Option<u32>, overridden: bool) -> Action {
     let mode = target.and_then(target_seccomp_mode);
     evaluate_mode(mode, overridden, probe_kernel)

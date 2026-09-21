@@ -2121,6 +2121,11 @@ fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOut
     // anything is forked, attached, or released past its barrier.
     resolve_program(&program)
         .map_err(|error| anyhow!("run: exec {}: {error}", Path::new(&program).display()))?;
+    // Before the fork: the owned child can install a seccomp filter after
+    // attach, so no startup /proc reading can qualify it — only a kernel
+    // proven to exempt the trampoline proceeds by default (F-01). An
+    // initial unconfined status cannot qualify that future state.
+    preflight_uretprobe_hazard(None, args.allow_confined_uretprobe)?;
 
     let mut child = OwnedChild::spawn(program, command.collect())
         .map_err(|error| anyhow!("run: starting the owned child: {error}"))?;
@@ -2304,9 +2309,10 @@ fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOut
 ///
 /// `target` is the one pid a `--pid` capture probes; `None` means the scope
 /// attaches process-wide, so the processes that would run the trampoline
-/// cannot be enumerated. `run` deliberately does not call this: its child arms
-/// any filter after exec, which is after attach, so there is nothing to read
-/// yet — that path reports the death instead.
+/// cannot be enumerated — or, for `run`, that the owned child arms any
+/// filter after exec, which is after attach, so there is nothing to read
+/// yet and only a proven-clean kernel proceeds. The death report stays as
+/// the second layer for override runs.
 fn preflight_uretprobe_hazard(target: Option<u32>, overridden: bool) -> Result<bool> {
     match uretprobe_hazard::evaluate(target, overridden) {
         uretprobe_hazard::Action::Proceed => Ok(false),

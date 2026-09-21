@@ -32,18 +32,26 @@ CHECKER = runpy.run_path(str(ROOT / "scripts/check-capture-evidence.py"))
 
 
 def run_measure(tmp, *, scope, mode, workload_argv, report_text,
-                stderr_lines=(), truth, truth_prego=None, duration_s=8):
-    """Run the real measurement main() on synthetic inputs; return record."""
+                stderr_lines=(), truth, truth_prego=None, duration_s=8,
+                receipt=None):
+    """Run the real measurement main() on synthetic inputs; return record.
+
+    `receipt` is the workload mapping/pin receipt (Package A: owned
+    matching needs one; omitted means the harness supplied none).
+    """
+    condition = {
+        "scope": scope, "mode": mode, "duration_s": duration_s,
+        "gate": "frame",
+        "observer_argv": ["p11scope", mode, "--system"],
+        "binary": "synthetic", "build_profile": "synthetic",
+        "ring_bytes": "default", "drain_interval_ms": "default",
+        "manifest": None, "workload_argv": workload_argv,
+        "seed": 1, "n_calls": sum(truth.values()), "pace_us": 0,
+    }
+    if receipt is not None:
+        condition["workload_module_identity"] = receipt
     meta = {
-        "condition": {
-            "scope": scope, "mode": mode, "duration_s": duration_s,
-            "gate": "frame",
-            "observer_argv": ["p11scope", mode, "--system"],
-            "binary": "synthetic", "build_profile": "synthetic",
-            "ring_bytes": "default", "drain_interval_ms": "default",
-            "manifest": None, "workload_argv": workload_argv,
-            "seed": 1, "n_calls": sum(truth.values()), "pace_us": 0,
-        },
+        "condition": condition,
         "timing": {"t_spawn_mono_ns": 0, "t_exit_mono_ns": 12_000_000_000,
                    "t_go_mono_ns": 1_000_000_000},
         "harness": {"git_rev": "synthetic", "git_clean": True},
@@ -110,11 +118,14 @@ class OwnedCoverageTests(unittest.TestCase):
                 report_text=profile_report(
                     functions=[{"names": ["unknown"], "calls": 7,
                                 "module": {"path": "foreign.so"}}],
-                    discovery=[{"path": "foreign.so", "tables": [{}]}],
+                    discovery=[{"path": "foreign.so", "dev": [8, 1],
+                                "ino": 12, "sha256": "bb", "tables": [{}]}],
                     skipped=[{"name": "owned.so",
                               "reason": "capacity: controlled workload refused"}]),
                 stderr_lines=["p11scope: module refused: owned.so — capacity"],
-                truth={"C_GenerateRandom": 7})
+                truth={"C_GenerateRandom": 7},
+                receipt=[{"dev": [8, 1], "ino": 11, "sha256": "aa",
+                          "path": "controlled-owned.so"}])
         tvo = record["truth_vs_observed"]
         self.assertFalse(tvo["counts_match"])
         self.assertIn("not admitted", tvo["match_note"])
@@ -151,7 +162,9 @@ class OwnedCoverageTests(unittest.TestCase):
                          "sha256": "bb", "tables": [{}]},
                     ],
                     probes=4, slots=2),
-                truth={"C_GenerateRandom": 7})
+                truth={"C_GenerateRandom": 7},
+                receipt=[{"dev": [8, 1], "ino": 11, "sha256": "aa",
+                          "path": "/w/owned.so"}])
         tvo = record["truth_vs_observed"]
         self.assertTrue(tvo["counts_match"])
         self.assertIn("owned-attributed coverage 7 vs truth 7",
@@ -181,7 +194,9 @@ class OwnedCoverageTests(unittest.TestCase):
                          "sha256": "bb", "tables": [{}]},
                     ],
                     probes=4, slots=2),
-                truth={"C_GenerateRandom": 7})
+                truth={"C_GenerateRandom": 7},
+                receipt=[{"dev": [8, 1], "ino": 11, "sha256": "aa",
+                          "path": "/w/owned.so"}])
         tvo = record["truth_vs_observed"]
         self.assertFalse(tvo["counts_match"])
         self.assertIn("owned-attributed coverage 0 vs truth 7",
@@ -201,7 +216,9 @@ class OwnedCoverageTests(unittest.TestCase):
                                            "sha256": "aa"}}],
                     discovery=[{"path": "/w/owned.so", "dev": [8, 1],
                                 "ino": 11, "sha256": "aa", "tables": [{}]}]),
-                truth={"C_GenerateRandom": 7})
+                truth={"C_GenerateRandom": 7},
+                receipt=[{"dev": [8, 1], "ino": 11, "sha256": "aa",
+                          "path": "/w/owned.so"}])
         self.assertFalse(record["truth_vs_observed"]["counts_match"])
         self.assertFalse(record["window"]["window_valid"])
 
@@ -215,10 +232,13 @@ class OwnedCoverageTests(unittest.TestCase):
                 report_text=profile_report(
                     functions=[{"names": ["C_GenerateRandom"], "calls": 7,
                                 "module": {"path": "foreign.so"}}],
-                    discovery=[{"path": "foreign.so", "tables": [{}]}],
+                    discovery=[{"path": "foreign.so", "dev": [8, 1],
+                                "ino": 12, "sha256": "bb", "tables": [{}]}],
                     skipped=[{"name": "owned.so", "reason": "capacity"}]),
                 stderr_lines=["p11scope: module refused: owned.so — capacity"],
-                truth={"C_GenerateRandom": 7})
+                truth={"C_GenerateRandom": 7},
+                receipt=[{"dev": [8, 1], "ino": 11, "sha256": "aa",
+                          "path": "controlled-owned.so"}])
         tvo = record["truth_vs_observed"]
         self.assertFalse(tvo["counts_match"])
         self.assertIn("requires the owned workload module",
@@ -234,7 +254,9 @@ class OwnedCoverageTests(unittest.TestCase):
         evidence = {name: 0 for name in CHECKER["COUNTERS"]}
         evidence.update(schema="p11scope/capture-evidence/v1",
                         completeness="PARTIAL", attached_probes=136,
-                        slots=68, discovery=[{"path": "foreign.so"}],
+                        slots=68, discovery=[{"path": "foreign.so",
+                                              "dev": [8, 1], "ino": 12,
+                                              "sha256": "bb"}],
                         modules_skipped=[{"name": "owned.so",
                                           "reason": "capacity"}])
         with tempfile.TemporaryDirectory() as raw:
@@ -245,7 +267,9 @@ class OwnedCoverageTests(unittest.TestCase):
                     lines=lines, stats_returned=7, raw_calls=7,
                     evidence=evidence),
                 stderr_lines=["p11scope: module refused: owned.so — capacity"],
-                truth={"C_GenerateRandom": 7})
+                truth={"C_GenerateRandom": 7},
+                receipt=[{"dev": [8, 1], "ino": 11, "sha256": "aa",
+                          "path": "controlled-owned.so"}])
         tvo = record["truth_vs_observed"]
         self.assertFalse(tvo["counts_match"])
         self.assertIn("not admitted", tvo["match_note"])
@@ -259,7 +283,9 @@ class OwnedCoverageTests(unittest.TestCase):
         evidence.update(schema="p11scope/capture-evidence/v1",
                         completeness="PARTIAL", attached_probes=136,
                         slots=68,
-                        discovery=[{"path": "controlled-owned.so"}])
+                        discovery=[{"path": "controlled-owned.so",
+                                    "dev": [8, 1], "ino": 11,
+                                    "sha256": "aa"}])
         with tempfile.TemporaryDirectory() as raw:
             record = run_measure(
                 Path(raw), scope="system", mode="trace",
@@ -267,7 +293,9 @@ class OwnedCoverageTests(unittest.TestCase):
                 report_text=trace_stream(
                     lines=lines, stats_returned=7, raw_calls=7,
                     evidence=evidence),
-                truth={"C_GenerateRandom": 7})
+                truth={"C_GenerateRandom": 7},
+                receipt=[{"dev": [8, 1], "ino": 11, "sha256": "aa",
+                          "path": "controlled-owned.so"}])
         self.assertTrue(record["truth_vs_observed"]["counts_match"])
         self.assertTrue(record["window"]["window_valid"])
 

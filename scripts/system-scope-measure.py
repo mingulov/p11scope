@@ -14,6 +14,13 @@ imported from scripts/check-capture-evidence.py (COUNTERS) so it cannot
 drift; an embedded fallback is used only if that import fails, and the
 record says which source was used.
 
+System-scope owned matching needs the workload's own mapping/pin
+receipt: meta["condition"]["workload_module_identity"], a list of
+{"dev", "ino", "sha256"?, "path"?} dicts attesting the module the
+workload mapped. Pathnames (workload argv, discovery labels, refusal
+lines) are display-only: without a receipt, or without identity on
+the report side, owned matching is unknown, never pathname-guessed.
+
 Stdlib only.
 """
 
@@ -294,10 +301,16 @@ def trace_counts_match(scope, truth, stats_returned, *, owned_admitted=True,
     """
     truth_total = sum(truth.values())
     if scope != "pid" and not owned_admitted:
-        note = ("trace system: owned workload module not admitted; kernel "
-                f"aggregate total ({stats_returned}) cannot prove owned "
-                f"coverage of truth ({truth_total})"
-                + ("" if not owned_note else f" ({owned_note})"))
+        if owned_admitted is None:
+            note = ("trace system: owned workload matching unresolved; "
+                    f"kernel aggregate total ({stats_returned}) cannot prove "
+                    f"owned coverage of truth ({truth_total})"
+                    + ("" if not owned_note else f" ({owned_note})"))
+        else:
+            note = ("trace system: owned workload module not admitted; kernel "
+                    f"aggregate total ({stats_returned}) cannot prove owned "
+                    f"coverage of truth ({truth_total})"
+                    + ("" if not owned_note else f" ({owned_note})"))
         return False, note
     if scope == "pid":
         match = stats_returned == truth_total
@@ -357,6 +370,7 @@ def build_event_path(*, mode, generated, kernel_observed, event_loss,
         "burst_rate_per_s": (generated / burst_wall_s
                              if burst_wall_s and burst_wall_s > 0 else None),
         "delivered_derived": None,
+        "delivered_note": None,
         "lines_vs_raw_calls_match": None,
         "delivery_gap": None,
     }
@@ -372,6 +386,10 @@ def build_event_path(*, mode, generated, kernel_observed, event_loss,
                 "(write suppression or post-limit reduction; see truncated flag)")
     elif semantic_capture_failures == 0:
         path["delivered_derived"] = kernel_observed - event_loss
+        path["delivered_note"] = (
+            "arithmetic identity (kernel_observed - event_loss), not an "
+            "independently observed consumer count: profile mode has no "
+            "consumer oracle (audit F-74)")
     else:
         path["delivery_gap"] = (
             f"semantic_capture_failures={semantic_capture_failures}: some "
@@ -382,6 +400,16 @@ def build_event_path(*, mode, generated, kernel_observed, event_loss,
 
 CANCEL_MARKER_RE = re.compile(
     r"p11scope: cancel: loop exited on signal (-?\d+) after (\d+) ticks")
+# The discovery completion marker (engine.rs `report`), and only it: the
+# generic "p11scope: discovery:" prefix also matches per-class noise
+# summaries, broad fixed-family tallies and overlay-collapse notes, any
+# of which may precede the completion line (audit F-74).
+DISCOVERY_COMPLETION_RE = re.compile(
+    r"p11scope: discovery: \d+ module\(s\), \d+ attach slot\(s\), "
+    r"scan \d+ms, conflicts \d+, uncorroborated \d+")
+# The loop-end marker run.rs prints when the capture loop stops because
+# its target exited (audit F-74: the actual early-exit boundary).
+TARGET_EXIT_RE = re.compile(r"p11scope: capture ended: target exited")
 CANCEL_LATENCY_BUDGET_NS = 100_000_000
 
 
@@ -520,7 +548,7 @@ def cancel_probe_verdict(t0_ns, t_marker_ns):
                       "budget"}
 
 
-def assess_window(*, gate, scope, counts_match, collapsed,
+def assess_window(*, gate, scope, counts_match, burst_outside_window,
                   attached_probes, trace_crosscheck, coverage_detail=None):
     """Post-hoc window validity, decisive for weak (non-frame) gates.
 
@@ -530,6 +558,11 @@ def assess_window(*, gate, scope, counts_match, collapsed,
     window proof rather than a loss statement. `coverage_detail`, when
     given, names the exact coverage failure (e.g. unattributable owned
     traffic) instead of the generic missed-window text.
+    `burst_outside_window` is the boundary-based overlap verdict from
+    derive_phases: True when the workload burst provably escaped the
+    estimated capture window (audit F-74 replaced the setup-vs-duration
+    collapse inference with actual monotonic boundaries); None leaves
+    the overlap unchecked without invalidating the window.
     """
     problems = []
     if not counts_match:
@@ -537,8 +570,9 @@ def assess_window(*, gate, scope, counts_match, collapsed,
             problems.append("counts_match=False (window missed workload calls)")
         else:
             problems.append(f"counts_match=False ({coverage_detail})")
-    if collapsed:
-        problems.append("COLLAPSED WINDOW (setup exceeded the duration)")
+    if burst_outside_window:
+        problems.append("BURST OUTSIDE WINDOW (workload burst escaped the "
+                        "estimated capture window; see method warnings)")
     if attached_probes <= 0:
         problems.append("attached_probes=0 (attach never completed)")
     if not trace_crosscheck:
@@ -584,7 +618,8 @@ def owned_module_candidates(meta):
 
     The harness runs the workload as [workload, MODULE, N, PACE, MAP_EARLY],
     so argv[1] is the owned module; a single-entry argv (synthetic inputs)
-    names it directly.
+    names it directly. Display labels only: matching uses the workload
+    mapping/pin receipt, and these labels merely veto on refusal.
     """
     argv = (meta.get("condition", {}).get("workload_argv") or [])
     if len(argv) > 1:
@@ -608,50 +643,92 @@ def _module_identity(ref):
     return (dev, ref.get("ino"), ref.get("sha256"))
 
 
-def assess_owned_coverage(functions, discovery, refused, owned_paths):
+def assess_owned_coverage(functions, discovery, refused, owned_paths,
+                          owned_receipts=None):
     """Owned-workload attribution for system-scope coverage (audit F2).
 
     Scan-only system captures name every slot `unknown`, so unknown-name
     totals cannot tell owned workload calls from foreign traffic: coverage
     must come from calls attributed to the owned workload module, never
-    from global sums. Returns {"owned_admitted", "owned_calls",
-    "total_calls", "note"}.
+    from global sums. Matching is by physical identity from the
+    workload's own mapping/pin receipt (`owned_receipts`: {"dev", "ino",
+    "sha256"?} dicts); pathname labels are display-only (audit F-74):
+    the same pathname on another inode is not the owned module, and an
+    alternate path to the receipt's inode is. A sha256 present on both
+    sides must agree; a file that changed under the receipt no longer
+    matches it. A refusal naming an owned label vetoes admission even
+    without a receipt — negative evidence fails closed.
+    Returns {"owned_admitted" (True/False/None when unresolvable),
+    "owned_calls" (int/None), "total_calls", "note"}.
     """
     discovery = discovery or []
+    if isinstance(owned_receipts, dict):
+        owned_receipts = [owned_receipts]
+    receipt_identities = set()
+    for receipt in owned_receipts or []:
+        identity = _module_identity(receipt)
+        if identity is not None:
+            receipt_identities.add(identity)
+
+    def receipt_match(ref):
+        if not isinstance(ref, dict):
+            return False
+        identity = _module_identity(ref)
+        if identity is None:
+            return False
+        dev, ino, sha = identity
+        for receipt_dev, receipt_ino, receipt_sha in receipt_identities:
+            if (dev, ino) != (receipt_dev, receipt_ino):
+                continue
+            if (sha is not None and receipt_sha is not None
+                    and sha != receipt_sha):
+                continue
+            return True
+        return False
+
     refused_paths = {str(row.get("path")) for row in (refused or [])
                      if isinstance(row, dict) and row.get("path")}
-    owned_entries = [entry for entry in discovery
-                     if isinstance(entry, dict)
-                     and str(entry.get("path")) in owned_paths]
-    owned_identities = {_module_identity(entry) for entry in owned_entries}
-    owned_identities.discard(None)
     owned_refused = [path for path in owned_paths if path in refused_paths]
-    owned_admitted = bool(owned_entries) and not owned_refused
+    owned_entries = [entry for entry in discovery if receipt_match(entry)]
+    identified = [entry for entry in discovery
+                  if isinstance(entry, dict)
+                  and _module_identity(entry) is not None]
     owned_calls = 0
     total_calls = 0
     for entry in functions or []:
         calls = int(entry.get("calls", 0))
         total_calls += calls
-        ref = entry.get("module")
-        if _module_identity(ref) is not None:
-            if _module_identity(ref) in owned_identities:
-                owned_calls += calls
-        elif isinstance(ref, dict) and str(ref.get("path")) in owned_paths:
+        if receipt_match(entry.get("module")):
             owned_calls += calls
+    admitted = sorted(str(entry.get("path")) for entry in discovery
+                      if isinstance(entry, dict)) or ["none"]
+    if owned_refused:
+        note = (f"owned workload module {owned_refused} refused (not "
+                f"admitted); unknown-name totals cannot prove owned coverage")
+        return {"owned_admitted": False, "owned_calls": owned_calls,
+                "total_calls": total_calls, "note": note}
+    if not receipt_identities:
+        note = ("owned workload matching unresolved: no workload "
+                f"mapping/pin receipt (pathnames {owned_paths} are "
+                "display-only)")
+        return {"owned_admitted": None, "owned_calls": None,
+                "total_calls": total_calls, "note": note}
+    if not identified:
+        note = ("owned workload matching unresolved: no discovery entry "
+                f"carries mapping/pin identity (pathnames {admitted} are "
+                "display-only)")
+        return {"owned_admitted": None, "owned_calls": None,
+                "total_calls": total_calls, "note": note}
     if not owned_entries:
-        admitted = sorted(str(entry.get("path")) for entry in discovery
-                          if isinstance(entry, dict)) or ["none"]
         note = (f"owned workload module {owned_paths} not admitted "
                 f"(admitted: {admitted}"
                 + ("" if not refused_paths else
                    f"; refused: {sorted(refused_paths)}") + ")")
-    elif owned_refused:
-        note = (f"owned workload module {owned_refused} refused; "
-                "unknown-name totals cannot prove owned coverage")
-    else:
-        note = (f"owned-attributed {owned_calls} of {total_calls} observed "
-                f"calls (module {owned_paths})")
-    return {"owned_admitted": owned_admitted, "owned_calls": owned_calls,
+        return {"owned_admitted": False, "owned_calls": owned_calls,
+                "total_calls": total_calls, "note": note}
+    note = (f"owned-attributed {owned_calls} of {total_calls} observed "
+            f"calls (module {owned_paths})")
+    return {"owned_admitted": True, "owned_calls": owned_calls,
             "total_calls": total_calls, "note": note}
 
 
@@ -668,22 +745,37 @@ def _observer_phase_s(phase_ms, key):
 
 
 def derive_phases(samples, stderr_rows, duration_s, t_spawn_ns, t_exit_ns,
-                  t_go_ns=None, phase_ms=None):
+                  t_go_ns=None, phase_ms=None, burst_go_ns=None,
+                  burst_end_ns=None):
     """Split wall time into phases from external traces.
 
-    t_discovery: timestamped `p11scope: discovery:` stderr marker (the
+    t_discovery: the discovery *completion* marker's timestamp (the
       observer prints it when discovery completes, before attach).
+      Per-class noise summaries share the `p11scope: discovery:` prefix
+      and may precede it, so only the completion shape counts.
     t_attached: first fd sample reaching 95% of the run max — the end of
       the per-slot link ramp, after which the capture loop starts.
     t_expiry: t_attached + requested duration (the observer honors
       --duration from loop start; capture.start/end are 1 s precision and
       serve only as a cross-check).
-    t_detach_start: first post-expiry sample below 95% of max (sustained).
+    t_loop_end: a loop-end marker (target-exit, cancel) when one names
+      the loop's actual end, else t_expiry. drain/detach anchor here, so
+      an early target exit moves them instead of stranding them past a
+      taper the loop never reached.
+    t_detach_start: first post-loop-end sample below 95% of max (sustained).
     t_detach_end: first sample after that back at baseline.
-    drain = expiry -> detach start (final drain + detach setup);
+    drain = loop end -> detach start (final drain + detach setup);
     publish = detach end -> exit (report write + teardown).
     BPF program/map load has no external marker: it is folded into attach
     and reported as load_s=null with this reason.
+    `t_go_ns` is the harness gate-release boundary, recorded for
+    cross-checks; it feeds no collapse inference (audit F-74: the
+    observer's duration clock starts after attach, so setup-vs-duration
+    cannot establish expiry — a 60 s setup with an 8 s post-attach
+    capture is a healthy 8 s window). The workload/window overlap uses
+    the workload's own BURST bounds instead: `burst_outside_window` is
+    True when the burst provably predated attach or outlived expiry,
+    False when it sits inside, None when no bounds were supplied.
     `phase_ms`: the observer's own phase timers
       (evidence.scheduling.phase_ms), when the report carries them. The
       fd-trace estimator assumes the target lives until the computed
@@ -696,26 +788,33 @@ def derive_phases(samples, stderr_rows, duration_s, t_spawn_ns, t_exit_ns,
     method_warnings = []
     t_discovery = None
     discovery_line = None
+    summary_shaped = 0
     for row in stderr_rows:
-        if "p11scope: discovery:" in row.get("line", ""):
+        line = row.get("line", "")
+        if DISCOVERY_COMPLETION_RE.search(line):
             t_discovery = int(row["t_mono_ns"])
-            discovery_line = row["line"]
+            discovery_line = line
             break
+        if "p11scope: discovery:" in line:
+            summary_shaped += 1
     if t_discovery is None:
-        method_warnings.append("no discovery marker on stderr; discovery/attach split unknown")
-    if t_go_ns is not None and (t_go_ns - t_spawn_ns) / 1e9 > duration_s:
-        # The observer's --duration runs from capture-loop start and expires
-        # at the first tick after the budget is spent. The attach gate
-        # (first live frame) marks loop-live: if setup alone exceeds the
-        # requested duration, expiry fires on an early post-go tick and the
-        # workload window collapses from D seconds to tick granularity —
-        # whether the burst fits is timing luck, not margin. counts_match
-        # tells whether it fit; this flag tells not to trust the margin.
-        method_warnings.append(
-            f"COLLAPSED WINDOW: setup (spawn to capture-live) took "
-            f"{(t_go_ns - t_spawn_ns) / 1e9:.1f}s, exceeding the requested "
-            f"{duration_s}s capture; the loop expired during setup, so the "
-            f"workload burst raced teardown at tick granularity")
+        ignored = (f" ({summary_shaped} summary-shaped lines ignored)"
+                   if summary_shaped else "")
+        method_warnings.append("no discovery completion marker on stderr"
+                               + ignored + "; discovery/attach split unknown")
+    t_loop_markers = []
+    for row in stderr_rows:
+        line = row.get("line", "")
+        if TARGET_EXIT_RE.search(line):
+            reason = "target-exit"
+        elif CANCEL_MARKER_RE.search(line):
+            reason = "cancel"
+        else:
+            continue
+        ts = row.get("ts_ns", row.get("t_mono_ns"))
+        if ts is None:
+            continue
+        t_loop_markers.append((int(ts), reason))
 
     phases = {
         "discovery_s": None,
@@ -732,10 +831,17 @@ def derive_phases(samples, stderr_rows, duration_s, t_spawn_ns, t_exit_ns,
         "method_warnings": method_warnings,
         "t_spawn_mono_ns": t_spawn_ns,
         "t_exit_mono_ns": t_exit_ns,
+        "t_go_mono_ns": t_go_ns,
         "t_discovery_mono_ns": t_discovery,
         "t_attached_mono_ns": None,
+        "t_expiry_mono_ns": None,
+        "t_loop_end_mono_ns": None,
+        "loop_end_reason": "expiry",
         "t_detach_start_mono_ns": None,
         "t_detach_end_mono_ns": None,
+        "burst_go_mono_ns": burst_go_ns,
+        "burst_end_mono_ns": burst_end_ns,
+        "burst_outside_window": None,
     }
     if not samples:
         method_warnings.append("no sampler rows; only wall time is known")
@@ -760,31 +866,65 @@ def derive_phases(samples, stderr_rows, duration_s, t_spawn_ns, t_exit_ns,
         phases["discovery_s"] = max(0.0, (t_discovery - t_spawn_ns) / 1e9)
         phases["attach_s"] = max(0.0, (t_attached - t_discovery) / 1e9)
     t_expiry = t_attached + int(duration_s * 1e9)
-    phases["capture_measured_s"] = duration_s
-    # First post-expiry dip below the plateau, sustained over 3 samples.
+    phases["t_expiry_mono_ns"] = t_expiry
+    if t_loop_markers:
+        t_loop_end, loop_end_reason = min(t_loop_markers)
+    else:
+        t_loop_end, loop_end_reason = t_expiry, "expiry"
+    phases["t_loop_end_mono_ns"] = t_loop_end
+    phases["loop_end_reason"] = loop_end_reason
+    if t_loop_markers and t_loop_end < t_attached:
+        method_warnings.append(
+            "loop-end marker precedes estimated attach (coarse fd sampling "
+            "dated attach late); measured window unknown")
+    elif not t_loop_markers and t_exit_ns < t_expiry:
+        method_warnings.append(
+            f"capture_measured unknown: observer exited "
+            f"{(t_expiry - t_exit_ns) / 1e9:.2f}s before estimated expiry "
+            "with no target-exit or cancel marker")
+        phases["loop_end_reason"] = "unknown-early-exit"
+    else:
+        phases["capture_measured_s"] = max(
+            0.0, (t_loop_end - t_attached) / 1e9)
+    if burst_go_ns is not None and burst_end_ns is not None:
+        outside = False
+        if burst_go_ns < t_attached:
+            method_warnings.append(
+                f"BURST PREDATED ATTACH: workload burst began "
+                f"{(t_attached - burst_go_ns) / 1e9:.2f}s before attach "
+                "completed; pre-attach calls are outside the window")
+            outside = True
+        if burst_end_ns > t_expiry:
+            method_warnings.append(
+                f"BURST OUTLIVED WINDOW: workload burst ended "
+                f"{(burst_end_ns - t_expiry) / 1e9:.2f}s after the estimated "
+                "capture expiry; calls past expiry are outside the window")
+            outside = True
+        phases["burst_outside_window"] = outside
+    # First post-loop-end dip below the plateau, sustained over 3 samples.
     detach_start = None
     for i in range(len(samples)):
-        if times[i] < t_expiry or fds[i] >= hi:
+        if times[i] < t_loop_end or fds[i] >= hi:
             continue
         if all(fds[j] < hi for j in range(i, min(i + 3, len(samples)))):
             detach_start = times[i]
             break
     if detach_start is None:
         # No dip found (short capture, coarse sampling): fall back to the
-        # first below-plateau post-expiry sample, else the last sample.
+        # first below-plateau post-loop-end sample, else the last sample.
         later = [t for t, value in zip(times, fds)
-                 if t >= t_expiry and value < hi]
+                 if t >= t_loop_end and value < hi]
         detach_start = later[0] if later else times[-1]
-        method_warnings.append("detach start fell back to first post-expiry dip")
+        method_warnings.append("detach start fell back to first post-loop-end dip")
     phases["t_detach_start_mono_ns"] = detach_start
     floor = baseline + max(10, int(0.05 * run_max))
     detach_end = next((t for t, value in zip(times, fds)
                        if t >= detach_start and value <= floor), times[-1])
     phases["t_detach_end_mono_ns"] = detach_end
-    drain = (detach_start - t_expiry) / 1e9
+    drain = (detach_start - t_loop_end) / 1e9
     if drain < 0:
         method_warnings.append(
-            f"detach began {abs(drain):.2f}s before estimated expiry; "
+            f"detach began {abs(drain):.2f}s before estimated loop end; "
             "capture window estimate is off (attach-end marker or duration)")
         drain = 0.0
     phases["drain_s"] = drain
@@ -942,6 +1082,8 @@ def build_summary(record):
             f"  delivered_derived={path['delivered_derived']} "
             f"delivery_gap={path['delivery_gap'] or 'none'}",
         ]
+        if path.get("delivered_note") is not None:
+            lines.append(f"  delivered note: {path['delivered_note']}")
     stream = record.get("trace_stream")
     if stream is not None:
         lines += [
@@ -1040,7 +1182,8 @@ def main(argv):
     # of this assessment still applies to them.
     owned = assess_owned_coverage(
         report.get("functions", []), evidence.get("discovery", []),
-        refused, owned_module_candidates(meta))
+        refused, owned_module_candidates(meta),
+        meta["condition"].get("workload_module_identity"))
     if is_trace:
         kernel_observed = int(stream["count_evidence"]["stats_returned"])
         counts_match, match_note = trace_counts_match(
@@ -1107,6 +1250,7 @@ def main(argv):
         int(meta["timing"]["t_exit_mono_ns"]),
         int(meta["timing"]["t_go_mono_ns"]),
         phase_ms=observer_phase_ms,
+        burst_go_ns=burst_go_ns, burst_end_ns=burst_end_ns,
     )
     if missing_counters:
         phases["method_warnings"].append(
@@ -1146,11 +1290,10 @@ def main(argv):
             raw_calls=(int(stream["count_evidence"]["raw_calls"])
                        if stream else None),
             ring_bytes=ring_effective, burst_wall_s=burst_wall_s)
-    collapsed = any("COLLAPSED WINDOW" in warning
-                    for warning in phases["method_warnings"])
     window = assess_window(
         gate=meta["condition"].get("gate", "frame"), scope=scope,
-        counts_match=counts_match, collapsed=collapsed,
+        counts_match=counts_match,
+        burst_outside_window=phases["burst_outside_window"],
         attached_probes=attached_probes,
         trace_crosscheck=crosscheck_holds,
         coverage_detail=window_coverage_detail)
@@ -1302,17 +1445,23 @@ def main(argv):
             sorted(samples, key=lambda row: int(row["t_mono_ns"]))),
         "artifacts": meta["artifacts"],
         "limitations": [
-            "Phase boundaries are externally derived (fd trace + one stderr "
-            "marker), not in-observer timestamps; drain/detach/publish splits "
-            "are approximate.",
+            "Phase boundaries are externally derived (fd trace + stderr "
+            "markers), not in-observer timestamps; drain/detach/publish "
+            "splits are approximate. Without a loop-end marker, an early "
+            "exit leaves the measured window unknown rather than assumed.",
             "BPF load is folded into attach_s (no external marker).",
             "Observer CPU/RSS are wall-window samples; noisy under concurrent "
             "build load (sibling workers) — see the design note.",
             "counts_match for pid scope requires exact per-name equality; "
             "for system scope it requires the owned workload module to be "
-            "admitted, and for scan-only (unknown names) owned-attributed "
-            "calls must cover truth (foreign/unknown totals alone never "
-            "satisfy coverage).",
+            "admitted by mapping/pin identity, and for scan-only (unknown "
+            "names) owned-attributed calls must cover truth "
+            "(foreign/unknown totals alone never satisfy coverage). "
+            "Without a workload mapping/pin receipt, owned matching is "
+            "unknown.",
+            "delivered_derived in profile mode is arithmetic "
+            "(kernel_observed - event_loss), not an independently "
+            "observed consumer count.",
         ],
     }
     Path(args.out).write_text(json.dumps(record, indent=2) + "\n",

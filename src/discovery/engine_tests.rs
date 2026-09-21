@@ -20030,62 +20030,62 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
     let counters = DiscoveryCounters::default();
     let manifest = valid_manifest_for(std::slice::from_ref(&provider.path), &[0u32; 67]);
 
-    // (module object, entry objects, manifests, ordinals, pins, facts)
-    // per failure mode. Refused-module resolution shares
+    // One failing input set per mode. Refused-module resolution shares
     // `module_id_for_object` with the covered modes; refused plans only
     // arise from ceiling rebuilds, which the suite covers elsewhere.
+    struct FailureMode {
+        name: &'static str,
+        modules: Vec<ReconciledModule>,
+        manifests: Vec<Manifest>,
+        ordinals: Vec<u32>,
+        pins: PinnedObjects,
+        facts: CaptureFacts,
+    }
     let object_without_identity = PinnedObjectId(999);
-    let modes: Vec<(
-        &str,
-        Vec<ReconciledModule>,
-        Vec<Manifest>,
-        Vec<u32>,
-        PinnedObjects,
-        CaptureFacts,
-    )> = vec![
-        (
-            "ordinal mismatch",
-            Vec::new(),
-            vec![manifest.clone()],
-            Vec::new(),
-            engine.pinned.clone(),
-            engine.capture_facts.clone(),
-        ),
-        (
-            "module without opened identity",
-            vec![ReconciledModule {
+    let modes = vec![
+        FailureMode {
+            name: "ordinal mismatch",
+            modules: Vec::new(),
+            manifests: vec![manifest.clone()],
+            ordinals: Vec::new(),
+            pins: engine.pinned.clone(),
+            facts: engine.capture_facts.clone(),
+        },
+        FailureMode {
+            name: "module without opened identity",
+            modules: vec![ReconciledModule {
                 object: object_without_identity,
                 scanned: reconciled.scanned.clone(),
                 entry_objects: Vec::new(),
             }],
-            Vec::new(),
-            Vec::new(),
-            engine.pinned.clone(),
-            engine.capture_facts.clone(),
-        ),
-        (
-            "module without stable ID",
-            vec![reconciled.clone()],
-            Vec::new(),
-            Vec::new(),
-            engine.pinned.clone(),
-            CaptureFacts::default(),
-        ),
-        (
-            "table without parallel identities",
-            vec![ReconciledModule {
+            manifests: Vec::new(),
+            ordinals: Vec::new(),
+            pins: engine.pinned.clone(),
+            facts: engine.capture_facts.clone(),
+        },
+        FailureMode {
+            name: "module without stable ID",
+            modules: vec![reconciled.clone()],
+            manifests: Vec::new(),
+            ordinals: Vec::new(),
+            pins: engine.pinned.clone(),
+            facts: CaptureFacts::default(),
+        },
+        FailureMode {
+            name: "table without parallel identities",
+            modules: vec![ReconciledModule {
                 object: so_id,
                 scanned: reconciled.scanned.clone(),
                 entry_objects: Vec::new(),
             }],
-            Vec::new(),
-            Vec::new(),
-            engine.pinned.clone(),
-            engine.capture_facts.clone(),
-        ),
-        (
-            "entry target without identity",
-            vec![ReconciledModule {
+            manifests: Vec::new(),
+            ordinals: Vec::new(),
+            pins: engine.pinned.clone(),
+            facts: engine.capture_facts.clone(),
+        },
+        FailureMode {
+            name: "entry target without identity",
+            modules: vec![ReconciledModule {
                 object: so_id,
                 scanned: reconciled.scanned.clone(),
                 entry_objects: vec![vec![
@@ -20093,36 +20093,53 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
                     reconciled.scanned.tables[0].entries.len()
                 ]],
             }],
-            Vec::new(),
-            Vec::new(),
-            engine.pinned.clone(),
-            engine.capture_facts.clone(),
-        ),
-        (
-            "manifest without pinned identity",
-            Vec::new(),
-            vec![manifest],
-            vec![0],
-            engine.pinned.clone(),
-            engine.capture_facts.clone(),
-        ),
+            manifests: Vec::new(),
+            ordinals: Vec::new(),
+            pins: engine.pinned.clone(),
+            facts: engine.capture_facts.clone(),
+        },
+        FailureMode {
+            name: "manifest without pinned identity",
+            modules: Vec::new(),
+            manifests: vec![manifest],
+            ordinals: vec![0],
+            pins: engine.pinned.clone(),
+            facts: engine.capture_facts.clone(),
+        },
     ];
-    for (mode, modules, manifests, ordinals, pins, facts) in modes {
-        let preflight = facts
-            .resolve_merge_inputs(&plan, &pins, &modules, &manifests, &ordinals)
-            .expect_err(&format!("{mode}: the preflight must fail"))
-            .to_string();
-        let mut attempted = facts.clone();
-        let merge = attempted
-            .merge_current(&plan, &pins, &modules, &manifests, &ordinals, &counters)
-            .expect_err(&format!("{mode}: the merge must fail"))
-            .to_string();
-        assert_eq!(preflight, merge, "{mode}: proof and merge must agree");
+    for mode in modes {
+        let preflight = match mode.facts.resolve_merge_inputs(
+            &plan,
+            &mode.pins,
+            &mode.modules,
+            &mode.manifests,
+            &mode.ordinals,
+        ) {
+            Ok(()) => panic!("{}: the preflight must fail", mode.name),
+            Err(error) => error.to_string(),
+        };
+        let mut attempted = mode.facts.clone();
+        let merge = match attempted.merge_current(
+            &plan,
+            &mode.pins,
+            &mode.modules,
+            &mode.manifests,
+            &mode.ordinals,
+            &counters,
+        ) {
+            Ok(()) => panic!("{}: the merge must fail", mode.name),
+            Err(error) => error.to_string(),
+        };
+        assert_eq!(
+            preflight, merge,
+            "{}: proof and merge must agree",
+            mode.name
+        );
         // The failed merge changed nothing observable: valid inputs still
         // merge cleanly into the same facts.
-        attempted
-            .merge_current(&plan, &pins, &[], &[], &[], &counters)
-            .expect(&format!("{mode}: facts stay usable after failure"));
+        if let Err(error) = attempted.merge_current(&plan, &mode.pins, &[], &[], &[], &counters) {
+            panic!("{}: facts stay usable after failure: {error:#}", mode.name);
+        }
     }
 }
 

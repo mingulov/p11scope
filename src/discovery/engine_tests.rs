@@ -16344,7 +16344,7 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
 /// clean while a provider went unobserved.
 fn p2_refuse_then_exit(
     counters: &mut DiscoveryCounters,
-) -> Result<(Vec<ScannedModule>, PinnedObjects)> {
+) -> Result<(Vec<ScannedModule>, PinnedObjects, bool)> {
     let mut child = std::process::Command::new("/bin/cat")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
@@ -19317,7 +19317,9 @@ impl E07Provider {
         let path = dir.path().join("provider.so");
         std::fs::write(
             &c,
-            "unsigned long p11scope_e07_table[105] = { 1 };\n",
+            "unsigned long p11scope_e07_table[105] = { 1 };\n\
+             unsigned long p11scope_e07_iface[3] = { 4, 5, 6 };\n\
+             char p11scope_e07_name[8] = \"PKCS 11\";\n",
         )
         .unwrap();
         let status = std::process::Command::new("gcc")
@@ -19327,22 +19329,35 @@ impl E07Provider {
             .status()
             .unwrap();
         assert!(status.success(), "the fixture provider must compile");
-        let cpath =
-            std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
         // SAFETY: an owned file just written by this test; RTLD_LOCAL keeps
         // its symbols out of every other test in this process.
         let handle = unsafe { libc::dlopen(cpath.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
         assert!(!handle.is_null(), "the fixture provider must load");
-        let name = std::ffi::CString::new("p11scope_e07_table").unwrap();
-        // SAFETY: the symbol is the 105-word table above; the handle stays
-        // open until Drop, and only this thread writes through it.
-        let table = unsafe { libc::dlsym(handle, name.as_ptr()) } as *mut u64;
-        assert!(!table.is_null(), "the planted table must resolve");
+        let symbol = |name: &str| {
+            let name = std::ffi::CString::new(name).unwrap();
+            // SAFETY: the symbols are the arrays above; the handle stays
+            // open until Drop, and only this thread writes through them.
+            (unsafe { libc::dlsym(handle, name.as_ptr()) }) as *mut u64
+        };
+        let table = symbol("p11scope_e07_table");
+        let iface = symbol("p11scope_e07_iface");
+        let name = symbol("p11scope_e07_name");
+        assert!(
+            !table.is_null() && !iface.is_null() && !name.is_null(),
+            "the planted records must resolve"
+        );
         let words = unsafe { std::slice::from_raw_parts_mut(table, E07_TABLE_WORDS) };
         words[0] = 0x2802; // CK_VERSION { major 2, minor 40 }.
         for word in &mut words[1..] {
             *word = e07_anchor as usize as u64;
         }
+        // The interface triple linking the table: publication evidence, so
+        // the plan authorizes the table's endpoints.
+        let triple = unsafe { std::slice::from_raw_parts_mut(iface, 3) };
+        triple[0] = name as u64;
+        triple[1] = table as u64;
+        triple[2] = 0;
         Self {
             _dir: dir,
             path,
@@ -19377,14 +19392,44 @@ fn e07_engine() -> Engine {
     engine
 }
 
+/// A loader context over a stably pinned loader object (this test
+/// binary): the loader id must resolve in every candidate's pins, so it is
+/// pinned once here and never rescanned.
 fn e07_loader_context(engine: &mut Engine, view: ProcessViewId) -> LoaderContextId {
     use p11scope_manifest::elf::SymbolFact;
 
+    let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+    let map_index = MapIndex::new(&maps).expect("the self maps snapshot is valid");
+    let executable = std::env::current_exe().unwrap();
+    let (loader_mapping, loader_path) = maps
+        .iter()
+        .filter(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0)
+        .find_map(|mapping| match map_index.resolve(mapping.start) {
+            Resolved::File {
+                path: MappedPath::Usable(path),
+                ..
+            } if path == executable => Some((mapping, path)),
+            _ => None,
+        })
+        .expect("the test process maps its own executable");
+    let view_ref = engine
+        .views
+        .iter()
+        .find(|retained| retained.id() == view)
+        .expect("the engine retains the view");
+    let loader_module = mapped_object(view_ref, loader_mapping, &loader_path);
+    let loader_pins = pin_test_module(view_ref, &loader_module);
+    let absorb_skips = engine.pinned.absorb(loader_pins);
+    assert!(absorb_skips.is_empty(), "{absorb_skips:?}");
+    let loader = engine
+        .pinned
+        .id_for_scanned(&loader_module, loader_module.key, &loader_module.path)
+        .expect("the loader pin resolves");
     let prepared = engine
         .loader_registry
         .preflight(LoaderContextSpec {
             view,
-            loader: PinnedObjectId(9),
+            loader,
             mapping: None,
             hook: SymbolFact {
                 virtual_address: 0x2100,
@@ -19451,7 +19496,13 @@ fn e07_unchanged_complete_loader_rescan_retires_nothing() {
     let mut additions = true;
     let mut pending = PendingViewRetirements::new();
 
-    let outcome = e07_rescan(&mut engine, &mut session, context, &mut additions, &mut pending);
+    let outcome = e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
     assert!(outcome.changed(), "the first scan attaches its tables");
     let attached = e07_active_targets(&engine);
     assert!(!attached.is_empty(), "the planted table is covered");
@@ -19471,18 +19522,25 @@ fn e07_unchanged_complete_loader_rescan_retires_nothing() {
     assert!(!found[0].tables.is_empty());
 
     // And the loader rescan through the engine is a no-op.
-    let outcome = e07_rescan(&mut engine, &mut session, context, &mut additions, &mut pending);
-    assert!(
-        !outcome.changed(),
-        "an unchanged rescan changes nothing"
+    let outcome = e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
     );
+    assert!(!outcome.changed(), "an unchanged rescan changes nothing");
     assert_eq!(e07_active_targets(&engine), attached);
     assert_eq!(
-        session.detached_slots.last(),
-        Some(&0),
+        session.detached_slots.iter().sum::<usize>(),
+        0,
         "an unchanged rescan detaches nothing"
     );
-    assert_eq!(session.attached_slots.len(), 1, "nothing re-attaches");
+    assert_eq!(
+        session.attached_slots.iter().sum::<usize>(),
+        1,
+        "nothing re-attaches"
+    );
 }
 
 /// E07: a saturated table cap still recognizes the unchanged rescan, so no
@@ -19499,7 +19557,13 @@ fn e07_saturated_table_cap_unchanged_rescan_retires_nothing() {
     let mut additions = true;
     let mut pending = PendingViewRetirements::new();
 
-    e07_rescan(&mut engine, &mut session, context, &mut additions, &mut pending);
+    e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
     let attached = e07_active_targets(&engine);
     assert!(!attached.is_empty(), "the planted table is covered");
 
@@ -19539,21 +19603,29 @@ fn e07_saturated_table_cap_unchanged_rescan_retires_nothing() {
         "the ceiling is saturated"
     );
 
-    let outcome = e07_rescan(&mut engine, &mut session, context, &mut additions, &mut pending);
+    let outcome = e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
     assert!(
         !outcome.changed(),
         "an unchanged rescan under a saturated cap changes nothing"
     );
     assert_eq!(e07_active_targets(&engine), attached);
     assert_eq!(
-        session.detached_slots.last(),
-        Some(&0),
+        session.detached_slots.iter().sum::<usize>(),
+        0,
         "no spurious retirement under a saturated cap"
     );
     assert!(
-        !engine.counters.object_skips.iter().any(|skip| skip
-            .reason
-            .contains("table decode ceiling")),
+        !engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.reason.contains("table decode ceiling")),
         "repeats are recognized, never refused: {:?}",
         engine.counters.object_skips
     );
@@ -19573,26 +19645,47 @@ fn e07_incomplete_loader_rescan_retains_validated_endpoints() {
     let mut additions = true;
     let mut pending = PendingViewRetirements::new();
 
-    e07_rescan(&mut engine, &mut session, context, &mut additions, &mut pending);
+    e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
     let attached = e07_active_targets(&engine);
     assert!(!attached.is_empty(), "the planted table is covered");
 
     assert!(!engine.budget.charge(u64::MAX), "the budget stops");
-    let outcome = e07_rescan(&mut engine, &mut session, context, &mut additions, &mut pending);
+    let outcome = e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
     assert!(
-        !outcome.changed(),
-        "a budget-limited rescan changes nothing"
+        outcome.changed(),
+        "the stop is published as new plan evidence"
     );
     assert_eq!(
         e07_active_targets(&engine),
         attached,
         "budget-limited absence must not retire validated endpoints"
     );
-    assert_eq!(session.detached_slots.last(), Some(&0));
+    assert_eq!(
+        session.detached_slots.iter().sum::<usize>(),
+        0,
+        "retention detaches nothing"
+    );
+    assert_eq!(
+        session.attached_slots.iter().sum::<usize>(),
+        1,
+        "retention attaches nothing new"
+    );
     assert!(
-        engine.counters.object_skips.iter().any(|skip| skip.reason.contains(
-            "capture discovery work ceiling reached"
-        )),
+        engine.counters.object_skips.iter().any(|skip| skip
+            .reason
+            .contains("capture discovery work ceiling reached")),
         "the stop stays explicit evidence: {:?}",
         engine.counters.object_skips
     );
@@ -19611,19 +19704,32 @@ fn e07_genuine_unmap_retires_on_a_complete_rescan() {
     let mut additions = true;
     let mut pending = PendingViewRetirements::new();
 
-    e07_rescan(&mut engine, &mut session, context, &mut additions, &mut pending);
+    e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
     assert!(!e07_active_targets(&engine).is_empty());
 
     drop(provider);
-    let outcome = e07_rescan(&mut engine, &mut session, context, &mut additions, &mut pending);
+    let outcome = e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
     assert!(outcome.changed(), "the unmap detaches its targets");
     assert!(
         e07_active_targets(&engine).is_empty(),
         "a genuine unmap retires"
     );
-    assert!(
-        session.detached_slots.last().is_some_and(|detached| *detached > 0),
-        "the unmap detaches: {:?}",
+    assert_eq!(
+        session.detached_slots.iter().sum::<usize>(),
+        1,
+        "the unmap detaches exactly its slot: {:?}",
         session.detached_slots
     );
 }
@@ -19641,20 +19747,34 @@ fn e07_changed_table_bytes_retire_stale_targets() {
     let mut additions = true;
     let mut pending = PendingViewRetirements::new();
 
-    e07_rescan(&mut engine, &mut session, context, &mut additions, &mut pending);
+    e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
     assert!(!e07_active_targets(&engine).is_empty());
 
     provider.zero_version();
-    let outcome = e07_rescan(&mut engine, &mut session, context, &mut additions, &mut pending);
+    let outcome = e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
     assert!(outcome.changed(), "changed bytes detach stale targets");
     assert!(
         e07_active_targets(&engine).is_empty(),
         "changed bytes retire stale targets"
     );
     assert!(
-        engine.counters.object_skips.iter().any(|skip| skip
-            .reason
-            .contains("no function table was found")),
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.reason.contains("no function table was found")),
         "verified absence stays explicit: {:?}",
         engine.counters.object_skips
     );
@@ -19674,11 +19794,23 @@ fn e07_deleted_provider_file_retires_safely_with_evidence() {
     let mut additions = true;
     let mut pending = PendingViewRetirements::new();
 
-    e07_rescan(&mut engine, &mut session, context, &mut additions, &mut pending);
+    e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
     assert!(!e07_active_targets(&engine).is_empty());
 
     std::fs::remove_file(&provider.path).unwrap();
-    let outcome = e07_rescan(&mut engine, &mut session, context, &mut additions, &mut pending);
+    let outcome = e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
     assert!(outcome.changed(), "the deleted file detaches its targets");
     assert!(
         e07_active_targets(&engine).is_empty(),
@@ -19704,7 +19836,13 @@ fn e07_incomplete_rescan_over_replaced_files_does_not_retain() {
     let mut additions = true;
     let mut pending = PendingViewRetirements::new();
 
-    e07_rescan(&mut engine, &mut session, context, &mut additions, &mut pending);
+    e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
     assert!(!e07_active_targets(&engine).is_empty());
 
     std::fs::remove_file(&provider.path).unwrap();
@@ -19713,7 +19851,13 @@ fn e07_incomplete_rescan_over_replaced_files_does_not_retain() {
         !engine.view_pins_unchanged(view_id),
         "the deleted file fails revalidation"
     );
-    let outcome = e07_rescan(&mut engine, &mut session, context, &mut additions, &mut pending);
+    let outcome = e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
     assert!(
         e07_active_targets(&engine).is_empty(),
         "failed revalidation must not retain stale targets"
@@ -19747,7 +19891,10 @@ fn loader_rescan_with_a_stale_generation_refuses_without_mutation() {
         scanned: ScannedModule {
             view: view_id,
             mount_namespace,
-            key: ObjectKey { device: Device { major: 8, minor: 1 }, inode: 7 },
+            key: ObjectKey {
+                device: Device { major: 8, minor: 1 },
+                inode: 7,
+            },
             path: "/lib/provider.so".to_string(),
             decoder_abi: None,
             exports: Vec::new(),
@@ -19757,7 +19904,34 @@ fn loader_rescan_with_a_stale_generation_refuses_without_mutation() {
         entry_objects: Vec::new(),
     }];
     let before = engine.modules.clone();
-    let context = e07_loader_context(&mut engine, view_id);
+    // A fake loader id is fine here: the stale scan errors before any
+    // candidate admission could consult it.
+    let context = {
+        use p11scope_manifest::elf::SymbolFact;
+
+        let prepared = engine
+            .loader_registry
+            .preflight(LoaderContextSpec {
+                view: view_id,
+                loader: PinnedObjectId(9),
+                mapping: None,
+                hook: SymbolFact {
+                    virtual_address: 0x2100,
+                    file_offset: 0x2100,
+                },
+                state_address: None,
+            })
+            .expect("a preflighted loader context");
+        let context = engine
+            .loader_registry
+            .prepare(prepared)
+            .expect("a prepared loader context");
+        engine
+            .loader_registry
+            .mark_attached(context)
+            .expect("an attached loader context");
+        context
+    };
     let mut session = ScriptedSession::default();
     let mut additions = true;
     let mut pending = PendingViewRetirements::new();

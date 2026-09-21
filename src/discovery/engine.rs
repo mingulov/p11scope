@@ -20,8 +20,8 @@ use crate::discovery::scan::{
     CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedEntry, ScannedInterface, ScannedModule,
     ScannedTable, Skipped, TableIdentity, decode_exact_table, exact_table_addresses,
     exact_table_bytes, index_maps_or_refuse, read_elf_snapshot, read_maps_or_refuse,
-    scan_process_view, scan_process_view_without_memory, spans_for, table_evidence_score,
-    table_linkage, target_layout,
+    scan_process_view, scan_process_view_without_memory, scan_skip_truncates, spans_for,
+    table_evidence_score, table_linkage, target_layout,
 };
 use crate::discovery::scheduler::{DiscoveryScheduler, InventoryCadence, MAX_PENDING_REFRESH};
 use crate::manifest_input::{read_manifest, selection_surface_usable, validate_structure};
@@ -3403,27 +3403,15 @@ fn scan_and_pin(
         broad_admit,
         scan_process_view,
     )
+    .map(|(modules, pins, _)| (modules, pins))
 }
 
-fn scan_and_pin_without_memory(
-    view: &ProcessView,
-    hints: &[PathBuf],
-    hooks: &HookRegistry,
-    budget: &mut CaptureWorkBudget,
-    counters: &mut DiscoveryCounters,
-    broad_admit: bool,
-) -> Result<(Vec<ScannedModule>, PinnedObjects)> {
-    scan_and_pin_with(
-        view,
-        hints,
-        hooks,
-        budget,
-        counters,
-        broad_admit,
-        scan_process_view_without_memory,
-    )
-}
-
+/// One scan plus its pins plus whether absence inside it is verified. The
+/// `complete` flag is the scan-to-live-candidate boundary: only a memory
+/// scan that ran unbounded (no stop before, during or after), refused no
+/// new candidate, and emitted no truncating skip may retire previously
+/// observed modules by absence. Broadening and pinning run after the
+/// snapshot, so their own budget effects never rewrite the scan's verdict.
 fn scan_and_pin_with(
     view: &ProcessView,
     hints: &[PathBuf],
@@ -3436,7 +3424,9 @@ fn scan_and_pin_with(
         &ProcessView,
         &mut CaptureWorkBudget,
     ) -> std::result::Result<ScanOutcome, String>,
-) -> Result<(Vec<ScannedModule>, PinnedObjects)> {
+) -> Result<(Vec<ScannedModule>, PinnedObjects, bool)> {
+    let stop_before = budget.stopped_reason();
+    let refusals_before = budget.refusal_counts();
     let outcome = scan(
         &ScanRequest {
             pid: view.pid(),
@@ -3447,6 +3437,14 @@ fn scan_and_pin_with(
         budget,
     )
     .map_err(|error| anyhow!("scanning process view {:?}: {error}", view.id()))?;
+    let complete = outcome.unavailable_reason().is_none()
+        && stop_before.is_none()
+        && budget.stopped_reason().is_none()
+        && budget.refusal_counts() == refusals_before
+        && !outcome
+            .skipped()
+            .iter()
+            .any(|skip| scan_skip_truncates(&skip.reason));
     counters.scan_unavailable = counters.scan_unavailable.or(outcome.unavailable_reason());
     // Retain acquisition losses before pinning can fail on an exited generation.
     for skipped in outcome.skipped() {
@@ -3472,7 +3470,7 @@ fn scan_and_pin_with(
         attribution::note(&skipped);
         counters.object_skips.push(skipped);
     }
-    Ok((modules, pinned))
+    Ok((modules, pinned, complete))
 }
 
 /// Task 1.6 experiment: recognized fixed-family pool layout.
@@ -5871,6 +5869,21 @@ fn lower_heap_export_record(
     Ok(HeapLowerOutcome::Admitted(module))
 }
 
+/// Whether `module` has no counterpart among already-retained modules:
+/// the same (view, mount namespace, object key, path) match
+/// `merge_scanned_module` unions on, ignoring decoder ABI (an
+/// ABI-mismatched twin keeps its raw pins; binding drops whichever twin it
+/// cannot use). The retention tests keep this predicate in sync with that
+/// union.
+fn is_newly_observed_module(retained: &[ScannedModule], module: &ScannedModule) -> bool {
+    !retained.iter().any(|known| {
+        known.view == module.view
+            && known.mount_namespace == module.mount_namespace
+            && known.key == module.key
+            && known.path == module.path
+    })
+}
+
 fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedModule) {
     let Some(position) = modules.iter().position(|module| {
         module.view == incoming.view
@@ -7847,11 +7860,19 @@ impl Engine {
         budget: &mut CaptureWorkBudget,
         broad_admit: bool,
     ) -> (
-        Result<(Vec<ScannedModule>, PinnedObjects)>,
+        Result<(Vec<ScannedModule>, PinnedObjects, bool)>,
         DiscoveryCounters,
     ) {
         Self::scan_retained_view_with(|counters| {
-            scan_and_pin(view, module_hints, hooks, budget, counters, broad_admit)
+            scan_and_pin_with(
+                view,
+                module_hints,
+                hooks,
+                budget,
+                counters,
+                broad_admit,
+                scan_process_view,
+            )
         })
     }
 
@@ -7862,11 +7883,19 @@ impl Engine {
         budget: &mut CaptureWorkBudget,
         broad_admit: bool,
     ) -> (
-        Result<(Vec<ScannedModule>, PinnedObjects)>,
+        Result<(Vec<ScannedModule>, PinnedObjects, bool)>,
         DiscoveryCounters,
     ) {
         Self::scan_retained_view_with(|counters| {
-            scan_and_pin_without_memory(view, module_hints, hooks, budget, counters, broad_admit)
+            scan_and_pin_with(
+                view,
+                module_hints,
+                hooks,
+                budget,
+                counters,
+                broad_admit,
+                scan_process_view_without_memory,
+            )
         })
     }
 
@@ -7936,9 +7965,9 @@ impl Engine {
     }
 
     fn scan_retained_view_with(
-        scan: impl FnOnce(&mut DiscoveryCounters) -> Result<(Vec<ScannedModule>, PinnedObjects)>,
+        scan: impl FnOnce(&mut DiscoveryCounters) -> Result<(Vec<ScannedModule>, PinnedObjects, bool)>,
     ) -> (
-        Result<(Vec<ScannedModule>, PinnedObjects)>,
+        Result<(Vec<ScannedModule>, PinnedObjects, bool)>,
         DiscoveryCounters,
     ) {
         let mut counters = DiscoveryCounters::default();
@@ -9228,6 +9257,25 @@ impl Engine {
         ))
     }
 
+    /// Whether every object this view owns still has the pin it was pinned
+    /// under: per-view physical-identity revalidation for retaining modules
+    /// across an incomplete scan. Budget-free (fstat over already-open
+    /// files) and side-effect-free, unlike the sticky capture-wide check.
+    /// Manifest objects stay in the subset — a changed manifest fails
+    /// closed into replacement.
+    fn view_pins_unchanged(&self, view: ProcessViewId) -> bool {
+        let mut subset = self.pinned.clone();
+        for other in self
+            .views
+            .iter()
+            .map(ProcessView::id)
+            .filter(|id| *id != view)
+        {
+            subset.remove_view(other);
+        }
+        subset.check_unchanged().unwrap_or(false)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn process_validated_loader_scan(
         &mut self,
@@ -9263,7 +9311,7 @@ impl Engine {
             ),
         };
         let mut skipped = self.absorb_scan_counters(scan_counters);
-        let (mut found, fresh_pins) = match scan_result {
+        let (mut found, fresh_pins, found_complete) = match scan_result {
             Ok(value) => value,
             Err(error) => {
                 for skip in skipped {
@@ -9293,21 +9341,67 @@ impl Engine {
             .context(context_id)
             .map(|context| context.spec.loader)
             .ok_or_else(|| anyhow!("loader context disappeared after record validation"))?;
-        let mut candidate_pins = self.pinned.clone();
-        skipped.extend(candidate_pins.replace_view_pins(
-            self.views[position].id(),
-            fresh_pins,
-            &[loader],
-        ));
-        let mut raw_modules: Vec<_> = self
-            .modules
-            .iter()
-            .filter(|module| module.scanned.view != self.views[position].id())
-            .map(|module| module.scanned.clone())
-            .collect();
-        for module in found {
-            merge_scanned_module(&mut raw_modules, module);
-        }
+        let view_id = self.views[position].id();
+        // An incomplete scan is not proof that a provider disappeared: when
+        // the memory rescan was bounded, this view's existing modules are
+        // retained after their pins revalidate instead of being replaced by
+        // partial results. Metadata-only scans keep their own explicit
+        // table restoration above; failed revalidation falls through to the
+        // replacement below, so stale identity still retires.
+        let revalidated = !found_complete
+            && mode == LoaderScanMode::Memory
+            && self.views[position].still_the_same()
+            && self.view_pins_unchanged(view_id);
+        let (candidate_pins, raw_modules) = if revalidated {
+            let mut candidate_pins = self.pinned.clone();
+            // Fresh pins cover only newly observed modules: re-pinning
+            // retained ones under an exhausted budget would reject their
+            // keys and drop exactly what revalidation just approved.
+            // `fresh_pins` (all of `found`, pinned during the scan) is
+            // discarded here; its skips are already in `skipped` as
+            // evidence, and its cache priming makes this second pin cheap.
+            let retained: Vec<ScannedModule> = self
+                .modules
+                .iter()
+                .filter(|module| module.scanned.view == view_id)
+                .map(|module| module.scanned.clone())
+                .collect();
+            let new_modules: Vec<ScannedModule> = found
+                .iter()
+                .filter(|module| is_newly_observed_module(&retained, module))
+                .cloned()
+                .collect();
+            let (new_pins, pin_skips) =
+                pin_scanned_view_objects(&self.views[position], &new_modules, &mut self.budget)
+                    .map_err(anyhow::Error::msg)?;
+            skipped.extend(pin_skips);
+            skipped.extend(candidate_pins.absorb(new_pins));
+            let mut retained = retained;
+            for module in found {
+                merge_scanned_module(&mut retained, module);
+            }
+            let mut raw_modules: Vec<_> = self
+                .modules
+                .iter()
+                .filter(|module| module.scanned.view != view_id)
+                .map(|module| module.scanned.clone())
+                .collect();
+            raw_modules.extend(retained);
+            (candidate_pins, raw_modules)
+        } else {
+            let mut candidate_pins = self.pinned.clone();
+            skipped.extend(candidate_pins.replace_view_pins(view_id, fresh_pins, &[loader]));
+            let mut raw_modules: Vec<_> = self
+                .modules
+                .iter()
+                .filter(|module| module.scanned.view != view_id)
+                .map(|module| module.scanned.clone())
+                .collect();
+            for module in found {
+                merge_scanned_module(&mut raw_modules, module);
+            }
+            (candidate_pins, raw_modules)
+        };
         let mut candidate = self.live_candidate(candidate_pins, raw_modules, skipped)?;
         candidate.views.insert(self.views[position].id());
         let observed = candidate_timing_keys(&candidate, &export_modules);
@@ -12672,7 +12766,12 @@ impl Engine {
             );
             skipped.extend(self.absorb_scan_counters(counters));
             match scan_result {
-                Ok((modules, pins)) => {
+                // Completeness is intentionally unused here: refreshed
+                // views are exec refreshes whose old image may be gone, so
+                // absence of the old modules is expected and retention
+                // would be unsound. The loader path above is where an
+                // incomplete scan of a stable generation retains.
+                Ok((modules, pins, _complete)) => {
                     scans.push((*view_id, modules, pins));
                 }
                 Err(error) => {
@@ -13103,7 +13202,10 @@ impl Engine {
             );
             skipped.extend(self.absorb_scan_counters(counters));
             match scan_result {
-                Ok((modules, pins)) => {
+                // Completeness is intentionally unused here: a new view has
+                // no retained modules, so a partial first scan simply
+                // attaches what it verified with the skips as evidence.
+                Ok((modules, pins, _complete)) => {
                     new_views.push((view, modules, pins));
                 }
                 Err(error) => {

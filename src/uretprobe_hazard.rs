@@ -739,6 +739,13 @@ mod tests {
         );
     }
 
+    /// A pid with no readable status is not unconfined: it feeds the
+    /// fail-closed `None` arm, never a guessed mode.
+    #[test]
+    fn a_pid_without_readable_status_has_no_mode() {
+        assert_eq!(target_seccomp_mode(u32::MAX), None);
+    }
+
     /// `run`'s exact call shape: an unprovable kernel refuses an owned
     /// child it cannot show unconfined, and the override converts that
     /// refusal into a warning with the same reason.

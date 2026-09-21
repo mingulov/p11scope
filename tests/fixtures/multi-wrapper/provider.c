@@ -25,6 +25,16 @@
  *   gcc -std=c11 -O2 -Wall -Wextra -Werror -fPIC -shared -Wl,-z,defs \
  *       -o provider.so provider.c /abs/path/backend.so
  * Stripped variant adds -DSTRIPPED_VARIANT=1 and is then `strip --strip-all`.
+ *
+ * Package F (SYSPLAN generalizing passive publication) additions, behavior
+ * unchanged for every scenario above:
+ * - `C_GetInterface` with a NULL name returns the default interface: the
+ *   lowest-index live wrapper, else the legacy interface. Deterministic
+ *   under the single-threaded stage driver.
+ * - `mw_set_version` rewrites one live wrapper's version word in place
+ *   (shape matrix, including future-minor refusal).
+ * - `mw_poke` rewrites one live wrapper entry in place (malicious-pointer
+ *   matrix: legal hole, unmapped, file-backed data, anonymous heap data).
  */
 #define _GNU_SOURCE
 #include <stdint.h>
@@ -438,13 +448,63 @@ MW_PUBLIC CK_RV C_GetInterfaceList(CK_INTERFACE *list, CK_ULONG *count)
     return CKR_OK;
 }
 
+MW_PUBLIC void mw_set_version(void *handle, int major, int minor)
+{
+    Wrapper *w = handle;
+    if (w == NULL) {
+        return;
+    }
+    w->bound.version.major = (CK_BYTE)major;
+    w->bound.version.minor = (CK_BYTE)minor;
+}
+
+MW_PUBLIC void mw_poke(void *handle, int ord, int mode)
+{
+    Wrapper *w = handle;
+    if (w == NULL || ord < 0 || ord >= NENTRY) {
+        return;
+    }
+    switch (mode) {
+    case 0: /* legal hole */
+        w->bound.funcs[ord] = NULL;
+        break;
+    case 1: /* unmapped */
+        w->bound.funcs[ord] = (void *)0x1;
+        break;
+    case 2: /* file-backed provider .bss: addressable data, never executable */
+        w->bound.funcs[ord] = &fail_ord[0];
+        break;
+    case 3: /* anonymous heap data, never executable (one-way test leak) */
+        w->bound.funcs[ord] = malloc(8);
+        break;
+    default:
+        break;
+    }
+}
+
 MW_PUBLIC CK_RV C_GetInterface(void *name, void *version, void **out, CK_FLAGS flags)
 {
     (void)version;
     (void)flags;
     static CK_INTERFACE found;
-    if (name == NULL || out == NULL) {
+    if (out == NULL) {
         return CKR_ARGUMENTS_BAD;
+    }
+    if (name == NULL) {
+        for (int idx = 0; idx < NWRAP; idx++) {
+            if (pool_occupied(idx)) {
+                found.pInterfaceName = iface_names[idx];
+                found.pFunctionList = &live_wrappers[idx]->bound;
+                found.flags = 0;
+                *out = &found;
+                return CKR_OK;
+            }
+        }
+        found.pInterfaceName = "P11Scope-MW-legacy";
+        found.pFunctionList = &legacy_table;
+        found.flags = 0;
+        *out = &found;
+        return CKR_OK;
     }
     if (strcmp(name, "P11Scope-MW-legacy") == 0) {
         found.pInterfaceName = "P11Scope-MW-legacy";

@@ -24,6 +24,14 @@ workload activates, and the oracle is the exact expected observation.
 - `tests/multi_wrapper_oracle.rs` — fixture self-tests (exact oracle
   assertions + pinned goldens). Later tasks consume the same binaries.
 
+Package F additions (no scenario behavior change): `C_GetInterface`
+with a NULL name returns the default interface (lowest-index live
+wrapper, else legacy); `mw_set_version` rewrites one live wrapper's
+version word in place; `mw_poke` rewrites one live entry in place (0
+NULL hole, 1 unmapped, 2 provider .bss data, 3 heap data). The stage
+REPL gains `G <name|-> [major minor]` (drive `C_GetInterface`, print
+the result), `V <idx> <major> <minor>` and `M <idx> <ord> <mode>`.
+
 `STRIPPED_VARIANT=1` renames/hides the template pool and packs occupancy as
 a bitmap instead of a byte array; the build then runs `strip --strip-all`.
 Same workload behavior, unknown layout (`layout_known: false`).

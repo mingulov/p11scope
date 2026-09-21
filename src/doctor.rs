@@ -13,6 +13,7 @@ use anyhow::Result;
 use aya::programs::ProgramError;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -266,7 +267,7 @@ fn not_applicable(name: &str, reason: &str) -> Check {
     }
 }
 
-fn parse_major_minor(release: &str) -> Option<(u32, u32)> {
+pub(crate) fn parse_major_minor(release: &str) -> Option<(u32, u32)> {
     let mut parts = release.split(|c: char| !c.is_ascii_digit());
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
@@ -480,6 +481,7 @@ fn bpf_checks() -> Vec<Check> {
         crate::attach::Session::diagnostic(),
         attach_self_probe,
         uretprobe_seccomp_check,
+        uprobe_multi_check,
     )
 }
 
@@ -487,6 +489,7 @@ fn bpf_checks_with_seccomp<T>(
     setup: anyhow::Result<T>,
     diagnostic: impl FnOnce(&mut T) -> Result<(), String>,
     seccomp: impl FnOnce() -> Check,
+    multi: impl FnOnce() -> Check,
 ) -> Vec<Check> {
     let setup_succeeded = setup.is_ok();
     let mut checks = bpf_checks_with(setup, diagnostic);
@@ -498,8 +501,22 @@ fn bpf_checks_with_seccomp<T>(
             "unavailable: shared capture setup refused; active probe skipped",
         )
     });
+    checks.push(if setup_succeeded {
+        multi()
+    } else {
+        not_applicable(
+            "uprobe-multi attach (own libc)",
+            "unavailable: shared capture setup refused; active probe skipped",
+        )
+    });
     checks
 }
+
+/// The singles self-probe row: `(self)` because the anchor is the
+/// observer's own libc mapping, falling back to its own entry point for
+/// static linkage — never libc alone. One constant for the producer and
+/// the tier classifier, so the two cannot drift again (F-09).
+const UPROBE_ATTACH_SELF_ROW: &str = "uprobe attach (self)";
 
 fn bpf_checks_with<T>(
     setup: anyhow::Result<T>,
@@ -517,7 +534,7 @@ fn bpf_checks_with<T>(
                     status: Status::Ok(String::new()),
                 },
                 Check {
-                    name: "uprobe attach (own libc)".into(),
+                    name: UPROBE_ATTACH_SELF_ROW.into(),
                     status,
                 },
             ]
@@ -528,7 +545,7 @@ fn bpf_checks_with<T>(
                 status: Status::Fail(format_preflight_error(error.as_ref())),
             },
             Check {
-                name: "uprobe attach (own libc)".into(),
+                name: UPROBE_ATTACH_SELF_ROW.into(),
                 status: Status::Fail("skipped: shared capture setup failed".into()),
             },
         ],
@@ -574,6 +591,79 @@ fn attach_self_probe(session: &mut crate::attach::Session) -> Result<(), String>
         .attach_diagnostic_probe(&anchor_path, offset)
         .map_err(|e| format!("{e:#}"))?;
     session.detach_producers().map_err(|e| format!("{e:#}"))
+}
+
+/// Functional uprobe-multi probe: loads the mapless scratch program and
+/// self-links it at the anchor the singles row uses, then drops the link
+/// (drop = detach; the no-op program is safe even if it fired). Never
+/// `Fail`: multi is optional with a singles fallback, so the row reports
+/// Ok / Warn / NotApplicable only, stays out of the capability tier, and
+/// its name deliberately avoids the `uprobe attach` capture-row prefix.
+fn uprobe_multi_check() -> Check {
+    let status = match uprobe_multi_self_link() {
+        Ok(linked) => linked,
+        Err(unavailable) => Status::NotApplicable(unavailable),
+    };
+    Check {
+        name: "uprobe-multi attach (own libc)".to_string(),
+        status,
+    }
+}
+
+/// Runs the scratch self-link: the anchor plus a scratch-program load
+/// plus one single-offset link to this process. Returns the row status,
+/// or the reason the probe itself could not run.
+fn uprobe_multi_self_link() -> Result<Status, String> {
+    let (path, offset) =
+        self_probe_anchor().map_err(|error| format!("self-probe anchor unavailable: {error}"))?;
+    let prog = match p11scope_bpf_multi::prog_load_scratch_multi() {
+        Ok(prog) => prog,
+        Err(error) => {
+            return Ok(Status::Warn(format!(
+                "scratch program load failed ({error}); multi availability unproven"
+            )));
+        }
+    };
+    let link = p11scope_bpf_multi::attach_group(
+        prog.as_raw_fd(),
+        std::process::id(),
+        &path,
+        &[offset],
+        &[1],
+        false,
+    );
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .map(|release| release.trim().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    // The link fd drops here: detach before the row returns.
+    Ok(multi_self_link_status(link.map(|_| ()), &release))
+}
+
+/// Classifies the scratch self-link outcome. Pure over the link result
+/// and the kernel release so the EINVAL rule is unit-testable: link
+/// errors that prove an incapable kernel are NotApplicable (the auto
+/// backend stays on singles); anything unexpected is Warn, never Fail.
+fn multi_self_link_status(link: Result<(), std::io::Error>, release: &str) -> Status {
+    match link {
+        Ok(()) => Status::Ok("self-link attached and detached".to_string()),
+        Err(error) => {
+            let errno = error.raw_os_error();
+            if errno.is_some_and(p11scope_bpf_multi::is_unsupported_kernel_errno) {
+                Status::NotApplicable(format!(
+                    "kernel lacks uprobe-multi ({error}); static probes use per-offset links"
+                ))
+            } else if errno == Some(libc::EINVAL) && !crate::attach::multi_allowed_on(release) {
+                Status::NotApplicable(format!(
+                    "kernel {release} predates the 6.9 multi floor ({error}); \
+                     static probes use per-offset links"
+                ))
+            } else {
+                Status::Warn(format!(
+                    "self-link failed ({error}); the auto backend tries multi and falls back per run"
+                ))
+            }
+        }
+    }
 }
 
 /// What the live-discovery lanes need from the target's dynamic loader, read
@@ -1016,7 +1106,7 @@ fn capability_tier(checks: &[Check]) -> CapabilityTierResult {
         // alone. A kernel that genuinely lacks the support fails these three
         // rows, so nothing is lost by trusting them instead.
         host_attach: row_ok("BPF map create")
-            && row_ok("uprobe attach (self)")
+            && row_ok(UPROBE_ATTACH_SELF_ROW)
             && row_ok("host program preflight"),
         target_readable,
         lifecycle: row_ok("lifecycle preflight"),
@@ -1137,6 +1227,7 @@ mod tests {
     #[test]
     fn correction1_failed_setup_never_invokes_active_seccomp_probe() {
         let mut active_calls = 0;
+        let mut multi_calls = 0;
         let checks = bpf_checks_with_seccomp::<()>(
             Err(std::io::Error::from_raw_os_error(libc::EPERM).into()),
             |_| panic!("diagnostic after failed setup"),
@@ -1147,23 +1238,34 @@ mod tests {
                     status: Status::Ok("unexpected active probe".into()),
                 }
             },
+            || {
+                multi_calls += 1;
+                Check {
+                    name: "uprobe-multi attach (own libc)".into(),
+                    status: Status::Ok("unexpected active probe".into()),
+                }
+            },
         );
         assert_eq!(active_calls, 0);
+        assert_eq!(multi_calls, 0);
         assert_eq!(verdict(&checks), 1);
-        assert_eq!(checks.last().unwrap().name, "uretprobe vs seccomp");
-        assert!(matches!(
-            checks.last().unwrap().status,
-            Status::NotApplicable(_)
-        ));
-        assert!(
-            status_detail(&checks.last().unwrap().status).contains("shared capture setup refused")
-        );
+        let seccomp = checks
+            .iter()
+            .find(|check| check.name == "uretprobe vs seccomp")
+            .unwrap();
+        assert!(matches!(seccomp.status, Status::NotApplicable(_)));
+        assert!(status_detail(&seccomp.status).contains("shared capture setup refused"));
+        let multi = checks.last().unwrap();
+        assert_eq!(multi.name, "uprobe-multi attach (own libc)");
+        assert!(matches!(multi.status, Status::NotApplicable(_)));
+        assert!(status_detail(&multi.status).contains("shared capture setup refused"));
     }
 
     #[test]
     fn correction1_successful_setup_preserves_active_seccomp_result() {
         for diagnostic_ok in [true, false] {
             let mut active_calls = 0;
+            let mut multi_calls = 0;
             let checks = bpf_checks_with_seccomp(
                 Ok(()),
                 |_| {
@@ -1180,14 +1282,79 @@ mod tests {
                         status: Status::Warn("controlled hazard result".into()),
                     }
                 },
+                || {
+                    multi_calls += 1;
+                    Check {
+                        name: "uprobe-multi attach (own libc)".into(),
+                        status: Status::Ok("controlled multi result".into()),
+                    }
+                },
             );
             assert_eq!(active_calls, 1);
+            assert_eq!(multi_calls, 1);
+            let seccomp = checks
+                .iter()
+                .find(|check| check.name == "uretprobe vs seccomp")
+                .unwrap();
+            assert_eq!(
+                seccomp.status,
+                Status::Warn("controlled hazard result".into())
+            );
             assert_eq!(
                 checks.last().unwrap().status,
-                Status::Warn("controlled hazard result".into())
+                Status::Ok("controlled multi result".into())
             );
             assert_eq!(verdict(&checks), i32::from(!diagnostic_ok));
         }
+    }
+
+    #[test]
+    fn multi_self_link_classification_proves_or_defers_never_fails() {
+        assert_eq!(
+            multi_self_link_status(Ok(()), "7.0.0"),
+            Status::Ok("self-link attached and detached".into())
+        );
+        for errno in [libc::ENOTSUP, libc::EOPNOTSUPP] {
+            let status =
+                multi_self_link_status(Err(std::io::Error::from_raw_os_error(errno)), "7.0.0");
+            assert!(
+                matches!(status, Status::NotApplicable(_)),
+                "errno {errno} proves an incapable kernel"
+            );
+            assert!(status_detail(&status).contains("per-offset links"));
+        }
+        // EINVAL on an old kernel is the unknown attach type: incapable.
+        let status = multi_self_link_status(
+            Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+            "5.15.0",
+        );
+        assert!(matches!(status, Status::NotApplicable(_)));
+        assert!(status_detail(&status).contains("predates the 6.9 multi floor"));
+        // EINVAL past the floor is unexpected: warn, the runtime falls back.
+        let status = multi_self_link_status(
+            Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+            "6.9.0",
+        );
+        assert!(matches!(status, Status::Warn(_)));
+        assert!(status_detail(&status).contains("falls back per run"));
+        // Anything else (EPERM, EMFILE, ...) warns too, never fails.
+        for errno in [libc::EPERM, libc::EACCES, libc::EMFILE] {
+            let status =
+                multi_self_link_status(Err(std::io::Error::from_raw_os_error(errno)), "7.0.0");
+            assert!(matches!(status, Status::Warn(_)), "errno {errno}");
+        }
+    }
+
+    #[test]
+    fn multi_row_is_neither_capture_nor_tier() {
+        assert!(!is_capture_row("uprobe-multi attach (own libc)"));
+        assert_eq!(
+            verdict(&[Check {
+                name: "uprobe-multi attach (own libc)".into(),
+                status: Status::Warn("controlled".into()),
+            }]),
+            0
+        );
     }
 
     #[test]
@@ -1287,6 +1454,33 @@ mod tests {
                 .all(|check| matches!(check.status, Status::Ok(_)))
         );
         assert_eq!(verdict(&checks), 0);
+    }
+
+    /// F-09: the tier classifier must read the row `bpf_checks_with`
+    /// actually emits. The producer said `(own libc)` while the
+    /// classifier looked up `(self)`, so every real run with a working
+    /// attach classified T0 offline while unit tests with hand-built
+    /// `(self)` rows passed. This feeds the real rows into the real
+    /// classifier — and pins the user-facing row name literally, so a
+    /// shared constant cannot drift both ends together.
+    #[test]
+    fn tier_classification_reads_the_row_bpf_checks_actually_emits() {
+        let mut checks = bpf_checks_with(Ok(()), |_| Ok(()));
+        assert_eq!(checks[1].name, "uprobe attach (self)");
+        checks.push(Check {
+            name: "host program preflight".into(),
+            status: Status::Ok("available".into()),
+        });
+        // Host attach works, target unassessed: T1, not T0 offline.
+        assert_eq!(capability_tier(&checks).tier, CapabilityTier::T1);
+
+        // The other direction: a failed diagnostic still classifies T0.
+        let mut failed = bpf_checks_with(Ok(()), |_| Err("EACCES".into()));
+        failed.push(Check {
+            name: "host program preflight".into(),
+            status: Status::Ok("available".into()),
+        });
+        assert_eq!(capability_tier(&failed).tier, CapabilityTier::T0);
     }
     use super::*;
 
@@ -1699,8 +1893,8 @@ mod tests {
     fn probe_marks_unrequested_lanes_not_applicable_and_never_fails_them() {
         let checks = probe(None, None);
         // 13 host/target rows, eight §10.1 rows, three finite preflight rows,
-        // and the cgroup version row.
-        assert_eq!(checks.len(), 25, "{checks:?}");
+        // the cgroup version row, and the uprobe-multi self-link row.
+        assert_eq!(checks.len(), 26, "{checks:?}");
         let by_name = |name: &str| checks.iter().find(|c| c.name == name).unwrap();
         assert_eq!(
             by_name("/proc/<pid>/maps").status,

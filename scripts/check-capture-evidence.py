@@ -84,6 +84,30 @@ LOADER_DISCOVERY_GROUPS = {
     "initial_set_capture": ("eligible", "none"),
 }
 LOADER_DISCOVERY_COUNTERS = ("hits", "state_read_failures")
+# Consumer-scheduling evidence (Task 3.1 repair): one nested object, closed
+# keys, exact loss-split identities. The terminal drain bound is a source
+# constant (events.rs TERMINAL_DRAIN_BOUND); pinning its value here forces
+# the oracle and the producer to change together.
+SCHEDULING_SINK_POLICY = "bounded-wait-drop"
+SCHEDULING_TERMINAL_DRAIN_BOUND = 65536
+SCHEDULING_U64_KEYS = (
+    "drain_repolls",
+    "drain_budget_exhaustions",
+    "capture_event_loss",
+    "detach_event_loss",
+    "capture_discovery_loss",
+    "detach_discovery_loss",
+    "terminal_drain_bound",
+    "sink_stall_ms",
+    "sink_timeouts",
+    "sink_dropped_bytes",
+    "max_inter_drain_gap_ms",
+)
+SCHEDULING_KEYS = set(SCHEDULING_U64_KEYS) | {
+    "terminal_drain_truncated", "sink_policy", "phase_ms",
+}
+SCHEDULING_PHASE_KEYS = ("discovery", "discovery_terminal", "drain",
+                           "maps", "render", "detach")
 PAUSE_VALUES = ("none", "sigstop", "partial")
 PAUSE_COUNTERS = ("pause_attempts", "pause_confirmed", "pause_partial")
 DISCOVERY_LOSS_COUNTERS = (
@@ -137,7 +161,12 @@ BASE_EVIDENCE_KEYS = set(COUNTERS) | {
     "attach_failures", "aliased", "skipped", "in_flight_at_end", "surfaces",
     "vendor_interfaces", "interface_list", "attach_gap_ms", "pause",
     *PAUSE_COUNTERS, "loader_discovery", "templates_truncated", "provider_changed",
+    "scheduling",
     "completeness",
+    # Informational, not a COUNTER: spilling heuristic lookalikes past the
+    # per-object cap is correct admission, not a coverage gap, so it never
+    # forces PARTIAL and needs no lane allowance or mutation.
+    "discovery_uncorroborated_candidates",
 }
 TRACE_TERMINAL_KEYS = {
     "privacy_mode", "capture_aborted", "final_drain", "counters_available",
@@ -217,12 +246,25 @@ SHARED_OVERLAY_UNCERTAINTY = (
     "shared-overlay physical identity is uncertain; a distinct byte-identical "
     "instance may be unobserved"
 )
+# Audit F-13: render.rs `capture_skipped_out` emits this sixth reason when
+# equal mapping keys carry unequal or unavailable full opened-file
+# identities. It is a discovery-scope loss (subject `discovery subject`),
+# not an entry loss; the validator must accept what the producer emits.
+PHYSICAL_IDENTITY_AMBIGUITY = (
+    "physical identity is ambiguous; the collision group was not attached"
+)
 DISCOVERY_REASONS = {
     DISCOVERY_UNAVAILABLE,
     TABLE_UNAVAILABLE,
     SHARED_OVERLAY_UNCERTAINTY,
+    PHYSICAL_IDENTITY_AMBIGUITY,
 }
 ENTRY_REASONS = {"null pointer", ENTRY_UNAVAILABLE}
+# The one gated entry-like skip whose subject is not a standard function: a
+# null slot in an unlinked table, renamed `unknown` by the mislabel guard
+# (render.rs `capture_skipped_out` gated_null branch). Entry-granularity, so
+# it joins `entry_skips` as a lane-oracle item — never `discovery_skips`.
+UNKNOWN_NULL_SKIP = {"name": "unknown", "reason": "null pointer"}
 # Both walks publish the provider's two tables, so every walked surface is
 # doubled; the unwalked one is a single scan-side record.
 G1_SURFACES = Counter({("full", 68): 2, ("full", 92): 2, ("not_walked", 0): 1})
@@ -230,14 +272,31 @@ LEGACY_SURFACES = Counter({("full", 68): 1})
 # `p11scope_ebpf_common::MAX_SLOTS` (src/discovery/scan.rs, plan:83): the frozen
 # attach ceiling a whole-module capacity refusal is taken against.
 MAX_SLOTS = 512
-# What the p11-kit proxy lane's capacity-refused module really decodes on the
-# hosted lane: libp11-kit maps 64 static CK_FUNCTION_LIST_3_0 closures, 92
-# entries each. The refusal is an attach-ceiling refusal, taken after decode, so
-# every one of those entries stays counted in `table_entries`.
-PROXY_REFUSED_SURFACES = Counter({("full", 92): 64})
-PROXY_REFUSED_ENTRIES = sum(
-    entries * count for (_walk, entries), count in PROXY_REFUSED_SURFACES.items()
-)
+# What the installed libp11-kit really maps (verified byte-level on the lane
+# host, Task 1.4): 64 static CK_FUNCTION_LIST_3_2 closure templates, 104
+# entries each, ordinals 65/66 shared by all 64 (64*102+2 = 6530 distinct
+# targets). The K=4 per-object heuristic cap admits 4 tables (any 4 share
+# exactly the 2 family targets: 4*102+2 = 410 distinct, 0 nulls); the other
+# 60 spill as `discovery_uncorroborated_candidates` — evidence, never slots.
+#
+# Admitted p11-kit template families (audit F8): the 3.x (version, entries)
+# combinations the version matrix declares — 92-entry 3.0/3.1, 104-entry
+# 3.2 — each with the distinct targets K=4 admits from 4 tables sharing the
+# 2 family targets (4*(entries-2)+2). The lane qualifies whichever build is
+# installed instead of pinning one provider version; every table in one
+# capture must still share exactly one shape.
+ADMITTED_PROXY_TABLE_SHAPES = {
+    (3, 0): {"entries": 92, "admitted_slots": 362},
+    (3, 1): {"entries": 92, "admitted_slots": 362},
+    (3, 2): {"entries": 104, "admitted_slots": 410},
+}
+PROXY_TABLES = 64
+# The installed build's shape, which the self-test fixture pins exactly.
+PROXY_TABLE_ENTRIES = ADMITTED_PROXY_TABLE_SHAPES[(3, 2)]["entries"]
+PROXY_ADMITTED_TABLES = 4
+PROXY_ADMITTED_SLOTS = ADMITTED_PROXY_TABLE_SHAPES[(3, 2)]["admitted_slots"]
+PROXY_SPILL = PROXY_TABLES - PROXY_ADMITTED_TABLES
+PROXY_DECODED_ENTRIES = PROXY_TABLES * PROXY_TABLE_ENTRIES
 
 SAFE_ALLOWANCES = {
     "semantic_capture_failures": 3,
@@ -328,6 +387,7 @@ def exact_profile_v3_selection(document, *, terminal=False, run=False):
     else:
         evidence = document
     exact_evidence_keys(evidence, profile=True, terminal=terminal, child=run)
+    exact_scheduling_evidence(evidence)
     exact_task_uprobe_link_losses(evidence)
     missing = {
         "interface_selection", "attach_mechanisms", "pid_descendant_gaps",
@@ -473,6 +533,10 @@ def exact_role_counts(description):
 def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, historical=False):
     counter_keys = set(HISTORICAL_COUNTERS if historical else COUNTERS)
     wanted = (BASE_EVIDENCE_KEYS - set(COUNTERS)) | counter_keys
+    if historical:
+        # Retained v2-metrics documents predate scheduling evidence, like
+        # the newer counters HISTORICAL_COUNTERS already excludes.
+        wanted.discard("scheduling")
     wanted |= PROFILE_V3_FIELDS if profile else set()
     if terminal:
         wanted |= TRACE_TERMINAL_KEYS
@@ -547,6 +611,7 @@ def exact_metrics_schema(document, *, run=False):
     require(document["capture"]["privacy_mode"] == "aggregate-only", document["capture"])
     exact_capture_scope(document)
     exact_evidence_keys(document["evidence"], profile=False, child=run)
+    exact_scheduling_evidence(document["evidence"])
     exact_task_uprobe_link_losses(document["evidence"])
 
 
@@ -557,6 +622,62 @@ def exact_historical_metrics_schema(document, *, run=False):
     require(document["capture"]["privacy_mode"] == "aggregate-only", document["capture"])
     exact_evidence_keys(
         document["evidence"], profile=False, child=run, historical=True
+    )
+
+
+def exact_scheduling_evidence(evidence):
+    """Closed scheduling shape plus the loss-split identities.
+
+    The splits are checked against the published loss counters, not just
+    for shape: a capture/detach attribution that does not sum to the
+    counter it claims to decompose is a misattribution, not evidence.
+    """
+    scheduling = evidence.get("scheduling")
+    require(isinstance(scheduling, dict), "scheduling evidence must be an object")
+    actual = set(scheduling)
+    require(
+        actual == SCHEDULING_KEYS,
+        f"unexpected scheduling keys: missing={sorted(SCHEDULING_KEYS - actual)}, "
+        f"extra={sorted(actual - SCHEDULING_KEYS)}",
+    )
+    for name in SCHEDULING_U64_KEYS:
+        require(u64(scheduling[name]), f"scheduling.{name}: invalid counter {scheduling[name]!r}")
+    require(
+        scheduling["terminal_drain_bound"] == SCHEDULING_TERMINAL_DRAIN_BOUND,
+        f"scheduling.terminal_drain_bound: want {SCHEDULING_TERMINAL_DRAIN_BOUND}, "
+        f"got {scheduling['terminal_drain_bound']}",
+    )
+    require(
+        scheduling["terminal_drain_truncated"] is False
+        or scheduling["terminal_drain_truncated"] is True,
+        f"scheduling.terminal_drain_truncated: invalid bool "
+        f"{scheduling['terminal_drain_truncated']!r}",
+    )
+    require(
+        scheduling["sink_policy"] == SCHEDULING_SINK_POLICY,
+        f"scheduling.sink_policy: want {SCHEDULING_SINK_POLICY!r}, "
+        f"got {scheduling['sink_policy']!r}",
+    )
+    phases = scheduling["phase_ms"]
+    require(isinstance(phases, dict), "scheduling.phase_ms must be an object")
+    require(
+        set(phases) == set(SCHEDULING_PHASE_KEYS),
+        f"unexpected phase_ms keys: {sorted(phases)}",
+    )
+    for name in SCHEDULING_PHASE_KEYS:
+        require(u64(phases[name]), f"scheduling.phase_ms.{name}: invalid counter {phases[name]!r}")
+    event_split = scheduling["capture_event_loss"] + scheduling["detach_event_loss"]
+    require(
+        event_split == evidence["event_loss"],
+        f"scheduling event split {event_split} != event_loss {evidence['event_loss']}",
+    )
+    discovery_split = (
+        scheduling["capture_discovery_loss"] + scheduling["detach_discovery_loss"]
+    )
+    require(
+        discovery_split == evidence["discovery_ring_loss"],
+        f"scheduling discovery split {discovery_split} != discovery_ring_loss "
+        f"{evidence['discovery_ring_loss']}",
     )
 
 
@@ -828,8 +949,16 @@ def entry_skips(evidence):
     Only the first kind is an oracle a lane can state exactly — the second kind
     depends on what else the scan walked, which for a `--cgroup` lane is every
     process in that cgroup.
+    The one exception is the gated null of an unlinked table's null slot: its
+    subject is `unknown`, not a function, but the loss is still
+    entry-granularity and the pair is fully specified, so a lane states it
+    here exactly like any entry skip.
     """
-    return [item for item in evidence["skipped"] if item["name"].startswith("C_")]
+    return [
+        item
+        for item in evidence["skipped"]
+        if item["name"].startswith("C_") or item == UNKNOWN_NULL_SKIP
+    ]
 
 
 def bounded_skip(item):
@@ -842,13 +971,14 @@ def bounded_skip(item):
         f"invalid capture skip: {item!r}",
     )
     entry = item["name"].startswith("C_")
+    gated_null = item == UNKNOWN_NULL_SKIP
     require(
-        entry or item["name"] == DISCOVERY_SUBJECT,
+        entry or gated_null or item["name"] == DISCOVERY_SUBJECT,
         f"unbounded capture skip subject: {item}",
     )
-    allowed = ENTRY_REASONS if entry else DISCOVERY_REASONS
+    allowed = ENTRY_REASONS if (entry or gated_null) else DISCOVERY_REASONS
     require(item["reason"] in allowed, f"unbounded capture skip reason: {item}")
-    return entry
+    return entry or gated_null
 
 
 def discovery_skips(evidence):
@@ -1283,15 +1413,20 @@ def exact_capture_modules(document):
 
 
 def validate_proxy_capacity_fallback(document, module_path=None):
-    """The exact p11-kit-over-capacity/SoftHSM2-attached live shape.
+    """The exact p11-kit-bounded/SoftHSM2-attached live shape.
 
-    This is the p11-kit proxy lane's *expected* outcome, not a fallback: a real
-    libp11-kit maps its 64 static 3.0 closures into the scanned image, which is
-    thousands of decoded entries against a frozen 512-slot ceiling, so the
-    proxy module is always discovered and always refused whole
-    (plan 2026-08-19-slice1b2-production.md:1120-1136). `module_path`, when the
-    caller controls it, pins the one directly-attached module by the exact path
-    the lane configured rather than by a substring.
+    This is the p11-kit proxy lane's *expected* outcome, not a fallback. The
+    installed libp11-kit maps 64 static 3.x closure templates into the
+    scanned image — one of ADMITTED_PROXY_TABLE_SHAPES, e.g. 3.2/104-entry
+    (6530 distinct targets) on the lane host. Since Task 1.2 the K=4
+    per-object heuristic cap admits 4 tables (410 distinct targets at
+    3.2/104) and records the other 60 as
+    `discovery_uncorroborated_candidates` — spill is evidence, never slots
+    — so the proxy module is NOT refused whole: both providers attach (478
+    slots at 3.2/104), nothing is skipped, and every slot is scan-only
+    `unknown` (1.3 mislabel guard). `module_path`, when the caller controls
+    it, pins the directly-attached SoftHSM2 module by the exact path the
+    lane configured rather than by a substring.
     """
     exact_metrics_schema(document)
     exact_capture_modules(document)
@@ -1306,108 +1441,153 @@ def validate_proxy_capacity_fallback(document, module_path=None):
     require(evidence["authority"] == "hash-pinned", evidence["authority"])
     require(evidence["scan_unavailable"] is None, evidence["scan_unavailable"])
     require(evidence["completeness"] == "PARTIAL", evidence["completeness"])
+    require(evidence["modules_skipped"] == [], evidence["modules_skipped"])
+    require(evidence["skipped"] == [], evidence["skipped"])
 
     modules = document["capture"]["modules"]
-    require(len(modules) == 1, [module["path"] for module in modules])
-    module = modules[0]
-    require("softhsm" in module["path"].lower(), module["path"])
-    require("p11-kit" not in module["path"].lower(), module["path"])
+    require(len(modules) == 2, [module["path"] for module in modules])
+    soft = [m for m in modules if "softhsm" in m["path"].lower()]
+    require(len(soft) == 1, [module["path"] for module in modules])
+    soft = soft[0]
+    proxy = [m for m in modules if m["path"] != soft["path"]]
+    require(len(proxy) == 1, [module["path"] for module in modules])
+    proxy = proxy[0]
+    require("p11-kit" in proxy["path"].lower(), proxy["path"])
+    require("p11-kit" not in soft["path"].lower(), soft["path"])
     require(
-        module_path is None or module["path"] == module_path,
-        f"attached module is not the lane's own module: {module['path']!r}",
+        module_path is None or soft["path"] == module_path,
+        f"attached SoftHSM2 module is not the lane's own module: {soft['path']!r}",
     )
+    soft_id = {key: soft[key] for key in ("dev", "ino", "sha256")}
+    proxy_id = {key: proxy[key] for key in ("dev", "ino", "sha256")}
+
     discovery = evidence["discovery"]
-    require(len(discovery) == 1, discovery)
-    require(discovery[0]["sources"] == ["scan"], discovery)
-    require(discovery[0]["corroborated"] is False, discovery)
-    require(discovery[0]["corroboration"] == ["single_source"], discovery)
-    require(discovery[0]["interfaces"] == 0, discovery)
-    require(discovery[0]["skipped"] == [], discovery)
+    require(len(discovery) == 2, [module["path"] for module in discovery])
+    by_path = {module["path"]: module for module in discovery}
+    require(set(by_path) == {soft["path"], proxy["path"]}, by_path)
+    for record in discovery:
+        require(record["sources"] == ["scan"], record)
+        require(record["corroborated"] is False, record)
+        require(record["corroboration"] == ["single_source"], record)
+        require(record["interfaces"] == 0, record)
+        require(record["skipped"] == [], record)
+        objects = record["objects"]
+        require(len(objects) == 1, objects)
+        target = objects[0]
+        identity = soft_id if record["path"] == soft["path"] else proxy_id
+        require(
+            {key: target[key] for key in identity} == identity,
+            f"attached target is not the module object: {target}",
+        )
+        require(target["path"] == record["path"], target)
+    # Task 1.3 provenance: every decoded table carries its version-word file
+    # offset and linkage kind. Zero interfaces means heuristic decode, so the
+    # slots are named `unknown`, never ordinal PKCS#11 labels.
+    soft_tables = by_path[soft["path"]]["tables"]
+    require(len(soft_tables) == 1, soft_tables)
     require(
-        discovery[0]["tables"] == [{"version": [2, 40], "entries": 68, "source": "scan"}],
-        discovery,
+        {key: soft_tables[0][key] for key in ("version", "entries", "source")}
+        == {"version": [2, 40], "entries": 68, "source": "scan"},
+        soft_tables,
     )
-    objects = discovery[0]["objects"]
-    require(len(objects) == 1, objects)
-    target = objects[0]
-    identity = {key: module[key] for key in ("dev", "ino", "sha256")}
+    require(soft_tables[0]["linkage"] == "heuristic", soft_tables)
+    require(u64(soft_tables[0]["file_offset"]), soft_tables)
+    proxy_tables = by_path[proxy["path"]]["tables"]
+    require(len(proxy_tables) == PROXY_TABLES, len(proxy_tables))
+    offsets = set()
+    shape = None
+    for table in proxy_tables:
+        version = table["version"]
+        require(
+            isinstance(version, list)
+            and len(version) == 2
+            and all(isinstance(value, int) for value in version),
+            f"proxy table version is not a [major, minor] pair: {table}",
+        )
+        key = tuple(version)
+        require(
+            key in ADMITTED_PROXY_TABLE_SHAPES
+            and table["entries"] == ADMITTED_PROXY_TABLE_SHAPES[key]["entries"]
+            and table["source"] == "scan",
+            table,
+        )
+        if shape is None:
+            shape = key
+        require(key == shape, f"proxy tables mix provider builds: {shape} vs {key}")
+        require(table["linkage"] == "heuristic", table)
+        require(u64(table["file_offset"]), table)
+        offsets.add(table["file_offset"])
+    require(len(offsets) == PROXY_TABLES, "proxy tables share a file offset")
+    admitted = ADMITTED_PROXY_TABLE_SHAPES[shape]
+    table_entries = admitted["entries"]
+    admitted_slots = admitted["admitted_slots"]
+    # K=4 spill: 64 decoded, 4 admitted, 60 recorded as candidates.
     require(
-        {key: target[key] for key in identity} == identity,
-        f"attached target is not the SoftHSM2 module object: {target}",
+        evidence["discovery_uncorroborated_candidates"] == PROXY_SPILL,
+        evidence["discovery_uncorroborated_candidates"],
     )
-    require(target["path"] == module["path"], target)
-    require("p11-kit" not in target["path"].lower(), target)
 
-    refused = evidence["modules_skipped"]
-    require(len(refused) == 1, refused)
-    require("p11-kit" in refused[0]["name"].lower(), refused)
-    match = re.fullmatch(
-        rf"module needs ([0-9]+) more of the {MAX_SLOTS} attach slots; ([0-9]+) are in use "
-        r"— refusing to attach a prefix",
-        refused[0]["reason"],
-    )
-    require(match, refused)
-    wanted, occupied = map(int, match.groups())
-    require(
-        occupied in (0, evidence["slots"]),
-        f"capacity occupancy: {occupied}, {evidence['slots']}",
-    )
-    require(
-        occupied + wanted > MAX_SLOTS,
-        f"capacity refusal fits: {occupied} + {wanted}",
-    )
-
-    # Decoded occurrences are recorded *before* slot-capacity admission, so a
-    # module refused only by the attach ceiling keeps every entry it decoded;
-    # capacity bounds attachment, not discovery
-    # (plan 2026-08-19-slice1b2-production.md:1120-1136, schema v2 `table_entries`).
-    # How much that is belongs to the p11-kit build under test — this one maps
-    # 64 static 3.0 closures — so the refused contribution is derived from the
-    # surfaces the capture attributed to the refused module, never frozen at the
-    # attached module's own 68. Both modules must own every surface: an
-    # unattributable surface is a gap, not an allowance.
-    attached_surfaces = Counter()
-    refused_entries = 0
+    # Decoded occurrences are recorded *before* heuristic-cap admission, so
+    # the bounded module keeps every entry it decoded; the cap bounds
+    # attachment, not discovery (schema v2 `table_entries`). Both modules must
+    # own every surface: an unattributable surface is a gap, not an allowance.
+    soft_surfaces = Counter()
+    proxy_surfaces = Counter()
     for surface in evidence["surfaces"]:
         require(surface["acquisition"] == "ok", f"surface acquisition failure: {surface}")
-        if surface["source"].startswith(f"{module['path']} "):
-            attached_surfaces[(surface["walk"], surface["functions"])] += 1
-        elif surface["source"].startswith(f"{refused[0]['name']} "):
-            refused_entries += surface["functions"]
+        if surface["source"].startswith(f"{soft['path']} "):
+            soft_surfaces[(surface["walk"], surface["functions"])] += 1
+        elif surface["source"].startswith(f"{proxy['path']} "):
+            proxy_surfaces[(surface["walk"], surface["functions"])] += 1
         else:
             require(False, f"surface belongs to neither module: {surface}")
     require(
-        attached_surfaces == LEGACY_SURFACES,
-        f"unexpected attached-module surfaces: {dict(attached_surfaces)}",
+        soft_surfaces == LEGACY_SURFACES,
+        f"unexpected SoftHSM2 surfaces: {dict(soft_surfaces)}",
     )
     require(
-        refused_entries > 0,
-        f"the capacity-refused module kept none of its decoded entries: {evidence['surfaces']}",
+        proxy_surfaces == Counter({("full", table_entries): PROXY_TABLES}),
+        f"unexpected proxy surfaces: {dict(proxy_surfaces)}",
     )
-    # `slots`/`attached_probes` stay bounded to the one attached module: the
-    # refused module contributes decoded history and no public accepted module.
-    # One slot per {object, offset} and two probes per slot: a target both
-    # providers publish is attached exactly once, through the direct module.
+    # One slot per {object, offset} and two probes per slot. The admitted
+    # proxy slots are the distinct targets across 4 admitted tables of the
+    # observed shape (410 at 3.2/104: 4*102+2, ordinals 65/66 shared,
+    # byte-verified, 0 nulls); a target both providers publish is attached
+    # exactly once.
     for name, wanted in (
-        ("table_entries", 68 + refused_entries),
-        ("slots", 68),
-        ("attached_probes", 136),
+        ("table_entries", 68 + PROXY_TABLES * table_entries),
+        ("slots", 68 + admitted_slots),
+        ("attached_probes", 2 * (68 + admitted_slots)),
         ("vendor_interfaces", 0),
         ("interface_list", "absent"),
     ):
         require(evidence[name] == wanted, f"{name}: want {wanted!r}, got {evidence[name]!r}")
 
-    require(evidence["skipped"] == [], evidence["skipped"])
-
     functions = document["functions"]
-    require(len(functions) == 68, len(functions))
-    called = 0
+    require(len(functions) == evidence["slots"], len(functions))
+    attributed = Counter()
+    called_soft = 0
+    called_proxy = 0
     for item in functions:
+        require(item["names"] == ["unknown"], f"scan-only function must be unnamed: {item}")
+        require(item["aliased"] is False, item)
         require(item["module_ambiguous"] is False, item)
-        require(item["module"] == identity, item)
+        require(item["module"] in (soft_id, proxy_id), item)
+        attributed["soft" if item["module"] == soft_id else "proxy"] += 1
         require(isinstance(item["calls"], int) and item["calls"] >= 0, item)
-        called += item["calls"]
-    require(called > 0, "the SoftHSM2 backend handled no calls")
+        if item["module"] == soft_id:
+            called_soft += item["calls"]
+        else:
+            called_proxy += item["calls"]
+    require(
+        dict(attributed) == {"soft": 68, "proxy": admitted_slots},
+        f"per-module function split: {dict(attributed)}",
+    )
+    # A green lane claims two-provider call coverage (audit F6): one global
+    # positive count lets complete loss on either provider pass, so each
+    # provider must have handled at least one call.
+    require(called_soft > 0, "SoftHSM2 handled no calls: single-provider, not proxy-stack coverage")
+    require(called_proxy > 0, "the proxy handled no calls: complete proxy-call loss is not two-provider coverage")
 
 
 def load_json(path):
@@ -1455,7 +1635,13 @@ def validate_clean_metrics(
     discovery_skipped=0,
     run=False,
 ):
-    """SoftHSM2 counted exactly, with discovery stated rather than assumed."""
+    """SoftHSM2 counted exactly, with discovery stated rather than assumed.
+
+    Since the 1.3 mislabel guard, scan-only tables carry no linkage and their
+    slots are named `unknown` — never ordinal PKCS#11 labels — so the scan
+    lane asserts exact counts on totals, while manifest-authorized lanes
+    (manifest-only, corroborated) keep exact per-name counts.
+    """
     require(discovery in CLEAN_DISCOVERY, f"unknown clean-metrics discovery: {discovery}")
     wanted_sources, allowances = CLEAN_DISCOVERY[discovery]
     require(multiplier >= 1, f"invalid clean-metrics multiplier: {multiplier}")
@@ -1505,6 +1691,31 @@ def validate_clean_metrics(
         )
     exact_capture_modules(document)
 
+    wanted = {name: calls * multiplier for name, calls in expected.items()}
+    require("C_GetFunctionList" not in wanted, "expected-count file must omit bootstrap")
+    wanted["C_GetFunctionList"] = multiplier
+    if discovery == "scan":
+        # Scan-only: unlinked heuristic tables are count-only under `unknown`
+        # (1.3 mislabel guard) — the bootstrap loader call included — so
+        # exactness is on the total, never per name.
+        total = 0
+        for item in document["functions"]:
+            calls = item["calls"]
+            require(u64(calls), f"invalid call count: {item}")
+            require(
+                item["names"] == ["unknown"],
+                f"scan-only function must be unnamed: {item}",
+            )
+            require(
+                item["aliased"] is False,
+                f"clean metrics cannot contain aliases: {item}",
+            )
+            total += calls
+        require(
+            total == sum(wanted.values()),
+            f"scan-only total calls: want {sum(wanted.values())}, got {total}",
+        )
+        return
     actual = Counter()
     for item in document["functions"]:
         calls = item["calls"]
@@ -1520,9 +1731,6 @@ def validate_clean_metrics(
         require(item["aliased"] is False, f"clean metrics cannot contain aliases: {item}")
         if calls:
             actual.update({name: calls for name in names})
-    wanted = {name: calls * multiplier for name, calls in expected.items()}
-    require("C_GetFunctionList" not in wanted, "expected-count file must omit bootstrap")
-    wanted["C_GetFunctionList"] = multiplier
     require(dict(actual) == wanted, f"positive function counts: want {wanted}, got {dict(actual)}")
 
 
@@ -1838,10 +2046,19 @@ MODULE_FIXTURE = {
     "build_id": "aabb",
 }
 
+PROXY_MODULE_FIXTURE = {
+    "path": "/usr/lib/x86_64-linux-gnu/libp11-kit.so.0.4.8",
+    "dev": [8, 2],
+    "ino": 9999,
+    "sha256": "22" * 32,
+    "build_id": "ccdd",
+}
 
-def function_items(pairs):
+
+def function_items(pairs, identity=None):
     """`functions[]` items as v2 emits them: every count attributed to a module."""
-    identity = {key: MODULE_FIXTURE[key] for key in ("dev", "ino", "sha256")}
+    if identity is None:
+        identity = {key: MODULE_FIXTURE[key] for key in ("dev", "ino", "sha256")}
     return [
         {
             "names": names,
@@ -1880,7 +2097,13 @@ def discovery_fixture(sources=("scan",)):
             corroborated=corroborated,
             corroboration=[outcome],
             tables=[
-                {"version": [2, 40], "entries": 68, "source": source}
+                {
+                    "version": [2, 40],
+                    "entries": 68,
+                    "source": source,
+                    "file_offset": 0x1000 if source == "scan" else None,
+                    "linkage": "heuristic" if source == "scan" else "manifest",
+                }
                 for source in sources
             ],
             interfaces=0,
@@ -1921,6 +2144,22 @@ def loader_discovery_fixture(**overrides):
     return aggregate
 
 
+def scheduling_fixture(**overrides):
+    """Closed scheduling shape, idle. Overrides state the exercised counts."""
+    fixture = {name: 0 for name in SCHEDULING_U64_KEYS}
+    fixture["terminal_drain_bound"] = SCHEDULING_TERMINAL_DRAIN_BOUND
+    fixture["terminal_drain_truncated"] = False
+    fixture["sink_policy"] = SCHEDULING_SINK_POLICY
+    fixture["phase_ms"] = {name: 0 for name in SCHEDULING_PHASE_KEYS}
+    for name, value in overrides.items():
+        require(
+            name in SCHEDULING_KEYS,
+            f"unknown scheduling fixture override: {name}",
+        )
+        fixture[name] = value
+    return fixture
+
+
 def evidence_fixture(surfaces, sources=("scan",), discovery_skipped=0):
     return {
         "authority": "hash-pinned",
@@ -1959,8 +2198,10 @@ def evidence_fixture(surfaces, sources=("scan",), discovery_skipped=0):
         # A fixture is self-consistent: a module only the manifest described is
         # uncorroborated, by definition of the word.
         "discovery_uncorroborated": 1 if list(sources) == ["manifest"] else 0,
+        "discovery_uncorroborated_candidates": 0,
         "templates_truncated": False,
         "provider_changed": False,
+        "scheduling": scheduling_fixture(),
         "completeness": "PARTIAL",
     }
 
@@ -1982,6 +2223,7 @@ def document_fixture(evidence, *, schema=PROFILE_SCHEMA, mode="profile", privacy
             evidence.pop("task_uprobe_link_losses", None)
             evidence.pop("abi_refusals", None)
             evidence.pop("semantic_history_drops", None)
+            evidence.pop("scheduling", None)
     capture = {
         "mode": mode,
         "privacy_mode": privacy,
@@ -2028,9 +2270,7 @@ def self_test():
         mode="metrics",
         privacy="aggregate-only",
     )
-    clean["functions"] = function_items(
-        [(["C_GetFunctionList"], 1), (["C_Initialize"], 1)]
-    )
+    clean["functions"] = function_items([(["unknown"], 2)])
     validate_clean_metrics(clean, {"C_Initialize": 1})
     historical = document_fixture(
         clean_evidence,
@@ -2070,13 +2310,18 @@ def self_test():
         rejected(lambda bad=bad: validate_shared_layer_metrics(bad, {"C_Initialize": 1}))
     print("shared-layer metrics permits exactly one bounded overlay uncertainty: OK")
     bad = copy.deepcopy(clean)
-    bad["functions"] += function_items([(["C_Unexpected"], 1)])
+    bad["functions"] += function_items([(["unknown"], 1)])
     rejected(lambda: validate_clean_metrics(bad, {"C_Initialize": 1}))
     print("unexpected positive function rejected: OK")
+    # A scan-only slot carrying an ordinal label is a mislabel, not evidence.
     bad = copy.deepcopy(clean)
-    bad["functions"][0]["calls"] = 2
+    bad["functions"] = function_items([(["unknown"], 1), (["C_Initialize"], 1)])
     rejected(lambda: validate_clean_metrics(bad, {"C_Initialize": 1}))
-    print("bootstrap function exact count required: OK")
+    print("scan-only ordinal label rejected: OK")
+    bad = copy.deepcopy(clean)
+    bad["functions"][0]["calls"] = 3
+    rejected(lambda: validate_clean_metrics(bad, {"C_Initialize": 1}))
+    print("scan-only total exact count required: OK")
     doubled = copy.deepcopy(clean)
     for item in doubled["functions"]:
         item["calls"] *= 2
@@ -2362,41 +2607,63 @@ def self_test():
     proxy["capture"]["modules"][0]["path"] = soft_path
     proxy["evidence"]["discovery"][0]["path"] = soft_path
     proxy["evidence"]["discovery"][0]["objects"][0]["path"] = soft_path
-    proxy_refused = "/usr/lib/x86_64-linux-gnu/libp11-kit.so.0.3.1"
-    proxy["evidence"]["modules_skipped"] = [
-        {
-            "name": proxy_refused,
-            "reason": "module needs 5762 more of the 512 attach slots; 68 are in use "
-            "— refusing to attach a prefix",
-        }
-    ]
-    # The refused module's decode survives its attach refusal, so the capture
-    # keeps its surfaces and counts their entries on top of the attached 68.
+    proxy_id = {key: PROXY_MODULE_FIXTURE[key] for key in ("dev", "ino", "sha256")}
+    soft_id = {key: MODULE_FIXTURE[key] for key in ("dev", "ino", "sha256")}
+    proxy["capture"]["modules"].append(dict(PROXY_MODULE_FIXTURE))
+    proxy["evidence"]["discovery"].append(
+        dict(
+            PROXY_MODULE_FIXTURE,
+            objects=[
+                dict(
+                    PROXY_MODULE_FIXTURE,
+                    identity_source="mountinfo",
+                    note=None,
+                    sources=["scan"],
+                )
+            ],
+            sources=["scan"],
+            corroborated=False,
+            corroboration=["single_source"],
+            tables=[
+                {
+                    "version": [3, 2],
+                    "entries": PROXY_TABLE_ENTRIES,
+                    "source": "scan",
+                    "file_offset": 0x2000 + index * 840,
+                    "linkage": "heuristic",
+                }
+                for index in range(PROXY_TABLES)
+            ],
+            interfaces=0,
+            skipped=[],
+        )
+    )
+    # The bounded module's decode survives the K=4 cap, so the capture keeps
+    # its surfaces and counts their entries on top of the attached 68.
     proxy["evidence"]["surfaces"][0]["source"] = f"{soft_path} table 2.40"
     proxy["evidence"]["surfaces"] += [
         {
-            "walk": walk,
-            "functions": functions,
+            "walk": "full",
+            "functions": PROXY_TABLE_ENTRIES,
             "acquisition": "ok",
-            "source": f"{proxy_refused} table 3.0",
+            "source": f"{PROXY_MODULE_FIXTURE['path']} table 3.2",
         }
-        for (walk, functions), count in PROXY_REFUSED_SURFACES.items()
-        for _ in range(count)
+        for _ in range(PROXY_TABLES)
     ]
-    proxy["evidence"]["table_entries"] = 68 + PROXY_REFUSED_ENTRIES
-    proxy["evidence"]["skipped"] = []
+    proxy["evidence"].update(
+        table_entries=68 + PROXY_DECODED_ENTRIES,
+        slots=68 + PROXY_ADMITTED_SLOTS,
+        attached_probes=2 * (68 + PROXY_ADMITTED_SLOTS),
+        discovery_uncorroborated_candidates=PROXY_SPILL,
+        skipped=[],
+    )
     proxy["functions"] = function_items(
-        [(["C_GetFunctionList"], 1), (["C_Initialize"], 1)]
-        + [([f"C_Unused_{index}"], 0) for index in range(66)]
+        [(["unknown"], 1)] + [(["unknown"], 0)] * 67
+    ) + function_items(
+        [(["unknown"], 1)] + [(["unknown"], 0)] * (PROXY_ADMITTED_SLOTS - 1),
+        identity=proxy_id,
     )
     validate_proxy_capacity_fallback(proxy, module_path=soft_path)
-    # Capacity records occupancy when this whole module is considered. The
-    # other module can be admitted before or after that refusal.
-    proxy_first = copy.deepcopy(proxy)
-    proxy_first["evidence"]["modules_skipped"][0]["reason"] = proxy_first[
-        "evidence"
-    ]["modules_skipped"][0]["reason"].replace("68 are in use", "0 are in use")
-    validate_proxy_capacity_fallback(proxy_first, module_path=soft_path)
     # The lane pins its own module by exact path, so a capture that attached
     # some other SoftHSM2 build is not this lane's evidence.
     rejected(
@@ -2405,44 +2672,88 @@ def self_test():
         )
     )
     for mutate in (
-        lambda d: d["evidence"]["discovery"][0]["objects"][0].update(
-            path="/usr/lib/x86_64-linux-gnu/libp11-kit.so.0.3.1", ino=999
+        lambda d: d["evidence"]["discovery"][1]["objects"][0].update(
+            path=soft_path, ino=999
         ),
         lambda d: d["evidence"]["skipped"].append(dict(DISCOVERY_SKIP)),
         lambda d: d["evidence"].update(event_loss=1),
-        lambda d: d["evidence"]["modules_skipped"][0].update(reason="capacity"),
-        lambda d: d["evidence"]["modules_skipped"][0].update(
-            reason="module needs 5762 more of the 512 attach slots; 67 are in use "
-            "— refusing to attach a prefix"
-        ),
-        lambda d: d["evidence"]["modules_skipped"][0].update(
-            reason="module needs 444 more of the 512 attach slots; 68 are in use "
-            "— refusing to attach a prefix"
+        lambda d: d["evidence"]["modules_skipped"].append(
+            {"name": "whole refusal", "reason": "stale shape"}
         ),
         lambda d: d["functions"][0]["module"].update(ino=999),
         lambda d: d["evidence"].update(completeness="COMPLETE"),
-        lambda d: d["evidence"].update(slots=67),
+        lambda d: d["evidence"].update(slots=68 + PROXY_ADMITTED_SLOTS - 1),
         lambda d: [item.update(calls=0) for item in d["functions"]],
-        # The refused module's decode is dropped rather than retained — the
-        # shape the frozen oracle demanded, and the one plan:1120-1136 forbids.
+        # Audit F6: complete call loss on one provider is not two-provider
+        # coverage, even with the other provider's call still present.
+        lambda d: [item.update(calls=0) for item in d["functions"][68:]],
+        lambda d: d["functions"][0].update(calls=0),
+        # The K=4 spill is exact in both directions.
+        lambda d: d["evidence"].update(discovery_uncorroborated_candidates=PROXY_SPILL - 1),
+        lambda d: d["evidence"].update(discovery_uncorroborated_candidates=PROXY_SPILL + 1),
+        # A decoded table dropped from history, or relabeled as linked.
+        lambda d: d["evidence"]["discovery"][1]["tables"].pop(),
+        lambda d: d["evidence"]["discovery"][1]["tables"][0].update(linkage="manifest"),
+        # The bounded module's decode is dropped rather than retained — the
+        # cap bounds attachment, never discovery.
         lambda d: d["evidence"].update(
             table_entries=68,
             surfaces=[s for s in d["evidence"]["surfaces"] if s["functions"] == 68],
         ),
         # ... or kept as surfaces but not counted, or miscounted either way.
         lambda d: d["evidence"].update(table_entries=68),
-        lambda d: d["evidence"].update(table_entries=68 + PROXY_REFUSED_ENTRIES + 1),
+        lambda d: d["evidence"].update(table_entries=68 + PROXY_DECODED_ENTRIES + 1),
         lambda d: d["evidence"]["surfaces"].pop(),
         # A surface neither module owns is a gap, never an allowance.
-        lambda d: d["evidence"]["surfaces"][-1].update(source="/usr/lib/other.so table 3.0"),
+        lambda d: d["evidence"]["surfaces"][-1].update(source="/usr/lib/other.so table 3.2"),
+        # A labeled slot in a scan-only capture is a mislabel, not evidence.
+        lambda d: d["functions"][0].update(names=["C_Initialize"]),
+        # A proxy slot reattributed to SoftHSM2 breaks the per-module split.
+        lambda d: d["functions"][68].update(module=dict(soft_id)),
         # A target both providers publish is attached once: two probes per
         # slot, one reported function per slot.
-        lambda d: d["evidence"].update(attached_probes=137),
+        lambda d: d["evidence"].update(attached_probes=2 * (68 + PROXY_ADMITTED_SLOTS) + 1),
         lambda d: d["functions"].pop(),
     ):
         bad = copy.deepcopy(proxy)
         mutate(bad)
         rejected(lambda bad=bad: validate_proxy_capacity_fallback(bad))
+    # Audit F8: every other admitted 3.x family is accepted when it is
+    # internally consistent — same table count, one shape, K=4 spill, and
+    # the slot/surface/call counts that shape implies.
+    for shape in ((3, 0), (3, 1)):
+        entries = ADMITTED_PROXY_TABLE_SHAPES[shape]["entries"]
+        admitted = ADMITTED_PROXY_TABLE_SHAPES[shape]["admitted_slots"]
+        older = copy.deepcopy(proxy)
+        for table in older["evidence"]["discovery"][1]["tables"]:
+            table["version"] = list(shape)
+            table["entries"] = entries
+        for surface in older["evidence"]["surfaces"][1:]:
+            surface["functions"] = entries
+            surface["source"] = surface["source"].replace("table 3.2", f"table {shape[0]}.{shape[1]}")
+        older["evidence"].update(
+            table_entries=68 + PROXY_TABLES * entries,
+            slots=68 + admitted,
+            attached_probes=2 * (68 + admitted),
+        )
+        older["functions"] = older["functions"][: 68 + admitted]
+        validate_proxy_capacity_fallback(older)
+        # ... but the pin stays exact per shape: a mixed build, a version
+        # with the wrong entry count, an undeclared version, the wrong
+        # admitted slots for the shape, and a malformed version all fail.
+        mixed = copy.deepcopy(older)
+        mixed["evidence"]["discovery"][1]["tables"][0]["version"] = [3, 2]
+        mixed["evidence"]["discovery"][1]["tables"][0]["entries"] = PROXY_TABLE_ENTRIES
+        rejected(lambda mixed=mixed: validate_proxy_capacity_fallback(mixed))
+        for mutate in (
+            lambda d: d["evidence"]["discovery"][1]["tables"][0].update(entries=PROXY_TABLE_ENTRIES),
+            lambda d: [table.update(version=[3, 9]) for table in d["evidence"]["discovery"][1]["tables"]],
+            lambda d: d["evidence"].update(slots=68 + PROXY_ADMITTED_SLOTS),
+            lambda d: d["evidence"]["discovery"][1]["tables"][0].update(version="3.0"),
+        ):
+            bad = copy.deepcopy(older)
+            mutate(bad)
+            rejected(lambda bad=bad: validate_proxy_capacity_fallback(bad))
     print("proxy capacity fallback accepts only its exact evidence shape: OK")
 
     version = evidence_fixture(
@@ -2864,6 +3175,21 @@ def self_test():
         bad = copy.deepcopy(bounded_skips)
         bad["skipped"][0]["reason"] = leaked_reason
         rejected(lambda bad=bad: discovery_skips(bad))
+    gated_null = copy.deepcopy(bounded_skips)
+    gated_null["skipped"] = [dict(UNKNOWN_NULL_SKIP)]
+    discovery_skips(gated_null)
+    require(
+        entry_skips(gated_null) == [dict(UNKNOWN_NULL_SKIP)],
+        f"gated null is not an entry oracle item: {entry_skips(gated_null)}",
+    )
+    require(
+        discovery_skips(gated_null) == [],
+        f"gated null leaks into discovery skips: {discovery_skips(gated_null)}",
+    )
+    for wrong_reason in (DISCOVERY_UNAVAILABLE, TABLE_UNAVAILABLE, ENTRY_UNAVAILABLE):
+        bad = copy.deepcopy(bounded_skips)
+        bad["skipped"] = [{"name": "unknown", "reason": wrong_reason}]
+        rejected(lambda bad=bad: discovery_skips(bad))
     print("capture skip names and reasons are bounded before JSON output: OK")
     bad = copy.deepcopy(safe)
     bad["evidence"]["attached_probes"] = 206
@@ -3033,6 +3359,9 @@ def self_test():
         attached_probes=136,
         event_loss=1,
         unmatched_closes=1,
+        # The one lost event dropped while the capture loop ran, before the
+        # detach window opened.
+        scheduling=scheduling_fixture(capture_event_loss=1),
     )
     induced["G3"] = document_fixture(g3)
     induced["G3"]["functions"] = function_items(
@@ -3507,6 +3836,41 @@ def self_test():
         mutate(bad)
         rejected(lambda bad=bad: exact_active_to_empty(bad))
     print("active-to-empty keeps its history and declares every owner: OK")
+
+    # ---- consumer scheduling (Task 3.1 repair) --------------------------
+    # The loss splits are identities: capture + detach shares always sum to
+    # the published loss counter, so a repair that misattributes fails here.
+    scheduled = copy.deepcopy(clean)
+    scheduled["evidence"]["event_loss"] = 10
+    scheduled["evidence"]["scheduling"] = scheduling_fixture(
+        capture_event_loss=6, detach_event_loss=4,
+        drain_repolls=3, sink_dropped_bytes=0,
+    )
+    exact_scheduling_evidence(scheduled["evidence"])
+    for mutate in (
+        lambda d: d["evidence"].pop("scheduling"),
+        lambda d: d["evidence"]["scheduling"].pop("sink_policy"),
+        lambda d: d["evidence"]["scheduling"].update(sink_policy="drop-all"),
+        lambda d: d["evidence"]["scheduling"].update(drain_repolls=-1),
+        lambda d: d["evidence"]["scheduling"].update(drain_repolls=True),
+        lambda d: d["evidence"]["scheduling"].update(
+            terminal_drain_truncated="no"),
+        lambda d: d["evidence"]["scheduling"].update(terminal_drain_bound=0),
+        lambda d: d["evidence"]["scheduling"]["phase_ms"].pop("detach"),
+        lambda d: d["evidence"]["scheduling"]["phase_ms"].update(
+            discovery="fast"),
+        lambda d: d["evidence"]["scheduling"]["phase_ms"].update(
+            discovery_terminal="slow"),
+        lambda d: d["evidence"]["scheduling"].update(extra_key=1),
+        # Split identities: the shares must sum to the published counters.
+        lambda d: d["evidence"]["scheduling"].update(detach_event_loss=5),
+        lambda d: d["evidence"]["scheduling"].update(detach_discovery_loss=1),
+        lambda d: d["evidence"].update(event_loss=11),
+    ):
+        bad = copy.deepcopy(scheduled)
+        mutate(bad)
+        rejected(lambda bad=bad: exact_scheduling_evidence(bad["evidence"]))
+    print("scheduling evidence is exact and its loss splits are identities: OK")
     print("self-test: OK")
 
 

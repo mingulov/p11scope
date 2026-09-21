@@ -13,7 +13,7 @@ use std::mem::size_of;
 use std::ops::{ControlFlow, Deref};
 use std::{
     num::NonZeroU64,
-    os::fd::{AsFd, OwnedFd},
+    os::fd::{AsFd, BorrowedFd, OwnedFd},
     sync::Arc,
 };
 
@@ -40,7 +40,18 @@ impl EventsDomain {
     pub(crate) fn id(&self) -> u64 {
         self.0.id.get()
     }
+}
 
+impl AsFd for EventsDomain {
+    /// The retained EVENTS map descriptor, for readiness waits. Polling
+    /// observes readability without consuming anything; the single
+    /// consumer stays the event drain.
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0._fd.as_fd()
+    }
+}
+
+impl EventsDomain {
     /// Synthetic identity for reducer tests; the owned FD is NOT a BPF map.
     #[cfg(test)]
     pub(crate) fn test_standin(id: u64) -> Self {
@@ -56,19 +67,27 @@ impl EventsDomain {
 }
 
 /// Records one live poll consumes before returning to its caller's duration,
-/// signal and `--max-events` checks. Several times the 256 KiB ring's ~900
-/// record capacity, so a poll stopped here has emptied the ring repeatedly
-/// and leaves only what the producer wrote during the poll itself; an
-/// overflow before the next tick is the kernel's loss counter, reported as
-/// `LOST n events` / `ring_loss` like any other.
+/// signal and `--max-events` checks. Sized against small explicit rings
+/// (256 KiB holds 780): a poll stopped here has emptied such a ring
+/// repeatedly and leaves only what the producer wrote during the poll
+/// itself; an overflow before the next tick is the kernel's loss counter,
+/// reported as `LOST n events` / `ring_loss` like any other.
 pub const LIVE_POLL_QUANTUM: usize = 4096;
 
+/// Explicit record bound of the post-detach terminal `EVENTS` drain: the
+/// terminal poll takes at most this many records, and backlog past it is
+/// reported as truncation, never silently absorbed. Sixteen live quanta —
+/// several ringfuls at the largest supported ring — so a bound stop is a
+/// real detach-window backlog, not a calibration miss.
+pub const TERMINAL_DRAIN_BOUND: usize = 65536;
+
 /// The bound one poll of the `EVENTS` ring gets: the quantum while producers
-/// can still refill it, none once they are all detached and the drain is
-/// finite. A partially failed detach keeps the ring live, so it keeps the bound.
+/// can still refill it, the explicit terminal bound once they are all
+/// detached. A partially failed detach keeps the ring live, so it keeps
+/// the live bound.
 pub fn poll_quantum(producers_detached: bool) -> Option<usize> {
     if producers_detached {
-        None
+        Some(TERMINAL_DRAIN_BOUND)
     } else {
         Some(LIVE_POLL_QUANTUM)
     }
@@ -404,10 +423,12 @@ impl<S: RecordSource> EventDrain<S> {
         self.domain.as_ref().map_or(0, EventsDomain::id)
     }
 
-    /// Drains up to `quantum` records without blocking; `None` is for a ring
-    /// whose producers are detached, where the drain is finite. Returns
-    /// `true` when it stopped with records possibly still queued — the
-    /// quantum was reached or `f` broke — and `false` once the ring read empty.
+    /// Drains up to `quantum` records without blocking; `None` reads the
+    /// ring whole with no bound. Production always passes an explicit
+    /// bound (`poll_quantum`); unbounded polls are tests pinning drain
+    /// behavior on finite scripts. Returns `true` when it stopped with
+    /// records possibly still queued — the quantum was reached or `f`
+    /// broke — and `false` once the ring read empty.
     pub fn poll(
         &mut self,
         quantum: Option<usize>,
@@ -654,9 +675,15 @@ mod tests {
     }
 
     #[test]
-    fn only_a_fully_detached_ring_is_polled_without_a_quantum() {
+    fn detached_ring_is_polled_with_the_explicit_terminal_bound() {
         assert_eq!(poll_quantum(false), Some(LIVE_POLL_QUANTUM));
-        assert_eq!(poll_quantum(true), None);
+        assert_eq!(poll_quantum(true), Some(TERMINAL_DRAIN_BOUND));
+    }
+
+    #[test]
+    fn terminal_drain_bound_is_sixteen_live_quanta() {
+        assert_eq!(TERMINAL_DRAIN_BOUND, 16 * LIVE_POLL_QUANTUM);
+        assert_eq!(TERMINAL_DRAIN_BOUND, 65536);
     }
 
     #[test]

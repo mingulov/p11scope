@@ -1,0 +1,12 @@
+[package]
+name = "p11scope-bpf-multi"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/mingulov/p11scope"
+description = "uprobe_multi link creation plus bounded poison-offset isolation for p11scope"
+publish = false
+
+[dependencies]
+libc = "0.2"

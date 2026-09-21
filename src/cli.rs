@@ -2,6 +2,7 @@
 //! Command-line parsing for every subcommand: one parser body for profile and
 //! trace, durations with suffixes, hints for removed flags.
 
+use crate::attach::BackendSelection;
 use crate::discovery::hooks::HookRegistry;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -35,7 +36,7 @@ pub struct CaptureArgs {
     pub max_events: Option<u64>,
     /// `--max-scan-pids`: scope members scanned per pass; None ⇒ 256 default.
     pub max_scan_pids: Option<usize>,
-    /// `--ring-bytes`: EVENTS ringbuf size override; None ⇒ 256 KiB default.
+    /// `--ring-bytes`: EVENTS ringbuf size override; None ⇒ 4 MiB default.
     pub ring_bytes: Option<u32>,
     /// `--drain-interval-ms`: capture-loop tick override; None ⇒ per-mode default.
     pub drain_interval: Option<Duration>,
@@ -43,6 +44,8 @@ pub struct CaptureArgs {
     /// `--allow-uretprobe-on-confined-target`: attach uretprobes even when this
     /// kernel is measured to kill a seccomp-confined target for doing so.
     pub allow_confined_uretprobe: bool,
+    /// `--attach-backend`: static attach backend; Auto follows the policy.
+    pub attach_backend: BackendSelection,
 }
 
 /// What `run` is allowed to do to its own child to keep loader discovery from
@@ -72,7 +75,7 @@ pub struct RunArgs {
     pub max_events: Option<u64>,
     /// `--max-scan-pids`: scope members scanned per pass; None ⇒ 256 default.
     pub max_scan_pids: Option<usize>,
-    /// `--ring-bytes`: EVENTS ringbuf size override; None ⇒ 256 KiB default.
+    /// `--ring-bytes`: EVENTS ringbuf size override; None ⇒ 4 MiB default.
     pub ring_bytes: Option<u32>,
     /// `--drain-interval-ms`: capture-loop tick override; None ⇒ per-mode default.
     pub drain_interval: Option<Duration>,
@@ -81,6 +84,8 @@ pub struct RunArgs {
     /// kernel is measured to kill a seccomp-confined target for doing so.
     pub allow_confined_uretprobe: bool,
     pub pause: PausePolicy,
+    /// `--attach-backend`: static attach backend; Auto follows the policy.
+    pub attach_backend: BackendSelection,
     /// `--kill-on-timeout`: `--duration` expiry ends the child too, instead of
     /// handing it back still running.
     pub kill_on_timeout: bool,
@@ -160,11 +165,14 @@ pub const USAGE: &str = "usage:
                    [--unsafe-unvalidated-metadata]
                    [--allow-uretprobe-on-confined-target]
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>]
+                   [--attach-backend auto|multi|singles]
                    [--max-scan-pids <n>]
   p11scope trace   [same scope and discovery options] [--duration <…>] [--max-events <n>] [-o <out.file>]
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>]
+                   [--attach-backend auto|multi|singles]
   p11scope run     [same discovery options] [--mode profile|metrics | --trace] [--duration <…>]
                    [-o <out>] [--pause never|auto|always] [--kill-on-timeout]
+                   [--attach-backend auto|multi|singles]
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>] -- CMD [ARGS...]
   p11scope inspect --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--json]
   p11scope doctor  [--pid <n>] [--cgroup <path>]
@@ -177,6 +185,10 @@ run starts CMD itself and captures exactly that command; it takes no --pid/--cgr
 selects what run may do to its own child while it observes loading: never (default) touches
 nothing, auto only when the child would otherwise load unobserved, always on every load.
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
+--attach-backend selects the static probe backend: auto (default) uses one
+multi-uprobe link per attach group on kernels 6.9+ and per-offset links below,
+multi forces multi (needs 6.6+), singles forces per-offset. Dynamic loader and
+export probes always use per-offset links.
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
 ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
 every descendant (kernel >= 5.15). --system requests whole-machine capture with
@@ -194,6 +206,7 @@ const PROFILE_HELP: &str = "usage:
                    [--unsafe-unvalidated-metadata]
                    [--allow-uretprobe-on-confined-target]
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>]
+                   [--attach-backend auto|multi|singles]
                    [--max-scan-pids <n>]
 
 notes: discovery scans the target's mapped memory — no manifest and no helper are required.
@@ -203,6 +216,10 @@ run starts CMD itself and captures exactly that command; it takes no --pid/--cgr
 selects what run may do to its own child while it observes loading: never (default) touches
 nothing, auto only when the child would otherwise load unobserved, always on every load.
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
+--attach-backend selects the static probe backend: auto (default) uses one
+multi-uprobe link per attach group on kernels 6.9+ and per-offset links below,
+multi forces multi (needs 6.6+), singles forces per-offset. Dynamic loader and
+export probes always use per-offset links.
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
 ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
 every descendant (kernel >= 5.15). --system requests whole-machine capture with
@@ -217,6 +234,7 @@ checked for in-place change during capture (evidence.provider_changed).
 const TRACE_HELP: &str = "usage:
   p11scope trace   [same scope and discovery options] [--duration <…>] [--max-events <n>] [-o <out.file>]
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>]
+                   [--attach-backend auto|multi|singles]
 
 notes: discovery scans the target's mapped memory — no manifest and no helper are required.
 --module narrows the scan to named providers. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
@@ -225,6 +243,10 @@ run starts CMD itself and captures exactly that command; it takes no --pid/--cgr
 selects what run may do to its own child while it observes loading: never (default) touches
 nothing, auto only when the child would otherwise load unobserved, always on every load.
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
+--attach-backend selects the static probe backend: auto (default) uses one
+multi-uprobe link per attach group on kernels 6.9+ and per-offset links below,
+multi forces multi (needs 6.6+), singles forces per-offset. Dynamic loader and
+export probes always use per-offset links.
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
 ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
 every descendant (kernel >= 5.15). --system requests whole-machine capture with
@@ -239,6 +261,7 @@ checked for in-place change during capture (evidence.provider_changed).
 const RUN_HELP: &str = "usage:
   p11scope run     [same discovery options] [--mode profile|metrics | --trace] [--duration <…>]
                    [-o <out>] [--pause never|auto|always] [--kill-on-timeout]
+                   [--attach-backend auto|multi|singles]
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>] -- CMD [ARGS...]
 
 notes: discovery scans the target's mapped memory — no manifest and no helper are required.
@@ -248,6 +271,10 @@ run starts CMD itself and captures exactly that command; it takes no --pid/--cgr
 selects what run may do to its own child while it observes loading: never (default) touches
 nothing, auto only when the child would otherwise load unobserved, always on every load.
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
+--attach-backend selects the static probe backend: auto (default) uses one
+multi-uprobe link per attach group on kernels 6.9+ and per-offset links below,
+multi forces multi (needs 6.6+), singles forces per-offset. Dynamic loader and
+export probes always use per-offset links.
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
 ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
 every descendant (kernel >= 5.15). --system requests whole-machine capture with
@@ -269,6 +296,10 @@ run starts CMD itself and captures exactly that command; it takes no --pid/--cgr
 selects what run may do to its own child while it observes loading: never (default) touches
 nothing, auto only when the child would otherwise load unobserved, always on every load.
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
+--attach-backend selects the static probe backend: auto (default) uses one
+multi-uprobe link per attach group on kernels 6.9+ and per-offset links below,
+multi forces multi (needs 6.6+), singles forces per-offset. Dynamic loader and
+export probes always use per-offset links.
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
 ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
 every descendant (kernel >= 5.15). --system requests whole-machine capture with
@@ -290,6 +321,10 @@ run starts CMD itself and captures exactly that command; it takes no --pid/--cgr
 selects what run may do to its own child while it observes loading: never (default) touches
 nothing, auto only when the child would otherwise load unobserved, always on every load.
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
+--attach-backend selects the static probe backend: auto (default) uses one
+multi-uprobe link per attach group on kernels 6.9+ and per-offset links below,
+multi forces multi (needs 6.6+), singles forces per-offset. Dynamic loader and
+export probes always use per-offset links.
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
 ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
 every descendant (kernel >= 5.15). --system requests whole-machine capture with
@@ -375,6 +410,7 @@ struct Common {
     drain_interval: Option<Duration>,
     unsafe_requested: bool,
     allow_confined_uretprobe: bool,
+    attach_backend: BackendSelection,
 }
 
 impl Common {
@@ -464,6 +500,11 @@ fn capture_option(
                 return Err(usage_err("--drain-interval-ms must be between 5 and 60000"));
             }
             common.drain_interval = Some(Duration::from_millis(ms));
+        }
+        "--attach-backend" => {
+            let v = require_value(args, "--attach-backend")?;
+            common.attach_backend =
+                BackendSelection::from_cli(&v).map_err(|e| usage_err(format!("{e:#}")))?;
         }
         "-o" => common.out = Some(require_value(args, "-o")?.into()),
         "--unsafe-unvalidated-metadata" => common.unsafe_requested = true,
@@ -614,6 +655,7 @@ pub fn parse_capture(
         drain_interval: common.drain_interval,
         unsafe_requested: common.unsafe_requested,
         allow_confined_uretprobe: common.allow_confined_uretprobe,
+        attach_backend: common.attach_backend,
     })
 }
 
@@ -690,6 +732,7 @@ fn parse_run(mut args: impl Iterator<Item = String>) -> Result<RunArgs, CliError
         unsafe_requested: common.unsafe_requested,
         allow_confined_uretprobe: common.allow_confined_uretprobe,
         pause,
+        attach_backend: common.attach_backend,
         kill_on_timeout,
         command,
     })
@@ -1024,6 +1067,50 @@ mod tests {
     }
 
     #[test]
+    fn attach_backend_flag_selects_the_static_backend_on_every_capture_surface() {
+        let Command::Profile(a) = parse(args(&[
+            "profile",
+            "--pid",
+            "42",
+            "--attach-backend",
+            "multi",
+        ]))
+        .unwrap() else {
+            panic!("expected profile")
+        };
+        assert_eq!(a.attach_backend, BackendSelection::Multi);
+        let Command::Trace(a) = parse(args(&[
+            "trace",
+            "--pid",
+            "42",
+            "--attach-backend",
+            "singles",
+        ]))
+        .unwrap() else {
+            panic!("expected trace")
+        };
+        assert_eq!(a.attach_backend, BackendSelection::Singles);
+        let Command::Run(a) =
+            parse(args(&["run", "--attach-backend", "multi", "--", "true"])).unwrap()
+        else {
+            panic!("expected run")
+        };
+        assert_eq!(a.attach_backend, BackendSelection::Multi);
+        let Command::Profile(a) = parse(args(&["profile", "--pid", "42"])).unwrap() else {
+            panic!("expected profile")
+        };
+        assert_eq!(a.attach_backend, BackendSelection::Auto);
+        assert!(matches!(
+            parse(args(&["profile", "--pid", "42", "--attach-backend", "uprobe-multi"])),
+            Err(CliError::Usage(m)) if m.contains("--attach-backend: invalid value")
+        ));
+        assert!(
+            USAGE.contains("--attach-backend"),
+            "help names the backend flag"
+        );
+    }
+
+    #[test]
     fn run_takes_capture_options_a_pause_policy_and_the_trailing_command() {
         let Command::Run(a) = parse(args(&[
             "run",
@@ -1233,8 +1320,8 @@ mod tests {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(1099511628211);
         }
-        assert_eq!(USAGE.len(), 2510);
-        assert_eq!(hash, 0x4bf3078c_379924ef);
+        assert_eq!(USAGE.len(), 2957);
+        assert_eq!(hash, 0xdafc9b52_cc10e6fb);
         assert_eq!(HelpTopic::Global.text(), USAGE);
     }
 

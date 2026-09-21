@@ -18,6 +18,7 @@ pub(crate) mod run;
 pub mod scope;
 pub mod semantics;
 pub mod shapes;
+pub(crate) mod sink;
 pub mod trace;
 pub(crate) mod uretprobe_hazard;
 

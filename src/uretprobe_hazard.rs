@@ -95,14 +95,23 @@ pub(crate) fn decide(
         ),
         (KernelVerdict::Affected(how), None) => format!(
             "this kernel filters the uretprobe trampoline's syscall through seccomp (self-probe: \
-             {how}) and the target's seccomp mode could not be read, so attaching a uretprobe \
-             might kill it"
+             {how}) and the target cannot be shown unconfined (its seccomp mode could not be \
+             read, the scope's targets cannot be enumerated, or an owned run child may confine \
+             itself after attach), so attaching a uretprobe might kill it"
         ),
         (KernelVerdict::Unknown(why), Some(_)) => format!(
             "the target confines syscalls and this kernel could not be shown to exempt the \
              uretprobe trampoline's syscall ({why}), so attaching a uretprobe might kill it"
         ),
-        (KernelVerdict::Unknown(_), None) => return Action::Proceed,
+        // F-01: fail closed. An unproven kernel with a target that cannot be
+        // shown unconfined is the widest blast radius under the weakest
+        // protection; it used to proceed.
+        (KernelVerdict::Unknown(why), None) => format!(
+            "this kernel could not be shown to exempt the uretprobe trampoline's syscall \
+             ({why}) and the target cannot be shown unconfined (its seccomp mode could not \
+             be read, the scope's targets cannot be enumerated, or an owned run child may \
+             confine itself after attach), so attaching a uretprobe might kill it"
+        ),
     };
     if overridden {
         Action::ProceedUnderOverride(reason)
@@ -184,13 +193,26 @@ fn needs_kernel_probe(mode: Option<SeccompMode>) -> bool {
 /// `target` is the single pid a `--pid` capture probes. `None` means the scope
 /// installs probes process-wide (`--cgroup` attaches `AllProcesses` and filters
 /// in BPF), so the set of processes that would run the trampoline cannot be
-/// enumerated and must be treated as possibly confined.
+/// enumerated and must be treated as possibly confined — or an owned `run`
+/// child, which may confine itself after attach.
 pub(crate) fn evaluate(target: Option<u32>, overridden: bool) -> Action {
     let mode = target.and_then(target_seccomp_mode);
+    evaluate_mode(mode, overridden, probe_kernel)
+}
+
+/// The policy half of [`evaluate`], with the kernel verdict injected so the
+/// verdict/target matrix is testable without forking a self-probe — `run`
+/// reaches it as `evaluate_mode(None, …)`, the shape an owned child that
+/// may confine itself after attach requires.
+fn evaluate_mode(
+    mode: Option<SeccompMode>,
+    overridden: bool,
+    probe: impl FnOnce() -> KernelVerdict,
+) -> Action {
     if !needs_kernel_probe(mode) {
         return Action::Proceed;
     }
-    decide(&probe_kernel(), mode, overridden)
+    decide(&probe(), mode, overridden)
 }
 
 /// Runs the self-probe: fork a child, have it refuse the uretprobe syscall,
@@ -325,7 +347,7 @@ fn probe_parent(
         std::num::NonZeroU32::new(child).context("the self-probe child pid must be non-zero")?,
     );
     let link = program
-        .attach(point, "/proc/self/exe", scope)
+        .attach([point], "/proc/self/exe", scope)
         .context("attaching the uretprobe self-probe")?;
 
     drop(release_write); // the child's blocking read returns 0 -> it proceeds
@@ -603,16 +625,72 @@ mod tests {
         ));
     }
 
-    /// An unknown verdict is not a clean one. It only bites a confined target,
-    /// so a failed self-probe cannot break ordinary captures.
+    /// An unknown verdict is not a clean one: it refuses a confined target
+    /// and anything that cannot be shown unconfined. Only a positively
+    /// unconfined target escapes it, so a failed self-probe cannot break
+    /// ordinary captures but can never silently authorize a risky one.
     #[test]
-    fn an_unprovable_kernel_refuses_only_a_confined_target() {
+    fn an_unprovable_kernel_refuses_everything_but_an_unconfined_target() {
         let unknown = KernelVerdict::Unknown("fork failed".to_string());
-        assert!(matches!(
-            decide(&unknown, Some(SeccompMode::Filter), false),
-            Action::Refuse(_)
-        ));
-        assert_eq!(decide(&unknown, None, false), Action::Proceed);
+        for target in [Some(SeccompMode::Strict), Some(SeccompMode::Filter), None] {
+            assert!(
+                matches!(decide(&unknown, target, false), Action::Refuse(_)),
+                "{target:?} must be refused"
+            );
+        }
+        assert_eq!(
+            decide(&unknown, Some(SeccompMode::Disabled), false),
+            Action::Proceed
+        );
+    }
+
+    /// F-01: an Unknown kernel with an unspecified target (`--cgroup` /
+    /// `--system`, whose targets cannot be enumerated) or an unreadable
+    /// one must fail closed — that is the widest blast radius under the
+    /// weakest protection, and it used to proceed.
+    #[test]
+    fn an_unprovable_kernel_with_an_unreadable_target_refuses() {
+        let Action::Refuse(reason) = decide(
+            &KernelVerdict::Unknown("BPF load failed".to_string()),
+            None,
+            false,
+        ) else {
+            panic!("Unknown kernel + unreadable target must refuse");
+        };
+        assert!(
+            reason.contains("might kill it") && reason.contains("BPF load failed"),
+            "the refusal must name the harm and the evidence: {reason}"
+        );
+    }
+
+    /// The complete policy matrix: every kernel verdict against every
+    /// target kind. Clean never refuses; Disabled never refuses; every
+    /// other combination refuses by default.
+    #[test]
+    fn the_full_verdict_target_matrix_fails_closed() {
+        let affected = KernelVerdict::Affected("killed by SIGSYS");
+        let unknown = KernelVerdict::Unknown("fork failed".to_string());
+        for (kernel, target, refuses) in [
+            (&KernelVerdict::Clean, Some(SeccompMode::Disabled), false),
+            (&KernelVerdict::Clean, Some(SeccompMode::Strict), false),
+            (&KernelVerdict::Clean, Some(SeccompMode::Filter), false),
+            (&KernelVerdict::Clean, None, false),
+            (&affected, Some(SeccompMode::Disabled), false),
+            (&affected, Some(SeccompMode::Strict), true),
+            (&affected, Some(SeccompMode::Filter), true),
+            (&affected, None, true),
+            (&unknown, Some(SeccompMode::Disabled), false),
+            (&unknown, Some(SeccompMode::Strict), true),
+            (&unknown, Some(SeccompMode::Filter), true),
+            (&unknown, None, true),
+        ] {
+            let action = decide(kernel, target, false);
+            assert_eq!(
+                matches!(action, Action::Refuse(_)),
+                refuses,
+                "{kernel:?} + {target:?} -> {action:?}"
+            );
+        }
     }
 
     #[test]
@@ -627,6 +705,7 @@ mod tests {
                 KernelVerdict::Unknown("x".to_string()),
                 Some(SeccompMode::Filter),
             ),
+            (KernelVerdict::Unknown("x".to_string()), None),
         ] {
             let Action::Refuse(refused) = decide(&kernel, target, false) else {
                 panic!("{kernel:?}/{target:?} must refuse by default");
@@ -657,6 +736,59 @@ mod tests {
         assert!(
             needs_kernel_probe(None),
             "a scope whose targets cannot be enumerated must still be probed"
+        );
+    }
+
+    /// A pid with no readable status is not unconfined: it feeds the
+    /// fail-closed `None` arm, never a guessed mode.
+    #[test]
+    fn a_pid_without_readable_status_has_no_mode() {
+        assert_eq!(target_seccomp_mode(u32::MAX), None);
+    }
+
+    /// `run`'s exact call shape: an unprovable kernel refuses an owned
+    /// child it cannot show unconfined, and the override converts that
+    /// refusal into a warning with the same reason.
+    #[test]
+    fn an_owned_child_needs_positive_kernel_evidence() {
+        assert!(matches!(
+            evaluate_mode(None, false, || KernelVerdict::Unknown(
+                "BPF load failed".to_string()
+            )),
+            Action::Refuse(_)
+        ));
+        assert!(matches!(
+            evaluate_mode(None, false, || KernelVerdict::Affected(
+                "the probe child was killed by SIGSYS"
+            )),
+            Action::Refuse(_)
+        ));
+        assert_eq!(
+            evaluate_mode(None, false, || KernelVerdict::Clean),
+            Action::Proceed
+        );
+        let Action::Refuse(refused) =
+            evaluate_mode(None, false, || KernelVerdict::Unknown("x".to_string()))
+        else {
+            panic!("an unprovable kernel must refuse an owned child");
+        };
+        let Action::ProceedUnderOverride(warned) =
+            evaluate_mode(None, true, || KernelVerdict::Unknown("x".to_string()))
+        else {
+            panic!("the override must convert the refusal");
+        };
+        assert_eq!(refused, warned, "the override must not soften the reason");
+    }
+
+    /// The probe is only consulted when the target side needs it: an
+    /// unconfined target proceeds without forking anything.
+    #[test]
+    fn an_unconfined_target_never_pays_for_the_fork() {
+        assert_eq!(
+            evaluate_mode(Some(SeccompMode::Disabled), false, || panic!(
+                "an unconfined target must not probe the kernel"
+            )),
+            Action::Proceed
         );
     }
 

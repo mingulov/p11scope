@@ -612,11 +612,11 @@ fn assert_live_discovery_host_contract(
         || run.contains("Session::start(")
         || engine.matches("Session::start(").count() != 1
         || engine
-            .matches("Session::start(\n                    plan,\n                    scope,\n                    pinned,\n                    policy,\n                    pause_generation.take(),\n                    ring_bytes,\n                    owned_child,\n                )")
+            .matches("Session::start(\n                    plan,\n                    scope,\n                    pinned,\n                    policy,\n                    pause_generation.take(),\n                    ring_bytes,\n                    owned_child,\n                    backend,\n                )")
             .count()
             != 1
         || engine
-            .matches("self.start_session_with(policy, None, None, ring_bytes)")
+            .matches("self.start_session_with(policy, None, None, ring_bytes, backend)")
             .count()
             != 1
         || engine
@@ -971,7 +971,14 @@ fn assert_static_descriptor_cookie_contract(
         "pub(crate) fn attach_targets(",
         "pub fn replace_targets",
     )?;
-    require_contract_marker(attach_targets, "prog.attach(point", "Aya uprobe attachment")?;
+    // Multi-point call shape since the vendored Aya p2 backport
+    // (`UProbe::attach(points, ..)`); the guarded property — the Aya
+    // uprobe attachment lives in `attach_targets` — is unchanged.
+    require_contract_marker(
+        attach_targets,
+        "prog.attach([point]",
+        "Aya uprobe attachment",
+    )?;
 
     assert_start_owner_seam(ebpf, owner)?;
 
@@ -2615,6 +2622,42 @@ fn subset_oracle_requires_independent_calls_and_clean_capture() {
 }
 
 #[test]
+fn loss_share_measure_oracle_pins_trace_burst_capacity_and_window() {
+    run_ok(
+        "python3",
+        &[
+            "-I",
+            "tests/python/test_loss_share_measure.py",
+            "-v",
+            "TraceStreamTests",
+            "BurstParseTests",
+            "EventPathTests",
+            "RingBytesTests",
+            "TraceMatchTests",
+            "WindowValidityTests",
+            "LoadavgTests",
+            "SchedulingEvidenceCheckTests",
+            "LossAttributionTests",
+            "CancelProbeTests",
+        ],
+    );
+}
+
+#[test]
+fn audit_oracle_regressions_pin_owned_coverage_and_phase_timers() {
+    run_ok(
+        "python3",
+        &[
+            "-I",
+            "tests/python/test_audit_oracle.py",
+            "-v",
+            "OwnedCoverageTests",
+            "PhaseTimerTests",
+        ],
+    );
+}
+
+#[test]
 fn native_helper_suite_recorded_launcher_requires_authenticated_generations_and_bounded_cleanup() {
     run_native_python_suite(
         "tests/python/test_root_recorded_launcher.py",
@@ -3847,7 +3890,8 @@ fn capture_evidence_checker_self_test() {
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 checker output");
     for marker in [
         "unexpected positive function rejected: OK",
-        "bootstrap function exact count required: OK",
+        "scan-only ordinal label rejected: OK",
+        "scan-only total exact count required: OK",
         "clean metrics multiplier is exact: OK",
         "clean metrics discovery source is exact in all three lanes: OK",
         "lane13 manifest-only shared overlay is exact: OK",
@@ -3924,6 +3968,7 @@ fn every_script_parses_with_sh_n() {
         "scripts/bench-overhead.sh",
         "scripts/build-release.sh",
         "scripts/attach-pod.sh",
+        "scripts/tsprobe.sh",
         "scripts/verify-attach-e2e.sh",
         "scripts/verify-inspect-doctor.sh",
         "scripts/verify-canaries.sh",
@@ -4762,8 +4807,8 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_owned_child_only() {
         "the owned capability fields must remain opaque"
     );
     let armed_engine = engine.replacen(
-        "self.start_session_with(policy, None, None, ring_bytes)",
-        "self.start_owned_session(policy, child)",
+        "self.start_session_with(policy, None, None, ring_bytes, backend)",
+        "self.start_owned_session(policy, child, backend)",
         1,
     );
     assert!(
@@ -7482,11 +7527,24 @@ fn both_capture_loops_wire_behavioral_helpers_and_terminal_publication() {
         assert!(terminal.contains("context.0.settle_terminal_drain();"));
     }
     // Metrics must not consume EVENTS; both live and terminal profile paths gate it.
-    assert!(profile.contains(
-        "if profile {\n                        *consumers.malformed_records += drain_events("
-    ));
+    // The live and terminal call shapes are identical since the readiness
+    // drain, so each region is checked separately: one gated consumer in
+    // the live tick, one in the terminal drain.
+    let (profile_tick, profile_after_loop) = profile
+        .split_once("let mut finish_context =")
+        .expect("profile live/terminal boundary");
+    for (region, source) in [("live", profile_tick), ("terminal", profile_after_loop)] {
+        assert_eq!(
+            source
+                .matches(
+                    "if profile {\n                        *consumers.malformed_records += drain_events(",
+                )
+                .count(),
+            1,
+            "profile {region} gated EVENTS consumer"
+        );
+    }
     assert!(profile.contains("if profile {\n                        (\n                            drain_original_root_events("));
-    assert!(profile.contains("if profile {\n                        *consumers.malformed_records +=\n                            drain_events("));
     let profile_terminal = profile
         .split_once("drain_capture_terminal_with(")
         .unwrap()
@@ -7593,6 +7651,8 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
             version: (2, 40),
             entries: 68,
             source: "scan",
+            file_offset: None,
+            linkage: "heuristic",
         }],
         interfaces: 0,
         skipped: vec![],
@@ -7683,6 +7743,10 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
             modules: vec![module],
             ..DiscoveryEvidence::default()
         },
+        scheduling: p11scope::render::SchedulingEvidence {
+            terminal_drain_bound: 65536,
+            ..Default::default()
+        },
         completeness: "UNKNOWN",
     };
     evidence.verdict();
@@ -7744,6 +7808,7 @@ checker.exact_live_discovery_evidence(document["evidence"])
 checker.exact_module_ownership(document)
 checker.exact_active_to_empty(document)
 checker.exact_capture_modules(document)
+checker.exact_scheduling_evidence(document["evidence"])
 print("accepted")
 "#;
     let accepted = std::process::Command::new("python3")
@@ -7774,6 +7839,29 @@ print("accepted")
     assert!(
         !rejected.status.success(),
         "the checker accepted a document with no loader_discovery"
+    );
+
+    // Same for the scheduling evidence: a document whose loss splits are
+    // missing is not checker-viable either.
+    let mut unscheduled = document.clone();
+    unscheduled["evidence"]
+        .as_object_mut()
+        .unwrap()
+        .remove("scheduling");
+    let unscheduled_path = dir.join("unscheduled.json");
+    fs::write(
+        &unscheduled_path,
+        serde_json::to_vec_pretty(&unscheduled).unwrap(),
+    )
+    .unwrap();
+    let unscheduled_rejected = std::process::Command::new("python3")
+        .args(["-c", driver])
+        .arg(&unscheduled_path)
+        .output()
+        .expect("running python3");
+    assert!(
+        !unscheduled_rejected.status.success(),
+        "the checker accepted a document with no scheduling evidence"
     );
 
     // The unowned row is accepted because it states its reason, not because the
@@ -9013,6 +9101,27 @@ fn the_uretprobe_hazard_row_is_not_a_capability_tier_input() {
     );
     assert!(
         source.contains("\"uretprobe vs seccomp\""),
+        "doctor must still report the row"
+    );
+}
+
+/// Multi is optional with a whole-session singles fallback, so the
+/// self-link row is informational: it must never feed the tier (which
+/// would offline capable-but-old kernels) nor the exit code.
+#[test]
+fn the_multi_self_link_row_is_not_a_capability_tier_input() {
+    let source = read("src/doctor.rs");
+    let tier = source
+        .split_once("fn capability_tier(")
+        .expect("doctor.rs must define capability_tier")
+        .1;
+    let tier = tier.split_once("\nfn ").map_or(tier, |(body, _)| body);
+    assert!(
+        !tier.contains("uprobe-multi"),
+        "capability_tier must not read the multi row: an old kernel is fully capable on singles"
+    );
+    assert!(
+        source.contains("\"uprobe-multi attach (own libc)\""),
         "doctor must still report the row"
     );
 }

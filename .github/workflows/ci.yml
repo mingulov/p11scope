@@ -34,6 +34,10 @@ jobs:
           UNRUN: scripts/dump-owned-bpf-maps.py (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/k8s-profile-entry.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/qualify-task-storage-canary.py (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
+          UNRUN: scripts/system-scope-measure.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
+          UNRUN: scripts/system-scope-sample.py (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
+          UNRUN: scripts/task-1.6-lane-a.py (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/tsprobe.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/lane-build-release-oracle-1.py (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/lane-receipt-lane02-oracle-6.py (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/lane-receipt-lane02-oracle-7.py (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
@@ -74,8 +78,13 @@ jobs:
       # Network acquisition is explicit and precedes every offline validation.
       - run: cargo +1.88 fetch --locked --manifest-path Cargo.toml
       - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
-      - run: cargo +1.88 fetch --locked --manifest-path third-party/src/aya-0.14.0-p1/Cargo.toml
-      - run: cargo +1.88 fetch --locked --manifest-path third-party/src/aya-obj-0.3.0-p1/Cargo.toml
+      # The aya-p2 tree resolves its aya-obj dependency to the sibling p2
+      # tree: its multi-backport needs fields only aya-obj-p2 has, so the
+      # vendored upstream lock (crates.io aya-obj) cannot build it. Both
+      # standalone steps inject that patch and resolve unlocked; the
+      # shipped combination stays locked by the root workspace steps.
+      - run: cargo +1.88 fetch --config 'patch.crates-io.aya-obj.path="third-party/src/aya-obj-0.3.0-p2"' --manifest-path third-party/src/aya-0.14.0-p2/Cargo.toml
+      - run: cargo +1.88 fetch --locked --manifest-path third-party/src/aya-obj-0.3.0-p2/Cargo.toml
       - name: Verify prepared dependency selection
         shell: bash
         run: |
@@ -95,8 +104,8 @@ jobs:
       - name: Aya dependency unit tests
         env:
           CARGO_PROFILE_TEST_OVERFLOW_CHECKS: "true"
-        run: cargo +1.88 test --locked --offline --manifest-path third-party/src/aya-0.14.0-p1/Cargo.toml --target-dir target/aya-tests --lib
-      - run: cargo +1.88 test --locked --offline --manifest-path third-party/src/aya-obj-0.3.0-p1/Cargo.toml --target-dir target/aya-obj-tests --lib
+        run: cargo +1.88 test --offline --config 'patch.crates-io.aya-obj.path="third-party/src/aya-obj-0.3.0-p2"' --manifest-path third-party/src/aya-0.14.0-p2/Cargo.toml --target-dir target/aya-tests --lib
+      - run: cargo +1.88 test --locked --offline --manifest-path third-party/src/aya-obj-0.3.0-p2/Cargo.toml --target-dir target/aya-obj-tests --lib
       - run: cargo +1.88 clippy --locked --offline --workspace --all-targets -- -D warnings
       # libtest exits 0 when a filter matches nothing, so this step proves a test
       # actually ran rather than trusting the source to keep naming one. A rename,
@@ -130,6 +139,7 @@ jobs:
       - run: scripts/build-release.sh --self-test
       - run: scripts/k8s-profile-entry.sh --self-test
       - run: scripts/verify-k8s-attach.sh --self-test
+      - run: scripts/tsprobe.sh --self-test
       - run: scripts/matrix/verify-fork-scope.sh --self-test
       - run: scripts/matrix/verify-ia32-compat.sh --self-test
       - run: scripts/matrix/verify-oracle.sh --self-test
@@ -148,6 +158,8 @@ jobs:
       - run: python3 -I scripts/lane-induced-gaps-oracle-2.py --self-test
       - run: python3 -I scripts/lane-induced-gaps-oracle-3.py --self-test
       - run: python3 -I scripts/lane-induced-gaps-oracle-4.py --self-test
+      - run: python3 -I scripts/task-1.6-lane-a.py --self-test
+      - run: python3 -I scripts/task-1.6-lane-b-sparse-model.py --self-test
       - run: python3 -I tests/python/test_canary_evidence.py --target-bits 32 -v
       - run: python3 -I tests/python/test_canary_evidence.py --target-bits 64 -v
       - run: scripts/verify-inspect-doctor.sh

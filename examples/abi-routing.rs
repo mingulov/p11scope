@@ -510,7 +510,7 @@ fn attach_program(
         .with_context(|| format!("embedded object has no {name} program"))?
         .try_into()?;
     program
-        .attach(point, path, scope)
+        .attach([point], path, scope)
         .with_context(|| format!("attaching {name} to retained fixture"))
 }
 

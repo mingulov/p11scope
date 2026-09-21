@@ -2,8 +2,8 @@
 //! Initial and incremental provider discovery ownership.
 
 use crate::attach::{
-    CapturePolicy, CounterSnapshot, DynamicExportIdentity, DynamicLoaderAttachFailure,
-    OwnedPauseGeneration, Scope, Session,
+    BackendSelection, CapturePolicy, CounterSnapshot, DetachOutcome, DynamicExportIdentity,
+    DynamicLoaderAttachFailure, OwnedPauseGeneration, ReplacementOutcome, Scope, Session,
 };
 use crate::cli::CaptureArgs;
 use crate::discovery::attribution;
@@ -15,12 +15,15 @@ use crate::discovery::identity::{
     retained_object_key, target_paths_equal, view_object_key,
 };
 use crate::discovery::loader::{LoaderContextId, LoaderContextSpec, LoaderRegistry};
+use crate::discovery::noise::DiscoveryNoiseAggregator;
 use crate::discovery::scan::{
     CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedEntry, ScannedInterface, ScannedModule,
     ScannedTable, Skipped, TableIdentity, decode_exact_table, exact_table_addresses,
     exact_table_bytes, index_maps_or_refuse, read_elf_snapshot, read_maps_or_refuse,
-    scan_process_view, scan_process_view_without_memory, spans_for, target_layout,
+    scan_process_view, scan_process_view_without_memory, spans_for, table_evidence_score,
+    table_linkage, target_layout,
 };
+use crate::discovery::scheduler::{DiscoveryScheduler, InventoryCadence, MAX_PENDING_REFRESH};
 use crate::manifest_input::{read_manifest, selection_surface_usable, validate_structure};
 use crate::process::{self, OriginalGenerationState, ProcessView, ProcessViewId};
 use crate::run::OwnedChild;
@@ -42,7 +45,7 @@ use p11scope_manifest::manifest::{
     SelectionNameClass, SelectionRequest, SelectionVersionClass, SurfaceSource, WalkOutcome,
 };
 use p11scope_manifest::maps::{Device, MapEntry, MapIndex, MappedPath, ObjectKey, Resolved};
-use pkcs11_module::LinuxLayout;
+use pkcs11_module::{LinuxLayout, read_function_pointer};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::num::NonZeroU64;
@@ -84,6 +87,7 @@ pub struct Engine {
     counter_snapshot: CounterSnapshot,
     malformed_discovery: u64,
     refresh_requested: BTreeSet<u32>,
+    scheduler: DiscoveryScheduler,
     loader_records_accepted: u64,
     timings: CausalTimings,
     discovery_truncated: u64,
@@ -96,6 +100,10 @@ pub struct Engine {
     pending_leader_exit_views: BTreeSet<ProcessViewId>,
     counted_leader_exit_views: BTreeSet<ProcessViewId>,
     pid_descendant_gaps: u64,
+    /// Multi-group rebuild windows this capture published: one per rebuilt
+    /// group per rebuild transaction. Ungated by scope — a rebuild blinds
+    /// its members wherever the capture runs.
+    multi_rebuild_gaps: u64,
     // Both ledgers are capture-local and bounded by the process-view ceiling;
     // only the scalar crosses the render boundary.
     admitted_cgroup_views: BTreeMap<ProcessViewId, CgroupAdmission>,
@@ -115,6 +123,10 @@ pub struct Engine {
     pending_loader_scans: BTreeMap<PendingLoaderScanKey, u64>,
     selection_claims: BTreeMap<SelectionClaimKey, SelectionClaim>,
     selection_tables: BTreeMap<SelectionTableKey, SelectionTableFact>,
+    /// Task 1.6 experiment: broad admission. Set once from
+    /// `P11SCOPE_BROAD_ADMIT=1` in `discover_plan` (production) or directly
+    /// by broad tests; `false` preserves selected admission everywhere.
+    broad_admit: bool,
     #[cfg(test)]
     loader_memory_scan_attempts: usize,
 }
@@ -325,6 +337,13 @@ struct CaptureHistory {
     /// base above never counted, so it is additive and permanent — mixing it
     /// into the base would let another module's re-derivation subtract it away.
     uncorroborated_tombstones: u64,
+    /// The high-water mark of `plan.uncorroborated_candidates`. The plan's
+    /// counter is current-state — a live merge that bypasses a spilled table
+    /// resolves it — but omission exposure is capture-lifetime evidence: a
+    /// run that spilled and then settled must still report the earlier
+    /// omission, so every merge latches the maximum and `discovery`
+    /// publishes it. Nothing here ever decreases.
+    uncorroborated_candidates: u64,
     scan_unavailable: Option<String>,
     scan_ms: u64,
     vendor_interfaces: usize,
@@ -1491,6 +1510,14 @@ impl CaptureFacts {
                 }
                 let table_fact = (table.version, table.entries.len());
                 let table_occurrence = tables.entry(table_fact).or_insert(0usize);
+                let table_score = table_evidence_score(
+                    table_index,
+                    &module.scanned.tables,
+                    &module.scanned.interfaces,
+                    &[],
+                    &[],
+                );
+                let linkage = table_linkage(&table_score);
                 history
                     .tables
                     .entry(TableOccurrence::Scan {
@@ -1499,10 +1526,21 @@ impl CaptureFacts {
                         entries: table_fact.1,
                         occurrence: *table_occurrence,
                     })
+                    .and_modify(|known| {
+                        // Publication proof is monotonic: a live return
+                        // upgrades the initial heuristic linkage, but a later
+                        // less-informed reading — a view retired with its
+                        // proof — never downgrades a corroborated one.
+                        if known.linkage == "heuristic" && linkage != "heuristic" {
+                            known.linkage = linkage;
+                        }
+                    })
                     .or_insert(plan::TableSummary {
                         version: table_fact.0,
                         entries: table_fact.1,
                         source: "scan",
+                        file_offset: table.file_offset,
+                        linkage,
                     });
                 *table_occurrence += 1;
                 *surface_occurrence += 1;
@@ -1640,6 +1678,8 @@ impl CaptureFacts {
                             .map_or((0, 0), |version| (version.major, version.minor)),
                         entries: surface.functions.len(),
                         source: "manifest",
+                        file_offset: None,
+                        linkage: "manifest",
                     });
                 for (function_index, function) in surface.functions.iter().enumerate() {
                     let key = DecodedOccurrence::ManifestFunction {
@@ -1759,13 +1799,18 @@ impl CaptureFacts {
                 history.fallbacks.entry(key).or_insert(fallback);
             }
         }
-        // Both stay pure high-water marks of what the plan reports. What the
-        // capture-end re-derivation adds or removes is held in
+        // All three stay pure high-water marks of what the plan reports.
+        // What the capture-end re-derivation adds or removes is held in
         // `recorroborated`, and `discovery` combines the two once — a latch
         // that could drop below `current` would let one module's re-derivation
-        // absorb another module's tombstone gap.
+        // absorb another module's tombstone gap. The spill latch below is the
+        // separately-kept history `plan.rs` promises: the plan's counter
+        // resolves on a live merge, this one never does.
         history.conflicts = history.conflicts.max(current.conflicts);
         history.uncorroborated = history.uncorroborated.max(current.uncorroborated);
+        history.uncorroborated_candidates = history
+            .uncorroborated_candidates
+            .max(plan.uncorroborated_candidates);
         history.scan_unavailable = history.scan_unavailable.take().or(current.scan_unavailable);
         history.scan_ms = history.scan_ms.max(current.scan_ms);
         history.vendor_interfaces = history.vendor_interfaces.max(plan.vendor_interfaces);
@@ -1834,6 +1879,12 @@ impl CaptureFacts {
                 .saturating_sub(derived_corroborated)
                 .saturating_add(history.uncorroborated_tombstones),
             module_ambiguous: plan.module_ambiguous as u64,
+            // Lifetime spill exposure: the latched maximum, never below the
+            // current plan — projection paths that skip a merge (restore,
+            // invalidation) must not hide what the engine holds right now.
+            uncorroborated_candidates: history
+                .uncorroborated_candidates
+                .max(plan.uncorroborated_candidates),
             modules_skipped: history.refusals.values().map(skipped_out).collect(),
             manifest_object_fallbacks: history.fallbacks.values().cloned().collect(),
             scan_unavailable: history.scan_unavailable.clone(),
@@ -1929,7 +1980,6 @@ type DiscoveryCollector<'a> =
     dyn FnMut(&mut dyn EngineSession) -> Result<(Vec<DiscoveryRecord>, u64)> + 'a;
 type SlotCompletion = (u32, Option<u64>);
 type TargetAttachResult = (Vec<u32>, Vec<SlotCompletion>);
-type ReplacementAttachResult = (Vec<SlotCompletion>, bool);
 
 /// Exactly the `Session` surface the discovery/pause path already uses. It
 /// exists so the Engine/coordinator lifecycle can be driven without loading a
@@ -1960,8 +2010,8 @@ pub(crate) trait EngineSession {
         plan: &mut plan::AttachPlan,
         replace: &[plan::Slot],
         objects: &PinnedObjects,
-    ) -> Result<ReplacementAttachResult>;
-    fn detach_slots(&mut self, slots: &[plan::Slot]) -> Result<()>;
+    ) -> Result<ReplacementOutcome>;
+    fn detach_slots(&mut self, slots: &[plan::Slot]) -> Result<DetachOutcome>;
     fn has_dynamic_export(
         &self,
         context: LoaderContextId,
@@ -2049,11 +2099,11 @@ impl EngineSession for Session {
         plan: &mut plan::AttachPlan,
         replace: &[plan::Slot],
         objects: &PinnedObjects,
-    ) -> Result<ReplacementAttachResult> {
+    ) -> Result<ReplacementOutcome> {
         Session::replace_targets(self, plan, replace, objects)
     }
 
-    fn detach_slots(&mut self, slots: &[plan::Slot]) -> Result<()> {
+    fn detach_slots(&mut self, slots: &[plan::Slot]) -> Result<DetachOutcome> {
         Session::detach_slots(self, slots)
     }
 
@@ -2850,6 +2900,10 @@ struct DiscoveryCounters {
     corroboration: Vec<(BTreeSet<PinnedObjectId>, &'static str)>,
     /// Stale manifest objects replaced only by exact scan-opened objects.
     manifest_fallbacks: Vec<ManifestFallback>,
+    /// Task 3.2 (S1): per-class stderr-noise accumulator. Buffered during the
+    /// scan, reported once as summaries, then cleared so live accumulation
+    /// starts fresh.
+    noise: DiscoveryNoiseAggregator,
 }
 
 impl DiscoveryCounters {
@@ -3338,8 +3392,17 @@ fn scan_and_pin(
     hooks: &HookRegistry,
     budget: &mut CaptureWorkBudget,
     counters: &mut DiscoveryCounters,
+    broad_admit: bool,
 ) -> Result<(Vec<ScannedModule>, PinnedObjects)> {
-    scan_and_pin_with(view, hints, hooks, budget, counters, scan_process_view)
+    scan_and_pin_with(
+        view,
+        hints,
+        hooks,
+        budget,
+        counters,
+        broad_admit,
+        scan_process_view,
+    )
 }
 
 fn scan_and_pin_without_memory(
@@ -3348,6 +3411,7 @@ fn scan_and_pin_without_memory(
     hooks: &HookRegistry,
     budget: &mut CaptureWorkBudget,
     counters: &mut DiscoveryCounters,
+    broad_admit: bool,
 ) -> Result<(Vec<ScannedModule>, PinnedObjects)> {
     scan_and_pin_with(
         view,
@@ -3355,6 +3419,7 @@ fn scan_and_pin_without_memory(
         hooks,
         budget,
         counters,
+        broad_admit,
         scan_process_view_without_memory,
     )
 }
@@ -3365,6 +3430,7 @@ fn scan_and_pin_with(
     hooks: &HookRegistry,
     budget: &mut CaptureWorkBudget,
     counters: &mut DiscoveryCounters,
+    broad_admit: bool,
     scan: impl FnOnce(
         &ScanRequest<'_>,
         &ProcessView,
@@ -3384,30 +3450,327 @@ fn scan_and_pin_with(
     counters.scan_unavailable = counters.scan_unavailable.or(outcome.unavailable_reason());
     // Retain acquisition losses before pinning can fail on an exited generation.
     for skipped in outcome.skipped() {
-        eprintln!(
-            "{}",
-            format_discovery_skip(&skipped.subject, &skipped.reason)
-        );
+        counters.noise.note_skip(&skipped.subject, &skipped.reason);
         attribution::note(skipped);
         counters.object_skips.push(skipped.clone());
     }
     if let ScanOutcome::Scanned { scan_ms, .. } = &outcome {
         counters.scan_ms = counters.scan_ms.saturating_add(*scan_ms);
     }
-    let (pinned, pin_skips) = pin_scanned_view_objects(view, outcome.modules(), budget)
+    let mut modules = match outcome {
+        ScanOutcome::Scanned { modules, .. } | ScanOutcome::Unavailable { modules, .. } => modules,
+    };
+    // Broad (Task 1.6) augments swept modules with validated fixed-family
+    // tables before pinning, so pinning covers the union with one call.
+    if broad_admit {
+        broad_fixed_pool_pass(view, &mut modules, budget, counters);
+    }
+    let (pinned, pin_skips) = pin_scanned_view_objects(view, &modules, budget)
         .map_err(|error| anyhow!("pinning process view {:?}: {error}", view.id()))?;
     for skipped in pin_skips {
-        eprintln!(
-            "{}",
-            format_discovery_skip(&skipped.subject, &skipped.reason)
-        );
+        counters.noise.note_skip(&skipped.subject, &skipped.reason);
         attribution::note(&skipped);
         counters.object_skips.push(skipped);
     }
-    let modules = match outcome {
-        ScanOutcome::Scanned { modules, .. } | ScanOutcome::Unavailable { modules, .. } => modules,
-    };
     Ok((modules, pinned))
+}
+
+/// Task 1.6 experiment: recognized fixed-family pool layout.
+///
+/// Recognition is name + geometry + per-table decode validation, in that
+/// order: an object exporting `p11scope_fixed` whose 53,760 bytes hold 64
+/// contiguous 840-byte `{3,2}` tables (the owned fixture's contract in
+/// `tests/fixtures/multi-wrapper/provider.c`). Every table validates through
+/// the same bracketed exact-table reader as 1.5 heap publication (maps-A
+/// membership, one bounded mem read, same-decoder decode, maps-B stability,
+/// generation check); a table that fails any of those is refused loudly,
+/// never attached. The symbol lookup intentionally accepts BSS: the pool is
+/// filled by the provider constructor at load, so file bytes never carry it.
+///
+/// What broad does NOT do: unknown-layout builds (no symbol, e.g. the
+/// stripped fixture) stay publication-driven; the sweep's file-backed tables
+/// are never re-read (a pool table the sweep already decoded is skipped as
+/// covered after an entry-equality check); names stay unauthorized (pool
+/// tables are unlinked heuristic evidence — the 1.3 mislabel guard is
+/// untouched). Costs charge through the shared budget like any other read.
+const BROAD_POOL_SYMBOL: &str = "p11scope_fixed";
+const BROAD_POOL_TABLES: usize = 64;
+const BROAD_POOL_TABLE_BYTES: usize = 840;
+const BROAD_POOL_BYTES: usize = BROAD_POOL_TABLES * BROAD_POOL_TABLE_BYTES;
+const BROAD_POOL_VERSION: (u8, u8) = (3, 2);
+
+fn broad_fixed_pool_pass(
+    view: &ProcessView,
+    modules: &mut [ScannedModule],
+    budget: &mut CaptureWorkBudget,
+    counters: &mut DiscoveryCounters,
+) {
+    if !view.still_the_same() {
+        return;
+    }
+    let maps = match Engine::read_maps(view, budget) {
+        Ok(maps) => maps,
+        Err(_) => {
+            broad_note(
+                counters,
+                "broad fixed-family",
+                "the process maps could not be re-read; no fixed-family tables were added",
+            );
+            return;
+        }
+    };
+    let index = match index_maps_or_refuse(&maps, budget) {
+        Ok(index) => index,
+        Err(_) => {
+            broad_note(
+                counters,
+                "broad fixed-family",
+                "the process maps snapshot was refused; no fixed-family tables were added",
+            );
+            return;
+        }
+    };
+    for module in modules.iter_mut() {
+        broad_fixed_pool_module(view, module, &index, budget, counters);
+    }
+}
+
+fn broad_note(counters: &mut DiscoveryCounters, subject: &str, reason: &str) {
+    let skipped = Skipped {
+        subject: subject.to_string(),
+        reason: reason.to_string(),
+    };
+    counters.noise.note_skip(&skipped.subject, &skipped.reason);
+    attribution::note(&skipped);
+    counters.object_skips.push(skipped);
+}
+
+fn broad_fixed_pool_module(
+    view: &ProcessView,
+    module: &mut ScannedModule,
+    index: &MapIndex<'_>,
+    budget: &mut CaptureWorkBudget,
+    counters: &mut DiscoveryCounters,
+) {
+    let Some(abi) = module.decoder_abi else {
+        return;
+    };
+    let layout = target_layout(abi);
+    let relative = match module.path.strip_prefix('/') {
+        Some(relative) => relative,
+        None => return,
+    };
+    let rooted = PathBuf::from(format!("/proc/{}/root", view.pid())).join(relative);
+    let (file, key) = match open_view_object(view, &rooted, budget) {
+        Ok(opened) => opened,
+        Err(_) => return,
+    };
+    if key != module.key {
+        broad_note(
+            counters,
+            &module.path,
+            "broad fixed-family: the object file identity changed under the scan; \
+             no fixed-family tables were added",
+        );
+        return;
+    }
+    let snapshot = match read_elf_snapshot(&file, budget) {
+        Ok(snapshot) => snapshot,
+        Err(_) => return,
+    };
+    let pool_vaddr =
+        match snapshot.defined_symbol_virtual_address(BROAD_POOL_SYMBOL, BROAD_POOL_BYTES) {
+            Ok(Some(vaddr)) => vaddr,
+            // Not a recognized fixed-family build: silence is correct — selected
+            // admission already covered whatever the sweep decoded.
+            Ok(None) => return,
+            Err(reason) => {
+                broad_note(
+                    counters,
+                    &module.path,
+                    &format!("broad fixed-family: {reason}"),
+                );
+                return;
+            }
+        };
+    let bias = match index
+        .entries()
+        .iter()
+        .find(|entry| entry.device == module.key.device && entry.inode == module.key.inode)
+        .and_then(|entry| entry.start.checked_sub(entry.file_offset))
+    {
+        Some(bias) => bias,
+        None => {
+            broad_note(
+                counters,
+                &module.path,
+                "broad fixed-family: no mapping of the object remains; \
+                 no fixed-family tables were added",
+            );
+            return;
+        }
+    };
+    let Some(pool) = bias.checked_add(pool_vaddr) else {
+        broad_note(
+            counters,
+            &module.path,
+            "broad fixed-family: the pool address overflows; \
+             no fixed-family tables were added",
+        );
+        return;
+    };
+    let owned = index.containing(pool).is_some_and(|mapping| {
+        mapping.device == module.key.device && mapping.inode == module.key.inode
+    });
+    if !owned {
+        broad_note(
+            counters,
+            &module.path,
+            "broad fixed-family: the pool address is not mapped by the object; \
+             no fixed-family tables were added",
+        );
+        return;
+    }
+    // Table 0 establishes the stride: without it, stepping is blind.
+    let mut tallies = BroadTallies::default();
+    let mut refused = 0usize;
+    let mut first_reason = None;
+    let stride = match broad_pool_table(view, module, index, budget, pool, layout, &mut tallies) {
+        Ok(stride) => stride,
+        Err(reason) => {
+            broad_note(
+                counters,
+                &module.path,
+                &format!(
+                    "broad fixed-family: pool table 0 refused ({reason}); the pool layout \
+                 is unverified, so no fixed-family tables were added"
+                ),
+            );
+            return;
+        }
+    };
+    if stride != BROAD_POOL_TABLE_BYTES {
+        broad_note(
+            counters,
+            &module.path,
+            &format!(
+                "broad fixed-family: pool table 0 decoded {stride} bytes, not the \
+             {BROAD_POOL_TABLE_BYTES}-byte recipe; no fixed-family tables were added"
+            ),
+        );
+        // Table 0 may already have been added above; drop it — a pool whose
+        // stride is unverified contributes nothing.
+        module.tables.retain(|table| table.address != pool);
+        return;
+    }
+    let mut refused_ordinals = Vec::new();
+    for ordinal in 1..BROAD_POOL_TABLES {
+        let offset = (ordinal as u64).saturating_mul(stride as u64);
+        let Some(address) = pool.checked_add(offset) else {
+            refused += 1;
+            refused_ordinals.push(ordinal);
+            if first_reason.is_none() {
+                first_reason = Some("the pool address overflows".to_string());
+            }
+            continue;
+        };
+        if let Err(reason) =
+            broad_pool_table(view, module, index, budget, address, layout, &mut tallies)
+        {
+            refused += 1;
+            refused_ordinals.push(ordinal);
+            if first_reason.is_none() {
+                first_reason = Some(reason);
+            }
+        }
+    }
+    let first_reason = first_reason.unwrap_or_else(|| "unknown".to_string());
+    eprintln!(
+        "p11scope: discovery: broad fixed-family: {}: {} table(s) added, {} \
+         already covered, {refused} refused at {refused_ordinals:?} \
+         (first reason: {first_reason})",
+        module.path, tallies.added, tallies.covered,
+    );
+    if refused > 0 {
+        counters.notes.push(format!(
+            "broad fixed-family: {} refused {refused} pool table(s) at {refused_ordinals:?}; \
+             first reason: {first_reason}",
+            module.path,
+        ));
+    }
+}
+
+#[derive(Default)]
+struct BroadTallies {
+    covered: usize,
+    added: usize,
+}
+
+/// Validates one pool table through the shared bracketed reader and appends
+/// it unless the sweep already decoded the same bytes. Returns the decoded
+/// table size (the pool stride) on success.
+fn broad_pool_table(
+    view: &ProcessView,
+    module: &mut ScannedModule,
+    index: &MapIndex<'_>,
+    budget: &mut CaptureWorkBudget,
+    address: u64,
+    layout: LinuxLayout,
+    tallies: &mut BroadTallies,
+) -> std::result::Result<usize, String> {
+    let (_, mut table, bytes) = Engine::read_exact_table_bracketed(
+        view, address, layout, index, budget, true,
+    )
+    .map_err(|refusal| match refusal {
+        ExactReadRefusal::Budget => "a decode budget ceiling stopped the validation".to_string(),
+        ExactReadRefusal::Unstable => {
+            "the mappings moved or the generation changed during validation".to_string()
+        }
+        ExactReadRefusal::Unreadable => {
+            "the pool address was unreadable when validated".to_string()
+        }
+        ExactReadRefusal::Undecodable => {
+            "the pool bytes did not decode as a function table".to_string()
+        }
+    })?;
+    if table.version != BROAD_POOL_VERSION {
+        return Err(format!(
+            "pool table version is {:?}, not the {:?} recipe",
+            table.version, BROAD_POOL_VERSION
+        ));
+    }
+    table.file_offset = match index.resolve(address) {
+        Resolved::File {
+            file_offset, inode, ..
+        } if inode != 0 => Some(file_offset),
+        _ => None,
+    };
+    // Pool tables carry no publication evidence: unlinked, no live return,
+    // no manifest support — heuristic evidence with unauthorized names.
+    table.live_return = false;
+    table.manifest_supported = false;
+    if let Some(offset) = table.file_offset {
+        if let Some(known) = module
+            .tables
+            .iter()
+            .find(|known| known.file_offset == Some(offset) && known.version == table.version)
+        {
+            if known.entries == table.entries {
+                tallies.covered += 1;
+                return Ok(bytes.len());
+            }
+            // Same version-word location, different entries: memory is the
+            // live truth, so the pool instance admits alongside — loudly.
+            eprintln!(
+                "p11scope: discovery: broad fixed-family: {}: pool table at file offset \
+                 {offset:#x} diverges from the swept instance; admitting the live bytes",
+                module.path,
+            );
+        }
+    }
+    module.tables.push(table);
+    tallies.added += 1;
+    Ok(bytes.len())
 }
 
 /// A mapping that can carry a PKCS#11 provider: a mapped file whose path
@@ -3516,12 +3879,19 @@ fn sweep_process_maps(pids: &[u32], budget: &mut CaptureWorkBudget) -> Vec<(u32,
 
 /// Discovery for one capture: scan the scope, read and corroborate any manifests,
 /// merge into one plan, pin every object, and record how all of it was found.
+/// Task 1.6 experiment switch, read once per discovery (read-only, so
+/// parallel tests without the variable set always observe `false`).
+fn broad_admit_from_env() -> bool {
+    std::env::var_os("P11SCOPE_BROAD_ADMIT").is_some_and(|value| value == "1")
+}
+
 fn discover_plan(
     a: &CaptureArgs,
     scope: &Scope,
     mut named_view: Option<ProcessView>,
 ) -> Result<Engine> {
     let mut discovered = Engine::empty();
+    discovered.broad_admit = broad_admit_from_env();
     discovered.scope = scope.clone();
     discovered.hooks = a.hooks.clone();
     discovered.module_hints = a.modules.clone();
@@ -3590,6 +3960,7 @@ fn discover_plan(
                     *pid,
                     process::generation_gone(*pid),
                     &format!("the process generation could not be pinned: {error}"),
+                    &mut discovered.base_counters.noise,
                 ) {
                     attribution::note(&skipped);
                     discovered.base_counters.object_skips.push(skipped);
@@ -3609,12 +3980,14 @@ fn discover_plan(
             break;
         }
         let mut counters = DiscoveryCounters::default();
+        let broad_admit = discovered.broad_admit;
         match scan_and_pin(
             &view,
             &a.modules,
             &a.hooks,
             &mut discovered.budget,
             &mut counters,
+            broad_admit,
         ) {
             Ok((found, pins)) => {
                 discovered.scan_inputs.insert(
@@ -3647,10 +4020,12 @@ fn discover_plan(
                     .base_counters
                     .object_skips
                     .extend(counters.object_skips);
+                discovered.base_counters.noise.merge(&counters.noise);
                 if let Some(skipped) = unreadable_member_skip(
                     *pid,
                     view.original_exited() == Ok(true),
                     &format!("the process could not be scanned: {error:#}"),
+                    &mut discovered.base_counters.noise,
                 ) {
                     attribution::note(&skipped);
                     discovered.base_counters.object_skips.push(skipped);
@@ -3688,6 +4063,15 @@ fn discover_plan(
 
     rebuild_discovered(&mut discovered)?;
     discovered.counters.report_notes();
+    // Task 3.2 (S1): one categorical summary per noise class instead of one
+    // line per skipped view. Cleared here so live accumulation starts fresh
+    // and a later rebuild cannot re-merge initial noise.
+    discovered.counters.noise.report();
+    discovered.counters.noise.clear();
+    discovered.base_counters.noise.clear();
+    for input in discovered.scan_inputs.values_mut() {
+        input.counters.noise.clear();
+    }
     for refused in &discovered.plan.modules_skipped {
         eprintln!(
             "{}",
@@ -3698,6 +4082,7 @@ fn discover_plan(
     Ok(discovered)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_current_plan(
     modules: &[ReconciledModule],
     manifests: &[Manifest],
@@ -3706,10 +4091,11 @@ fn build_current_plan(
     corroborated: &BTreeSet<PinnedObjectId>,
     identity_mismatches: usize,
     manifest_fallbacks: usize,
+    broad_admit: bool,
 ) -> Result<plan::AttachPlan> {
     // Every plan reference is a capture-local pinned ID. Raw mapping keys remain
     // evidence only and cannot select an attach fd.
-    let mut plan = plan::build_from_sources(modules, manifests, pinned);
+    let mut plan = plan::build_from_sources_broad(modules, manifests, pinned, broad_admit);
     record_object_skips(&mut plan, &counters.object_skips);
     for object in corroborated {
         if let Some(summary) = plan
@@ -3896,6 +4282,7 @@ fn discovery_evidence(
         conflicts: counters.conflicts,
         uncorroborated: counters.uncorroborated,
         module_ambiguous: plan.module_ambiguous as u64,
+        uncorroborated_candidates: plan.uncorroborated_candidates,
         modules_skipped: plan.modules_skipped.iter().map(skipped_out).collect(),
         manifest_object_fallbacks,
         scan_unavailable: counters.scan_unavailable.map(str::to_string),
@@ -4062,6 +4449,10 @@ const UNREADABLE_MEMBER_SUBJECT: &str = "process view";
 const UNREADABLE_MEMBER_REASON: &str = "a process in scope could not be retained or scanned before it changed; a provider \
      only that generation mapped was never discovered";
 
+/// Pinned by `scan_pin_diagnostics_escape_target_controls`. Production stderr
+/// now aggregates through `DiscoveryNoiseAggregator` (Task 3.2); this format
+/// survives only as the oracle for the escaping contract.
+#[cfg(test)]
 fn format_discovery_skip(subject: &str, reason: &str) -> String {
     format!(
         "p11scope: discovery skipped {} — {}",
@@ -4070,6 +4461,9 @@ fn format_discovery_skip(subject: &str, reason: &str) -> String {
     )
 }
 
+/// Pinned by `unreadable_member_diagnostics_escape_target_controls`.
+/// Production no longer prints per-pid lines (Task 3.2 aggregates scrubbed).
+#[cfg(test)]
 fn format_unreadable_member(pid: u32, detail: &str) -> String {
     format!(
         "p11scope: discovery skipped pid {pid}: {}",
@@ -4089,12 +4483,18 @@ fn format_module_refusal(subject: &str, reason: &str) -> String {
 /// generation is *provably* gone — the ordinary end of a process, on the same
 /// authority `queue_retirement` and the live-record rule already use, and
 /// nothing a capture that keeps running can still observe. Loss stays loss,
-/// and loud, whenever the end cannot be proven.
-fn unreadable_member_skip(pid: u32, gone: bool, detail: &str) -> Option<Skipped> {
+/// and loud, whenever the end cannot be proven. Loud means aggregated (Task
+/// 3.2): the detail is noted to `noise` scrubbed of PIDs, never printed raw.
+fn unreadable_member_skip(
+    pid: u32,
+    gone: bool,
+    detail: &str,
+    noise: &mut DiscoveryNoiseAggregator,
+) -> Option<Skipped> {
     if gone {
         return None;
     }
-    eprintln!("{}", format_unreadable_member(pid, detail));
+    noise.note_unreadable(pid, detail);
     Some(Skipped {
         subject: UNREADABLE_MEMBER_SUBJECT.into(),
         reason: UNREADABLE_MEMBER_REASON.into(),
@@ -4610,6 +5010,7 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
         counters
             .object_skips
             .extend(input.counters.object_skips.clone());
+        counters.noise.merge(&input.counters.noise);
         scan_modules.extend(input.modules.clone());
     }
     let (mut pinned, aggregation_skips) =
@@ -4813,7 +5214,7 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
         }
     }
 
-    let (modules, differed) = bind_scanned_modules(&scan_modules, &mut pinned);
+    let (mut modules, differed) = bind_scanned_modules(&scan_modules, &mut pinned);
     attribution::note_all(&differed);
     counters.object_skips.extend(differed);
     let corroborated =
@@ -4828,6 +5229,26 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
                 pending.object
             );
         };
+        // The manifest structurally agreed with these scan tables — the proof
+        // verified version, name claims, and exact targets — so they inherit
+        // the manifest's name authority ("or-manifest" authorization). Without
+        // this, the mislabel guard would present the replacement's ordinal
+        // labels as `unknown` and the proof could never complete in the plan.
+        for module in modules.iter_mut().filter(|module| {
+            module.scanned.view == pending.candidate.module_view
+                && module.scanned.key == pending.candidate.module_key
+                && module.scanned.path == pending.candidate.module_path
+        }) {
+            for table in module.scanned.tables.iter_mut() {
+                if proof
+                    .tables
+                    .iter()
+                    .any(|bound| bound.address == table.address)
+                {
+                    table.manifest_supported = true;
+                }
+            }
+        }
         if !replacements.insert(replacement) {
             bail!(
                 "more than one stale manifest object maps to the same canonical scanned replacement"
@@ -4842,6 +5263,7 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
         });
     }
     let manifest_fallbacks = counters.manifest_fallbacks.len();
+    let broad_admit = discovered.broad_admit;
     let mut plan = build_current_plan(
         &modules,
         &accepted,
@@ -4850,6 +5272,7 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
         &corroborated,
         identity_mismatches,
         manifest_fallbacks,
+        broad_admit,
     )
     .inspect_err(|_| counters.report_notes())?;
     discovered
@@ -4918,11 +5341,23 @@ fn remove_stale_views(discovered: &mut Engine, stale: &[ProcessViewId]) -> Resul
             subject: "process view".into(),
             reason: STALE_VIEW_REASON.into(),
         };
+        discovered
+            .base_counters
+            .noise
+            .note_skip(&skipped.subject, &skipped.reason);
         attribution::note(&skipped);
         discovered.base_counters.object_skips.push(skipped);
-        eprintln!("p11scope: discovery skipped process view — {STALE_VIEW_REASON}");
     }
     rebuild_discovered(discovered)?;
+    // Stale removals happen during attach preparation, after the initial
+    // report: flush their summaries now so the operator sees them before the
+    // capture starts, and live accumulation starts fresh.
+    discovered.counters.noise.report();
+    discovered.counters.noise.clear();
+    discovered.base_counters.noise.clear();
+    for input in discovered.scan_inputs.values_mut() {
+        input.counters.noise.clear();
+    }
     Ok(removed)
 }
 
@@ -4981,6 +5416,87 @@ fn name_class(class: u8) -> &'static str {
         DISCOVERY_NAME_NULL => "null",
         _ => "unreadable",
     }
+}
+
+/// Outcome of heap-wrapper export lowering: an admitted module, or an
+/// explicit refusal the caller publishes as live loss. Refusals degrade
+/// confidence — they never claim the table is absent.
+enum HeapLowerOutcome {
+    Admitted(ScannedModule),
+    Refused(&'static str),
+}
+
+/// Why one bounded exact-address validation failed. The selection path
+/// collapses these to its historical unit loss; heap-wrapper lowering
+/// publishes each as a distinct live loss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExactReadRefusal {
+    /// No readable mapping contains the table address.
+    Unreadable,
+    /// The bytes at the address are not a function table.
+    Undecodable,
+    /// The mappings moved, or the generation changed, under the read.
+    Unstable,
+    /// A decode budget ceiling stopped the validation.
+    Budget,
+}
+
+/// Attributes a heap/anonymous published table to the provider that
+/// returned it. The table's own mapping names no file, so ownership is
+/// resolved from the factory that published it plus the exact validated
+/// entries: candidates are the scanned modules in this view exporting the
+/// hook symbol, and the winner must also hold entry targets — except the
+/// proxy shape, where the sole factory exporter owns a table pointing
+/// elsewhere. Anything ambiguous refuses: attribution is exact or absent.
+fn resolve_heap_table_owner(
+    hook: &str,
+    view: ProcessViewId,
+    entries: &[ScannedEntry],
+    modules: &[ReconciledModule],
+) -> Option<(ObjectKey, String)> {
+    let exporters: Vec<&ScannedModule> = modules
+        .iter()
+        .map(|module| &module.scanned)
+        .filter(|module| module.view == view && module.exports.iter().any(|name| name == hook))
+        .collect();
+    if exporters.is_empty() {
+        return None;
+    }
+    let holders: Vec<&&ScannedModule> = exporters
+        .iter()
+        .filter(|module| entries.iter().any(|entry| entry.object == module.key))
+        .collect();
+    if holders.len() == 1 {
+        let winner = holders[0];
+        return Some((winner.key, winner.path.clone()));
+    }
+    if holders.is_empty() && exporters.len() == 1 {
+        let winner = exporters[0];
+        return Some((winner.key, winner.path.clone()));
+    }
+    None
+}
+
+/// Decoder layouts for one heap-table exact read, strongest first: the
+/// scanned hook exporters' ABI when they agree, both widths otherwise.
+/// At most two bounded reads; a wrong width fails fast on the version word.
+fn heap_table_layouts(
+    hook: &str,
+    view: ProcessViewId,
+    modules: &[ReconciledModule],
+) -> Vec<LinuxLayout> {
+    let mut abis = BTreeSet::new();
+    for module in modules.iter().map(|module| &module.scanned) {
+        if module.view == view && module.exports.iter().any(|name| name == hook) {
+            if let Some(abi) = module.decoder_abi {
+                abis.insert(abi);
+            }
+        }
+    }
+    if let Some(abi) = abis.iter().next().filter(|_| abis.len() == 1) {
+        return vec![target_layout(*abi)];
+    }
+    vec![LinuxLayout::Lp64, LinuxLayout::Ilp32]
 }
 
 /// Lowers one already-decoded export record through the same table-layout and
@@ -5139,6 +5655,12 @@ fn lower_export_record(
             unpinned: Vec::new(),
             address: record.table_ptr,
             file_offset: Some(table_file_offset),
+            // The provider returned this table through a live export: its
+            // ordinal names carry publication evidence, unlike heuristic decode.
+            live_return: true,
+            // Manifest agreement is derived per rebuild by fallback binding,
+            // never at lowering time.
+            manifest_supported: false,
         }],
         interfaces,
     };
@@ -5146,6 +5668,207 @@ fn lower_export_record(
         return Err("process generation changed during export lowering".into());
     }
     Ok(Some(module))
+}
+
+/// Lowers a published table the file-backed prefix path could not own:
+/// heap/anonymous tables (wrapper `&live->bound`, anonymous-BSS legacy)
+/// and list-element records, which carry the table address but no prefix
+/// by transport contract. Validates the exact returned table through the
+/// same bounded exact-address reader as the selection path (maps-A
+/// membership, one bounded mem read, same-decoder decode, maps-B
+/// stability bracket, generation check), cross-checks a carried prefix
+/// when the record has one, and attributes anonymous tables to the
+/// publishing provider via the ownership contract. File-backed tables
+/// keep their mapping's own owner, so a live element over a swept table
+/// merges onto the scan instance instead of duplicating it.
+///
+/// The lowered interface stays unlinked (`table: None`): the live-return
+/// flag on the table carries the publication evidence, while linkage
+/// stays the sweep's own decoded triples — a live list position never
+/// widens into interface linkage.
+fn lower_heap_export_record(
+    view: &ProcessView,
+    index_a: &MapIndex<'_>,
+    hooks: &HookRegistry,
+    record: &DiscoveryRecord,
+    modules: &[ReconciledModule],
+    budget: &mut CaptureWorkBudget,
+) -> Result<HeapLowerOutcome, String> {
+    // Mirror the file-backed path's validation: this runs only after it
+    // returned None, but a record is never trusted twice — re-derive.
+    if record.kind == DISCOVERY_KIND_INTERFACE_RETURN {
+        return Err("selection record reached export lowering".into());
+    }
+    if !valid_discovery_record(record) {
+        return Err("malformed discovery record reached export lowering".into());
+    }
+    let Some(expected_abi) = export_abi(record.kind) else {
+        return Err("non-export discovery record reached export lowering".into());
+    };
+    let Some((hook_name, abi)) = hooks.by_id(record.symbol_id) else {
+        return Err("export record names an unknown private hook ID".into());
+    };
+    if abi != expected_abi {
+        return Err("export record kind disagrees with its private hook ABI".into());
+    }
+    if !view.still_the_same() {
+        return Err("process generation changed before export lowering".into());
+    }
+    if let Some(reason) = budget.stopped_now() {
+        return Err(reason.into());
+    }
+    budget.spend(1)?;
+
+    // Strongest layout first, at most two bounded reads; the wrong width
+    // fails fast on the version word.
+    let mut refusals = Vec::new();
+    let mut validated = None;
+    for layout in heap_table_layouts(hook_name, view.id(), modules) {
+        match Engine::read_exact_table_bracketed(
+            view,
+            record.table_ptr,
+            layout,
+            index_a,
+            budget,
+            false,
+        ) {
+            Ok(valid) => {
+                validated = Some((layout, valid));
+                break;
+            }
+            Err(refusal) => refusals.push(refusal),
+        }
+    }
+    let Some((layout, (_, mut table, bytes))) = validated else {
+        // The most actionable refusal first: a capture stop, then
+        // instability (the world moved mid-read), then undecodability.
+        let refusal = refusals
+            .iter()
+            .find(|refusal| **refusal == ExactReadRefusal::Budget)
+            .or_else(|| {
+                refusals
+                    .iter()
+                    .find(|refusal| **refusal == ExactReadRefusal::Unstable)
+            })
+            .or(refusals.first());
+        return Ok(HeapLowerOutcome::Refused(match refusal {
+            Some(ExactReadRefusal::Budget) => {
+                "a published table validation stopped at a decode budget ceiling"
+            }
+            Some(ExactReadRefusal::Unstable) => {
+                "a published table moved or the process generation changed during validation"
+            }
+            Some(ExactReadRefusal::Unreadable) => {
+                "a published table address was unreadable when validated"
+            }
+            _ => "a published table's bytes did not decode as a function table",
+        }));
+    };
+
+    // A carried prefix is the probe's observation; the mem read above is
+    // the validator's. Both name the same table, or the table changed
+    // under us — refuse, never blend.
+    let usable = usize::from(record.usable_n);
+    if usable > 0 {
+        if (record.version_major, record.version_minor) != table.version {
+            return Ok(HeapLowerOutcome::Refused(
+                "a published table changed between the probe capture and validation",
+            ));
+        }
+        let mut matches = true;
+        for (ordinal, expected) in record.pointers.iter().take(usable).enumerate() {
+            match read_function_pointer(&bytes, layout, ordinal) {
+                Ok(actual) if actual == *expected => {}
+                _ => {
+                    matches = false;
+                    break;
+                }
+            }
+        }
+        if !matches {
+            return Ok(HeapLowerOutcome::Refused(
+                "a published table changed between the probe capture and validation",
+            ));
+        }
+    }
+
+    // Ownership: a file-backed table names its own file; an anonymous one
+    // is attributed to its publishing provider — exact or absent.
+    let file_owner = match index_a.resolve(record.table_ptr) {
+        Resolved::File {
+            path: MappedPath::Usable(path),
+            device,
+            inode,
+            file_offset,
+            ..
+        } if inode != 0 => Some((
+            ObjectKey { device, inode },
+            path.display().to_string(),
+            file_offset,
+        )),
+        _ => None,
+    };
+    let (key, path) = match file_owner {
+        Some((key, path, file_offset)) => {
+            table.file_offset = Some(file_offset);
+            (key, path)
+        }
+        None => {
+            table.file_offset = None;
+            match resolve_heap_table_owner(hook_name, view.id(), &table.entries, modules) {
+                Some(owner) => owner,
+                None => {
+                    return Ok(HeapLowerOutcome::Refused(
+                        "a published heap table could not be attributed to exactly one provider",
+                    ));
+                }
+            }
+        }
+    };
+
+    // The provider returned this table through a live export: its ordinal
+    // names carry publication evidence, unlike heuristic decode. Manifest
+    // agreement is derived per rebuild by fallback binding, never here.
+    table.live_return = true;
+    table.manifest_supported = false;
+    if matches!(
+        record.kind,
+        DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN | DISCOVERY_KIND_INTERFACE_RETURN
+    ) && !budget.admit_interface()
+    {
+        return Ok(HeapLowerOutcome::Refused(
+            "the interface-record ceiling refused a published list element",
+        ));
+    }
+
+    let interfaces = match record.kind {
+        DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN | DISCOVERY_KIND_INTERFACE_RETURN => {
+            vec![ScannedInterface {
+                index: usize::from(record.interface_index),
+                name_class: name_class(record.name_class),
+                name_lossy: None,
+                name_private: None,
+                flags: record.interface_flags,
+                // Unlinked by contract (see above): no widening.
+                table: None,
+            }]
+        }
+        _ => Vec::new(),
+    };
+    let module = ScannedModule {
+        view: view.id(),
+        mount_namespace: view.mount_namespace(),
+        key,
+        path,
+        decoder_abi: None,
+        exports: vec![hook_name.to_string()],
+        tables: vec![table],
+        interfaces,
+    };
+    if !view.still_the_same() {
+        return Err("process generation changed during export lowering".into());
+    }
+    Ok(HeapLowerOutcome::Admitted(module))
 }
 
 fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedModule) {
@@ -5177,10 +5900,19 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
     let mut table_indices = Vec::new();
     for table in incoming.tables.drain(..) {
         let index = existing.tables.iter().position(|known| *known == table);
-        table_indices.push(index.unwrap_or_else(|| {
-            existing.tables.push(table);
-            existing.tables.len() - 1
-        }));
+        table_indices.push(match index {
+            Some(index) => {
+                // Same table seen twice: publication evidence unions —
+                // whichever instance observed it, the table was observed.
+                existing.tables[index].live_return |= table.live_return;
+                existing.tables[index].manifest_supported |= table.manifest_supported;
+                index
+            }
+            None => {
+                existing.tables.push(table);
+                existing.tables.len() - 1
+            }
+        });
     }
     for mut interface in incoming.interfaces.drain(..) {
         interface.table = interface
@@ -6051,6 +6783,7 @@ impl Engine {
             counter_snapshot: CounterSnapshot::default(),
             malformed_discovery: 0,
             refresh_requested: BTreeSet::new(),
+            scheduler: DiscoveryScheduler::new(),
             loader_records_accepted: 0,
             timings: CausalTimings::default(),
             discovery_truncated: 0,
@@ -6063,6 +6796,7 @@ impl Engine {
             pending_leader_exit_views: BTreeSet::new(),
             counted_leader_exit_views: BTreeSet::new(),
             pid_descendant_gaps: 0,
+            multi_rebuild_gaps: 0,
             admitted_cgroup_views: BTreeMap::new(),
             unmatched_leader_exit_events: BTreeSet::new(),
             cgroup_ingress_overflow: false,
@@ -6073,6 +6807,7 @@ impl Engine {
             selection_tables: BTreeMap::new(),
             loader_contexts: BTreeMap::new(),
             pending_loader_scans: BTreeMap::new(),
+            broad_admit: false,
             #[cfg(test)]
             loader_memory_scan_attempts: 0,
         }
@@ -6184,6 +6919,10 @@ impl Engine {
         } else {
             0
         }
+    }
+
+    pub(crate) fn multi_rebuild_gaps(&self) -> u64 {
+        self.multi_rebuild_gaps
     }
 
     /// Scopes that admit process generations over time: cgroup membership and
@@ -6880,6 +7619,65 @@ impl Engine {
         }
     }
 
+    /// Applies one multi-group rebuild report with the existing conservative
+    /// rules: recompleted survivors record fresh completions through the
+    /// same records fresh attach uses, failed survivors deactivate and
+    /// record failures exactly like failed fresh targets, and every rebuilt
+    /// group counts a published gap window. Detach proves no callback
+    /// quiescence and the task+slot pairing key carries no attachment
+    /// generation, so every rebuild also publishes pairing uncertainty for
+    /// calls in flight across the window; the next call on the task+slot
+    /// pairs fresh once the stale start is consumed. A report member the
+    /// plan cannot resolve is never applied silently.
+    fn apply_group_rebuild(
+        &mut self,
+        plan: &mut plan::AttachPlan,
+        owners: &BTreeMap<plan::ModuleId, PinnedTimingKey>,
+        report: DetachOutcome,
+        outcome: &mut ApplyOutcome,
+    ) {
+        let DetachOutcome {
+            recompleted,
+            rebuild_failures,
+            rebuilt_groups,
+        } = report;
+        if rebuilt_groups == 0 && recompleted.is_empty() && rebuild_failures.is_empty() {
+            return;
+        }
+        for index in recompleted
+            .iter()
+            .map(|(index, _)| index)
+            .chain(rebuild_failures.iter().map(|(index, _)| index))
+        {
+            if !plan.slots.iter().any(|slot| slot.index == *index) {
+                self.mark_partial(
+                    "multi group rebuild",
+                    "a rebuilt slot has no plan entry; its reactivation is unrecorded",
+                );
+            }
+        }
+        outcome.record_completions(&plan.slots, owners, recompleted);
+        for (index, _) in &rebuild_failures {
+            if let Some(slot) = plan.slots.iter().find(|slot| slot.index == *index).cloned() {
+                outcome
+                    .static_failures
+                    .extend(slot_timing_keys(&slot, owners));
+                plan.deactivate(*index);
+            }
+        }
+        self.multi_rebuild_gaps = self.multi_rebuild_gaps.saturating_add(rebuilt_groups);
+        if !rebuild_failures.is_empty() {
+            self.mark_partial(
+                "multi group rebuild",
+                "rebuilt-group survivors failed to reattach and were deactivated",
+            );
+        }
+        self.mark_partial(
+            "multi group rebuild",
+            "one or more groups rebuilt; calls in flight across the rebuild window may pair entry and return across attachment generations",
+        );
+    }
+
     /// The live path's `/proc/<pid>/maps` snapshot: the scan path's bounded
     /// reader, refused whole when any ceiling or the batch deadline cuts it
     /// (`read_maps_or_refuse`). Every caller turns `Err` into a refused
@@ -7047,12 +7845,13 @@ impl Engine {
         module_hints: &[PathBuf],
         hooks: &HookRegistry,
         budget: &mut CaptureWorkBudget,
+        broad_admit: bool,
     ) -> (
         Result<(Vec<ScannedModule>, PinnedObjects)>,
         DiscoveryCounters,
     ) {
         Self::scan_retained_view_with(|counters| {
-            scan_and_pin(view, module_hints, hooks, budget, counters)
+            scan_and_pin(view, module_hints, hooks, budget, counters, broad_admit)
         })
     }
 
@@ -7061,13 +7860,33 @@ impl Engine {
         module_hints: &[PathBuf],
         hooks: &HookRegistry,
         budget: &mut CaptureWorkBudget,
+        broad_admit: bool,
     ) -> (
         Result<(Vec<ScannedModule>, PinnedObjects)>,
         DiscoveryCounters,
     ) {
         Self::scan_retained_view_with(|counters| {
-            scan_and_pin_without_memory(view, module_hints, hooks, budget, counters)
+            scan_and_pin_without_memory(view, module_hints, hooks, budget, counters, broad_admit)
         })
+    }
+
+    /// Enqueues one lifecycle/loader refresh request on the bounded pending
+    /// queue (Task 3.1b). Past the cap the excess request is dropped with
+    /// explicit truncation evidence — the queue never grows unbounded.
+    /// Re-requesting an already-queued pid is free.
+    fn request_refresh(&mut self, pid: u32) {
+        if self.refresh_requested.contains(&pid) {
+            return;
+        }
+        if self.refresh_requested.len() >= MAX_PENDING_REFRESH {
+            self.discovery_truncated = self.discovery_truncated.saturating_add(1);
+            self.mark_live_loss(
+                "live discovery refresh",
+                "refresh requests exceeded the bounded pending queue; excess requests were dropped",
+            );
+            return;
+        }
+        self.refresh_requested.insert(pid);
     }
 
     fn defer_loader_memory_scan(&mut self, key: PendingLoaderScanKey, hook_ts_ns: u64) {
@@ -7131,6 +7950,7 @@ impl Engine {
         self.counters.scan_unavailable =
             self.counters.scan_unavailable.or(counters.scan_unavailable);
         self.counters.scan_ms = self.counters.scan_ms.saturating_add(counters.scan_ms);
+        self.counters.noise.merge(&counters.noise);
         // An acquisition failure has already happened. Keep it even if later
         // inventory construction fails or normal exit suppresses a generic gap.
         for skipped in &counters.object_skips {
@@ -7310,9 +8130,10 @@ impl Engine {
                 self.counters.object_skips.push(skip);
             }
         }
-        let mut rebuilt = self
-            .plan
-            .rebuild_from_sources(&modules, &self.manifests, &pinned);
+        let broad_admit = self.broad_admit;
+        let mut rebuilt =
+            self.plan
+                .rebuild_from_sources_broad(&modules, &self.manifests, &pinned, broad_admit);
         self.capture_facts.bind_plan_module_ids(
             &mut rebuilt,
             &modules,
@@ -7668,7 +8489,13 @@ impl Engine {
             .chain(&candidate.delta.replace)
             .cloned()
             .collect();
-        let detach_failed = session.detach_slots(&selected).is_err();
+        let detach_failed = match session.detach_slots(&selected) {
+            Ok(report) => {
+                self.apply_group_rebuild(&mut candidate.plan, &timing_owners, report, &mut outcome);
+                false
+            }
+            Err(_) => true,
+        };
         if detach_failed {
             *additions_allowed = false;
             outcome
@@ -7713,12 +8540,20 @@ impl Engine {
                             .filter(|slot| failed.contains(&slot.index))
                             .cloned()
                             .collect();
-                        if session.detach_slots(&failed_slots).is_err() {
-                            *additions_allowed = false;
-                            self.mark_partial(
-                                "live discovery detach",
-                                "a partial new-slot detach failed once and was not retried",
-                            );
+                        match session.detach_slots(&failed_slots) {
+                            Ok(report) => self.apply_group_rebuild(
+                                &mut candidate.plan,
+                                &timing_owners,
+                                report,
+                                &mut outcome,
+                            ),
+                            Err(_) => {
+                                *additions_allowed = false;
+                                self.mark_partial(
+                                    "live discovery detach",
+                                    "a partial new-slot detach failed once and was not retried",
+                                );
+                            }
                         }
                         for slot in failed_slots {
                             outcome
@@ -7760,11 +8595,22 @@ impl Engine {
                 };
                 generation_lost |= replacement_stale;
                 match replacement {
-                    Some(Ok((completed, failed_detach))) => {
+                    Some(Ok(replacement)) => {
+                        let ReplacementOutcome {
+                            completed,
+                            failed_detach,
+                            rebuild,
+                        } = replacement;
                         outcome.record_completions(
                             &candidate.delta.replace,
                             &timing_owners,
                             completed,
+                        );
+                        self.apply_group_rebuild(
+                            &mut candidate.plan,
+                            &timing_owners,
+                            rebuild,
+                            &mut outcome,
                         );
                         if failed_detach {
                             *additions_allowed = false;
@@ -7861,7 +8707,13 @@ impl Engine {
         if retired {
             *additions_allowed = false;
             outcome.static_failures.extend(target_modules);
-            self.retire_stale_candidate_sources(session, &mut candidate, &outcome.stale_views);
+            let stale_views = outcome.stale_views.clone();
+            self.retire_stale_candidate_sources(
+                session,
+                &mut candidate,
+                &stale_views,
+                &mut *outcome,
+            );
             self.mark_partial(
                 "live discovery generation",
                 "a process generation changed after link mutation; its targets were retired before context cleanup",
@@ -7940,11 +8792,22 @@ impl Engine {
                     })
                     .cloned()
                     .collect();
-                if session.detach_slots(&detach).is_err() {
-                    self.mark_partial(
-                        "live interface selection",
-                        "a refused selection table could not detach one-shot additions",
-                    );
+                match session.detach_slots(&detach) {
+                    Ok(report) => {
+                        let owners = candidate_timing_owners(&candidate);
+                        self.apply_group_rebuild(
+                            &mut candidate.plan,
+                            &owners,
+                            report,
+                            &mut *outcome,
+                        );
+                    }
+                    Err(_) => {
+                        self.mark_partial(
+                            "live interface selection",
+                            "a refused selection table could not detach one-shot additions",
+                        );
+                    }
                 }
                 for slot in detach {
                     candidate.plan.deactivate(slot.index);
@@ -8056,11 +8919,17 @@ impl Engine {
                 })
                 .cloned()
                 .collect();
-            if session.detach_slots(&rollback).is_err() {
-                self.mark_partial(
-                    "offline interface selection",
-                    "a failed manifest selection table could not detach its successful prefix",
-                );
+            match session.detach_slots(&rollback) {
+                Ok(report) => {
+                    let owners = candidate_timing_owners(&candidate);
+                    self.apply_group_rebuild(&mut candidate.plan, &owners, report, &mut *outcome);
+                }
+                Err(_) => {
+                    self.mark_partial(
+                        "offline interface selection",
+                        "a failed manifest selection table could not detach its successful prefix",
+                    );
+                }
             }
             for slot in rollback {
                 candidate.plan.deactivate(slot.index);
@@ -8114,6 +8983,7 @@ impl Engine {
         session: &mut dyn EngineSession,
         candidate: &mut LiveCandidate,
         stale_views: &BTreeSet<ProcessViewId>,
+        outcome: &mut ApplyOutcome,
     ) {
         // A binding belongs to one process view even when its physical target is
         // shared with another view. Retire the binding itself before dropping
@@ -8159,9 +9029,13 @@ impl Engine {
                     file_offset: target.file_offset,
                 })
                 .collect();
-        let inventory_plan =
-            self.plan
-                .rebuild_from_sources(&cleaned_modules, &self.manifests, &cleaned_pins);
+        let broad_admit = self.broad_admit;
+        let inventory_plan = self.plan.rebuild_from_sources_broad(
+            &cleaned_modules,
+            &self.manifests,
+            &cleaned_pins,
+            broad_admit,
+        );
         let inventory_keys: BTreeSet<_> = inventory_plan
             .slots
             .iter()
@@ -8187,11 +9061,19 @@ impl Engine {
             })
             .cloned()
             .collect();
-        if !orphaned_selection.is_empty() && session.detach_slots(&orphaned_selection).is_err() {
-            self.mark_partial(
-                "live discovery detach",
-                "stale selection claims lost their final owner but one link detach failed",
-            );
+        if !orphaned_selection.is_empty() {
+            match session.detach_slots(&orphaned_selection) {
+                Ok(report) => {
+                    let owners = candidate_timing_owners(candidate);
+                    self.apply_group_rebuild(&mut candidate.plan, &owners, report, &mut *outcome);
+                }
+                Err(_) => {
+                    self.mark_partial(
+                        "live discovery detach",
+                        "stale selection claims lost their final owner but one link detach failed",
+                    );
+                }
+            }
         }
         for slot in orphaned_selection {
             candidate.plan.deactivate(slot.index);
@@ -8199,11 +9081,17 @@ impl Engine {
         let retired = candidate
             .plan
             .retire_unpinned_targets(&cleaned_pins, self.plan.slots.len());
-        if session.detach_slots(&retired).is_err() {
-            self.mark_partial(
-                "live discovery detach",
-                "generation loss cleanup had a one-shot detach failure",
-            );
+        match session.detach_slots(&retired) {
+            Ok(report) => {
+                let owners = candidate_timing_owners(candidate);
+                self.apply_group_rebuild(&mut candidate.plan, &owners, report, &mut *outcome);
+            }
+            Err(_) => {
+                self.mark_partial(
+                    "live discovery detach",
+                    "generation loss cleanup had a one-shot detach failure",
+                );
+            }
         }
         commit_cleaned_candidate_identity(candidate, cleaned_pins, cleaned_modules, stale_views);
     }
@@ -8272,7 +9160,7 @@ impl Engine {
         }
         let pid = (record.pid_tgid >> 32) as u32;
         let Some(position) = self.views.iter().position(|view| view.pid() == pid) else {
-            self.refresh_requested.insert(pid);
+            self.request_refresh(pid);
             self.mark_live_loss(
                 "live export discovery",
                 "an export record had no retained process generation",
@@ -8286,16 +9174,31 @@ impl Engine {
             let maps = Self::read_maps(view, &mut self.budget)?;
             let index =
                 index_maps_or_refuse(&maps, &mut self.budget).map_err(|error| anyhow!(error))?;
-            lower_export_record(view, &index, &self.hooks, record, &mut self.budget)
-        };
-        let Some(lowered) = lowered.map_err(|error| anyhow!(error))? else {
-            self.mark_live_loss(
-                "live export discovery",
-                "an export table had no usable exact file-backed owner and prefix",
-            );
-            return Ok(DiscoveryRecordOutcome::Rejected(
-                RecordRejection::ExportNoLowerableOwner,
-            ));
+            match lower_export_record(view, &index, &self.hooks, record, &mut self.budget) {
+                Err(error) => return Err(anyhow!(error)),
+                Ok(Some(module)) => module,
+                // The prefix path owns file-backed tables only; anything a
+                // factory published that it cannot own — heap wrappers,
+                // anonymous-BSS tables, bare list-element addresses —
+                // validates through the heap contract instead.
+                Ok(None) => match lower_heap_export_record(
+                    view,
+                    &index,
+                    &self.hooks,
+                    record,
+                    &self.modules,
+                    &mut self.budget,
+                ) {
+                    Err(error) => return Err(anyhow!(error)),
+                    Ok(HeapLowerOutcome::Admitted(module)) => module,
+                    Ok(HeapLowerOutcome::Refused(reason)) => {
+                        self.mark_live_loss("live export discovery", reason);
+                        return Ok(DiscoveryRecordOutcome::Rejected(
+                            RecordRejection::ExportNoLowerableOwner,
+                        ));
+                    }
+                },
+            }
         };
         let (pins, pin_skips) = {
             let view = &self.views[position];
@@ -8342,18 +9245,21 @@ impl Engine {
         if mode == LoaderScanMode::Memory {
             self.loader_memory_scan_attempts = self.loader_memory_scan_attempts.saturating_add(1);
         }
+        let broad_admit = self.broad_admit;
         let (scan_result, scan_counters) = match mode {
             LoaderScanMode::Memory => Self::scan_retained_view(
                 &self.views[position],
                 &self.module_hints,
                 &self.hooks,
                 &mut self.budget,
+                broad_admit,
             ),
             LoaderScanMode::MetadataOnly => Self::scan_retained_view_without_memory(
                 &self.views[position],
                 &self.module_hints,
                 &self.hooks,
                 &mut self.budget,
+                broad_admit,
             ),
         };
         let mut skipped = self.absorb_scan_counters(scan_counters);
@@ -8585,7 +9491,7 @@ impl Engine {
         }
         let pid = (record.pid_tgid >> 32) as u32;
         let Some(position) = self.views.iter().position(|view| view.pid() == pid) else {
-            self.refresh_requested.insert(pid);
+            self.request_refresh(pid);
             self.reject_loader_record("a loader hit had no retained process generation");
             return Ok(DiscoveryRecordOutcome::Rejected(
                 RecordRejection::LoaderNoRetainedView,
@@ -9398,75 +10304,144 @@ impl Engine {
     ) -> std::result::Result<(MapEntry, ScannedTable), ()> {
         let maps_a = Self::read_maps(view, budget).map_err(|_| ())?;
         let index_a = index_maps_or_refuse(&maps_a, budget).map_err(|_| ())?;
-        let mapping_a = index_a.containing(address).cloned().ok_or(())?;
+        Self::read_exact_table_bracketed(view, address, layout, &index_a, budget, false)
+            .map(|(mapping, table, _)| (mapping, table))
+            .map_err(|_| ())
+    }
+
+    /// Bounded exact-address table validation, shared by the selection path
+    /// and heap-wrapper export lowering: maps-A membership, one bounded mem
+    /// read (version word first, then the exact table extent), same-decoder
+    /// decode against index A, then the maps-B stability bracket plus the
+    /// generation check. Returns the containing mapping, the decoded table,
+    /// and the raw table bytes (publication cross-checks need them).
+    ///
+    /// `allow_span` (broad fixed-family only) permits the table extent to
+    /// cover a run of contiguous readable mappings instead of one: a fixed
+    /// pool legitimately crosses the file-tail/anonymous-BSS split. The run
+    /// is contiguity-checked mapping by mapping, fully decoded (104
+    /// executable entries stay the content anchor), and every touched
+    /// mapping is stability-bracketed — same contract, wider extent.
+    fn read_exact_table_bracketed(
+        view: &ProcessView,
+        address: u64,
+        layout: LinuxLayout,
+        index_a: &MapIndex,
+        budget: &mut CaptureWorkBudget,
+        allow_span: bool,
+    ) -> std::result::Result<(MapEntry, ScannedTable, Vec<u8>), ExactReadRefusal> {
+        let mapping_a = index_a
+            .containing(address)
+            .cloned()
+            .ok_or(ExactReadRefusal::Unreadable)?;
         if mapping_a.permissions[0] != b'r' {
-            return Err(());
+            return Err(ExactReadRefusal::Unreadable);
         }
         let mem = view
             .run_while_same(|| File::open(format!("/proc/{}/mem", view.pid())))
-            .map_err(|_| ())?
-            .map_err(|_| ())?;
+            .map_err(|_| ExactReadRefusal::Unreadable)?
+            .map_err(|_| ExactReadRefusal::Unreadable)?;
         let width = layout.word_bytes();
         let mut bytes = vec![0; width];
         let mut operation_bytes = 0u64;
-        let mut read_exact = |bytes: &mut [u8], base: u64| -> Result<(), ()> {
-            let mut done = 0usize;
-            while done < bytes.len() {
-                if budget.check_deadline_now().is_some() {
-                    return Err(());
+        let mut read_exact =
+            |bytes: &mut [u8], base: u64| -> std::result::Result<(), ExactReadRefusal> {
+                let mut done = 0usize;
+                while done < bytes.len() {
+                    if budget.check_deadline_now().is_some() {
+                        return Err(ExactReadRefusal::Budget);
+                    }
+                    let allowed = budget.allowed_io(operation_bytes, bytes.len() - done);
+                    if allowed == 0 {
+                        return Err(ExactReadRefusal::Budget);
+                    }
+                    let at = base
+                        .checked_add(done as u64)
+                        .ok_or(ExactReadRefusal::Unstable)?;
+                    let read = mem
+                        .read_at(&mut bytes[done..done + allowed], at)
+                        .map_err(|_| ExactReadRefusal::Unstable)?;
+                    if read == 0 {
+                        return Err(ExactReadRefusal::Unstable);
+                    }
+                    budget.record_io(read);
+                    operation_bytes = operation_bytes.saturating_add(read as u64);
+                    done += read;
                 }
-                let allowed = budget.allowed_io(operation_bytes, bytes.len() - done);
-                if allowed == 0 {
-                    return Err(());
-                }
-                let at = base.checked_add(done as u64).ok_or(())?;
-                let read = mem
-                    .read_at(&mut bytes[done..done + allowed], at)
-                    .map_err(|_| ())?;
-                if read == 0 {
-                    return Err(());
-                }
-                budget.record_io(read);
-                operation_bytes = operation_bytes.saturating_add(read as u64);
-                done += read;
-            }
-            Ok(())
-        };
+                Ok(())
+            };
         read_exact(&mut bytes, address)?;
-        let table_bytes = exact_table_bytes(&bytes, layout).ok_or(())?;
-        let table_end = address.checked_add(table_bytes as u64).ok_or(())?;
+        let table_bytes = exact_table_bytes(&bytes, layout).ok_or(ExactReadRefusal::Undecodable)?;
+        let table_end = address
+            .checked_add(table_bytes as u64)
+            .ok_or(ExactReadRefusal::Undecodable)?;
+        // Mappings the table extent touches: one, or a contiguous readable
+        // run when the caller allows a span. Every touched mapping joins
+        // the maps-B stability check below.
+        let mut span = vec![mapping_a.clone()];
         if table_end > mapping_a.end {
-            return Err(());
+            if !allow_span {
+                return Err(ExactReadRefusal::Undecodable);
+            }
+            let mut cursor = mapping_a.end;
+            while cursor < table_end {
+                let Some(next) = index_a.containing(cursor).cloned() else {
+                    return Err(ExactReadRefusal::Undecodable);
+                };
+                if next.start != cursor || next.permissions[0] != b'r' {
+                    return Err(ExactReadRefusal::Undecodable);
+                }
+                cursor = next.end;
+                span.push(next);
+                if span.len() > index_a.entries().len() {
+                    return Err(ExactReadRefusal::Undecodable);
+                }
+            }
         }
         bytes.resize(table_bytes, 0);
         if table_bytes > width {
             read_exact(
                 &mut bytes[width..],
-                address.checked_add(width as u64).ok_or(())?,
+                address
+                    .checked_add(width as u64)
+                    .ok_or(ExactReadRefusal::Unstable)?,
             )?;
         }
-        let raw_addresses = exact_table_addresses(&bytes, layout).ok_or(())?;
+        let raw_addresses =
+            exact_table_addresses(&bytes, layout).ok_or(ExactReadRefusal::Undecodable)?;
         let mut addresses = Vec::with_capacity(raw_addresses.len() + 1);
         addresses.push(address);
         addresses.extend(raw_addresses);
         let mappings_a: Vec<_> = addresses
             .iter()
-            .map(|address| index_a.containing(*address).cloned().ok_or(()))
+            .map(|address| {
+                index_a
+                    .containing(*address)
+                    .cloned()
+                    .ok_or(ExactReadRefusal::Undecodable)
+            })
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let table = decode_exact_table(&bytes, address, layout, &index_a, budget)
-            .map_err(|_| ())?
-            .ok_or(())?;
-        let maps_b = Self::read_maps(view, budget).map_err(|_| ())?;
-        let index_b = index_maps_or_refuse(&maps_b, budget).map_err(|_| ())?;
+        let table =
+            match decode_exact_table(&bytes, address, layout, index_a, budget, Some(view.id())) {
+                Err(()) => return Err(ExactReadRefusal::Budget),
+                Ok(None) => return Err(ExactReadRefusal::Undecodable),
+                Ok(Some(table)) => table,
+            };
+        let maps_b = Self::read_maps(view, budget).map_err(|_| ExactReadRefusal::Unstable)?;
+        let index_b =
+            index_maps_or_refuse(&maps_b, budget).map_err(|_| ExactReadRefusal::Unstable)?;
         if !mappings_a
             .iter()
             .zip(&addresses)
             .all(|(mapping, address)| index_b.containing(*address) == Some(mapping))
+            || !span
+                .iter()
+                .all(|mapping| index_b.containing(mapping.start) == Some(mapping))
             || !view.still_the_same()
         {
-            return Err(());
+            return Err(ExactReadRefusal::Unstable);
         }
-        Ok((mapping_a, table))
+        Ok((mapping_a, table, bytes))
     }
 
     fn collect_dynamic_export_work(
@@ -11129,7 +12104,7 @@ impl Engine {
                     self.refresh_requested.remove(&pid);
                 }
                 RetirementCause::ExecRefresh | RetirementCause::GenerationLost => {
-                    self.refresh_requested.insert(pid);
+                    self.request_refresh(pid);
                 }
             }
         }
@@ -11319,7 +12294,7 @@ impl Engine {
         } else if record.kind == DISCOVERY_KIND_EXEC
             && unmatched_exec_requests_refresh(&self.views, pid)
         {
-            self.refresh_requested.insert(pid);
+            self.request_refresh(pid);
             None
         } else {
             if record.kind == DISCOVERY_KIND_LEADER_EXIT {
@@ -11687,11 +12662,13 @@ impl Engine {
                 skipped.push(skip);
                 continue;
             };
+            let broad_admit = self.broad_admit;
             let (scan_result, counters) = Self::scan_retained_view(
                 &self.views[position],
                 &self.module_hints,
                 &self.hooks,
                 &mut self.budget,
+                broad_admit,
             );
             skipped.extend(self.absorb_scan_counters(counters));
             match scan_result {
@@ -11699,12 +12676,15 @@ impl Engine {
                     scans.push((*view_id, modules, pins));
                 }
                 Err(error) => {
-                    let view = &self.views[position];
-                    failed_pids.insert(view.pid());
+                    let pid = self.views[position].pid();
+                    let gone = self.views[position].original_exited() == Ok(true);
+                    failed_pids.insert(pid);
+                    let detail = format!("{failure}: {error:#}");
                     skipped.extend(unreadable_member_skip(
-                        view.pid(),
-                        view.original_exited() == Ok(true),
-                        &format!("{failure}: {error:#}"),
+                        pid,
+                        gone,
+                        &detail,
+                        &mut self.counters.noise,
                     ));
                 }
             }
@@ -11788,6 +12768,144 @@ impl Engine {
         )
     }
 
+    /// Over-cap candidate selection without a full maps sweep (Task 3.1b).
+    /// Ordinary passes serve event-driven refresh requests plus a
+    /// fairness-rotation window over unscanned pids — no maps reads, so no
+    /// budget charge — and defer the rest to the reconciliation sweep with
+    /// an exact categorical gap. Every Nth over-cap pass reconciles: one
+    /// bounded maps slice after the cursor (wall-time quantum, generation
+    /// revalidation of covered retained views) with rarity-ordered
+    /// admission inside the slice. Retained views are always desired and
+    /// never displaced; rotation only fills free view slots.
+    fn select_over_cap_desired(&mut self, pids: &[u32]) -> BTreeSet<u32> {
+        let known: BTreeSet<u32> = self.views.iter().map(|view| view.pid()).collect();
+        let enumerated: BTreeSet<u32> = pids.iter().copied().collect();
+        let pending: BTreeSet<u32> = self
+            .refresh_requested
+            .intersection(&enumerated)
+            .copied()
+            .collect();
+        let mut desired = known.clone();
+        desired.extend(pending.iter().copied());
+        let max_scan_pids = self.max_scan_pids;
+        let subject = scope_label(&self.scope);
+        match self.scheduler.begin_over_cap_pass() {
+            InventoryCadence::Ordinary => {
+                let exclude: BTreeSet<u32> = known.union(&pending).copied().collect();
+                let free_slots = max_scan_pids.saturating_sub(self.views.len());
+                let window = DiscoveryScheduler::rotation_window(pids, &exclude, free_slots);
+                desired.extend(window.iter().copied());
+                let fresh = desired.iter().filter(|pid| !known.contains(pid)).count();
+                let retained = known.intersection(&enumerated).count();
+                let deferred = enumerated
+                    .len()
+                    .saturating_sub(retained)
+                    .saturating_sub(fresh);
+                if deferred > 0 {
+                    self.mark_partial(
+                        &subject,
+                        &format!(
+                            "{} processes in scope; live discovery deferred {deferred} unscanned processes to the periodic reconciliation sweep (limit {max_scan_pids})",
+                            enumerated.len()
+                        ),
+                    );
+                }
+                desired
+            }
+            InventoryCadence::Reconcile => {
+                let free_slots = max_scan_pids.saturating_sub(self.views.len());
+                let selected = self.reconcile_slice(pids, &known, free_slots);
+                desired.extend(selected.iter().copied());
+                let fresh = desired.iter().filter(|pid| !known.contains(pid)).count();
+                self.mark_partial(
+                    &subject,
+                    &scan_cap_reason(enumerated.len(), fresh, max_scan_pids, true),
+                );
+                desired
+            }
+        }
+    }
+
+    /// One bounded reconciliation slice: re-read maps for the next slice of
+    /// pids after the cursor (wrapping), stopping at the wall-time quantum.
+    /// Retained views covered by the slice are generation-revalidated;
+    /// unscanned slice pids are rarity-ordered into the free view slots.
+    /// Returns the selected new pids. The cursor advances past the last pid
+    /// read; an incomplete slice publishes its exact coverage gap. Slice
+    /// maps bytes are re-read every sweep, never served from a cache: only
+    /// stable file-derived facts (pin-keyed ELF/inspection entries) are
+    /// cached, never mappings or heap content.
+    fn reconcile_slice(
+        &mut self,
+        pids: &[u32],
+        known: &BTreeSet<u32>,
+        free_slots: usize,
+    ) -> Vec<u32> {
+        let quantum_ns = self.scheduler.quantum_ns();
+        let slice_pids = self.scheduler.slice_pids();
+        let order = DiscoveryScheduler::rotated_after(pids, self.scheduler.cursor());
+        let start = crate::attach::monotonic_ns();
+        let mut slice: Vec<(u32, Vec<MapEntry>)> = Vec::new();
+        let mut revalidated = 0u64;
+        let mut quantum_stopped = false;
+        let mut clock_failed = start.is_none();
+        for pid in order.into_iter().take(slice_pids) {
+            let elapsed = match (start, crate::attach::monotonic_ns()) {
+                (Some(start), Some(now)) => now.saturating_sub(start),
+                // No clock, no unbounded slice: defer rather than run blind.
+                _ => {
+                    clock_failed = true;
+                    quantum_ns
+                }
+            };
+            if elapsed >= quantum_ns {
+                quantum_stopped = true;
+                break;
+            }
+            if known.contains(&pid)
+                && self
+                    .views
+                    .iter()
+                    .filter(|view| view.pid() == pid)
+                    .all(|view| view.still_the_same())
+            {
+                revalidated = revalidated.saturating_add(1);
+            }
+            let entries = std::fs::File::open(format!("/proc/{pid}/maps"))
+                .map_err(|error| error.to_string())
+                .and_then(|maps| {
+                    read_maps_or_refuse(maps, &mut self.budget, crate::attach::monotonic_ns)
+                })
+                .unwrap_or_default();
+            slice.push((pid, entries));
+            self.scheduler.advance_cursor(pid);
+        }
+        let read = slice.len();
+        let enumerated = pids.len();
+        if read < enumerated {
+            let left = enumerated.saturating_sub(read);
+            let tail = if clock_failed {
+                format!("wall clock unavailable, {left} deferred to the next sweep")
+            } else if quantum_stopped {
+                format!("wall-time quantum exhausted, {left} deferred to the next sweep")
+            } else {
+                format!("{left} deferred to the next sweep")
+            };
+            let subject = scope_label(&self.scope);
+            self.mark_partial(
+                &subject,
+                &format!(
+                    "reconciliation sweep covered {read} of {enumerated} observed processes and revalidated {revalidated} retained generations; {tail}"
+                ),
+            );
+        }
+        let pool: Vec<(u32, Vec<MapEntry>)> = slice
+            .into_iter()
+            .filter(|(pid, _)| !known.contains(pid))
+            .collect();
+        select_deep_scan_candidates(&pool, free_slots)
+    }
+
     fn refresh_inventory(
         &mut self,
         session: &mut dyn EngineSession,
@@ -11859,31 +12977,28 @@ impl Engine {
         let membership_complete = skipped.is_empty() && pids.len() <= max_scan_pids;
         let enumerated = pids.len();
         let over_cap = enumerated > max_scan_pids;
-        // Two-phase scan: phase 1 sweeps every in-scope pid's maps, phase 2
-        // deep-scans the selected candidates only. Under the cap selection is
-        // the identity, so the sweep (and its per-tick budget charge) is
-        // skipped there; over the cap membership is not authoritative, so
-        // narrowing `desired` only narrows which new pids get deep-scanned.
-        // A zero cap short-circuits to empty: selection could only ever take
-        // nothing, so the sweep reads are skipped outright.
+        // Ordinary ticks never sweep maps: over the cap the scheduler serves
+        // queued event-driven work plus a fairness-rotation window, and only
+        // the slower reconciliation pass re-reads one bounded slice (Task
+        // 3.1b). Under the cap selection is the identity, so no sweep runs
+        // there; over the cap membership is not authoritative, so narrowing
+        // `desired` only narrows which new pids get deep-scanned. A zero cap
+        // short-circuits to empty: selection could only ever take nothing,
+        // so the sweep reads are skipped outright.
         let desired: BTreeSet<_> = if max_scan_pids == 0 {
             BTreeSet::new()
         } else if pids.len() > max_scan_pids {
-            let sweep = sweep_process_maps(&pids, &mut self.budget);
-            select_deep_scan_candidates(&sweep, max_scan_pids)
-                .into_iter()
-                .collect()
+            self.select_over_cap_desired(&pids)
         } else {
             pids.into_iter().collect()
         };
-        // Formed after selection so the counts describe the actual set.
         // Only new candidates count: known views are retained, not selected.
-        if over_cap {
-            let known: BTreeSet<u32> = self.views.iter().map(|view| view.pid()).collect();
-            let fresh = desired.iter().filter(|pid| !known.contains(pid)).count();
+        // The zero-cap short-circuit keeps its exact historical skip; the
+        // scheduler publishes the ordinary/reconcile gaps itself.
+        if over_cap && max_scan_pids == 0 {
             skipped.push(Skipped {
                 subject: scope_label(&self.scope),
-                reason: scan_cap_reason(enumerated, fresh, max_scan_pids, true),
+                reason: scan_cap_reason(enumerated, 0, max_scan_pids, true),
             });
         }
         // A complete /proc sweep is authoritative membership for system scope
@@ -11943,7 +13058,8 @@ impl Engine {
         skipped.extend(refresh_skips);
 
         let mut new_views = Vec::new();
-        for pid in new_pids {
+        let mut unprocessed = new_pids.into_iter();
+        while let Some(pid) = unprocessed.next() {
             let id = match self.allocate_view_id() {
                 Ok(id) => id,
                 Err(_) => {
@@ -11953,6 +13069,11 @@ impl Engine {
                             "capture process-view capacity {max_scan_pids} was exhausted; remaining generations were not scanned"
                         ),
                     });
+                    // Exhaustion drops nothing: the unprocessed pids stay
+                    // queued (bounded) so a later pass with a free slot
+                    // serves them instead of losing event-driven work.
+                    failed_refresh_pids.insert(pid);
+                    failed_refresh_pids.extend(unprocessed);
                     break;
                 }
             };
@@ -11967,12 +13088,19 @@ impl Engine {
                         pid,
                         process::generation_gone(pid),
                         &format!("the process generation could not be retained: {error}"),
+                        &mut self.counters.noise,
                     ));
                     continue;
                 }
             };
-            let (scan_result, counters) =
-                Self::scan_retained_view(&view, &self.module_hints, &self.hooks, &mut self.budget);
+            let broad_admit = self.broad_admit;
+            let (scan_result, counters) = Self::scan_retained_view(
+                &view,
+                &self.module_hints,
+                &self.hooks,
+                &mut self.budget,
+                broad_admit,
+            );
             skipped.extend(self.absorb_scan_counters(counters));
             match scan_result {
                 Ok((modules, pins)) => {
@@ -11987,6 +13115,7 @@ impl Engine {
                         pid,
                         view.original_exited() == Ok(true),
                         &format!("the process generation could not be scanned: {error:#}"),
+                        &mut self.counters.noise,
                     ));
                 }
             }
@@ -12021,7 +13150,7 @@ impl Engine {
             self.queue_stale_views(&retained_stale, pending_views);
             for (view, _, _) in &new_views {
                 if admission.stale_views.contains(&view.id()) {
-                    self.refresh_requested.insert(view.pid());
+                    self.request_refresh(view.pid());
                     failed_refresh_pids.insert(view.pid());
                 }
             }
@@ -12069,7 +13198,7 @@ impl Engine {
                 .find(|candidate| candidate.id() == view)
                 .map(ProcessView::pid)
             {
-                self.refresh_requested.insert(pid);
+                self.request_refresh(pid);
             }
         }
 
@@ -12104,7 +13233,7 @@ impl Engine {
                     .map(ProcessView::pid)
                 {
                     failed_refresh_pids.insert(pid);
-                    self.refresh_requested.insert(pid);
+                    self.request_refresh(pid);
                 }
             }
         }
@@ -12165,7 +13294,7 @@ impl Engine {
                 .collect();
             for (view, _, _) in &new_views {
                 if admission.stale_views.contains(&view.id()) {
-                    self.refresh_requested.insert(view.pid());
+                    self.request_refresh(view.pid());
                     failed_refresh_pids.insert(view.pid());
                 }
             }
@@ -12239,7 +13368,7 @@ impl Engine {
                 .find(|(candidate, _, _)| candidate.id() == *view)
                 .map(|(view, _, _)| view.pid())
             {
-                self.refresh_requested.insert(pid);
+                self.request_refresh(pid);
             }
         }
         if outcome.accepted() && !conservative_only {
@@ -12343,6 +13472,57 @@ impl Engine {
     /// draining the ordinary event ring.
     pub fn drain_discovery(&mut self, session: &mut Session) -> Result<bool> {
         self.drain_discovery_from(session)
+    }
+
+    /// Whether a frame may skip the inventory sweep: no queued work, no
+    /// refresh request, no staged facts, and a sweep-driven scope. Pid
+    /// scope never defers — its per-tick sweep is the generation
+    /// authority and already cheap — and anything queued forces the full
+    /// pass. The `/proc` sweep itself is the only deferred work, bounded
+    /// by the run loop's periodic forced full frame.
+    fn discovery_shallow_idle(&self) -> bool {
+        !matches!(self.scope, Scope::Pid(_))
+            && self.pending_discovery_records.is_empty()
+            && self.pending_loader_scans.is_empty()
+            && self.pending_retirements.is_empty()
+            && self.pending_rejected_keys.is_empty()
+            && self.ready_expected_removals.is_empty()
+            && self.expected_target_exit_pending.is_none()
+            && self.pending_leader_exit_views.is_empty()
+            && self.refresh_requested.is_empty()
+            && self.capture_facts.staged.is_none()
+    }
+
+    /// A framed discovery pass: the ring always drains, and any records,
+    /// malformed items, queued work, or pid scope upgrades to the full
+    /// pass same-frame — loader events are never delayed. Only a quiet
+    /// sweep-driven frame skips the inventory, unless `force_full`
+    /// (the run loop's periodic full frame) says otherwise.
+    pub fn drain_discovery_shallow(
+        &mut self,
+        session: &mut Session,
+        force_full: bool,
+    ) -> Result<bool> {
+        self.drain_discovery_shallow_from(session, force_full)
+    }
+
+    pub(crate) fn drain_discovery_shallow_from(
+        &mut self,
+        session: &mut dyn EngineSession,
+        force_full: bool,
+    ) -> Result<bool> {
+        let (records, malformed) = match Self::collect_discovery_records(session) {
+            Ok(drained) => drained,
+            Err(error) => match error.downcast::<IncompleteTerminalDrain>() {
+                Ok(incomplete) if incomplete.backlog => (incomplete.records, incomplete.malformed),
+                Ok(incomplete) => return Err(Self::generic_drain_error(incomplete.into())),
+                Err(error) => return Err(error),
+            },
+        };
+        if force_full || !records.is_empty() || malformed != 0 || !self.discovery_shallow_idle() {
+            return self.apply_discovery_batch(session, records, malformed);
+        }
+        Ok(false)
     }
 
     /// Drains the detached discovery ring to an observed empty read. Every
@@ -12663,12 +13843,21 @@ impl Engine {
         )
     }
 
+    /// Task 3.2 (S1): flush live-accumulated discovery noise as per-class
+    /// summaries. Called once at capture end; initial noise was already
+    /// reported and cleared by `discover_plan`, so this covers live only.
+    pub fn report_discovery_noise(&mut self) {
+        self.counters.noise.report();
+        self.counters.noise.clear();
+    }
+
     pub fn start_session(
         &mut self,
         policy: CapturePolicy,
         ring_bytes: Option<u32>,
+        backend: BackendSelection,
     ) -> Result<Session> {
-        self.start_session_with(policy, None, None, ring_bytes)
+        self.start_session_with(policy, None, None, ring_bytes, backend)
     }
 
     pub(crate) fn start_owned_session(
@@ -12676,9 +13865,10 @@ impl Engine {
         policy: CapturePolicy,
         child: &mut OwnedChild,
         ring_bytes: Option<u32>,
+        backend: BackendSelection,
     ) -> Result<Session> {
         let generation = OwnedPauseGeneration::from_owned_child(child);
-        self.start_session_with(policy, Some(generation), Some(child), ring_bytes)
+        self.start_session_with(policy, Some(generation), Some(child), ring_bytes, backend)
     }
 
     /// Task 8 calls this only after its coordinator armed the pause epoch and
@@ -12768,6 +13958,7 @@ impl Engine {
         mut pause_generation: Option<OwnedPauseGeneration>,
         owned_child: Option<&OwnedChild>,
         ring_bytes: Option<u32>,
+        backend: BackendSelection,
     ) -> Result<Session> {
         self.seed_initial_cgroup_views();
         let snapshot = self.begin_start_capture_attempt()?;
@@ -12784,6 +13975,7 @@ impl Engine {
                     pause_generation.take(),
                     ring_bytes,
                     owned_child,
+                    backend,
                 )
             }) {
                 Ok(session) => session,
@@ -12905,6 +14097,9 @@ pub(crate) mod session_fixture {
         pub(crate) detached_slot_indices: Vec<Vec<u32>>,
         /// One entry per upcoming `detach_slots` call; `true` fails it.
         detach_slot_script: VecDeque<bool>,
+        /// One rebuild report per upcoming `detach_slots` call; later calls
+        /// report no rebuild.
+        detach_rebuild_script: VecDeque<DetachOutcome>,
         /// Static target slot indices that the next attach reports as failed.
         fail_target_slots: BTreeSet<u32>,
         /// Slot counts of every `attach_targets` call, in order.
@@ -12988,6 +14183,15 @@ pub(crate) mod session_fixture {
         /// fails that call. Later calls succeed.
         pub(crate) fn fail_slot_detaches(&mut self, script: impl IntoIterator<Item = bool>) {
             self.detach_slot_script = script.into_iter().collect();
+        }
+
+        /// Schedules one rebuild report per upcoming `detach_slots` call.
+        /// Later calls report no rebuild.
+        pub(crate) fn report_slot_rebuilds(
+            &mut self,
+            script: impl IntoIterator<Item = DetachOutcome>,
+        ) {
+            self.detach_rebuild_script = script.into_iter().collect();
         }
 
         pub(crate) fn fail_target_slots(&mut self, slots: impl IntoIterator<Item = u32>) {
@@ -13086,12 +14290,12 @@ pub(crate) mod session_fixture {
             _: &mut plan::AttachPlan,
             slots: &[plan::Slot],
             _: &PinnedObjects,
-        ) -> Result<ReplacementAttachResult> {
+        ) -> Result<ReplacementOutcome> {
             attachment_admission(&self.detach_failures, !slots.is_empty())?;
-            Ok((Vec::new(), false))
+            Ok(ReplacementOutcome::default())
         }
 
-        fn detach_slots(&mut self, slots: &[plan::Slot]) -> Result<()> {
+        fn detach_slots(&mut self, slots: &[plan::Slot]) -> Result<DetachOutcome> {
             self.detached_slots.push(slots.len());
             self.detached_slot_indices
                 .push(slots.iter().map(|slot| slot.index).collect());
@@ -13100,7 +14304,7 @@ pub(crate) mod session_fixture {
                     .push("scripted one-shot slot detach failed".into());
                 bail!("scripted one-shot slot detach failed");
             }
-            Ok(())
+            Ok(self.detach_rebuild_script.pop_front().unwrap_or_default())
         }
 
         fn has_dynamic_export(
@@ -13305,3 +14509,7 @@ impl Engine {
 #[cfg(test)]
 #[path = "engine_tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(test)]
+#[path = "publication_tests.rs"]
+pub(crate) mod publication_tests;

@@ -15,6 +15,7 @@ use aya::programs::tp_btf::BtfTracePointLinkId;
 use aya::programs::uprobe::{UProbeAttachLocation, UProbeAttachPoint, UProbeLinkId, UProbeScope};
 use aya::programs::{BtfTracePoint, RawTracePoint, UProbe};
 use aya::{Btf, Ebpf, EbpfLoader};
+use p11scope_bpf_multi::{GroupHalt, attach_group, bisect_attach};
 use p11scope_ebpf_common::{
     ARG_NONE, DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES,
     DISCOVERY_COUNTER_EXPORT_STATE_FAILURES, DISCOVERY_COUNTER_LOADER_HITS,
@@ -33,7 +34,7 @@ use std::fs::File;
 use std::io;
 use std::mem::size_of_val;
 use std::num::{NonZeroU32, NonZeroU64};
-use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd};
+use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -725,6 +726,108 @@ impl CapturePolicy {
     }
 }
 
+/// Resolved static attach backend: one multi link per (attach path, entry
+/// program) group, or today's one-per-endpoint singles. Dynamic
+/// loader/export probes stay singles under both backends.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum AttachBackend {
+    Multi,
+    Singles,
+}
+
+/// Operator's `--attach-backend` request: `auto` follows the backend
+/// policy (multi on 6.9+, singles below), `multi`/`singles` force one.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+pub enum BackendSelection {
+    #[default]
+    Auto,
+    Multi,
+    Singles,
+}
+
+impl BackendSelection {
+    pub fn from_cli(value: &str) -> Result<Self> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "multi" => Ok(Self::Multi),
+            "singles" => Ok(Self::Singles),
+            _ => bail!("--attach-backend: invalid value {value:?} (expected auto|multi|singles)"),
+        }
+    }
+}
+
+/// A multi link attempt proved the kernel lacks multi support. The
+/// session retries on singles (auto) or surfaces this as a hard error
+/// (forced multi).
+#[derive(Debug)]
+pub(crate) struct BackendFallbackRequired {
+    error: io::Error,
+}
+
+impl BackendFallbackRequired {
+    fn unsupported(error: io::Error) -> Self {
+        Self { error }
+    }
+}
+
+impl std::fmt::Display for BackendFallbackRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "multi-uprobe unsupported by the running kernel: {}",
+            self.error
+        )
+    }
+}
+
+impl std::error::Error for BackendFallbackRequired {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+/// Kernel floor for the multi backend: `uprobe_multi` landed in 6.6,
+/// but the session only attempts multi on 6.9+, where the link UAPI the
+/// backport targets is settled. Below the floor `Auto` is singles; an
+/// `ENOTSUP`/`EOPNOTSUPP` link error still falls back at runtime.
+pub(crate) const MULTI_KERNEL_FLOOR: (u32, u32) = (6, 9);
+
+/// Pure policy predicate over a `/proc/sys/kernel/osrelease` release
+/// string: multi is attempted at or above [`MULTI_KERNEL_FLOOR`], and
+/// an unparseable release conservatively resolves to singles.
+pub(crate) fn multi_allowed_on(release: &str) -> bool {
+    crate::doctor::parse_major_minor(release).is_some_and(|version| version >= MULTI_KERNEL_FLOOR)
+}
+
+/// Live policy probe: multi is attempted when the running kernel is at
+/// or above [`MULTI_KERNEL_FLOOR`]. An unreadable release resolves to
+/// singles; forced multi still attempts regardless (see `start`).
+pub(crate) fn kernel_supports_multi() -> bool {
+    std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .map(|release| multi_allowed_on(release.trim()))
+        .unwrap_or(false)
+}
+
+/// First backend attempted for a session. `Auto` follows the kernel
+/// policy (multi on 6.9+, singles below); `Multi`/`Singles` force one.
+/// An auto multi attempt that the kernel refuses is rebuilt on singles
+/// at session granularity; forced multi surfaces the refusal instead.
+pub(crate) fn resolve_initial_backend(selection: BackendSelection) -> AttachBackend {
+    match selection {
+        BackendSelection::Auto if kernel_supports_multi() => AttachBackend::Multi,
+        BackendSelection::Auto | BackendSelection::Singles => AttachBackend::Singles,
+        BackendSelection::Multi => AttachBackend::Multi,
+    }
+}
+
+/// The static endpoint twins (every program `static_probe_side` routes)
+/// load with `expected_attach_type=48` under multi so one program can own
+/// the group's return/entry links; everything else (dynamic, diagnostic,
+/// lifecycle, tail-call targets) loads plain under both backends.
+pub(crate) fn loads_with_multi_flag(backend: AttachBackend, program: &str) -> bool {
+    backend == AttachBackend::Multi && static_probe_side(program).is_some()
+}
+
 fn process_creation_capture_enabled(scope: &Scope, policy: CapturePolicy) -> bool {
     let _ = (scope, policy);
     true
@@ -811,6 +914,7 @@ impl RootSeed {
 ///         attach_failures: panic!("compile-only placeholder"),
 ///         detach_failures: panic!("compile-only placeholder"),
 ///         producers_detached: panic!("compile-only placeholder"),
+///         detach_wall_ms: panic!("compile-only placeholder"),
 ///         successful_static: panic!("compile-only placeholder"),
 ///         dynamic_attach_evidence: panic!("compile-only placeholder"),
 ///         policy: panic!("compile-only placeholder"),
@@ -818,6 +922,7 @@ impl RootSeed {
 ///         pause_key: panic!("compile-only placeholder"),
 ///         lifecycle_tracking_unavailable: panic!("compile-only placeholder"),
 ///         process_creation_tracking_unavailable: panic!("compile-only placeholder"),
+///         retained_static: panic!("compile-only placeholder"),
 ///         links: panic!("compile-only placeholder"),
 ///     }
 /// }
@@ -851,14 +956,24 @@ pub struct Session {
     /// This permits the existing best-effort terminal poll, not callback
     /// settlement or exact root retirement.
     producers_detached: bool,
+    /// Wall time the producer detach took, in whole milliseconds; zero
+    /// until `detach_producers` runs.
+    detach_wall_ms: u64,
     successful_static: BTreeSet<StaticEndpoint>,
     dynamic_attach_evidence: DynamicAttachEvidence,
     policy: CapturePolicy,
+    /// Load-time backend: static endpoint twins load with attach type 48
+    /// under multi, so the attach path must match the load decision.
+    backend: AttachBackend,
     uprobe_scope: UProbeScope,
     #[allow(dead_code)] // Task 8 drives the Task 7 pause coordinator.
     pause_key: Option<PauseKey>,
     lifecycle_tracking_unavailable: Option<String>,
     process_creation_tracking_unavailable: Option<String>,
+    /// Exact reattach facts per statically attached slot, retained so a
+    /// multi-group rebuild can reattach surviving siblings; pruned as the
+    /// slot's last link detaches (see [`RetainedStaticTarget`]).
+    retained_static: BTreeMap<u32, RetainedStaticTarget>,
     links: Vec<RegisteredLink>,
 }
 
@@ -939,6 +1054,14 @@ enum RegisteredLink {
         slot: u32,
         id: UProbeLinkId,
     },
+    /// One attached multi group side outside Aya's link table: the
+    /// program, its member slots, and the live link fds (one per bisect
+    /// leaf). Detach is drop: closing the fds detaches the links.
+    MultiUProbe {
+        program: &'static str,
+        slots: Vec<u32>,
+        fds: Vec<OwnedFd>,
+    },
     RawTracePoint {
         program: &'static str,
         id: RawTracePointLinkId,
@@ -994,6 +1117,7 @@ impl RegisteredLink {
     fn producer(&self) -> ProducerProgram {
         match self {
             Self::UProbe { program, .. }
+            | Self::MultiUProbe { program, .. }
             | Self::DynamicUProbe { program, .. }
             | Self::DiagnosticUProbe { program, .. } => ProducerProgram::UProbe(program),
             Self::RawTracePoint { program, .. } => ProducerProgram::RawTracePoint(program),
@@ -1001,13 +1125,14 @@ impl RegisteredLink {
         }
     }
 
-    fn slot(&self) -> Option<u32> {
+    fn slots(&self) -> &[u32] {
         match self {
-            Self::UProbe { slot, .. } => Some(*slot),
+            Self::UProbe { slot, .. } => std::slice::from_ref(slot),
+            Self::MultiUProbe { slots, .. } => slots,
             Self::RawTracePoint { .. }
             | Self::BtfTracePoint { .. }
             | Self::DiagnosticUProbe { .. }
-            | Self::DynamicUProbe { .. } => None,
+            | Self::DynamicUProbe { .. } => &[],
         }
     }
 
@@ -1015,11 +1140,90 @@ impl RegisteredLink {
         match self {
             Self::DynamicUProbe { context, .. } => Some(*context),
             Self::UProbe { .. }
+            | Self::MultiUProbe { .. }
             | Self::RawTracePoint { .. }
             | Self::BtfTracePoint { .. }
             | Self::DiagnosticUProbe { .. } => None,
         }
     }
+}
+
+fn links_cover_slot(links: &[RegisteredLink], slot: u32) -> bool {
+    links.iter().any(|link| link.slots().contains(&slot))
+}
+
+/// The smallest requested slot that shares a multi group link with a
+/// slot outside the request, if any. Group links are immutable: a
+/// bundle drops only when every member is requested, so a partially
+/// covered member triggers the explicit group rebuild while fully
+/// covered bundles still detach outright.
+fn find_partial_multi_member(links: &[RegisteredLink], slots: &BTreeSet<u32>) -> Option<u32> {
+    slots.iter().copied().find(|slot| {
+        links.iter().any(|link| {
+            matches!(link, RegisteredLink::MultiUProbe { slots: members, .. }
+                if members.contains(slot)
+                    && members.iter().any(|member| !slots.contains(member)))
+        })
+    })
+}
+
+/// Every slot sharing a multi group link with `requested`, transitively:
+/// partially covered bundles pull in their survivors, and bundles
+/// overlapping those survivors join too (a return bundle widened by an
+/// entry-refused member shares its sibling's entry bundle). Returns `None`
+/// when no multi bundle is partially covered, i.e. the plain detach path
+/// applies: whole bundles, singles, and unlinked slots.
+fn plan_group_rebuild(
+    links: &[RegisteredLink],
+    requested: &BTreeSet<u32>,
+) -> Option<BTreeSet<u32>> {
+    find_partial_multi_member(links, requested)?;
+    let mut affected: BTreeSet<u32> = requested.clone();
+    loop {
+        let mut grown = false;
+        for link in links {
+            let RegisteredLink::MultiUProbe { slots: members, .. } = link else {
+                continue;
+            };
+            if members.iter().any(|member| affected.contains(member))
+                && members.iter().any(|member| !affected.contains(member))
+            {
+                affected.extend(members.iter().copied());
+                grown = true;
+            }
+        }
+        if !grown {
+            break;
+        }
+    }
+    Some(affected)
+}
+
+/// How many live multi groups one rebuild disturbs: bundles sharing a
+/// member are sides of one group (a return bundle widened by refusals
+/// still shares its sibling's entry bundle), disjoint bundles are
+/// distinct groups. Each disturbed group is one published gap window.
+fn affected_group_count(links: &[RegisteredLink], affected: &BTreeSet<u32>) -> u64 {
+    let mut components: Vec<BTreeSet<u32>> = Vec::new();
+    for link in links {
+        let RegisteredLink::MultiUProbe { slots: members, .. } = link else {
+            continue;
+        };
+        if !members.iter().any(|member| affected.contains(member)) {
+            continue;
+        }
+        let mut merged: BTreeSet<u32> = members.iter().copied().collect();
+        components.retain(|component| {
+            if component.intersection(&merged).next().is_none() {
+                true
+            } else {
+                merged.extend(component.iter().copied());
+                false
+            }
+        });
+        components.push(merged);
+    }
+    components.len() as u64
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1173,11 +1377,42 @@ struct AttachOutcome {
     successful: BTreeSet<StaticEndpoint>,
     failures: Vec<(u32, String)>,
     completed: Vec<SlotCompletion>,
+    /// The run stopped early on fd exhaustion: members without a success
+    /// or failure entry were never attempted. Fresh attach reports the one
+    /// shared summary; the group rebuild records every remainder explicitly.
+    exhausted: bool,
 }
 
 type SlotCompletion = (u32, Option<u64>);
 type TargetAttachResult = (Vec<u32>, Vec<SlotCompletion>);
-type ReplacementAttachResult = (Vec<SlotCompletion>, bool);
+
+/// What one [`Session::replace_targets`] call attached: the replacements
+/// that completed, whether their cleanup detach failed, and any group
+/// rebuilds that cleanup triggered.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReplacementOutcome {
+    /// (slot, attach timestamp) for every replacement fully attached.
+    pub completed: Vec<(u32, Option<u64>)>,
+    /// A partial replacement detach failed once; the caller blocks additions.
+    pub failed_detach: bool,
+    /// Group rebuilds the replacement's cleanup detaches triggered.
+    pub rebuild: DetachOutcome,
+}
+
+/// What one [`Session::detach_slots`] call rebuilt, if anything: per-member
+/// evidence for multi-group survivors plus the gap count. Empty when no
+/// group needed a rebuild (singles detach, whole-bundle detach).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DetachOutcome {
+    /// (slot, reactivation timestamp) for every survivor fully reattached,
+    /// including unchanged siblings.
+    pub recompleted: Vec<(u32, Option<u64>)>,
+    /// (slot, reason) for every survivor that lost its links; the caller
+    /// deactivates these in the plan exactly like failed fresh targets.
+    pub rebuild_failures: Vec<(u32, String)>,
+    /// How many groups dropped and rebuilt: one published gap window each.
+    pub rebuilt_groups: u64,
+}
 
 fn export_programs(abi: HookAbi) -> (&'static str, &'static str) {
     match abi {
@@ -1187,16 +1422,493 @@ fn export_programs(abi: HookAbi) -> (&'static str, &'static str) {
     }
 }
 
-fn static_endpoint(program: &str, slot: u32) -> Option<StaticEndpoint> {
+fn static_probe_side(program: &str) -> Option<ProbeSide> {
     match program {
-        "p11_return" => Some((slot, ProbeSide::Return)),
+        "p11_return" => Some(ProbeSide::Return),
         "p11_entry"
         | "p11_entry_ia32"
         | "p11_entry_template"
         | "p11_entry_template_types"
-        | "p11_entry_template_pair" => Some((slot, ProbeSide::Entry)),
+        | "p11_entry_template_pair" => Some(ProbeSide::Entry),
         _ => None,
     }
+}
+
+fn static_endpoint(program: &str, slot: u32) -> Option<StaticEndpoint> {
+    static_probe_side(program).map(|side| (slot, side))
+}
+
+/// One member of a static attach group: the slot plus its resolved
+/// multi-link site (file offset + attach cookie).
+#[derive(Debug, Clone)]
+struct StaticGroupMember {
+    slot: Slot,
+    offset: u64,
+    cookie: u64,
+}
+
+/// One multi-attach unit: all slots sharing an attach path AND an entry
+/// program take one return link plus one entry link. Members are sorted
+/// by slot so link order is deterministic.
+#[derive(Debug)]
+struct StaticGroup {
+    path: PathBuf,
+    entry_program: &'static str,
+    members: Vec<StaticGroupMember>,
+}
+
+/// One statically attached slot's exact reattach facts: the descriptor the
+/// attach used plus the pinned path/ABI it resolved. Retained so a
+/// multi-group rebuild can reattach surviving siblings without re-deriving
+/// identity; facts survive exactly while a link does.
+#[derive(Debug, Clone)]
+struct RetainedStaticTarget {
+    slot: Slot,
+    path: PathBuf,
+    abi: ElfAbi,
+}
+
+/// Retains exact reattach facts for every requested slot that gained a
+/// link. Reattach overwrites: a replacement's new descriptor supersedes
+/// the frozen one the rebuild pruned.
+fn retain_from_successful(
+    retained: &mut BTreeMap<u32, RetainedStaticTarget>,
+    targets: &[Slot],
+    attach_targets: &BTreeMap<u32, (PathBuf, ElfAbi)>,
+    successful: &BTreeSet<StaticEndpoint>,
+) {
+    let linked: BTreeSet<u32> = successful.iter().map(|(slot, _)| *slot).collect();
+    for slot in targets {
+        if !linked.contains(&slot.index) {
+            continue;
+        }
+        let (path, abi) = attach_targets
+            .get(&slot.index)
+            .expect("every selected target has retained pinned facts");
+        retained.insert(
+            slot.index,
+            RetainedStaticTarget {
+                slot: slot.clone(),
+                path: path.clone(),
+                abi: *abi,
+            },
+        );
+    }
+}
+
+/// Drops retained facts for slots with no remaining link. The rebuild
+/// consults facts only for link-carrying survivors, so pruning is what
+/// keeps a detached slot's descriptor from ever reattaching stale.
+fn prune_linkless_retained(
+    retained: &mut BTreeMap<u32, RetainedStaticTarget>,
+    links: &[RegisteredLink],
+) {
+    retained.retain(|slot, _| links_cover_slot(links, *slot));
+}
+
+fn group_static_slots(
+    slots: &[Slot],
+    policy: CapturePolicy,
+    object_has_unsafe: bool,
+    attach_targets: &BTreeMap<u32, (PathBuf, ElfAbi)>,
+) -> Vec<StaticGroup> {
+    let mut by_key: BTreeMap<(PathBuf, &'static str), Vec<StaticGroupMember>> = BTreeMap::new();
+    for slot in slots {
+        let (path, abi) = attach_targets
+            .get(&slot.index)
+            .expect("every selected target has retained pinned facts");
+        let UProbeAttachPoint {
+            location: UProbeAttachLocation::AbsoluteOffset(offset),
+            cookie: Some(cookie),
+        } = slot_attach_point(slot)
+        else {
+            unreachable!("static attach points are absolute with cookies");
+        };
+        let program = entry_program(&slot.semantics, policy, object_has_unsafe, *abi);
+        by_key
+            .entry((path.clone(), program))
+            .or_default()
+            .push(StaticGroupMember {
+                slot: slot.clone(),
+                offset,
+                cookie,
+            });
+    }
+    by_key
+        .into_iter()
+        .map(|((path, entry_program), mut members)| {
+            members.sort_by_key(|member| member.slot.index);
+            StaticGroup {
+                path,
+                entry_program,
+                members,
+            }
+        })
+        .collect()
+}
+
+/// One attached group side: the program, its member slots, and the live
+/// links (one per bisect leaf). Generic over the link handle so the
+/// orchestration unit-tests without fds; production uses `OwnedFd`.
+#[derive(Debug)]
+struct MultiLinkBundle<T> {
+    program: &'static str,
+    slots: Vec<u32>,
+    links: Vec<T>,
+}
+
+fn exhausted_multi(slot: u32, endpoints: usize, links: usize) -> (u32, String) {
+    (
+        slot,
+        format!(
+            "fd table exhausted attaching slot {slot} ({endpoints} endpoints across {links} links); \
+             raise RLIMIT_NOFILE (ulimit -n) and retry"
+        ),
+    )
+}
+
+/// Attaches regrouped static slots: per group, the return link(s) first,
+/// then the entry link(s) over the return-paired members only, so an
+/// entry is never attempted without its return. Kernel-rejected offsets
+/// bisect into per-slot failures; permission errors fail the side and
+/// the loop continues with the next group; fd exhaustion ends the run
+/// with one summary like singles; an unsupported kernel aborts with
+/// [`BackendFallbackRequired`]. Returns the live links (one bundle per
+/// attached side) plus the singles-shaped [`AttachOutcome`].
+fn attach_target_groups_with<T>(
+    groups: &[StaticGroup],
+    mut completed_at: impl FnMut(&Slot) -> Option<u64>,
+    mut attach_link: impl FnMut(&'static str, &Path, &[(u64, u64)], bool) -> io::Result<T>,
+) -> Result<(Vec<MultiLinkBundle<T>>, AttachOutcome), BackendFallbackRequired> {
+    let mut successful = BTreeSet::new();
+    let mut failures = Vec::new();
+    let mut completed = Vec::new();
+    let mut bundles = Vec::new();
+    let mut links_attached = 0usize;
+    for group in groups {
+        let sites: Vec<(u64, u64)> = group
+            .members
+            .iter()
+            .map(|member| (member.offset, member.cookie))
+            .collect();
+        let (return_links, return_refused) = match bisect_attach(
+            &mut |slice| attach_link("p11_return", &group.path, slice, true),
+            &sites,
+        ) {
+            Ok(ok) => ok,
+            Err(GroupHalt::Unsupported(error)) => {
+                return Err(BackendFallbackRequired::unsupported(error));
+            }
+            Err(GroupHalt::Exhausted(_)) => {
+                let first = group.members.first().expect("groups are never empty");
+                failures.push(exhausted_multi(
+                    first.slot.index,
+                    successful.len(),
+                    links_attached,
+                ));
+                return Ok((
+                    bundles,
+                    AttachOutcome {
+                        successful,
+                        failures,
+                        completed,
+                        exhausted: true,
+                    },
+                ));
+            }
+        };
+        links_attached += return_links.len();
+        let refused: BTreeSet<usize> = return_refused.iter().map(|site| site.index).collect();
+        for site in &return_refused {
+            let member = &group.members[site.index];
+            failures.push((
+                member.slot.index,
+                format!(
+                    "p11_return at {}+{:#x}: {}",
+                    group.path.display(),
+                    member.offset,
+                    error_chain(&site.error)
+                ),
+            ));
+        }
+        let paired: Vec<&StaticGroupMember> = group
+            .members
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !refused.contains(index))
+            .map(|(_, member)| member)
+            .collect();
+        for member in &paired {
+            successful.insert(
+                static_endpoint("p11_return", member.slot.index)
+                    .expect("p11_return is a static endpoint"),
+            );
+        }
+        if !return_links.is_empty() {
+            bundles.push(MultiLinkBundle {
+                program: "p11_return",
+                slots: paired.iter().map(|member| member.slot.index).collect(),
+                links: return_links,
+            });
+        }
+        if paired.is_empty() {
+            continue;
+        }
+        let entry_sites: Vec<(u64, u64)> = paired
+            .iter()
+            .map(|member| (member.offset, member.cookie))
+            .collect();
+        let (entry_links, entry_refused) = match bisect_attach(
+            &mut |slice| attach_link(group.entry_program, &group.path, slice, false),
+            &entry_sites,
+        ) {
+            Ok(ok) => ok,
+            Err(GroupHalt::Unsupported(error)) => {
+                return Err(BackendFallbackRequired::unsupported(error));
+            }
+            Err(GroupHalt::Exhausted(_)) => {
+                failures.push(exhausted_multi(
+                    paired[0].slot.index,
+                    successful.len(),
+                    links_attached,
+                ));
+                return Ok((
+                    bundles,
+                    AttachOutcome {
+                        successful,
+                        failures,
+                        completed,
+                        exhausted: true,
+                    },
+                ));
+            }
+        };
+        links_attached += entry_links.len();
+        let refused: BTreeSet<usize> = entry_refused.iter().map(|site| site.index).collect();
+        for site in &entry_refused {
+            let member = paired[site.index];
+            failures.push((
+                member.slot.index,
+                format!(
+                    "{} at {}+{:#x}: {}",
+                    group.entry_program,
+                    group.path.display(),
+                    member.offset,
+                    error_chain(&site.error)
+                ),
+            ));
+        }
+        let mut entry_slots = Vec::new();
+        for (index, member) in paired.iter().enumerate() {
+            if refused.contains(&index) {
+                continue;
+            }
+            successful.insert(
+                static_endpoint(group.entry_program, member.slot.index)
+                    .expect("selected entry program is a static endpoint"),
+            );
+            completed.push((member.slot.index, completed_at(&member.slot)));
+            entry_slots.push(member.slot.index);
+        }
+        if !entry_links.is_empty() {
+            bundles.push(MultiLinkBundle {
+                program: group.entry_program,
+                slots: entry_slots,
+                links: entry_links,
+            });
+        }
+    }
+    Ok((
+        bundles,
+        AttachOutcome {
+            successful,
+            failures,
+            completed,
+            exhausted: false,
+        },
+    ))
+}
+
+/// Records every survivor a halted rebuild never attempted. A silent
+/// link-less survivor would violate the rebuild's exact-evidence rule,
+/// so each one carries the halt reason explicitly.
+fn fail_unreattached(
+    failures: &mut Vec<(u32, String)>,
+    slots: impl IntoIterator<Item = u32>,
+    reason: &str,
+) {
+    for slot in slots {
+        failures.push((slot, format!("slot {slot} was not reattached: {reason}")));
+    }
+}
+
+/// Drops one dirty round's bundles entries-first, mirroring the detach
+/// order [`detach_selected_with`] applies to live links: no return outlives
+/// the entry it pairs with.
+fn detach_rebuild_round<T>(
+    detach_bundles: &mut impl FnMut(Vec<MultiLinkBundle<T>>),
+    mut bundles: Vec<MultiLinkBundle<T>>,
+) {
+    bundles.sort_by_key(|bundle| match static_probe_side(bundle.program) {
+        Some(ProbeSide::Entry) => 0,
+        Some(ProbeSide::Return) => 1,
+        None => 2,
+    });
+    detach_bundles(bundles);
+}
+
+/// Reattaches regrouped rebuild survivors to fixpoint, one group at a
+/// time: returns before entries per group (via
+/// [`attach_target_groups_with`]), so an entry-partial survivor (return
+/// live, entry refused) drops with its exact failure and the round's
+/// bundles detach entries-first before the remainder reattaches. A clean
+/// group's bundles are never detached for another group's partial. Only
+/// kept links contribute successes or completions; fd exhaustion and an
+/// unsupported kernel stop the run with every remainder recorded
+/// explicitly. Terminates: every dirty round strictly shrinks its group.
+fn reattach_rebuilt_groups_with<T>(
+    groups: &[StaticGroup],
+    mut completed_at: impl FnMut(&Slot) -> Option<u64>,
+    mut attach_link: impl FnMut(&'static str, &Path, &[(u64, u64)], bool) -> io::Result<T>,
+    mut detach_bundles: impl FnMut(Vec<MultiLinkBundle<T>>),
+) -> (Vec<MultiLinkBundle<T>>, AttachOutcome) {
+    let mut kept = Vec::new();
+    let mut successful = BTreeSet::new();
+    let mut failures = Vec::new();
+    let mut completed = Vec::new();
+    let mut exhausted = false;
+    for (position, group) in groups.iter().enumerate() {
+        let later = || {
+            groups[position + 1..]
+                .iter()
+                .flat_map(|later| later.members.iter().map(|member| member.slot.index))
+        };
+        let mut remaining: Vec<StaticGroupMember> = group.members.clone();
+        while !remaining.is_empty() {
+            let round = StaticGroup {
+                path: group.path.clone(),
+                entry_program: group.entry_program,
+                members: std::mem::take(&mut remaining),
+            };
+            let (bundles, outcome) = match attach_target_groups_with(
+                std::slice::from_ref(&round),
+                &mut completed_at,
+                &mut attach_link,
+            ) {
+                Ok(ok) => ok,
+                Err(sentinel) => {
+                    fail_unreattached(
+                        &mut failures,
+                        round
+                            .members
+                            .iter()
+                            .map(|member| member.slot.index)
+                            .chain(later()),
+                        &format!("{sentinel:#}"),
+                    );
+                    return (
+                        kept,
+                        AttachOutcome {
+                            successful,
+                            failures,
+                            completed,
+                            exhausted,
+                        },
+                    );
+                }
+            };
+            if outcome.exhausted {
+                // The fd table is full: nothing more can attach. The round's
+                // bundles drop — a kept return without its entry would strand
+                // a partial link — and every member without an entry is
+                // recorded explicitly instead of staying silently link-less.
+                exhausted = true;
+                let failed: BTreeSet<u32> =
+                    outcome.failures.iter().map(|(slot, _)| *slot).collect();
+                failures.extend(outcome.failures);
+                detach_rebuild_round(&mut detach_bundles, bundles);
+                fail_unreattached(
+                    &mut failures,
+                    round
+                        .members
+                        .iter()
+                        .map(|member| member.slot.index)
+                        .filter(|slot| !failed.contains(slot))
+                        .chain(later()),
+                    "fd table exhausted; raise RLIMIT_NOFILE (ulimit -n) and retry",
+                );
+                return (
+                    kept,
+                    AttachOutcome {
+                        successful,
+                        failures,
+                        completed,
+                        exhausted,
+                    },
+                );
+            }
+            let partials: BTreeSet<u32> = round
+                .members
+                .iter()
+                .map(|member| member.slot.index)
+                .filter(|slot| {
+                    outcome.successful.contains(&(*slot, ProbeSide::Return))
+                        && !outcome.successful.contains(&(*slot, ProbeSide::Entry))
+                })
+                .collect();
+            failures.extend(outcome.failures);
+            if partials.is_empty() {
+                successful.extend(outcome.successful);
+                completed.extend(outcome.completed);
+                kept.extend(bundles);
+            } else {
+                // The round's links all drop, so none of its successes or
+                // completions describe a kept link; the remainder re-rounds
+                // and re-completes with its final reactivation time.
+                detach_rebuild_round(&mut detach_bundles, bundles);
+                remaining = round
+                    .members
+                    .into_iter()
+                    .filter(|member| !partials.contains(&member.slot.index))
+                    .collect();
+            }
+        }
+    }
+    (
+        kept,
+        AttachOutcome {
+            successful,
+            failures,
+            completed,
+            exhausted,
+        },
+    )
+}
+
+/// Raw fd of a loaded static twin for the multi `link_create` leaf:
+/// resolved once per program before the first group link so a missing
+/// program fails fast instead of bisecting into per-slot refusals. The
+/// fd stays owned by `ebpf` for the whole attach.
+fn multi_prog_fd(ebpf: &mut Ebpf, program: &'static str) -> Result<RawFd> {
+    let probe: &mut UProbe = ebpf
+        .program_mut(program)
+        .with_context(|| format!("program {program} missing from object"))?
+        .try_into()?;
+    let fd = probe
+        .fd()
+        .with_context(|| format!("program {program} has no loaded fd"))?;
+    Ok(fd.as_fd().as_raw_fd())
+}
+
+/// PID filter for the multi `link_create`: always 0 (all processes).
+/// The 6.9.x kernel pid filter misses threads (osslscope-proven), so
+/// `Scope::Pid` under multi relies on the existing in-BPF `PID_FILTER`
+/// tgid guard, which every static probe already consults via
+/// `scope_auth`; Cgroup/System scopes are BPF-enforced under singles
+/// too. Out-of-scope tasks run the probe prologue and return 0, so
+/// captured events are identical to kernel-filtered singles.
+fn multi_link_pid() -> u32 {
+    0
 }
 
 pub(crate) fn monotonic_ns() -> Option<u64> {
@@ -1281,6 +1993,7 @@ fn attach_targets_with(
                         successful,
                         failures,
                         completed,
+                        exhausted: true,
                     });
                 }
                 failures.push((slot.index, format!("{error:#}")));
@@ -1321,6 +2034,7 @@ fn attach_targets_with(
                             successful,
                             failures,
                             completed,
+                            exhausted: true,
                         });
                     }
                     failures.push((slot.index, format!("{error:#}")));
@@ -1332,6 +2046,7 @@ fn attach_targets_with(
         successful,
         failures,
         completed,
+        exhausted: false,
     })
 }
 
@@ -1678,6 +2393,7 @@ impl Session {
         self.policy
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn start(
         plan: &AttachPlan,
         scope: &Scope,
@@ -1686,19 +2402,68 @@ impl Session {
         pause_generation: Option<OwnedPauseGeneration>,
         ring_bytes: Option<u32>,
         owned_child: Option<&OwnedChild>,
+        selection: BackendSelection,
     ) -> Result<Self> {
         // Raise before the first link: every return/entry pair burns fds
         // against RLIMIT_NOFILE, and no tracker (the previous raise site)
         // exists yet at attach time. A 1024 soft limit dies near slot 256.
         let _ = crate::process::raise_nofile();
         let pause_key = pause_key_for(scope, pause_generation.as_ref())?;
+        let backend = resolve_initial_backend(selection);
+        match Self::start_on_backend(
+            plan,
+            scope,
+            objects,
+            policy,
+            pause_key,
+            ring_bytes,
+            owned_child,
+            backend,
+        ) {
+            Ok(session) => Ok(session),
+            Err(error)
+                if selection == BackendSelection::Auto
+                    && backend == AttachBackend::Multi
+                    && error.downcast_ref::<BackendFallbackRequired>().is_some() =>
+            {
+                // 48-loaded programs cannot single-attach, so an auto multi
+                // attempt the kernel refuses is rebuilt on singles at
+                // session granularity; the dropped session detaches every
+                // probe it created. Forced multi surfaces the refusal.
+                Self::start_on_backend(
+                    plan,
+                    scope,
+                    objects,
+                    policy,
+                    pause_key,
+                    ring_bytes,
+                    owned_child,
+                    AttachBackend::Singles,
+                )
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_on_backend(
+        plan: &AttachPlan,
+        scope: &Scope,
+        objects: &PinnedObjects,
+        policy: CapturePolicy,
+        pause_key: Option<PauseKey>,
+        ring_bytes: Option<u32>,
+        owned_child: Option<&OwnedChild>,
+        backend: AttachBackend,
+    ) -> Result<Self> {
         if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
             bail!(
                 "a pinned provider object changed before attach; refusing to observe changed bytes"
             );
         }
-        let mut session = Self::start_inner(scope, policy, pause_key, ring_bytes, owned_child)
-            .map_err(unsupported_environment_context)?;
+        let mut session =
+            Self::start_inner(scope, policy, pause_key, ring_bytes, owned_child, backend)
+                .map_err(unsupported_environment_context)?;
         session
             .attach_plan(plan, objects)
             .map_err(unsupported_environment_context)?;
@@ -1715,7 +2480,14 @@ impl Session {
     /// requested scope, process-creation boundary, and exec/exit links. Dropping the local
     /// session detaches every link before this finite result is returned.
     pub(crate) fn preflight(scope: &Scope) -> Result<AttachPreflight> {
-        let session = Self::start_inner(scope, CapturePolicy::Allowlisted, None, None, None)?;
+        let session = Self::start_inner(
+            scope,
+            CapturePolicy::Allowlisted,
+            None,
+            None,
+            None,
+            AttachBackend::Singles,
+        )?;
         Ok(AttachPreflight {
             lifecycle: session.lifecycle_tracking_unavailable.is_none(),
             scope: session.process_creation_tracking_unavailable.is_none(),
@@ -1728,6 +2500,7 @@ impl Session {
         pause_key: Option<PauseKey>,
         ring_bytes: Option<u32>,
         owned_child: Option<&OwnedChild>,
+        backend: AttachBackend,
     ) -> Result<Self> {
         if policy.uses_unsafe_decoders() && !cfg!(feature = "unsafe-unvalidated-metadata") {
             bail!("unsafe-unvalidated-metadata policy is absent from this eBPF object");
@@ -1839,8 +2612,13 @@ impl Session {
                             .program_mut(prog_name)
                             .with_context(|| format!("program {prog_name} missing from object"))?
                             .try_into()?;
-                        prog.load()
-                            .with_context(|| format!("loading {prog_name}"))?;
+                        if loads_with_multi_flag(backend, prog_name) {
+                            prog.load_multi()
+                                .with_context(|| format!("loading {prog_name} for multi attach"))?;
+                        } else {
+                            prog.load()
+                                .with_context(|| format!("loading {prog_name}"))?;
+                        }
                     }
                 }
                 SessionPreparation::FreezeDeferred(name) => {
@@ -1899,13 +2677,16 @@ impl Session {
             attach_failures: vec![],
             detach_failures: vec![],
             producers_detached: false,
+            detach_wall_ms: 0,
             successful_static: BTreeSet::new(),
             dynamic_attach_evidence: DynamicAttachEvidence::default(),
             policy,
+            backend,
             uprobe_scope,
             pause_key,
             lifecycle_tracking_unavailable: None,
             process_creation_tracking_unavailable: None,
+            retained_static: BTreeMap::new(),
             links,
         })
     }
@@ -1991,7 +2772,7 @@ impl Session {
             std::num::NonZeroU32::new(pid).ok_or(DynamicLoaderAttachFailure::InvalidPid)?,
         );
         match record_dynamic_attach_with(probe, &mut self.dynamic_attach_evidence, |probe| {
-            probe.attach(point, &path, scope)
+            probe.attach([point], &path, scope)
         }) {
             Ok(id) => {
                 self.links.push(RegisteredLink::DynamicUProbe {
@@ -2060,7 +2841,7 @@ impl Session {
                     .program_mut(program)
                     .with_context(|| format!("program {program} missing from object"))?
                     .try_into()?;
-                probe.attach(point(), &path, scope).map_err(|error| {
+                probe.attach([point()], &path, scope).map_err(|error| {
                     anyhow!(
                         "{program} at object {:?}+{file_offset:#x}: {}",
                         object,
@@ -2161,6 +2942,7 @@ impl Session {
                 }),
             ),
             RegisteredLink::UProbe { .. }
+            | RegisteredLink::MultiUProbe { .. }
             | RegisteredLink::RawTracePoint { .. }
             | RegisteredLink::BtfTracePoint { .. }
             | RegisteredLink::DiagnosticUProbe { .. } => (context, None),
@@ -2224,55 +3006,117 @@ impl Session {
             })
             .collect::<Result<_>>()?;
         let scope = self.uprobe_scope;
-        let ebpf = &mut self.ebpf;
-        let links = &mut self.links;
-        let outcome = attach_targets_with(
-            targets,
-            self.policy,
-            cfg!(feature = "unsafe-unvalidated-metadata"),
-            |slot| {
-                Ok(attach_targets
-                    .get(&slot.index)
-                    .expect("every selected target has retained pinned facts")
-                    .1)
-            },
-            |program, slot, point| {
-                let path = &attach_targets
-                    .get(&slot.index)
-                    .expect("every selected target has retained pinned facts")
-                    .0;
-                let prog: &mut UProbe = ebpf
-                    .program_mut(program)
-                    .with_context(|| format!("program {program} missing from object"))?
-                    .try_into()?;
-                match prog.attach(point, path, scope) {
-                    Ok(id) => {
-                        links.push(RegisteredLink::UProbe {
-                            program,
-                            slot: slot.index,
-                            id,
-                        });
-                        Ok(())
+        let outcome = if self.backend == AttachBackend::Multi {
+            self.attach_targets_multi(targets, &attach_targets)?
+        } else {
+            let ebpf = &mut self.ebpf;
+            let links = &mut self.links;
+            attach_targets_with(
+                targets,
+                self.policy,
+                cfg!(feature = "unsafe-unvalidated-metadata"),
+                |slot| {
+                    Ok(attach_targets
+                        .get(&slot.index)
+                        .expect("every selected target has retained pinned facts")
+                        .1)
+                },
+                |program, slot, point| {
+                    let path = &attach_targets
+                        .get(&slot.index)
+                        .expect("every selected target has retained pinned facts")
+                        .0;
+                    let prog: &mut UProbe = ebpf
+                        .program_mut(program)
+                        .with_context(|| format!("program {program} missing from object"))?
+                        .try_into()?;
+                    match prog.attach([point], path, scope) {
+                        Ok(id) => {
+                            links.push(RegisteredLink::UProbe {
+                                program,
+                                slot: slot.index,
+                                id,
+                            });
+                            Ok(())
+                        }
+                        Err(error) => Err(anyhow!(
+                            "{program} at {}+{:#x}: {}",
+                            slot.object_path,
+                            slot.file_offset,
+                            error_chain(&error)
+                        )),
                     }
-                    Err(error) => Err(anyhow!(
-                        "{program} at {}+{:#x}: {}",
-                        slot.object_path,
-                        slot.file_offset,
-                        error_chain(&error)
-                    )),
-                }
-            },
-            |_| monotonic_ns(),
-        )?;
+                },
+                |_| monotonic_ns(),
+            )?
+        };
         let AttachOutcome {
             successful,
             failures,
             completed,
+            exhausted: _,
         } = outcome;
+        retain_from_successful(
+            &mut self.retained_static,
+            targets,
+            &attach_targets,
+            &successful,
+        );
         self.successful_static.extend(successful);
         let failed: Vec<_> = failures.iter().map(|(slot, _)| *slot).collect();
         self.attach_failures.extend(failures);
         Ok((failed, completed))
+    }
+
+    /// Multi half of [`Session::attach_targets`]: regroups the targets by
+    /// (attach path, entry program) and attaches one return link plus one
+    /// entry link per group over the 48-loaded twins, pid-wide with the
+    /// existing in-BPF scope filter (see [`multi_link_pid`]). Late
+    /// joiners (live discovery) form their own groups and attach as
+    /// additional links; the Task 2.3 rebuild covers retirement and
+    /// replacement, not coalescing live groups. A kernel without multi
+    /// support aborts with
+    /// [`BackendFallbackRequired`] (downcastable through anyhow) so
+    /// `start` can rebuild the session on singles.
+    fn attach_targets_multi(
+        &mut self,
+        targets: &[Slot],
+        attach_targets: &BTreeMap<u32, (PathBuf, ElfAbi)>,
+    ) -> Result<AttachOutcome> {
+        let groups = group_static_slots(
+            targets,
+            self.policy,
+            cfg!(feature = "unsafe-unvalidated-metadata"),
+            attach_targets,
+        );
+        let mut programs: BTreeSet<&'static str> =
+            groups.iter().map(|group| group.entry_program).collect();
+        programs.insert("p11_return");
+        let mut prog_fds = BTreeMap::new();
+        for program in programs {
+            prog_fds.insert(program, multi_prog_fd(&mut self.ebpf, program)?);
+        }
+        let pid = multi_link_pid();
+        let (bundles, outcome) = attach_target_groups_with(
+            &groups,
+            |_| monotonic_ns(),
+            |program, path, slice, is_return| {
+                let prog_fd = prog_fds
+                    .get(program)
+                    .copied()
+                    .expect("every group side pre-resolved its program fd");
+                let (offsets, cookies): (Vec<u64>, Vec<u64>) = slice.iter().copied().unzip();
+                attach_group(prog_fd, pid, path, &offsets, &cookies, is_return)
+            },
+        )?;
+        for bundle in bundles {
+            self.links.push(RegisteredLink::MultiUProbe {
+                program: bundle.program,
+                slots: bundle.slots,
+                fds: bundle.links,
+            });
+        }
+        Ok(outcome)
     }
 
     /// Applies the attachment half of a descriptor downgrade after the caller
@@ -2283,7 +3127,7 @@ impl Session {
         plan: &mut AttachPlan,
         replace: &[Slot],
         objects: &PinnedObjects,
-    ) -> Result<ReplacementAttachResult> {
+    ) -> Result<ReplacementOutcome> {
         if let Some(slot) = replace.iter().find(|slot| self.has_slot_link(slot.index)) {
             bail!(
                 "replacement slot {} still has an old link; detach and synchronize it before reattach",
@@ -2313,14 +3157,132 @@ impl Session {
         for slot in &failed_slots {
             plan.deactivate(slot.index);
         }
-        Ok((completed, detach.is_err()))
+        let (failed_detach, rebuild) = match detach {
+            Ok(rebuild) => (false, rebuild),
+            Err(_) => (true, DetachOutcome::default()),
+        };
+        Ok(ReplacementOutcome {
+            completed,
+            failed_detach,
+            rebuild,
+        })
     }
 
     /// Detaches all slot links selected by a finite retirement/replacement
-    /// delta. Each attempt is made even if an earlier Aya detach failed.
-    pub fn detach_slots(&mut self, slots: &[Slot]) -> Result<()> {
-        let slots: BTreeSet<_> = slots.iter().map(|slot| slot.index).collect();
-        self.detach_links(|link| link.slot().is_some_and(|slot| slots.contains(&slot)))
+    /// delta, rebuilding partially covered multi groups. Each detach attempt
+    /// is made even if an earlier one failed; the report carries per-member
+    /// rebuild evidence for the caller to apply.
+    pub fn detach_slots(&mut self, slots: &[Slot]) -> Result<DetachOutcome> {
+        let requested: BTreeSet<_> = slots.iter().map(|slot| slot.index).collect();
+        let Some(affected) = plan_group_rebuild(&self.links, &requested) else {
+            let detached = self.detach_links(|link| match link {
+                // A group link drops only with all its members.
+                RegisteredLink::MultiUProbe { slots, .. } => {
+                    !slots.is_empty() && slots.iter().all(|slot| requested.contains(slot))
+                }
+                _ => link.slots().iter().any(|slot| requested.contains(slot)),
+            });
+            prune_linkless_retained(&mut self.retained_static, &self.links);
+            return detached.map(|()| DetachOutcome::default());
+        };
+        self.rebuild_affected_groups(&requested, &affected)
+    }
+
+    /// Explicit multi-group rebuild for a partially covered retirement:
+    /// determine every affected member from retained facts, detach old
+    /// entries before returns, then reattach surviving siblings returns
+    /// before entries. A detach failure aborts before any reattach — a
+    /// maybe-live old link must never overlap a replacement, and the
+    /// ownership uncertainty blocks additions through the existing
+    /// [`attachment_admission`] refusal. Reattach evidence is per member:
+    /// only fully paired survivors count as multi-attached.
+    fn rebuild_affected_groups(
+        &mut self,
+        requested: &BTreeSet<u32>,
+        affected: &BTreeSet<u32>,
+    ) -> Result<DetachOutcome> {
+        let mut survivors = Vec::new();
+        let mut missing = Vec::new();
+        for member in affected.difference(requested) {
+            match self.retained_static.get(member) {
+                Some(target) => survivors.push(target.clone()),
+                None => missing.push(*member),
+            }
+        }
+        // Regroup and resolve program fds before the first link mutation:
+        // a failure here leaves every old link untouched.
+        let regrouped: Vec<Slot> = survivors.iter().map(|target| target.slot.clone()).collect();
+        let targets: BTreeMap<u32, (PathBuf, ElfAbi)> = survivors
+            .iter()
+            .map(|target| (target.slot.index, (target.path.clone(), target.abi)))
+            .collect();
+        let groups = group_static_slots(
+            &regrouped,
+            self.policy,
+            cfg!(feature = "unsafe-unvalidated-metadata"),
+            &targets,
+        );
+        let rebuilt_groups = affected_group_count(&self.links, affected);
+        let mut programs: BTreeSet<&'static str> =
+            groups.iter().map(|group| group.entry_program).collect();
+        programs.insert("p11_return");
+        let mut prog_fds = BTreeMap::new();
+        for program in programs {
+            prog_fds.insert(program, multi_prog_fd(&mut self.ebpf, program)?);
+        }
+        self.detach_links(|link| match link {
+            RegisteredLink::MultiUProbe { slots, .. } => {
+                slots.iter().any(|slot| affected.contains(slot))
+            }
+            _ => link.slots().iter().any(|slot| requested.contains(slot)),
+        })?;
+        prune_linkless_retained(&mut self.retained_static, &self.links);
+        let pid = multi_link_pid();
+        let (bundles, outcome) = reattach_rebuilt_groups_with(
+            &groups,
+            |_| monotonic_ns(),
+            |program, path, slice, is_return| {
+                let prog_fd = prog_fds
+                    .get(program)
+                    .copied()
+                    .expect("every rebuilt side pre-resolved its program fd");
+                let (offsets, cookies): (Vec<u64>, Vec<u64>) = slice.iter().copied().unzip();
+                attach_group(prog_fd, pid, path, &offsets, &cookies, is_return)
+            },
+            // Closing the owned fds detaches the rolled-back links.
+            drop,
+        );
+        for bundle in bundles {
+            self.links.push(RegisteredLink::MultiUProbe {
+                program: bundle.program,
+                slots: bundle.slots,
+                fds: bundle.links,
+            });
+        }
+        let AttachOutcome {
+            successful,
+            failures: mut rebuild_failures,
+            completed: recompleted,
+            exhausted: _,
+        } = outcome;
+        self.successful_static.extend(successful);
+        for member in missing {
+            rebuild_failures.push((
+                member,
+                format!(
+                    "slot {member} was not reattached: \
+                     no retained attach facts for a live group member"
+                ),
+            ));
+        }
+        self.attach_failures
+            .extend(rebuild_failures.iter().cloned());
+        prune_linkless_retained(&mut self.retained_static, &self.links);
+        Ok(DetachOutcome {
+            recompleted,
+            rebuild_failures,
+            rebuilt_groups,
+        })
     }
 
     /// Detach every event/map producer while keeping the maps and ring reader
@@ -2329,7 +3291,9 @@ impl Session {
     /// removed last. Kernel detach does not wait for callbacks already running
     /// on another CPU; callers must not claim that the terminal drain is final.
     pub fn detach_producers(&mut self) -> Result<()> {
+        let start = std::time::Instant::now();
         let detached = self.detach_links(|_| true);
+        self.detach_wall_ms = detach_wall_ms_since(start);
         finish_producer_detach(
             &mut self.producers_detached,
             &self.detach_failures,
@@ -2337,9 +3301,21 @@ impl Session {
         )
     }
 
+    /// Wall time the producer detach took, in whole milliseconds; zero
+    /// when detach never ran.
+    pub(crate) fn detach_wall_ms(&self) -> u64 {
+        self.detach_wall_ms
+    }
+
     /// The bound the next `EVENTS` poll gets — see `events::poll_quantum`.
     pub fn live_poll_quantum(&self) -> Option<usize> {
         events::poll_quantum(self.producers_detached)
+    }
+
+    /// Whether every producer detached: live drains re-poll within the
+    /// tick budget, the terminal drain takes one explicitly bounded poll.
+    pub(crate) fn producers_detached(&self) -> bool {
+        self.producers_detached
     }
 
     pub(crate) fn take_root_seed(&mut self) -> Option<RootSeed> {
@@ -2347,7 +3323,7 @@ impl Session {
     }
 
     fn has_slot_link(&self, slot: u32) -> bool {
-        self.links.iter().any(|link| link.slot() == Some(slot))
+        links_cover_slot(&self.links, slot)
     }
 
     fn detach_links(&mut self, mut select: impl FnMut(&RegisteredLink) -> bool) -> Result<()> {
@@ -2390,6 +3366,7 @@ impl Session {
             None,
             None,
             None,
+            AttachBackend::Singles,
         )
     }
 
@@ -2401,10 +3378,10 @@ impl Session {
             .context("diagnostic p11_entry program")?
             .try_into()?;
         let id = probe.attach(
-            UProbeAttachPoint {
+            [UProbeAttachPoint {
                 location: UProbeAttachLocation::AbsoluteOffset(offset),
                 cookie: None,
-            },
+            }],
             path,
             UProbeScope::CallingProcess,
         )?;
@@ -2421,6 +3398,13 @@ impl Session {
 
     pub fn event_drain(&mut self) -> Result<events::Drain<'_>> {
         events::Drain::new(&mut self.ebpf, self.events_domain.clone())
+    }
+
+    /// Borrow the EVENTS map descriptor for readiness waits. The idle
+    /// wait polls this fd (wake on data or timeout); draining still
+    /// goes through `event_drain`, the single consumer.
+    pub(crate) fn events_readiness_fd(&self) -> BorrowedFd<'_> {
+        self.events_domain.as_fd()
     }
 
     pub(crate) fn discovery_dequeue(&mut self) -> Result<Option<events::DiscoveryItem>> {
@@ -2519,6 +3503,13 @@ impl Session {
         self.successful_static.len()
     }
 
+    /// True when static endpoints attached through multi group links.
+    /// The backend is fixed at load, so this is exact: every static
+    /// endpoint in the session shares it.
+    pub fn static_multi_attached(&self) -> bool {
+        self.backend == AttachBackend::Multi && !self.successful_static.is_empty()
+    }
+
     pub(crate) fn dynamic_per_offset_attached(&self) -> bool {
         self.dynamic_attach_evidence.successful()
     }
@@ -2526,6 +3517,12 @@ impl Session {
 
 fn detach_registered_link(ebpf: &mut Ebpf, link: RegisteredLink) -> Result<()> {
     match link {
+        // Detach is drop: closing the last link fd detaches the kernel
+        // link, so moving the fds out here releases every leaf.
+        RegisteredLink::MultiUProbe { fds, .. } => {
+            drop(fds);
+            Ok(())
+        }
         RegisteredLink::UProbe { program, id, .. }
         | RegisteredLink::DiagnosticUProbe { program, id } => (|| {
             let probe: &mut UProbe = ebpf
@@ -2564,6 +3561,10 @@ fn detach_registered_link(ebpf: &mut Ebpf, link: RegisteredLink) -> Result<()> {
                 .with_context(|| format!("detaching {program}"))
         })(),
     }
+}
+
+fn detach_wall_ms_since(start: std::time::Instant) -> u64 {
+    start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 fn finish_producer_detach(
@@ -2663,6 +3664,197 @@ mod policy_output {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn backport_multi_sections_parse_for_uprobe_twins() {
+        use std::str::FromStr as _;
+        for section in [
+            "uprobe/p11_entry",
+            "uprobe.s/p11_entry",
+            "uprobe.multi/p11_entry",
+            "uprobe.multi.s/p11_entry",
+            "uretprobe/p11_return",
+            "uretprobe.s/p11_return",
+            "uretprobe.multi/p11_return",
+            "uretprobe.multi.s/p11_return",
+        ] {
+            assert!(
+                aya_obj::ProgramSection::from_str(section).is_ok(),
+                "{section} must parse"
+            );
+        }
+    }
+
+    #[test]
+    fn backport_multi_flag_set_only_for_multi_sections() {
+        use aya_obj::ProgramSection;
+        use std::str::FromStr as _;
+        for (section, sleepable, multi, ret) in [
+            ("uprobe/p11_entry", false, false, false),
+            ("uprobe.s/p11_entry", true, false, false),
+            ("uprobe.multi/p11_entry", false, true, false),
+            ("uprobe.multi.s/p11_entry", true, true, false),
+            ("uretprobe/p11_return", false, false, true),
+            ("uretprobe.s/p11_return", true, false, true),
+            ("uretprobe.multi/p11_return", false, true, true),
+            ("uretprobe.multi.s/p11_return", true, true, true),
+        ] {
+            let parsed = ProgramSection::from_str(section).unwrap();
+            let (actual_sleepable, actual_multi, actual_ret) = match parsed {
+                ProgramSection::UProbe {
+                    sleepable, multi, ..
+                } => (sleepable, multi, false),
+                ProgramSection::URetProbe {
+                    sleepable, multi, ..
+                } => (sleepable, multi, true),
+                _ => panic!("{section} parsed as {parsed:?}"),
+            };
+            assert_eq!(
+                (actual_sleepable, actual_multi, actual_ret),
+                (sleepable, multi, ret),
+                "{section}"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_selection_parses_the_three_documented_values() {
+        use super::BackendSelection;
+        assert_eq!(
+            BackendSelection::from_cli("auto").unwrap(),
+            BackendSelection::Auto
+        );
+        assert_eq!(
+            BackendSelection::from_cli("multi").unwrap(),
+            BackendSelection::Multi
+        );
+        assert_eq!(
+            BackendSelection::from_cli("singles").unwrap(),
+            BackendSelection::Singles
+        );
+        assert_eq!(BackendSelection::default(), BackendSelection::Auto);
+        for bad in ["", "MULTI", "uprobe-multi", "per-offset", "multi "] {
+            assert!(
+                BackendSelection::from_cli(bad).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_policy_follows_the_6_9_floor_and_rejects_garbage() {
+        use super::multi_allowed_on;
+        for release in [
+            "6.9.0",
+            "6.9.12-1-generic",
+            "6.10.0",
+            "6.15.0-100-generic",
+            "7.0.0",
+        ] {
+            assert!(multi_allowed_on(release), "{release} must allow multi");
+        }
+        for release in ["6.8.0", "6.6.0", "6.5.0-15-generic", "5.15.0", "4.19.0", ""] {
+            assert!(!multi_allowed_on(release), "{release:?} must stay singles");
+        }
+        for release in ["not-a-release", "6", "6.x", "v6.9.0-"] {
+            assert!(
+                !multi_allowed_on(release),
+                "{release:?} must conservatively stay singles"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_links_attach_pid_wide_and_filter_in_bpf() {
+        // Pin the sketch step-6 decision: the kernel pid filter is never
+        // used for multi links (6.9.x misses threads); Scope::Pid rides
+        // on the in-BPF PID_FILTER tgid guard every static probe checks.
+        assert_eq!(super::multi_link_pid(), 0);
+    }
+
+    #[test]
+    fn only_static_endpoint_twins_take_the_multi_load_flag() {
+        use super::AttachBackend;
+        use super::loads_with_multi_flag;
+        for program in [
+            "p11_return",
+            "p11_entry",
+            "p11_entry_ia32",
+            "p11_entry_template",
+            "p11_entry_template_types",
+            "p11_entry_template_pair",
+        ] {
+            assert!(
+                loads_with_multi_flag(AttachBackend::Multi, program),
+                "{program} must load with the multi flag"
+            );
+            assert!(
+                !loads_with_multi_flag(AttachBackend::Singles, program),
+                "{program} must load plain under singles"
+            );
+        }
+        for program in [
+            "dl_debug_state",
+            "function_list_entry",
+            "sched_process_exec",
+            "task_newtask",
+            "interface_list_worker",
+            "p11_entry_template_second",
+            "no_such_program",
+        ] {
+            assert!(
+                !loads_with_multi_flag(AttachBackend::Multi, program),
+                "{program} must stay on singles (dynamic/diag/lifecycle)"
+            );
+        }
+    }
+
+    #[test]
+    fn static_probe_side_routes_entry_variants_and_return() {
+        use super::ProbeSide;
+        use super::static_probe_side;
+        assert_eq!(static_probe_side("p11_return"), Some(ProbeSide::Return));
+        for program in [
+            "p11_entry",
+            "p11_entry_ia32",
+            "p11_entry_template",
+            "p11_entry_template_types",
+            "p11_entry_template_pair",
+        ] {
+            assert_eq!(static_probe_side(program), Some(ProbeSide::Entry));
+        }
+        assert_eq!(static_probe_side("task_newtask"), None);
+    }
+
+    #[test]
+    fn backend_resolution_forces_directly_and_auto_follows_the_kernel() {
+        use super::AttachBackend;
+        use super::BackendSelection;
+        use super::kernel_supports_multi;
+        use super::resolve_initial_backend;
+        assert_eq!(
+            resolve_initial_backend(BackendSelection::Multi),
+            AttachBackend::Multi
+        );
+        assert_eq!(
+            resolve_initial_backend(BackendSelection::Singles),
+            AttachBackend::Singles
+        );
+        let expected = if kernel_supports_multi() {
+            AttachBackend::Multi
+        } else {
+            AttachBackend::Singles
+        };
+        assert_eq!(resolve_initial_backend(BackendSelection::Auto), expected);
+    }
+
+    #[test]
+    fn detach_wall_time_is_measured_in_whole_milliseconds() {
+        let now = std::time::Instant::now();
+        assert_eq!(super::detach_wall_ms_since(now), 0);
+        let past = now - std::time::Duration::from_millis(61_234);
+        assert_eq!(super::detach_wall_ms_since(past), 61_234);
+    }
+
     #[test]
     fn owner_limit_uses_exact_loaded_start_shape() {
         for (capacity, limit) in [(16_384, 16_448), (1, 65)] {
@@ -3174,7 +4366,10 @@ mod tests {
         );
         let mut clean = false;
         finish_producer_detach(&mut clean, &[], Ok(())).unwrap();
-        assert_eq!(events::poll_quantum(clean), None);
+        assert_eq!(
+            events::poll_quantum(clean),
+            Some(events::TERMINAL_DRAIN_BOUND)
+        );
         assert!(attachment_admission(&failures, true).is_err());
         attachment_admission(&failures, false).unwrap();
     }
@@ -3833,6 +5028,835 @@ mod tests {
         }
     }
 
+    fn group_slot(index: u32, object: u32, semantics: SlotSemantics) -> crate::plan::Slot {
+        let mut slot = test_slot(index);
+        slot.object = PinnedObjectId(object);
+        slot.semantics = semantics;
+        slot
+    }
+
+    fn group_targets(entries: &[(u32, &str, ElfAbi)]) -> BTreeMap<u32, (PathBuf, ElfAbi)> {
+        entries
+            .iter()
+            .map(|(index, path, abi)| (*index, (PathBuf::from(path), *abi)))
+            .collect()
+    }
+
+    fn group_member_indices(group: &StaticGroup) -> Vec<u32> {
+        group.members.iter().map(|m| m.slot.index).collect()
+    }
+
+    fn grouped_offset(groups: &[StaticGroup], index: u32) -> u64 {
+        groups
+            .iter()
+            .flat_map(|group| &group.members)
+            .find(|member| member.slot.index == index)
+            .unwrap_or_else(|| panic!("slot {index} is grouped"))
+            .offset
+    }
+
+    #[test]
+    fn groups_split_by_attach_path_and_entry_program() {
+        let slots = vec![
+            group_slot(0, 1, SlotSemantics::COUNT_ONLY),
+            group_slot(1, 1, SlotSemantics::COUNT_ONLY),
+            group_slot(2, 2, SlotSemantics::COUNT_ONLY),
+            group_slot(3, 2, SlotSemantics::COUNT_ONLY),
+        ];
+        let targets = group_targets(&[
+            (0, "/a.so", ElfAbi::Lp64),
+            (1, "/a.so", ElfAbi::Lp64),
+            (2, "/b.so", ElfAbi::Lp64),
+            (3, "/b.so", ElfAbi::Ilp32),
+        ]);
+        let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, true, &targets);
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].path, PathBuf::from("/a.so"));
+        assert_eq!(groups[0].entry_program, "p11_entry");
+        assert_eq!(group_member_indices(&groups[0]), vec![0, 1]);
+        assert_eq!(groups[1].path, PathBuf::from("/b.so"));
+        assert_eq!(groups[1].entry_program, "p11_entry");
+        assert_eq!(group_member_indices(&groups[1]), vec![2]);
+        assert_eq!(groups[2].path, PathBuf::from("/b.so"));
+        assert_eq!(groups[2].entry_program, "p11_entry_ia32");
+        assert_eq!(group_member_indices(&groups[2]), vec![3]);
+        for group in &groups {
+            for member in &group.members {
+                assert_eq!(member.offset, member.slot.file_offset);
+                assert_eq!(
+                    member.cookie,
+                    attach_cookie(member.slot.index, member.slot.descriptor_index)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn groups_sort_scrambled_members_deterministically() {
+        let slots = vec![
+            group_slot(3, 2, SlotSemantics::COUNT_ONLY),
+            group_slot(0, 1, SlotSemantics::COUNT_ONLY),
+            group_slot(2, 2, SlotSemantics::COUNT_ONLY),
+            group_slot(1, 1, SlotSemantics::COUNT_ONLY),
+        ];
+        let targets = group_targets(&[
+            (0, "/a.so", ElfAbi::Lp64),
+            (1, "/a.so", ElfAbi::Lp64),
+            (2, "/b.so", ElfAbi::Lp64),
+            (3, "/b.so", ElfAbi::Lp64),
+        ]);
+        let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(group_member_indices(&groups[0]), vec![0, 1]);
+        assert_eq!(group_member_indices(&groups[1]), vec![2, 3]);
+    }
+
+    type MockLink = Vec<(u64, u64)>;
+
+    type MockCall = (String, bool, Vec<(u64, u64)>);
+    type MockFail = dyn Fn(&str, &[(u64, u64)], bool) -> Option<io::Error>;
+
+    struct MockGroup {
+        calls: std::cell::RefCell<Vec<MockCall>>,
+        fail: Box<MockFail>,
+    }
+
+    impl MockGroup {
+        fn leaf(
+            &self,
+        ) -> impl FnMut(&'static str, &Path, &[(u64, u64)], bool) -> io::Result<MockLink> + '_
+        {
+            |program, path, sites, is_return| {
+                self.calls
+                    .borrow_mut()
+                    .push((program.to_string(), is_return, sites.to_vec()));
+                if let Some(error) = (self.fail)(path.to_str().unwrap(), sites, is_return) {
+                    return Err(error);
+                }
+                Ok(sites.to_vec())
+            }
+        }
+
+        fn programs_called(&self) -> Vec<(String, bool)> {
+            self.calls
+                .borrow()
+                .iter()
+                .map(|(program, is_return, _)| (program.clone(), *is_return))
+                .collect()
+        }
+    }
+
+    fn two_groups() -> (Vec<crate::plan::Slot>, BTreeMap<u32, (PathBuf, ElfAbi)>) {
+        let slots = vec![
+            group_slot(0, 1, SlotSemantics::COUNT_ONLY),
+            group_slot(1, 1, SlotSemantics::COUNT_ONLY),
+            group_slot(2, 2, SlotSemantics::COUNT_ONLY),
+            group_slot(3, 2, SlotSemantics::COUNT_ONLY),
+        ];
+        let targets = group_targets(&[
+            (0, "/a.so", ElfAbi::Lp64),
+            (1, "/a.so", ElfAbi::Lp64),
+            (2, "/b.so", ElfAbi::Lp64),
+            (3, "/b.so", ElfAbi::Lp64),
+        ]);
+        (slots, targets)
+    }
+
+    #[test]
+    fn multi_all_good_links_return_before_entry_per_group() {
+        let (slots, targets) = two_groups();
+        let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
+        assert_eq!(groups.len(), 2);
+        let mock = MockGroup {
+            calls: std::cell::RefCell::new(Vec::new()),
+            fail: Box::new(|_, _, _| None),
+        };
+        let (bundles, outcome) =
+            attach_target_groups_with(&groups, |_| Some(7), mock.leaf()).unwrap();
+        assert_eq!(bundles.len(), 4);
+        for bundle in &bundles {
+            assert_eq!(bundle.links.len(), 1);
+            assert_eq!(bundle.slots.len(), 2);
+        }
+        assert_eq!(bundles[0].program, "p11_return");
+        assert_eq!(bundles[1].program, "p11_entry");
+        assert_eq!(bundles[2].program, "p11_return");
+        assert_eq!(bundles[3].program, "p11_entry");
+        assert_eq!(outcome.successful.len(), 8);
+        assert!(outcome.failures.is_empty());
+        assert!(!outcome.exhausted);
+        assert_eq!(outcome.completed.len(), 4);
+        assert!(
+            outcome.completed.iter().all(|(_, at)| *at == Some(7)),
+            "completed carries the clock"
+        );
+        assert_eq!(mock.calls.borrow().len(), 4);
+        let called: Vec<(String, bool)> = mock.programs_called();
+        let called: Vec<(&str, bool)> = called.iter().map(|(p, r)| (p.as_str(), *r)).collect();
+        assert_eq!(
+            called,
+            vec![
+                ("p11_return", true),
+                ("p11_entry", false),
+                ("p11_return", true),
+                ("p11_entry", false),
+            ]
+        );
+    }
+
+    #[test]
+    fn multi_poison_return_refusal_skips_entry_for_that_member() {
+        let (slots, targets) = two_groups();
+        let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
+        let poison = grouped_offset(&groups, 1);
+        let mock = MockGroup {
+            calls: std::cell::RefCell::new(Vec::new()),
+            fail: Box::new(move |_, sites, is_return| {
+                if is_return && sites.iter().any(|(offset, _)| *offset == poison) {
+                    Some(io::Error::from_raw_os_error(libc::EINVAL))
+                } else {
+                    None
+                }
+            }),
+        };
+        let (bundles, outcome) =
+            attach_target_groups_with(&groups, |_| Some(7), mock.leaf()).unwrap();
+        assert_eq!(outcome.successful.len(), 6);
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(outcome.failures[0].0, 1);
+        assert!(
+            outcome.failures[0]
+                .1
+                .starts_with("p11_return at /a.so+0x18: ")
+        );
+        assert_eq!(outcome.completed.len(), 3);
+        // Entry never saw the refused member's offset.
+        for (program, is_return, sites) in mock.calls.borrow().iter() {
+            if program == "p11_entry" && !is_return {
+                assert!(
+                    sites.iter().all(|(offset, _)| *offset != poison),
+                    "entry must exclude return-refused members"
+                );
+            }
+        }
+        let return_a = bundles.iter().find(|b| b.program == "p11_return").unwrap();
+        assert_eq!(return_a.slots, vec![0]);
+    }
+
+    #[test]
+    fn multi_entry_poison_leaves_return_and_records_entry_failure() {
+        let (slots, targets) = two_groups();
+        let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
+        let poison = grouped_offset(&groups, 3);
+        let mock = MockGroup {
+            calls: std::cell::RefCell::new(Vec::new()),
+            fail: Box::new(move |_, sites, is_return| {
+                if !is_return && sites.iter().any(|(offset, _)| *offset == poison) {
+                    Some(io::Error::from_raw_os_error(libc::EINVAL))
+                } else {
+                    None
+                }
+            }),
+        };
+        let (bundles, outcome) =
+            attach_target_groups_with(&groups, |_| Some(7), mock.leaf()).unwrap();
+        assert_eq!(outcome.successful.len(), 7);
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(outcome.failures[0].0, 3);
+        assert!(
+            outcome.failures[0]
+                .1
+                .starts_with("p11_entry at /b.so+0x28: ")
+        );
+        assert_eq!(outcome.completed.len(), 3);
+        // The return endpoint stays successful without its entry.
+        assert!(outcome.successful.contains(&(3, ProbeSide::Return)));
+        assert!(!outcome.successful.contains(&(3, ProbeSide::Entry)));
+        assert_eq!(bundles.len(), 4);
+    }
+
+    #[test]
+    fn multi_permission_error_fails_the_side_and_continues() {
+        let (slots, targets) = two_groups();
+        let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
+        let mock = MockGroup {
+            calls: std::cell::RefCell::new(Vec::new()),
+            fail: Box::new(|path, _, _| {
+                if path == "/a.so" {
+                    Some(io::Error::from_raw_os_error(libc::EPERM))
+                } else {
+                    None
+                }
+            }),
+        };
+        let (bundles, outcome) =
+            attach_target_groups_with(&groups, |_| Some(7), mock.leaf()).unwrap();
+        // Group /a.so refused wholesale (one fail-fast attempt, no entry
+        // attempts); group /b.so attached fully.
+        let calls = mock.calls.borrow();
+        assert_eq!(calls.len(), 3);
+        for (program, _, sites) in calls.iter() {
+            if program == "p11_entry" {
+                assert!(
+                    sites.iter().all(|(offset, _)| *offset >= 0x20),
+                    "no entry attempts for the refused group"
+                );
+            }
+        }
+        assert_eq!(outcome.successful.len(), 4);
+        assert_eq!(outcome.failures.len(), 2);
+        assert_eq!(bundles.len(), 2);
+        assert!(bundles.iter().all(|b| b.slots == vec![2, 3]));
+    }
+
+    #[test]
+    fn multi_exhaustion_ends_the_run_with_a_summary() {
+        let (slots, targets) = two_groups();
+        let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
+        let mock = MockGroup {
+            calls: std::cell::RefCell::new(Vec::new()),
+            fail: Box::new(|_, _, is_return| {
+                if !is_return {
+                    Some(io::Error::from_raw_os_error(libc::EMFILE))
+                } else {
+                    None
+                }
+            }),
+        };
+        let (bundles, outcome) =
+            attach_target_groups_with(&groups, |_| Some(7), mock.leaf()).unwrap();
+        assert!(outcome.exhausted);
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(outcome.failures[0].0, 0);
+        assert_eq!(
+            outcome.failures[0].1,
+            "fd table exhausted attaching slot 0 (2 endpoints across 1 links); \
+             raise RLIMIT_NOFILE (ulimit -n) and retry"
+        );
+        // Partial links are kept; later groups are never attempted.
+        assert_eq!(bundles.len(), 1);
+        assert_eq!(bundles[0].program, "p11_return");
+        assert!(
+            mock.calls
+                .borrow()
+                .iter()
+                .all(|(_, _, sites)| sites.len() <= 2)
+        );
+        assert_eq!(outcome.successful.len(), 2);
+        assert!(outcome.completed.is_empty());
+    }
+
+    #[test]
+    fn multi_unsupported_aborts_with_the_fallback_sentinel() {
+        let (slots, targets) = two_groups();
+        let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
+        for errno in [libc::ENOTSUP, libc::EOPNOTSUPP] {
+            let mock = MockGroup {
+                calls: std::cell::RefCell::new(Vec::new()),
+                fail: Box::new(move |_, _, _| Some(io::Error::from_raw_os_error(errno))),
+            };
+            let error = attach_target_groups_with(&groups, |_| Some(7), mock.leaf()).unwrap_err();
+            assert!(
+                format!("{error}").contains("multi-uprobe unsupported"),
+                "unexpected sentinel text: {error}"
+            );
+            assert_eq!(mock.calls.borrow().len(), 1);
+        }
+    }
+
+    #[test]
+    fn multi_unsupported_on_entry_side_still_aborts() {
+        let (slots, targets) = two_groups();
+        let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
+        let mock = MockGroup {
+            calls: std::cell::RefCell::new(Vec::new()),
+            fail: Box::new(|_, _, is_return| {
+                if !is_return {
+                    Some(io::Error::from_raw_os_error(libc::ENOTSUP))
+                } else {
+                    None
+                }
+            }),
+        };
+        let error = attach_target_groups_with(&groups, |_| Some(7), mock.leaf()).unwrap_err();
+        assert!(format!("{error}").contains("multi-uprobe unsupported"));
+        // Return linked, then the entry side proved the kernel lacks multi.
+        assert_eq!(mock.calls.borrow().len(), 2);
+    }
+
+    fn multi_link(program: &'static str, slots: Vec<u32>) -> RegisteredLink {
+        RegisteredLink::MultiUProbe {
+            program,
+            slots,
+            fds: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn multi_link_registry_reports_members_program_and_no_context() {
+        let link = multi_link("p11_entry", vec![3, 7]);
+        assert_eq!(link.slots(), &[3, 7]);
+        assert!(matches!(
+            link.producer(),
+            ProducerProgram::UProbe("p11_entry")
+        ));
+        assert_eq!(link.context(), None);
+        let link = multi_link("p11_return", vec![9]);
+        assert!(matches!(
+            link.producer(),
+            ProducerProgram::UProbe("p11_return")
+        ));
+    }
+
+    #[test]
+    fn partial_multi_member_detected_whole_bundle_is_not() {
+        let links = vec![multi_link("p11_return", vec![3, 7])];
+        assert_eq!(
+            find_partial_multi_member(&links, &BTreeSet::from([7, 9])),
+            Some(7)
+        );
+        assert_eq!(
+            find_partial_multi_member(&links, &BTreeSet::from([3, 7])),
+            None
+        );
+        assert_eq!(
+            find_partial_multi_member(&links, &BTreeSet::from([9])),
+            None
+        );
+        assert_eq!(find_partial_multi_member(&[], &BTreeSet::from([7])), None);
+    }
+
+    #[test]
+    fn slot_coverage_sees_multi_members() {
+        let links = vec![multi_link("p11_return", vec![3, 7])];
+        assert!(links_cover_slot(&links, 7));
+        assert!(!links_cover_slot(&links, 9));
+        assert!(!links_cover_slot(&[], 7));
+    }
+
+    #[test]
+    fn rebuild_closure_collects_every_affected_member() {
+        let links = vec![
+            multi_link("p11_return", vec![0, 1, 2]),
+            multi_link("p11_entry", vec![0, 1, 2]),
+            multi_link("p11_return", vec![5, 6]),
+            multi_link("p11_entry", vec![5, 6]),
+        ];
+        assert_eq!(
+            plan_group_rebuild(&links, &BTreeSet::from([1])),
+            Some(BTreeSet::from([0, 1, 2])),
+            "a partially retired group rebuilds every member, survivors included"
+        );
+        assert_eq!(
+            plan_group_rebuild(&links, &BTreeSet::from([0, 1, 2])),
+            None,
+            "a wholly retired bundle detaches with no rebuild"
+        );
+        assert_eq!(
+            plan_group_rebuild(&links, &BTreeSet::from([9])),
+            None,
+            "an unlinked slot never triggers a rebuild"
+        );
+        assert_eq!(
+            plan_group_rebuild(&links, &BTreeSet::new()),
+            None,
+            "an empty retirement never triggers a rebuild"
+        );
+        assert_eq!(
+            plan_group_rebuild(&[], &BTreeSet::from([1])),
+            None,
+            "no links means no groups to rebuild"
+        );
+    }
+
+    #[test]
+    fn rebuild_closure_follows_entry_subset_bundles() {
+        // An entry-refused member left the return bundle wider than the
+        // entry bundle; retiring the refused member still rebuilds the
+        // entry side that shares its surviving sibling.
+        let links = vec![
+            multi_link("p11_return", vec![0, 1]),
+            multi_link("p11_entry", vec![0]),
+        ];
+        assert_eq!(
+            plan_group_rebuild(&links, &BTreeSet::from([1])),
+            Some(BTreeSet::from([0, 1]))
+        );
+    }
+
+    #[test]
+    fn rebuild_closure_is_transitive_over_overlapping_bundles() {
+        let links = vec![
+            multi_link("p11_return", vec![0, 1]),
+            multi_link("p11_return", vec![1, 2]),
+        ];
+        assert_eq!(
+            plan_group_rebuild(&links, &BTreeSet::from([0])),
+            Some(BTreeSet::from([0, 1, 2]))
+        );
+    }
+
+    #[test]
+    fn affected_group_count_covers_disturbed_bundles_once() {
+        let links = vec![
+            multi_link("p11_return", vec![0, 1, 2]),
+            multi_link("p11_entry", vec![0, 1]),
+            multi_link("p11_return", vec![5, 6]),
+            multi_link("p11_entry", vec![5, 6]),
+        ];
+        assert_eq!(
+            affected_group_count(&links, &BTreeSet::from([0, 1, 2])),
+            1,
+            "both sides of one group count once"
+        );
+        assert_eq!(
+            affected_group_count(&links, &BTreeSet::from([1, 5])),
+            2,
+            "members from two groups count both"
+        );
+        assert_eq!(
+            affected_group_count(&links, &BTreeSet::from([9])),
+            0,
+            "unlinked members disturb no group"
+        );
+    }
+
+    type DropRecord = std::rc::Rc<std::cell::RefCell<Vec<Vec<String>>>>;
+
+    fn rebuild_drops() -> (DropRecord, impl FnMut(Vec<MultiLinkBundle<MockLink>>)) {
+        let drops = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let record = {
+            let drops = std::rc::Rc::clone(&drops);
+            move |bundles: Vec<MultiLinkBundle<MockLink>>| {
+                drops.borrow_mut().push(
+                    bundles
+                        .iter()
+                        .map(|bundle| bundle.program.to_string())
+                        .collect(),
+                );
+            }
+        };
+        (drops, record)
+    }
+
+    #[test]
+    fn reattach_all_good_returns_before_entries_with_completions() {
+        let (slots, targets) = two_groups();
+        let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
+        let mock = MockGroup {
+            calls: std::cell::RefCell::new(Vec::new()),
+            fail: Box::new(|_, _, _| None),
+        };
+        let (drops, record) = rebuild_drops();
+        let (bundles, outcome) =
+            reattach_rebuilt_groups_with(&groups, |_| Some(9), mock.leaf(), record);
+        assert_eq!(bundles.len(), 4);
+        assert_eq!(outcome.successful.len(), 8);
+        assert!(outcome.failures.is_empty());
+        assert_eq!(outcome.completed.len(), 4);
+        assert!(
+            outcome.completed.iter().all(|(_, at)| *at == Some(9)),
+            "reactivation carries the clock"
+        );
+        assert!(drops.borrow().is_empty(), "no rollback without a partial");
+        assert_eq!(mock.calls.borrow().len(), 4);
+    }
+
+    #[test]
+    fn reattach_entry_partial_drops_member_and_reattaches_the_rest() {
+        let (slots, targets) = two_groups();
+        let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
+        let poison = grouped_offset(&groups, 1);
+        let mock = MockGroup {
+            calls: std::cell::RefCell::new(Vec::new()),
+            fail: Box::new(move |_, sites, is_return| {
+                if !is_return && sites.iter().any(|(offset, _)| *offset == poison) {
+                    Some(io::Error::from_raw_os_error(libc::EINVAL))
+                } else {
+                    None
+                }
+            }),
+        };
+        let (drops, record) = rebuild_drops();
+        let (bundles, outcome) =
+            reattach_rebuilt_groups_with(&groups, |_| Some(9), mock.leaf(), record);
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(outcome.failures[0].0, 1);
+        assert!(
+            outcome.failures[0]
+                .1
+                .starts_with("p11_entry at /a.so+0x18: "),
+            "unexpected failure: {}",
+            outcome.failures[0].1
+        );
+        let completed: BTreeSet<u32> = outcome.completed.iter().map(|(slot, _)| *slot).collect();
+        assert_eq!(completed, BTreeSet::from([0, 2, 3]));
+        assert_eq!(
+            outcome.successful.len(),
+            6,
+            "only kept links count as successful"
+        );
+        // The dirty round's bundles drop entries-first; the clean group is
+        // never detached and the failed member leaves no link behind.
+        assert_eq!(drops.borrow().len(), 1);
+        assert_eq!(
+            drops.borrow()[0],
+            vec!["p11_entry".to_string(), "p11_return".to_string()],
+            "one rollback round, entries before returns"
+        );
+        assert_eq!(bundles.len(), 4);
+        for bundle in &bundles {
+            assert!(
+                !bundle.slots.contains(&1),
+                "slot 1 keeps no rebuilt link: {bundle:?}"
+            );
+        }
+        let group_b: Vec<_> = bundles
+            .iter()
+            .filter(|bundle| bundle.slots == vec![2, 3])
+            .collect();
+        assert_eq!(group_b.len(), 2, "group B attaches once and is kept");
+        assert!(
+            !outcome.successful.contains(&(1, ProbeSide::Return)),
+            "the dropped return endpoint is not reported successful"
+        );
+        let returns = mock
+            .calls
+            .borrow()
+            .iter()
+            .filter(|(_, is_return, _)| *is_return)
+            .count();
+        assert_eq!(
+            returns, 3,
+            "group A retries its return once, group B attaches once"
+        );
+    }
+
+    #[test]
+    fn reattach_return_poison_fails_member_without_entry_attempt() {
+        let (slots, targets) = two_groups();
+        let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
+        let poison = grouped_offset(&groups, 3);
+        let mock = MockGroup {
+            calls: std::cell::RefCell::new(Vec::new()),
+            fail: Box::new(move |_, sites, is_return| {
+                if is_return && sites.iter().any(|(offset, _)| *offset == poison) {
+                    Some(io::Error::from_raw_os_error(libc::EINVAL))
+                } else {
+                    None
+                }
+            }),
+        };
+        let (drops, record) = rebuild_drops();
+        let (bundles, outcome) =
+            reattach_rebuilt_groups_with(&groups, |_| Some(9), mock.leaf(), record);
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(outcome.failures[0].0, 3);
+        assert!(
+            outcome.failures[0]
+                .1
+                .starts_with("p11_return at /b.so+0x28: "),
+            "unexpected failure: {}",
+            outcome.failures[0].1
+        );
+        let completed: BTreeSet<u32> = outcome.completed.iter().map(|(slot, _)| *slot).collect();
+        assert_eq!(completed, BTreeSet::from([0, 1, 2]));
+        assert!(
+            drops.borrow().is_empty(),
+            "a return refusal leaves no partial link to roll back"
+        );
+        assert!(
+            bundles
+                .iter()
+                .any(|b| b.program == "p11_return" && b.slots == vec![2]),
+            "group B return narrows to its survivor: {bundles:?}"
+        );
+    }
+
+    #[test]
+    fn reattach_persistent_entry_poison_terminates_with_no_links() {
+        let (slots, targets) = two_groups();
+        let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
+        let mock = MockGroup {
+            calls: std::cell::RefCell::new(Vec::new()),
+            fail: Box::new(|_, _, is_return| {
+                if !is_return {
+                    Some(io::Error::from_raw_os_error(libc::EINVAL))
+                } else {
+                    None
+                }
+            }),
+        };
+        let (drops, record) = rebuild_drops();
+        let (bundles, outcome) =
+            reattach_rebuilt_groups_with(&groups, |_| Some(9), mock.leaf(), record);
+        assert_eq!(outcome.failures.len(), 4);
+        assert!(outcome.completed.is_empty());
+        assert!(outcome.successful.is_empty());
+        assert!(bundles.is_empty(), "no member keeps a partial link");
+        assert_eq!(drops.borrow().len(), 2, "one rollback round per group");
+        let returns = mock
+            .calls
+            .borrow()
+            .iter()
+            .filter(|(_, is_return, _)| *is_return)
+            .count();
+        assert_eq!(
+            returns, 2,
+            "a fully poisoned group never retries its return"
+        );
+    }
+
+    #[test]
+    fn reattach_exhaustion_stops_with_explicit_remainder() {
+        let (slots, targets) = two_groups();
+        let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
+        let mock = MockGroup {
+            calls: std::cell::RefCell::new(Vec::new()),
+            fail: Box::new(|_, _, is_return| {
+                if !is_return {
+                    Some(io::Error::from_raw_os_error(libc::EMFILE))
+                } else {
+                    None
+                }
+            }),
+        };
+        let (drops, record) = rebuild_drops();
+        let (bundles, outcome) =
+            reattach_rebuilt_groups_with(&groups, |_| Some(9), mock.leaf(), record);
+        assert_eq!(outcome.failures.len(), 4);
+        assert_eq!(outcome.failures[0].0, 0);
+        assert!(
+            outcome.failures[0].1.contains("fd table exhausted"),
+            "first failure keeps the shared summary: {}",
+            outcome.failures[0].1
+        );
+        for (slot, reason) in outcome.failures.iter().skip(1) {
+            assert!(
+                reason.contains("was not reattached"),
+                "slot {slot} is explicitly unattempted, never silent: {reason}"
+            );
+        }
+        assert!(outcome.completed.is_empty());
+        assert!(bundles.is_empty(), "the exhausted round keeps no links");
+        assert_eq!(drops.borrow().len(), 1);
+        assert!(
+            mock.calls
+                .borrow()
+                .iter()
+                .all(|(_, _, sites)| sites.iter().all(|(offset, _)| *offset < 0x20)),
+            "group B is never attempted after exhaustion"
+        );
+    }
+
+    #[test]
+    fn reattach_unsupported_aborts_every_remaining_member() {
+        let (slots, targets) = two_groups();
+        let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
+        let mock = MockGroup {
+            calls: std::cell::RefCell::new(Vec::new()),
+            fail: Box::new(|_, _, _| Some(io::Error::from_raw_os_error(libc::ENOTSUP))),
+        };
+        let (drops, record) = rebuild_drops();
+        let (bundles, outcome) =
+            reattach_rebuilt_groups_with(&groups, |_| Some(9), mock.leaf(), record);
+        assert_eq!(outcome.failures.len(), 4);
+        for (slot, reason) in &outcome.failures {
+            assert!(
+                reason.contains("multi-uprobe unsupported"),
+                "slot {slot} names the abort: {reason}"
+            );
+        }
+        assert!(outcome.completed.is_empty());
+        assert!(bundles.is_empty());
+        assert!(drops.borrow().is_empty());
+        assert_eq!(mock.calls.borrow().len(), 1);
+    }
+
+    fn retained_target(index: u32, path: &str) -> RetainedStaticTarget {
+        let slot = group_slot(index, 1, SlotSemantics::COUNT_ONLY);
+        let targets = group_targets(&[(index, path, ElfAbi::Lp64)]);
+        let (path, abi) = targets.get(&index).cloned().unwrap();
+        RetainedStaticTarget { slot, path, abi }
+    }
+
+    #[test]
+    fn retention_keeps_exact_facts_for_linked_slots_only() {
+        let slots = vec![
+            group_slot(0, 1, SlotSemantics::COUNT_ONLY),
+            group_slot(1, 1, SlotSemantics::COUNT_ONLY),
+            group_slot(2, 1, SlotSemantics::COUNT_ONLY),
+        ];
+        let targets = group_targets(&[
+            (0, "/a.so", ElfAbi::Lp64),
+            (1, "/a.so", ElfAbi::Lp64),
+            (2, "/a.so", ElfAbi::Lp64),
+        ]);
+        let successful = BTreeSet::from([(0, ProbeSide::Return), (0, ProbeSide::Entry)]);
+        let mut retained = BTreeMap::new();
+        retain_from_successful(&mut retained, &slots, &targets, &successful);
+        assert_eq!(retained.keys().copied().collect::<Vec<_>>(), vec![0]);
+        let kept = retained.get(&0).unwrap();
+        assert_eq!(kept.slot, slots[0]);
+        assert_eq!(kept.path, PathBuf::from("/a.so"));
+        assert_eq!(kept.abi, ElfAbi::Lp64);
+    }
+
+    #[test]
+    fn retention_overwrites_stale_descriptors_on_reattach() {
+        let slots = vec![group_slot(0, 1, SlotSemantics::COUNT_ONLY)];
+        let targets = group_targets(&[(0, "/a.so", ElfAbi::Lp64)]);
+        let mut retained = BTreeMap::from([(0, retained_target(0, "/a.so"))]);
+        retained.get_mut(&0).unwrap().slot.descriptor_index = 5;
+        let successful = BTreeSet::from([(0, ProbeSide::Return), (0, ProbeSide::Entry)]);
+        retain_from_successful(&mut retained, &slots, &targets, &successful);
+        assert_eq!(
+            retained.get(&0).unwrap().slot.descriptor_index,
+            slots[0].descriptor_index,
+            "reattach replaces the frozen descriptor it superseded"
+        );
+    }
+
+    #[test]
+    fn prune_drops_facts_for_linkless_slots() {
+        let mut retained = BTreeMap::from([
+            (0, retained_target(0, "/a.so")),
+            (1, retained_target(1, "/a.so")),
+            (2, retained_target(2, "/a.so")),
+        ]);
+        let links = vec![multi_link("p11_return", vec![0, 1])];
+        prune_linkless_retained(&mut retained, &links);
+        assert_eq!(
+            retained.keys().copied().collect::<Vec<_>>(),
+            vec![0, 1],
+            "facts survive exactly while a link does"
+        );
+    }
+
+    #[test]
+    fn template_semantics_route_to_their_template_group() {
+        let template = SlotSemantics {
+            template0_arg: 1,
+            ..SlotSemantics::COUNT_ONLY
+        };
+        let slots = vec![
+            group_slot(0, 1, SlotSemantics::COUNT_ONLY),
+            group_slot(1, 1, template),
+        ];
+        let targets = group_targets(&[(0, "/a.so", ElfAbi::Lp64), (1, "/a.so", ElfAbi::Lp64)]);
+        let groups = group_static_slots(
+            &slots,
+            CapturePolicy::UnsafeUnvalidatedMetadata,
+            false,
+            &targets,
+        );
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].entry_program, "p11_entry");
+        assert_eq!(group_member_indices(&groups[0]), vec![0]);
+        assert_eq!(groups[1].entry_program, "p11_entry_template");
+        assert_eq!(group_member_indices(&groups[1]), vec![1]);
+    }
+
     #[test]
     fn only_static_slot_programs_have_endpoint_identities() {
         assert_eq!(
@@ -4048,6 +6072,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(attempted, [("p11_return", 0), ("p11_return", 1)]);
+        assert!(outcome.exhausted);
         assert_eq!(outcome.failures.len(), 1);
         assert_eq!(outcome.failures[0].0, 1);
         assert!(

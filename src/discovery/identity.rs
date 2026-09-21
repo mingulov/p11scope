@@ -1745,6 +1745,8 @@ pub(crate) mod test_fixture {
                 unpinned: vec![],
                 address: 0x7000,
                 file_offset: Some(0),
+                live_return: false,
+                manifest_supported: false,
             }],
             interfaces: vec![],
         }
@@ -3302,7 +3304,10 @@ mod tests {
         // One module reached by two mounts is not two modules claiming one target:
         // the slot keeps its semantics and the capture stays attributed.
         assert_eq!(plan.slots[0].module_ids.len(), 1);
-        assert!(!plan.slots[0].semantic_ambiguous);
+        // Task 1.3: the unlinked table's ordinal label is gated to `unknown`,
+        // and an unnamed slot cannot resolve one descriptor.
+        assert_eq!(plan.slots[0].names, ["unknown"]);
+        assert!(plan.slots[0].semantic_ambiguous);
         assert_eq!(plan.module_ambiguous, 0);
         assert_eq!(
             plan.entries_seen, 1,

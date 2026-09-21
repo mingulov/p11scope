@@ -268,6 +268,15 @@ pub struct DiscoveryEvidence {
     /// could not run, or the scan decoded no table in them.
     #[serde(rename = "discovery_uncorroborated")]
     pub uncorroborated: u64,
+    /// Heuristic tables decoded but not admitted: past the per-object
+    /// evidence-ordered cap or past the remaining global budget. Informational
+    /// — spilling lookalikes is correct admission, not a coverage gap — so it
+    /// does not affect `completeness` on its own. Capture-lifetime evidence:
+    /// the high-water mark across publications, so a spill a later live merge
+    /// resolves stays reported (the plan's own counter is the current-state
+    /// one that resolves).
+    #[serde(rename = "discovery_uncorroborated_candidates")]
+    pub uncorroborated_candidates: u64,
     /// Attach slots two modules both publish: counted, never attributed.
     pub module_ambiguous: u64,
     /// Modules refused whole at the slot ceiling — never attached in part.
@@ -288,6 +297,7 @@ impl Default for DiscoveryEvidence {
             modules: Vec::new(),
             conflicts: 0,
             uncorroborated: 0,
+            uncorroborated_candidates: 0,
             module_ambiguous: 0,
             modules_skipped: Vec::new(),
             manifest_object_fallbacks: Vec::new(),
@@ -531,6 +541,8 @@ pub struct Evidence {
     /// Everything discovery learned, flattened into this object.
     #[serde(flatten)]
     pub discovery: DiscoveryEvidence,
+    /// Consumer-scheduling evidence: which bound broke, and phase timings.
+    pub scheduling: SchedulingEvidence,
     pub completeness: &'static str,
 }
 
@@ -538,6 +550,90 @@ pub struct Evidence {
 pub struct SkippedOut {
     pub name: String,
     pub reason: String,
+}
+
+/// The declared slow-sink policy: a stalled stdout flush waits at most the
+/// per-tick budget, then its pending bytes are dropped with counters, never
+/// held unboundedly. The capture continues; the evidence says what left
+/// through the sink and what did not.
+pub const SINK_POLICY_BOUNDED_WAIT_DROP: &str = "bounded-wait-drop";
+
+/// In-observer per-phase wall time in milliseconds, cumulative over the
+/// capture. Discovery is measured directly here (Task 3.1 G-discovery-
+/// tick-slice), not as a residual of totals; `discovery` covers every
+/// discovery drain (tick + terminal), while `discovery_terminal` covers
+/// only the post-detach terminal drain, so the per-frame tick slice is
+/// `discovery - discovery_terminal`.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub struct SchedulingPhaseMs {
+    pub discovery: u64,
+    pub discovery_terminal: u64,
+    pub drain: u64,
+    pub maps: u64,
+    pub render: u64,
+    pub detach: u64,
+}
+
+/// Consumer-scheduling evidence (Task 3.1 repair): which bound broke when
+/// the event path lost data, and how the capture loop spent its time.
+/// The loss splits are identities, not estimates: capture + detach shares
+/// always sum to the published loss counter.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SchedulingEvidence {
+    /// Extra event-ring polls after a quantum stopped with backlog queued.
+    pub drain_repolls: u64,
+    /// Ticks that stopped draining with backlog left under the per-tick
+    /// record/wall budget.
+    pub drain_budget_exhaustions: u64,
+    /// Ring loss sampled at capture-loop end, before producer detach.
+    pub capture_event_loss: u64,
+    /// Ring loss accrued during the detach window (post-detach minus
+    /// capture-phase).
+    pub detach_event_loss: u64,
+    /// Discovery-ring loss at capture-loop end, before producer detach.
+    pub capture_discovery_loss: u64,
+    /// Discovery-ring loss accrued during the detach window.
+    pub detach_discovery_loss: u64,
+    /// Explicit record bound of the post-detach terminal event drain.
+    pub terminal_drain_bound: u64,
+    /// The terminal drain stopped at its bound with backlog still queued.
+    pub terminal_drain_truncated: bool,
+    /// Declared slow-sink policy; always [`SINK_POLICY_BOUNDED_WAIT_DROP`].
+    pub sink_policy: &'static str,
+    /// Total milliseconds stdout flushes stalled under backpressure.
+    pub sink_stall_ms: u64,
+    /// Flushes that exceeded the per-tick stall budget and dropped bytes.
+    pub sink_timeouts: u64,
+    /// Stdout bytes discarded by the slow-sink policy.
+    pub sink_dropped_bytes: u64,
+    /// Cumulative per-phase wall time.
+    pub phase_ms: SchedulingPhaseMs,
+    /// Largest gap between consecutive event drains during the capture
+    /// loop. The undrained detach window and terminal drain never extend
+    /// it (frozen at loop end): the detach window is separately counted
+    /// (capture/detach split) and timed (detach phase).
+    pub max_inter_drain_gap_ms: u64,
+}
+
+impl Default for SchedulingEvidence {
+    fn default() -> Self {
+        Self {
+            drain_repolls: 0,
+            drain_budget_exhaustions: 0,
+            capture_event_loss: 0,
+            detach_event_loss: 0,
+            capture_discovery_loss: 0,
+            detach_discovery_loss: 0,
+            terminal_drain_bound: 0,
+            terminal_drain_truncated: false,
+            sink_policy: SINK_POLICY_BOUNDED_WAIT_DROP,
+            sink_stall_ms: 0,
+            sink_timeouts: 0,
+            sink_dropped_bytes: 0,
+            phase_ms: SchedulingPhaseMs::default(),
+            max_inter_drain_gap_ms: 0,
+        }
+    }
 }
 
 const DISCOVERY_SUBJECT: &str = "discovery subject";
@@ -554,12 +650,18 @@ const PHYSICAL_IDENTITY_AMBIGUITY: &str =
 /// completeness honest.
 pub fn capture_skipped_out(s: &Skipped) -> SkippedOut {
     let function = kinds::function_id(&s.subject).is_some();
+    // A gated null fact: the mislabel guard renamed an unlinked table's null
+    // slot to `unknown`, and the nullness itself is still evidence worth
+    // keeping — without claiming which function was null.
+    let gated_null = s.subject == crate::plan::UNKNOWN_FUNCTION_NAME && s.reason == "null pointer";
     let reason = if function {
         if s.reason == "null pointer" {
             "null pointer"
         } else {
             ENTRY_UNAVAILABLE
         }
+    } else if gated_null {
+        "null pointer"
     } else if s
         .reason
         .contains("cannot prove physical identity across overlay instances")
@@ -578,7 +680,7 @@ pub fn capture_skipped_out(s: &Skipped) -> SkippedOut {
         DISCOVERY_UNAVAILABLE
     };
     SkippedOut {
-        name: if function {
+        name: if function || gated_null {
             s.subject.clone()
         } else {
             DISCOVERY_SUBJECT.into()
@@ -670,6 +772,8 @@ impl Evidence {
             && self.discovery_truncated == 0
             && self.task_uprobe_link_losses == 0
             && self.pause_partial == 0
+            && !self.scheduling.terminal_drain_truncated
+            && self.scheduling.sink_dropped_bytes == 0
             && self.loader_discovery.complete()
             && (!include_selection
                 || self.interface_selection.complete()
@@ -1514,6 +1618,7 @@ mod tests {
                 modules: vec![discovered_fixture()],
                 ..DiscoveryEvidence::default()
             },
+            scheduling: SchedulingEvidence::default(),
             completeness: "UNKNOWN",
         }
     }
@@ -1892,6 +1997,8 @@ mod tests {
                 version: (2, 40),
                 entries: 68,
                 source: "scan",
+                file_offset: None,
+                linkage: "heuristic",
             }],
             interfaces: 1,
             skipped: vec![],
@@ -2057,6 +2164,120 @@ mod tests {
         );
     }
 
+    /// Task 1.3 mislabel guard: an admitted scan table carries (file_offset,
+    /// entry count, linkage kind) from plan into evidence, and a heuristic
+    /// table with no linkage is named `unknown` — never the PKCS#11 label its
+    /// ordinals suggest. Only a linkage-or-manifest-authorized table keeps
+    /// `function_name` names.
+    #[test]
+    fn admitted_tables_carry_provenance_and_unlinked_tables_are_unknown() {
+        use crate::discovery::identity::ReconciledModule;
+        use crate::discovery::scan::{ScannedEntry, ScannedInterface, ScannedModule, ScannedTable};
+        use crate::process::{MountNamespaceId, ProcessViewId};
+        use p11scope_manifest::maps::{Device, ObjectKey};
+
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: 42,
+        };
+        let entry = |name: &'static str, file_offset: u64| ScannedEntry {
+            name,
+            object: key,
+            object_path: "/opt/p11.so".into(),
+            file_offset,
+        };
+        let object = crate::plan::TEST_PINNED_OBJECT;
+        let plan = crate::plan::build_from_reconciled_modules(&[ReconciledModule {
+            object,
+            entry_objects: vec![vec![object, object], vec![object]],
+            scanned: ScannedModule {
+                view: ProcessViewId(0),
+                mount_namespace: MountNamespaceId {
+                    device: 1,
+                    inode: 1,
+                },
+                key,
+                path: "/opt/p11.so".into(),
+                decoder_abi: Some(p11scope_manifest::elf::ElfAbi::Lp64),
+                exports: vec!["C_GetFunctionList".into()],
+                tables: vec![
+                    ScannedTable {
+                        version: (2, 40),
+                        walk: "full",
+                        entries: vec![entry("C_Sign", 0x10), entry("C_Verify", 0x18)],
+                        null_entries: vec!["C_GetFunctionStatus"],
+                        unpinned: vec![],
+                        address: 0x7000,
+                        file_offset: Some(0x100),
+                        live_return: false,
+                        manifest_supported: false,
+                    },
+                    ScannedTable {
+                        version: (2, 40),
+                        walk: "full",
+                        entries: vec![entry("C_Encrypt", 0x20)],
+                        null_entries: vec![],
+                        unpinned: vec![],
+                        address: 0x8000,
+                        file_offset: Some(0x200),
+                        live_return: false,
+                        manifest_supported: false,
+                    },
+                ],
+                interfaces: vec![ScannedInterface {
+                    index: 0,
+                    name_class: "exact_standard",
+                    name_lossy: None,
+                    name_private: Some(b"PKCS 11".to_vec()),
+                    flags: 0,
+                    table: Some(1),
+                }],
+            },
+        }]);
+
+        assert_eq!(plan.slots.len(), 3);
+        let names_of = |offset: u64| {
+            plan.slots
+                .iter()
+                .find(|slot| slot.file_offset == offset)
+                .unwrap()
+                .names
+                .clone()
+        };
+        assert_eq!(names_of(0x10), ["unknown"]);
+        assert_eq!(names_of(0x18), ["unknown"]);
+        assert_eq!(names_of(0x20), ["C_Encrypt"]);
+
+        let tables = &plan.modules[0].tables;
+        assert_eq!(tables.len(), 2);
+        assert_eq!(tables[0].file_offset, Some(0x100));
+        assert_eq!(tables[0].entries, 2);
+        assert_eq!(tables[0].linkage, "heuristic");
+        assert_eq!(tables[1].file_offset, Some(0x200));
+        assert_eq!(tables[1].entries, 1);
+        assert_eq!(tables[1].linkage, "interface");
+
+        // The null slot of the unlinked table stays a null fact without
+        // claiming which function was null.
+        assert!(
+            plan.skipped
+                .iter()
+                .any(|skip| skip.subject == "unknown" && skip.reason == "null pointer"),
+            "{:?}",
+            plan.skipped
+        );
+
+        // Provenance reaches rendered evidence as JSON keys, not comments.
+        let mut discovered = discovered_fixture();
+        discovered.tables = tables.clone();
+        let value = serde_json::to_value(&discovered).unwrap();
+        assert_eq!(value["tables"][0]["file_offset"], 0x100);
+        assert_eq!(value["tables"][0]["entries"], 2);
+        assert_eq!(value["tables"][0]["linkage"], "heuristic");
+        assert_eq!(value["tables"][1]["file_offset"], 0x200);
+        assert_eq!(value["tables"][1]["linkage"], "interface");
+    }
+
     #[test]
     fn scan_only_count_only_event_keeps_aggregate_output_and_no_semantic_payload() {
         use crate::discovery::identity::ReconciledModule;
@@ -2095,6 +2316,8 @@ mod tests {
                     unpinned: vec![],
                     address: 0x7000,
                     file_offset: Some(0),
+                    live_return: false,
+                    manifest_supported: false,
                 }],
                 interfaces: vec![],
             },
@@ -2225,9 +2448,11 @@ mod tests {
                 value if value == pkcs11_types::CkRv::PENDING.0 => "CKR_PENDING",
                 value => unreachable!("unexpected fixture RV {value:#x}"),
             };
+            // Task 1.3: the scan-only table is unlinked, so the trace names
+            // the slot `unknown` — the counts and RVs are retained unchanged.
             assert_eq!(
                 &line[15..],
-                format!(" pid 100 tid 1 C_OpenSession [semantics unverified] → {rv} 100ns"),
+                format!(" pid 100 tid 1 unknown [semantics unverified] → {rv} 100ns"),
                 "the generated trace must retain every aggregate RV without semantic payload"
             );
         }
@@ -2620,6 +2845,69 @@ mod tests {
         assert_eq!(ev.malformed_records, 0);
         let value = serde_json::to_value(&ev).unwrap();
         assert!(value.get("terminal_drain_unproven").is_none());
+    }
+
+    #[test]
+    fn sink_drops_force_partial_with_stated_counts() {
+        let mut ev = evidence();
+        ev.verdict();
+        assert_eq!(ev.completeness, "COMPLETE");
+
+        ev.scheduling.sink_dropped_bytes = 1024;
+        ev.scheduling.sink_timeouts = 1;
+        ev.verdict();
+
+        assert_eq!(ev.completeness, "PARTIAL");
+        assert_eq!(ev.scheduling.sink_dropped_bytes, 1024);
+        assert_eq!(ev.scheduling.sink_timeouts, 1);
+    }
+
+    #[test]
+    fn terminal_drain_truncation_forces_partial() {
+        let mut ev = evidence();
+        ev.verdict();
+        assert_eq!(ev.completeness, "COMPLETE");
+
+        ev.scheduling.terminal_drain_truncated = true;
+        ev.verdict();
+
+        assert_eq!(ev.completeness, "PARTIAL");
+    }
+
+    #[test]
+    fn scheduling_evidence_serializes_with_declared_policy() {
+        let value = serde_json::to_value(evidence()).unwrap();
+        let scheduling = value
+            .get("scheduling")
+            .expect("scheduling evidence is serialized");
+        assert_eq!(scheduling["sink_policy"], "bounded-wait-drop");
+        for key in [
+            "drain_repolls",
+            "drain_budget_exhaustions",
+            "capture_event_loss",
+            "detach_event_loss",
+            "capture_discovery_loss",
+            "detach_discovery_loss",
+            "terminal_drain_bound",
+            "terminal_drain_truncated",
+            "sink_policy",
+            "sink_stall_ms",
+            "sink_timeouts",
+            "sink_dropped_bytes",
+            "phase_ms",
+            "max_inter_drain_gap_ms",
+        ] {
+            assert!(
+                scheduling.get(key).is_some(),
+                "scheduling evidence lacks {key}"
+            );
+        }
+        for key in ["discovery", "drain", "maps", "render", "detach"] {
+            assert!(
+                scheduling["phase_ms"].get(key).is_some(),
+                "phase timers lack {key}"
+            );
+        }
     }
 
     #[test]

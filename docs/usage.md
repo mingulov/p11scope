@@ -171,7 +171,7 @@ and run, and both are disclosed in every JSON report's `capture` block as
 produced it.
 
 - `--ring-bytes <n[K|M]>` — the EVENTS ring buffer size: a power of two from
-  4K to 64M (default 256K). A larger ring absorbs call bursts without loss; a
+  4K to 64M (default 4M). A larger ring absorbs call bursts without loss; a
   smaller ring overflows sooner. Overflow never corrupts counts — the
   aggregate maps are the count authority — but it is disclosed as `event_loss`
   with a `PARTIAL` verdict instead of `COMPLETE`.
@@ -191,7 +191,7 @@ produce the same disclosed event-loss evidence with exact counts.
 
 Measured loss rates — the only bench-measured tuning data points, from the
 `scripts/bench-overhead.sh` run in "Overhead (measured)" (1M back-to-back
-calls/sec, default 256K ring): `profile` (1s drain) lost 991,290-991,350
+calls/sec, then-default 256K ring): `profile` (1s drain) lost 991,290-991,350
 of 1,000,000 events (99.1%+); `trace` (200ms drain) wrote only
 122,348-145,383 lines. A faster drain cadence meaningfully reduces loss
 but does not eliminate it at that call rate. No larger `--ring-bytes`
@@ -434,11 +434,18 @@ counts every well-formed non-fork event consumed before truncation.
   owned child. Without it the default is to hand a still-running child back
   and exit 0.
 - `inspect --json` — print the inspection as JSON instead of the human-readable
-  text table.
+  text table. A scan that fails soft (the target changed mid-scan) still
+  prints JSON: the success schema with `scan.status` failed and the
+  reason, exit 1. A target that cannot be read at all stays a hard
+  error: one stderr line, empty stdout, exit 1.
 - `--allow-uretprobe-on-confined-target` — accept the uretprobe hazard on a
   target that confines syscalls instead of refusing to attach. The default
   refusal is deliberate: on affected kernels a uretprobe on a confined target
-  can kill it. See `p11scope doctor` and `src/uretprobe_hazard.rs`.
+  can kill it. An unproven kernel (the self-probe could not reach a verdict)
+  refuses the same way wherever the target cannot be shown unconfined —
+  unreadable targets, `--cgroup`/`--system` scopes, and `run` children,
+  which may confine themselves after attach. See `p11scope doctor` and
+  `src/uretprobe_hazard.rs`.
 
 ### Exit codes
 

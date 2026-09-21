@@ -10,6 +10,7 @@
 //! child crosses its pre-exec barrier, so "the command never ran" is as much a
 //! contract as the exit status is where capture works.
 
+use p11scope::attach::BackendSelection;
 use p11scope::cli::{Kind, PausePolicy, RunArgs};
 use p11scope::discovery::hooks::HookRegistry;
 use p11scope::run_owned;
@@ -40,6 +41,7 @@ fn run_args(command: &[&str]) -> RunArgs {
         unsafe_requested: false,
         allow_confined_uretprobe: false,
         pause: PausePolicy::Never,
+        attach_backend: BackendSelection::default(),
         kill_on_timeout: false,
         command: command.iter().map(|a| a.to_string()).collect(),
     }

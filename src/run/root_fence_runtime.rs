@@ -4,6 +4,7 @@
 //! survive both reductions and token construction until explicit retirement.
 
 use super::*;
+use crate::attach::BackendSelection;
 use crate::events::{OwnedRootTail, RootTailProgress};
 use anyhow::ensure;
 use p11scope_ebpf_common::{Event, SESSION_NONE, capture, event_type};
@@ -213,6 +214,7 @@ fn document(
         engine.capture_facts(),
         session.attached_probes(),
         session.dynamic_per_offset_attached(),
+        session.static_multi_attached(),
         session.attach_failures(),
         &reports,
         kernel,
@@ -228,6 +230,7 @@ fn document(
             session.process_creation_tracking_unavailable().is_some(),
             session.lifecycle_tracking_unavailable().is_some(),
         ),
+        render::SchedulingEvidence::default(),
     );
     evidence.mark_terminal_drain_unproven();
     let kernel_release = std::fs::read_to_string("/proc/sys/kernel/osrelease")?;
@@ -306,6 +309,7 @@ fn scenario(
         drain_interval: None,
         unsafe_requested: false,
         allow_confined_uretprobe: false,
+        attach_backend: BackendSelection::default(),
     };
     let view = ProcessView::open(ProcessViewId(0), pid).map_err(anyhow::Error::msg)?;
     let engine = Engine::discover(&args, &scope, Some(view))?;
@@ -357,6 +361,7 @@ fn scenario(
         None,
         None,
         owner.as_ref(),
+        BackendSelection::Auto,
     )?);
     let session = active.as_mut().context("capture session")?;
     ensure!(

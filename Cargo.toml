@@ -24,6 +24,7 @@ anyhow = "1"
 aya = "=0.14.0"
 cryptoki-sys = "0.5"
 libc = "0.2"
+p11scope-bpf-multi = { path = "crates/bpf-multi" }
 p11scope-ebpf-common = { path = "crates/ebpf-common", features = ["user"] }
 p11scope-manifest = { path = "crates/manifest", features = ["identify"] }
 pkcs11-module = { git = "https://github.com/mingulov/pkcs11-components", rev = "d0a47c71d34294466bc41100ae6b5a5a329029d2" }
@@ -39,9 +40,9 @@ sha2 = "=0.11.0"
 tempfile = "3"
 
 [workspace]
-members = ["crates/discover", "crates/manifest", "crates/ebpf-common"]
-exclude = ["third-party/src/aya-0.14.0-p1", "third-party/src/aya-obj-0.3.0-p1"]
+members = ["crates/discover", "crates/manifest", "crates/ebpf-common", "crates/bpf-multi"]
+exclude = ["third-party/src/aya-0.14.0-p2", "third-party/src/aya-obj-0.3.0-p2"]
 
 [patch.crates-io]
-aya = { path = "third-party/src/aya-0.14.0-p1" }
-aya-obj = { path = "third-party/src/aya-obj-0.3.0-p1" }
+aya = { path = "third-party/src/aya-0.14.0-p2" }
+aya-obj = { path = "third-party/src/aya-obj-0.3.0-p2" }

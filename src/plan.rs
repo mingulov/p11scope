@@ -4,8 +4,14 @@
 //! unique {object, file_offset} across all of them. A target two modules both hand
 //! out is attached once (attaching twice would double-count every call through it),
 //! and because its counts then belong to neither module its semantics degrade to
-//! COUNT_ONLY (spec §4.7). Capacity is refused whole modules at a time, never
-//! truncated: a partially attached module silently under-reports a provider.
+//! COUNT_ONLY (spec §4.7). Manifest modules are refused whole when they exceed
+//! the remaining budget, never truncated: a partially attached module silently
+//! under-reports a provider. Scan tables admit in publication-evidence order:
+//! corroborated/published tables bypass the per-object cap (global budget
+//! only, atomic refusal), unresolved heuristic tables admit until the
+//! per-object cap, and the heuristic spill is reported as
+//! `uncorroborated_candidates` — whole-module refusal stays only for the case
+//! where even the strongest table exceeds the remaining budget.
 //!
 //! Both discovery sources — the memory scan and a manifest — lower into `Discovered`
 //! and go through the same `merge`, so there is exactly one implementation of the
@@ -13,6 +19,10 @@
 
 use crate::discovery::identity::{PinnedObjectId, PinnedObjects, ReconciledModule};
 pub use crate::discovery::scan::Skipped;
+use crate::discovery::scan::{
+    ScannedInterface, ScannedTable, TableEvidenceScore, order_tables_by_evidence,
+    table_evidence_score, table_linkage, table_name_authorized,
+};
 use p11scope_ebpf_common::{MAX_SLOTS, SlotSemantics};
 use p11scope_manifest::manifest::{
     Acquisition, InterfaceClassification, Manifest, ObjectRecord, Resolution, SurfaceSource,
@@ -82,6 +92,21 @@ pub struct Slot {
     pub module_ids: Vec<ModuleId>,
 }
 
+/// The presented name for a slot no authorized source named: an unlinked
+/// heuristic table's ordinal labels are positional guesses, never attributions.
+/// Transparent in a slot's claim set — an authorized name always wins over it —
+/// never a rival claim and never semantic authority.
+pub(crate) const UNKNOWN_FUNCTION_NAME: &str = "unknown";
+
+/// `unknown` is the absence of a name claim: it never survives beside a real
+/// name. Applied everywhere slot names union (merge drops it from the claim
+/// map before collecting; extend and selection drop it from the vec).
+fn drop_transparent_unknown(names: &mut Vec<String>) {
+    if names.len() > 1 {
+        names.retain(|name| name != UNKNOWN_FUNCTION_NAME);
+    }
+}
+
 /// One function table a module published.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct TableSummary {
@@ -91,6 +116,16 @@ pub struct TableSummary {
     pub entries: usize,
     /// "scan" | "manifest".
     pub source: &'static str,
+    /// Exact object-relative location of the table's version word, when the
+    /// table was decoded from mapped bytes. `None` for manifest tables (the
+    /// manifest records entry offsets, not table locations) and for tables
+    /// decoded where no file owner could be proven.
+    pub file_offset: Option<u64>,
+    /// Strongest publication evidence behind this table: "interface" (named by
+    /// an interface triple), "live_return" (returned by a live provider
+    /// export), "manifest" (operator-authoritative), or "heuristic" (bare
+    /// decode with no linkage — its names are presented as `unknown`).
+    pub linkage: &'static str,
 }
 
 /// One module that contributed targets to this plan.
@@ -173,10 +208,32 @@ fn acquisition_label(a: &Acquisition) -> String {
     }
 }
 
+/// Unresolved heuristic (scan-decoded, uncorroborated) tables admitted per
+/// object, strongest publication evidence first. The scan admits any plausible
+/// version word, so one object can decode dozens of lookalike tables (p11-kit
+/// decodes 64 closure templates); the cap bounds one object's unresolved
+/// slots to `MAX_TABLES_PER_OBJECT * 104 = 416`, inside the 512 slot ceiling,
+/// while the spill is reported as `uncorroborated_candidates` instead of
+/// refusing the module. Corroborated/published scan tables (interface-linked,
+/// manifest/live-return supported) bypass this cap, subject only to the global
+/// budget with atomic whole-module refusal. Manifest tables are
+/// operator-authoritative and never capped.
+///
+/// Task 1.6 experiment: broad admission (`P11SCOPE_BROAD_ADMIT=1`) lifts this
+/// cap for validated tables — every validated table admits until the global
+/// budget, and the first table that does not fit refuses the module whole
+/// (the `spent` arm below). Validation is unchanged: only decoder-accepted
+/// tables reach `merge`, broad or not.
+pub(crate) const MAX_TABLES_PER_OBJECT: usize = 4;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct AttachPlan {
     pub slots: Vec<Slot>,
     pub modules: Vec<ModuleSummary>,
+    /// Heuristic tables decoded but not admitted: past the per-object cap or
+    /// past the remaining global budget. Evidence, never slots — the module
+    /// they were decoded from is still admitted on its strongest tables.
+    pub uncorroborated_candidates: u64,
     pub skipped: Vec<Skipped>,
     /// Modules refused whole because the slot ceiling was reached.
     pub modules_skipped: Vec<Skipped>,
@@ -267,6 +324,7 @@ impl AttachPlan {
         Self {
             slots,
             modules: vec![],
+            uncorroborated_candidates: 0,
             skipped: vec![],
             modules_skipped: vec![],
             refused_module_objects: vec![],
@@ -294,6 +352,19 @@ impl AttachPlan {
         manifests: &[Manifest],
         pinned: &PinnedObjects,
     ) -> AttachPlan {
+        self.rebuild_from_sources_broad(scanned, manifests, pinned, false)
+    }
+
+    /// Task 1.6 experiment: `broad_admit` lifts the per-object heuristic cap
+    /// and refuses a module whole unless every validated table fits. Only the
+    /// engine's broad pass sets this; every other caller keeps `false`.
+    pub fn rebuild_from_sources_broad(
+        &self,
+        scanned: &[ReconciledModule],
+        manifests: &[Manifest],
+        pinned: &PinnedObjects,
+        broad_admit: bool,
+    ) -> AttachPlan {
         self.rebuild_from_sources_with(
             scanned,
             manifests,
@@ -304,6 +375,7 @@ impl AttachPlan {
                     (Some(provider), Some(target)) if provider == target
                 )
             },
+            broad_admit,
         )
     }
 
@@ -313,6 +385,7 @@ impl AttachPlan {
         manifests: &[Manifest],
         pinned_id: impl FnMut(ObjectKey, &str) -> Option<PinnedObjectId>,
         compatible: impl FnMut(PinnedObjectId, PinnedObjectId) -> bool,
+        broad_admit: bool,
     ) -> AttachPlan {
         let mut rebuilt = build_from_sources_with(
             scanned,
@@ -321,6 +394,7 @@ impl AttachPlan {
             compatible,
             self.slots.len(),
             &self.slot_by_key,
+            broad_admit,
         );
         for (key, object) in &self.provisional_get_function_list {
             if key.object != *object || rebuilt.slot_by_key.contains_key(key) {
@@ -478,6 +552,9 @@ impl AttachPlan {
                 slot.names.extend(names.into_iter().map(str::to_string));
                 slot.names.sort();
                 slot.names.dedup();
+                // Selection names are interface-selected and authorized: they
+                // displace a prior `unknown`, never alias with it.
+                drop_transparent_unknown(&mut slot.names);
                 slot.aliased |= slot.names.len() >= 2;
                 continue;
             }
@@ -673,10 +750,17 @@ impl AttachPlan {
                     updated.names.extend(old.names);
                     updated.names.sort();
                     updated.names.dedup();
+                    drop_transparent_unknown(&mut updated.names);
                     updated.aliased |= old.aliased || updated.names.len() >= 2;
                     if old.descriptor_index == 0 || updated.descriptor_index == 0 {
                         updated.semantic_ambiguous = true;
                     }
+                } else if updated.names == [UNKNOWN_FUNCTION_NAME] {
+                    // A rebuild that learned nothing new about names must not
+                    // clobber the last authorized name (an export-derived
+                    // provisional seed, an earlier linkage) with `unknown`.
+                    updated.names.clone_from(&old.names);
+                    updated.aliased = old.aliased;
                 }
                 if old.descriptor_index != updated.descriptor_index {
                     if old.descriptor_index == 0 {
@@ -712,6 +796,10 @@ impl AttachPlan {
 
         self.slots = slots;
         self.modules = rebuilt.modules;
+        // The spill count is current-state evidence like `entries_seen`,
+        // not a high-water mark (capture history keeps those separately):
+        // a live merge that bypasses a spilled table resolves the spill.
+        self.uncorroborated_candidates = rebuilt.uncorroborated_candidates;
         self.skipped = rebuilt.skipped;
         self.modules_skipped = rebuilt.modules_skipped;
         self.refused_module_objects = rebuilt.refused_module_objects;
@@ -1022,12 +1110,56 @@ pub(crate) const TEST_PINNED_OBJECT: PinnedObjectId = PinnedObjectId(42);
 
 /// One attachable target as discovery reported it.
 struct Target<'a> {
+    /// The ordinal/operator label as decoded. Occurrence counting keys on this
+    /// verbatim label, so the mislabel guard must NOT rewrite it here — the
+    /// presented name is decided at slot building from `name_authorized`.
     name: &'a str,
     object: PinnedObjectId,
     object_path: &'a str,
     file_offset: u64,
     fork_safe: bool,
     semantic_authorized: bool,
+    /// Whether `name` may be presented as a PKCS#11 name: manifest targets are
+    /// operator-authoritative, scan targets need linkage-or-manifest
+    /// authorization for their table.
+    name_authorized: bool,
+    /// Index into the scan piece's `tables` this target was decoded from.
+    /// `None` for manifest targets, which are authoritative and never capped.
+    table: Option<usize>,
+}
+
+/// Borrowed scan decode behind one scan piece, for evidence-ordered table
+/// admission in `merge`. Manifest pieces carry `None`: their tables are
+/// operator-authoritative, admitted whole or refused whole as before.
+struct ScanEvidence<'a> {
+    tables: &'a [ScannedTable],
+    interfaces: &'a [ScannedInterface],
+}
+
+/// Identity of one heuristic table for cross-view dedup: one object seen
+/// from several processes decodes the same tables repeatedly, and the
+/// per-object cap counts distinct tables, not decode instances.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum TableKey {
+    /// Version-word file offset plus decoded version: the same table however
+    /// many views decoded it.
+    Located { file_offset: u64, version: (u8, u8) },
+    /// No file offset, so sameness is unprovable (runtime addresses are
+    /// generation-local): each instance admits alone.
+    Unlocated { piece: usize, table: usize },
+}
+
+fn table_key(piece: usize, index: usize, table: &ScannedTable) -> TableKey {
+    match table.file_offset {
+        Some(file_offset) => TableKey::Located {
+            file_offset,
+            version: table.version,
+        },
+        None => TableKey::Unlocated {
+            piece,
+            table: index,
+        },
+    }
 }
 
 /// One module lowered for `merge`.
@@ -1043,6 +1175,7 @@ struct Discovered<'a> {
     entries_seen: usize,
     targets: Vec<Target<'a>>,
     skipped: Vec<Skipped>,
+    scan_evidence: Option<ScanEvidence<'a>>,
 }
 
 /// A slot under construction: the names and modules claiming one target.
@@ -1087,6 +1220,7 @@ fn merge(
     interface_list: String,
     allocated_slots: usize,
     existing_slots: &BTreeMap<AttachKey, usize>,
+    broad_admit: bool,
 ) -> AttachPlan {
     let capacity = MAX_SLOTS as usize;
     let mut groups: Vec<Vec<Discovered<'_>>> = Vec::new();
@@ -1108,15 +1242,19 @@ fn merge(
     let mut skipped = Vec::new();
     let mut surfaces = Vec::new();
     let mut entries_seen = 0usize;
+    let mut uncorroborated_candidates = 0u64;
     let mut allocated_slots = allocated_slots;
-    for group in groups {
+    'groups: for group in groups {
         let key = group[0].key;
         let object = group[0].object;
         let path = group[0].path;
         let source = group[0].source;
         entries_seen += decoded_occurrence_count(&group);
-        let wanted: BTreeSet<AttachKey> = group
+        // Manifest targets are operator-authoritative: admitted whole, and the
+        // module is refused whole when even they exceed the remaining budget.
+        let manifest_wanted: BTreeSet<AttachKey> = group
             .iter()
+            .filter(|module| module.scan_evidence.is_none())
             .flat_map(|module| &module.targets)
             .map(|target| AttachKey {
                 object: target.object,
@@ -1127,13 +1265,13 @@ fn merge(
                     && !existing_slots.contains_key(target)
             })
             .collect();
-        if allocated_slots + wanted.len() > capacity {
+        if allocated_slots + manifest_wanted.len() > capacity {
             let skipped = Skipped {
                 subject: path.to_string(),
                 reason: format!(
                     "module needs {} more of the {MAX_SLOTS} attach slots; {} are in use \
                      — refusing to attach a prefix",
-                    wanted.len(),
+                    manifest_wanted.len(),
                     allocated_slots
                 ),
             };
@@ -1141,7 +1279,214 @@ fn merge(
             modules_skipped.push(skipped);
             continue;
         }
-        allocated_slots += wanted.len();
+        // Scan tables admit in publication-evidence order. Corroborated tables
+        // (interface-linked, manifest/live-return supported) bypass the
+        // per-object cap, subject only to the global budget with atomic
+        // whole-module refusal; unresolved heuristic tables admit until the
+        // per-object cap, and their spill is counted, never slotted. Linkage
+        // is preferred, never gated: unlinked tables still admit in turn, so
+        // scan-only capture of never-called legacy providers keeps working.
+        // One object seen from several views decodes the same tables
+        // repeatedly: distinct tables admit once, scored by the strongest
+        // instance, so linkage observed from any view counts.
+        let mut distinct: BTreeMap<TableKey, (TableEvidenceScore, usize)> = BTreeMap::new();
+        let mut sequence = 0usize;
+        for (piece, module) in group.iter().enumerate() {
+            let Some(evidence) = &module.scan_evidence else {
+                continue;
+            };
+            for index in order_tables_by_evidence(evidence.tables, evidence.interfaces, &[], &[]) {
+                let score =
+                    table_evidence_score(index, evidence.tables, evidence.interfaces, &[], &[]);
+                let key = table_key(piece, index, &evidence.tables[index]);
+                distinct
+                    .entry(key)
+                    .and_modify(|slot| slot.0 = slot.0.max(score))
+                    .or_insert_with(|| {
+                        let slot = (score, sequence);
+                        sequence += 1;
+                        slot
+                    });
+            }
+        }
+        let mut ordered: Vec<(TableKey, TableEvidenceScore, usize)> = distinct
+            .into_iter()
+            .map(|(key, (score, sequence))| (key, score, sequence))
+            .collect();
+        // Strongest evidence first; ties keep first-seen order, so scoring
+        // never reorders what it cannot distinguish.
+        ordered.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.2.cmp(&right.2)));
+        // Every scan target of this group, by distinct table, for marginal
+        // budget accounting across views of one object.
+        let mut keys_of: BTreeMap<TableKey, BTreeSet<AttachKey>> = BTreeMap::new();
+        for (piece, module) in group.iter().enumerate() {
+            let Some(evidence) = &module.scan_evidence else {
+                continue;
+            };
+            for target in &module.targets {
+                let Some(index) = target.table else { continue };
+                let Some(table) = evidence.tables.get(index) else {
+                    continue;
+                };
+                keys_of
+                    .entry(table_key(piece, index, table))
+                    .or_default()
+                    .insert(AttachKey {
+                        object: target.object,
+                        file_offset: target.file_offset,
+                    });
+            }
+        }
+        let is_fresh = |key: &AttachKey| {
+            !positions.contains_key(&(key.object, key.file_offset))
+                && !existing_slots.contains_key(key)
+        };
+        let is_published = table_name_authorized;
+        // All-or-nothing refusal survives only here: when even the strongest
+        // table exceeds the remaining global budget, the module — scan and
+        // manifest parts alike — is refused whole. A manifest subset must not
+        // reattach an oversized scan as a prefix.
+        if let Some((top, _, _)) = ordered.first() {
+            let top_marginal = keys_of
+                .get(top)
+                .map_or(0, |keys| keys.iter().filter(|key| is_fresh(key)).count());
+            if allocated_slots + top_marginal > capacity {
+                let skipped = Skipped {
+                    subject: path.to_string(),
+                    reason: format!(
+                        "module needs {top_marginal} more of the {MAX_SLOTS} attach slots; \
+                         {allocated_slots} are in use — refusing to attach a prefix"
+                    ),
+                };
+                refused_module_objects.push((object, skipped.clone()));
+                modules_skipped.push(skipped);
+                continue 'groups;
+            }
+        }
+        // Published tables bypass the per-object cap but stay atomic: their
+        // union with the manifest subset must fit the remaining global budget,
+        // else the whole module is refused. A published spill would be neither
+        // an honest refusal nor an honest uncorroborated count, so it never
+        // spills — it refuses.
+        let mut fresh: BTreeSet<AttachKey> = manifest_wanted;
+        let mut admitted: BTreeSet<TableKey> = BTreeSet::new();
+        let published: Vec<TableKey> = ordered
+            .iter()
+            .filter(|(_, score, _)| is_published(score))
+            .map(|(key, _, _)| *key)
+            .collect();
+        let mut published_union = fresh.clone();
+        for key in &published {
+            if let Some(keys) = keys_of.get(key) {
+                published_union.extend(keys.iter().filter(|key| is_fresh(key)).copied());
+            }
+        }
+        if allocated_slots + published_union.len() > capacity {
+            let skipped = Skipped {
+                subject: path.to_string(),
+                reason: format!(
+                    "module needs {} more of the {MAX_SLOTS} attach slots; {} are in use \
+                     — refusing to attach a prefix",
+                    published_union.len(),
+                    allocated_slots
+                ),
+            };
+            refused_module_objects.push((object, skipped.clone()));
+            modules_skipped.push(skipped);
+            continue 'groups;
+        }
+        fresh = published_union;
+        // Empty published tables cost nothing: admitted, never spilled, never
+        // counted — they are corroborated, not uncorroborated.
+        admitted.extend(published.iter().copied());
+        // Unresolved heuristic tables admit strongest-first until the
+        // per-object cap or the remaining global budget; the spill is
+        // uncorroborated evidence, never slots.
+        //
+        // Broad (Task 1.6 experiment) instead demands the complete validated
+        // set: every table's targets must fit the remaining global budget or
+        // the module refuses whole, like a published over-budget module. A
+        // strongest-prefix plus spill would break the dormant-activation
+        // promise (spill is informational, never PARTIAL), so broad never
+        // spills — it refuses, loudly, with the same shape. Empty tables cost
+        // nothing either way and admit, never spilling.
+        if broad_admit {
+            let mut scan_union = fresh.clone();
+            for (key, _, _) in &ordered {
+                if let Some(keys) = keys_of.get(key) {
+                    scan_union.extend(keys.iter().filter(|key| is_fresh(key)).copied());
+                }
+            }
+            if allocated_slots + scan_union.len() > capacity {
+                let skipped = Skipped {
+                    subject: path.to_string(),
+                    reason: format!(
+                        "module needs {} more of the {MAX_SLOTS} attach slots; {} are in use \
+                         — refusing to attach a prefix",
+                        scan_union.len(),
+                        allocated_slots
+                    ),
+                };
+                refused_module_objects.push((object, skipped.clone()));
+                modules_skipped.push(skipped);
+                continue 'groups;
+            }
+            fresh = scan_union;
+            admitted.extend(ordered.iter().map(|(key, _, _)| *key));
+        } else {
+            let mut heuristic_admitted = 0usize;
+            let mut spent = false;
+            for (key, score, _) in &ordered {
+                if is_published(score) {
+                    continue;
+                }
+                // A heuristic table with no attachable target costs nothing either
+                // way: counted as spill, never consuming the cap.
+                if keys_of.get(key).is_none_or(|keys| keys.is_empty()) {
+                    uncorroborated_candidates += 1;
+                    continue;
+                }
+                if spent || heuristic_admitted >= MAX_TABLES_PER_OBJECT {
+                    uncorroborated_candidates += 1;
+                    continue;
+                }
+                let marginal = keys_of.get(key).map_or(0, |keys| {
+                    keys.iter()
+                        .filter(|key| is_fresh(key) && !fresh.contains(key))
+                        .count()
+                });
+                if allocated_slots + fresh.len() + marginal > capacity {
+                    // The budget is spent: this table and every weaker one spill.
+                    // Admission stays a strongest-evidence prefix — a strong
+                    // table is never skipped to admit a weaker one.
+                    uncorroborated_candidates += 1;
+                    spent = true;
+                    continue;
+                }
+                if let Some(keys) = keys_of.get(key) {
+                    fresh.extend(keys.iter().filter(|key| is_fresh(key)).copied());
+                }
+                admitted.insert(*key);
+                heuristic_admitted += 1;
+            }
+        }
+        allocated_slots += fresh.len();
+        // Per scan piece, per table index: admitted above. Manifest pieces
+        // carry `None` and admit every target.
+        let admitted_instance: Vec<Option<Vec<bool>>> = group
+            .iter()
+            .enumerate()
+            .map(|(piece, module)| {
+                module.scan_evidence.as_ref().map(|evidence| {
+                    evidence
+                        .tables
+                        .iter()
+                        .enumerate()
+                        .map(|(index, table)| admitted.contains(&table_key(piece, index, table)))
+                        .collect()
+                })
+            })
+            .collect();
 
         // One object is one module however many sources described it. A manifest
         // corroborating a scanned module must not read as two rivals claiming the same
@@ -1164,12 +1509,23 @@ fn merge(
         let mut seen_surfaces = Vec::new();
         let mut group_surfaces = Vec::new();
         let mut group_skips = Vec::new();
-        for module in group {
+        for (piece, module) in group.into_iter().enumerate() {
             debug_assert_eq!(
                 module.entries_seen,
                 module.targets.len() + module.skipped.len()
             );
             for target in &module.targets {
+                if let Some(admit) = admitted_instance.get(piece).and_then(|slot| slot.as_ref()) {
+                    // Spilled heuristic tables are evidence, never slots. A
+                    // scan target naming no admitted table fails closed.
+                    let admitted_table = target
+                        .table
+                        .and_then(|index| admit.get(index).copied())
+                        .unwrap_or(false);
+                    if !admitted_table {
+                        continue;
+                    }
+                }
                 let position = *positions
                     .entry((target.object, target.file_offset))
                     .or_insert_with(|| {
@@ -1190,7 +1546,7 @@ fn merge(
                     slot.module_ids.push(id);
                 }
                 slot.name_authority
-                    .entry(target.name.to_string())
+                    .entry(presented_name(target.name_authorized, target.name).to_string())
                     .and_modify(|authorized| *authorized |= target.semantic_authorized)
                     .or_insert(target.semantic_authorized);
                 slot.fork_safe &= target.fork_safe;
@@ -1256,7 +1612,13 @@ fn merge(
     let slots: Vec<Slot> = building
         .into_iter()
         .enumerate()
-        .map(|(index, slot)| {
+        .map(|(index, mut slot)| {
+            // `unknown` is the absence of a name claim, not a rival one: an
+            // authorized name (manifest, linked table) always wins over it,
+            // so a corroborated slot is never "C_Sign|unknown (aliased)".
+            if slot.name_authority.len() > 1 {
+                slot.name_authority.remove(UNKNOWN_FUNCTION_NAME);
+            }
             let names: Vec<_> = slot.name_authority.keys().cloned().collect();
             let semantic_authorized = slot.name_authority.values().all(|value| *value);
             let (descriptor_index, semantic_ambiguous) = crate::kinds::descriptor_index(&names);
@@ -1291,6 +1653,7 @@ fn merge(
         .collect();
     let mut plan = AttachPlan::from_slots(slots);
     plan.modules = modules;
+    plan.uncorroborated_candidates = uncorroborated_candidates;
     plan.skipped = skipped;
     plan.modules_skipped = modules_skipped;
     plan.refused_module_objects = refused_module_objects;
@@ -1309,6 +1672,7 @@ pub fn build_from_reconciled_modules(modules: &[ReconciledModule]) -> AttachPlan
         "absent".into(),
         0,
         &BTreeMap::new(),
+        false,
     )
 }
 
@@ -1320,6 +1684,18 @@ pub fn build_from_sources(
     scanned: &[ReconciledModule],
     manifests: &[Manifest],
     pinned: &PinnedObjects,
+) -> AttachPlan {
+    build_from_sources_broad(scanned, manifests, pinned, false)
+}
+
+/// Task 1.6 experiment: `broad_admit` lifts the per-object heuristic cap
+/// and refuses a module whole unless every validated table fits. Only the
+/// engine's broad pass sets this; every other caller keeps `false`.
+pub fn build_from_sources_broad(
+    scanned: &[ReconciledModule],
+    manifests: &[Manifest],
+    pinned: &PinnedObjects,
+    broad_admit: bool,
 ) -> AttachPlan {
     build_from_sources_with(
         scanned,
@@ -1333,6 +1709,7 @@ pub fn build_from_sources(
         },
         0,
         &BTreeMap::new(),
+        broad_admit,
     )
 }
 
@@ -1343,6 +1720,7 @@ fn build_from_sources_with(
     mut compatible: impl FnMut(PinnedObjectId, PinnedObjectId) -> bool,
     allocated_slots: usize,
     existing_slots: &BTreeMap<AttachKey, usize>,
+    broad_admit: bool,
 ) -> AttachPlan {
     let mut discovered: Vec<Discovered<'_>> = scanned.iter().map(lower_scanned).collect();
     let mut orphaned = Vec::new();
@@ -1363,6 +1741,7 @@ fn build_from_sources_with(
         ),
         allocated_slots,
         existing_slots,
+        broad_admit,
     );
     plan.skipped.extend(orphaned);
     plan
@@ -1377,7 +1756,20 @@ fn build_from_test_sources(scanned: &[ReconciledModule], manifests: &[Manifest])
         |_, _| true,
         0,
         &BTreeMap::new(),
+        false,
     )
+}
+
+/// Mislabel guard: an unlinked heuristic table's ordinal label is a positional
+/// guess — its slots are named `unknown`, never e.g. `C_Sign`. Only
+/// linkage-or-manifest authorization presents PKCS#11 names. Admission is
+/// untouched: linkage is preferred, never gated.
+fn presented_name(authorized: bool, name: &str) -> &str {
+    if authorized {
+        name
+    } else {
+        UNKNOWN_FUNCTION_NAME
+    }
 }
 
 fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
@@ -1400,10 +1792,16 @@ fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
         // or `slots` vs `table_entries` stops reading as attached vs seen.
         let published = table.entries.len() + table.null_entries.len() + table.unpinned.len();
         entries_seen += published;
+        // Same score inputs `merge` admits by, so provenance, the heuristic
+        // cap, and name authorization can never disagree about one table.
+        let score = table_evidence_score(index, &scanned.tables, &scanned.interfaces, &[], &[]);
+        let authorized = table_name_authorized(&score);
         tables.push(TableSummary {
             version: table.version,
             entries: table.entries.len(),
             source: "scan",
+            file_offset: table.file_offset,
+            linkage: table_linkage(&score),
         });
         surfaces.push(SurfaceSummary {
             source: format!(
@@ -1435,13 +1833,20 @@ fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
                 file_offset: entry.file_offset,
                 fork_safe,
                 semantic_authorized: false,
+                name_authorized: authorized,
+                table: Some(index),
             },
         ));
         skipped.extend(table.null_entries.iter().map(|name| Skipped {
-            subject: (*name).to_string(),
+            subject: presented_name(authorized, name).to_string(),
             reason: "null pointer".into(),
         }));
-        skipped.extend(table.unpinned.iter().cloned());
+        // Unpinned subjects are the same ordinal labels (reconciliation records
+        // them verbatim), so the same gate applies; the reasons keep the facts.
+        skipped.extend(table.unpinned.iter().map(|skip| Skipped {
+            subject: presented_name(authorized, &skip.subject).to_string(),
+            reason: skip.reason.clone(),
+        }));
     }
     Discovered {
         object: module.object,
@@ -1454,6 +1859,10 @@ fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
         entries_seen,
         targets,
         skipped,
+        scan_evidence: Some(ScanEvidence {
+            tables: &scanned.tables,
+            interfaces: &scanned.interfaces,
+        }),
     }
 }
 
@@ -1514,6 +1923,7 @@ fn build(m: &Manifest) -> AttachPlan {
         acquisition_label(&m.interface_list),
         0,
         &BTreeMap::new(),
+        false,
     );
     plan.skipped.extend(orphaned);
     plan
@@ -1543,6 +1953,8 @@ fn lower_manifest(
                 .map_or((0, 0), |version| (version.major, version.minor)),
             entries: surface.functions.len(),
             source: "manifest",
+            file_offset: None,
+            linkage: "manifest",
         });
         let fork_safe = matches!(
             &surface.source,
@@ -1596,11 +2008,13 @@ fn lower_manifest(
                     }
                     targets.push(Target {
                         name: &f.name,
+                        table: None,
                         object,
                         object_path: &record.path,
                         file_offset: *file_offset,
                         fork_safe,
                         semantic_authorized: true,
+                        name_authorized: true,
                     });
                 }
                 Resolution::NullPointer => skip("null pointer".into()),
@@ -1644,6 +2058,7 @@ fn lower_manifest(
             entries_seen,
             targets,
             skipped,
+            scan_evidence: None,
         }),
         Vec::new(),
     )
@@ -1754,6 +2169,8 @@ mod tests {
                     unpinned: vec![],
                     address: 0x7000,
                     file_offset: Some(0),
+                    live_return: false,
+                    manifest_supported: false,
                 }],
                 interfaces: vec![],
             },
@@ -1835,12 +2252,14 @@ mod tests {
 
         assert_eq!(plan.slots.len(), 1);
         assert_eq!(plan.entries_seen, 1);
-        assert_eq!(plan.slots[0].names, ["C_Sign"]);
+        // Task 1.3 mislabel guard: the unlinked table's ordinal label is a
+        // positional guess, never presented as a PKCS#11 name.
+        assert_eq!(plan.slots[0].names, ["unknown"]);
         assert_eq!(plan.slots[0].semantics, SlotSemantics::COUNT_ONLY);
         assert!(!plan.slots[0].semantic_authorized);
         assert!(
-            !plan.slots[0].semantic_ambiguous,
-            "missing semantic authority is not alias or module ambiguity"
+            plan.slots[0].semantic_ambiguous,
+            "an unnamed slot cannot resolve one descriptor"
         );
     }
 
@@ -1866,8 +2285,44 @@ mod tests {
     }
 
     #[test]
-    fn manifest_cannot_authorize_a_different_name_at_the_same_target() {
+    fn unlinked_scan_label_is_not_a_rival_claim_against_the_manifest() {
+        // Task 1.3: an unlinked table's ordinal label carries no information,
+        // so it cannot dispute the manifest's operator-authoritative name —
+        // `unknown` is transparent, never a rival claim.
         let scanned = scanned_with(TEST_OBJECT, "/opt/p11.so", [0x10]);
+        let manifest = manifest_with(vec![resolved("C_Login", 0x10)]);
+
+        let plan = build_from_test_sources(
+            std::slice::from_ref(&scanned),
+            std::slice::from_ref(&manifest),
+        );
+
+        assert_eq!(plan.slots.len(), 1);
+        assert_eq!(plan.slots[0].names, ["C_Login"]);
+        assert!(plan.slots[0].semantic_authorized);
+        assert_eq!(
+            plan.slots[0].semantics,
+            crate::kinds::descriptor("C_Login").unwrap()
+        );
+        assert!(!plan.slots[0].semantic_ambiguous);
+    }
+
+    #[test]
+    fn linked_scan_label_disputing_the_manifest_stays_count_only() {
+        // The safety property the unlinked case retires survives where it has
+        // teeth: two AUTHORIZED names disagreeing about one target stay
+        // unresolvable, counted but never attributed.
+        use crate::discovery::scan::ScannedInterface;
+
+        let mut scanned = scanned_with(TEST_OBJECT, "/opt/p11.so", [0x10]);
+        scanned.scanned.interfaces.push(ScannedInterface {
+            index: 0,
+            name_class: "exact_standard",
+            name_lossy: None,
+            name_private: Some(b"PKCS 11".to_vec()),
+            flags: 0,
+            table: Some(0),
+        });
         let manifest = manifest_with(vec![resolved("C_Login", 0x10)]);
 
         let plan = build_from_test_sources(
@@ -1898,6 +2353,7 @@ mod tests {
             |_, _| true,
             0,
             &BTreeMap::new(),
+            false,
         );
 
         assert_eq!(plan.slots.len(), 2, "distinct pinned objects stay distinct");
@@ -1908,7 +2364,10 @@ mod tests {
             .unwrap();
         assert_eq!(scan_slot.semantics, SlotSemantics::COUNT_ONLY);
         assert!(!scan_slot.semantic_authorized);
-        assert!(!scan_slot.semantic_ambiguous);
+        // Task 1.3: the unlinked scan slot is unnamed, and an unnamed slot
+        // cannot resolve one descriptor.
+        assert_eq!(scan_slot.names, ["unknown"]);
+        assert!(scan_slot.semantic_ambiguous);
         let manifest_slot = plan
             .slots
             .iter()
@@ -1931,6 +2390,7 @@ mod tests {
             |_, _| false,
             0,
             &BTreeMap::new(),
+            false,
         );
         assert!(plan.slots.is_empty());
         assert_eq!(plan.entries_seen, 1);
@@ -2778,6 +3238,8 @@ mod tests {
                 file_offset,
                 fork_safe: false,
                 semantic_authorized: true,
+                name_authorized: true,
+                table: None,
             })
             .collect();
         Discovered {
@@ -2794,6 +3256,7 @@ mod tests {
             entries_seen: targets.len(),
             targets,
             skipped: vec![],
+            scan_evidence: None,
         }
     }
 
@@ -3252,6 +3715,7 @@ mod tests {
             "absent".into(),
             plan.slots.len(),
             &plan.slot_by_key,
+            false,
         );
 
         assert_eq!(rebuilt.modules.len(), 1);

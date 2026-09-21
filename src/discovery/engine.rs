@@ -24,7 +24,7 @@ use crate::discovery::scan::{
     table_evidence_score, table_linkage, target_layout,
 };
 use crate::discovery::scheduler::{
-    DiscoveryScheduler, InventoryCadence, MAX_PENDING_REFRESH, MAX_POLLING_RESCANS_PER_SWEEP,
+    DiscoveryScheduler, InventoryCadence, MAX_PENDING_REFRESH, MAX_POLLING_RESCANS,
 };
 use crate::manifest_input::{read_manifest, selection_surface_usable, validate_structure};
 use crate::process::{self, OriginalGenerationState, ProcessView, ProcessViewId};
@@ -12868,11 +12868,12 @@ impl Engine {
                         failed_pids.insert(view.pid());
                     }
                 }
+                let left = ordered.len() - index;
+                let noun = if left == 1 { "view" } else { "views" };
                 skipped.push(Skipped {
                     subject: "live discovery tick".into(),
                     reason: format!(
-                        "tick deep-scan quantum exhausted; {} refreshed views deferred to the next tick",
-                        ordered.len() - index
+                        "tick deep-scan quantum exhausted; {left} refreshed {noun} deferred to the next tick"
                     ),
                 });
                 break;
@@ -13131,6 +13132,51 @@ impl Engine {
         victims.into_iter().map(|(_, id)| id).collect()
     }
 
+    /// One polling round over the enumerated pids (sorted ascending): queue
+    /// a bounded number of retained exploratory views — in poll-cursor
+    /// order, so the cursor round-robins them — for a same-tick refresh
+    /// rescan through the normal replace-always path. Unarmed views would
+    /// otherwise never re-scan a process that gains a provider; a found
+    /// provider upgrades the view to owned and arms it then. Already-
+    /// requested pids are skipped, so event-driven work is never
+    /// double-queued. Polling can only add coverage (its targets hold
+    /// nothing), never flap owned modules — owned views rely on
+    /// event-driven refresh instead. `pids` must be sorted ascending.
+    fn queue_polling_rescans(&mut self, pids: &[u32]) {
+        let mut polling = 0;
+        let mut last_queued = None;
+        for pid in self.scheduler.poll_order(pids) {
+            if polling >= MAX_POLLING_RESCANS {
+                break;
+            }
+            if self.refresh_requested.contains(&pid) {
+                continue;
+            }
+            let retained_exploratory = self
+                .views
+                .iter()
+                .any(|view| view.pid() == pid && self.exploratory_evictable(view.id()));
+            if !retained_exploratory {
+                continue;
+            }
+            self.request_refresh(pid);
+            if self.refresh_requested.contains(&pid) {
+                polling += 1;
+                last_queued = Some(pid);
+            }
+        }
+        if let Some(last) = last_queued {
+            self.scheduler.advance_poll_cursor(last);
+        }
+        if polling > 0 {
+            let noun = if polling == 1 { "view" } else { "views" };
+            self.mark_partial(
+                "live discovery rotation",
+                &format!("queued {polling} retained exploratory {noun} for polling rescan"),
+            );
+        }
+    }
+
     /// Evicts exploratory views outside the retirement transaction: by the
     /// classifier they hold no modules, contexts, claims, or queued work,
     /// so there is nothing to retire — removal drops the view, its pins
@@ -13250,8 +13296,7 @@ impl Engine {
                 let evict_budget = evictable
                     .len()
                     .min(self.scheduler.max_evictions_per_pass());
-                let (selected, read) =
-                    self.reconcile_slice(pids, &known, free_slots + evict_budget);
+                let selected = self.reconcile_slice(pids, &known, free_slots + evict_budget);
                 let need = selected.len().saturating_sub(free_slots);
                 let victims: BTreeSet<ProcessViewId> =
                     evictable.into_iter().take(need).collect();
@@ -13270,41 +13315,9 @@ impl Engine {
                     })
                     .collect();
                 self.evict_exploratory_views(&victims);
-                // Polling rescans for retained exploratory views, queued
-                // after eviction so victims are never polled: unarmed views
-                // would otherwise never re-scan a process that gains a
-                // provider. A bounded number of covered retained
-                // exploratory views — in cursor order, so the cursor
-                // round-robins them — takes the normal same-tick refresh
-                // path (replace-always); a found provider upgrades the view
-                // to owned and arms it then. Already-requested pids are
-                // skipped, so event-driven work is never double-queued.
-                let mut polling = 0;
-                for pid in &read {
-                    if polling >= MAX_POLLING_RESCANS_PER_SWEEP {
-                        break;
-                    }
-                    if self.refresh_requested.contains(pid) {
-                        continue;
-                    }
-                    let retained_exploratory = self.views.iter().any(|view| {
-                        view.pid() == *pid && self.exploratory_evictable(view.id())
-                    });
-                    if !retained_exploratory {
-                        continue;
-                    }
-                    self.request_refresh(*pid);
-                    if self.refresh_requested.contains(pid) {
-                        polling += 1;
-                    }
-                }
-                if polling > 0 {
-                    let noun = if polling == 1 { "view" } else { "views" };
-                    self.mark_partial(
-                        "live discovery rotation",
-                        &format!("queued {polling} retained exploratory {noun} for polling rescan"),
-                    );
-                }
+                // Polling runs after eviction so victims are never polled.
+                // `scope_pids` guarantees pid order for the poll cursor.
+                self.queue_polling_rescans(pids);
                 desired.extend(selected.iter().copied());
                 desired.retain(|pid| !victim_pids.contains(pid));
                 let fresh = desired.iter().filter(|pid| !known.contains(pid)).count();
@@ -13337,18 +13350,17 @@ impl Engine {
     /// eligible unscanned slice pids (cooling-down pids sit out) are
     /// rarity-ordered into the free view slots plus the bounded eviction
     /// allowance the caller folded in.
-    /// Returns the selected new pids plus the read pids in cursor order
-    /// (for polling-rescan queueing after eviction). The cursor advances
-    /// past the last pid read; an incomplete slice publishes its exact
-    /// coverage gap. Slice maps bytes are re-read every sweep, never served
-    /// from a cache: only stable file-derived facts (pin-keyed
-    /// ELF/inspection entries) are cached, never mappings or heap content.
+    /// Returns the selected new pids. The cursor advances past the last pid
+    /// read; an incomplete slice publishes its exact coverage gap. Slice
+    /// maps bytes are re-read every sweep, never served from a cache: only
+    /// stable file-derived facts (pin-keyed ELF/inspection entries) are
+    /// cached, never mappings or heap content.
     fn reconcile_slice(
         &mut self,
         pids: &[u32],
         known: &BTreeSet<u32>,
         free_slots: usize,
-    ) -> (Vec<u32>, Vec<u32>) {
+    ) -> Vec<u32> {
         let quantum_ns = self.scheduler.quantum_ns();
         let slice_pids = self.scheduler.slice_pids();
         let order = DiscoveryScheduler::rotated_after(pids, self.scheduler.cursor());
@@ -13411,15 +13423,11 @@ impl Engine {
         // out selection until their cooldown expires, so rotation walks
         // forward instead of churning. Queued refresh requests for them
         // rejoin through the pending set in the caller.
-        let read: Vec<u32> = slice.iter().map(|(pid, _)| *pid).collect();
         let pool: Vec<(u32, Vec<MapEntry>)> = slice
             .into_iter()
             .filter(|(pid, _)| !known.contains(pid) && !self.scheduler.cooling_down(*pid))
             .collect();
-        (
-            select_deep_scan_candidates(&pool, free_slots),
-            read,
-        )
+        select_deep_scan_candidates(&pool, free_slots)
     }
 
     fn refresh_inventory(
@@ -13506,6 +13514,16 @@ impl Engine {
         } else if pids.len() > max_scan_pids {
             self.select_over_cap_desired(&pids)
         } else {
+            // Under-cap polling round, every fourth under-cap tick: retained
+            // exploratory views carry no loader context, so without this a
+            // process that gains a provider while the capture sits under the
+            // cap would never re-scan. Queued here so the requests flow into
+            // `refreshed` below and are served same-tick. The zero cap
+            // short-circuits above and never polls. `scope_pids` guarantees
+            // pid order for the poll cursor.
+            if self.scheduler.begin_under_cap_tick() {
+                self.queue_polling_rescans(&pids);
+            }
             pids.into_iter().collect()
         };
         // Only new candidates count: known views are retained, not selected.
@@ -13587,11 +13605,12 @@ impl Engine {
         let deferred: Vec<u32> = new_pids.collect();
         if !deferred.is_empty() {
             failed_refresh_pids.extend(deferred.iter().copied());
+            let pending = admitted.len() + deferred.len();
+            let noun = if pending == 1 { "process" } else { "processes" };
             skipped.push(Skipped {
                 subject: "live discovery tick".into(),
                 reason: format!(
-                    "{} new processes pending; tick admitted {} for deep scanning (tick limit {max_new_views})",
-                    admitted.len() + deferred.len(),
+                    "{pending} new {noun} pending; tick admitted {} for deep scanning (tick limit {max_new_views})",
                     admitted.len()
                 ),
             });

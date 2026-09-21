@@ -51,13 +51,14 @@ pub(crate) const RECONCILE_EVICTION_COOLDOWN_SWEEPS: u64 = 2;
 /// Provisional — ratify by measurement.
 pub(crate) const MAX_NEW_VIEWS_PER_TICK: usize = 64;
 
-/// Polling rescans per reconcile sweep: at most this many covered retained
+/// Polling rescans per polling round: at most this many retained
 /// exploratory views are queued for a same-tick refresh rescan, so a
 /// retained process that gains a provider is re-examined within a finite
-/// number of sweeps even though it carries no loader context. The cursor
-/// round-robins them; the tick quantum still bounds the rescan phase.
-/// Provisional — ratify by measurement.
-pub(crate) const MAX_POLLING_RESCANS_PER_SWEEP: usize = 8;
+/// number of rounds even though it carries no loader context. A round runs
+/// on every over-cap reconcile sweep and every fourth under-cap tick; the
+/// poll cursor round-robins the eligible set and the tick quantum still
+/// bounds the rescan phase. Provisional — ratify by measurement.
+pub(crate) const MAX_POLLING_RESCANS: usize = 8;
 
 /// Wall-time quantum for one tick's deep-scan phase, in nanoseconds:
 /// refreshed-view rescans plus new-view admissions. The phase stops before
@@ -93,6 +94,8 @@ pub(crate) struct DiscoveryScheduler {
     cooldown_sweeps: u64,
     max_new_views: usize,
     tick_quantum_ns: u64,
+    under_cap_ticks: u64,
+    poll_cursor: Option<u32>,
     /// Wall-time deadline for the current tick's deep-scan phase, installed
     /// by `begin_deep_scan_tick`. `None` outside a tick means unbounded —
     /// direct scan calls (and unit tests driving them) are not ticks.
@@ -113,6 +116,8 @@ impl DiscoveryScheduler {
             max_new_views: MAX_NEW_VIEWS_PER_TICK,
             tick_quantum_ns: TICK_DEEP_SCAN_QUANTUM_NS,
             tick_deadline_ns: None,
+            under_cap_ticks: 0,
+            poll_cursor: None,
         }
     }
 
@@ -167,6 +172,27 @@ impl DiscoveryScheduler {
 
     pub(crate) fn max_new_views_per_tick(&self) -> usize {
         self.max_new_views
+    }
+
+    /// Counts one under-cap inventory tick and reports whether it runs a
+    /// polling round: every fourth, mirroring the reconcile cadence, so
+    /// quiet under-cap ticks keep their no-op behavior between rounds.
+    pub(crate) fn begin_under_cap_tick(&mut self) -> bool {
+        self.under_cap_ticks = self.under_cap_ticks.saturating_add(1);
+        self.under_cap_ticks % RECONCILE_EVERY_N_OVER_CAP_PASSES == 0
+    }
+
+    /// The pids rotated to start after the poll cursor, for fair
+    /// round-robin polling queueing. `pids` must be sorted ascending.
+    pub(crate) fn poll_order(&self, pids: &[u32]) -> Vec<u32> {
+        Self::rotated_after(pids, self.poll_cursor)
+    }
+
+    /// Parks the poll cursor at the last queued pid, so the next round
+    /// continues past it. Never called when a round queues nothing, so an
+    /// all-ineligible round retries the same window next time.
+    pub(crate) fn advance_poll_cursor(&mut self, last_queued: u32) {
+        self.poll_cursor = Some(last_queued);
     }
 
     /// Installs the current tick's deep-scan deadline from the caller's
@@ -491,6 +517,21 @@ mod tests {
             scheduler.tick_expired(Some(u64::MAX)),
             "a clock failure at install defers the whole phase"
         );
+    }
+
+    /// Under-cap ticks poll every fourth, mirroring the reconcile cadence,
+    /// and the poll cursor round-robins queueing past the last queued pid.
+    #[test]
+    fn under_cap_ticks_poll_every_fourth_in_poll_cursor_order() {
+        let mut scheduler = DiscoveryScheduler::new();
+        assert!(!scheduler.begin_under_cap_tick());
+        assert!(!scheduler.begin_under_cap_tick());
+        assert!(!scheduler.begin_under_cap_tick());
+        assert!(scheduler.begin_under_cap_tick());
+        assert!(!scheduler.begin_under_cap_tick());
+        assert_eq!(scheduler.poll_order(&[10, 20, 30]), vec![10, 20, 30]);
+        scheduler.advance_poll_cursor(20);
+        assert_eq!(scheduler.poll_order(&[10, 20, 30]), vec![30, 10, 20]);
     }
 
     /// The exploration bound is exact small arithmetic: nothing unscanned

@@ -2530,10 +2530,10 @@ fn drain_original_root_events(
         exit,
         Instant::now() + crate::events::ROOT_TAIL_FENCE_TIMEOUT,
     );
-    let mut drain = session
+    let drain = session
         .event_drain()
         .context("root_tail_incomplete: EVENTS reader")?;
-    drain_original_root_events_from(&mut drain, tail, signals, reduce)
+    drain_original_root_events_from(drain, tail, signals, reduce)
 }
 
 fn drain_original_root_events_from<S: crate::events::BoundedRecordSource>(
@@ -2549,7 +2549,7 @@ fn drain_original_root_events_from<S: crate::events::BoundedRecordSource>(
             // The original child and domain stay retained until this explicit
             // abandonment; this outcome cannot carry a retirement token.
             return Ok(OriginalRootDrain::Cancelled {
-                malformed: drain.malformed(),
+                malformed: drain.take_malformed_delta(),
                 remaining,
             });
         }
@@ -2559,12 +2559,12 @@ fn drain_original_root_events_from<S: crate::events::BoundedRecordSource>(
             crate::events::RootTailProgress::Reached => {
                 if let Some(remaining) = tail.cancellation(signals.interrupted(), Instant::now())? {
                     return Ok(OriginalRootDrain::Cancelled {
-                        malformed: drain.malformed(),
+                        malformed: drain.take_malformed_delta(),
                         remaining,
                     });
                 }
                 return Ok(OriginalRootDrain::Completed {
-                    malformed: drain.malformed(),
+                    malformed: drain.take_malformed_delta(),
                     tail: Box::new(tail.complete()?),
                 });
             }
@@ -3103,8 +3103,8 @@ fn capture_profile(
             &mut || interrupted.interrupted() || duration.is_some_and(|d| clock.elapsed() >= d),
             || {
                 select_and_drain_events(session, Session::live_poll_quantum, |session, quantum| {
-                    let mut drain = session.event_drain()?;
-                    drain_profile_events(&mut drain, state, tracker, scope, quantum)
+                    let drain = session.event_drain()?;
+                    drain_profile_events(drain, state, tracker, scope, quantum)
                 })
             },
         )?;
@@ -4133,8 +4133,8 @@ fn emit_bounded_trace_event<W: Write, F: FnOnce() -> String>(
 }
 
 /// One profile poll: `Some(quantum)` on the live ring, `None` once the
-/// producers are detached and the drain is finite. Returns the malformed
-/// count so far.
+/// producers are detached and the drain is finite. Returns the per-poll
+/// malformed delta from the retained drain.
 fn select_and_drain_events<C, T>(
     context: &mut C,
     select: impl FnOnce(&C) -> Option<usize>,
@@ -4387,13 +4387,13 @@ fn drain_profile_events<S: crate::events::RecordSource>(
     if let Some(error) = failure {
         return Err(error);
     }
-    Ok((drain.malformed(), may_remain))
+    Ok((drain.take_malformed_delta(), may_remain))
 }
 
 /// Drains what the ring buffer currently holds — one quantum on the live
 /// ring, whole after detach — rendering and emitting one line per completed
-/// call. Returns the malformed-record count from this drain, to accumulate at
-/// the call site.
+/// call. Returns the per-poll malformed-record delta from this drain, to
+/// accumulate at the call site.
 #[allow(clippy::too_many_arguments)]
 fn drain_trace_events<W: Write>(
     session: &mut Session,
@@ -4418,9 +4418,9 @@ fn drain_trace_events<W: Write>(
         should_yield,
         || {
             select_and_drain_events(session, Session::live_poll_quantum, |session, quantum| {
-                let mut drain = session.event_drain()?;
+                let drain = session.event_drain()?;
                 drain_trace_events_from(
-                    &mut drain,
+                    drain,
                     remaining,
                     state,
                     tracker,
@@ -4545,7 +4545,7 @@ fn drain_trace_events_from<S: crate::events::RecordSource, W: Write>(
     // A reached live limit owns no more live work: the readiness loop must
     // not re-poll past it, and the terminal drain owns the remainder.
     let live_limited = quantum.is_some() && matches!(*remaining, Some(0));
-    Ok((drain.malformed(), may_remain && !live_limited))
+    Ok((drain.take_malformed_delta(), may_remain && !live_limited))
 }
 
 /// Emits `LOST n events` when the ring buffer's loss counter has grown

@@ -1100,3 +1100,39 @@ fn capture_tick_short_circuits_end_and_errors_after_required_sync() {
     assert!(line.contains(" C_OpenSession "));
     assert_eq!(state.sessions().opened, 1);
 }
+
+/// E04 correctness gate: a cancelled root tail abandons only the optional
+/// retirement, carrying the exact unconsumed backlog and the per-poll
+/// malformed delta — no retirement token, no silent loss.
+#[test]
+fn root_tail_cancellation_abandons_backlog_with_exact_malformed_delta() {
+    let domain = crate::events::EventsDomain::test_standin(71);
+    let tail = crate::events::OwnedRootTail::new(
+        OriginalRootExit::test_reaped(domain.clone()),
+        Instant::now() + Duration::from_secs(1),
+    );
+    let mut drain = EventDrain::over_domain(
+        crate::events::root_fence_tests::source([root_event(0, pkcs11_types::CkRv::OK.0)]),
+        domain,
+    );
+    let signals = SignalState::new();
+    signals.observe(libc::SIGTERM);
+    let reduced = std::cell::Cell::new(0);
+    let outcome = drain_original_root_events_from(&mut drain, tail, &signals, |_, _| {
+        reduced.set(reduced.get() + 1);
+        Ok(())
+    })
+    .unwrap();
+    match outcome {
+        OriginalRootDrain::Cancelled {
+            malformed,
+            remaining,
+        } => {
+            assert_eq!(reduced.get(), 0);
+            assert_eq!(malformed, 0);
+            assert_eq!(remaining, 8, "the one snapshot record stays backlog");
+            assert_eq!(drain.take_malformed_delta(), 0);
+        }
+        _ => panic!("a pre-cancelled tail must abandon, not complete or vanish"),
+    }
+}

@@ -662,8 +662,8 @@ mod tests {
         event_bytes(ev)
     }
 
-    fn counting_poll(
-        drain: &mut EventDrain<ScriptedRecords>,
+    fn counting_poll<S: RecordSource>(
+        drain: &mut EventDrain<S>,
         quantum: Option<usize>,
     ) -> (usize, bool) {
         let mut seen = 0;
@@ -672,6 +672,203 @@ mod tests {
             ControlFlow::Continue(())
         });
         (seen, backlog)
+    }
+
+    /// A scripted ring with an explicit consumer cursor shared by ordinary
+    /// and bounded reads: ordinary polls advance it, the root fence
+    /// snapshots it, and the terminal poll observes it — exactly the
+    /// one-cursor sequence the retained production consumer must keep.
+    struct CursorScript {
+        cursor: std::rc::Rc<std::cell::Cell<usize>>,
+        producer: usize,
+        capacity: usize,
+        queue: std::collections::VecDeque<Vec<u8>>,
+    }
+
+    struct CursorItem {
+        bytes: Vec<u8>,
+        cursor: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl Deref for CursorItem {
+        type Target = [u8];
+        fn deref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    impl Drop for CursorItem {
+        fn drop(&mut self) {
+            self.cursor.set(self.cursor.get().wrapping_add(8));
+        }
+    }
+
+    impl CursorScript {
+        fn scripted(records: impl IntoIterator<Item = Vec<u8>>) -> Self {
+            let queue: std::collections::VecDeque<_> = records.into_iter().collect();
+            Self {
+                cursor: std::rc::Rc::new(std::cell::Cell::new(0)),
+                producer: queue.len() * 8,
+                capacity: 4096,
+                queue,
+            }
+        }
+    }
+
+    impl RecordSource for CursorScript {
+        fn next_record(&mut self) -> Option<impl Deref<Target = [u8]> + '_> {
+            if self.cursor.get() == self.producer {
+                return None;
+            }
+            let bytes = self.queue.pop_front()?;
+            Some(CursorItem {
+                bytes,
+                cursor: self.cursor.clone(),
+            })
+        }
+    }
+
+    impl BoundedRecordSource for CursorScript {
+        fn positions(&self) -> aya::maps::ring_buf::RingBufPositions {
+            aya::maps::ring_buf::RingBufPositions {
+                consumer: self.cursor.get(),
+                producer: self.producer,
+                capacity: self.capacity,
+            }
+        }
+        fn consumer(&self) -> usize {
+            self.cursor.get()
+        }
+        fn bounded_record(
+            &mut self,
+            stop: usize,
+        ) -> Result<BoundedRecord<impl Deref<Target = [u8]> + '_>> {
+            if self.cursor.get() == stop {
+                return Ok(BoundedRecord::Reached);
+            }
+            match self.queue.pop_front() {
+                Some(bytes) => Ok(BoundedRecord::Item(CursorItem {
+                    bytes,
+                    cursor: self.cursor.clone(),
+                })),
+                None => Ok(BoundedRecord::Pending),
+            }
+        }
+    }
+
+    /// E04 correctness gate: one retained consumer serves two quanta; a
+    /// malformed record in quantum 1 plus valid records in quantum 2 is
+    /// counted exactly once — per-poll deltas, never re-summed totals.
+    #[test]
+    fn persistent_consumer_counts_malformed_then_valid_quanta_exactly_once() {
+        let records = vec![
+            vec![0u8; 3],
+            to_bytes(&sample_event()),
+            to_bytes(&sample_event()),
+            to_bytes(&sample_event()),
+        ];
+        let mut drain = EventDrain::over(ScriptedRecords::records(records, 4));
+
+        let (seen, backlog) = counting_poll(&mut drain, Some(2));
+        assert_eq!((seen, backlog), (1, true));
+        assert_eq!(drain.take_malformed_delta(), 1);
+
+        let (seen, backlog) = counting_poll(&mut drain, Some(2));
+        assert_eq!((seen, backlog), (2, false));
+        assert_eq!(drain.take_malformed_delta(), 0);
+
+        assert_eq!(drain.malformed(), 1);
+    }
+
+    /// Deltas checkpoint: polls with no malformed records report zero
+    /// without disturbing the cumulative total a later poll still deltas.
+    #[test]
+    fn per_poll_malformed_deltas_never_recount_or_lose() {
+        let records = vec![
+            vec![0u8; 3],
+            to_bytes(&sample_event()),
+            vec![0u8; 5],
+            vec![0u8; 7],
+        ];
+        let mut drain = EventDrain::over(ScriptedRecords::records(records, 4));
+
+        let (seen, _) = counting_poll(&mut drain, Some(1));
+        assert_eq!(seen, 0);
+        assert_eq!(drain.take_malformed_delta(), 1);
+
+        let (seen, _) = counting_poll(&mut drain, Some(1));
+        assert_eq!(seen, 1);
+        assert_eq!(drain.take_malformed_delta(), 0);
+
+        let (seen, backlog) = counting_poll(&mut drain, Some(2));
+        assert_eq!((seen, backlog), (0, false));
+        assert_eq!(drain.take_malformed_delta(), 2);
+
+        assert_eq!(drain.malformed(), 3);
+    }
+
+    /// The terminal poll keeps the explicit bound on the retained drain:
+    /// one record past it is backlog (truncation), not a re-poll, and the
+    /// delta still accounts the quantum exactly.
+    #[test]
+    fn terminal_poll_reports_backlog_past_the_explicit_bound_on_one_drain() {
+        let events = (0..=TERMINAL_DRAIN_BOUND).map(|_| sample_event());
+        let mut drain = EventDrain::over(ScriptedRecords::events(events, TERMINAL_DRAIN_BOUND));
+
+        let (seen, backlog) = counting_poll(&mut drain, poll_quantum(true));
+
+        assert_eq!(seen, TERMINAL_DRAIN_BOUND);
+        assert!(backlog, "backlog past the terminal bound is truncation");
+        assert_eq!(drain.source().remaining(), 1);
+        assert_eq!(drain.take_malformed_delta(), 0);
+        assert_eq!(drain.malformed(), 0);
+    }
+
+    /// One consumer cursor spans the ordinary, root-tail and terminal
+    /// phases: ordinary polls advance it, the tail snapshots the advanced
+    /// cursor and reduces to its boundary (counting its malformed record
+    /// in the delta), and the terminal poll finds the ring empty.
+    #[test]
+    fn one_consumer_cursor_spans_ordinary_root_tail_and_terminal_polls() {
+        let domain = EventsDomain::test_standin(201);
+        let mut drain = EventDrain::over_domain(
+            CursorScript::scripted([
+                to_bytes(&sample_event()),
+                to_bytes(&sample_event()),
+                vec![0u8; 3],
+                to_bytes(&sample_event()),
+            ]),
+            domain.clone(),
+        );
+
+        let (seen, backlog) = counting_poll(&mut drain, Some(2));
+        assert_eq!((seen, backlog), (2, true));
+        assert_eq!(drain.take_malformed_delta(), 0);
+        assert_eq!(drain.source.consumer(), 16);
+
+        let mut tail = OwnedRootTail::new(
+            crate::run::OriginalRootExit::test_reaped(domain),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        );
+        drain.begin_root_tail(&mut tail).unwrap();
+        let mut reduced = 0;
+        assert_eq!(
+            drain
+                .poll_root_tail(&mut tail, LIVE_POLL_QUANTUM, |_| {
+                    reduced += 1;
+                    Ok(())
+                })
+                .unwrap(),
+            RootTailProgress::Reached
+        );
+        assert_eq!(reduced, 1);
+        assert_eq!(drain.take_malformed_delta(), 1);
+        assert!(tail.complete().is_ok());
+
+        let (seen, backlog) = counting_poll(&mut drain, poll_quantum(true));
+        assert_eq!((seen, backlog), (0, false));
+        assert_eq!(drain.take_malformed_delta(), 0);
+        assert_eq!(drain.malformed(), 1);
     }
 
     #[test]

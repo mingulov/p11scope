@@ -20002,6 +20002,193 @@ fn view_pin_revalidation_detects_replaced_files() {
     );
 }
 
+/// E25: the preflight walk proves exactly what the merge would fail on.
+/// Every failure mode below must fail identically (same message) in both,
+/// and a failed merge must leave the facts usable — the merge is atomic.
+#[test]
+fn merge_preflight_agrees_with_merge_on_failure_modes() {
+    let provider = E07Provider::dlopen();
+    let mut engine = e07_engine();
+    engine.module_hints = vec![provider.path.clone()];
+    let view_id = engine.views[0].id();
+    let context = e07_loader_context(&mut engine, view_id);
+    let mut session = ScriptedSession::default();
+    let mut additions = true;
+    let mut pending = PendingViewRetirements::new();
+    e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
+    assert!(!engine.modules.is_empty());
+    let reconciled = engine.modules[0].clone();
+    let object = reconciled.object;
+    let so_id = object;
+    let plan = plan::build_from_reconciled_modules(&[]);
+    let counters = DiscoveryCounters::default();
+    let manifest = valid_manifest_for(std::slice::from_ref(&provider.path), &[0u32; 67]);
+
+    // (module object, entry objects, manifests, ordinals, pins, facts)
+    // per failure mode. Refused-module resolution shares
+    // `module_id_for_object` with the covered modes; refused plans only
+    // arise from ceiling rebuilds, which the suite covers elsewhere.
+    let object_without_identity = PinnedObjectId(999);
+    let modes: Vec<(
+        &str,
+        Vec<ReconciledModule>,
+        Vec<Manifest>,
+        Vec<u32>,
+        PinnedObjects,
+        CaptureFacts,
+    )> = vec![
+        (
+            "ordinal mismatch",
+            Vec::new(),
+            vec![manifest.clone()],
+            Vec::new(),
+            engine.pinned.clone(),
+            engine.capture_facts.clone(),
+        ),
+        (
+            "module without opened identity",
+            vec![ReconciledModule {
+                object: object_without_identity,
+                scanned: reconciled.scanned.clone(),
+                entry_objects: Vec::new(),
+            }],
+            Vec::new(),
+            Vec::new(),
+            engine.pinned.clone(),
+            engine.capture_facts.clone(),
+        ),
+        (
+            "module without stable ID",
+            vec![reconciled.clone()],
+            Vec::new(),
+            Vec::new(),
+            engine.pinned.clone(),
+            CaptureFacts::default(),
+        ),
+        (
+            "table without parallel identities",
+            vec![ReconciledModule {
+                object: so_id,
+                scanned: reconciled.scanned.clone(),
+                entry_objects: Vec::new(),
+            }],
+            Vec::new(),
+            Vec::new(),
+            engine.pinned.clone(),
+            engine.capture_facts.clone(),
+        ),
+        (
+            "entry target without identity",
+            vec![ReconciledModule {
+                object: so_id,
+                scanned: reconciled.scanned.clone(),
+                entry_objects: vec![vec![
+                    object_without_identity;
+                    reconciled.scanned.tables[0].entries.len()
+                ]],
+            }],
+            Vec::new(),
+            Vec::new(),
+            engine.pinned.clone(),
+            engine.capture_facts.clone(),
+        ),
+        (
+            "manifest without pinned identity",
+            Vec::new(),
+            vec![manifest],
+            vec![0],
+            engine.pinned.clone(),
+            engine.capture_facts.clone(),
+        ),
+    ];
+    for (mode, modules, manifests, ordinals, pins, facts) in modes {
+        let preflight = facts
+            .resolve_merge_inputs(&plan, &pins, &modules, &manifests, &ordinals)
+            .expect_err(&format!("{mode}: the preflight must fail"))
+            .to_string();
+        let mut attempted = facts.clone();
+        let merge = attempted
+            .merge_current(&plan, &pins, &modules, &manifests, &ordinals, &counters)
+            .expect_err(&format!("{mode}: the merge must fail"))
+            .to_string();
+        assert_eq!(preflight, merge, "{mode}: proof and merge must agree");
+        // The failed merge changed nothing observable: valid inputs still
+        // merge cleanly into the same facts.
+        attempted
+            .merge_current(&plan, &pins, &[], &[], &[], &counters)
+            .expect(&format!("{mode}: facts stay usable after failure"));
+    }
+}
+
+/// E25: preflight success implies merge success with identical results.
+/// Two merges of real candidate inputs produce byte-identical histories
+/// and public projections.
+#[test]
+fn merge_preflight_success_implies_identical_merge_results() {
+    let provider = E07Provider::dlopen();
+    let mut engine = e07_engine();
+    engine.module_hints = vec![provider.path.clone()];
+    let view_id = engine.views[0].id();
+    let context = e07_loader_context(&mut engine, view_id);
+    let mut session = ScriptedSession::default();
+    let mut additions = true;
+    let mut pending = PendingViewRetirements::new();
+    e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
+
+    let inputs = (
+        engine.plan.clone(),
+        engine.pinned.clone(),
+        engine.modules.clone(),
+        engine.manifests.clone(),
+        engine.manifest_ordinals.clone(),
+        engine.counters.clone(),
+    );
+    engine
+        .capture_facts
+        .resolve_merge_inputs(&inputs.0, &inputs.1, &inputs.2, &inputs.3, &inputs.4)
+        .expect("the preflight proves real candidate inputs");
+    let mut first = engine.capture_facts.clone();
+    first
+        .merge_current(
+            &inputs.0, &inputs.1, &inputs.2, &inputs.3, &inputs.4, &inputs.5,
+        )
+        .expect("the merge accepts real candidate inputs");
+    let mut second = engine.capture_facts.clone();
+    second
+        .merge_current(
+            &inputs.0, &inputs.1, &inputs.2, &inputs.3, &inputs.4, &inputs.5,
+        )
+        .expect("the merge is repeatable");
+    assert_eq!(
+        format!("{:?}", first.visible_history()),
+        format!("{:?}", second.visible_history()),
+        "merges produce identical histories"
+    );
+    let mut plan_a = inputs.0.clone();
+    let mut plan_b = inputs.0.clone();
+    first.apply_to_plan(&mut plan_a);
+    second.apply_to_plan(&mut plan_b);
+    assert_eq!(plan_a.skipped, plan_b.skipped);
+    assert_eq!(plan_a.entries_seen, plan_b.entries_seen);
+    assert_eq!(
+        format!("{:?}", first.discovery(&plan_a)),
+        format!("{:?}", second.discovery(&plan_b)),
+        "merges publish identical discovery"
+    );
+}
+
 /// The scan-to-live-candidate completeness contract: a clean scan over a
 /// live budget is complete; stops, refusals and truncating skips are not,
 /// while verified-absence skips keep a scan complete.

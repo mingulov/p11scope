@@ -1307,6 +1307,63 @@ impl CaptureFacts {
             .ok_or_else(|| anyhow!("provider exact identity has no stable module ID"))
     }
 
+    /// The fallible surface of `merge_current` as pure checks: every `?`
+    /// below runs first, in the same order, in `merge_current` itself, so
+    /// this proves exactly what the merge would fail on — without cloning
+    /// or walking the history. `preflight_candidate_publication` uses it
+    /// instead of a throwaway merge (E25); `merge_current` re-runs it as
+    /// its first step and keeps its own interleaved checks, so proof and
+    /// merge cannot disagree on current inputs. If a new fallible lookup
+    /// is ever added to the merge, it must be added here first, in merge
+    /// order — the equivalence tests pin every current failure mode.
+    fn resolve_merge_inputs(
+        &self,
+        plan: &plan::AttachPlan,
+        pinned: &PinnedObjects,
+        modules: &[ReconciledModule],
+        manifests: &[Manifest],
+        manifest_ordinals: &[u32],
+    ) -> Result<()> {
+        if manifests.len() != manifest_ordinals.len() {
+            bail!("accepted manifest history lost its source ordinals");
+        }
+        for module in modules {
+            self.module_id_for_object(pinned, module.object)?;
+            pinned
+                .owned_timing_key(module.object)
+                .ok_or_else(|| anyhow!("scanned provider has no exact opened identity"))?;
+            for (table_index, table) in module.scanned.tables.iter().enumerate() {
+                let objects = module.entry_objects.get(table_index).ok_or_else(|| {
+                    anyhow!("reconciled provider table has no parallel target identities")
+                })?;
+                if objects.len() != table.entries.len() {
+                    bail!("reconciled provider table target identities are incomplete");
+                }
+                for object in objects {
+                    pinned.owned_timing_key(*object).ok_or_else(|| {
+                        anyhow!("decoded target object has no exact opened identity")
+                    })?;
+                }
+            }
+        }
+        for manifest in manifests {
+            let object = manifest_module_object(manifest, pinned).ok_or_else(|| {
+                anyhow!(
+                    "accepted manifest {} has no exact pinned provider identity",
+                    manifest.module_path
+                )
+            })?;
+            self.module_id_for_object(pinned, object)?;
+            pinned
+                .owned_timing_key(object)
+                .ok_or_else(|| anyhow!("manifest provider has no exact opened identity"))?;
+        }
+        for (object, _) in plan.refused_modules() {
+            self.module_id_for_object(pinned, object)?;
+        }
+        Ok(())
+    }
+
     fn merge_current(
         &mut self,
         plan: &plan::AttachPlan,
@@ -1316,9 +1373,9 @@ impl CaptureFacts {
         manifest_ordinals: &[u32],
         counters: &DiscoveryCounters,
     ) -> Result<()> {
-        if manifests.len() != manifest_ordinals.len() {
-            bail!("accepted manifest history lost its source ordinals");
-        }
+        // Proves the fallible surface before cloning: same checks, same
+        // order, same first failure as the interleaved checks below.
+        self.resolve_merge_inputs(plan, pinned, modules, manifests, manifest_ordinals)?;
         let mut history = self.visible_history().clone();
         let live_views: BTreeSet<_> = modules.iter().map(|module| module.scanned.view).collect();
         prune_selection_inventory(&mut history, &live_views);
@@ -8704,17 +8761,16 @@ impl Engine {
         if !candidate_identity_is_complete(&candidate.plan, &candidate.modules, &candidate.pinned) {
             bail!("live candidate lost exact pinned identity before link mutation");
         }
-        // ponytail: proves the publication on a throwaway copy of the fact
-        // store, so the fallible surface is exact by construction rather than
-        // a second list that can drift. Swap for a dedicated preflight walk if
-        // the doubled history merge ever shows up in capture cost.
-        self.capture_facts.clone().merge_current(
+        // A dedicated preflight walk over the merge's fallible surface
+        // (E25): proves exactly what `merge_current` would fail on without
+        // cloning or walking the history. `merge_current` re-runs the same
+        // checks first and keeps its own, so proof and merge agree.
+        self.capture_facts.resolve_merge_inputs(
             &candidate.plan,
             &candidate.pinned,
             &candidate.modules,
             &self.manifests,
             &self.manifest_ordinals,
-            &self.counters,
         )
     }
 

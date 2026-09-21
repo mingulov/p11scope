@@ -4625,4 +4625,344 @@ mod tests {
         // The stable arm: an unchanged file passes with no refusal.
         assert_eq!(check_pin_after_read(Ok(before), &before), Ok(()));
     }
+
+    /// SYSPLAN E07: a saturated table budget must still recognize unchanged
+    /// repeats. 512 distinct candidate tables sharing one endpoint set fill
+    /// the ceiling; an unchanged rescan of two of them must decode both with
+    /// no new charges and no exhaustion evidence — budget-limited absence
+    /// must never look like the tables disappeared.
+    #[test]
+    fn e07_saturated_table_budget_still_recognizes_unchanged_repeats() {
+        let maps = parse_maps(
+            b"1000-3000 r-xp 00000000 08:01 7 /lib/provider.so\n\
+              7000-80000 r--p 00001000 08:01 7 /lib/provider.so\n",
+        )
+        .unwrap();
+        let map_index = MapIndex::new(&maps).unwrap();
+        let table_len = 8 + 104 * 8;
+        let mut snapshot = vec![0u8; 512 * table_len];
+        for table in 0..512 {
+            let base = table * table_len;
+            snapshot[base..base + 8].copy_from_slice(&0x0203u64.to_ne_bytes());
+            for slot in 0..104 {
+                let at = base + 8 + slot * 8;
+                snapshot[at..at + 8].copy_from_slice(&0x1500u64.to_ne_bytes());
+            }
+        }
+        let mut budget = CaptureWorkBudget::default();
+        let (tables, skipped) = detect_tables(&snapshot, 0x7000, &map_index, &mut budget);
+        assert_eq!(tables.len(), 512, "all distinct candidates decode");
+        assert!(
+            skipped.is_empty(),
+            "exactly filling the ceiling refuses nothing: {skipped:?}"
+        );
+        assert_eq!(budget.table_candidates_count(), 512);
+        assert!(
+            tables.windows(2).all(|pair| pair[0].entries == pair[1].entries),
+            "512 candidate tables share few endpoints"
+        );
+
+        // An unchanged rescan of two of the same tables at their own
+        // addresses: repeats, recognized under the saturated cap.
+        let rescan = snapshot[..2 * table_len].to_vec();
+        let (repeated, rescan_skipped) = detect_tables(&rescan, 0x7000, &map_index, &mut budget);
+        assert_eq!(
+            repeated.len(),
+            2,
+            "an unchanged rescan under a saturated cap still decodes its repeats"
+        );
+        assert_eq!(repeated[0], tables[0]);
+        assert_eq!(repeated[1], tables[1]);
+        assert_eq!(
+            budget.table_candidates_count(),
+            512,
+            "repeats must not burn new candidates"
+        );
+        assert!(
+            rescan_skipped.is_empty(),
+            "nothing new was refused, so no exhaustion evidence is owed: {rescan_skipped:?}"
+        );
+    }
+
+    /// SYSPLAN E09: one unchanged interface rescanned 513 times charges the
+    /// 512-record lifetime allowance once. Attempted I/O and work accrue on
+    /// every rescan — uniqueness deduplicates cardinality, never work.
+    #[test]
+    fn e09_repeated_interface_rescans_charge_once_but_work_every_time() {
+        let maps = parse_maps(
+            b"0-1000 r--p 00000000 08:01 7 /lib/provider.so\n\
+              1000-3000 r-xp 00001000 08:01 7 /lib/provider.so\n\
+              7000-9000 r--p 00002000 08:01 7 /lib/provider.so\n",
+        )
+        .unwrap();
+        let map_index = MapIndex::new(&maps).unwrap();
+        let name_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(name_file.path(), b"_PKCS 11\0").unwrap();
+        let mem = File::open(name_file.path()).unwrap();
+        let table = ScannedTable {
+            version: (2, 40),
+            walk: "full",
+            entries: Vec::new(),
+            null_entries: Vec::new(),
+            unpinned: Vec::new(),
+            address: 0x7000,
+            file_offset: Some(0x2000),
+            live_return: false,
+            manifest_supported: false,
+        };
+        let mut snapshot = vec![0u8; INTERFACE_BYTES];
+        snapshot[..WORD].copy_from_slice(&1u64.to_ne_bytes());
+        snapshot[WORD..2 * WORD].copy_from_slice(&table.address.to_ne_bytes());
+        let key = ObjectKey::of(&maps[0]);
+        let mut budget = CaptureWorkBudget::default();
+
+        let mut first_io = 0;
+        for scan in 0..513 {
+            let mut operation_bytes = 0;
+            let (interfaces, skipped) = scan_interfaces(
+                &snapshot,
+                &mem,
+                std::slice::from_ref(&table),
+                &map_index,
+                key,
+                &mut budget,
+                &mut operation_bytes,
+            );
+            assert_eq!(
+                interfaces.len(),
+                1,
+                "rescan {scan}: the unchanged interface still decodes"
+            );
+            assert_eq!(interfaces[0].name_class, "exact_standard");
+            assert!(
+                skipped.is_empty(),
+                "rescan {scan}: a repeat refuses nothing: {skipped:?}"
+            );
+            if scan == 0 {
+                first_io = budget.attempted_io_bytes();
+                assert!(first_io > 0, "the name read charges attempted I/O");
+            }
+        }
+        assert_eq!(
+            budget.interface_records_count(),
+            1,
+            "513 rescans of one interface consume one lifetime record"
+        );
+        assert_eq!(
+            budget.attempted_io_bytes(),
+            513 * first_io,
+            "attempted I/O accrues per rescan, independent of uniqueness"
+        );
+        assert_eq!(
+            budget.work_units_count(),
+            513,
+            "work accrues per rescan, independent of uniqueness"
+        );
+    }
+
+    /// SYSPLAN E09 countercontrol: a changed table at a reused address is a
+    /// new interface, not a repeat — while a genuine repeat across processes
+    /// sharing one provider inode stays free.
+    #[test]
+    fn e09_changed_table_at_a_reused_address_charges_again() {
+        let maps = parse_maps(b"1000-3000 r-xp 00000000 08:01 7 /lib/provider.so\n").unwrap();
+        let map_index = MapIndex::new(&maps).unwrap();
+        let table_v2 = ScannedTable {
+            version: (2, 3),
+            walk: "full",
+            entries: Vec::new(),
+            null_entries: Vec::new(),
+            unpinned: Vec::new(),
+            address: 0x7000,
+            file_offset: Some(0),
+            live_return: false,
+            manifest_supported: false,
+        };
+        let mut table_v3 = table_v2.clone();
+        table_v3.version = (3, 2);
+        let mut snapshot = vec![0u8; INTERFACE_BYTES];
+        snapshot[WORD..2 * WORD].copy_from_slice(&0x7000u64.to_ne_bytes());
+        let mem = tempfile::tempfile().unwrap();
+        let key = ObjectKey::of(&maps[0]);
+        let mut budget = CaptureWorkBudget::default();
+        let mut operation_bytes = 0;
+
+        let (first, skipped) = scan_interfaces(
+            &snapshot,
+            &mem,
+            std::slice::from_ref(&table_v2),
+            &map_index,
+            key,
+            &mut budget,
+            &mut operation_bytes,
+        );
+        assert_eq!(first.len(), 1);
+        assert!(skipped.is_empty());
+        assert_eq!(budget.interface_records_count(), 1);
+
+        // Same address, changed table: a new interface, charged again.
+        let (changed, skipped) = scan_interfaces(
+            &snapshot,
+            &mem,
+            std::slice::from_ref(&table_v3),
+            &map_index,
+            key,
+            &mut budget,
+            &mut operation_bytes,
+        );
+        assert_eq!(changed.len(), 1, "the changed table still decodes");
+        assert!(skipped.is_empty());
+        assert_eq!(
+            budget.interface_records_count(),
+            2,
+            "a changed table at a reused address is not a false repeat"
+        );
+
+        // The original table again: a genuine repeat, free.
+        let (repeat, skipped) = scan_interfaces(
+            &snapshot,
+            &mem,
+            std::slice::from_ref(&table_v2),
+            &map_index,
+            key,
+            &mut budget,
+            &mut operation_bytes,
+        );
+        assert_eq!(repeat.len(), 1);
+        assert!(skipped.is_empty());
+        assert_eq!(
+            budget.interface_records_count(),
+            2,
+            "a genuine repeat must not burn another record"
+        );
+    }
+
+    /// SYSPLAN E09 runtime countercontrol: anonymous tables have no stable
+    /// file owner, so their interfaces are scoped to one process generation
+    /// and sensitive to content — a freed slot reallocated with different
+    /// entries at a reused address charges again.
+    #[test]
+    fn e09_runtime_interface_repeats_are_view_scoped_and_content_sensitive() {
+        let maps = parse_maps(
+            b"1000-3000 r-xp 00000000 08:01 7 /lib/provider.so\n\
+              7000-9000 rw-p 00000000 00:00 0\n",
+        )
+        .unwrap();
+        let map_index = MapIndex::new(&maps).unwrap();
+        let entry = |file_offset: u64| ScannedEntry {
+            name: function_name(0).unwrap(),
+            object: ObjectKey::of(&maps[0]),
+            object_path: "/lib/provider.so".to_string(),
+            file_offset,
+        };
+        let table = ScannedTable {
+            version: (2, 3),
+            walk: "full",
+            entries: vec![entry(0x100)],
+            null_entries: vec![function_name(1).unwrap()],
+            unpinned: Vec::new(),
+            address: 0x7000,
+            file_offset: None,
+            live_return: false,
+            manifest_supported: false,
+        };
+        let mut changed = table.clone();
+        changed.entries = vec![entry(0x200)];
+        let mut snapshot = vec![0u8; INTERFACE_BYTES];
+        snapshot[WORD..2 * WORD].copy_from_slice(&0x7000u64.to_ne_bytes());
+        let mem = tempfile::tempfile().unwrap();
+        let key = ObjectKey::of(&maps[0]);
+        let mut budget = CaptureWorkBudget::default();
+        let mut operation_bytes = 0;
+        let scan = |budget: &mut CaptureWorkBudget,
+                    operation_bytes: &mut u64,
+                    tables: &[ScannedTable],
+                    view: ProcessViewId|
+         -> usize {
+            let (interfaces, skipped) = scan_interfaces_for_layout(
+                LinuxLayout::Lp64,
+                &snapshot,
+                &mem,
+                tables,
+                &map_index,
+                key,
+                budget,
+                operation_bytes,
+                Some(view),
+            );
+            assert_eq!(interfaces.len(), 1, "every scan still decodes");
+            assert!(skipped.is_empty(), "{skipped:?}");
+            budget.interface_records_count()
+        };
+
+        assert_eq!(scan(&mut budget, &mut operation_bytes, &[table.clone()], ProcessViewId(0)), 1);
+        assert_eq!(
+            scan(&mut budget, &mut operation_bytes, &[table.clone()], ProcessViewId(0)),
+            1,
+            "an unchanged repeat in the same generation is free"
+        );
+        assert_eq!(
+            scan(&mut budget, &mut operation_bytes, &[table.clone()], ProcessViewId(1)),
+            2,
+            "a new process generation is not a repeat"
+        );
+        assert_eq!(
+            scan(&mut budget, &mut operation_bytes, &[changed], ProcessViewId(1)),
+            3,
+            "changed entries at a reused address charge again"
+        );
+    }
+
+    /// The scan-to-live-candidate boundary: only verified absence is benign.
+    /// Every bounded/incomplete outcome — ceilings, stops, refusals, partial
+    /// reads — truncates, and unknown future reasons fail closed.
+    #[test]
+    fn scan_skip_truncation_classifier_marks_only_verified_absence_benign() {
+        let mut budget = CaptureWorkBudget::default();
+        let table_reason = budget.table_exhaustion_reason().unwrap();
+        let interface_reason = budget.interface_exhaustion_reason().unwrap();
+        let truncating = [
+            IO_CEILING_REASON,
+            WORK_CEILING_REASON,
+            SCAN_DEADLINE_REASON,
+            SCAN_CLOCK_REASON,
+            MAPS_CEILING_REASON,
+            MAPS_ENTRY_CEILING_REASON,
+            MOUNTINFO_CEILING_REASON,
+            MOUNTINFO_ENTRY_CEILING_REASON,
+            table_reason.as_str(),
+            interface_reason.as_str(),
+            "too_large (123 bytes; per-object cap is 456)",
+            MAPPING_CHANGED_REASON,
+            "memory scan refused: final mapping validation unavailable: gone",
+            "memory scan refused: initial mapping validation unavailable: gone",
+            "memory scan refused: process generation changed during acquisition: gone",
+            "file changed while it was being scanned — retry",
+            "partial snapshot of one data mapping: read 3 of 9 bytes: the read failed: gone",
+            "some future reason",
+        ];
+        for reason in truncating {
+            assert!(
+                scan_skip_truncates(reason),
+                "{reason:?} must truncate the scan it came from"
+            );
+        }
+        let benign = [
+            "no function table was found in its file-backed data; a table built at run time \
+             in .bss or on the heap is outside the memory scan's reach",
+            "matched a --module hint; no function table was found in its file-backed data; a \
+             table built at run time in .bss or on the heap is outside the memory scan's reach",
+            "not mapped in the target",
+            "no absolute pathname in /proc/<pid>/maps",
+            "ambiguous \\012 pathname",
+            "deleted mapping",
+            "non-UTF-8 pathname",
+        ];
+        for reason in benign {
+            assert!(
+                !scan_skip_truncates(reason),
+                "{reason:?} is verified absence, not truncation"
+            );
+        }
+    }
 }

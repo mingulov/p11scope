@@ -19292,3 +19292,668 @@ fn republish_all_heuristic(engine: &mut Engine, raw: ScannedModule) {
     engine.modules = modules;
     engine.publish_current_capture_facts().unwrap();
 }
+
+// SYSPLAN Package B (E07/E09): preserve coverage through incomplete scans.
+//
+// The fixture below is a gcc-built provider look-alike with one planted
+// function table and NO hook exports: hint-scoped scans of this process see
+// it, while hintless full scans skip it for lack of exports — so it is
+// invisible to every other test scanning this process.
+const E07_TABLE_WORDS: usize = 105;
+
+extern "C" fn e07_anchor() {}
+
+struct E07Provider {
+    _dir: tempfile::TempDir,
+    path: PathBuf,
+    handle: *mut std::ffi::c_void,
+    table: *mut u64,
+}
+
+impl E07Provider {
+    fn dlopen() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let c = dir.path().join("provider.c");
+        let path = dir.path().join("provider.so");
+        std::fs::write(
+            &c,
+            "unsigned long p11scope_e07_table[105] = { 1 };\n",
+        )
+        .unwrap();
+        let status = std::process::Command::new("gcc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&path)
+            .arg(&c)
+            .status()
+            .unwrap();
+        assert!(status.success(), "the fixture provider must compile");
+        let cpath =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: an owned file just written by this test; RTLD_LOCAL keeps
+        // its symbols out of every other test in this process.
+        let handle = unsafe { libc::dlopen(cpath.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+        assert!(!handle.is_null(), "the fixture provider must load");
+        let name = std::ffi::CString::new("p11scope_e07_table").unwrap();
+        // SAFETY: the symbol is the 105-word table above; the handle stays
+        // open until Drop, and only this thread writes through it.
+        let table = unsafe { libc::dlsym(handle, name.as_ptr()) } as *mut u64;
+        assert!(!table.is_null(), "the planted table must resolve");
+        let words = unsafe { std::slice::from_raw_parts_mut(table, E07_TABLE_WORDS) };
+        words[0] = 0x2802; // CK_VERSION { major 2, minor 40 }.
+        for word in &mut words[1..] {
+            *word = e07_anchor as usize as u64;
+        }
+        Self {
+            _dir: dir,
+            path,
+            handle,
+            table,
+        }
+    }
+
+    /// Zero the version word: the next scan finds the module with no table.
+    fn zero_version(&self) {
+        unsafe { self.table.write(0) };
+    }
+}
+
+impl Drop for E07Provider {
+    fn drop(&mut self) {
+        unsafe { libc::dlclose(self.handle) };
+    }
+}
+
+fn e07_engine() -> Engine {
+    let pid = std::process::id();
+    let view = ProcessView::open(ProcessViewId(0), pid).unwrap();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Pid(pid);
+    engine.views.push(view);
+    engine.next_view_id = 1;
+    engine.budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: u64::MAX,
+        total_bytes: u64::MAX,
+    });
+    engine
+}
+
+fn e07_loader_context(engine: &mut Engine, view: ProcessViewId) -> LoaderContextId {
+    use p11scope_manifest::elf::SymbolFact;
+
+    let prepared = engine
+        .loader_registry
+        .preflight(LoaderContextSpec {
+            view,
+            loader: PinnedObjectId(9),
+            mapping: None,
+            hook: SymbolFact {
+                virtual_address: 0x2100,
+                file_offset: 0x2100,
+            },
+            state_address: None,
+        })
+        .expect("a preflighted loader context");
+    let context = engine
+        .loader_registry
+        .prepare(prepared)
+        .expect("a prepared loader context");
+    engine
+        .loader_registry
+        .mark_attached(context)
+        .expect("an attached loader context");
+    context
+}
+
+fn e07_rescan(
+    engine: &mut Engine,
+    session: &mut ScriptedSession,
+    context: LoaderContextId,
+    additions: &mut bool,
+    pending: &mut PendingViewRetirements,
+) -> DiscoveryRecordOutcome {
+    engine
+        .process_validated_loader_scan(
+            0,
+            context,
+            1_000_000,
+            None,
+            &[],
+            LoaderScanMode::Memory,
+            session,
+            additions,
+            pending,
+        )
+        .expect("a live loader rescan applies")
+}
+
+/// Active (object, file offset) targets: the covered-endpoint set.
+fn e07_active_targets(engine: &Engine) -> BTreeSet<(PinnedObjectId, u64)> {
+    engine
+        .plan
+        .slots
+        .iter()
+        .filter(|slot| engine.plan.is_active(slot.index))
+        .map(|slot| (slot.object, slot.file_offset))
+        .collect()
+}
+
+/// E07: an unchanged complete loader rescan retires nothing. The direct scan
+/// reports complete, and the rescan is a no-op: same tables, same slots,
+/// no detaches.
+#[test]
+fn e07_unchanged_complete_loader_rescan_retires_nothing() {
+    let provider = E07Provider::dlopen();
+    let mut engine = e07_engine();
+    engine.module_hints = vec![provider.path.clone()];
+    let view_id = engine.views[0].id();
+    let context = e07_loader_context(&mut engine, view_id);
+    let mut session = ScriptedSession::default();
+    let mut additions = true;
+    let mut pending = PendingViewRetirements::new();
+
+    let outcome = e07_rescan(&mut engine, &mut session, context, &mut additions, &mut pending);
+    assert!(outcome.changed(), "the first scan attaches its tables");
+    let attached = e07_active_targets(&engine);
+    assert!(!attached.is_empty(), "the planted table is covered");
+    assert_eq!(session.attached_slots.len(), 1);
+
+    // A direct scan of the unchanged view is complete: verified absence.
+    let (scan_result, _) = Engine::scan_retained_view(
+        &engine.views[0],
+        &engine.module_hints,
+        &engine.hooks,
+        &mut engine.budget,
+        false,
+    );
+    let (found, _, complete) = scan_result.expect("the view still scans");
+    assert!(complete, "an unchanged full scan is complete");
+    assert_eq!(found.len(), 1);
+    assert!(!found[0].tables.is_empty());
+
+    // And the loader rescan through the engine is a no-op.
+    let outcome = e07_rescan(&mut engine, &mut session, context, &mut additions, &mut pending);
+    assert!(
+        !outcome.changed(),
+        "an unchanged rescan changes nothing"
+    );
+    assert_eq!(e07_active_targets(&engine), attached);
+    assert_eq!(
+        session.detached_slots.last(),
+        Some(&0),
+        "an unchanged rescan detaches nothing"
+    );
+    assert_eq!(session.attached_slots.len(), 1, "nothing re-attaches");
+}
+
+/// E07: a saturated table cap still recognizes the unchanged rescan, so no
+/// spurious retirement follows. 511 further distinct tables fill the 512
+/// budget on top of the planted one; the rescan decodes its repeat free.
+#[test]
+fn e07_saturated_table_cap_unchanged_rescan_retires_nothing() {
+    let provider = E07Provider::dlopen();
+    let mut engine = e07_engine();
+    engine.module_hints = vec![provider.path.clone()];
+    let view_id = engine.views[0].id();
+    let context = e07_loader_context(&mut engine, view_id);
+    let mut session = ScriptedSession::default();
+    let mut additions = true;
+    let mut pending = PendingViewRetirements::new();
+
+    e07_rescan(&mut engine, &mut session, context, &mut additions, &mut pending);
+    let attached = e07_active_targets(&engine);
+    assert!(!attached.is_empty(), "the planted table is covered");
+
+    // Saturate the candidate ceiling with distinct tables decoded from
+    // crafted snapshots inside this binary's own data mapping.
+    let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+    let map_index = MapIndex::new(&maps).expect("the self maps snapshot is valid");
+    let data = maps
+        .iter()
+        .find(|mapping| {
+            mapping.permissions.starts_with(b"rw-") && mapping.end - mapping.start >= 4096
+        })
+        .expect("the test process has a writable data mapping");
+    let mut snapshot = vec![0u8; 2048];
+    snapshot[..8].copy_from_slice(&0x2802u64.to_le_bytes());
+    for slot in 0..255 {
+        let at = 8 + slot * 8;
+        snapshot[at..at + 8].copy_from_slice(&(e07_anchor as usize as u64).to_le_bytes());
+    }
+    for table in 0..511 {
+        let address = data.start + table as u64 * 8;
+        let decoded = decode_exact_table(
+            &snapshot,
+            address,
+            LinuxLayout::Lp64,
+            &map_index,
+            &mut engine.budget,
+            None,
+        )
+        .expect("a valid table decodes")
+        .expect("all slots walkable");
+        assert!(!decoded.entries.is_empty());
+    }
+    assert_eq!(
+        engine.budget.table_candidates_count(),
+        512,
+        "the ceiling is saturated"
+    );
+
+    let outcome = e07_rescan(&mut engine, &mut session, context, &mut additions, &mut pending);
+    assert!(
+        !outcome.changed(),
+        "an unchanged rescan under a saturated cap changes nothing"
+    );
+    assert_eq!(e07_active_targets(&engine), attached);
+    assert_eq!(
+        session.detached_slots.last(),
+        Some(&0),
+        "no spurious retirement under a saturated cap"
+    );
+    assert!(
+        !engine.counters.object_skips.iter().any(|skip| skip
+            .reason
+            .contains("table decode ceiling")),
+        "repeats are recognized, never refused: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// E07: an incomplete loader rescan (here: a stopped capture budget) must
+/// not retire still-validated endpoints. The old tables are retained after
+/// their pins revalidate; the stop stays explicit evidence.
+#[test]
+fn e07_incomplete_loader_rescan_retains_validated_endpoints() {
+    let provider = E07Provider::dlopen();
+    let mut engine = e07_engine();
+    engine.module_hints = vec![provider.path.clone()];
+    let view_id = engine.views[0].id();
+    let context = e07_loader_context(&mut engine, view_id);
+    let mut session = ScriptedSession::default();
+    let mut additions = true;
+    let mut pending = PendingViewRetirements::new();
+
+    e07_rescan(&mut engine, &mut session, context, &mut additions, &mut pending);
+    let attached = e07_active_targets(&engine);
+    assert!(!attached.is_empty(), "the planted table is covered");
+
+    assert!(!engine.budget.charge(u64::MAX), "the budget stops");
+    let outcome = e07_rescan(&mut engine, &mut session, context, &mut additions, &mut pending);
+    assert!(
+        !outcome.changed(),
+        "a budget-limited rescan changes nothing"
+    );
+    assert_eq!(
+        e07_active_targets(&engine),
+        attached,
+        "budget-limited absence must not retire validated endpoints"
+    );
+    assert_eq!(session.detached_slots.last(), Some(&0));
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| skip.reason.contains(
+            "capture discovery work ceiling reached"
+        )),
+        "the stop stays explicit evidence: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// E07 negative control: a genuine unmap still retires on a complete
+/// rescan. After dlclose the loader scan verifies absence and detaches.
+#[test]
+fn e07_genuine_unmap_retires_on_a_complete_rescan() {
+    let provider = E07Provider::dlopen();
+    let mut engine = e07_engine();
+    engine.module_hints = vec![provider.path.clone()];
+    let view_id = engine.views[0].id();
+    let context = e07_loader_context(&mut engine, view_id);
+    let mut session = ScriptedSession::default();
+    let mut additions = true;
+    let mut pending = PendingViewRetirements::new();
+
+    e07_rescan(&mut engine, &mut session, context, &mut additions, &mut pending);
+    assert!(!e07_active_targets(&engine).is_empty());
+
+    drop(provider);
+    let outcome = e07_rescan(&mut engine, &mut session, context, &mut additions, &mut pending);
+    assert!(outcome.changed(), "the unmap detaches its targets");
+    assert!(
+        e07_active_targets(&engine).is_empty(),
+        "a genuine unmap retires"
+    );
+    assert!(
+        session.detached_slots.last().is_some_and(|detached| *detached > 0),
+        "the unmap detaches: {:?}",
+        session.detached_slots
+    );
+}
+
+/// E07 negative control: changed table bytes still retire stale targets.
+/// Zeroing the version word makes the next complete scan verify absence.
+#[test]
+fn e07_changed_table_bytes_retire_stale_targets() {
+    let provider = E07Provider::dlopen();
+    let mut engine = e07_engine();
+    engine.module_hints = vec![provider.path.clone()];
+    let view_id = engine.views[0].id();
+    let context = e07_loader_context(&mut engine, view_id);
+    let mut session = ScriptedSession::default();
+    let mut additions = true;
+    let mut pending = PendingViewRetirements::new();
+
+    e07_rescan(&mut engine, &mut session, context, &mut additions, &mut pending);
+    assert!(!e07_active_targets(&engine).is_empty());
+
+    provider.zero_version();
+    let outcome = e07_rescan(&mut engine, &mut session, context, &mut additions, &mut pending);
+    assert!(outcome.changed(), "changed bytes detach stale targets");
+    assert!(
+        e07_active_targets(&engine).is_empty(),
+        "changed bytes retire stale targets"
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| skip
+            .reason
+            .contains("no function table was found")),
+        "verified absence stays explicit: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// E07 negative control: a deleted provider file retires safely. The mapping
+/// is gone from the namespace, the scan verifies absence, the targets
+/// detach with the refusal as evidence.
+#[test]
+fn e07_deleted_provider_file_retires_safely_with_evidence() {
+    let provider = E07Provider::dlopen();
+    let mut engine = e07_engine();
+    engine.module_hints = vec![provider.path.clone()];
+    let view_id = engine.views[0].id();
+    let context = e07_loader_context(&mut engine, view_id);
+    let mut session = ScriptedSession::default();
+    let mut additions = true;
+    let mut pending = PendingViewRetirements::new();
+
+    e07_rescan(&mut engine, &mut session, context, &mut additions, &mut pending);
+    assert!(!e07_active_targets(&engine).is_empty());
+
+    std::fs::remove_file(&provider.path).unwrap();
+    let outcome = e07_rescan(&mut engine, &mut session, context, &mut additions, &mut pending);
+    assert!(outcome.changed(), "the deleted file detaches its targets");
+    assert!(
+        e07_active_targets(&engine).is_empty(),
+        "unavailable identity retires"
+    );
+    assert!(
+        !engine.counters.object_skips.is_empty(),
+        "the refusal stays explicit evidence"
+    );
+}
+
+/// E07 negative control: retention requires revalidation. An incomplete
+/// rescan over a replaced (deleted) file must NOT retain: the pins no
+/// longer validate, so the stale targets retire.
+#[test]
+fn e07_incomplete_rescan_over_replaced_files_does_not_retain() {
+    let provider = E07Provider::dlopen();
+    let mut engine = e07_engine();
+    engine.module_hints = vec![provider.path.clone()];
+    let view_id = engine.views[0].id();
+    let context = e07_loader_context(&mut engine, view_id);
+    let mut session = ScriptedSession::default();
+    let mut additions = true;
+    let mut pending = PendingViewRetirements::new();
+
+    e07_rescan(&mut engine, &mut session, context, &mut additions, &mut pending);
+    assert!(!e07_active_targets(&engine).is_empty());
+
+    std::fs::remove_file(&provider.path).unwrap();
+    assert!(!engine.budget.charge(u64::MAX), "the budget stops");
+    assert!(
+        !engine.view_pins_unchanged(view_id),
+        "the deleted file fails revalidation"
+    );
+    let outcome = e07_rescan(&mut engine, &mut session, context, &mut additions, &mut pending);
+    assert!(
+        e07_active_targets(&engine).is_empty(),
+        "failed revalidation must not retain stale targets"
+    );
+    assert!(outcome.changed());
+}
+
+/// A loader rescan against a stale process generation is an error, never a
+/// retirement: the engine's modules, pins and plan are untouched.
+#[test]
+fn loader_rescan_with_a_stale_generation_refuses_without_mutation() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("an owned sleeper");
+    let pid = child.id();
+    let view = ProcessView::open(ProcessViewId(0), pid).unwrap();
+    let view_id = view.id();
+    let mount_namespace = view.mount_namespace();
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    child.wait().expect("the sleeper is reaped");
+    assert!(!view.still_the_same(), "the generation is stale");
+
+    let mut engine = Engine::empty();
+    engine.views.push(view);
+    engine.next_view_id = 1;
+    engine.modules = vec![ReconciledModule {
+        object: PinnedObjectId(7),
+        scanned: ScannedModule {
+            view: view_id,
+            mount_namespace,
+            key: ObjectKey { device: Device { major: 8, minor: 1 }, inode: 7 },
+            path: "/lib/provider.so".to_string(),
+            decoder_abi: None,
+            exports: Vec::new(),
+            tables: Vec::new(),
+            interfaces: Vec::new(),
+        },
+        entry_objects: Vec::new(),
+    }];
+    let before = engine.modules.clone();
+    let context = e07_loader_context(&mut engine, view_id);
+    let mut session = ScriptedSession::default();
+    let mut additions = true;
+    let mut pending = PendingViewRetirements::new();
+
+    let error = engine
+        .process_validated_loader_scan(
+            0,
+            context,
+            1_000_000,
+            None,
+            &[],
+            LoaderScanMode::Memory,
+            &mut session,
+            &mut additions,
+            &mut pending,
+        )
+        .expect_err("a stale generation refuses");
+    assert!(
+        format!("{error:#}").contains("exited"),
+        "the refusal names the exited generation: {error:#}"
+    );
+    assert_eq!(engine.modules, before, "nothing is retired on refusal");
+    assert_eq!(engine.views.len(), 1, "the view itself is untouched");
+    assert!(engine.plan.slots.is_empty());
+}
+
+/// Retention revalidation is per view and pin-exact: an untouched view
+/// revalidates, and replacing one of its files fails it.
+#[test]
+fn view_pin_revalidation_detects_replaced_files() {
+    let pid = std::process::id();
+    let view = ProcessView::open(ProcessViewId(0), pid).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("provider.so");
+    std::fs::copy("/bin/sh", &path).unwrap();
+    let mut budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: u64::MAX,
+        total_bytes: u64::MAX,
+    });
+    let rooted = PathBuf::from(format!("/proc/{pid}/root{}", path.display()));
+    let (_, key) = open_view_object(&view, &rooted, &mut budget).unwrap();
+    let module = ScannedModule {
+        view: view.id(),
+        mount_namespace: view.mount_namespace(),
+        key,
+        path: path.display().to_string(),
+        decoder_abi: None,
+        exports: Vec::new(),
+        tables: Vec::new(),
+        interfaces: Vec::new(),
+    };
+    let (pins, skipped) =
+        pin_scanned_view_objects(&view, std::slice::from_ref(&module), &mut budget).unwrap();
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let mut engine = Engine::empty();
+    engine.views.push(view);
+    engine.pinned = pins;
+    let view_id = engine.views[0].id();
+
+    assert!(
+        engine.view_pins_unchanged(view_id),
+        "an untouched view revalidates"
+    );
+    std::fs::write(&path, b"replaced").unwrap();
+    assert!(
+        !engine.view_pins_unchanged(view_id),
+        "a replaced file fails revalidation"
+    );
+}
+
+/// The scan-to-live-candidate completeness contract: a clean scan over a
+/// live budget is complete; stops, refusals and truncating skips are not,
+/// while verified-absence skips keep a scan complete.
+#[test]
+fn scan_and_pin_reports_completeness_for_the_candidate_boundary() {
+    let pid = std::process::id();
+    let view = ProcessView::open(ProcessViewId(0), pid).unwrap();
+    let hooks = HookRegistry::builtin();
+    fn clean(
+        _: &ScanRequest<'_>,
+        _: &ProcessView,
+        _: &mut CaptureWorkBudget,
+    ) -> Result<ScanOutcome, String> {
+        Ok(ScanOutcome::Scanned {
+            modules: Vec::new(),
+            skipped: Vec::new(),
+            scan_ms: 0,
+        })
+    }
+
+    // A clean scan over a live budget is complete.
+    let mut budget = CaptureWorkBudget::default();
+    let mut counters = DiscoveryCounters::default();
+    let (_, _, complete) =
+        scan_and_pin_with(&view, &[], &hooks, &mut budget, &mut counters, false, clean).unwrap();
+    assert!(complete);
+
+    // Verified absence keeps a scan complete.
+    let mut budget = CaptureWorkBudget::default();
+    let mut counters = DiscoveryCounters::default();
+    let (_, _, complete) = scan_and_pin_with(
+        &view,
+        &[],
+        &hooks,
+        &mut budget,
+        &mut counters,
+        false,
+        |_, _, _| {
+            Ok::<_, String>(ScanOutcome::Scanned {
+                modules: Vec::new(),
+                skipped: vec![Skipped {
+                    subject: "/lib/provider.so".into(),
+                    reason: "not mapped in the target".into(),
+                }],
+                scan_ms: 0,
+            })
+        },
+    )
+    .unwrap();
+    assert!(complete, "verified absence is complete");
+
+    // A truncating skip marks the scan incomplete.
+    let mut budget = CaptureWorkBudget::default();
+    let mut counters = DiscoveryCounters::default();
+    let (_, _, complete) = scan_and_pin_with(
+        &view,
+        &[],
+        &hooks,
+        &mut budget,
+        &mut counters,
+        false,
+        |_, _, _| {
+            Ok::<_, String>(ScanOutcome::Scanned {
+                modules: Vec::new(),
+                skipped: vec![Skipped {
+                    subject: "/lib/provider.so".into(),
+                    reason: IO_CEILING_REASON.into(),
+                }],
+                scan_ms: 0,
+            })
+        },
+    )
+    .unwrap();
+    assert!(!complete, "a truncating skip is incomplete");
+
+    // An unavailable memory scan is incomplete: nothing was examined.
+    let mut budget = CaptureWorkBudget::default();
+    let mut counters = DiscoveryCounters::default();
+    let (_, _, complete) = scan_and_pin_with(
+        &view,
+        &[],
+        &hooks,
+        &mut budget,
+        &mut counters,
+        false,
+        |_, _, _| {
+            Ok::<_, String>(ScanOutcome::Unavailable {
+                reason: "ptrace",
+                modules: Vec::new(),
+                skipped: Vec::new(),
+            })
+        },
+    )
+    .unwrap();
+    assert!(!complete, "an unavailable scan is incomplete");
+
+    // A stopped budget marks the scan incomplete even with clean output.
+    let mut budget = CaptureWorkBudget::default();
+    assert!(!budget.charge(u64::MAX), "the budget stops");
+    let mut counters = DiscoveryCounters::default();
+    let (_, _, complete) =
+        scan_and_pin_with(&view, &[], &hooks, &mut budget, &mut counters, false, clean).unwrap();
+    assert!(!complete, "a stopped scan is incomplete");
+
+    // A refused new candidate marks the scan incomplete.
+    let mut budget = CaptureWorkBudget::default();
+    for _ in 0..512 {
+        assert!(budget.admit_table(1));
+    }
+    let mut counters = DiscoveryCounters::default();
+    let (_, _, complete) = scan_and_pin_with(
+        &view,
+        &[],
+        &hooks,
+        &mut budget,
+        &mut counters,
+        false,
+        |_, _, budget| {
+            assert!(!budget.admit_table(1), "the 513th candidate refuses");
+            Ok::<_, String>(ScanOutcome::Scanned {
+                modules: Vec::new(),
+                skipped: Vec::new(),
+                scan_ms: 0,
+            })
+        },
+    )
+    .unwrap();
+    assert!(!complete, "a refused candidate is incomplete");
+}

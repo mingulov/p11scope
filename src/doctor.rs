@@ -512,6 +512,12 @@ fn bpf_checks_with_seccomp<T>(
     checks
 }
 
+/// The singles self-probe row: `(self)` because the anchor is the
+/// observer's own libc mapping, falling back to its own entry point for
+/// static linkage — never libc alone. One constant for the producer and
+/// the tier classifier, so the two cannot drift again (F-09).
+const UPROBE_ATTACH_SELF_ROW: &str = "uprobe attach (self)";
+
 fn bpf_checks_with<T>(
     setup: anyhow::Result<T>,
     diagnostic: impl FnOnce(&mut T) -> Result<(), String>,
@@ -528,7 +534,7 @@ fn bpf_checks_with<T>(
                     status: Status::Ok(String::new()),
                 },
                 Check {
-                    name: "uprobe attach (own libc)".into(),
+                    name: UPROBE_ATTACH_SELF_ROW.into(),
                     status,
                 },
             ]
@@ -539,7 +545,7 @@ fn bpf_checks_with<T>(
                 status: Status::Fail(format_preflight_error(error.as_ref())),
             },
             Check {
-                name: "uprobe attach (own libc)".into(),
+                name: UPROBE_ATTACH_SELF_ROW.into(),
                 status: Status::Fail("skipped: shared capture setup failed".into()),
             },
         ],
@@ -1100,7 +1106,7 @@ fn capability_tier(checks: &[Check]) -> CapabilityTierResult {
         // alone. A kernel that genuinely lacks the support fails these three
         // rows, so nothing is lost by trusting them instead.
         host_attach: row_ok("BPF map create")
-            && row_ok("uprobe attach (self)")
+            && row_ok(UPROBE_ATTACH_SELF_ROW)
             && row_ok("host program preflight"),
         target_readable,
         lifecycle: row_ok("lifecycle preflight"),
@@ -1448,6 +1454,33 @@ mod tests {
                 .all(|check| matches!(check.status, Status::Ok(_)))
         );
         assert_eq!(verdict(&checks), 0);
+    }
+
+    /// F-09: the tier classifier must read the row `bpf_checks_with`
+    /// actually emits. The producer said `(own libc)` while the
+    /// classifier looked up `(self)`, so every real run with a working
+    /// attach classified T0 offline while unit tests with hand-built
+    /// `(self)` rows passed. This feeds the real rows into the real
+    /// classifier — and pins the user-facing row name literally, so a
+    /// shared constant cannot drift both ends together.
+    #[test]
+    fn tier_classification_reads_the_row_bpf_checks_actually_emits() {
+        let mut checks = bpf_checks_with(Ok(()), |_| Ok(()));
+        assert_eq!(checks[1].name, "uprobe attach (self)");
+        checks.push(Check {
+            name: "host program preflight".into(),
+            status: Status::Ok("available".into()),
+        });
+        // Host attach works, target unassessed: T1, not T0 offline.
+        assert_eq!(capability_tier(&checks).tier, CapabilityTier::T1);
+
+        // The other direction: a failed diagnostic still classifies T0.
+        let mut failed = bpf_checks_with(Ok(()), |_| Err("EACCES".into()));
+        failed.push(Check {
+            name: "host program preflight".into(),
+            status: Status::Ok("available".into()),
+        });
+        assert_eq!(capability_tier(&failed).tier, CapabilityTier::T0);
     }
     use super::*;
 

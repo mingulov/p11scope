@@ -14,7 +14,6 @@ use crate::discovery::scan::{
 use crate::process::{ProcessView, ProcessViewId};
 use anyhow::Result;
 use std::fmt::Write as _;
-use std::io::Write as _;
 use std::path::PathBuf;
 
 const DOC_ID: &str = "p11scope/inspect/v1";

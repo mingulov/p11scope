@@ -507,7 +507,7 @@ fn assert_live_discovery_host_contract(
             "five-argument Session start",
         ),
         (
-            "pub fn event_drain(&mut self) -> Result<events::Drain<'_>>",
+            "pub fn event_drain(&mut self) -> Result<&mut events::OwnedDrain>",
             "fixed-purpose public EVENTS drain",
         ),
         (
@@ -638,9 +638,9 @@ fn assert_live_discovery_host_contract(
     // exactly one of each. The seam contract follows the loops: neither the
     // binary nor the loop module may reach past `Session::event_drain`, and
     // the two drains are still exactly the periodic one and the terminal one.
-    if main.contains("events::Drain::new(&mut session.ebpf)")
+    if main.contains("OwnedDrain::for_session")
         || main.contains("session.event_drain()?")
-        || run.contains("events::Drain::new(&mut session.ebpf)")
+        || run.contains("OwnedDrain::for_session")
         || run.matches("session.event_drain()?").count() != 2
     {
         return Err("the binary must use only the fixed-purpose event drain seam".into());

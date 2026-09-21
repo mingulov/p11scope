@@ -424,7 +424,7 @@ fn scenario(
     let mut consumed = 0;
     let malformed;
     {
-        let mut drain = session.event_drain()?;
+        let drain = session.event_drain()?;
         drain.begin_root_tail(&mut tail)?;
         let (positions, bytes, reached) = tail.observed_boundary();
         let boundary = positions.context("stored boundary")?;
@@ -517,7 +517,7 @@ fn scenario(
                 && positions.producer == boundary.producer,
             "fixed boundary was not reached"
         );
-        malformed = drain.malformed();
+        malformed = drain.take_malformed_delta();
         ensure!(malformed == 0, "malformed EVENTS records");
         writeln!(io::stdout(), "root-runtime {kind:?} reached-boundary")?;
     }

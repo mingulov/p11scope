@@ -1118,14 +1118,16 @@ fn root_tail_cancellation_abandons_backlog_with_exact_malformed_delta() {
     let signals = SignalState::new();
     signals.observe(libc::SIGTERM);
     let reduced = std::cell::Cell::new(0);
-    let outcome =
-        drain_original_root_events_from(&mut drain, tail, &signals, |_, _| {
-            reduced.set(reduced.get() + 1);
-            Ok(())
-        })
-        .unwrap();
+    let outcome = drain_original_root_events_from(&mut drain, tail, &signals, |_, _| {
+        reduced.set(reduced.get() + 1);
+        Ok(())
+    })
+    .unwrap();
     match outcome {
-        OriginalRootDrain::Cancelled { malformed, remaining } => {
+        OriginalRootDrain::Cancelled {
+            malformed,
+            remaining,
+        } => {
             assert_eq!(reduced.get(), 0);
             assert_eq!(malformed, 0);
             assert_eq!(remaining, 8, "the one snapshot record stays backlog");

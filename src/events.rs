@@ -128,14 +128,18 @@ pub trait RecordSource {
     fn next_record(&mut self) -> Option<impl Deref<Target = [u8]> + '_>;
 }
 
-impl RecordSource for aya::maps::RingBuf<&mut MapData> {
+impl RecordSource for aya::maps::RingBuf<MapData> {
     fn next_record(&mut self) -> Option<impl Deref<Target = [u8]> + '_> {
         self.next()
     }
 }
 
-/// The `EVENTS` drain over the live ring.
-pub type Drain<'a> = EventDrain<aya::maps::RingBuf<&'a mut MapData>>;
+/// The session's single retained `EVENTS` consumer: an owned map-backed
+/// ring reader over a duplicate of the retained domain descriptor. It
+/// owns its mappings and descriptor for the whole capture, so one cursor
+/// and one malformed total survive every live, root-tail and terminal
+/// poll without per-poll mmap/munmap and identity-query work.
+pub type OwnedDrain = EventDrain<aya::maps::RingBuf<MapData>>;
 
 pub(crate) enum BoundedRecord<T> {
     Item(T),
@@ -153,7 +157,7 @@ pub(crate) trait BoundedRecordSource: RecordSource {
         stop: usize,
     ) -> Result<BoundedRecord<impl Deref<Target = [u8]> + '_>>;
 }
-impl BoundedRecordSource for aya::maps::RingBuf<&mut MapData> {
+impl BoundedRecordSource for aya::maps::RingBuf<MapData> {
     fn positions(&self) -> aya::maps::ring_buf::RingBufPositions {
         self.snapshot_positions()
     }
@@ -366,24 +370,41 @@ impl<S: RecordSource> EventDrain<S> {
 pub struct EventDrain<S> {
     source: S,
     malformed: u64,
+    malformed_reported: u64,
     domain: Option<EventsDomain>,
 }
 
-impl<'a> Drain<'a> {
-    pub(crate) fn new(ebpf: &'a mut Ebpf, domain: EventsDomain) -> Result<Self> {
-        let map = ebpf.map_mut("EVENTS").context("EVENTS map")?;
-        let Map::RingBuf(data) = &*map else {
+impl OwnedDrain {
+    /// Builds the session's single retained consumer. The live `EVENTS`
+    /// map must still match the retained domain (the same check the
+    /// retired per-poll constructor made); the reader itself is then
+    /// mmapped over a duplicate of the retained descriptor, so the
+    /// returned value owns everything and never borrows `ebpf`. Call
+    /// exactly once per session: the ring has one consumer cursor, and a
+    /// second reader would desynchronize this value's in-memory position.
+    pub(crate) fn for_session(ebpf: &Ebpf, domain: &EventsDomain) -> Result<Self> {
+        let Map::RingBuf(data) = ebpf.map("EVENTS").context("EVENTS map")? else {
             anyhow::bail!("EVENTS is not a ring buffer");
         };
         anyhow::ensure!(
             u64::from(data.info()?.id()) == domain.id(),
             "EVENTS map does not match retained domain"
         );
-        let ring = aya::maps::RingBuf::try_from(map)?;
+        let retained = domain
+            .as_fd()
+            .try_clone_to_owned()
+            .context("duplicating retained EVENTS descriptor")?;
+        let data = MapData::from_fd(retained).context("reopening retained EVENTS map")?;
+        anyhow::ensure!(
+            u64::from(data.info()?.id()) == domain.id(),
+            "EVENTS map does not match retained domain"
+        );
+        let ring = aya::maps::RingBuf::try_from(Map::from_map_data(data)?)?;
         Ok(Self {
             source: ring,
             malformed: 0,
-            domain: Some(domain),
+            malformed_reported: 0,
+            domain: Some(domain.clone()),
         })
     }
 }
@@ -394,6 +415,7 @@ impl<S: RecordSource> EventDrain<S> {
         Self {
             source,
             malformed: 0,
+            malformed_reported: 0,
             domain: None,
         }
     }
@@ -408,6 +430,7 @@ impl<S: RecordSource> EventDrain<S> {
         Self {
             source,
             malformed: 0,
+            malformed_reported: 0,
             domain: Some(domain),
         }
     }
@@ -459,6 +482,16 @@ impl<S: RecordSource> EventDrain<S> {
     /// Records rejected by the size or affiliation check so far.
     pub fn malformed(&self) -> u64 {
         self.malformed
+    }
+
+    /// Malformed records since the last delta was taken, advancing the
+    /// checkpoint to the current total. With one retained consumer per
+    /// session, callers sum these per-poll deltas instead of the
+    /// fresh-drain totals they summed before.
+    pub fn take_malformed_delta(&mut self) -> u64 {
+        let delta = self.malformed.saturating_sub(self.malformed_reported);
+        self.malformed_reported = self.malformed;
+        delta
     }
 }
 
@@ -773,8 +806,14 @@ mod tests {
         assert_eq!((seen, backlog), (1, true));
         assert_eq!(drain.take_malformed_delta(), 1);
 
+        // A quantum stop reports backlog even when it took the last
+        // record; only a read that finds the ring empty reports none.
         let (seen, backlog) = counting_poll(&mut drain, Some(2));
-        assert_eq!((seen, backlog), (2, false));
+        assert_eq!((seen, backlog), (2, true));
+        assert_eq!(drain.take_malformed_delta(), 0);
+
+        let (seen, backlog) = counting_poll(&mut drain, Some(2));
+        assert_eq!((seen, backlog), (0, false));
         assert_eq!(drain.take_malformed_delta(), 0);
 
         assert_eq!(drain.malformed(), 1);
@@ -801,8 +840,12 @@ mod tests {
         assert_eq!(drain.take_malformed_delta(), 0);
 
         let (seen, backlog) = counting_poll(&mut drain, Some(2));
-        assert_eq!((seen, backlog), (0, false));
+        assert_eq!((seen, backlog), (0, true));
         assert_eq!(drain.take_malformed_delta(), 2);
+
+        let (seen, backlog) = counting_poll(&mut drain, Some(2));
+        assert_eq!((seen, backlog), (0, false));
+        assert_eq!(drain.take_malformed_delta(), 0);
 
         assert_eq!(drain.malformed(), 3);
     }

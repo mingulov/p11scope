@@ -3422,6 +3422,73 @@ mod tests {
         }
     }
 
+    /// Package F (E08/E15/E21): the explicit known ABI bounds. Only
+    /// these version words walk a full table; a non-listed 2.x minor
+    /// walks the known prefix with an explicit marker; everything else
+    /// (including any 3.x past 3.2) refuses. The exhaustive low-word
+    /// sweep proves the set is exactly this — bounded total work, no
+    /// panic on any input.
+    #[test]
+    fn f_package_known_abi_bounds_walk_full_only_for_supported_shapes() {
+        for (word, version, slots) in [
+            (0x2802u64, (2u8, 40u8), 68usize),
+            (0x0003, (3, 0), 92),
+            (0x0103, (3, 1), 92),
+            (0x0203, (3, 2), 104),
+        ] {
+            let (decoded, spans, walk) = spans_for(word).expect("supported shape walks");
+            assert_eq!((decoded, walk), (version, "full"));
+            assert_eq!(
+                spans.iter().map(|span| span.fields().len()).sum::<usize>(),
+                slots,
+                "{version:?} walks its exact slot count"
+            );
+        }
+        let (_, _, walk) = spans_for(0x2702).expect("a 2.39 prefix decodes");
+        assert_eq!(
+            walk, "known_prefix",
+            "non-listed minors stay explicitly bounded"
+        );
+        for word in [
+            0x2902u64,
+            0x0303,
+            0x0004,
+            0x0204,
+            0x0000,
+            0xffff,
+            0x1_0000,
+            u64::MAX,
+        ] {
+            assert!(spans_for(word).is_none(), "{word:#x} must not be a table");
+        }
+        let mut full = Vec::new();
+        for word in 0..=0xffffu64 {
+            if let Some(((major, minor), _, walk)) = spans_for(word) {
+                if walk == "full" {
+                    full.push((major, minor));
+                }
+            }
+        }
+        full.sort();
+        full.dedup();
+        assert_eq!(
+            full,
+            vec![
+                (2, 0),
+                (2, 1),
+                (2, 10),
+                (2, 11),
+                (2, 20),
+                (2, 30),
+                (2, 40),
+                (3, 0),
+                (3, 1),
+                (3, 2),
+            ],
+            "the full-walk set is exactly the known ABI bounds"
+        );
+    }
+
     #[test]
     fn ilp32_tables_use_four_byte_words_and_ignore_adjacent_poison() {
         let maps = parse_maps(b"1000-3000 r-xp 00000000 08:01 7 /lib/provider.so\n").unwrap();

@@ -32,6 +32,22 @@
  *             T               print the template pool (or TEMPLATE unknown
  *                             when the pool symbol is hidden)
  *             B               print the six backend entry addresses
+ *             G <name|-> [major minor]
+ *                             drive C_GetInterface ("-" is a NULL name) and
+ *                             print the result; an explicit version is
+ *                             passed by pointer, else NULL. Replies
+ *                             IFACE rv=<rv> name=<name|(none)> table=<ptr>
+ *                             flags=<flags> (table=(nil) when no interface
+ *                             is returned).
+ *             V <idx> <major> <minor>
+ *                             rewrite wrapper <idx>'s version word in
+ *                             place; replies VERSION idx=<i> major=<ma>
+ *                             minor=<mi>
+ *             M <idx> <ord> <mode>
+ *                             rewrite wrapper <idx>'s entry <ord> in place
+ *                             (0 NULL hole, 1 unmapped, 2 provider .bss,
+ *                             3 heap data); replies POKED idx=<i> ord=<o>
+ *                             mode=<m>
  *             X               exit 0
  *
  * The log path is exported as P11SCOPE_MW_LOG for the provider/backend
@@ -182,6 +198,8 @@ typedef void *(*alloc_fn)(int fwd_mask, int fail_ord);
 typedef void (*free_fn)(void *handle);
 typedef int (*index_fn)(void *handle);
 typedef void *(*table_fn)(void *handle);
+typedef void (*set_version_fn)(void *handle, int major, int minor);
+typedef void (*poke_fn)(void *handle, int ord, int mode);
 typedef int (*occupied_fn)(int idx);
 typedef CK_RV (*gfl_fn)(void **list);
 typedef CK_RV (*gil_fn)(CK_INTERFACE *list, CK_ULONG *count);
@@ -307,6 +325,8 @@ typedef struct {
     free_fn do_free;
     index_fn do_index;
     table_fn do_table;
+    set_version_fn do_set_version;
+    poke_fn do_poke;
     gfl_fn gfl;
     gil_fn gil;
     gi_fn gi;
@@ -407,6 +427,8 @@ static int run_stage(void *handle)
     s.do_free = need_sym(handle, "mw_free");
     s.do_index = need_sym(handle, "mw_index");
     s.do_table = need_sym(handle, "mw_table");
+    s.do_set_version = need_sym(handle, "mw_set_version");
+    s.do_poke = need_sym(handle, "mw_poke");
     s.gfl = need_sym(handle, "C_GetFunctionList");
     s.gil = need_sym(handle, "C_GetInterfaceList");
     s.gi = need_sym(handle, "C_GetInterface");
@@ -486,6 +508,71 @@ static int run_stage(void *handle)
             s.do_free(s.handles[idx]);
             s.handles[idx] = NULL;
             printf("FREED idx=%d\n", idx);
+            continue;
+        }
+        if (line[0] == 'G') {
+            char name[64];
+            int major = -1;
+            int minor = -1;
+            int fields = sscanf(line + 1, "%63s %d %d", name, &major, &minor);
+            if (fields != 1 && fields != 3) {
+                printf("ERROR bad get-interface\n");
+                free(line);
+                return EXIT_SCENARIO;
+            }
+            if (fields == 3 && (major < 0 || major > 255 || minor < 0 || minor > 255)) {
+                printf("ERROR bad get-interface version\n");
+                free(line);
+                return EXIT_SCENARIO;
+            }
+            CK_VERSION version;
+            void *version_ptr = NULL;
+            if (fields == 3) {
+                version.major = (CK_BYTE)major;
+                version.minor = (CK_BYTE)minor;
+                version_ptr = &version;
+            }
+            void *want = strcmp(name, "-") == 0 ? NULL : name;
+            void *found = NULL;
+            CK_RV rv = s.gi(want, version_ptr, &found, 0);
+            if (rv != CKR_OK || found == NULL) {
+                printf("IFACE rv=%lu name=(none) table=(nil) flags=0\n", rv);
+            } else {
+                const CK_INTERFACE *iface = found;
+                printf("IFACE rv=%lu name=%s table=%p flags=%lu\n", rv,
+                    iface->pInterfaceName != NULL ? iface->pInterfaceName : "(null)",
+                    iface->pFunctionList, iface->flags);
+            }
+            continue;
+        }
+        if (line[0] == 'V') {
+            int idx = -1;
+            int major = -1;
+            int minor = -1;
+            if (sscanf(line + 1, "%d %d %d", &idx, &major, &minor) != 3 || idx < 0
+                || idx >= STAGE_NWRAP || s.handles[idx] == NULL || major < 0 || major > 255
+                || minor < 0 || minor > 255) {
+                printf("ERROR bad set-version\n");
+                free(line);
+                return EXIT_SCENARIO;
+            }
+            s.do_set_version(s.handles[idx], major, minor);
+            printf("VERSION idx=%d major=%d minor=%d\n", idx, major, minor);
+            continue;
+        }
+        if (line[0] == 'M') {
+            int idx = -1;
+            int ord = -1;
+            int mode = -1;
+            if (sscanf(line + 1, "%d %d %d", &idx, &ord, &mode) != 3 || idx < 0
+                || idx >= STAGE_NWRAP || s.handles[idx] == NULL || ord < 0
+                || ord >= STAGE_NENTRY || mode < 0 || mode > 3) {
+                printf("ERROR bad poke\n");
+                free(line);
+                return EXIT_SCENARIO;
+            }
+            s.do_poke(s.handles[idx], ord, mode);
+            printf("POKED idx=%d ord=%d mode=%d\n", idx, ord, mode);
             continue;
         }
         if (line[0] == 'C') {

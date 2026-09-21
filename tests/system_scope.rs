@@ -378,7 +378,7 @@ fn system_scope_provider_matrix_shared_copied_variant_and_multi() {
     let provider_c = build_fixture_variant(&dir, "mx-c");
     let driver = build_driver(&dir);
 
-    let children = vec![
+    let children = [
         spawn_loaded(&driver, &provider_a),
         spawn_loaded(&driver, &provider_a),
         spawn_loaded(&driver, &provider_b),

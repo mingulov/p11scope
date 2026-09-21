@@ -172,7 +172,9 @@ impl DiscoveryScheduler {
     /// Whether the pid was evicted and not since re-admitted (whether or
     /// not its hard window expired). Stale pids stay selectable but sort
     /// behind never-evicted pids within their rarity class, so rotation
-    /// covers every pid instead of churning the lowest ones.
+    /// covers every pid instead of churning the lowest ones. Test-only: the
+    /// product reads the whole set via `stale_pids`.
+    #[cfg(test)]
     pub(crate) fn is_stale(&self, pid: u32) -> bool {
         self.cooling.contains_key(&pid)
     }

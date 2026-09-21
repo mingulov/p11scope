@@ -4824,7 +4824,7 @@ fn reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor() {
         let candidate =
             Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
         let view_pids: Vec<u32> = candidate.views.iter().map(|view| view.pid()).collect();
-        let agrees = view_pids.as_slice() == &[pids[0]];
+        let agrees = view_pids.as_slice() == [pids[0]];
         agreed = Some(candidate);
         if agrees {
             break;
@@ -21388,7 +21388,6 @@ impl LazyLoader {
     }
 
     fn wait_for(&mut self, marker: &[u8]) {
-        use std::io::Read as _;
         use std::os::fd::AsRawFd as _;
         let mut seen = Vec::new();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

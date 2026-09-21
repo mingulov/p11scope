@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
-const MAX_TRACKED: usize = 16_384;
+pub(crate) const MAX_TRACKED: usize = 16_384;
 const RESERVED_FDS: usize = 64;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

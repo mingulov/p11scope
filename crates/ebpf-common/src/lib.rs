@@ -84,6 +84,17 @@ pub fn target_stack_arg_address(stack_pointer: u64, index: u8, layout: LinuxLayo
 /// 512 covers the 104-entry 3.2 table several times over.
 pub const MAX_SLOTS: u32 = 512;
 
+/// Experimental slot-count candidate for the Package G (E11) dense/sparse
+/// storage comparison. This is NEVER a sufficiency claim and NEVER gates
+/// admission: production stays at MAX_SLOTS until a reviewed contract
+/// qualifies a broader envelope.
+pub const EXPERIMENTAL_SLOT_CANDIDATE: u32 = 8_192;
+
+/// Native task-owner slot bound shared with `native/task_owner.c`. The
+/// lookup checks, start-count bound and exec/exit cleanup loop all pin this
+/// literal; they move together or not at all.
+pub const NATIVE_OWNER_SLOT_BOUND: u32 = 512;
+
 /// Fixed static policy descriptors: count-only plus the 104 canonical
 /// PKCS#11 function-table entries.
 pub const MAX_DESCRIPTORS: u32 = 105;
@@ -1385,6 +1396,17 @@ mod tests {
         assert_eq!(core::mem::size_of::<SlotSemantics>(), 18);
         assert_eq!(core::mem::align_of::<SlotSemantics>(), 2);
         assert_eq!(ARG_NONE, u8::MAX);
+    }
+
+    #[test]
+    fn package_g_capacity_bounds_share_one_native_slot_literal() {
+        assert_eq!(MAX_SLOTS, 512);
+        assert_eq!(NATIVE_OWNER_SLOT_BOUND, MAX_SLOTS);
+        assert_eq!(EXPERIMENTAL_SLOT_CANDIDATE, 8_192);
+        assert_ne!(EXPERIMENTAL_SLOT_CANDIDATE, MAX_SLOTS);
+        // Locks the Package G storage-model input: 5 u64 counters plus 32
+        // u64 latency buckets.
+        assert_eq!(core::mem::size_of::<SlotStats>(), 296);
     }
 
     #[test]

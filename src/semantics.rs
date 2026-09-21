@@ -1982,8 +1982,8 @@ const KNOWN_CANCEL_FLAGS: u64 = CKF_MESSAGE_ENCRYPT
     | CKF_DERIVE
     | CKF_ENCAPSULATE
     | CKF_DECAPSULATE;
-const MAX_PENDING: usize = 16_384;
-const MAX_STATE_KEYS: usize = 16_384;
+pub(crate) const MAX_PENDING: usize = 16_384;
+pub(crate) const MAX_STATE_KEYS: usize = 16_384;
 
 fn pid_of(ev: &Event) -> u32 {
     (ev.pid_tgid >> 32) as u32

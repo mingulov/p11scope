@@ -1,4 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+/* Package G capacity contract: the 512 slot literal below is
+ * NATIVE_OWNER_SLOT_BOUND == MAX_SLOTS. The lookup checks
+ * (p11_owner_start_get/remove), the start-count bound (valid_owner,
+ * p11_owner_start_insert) and the exec/exit cleanup loop (p11_owner_cleanup)
+ * pin the same value; update them together or not at all. The
+ * capacity_contract test suite enforces this. */
 #include "task_owner.h"
 
 struct {

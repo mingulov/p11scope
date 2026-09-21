@@ -2356,10 +2356,23 @@ impl State {
         if ev.event_type != event_type::CALL {
             return;
         }
-        if !self.cgroups.contains_key(&ev.cgroup_id) && self.admit(1) {
-            self.cgroups.insert(ev.cgroup_id, CgroupStat::default());
-        }
-        if let Some(cg) = self.cgroups.get_mut(&ev.cgroup_id) {
+        // E19: fuse admission probe + insert + update (3 lookups) into
+        // probe + one insert-or-update (2). Admission still precedes
+        // insertion; a refused cell counts nothing, as before.
+        let is_new = !self.cgroups.contains_key(&ev.cgroup_id);
+        if is_new {
+            if self.admit(1) {
+                let is_error = ev.rv != CkRv::OK.0 && ev.rv != CkRv::PENDING.0;
+                self.cgroups.insert(
+                    ev.cgroup_id,
+                    CgroupStat {
+                        calls: 1,
+                        errors: u64::from(is_error),
+                        mechanisms: BTreeMap::new(),
+                    },
+                );
+            }
+        } else if let Some(cg) = self.cgroups.get_mut(&ev.cgroup_id) {
             cg.calls = cg.calls.saturating_add(1);
             if ev.rv != CkRv::OK.0 && ev.rv != CkRv::PENDING.0 {
                 cg.errors = cg.errors.saturating_add(1);
@@ -2376,10 +2389,23 @@ impl State {
             self.reduced_histories.insert(process);
         }
         let meta = self.slots.get(ev.slot as usize).and_then(Clone::clone);
-        if !self.cgroups.contains_key(&ev.cgroup_id) && self.admit(1) {
-            self.cgroups.insert(ev.cgroup_id, CgroupStat::default());
-        }
-        if let Some(cg) = self.cgroups.get_mut(&ev.cgroup_id) {
+        // E19: same fused cgroup admission as `reject_history` (2 lookups,
+        // not 3). A refused cell skips counting but never gates the
+        // semantic path below.
+        let is_new_cgroup = !self.cgroups.contains_key(&ev.cgroup_id);
+        if is_new_cgroup {
+            if self.admit(1) {
+                let is_error = ev.rv != CkRv::OK.0 && ev.rv != CkRv::PENDING.0;
+                self.cgroups.insert(
+                    ev.cgroup_id,
+                    CgroupStat {
+                        calls: 1,
+                        errors: u64::from(is_error),
+                        mechanisms: BTreeMap::new(),
+                    },
+                );
+            }
+        } else if let Some(cg) = self.cgroups.get_mut(&ev.cgroup_id) {
             cg.calls += 1;
             if ev.rv != CkRv::OK.0 && ev.rv != CkRv::PENDING.0 {
                 cg.errors += 1;
@@ -2430,11 +2456,13 @@ impl State {
             && ev.rv == CkRv::OK.0
             && ev.user_type != USER_TYPE_NONE
         {
-            if !self.logins.contains_key(&ev.user_type) && self.admit(1) {
-                self.logins.insert(ev.user_type, 0);
-            }
-            if let Some(calls) = self.logins.get_mut(&ev.user_type) {
-                *calls += 1;
+            // E19: fused login admission (probe + entry, not probe +
+            // insert + get_mut). Admission precedes insertion.
+            let is_new = !self.logins.contains_key(&ev.user_type);
+            if is_new && !self.admit(1) {
+                // Refused cell counts nothing; fall through to lifecycle.
+            } else {
+                *self.logins.entry(ev.user_type).or_default() += 1;
             }
         }
         if self.reconcile_conclusive(process, ev, meta) {
@@ -2452,24 +2480,35 @@ impl State {
         let MechanismCapture::Value(mechanism) = mechanism_capture(ev) else {
             return;
         };
-        if !self.mechanisms.contains_key(&mechanism) && self.admit(1) {
-            self.mechanisms.insert(mechanism, MechStat::default());
-        }
-        let Some(stat) = self.mechanisms.get_mut(&mechanism) else {
+        // E19: fuse the admission probe and the insert into one entry lookup.
+        // Admission still precedes insertion; the `contains_key` decides the
+        // budget before `entry` materializes the cell.
+        let is_new = !self.mechanisms.contains_key(&mechanism);
+        if is_new && !self.admit(1) {
             return;
-        };
+        }
+        let stat = self.mechanisms.entry(mechanism).or_default();
         record_call(stat, ev);
-        stat.ops
-            .extend(operation_bits(meta.semantics.operations).map(|(_, name)| name.to_string()));
-        if let Some(name) = direct_name(meta.semantics.direct) {
-            stat.ops.insert(name.to_string());
+        // E19: skip the `String` allocation when the operation name is
+        // already recorded. `BTreeSet<String>::contains` borrows `&str`,
+        // so the hot re-record path allocates nothing; output ordering
+        // (BTreeSet) is unchanged.
+        for (_, name) in operation_bits(meta.semantics.operations) {
+            if !stat.ops.contains(name) {
+                stat.ops.insert(name.to_owned());
+            }
+        }
+        if let Some(name) = direct_name(meta.semantics.direct)
+            && !stat.ops.contains(name)
+        {
+            stat.ops.insert(name.to_owned());
         }
         if self.policy.uses_unsafe_decoders() {
             let combo = (ev.shape, ev.p0, ev.p1, ev.p2);
             if ev.shape == shape::NONE {
                 stat.init_no_shape += 1;
-            } else if stat.param_combos.contains_key(&combo) {
-                *stat.param_combos.get_mut(&combo).unwrap() += 1;
+            } else if let Some(count) = stat.param_combos.get_mut(&combo) {
+                *count += 1;
             } else {
                 let _ = stat;
                 if self.admit(1) {
@@ -2530,12 +2569,16 @@ impl State {
             }
         }
         for mechanism in mechanisms {
-            if !self.mechanisms.contains_key(&mechanism) && self.admit(1) {
-                self.mechanisms.insert(mechanism, MechStat::default());
+            // E19: same fused admission-before-insertion as
+            // `record_requested_mechanism`: one probe plus one entry. A
+            // refused mechanism cell still records cgroup attribution,
+            // exactly as before.
+            let is_new = !self.mechanisms.contains_key(&mechanism);
+            if is_new && !self.admit(1) {
+                self.record_cgroup_mechanism(ev.cgroup_id, mechanism, ev.rv);
+                continue;
             }
-            if let Some(stat) = self.mechanisms.get_mut(&mechanism) {
-                record_call(stat, ev);
-            }
+            record_call(self.mechanisms.entry(mechanism).or_default(), ev);
             self.record_cgroup_mechanism(ev.cgroup_id, mechanism, ev.rv);
         }
 
@@ -2845,16 +2888,24 @@ impl State {
                         self.evidence.async_duplicates =
                             self.evidence.async_duplicates.saturating_add(1);
                     }
+                    // FU-1: a live tombstone survives even a same-owner
+                    // re-mint. The newcomer is dropped (its pending was
+                    // already consumed above), the original pending and
+                    // owner stand, and the duplicate is still counted.
+                    // One owner cannot unilaterally rewrite an ambiguous
+                    // record while the other owner's claim stands.
+                    Some(existing) if existing.collided => {
+                        self.evidence.async_duplicates =
+                            self.evidence.async_duplicates.saturating_add(1);
+                    }
                     Some(existing) => {
-                        // Same owner re-minting one id: overwrite as before,
-                        // but a live cross-process tombstone survives — the
-                        // other owner's claim still stands.
-                        let collided = existing.collided;
+                        // Same owner re-minting one id with no live
+                        // tombstone: overwrite as before.
                         *existing = Detached {
                             pending,
                             owner: Some((process, session)),
                             process,
-                            collided,
+                            collided: false,
                         };
                         self.evidence.async_duplicates =
                             self.evidence.async_duplicates.saturating_add(1);
@@ -3199,16 +3250,20 @@ impl State {
             .filter(|((owner, _), _)| *owner == parent)
             .map(|((_, session), info)| (*session, *info))
             .collect();
-        // The parent's in-flight ops, collected once: the loop below only
-        // reads them (child-keyed inserts never match the parent filter),
-        // so one pre-pass is equivalent to a per-session full-map clone and
-        // turns O(sessions x ops) into O(sessions + ops) per fork.
-        let parent_ops: Vec<((ProcessKey, SessionRef, u16), Binding)> = self
-            .active_ops
-            .iter()
-            .filter(|((owner, _, _), _)| *owner == parent)
-            .map(|(key, binding)| (*key, *binding))
-            .collect();
+        // The parent's in-flight ops, grouped once by session (ordered
+        // keys, so per-session op order matches the map order): each fork
+        // visits every parent op once during grouping plus once during its
+        // own session's inheritance — O(sessions + ops), not the
+        // O(sessions x ops) scan-per-session below used to pay.
+        let mut grouped: BTreeMap<SessionRef, Vec<(u16, Binding)>> = BTreeMap::new();
+        for ((owner, handle, operation), binding) in self.active_ops.iter() {
+            if *owner == parent {
+                grouped
+                    .entry(*handle)
+                    .or_default()
+                    .push((*operation, *binding));
+            }
+        }
         for (session, info) in sessions {
             if !info.fork_safe {
                 let key = (child, session);
@@ -3233,10 +3288,10 @@ impl State {
                 },
             );
             self.sessions.inherited = self.sessions.inherited.saturating_add(1);
-            for ((_, handle, operation), binding) in &parent_ops {
-                #[cfg(test)]
-                self.fork_op_visits.set(self.fork_op_visits.get() + 1);
-                if *handle == session {
+            if let Some(ops) = grouped.get(&session) {
+                for (operation, binding) in ops {
+                    #[cfg(test)]
+                    self.fork_op_visits.set(self.fork_op_visits.get() + 1);
                     if binding.fork_safe {
                         let key = (child, session, *operation);
                         if self.active_ops.contains_key(&key) || self.admit(1) {

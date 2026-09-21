@@ -20335,3 +20335,208 @@ fn scan_and_pin_reports_completeness_for_the_candidate_boundary() {
     .unwrap();
     assert!(!complete, "a refused candidate is incomplete");
 }
+
+// SYSPLAN Package C (E06): fair bounded system exploration.
+//
+// The RED pair below pins the experiment before the fix: with the scan cap
+// full of long-lived provider-free views, a later process carrying a unique
+// provider is never reached — ordinary ticks have no free slot and the
+// reconcile slice selects into zero free slots, so the newcomer starves
+// forever. The shared-inode twin is the countercontrol: the starvation is
+// generic, not specific to unique providers, so the fix must cover both.
+fn e06_cgroup_args(
+    scope_dir: &Path,
+    hints: Vec<PathBuf>,
+    max_scan_pids: Option<usize>,
+) -> CaptureArgs {
+    CaptureArgs {
+        kind: crate::cli::Kind::Profile,
+        modules: hints,
+        manifests: vec![],
+        hooks: HookRegistry::builtin(),
+        scope: crate::cli::ScopeArg::Cgroup(scope_dir.to_path_buf()),
+        metrics: false,
+        duration: None,
+        out: None,
+        max_events: None,
+        ring_bytes: None,
+        drain_interval: None,
+        max_scan_pids,
+        unsafe_requested: false,
+        allow_confined_uretprobe: false,
+        attach_backend: BackendSelection::default(),
+    }
+}
+
+fn e06_spawn_sleeps(count: usize) -> Vec<SystemScopeChildGuard> {
+    let guards: Vec<SystemScopeChildGuard> = (0..count)
+        .map(|_| {
+            SystemScopeChildGuard::new(
+                std::process::Command::new("sleep")
+                    .arg("30")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            )
+        })
+        .collect();
+    // Readiness (same idiom as the cap siblings): discover only once every
+    // child execed sleep, so no maps read races a fork-exec transition.
+    let self_exe = std::env::current_exe().unwrap();
+    for guard in &guards {
+        let pid = guard.pid();
+        let exe = format!("/proc/{pid}/exe");
+        let mut execed = false;
+        for _ in 0..500 {
+            if std::fs::read_link(&exe).is_ok_and(|target| target != self_exe) {
+                execed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(execed, "sleep child {pid} never execed");
+    }
+    guards
+}
+
+fn e06_write_listing(scope_dir: &Path, pids: &[u32]) {
+    let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
+    std::fs::write(scope_dir.join("cgroup.procs"), listing).expect("a cgroup.procs");
+}
+
+/// E06 RED: `max_scan_pids=2` retains two long-lived provider-free views;
+/// a third process with a unique provider arrives later. At least eight
+/// reconciliation frames must reach it. The oracle is actual deep-scan and
+/// admission evidence (plan module, attachable slots, refresh-phase
+/// `scan_ms`), never `/proc/maps` visits.
+#[test]
+fn e06_unique_provider_reached_within_bounded_frames() {
+    let sleeps = e06_spawn_sleeps(2);
+    let sleep_pids: Vec<u32> = sleeps.iter().map(|guard| guard.pid()).collect();
+    let dir = tempfile::tempdir().expect("a fixture directory");
+    let provider = system_scope_build_fixture(dir.path(), "e06-unique");
+    let driver = system_scope_build_driver(dir.path());
+    let scope_dir = tempfile::tempdir().expect("a scope directory");
+    e06_write_listing(scope_dir.path(), &sleep_pids);
+    let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
+    let args = e06_cgroup_args(scope_dir.path(), vec![provider.clone()], Some(2));
+
+    let mut engine =
+        Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
+    assert_eq!(engine.views.len(), 2, "both provider-free views are retained");
+    assert!(
+        engine.plan.modules.is_empty(),
+        "no provider is mapped yet: {:?}",
+        engine.plan.modules
+    );
+
+    let child = system_scope_spawn_loaded(&driver, &provider);
+    let newcomer = child.pid();
+    let mut pids = sleep_pids.clone();
+    pids.push(newcomer);
+    e06_write_listing(scope_dir.path(), &pids);
+
+    let mut first_seen = None;
+    for frame in 1..=8 {
+        refresh_inventory_once(&mut engine);
+        assert!(
+            engine.views.len() <= 2,
+            "frame {frame}: the cap still binds: {}",
+            engine.views.len()
+        );
+        if first_seen.is_none()
+            && engine
+                .plan
+                .modules
+                .iter()
+                .any(|module| module.path.ends_with("e06-unique.so"))
+        {
+            first_seen = Some(frame);
+        }
+    }
+    let first_seen = first_seen.expect(
+        "the unique provider is discovered within eight reconciliation frames",
+    );
+    assert!(
+        first_seen <= 4,
+        "one reconcile reaches it: first seen at frame {first_seen}"
+    );
+    assert!(
+        engine
+            .views
+            .iter()
+            .any(|view| view.pid() == newcomer),
+        "the newcomer generation is retained: {:?}",
+        engine.views.iter().map(|view| view.pid()).collect::<Vec<_>>()
+    );
+    assert!(
+        !system_scope_slots_for(&engine, "e06-unique.so").is_empty(),
+        "admission produced attachable slots, not just a maps visit"
+    );
+    assert!(
+        engine.counters.scan_ms > 0,
+        "the refresh phase ran actual deep scans"
+    );
+}
+
+/// E06 countercontrol: the same starvation setup with shared-inode
+/// endpoints. Both children map the one provider file; rotation must cover
+/// both generations while keeping the shared file pinned once (union
+/// indices, no duplicate provider).
+#[test]
+fn e06_shared_inode_control_stays_covered_across_rotation() {
+    let sleeps = e06_spawn_sleeps(2);
+    let sleep_pids: Vec<u32> = sleeps.iter().map(|guard| guard.pid()).collect();
+    let dir = tempfile::tempdir().expect("a fixture directory");
+    let provider = system_scope_build_fixture(dir.path(), "e06-shared");
+    let driver = system_scope_build_driver(dir.path());
+    let scope_dir = tempfile::tempdir().expect("a scope directory");
+    e06_write_listing(scope_dir.path(), &sleep_pids);
+    let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
+    let args = e06_cgroup_args(scope_dir.path(), vec![provider.clone()], Some(2));
+
+    let mut engine =
+        Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
+    assert_eq!(engine.views.len(), 2);
+
+    let child_a = system_scope_spawn_loaded(&driver, &provider);
+    let child_b = system_scope_spawn_loaded(&driver, &provider);
+    let mut pids = sleep_pids.clone();
+    pids.push(child_a.pid());
+    pids.push(child_b.pid());
+    e06_write_listing(scope_dir.path(), &pids);
+
+    for frame in 1..=8 {
+        refresh_inventory_once(&mut engine);
+        assert!(
+            engine.views.len() <= 2,
+            "frame {frame}: the cap still binds: {}",
+            engine.views.len()
+        );
+    }
+    let kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
+    assert!(
+        kept.contains(&child_a.pid()) && kept.contains(&child_b.pid()),
+        "both shared-inode generations are retained: {kept:?}"
+    );
+    let provider_modules: Vec<_> = engine
+        .modules
+        .iter()
+        .filter(|module| module.scanned.path.ends_with("e06-shared.so"))
+        .collect();
+    assert_eq!(
+        provider_modules.len(),
+        2,
+        "both generations contribute their scanned module"
+    );
+    assert_eq!(
+        provider_modules[0].object, provider_modules[1].object,
+        "the shared file is pinned once across both views"
+    );
+    assert!(
+        !system_scope_slots_for(&engine, "e06-shared.so").is_empty(),
+        "the shared provider admits attachable slots"
+    );
+}

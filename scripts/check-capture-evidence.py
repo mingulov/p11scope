@@ -246,10 +246,18 @@ SHARED_OVERLAY_UNCERTAINTY = (
     "shared-overlay physical identity is uncertain; a distinct byte-identical "
     "instance may be unobserved"
 )
+# Audit F-13: render.rs `capture_skipped_out` emits this sixth reason when
+# equal mapping keys carry unequal or unavailable full opened-file
+# identities. It is a discovery-scope loss (subject `discovery subject`),
+# not an entry loss; the validator must accept what the producer emits.
+PHYSICAL_IDENTITY_AMBIGUITY = (
+    "physical identity is ambiguous; the collision group was not attached"
+)
 DISCOVERY_REASONS = {
     DISCOVERY_UNAVAILABLE,
     TABLE_UNAVAILABLE,
     SHARED_OVERLAY_UNCERTAINTY,
+    PHYSICAL_IDENTITY_AMBIGUITY,
 }
 ENTRY_REASONS = {"null pointer", ENTRY_UNAVAILABLE}
 # The one gated entry-like skip whose subject is not a standard function: a

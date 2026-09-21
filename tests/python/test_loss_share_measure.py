@@ -224,7 +224,7 @@ class EventPathTests(unittest.TestCase):
 class WindowValidityTests(unittest.TestCase):
     def assess(self, **overrides):
         kwargs = {"gate": "frame", "scope": "pid", "counts_match": True,
-                  "collapsed": False, "attached_probes": 136,
+                  "burst_outside_window": False, "attached_probes": 136,
                   "trace_crosscheck": True}
         kwargs.update(overrides)
         return MEASURE["assess_window"](**kwargs)
@@ -240,12 +240,13 @@ class WindowValidityTests(unittest.TestCase):
         self.assertFalse(invalid["window_valid"])
         self.assertIn("counts_match=False", invalid["window_note"])
 
-    def test_weak_gate_system_needs_probes_and_no_collapse(self):
+    def test_weak_gate_system_needs_probes_and_no_burst_escape(self):
         valid = self.assess(gate="marker+plateau+settle:20s", scope="system")
         self.assertTrue(valid["window_valid"])
-        collapsed = self.assess(gate="marker+plateau+settle:20s",
-                                scope="system", collapsed=True)
-        self.assertFalse(collapsed["window_valid"])
+        escaped = self.assess(gate="marker+plateau+settle:20s",
+                              scope="system", burst_outside_window=True)
+        self.assertFalse(escaped["window_valid"])
+        self.assertIn("BURST OUTSIDE WINDOW", escaped["window_note"])
         unattached = self.assess(gate="marker+plateau+settle:20s",
                                  scope="system", attached_probes=0)
         self.assertFalse(unattached["window_valid"])

@@ -223,7 +223,35 @@ fn b6_doctor_reports_rows_and_verdict() {
 #[test]
 fn b7_run_refuses_without_capture_lane() {
     if !capture_available() {
-        let refused = run(&["run", "--", "/bin/true"]);
+        // Hazard-first (Package A, F-01): without the override the run
+        // refuses on the uretprobe hazard before any attach attempt.
+        let hazard = run(&["run", "--", "/bin/true"]);
+        assert_eq!(hazard.code, Some(1));
+        assert!(
+            hazard.stderr.contains("refusing to attach"),
+            "{}",
+            hazard.stderr
+        );
+        assert!(
+            hazard
+                .stderr
+                .contains("--allow-uretprobe-on-confined-target"),
+            "{}",
+            hazard.stderr
+        );
+        assert!(
+            !hazard.stderr.contains("starting attach session"),
+            "{}",
+            hazard.stderr
+        );
+        // F7 pins (Task 3) behind the explicit override: the attach
+        // refusal below is reachable once the hazard risk is accepted.
+        let refused = run(&[
+            "run",
+            "--allow-uretprobe-on-confined-target",
+            "--",
+            "/bin/true",
+        ]);
         assert_eq!(refused.code, Some(1));
         assert!(
             refused.stderr.contains("starting attach session"),
@@ -553,7 +581,35 @@ fn t3_f7_attach_refusal_points_at_doctor() {
     // pointer, and now names `p11scope doctor` as the command that knows
     // which cause applies. Exit 1 unchanged.
     if !capture_available() {
-        let refused = run(&["run", "--", "/bin/true"]);
+        // Hazard-first (Package A, F-01): without the override the run
+        // refuses on the uretprobe hazard before any attach attempt.
+        let hazard = run(&["run", "--", "/bin/true"]);
+        assert_eq!(hazard.code, Some(1));
+        assert!(
+            hazard.stderr.contains("refusing to attach"),
+            "{}",
+            hazard.stderr
+        );
+        assert!(
+            hazard
+                .stderr
+                .contains("--allow-uretprobe-on-confined-target"),
+            "{}",
+            hazard.stderr
+        );
+        assert!(
+            !hazard.stderr.contains("starting attach session"),
+            "{}",
+            hazard.stderr
+        );
+        // F7 pins behind the explicit override: the attach refusal below
+        // is reachable once the hazard risk is accepted.
+        let refused = run(&[
+            "run",
+            "--allow-uretprobe-on-confined-target",
+            "--",
+            "/bin/true",
+        ]);
         assert_eq!(refused.code, Some(1));
         assert!(
             refused.stderr.contains("starting attach session"),

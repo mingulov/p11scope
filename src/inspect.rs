@@ -289,9 +289,19 @@ fn scan_and_pin_retained_with<C, S, P>(
 /// `p11scope inspect` — scans, pins, prints. Exit code: 0 when the scan ran
 /// (even with zero modules), 1 when the target could not be read at all.
 pub fn run(pid: u32, hints: &[PathBuf], hooks: &HookRegistry, json: bool) -> Result<i32> {
+    run_with_writer(pid, hints, hooks, json, &mut std::io::stdout().lock())
+}
+
+fn run_with_writer(
+    pid: u32,
+    hints: &[PathBuf],
+    hooks: &HookRegistry,
+    json: bool,
+    out: &mut dyn std::io::Write,
+) -> Result<i32> {
     let view = ProcessView::open(ProcessViewId(0), pid).map_err(anyhow::Error::msg)?;
     let mut context = (&view, CaptureWorkBudget::default());
-    let (outcome, (pinned, pin_skips)) = match scan_and_pin_retained_with(
+    let result = scan_and_pin_retained_with(
         &mut context,
         |context| context.0.still_the_same(),
         |context| {
@@ -302,24 +312,57 @@ pub fn run(pid: u32, hints: &[PathBuf], hooks: &HookRegistry, json: bool) -> Res
             )
         },
         |context, outcome| pin_scanned_view_objects(context.0, outcome.modules(), &mut context.1),
-    ) {
+    );
+    emit_diagnosis(pid, json, out, result)
+}
+
+/// Renders a finished — or failed — diagnosis to `out`. Pure over the
+/// diagnosis result, so both branches are unit-testable. A soft failure
+/// (the target changed mid-scan or mid-pin) still exits 1, but with
+/// `--json` it prints a machine-readable failure document instead of
+/// breaking the JSON stream with a text line (F-20). Hard failures (the
+/// view never opened) never reach here: they return `Err`, which `main`
+/// reports on stderr with stdout left empty.
+fn emit_diagnosis(
+    pid: u32,
+    json: bool,
+    out: &mut dyn std::io::Write,
+    result: Result<(ScanOutcome, (PinnedObjects, Vec<Skipped>)), String>,
+) -> Result<i32> {
+    let (outcome, (pinned, pin_skips)) = match result {
         Ok(result) => result,
         Err(error) => {
-            println!("p11scope: cannot inspect pid {pid}: {error}");
+            if json {
+                let document = serde_json::to_string_pretty(&failure_json(pid, &error))?;
+                writeln!(out, "{document}")?;
+            } else {
+                writeln!(out, "p11scope: cannot inspect pid {pid}: {error}")?;
+            }
             return Ok(1);
         }
     };
     let outcome = with_extra_skips(outcome, pin_skips);
 
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&render_json(pid, &outcome, &pinned))?
-        );
+        let document = serde_json::to_string_pretty(&render_json(pid, &outcome, &pinned))?;
+        writeln!(out, "{document}")?;
     } else {
-        print!("{}", render_text(pid, &outcome, &pinned));
+        write!(out, "{}", render_text(pid, &outcome, &pinned))?;
     }
     Ok(0)
+}
+
+/// The machine-readable soft-failure document: the success schema with
+/// `scan.status` failed and the reason, no modules. A failed inspect
+/// must neither break `| jq` nor validate as a successful one.
+fn failure_json(pid: u32, reason: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema": DOC_ID,
+        "pid": pid,
+        "scan": { "status": "failed", "reason": reason },
+        "modules": [],
+        "skipped": [],
+    })
 }
 
 #[cfg(test)]
@@ -333,6 +376,82 @@ mod tests {
             device: Device { major: 8, minor: 1 },
             inode,
         }
+    }
+
+    /// F-20: a soft diagnosis failure (the target changed mid-scan or
+    /// mid-pin) with `--json` prints a machine-readable failure document
+    /// on stdout and exits 1 — never a text line that breaks `| jq`.
+    #[test]
+    fn soft_diagnosis_failure_with_json_prints_a_failure_document() {
+        let mut stdout = Vec::new();
+        let code = emit_diagnosis(
+            4242,
+            true,
+            &mut stdout,
+            Err("process generation changed while inspect was scanning".into()),
+        )
+        .unwrap();
+        assert_eq!(code, 1);
+        let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(document["schema"], DOC_ID);
+        assert_eq!(document["pid"], 4242);
+        assert_eq!(document["scan"]["status"], "failed");
+        assert_eq!(
+            document["scan"]["reason"],
+            "process generation changed while inspect was scanning"
+        );
+        assert_eq!(document["modules"], serde_json::json!([]));
+        assert_eq!(document["skipped"], serde_json::json!([]));
+    }
+
+    /// The text contract is unchanged: same line, same exit code.
+    #[test]
+    fn soft_diagnosis_failure_without_json_keeps_the_text_line() {
+        let mut stdout = Vec::new();
+        let code = emit_diagnosis(
+            4242,
+            false,
+            &mut stdout,
+            Err("process generation changed while inspect was pinning".into()),
+        )
+        .unwrap();
+        assert_eq!(code, 1);
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            "p11scope: cannot inspect pid 4242: process generation changed while inspect was \
+             pinning\n"
+        );
+    }
+
+    /// Hard errors never reach the diagnosis renderer: a pid that names
+    /// nothing fails before a single byte is written, so stdout stays
+    /// empty and `main` reports the error on stderr instead.
+    #[test]
+    fn hard_errors_write_nothing_to_stdout() {
+        let mut stdout = Vec::new();
+        let error = run_with_writer(u32::MAX, &[], &HookRegistry::builtin(), true, &mut stdout)
+            .unwrap_err();
+        assert!(stdout.is_empty(), "hard errors must not touch stdout");
+        assert!(!format!("{error:#}").is_empty());
+    }
+
+    /// The full success wiring through the writer: scanning this
+    /// process always succeeds (its pidfd generation is stable) and
+    /// prints a parseable success document.
+    #[test]
+    fn successful_inspect_writes_a_parseable_success_document() {
+        let mut stdout = Vec::new();
+        let pid = std::process::id();
+        let code = run_with_writer(pid, &[], &HookRegistry::builtin(), true, &mut stdout).unwrap();
+        assert_eq!(code, 0);
+        let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(document["schema"], DOC_ID);
+        assert_eq!(document["pid"], pid);
+        assert!(
+            document["scan"]["status"] == "scanned" || document["scan"]["status"] == "unavailable",
+            "unexpected success status: {}",
+            document["scan"]["status"]
+        );
     }
 
     /// Mutation caught: reopening the PID for pinning, omitting the check between

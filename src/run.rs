@@ -397,6 +397,38 @@ fn resolve_program(program: &OsStr) -> io::Result<PathBuf> {
     Err(io::Error::from(io::ErrorKind::NotFound))
 }
 
+/// The launch-file checks: a regular executable file, and ELF (scripts
+/// must go through an interpreter). Shared by the fail-fast pre-fork
+/// refusal and `OwnedChild::spawn`'s own guard, so the early refusal
+/// never weakens the guard at the fork.
+fn check_launch_file(launch_file: &File) -> io::Result<()> {
+    let metadata = launch_file.metadata()?;
+    if !metadata.is_file() || metadata.mode() & 0o111 == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "owned command must be a regular executable file",
+        ));
+    }
+    if let Err(error) = ElfSnapshot::read(launch_file) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "owned command must be an ELF executable: {error}; invoke scripts through an interpreter"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses a command that cannot run as an owned target by name, before
+/// anything is forked. Name errors precede hazard errors: a script is
+/// told about its interpreter before any kernel verdict is consulted.
+fn check_owned_target_runnable(program: &OsStr) -> io::Result<()> {
+    let resolved = resolve_program(program)?;
+    let launch_file = File::open(&resolved)?;
+    check_launch_file(&launch_file)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ChildIdentity {
     uid: libc::uid_t,
@@ -680,21 +712,7 @@ impl OwnedChild {
         let identity = ChildIdentity::for_invoker()?;
         let resolved = resolve_program(&program)?;
         let launch_file = File::open(&resolved)?;
-        let metadata = launch_file.metadata()?;
-        if !metadata.is_file() || metadata.mode() & 0o111 == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "owned command must be a regular executable file",
-            ));
-        }
-        if let Err(error) = ElfSnapshot::read(&launch_file) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "owned command must be an ELF executable: {error}; invoke scripts through an interpreter"
-                ),
-            ));
-        }
+        check_launch_file(&launch_file)?;
         let prepared = PreparedExecutable::resolve(resolved.as_os_str())
             .ok()
             .flatten();
@@ -2121,6 +2139,16 @@ fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOut
     // anything is forked, attached, or released past its barrier.
     resolve_program(&program)
         .map_err(|error| anyhow!("run: exec {}: {error}", Path::new(&program).display()))?;
+    // Name errors precede hazard errors: a script (or a non-executable)
+    // is refused with its interpreter fix before any kernel verdict is
+    // consulted, exactly as `spawn` would refuse it at the fork.
+    check_owned_target_runnable(&program)
+        .map_err(|error| anyhow!("run: starting the owned child: {error}"))?;
+    // Before the fork: the owned child can install a seccomp filter after
+    // attach, so no startup /proc reading can qualify it — only a kernel
+    // proven to exempt the trampoline proceeds by default (F-01). An
+    // initial unconfined status cannot qualify that future state.
+    preflight_uretprobe_hazard(None, args.allow_confined_uretprobe)?;
 
     let mut child = OwnedChild::spawn(program, command.collect())
         .map_err(|error| anyhow!("run: starting the owned child: {error}"))?;
@@ -2304,9 +2332,10 @@ fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOut
 ///
 /// `target` is the one pid a `--pid` capture probes; `None` means the scope
 /// attaches process-wide, so the processes that would run the trampoline
-/// cannot be enumerated. `run` deliberately does not call this: its child arms
-/// any filter after exec, which is after attach, so there is nothing to read
-/// yet — that path reports the death instead.
+/// cannot be enumerated — or, for `run`, that the owned child arms any
+/// filter after exec, which is after attach, so there is nothing to read
+/// yet and only a proven-clean kernel proceeds. The death report stays as
+/// the second layer for override runs.
 fn preflight_uretprobe_hazard(target: Option<u32>, overridden: bool) -> Result<bool> {
     match uretprobe_hazard::evaluate(target, overridden) {
         uretprobe_hazard::Action::Proceed => Ok(false),
@@ -2846,6 +2875,13 @@ fn cancel_marker(signal: Option<libc::c_int>, ticks: u64) -> String {
     )
 }
 
+/// The loop-end marker for a target that exited mid-capture: the
+/// measurement harness timestamps this stderr line as the actual
+/// early-exit boundary (F-74), instead of assuming the full window.
+fn target_exit_marker(ticks: u64) -> String {
+    format!("p11scope: capture ended: target exited after {ticks} ticks")
+}
+
 const PROFILE_CADENCE: Duration = Duration::from_secs(1);
 const TRACE_CADENCE: Duration = Duration::from_millis(200);
 const DEFAULT_TRACE_MAX_EVENTS: u64 = 10_000_000;
@@ -2891,7 +2927,7 @@ type ProfileTerminalContext<
     &'engine mut Engine,
     &'session mut Session,
     &'owned_ref mut Option<&'owned mut Owned>,
-    &'stdout_ref mut crate::sink::SinkWriter<std::fs::File>,
+    &'stdout_ref mut crate::sink::SinkWriter<crate::sink::StdoutInner>,
     &'stdout_open mut bool,
     &'output mut Option<AtomicFile>,
 );
@@ -2912,7 +2948,7 @@ type TraceTickContext<
     &'owned_ref mut Option<&'owned mut Owned>,
     &'remaining mut Option<u64>,
     &'loss mut u64,
-    &'stdout_ref mut crate::sink::SinkWriter<std::fs::File>,
+    &'stdout_ref mut crate::sink::SinkWriter<crate::sink::StdoutInner>,
     &'stdout_open mut bool,
     &'out_file mut Option<std::io::BufWriter<std::fs::File>>,
 );
@@ -3031,7 +3067,7 @@ fn capture_profile(
     let has_output = output.is_some();
     let mut stdout_sink = crate::sink::stdout_sink()?;
     stdout_sink.set_cancel_flag(interrupted.cancel_flag());
-    let stdout: &mut crate::sink::SinkWriter<std::fs::File> = &mut stdout_sink;
+    let stdout: &mut crate::sink::SinkWriter<crate::sink::StdoutInner> = &mut stdout_sink;
     let profile = policy.uses_events();
     let mode = if profile { "profile" } else { "metrics" };
 
@@ -3244,6 +3280,9 @@ fn capture_profile(
     })();
     if matches!(loop_result, Ok(CaptureEnd::Signal)) {
         eprintln!("{}", cancel_marker(interrupted.first_signal(), ticks));
+    }
+    if matches!(loop_result, Ok(CaptureEnd::TargetExit)) {
+        eprintln!("{}", target_exit_marker(ticks));
     }
     if profile {
         scheduling.note_loop_end(
@@ -3485,7 +3524,7 @@ fn capture_trace(
     let out_file = &mut out_sink;
     let mut stdout_sink = crate::sink::stdout_sink()?;
     stdout_sink.set_cancel_flag(interrupted.cancel_flag());
-    let stdout: &mut crate::sink::SinkWriter<std::fs::File> = &mut stdout_sink;
+    let stdout: &mut crate::sink::SinkWriter<crate::sink::StdoutInner> = &mut stdout_sink;
 
     let domain = session.events_domain();
     let mut state = semantics::State::for_capture(engine.plan(), policy, domain.clone());
@@ -3673,6 +3712,9 @@ fn capture_trace(
     })();
     if matches!(loop_result, Ok(CaptureEnd::Signal)) {
         eprintln!("{}", cancel_marker(interrupted.first_signal(), ticks));
+    }
+    if matches!(loop_result, Ok(CaptureEnd::TargetExit)) {
+        eprintln!("{}", target_exit_marker(ticks));
     }
 
     scheduling.note_loop_end(
@@ -3930,7 +3972,7 @@ fn emit_trace_terminal_accounted<W: Write>(
     reports: &[metrics::SlotReport],
     tracer: &trace::Tracer,
     scheduling: &mut SchedulingAccumulator,
-    stdout: &mut crate::sink::SinkWriter<std::fs::File>,
+    stdout: &mut crate::sink::SinkWriter<crate::sink::StdoutInner>,
     stdout_open: &mut bool,
     out_file: &mut Option<W>,
 ) -> Result<()> {
@@ -4038,7 +4080,7 @@ fn sink_note_due(drops: &crate::sink::SinkDrops, last_note: Option<Instant>, now
 /// stalls on stderr (throttled): stdout's own evidence line is
 /// best-effort under backpressure, so the note is the fallback record.
 fn collect_sink_drops(
-    sink: &mut crate::sink::SinkWriter<std::fs::File>,
+    sink: &mut crate::sink::SinkWriter<crate::sink::StdoutInner>,
     acc: &mut SchedulingAccumulator,
     last_note: &mut Option<Instant>,
     now: Instant,
@@ -6425,6 +6467,25 @@ mod tests {
 
     // ---- Slice 1b-2 error taxonomy (design §10.3) -----------------------
 
+    /// Name errors precede hazard errors: the fail-fast target check
+    /// refuses a script with its interpreter fix before any kernel
+    /// verdict is consulted, exactly as `spawn` would at the fork.
+    #[test]
+    fn unrunnable_targets_are_refused_by_name_before_the_preflight() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("hello.sh");
+        std::fs::write(&script, "#!/bin/sh\necho hello\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = check_owned_target_runnable(script.as_os_str()).unwrap_err();
+        let text = format!("{error}");
+        assert!(text.contains("must be an ELF executable"), "{text}");
+        assert!(
+            text.contains("invoke scripts through an interpreter"),
+            "{text}"
+        );
+        assert!(check_owned_target_runnable(std::ffi::OsStr::new("/bin/true")).is_ok());
+    }
+
     fn run_args(pause: cli::PausePolicy, command: &[&str]) -> RunArgs {
         RunArgs {
             kind: Kind::Profile,
@@ -6497,15 +6558,34 @@ mod tests {
         // it never replaces it, and it never attaches to an unrelated failure.
         let capture_available = crate::doctor::verdict(&crate::doctor::probe(None, None)) == 0;
         if !capture_available {
+            // The hazard preflight refuses first: without BPF the kernel
+            // cannot be proven to exempt the trampoline, so an owned
+            // child is refused before anything is forked (F-01).
             let never = format!(
                 "{:#}",
                 run_owned(&run_args(cli::PausePolicy::Never, &["/bin/true"]))
                     .expect_err("an unavailable capture lane must refuse")
             );
-            assert!(never.contains("attach session"), "{never}");
+            assert!(never.contains("refusing to attach"), "{never}");
             assert!(
                 !never.contains("pause"),
                 "an environment failure is not a pause failure: {never}"
+            );
+            // Behind the override, the environment failure keeps its own
+            // category: the session still cannot start without BPF.
+            let mut overridden = run_args(cli::PausePolicy::Never, &["/bin/true"]);
+            overridden.allow_confined_uretprobe = true;
+            let behind_override = format!(
+                "{:#}",
+                run_owned(&overridden).expect_err("an unavailable capture lane must refuse")
+            );
+            assert!(
+                behind_override.contains("attach session"),
+                "{behind_override}"
+            );
+            assert!(
+                !behind_override.contains("pause"),
+                "an environment failure is not a pause failure: {behind_override}"
             );
             let always = format!(
                 "{:#}",
@@ -6514,7 +6594,7 @@ mod tests {
             );
             assert!(always.contains("pause"), "{always}");
             assert!(
-                always.contains("attach session"),
+                always.contains("refusing to attach"),
                 "the required-pause category must not hide the real cause: {always}"
             );
         }
@@ -7180,6 +7260,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn target_exit_marker_names_the_tick_count() {
+        assert_eq!(
+            target_exit_marker(12),
+            "p11scope: capture ended: target exited after 12 ticks"
+        );
+    }
+
     /// The sink watches the same observation the loop polls: the first
     /// observed stop signal raises the shared cancel flag (F4 wiring).
     #[test]
@@ -7562,7 +7650,8 @@ mod tests {
     #[test]
     fn terminal_trace_evidence_accounts_every_terminal_drop_byte_exact() {
         let (reader, writer) = pipe_pair();
-        let mut sink = crate::sink::SinkWriter::new(writer).unwrap();
+        let mut sink =
+            crate::sink::SinkWriter::new(crate::sink::StdoutInner::File(writer)).unwrap();
         let mut stdout_open = true;
         let mut file = Some(Vec::new());
         let mut scheduling = SchedulingAccumulator::default();
@@ -7622,7 +7711,8 @@ mod tests {
     #[test]
     fn terminal_trace_old_order_strands_terminal_drops_outside_evidence() {
         let (reader, writer) = pipe_pair();
-        let mut sink = crate::sink::SinkWriter::new(writer).unwrap();
+        let mut sink =
+            crate::sink::SinkWriter::new(crate::sink::StdoutInner::File(writer)).unwrap();
         let mut stdout_open = true;
         let mut file = Some(Vec::new());
         let mut scheduling = SchedulingAccumulator::default();

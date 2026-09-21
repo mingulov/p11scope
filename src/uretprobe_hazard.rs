@@ -632,11 +632,7 @@ mod tests {
     #[test]
     fn an_unprovable_kernel_refuses_everything_but_an_unconfined_target() {
         let unknown = KernelVerdict::Unknown("fork failed".to_string());
-        for target in [
-            Some(SeccompMode::Strict),
-            Some(SeccompMode::Filter),
-            None,
-        ] {
+        for target in [Some(SeccompMode::Strict), Some(SeccompMode::Filter), None] {
             assert!(
                 matches!(decide(&unknown, target, false), Action::Refuse(_)),
                 "{target:?} must be refused"
@@ -764,14 +760,14 @@ mod tests {
             evaluate_mode(None, false, || KernelVerdict::Clean),
             Action::Proceed
         );
-        let Action::Refuse(refused) = evaluate_mode(None, false, || {
-            KernelVerdict::Unknown("x".to_string())
-        }) else {
+        let Action::Refuse(refused) =
+            evaluate_mode(None, false, || KernelVerdict::Unknown("x".to_string()))
+        else {
             panic!("an unprovable kernel must refuse an owned child");
         };
-        let Action::ProceedUnderOverride(warned) = evaluate_mode(None, true, || {
-            KernelVerdict::Unknown("x".to_string())
-        }) else {
+        let Action::ProceedUnderOverride(warned) =
+            evaluate_mode(None, true, || KernelVerdict::Unknown("x".to_string()))
+        else {
             panic!("the override must convert the refusal");
         };
         assert_eq!(refused, warned, "the override must not soften the reason");

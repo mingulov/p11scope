@@ -1849,8 +1849,8 @@ fn two_processes_union_indices_of_one_inode() {
     assert_eq!(engine.budget.table_candidates_count(), 10);
     // 416 scan + 416 live heaps + 136 live legacy (one per view).
     assert_eq!(engine.budget.decoded_table_entries_count(), 416 + 416 + 136);
-    // Two sweep triples (one per view) plus six live list elements.
-    assert_eq!(engine.budget.interface_records_count(), 8);
+    // One shared sweep triple (deduped across views on file identity) plus six live list elements.
+    assert_eq!(engine.budget.interface_records_count(), 7);
     assert_eq!(
         session.attached_slots.iter().sum::<usize>(),
         engine.plan().slots.len() - 27,

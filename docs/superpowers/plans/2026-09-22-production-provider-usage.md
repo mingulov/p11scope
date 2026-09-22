@@ -296,6 +296,34 @@ window budgets are independent bounds with explicit exhaustion evidence.
 Reserve room for later arrivals because an array cannot grow in place. Defaults
 must be justified by measured host/VM envelopes, not an unexplained new number.
 
+The user's subsequent clarification makes adaptive capacity an explicit design
+direction. The 576-endpoint fixture is a regression workload, not a new product
+limit. Treat the initial census as a lower bound. Derive initial allocation and
+reserve from an explicit global resource envelope, and allocate additional
+capacity before exhaustion. Compare appended endpoint segments with a directory
+of compatible inner maps; do not replace a live map and assume its concurrent
+observations were copied safely. Existing evidence IDs remain stable. Growing
+the physical allocation within an authorized envelope is separate from changing
+the logical policy generation or safely recycling identities.
+
+Before choosing segment mechanics, specify one shared caller-identity and
+discovery/lifecycle domain. Caller and full-return-code cardinality must also
+grow on an already attached endpoint; adding only new endpoint segments does not
+solve those limits. Retain positive observations and cumulative counters across
+growth and selection changes. Optional key annotations may become unknown after
+cache eviction. Whole-object resource reservation and completion of kernel
+attachment are separate states, including failures halfway through attachment.
+
+Required growth tests include more than 256 provider-bearing generations with a
+unique late provider; progress after scan-window exhaustion; 576 and larger
+unions without selecting an arbitrary table subset; hot existing endpoints with
+new callers and return codes; allocation/publication failure; cross-segment
+identity and operation continuity; and monotonic cumulative snapshots. Honest
+refusal is a failure-handling result, not a successful all-provider coverage
+result within the declared supported workload envelope. The corrected second
+Fable review is recorded in
+`audit-notes/perf/2026-09-22-adaptive-capacity-review.md`.
+
 Compare baseline/candidate application CPU and wall time, tracer CPU/RSS,
 kernel map memory, links/FDs, discovery-to-attachment delay and teardown. Use
 repeated paired runs on quiet lanes. Proposed SLOs must be stated before final

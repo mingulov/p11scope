@@ -1206,7 +1206,9 @@ fn run_ok(program: &str, args: &[&str]) -> String {
         .unwrap_or_else(|error| panic!("running {program}: {error}"));
     assert!(
         output.status.success(),
-        "{program} {args:?}: {}",
+        "{program} {args:?} exited {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).expect("command stdout is UTF-8")
@@ -6360,11 +6362,16 @@ aggregate-only-metrics default metrics"
     );
     assert!(faults.contains("blocked template faults: all calls CKR_OK"));
 
+    // The wrapper runs three Python suites plus checker self-tests in sequence.
+    // In the parallel workspace gate, the first two suites alone took 52 s;
+    // the old 60 s aggregate bound interrupted the still-passing third suite.
+    // Allow 60 s per suite here; individual case and native-width lane bounds
+    // below remain unchanged, as does the final forced-cleanup grace period.
     let lanes = run_ok(
         "timeout",
         &[
             "--kill-after=2s",
-            "60s",
+            "180s",
             "sh",
             "scripts/verify-canaries.sh",
             "--self-test",

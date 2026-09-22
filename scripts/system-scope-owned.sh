@@ -152,31 +152,47 @@ owned_wait_supervisor_terminal() {
     owned_wait_root_terminal "$owned_supervisor_pid" "$owned_supervisor_birth" "$2"
 }
 
+owned_process_state() {
+    owned_inspection=$(mktemp "${TMPDIR:-/tmp}/p11scope-inspect.XXXXXX") || return 2
+    owned_inspect_status=0
+    python3 -I "$P11SCOPE_RECEIPT_HELPER" inspect-process \
+        --pid "$1" --starttime "$2" >"$owned_inspection" 2>/dev/null || \
+        owned_inspect_status=$?
+    if [ "$owned_inspect_status" -ne 0 ]; then
+        rm -f "$owned_inspection"
+        return 2
+    fi
+    owned_state=$(python3 -I - "$owned_inspection" "$1" "$2" <<'PY'
+import json, sys
+record = json.load(open(sys.argv[1], encoding="utf-8"))
+pid, birth = int(sys.argv[2]), int(sys.argv[3])
+if not isinstance(record, dict):
+    raise SystemExit(1)
+if record.get("pid") != pid or record.get("starttime") != birth:
+    raise SystemExit(1)
+state = record.get("state")
+if state not in ("live", "terminal", "unknown"):
+    raise SystemExit(1)
+print(state)
+PY
+    ) || {
+        rm -f "$owned_inspection"
+        return 2
+    }
+    rm -f "$owned_inspection"
+    printf '%s\n' "$owned_state"
+}
+
 owned_wait_root_terminal() {
     owned_end=$(( $(date +%s) + $3 ))
-    owned_inspection=$(mktemp "${TMPDIR:-/tmp}/p11scope-inspect.XXXXXX") || return 2
     while :; do
-        owned_inspect_status=0
-        python3 -I "$P11SCOPE_RECEIPT_HELPER" inspect-process \
-            --pid "$1" --starttime "$2" >"$owned_inspection" 2>/dev/null || \
-            owned_inspect_status=$?
-        if [ "$owned_inspect_status" -ne 0 ]; then
-            rm -f "$owned_inspection"
-            return 2
-        fi
-        owned_state=$(python3 -I -c \
-            'import json,sys; print(json.load(open(sys.argv[1]))["state"])' \
-            "$owned_inspection" 2>/dev/null) || {
-            rm -f "$owned_inspection"
-            return 2
-        }
+        owned_state=$(owned_process_state "$1" "$2") || return 2
         case "$owned_state" in
-            terminal) rm -f "$owned_inspection"; return 0 ;;
+            terminal) return 0 ;;
             live) ;;
-            *) rm -f "$owned_inspection"; return 2 ;;
+            *) return 2 ;;
         esac
         if [ "$(date +%s)" -ge "$owned_end" ]; then
-            rm -f "$owned_inspection"
             return 1
         fi
         sleep 0.1

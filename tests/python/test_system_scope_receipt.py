@@ -832,35 +832,57 @@ class ProcessCustodyTest(unittest.TestCase):
     def test_root_exits_on_term_but_retained_child_is_killed(self):
         with tempfile.TemporaryDirectory() as raw:
             child_file = Path(raw) / "child.pid"
-            child_code = ("import signal,time; "
-                          "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-                          "time.sleep(60)")
+            child_tmp = child_file.with_suffix(".pid.tmp")
+            child_code = (
+                "import os,pathlib,signal,time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                f"tmp=pathlib.Path({str(child_tmp)!r}); "
+                "tmp.write_text(str(os.getpid())); "
+                f"os.replace(tmp,{str(child_file)!r}); "
+                "time.sleep(60)"
+            )
             parent_code = (
                 "import signal,subprocess,sys,time; "
                 "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); "
                 f"p=subprocess.Popen([sys.executable,'-c',{child_code!r}]); "
-                f"open({str(child_file)!r},'w').write(str(p.pid)); "
                 "time.sleep(60)"
             )
             process = subprocess.Popen(["python3", "-c", parent_code])
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline and not child_file.exists():
-                time.sleep(0.01)
-            self.assertTrue(child_file.exists())
-            child_pid = int(child_file.read_text())
             starttime = self.process_identity(process.pid)["starttime"]
-            result = subprocess.run([
-                "python3", "-I", str(RECEIPT), "teardown",
-                "--pid", str(process.pid), "--starttime", str(starttime),
-                "--first-signal", "TERM", "--term-timeout", "0.1",
-                "--kill-timeout", "1",
-            ], cwd=ROOT, text=True, stdout=subprocess.PIPE,
-               stderr=subprocess.PIPE, check=False, timeout=3)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            proof = json.loads(result.stdout)
-            self.assertIn(child_pid, proof["targets"])
-            self.assertIn(child_pid, proof["escalated"])
-            process.wait(timeout=2)
+            child_identity = None
+            try:
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and not child_file.exists():
+                    time.sleep(0.01)
+                self.assertTrue(child_file.exists())
+                child_pid = int(child_file.read_text())
+                child_identity = (
+                    child_pid, self.process_identity(child_pid)["starttime"])
+                result = subprocess.run([
+                    "python3", "-I", str(RECEIPT), "teardown",
+                    "--pid", str(process.pid), "--starttime", str(starttime),
+                    "--first-signal", "TERM", "--term-timeout", "0.1",
+                    "--kill-timeout", "1",
+                ], cwd=ROOT, text=True, stdout=subprocess.PIPE,
+                   stderr=subprocess.PIPE, check=False, timeout=3)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                proof = json.loads(result.stdout)
+                self.assertIn(child_pid, proof["targets"])
+                self.assertIn(child_pid, proof["escalated"])
+                process.wait(timeout=2)
+            finally:
+                identities = [(process.pid, starttime)]
+                if child_identity is not None:
+                    identities.append(child_identity)
+                for pid, birth in identities:
+                    subprocess.run([
+                        "python3", "-I", str(RECEIPT), "teardown",
+                        "--pid", str(pid), "--starttime", str(birth),
+                        "--first-signal", "KILL", "--kill-timeout", "1",
+                    ], cwd=ROOT, text=True, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, check=False, timeout=3)
+                if process.poll() is None:
+                    process.wait(timeout=2)
 
     def test_wrong_root_birth_is_refused_without_signal(self):
         process = subprocess.Popen(["python3", "-c", "import time; time.sleep(60)"])

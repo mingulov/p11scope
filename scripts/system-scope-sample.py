@@ -3,10 +3,11 @@
 """Sample a privileged observer's CPU/RSS/fds from /proc at a fixed cadence.
 
 The observer runs under sudo, so this sampler runs under sudo too (reading
-another root process's /proc/PID/fd needs it). Takes the sudo parent PID,
-resolves the real child via the children file, and writes one JSON object
-per line: monotonic + wall timestamps, utime/stime ticks, RSS bytes, fd
-count, thread count. Exits when the target (and its parent) are gone.
+another root process's /proc/PID/fd needs it). Exact mode takes a retained PID
+and starttime identity. Legacy parent mode resolves a child via the children
+file. Each mode writes one JSON object per line: monotonic + wall timestamps,
+utime/stime ticks, RSS bytes, fd count, thread count. Exits when the exact
+target, or the legacy target and its parent, are gone.
 
 Stdlib only. No arguments are echoed; the output path is the only write.
 """
@@ -19,6 +20,10 @@ import time
 
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 PAGE_BYTES = os.sysconf("SC_PAGE_SIZE")
+
+
+class TargetInspectionError(RuntimeError):
+    """The exact target identity could not be inspected safely."""
 
 
 def read_text(path):
@@ -88,15 +93,110 @@ def sample(pid):
     }
 
 
+def read_exact_stat(pid):
+    """Return parsed stat fields, None when terminal, or fail on unknown."""
+    try:
+        stat = read_text(f"/proc/{pid}/stat")
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    except OSError as error:
+        raise TargetInspectionError(
+            f"cannot inspect exact target stat: {type(error).__name__}"
+        ) from error
+    try:
+        tail = stat.rsplit(")", 1)[1].split()
+        state = tail[0]
+        starttime = int(tail[19])
+    except (IndexError, ValueError) as error:
+        raise TargetInspectionError("exact target stat is malformed") from error
+    return tail, state, starttime
+
+
+def sample_exact(pid, expected_starttime):
+    """Sample only one retained process generation, bracketed by stat reads."""
+    before = read_exact_stat(pid)
+    if before is None:
+        return None
+    before_tail, before_state, before_starttime = before
+    if before_starttime != expected_starttime:
+        raise TargetInspectionError("exact target birth identity changed")
+    if before_state in ("X", "x", "Z"):
+        return None
+    try:
+        statm = read_text(f"/proc/{pid}/statm").split()
+        fds = len(os.listdir(f"/proc/{pid}/fd"))
+        rss_bytes = int(statm[1]) * PAGE_BYTES
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    except (OSError, IndexError, ValueError) as error:
+        raise TargetInspectionError(
+            f"cannot inspect exact target metrics: {type(error).__name__}"
+        ) from error
+
+    after = read_exact_stat(pid)
+    if after is None:
+        return None
+    after_tail, after_state, after_starttime = after
+    if after_starttime != expected_starttime:
+        raise TargetInspectionError("exact target birth identity changed")
+    if after_state in ("X", "x", "Z"):
+        return None
+    try:
+        utime = int(after_tail[11])
+        stime = int(after_tail[12])
+        threads = int(after_tail[17])
+    except (IndexError, ValueError) as error:
+        raise TargetInspectionError("exact target stat is malformed") from error
+    return {
+        "t_mono_ns": time.monotonic_ns(),
+        "t_wall_ns": time.time_ns(),
+        "pid": pid,
+        "utime_ticks": utime,
+        "stime_ticks": stime,
+        "rss_bytes": rss_bytes,
+        "fds": fds,
+        "threads": threads,
+        "clk_tck": CLK_TCK,
+    }
+
+
 def main(argv):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--ppid", type=int, required=True)
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("--ppid", type=int)
+    target.add_argument("--pid", type=int)
+    parser.add_argument("--starttime", type=int)
     parser.add_argument("--out", required=True)
     parser.add_argument("--interval", type=float, default=0.05)
     parser.add_argument("--settle-s", type=float, default=30.0)
     args = parser.parse_args(argv)
     if not 0.005 <= args.interval <= 5.0:
         raise SystemExit("interval must be within [0.005, 5.0] seconds")
+    if args.pid is not None and args.starttime is None:
+        parser.error("--pid requires --starttime")
+    if args.ppid is not None and args.starttime is not None:
+        parser.error("--starttime is valid only with --pid")
+    if args.pid is not None and (args.pid <= 0 or args.starttime <= 0):
+        parser.error("--pid and --starttime must be positive")
+
+    if args.pid is not None:
+        seen = False
+        # Create the bounded artifact even when the initial identity is absent
+        # or unknown; it remains empty and the nonzero outcome invalidates the
+        # measurement without a later missing-file ambiguity.
+        with open(args.out, "w", encoding="utf-8", buffering=1) as handle:
+            while True:
+                try:
+                    row = sample_exact(args.pid, args.starttime)
+                except TargetInspectionError as error:
+                    raise SystemExit(str(error)) from error
+                if row is None:
+                    if not seen:
+                        raise SystemExit("exact target was not live")
+                    return 0
+                seen = True
+                handle.write(json.dumps(row) + "\n")
+                time.sleep(args.interval)
 
     deadline = time.monotonic() + args.settle_s
     target = None

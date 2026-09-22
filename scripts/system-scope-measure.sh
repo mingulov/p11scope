@@ -81,10 +81,12 @@ WPID=
 WPID_STARTTIME=
 WPID_RECEIPT=
 WTARGET_PID=
+WTARGET_STARTTIME=
 SPID=
 SPID_STARTTIME=
 SPID_RECEIPT=
 STARGET_PID=
+STARGET_STARTTIME=
 SMPID=
 SMPID_STARTTIME=
 SMPID_RECEIPT=
@@ -231,14 +233,31 @@ wait_file() {
     return 0
 }
 
-# wait_file_alive <path> <observer-pid> <workload-pid> <timeout_s> — a missing mapped handshake is a
+# Classify one exact process generation without signalling it. Permission to
+# send a signal says nothing about liveness for a root observer.
+owned_require_live() {
+    owned_live_state=$(owned_process_state "$1" "$2") || return 2
+    case "$owned_live_state" in
+        live) return 0 ;;
+        terminal) return 1 ;;
+        unknown) return 2 ;;
+    esac
+    return 2
+}
+
+# wait_file_alive <path> <observer-pid> <observer-birth>
+#   <workload-pid> <workload-birth> <timeout_s> — a missing mapped handshake is a
 # harness failure, and an observer that exits before owned calls are released
 # cannot be turned into a short successful capture.
 wait_file_alive() {
-    end=$(( $(date +%s) + $4 ))
+    end=$(( $(date +%s) + $6 ))
     while [ ! -f "$1" ]; do
-        kill -0 "$2" 2>/dev/null || return 2
-        kill -0 "$3" 2>/dev/null || return 3
+        owned_live_status=0
+        owned_require_live "$2" "$3" || owned_live_status=$?
+        case "$owned_live_status" in 0) ;; 1) return 2 ;; *) return 4 ;; esac
+        owned_live_status=0
+        owned_require_live "$4" "$5" || owned_live_status=$?
+        case "$owned_live_status" in 0) ;; 1) return 3 ;; *) return 5 ;; esac
         [ "$(date +%s)" -lt "$end" ] || return 1
         sleep 0.05
     done
@@ -268,7 +287,7 @@ collect_receipt() {
         > "$1/receipt-metadata.json" || return 1
 }
 
-# wait_attach <cond_dir> <observer_pid> <timeout_s> — hold the go file
+# wait_attach <cond_dir> <observer_pid> <observer_birth> <timeout_s> — hold the go file
 # until discovery is done (marker on the timestamped stderr passthrough)
 # AND the capture loop is live: the observer renders its first live frame
 # to stdout on tick one (last_frame starts a full drain interval in the
@@ -276,12 +295,14 @@ collect_receipt() {
 # "probes attached" line is an in-observer attach-end signal. An fd
 # plateau is NOT the gate — under load attach stalls for seconds mid-ramp
 # and a plateau detector fires early, releasing the workload burst into a
-# half-attached observer (observed once: 1/20000 calls). Returns 2
-# immediately if the observer dies first.
+# half-attached observer (observed once: 1/20000 calls). Returns 2 if the
+# observer is terminal and 3 if its exact identity cannot be inspected.
 wait_attach() {
-    end=$(( $(date +%s) + $3 ))
+    end=$(( $(date +%s) + $4 ))
     while :; do
-        kill -0 "$2" 2>/dev/null || return 2
+        owned_live_status=0
+        owned_require_live "$2" "$3" || owned_live_status=$?
+        case "$owned_live_status" in 0) ;; 1) return 2 ;; *) return 3 ;; esac
         [ "$(date +%s)" -lt "$end" ] || return 1
         if grep -q "p11scope: discovery:" "$1/stderr.txt" 2>/dev/null \
             && grep -q "probes attached" "$1/observer.stdout" 2>/dev/null; then
@@ -291,15 +312,17 @@ wait_attach() {
     done
 }
 
-# wait_marker <cond_dir> <observer_pid> <timeout_s> — hold until the
+# wait_marker <cond_dir> <observer_pid> <observer_birth> <timeout_s> — hold until the
 # discovery marker lands on stderr. Weaker than wait_attach (no
 # in-observer attach-end signal): used only where no first live frame
 # exists (trace mode) or the frame is not kept (discard/slow-pipe sinks).
 # Settles after the marker; post-hoc counts prove the window.
 wait_marker() {
-    end=$(( $(date +%s) + $3 ))
+    end=$(( $(date +%s) + $4 ))
     while :; do
-        kill -0 "$2" 2>/dev/null || return 2
+        owned_live_status=0
+        owned_require_live "$2" "$3" || owned_live_status=$?
+        case "$owned_live_status" in 0) ;; 1) return 2 ;; *) return 3 ;; esac
         [ "$(date +%s)" -lt "$end" ] || return 1
         if grep -q "p11scope: discovery:" "$1/stderr.txt" 2>/dev/null; then
             return 0
@@ -329,20 +352,24 @@ else:
 " "$1"
 }
 
-# wait_fd_plateau <cond_dir> <observer_pid> <timeout_s> — hold until the
+# wait_fd_plateau <cond_dir> <observer_pid> <observer_birth> <timeout_s> — hold until the
 # fd trace stops climbing: no new max for 15 s and at least 40 s past the
 # discovery marker (attach ramps links for ~50 s on --system; a bare
 # plateau fires early when attach stalls mid-ramp under load). Prints the
-# plateau fd count. Returns 2 if the observer dies first.
+# plateau fd count. Returns 2 if the observer is terminal and 3 if its exact
+# identity cannot be inspected.
 wait_fd_plateau() {
     dir=$1
     pid=$2
-    end=$(( $(date +%s) + $3 ))
+    birth=$3
+    end=$(( $(date +%s) + $4 ))
     marker_s=$(date +%s)
     best=0
     best_s=$marker_s
     while :; do
-        kill -0 "$pid" 2>/dev/null || return 2
+        owned_live_status=0
+        owned_require_live "$pid" "$birth" || owned_live_status=$?
+        case "$owned_live_status" in 0) ;; 1) return 2 ;; *) return 3 ;; esac
         now=$(date +%s)
         [ "$now" -lt "$end" ] || return 1
         # shellcheck disable=SC2086
@@ -384,6 +411,7 @@ run_condition() {
     WPID_RECEIPT=$OWNED_RECEIPT
     owned_verify_launch "$WPID" "$WPID_STARTTIME" "$WPID_RECEIPT" || exit 1
     WTARGET_PID=$OWNED_COMMAND_PID
+    WTARGET_STARTTIME=$OWNED_COMMAND_STARTTIME
     wait_file "$dir/ready" 60 || { echo "workload never became ready" >&2; cat "$dir/workload.log" >&2; exit 1; }
     T_MAPPING_READY=null
     T_RECEIPT_READY=null
@@ -422,23 +450,23 @@ run_condition() {
     if [ "$scope" = pid ]; then
         if [ "$mode" = trace ]; then
             # shellcheck disable=SC2086
-            set -- sudo --preserve-env=SOFTHSM2_CONF "$BINARY" trace \
+            set -- "$BINARY" trace \
                 --pid "$WTARGET_PID" --manifest "$WORK/manifest.json" \
                 --duration "$DURATION" --max-events 10000000 -o "$TRACE_OUT"
         else
             # shellcheck disable=SC2086
-            set -- sudo --preserve-env=SOFTHSM2_CONF "$BINARY" profile \
+            set -- "$BINARY" profile \
                 --pid "$WTARGET_PID" --manifest "$WORK/manifest.json" \
                 --mode "$mode" --duration "$DURATION" -o "$dir/report.json"
         fi
     else
         if [ "$mode" = trace ]; then
             # shellcheck disable=SC2086
-            set -- sudo --preserve-env=SOFTHSM2_CONF "$BINARY" trace \
+            set -- "$BINARY" trace \
                 --system --duration "$DURATION" --max-events 10000000 -o "$TRACE_OUT"
         else
             # shellcheck disable=SC2086
-            set -- sudo --preserve-env=SOFTHSM2_CONF "$BINARY" profile \
+            set -- "$BINARY" profile \
                 --system --mode "$mode" --duration "$DURATION" -o "$dir/report.json"
         fi
     fi
@@ -497,8 +525,10 @@ out.close()
     [ -z "$TPID" ] || owned_verify_launch "$TPID" "$TPID_STARTTIME" "$TPID_RECEIPT" || exit 1
     owned_verify_launch "$SPID" "$SPID_STARTTIME" "$SPID_RECEIPT" || exit 1
     STARGET_PID=$OWNED_COMMAND_PID
+    STARGET_STARTTIME=$OWNED_COMMAND_STARTTIME
     owned_launch root - "$dir/sampler.stdout" "$dir/sampler.stderr" -- \
-        sudo -n python3 -I "$PWD/scripts/system-scope-sample.py" --ppid "$STARGET_PID" \
+        python3 -I "$PWD/scripts/system-scope-sample.py" \
+        --pid "$STARGET_PID" --starttime "$STARGET_STARTTIME" \
         --out "$dir/samples.jsonl" --interval 0.05
     SMPID=$OWNED_PID
     SMPID_STARTTIME=$OWNED_STARTTIME
@@ -511,12 +541,15 @@ out.close()
     # post-hoc counts prove the window. The gate used is recorded.
     GATE=frame
     if [ "$mode" != trace ] && [ "$SINK" != discard ]; then
-        if wait_attach "$dir" "$STARGET_PID" 600; then
+        if wait_attach "$dir" "$STARGET_PID" "$STARGET_STARTTIME" 600; then
             :
         else
             rc=$?
             if [ "$rc" -eq 2 ]; then
                 echo "observer died during attach for $cond:" >&2
+                cat "$dir/stderr.txt" >&2
+            elif [ "$rc" -eq 3 ]; then
+                echo "observer identity became unknown during attach for $cond:" >&2
                 cat "$dir/stderr.txt" >&2
             else
                 echo "attach never settled for $cond (see $dir/stderr.txt)" >&2
@@ -524,12 +557,15 @@ out.close()
             exit 1
         fi
     else
-        if wait_marker "$dir" "$STARGET_PID" 600; then
+        if wait_marker "$dir" "$STARGET_PID" "$STARGET_STARTTIME" 600; then
             :
         else
             rc=$?
             if [ "$rc" -eq 2 ]; then
                 echo "observer died during attach for $cond:" >&2
+                cat "$dir/stderr.txt" >&2
+            elif [ "$rc" -eq 3 ]; then
+                echo "observer identity became unknown during attach for $cond:" >&2
                 cat "$dir/stderr.txt" >&2
             else
                 echo "attach never settled for $cond (see $dir/stderr.txt)" >&2
@@ -537,7 +573,7 @@ out.close()
             exit 1
         fi
         if [ "$scope" = system ]; then
-            plateau_fds=$(wait_fd_plateau "$dir" "$STARGET_PID" 600) || {
+            plateau_fds=$(wait_fd_plateau "$dir" "$STARGET_PID" "$STARGET_STARTTIME" 600) || {
                 echo "fd plateau never reached for $cond" >&2
                 exit 1
             }
@@ -552,14 +588,18 @@ out.close()
     T_INITIAL_GO=$(mono_ns)
     T_GO=$T_INITIAL_GO
     LOADAVG=$(cat /proc/loadavg)
-    kill -0 "$STARGET_PID" 2>/dev/null || {
-        echo "observer exited before owned calls were released" >&2
-        exit 1
-    }
+    owned_live_status=0
+    owned_require_live "$STARGET_PID" "$STARGET_STARTTIME" || owned_live_status=$?
+    case "$owned_live_status" in
+        0) ;;
+        1) echo "observer exited before owned calls were released" >&2; exit 1 ;;
+        *) echo "observer identity unknown before owned calls were released" >&2; exit 1 ;;
+    esac
     touch "$dir/go"
 
     if [ "$MAP_EARLY" -eq 0 ]; then
-        if wait_file_alive "$dir/mapped" "$STARGET_PID" "$WTARGET_PID" 60; then
+        if wait_file_alive "$dir/mapped" "$STARGET_PID" "$STARGET_STARTTIME" \
+            "$WTARGET_PID" "$WTARGET_STARTTIME" 60; then
             :
         else
             rc=$?
@@ -567,6 +607,10 @@ out.close()
                 echo "observer exited before late workload mapping was receipted" >&2
             elif [ "$rc" -eq 3 ]; then
                 echo "late workload exited before publishing its mapping" >&2
+            elif [ "$rc" -eq 4 ]; then
+                echo "observer identity became unknown before late workload mapping" >&2
+            elif [ "$rc" -eq 5 ]; then
+                echo "late workload identity became unknown before mapping" >&2
             else
                 echo "late workload published no mapping handshake" >&2
             fi
@@ -578,10 +622,13 @@ out.close()
             echo "could not pin late workload mapping for $cond" >&2
             exit 1
         }
-        kill -0 "$STARGET_PID" 2>/dev/null || {
-            echo "observer exited before owned calls were released" >&2
-            exit 1
-        }
+        owned_live_status=0
+        owned_require_live "$STARGET_PID" "$STARGET_STARTTIME" || owned_live_status=$?
+        case "$owned_live_status" in
+            0) ;;
+            1) echo "observer exited before owned calls were released" >&2; exit 1 ;;
+            *) echo "observer identity unknown before owned calls were released" >&2; exit 1 ;;
+        esac
         T_RECEIPT_READY=$(mono_ns)
         touch "$dir/receipt-ready"
     fi
@@ -648,6 +695,14 @@ out.close()
     }
     SMPID=
     SMPID_STARTTIME=
+    owned_command_outcome "$SMPID_RECEIPT" || {
+        echo "sampler receipt has no exact command outcome for $cond" >&2
+        exit 1
+    }
+    if [ "$OWNED_COMMAND_EXIT" -ne 0 ] || [ "$OWNED_COMMAND_SIGNAL" != null ]; then
+        echo "sampler failed for $cond: exit=$OWNED_COMMAND_EXIT signal=$OWNED_COMMAND_SIGNAL" >&2
+        exit 1
+    fi
     owned_finish "$TSPID" "$TSPID_STARTTIME" "$TSPID_RECEIPT" 15 || {
         echo "timestamp helper teardown failed for $cond; left unreaped" >&2
         exit 1

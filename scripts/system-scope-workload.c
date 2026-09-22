@@ -7,6 +7,9 @@
  * before READY so a --system scan corroborates it; EARLY=0 reports READY
  * first and does everything after GO (bench-style: per-PID attach on this
  * HEAD fails when the provider is already mapped — see the design note).
+ * After dlopen, both modes publish the literal C_GenerateRandom address and
+ * wait on RECEIPT_READY. This keeps the mapped process alive while the
+ * harness pins /proc/PID/map_files and hashes the physical target.
  * The generated-call truth is identical either way.
  *
  * Prints `TRUTH_PREGO {...}` at READY (calls already made, outside the
@@ -94,10 +97,94 @@ static int signal_ready(const char *ready_file)
     return 0;
 }
 
+static unsigned long long process_starttime(void)
+{
+    FILE *stream = fopen("/proc/self/stat", "r");
+    if (!stream) {
+        perror("workload: /proc/self/stat");
+        return 0;
+    }
+    char line[4096];
+    if (!fgets(line, sizeof line, stream)) {
+        fclose(stream);
+        fprintf(stderr, "workload: cannot read /proc/self/stat\n");
+        return 0;
+    }
+    fclose(stream);
+    char *tail = strrchr(line, ')');
+    if (!tail) {
+        fprintf(stderr, "workload: malformed /proc/self/stat\n");
+        return 0;
+    }
+    tail++;
+    char *save = NULL;
+    char *token = strtok_r(tail, " ", &save);
+    for (int field = 3; token && field < 22; field++)
+        token = strtok_r(NULL, " ", &save);
+    if (!token) {
+        fprintf(stderr, "workload: /proc/self/stat has no starttime\n");
+        return 0;
+    }
+    return strtoull(token, NULL, 10);
+}
+
+static int signal_mapped(const char *mapped_file)
+{
+    unsigned long long starttime = process_starttime();
+    if (!starttime)
+        return 1;
+    size_t temporary_len = strlen(mapped_file) + 48;
+    char *temporary = malloc(temporary_len);
+    if (!temporary) {
+        perror("workload: mapped temporary allocation");
+        return 1;
+    }
+    snprintf(temporary, temporary_len, "%s.tmp.%d", mapped_file, (int)getpid());
+    FILE *stream = fopen(temporary, "wx");
+    if (!stream) {
+        perror("workload: mapped temporary file");
+        free(temporary);
+        return 1;
+    }
+    int failed = fprintf(stream, "pid=%d starttime=%llu endpoint=%p\n",
+                         (int)getpid(), starttime, fns[I_GenerateRandom]) < 0;
+    if (!failed && fflush(stream) != 0)
+        failed = 1;
+    if (!failed && fsync(fileno(stream)) != 0)
+        failed = 1;
+    if (fclose(stream) != 0)
+        failed = 1;
+    if (failed) {
+        perror("workload: mapped file close");
+        unlink(temporary);
+        free(temporary);
+        return 1;
+    }
+    /* Test-only adversarial publication gate: the destination must remain
+     * absent even while a complete temporary file is held before rename. */
+    const char *publish_gate = getenv("P11SCOPE_MEASURE_PUBLISH_GATE");
+    if (publish_gate && *publish_gate && wait_for_file(publish_gate, 30) != 0) {
+        unlink(temporary);
+        free(temporary);
+        return 1;
+    }
+    if (rename(temporary, mapped_file) != 0) {
+        perror("workload: mapped file rename");
+        unlink(temporary);
+        free(temporary);
+        return 1;
+    }
+    free(temporary);
+    printf("workload: MAPPED pid=%d starttime=%llu endpoint=%p\n",
+           (int)getpid(), starttime, fns[I_GenerateRandom]);
+    fflush(stdout);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
-    if (argc != 7) {
-        fprintf(stderr, "usage: %s /path/to/module.so <n_calls> <pace_us> <early:0|1> <ready_file> <go_file>\n",
+    if (argc != 9) {
+        fprintf(stderr, "usage: %s /path/to/module.so <n_calls> <pace_us> <early:0|1> <ready_file> <go_file> <mapped_file> <receipt_ready_file>\n",
                 argv[0]);
         return 2;
     }
@@ -106,6 +193,8 @@ int main(int argc, char **argv)
     int early = atoi(argv[4]);
     const char *ready_file = argv[5];
     const char *go_file = argv[6];
+    const char *mapped_file = argv[7];
+    const char *receipt_ready_file = argv[8];
     if (n < 0 || pace_us < 0 || (early != 0 && early != 1)) {
         fprintf(stderr, "workload: bad arguments\n");
         return 2;
@@ -116,11 +205,15 @@ int main(int argc, char **argv)
     if (early) {
         if (phase_setup(argv[1], &sess) != 0)
             return 1;
+        if (signal_mapped(mapped_file) != 0)
+            return 1;
         /* Pre-go calls are outside the capture window by construction. */
         printf("TRUTH_PREGO {\"C_GetFunctionList\": 1, \"C_Initialize\": 1, "
                "\"C_GetSlotList\": 1, \"C_OpenSession\": 1}\n");
         fflush(stdout);
         if (signal_ready(ready_file) != 0)
+            return 1;
+        if (wait_for_file(receipt_ready_file, 660) != 0)
             return 1;
         /* Longer than the harness's own attach-gate timeout (600 s): the
          * harness kills this process on gate failure, so the wait must
@@ -137,6 +230,10 @@ int main(int argc, char **argv)
             return 1;
         go_ns = now_ns();
         if (phase_setup(argv[1], &sess) != 0)
+            return 1;
+        if (signal_mapped(mapped_file) != 0)
+            return 1;
+        if (wait_for_file(receipt_ready_file, 660) != 0)
             return 1;
     }
 

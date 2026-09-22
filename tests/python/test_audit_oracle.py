@@ -48,12 +48,18 @@ def run_measure(tmp, *, scope, mode, workload_argv, report_text,
         "seed": 1, "n_calls": sum(truth.values()), "pace_us": 0,
     }
     if receipt is not None:
-        condition["workload_module_identity"] = receipt
+        condition["workload_module_identity"] = [
+            {**entry, "report_identity_associated":
+             entry.get("report_identity_associated", True)}
+            for entry in receipt
+        ]
     meta = {
         "condition": condition,
         "timing": {"t_spawn_mono_ns": 0, "t_exit_mono_ns": 12_000_000_000,
                    "t_go_mono_ns": 1_000_000_000},
-        "harness": {"git_rev": "synthetic", "git_clean": True},
+        "harness": {"git_rev": "synthetic", "git_clean": True,
+                    "observer_exit": 0, "observer_timed_out": False,
+                    "observer_signal": None},
         "host": {"kernel": "synthetic", "cpu": "synthetic", "ncpu": 1,
                  "loadavg": "0 0 0"},
         "artifacts": {},
@@ -274,7 +280,7 @@ class OwnedCoverageTests(unittest.TestCase):
         self.assertFalse(record["window"]["window_valid"])
         self.assertTrue(record["trace_stream"]["crosscheck_holds"])
 
-    def test_trace_system_admitted_owned_still_validates(self):
+    def test_trace_system_admission_does_not_attribute_global_totals(self):
         lines = ["03:15:44.123456 pid 111 tid 111 C_GenerateRandom "
                  "→ CKR_OK 1.23µs"] * 7
         evidence = {name: 0 for name in CHECKER["COUNTERS"]}
@@ -294,8 +300,10 @@ class OwnedCoverageTests(unittest.TestCase):
                 truth={"C_GenerateRandom": 7},
                 receipt=[{"dev": [8, 1], "ino": 11, "sha256": "aa",
                           "path": "controlled-owned.so"}])
-        self.assertTrue(record["truth_vs_observed"]["counts_match"])
-        self.assertTrue(record["window"]["window_valid"])
+        self.assertFalse(record["truth_vs_observed"]["counts_match"])
+        self.assertIn("lacks per-module attribution",
+                      record["truth_vs_observed"]["match_note"])
+        self.assertFalse(record["window"]["window_valid"])
 
 
 def early_exit_samples():

@@ -1912,6 +1912,15 @@ fn settle_after_signal_with_grace(
     signals: &SignalState,
     grace: Duration,
 ) -> Result<ChildOutcome> {
+    settle_after_signal_with_grace_and(child, signals, grace, || {})
+}
+
+fn settle_after_signal_with_grace_and(
+    child: &mut OwnedChild,
+    signals: &SignalState,
+    grace: Duration,
+    mut after_fallback_term: impl FnMut(),
+) -> Result<ChildOutcome> {
     child.begin_settlement(grace.saturating_mul(2).saturating_add(FINAL_KILL_GRACE));
     let signal = signals
         .first_signal()
@@ -1971,6 +1980,7 @@ fn settle_after_signal_with_grace(
             }
             fallback_term_forwarded = true;
             deadline = child.phase_deadline(grace);
+            after_fallback_term();
             continue;
         }
         match child
@@ -6293,14 +6303,12 @@ mod tests {
     fn signal_settlement_observes_second_sigint_during_fallback_term_grace() {
         let directory = tempfile::tempdir().unwrap();
         let ready = directory.path().join("ready");
-        let term = directory.path().join("term");
         let mut child = spawn(
             "/bin/sh",
             &[
                 "-c",
                 &format!(
-                    "trap '' INT; trap ': > {}' TERM; : > {}; while :; do :; done",
-                    term.display(),
+                    "trap '' INT TERM; : > {}; while :; do :; done",
                     ready.display(),
                 ),
             ],
@@ -6311,24 +6319,29 @@ mod tests {
         let signals = Arc::new(SignalState::new());
         signals.observe(libc::SIGINT);
         let observed = Arc::clone(&signals);
-        let sender = std::thread::spawn(move || {
-            wait_until(
-                || term.exists(),
-                "settlement never forwarded fallback SIGTERM",
-            );
-            assert_eq!(
-                observed.sigint_deliveries(),
-                1,
-                "the second SIGINT was recorded before fallback SIGTERM",
-            );
-            observed.observe(libc::SIGINT);
-        });
+        let mut fallback_terms = 0;
         assert_eq!(
-            settle_after_signal_with_grace(&mut child, &signals, Duration::from_millis(100))
-                .unwrap(),
+            settle_after_signal_with_grace_and(
+                &mut child,
+                &signals,
+                Duration::from_millis(100),
+                || {
+                    fallback_terms += 1;
+                    assert_eq!(
+                        observed.sigint_deliveries(),
+                        1,
+                        "the second SIGINT was recorded before fallback SIGTERM",
+                    );
+                    observed.observe(libc::SIGINT);
+                },
+            )
+            .unwrap(),
             ChildOutcome::Exited(128 + libc::SIGKILL)
         );
-        sender.join().unwrap();
+        assert_eq!(
+            fallback_terms, 1,
+            "settlement did not enter fallback SIGTERM grace"
+        );
         assert_eq!(signals.sigint_deliveries(), 2);
         assert_eq!(child.interrupt_count, 2);
         assert!(child.is_reaped());

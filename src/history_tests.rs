@@ -1247,7 +1247,10 @@ fn root_cancel_never_relabels_timeout_domain_reducer_or_crossing_failures() {
         let deadline = if failure == 0 {
             Instant::now() - Duration::from_secs(1)
         } else {
-            Instant::now() + Duration::from_secs(1)
+            // These cases assert domain, reducer, and cursor-crossing
+            // failures. Keep the wall clock from becoming a competing
+            // failure source when the full suite deschedules this test.
+            Instant::now() + Duration::from_secs(60 * 60)
         };
         let tail = crate::events::OwnedRootTail::new(
             OriginalRootExit::test_reaped(domain.clone()),

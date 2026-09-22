@@ -42,6 +42,38 @@ impl EventsDomain {
     }
 }
 
+/// Retains the exact DISCOVERY map independently of the loaded BPF object.
+#[derive(Clone)]
+pub(crate) struct DiscoveryDomain(Arc<RetainedDiscovery>);
+struct RetainedDiscovery {
+    id: NonZeroU64,
+    _fd: OwnedFd,
+}
+impl DiscoveryDomain {
+    pub(crate) fn from_discovery(ebpf: &Ebpf) -> Result<Self> {
+        let Map::RingBuf(map) = ebpf.map("DISCOVERY").context("DISCOVERY map")? else {
+            anyhow::bail!("DISCOVERY is not a ring buffer");
+        };
+        let id =
+            NonZeroU64::new(u64::from(map.info()?.id())).context("DISCOVERY map ID is zero")?;
+        let fd = map
+            .fd()
+            .as_fd()
+            .try_clone_to_owned()
+            .context("retaining DISCOVERY map descriptor")?;
+        Ok(Self(Arc::new(RetainedDiscovery { id, _fd: fd })))
+    }
+    pub(crate) fn id(&self) -> u64 {
+        self.0.id.get()
+    }
+}
+
+impl AsFd for DiscoveryDomain {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0._fd.as_fd()
+    }
+}
+
 impl AsFd for EventsDomain {
     /// The retained EVENTS map descriptor, for readiness waits. Polling
     /// observes readability without consuming anything; the single
@@ -548,21 +580,63 @@ pub(crate) fn event_bytes(ev: &Event) -> Vec<u8> {
     }
 }
 
-/// Fixed-purpose owner for the private live-discovery ring. Its malformed
-/// count is deliberately independent from the public call-event transport.
-pub(crate) struct DiscoveryDrain<'a> {
-    ring: aya::maps::RingBuf<&'a mut MapData>,
+/// The session's single retained consumer for the private live-discovery ring.
+/// It owns a duplicate descriptor and its mappings, while malformed records
+/// remain deliberately independent from the public call-event transport.
+pub(crate) type OwnedDiscoveryDrain = DiscoveryDrain<aya::maps::RingBuf<MapData>>;
+
+pub(crate) struct DiscoveryDrain<S> {
+    source: S,
+    _domain: Option<DiscoveryDomain>,
 }
 
-impl<'a> DiscoveryDrain<'a> {
-    pub(crate) fn new(ebpf: &'a mut Ebpf) -> Result<Self> {
-        let ring =
-            aya::maps::RingBuf::try_from(ebpf.map_mut("DISCOVERY").context("DISCOVERY map")?)?;
-        Ok(Self { ring })
+impl OwnedDiscoveryDrain {
+    pub(crate) fn for_session(ebpf: &Ebpf, domain: &DiscoveryDomain) -> Result<Self> {
+        let Map::RingBuf(data) = ebpf.map("DISCOVERY").context("DISCOVERY map")? else {
+            anyhow::bail!("DISCOVERY is not a ring buffer");
+        };
+        anyhow::ensure!(
+            u64::from(data.info()?.id()) == domain.id(),
+            "DISCOVERY map does not match retained domain"
+        );
+        let retained = domain
+            .as_fd()
+            .try_clone_to_owned()
+            .context("duplicating retained DISCOVERY descriptor")?;
+        let data = MapData::from_fd(retained).context("reopening retained DISCOVERY map")?;
+        anyhow::ensure!(
+            u64::from(data.info()?.id()) == domain.id(),
+            "DISCOVERY map does not match retained domain"
+        );
+        let ring = aya::maps::RingBuf::try_from(Map::from_map_data(data)?)?;
+        Ok(Self {
+            source: ring,
+            _domain: Some(domain.clone()),
+        })
+    }
+}
+
+impl<S: RecordSource> DiscoveryDrain<S> {
+    #[cfg(test)]
+    pub(crate) fn over(source: S) -> Self {
+        Self {
+            source,
+            _domain: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn source(&self) -> &S {
+        &self.source
+    }
+
+    #[cfg(test)]
+    pub(crate) fn domain_id(&self) -> u64 {
+        self._domain.as_ref().map_or(0, DiscoveryDomain::id)
     }
 
     pub(crate) fn dequeue(&mut self) -> Option<DiscoveryItem> {
-        let item = self.ring.next()?;
+        let item = self.source.next_record()?;
         match decode_discovery(&item) {
             Some(record) => Some(DiscoveryItem::Record(record)),
             None => Some(DiscoveryItem::Malformed),
@@ -1056,6 +1130,38 @@ mod tests {
         let mut malformed = record;
         malformed.reserved_tail_zero[0] = 1;
         assert!(decode_discovery(&discovery_bytes(&malformed)).is_none());
+    }
+
+    /// Regression: one retained reader advances through backlog once, rejects
+    /// malformed bytes once, and stays empty after the queue is consumed.
+    #[test]
+    fn retained_discovery_consumer_spans_valid_malformed_backlog_and_empty_polls() {
+        let mut first: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        first.kind = DISCOVERY_KIND_LEADER_EXIT;
+        first.pid_tgid = 7u64 << 32;
+        let mut second = first;
+        second.pid_tgid = 11u64 << 32;
+        let records = [
+            discovery_bytes(&first),
+            vec![0u8; 3],
+            discovery_bytes(&second),
+        ];
+        let mut drain = DiscoveryDrain::over(ScriptedRecords::records(records, 3));
+
+        let Some(DiscoveryItem::Record(record)) = drain.dequeue() else {
+            panic!("first valid discovery record was not dequeued");
+        };
+        assert_eq!(record.pid_tgid, 7u64 << 32);
+        assert_eq!(drain.source().remaining(), 2, "backlog stays on one cursor");
+        assert!(matches!(drain.dequeue(), Some(DiscoveryItem::Malformed)));
+        assert_eq!(drain.source().remaining(), 1);
+        let Some(DiscoveryItem::Record(record)) = drain.dequeue() else {
+            panic!("second valid discovery record was not dequeued");
+        };
+        assert_eq!(record.pid_tgid, 11u64 << 32);
+        assert_eq!(drain.source().remaining(), 0);
+        assert!(drain.dequeue().is_none());
+        assert!(drain.dequeue().is_none());
     }
 }
 

@@ -911,6 +911,8 @@ impl RootSeed {
 ///         ebpf: panic!("compile-only placeholder"),
 ///         events_domain: panic!("compile-only placeholder"),
 ///         events_consumer: panic!("compile-only placeholder"),
+///         discovery_domain: panic!("compile-only placeholder"),
+///         discovery_consumer: panic!("compile-only placeholder"),
 ///         root_seed: panic!("compile-only placeholder"),
 ///         attach_failures: panic!("compile-only placeholder"),
 ///         detach_failures: panic!("compile-only placeholder"),
@@ -956,6 +958,10 @@ pub struct Session {
     /// it never borrows `ebpf`; `None` until the first drain keeps
     /// metrics-mode sessions (which never drain) free of reader setup.
     events_consumer: Option<events::OwnedDrain>,
+    discovery_domain: events::DiscoveryDomain,
+    /// One cursor over DISCOVERY for all dequeues. The owned mapping is
+    /// created lazily and then lives until this Session is dropped.
+    discovery_consumer: Option<events::OwnedDiscoveryDrain>,
     root_seed: Option<RootSeed>,
     attach_failures: Vec<(u32, String)>,
     detach_failures: Vec<String>,
@@ -2528,6 +2534,7 @@ impl Session {
         let generation_token = pause_key.map(|key| key.generation_token);
         let mut uprobe_scope = UProbeScope::AllProcesses;
         let mut prepared_domain = None;
+        let mut prepared_discovery_domain = None;
         let mut root_seed = None;
         let preparation = prepare_session_with(object_has_unsafe, |step| {
             match step {
@@ -2638,49 +2645,57 @@ impl Session {
                 }
                 SessionPreparation::PrepareEventsDomain => {
                     let events_domain = events::EventsDomain::from_events(&ebpf)?;
+                    let discovery_domain = events::DiscoveryDomain::from_discovery(&ebpf)?;
                     root_seed = owned_child.map(|child| RootSeed {
                         pin: child.seed_pin(),
                         domain: events_domain.clone(),
                     });
                     prepared_domain = Some(events_domain);
+                    prepared_discovery_domain = Some(discovery_domain);
                 }
             }
             Ok(())
         });
-        let (events_domain, links) = activate_after_preparation_with(preparation, || {
-            let events_domain = prepared_domain.expect("preparation established the events domain");
-            let links = attach_lifecycle_with(
-                &mut ebpf,
-                |ebpf, program| {
-                    if program == "task_newtask" {
-                        let hook: &mut BtfTracePoint = ebpf
-                            .program_mut(program)
-                            .context("required task_newtask program")?
-                            .try_into()?;
-                        Ok(RegisteredLink::BtfTracePoint {
-                            program,
-                            id: hook.attach()?,
-                        })
-                    } else {
-                        let hook: &mut RawTracePoint = ebpf
-                            .program_mut(program)
-                            .with_context(|| format!("required raw {program} program"))?
-                            .try_into()?;
-                        Ok(RegisteredLink::RawTracePoint {
-                            program,
-                            id: hook.attach(program)?,
-                        })
-                    }
-                },
-                |ebpf, _, link| detach_registered_link(ebpf, link),
-            )?;
-            Ok((events_domain, links))
-        })?;
+        let (events_domain, discovery_domain, links) =
+            activate_after_preparation_with(preparation, || {
+                let events_domain =
+                    prepared_domain.expect("preparation established the events domain");
+                let discovery_domain = prepared_discovery_domain
+                    .expect("preparation established the discovery domain");
+                let links = attach_lifecycle_with(
+                    &mut ebpf,
+                    |ebpf, program| {
+                        if program == "task_newtask" {
+                            let hook: &mut BtfTracePoint = ebpf
+                                .program_mut(program)
+                                .context("required task_newtask program")?
+                                .try_into()?;
+                            Ok(RegisteredLink::BtfTracePoint {
+                                program,
+                                id: hook.attach()?,
+                            })
+                        } else {
+                            let hook: &mut RawTracePoint = ebpf
+                                .program_mut(program)
+                                .with_context(|| format!("required raw {program} program"))?
+                                .try_into()?;
+                            Ok(RegisteredLink::RawTracePoint {
+                                program,
+                                id: hook.attach(program)?,
+                            })
+                        }
+                    },
+                    |ebpf, _, link| detach_registered_link(ebpf, link),
+                )?;
+                Ok((events_domain, discovery_domain, links))
+            })?;
 
         Ok(Self {
             ebpf,
             events_domain,
             events_consumer: None,
+            discovery_domain,
+            discovery_consumer: None,
             root_seed,
             attach_failures: vec![],
             detach_failures: vec![],
@@ -3426,8 +3441,16 @@ impl Session {
     }
 
     pub(crate) fn discovery_dequeue(&mut self) -> Result<Option<events::DiscoveryItem>> {
-        let mut drain = events::DiscoveryDrain::new(&mut self.ebpf)?;
-        Ok(drain.dequeue())
+        if self.discovery_consumer.is_none() {
+            let consumer =
+                events::OwnedDiscoveryDrain::for_session(&self.ebpf, &self.discovery_domain)?;
+            self.discovery_consumer = Some(consumer);
+        }
+        Ok(self
+            .discovery_consumer
+            .as_mut()
+            .context("retained DISCOVERY consumer vanished after creation")?
+            .dequeue())
     }
 
     #[allow(dead_code)] // Task 8 drives the Task 7 pause coordinator.

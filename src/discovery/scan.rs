@@ -23,6 +23,7 @@ use std::fs::File;
 use std::io::Read;
 use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 const INTERFACE_NAME_CAP: usize = 64;
@@ -49,6 +50,10 @@ pub(crate) const SCAN_DEADLINE_REASON: &str =
     "capture discovery deadline reached; remaining provider bytes were not scanned";
 pub(crate) const SCAN_CLOCK_REASON: &str =
     "monotonic clock read failed; remaining provider bytes were not scanned";
+pub(crate) const TABLE_WINDOW_CEILING_REASON: &str =
+    "discovery window table decode allowance reached; remaining table data was not decoded";
+pub(crate) const INTERFACE_WINDOW_CEILING_REASON: &str =
+    "discovery window interface decode allowance reached; remaining interface data was not decoded";
 /// Stable marker inside the scan's own verified-absence vocabulary. The
 /// scan-to-live-candidate completeness boundary (`scan_skip_truncates`)
 /// matches these markers — the push sites below must keep using them.
@@ -116,21 +121,72 @@ fn read_elf_snapshot_with(
     })
 }
 
-/// Demand-paged export facts for the scan path: the ELF tables are queried
-/// through a mapping instead of a whole-file snapshot, so no whole-size gate
-/// applies here. The table charge posts to the capture budget all-or-nothing:
-/// when the remaining capture allowance cannot cover it, the path reports the
-/// identical ceiling skip a mid-read abort produces, and the budget saturates.
+/// Inventory's conservative export unit: reserve and debit the complete
+/// logical mapped range before entering the indivisible dependency parser.
+/// Parse failure and a stop reached during parsing do not refund the debit.
+fn read_inventory_export_facts_budgeted_with<Now, ReadFacts>(
+    file: &File,
+    wanted: &[&str],
+    budget: &mut CaptureWorkBudget,
+    mut now: Now,
+    read_facts: ReadFacts,
+) -> Result<(ElfAbi, Vec<(String, u64)>), String>
+where
+    Now: FnMut() -> Option<u64>,
+    ReadFacts: FnOnce(&File, &[&str], u64) -> Result<(ElfAbi, Vec<(String, u64)>, u64), String>,
+{
+    if budget.active_scan.is_none() {
+        return Err("read failed: inventory discovery requires an active scan".into());
+    }
+    if let Some(reason) = budget.check_deadline(now()) {
+        return Err(format!("read failed: {reason}"));
+    }
+    let reservation = file
+        .metadata()
+        .map_err(|error| format!("metadata failed: {error}"))?
+        .len();
+    let reservation_usize = usize::try_from(reservation).map_err(|_| {
+        budget.set_scan_stop(IO_CEILING_REASON);
+        format!("read failed: {IO_CEILING_REASON}")
+    })?;
+    if reservation > budget.limits().per_object_bytes
+        || reservation > budget.remaining_window_io().unwrap_or(0)
+    {
+        budget.set_scan_stop(IO_CEILING_REASON);
+        return Err(format!("read failed: {IO_CEILING_REASON}"));
+    }
+    budget.record_io(reservation_usize);
+    let parsed = read_facts(file, wanted, reservation);
+    if let Some(reason) = budget.check_deadline(now()) {
+        return Err(format!("read failed: {reason}"));
+    }
+    let (abi, exports, structural_bytes) = parsed?;
+    if structural_bytes > reservation {
+        budget.set_scan_stop(IO_CEILING_REASON);
+        return Err(format!("read failed: {IO_CEILING_REASON}"));
+    }
+    Ok((abi, exports))
+}
+
+/// Demand-paged export facts for the scan path. Detailed mode preserves its
+/// sparse structural post-read charge. Inventory pre-debits a conservative
+/// logical mapped-byte reservation and fixes the dependency mapping to it.
 fn read_export_facts_budgeted(
     file: &File,
     wanted: &[&str],
     budget: &mut CaptureWorkBudget,
 ) -> Result<(ElfAbi, Vec<(String, u64)>), String> {
+    if matches!(budget.policy(), DiscoveryPolicy::Inventory(_)) {
+        return read_inventory_export_facts_budgeted_with(
+            file,
+            wanted,
+            budget,
+            crate::attach::monotonic_ns,
+            p11scope_manifest::elf::read_export_facts_bounded,
+        );
+    }
     let (abi, exports, charged) = p11scope_manifest::elf::read_export_facts(file, wanted)?;
-    let remaining = budget
-        .limits()
-        .total_bytes
-        .saturating_sub(budget.attempted_io_bytes());
+    let remaining = budget.remaining_window_io().unwrap_or(0);
     if charged > remaining {
         budget.record_io(usize::try_from(remaining).unwrap_or(usize::MAX));
         return Err(format!("read failed: {IO_CEILING_REASON}"));
@@ -174,11 +230,11 @@ pub(crate) fn read_mountinfo_with<R: Read>(
             return Err(reason.into());
         }
 
-        let capture_left = budget
-            .limits()
-            .total_bytes
-            .saturating_sub(budget.attempted_io_bytes());
+        let capture_left = budget.remaining_window_io().unwrap_or(0);
         if capture_left == 0 {
+            if matches!(budget.policy(), DiscoveryPolicy::Inventory(_)) {
+                budget.set_scan_stop(IO_CEILING_REASON);
+            }
             return Err(IO_CEILING_REASON.into());
         }
         let table_bytes = u64::try_from(table.len()).unwrap_or(u64::MAX);
@@ -238,6 +294,176 @@ pub(crate) fn read_mountinfo_with<R: Read>(
 pub struct ScanLimits {
     pub per_object_bytes: u64,
     pub total_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InventoryWindowLimits {
+    io_bytes: u64,
+    work_units: u64,
+    decoded_tables: usize,
+    decoded_entries: usize,
+    interfaces: usize,
+}
+
+impl InventoryWindowLimits {
+    pub fn new(
+        io_bytes: u64,
+        work_units: u64,
+        decoded_tables: usize,
+        decoded_entries: usize,
+        interfaces: usize,
+    ) -> Result<Self, String> {
+        if io_bytes == 0
+            || work_units == 0
+            || decoded_tables == 0
+            || decoded_entries == 0
+            || interfaces == 0
+        {
+            return Err("inventory discovery window limits must all be non-zero".into());
+        }
+        Ok(Self {
+            io_bytes,
+            work_units,
+            decoded_tables,
+            decoded_entries,
+            interfaces,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InventoryRetainedLimits {
+    table_keys: usize,
+    runtime_keys: usize,
+    interface_keys: usize,
+    inspection_cache_entries: usize,
+    export_cache_entries: usize,
+    /// Accounted key/value payload bytes. This excludes allocator and BTree
+    /// node overhead and is not a heap or RSS measurement.
+    cache_bytes: u64,
+}
+
+impl InventoryRetainedLimits {
+    pub fn new(
+        table_keys: usize,
+        runtime_keys: usize,
+        interface_keys: usize,
+        inspection_cache_entries: usize,
+        export_cache_entries: usize,
+        cache_bytes: u64,
+    ) -> Result<Self, String> {
+        if table_keys == 0
+            || runtime_keys == 0
+            || interface_keys == 0
+            || inspection_cache_entries == 0
+            || export_cache_entries == 0
+            || cache_bytes == 0
+        {
+            return Err("inventory retained discovery limits must all be non-zero".into());
+        }
+        Ok(Self {
+            table_keys,
+            runtime_keys,
+            interface_keys,
+            inspection_cache_entries,
+            export_cache_entries,
+            cache_bytes,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InventoryDiscoveryLimits {
+    per_operation_bytes: u64,
+    window: InventoryWindowLimits,
+    retained: InventoryRetainedLimits,
+}
+
+impl InventoryDiscoveryLimits {
+    pub fn new(
+        per_operation_bytes: u64,
+        window: InventoryWindowLimits,
+        retained: InventoryRetainedLimits,
+    ) -> Result<Self, String> {
+        if per_operation_bytes == 0 {
+            return Err("inventory per-operation byte limit must be non-zero".into());
+        }
+        if per_operation_bytes > window.io_bytes {
+            return Err(format!(
+                "inventory per-operation byte limit {per_operation_bytes} exceeds the {}-byte window",
+                window.io_bytes
+            ));
+        }
+        Ok(Self {
+            per_operation_bytes,
+            window,
+            retained,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscoveryPolicy {
+    DetailedLegacy,
+    Inventory(InventoryDiscoveryLimits),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct WindowId(u64);
+
+impl WindowId {
+    pub const fn new(id: u64) -> Self {
+        Self(id)
+    }
+}
+
+#[derive(Debug)]
+struct BudgetDomain;
+
+#[derive(Debug, Clone)]
+pub struct WindowToken {
+    domain: Arc<BudgetDomain>,
+    id: WindowId,
+}
+
+impl PartialEq for WindowToken {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && Arc::ptr_eq(&self.domain, &other.domain)
+    }
+}
+
+impl Eq for WindowToken {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanCheckpoint {
+    token: WindowToken,
+    serial: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowReceipt {
+    id: WindowId,
+    io_bytes: u64,
+    work_units: u64,
+    stop_reason: Option<&'static str>,
+}
+
+impl WindowReceipt {
+    pub const fn id(&self) -> WindowId {
+        self.id
+    }
+
+    pub const fn io_bytes(&self) -> u64 {
+        self.io_bytes
+    }
+
+    pub const fn work_units(&self) -> u64 {
+        self.work_units
+    }
+
+    pub const fn stop_reason(&self) -> Option<&'static str> {
+        self.stop_reason
+    }
 }
 
 impl Default for ScanLimits {
@@ -499,11 +725,67 @@ pub(crate) struct ElfExportFacts {
     pub(crate) exports: Vec<(String, u64)>,
 }
 
+fn inspected_cache_bytes(key: &InspectedFileKey, value: &InspectedFile) -> u64 {
+    let dynamic = value
+        .identity
+        .value
+        .as_ref()
+        .map_or(0, String::len)
+        .saturating_add(value.identity.sha256.as_ref().map_or(0, String::len))
+        .saturating_add(value.identity.note.as_ref().map_or(0, String::len))
+        .saturating_add(
+            value
+                .executable_ranges
+                .len()
+                .saturating_mul(std::mem::size_of::<(u64, u64)>()),
+        );
+    u64::try_from(
+        std::mem::size_of_val(key)
+            .saturating_add(std::mem::size_of_val(value))
+            .saturating_add(dynamic),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+fn export_cache_bytes(key: &InspectedFileKey, value: &ElfExportFacts) -> u64 {
+    let dynamic = value
+        .exports
+        .iter()
+        .fold(0usize, |bytes, (name, _)| bytes.saturating_add(name.len()));
+    u64::try_from(
+        std::mem::size_of_val(key)
+            .saturating_add(std::mem::size_of_val(value))
+            .saturating_add(
+                value
+                    .exports
+                    .len()
+                    .saturating_mul(std::mem::size_of::<(String, u64)>()),
+            )
+            .saturating_add(dynamic),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+#[derive(Debug, Clone)]
+struct ActiveInventoryWindow {
+    token: WindowToken,
+    limits: InventoryWindowLimits,
+    deadline_ns: u64,
+    io_bytes: u64,
+    work_units: u64,
+    decoded_tables: usize,
+    decoded_entries: usize,
+    interfaces: usize,
+    stop_reason: Option<&'static str>,
+}
+
 /// One capture's concrete discovery allowance. Memory snapshots and file hashes
 /// spend the same byte total; cardinality counters stop decoded-record amplification.
 #[derive(Debug)]
 pub struct CaptureWorkBudget {
     limits: ScanLimits,
+    policy: DiscoveryPolicy,
+    domain: Option<Arc<BudgetDomain>>,
     attempted_io_bytes: u64,
     table_candidates: usize,
     decoded_table_entries: usize,
@@ -528,6 +810,12 @@ pub struct CaptureWorkBudget {
     interface_exhaustion_reported: bool,
     work_ceiling: u64,
     work_units: u64,
+    active_window: Option<ActiveInventoryWindow>,
+    last_window: Option<WindowId>,
+    active_scan: Option<ScanCheckpoint>,
+    next_scan_serial: u64,
+    window_exhaustions: u64,
+    retained_cache_bytes: u64,
     deadline_ns: Option<u64>,
     /// Test-only: the deadline most recently *installed* (a `Some` passed to
     /// `set_deadline`). The end-of-batch `None` clear leaves it in place, so a
@@ -542,6 +830,8 @@ impl CaptureWorkBudget {
     pub fn new(limits: ScanLimits) -> Self {
         Self {
             limits,
+            policy: DiscoveryPolicy::DetailedLegacy,
+            domain: None,
             attempted_io_bytes: 0,
             table_candidates: 0,
             decoded_table_entries: 0,
@@ -558,12 +848,186 @@ impl CaptureWorkBudget {
             interface_exhaustion_reported: false,
             work_ceiling: DEFAULT_WORK_CEILING,
             work_units: 0,
+            active_window: None,
+            last_window: None,
+            active_scan: None,
+            next_scan_serial: 0,
+            window_exhaustions: 0,
+            retained_cache_bytes: 0,
             deadline_ns: None,
             #[cfg(test)]
             last_installed_deadline: None,
             scan_stop_reason: None,
             scan_stop_reported: false,
         }
+    }
+
+    pub fn for_inventory(limits: InventoryDiscoveryLimits) -> Self {
+        let mut budget = Self::new(ScanLimits {
+            per_object_bytes: limits.per_operation_bytes,
+            total_bytes: limits.window.io_bytes,
+        });
+        budget.policy = DiscoveryPolicy::Inventory(limits);
+        budget.domain = Some(Arc::new(BudgetDomain));
+        budget
+    }
+
+    pub const fn policy(&self) -> DiscoveryPolicy {
+        self.policy
+    }
+
+    pub fn begin_window(&mut self, id: WindowId, deadline_ns: u64) -> Result<WindowToken, String> {
+        let DiscoveryPolicy::Inventory(limits) = self.policy else {
+            return Err("renewable discovery windows require Inventory policy".into());
+        };
+        self.begin_window_with_limits(id, limits.window, deadline_ns)
+    }
+
+    pub fn begin_window_with_limits(
+        &mut self,
+        id: WindowId,
+        window_limits: InventoryWindowLimits,
+        deadline_ns: u64,
+    ) -> Result<WindowToken, String> {
+        let DiscoveryPolicy::Inventory(limits) = self.policy else {
+            return Err("renewable discovery windows require Inventory policy".into());
+        };
+        if self.active_window.is_some() || self.active_scan.is_some() {
+            return Err("cannot renew discovery work while a window or scan is active".into());
+        }
+        if self.last_window.is_some_and(|last| id <= last) {
+            return Err("inventory discovery window ID is stale or repeated".into());
+        }
+        if window_limits.io_bytes > limits.window.io_bytes
+            || window_limits.work_units > limits.window.work_units
+            || window_limits.decoded_tables > limits.window.decoded_tables
+            || window_limits.decoded_entries > limits.window.decoded_entries
+            || window_limits.interfaces > limits.window.interfaces
+        {
+            return Err("adaptive inventory window exceeds its immutable policy maximum".into());
+        }
+        let token = WindowToken {
+            domain: Arc::clone(
+                self.domain
+                    .as_ref()
+                    .expect("Inventory policy owns a budget domain"),
+            ),
+            id,
+        };
+        self.active_window = Some(ActiveInventoryWindow {
+            token: token.clone(),
+            limits: window_limits,
+            deadline_ns,
+            io_bytes: 0,
+            work_units: 0,
+            decoded_tables: 0,
+            decoded_entries: 0,
+            interfaces: 0,
+            stop_reason: None,
+        });
+        self.last_window = Some(id);
+        self.deadline_ns = None;
+        self.scan_stop_reason = None;
+        self.scan_stop_reported = false;
+        Ok(token)
+    }
+
+    pub fn checkpoint(&mut self, token: WindowToken) -> Result<ScanCheckpoint, String> {
+        self.validate_window_token(&token)?;
+        if self.active_scan.is_some() {
+            return Err("inventory discovery scan is already active".into());
+        }
+        let serial = self
+            .next_scan_serial
+            .checked_add(1)
+            .ok_or_else(|| "inventory discovery scan serial exhausted".to_string())?;
+        self.next_scan_serial = serial;
+        let checkpoint = ScanCheckpoint { token, serial };
+        self.active_scan = Some(checkpoint.clone());
+        Ok(checkpoint)
+    }
+
+    pub fn finish_scan(&mut self, checkpoint: ScanCheckpoint) -> Result<(), String> {
+        if self.active_scan.as_ref() != Some(&checkpoint) {
+            return Err("inventory discovery scan checkpoint is stale or missing".into());
+        }
+        self.validate_window_token(&checkpoint.token)?;
+        self.active_scan = None;
+        Ok(())
+    }
+
+    pub fn finish_window(&mut self, token: WindowToken) -> Result<WindowReceipt, String> {
+        self.validate_window_token(&token)?;
+        if self.active_scan.is_some() {
+            return Err("cannot finish an inventory discovery window during a scan".into());
+        }
+        let window = self
+            .active_window
+            .take()
+            .expect("validated inventory window exists");
+        self.deadline_ns = None;
+        self.scan_stop_reason = None;
+        self.scan_stop_reported = false;
+        Ok(WindowReceipt {
+            id: token.id,
+            io_bytes: window.io_bytes,
+            work_units: window.work_units,
+            stop_reason: window.stop_reason,
+        })
+    }
+
+    fn validate_window_token(&self, token: &WindowToken) -> Result<(), String> {
+        match self.active_window.as_ref() {
+            Some(window) if window.token == *token => Ok(()),
+            Some(_) => Err("inventory discovery window token is stale".into()),
+            None => Err("inventory discovery window token is missing".into()),
+        }
+    }
+
+    fn inventory_limits(&self) -> Option<InventoryDiscoveryLimits> {
+        match self.policy {
+            DiscoveryPolicy::DetailedLegacy => None,
+            DiscoveryPolicy::Inventory(limits) => Some(limits),
+        }
+    }
+
+    fn may_mutate_retained_state(&self) -> bool {
+        matches!(self.policy, DiscoveryPolicy::DetailedLegacy) || self.active_scan.is_some()
+    }
+
+    fn cache_can_replace(
+        &self,
+        old_bytes: Option<u64>,
+        new_bytes: u64,
+        entries: usize,
+        entry_limit: Option<usize>,
+    ) -> bool {
+        let Some(limits) = self.inventory_limits() else {
+            return true;
+        };
+        if old_bytes.is_none() && entry_limit.is_some_and(|limit| entries >= limit) {
+            return false;
+        }
+        self.retained_cache_bytes
+            .checked_sub(old_bytes.unwrap_or(0))
+            .and_then(|bytes| bytes.checked_add(new_bytes))
+            .is_some_and(|bytes| bytes <= limits.retained.cache_bytes)
+    }
+
+    fn set_scan_stop(&mut self, reason: &'static str) {
+        if self.scan_stop_reason.is_some() {
+            return;
+        }
+        self.scan_stop_reason = Some(reason);
+        if let Some(window) = self.active_window.as_mut() {
+            window.stop_reason = Some(reason);
+            self.window_exhaustions = self.window_exhaustions.saturating_add(1);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn window_exhaustions(&self) -> u64 {
+        self.window_exhaustions
     }
 
     pub fn limits(&self) -> ScanLimits {
@@ -574,27 +1038,67 @@ impl CaptureWorkBudget {
         self.attempted_io_bytes
     }
 
-    pub(crate) fn allowed_io(&self, operation_bytes: u64, wanted: usize) -> usize {
+    pub fn remaining_window_io(&self) -> Result<u64, String> {
+        match self.policy {
+            DiscoveryPolicy::DetailedLegacy => Ok(self
+                .limits
+                .total_bytes
+                .saturating_sub(self.attempted_io_bytes)),
+            DiscoveryPolicy::Inventory(_) => self
+                .active_window
+                .as_ref()
+                .map(|window| window.limits.io_bytes.saturating_sub(window.io_bytes))
+                .ok_or_else(|| "inventory discovery I/O requires an active window".into()),
+        }
+    }
+
+    pub(crate) fn allowed_io(&mut self, operation_bytes: u64, wanted: usize) -> usize {
+        if matches!(self.policy, DiscoveryPolicy::Inventory(_)) && self.active_scan.is_none() {
+            return 0;
+        }
         let operation_left = self.limits.per_object_bytes.saturating_sub(operation_bytes);
-        let capture_left = self
-            .limits
-            .total_bytes
-            .saturating_sub(self.attempted_io_bytes);
-        wanted.min(
+        let capture_left = self.remaining_window_io().unwrap_or(0);
+        let allowed = wanted.min(
             operation_left
                 .min(capture_left)
                 .try_into()
                 .unwrap_or(usize::MAX),
-        )
+        );
+        if allowed == 0 && wanted != 0 && matches!(self.policy, DiscoveryPolicy::Inventory(_)) {
+            self.set_scan_stop(IO_CEILING_REASON);
+        }
+        allowed
     }
 
     pub(crate) fn record_io(&mut self, bytes: usize) {
         self.attempted_io_bytes = self.attempted_io_bytes.saturating_add(bytes as u64);
+        if let Some(window) = self.active_window.as_mut() {
+            window.io_bytes = window.io_bytes.saturating_add(bytes as u64);
+        }
     }
 
     pub fn charge(&mut self, units: u64) -> bool {
         if self.scan_stop_reason.is_some() {
             return false;
+        }
+        if let DiscoveryPolicy::Inventory(_) = self.policy {
+            if self.active_scan.is_none() {
+                return false;
+            }
+            let Some(window) = self.active_window.as_mut() else {
+                return false;
+            };
+            let Some(next) = window.work_units.checked_add(units) else {
+                self.set_scan_stop(WORK_CEILING_REASON);
+                return false;
+            };
+            if next > window.limits.work_units {
+                self.set_scan_stop(WORK_CEILING_REASON);
+                return false;
+            }
+            window.work_units = next;
+            self.work_units = self.work_units.saturating_add(units);
+            return true;
         }
         let Some(next) = self.work_units.checked_add(units) else {
             self.scan_stop_reason = Some(WORK_CEILING_REASON);
@@ -614,7 +1118,8 @@ impl CaptureWorkBudget {
             self.last_installed_deadline = deadline_ns;
         }
         self.deadline_ns = deadline_ns;
-        if deadline_ns.is_none()
+        if matches!(self.policy, DiscoveryPolicy::DetailedLegacy)
+            && deadline_ns.is_none()
             && matches!(
                 self.scan_stop_reason,
                 Some(SCAN_DEADLINE_REASON | SCAN_CLOCK_REASON)
@@ -634,22 +1139,32 @@ impl CaptureWorkBudget {
         if let Some(reason) = self.scan_stop_reason {
             return Some(reason);
         }
-        let deadline = self.deadline_ns?;
+        let window_deadline = self.active_window.as_ref().map(|window| window.deadline_ns);
+        let deadline = match (window_deadline, self.deadline_ns) {
+            (Some(window), Some(transaction)) => window.min(transaction),
+            (Some(window), None) => window,
+            (None, Some(transaction)) => transaction,
+            (None, None) => return None,
+        };
         let reason = match now {
             Some(now) if now < deadline => return None,
             Some(_) => SCAN_DEADLINE_REASON,
             None => SCAN_CLOCK_REASON,
         };
-        self.scan_stop_reason = Some(reason);
+        self.set_scan_stop(reason);
         Some(reason)
     }
 
     pub(crate) fn check_deadline_now(&mut self) -> Option<&'static str> {
-        if self.deadline_ns.is_some() {
+        if self.deadline_ns.is_some() || self.active_window.is_some() {
             self.check_deadline(crate::attach::monotonic_ns())
         } else {
             None
         }
+    }
+
+    fn has_deadline(&self) -> bool {
+        self.deadline_ns.is_some() || self.active_window.is_some()
     }
 
     /// The capture's stop, sticky reason first and otherwise one clock poll:
@@ -685,12 +1200,19 @@ impl CaptureWorkBudget {
         self.scan_stop_reason.is_some()
     }
 
-    fn allowed_capture_io(&self, wanted: usize) -> usize {
-        self.limits
-            .total_bytes
-            .saturating_sub(self.attempted_io_bytes)
+    fn allowed_capture_io(&mut self, wanted: usize) -> usize {
+        if matches!(self.policy, DiscoveryPolicy::Inventory(_)) && self.active_scan.is_none() {
+            return 0;
+        }
+        let allowed = self
+            .remaining_window_io()
+            .unwrap_or(0)
             .try_into()
-            .map_or(usize::MAX, |left| wanted.min(left))
+            .map_or(usize::MAX, |left| wanted.min(left));
+        if allowed == 0 && wanted != 0 && matches!(self.policy, DiscoveryPolicy::Inventory(_)) {
+            self.set_scan_stop(IO_CEILING_REASON);
+        }
+        allowed
     }
 
     /// The capture's stop, without polling the clock: the pure read behind
@@ -714,6 +1236,9 @@ impl CaptureWorkBudget {
     /// Records one `spans_for` version refusal: a version-shaped word for a
     /// layout the scanner will not walk.
     pub(crate) fn note_unsupported_version(&mut self) {
+        if !self.may_mutate_retained_state() {
+            return;
+        }
         self.unsupported_version_refusals = self.unsupported_version_refusals.saturating_add(1);
     }
 
@@ -729,6 +1254,9 @@ impl CaptureWorkBudget {
         if self.scan_stopped() {
             return false;
         }
+        if matches!(self.policy, DiscoveryPolicy::Inventory(_)) {
+            return true;
+        }
         let Some(decoded) = self.decoded_table_entries.checked_add(entries) else {
             self.table_refusals = self.table_refusals.saturating_add(1);
             return false;
@@ -742,36 +1270,148 @@ impl CaptureWorkBudget {
         true
     }
 
+    pub(crate) fn admit_decoded_table(&mut self, entries: usize) -> bool {
+        let DiscoveryPolicy::Inventory(_) = self.policy else {
+            return true;
+        };
+        if self.active_scan.is_none() || self.scan_stopped() {
+            return false;
+        }
+        let Some(window) = self.active_window.as_mut() else {
+            return false;
+        };
+        let Some(tables) = window.decoded_tables.checked_add(1) else {
+            self.table_refusals = self.table_refusals.saturating_add(1);
+            self.set_scan_stop(TABLE_WINDOW_CEILING_REASON);
+            return false;
+        };
+        let Some(decoded_entries) = window.decoded_entries.checked_add(entries) else {
+            self.table_refusals = self.table_refusals.saturating_add(1);
+            self.set_scan_stop(TABLE_WINDOW_CEILING_REASON);
+            return false;
+        };
+        if tables > window.limits.decoded_tables || decoded_entries > window.limits.decoded_entries
+        {
+            self.table_refusals = self.table_refusals.saturating_add(1);
+            self.set_scan_stop(TABLE_WINDOW_CEILING_REASON);
+            return false;
+        }
+        window.decoded_tables = tables;
+        window.decoded_entries = decoded_entries;
+        self.table_candidates = self.table_candidates.saturating_add(1);
+        self.decoded_table_entries = self.decoded_table_entries.saturating_add(entries);
+        true
+    }
+
     pub(crate) fn table_already_admitted(&self, id: &TableIdentity) -> bool {
         self.admitted_tables.contains(id)
     }
 
-    pub(crate) fn note_table_admitted(&mut self, id: TableIdentity) {
-        self.admitted_tables.insert(id);
+    pub(crate) fn note_table_admitted(&mut self, id: TableIdentity) -> bool {
+        if !self.may_mutate_retained_state() {
+            return false;
+        }
+        if self.admitted_tables.contains(&id) {
+            return true;
+        }
+        if self
+            .inventory_limits()
+            .is_some_and(|limits| self.admitted_tables.len() >= limits.retained.table_keys)
+        {
+            self.table_refusals = self.table_refusals.saturating_add(1);
+            return false;
+        }
+        self.admitted_tables.insert(id)
     }
 
     pub(crate) fn runtime_table_already_admitted(&self, id: &RuntimeTableIdentity) -> bool {
         self.admitted_runtime_tables.contains(id)
     }
 
-    pub(crate) fn note_runtime_table_admitted(&mut self, id: RuntimeTableIdentity) {
-        self.admitted_runtime_tables.insert(id);
+    pub(crate) fn note_runtime_table_admitted(&mut self, id: RuntimeTableIdentity) -> bool {
+        if !self.may_mutate_retained_state() {
+            return false;
+        }
+        if self.admitted_runtime_tables.contains(&id) {
+            return true;
+        }
+        if self.inventory_limits().is_some_and(|limits| {
+            self.admitted_runtime_tables.len() >= limits.retained.runtime_keys
+        }) {
+            self.table_refusals = self.table_refusals.saturating_add(1);
+            return false;
+        }
+        self.admitted_runtime_tables.insert(id)
     }
 
     pub(crate) fn inspected_file(&self, key: &InspectedFileKey) -> Option<InspectedFile> {
         self.inspected_files.get(key).cloned()
     }
 
-    pub(crate) fn note_inspected_file(&mut self, key: InspectedFileKey, value: InspectedFile) {
-        self.inspected_files.insert(key, value);
+    pub(crate) fn note_inspected_file(
+        &mut self,
+        key: InspectedFileKey,
+        value: InspectedFile,
+    ) -> bool {
+        if !self.may_mutate_retained_state() {
+            return false;
+        }
+        let bytes = inspected_cache_bytes(&key, &value);
+        if !self.cache_can_replace(
+            self.inspected_files
+                .get(&key)
+                .map(|old| inspected_cache_bytes(&key, old)),
+            bytes,
+            self.inspected_files.len(),
+            self.inventory_limits()
+                .map(|limits| limits.retained.inspection_cache_entries),
+        ) {
+            return false;
+        }
+        let old = self
+            .inspected_files
+            .insert(key, value)
+            .map_or(0, |old| inspected_cache_bytes(&key, &old));
+        self.retained_cache_bytes = self
+            .retained_cache_bytes
+            .saturating_sub(old)
+            .saturating_add(bytes);
+        true
     }
 
     pub(crate) fn elf_export_facts_for(&self, key: &InspectedFileKey) -> Option<ElfExportFacts> {
         self.elf_export_facts.get(key).cloned()
     }
 
-    pub(crate) fn note_elf_export_facts(&mut self, key: InspectedFileKey, value: ElfExportFacts) {
-        self.elf_export_facts.insert(key, value);
+    pub(crate) fn note_elf_export_facts(
+        &mut self,
+        key: InspectedFileKey,
+        value: ElfExportFacts,
+    ) -> bool {
+        if !self.may_mutate_retained_state() {
+            return false;
+        }
+        let bytes = export_cache_bytes(&key, &value);
+        if !self.cache_can_replace(
+            self.elf_export_facts
+                .get(&key)
+                .map(|old| export_cache_bytes(&key, old)),
+            bytes,
+            self.elf_export_facts.len(),
+            self.inventory_limits()
+                .map(|limits| limits.retained.export_cache_entries),
+        ) {
+            return false;
+        }
+        let old = self
+            .elf_export_facts
+            .insert(key, value)
+            .map_or(0, |old| export_cache_bytes(&key, &old));
+        self.retained_cache_bytes = self
+            .retained_cache_bytes
+            .saturating_sub(old)
+            .saturating_add(bytes);
+        true
     }
 
     #[cfg(test)]
@@ -794,9 +1434,26 @@ impl CaptureWorkBudget {
         self.work_units
     }
 
+    #[cfg(test)]
+    pub(crate) fn retained_counts(&self) -> (usize, usize, usize, usize, usize, u64) {
+        (
+            self.admitted_tables.len(),
+            self.admitted_runtime_tables.len(),
+            self.admitted_interfaces.len(),
+            self.inspected_files.len(),
+            self.elf_export_facts.len(),
+            self.retained_cache_bytes,
+        )
+    }
+
     fn table_exhaustion_reason(&mut self) -> Option<String> {
         if std::mem::replace(&mut self.table_exhaustion_reported, true) {
             None
+        } else if let Some(limits) = self.inventory_limits() {
+            Some(format!(
+                "capture retained table-key budget reached ({} file keys, {} runtime keys); remaining table data was not retained",
+                limits.retained.table_keys, limits.retained.runtime_keys
+            ))
         } else {
             Some(format!(
                 "capture table decode ceiling reached ({MAX_TABLE_CANDIDATES} candidates, \
@@ -809,6 +1466,9 @@ impl CaptureWorkBudget {
         if self.scan_stopped() {
             return false;
         }
+        if matches!(self.policy, DiscoveryPolicy::Inventory(_)) {
+            return true;
+        }
         if self.interface_records == MAX_INTERFACE_RECORDS {
             self.interface_refusals = self.interface_refusals.saturating_add(1);
             return false;
@@ -817,17 +1477,60 @@ impl CaptureWorkBudget {
         true
     }
 
+    pub(crate) fn admit_decoded_interface(&mut self) -> bool {
+        let DiscoveryPolicy::Inventory(_) = self.policy else {
+            return true;
+        };
+        if self.active_scan.is_none() || self.scan_stopped() {
+            return false;
+        }
+        let Some(window) = self.active_window.as_mut() else {
+            return false;
+        };
+        let Some(next) = window.interfaces.checked_add(1) else {
+            self.interface_refusals = self.interface_refusals.saturating_add(1);
+            self.set_scan_stop(INTERFACE_WINDOW_CEILING_REASON);
+            return false;
+        };
+        if next > window.limits.interfaces {
+            self.interface_refusals = self.interface_refusals.saturating_add(1);
+            self.set_scan_stop(INTERFACE_WINDOW_CEILING_REASON);
+            return false;
+        }
+        window.interfaces = next;
+        self.interface_records = self.interface_records.saturating_add(1);
+        true
+    }
+
     pub(crate) fn interface_already_admitted(&self, id: &InterfaceIdentity) -> bool {
         self.admitted_interfaces.contains(id)
     }
 
-    pub(crate) fn note_interface_admitted(&mut self, id: InterfaceIdentity) {
-        self.admitted_interfaces.insert(id);
+    pub(crate) fn note_interface_admitted(&mut self, id: InterfaceIdentity) -> bool {
+        if !self.may_mutate_retained_state() {
+            return false;
+        }
+        if self.admitted_interfaces.contains(&id) {
+            return true;
+        }
+        if self
+            .inventory_limits()
+            .is_some_and(|limits| self.admitted_interfaces.len() >= limits.retained.interface_keys)
+        {
+            self.interface_refusals = self.interface_refusals.saturating_add(1);
+            return false;
+        }
+        self.admitted_interfaces.insert(id)
     }
 
     fn interface_exhaustion_reason(&mut self) -> Option<String> {
         if std::mem::replace(&mut self.interface_exhaustion_reported, true) {
             None
+        } else if let Some(limits) = self.inventory_limits() {
+            Some(format!(
+                "capture retained interface-key budget reached ({} keys); remaining interface data was not retained",
+                limits.retained.interface_keys
+            ))
         } else {
             Some(format!(
                 "capture interface decode ceiling reached ({MAX_INTERFACE_RECORDS} records); \
@@ -1313,15 +2016,22 @@ fn decode_candidate(
         || runtime_identity
             .as_ref()
             .is_some_and(|id| budget.runtime_table_already_admitted(id));
+    if !budget.admit_decoded_table(decoded_entries) {
+        return Err(());
+    }
     if !repeat {
         if !budget.admit_table(decoded_entries) {
             return Err(());
         }
-        if let Some(id) = identity {
-            budget.note_table_admitted(id);
+        if let Some(id) = identity
+            && !budget.note_table_admitted(id)
+        {
+            return Err(());
         }
-        if let Some(id) = runtime_identity {
-            budget.note_runtime_table_admitted(id);
+        if let Some(id) = runtime_identity
+            && !budget.note_runtime_table_admitted(id)
+        {
+            return Err(());
         }
     }
 
@@ -1429,7 +2139,7 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
     let width = layout.word_bytes();
     while offset + width <= snapshot.len() {
         if (offset / width) % 4096 == 0
-            && budget.deadline_ns.is_some()
+            && budget.has_deadline()
             && budget.check_deadline(now()).is_some()
         {
             if let Some(reason) = budget.take_scan_stop_reason() {
@@ -1573,7 +2283,7 @@ fn scan_interfaces_with_clock<F: FnMut() -> Option<u64>>(
     let mut offset = 0usize;
     while offset + interface.stride <= snapshot.len() {
         if (offset / layout.word_bytes()) % 4096 == 0
-            && budget.deadline_ns.is_some()
+            && budget.has_deadline()
             && budget.check_deadline(now()).is_some()
         {
             if let Some(reason) = budget.take_scan_stop_reason() {
@@ -1656,6 +2366,12 @@ fn scan_interfaces_with_clock<F: FnMut() -> Option<u64>>(
             let repeat = identity
                 .as_ref()
                 .is_some_and(|id| budget.interface_already_admitted(id));
+            if !budget.admit_decoded_interface() {
+                if let Some(reason) = budget.interface_exhaustion_reason() {
+                    skipped.push(reason);
+                }
+                return None;
+            }
             if !repeat {
                 if !budget.admit_interface() {
                     if let Some(reason) = budget.interface_exhaustion_reason() {
@@ -1663,8 +2379,13 @@ fn scan_interfaces_with_clock<F: FnMut() -> Option<u64>>(
                     }
                     return None;
                 }
-                if let Some(id) = identity {
-                    budget.note_interface_admitted(id);
+                if let Some(id) = identity
+                    && !budget.note_interface_admitted(id)
+                {
+                    if let Some(reason) = budget.interface_exhaustion_reason() {
+                        skipped.push(reason);
+                    }
+                    return None;
                 }
             }
             Some(ScannedInterface {
@@ -1959,7 +2680,7 @@ fn read_maps_with_limits<R: Read, F: FnMut() -> Option<u64>>(
     let mut chunk = vec![0; chunk_size];
 
     loop {
-        if budget.deadline_ns.is_some() && budget.check_deadline(now()).is_some() {
+        if budget.has_deadline() && budget.check_deadline(now()).is_some() {
             deadline_stop = true;
             break;
         }
@@ -2039,7 +2760,7 @@ pub(crate) fn read_maps_or_refuse<R: Read, F: FnMut() -> Option<u64>>(
 ) -> Result<Vec<MapEntry>, String> {
     // The reader reports a stopped batch's reason only once; the refusal must
     // not depend on that, so ask the budget directly before reading.
-    if budget.deadline_ns.is_some() {
+    if budget.has_deadline() {
         if let Some(reason) = budget.check_deadline(now()) {
             return Err(reason.into());
         }
@@ -2489,9 +3210,9 @@ fn scan_process_view_with_io_mode(
                 continue;
             }
         };
-        // No whole-size gate on the export check: the tables are demand-paged,
-        // so cost follows touched pages rather than file size. `actual_size`
-        // stays above for hint attribution.
+        // DetailedLegacy has no whole-size gate on this demand-paged export
+        // check. Inventory reserves the full logical mapped range below.
+        // `actual_size` stays above for hint attribution.
         let cache_key = InspectedFileKey {
             device: key.device,
             inode: key.inode,
@@ -5478,5 +6199,747 @@ mod tests {
             out.reason,
             "unsupported function-table version; the scanner does not walk this layout"
         );
+    }
+
+    fn inventory_limits(
+        window_io: u64,
+        window_work: u64,
+        decoded_tables: usize,
+        decoded_entries: usize,
+        interfaces: usize,
+        retained_tables: usize,
+    ) -> InventoryDiscoveryLimits {
+        InventoryDiscoveryLimits::new(
+            window_io,
+            InventoryWindowLimits::new(
+                window_io,
+                window_work,
+                decoded_tables,
+                decoded_entries,
+                interfaces,
+            )
+            .unwrap(),
+            InventoryRetainedLimits::new(
+                retained_tables,
+                retained_tables,
+                retained_tables,
+                4,
+                4,
+                64 * 1024,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn table_identity(index: u64) -> TableIdentity {
+        TableIdentity {
+            device: Device { major: 8, minor: 1 },
+            inode: index + 1,
+            file_offset: index * 8,
+            version_word: 0x2802,
+            usable: 68,
+        }
+    }
+
+    #[test]
+    fn inventory_limits_are_checked_and_detailed_legacy_stays_the_default() {
+        assert!(InventoryWindowLimits::new(0, 1, 1, 1, 1).is_err());
+        assert!(InventoryWindowLimits::new(1, 0, 1, 1, 1).is_err());
+        assert!(InventoryRetainedLimits::new(0, 1, 1, 1, 1, 1).is_err());
+        let window = InventoryWindowLimits::new(8, 1, 1, 1, 1).unwrap();
+        let retained = InventoryRetainedLimits::new(1, 1, 1, 1, 1, 1).unwrap();
+        assert!(InventoryDiscoveryLimits::new(0, window, retained).is_err());
+        assert!(InventoryDiscoveryLimits::new(9, window, retained).is_err());
+
+        let mut detailed = CaptureWorkBudget::default();
+        assert_eq!(detailed.policy(), DiscoveryPolicy::DetailedLegacy);
+        for _ in 0..MAX_TABLE_CANDIDATES {
+            assert!(detailed.admit_table(1));
+        }
+        assert!(!detailed.admit_table(1));
+        assert!(
+            detailed.begin_window(WindowId::new(1), 10).is_err(),
+            "DetailedLegacy does not silently opt into renewable inventory work"
+        );
+    }
+
+    #[test]
+    fn inventory_windows_renew_work_io_and_decode_but_keep_evidence_and_keys() {
+        let limits = inventory_limits(4, 2, 1, 68, 1, 4);
+        let mut budget = CaptureWorkBudget::for_inventory(limits);
+        assert!(budget.remaining_window_io().is_err());
+        assert!(!budget.charge(1), "inventory work needs an active window");
+
+        let first = budget.begin_window(WindowId::new(1), 100).unwrap();
+        let first_scan = budget.checkpoint(first.clone()).unwrap();
+        assert!(budget.charge(1));
+        assert!(budget.admit_decoded_table(68));
+        let identity = table_identity(1);
+        assert!(budget.note_table_admitted(identity));
+        assert!(budget.charge(1));
+        assert!(!budget.charge(1));
+        budget.note_unsupported_version();
+        budget.finish_scan(first_scan).unwrap();
+        let first_receipt = budget.finish_window(first.clone()).unwrap();
+        assert_eq!(first_receipt.work_units(), 2);
+        assert_eq!(first_receipt.stop_reason(), Some(WORK_CEILING_REASON));
+        assert_eq!(budget.retained_counts().0, 1);
+        assert_eq!(budget.unsupported_version_refusals(), 1);
+        assert!(
+            budget.checkpoint(first.clone()).is_err(),
+            "finished token is stale"
+        );
+        assert!(
+            budget.begin_window(WindowId::new(1), 200).is_err(),
+            "window IDs are monotonic"
+        );
+
+        let second = budget.begin_window(WindowId::new(2), 200).unwrap();
+        let second_scan = budget.checkpoint(second.clone()).unwrap();
+        assert!(budget.charge(1), "work allowance renews");
+        assert!(budget.admit_decoded_table(68), "decode allowance renews");
+        assert!(
+            budget.note_table_admitted(identity),
+            "a repeat remains valid"
+        );
+        assert!(budget.charge(1));
+        assert_eq!(
+            budget.retained_counts().0,
+            1,
+            "repeat key does not grow retention"
+        );
+        assert_eq!(
+            budget.work_units_count(),
+            4,
+            "lifetime work evidence is cumulative"
+        );
+        assert_eq!(
+            budget.unsupported_version_refusals(),
+            1,
+            "prior loss is sticky"
+        );
+        budget.finish_scan(second_scan).unwrap();
+        budget.finish_window(second).unwrap();
+    }
+
+    #[test]
+    fn inventory_rejects_stale_missing_and_active_window_transitions() {
+        let mut budget = CaptureWorkBudget::for_inventory(inventory_limits(8, 8, 2, 136, 2, 4));
+        assert!(budget.remaining_window_io().is_err());
+        let first = budget.begin_window(WindowId::new(7), 100).unwrap();
+        let scan = budget.checkpoint(first.clone()).unwrap();
+        let stale = scan.clone();
+        let finished = scan.clone();
+        assert!(
+            budget.checkpoint(first.clone()).is_err(),
+            "one scan owns the window"
+        );
+        assert!(budget.begin_window(WindowId::new(8), 200).is_err());
+        assert!(budget.finish_window(first.clone()).is_err());
+        budget.finish_scan(scan).unwrap();
+        let current = budget.checkpoint(first.clone()).unwrap();
+        assert!(
+            budget.finish_scan(stale).is_err(),
+            "scan A cannot finish scan B in the same window"
+        );
+        assert!(
+            budget.finish_window(first.clone()).is_err(),
+            "failed stale completion leaves scan B active"
+        );
+        assert!(
+            budget.begin_window(WindowId::new(8), 200).is_err(),
+            "failed stale completion cannot authorize renewal"
+        );
+        budget.finish_scan(current).unwrap();
+        budget.finish_window(first.clone()).unwrap();
+        assert!(budget.finish_scan(finished).is_err());
+        assert!(budget.checkpoint(first.clone()).is_err());
+        assert!(budget.begin_window(WindowId::new(6), 300).is_err());
+        assert!(
+            !budget.note_table_admitted(table_identity(99)),
+            "retained inventory state cannot change outside an owned scan"
+        );
+    }
+
+    #[test]
+    fn inventory_tokens_are_bound_to_one_budget_domain() {
+        let limits = inventory_limits(8, 8, 2, 136, 2, 4);
+        let mut first_budget = CaptureWorkBudget::for_inventory(limits);
+        let mut second_budget = CaptureWorkBudget::for_inventory(limits);
+        let first = first_budget.begin_window(WindowId::new(1), 100).unwrap();
+        let second = second_budget.begin_window(WindowId::new(1), 100).unwrap();
+
+        assert!(
+            second_budget.checkpoint(first.clone()).is_err(),
+            "equal caller IDs do not transfer authority across budgets"
+        );
+        let scan = second_budget.checkpoint(second.clone()).unwrap();
+        second_budget.finish_scan(scan).unwrap();
+        second_budget.finish_window(second).unwrap();
+        first_budget.finish_window(first).unwrap();
+    }
+
+    #[test]
+    fn inventory_scan_serial_overflow_refuses_without_creating_an_owner() {
+        let mut budget = CaptureWorkBudget::for_inventory(inventory_limits(8, 8, 2, 136, 2, 4));
+        let window = budget.begin_window(WindowId::new(1), 100).unwrap();
+        budget.next_scan_serial = u64::MAX;
+
+        assert!(budget.checkpoint(window.clone()).is_err());
+        assert!(
+            budget.finish_window(window).is_ok(),
+            "overflow must not install a phantom active scan"
+        );
+    }
+
+    #[test]
+    fn inventory_window_deadline_survives_nested_deadline_clear() {
+        let mut budget = CaptureWorkBudget::for_inventory(inventory_limits(8, 8, 2, 136, 2, 4));
+        let first = budget.begin_window(WindowId::new(1), 10).unwrap();
+        let scan = budget.checkpoint(first.clone()).unwrap();
+        budget.set_deadline(Some(5));
+        assert_eq!(budget.check_deadline(Some(5)), Some(SCAN_DEADLINE_REASON));
+        budget.set_deadline(None);
+        assert_eq!(
+            budget.stopped_reason(),
+            Some(SCAN_DEADLINE_REASON),
+            "clearing a nested deadline cannot clear the window stop"
+        );
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(first).unwrap();
+
+        let second = budget.begin_window(WindowId::new(2), 20).unwrap();
+        let scan = budget.checkpoint(second.clone()).unwrap();
+        budget.set_deadline(Some(30));
+        assert_eq!(budget.check_deadline(Some(19)), None);
+        assert_eq!(budget.check_deadline(Some(20)), Some(SCAN_DEADLINE_REASON));
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(second).unwrap();
+    }
+
+    #[test]
+    fn inventory_decoder_retains_513_candidates_and_charges_repeats_across_windows() {
+        let table_len = 8 + 68 * 8;
+        let table_end = 0x7000 + 514 * table_len as u64;
+        let maps = parse_maps(
+            format!(
+                "1000-3000 r-xp 00000000 08:01 7 /lib/provider.so\n\
+                 7000-{table_end:x} r--p 00001000 08:01 9 /lib/tables.so\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let map_index = MapIndex::new(&maps).unwrap();
+        let mut snapshot = vec![0u8; table_len];
+        snapshot[..8].copy_from_slice(&0x2802u64.to_ne_bytes());
+        for slot in 0..68 {
+            let at = 8 + slot * 8;
+            snapshot[at..at + 8].copy_from_slice(&0x1500u64.to_ne_bytes());
+        }
+
+        let limits = inventory_limits(8, 68, 1, 68, 1, 513);
+        let mut budget = CaptureWorkBudget::for_inventory(limits);
+        for index in 0..513u64 {
+            let token = budget
+                .begin_window(WindowId::new(index + 1), u64::MAX)
+                .unwrap();
+            let scan = budget.checkpoint(token.clone()).unwrap();
+            let address = 0x7000 + index * table_len as u64;
+            assert!(
+                decode_exact_table(
+                    &snapshot,
+                    address,
+                    LinuxLayout::Lp64,
+                    &map_index,
+                    &mut budget,
+                    None,
+                )
+                .unwrap()
+                .is_some(),
+                "candidate {index} passes the actual decoder"
+            );
+            budget.finish_scan(scan).unwrap();
+            budget.finish_window(token).unwrap();
+        }
+        assert_eq!(budget.retained_counts().0, 513);
+        assert_eq!(budget.table_candidates_count(), 513);
+        assert_eq!(budget.decoded_table_entries_count(), 513 * 68);
+        assert_eq!(budget.work_units_count(), 513 * 68);
+        assert_eq!(budget.refusal_counts(), (0, 0, 0));
+
+        let token = budget.begin_window(WindowId::new(514), u64::MAX).unwrap();
+        let scan = budget.checkpoint(token.clone()).unwrap();
+        assert!(
+            decode_exact_table(
+                &snapshot,
+                0x7000,
+                LinuxLayout::Lp64,
+                &map_index,
+                &mut budget,
+                None,
+            )
+            .unwrap()
+            .is_some(),
+            "a repeat still traverses the actual decoder"
+        );
+        assert_eq!(budget.retained_counts().0, 513);
+        assert_eq!(budget.table_candidates_count(), 514);
+        assert_eq!(budget.decoded_table_entries_count(), 514 * 68);
+        assert_eq!(budget.work_units_count(), 514 * 68);
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(token).unwrap();
+
+        let token = budget.begin_window(WindowId::new(515), u64::MAX).unwrap();
+        let scan = budget.checkpoint(token.clone()).unwrap();
+        assert!(
+            decode_exact_table(
+                &snapshot,
+                0x7000 + 513 * table_len as u64,
+                LinuxLayout::Lp64,
+                &map_index,
+                &mut budget,
+                None,
+            )
+            .is_err(),
+            "the configured retained-key limit refuses one decoded candidate over"
+        );
+        assert_eq!(budget.retained_counts().0, 513);
+        assert_eq!(budget.table_candidates_count(), 515);
+        assert_eq!(budget.decoded_table_entries_count(), 515 * 68);
+        assert_eq!(budget.work_units_count(), 515 * 68);
+        assert_eq!(budget.refusal_counts(), (1, 0, 0));
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(token).unwrap();
+    }
+
+    #[test]
+    fn inventory_runtime_interface_and_cache_bounds_are_independent_and_exact() {
+        let window = InventoryWindowLimits::new(1024, 32, 4, 512, 4).unwrap();
+        let retained = InventoryRetainedLimits::new(2, 1, 1, 1, 1, u64::MAX).unwrap();
+        let limits = InventoryDiscoveryLimits::new(1024, window, retained).unwrap();
+        let mut budget = CaptureWorkBudget::for_inventory(limits);
+        let token = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = budget.checkpoint(token.clone()).unwrap();
+
+        let runtime = |view| RuntimeTableIdentity {
+            view: ProcessViewId(view),
+            address: 0x1000,
+            version_word: 0x2802,
+            usable: 68,
+            content: u64::from(view),
+        };
+        assert!(budget.note_runtime_table_admitted(runtime(1)));
+        assert!(!budget.note_runtime_table_admitted(runtime(2)));
+
+        let interface = |flags| InterfaceIdentity {
+            table: InterfaceTableKey::File(table_identity(1)),
+            name: InterfaceNameKey::Null,
+            flags,
+        };
+        assert!(budget.note_interface_admitted(interface(1)));
+        assert!(!budget.note_interface_admitted(interface(2)));
+
+        let file = File::open("/bin/sh").unwrap();
+        let inspected = p11scope_manifest::identity::inspect_file(&file).unwrap();
+        let pin = pin_of(&file).unwrap();
+        let key = |inode| InspectedFileKey {
+            device: Device { major: 8, minor: 1 },
+            inode,
+            pin,
+        };
+        assert!(budget.note_inspected_file(key(1), inspected.clone()));
+        assert!(!budget.note_inspected_file(key(2), inspected));
+
+        let facts = ElfExportFacts {
+            abi: ElfAbi::Lp64,
+            exports: vec![("C_GetFunctionList".into(), 7)],
+        };
+        assert!(budget.note_elf_export_facts(key(1), facts.clone()));
+        assert!(!budget.note_elf_export_facts(key(2), facts));
+        assert_eq!(budget.retained_counts().1, 1);
+        assert_eq!(budget.retained_counts().2, 1);
+        assert_eq!(budget.retained_counts().3, 1);
+        assert_eq!(budget.retained_counts().4, 1);
+
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(token).unwrap();
+        let next = budget.begin_window(WindowId::new(2), u64::MAX).unwrap();
+        assert!(budget.inspected_file(&key(1)).is_some());
+        assert!(budget.elf_export_facts_for(&key(1)).is_some());
+        budget.finish_window(next).unwrap();
+    }
+
+    #[test]
+    fn inventory_cache_byte_limit_accepts_exact_size_and_refuses_one_over() {
+        let key = InspectedFileKey {
+            device: Device { major: 8, minor: 1 },
+            inode: 7,
+            pin: pin_of(&File::open("/bin/sh").unwrap()).unwrap(),
+        };
+        let exact = ElfExportFacts {
+            abi: ElfAbi::Lp64,
+            exports: vec![("C_GetFunctionList".into(), 7)],
+        };
+        let exact_bytes = export_cache_bytes(&key, &exact);
+        let window = InventoryWindowLimits::new(1024, 32, 4, 512, 4).unwrap();
+        let retained = InventoryRetainedLimits::new(1, 1, 1, 1, 1, exact_bytes).unwrap();
+        let mut budget = CaptureWorkBudget::for_inventory(
+            InventoryDiscoveryLimits::new(1024, window, retained).unwrap(),
+        );
+        let token = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = budget.checkpoint(token.clone()).unwrap();
+
+        assert!(budget.note_elf_export_facts(key, exact.clone()));
+        assert_eq!(budget.retained_counts().5, exact_bytes);
+        let one_over = ElfExportFacts {
+            abi: exact.abi,
+            exports: vec![("C_GetFunctionList_".into(), 7)],
+        };
+        assert_eq!(export_cache_bytes(&key, &one_over), exact_bytes + 1);
+        assert!(!budget.note_elf_export_facts(key, one_over));
+        assert_eq!(budget.elf_export_facts_for(&key), Some(exact));
+        assert_eq!(budget.retained_counts().5, exact_bytes);
+
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(token).unwrap();
+    }
+
+    #[test]
+    fn inventory_adaptive_windows_respect_policy_maxima_and_operation_continuations() {
+        let maximum = InventoryWindowLimits::new(8, 8, 2, 136, 2).unwrap();
+        let retained = InventoryRetainedLimits::new(4, 4, 4, 1, 1, 4096).unwrap();
+        let limits = InventoryDiscoveryLimits::new(4, maximum, retained).unwrap();
+        let mut budget = CaptureWorkBudget::for_inventory(limits);
+        let oversized = InventoryWindowLimits::new(8, 9, 2, 136, 2).unwrap();
+        assert!(
+            budget
+                .begin_window_with_limits(WindowId::new(1), oversized, 100)
+                .is_err()
+        );
+
+        let small = InventoryWindowLimits::new(4, 2, 1, 68, 1).unwrap();
+        let first = budget
+            .begin_window_with_limits(WindowId::new(1), small, 100)
+            .unwrap();
+        let scan = budget.checkpoint(first.clone()).unwrap();
+        assert_eq!(budget.allowed_io(3, 8), 1);
+        budget.record_io(1);
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(first).unwrap();
+
+        let second = budget
+            .begin_window_with_limits(WindowId::new(2), small, 200)
+            .unwrap();
+        let scan = budget.checkpoint(second.clone()).unwrap();
+        assert_eq!(
+            budget.allowed_io(4, 1),
+            0,
+            "renewal does not reset a continued operation's size guard"
+        );
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(second).unwrap();
+
+        let third = budget
+            .begin_window_with_limits(WindowId::new(3), small, 300)
+            .unwrap();
+        let scan = budget.checkpoint(third.clone()).unwrap();
+        assert!(budget.admit_decoded_table(68));
+        assert!(!budget.admit_decoded_table(1));
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(third).unwrap();
+
+        let fourth = budget
+            .begin_window_with_limits(WindowId::new(4), small, 400)
+            .unwrap();
+        let scan = budget.checkpoint(fourth.clone()).unwrap();
+        assert!(budget.admit_decoded_interface());
+        assert!(!budget.admit_decoded_interface());
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(fourth).unwrap();
+    }
+
+    #[test]
+    fn inventory_reader_exhausts_window_a_and_progresses_in_b_with_sticky_totals() {
+        let mut budget = CaptureWorkBudget::for_inventory(inventory_limits(4, 32, 2, 136, 2, 4));
+        let first = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = budget.checkpoint(first.clone()).unwrap();
+        let mut first_reader = std::io::Cursor::new(b"17 1\n".as_slice());
+        assert_eq!(
+            read_mountinfo_with(&mut first_reader, &mut budget, 8, |_| None).unwrap_err(),
+            IO_CEILING_REASON
+        );
+        assert_eq!(budget.attempted_io_bytes(), 4);
+        budget.finish_scan(scan).unwrap();
+        let receipt = budget.finish_window(first).unwrap();
+        assert_eq!(receipt.io_bytes(), 4);
+        assert_eq!(receipt.stop_reason(), Some(IO_CEILING_REASON));
+
+        let second = budget.begin_window(WindowId::new(2), u64::MAX).unwrap();
+        let scan = budget.checkpoint(second.clone()).unwrap();
+        let mut second_reader = std::io::Cursor::new(b"a\n".as_slice());
+        assert_eq!(
+            read_mountinfo_with(&mut second_reader, &mut budget, 8, |_| None).unwrap(),
+            "a\n"
+        );
+        assert_eq!(
+            budget.attempted_io_bytes(),
+            6,
+            "lifetime I/O stays cumulative"
+        );
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(second).unwrap();
+        assert_eq!(
+            budget.window_exhaustions(),
+            1,
+            "the prior loss stays sticky"
+        );
+    }
+
+    #[test]
+    fn inventory_export_preflight_refuses_before_excess_io() {
+        let file = File::open("/bin/sh").unwrap();
+        let hooks = HookRegistry::builtin();
+        let mut budget = CaptureWorkBudget::for_inventory(inventory_limits(16, 32, 2, 136, 2, 4));
+        let token = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = budget.checkpoint(token.clone()).unwrap();
+        let error = read_export_facts_budgeted(&file, &hooks.names(), &mut budget).unwrap_err();
+        assert_eq!(error, format!("read failed: {IO_CEILING_REASON}"));
+        assert_eq!(
+            budget.attempted_io_bytes(),
+            0,
+            "inventory refuses before the unbounded dependency reads"
+        );
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(token).unwrap();
+    }
+
+    #[test]
+    fn inventory_export_refuses_before_dependency_without_owned_live_work() {
+        let file = File::open("/bin/sh").unwrap();
+        let size = file.metadata().unwrap().len();
+        let wanted: [&str; 0] = [];
+
+        let mut no_scan = CaptureWorkBudget::for_inventory(inventory_limits(size, 2, 1, 1, 1, 1));
+        let window = no_scan.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let mut calls = 0;
+        assert!(
+            read_inventory_export_facts_budgeted_with(
+                &file,
+                &wanted,
+                &mut no_scan,
+                || Some(0),
+                |file, wanted, reserved| {
+                    calls += 1;
+                    p11scope_manifest::elf::read_export_facts_bounded(file, wanted, reserved)
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(calls, 0);
+        assert_eq!(no_scan.attempted_io_bytes(), 0);
+        no_scan.finish_window(window).unwrap();
+
+        let mut expired = CaptureWorkBudget::for_inventory(inventory_limits(size, 2, 1, 1, 1, 1));
+        let window = expired.begin_window(WindowId::new(1), 0).unwrap();
+        let scan = expired.checkpoint(window.clone()).unwrap();
+        let mut calls = 0;
+        assert!(
+            read_inventory_export_facts_budgeted_with(
+                &file,
+                &wanted,
+                &mut expired,
+                || Some(0),
+                |file, wanted, reserved| {
+                    calls += 1;
+                    p11scope_manifest::elf::read_export_facts_bounded(file, wanted, reserved)
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(calls, 0);
+        assert_eq!(expired.attempted_io_bytes(), 0);
+        assert_eq!(expired.stopped_reason(), Some(SCAN_DEADLINE_REASON));
+        expired.finish_scan(scan).unwrap();
+        expired.finish_window(window).unwrap();
+
+        let mut stopped = CaptureWorkBudget::for_inventory(inventory_limits(size, 1, 1, 1, 1, 1));
+        let window = stopped.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = stopped.checkpoint(window.clone()).unwrap();
+        assert!(stopped.charge(1));
+        assert!(!stopped.charge(1));
+        let mut calls = 0;
+        assert!(
+            read_inventory_export_facts_budgeted_with(
+                &file,
+                &wanted,
+                &mut stopped,
+                || Some(0),
+                |file, wanted, reserved| {
+                    calls += 1;
+                    p11scope_manifest::elf::read_export_facts_bounded(file, wanted, reserved)
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(calls, 0);
+        assert_eq!(stopped.attempted_io_bytes(), 0);
+        assert_eq!(stopped.stopped_reason(), Some(WORK_CEILING_REASON));
+        stopped.finish_scan(scan).unwrap();
+        stopped.finish_window(window).unwrap();
+    }
+
+    #[test]
+    fn inventory_export_reservation_is_debited_before_success_and_parse_failure() {
+        let wanted: [&str; 0] = [];
+        let good = File::open("/bin/sh").unwrap();
+        let good_size = good.metadata().unwrap().len();
+        let mut success =
+            CaptureWorkBudget::for_inventory(inventory_limits(good_size, 2, 1, 1, 1, 1));
+        let window = success.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = success.checkpoint(window.clone()).unwrap();
+        let mut calls = 0;
+        read_inventory_export_facts_budgeted_with(
+            &good,
+            &wanted,
+            &mut success,
+            || Some(0),
+            |file, wanted, reserved| {
+                calls += 1;
+                assert_eq!(reserved, good_size);
+                p11scope_manifest::elf::read_export_facts_bounded(file, wanted, reserved)
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(success.attempted_io_bytes(), good_size);
+        assert!(
+            read_inventory_export_facts_budgeted_with(
+                &good,
+                &wanted,
+                &mut success,
+                || Some(0),
+                |file, wanted, reserved| {
+                    calls += 1;
+                    p11scope_manifest::elf::read_export_facts_bounded(file, wanted, reserved)
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(calls, 1, "one-over refuses before dependency work");
+        assert_eq!(success.attempted_io_bytes(), good_size);
+        success.finish_scan(scan).unwrap();
+        success.finish_window(window).unwrap();
+
+        let malformed = tempfile::tempfile().unwrap();
+        malformed.set_len(4096).unwrap();
+        let mut failed = CaptureWorkBudget::for_inventory(inventory_limits(4096, 2, 1, 1, 1, 1));
+        let window = failed.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = failed.checkpoint(window.clone()).unwrap();
+        let mut calls = 0;
+        assert!(
+            read_inventory_export_facts_budgeted_with(
+                &malformed,
+                &wanted,
+                &mut failed,
+                || Some(0),
+                |file, wanted, reserved| {
+                    calls += 1;
+                    assert_eq!(reserved, 4096);
+                    p11scope_manifest::elf::read_export_facts_bounded(file, wanted, reserved)
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(failed.attempted_io_bytes(), 4096);
+        assert!(
+            read_inventory_export_facts_budgeted_with(
+                &malformed,
+                &wanted,
+                &mut failed,
+                || Some(0),
+                |file, wanted, reserved| {
+                    calls += 1;
+                    p11scope_manifest::elf::read_export_facts_bounded(file, wanted, reserved)
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(calls, 1, "a failed parse still spends the window");
+        assert_eq!(failed.attempted_io_bytes(), 4096);
+        failed.finish_scan(scan).unwrap();
+        failed.finish_window(window).unwrap();
+    }
+
+    #[test]
+    fn inventory_export_rechecks_deadline_after_indivisible_dependency_work() {
+        let file = File::open("/bin/sh").unwrap();
+        let size = file.metadata().unwrap().len();
+        let mut budget = CaptureWorkBudget::for_inventory(inventory_limits(size, 2, 1, 1, 1, 1));
+        let window = budget.begin_window(WindowId::new(1), 5).unwrap();
+        let scan = budget.checkpoint(window.clone()).unwrap();
+        let mut clock = [Some(0), Some(5)].into_iter();
+        let mut calls = 0;
+
+        let error = read_inventory_export_facts_budgeted_with(
+            &file,
+            &[],
+            &mut budget,
+            || clock.next().unwrap(),
+            |file, wanted, reserved| {
+                calls += 1;
+                p11scope_manifest::elf::read_export_facts_bounded(file, wanted, reserved)
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, format!("read failed: {SCAN_DEADLINE_REASON}"));
+        assert_eq!(calls, 1, "the parser remains one indivisible work unit");
+        assert_eq!(
+            budget.attempted_io_bytes(),
+            size,
+            "deadline refusal does not refund the mapped-byte reservation"
+        );
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(window).unwrap();
+    }
+
+    #[test]
+    fn inventory_export_growth_after_reservation_is_refused_by_dependency_bound() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("growing.so");
+        std::fs::copy("/bin/sh", &path).unwrap();
+        let file = File::open(&path).unwrap();
+        let reserved = file.metadata().unwrap().len();
+        let mut budget =
+            CaptureWorkBudget::for_inventory(inventory_limits(reserved, 2, 1, 1, 1, 1));
+        let window = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = budget.checkpoint(window.clone()).unwrap();
+        let mut calls = 0;
+        let error = read_inventory_export_facts_budgeted_with(
+            &file,
+            &[],
+            &mut budget,
+            || Some(0),
+            |file, wanted, dependency_bound| {
+                calls += 1;
+                assert_eq!(dependency_bound, reserved);
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(&[0])
+                    .unwrap();
+                p11scope_manifest::elf::read_export_facts_bounded(file, wanted, dependency_bound)
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("reserved"), "{error}");
+        assert_eq!(calls, 1);
+        assert_eq!(budget.attempted_io_bytes(), reserved);
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(window).unwrap();
     }
 }

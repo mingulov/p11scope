@@ -1,7 +1,8 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 use object::elf;
 use p11scope_manifest::elf::{
-    ElfAbi, ElfSnapshot, entry_file_offset, exports_matching, read_export_facts, symbol_file_offset,
+    ElfAbi, ElfSnapshot, entry_file_offset, exports_matching, read_export_facts,
+    read_export_facts_bounded, symbol_file_offset,
 };
 use std::os::unix::fs::FileExt as _;
 use std::path::{Path, PathBuf};
@@ -738,6 +739,41 @@ fn export_facts_refuse_corrupt_tables_exactly_like_snapshot() {
         );
         assert_sparse_matches_oracle(&path, REGISTRY);
     }
+}
+
+#[test]
+fn bounded_export_facts_map_no_more_than_the_reserved_file_length() {
+    use std::io::Write as _;
+
+    let d = tmp("elf-export-facts-bounded");
+    let provider = cc_so(&d, "provider", provider_source());
+    let file = p11scope_manifest::identity::open_object(&provider).unwrap();
+    let reserved = file.metadata().unwrap().len();
+    let ordinary = read_export_facts(&file, REGISTRY).unwrap();
+    assert_eq!(
+        read_export_facts_bounded(&file, REGISTRY, reserved).unwrap(),
+        ordinary,
+        "an exact reservation preserves the existing export facts"
+    );
+    assert!(
+        read_export_facts_bounded(&file, REGISTRY, reserved - 1)
+            .unwrap_err()
+            .contains("reserved"),
+        "one byte over the reservation is refused before mapping"
+    );
+
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&provider)
+        .unwrap()
+        .write_all(&[0])
+        .unwrap();
+    assert!(
+        read_export_facts_bounded(&file, REGISTRY, reserved)
+            .unwrap_err()
+            .contains("reserved"),
+        "growth after reservation cannot enlarge the dependency mapping"
+    );
 }
 
 #[test]

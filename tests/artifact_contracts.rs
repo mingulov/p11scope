@@ -5208,6 +5208,14 @@ fn selection_transport_never_carries_name_bytes() {
 }
 
 #[test]
+fn image_identity_native_core_fixture_is_independent() {
+    run_native_python_suite(
+        "tests/python/test_image_identity_core.py",
+        "IdentityCoreTests",
+    );
+}
+
+#[test]
 fn image_identity_native_control_refuses_invalid_and_exhausted_tickets() {
     let directory = tempfile::tempdir().expect("temporary native identity test");
     let binary = directory.path().join("helper-tests");
@@ -9592,7 +9600,7 @@ fn aggregate_policy_returns_before_both_events_reserves() {
         "fork capture must stay disabled under aggregate policy"
     );
 
-    let native = read("crates/ebpf/native/image_identity.c");
+    let native = read("crates/ebpf/native/image_identity_fork.c");
     assert_eq!(
         native.matches("p11_link_emit_fork(").count(),
         2,
@@ -9623,8 +9631,8 @@ fn aggregate_policy_returns_before_both_events_reserves() {
 // - Markdown: `<!-- SPDX-License-Identifier: GPL-3.0-or-later -->` first line.
 // - C/C header: `/* SPDX-License-Identifier: ... */` first line,
 //   `GPL-2.0-only` under `crates/ebpf/native/` (matches the crates/ebpf
-//   manifest) and in `scripts/native/dump-task-storage.bpf.c` (Task 2
-//   ruling), `GPL-3.0-or-later` elsewhere.
+//   manifest), the native task-storage dump, and the identity-core canary;
+//   `GPL-3.0-or-later` elsewhere.
 //
 // Documented exemptions (each pinned below so it cannot silently rot):
 // (a) `CLAUDE.md` is a symlink to the headered `AGENTS.md`;
@@ -9708,6 +9716,7 @@ fn license_expected_header(path: &str) -> Option<&'static str> {
         }
         if path.starts_with("crates/ebpf/native/")
             || path == "scripts/native/dump-task-storage.bpf.c"
+            || path == "scripts/native/image-identity-core-canary.c"
         {
             return Some("/* SPDX-License-Identifier: GPL-2.0-only */");
         }

@@ -1,6 +1,7 @@
 /* Real typed birth hook calls real root propagation and identity helpers. */
 #include "root_affiliation.c"
 #include "image_identity.c"
+#include "image_identity_fork.c"
 #include <assert.h>
 #include <stdio.h>
 

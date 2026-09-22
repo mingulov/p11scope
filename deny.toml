@@ -1,0 +1,58 @@
+# cargo-deny policy (SYSPLAN residual F-27). The `checks-and-e2e` CI job runs
+# `cargo deny check`; a new license, a yanked/duplicate dependency, or an
+# unvetted source fails the gate until a human reviews it here.
+[graph]
+targets = [
+  { triple = "x86_64-unknown-linux-gnu" },
+  { triple = "x86_64-unknown-linux-musl" },
+  { triple = "bpfel-unknown-none" },
+]
+all-features = true
+
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+ignore = []
+
+[licenses]
+# Exactly the licenses in the tree today: a new license fails the gate
+# until a human allows it here.
+allow = [
+  "Apache-2.0",
+  "GPL-3.0-or-later",
+  "ISC",
+  "MIT",
+  "Unicode-3.0",
+  "Zlib",
+]
+confidence-threshold = 0.8
+exceptions = []
+
+[licenses.private]
+ignore = false
+registries = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+# Every path/git requirement carries an explicit version (Cargo.toml), so
+# `wildcards = deny` holds with an empty allowlist: any new `*` fails.
+allow = []
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# The only git dependency: rev-pinned PKCS #11 bindings, lockfile-pinned.
+allow-git = ["https://github.com/mingulov/pkcs11-components"]
+
+[sources.allow-org]
+github = []
+gitlab = []
+bitbucket = []

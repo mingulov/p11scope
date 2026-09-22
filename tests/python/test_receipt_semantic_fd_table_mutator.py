@@ -585,8 +585,8 @@ class SemanticTraceFdTableMutatorTests(unittest.TestCase):
         # Same exact table/pending/TID is the only idempotent retry; equal copied tables
         # are independent, while a shared-table alias is denied without mutation.
         state = seed_state()
-        root_pending = arm(state, dup2_operation())
-        peer_pending = arm(state, dup_operation(), tid=101)
+        arm(state, dup2_operation())
+        arm(state, dup_operation(), tid=101)
         root_table = state._task(100)["fds"]
         copied_table = state._task(102)["fds"]
         if root_table == copied_table and root_table is copied_table:
@@ -864,7 +864,7 @@ class SemanticTraceFdTableMutatorTests(unittest.TestCase):
         for handler_name in ("dup2", "dup"):
             state = seed_state()
             operation = dup2_operation() if handler_name == "dup2" else dup_operation()
-            pending = arm(state, operation)
+            arm(state, operation)
             before = snapshot(state)
             if handler_name == "dup2":
                 invoke = lambda: state.finish_dup2_syscall(tid=100, result=6, errno=None)

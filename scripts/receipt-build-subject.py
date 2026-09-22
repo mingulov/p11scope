@@ -1601,7 +1601,7 @@ def run_reconciled_build(
     stable_sysroot_root,
     nightly_sysroot_root,
     private_parent_fd: int,
-) -> "ProductionFreeze":
+) -> bytes:
     if (
         type(expected_ledger_fd) is not int
         or expected_ledger_fd < 0
@@ -1798,7 +1798,7 @@ def run_reconciled_build(
                     stage2_capability = True
                 else:
                     stage2_failure = MutationError("ledger duplication failed")
-            except Exception as exc:
+            except Exception:
                 stage2_failure = MutationError("ledger duplication failed")
             else:
                 if (
@@ -1823,7 +1823,7 @@ def run_reconciled_build(
                     stage2_capability = True
                 else:
                     stage2_failure = MutationError("private parent open failed")
-            except Exception as exc:
+            except Exception:
                 stage2_failure = MutationError("private parent open failed")
             else:
                 if (

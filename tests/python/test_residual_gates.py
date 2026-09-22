@@ -10,7 +10,6 @@ green by implementation, never by weakening.
 Run: python3 -I tests/python/test_residual_gates.py -v
 """
 
-import re
 import unittest
 from pathlib import Path
 

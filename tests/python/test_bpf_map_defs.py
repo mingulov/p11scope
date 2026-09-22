@@ -423,7 +423,6 @@ class MapDefsTests(unittest.TestCase):
             if node and node[0] == 1 and node[2] == 8 and node[5][0] >> 24 == 0
         )
 
-        ext_base = elf.sections[".BTF.ext"][0][4]
         ext = elf.sections[".BTF.ext"][1]
         hlen, off, length = struct.unpack_from("<III", ext, 4)
         pos = hlen + off

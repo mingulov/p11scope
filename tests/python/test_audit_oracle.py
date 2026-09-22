@@ -21,7 +21,6 @@ import contextlib
 import io
 import json
 import runpy
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -175,7 +174,6 @@ class OwnedCoverageTests(unittest.TestCase):
         # Admission alone is not coverage: the owned module is admitted
         # but every observed call is foreign-attributed or unattributable
         # (null module), so a large foreign total must still fail.
-        owned = {"dev": [8, 1], "ino": 11, "sha256": "aa"}
         foreign = {"dev": [8, 1], "ino": 12, "sha256": "bb"}
         with tempfile.TemporaryDirectory() as raw:
             record = run_measure(

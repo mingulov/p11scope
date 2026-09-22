@@ -3,9 +3,11 @@
 
 **Goal:** identify all used PKCS#11 providers in the supported observation
 envelope, with positive execution evidence, late discovery and sound lifecycle
-handling. Preserve detailed metrics/profile/trace and improve their scale and
-overhead separately. Reporting only the successfully observed subset without
-disclosing omissions does not satisfy the goal.
+handling. The live inventory must include callers and support selecting
+providers/callers for profiling or tracing while broad observation continues.
+Preserve detailed metrics/profile/trace and improve their scale and overhead
+separately. Reporting only the successfully observed subset without disclosing
+omissions does not satisfy the goal.
 
 **Status:** authorized full-system campaign, implementation in progress. Source
 baseline 7dee8b3; reviewed findings and live baseline are in
@@ -20,6 +22,15 @@ numeric performance success is claimed by this plan.
   an in-scope entry probe may change 0 to 1. Mapping and publication cannot.
   It reads no ordinary arguments, emits no per-call events, and promises no
   return, success, latency, cryptographic-operation or exact call-count fact.
+- That global bit is only one inventory component. The user's subsequent
+  caller requirement needs independent positive execution evidence for each
+  caller association, with generation/exec identity and explicit capacity/loss
+  accounting. A previously set global bit must not suppress discovery of a
+  different caller. Mapping presence cannot supply missing execution evidence.
+- Present currently mapped, observed execution, recent activity, and retained
+  historical use as distinct facts. A process identity is not a stack or an
+  application-level call graph. Define any recent-activity time window and
+  measurement cost before implementing it.
 - The capture-local endpoint ID is immutable and not serialized. Positive use
   survives unload, retirement, attribution changes and resource cleanup. No
   reuse or automatic detail promotion until a separate lifecycle proof exists.
@@ -27,8 +38,16 @@ numeric performance success is claimed by this plan.
   resource bounds. K4/K1 selection and fixture-specific pool names cannot be
   the production coverage policy. Every omitted required addition is a gap.
 - Scope filtering precedes the first update. Shared physical execution cannot
-  credit every possible logical publisher. No per-process attribution map or
-  raw PID/instance/address output is required for the brief inventory contract.
+  credit every possible logical publisher. Caller inventory has a separate
+  explicit output contract authorized by the user's 2026-09-22 clarification;
+  old profile/metrics schemas retain their existing privacy boundaries. No
+  command arguments, environment, stack contents, credentials, or raw internal
+  identity/address fields are implied by the request for callers.
+- Selected detail capture must leave broad observation running. Prefer
+  independent detail state and immutable attachment identities over mutating
+  inventory cookies or reclaiming cells without producer-quiescence proof.
+  A selection must bind physical provider and caller-generation identities,
+  reject stale/replaced targets, and preserve shared-target ambiguity.
 - Detailed-mode behavior remains unchanged until its separate reviewed changes.
   Optional filtered detail does not substitute for broad detailed-mode scaling.
 - Never equate entry-only ordinary probes with return-free discovery. Interface
@@ -93,6 +112,26 @@ refusal before updates. Prove ordinary inventory creates no START state, return
 links or events, and measure actual kernel map memory. Existing detailed object
 and schema gates remain required.
 
+### I2c: Add caller execution evidence
+
+The compile-only I2a object and I2b loader are enabling work, not a finished
+caller inventory. Review the sparse per-caller/provider mechanism before
+changing their entry path. Bind a caller to a kernel-derived process/image
+generation, preserve evidence through exit, and reconcile display metadata
+without assigning an old process's activity to a reused numeric PID.
+
+Budget active caller associations, retained history, first-observation
+transport, task identity and event loss separately. Do not use silent LRU
+eviction or an endpoint-by-CPU-by-caller matrix. Measure the required identity
+and lookup work on repeated calls as well as first use; the global eight-byte
+cell estimate is not the total cost of caller-aware inventory.
+
+Gate: two callers sharing an already-positive physical endpoint; multiple
+threads; exec and PID reuse; short-lived callers; namespace identity; shared
+targets; exhausted association/history/transport capacity; lost exit records;
+and preserved historical positives. No exact activity timestamp or call count
+may be derived from a one-time usage flag.
+
 ### I3: Add entry-only attachment and publication discovery
 
 Files: attach/run/safety and shared bounded discovery implementation. Singles
@@ -144,10 +183,22 @@ claim; another mapper retains observation. Incomplete reconciliation means
 unknown liveness. Historical positive use remains. Read usage at reporting
 cadence and termination, preserving the existing terminal uncertainty.
 
+Expose caller associations only under the separately reviewed inventory
+schema, with positive-use and mapping-only states distinguished. Bind detail
+selections to retained provider/caller identities and show when the selected
+target exits or changes. Starting/stopping selected profile/trace must neither
+stop system discovery nor erase inventory history; the detail session's own
+capacity and safety refusals remain visible.
+
 Gate: late load/use/unload/reload including a newly used endpoint after reload;
 two sharers; pathname replacement; delayed callbacks; closed-schema/canary
 mutations; real browser and multi-tenant provider workloads with independent
 physical receipts. Missing supported exercised providers fail acceptance.
+
+Also require live selection of a used provider/caller while a different
+provider arrives, and stopping that detail capture while inventory continues.
+Verify stale selections, two callers of one provider, exit/reload, and schema
+canaries. The selected detail view cannot substitute for broad coverage.
 
 Include immediate load → single use → unload without an observer attachment
 gate. Test both an already covered physical object and a never-seen object.

@@ -1535,7 +1535,7 @@ exit "$helper_status"
             self.assertIn(f"release_apply_success_{release_name}=1", facts)
             self.assertIn(f"release_deleted={release_name}", facts)
             self.assertIn(f"release_absent={release_name}", facts)
-            self.assertIn(f"release_redirects=1", facts)
+            self.assertIn("release_redirects=1", facts)
             self.assertIn(
                 f"release_effective=https://release-assets.githubusercontent.com/{release_name}",
                 facts,
@@ -2351,7 +2351,6 @@ exit "$helper_status"
             self.assert_process_absent(target["pid"], target["starttime"])
             self.assertIsNone(decoy.poll())
 
-            invalid_records = []
             unknown = target | {"owner": "unknown-owned-launch"}
             unknown["record_id"] = (
                 f"{unknown['owner']}:{unknown['kind']}:{unknown['pid']}:{unknown['starttime']}"

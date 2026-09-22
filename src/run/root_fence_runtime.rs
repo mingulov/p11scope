@@ -231,12 +231,14 @@ fn document(
             session.lifecycle_tracking_unavailable().is_some(),
         ),
         render::SchedulingEvidence::default(),
+        None,
+        None,
     );
     evidence.mark_terminal_drain_unproven();
     let kernel_release = std::fs::read_to_string("/proc/sys/kernel/osrelease")?;
     let output = render::profile_json(
         &reports,
-        &evidence,
+        render::VersionedEvidence::wrap(&evidence),
         state,
         &render::CaptureMeta {
             started: &fmt_rfc3339(started),

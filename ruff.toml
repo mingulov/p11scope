@@ -1,0 +1,16 @@
+# SYSPLAN residual F-63: lint ratchet over scripts/ and tests/python/.
+#
+# `select` is exactly the rule set that is clean today: E9 (syntax errors
+# can never land) plus all of pyflakes F (undefined names, unused
+# imports/variables — the F821/F401/F841/F541 cleanup that introduced this
+# file). Expand the select as files are cleaned (E7 next, then SIM/UP);
+# never shrink it. New code must be E9+F clean on arrival.
+#
+# E501 (line length) stays off deliberately: this tree writes long oracle
+# and ledger lines Rustfmt-style, not 88-column Python, and wrapping them
+# would churn every exact-string pin. Shell scripts are gated separately
+# by `shellcheck -S error` (see the lint job in ci.yml); the 100+ warning
+# findings are dominated by the deliberate T4_TOOL_* indirection idiom and
+# stay triage debt, not gate failures.
+[lint]
+select = ["E9", "F"]

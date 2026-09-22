@@ -36,6 +36,9 @@ pub(crate) struct Registry {
     root_completed: bool,
 }
 impl Registry {
+    // Legacy-ladder support only (SYSPLAN residual F-44): the production
+    // tracker always carries a live registry from `for_producer`.
+    #[cfg(test)]
     pub(crate) fn disabled() -> Self {
         Self {
             domain: None,

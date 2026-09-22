@@ -7181,7 +7181,67 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
     // A lane named anywhere but the checks job is refused rather than credited as
     // a full run: `hosted_full` feeds the `scope:` line, whose text is a claim
     // about THIS job, so the two must be scoped alike.
-    for line in ci.replacen(checks, "", 1).lines().map(str::trim) {
+    // SYSPLAN residual: three jobs outside the checks job may name lanes, each
+    // with its gate pinned. None runs on the push/PR success path (manual
+    // dispatch or post-failure evidence only), so the checks job's UNRUN and
+    // scope: claims keep their exact meaning. A new lane in any of these
+    // jobs, or a fourth lane-naming job, fails here until this table is
+    // taught about it first.
+    let manual_jobs: [(&str, &str, &[&str]); 3] = [
+        (
+            "privileged-e2e",
+            "github.event_name == 'workflow_dispatch'",
+            &["scripts/system-scope-measure.sh"],
+        ),
+        (
+            "release-preview",
+            "github.event_name == 'workflow_dispatch'",
+            &["scripts/build-release.sh"],
+        ),
+        (
+            "quarantine",
+            "if: failure()",
+            &["scripts/run-flake-quarantine.sh"],
+        ),
+    ];
+    let mut outside = ci.replacen(checks, "", 1);
+    for (job, gate, lanes) in manual_jobs {
+        let block = block_under(&ci, &format!("  {job}:"));
+        assert!(
+            block.contains(gate),
+            "{job} must carry its {gate} gate: without it the lane would run on the push/PR \
+             path and the checks job's UNRUN claim would be false",
+        );
+        for line in block.lines().map(str::trim) {
+            let line = line
+                .split_once(" #")
+                .map_or(line, |(code, _)| code.trim_end());
+            if line.starts_with('#') || !names_lane(line) {
+                continue;
+            }
+            for script in named_scripts(line) {
+                let dependency_only = dependency_helpers.contains(&script.as_str());
+                assert!(
+                    dependency_only || lanes.contains(&script.as_str()),
+                    "{job} names {script}, outside its documented lane set {lanes:?}: teach the \
+                     table about it first",
+                );
+            }
+        }
+        for lane in lanes {
+            assert!(
+                block.lines().map(str::trim).any(|line| {
+                    let line = line
+                        .split_once(" #")
+                        .map_or(line, |(code, _)| code.trim_end());
+                    !line.starts_with('#') && line.contains(lane)
+                }),
+                "{job} never names its documented lane {lane}: the table rotted",
+            );
+        }
+        outside = outside.replacen(block, "", 1);
+    }
+    for line in outside.lines().map(str::trim) {
         let line = line
             .split_once(" #")
             .map_or(line, |(code, _)| code.trim_end());
@@ -7747,6 +7807,11 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
             terminal_drain_bound: 65536,
             ..Default::default()
         },
+        drain_proven: false,
+        verdict_detail: p11scope::render::VERDICT_CONCRETE_GAP,
+        uretprobe_override: None,
+        handoff_child_pid: None,
+        p11scope_env: vec![],
         completeness: "UNKNOWN",
     };
     evidence.verdict();

@@ -6627,6 +6627,11 @@ fn evidence_verdict(
         provider_changed: false,
         discovery: discovery_evidence(plan, pinned, counters),
         scheduling: render::SchedulingEvidence::default(),
+        drain_proven: false,
+        verdict_detail: render::VERDICT_CONCRETE_GAP,
+        uretprobe_override: None,
+        handoff_child_pid: None,
+        p11scope_env: vec![],
         completeness: "UNKNOWN",
     };
     evidence.verdict();
@@ -16424,6 +16429,11 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
         provider_changed: false,
         discovery,
         scheduling: render::SchedulingEvidence::default(),
+        drain_proven: false,
+        verdict_detail: render::VERDICT_CONCRETE_GAP,
+        uretprobe_override: None,
+        handoff_child_pid: None,
+        p11scope_env: vec![],
         completeness: "UNKNOWN",
     };
     evidence.verdict();
@@ -16437,7 +16447,12 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
         drain_interval_ms: 1000,
     };
     let state = semantics::State::with_policy(&plan, CapturePolicy::Allowlisted);
-    let profile = render::profile_json(&[], &evidence, &state, &profile_capture);
+    let profile = render::profile_json(
+        &[],
+        render::VersionedEvidence::wrap(&evidence),
+        &state,
+        &profile_capture,
+    );
     let metrics_capture = render::CaptureMeta {
         policy: CapturePolicy::AggregateOnly,
         ..profile_capture

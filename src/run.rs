@@ -1498,10 +1498,7 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
         ScopeArg::System => (Scope::System, None),
     };
     if kind == Kind::Trace && a.duration.is_none() {
-        eprintln!(
-            "p11scope: no --duration given; trace streams until interrupted (Ctrl-C) or the \
-             process exits"
-        );
+        eprintln!("{}", no_duration_notice());
     }
     warn_unsafe_policy(policy);
     let accepted = preflight_uretprobe_hazard(
@@ -1511,7 +1508,13 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
         },
         a.allow_confined_uretprobe,
     )?;
-    let accepted_uretprobe_risk = accepted;
+    let accepted_uretprobe_risk = accepted.is_some();
+    // Durable, not just stderr (SYSPLAN residual F-01): the override flag +
+    // hazard reason travel with the evidence this capture renders.
+    let uretprobe_override = accepted.map(|reason| render::UretprobeOverride {
+        flag: "--allow-uretprobe-on-confined-target",
+        reason,
+    });
     // Before the discovery scan: a bad `-o` path must fail fast (F-Scale-6)
     // instead of after a scan — and still before any probe is on. The profile
     // sink stays an atomically-published temp file; opening it early only
@@ -1540,6 +1543,7 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
         None,
         a.drain_interval,
         a.ring_bytes,
+        uretprobe_override,
     )?;
     // `--pid` cannot read a non-child's exit status, so the honest report is
     // the pairing of two facts we do have: the target went away, and this
@@ -1555,6 +1559,17 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The no-duration notice (SYSPLAN residual F-17): "until interrupted" is
+/// only half the story — the event cap still applies, so the notice names
+/// the effective default rather than promising unbounded streaming.
+fn no_duration_notice() -> String {
+    format!(
+        "p11scope: no --duration given; trace streams until interrupted (Ctrl-C) or the \
+         process exits (event cap still applies: default {DEFAULT_TRACE_MAX_EVENTS} events, \
+         --max-events to change)"
+    )
 }
 
 fn capture_policy(kind: Kind, metrics: bool, unsafe_requested: bool) -> Result<CapturePolicy> {
@@ -1611,6 +1626,7 @@ fn run_loop(
     owned: Option<&mut Owned>,
     drain_interval: Option<Duration>,
     ring_bytes: Option<u32>,
+    uretprobe_override: Option<render::UretprobeOverride>,
 ) -> Result<render::Evidence> {
     report_attach_failures(session);
     let drain = resolve_drain_cadence(kind, drain_interval);
@@ -1631,6 +1647,7 @@ fn run_loop(
                 owned,
                 drain,
                 ring_bytes,
+                uretprobe_override,
             )?
         }
         Kind::Trace => {
@@ -1649,6 +1666,7 @@ fn run_loop(
                 interrupted,
                 owned,
                 drain,
+                uretprobe_override,
             )?
         }
     };
@@ -2148,7 +2166,13 @@ fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOut
     // attach, so no startup /proc reading can qualify it — only a kernel
     // proven to exempt the trampoline proceeds by default (F-01). An
     // initial unconfined status cannot qualify that future state.
-    preflight_uretprobe_hazard(None, args.allow_confined_uretprobe)?;
+    let uretprobe_override =
+        preflight_uretprobe_hazard(None, args.allow_confined_uretprobe)?.map(|reason| {
+            render::UretprobeOverride {
+                flag: "--allow-uretprobe-on-confined-target",
+                reason,
+            }
+        });
 
     let mut child = OwnedChild::spawn(program, command.collect())
         .map_err(|error| anyhow!("run: starting the owned child: {error}"))?;
@@ -2299,6 +2323,7 @@ fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOut
         Some(&mut owned),
         args.drain_interval,
         args.ring_bytes,
+        uretprobe_override,
     )
     .map_err(|error| {
         combine_handoff_failure(error, abort_pending_handoff(&mut owned.pending_handoff))
@@ -2318,6 +2343,13 @@ fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOut
     {
         eprintln!("p11scope: {explanation}");
     }
+    // A handed-back child is named on the terminal path (SYSPLAN residual
+    // F-15): the evidence already carries `handoff_child_pid`, and the
+    // operator reading stderr gets the same PID plus the handoff state.
+    // Still exit 0 — a deliberate handoff is observer success.
+    if owned.still_running {
+        eprintln!("{}", format_handoff_note(owned.pid));
+    }
     Ok(OwnedRunOutcome {
         child_exit_code: owned.exit_code,
         child_still_running: owned.still_running,
@@ -2336,15 +2368,15 @@ fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOut
 /// filter after exec, which is after attach, so there is nothing to read
 /// yet and only a proven-clean kernel proceeds. The death report stays as
 /// the second layer for override runs.
-fn preflight_uretprobe_hazard(target: Option<u32>, overridden: bool) -> Result<bool> {
+fn preflight_uretprobe_hazard(target: Option<u32>, overridden: bool) -> Result<Option<String>> {
     match uretprobe_hazard::evaluate(target, overridden) {
-        uretprobe_hazard::Action::Proceed => Ok(false),
+        uretprobe_hazard::Action::Proceed => Ok(None),
         uretprobe_hazard::Action::ProceedUnderOverride(reason) => {
             eprintln!(
                 "p11scope: WARNING: {reason}. Continuing because \
                  --allow-uretprobe-on-confined-target was given"
             );
-            Ok(true)
+            Ok(Some(reason.to_string()))
         }
         uretprobe_hazard::Action::Refuse(reason) => Err(anyhow!(
             "refusing to attach: {reason}. Re-run with \
@@ -2414,6 +2446,16 @@ fn format_attach_failure(slot: u32, message: &str) -> String {
     format!(
         "attach failed (slot {slot}): {}",
         render::escape_controls(message)
+    )
+}
+
+/// The live-handoff terminal note (SYSPLAN residual F-15): names the orphan
+/// PID plus the handoff state, so a duration expiry without
+/// `--kill-on-timeout` never exits 0 unnamed.
+fn format_handoff_note(pid: u32) -> String {
+    format!(
+        "p11scope: duration expired without --kill-on-timeout; handed back live child \
+         pid {pid} (handoff committed, still running outside this capture)"
     )
 }
 
@@ -3061,6 +3103,7 @@ fn capture_profile(
     mut owned: Option<&mut Owned>,
     drain: Duration,
     ring_bytes: Option<u32>,
+    uretprobe_override: Option<render::UretprobeOverride>,
 ) -> Result<render::Evidence> {
     // Opened by the caller before the attach; published by `commit()` only
     // once the final report is written.
@@ -3242,6 +3285,10 @@ fn capture_profile(
                 owned.as_deref().map(|owned| owned.still_running),
                 capture_tracking_degraded,
                 scheduling.snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64),
+                uretprobe_override.clone(),
+                owned
+                    .as_deref()
+                    .and_then(|owned| owned.still_running.then_some(owned.pid)),
             );
             let frame = render::live(
                 &reports,
@@ -3429,6 +3476,11 @@ fn capture_profile(
                         consumers
                             .scheduling
                             .snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64),
+                        uretprobe_override.clone(),
+                        context
+                            .2
+                            .as_deref()
+                            .and_then(|owned| owned.still_running.then_some(owned.pid)),
                     );
                     ev.mark_terminal_drain_unproven();
                     let facts = context.0.capture_facts();
@@ -3471,7 +3523,12 @@ fn capture_profile(
                             drain_interval_ms: drain.as_millis() as u64,
                         };
                         let j = if profile {
-                            render::profile_json(&reports, &ev, consumers.state, &capture)
+                            render::profile_json(
+                                &reports,
+                                render::VersionedEvidence::wrap(&ev),
+                                consumers.state,
+                                &capture,
+                            )
                         } else {
                             render::json(&reports, &ev, &capture)
                         };
@@ -3515,6 +3572,7 @@ fn capture_trace(
     interrupted: &SignalState,
     mut owned: Option<&mut Owned>,
     drain: Duration,
+    uretprobe_override: Option<render::UretprobeOverride>,
 ) -> Result<render::Evidence> {
     let trace_limit = resolve_trace_max_events(max_events);
     let mut remaining = Some(trace_limit);
@@ -3881,6 +3939,11 @@ fn capture_trace(
                         consumers
                             .scheduling
                             .snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64),
+                        uretprobe_override.clone(),
+                        context
+                            .2
+                            .as_deref()
+                            .and_then(|owned| owned.still_running.then_some(owned.pid)),
                     );
                     evidence.mark_terminal_drain_unproven();
                     if *consumers.malformed_records > 0 {
@@ -3894,6 +3957,7 @@ fn capture_trace(
                         policy,
                         trace_truncated,
                         trace_limit,
+                        max_events.is_some(),
                         &reports,
                         consumers.tracer.as_deref().expect("trace consumer"),
                         consumers.scheduling,
@@ -3969,6 +4033,7 @@ fn emit_trace_terminal_accounted<W: Write>(
     policy: CapturePolicy,
     trace_truncated: bool,
     trace_limit: u64,
+    trace_limit_explicit: bool,
     reports: &[metrics::SlotReport],
     tracer: &trace::Tracer,
     scheduling: &mut SchedulingAccumulator,
@@ -3978,7 +4043,7 @@ fn emit_trace_terminal_accounted<W: Write>(
 ) -> Result<()> {
     if trace_truncated {
         emit_trace_line(
-            &trace::truncated_line(trace_limit),
+            &trace::truncated_line(trace_limit, trace_limit_explicit),
             stdout,
             stdout_open,
             out_file,
@@ -4592,6 +4657,8 @@ fn evidence_for(
     child_still_running: Option<bool>,
     capture_tracking_degraded: bool,
     scheduling: render::SchedulingEvidence,
+    uretprobe_override: Option<render::UretprobeOverride>,
+    handoff_child_pid: Option<u32>,
 ) -> render::Evidence {
     let semantic = state.semantic_evidence();
     // The frozen consumer map (plan Task 8 Step 2), in one place:
@@ -4725,6 +4792,11 @@ fn evidence_for(
             .count(),
         discovery: facts.discovery().clone(),
         scheduling,
+        drain_proven: false,
+        verdict_detail: render::VERDICT_CONCRETE_GAP,
+        uretprobe_override,
+        handoff_child_pid,
+        p11scope_env: render::snapshot_process_env(),
         completeness: "UNKNOWN",
     };
     ev.verdict_with_selection(include_selection);
@@ -7611,6 +7683,8 @@ mod tests {
             None,
             false,
             scheduling,
+            None,
+            None,
         );
         evidence.mark_terminal_drain_unproven();
         evidence
@@ -7675,6 +7749,7 @@ mod tests {
             CapturePolicy::AggregateOnly,
             false,
             DEFAULT_TRACE_MAX_EVENTS,
+            false,
             &[],
             &tracer,
             &mut scheduling,
@@ -8178,6 +8253,8 @@ mod tests {
                 None,
                 false,
                 render::SchedulingEvidence::default(),
+                None,
+                None,
             )
         };
 
@@ -8272,6 +8349,8 @@ mod tests {
                     child_still_running,
                     false,
                     render::SchedulingEvidence::default(),
+                    None,
+                    None,
                 );
                 assert_eq!(evidence.pause, status);
                 assert_eq!(evidence.unprotected_live_windows, unprotected);
@@ -8341,6 +8420,8 @@ mod tests {
             None,
             false,
             render::SchedulingEvidence::default(),
+            None,
+            None,
         );
         let capture = render::CaptureMeta {
             started: "t0",
@@ -8391,6 +8472,8 @@ mod tests {
             None,
             true,
             render::SchedulingEvidence::default(),
+            None,
+            None,
         );
 
         assert_eq!(evidence.pid_descendant_gaps, 0);
@@ -9163,5 +9246,27 @@ mod correction1_tests {
             assert_eq!(c.vector(), (2, 0, 2, 0, 2, 0));
             assert_eq!(c.adapter.0.borrow().queries, 0);
         }
+    }
+
+    // SYSPLAN residual F-15 (GREEN): the handoff note names the orphan PID
+    // plus the handoff state.
+    #[test]
+    fn handoff_note_names_orphan_pid_and_state() {
+        let note = format_handoff_note(4242);
+        assert!(note.contains("4242"), "{note:?}");
+        assert!(note.contains("still running"), "{note:?}");
+        assert!(note.contains("--kill-on-timeout"), "{note:?}");
+    }
+
+    // SYSPLAN residual F-17 (GREEN): the no-duration notice names the
+    // effective default cap, derived from the constant, not a copy.
+    #[test]
+    fn no_duration_notice_names_effective_default_cap() {
+        let notice = no_duration_notice();
+        assert!(
+            notice.contains(&DEFAULT_TRACE_MAX_EVENTS.to_string()),
+            "{notice:?}"
+        );
+        assert!(notice.contains("--max-events"), "{notice:?}");
     }
 }

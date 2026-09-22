@@ -33,4 +33,9 @@ pub use run::{OwnedRunOutcome, capture, run_owned};
 pub static EBPF_OBJECT: &[u8] =
     aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/p11scope-ebpf"));
 
+/// Dedicated endpoint-use inventory object. It has no ordinary call event or
+/// return/latency state; loader preparation is a separate capability contract.
+pub static EBPF_INVENTORY_OBJECT: &[u8] =
+    aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/p11scope-ebpf-inventory"));
+
 pub(crate) mod history;

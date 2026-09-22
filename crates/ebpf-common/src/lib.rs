@@ -317,6 +317,69 @@ pub const FLAG_POLICY_ALLOWLISTED: u64 = 1 << 2;
 pub const FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA: u64 = 1 << 3;
 pub const FLAG_POLICY_AGGREGATE: u64 = 1 << 4;
 pub const FLAG_PAUSE_ENABLED: u64 = 1 << 5;
+/// Dedicated compact inventory object. Detailed objects deliberately reject it.
+pub const FLAG_POLICY_INVENTORY: u64 = 1 << 7;
+
+/// Inventory accepts one external scope and its own policy, without detail or pause.
+pub const fn valid_inventory_config(flags: u64) -> bool {
+    flags == (FLAG_POLICY_INVENTORY | FLAG_PID_FILTER)
+        || flags == (FLAG_POLICY_INVENTORY | FLAG_CGROUP_FILTER)
+        || flags == (FLAG_POLICY_INVENTORY | FLAG_SYSTEM_FILTER)
+}
+
+pub const INVENTORY_COOKIE_TAG: u32 = 0x5055_5347;
+pub const INVENTORY_USAGE_VERSION: u32 = 1;
+pub const INVENTORY_OWNER_LIMIT: u64 = 64;
+pub const USAGE_EVIDENCE_INVALID_CONFIG: u32 = 0;
+pub const USAGE_EVIDENCE_INVALID_COOKIE: u32 = 1;
+pub const USAGE_EVIDENCE_INVALID_STATE: u32 = 2;
+pub const USAGE_EVIDENCE_CELLS: u32 = 3;
+
+/// Loader publishes the checked runtime capacity before any links. USAGE map
+/// metadata must independently agree; this value does not allocate or budget it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InventoryUsageConfig {
+    pub version: u32,
+    pub endpoint_capacity: u32,
+}
+
+impl InventoryUsageConfig {
+    pub const fn is_valid(self) -> bool {
+        self.version == INVENTORY_USAGE_VERSION && self.endpoint_capacity != 0
+    }
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for InventoryUsageConfig {}
+
+/// The low word denotes a physical endpoint only after the exact tag and the
+/// approved runtime bound match. Zero is never an inventory cookie.
+pub const fn inventory_cookie_endpoint(cookie: u64, capacity: u32) -> Option<u32> {
+    let endpoint = cookie as u32;
+    if cookie >> 32 != INVENTORY_COOKIE_TAG as u64 || endpoint >= capacity {
+        None
+    } else {
+        Some(endpoint)
+    }
+}
+
+/// Shared monotonic decision with target-specific atomic operations supplied by
+/// the caller. `load` must be an aligned atomic load; `set_if_zero` must return
+/// the previous value from an atomic compare-exchange of exactly 0 to 1.
+/// No cell may be reset/reused within a retained session. A positive bit says
+/// an attached endpoint executed, without caller or provider-instance attribution.
+#[inline(always)]
+pub fn inventory_mark_used_with(
+    load: impl FnOnce() -> u64,
+    set_if_zero: impl FnOnce() -> u64,
+) -> bool {
+    match load() {
+        0 => matches!(set_if_zero(), 0 | 1),
+        1 => true,
+        _ => false,
+    }
+}
 
 /// A loaded program may observe only an explicitly selected scope under one
 /// immutable capture policy. Unknown and multi-bit configurations fail closed.
@@ -2431,3 +2494,6 @@ mod safe_capture {
         );
     }
 }
+
+#[cfg(test)]
+mod inventory_tests;

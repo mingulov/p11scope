@@ -4,10 +4,10 @@ use std::process::Command;
 #[test]
 fn production_task_owner_transactions_and_lifecycle() {
     let temporary = tempfile::tempdir().expect("native owner test directory");
-    for small in [false, true] {
+    for (small, inventory) in [(false, false), (true, false), (false, true), (true, true)] {
         let binary = temporary
             .path()
-            .join(if small { "small" } else { "normal" });
+            .join(format!("small-{small}-inventory-{inventory}"));
         let mut compiler = Command::new("clang-18");
         compiler
             .args([
@@ -24,6 +24,9 @@ fn production_task_owner_transactions_and_lifecycle() {
             .arg(&binary);
         if small {
             compiler.arg("-DP11SCOPE_SMALL_STATE_MAPS");
+        }
+        if inventory {
+            compiler.arg("-DP11SCOPE_INVENTORY_ONLY");
         }
         let output = compiler.output().expect("execute clang-18");
         assert!(

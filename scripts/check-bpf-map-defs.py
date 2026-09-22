@@ -408,7 +408,7 @@ DIAGNOSTIC_GLOBAL_HELPERS = frozenset({"p11_decode_params", "p11_walk_template"}
 
 
 def validate_private_helpers(elf, prefix, required, optional, label,
-                             global_helpers=frozenset(), required_map=None):
+                             global_helpers=frozenset(), required_map=None, inventory=False):
     """Verify exact native helper linkage, metadata, calls and map boundaries.
 
     Pointer-taking owner APIs stay LOCAL/STATIC; only the supplied scalar owner
@@ -438,6 +438,8 @@ def validate_private_helpers(elf, prefix, required, optional, label,
         if not size or value % 8 or size % 8 or value + size > len(elf.sections[".text"][1]):
             raise RuntimeError(f"{label} helper {name} has invalid/empty body")
     for name, location in EXACT_PROGRAM_SECTIONS.items():
+        if inventory and name == "task_newtask":
+            continue
         matches = [s for s in elf.symbols if s[0] == name]
         if (len(matches) != 1 or matches[0][1] != 0x12 or matches[0][2] != 0
                 or matches[0][3] != elf.indices.get(location)):
@@ -588,12 +590,14 @@ def validate_private_helpers(elf, prefix, required, optional, label,
                 )
 
 
-def validate_owner_helpers(elf):
+def validate_owner_helpers(elf, inventory=False):
     exported = (REQUIRED_GLOBAL_OWNER_HELPERS
                 if any(symbol[0] == "OWNER_CTL" for symbol in elf.symbols)
                 else frozenset())
-    validate_private_helpers(elf, "p11_owner_", REQUIRED_LOCAL_OWNER_HELPERS,
-                             OPTIONAL_LOCAL_OWNER_HELPERS, "owner", exported, "OWNER_CTL")
+    required = (REQUIRED_LOCAL_OWNER_HELPERS - {"p11_owner_start_get", "p11_owner_start_insert", "p11_owner_start_remove"}
+                if inventory else REQUIRED_LOCAL_OWNER_HELPERS)
+    validate_private_helpers(elf, "p11_owner_", required,
+                             OPTIONAL_LOCAL_OWNER_HELPERS, "owner", exported, "OWNER_CTL", inventory=inventory)
 
 
 def validate_ia32_span_paths(graph, entry, guard, rejected, read, updates, exits):
@@ -674,7 +678,7 @@ def validate_ia32_raw_span(insns, read):
     validate_ia32_span_paths(graph, 0, guard, guard + 1 + insns[guard][2], read, updates, exits)
 
 
-def validate_ia32_reader(elf):
+def validate_ia32_reader(elf, inventory=False):
     """Verify the scalar-only ia32 user-read boundary and one reachable call."""
     selected = [symbol for symbol in elf.symbols if symbol[0] == "p11_read_ia32_arg"]
     production = any(symbol[0] == "p11_entry" for symbol in elf.symbols)
@@ -848,7 +852,7 @@ def validate_ia32_reader(elf):
                     destination = (section_index, start + pos + (imm + 1) * 8)
                 if destination in bodies:
                     edges[section_index, start].add(destination)
-    root_name = ("p11_entry_ia32"
+    root_name = ("function_list_entry" if inventory else "p11_entry_ia32"
                  if any(candidate[0] == "p11_entry_ia32" for candidate in elf.symbols)
                  else "p11_entry")
     roots = [candidate for candidate in elf.symbols if candidate[0] == root_name]
@@ -871,7 +875,138 @@ def validate_root_helpers(elf):
     validate_private_helpers(elf, "p11_root_", REQUIRED_LOCAL_ROOT_HELPERS,
                              frozenset(), "root")
 
-def inspect(path, allowed_text_globals=frozenset()):
+def validate_inventory_usage_transition(elf, root, relocations):
+    """Pin the supported load/fast-path/CAS lowering, not a general interpreter."""
+    body = checked_slice(elf.sections["uprobe"][1], root[4], root[5], "usage root")
+    instructions = [struct.unpack_from("<BBhi", body, i) for i in range(0, len(body), 8)]
+    atomic = [i for i, (op, _, _, imm) in enumerate(instructions) if op == 0xdb and imm == 0xf1]
+    if len(atomic) != 1 or atomic[0] < 10:
+        raise RuntimeError("usage requires one conditional atomic compare-exchange")
+    at = atomic[0]
+    usage = relocations.get((root[3], root[4] + (at - 10) * 8))
+    if (not usage or usage[0] != 1 or usage[1][0] != "USAGE"
+            or instructions[at - 10][0] != 0x18
+            or instructions[at - 8] != (0x85, 0, 0, 1)
+            or instructions[at - 7][0:2] != (0x15, 0)
+            or instructions[at - 7][3] != 0):
+        raise RuntimeError("usage CAS requires the exact checked USAGE lookup")
+    load, positive, zero = instructions[at - 6:at - 3]
+    register = load[1] & 15
+    # R0 must retain the lookup pointer until the later pointer copy.
+    if (not 1 <= register <= 9 or load != (0x79, register, 0, 0)
+            or positive[0:2] != (0x15, register)
+            or positive[3] != 1 or zero[0:2] != (0x55, register) or zero[3] != 0
+            or at - 4 + 1 + zero[2] <= at):
+        raise RuntimeError("usage needs aligned u64 load and exact one/zero guards")
+    replacement, pointer, expected = instructions[at - 3:at]
+    replacement_register, pointer_register = replacement[1], pointer[1]
+    # Replacement must preserve R0; its pointer copy must preserve replacement.
+    # Neither operand may alias R0, which is then overwritten with expected zero.
+    if (replacement != (0xb7, replacement_register, 0, 1)
+            or not 1 <= replacement_register <= 9
+            or pointer != (0xbf, pointer_register, 0, 0)
+            or not 1 <= pointer_register <= 9
+            or replacement_register == pointer_register
+            or expected != (0xb7, 0, 0, 0)
+            or instructions[at] != (0xdb, replacement_register << 4 | pointer_register, 0, 0xf1)):
+        raise RuntimeError("usage atomic operation must compare zero and write one to the same cell")
+    # The already-positive path must reach exit without any map write, helper,
+    # or CAS. Only a zero return and forward jumps may remain in this lowering.
+    cursor, visited = at - 5 + 1 + positive[2], set()
+    while 0 <= cursor < len(instructions) and cursor not in visited:
+        visited.add(cursor)
+        instruction = instructions[cursor]
+        if instruction == (0x95, 0, 0, 0):
+            return
+        if instruction == (0xb7, 0, 0, 0):
+            cursor += 1
+        elif instruction[0:2] == (0x05, 0) and instruction[2] > 0 and instruction[3] == 0:
+            cursor += instruction[2] + 1
+        else:
+            break
+    raise RuntimeError("usage already-one path must return without a write or atomic operation")
+
+
+def validate_inventory_entry_reachability(elf):
+    """Bounded emitted-call-graph check; this is not verifier or branch proof.
+
+    Ordinary usage roots may only look up scope/config/use maps and call the
+    four scalar/scope helpers below. Discovery's legitimate user reads are
+    checked separately and are not reachable from these roots.
+    """
+    bodies = {(s[3], s[4]): s for s in elf.symbols if s[1] & 15 == 2 and s[5] and s[3]}
+    sections = {elf.indices[name]: raw for name, (_, raw) in elf.sections.items()}
+    relocations = {}
+    for row, raw in elf.sections.values():
+        if row[1] == 9 and row[7] in {key[0] for key in bodies}:
+            for offset in range(0, len(raw), 16):
+                address, info = struct.unpack_from("<QQ", raw, offset)
+                relocations[row[7], address] = (info & 0xffffffff, elf.symbols[info >> 32])
+    allowed_maps = {"CONFIG", "PID_FILTER", "CGROUP_FILTER", "OWNER_CTL", "EVIDENCE",
+                    "USAGE", "USAGE_CONFIG", "USAGE_EVIDENCE"}
+    reports = {}
+    for name in ("p11_usage_entry_lp64", "p11_usage_entry_ia32"):
+        roots = [s for s in elf.symbols if s[0] == name]
+        if len(roots) != 1 or roots[0][1:3] != (0x12, 0) or roots[0][3] != elf.indices.get("uprobe"):
+            raise RuntimeError(f"inventory requires exact GLOBAL DEFAULT uprobe {name}")
+        validate_inventory_usage_transition(elf, roots[0], relocations)
+        todo, seen = [(roots[0][3], roots[0][4])], set()
+        helpers, maps, compare_exchanges = set(), set(), 0
+        while todo:
+            key = todo.pop()
+            if key in seen:
+                continue
+            if key not in bodies:
+                raise RuntimeError("inventory entry has unresolved function call")
+            seen.add(key)
+            symbol = bodies[key]
+            body = checked_slice(sections[key[0]], key[1], symbol[5], "inventory entry function")
+            for offset in range(0, len(body), 8):
+                op, registers, _, immediate = struct.unpack_from("<BBhi", body, offset)
+                relocation = relocations.get((key[0], key[1] + offset))
+                if op == 0x18 and relocation:
+                    target = relocation[1]
+                    map_name = target[0]
+                    if target[1] & 15 == 3:  # Native LOCAL map: section plus LDDW addend.
+                        high = struct.unpack_from("<I", body, offset + 12)[0]
+                        address = target[4] + (immediate & 0xffffffff) + (high << 32)
+                        matches = [candidate[0] for candidate in elf.symbols
+                                   if candidate[1] & 15 == 1 and candidate[3] == target[3]
+                                   and candidate[4] == address]
+                        map_name = matches[0] if len(matches) == 1 else ""
+                    if relocation[0] != 1 or map_name not in allowed_maps:
+                        raise RuntimeError(f"inventory entry reaches forbidden map/global {map_name!r}")
+                    maps.add(map_name)
+                if op == 0x85:
+                    if registers == 0:
+                        if immediate not in {1, 14, 37, 174}:
+                            raise RuntimeError(f"inventory entry reaches forbidden helper {immediate}")
+                        helpers.add(immediate)
+                    elif registers == 0x10:
+                        if relocation and relocation[0] == 10:
+                            todo.append((relocation[1][3], relocation[1][4] + (immediate + 1) * 8))
+                        elif relocation:
+                            raise RuntimeError("inventory entry has unknown call relocation")
+                        else:
+                            todo.append((key[0], key[1] + offset + (immediate + 1) * 8))
+                    else:
+                        raise RuntimeError("inventory entry has unsupported call kind")
+                if op == 0xdb and immediate == 0xf1:
+                    compare_exchanges += 1
+        required_maps = {"CONFIG", "OWNER_CTL", "USAGE", "USAGE_CONFIG", "USAGE_EVIDENCE"}
+        if not required_maps <= maps or not {1, 14, 174} <= helpers:
+            raise RuntimeError(f"inventory entry missing scope/config/use dependencies: {name}")
+        if not compare_exchanges:
+            raise RuntimeError(f"inventory entry missing atomic compare-exchange: {name}")
+        reports[name] = {"functions": len(seen), "maps": sorted(maps),
+                         "helpers": sorted(helpers), "compare_exchanges": compare_exchanges}
+    return reports
+
+
+def inspect(path, allowed_text_globals=frozenset(), *, variant="default"):
+    if variant not in FROZEN_INVENTORY:
+        raise RuntimeError(f"unknown object variant {variant!r}")
+    inventory = variant.startswith("inventory")
     elf = Elf(Path(path).read_bytes())
     records, sections = elf_records(path)
     if records != elf.records or {name: index for name, index in sections.items() if index} != elf.indices:
@@ -898,16 +1033,21 @@ def inspect(path, allowed_text_globals=frozenset()):
         btf = Btf(elf.sections[".BTF"][1])
         if any(node[0] == 15 and node[1] == ".maps" for node in btf.types[1:]):
             raise RuntimeError("native BTF DATASEC missing ELF .maps section")
-    validate_ia32_reader(elf)
-    validate_owner_helpers(elf)
-    validate_root_helpers(elf)
-    return maps, classify(records, sections, allowed_text_globals | REQUIRED_GLOBAL_HELPERS
-                          | REQUIRED_GLOBAL_OWNER_HELPERS | REQUIRED_GLOBAL_SCALAR_HELPERS), {
+    validate_ia32_reader(elf, inventory)
+    validate_owner_helpers(elf, inventory)
+    if not inventory:
+        validate_root_helpers(elf)
+    else:
+        validate_inventory_entry_reachability(elf)
+    image_helpers = frozenset() if inventory else REQUIRED_GLOBAL_HELPERS
+    return maps, classify(records, sections, allowed_text_globals | image_helpers
+                          | REQUIRED_GLOBAL_OWNER_HELPERS | REQUIRED_GLOBAL_SCALAR_HELPERS,
+                          inventory=inventory), {
         record[-1] for record in records
     }
 
 
-def classify(records, sections, allowed_text_globals=frozenset()):
+def classify(records, sections, allowed_text_globals=frozenset(), *, inventory=False):
     """Return the object's BPF program names, refusing what cannot be classified.
 
     A program emitted under an attach type the whitelist does not name (`raw_tp/`,
@@ -954,7 +1094,7 @@ def classify(records, sections, allowed_text_globals=frozenset()):
         raise RuntimeError(f"global functions in unclassified sections: {name} in {location}")
     # Generic fixtures need no production helpers. A production hook or helper
     # selects the complete exact export contract, independent of program counts.
-    if programs & EXACT_PROGRAM_SECTIONS.keys() or helpers & REQUIRED_GLOBAL_HELPERS:
+    if not inventory and (programs & EXACT_PROGRAM_SECTIONS.keys() or helpers & REQUIRED_GLOBAL_HELPERS):
         missing = REQUIRED_GLOBAL_HELPERS - helpers
         if missing:
             raise RuntimeError(f"missing required .text helpers: {sorted(missing)}")
@@ -1024,7 +1164,26 @@ UNSAFE_PROGRAMS = SAFE_PROGRAMS | {
 }
 
 
+INVENTORY_MAPS = {name: SAFE_MAPS[name] for name in (
+    "CONFIG", "PID_FILTER", "CGROUP_FILTER", "TAIL_CALLS", "EVIDENCE", "COUNTERS",
+    "DISCOVERY", "DISCOVERY_STATE", "THREAD_OWNER", "OWNER_CTL",
+)} | {
+    "USAGE": map_def(2, 4, 8, 1),
+    "USAGE_CONFIG": map_def(2, 4, 8, 1, 128),
+    "USAGE_EVIDENCE": map_def(6, 4, 8, 3),
+}
+INVENTORY_PROGRAMS = (SAFE_PROGRAMS - {"p11_entry", "p11_return", "task_newtask"}) | {
+    "p11_usage_entry_lp64", "p11_usage_entry_ia32",
+}
+INVENTORY_FORBIDDEN_MAPS = {
+    "STATS", "START", "RV_COUNTS", "EVENTS", "DESCRIPTORS", "MECH_SHAPE",
+    "ASYNC_FUNCTIONS", "ATTR_BOOL_BITS", "PAUSE_PIDS", "TASK_COOKIE", "COOKIE_CTL",
+    "ROOT_AFFILIATION", "ROOT_CTL",
+}
+
 FROZEN_INVENTORY = {
+    "inventory": (INVENTORY_MAPS, INVENTORY_PROGRAMS),
+    "inventory-small-discovery": (INVENTORY_MAPS | {"DISCOVERY": map_def(27, 0, 0, 4096)}, INVENTORY_PROGRAMS),
     "default": (SAFE_MAPS, SAFE_PROGRAMS),
     "diagnostic": (UNSAFE_MAPS, UNSAFE_PROGRAMS),
 }
@@ -1036,6 +1195,8 @@ FROZEN_INVENTORY = {
 # The diagnostic object carries two ABI-specialized local implementations under
 # each global boundary, plus two ABI-specialized local types-only walkers.
 FROZEN_SYMBOLS = {
+    "inventory": (False, False, 0, 0, 0),
+    "inventory-small-discovery": (False, False, 0, 0, 0),
     "default": (False, False, 0, 0, 0),
     "diagnostic": (True, True, 2, 2, 2),
 }
@@ -1065,7 +1226,15 @@ def validate_inventory(variant, maps, programs, symbols):
         for name in sorted(frozen_programs - programs):
             print(f"program removed: {name}", file=sys.stderr)
         raise RuntimeError(f"{variant} program inventory differs")
-    missing_helpers = REQUIRED_GLOBAL_HELPERS - symbols
+    inventory = variant.startswith("inventory")
+    if inventory:
+        forbidden = {name for name in symbols if name in INVENTORY_FORBIDDEN_MAPS
+                     or name.startswith(("p11_owner_start_", "p11_link_", "p11_root_"))}
+        if forbidden:
+            raise RuntimeError(f"inventory contains forbidden detailed symbols: {sorted(forbidden)}")
+    required_helpers = (REQUIRED_GLOBAL_OWNER_HELPERS | REQUIRED_GLOBAL_SCALAR_HELPERS
+                        if inventory else REQUIRED_GLOBAL_HELPERS)
+    missing_helpers = required_helpers - symbols
     if missing_helpers:
         raise RuntimeError(f"missing required .text helpers: {sorted(missing_helpers)}")
     found = (
@@ -1240,7 +1409,7 @@ def self_test():
 def usage():
     return (
         f"usage: {sys.argv[0]} BPF_ELF MAP=MAX_ENTRIES [...] | "
-        "--inventory default|diagnostic BPF_ELF | "
+        "--inventory default|diagnostic|inventory|inventory-small-discovery BPF_ELF | "
         "--policy-inventory DEFAULT_ELF DIAGNOSTIC_ELF | --json BPF_ELF | --self-test"
     )
 
@@ -1265,7 +1434,7 @@ def main():
         # classification; the per-variant symbol freeze below still rejects
         # either helper in a default object. This lets the cross-variant
         # negative control reach the requested inventory comparison.
-        maps, programs, symbols = inspect(path, DIAGNOSTIC_GLOBAL_HELPERS)
+        maps, programs, symbols = inspect(path, DIAGNOSTIC_GLOBAL_HELPERS, variant=variant)
         validate_inventory(variant, maps, programs, symbols)
         print(f"inventory {variant}: maps={len(maps)} programs={len(programs)} OK")
         return

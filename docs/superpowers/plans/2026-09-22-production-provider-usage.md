@@ -69,6 +69,16 @@ numeric performance success is claimed by this plan.
   reject stale PID/exec identities, handle cgroup membership changes, and preserve
   provider selection across late discovery without widening the selected scope.
   System-wide throughput results alone do not establish these isolation rules.
+- Scoped operation is a collection policy, not just an output filter. Prefer
+  PID-specific probe attachment where its kernel semantics are adequate, and
+  otherwise reject out-of-scope calls at the BPF entry gate before argument
+  reads, pairing state, caller/use updates or event emission. Cgroup membership
+  checks belong in that early gate. PID and owned `run` discovery must avoid a
+  whole-system scan; cgroup discovery considers the selected subtree. Preserve
+  `run`'s explicit descendant policy. Select provider endpoints before detailed
+  probe installation. Where shared lifecycle hooks are necessary, bound their
+  work and disclose its cost; collecting every payload for later userspace
+  rejection does not satisfy this requirement.
 - Selected detail capture must leave broad observation running. Prefer
   independent detail state and immutable attachment identities over mutating
   inventory cookies or reclaiming cells without producer-quiescence proof.

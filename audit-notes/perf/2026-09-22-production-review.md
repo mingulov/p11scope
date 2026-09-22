@@ -60,6 +60,23 @@ One system run took roughly 5.6 s discovery, 14.9 s load/attach, 8 s capture and
 6.7 s detach, with about 25.9 s observer CPU and 272 MB peak RSS. These are one
 run's externally derived phase estimates, not a performance distribution or SLO.
 
+An owned Fedora 44 VM reproduced the admission problem independently of the
+host's discovery-ring overflow. The guest ran kernel 6.19.10-300.fc44.x86_64,
+glibc 2.43-8 and NSS 3.129.0. Chrome for Testing 153.0.8010.52 retained its
+sandbox, used a private NSS database, and connected only to an owned loopback
+server requiring a generated client certificate. The server recorded five
+successful, non-resumed TLS connections during the attached system capture.
+
+The same frozen observer again allocated 478/512 endpoints and refused
+`/usr/lib64/libsoftokn3.so` because its 68 endpoints did not fit. Both discovery
+and CALL-ring loss were zero. The report's 108 positive calls belonged to the
+physical p11-kit trust object, across three unnamed rows; they do not establish
+NSS coverage. The browser/server ledger proves application work, not an exact
+PKCS#11 call denominator or an independently pinned softokn execution receipt.
+Artifacts are in `browser-vm/artifacts/browser-system-baseline/` and
+`browser-vm/artifacts/system-baseline-driver.json` under the evidence directory.
+This is a functional admission experiment, not a timing benchmark.
+
 ## Independent reviews and cross-checks
 
 An Astra Max source review covered discovery/admission, lifecycle, event

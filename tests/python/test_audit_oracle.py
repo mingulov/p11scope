@@ -48,11 +48,25 @@ def run_measure(tmp, *, scope, mode, workload_argv, report_text,
         "seed": 1, "n_calls": sum(truth.values()), "pace_us": 0,
     }
     if receipt is not None:
-        condition["workload_module_identity"] = [
-            {**entry, "report_identity_associated":
-             entry.get("report_identity_associated", True)}
-            for entry in receipt
-        ]
+        identities = []
+        for entry in receipt:
+            value = {**entry, "report_identity_associated":
+                     entry.get("report_identity_associated", True)}
+            if value["report_identity_associated"] is True:
+                value.setdefault("report_identity_bridge", {
+                    "schema": "p11scope/map-files-mountinfo-bridge/v1",
+                    "kind": "map_files_fdinfo_target_mountinfo",
+                    "mapping_identity": {
+                        "dev": value["dev"], "ino": value["ino"]},
+                    "opened_mapping_identity": {
+                        "mount_id": 17, "dev": value["dev"],
+                        "ino": value["ino"]},
+                    "opened_file_identity": {
+                        "dev": [0, 44], "ino": value["ino"],
+                        "sha256": value["sha256"]},
+                })
+            identities.append(value)
+        condition["workload_module_identity"] = identities
     meta = {
         "condition": condition,
         "timing": {"t_spawn_mono_ns": 0, "t_exit_mono_ns": 12_000_000_000,

@@ -125,9 +125,20 @@ def profile_report(*, functions, discovery, skipped=(), probes=2, slots=1):
 
 
 def owned_receipt(*, associated=True):
-    return [{"dev": [8, 1], "ino": 11, "sha256": "aa",
-             "path": "/w/owned.so",
-             "report_identity_associated": associated}]
+    receipt = {"dev": [8, 1], "ino": 11, "sha256": "aa",
+               "path": "/w/owned.so",
+               "report_identity_associated": associated}
+    if associated:
+        receipt["report_identity_bridge"] = {
+            "schema": "p11scope/map-files-mountinfo-bridge/v1",
+            "kind": "map_files_fdinfo_target_mountinfo",
+            "mapping_identity": {"dev": [8, 1], "ino": 11},
+            "opened_mapping_identity": {
+                "mount_id": 17, "dev": [8, 1], "ino": 11},
+            "opened_file_identity": {
+                "dev": [0, 44], "ino": 11, "sha256": "aa"},
+        }
+    return [receipt]
 
 
 def trace_report(*, stats_returned, raw_calls, discovery, probes=2):
@@ -362,6 +373,24 @@ class IdentityTests(unittest.TestCase):
         self.assertFalse(record["window"]["window_valid"])
         self.assertIn("opened-object association",
                       record["truth_vs_observed"]["match_note"])
+
+    def test_missing_or_forged_bridge_cannot_authorize_report_rows(self):
+        matching_functions = [{"names": ["unknown"], "calls": 7,
+                               "module": {"dev": [8, 1], "ino": 11,
+                                          "sha256": "aa"}}]
+        matching_discovery = [{"path": "/w/owned.so", "dev": [8, 1],
+                               "ino": 11, "sha256": "aa", "tables": [{}]}]
+        missing = owned_receipt()[0]
+        del missing["report_identity_bridge"]
+        forged = owned_receipt()[0]
+        forged["report_identity_bridge"]["opened_mapping_identity"]["dev"] = [8, 2]
+        for name, receipt in (("missing", missing), ("forged", forged)):
+            with self.subTest(name=name):
+                result = self.assess(matching_functions, matching_discovery,
+                                     receipts=[receipt])
+                self.assertIsNone(result["owned_admitted"])
+                self.assertIsNone(result["owned_calls"])
+                self.assertIn("opened-object association", result["note"])
 
     def test_alternate_path_to_the_same_inode_is_owned(self):
         result = self.assess(

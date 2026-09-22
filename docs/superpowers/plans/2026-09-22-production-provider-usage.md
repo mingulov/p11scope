@@ -14,6 +14,10 @@ baseline 7dee8b3; reviewed findings and live baseline are in
 `audit-notes/perf/2026-09-22-production-review.md`. No release qualification or
 numeric performance success is claimed by this plan.
 
+The prioritized regression, kernel experiment and benchmark queue is in
+[the eBPF quality test plan](2026-09-22-ebpf-quality-tests.md). Its proposed
+cells are not completed gates; acceptance requires their recorded live evidence.
+
 ## Controlling decisions
 
 - The user's latest priority is the low-level BPF and communication core first:

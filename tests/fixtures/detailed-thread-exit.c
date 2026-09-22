@@ -92,10 +92,69 @@ static void receive(int fd, char expected, unsigned long seconds) {
     }
 }
 
+static inline void kernel_join(int *child_tid) {
+    unsigned long deadline = clock_ns() + 30000000000UL;
+    for (;;) {
+        int observed = __atomic_load_n(child_tid, __ATOMIC_ACQUIRE);
+        if (observed == 0) return;
+        unsigned long now = clock_ns();
+        if (now >= deadline) fail(98);
+        unsigned long remaining = deadline - now;
+        struct timespec timeout = {
+            .tv_sec = (long)(remaining / 1000000000UL),
+            .tv_nsec = (long)(remaining % 1000000000UL)
+        };
+        /* clear_child_tid wakes shared futex waiters, not FUTEX_WAIT_PRIVATE. */
+        long result = raw6(SYS_futex, (long)child_tid, FUTEX_WAIT, observed,
+                           (long)&timeout, 0, 0);
+        if (result != 0 && result != -EAGAIN && result != -EINTR) fail(99);
+    }
+}
+
+#ifdef DETAILED_SIBLING_EXIT
+/* Only the kernel writes the child_tid terminal zero. The other two cells
+ * are private 0->1 handshakes, published with release and read with acquire.
+ */
+struct sibling_sync {
+    _Alignas(4) int worker_ready;
+    _Alignas(4) int worker_exit;
+    int *child_tid;
+    int worker_tid;
+};
+
+static inline void publish(int *cell) {
+    __atomic_store_n(cell, 1, __ATOMIC_RELEASE);
+    if (raw6(SYS_futex, (long)cell, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0) < 0) fail(100);
+}
+
+static void await_one(int *cell) {
+    unsigned long deadline = clock_ns() + 30000000000UL;
+    for (;;) {
+        int observed = __atomic_load_n(cell, __ATOMIC_ACQUIRE);
+        if (observed == 1) return;
+        if (observed != 0) fail(101);
+        unsigned long now = clock_ns();
+        if (now >= deadline) fail(102);
+        unsigned long remaining = deadline - now;
+        struct timespec timeout = {
+            .tv_sec = (long)(remaining / 1000000000UL),
+            .tv_nsec = (long)(remaining % 1000000000UL)
+        };
+        long result = raw6(SYS_futex, (long)cell, FUTEX_WAIT_PRIVATE, 0,
+                           (long)&timeout, 0, 0);
+        if (result != 0 && result != -EAGAIN && result != -EINTR) fail(103);
+    }
+}
+#endif
+
 struct request {
     unsigned long rv;
     int abandon;
     int exit_gate;
+#ifdef DETAILED_SIBLING_EXIT
+    struct sibling_sync *sibling;
+    int hold_leader;
+#endif
 };
 
 #ifdef DETAILED_THREAD_EXIT_PROVIDER
@@ -110,11 +169,35 @@ unsigned long C_Initialize(void *argument) {
             (unsigned long)raw6(SYS_gettid, 0, 0, 0, 0, 0, 0)
         };
         emit("BODY", fields, 2);
+#ifdef DETAILED_SIBLING_EXIT
+        /* BODY is fully written before the leader can enter its held call. */
+        publish(&request->sibling->worker_ready);
+        await_one(&request->sibling->worker_exit);
+#else
         receive(request->exit_gate, 'X', 30);
+#endif
         /* The actual probed frame does not return. This is per-thread exit. */
         (void)raw6(SYS_exit, 0, 0, 0, 0, 0, 0);
         fail(95);
     }
+#ifdef DETAILED_SIBLING_EXIT
+    if (request->hold_leader) {
+        struct sibling_sync *sync = request->sibling;
+        unsigned long pid = (unsigned long)raw6(SYS_getpid, 0, 0, 0, 0, 0, 0);
+        unsigned long fields[] = { pid, (unsigned long)raw6(SYS_gettid, 0, 0, 0, 0, 0, 0) };
+        emit("LEADER_BODY", fields, 2);
+        /* This leader is the only stdin reader throughout the sibling case. */
+        receive(0, 'X', 30);
+        publish(&sync->worker_exit);
+        kernel_join(sync->child_tid);
+        unsigned long exited[] = {
+            pid, (unsigned long)sync->worker_tid,
+            (unsigned long)__atomic_load_n(sync->child_tid, __ATOMIC_ACQUIRE)
+        };
+        emit("EXITED", exited, 3);
+        receive(0, 'L', 30);
+    }
+#endif
     return request->rv;
 }
 
@@ -133,6 +216,9 @@ typedef unsigned long (*call_fn)(void *);
 struct worker_args {
     call_fn call;
     int go;
+#ifdef DETAILED_SIBLING_EXIT
+    struct sibling_sync *sibling;
+#endif
 };
 
 static void calls(call_fn call, unsigned long count, const char *phase) {
@@ -157,27 +243,11 @@ static int worker(void *argument) {
     receive(args->go, 'W', 30);
     calls(args->call, 11, "WORKER_DONE");
     struct request abandoned = { .rv = 777, .abandon = 1, .exit_gate = 0 };
+#ifdef DETAILED_SIBLING_EXIT
+    abandoned.sibling = args->sibling;
+#endif
     (void)args->call(&abandoned);
     fail(97);
-}
-
-static void kernel_join(int *child_tid) {
-    unsigned long deadline = clock_ns() + 30000000000UL;
-    for (;;) {
-        int observed = __atomic_load_n(child_tid, __ATOMIC_ACQUIRE);
-        if (observed == 0) return;
-        unsigned long now = clock_ns();
-        if (now >= deadline) fail(98);
-        unsigned long remaining = deadline - now;
-        struct timespec timeout = {
-            .tv_sec = (long)(remaining / 1000000000UL),
-            .tv_nsec = (long)(remaining % 1000000000UL)
-        };
-        /* clear_child_tid wakes shared futex waiters, not FUTEX_WAIT_PRIVATE. */
-        long result = raw6(SYS_futex, (long)child_tid, FUTEX_WAIT, observed,
-                           (long)&timeout, 0, 0);
-        if (result != 0 && result != -EAGAIN && result != -EINTR) fail(99);
-    }
 }
 
 int main(int argc, char **argv) {
@@ -207,19 +277,45 @@ int main(int argc, char **argv) {
     if (pipe(go)) return 9;
     struct worker_args args = { .call = call, .go = go[0] };
     _Alignas(4) int child_tid = -1;
+#ifdef DETAILED_SIBLING_EXIT
+    struct sibling_sync sync = { .child_tid = &child_tid };
+    args.sibling = &sync;
+#endif
     int flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD
               | CLONE_SYSVSEM | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID;
     int tid = clone(worker, stack + page + stack_size, flags, &args, &child_tid, NULL, &child_tid);
     if (tid <= 0 || __atomic_load_n(&child_tid, __ATOMIC_ACQUIRE) != tid) return 10;
+#ifdef DETAILED_SIBLING_EXIT
+    sync.worker_tid = tid;
+#endif
     unsigned long started[] = { pid, (unsigned long)tid, (unsigned long)child_tid };
     emit("THREAD", started, 3);
     write_all(go[1], "W", 1);
 
+#ifdef DETAILED_SIBLING_EXIT
+    await_one(&sync.worker_ready);
+    struct request held = { .rv = 0, .sibling = &sync, .hold_leader = 1 };
+    unsigned long held_rv = call(&held);
+    if (held_rv != 0) fail(104);
+    /* Count the checked held return, then preserve the complete 17-call
+     * alternating sequence by starting the remaining calls at index one. */
+    unsigned long success = 1, error = 0;
+    for (unsigned long i = 1; i < 17; ++i) {
+        struct request request = { .rv = (i & 1) ? 5 : 0 };
+        unsigned long rv = call(&request);
+        if (rv != request.rv) fail(105);
+        if (rv == 0) ++success;
+        else ++error;
+    }
+    unsigned long completed[] = { pid, pid, 17, success, error };
+    emit("LEADER_DONE", completed, 5);
+#else
     kernel_join(&child_tid);
     unsigned long exited[] = { pid, (unsigned long)tid, (unsigned long)__atomic_load_n(&child_tid, __ATOMIC_ACQUIRE) };
     emit("EXITED", exited, 3);
     receive(0, 'L', 30);
     calls(call, 17, "LEADER_DONE");
+#endif
     receive(0, 'F', 30);
     /* Retain stack, shared arguments and provider until the entire protocol ends. */
     if (munmap(stack, allocation) || close(go[0]) || close(go[1]) || dlclose(provider)) return 11;

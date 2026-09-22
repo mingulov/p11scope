@@ -1,5 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
-//! One owned Detailed lifecycle gate and its unprivileged fixture protocol.
+//! Owned Detailed lifecycle gates and their unprivileged fixture protocols.
 //! Explicitly selected ignored gates fail on unavailable kernel support.
 
 use super::*;
@@ -27,10 +27,19 @@ struct Fixture {
     _directory: tempfile::TempDir,
     provider: PathBuf,
     driver: PathBuf,
+    sibling: bool,
 }
 
 impl Fixture {
     fn build() -> Result<Self> {
+        Self::build_variant(false)
+    }
+
+    fn build_sibling() -> Result<Self> {
+        Self::build_variant(true)
+    }
+
+    fn build_variant(sibling: bool) -> Result<Self> {
         let directory = tempfile::tempdir()?;
         let source = directory.path().join("thread-exit.c");
         std::fs::write(
@@ -51,6 +60,9 @@ impl Fixture {
                 "-fno-stack-protector",
                 "-fno-omit-frame-pointer",
             ]);
+            if sibling {
+                compiler.arg("-DDETAILED_SIBLING_EXIT");
+            }
             if is_provider {
                 compiler.args(["-fPIC", "-shared", "-DDETAILED_THREAD_EXIT_PROVIDER"]);
             }
@@ -72,6 +84,7 @@ impl Fixture {
             _directory: directory,
             provider,
             driver,
+            sibling,
         })
     }
 
@@ -102,6 +115,7 @@ impl Fixture {
             birth,
             last_ns: 0,
             lines: 0,
+            max_lines: if self.sibling { 7 } else { 6 },
         };
         let fields = caller.record("READY", 4)?;
         let metadata = std::fs::metadata(&self.provider)?;
@@ -218,6 +232,7 @@ struct Caller {
     birth: u64,
     last_ns: u64,
     lines: usize,
+    max_lines: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -299,7 +314,10 @@ impl Caller {
         let text = String::from_utf8(bytes)?;
         eprintln!("LIFECYCLE_FIXTURE {text}");
         self.lines += 1;
-        ensure!(self.lines <= 6, "unexpected extra fixture receipt");
+        ensure!(
+            self.lines <= self.max_lines,
+            "unexpected extra fixture receipt"
+        );
         let mut parts = text.split_ascii_whitespace();
         ensure!(
             parts.next() == Some(phase),
@@ -347,6 +365,24 @@ impl Caller {
         ensure!(
             unsafe { libc::poll(&mut fd, 1, 0) } == 0,
             "worker escaped its body barrier"
+        );
+        Ok(())
+    }
+    fn await_sibling_bodies(&mut self, worker: Worker) -> Result<()> {
+        ensure!(self.record("LEADER_BODY", 2)? == [u64::from(self.pid()), u64::from(self.pid())]);
+        self.assert_worker_body_held(worker)
+    }
+    fn assert_leader_body_held(&self) -> Result<()> {
+        self.same_leader()?;
+        let mut fd = libc::pollfd {
+            fd: self.output.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // No delay or duration inference: the explicit L command is withheld.
+        ensure!(
+            unsafe { libc::poll(&mut fd, 1, 0) } == 0,
+            "leader completed before its explicit return release"
         );
         Ok(())
     }
@@ -829,4 +865,204 @@ fn detailed_thread_exit_fixture_requires_kernel_exit_before_leader_continuation(
 #[ignore = "root-owned BPF lane; real Detailed Singles, raw nonleader exit and surviving leader"]
 fn privileged_detailed_nonleader_exit_reclaims_start_and_preserves_leader() -> anyhow::Result<()> {
     detailed_nonleader_exit_gate()
+}
+
+// Read the actual kernel value as bytes. This covers every field and padding
+// without observing Rust struct padding or synthesizing an expected value.
+fn start_bytes(session: &Session, key: &StartKey) -> Result<[u8; size_of::<CallStart>()]> {
+    let starts: HashMap<_, StartKey, [u8; size_of::<CallStart>()]> =
+        HashMap::try_from(session.ebpf.map("START").context("START bytes")?)?;
+    Ok(starts.get(key, 0)?)
+}
+
+fn detailed_sibling_exit_gate() -> Result<()> {
+    let fixture = Fixture::build_sibling()?;
+    let mut child = fixture.spawn()?;
+    let (view, pins, plan) = fixture.pin(&child)?;
+    let object_hash: String = Sha256::digest(crate::EBPF_OBJECT)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    eprintln!("LIFECYCLE_OBJECT sha256={object_hash}");
+    let mut session = Session::start(
+        &plan,
+        &Scope::Pid(child.pid()),
+        &pins,
+        CapturePolicy::Allowlisted,
+        None,
+        None,
+        None,
+        BackendSelection::Singles,
+    )?;
+    ensure!(session.attach_failures().is_empty() && session.attached_probes() == 2);
+    ensure!(session.lifecycle_tracking_unavailable().is_none());
+    ensure!(session.process_creation_tracking_unavailable().is_none());
+    let ids = OwnedIds::observe(&session)?;
+    let result = (|| -> Result<()> {
+        assert_maps(
+            &session,
+            "baseline",
+            Expected {
+                entered: 0,
+                returned: 0,
+                errors: 0,
+                starts: 0,
+                outstanding: 0,
+                abandoned: 0,
+                rv_zero: 0,
+                rv_five: 0,
+            },
+        )?;
+        let worker = child.start_worker()?;
+        child.await_sibling_bodies(worker)?;
+        let rows = assert_maps(
+            &session,
+            "sibling_bodies",
+            Expected {
+                entered: 13,
+                returned: 11,
+                errors: 5,
+                starts: 2,
+                outstanding: 2,
+                abandoned: 0,
+                rv_zero: 6,
+                rv_five: 5,
+            },
+        )?;
+        let worker_id = u64::from(child.pid()) << 32 | u64::from(worker.tid);
+        let leader_id = u64::from(child.pid()) << 32 | u64::from(child.pid());
+        ensure!(rows.iter().all(|(key, _)| key.slot == 0 && key._pad == 0));
+        let (_, worker_start) = rows
+            .iter()
+            .find(|(key, _)| key.pid_tgid == worker_id)
+            .context("exact held worker START")?;
+        let (leader_key, leader_start) = rows
+            .iter()
+            .find(|(key, _)| key.pid_tgid == leader_id)
+            .context("exact same-slot held leader START")?;
+        let image = worker_start.image;
+        ensure!(image.task_cookie != 0 && leader_start.image == image);
+        ensure!(worker_start.ts_ns > 0 && leader_start.ts_ns >= worker_start.ts_ns);
+        let saved_leader = start_bytes(&session, leader_key)?;
+        let leader_hash: String = Sha256::digest(saved_leader)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        eprintln!(
+            "LIFECYCLE_SIBLING_START phase=both_held worker_pid_tgid={worker_id} leader_pid_tgid={leader_id} slot=0 bytes={} leader_sha256={leader_hash}",
+            saved_leader.len()
+        );
+        let mut events = Vec::with_capacity(28);
+        drain_owned(&mut session, &child, worker, &mut events)?;
+        ensure!(events.len() == 11 && events.iter().all(|event| event.pid_tgid == worker_id));
+
+        // X is read inside the leader's still-probed frame. Its EXITED receipt
+        // follows the kernel's child_tid clear, before L can allow its return.
+        child.release_worker(worker)?;
+        child.assert_leader_body_held()?;
+        let survivor = assert_maps(
+            &session,
+            "worker_exited_sibling_held",
+            Expected {
+                entered: 13,
+                returned: 11,
+                errors: 5,
+                starts: 1,
+                outstanding: 1,
+                abandoned: 1,
+                rv_zero: 6,
+                rv_five: 5,
+            },
+        )?;
+        ensure!(
+            survivor[0].0.pid_tgid == leader_id
+                && survivor[0].0.slot == 0
+                && survivor[0].0._pad == 0,
+            "worker cleanup did not preserve the exact sibling key"
+        );
+        ensure!(
+            start_bytes(&session, leader_key)? == saved_leader,
+            "worker cleanup changed the surviving sibling's START value"
+        );
+        eprintln!(
+            "LIFECYCLE_SIBLING_START phase=worker_exited worker_absent=true leader_pid_tgid={leader_id} slot=0 preserved=true leader_sha256={leader_hash}"
+        );
+        drain_owned(&mut session, &child, worker, &mut events)?;
+        ensure!(
+            events.len() == 11,
+            "a held/abandoned call produced a false completion"
+        );
+        ensure!(view.still_the_same() && session.has_slot_link(0));
+        ensure!(pins.check_unchanged().map_err(anyhow::Error::msg)?);
+        child.continue_leader()?;
+        assert_maps(
+            &session,
+            "leader_done",
+            Expected {
+                entered: 29,
+                returned: 28,
+                errors: 13,
+                starts: 0,
+                outstanding: 0,
+                abandoned: 1,
+                rv_zero: 15,
+                rv_five: 13,
+            },
+        )?;
+        drain_owned(&mut session, &child, worker, &mut events)?;
+        ensure!(events.len() == 28 && events.iter().all(|event| event.image == image));
+        let worker_rvs: Vec<_> = events
+            .iter()
+            .filter(|event| event.pid_tgid == worker_id)
+            .map(|event| event.rv)
+            .collect();
+        let leader_rvs: Vec<_> = events
+            .iter()
+            .filter(|event| event.pid_tgid == leader_id)
+            .map(|event| event.rv)
+            .collect();
+        ensure!(worker_rvs == [0, 5, 0, 5, 0, 5, 0, 5, 0, 5, 0]);
+        ensure!(leader_rvs == [0, 5, 0, 5, 0, 5, 0, 5, 0, 5, 0, 5, 0, 5, 0, 5, 0]);
+        ensure!(view.still_the_same() && session.has_slot_link(0));
+        ensure!(pins.check_unchanged().map_err(anyhow::Error::msg)?);
+        child.same_leader()?;
+        eprintln!(
+            "LIFECYCLE_ACCOUNTED sibling_preserved=true worker_completed=11 leader_completed=17 abandoned=1 image={image:?}"
+        );
+        Ok(())
+    })();
+    if let Err(error) = &result {
+        eprintln!("LIFECYCLE_FAILURE {error:#}");
+    }
+    let detach = session.detach_producers();
+    let detached_cleanly = session.detach_failures().is_empty();
+    drop(session);
+    let released = ids.released();
+    if result.is_ok() {
+        child.finish()?;
+    }
+    result?;
+    detach?;
+    ensure!(detached_cleanly);
+    released?;
+    Ok(())
+}
+
+#[test]
+fn detailed_sibling_exit_fixture_holds_leader_through_kernel_worker_exit() -> anyhow::Result<()> {
+    let fixture = Fixture::build_sibling()?;
+    let mut child = fixture.spawn()?;
+    let worker = child.start_worker()?;
+    child.await_sibling_bodies(worker)?;
+    child.release_worker(worker)?;
+    child.assert_leader_body_held()?;
+    child.continue_leader()?;
+    child.finish()?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "root-owned BPF lane; real Detailed Singles, two held STARTs and selective thread cleanup"]
+fn privileged_detailed_nonleader_exit_preserves_same_slot_sibling_start() -> anyhow::Result<()> {
+    detailed_sibling_exit_gate()
 }

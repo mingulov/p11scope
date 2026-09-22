@@ -486,24 +486,19 @@ fn system_scope_restricted_procfs_cross_uid_cell() {
         );
         return;
     }
-    // Staged outside the worktree: the checkout path above is not
-    // other-traversable, while the temp root is world-traversable.
-    let dir = std::env::temp_dir().join(format!(
-        "sysplan-c-xuid-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let provider = build_fixture(&dir, "mx-d");
-    let driver = build_driver(&dir);
+    // This cross-UID fixture cannot use the repository's private (0700)
+    // TMPDIR: nobody must traverse every parent. Keep its owned directory
+    // directly under /var/tmp and let TempDir remove it after the child.
+    let dir = tempfile::Builder::new()
+        .prefix("sysplan-c-xuid-")
+        .tempdir_in("/var/tmp")
+        .unwrap();
+    let provider = build_fixture(dir.path(), "mx-d");
+    let driver = build_driver(dir.path());
     // `nobody` must traverse, read, and execute the fixtures (tempdirs are
     // 0700): the directory and driver take 0755, the provider 0644.
     use std::os::unix::fs::PermissionsExt as _;
-    for (path, mode) in [(&dir, 0o755), (&provider, 0o644), (&driver, 0o755)] {
+    for (path, mode) in [(dir.path(), 0o755), (&provider, 0o644), (&driver, 0o755)] {
         let mut permissions = std::fs::metadata(path).unwrap().permissions();
         permissions.set_mode(mode);
         std::fs::set_permissions(path, permissions).unwrap();

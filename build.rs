@@ -23,6 +23,13 @@ use std::{env, path::PathBuf, process::Command};
 #[path = "build_support/bpf_tools.rs"]
 mod bpf_tools;
 
+#[derive(Clone, Copy)]
+enum BpfFlavor {
+    Detailed,
+    InventoryGlobal,
+    InventoryCallers,
+}
+
 /// Drops host-only coverage instrumentation from rustflags before they are
 /// forwarded to the freestanding BPF target: `-C instrument-coverage`
 /// pairs, `--cfg=coverage`, and `--cfg coverage` pairs. Everything else
@@ -105,8 +112,13 @@ fn main() {
         Ok("1") | Ok("true")
     );
 
-    build_variant(false, small_ring, small_state_maps, small_discovery_ring);
-    build_variant(true, small_ring, small_state_maps, small_discovery_ring);
+    for flavor in [
+        BpfFlavor::Detailed,
+        BpfFlavor::InventoryGlobal,
+        BpfFlavor::InventoryCallers,
+    ] {
+        build_variant(flavor, small_ring, small_state_maps, small_discovery_ring);
+    }
     println!(
         "cargo:rustc-env=P11SCOPE_INVENTORY_VARIANT={}",
         if small_discovery_ring {
@@ -115,14 +127,23 @@ fn main() {
             "inventory"
         }
     );
+    println!(
+        "cargo:rustc-env=P11SCOPE_INVENTORY_CALLERS_VARIANT={}",
+        if small_discovery_ring {
+            "inventory-callers-small-discovery"
+        } else {
+            "inventory-callers"
+        }
+    );
 }
 
 fn build_variant(
-    inventory: bool,
+    flavor: BpfFlavor,
     small_ring: bool,
     small_state_maps: bool,
     small_discovery_ring: bool,
 ) {
+    let inventory = !matches!(flavor, BpfFlavor::Detailed);
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR not set"));
@@ -135,20 +156,25 @@ fn build_variant(
         .unwrap_or_else(|error| panic!("selecting BPF Cargo and rustc: {error}"));
 
     // The native variant is isolated as well as the Cargo target directory.
-    // Inventory has no image identity, root affiliation, or START dependency.
-    let native_units: &[&str] = if inventory {
-        &["task_owner"]
-    } else {
-        &[
+    // Only caller Inventory retains the exact identity core. Neither Inventory
+    // flavor has a fork wrapper, root affiliation, or START dependency.
+    let native_units: &[&str] = match flavor {
+        BpfFlavor::InventoryGlobal => &["task_owner"],
+        BpfFlavor::InventoryCallers => &["image_identity", "task_owner"],
+        BpfFlavor::Detailed => &[
             "image_identity",
             "image_identity_fork",
             "task_owner",
             "root_affiliation",
-        ]
+        ],
     };
     let mut native_bitcodes = Vec::new();
     for unit in native_units {
-        let suffix = if inventory { "inventory" } else { "detailed" };
+        let suffix = match flavor {
+            BpfFlavor::Detailed => "detailed",
+            BpfFlavor::InventoryGlobal => "inventory",
+            BpfFlavor::InventoryCallers => "inventory-callers",
+        };
         let bitcode = out_dir.join(format!("{unit}-{suffix}.bc"));
         let mut compile = Command::new("clang-18");
         compile
@@ -186,10 +212,10 @@ fn build_variant(
     }
 
     let ebpf_manifest = manifest_dir.join("crates/ebpf/Cargo.toml");
-    let target_dir = out_dir.join(if inventory {
-        "ebpf-inventory-target"
-    } else {
-        "ebpf-target"
+    let target_dir = out_dir.join(match flavor {
+        BpfFlavor::Detailed => "ebpf-target",
+        BpfFlavor::InventoryGlobal => "ebpf-inventory-target",
+        BpfFlavor::InventoryCallers => "ebpf-inventory-callers-target",
     });
     cmd.args([
         "build",
@@ -205,8 +231,10 @@ fn build_variant(
     .arg("--target-dir")
     .arg(&target_dir);
     let mut features = Vec::new();
-    if inventory {
-        features.push("inventory-only");
+    match flavor {
+        BpfFlavor::Detailed => {}
+        BpfFlavor::InventoryGlobal => features.push("inventory-only"),
+        BpfFlavor::InventoryCallers => features.push("inventory-callers"),
     }
     if small_ring && !inventory {
         features.push("small-ring");
@@ -244,10 +272,12 @@ fn build_variant(
     ] {
         append_flag(flag);
     }
+    if !matches!(flavor, BpfFlavor::InventoryGlobal) {
+        append_flag("-C");
+        append_flag("link-arg=--export=p11_link_current_identity");
+    }
     if !inventory {
         for flag in [
-            "-C",
-            "link-arg=--export=p11_link_current_identity",
             "-C",
             "link-arg=--export=p11_link_fork_allowed",
             "-C",
@@ -310,10 +340,10 @@ fn build_variant(
     let built = target_dir.join(target).join("release/p11scope-ebpf");
     std::fs::copy(
         &built,
-        out_dir.join(if inventory {
-            "p11scope-ebpf-inventory"
-        } else {
-            "p11scope-ebpf"
+        out_dir.join(match flavor {
+            BpfFlavor::Detailed => "p11scope-ebpf",
+            BpfFlavor::InventoryGlobal => "p11scope-ebpf-inventory",
+            BpfFlavor::InventoryCallers => "p11scope-ebpf-inventory-callers",
         }),
     )
     .unwrap_or_else(|e| panic!("copying {} to OUT_DIR: {e}", built.display()));

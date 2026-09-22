@@ -107,12 +107,15 @@ class IdentityCoreTests(unittest.TestCase):
         self.assertNotIn('SEC("tp_btf/task_newtask")', core)
         self.assertNotIn('p11_link_fork_allowed', core)
         build = (ROOT / "build.rs").read_text()
-        units = build.split('let native_units: &[&str] = if inventory {', 1)[1].split('};', 1)[0]
-        inventory, detailed = units.split('} else {', 1)
-        self.assertEqual(inventory.strip(), '&["task_owner"]')
-        self.assertIn('"image_identity"', detailed)
-        self.assertIn('"image_identity_fork"', detailed)
-        self.assertNotIn('inventory-callers', build)
+        units = build.split('let native_units: &[&str] = match flavor {', 1)[1].split('};', 1)[0]
+        # The caller flavor now has a real consumer. Keep each exact native
+        # translation-unit set separate; the independent core fixture above
+        # still owns its no-fork/no-START object boundary.
+        self.assertEqual(' '.join(units.split()),
+                         'BpfFlavor::InventoryGlobal => &["task_owner"], '
+                         'BpfFlavor::InventoryCallers => &["image_identity", "task_owner"], '
+                         'BpfFlavor::Detailed => &[ "image_identity", "image_identity_fork", '
+                         '"task_owner", "root_affiliation", ],')
 
 
 if __name__ == "__main__":

@@ -8,6 +8,8 @@
 
 use crate::ImageIdentity;
 
+pub mod entry;
+
 /// A committed physical object; the logical publisher remains unresolved.
 pub const ENDPOINT_OBJECT_COMMITTED_PHYSICAL: u32 = 1;
 /// Positive physical-use evidence. No other flags are defined.

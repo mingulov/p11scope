@@ -13,6 +13,8 @@ compile_error!("inventory-only cannot be combined with unsafe-unvalidated-metada
 
 #[cfg(feature = "inventory-only")]
 mod inventory;
+#[cfg(feature = "inventory-callers")]
+mod inventory_callers;
 
 use aya_ebpf::bindings::BPF_F_RDONLY_PROG;
 use aya_ebpf::macros::{map, raw_tracepoint, uprobe, uretprobe};
@@ -2168,7 +2170,7 @@ unsafe extern "C" {
     fn p11_root_current_tag() -> u64;
     #[cfg(not(feature = "inventory-only"))]
     fn p11_root_current_exit();
-    #[cfg(not(feature = "inventory-only"))]
+    #[cfg(any(not(feature = "inventory-only"), feature = "inventory-callers"))]
     fn p11_link_current_identity(out: *mut ImageIdentity) -> u32;
     fn p11_owner_healthy() -> u32;
     fn p11_owner_cleanup();

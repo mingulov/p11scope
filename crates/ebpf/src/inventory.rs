@@ -1,6 +1,6 @@
 //! SPDX-License-Identifier: GPL-2.0-only
-//! Global endpoint-use evidence only; caller attribution and current liveness
-//! require separate evidence. No ordinary arguments, returns, or latency.
+//! Ordinary endpoint-use entries. The optional caller flavor additionally
+//! records exact image/object witnesses. No ordinary arguments or returns.
 use super::*;
 use p11scope_ebpf_common::{
     inventory_cookie_endpoint, inventory_mark_used_with, InventoryUsageConfig,
@@ -35,9 +35,14 @@ pub fn p11_usage_entry_ia32(ctx: ProbeContext) -> u32 {
 #[inline(always)]
 fn usage_entry(ctx: ProbeContext, declared_layout: LinuxLayout) -> u32 {
     // Even malformed config/cookie evidence must not become an unscoped signal.
+    #[cfg(not(feature = "inventory-callers"))]
     if scope_auth().is_none() {
         return 0;
     }
+    #[cfg(feature = "inventory-callers")]
+    let Some(scope) = scope_auth() else {
+        return 0;
+    };
     if probe_layout(&ctx) != Some(declared_layout) {
         bump_evidence(EVIDENCE_ABI_REFUSALS);
         return 0;
@@ -55,16 +60,34 @@ fn usage_entry(ctx: ProbeContext, declared_layout: LinuxLayout) -> u32 {
         bump_usage_evidence(USAGE_EVIDENCE_INVALID_COOKIE);
         return 0;
     };
-    let Some(cell) = USAGE.get_ptr_mut(endpoint) else {
+    #[cfg(not(feature = "inventory-callers"))]
+    if !mark_usage(endpoint) {
         bump_usage_evidence(USAGE_EVIDENCE_INVALID_STATE);
-        return 0;
+    }
+    #[cfg(feature = "inventory-callers")]
+    if let Err(error) = inventory_callers::record(endpoint, config.endpoint_capacity, scope.tgid) {
+        use p11scope_ebpf_common::inventory_callers::entry::CallerEntryFailure;
+        match error {
+            CallerEntryFailure::GlobalStateInvalid => {
+                bump_usage_evidence(USAGE_EVIDENCE_INVALID_STATE);
+            }
+            CallerEntryFailure::Caller(kind) => inventory_callers::bump_evidence(kind),
+        }
+    }
+    0
+}
+
+#[inline(always)]
+pub(super) fn mark_usage(endpoint: u32) -> bool {
+    let Some(cell) = USAGE.get_ptr_mut(endpoint) else {
+        return false;
     };
     // This aligned map cell is never reset or recycled in a retained session.
     // The pinned generic BPF backend cannot lower Rust AtomicLoad. As in the
     // native owner helpers, an aligned volatile u64 read emits one BPF LDXDW;
     // the shared kernel map is not Rust-owned memory. CAS performs the only
     // transition, using the same intrinsic as the existing pause writer.
-    let valid = inventory_mark_used_with(
+    inventory_mark_used_with(
         || unsafe { core::ptr::read_volatile(cell) },
         || unsafe {
             core::intrinsics::atomic_cxchg::<
@@ -74,9 +97,5 @@ fn usage_entry(ctx: ProbeContext, declared_layout: LinuxLayout) -> u32 {
             >(cell, 0, 1)
             .0
         },
-    );
-    if !valid {
-        bump_usage_evidence(USAGE_EVIDENCE_INVALID_STATE);
-    }
-    0
+    )
 }

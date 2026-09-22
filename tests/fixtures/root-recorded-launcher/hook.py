@@ -19,7 +19,9 @@ snapshot = {name: value for name, value in os.environ.items()
             if name.startswith(("ROOT_", "USER_"))}
 (work / "snapshot.json").write_text(json.dumps(snapshot))
 action = os.environ.get("HOOK_ACTION", "fail")
-if action == "hold":
+if action == "snapshot":
+    pass
+elif action == "hold":
     temporary = work / "hook.waiting.tmp"
     temporary.write_text(json.dumps({"pid": int(os.environ["FIXTURE_OWN_PID"]),
                                      "starttime": int(os.environ["FIXTURE_OWN_STARTTIME"])}))

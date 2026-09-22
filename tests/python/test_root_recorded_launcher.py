@@ -697,24 +697,89 @@ IFS=:
         self.assertEqual(snapshot["ROOT_RECORD_PHASE"], "root-acknowledged")
         self.wait_path(self.work / "target.entered")
 
+    def delayed_phase_diagnostic(self, phase, proc, parent_fd, record, context, stderr):
+        if stderr is None:
+            try:
+                stderr = (os.read(proc.stderr.fileno(), 4096)
+                          if select.select([proc.stderr], [], [], 0)[0] else b"<not ready>")
+            except (OSError, ValueError) as error:
+                stderr = f"<unreadable {type(error).__name__}: {error}>"
+        parts = [
+            f"delayed phase={phase}; monotonic_ns={time.monotonic_ns()}",
+            f"authenticated_record={self.bounded_repr(record)}",
+            f"context={self.bounded_repr(context)}",
+            f"direct-parent-status={self.direct_parent_status(parent_fd)}",
+            f"driver-stderr={self.bounded_repr(stderr)}",
+        ]
+        for name in ("fields", "wrapper.stopped", "snapshot.json", "target.log"):
+            parts.append(self.diagnostic_file(name, self.work / name))
+        if isinstance(context, dict) and isinstance(context.get("path"), str):
+            for name in ("launcher.self", "launcher.ack", "launcher.committed", "root.self"):
+                parts.append(self.diagnostic_file(name, Path(context["path"]) / name))
+        return "; ".join(parts)
+
     def delayed_phase(self, phase):
         self.shim()
-        self.env.update(DELAY_PHASE=phase, CASE_DEADLINE="0.35")
+        # Root must first complete the launcher handshake. Use the fixture's
+        # normal setup budget, then test expiry at the recorded root boundary.
+        self.env.update(DELAY_PHASE=phase, CASE_DEADLINE="2" if phase == "root" else "0.35")
+        if phase == "root":
+            self.env.update(HOOK_OPERATION="read", HOOK_PHASE="root", HOOK_ACTION="snapshot")
         mode = "user" if phase == "user" else "root"
-        proc, _ = self.child(["sh", str(FIXTURES / "driver.sh"), mode, "sh", str(FIXTURES / "target.sh")],
-                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        record = json.loads(self.wait_path(self.work / "wrapper.stopped").read_text())
-        fd = self.adopt(record["pid"], record["starttime"])
-        self.assertIsNotNone(fd)
-        proc.communicate(timeout=4)
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertFalse((self.work / "target.entered").exists())
-        if phase in ("launcher", "user"):
-            self.assertFalse((self.work / "sudo.entered").exists())
-        signal.pidfd_send_signal(fd, signal.SIGCONT)
-        self.assertTrue(select.select([fd], [], [], 3)[0])
-        self.assertFalse((self.work / "target.entered").exists())
-        self.assertFalse((self.work / "numeric-signals").exists())
+        proc, parent_fd = self.child(
+            ["sh", str(FIXTURES / "driver.sh"), mode, "sh", str(FIXTURES / "target.sh")],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        record = context = stderr = None
+        try:
+            record = json.loads(self.wait_path(self.work / "wrapper.stopped").read_text())
+            fd = self.adopt(record["pid"], record["starttime"])
+            self.assertIsNotNone(fd)
+            stopped_deadline = time.monotonic() + 3
+            while True:
+                tail = Path(f"/proc/{record['pid']}/stat").read_bytes().rsplit(b") ", 1)[1].split()
+                self.assertEqual(int(tail[19]), record["starttime"])
+                if tail[0] == b"T":
+                    break
+                self.assertLess(time.monotonic(), stopped_deadline, "wrapper did not stop")
+                time.sleep(0.01)
+            if phase == "root":
+                snapshot = json.loads(self.wait_path(self.work / "snapshot.json").read_text())
+                context = json.loads(snapshot["ROOT_RECORD_IDENTITY"])
+                control = Path(context["path"])
+                self.assertEqual(snapshot["ROOT_RECORD_PHASE"], "launcher-acknowledged")
+                self.assertEqual(snapshot["ROOT_RECORD_CONTROL"], context["path"])
+                self.assertEqual((snapshot["ROOT_LAUNCH_PID"], snapshot["ROOT_LAUNCH_STARTTIME"]),
+                                 (str(record["pid"]), str(record["starttime"])))
+                self.assertTrue((self.work / "sudo.entered").exists())
+                for kind in ("ack", "committed"):
+                    actual = json.loads((control / f"launcher.{kind}").read_text())
+                    self.assertEqual(actual, {"phase": "launcher", "kind": kind,
+                                             "attempt": context["attempt"], "pid": record["pid"],
+                                             "starttime": record["starttime"]})
+                self.assertFalse((control / "root.self").exists())
+                self.assertIs(type(context["deadline"]), int)
+                while True:
+                    remaining = (context["deadline"] - time.monotonic_ns()) / 1_000_000_000
+                    if remaining <= 0:
+                        break
+                    self.assertLessEqual(remaining, 2, "unexpected root deadline")
+                    time.sleep(min(remaining, 0.01))
+            _, stderr = proc.communicate(timeout=4)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertFalse((self.work / "target.entered").exists())
+            if phase in ("launcher", "user"):
+                self.assertFalse((self.work / "sudo.entered").exists())
+            signal.pidfd_send_signal(fd, signal.SIGCONT)
+            self.assertTrue(select.select([fd], [], [], 3)[0])
+            self.assertFalse((self.work / "target.entered").exists())
+            self.assertFalse((self.work / "numeric-signals").exists())
+            if phase == "root":
+                self.assertGreaterEqual(time.monotonic_ns(), context["deadline"])
+                self.assertIn("recorded launch deadline expired", (self.work / "target.log").read_text())
+                self.assertFalse((control / "root.self").exists())
+        except Exception as error:
+            diagnostic = self.delayed_phase_diagnostic(phase, proc, parent_fd, record, context, stderr)
+            raise self.failureException(f"{type(error).__name__}: {error}; {diagnostic}") from error
 
     def test_missing_launcher_self_resumed_after_deadline_never_enters_sudo(self):
         self.delayed_phase("launcher")

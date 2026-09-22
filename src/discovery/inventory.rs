@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-License-Identifier: GPL-3.0-or-later
 
 //! Inventory-only ownership and reconciliation preparation. This component does
 //! not attach probes, publish capture output, schedule work, or commit link state.

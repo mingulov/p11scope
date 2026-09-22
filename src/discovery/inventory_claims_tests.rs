@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-License-Identifier: GPL-3.0-or-later
 
 //! I4b Slice 1 regressions through the existing owner and candidate paths.
 //! Scan results and native-image replies are scripted at those dependency
@@ -106,13 +106,22 @@ fn receipt_at(
 /// Tables are synthetic. Process pins, executable mappings, open file identity,
 /// reconciliation, deduplication, and plan construction are the production path.
 fn mapped_providers(view: &ProcessView, count: usize) -> Vec<ScannedModule> {
+    let modules: Vec<_> = mapped_provider_candidates(view)
+        .into_iter()
+        .take(count)
+        .map(|(mapping, path)| provider_module(view, &mapping, &path, mapping.file_offset))
+        .collect();
+    assert_eq!(modules.len(), count, "enough distinct executable mappings");
+    modules
+}
+
+fn mapped_provider_candidates(view: &ProcessView) -> Vec<(MapEntry, PathBuf)> {
     let bytes = std::fs::read(format!("/proc/{}/maps", view.pid())).unwrap();
     let maps = parse_maps(&bytes).unwrap();
     let index = MapIndex::new(&maps).unwrap();
     let executable = std::env::current_exe().unwrap();
     let mut seen = BTreeSet::new();
-    let modules: Vec<_> = maps
-        .iter()
+    maps.iter()
         .filter(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0)
         .filter_map(|mapping| {
             let Resolved::File {
@@ -127,12 +136,58 @@ fn mapped_providers(view: &ProcessView, count: usize) -> Vec<ScannedModule> {
             if path == executable || !seen.insert(ObjectKey::of(mapping)) {
                 return None;
             }
-            Some(provider_module(view, mapping, &path, mapping.file_offset))
+            Some((mapping.clone(), path))
         })
-        .take(count)
+        .collect()
+}
+
+fn shared_mapping_indices(own: &[ObjectKey], peer: &[ObjectKey]) -> Option<(usize, usize)> {
+    own.iter().enumerate().find_map(|(own_index, key)| {
+        peer.iter()
+            .position(|peer_key| peer_key == key)
+            .map(|peer_index| (own_index, peer_index))
+    })
+}
+
+#[test]
+fn shared_pair_selector_searches_past_unrelated_prefix_by_exact_object_key() {
+    let key = |minor, inode| ObjectKey {
+        device: Device { major: 8, minor },
+        inode,
+    };
+    let shared = key(1, 77);
+    let own = [
+        key(1, 10),
+        key(1, 11),
+        key(2, 77), // Same inode on another device is a different object.
+        shared,
+    ];
+    let peer = [shared];
+
+    assert_eq!(shared_mapping_indices(&own, &peer), Some((3, 0)));
+}
+
+fn shared_provider_pair(
+    own_view: &ProcessView,
+    peer_view: &ProcessView,
+) -> Option<(ScannedModule, ScannedModule)> {
+    let own = mapped_provider_candidates(own_view);
+    let peer = mapped_provider_candidates(peer_view);
+    let own_keys: Vec<_> = own
+        .iter()
+        .map(|(mapping, _)| ObjectKey::of(mapping))
         .collect();
-    assert_eq!(modules.len(), count, "enough distinct executable mappings");
-    modules
+    let peer_keys: Vec<_> = peer
+        .iter()
+        .map(|(mapping, _)| ObjectKey::of(mapping))
+        .collect();
+    let (own_index, peer_index) = shared_mapping_indices(&own_keys, &peer_keys)?;
+    let (own_mapping, own_path) = &own[own_index];
+    let (peer_mapping, peer_path) = &peer[peer_index];
+    Some((
+        provider_module(own_view, own_mapping, own_path, own_mapping.file_offset),
+        provider_module(peer_view, peer_mapping, peer_path, 0x1000),
+    ))
 }
 
 /// Seed an already accepted snapshot without simulating an Inventory BPF
@@ -303,16 +358,7 @@ fn inventory_one_mapper_removal_preserves_other_mapper_and_physical_slot() {
     let mut engine = inventory_engine(2);
     let own = open_owner(&mut engine, std::process::id());
     let peer = open_owner(&mut engine, child.0.id());
-    let own_modules = mapped_providers(&engine.views[0], 3);
-    let peer_modules = child_provider_modules(&engine.views[1]);
-    let (own_module, peer_module) = own_modules
-        .iter()
-        .find_map(|own_module| {
-            peer_modules
-                .iter()
-                .find(|peer_module| peer_module.key == own_module.key)
-                .map(|peer_module| (own_module.clone(), peer_module.clone()))
-        })
+    let (own_module, peer_module) = shared_provider_pair(&engine.views[0], &engine.views[1])
         .expect("the two real processes share an executable ELF object");
     let mut peer_module = peer_module;
     peer_module.tables[0].entries[0].file_offset = own_module.tables[0].entries[0].file_offset;
@@ -560,16 +606,7 @@ fn two_owner_claim_fixture(
     let mut engine = inventory_engine_with_claim_capacity(2, claim_capacity);
     let own = open_owner(&mut engine, std::process::id());
     let peer = open_owner(&mut engine, child.0.id());
-    let own_modules = mapped_providers(&engine.views[0], 3);
-    let peer_modules = child_provider_modules(&engine.views[1]);
-    let (own_module, mut peer_module) = own_modules
-        .iter()
-        .find_map(|own_module| {
-            peer_modules
-                .iter()
-                .find(|peer_module| peer_module.key == own_module.key)
-                .map(|peer_module| (own_module.clone(), peer_module.clone()))
-        })
+    let (own_module, mut peer_module) = shared_provider_pair(&engine.views[0], &engine.views[1])
         .expect("the two real processes share an executable ELF object");
     peer_module.tables[0].entries[0].file_offset = own_module.tables[0].entries[0].file_offset;
     let modules = [own_module, peer_module];

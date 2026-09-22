@@ -111,7 +111,12 @@ static __always_inline int valid_owner(struct owner_control *ctl, struct thread_
 {
     if (!*(volatile u64 *)&ctl->outstanding ||
         owner->flags != OWNER_LEASED || !owner->original_pid_tgid ||
-        owner->start_count > 512 || (owner->selection_domains & ~owner->occupied)) {
+#ifdef P11SCOPE_INVENTORY_ONLY
+        owner->start_count != 0 ||
+#else
+        owner->start_count > 512 ||
+#endif
+        (owner->selection_domains & ~owner->occupied)) {
         poison(ctl, OWNER_BAD_RECORD);
         return 0;
     }
@@ -177,6 +182,7 @@ static __always_inline int release_empty(struct owner_control *ctl, struct threa
     return p11_owner_refund();
 }
 
+#ifndef P11SCOPE_INVENTORY_ONLY
 static __always_inline int start_key_valid(struct thread_owner *owner,
                                           const struct owner_start_key *key)
 {
@@ -184,6 +190,7 @@ static __always_inline int start_key_valid(struct thread_owner *owner,
         key->pid_tgid == owner->original_pid_tgid;
 }
 
+#endif
 /* An exact hash absence permits only an optional ordinary no-op. A readable
  * owner is still checked for contradictions. NULL here says nothing about
  * owner absence; no deletion/refund/bookkeeping settlement follows it. */
@@ -196,6 +203,7 @@ static __always_inline struct thread_owner *peek_absent_owner(struct owner_contr
     return owner && valid_owner(ctl, owner) ? owner : (void *)0;
 }
 
+#ifndef P11SCOPE_INVENTORY_ONLY
 __attribute__((noinline)) void *p11_owner_start_get(const struct owner_start_key *key, u32 required)
 {
     struct owner_control *ctl = control();
@@ -295,6 +303,7 @@ __attribute__((noinline)) long p11_owner_start_insert(const struct owner_start_k
     return rc;
 }
 
+#endif
 static __always_inline int discovery_key_valid(struct thread_owner *owner,
                                                const struct owner_discovery_key *key)
 {
@@ -475,6 +484,7 @@ __attribute__((noinline)) void p11_owner_cleanup(void)
     }
     if (!valid_owner(ctl, owner))
         return;
+#ifndef P11SCOPE_INVENTORY_ONLY
     struct owner_start_key start = { .pid_tgid = owner->original_pid_tgid, .slot = 0, .pad = 0 };
     for (u32 i = 0; i < 512; i++) {
         start.slot = i;
@@ -488,6 +498,7 @@ __attribute__((noinline)) void p11_owner_cleanup(void)
         poison(ctl, OWNER_BOOKKEEPING_FAILED);
         return;
     }
+#endif
     struct owner_discovery_key key = { .pid_tgid = owner->original_pid_tgid };
     for (u32 i = 0; i < 64; i++) {
         u64 bit = 1ULL << i;

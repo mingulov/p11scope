@@ -6,6 +6,7 @@ license = "GPL-2.0-only"
 publish = false
 
 [features]
+inventory-only = []
 small-ring = ["p11scope-ebpf-common/small-ring"]
 small-state-maps = ["p11scope-ebpf-common/small-state-maps"]
 small-discovery-ring = ["p11scope-ebpf-common/small-discovery-ring"]

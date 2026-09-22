@@ -8,44 +8,52 @@
 #![feature(core_intrinsics)]
 #![allow(internal_features)]
 
+#[cfg(all(feature = "inventory-only", feature = "unsafe-unvalidated-metadata"))]
+compile_error!("inventory-only cannot be combined with unsafe-unvalidated-metadata");
+
+#[cfg(feature = "inventory-only")]
+mod inventory;
+
 use aya_ebpf::bindings::BPF_F_RDONLY_PROG;
 use aya_ebpf::macros::{map, raw_tracepoint, uprobe, uretprobe};
-use aya_ebpf::maps::ProgramArray;
 use aya_ebpf::maps::ring_buf::RingBufEntry;
-use aya_ebpf::maps::{Array, CgroupArray, HashMap, PerCpuArray, PerCpuHashMap, RingBuf};
+#[cfg(not(feature = "inventory-only"))]
+use aya_ebpf::maps::PerCpuHashMap;
+use aya_ebpf::maps::ProgramArray;
+use aya_ebpf::maps::{Array, CgroupArray, HashMap, PerCpuArray, RingBuf};
 use aya_ebpf::programs::{ProbeContext, RawTracePointContext, RetProbeContext};
-use aya_ebpf::{EbpfContext as _, helpers};
+use aya_ebpf::{helpers, EbpfContext as _};
+#[cfg(not(feature = "inventory-only"))]
 use core::mem::MaybeUninit;
+#[cfg_attr(feature = "inventory-only", allow(unused_imports))]
 use p11scope_ebpf_common::{
-    ARG_NONE, CFG_FLAGS, COALESCED_NO_HELPER_RC, CallStart, DISCOVERY_BYTES,
-    DISCOVERY_COUNTER_CELLS, DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES,
-    DISCOVERY_COUNTER_EXPORT_STATE_FAILURES, DISCOVERY_COUNTER_LOADER_HITS,
-    DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES, DISCOVERY_COUNTER_RING_LOSS,
-    DISCOVERY_INTERFACES, DISCOVERY_KIND_EXEC, DISCOVERY_KIND_FUNCTION_LIST_RETURN,
-    DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN, DISCOVERY_KIND_INTERFACE_RETURN,
-    DISCOVERY_KIND_LEADER_EXIT, DISCOVERY_KIND_LOADER, DISCOVERY_NAME_EXACT_STANDARD,
-    DISCOVERY_NAME_NA, DISCOVERY_NAME_NULL, DISCOVERY_NAME_OTHER, DISCOVERY_NAME_UNREADABLE,
-    DISCOVERY_STATUS_COALESCED_NO_HELPER, DISCOVERY_STATUS_LOADER_CONTEXT_INVALID,
-    DISCOVERY_STATUS_READ_FAILURE, DISCOVERY_VERSION_NULL, DISCOVERY_VERSION_UNREADABLE,
-    DISCOVERY_VERSION_V3_0, DISCOVERY_VERSION_V3_1, DISCOVERY_VERSION_V3_2, DiscoveryRecord,
-    EVIDENCE_ABI_REFUSALS, EVIDENCE_CELLS, EVIDENCE_CGROUP_SCOPE_FAILURES, EVIDENCE_RING_LOSS,
-    EVIDENCE_RV_UPDATE_FAILURES, EVIDENCE_SEMANTIC_CAPTURE_FAILURES,
+    bucket_of, capture, classify_task_newtask, cookie_descriptor, cookie_slot,
+    decode_export_attach_cookie, discovery_pause_coalesced, discovery_pause_enabled,
+    discovery_state_take_failed, discovery_state_take_scope_lost, discovery_table_slots,
+    discovery_usable_prefix, discovery_version_class, event_type, image_pair_matches,
+    interface_continuation_next, interface_continuation_pack, interface_continuation_unpack,
+    lifecycle, normalize_target_word, read_ia32_arg_with, return_allows_mechanism, shape,
+    target_layout_from_cs, target_stack_arg_address, target_word_end, valid_config,
+    valid_loader_cookie, CallStart, DiscoveryRecord, Event, FunctionNameKey, ImageIdentity,
+    LinuxLayout, PauseKey, RvKey, SlotSemantics, SlotStats, StartKey, StartState, StateKey,
+    ARG_NONE, CFG_FLAGS, COALESCED_NO_HELPER_RC, DISCOVERY_BYTES, DISCOVERY_COUNTER_CELLS,
+    DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES, DISCOVERY_COUNTER_EXPORT_STATE_FAILURES,
+    DISCOVERY_COUNTER_LOADER_HITS, DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES,
+    DISCOVERY_COUNTER_RING_LOSS, DISCOVERY_INTERFACES, DISCOVERY_KIND_EXEC,
+    DISCOVERY_KIND_FUNCTION_LIST_RETURN, DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN,
+    DISCOVERY_KIND_INTERFACE_RETURN, DISCOVERY_KIND_LEADER_EXIT, DISCOVERY_KIND_LOADER,
+    DISCOVERY_NAME_EXACT_STANDARD, DISCOVERY_NAME_NA, DISCOVERY_NAME_NULL, DISCOVERY_NAME_OTHER,
+    DISCOVERY_NAME_UNREADABLE, DISCOVERY_STATUS_COALESCED_NO_HELPER,
+    DISCOVERY_STATUS_LOADER_CONTEXT_INVALID, DISCOVERY_STATUS_READ_FAILURE, DISCOVERY_VERSION_NULL,
+    DISCOVERY_VERSION_UNREADABLE, DISCOVERY_VERSION_V3_0, DISCOVERY_VERSION_V3_1,
+    DISCOVERY_VERSION_V3_2, EVIDENCE_ABI_REFUSALS, EVIDENCE_CELLS, EVIDENCE_CGROUP_SCOPE_FAILURES,
+    EVIDENCE_RING_LOSS, EVIDENCE_RV_UPDATE_FAILURES, EVIDENCE_SEMANTIC_CAPTURE_FAILURES,
     EVIDENCE_START_INSERT_FAILURES, EVIDENCE_UNMATCHED_RETURNS, EVIDENCE_UNREGISTERED_MECHANISMS,
-    Event, FLAG_CGROUP_FILTER, FLAG_PID_FILTER, FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED,
-    FLAG_SYSTEM_FILTER,
-    FUNCTION_NAME_MAX_BYTES, FUNCTION_NONE, FunctionNameKey, ImageIdentity, LOADER_STATE_PRESENT,
-    LinuxLayout, MAX_DESCRIPTORS, MAX_MECH_SHAPES, MAX_SLOTS, MECH_NONE,
-    NATIVE_OWNER_SLOT_BOUND, PAUSE_ARMED,
-    PAUSE_REQUESTED, PauseKey, RING_BYTES, RV_ENTRIES, RvKey, SESSION_NONE, START_ENTRIES,
-    STATE_DOMAIN_EXPORT, STATE_DOMAIN_SELECTION, SlotSemantics, SlotStats, StartKey, StartState,
-    StateKey, TAIL_CALLS_INTERFACE_WORKER_SLOT, USER_TYPE_NONE, bucket_of, capture,
-    classify_task_newtask, cookie_descriptor, cookie_slot, decode_export_attach_cookie,
-    discovery_pause_coalesced, discovery_pause_enabled, discovery_state_take_failed,
-    discovery_state_take_scope_lost, discovery_table_slots, discovery_usable_prefix,
-    discovery_version_class, event_type, image_pair_matches, interface_continuation_next,
-    interface_continuation_pack, interface_continuation_unpack, lifecycle, normalize_target_word,
-    read_ia32_arg_with, return_allows_mechanism, shape, target_layout_from_cs,
-    target_stack_arg_address, target_word_end, valid_config, valid_loader_cookie,
+    FLAG_CGROUP_FILTER, FLAG_PID_FILTER, FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED,
+    FLAG_SYSTEM_FILTER, FUNCTION_NAME_MAX_BYTES, FUNCTION_NONE, LOADER_STATE_PRESENT,
+    MAX_DESCRIPTORS, MAX_MECH_SHAPES, MAX_SLOTS, MECH_NONE, NATIVE_OWNER_SLOT_BOUND, PAUSE_ARMED,
+    PAUSE_REQUESTED, RING_BYTES, RV_ENTRIES, SESSION_NONE, START_ENTRIES, STATE_DOMAIN_EXPORT,
+    STATE_DOMAIN_SELECTION, TAIL_CALLS_INTERFACE_WORKER_SLOT, USER_TYPE_NONE,
 };
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 use p11scope_ebpf_common::{
@@ -66,15 +74,19 @@ static PID_FILTER: HashMap<u32, u64> = HashMap::with_max_entries(1024, BPF_F_RDO
 #[map]
 static CGROUP_FILTER: CgroupArray = CgroupArray::with_max_entries(1, 0);
 
+#[cfg(not(feature = "inventory-only"))]
 #[map]
 static STATS: PerCpuArray<SlotStats> = PerCpuArray::with_max_entries(MAX_SLOTS, 0);
 
+#[cfg(not(feature = "inventory-only"))]
 #[map]
 static START: HashMap<StartKey, CallStart> = HashMap::with_max_entries(START_ENTRIES, 0);
 
+#[cfg(not(feature = "inventory-only"))]
 #[map]
 static RV_COUNTS: PerCpuHashMap<RvKey, u64> = PerCpuHashMap::with_max_entries(RV_ENTRIES, 0);
 
+#[cfg(not(feature = "inventory-only"))]
 #[map]
 static DESCRIPTORS: Array<SlotSemantics> =
     Array::with_max_entries(MAX_DESCRIPTORS, BPF_F_RDONLY_PROG);
@@ -82,6 +94,7 @@ static DESCRIPTORS: Array<SlotSemantics> =
 /// Mechanism id -> parameter shape code, published by userspace from
 /// pkcs11-types' registry. An unknown mechanism id looks up empty and is
 /// treated as `shape::NONE`.
+#[cfg(not(feature = "inventory-only"))]
 #[map]
 static MECH_SHAPE: HashMap<u64, u32> =
     HashMap::with_max_entries(MAX_MECH_SHAPES, BPF_F_RDONLY_PROG);
@@ -98,10 +111,12 @@ static TAIL_CALLS: ProgramArray = ProgramArray::with_max_entries(2, 0);
 
 /// Exact bounded standard function name -> stable shared-table id. Raw
 /// `pFunctionName` bytes never leave the BPF stack.
+#[cfg(not(feature = "inventory-only"))]
 #[map]
 static ASYNC_FUNCTIONS: HashMap<FunctionNameKey, u32> =
     HashMap::with_max_entries(128, BPF_F_RDONLY_PROG);
 
+#[cfg(not(feature = "inventory-only"))]
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(RING_BYTES, 0);
 
@@ -117,6 +132,7 @@ static DISCOVERY_STATE: HashMap<StateKey, StartState> = HashMap::with_max_entrie
 #[map]
 static COUNTERS: PerCpuArray<u64> = PerCpuArray::with_max_entries(DISCOVERY_COUNTER_CELLS, 0);
 
+#[cfg(not(feature = "inventory-only"))]
 #[map]
 static PAUSE_PIDS: HashMap<PauseKey, u64> = HashMap::with_max_entries(1, 0);
 
@@ -185,6 +201,7 @@ fn read_word_pair(address: u64, layout: LinuxLayout) -> Result<[u64; 2], ()> {
 
 const _: [(); 288] = [(); core::mem::size_of::<CallStart>()];
 
+#[cfg(not(feature = "inventory-only"))]
 #[inline(always)]
 fn zero_call_start(start: &mut MaybeUninit<CallStart>) {
     let words = start.as_mut_ptr().cast::<u64>();
@@ -252,7 +269,11 @@ fn scope_auth() -> Option<ScopeAuth> {
         return None;
     }
     let flags = CONFIG.get(CFG_FLAGS).copied().unwrap_or(0);
-    if !valid_config(flags) {
+    #[cfg(not(feature = "inventory-only"))]
+    let valid = valid_config(flags);
+    #[cfg(feature = "inventory-only")]
+    let valid = p11scope_ebpf_common::valid_inventory_config(flags);
+    if !valid {
         return None;
     }
     let pid_tgid = helpers::bpf_get_current_pid_tgid();
@@ -300,6 +321,7 @@ fn scope_auth() -> Option<ScopeAuth> {
     None
 }
 
+#[cfg(not(feature = "inventory-only"))]
 fn scope_flags() -> Option<u64> {
     scope_auth().map(|scope| scope.flags)
 }
@@ -453,9 +475,10 @@ fn finish_discovery_record(
     scope: ScopeAuth,
     eligible: bool,
     pid_tgid: u64,
-    mut status_flags: u8,
+    #[allow(unused_mut)] mut status_flags: u8,
 ) {
     let raw = entry.as_mut_ptr();
+    #[cfg(not(feature = "inventory-only"))]
     let (hook_ts_ns, send_signal_rc) =
         if discovery_pause_enabled(eligible, scope.flags, scope.generation_token) {
             let key = PauseKey {
@@ -494,6 +517,11 @@ fn finish_discovery_record(
         } else {
             (unsafe { helpers::bpf_ktime_get_ns() }, 0)
         };
+    #[cfg(feature = "inventory-only")]
+    let (hook_ts_ns, send_signal_rc) = {
+        let _ = (scope, eligible);
+        (unsafe { helpers::bpf_ktime_get_ns() }, 0i64)
+    };
     // SAFETY: the shared initializer and all producer-specific writes finish
     // before this terminal timestamp/result sequence.
     unsafe {
@@ -1502,7 +1530,10 @@ pub fn sched_process_exec(_ctx: RawTracePointContext) -> u32 {
 pub fn sched_process_exit(_ctx: RawTracePointContext) -> u32 {
     // Retained original keys also cover fatal nonleader post-de_thread exit.
     unsafe { p11_owner_cleanup() };
-    unsafe { p11_root_current_exit() };
+    #[cfg(not(feature = "inventory-only"))]
+    unsafe {
+        p11_root_current_exit()
+    };
     let pid_tgid = helpers::bpf_get_current_pid_tgid();
     if pid_tgid as u32 != (pid_tgid >> 32) as u32 {
         return 0;
@@ -1520,6 +1551,7 @@ where
     unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) }
 }
 
+#[cfg(not(feature = "inventory-only"))]
 fn slot_of<C>(ctx: &C) -> u32
 where
     C: aya_ebpf::EbpfContext,
@@ -1527,6 +1559,7 @@ where
     cookie_slot(cookie_of(ctx))
 }
 
+#[cfg(not(feature = "inventory-only"))]
 fn semantics_of<C>(ctx: &C) -> SlotSemantics
 where
     C: aya_ebpf::EbpfContext,
@@ -1934,11 +1967,13 @@ pub extern "C" fn p11_read_ia32_arg(stack_pointer: u64, index: u32) -> u64 {
     })
 }
 
+#[cfg(not(feature = "inventory-only"))]
 fn capture_failure(start: &mut CallStart) {
     start.capture |= capture::ARG_READ_FAILURE;
     bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
 }
 
+#[cfg(not(feature = "inventory-only"))]
 fn capture_scalar(
     ctx: &ProbeContext,
     index: u8,
@@ -1960,6 +1995,7 @@ fn capture_scalar(
 const _: [(); 32] = [(); core::mem::size_of::<FunctionNameKey>()];
 const _: () = assert!(core::mem::align_of::<FunctionNameKey>() >= 4);
 
+#[cfg(not(feature = "inventory-only"))]
 #[inline(always)]
 fn zero_function_name_key(key: &mut MaybeUninit<FunctionNameKey>) {
     let words = key.as_mut_ptr().cast::<u32>();
@@ -1977,6 +2013,7 @@ fn zero_function_name_key(key: &mut MaybeUninit<FunctionNameKey>) {
     }
 }
 
+#[cfg(not(feature = "inventory-only"))]
 fn capture_async_target(pointer: u64, start: &mut CallStart) {
     if pointer == 0 {
         capture_failure(start);
@@ -2050,10 +2087,14 @@ fn capture_async_target(pointer: u64, start: &mut CallStart) {
     }
 }
 
+#[cfg(not(feature = "inventory-only"))]
 const ENTRY_ABI_MIXED: u8 = 0;
+#[cfg(not(feature = "inventory-only"))]
 const ENTRY_ABI_LP64: u8 = 1;
+#[cfg(not(feature = "inventory-only"))]
 const ENTRY_ABI_ILP32: u8 = 2;
 
+#[cfg(not(feature = "inventory-only"))]
 #[uprobe]
 pub fn p11_entry(ctx: ProbeContext) -> u32 {
     #[cfg(not(feature = "unsafe-unvalidated-metadata"))]
@@ -2123,13 +2164,19 @@ pub fn p11_entry_template_second(ctx: ProbeContext) -> u32 {
 }
 
 unsafe extern "C" {
+    #[cfg(not(feature = "inventory-only"))]
     fn p11_root_current_tag() -> u64;
+    #[cfg(not(feature = "inventory-only"))]
     fn p11_root_current_exit();
+    #[cfg(not(feature = "inventory-only"))]
     fn p11_link_current_identity(out: *mut ImageIdentity) -> u32;
     fn p11_owner_healthy() -> u32;
     fn p11_owner_cleanup();
+    #[cfg(not(feature = "inventory-only"))]
     fn p11_owner_start_get(key: *const StartKey, required: u32) -> *mut CallStart;
+    #[cfg(not(feature = "inventory-only"))]
     fn p11_owner_start_insert(key: *const StartKey, value: *const CallStart) -> i64;
+    #[cfg(not(feature = "inventory-only"))]
     fn p11_owner_start_remove(key: *const StartKey, required: u32) -> i64;
     fn p11_owner_discovery_get(key: *const StateKey, required: u32) -> *mut StartState;
     fn p11_owner_discovery_insert(
@@ -2142,6 +2189,7 @@ unsafe extern "C" {
 
 // All pairing map access is mediated by the native current-task owner. These
 // thin wrappers retain the existing callers' success/failure behavior.
+#[cfg(not(feature = "inventory-only"))]
 #[inline(always)]
 fn owned_start_get(key: &StartKey) -> Option<&'static CallStart> {
     unsafe { p11_owner_start_get(key, 0).as_ref() }
@@ -2154,6 +2202,7 @@ fn owned_start_mut(key: &StartKey) -> Option<*mut CallStart> {
     (!pointer.is_null()).then_some(pointer)
 }
 
+#[cfg(not(feature = "inventory-only"))]
 #[inline(always)]
 fn owned_start_remove(key: &StartKey, required: bool) -> Result<(), ()> {
     (unsafe { p11_owner_start_remove(key, u32::from(required)) } == 0)
@@ -2180,6 +2229,7 @@ fn owned_discovery_remove(key: &StateKey, required: bool) -> Result<(), ()> {
         .ok_or(())
 }
 
+#[cfg(not(feature = "inventory-only"))]
 #[inline(always)]
 fn store_start(key: &StartKey, start: &CallStart) -> bool {
     if unsafe { p11_owner_start_insert(key, start) } == 0 {
@@ -2191,6 +2241,7 @@ fn store_start(key: &StartKey, start: &CallStart) -> bool {
     false
 }
 
+#[cfg(not(feature = "inventory-only"))]
 #[inline(always)]
 fn record_aggregate_start(key: &StartKey) {
     let mut storage = MaybeUninit::<CallStart>::uninit();
@@ -2201,6 +2252,7 @@ fn record_aggregate_start(key: &StartKey) {
     let _ = store_start(key, start);
 }
 
+#[cfg(not(feature = "inventory-only"))]
 #[inline(always)]
 fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContext) -> u32 {
     let slot = slot_of(&ctx);
@@ -2418,6 +2470,7 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
     0
 }
 
+#[cfg(not(feature = "inventory-only"))]
 #[uretprobe]
 pub fn p11_return(ctx: RetProbeContext) -> u32 {
     let slot = slot_of(&ctx);
@@ -2586,6 +2639,7 @@ pub fn p11_return(ctx: RetProbeContext) -> u32 {
     0
 }
 
+#[cfg(not(feature = "inventory-only"))]
 #[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn p11_link_fork_allowed() -> u32 {
@@ -2600,6 +2654,7 @@ pub extern "C" fn p11_link_fork_allowed() -> u32 {
     u32::from(scope.flags & FLAG_POLICY_AGGREGATE == 0)
 }
 
+#[cfg(not(feature = "inventory-only"))]
 #[unsafe(no_mangle)]
 #[inline(never)]
 pub unsafe extern "C" fn p11_link_emit_fork(

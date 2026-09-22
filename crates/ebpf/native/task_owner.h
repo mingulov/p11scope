@@ -10,7 +10,9 @@ typedef unsigned long long u64;
 #define __type(name, value) typeof(value) *name
 #define OWNER_LEASED 1U
 #define OWNER_CAS_TRIES 8
-#ifdef P11SCOPE_SMALL_STATE_MAPS
+#if defined(P11SCOPE_INVENTORY_ONLY)
+#define OWNER_LIMIT 64ULL
+#elif defined(P11SCOPE_SMALL_STATE_MAPS)
 #define OWNER_LIMIT 65ULL
 #else
 #define OWNER_LIMIT 16448ULL
@@ -68,7 +70,9 @@ _Static_assert(__builtin_offsetof(struct owner_discovery_key, cookie) == 8, "dis
 _Static_assert(__builtin_offsetof(struct owner_discovery_key, domain) == 16, "discovery domain");
 
 /* Existing real Rust map symbols; only their addresses enter map helpers. */
+#ifndef P11SCOPE_INVENTORY_ONLY
 extern unsigned char START;
+#endif
 extern unsigned char DISCOVERY_STATE;
 static void *(*owner_map_lookup)(void *, const void *) = (void *)1;
 static long (*owner_map_update)(void *, const void *, const void *, u64) = (void *)2;

@@ -104,6 +104,24 @@ fn main() {
         Ok("1") | Ok("true")
     );
 
+    build_variant(false, small_ring, small_state_maps, small_discovery_ring);
+    build_variant(true, small_ring, small_state_maps, small_discovery_ring);
+    println!(
+        "cargo:rustc-env=P11SCOPE_INVENTORY_VARIANT={}",
+        if small_discovery_ring {
+            "inventory-small-discovery"
+        } else {
+            "inventory"
+        }
+    );
+}
+
+fn build_variant(
+    inventory: bool,
+    small_ring: bool,
+    small_state_maps: bool,
+    small_discovery_ring: bool,
+) {
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR not set"));
@@ -115,39 +133,17 @@ fn main() {
     let mut cmd = bpf_tools::bpf_cargo_command_from_env()
         .unwrap_or_else(|error| panic!("selecting BPF Cargo and rustc: {error}"));
 
-    let native_bitcode = out_dir.join("image_identity.bc");
-    let status = Command::new("clang-18")
-        .args([
-            "-target",
-            if target.starts_with("bpfeb") {
-                "bpfeb"
-            } else {
-                "bpfel"
-            },
-            "-O2",
-            "-g",
-            "-Wall",
-            "-Wextra",
-            "-Werror",
-            "-emit-llvm",
-            "-c",
-        ])
-        .arg(manifest_dir.join("crates/ebpf/native/image_identity.c"))
-        .arg("-o")
-        .arg(&native_bitcode)
-        .status()
-        .expect("failed to spawn clang-18 for image identity");
-    assert!(
-        status.success(),
-        "building native image identity failed: {status}"
-    );
-
-    let owner_bitcode = out_dir.join("task_owner.bc");
-    let root_bitcode = out_dir.join("root_affiliation.bc");
-    for (unit, bitcode) in [
-        ("task_owner", &owner_bitcode),
-        ("root_affiliation", &root_bitcode),
-    ] {
+    // The native variant is isolated as well as the Cargo target directory.
+    // Inventory has no image identity, root affiliation, or START dependency.
+    let native_units: &[&str] = if inventory {
+        &["task_owner"]
+    } else {
+        &["image_identity", "task_owner", "root_affiliation"]
+    };
+    let mut native_bitcodes = Vec::new();
+    for unit in native_units {
+        let suffix = if inventory { "inventory" } else { "detailed" };
+        let bitcode = out_dir.join(format!("{unit}-{suffix}.bc"));
         let mut compile = Command::new("clang-18");
         compile
             .args([
@@ -167,18 +163,28 @@ fn main() {
             ])
             .arg(manifest_dir.join(format!("crates/ebpf/native/{unit}.c")))
             .arg("-o")
-            .arg(bitcode);
-        if small_state_maps {
+            .arg(&bitcode);
+        if inventory {
+            compile.arg("-DP11SCOPE_INVENTORY_ONLY");
+        } else if small_state_maps && *unit != "image_identity" {
             compile.arg("-DP11SCOPE_SMALL_STATE_MAPS");
         }
         let status = compile
             .status()
             .expect("failed to spawn clang-18 for native state");
-        assert!(status.success(), "building native {unit} failed: {status}");
+        assert!(
+            status.success(),
+            "building native {unit} ({suffix}) failed: {status}"
+        );
+        native_bitcodes.push(bitcode);
     }
 
     let ebpf_manifest = manifest_dir.join("crates/ebpf/Cargo.toml");
-    let target_dir = out_dir.join("ebpf-target");
+    let target_dir = out_dir.join(if inventory {
+        "ebpf-inventory-target"
+    } else {
+        "ebpf-target"
+    });
     cmd.args([
         "build",
         "--locked",
@@ -193,10 +199,13 @@ fn main() {
     .arg("--target-dir")
     .arg(&target_dir);
     let mut features = Vec::new();
-    if small_ring {
+    if inventory {
+        features.push("inventory-only");
+    }
+    if small_ring && !inventory {
         features.push("small-ring");
     }
-    if small_state_maps {
+    if small_state_maps && !inventory {
         features.push("small-state-maps");
     }
     if small_discovery_ring {
@@ -221,14 +230,6 @@ fn main() {
         "-C",
         "link-arg=--btf",
         "-C",
-        "link-arg=--export=p11_link_current_identity",
-        "-C",
-        "link-arg=--export=p11_link_fork_allowed",
-        "-C",
-        "link-arg=--export=p11_link_emit_fork",
-        "-C",
-        "link-arg=--export=task_newtask",
-        "-C",
         "link-arg=--export=p11_owner_reserve",
         "-C",
         "link-arg=--export=p11_owner_refund",
@@ -237,17 +238,29 @@ fn main() {
     ] {
         append_flag(flag);
     }
-    append_flag("-C");
-    append_flag(&format!("link-arg={}", native_bitcode.display()));
-    append_flag("-C");
-    append_flag(&format!("link-arg={}", owner_bitcode.display()));
-    append_flag("-C");
-    append_flag(&format!("link-arg={}", root_bitcode.display()));
-    for symbol in ["START", "DISCOVERY_STATE"] {
+    if !inventory {
+        for flag in [
+            "-C",
+            "link-arg=--export=p11_link_current_identity",
+            "-C",
+            "link-arg=--export=p11_link_fork_allowed",
+            "-C",
+            "link-arg=--export=p11_link_emit_fork",
+            "-C",
+            "link-arg=--export=task_newtask",
+        ] {
+            append_flag(flag);
+        }
         append_flag("-C");
-        append_flag(&format!("link-arg=--export={symbol}"));
+        append_flag("link-arg=--export=START");
     }
-    if env::var_os("CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA").is_some() {
+    for bitcode in native_bitcodes {
+        append_flag("-C");
+        append_flag(&format!("link-arg={}", bitcode.display()));
+    }
+    append_flag("-C");
+    append_flag("link-arg=--export=DISCOVERY_STATE");
+    if !inventory && env::var_os("CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA").is_some() {
         features.push("unsafe-unvalidated-metadata");
         // Preserve separately verified diagnostic helpers and their BTF signatures.
         for flag in [
@@ -289,6 +302,13 @@ fn main() {
     assert!(status.success(), "building crates/ebpf failed: {status}");
 
     let built = target_dir.join(target).join("release/p11scope-ebpf");
-    std::fs::copy(&built, out_dir.join("p11scope-ebpf"))
-        .unwrap_or_else(|e| panic!("copying {} to OUT_DIR: {e}", built.display()));
+    std::fs::copy(
+        &built,
+        out_dir.join(if inventory {
+            "p11scope-ebpf-inventory"
+        } else {
+            "p11scope-ebpf"
+        }),
+    )
+    .unwrap_or_else(|e| panic!("copying {} to OUT_DIR: {e}", built.display()));
 }

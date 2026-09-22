@@ -42,7 +42,13 @@ static u64 controlled_cas(u64 *cell, u64 old, u64 replacement)
     return __sync_val_compare_and_swap(cell, old, replacement);
 }
 
-static size_t key_size(void *map) { return map == &START ? 16 : 24; }
+static size_t key_size(void *map) {
+#ifdef P11SCOPE_INVENTORY_ONLY
+    /* Any remaining START transaction or cleanup is a test failure. */
+    assert(map == &DISCOVERY_STATE);
+#endif
+    return map == &START ? 16 : 24;
+}
 static struct row *row(void *map, const void *key)
 {
     for (unsigned i = 0; i < 600; i++)
@@ -127,7 +133,9 @@ static void cas_boundaries(void)
     reset();
     assert(ctl.limit == OWNER_LIMIT);
     assert(OWNER_LIMIT ==
-#ifdef P11SCOPE_SMALL_STATE_MAPS
+#if defined(P11SCOPE_INVENTORY_ONLY)
+           64ULL
+#elif defined(P11SCOPE_SMALL_STATE_MAPS)
            65ULL
 #else
            16448ULL
@@ -172,10 +180,12 @@ static void cas_boundaries(void)
     assert(p11_owner_refund());
     assert(cas_attempts == 1 && !ctl.outstanding && ctl.poison == OWNER_CLASSIFIER_FAILED);
 }
+#ifndef P11SCOPE_INVENTORY_ONLY
 static struct owner_start_key start_key(u32 slot)
 {
     return (struct owner_start_key){pid_tgid(), slot, 0};
 }
+#endif
 static struct owner_discovery_key discovery_key(u64 cookie, u64 domain)
 {
     return (struct owner_discovery_key){pid_tgid(), cookie, domain};
@@ -191,6 +201,15 @@ static void classifier(void)
     assert(ctl.outstanding == 1 && deletes == 1 && !creates);
     reset(); ctl.outstanding = 1;
     p11_owner_cleanup(); assert(!ctl.poison && ctl.outstanding == 1 && deletes == 1);
+#ifdef P11SCOPE_INVENTORY_ONLY
+    reset(); struct owner_discovery_key key = discovery_key(7, 1);
+    assert(!p11_owner_discovery_insert(&key, value, 1));
+    miss_get = 1;
+    p11_owner_cleanup();
+    assert(ctl.poison && ctl.outstanding == 1 && row(&DISCOVERY_STATE, &key));
+    assert(!p11_owner_discovery_get(&key, 1));
+    assert(p11_owner_discovery_insert(&key, value, 1));
+#else
     reset(); struct owner_start_key key = start_key(7);
     assert(!p11_owner_start_insert(&key, value));
     miss_get = 1; /* Classifier unexpectedly deletes an unknown installed owner. */
@@ -198,8 +217,10 @@ static void classifier(void)
     assert(ctl.poison && ctl.outstanding == 1 && row(&START, &key));
     assert(!p11_owner_start_get(&key, 1)); /* Poison must dominate saved state. */
     assert(p11_owner_start_insert(&key, value));
+#endif
     assert(!p11_owner_healthy());
 }
+#ifndef P11SCOPE_INVENTORY_ONLY
 static void transactions(void)
 {
     reset(); struct owner_start_key key = start_key(7);
@@ -247,6 +268,7 @@ static void transactions(void)
     }
     assert(!ctl.poison && !ctl.outstanding);
 }
+#endif
 static void directory(void)
 {
     reset(); struct owner_discovery_key a = discovery_key(0, 1), b = discovery_key(0, 2);
@@ -281,6 +303,7 @@ static void directory(void)
     assert(owners[0].occupied == ~0ULL && ctl.outstanding == 1);
     p11_owner_cleanup(); assert(ctl.abandoned_discovery == 64 && !ctl.outstanding);
 }
+#ifndef P11SCOPE_INVENTORY_ONLY
 static void lifecycle(void)
 {
     reset(); struct owner_start_key first = start_key(7);
@@ -328,6 +351,7 @@ static void poisoned_reads(void)
     assert(p11_owner_start_insert(&start, value));
     assert(ctl.poison && row(&START, &start) && ctl.outstanding == 1);
 }
+#endif
 /* Each operation starts healthy: poison from the first refusal must not make
  * the later refusals vacuous. Both domains use the same numeric key in a
  * different physical task, including one with its own installed owner. */
@@ -368,6 +392,7 @@ static void discovery_foreign_owner(void)
         }
     }
 }
+#ifndef P11SCOPE_INVENTORY_ONLY
 static void capacity_collision(void)
 {
     reset();
@@ -436,6 +461,47 @@ static void ordinary_absence(void)
     assert(p11_owner_discovery_insert(&live_discovery, value, 1));
     assert(ctl.poison && ctl.outstanding == 1 && installed[0]);
 }
+#endif
+#ifdef P11SCOPE_INVENTORY_ONLY
+static void inventory_contract(void)
+{
+    reset();
+    struct owner_discovery_key key = discovery_key(7, 1);
+    /* Numeric capacity is tested through admission, not only a macro. */
+    ctl.outstanding = 64;
+    assert(p11_owner_discovery_insert(&key, value, 1));
+    assert(!creates && ctl.outstanding == 64 && ctl.admission_failures == 1);
+    ctl.outstanding = 63;
+    assert(!p11_owner_discovery_insert(&key, value, 1));
+    assert(ctl.outstanding == 64);
+    assert(!p11_owner_discovery_remove(&key, 1));
+    assert(ctl.outstanding == 63);
+
+    for (unsigned operation = 0; operation < 4; operation++) {
+        reset();
+        assert(!p11_owner_discovery_insert(&key, value, 1));
+        owners[0].start_count = 1;
+        if (operation == 0) assert(!p11_owner_discovery_get(&key, 1));
+        else if (operation == 1) assert(p11_owner_discovery_insert(&key, value, 2));
+        else if (operation == 2) assert(p11_owner_discovery_remove(&key, 1));
+        else p11_owner_cleanup();
+        assert((ctl.poison & OWNER_BAD_RECORD) && ctl.outstanding == 1);
+        assert(row(&DISCOVERY_STATE, &key) && !ctl.abandoned_start);
+    }
+    reset();
+    assert(!p11_owner_discovery_insert(&key, value, 1));
+    ctl.poison = OWNER_CLASSIFIER_FAILED;
+    assert(!p11_owner_discovery_get(&key, 1));
+    p11_owner_cleanup();
+    assert(ctl.poison && !ctl.outstanding && ctl.abandoned_discovery == 1);
+    assert(!ctl.abandoned_start);
+}
+int main(void)
+{
+    cas_boundaries(); classifier(); inventory_contract(); directory(); discovery_foreign_owner();
+    puts("task-owner inventory: real discovery capacity, transactions, poison and cleanup passed");
+}
+#else
 int main(int argc, char **argv)
 {
     if (argc == 2) {
@@ -454,3 +520,5 @@ int main(int argc, char **argv)
     }
     puts("task-owner: actual helper classifier, transactions, directory and lifecycle controls passed");
 }
+
+#endif

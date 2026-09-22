@@ -54,6 +54,9 @@ numeric performance success is claimed by this plan.
   and individual-call trace as explicit capabilities with measured costs.
   A usage bit is not a counter. Turning off latency does not eliminate the
   return observation required to establish a call's outcome.
+- Event time and duration are separate. Second-resolution activity/operation
+  timestamps satisfy the user's minimum time requirement; finer timestamps
+  and duration measurements are optional and need overhead qualification.
 - Detailed-mode behavior remains unchanged until its separate reviewed changes.
   Optional filtered detail does not substitute for broad detailed-mode scaling.
 - Never equate entry-only ordinary probes with return-free discovery. Interface
@@ -237,12 +240,18 @@ Concurrent map reads are not an atomic machine-wide instant. Count completed
 operations consistently at their observed completion; retain initialization
 and key context across collection boundaries.
 
-RSA bit length and EC curve require a separate bounded public-metadata path
-and lifecycle-bound object-handle associations. Mechanism identity alone does
-not supply them. Observe safe key-generation/attribute metadata only where
-the implementation can establish provenance; otherwise output unknown. Do not
-read key material or actively call into a production provider. This needs an
-explicit metadata allowlist/schema review and canary update before release.
+RSA bit length and EC curve are optional enrichment, per the user's subsequent
+clarification. They require a separate bounded public-metadata path and
+lifecycle-bound object-handle associations. Mechanism identity alone does not
+supply them. Observe safe key-generation/import/attribute metadata only where
+the implementation can establish provenance; otherwise output unknown. Cache
+eviction must preserve call/operation counts and yield unknown enrichment for
+future observations, never a guessed or reused association. Separate requested
+key-generation metadata from successful generation and later-key use. Do not
+read key material or actively call into a production provider. Token inspection
+is a separate possible feature; the mere presence of a matching key does not
+identify the key used by an application call. This needs an explicit metadata
+allowlist/schema review and canary update before release.
 
 Evaluate kernel aggregation against the current per-call event/reducer path,
 including context lookup, cardinality, CPU multiplicity, dropped updates and

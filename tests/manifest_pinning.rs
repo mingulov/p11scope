@@ -1964,9 +1964,81 @@ fn a_retargeted_path_is_skipped_as_an_identity_mismatch() {
 
 #[test]
 fn an_object_over_the_byte_budget_is_skipped_naming_the_cap() {
-    use p11scope::discovery::scan::ScanLimits;
+    use p11scope::discovery::hooks::HookRegistry;
+    use p11scope::discovery::scan::{ScanLimits, ScanRequest, scan_pid};
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd as _;
+    use std::process::Stdio;
 
-    let (exe, modules) = scan_self();
+    // The budget check needs a mapped object. A child owns stable mappings while
+    // other tests in this binary run, and is reaped even if an assertion fails.
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tmpdir("byte-budget-child");
+    let source = dir.join("hold.c");
+    let executable = dir.join("hold");
+    std::fs::write(
+        &source,
+        "#include <unistd.h>\nint main(void) { char ready = 'R', stop; if (write(1, &ready, 1) != 1) return 2; return read(0, &stop, 1) == 1 ? 0 : 3; }\n",
+    )
+    .unwrap();
+    {
+        let _guard = CC_LOCK.lock().unwrap();
+        assert!(
+            Command::new("gcc")
+                .arg("-o")
+                .arg(&executable)
+                .arg(&source)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let mut child = ChildGuard(
+        Command::new(&executable)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let stdout = child.0.stdout.as_mut().unwrap();
+    let mut poll = libc::pollfd {
+        fd: stdout.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: the child pipe remains open and poll borrows one initialized fd.
+    let ready_events = unsafe { libc::poll(&mut poll, 1, 5000) };
+    assert_eq!(ready_events, 1, "child readiness deadline or poll failure");
+    assert_ne!(poll.revents & libc::POLLIN, 0, "child closed before ready");
+    let mut ready = [0];
+    stdout.read_exact(&mut ready).unwrap();
+    assert_eq!(ready, [b'R']);
+    let pid = child.0.id();
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
+    let hooks = HookRegistry::builtin();
+    let outcome = scan_pid(
+        &ScanRequest {
+            pid,
+            hints: &[exe.clone()],
+            hooks: &hooks,
+        },
+        &mut self_binary_budget(),
+    )
+    .unwrap();
+    let modules = outcome.modules();
+    assert_eq!(
+        modules.len(),
+        1,
+        "the hinted child executable must be selected before testing pinning: {:?}",
+        outcome.skipped()
+    );
+    assert_eq!(modules[0].path, exe.display().to_string());
     // Sized from live data: one byte under the object the scan actually reported.
     let len = std::fs::metadata(&exe).unwrap().len();
     let limits = ScanLimits {
@@ -1974,8 +2046,8 @@ fn an_object_over_the_byte_budget_is_skipped_naming_the_cap() {
         total_bytes: u64::MAX,
     };
     let (pinned, skipped) = p11scope::discovery::identity::pin_scanned_objects(
-        std::process::id(),
-        &modules,
+        pid,
+        modules,
         &mut CaptureWorkBudget::new(limits),
     )
     .unwrap();

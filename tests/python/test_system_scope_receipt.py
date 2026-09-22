@@ -30,6 +30,19 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def fd_mount_id(path):
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        prefix = "mnt_id:\t"
+        for line in Path(f"/proc/self/fdinfo/{fd}").read_text(
+                encoding="utf-8").splitlines():
+            if line.startswith(prefix):
+                return int(line.removeprefix(prefix))
+    finally:
+        os.close(fd)
+    raise AssertionError("opened test file has no fd mount identity")
+
+
 def proc_stat(pid, starttime):
     # Fields 4..21 are zero; starttime is field 22. The command deliberately
     # contains a space and ')' to exercise last-paren parsing.
@@ -39,7 +52,7 @@ def proc_stat(pid, starttime):
 class SyntheticProc:
     def __init__(self, root, mapped, *, pid=4321, starttime=777,
                  address=0x7F000123, path="/alias/provider.so", perms="r-xp",
-                 mapping_dev=None):
+                 mapping_dev=None, mountinfo=None):
         self.root = root
         self.pid = pid
         self.starttime = starttime
@@ -48,13 +61,24 @@ class SyntheticProc:
         self.end = 0x7F001000
         process = root / str(pid)
         (process / "map_files").mkdir(parents=True)
+        (process / "ns").mkdir()
+        (process / "ns" / "mnt").write_text("synthetic namespace\n",
+                                               encoding="utf-8")
         (process / "stat").write_text(proc_stat(pid, starttime), encoding="utf-8")
         info = mapped.stat()
         dev = mapping_dev or f"{os.major(info.st_dev):x}:{os.minor(info.st_dev):x}"
+        mapping_major, mapping_minor = (int(field, 16)
+                                        for field in dev.split(":", 1))
         line = (f"{self.begin:x}-{self.end:x} {perms} 00000000 {dev} "
                 f"{info.st_ino} {path}\n")
         (process / "maps").write_text(line, encoding="utf-8")
         (process / "map_files" / f"{self.begin:x}-{self.end:x}").symlink_to(mapped)
+        mount_id = fd_mount_id(mapped)
+        if mountinfo is None:
+            mountinfo = (f"{mount_id} 1 {mapping_major}:{mapping_minor} "
+                         "/ /synthetic rw - "
+                         "synthetic synthetic rw\n")
+        (process / "mountinfo").write_text(mountinfo, encoding="utf-8")
         self.handshake = root / "mapped"
         self.handshake.write_text(
             f"pid={pid} starttime={starttime} endpoint=0x{address:x}\n",
@@ -125,7 +149,7 @@ class ReceiptCliTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("expected copy identity", result.stderr)
 
-    def test_mapping_and_opened_device_domains_are_preserved(self):
+    def test_btrfs_device_domains_are_bridged_through_target_mountinfo(self):
         with tempfile.TemporaryDirectory() as raw:
             base = Path(raw)
             private = base / "private.so"
@@ -141,6 +165,12 @@ class ReceiptCliTest(unittest.TestCase):
                 os.major(private.stat().st_dev), os.minor(private.stat().st_dev)])
             self.assertNotEqual(receipt["mapping_identity"]["dev"],
                                 receipt["opened_file_identity"]["dev"])
+            self.assertEqual(receipt["opened_mapping_identity"]["dev"],
+                             [0, 0x23])
+            self.assertEqual(receipt["opened_mapping_identity"]["ino"],
+                             private.stat().st_ino)
+            self.assertEqual(receipt["mapping_bridge"]["kind"],
+                             "map_files_fdinfo_target_mountinfo")
             receipt_path = base / "receipt.json"
             receipt_path.write_text(result.stdout, encoding="utf-8")
             source = base / "source.so"
@@ -158,7 +188,82 @@ class ReceiptCliTest(unittest.TestCase):
             self.assertEqual(joined["dev"], [0, 0x23])
             self.assertEqual(joined["ino"], private.stat().st_ino)
             self.assertEqual(joined["sha256"], digest(private))
-            self.assertFalse(joined["report_identity_associated"])
+            self.assertTrue(joined["report_identity_associated"])
+            self.assertEqual(joined["report_identity_bridge"][
+                "opened_file_identity"]["dev"], receipt[
+                    "opened_file_identity"]["dev"])
+
+    def test_same_domain_mapping_remains_associated(self):
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            private = base / "private.so"
+            private.write_bytes(b"provider")
+            info = private.stat()
+            dev = f"{os.major(info.st_dev):x}:{os.minor(info.st_dev):x}"
+            proc = SyntheticProc(base / "proc", private, mapping_dev=dev)
+            result = self.run_mapping(proc, private)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            receipt = json.loads(result.stdout)
+            self.assertEqual(receipt["mapping_identity"], {
+                "dev": [os.major(info.st_dev), os.minor(info.st_dev)],
+                "ino": info.st_ino,
+            })
+            self.assertEqual(receipt["mapping_identity"], {
+                "dev": receipt["opened_mapping_identity"]["dev"],
+                "ino": receipt["opened_mapping_identity"]["ino"],
+            })
+
+    def test_target_mountinfo_not_observer_mountinfo_defines_mapping_device(self):
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            private = base / "private.so"
+            private.write_bytes(b"provider")
+            actual = private.stat()
+            self.assertNotEqual([os.major(actual.st_dev), os.minor(actual.st_dev)],
+                                [0, 0x23])
+            proc = SyntheticProc(base / "proc", private, mapping_dev="0:23")
+            result = self.run_mapping(proc, private)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)[
+                "opened_mapping_identity"]["dev"], [0, 0x23])
+
+    def test_wrong_target_mount_device_is_refused(self):
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            private = base / "private.so"
+            private.write_bytes(b"provider")
+            mount_id = fd_mount_id(private)
+            proc = SyntheticProc(
+                base / "proc", private, mapping_dev="0:23",
+                mountinfo=f"{mount_id} 1 0:36 / /x rw - x x rw\n")
+            result = self.run_mapping(proc, private)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("mountinfo identity disagrees", result.stderr)
+
+    def test_mountinfo_missing_duplicate_malformed_partial_and_overlimit_fail(self):
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            private = base / "private.so"
+            private.write_bytes(b"provider")
+            mount_id = fd_mount_id(private)
+            cases = {
+                "missing": "999999 1 0:23 / /x rw - x x rw\n",
+                "duplicate": (f"{mount_id} 1 0:35 / /a rw - x x rw\n"
+                              f"{mount_id} 1 0:35 / /b rw - x x rw\n"),
+                "malformed": f"{mount_id} 1 not-a-device / /x rw - x x rw\n",
+                "short": f"{mount_id} 1 0:35\n",
+                "missing separator": (
+                    f"{mount_id} 1 0:35 / /x rw synthetic source rw\n"),
+                "partial": f"{mount_id} 1 0:35 / /x rw - x x rw",
+                "overlimit": "x" * (RECEIPT_NS["MAX_MOUNTINFO_BYTES"] + 1),
+            }
+            for name, table in cases.items():
+                with self.subTest(name=name):
+                    proc = SyntheticProc(base / name, private,
+                                         mapping_dev="0:23", mountinfo=table)
+                    result = self.run_mapping(proc, private)
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertIn("mountinfo", result.stderr)
 
     def test_missing_map_files_pin_is_unknown(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -192,6 +297,136 @@ class ReceiptCliTest(unittest.TestCase):
             result = self.run_mapping(before, private, after_root=after.root)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("birth identity changed", result.stderr)
+
+    def test_mount_namespace_change_between_snapshots_is_refused(self):
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            private = base / "private.so"
+            private.write_bytes(b"provider")
+            before = SyntheticProc(base / "before", private)
+            after = SyntheticProc(base / "after", private)
+            result = self.run_mapping(before, private, after_root=after.root)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("mount namespace changed", result.stderr)
+
+    def test_map_files_descriptor_is_retained_through_after_snapshot(self):
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            private = base / "private.so"
+            private.write_bytes(b"provider")
+            proc = SyntheticProc(base / "proc", private)
+            real_identity = RECEIPT_NS["identity_from_fd"]
+            real_read_maps = RECEIPT_NS["read_maps"]
+            pin = {"fd": None}
+            reads = {"count": 0}
+
+            def identity(fd, path):
+                if "map_files" in str(path):
+                    pin["fd"] = fd
+                return real_identity(fd, path)
+
+            def read_maps(root, pid):
+                reads["count"] += 1
+                if reads["count"] == 2:
+                    os.fstat(pin["fd"])
+                return real_read_maps(root, pid)
+
+            args = argparse.Namespace(
+                proc_root=str(proc.root), after_proc_root=None,
+                handshake=str(proc.handshake), expected_file=str(private),
+                source_file=None)
+            with mock.patch.dict(RECEIPT_NS["mapping_receipt"].__globals__, {
+                    "identity_from_fd": identity, "read_maps": read_maps}):
+                RECEIPT_NS["mapping_receipt"](args)
+            with self.assertRaises(OSError):
+                os.fstat(pin["fd"])
+
+    def test_final_maps_read_is_bracketed_by_birth_and_namespace(self):
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            private = base / "private.so"
+            private.write_bytes(b"provider")
+            for case in ("birth", "namespace"):
+                with self.subTest(case=case):
+                    proc = SyntheticProc(base / case, private)
+                    real_identity = RECEIPT_NS["identity_from_fd"]
+                    real_read_maps = RECEIPT_NS["read_maps"]
+                    pin = {"fd": None}
+                    reads = {"count": 0}
+
+                    def identity(fd, path):
+                        if "map_files" in str(path):
+                            pin["fd"] = fd
+                        return real_identity(fd, path)
+
+                    def raced_maps(root, pid):
+                        reads["count"] += 1
+                        if reads["count"] == 2:
+                            if case == "birth":
+                                (proc.root / str(pid) / "stat").write_text(
+                                    proc_stat(pid, proc.starttime + 1),
+                                    encoding="utf-8")
+                            else:
+                                replacement = (proc.root / str(pid) / "ns" /
+                                               "replacement")
+                                replacement.write_text("replacement namespace\n",
+                                                       encoding="utf-8")
+                                os.replace(replacement, proc.root / str(pid) /
+                                           "ns" / "mnt")
+                        return real_read_maps(root, pid)
+
+                    args = argparse.Namespace(
+                        proc_root=str(proc.root), after_proc_root=None,
+                        handshake=str(proc.handshake),
+                        expected_file=str(private), source_file=None)
+                    with mock.patch.dict(
+                            RECEIPT_NS["mapping_receipt"].__globals__, {
+                                "identity_from_fd": identity,
+                                "read_maps": raced_maps}):
+                        with self.assertRaisesRegex(
+                                RECEIPT_NS["ReceiptError"],
+                                "birth identity changed|mount namespace changed"):
+                            RECEIPT_NS["mapping_receipt"](args)
+                    with self.assertRaises(OSError):
+                        os.fstat(pin["fd"])
+
+    def test_metadata_rejects_forged_mapping_bridge(self):
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            source = base / "source.so"
+            private = base / "private.so"
+            observer = base / "observer"
+            source.write_bytes(b"provider")
+            private.write_bytes(b"provider")
+            observer.write_bytes(b"observer")
+            proc = SyntheticProc(base / "proc", private)
+            mapping = self.run_mapping(proc, private, source)
+            self.assertEqual(mapping.returncode, 0, mapping.stderr)
+            original = json.loads(mapping.stdout)
+            for name, mutate in (
+                    ("opened identity", lambda value: value[
+                        "opened_mapping_identity"].update(dev=[9, 9])),
+                    ("exact range", lambda value: value[
+                        "mapping_bridge"].update(range="1-2")),
+                    ("non executable", lambda value: value[
+                        "mapping"].update(perms="r--p")),
+                    ("endpoint outside", lambda value: value.update(
+                        endpoint_address="0x1"))):
+                with self.subTest(name=name):
+                    receipt = json.loads(json.dumps(original))
+                    mutate(receipt)
+                    receipt_path = base / "receipt.json"
+                    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+                    result = subprocess.run([
+                        "python3", "-I", str(RECEIPT), "metadata",
+                        "--receipt", str(receipt_path),
+                        "--observer", str(observer),
+                        "--source-file", str(source),
+                        "--copy-file", str(private),
+                    ], cwd=ROOT, text=True, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, check=False)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("mapping bridge", result.stderr)
 
     def test_metadata_wires_receipt_private_copy_and_observer_sha(self):
         with tempfile.TemporaryDirectory() as raw:

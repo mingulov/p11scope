@@ -641,6 +641,46 @@ def _module_identity(ref):
     return (dev, ref.get("ino"), ref.get("sha256"))
 
 
+def _validated_report_identity_bridge(receipt):
+    """Return the receipt identity only for an exact map-files bridge."""
+    if not isinstance(receipt, dict):
+        return None
+    identity = _module_identity(receipt)
+    bridge = receipt.get("report_identity_bridge")
+    if (receipt.get("report_identity_associated") is not True
+            or not isinstance(bridge, dict)
+            or bridge.get("schema") != "p11scope/map-files-mountinfo-bridge/v1"
+            or bridge.get("kind") != "map_files_fdinfo_target_mountinfo"):
+        return None
+    mapping = _module_identity(bridge.get("mapping_identity"))
+    opened_mapping = bridge.get("opened_mapping_identity")
+    opened_file = bridge.get("opened_file_identity")
+    if (identity is None or mapping is None
+            or not isinstance(opened_mapping, dict)
+            or not isinstance(opened_file, dict)):
+        return None
+    opened_mapping_identity = _module_identity(opened_mapping)
+    if (opened_mapping_identity is None
+            or type(opened_mapping.get("mount_id")) is not int
+            or opened_mapping["mount_id"] <= 0):
+        return None
+    identity_dev, identity_ino, identity_sha = identity
+    mapping_dev, mapping_ino, _ = mapping
+    opened_dev, opened_ino, _ = opened_mapping_identity
+    file_dev = opened_file.get("dev")
+    if isinstance(file_dev, (list, tuple)):
+        file_dev = tuple(file_dev)
+    if not (identity_dev == mapping_dev == opened_dev
+            and identity_ino == mapping_ino == opened_ino
+            and opened_file.get("ino") == identity_ino
+            and isinstance(identity_sha, str)
+            and opened_file.get("sha256") == identity_sha
+            and isinstance(file_dev, tuple) and len(file_dev) == 2
+            and all(type(part) is int and part >= 0 for part in file_dev)):
+        return None
+    return identity
+
+
 def assess_owned_coverage(functions, discovery, refused, owned_paths,
                           owned_receipts=None):
     """Owned-workload attribution for system-scope coverage (audit F2).
@@ -669,12 +709,11 @@ def assess_owned_coverage(functions, discovery, refused, owned_paths,
     for receipt in owned_receipts or []:
         if not isinstance(receipt, dict):
             continue
-        if receipt.get("report_identity_associated") is not True:
+        identity = _validated_report_identity_bridge(receipt)
+        if identity is None:
             association_unavailable = True
             continue
-        identity = _module_identity(receipt)
-        if identity is not None:
-            receipt_identities.add(identity)
+        receipt_identities.add(identity)
 
     def receipt_match(ref):
         if not isinstance(ref, dict):

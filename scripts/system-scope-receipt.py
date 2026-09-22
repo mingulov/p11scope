@@ -23,7 +23,9 @@ from pathlib import Path
 
 
 MAPPING_SCHEMA = "p11scope/workload-mapping-receipt/v1"
+MAPPING_BRIDGE_SCHEMA = "p11scope/map-files-mountinfo-bridge/v1"
 WRAPPER_SETTLEMENT_SCHEMA = "p11scope/wrapper-settlement/v1"
+MAX_MOUNTINFO_BYTES = 2 * 1024 * 1024
 HANDSHAKE = re.compile(
     r"^pid=(?P<pid>[1-9][0-9]*) starttime=(?P<starttime>[1-9][0-9]*) "
     r"endpoint=(?P<endpoint>0x[0-9a-fA-F]+)$"
@@ -219,6 +221,69 @@ def read_birth(proc_root, pid):
     return int(tail[19])
 
 
+def read_mount_namespace(proc_root, pid):
+    info = os.stat(Path(proc_root) / str(pid) / "ns" / "mnt")
+    return {"dev": [os.major(info.st_dev), os.minor(info.st_dev)],
+            "ino": info.st_ino}
+
+
+def read_mountinfo(proc_root, pid):
+    path = Path(proc_root) / str(pid) / "mountinfo"
+    with path.open("rb") as stream:
+        content = stream.read(MAX_MOUNTINFO_BYTES + 1)
+    require(len(content) <= MAX_MOUNTINFO_BYTES,
+            f"mountinfo exceeds {MAX_MOUNTINFO_BYTES}-byte bound")
+    require(content.endswith(b"\n"), "mountinfo is partial (missing final newline)")
+    return content
+
+
+def fd_mount_id(fd):
+    content = Path(f"/proc/self/fdinfo/{fd}").read_text(encoding="utf-8")
+    values = [line.removeprefix("mnt_id:\t") for line in content.splitlines()
+              if line.startswith("mnt_id:\t")]
+    require(len(values) == 1 and values[0].isdigit(),
+            "opened map_files fd mount identity is missing or malformed")
+    return int(values[0])
+
+
+def opened_mapping_identity(fd, mountinfo):
+    mount_id = fd_mount_id(fd)
+    try:
+        text = mountinfo.decode("utf-8", errors="strict")
+    except UnicodeError as error:
+        raise ReceiptError(f"mountinfo is not UTF-8: {error}") from error
+    rows = []
+    for line in text.splitlines():
+        fields = line.split()
+        require(len(fields) >= 3, f"malformed mountinfo row: {line!r}")
+        require(fields[0].isdigit(),
+                f"malformed mountinfo mount ID: {fields[0]!r}")
+        if int(fields[0]) == mount_id:
+            rows.append(fields)
+    require(len(rows) == 1,
+            f"fd mount {mount_id} resolves to {len(rows)} mountinfo rows")
+    selected = rows[0]
+    separators = [index for index, field in enumerate(selected)
+                  if field == "-"]
+    require(len(selected) >= 10
+            and selected[1].isdigit()
+            and selected[3].startswith("/")
+            and selected[4].startswith("/")
+            and len(separators) == 1
+            and separators[0] >= 6
+            and len(selected) - separators[0] - 1 >= 3,
+            "selected mountinfo row is structurally incomplete")
+    device = selected[2]
+    match = re.fullmatch(r"([0-9]+):([0-9]+)", device)
+    require(match is not None, f"malformed mountinfo device: {device!r}")
+    info = os.fstat(fd)
+    return {
+        "mount_id": mount_id,
+        "dev": [int(match[1]), int(match[2])],
+        "ino": info.st_ino,
+    }
+
+
 def read_process(proc_root, pid):
     text = (Path(proc_root) / str(pid) / "stat").read_text(encoding="utf-8").strip()
     close = text.rfind(")")
@@ -279,6 +344,68 @@ def same_mapping(left, right):
     return all(left[key] == right[key] for key in keys)
 
 
+def report_identity_bridge(receipt):
+    mapping = receipt.get("mapping_identity", {})
+    mapping_record = receipt.get("mapping", {})
+    opened_mapping = receipt.get("opened_mapping_identity", {})
+    opened = receipt.get("opened_file_identity", receipt.get("pinned", {}))
+    before_namespace = receipt.get("mount_namespace_identity_before")
+    after_namespace = receipt.get("mount_namespace_identity_after")
+    require(before_namespace == after_namespace
+            and isinstance(before_namespace, dict),
+            "mapping bridge mount namespace identity is invalid")
+    require(type(opened_mapping.get("mount_id")) is int
+            and opened_mapping["mount_id"] > 0,
+            "mapping bridge mount ID is invalid")
+    require(mapping.get("dev") == opened_mapping.get("dev")
+            and mapping.get("ino") == opened_mapping.get("ino"),
+            "mapping bridge mountinfo identity disagrees with maps")
+    require(mapping.get("ino") == opened.get("ino"),
+            "mapping bridge opened-file inode disagrees with maps")
+    bridge = {
+        "schema": MAPPING_BRIDGE_SCHEMA,
+        "kind": "map_files_fdinfo_target_mountinfo",
+        "mapping_identity": {
+            "dev": mapping["dev"], "ino": mapping["ino"]},
+        "opened_mapping_identity": {
+            "mount_id": opened_mapping["mount_id"],
+            "dev": opened_mapping["dev"], "ino": opened_mapping["ino"]},
+        "opened_file_identity": {
+            "dev": opened["dev"], "ino": opened["ino"],
+            "sha256": opened["sha256"]},
+    }
+    stored = receipt.get("mapping_bridge")
+    start_text = mapping_record.get("start")
+    end_text = mapping_record.get("end")
+    endpoint_text = receipt.get("endpoint_address")
+    try:
+        require(all(isinstance(value, str)
+                    and re.fullmatch(r"0x[0-9a-f]+", value)
+                    for value in (start_text, end_text, endpoint_text)),
+                "mapping bridge endpoint proof is not canonical")
+        start = int(start_text, 16)
+        end = int(end_text, 16)
+        endpoint = int(endpoint_text, 16)
+        require(start < end and start <= endpoint < end,
+                "mapping bridge endpoint is outside its executable range")
+        require(re.fullmatch(r"[r-][w-]x[ps]",
+                             str(mapping_record.get("perms"))) is not None,
+                "mapping bridge range is not executable")
+        exact_range = f"{start:x}-{end:x}"
+    except (KeyError, TypeError, ValueError) as error:
+        raise ReceiptError("mapping bridge endpoint proof is malformed") from error
+    require(isinstance(stored, dict)
+            and stored.get("schema") == MAPPING_BRIDGE_SCHEMA
+            and stored.get("kind") == bridge["kind"]
+            and stored.get("range") == exact_range
+            and stored.get("mount_namespace_identity") == before_namespace
+            and re.fullmatch(r"[0-9a-f]{64}",
+                             str(stored.get("mountinfo_sha256"))) is not None
+            and stored.get("report_identity_bridge") == bridge,
+            "mapping bridge receipt is missing or forged")
+    return bridge
+
+
 def mapping_receipt(args):
     pid, handshake_birth, endpoint = parse_handshake(args.handshake)
     before_root = Path(args.proc_root)
@@ -286,6 +413,7 @@ def mapping_receipt(args):
     birth_before = read_birth(before_root, pid)
     require(birth_before == handshake_birth,
             "mapped handshake PID birth identity does not match /proc")
+    namespace_before = read_mount_namespace(before_root, pid)
     maps_before_bytes, maps_before = read_maps(before_root, pid)
     mapping_before = addressed_mapping(maps_before, endpoint)
     pin_name = f"{mapping_before['start']:x}-{mapping_before['end']:x}"
@@ -300,6 +428,37 @@ def mapping_receipt(args):
         raise ReceiptError(f"cannot pin live map_files/{pin_name}: {error}") from error
     try:
         pinned = identity_from_fd(pin_fd, pin_path)
+        mountinfo_bytes = read_mountinfo(before_root, pid)
+        opened_mapping = opened_mapping_identity(pin_fd, mountinfo_bytes)
+        require(opened_mapping["dev"] == mapping_before["dev"]
+                and opened_mapping["ino"] == mapping_before["ino"],
+                "map_files mountinfo identity disagrees with addressed maps entry")
+
+        # Keep the exact VMA descriptor alive while copy provenance and the
+        # after snapshots are checked. Closing it earlier would discard the
+        # kernel relation before the receipt is complete.
+        expected = file_identity(args.expected_file)
+        require(physical(pinned) == physical(expected),
+                "pinned mapping does not match expected copy identity")
+        source = file_identity(args.source_file) if args.source_file else None
+
+        birth_after = read_birth(after_root, pid)
+        require(birth_after == birth_before,
+                "PID birth identity changed while pinning mapping")
+        namespace_after = read_mount_namespace(after_root, pid)
+        require(namespace_after == namespace_before,
+                "PID mount namespace changed while pinning mapping")
+        maps_after_bytes, maps_after = read_maps(after_root, pid)
+        mapping_after = addressed_mapping(maps_after, endpoint)
+        require(same_mapping(mapping_before, mapping_after),
+                "addressed executable mapping changed while pinning")
+        birth_final = read_birth(after_root, pid)
+        require(birth_final == birth_before,
+                "PID birth identity changed during final maps snapshot")
+        namespace_final = read_mount_namespace(after_root, pid)
+        require(namespace_final == namespace_before,
+                "PID mount namespace changed during final maps snapshot")
+        namespace_after = namespace_final
     finally:
         os.close(pin_fd)
     # `maps` reports the mapping superblock device while fstat reports the
@@ -310,22 +469,17 @@ def mapping_receipt(args):
     require(pinned["ino"] == mapping_before["ino"],
             "addressed map_files inode disagrees with /proc/PID/maps")
 
-    expected = file_identity(args.expected_file)
-    require(physical(pinned) == physical(expected),
-            "pinned mapping does not match expected copy identity")
-    source = file_identity(args.source_file) if args.source_file else None
-
-    birth_after = read_birth(after_root, pid)
-    require(birth_after == birth_before, "PID birth identity changed while pinning mapping")
-    maps_after_bytes, maps_after = read_maps(after_root, pid)
-    mapping_after = addressed_mapping(maps_after, endpoint)
-    require(same_mapping(mapping_before, mapping_after),
-            "addressed executable mapping changed while pinning")
-
     mapping_out = dict(mapping_before)
     mapping_out["start"] = f"0x{mapping_before['start']:x}"
     mapping_out["end"] = f"0x{mapping_before['end']:x}"
     mapping_out["offset"] = f"0x{mapping_before['offset']:x}"
+    bridge = {
+        "schema": MAPPING_BRIDGE_SCHEMA,
+        "kind": "map_files_fdinfo_target_mountinfo",
+        "range": pin_name,
+        "mount_namespace_identity": namespace_before,
+        "mountinfo_sha256": hashlib.sha256(mountinfo_bytes).hexdigest(),
+    }
     receipt = {
         "schema": MAPPING_SCHEMA,
         "pid": pid,
@@ -334,13 +488,26 @@ def mapping_receipt(args):
         "mapping": mapping_out,
         "mapping_identity": {
             "dev": mapping_before["dev"], "ino": mapping_before["ino"]},
+        "opened_mapping_identity": opened_mapping,
         "pinned": pinned,
         "opened_file_identity": pinned,
+        "mount_namespace_identity_before": namespace_before,
+        "mount_namespace_identity_after": namespace_after,
         "expected": expected,
         "source": source,
         "maps_before_sha256": hashlib.sha256(maps_before_bytes).hexdigest(),
         "maps_after_sha256": hashlib.sha256(maps_after_bytes).hexdigest(),
     }
+    bridge["report_identity_bridge"] = {
+        "schema": MAPPING_BRIDGE_SCHEMA,
+        "kind": bridge["kind"],
+        "mapping_identity": receipt["mapping_identity"],
+        "opened_mapping_identity": opened_mapping,
+        "opened_file_identity": {
+            "dev": pinned["dev"], "ino": pinned["ino"],
+            "sha256": pinned["sha256"]},
+    }
+    receipt["mapping_bridge"] = bridge
     return receipt
 
 
@@ -359,8 +526,7 @@ def metadata(args):
     require(mapping.get("dev") == receipt.get("mapping", {}).get("dev")
             and mapping.get("ino") == receipt.get("mapping", {}).get("ino"),
             "mapping identity disagrees with addressed maps entry")
-    require(mapping.get("ino") == opened.get("ino"),
-            "mapping/opened-file inode relation changed")
+    bridge = report_identity_bridge(receipt)
     require(copy["sha256"] == source["sha256"] and copy["size"] == source["size"],
             "private provider copy bytes differ from source")
     require((copy["dev"], copy["ino"]) != (source["dev"], source["ino"]),
@@ -378,9 +544,8 @@ def metadata(args):
     identity = {
         "dev": mapping["dev"], "ino": mapping["ino"],
         "sha256": opened["sha256"], "path": copy["path"],
-        # Device-domain mismatch has no report-visible opened-object link.
-        # Retain the diagnostic join but forbid it as attribution authority.
-        "report_identity_associated": mapping["dev"] == opened["dev"],
+        "report_identity_associated": True,
+        "report_identity_bridge": bridge,
     }
     return {
         "workload_module_identity": [identity],

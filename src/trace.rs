@@ -907,4 +907,15 @@ mod tests {
         assert!(!line.contains("sess#"), "{line}");
         assert!(!state.pid_has_process_state(100));
     }
+
+    // SYSPLAN residual F-17 (RED): the TRUNCATED message cites the effective
+    // cap instead of blaming a flag the operator never passed.
+    #[test]
+    fn truncated_message_cites_effective_default_cap() {
+        let msg = truncated_line(10_000_000);
+        assert!(
+            msg.contains("default"),
+            "default-cap truncation must say so: {msg:?}"
+        );
+    }
 }

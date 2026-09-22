@@ -1463,4 +1463,53 @@ mod tests {
             assert!(USAGE.contains(statement), "missing help text: {statement}");
         }
     }
+
+    // SYSPLAN residual F-17 (RED): the hidden 10M default trace cap is
+    // surfaced in help.
+    #[test]
+    fn help_surfaces_default_trace_event_cap() {
+        assert!(
+            USAGE.contains("10,000,000"),
+            "help never names the default trace event cap"
+        );
+    }
+
+    // SYSPLAN residual F-26 (RED): every P11SCOPE_* behavior switch is
+    // listed in --help/usage.
+    #[test]
+    fn help_lists_every_p11scope_env_switch() {
+        for var in ["P11SCOPE_BROAD_ADMIT", "P11SCOPE_LOADER_ENV_SANITIZED"] {
+            assert!(USAGE.contains(var), "help never names {var}");
+        }
+    }
+
+    // SYSPLAN residual F-30 (RED): docs/usage.md documents every CLI flag
+    // USAGE advertises, so help and the usage doc cannot drift apart.
+    #[test]
+    fn usage_doc_documents_every_cli_flag() {
+        const USAGE_MD: &str = include_str!("../docs/usage.md");
+        for flag in cli_flags_in(USAGE) {
+            assert!(
+                USAGE_MD.contains(&flag),
+                "docs/usage.md never documents {flag}"
+            );
+        }
+    }
+
+    /// Every `--flag` token advertised in `text` (`--mode`, not `--mode's`).
+    fn cli_flags_in(text: &str) -> Vec<String> {
+        let mut flags = Vec::new();
+        for token in text.split(|c: char| c.is_whitespace() || c == '[' || c == ']') {
+            let token = token.trim_matches(|c| c == ',' || c == '.' || c == ')');
+            let flag = token.split('=').next().unwrap_or("");
+            if flag.len() > 2
+                && flag.starts_with("--")
+                && flag[2..].chars().all(|c| c.is_ascii_lowercase() || c == '-')
+                && !flags.contains(&flag.to_string())
+            {
+                flags.push(flag.to_string());
+            }
+        }
+        flags
+    }
 }

@@ -1,0 +1,106 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""SYSPLAN residual CI/doc gates (F-04, F-28, F-27, F-63, F-40, F-30, F-29).
+
+Each test pins one residual finding's recurring gate: a privileged E2E job,
+a release-preview job, an advisory/deny gate, a scripts lint gate, a
+coverage gate with a ratchet, a help/usage drift check, and the flake
+quarantine mapping. All fail until the gates land (RED); the suite stays
+green by implementation, never by weakening.
+
+Run: python3 -I tests/python/test_residual_gates.py -v
+"""
+
+import re
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+CI_YML = ROOT / ".github" / "workflows" / "ci.yml"
+DENY_TOML = ROOT / "deny.toml"
+QUARANTINE = ROOT / "docs" / "notes" / "test-quarantine.md"
+
+
+def ci_text():
+    return CI_YML.read_text(encoding="utf-8")
+
+
+class ResidualGates(unittest.TestCase):
+    def test_privileged_e2e_job_exists(self):
+        """F-04: one privileged CI E2E job running the gated capture cells."""
+        text = ci_text()
+        self.assertIn("privileged-e2e", text)
+        self.assertIn("system-scope-measure", text)
+
+    def test_release_preview_job_exists(self):
+        """F-28: release-preview CI job (musl/docker/SBOM/build-release)."""
+        text = ci_text()
+        self.assertIn("release-preview", text)
+        self.assertIn("build-release.sh", text)
+
+    def test_advisory_gate_exists(self):
+        """F-27: cargo audit/deny CI gate + deny.toml."""
+        text = ci_text()
+        self.assertTrue(
+            "cargo-audit" in text or "cargo audit" in text, "no cargo audit gate"
+        )
+        self.assertTrue(
+            "cargo-deny" in text or "cargo deny" in text, "no cargo deny gate"
+        )
+        self.assertTrue(DENY_TOML.is_file(), "deny.toml missing")
+
+    def test_scripts_lint_gate_exists(self):
+        """F-63: shellcheck/ruff CI over scripts/."""
+        text = ci_text()
+        self.assertIn("shellcheck", text)
+        self.assertIn("ruff", text)
+
+    def test_coverage_gate_exists(self):
+        """F-40: llvm-cov/tarpaulin CI gate with a ratchet."""
+        text = ci_text()
+        self.assertTrue(
+            "llvm-cov" in text or "tarpaulin" in text, "no coverage gate"
+        )
+
+    def test_help_drift_check_exists(self):
+        """F-30: CI drift check for flags/help/usage agreement."""
+        text = ci_text()
+        self.assertTrue(
+            "help-drift" in text or "test_help_usage_drift" in text,
+            "no help/usage drift check in CI",
+        )
+
+    def test_flake_quarantine_mapping_exists(self):
+        """F-29: the 7 documented flakes have a quarantine mapping."""
+        self.assertTrue(QUARANTINE.is_file(), f"{QUARANTINE} missing")
+        text = QUARANTINE.read_text(encoding="utf-8")
+        for name in (
+            "lane13_evidence_finalizes_only_after_owned_cleanup",
+            "metadata_canary_matrix",
+            "stopped_canary_capture_lifecycle",
+            "native_helper_suite_recorded_launcher_requires_authenticated_generations_and_bounded_cleanup",
+            "actual_handoff_helpers_preserve_errno_and_retry_without_renewing_deadlines",
+            "release_seal_denies_the_caller_path_to_every_reached_command",
+            "signal_settlement_observes_second_sigint_during_fallback_term_grace",
+        ):
+            self.assertIn(name, text)
+
+
+class ResidualOracleKeys(unittest.TestCase):
+    def test_oracle_pins_new_evidence_keys(self):
+        """F-02/F-01/F-15: oracle pins drain_proven, verdict_detail,
+        uretprobe_override, handoff_child_pid."""
+        import runpy
+
+        checker = runpy.run_path(str(ROOT / "scripts/check-capture-evidence.py"))
+        keys = checker["BASE_EVIDENCE_KEYS"]
+        for key in (
+            "drain_proven",
+            "verdict_detail",
+            "uretprobe_override",
+            "handoff_child_pid",
+        ):
+            self.assertIn(key, keys)
+
+
+if __name__ == "__main__":
+    unittest.main()

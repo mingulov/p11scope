@@ -4709,4 +4709,66 @@ mod tests {
         );
         assert!(frame.contains(r"\u{1b}[2Jevil\r"), "{frame:?}");
     }
+
+    // SYSPLAN residual F-02 (RED): the terminal verdict splits clean-but-
+    // unproven from concrete-gap via a machine-readable drain_proven latch
+    // plus a verdict_detail enum. Terminal PARTIAL is kept, not deleted.
+    #[test]
+    fn terminal_verdict_splits_clean_unproven_from_concrete_gap() {
+        let mut clean = evidence();
+        clean.verdict();
+        assert_eq!(clean.completeness, "COMPLETE", "fixture must start clean");
+        clean.mark_terminal_drain_unproven();
+        let clean_value = versioned_evidence(&clean);
+        assert_eq!(clean_value["completeness"], "PARTIAL");
+        assert_eq!(clean_value["drain_proven"], false);
+        assert_eq!(clean_value["verdict_detail"], "clean_but_unproven");
+
+        let mut gappy = evidence();
+        gappy.event_loss = 1;
+        gappy.verdict();
+        assert_eq!(gappy.completeness, "PARTIAL");
+        gappy.mark_terminal_drain_unproven();
+        let gappy_value = versioned_evidence(&gappy);
+        assert_eq!(gappy_value["completeness"], "PARTIAL");
+        assert_eq!(gappy_value["drain_proven"], false);
+        assert_eq!(gappy_value["verdict_detail"], "concrete_gap");
+    }
+
+    // SYSPLAN residual F-01-partial (RED): the uretprobe/hazard override
+    // flag + reason is durable report evidence, not just a stderr warning.
+    #[test]
+    fn durable_evidence_records_uretprobe_override() {
+        let value = versioned_evidence(&evidence());
+        assert!(
+            value.get("uretprobe_override").is_some(),
+            "missing uretprobe_override in durable evidence: {value}"
+        );
+    }
+
+    // SYSPLAN residual F-15 (RED): the handed-back orphan PID is named in
+    // machine-readable evidence, not dropped.
+    #[test]
+    fn durable_evidence_names_handoff_child_pid() {
+        let value = versioned_evidence(&evidence());
+        assert!(
+            value.get("handoff_child_pid").is_some(),
+            "missing handoff_child_pid in durable evidence: {value}"
+        );
+    }
+
+    // SYSPLAN residual F-12 (RED): profile and metrics documents carry a
+    // machine-readable lane discriminator.
+    #[test]
+    fn profile_and_metrics_documents_carry_lane_discriminator() {
+        let profile = profile_json(
+            &reports_fixture(),
+            &evidence(),
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        assert_eq!(profile["lane"], "profile");
+        let metrics = json(&reports_fixture(), &evidence(), &capture_fixture());
+        assert_eq!(metrics["lane"], "metrics");
+    }
 }

@@ -2128,4 +2128,22 @@ mod tests {
             "doctor left a BPF program, link, or map loaded"
         );
     }
+
+    // SYSPLAN residual F-59 (RED): render() sanitizes newlines in details so
+    // one check can never forge a second output line.
+    #[test]
+    fn render_sanitizes_newlines_in_check_details() {
+        let out = render(&[Check {
+            name: "probe row".into(),
+            status: Status::Fail("first line\nverdict: forged".into()),
+        }]);
+        assert!(
+            !out.contains("verdict: forged\n") && !out.lines().any(|l| l == "verdict: forged"),
+            "raw injected line survived render: {out:?}"
+        );
+        assert!(
+            out.lines().count() == 3,
+            "one check must render exactly one row + tier + verdict: {out:?}"
+        );
+    }
 }

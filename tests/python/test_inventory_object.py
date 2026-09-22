@@ -56,6 +56,61 @@ class InventoryManifestTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("P11SCOPE_INVENTORY_OBJECT"), "actual object supplied by Rust integration gate")
 class ActualInventoryTests(unittest.TestCase):
+    def test_actual_usage_scope_refusal_cannot_reach_marking(self):
+        """Deleting, bypassing or reversing authorization must fail admission."""
+        body = Path(os.environ["P11SCOPE_INVENTORY_OBJECT"]).read_bytes()
+        elf = checker.Elf(body)
+        # Positive control uses the same entry checker as every mutation.
+        checker.validate_inventory_entry_reachability(elf)
+        roots = [symbol for symbol in elf.symbols
+                 if symbol[0] in {"p11_usage_entry_lp64", "p11_usage_entry_ia32"}]
+        self.assertEqual(len(roots), 2)
+        section = elf.sections["uprobe"]
+        for root in roots:
+            start = section[0][4] + root[4]
+            prefix = [struct.unpack_from("<BBhi", body, start + i * 8)
+                      for i in range(6)]
+            # Hand-checked actual lowering: returned Option discriminator,
+            # followed by the first conditional branch, before any USAGE work.
+            self.assertEqual(prefix[3], (0x85, 0x10, 0, -1))
+            self.assertEqual(prefix[4], (0x79, 0xa1, -32, 0))
+            self.assertEqual(prefix[5][0:2], (0x15, 1))
+            self.assertEqual(prefix[5][3], 0)
+            refusal = prefix[5][2]
+            for label, instruction in [
+                ("removed-authorization-branch", (0xbf, 0x11, 0, 0)),
+                ("bypassed-authorization-branch", (0x05, 0, 0, 0)),
+                ("inverted-authorization-branch", (0x55, 1, refusal, 0)),
+                ("refusal-continues-to-collection", (0x15, 1, 0, 0)),
+            ]:
+                changed = bytearray(body)
+                struct.pack_into("<BBhi", changed, start + 5 * 8, *instruction)
+                with self.subTest(program=root[0], mutation=label), self.assertRaises(RuntimeError):
+                    checker.validate_inventory_entry_reachability(checker.Elf(bytes(changed)))
+
+    def test_actual_usage_cannot_read_inventory_state_inside_authorization(self):
+        """A scope helper must not touch USAGE before returning authorization."""
+        body = Path(os.environ["P11SCOPE_INVENTORY_OBJECT"]).read_bytes()
+        elf = checker.Elf(body)
+        usage = next(i for i, symbol in enumerate(elf.symbols) if symbol[0] == "USAGE")
+        auth = [s for s in elf.symbols if s[0].endswith("10scope_auth")]
+        self.assertEqual(len(auth), 1)
+        locations = []
+        for row, raw in elf.sections.values():
+            if row[1] != 9 or row[7] != auth[0][3]:
+                continue
+            for offset in range(0, len(raw), 16):
+                address, info = struct.unpack_from("<QQ", raw, offset)
+                if (auth[0][4] <= address < auth[0][4] + auth[0][5]
+                        and elf.symbols[info >> 32][0] == "PID_FILTER"):
+                    self.assertEqual(info & 0xffffffff, 1)
+                    locations.append(row[4] + offset + 8)
+        self.assertEqual(len(locations), 1)
+        changed = bytearray(body)
+        struct.pack_into("<Q", changed, locations[0], (usage << 32) | 1)
+        with self.assertRaises(RuntimeError):
+            checker.validate_inventory_entry_reachability(checker.Elf(bytes(changed)))
+
     def test_actual_object_and_legacy_map_mutations(self):
         source = Path(os.environ["P11SCOPE_INVENTORY_OBJECT"])
         maps, programs, symbols = checker.inspect(source, variant=os.environ.get("P11SCOPE_INVENTORY_VARIANT", "inventory"))

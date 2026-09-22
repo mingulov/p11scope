@@ -927,12 +927,60 @@ def validate_inventory_usage_transition(elf, root, relocations):
     raise RuntimeError("usage already-one path must return without a write or atomic operation")
 
 
+def validate_inventory_scope_prefix(elf, root, relocations):
+    """Prove caller refusal for the supported emitted Option<ScopeAuth> ABI.
+
+    This is a fail-closed lowering contract, not a general BPF interpreter or
+    a proof of scope_auth's PID/cgroup/config semantics. The first six
+    instructions must call the actual local scope_auth with a stack result,
+    then test that result's discriminator. Refusal may only return zero.
+    """
+    body = checked_slice(elf.sections["uprobe"][1], root[4], root[5], "usage root")
+    if len(body) % 8 or len(body) < 6 * 8:
+        raise RuntimeError("inventory authorization requires an aligned entry prefix")
+    instructions = [struct.unpack_from("<BBhi", body, i) for i in range(0, len(body), 8)]
+    # No branch, payload access or map operation can precede authorization.
+    # R6 preserves the original probe context; R1 is the 32-byte sret frame.
+    if instructions[:3] != [(0xbf, 0x16, 0, 0), (0xbf, 0xa1, 0, 0), (0x07, 1, 0, -32)]:
+        raise RuntimeError("inventory authorization requires the checked stack-result prefix")
+    call = instructions[3]
+    relocation = relocations.get((root[3], root[4] + 3 * 8))
+    auth = [s for s in elf.symbols if s[0].endswith("10scope_auth")]
+    if (len(auth) != 1 or auth[0][1:3] != (2, 0)
+            or auth[0][3] != elf.indices.get(".text") or not auth[0][5]
+            or call[:3] != (0x85, 0x10, 0)
+            or not relocation or relocation[0] != 10
+            or (relocation[1][3], relocation[1][4] + (call[3] + 1) * 8) != auth[0][3:5]):
+        raise RuntimeError("inventory authorization must call the actual local scope_auth")
+    guard = instructions[5]
+    if (instructions[4] != (0x79, 0xa1, -32, 0)
+            or guard[:2] != (0x15, 1) or guard[3] != 0 or guard[2] <= 0):
+        raise RuntimeError("inventory authorization must reject the returned zero discriminator")
+    # The complete false path has no helper, map access, write, or alternative
+    # successor. Do not accept a branch merely because it targets some exit.
+    cursor, zeroed, visited = 6 + guard[2], False, set()
+    while 0 <= cursor < len(instructions) and cursor not in visited:
+        visited.add(cursor)
+        instruction = instructions[cursor]
+        if instruction == (0x95, 0, 0, 0) and zeroed:
+            return
+        if instruction == (0xb7, 0, 0, 0):
+            zeroed = True
+            cursor += 1
+        elif instruction[:2] == (0x05, 0) and instruction[2] > 0 and instruction[3] == 0:
+            cursor += 1 + instruction[2]
+        else:
+            break
+    raise RuntimeError("inventory authorization refusal must return without collection")
+
+
 def validate_inventory_entry_reachability(elf):
-    """Bounded emitted-call-graph check; this is not verifier or branch proof.
+    """Bounded call graph plus entry authorization/usage lowering contracts.
 
     Ordinary usage roots may only look up scope/config/use maps and call the
     four scalar/scope helpers below. Discovery's legitimate user reads are
-    checked separately and are not reachable from these roots.
+    checked separately and are not reachable from these roots. The caller
+    authorization proof is limited to validate_inventory_scope_prefix's ABI.
     """
     bodies = {(s[3], s[4]): s for s in elf.symbols if s[1] & 15 == 2 and s[5] and s[3]}
     sections = {elf.indices[name]: raw for name, (_, raw) in elf.sections.items()}
@@ -949,6 +997,7 @@ def validate_inventory_entry_reachability(elf):
         roots = [s for s in elf.symbols if s[0] == name]
         if len(roots) != 1 or roots[0][1:3] != (0x12, 0) or roots[0][3] != elf.indices.get("uprobe"):
             raise RuntimeError(f"inventory requires exact GLOBAL DEFAULT uprobe {name}")
+        validate_inventory_scope_prefix(elf, roots[0], relocations)
         validate_inventory_usage_transition(elf, roots[0], relocations)
         todo, seen = [(roots[0][3], roots[0][4])], set()
         helpers, maps, compare_exchanges = set(), set(), 0
@@ -976,6 +1025,11 @@ def validate_inventory_entry_reachability(elf):
                         map_name = matches[0] if len(matches) == 1 else ""
                     if relocation[0] != 1 or map_name not in allowed_maps:
                         raise RuntimeError(f"inventory entry reaches forbidden map/global {map_name!r}")
+                    # Authorization executes before its result can be checked.
+                    # It and its callees may not collect Inventory state. The
+                    # supported lowering keeps usage work in the entry root.
+                    if key != (roots[0][3], roots[0][4]) and map_name.startswith("USAGE"):
+                        raise RuntimeError("inventory authorization callee reaches usage state")
                     maps.add(map_name)
                 if op == 0x85:
                     if registers == 0:

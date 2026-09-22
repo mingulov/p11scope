@@ -1057,10 +1057,117 @@ def validate_inventory_entry_reachability(elf):
     return reports
 
 
+def validate_inventory_caller_entry_reachability(elf):
+    """Separate caller-flavor graph; never broaden the global-only allowlist.
+
+    This checks exact native linkage and reachable map/helper boundaries. The
+    caller object integration test additionally executes bounded ordinary-entry
+    bytecode cases with explicit scope and native-identity boundary results; it
+    does not treat graph reachability alone as an authorization proof.
+    """
+    bodies = {(s[3], s[4]): s for s in elf.symbols if s[1] & 15 == 2 and s[5] and s[3]}
+    sections = {elf.indices[name]: raw for name, (_, raw) in elf.sections.items()}
+    relocations = {}
+    for row, raw in elf.sections.values():
+        if row[1] == 9 and row[7] in {key[0] for key in bodies}:
+            for offset in range(0, len(raw), 16):
+                address, info = struct.unpack_from("<QQ", raw, offset)
+                relocations[row[7], address] = (info & 0xffffffff, elf.symbols[info >> 32])
+    identity = [s for s in elf.symbols if s[0] == "p11_link_current_identity"]
+    auth = [s for s in elf.symbols if s[0].endswith("10scope_auth")]
+    if (len(identity) != 1 or identity[0][1:3] != (0x12, 0)
+            or identity[0][3] != elf.indices.get(".text") or not identity[0][5]
+            or len(auth) != 1 or auth[0][1:3] != (2, 0)
+            or auth[0][3] != elf.indices.get(".text") or not auth[0][5]):
+        raise RuntimeError("caller inventory requires exact native identity and local scope boundaries")
+    btf = Btf(elf.sections[".BTF"][1])
+    functions = [node for node in btf.types[1:]
+                 if node[0] == 12 and node[1] == "p11_link_current_identity"]
+    if len(functions) != 1 or functions[0][3] != 1:
+        raise RuntimeError("caller identity requires one GLOBAL BTF function")
+    proto = btf.types[functions[0][2]]
+    if proto[0] != 13 or proto[3] != 1 or len(proto[5]) != 2:
+        raise RuntimeError("caller identity requires one exact output pointer")
+    result, pointer = btf.resolve(proto[2]), btf.resolve(proto[5][1])
+    if (result[0] != 1 or result[2] != 4 or pointer[0] != 2
+            or btf.resolve(pointer[2])[0:3] != (4, "image_identity", 16)):
+        raise RuntimeError("caller identity native ABI differs")
+    scope_maps = {"CONFIG", "PID_FILTER", "CGROUP_FILTER", "OWNER_CTL", "EVIDENCE"}
+    caller_maps = {"USAGE", "USAGE_CONFIG", "USAGE_EVIDENCE", "ENDPOINT_OBJECT",
+                   "CALLER_USE", "CALLER_EVIDENCE", "TASK_COOKIE", "COOKIE_CTL"}
+
+    def walk(start, allowed_maps, allowed_helpers):
+        todo, seen, maps, helpers, atomic = [start], set(), set(), set(), 0
+        while todo:
+            key = todo.pop()
+            if key in seen:
+                continue
+            if key not in bodies:
+                raise RuntimeError("caller inventory has an unresolved call")
+            seen.add(key)
+            symbol = bodies[key]
+            body = checked_slice(sections[key[0]], key[1], symbol[5], "caller entry function")
+            for offset in range(0, len(body), 8):
+                op, registers, _, immediate = struct.unpack_from("<BBhi", body, offset)
+                relocation = relocations.get((key[0], key[1] + offset))
+                if op == 0x18 and relocation:
+                    target = relocation[1]
+                    map_name = target[0]
+                    if target[1] & 15 == 3:
+                        high = struct.unpack_from("<I", body, offset + 12)[0]
+                        address = target[4] + (immediate & 0xffffffff) + (high << 32)
+                        matches = [candidate[0] for candidate in elf.symbols
+                                   if candidate[1] & 15 == 1 and candidate[3] == target[3]
+                                   and candidate[4] == address]
+                        map_name = matches[0] if len(matches) == 1 else ""
+                    if relocation[0] != 1 or map_name not in allowed_maps:
+                        raise RuntimeError(f"caller inventory reaches forbidden map/global {map_name!r}")
+                    maps.add(map_name)
+                if op == 0x85:
+                    if registers == 0:
+                        if immediate not in allowed_helpers:
+                            raise RuntimeError(f"caller inventory reaches forbidden helper {immediate}")
+                        helpers.add(immediate)
+                    elif registers == 0x10:
+                        if relocation and relocation[0] == 10:
+                            todo.append((relocation[1][3], relocation[1][4] + (immediate + 1) * 8))
+                        elif relocation:
+                            raise RuntimeError("caller inventory has unknown call relocation")
+                        else:
+                            todo.append((key[0], key[1] + offset + (immediate + 1) * 8))
+                    else:
+                        raise RuntimeError("caller inventory has unsupported call kind")
+                if op == 0xdb and immediate == 0xf1:
+                    atomic += 1
+        return seen, maps, helpers, atomic
+
+    # Scope must not allocate an identity or inspect/mutate inventory evidence.
+    walk(auth[0][3:5], scope_maps, {1, 14, 37})
+    identity_seen, identity_maps, identity_helpers, _ = walk(
+        identity[0][3:5], {"TASK_COOKIE", "COOKIE_CTL"}, {1, 156, 158})
+    if (identity_maps != {"TASK_COOKIE", "COOKIE_CTL"}
+            or identity_helpers != {1, 156, 158} or len(identity_seen) != 1):
+        raise RuntimeError("caller native identity requires the single exact core domain")
+    reports = {}
+    for name in ("p11_usage_entry_lp64", "p11_usage_entry_ia32"):
+        roots = [s for s in elf.symbols if s[0] == name]
+        if len(roots) != 1 or roots[0][1:3] != (0x12, 0) or roots[0][3] != elf.indices.get("uprobe"):
+            raise RuntimeError(f"caller inventory requires exact GLOBAL DEFAULT uprobe {name}")
+        seen, maps, helpers, atomic = walk(
+            roots[0][3:5], scope_maps | caller_maps, {1, 2, 5, 14, 37, 156, 158, 174})
+        if (not {identity[0][3:5], auth[0][3:5]} <= seen or not caller_maps <= maps
+                or not {1, 2, 5, 14, 156, 158, 174} <= helpers or not atomic):
+            raise RuntimeError(f"caller inventory missing real scope/use/identity/pair dependencies: {name}")
+        reports[name] = {"functions": len(seen), "maps": sorted(maps),
+                         "helpers": sorted(helpers), "compare_exchanges": atomic}
+    return reports
+
+
 def inspect(path, allowed_text_globals=frozenset(), *, variant="default"):
     if variant not in FROZEN_INVENTORY:
         raise RuntimeError(f"unknown object variant {variant!r}")
     inventory = variant.startswith("inventory")
+    callers = variant.startswith("inventory-callers")
     elf = Elf(Path(path).read_bytes())
     records, sections = elf_records(path)
     if records != elf.records or {name: index for name, index in sections.items() if index} != elf.indices:
@@ -1091,9 +1198,12 @@ def inspect(path, allowed_text_globals=frozenset(), *, variant="default"):
     validate_owner_helpers(elf, inventory)
     if not inventory:
         validate_root_helpers(elf)
+    elif callers:
+        validate_inventory_caller_entry_reachability(elf)
     else:
         validate_inventory_entry_reachability(elf)
-    image_helpers = frozenset() if inventory else REQUIRED_GLOBAL_HELPERS
+    image_helpers = (frozenset({"p11_link_current_identity"}) if callers else
+                     frozenset() if inventory else REQUIRED_GLOBAL_HELPERS)
     return maps, classify(records, sections, allowed_text_globals | image_helpers
                           | REQUIRED_GLOBAL_OWNER_HELPERS | REQUIRED_GLOBAL_SCALAR_HELPERS,
                           inventory=inventory), {
@@ -1234,10 +1344,19 @@ INVENTORY_FORBIDDEN_MAPS = {
     "ASYNC_FUNCTIONS", "ATTR_BOOL_BITS", "PAUSE_PIDS", "TASK_COOKIE", "COOKIE_CTL",
     "ROOT_AFFILIATION", "ROOT_CTL",
 }
+INVENTORY_CALLER_MAPS = INVENTORY_MAPS | {
+    "ENDPOINT_OBJECT": map_def(2, 4, 8, 1, 128),
+    "CALLER_USE": map_def(1, 24, 32, 1),
+    "CALLER_EVIDENCE": map_def(6, 4, 8, 4),
+    "TASK_COOKIE": SAFE_MAPS["TASK_COOKIE"],
+    "COOKIE_CTL": SAFE_MAPS["COOKIE_CTL"],
+}
 
 FROZEN_INVENTORY = {
     "inventory": (INVENTORY_MAPS, INVENTORY_PROGRAMS),
     "inventory-small-discovery": (INVENTORY_MAPS | {"DISCOVERY": map_def(27, 0, 0, 4096)}, INVENTORY_PROGRAMS),
+    "inventory-callers": (INVENTORY_CALLER_MAPS, INVENTORY_PROGRAMS),
+    "inventory-callers-small-discovery": (INVENTORY_CALLER_MAPS | {"DISCOVERY": map_def(27, 0, 0, 4096)}, INVENTORY_PROGRAMS),
     "default": (SAFE_MAPS, SAFE_PROGRAMS),
     "diagnostic": (UNSAFE_MAPS, UNSAFE_PROGRAMS),
 }
@@ -1251,6 +1370,8 @@ FROZEN_INVENTORY = {
 FROZEN_SYMBOLS = {
     "inventory": (False, False, 0, 0, 0),
     "inventory-small-discovery": (False, False, 0, 0, 0),
+    "inventory-callers": (False, False, 0, 0, 0),
+    "inventory-callers-small-discovery": (False, False, 0, 0, 0),
     "default": (False, False, 0, 0, 0),
     "diagnostic": (True, True, 2, 2, 2),
 }
@@ -1281,13 +1402,18 @@ def validate_inventory(variant, maps, programs, symbols):
             print(f"program removed: {name}", file=sys.stderr)
         raise RuntimeError(f"{variant} program inventory differs")
     inventory = variant.startswith("inventory")
+    callers = variant.startswith("inventory-callers")
     if inventory:
-        forbidden = {name for name in symbols if name in INVENTORY_FORBIDDEN_MAPS
-                     or name.startswith(("p11_owner_start_", "p11_link_", "p11_root_"))}
+        allowed = {"TASK_COOKIE", "COOKIE_CTL", "p11_link_current_identity"} if callers else set()
+        forbidden = {name for name in symbols if name not in allowed and
+                     (name in INVENTORY_FORBIDDEN_MAPS
+                      or name.startswith(("p11_owner_start_", "p11_link_", "p11_root_")))}
         if forbidden:
             raise RuntimeError(f"inventory contains forbidden detailed symbols: {sorted(forbidden)}")
     required_helpers = (REQUIRED_GLOBAL_OWNER_HELPERS | REQUIRED_GLOBAL_SCALAR_HELPERS
                         if inventory else REQUIRED_GLOBAL_HELPERS)
+    if callers:
+        required_helpers |= {"p11_link_current_identity"}
     missing_helpers = required_helpers - symbols
     if missing_helpers:
         raise RuntimeError(f"missing required .text helpers: {sorted(missing_helpers)}")
@@ -1463,7 +1589,8 @@ def self_test():
 def usage():
     return (
         f"usage: {sys.argv[0]} BPF_ELF MAP=MAX_ENTRIES [...] | "
-        "--inventory default|diagnostic|inventory|inventory-small-discovery BPF_ELF | "
+        "--inventory VARIANT BPF_ELF (default, diagnostic, inventory[-small-discovery], "
+        "inventory-callers[-small-discovery]) | "
         "--policy-inventory DEFAULT_ELF DIAGNOSTIC_ELF | --json BPF_ELF | --self-test"
     )
 

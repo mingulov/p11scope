@@ -124,6 +124,44 @@ struct Entry {
     overlay: bool,
 }
 
+/// The exact, bounded pin subset retained by private Inventory activation.
+/// Cloning one entry preserves its complete canonical identity and opened file;
+/// it does not clone discovery ownership graphs or reopen a pathname.
+#[derive(Debug)]
+pub(crate) struct RetainedInventoryTarget {
+    entry: Entry,
+    changed: std::cell::Cell<bool>,
+}
+
+impl RetainedInventoryTarget {
+    pub(crate) fn retirement_lease(&self) -> Arc<std::fs::File> {
+        // The retirement worker needs only custody of the already-open file.
+        // Identity and sticky mutation checks stay with the main target owner.
+        self.entry.file.clone()
+    }
+
+    pub(crate) fn abi(&self) -> ElfAbi {
+        self.entry.abi
+    }
+
+    pub(crate) fn attach_path(&self) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", self.entry.file.as_raw_fd()))
+    }
+
+    /// Same best-effort metadata check as `PinnedObjects`, with independent
+    /// sticky evidence after the discovery owner has released its copy.
+    pub(crate) fn check_unchanged(&self) -> Result<bool, String> {
+        if self.changed.get() {
+            return Ok(false);
+        }
+        let unchanged = pin_of(&self.entry.file)? == self.entry.pin;
+        if !unchanged {
+            self.changed.set(true);
+        }
+        Ok(unchanged)
+    }
+}
+
 /// Capture-private ownership key for causal timing. Numeric pin/module IDs and
 /// path spellings are intentionally absent: this is the same complete opened
 /// identity used by ordinary pin reconciliation.
@@ -391,6 +429,28 @@ impl PinnedObjects {
 
     pub(crate) fn abi_for(&self, id: PinnedObjectId) -> Option<ElfAbi> {
         self.by_id.get(&id).map(|entry| entry.abi)
+    }
+
+    pub(crate) fn retain_inventory_target(
+        &self,
+        id: PinnedObjectId,
+    ) -> Result<RetainedInventoryTarget, String> {
+        if self.provider_changed() {
+            return Err("provider changed before Inventory target retention".into());
+        }
+        let entry = self
+            .by_id
+            .get(&id)
+            .ok_or_else(|| format!("Inventory object {id:?} was not pinned"))?
+            .clone();
+        let retained = RetainedInventoryTarget {
+            entry,
+            changed: std::cell::Cell::new(false),
+        };
+        if !retained.check_unchanged()? {
+            return Err(format!("Inventory object {id:?} changed before retention"));
+        }
+        Ok(retained)
     }
 
     /// Replaces the raw ownership for one retained process generation while

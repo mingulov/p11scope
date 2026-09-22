@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 
 /// No links, event domain, or mutable object access exist on this capability.
-/// I3 consumes it inside this module before adding any activation methods.
+/// Private activation consumes it before installing any producers.
 pub(crate) struct PreparedInventory {
     ebpf: Ebpf,
     discovery_domain: DiscoveryDomain,
@@ -557,3 +557,5 @@ fn require_inventory_custody_with(check: impl FnOnce() -> Result<bool>) -> Resul
 mod privileged_tests;
 #[cfg(test)]
 mod tests;
+
+mod activation;

@@ -5637,10 +5637,71 @@ struct DiscoveryLifecycleFixture {
     pidfd: std::os::fd::OwnedFd,
 }
 
+// An explicit ignored entrypoint keeps the offline helper in a fresh exec image
+// even when only `cargo test --lib` was built. It is not a separate passing test.
+#[test]
+#[ignore = "private manifest helper; invoked by DiscoveryLifecycleFixture"]
+fn lifecycle_manifest_helper_entrypoint() {
+    let provider = std::env::var_os("P11SCOPE_TEST_DISCOVERY_PROVIDER")
+        .expect("the fixture supplies its owned provider");
+    let output = std::env::var_os("P11SCOPE_TEST_DISCOVERY_MANIFEST")
+        .expect("the fixture supplies its manifest output");
+    let manifest = p11scope_discover::discover::discover(Path::new(&provider))
+        .expect("the real offline helper acquires the fixture's table");
+    std::fs::write(output, serde_json::to_vec(&manifest).unwrap()).unwrap();
+}
+
 impl DiscoveryLifecycleFixture {
-    fn start() -> Self {
+    fn child_pidfd(child: &SystemScopeChildGuard) -> std::os::fd::OwnedFd {
         use std::os::fd::FromRawFd as _;
 
+        // SAFETY: pidfd_open takes a live owned child's PID and flags zero,
+        // returning a new descriptor owned exclusively by this fixture.
+        let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, child.pid(), 0) };
+        assert!(
+            descriptor >= 0,
+            "retain child exit readiness: {}",
+            std::io::Error::last_os_error()
+        );
+        unsafe { std::os::fd::OwnedFd::from_raw_fd(descriptor as i32) }
+    }
+
+    fn acquire_manifest(provider: &Path, manifest: &Path, log: &Path) {
+        use std::os::fd::AsRawFd as _;
+
+        let output = std::fs::File::create(log).unwrap();
+        let mut helper = SystemScopeChildGuard::new(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "discovery::engine::tests::lifecycle_manifest_helper_entrypoint",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env("P11SCOPE_TEST_DISCOVERY_PROVIDER", provider)
+                .env("P11SCOPE_TEST_DISCOVERY_MANIFEST", manifest)
+                .stdin(std::process::Stdio::null())
+                .stdout(output.try_clone().unwrap())
+                .stderr(output)
+                .spawn()
+                .expect("exec an isolated offline manifest helper"),
+        );
+        let pidfd = Self::child_pidfd(&helper);
+        assert!(
+            system_scope_poll_fd(pidfd.as_raw_fd(), std::time::Duration::from_secs(60)).unwrap(),
+            "manifest helper must finish within its owned-process deadline"
+        );
+        let status = helper.child.wait().expect("reap the exact manifest helper");
+        helper.live = false;
+        assert!(
+            status.success(),
+            "isolated manifest helper failed: {status}\n{}",
+            std::fs::read_to_string(log).unwrap()
+        );
+    }
+
+    fn start() -> Self {
         let dir = tempfile::tempdir().expect("a discovery lifecycle fixture directory");
         let source =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/discovery-lifecycle.c");
@@ -5667,9 +5728,11 @@ impl DiscoveryLifecycleFixture {
             );
         }
         let manifest = dir.path().join("provider.json");
-        let acquired = p11scope_discover::discover::discover(&provider)
-            .expect("the real offline helper acquires the fixture's table");
-        std::fs::write(&manifest, serde_json::to_vec(&acquired).unwrap()).unwrap();
+        Self::acquire_manifest(
+            &provider,
+            &manifest,
+            &dir.path().join("manifest-helper.log"),
+        );
 
         let mut child = SystemScopeChildGuard::new(
             std::process::Command::new(&driver)
@@ -5681,15 +5744,7 @@ impl DiscoveryLifecycleFixture {
                 .expect("start the owned loader behind its pre-load barrier"),
         );
         let output = child.child.stdout.take().unwrap();
-        // SAFETY: pidfd_open takes a live child PID and flags zero, and returns
-        // a new descriptor owned exclusively by this fixture.
-        let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, child.pid(), 0) };
-        assert!(
-            descriptor >= 0,
-            "retain child exit readiness: {}",
-            std::io::Error::last_os_error()
-        );
-        let pidfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(descriptor as i32) };
+        let pidfd = Self::child_pidfd(&child);
         let mut fixture = Self {
             _dir: dir,
             provider,
@@ -5889,6 +5944,33 @@ fn lifecycle_exit_before_discovery_service_stays_explicitly_uncorroborated() {
         engine.plan.skipped.is_empty(),
         "a proven owned exit is not discovery loss: {:?}",
         engine.plan.skipped
+    );
+}
+
+/// Other parallel tests legitimately keep a provider mapped after unlinking its
+/// pathname. Manifest acquisition must not inspect that test worker's maps.
+#[test]
+fn lifecycle_manifest_acquisition_ignores_an_unrelated_deleted_mapping() {
+    let unrelated = E07Provider::dlopen();
+    std::fs::remove_file(&unrelated.path).unwrap();
+    let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+    assert!(
+        maps.lines()
+            .any(|line| line.contains(unrelated.path.to_str().unwrap())
+                && line.ends_with(" (deleted)")),
+        "the interfering mapping must actually remain present"
+    );
+
+    let fixture = DiscoveryLifecycleFixture::start();
+    let manifest: Manifest =
+        serde_json::from_slice(&std::fs::read(&fixture.manifest).unwrap()).unwrap();
+    assert_eq!(manifest.module_path, fixture.provider.to_str().unwrap());
+    assert!(
+        manifest
+            .provenance_objects
+            .iter()
+            .all(|object| object.path != unrelated.path.to_str().unwrap()),
+        "a foreign test worker's mapping is not fixture provenance"
     );
 }
 

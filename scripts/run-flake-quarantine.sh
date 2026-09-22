@@ -32,10 +32,31 @@ report() {
     fi
 }
 
+# Guard: --exact with a stale filter runs 0 tests yet exits 0, which would
+# fake-green the quarantine count. Fail unless exactly one test ran.
+guard_single() {
+    # $1 = filter, $2 = captured output, $3 = cargo exit status
+    echo "$2"
+    if [ "$3" -ne 0 ]; then
+        return "$3"
+    fi
+    case "$2" in
+        *"test result: ok. 1 passed; 0 failed"*)
+            return 0
+            ;;
+        *)
+            echo "quarantine: $1 ran != 1 test (filter stale?)"
+            return 1
+            ;;
+    esac
+}
+
 run_artifact() {
     echo "--- quarantine: $1"
     set +e
-    cargo +1.88 test --locked --offline --test artifact_contracts "$1" -- --exact --nocapture --test-threads=1
+    out=$(cargo +1.88 test --locked --offline --test artifact_contracts "$1" -- --exact --nocapture --test-threads=1 2>&1)
+    status=$?
+    guard_single "$1" "$out" "$status"
     status=$?
     set -e
     report "$1" "$status"
@@ -44,7 +65,9 @@ run_artifact() {
 run_lib() {
     echo "--- quarantine: $1"
     set +e
-    cargo +1.88 test --locked --offline --lib "$1" -- --exact --nocapture --test-threads=1
+    out=$(cargo +1.88 test --locked --offline --lib "$1" -- --exact --nocapture --test-threads=1 2>&1)
+    status=$?
+    guard_single "$1" "$out" "$status"
     status=$?
     set -e
     report "$1" "$status"
@@ -54,9 +77,9 @@ run_artifact "lane13_evidence_finalizes_only_after_owned_cleanup"
 run_artifact "metadata_canary_matrix"
 run_artifact "stopped_canary_capture_lifecycle"
 run_artifact "native_helper_suite_recorded_launcher_requires_authenticated_generations_and_bounded_cleanup"
-run_lib "actual_handoff_helpers_preserve_errno_and_retry_without_renewing_deadlines"
+run_lib "run::tests::actual_handoff_helpers_preserve_errno_and_retry_without_renewing_deadlines"
 run_artifact "release_seal_denies_the_caller_path_to_every_reached_command"
-run_lib "signal_settlement_observes_second_sigint_during_fallback_term_grace"
+run_lib "run::tests::signal_settlement_observes_second_sigint_during_fallback_term_grace"
 
 echo "quarantine: $pass passed, $fail failed in isolation"
 [ "$fail" -eq 0 ]

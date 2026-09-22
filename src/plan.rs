@@ -31,6 +31,61 @@ use p11scope_manifest::manifest::{
 use p11scope_manifest::maps::{Device, ObjectKey};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Immutable admission contract carried by one planner for its whole capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionPolicy {
+    /// Existing metrics/profile/trace behavior: 512 lifetime slots and K4
+    /// unresolved heuristic tables per physical provider object.
+    Detailed,
+    /// Compact entry-use inventory: every validated physical target is
+    /// count-only and the complete union is admitted atomically within this
+    /// endpoint/payload budget.
+    Inventory(crate::capacity::InventoryBudget),
+}
+
+impl AdmissionPolicy {
+    pub const fn detailed() -> Self {
+        Self::Detailed
+    }
+
+    pub const fn inventory(budget: crate::capacity::InventoryBudget) -> Self {
+        Self::Inventory(budget)
+    }
+
+    fn endpoint_limit(self) -> usize {
+        match self {
+            Self::Detailed => MAX_SLOTS as usize,
+            Self::Inventory(budget) => budget.endpoint_limit() as usize,
+        }
+    }
+
+    fn admits_complete_validated_union(self) -> bool {
+        matches!(self, Self::Inventory(_))
+    }
+
+    fn forces_count_only(self) -> bool {
+        matches!(self, Self::Inventory(_))
+    }
+
+    fn validate_count(self, endpoints: usize) -> Result<(), String> {
+        match self {
+            Self::Detailed if endpoints <= MAX_SLOTS as usize => Ok(()),
+            Self::Detailed => Err(format!(
+                "attach plan requires {endpoints} allocated slots but only {MAX_SLOTS} are available"
+            )),
+            Self::Inventory(budget) => budget.validate_count(endpoints),
+        }
+    }
+
+    fn checked_required(self, current: usize, additions: usize) -> Result<usize, String> {
+        let required = current
+            .checked_add(additions)
+            .ok_or_else(|| "attach slot requirement overflowed".to_string())?;
+        self.validate_count(required)?;
+        Ok(required)
+    }
+}
+
 /// Capture-local module index; the stable identity in output is {dev, ino, sha256, path}.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ModuleId(pub u32);
@@ -264,6 +319,7 @@ pub struct AttachPlan {
     // Capture-lifetime ownership for every allocated aggregate cell. Active
     // topology remains in `slot_by_key` and each slot's current `module_ids`.
     aggregate_owners: Vec<AggregateOwner>,
+    admission_policy: AdmissionPolicy,
 }
 
 /// The one physical attachment identity. A pathname is diagnostic data, not
@@ -309,19 +365,41 @@ pub struct AttachDelta {
 
 impl AttachPlan {
     pub fn from_slots(slots: Vec<Slot>) -> Self {
+        Self::from_indexed_slots(slots, AdmissionPolicy::detailed())
+            .expect("slots must have dense indices and unique exact targets")
+    }
+
+    pub fn from_slots_with_policy(
+        slots: Vec<Slot>,
+        admission_policy: AdmissionPolicy,
+    ) -> Result<Self, String> {
+        admission_policy.validate_count(slots.len())?;
+        let plan = Self::from_indexed_slots(slots, admission_policy)?;
+        plan.validate_slot_index()?;
+        Ok(plan)
+    }
+
+    fn from_indexed_slots(
+        slots: Vec<Slot>,
+        admission_policy: AdmissionPolicy,
+    ) -> Result<Self, String> {
         let mut slot_by_key = BTreeMap::new();
         let aggregate_owners: Vec<_> = slots
             .iter()
             .map(|slot| AggregateOwner::from_module_ids(&slot.module_ids))
             .collect();
         for (position, slot) in slots.iter().enumerate() {
-            assert_eq!(slot.index as usize, position, "slot indices must be dense");
-            assert!(
-                slot_by_key.insert(AttachKey::of(slot), position).is_none(),
-                "one exact target may occupy one slot"
-            );
+            if slot.index as usize != position {
+                return Err(format!(
+                    "slot index {} does not match its allocated position {position}",
+                    slot.index
+                ));
+            }
+            if slot_by_key.insert(AttachKey::of(slot), position).is_some() {
+                return Err("one exact target may occupy one slot".into());
+            }
         }
-        Self {
+        Ok(Self {
             slots,
             modules: vec![],
             uncorroborated_candidates: 0,
@@ -340,7 +418,12 @@ impl AttachPlan {
             provisional_get_function_list: BTreeMap::new(),
             retired_slots: BTreeSet::new(),
             aggregate_owners,
-        }
+            admission_policy,
+        })
+    }
+
+    pub const fn admission_policy(&self) -> AdmissionPolicy {
+        self.admission_policy
     }
 
     /// Rebuilds the one complete, capacity-aware snapshot a live caller passes
@@ -376,6 +459,7 @@ impl AttachPlan {
                 )
             },
             broad_admit,
+            self.admission_policy,
         )
     }
 
@@ -386,15 +470,19 @@ impl AttachPlan {
         pinned_id: impl FnMut(ObjectKey, &str) -> Option<PinnedObjectId>,
         compatible: impl FnMut(PinnedObjectId, PinnedObjectId) -> bool,
         broad_admit: bool,
+        admission_policy: AdmissionPolicy,
     ) -> AttachPlan {
         let mut rebuilt = build_from_sources_with(
             scanned,
             manifests,
             pinned_id,
             compatible,
-            self.slots.len(),
-            &self.slot_by_key,
+            ExistingAllocation {
+                slots: self.slots.len(),
+                active: &self.slot_by_key,
+            },
             broad_admit,
+            admission_policy,
         );
         for (key, object) in &self.provisional_get_function_list {
             if key.object != *object || rebuilt.slot_by_key.contains_key(key) {
@@ -414,7 +502,7 @@ impl AttachPlan {
             let Some(slot) = self.slots.get(position) else {
                 continue;
             };
-            if rebuilt.slots.len() < MAX_SLOTS as usize {
+            if rebuilt.slots.len() < admission_policy.endpoint_limit() {
                 rebuilt
                     .add_provisional_get_function_list(ProvisionalGetFunctionList {
                         module: module_id,
@@ -458,12 +546,9 @@ impl AttachPlan {
         {
             return Ok(None);
         }
-        if self.slots.len() >= MAX_SLOTS as usize {
-            return Err(format!(
-                "attach plan has {} allocated slots but only {MAX_SLOTS} are available",
-                self.slots.len()
-            ));
-        }
+        self.admission_policy
+            .checked_required(self.slots.len(), 1)
+            .map_err(|error| format!("provisional C_GetFunctionList: {error}"))?;
         let slot = Slot {
             index: self.slots.len() as u32,
             descriptor_index: 0,
@@ -498,6 +583,9 @@ impl AttachPlan {
     ) -> Result<(), String> {
         self.validate_slot_index()?;
         allocated.validate_slot_index()?;
+        if self.admission_policy != allocated.admission_policy {
+            return Err("selection table admission policy does not match allocated plan".into());
+        }
         let Some(provider) = self.modules.iter().find(|known| known.id == module) else {
             return Err(format!("selection table names missing module {}", module.0));
         };
@@ -532,17 +620,18 @@ impl AttachPlan {
                 !self.slot_by_key.contains_key(key) && !allocated.slot_by_key.contains_key(key)
             })
             .count();
-        let required = allocated
-            .slots
-            .len()
-            .checked_add(candidate_additions)
-            .and_then(|required| required.checked_add(table_additions))
-            .ok_or_else(|| "selection table slot requirement overflowed".to_string())?;
-        if required > MAX_SLOTS as usize {
+        let pending = self
+            .admission_policy
+            .checked_required(allocated.slots.len(), candidate_additions)?;
+        if self
+            .admission_policy
+            .checked_required(pending, table_additions)
+            .is_err()
+        {
+            let capacity = self.admission_policy.endpoint_limit();
             return Err(format!(
-                "selection table needs {table_additions} more of the {MAX_SLOTS} attach slots; \
-                 {} are allocated or pending — refusing to attach a prefix",
-                required - table_additions
+                "selection table needs {table_additions} more of the {capacity} attach slots; \
+                 {pending} are allocated or pending — refusing to attach a prefix"
             ));
         }
 
@@ -682,6 +771,7 @@ impl AttachPlan {
     pub fn extend_exact(&mut self, mut rebuilt: AttachPlan) -> Result<AttachDelta, String> {
         self.validate_slot_index()?;
         rebuilt.validate_slot_index()?;
+        self.validate_matching_policy(&rebuilt)?;
         self.remap_modules(&mut rebuilt)?;
         self.extend_exact_prepared(rebuilt)
     }
@@ -694,6 +784,7 @@ impl AttachPlan {
     ) -> Result<AttachDelta, String> {
         self.validate_slot_index()?;
         rebuilt.validate_slot_index()?;
+        self.validate_matching_policy(&rebuilt)?;
         Self::validate_stable_module_ids(&rebuilt)?;
         self.extend_exact_prepared(rebuilt)
     }
@@ -849,12 +940,15 @@ impl AttachPlan {
             .iter()
             .filter(|slot| !self.slot_by_key.contains_key(&AttachKey::of(slot)))
             .count();
-        let required = self.slots.len() + additions;
-        if required > MAX_SLOTS as usize {
-            return Err(format!(
-                "attach plan requires {required} allocated slots but only {MAX_SLOTS} are available; \
-                 refusing to attach a prefix"
-            ));
+        self.admission_policy
+            .checked_required(self.slots.len(), additions)
+            .map(|_| ())
+            .map_err(|error| format!("{error}; refusing to attach a prefix"))
+    }
+
+    fn validate_matching_policy(&self, rebuilt: &AttachPlan) -> Result<(), String> {
+        if self.admission_policy != rebuilt.admission_policy {
+            return Err("rebuilt attach plan admission policy changed during capture".into());
         }
         Ok(())
     }
@@ -920,12 +1014,7 @@ impl AttachPlan {
         if self.aggregate_owners.len() != self.slots.len() {
             return Err("aggregate-owner state does not match allocated slots".into());
         }
-        if self.slots.len() > MAX_SLOTS as usize {
-            return Err(format!(
-                "attach plan has {} allocated slots but only {MAX_SLOTS} are available",
-                self.slots.len()
-            ));
-        }
+        self.admission_policy.validate_count(self.slots.len())?;
         let mut active_keys = BTreeSet::new();
         for (position, slot) in self.slots.iter().enumerate() {
             if slot.index as usize != position {
@@ -946,6 +1035,13 @@ impl AttachPlan {
                     "slot {} semantics do not match fixed descriptor {}",
                     slot.index, slot.descriptor_index
                 ));
+            }
+            if self.admission_policy.forces_count_only()
+                && (slot.descriptor_index != 0
+                    || slot.semantics != SlotSemantics::COUNT_ONLY
+                    || slot.semantic_authorized)
+            {
+                return Err(format!("inventory slot {} is not count-only", slot.index));
             }
             if slot.descriptor_index != 0
                 && (!slot.semantic_authorized
@@ -1088,14 +1184,14 @@ impl AttachPlan {
 
 pub fn ensure_capacity(plan: &AttachPlan) -> Result<(), String> {
     let required = plan.slots.len();
-    let available = MAX_SLOTS as usize;
-    if required > available {
-        Err(format!(
-            "attach plan requires {required} slots but only {available} are available; refusing to attach a prefix"
-        ))
-    } else {
-        Ok(())
-    }
+    plan.admission_policy
+        .validate_count(required)
+        .map_err(|_| {
+            let available = plan.admission_policy.endpoint_limit();
+            format!(
+                "attach plan requires {required} slots but only {available} are available; refusing to attach a prefix"
+            )
+        })
 }
 
 /// A stand-in object identity for slot fixtures in other modules' unit tests.
@@ -1221,8 +1317,9 @@ fn merge(
     allocated_slots: usize,
     existing_slots: &BTreeMap<AttachKey, usize>,
     broad_admit: bool,
+    admission_policy: AdmissionPolicy,
 ) -> AttachPlan {
-    let capacity = MAX_SLOTS as usize;
+    let capacity = admission_policy.endpoint_limit();
     let mut groups: Vec<Vec<Discovered<'_>>> = Vec::new();
     let mut group_positions: BTreeMap<PinnedObjectId, usize> = BTreeMap::new();
     for module in discovered {
@@ -1265,11 +1362,14 @@ fn merge(
                     && !existing_slots.contains_key(target)
             })
             .collect();
-        if allocated_slots + manifest_wanted.len() > capacity {
+        if admission_policy
+            .checked_required(allocated_slots, manifest_wanted.len())
+            .is_err()
+        {
             let skipped = Skipped {
                 subject: path.to_string(),
                 reason: format!(
-                    "module needs {} more of the {MAX_SLOTS} attach slots; {} are in use \
+                    "module needs {} more; only {capacity} attach slots are available; {} are in use \
                      — refusing to attach a prefix",
                     manifest_wanted.len(),
                     allocated_slots
@@ -1350,11 +1450,14 @@ fn merge(
             let top_marginal = keys_of
                 .get(top)
                 .map_or(0, |keys| keys.iter().filter(|key| is_fresh(key)).count());
-            if allocated_slots + top_marginal > capacity {
+            if admission_policy
+                .checked_required(allocated_slots, top_marginal)
+                .is_err()
+            {
                 let skipped = Skipped {
                     subject: path.to_string(),
                     reason: format!(
-                        "module needs {top_marginal} more of the {MAX_SLOTS} attach slots; \
+                        "module needs {top_marginal} more; only {capacity} attach slots are available; \
                          {allocated_slots} are in use — refusing to attach a prefix"
                     ),
                 };
@@ -1381,11 +1484,14 @@ fn merge(
                 published_union.extend(keys.iter().filter(|key| is_fresh(key)).copied());
             }
         }
-        if allocated_slots + published_union.len() > capacity {
+        if admission_policy
+            .checked_required(allocated_slots, published_union.len())
+            .is_err()
+        {
             let skipped = Skipped {
                 subject: path.to_string(),
                 reason: format!(
-                    "module needs {} more of the {MAX_SLOTS} attach slots; {} are in use \
+                    "module needs {} more; only {capacity} attach slots are available; {} are in use \
                      — refusing to attach a prefix",
                     published_union.len(),
                     allocated_slots
@@ -1410,18 +1516,21 @@ fn merge(
         // promise (spill is informational, never PARTIAL), so broad never
         // spills — it refuses, loudly, with the same shape. Empty tables cost
         // nothing either way and admit, never spilling.
-        if broad_admit {
+        if broad_admit || admission_policy.admits_complete_validated_union() {
             let mut scan_union = fresh.clone();
             for (key, _, _) in &ordered {
                 if let Some(keys) = keys_of.get(key) {
                     scan_union.extend(keys.iter().filter(|key| is_fresh(key)).copied());
                 }
             }
-            if allocated_slots + scan_union.len() > capacity {
+            if admission_policy
+                .checked_required(allocated_slots, scan_union.len())
+                .is_err()
+            {
                 let skipped = Skipped {
                     subject: path.to_string(),
                     reason: format!(
-                        "module needs {} more of the {MAX_SLOTS} attach slots; {} are in use \
+                        "module needs {} more; only {capacity} attach slots are available; {} are in use \
                          — refusing to attach a prefix",
                         scan_union.len(),
                         allocated_slots
@@ -1455,7 +1564,11 @@ fn merge(
                         .filter(|key| is_fresh(key) && !fresh.contains(key))
                         .count()
                 });
-                if allocated_slots + fresh.len() + marginal > capacity {
+                if admission_policy
+                    .checked_required(allocated_slots, fresh.len())
+                    .and_then(|required| admission_policy.checked_required(required, marginal))
+                    .is_err()
+                {
                     // The budget is spent: this table and every weaker one spill.
                     // Admission stays a strongest-evidence prefix — a strong
                     // table is never skipped to admit a weaker one.
@@ -1470,7 +1583,9 @@ fn merge(
                 heuristic_admitted += 1;
             }
         }
-        allocated_slots += fresh.len();
+        allocated_slots = admission_policy
+            .checked_required(allocated_slots, fresh.len())
+            .expect("admitted target union was checked before allocation");
         // Per scan piece, per table index: admitted above. Manifest pieces
         // carry `None` and admit every target.
         let admitted_instance: Vec<Option<Vec<bool>>> = group
@@ -1620,7 +1735,8 @@ fn merge(
                 slot.name_authority.remove(UNKNOWN_FUNCTION_NAME);
             }
             let names: Vec<_> = slot.name_authority.keys().cloned().collect();
-            let semantic_authorized = slot.name_authority.values().all(|value| *value);
+            let semantic_authorized = !admission_policy.forces_count_only()
+                && slot.name_authority.values().all(|value| *value);
             let (descriptor_index, semantic_ambiguous) = crate::kinds::descriptor_index(&names);
             let semantics = crate::kinds::DESCRIPTORS[descriptor_index as usize];
             // Counts through a target two modules both publish cannot be attributed
@@ -1651,7 +1767,8 @@ fn merge(
             }
         })
         .collect();
-    let mut plan = AttachPlan::from_slots(slots);
+    let mut plan = AttachPlan::from_slots_with_policy(slots, admission_policy)
+        .expect("merge enforces its immutable admission policy");
     plan.modules = modules;
     plan.uncorroborated_candidates = uncorroborated_candidates;
     plan.skipped = skipped;
@@ -1673,6 +1790,7 @@ pub fn build_from_reconciled_modules(modules: &[ReconciledModule]) -> AttachPlan
         0,
         &BTreeMap::new(),
         false,
+        AdmissionPolicy::detailed(),
     )
 }
 
@@ -1697,6 +1815,33 @@ pub fn build_from_sources_broad(
     pinned: &PinnedObjects,
     broad_admit: bool,
 ) -> AttachPlan {
+    build_from_sources_with_policy(
+        scanned,
+        manifests,
+        pinned,
+        broad_admit,
+        AdmissionPolicy::detailed(),
+    )
+}
+
+/// Builds an initial plan under an explicit immutable admission policy.
+/// Inventory callers do not depend on the detailed-mode broad-admit experiment.
+pub fn build_from_sources_for_policy(
+    scanned: &[ReconciledModule],
+    manifests: &[Manifest],
+    pinned: &PinnedObjects,
+    admission_policy: AdmissionPolicy,
+) -> AttachPlan {
+    build_from_sources_with_policy(scanned, manifests, pinned, false, admission_policy)
+}
+
+fn build_from_sources_with_policy(
+    scanned: &[ReconciledModule],
+    manifests: &[Manifest],
+    pinned: &PinnedObjects,
+    broad_admit: bool,
+    admission_policy: AdmissionPolicy,
+) -> AttachPlan {
     build_from_sources_with(
         scanned,
         manifests,
@@ -1707,10 +1852,20 @@ pub fn build_from_sources_broad(
                 (Some(provider), Some(target)) if provider == target
             )
         },
-        0,
-        &BTreeMap::new(),
+        ExistingAllocation {
+            slots: 0,
+            active: &BTreeMap::new(),
+        },
         broad_admit,
+        admission_policy,
     )
+}
+
+/// Historical allocations and their still-active subset travel together.
+/// Retired slots count against capacity even though they are absent from `active`.
+struct ExistingAllocation<'a> {
+    slots: usize,
+    active: &'a BTreeMap<AttachKey, usize>,
 }
 
 fn build_from_sources_with(
@@ -1718,9 +1873,9 @@ fn build_from_sources_with(
     manifests: &[Manifest],
     mut pinned_id: impl FnMut(ObjectKey, &str) -> Option<PinnedObjectId>,
     mut compatible: impl FnMut(PinnedObjectId, PinnedObjectId) -> bool,
-    allocated_slots: usize,
-    existing_slots: &BTreeMap<AttachKey, usize>,
+    allocated: ExistingAllocation<'_>,
     broad_admit: bool,
+    admission_policy: AdmissionPolicy,
 ) -> AttachPlan {
     let mut discovered: Vec<Discovered<'_>> = scanned.iter().map(lower_scanned).collect();
     let mut orphaned = Vec::new();
@@ -1739,9 +1894,10 @@ fn build_from_sources_with(
             || "absent".to_string(),
             |m| acquisition_label(&m.interface_list),
         ),
-        allocated_slots,
-        existing_slots,
+        allocated.slots,
+        allocated.active,
         broad_admit,
+        admission_policy,
     );
     plan.skipped.extend(orphaned);
     plan
@@ -1749,14 +1905,26 @@ fn build_from_sources_with(
 
 #[cfg(test)]
 fn build_from_test_sources(scanned: &[ReconciledModule], manifests: &[Manifest]) -> AttachPlan {
+    build_from_test_sources_with_policy(scanned, manifests, AdmissionPolicy::detailed())
+}
+
+#[cfg(test)]
+fn build_from_test_sources_with_policy(
+    scanned: &[ReconciledModule],
+    manifests: &[Manifest],
+    admission_policy: AdmissionPolicy,
+) -> AttachPlan {
     build_from_sources_with(
         scanned,
         manifests,
         |key, _| u32::try_from(key.inode).ok().map(PinnedObjectId),
         |_, _| true,
-        0,
-        &BTreeMap::new(),
+        ExistingAllocation {
+            slots: 0,
+            active: &BTreeMap::new(),
+        },
         false,
+        admission_policy,
     )
 }
 
@@ -1924,6 +2092,7 @@ fn build(m: &Manifest) -> AttachPlan {
         0,
         &BTreeMap::new(),
         false,
+        AdmissionPolicy::detailed(),
     );
     plan.skipped.extend(orphaned);
     plan
@@ -2177,6 +2346,55 @@ mod tests {
         }
     }
 
+    fn scanned_with_heuristic_tables(count: usize) -> ReconciledModule {
+        use crate::discovery::scan::{ScannedEntry, ScannedTable};
+
+        let mut scanned = scanned_with(TEST_OBJECT, "/opt/heuristic.so", []);
+        let object = scanned.object;
+        scanned.scanned.tables = (0..count)
+            .map(|index| ScannedTable {
+                version: (2, 40),
+                walk: "full",
+                entries: vec![ScannedEntry {
+                    name: "C_Sign",
+                    object: TEST_OBJECT,
+                    object_path: "/opt/heuristic.so".into(),
+                    file_offset: index as u64 * 8,
+                }],
+                null_entries: vec![],
+                unpinned: vec![],
+                address: 0x7000 + index as u64 * 0x1000,
+                file_offset: Some(index as u64 * 0x1000),
+                live_return: false,
+                manifest_supported: false,
+            })
+            .collect();
+        scanned.entry_objects = vec![vec![object]; count];
+        scanned
+    }
+
+    fn inventory_policy(endpoint_limit: u64) -> AdmissionPolicy {
+        AdmissionPolicy::inventory(
+            crate::capacity::InventoryBudget::new(
+                endpoint_limit,
+                endpoint_limit.checked_mul(8).unwrap(),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn inventory_plan(
+        slots: Vec<Slot>,
+        modules: Vec<ModuleSummary>,
+        endpoint_limit: u64,
+    ) -> AttachPlan {
+        let mut plan =
+            AttachPlan::from_slots_with_policy(slots, inventory_policy(endpoint_limit)).unwrap();
+        plan.modules = modules;
+        plan.entries_seen = plan.slots.len();
+        plan
+    }
+
     #[test]
     fn scanned_interfaces_are_published_as_classified_surfaces() {
         use crate::discovery::scan::ScannedInterface;
@@ -2351,9 +2569,12 @@ mod tests {
             std::slice::from_ref(&manifest),
             |_, _| Some(manifest_object),
             |_, _| true,
-            0,
-            &BTreeMap::new(),
+            ExistingAllocation {
+                slots: 0,
+                active: &BTreeMap::new(),
+            },
             false,
+            AdmissionPolicy::detailed(),
         );
 
         assert_eq!(plan.slots.len(), 2, "distinct pinned objects stay distinct");
@@ -2388,9 +2609,12 @@ mod tests {
             std::slice::from_ref(&manifest),
             |_, _| Some(PinnedObjectId(1)),
             |_, _| false,
-            0,
-            &BTreeMap::new(),
+            ExistingAllocation {
+                slots: 0,
+                active: &BTreeMap::new(),
+            },
             false,
+            AdmissionPolicy::detailed(),
         );
         assert!(plan.slots.is_empty());
         assert_eq!(plan.entries_seen, 1);
@@ -3716,6 +3940,7 @@ mod tests {
             plan.slots.len(),
             &plan.slot_by_key,
             false,
+            AdmissionPolicy::detailed(),
         );
 
         assert_eq!(rebuilt.modules.len(), 1);
@@ -3878,5 +4103,377 @@ mod tests {
         assert!(delta.new.is_empty());
         assert!(delta.replace.is_empty());
         assert!(delta.retire.is_empty());
+    }
+
+    #[test]
+    fn inventory_admits_all_sixty_four_heuristic_tables_while_detailed_stays_k4() {
+        let scanned = scanned_with_heuristic_tables(64);
+
+        let detailed = build_from_reconciled_modules(std::slice::from_ref(&scanned));
+        assert_eq!(detailed.admission_policy(), AdmissionPolicy::detailed());
+        assert_eq!(detailed.slots.len(), MAX_TABLES_PER_OBJECT);
+        assert_eq!(detailed.uncorroborated_candidates, 60);
+
+        let inventory = build_from_test_sources_with_policy(
+            std::slice::from_ref(&scanned),
+            &[],
+            inventory_policy(64),
+        );
+        assert_eq!(inventory.slots.len(), 64);
+        assert_eq!(inventory.uncorroborated_candidates, 0);
+        assert!(inventory.slots.iter().all(|slot| slot.descriptor_index == 0
+            && slot.semantics == SlotSemantics::COUNT_ONLY
+            && !slot.semantic_authorized));
+        assert!(
+            inventory
+                .slots
+                .iter()
+                .any(|slot| slot.file_offset == 63 * 8),
+            "the endpoint in the last heuristic table is admitted"
+        );
+    }
+
+    #[test]
+    fn inventory_checked_constructor_rejects_invalid_indices_and_duplicate_targets() {
+        let object = PinnedObjectId(7);
+        let non_dense = vec![exact_slot(1, object, 0x10, 0, vec![ModuleId(0)])];
+        assert!(AttachPlan::from_slots_with_policy(non_dense, inventory_policy(2)).is_err());
+
+        let duplicate = vec![
+            exact_slot(0, object, 0x10, 0, vec![ModuleId(0)]),
+            exact_slot(1, object, 0x10, 0, vec![ModuleId(0)]),
+        ];
+        assert!(AttachPlan::from_slots_with_policy(duplicate, inventory_policy(2)).is_err());
+    }
+
+    #[test]
+    fn inventory_multi_provider_rebuild_crosses_512_without_duplicate_view_allocations() {
+        let sources: Vec<_> = (0..9)
+            .map(|index| {
+                let key = ObjectKey {
+                    device: TEST_OBJECT.device,
+                    inode: TEST_OBJECT.inode + index,
+                };
+                scanned_with(
+                    key,
+                    &format!("/opt/provider-{index}.so"),
+                    (0..64).map(|n| n * 8),
+                )
+            })
+            .collect();
+        let policy = inventory_policy(576);
+        let mut plan = build_from_test_sources_with_policy(&sources[..8], &[], policy);
+        assert_eq!(plan.slots.len(), 512);
+
+        let mut duplicate_views = sources.clone();
+        for source in &sources {
+            let mut another_view = source.clone();
+            another_view.scanned.view = ProcessViewId(1);
+            duplicate_views.push(another_view);
+        }
+        let rebuilt = plan.rebuild_from_sources(&duplicate_views, &[], &PinnedObjects::empty());
+        assert_eq!(rebuilt.slots.len(), 576);
+        assert!(rebuilt.modules_skipped.is_empty());
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert_eq!(delta.new.len(), 64);
+        assert_eq!(plan.slots.len(), 576);
+        assert!(plan.is_active(575));
+        assert!(delta.retire.is_empty());
+
+        let refused = build_from_test_sources_with_policy(&sources, &[], inventory_policy(575));
+        assert_eq!(
+            refused.slots.len(),
+            512,
+            "the ninth provider is refused whole"
+        );
+        assert_eq!(refused.modules_skipped.len(), 1);
+        assert!(
+            refused
+                .slots
+                .iter()
+                .all(|slot| slot.object != sources[8].object)
+        );
+
+        let mut expanded = sources.clone();
+        expanded[8] = scanned_with(
+            sources[8].scanned.key,
+            "/opt/provider-8.so",
+            (0..65).map(|n| n * 8),
+        );
+        let rebuilt = plan.rebuild_from_sources(&expanded, &[], &PinnedObjects::empty());
+        assert_eq!(rebuilt.modules_skipped.len(), 1);
+        assert_eq!(
+            rebuilt.slots.len(),
+            512,
+            "an over-budget provider leaves no new prefix"
+        );
+        assert_eq!(
+            plan.slots.len(),
+            576,
+            "building a snapshot does not mutate allocations"
+        );
+        // Applying this refused snapshot would retain Detailed's retirement
+        // semantics. Inventory's later link owner must retain old probes;
+        // a capacity refusal is neither an unload nor quiescence evidence.
+    }
+
+    #[test]
+    fn inventory_selection_overlaps_and_deduplicates_beyond_512() {
+        let object = PinnedObjectId(7);
+        let slots = (0..513)
+            .map(|index| exact_slot(index, object, u64::from(index) * 8, 0, vec![ModuleId(0)]))
+            .collect();
+        let mut allocated = inventory_plan(slots, vec![exact_module(0, object)], 514);
+        let mut selection = allocated.clone();
+        selection
+            .add_selection_table(
+                &allocated,
+                ModuleId(0),
+                [
+                    selection_target(object, 0, "C_Sign"),
+                    selection_target(object, 0x10000, "C_Encrypt"),
+                    selection_target(object, 0x10000, "C_Decrypt"),
+                ],
+            )
+            .unwrap();
+        assert_eq!(selection.slots.len(), 514);
+        let delta = allocated.extend_exact(selection).unwrap();
+        assert_eq!(delta.new.len(), 1);
+        assert_eq!(delta.new[0].index, 513);
+        assert_eq!(delta.new[0].names, ["C_Decrypt", "C_Encrypt"]);
+        assert!(delta.new[0].aliased);
+        assert_eq!(delta.new[0].semantics, SlotSemantics::COUNT_ONLY);
+    }
+
+    #[test]
+    fn inventory_unequal_budgets_reject_extension_and_selection_without_mutation() {
+        let object = PinnedObjectId(7);
+        let slots = vec![exact_slot(0, object, 0x10, 0, vec![ModuleId(0)])];
+        let mut accepted = inventory_plan(slots.clone(), vec![exact_module(0, object)], 513);
+        let unequal = inventory_plan(slots, vec![exact_module(0, object)], 514);
+        let before = accepted.clone();
+        assert!(accepted.extend_exact(unequal.clone()).is_err());
+        assert_eq!(accepted, before);
+        assert!(
+            accepted
+                .add_selection_table(
+                    &unequal,
+                    ModuleId(0),
+                    [selection_target(object, 0x20, "C_Encrypt")],
+                )
+                .is_err()
+        );
+        assert_eq!(accepted, before);
+    }
+
+    #[test]
+    fn inventory_admission_rejects_slot_count_overflow() {
+        let policy = inventory_policy(1);
+
+        assert!(policy.checked_required(usize::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn inventory_unions_published_heuristic_forwarded_aliased_and_distinct_equal_bytes() {
+        use crate::discovery::scan::{ScannedEntry, ScannedTable};
+
+        let mut scanned = scanned_with(TEST_OBJECT, "/opt/p11.so", [0x10]);
+        scanned.scanned.tables[0].live_return = true;
+        let forwarded_key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: 77,
+        };
+        scanned.scanned.tables[0].entries.push(ScannedEntry {
+            name: "C_Encrypt",
+            object: forwarded_key,
+            object_path: "/opt/forwarded.so".into(),
+            file_offset: 0x20,
+        });
+        scanned.entry_objects[0].push(PinnedObjectId(77));
+        scanned.scanned.tables.push(ScannedTable {
+            version: (2, 40),
+            walk: "full",
+            entries: vec![ScannedEntry {
+                name: "C_Decrypt",
+                object: TEST_OBJECT,
+                object_path: "/opt/p11.so".into(),
+                file_offset: 0x30,
+            }],
+            null_entries: vec![],
+            unpinned: vec![],
+            address: 0x9000,
+            file_offset: Some(0x1000),
+            live_return: false,
+            manifest_supported: false,
+        });
+        scanned.entry_objects.push(vec![scanned.object]);
+
+        let aliased = manifest_with(vec![resolved("C_Sign", 0x10), resolved("C_Verify", 0x10)]);
+        let mut equal_bytes_other_object = manifest_with(vec![resolved("C_Sign", 0x10)]);
+        equal_bytes_other_object.provenance_objects[0].inode = 99;
+
+        let plan = build_from_test_sources_with_policy(
+            &[scanned],
+            &[aliased, equal_bytes_other_object],
+            inventory_policy(4),
+        );
+        let keys: BTreeSet<_> = plan.slots.iter().map(AttachKey::of).collect();
+        assert_eq!(
+            keys,
+            BTreeSet::from([
+                AttachKey {
+                    object: PinnedObjectId(42),
+                    file_offset: 0x10,
+                },
+                AttachKey {
+                    object: PinnedObjectId(42),
+                    file_offset: 0x30,
+                },
+                AttachKey {
+                    object: PinnedObjectId(77),
+                    file_offset: 0x20,
+                },
+                AttachKey {
+                    object: PinnedObjectId(99),
+                    file_offset: 0x10,
+                },
+            ])
+        );
+        let alias = plan
+            .slots
+            .iter()
+            .find(|slot| slot.object == PinnedObjectId(42) && slot.file_offset == 0x10)
+            .unwrap();
+        assert_eq!(alias.names, ["C_Sign", "C_Verify"]);
+        assert!(alias.aliased);
+        assert!(
+            plan.slots
+                .iter()
+                .all(|slot| slot.semantics == SlotSemantics::COUNT_ONLY)
+        );
+    }
+
+    #[test]
+    fn inventory_initial_admission_is_exact_at_budget_and_refuses_one_over_whole() {
+        let scanned = scanned_with(TEST_OBJECT, "/opt/p11.so", [0, 8, 16]);
+        let exact = build_from_test_sources_with_policy(
+            std::slice::from_ref(&scanned),
+            &[],
+            inventory_policy(3),
+        );
+        assert_eq!(exact.slots.len(), 3);
+        assert!(exact.modules_skipped.is_empty());
+
+        let over = build_from_test_sources_with_policy(&[scanned], &[], inventory_policy(2));
+        assert!(over.slots.is_empty(), "a refused module leaves no prefix");
+        assert!(over.modules.is_empty());
+        assert_eq!(over.modules_skipped.len(), 1);
+        assert!(over.modules_skipped[0].reason.contains("only 2"));
+    }
+
+    #[test]
+    fn inventory_budget_is_carried_through_bootstrap_rebuild_selection_and_extension() {
+        let object = PinnedObjectId(7);
+        let mut bootstrap = inventory_plan(vec![], vec![exact_module(0, object)], 1);
+        bootstrap
+            .add_provisional_get_function_list(ProvisionalGetFunctionList {
+                module: ModuleId(0),
+                object,
+                object_path: "/opt/p11.so".into(),
+                file_offset: 0x10,
+            })
+            .unwrap();
+        assert!(
+            bootstrap
+                .add_provisional_get_function_list(ProvisionalGetFunctionList {
+                    module: ModuleId(0),
+                    object,
+                    object_path: "/opt/p11.so".into(),
+                    file_offset: 0x20,
+                })
+                .is_err()
+        );
+
+        let mut committed = inventory_plan(
+            vec![exact_slot(0, object, 0x10, 0, vec![ModuleId(0)])],
+            vec![exact_module(0, object)],
+            3,
+        );
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: u64::from(object.0),
+        };
+        let rebuilt = committed.rebuild_from_sources(
+            &[scanned_with(key, "/opt/p11.so", [0x10, 0x20, 0x30])],
+            &[],
+            &PinnedObjects::empty(),
+        );
+        assert_eq!(rebuilt.admission_policy(), inventory_policy(3));
+        let delta = committed.extend_exact(rebuilt).unwrap();
+        assert_eq!(delta.new.len(), 2);
+        assert_eq!(committed.slots.len(), 3);
+
+        let mut selection = committed.clone();
+        let before = selection.clone();
+        assert!(
+            selection
+                .add_selection_table(
+                    &committed,
+                    ModuleId(0),
+                    [selection_target(object, 0x40, "C_Encrypt")],
+                )
+                .is_err()
+        );
+        assert_eq!(selection, before, "selection refusal is atomic");
+
+        let detailed = exact_plan(
+            vec![exact_slot(0, object, 0x10, 0, vec![ModuleId(0)])],
+            vec![exact_module(0, object)],
+        );
+        let before = committed.clone();
+        assert!(committed.extend_exact(detailed).is_err());
+        assert_eq!(committed, before, "mode policy cannot change in extension");
+    }
+
+    #[test]
+    fn inventory_retirement_never_reuses_ids_or_refunds_lifetime_budget() {
+        let object = PinnedObjectId(7);
+        let slots = vec![
+            exact_slot(0, object, 0x10, 0, vec![ModuleId(0)]),
+            exact_slot(1, object, 0x20, 0, vec![ModuleId(0)]),
+        ];
+        let mut plan = inventory_plan(slots, vec![exact_module(0, object)], 3);
+        let surviving = inventory_plan(
+            vec![exact_slot(0, object, 0x10, 0, vec![ModuleId(0)])],
+            vec![exact_module(0, object)],
+            3,
+        );
+        plan.extend_exact(surviving).unwrap();
+        assert!(!plan.is_active(1));
+
+        let reappeared = inventory_plan(
+            vec![
+                exact_slot(0, object, 0x10, 0, vec![ModuleId(0)]),
+                exact_slot(1, object, 0x20, 0, vec![ModuleId(0)]),
+            ],
+            vec![exact_module(0, object)],
+            3,
+        );
+        let delta = plan.extend_exact(reappeared).unwrap();
+        assert_eq!(delta.new[0].index, 2);
+        assert!(!plan.is_active(1));
+
+        let one_more = inventory_plan(
+            vec![
+                exact_slot(0, object, 0x10, 0, vec![ModuleId(0)]),
+                exact_slot(1, object, 0x20, 0, vec![ModuleId(0)]),
+                exact_slot(2, object, 0x30, 0, vec![ModuleId(0)]),
+            ],
+            vec![exact_module(0, object)],
+            3,
+        );
+        let before = plan.clone();
+        assert!(plan.extend_exact(one_more).is_err());
+        assert_eq!(plan, before, "retirement does not refund an endpoint id");
     }
 }

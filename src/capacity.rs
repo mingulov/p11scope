@@ -12,10 +12,73 @@ use p11scope_ebpf_common::{
     RING_BYTES, ROOT_AFFILIATION_LIMIT, RV_ENTRIES, START_ENTRIES, THREAD_OWNER_LIMIT,
 };
 use std::collections::{BTreeSet, HashSet};
+use std::mem::size_of;
 use std::sync::{
     Mutex,
     atomic::{AtomicU64, Ordering},
 };
+
+/// One compact inventory value is one atomic `u64` constrained to 0/1.
+pub const INVENTORY_ENDPOINT_BYTES: u64 = size_of::<u64>() as u64;
+
+/// Validated capacity for the compact provider-usage inventory.
+///
+/// The endpoint count is the capture-lifetime ID bound. Its payload is exactly
+/// one eight-byte value per endpoint; kernel map overhead is measured
+/// separately and is deliberately not folded into this contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InventoryBudget {
+    endpoint_limit: u64,
+    payload_bytes: u64,
+}
+
+impl InventoryBudget {
+    pub fn new(endpoint_limit: u64, payload_bytes: u64) -> Result<Self, String> {
+        if endpoint_limit == 0 {
+            return Err("inventory endpoint budget must be non-zero".into());
+        }
+        if endpoint_limit > u64::from(u32::MAX) {
+            return Err(format!(
+                "inventory endpoint budget {endpoint_limit} exceeds the u32 endpoint ID space"
+            ));
+        }
+        let required = endpoint_limit
+            .checked_mul(INVENTORY_ENDPOINT_BYTES)
+            .ok_or_else(|| "inventory payload budget overflowed".to_string())?;
+        if payload_bytes != required {
+            return Err(format!(
+                "inventory payload budget is {payload_bytes} bytes but {endpoint_limit} endpoints require exactly {required} bytes"
+            ));
+        }
+        Ok(Self {
+            endpoint_limit,
+            payload_bytes,
+        })
+    }
+
+    pub const fn endpoint_limit(self) -> u64 {
+        self.endpoint_limit
+    }
+
+    pub const fn payload_bytes(self) -> u64 {
+        self.payload_bytes
+    }
+
+    pub(crate) fn validate_count(self, endpoints: usize) -> Result<(), String> {
+        let endpoints = u64::try_from(endpoints)
+            .map_err(|_| "inventory endpoint count does not fit u64".to_string())?;
+        let payload = endpoints
+            .checked_mul(INVENTORY_ENDPOINT_BYTES)
+            .ok_or_else(|| "inventory payload requirement overflowed".to_string())?;
+        if endpoints > self.endpoint_limit || payload > self.payload_bytes {
+            return Err(format!(
+                "inventory plan requires {endpoints} endpoints ({payload} payload bytes) but only {} endpoints ({} payload bytes) are available",
+                self.endpoint_limit, self.payload_bytes
+            ));
+        }
+        Ok(())
+    }
+}
 
 /// One row of the capacity inventory: the enforced limit and the source that
 /// reports live occupancy or loss for it.
@@ -414,6 +477,17 @@ pub fn admission_envelope() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inventory_budget_requires_an_exact_checked_eight_byte_payload() {
+        let budget = InventoryBudget::new(64, 512).unwrap();
+        assert_eq!(budget.endpoint_limit(), 64);
+        assert_eq!(budget.payload_bytes(), 512);
+        assert!(InventoryBudget::new(0, 0).is_err());
+        assert!(InventoryBudget::new(64, 511).is_err());
+        assert!(InventoryBudget::new(64, 513).is_err());
+        assert!(InventoryBudget::new(u64::MAX, u64::MAX).is_err());
+    }
 
     #[test]
     fn inventory_has_unique_names_and_positive_limits() {

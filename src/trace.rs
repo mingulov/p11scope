@@ -167,8 +167,16 @@ pub fn lost_line(n: u64) -> Option<String> {
     (n > 0).then(|| format!("LOST {n} events"))
 }
 
-pub fn truncated_line(limit: u64) -> String {
-    format!("TRUNCATED at {limit} events (--max-events)")
+/// `TRUNCATED at {limit} events`, citing the effective cap: the explicit
+/// `--max-events` value when the operator passed one, the default cap
+/// otherwise — never blaming a flag that was never given (SYSPLAN
+/// residual F-17).
+pub fn truncated_line(limit: u64, explicit: bool) -> String {
+    if explicit {
+        format!("TRUNCATED at {limit} events (--max-events {limit})")
+    } else {
+        format!("TRUNCATED at {limit} events (default cap; pass --max-events <n> to change it)")
+    }
 }
 
 pub fn capture_line(policy: CapturePolicy) -> String {
@@ -607,6 +615,11 @@ mod tests {
             module_unresolved_slots: 0,
             provider_changed: false,
             scheduling: render::SchedulingEvidence::default(),
+            drain_proven: false,
+            verdict_detail: render::VERDICT_CONCRETE_GAP,
+            uretprobe_override: None,
+            handoff_child_pid: None,
+            p11scope_env: vec![],
             completeness: "COMPLETE",
         }
     }
@@ -649,7 +662,7 @@ mod tests {
         for line in [
             capture_line(CapturePolicy::Allowlisted),
             lost_line(1).unwrap(),
-            truncated_line(1),
+            truncated_line(1, true),
         ] {
             assert!(!line.contains("interface_selection"));
             assert!(!line.contains("selection_truncated"));
@@ -668,7 +681,14 @@ mod tests {
 
     #[test]
     fn a_truncated_trace_says_so_in_its_terminal_record() {
-        assert_eq!(truncated_line(1), "TRUNCATED at 1 events (--max-events)");
+        assert_eq!(
+            truncated_line(1, true),
+            "TRUNCATED at 1 events (--max-events 1)"
+        );
+        assert_eq!(
+            truncated_line(1, false),
+            "TRUNCATED at 1 events (default cap; pass --max-events <n> to change it)"
+        );
         let evidence = empty_evidence();
         let line = evidence_line(&evidence, crate::attach::CapturePolicy::Allowlisted, true);
         let value: serde_json::Value =
@@ -908,14 +928,23 @@ mod tests {
         assert!(!state.pid_has_process_state(100));
     }
 
-    // SYSPLAN residual F-17 (RED): the TRUNCATED message cites the effective
+    // SYSPLAN residual F-17 (GREEN): the TRUNCATED message cites the effective
     // cap instead of blaming a flag the operator never passed.
     #[test]
     fn truncated_message_cites_effective_default_cap() {
-        let msg = truncated_line(10_000_000);
+        let msg = truncated_line(10_000_000, false);
         assert!(
             msg.contains("default"),
             "default-cap truncation must say so: {msg:?}"
+        );
+        assert!(
+            !msg.contains("--max-events 10000000"),
+            "must not blame an unpassed flag value: {msg:?}"
+        );
+        let explicit = truncated_line(5, true);
+        assert!(
+            explicit.contains("--max-events 5"),
+            "explicit cap must cite the flag: {explicit:?}"
         );
     }
 }

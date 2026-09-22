@@ -135,6 +135,17 @@ U32_MAX = (1 << 32) - 1
 U16_MAX = (1 << 16) - 1
 PROFILE_SCHEMA = "p11scope/observed-profile/v3"
 METRICS_SCHEMA = "p11scope/observed-profile/v3-metrics"
+# SYSPLAN residual F-02: the terminal verdict split. `drain_proven` is the
+# settlement latch (a future COMPLETE requires it set); `verdict_detail`
+# says which terminal story `completeness` tells.
+VERDICT_DETAILS = {"clean_proven", "clean_but_unproven", "concrete_gap"}
+# SYSPLAN residual F-01: the only override flag durable evidence may name.
+URETPROBE_OVERRIDE_FLAG = "--allow-uretprobe-on-confined-target"
+# SYSPLAN residual F-26: capture-visible environment switches.
+P11SCOPE_ENV_VARS = {"P11SCOPE_BROAD_ADMIT", "P11SCOPE_LOADER_ENV_SANITIZED"}
+# SYSPLAN residual F-12: machine-readable lane discriminators.
+PROFILE_LANE = "profile"
+METRICS_LANE = "metrics"
 SELECTION_KEYS = {
     "providers", "standard_exports", "inventory_surfaces", "tuples",
     "selection_truncated",
@@ -155,6 +166,16 @@ PROFILE_V3_FIELDS = {
     "interface_selection", "attach_mechanisms", "pid_descendant_gaps",
     "multi_rebuild_gaps",
 }
+RESIDUAL_EVIDENCE_KEYS = {
+    # F-02: settlement latch + terminal verdict detail.
+    "drain_proven", "verdict_detail",
+    # F-01: durable uretprobe/hazard override (flag + reason), null when clean.
+    "uretprobe_override",
+    # F-15: handed-back orphan PID, null unless the run lane left it alive.
+    "handoff_child_pid",
+    # F-26: active values of every capture-visible P11SCOPE_* switch.
+    "p11scope_env",
+}
 BASE_EVIDENCE_KEYS = set(COUNTERS) | {
     "authority", "discovery", "manifest_object_fallbacks", "modules_skipped",
     "scan_unavailable", "scan_ms", "table_entries", "slots", "attached_probes",
@@ -163,6 +184,7 @@ BASE_EVIDENCE_KEYS = set(COUNTERS) | {
     *PAUSE_COUNTERS, "loader_discovery", "templates_truncated", "provider_changed",
     "scheduling",
     "completeness",
+    *RESIDUAL_EVIDENCE_KEYS,
     # Informational, not a COUNTER: spilling heuristic lookalikes past the
     # per-object cap is correct admission, not a coverage gap, so it never
     # forces PARTIAL and needs no lane allowance or mutation.
@@ -253,11 +275,18 @@ SHARED_OVERLAY_UNCERTAINTY = (
 PHYSICAL_IDENTITY_AMBIGUITY = (
     "physical identity is ambiguous; the collision group was not attached"
 )
+# SYSPLAN residual F-14: render.rs `capture_skipped_out` emits this seventh
+# reason when the memory scan refuses a future-minor table at the
+# `spans_for` gate. Fixed string, never with version numbers attached.
+UNSUPPORTED_TABLE_VERSION = (
+    "unsupported function-table version; the scanner does not walk this layout"
+)
 DISCOVERY_REASONS = {
     DISCOVERY_UNAVAILABLE,
     TABLE_UNAVAILABLE,
     SHARED_OVERLAY_UNCERTAINTY,
     PHYSICAL_IDENTITY_AMBIGUITY,
+    UNSUPPORTED_TABLE_VERSION,
 }
 ENTRY_REASONS = {"null pointer", ENTRY_UNAVAILABLE}
 # The one gated entry-like skip whose subject is not a standard function: a
@@ -380,6 +409,7 @@ def exact_profile_v3_selection(document, *, terminal=False, run=False):
     """Validate the closed, bounded profile-v3 selection/privacy extension."""
     if not terminal:
         require(document["schema"] == PROFILE_SCHEMA, document["schema"])
+        require(document["lane"] == PROFILE_LANE, document.get("lane"))
         # The terminal trace carries no `capture` header, so only live
         # profile documents state their selecting scope here.
         exact_capture_scope(document)
@@ -389,6 +419,7 @@ def exact_profile_v3_selection(document, *, terminal=False, run=False):
     exact_evidence_keys(evidence, profile=True, terminal=terminal, child=run)
     exact_scheduling_evidence(evidence)
     exact_task_uprobe_link_losses(evidence)
+    exact_terminal_verdict(evidence)
     missing = {
         "interface_selection", "attach_mechanisms", "pid_descendant_gaps",
         "multi_rebuild_gaps",
@@ -530,13 +561,33 @@ def exact_role_counts(description):
     }, f"observer/helper roles are reversed or widened: {description}")
 
 
+def helper_selection_call_count():
+    """The helper's exact `C_GetInterface` call count, derived from the
+    fixed selector×flag matrix in its source (SYSPLAN residual F-50/F5.7:
+    the ten-call promise used to be a self-test against a literal, wired
+    to no artifact — now the matrix bounds are read from the artifact and
+    the count must still be exactly ten)."""
+    text = Path("crates/discover/src/discover.rs").read_text(encoding="utf-8")
+    selectors = re.search(r"for selector in 0\.\.(\d+)u8", text)
+    flags = re.search(r"for flag in \[0u8, 1\]", text)
+    require(selectors is not None, "helper selector loop is not the fixed 0..N matrix")
+    require(flags is not None, "helper flag loop is not the fixed [0, 1] matrix")
+    require(
+        text.count("get_interface(name_ptr, version_ptr, &mut output, flags)") == 1,
+        "helper must make its interface call at exactly one site",
+    )
+    return int(selectors.group(1)) * 2
+
+
 def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, historical=False):
     counter_keys = set(HISTORICAL_COUNTERS if historical else COUNTERS)
     wanted = (BASE_EVIDENCE_KEYS - set(COUNTERS)) | counter_keys
     if historical:
         # Retained v2-metrics documents predate scheduling evidence, like
-        # the newer counters HISTORICAL_COUNTERS already excludes.
+        # the newer counters HISTORICAL_COUNTERS already excludes, and
+        # predate the residual terminal/override/handoff/env evidence too.
         wanted.discard("scheduling")
+        wanted -= RESIDUAL_EVIDENCE_KEYS
     wanted |= PROFILE_V3_FIELDS if profile else set()
     if terminal:
         wanted |= TRACE_TERMINAL_KEYS
@@ -607,12 +658,14 @@ def exact_capture_scope(document):
 
 def exact_metrics_schema(document, *, run=False):
     require(document["schema"] == METRICS_SCHEMA, document["schema"])
+    require(document["lane"] == METRICS_LANE, document.get("lane"))
     require(document["capture"]["mode"] == "metrics", document["capture"])
     require(document["capture"]["privacy_mode"] == "aggregate-only", document["capture"])
     exact_capture_scope(document)
     exact_evidence_keys(document["evidence"], profile=False, child=run)
     exact_scheduling_evidence(document["evidence"])
     exact_task_uprobe_link_losses(document["evidence"])
+    exact_terminal_verdict(document["evidence"])
 
 
 def exact_historical_metrics_schema(document, *, run=False):
@@ -689,6 +742,77 @@ def exact_task_uprobe_link_losses(evidence):
         require(
             evidence["completeness"] != "COMPLETE",
             "task-uprobe link loss cannot be COMPLETE",
+        )
+
+
+def exact_terminal_verdict(evidence):
+    """SYSPLAN residual terminal split (F-02) + durable override (F-01),
+    handoff PID (F-15), and environment snapshot (F-26).
+
+    The oracle gates any future COMPLETE on the settlement latch exactly
+    like the producer's terminal seal: COMPLETE requires `drain_proven`
+    and `clean_proven`; anything else is PARTIAL with the detail saying
+    whether the run was clean-but-unproven or had a concrete gap.
+    """
+    require(
+        evidence["completeness"] in {"COMPLETE", "PARTIAL"},
+        f"invalid completeness: {evidence['completeness']!r}",
+    )
+    require(
+        evidence["drain_proven"] is True or evidence["drain_proven"] is False,
+        f"invalid drain_proven: {evidence['drain_proven']!r}",
+    )
+    detail = evidence["verdict_detail"]
+    require(detail in VERDICT_DETAILS, f"invalid verdict_detail: {detail!r}")
+    if evidence["completeness"] == "COMPLETE":
+        require(
+            evidence["drain_proven"] is True,
+            "COMPLETE requires a proven terminal drain",
+        )
+        require(detail == "clean_proven", f"COMPLETE needs clean_proven: {detail!r}")
+    elif detail == "clean_but_unproven":
+        require(
+            evidence["drain_proven"] is False,
+            "clean_but_unproven needs an unproven drain",
+        )
+    override = evidence["uretprobe_override"]
+    if override is not None:
+        exact_keys(override, {"flag", "reason"}, "uretprobe_override")
+        require(
+            override["flag"] == URETPROBE_OVERRIDE_FLAG,
+            f"invalid uretprobe_override.flag: {override!r}",
+        )
+        require(
+            isinstance(override["reason"], str) and override["reason"],
+            f"invalid uretprobe_override.reason: {override!r}",
+        )
+    pid = evidence["handoff_child_pid"]
+    require(
+        pid is None or (u64(pid) and 0 < pid <= U32_MAX),
+        f"invalid handoff_child_pid: {pid!r}",
+    )
+    if "child_still_running" in evidence:
+        require(
+            (pid is None) == (evidence["child_still_running"] is not True),
+            "handoff_child_pid disagrees with child_still_running",
+        )
+    else:
+        require(pid is None, "handoff PID outside the run lane")
+    env = evidence["p11scope_env"]
+    require(isinstance(env, list), f"p11scope_env must be a list: {env!r}")
+    seen = set()
+    for item in env:
+        exact_keys(item, {"name", "effect", "value"}, "p11scope_env item")
+        require(item["name"] in P11SCOPE_ENV_VARS, f"unknown env switch: {item!r}")
+        require(item["name"] not in seen, f"duplicate env switch: {item!r}")
+        seen.add(item["name"])
+        require(
+            isinstance(item["effect"], str) and item["effect"],
+            f"invalid env effect: {item!r}",
+        )
+        require(
+            item["value"] is None or isinstance(item["value"], str),
+            f"invalid env value: {item!r}",
         )
 
 
@@ -1058,6 +1182,11 @@ PUBLISHED_LOADER_PAUSE_FIELDS = {
     "pause",
     "loader_discovery",
     "child_still_running",
+    # SYSPLAN residual F-15: the run lane's own child, handed back alive.
+    # The operator started this process; naming it leaks no target identity
+    # they could not already see. `exact_terminal_verdict` pins it to the
+    # run lane and to `child_still_running`.
+    "handoff_child_pid",
     *PAUSE_COUNTERS,
 }
 
@@ -2203,6 +2332,13 @@ def evidence_fixture(surfaces, sources=("scan",), discovery_skipped=0):
         "provider_changed": False,
         "scheduling": scheduling_fixture(),
         "completeness": "PARTIAL",
+        # SYSPLAN residual: unproven drain, concrete gap, clean preflight,
+        # no handoff, no env switches live.
+        "drain_proven": False,
+        "verdict_detail": "concrete_gap",
+        "uretprobe_override": None,
+        "handoff_child_pid": None,
+        "p11scope_env": [],
     }
 
 
@@ -2224,6 +2360,8 @@ def document_fixture(evidence, *, schema=PROFILE_SCHEMA, mode="profile", privacy
             evidence.pop("abi_refusals", None)
             evidence.pop("semantic_history_drops", None)
             evidence.pop("scheduling", None)
+            for field in RESIDUAL_EVIDENCE_KEYS:
+                evidence.pop(field, None)
     capture = {
         "mode": mode,
         "privacy_mode": privacy,
@@ -2240,8 +2378,15 @@ def document_fixture(evidence, *, schema=PROFILE_SCHEMA, mode="profile", privacy
         # Current v3 profile/metrics captures disclose which scope selected
         # them; the retained v2-metrics shape predates the field.
         capture["scope"] = "pid"
+    if schema == PROFILE_SCHEMA:
+        lane = PROFILE_LANE
+    elif schema == METRICS_SCHEMA:
+        lane = METRICS_LANE
+    else:
+        lane = METRICS_LANE
     return {
         "schema": schema,
+        "lane": lane,
         "capture": capture,
         "evidence": evidence,
         "functions": [],
@@ -2257,7 +2402,8 @@ def rejected(action):
 
 
 def self_test():
-    roles = {"observer_calls": 0, "inspect_calls": 0, "helper_calls": 10}
+    helper_calls = helper_selection_call_count()
+    roles = {"observer_calls": 0, "inspect_calls": 0, "helper_calls": helper_calls}
     exact_role_counts(roles)
     reversed_roles = {"observer_calls": 10, "inspect_calls": 0, "helper_calls": 0}
     rejected(lambda: exact_role_counts(reversed_roles))

@@ -7747,6 +7747,11 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
             terminal_drain_bound: 65536,
             ..Default::default()
         },
+        drain_proven: false,
+        verdict_detail: p11scope::render::VERDICT_CONCRETE_GAP,
+        uretprobe_override: None,
+        handoff_child_pid: None,
+        p11scope_env: vec![],
         completeness: "UNKNOWN",
     };
     evidence.verdict();

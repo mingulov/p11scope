@@ -1186,6 +1186,11 @@ pub fn render(checks: &[Check]) -> String {
         let dots = NAME_WIDTH.saturating_sub(check.name.chars().count());
         let word = status_word(&check.status);
         let detail = status_detail(&check.status);
+        // Details carry target-controlled bytes (paths, errors): a newline
+        // must never let one check forge a second output line (SYSPLAN
+        // residual F-59). The same escape the capture renderers use.
+        let flattened = detail.replace('\n', "\\n");
+        let detail = crate::render::escape_controls(&flattened);
         let _ = write!(out, "{} {} {word}", check.name, ".".repeat(dots));
         if !detail.is_empty() {
             let pad = STATUS_WIDTH.saturating_sub(word.len());
@@ -2138,8 +2143,12 @@ mod tests {
             status: Status::Fail("first line\nverdict: forged".into()),
         }]);
         assert!(
-            !out.contains("verdict: forged\n") && !out.lines().any(|l| l == "verdict: forged"),
+            !out.lines().any(|l| l == "verdict: forged"),
             "raw injected line survived render: {out:?}"
+        );
+        assert!(
+            out.contains("first line\\nverdict: forged"),
+            "detail must survive escaped on its own row: {out:?}"
         );
         assert!(
             out.lines().count() == 3,

@@ -1,0 +1,413 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://p11scope/observed-profile/v3.schema.json",
+  "title": "p11scope observed-profile v3 document",
+  "description": "Consumer aid for live v3 profile and v3-metrics documents (SYSPLAN residual F-50). The evidence object is closed per lane; the release oracle (scripts/check-capture-evidence.py) is the enforcement behind this file, and tests/python/test_schema_json.py keeps the two in agreement. Terminal trace EVIDENCE objects are not documents and are out of scope, as are historical v2 shapes.",
+  "type": "object",
+  "required": ["schema", "lane", "capture", "evidence", "functions"],
+  "properties": {
+    "schema": {
+      "enum": ["p11scope/observed-profile/v3", "p11scope/observed-profile/v3-metrics"]
+    },
+    "lane": {"enum": ["profile", "metrics"]},
+    "capture": {
+      "type": "object",
+      "required": ["mode", "privacy_mode", "scope", "ring_bytes", "drain_interval_ms", "modules"],
+      "properties": {
+        "mode": {"enum": ["profile", "metrics"]},
+        "privacy_mode": {"type": "string"},
+        "scope": {"enum": ["pid", "cgroup", "system"]},
+        "ring_bytes": {"type": "integer", "minimum": 0},
+        "drain_interval_ms": {"type": "integer", "minimum": 0},
+        "modules": {"type": "array"}
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "abi_refusals", "aliased", "async_duplicates", "async_evictions",
+        "async_orphans", "async_target_failures", "attach_failures",
+        "attach_gap_ms", "attached_probes", "auth_state_ambiguities",
+        "authority", "cgroup_scope_failures", "completeness", "discovery",
+        "discovery_conflicts", "discovery_read_failures", "discovery_ring_loss",
+        "discovery_state_failures", "discovery_truncated",
+        "discovery_uncorroborated", "discovery_uncorroborated_candidates",
+        "drain_proven", "event_loss", "fork_state_ambiguities",
+        "handoff_child_pid", "in_flight_at_end", "interface_list",
+        "loader_discovery", "malformed_records", "manifest_object_fallbacks",
+        "module_ambiguous", "modules_skipped", "operation_state_imports",
+        "orphan_ops", "p11scope_env", "pause", "pause_attempts",
+        "pause_confirmed", "pause_partial", "pending_at_end",
+        "process_tracking_evictions", "process_tracking_failures",
+        "process_tracking_fallbacks", "provider_changed", "rv_update_failures",
+        "scan_ms", "scan_unavailable", "scheduling",
+        "semantic_capture_failures", "semantic_history_drops",
+        "semantic_state_drops", "session_cancel_ambiguities",
+        "session_cancel_unknown_flags", "shape_decode_failures",
+        "shape_decode_total_failures", "skipped", "slots",
+        "start_insert_failures", "state_reconciliations", "surfaces",
+        "table_entries", "task_uprobe_link_losses", "template_tail_failures",
+        "templates_truncated", "unmatched_closes", "unmatched_returns",
+        "unregistered_mechanisms", "uretprobe_override", "vendor_interfaces",
+        "verdict_detail"
+      ],
+      "properties": {
+        "abi_refusals": {"type": "integer", "minimum": 0},
+        "aliased": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}},
+        "async_duplicates": {"type": "integer", "minimum": 0},
+        "async_evictions": {"type": "integer", "minimum": 0},
+        "async_orphans": {"type": "integer", "minimum": 0},
+        "async_target_failures": {"type": "integer", "minimum": 0},
+        "attach_failures": {"type": "array", "items": {"type": "string"}},
+        "attach_gap_ms": {"type": ["integer", "null"], "minimum": 0},
+        "attached_probes": {"type": "integer", "minimum": 0},
+        "auth_state_ambiguities": {"type": "integer", "minimum": 0},
+        "authority": {"const": "hash-pinned"},
+        "cgroup_scope_failures": {"type": "integer", "minimum": 0},
+        "child_still_running": {"type": "boolean"},
+        "completeness": {"enum": ["COMPLETE", "PARTIAL"]},
+        "discovery": {"type": "array"},
+        "discovery_conflicts": {"type": "integer", "minimum": 0},
+        "discovery_read_failures": {"type": "integer", "minimum": 0},
+        "discovery_ring_loss": {"type": "integer", "minimum": 0},
+        "discovery_state_failures": {"type": "integer", "minimum": 0},
+        "discovery_truncated": {"type": "integer", "minimum": 0},
+        "discovery_uncorroborated": {"type": "integer", "minimum": 0},
+        "discovery_uncorroborated_candidates": {"type": "integer", "minimum": 0},
+        "drain_proven": {"type": "boolean"},
+        "event_loss": {"type": "integer", "minimum": 0},
+        "fork_state_ambiguities": {"type": "integer", "minimum": 0},
+        "handoff_child_pid": {"type": ["integer", "null"], "minimum": 1},
+        "in_flight_at_end": {"type": "integer", "minimum": 0},
+        "interface_list": {"type": "string"},
+        "loader_discovery": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["strategies", "dlopen_timing", "initial_set_timing", "initial_set_capture", "hits", "state_read_failures"],
+          "properties": {
+            "strategies": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["debug_state_every_hit", "dlopen_return", "unavailable"],
+              "properties": {
+                "debug_state_every_hit": {"type": "integer", "minimum": 0},
+                "dlopen_return": {"type": "integer", "minimum": 0},
+                "unavailable": {"type": "integer", "minimum": 0}
+              }
+            },
+            "dlopen_timing": {"$ref": "#/$defs/loader_timing"},
+            "initial_set_timing": {"$ref": "#/$defs/loader_timing"},
+            "initial_set_capture": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["eligible", "none"],
+              "properties": {
+                "eligible": {"type": "integer", "minimum": 0},
+                "none": {"type": "integer", "minimum": 0}
+              }
+            },
+            "hits": {"type": "integer", "minimum": 0},
+            "state_read_failures": {"type": "integer", "minimum": 0}
+          }
+        },
+        "malformed_records": {"type": "integer", "minimum": 0},
+        "manifest_object_fallbacks": {
+          "type": "array",
+          "maxItems": 512,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["manifest", "object", "reason", "replacement"],
+            "properties": {
+              "manifest": {"type": "integer", "minimum": 0},
+              "object": {"type": "integer", "minimum": 0, "maximum": 511},
+              "reason": {"enum": ["open_stale", "identity_mismatch"]},
+              "replacement": {"type": "object"}
+            }
+          }
+        },
+        "module_ambiguous": {"type": "integer", "minimum": 0},
+        "modules_skipped": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "reason"],
+            "properties": {
+              "name": {"type": "string"},
+              "reason": {"type": "string"}
+            }
+          }
+        },
+        "operation_state_imports": {"type": "integer", "minimum": 0},
+        "orphan_ops": {"type": "integer", "minimum": 0},
+        "p11scope_env": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "effect", "value"],
+            "properties": {
+              "name": {"enum": ["P11SCOPE_BROAD_ADMIT", "P11SCOPE_LOADER_ENV_SANITIZED"]},
+              "effect": {"type": "string", "minLength": 1},
+              "value": {"type": ["string", "null"]}
+            }
+          }
+        },
+        "pause": {"enum": ["none", "sigstop", "partial"]},
+        "pause_attempts": {"type": "integer", "minimum": 0},
+        "pause_confirmed": {"type": "integer", "minimum": 0},
+        "pause_partial": {"type": "integer", "minimum": 0},
+        "pending_at_end": {"type": "integer", "minimum": 0},
+        "process_tracking_evictions": {"type": "integer", "minimum": 0},
+        "process_tracking_failures": {"type": "integer", "minimum": 0},
+        "process_tracking_fallbacks": {"type": "integer", "minimum": 0},
+        "provider_changed": {"type": "boolean"},
+        "rv_update_failures": {"type": "integer", "minimum": 0},
+        "scan_ms": {"type": "integer", "minimum": 0},
+        "scan_unavailable": {"type": ["string", "null"]},
+        "scheduling": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["drain_repolls", "drain_budget_exhaustions", "capture_event_loss", "detach_event_loss", "capture_discovery_loss", "detach_discovery_loss", "terminal_drain_bound", "terminal_drain_truncated", "sink_policy", "sink_stall_ms", "sink_timeouts", "sink_dropped_bytes", "max_inter_drain_gap_ms", "phase_ms"],
+          "properties": {
+            "drain_repolls": {"type": "integer", "minimum": 0},
+            "drain_budget_exhaustions": {"type": "integer", "minimum": 0},
+            "capture_event_loss": {"type": "integer", "minimum": 0},
+            "detach_event_loss": {"type": "integer", "minimum": 0},
+            "capture_discovery_loss": {"type": "integer", "minimum": 0},
+            "detach_discovery_loss": {"type": "integer", "minimum": 0},
+            "terminal_drain_bound": {"const": 65536},
+            "terminal_drain_truncated": {"type": "boolean"},
+            "sink_policy": {"const": "bounded-wait-drop"},
+            "sink_stall_ms": {"type": "integer", "minimum": 0},
+            "sink_timeouts": {"type": "integer", "minimum": 0},
+            "sink_dropped_bytes": {"type": "integer", "minimum": 0},
+            "max_inter_drain_gap_ms": {"type": "integer", "minimum": 0},
+            "phase_ms": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["discovery", "discovery_terminal", "drain", "maps", "render", "detach"],
+              "properties": {
+                "discovery": {"type": "integer", "minimum": 0},
+                "discovery_terminal": {"type": "integer", "minimum": 0},
+                "drain": {"type": "integer", "minimum": 0},
+                "maps": {"type": "integer", "minimum": 0},
+                "render": {"type": "integer", "minimum": 0},
+                "detach": {"type": "integer", "minimum": 0}
+              }
+            }
+          }
+        },
+        "semantic_capture_failures": {"type": "integer", "minimum": 0},
+        "semantic_history_drops": {"type": "integer", "minimum": 0},
+        "semantic_state_drops": {"type": "integer", "minimum": 0},
+        "session_cancel_ambiguities": {"type": "integer", "minimum": 0},
+        "session_cancel_unknown_flags": {"type": "integer", "minimum": 0},
+        "shape_decode_failures": {"type": "integer", "minimum": 0},
+        "shape_decode_total_failures": {"type": "integer", "minimum": 0},
+        "skipped": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "reason"],
+            "properties": {
+              "name": {"type": "string"},
+              "reason": {
+                "enum": [
+                  "null pointer",
+                  "function entry unavailable",
+                  "function table unavailable in file-backed data",
+                  "discovery unavailable",
+                  "shared-overlay physical identity is uncertain; a distinct byte-identical instance may be unobserved",
+                  "physical identity is ambiguous; the collision group was not attached",
+                  "unsupported function-table version; the scanner does not walk this layout"
+                ]
+              }
+            }
+          }
+        },
+        "slots": {"type": "integer", "minimum": 0},
+        "start_insert_failures": {"type": "integer", "minimum": 0},
+        "state_reconciliations": {"type": "integer", "minimum": 0},
+        "surfaces": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["walk", "functions", "acquisition", "source"],
+            "properties": {
+              "walk": {"type": "string"},
+              "functions": {"type": "integer", "minimum": 0},
+              "acquisition": {"type": "string"},
+              "source": {"type": "string"}
+            }
+          }
+        },
+        "table_entries": {"type": "integer", "minimum": 0},
+        "task_uprobe_link_losses": {"type": "integer", "minimum": 0},
+        "template_tail_failures": {"type": "integer", "minimum": 0},
+        "templates_truncated": {"type": "boolean"},
+        "unmatched_closes": {"type": "integer", "minimum": 0},
+        "unmatched_returns": {"type": "integer", "minimum": 0},
+        "unregistered_mechanisms": {"type": "integer", "minimum": 0},
+        "uretprobe_override": {
+          "type": ["object", "null"],
+          "properties": {
+            "flag": {"const": "--allow-uretprobe-on-confined-target"},
+            "reason": {"type": "string", "minLength": 1}
+          },
+          "required": ["flag", "reason"]
+        },
+        "vendor_interfaces": {"type": "integer", "minimum": 0},
+        "verdict_detail": {"enum": ["clean_proven", "clean_but_unproven", "concrete_gap"]},
+        "interface_selection": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["providers", "standard_exports", "inventory_surfaces", "tuples", "selection_truncated"],
+          "properties": {
+            "providers": {
+              "type": "array",
+              "maxItems": 512,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["module", "coverage"],
+                "properties": {
+                  "module": {"type": "integer", "minimum": 0},
+                  "coverage": {"enum": ["observed", "observed_uncovered", "absent_covered", "absent_uncovered"]}
+                }
+              }
+            },
+            "standard_exports": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["module", "status"],
+                "properties": {
+                  "module": {"type": "integer", "minimum": 0},
+                  "status": {"enum": ["present", "outside_module", "legacy_absent", "required_absent", "unresolved"]}
+                }
+              }
+            },
+            "inventory_surfaces": {
+              "type": "array",
+              "maxItems": 512,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["module", "ordinal", "kind"],
+                "properties": {
+                  "module": {"type": "integer", "minimum": 0},
+                  "ordinal": {"type": "integer", "minimum": 0},
+                  "kind": {"enum": ["legacy", "interface"]}
+                }
+              }
+            },
+            "tuples": {
+              "type": "array",
+              "maxItems": 16,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["module", "request", "rv", "result", "table_match", "inventory_matches", "authority", "count"],
+                "properties": {
+                  "module": {"type": "integer", "minimum": 0},
+                  "request": {"$ref": "#/$defs/selection_request"},
+                  "rv": {"type": "integer", "minimum": 0},
+                  "result": {
+                    "anyOf": [{"$ref": "#/$defs/selection_request"}, {"type": "null"}]
+                  },
+                  "table_match": {"type": "boolean"},
+                  "inventory_matches": {
+                    "type": "array",
+                    "maxItems": 16,
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["surface", "name_agrees", "version_agrees"],
+                      "properties": {
+                        "surface": {"type": "integer", "minimum": 0},
+                        "name_agrees": {"type": "boolean"},
+                        "version_agrees": {"type": "boolean"}
+                      }
+                    }
+                  },
+                  "authority": {"enum": ["inventory", "selection_count_only", "none"]},
+                  "count": {"type": "integer", "minimum": 1}
+                }
+              }
+            },
+            "selection_truncated": {"type": "boolean"}
+          }
+        },
+        "attach_mechanisms": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"enum": ["per-offset", "uprobe-multi"]}
+        },
+        "pid_descendant_gaps": {"type": "integer", "minimum": 0},
+        "multi_rebuild_gaps": {"type": "integer", "minimum": 0}
+      }
+    },
+    "functions": {"type": "array"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"lane": {"const": "profile"}}},
+      "then": {
+        "properties": {
+          "schema": {"const": "p11scope/observed-profile/v3"},
+          "evidence": {
+            "required": ["interface_selection", "attach_mechanisms", "pid_descendant_gaps", "multi_rebuild_gaps"]
+          }
+        },
+        "required": ["mechanisms", "sessions", "logins", "templates", "cgroups"]
+      }
+    },
+    {
+      "if": {"properties": {"lane": {"const": "metrics"}}},
+      "then": {
+        "properties": {
+          "schema": {"const": "p11scope/observed-profile/v3-metrics"},
+          "evidence": {
+            "not": {
+              "anyOf": [
+                {"required": ["interface_selection"]},
+                {"required": ["attach_mechanisms"]},
+                {"required": ["pid_descendant_gaps"]},
+                {"required": ["multi_rebuild_gaps"]}
+              ]
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "loader_timing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["qualified_pre_constructor", "known_pre_relocation", "unproven", "none"],
+      "properties": {
+        "qualified_pre_constructor": {"type": "integer", "minimum": 0},
+        "known_pre_relocation": {"type": "integer", "minimum": 0},
+        "unproven": {"type": "integer", "minimum": 0},
+        "none": {"type": "integer", "minimum": 0}
+      }
+    },
+    "selection_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "flags"],
+      "properties": {
+        "name": {"enum": ["null", "exact_standard", "other", "unreadable"]},
+        "version": {"enum": ["null", "unreadable", "v2_40", "v3_0", "v3_1", "v3_2", "other"]},
+        "flags": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}

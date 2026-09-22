@@ -97,6 +97,66 @@ impl LoaderDiscovery {
     }
 }
 
+/// Terminal verdict detail (SYSPLAN residual F-02): `completeness` alone can
+/// no longer distinguish a clean-but-unproven drain from a concrete gap.
+pub const VERDICT_CLEAN_PROVEN: &str = "clean_proven";
+pub const VERDICT_CLEAN_BUT_UNPROVEN: &str = "clean_but_unproven";
+pub const VERDICT_CONCRETE_GAP: &str = "concrete_gap";
+
+/// Every `P11SCOPE_*` switch that can change capture behavior, with its
+/// effect. `--help` and `docs/usage.md` list exactly these (plus the
+/// build/lane inputs usage.md owns); capture evidence records the active
+/// value of each (SYSPLAN residual F-26). Test-only re-exec markers and
+/// lane-internal plumbing are not operator switches and stay out.
+pub const P11SCOPE_ENV_VARS: &[(&str, &str)] = &[
+    (
+        "P11SCOPE_BROAD_ADMIT",
+        "experiment-only broad provider admission; anything but exactly \
+         \"1\" keeps the narrow default",
+    ),
+    (
+        "P11SCOPE_LOADER_ENV_SANITIZED",
+        "p11scope-discover loader-environment marker; a forged value is \
+         rejected, never trusted",
+    ),
+];
+
+/// One capture-visible environment switch and its active value: `None`
+/// when unset (SYSPLAN residual F-26).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct EnvEvidence {
+    pub name: &'static str,
+    pub effect: &'static str,
+    pub value: Option<String>,
+}
+
+/// Snapshots [`P11SCOPE_ENV_VARS`] through `get`, so tests inject a fake
+/// environment instead of mutating the process's.
+pub fn snapshot_env(get: impl Fn(&str) -> Option<String>) -> Vec<EnvEvidence> {
+    P11SCOPE_ENV_VARS
+        .iter()
+        .map(|(name, effect)| EnvEvidence {
+            name,
+            effect,
+            value: get(name),
+        })
+        .collect()
+}
+
+/// Snapshots [`P11SCOPE_ENV_VARS`] from the process environment.
+pub fn snapshot_process_env() -> Vec<EnvEvidence> {
+    snapshot_env(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
+}
+
+/// A `--allow-uretprobe-on-confined-target` override, recorded durably
+/// (SYSPLAN residual F-01): the flag that accepted the risk plus the
+/// hazard preflight's reason for requiring it.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct UretprobeOverride {
+    pub flag: &'static str,
+    pub reason: String,
+}
+
 /// The capture-lifetime, render-ready facts the binary may see: everything the
 /// headings, the final frame, and the JSON document are built from. Sanitized
 /// by construction — no pins, process views, open files, timing keys, or
@@ -543,6 +603,26 @@ pub struct Evidence {
     pub discovery: DiscoveryEvidence,
     /// Consumer-scheduling evidence: which bound broke, and phase timings.
     pub scheduling: SchedulingEvidence,
+    /// Terminal drain settlement latch (SYSPLAN residual F-02). False until
+    /// a bounded quiescence/settlement experiment proves the terminal drain
+    /// saw every in-flight callback. The terminal seal forces PARTIAL while
+    /// false, so a future COMPLETE requires this latch — never call-site
+    /// discipline.
+    pub drain_proven: bool,
+    /// Which terminal story `completeness` tells: [`VERDICT_CLEAN_PROVEN`],
+    /// [`VERDICT_CLEAN_BUT_UNPROVEN`], or [`VERDICT_CONCRETE_GAP`].
+    pub verdict_detail: &'static str,
+    /// The uretprobe/hazard override behind this capture, if any (SYSPLAN
+    /// residual F-01). `None` exactly when the preflight proceeded clean.
+    pub uretprobe_override: Option<UretprobeOverride>,
+    /// The PID handed back alive at duration expiry, if any (SYSPLAN
+    /// residual F-15). `Some` exactly when the `run` lane left its owned
+    /// child running — the operator's own child, nameable, exit still 0.
+    pub handoff_child_pid: Option<u32>,
+    /// Active values of every capture-visible `P11SCOPE_*` switch
+    /// ([`P11SCOPE_ENV_VARS`]), so the document says which behavior
+    /// switches were live (SYSPLAN residual F-26).
+    pub p11scope_env: Vec<EnvEvidence>,
     pub completeness: &'static str,
 }
 
@@ -643,6 +723,8 @@ const TABLE_UNAVAILABLE: &str = "function table unavailable in file-backed data"
 const SHARED_OVERLAY_UNCERTAINTY: &str = "shared-overlay physical identity is uncertain; a distinct byte-identical instance may be unobserved";
 const PHYSICAL_IDENTITY_AMBIGUITY: &str =
     "physical identity is ambiguous; the collision group was not attached";
+const UNSUPPORTED_TABLE_VERSION: &str =
+    "unsupported function-table version; the scanner does not walk this layout";
 
 /// Convert an untyped internal discovery loss into the finite public capture
 /// record. Detailed paths, process identities, and error chains remain in
@@ -669,6 +751,8 @@ pub fn capture_skipped_out(s: &Skipped) -> SkippedOut {
         SHARED_OVERLAY_UNCERTAINTY
     } else if s.reason.contains("physical identity is ambiguous") {
         PHYSICAL_IDENTITY_AMBIGUITY
+    } else if s.reason.contains("unsupported function-table version") {
+        UNSUPPORTED_TABLE_VERSION
     } else if s
         .reason
         .contains("table header extends past the object's file-backed data")
@@ -784,12 +868,31 @@ impl Evidence {
         } else {
             "PARTIAL"
         };
+        self.verdict_detail = match (self.completeness, self.drain_proven) {
+            ("COMPLETE", true) => VERDICT_CLEAN_PROVEN,
+            ("COMPLETE", false) => VERDICT_CLEAN_BUT_UNPROVEN,
+            _ => VERDICT_CONCRETE_GAP,
+        };
     }
 
     /// A detached perf link stops new invocations but does not wait for BPF
     /// callbacks already executing on another CPU. Until capture has a real
-    /// kernel quiescence barrier, a terminal snapshot cannot be COMPLETE.
+    /// kernel quiescence barrier, a terminal snapshot cannot be COMPLETE —
+    /// and from here on that gate is the `drain_proven` latch, not this
+    /// function's unconditional assignment: a future settlement experiment
+    /// sets the latch, and only then may a terminal COMPLETE survive the
+    /// seal. Nothing sets the latch today, so every terminal document stays
+    /// PARTIAL — but clean-but-unproven and concrete-gap runs now say which
+    /// they are (SYSPLAN residual F-02). PARTIAL is split, never deleted.
     pub fn mark_terminal_drain_unproven(&mut self) {
+        if self.drain_proven {
+            return;
+        }
+        if self.completeness == "COMPLETE" {
+            self.verdict_detail = VERDICT_CLEAN_BUT_UNPROVEN;
+        } else {
+            self.verdict_detail = VERDICT_CONCRETE_GAP;
+        }
         self.completeness = "PARTIAL";
     }
 }
@@ -1099,6 +1202,10 @@ fn capture_modules(ev: &Evidence) -> Vec<serde_json::Value> {
 pub fn json(reports: &[SlotReport], ev: &Evidence, capture: &CaptureMeta<'_>) -> serde_json::Value {
     serde_json::json!({
         "schema": "p11scope/observed-profile/v3-metrics",
+        // Machine-readable lane discriminator (SYSPLAN residual F-12): the
+        // metrics lane embeds `Evidence` directly (the four profile-only
+        // fields are absent) with a selection-blind verdict.
+        "lane": "metrics",
         "capture": { "start": capture.started, "end": capture.ended, "mode": "metrics",
                      "privacy_mode": capture.policy.privacy_mode(),
                      "scope": capture.scope,
@@ -1109,6 +1216,32 @@ pub fn json(reports: &[SlotReport], ev: &Evidence, capture: &CaptureMeta<'_>) ->
         "evidence": ev,
         "functions": functions_out(reports, &ev.discovery.modules),
     })
+}
+
+/// Type-enforced versioned evidence (SYSPLAN residual F-08): the only input
+/// `profile_json` accepts, so the profile lane can never silently regress
+/// to embedding a raw `Evidence` by call-site discipline. The Python oracle
+/// stays a second reader of the emitted shape.
+pub struct VersionedEvidence<'a> {
+    ev: &'a Evidence,
+    value: serde_json::Value,
+}
+
+impl<'a> VersionedEvidence<'a> {
+    pub fn wrap(ev: &'a Evidence) -> Self {
+        Self {
+            ev,
+            value: versioned_evidence(ev),
+        }
+    }
+
+    pub fn evidence(&self) -> &'a Evidence {
+        self.ev
+    }
+
+    pub fn value(&self) -> &serde_json::Value {
+        &self.value
+    }
 }
 
 pub(crate) fn versioned_evidence(ev: &Evidence) -> serde_json::Value {
@@ -1384,10 +1517,11 @@ pub struct CaptureMeta<'a> {
 /// stream.
 pub fn profile_json(
     reports: &[SlotReport],
-    ev: &Evidence,
+    versioned: VersionedEvidence<'_>,
     state: &crate::semantics::State,
     capture: &CaptureMeta,
 ) -> serde_json::Value {
+    let ev = versioned.evidence();
     let mechanisms: Vec<MechanismOut> = state
         .mechanisms()
         .iter()
@@ -1470,6 +1604,10 @@ pub fn profile_json(
 
     serde_json::json!({
         "schema": "p11scope/observed-profile/v3",
+        // Machine-readable lane discriminator (SYSPLAN residual F-12): the
+        // profile lane carries the four versioned-only evidence fields with
+        // a selection-aware verdict.
+        "lane": "profile",
         "capture": {
             "start": capture.started, "end": capture.ended, "mode": "profile",
             "privacy_mode": capture.policy.privacy_mode(),
@@ -1479,7 +1617,7 @@ pub fn profile_json(
             "drain_interval_ms": capture.drain_interval_ms,
             "modules": capture_modules(ev),
         },
-        "evidence": versioned_evidence(ev),
+        "evidence": versioned.value().clone(),
         "functions": functions_out(reports, &ev.discovery.modules),
         "mechanisms": mechanisms,
         "sessions": sessions_out,
@@ -1619,6 +1757,11 @@ mod tests {
                 ..DiscoveryEvidence::default()
             },
             scheduling: SchedulingEvidence::default(),
+            drain_proven: false,
+            verdict_detail: VERDICT_CONCRETE_GAP,
+            uretprobe_override: None,
+            handoff_child_pid: None,
+            p11scope_env: vec![],
             completeness: "UNKNOWN",
         }
     }
@@ -1646,7 +1789,7 @@ mod tests {
         let ev = evidence();
         let profile = profile_json(
             &reports_fixture(),
-            &ev,
+            VersionedEvidence::wrap(&ev),
             &state_fixture(),
             &capture_fixture(),
         );
@@ -1798,7 +1941,7 @@ mod tests {
 
         let profile = profile_json(
             &reports_fixture(),
-            &ev,
+            VersionedEvidence::wrap(&ev),
             &state_fixture(),
             &capture_fixture(),
         );
@@ -2082,7 +2225,7 @@ mod tests {
 
         let profile = profile_json(
             &reports_fixture(),
-            &ev,
+            VersionedEvidence::wrap(&ev),
             &state_fixture(),
             &capture_fixture(),
         );
@@ -2456,7 +2599,12 @@ mod tests {
                 "the generated trace must retain every aggregate RV without semantic payload"
             );
         }
-        let profile = profile_json(&[report], &ev, &state, &capture_fixture());
+        let profile = profile_json(
+            &[report],
+            VersionedEvidence::wrap(&ev),
+            &state,
+            &capture_fixture(),
+        );
 
         assert_eq!(profile["evidence"]["completeness"], "PARTIAL");
         assert_eq!(
@@ -2594,7 +2742,7 @@ mod tests {
 
         let profile = profile_json(
             &reports_fixture(),
-            &ev,
+            VersionedEvidence::wrap(&ev),
             &state_fixture(),
             &capture_fixture(),
         );
@@ -2638,7 +2786,7 @@ mod tests {
         for document in [
             profile_json(
                 &reports_fixture(),
-                &ev,
+                VersionedEvidence::wrap(&ev),
                 &state_fixture(),
                 &capture_fixture(),
             ),
@@ -2677,7 +2825,7 @@ mod tests {
             assert_eq!(ev.completeness, "PARTIAL");
             let profile = profile_json(
                 &reports_fixture(),
-                &ev,
+                VersionedEvidence::wrap(&ev),
                 &state_fixture(),
                 &capture_fixture(),
             );
@@ -2697,7 +2845,7 @@ mod tests {
     fn v3_json_publishes_modules_and_per_function_module_identity() {
         let v = profile_json(
             &reports_fixture(),
-            &evidence(),
+            VersionedEvidence::wrap(&evidence()),
             &state_fixture(),
             &capture_fixture(),
         );
@@ -2731,7 +2879,12 @@ mod tests {
         let mut ev = evidence();
         ev.discovery.module_ambiguous = 1;
         ev.verdict();
-        let v = profile_json(&[report], &ev, &state_fixture(), &capture_fixture());
+        let v = profile_json(
+            &[report],
+            VersionedEvidence::wrap(&ev),
+            &state_fixture(),
+            &capture_fixture(),
+        );
         assert_eq!(v["functions"][0]["module"], serde_json::Value::Null);
         assert_eq!(v["functions"][0]["module_ambiguous"], true);
         assert_eq!(v["functions"][0]["calls"], 3);
@@ -2768,7 +2921,7 @@ mod tests {
         ev.verdict();
         let v = profile_json(
             &reports_fixture(),
-            &ev,
+            VersionedEvidence::wrap(&ev),
             &state_fixture(),
             &capture_fixture(),
         );
@@ -2928,7 +3081,7 @@ mod tests {
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
-        let value = profile_json(&[], &ev, &state, &capture);
+        let value = profile_json(&[], VersionedEvidence::wrap(&ev), &state, &capture);
         assert_eq!(value["evidence"]["semantic_history_drops"], 1);
         assert_eq!(value["evidence"]["completeness"], "PARTIAL");
         assert!(
@@ -3357,7 +3510,7 @@ mod tests {
             crate::attach::CapturePolicy::Allowlisted,
         );
         let capture = capture_fixture();
-        let v = profile_json(&[], &ev, &state, &capture);
+        let v = profile_json(&[], VersionedEvidence::wrap(&ev), &state, &capture);
 
         assert_eq!(v["schema"], "p11scope/observed-profile/v3");
         assert_eq!(v["capture"]["privacy_mode"], "allowlisted");
@@ -3406,7 +3559,7 @@ mod tests {
             ring_bytes: 4096,
             drain_interval_ms: 1000,
         };
-        let v = profile_json(&[], &ev, &state, &capture);
+        let v = profile_json(&[], VersionedEvidence::wrap(&ev), &state, &capture);
         assert_eq!(v["capture"]["ring_bytes"], 4096);
         assert_eq!(v["capture"]["drain_interval_ms"], 1000);
     }
@@ -3429,7 +3582,7 @@ mod tests {
                 ring_bytes: 4096,
                 drain_interval_ms: 1000,
             };
-            let profile = profile_json(&[], &ev, &state, &capture);
+            let profile = profile_json(&[], VersionedEvidence::wrap(&ev), &state, &capture);
             assert_eq!(profile["capture"]["scope"], scope);
             let metrics = json(&[], &ev, &capture);
             assert_eq!(metrics["capture"]["scope"], scope);
@@ -3453,7 +3606,7 @@ mod tests {
         });
         let profile = profile_json(
             &reports_fixture(),
-            &ev,
+            VersionedEvidence::wrap(&ev),
             &state_fixture(),
             &capture_fixture(),
         );
@@ -3504,7 +3657,7 @@ mod tests {
         let mut ev = evidence();
         ev.verdict();
         let capture = capture_fixture();
-        let value = profile_json(&[], &ev, &state, &capture);
+        let value = profile_json(&[], VersionedEvidence::wrap(&ev), &state, &capture);
 
         assert_eq!(value["mechanisms"][0]["mechanism"], u64::MAX);
         assert_eq!(
@@ -3568,7 +3721,7 @@ mod tests {
         let mut ev = evidence();
         ev.verdict();
         let capture = capture_fixture();
-        let v = profile_json(&[], &ev, &state, &capture);
+        let v = profile_json(&[], VersionedEvidence::wrap(&ev), &state, &capture);
 
         let mech = &v["mechanisms"][0];
         assert_eq!(mech["mechanism"], vendor_id);
@@ -3656,7 +3809,7 @@ mod tests {
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
-        let v = profile_json(&[], &ev, &state, &capture);
+        let v = profile_json(&[], VersionedEvidence::wrap(&ev), &state, &capture);
 
         assert_eq!(v["capture"]["privacy_mode"], "unsafe-unvalidated-metadata");
         let params = &v["mechanisms"][0]["params"];
@@ -3697,7 +3850,7 @@ mod tests {
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
-        let v = profile_json(&[], &ev, &state, &capture);
+        let v = profile_json(&[], VersionedEvidence::wrap(&ev), &state, &capture);
 
         let combos = v["mechanisms"][0]["params"].as_array().unwrap();
         assert_eq!(combos.len(), 2, "two distinct layouts, not merged");
@@ -3745,7 +3898,7 @@ mod tests {
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
-        let v = profile_json(&[], &ev, &state, &capture);
+        let v = profile_json(&[], VersionedEvidence::wrap(&ev), &state, &capture);
 
         assert_eq!(
             v["mechanisms"][0]["params"].as_array().unwrap().len(),
@@ -3774,7 +3927,7 @@ mod tests {
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
-        let v = profile_json(&[], &ev, &state, &capture);
+        let v = profile_json(&[], VersionedEvidence::wrap(&ev), &state, &capture);
 
         assert_eq!(v["mechanisms"][0]["params"], serde_json::Value::Null);
     }
@@ -3812,7 +3965,7 @@ mod tests {
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
-        let v = profile_json(&[], &ev, &state, &capture);
+        let v = profile_json(&[], VersionedEvidence::wrap(&ev), &state, &capture);
         assert_eq!(v["mechanisms"][0]["params"], serde_json::Value::Null);
         let note = v["mechanisms"][0]["note"].as_str().unwrap();
         assert!(
@@ -3856,7 +4009,7 @@ mod tests {
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
-        let v = profile_json(&[], &ev, &state, &capture);
+        let v = profile_json(&[], VersionedEvidence::wrap(&ev), &state, &capture);
         assert_eq!(v["mechanisms"][0]["params"], serde_json::Value::Null);
         assert_eq!(
             v["mechanisms"][0]["note"],
@@ -3945,7 +4098,7 @@ mod tests {
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
-        let v = profile_json(&[], &ev, &state, &capture);
+        let v = profile_json(&[], VersionedEvidence::wrap(&ev), &state, &capture);
 
         let op = &v["templates"]["operations"][0];
         assert_eq!(op["names"], serde_json::json!(["C_FindObjectsInit"]));
@@ -4013,7 +4166,7 @@ mod tests {
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
-        let v = profile_json(&[], &ev, &state, &capture);
+        let v = profile_json(&[], VersionedEvidence::wrap(&ev), &state, &capture);
         assert_eq!(v["templates"]["operations"][0]["truncated"], true);
         assert_eq!(v["evidence"]["templates_truncated"], true);
         assert_eq!(v["evidence"]["completeness"], "PARTIAL");
@@ -4036,7 +4189,7 @@ mod tests {
         let mut ev = evidence();
         ev.verdict();
         let capture = capture_fixture();
-        let v = profile_json(&[], &ev, &state, &capture);
+        let v = profile_json(&[], VersionedEvidence::wrap(&ev), &state, &capture);
 
         let cgroups = v["cgroups"].as_array().unwrap();
         assert_eq!(cgroups.len(), 2, "two distinct cgroup ids, two entries");
@@ -4105,7 +4258,7 @@ mod tests {
         ev.verdict();
         let profile = profile_json(
             &reports_fixture(),
-            &ev,
+            VersionedEvidence::wrap(&ev),
             &state_fixture(),
             &capture_fixture(),
         );
@@ -4237,7 +4390,7 @@ mod tests {
 
         let out = profile_json(
             &[owned, ambiguous, unresolved],
-            &ev,
+            VersionedEvidence::wrap(&ev),
             &state_fixture(),
             &capture_fixture(),
         );
@@ -4480,7 +4633,12 @@ mod tests {
             ev.verdict();
             assert_eq!(ev.completeness, "PARTIAL", "{field}");
 
-            let profile = profile_json(&reports, &ev, &state_fixture(), &capture_fixture());
+            let profile = profile_json(
+                &reports,
+                VersionedEvidence::wrap(&ev),
+                &state_fixture(),
+                &capture_fixture(),
+            );
             let metrics = json(&reports, &ev, &capture_fixture());
             let terminal = trace_evidence_object(&ev);
             for document in [&profile["evidence"], &metrics["evidence"], &terminal] {
@@ -4582,7 +4740,12 @@ mod tests {
         ev.verdict();
         let reports = reports_fixture();
 
-        let profile = profile_json(&reports, &ev, &state_fixture(), &capture_fixture());
+        let profile = profile_json(
+            &reports,
+            VersionedEvidence::wrap(&ev),
+            &state_fixture(),
+            &capture_fixture(),
+        );
         let metrics = json(&reports, &ev, &capture_fixture());
         let trace = trace_evidence_object(&ev);
         for document in [&profile["evidence"], &metrics["evidence"], &trace] {
@@ -4713,6 +4876,20 @@ mod tests {
     // SYSPLAN residual F-02 (RED): the terminal verdict splits clean-but-
     // unproven from concrete-gap via a machine-readable drain_proven latch
     // plus a verdict_detail enum. Terminal PARTIAL is kept, not deleted.
+    // GREEN: the gate works both ways — a proven drain survives the seal.
+    #[test]
+    fn terminal_seal_gates_complete_on_the_drain_proven_latch() {
+        let mut proven = evidence();
+        proven.drain_proven = true;
+        proven.verdict();
+        assert_eq!(proven.completeness, "COMPLETE");
+        proven.mark_terminal_drain_unproven();
+        assert_eq!(proven.completeness, "COMPLETE");
+        let value = versioned_evidence(&proven);
+        assert_eq!(value["drain_proven"], true);
+        assert_eq!(value["verdict_detail"], "clean_proven");
+    }
+
     #[test]
     fn terminal_verdict_splits_clean_unproven_from_concrete_gap() {
         let mut clean = evidence();
@@ -4746,6 +4923,56 @@ mod tests {
         );
     }
 
+    // SYSPLAN residual F-01 (GREEN): the override serializes as the exact
+    // flag plus the hazard reason, and the verdict ignores it (an accepted
+    // risk is disclosed, not a gap).
+    #[test]
+    fn uretprobe_override_serializes_flag_and_reason_without_forcing_partial() {
+        let mut ev = evidence();
+        ev.uretprobe_override = Some(UretprobeOverride {
+            flag: "--allow-uretprobe-on-confined-target",
+            reason: "unproven kernel with an unreadable target".into(),
+        });
+        ev.verdict();
+        assert_eq!(ev.completeness, "COMPLETE");
+        let value = versioned_evidence(&ev);
+        assert_eq!(
+            value["uretprobe_override"]["flag"],
+            "--allow-uretprobe-on-confined-target"
+        );
+        assert_eq!(
+            value["uretprobe_override"]["reason"],
+            "unproven kernel with an unreadable target"
+        );
+    }
+
+    // SYSPLAN residual F-08 (GREEN): `profile_json` only accepts the
+    // newtype, and the newtype carries exactly `versioned_evidence`.
+    #[test]
+    fn versioned_evidence_newtype_carries_the_versioned_shape() {
+        let ev = evidence();
+        let versioned = VersionedEvidence::wrap(&ev);
+        assert_eq!(versioned.value(), &versioned_evidence(&ev));
+        assert!(versioned.value().get("interface_selection").is_some());
+        assert!(std::ptr::eq(versioned.evidence(), &ev));
+    }
+
+    // SYSPLAN residual F-26 (GREEN): the env snapshot records every known
+    // switch with its active value, without touching the process env.
+    #[test]
+    fn env_snapshot_records_active_values_through_an_injected_getter() {
+        let snap = snapshot_env(|name| match name {
+            "P11SCOPE_BROAD_ADMIT" => Some("1".into()),
+            _ => None,
+        });
+        assert_eq!(snap.len(), P11SCOPE_ENV_VARS.len());
+        assert_eq!(snap[0].name, "P11SCOPE_BROAD_ADMIT");
+        assert_eq!(snap[0].value.as_deref(), Some("1"));
+        assert!(snap[0].effect.contains("broad provider admission"));
+        assert_eq!(snap[1].name, "P11SCOPE_LOADER_ENV_SANITIZED");
+        assert_eq!(snap[1].value, None);
+    }
+
     // SYSPLAN residual F-15 (RED): the handed-back orphan PID is named in
     // machine-readable evidence, not dropped.
     #[test]
@@ -4763,7 +4990,7 @@ mod tests {
     fn profile_and_metrics_documents_carry_lane_discriminator() {
         let profile = profile_json(
             &reports_fixture(),
-            &evidence(),
+            VersionedEvidence::wrap(&evidence()),
             &state_fixture(),
             &capture_fixture(),
         );

@@ -88,6 +88,19 @@ Support is cumulative: legacy 2.00 (67 slots), 2.01 through 2.40 (68), 3.0
 and 3.1 interfaces (92), and the final 3.2 interface (104 published slots).
 Newer support does not replace 2.x support.
 
+Two matrices govern two paths, and they agree by scope. The live memory
+scan walks the Slice-1 §4.1 plausibility window — 2.x at minor 40 and
+below, 3.x at minor 2 and below — and a version-shaped word above that
+window is refused with an explicit `unsupported function-table version`
+skip plus a `PARTIAL` verdict, never silently. The offline
+`p11scope-discover` helper instead implements the wider v0.1 compatibility
+matrix (known-prefix decode of newer layouts), because it runs offline
+against a provider file rather than live target memory. A future-minor
+table therefore decodes on the helper path and refuses loudly on the scan
+path; the live-export path converts the same table into counted loss, so
+only a never-called provider scanned proactively can vanish, and even that
+leaves its version skip behind.
+
 The standard name `"PKCS 11"` is common but not universal. Discovery also
 handles alternate, null, unreadable, and non-UTF-8 names. It walks those tables
 only when standard export anchors—or an independently acquired legacy 2.40
@@ -445,7 +458,68 @@ counts every well-formed non-fork event consumed before truncation.
   refuses the same way wherever the target cannot be shown unconfined —
   unreadable targets, `--cgroup`/`--system` scopes, and `run` children,
   which may confine themselves after attach. See `p11scope doctor` and
-  `src/uretprobe_hazard.rs`.
+  `src/uretprobe_hazard.rs`. When the override is taken, the flag plus the
+  hazard reason is recorded in report evidence (`evidence.uretprobe_override`),
+  not just on stderr.
+- `--version` — print the observer version (`p11scope <semver>`) and exit 0.
+  Takes no scope or subcommand; anything after it is a usage error.
+- `--attach-backend auto|multi|singles` — the static probe backend. `auto`
+  (default) uses one multi-uprobe link per attach group on kernels 6.9+ and
+  per-offset links below; `multi` forces multi (needs 6.6+); `singles` forces
+  per-offset links everywhere. Dynamic loader and export probes always use
+  per-offset links. The backend that owned each link is disclosed per report
+  (`evidence.attach_mechanisms`).
+- Trace event cap — `trace` (including `run --trace`) without `--max-events`
+  still stops at 10,000,000 events: the cap is a default, not unbounded
+  streaming, and the no-duration notice says so. The `TRUNCATED` line cites
+  the effective cap and names `--max-events` only when the operator passed it.
+
+### Environment (`P11SCOPE_*`)
+
+Every `P11SCOPE_*` switch that can change capture behavior, with its effect
+and default. Capture evidence records the active value of the capture-visible
+ones (`evidence.p11scope_env`), so a report always says which switches were
+live; absent means the narrow default in every row. `--help` lists the two
+capture-visible switches; the build/lane inputs below take documented
+arguments instead of environment wherever a script is invoked by hand.
+
+- `P11SCOPE_BROAD_ADMIT` — experiment-only broad provider admission for the
+  observer. Exactly `1` enables it; anything else (including unset) keeps the
+  narrow default. Capture-visible.
+- `P11SCOPE_LOADER_ENV_SANITIZED` — `p11scope-discover` loader-environment
+  marker. The helper sets it for the provider it executes; a forged value in
+  the incoming environment is rejected, never trusted. Capture-visible.
+- `P11SCOPE_PRODUCT_BUILD_MODE` — build lane selector for `scripts/`: `ordinary`
+  (default) builds with the ambient toolchain, `prepared` builds with the
+  pinned prepared-dependency toolchain. Affects builds, never a capture.
+- `P11SCOPE_PREPARED_STABLE_CARGO`, `P11SCOPE_PREPARED_STABLE_RUSTC`,
+  `P11SCOPE_PREPARED_BPF_CARGO`, `P11SCOPE_PREPARED_BPF_RUSTC`,
+  `P11SCOPE_PREPARED_PYTHON`, `P11SCOPE_PREPARED_RUSTUP` — pinned tool paths
+  selected by `scripts/prepared-dependency-tools.sh` for prepared builds and
+  dependency verification. Build-only.
+- `P11SCOPE_K8S_NAMESPACE`, `P11SCOPE_K8S_WORK`, `P11SCOPE_K8S_ALLOW_CONTEXT` —
+  Kubernetes lane inputs: the namespace and work directory under test, and the
+  explicit context allowlist a lane may touch. Lane-only.
+- `P11SCOPE_PKCS11_MODULE` — provider under test for lanes that take one as
+  input (notably the capability-tier lane). Lane-only.
+- `P11SCOPE_MEASURE_SEED`, `P11SCOPE_CANARY_TARGET_BITS`,
+  `P11SCOPE_LANE_EVIDENCE_DIR`, `P11SCOPE_RECEIPT_WORK` — measurement and
+  receipt-lane inputs: harness seed, canary word size, and evidence/work
+  directories. Lane-only.
+- `P11SCOPE_ORACLE_SOURCE_ONLY`, `P11SCOPE_IA32_SOURCE_ONLY`,
+  `P11SCOPE_IA32_COMPAT_EVIDENCE` — oracle lane inputs selecting source-only
+  checking and ia32-compat evidence paths. Lane-only.
+
+Not operator switches (deliberately undocumented above): C header guards
+(`P11SCOPE_*_H`), compile-time size selectors (`P11SCOPE_SMALL_*`), test-only
+re-exec markers (`P11SCOPE_*_CHILD`, `P11SCOPE_FIXTURE_*`,
+`P11SCOPE_ROOT_RUNTIME_STAGE`), fixture stderr markers (`P11SCOPE_LAZY`), and
+internal lane plumbing (`P11SCOPE_LANE13_*`, `P11SCOPE_RECEIPT_*`,
+`P11SCOPE_HOLD`, `P11SCOPE_FREEZE`, `P11SCOPE_DISCOVER`, `P11SCOPE_OBSERVER`,
+`P11SCOPE_BIN`, `P11SCOPE_STATIC`, `P11SCOPE_DEFAULT`, `P11SCOPE_FEATURE`,
+`P11SCOPE_POINTERS`, `P11SCOPE_PROGRAM_HEADERS`, `P11SCOPE_EXPORT_TABLES`,
+`P11SCOPE_HASH`, `P11SCOPE_DRIVER_NEEDED`). If a new `P11SCOPE_*` name starts
+changing capture behavior, it joins the table above and the `--help` list.
 
 ### Exit codes
 

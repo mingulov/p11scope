@@ -195,6 +195,10 @@ every descendant (kernel >= 5.15). --system requests whole-machine capture with
 no cgroup path; per-process and per-module attribution is still recorded. Provider
 identity is pinned by SHA-256 at attach and
 checked for in-place change during capture (evidence.provider_changed).
+trace without --max-events still stops at a 10,000,000-event default cap; the TRUNCATED line cites the effective cap.
+environment: P11SCOPE_BROAD_ADMIT=1 enables experiment-only broad provider admission (anything else keeps the narrow default).
+P11SCOPE_LOADER_ENV_SANITIZED is the offline discover helper's loader-environment marker (forged values are rejected).
+capture evidence records the active value of each (evidence.p11scope_env); docs/usage.md documents every P11SCOPE_* input.
 ";
 /// `p11scope profile --help`: that subcommand's usage section plus the
 /// shared notes footer. Every line is verbatim from [`USAGE`]; update
@@ -226,6 +230,10 @@ every descendant (kernel >= 5.15). --system requests whole-machine capture with
 no cgroup path; per-process and per-module attribution is still recorded. Provider
 identity is pinned by SHA-256 at attach and
 checked for in-place change during capture (evidence.provider_changed).
+trace without --max-events still stops at a 10,000,000-event default cap; the TRUNCATED line cites the effective cap.
+environment: P11SCOPE_BROAD_ADMIT=1 enables experiment-only broad provider admission (anything else keeps the narrow default).
+P11SCOPE_LOADER_ENV_SANITIZED is the offline discover helper's loader-environment marker (forged values are rejected).
+capture evidence records the active value of each (evidence.p11scope_env); docs/usage.md documents every P11SCOPE_* input.
 ";
 
 /// `p11scope trace --help`: that subcommand's usage section plus the
@@ -253,6 +261,10 @@ every descendant (kernel >= 5.15). --system requests whole-machine capture with
 no cgroup path; per-process and per-module attribution is still recorded. Provider
 identity is pinned by SHA-256 at attach and
 checked for in-place change during capture (evidence.provider_changed).
+trace without --max-events still stops at a 10,000,000-event default cap; the TRUNCATED line cites the effective cap.
+environment: P11SCOPE_BROAD_ADMIT=1 enables experiment-only broad provider admission (anything else keeps the narrow default).
+P11SCOPE_LOADER_ENV_SANITIZED is the offline discover helper's loader-environment marker (forged values are rejected).
+capture evidence records the active value of each (evidence.p11scope_env); docs/usage.md documents every P11SCOPE_* input.
 ";
 
 /// `p11scope run --help`: that subcommand's usage section plus the
@@ -281,6 +293,10 @@ every descendant (kernel >= 5.15). --system requests whole-machine capture with
 no cgroup path; per-process and per-module attribution is still recorded. Provider
 identity is pinned by SHA-256 at attach and
 checked for in-place change during capture (evidence.provider_changed).
+trace without --max-events still stops at a 10,000,000-event default cap; the TRUNCATED line cites the effective cap.
+environment: P11SCOPE_BROAD_ADMIT=1 enables experiment-only broad provider admission (anything else keeps the narrow default).
+P11SCOPE_LOADER_ENV_SANITIZED is the offline discover helper's loader-environment marker (forged values are rejected).
+capture evidence records the active value of each (evidence.p11scope_env); docs/usage.md documents every P11SCOPE_* input.
 ";
 
 /// `p11scope inspect --help`: that subcommand's usage section plus the
@@ -306,6 +322,10 @@ every descendant (kernel >= 5.15). --system requests whole-machine capture with
 no cgroup path; per-process and per-module attribution is still recorded. Provider
 identity is pinned by SHA-256 at attach and
 checked for in-place change during capture (evidence.provider_changed).
+trace without --max-events still stops at a 10,000,000-event default cap; the TRUNCATED line cites the effective cap.
+environment: P11SCOPE_BROAD_ADMIT=1 enables experiment-only broad provider admission (anything else keeps the narrow default).
+P11SCOPE_LOADER_ENV_SANITIZED is the offline discover helper's loader-environment marker (forged values are rejected).
+capture evidence records the active value of each (evidence.p11scope_env); docs/usage.md documents every P11SCOPE_* input.
 ";
 
 /// `p11scope doctor --help`: that subcommand's usage section plus the
@@ -331,6 +351,10 @@ every descendant (kernel >= 5.15). --system requests whole-machine capture with
 no cgroup path; per-process and per-module attribution is still recorded. Provider
 identity is pinned by SHA-256 at attach and
 checked for in-place change during capture (evidence.provider_changed).
+trace without --max-events still stops at a 10,000,000-event default cap; the TRUNCATED line cites the effective cap.
+environment: P11SCOPE_BROAD_ADMIT=1 enables experiment-only broad provider admission (anything else keeps the narrow default).
+P11SCOPE_LOADER_ENV_SANITIZED is the offline discover helper's loader-environment marker (forged values are rejected).
+capture evidence records the active value of each (evidence.p11scope_env); docs/usage.md documents every P11SCOPE_* input.
 ";
 
 const REMOVED_FLAG_HINT: &str = "removed in productization slice 1a: the observer pins provider \
@@ -1320,8 +1344,8 @@ mod tests {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(1099511628211);
         }
-        assert_eq!(USAGE.len(), 2957);
-        assert_eq!(hash, 0xdafc9b52_cc10e6fb);
+        assert_eq!(USAGE.len(), 3444);
+        assert_eq!(hash, 0x30b2d862_636e3087);
         assert_eq!(HelpTopic::Global.text(), USAGE);
     }
 
@@ -1472,6 +1496,10 @@ mod tests {
             USAGE.contains("10,000,000"),
             "help never names the default trace event cap"
         );
+        assert!(
+            USAGE.contains("TRUNCATED"),
+            "help never explains the TRUNCATED line"
+        );
     }
 
     // SYSPLAN residual F-26 (RED): every P11SCOPE_* behavior switch is
@@ -1480,6 +1508,19 @@ mod tests {
     fn help_lists_every_p11scope_env_switch() {
         for var in ["P11SCOPE_BROAD_ADMIT", "P11SCOPE_LOADER_ENV_SANITIZED"] {
             assert!(USAGE.contains(var), "help never names {var}");
+        }
+    }
+
+    // SYSPLAN residual F-26 (GREEN): help and the evidence table agree —
+    // a switch added to one without the other fails here.
+    #[test]
+    fn help_and_evidence_env_table_agree() {
+        for (name, _) in crate::render::P11SCOPE_ENV_VARS {
+            assert!(USAGE.contains(name), "help never names {name}");
+        }
+        const USAGE_MD: &str = include_str!("../docs/usage.md");
+        for (name, _) in crate::render::P11SCOPE_ENV_VARS {
+            assert!(USAGE_MD.contains(name), "usage.md never names {name}");
         }
     }
 
@@ -1504,7 +1545,9 @@ mod tests {
             let flag = token.split('=').next().unwrap_or("");
             if flag.len() > 2
                 && flag.starts_with("--")
-                && flag[2..].chars().all(|c| c.is_ascii_lowercase() || c == '-')
+                && flag[2..]
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '-')
                 && !flags.contains(&flag.to_string())
             {
                 flags.push(flag.to_string());

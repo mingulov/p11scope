@@ -299,7 +299,7 @@ fn exports_matching_in_object(object: &object::File<'_>, wanted: &[&str]) -> Vec
 /// and dynamic tables as present. Computed from the parsed tables — an honest
 /// lower bound any correct implementation must move — clamped to the mapped
 /// length so a corrupt section header claiming a larger-than-file table
-/// cannot inflate the charge past what could physically have moved.
+/// cannot inflate the charge beyond the logical mapped range.
 fn export_table_bytes(object: &object::File<'_>, mmap_len: u64) -> u64 {
     macro_rules! tables {
         ($elf:expr) => {{
@@ -340,6 +340,16 @@ fn export_table_bytes(object: &object::File<'_>, mmap_len: u64) -> u64 {
     }
 }
 
+#[allow(clippy::type_complexity)]
+fn export_facts_from_mmap(
+    mmap: &memmap2::Mmap,
+    wanted: &[&str],
+) -> Result<(ElfAbi, Vec<(String, u64)>, u64 /* charged_bytes */), String> {
+    let (object, abi) = classified_object(mmap)?;
+    let exports = exports_matching_in_object(&object, wanted);
+    Ok((abi, exports, export_table_bytes(&object, mmap.len() as u64)))
+}
+
 /// `(abi, exports)` for `wanted` without reading the whole file: the image is
 /// demand-paged through a shared mapping and queried with the same
 /// `object`-based core as [`ElfSnapshot`], so facts and refusals agree
@@ -366,9 +376,35 @@ pub fn read_export_facts(
     // mapped executable shares.
     let mmap =
         unsafe { memmap2::Mmap::map(file) }.map_err(|error| format!("read failed: {error}"))?;
-    let (object, abi) = classified_object(&mmap)?;
-    let exports = exports_matching_in_object(&object, wanted);
-    Ok((abi, exports, export_table_bytes(&object, mmap.len() as u64)))
+    export_facts_from_mmap(&mmap, wanted)
+}
+
+/// The export-facts query with an explicit upper bound on the logical byte
+/// range mapped from `file`. This is an admission bound, not a measurement of
+/// disk reads, page faults, allocator use, or resident memory.
+#[allow(clippy::type_complexity)]
+pub fn read_export_facts_bounded(
+    file: &std::fs::File,
+    wanted: &[&str],
+    max_mapped_bytes: u64,
+) -> Result<(ElfAbi, Vec<(String, u64)>, u64 /* charged_bytes */), String> {
+    let file_len = file
+        .metadata()
+        .map_err(|error| format!("metadata failed: {error}"))?
+        .len();
+    if file_len > max_mapped_bytes {
+        return Err(format!(
+            "read failed: file length {file_len} exceeds reserved mapped-byte bound {max_mapped_bytes}"
+        ));
+    }
+    let mapped_len = usize::try_from(file_len)
+        .map_err(|_| format!("read failed: file length {file_len} does not fit address space"))?;
+    // SAFETY: the declared mapping is read-only and no longer than both the
+    // current file and the caller's reservation. The same concurrent file
+    // modification limitation documented on `read_export_facts` applies.
+    let mmap = unsafe { memmap2::MmapOptions::new().len(mapped_len).map(file) }
+        .map_err(|error| format!("read failed: {error}"))?;
+    export_facts_from_mmap(&mmap, wanted)
 }
 
 /// Names from `wanted` that the object exports in .dynsym, with their file offsets.

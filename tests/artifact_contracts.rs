@@ -7065,6 +7065,287 @@ fn hosted_pipeline_runs_every_unprivileged_self_test() {
     );
 }
 
+fn privileged_python_command_invoked(source: &str, file: &str) -> bool {
+    // This additional recognizer reads the literal command forms used by the
+    // owned launcher. It never executes shell text or treats argv payload as a
+    // second command. The existing direct-sudo heuristic remains separate.
+    fn words(line: &str) -> Option<Vec<String>> {
+        let mut result = Vec::new();
+        let mut word = String::new();
+        let mut started = false;
+        let mut quote = None;
+        let mut chars = line.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if let Some(delimiter) = quote {
+                if ch == delimiter {
+                    quote = None;
+                } else if ch == '\\' && delimiter == '"' {
+                    word.push(chars.next()?);
+                } else {
+                    word.push(ch);
+                }
+                continue;
+            }
+            match ch {
+                '#' if !started => break,
+                '\'' | '"' => {
+                    quote = Some(ch);
+                    started = true;
+                }
+                '\\' => {
+                    word.push(chars.next()?);
+                    started = true;
+                }
+                ch if ch.is_ascii_whitespace() => {
+                    if started {
+                        result.push(std::mem::take(&mut word));
+                        started = false;
+                    }
+                }
+                '<' | '>' | ';' | '|' | '&' => {
+                    if started {
+                        result.push(std::mem::take(&mut word));
+                        started = false;
+                    }
+                    let mut operator = ch.to_string();
+                    if ch == '<' && chars.peek() == Some(&'<') {
+                        operator.push(chars.next()?);
+                        if chars.peek() == Some(&'-') {
+                            operator.push(chars.next()?);
+                        }
+                    }
+                    result.push(operator);
+                }
+                _ => {
+                    word.push(ch);
+                    started = true;
+                }
+            }
+        }
+        if quote.is_some() {
+            return None;
+        }
+        if started {
+            result.push(word);
+        }
+        Some(result)
+    }
+
+    fn invokes(words: &[String], file: &str) -> bool {
+        let mut args = words;
+        if args.first().is_some_and(|word| word == "exec") {
+            args = &args[1..];
+        }
+        if args.first().is_some_and(|word| word == "timeout") {
+            args = &args[1..];
+            while args.first().is_some_and(|word| word.starts_with('-')) {
+                let value = matches!(args[0].as_str(), "-s" | "--signal" | "-k" | "--kill-after");
+                args = &args[1..];
+                if value {
+                    let Some((_, rest)) = args.split_first() else {
+                        return false;
+                    };
+                    args = rest;
+                }
+            }
+            let Some((_, rest)) = args.split_first() else {
+                return false;
+            };
+            args = rest; // The literal timeout duration.
+        }
+        match args.first().map(String::as_str) {
+            Some("owned_launch") => {
+                if args.get(1).map(String::as_str) != Some("root")
+                    || args.get(5).map(String::as_str) != Some("--")
+                {
+                    return false;
+                }
+                args = &args[6..];
+            }
+            Some("sudo") => {
+                args = &args[1..];
+                while args.first().is_some_and(|word| word.starts_with('-')) {
+                    let option = &args[0];
+                    let value = matches!(option.as_str(), "-u" | "--user" | "-g" | "--group");
+                    let end = option == "--";
+                    args = &args[1..];
+                    if end {
+                        break;
+                    }
+                    if value {
+                        let Some((_, rest)) = args.split_first() else {
+                            return false;
+                        };
+                        args = rest;
+                    }
+                }
+            }
+            _ => return false,
+        }
+        let Some((python, rest)) = args.split_first() else {
+            return false;
+        };
+        if python.rsplit('/').next() != Some("python3") {
+            return false;
+        }
+        args = rest;
+        while args
+            .first()
+            .is_some_and(|word| matches!(word.as_str(), "-I" | "-B" | "-u"))
+        {
+            args = &args[1..];
+        }
+        args.first()
+            .is_some_and(|script| script.rsplit('/').next() == Some(file))
+    }
+
+    let mut command = String::new();
+    let mut heredocs = std::collections::VecDeque::new();
+    for line in source.lines() {
+        if let Some((delimiter, strip_tabs)) = heredocs.front() {
+            let candidate = if *strip_tabs {
+                line.trim_start_matches('\t')
+            } else {
+                line
+            };
+            if candidate == delimiter {
+                heredocs.pop_front();
+            }
+            continue;
+        }
+        if command.is_empty() && line.trim_start().starts_with('#') {
+            continue;
+        }
+        let continued = line.bytes().rev().take_while(|byte| *byte == b'\\').count() % 2 == 1;
+        command.push_str(if continued {
+            &line[..line.len() - 1]
+        } else {
+            line
+        });
+        if continued {
+            command.push(' ');
+            continue;
+        }
+        let Some(parsed) = words(&command) else {
+            // A quoted shell word can span physical lines. Keep its context so
+            // command-looking text inside it remains data.
+            command.push('\n');
+            continue;
+        };
+        command.clear();
+        for pair in parsed.windows(2) {
+            if matches!(pair[0].as_str(), "<<" | "<<-") {
+                heredocs.push_back((pair[1].clone(), pair[0] == "<<-"));
+            }
+        }
+        if invokes(&parsed, file) {
+            return true;
+        }
+    }
+    false
+}
+
+#[test]
+fn hosted_python_privilege_recognizes_continued_sudo() {
+    let source = r#"exec sudo -n --preserve-env=SOFTHSM2_CONF \
+        python3 -I scripts/system-scope-supervisor.py \
+        --receipt "$OWNED_RECEIPT" --root-group -- "$@"
+"#;
+    assert!(privileged_python_command_invoked(
+        source,
+        "system-scope-supervisor.py"
+    ));
+}
+
+#[test]
+fn hosted_python_privilege_recognizes_owned_root_launch() {
+    for source in [
+        r#"owned_launch root - out err -- python3 -I scripts/system-scope-sample.py"#,
+        r#"owned_launch root - "$dir/sampler stdout" "$dir/sampler.stderr" -- \
+            python3 -I "$PWD/scripts/system-scope-sample.py" \
+            --pid "$STARGET_PID" --starttime "$STARGET_STARTTIME"
+"#,
+    ] {
+        assert!(
+            privileged_python_command_invoked(source, "system-scope-sample.py"),
+            "owned root command was missed: {source}"
+        );
+    }
+}
+
+#[test]
+fn hosted_python_privilege_rejects_non_invocations() {
+    for source in [
+        "# sudo python3 -I scripts/helper.py\n",
+        r#"printf '%s\n' 'sudo python3 -I scripts/helper.py'"#,
+        r#"message="sudo python3 -I scripts/helper.py""#,
+        r#"python3 -I scripts/helper.py --message sudo"#,
+        r#"owned_launch user - out err -- python3 -I scripts/helper.py --message sudo"#,
+        r#"sudo python3 -I scripts/other.py --message scripts/helper.py"#,
+        r#"sudo python3 -I scripts/helper.py.extra"#,
+        r#"sudo python3 -c 'print("scripts/helper.py")'"#,
+        r#"some_sudo python3 -I scripts/helper.py"#,
+        r#"cat <<'BODY'
+sudo python3 -I scripts/helper.py
+owned_launch root - out err -- python3 -I scripts/helper.py
+BODY
+"#,
+        r#"printf '%s\n' "sudo \
+            python3 -I scripts/helper.py""#,
+    ] {
+        assert!(
+            !privileged_python_command_invoked(source, "helper.py"),
+            "a name mention became a privileged invocation: {source}"
+        );
+    }
+}
+
+#[test]
+fn hosted_python_privilege_rejects_multiline_quoted_data() {
+    for source in [
+        "message=\"description\nowned_launch root - out err -- python3 -I scripts/helper.py\n\"\n",
+        "printf '%s\\n' 'description\nsudo python3 -I scripts/helper.py\n'\n",
+    ] {
+        assert!(
+            !privileged_python_command_invoked(source, "helper.py"),
+            "quoted data became a privileged invocation: {source}"
+        );
+    }
+}
+
+#[test]
+fn hosted_python_privilege_retains_direct_sudo_forms() {
+    for source in [
+        "sudo python3 -I scripts/helper.py\n",
+        "exec sudo -n python3 -I scripts/helper.py\n",
+        r#"timeout --signal=TERM --kill-after=5s 30s \
+            sudo -n python3 -I "$PWD/scripts/helper.py" mapping
+"#,
+        "# This comment does not continue \\\nsudo python3 -I scripts/helper.py\n",
+    ] {
+        assert!(
+            privileged_python_command_invoked(source, "helper.py"),
+            "a real sudo command was missed: {source}"
+        );
+    }
+}
+
+#[test]
+fn hosted_python_privilege_covers_real_owned_launcher_call_sites() {
+    assert!(privileged_python_command_invoked(
+        &read("scripts/system-scope-owned.sh"),
+        "system-scope-supervisor.py"
+    ));
+    assert!(privileged_python_command_invoked(
+        &read("scripts/system-scope-measure.sh"),
+        "system-scope-sample.py"
+    ));
+    assert!(privileged_python_command_invoked(
+        &read("scripts/system-scope-measure.sh"),
+        "system-scope-receipt.py"
+    ));
+}
+
 /// A green hosted job must never imply a privileged or container lane ran.
 /// The pipeline names every such lane verbatim as `UNRUN: <path>` (the
 /// `verify-capability-tier.sh` idiom) in the log and the job summary, as its
@@ -7131,14 +7412,12 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
                 .filter_map(Result::ok)
                 .filter(|entry| entry.path().extension().is_some_and(|e| e == "sh"))
                 .any(|entry| {
-                    read(entry.path().to_str().unwrap_or_default())
-                        .lines()
-                        .map(str::trim)
-                        .any(|line| {
-                            !line.starts_with('#')
-                                && line.contains("sudo")
-                                && line.contains(file.as_str())
-                        })
+                    let source = read(entry.path().to_str().unwrap_or_default());
+                    source.lines().map(str::trim).any(|line| {
+                        !line.starts_with('#')
+                            && line.contains("sudo")
+                            && line.contains(file.as_str())
+                    }) || privileged_python_command_invoked(&source, &file)
                 })
         })
     };

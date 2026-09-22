@@ -16,6 +16,24 @@ numeric performance success is claimed by this plan.
 
 ## Controlling decisions
 
+- The user's latest priority is the low-level BPF and communication core first:
+  provider/table parsing, API-call observation, callers, late load/unload/exec,
+  capacity and reliable event/counter transport. Qualify these on this host
+  (including the existing Firefox), owned fixtures and the Chrome VM before
+  spending effort on presentation. A terminal UI is a follow-up task.
+- The delivery interface is CLI-first machine-readable observability. JSONL
+  has distinct inventory/lifecycle, statistics, optional trace and health
+  records; a monitoring consumer needs no interactive UI. All discovered
+  providers receive cumulative API/return-code counters by default, including
+  new arrivals. The user explicitly selected this default; individual call
+  records require `--trace`. Filters narrow measurement while broad discovery
+  continues. Output channels can share one typed JSONL stream initially.
+- A loaded provider may have no observed calls. Nonzero ordinary API-entry
+  counts prove observed use, including unsuccessful calls. Initialization and
+  information queries are distinct from cryptographic operations. Zero means
+  no observed call in a stated window, with coverage evidence; it does not
+  prove that the provider was never used. Mapping and publication alone do not
+  increase ordinary API/operation counters.
 - A physical endpoint is the validated pinned object plus file offset. Equal
   paths or bytes do not merge different physical attachment identities.
 - Compact inventory uses an atomic u64 constrained to 0/1 per endpoint. Only
@@ -63,6 +81,16 @@ numeric performance success is claimed by this plan.
   publication still needs a bounded output-pointer/table path and safety rules.
 
 ## Execution order and ownership
+
+Phase 1 prioritizes M/R, I1/I2/I2c, I3 and I4 plus the low-level counter and
+semantic-transport parts of the operation-counter design. It must exercise real
+provider parsing, initial/late attachment, API outcomes, identity/lifecycle,
+capacity exhaustion, transport loss/backpressure and terminal cleanup before
+claiming the core complete. Uncoordinated first-use/transient-provider tests
+remain required; an attach-then-GO fixture alone does not close that gap.
+I5's CLI/JSONL integration follows the validated core. Its default all-provider
+counter policy must be tested at system scale; a filtered subset is not the
+acceptance target. The interactive UI remains outside this campaign.
 
 One Cargo-heavy command and one privileged BPF experiment at a time. No Cargo
 or VM setup during performance comparisons. Independent reviewers inspect only

@@ -48,6 +48,12 @@ numeric performance success is claimed by this plan.
   inventory cookies or reclaiming cells without producer-quiescence proof.
   A selection must bind physical provider and caller-generation identities,
   reject stale/replaced targets, and preserve shared-target ambiguity.
+- The subsequent telemetry clarification makes cumulative operation counts
+  central; exact latency is optional. Keep discovery/use inventory, selected
+  function/outcome counters, semantic operation counters, optional latency,
+  and individual-call trace as explicit capabilities with measured costs.
+  A usage bit is not a counter. Turning off latency does not eliminate the
+  return observation required to establish a call's outcome.
 - Detailed-mode behavior remains unchanged until its separate reviewed changes.
   Optional filtered detail does not substitute for broad detailed-mode scaling.
 - Never equate entry-only ordinary probes with return-free discovery. Interface
@@ -208,6 +214,49 @@ arbitrary new objects. Retained file probes help future mappers of known
 objects. Never reconstruct a missed execution fact from a later mapping or
 publication. Unseen-object gaps must remain explicit; a lower-bound report
 alone does not complete the user's all-used-provider requirement.
+
+### O: Cumulative operation counters and structured collection
+
+The user wants intervals such as three RSA-4096 signing requests/completions.
+Existing `functions[].calls` counts completed API calls; existing mechanism
+totals can include Init and operational calls for the same operation. Preserve
+those existing meanings. Add separate operation-attempt/completion counters
+under a reviewed schema rather than relabelling either total as signatures.
+
+Define single-part, multipart, message and async transitions, cancellation,
+successful buffer-size queries, retries, pending results and failed starts.
+Retain full return-code counts and distinguish protocol outcomes from terminal
+operation failures. Each semantic claim needs trusted function attribution;
+a heuristic table alone cannot authorize arbitrary metadata decoding.
+
+Keep counters cumulative within a capture generation; collection does not
+clear live maps or semantic state. Compute deltas against the previous
+successful snapshot of that same generation. Record collection intervals,
+restart/reset boundaries, saturation, loss and inconsistent/incomplete reads.
+Concurrent map reads are not an atomic machine-wide instant. Count completed
+operations consistently at their observed completion; retain initialization
+and key context across collection boundaries.
+
+RSA bit length and EC curve require a separate bounded public-metadata path
+and lifecycle-bound object-handle associations. Mechanism identity alone does
+not supply them. Observe safe key-generation/attribute metadata only where
+the implementation can establish provenance; otherwise output unknown. Do not
+read key material or actively call into a production provider. This needs an
+explicit metadata allowlist/schema review and canary update before release.
+
+Evaluate kernel aggregation against the current per-call event/reducer path,
+including context lookup, cardinality, CPU multiplicity, dropped updates and
+optional latency state. Selecting all providers must remain supported within
+measured resource limits. Add structured cumulative/interval output suitable
+for telemetry; keep per-call tracing an optional separate output capability.
+An external exporter cannot repair missing capture or attribution evidence.
+
+Gate: independent API-call and operation ledgers; Init/Update/Final sequences;
+buffer-size query plus retry; CKR_PENDING completion; errors and cancellation;
+operations crossing collection boundaries; concurrent scrapes without map
+reset; restart/overflow/loss; RSA-2048 versus RSA-4096 and EC curves where
+metadata is observed; reused/destroyed/imported/pre-existing key handles with
+unknown metadata preserved; and selected/all-provider cardinality workloads.
 
 ### D: Scale the detailed modes without changing their meanings
 

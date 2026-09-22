@@ -91,6 +91,61 @@ fn real_retained_consumer_keeps_one_cursor_across_all_drains() {
 }
 
 #[test]
+#[ignore = "requires privileged BPF map creation on a supported kernel"]
+fn real_retained_discovery_consumer_owns_one_exact_map() {
+    let load = || {
+        aya::EbpfLoader::new()
+            .allow_unsupported_maps()
+            .load(crate::EBPF_OBJECT)
+            .expect("load actual embedded object with required task-storage maps")
+    };
+    let first = load();
+    let second = load();
+    let first_domain =
+        DiscoveryDomain::from_discovery(&first).expect("first actual DISCOVERY domain");
+    let second_domain =
+        DiscoveryDomain::from_discovery(&second).expect("second actual DISCOVERY domain");
+    assert_ne!(first_domain.id(), second_domain.id());
+
+    let mut consumer = OwnedDiscoveryDrain::for_session(&first, &first_domain)
+        .expect("retained consumer over same DISCOVERY map");
+    let first_id = first_domain.id();
+    assert_eq!(consumer.domain_id(), first_id);
+    let positions = consumer.source().snapshot_positions();
+    assert_eq!((positions.consumer, positions.producer), (0, 0));
+    assert!(consumer.dequeue().is_none());
+    assert_eq!(consumer.source().snapshot_positions(), positions);
+
+    match OwnedDiscoveryDrain::for_session(&second, &first_domain) {
+        Ok(_) => panic!("foreign DISCOVERY map accepted with equal cursors"),
+        Err(error) => assert_eq!(
+            error.to_string(),
+            "DISCOVERY map does not match retained domain"
+        ),
+    }
+
+    let retained_domain = Arc::downgrade(&first_domain.0);
+    drop(first);
+    drop(first_domain);
+    drop(second);
+    drop(second_domain);
+    assert!(
+        retained_domain.upgrade().is_some(),
+        "owned consumer retains its exact DISCOVERY domain"
+    );
+    let retained = MapData::from_fd(consumer.source().as_fd().try_clone_to_owned().unwrap())
+        .expect("owned consumer descriptor still identifies a live BPF map");
+    assert_eq!(u64::from(retained.info().unwrap().id()), first_id);
+    assert_eq!(retained.info().unwrap().name(), b"DISCOVERY");
+    drop(retained);
+    drop(consumer);
+    assert!(
+        retained_domain.upgrade().is_none(),
+        "dropping the consumer releases its retained domain"
+    );
+}
+
+#[test]
 #[ignore = "loads p11_return and probes a fresh owned seccomp-confined child"]
 fn real_uretprobe_hazard_self_probe_reaches_a_verdict() {
     let verdict = crate::uretprobe_hazard::probe_kernel();

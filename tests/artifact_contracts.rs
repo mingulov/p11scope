@@ -515,6 +515,14 @@ fn assert_live_discovery_host_contract(
             "crate-only one-item DISCOVERY dequeue",
         ),
         (
+            "discovery_consumer: Option<events::OwnedDiscoveryDrain>,",
+            "session-owned retained DISCOVERY cursor",
+        ),
+        (
+            "events::OwnedDiscoveryDrain::for_session(&self.ebpf, &self.discovery_domain)",
+            "one exact-map DISCOVERY consumer construction",
+        ),
+        (
             "fn arm_pause(&mut self)",
             "argument-free crate-internal pause arm",
         ),
@@ -523,8 +531,12 @@ fn assert_live_discovery_host_contract(
     }
     for (marker, contract) in [
         (
-            "struct DiscoveryDrain<'a>",
-            "separate discovery drain owner",
+            "pub(crate) type OwnedDiscoveryDrain = DiscoveryDrain<aya::maps::RingBuf<MapData>>;",
+            "separate retained discovery drain owner",
+        ),
+        (
+            "DISCOVERY map does not match retained domain",
+            "exact DISCOVERY map identity check",
         ),
         (
             "pub(crate) enum DiscoveryItem {\n    Record(DiscoveryRecord),\n    Malformed,\n}",
@@ -4824,8 +4836,11 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_owned_child_only() {
         .is_err(),
         "ordinary start must not gain an owned pause capability"
     );
-    let shared_malformed =
-        events.replacen("struct DiscoveryDrain<'a>", "struct GenericDrain<'a>", 1);
+    let shared_malformed = events.replacen(
+        "pub(crate) type OwnedDiscoveryDrain = DiscoveryDrain<aya::maps::RingBuf<MapData>>;",
+        "pub(crate) type OwnedDiscoveryDrain = GenericDrain<aya::maps::RingBuf<MapData>>;",
+        1,
+    );
     assert!(
         assert_live_discovery_host_contract(
             &attach,
@@ -4837,7 +4852,7 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_owned_child_only() {
             &run,
         )
         .is_err(),
-        "DISCOVERY must keep its own fixed-purpose drain owner"
+        "DISCOVERY must keep its own retained fixed-purpose drain owner"
     );
     let drifted_cgroup_metadata = attach.replacen(
         "map_metadata(MapType::CgroupArray, 4, 4, 1, 0)",

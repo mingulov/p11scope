@@ -61,6 +61,14 @@ numeric performance success is claimed by this plan.
   old profile/metrics schemas retain their existing privacy boundaries. No
   command arguments, environment, stack contents, credentials, or raw internal
   identity/address fields are implied by the request for callers.
+- PID, cgroup and module/provider filters remain required through the system-scale
+  work, as reaffirmed by the user on 2026-09-22. The shared engine must retain
+  their behavior and isolation. Broad discovery continues within the chosen
+  process/cgroup scope when provider selections narrow measurement. Qualify
+  filtered capture separately: exclude out-of-scope calls at shared endpoints,
+  reject stale PID/exec identities, handle cgroup membership changes, and preserve
+  provider selection across late discovery without widening the selected scope.
+  System-wide throughput results alone do not establish these isolation rules.
 - Selected detail capture must leave broad observation running. Prefer
   independent detail state and immutable attachment identities over mutating
   inventory cookies or reclaiming cells without producer-quiescence proof.

@@ -44,6 +44,9 @@ mod inventory;
 #[allow(unused_imports)]
 pub(crate) use inventory::PreparedInventory;
 
+#[cfg(test)]
+mod lifecycle_tests;
+
 const BPF_F_RDONLY_PROG: u32 = 1 << 7;
 #[derive(Debug)]
 pub(crate) enum DynamicLoaderAttachFailure {

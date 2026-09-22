@@ -47,9 +47,64 @@ def ramp_samples(*, attach_s, end_s, detach_s=None, step_s=1.0,
             )
         else:
             fds = plateau
-        rows.append({"t_mono_ns": int(moment * 1e9), "fds": fds})
+        rows.append({
+            "t_mono_ns": int(moment * 1e9), "fds": fds,
+            "utime_ticks": int(moment * 10),
+            "stime_ticks": int(moment * 5),
+            "rss_bytes": 4096, "threads": 1, "clk_tck": 100,
+        })
         moment += step_s
     return rows
+
+
+def complete_target_receipt(pid, starttime, *, endpoint="0x1800"):
+    """Synthetic complete mapping receipt plus its validated report join."""
+    sha = "aa" * 32
+    mapping = {"dev": [8, 1], "ino": 11}
+    opened_mapping = {**mapping, "mount_id": 5}
+    opened_file = {"dev": [8, 1], "ino": 11, "sha256": sha,
+                   "size": 100, "path": "/w/owned.so"}
+    report_bridge = {
+        "schema": "p11scope/map-files-mountinfo-bridge/v1",
+        "kind": "map_files_fdinfo_target_mountinfo",
+        "mapping_identity": mapping,
+        "opened_mapping_identity": opened_mapping,
+        "opened_file_identity": {"dev": [8, 1], "ino": 11,
+                                 "sha256": sha},
+    }
+    namespace = {"dev": [0, 5], "ino": 99}
+    receipt = {
+        "schema": "p11scope/workload-mapping-receipt/v1",
+        "pid": pid, "starttime": starttime,
+        "endpoint_address": endpoint,
+        "mapping": {**mapping, "start": "0x1000", "end": "0x2000",
+                    "offset": "0x0", "perms": "r-xp",
+                    "path": "/w/owned.so"},
+        "mapping_identity": mapping,
+        "opened_mapping_identity": opened_mapping,
+        "opened_file_identity": opened_file,
+        "pinned": opened_file,
+        "expected": opened_file,
+        "source": {**opened_file, "ino": 12, "path": "/usr/lib/source.so"},
+        "mount_namespace_identity_before": namespace,
+        "mount_namespace_identity_after": namespace,
+        "maps_before_sha256": "bb" * 32,
+        "maps_after_sha256": "cc" * 32,
+        "mapping_bridge": {
+            "schema": "p11scope/map-files-mountinfo-bridge/v1",
+            "kind": "map_files_fdinfo_target_mountinfo",
+            "range": "1000-2000",
+            "mount_namespace_identity": namespace,
+            "mountinfo_sha256": "dd" * 32,
+            "report_identity_bridge": report_bridge,
+        },
+    }
+    module_identity = [{
+        **mapping, "sha256": sha, "path": "/w/owned.so",
+        "report_identity_associated": True,
+        "report_identity_bridge": report_bridge,
+    }]
+    return receipt, module_identity
 
 
 def run_measure(tmp, *, scope="pid", mode="profile", workload_argv,
@@ -57,7 +112,9 @@ def run_measure(tmp, *, scope="pid", mode="profile", workload_argv,
                 duration_s=8, samples=(), t_spawn_ns=0, t_go_ns=1_000_000_000,
                 t_exit_ns=12_000_000_000, burst_go_ns=1_000_000_000,
                 burst_end_ns=1_100_000_000, receipt=None, observer_exit=0,
-                observer_timed_out=False, observer_signal=None):
+                observer_timed_out=False, observer_signal=None, gate="frame",
+                target_receipt=None, observer_pid=None, mapped_pid=None,
+                mapped_starttime=None, mapped_endpoint="0x1800"):
     """Run the real measurement main() on synthetic inputs.
 
     Returns (record, summary). `receipt` becomes the workload mapping/pin
@@ -65,8 +122,10 @@ def run_measure(tmp, *, scope="pid", mode="profile", workload_argv,
     """
     condition = {
         "scope": scope, "mode": mode, "duration_s": duration_s,
-        "gate": "frame",
-        "observer_argv": ["p11scope", mode, "--system"],
+        "gate": gate,
+        "observer_argv": (["p11scope", mode, "--pid", str(observer_pid)]
+                          if observer_pid is not None else
+                          ["p11scope", mode, "--system"]),
         "binary": "synthetic", "build_profile": "synthetic",
         "ring_bytes": "default", "drain_interval_ms": "default",
         "manifest": None, "workload_argv": workload_argv,
@@ -74,6 +133,8 @@ def run_measure(tmp, *, scope="pid", mode="profile", workload_argv,
     }
     if receipt is not None:
         condition["workload_module_identity"] = receipt
+    if target_receipt is not None:
+        condition["workload_mapping_receipt"] = target_receipt
     meta = {
         "condition": condition,
         "timing": {"t_spawn_mono_ns": t_spawn_ns,
@@ -97,7 +158,10 @@ def run_measure(tmp, *, scope="pid", mode="profile", workload_argv,
             for ts, line in stderr_lines)),
         ("workload-log",
          f"TRUTH_PREGO {json.dumps(truth_prego or {})}\n"
-         f"BURST go_ns={burst_go_ns} end_ns={burst_end_ns}\n"
+         + (f"workload: MAPPED pid={mapped_pid} "
+            f"starttime={mapped_starttime} endpoint={mapped_endpoint}\n"
+            if mapped_pid is not None and mapped_starttime is not None else "")
+         + f"BURST go_ns={burst_go_ns} end_ns={burst_end_ns}\n"
          f"TRUTH {json.dumps(truth)}\n"),
     ):
         path = tmp / f"{name}.input"
@@ -222,6 +286,243 @@ class CollapseInferenceTests(unittest.TestCase):
             burst_outside_window=None, attached_probes=136,
             trace_crosscheck=True)
         self.assertTrue(window["window_valid"])
+
+
+class FrameBoundaryTests(unittest.TestCase):
+    def derive(self, *, burst_go_ns, burst_end_ns, marker_ns=None,
+               duration_s=8.0, marker_line=TARGET_EXIT,
+               owned_target_exit_causal=True):
+        rows = ([] if marker_ns is None else
+                [{"t_mono_ns": marker_ns, "line": marker_line}])
+        rows.insert(0, {"t_mono_ns": 2_000_000_000,
+                        "line": COMPLETION})
+        return MEASURE["derive_phases"](
+            ramp_samples(attach_s=4, end_s=7, detach_s=5.5,
+                         step_s=0.5, baseline=30, plateau=60),
+            rows, duration_s, 1_000_000_000, 7_000_000_000, 3_000_000_000,
+            burst_go_ns=burst_go_ns, burst_end_ns=burst_end_ns,
+            gate="frame",
+            owned_target_exit_causal=owned_target_exit_causal)[0]
+
+    def test_delayed_fd_max_does_not_reject_frame_gated_burst(self):
+        phases = self.derive(
+            burst_go_ns=3_100_000_000, burst_end_ns=4_400_000_000,
+            marker_ns=5_000_000_000)
+        self.assertIsNone(phases["t_attached_mono_ns"])
+        self.assertEqual(phases["t_attached_fd_estimate_mono_ns"],
+                         4_000_000_000)
+        self.assertIsNone(phases["t_expiry_mono_ns"])
+        self.assertAlmostEqual(phases["capture_proven_lower_bound_s"], 1.4)
+        self.assertFalse(phases["burst_outside_window"])
+        self.assertFalse(any("PREDATED ATTACH" in warning
+                             for warning in phases["method_warnings"]))
+
+    def test_frame_gate_preserves_provable_early_and_late_negatives(self):
+        early = self.derive(
+            burst_go_ns=100_000_000, burst_end_ns=500_000_000,
+            marker_ns=5_000_000_000)
+        late_marker = self.derive(
+            burst_go_ns=3_100_000_000, burst_end_ns=5_500_000_000,
+            marker_ns=5_000_000_000, owned_target_exit_causal=False)
+        late_duration_bound = self.derive(
+            burst_go_ns=3_100_000_000, burst_end_ns=5_500_000_000,
+            duration_s=2.0)
+        self.assertTrue(early["burst_outside_window"])
+        self.assertTrue(late_marker["burst_outside_window"])
+        self.assertTrue(late_duration_bound["burst_outside_window"])
+
+    def test_delayed_frame_receipt_never_invents_expiry(self):
+        phases = self.derive(
+            burst_go_ns=3_100_000_000, burst_end_ns=4_000_000_000)
+        self.assertIsNone(phases["t_expiry_mono_ns"])
+        self.assertIsNone(phases["capture_measured_s"])
+        self.assertIsNone(phases["burst_outside_window"])
+        self.assertTrue(any("unknown" in warning.lower()
+                            for warning in phases["method_warnings"]))
+
+    def test_delayed_cancel_observation_cannot_prove_burst_preceded_stop(self):
+        phases = self.derive(
+            burst_go_ns=3_100_000_000, burst_end_ns=5_000_000_000,
+            marker_ns=6_000_000_000,
+            marker_line="p11scope: cancel: loop exited on signal 2 after 9 ticks",
+            owned_target_exit_causal=False)
+        self.assertEqual(phases["burst_window_relation"], "unknown")
+        window = MEASURE["assess_window"](
+            gate="frame", scope="pid", counts_match=True,
+            burst_outside_window=phases["burst_outside_window"],
+            burst_window_relation=phases["burst_window_relation"],
+            attached_probes=136, trace_crosscheck=True)
+        self.assertFalse(window["window_valid"])
+        self.assertIn("BURST WINDOW UNKNOWN", window["window_note"])
+
+    def test_generic_target_exit_observation_is_not_causal_owned_proof(self):
+        phases = self.derive(
+            burst_go_ns=3_100_000_000, burst_end_ns=4_400_000_000,
+            marker_ns=5_000_000_000, owned_target_exit_causal=False)
+        self.assertEqual(phases["burst_window_relation"], "unknown")
+        self.assertIsNone(phases["burst_outside_window"])
+
+    def test_raw_main_uses_frame_bounds_not_late_fd_max(self):
+        with tempfile.TemporaryDirectory() as raw:
+            target, module = complete_target_receipt(4242, 99)
+            record, _ = run_measure(
+                Path(raw), scope="pid", mode="profile",
+                workload_argv=["/w/workload", "/w/owned.so", "7", "0", "0"],
+                report_text=profile_report(
+                    functions=[{"names": ["C_GenerateRandom"], "calls": 7,
+                                "module": {"dev": [8, 1], "ino": 11,
+                                           "sha256": "aa"}}],
+                    discovery=[{"path": "/w/owned.so", "dev": [8, 1],
+                                "ino": 11, "sha256": "aa", "tables": [{}]}]),
+                stderr_lines=[(2_000_000_000, COMPLETION),
+                              (5_000_000_000, TARGET_EXIT)],
+                truth={"C_GenerateRandom": 7},
+                samples=ramp_samples(attach_s=4, end_s=7, detach_s=5.5,
+                                     step_s=0.5, baseline=30, plateau=60),
+                t_go_ns=3_000_000_000, t_exit_ns=7_000_000_000,
+                burst_go_ns=3_100_000_000, burst_end_ns=4_400_000_000,
+                receipt=module, observer_pid=4242, target_receipt=target,
+                mapped_pid=4242, mapped_starttime=99)
+        self.assertTrue(record["truth_vs_observed"]["counts_match"])
+        self.assertTrue(record["window"]["window_valid"])
+        self.assertFalse(record["phases"]["burst_outside_window"])
+        self.assertEqual(record["phases"]["t_attached_fd_estimate_mono_ns"],
+                         4_000_000_000)
+
+    def test_raw_main_delayed_cancel_stays_temporally_unknown(self):
+        with tempfile.TemporaryDirectory() as raw:
+            record, _ = run_measure(
+                Path(raw), scope="pid", mode="profile",
+                workload_argv=["/w/workload", "/w/owned.so", "7", "0", "0"],
+                report_text=profile_report(
+                    functions=[{"names": ["C_GenerateRandom"], "calls": 7,
+                                "module": {"dev": [8, 1], "ino": 11,
+                                           "sha256": "aa"}}],
+                    discovery=[{"path": "/w/owned.so", "dev": [8, 1],
+                                "ino": 11, "sha256": "aa", "tables": [{}]}]),
+                stderr_lines=[
+                    (2_000_000_000, COMPLETION),
+                    (6_000_000_000, "p11scope: cancel: loop exited on "
+                     "signal 2 after 9 ticks"),
+                ],
+                truth={"C_GenerateRandom": 7},
+                samples=ramp_samples(attach_s=4, end_s=7, detach_s=6.5,
+                                     step_s=0.5, baseline=30, plateau=60),
+                t_go_ns=3_000_000_000, t_exit_ns=7_000_000_000,
+                burst_go_ns=3_100_000_000, burst_end_ns=5_000_000_000)
+        self.assertTrue(record["truth_vs_observed"]["counts_match"])
+        self.assertEqual(record["phases"]["burst_window_relation"], "unknown")
+        self.assertFalse(record["window"]["window_valid"])
+
+    def test_raw_main_requires_exact_owned_generation_for_target_exit(self):
+        with tempfile.TemporaryDirectory() as raw:
+            target, module = complete_target_receipt(4242, 99)
+            record, _ = run_measure(
+                Path(raw), scope="pid", mode="profile",
+                workload_argv=["/w/workload", "/w/owned.so", "7", "0", "0"],
+                report_text=profile_report(
+                    functions=[{"names": ["C_GenerateRandom"], "calls": 7,
+                                "module": {"dev": [8, 1], "ino": 11,
+                                           "sha256": "aa"}}],
+                    discovery=[{"path": "/w/owned.so", "dev": [8, 1],
+                                "ino": 11, "sha256": "aa", "tables": [{}]}]),
+                stderr_lines=[(2_000_000_000, COMPLETION),
+                              (5_000_000_000, TARGET_EXIT)],
+                truth={"C_GenerateRandom": 7},
+                samples=ramp_samples(attach_s=4, end_s=7, detach_s=5.5,
+                                     step_s=0.5, baseline=30, plateau=60),
+                t_go_ns=3_000_000_000, t_exit_ns=7_000_000_000,
+                burst_go_ns=3_100_000_000, burst_end_ns=4_400_000_000,
+                receipt=module, observer_pid=4243, target_receipt=target,
+                mapped_pid=4242, mapped_starttime=99)
+        self.assertTrue(record["truth_vs_observed"]["counts_match"])
+        self.assertEqual(record["phases"]["burst_window_relation"], "unknown")
+        self.assertFalse(record["window"]["window_valid"])
+
+    def test_raw_main_without_loop_end_cannot_accept_unknown_expiry(self):
+        with tempfile.TemporaryDirectory() as raw:
+            target, module = complete_target_receipt(4242, 99)
+            record, _ = run_measure(
+                Path(raw), scope="pid", mode="profile",
+                workload_argv=["/w/workload", "/w/owned.so", "7", "0", "0"],
+                report_text=profile_report(
+                    functions=[{"names": ["C_GenerateRandom"], "calls": 7}],
+                    discovery=[]),
+                stderr_lines=[(2_000_000_000, COMPLETION)],
+                truth={"C_GenerateRandom": 7}, duration_s=2,
+                samples=ramp_samples(attach_s=4, end_s=6, detach_s=5.5,
+                                     step_s=0.5, baseline=30, plateau=60),
+                t_spawn_ns=1_000_000_000, t_go_ns=3_000_000_000,
+                t_exit_ns=6_000_000_000,
+                burst_go_ns=3_100_000_000, burst_end_ns=4_400_000_000,
+                receipt=module, observer_pid=4242, target_receipt=target,
+                mapped_pid=4242, mapped_starttime=99)
+        self.assertTrue(record["truth_vs_observed"]["counts_match"])
+        self.assertEqual(record["phases"]["burst_window_relation"], "unknown")
+        self.assertFalse(record["window"]["window_valid"])
+
+    def test_raw_main_receipt_birth_must_match_mapped_generation(self):
+        with tempfile.TemporaryDirectory() as raw:
+            target, module = complete_target_receipt(4242, 100)
+            record, _ = run_measure(
+                Path(raw), scope="pid", mode="profile",
+                workload_argv=["/w/workload", "/w/owned.so", "7", "0", "0"],
+                report_text=profile_report(
+                    functions=[{"names": ["C_GenerateRandom"], "calls": 7}],
+                    discovery=[]),
+                stderr_lines=[(2_000_000_000, COMPLETION),
+                              (5_000_000_000, TARGET_EXIT)],
+                truth={"C_GenerateRandom": 7},
+                samples=ramp_samples(attach_s=4, end_s=7, detach_s=5.5,
+                                     step_s=0.5, baseline=30, plateau=60),
+                t_go_ns=3_000_000_000, t_exit_ns=7_000_000_000,
+                burst_go_ns=3_100_000_000, burst_end_ns=4_400_000_000,
+                receipt=module, observer_pid=4242, target_receipt=target,
+                mapped_pid=4242, mapped_starttime=99)
+        self.assertEqual(record["phases"]["burst_window_relation"], "unknown")
+        self.assertFalse(record["window"]["window_valid"])
+
+    def test_raw_main_mapped_birth_must_match_complete_receipt(self):
+        with tempfile.TemporaryDirectory() as raw:
+            target, module = complete_target_receipt(4242, 99)
+            record, _ = run_measure(
+                Path(raw), scope="pid", mode="profile",
+                workload_argv=["/w/workload", "/w/owned.so", "7", "0", "0"],
+                report_text=profile_report(
+                    functions=[{"names": ["C_GenerateRandom"], "calls": 7}],
+                    discovery=[]),
+                stderr_lines=[(2_000_000_000, COMPLETION),
+                              (5_000_000_000, TARGET_EXIT)],
+                truth={"C_GenerateRandom": 7},
+                samples=ramp_samples(attach_s=4, end_s=7, detach_s=5.5,
+                                     step_s=0.5, baseline=30, plateau=60),
+                t_go_ns=3_000_000_000, t_exit_ns=7_000_000_000,
+                burst_go_ns=3_100_000_000, burst_end_ns=4_400_000_000,
+                receipt=module, observer_pid=4242, target_receipt=target,
+                mapped_pid=4242, mapped_starttime=100)
+        self.assertEqual(record["phases"]["burst_window_relation"], "unknown")
+        self.assertFalse(record["window"]["window_valid"])
+
+    def test_raw_main_incomplete_receipt_cannot_prove_target_exit_order(self):
+        with tempfile.TemporaryDirectory() as raw:
+            record, _ = run_measure(
+                Path(raw), scope="pid", mode="profile",
+                workload_argv=["/w/workload", "/w/owned.so", "7", "0", "0"],
+                report_text=profile_report(
+                    functions=[{"names": ["C_GenerateRandom"], "calls": 7}],
+                    discovery=[]),
+                stderr_lines=[(2_000_000_000, COMPLETION),
+                              (5_000_000_000, TARGET_EXIT)],
+                truth={"C_GenerateRandom": 7},
+                samples=ramp_samples(attach_s=4, end_s=7, detach_s=5.5,
+                                     step_s=0.5, baseline=30, plateau=60),
+                t_go_ns=3_000_000_000, t_exit_ns=7_000_000_000,
+                burst_go_ns=3_100_000_000, burst_end_ns=4_400_000_000,
+                observer_pid=4242,
+                target_receipt={"pid": 4242, "starttime": 99},
+                mapped_pid=4242, mapped_starttime=99)
+        self.assertEqual(record["phases"]["burst_window_relation"], "unknown")
+        self.assertFalse(record["window"]["window_valid"])
 
 
 class EarlyExitTests(unittest.TestCase):
@@ -455,7 +756,7 @@ class IdentityTests(unittest.TestCase):
         self.assertIn("receipt", tvo["match_note"])
         self.assertFalse(record["window"]["window_valid"])
 
-    def test_receipt_backed_coverage_validates_end_to_end(self):
+    def test_receipt_backed_coverage_does_not_replace_temporal_proof(self):
         with tempfile.TemporaryDirectory() as raw:
             record, summary = run_measure(
                 Path(raw), scope="system", mode="profile",
@@ -469,7 +770,8 @@ class IdentityTests(unittest.TestCase):
                 truth={"C_GenerateRandom": 7}, receipt=owned_receipt())
         tvo = record["truth_vs_observed"]
         self.assertTrue(tvo["counts_match"])
-        self.assertTrue(record["window"]["window_valid"])
+        self.assertEqual(record["phases"]["burst_window_relation"], "unknown")
+        self.assertFalse(record["window"]["window_valid"])
         self.assertIn("not an independently observed consumer count", summary)
 
     def test_named_foreign_rows_cannot_satisfy_owned_truth_in_raw_main(self):

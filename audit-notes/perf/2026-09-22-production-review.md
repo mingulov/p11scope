@@ -14,7 +14,8 @@ Raw campaign evidence lives at
 
 The goal covers real full-system capture across providers, browsers, users,
 namespaces, and long runtimes with low measured overhead. The clarified minimum
-is a brief inventory of every provider whose use is observed. Mapping, table
+is a brief inventory of all used providers, backed by observed execution.
+Missing a supported exercised provider fails acceptance. Mapping, table
 discovery, publication, attachment and endpoint execution are distinct facts.
 Providers loaded later must be reached. Unload/exit/reload must release live
 resources, retain history and preserve probes still needed by other mappers.

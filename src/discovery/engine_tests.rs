@@ -5625,6 +5625,273 @@ fn a_capture_refresh_ends_on_a_proven_exit_instead_of_failing() {
     assert!(engine.expected_target_exit());
 }
 
+/// Real child, /proc reads, offline table acquisition, inventory reconciliation,
+/// and publication. Only the BPF/link adapter is substituted. The child cannot
+/// load or exit until the test acknowledges the preceding engine operation.
+struct DiscoveryLifecycleFixture {
+    _dir: tempfile::TempDir,
+    provider: PathBuf,
+    manifest: PathBuf,
+    child: SystemScopeChildGuard,
+    output: std::process::ChildStdout,
+    pidfd: std::os::fd::OwnedFd,
+}
+
+impl DiscoveryLifecycleFixture {
+    fn start() -> Self {
+        use std::os::fd::FromRawFd as _;
+
+        let dir = tempfile::tempdir().expect("a discovery lifecycle fixture directory");
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/discovery-lifecycle.c");
+        let provider = dir.path().join("lifecycle-provider.so");
+        let driver = dir.path().join("lifecycle-driver");
+        for (output, extra) in [
+            (
+                &provider,
+                &["-shared", "-fPIC", "-DDISCOVERY_LIFECYCLE_PROVIDER"][..],
+            ),
+            (&driver, &[][..]),
+        ] {
+            assert!(
+                std::process::Command::new("gcc")
+                    .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"])
+                    .args(extra)
+                    .arg(&source)
+                    .arg("-o")
+                    .arg(output)
+                    .arg("-ldl")
+                    .status()
+                    .expect("compile the owned discovery fixture")
+                    .success()
+            );
+        }
+        let manifest = dir.path().join("provider.json");
+        let acquired = p11scope_discover::discover::discover(&provider)
+            .expect("the real offline helper acquires the fixture's table");
+        std::fs::write(&manifest, serde_json::to_vec(&acquired).unwrap()).unwrap();
+
+        let mut child = SystemScopeChildGuard::new(
+            std::process::Command::new(&driver)
+                .arg(&provider)
+                .env_clear()
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("start the owned loader behind its pre-load barrier"),
+        );
+        let output = child.child.stdout.take().unwrap();
+        // SAFETY: pidfd_open takes a live child PID and flags zero, and returns
+        // a new descriptor owned exclusively by this fixture.
+        let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, child.pid(), 0) };
+        assert!(
+            descriptor >= 0,
+            "retain child exit readiness: {}",
+            std::io::Error::last_os_error()
+        );
+        let pidfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(descriptor as i32) };
+        let mut fixture = Self {
+            _dir: dir,
+            provider,
+            manifest,
+            child,
+            output,
+            pidfd,
+        };
+        assert_eq!(
+            fixture.read_ack(),
+            format!("READY {}\n", fixture.child.pid())
+        );
+        fixture
+    }
+
+    fn read_ack(&mut self) -> String {
+        use std::io::Read as _;
+        use std::os::fd::AsRawFd as _;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut ack = Vec::new();
+        while !ack.ends_with(b"\n") {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(
+                !remaining.is_zero() && ack.len() < 256,
+                "bounded fixture acknowledgement: {ack:?}"
+            );
+            assert!(system_scope_poll_fd(self.output.as_raw_fd(), remaining).unwrap());
+            let mut byte = [0];
+            assert_eq!(
+                self.output.read(&mut byte).unwrap(),
+                1,
+                "fixture exited before acknowledgement: {ack:?}"
+            );
+            ack.push(byte[0]);
+        }
+        String::from_utf8(ack).unwrap()
+    }
+
+    fn discover_before_load(&self) -> Engine {
+        let pid = self.child.pid();
+        let mut args = system_args(vec![self.provider.clone()], None);
+        args.scope = crate::cli::ScopeArg::Pid(pid);
+        args.manifests = vec![self.manifest.clone()];
+        let view = ProcessView::open(ProcessViewId(0), pid).expect("retain the owned generation");
+        let engine = Engine::discover(&args, &Scope::Pid(pid), Some(view))
+            .expect("manifest-backed discovery before dlopen");
+        assert_eq!(engine.discovery.uncorroborated, 1);
+        assert_eq!(engine.discovery.modules.len(), 1);
+        assert!(!engine.discovery.modules[0].corroborated);
+        assert_eq!(
+            engine.discovery.modules[0].corroboration,
+            ["uncorroborated"]
+        );
+        assert!(
+            engine.modules.is_empty(),
+            "the child has not mapped the provider"
+        );
+        engine
+    }
+
+    fn load(&mut self) {
+        use std::os::unix::fs::MetadataExt as _;
+
+        self.child
+            .child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"L")
+            .unwrap();
+        let identity = std::fs::metadata(&self.provider).unwrap();
+        assert_eq!(
+            self.read_ack(),
+            format!(
+                "LOADED {} {} {} 68\n",
+                self.child.pid(),
+                identity.dev(),
+                identity.ino()
+            )
+        );
+    }
+
+    fn exit_and_reap(&mut self) {
+        use std::os::fd::AsRawFd as _;
+
+        self.child
+            .child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"X")
+            .unwrap();
+        assert!(
+            system_scope_poll_fd(self.pidfd.as_raw_fd(), std::time::Duration::from_secs(10))
+                .unwrap(),
+            "owned fixture must exit after release"
+        );
+        let status = self.child.child.wait().expect("reap the exact owned child");
+        self.child.live = false;
+        assert!(status.success(), "fixture exit: {status}");
+    }
+}
+
+/// Unlike the synthetic corroboration unit tests, these regressions acquire
+/// their manifest and scanned table independently from a real shared object.
+/// Calling refresh requests service; only accepted tables plus publication
+/// establish agreement. No loader event or elapsed delay is an acknowledgement.
+#[test]
+fn lifecycle_completed_discovery_agreement_survives_real_child_exit() {
+    let mut fixture = DiscoveryLifecycleFixture::start();
+    let mut engine = fixture.discover_before_load();
+    let generation = engine.views[0].id();
+    fixture.load();
+    engine.request_refresh(fixture.child.pid());
+    refresh_inventory_once(&mut engine);
+    engine.publish_current_capture_facts().unwrap();
+
+    assert_eq!(engine.views.len(), 1);
+    assert_eq!(engine.views[0].id(), generation);
+    assert!(
+        engine.views[0].still_the_same(),
+        "agreement is acknowledged while the child is alive"
+    );
+    assert!(
+        engine
+            .modules
+            .iter()
+            .any(|module| module.scanned.view == generation
+                && module
+                    .scanned
+                    .tables
+                    .iter()
+                    .any(|table| table.entries.len() == 68)),
+        "a real complete table must have been acquired: {:?}",
+        engine.modules
+    );
+    assert_eq!(engine.discovery.uncorroborated, 0, "{:?}", engine.discovery);
+    assert_eq!(engine.discovery.conflicts, 0);
+    assert_eq!(engine.discovery.modules.len(), 1);
+    assert!(engine.discovery.modules[0].corroborated);
+    assert_eq!(engine.discovery.modules[0].corroboration, ["agreed"]);
+    let identity = (
+        engine.discovery.modules[0].dev,
+        engine.discovery.modules[0].ino,
+        engine.discovery.modules[0].sha256.clone(),
+    );
+
+    fixture.exit_and_reap();
+    refresh_inventory_once(&mut engine);
+    engine.publish_current_capture_facts().unwrap();
+
+    assert!(engine.expected_target_exit());
+    assert!(engine.views.is_empty());
+    assert!(
+        engine.modules.is_empty(),
+        "the live scan view really retired"
+    );
+    assert_eq!(engine.discovery.uncorroborated, 0, "{:?}", engine.discovery);
+    assert_eq!(engine.discovery.conflicts, 0);
+    assert_eq!(
+        engine.discovery.modules.len(),
+        1,
+        "the historical provider survives retirement"
+    );
+    let module = &engine.discovery.modules[0];
+    assert_eq!((module.dev, module.ino, module.sha256.clone()), identity);
+    assert!(module.corroborated);
+    assert_eq!(module.corroboration, ["agreed"]);
+    assert!(engine.plan.skipped.is_empty(), "{:?}", engine.plan.skipped);
+}
+
+#[test]
+fn lifecycle_exit_before_discovery_service_stays_explicitly_uncorroborated() {
+    let mut fixture = DiscoveryLifecycleFixture::start();
+    let mut engine = fixture.discover_before_load();
+    fixture.load();
+    engine.request_refresh(fixture.child.pid());
+    // The workload did load and acquire its provider, but the observer has
+    // deliberately not serviced the request when this exact generation exits.
+    fixture.exit_and_reap();
+    refresh_inventory_once(&mut engine);
+    engine.publish_current_capture_facts().unwrap();
+
+    assert!(engine.expected_target_exit());
+    assert!(engine.views.is_empty());
+    assert!(engine.modules.is_empty());
+    assert_eq!(engine.discovery.uncorroborated, 1, "{:?}", engine.discovery);
+    assert_eq!(engine.discovery.conflicts, 0);
+    assert_eq!(engine.discovery.modules.len(), 1);
+    assert!(!engine.discovery.modules[0].corroborated);
+    assert_eq!(
+        engine.discovery.modules[0].corroboration,
+        ["uncorroborated"]
+    );
+    assert!(
+        engine.plan.skipped.is_empty(),
+        "a proven owned exit is not discovery loss: {:?}",
+        engine.plan.skipped
+    );
+}
+
 /// Plan Task 8 Step 1 checkbox 8, deferred to Step 2 because it needs the
 /// crate-private `DiscoveryItem`/record path: strategy, timing, and
 /// capture counts deduplicate the exact internal

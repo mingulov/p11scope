@@ -144,6 +144,28 @@ def parse_burst(lines):
     raise SystemExit("no BURST line in workload log")
 
 
+def parse_mapped_generation(lines):
+    """Return the workload's unique mapped (PID, birth, endpoint) tuple.
+
+    Mapping evidence is used only for the PID target-exit ordering proof.
+    Missing, duplicate, or malformed evidence leaves that proof unavailable;
+    it does not weaken the independent call-count oracle.
+    """
+    pattern = re.compile(
+        r"workload: MAPPED pid=([1-9][0-9]*) "
+        r"starttime=([1-9][0-9]*) endpoint=(0x[0-9a-f]+)")
+    found = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped.startswith("workload: MAPPED"):
+            continue
+        match = pattern.fullmatch(stripped)
+        if match is None:
+            return None
+        found.append((int(match[1]), int(match[2]), int(match[3], 16)))
+    return found[0] if len(found) == 1 else None
+
+
 def burst_rate_per_s(n_calls, go_ns, end_ns):
     """Calls per second over the burst window, or None when unknowable."""
     if n_calls <= 0 or end_ns <= go_ns:
@@ -545,7 +567,7 @@ def cancel_probe_verdict(t0_ns, t_marker_ns):
 
 def assess_window(*, gate, scope, counts_match, burst_outside_window,
                   attached_probes, trace_crosscheck, coverage_detail=None,
-                  observer_outcome=None):
+                  observer_outcome=None, burst_window_relation=None):
     """Post-hoc window validity, decisive for weak (non-frame) gates.
 
     The frame gate is an in-observer attach-end signal; marker+settle
@@ -554,11 +576,10 @@ def assess_window(*, gate, scope, counts_match, burst_outside_window,
     window proof rather than a loss statement. `coverage_detail`, when
     given, names the exact coverage failure (e.g. unattributable owned
     traffic) instead of the generic missed-window text.
-    `burst_outside_window` is the boundary-based overlap verdict from
-    derive_phases: True when the workload burst provably escaped the
-    estimated capture window (audit F-74 replaced the setup-vs-duration
-    collapse inference with actual monotonic boundaries); None leaves
-    the overlap unchecked without invalidating the window.
+    `burst_window_relation` is the boundary-based overlap verdict from
+    derive_phases. An explicit unknown fails closed; unchecked preserves
+    the legacy case where no temporal claim was requested. When omitted,
+    `burst_outside_window` supplies the backward-compatible verdict.
     """
     problems = []
     if observer_outcome:
@@ -568,9 +589,22 @@ def assess_window(*, gate, scope, counts_match, burst_outside_window,
             problems.append("counts_match=False (window missed workload calls)")
         else:
             problems.append(f"counts_match=False ({coverage_detail})")
-    if burst_outside_window:
+    if burst_window_relation is None:
+        if burst_outside_window is True:
+            burst_window_relation = "outside"
+        elif burst_outside_window is False:
+            burst_window_relation = "inside"
+        else:
+            burst_window_relation = "unchecked"
+    if burst_window_relation == "outside":
         problems.append("BURST OUTSIDE WINDOW (workload burst escaped the "
                         "estimated capture window; see method warnings)")
+    elif burst_window_relation == "unknown":
+        problems.append("BURST WINDOW UNKNOWN (available external timestamps "
+                        "do not prove that the workload burst stayed inside "
+                        "the capture loop)")
+    elif burst_window_relation not in ("inside", "unchecked"):
+        problems.append("BURST WINDOW UNKNOWN (invalid boundary relation)")
     if attached_probes <= 0:
         problems.append("attached_probes=0 (attach never completed)")
     if not trace_crosscheck:
@@ -807,38 +841,181 @@ def _observer_phase_s(phase_ms, key):
     return float(value) / 1000.0
 
 
+def _canonical_identity(ref, *, require_sha=False, require_size=False):
+    """Strict receipt identity tuple, or None for an incomplete record."""
+    if not isinstance(ref, dict):
+        return None
+    dev = ref.get("dev")
+    ino = ref.get("ino")
+    if (not isinstance(dev, (list, tuple)) or len(dev) != 2
+            or any(isinstance(part, bool) or not isinstance(part, int)
+                   or part < 0 for part in dev)
+            or isinstance(ino, bool) or not isinstance(ino, int) or ino <= 0):
+        return None
+    sha = ref.get("sha256")
+    if require_sha and (not isinstance(sha, str)
+                        or re.fullmatch(r"[0-9a-f]{64}", sha) is None):
+        return None
+    size = ref.get("size")
+    if require_size and (isinstance(size, bool) or not isinstance(size, int)
+                         or size < 0):
+        return None
+    return (tuple(dev), ino, sha, size)
+
+
+def _validated_workload_generation(condition, mapped_generation):
+    """Authenticate the selected PID generation against the full receipt."""
+    if not isinstance(condition, dict) or condition.get("scope") != "pid":
+        return None
+    if mapped_generation is None:
+        return None
+    receipt = condition.get("workload_mapping_receipt")
+    if (not isinstance(receipt, dict)
+            or receipt.get("schema") != "p11scope/workload-mapping-receipt/v1"):
+        return None
+    pid = receipt.get("pid")
+    birth = receipt.get("starttime")
+    endpoint_text = receipt.get("endpoint_address")
+    if (isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0
+            or isinstance(birth, bool) or not isinstance(birth, int)
+            or birth <= 0 or not isinstance(endpoint_text, str)
+            or re.fullmatch(r"0x[0-9a-f]+", endpoint_text) is None):
+        return None
+    endpoint = int(endpoint_text, 16)
+    if mapped_generation != (pid, birth, endpoint):
+        return None
+
+    mapping = receipt.get("mapping")
+    mapping_id = _canonical_identity(receipt.get("mapping_identity"))
+    opened_mapping = _canonical_identity(receipt.get("opened_mapping_identity"))
+    opened = _canonical_identity(receipt.get("opened_file_identity"),
+                                 require_sha=True, require_size=True)
+    pinned = _canonical_identity(receipt.get("pinned"),
+                                 require_sha=True, require_size=True)
+    expected = _canonical_identity(receipt.get("expected"),
+                                   require_sha=True, require_size=True)
+    source = _canonical_identity(receipt.get("source"),
+                                 require_sha=True, require_size=True)
+    if (not isinstance(mapping, dict) or mapping_id is None
+            or opened_mapping is None or opened is None or pinned is None
+            or expected is None or source is None):
+        return None
+    mapping_row_id = _canonical_identity(mapping)
+    mount_id = receipt.get("opened_mapping_identity", {}).get("mount_id")
+    if (mapping_row_id is None or mapping_id[:2] != mapping_row_id[:2]
+            or mapping_id[:2] != opened_mapping[:2]
+            or mapping_id[1] != opened[1]
+            or opened != pinned or opened != expected
+            or source[2:] != expected[2:] or source[:2] == expected[:2]
+            or isinstance(mount_id, bool) or not isinstance(mount_id, int)
+            or mount_id <= 0):
+        return None
+    try:
+        start = int(mapping["start"], 16)
+        end = int(mapping["end"], 16)
+    except (KeyError, TypeError, ValueError):
+        return None
+    if (not all(isinstance(mapping.get(key), str)
+                and re.fullmatch(r"0x[0-9a-f]+", mapping[key])
+                for key in ("start", "end", "offset"))
+            or start >= end or not start <= endpoint < end
+            or re.fullmatch(r"[r-][w-]x[ps]", str(mapping.get("perms"))) is None):
+        return None
+
+    namespace_before = receipt.get("mount_namespace_identity_before")
+    namespace_after = receipt.get("mount_namespace_identity_after")
+    bridge = receipt.get("mapping_bridge")
+    if (_canonical_identity(namespace_before) is None
+            or namespace_before != namespace_after or not isinstance(bridge, dict)
+            or bridge.get("schema") != "p11scope/map-files-mountinfo-bridge/v1"
+            or bridge.get("kind") != "map_files_fdinfo_target_mountinfo"
+            or bridge.get("range") != f"{start:x}-{end:x}"
+            or bridge.get("mount_namespace_identity") != namespace_before
+            or re.fullmatch(r"[0-9a-f]{64}",
+                            str(bridge.get("mountinfo_sha256"))) is None
+            or any(re.fullmatch(r"[0-9a-f]{64}", str(receipt.get(name))) is None
+                   for name in ("maps_before_sha256", "maps_after_sha256"))):
+        return None
+    report_bridge = {
+        "schema": "p11scope/map-files-mountinfo-bridge/v1",
+        "kind": "map_files_fdinfo_target_mountinfo",
+        "mapping_identity": receipt["mapping_identity"],
+        "opened_mapping_identity": receipt["opened_mapping_identity"],
+        "opened_file_identity": {
+            "dev": receipt["opened_file_identity"]["dev"],
+            "ino": receipt["opened_file_identity"]["ino"],
+            "sha256": receipt["opened_file_identity"]["sha256"],
+        },
+    }
+    if bridge.get("report_identity_bridge") != report_bridge:
+        return None
+    module_receipts = condition.get("workload_module_identity")
+    if isinstance(module_receipts, dict):
+        module_receipts = [module_receipts]
+    if not isinstance(module_receipts, list):
+        return None
+    expected_report_id = (mapping_id[0], mapping_id[1], opened[2])
+    if not any(isinstance(candidate, dict)
+               and candidate.get("report_identity_bridge") == report_bridge
+               and _validated_report_identity_bridge(candidate)
+               == expected_report_id
+               for candidate in module_receipts):
+        return None
+    return pid, birth
+
+
+def owned_pid_target_causal(condition, mapped_generation):
+    """Whether target-exit causally follows this owned workload generation."""
+    generation = _validated_workload_generation(condition, mapped_generation)
+    if generation is None:
+        return False
+    receipt_pid, _ = generation
+    argv = condition.get("observer_argv")
+    if not isinstance(argv, list) or argv.count("--pid") != 1:
+        return False
+    index = argv.index("--pid")
+    if index + 1 >= len(argv):
+        return False
+    try:
+        selected_pid = int(argv[index + 1])
+    except (TypeError, ValueError):
+        return False
+    return selected_pid == receipt_pid
+
+
 def derive_phases(samples, stderr_rows, duration_s, t_spawn_ns, t_exit_ns,
                   t_go_ns=None, phase_ms=None, burst_go_ns=None,
-                  burst_end_ns=None):
+                  burst_end_ns=None, gate=None,
+                  owned_target_exit_causal=False):
     """Split wall time into phases from external traces.
 
     t_discovery: the discovery *completion* marker's timestamp (the
       observer prints it when discovery completes, before attach).
       Per-class noise summaries share the `p11scope: discovery:` prefix
       and may precede it, so only the completion shape counts.
-    t_attached: first fd sample reaching 95% of the run max — the end of
-      the per-slot link ramp, after which the capture loop starts.
-    t_expiry: t_attached + requested duration (the observer honors
-      --duration from loop start; capture.start/end are 1 s precision and
-      serve only as a cross-check).
-    t_loop_end: a loop-end marker (target-exit, cancel) when one names
-      the loop's actual end, else t_expiry. drain/detach anchor here, so
-      an early target exit moves them instead of stranding them past a
-      taper the loop never reached.
+    t_attached_fd_estimate: first fd sample reaching 95% of the run max.
+      It is retrospective phase diagnostics, not an authoritative capture
+      boundary. For a frame gate, t_go is recorded only as a latest-start
+      bound: the loop was live before the harness observed the frame and
+      released the workload, but frame delivery may be delayed.
+    t_expiry_fd_estimate: fd attach estimate + requested duration. Frame
+      gates never publish this as an exact expiry and never derive expiry
+      from the delayed gate receipt.
+    t_loop_end: for legacy gates, a loop-end marker (target-exit, cancel)
+      when present, else t_expiry. For frame gates, external marker receipt
+      is only an observation bound; it remains diagnostic unless exact
+      owned-PID ordering supplies the causal target-exit premise.
     t_detach_start: first post-loop-end sample below 95% of max (sustained).
     t_detach_end: first sample after that back at baseline.
     drain = loop end -> detach start (final drain + detach setup);
     publish = detach end -> exit (report write + teardown).
     BPF program/map load has no external marker: it is folded into attach
     and reported as load_s=null with this reason.
-    `t_go_ns` is the harness gate-release boundary, recorded for
-    cross-checks; it feeds no collapse inference (audit F-74: the
-    observer's duration clock starts after attach, so setup-vs-duration
-    cannot establish expiry — a 60 s setup with an 8 s post-attach
-    capture is a healthy 8 s window). The workload/window overlap uses
-    the workload's own BURST bounds instead: `burst_outside_window` is
-    True when the burst provably predated attach or outlived expiry,
-    False when it sits inside, None when no bounds were supplied.
+    For frame gates the workload/window overlap uses conservative bounds:
+    a BURST after gate release started after attach; an owned PID target-exit
+    is causally after that exact workload generation's BURST; generic exit
+    and cancel marker timestamps are only observation upper bounds. Unknown
+    ordering is reported as unknown and cannot validate the window.
     `phase_ms`: the observer's own phase timers
       (evidence.scheduling.phase_ms), when the report carries them. The
       fd-trace estimator assumes the target lives until the computed
@@ -895,9 +1072,15 @@ def derive_phases(samples, stderr_rows, duration_s, t_spawn_ns, t_exit_ns,
         "t_spawn_mono_ns": t_spawn_ns,
         "t_exit_mono_ns": t_exit_ns,
         "t_go_mono_ns": t_go_ns,
+        "t_gate_release_mono_ns": t_go_ns if gate == "frame" else None,
         "t_discovery_mono_ns": t_discovery,
         "t_attached_mono_ns": None,
         "t_expiry_mono_ns": None,
+        "t_attached_fd_estimate_mono_ns": None,
+        "t_expiry_fd_estimate_mono_ns": None,
+        "attach_fd_estimate_s": None,
+        "capture_proven_lower_bound_s": None,
+        "t_loop_end_observed_mono_ns": None,
         "t_loop_end_mono_ns": None,
         "loop_end_reason": "expiry",
         "t_detach_start_mono_ns": None,
@@ -905,7 +1088,89 @@ def derive_phases(samples, stderr_rows, duration_s, t_spawn_ns, t_exit_ns,
         "burst_go_mono_ns": burst_go_ns,
         "burst_end_mono_ns": burst_end_ns,
         "burst_outside_window": None,
+        "burst_window_relation": "unchecked",
     }
+
+    is_frame_gate = gate == "frame"
+    if is_frame_gate:
+        phases["attach_boundary_source"] = "frame_gate_release_latest_bound"
+        phases["capture_boundary_source"] = "external_bounds"
+        if t_loop_markers:
+            observed_end, observed_reason = min(t_loop_markers)
+            phases["t_loop_end_observed_mono_ns"] = observed_end
+            phases["loop_end_reason"] = observed_reason
+    else:
+        phases["attach_boundary_source"] = "fd_95pct_estimate"
+        phases["capture_boundary_source"] = "fd_estimate_plus_duration"
+
+    def classify_frame_burst():
+        if burst_go_ns is None or burst_end_ns is None:
+            return
+        outside = False
+        start_safe = False
+        end_safe = False
+        if burst_end_ns <= t_spawn_ns:
+            outside = True
+            method_warnings.append(
+                "BURST PREDATED ATTACH: workload burst ended before "
+                "the observer was spawned")
+        elif t_go_ns is not None and burst_go_ns >= t_go_ns:
+            start_safe = True
+        else:
+            method_warnings.append(
+                "BURST START UNKNOWN: frame receipt is a latest attach "
+                "bound and the workload began before that receipt")
+
+        marker = min(t_loop_markers) if t_loop_markers else None
+        if marker is not None:
+            marker_ns, marker_reason = marker
+            if marker_reason == "target-exit" and owned_target_exit_causal:
+                if burst_end_ns > marker_ns:
+                    method_warnings.append(
+                        "BURST END UNKNOWN: owned target-exit observation "
+                        "contradicts workload ordering")
+                else:
+                    # The truth/BURST log and mapping receipt name the exact
+                    # selected PID generation. That process emits BURST end
+                    # before it can exit, independent of stderr pipe delay.
+                    end_safe = True
+            elif burst_end_ns > marker_ns:
+                outside = True
+                method_warnings.append(
+                    f"BURST OUTLIVED {marker_reason.upper()}: workload burst "
+                    "ended after the externally observed loop-end marker")
+            else:
+                method_warnings.append(
+                    f"BURST END UNKNOWN: delayed {marker_reason} observation "
+                    "does not prove when the loop stopped")
+        elif t_go_ns is not None:
+            latest_expiry = t_go_ns + int(duration_s * 1e9)
+            if burst_end_ns > latest_expiry:
+                outside = True
+                method_warnings.append(
+                    "BURST OUTLIVED WINDOW: workload burst ended after the "
+                    "latest possible duration expiry")
+            else:
+                method_warnings.append(
+                    "capture expiry unknown: delayed frame receipt is not "
+                    "the loop-start timestamp")
+        else:
+            method_warnings.append(
+                "BURST END UNKNOWN: frame gate has no release timestamp")
+
+        if outside:
+            phases["burst_outside_window"] = True
+            phases["burst_window_relation"] = "outside"
+        elif start_safe and end_safe:
+            phases["burst_outside_window"] = False
+            phases["burst_window_relation"] = "inside"
+            phases["capture_proven_lower_bound_s"] = max(
+                0.0, (burst_end_ns - t_go_ns) / 1e9)
+        else:
+            phases["burst_window_relation"] = "unknown"
+
+    if is_frame_gate:
+        classify_frame_burst()
     if not samples:
         method_warnings.append("no sampler rows; only wall time is known")
         return phases, discovery_line
@@ -924,17 +1189,28 @@ def derive_phases(samples, stderr_rows, duration_s, t_spawn_ns, t_exit_ns,
     hi = 0.95 * run_max
     attach_idx = next(i for i, value in enumerate(fds) if value >= hi)
     t_attached = times[attach_idx]
-    phases["t_attached_mono_ns"] = t_attached
+    phases["t_attached_fd_estimate_mono_ns"] = t_attached
     if t_discovery is not None:
         phases["discovery_s"] = max(0.0, (t_discovery - t_spawn_ns) / 1e9)
-        phases["attach_s"] = max(0.0, (t_attached - t_discovery) / 1e9)
+        phases["attach_fd_estimate_s"] = max(
+            0.0, (t_attached - t_discovery) / 1e9)
     t_expiry = t_attached + int(duration_s * 1e9)
-    phases["t_expiry_mono_ns"] = t_expiry
+    phases["t_expiry_fd_estimate_mono_ns"] = t_expiry
+    if not is_frame_gate:
+        phases["t_attached_mono_ns"] = t_attached
+        phases["t_expiry_mono_ns"] = t_expiry
+        phases["attach_s"] = phases["attach_fd_estimate_s"]
     if t_loop_markers:
         t_loop_end, loop_end_reason = min(t_loop_markers)
     else:
         t_loop_end, loop_end_reason = t_expiry, "expiry"
-    phases["t_loop_end_mono_ns"] = t_loop_end
+    if is_frame_gate:
+        if t_loop_markers:
+            phases["t_loop_end_observed_mono_ns"] = t_loop_end
+        else:
+            loop_end_reason = "fd-estimated-expiry"
+    else:
+        phases["t_loop_end_mono_ns"] = t_loop_end
     phases["loop_end_reason"] = loop_end_reason
     if t_loop_markers and t_loop_end < t_attached:
         method_warnings.append(
@@ -946,10 +1222,11 @@ def derive_phases(samples, stderr_rows, duration_s, t_spawn_ns, t_exit_ns,
             f"{(t_expiry - t_exit_ns) / 1e9:.2f}s before estimated expiry "
             "with no target-exit or cancel marker")
         phases["loop_end_reason"] = "unknown-early-exit"
-    else:
+    elif not is_frame_gate:
         phases["capture_measured_s"] = max(
             0.0, (t_loop_end - t_attached) / 1e9)
-    if burst_go_ns is not None and burst_end_ns is not None:
+    if (not is_frame_gate and burst_go_ns is not None
+            and burst_end_ns is not None):
         outside = False
         if burst_go_ns < t_attached:
             method_warnings.append(
@@ -964,6 +1241,7 @@ def derive_phases(samples, stderr_rows, duration_s, t_spawn_ns, t_exit_ns,
                 "capture expiry; calls past expiry are outside the window")
             outside = True
         phases["burst_outside_window"] = outside
+        phases["burst_window_relation"] = "outside" if outside else "inside"
     # First post-loop-end dip below the plateau, sustained over 3 samples.
     detach_start = None
     for i in range(len(samples)):
@@ -1070,6 +1348,11 @@ def build_summary(record):
         f"attach={fmt_seconds(phases['attach_s'])} "
         f"capture={fmt_seconds(phases['capture_measured_s'])} "
         f"(requested {phases['capture_requested_s']}s)",
+        f"  boundaries: attach_source={phases.get('attach_boundary_source')} "
+        f"attach_fd_estimate={fmt_seconds(phases.get('attach_fd_estimate_s'))} "
+        f"capture_source={phases.get('capture_boundary_source')} "
+        f"capture_proven_lower_bound="
+        f"{fmt_seconds(phases.get('capture_proven_lower_bound_s'))}",
         f"  drain={fmt_seconds(phases['drain_s'])} "
         f"detach={fmt_seconds(phases['detach_s'])} "
         f"publish={fmt_seconds(phases['publish_s'])} "
@@ -1193,6 +1476,7 @@ def main(argv):
     truth, truth_prego = parse_truth(args.workload_log)
     workload_lines = Path(args.workload_log).read_text(encoding="utf-8").splitlines()
     burst_go_ns, burst_end_ns = parse_burst(workload_lines)
+    mapped_generation = parse_mapped_generation(workload_lines)
     burst_wall_s = (burst_end_ns - burst_go_ns) / 1e9
 
     stream = None
@@ -1319,6 +1603,9 @@ def main(argv):
         int(meta["timing"]["t_go_mono_ns"]),
         phase_ms=observer_phase_ms,
         burst_go_ns=burst_go_ns, burst_end_ns=burst_end_ns,
+        gate=meta["condition"].get("gate"),
+        owned_target_exit_causal=owned_pid_target_causal(
+            meta["condition"], mapped_generation),
     )
     if missing_counters:
         phases["method_warnings"].append(
@@ -1378,7 +1665,8 @@ def main(argv):
         attached_probes=attached_probes,
         trace_crosscheck=crosscheck_holds,
         coverage_detail=window_coverage_detail,
-        observer_outcome=observer_outcome)
+        observer_outcome=observer_outcome,
+        burst_window_relation=phases["burst_window_relation"])
 
     # Task 3.1 repair: scheduling consistency + which-bound-broke
     # attribution + the cancel control-latency probe. A missing scheduling

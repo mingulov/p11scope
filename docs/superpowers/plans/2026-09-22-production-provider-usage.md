@@ -149,6 +149,15 @@ two sharers; pathname replacement; delayed callbacks; closed-schema/canary
 mutations; real browser and multi-tenant provider workloads with independent
 physical receipts. Missing supported exercised providers fail acceptance.
 
+Include immediate load → single use → unload without an observer attachment
+gate. Test both an already covered physical object and a never-seen object.
+Waiting for attachment before releasing the workload only qualifies calls
+inside that controlled window; it cannot establish first-use coverage for
+arbitrary new objects. Retained file probes help future mappers of known
+objects. Never reconstruct a missed execution fact from a later mapping or
+publication. Unseen-object gaps must remain explicit; a lower-bound report
+alone does not complete the user's all-used-provider requirement.
+
 ### D: Scale the detailed modes without changing their meanings
 
 Compare actual dense/sparse memory and update costs including possible CPUs,

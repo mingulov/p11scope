@@ -77,6 +77,17 @@ Artifacts are in `browser-vm/artifacts/browser-system-baseline/` and
 `browser-vm/artifacts/system-baseline-driver.json` under the evidence directory.
 This is a functional admission experiment, not a timing benchmark.
 
+A subsequent diagnostic capture narrowed to that NSS module and repeated five
+client-certificate connections. It observed 40 calls in the exact softokn
+object, including five successful `C_SignInit` and five successful `C_Sign`
+returns, with no refusal or ring loss. The physical identity was device 0:32,
+inode 36821, SHA256
+`b0bf515e5d14f5c03c381457c8273d9ec847a42445d6378a31c328a555f716fc`.
+This confirms exercised provider endpoints in the control; the module filter
+is a diagnostic, not a solution for unrestricted system admission. Artifacts:
+`browser-vm/artifacts/browser-softokn-control/` and
+`browser-vm/artifacts/softokn-control-driver.json`.
+
 ## Independent reviews and cross-checks
 
 An Astra Max source review covered discovery/admission, lifecycle, event

@@ -9714,7 +9714,7 @@ fn license_expected_header(path: &str) -> Option<&'static str> {
         return Some("/* SPDX-License-Identifier: GPL-3.0-or-later */");
     }
     if path.ends_with(".rs") {
-        if path == "crates/ebpf/src/main.rs" {
+        if path.starts_with("crates/ebpf/src/") {
             return Some("//! SPDX-License-Identifier: GPL-2.0-only");
         }
         return Some("//! SPDX-License-Identifier: GPL-3.0-or-later");

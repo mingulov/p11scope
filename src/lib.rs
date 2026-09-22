@@ -38,8 +38,8 @@ pub static EBPF_OBJECT: &[u8] =
 pub static EBPF_INVENTORY_OBJECT: &[u8] =
     aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/p11scope-ebpf-inventory"));
 
-/// Caller/object Inventory producer. This object has no preparation or
-/// activation capability until its separate loader contract is implemented.
+/// Caller/object Inventory producer for private caller preparation and static
+/// activation. Public caller selection and query remain separate contracts.
 pub static EBPF_INVENTORY_CALLERS_OBJECT: &[u8] =
     aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/p11scope-ebpf-inventory-callers"));
 

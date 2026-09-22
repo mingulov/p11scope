@@ -2,7 +2,7 @@
 //! Private static Inventory activation: entry-only Singles with retained pins,
 //! discovery transport and monotonic positive evidence. No caller/count claim.
 
-use super::{AttachBackend, InventoryBudget, PreparedInventory, Scope};
+use super::{AttachBackend, InventoryBudget, InventoryFlavor, PreparedInventory, Scope, callers};
 use crate::discovery::identity::{PinnedObjectId, PinnedObjects, RetainedInventoryTarget};
 use crate::events::{DiscoveryItem, OwnedDiscoveryDrain};
 use crate::plan::{AdmissionPolicy, AttachPlan};
@@ -139,6 +139,7 @@ enum InventoryAttachRequest<'a> {
 
 trait InventoryLinkIo {
     type Link;
+    fn publish_endpoint(&mut self, endpoint: u32, object: PinnedObjectId) -> Result<()>;
     fn attach(&mut self, request: InventoryAttachRequest<'_>) -> Result<Self::Link>;
     fn detach(&mut self, link: &mut Self::Link) -> Result<()>;
     fn attachment_error(&self, _link: &Self::Link) -> Option<String> {
@@ -204,6 +205,10 @@ fn attach_inventory_with<I: InventoryLinkIo>(
                 u64::from(entry.id) < targets.budget.endpoint_limit(),
                 "Inventory endpoint ID exceeds N"
             );
+        }
+        for entry in &targets.entries {
+            io.publish_endpoint(entry.id, entry.object)
+                .with_context(|| format!("publishing Inventory endpoint {}", entry.id))?;
         }
         for program in ["sched_process_exec", "sched_process_exit"] {
             let handle = io
@@ -395,12 +400,21 @@ enum KernelInventoryLink {
 
 struct AyaInventoryLinkIo<'a> {
     ebpf: &'a mut Ebpf,
+    caller: bool,
     #[cfg(test)]
     before_attach: &'a mut dyn FnMut(&InventoryAttachRequest<'_>) -> Result<()>,
 }
 
 impl InventoryLinkIo for AyaInventoryLinkIo<'_> {
     type Link = KernelInventoryLink;
+
+    fn publish_endpoint(&mut self, endpoint: u32, object: PinnedObjectId) -> Result<()> {
+        if self.caller {
+            callers::publish_caller_endpoint_with(self.ebpf, endpoint, object)
+        } else {
+            Ok(())
+        }
+    }
 
     fn attach(&mut self, request: InventoryAttachRequest<'_>) -> Result<Self::Link> {
         #[cfg(test)]
@@ -626,7 +640,11 @@ impl InventoryState {
         window: InventoryReadWindow,
         retired: bool,
     ) -> InventoryUsageSnapshot {
-        let health = read_inventory_health(&self.prepared.ebpf, window.deadline);
+        let health = read_inventory_health_flavor(
+            &self.prepared.ebpf,
+            window.deadline,
+            self.prepared.flavor,
+        );
         self.health_read_failures = self
             .health_read_failures
             .saturating_add(health.failures.len() as u64);
@@ -978,6 +996,7 @@ impl PreparedInventory {
         }
         let mut io = AyaInventoryLinkIo {
             ebpf: &mut state.prepared.ebpf,
+            caller: matches!(state.prepared.flavor, InventoryFlavor::Callers(_)),
             #[cfg(test)]
             before_attach: &mut before_attach,
         };
@@ -1027,6 +1046,8 @@ struct InventoryHealthSnapshot {
     evidence: Option<[u64; 9]>,
     usage_evidence: Option<[u64; 3]>,
     owner: Option<ThreadOwnerControl>,
+    caller_evidence: Option<[u64; 4]>,
+    caller_control: Option<p11scope_ebpf_common::ImageIdentityControl>,
     failures: Vec<String>,
 }
 
@@ -1047,6 +1068,14 @@ struct InventoryUsageSnapshot {
 }
 
 fn read_inventory_health(ebpf: &Ebpf, deadline: Instant) -> InventoryHealthSnapshot {
+    read_inventory_health_flavor(ebpf, deadline, InventoryFlavor::Global)
+}
+
+fn read_inventory_health_flavor(
+    ebpf: &Ebpf,
+    deadline: Instant,
+    flavor: InventoryFlavor,
+) -> InventoryHealthSnapshot {
     fn per_cpu<const N: usize>(ebpf: &Ebpf, name: &str, deadline: Instant) -> Result<[u64; N]> {
         let map: PerCpuArray<_, u64> =
             PerCpuArray::try_from(ebpf.map(name).with_context(|| format!("{name} map"))?)?;
@@ -1092,6 +1121,13 @@ fn read_inventory_health(ebpf: &Ebpf, deadline: Instant) -> InventoryHealthSnaps
         })(),
         &mut health.failures,
     );
+    if matches!(flavor, InventoryFlavor::Callers(_)) {
+        let mut caller_io = ebpf;
+        let caller = callers::read_caller_health_with(&mut caller_io, deadline);
+        health.caller_evidence = caller.evidence;
+        health.caller_control = caller.control;
+        health.failures.extend(caller.failures);
+    }
     health
 }
 

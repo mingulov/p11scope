@@ -1,6 +1,8 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Root-owned gates; run explicitly with --ignored --test-threads=1.
 use super::*;
+use crate::capacity::CallerBudget;
+use crate::discovery::identity::PinnedObjectId;
 use aya::programs::{ProgramError, loaded_links};
 use aya_obj::generated::bpf_cmd;
 use std::collections::BTreeSet;
@@ -77,6 +79,21 @@ impl OwnedIds {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    fn still_registered(&self) -> Result<Self> {
+        let mut live = Self::default();
+        for id in &self.maps {
+            if id_exists(bpf_cmd::BPF_MAP_GET_NEXT_ID, *id)? {
+                live.maps.insert(*id);
+            }
+        }
+        for id in &self.programs {
+            if id_exists(bpf_cmd::BPF_PROG_GET_NEXT_ID, *id)? {
+                live.programs.insert(*id);
+            }
+        }
+        Ok(live)
     }
 }
 
@@ -371,6 +388,161 @@ fn privileged_inventory_preparation_failure_releases_owned_resources() -> Result
         let ids = inspect_prepared(&prepared)?;
         drop(prepared);
         ids.wait_for_release(Some(before))?;
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "root-owned BPF lane; exact caller map/freeze and private ENDPOINT_OBJECT publication"]
+fn privileged_inventory_caller_preparation_freezes_native_maps_and_publishes_binding() -> Result<()>
+{
+    use p11scope_ebpf_common::ImageIdentity;
+    use p11scope_ebpf_common::inventory_callers::{
+        CallerObjectKey, CallerObjectUse, EndpointObject,
+    };
+    let endpoint = budget(3);
+    let caller = CallerBudget::new(endpoint, 5, 304).map_err(anyhow::Error::msg)?;
+    let prepared = PreparedInventory::prepare_callers(
+        Scope::System,
+        endpoint,
+        caller,
+        AttachBackend::Singles,
+    )?;
+    callers::validate_runtime_caller_maps(&prepared.ebpf, caller)?;
+    validate_runtime_inventory_programs(&prepared.ebpf)?;
+    let mut ids = OwnedIds::default();
+    ids.observe(&prepared.ebpf)?;
+    anyhow::ensure!(ids.maps.len() == 18 && ids.programs.len() == 12);
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, std::process::id(), 0) };
+    anyhow::ensure!(
+        pidfd >= 0,
+        "pidfd_open: {}",
+        std::io::Error::last_os_error()
+    );
+    let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd as i32) };
+    let task_key = pidfd.as_raw_fd() as u32;
+    let key = CallerObjectKey {
+        image: ImageIdentity {
+            task_cookie: 1,
+            exec_id: 0,
+        },
+        object_id: 0,
+        reserved: 0,
+    };
+    let positive = CallerObjectUse {
+        host_tgid: std::process::id(),
+        witness_endpoint: 0,
+        flags: 1,
+        ..CallerObjectUse::default()
+    };
+    for name in ["TASK_COOKIE", "COOKIE_CTL", "CALLER_USE"] {
+        let map = inventory_map_data(name, prepared.ebpf.map(name).context(name)?)?.1;
+        let result = match name {
+            "TASK_COOKIE" => map_element(bpf_cmd::BPF_MAP_UPDATE_ELEM, map, &task_key, Some(&1u64)),
+            "COOKIE_CTL" => map_element(
+                bpf_cmd::BPF_MAP_UPDATE_ELEM,
+                map,
+                &0u32,
+                Some(&ImageIdentityControl {
+                    limit: IMAGE_IDENTITY_TICKET_LIMIT,
+                    ..Default::default()
+                }),
+            ),
+            "CALLER_USE" => map_element(bpf_cmd::BPF_MAP_UPDATE_ELEM, map, &key, Some(&positive)),
+            _ => unreachable!(),
+        };
+        anyhow::ensure!(
+            result.as_ref().err().and_then(std::io::Error::raw_os_error) == Some(libc::EPERM),
+            "{name} userspace write was not frozen: {result:?}"
+        );
+    }
+    let mut prepared = prepared;
+    callers::publish_caller_endpoint_with(&mut prepared.ebpf, 0, PinnedObjectId(0))?;
+    let map: Array<_, EndpointObject> = Array::try_from(
+        prepared
+            .ebpf
+            .map("ENDPOINT_OBJECT")
+            .context("ENDPOINT_OBJECT")?,
+    )?;
+    anyhow::ensure!(
+        map.get(&0, 0)?
+            == EndpointObject {
+                object_id: 0,
+                class: 1
+            }
+    );
+    anyhow::ensure!(
+        callers::publish_caller_endpoint_with(&mut prepared.ebpf, 0, PinnedObjectId(0)).is_err(),
+        "committed physical binding was rewritten"
+    );
+    let control: Array<_, ImageIdentityControl> =
+        Array::try_from(prepared.ebpf.map("COOKIE_CTL").context("COOKIE_CTL")?)?;
+    callers::validate_caller_control(control.get(&0, 0)?)?;
+    ids.assert_no_links()?;
+    eprintln!("I2C_CALLER_PREP_IDS phase=held step=Prepared ids={ids:?} links={{}}");
+    eprintln!(
+        "I2C_CALLER_PREPARED maps={} programs={} frozen=TASK_COOKIE,COOKIE_CTL,CALLER_USE endpoint0=object0",
+        ids.maps.len(),
+        ids.programs.len()
+    );
+    drop(prepared);
+    ids.wait_for_release(None)?;
+    eprintln!(
+        "I2C_CALLER_PREP_IDS phase=released step=Prepared ids={:?} links={{}}",
+        ids.still_registered()?
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "root-owned BPF lane; each caller native preparation fault retains source and releases IDs"]
+fn privileged_inventory_caller_preparation_faults_release_exact_resources() -> Result<()> {
+    let endpoint = budget(3);
+    let caller = CallerBudget::new(endpoint, 5, 304).map_err(anyhow::Error::msg)?;
+    for failed in [
+        InventoryPreparation::WriteCallerControl,
+        InventoryPreparation::ReadCallerControl,
+        InventoryPreparation::Freeze("TASK_COOKIE"),
+        InventoryPreparation::Freeze("COOKIE_CTL"),
+        InventoryPreparation::Freeze("CALLER_USE"),
+    ] {
+        let before = fd_count();
+        let mut ids = OwnedIds::default();
+        let error = PreparedInventory::prepare_inner_flavor(
+            Scope::System,
+            endpoint,
+            AttachBackend::Singles,
+            InventoryFlavor::Callers(caller),
+            |state, step| {
+                ids.observe(state.ebpf()?)?;
+                if step == failed {
+                    anyhow::ensure!(ids.maps.len() == 18 && ids.programs.is_empty());
+                    ids.assert_no_links()?;
+                    eprintln!(
+                        "I2C_CALLER_PREP_IDS phase=held step={failed:?} ids={ids:?} links={{}}"
+                    );
+                    bail!("owned caller fault at {failed:?}");
+                }
+                Ok(())
+            },
+        )
+        .err()
+        .context("caller fault was skipped")?;
+        anyhow::ensure!(
+            format!("{error:#}").contains("owned caller fault"),
+            "{error:#}"
+        );
+        ids.assert_no_links()?;
+        ids.wait_for_release(Some(before))?;
+        eprintln!(
+            "I2C_CALLER_PREP_IDS phase=released step={failed:?} ids={:?} links={{}}",
+            ids.still_registered()?
+        );
+        eprintln!(
+            "I2C_CALLER_PREP_FAULT step={failed:?} maps={} programs={}",
+            ids.maps.len(),
+            ids.programs.len()
+        );
     }
     Ok(())
 }

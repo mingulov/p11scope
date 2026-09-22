@@ -146,6 +146,10 @@ struct LinkIo {
 impl InventoryLinkIo for LinkIo {
     type Link = TestLink;
 
+    fn publish_endpoint(&mut self, _endpoint: u32, _object: PinnedObjectId) -> Result<()> {
+        Ok(())
+    }
+
     fn attach(&mut self, request: InventoryAttachRequest<'_>) -> anyhow::Result<Self::Link> {
         let request = match request {
             InventoryAttachRequest::Lifecycle {
@@ -203,6 +207,159 @@ impl InventoryLinkIo for LinkIo {
     fn attachment_error(&self, link: &Self::Link) -> Option<String> {
         (self.fail_custody == Some(link.ordinal)).then(|| "post-acquisition custody failure".into())
     }
+}
+
+/// Replaces only the map-publication/link IO boundary. The real attach
+/// transaction must order all bindings before even its lifecycle producers.
+#[derive(Default)]
+struct CallerLinkIo {
+    inner: LinkIo,
+    committed: Vec<(u32, PinnedObjectId)>,
+    publication_failure: Option<u32>,
+    published_at_first_attach: Option<usize>,
+}
+
+impl InventoryLinkIo for CallerLinkIo {
+    type Link = TestLink;
+
+    fn publish_endpoint(&mut self, endpoint: u32, object: PinnedObjectId) -> Result<()> {
+        if self.publication_failure == Some(endpoint) {
+            bail!("owned endpoint {endpoint} publication/readback failure");
+        }
+        self.committed.push((endpoint, object));
+        Ok(())
+    }
+
+    fn attach(&mut self, request: InventoryAttachRequest<'_>) -> Result<Self::Link> {
+        self.published_at_first_attach
+            .get_or_insert(self.committed.len());
+        self.inner.attach(request)
+    }
+
+    fn detach(&mut self, link: &mut Self::Link) -> Result<()> {
+        self.inner.detach(link)
+    }
+
+    fn attachment_error(&self, link: &Self::Link) -> Option<String> {
+        self.inner.attachment_error(link)
+    }
+}
+
+#[test]
+fn caller_activation_publishes_all_physical_bindings_before_first_lifecycle_producer() {
+    let fixture = Fixture::new();
+    assert_eq!(
+        fixture.object,
+        PinnedObjectId(0),
+        "object zero is a valid physical owner"
+    );
+    let targets = fixture.targets(2, 3);
+    let mut io = CallerLinkIo::default();
+    let links = attach_inventory_with(&mut io, &targets).unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(
+        io.committed,
+        [(0, PinnedObjectId(0)), (1, PinnedObjectId(0))],
+        "caller endpoint bindings were not published"
+    );
+    assert_eq!(
+        io.published_at_first_attach,
+        Some(2),
+        "a producer preceded endpoint publication"
+    );
+    assert_eq!(links.len(), 4);
+    drop(links);
+    assert!(io.inner.state.lock().unwrap().live.is_empty());
+}
+
+#[test]
+fn caller_activation_publication_failure_keeps_prior_binding_and_attaches_nothing() {
+    let fixture = Fixture::new();
+    let targets = fixture.targets(2, 3);
+    let mut io = CallerLinkIo {
+        publication_failure: Some(1),
+        ..Default::default()
+    };
+    let failure = attach_inventory_with(&mut io, &targets)
+        .err()
+        .expect("caller publication failure must prevent every producer");
+    assert!(
+        format!("{:#}", failure.error).contains("owned endpoint 1 publication/readback failure")
+    );
+    assert_eq!(io.committed, [(0, fixture.object)]);
+    assert!(failure.links.is_empty());
+    assert_eq!(io.published_at_first_attach, None);
+    assert!(io.inner.state.lock().unwrap().requests.is_empty());
+    assert_eq!(targets.allocated, [0, 1], "failed IDs stay allocated");
+}
+
+#[test]
+fn caller_activation_later_attach_failure_keeps_bindings_and_existing_retirement_custody() {
+    let fixture = Fixture::new();
+    let targets = fixture.targets(2, 3);
+    let mut io = CallerLinkIo {
+        inner: LinkIo {
+            fail_attach: Some(3),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let failure = attach_inventory_with(&mut io, &targets)
+        .err()
+        .expect("injected entry attach failure");
+    assert_eq!(io.committed, [(0, fixture.object), (1, fixture.object)]);
+    assert_eq!(io.published_at_first_attach, Some(2));
+    assert_eq!(targets.allocated, [0, 1]);
+    assert_eq!(
+        failure.links.len(),
+        3,
+        "all acquired handles stay owned by the failure"
+    );
+    let failure = finish_failed_transaction(&io.inner, failure);
+    assert!(format!("{:#}", failure.error).contains("original attach failure 3"));
+    assert_eq!(failure.cleanup.closed, 3);
+    assert!(failure.links.is_empty());
+    assert_eq!(
+        io.committed,
+        [(0, fixture.object), (1, fixture.object)],
+        "retirement must not clear metadata"
+    );
+    assert!(io.inner.state.lock().unwrap().live.is_empty());
+}
+
+#[test]
+fn caller_activation_leaves_inactive_id_allocated_without_publishing_or_reusing_it() {
+    let fixture = Fixture::new();
+    let mut plan = fixture.plan(3, 3);
+    plan.deactivate(1);
+    let targets = InventoryTargets::from_plan(&plan, &fixture.pins).unwrap();
+    let mut io = CallerLinkIo::default();
+    let links = attach_inventory_with(&mut io, &targets).unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(targets.allocated, [0, 1, 2]);
+    assert_eq!(io.committed, [(0, fixture.object), (2, fixture.object)]);
+    assert_eq!(io.published_at_first_attach, Some(2));
+    assert_eq!(links.len(), 4);
+    drop(links);
+    assert!(io.inner.state.lock().unwrap().live.is_empty());
+}
+
+#[test]
+fn caller_activation_changed_pin_prevents_publication_and_attachment() {
+    let fixture = Fixture::new();
+    let targets = fixture.targets(2, 3);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&fixture.path)
+        .unwrap()
+        .write_all(&[0])
+        .unwrap();
+    let mut io = CallerLinkIo::default();
+    let failure = attach_inventory_with(&mut io, &targets)
+        .err()
+        .expect("changed pin was accepted");
+    assert!(format!("{:#}", failure.error).contains("changed"));
+    assert!(io.committed.is_empty());
+    assert!(failure.links.is_empty());
+    assert!(io.inner.state.lock().unwrap().requests.is_empty());
 }
 
 fn finish_failed_transaction(
@@ -578,6 +735,10 @@ struct HeldCloseIo {
 
 impl InventoryLinkIo for HeldCloseIo {
     type Link = u32;
+
+    fn publish_endpoint(&mut self, _endpoint: u32, _object: PinnedObjectId) -> Result<()> {
+        bail!("retirement regression must not publish endpoints")
+    }
 
     fn attach(&mut self, _request: InventoryAttachRequest<'_>) -> Result<Self::Link> {
         bail!("retirement regression must not attach")

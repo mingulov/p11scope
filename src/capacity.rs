@@ -80,6 +80,64 @@ impl InventoryBudget {
     }
 }
 
+/// Explicit additional endpoint metadata and sparse caller-pair payload.
+/// This private budget has no implicit pair capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CallerBudget {
+    endpoint_budget: InventoryBudget,
+    pair_limit: u64,
+    additional_payload_bytes: u64,
+}
+
+impl CallerBudget {
+    // The private constructor becomes a production call site when caller
+    // activation is selected; the current public CLI remains global-only.
+    #[allow(dead_code)]
+    pub(crate) fn new(
+        endpoint_budget: InventoryBudget,
+        pair_limit: u64,
+        additional_payload_bytes: u64,
+    ) -> Result<Self, String> {
+        if pair_limit == 0 || pair_limit > u64::from(u32::MAX) {
+            return Err(format!(
+                "caller pair limit {pair_limit} must fit the non-zero u32 map capacity"
+            ));
+        }
+        let required = endpoint_budget
+            .endpoint_limit()
+            .checked_mul(8)
+            .and_then(|endpoints| {
+                pair_limit
+                    .checked_mul(56)
+                    .and_then(|pairs| endpoints.checked_add(pairs))
+            })
+            .ok_or_else(|| "caller additional payload budget overflowed".to_string())?;
+        if additional_payload_bytes != required {
+            return Err(format!(
+                "caller additional payload is {additional_payload_bytes} bytes, expected {required} bytes"
+            ));
+        }
+        Ok(Self {
+            endpoint_budget,
+            pair_limit,
+            additional_payload_bytes,
+        })
+    }
+
+    pub(crate) const fn endpoint_budget(self) -> InventoryBudget {
+        self.endpoint_budget
+    }
+
+    pub(crate) const fn pair_limit(self) -> u64 {
+        self.pair_limit
+    }
+
+    #[allow(dead_code)]
+    pub(crate) const fn additional_payload_bytes(self) -> u64 {
+        self.additional_payload_bytes
+    }
+}
+
 /// One row of the capacity inventory: the enforced limit and the source that
 /// reports live occupancy or loss for it.
 pub struct ResourceEntry {

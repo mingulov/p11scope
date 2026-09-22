@@ -1,11 +1,14 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Owned, ignored live gates. The parent runs these serially with its BPF lane.
 use super::*;
+use crate::capacity::CallerBudget;
 use crate::discovery::identity::pin_scanned_view_objects;
 use crate::discovery::scan::{CaptureWorkBudget, ScannedModule};
 use crate::plan::Slot;
 use crate::process::{ProcessView, ProcessViewId};
+use aya::maps::HashMap;
 use aya_obj::generated::{bpf_cmd, bpf_link_info, bpf_link_type, bpf_perf_event_type};
+use p11scope_ebpf_common::inventory_callers::{CallerObjectKey, CallerObjectUse, EndpointObject};
 use p11scope_ebpf_common::{DISCOVERY_KIND_EXEC, DISCOVERY_KIND_LEADER_EXIT, SlotSemantics};
 use p11scope_manifest::elf::ElfSnapshot;
 use p11scope_manifest::identity::{inspect_file, mapping_file_key, open_object};
@@ -18,6 +21,9 @@ use std::time::Duration;
 
 fn budget() -> InventoryBudget {
     InventoryBudget::new(576, 4608).unwrap()
+}
+fn caller_budget(pairs: u64) -> CallerBudget {
+    CallerBudget::new(budget(), pairs, 4608 + 56 * pairs).unwrap()
 }
 fn window() -> InventoryReadWindow {
     InventoryReadWindow::new(576, Instant::now() + Duration::from_secs(3)).unwrap()
@@ -39,7 +45,15 @@ impl OwnedFixture {
         let source = directory.path().join("owned.c");
         let path = directory.path().join("owned-provider");
         let mut c = String::from(
-            "#include <stdio.h>\n#include <stdint.h>\n#include <unistd.h>\nstatic unsigned hold_id = 999;\nstatic void hold_in_body(unsigned id) { if (hold_id != id) return; hold_id = 999; printf(\"BODY %u\\n\", id); unsigned resume; if (scanf(\"%u\", &resume) != 1 || resume != 997) _exit(4); printf(\"RESUMED %u\\n\", id); }\n",
+            r#"#include <stdio.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <string.h>
+#include <pthread.h>
+#include <sys/syscall.h>
+static unsigned hold_id = 999;
+static void hold_in_body(unsigned id) { if (hold_id != id) return; hold_id = 999; printf("BODY %u\n", id); char resume[16]; if (scanf("%15s", resume) != 1 || strcmp(resume, "RESUME")) _exit(4); printf("RESUMED %u\n", id); }
+"#,
         );
         for id in 0..576 {
             c.push_str(&format!("__attribute__((noinline,used)) unsigned long owned_{id}(unsigned long x) {{ __asm__ volatile(\"\" ::: \"memory\"); hold_in_body({id}); return x + {id}; }}\n"));
@@ -50,10 +64,57 @@ impl OwnedFixture {
         for id in 0..576 {
             c.push_str(&format!("owned_{id},\n"));
         }
-        c.push_str("};\nint main(void) { setvbuf(stdout, NULL, _IONBF, 0); printf(\"READY %ld\\n\", (long)getpid()); unsigned id, calls; while (scanf(\"%u %u\", &id, &calls) == 2) { if (id == 999) return 0; if (id == 998 && calls < 576) { hold_id = calls; printf(\"ARMED %u\\n\", hold_id); continue; } if (id >= 576 || calls > 1000000) return 2; printf(\"START %u %u\\n\", id, calls); unsigned long sum = 0; for (unsigned n = 0; n < calls; n++) sum += functions[id](n); printf(\"DONE %u %u %lu\\n\", id, calls, sum); } return 3; }\n");
+        c.push_str(
+            r#"};
+struct thread_work { unsigned id, calls; unsigned long sum; unsigned tid; };
+static void *thread_call(void *data) {
+    struct thread_work *work = data;
+    work->tid = (unsigned)syscall(SYS_gettid);
+    for (unsigned n = 0; n < work->calls; n++) work->sum += functions[work->id](n);
+    return NULL;
+}
+int main(int argc, char **argv) {
+    if (argc != 1) return 2;
+    setvbuf(stdout, NULL, _IONBF, 0);
+    printf("READY %ld\n", (long)getpid());
+    char command[16]; unsigned id, calls;
+    while (scanf("%15s", command) == 1) {
+        if (!strcmp(command, "EXIT")) return 0;
+        if (!strcmp(command, "EXEC")) { execv(argv[0], argv); return 5; }
+        if (!strcmp(command, "ARM")) {
+            if (scanf("%u", &id) != 1 || id >= 576) return 2;
+            hold_id = id; printf("ARMED %u\n", id); continue;
+        }
+        int thread = !strcmp(command, "THREAD");
+        if (!thread && strcmp(command, "CALL")) return 2;
+        if (scanf("%u %u", &id, &calls) != 2 || id >= 576 || calls > 1000000) return 2;
+        if (thread) {
+            struct thread_work work = {id, calls, 0, 0}; pthread_t worker;
+            printf("THREAD_START %u %u\n", id, calls);
+            if (pthread_create(&worker, NULL, thread_call, &work)) return 6;
+            if (pthread_join(worker, NULL)) return 7;
+            printf("THREAD_DONE %u %u %lu %u\n", id, calls, work.sum, work.tid);
+        } else {
+            printf("START %u %u\n", id, calls);
+            unsigned long sum = 0;
+            for (unsigned n = 0; n < calls; n++) sum += functions[id](n);
+            printf("DONE %u %u %lu\n", id, calls, sum);
+        }
+    }
+    return 3;
+}
+"#,
+        );
         std::fs::write(&source, c)?;
         let mut compiler = Command::new("cc");
-        compiler.args(["-O0", "-fno-inline", "-fno-pie", "-no-pie", "-rdynamic"]);
+        compiler.args([
+            "-O0",
+            "-fno-inline",
+            "-fno-pie",
+            "-no-pie",
+            "-rdynamic",
+            "-pthread",
+        ]);
         if ia32 {
             compiler.arg("-m32");
         }
@@ -245,8 +306,36 @@ impl OwnedCaller {
         self.finish_calls(id, calls)
     }
 
+    fn thread_calls(&mut self, id: u32, calls: u32) -> Result<u32> {
+        writeln!(self.input, "THREAD {id} {calls}")?;
+        self.input.flush()?;
+        ensure!(self.line()? == format!("THREAD_START {id} {calls}"));
+        let sum = u64::from(calls) * u64::from(id)
+            + u64::from(calls) * u64::from(calls.saturating_sub(1)) / 2;
+        let receipt = self.line()?;
+        let prefix = format!("THREAD_DONE {id} {calls} {sum} ");
+        let tid: u32 = receipt
+            .strip_prefix(&prefix)
+            .context("owned thread receipt mismatch")?
+            .parse()?;
+        ensure!(
+            tid != 0 && tid != self.child.id(),
+            "owned worker was not a physical nonleader thread"
+        );
+        eprintln!("OWNED_THREAD pid={} tid={tid} {receipt}", self.child.id());
+        Ok(tid)
+    }
+
+    fn exec_self(&mut self) -> Result<()> {
+        writeln!(self.input, "EXEC")?;
+        self.input.flush()?;
+        ensure!(self.line()? == format!("READY {}", self.child.id()));
+        eprintln!("OWNED_EXEC pid={}", self.child.id());
+        Ok(())
+    }
+
     fn start_calls(&mut self, id: u32, calls: u32) -> Result<()> {
-        writeln!(self.input, "{id} {calls}")?;
+        writeln!(self.input, "CALL {id} {calls}")?;
         self.input.flush()?;
         ensure!(self.line()? == format!("START {id} {calls}"));
         Ok(())
@@ -254,7 +343,7 @@ impl OwnedCaller {
 
     fn hold_call_in_body(&mut self, id: u32, calls: u32) -> Result<()> {
         ensure!(calls != 0);
-        writeln!(self.input, "998 {id}")?;
+        writeln!(self.input, "ARM {id}")?;
         self.input.flush()?;
         ensure!(self.line()? == format!("ARMED {id}"));
         self.start_calls(id, calls)?;
@@ -280,7 +369,7 @@ impl OwnedCaller {
     }
 
     fn resume_body(&mut self, id: u32) -> Result<()> {
-        writeln!(self.input, "997")?;
+        writeln!(self.input, "RESUME")?;
         self.input.flush()?;
         ensure!(self.line()? == format!("RESUMED {id}"));
         Ok(())
@@ -299,7 +388,7 @@ impl OwnedCaller {
     }
 
     fn finish(&mut self) -> Result<()> {
-        writeln!(self.input, "999 0")?;
+        writeln!(self.input, "EXIT")?;
         self.input.flush()?;
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
@@ -360,7 +449,12 @@ impl OwnedIds {
             ensure!(id_exists(bpf_cmd::BPF_PROG_GET_NEXT_ID, id)?);
             ids.programs.insert(id);
         }
-        ensure!(ids.maps.len() == 13 && ids.programs.len() == 12);
+        let expected_maps = if matches!(prepared.flavor, InventoryFlavor::Callers(_)) {
+            18
+        } else {
+            13
+        };
+        ensure!(ids.maps.len() == expected_maps && ids.programs.len() == 12);
         Ok(ids)
     }
 
@@ -703,6 +797,81 @@ fn assert_non_loss_health(snapshot: &InventoryUsageSnapshot) -> Result<()> {
     Ok(())
 }
 
+fn caller_rows(
+    ebpf: &Ebpf,
+    expected_object: PinnedObjectId,
+) -> Result<Vec<(CallerObjectKey, CallerObjectUse)>> {
+    let map: HashMap<_, CallerObjectKey, CallerObjectUse> =
+        HashMap::try_from(ebpf.map("CALLER_USE").context("CALLER_USE map")?)?;
+    let endpoints: Array<_, EndpointObject> =
+        Array::try_from(ebpf.map("ENDPOINT_OBJECT").context("ENDPOINT_OBJECT map")?)?;
+    let rows = map.iter().collect::<Result<Vec<_>, _>>()?;
+    for (key, value) in &rows {
+        ensure!(
+            key.is_valid() && key.object_id == expected_object.0,
+            "foreign or malformed caller key {key:?}"
+        );
+        ensure!(value.is_valid(576), "malformed caller witness {value:?}");
+        let binding = endpoints.get(&value.witness_endpoint, 0)?;
+        ensure!(
+            binding.committed_object_id() == Some(key.object_id),
+            "witness lacks physical binding"
+        );
+    }
+    Ok(rows)
+}
+
+fn caller_pair_set(
+    ebpf: &Ebpf,
+    expected_object: PinnedObjectId,
+) -> Result<Vec<(CallerObjectKey, CallerObjectUse)>> {
+    let mut rows = caller_rows(ebpf, expected_object)?;
+    rows.sort_by_key(|(key, _)| {
+        (
+            key.image.task_cookie,
+            key.image.exec_id,
+            key.object_id,
+            key.reserved,
+        )
+    });
+    Ok(rows)
+}
+
+fn caller_usage(ebpf: &Ebpf, endpoint: u32) -> Result<u64> {
+    let map: Array<_, u64> = Array::try_from(ebpf.map("USAGE").context("USAGE map")?)?;
+    Ok(map.get(&endpoint, 0)?)
+}
+
+fn assert_retained_pin(targets: &InventoryTargets, object: PinnedObjectId) -> Result<()> {
+    let target = targets
+        .pins
+        .get(&object)
+        .context("retained physical target")?;
+    ensure!(target.check_unchanged().map_err(anyhow::Error::msg)?);
+    ensure!(
+        std::fs::metadata(target.attach_path()).is_ok(),
+        "retained physical target descriptor closed"
+    );
+    Ok(())
+}
+
+fn assert_caller_health(snapshot: &InventoryUsageSnapshot, evidence: [u64; 4]) -> Result<()> {
+    assert_non_loss_health(snapshot)?;
+    ensure!(
+        snapshot.health.caller_evidence == Some(evidence),
+        "caller evidence {snapshot:?}"
+    );
+    let control = snapshot
+        .health
+        .caller_control
+        .context("caller native control is unknown")?;
+    ensure!(
+        control.limit == 16_384 && control.next_ticket > 0,
+        "caller native control {control:?}"
+    );
+    Ok(())
+}
+
 fn await_lifecycle(active: &mut ActiveInventory, pid: u32, kind: u8) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(3);
     for _ in 0..4096 {
@@ -912,6 +1081,42 @@ fn owned_inventory_fixture_holds_entered_call_until_resume_and_reaps_held_child(
 }
 
 #[test]
+fn owned_inventory_fixture_text_protocol_threads_and_same_pid_exec_have_bounded_receipts()
+-> Result<()> {
+    let fixture = OwnedFixture::build(false)?;
+    let mut caller = fixture.spawn()?;
+    let pid = caller.child.id();
+    caller.calls(0, 2)?;
+    let first_tid = caller.thread_calls(575, 3)?;
+    let second_tid = caller.thread_calls(575, 2)?;
+    ensure!(
+        first_tid != 0
+            && second_tid != 0
+            && first_tid != second_tid
+            && first_tid != pid
+            && second_tid != pid,
+        "fixture did not prove two distinct nonleader physical threads"
+    );
+    caller.exec_self()?;
+    ensure!(caller.child.id() == pid, "exec changed owned PID");
+    caller.calls(575, 5)?;
+    caller.finish()
+}
+
+#[test]
+fn owned_inventory_fixture_ia32_thread_and_exec_receipts_are_physical() -> Result<()> {
+    let fixture = OwnedFixture::build(true)?;
+    let mut caller = fixture.spawn()?;
+    let pid = caller.child.id();
+    let tid = caller.thread_calls(575, 1)?;
+    ensure!(tid != pid, "ia32 thread receipt named the leader");
+    caller.exec_self()?;
+    ensure!(caller.child.id() == pid, "ia32 exec changed owned PID");
+    caller.calls(575, 2)?;
+    caller.finish()
+}
+
+#[test]
 #[ignore = "parent-owned privileged BPF lane; actual links, physical owned GO ledger and cleanup"]
 fn privileged_inventory_activation_system_lp64() -> Result<()> {
     system_gate(false)
@@ -921,6 +1126,383 @@ fn privileged_inventory_activation_system_lp64() -> Result<()> {
 #[ignore = "parent-owned privileged BPF lane plus cc -m32; actual IA32 entry links and workload"]
 fn privileged_inventory_activation_system_ia32() -> Result<()> {
     system_gate(true)
+}
+
+fn caller_system_gate(ia32: bool) -> Result<()> {
+    let mut fixture = OwnedFixture::build(ia32)?;
+    let object = fixture.plan.slots[0].object;
+    let prepared = PreparedInventory::prepare_callers(
+        Scope::System,
+        budget(),
+        caller_budget(3),
+        AttachBackend::Singles,
+    )?;
+    let mut ids = OwnedIds::prepared(&prepared)?;
+    let mut active = prepared
+        .activate(fixture.targets()?)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    ids.inspect_links(&active.state, 576)?;
+    fixture.pins = PinnedObjects::empty();
+    assert_retained_pin(&active.state.targets, object)?;
+    ensure!(caller_pair_set(&active.state.prepared.ebpf, object)?.is_empty());
+    ensure!(caller_usage(&active.state.prepared.ebpf, 575)? == 0);
+    eprintln!(
+        "I2C_CALLER_READY abi={:?} maps={} programs={} links={}",
+        fixture.expected_abi,
+        ids.maps.len(),
+        ids.programs.len(),
+        ids.links.len()
+    );
+
+    let mut a = fixture.spawn()?;
+    await_lifecycle(&mut active, a.child.id(), DISCOVERY_KIND_EXEC)?;
+    a.calls(575, 1)?;
+    let first = caller_pair_set(&active.state.prepared.ebpf, object)?;
+    ensure!(
+        first.len() == 1
+            && first[0].0.object_id == object.0
+            && first[0].1.host_tgid == a.child.id()
+            && first[0].1.witness_endpoint == 575,
+        "A first leader call did not create exact endpoint-575 pair: {first:?}"
+    );
+    ensure!(caller_usage(&active.state.prepared.ebpf, 575)? == 1);
+    assert_caller_health(&active.usage_snapshot(window()), [0; 4])?;
+    eprintln!(
+        "I2C_CALLER_A_FIRST abi={:?} pid={} rows=1 witness=575 usage575=1",
+        fixture.expected_abi,
+        a.child.id()
+    );
+    a.calls(575, 2)?;
+    ensure!(caller_pair_set(&active.state.prepared.ebpf, object)? == first);
+    ensure!(caller_usage(&active.state.prepared.ebpf, 575)? == 1);
+    eprintln!(
+        "I2C_CALLER_A_REPEAT abi={:?} rows=1 witness=575",
+        fixture.expected_abi
+    );
+    let thread_1 = a.thread_calls(575, 1)?;
+    ensure!(thread_1 != a.child.id(), "first A worker was the leader");
+    ensure!(caller_pair_set(&active.state.prepared.ebpf, object)? == first);
+    eprintln!(
+        "I2C_CALLER_A_THREAD abi={:?} ordinal=1 tid={thread_1} rows=1",
+        fixture.expected_abi
+    );
+    let thread_2 = a.thread_calls(575, 2)?;
+    ensure!(
+        thread_1 != thread_2 && thread_1 != a.child.id() && thread_2 != a.child.id(),
+        "two A physical thread identities were not proven"
+    );
+    ensure!(caller_pair_set(&active.state.prepared.ebpf, object)? == first);
+    ensure!(caller_usage(&active.state.prepared.ebpf, 575)? == 1);
+    eprintln!(
+        "I2C_CALLER_A_THREAD abi={:?} ordinal=2 tid={thread_2} rows=1",
+        fixture.expected_abi
+    );
+    assert_caller_health(&active.usage_snapshot(window()), [0; 4])?;
+
+    let mut b = fixture.spawn()?;
+    await_lifecycle(&mut active, b.child.id(), DISCOVERY_KIND_EXEC)?;
+    b.calls(575, 3)?;
+    b.finish()?;
+    await_lifecycle(&mut active, b.child.id(), DISCOVERY_KIND_LEADER_EXIT)?;
+    let after_b = caller_pair_set(&active.state.prepared.ebpf, object)?;
+    ensure!(
+        after_b.len() == 2
+            && after_b.contains(&first[0])
+            && after_b.iter().any(|(key, value)| {
+                value.host_tgid == b.child.id()
+                    && value.witness_endpoint == 575
+                    && key.image.task_cookie != first[0].0.image.task_cookie
+                    && key.object_id == object.0
+            }),
+        "B after USAGE=1 or exit history absent: {after_b:?}"
+    );
+    ensure!(caller_usage(&active.state.prepared.ebpf, 575)? == 1);
+    assert_caller_health(&active.usage_snapshot(window()), [0; 4])?;
+    eprintln!(
+        "I2C_CALLER_B_AFTER_GLOBAL abi={:?} pid={} rows=2",
+        fixture.expected_abi,
+        b.child.id()
+    );
+
+    a.exec_self()?;
+    await_lifecycle(&mut active, a.child.id(), DISCOVERY_KIND_EXEC)?;
+    a.calls(575, 4)?;
+    let after_exec = caller_pair_set(&active.state.prepared.ebpf, object)?;
+    ensure!(
+        after_exec.len() == 3
+            && after_b.iter().all(|row| after_exec.contains(row))
+            && after_exec.iter().any(|(key, value)| {
+                value.host_tgid == a.child.id()
+                    && value.witness_endpoint == 575
+                    && key.object_id == object.0
+                    && key.image.task_cookie == first[0].0.image.task_cookie
+                    && key.image.exec_id != first[0].0.image.exec_id
+            }),
+        "same-PID exec did not retain old pairs and create new image pair: {after_exec:?}"
+    );
+    ensure!(caller_usage(&active.state.prepared.ebpf, 575)? == 1);
+    assert_caller_health(&active.usage_snapshot(window()), [0; 4])?;
+    eprintln!(
+        "I2C_CALLER_EXEC abi={:?} pid={} rows=3",
+        fixture.expected_abi,
+        a.child.id()
+    );
+
+    let mut c = fixture.spawn()?;
+    let before_c = active.usage_snapshot(window());
+    assert_caller_health(&before_c, [0; 4])?;
+    c.calls(575, 5)?;
+    c.finish()?;
+    let exhausted = active.usage_snapshot(window());
+    let evidence = exhausted
+        .health
+        .caller_evidence
+        .context("caller evidence after P exhaustion")?;
+    ensure!(
+        evidence[2] > 0 && evidence[0] == 0 && evidence[1] == 0 && evidence[3] == 0,
+        "P exhaustion evidence {evidence:?}"
+    );
+    let prior_evidence = before_c
+        .health
+        .caller_evidence
+        .context("pre-C caller evidence")?;
+    ensure!(
+        evidence[2] > prior_evidence[2]
+            && evidence[0] == prior_evidence[0]
+            && evidence[1] == prior_evidence[1]
+            && evidence[3] == prior_evidence[3],
+        "C did not raise only pair-insert failure: before={prior_evidence:?} after={evidence:?}"
+    );
+    ensure!(
+        caller_pair_set(&active.state.prepared.ebpf, object)? == after_exec,
+        "P exhaustion replaced an existing pair"
+    );
+    ensure!(
+        !after_exec
+            .iter()
+            .any(|(_, value)| value.host_tgid == c.child.id()),
+        "C acquired a positive pair at capacity"
+    );
+    ensure!(caller_usage(&active.state.prepared.ebpf, 575)? == 1);
+    ensure!(
+        exhausted.usage.positive_count == 1,
+        "global use lost after P exhaustion"
+    );
+    eprintln!(
+        "I2C_CALLER_P_EXHAUST abi={:?} rows=3 evidence={evidence:?}",
+        fixture.expected_abi
+    );
+    a.calls(575, 6)?;
+    ensure!(caller_pair_set(&active.state.prepared.ebpf, object)? == after_exec);
+    let after_repeat = active.usage_snapshot(window());
+    assert_caller_health(&after_repeat, evidence)?;
+    a.finish()?;
+    let retiring = active.begin_stop();
+    assert_retained_pin(
+        &retiring.state.as_ref().context("retiring state")?.targets,
+        object,
+    )?;
+    let mut retired = finish_owned_retirement(retiring)?;
+    ensure!(retired.cleanup.closed == 578 && retired.cleanup.failures.is_empty());
+    let last = retired.usage_snapshot(window());
+    ensure!(last.terminal_unsettled && last.health.caller_evidence == Some(evidence));
+    ensure!(caller_pair_set(&retired.state.prepared.ebpf, object)? == after_exec);
+    assert_retained_pin(&retired.state.targets, object)?;
+    eprintln!(
+        "I2C_CALLER_RETAINED abi={:?} rows=3 maps={}",
+        fixture.expected_abi,
+        ids.maps.len()
+    );
+    drop(retired);
+    ids.released()?;
+    eprintln!("I2C_CALLER_RELEASED abi={:?}", fixture.expected_abi);
+    Ok(())
+}
+
+#[test]
+#[ignore = "root-owned live BPF lane; exact LP64 caller images, pair exhaustion and release"]
+fn privileged_inventory_caller_system_lp64() -> Result<()> {
+    caller_system_gate(false)
+}
+
+#[test]
+#[ignore = "root-owned live BPF lane; exact IA32 caller images, pair exhaustion and release"]
+fn privileged_inventory_caller_system_ia32() -> Result<()> {
+    caller_system_gate(true)
+}
+
+#[test]
+#[ignore = "root-owned live BPF/cgroup lane; included/excluded image pairs and release"]
+fn privileged_inventory_caller_cgroup_lp64() -> Result<()> {
+    let mut fixture = OwnedFixture::build(false)?;
+    let object = fixture.plan.slots[0].object;
+    let group = OwnedCgroup::create()?;
+    let mut inside = fixture.spawn()?;
+    let mut outside = fixture.spawn()?;
+    group.move_in(&inside)?;
+    let scope = crate::scope::cgroup(&group.path)?;
+    let prepared = PreparedInventory::prepare_callers(
+        scope,
+        budget(),
+        caller_budget(2),
+        AttachBackend::Singles,
+    )?;
+    let mut ids = OwnedIds::prepared(&prepared)?;
+    let mut active = prepared
+        .activate(fixture.targets()?)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    ids.inspect_links(&active.state, 576)?;
+    fixture.pins = PinnedObjects::empty();
+    assert_retained_pin(&active.state.targets, object)?;
+    outside.calls(575, 1)?;
+    ensure!(
+        caller_pair_set(&active.state.prepared.ebpf, object)?.is_empty(),
+        "excluded caller acquired pair"
+    );
+    ensure!(caller_usage(&active.state.prepared.ebpf, 575)? == 0);
+    let excluded = active.usage_snapshot(window());
+    assert_non_loss_health(&excluded)?;
+    ensure!(excluded.health.caller_evidence == Some([0; 4]));
+    let excluded_control = excluded
+        .health
+        .caller_control
+        .context("caller native control after excluded call is unknown")?;
+    ensure!(
+        excluded_control.limit == 16_384
+            && excluded_control.next_ticket == 0
+            && excluded_control.unavailable == 0
+            && excluded_control.create_failures == 0
+            && excluded_control.retry_exhausted == 0,
+        "excluded caller changed native control: {excluded_control:?}"
+    );
+    ensure!(
+        excluded.usage.positive_count == 0 && excluded.usage.newly_positive.is_empty(),
+        "excluded caller set global usage: {excluded:?}"
+    );
+    eprintln!(
+        "I2C_CALLER_CGROUP_EXCLUDED pid={} rows=0 usage575=0 evidence=[0,0,0,0]",
+        outside.child.id()
+    );
+    inside.calls(575, 2)?;
+    let rows = caller_pair_set(&active.state.prepared.ebpf, object)?;
+    ensure!(
+        rows.len() == 1
+            && rows[0].1.host_tgid == inside.child.id()
+            && rows[0].1.witness_endpoint == 575
+            && rows[0].0.object_id == object.0,
+        "cgroup physical caller rows {rows:?}"
+    );
+    ensure!(caller_usage(&active.state.prepared.ebpf, 575)? == 1);
+    let snapshot = active.usage_snapshot(window());
+    assert_caller_health(&snapshot, [0; 4])?;
+    ensure!(snapshot.usage.newly_positive == [575] && snapshot.usage.positive_count == 1);
+    eprintln!(
+        "I2C_CALLER_CGROUP path={} included={} excluded={} rows=1",
+        group.path.display(),
+        inside.child.id(),
+        outside.child.id()
+    );
+    inside.finish()?;
+    outside.finish()?;
+    let retiring = active.begin_stop();
+    assert_retained_pin(
+        &retiring.state.as_ref().context("retiring state")?.targets,
+        object,
+    )?;
+    let retired = finish_owned_retirement(retiring)?;
+    ensure!(retired.cleanup.failures.is_empty());
+    assert_retained_pin(&retired.state.targets, object)?;
+    ensure!(caller_pair_set(&retired.state.prepared.ebpf, object)? == rows);
+    drop(retired);
+    ids.released()?;
+    drop(inside);
+    drop(outside);
+    std::fs::remove_dir(&group.path).context("caller cgroup cleanup")?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "root-owned live BPF lane; partial caller activation retains binding, pair, IDs and pin"]
+fn privileged_inventory_caller_partial_activation_lp64() -> Result<()> {
+    let mut fixture = OwnedFixture::build(false)?;
+    let object = fixture.plan.slots[0].object;
+    let mut caller = fixture.spawn()?;
+    let targets = fixture.targets()?;
+    assert_retained_pin(&targets, object)?;
+    let retained = targets
+        .pins
+        .get(&object)
+        .context("retained target")?
+        .attach_path();
+    fixture.pins = PinnedObjects::empty();
+    ensure!(std::fs::metadata(&retained).is_ok());
+    let prepared = PreparedInventory::prepare_callers(
+        Scope::System,
+        budget(),
+        caller_budget(2),
+        AttachBackend::Singles,
+    )?;
+    let mut ids = OwnedIds::prepared(&prepared)?;
+    let mut ordinal = 0;
+    let result = prepared.activate_inner(targets, |_| {
+        let current = ordinal;
+        ordinal += 1;
+        if current == 3 {
+            ids.observe_open_owned_links()?;
+            ensure!(
+                ids.links.len() == 3,
+                "partial caller activation lost link custody"
+            );
+            eprintln!("I2C_CALLER_PARTIAL_IDS phase=held ids={ids:?}");
+            ensure!(
+                std::fs::metadata(&retained).is_ok(),
+                "retained pin closed before fault"
+            );
+            caller.calls(0, 2)?;
+            bail!("owned caller second-entry attachment failure");
+        }
+        Ok(())
+    });
+    let failure = match result {
+        Ok(_) => bail!("caller partial activation fault skipped"),
+        Err(failure) => failure,
+    };
+    ensure!(
+        format!("{:#}", failure.error).contains("owned caller second-entry attachment failure")
+    );
+    assert_retained_pin(
+        &failure
+            .retiring
+            .state
+            .as_ref()
+            .context("retiring state")?
+            .targets,
+        object,
+    )?;
+    let mut retired = finish_owned_retirement(*failure.retiring)?;
+    ensure!(retired.cleanup.closed == 3 && retired.cleanup.failures.is_empty());
+    let rows = caller_pair_set(&retired.state.prepared.ebpf, object)?;
+    ensure!(
+        rows.len() == 1
+            && rows[0].1.host_tgid == caller.child.id()
+            && rows[0].1.witness_endpoint == 0,
+        "partial caller positive pair lost {rows:?}"
+    );
+    let snapshot = retired.usage_snapshot(window());
+    assert_caller_health(&snapshot, [0; 4])?;
+    ensure!(snapshot.usage.positive_count == 1 && snapshot.terminal_unsettled);
+    ensure!(retired.state.targets.allocated.len() == 576);
+    assert_retained_pin(&retired.state.targets, object)?;
+    eprintln!(
+        "I2C_CALLER_PARTIAL pid={} rows=1 allocated={} maps={} links={}",
+        caller.child.id(),
+        retired.state.targets.allocated.len(),
+        ids.maps.len(),
+        ids.links.len()
+    );
+    caller.finish()?;
+    drop(retired);
+    ids.released()
 }
 
 fn monotonic_ns() -> Result<u64> {

@@ -4,15 +4,16 @@ use super::{
     AttachBackend, BPF_F_RDONLY_PROG, ExactMapMetadata, Scope, compare_map_metadata, freeze_map,
     map_metadata, publish_and_freeze_tail_calls, read_map_metadata,
 };
-use crate::capacity::InventoryBudget;
+use crate::capacity::{CallerBudget, InventoryBudget};
 use crate::events::DiscoveryDomain;
 use crate::process::PidPin;
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, bail, ensure};
 use aya::maps::{Array, Map, MapData, MapType};
 use aya::programs::{ProbeKind, Program, RawTracePoint, UProbe};
 use aya::{Btf, Ebpf, EbpfLoader};
 use p11scope_ebpf_common::{
-    INVENTORY_OWNER_LIMIT, INVENTORY_USAGE_VERSION, InventoryUsageConfig, ThreadOwnerControl,
+    IMAGE_IDENTITY_TICKET_LIMIT, INVENTORY_OWNER_LIMIT, INVENTORY_USAGE_VERSION,
+    ImageIdentityControl, InventoryUsageConfig, ThreadOwnerControl,
 };
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
@@ -23,10 +24,17 @@ pub(crate) struct PreparedInventory {
     ebpf: Ebpf,
     discovery_domain: DiscoveryDomain,
     budget: InventoryBudget,
+    flavor: InventoryFlavor,
     capacity: NonZeroU32,
     backend: AttachBackend,
     scope: Scope,
     pid_pin: Option<PidPin>,
+}
+
+#[derive(Clone, Copy)]
+enum InventoryFlavor {
+    Global,
+    Callers(CallerBudget),
 }
 
 impl PreparedInventory {
@@ -44,6 +52,22 @@ impl PreparedInventory {
         )
     }
 
+    pub(crate) fn prepare_callers(
+        scope: Scope,
+        endpoint_budget: InventoryBudget,
+        caller_budget: CallerBudget,
+        backend: AttachBackend,
+    ) -> Result<Self> {
+        Self::prepare_inner_flavor(
+            scope,
+            endpoint_budget,
+            backend,
+            InventoryFlavor::Callers(caller_budget),
+            #[cfg(test)]
+            |_, _| Ok(()),
+        )
+    }
+
     pub(crate) fn endpoint_capacity(&self) -> NonZeroU32 {
         self.capacity
     }
@@ -56,9 +80,32 @@ impl PreparedInventory {
         scope: Scope,
         budget: InventoryBudget,
         backend: AttachBackend,
+        #[cfg(test)] observe: impl FnMut(&PreparingInventory, InventoryPreparation) -> Result<()>,
+    ) -> Result<Self> {
+        Self::prepare_inner_flavor(
+            scope,
+            budget,
+            backend,
+            InventoryFlavor::Global,
+            #[cfg(test)]
+            observe,
+        )
+    }
+
+    fn prepare_inner_flavor(
+        scope: Scope,
+        budget: InventoryBudget,
+        backend: AttachBackend,
+        flavor: InventoryFlavor,
         #[cfg(test)] mut observe: impl FnMut(&PreparingInventory, InventoryPreparation) -> Result<()>,
     ) -> Result<Self> {
         let capacity = inventory_capacity(budget)?;
+        if let InventoryFlavor::Callers(caller_budget) = flavor {
+            ensure!(
+                budget == caller_budget.endpoint_budget(),
+                "caller endpoint budget differs from Inventory budget"
+            );
+        }
         let pid_pin = match &scope {
             Scope::Pid(pid) => {
                 NonZeroU32::new(*pid).context("Inventory PID must be non-zero")?;
@@ -67,136 +114,182 @@ impl PreparedInventory {
             Scope::Cgroup { .. } | Scope::System => None,
         };
         let btf = Btf::from_sys_fs().context("loading required vmlinux BTF for Inventory")?;
-        let mut prepared = prepare_inventory_with(
-            backend,
-            PreparingInventory {
-                ebpf: None,
-                discovery_domain: None,
-            },
-            |state, step| {
-                match step {
-                    InventoryPreparation::LoadObject => {
-                        // Fresh maps only. This allocation capacity is immutable
-                        // and is not a policy for growing or renewing sessions.
-                        state.ebpf = Some(
-                            EbpfLoader::new()
-                                .btf(Some(&btf))
-                                .allow_unsupported_maps()
-                                .map_max_entries("USAGE", capacity.get())
-                                .load(crate::EBPF_INVENTORY_OBJECT)
-                                .context("loading fresh Inventory object and resized USAGE")?,
-                        );
+        let state = PreparingInventory {
+            ebpf: None,
+            discovery_domain: None,
+        };
+        let execute = |state: &mut PreparingInventory, step| {
+            match step {
+                InventoryPreparation::LoadObject => {
+                    // Fresh maps only. This allocation capacity is immutable
+                    // and is not a policy for growing or renewing sessions.
+                    let mut loader = EbpfLoader::new();
+                    loader
+                        .btf(Some(&btf))
+                        .allow_unsupported_maps()
+                        .map_max_entries("USAGE", capacity.get());
+                    let bytes = match flavor {
+                        InventoryFlavor::Global => crate::EBPF_INVENTORY_OBJECT,
+                        InventoryFlavor::Callers(caller_budget) => {
+                            loader
+                                .map_max_entries("ENDPOINT_OBJECT", capacity.get())
+                                .map_max_entries(
+                                    "CALLER_USE",
+                                    u32::try_from(caller_budget.pair_limit())?,
+                                );
+                            crate::EBPF_INVENTORY_CALLERS_OBJECT
+                        }
+                    };
+                    state.ebpf = Some(
+                        loader
+                            .load(bytes)
+                            .context("loading fresh Inventory object with exact capacity")?,
+                    );
+                }
+                InventoryPreparation::ValidateMaps => match flavor {
+                    InventoryFlavor::Global => {
+                        validate_runtime_inventory_maps(state.ebpf()?, capacity)?
                     }
-                    InventoryPreparation::ValidateMaps => {
-                        validate_runtime_inventory_maps(state.ebpf()?, capacity)?;
+                    InventoryFlavor::Callers(caller_budget) => {
+                        callers::validate_runtime_caller_maps(state.ebpf()?, caller_budget)?
                     }
-                    InventoryPreparation::ValidatePrograms => {
-                        validate_runtime_inventory_programs(state.ebpf()?)?;
-                    }
-                    InventoryPreparation::PublishScope => {
-                        crate::scope::publish_inventory(state.ebpf_mut()?, &scope)?;
-                    }
-                    InventoryPreparation::WriteUsageConfig => {
-                        let mut map: Array<_, InventoryUsageConfig> = Array::try_from(
-                            state
-                                .ebpf_mut()?
-                                .map_mut("USAGE_CONFIG")
-                                .context("USAGE_CONFIG map")?,
-                        )?;
-                        map.set(
-                            0,
-                            InventoryUsageConfig {
-                                version: INVENTORY_USAGE_VERSION,
-                                endpoint_capacity: capacity.get(),
-                            },
-                            0,
-                        )?;
-                    }
-                    InventoryPreparation::ReadUsageConfig => {
-                        let ebpf = state.ebpf()?;
-                        let map: Array<_, InventoryUsageConfig> =
-                            Array::try_from(ebpf.map("USAGE_CONFIG").context("USAGE_CONFIG map")?)?;
-                        let (_, usage) =
-                            inventory_map_data("USAGE", ebpf.map("USAGE").context("USAGE map")?)?;
-                        validate_inventory_usage_config(
-                            capacity,
-                            read_map_metadata("USAGE", usage)?.max_entries,
-                            map.get(&0, 0)?,
-                        )?;
-                    }
-                    InventoryPreparation::WriteOwner => {
-                        let mut map: Array<_, ThreadOwnerControl> = Array::try_from(
-                            state
-                                .ebpf_mut()?
-                                .map_mut("OWNER_CTL")
-                                .context("OWNER_CTL map")?,
-                        )?;
-                        map.set(
-                            0,
-                            ThreadOwnerControl {
-                                limit: INVENTORY_OWNER_LIMIT,
-                                ..ThreadOwnerControl::default()
-                            },
-                            0,
-                        )?;
-                    }
-                    InventoryPreparation::ReadOwner => {
-                        let map: Array<_, ThreadOwnerControl> = Array::try_from(
-                            state.ebpf()?.map("OWNER_CTL").context("OWNER_CTL map")?,
-                        )?;
-                        validate_inventory_owner_control(map.get(&0, 0)?)?;
-                    }
-                    InventoryPreparation::Freeze(name) => {
-                        freeze_map(
-                            name,
-                            state
-                                .ebpf()?
-                                .map(name)
-                                .with_context(|| format!("{name} map"))?,
-                        )?;
-                    }
-                    InventoryPreparation::LoadProgram(name, mode) => {
-                        let program = state
+                },
+                InventoryPreparation::ValidatePrograms => {
+                    validate_runtime_inventory_programs(state.ebpf()?)?;
+                }
+                InventoryPreparation::PublishScope => {
+                    crate::scope::publish_inventory(state.ebpf_mut()?, &scope)?;
+                }
+                InventoryPreparation::WriteUsageConfig => {
+                    let mut map: Array<_, InventoryUsageConfig> = Array::try_from(
+                        state
                             .ebpf_mut()?
-                            .program_mut(name)
-                            .with_context(|| format!("Inventory program {name}"))?;
-                        match mode {
-                            InventoryProgramLoad::RawTracePoint => {
-                                let program: &mut RawTracePoint = program.try_into()?;
+                            .map_mut("USAGE_CONFIG")
+                            .context("USAGE_CONFIG map")?,
+                    )?;
+                    map.set(
+                        0,
+                        InventoryUsageConfig {
+                            version: INVENTORY_USAGE_VERSION,
+                            endpoint_capacity: capacity.get(),
+                        },
+                        0,
+                    )?;
+                }
+                InventoryPreparation::ReadUsageConfig => {
+                    let ebpf = state.ebpf()?;
+                    let map: Array<_, InventoryUsageConfig> =
+                        Array::try_from(ebpf.map("USAGE_CONFIG").context("USAGE_CONFIG map")?)?;
+                    let (_, usage) =
+                        inventory_map_data("USAGE", ebpf.map("USAGE").context("USAGE map")?)?;
+                    validate_inventory_usage_config(
+                        capacity,
+                        read_map_metadata("USAGE", usage)?.max_entries,
+                        map.get(&0, 0)?,
+                    )?;
+                }
+                InventoryPreparation::WriteOwner => {
+                    let mut map: Array<_, ThreadOwnerControl> = Array::try_from(
+                        state
+                            .ebpf_mut()?
+                            .map_mut("OWNER_CTL")
+                            .context("OWNER_CTL map")?,
+                    )?;
+                    map.set(
+                        0,
+                        ThreadOwnerControl {
+                            limit: INVENTORY_OWNER_LIMIT,
+                            ..ThreadOwnerControl::default()
+                        },
+                        0,
+                    )?;
+                }
+                InventoryPreparation::ReadOwner => {
+                    let map: Array<_, ThreadOwnerControl> =
+                        Array::try_from(state.ebpf()?.map("OWNER_CTL").context("OWNER_CTL map")?)?;
+                    validate_inventory_owner_control(map.get(&0, 0)?)?;
+                }
+                InventoryPreparation::WriteCallerControl => {
+                    let mut map: Array<_, ImageIdentityControl> = Array::try_from(
+                        state
+                            .ebpf_mut()?
+                            .map_mut("COOKIE_CTL")
+                            .context("COOKIE_CTL map")?,
+                    )?;
+                    map.set(
+                        0,
+                        ImageIdentityControl {
+                            limit: IMAGE_IDENTITY_TICKET_LIMIT,
+                            ..Default::default()
+                        },
+                        0,
+                    )?;
+                }
+                InventoryPreparation::ReadCallerControl => {
+                    let map: Array<_, ImageIdentityControl> = Array::try_from(
+                        state.ebpf()?.map("COOKIE_CTL").context("COOKIE_CTL map")?,
+                    )?;
+                    callers::validate_caller_control(map.get(&0, 0)?)?;
+                }
+                InventoryPreparation::Freeze(name) => {
+                    freeze_map(
+                        name,
+                        state
+                            .ebpf()?
+                            .map(name)
+                            .with_context(|| format!("{name} map"))?,
+                    )?;
+                }
+                InventoryPreparation::LoadProgram(name, mode) => {
+                    let program = state
+                        .ebpf_mut()?
+                        .program_mut(name)
+                        .with_context(|| format!("Inventory program {name}"))?;
+                    match mode {
+                        InventoryProgramLoad::RawTracePoint => {
+                            let program: &mut RawTracePoint = program.try_into()?;
+                            program.load()?;
+                        }
+                        InventoryProgramLoad::UProbe | InventoryProgramLoad::UProbeMulti => {
+                            let program: &mut UProbe = program.try_into()?;
+                            if mode == InventoryProgramLoad::UProbeMulti {
+                                program.load_multi()?;
+                            } else {
                                 program.load()?;
                             }
-                            InventoryProgramLoad::UProbe | InventoryProgramLoad::UProbeMulti => {
-                                let program: &mut UProbe = program.try_into()?;
-                                if mode == InventoryProgramLoad::UProbeMulti {
-                                    program.load_multi()?;
-                                } else {
-                                    program.load()?;
-                                }
-                            }
-                        }
-                    }
-                    InventoryPreparation::PublishTailCalls => {
-                        publish_and_freeze_tail_calls(state.ebpf_mut()?, false)?;
-                    }
-                    InventoryPreparation::RetainDiscovery => {
-                        state.discovery_domain =
-                            Some(DiscoveryDomain::from_discovery(state.ebpf()?)?);
-                    }
-                    InventoryPreparation::RecheckCustody => {
-                        if let Some(pin) = &pid_pin {
-                            require_inventory_custody_with(|| {
-                                pin.original_exited()
-                                    .map(|exited| !exited)
-                                    .map_err(anyhow::Error::msg)
-                            })?;
                         }
                     }
                 }
-                #[cfg(test)]
-                observe(state, step)?;
-                Ok(())
-            },
-        )?;
+                InventoryPreparation::PublishTailCalls => {
+                    publish_and_freeze_tail_calls(state.ebpf_mut()?, false)?;
+                }
+                InventoryPreparation::RetainDiscovery => {
+                    state.discovery_domain = Some(DiscoveryDomain::from_discovery(state.ebpf()?)?);
+                }
+                InventoryPreparation::RecheckCustody => {
+                    if let Some(pin) = &pid_pin {
+                        require_inventory_custody_with(|| {
+                            pin.original_exited()
+                                .map(|exited| !exited)
+                                .map_err(anyhow::Error::msg)
+                        })?;
+                    }
+                }
+            }
+            #[cfg(test)]
+            observe(state, step)?;
+            Ok(())
+        };
+        let mut prepared = match flavor {
+            InventoryFlavor::Global => prepare_inventory_with(backend, state, execute)?,
+            InventoryFlavor::Callers(caller_budget) => callers::prepare_caller_inventory_with(
+                budget,
+                caller_budget,
+                backend,
+                state,
+                execute,
+            )?,
+        };
         Ok(Self {
             ebpf: prepared
                 .ebpf
@@ -207,6 +300,7 @@ impl PreparedInventory {
                 .take()
                 .context("Inventory preparation omitted retained DISCOVERY")?,
             budget,
+            flavor,
             capacity,
             backend,
             scope,
@@ -266,6 +360,8 @@ enum InventoryPreparation {
     ReadUsageConfig,
     WriteOwner,
     ReadOwner,
+    WriteCallerControl,
+    ReadCallerControl,
     Freeze(&'static str),
     LoadProgram(&'static str, InventoryProgramLoad),
     PublishTailCalls,
@@ -394,7 +490,9 @@ fn inventory_map_data<'a>(name: &str, map: &'a Map) -> Result<(InventoryMapKind,
         Map::ProgramArray(data) => Ok((K::ProgramArray, data)),
         Map::PerCpuArray(data) => Ok((K::PerCpuArray, data)),
         Map::RingBuf(data) => Ok((K::RingBuf, data)),
-        Map::Unsupported(data) if name == "THREAD_OWNER" => Ok((K::Unsupported, data)),
+        Map::Unsupported(data) if matches!(name, "THREAD_OWNER" | "TASK_COOKIE") => {
+            Ok((K::Unsupported, data))
+        }
         other => bail!("Inventory refuses {name} map variant {other:?}"),
     }
 }
@@ -508,7 +606,16 @@ fn validate_inventory_owner_control(control: ThreadOwnerControl) -> Result<()> {
 
 fn prepare_inventory_with<T>(
     backend: AttachBackend,
+    state: T,
+    operation: impl FnMut(&mut T, InventoryPreparation) -> Result<()>,
+) -> Result<T> {
+    prepare_inventory_with_kind(backend, state, false, operation)
+}
+
+fn prepare_inventory_with_kind<T>(
+    backend: AttachBackend,
     mut state: T,
+    caller: bool,
     mut operation: impl FnMut(&mut T, InventoryPreparation) -> Result<()>,
 ) -> Result<T> {
     use InventoryPreparation::*;
@@ -530,6 +637,18 @@ fn prepare_inventory_with<T>(
     ];
     for step in initial {
         operation(&mut state, step).with_context(|| format!("preparing Inventory: {step:?}"))?;
+    }
+    if caller {
+        for step in [
+            WriteCallerControl,
+            ReadCallerControl,
+            Freeze("TASK_COOKIE"),
+            Freeze("COOKIE_CTL"),
+            Freeze("CALLER_USE"),
+        ] {
+            operation(&mut state, step)
+                .with_context(|| format!("preparing caller Inventory: {step:?}"))?;
+        }
     }
     for (name, _) in INVENTORY_PROGRAMS {
         let step = LoadProgram(name, inventory_program_load(name, backend)?);
@@ -559,3 +678,4 @@ mod privileged_tests;
 mod tests;
 
 mod activation;
+mod callers;

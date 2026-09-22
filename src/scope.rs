@@ -8,8 +8,8 @@ use anyhow::{Context as _, Result, bail};
 use aya::Ebpf;
 use aya::maps::{Array, CgroupArray, HashMap};
 use p11scope_ebpf_common::{
-    CFG_FLAGS, FLAG_CGROUP_FILTER, FLAG_PAUSE_ENABLED, FLAG_PID_FILTER, FLAG_SYSTEM_FILTER,
-    valid_config,
+    CFG_FLAGS, FLAG_CGROUP_FILTER, FLAG_PAUSE_ENABLED, FLAG_PID_FILTER, FLAG_POLICY_INVENTORY,
+    FLAG_SYSTEM_FILTER, valid_config, valid_inventory_config,
 };
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -166,68 +166,140 @@ pub(crate) fn publish(
     policy: CapturePolicy,
     generation_token: Option<u64>,
 ) -> Result<()> {
+    publish_detailed_with(scope, policy, generation_token, &mut EbpfScopeIo(ebpf))
+}
+
+pub(crate) fn publish_inventory(ebpf: &mut Ebpf, scope: &Scope) -> Result<()> {
+    publish_inventory_with(scope, &mut EbpfScopeIo(ebpf))
+}
+
+fn scope_flag(scope: &Scope) -> u64 {
+    match scope {
+        Scope::Pid(_) => FLAG_PID_FILTER,
+        Scope::Cgroup { .. } => FLAG_CGROUP_FILTER,
+        Scope::System => FLAG_SYSTEM_FILTER,
+    }
+}
+
+fn publish_detailed_with(
+    scope: &Scope,
+    policy: CapturePolicy,
+    generation_token: Option<u64>,
+    io: &mut impl ScopePublicationIo,
+) -> Result<()> {
     if generation_token == Some(0) {
         bail!("pause generation token must be non-zero");
     }
     if generation_token.is_some() && !matches!(scope, Scope::Pid(_)) {
         bail!("pause generation requires PID scope");
     }
-    let scope_flag = match scope {
-        Scope::Pid(_) => FLAG_PID_FILTER,
-        Scope::Cgroup { .. } => FLAG_CGROUP_FILTER,
-        Scope::System => FLAG_SYSTEM_FILTER,
-    };
     let pause_flag = generation_token.map_or(0, |_| FLAG_PAUSE_ENABLED);
-    let config = scope_flag | policy.config_bit() | pause_flag;
+    let config = scope_flag(scope) | policy.config_bit() | pause_flag;
     if !valid_config(config) {
         bail!("refusing invalid CONFIG {config:#x}");
     }
+    publish_validated_scope_with(scope, generation_token.unwrap_or(1), config, false, io)
+}
 
+fn publish_inventory_with(scope: &Scope, io: &mut impl ScopePublicationIo) -> Result<()> {
+    let config = scope_flag(scope) | FLAG_POLICY_INVENTORY;
+    if !valid_inventory_config(config) {
+        bail!("refusing invalid Inventory CONFIG {config:#x}");
+    }
+    publish_validated_scope_with(scope, 1, config, true, io)
+}
+
+// Only the two mode-specific wrappers above construct the validated config.
+// Sharing map I/O does not allow Inventory to pass a Detailed policy validator.
+fn publish_validated_scope_with(
+    scope: &Scope,
+    token: u64,
+    config: u64,
+    reserved_config_zero: bool,
+    io: &mut impl ScopePublicationIo,
+) -> Result<()> {
     let mut expected_pids = BTreeMap::new();
     match scope {
         Scope::Pid(pid) => {
             if *pid == 0 {
                 bail!("pid must be non-zero");
             }
-            let mut m: HashMap<_, u32, u64> =
-                HashMap::try_from(ebpf.map_mut("PID_FILTER").context("PID_FILTER map")?)?;
-            let token = generation_token.unwrap_or(1);
-            m.insert(*pid, token, 0)?;
+            io.insert_pid(*pid, token)
+                .context("publishing PID_FILTER")?;
             expected_pids.insert(*pid, token);
         }
         Scope::Cgroup { dir, .. } => {
-            let mut groups: CgroupArray<_> =
-                CgroupArray::try_from(ebpf.map_mut("CGROUP_FILTER").context("CGROUP_FILTER map")?)?;
-            // CgroupArray has no userspace lookup; exact metadata, this
-            // retained descriptor, and successful set are the content proof.
-            publish_cgroup_fd_with(dir, |directory| {
-                groups.set(0, directory, 0)?;
-                Ok(())
-            })?;
+            // CgroupArray has no userspace lookup; its exact metadata and
+            // successful publication of this retained FD are the content proof.
+            publish_cgroup_fd_with(dir, |directory| io.insert_cgroup(directory))
+                .context("publishing CGROUP_FILTER")?;
         }
-        // System scope publishes no PID list and no cgroup descriptor: the
-        // CONFIG bit alone authorizes every task. The empty-PID readback
-        // below proves nothing was written.
         Scope::System => {}
     }
-
-    let pids: HashMap<_, u32, u64> =
-        HashMap::try_from(ebpf.map("PID_FILTER").context("PID_FILTER map")?)?;
-    let actual_pids = pids.iter().collect::<Result<BTreeMap<_, _>, _>>()?;
-    if actual_pids != expected_pids {
+    if io.read_pids().context("reading PID_FILTER")? != expected_pids {
         bail!("PID_FILTER exact readback differs from the selected scope");
     }
-
-    let mut cfg: Array<_, u64> = Array::try_from(ebpf.map_mut("CONFIG").context("CONFIG map")?)?;
-    cfg.set(CFG_FLAGS, config, 0)?;
-    let cfg: Array<_, u64> = Array::try_from(ebpf.map("CONFIG").context("CONFIG map")?)?;
-    let readback = cfg.get(&CFG_FLAGS, 0)?;
-    if readback != config || !valid_config(readback) {
+    io.write_config(CFG_FLAGS, config)
+        .context("publishing CONFIG")?;
+    let readback = io.read_config(CFG_FLAGS).context("reading CONFIG flags")?;
+    if readback != config {
         bail!("CONFIG exact readback {readback:#x} differs from {config:#x}");
     }
-
+    if reserved_config_zero && io.read_config(1).context("reading reserved CONFIG cell")? != 0 {
+        bail!("Inventory CONFIG reserved cell 1 must remain zero");
+    }
     Ok(())
 }
+
+trait ScopePublicationIo {
+    fn insert_pid(&mut self, pid: u32, token: u64) -> Result<()>;
+    fn insert_cgroup(&mut self, directory: File) -> Result<()>;
+    fn read_pids(&mut self) -> Result<BTreeMap<u32, u64>>;
+    fn write_config(&mut self, index: u32, value: u64) -> Result<()>;
+    fn read_config(&mut self, index: u32) -> Result<u64>;
+}
+
+struct EbpfScopeIo<'a>(&'a mut Ebpf);
+impl ScopePublicationIo for EbpfScopeIo<'_> {
+    fn insert_pid(&mut self, pid: u32, token: u64) -> Result<()> {
+        let mut map: HashMap<_, u32, u64> =
+            HashMap::try_from(self.0.map_mut("PID_FILTER").context("PID_FILTER map")?)?;
+        map.insert(pid, token, 0)?;
+        Ok(())
+    }
+
+    fn insert_cgroup(&mut self, directory: File) -> Result<()> {
+        let mut groups: CgroupArray<_> = CgroupArray::try_from(
+            self.0
+                .map_mut("CGROUP_FILTER")
+                .context("CGROUP_FILTER map")?,
+        )?;
+        groups.set(0, directory, 0)?;
+        Ok(())
+    }
+
+    fn read_pids(&mut self) -> Result<BTreeMap<u32, u64>> {
+        let map: HashMap<_, u32, u64> =
+            HashMap::try_from(self.0.map("PID_FILTER").context("PID_FILTER map")?)?;
+        Ok(map.iter().collect::<Result<_, _>>()?)
+    }
+
+    fn write_config(&mut self, index: u32, value: u64) -> Result<()> {
+        let mut map: Array<_, u64> =
+            Array::try_from(self.0.map_mut("CONFIG").context("CONFIG map")?)?;
+        map.set(index, value, 0)?;
+        Ok(())
+    }
+
+    fn read_config(&mut self, index: u32) -> Result<u64> {
+        let map: Array<_, u64> = Array::try_from(self.0.map("CONFIG").context("CONFIG map")?)?;
+        Ok(map.get(&index, 0)?)
+    }
+}
+
+#[cfg(test)]
+#[path = "scope/inventory_tests.rs"]
+mod inventory_tests;
 
 #[cfg(test)]
 mod tests {

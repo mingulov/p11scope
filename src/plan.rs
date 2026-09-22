@@ -1010,7 +1010,7 @@ impl AttachPlan {
             .count();
     }
 
-    fn validate_slot_index(&self) -> Result<(), String> {
+    pub(crate) fn validate_slot_index(&self) -> Result<(), String> {
         if self.aggregate_owners.len() != self.slots.len() {
             return Err("aggregate-owner state does not match allocated slots".into());
         }

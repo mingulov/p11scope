@@ -48,7 +48,8 @@ WORK=/var/tmp/p11scope-system-scope-measure
 PROFILE=release
 BINARY=
 NO_BUILD=0
-MODULE=/usr/lib/softhsm/libsofthsm2.so
+SOURCE_MODULE=/usr/lib/softhsm/libsofthsm2.so
+MODULE=
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -77,38 +78,51 @@ case "$PROFILE" in release|debug) ;; *) echo "bad --profile: $PROFILE" >&2; exit
 case "$WORK" in /*) ;; *) WORK="$PWD/$WORK" ;; esac
 
 WPID=
+WPID_STARTTIME=
+WPID_RECEIPT=
+WTARGET_PID=
 SPID=
+SPID_STARTTIME=
+SPID_RECEIPT=
+STARGET_PID=
 SMPID=
+SMPID_STARTTIME=
+SMPID_RECEIPT=
 TSPID=
+TSPID_STARTTIME=
+TSPID_RECEIPT=
 TPID=
+TPID_STARTTIME=
+TPID_RECEIPT=
 CFIFO=
 SFIFO=
-
-# signal_proc <pid> <signal>: signal a sudo-launched process AND its real
-# child. Signalling only the sudo parent orphans the child: it is reparented
-# and keeps running (observed: a stuck observer survived cleanup and sampled
-# for 19 minutes).
-signal_proc() {
-    for kid in $(cat /proc/$1/task/*/children 2>/dev/null); do
-        case "$kid" in ''|*[!0-9]*) continue ;; esac
-        sudo -n kill "-$2" "$kid" 2>/dev/null || kill "-$2" "$kid" 2>/dev/null || true
-    done
-    sudo -n kill "-$2" "$1" 2>/dev/null || kill "-$2" "$1" 2>/dev/null || true
-}
+P11SCOPE_RECEIPT_HELPER="$PWD/scripts/system-scope-receipt.py"
+export P11SCOPE_RECEIPT_HELPER
+. scripts/system-scope-owned.sh
 
 cleanup() {
     status=$?
     trap - EXIT INT TERM
-    [ -z "$TSPID" ] || kill "$TSPID" 2>/dev/null || true
-    [ -z "$TPID" ] || kill "$TPID" 2>/dev/null || true
-    [ -z "$SMPID" ] || signal_proc "$SMPID" TERM
-    [ -z "$SPID" ] || signal_proc "$SPID" INT
-    [ -z "$WPID" ] || kill "$WPID" 2>/dev/null || true
-    [ -z "$TSPID" ] || wait "$TSPID" 2>/dev/null || true
-    [ -z "$TPID" ] || wait "$TPID" 2>/dev/null || true
-    [ -z "$SMPID" ] || wait "$SMPID" 2>/dev/null || true
-    [ -z "$SPID" ] || wait "$SPID" 2>/dev/null || true
-    [ -z "$WPID" ] || wait "$WPID" 2>/dev/null || true
+    if [ -n "$TSPID" ] && [ -n "$TSPID_STARTTIME" ] &&
+       ! owned_finish "$TSPID" "$TSPID_STARTTIME" "$TSPID_RECEIPT" 0; then
+        echo "timestamp helper teardown failed; left unreaped" >&2
+    fi
+    if [ -n "$TPID" ] && [ -n "$TPID_STARTTIME" ] &&
+       ! owned_finish "$TPID" "$TPID_STARTTIME" "$TPID_RECEIPT" 0; then
+        echo "sink helper teardown failed; left unreaped" >&2
+    fi
+    if [ -n "$SMPID" ] && [ -n "$SMPID_STARTTIME" ] &&
+       ! owned_finish "$SMPID" "$SMPID_STARTTIME" "$SMPID_RECEIPT" 0; then
+        echo "sampler teardown failed; left unreaped" >&2
+    fi
+    if [ -n "$SPID" ] && [ -n "$SPID_STARTTIME" ] &&
+       ! owned_finish "$SPID" "$SPID_STARTTIME" "$SPID_RECEIPT" 0; then
+        echo "observer teardown failed; left unreaped" >&2
+    fi
+    if [ -n "$WPID" ] && [ -n "$WPID_STARTTIME" ] &&
+       ! owned_finish "$WPID" "$WPID_STARTTIME" "$WPID_RECEIPT" 0; then
+        echo "workload teardown failed; left unreaped" >&2
+    fi
     [ -z "$CFIFO" ] || rm -f "$CFIFO" || true
     [ -z "$SFIFO" ] || rm -f "$SFIFO" || true
     exit "$status"
@@ -119,12 +133,26 @@ require_non_root_caller
 command -v gcc >/dev/null || { echo "gcc required"; exit 1; }
 command -v softhsm2-util >/dev/null || { echo "softhsm2-util required"; exit 1; }
 command -v python3 >/dev/null || { echo "python3 required"; exit 1; }
+command -v timeout >/dev/null || { echo "timeout required"; exit 1; }
 sudo -n true || { echo "passwordless sudo required"; exit 1; }
-test -f "$MODULE" || { echo "SoftHSM2 not installed at $MODULE"; exit 1; }
+test -f "$SOURCE_MODULE" || { echo "SoftHSM2 not installed at $SOURCE_MODULE"; exit 1; }
 export TMPDIR=/var/tmp/p11scope-ws-tmp
 mkdir -p "$TMPDIR" "$WORK"
 # The observer fails closed on untrusted output dirs: 0700 caller-owned.
 chmod 700 "$WORK"
+
+# Every run gets a private provider inode. System-scope totals from an
+# unrelated host process using the packaged SoftHSM object can therefore never
+# satisfy this workload's physical-identity oracle.
+mkdir -p "$WORK/provider"
+chmod 700 "$WORK/provider"
+MODULE="$WORK/provider/libsofthsm2-owned.so"
+rm -f "$MODULE"
+python3 -I scripts/system-scope-receipt.py file --path "$SOURCE_MODULE" \
+    > "$WORK/provider-source.identity.json"
+install -m 0555 "$SOURCE_MODULE" "$MODULE"
+python3 -I scripts/system-scope-receipt.py file --path "$MODULE" \
+    > "$WORK/provider-copy.identity.json"
 
 echo "=== build ==="
 gcc -O0 -o "$WORK/workload" scripts/system-scope-workload.c -ldl
@@ -145,6 +173,20 @@ else
 fi
 test -x "$BINARY" || { echo "no observer binary at $BINARY"; exit 1; }
 test -x "$DISCOVER" || { echo "no discover binary at $DISCOVER"; exit 1; }
+OBSERVER_SOURCE=$BINARY
+DISCOVER_SOURCE=$DISCOVER
+mkdir -p "$WORK/observer"
+chmod 700 "$WORK/observer"
+rm -f "$WORK/observer/p11scope" "$WORK/observer/p11scope-discover"
+install -m 0555 "$OBSERVER_SOURCE" "$WORK/observer/p11scope"
+install -m 0555 "$DISCOVER_SOURCE" "$WORK/observer/p11scope-discover"
+BINARY="$WORK/observer/p11scope"
+DISCOVER="$WORK/observer/p11scope-discover"
+chmod 500 "$WORK/observer"
+python3 -I scripts/system-scope-receipt.py file --path "$OBSERVER_SOURCE" \
+    > "$WORK/observer-source.identity.json"
+python3 -I scripts/system-scope-receipt.py file --path "$BINARY" \
+    > "$WORK/observer.identity.json"
 
 echo "=== private softhsm token ==="
 export SOFTHSM2_CONF="$WORK/softhsm2.conf"
@@ -189,14 +231,41 @@ wait_file() {
     return 0
 }
 
-# wait_gone <pid> <timeout_s> — poll for a process to exit.
-wait_gone() {
-    end=$(( $(date +%s) + $2 ))
-    while kill -0 "$1" 2>/dev/null; do
+# wait_file_alive <path> <observer-pid> <workload-pid> <timeout_s> — a missing mapped handshake is a
+# harness failure, and an observer that exits before owned calls are released
+# cannot be turned into a short successful capture.
+wait_file_alive() {
+    end=$(( $(date +%s) + $4 ))
+    while [ ! -f "$1" ]; do
+        kill -0 "$2" 2>/dev/null || return 2
+        kill -0 "$3" 2>/dev/null || return 3
         [ "$(date +%s)" -lt "$end" ] || return 1
-        sleep 0.1
+        sleep 0.05
     done
     return 0
+}
+
+# collect_receipt <condition-dir> — run while the owned child is alive and
+# gated. Root is used only to cross hosts whose ptrace policy denies a sibling
+# process access to map_files; the output file is opened by this user.
+collect_receipt() {
+    python3 -I scripts/system-scope-receipt.py verify-file \
+        --identity "$WORK/provider-source.identity.json" \
+        --path "$SOURCE_MODULE" >/dev/null || return 1
+    python3 -I scripts/system-scope-receipt.py verify-file \
+        --identity "$WORK/provider-copy.identity.json" --path "$MODULE" >/dev/null \
+        || return 1
+    timeout --signal=TERM --kill-after=5s 30s \
+      sudo -n python3 -I "$PWD/scripts/system-scope-receipt.py" mapping \
+        --handshake "$1/mapped" --expected-file "$MODULE" \
+        --source-file "$SOURCE_MODULE" > "$1/workload-mapping-receipt.json" \
+        || return 1
+    timeout --signal=TERM --kill-after=5s 30s \
+      python3 -I scripts/system-scope-receipt.py metadata \
+        --receipt "$1/workload-mapping-receipt.json" --observer "$BINARY" \
+        --observer-source "$OBSERVER_SOURCE" \
+        --source-file "$SOURCE_MODULE" --copy-file "$MODULE" \
+        > "$1/receipt-metadata.json" || return 1
 }
 
 # wait_attach <cond_dir> <observer_pid> <timeout_s> — hold the go file
@@ -305,18 +374,43 @@ run_condition() {
     # corroborates the workload provider. The generated-call truth is
     # identical either way; map_early is recorded per condition.
     if [ "$scope" = pid ]; then MAP_EARLY=0; else MAP_EARLY=1; fi
-    rm -f "$dir/go"
-    P11SCOPE_MEASURE_SEED="$SEED" "$WORK/workload" "$MODULE" "$N_CALLS" "$PACE_US" "$MAP_EARLY" \
-        "$dir/ready" "$dir/go" > "$dir/workload.log" 2>&1 &
-    WPID=$!
+    rm -f "$dir/go" "$dir/mapped" "$dir/receipt-ready" \
+        "$dir/workload-mapping-receipt.json" "$dir/receipt-metadata.json"
+    owned_launch user - "$dir/workload.log" = -- env P11SCOPE_MEASURE_SEED="$SEED" \
+        "$WORK/workload" "$MODULE" "$N_CALLS" "$PACE_US" "$MAP_EARLY" \
+        "$dir/ready" "$dir/go" "$dir/mapped" "$dir/receipt-ready"
+    WPID=$OWNED_PID
+    WPID_STARTTIME=$OWNED_STARTTIME
+    WPID_RECEIPT=$OWNED_RECEIPT
+    owned_verify_launch "$WPID" "$WPID_STARTTIME" "$WPID_RECEIPT" || exit 1
+    WTARGET_PID=$OWNED_COMMAND_PID
     wait_file "$dir/ready" 60 || { echo "workload never became ready" >&2; cat "$dir/workload.log" >&2; exit 1; }
+    T_MAPPING_READY=null
+    T_RECEIPT_READY=null
+    if [ "$MAP_EARLY" -eq 1 ]; then
+        wait_file "$dir/mapped" 60 || {
+            echo "early-mapped workload published no mapping handshake" >&2
+            cat "$dir/workload.log" >&2
+            exit 1
+        }
+        T_MAPPING_READY=$(mono_ns)
+        collect_receipt "$dir" || {
+            echo "could not pin early workload mapping for $cond" >&2
+            exit 1
+        }
+        T_RECEIPT_READY=$(mono_ns)
+        touch "$dir/receipt-ready"
+    fi
 
     CFIFO="$dir/stderr.fifo"
     rm -f "$CFIFO"
     mkfifo "$CFIFO"
-    python3 -I scripts/system-scope-ts.py --out "$dir/stderr-ts.jsonl" \
-        --passthrough "$dir/stderr.txt" < "$CFIFO" &
-    TSPID=$!
+    owned_launch user "$CFIFO" /dev/null "$dir/ts-helper.stderr" -- \
+        python3 -I scripts/system-scope-ts.py --out "$dir/stderr-ts.jsonl" \
+        --passthrough "$dir/stderr.txt"
+    TSPID=$OWNED_PID
+    TSPID_STARTTIME=$OWNED_STARTTIME
+    TSPID_RECEIPT=$OWNED_RECEIPT
 
     # Per-PID runs take the manifest (repo convention: deterministic attach);
     # --system runs use true discovery (the workload already mapped the
@@ -329,12 +423,12 @@ run_condition() {
         if [ "$mode" = trace ]; then
             # shellcheck disable=SC2086
             set -- sudo --preserve-env=SOFTHSM2_CONF "$BINARY" trace \
-                --pid "$WPID" --manifest "$WORK/manifest.json" \
+                --pid "$WTARGET_PID" --manifest "$WORK/manifest.json" \
                 --duration "$DURATION" --max-events 10000000 -o "$TRACE_OUT"
         else
             # shellcheck disable=SC2086
             set -- sudo --preserve-env=SOFTHSM2_CONF "$BINARY" profile \
-                --pid "$WPID" --manifest "$WORK/manifest.json" \
+                --pid "$WTARGET_PID" --manifest "$WORK/manifest.json" \
                 --mode "$mode" --duration "$DURATION" -o "$dir/report.json"
         fi
     else
@@ -359,22 +453,28 @@ run_condition() {
     SFIFO=
     TPID=
     case "$SINK" in
-        file) "$@" > "$dir/observer.stdout" 2> "$CFIFO" & SPID=$! ;;
-        discard) "$@" > /dev/null 2> "$CFIFO" & SPID=$! ;;
+        file)
+            owned_launch root - "$dir/observer.stdout" "$CFIFO" -- "$@"
+            SPID=$OWNED_PID; SPID_STARTTIME=$OWNED_STARTTIME
+            SPID_RECEIPT=$OWNED_RECEIPT
+            ;;
+        discard)
+            owned_launch root - /dev/null "$CFIFO" -- "$@"
+            SPID=$OWNED_PID; SPID_STARTTIME=$OWNED_STARTTIME
+            SPID_RECEIPT=$OWNED_RECEIPT
+            ;;
         slow-pipe)
             SFIFO="$dir/stdout.fifo"
             rm -f "$SFIFO"
             mkfifo "$SFIFO"
-            python3 -I -c "
+            owned_launch user "$SFIFO" /dev/null "$dir/sink-helper.stderr" -- \
+                python3 -I -c "
 import sys, time
 rate = float(sys.argv[1]) * 1024
 out = open(sys.argv[2], 'wb')
 start = time.monotonic()
 written = 0
 while True:
-    # read1, not read: BufferedReader.read(n) waits to fill n bytes,
-    # which would hold back small frames for seconds and break the
-    # attach gate (observed: a whole 3 KB run never reached 4096).
     chunk = sys.stdin.buffer.read1(4096)
     if not chunk:
         break
@@ -385,14 +485,25 @@ while True:
     if ahead > 0:
         time.sleep(ahead / rate)
 out.close()
-" "$SINK_RATE_KBPS" "$dir/observer.stdout" < "$SFIFO" &
-            TPID=$!
-            "$@" > "$SFIFO" 2> "$CFIFO" & SPID=$!
+" "$SINK_RATE_KBPS" "$dir/observer.stdout"
+            TPID=$OWNED_PID; TPID_STARTTIME=$OWNED_STARTTIME
+            TPID_RECEIPT=$OWNED_RECEIPT
+            owned_launch root - "$SFIFO" "$CFIFO" -- "$@"
+            SPID=$OWNED_PID; SPID_STARTTIME=$OWNED_STARTTIME
+            SPID_RECEIPT=$OWNED_RECEIPT
             ;;
     esac
-    sudo -n python3 -I "$PWD/scripts/system-scope-sample.py" --ppid "$SPID" \
-        --out "$dir/samples.jsonl" --interval 0.05 &
-    SMPID=$!
+    owned_verify_launch "$TSPID" "$TSPID_STARTTIME" "$TSPID_RECEIPT" || exit 1
+    [ -z "$TPID" ] || owned_verify_launch "$TPID" "$TPID_STARTTIME" "$TPID_RECEIPT" || exit 1
+    owned_verify_launch "$SPID" "$SPID_STARTTIME" "$SPID_RECEIPT" || exit 1
+    STARGET_PID=$OWNED_COMMAND_PID
+    owned_launch root - "$dir/sampler.stdout" "$dir/sampler.stderr" -- \
+        sudo -n python3 -I "$PWD/scripts/system-scope-sample.py" --ppid "$STARGET_PID" \
+        --out "$dir/samples.jsonl" --interval 0.05
+    SMPID=$OWNED_PID
+    SMPID_STARTTIME=$OWNED_STARTTIME
+    SMPID_RECEIPT=$OWNED_RECEIPT
+    owned_verify_launch "$SMPID" "$SMPID_STARTTIME" "$SMPID_RECEIPT" || exit 1
 
     # Attach gate: the first live frame (profile/metrics to a kept sink)
     # is an in-observer attach-end signal; everywhere else (trace has no
@@ -400,7 +511,7 @@ out.close()
     # post-hoc counts prove the window. The gate used is recorded.
     GATE=frame
     if [ "$mode" != trace ] && [ "$SINK" != discard ]; then
-        if wait_attach "$dir" "$SPID" 600; then
+        if wait_attach "$dir" "$STARGET_PID" 600; then
             :
         else
             rc=$?
@@ -413,7 +524,7 @@ out.close()
             exit 1
         fi
     else
-        if wait_marker "$dir" "$SPID" 600; then
+        if wait_marker "$dir" "$STARGET_PID" 600; then
             :
         else
             rc=$?
@@ -426,7 +537,7 @@ out.close()
             exit 1
         fi
         if [ "$scope" = system ]; then
-            plateau_fds=$(wait_fd_plateau "$dir" "$SPID" 600) || {
+            plateau_fds=$(wait_fd_plateau "$dir" "$STARGET_PID" 600) || {
                 echo "fd plateau never reached for $cond" >&2
                 exit 1
             }
@@ -438,43 +549,118 @@ out.close()
             GATE="marker+settle:10s"
         fi
     fi
-    T_GO=$(mono_ns)
+    T_INITIAL_GO=$(mono_ns)
+    T_GO=$T_INITIAL_GO
     LOADAVG=$(cat /proc/loadavg)
+    kill -0 "$STARGET_PID" 2>/dev/null || {
+        echo "observer exited before owned calls were released" >&2
+        exit 1
+    }
     touch "$dir/go"
 
-    if ! wait_gone "$WPID" 120; then
-        echo "workload hung for $cond" >&2
+    if [ "$MAP_EARLY" -eq 0 ]; then
+        if wait_file_alive "$dir/mapped" "$STARGET_PID" "$WTARGET_PID" 60; then
+            :
+        else
+            rc=$?
+            if [ "$rc" -eq 2 ]; then
+                echo "observer exited before late workload mapping was receipted" >&2
+            elif [ "$rc" -eq 3 ]; then
+                echo "late workload exited before publishing its mapping" >&2
+            else
+                echo "late workload published no mapping handshake" >&2
+            fi
+            cat "$dir/workload.log" >&2
+            exit 1
+        fi
+        T_MAPPING_READY=$(mono_ns)
+        collect_receipt "$dir" || {
+            echo "could not pin late workload mapping for $cond" >&2
+            exit 1
+        }
+        kill -0 "$STARGET_PID" 2>/dev/null || {
+            echo "observer exited before owned calls were released" >&2
+            exit 1
+        }
+        T_RECEIPT_READY=$(mono_ns)
+        touch "$dir/receipt-ready"
+    fi
+
+    if ! owned_finish "$WPID" "$WPID_STARTTIME" "$WPID_RECEIPT" 120; then
+        echo "workload settlement failed for $cond; left unreaped" >&2
         exit 1
     fi
-    wait "$WPID" || { echo "workload failed for $cond" >&2; cat "$dir/workload.log" >&2; exit 1; }
+    WORKLOAD_RC=$OWNED_EXIT
+    [ "$WORKLOAD_RC" -eq 0 ] || {
+        echo "workload failed for $cond (exit=$WORKLOAD_RC)" >&2
+        cat "$dir/workload.log" >&2
+        exit 1
+    }
     WPID=
+    WPID_STARTTIME=
 
     # The observer exits on its own after --duration + detach + publish;
     # detach taper dominates on --system (minutes under concurrent build
     # load), so the deadline is generous and the escalation signals the
     # real observer child, never just its sudo parent.
-    if ! wait_gone "$SPID" $(( DURATION + 600 )); then
-        echo "observer hung for $cond; interrupting" >&2
-        signal_proc "$SPID" INT
-        wait_gone "$SPID" 300 || signal_proc "$SPID" KILL
+    OBSERVER_TIMED_OUT=false
+    OBSERVER_SIGNAL=null
+    observer_wait_state=0
+    owned_wait_supervisor_terminal "$SPID_RECEIPT" $(( DURATION + 600 )) || \
+        observer_wait_state=$?
+    case "$observer_wait_state" in
+        0) ;;
+        1)
+            echo "observer hung for $cond; interrupting" >&2
+            OBSERVER_TIMED_OUT=true
+            ;;
+        *)
+            echo "observer terminal state is unknown for $cond" >&2
+            exit 1
+            ;;
+    esac
+    owned_finish "$SPID" "$SPID_STARTTIME" "$SPID_RECEIPT" 0 || {
+        echo "observer descendant settlement failed for $cond; left unreaped" >&2
+        exit 1
+    }
+    owned_command_outcome "$SPID_RECEIPT" || {
+        echo "observer receipt has no exact command outcome for $cond" >&2
+        exit 1
+    }
+    OBS_RC=$OWNED_COMMAND_EXIT
+    if [ "$OWNED_COMMAND_SIGNAL" != null ]; then
+        OBSERVER_SIGNAL="\"$OWNED_COMMAND_SIGNAL\""
     fi
-    OBS_RC=0
-    wait "$SPID" || OBS_RC=$?
     SPID=
+    SPID_STARTTIME=
     T_EXIT=$(mono_ns)
+    python3 -I scripts/system-scope-receipt.py verify-file \
+        --identity "$WORK/observer.identity.json" --path "$BINARY" >/dev/null || {
+        echo "observer binary changed during $cond" >&2
+        exit 1
+    }
 
     # Sampler/ts/trickle exit on their own once the observer is gone;
     # bound the wait.
-    wait_gone "$SMPID" 15 || signal_proc "$SMPID" KILL
-    wait "$SMPID" 2>/dev/null || true
+    owned_finish "$SMPID" "$SMPID_STARTTIME" "$SMPID_RECEIPT" 15 || {
+        echo "sampler teardown failed for $cond; left unreaped" >&2
+        exit 1
+    }
     SMPID=
-    wait_gone "$TSPID" 15 || kill -KILL "$TSPID" 2>/dev/null || true
-    wait "$TSPID" 2>/dev/null || true
+    SMPID_STARTTIME=
+    owned_finish "$TSPID" "$TSPID_STARTTIME" "$TSPID_RECEIPT" 15 || {
+        echo "timestamp helper teardown failed for $cond; left unreaped" >&2
+        exit 1
+    }
     TSPID=
+    TSPID_STARTTIME=
     if [ -n "$TPID" ]; then
-        wait_gone "$TPID" 60 || kill -KILL "$TPID" 2>/dev/null || true
-        wait "$TPID" 2>/dev/null || true
+        owned_finish "$TPID" "$TPID_STARTTIME" "$TPID_RECEIPT" 60 || {
+            echo "sink helper teardown failed for $cond; left unreaped" >&2
+            exit 1
+        }
         TPID=
+        TPID_STARTTIME=
     fi
     rm -f "$CFIFO"
     CFIFO=
@@ -491,7 +677,7 @@ out.close()
     fi
     reclaim_root_output "$REPORT_SRC" "$dir/samples.jsonl"
 
-    WORKLOAD_ARGV_JSON=$(python3 -I -c "import json; print(json.dumps(['$WORK/workload', '$MODULE', '$N_CALLS', '$PACE_US', '$MAP_EARLY']))")
+    WORKLOAD_ARGV_JSON=$(python3 -I -c "import json; print(json.dumps(['$WORK/workload', '$MODULE', '$N_CALLS', '$PACE_US', '$MAP_EARLY', '$dir/ready', '$dir/go', '$dir/mapped', '$dir/receipt-ready']))")
     MANIFEST_JSON="null"
     if [ "$scope" = pid ]; then MANIFEST_JSON="\"$WORK/manifest.json\""; fi
     RING_JSON="\"default\""; [ -z "$RING_BYTES" ] || RING_JSON="\"$RING_BYTES\""
@@ -499,19 +685,36 @@ out.close()
     cat > "$dir/meta.json" <<EOF
 {"harness": {"name": "system-scope-measure.sh", "git_rev": "$GIT_REV", "git_clean": $GIT_CLEAN,
   "git_tracked_clean": $GIT_TRACKED_CLEAN, "started_iso": "$HARNESS_START_ISO",
-  "observer_exit": $OBS_RC},
+  "observer_exit": $OBS_RC, "observer_timed_out": $OBSERVER_TIMED_OUT,
+  "observer_signal": $OBSERVER_SIGNAL},
  "condition": {"scope": "$scope", "mode": "$mode", "duration_s": $DURATION,
   "n_calls": $N_CALLS, "pace_us": $PACE_US, "seed": $SEED, "map_early": $MAP_EARLY,
   "ring_bytes": $RING_JSON, "drain_interval_ms": $DRAIN_JSON,
   "sink": "$SINK", "sink_rate_kbps": $SINK_RATE_KBPS, "gate": "$GATE",
   "manifest": $MANIFEST_JSON, "binary": "$BINARY", "build_profile": "$PROFILE",
-  "observer_argv": $OBS_ARGV_JSON, "workload_argv": $WORKLOAD_ARGV_JSON},
+  "observer_source_revision": null,
+  "observer_argv": $OBS_ARGV_JSON, "workload_argv": $WORKLOAD_ARGV_JSON,
+  "mapping_gate": "$([ "$MAP_EARLY" -eq 1 ] && echo pre-observer || echo post-attach)"},
  "host": {"kernel": "$KERNEL", "cpu": "$CPU", "ncpu": $NCPU, "loadavg": "$LOADAVG"},
- "timing": {"t_spawn_mono_ns": $T_SPAWN, "t_go_mono_ns": $T_GO, "t_exit_mono_ns": $T_EXIT},
+ "timing": {"t_spawn_mono_ns": $T_SPAWN, "t_initial_go_mono_ns": $T_INITIAL_GO,
+  "t_mapping_ready_mono_ns": $T_MAPPING_READY, "t_receipt_ready_mono_ns": $T_RECEIPT_READY,
+  "t_go_mono_ns": $T_GO, "t_exit_mono_ns": $T_EXIT},
  "artifacts": {"dir": "$dir", "report": "$REPORT_SRC", "samples": "$dir/samples.jsonl",
   "stderr_ts": "$dir/stderr-ts.jsonl", "stderr": "$dir/stderr.txt",
-  "workload_log": "$dir/workload.log"}}
+  "workload_log": "$dir/workload.log", "mapping_receipt": "$dir/workload-mapping-receipt.json"}}
 EOF
+    python3 -I - "$dir/meta.json" "$dir/receipt-metadata.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+meta_path = Path(sys.argv[1])
+receipt_path = Path(sys.argv[2])
+meta = json.loads(meta_path.read_text(encoding="utf-8"))
+receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+meta["condition"].update(receipt)
+meta_path.write_text(json.dumps(meta, sort_keys=True) + "\n", encoding="utf-8")
+PY
     python3 -I scripts/system-scope-measure.py --meta "$dir/meta.json" \
         --report "$REPORT_SRC" --samples "$dir/samples.jsonl" \
         --stderr-ts "$dir/stderr-ts.jsonl" --workload-log "$dir/workload.log" \
@@ -520,6 +723,11 @@ EOF
     # the run (never pipe this script's stdout to `head` — redirect to a
     # file and grep that instead).
     cat "$dir/summary.txt" || true
+    if [ "$OBSERVER_TIMED_OUT" = true ] || [ "$OBS_RC" -ne 0 ] || \
+       [ "$OBSERVER_SIGNAL" != null ]; then
+        echo "observer outcome invalid for $cond: exit=$OBS_RC timeout=$OBSERVER_TIMED_OUT signal=$OBSERVER_SIGNAL" >&2
+        return 1
+    fi
 }
 
 case "$SCOPE" in
@@ -550,8 +758,13 @@ for path in sorted(glob.glob('$WORK/*/record.json')):
     key = record['condition']['scope'] + '/' + record['condition']['mode']
     records[key] = record
 with open('$WORK/matrix.json', 'w') as handle:
+    with open('$WORK/observer.identity.json') as observer_handle:
+        observer_identity = json.load(observer_handle)
     json.dump({'schema': 'p11scope/system-scope-matrix/v1',
-               'git_rev': '$GIT_REV', 'records': records}, handle, indent=2)
+               'harness_git_rev': '$GIT_REV',
+               'observer_source_revision': None,
+               'observer_binary_identity': observer_identity,
+               'records': records}, handle, indent=2)
 try:
     print('matrix: $WORK/matrix.json', flush=True)
 except BrokenPipeError:

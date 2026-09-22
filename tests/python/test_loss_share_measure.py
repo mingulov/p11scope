@@ -282,10 +282,11 @@ class TraceMatchTests(unittest.TestCase):
             "pid", {"C_GenerateRandom": 20000}, 19999)
         self.assertFalse(match)
 
-    def test_system_requires_covering_kernel_total(self):
-        match, _ = MEASURE["trace_counts_match"](
+    def test_system_global_total_is_unattributed(self):
+        match, note = MEASURE["trace_counts_match"](
             "system", {"C_GenerateRandom": 20000}, 20010)
-        self.assertTrue(match)
+        self.assertFalse(match)
+        self.assertIn("lacks per-module attribution", note)
         match, _ = MEASURE["trace_counts_match"](
             "system", {"C_GenerateRandom": 20000}, 19999)
         self.assertFalse(match)

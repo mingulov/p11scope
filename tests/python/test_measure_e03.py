@@ -56,7 +56,8 @@ def run_measure(tmp, *, scope="pid", mode="profile", workload_argv,
                 report_text, stderr_lines=(), truth, truth_prego=None,
                 duration_s=8, samples=(), t_spawn_ns=0, t_go_ns=1_000_000_000,
                 t_exit_ns=12_000_000_000, burst_go_ns=1_000_000_000,
-                burst_end_ns=1_100_000_000, receipt=None):
+                burst_end_ns=1_100_000_000, receipt=None, observer_exit=0,
+                observer_timed_out=False, observer_signal=None):
     """Run the real measurement main() on synthetic inputs.
 
     Returns (record, summary). `receipt` becomes the workload mapping/pin
@@ -78,7 +79,10 @@ def run_measure(tmp, *, scope="pid", mode="profile", workload_argv,
         "timing": {"t_spawn_mono_ns": t_spawn_ns,
                    "t_exit_mono_ns": t_exit_ns,
                    "t_go_mono_ns": t_go_ns},
-        "harness": {"git_rev": "synthetic", "git_clean": True},
+        "harness": {"git_rev": "synthetic", "git_clean": True,
+                    "observer_exit": observer_exit,
+                    "observer_timed_out": observer_timed_out,
+                    "observer_signal": observer_signal},
         "host": {"kernel": "synthetic", "cpu": "synthetic", "ncpu": 1,
                  "loadavg": "0 0 0"},
         "artifacts": {},
@@ -120,9 +124,27 @@ def profile_report(*, functions, discovery, skipped=(), probes=2, slots=1):
                        "functions": functions, "evidence": evidence})
 
 
-def owned_receipt():
+def owned_receipt(*, associated=True):
     return [{"dev": [8, 1], "ino": 11, "sha256": "aa",
-             "path": "/w/owned.so"}]
+             "path": "/w/owned.so",
+             "report_identity_associated": associated}]
+
+
+def trace_report(*, stats_returned, raw_calls, discovery, probes=2):
+    evidence = {name: 0 for name in CHECKER["COUNTERS"]}
+    evidence.update(schema="p11scope/capture-evidence/v1",
+                    completeness="PARTIAL", attached_probes=probes,
+                    slots=1, discovery=discovery, modules_skipped=[])
+    return "\n".join([
+        "CAPTURE privacy=allowlisted",
+        "COUNT_EVIDENCE " + json.dumps({
+            "stats_entered": stats_returned,
+            "stats_returned": stats_returned,
+            "raw_calls": raw_calls,
+        }),
+        "EVIDENCE " + json.dumps(evidence),
+        "",
+    ])
 
 
 class CollapseInferenceTests(unittest.TestCase):
@@ -303,6 +325,44 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(result["owned_calls"], 0)
         self.assertIn("not admitted", result["note"])
 
+    def test_foreign_host_calls_cannot_satisfy_private_copy_truth(self):
+        result = self.assess(
+            [{"names": ["unknown"], "calls": 5000,
+              "module": {"dev": [8, 1], "ino": 22, "sha256": "bb"}}],
+            [{"path": "/usr/lib/softhsm/libsofthsm2.so", "dev": [8, 1],
+              "ino": 22, "sha256": "bb", "tables": [{}]}])
+        self.assertFalse(result["owned_admitted"])
+        self.assertEqual(result["owned_calls"], 0)
+        self.assertEqual(result["total_calls"], 5000)
+
+    def test_device_domain_mismatch_cannot_match_coincident_report_key(self):
+        result = self.assess(
+            [{"names": ["unknown"], "calls": 7,
+              "module": {"dev": [0, 35], "ino": 11, "sha256": "aa"}}],
+            [{"path": "/foreign/subvolume.so", "dev": [0, 35],
+              "ino": 11, "sha256": "aa", "tables": [{}]}],
+            receipts=owned_receipt(associated=False))
+        self.assertIsNone(result["owned_admitted"])
+        self.assertIsNone(result["owned_calls"])
+        self.assertIn("opened-object association", result["note"])
+        with tempfile.TemporaryDirectory() as raw:
+            record, _ = run_measure(
+                Path(raw), scope="system", mode="profile",
+                workload_argv=["/w/workload", "/w/owned.so", "7", "0", "1"],
+                report_text=profile_report(
+                    functions=[{"names": ["unknown"], "calls": 7,
+                                "module": {"dev": [0, 35], "ino": 11,
+                                           "sha256": "aa"}}],
+                    discovery=[{"path": "/foreign/subvolume.so",
+                                "dev": [0, 35], "ino": 11,
+                                "sha256": "aa", "tables": [{}]}]),
+                truth={"C_GenerateRandom": 7},
+                receipt=owned_receipt(associated=False))
+        self.assertFalse(record["truth_vs_observed"]["counts_match"])
+        self.assertFalse(record["window"]["window_valid"])
+        self.assertIn("opened-object association",
+                      record["truth_vs_observed"]["match_note"])
+
     def test_alternate_path_to_the_same_inode_is_owned(self):
         result = self.assess(
             [{"names": ["unknown"], "calls": 7,
@@ -382,6 +442,72 @@ class IdentityTests(unittest.TestCase):
         self.assertTrue(tvo["counts_match"])
         self.assertTrue(record["window"]["window_valid"])
         self.assertIn("not an independently observed consumer count", summary)
+
+    def test_named_foreign_rows_cannot_satisfy_owned_truth_in_raw_main(self):
+        with tempfile.TemporaryDirectory() as raw:
+            record, _ = run_measure(
+                Path(raw), scope="system", mode="profile",
+                workload_argv=["/w/workload", "/w/owned.so", "7", "0", "1"],
+                report_text=profile_report(
+                    functions=[
+                        {"names": ["C_GenerateRandom"], "calls": 0,
+                         "module": {"dev": [8, 1], "ino": 11,
+                                    "sha256": "aa"}},
+                        {"names": ["C_GenerateRandom"], "calls": 7,
+                         "module": {"dev": [8, 1], "ino": 22,
+                                    "sha256": "bb"}},
+                    ],
+                    discovery=[
+                        {"path": "/w/owned.so", "dev": [8, 1],
+                         "ino": 11, "sha256": "aa", "tables": [{}]},
+                        {"path": "/usr/lib/foreign.so", "dev": [8, 1],
+                         "ino": 22, "sha256": "bb", "tables": [{}]},
+                    ]),
+                truth={"C_GenerateRandom": 7}, receipt=owned_receipt())
+        self.assertEqual(record["truth_vs_observed"]["observed"],
+                         {"C_GenerateRandom": 7})
+        self.assertFalse(record["truth_vs_observed"]["counts_match"])
+        self.assertIn("owned-attributed", record["truth_vs_observed"]["match_note"])
+        self.assertFalse(record["window"]["window_valid"])
+
+    def test_system_trace_global_total_is_unknown_without_owned_rows(self):
+        with tempfile.TemporaryDirectory() as raw:
+            record, _ = run_measure(
+                Path(raw), scope="system", mode="trace",
+                workload_argv=["/w/workload", "/w/owned.so", "7", "0", "1"],
+                report_text=trace_report(
+                    stats_returned=7007, raw_calls=7007,
+                    discovery=[{"path": "/w/owned.so", "dev": [8, 1],
+                                "ino": 11, "sha256": "aa", "tables": [{}]}]),
+                truth={"C_GenerateRandom": 7}, receipt=owned_receipt())
+        self.assertFalse(record["truth_vs_observed"]["counts_match"])
+        self.assertIn("lacks per-module attribution",
+                      record["truth_vs_observed"]["match_note"])
+        self.assertFalse(record["window"]["window_valid"])
+
+    def test_each_observer_failure_invalidates_correct_pid_counts(self):
+        failures = [
+            ({"observer_exit": 7}, "observer exit=7"),
+            ({"observer_timed_out": True}, "observer timed out"),
+            ({"observer_signal": "SIGKILL"}, "observer terminated by SIGKILL"),
+        ]
+        for kwargs, expected in failures:
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as raw:
+                record, _ = run_measure(
+                    Path(raw), scope="pid", mode="profile",
+                    workload_argv=["/w/workload", "/w/owned.so", "7", "0", "0"],
+                    report_text=profile_report(
+                        functions=[{"names": ["C_GenerateRandom"], "calls": 7,
+                                    "module": {"dev": [8, 1], "ino": 11,
+                                               "sha256": "aa"}}],
+                        discovery=[{"path": "/w/owned.so", "dev": [8, 1],
+                                    "ino": 11, "sha256": "aa",
+                                    "tables": [{}]}]),
+                    truth={"C_GenerateRandom": 7}, receipt=owned_receipt(),
+                    **kwargs)
+            self.assertTrue(record["truth_vs_observed"]["counts_match"])
+            self.assertFalse(record["window"]["window_valid"])
+            self.assertIn(expected, record["window"]["window_note"])
 
 
 class DeliveredNoteTests(unittest.TestCase):

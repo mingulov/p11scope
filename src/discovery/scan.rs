@@ -2557,34 +2557,62 @@ enum HintMatch {
     Inode,
 }
 
-/// Whether a hint match may be attributed to the object that was just opened.
-///
-/// Only an *inode* match needs corroboration: `/proc/<pid>/maps` renders the mount's
-/// device rather than the file's `st_dev` (see `identity::mapping_file_key`), so the
-/// device cannot be compared and a bare inode number can repeat across filesystems.
-/// Size agreement stands in for it.
-///
-/// A *path* match must never be gated on size. Matching by inode requires
-/// `hint_identity` to have succeeded, so `hint_size == None` implies the match was by
-/// path — a target in another mount namespace, where the hint does not resolve on the
-/// host at all. Gating that on a size the observer cannot read would reject every
-/// correctly-matched containerized module.
-fn hint_gate(
-    kind: HintMatch,
-    hint_size: Option<u64>,
-    actual_size: Option<u64>,
+/// Physical identity read from an already-open object. Unlike the device rendered in
+/// `/proc/<pid>/maps`, two `st_dev` values read by this observer are comparable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OpenedHintIdentity {
+    device: u64,
+    inode: u64,
+    size: u64,
+}
+
+fn opened_hint_identity(file: &File) -> Result<OpenedHintIdentity, String> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot stat opened module object: {error}"))?;
+    Ok(OpenedHintIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        size: metadata.len(),
+    })
+}
+
+fn opened_hint_identity_gate(
+    hint: OpenedHintIdentity,
+    actual: OpenedHintIdentity,
 ) -> Result<(), String> {
-    if kind == HintMatch::Path || hint_size == actual_size {
+    if (hint.device, hint.inode) == (actual.device, actual.inode) {
         return Ok(());
     }
-    let bytes = |size: Option<u64>| size.map_or("unknown".to_string(), |size| size.to_string());
     Err(format!(
-        "a --module hint has this object's inode number but a different size ({} bytes \
-         in the hint, {} bytes in the target); refusing to attribute an object whose \
-         inode number is reused on another filesystem",
-        bytes(hint_size),
-        bytes(actual_size)
+        "opened --module hint physical identity device {} inode {} ({} bytes) does not \
+         match opened target device {} inode {} ({} bytes); refusing an inode alias \
+         that may name another filesystem",
+        hint.device, hint.inode, hint.size, actual.device, actual.inode, actual.size,
     ))
+}
+
+/// Whether a hint match may be attributed to the object that was just opened.
+///
+/// Exact path equality is evaluated in the target's view and remains sufficient even
+/// when the observer cannot open that path. An inode-only candidate is weaker: reopen
+/// the observer hint while the target descriptor is retained, then compare the two
+/// observer `fstat` identities. Only one extra descriptor is live at a time, regardless
+/// of the number of hints.
+fn hint_gate(kind: HintMatch, hint: &Path, actual: &File) -> Result<(), String> {
+    if kind == HintMatch::Path {
+        return Ok(());
+    }
+    let hint_file = open_object(hint).map_err(|error| {
+        format!(
+            "cannot open --module hint {} to corroborate an inode alias: {error}",
+            hint.display()
+        )
+    })?;
+    opened_hint_identity_gate(
+        opened_hint_identity(&hint_file)?,
+        opened_hint_identity(actual)?,
+    )
 }
 
 /// Why `/proc/<pid>/mem` could not be opened, and whether that is a published
@@ -3181,10 +3209,9 @@ fn scan_process_view_with_io_mode(
             continue;
         }
         // Corroborate an inode-only match before attributing the object to the hint.
-        let actual_size = file.metadata().ok().map(|metadata| metadata.len());
         let mut refusal = None;
         let attributable = matched.iter().any(|(index, kind)| {
-            match hint_gate(*kind, hint_ids[*index].map(|(_, size)| size), actual_size) {
+            match hint_gate(*kind, &request.hints[*index], &file) {
                 Ok(()) => true,
                 Err(reason) => {
                     refusal = Some(reason);
@@ -3212,7 +3239,6 @@ fn scan_process_view_with_io_mode(
         };
         // DetailedLegacy has no whole-size gate on this demand-paged export
         // check. Inventory reserves the full logical mapped range below.
-        // `actual_size` stays above for hint attribution.
         let cache_key = InspectedFileKey {
             device: key.device,
             inode: key.inode,
@@ -4647,31 +4673,132 @@ mod tests {
         assert_eq!(budget.attempted_io_bytes(), 0);
     }
 
-    /// Case 3 is the one that matters and the one no end-to-end test can reach here:
-    /// a hint naming a path that exists only inside the target's mount namespace has no
-    /// local identity at all, so the size gate must not apply to it. Reproducing that
-    /// for real needs a container or a second mount namespace, which this slice's tests
-    /// deliberately do not require; the docker gate in a later task exercises it.
+    /// A hint naming a path that exists only inside the target's mount namespace has no
+    /// local identity, so an exact path match must bypass observer-side opening. The
+    /// inode-alias branch has the opposite rule and requires two opened-file identities.
     #[test]
-    fn only_an_inode_match_is_gated_on_size() {
-        // 1. Inode match, sizes agree.
-        assert_eq!(hint_gate(HintMatch::Inode, Some(4096), Some(4096)), Ok(()));
-        // 2. Inode match, sizes differ: refused, and the reason names the collision.
-        let refused = hint_gate(HintMatch::Inode, Some(4096), Some(8192)).unwrap_err();
+    fn alias_hint_requires_same_opened_file_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = directory.path().join("provider.so");
+        let alias = directory.path().join("provider-alias.so");
+        let foreign = directory.path().join("foreign.so");
+        std::fs::write(&provider, b"provider bytes").unwrap();
+        std::fs::hard_link(&provider, &alias).unwrap();
+        std::fs::write(&foreign, b"provider bytes").unwrap();
+        let target = open_object(&provider).unwrap();
+
+        // Two simultaneously opened names for the same object are one alias.
+        assert_eq!(hint_gate(HintMatch::Inode, &alias, &target), Ok(()));
+
+        // Two equal-size files are not aliases, even on one filesystem.
+        let refused = hint_gate(HintMatch::Inode, &foreign, &target).unwrap_err();
         assert!(
-            refused.contains("inode number")
-                && refused.contains("4096")
-                && refused.contains("8192")
-                && refused.contains("reused on another filesystem"),
+            refused.contains("physical identity") && refused.contains("another filesystem"),
             "{refused}"
         );
-        // 3. Path match with no local identity (containerized target): accepted.
-        assert_eq!(hint_gate(HintMatch::Path, None, Some(8192)), Ok(()));
-        // A path match is never gated on size even when both sizes are known.
-        assert_eq!(hint_gate(HintMatch::Path, Some(1), Some(2)), Ok(()));
-        // An inode match cannot arise without a local identity, but must not be
-        // silently accepted if one ever did.
-        assert!(hint_gate(HintMatch::Inode, None, Some(8192)).is_err());
+
+        // The device comparison is material: equal inode and size from another
+        // opened-device domain must still be rejected. The privileged scan fixture
+        // supplies the corresponding real cross-mount pair.
+        let target_identity = opened_hint_identity(&target).unwrap();
+        let foreign_device = OpenedHintIdentity {
+            device: target_identity.device.wrapping_add(1),
+            ..target_identity
+        };
+        assert!(opened_hint_identity_gate(foreign_device, target_identity).is_err());
+
+        // Exact path match with no local identity (containerized target): accepted.
+        let absent = directory.path().join("target-namespace-only.so");
+        assert_eq!(hint_gate(HintMatch::Path, &absent, &target), Ok(()));
+    }
+
+    #[test]
+    fn scan_accepts_a_real_hardlink_alias() {
+        let mut fixture = BracketFixture::new(8, true);
+        let alias = fixture._dir.path().join("provider-alias.so");
+        std::fs::hard_link(&fixture.path, &alias).unwrap();
+        let view = ProcessView::open(fixture.view.id(), fixture.view.pid()).unwrap();
+        let hints = [alias];
+        let outcome = scan_process_view_with_io(
+            &ScanRequest {
+                pid: view.pid(),
+                hints: &hints,
+                hooks: &HookRegistry::builtin(),
+            },
+            &view,
+            &mut CaptureWorkBudget::default(),
+            &mut fixture,
+        )
+        .unwrap();
+        assert_eq!(outcome.modules().len(), 1, "{:#?}", outcome.skipped());
+    }
+
+    #[test]
+    #[ignore = "requires a root-owned target with two private cross-device mounts"]
+    fn privileged_cross_device_same_inode_alias_is_refused_on_scan_path() {
+        let pid = std::env::var("P11SCOPE_ALIAS_COLLISION_PID")
+            .expect("fixture target pid")
+            .parse::<u32>()
+            .expect("numeric fixture target pid");
+        let hint = PathBuf::from(
+            std::env::var_os("P11SCOPE_ALIAS_COLLISION_HINT").expect("fixture hint path"),
+        );
+        let target = PathBuf::from(
+            std::env::var_os("P11SCOPE_ALIAS_COLLISION_TARGET").expect("fixture target path"),
+        );
+        let hardlink = PathBuf::from(
+            std::env::var_os("P11SCOPE_ALIAS_COLLISION_HARDLINK")
+                .expect("fixture target hardlink path"),
+        );
+        let hint_metadata = std::fs::metadata(&hint).expect("stat fixture hint");
+        let target_metadata = std::fs::metadata(&target).expect("stat fixture target");
+        let hardlink_metadata = std::fs::metadata(&hardlink).expect("stat fixture hardlink");
+        assert_ne!(hint_metadata.dev(), target_metadata.dev());
+        assert_eq!(hint_metadata.ino(), target_metadata.ino());
+        assert_eq!(hint_metadata.len(), target_metadata.len());
+        assert_eq!(hardlink_metadata.dev(), target_metadata.dev());
+        assert_eq!(hardlink_metadata.ino(), target_metadata.ino());
+
+        let view = ProcessView::open(ProcessViewId(0), pid).expect("retain fixture target");
+        let scan = |hint: PathBuf| {
+            let hints = [hint];
+            scan_process_view_without_memory(
+                &ScanRequest {
+                    pid,
+                    hints: &hints,
+                    hooks: &HookRegistry::builtin(),
+                },
+                &view,
+                &mut CaptureWorkBudget::default(),
+            )
+            .expect("scan fixture target")
+        };
+
+        let exact = scan(target);
+        assert_eq!(
+            exact.modules().len(),
+            1,
+            "valid provider was not found by exact target path: {:#?}",
+            exact.skipped()
+        );
+        let alias = scan(hardlink);
+        assert_eq!(
+            alias.modules().len(),
+            1,
+            "valid provider was not found by its physical hardlink: {:#?}",
+            alias.skipped()
+        );
+
+        let outcome = scan(hint);
+        assert!(outcome.modules().is_empty(), "foreign alias was admitted");
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.reason.contains("physical identity")),
+            "missing physical-identity refusal: {:#?}",
+            outcome.skipped()
+        );
     }
 
     #[test]
@@ -4745,6 +4872,18 @@ mod tests {
         assert!(
             guard < hint_gate,
             "identity must be checked before hint gating"
+        );
+        let physical_hint_gate = scan_lines
+            .iter()
+            .position(|line| *line == "match hint_gate(*kind, &request.hints[*index], &file) {")
+            .expect("scan path must gate aliases using both opened files");
+        let elf_pin = scan_lines
+            .iter()
+            .position(|line| *line == "let before = match pin_of(&file) {")
+            .expect("ELF inspection pin");
+        assert!(
+            guard < physical_hint_gate && physical_hint_gate < elf_pin,
+            "alias rejection must happen after maps identity and before ELF/table work"
         );
         let guard_body = &include_str!("scan.rs")[include_str!("scan.rs")
             .find("fn opened_file_identity_guard(")

@@ -2,6 +2,8 @@
 //! Owned Detailed lifecycle gates and their unprivileged fixture protocols.
 //! Explicitly selected ignored gates fail on unavailable kernel support.
 
+mod exec_tests;
+
 use super::*;
 use crate::discovery::identity::pin_scanned_view_objects;
 use crate::discovery::scan::{CaptureWorkBudget, ScannedModule};

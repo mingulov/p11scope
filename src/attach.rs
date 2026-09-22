@@ -38,6 +38,12 @@ use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+// I3 will consume this preparation capability; I2b installs no callers or links.
+#[allow(dead_code)]
+mod inventory;
+#[allow(unused_imports)]
+pub(crate) use inventory::PreparedInventory;
+
 const BPF_F_RDONLY_PROG: u32 = 1 << 7;
 #[derive(Debug)]
 pub(crate) enum DynamicLoaderAttachFailure {

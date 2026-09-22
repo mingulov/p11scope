@@ -231,12 +231,14 @@ fn document(
             session.lifecycle_tracking_unavailable().is_some(),
         ),
         render::SchedulingEvidence::default(),
+        None,
+        None,
     );
     evidence.mark_terminal_drain_unproven();
     let kernel_release = std::fs::read_to_string("/proc/sys/kernel/osrelease")?;
     let output = render::profile_json(
         &reports,
-        &evidence,
+        render::VersionedEvidence::wrap(&evidence),
         state,
         &render::CaptureMeta {
             started: &fmt_rfc3339(started),
@@ -424,7 +426,7 @@ fn scenario(
     let mut consumed = 0;
     let malformed;
     {
-        let mut drain = session.event_drain()?;
+        let drain = session.event_drain()?;
         drain.begin_root_tail(&mut tail)?;
         let (positions, bytes, reached) = tail.observed_boundary();
         let boundary = positions.context("stored boundary")?;
@@ -517,7 +519,7 @@ fn scenario(
                 && positions.producer == boundary.producer,
             "fixed boundary was not reached"
         );
-        malformed = drain.malformed();
+        malformed = drain.take_malformed_delta();
         ensure!(malformed == 0, "malformed EVENTS records");
         writeln!(io::stdout(), "root-runtime {kind:?} reached-boundary")?;
     }

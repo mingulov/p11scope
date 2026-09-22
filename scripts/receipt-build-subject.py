@@ -21,6 +21,13 @@ class MutationError(RuntimeError):
 _MAX_OFFSET = 2**63 - 1
 
 
+# Candidate-only API contract: run_reconciled_build returns frozen
+# production bytes. The "ProductionFreeze" return-annotation name is pinned
+# by tests/python/test_receipt_discovery_api.py, so keep this alias defined
+# (also satisfies ruff F821 for the string annotation).
+ProductionFreeze = bytes
+
+
 @_dataclasses.dataclass(slots=True, eq=False)
 class _OpenDescription:
     kind: str
@@ -1798,7 +1805,7 @@ def run_reconciled_build(
                     stage2_capability = True
                 else:
                     stage2_failure = MutationError("ledger duplication failed")
-            except Exception as exc:
+            except Exception:
                 stage2_failure = MutationError("ledger duplication failed")
             else:
                 if (
@@ -1823,7 +1830,7 @@ def run_reconciled_build(
                     stage2_capability = True
                 else:
                     stage2_failure = MutationError("private parent open failed")
-            except Exception as exc:
+            except Exception:
                 stage2_failure = MutationError("private parent open failed")
             else:
                 if (

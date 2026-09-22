@@ -7,7 +7,6 @@ Run: python3 -I tests/python/test_loss_share_measure.py -v
 """
 
 import runpy
-import sys
 import unittest
 from pathlib import Path
 

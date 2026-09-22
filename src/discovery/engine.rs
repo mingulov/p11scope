@@ -20,10 +20,12 @@ use crate::discovery::scan::{
     CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedEntry, ScannedInterface, ScannedModule,
     ScannedTable, Skipped, TableIdentity, decode_exact_table, exact_table_addresses,
     exact_table_bytes, index_maps_or_refuse, read_elf_snapshot, read_maps_or_refuse,
-    scan_process_view, scan_process_view_without_memory, spans_for, table_evidence_score,
-    table_linkage, target_layout,
+    scan_process_view, scan_process_view_without_memory, scan_skip_truncates, spans_for,
+    table_evidence_score, table_linkage, target_layout,
 };
-use crate::discovery::scheduler::{DiscoveryScheduler, InventoryCadence, MAX_PENDING_REFRESH};
+use crate::discovery::scheduler::{
+    DiscoveryScheduler, InventoryCadence, MAX_PENDING_REFRESH, MAX_POLLING_RESCANS,
+};
 use crate::manifest_input::{read_manifest, selection_surface_usable, validate_structure};
 use crate::process::{self, OriginalGenerationState, ProcessView, ProcessViewId};
 use crate::run::OwnedChild;
@@ -127,6 +129,26 @@ pub struct Engine {
     /// `P11SCOPE_BROAD_ADMIT=1` in `discover_plan` (production) or directly
     /// by broad tests; `false` preserves selected admission everywhere.
     broad_admit: bool,
+    /// View IDs that have ever contributed provider evidence (a scan or a
+    /// live record observed modules for them). Eviction eligibility needs
+    /// this history, not just the current state: the capture budget keys
+    /// runtime (non-file-backed) table/interface identities by view ID, and
+    /// `scan.rs` offers no per-view scrub — so an ID that ever carried such
+    /// evidence must never be recycled into a new generation's scan. Only
+    /// never-dirty, currently-empty views rotate. Never cleared: IDs are
+    /// reused, and a reused dirty ID stays non-rotatable. Bounded by the
+    /// view-ID space.
+    exploratory_dirty: BTreeSet<ProcessViewId>,
+    /// Actual deep-scan executions driven by discovery and inventory
+    /// (initial scans, refresh rescans, new-view admissions, loader
+    /// rescans) — the E06 oracle alongside maps bytes, never derived from
+    /// them.
+    deep_scans: u64,
+    /// Loader-arm attempts driven by inventory (`arm_loader_or_partial`
+    /// calls) — the hook half of the same oracle.
+    loader_arms: u64,
+    /// Cumulative exploratory views evicted by rotation.
+    exploratory_evictions: u64,
     #[cfg(test)]
     loader_memory_scan_attempts: usize,
 }
@@ -1307,6 +1329,63 @@ impl CaptureFacts {
             .ok_or_else(|| anyhow!("provider exact identity has no stable module ID"))
     }
 
+    /// The fallible surface of `merge_current` as pure checks: every `?`
+    /// below runs first, in the same order, in `merge_current` itself, so
+    /// this proves exactly what the merge would fail on — without cloning
+    /// or walking the history. `preflight_candidate_publication` uses it
+    /// instead of a throwaway merge (E25); `merge_current` re-runs it as
+    /// its first step and keeps its own interleaved checks, so proof and
+    /// merge cannot disagree on current inputs. If a new fallible lookup
+    /// is ever added to the merge, it must be added here first, in merge
+    /// order — the equivalence tests pin every current failure mode.
+    fn resolve_merge_inputs(
+        &self,
+        plan: &plan::AttachPlan,
+        pinned: &PinnedObjects,
+        modules: &[ReconciledModule],
+        manifests: &[Manifest],
+        manifest_ordinals: &[u32],
+    ) -> Result<()> {
+        if manifests.len() != manifest_ordinals.len() {
+            bail!("accepted manifest history lost its source ordinals");
+        }
+        for module in modules {
+            self.module_id_for_object(pinned, module.object)?;
+            pinned
+                .owned_timing_key(module.object)
+                .ok_or_else(|| anyhow!("scanned provider has no exact opened identity"))?;
+            for (table_index, table) in module.scanned.tables.iter().enumerate() {
+                let objects = module.entry_objects.get(table_index).ok_or_else(|| {
+                    anyhow!("reconciled provider table has no parallel target identities")
+                })?;
+                if objects.len() != table.entries.len() {
+                    bail!("reconciled provider table target identities are incomplete");
+                }
+                for object in objects {
+                    pinned.owned_timing_key(*object).ok_or_else(|| {
+                        anyhow!("decoded target object has no exact opened identity")
+                    })?;
+                }
+            }
+        }
+        for manifest in manifests {
+            let object = manifest_module_object(manifest, pinned).ok_or_else(|| {
+                anyhow!(
+                    "accepted manifest {} has no exact pinned provider identity",
+                    manifest.module_path
+                )
+            })?;
+            self.module_id_for_object(pinned, object)?;
+            pinned
+                .owned_timing_key(object)
+                .ok_or_else(|| anyhow!("manifest provider has no exact opened identity"))?;
+        }
+        for (object, _) in plan.refused_modules() {
+            self.module_id_for_object(pinned, object)?;
+        }
+        Ok(())
+    }
+
     fn merge_current(
         &mut self,
         plan: &plan::AttachPlan,
@@ -1316,9 +1395,9 @@ impl CaptureFacts {
         manifest_ordinals: &[u32],
         counters: &DiscoveryCounters,
     ) -> Result<()> {
-        if manifests.len() != manifest_ordinals.len() {
-            bail!("accepted manifest history lost its source ordinals");
-        }
+        // Proves the fallible surface before cloning: same checks, same
+        // order, same first failure as the interleaved checks below.
+        self.resolve_merge_inputs(plan, pinned, modules, manifests, manifest_ordinals)?;
         let mut history = self.visible_history().clone();
         let live_views: BTreeSet<_> = modules.iter().map(|module| module.scanned.view).collect();
         prune_selection_inventory(&mut history, &live_views);
@@ -3403,27 +3482,15 @@ fn scan_and_pin(
         broad_admit,
         scan_process_view,
     )
+    .map(|(modules, pins, _)| (modules, pins))
 }
 
-fn scan_and_pin_without_memory(
-    view: &ProcessView,
-    hints: &[PathBuf],
-    hooks: &HookRegistry,
-    budget: &mut CaptureWorkBudget,
-    counters: &mut DiscoveryCounters,
-    broad_admit: bool,
-) -> Result<(Vec<ScannedModule>, PinnedObjects)> {
-    scan_and_pin_with(
-        view,
-        hints,
-        hooks,
-        budget,
-        counters,
-        broad_admit,
-        scan_process_view_without_memory,
-    )
-}
-
+/// One scan plus its pins plus whether absence inside it is verified. The
+/// `complete` flag is the scan-to-live-candidate boundary: only a memory
+/// scan that ran unbounded (no stop before, during or after), refused no
+/// new candidate, and emitted no truncating skip may retire previously
+/// observed modules by absence. Broadening and pinning run after the
+/// snapshot, so their own budget effects never rewrite the scan's verdict.
 fn scan_and_pin_with(
     view: &ProcessView,
     hints: &[PathBuf],
@@ -3436,7 +3503,9 @@ fn scan_and_pin_with(
         &ProcessView,
         &mut CaptureWorkBudget,
     ) -> std::result::Result<ScanOutcome, String>,
-) -> Result<(Vec<ScannedModule>, PinnedObjects)> {
+) -> Result<(Vec<ScannedModule>, PinnedObjects, bool)> {
+    let stop_before = budget.stopped_reason();
+    let refusals_before = budget.refusal_counts();
     let outcome = scan(
         &ScanRequest {
             pid: view.pid(),
@@ -3447,6 +3516,14 @@ fn scan_and_pin_with(
         budget,
     )
     .map_err(|error| anyhow!("scanning process view {:?}: {error}", view.id()))?;
+    let complete = outcome.unavailable_reason().is_none()
+        && stop_before.is_none()
+        && budget.stopped_reason().is_none()
+        && budget.refusal_counts() == refusals_before
+        && !outcome
+            .skipped()
+            .iter()
+            .any(|skip| scan_skip_truncates(&skip.reason));
     counters.scan_unavailable = counters.scan_unavailable.or(outcome.unavailable_reason());
     // Retain acquisition losses before pinning can fail on an exited generation.
     for skipped in outcome.skipped() {
@@ -3472,7 +3549,7 @@ fn scan_and_pin_with(
         attribution::note(&skipped);
         counters.object_skips.push(skipped);
     }
-    Ok((modules, pinned))
+    Ok((modules, pinned, complete))
 }
 
 /// Task 1.6 experiment: recognized fixed-family pool layout.
@@ -3838,6 +3915,76 @@ fn select_deep_scan_candidates(sweep: &[(u32, Vec<MapEntry>)], max_pids: usize) 
         .collect()
 }
 
+/// Rotation's fairness-tiered variant of the selection above: identical
+/// grouping, global rarity census, and group order — but within each group
+/// the representative is the lowest never-evicted member (falling back to
+/// the lowest stale one), and unmapped pids trail fresh-first, pid order
+/// within each tier. Rarity still beats pid order across groups, so a rare
+/// provider is always reached first; within a class, never-scanned pids
+/// beat re-scans, so rotation covers every pid instead of churning the
+/// lowest evictees back ahead of higher never-scanned ones. With no stale
+/// pids this agrees with `select_deep_scan_candidates` exactly.
+fn select_rotation_candidates(
+    sweep: &[(u32, Vec<MapEntry>)],
+    max_pids: usize,
+    stale: &BTreeSet<u32>,
+) -> Vec<u32> {
+    if sweep.len() <= max_pids {
+        let mut pids: Vec<u32> = sweep.iter().map(|(pid, _)| *pid).collect();
+        pids.sort_unstable();
+        return pids;
+    }
+    let mut groups: BTreeMap<BTreeSet<ObjectKey>, Vec<u32>> = BTreeMap::new();
+    let mut unmapped: Vec<u32> = Vec::new();
+    for (pid, entries) in sweep {
+        let key: BTreeSet<ObjectKey> = entries
+            .iter()
+            .filter(|entry| is_provider_mapping(entry))
+            .map(ObjectKey::of)
+            .collect();
+        if key.is_empty() {
+            unmapped.push(*pid);
+        } else {
+            groups.entry(key).or_default().push(*pid);
+        }
+    }
+    let mut census: BTreeMap<ObjectKey, usize> = BTreeMap::new();
+    for (key, members) in &groups {
+        for file in key {
+            *census.entry(*file).or_default() += members.len();
+        }
+    }
+    let mut ordered: Vec<(BTreeSet<ObjectKey>, Vec<u32>)> = groups.into_iter().collect();
+    for (_, members) in &mut ordered {
+        members.sort_unstable();
+    }
+    ordered.sort_by_key(|(key, members)| {
+        let min_global = key
+            .iter()
+            .map(|file| census[file])
+            .min()
+            .unwrap_or(usize::MAX);
+        (min_global, members.len(), members[0])
+    });
+    unmapped.sort_unstable();
+    // `partition` preserves the sorted order within each tier.
+    let (fresh_unmapped, stale_unmapped): (Vec<u32>, Vec<u32>) =
+        unmapped.into_iter().partition(|pid| !stale.contains(pid));
+    ordered
+        .into_iter()
+        .map(|(_, members)| {
+            members
+                .iter()
+                .copied()
+                .find(|pid| !stale.contains(pid))
+                .unwrap_or(members[0])
+        })
+        .chain(fresh_unmapped)
+        .chain(stale_unmapped)
+        .take(max_pids)
+        .collect()
+}
+
 /// Categorical over-cap diagnostic: the actual selected count out of the
 /// enumerated count, the cap, and the selection method. Selection is
 /// provider-rarity order, not a pid prefix, so the message must never say
@@ -3981,15 +4128,18 @@ fn discover_plan(
         }
         let mut counters = DiscoveryCounters::default();
         let broad_admit = discovered.broad_admit;
-        match scan_and_pin(
+        let scan_result = scan_and_pin(
             &view,
             &a.modules,
             &a.hooks,
             &mut discovered.budget,
             &mut counters,
             broad_admit,
-        ) {
+        );
+        discovered.deep_scans = discovered.deep_scans.saturating_add(1);
+        match scan_result {
             Ok((found, pins)) => {
+                discovered.note_scan_observed(view.id(), &found);
                 discovered.scan_inputs.insert(
                     view.id(),
                     ScanInput {
@@ -5399,8 +5549,27 @@ fn export_abi(kind: u8) -> Option<HookAbi> {
     match kind {
         DISCOVERY_KIND_FUNCTION_LIST_RETURN => Some(HookAbi::FunctionList),
         DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN => Some(HookAbi::InterfaceList),
+        DISCOVERY_KIND_INTERFACE_RETURN => Some(HookAbi::Interface),
         _ => None,
     }
+}
+
+/// The table version a record's carried prefix claims, when it claims
+/// one. Export records carry the raw word; selection records carry the
+/// probe's version class instead (their raw word fields stay zero by
+/// transport contract). An unknown class claims nothing: the prefix is
+/// unusable and the table must re-validate from memory alone.
+fn record_prefix_version(record: &DiscoveryRecord) -> Option<(u8, u8)> {
+    if record.kind == DISCOVERY_KIND_INTERFACE_RETURN {
+        return match record.selection_version_class {
+            DISCOVERY_VERSION_V2_40 => Some((2, 40)),
+            DISCOVERY_VERSION_V3_0 => Some((3, 0)),
+            DISCOVERY_VERSION_V3_1 => Some((3, 1)),
+            DISCOVERY_VERSION_V3_2 => Some((3, 2)),
+            _ => None,
+        };
+    }
+    Some((record.version_major, record.version_minor))
 }
 
 fn interface_list_is_truncated(record: &DiscoveryRecord) -> bool {
@@ -5512,14 +5681,42 @@ fn lower_export_record(
     if record.kind == DISCOVERY_KIND_INTERFACE_RETURN {
         return Err("selection record reached export lowering".into());
     }
+    lower_publication_record(view, maps, hooks, record, budget, None)
+}
+
+/// The shared file-backed lowering behind export records and supported
+/// `C_GetInterface` results (Package F): a selection record carries no
+/// symbol ID — the transport binds it to a capture-local hook instead —
+/// so its caller passes that hook as `gi_hook`. Selection results lower
+/// exactly like list elements, except their interface stays unlinked: a
+/// selection result has no list position, so none may widen into linkage.
+fn lower_publication_record(
+    view: &ProcessView,
+    maps: &MapIndex<'_>,
+    hooks: &HookRegistry,
+    record: &DiscoveryRecord,
+    budget: &mut CaptureWorkBudget,
+    gi_hook: Option<(&str, HookAbi)>,
+) -> Result<Option<ScannedModule>, String> {
     if !valid_discovery_record(record) {
         return Err("malformed discovery record reached export lowering".into());
     }
     let Some(expected_abi) = export_abi(record.kind) else {
         return Err("non-export discovery record reached export lowering".into());
     };
-    let Some((hook_name, abi)) = hooks.by_id(record.symbol_id) else {
-        return Err("export record names an unknown private hook ID".into());
+    let (hook_name, abi) = match record.kind {
+        DISCOVERY_KIND_INTERFACE_RETURN => {
+            gi_hook.ok_or("selection record reached export lowering without its bound hook")?
+        }
+        _ => {
+            if gi_hook.is_some() {
+                return Err("export record reached export lowering with a selection hook".into());
+            }
+            let Some(resolved) = hooks.by_id(record.symbol_id) else {
+                return Err("export record names an unknown private hook ID".into());
+            };
+            resolved
+        }
     };
     if abi != expected_abi {
         return Err("export record kind disagrees with its private hook ABI".into());
@@ -5555,7 +5752,10 @@ fn lower_export_record(
         return Ok(None);
     }
 
-    let word = u64::from(record.version_major) | (u64::from(record.version_minor) << 8);
+    let Some((prefix_major, prefix_minor)) = record_prefix_version(record) else {
+        return Ok(None);
+    };
+    let word = u64::from(prefix_major) | (u64::from(prefix_minor) << 8);
     let Some((version, spans, walk)) = spans_for(word) else {
         return Ok(None);
     };
@@ -5625,16 +5825,24 @@ fn lower_export_record(
     }
 
     let interfaces = match record.kind {
-        DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN | DISCOVERY_KIND_INTERFACE_RETURN => {
-            vec![ScannedInterface {
-                index: usize::from(record.interface_index),
-                name_class: name_class(record.name_class),
-                name_lossy: None,
-                name_private: None,
-                flags: record.interface_flags,
-                table: Some(0),
-            }]
-        }
+        DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN => vec![ScannedInterface {
+            index: usize::from(record.interface_index),
+            name_class: name_class(record.name_class),
+            name_lossy: None,
+            name_private: None,
+            flags: record.interface_flags,
+            table: Some(0),
+        }],
+        DISCOVERY_KIND_INTERFACE_RETURN => vec![ScannedInterface {
+            index: usize::from(record.interface_index),
+            name_class: name_class(record.name_class),
+            name_lossy: None,
+            name_private: None,
+            flags: record.interface_flags,
+            // Unlinked (see the heap arm below): the echoed index is the
+            // request version class, not a list position.
+            table: None,
+        }],
         _ => Vec::new(),
     };
     let module = ScannedModule {
@@ -5685,28 +5893,39 @@ fn lower_export_record(
 /// The lowered interface stays unlinked (`table: None`): the live-return
 /// flag on the table carries the publication evidence, while linkage
 /// stays the sweep's own decoded triples — a live list position never
-/// widens into interface linkage.
-fn lower_heap_export_record(
+/// widens into interface linkage. Selection results lower here under
+/// the same contract (their echoed index is a request class, not a
+/// position at all).
+fn lower_heap_publication_record(
     view: &ProcessView,
     index_a: &MapIndex<'_>,
     hooks: &HookRegistry,
     record: &DiscoveryRecord,
     modules: &[ReconciledModule],
     budget: &mut CaptureWorkBudget,
+    gi_hook: Option<(&str, HookAbi)>,
 ) -> Result<HeapLowerOutcome, String> {
     // Mirror the file-backed path's validation: this runs only after it
     // returned None, but a record is never trusted twice — re-derive.
-    if record.kind == DISCOVERY_KIND_INTERFACE_RETURN {
-        return Err("selection record reached export lowering".into());
-    }
     if !valid_discovery_record(record) {
         return Err("malformed discovery record reached export lowering".into());
     }
     let Some(expected_abi) = export_abi(record.kind) else {
         return Err("non-export discovery record reached export lowering".into());
     };
-    let Some((hook_name, abi)) = hooks.by_id(record.symbol_id) else {
-        return Err("export record names an unknown private hook ID".into());
+    let (hook_name, abi) = match record.kind {
+        DISCOVERY_KIND_INTERFACE_RETURN => {
+            gi_hook.ok_or("selection record reached export lowering without its bound hook")?
+        }
+        _ => {
+            if gi_hook.is_some() {
+                return Err("export record reached export lowering with a selection hook".into());
+            }
+            let Some(resolved) = hooks.by_id(record.symbol_id) else {
+                return Err("export record names an unknown private hook ID".into());
+            };
+            resolved
+        }
     };
     if abi != expected_abi {
         return Err("export record kind disagrees with its private hook ABI".into());
@@ -5770,7 +5989,12 @@ fn lower_heap_export_record(
     // under us — refuse, never blend.
     let usable = usize::from(record.usable_n);
     if usable > 0 {
-        if (record.version_major, record.version_minor) != table.version {
+        let Some(prefix_version) = record_prefix_version(record) else {
+            return Ok(HeapLowerOutcome::Refused(
+                "a published selection result carried a table prefix with an unknown version class",
+            ));
+        };
+        if prefix_version != table.version {
             return Ok(HeapLowerOutcome::Refused(
                 "a published table changed between the probe capture and validation",
             ));
@@ -5869,6 +6093,21 @@ fn lower_heap_export_record(
         return Err("process generation changed during export lowering".into());
     }
     Ok(HeapLowerOutcome::Admitted(module))
+}
+
+/// Whether `module` has no counterpart among already-retained modules:
+/// the same (view, mount namespace, object key, path) match
+/// `merge_scanned_module` unions on, ignoring decoder ABI (an
+/// ABI-mismatched twin keeps its raw pins; binding drops whichever twin it
+/// cannot use). The retention tests keep this predicate in sync with that
+/// union.
+fn is_newly_observed_module(retained: &[ScannedModule], module: &ScannedModule) -> bool {
+    !retained.iter().any(|known| {
+        known.view == module.view
+            && known.mount_namespace == module.mount_namespace
+            && known.key == module.key
+            && known.path == module.path
+    })
 }
 
 fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedModule) {
@@ -6808,6 +7047,10 @@ impl Engine {
             loader_contexts: BTreeMap::new(),
             pending_loader_scans: BTreeMap::new(),
             broad_admit: false,
+            exploratory_dirty: BTreeSet::new(),
+            deep_scans: 0,
+            loader_arms: 0,
+            exploratory_evictions: 0,
             #[cfg(test)]
             loader_memory_scan_attempts: 0,
         }
@@ -7307,6 +7550,10 @@ impl Engine {
         if !self.retired_view_ids.contains(&id.0) {
             self.retired_view_ids.push(id.0);
         }
+        // `exploratory_dirty` is deliberately NOT cleared here: IDs are
+        // reused, and a reused dirty ID stays non-rotatable — the capture
+        // budget still keys that ID's old runtime evidence, and only a
+        // never-dirty ID is provably free of it. Bounded by the ID space.
     }
 
     fn retain_view_id(&mut self, id: ProcessViewId) -> Result<()> {
@@ -7847,11 +8094,19 @@ impl Engine {
         budget: &mut CaptureWorkBudget,
         broad_admit: bool,
     ) -> (
-        Result<(Vec<ScannedModule>, PinnedObjects)>,
+        Result<(Vec<ScannedModule>, PinnedObjects, bool)>,
         DiscoveryCounters,
     ) {
         Self::scan_retained_view_with(|counters| {
-            scan_and_pin(view, module_hints, hooks, budget, counters, broad_admit)
+            scan_and_pin_with(
+                view,
+                module_hints,
+                hooks,
+                budget,
+                counters,
+                broad_admit,
+                scan_process_view,
+            )
         })
     }
 
@@ -7862,11 +8117,19 @@ impl Engine {
         budget: &mut CaptureWorkBudget,
         broad_admit: bool,
     ) -> (
-        Result<(Vec<ScannedModule>, PinnedObjects)>,
+        Result<(Vec<ScannedModule>, PinnedObjects, bool)>,
         DiscoveryCounters,
     ) {
         Self::scan_retained_view_with(|counters| {
-            scan_and_pin_without_memory(view, module_hints, hooks, budget, counters, broad_admit)
+            scan_and_pin_with(
+                view,
+                module_hints,
+                hooks,
+                budget,
+                counters,
+                broad_admit,
+                scan_process_view_without_memory,
+            )
         })
     }
 
@@ -7936,9 +8199,9 @@ impl Engine {
     }
 
     fn scan_retained_view_with(
-        scan: impl FnOnce(&mut DiscoveryCounters) -> Result<(Vec<ScannedModule>, PinnedObjects)>,
+        scan: impl FnOnce(&mut DiscoveryCounters) -> Result<(Vec<ScannedModule>, PinnedObjects, bool)>,
     ) -> (
-        Result<(Vec<ScannedModule>, PinnedObjects)>,
+        Result<(Vec<ScannedModule>, PinnedObjects, bool)>,
         DiscoveryCounters,
     ) {
         let mut counters = DiscoveryCounters::default();
@@ -8675,17 +8938,16 @@ impl Engine {
         if !candidate_identity_is_complete(&candidate.plan, &candidate.modules, &candidate.pinned) {
             bail!("live candidate lost exact pinned identity before link mutation");
         }
-        // ponytail: proves the publication on a throwaway copy of the fact
-        // store, so the fallible surface is exact by construction rather than
-        // a second list that can drift. Swap for a dedicated preflight walk if
-        // the doubled history merge ever shows up in capture cost.
-        self.capture_facts.clone().merge_current(
+        // A dedicated preflight walk over the merge's fallible surface
+        // (E25): proves exactly what `merge_current` would fail on without
+        // cloning or walking the history. `merge_current` re-runs the same
+        // checks first and keeps its own, so proof and merge agree.
+        self.capture_facts.resolve_merge_inputs(
             &candidate.plan,
             &candidate.pinned,
             &candidate.modules,
             &self.manifests,
             &self.manifest_ordinals,
-            &self.counters,
         )
     }
 
@@ -9181,13 +9443,14 @@ impl Engine {
                 // factory published that it cannot own — heap wrappers,
                 // anonymous-BSS tables, bare list-element addresses —
                 // validates through the heap contract instead.
-                Ok(None) => match lower_heap_export_record(
+                Ok(None) => match lower_heap_publication_record(
                     view,
                     &index,
                     &self.hooks,
                     record,
                     &self.modules,
                     &mut self.budget,
+                    None,
                 ) {
                     Err(error) => return Err(anyhow!(error)),
                     Ok(HeapLowerOutcome::Admitted(module)) => module,
@@ -9200,6 +9463,29 @@ impl Engine {
                 },
             }
         };
+        self.apply_lowered_module(
+            lowered,
+            position,
+            record.hook_ts_ns,
+            session,
+            additions_allowed,
+            pending_views,
+        )
+    }
+
+    /// Pins, merges and applies one lowered publication module — the
+    /// shared tail of export-record and selection-result lowering, so
+    /// equivalent factory forms admit through one ownership-validation
+    /// path and one causal-timing observation.
+    fn apply_lowered_module(
+        &mut self,
+        lowered: ScannedModule,
+        position: usize,
+        hook_ts_ns: u64,
+        session: &mut dyn EngineSession,
+        additions_allowed: &mut bool,
+        pending_views: &mut PendingViewRetirements,
+    ) -> Result<DiscoveryRecordOutcome> {
         let (pins, pin_skips) = {
             let view = &self.views[position];
             pin_scanned_view_objects(view, std::slice::from_ref(&lowered), &mut self.budget)
@@ -9214,11 +9500,12 @@ impl Engine {
             .map(|module| module.scanned.clone())
             .collect();
         let observed_module = lowered.clone();
+        self.note_scan_observed(lowered.view, std::slice::from_ref(&lowered));
         merge_scanned_module(&mut raw_modules, lowered);
         let mut candidate = self.live_candidate(candidate_pins, raw_modules, skipped)?;
         candidate.views.insert(self.views[position].id());
         let observed = candidate_timing_keys(&candidate, std::slice::from_ref(&observed_module));
-        self.observe_causal_timing(&observed, record.hook_ts_ns);
+        self.observe_causal_timing(&observed, hook_ts_ns);
         let outcome = self.apply_candidate(session, candidate, additions_allowed, false, &[])?;
         self.record_apply_timing(&outcome);
         self.queue_apply_outcome(&outcome, pending_views);
@@ -9226,6 +9513,107 @@ impl Engine {
             outcome.changed,
             outcome.required_complete(),
         ))
+    }
+
+    /// Lowers a supported `C_GetInterface` result through the shared
+    /// export-lowering path (Package F, E08). Runs only after the
+    /// selection path attributed the record: the binding supplies the
+    /// hook and the exact view, so no PID-only resolution is trusted
+    /// here. Decode refusals publish the same explicit omission as the
+    /// equivalent list element; the selection tuple is already recorded,
+    /// so a refused lowering is complete handling, not an incomplete
+    /// record.
+    fn process_selection_lowering(
+        &mut self,
+        record: &DiscoveryRecord,
+        session: &mut dyn EngineSession,
+        additions_allowed: &mut bool,
+        pending_views: &mut PendingViewRetirements,
+    ) -> Result<DiscoveryRecordOutcome> {
+        let (binding_view, hook_name) = self
+            .selection_bindings
+            .get(&record.binding_id)
+            .and_then(|binding| {
+                self.hooks
+                    .by_id(binding.hook_id)
+                    .filter(|(_, abi)| *abi == HookAbi::Interface)
+                    .map(|(name, _)| (binding.view, name.to_string()))
+            })
+            .ok_or_else(|| anyhow!("selection lowering lost its attributed binding"))?;
+        let pid = (record.pid_tgid >> 32) as u32;
+        let Some(position) = self.views.iter().position(|view| {
+            view.id() == binding_view && view.pid() == pid && view.still_the_same()
+        }) else {
+            self.request_refresh(pid);
+            self.mark_live_loss(
+                "live interface selection",
+                "a selection result had no retained process generation when its table was validated",
+            );
+            return Ok(DiscoveryRecordOutcome::Rejected(
+                RecordRejection::SelectionUnattributed,
+            ));
+        };
+        let lowered = {
+            let view = &self.views[position];
+            let maps = Self::read_maps(view, &mut self.budget)?;
+            let index =
+                index_maps_or_refuse(&maps, &mut self.budget).map_err(|error| anyhow!(error))?;
+            let gi_hook = Some((hook_name.as_str(), HookAbi::Interface));
+            match lower_publication_record(
+                view,
+                &index,
+                &self.hooks,
+                record,
+                &mut self.budget,
+                gi_hook,
+            ) {
+                Err(error) => return Err(anyhow!(error)),
+                Ok(Some(module)) => module,
+                Ok(None) => match lower_heap_publication_record(
+                    view,
+                    &index,
+                    &self.hooks,
+                    record,
+                    &self.modules,
+                    &mut self.budget,
+                    gi_hook,
+                ) {
+                    Err(error) => return Err(anyhow!(error)),
+                    Ok(HeapLowerOutcome::Admitted(module)) => module,
+                    Ok(HeapLowerOutcome::Refused(reason)) => {
+                        self.mark_live_loss("live interface selection", reason);
+                        return Ok(DiscoveryRecordOutcome::applied(false, true));
+                    }
+                },
+            }
+        };
+        self.apply_lowered_module(
+            lowered,
+            position,
+            record.hook_ts_ns,
+            session,
+            additions_allowed,
+            pending_views,
+        )
+    }
+
+    /// Whether every object this view owns still has the pin it was pinned
+    /// under: per-view physical-identity revalidation for retaining modules
+    /// across an incomplete scan. Budget-free (fstat over already-open
+    /// files) and side-effect-free, unlike the sticky capture-wide check.
+    /// Manifest objects stay in the subset — a changed manifest fails
+    /// closed into replacement.
+    fn view_pins_unchanged(&self, view: ProcessViewId) -> bool {
+        let mut subset = self.pinned.clone();
+        for other in self
+            .views
+            .iter()
+            .map(ProcessView::id)
+            .filter(|id| *id != view)
+        {
+            subset.remove_view(other);
+        }
+        subset.check_unchanged().unwrap_or(false)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -9263,7 +9651,8 @@ impl Engine {
             ),
         };
         let mut skipped = self.absorb_scan_counters(scan_counters);
-        let (mut found, fresh_pins) = match scan_result {
+        self.deep_scans = self.deep_scans.saturating_add(1);
+        let (mut found, fresh_pins, found_complete) = match scan_result {
             Ok(value) => value,
             Err(error) => {
                 for skip in skipped {
@@ -9272,6 +9661,7 @@ impl Engine {
                 return Err(error);
             }
         };
+        self.note_scan_observed(self.views[position].id(), &found);
         if mode == LoaderScanMode::MetadataOnly {
             for module in &mut found {
                 let Some(current) = self.modules.iter().find(|current| {
@@ -9293,21 +9683,67 @@ impl Engine {
             .context(context_id)
             .map(|context| context.spec.loader)
             .ok_or_else(|| anyhow!("loader context disappeared after record validation"))?;
-        let mut candidate_pins = self.pinned.clone();
-        skipped.extend(candidate_pins.replace_view_pins(
-            self.views[position].id(),
-            fresh_pins,
-            &[loader],
-        ));
-        let mut raw_modules: Vec<_> = self
-            .modules
-            .iter()
-            .filter(|module| module.scanned.view != self.views[position].id())
-            .map(|module| module.scanned.clone())
-            .collect();
-        for module in found {
-            merge_scanned_module(&mut raw_modules, module);
-        }
+        let view_id = self.views[position].id();
+        // An incomplete scan is not proof that a provider disappeared: when
+        // the memory rescan was bounded, this view's existing modules are
+        // retained after their pins revalidate instead of being replaced by
+        // partial results. Metadata-only scans keep their own explicit
+        // table restoration above; failed revalidation falls through to the
+        // replacement below, so stale identity still retires.
+        let revalidated = !found_complete
+            && mode == LoaderScanMode::Memory
+            && self.views[position].still_the_same()
+            && self.view_pins_unchanged(view_id);
+        let (candidate_pins, raw_modules) = if revalidated {
+            let mut candidate_pins = self.pinned.clone();
+            // Fresh pins cover only newly observed modules: re-pinning
+            // retained ones under an exhausted budget would reject their
+            // keys and drop exactly what revalidation just approved.
+            // `fresh_pins` (all of `found`, pinned during the scan) is
+            // discarded here; its skips are already in `skipped` as
+            // evidence, and its cache priming makes this second pin cheap.
+            let retained: Vec<ScannedModule> = self
+                .modules
+                .iter()
+                .filter(|module| module.scanned.view == view_id)
+                .map(|module| module.scanned.clone())
+                .collect();
+            let new_modules: Vec<ScannedModule> = found
+                .iter()
+                .filter(|module| is_newly_observed_module(&retained, module))
+                .cloned()
+                .collect();
+            let (new_pins, pin_skips) =
+                pin_scanned_view_objects(&self.views[position], &new_modules, &mut self.budget)
+                    .map_err(anyhow::Error::msg)?;
+            skipped.extend(pin_skips);
+            skipped.extend(candidate_pins.absorb(new_pins));
+            let mut retained = retained;
+            for module in found {
+                merge_scanned_module(&mut retained, module);
+            }
+            let mut raw_modules: Vec<_> = self
+                .modules
+                .iter()
+                .filter(|module| module.scanned.view != view_id)
+                .map(|module| module.scanned.clone())
+                .collect();
+            raw_modules.extend(retained);
+            (candidate_pins, raw_modules)
+        } else {
+            let mut candidate_pins = self.pinned.clone();
+            skipped.extend(candidate_pins.replace_view_pins(view_id, fresh_pins, &[loader]));
+            let mut raw_modules: Vec<_> = self
+                .modules
+                .iter()
+                .filter(|module| module.scanned.view != view_id)
+                .map(|module| module.scanned.clone())
+                .collect();
+            for module in found {
+                merge_scanned_module(&mut raw_modules, module);
+            }
+            (candidate_pins, raw_modules)
+        };
         let mut candidate = self.live_candidate(candidate_pins, raw_modules, skipped)?;
         candidate.views.insert(self.views[position].id());
         let observed = candidate_timing_keys(&candidate, &export_modules);
@@ -11397,8 +11833,31 @@ impl Engine {
         additions_allowed: &mut bool,
         pending_views: &mut PendingViewRetirements,
     ) -> Result<bool> {
-        let named = matches!(self.scope, Scope::Pid(_));
+        // Ownership-gated arming (Package C): loader contexts are finite
+        // capture-lifetime IDs (256, never reused) backing event-driven
+        // tracking, so in multi-process scopes they are spent only where a
+        // provider is owned. Provider-free views stay unarmed and
+        // exploratory: rotation polls them within the exploration bound,
+        // and a polling rescan that finds a provider upgrades the view to
+        // owned and arms it then. Pid scope (including owned runs) always
+        // arms: the one named generation is the capture, not exploration.
+        // The skip is silent like NotArmable — the exploration envelope is
+        // stated, not a per-capture loss — and unrecorded, so gated views
+        // never inflate the `unavailable` aggregate.
         let view_id = self.views[position].id();
+        if self.admits_generations()
+            && !self
+                .modules
+                .iter()
+                .any(|module| module.scanned.view == view_id)
+            && self.pinned.view_claims(view_id).is_none_or(|claims| {
+                claims.tables.is_empty() && claims.targets.is_empty() && claims.pins.is_empty()
+            })
+        {
+            return Ok(false);
+        }
+        self.loader_arms = self.loader_arms.saturating_add(1);
+        let named = matches!(self.scope, Scope::Pid(_));
         let result = self.arm_loader_for_view(position, session, additions_allowed, pending_views);
         let generation_valid = self
             .views
@@ -12437,12 +12896,53 @@ impl Engine {
             DISCOVERY_KIND_FUNCTION_LIST_RETURN | DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN => {
                 self.process_export_record(&record, session, additions_allowed, pending_views)
             }
-            DISCOVERY_KIND_INTERFACE_RETURN => self.process_selection_record_with_session(
-                &queued,
-                session,
-                additions_allowed,
-                pending_views,
-            ),
+            DISCOVERY_KIND_INTERFACE_RETURN => {
+                let outcome = self.process_selection_record_with_session(
+                    &queued,
+                    session,
+                    additions_allowed,
+                    pending_views,
+                )?;
+                // Package F: an attributed live result also lowers through
+                // the shared publication path, so equivalent factory forms
+                // admit the same endpoint set. Selection runs first and
+                // unchanged: its attribution decides whether lowering may
+                // trust this record at all, and terminal (post-exit)
+                // records never validate live memory.
+                let lower = matches!(outcome, DiscoveryRecordOutcome::Applied { .. })
+                    && queued.terminal_owner.is_none()
+                    && queued.record.return_rv == 0
+                    && queued.record.table_ptr != 0;
+                let lowering = if lower {
+                    Some(self.process_selection_lowering(
+                        &queued.record,
+                        session,
+                        additions_allowed,
+                        pending_views,
+                    )?)
+                } else {
+                    None
+                };
+                Ok(match (outcome, lowering) {
+                    (
+                        DiscoveryRecordOutcome::Applied {
+                            changed: first,
+                            required_complete: first_complete,
+                        },
+                        Some(DiscoveryRecordOutcome::Applied {
+                            changed: second,
+                            required_complete: second_complete,
+                        }),
+                    ) => DiscoveryRecordOutcome::applied(
+                        first || second,
+                        first_complete && second_complete,
+                    ),
+                    (DiscoveryRecordOutcome::Applied { changed, .. }, Some(_)) => {
+                        DiscoveryRecordOutcome::applied(changed, false)
+                    }
+                    (outcome, _) => outcome,
+                })
+            }
             DISCOVERY_KIND_LOADER => self.process_loader_record(
                 queued,
                 session,
@@ -12649,7 +13149,27 @@ impl Engine {
         let mut scans = Vec::new();
         let mut failed_pids = BTreeSet::new();
         let mut skipped = Vec::new();
-        for view_id in views {
+        let ordered: Vec<ProcessViewId> = views.iter().copied().collect();
+        for (index, view_id) in ordered.iter().enumerate() {
+            // The tick's deep-scan quantum stops the phase before another
+            // scan: the current and remaining views defer to the next tick
+            // with their refresh requests retained, never dropped.
+            if self.scheduler.tick_expired(crate::attach::monotonic_ns()) {
+                for id in &ordered[index..] {
+                    if let Some(view) = self.views.iter().find(|view| view.id() == *id) {
+                        failed_pids.insert(view.pid());
+                    }
+                }
+                let left = ordered.len() - index;
+                let noun = if left == 1 { "view" } else { "views" };
+                skipped.push(Skipped {
+                    subject: "live discovery tick".into(),
+                    reason: format!(
+                        "tick deep-scan quantum exhausted; {left} refreshed {noun} deferred to the next tick"
+                    ),
+                });
+                break;
+            }
             let Some(position) = self.views.iter().position(|view| view.id() == *view_id) else {
                 // A refresh set can name a view retired after the set was
                 // built (stale loader context): skip it and disclose PARTIAL
@@ -12670,9 +13190,20 @@ impl Engine {
                 &mut self.budget,
                 broad_admit,
             );
+            self.deep_scans = self.deep_scans.saturating_add(1);
             skipped.extend(self.absorb_scan_counters(counters));
             match scan_result {
-                Ok((modules, pins)) => {
+                // Completeness is intentionally unused here: refreshed
+                // views are exec refreshes whose old image may be gone, so
+                // absence of the old modules is expected and retention
+                // would be unsound. The loader path above is where an
+                // incomplete scan of a stable generation retains.
+                // Replace-always is preserved: whatever the new image
+                // holds replaces the old, and the rotation classifier
+                // re-reads the outcome — a refreshed view with modules is
+                // owned, an empty never-dirty one stays exploratory.
+                Ok((modules, pins, _complete)) => {
+                    self.note_scan_observed(*view_id, &modules);
                     scans.push((*view_id, modules, pins));
                 }
                 Err(error) => {
@@ -12768,6 +13299,210 @@ impl Engine {
         )
     }
 
+    /// Marks the view dirty when a scan (or a live record application)
+    /// observed modules for it. Every scan-result observation site calls
+    /// this — initial discovery, refresh rescans, new-view admissions,
+    /// loader rescans, live lowering — so the dirty set is complete by
+    /// construction within this file, and eviction never needs `scan.rs`
+    /// internals to prove an ID evidence-free.
+    fn note_scan_observed(&mut self, view: ProcessViewId, modules: &[ScannedModule]) {
+        if !modules.is_empty() {
+            self.exploratory_dirty.insert(view);
+        }
+    }
+
+    /// Whether the retained view is pure exploratory ballast: never
+    /// contributed provider evidence, contributes none now, and owns no
+    /// in-flight work that eviction would strand. Every conjunct is load-
+    /// bearing — a view holding modules, loader contexts, pin claims,
+    /// scan inputs with modules, selection state, retirement or exit
+    /// intents, queued records, or a pending refresh is authoritative or
+    /// active, never exploratory. Cgroup admission-ledger entries are the
+    /// one exception: they close at eviction like any other removal.
+    fn exploratory_evictable(&self, id: ProcessViewId) -> bool {
+        let Some(view) = self.views.iter().find(|view| view.id() == id) else {
+            return false;
+        };
+        if !view.still_the_same() {
+            return false;
+        }
+        if self.exploratory_dirty.contains(&id) {
+            return false;
+        }
+        if self.modules.iter().any(|module| module.scanned.view == id) {
+            return false;
+        }
+        if !self.loader_registry.ids_for_view(id).is_empty() {
+            return false;
+        }
+        if self.pinned.view_claims(id).is_some_and(|claims| {
+            !(claims.tables.is_empty() && claims.targets.is_empty() && claims.pins.is_empty())
+        }) {
+            return false;
+        }
+        if self
+            .scan_inputs
+            .get(&id)
+            .is_some_and(|input| !input.modules.is_empty())
+        {
+            return false;
+        }
+        if self.retirement_intents.contains_key(&id)
+            || self.pending_retirements.contains(&id)
+            || self.ready_expected_removals.contains(&id)
+        {
+            return false;
+        }
+        if self.pending_loader_scans.keys().any(|key| key.view == id) {
+            return false;
+        }
+        let pid = view.pid();
+        if self
+            .pending_discovery_records
+            .iter()
+            .any(|queued| (queued.record.pid_tgid >> 32) as u32 == pid)
+        {
+            return false;
+        }
+        if self.refresh_requested.contains(&pid) {
+            return false;
+        }
+        if self.pending_leader_exit_views.contains(&id)
+            || self.counted_leader_exit_views.contains(&id)
+        {
+            return false;
+        }
+        if self.expected_target_exit_pending == Some(id) {
+            return false;
+        }
+        if self.selection_claims.keys().any(|key| key.view == id)
+            || self.selection_tables.keys().any(|key| key.view == id)
+            || self
+                .selection_bindings
+                .values()
+                .any(|binding| binding.view == id)
+        {
+            return false;
+        }
+        if self
+            .unmatched_leader_exit_events
+            .iter()
+            .any(|(event_pid, _)| *event_pid == pid)
+        {
+            return false;
+        }
+        true
+    }
+
+    /// Evictable views in deterministic rotation order: lowest pid first
+    /// (view ID breaks ties). Admission prefers the lowest unscanned pid
+    /// within a rarity class, and evicted pids cool down before
+    /// re-selection, so lowest-first eviction plus the cooldown walks the
+    /// whole unscanned set forward instead of churning one subset.
+    fn exploratory_evictable_views(&self) -> Vec<ProcessViewId> {
+        let mut victims: Vec<(u32, ProcessViewId)> = self
+            .views
+            .iter()
+            .filter(|view| self.exploratory_evictable(view.id()))
+            .map(|view| (view.pid(), view.id()))
+            .collect();
+        victims.sort();
+        victims.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// One polling round over the enumerated pids (sorted ascending): queue
+    /// a bounded number of retained exploratory views — in poll-cursor
+    /// order, so the cursor round-robins them — for a same-tick refresh
+    /// rescan through the normal replace-always path. Unarmed views would
+    /// otherwise never re-scan a process that gains a provider; a found
+    /// provider upgrades the view to owned and arms it then. Already-
+    /// requested pids are skipped, so event-driven work is never
+    /// double-queued. Polling can only add coverage (its targets hold
+    /// nothing), never flap owned modules — owned views rely on
+    /// event-driven refresh instead. `pids` must be sorted ascending.
+    fn queue_polling_rescans(&mut self, pids: &[u32]) {
+        let mut polling = 0;
+        let mut last_queued = None;
+        for pid in self.scheduler.poll_order(pids) {
+            if polling >= MAX_POLLING_RESCANS {
+                break;
+            }
+            if self.refresh_requested.contains(&pid) {
+                continue;
+            }
+            let retained_exploratory = self
+                .views
+                .iter()
+                .any(|view| view.pid() == pid && self.exploratory_evictable(view.id()));
+            if !retained_exploratory {
+                continue;
+            }
+            self.request_refresh(pid);
+            if self.refresh_requested.contains(&pid) {
+                polling += 1;
+                last_queued = Some(pid);
+            }
+        }
+        if let Some(last) = last_queued {
+            self.scheduler.advance_poll_cursor(last);
+        }
+        if polling > 0 {
+            let noun = if polling == 1 { "view" } else { "views" };
+            self.mark_partial(
+                "live discovery rotation",
+                &format!("queued {polling} retained exploratory {noun} for polling rescan"),
+            );
+        }
+    }
+
+    /// Evicts exploratory views outside the retirement transaction: by the
+    /// classifier they hold no modules, contexts, claims, or queued work,
+    /// so there is nothing to retire — removal drops the view, its pins
+    /// (shared objects survive via their other owners in `remove_view`),
+    /// its view-scoped scan inputs, and its non-authoritative loader-arm
+    /// classifications, then frees the ID for the newcomer admitted into
+    /// the freed slot. Admission-ledger and leader-exit settlement mirror
+    /// the transaction tail. Categorical evidence only: counts, never pids.
+    fn evict_exploratory_views(&mut self, victims: &BTreeSet<ProcessViewId>) {
+        let victims: BTreeSet<ProcessViewId> = victims
+            .iter()
+            .copied()
+            .filter(|id| self.exploratory_evictable(*id))
+            .collect();
+        if victims.is_empty() {
+            return;
+        }
+        for id in &victims {
+            if let Some(view) = self.views.iter().find(|view| view.id() == *id) {
+                self.scheduler.note_evicted(view.pid());
+            }
+        }
+        self.close_cgroup_admissions_at_removal(&victims);
+        self.settle_leader_exits_at_removal(victims.iter().copied());
+        for id in &victims {
+            self.pinned.remove_view(*id);
+            self.scan_inputs.remove(id);
+        }
+        self.loader_contexts
+            .retain(|(view, _, _), _| !victims.contains(view));
+        self.views.retain(|view| !victims.contains(&view.id()));
+        for id in &victims {
+            self.release_view_id(*id);
+        }
+        self.exploratory_evictions = self
+            .exploratory_evictions
+            .saturating_add(victims.len() as u64);
+        let max_scan_pids = self.max_scan_pids;
+        let noun = if victims.len() == 1 { "view" } else { "views" };
+        self.mark_partial(
+            "live discovery rotation",
+            &format!(
+                "exploratory rotation evicted {} provider-free process {noun} to reach unscanned processes (limit {max_scan_pids})",
+                victims.len()
+            ),
+        );
+    }
+
     /// Over-cap candidate selection without a full maps sweep (Task 3.1b).
     /// Ordinary passes serve event-driven refresh requests plus a
     /// fairness-rotation window over unscanned pids — no maps reads, so no
@@ -12775,8 +13510,10 @@ impl Engine {
     /// an exact categorical gap. Every Nth over-cap pass reconciles: one
     /// bounded maps slice after the cursor (wall-time quantum, generation
     /// revalidation of covered retained views) with rarity-ordered
-    /// admission inside the slice. Retained views are always desired and
-    /// never displaced; rotation only fills free view slots.
+    /// admission inside the slice. Retained views are always desired;
+    /// ordinary rotation only fills free view slots and never displaces,
+    /// while reconcile passes rotate exploratory (never-owned, currently
+    /// empty) views to reach unscanned processes within a finite bound.
     fn select_over_cap_desired(&mut self, pids: &[u32]) -> BTreeSet<u32> {
         let known: BTreeSet<u32> = self.views.iter().map(|view| view.pid()).collect();
         let enumerated: BTreeSet<u32> = pids.iter().copied().collect();
@@ -12791,7 +13528,17 @@ impl Engine {
         let subject = scope_label(&self.scope);
         match self.scheduler.begin_over_cap_pass() {
             InventoryCadence::Ordinary => {
-                let exclude: BTreeSet<u32> = known.union(&pending).copied().collect();
+                // Cooling pids sit out the rotation window (queued refresh
+                // requests for them still join `desired` via `pending`).
+                let exclude: BTreeSet<u32> = known
+                    .union(&pending)
+                    .copied()
+                    .chain(
+                        pids.iter()
+                            .copied()
+                            .filter(|pid| self.scheduler.cooling_down(*pid)),
+                    )
+                    .collect();
                 let free_slots = max_scan_pids.saturating_sub(self.views.len());
                 let window = DiscoveryScheduler::rotation_window(pids, &exclude, free_slots);
                 desired.extend(window.iter().copied());
@@ -12813,14 +13560,56 @@ impl Engine {
                 desired
             }
             InventoryCadence::Reconcile => {
+                // Exploratory rotation: the slice selects into the free
+                // slots plus a bounded number of evictable views, then only
+                // as many victims as the selection actually needs are
+                // evicted. Ordinary passes never reach this arm, so ticks
+                // outside reconciliation still displace nothing.
                 let free_slots = max_scan_pids.saturating_sub(self.views.len());
-                let selected = self.reconcile_slice(pids, &known, free_slots);
+                let evictable = self.exploratory_evictable_views();
+                let evict_budget = evictable.len().min(self.scheduler.max_evictions_per_pass());
+                let selected = self.reconcile_slice(pids, &known, free_slots + evict_budget);
+                let need = selected.len().saturating_sub(free_slots);
+                let victims: BTreeSet<ProcessViewId> = evictable.into_iter().take(need).collect();
+                // Evicted pids leave the desired set with their views: they
+                // were desired as retained views, and re-selecting them as
+                // newcomers in the same tick would evict-and-readmit
+                // without ever reaching the selected set. They rejoin
+                // eligibility when their cooldown expires.
+                let victim_pids: BTreeSet<u32> = victims
+                    .iter()
+                    .filter_map(|id| {
+                        self.views
+                            .iter()
+                            .find(|view| view.id() == *id)
+                            .map(|view| view.pid())
+                    })
+                    .collect();
+                self.evict_exploratory_views(&victims);
+                // Polling runs after eviction so victims are never polled.
+                // `scope_pids` guarantees pid order for the poll cursor.
+                self.queue_polling_rescans(pids);
                 desired.extend(selected.iter().copied());
+                desired.retain(|pid| !victim_pids.contains(pid));
                 let fresh = desired.iter().filter(|pid| !known.contains(pid)).count();
                 self.mark_partial(
                     &subject,
                     &scan_cap_reason(enumerated.len(), fresh, max_scan_pids, true),
                 );
+                let cooling = self.scheduler.cooling_len();
+                if cooling > 0 {
+                    let (noun, verb) = if cooling == 1 {
+                        ("process", "is")
+                    } else {
+                        ("processes", "are")
+                    };
+                    self.mark_partial(
+                        "live discovery rotation",
+                        &format!(
+                            "{cooling} unscanned {noun} {verb} cooling down after exploratory rotation"
+                        ),
+                    );
+                }
                 desired
             }
         }
@@ -12829,7 +13618,9 @@ impl Engine {
     /// One bounded reconciliation slice: re-read maps for the next slice of
     /// pids after the cursor (wrapping), stopping at the wall-time quantum.
     /// Retained views covered by the slice are generation-revalidated;
-    /// unscanned slice pids are rarity-ordered into the free view slots.
+    /// eligible unscanned slice pids (cooling-down pids sit out) are
+    /// rarity-ordered into the free view slots plus the bounded eviction
+    /// allowance the caller folded in.
     /// Returns the selected new pids. The cursor advances past the last pid
     /// read; an incomplete slice publishes its exact coverage gap. Slice
     /// maps bytes are re-read every sweep, never served from a cache: only
@@ -12899,11 +13690,18 @@ impl Engine {
                 ),
             );
         }
+        // Cooling pids were read (and revalidated when retained) but sit
+        // out selection until their cooldown expires, so rotation walks
+        // forward instead of churning. Queued refresh requests for them
+        // rejoin through the pending set in the caller. Cooled-but-stale
+        // pids stay in the pool and sort behind never-evicted pids within
+        // their rarity class (fairness tier), so every pid is covered.
         let pool: Vec<(u32, Vec<MapEntry>)> = slice
             .into_iter()
-            .filter(|(pid, _)| !known.contains(pid))
+            .filter(|(pid, _)| !known.contains(pid) && !self.scheduler.cooling_down(*pid))
             .collect();
-        select_deep_scan_candidates(&pool, free_slots)
+        let stale: BTreeSet<u32> = self.scheduler.stale_pids().into_iter().collect();
+        select_rotation_candidates(&pool, free_slots, &stale)
     }
 
     fn refresh_inventory(
@@ -12977,6 +13775,11 @@ impl Engine {
         let membership_complete = skipped.is_empty() && pids.len() <= max_scan_pids;
         let enumerated = pids.len();
         let over_cap = enumerated > max_scan_pids;
+        // Staleness tracks the live scope: departed pids prune every tick,
+        // which is what bounds the map (a reappearing pid is PID reuse, a
+        // new generation, correctly fresh).
+        let live: BTreeSet<u32> = pids.iter().copied().collect();
+        self.scheduler.prune_stale_to_enumerated(&live);
         // Ordinary ticks never sweep maps: over the cap the scheduler serves
         // queued event-driven work plus a fairness-rotation window, and only
         // the slower reconciliation pass re-reads one bounded slice (Task
@@ -12990,6 +13793,16 @@ impl Engine {
         } else if pids.len() > max_scan_pids {
             self.select_over_cap_desired(&pids)
         } else {
+            // Under-cap polling round, every fourth under-cap tick: retained
+            // exploratory views carry no loader context, so without this a
+            // process that gains a provider while the capture sits under the
+            // cap would never re-scan. Queued here so the requests flow into
+            // `refreshed` below and are served same-tick. The zero cap
+            // short-circuits above and never polls. `scope_pids` guarantees
+            // pid order for the poll cursor.
+            if self.scheduler.begin_under_cap_tick() {
+                self.queue_polling_rescans(&pids);
+            }
             pids.into_iter().collect()
         };
         // Only new candidates count: known views are retained, not selected.
@@ -13053,13 +13866,49 @@ impl Engine {
             return Ok(false);
         }
 
+        // The tick's deep-scan phase starts here: refreshed rescans plus
+        // new-view admissions share one wall-time quantum and one admission
+        // count bound. Direct scan calls outside this tick stay unbounded.
+        self.scheduler
+            .begin_deep_scan_tick(crate::attach::monotonic_ns());
         let (mut refreshed_scans, mut failed_refresh_pids, refresh_skips) =
             self.scan_inventory_views(&refreshed, "a requested inventory refresh failed");
         skipped.extend(refresh_skips);
 
+        // Per-tick admission bound: only the first `max_new_views` newcomers
+        // are deep-scanned; the rest defer to the next tick with explicit
+        // evidence, and their queued refresh requests are retained.
+        let max_new_views = self.scheduler.max_new_views_per_tick();
+        let mut new_pids = new_pids.into_iter();
+        let admitted: Vec<u32> = new_pids.by_ref().take(max_new_views).collect();
+        let deferred: Vec<u32> = new_pids.collect();
+        if !deferred.is_empty() {
+            failed_refresh_pids.extend(deferred.iter().copied());
+            let pending = admitted.len() + deferred.len();
+            let noun = if pending == 1 { "process" } else { "processes" };
+            skipped.push(Skipped {
+                subject: "live discovery tick".into(),
+                reason: format!(
+                    "{pending} new {noun} pending; tick admitted {} for deep scanning (tick limit {max_new_views})",
+                    admitted.len()
+                ),
+            });
+        }
         let mut new_views = Vec::new();
-        let mut unprocessed = new_pids.into_iter();
+        let mut unprocessed = admitted.into_iter();
         while let Some(pid) = unprocessed.next() {
+            // The tick quantum stops admissions before another scan: this
+            // pid and the rest defer with their requests retained.
+            if self.scheduler.tick_expired(crate::attach::monotonic_ns()) {
+                failed_refresh_pids.insert(pid);
+                failed_refresh_pids.extend(unprocessed);
+                skipped.push(Skipped {
+                    subject: "live discovery tick".into(),
+                    reason: "tick deep-scan quantum exhausted; remaining new processes deferred to the next tick"
+                        .into(),
+                });
+                break;
+            }
             let id = match self.allocate_view_id() {
                 Ok(id) => id,
                 Err(_) => {
@@ -13101,9 +13950,15 @@ impl Engine {
                 &mut self.budget,
                 broad_admit,
             );
+            self.deep_scans = self.deep_scans.saturating_add(1);
             skipped.extend(self.absorb_scan_counters(counters));
             match scan_result {
-                Ok((modules, pins)) => {
+                // Completeness is intentionally unused here: a new view has
+                // no retained modules, so a partial first scan simply
+                // attaches what it verified with the skips as evidence.
+                Ok((modules, pins, _complete)) => {
+                    self.note_scan_observed(view.id(), &modules);
+                    self.scheduler.note_admitted(pid);
                     new_views.push((view, modules, pins));
                 }
                 Err(error) => {

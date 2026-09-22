@@ -10,7 +10,9 @@ Schema identifiers are opaque dispatch keys. A v3 profile is not accepted as
 v2, and the historical v2-metrics document is not accepted as a v3
 profile. All profile fields documented by
 [`observed-profile-v2.md`](observed-profile-v2.md) remain unchanged except for
-the profile identifier and the six additions below.
+the profile identifier, the `lane` discriminator, the six original additions
+below, and the five residual additions (`drain_proven`, `verdict_detail`,
+`uretprobe_override`, `handoff_child_pid`, `p11scope_env`).
 
 Under the default `allowlisted` policy, every emitted mechanism has
 `params: null` and `templates.operations` is always empty. The diagnostic
@@ -25,13 +27,40 @@ pre-initialization `C_GetInterface` calls. Selection evidence is therefore a
 bounded observation of application calls, or an optional offline manifest
 fact; it is never created by probing the observed process.
 
+## The metrics/profile evidence split
+
+The two v3 lanes render deliberately different evidence objects from the same
+capture, and a consumer must dispatch on the top-level `lane` field
+(`profile` or `metrics`) before reading `evidence`:
+
+- The **profile** lane (`render::profile_json`, verdict
+  `verdict_with_selection(true)`) embeds `versioned_evidence`: the full base
+  set plus the four profile-only fields `interface_selection`,
+  `attach_mechanisms`, `pid_descendant_gaps`, and `multi_rebuild_gaps`. Its
+  verdict is selection-aware: a descendant gap, a rebuild gap, or any
+  selection loss forces `PARTIAL`.
+- The **metrics** lane (`render::json`, verdict
+  `verdict_with_selection(false)`) embeds `Evidence` directly, so the four
+  `#[serde(skip)]` profile-only fields above are absent. Its verdict is
+  selection-blind by construction: the same capture that reads `PARTIAL` as
+  profile over a descendant gap reads `COMPLETE`-eligible as metrics, with no
+  contradiction — the metrics verdict never saw the selection state.
+
+The terminal trace `EVIDENCE` object follows the profile lane: it carries the
+four versioned-only fields and no `lane` key (it is an evidence object, not a
+document). The release oracle enforces the split (`exact_evidence_keys` with
+`profile=True/False`), the per-lane verdict scope, and the `lane`
+discriminator value.
+
 ## Added `evidence` fields
 
 `interface_selection` is always present and has exactly these keys:
 
 - `providers`: sorted, unique `{module, coverage}` objects. `module` is the
   zero-based `evidence.discovery[]` index. `coverage` is exactly `observed`,
-  `observed_uncovered`, `absent_covered`, or `absent_uncovered`.
+  `observed_uncovered`, `absent_covered`, or `absent_uncovered`. At most 512
+  providers (fewer when fewer modules were discovered); past the bound the
+  array truncates with `selection_truncated` set.
 - `standard_exports`: sorted, unique `{module, status}` objects. `status` is
   exactly `present`, `outside_module`, `legacy_absent`, `required_absent`, or
   `unresolved`.
@@ -67,7 +96,9 @@ those are not part of the observed-profile-v3 shape.
 A successful matched result with an unreadable/null name or version retains its
 match but has `none` authority. The corresponding agreement boolean is false;
 legacy surfaces always have `name_agrees: false`. A nonzero `rv` has null
-`result`, no matches, and `none` authority.
+`result`, no matches, and `none` authority. An `rv` of zero with a null
+result (a null table output) is handled uniformly with nonzero `rv`: null
+`result`, no matches, `none` authority.
 
 `attach_mechanisms` is a sorted, duplicate-free subset of `per-offset` and
 `uprobe-multi`, derived only from successfully owned links. Before the
@@ -110,6 +141,33 @@ an uncompleted call, with no fabricated return value. The field is always
 present in v3 profile, metrics and terminal trace evidence; nonzero forces
 `PARTIAL`.
 
+## Residual additions: terminal verdict, override, handoff, environment
+
+These fields are always present in every v3 profile, v3-metrics, and terminal
+trace evidence object. Historical documents predate them (see Migration).
+
+- `drain_proven` (boolean) is the terminal-drain settlement latch. It is
+  false in every document until a bounded quiescence/settlement experiment
+  proves the terminal drain saw every in-flight callback; the producer's
+  terminal seal forces `PARTIAL` while it is false, and the oracle refuses
+  any `COMPLETE` without it.
+- `verdict_detail` is exactly `clean_proven` (no gap, latch set),
+  `clean_but_unproven` (no gap, latch unset — the terminal `PARTIAL` with
+  nothing concrete behind it), or `concrete_gap` (a gap forced `PARTIAL`).
+  Clean and lossy runs no longer share one signal.
+- `uretprobe_override` is `null` when the hazard preflight proceeded clean,
+  else `{flag, reason}`: the exact `--allow-uretprobe-on-confined-target`
+  flag plus the preflight's reason for requiring it. Disclosed, never a
+  verdict gap.
+- `handoff_child_pid` is `null` except in a `run` document whose owned child
+  was handed back alive, where it names that PID. It agrees with
+  `child_still_running` exactly (`Some` if and only if still running) and is
+  `null` in every `--pid`/`--cgroup`/`--system` document. The operator's own
+  child, nameable so exit 0 never leaves an orphan unnamed.
+- `p11scope_env` is the active value of every capture-visible `P11SCOPE_*`
+  switch: `{name, effect, value}` objects, `value` `null` when unset.
+  Absent means the narrow default.
+
 ## Added `capture` fields
 
 `capture.scope` is exactly `pid`, `cgroup`, or `system`, naming which scope
@@ -124,7 +182,11 @@ Any truncation, uncovered provider, export status other than `present` or
 nonzero descendant gap, nonzero rebuild gap, or nonzero
 `task_uprobe_link_losses` or `abi_refusals` forces
 `evidence.completeness` to `PARTIAL`. The ordinary terminal trace
-`EVIDENCE` object carries the same six fields and rules. Individual trace
+`EVIDENCE` object carries the same profile-lane fields and rules, plus five
+terminal-only keys: `privacy_mode` (string), `capture_aborted` (always
+`null` on the normal path), `final_drain` (always `false`: detaching perf
+links proves nothing about quiescence), `counters_available` (always
+`true`), and `trace_truncated` (boolean). Individual trace
 event lines never contain request/result selection data.
 
 The v3 profile evidence object and v3-metrics evidence object each have a
@@ -140,5 +202,14 @@ enums, ordering, references, and result/authority relations above. Historical
 v2 profiles remain historical. Metrics consumers must dispatch live output on
 `p11scope/observed-profile/v3-metrics`; historical
 `p11scope/observed-profile/v2-metrics` documents remain readable as a
-separate compatibility shape and contain neither `task_uprobe_link_losses`
-nor `abi_refusals`.
+separate compatibility shape. That shape predates — and therefore lacks —
+`task_uprobe_link_losses`, `abi_refusals`, `semantic_history_drops`,
+`scheduling`, and the five residual fields above (`drain_proven`,
+`verdict_detail`, `uretprobe_override`, `handoff_child_pid`, `p11scope_env`).
+
+A machine-readable JSON Schema for live v3 documents ships beside this file
+(`observed-profile-v3.schema.json`); it pins the closed evidence key sets
+per lane, the required enums, and the `lane` discriminator. It is a
+consumer aid: the release oracle (`scripts/check-capture-evidence.py`) is the
+enforcement behind it, and `tests/python/test_schema_json.py` keeps the two
+in agreement.

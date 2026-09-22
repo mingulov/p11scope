@@ -34,7 +34,6 @@ against the measured anchors, and replay determinism.
 """
 
 import argparse
-import json
 import sys
 import threading
 from pathlib import Path
@@ -256,7 +255,6 @@ def self_test():
     # Race: 8 threads first-touching 4 shared keys -> exactly-once
     # alloc per key, lossless updates.
     shared = BoundedSparseMap(4)
-    total = [0]
 
     def hammer(key):
         for _ in range(250):

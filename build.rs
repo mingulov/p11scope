@@ -23,6 +23,50 @@ use std::{env, path::PathBuf, process::Command};
 #[path = "build_support/bpf_tools.rs"]
 mod bpf_tools;
 
+/// Drops host-only coverage instrumentation from rustflags before they are
+/// forwarded to the freestanding BPF target: `-C instrument-coverage`
+/// pairs, `--cfg=coverage`, and `--cfg coverage` pairs. Everything else
+/// passes through untouched, reseparated with `sep`.
+fn strip_coverage_flags_separated(encoded: &str, sep: char) -> String {
+    let tokens: Vec<&str> = encoded
+        .split(sep)
+        .filter(|token| !token.is_empty())
+        .collect();
+    let mut kept = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = tokens[index];
+        if token == "-C"
+            && tokens.get(index + 1).is_some_and(|next| {
+                next == &"instrument-coverage" || next == &"instrument_coverage"
+            })
+        {
+            index += 2;
+            continue;
+        }
+        if token == "--cfg=coverage" || token == "--cfg=coverage-nightly" {
+            index += 1;
+            continue;
+        }
+        if token == "--cfg"
+            && tokens
+                .get(index + 1)
+                .is_some_and(|next| next == &"coverage" || next == &"coverage-nightly")
+        {
+            index += 2;
+            continue;
+        }
+        kept.push(token);
+        index += 1;
+    }
+    kept.join(&sep.to_string())
+}
+
+/// [`strip_coverage_flags_separated`] for `\u{1f}`-encoded rustflags.
+fn strip_coverage_flags(encoded: &str) -> String {
+    strip_coverage_flags_separated(encoded, '\u{1f}')
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=crates/ebpf/src");
     println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity.c");
@@ -158,7 +202,10 @@ fn main() {
     if small_discovery_ring {
         features.push("small-discovery-ring");
     }
-    let mut flags = env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default();
+    // Coverage instrumentation is host-only: strip it before forwarding to
+    // the freestanding BPF target, which has no profiler runtime (SYSPLAN
+    // residual F-40). A no-op for ordinary builds, which carry no such flags.
+    let mut flags = strip_coverage_flags(&env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default());
     let mut append_flag = |flag: &str| {
         if !flags.is_empty() {
             flags.push('\u{1f}');
@@ -213,6 +260,26 @@ fn main() {
         }
     }
     cmd.env("CARGO_ENCODED_RUSTFLAGS", flags);
+    // Coverage instrumentation is host-only, and it arrives on three
+    // channels: plain RUSTFLAGS, the encoded var above, and (for
+    // cargo-llvm-cov) a RUSTC_WRAPPER that injects flags per rustc
+    // invocation. Strip all three so the freestanding BPF target, which
+    // has no profiler runtime, builds clean under coverage (F-40).
+    if let Ok(rustflags) = env::var("RUSTFLAGS") {
+        cmd.env("RUSTFLAGS", strip_coverage_flags_separated(&rustflags, ' '));
+    }
+    cmd.env_remove("RUSTC_WRAPPER");
+    for key in [
+        "CARGO_LLVM_COV",
+        "CARGO_LLVM_COV_SHOW_ENV",
+        "CARGO_LLVM_COV_TARGET_DIR",
+        "CARGO_LLVM_COV_BUILD_DIR",
+        "__CARGO_LLVM_COV_RUSTC_WRAPPER",
+        "__CARGO_LLVM_COV_RUSTC_WRAPPER_RUSTFLAGS",
+        "__CARGO_LLVM_COV_RUSTC_WRAPPER_CRATE_NAMES",
+    ] {
+        cmd.env_remove(key);
+    }
     if !features.is_empty() {
         cmd.arg("--features").arg(features.join(","));
     }

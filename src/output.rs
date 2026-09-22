@@ -38,6 +38,13 @@ impl FileIdentity {
 /// A private temp file created beside a target path, published to that path
 /// with an identity-verified `rename(2)` on `commit`. If never committed (or
 /// if `commit` fails), the temp file is unlinked by `Drop`.
+///
+/// Final-name stat policy (SYSPLAN residual F-48, verified): the final name
+/// is never stated — only the temp name is (`verify_temp_identity`, `Drop`),
+/// and publication is `renameat`-only, so there is no final-path TOCTOU
+/// window to win. `#[must_use]` makes a silently dropped unpublished file a
+/// compile warning instead of a quiet no-op.
+#[must_use = "an AtomicFile that is never committed unlinks its temp file on drop; publish it with commit()"]
 pub struct AtomicFile {
     directory: std::fs::File,
     temp_file: std::fs::File,
@@ -853,5 +860,33 @@ mod tests {
             "Drop must not unlink a file it did not create"
         );
         assert!(!path.exists());
+    }
+
+    // SYSPLAN residual F-48 (GREEN): the final name is never stated — every
+    // `metadata_at` call in this file names the temp file, and publication
+    // is `renameat`-only. A future final-name stat fails here.
+    #[test]
+    fn final_name_is_never_stated_only_renamed_over() {
+        let source = include_str!("output.rs");
+        let production = source.split_once("mod tests").unwrap().0;
+        let mut calls = 0;
+        for line in production.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("fn metadata_at") {
+                continue;
+            }
+            if line.contains("metadata_at(") {
+                calls += 1;
+                assert!(
+                    line.contains("temp_name"),
+                    "a stat names something other than the temp file: {line:?}"
+                );
+                assert!(
+                    !line.contains("final_name"),
+                    "the final name must never be stated: {line:?}"
+                );
+            }
+        }
+        assert_eq!(calls, 2, "expected verify + Drop temp stats");
     }
 }

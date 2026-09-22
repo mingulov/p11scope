@@ -11,7 +11,6 @@ if sys.argv[1:] in (["--help"], ["-h"]):
 import glob
 import hashlib
 import json
-import os
 import sys
 
 

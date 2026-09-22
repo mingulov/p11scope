@@ -3,11 +3,13 @@
 
 use crate::discovery::scan::{CaptureWorkBudget, read_mountinfo};
 use crate::semantics::ProcessKey;
+#[cfg(test)]
 use std::collections::BTreeMap;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
-const MAX_TRACKED: usize = 16_384;
+pub(crate) const MAX_TRACKED: usize = 16_384;
+#[cfg(test)]
 const RESERVED_FDS: usize = 64;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -17,17 +19,28 @@ pub struct TrackingEvidence {
     pub evictions: u64,
 }
 
+// SYSPLAN residual F-44: the pid-keyed acquisition ladder (`identify` /
+// `poll_exited` / `Mode` / `Record`) is legacy test support, not a
+// production path — `history_tests.rs` pins that production trackers never
+// touch it, and wiring production through its `Untracked` fallback would
+// resurrect the F-16 fallback the revalidation retired. It is `cfg(test)`
+// so the shipped binary contains none of it; the `retire` dead end (zero
+// callers anywhere) is deleted outright. Live pidfd use survives intact in
+// `PidPin`, the production pin path below.
+#[cfg(test)]
 pub struct Identified {
     pub key: ProcessKey,
     pub retired: Option<ProcessKey>,
 }
 
+#[cfg(test)]
 enum Mode {
     PidFd(OwnedFd),
     ProcStat,
     Untracked,
 }
 
+#[cfg(test)]
 struct Record {
     key: ProcessKey,
     start_time: Option<u64>,
@@ -38,15 +51,21 @@ struct Record {
 pub struct Tracker {
     history: crate::history::Registry,
     // Optional control provenance; producer event admission never calls it.
+    #[cfg(test)]
     _control_adapter: Option<Box<dyn crate::history::TaskMembership>>,
+    #[cfg(test)]
     records: BTreeMap<u32, Record>,
+    #[cfg(test)]
     pidfd_limit: usize,
+    #[cfg(test)]
     process_limit: usize,
+    #[cfg(test)]
     sequence: u64,
     evidence: TrackingEvidence,
 }
 
 impl Tracker {
+    #[cfg(test)]
     pub fn new() -> Self {
         let limit = raise_nofile().unwrap_or(RESERVED_FDS);
         Self::with_limits(
@@ -55,6 +74,7 @@ impl Tracker {
         )
     }
 
+    #[cfg(test)]
     pub fn with_limits(pidfd_limit: usize, process_limit: usize) -> Self {
         Self {
             history: crate::history::Registry::disabled(),
@@ -74,9 +94,20 @@ impl Tracker {
         // the capture path never ran through Tracker::new, so raise here:
         // a 1024 soft limit dies near slot 256 otherwise.
         let _ = raise_nofile();
-        let mut tracker = Self::with_limits(0, 0);
-        tracker.history = crate::history::Registry::new(domain, limit);
-        tracker
+        Self {
+            history: crate::history::Registry::new(domain, limit),
+            #[cfg(test)]
+            _control_adapter: None,
+            #[cfg(test)]
+            records: BTreeMap::new(),
+            #[cfg(test)]
+            pidfd_limit: 0,
+            #[cfg(test)]
+            process_limit: 0,
+            #[cfg(test)]
+            sequence: 0,
+            evidence: TrackingEvidence::default(),
+        }
     }
     /// Existing proof harness constructor: optional control adapter is retained
     /// separately, with no event-driven candidate lookup or liveness sampling.
@@ -127,6 +158,7 @@ impl Tracker {
         self.history.confirm_retirement(key)
     }
 
+    #[cfg(test)]
     pub fn identify(&mut self, pid: u32) -> Identified {
         self.sequence = self.sequence.wrapping_add(1);
         if let Some(record) = self.records.get_mut(&pid) {
@@ -193,6 +225,7 @@ impl Tracker {
         Identified { key, retired }
     }
 
+    #[cfg(test)]
     pub fn poll_exited(&mut self) -> Vec<ProcessKey> {
         let dead: Vec<u32> = self
             .records
@@ -211,20 +244,11 @@ impl Tracker {
             .collect()
     }
 
-    pub fn retire(&mut self, key: ProcessKey) {
-        if self
-            .records
-            .get(&key.pid)
-            .is_some_and(|record| record.key == key)
-        {
-            self.records.remove(&key.pid);
-        }
-    }
-
     pub fn evidence(&self) -> TrackingEvidence {
         self.evidence
     }
 
+    #[cfg(test)]
     fn make_pidfd_room(&mut self) {
         if self.pidfd_count() < self.pidfd_limit || self.pidfd_limit == 0 {
             return;
@@ -244,6 +268,7 @@ impl Tracker {
         }
     }
 
+    #[cfg(test)]
     fn pidfd_count(&self) -> usize {
         self.records
             .values()
@@ -251,6 +276,7 @@ impl Tracker {
             .count()
     }
 
+    #[cfg(test)]
     fn least_recent_pid(&self) -> Option<u32> {
         self.records
             .iter()
@@ -259,6 +285,7 @@ impl Tracker {
     }
 }
 
+#[cfg(test)]
 impl Default for Tracker {
     fn default() -> Self {
         Self::new()

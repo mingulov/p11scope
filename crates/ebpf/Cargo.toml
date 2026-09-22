@@ -13,7 +13,7 @@ unsafe-unvalidated-metadata = []
 
 [dependencies]
 aya-ebpf = "=0.2.1"
-p11scope-ebpf-common = { path = "../ebpf-common" }
+p11scope-ebpf-common = { version = "0.0.0", path = "../ebpf-common" }
 
 [[bin]]
 name = "p11scope-ebpf"

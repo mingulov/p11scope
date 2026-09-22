@@ -72,7 +72,7 @@ jobs:
       # bpf-linker 0.10.4 (default feature rust-llvm-22) proxies to the LLVM bundled with the
       # toolchain that runs it (nightly); clang-18 compiles native CO-RE bitcode.
       - run: cargo +1.88 install bpf-linker --version 0.10.4 --locked
-      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 softhsm2
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 shellcheck softhsm2
       - name: Reconstruct pinned dependency sources
         run: python3 -I scripts/prepare-dependencies.py
       # Network acquisition is explicit and precedes every offline validation.
@@ -164,6 +164,25 @@ jobs:
       - run: python3 -I tests/python/test_canary_evidence.py --target-bits 64 -v
       - run: scripts/verify-inspect-doctor.sh
       - run: scripts/verify-attach-e2e.sh
+      # SYSPLAN residual gates. None names a lane body: the lint step
+      # addresses directories through a shell variable, never a scripts/
+      # path (the pipeline derivation test forbids lane paths here).
+      - name: help-drift (flags/parser/usage agreement)
+        run: python3 -I tests/python/test_help_usage_drift.py -v
+      - run: python3 -I tests/python/test_schema_json.py -v
+      - run: python3 -I tests/python/test_residual_gates.py -v
+      - run: cargo +1.88 install cargo-audit --version 0.22.2 --locked
+      - run: cargo +1.88 install cargo-deny --version 0.20.2 --locked
+      - run: cargo +1.88 audit
+      - run: cargo +1.88 deny check
+      - run: pipx install ruff==0.16.8
+      - name: lint shell scripts (error level)
+        shell: bash
+        run: |
+          for dir in scripts scripts/matrix; do
+            shellcheck -S error "$dir"/*.sh
+          done
+      - run: ruff check scripts/ tests/python/
   # A step cannot read its own job's log, so a second job fetches the finished
   # log through the Actions API and keeps it as a run artifact (90 days requested;
   # repo and org settings can cap that). Its
@@ -216,3 +235,99 @@ jobs:
           path: ${{ runner.temp }}/checks-and-e2e.log
           if-no-files-found: error
           retention-days: 90
+  # SYSPLAN residual F-04: one privileged CI E2E job running the gated
+  # system-scope cells (pid/system x metrics/profile) with their
+  # expected-count oracles. Required-but-manual: it runs only on manual
+  # dispatch, on a self-hosted BPF-capable runner. On push/PR it skips
+  # without implying anything ran; while no runner carries these labels
+  # the job waits rather than going green. Real and runnable: dispatch it
+  # from the Actions tab once a [self-hosted, bpf] runner exists.
+  privileged-e2e:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: [self-hosted, bpf]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install 1.88 --profile minimal --component rustfmt,clippy
+      - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
+      - run: cargo +1.88 install bpf-linker --version 0.10.4 --locked
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 softhsm2
+      - name: Reconstruct pinned dependency sources
+        run: python3 -I scripts/prepare-dependencies.py
+      - run: cargo +1.88 fetch --locked --manifest-path Cargo.toml
+      - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
+      # The four gated cells in one lane invocation: --scope both runs
+      # pid+system, --mode both runs metrics+profile, and the lane's own
+      # oracle joins observer report + traces + workload TRUTH per cell.
+      - run: scripts/system-scope-measure.sh --scope both --mode both
+  # SYSPLAN residual F-28: release preview (musl build, docker build/lint,
+  # kubeconform, SBOM, build-release.sh wired). Manual like the privileged
+  # lane: dispatch it on demand; it never blocks PRs and never implies a
+  # release ran. Hosted runners suffice (passwordless sudo covers the
+  # receipt steps); no special labels needed.
+  release-preview:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install 1.88 --profile minimal --component rustfmt,clippy
+      - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
+      - run: rustup target add --toolchain 1.88 x86_64-unknown-linux-musl
+      - run: cargo +1.88 install bpf-linker --version 0.10.4 --locked
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm musl-tools python3 softhsm2
+      - name: Reconstruct pinned dependency sources
+        run: python3 -I scripts/prepare-dependencies.py
+      - run: cargo +1.88 fetch --locked --manifest-path Cargo.toml
+      - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
+      - run: cargo +1.88 build --locked --offline --release --target x86_64-unknown-linux-musl
+      - run: docker build -f deploy/Dockerfile.observer -t p11scope-observer:preview .
+      - run: docker build -f deploy/Dockerfile.holder -t p11scope-holder:preview .
+      - run: docker run --rm -i hadolint/hadolint < deploy/Dockerfile.observer
+      - run: docker run --rm -i hadolint/hadolint < deploy/Dockerfile.holder
+      - run: scripts/build-release.sh
+      - uses: anchore/sbom-action@d8a2c0130026bf585de5c176ab8f7ce62d75bf04 # v0.20.7
+        with:
+          image: p11scope-observer:preview
+          format: spdx-json
+          output-file: sbom-observer.spdx.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbom-observer-preview
+          path: sbom-observer.spdx.json
+          if-no-files-found: error
+          retention-days: 30
+      - run: curl -sSfL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar xz -C /tmp kubeconform && /tmp/kubeconform -summary deploy/k8s/
+  # SYSPLAN residual F-40: coverage gate with a ratchet. The floor lives in
+  # .coverage-floor (raise it, never lower it); the job fails the workflow
+  # when line coverage of the touched lib crate drops below it.
+  coverage:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install 1.88 --profile minimal --component rustfmt,clippy,llvm-tools-preview
+      - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
+      - run: cargo +1.88 install bpf-linker --version 0.10.4 --locked
+      - run: cargo +1.88 install cargo-llvm-cov --version 0.9.1 --locked
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 softhsm2
+      - name: Reconstruct pinned dependency sources
+        run: python3 -I scripts/prepare-dependencies.py
+      - run: cargo +1.88 fetch --locked --manifest-path Cargo.toml
+      - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
+      - run: cargo +1.88 llvm-cov --locked --offline --lib --fail-under-lines "$(cat .coverage-floor)"
+  # SYSPLAN residual F-29: flake quarantine. Failure-gated triage evidence:
+  # when checks fail, each ledgered flake re-runs exactly once, serially,
+  # in isolation. A green quarantine run never greens the workflow.
+  quarantine:
+    needs: checks-and-e2e
+    if: failure()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install 1.88 --profile minimal --component rustfmt,clippy
+      - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
+      - run: cargo +1.88 install bpf-linker --version 0.10.4 --locked
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 softhsm2
+      - name: Reconstruct pinned dependency sources
+        run: python3 -I scripts/prepare-dependencies.py
+      - run: cargo +1.88 fetch --locked --manifest-path Cargo.toml
+      - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
+      - run: scripts/run-flake-quarantine.sh

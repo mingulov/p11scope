@@ -910,6 +910,7 @@ impl RootSeed {
 ///     Session {
 ///         ebpf: panic!("compile-only placeholder"),
 ///         events_domain: panic!("compile-only placeholder"),
+///         events_consumer: panic!("compile-only placeholder"),
 ///         root_seed: panic!("compile-only placeholder"),
 ///         attach_failures: panic!("compile-only placeholder"),
 ///         detach_failures: panic!("compile-only placeholder"),
@@ -949,6 +950,12 @@ impl RootSeed {
 pub struct Session {
     pub(crate) ebpf: Ebpf,
     events_domain: events::EventsDomain,
+    /// The session's single retained `EVENTS` consumer, built once from
+    /// the retained domain descriptor on first drain and reused by every
+    /// later poll. It owns a duplicated descriptor plus its mappings, so
+    /// it never borrows `ebpf`; `None` until the first drain keeps
+    /// metrics-mode sessions (which never drain) free of reader setup.
+    events_consumer: Option<events::OwnedDrain>,
     root_seed: Option<RootSeed>,
     attach_failures: Vec<(u32, String)>,
     detach_failures: Vec<String>,
@@ -2673,6 +2680,7 @@ impl Session {
         Ok(Self {
             ebpf,
             events_domain,
+            events_consumer: None,
             root_seed,
             attach_failures: vec![],
             detach_failures: vec![],
@@ -3396,8 +3404,18 @@ impl Session {
         self.events_domain.clone()
     }
 
-    pub fn event_drain(&mut self) -> Result<events::Drain<'_>> {
-        events::Drain::new(&mut self.ebpf, self.events_domain.clone())
+    /// The session's single retained `EVENTS` consumer, with exclusive
+    /// `&mut` access: one cursor and one malformed total across every
+    /// live, root-tail and terminal poll. Built once on first drain; the
+    /// reader owns its mappings and never borrows this session's `Ebpf`.
+    pub fn event_drain(&mut self) -> Result<&mut events::OwnedDrain> {
+        if self.events_consumer.is_none() {
+            let consumer = events::OwnedDrain::for_session(&self.ebpf, &self.events_domain)?;
+            self.events_consumer = Some(consumer);
+        }
+        self.events_consumer
+            .as_mut()
+            .context("retained EVENTS consumer vanished after creation")
     }
 
     /// Borrow the EVENTS map descriptor for readiness waits. The idle

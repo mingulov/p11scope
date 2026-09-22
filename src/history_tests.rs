@@ -53,6 +53,8 @@ fn plan() -> crate::plan::AttachPlan {
             "C_AsyncJoin",
             "C_AsyncComplete",
             "C_GetInfo",
+            "C_CloseSession",
+            "C_CloseAllSessions",
         ]
         .into_iter()
         .enumerate()
@@ -1294,4 +1296,316 @@ fn root_cancel_never_relabels_timeout_domain_reducer_or_crossing_failures() {
         assert!(diagnostic.is_empty());
         assert!(signals.interrupted());
     }
+}
+
+/// E20 / F-75 first regression. Same EVENTS domain (1), distinct task
+/// cookies (90 vs 20), equal module/slot/target-function/async ID, different
+/// pending mechanisms (0x101 vs 0x250). The second `C_AsyncGetID` is a proven
+/// independent-owner collision: the key is tombstoned, the first owner's join
+/// and every completion on it are refused, and no mechanism is published under
+/// either process — while PARTIAL-implying evidence (`async_duplicates`,
+/// `async_orphans`) stays explicit. The other owner's finalize retires only
+/// its own scope; a late completion after retirement is a history drop, never
+/// a binding.
+#[test]
+fn e20_f75_same_domain_collision_refuses_join_and_completion_without_wrong_binding() {
+    let target = crate::kinds::function_id("C_SignInit").unwrap();
+    let pending_init = |pid: u32, cookie: u64, mechanism: u64| {
+        let mut init = ev(pid, cookie, 0, 1);
+        init.rv = pkcs11_types::CkRv::PENDING.0;
+        init.capture = capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL;
+        init.mechanism = mechanism;
+        init
+    };
+    let get_id = |pid: u32, cookie: u64| {
+        let mut get = ev(pid, cookie, 0, 4);
+        get.target_function = target;
+        get.async_value = 42;
+        get
+    };
+    let join = |pid: u32, cookie: u64, session: u64| {
+        let mut join = ev(pid, cookie, 0, 5);
+        join.session = session;
+        join.target_function = target;
+        join.async_value = 42;
+        join
+    };
+    let complete = |pid: u32, cookie: u64, session: u64| {
+        let mut complete = ev(pid, cookie, 0, 6);
+        complete.session = session;
+        complete.target_function = target;
+        complete
+    };
+
+    let (mut s, mut t, _) = setup(16);
+    let a = key(90, 0);
+    let b = semantics::ProcessKey::history(1, 20, 0, 200);
+    let mut open_a8 = ev(100, 90, 0, 0);
+    open_a8.session = 8;
+    feed(
+        &mut s,
+        &mut t,
+        [ev(100, 90, 0, 0), open_a8, ev(200, 20, 0, 0)],
+    );
+    assert_eq!(vector(&s), (3, 0, 0, 3, 3, 0));
+
+    // Opposite pending mechanisms, one shared (module, slot, function, id).
+    feed(
+        &mut s,
+        &mut t,
+        [pending_init(100, 90, 0x101), pending_init(200, 20, 0x250)],
+    );
+    assert_eq!(s.pending_at_end(), 2);
+    feed(&mut s, &mut t, [get_id(100, 90)]);
+    assert_eq!(s.pending_at_end(), 2);
+    assert_eq!(s.semantic_evidence().async_duplicates, 0);
+
+    // The second GetID proves the collision: one tombstoned key, no new key,
+    // explicit duplicate evidence (PARTIAL-implying downstream).
+    feed(&mut s, &mut t, [get_id(200, 20)]);
+    assert_eq!(s.pending_at_end(), 1);
+    assert_eq!(s.semantic_evidence().async_duplicates, 1);
+
+    // The first owner's join is refused: custody cannot move off an
+    // ambiguous key.
+    feed(&mut s, &mut t, [join(100, 90, 8)]);
+    assert_eq!(s.semantic_evidence().async_orphans, 1);
+    assert_eq!(s.pending_at_end(), 1);
+
+    // Opposite completion order (B first) plus both of A's sessions: every
+    // completion on the collided key is refused and publishes nothing.
+    feed(&mut s, &mut t, [complete(200, 20, 7)]);
+    assert_eq!(s.semantic_evidence().async_orphans, 2);
+    feed(&mut s, &mut t, [complete(100, 90, 8)]);
+    assert_eq!(s.semantic_evidence().async_orphans, 3);
+    feed(&mut s, &mut t, [complete(100, 90, 7)]);
+    assert_eq!(s.semantic_evidence().async_orphans, 4);
+    assert!(
+        s.mechanisms().get(&0x101).is_none(),
+        "loser's mechanism must not publish"
+    );
+    assert!(
+        s.mechanisms().get(&0x250).is_none(),
+        "winner's mechanism must not publish under the other owner"
+    );
+    assert_eq!(s.pending_at_end(), 1);
+    assert!(s.has_process_state(a));
+    assert!(s.has_process_state(b));
+
+    // A later ordinary call on either session finds no smuggled binding.
+    let mut sign_a = ev(100, 90, 0, 2);
+    sign_a.session = 8;
+    feed(&mut s, &mut t, [sign_a, ev(200, 20, 0, 2)]);
+    assert!(s.mechanisms().get(&0x101).is_none());
+    assert!(s.mechanisms().get(&0x250).is_none());
+
+    // The other owner's finalize retires only its own scope: the tombstone
+    // (first inserter's Cryptoki) survives, B's session is settled.
+    feed(&mut s, &mut t, [ev(200, 20, 0, 3)]);
+    assert_eq!(vector(&s), (3, 0, 1, 2, 3, 1));
+    assert!(!s.has_process_state(b));
+    assert!(s.has_process_state(a));
+
+    // The first owner's finalize drops the tombstone with its Cryptoki.
+    feed(&mut s, &mut t, [ev(100, 90, 0, 3)]);
+    assert_eq!(vector(&s), (3, 0, 3, 0, 3, 0));
+    assert!(!s.has_process_state(a));
+
+    // Late completion after the collision settled: refused, still nothing
+    // published even though PARTIAL-implying evidence is set.
+    feed(&mut s, &mut t, [complete(100, 90, 7)]);
+    assert_eq!(s.semantic_evidence().async_orphans, 5);
+    assert!(s.mechanisms().is_empty());
+    assert_eq!(s.semantic_evidence().async_duplicates, 1);
+
+    // Exits retire both histories; anything later is a history drop.
+    apply_confirmed_retirement(&mut t, &mut s, a);
+    apply_confirmed_retirement(&mut t, &mut s, b);
+    assert_eq!(vector(&s), (3, 0, 3, 0, 3, 0));
+    feed(&mut s, &mut t, [complete(200, 20, 7)]);
+    assert_eq!(s.semantic_evidence().semantic_history_drops, 1);
+    assert_eq!(s.semantic_evidence().async_orphans, 5);
+    assert!(s.mechanisms().is_empty());
+}
+
+/// E20 countercontrol: one `C_AsyncGetID` followed by a genuine cross-process
+/// join still transfers custody and completes with the originator's own
+/// mechanism. The collision tombstone must never fire without a proven second
+/// owner; this test pins that valid transfers survive the gate.
+#[test]
+fn e20_valid_cross_process_transfer_still_completes_with_own_mechanism() {
+    let target = crate::kinds::function_id("C_SignInit").unwrap();
+    let (mut s, mut t, _) = setup(16);
+    feed(&mut s, &mut t, [ev(100, 90, 0, 0), ev(200, 20, 0, 0)]);
+    let mut init = ev(100, 90, 0, 1);
+    init.rv = pkcs11_types::CkRv::PENDING.0;
+    init.capture = capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL;
+    init.mechanism = 0x101;
+    let mut get = ev(100, 90, 0, 4);
+    get.target_function = target;
+    get.async_value = 42;
+    feed(&mut s, &mut t, [init, get]);
+    assert_eq!(s.pending_at_end(), 1);
+
+    let mut join = ev(200, 20, 0, 5);
+    join.target_function = target;
+    join.async_value = 42;
+    feed(&mut s, &mut t, [join]);
+    assert_eq!(s.semantic_evidence().async_orphans, 0);
+    assert_eq!(s.pending_at_end(), 1);
+
+    let mut complete = ev(200, 20, 0, 6);
+    complete.target_function = target;
+    feed(&mut s, &mut t, [complete]);
+    assert_eq!(s.semantic_evidence().async_orphans, 0);
+    assert_eq!(s.semantic_evidence().async_duplicates, 0);
+    assert_eq!(s.mechanisms()[&0x101].calls, 1);
+    assert_eq!(s.pending_at_end(), 0);
+    assert_eq!(vector(&s), (2, 0, 0, 2, 2, 0));
+}
+
+/// FU-1 via the real history drain (Package E): after the E20 same-domain
+/// collision, the first owner mints a fresh PENDING GetID on the collided
+/// key. Duplicates +1, exactly one record, joins/completions refused, and
+/// neither the original nor the fresh mechanism publishes.
+#[test]
+fn e20_fu1_history_remint_on_live_tombstone_refuses_without_binding() {
+    let target = crate::kinds::function_id("C_SignInit").unwrap();
+    let pending_init = |pid: u32, cookie: u64, mechanism: u64| {
+        let mut init = ev(pid, cookie, 0, 1);
+        init.rv = pkcs11_types::CkRv::PENDING.0;
+        init.capture = capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL;
+        init.mechanism = mechanism;
+        init
+    };
+    let get_id = |pid: u32, cookie: u64| {
+        let mut get = ev(pid, cookie, 0, 4);
+        get.target_function = target;
+        get.async_value = 42;
+        get
+    };
+    let join = |pid: u32, cookie: u64| {
+        let mut join = ev(pid, cookie, 0, 5);
+        join.target_function = target;
+        join.async_value = 42;
+        join
+    };
+    let complete = |pid: u32, cookie: u64| {
+        let mut complete = ev(pid, cookie, 0, 6);
+        complete.target_function = target;
+        complete
+    };
+
+    let (mut s, mut t, _) = setup(16);
+    feed(&mut s, &mut t, [ev(100, 90, 0, 0), ev(200, 20, 0, 0)]);
+    feed(
+        &mut s,
+        &mut t,
+        [pending_init(100, 90, 0x101), pending_init(200, 20, 0x250)],
+    );
+    feed(&mut s, &mut t, [get_id(100, 90), get_id(200, 20)]);
+    assert_eq!(s.semantic_evidence().async_duplicates, 1);
+    assert_eq!(s.pending_at_end(), 1);
+
+    // First owner mints a fresh PENDING operation and re-issues GetID.
+    feed(&mut s, &mut t, [pending_init(100, 90, 0x103)]);
+    assert_eq!(s.pending_at_end(), 2);
+    feed(&mut s, &mut t, [get_id(100, 90)]);
+    assert_eq!(
+        s.semantic_evidence().async_duplicates,
+        2,
+        "re-mint on a live tombstone counts one more duplicate"
+    );
+    assert_eq!(s.pending_at_end(), 1, "the tombstone adds zero keys");
+
+    feed(&mut s, &mut t, [join(100, 90)]);
+    assert_eq!(s.semantic_evidence().async_orphans, 1);
+    feed(&mut s, &mut t, [join(200, 20)]);
+    assert_eq!(s.semantic_evidence().async_orphans, 2);
+    feed(&mut s, &mut t, [complete(200, 20)]);
+    assert_eq!(s.semantic_evidence().async_orphans, 3);
+    feed(&mut s, &mut t, [complete(100, 90)]);
+    assert_eq!(s.semantic_evidence().async_orphans, 4);
+    assert!(s.mechanisms().get(&0x101).is_none());
+    assert!(s.mechanisms().get(&0x103).is_none());
+    assert!(s.mechanisms().get(&0x250).is_none());
+    assert_eq!(s.pending_at_end(), 1);
+}
+
+/// FU-2 via the real history drain (Package E): `C_CloseSession` (slot 8)
+/// and `C_CloseAllSessions` (slot 9) by each owner on a collided key leave
+/// the tombstone live: one record, joins/completions still refused.
+#[test]
+fn e20_fu2_history_close_on_live_tombstone_preserves_refusal() {
+    let target = crate::kinds::function_id("C_SignInit").unwrap();
+    let pending_init = |pid: u32, cookie: u64, mechanism: u64| {
+        let mut init = ev(pid, cookie, 0, 1);
+        init.rv = pkcs11_types::CkRv::PENDING.0;
+        init.capture = capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL;
+        init.mechanism = mechanism;
+        init
+    };
+    let get_id = |pid: u32, cookie: u64| {
+        let mut get = ev(pid, cookie, 0, 4);
+        get.target_function = target;
+        get.async_value = 42;
+        get
+    };
+
+    // --- C_CloseSession by each owner. ---
+    let (mut s, mut t, _) = setup(16);
+    feed(&mut s, &mut t, [ev(100, 90, 0, 0), ev(200, 20, 0, 0)]);
+    feed(
+        &mut s,
+        &mut t,
+        [pending_init(100, 90, 0x101), pending_init(200, 20, 0x250)],
+    );
+    feed(&mut s, &mut t, [get_id(100, 90), get_id(200, 20)]);
+    assert_eq!(s.semantic_evidence().async_duplicates, 1);
+    feed(&mut s, &mut t, [ev(200, 20, 0, 8)]);
+    assert_eq!(s.pending_at_end(), 1);
+    feed(&mut s, &mut t, [ev(100, 90, 0, 8)]);
+    assert_eq!(s.pending_at_end(), 1, "close detaches but never drops");
+    assert_eq!(vector(&s), (2, 0, 2, 0, 2, 1));
+    // Re-open both, joins/completions still refuse.
+    feed(&mut s, &mut t, [ev(100, 90, 0, 0), ev(200, 20, 0, 0)]);
+    let mut join = ev(100, 90, 0, 5);
+    join.target_function = target;
+    join.async_value = 42;
+    feed(&mut s, &mut t, [join]);
+    assert_eq!(s.semantic_evidence().async_orphans, 1);
+    let mut complete = ev(200, 20, 0, 6);
+    complete.target_function = target;
+    feed(&mut s, &mut t, [complete]);
+    assert_eq!(s.semantic_evidence().async_orphans, 2);
+    assert_eq!(s.pending_at_end(), 1);
+
+    // --- C_CloseAllSessions by each owner (fresh collision). ---
+    let (mut s, mut t, _) = setup(16);
+    feed(&mut s, &mut t, [ev(100, 90, 0, 0), ev(200, 20, 0, 0)]);
+    feed(
+        &mut s,
+        &mut t,
+        [pending_init(100, 90, 0x101), pending_init(200, 20, 0x250)],
+    );
+    feed(&mut s, &mut t, [get_id(100, 90), get_id(200, 20)]);
+    let mut close_all_b = ev(200, 20, 0, 9);
+    close_all_b.session = p11scope_ebpf_common::SESSION_NONE;
+    feed(&mut s, &mut t, [close_all_b]);
+    assert_eq!(s.pending_at_end(), 1);
+    let mut close_all_a = ev(100, 90, 0, 9);
+    close_all_a.session = p11scope_ebpf_common::SESSION_NONE;
+    feed(&mut s, &mut t, [close_all_a]);
+    assert_eq!(
+        s.pending_at_end(),
+        1,
+        "close-all detaches but never drops a live tombstone"
+    );
+    feed(&mut s, &mut t, [ev(100, 90, 0, 0)]);
+    let mut join = ev(100, 90, 0, 5);
+    join.target_function = target;
+    join.async_value = 42;
+    feed(&mut s, &mut t, [join]);
+    assert_eq!(s.semantic_evidence().async_orphans, 1);
+    assert!(s.mechanisms().is_empty());
 }

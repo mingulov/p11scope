@@ -92,6 +92,43 @@ historical evidence except for the explicitly discussed overlapping facets.
 They were not individually revalidated in full. R-01–R-05 also retain that
 qualification. In particular, this review does not convert accepted design
 limits or “body not opened” questions into confirmed exploitable defects.
+(F-29 leaves this paragraph on the residual branch: it is remediated below.)
+
+### SYSPLAN residual remediation — 2026-09-22 (branch `sysplan/residual`)
+
+Base `bc9e7be`. RED `ffa361a`, GREEN `e29464b` (code/docs/oracle),
+GREEN `b0c78ae` (CI). Gates on Rust 1.88 `--locked --offline`:
+`fmt --check`, `clippy --workspace --all-targets` zero warnings, full
+`cargo test` suite. Line numbers are tip-of-branch; the §4 drift table of
+`findings-triage.md` is applied (old cites replaced below).
+
+| ID | Remediated disposition and evidence |
+|---|---|
+| F-01 | **Partially remediated (override disclosure).** The `--allow-uretprobe-on-confined-target` override flag + hazard reason is durable report evidence (`render.rs:617`, `UretprobeOverride` `:155`; `run.rs` preflight returns the reason `:2371`, threaded through `run_loop`/`capture_profile`/`capture_trace` into `evidence_for`; oracle pins the shape `check-capture-evidence.py:exact_terminal_verdict`). The unknown-unknown acceptance clause itself is unchanged by design. |
+| F-02 | **Remediated (verdict split, PARTIAL kept).** Terminal verdict splits via `drain_proven` latch + `verdict_detail` enum (`render.rs:102-104,611-614`); the terminal seal forces PARTIAL while unproven and gates any future COMPLETE on the latch (`:887`); oracle enforces the same gate (`exact_terminal_verdict`). Clean-but-unproven and concrete-gap no longer share one signal. |
+| F-04 | **Remediated (recurring privileged E2E).** `ci.yml` `privileged-e2e` job runs the four gated cells (`scripts/system-scope-measure.sh --scope both --mode both` with expected-count oracles). Required-but-manual: `workflow_dispatch`-gated on `[self-hosted, bpf]`; skips on push/PR without implying anything ran. |
+| F-08 | **Remediated (type-enforced).** `VersionedEvidence` newtype (`render.rs:1225`) is the only input `profile_json` accepts; the metrics/profile split can no longer regress by call-site discipline. Python oracle stays a second reader. |
+| F-12 | **Remediated (documented + discriminated).** v3 schema doc gained the metrics/profile split section (4 serde-skip fields, `verdict_with_selection(true/false)` per lane); both lanes emit `lane` (`render.rs:1208,1610`); oracle enforces the discriminator. |
+| F-14 | **Remediated (explicit refusal).** `unsupported_version_of` (`scan.rs:1087`) + sticky budget counter (`:526,716`, third `refusal_counts` leg feeding scan completeness) + explicit fixed-string skip (`:1104`, public reason `render.rs` `UNSUPPORTED_TABLE_VERSION`, oracle + schema doc + vocab test extended to 7 reasons). Slice-1 §4.1 (scan window) vs v0.1 matrix (helper) reconciled in `usage.md`. |
+| F-15 | **Remediated (named handoff).** Orphan PID + handoff state on the terminal path (`run.rs:format_handoff_note:2455`, printed `:2350`) and machine-readable `handoff_child_pid` (`render.rs:621`) pinned to agree with `child_still_running` by the oracle. Exit stays 0. |
+| F-17 | **Remediated (cap disclosed).** 10M default in `--help` (`cli.rs:198` + scoped helps), no-duration notice names the effective cap (`run.rs:1567`), `TRUNCATED` cites the effective cap and names `--max-events` only when passed (`trace.rs:174`). |
+| F-26 | **Remediated (switches listed + captured).** Every capture-visible `P11SCOPE_*` var in `--help`/`usage.md` (full operator table incl. build/lane inputs; test-only/plumbing explicitly out of scope with rationale); active values captured in `evidence.p11scope_env` (`render.rs:127,625`) and pinned by the oracle. |
+| F-27 | **Remediated (advisory gate).** `cargo audit` (0 advisories) + `cargo deny check` (green) wired into `checks-and-e2e` with `deny.toml` (exact-6 license allowlist, rev-pinned git source allowlist, `wildcards=deny` with explicit versions on all path/git deps). |
+| F-28 | **Remediated (release preview).** `ci.yml` `release-preview` job: musl release build (verified: 8.3 MB static binary), both docker builds (verified), hadolint (verified exit 0), kubeconform 6/6 valid (verified), SBOM upload, `build-release.sh` wired. Manual-gated like the privileged lane; never blocks PRs. |
+| F-29 | **Remediated (quarantine owned).** `docs/notes/test-quarantine.md` maps all 7 flakes to lanes + isolation; `scripts/run-flake-quarantine.sh` re-runs each exactly once, serially, `--exact`, `--test-threads=1`, private target dir; CI `quarantine` job runs it failure-gated (triage evidence only, can never green the workflow). No test weakened. |
+| F-30 | **Remediated (drift closed).** `usage.md` documents `--version` + `--attach-backend` (the two gaps); `usage_doc_documents_every_cli_flag` (Rust) + `tests/python/test_help_usage_drift.py` pin USAGE↔usage.md↔parser agreement (the latter caught a real gap during development: removed-flag literals); CI `help-drift` step runs the static check. |
+| F-40 | **Remediated (coverage ratchet).** `coverage` job runs `cargo llvm-cov --lib --fail-under-lines "$(cat .coverage-floor)"` (floor 83; measured 83.51 on 1.88). Enabler: `build.rs` keeps coverage instrumentation (RUSTFLAGS/encoded/RUSTC_WRAPPER channels) off the freestanding BPF target. |
+| F-44 | **Remediated (legacy ladder out of prod).** `Tracker::identify`/`poll_exited`/`Mode`/`Record`/limits + `retire` (zero callers, deleted) are `cfg(test)` (`process.rs`); shipped binary contains none of it. Kept under test as the history tripwire's positive control (wiring production through the `Untracked` fallback would resurrect F-16); live pidfd use in `PidPin` untouched. |
+| F-48 | **Remediated (must-use + verified policy).** `#[must_use]` on `AtomicFile` (`output.rs:47`); final-name stat policy verified (only the temp name is ever stated; publication is `renameat`-only) and pinned by `final_name_is_never_stated_only_renamed_over`. |
+| F-50 | **Remediated (schema docs completed).** v2 doc gained the 4 missing F3 fields (`semantic_history_drops`, `scheduling` with loss-split identities, `discovery_uncorroborated_candidates`, `unregistered_mechanisms`) + F5 items (table `entries` usable-only, `modules_skipped` shape, `ring_bytes`/`drain_interval_ms`, providers bound, rv==0 rule, terminal five keys; `exact_role_counts` ten-call promise wired to the helper source). Machine-readable `docs/schema/observed-profile-v3.schema.json` published, kept in agreement with the oracle by `tests/python/test_schema_json.py`. |
+| F-59 | **Remediated (newline sanitized).** `doctor::render` escapes newlines/controls in details (`doctor.rs:1192-1193`); one check can no longer forge a second output line. |
+| F-63 | **Remediated (script lint gates).** `shellcheck -S error` over `scripts/` (0 findings; 100+ warnings stay triage debt, dominated by the deliberate `T4_TOOL_*` idiom) + `ruff check` over `scripts/` + `tests/python/` under `ruff.toml` (E9+F ratchet; F821 real bug + F401/F841/F541 cleaned, 0 remaining). Both wired into `checks-and-e2e`. |
+
+Deferred residuals (in-scope items not taken): none — all 19 prioritized
+items above are implemented. Out-of-scope findings keep their dispositions;
+the F-13/F-19/F-22/F-32/F-34 addressed-with-docs verdicts from
+`findings-triage.md` §1 belong to their owning Package-H/docs stage, not
+this branch.
 
 ### R-06 update — external standard grounding resolved for catalog size
 

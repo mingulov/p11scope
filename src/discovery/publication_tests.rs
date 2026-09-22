@@ -29,13 +29,35 @@
 //! 10. `broad_fixed_pool_admits_all_validated_templates`
 //! 11. `broad_stripped_build_adds_nothing_beyond_selected`
 //! 12. `broad_refuses_whole_when_validated_set_exceeds_budget`
+//!
+//! Package F (SYSPLAN generalizing passive publication) appends the
+//! `C_GetInterface` equivalence matrix, reusing the same stage driver with
+//! three new commands (`G` drives `C_GetInterface`, `V` rewrites a live
+//! wrapper's version word, `M` rewrites one live entry):
+//!
+//! 13. `f_e08_named_gi_heap_matches_list_element` (+ stripped leg)
+//! 14. `f_e08_forwarded_gi_keeps_distinct_endpoint_owners`
+//! 15. `f_e08_null_default_and_failure_request_matrix`
+//! 16. `f_e08_version_shape_matrix`
+//! 17. `f_e13_first_call_gap_and_precapture_boundary`
+//! 18. `f_e15_malicious_entries_refused_equally`
+//! 19. `f_e15_forged_exact_name_stays_count_only`
+//! 20. `f_e21_gi_public_output_carries_no_raw_pointers`
+//!
+//! Supported equivalent factory forms must yield the same exact count-only
+//! endpoint set; unsupported forms must refuse with the same specific
+//! omission on every route. Selection authority guards stay intact: the
+//! `C_GetInterface` tuple/claim path is unchanged, and publication lowers
+//! through the shared bounded ownership-validation path.
 use super::session_fixture::ScriptedSession;
 use super::*;
 use crate::discovery::identity::{ManifestStaleReason, pin_manifest_objects_deferred};
 use p11scope_ebpf_common::{
     DISCOVERY_INTERFACES, DISCOVERY_KIND_FUNCTION_LIST_RETURN,
-    DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN, DISCOVERY_NAME_NA, DISCOVERY_NAME_OTHER,
-    valid_discovery_record,
+    DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN, DISCOVERY_KIND_INTERFACE_RETURN,
+    DISCOVERY_NAME_EXACT_STANDARD, DISCOVERY_NAME_NA, DISCOVERY_NAME_NULL, DISCOVERY_NAME_OTHER,
+    DISCOVERY_VERSION_NULL, DISCOVERY_VERSION_OTHER, DISCOVERY_VERSION_V2_40,
+    DISCOVERY_VERSION_V3_0, DISCOVERY_VERSION_V3_1, DISCOVERY_VERSION_V3_2, valid_discovery_record,
 };
 use p11scope_manifest::identity::{IdentityKind, ObjectIdentity};
 use p11scope_manifest::manifest::{
@@ -220,6 +242,14 @@ fn parse_hex_addr(text: &str) -> u64 {
     u64::from_str_radix(digits, 16).expect("hex address")
 }
 
+fn parse_table_addr(text: &str) -> u64 {
+    if text == "(nil)" {
+        // A poked NULL hole (Package F): the entry is genuinely absent.
+        return 0;
+    }
+    parse_hex_addr(text)
+}
+
 fn parse_keyed(line: &str, key: &str) -> String {
     line.split_whitespace()
         .find_map(|field| field.strip_prefix(key))
@@ -242,7 +272,7 @@ fn read_table_print(lines: &mut impl Iterator<Item = String>) -> TablePrint {
         let got: usize = parse_keyed(&line, "ord=").parse().expect("ord");
         assert_eq!(got, ord, "entries print in ordinal order");
         entries.push((
-            parse_hex_addr(&parse_keyed(&line, "addr=")),
+            parse_table_addr(&parse_keyed(&line, "addr=")),
             parse_keyed(&line, "sym="),
         ));
     }
@@ -407,6 +437,68 @@ impl StageChild {
         assert!(lines.next().is_none(), "template block has no tail");
         Some(tables)
     }
+
+    /// Drive `C_GetInterface` in the child: `name` is `None` for a NULL
+    /// (default-interface) request; `version` is `None` for a NULL version.
+    fn gi(&mut self, name: Option<&str>, version: Option<(u8, u8)>) -> IfacePrint {
+        let command = match (name, version) {
+            (None, None) => "G -".to_string(),
+            (Some(name), None) => format!("G {name}"),
+            (None, Some((major, minor))) => format!("G - {major} {minor}"),
+            (Some(name), Some((major, minor))) => format!("G {name} {major} {minor}"),
+        };
+        self.command(&command);
+        let reply = self.line();
+        assert!(reply.starts_with("IFACE "), "expected IFACE, got {reply:?}");
+        let table_raw = parse_keyed(&reply, "table=");
+        IfacePrint {
+            rv: parse_keyed(&reply, "rv=").parse().expect("rv"),
+            name: parse_keyed(&reply, "name="),
+            table: if table_raw == "(nil)" {
+                0
+            } else {
+                parse_hex_addr(&table_raw)
+            },
+            flags: parse_keyed(&reply, "flags=").parse().expect("flags"),
+        }
+    }
+
+    fn set_version(&mut self, idx: i64, major: u8, minor: u8) {
+        self.command(&format!("V {idx} {major} {minor}"));
+        let reply = self.line();
+        assert_eq!(
+            reply,
+            format!("VERSION idx={idx} major={major} minor={minor}")
+        );
+    }
+
+    fn poke(&mut self, idx: i64, ord: usize, mode: u32) {
+        self.command(&format!("M {idx} {ord} {mode}"));
+        let reply = self.line();
+        assert_eq!(reply, format!("POKED idx={idx} ord={ord} mode={mode}"));
+    }
+
+    /// Call entry `ord` on wrapper `idx` `n` times through the published
+    /// heap table; returns the last return code.
+    fn call(&mut self, idx: i64, ord: usize, n: u32) -> u64 {
+        self.command(&format!("C {idx} {ord} {n}"));
+        let reply = self.line();
+        assert!(
+            reply.starts_with("CALLED "),
+            "expected CALLED, got {reply:?}"
+        );
+        parse_keyed(&reply, "rv=").parse().expect("rv")
+    }
+}
+
+/// One printed `C_GetInterface` result: `table` is 0 when the factory
+/// returned an error and no interface.
+#[derive(Debug, Clone)]
+struct IfacePrint {
+    rv: u64,
+    name: String,
+    table: u64,
+    flags: u64,
 }
 
 impl Drop for StageChild {
@@ -642,6 +734,178 @@ fn publish_records(pid: u32, publish: &PublishBlock, hooks: &HookRegistry) -> Ve
                 hooks,
             )
         })
+        .collect()
+}
+
+/// What the probe captures for a successful `C_GetInterface` return: the
+/// request classification, the bound hook, the result classification and
+/// the table address. No entry bytes travel for nonstandard names (the
+/// transport contract forbids a prefix there); the engine re-validates
+/// the table from memory either way. `request`/`result` are
+/// `(name class, version class, flags)`.
+fn gi_record(
+    pid: u32,
+    binding_id: u64,
+    request: (u8, u8, u64),
+    table_addr: u64,
+    result: (u8, u8, u64),
+) -> DiscoveryRecord {
+    assert_ne!(table_addr, 0, "success carries a table");
+    let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    record.kind = DISCOVERY_KIND_INTERFACE_RETURN;
+    record.pid_tgid = (u64::from(pid) << 32) | u64::from(pid);
+    record.hook_ts_ns = crate::attach::monotonic_ns().unwrap_or(0);
+    record.case_id = request.0;
+    record.interface_index = request.1;
+    record.request_flags = request.2;
+    record.binding_id = binding_id;
+    record.table_ptr = table_addr;
+    record.name_class = result.0;
+    record.selection_version_class = result.1;
+    record.interface_flags = result.2;
+    assert!(
+        valid_discovery_record(&record),
+        "synthetic gi record must satisfy the transport contract"
+    );
+    record
+}
+
+/// What the probe captures for a failed `C_GetInterface` return: the
+/// request classification and the return code, never a table.
+fn gi_failure_record(
+    pid: u32,
+    binding_id: u64,
+    request: (u8, u8, u64),
+    rv: u64,
+) -> DiscoveryRecord {
+    assert_ne!(rv, 0, "failure carries a return code");
+    let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    record.kind = DISCOVERY_KIND_INTERFACE_RETURN;
+    record.pid_tgid = (u64::from(pid) << 32) | u64::from(pid);
+    record.hook_ts_ns = crate::attach::monotonic_ns().unwrap_or(0);
+    record.case_id = request.0;
+    record.interface_index = request.1;
+    record.request_flags = request.2;
+    record.binding_id = binding_id;
+    record.return_rv = rv;
+    record.name_class = DISCOVERY_NAME_NA;
+    record.selection_version_class = DISCOVERY_VERSION_NULL;
+    assert!(
+        valid_discovery_record(&record),
+        "synthetic gi failure must satisfy the transport contract"
+    );
+    record
+}
+
+/// A successful `C_GetInterface` return with a carried exact-standard
+/// prefix, as the probe emits for exact-name V3 results. SYNTHETIC: no
+/// fixture interface is exact-named, so this exercises the engine's
+/// carried-prefix cross-check against live bytes, not a real probe row.
+fn gi_record_with_prefix(
+    pid: u32,
+    binding_id: u64,
+    request: (u8, u8, u64),
+    table: &TablePrint,
+    result_version: u8,
+    result_flags: u64,
+) -> DiscoveryRecord {
+    assert!(table.nentry <= p11scope_ebpf_common::DISCOVERY_POINTERS);
+    let mut record = gi_record(
+        pid,
+        binding_id,
+        request,
+        table.addr,
+        (DISCOVERY_NAME_EXACT_STANDARD, result_version, result_flags),
+    );
+    for (slot, (addr, _)) in record.pointers.iter_mut().zip(table.entries.iter()) {
+        *slot = *addr;
+    }
+    record.pointers_attempted = u8::try_from(table.nentry).expect("nentry fits");
+    record.completed_prefix = record.pointers_attempted;
+    record.usable_n = record.pointers_attempted;
+    assert!(
+        valid_discovery_record(&record),
+        "synthetic prefixed gi record must satisfy the transport contract"
+    );
+    record
+}
+
+/// A live `C_GetInterface` selection binding for the view's provider, as
+/// the attach path would establish it: a loader context for attribution
+/// plus a capture-local binding minted through the engine's own ID space.
+/// The context carries no mapping (nothing here exercises loader-record
+/// behavior); only its view membership matters to selection attribution.
+fn gi_binding(
+    engine: &mut Engine,
+    view: ProcessViewId,
+    object: PinnedObjectId,
+) -> SelectionBindingFact {
+    use p11scope_manifest::elf::SymbolFact;
+
+    let spec = LoaderContextSpec {
+        view,
+        loader: object,
+        mapping: None,
+        hook: SymbolFact {
+            virtual_address: 0,
+            file_offset: 0,
+        },
+        state_address: None,
+    };
+    let prepared = engine
+        .loader_registry
+        .preflight(spec)
+        .expect("preflight test loader context");
+    let context = engine
+        .loader_registry
+        .prepare(prepared)
+        .expect("prepare test loader context");
+    engine
+        .loader_registry
+        .mark_attached(context)
+        .expect("attach test loader context");
+    let module = engine
+        .plan()
+        .modules
+        .iter()
+        .find(|module| module.object == object)
+        .expect("provider plan module")
+        .id;
+    let hook_id = engine.hooks.id("C_GetInterface").expect("builtin hook id");
+    let mut binding = engine
+        .selection_binding_candidate(context, view, object, 0, hook_id, module)
+        .expect("mint test selection binding");
+    binding.attached = true;
+    engine.selection_bindings.insert(binding.id, binding);
+    binding
+}
+
+/// The pinned provider object: the one scanned module exporting
+/// `C_GetInterface` (unique to the provider in these tests).
+fn gi_provider_object(engine: &Engine) -> PinnedObjectId {
+    let mut objects = engine.modules.iter().filter_map(|module| {
+        module
+            .scanned
+            .exports
+            .iter()
+            .any(|name| name == "C_GetInterface")
+            .then_some(module.object)
+    });
+    let object = objects.next().expect("provider exports C_GetInterface");
+    assert!(
+        objects.next().is_none(),
+        "C_GetInterface has exactly one exporting provider here"
+    );
+    object
+}
+
+/// Every `(subject, reason)` live loss/partial published so far.
+fn skip_reasons(engine: &Engine) -> std::collections::BTreeSet<(String, String)> {
+    engine
+        .counters
+        .object_skips
+        .iter()
+        .map(|skipped| (skipped.subject.clone(), skipped.reason.clone()))
         .collect()
 }
 
@@ -1849,8 +2113,8 @@ fn two_processes_union_indices_of_one_inode() {
     assert_eq!(engine.budget.table_candidates_count(), 10);
     // 416 scan + 416 live heaps + 136 live legacy (one per view).
     assert_eq!(engine.budget.decoded_table_entries_count(), 416 + 416 + 136);
-    // Two sweep triples (one per view) plus six live list elements.
-    assert_eq!(engine.budget.interface_records_count(), 8);
+    // One shared sweep triple (deduped across views on file identity) plus six live list elements.
+    assert_eq!(engine.budget.interface_records_count(), 7);
     assert_eq!(
         session.attached_slots.iter().sum::<usize>(),
         engine.plan().slots.len() - 27,
@@ -2314,12 +2578,16 @@ fn unknown_build_admits_by_publication_without_layout() {
     let scan_baseline = engine.plan().slots.len();
     let baseline_targets = slot_targets(&engine);
     eprintln!("t8-stripped: scan-only baseline is {scan_baseline} slots");
-    // Link-order accident, pinned loudly: the stripped build packs the
-    // static legacy table into the last file page (the normal build spills
-    // it past the file page into anonymous BSS), so the sweep decodes it
-    // and the live return merges onto the scan instance instead of
-    // admitting a heap instance. If a toolchain relayouts this, the merge
-    // assertions below name what to re-derive.
+    // Link-order accidents, pinned loudly. (1) The stripped build packs
+    // the static legacy table into the last file page (the normal build
+    // spills it past the file page into anonymous BSS), so the sweep
+    // decodes it and the live return merges onto the scan instance
+    // instead of admitting a heap instance. (2) Since Package F's fixture
+    // controls grew .text/.eh_frame, the CET note's feature word now sits
+    // where padding plus relocated pointer arrays decode as one extra
+    // file-backed {3,0}/44 table. Both are layout luck, not contracts:
+    // if a toolchain relayouts this, the merge assertions below name what
+    // to re-derive.
     let legacy_extent =
         publish.legacy.addr..publish.legacy.addr + 8 + 8 * publish.legacy.nentry as u64;
     assert!(
@@ -2329,14 +2597,52 @@ fn unknown_build_admits_by_publication_without_layout() {
         "stripped legacy sits in the file page; re-derive the merge arm if this moves"
     );
     let (legacy_path, legacy_offset, _) = MapLite::file_target(&maps, publish.legacy.entries[0].0);
+    let artifact_tables: Vec<_> = engine
+        .modules
+        .iter()
+        .flat_map(|module| &module.scanned.tables)
+        .filter(|table| table.file_offset.is_some() && table.address != publish.legacy.addr)
+        .collect();
     assert_eq!(
-        scan_baseline, 1,
-        "the sweep sees the file-backed legacy only"
+        artifact_tables.len(),
+        1,
+        "exactly one non-legacy sweep-decoded table"
+    );
+    assert_eq!(artifact_tables[0].version, (3, 0));
+    assert_eq!(artifact_tables[0].walk, "full");
+    assert_eq!(artifact_tables[0].entries.len(), 44);
+    assert!(
+        !artifact_tables[0].live_return,
+        "the artifact is sweep-decoded, never published"
     );
     assert_eq!(
-        baseline_targets,
-        std::collections::BTreeSet::from([(legacy_path, legacy_offset)]),
-        "baseline is the one legacy target"
+        scan_baseline, 45,
+        "the sweep sees the file-backed legacy plus the layout artifact"
+    );
+    let mut baseline_offsets: Vec<u64> =
+        baseline_targets.iter().map(|(_, offset)| *offset).collect();
+    baseline_offsets.sort();
+    assert_eq!(
+        baseline_targets
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([build.stripped.to_string_lossy().to_string()]),
+        "every baseline slot pins the exact stripped fixture file"
+    );
+    assert_eq!(
+        baseline_offsets,
+        vec![
+            12736, 13008, 13072, 13392, 54592, 54704, 54832, 54960, 55088, 55216, 55344, 55472,
+            55600, 55728, 55856, 55984, 56112, 56240, 56368, 56496, 56624, 56752, 56880, 57008,
+            57136, 57264, 57392, 57520, 57648, 57776, 57904, 58032, 58160, 58288, 58416, 58544,
+            58672, 58800, 58928, 59056, 59184, 59312, 59440, 59568, 59696,
+        ],
+        "baseline is the legacy target plus the 44 artifact targets, exactly"
+    );
+    assert!(
+        baseline_targets.contains(&(legacy_path, legacy_offset)),
+        "the legacy target stays in the baseline set"
     );
     let hooks = HookRegistry::builtin();
     let mut records = publish_records(stage.pid, &publish, &hooks);
@@ -3158,4 +3464,937 @@ fn broad_p11kit_admission_arithmetic() {
 
     child.kill().expect("reap the holder");
     child.wait().expect("reap the holder");
+}
+
+/// Case 13 (Package F, E08): a named `C_GetInterface` result over a heap
+/// wrapper admits exactly the same count-only endpoint set as the
+/// `C_GetInterfaceList` element for that wrapper — on the normal and the
+/// stripped build. The selection tuple stays authority-free: a vendor
+/// name never authorizes semantics.
+#[test]
+fn f_e08_named_gi_heap_matches_list_element() {
+    let build = pub_build();
+    for (variant, provider) in [("normal", &build.provider), ("stripped", &build.stripped)] {
+        let dir = pub_tmp(&format!("f13-named-{variant}"));
+        let _ = &dir;
+        let mut stage = StageChild::spawn(&build.workload, provider);
+        // Index 17 sits beyond the template window: no sweep aliasing
+        // can cover it, so the asserted admission is publication-driven.
+        for want in 0..18 {
+            let (idx, _) = stage.alloc(0, -1);
+            assert_eq!(idx, want);
+        }
+        for idx in 0..17 {
+            stage.free(idx);
+        }
+        let maps = MapLite::snapshot(stage.pid);
+        let publish = stage.publish();
+        let heap17 = publish
+            .elements
+            .iter()
+            .find(|table| table.index == 17)
+            .expect("heap 17 published")
+            .clone();
+        let iface = stage.gi(Some("P11Scope-MW-17"), None);
+        assert_eq!(iface.rv, 0);
+        assert_eq!(iface.name, "P11Scope-MW-17");
+        assert_eq!(iface.table, heap17.addr);
+        assert_eq!(iface.flags, 0);
+
+        // Element route: the existing behavior, one list element only.
+        let hooks = HookRegistry::builtin();
+        let mut element_engine = engine_over_pids(&[stage.pid]);
+        let element_baseline = element_engine.plan().slots.len();
+        let element_session = drain_records(
+            &mut element_engine,
+            vec![element_record(stage.pid, heap17.addr, 0, 2, &hooks)],
+        );
+
+        // GI route: the same table through a named C_GetInterface result.
+        let started = Instant::now();
+        let mut gi_engine = engine_over_pids(&[stage.pid]);
+        let view = gi_engine.views[0].id();
+        let object = gi_provider_object(&gi_engine);
+        let binding = gi_binding(&mut gi_engine, view, object);
+        let record = gi_record(
+            stage.pid,
+            binding.id,
+            (DISCOVERY_NAME_OTHER, DISCOVERY_VERSION_NULL, 0),
+            iface.table,
+            (DISCOVERY_NAME_OTHER, DISCOVERY_VERSION_V3_2, iface.flags),
+        );
+        let gi_baseline = gi_engine.plan().slots.len();
+        let gi_session = drain_records(&mut gi_engine, vec![record]);
+        let wall = started.elapsed();
+
+        assert_eq!(
+            slot_targets(&gi_engine),
+            slot_targets(&element_engine),
+            "{variant}: named GI admits the element's exact endpoint set"
+        );
+        assert_eq!(
+            live_instances(&gi_engine),
+            live_instances(&element_engine),
+            "{variant}: identical live table instances"
+        );
+        assert_instance_entries(&gi_engine, &maps, &heap17, true);
+        assert_eq!(
+            gi_engine.budget.interface_records_count(),
+            element_engine.budget.interface_records_count(),
+            "{variant}: one bounded interface charge per publication record"
+        );
+        // The normal sweep contributes its linked triple; the stripped
+        // sweep decodes no triples (unknown layout). Either way the one
+        // live record charges exactly one.
+        let sweep_triples = if variant == "normal" { 1 } else { 0 };
+        assert_eq!(
+            gi_engine.budget.interface_records_count(),
+            sweep_triples + 1,
+            "{variant}: the sweep triples plus one live record"
+        );
+        assert_eq!(
+            gi_session.attached_slots.iter().sum::<usize>(),
+            gi_engine.plan().slots.len() - gi_baseline,
+            "{variant}: GI publication attaches exactly its new slots"
+        );
+        assert_eq!(
+            element_session.attached_slots.iter().sum::<usize>(),
+            element_engine.plan().slots.len() - element_baseline,
+        );
+        // The vendor name authorizes nothing: one factual tuple, no claim.
+        let tuples = &gi_engine.capture_facts.visible_history().selections;
+        assert_eq!(tuples.len(), 1, "{variant}: one selection tuple");
+        assert_eq!(tuples[0].rv, 0);
+        assert_eq!(tuples[0].authority, SelectionAuthority::None);
+        assert!(
+            gi_engine.selection_claims.is_empty(),
+            "{variant}: no selection claim from a vendor name"
+        );
+        assert_count_only(&gi_engine);
+        assert_count_only(&element_engine);
+        assert_costing(&gi_engine, wall, &format!("f13-named-{variant}"));
+    }
+}
+
+/// Case 14 (Package F, E08): forwarded entries through `C_GetInterface`
+/// keep each executable endpoint's own owner, distinct from the table
+/// owner — exactly as the list-element route does.
+#[test]
+fn f_e08_forwarded_gi_keeps_distinct_endpoint_owners() {
+    let build = pub_build();
+    let dir = pub_tmp("f14-forwarded");
+    let _ = &dir;
+    let mut stage = StageChild::spawn(&build.workload, &build.provider);
+    let mask = (1 << 1) | (1 << 4); // ordinals 5 and 43
+    let (idx, _) = stage.alloc(mask, -1);
+    assert_eq!(idx, 0);
+    let maps = MapLite::snapshot(stage.pid);
+    let publish = stage.publish();
+    let heap0 = publish
+        .elements
+        .iter()
+        .find(|table| table.index == 0)
+        .expect("heap 0 published")
+        .clone();
+    let iface = stage.gi(Some("P11Scope-MW-0"), None);
+    assert_eq!(iface.rv, 0);
+    assert_eq!(iface.table, heap0.addr);
+
+    let hooks = HookRegistry::builtin();
+    let mut element_engine = engine_over_pids(&[stage.pid]);
+    drain_records(
+        &mut element_engine,
+        vec![element_record(stage.pid, heap0.addr, 0, 2, &hooks)],
+    );
+
+    let started = Instant::now();
+    let mut gi_engine = engine_over_pids(&[stage.pid]);
+    let view = gi_engine.views[0].id();
+    let object = gi_provider_object(&gi_engine);
+    let binding = gi_binding(&mut gi_engine, view, object);
+    drain_records(
+        &mut gi_engine,
+        vec![gi_record(
+            stage.pid,
+            binding.id,
+            (DISCOVERY_NAME_OTHER, DISCOVERY_VERSION_NULL, 0),
+            iface.table,
+            (DISCOVERY_NAME_OTHER, DISCOVERY_VERSION_V3_2, iface.flags),
+        )],
+    );
+    let wall = started.elapsed();
+
+    assert_eq!(
+        slot_targets(&gi_engine),
+        slot_targets(&element_engine),
+        "forwarded GI admits the element's exact endpoint set"
+    );
+    // The two forwarded targets pin backend.so, a different object than
+    // the publishing provider that owns the table.
+    let keys = slot_object_keys(&gi_engine);
+    assert_eq!(keys.len(), 2, "provider + backend objects");
+    let backend_key = keys
+        .iter()
+        .find(|(path, _)| path.ends_with("backend.so"))
+        .expect("backend.so slots exist")
+        .1;
+    let provider_key = keys
+        .iter()
+        .find(|(path, _)| path.ends_with("provider.so"))
+        .expect("provider.so slots exist")
+        .1;
+    assert_ne!(backend_key, provider_key, "distinct pinned objects");
+    let mut backend_slots: Vec<u64> = gi_engine
+        .plan()
+        .slots
+        .iter()
+        .filter(|slot| {
+            gi_engine
+                .pinned()
+                .summary(slot.object)
+                .is_some_and(|summary| summary.path.ends_with("backend.so"))
+        })
+        .map(|slot| slot.file_offset)
+        .collect();
+    backend_slots.sort();
+    let mut expected_backend: Vec<u64> = [5u32, 43]
+        .iter()
+        .map(|ord| MapLite::file_target(&maps, heap0.entries[*ord as usize].0).1)
+        .collect();
+    expected_backend.sort();
+    assert_eq!(backend_slots, expected_backend);
+    assert_eq!(backend_slots.len(), 2, "exactly the forwarded ordinals");
+    assert_instance_entries(&gi_engine, &maps, &heap0, true);
+    assert_count_only(&gi_engine);
+    assert_costing(&gi_engine, wall, "f14-forwarded");
+}
+
+/// Case 15 (Package F, E08): default-NULL and failure requests. A NULL
+/// name resolves to the default interface (lowest live wrapper, else
+/// legacy) and admits its exact table; an unknown name fails factually
+/// with no admission and no loss.
+#[test]
+fn f_e08_null_default_and_failure_request_matrix() {
+    let build = pub_build();
+    let dir = pub_tmp("f15-requests");
+    let _ = &dir;
+    let hooks = HookRegistry::builtin();
+
+    // NULL with a live wrapper: the default is wrapper 17's heap
+    // table (index 17 sits beyond the template window, so the asserted
+    // admission is publication-driven).
+    let mut stage = StageChild::spawn(&build.workload, &build.provider);
+    for want in 0..18 {
+        let (idx, _) = stage.alloc(0, -1);
+        assert_eq!(idx, want);
+    }
+    for idx in 0..17 {
+        stage.free(idx);
+    }
+    let maps = MapLite::snapshot(stage.pid);
+    let publish = stage.publish();
+    let heap17 = publish
+        .elements
+        .iter()
+        .find(|table| table.index == 17)
+        .expect("heap 17 published")
+        .clone();
+    let iface = stage.gi(None, None);
+    assert_eq!(iface.rv, 0);
+    assert_eq!(iface.name, "P11Scope-MW-17");
+    assert_eq!(iface.table, heap17.addr);
+
+    let mut element_engine = engine_over_pids(&[stage.pid]);
+    drain_records(
+        &mut element_engine,
+        vec![element_record(stage.pid, heap17.addr, 0, 2, &hooks)],
+    );
+    let started = Instant::now();
+    let mut gi_engine = engine_over_pids(&[stage.pid]);
+    let view = gi_engine.views[0].id();
+    let object = gi_provider_object(&gi_engine);
+    let binding = gi_binding(&mut gi_engine, view, object);
+    drain_records(
+        &mut gi_engine,
+        vec![gi_record(
+            stage.pid,
+            binding.id,
+            (DISCOVERY_NAME_NULL, DISCOVERY_VERSION_NULL, 0),
+            iface.table,
+            (DISCOVERY_NAME_OTHER, DISCOVERY_VERSION_V3_2, iface.flags),
+        )],
+    );
+    let wall = started.elapsed();
+    assert_eq!(
+        slot_targets(&gi_engine),
+        slot_targets(&element_engine),
+        "NULL-default GI admits the default wrapper's exact endpoint set"
+    );
+    assert_instance_entries(&gi_engine, &maps, &heap17, true);
+    assert_count_only(&gi_engine);
+    assert_costing(&gi_engine, wall, "f15-requests-null");
+
+    // NULL with no live wrapper: the default is the legacy table. The
+    // scan alone leaves it unadmitted (case 7's boundary); the NULL
+    // publication admits exactly its target.
+    stage.free(17);
+    let maps = MapLite::snapshot(stage.pid);
+    let publish = stage.publish();
+    assert!(
+        publish.elements.iter().all(|table| table.index < 0),
+        "only the legacy element remains"
+    );
+    let iface = stage.gi(None, None);
+    assert_eq!(iface.rv, 0);
+    assert_eq!(iface.name, "P11Scope-MW-legacy");
+    assert_eq!(iface.table, publish.legacy.addr);
+    let mut legacy_engine = engine_over_pids(&[stage.pid]);
+    let (legacy_path, legacy_offset, _) = MapLite::file_target(&maps, publish.legacy.entries[0].0);
+    let legacy_target = (legacy_path, legacy_offset);
+    assert!(
+        !slot_targets(&legacy_engine).contains(&legacy_target),
+        "scan alone leaves the legacy publication unadmitted"
+    );
+    let view = legacy_engine.views[0].id();
+    let object = gi_provider_object(&legacy_engine);
+    let binding = gi_binding(&mut legacy_engine, view, object);
+    drain_records(
+        &mut legacy_engine,
+        vec![gi_record(
+            stage.pid,
+            binding.id,
+            (DISCOVERY_NAME_NULL, DISCOVERY_VERSION_NULL, 0),
+            iface.table,
+            (DISCOVERY_NAME_OTHER, DISCOVERY_VERSION_V2_40, iface.flags),
+        )],
+    );
+    assert!(
+        slot_targets(&legacy_engine).contains(&legacy_target),
+        "NULL-default GI admits the legacy table's exact target"
+    );
+    assert!(
+        legacy_engine.selection_claims.is_empty(),
+        "no selection claim is needed for publication admission"
+    );
+
+    // Unknown name: the factory fails; the record is factual evidence
+    // only — no admission, no new loss.
+    let iface = stage.gi(Some("P11Scope-NOPE"), None);
+    assert_ne!(iface.rv, 0);
+    assert_eq!(iface.table, 0);
+    let mut fail_engine = engine_over_pids(&[stage.pid]);
+    let baseline_slots = slot_targets(&fail_engine);
+    let baseline_skips = skip_reasons(&fail_engine);
+    let view = fail_engine.views[0].id();
+    let object = gi_provider_object(&fail_engine);
+    let binding = gi_binding(&mut fail_engine, view, object);
+    drain_records(
+        &mut fail_engine,
+        vec![gi_failure_record(
+            stage.pid,
+            binding.id,
+            (DISCOVERY_NAME_OTHER, DISCOVERY_VERSION_NULL, 0),
+            iface.rv,
+        )],
+    );
+    assert_eq!(
+        slot_targets(&fail_engine),
+        baseline_slots,
+        "a failed selection admits nothing"
+    );
+    assert_eq!(
+        skip_reasons(&fail_engine),
+        baseline_skips,
+        "a failed selection publishes no loss"
+    );
+    let tuples = &fail_engine.capture_facts.visible_history().selections;
+    assert_eq!(tuples.len(), 1);
+    assert_eq!(tuples[0].rv, iface.rv);
+    assert!(tuples[0].result.is_none());
+}
+
+/// Case 16 (Package F, E08): the ABI shape axis. `{3,2}`, `{3,1}` and
+/// `{3,0}` heap tables admit the walked prefix identically on both
+/// routes; a non-listed `{2,39}` minor admits the same known prefix on
+/// both; `{3,3}`, `{4,0}` and `{2,41}` refuse identically with the
+/// explicit decode omission.
+#[test]
+fn f_e08_version_shape_matrix() {
+    let build = pub_build();
+    let dir = pub_tmp("f16-versions");
+    let _ = &dir;
+    let hooks = HookRegistry::builtin();
+    let mut stage = StageChild::spawn(&build.workload, &build.provider);
+    // Index 17 sits beyond the template window: no sweep aliasing can
+    // cover it, so every asserted admission is publication-driven.
+    for want in 0..18 {
+        let (idx, _) = stage.alloc(0, -1);
+        assert_eq!(idx, want);
+    }
+    for idx in 0..17 {
+        stage.free(idx);
+    }
+
+    // Walked shapes: GI and element admit the identical walked set.
+    for (major, minor, version_class, walked) in [
+        (3u8, 2u8, DISCOVERY_VERSION_V3_2, 104usize),
+        (3, 1, DISCOVERY_VERSION_V3_1, 92),
+        (3, 0, DISCOVERY_VERSION_V3_0, 92),
+    ] {
+        stage.set_version(17, major, minor);
+        let publish = stage.publish();
+        let heap17 = publish
+            .elements
+            .iter()
+            .find(|table| table.index == 17)
+            .expect("heap 17 published")
+            .clone();
+        assert_eq!((heap17.major, heap17.minor), (major, minor));
+        let iface = stage.gi(Some("P11Scope-MW-17"), None);
+        assert_eq!(iface.rv, 0);
+        assert_eq!(iface.table, heap17.addr);
+
+        let mut element_engine = engine_over_pids(&[stage.pid]);
+        drain_records(
+            &mut element_engine,
+            vec![element_record(stage.pid, heap17.addr, 0, 2, &hooks)],
+        );
+        let mut gi_engine = engine_over_pids(&[stage.pid]);
+        let view = gi_engine.views[0].id();
+        let object = gi_provider_object(&gi_engine);
+        let binding = gi_binding(&mut gi_engine, view, object);
+        drain_records(
+            &mut gi_engine,
+            vec![gi_record(
+                stage.pid,
+                binding.id,
+                (DISCOVERY_NAME_OTHER, DISCOVERY_VERSION_NULL, 0),
+                iface.table,
+                (DISCOVERY_NAME_OTHER, version_class, iface.flags),
+            )],
+        );
+        assert_eq!(
+            slot_targets(&gi_engine),
+            slot_targets(&element_engine),
+            "{{{major},{minor}}}: identical admitted endpoint sets"
+        );
+        for (label, engine) in [("element", &element_engine), ("gi", &gi_engine)] {
+            let tables: Vec<_> = engine
+                .modules
+                .iter()
+                .flat_map(|module| &module.scanned.tables)
+                .filter(|table| table.address == heap17.addr)
+                .collect();
+            assert_eq!(tables.len(), 1, "{label} {{{major},{minor}}}: one instance");
+            assert_eq!(tables[0].version, (major, minor));
+            assert_eq!(tables[0].walk, "full");
+            assert_eq!(
+                tables[0].entries.len(),
+                walked,
+                "{label} {{{major},{minor}}}: the walked prefix only"
+            );
+        }
+        assert_count_only(&gi_engine);
+    }
+
+    // Non-listed 2.x minor: both routes admit the same known 68-entry
+    // prefix with the explicit known-prefix marker — the shared export
+    // contract for shapes past the fully known list.
+    stage.set_version(17, 2, 39);
+    let publish = stage.publish();
+    let heap17 = publish
+        .elements
+        .iter()
+        .find(|table| table.index == 17)
+        .expect("heap 17 published")
+        .clone();
+    assert_eq!((heap17.major, heap17.minor), (2, 39));
+    let iface = stage.gi(Some("P11Scope-MW-17"), None);
+    assert_eq!(iface.rv, 0);
+    let mut element_engine = engine_over_pids(&[stage.pid]);
+    drain_records(
+        &mut element_engine,
+        vec![element_record(stage.pid, heap17.addr, 0, 2, &hooks)],
+    );
+    let mut gi_engine = engine_over_pids(&[stage.pid]);
+    let view = gi_engine.views[0].id();
+    let object = gi_provider_object(&gi_engine);
+    let binding = gi_binding(&mut gi_engine, view, object);
+    drain_records(
+        &mut gi_engine,
+        vec![gi_record(
+            stage.pid,
+            binding.id,
+            (DISCOVERY_NAME_OTHER, DISCOVERY_VERSION_NULL, 0),
+            iface.table,
+            (DISCOVERY_NAME_OTHER, DISCOVERY_VERSION_OTHER, iface.flags),
+        )],
+    );
+    assert_eq!(
+        slot_targets(&gi_engine),
+        slot_targets(&element_engine),
+        "{{2,39}}: identical known-prefix endpoint sets"
+    );
+    for (label, engine) in [("element", &element_engine), ("gi", &gi_engine)] {
+        let tables: Vec<_> = engine
+            .modules
+            .iter()
+            .flat_map(|module| &module.scanned.tables)
+            .filter(|table| table.address == heap17.addr)
+            .collect();
+        assert_eq!(tables.len(), 1, "{label} {{2,39}}: one instance");
+        assert_eq!(tables[0].walk, "known_prefix", "{label}: explicit bound");
+        assert_eq!(tables[0].entries.len(), 68);
+    }
+
+    // Unwalkable shapes: both routes refuse with the explicit decode
+    // omission and admit nothing beyond the scan baseline.
+    for (major, minor) in [(3u8, 3u8), (4, 0), (2, 41)] {
+        stage.set_version(17, major, minor);
+        let publish = stage.publish();
+        let heap17 = publish
+            .elements
+            .iter()
+            .find(|table| table.index == 17)
+            .expect("heap 17 published")
+            .clone();
+        assert_eq!((heap17.major, heap17.minor), (major, minor));
+        let iface = stage.gi(Some("P11Scope-MW-17"), None);
+        assert_eq!(iface.rv, 0, "the factory still returns the table");
+
+        let mut element_engine = engine_over_pids(&[stage.pid]);
+        let element_baseline = slot_targets(&element_engine);
+        drain_records(
+            &mut element_engine,
+            vec![element_record(stage.pid, heap17.addr, 0, 2, &hooks)],
+        );
+        let mut gi_engine = engine_over_pids(&[stage.pid]);
+        let gi_baseline = slot_targets(&gi_engine);
+        let view = gi_engine.views[0].id();
+        let object = gi_provider_object(&gi_engine);
+        let binding = gi_binding(&mut gi_engine, view, object);
+        drain_records(
+            &mut gi_engine,
+            vec![gi_record(
+                stage.pid,
+                binding.id,
+                (DISCOVERY_NAME_OTHER, DISCOVERY_VERSION_NULL, 0),
+                iface.table,
+                (DISCOVERY_NAME_OTHER, DISCOVERY_VERSION_OTHER, iface.flags),
+            )],
+        );
+        assert_eq!(
+            slot_targets(&element_engine),
+            element_baseline,
+            "{{{major},{minor}}}: element admits nothing"
+        );
+        assert_eq!(
+            slot_targets(&gi_engine),
+            gi_baseline,
+            "{{{major},{minor}}}: GI admits nothing"
+        );
+        let omission = "a published table's bytes did not decode as a function table";
+        assert!(
+            skip_reasons(&element_engine)
+                .contains(&("live export discovery".to_string(), omission.to_string())),
+            "{{{major},{minor}}}: element carries the explicit omission"
+        );
+        assert!(
+            skip_reasons(&gi_engine)
+                .contains(&("live interface selection".to_string(), omission.to_string())),
+            "{{{major},{minor}}}: GI carries the same explicit omission"
+        );
+    }
+}
+
+/// Case 17 (Package F, E13): the first-call gap. Calls issued before the
+/// publication is capture-ready are missed with an explicit coverage
+/// boundary; calls after ready are covered. The trigger-to-ready
+/// lowering latency is measured and reported — never promised as zero.
+#[test]
+fn f_e13_first_call_gap_and_precapture_boundary() {
+    let build = pub_build();
+    let dir = pub_tmp("f17-firstcall");
+    let _ = &dir;
+    let mut stage = StageChild::spawn(&build.workload, &build.provider);
+    // Index 17 sits beyond the template window: no sweep aliasing can
+    // cover it, so every observation here is publication-driven.
+    for want in 0..18 {
+        let (idx, _) = stage.alloc(0, -1);
+        assert_eq!(idx, want);
+    }
+    for idx in 0..17 {
+        stage.free(idx);
+    }
+    let maps = MapLite::snapshot(stage.pid);
+    let publish = stage.publish();
+    let heap17 = publish
+        .elements
+        .iter()
+        .find(|table| table.index == 17)
+        .expect("heap 17 published")
+        .clone();
+    // Five pre-capture calls: the observer is not ready, so these are
+    // outside any capture boundary by construction.
+    for ord in EX_ORDS {
+        assert_eq!(stage.call(17, ord as usize, 1), 0);
+    }
+
+    // The capture starts now.
+    let mut engine = engine_over_pids(&[stage.pid]);
+    for ord in EX_ORDS {
+        let (path, offset, _) = MapLite::file_target(&maps, heap17.entries[ord as usize].0);
+        assert!(
+            !slot_targets(&engine).contains(&(path.clone(), offset)),
+            "idx17 ord{ord} misses before its publication is ready"
+        );
+    }
+
+    // Mid-capture publication through C_GetInterface becomes ready here.
+    let iface = stage.gi(Some("P11Scope-MW-17"), None);
+    assert_eq!(iface.rv, 0);
+    assert_eq!(iface.table, heap17.addr);
+    let view = engine.views[0].id();
+    let object = gi_provider_object(&engine);
+    let binding = gi_binding(&mut engine, view, object);
+    let record = gi_record(
+        stage.pid,
+        binding.id,
+        (DISCOVERY_NAME_OTHER, DISCOVERY_VERSION_NULL, 0),
+        iface.table,
+        (DISCOVERY_NAME_OTHER, DISCOVERY_VERSION_V3_2, iface.flags),
+    );
+    let hook_ts_ns = record.hook_ts_ns;
+    assert_ne!(hook_ts_ns, 0, "the trigger carries factory-return time");
+    let drain_started = Instant::now();
+    drain_records(&mut engine, vec![record]);
+    let drain_wall = drain_started.elapsed();
+    let ready_ns = crate::attach::monotonic_ns().expect("monotonic ready time");
+    assert!(
+        ready_ns >= hook_ts_ns,
+        "ready cannot precede the factory return that triggered it"
+    );
+    eprintln!(
+        "f17-firstcall: trigger-to-ready lowering+admission: {} ns (hook->ready), drain wall {drain_wall:?}",
+        ready_ns - hook_ts_ns,
+    );
+    for ord in EX_ORDS {
+        let (path, offset, _) = MapLite::file_target(&maps, heap17.entries[ord as usize].0);
+        assert!(
+            slot_targets(&engine).contains(&(path.clone(), offset)),
+            "idx17 ord{ord} is covered once its publication is ready"
+        );
+    }
+    // Post-ready calls land on covered targets.
+    for ord in EX_ORDS {
+        assert_eq!(stage.call(17, ord as usize, 2), 0);
+        let (path, offset, _) = MapLite::file_target(&maps, heap17.entries[ord as usize].0);
+        assert!(
+            slot_targets(&engine).contains(&(path, offset)),
+            "idx17 ord{ord} post-ready calls are covered"
+        );
+    }
+    assert_count_only(&engine);
+}
+
+/// Case 18 (Package F, E15/E21): malicious table entries refuse
+/// identically on both routes with the explicit decode omission — a
+/// poisoned table admits nothing, not even a prefix. A NULL hole is the
+/// control: holes admit identically on both routes.
+#[test]
+fn f_e15_malicious_entries_refused_equally() {
+    let build = pub_build();
+    let hooks = HookRegistry::builtin();
+    // Modes: 1 unmapped, 2 file-backed provider data, 3 heap data.
+    for mode in [1u32, 2, 3] {
+        let dir = pub_tmp(&format!("f18-poison-{mode}"));
+        let _ = &dir;
+        let mut stage = StageChild::spawn(&build.workload, &build.provider);
+        // Index 17 sits beyond the template window: no sweep aliasing
+        // can admit its healthy ordinals, so refusal is total.
+        for want in 0..18 {
+            let (idx, _) = stage.alloc(0, -1);
+            assert_eq!(idx, want);
+        }
+        for idx in 0..17 {
+            stage.free(idx);
+        }
+        stage.poke(17, 5, mode);
+        let maps = MapLite::snapshot(stage.pid);
+        let publish = stage.publish();
+        let heap17 = publish
+            .elements
+            .iter()
+            .find(|table| table.index == 17)
+            .expect("heap 17 published")
+            .clone();
+        let iface = stage.gi(Some("P11Scope-MW-17"), None);
+        assert_eq!(iface.rv, 0, "the factory still returns the table");
+
+        let mut element_engine = engine_over_pids(&[stage.pid]);
+        let element_baseline = slot_targets(&element_engine);
+        drain_records(
+            &mut element_engine,
+            vec![element_record(stage.pid, heap17.addr, 0, 2, &hooks)],
+        );
+        let mut gi_engine = engine_over_pids(&[stage.pid]);
+        let gi_baseline = slot_targets(&gi_engine);
+        let view = gi_engine.views[0].id();
+        let object = gi_provider_object(&gi_engine);
+        let binding = gi_binding(&mut gi_engine, view, object);
+        drain_records(
+            &mut gi_engine,
+            vec![gi_record(
+                stage.pid,
+                binding.id,
+                (DISCOVERY_NAME_OTHER, DISCOVERY_VERSION_NULL, 0),
+                iface.table,
+                (DISCOVERY_NAME_OTHER, DISCOVERY_VERSION_V3_2, iface.flags),
+            )],
+        );
+        assert_eq!(
+            slot_targets(&element_engine),
+            element_baseline,
+            "mode {mode}: element admits nothing"
+        );
+        assert_eq!(
+            slot_targets(&gi_engine),
+            gi_baseline,
+            "mode {mode}: GI admits nothing"
+        );
+        // Whole-table refusal: even the healthy ordinals admit nothing.
+        let (path, offset, _) = MapLite::file_target(&maps, heap17.entries[0].0);
+        assert!(
+            !slot_targets(&gi_engine).contains(&(path.clone(), offset)),
+            "mode {mode}: no prefix admission from a poisoned table"
+        );
+        assert!(
+            !slot_targets(&element_engine).contains(&(path, offset)),
+            "mode {mode}: no prefix admission from a poisoned table"
+        );
+        let omission = "a published table's bytes did not decode as a function table";
+        assert!(
+            skip_reasons(&element_engine)
+                .contains(&("live export discovery".to_string(), omission.to_string())),
+            "mode {mode}: element carries the explicit omission"
+        );
+        assert!(
+            skip_reasons(&gi_engine)
+                .contains(&("live interface selection".to_string(), omission.to_string())),
+            "mode {mode}: GI carries the same explicit omission"
+        );
+    }
+
+    // Control: a NULL hole is not poison — both routes admit the table
+    // identically, minus the hole.
+    let dir = pub_tmp("f18-hole");
+    let _ = &dir;
+    let mut stage = StageChild::spawn(&build.workload, &build.provider);
+    for want in 0..18 {
+        let (idx, _) = stage.alloc(0, -1);
+        assert_eq!(idx, want);
+    }
+    for idx in 0..17 {
+        stage.free(idx);
+    }
+    stage.poke(17, 5, 0);
+    let maps = MapLite::snapshot(stage.pid);
+    let publish = stage.publish();
+    let heap17 = publish
+        .elements
+        .iter()
+        .find(|table| table.index == 17)
+        .expect("heap 17 published")
+        .clone();
+    assert_eq!(heap17.entries[5].0, 0, "ordinal 5 is a NULL hole");
+    let iface = stage.gi(Some("P11Scope-MW-17"), None);
+    assert_eq!(iface.rv, 0);
+    let mut element_engine = engine_over_pids(&[stage.pid]);
+    drain_records(
+        &mut element_engine,
+        vec![element_record(stage.pid, heap17.addr, 0, 2, &hooks)],
+    );
+    let mut gi_engine = engine_over_pids(&[stage.pid]);
+    let view = gi_engine.views[0].id();
+    let object = gi_provider_object(&gi_engine);
+    let binding = gi_binding(&mut gi_engine, view, object);
+    drain_records(
+        &mut gi_engine,
+        vec![gi_record(
+            stage.pid,
+            binding.id,
+            (DISCOVERY_NAME_OTHER, DISCOVERY_VERSION_NULL, 0),
+            iface.table,
+            (DISCOVERY_NAME_OTHER, DISCOVERY_VERSION_V3_2, iface.flags),
+        )],
+    );
+    assert_eq!(
+        slot_targets(&gi_engine),
+        slot_targets(&element_engine),
+        "hole: identical admitted endpoint sets"
+    );
+    let (path, offset, _) = MapLite::file_target(&maps, heap17.entries[0].0);
+    assert!(
+        slot_targets(&gi_engine).contains(&(path, offset)),
+        "hole: healthy ordinals still admit"
+    );
+    assert_count_only(&gi_engine);
+}
+
+/// Case 19 (Package F, E15): a forged exact-standard name class on a
+/// `C_GetInterface` result changes nothing about authority. Admission
+/// still rests on byte validation alone, slot names still come from the
+/// ordinal catalog (never the record), and no selection claim authorizes
+/// a heap table. SYNTHETIC record: no fixture interface is exact-named.
+#[test]
+fn f_e15_forged_exact_name_stays_count_only() {
+    let build = pub_build();
+    let dir = pub_tmp("f19-forged");
+    let _ = &dir;
+    let hooks = HookRegistry::builtin();
+    let mut stage = StageChild::spawn(&build.workload, &build.provider);
+    for want in 0..18 {
+        let (idx, _) = stage.alloc(0, -1);
+        assert_eq!(idx, want);
+    }
+    for idx in 0..17 {
+        stage.free(idx);
+    }
+    let maps = MapLite::snapshot(stage.pid);
+    let publish = stage.publish();
+    let heap17 = publish
+        .elements
+        .iter()
+        .find(|table| table.index == 17)
+        .expect("heap 17 published")
+        .clone();
+
+    let mut element_engine = engine_over_pids(&[stage.pid]);
+    drain_records(
+        &mut element_engine,
+        vec![element_record(stage.pid, heap17.addr, 0, 2, &hooks)],
+    );
+    let mut gi_engine = engine_over_pids(&[stage.pid]);
+    let view = gi_engine.views[0].id();
+    let object = gi_provider_object(&gi_engine);
+    let binding = gi_binding(&mut gi_engine, view, object);
+    drain_records(
+        &mut gi_engine,
+        vec![gi_record_with_prefix(
+            stage.pid,
+            binding.id,
+            (DISCOVERY_NAME_OTHER, DISCOVERY_VERSION_NULL, 0),
+            &heap17,
+            DISCOVERY_VERSION_V3_2,
+            0,
+        )],
+    );
+    // The bytes validate, so the endpoints admit — exactly as the
+    // element route admits them. The name class grants nothing extra.
+    assert_eq!(
+        slot_targets(&gi_engine),
+        slot_targets(&element_engine),
+        "forged exact name: identical endpoint sets"
+    );
+    assert_eq!(
+        actual_slot_names(&gi_engine),
+        actual_slot_names(&element_engine),
+        "slot names come from the ordinal catalog, never the record"
+    );
+    assert_instance_entries(&gi_engine, &maps, &heap17, true);
+    // ... and no selection claim authorizes the heap table either: the
+    // same-object authority guard holds against the forged class.
+    assert!(
+        gi_engine.selection_claims.is_empty(),
+        "no selection claim from a forged name class"
+    );
+    let tuples = &gi_engine.capture_facts.visible_history().selections;
+    assert_eq!(tuples.len(), 1);
+    assert_ne!(
+        tuples[0].authority,
+        SelectionAuthority::SelectionCountOnly,
+        "the forged class authorizes no count-only claim"
+    );
+    assert_count_only(&gi_engine);
+}
+
+/// Case 20 (Package F, E21): nothing a `C_GetInterface` publication
+/// admits exposes raw userspace pointers on a public surface — neither
+/// the selection projection nor the admitted slot inventory.
+#[test]
+fn f_e21_gi_public_output_carries_no_raw_pointers() {
+    let build = pub_build();
+    let dir = pub_tmp("f20-privacy");
+    let _ = &dir;
+    let mut stage = StageChild::spawn(&build.workload, &build.provider);
+    // Index 17 sits beyond the template window, so the asserted
+    // admission is genuinely publication-driven, never sweep-aliased.
+    for want in 0..18 {
+        let (idx, _) = stage.alloc(0, -1);
+        assert_eq!(idx, want);
+    }
+    for idx in 0..17 {
+        stage.free(idx);
+    }
+    let maps = MapLite::snapshot(stage.pid);
+    let publish = stage.publish();
+    let heap17 = publish
+        .elements
+        .iter()
+        .find(|table| table.index == 17)
+        .expect("heap 17 published")
+        .clone();
+    let iface = stage.gi(Some("P11Scope-MW-17"), None);
+    assert_eq!(iface.rv, 0);
+    assert_eq!(iface.table, heap17.addr);
+
+    let mut gi_engine = engine_over_pids(&[stage.pid]);
+    let view = gi_engine.views[0].id();
+    let object = gi_provider_object(&gi_engine);
+    let binding = gi_binding(&mut gi_engine, view, object);
+    drain_records(
+        &mut gi_engine,
+        vec![gi_record(
+            stage.pid,
+            binding.id,
+            (DISCOVERY_NAME_OTHER, DISCOVERY_VERSION_NULL, 0),
+            iface.table,
+            (DISCOVERY_NAME_OTHER, DISCOVERY_VERSION_V3_2, iface.flags),
+        )],
+    );
+    // The publication admitted (or there is nothing to protect).
+    let (path, offset, _) = MapLite::file_target(&maps, heap17.entries[0].0);
+    assert!(
+        slot_targets(&gi_engine).contains(&(path, offset)),
+        "GI publication admits before privacy is assessed"
+    );
+    let heap_hex = format!("{:x}", heap17.addr);
+    assert!(
+        heap_hex.len() >= 8,
+        "the canary address is long enough to be unambiguous"
+    );
+    let selection_json =
+        serde_json::to_string(&gi_engine.interface_selection()).expect("selection serializes");
+    assert!(
+        !selection_json.contains(&heap_hex),
+        "the selection projection carries no table address"
+    );
+    let slots_debug = format!("{:?}", gi_engine.plan().slots);
+    assert!(
+        !slots_debug.contains(&heap_hex),
+        "the slot inventory carries no table address"
+    );
+    // Entry pointers stay private too: every printed entry address is
+    // absent from both public surfaces.
+    for (addr, _) in heap17.entries.iter().take(8) {
+        let entry_hex = format!("{addr:x}");
+        assert!(
+            !selection_json.contains(&entry_hex),
+            "entry {entry_hex} stays out of the selection projection"
+        );
+        assert!(
+            !slots_debug.contains(&entry_hex),
+            "entry {entry_hex} stays out of the slot inventory"
+        );
+    }
 }

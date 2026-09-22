@@ -208,6 +208,10 @@ def assert_no_loader_pause_identity(label, data, values=None):
 PUBLISHED_LOADER_PAUSE_FIELDS = {
     "attach_gap_ms", "pause", "pause_attempts", "pause_confirmed",
     "pause_partial", "loader_discovery", "child_still_running",
+    # SYSPLAN residual F-15: the run lane's own child, handed back alive.
+    # The operator started this process; naming it leaks no target identity
+    # they could not already see (mirrors check-capture-evidence.py).
+    "handoff_child_pid",
 }
 IDENTITY_PREFIXES = ("pause", "loader", "child", "attach_gap")
 IDENTITY_SUFFIXES = ("_pid", "_tid", "_tids", "_tasks", "_task_set")
@@ -451,8 +455,9 @@ def assert_unsafe_trace(text):
 
 
 def _assert_aggregate_metrics(doc, expected_calls):
-    assert set(doc) == {"schema", "capture", "evidence", "functions"}, doc
+    assert set(doc) == {"schema", "lane", "capture", "evidence", "functions"}, doc
     assert doc["schema"] == "p11scope/observed-profile/v3-metrics"
+    assert doc["lane"] == "metrics", doc
     assert doc["capture"]["mode"] == "metrics"
     assert doc["capture"]["privacy_mode"] == "aggregate-only"
     assert "secret_selection_payload" not in doc["evidence"], doc["evidence"]
@@ -1542,6 +1547,7 @@ def main(argv=None):
 
         aggregate = {
             "schema": "p11scope/observed-profile/v3-metrics",
+            "lane": "metrics",
             "capture": {"mode": "metrics", "privacy_mode": "aggregate-only"},
             "evidence": {
                 **full_fixture,

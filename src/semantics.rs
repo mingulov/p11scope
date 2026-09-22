@@ -787,6 +787,473 @@ mod corrective_tests {
         assert_eq!(state.pending_at_end(), 0);
     }
 
+    /// E20 / F-75 lifecycle matrix on one tombstoned key: same EVENTS
+    /// domain, distinct task cookies, equal module/slot/function/async ID,
+    /// different pending mechanisms. Join, opposite-order completions and
+    /// both owners' cancels all refuse without publishing either mechanism;
+    /// the tombstone adds zero keys, survives the second owner's cancel and
+    /// exit, and dies only with the first inserter's Cryptoki. A late
+    /// completion afterwards still publishes nothing.
+    #[test]
+    fn e20_collision_tombstone_lifecycle_matrix() {
+        let p = plan(&[
+            "C_OpenSession",
+            "C_SignInit",
+            "C_AsyncGetID",
+            "C_AsyncJoin",
+            "C_AsyncComplete",
+            "C_SessionCancel",
+            "C_Finalize",
+        ]);
+        let sign_init = crate::kinds::function_id("C_SignInit").unwrap();
+        let a = ProcessKey::history(1, 90, 0, 100);
+        let b = ProcessKey::history(1, 20, 0, 200);
+        let mut state = State::new(&p);
+        let get_id = |session: u64| {
+            let mut get_id = event(&p, "C_AsyncGetID", session, CkRv::OK.0);
+            get_id.target_function = sign_init;
+            get_id.async_value = 42;
+            get_id
+        };
+        let complete = |session: u64| {
+            let mut complete = event(&p, "C_AsyncComplete", session, CkRv::OK.0);
+            complete.target_function = sign_init;
+            complete.async_value = CkRv::OK.0;
+            complete
+        };
+
+        state.observe_process(a, &open(&p, 7, 3));
+        state.observe_process(b, &open(&p, 7, 3));
+        state.observe_process(a, &mechanism(&p, "C_SignInit", 7, 0x101, CkRv::PENDING.0));
+        state.observe_process(b, &mechanism(&p, "C_SignInit", 7, 0x250, CkRv::PENDING.0));
+        state.observe_process(a, &get_id(7));
+        state.observe_process(b, &get_id(7));
+        assert_eq!(state.semantic_evidence().async_duplicates, 1);
+        assert_eq!(state.detached.len(), 1, "the tombstone adds zero keys");
+        assert_eq!(state.pending_at_end(), 1);
+
+        // The first owner's join is refused; custody stays ambiguous.
+        let mut join = event(&p, "C_AsyncJoin", 7, CkRv::OK.0);
+        join.target_function = sign_init;
+        join.async_value = 42;
+        state.observe_process(a, &join);
+        assert_eq!(state.semantic_evidence().async_orphans, 1);
+        assert_eq!(state.pending_at_end(), 1);
+
+        // Opposite completion order: neither publishes its mechanism.
+        state.observe_process(b, &complete(7));
+        assert_eq!(state.semantic_evidence().async_orphans, 2);
+        state.observe_process(a, &complete(7));
+        assert_eq!(state.semantic_evidence().async_orphans, 3);
+        assert!(state.mechanisms().get(&0x101).is_none());
+        assert!(state.mechanisms().get(&0x250).is_none());
+        assert!(state.active_ops.is_empty());
+        assert_eq!(state.pending_at_end(), 1);
+
+        // Neither owner's cancel consumes the tombstoned key: one owner's
+        // cancel cannot prove the other owner's claim dead.
+        let mut cancel = event(&p, "C_SessionCancel", 7, CkRv::OK.0);
+        cancel.flags = CKF_SIGN;
+        state.observe_process(b, &cancel);
+        assert_eq!(state.detached.len(), 1);
+        state.observe_process(a, &cancel);
+        assert_eq!(state.detached.len(), 1);
+        assert_eq!(state.pending_at_end(), 1);
+        state.observe_process(b, &join);
+        assert_eq!(state.semantic_evidence().async_orphans, 4);
+
+        // Exit of the second owner leaves the tombstone; exit of the first
+        // inserter retires it with its Cryptoki.
+        assert!(state.has_process_state(a));
+        assert!(state.has_process_state(b));
+        state.retire_process(b);
+        assert_eq!(state.pending_at_end(), 1);
+        assert!(state.has_process_state(a));
+        state.retire_process(a);
+        assert_eq!(state.pending_at_end(), 0);
+        assert_eq!(state.sessions().closed, 2);
+
+        // Late completion after the collision settled: refused, nothing
+        // published even though PARTIAL-implying evidence is set.
+        state.observe_process(a, &complete(7));
+        assert_eq!(state.semantic_evidence().async_orphans, 5);
+        assert!(state.mechanisms().is_empty());
+        assert_eq!(state.semantic_evidence().async_duplicates, 1);
+    }
+
+    /// The tombstone must not fire without a proven second owner: the same
+    /// process re-minting one async id overwrites (counted) and the survivor
+    /// still joins and completes with its own mechanism.
+    #[test]
+    fn async_get_id_same_process_remint_overwrites_without_tombstone() {
+        let p = plan(&[
+            "C_OpenSession",
+            "C_SignInit",
+            "C_AsyncGetID",
+            "C_AsyncJoin",
+            "C_AsyncComplete",
+        ]);
+        let sign_init = crate::kinds::function_id("C_SignInit").unwrap();
+        let mut state = State::new(&p);
+        state.observe(&open(&p, 7, 3));
+        state.observe(&mechanism(&p, "C_SignInit", 7, 0x101, CkRv::PENDING.0));
+        let mut get_id = event(&p, "C_AsyncGetID", 7, CkRv::OK.0);
+        get_id.target_function = sign_init;
+        get_id.async_value = 42;
+        state.observe(&get_id);
+        state.observe(&mechanism(&p, "C_SignInit", 7, 0x102, CkRv::PENDING.0));
+        state.observe(&get_id);
+        assert_eq!(state.semantic_evidence().async_duplicates, 1);
+
+        let mut join = event(&p, "C_AsyncJoin", 7, CkRv::OK.0);
+        join.target_function = sign_init;
+        join.async_value = 42;
+        state.observe(&join);
+        assert_eq!(state.semantic_evidence().async_orphans, 0);
+
+        let mut complete = event(&p, "C_AsyncComplete", 7, CkRv::OK.0);
+        complete.target_function = sign_init;
+        complete.async_value = CkRv::OK.0;
+        state.observe(&complete);
+        assert_eq!(state.mechanisms()[&0x102].calls, 1);
+        assert!(state.mechanisms().get(&0x101).is_none());
+        assert_eq!(state.pending_at_end(), 0);
+    }
+
+    /// FU-1 (Package E): same-owner re-mint vs a live collision tombstone.
+    /// After A and B collide on one key, the first owner mints a fresh
+    /// PENDING operation and re-issues GetID on the same key. The live
+    /// tombstone must survive: duplicates +1, exactly one record, collided
+    /// still set, the original pending preserved (the newcomer is dropped,
+    /// like the cross-process case — one owner cannot unilaterally rewrite
+    /// an ambiguous record), and every later join/completion refused.
+    #[test]
+    fn e20_fu1_same_owner_remint_on_live_tombstone_preserves_original() {
+        let p = plan(&[
+            "C_OpenSession",
+            "C_SignInit",
+            "C_AsyncGetID",
+            "C_AsyncJoin",
+            "C_AsyncComplete",
+        ]);
+        let sign_init = crate::kinds::function_id("C_SignInit").unwrap();
+        let a = ProcessKey::history(1, 90, 0, 100);
+        let b = ProcessKey::history(1, 20, 0, 200);
+        let mut state = State::new(&p);
+        let get_id = |session: u64| {
+            let mut get_id = event(&p, "C_AsyncGetID", session, CkRv::OK.0);
+            get_id.target_function = sign_init;
+            get_id.async_value = 42;
+            get_id
+        };
+
+        state.observe_process(a, &open(&p, 7, 3));
+        state.observe_process(b, &open(&p, 7, 3));
+        state.observe_process(a, &mechanism(&p, "C_SignInit", 7, 0x101, CkRv::PENDING.0));
+        state.observe_process(b, &mechanism(&p, "C_SignInit", 7, 0x250, CkRv::PENDING.0));
+        state.observe_process(a, &get_id(7));
+        state.observe_process(b, &get_id(7));
+        assert_eq!(state.semantic_evidence().async_duplicates, 1);
+        assert_eq!(state.detached.len(), 1);
+        assert!(
+            state.detached.values().next().unwrap().collided,
+            "collision must tombstone the key"
+        );
+
+        // First owner mints a fresh PENDING operation and re-issues GetID.
+        state.observe_process(a, &mechanism(&p, "C_SignInit", 7, 0x103, CkRv::PENDING.0));
+        state.observe_process(a, &get_id(7));
+        assert_eq!(
+            state.semantic_evidence().async_duplicates,
+            2,
+            "re-mint on a live tombstone counts one more duplicate"
+        );
+        assert_eq!(state.detached.len(), 1, "the tombstone adds zero keys");
+        let record = state.detached.values().next().unwrap();
+        assert!(record.collided, "collided must stay set after re-mint");
+        assert_eq!(
+            record.pending.event.mechanism, 0x101,
+            "live tombstone keeps the original pending; the newcomer is dropped"
+        );
+        assert_eq!(state.pending_at_end(), 1);
+
+        // Every join and completion on the collided key is refused.
+        let mut join = event(&p, "C_AsyncJoin", 7, CkRv::OK.0);
+        join.target_function = sign_init;
+        join.async_value = 42;
+        state.observe_process(a, &join);
+        assert_eq!(state.semantic_evidence().async_orphans, 1);
+        state.observe_process(b, &join);
+        assert_eq!(state.semantic_evidence().async_orphans, 2);
+        let mut complete = event(&p, "C_AsyncComplete", 7, CkRv::OK.0);
+        complete.target_function = sign_init;
+        complete.async_value = CkRv::OK.0;
+        state.observe_process(b, &complete);
+        assert_eq!(state.semantic_evidence().async_orphans, 3);
+        state.observe_process(a, &complete);
+        assert_eq!(state.semantic_evidence().async_orphans, 4);
+        assert!(state.mechanisms().get(&0x101).is_none());
+        assert!(state.mechanisms().get(&0x103).is_none());
+        assert!(state.mechanisms().get(&0x250).is_none());
+        assert_eq!(state.pending_at_end(), 1);
+    }
+
+    /// FU-2 (Package E): close vs a live collision tombstone. `C_CloseSession`
+    /// and `C_CloseAllSessions` by each owner detach sessions but must not
+    /// clear the tombstone: the record survives with collided set, and later
+    /// joins/completions (after re-open) are still refused.
+    #[test]
+    fn e20_fu2_close_and_close_all_on_live_tombstone_preserve_refusal() {
+        let p = plan(&[
+            "C_OpenSession",
+            "C_CloseSession",
+            "C_CloseAllSessions",
+            "C_SignInit",
+            "C_AsyncGetID",
+            "C_AsyncJoin",
+            "C_AsyncComplete",
+        ]);
+        let sign_init = crate::kinds::function_id("C_SignInit").unwrap();
+        let a = ProcessKey::history(1, 90, 0, 100);
+        let b = ProcessKey::history(1, 20, 0, 200);
+        let mut state = State::new(&p);
+        let get_id = |session: u64| {
+            let mut get_id = event(&p, "C_AsyncGetID", session, CkRv::OK.0);
+            get_id.target_function = sign_init;
+            get_id.async_value = 42;
+            get_id
+        };
+        let join = |session: u64| {
+            let mut join = event(&p, "C_AsyncJoin", session, CkRv::OK.0);
+            join.target_function = sign_init;
+            join.async_value = 42;
+            join
+        };
+        let complete = |session: u64| {
+            let mut complete = event(&p, "C_AsyncComplete", session, CkRv::OK.0);
+            complete.target_function = sign_init;
+            complete.async_value = CkRv::OK.0;
+            complete
+        };
+
+        // --- C_CloseSession by each owner. ---
+        state.observe_process(a, &open(&p, 7, 3));
+        state.observe_process(b, &open(&p, 7, 3));
+        state.observe_process(a, &mechanism(&p, "C_SignInit", 7, 0x101, CkRv::PENDING.0));
+        state.observe_process(b, &mechanism(&p, "C_SignInit", 7, 0x250, CkRv::PENDING.0));
+        state.observe_process(a, &get_id(7));
+        state.observe_process(b, &get_id(7));
+        assert_eq!(state.semantic_evidence().async_duplicates, 1);
+
+        // Non-owner closes first: the tombstone (first inserter's Cryptoki)
+        // is untouched.
+        state.observe_process(b, &event(&p, "C_CloseSession", 7, 0));
+        assert_eq!(state.detached.len(), 1);
+        assert!(state.detached.values().next().unwrap().collided);
+        assert_eq!(state.pending_at_end(), 1);
+        assert!(state.has_process_state(a));
+        // Owner closes: the record floats (owner None) but survives collided.
+        state.observe_process(a, &event(&p, "C_CloseSession", 7, 0));
+        assert_eq!(state.detached.len(), 1);
+        let record = state.detached.values().next().unwrap();
+        assert!(record.collided, "close cannot clear a live tombstone");
+        assert_eq!(record.owner, None, "close detaches but never drops");
+        assert_eq!(state.pending_at_end(), 1);
+        assert!(
+            state.has_process_state(a),
+            "floating tombstone is live state"
+        );
+
+        // Re-open and confirm joins/completions still refuse.
+        state.observe_process(a, &open(&p, 7, 3));
+        state.observe_process(b, &open(&p, 7, 3));
+        state.observe_process(a, &join(7));
+        assert_eq!(state.semantic_evidence().async_orphans, 1);
+        state.observe_process(b, &complete(7));
+        assert_eq!(state.semantic_evidence().async_orphans, 2);
+        assert_eq!(state.pending_at_end(), 1);
+
+        // --- C_CloseAllSessions by each owner (fresh collision). ---
+        let mut state = State::new(&p);
+        state.observe_process(a, &open(&p, 7, 3));
+        state.observe_process(b, &open(&p, 7, 3));
+        state.observe_process(a, &mechanism(&p, "C_SignInit", 7, 0x101, CkRv::PENDING.0));
+        state.observe_process(b, &mechanism(&p, "C_SignInit", 7, 0x250, CkRv::PENDING.0));
+        state.observe_process(a, &get_id(7));
+        state.observe_process(b, &get_id(7));
+        let mut close_all = event(&p, "C_CloseAllSessions", SESSION_NONE, 0);
+        close_all.slot_id = 3;
+        state.observe_process(b, &close_all);
+        assert_eq!(state.detached.len(), 1);
+        assert!(state.detached.values().next().unwrap().collided);
+        state.observe_process(a, &close_all);
+        assert_eq!(state.detached.len(), 1);
+        assert!(
+            state.detached.values().next().unwrap().collided,
+            "close-all cannot clear a live tombstone"
+        );
+        assert_eq!(state.pending_at_end(), 1);
+        state.observe_process(a, &open(&p, 7, 3));
+        state.observe_process(a, &join(7));
+        assert_eq!(state.semantic_evidence().async_orphans, 1);
+        state.observe_process(a, &complete(7));
+        assert_eq!(state.semantic_evidence().async_orphans, 2);
+        assert!(state.mechanisms().is_empty());
+    }
+
+    /// E20 visit-count scaling (Package E): fork must group parent operations
+    /// by session instead of scanning every parent op per session. 200
+    /// sessions x 3 ops visits ~600 examinations linearly, not 200x600.
+    /// Supplements the `<2s` wall-time test without its hardware variance.
+    #[test]
+    fn fork_visit_count_scales_linearly_not_quadratically() {
+        let p = plan(&["C_OpenSession"]);
+        let mut state = State::new(&p);
+        let parent = ProcessKey {
+            pid: 100,
+            generation: 1,
+            domain: 0,
+            exec_id: 0,
+        };
+        let child = ProcessKey {
+            pid: 101,
+            generation: 1,
+            domain: 0,
+            exec_id: 0,
+        };
+        for handle in 0..200u64 {
+            state.open.insert(
+                (parent, sess(handle)),
+                SessionInfo {
+                    pseudonym: handle,
+                    slot: 0,
+                    fork_safe: true,
+                },
+            );
+            for operation in 0..3u16 {
+                state.active_ops.insert(
+                    (parent, sess(handle), operation),
+                    Binding {
+                        mechanism: 1,
+                        fork_safe: true,
+                    },
+                );
+            }
+        }
+        state.state_keys = state.open.len() + state.active_ops.len();
+        state.fork_process(parent, child);
+        assert_eq!(state.open.len(), 400);
+        assert_eq!(state.active_ops.len(), 1200);
+        let visits = state.fork_op_visits();
+        // Linear: one examination per parent op plus grouping overhead.
+        // Quadratic (current): 200 sessions x 600 ops = 120,000.
+        assert!(
+            visits <= 2000,
+            "fork visited {visits} parent-op examinations for 600 ops; want <= 2000 (linear)"
+        );
+    }
+
+    /// E19 equivalence (Package E): repeated operation-name recording keeps
+    /// admission-before-insertion and stable output ordering. Recording the
+    /// same mechanism/operation twice allocates the name once and counts
+    /// both calls; a second operation kind extends the ordered set.
+    #[test]
+    fn e19_operation_name_recording_is_idempotent_and_ordered() {
+        let p = plan(&["C_SignInit", "C_DigestInit", "C_Sign", "C_Digest"]);
+        let mut state = State::new(&p);
+        state.observe(&mechanism(&p, "C_SignInit", 7, 0x101, 0));
+        state.observe(&mechanism(&p, "C_SignInit", 7, 0x101, 0));
+        assert_eq!(state.mechanisms()[&0x101].calls, 2);
+        assert_eq!(
+            state.mechanisms()[&0x101].ops.iter().collect::<Vec<_>>(),
+            vec!["sign"],
+            "re-recording one op kind keeps a single ordered name"
+        );
+        // Same mechanism id serving a second operation kind extends the set.
+        state.observe(&mechanism(&p, "C_DigestInit", 7, 0x101, 0));
+        let ops: Vec<_> = state.mechanisms()[&0x101].ops.iter().collect();
+        assert_eq!(ops, vec!["digest", "sign"], "BTreeSet keeps stable order");
+        assert_eq!(state.mechanisms()[&0x101].calls, 3);
+    }
+
+    /// E20 deliberate-collision workload ledger (Package E): return pairing,
+    /// close/finalize and delayed joins are checked against each workload's
+    /// own ledger, not summed totals. Two processes share one provider and
+    /// deliberately reuse handle 7 / async id 42 with different mechanisms;
+    /// neither publishes under the other and sweeping one never sweeps both.
+    #[test]
+    fn e20_collision_workload_ledgers_stay_independent() {
+        let p = plan(&[
+            "C_OpenSession",
+            "C_CloseSession",
+            "C_SignInit",
+            "C_Sign",
+            "C_AsyncGetID",
+            "C_AsyncJoin",
+            "C_AsyncComplete",
+            "C_Finalize",
+        ]);
+        let sign_init = crate::kinds::function_id("C_SignInit").unwrap();
+        let sign = crate::kinds::function_id("C_Sign").unwrap();
+        let a = ProcessKey::history(1, 90, 0, 100);
+        let b = ProcessKey::history(1, 20, 0, 200);
+        let mut state = State::new(&p);
+        let get_id = |session: u64| {
+            let mut get_id = event(&p, "C_AsyncGetID", session, CkRv::OK.0);
+            get_id.target_function = sign_init;
+            get_id.async_value = 42;
+            get_id
+        };
+
+        // Each workload's own ledger: opens, pending mints, joins, completions.
+        let mut ledger_a = (0u64, 0u64, 0u64, 0u64);
+        let mut ledger_b = (0u64, 0u64, 0u64, 0u64);
+        state.observe_process(a, &open(&p, 7, 3));
+        ledger_a.0 += 1;
+        state.observe_process(b, &open(&p, 7, 3));
+        ledger_b.0 += 1;
+        // Distinct non-async return pairing per owner stays attributed.
+        state.observe_process(a, &mechanism(&p, "C_SignInit", 7, 0x101, 0));
+        state.observe_process(a, &event(&p, "C_Sign", 7, 0));
+        assert_eq!(sign, sign, "ledger anchor");
+        assert_eq!(state.mechanisms()[&0x101].calls, 2);
+        // Collide the async key with different pending mechanisms.
+        state.observe_process(a, &mechanism(&p, "C_SignInit", 7, 0x102, CkRv::PENDING.0));
+        ledger_a.1 += 1;
+        state.observe_process(b, &mechanism(&p, "C_SignInit", 7, 0x250, CkRv::PENDING.0));
+        ledger_b.1 += 1;
+        state.observe_process(a, &get_id(7));
+        state.observe_process(b, &get_id(7));
+        assert_eq!(state.semantic_evidence().async_duplicates, 1);
+
+        // Delayed joins against each workload's own ledger: both refuse.
+        let mut join = event(&p, "C_AsyncJoin", 7, CkRv::OK.0);
+        join.target_function = sign_init;
+        join.async_value = 42;
+        state.observe_process(a, &join);
+        ledger_a.2 += 1;
+        state.observe_process(b, &join);
+        ledger_b.2 += 1;
+        assert_eq!(state.semantic_evidence().async_orphans, 2);
+
+        // Close/finalize one workload: the other's ledger is untouched.
+        state.observe_process(b, &event(&p, "C_CloseSession", 7, 0));
+        assert!(state.has_process_state(a));
+        state.observe_process(b, &event(&p, "C_Finalize", SESSION_NONE, 0));
+        assert!(!state.has_process_state(b));
+        assert!(state.has_process_state(a));
+        assert_eq!(ledger_a, (1, 1, 1, 0));
+        assert_eq!(ledger_b, (1, 1, 1, 0));
+        // Delayed completion after B's finalize still refuses, publishes nil.
+        let mut complete = event(&p, "C_AsyncComplete", 7, CkRv::OK.0);
+        complete.target_function = sign_init;
+        complete.async_value = CkRv::OK.0;
+        state.observe_process(a, &complete);
+        assert_eq!(state.semantic_evidence().async_orphans, 3);
+        assert!(state.mechanisms().get(&0x102).is_none());
+        assert!(state.mechanisms().get(&0x250).is_none());
+    }
+
     /// The other half of the same trade: a floating id belonging to the
     /// process that finalizes *is* dropped, because a later `C_Initialize`
     /// there could mint the same key and `C_AsyncJoin` a dead operation.
@@ -1450,6 +1917,17 @@ struct Detached {
     /// together; `owner` is only ever cleared to `None`, never reassigned to a
     /// different process on its own.
     process: ProcessKey,
+    /// F-75/E20 collision tombstone. Set when a second independent process
+    /// proves the same `(module, slot, function, id)` key names two different
+    /// operations (the standard leaves the identifier namespace
+    /// module-dependent, so numeric equality is not identity). A tombstoned
+    /// record refuses every join and completion with `async_orphans`
+    /// evidence instead of attributing one owner's operation to another. The
+    /// flag is inline on the existing bounded record — a collision adds zero
+    /// keys — and dies with the scope's retirement or bounded eviction like
+    /// any other detached record. One owner's cancel or close cannot clear
+    /// it: withdrawing one claim does not disprove the other.
+    collided: bool,
 }
 
 const OPERATIONS: [(u16, &str); 11] = [
@@ -1504,8 +1982,8 @@ const KNOWN_CANCEL_FLAGS: u64 = CKF_MESSAGE_ENCRYPT
     | CKF_DERIVE
     | CKF_ENCAPSULATE
     | CKF_DECAPSULATE;
-const MAX_PENDING: usize = 16_384;
-const MAX_STATE_KEYS: usize = 16_384;
+pub(crate) const MAX_PENDING: usize = 16_384;
+pub(crate) const MAX_STATE_KEYS: usize = 16_384;
 
 fn pid_of(ev: &Event) -> u32 {
     (ev.pid_tgid >> 32) as u32
@@ -1597,6 +2075,9 @@ pub struct State {
     /// Async ids are only unique within one module's PKCS#11 slot, so the
     /// issuing module and loaded-object domain are part of the key here too.
     /// Processes in the SAME domain may still transfer custody by successful join.
+    /// Independent processes colliding on one key do not overwrite each other:
+    /// the second `ASYNC_GET_ID` tombstones the record (`Detached::collided`),
+    /// which then refuses joins and completions instead of cross-attributing.
     detached: BTreeMap<(ModuleId, u64, u32, u64, u64), Detached>,
     sequence: u64,
     mechanisms: BTreeMap<u64, MechStat>,
@@ -1612,6 +2093,12 @@ pub struct State {
     state_keys: usize,
     // Drop the anchor after all domain-indexed state.
     events_domain: Option<crate::events::EventsDomain>,
+    /// E20 visit-count instrumentation (test-only): counts parent-op
+    /// examinations during the last `fork_process` so scaling tests can
+    /// assert linear visits without wall-time flakiness. Production builds
+    /// carry no counter.
+    #[cfg(test)]
+    fork_op_visits: std::cell::Cell<u64>,
 }
 
 fn slot_metadata(plan: &AttachPlan) -> Vec<Option<SlotMeta>> {
@@ -1702,6 +2189,8 @@ impl State {
             mech_shapes: BTreeMap::new(),
             state_key_limit,
             state_keys: 0,
+            #[cfg(test)]
+            fork_op_visits: std::cell::Cell::new(0),
         }
     }
 
@@ -1867,10 +2356,23 @@ impl State {
         if ev.event_type != event_type::CALL {
             return;
         }
-        if !self.cgroups.contains_key(&ev.cgroup_id) && self.admit(1) {
-            self.cgroups.insert(ev.cgroup_id, CgroupStat::default());
-        }
-        if let Some(cg) = self.cgroups.get_mut(&ev.cgroup_id) {
+        // E19: fuse admission probe + insert + update (3 lookups) into
+        // probe + one insert-or-update (2). Admission still precedes
+        // insertion; a refused cell counts nothing, as before.
+        let is_new = !self.cgroups.contains_key(&ev.cgroup_id);
+        if is_new {
+            if self.admit(1) {
+                let is_error = ev.rv != CkRv::OK.0 && ev.rv != CkRv::PENDING.0;
+                self.cgroups.insert(
+                    ev.cgroup_id,
+                    CgroupStat {
+                        calls: 1,
+                        errors: u64::from(is_error),
+                        mechanisms: BTreeMap::new(),
+                    },
+                );
+            }
+        } else if let Some(cg) = self.cgroups.get_mut(&ev.cgroup_id) {
             cg.calls = cg.calls.saturating_add(1);
             if ev.rv != CkRv::OK.0 && ev.rv != CkRv::PENDING.0 {
                 cg.errors = cg.errors.saturating_add(1);
@@ -1887,10 +2389,23 @@ impl State {
             self.reduced_histories.insert(process);
         }
         let meta = self.slots.get(ev.slot as usize).and_then(Clone::clone);
-        if !self.cgroups.contains_key(&ev.cgroup_id) && self.admit(1) {
-            self.cgroups.insert(ev.cgroup_id, CgroupStat::default());
-        }
-        if let Some(cg) = self.cgroups.get_mut(&ev.cgroup_id) {
+        // E19: same fused cgroup admission as `reject_history` (2 lookups,
+        // not 3). A refused cell skips counting but never gates the
+        // semantic path below.
+        let is_new_cgroup = !self.cgroups.contains_key(&ev.cgroup_id);
+        if is_new_cgroup {
+            if self.admit(1) {
+                let is_error = ev.rv != CkRv::OK.0 && ev.rv != CkRv::PENDING.0;
+                self.cgroups.insert(
+                    ev.cgroup_id,
+                    CgroupStat {
+                        calls: 1,
+                        errors: u64::from(is_error),
+                        mechanisms: BTreeMap::new(),
+                    },
+                );
+            }
+        } else if let Some(cg) = self.cgroups.get_mut(&ev.cgroup_id) {
             cg.calls += 1;
             if ev.rv != CkRv::OK.0 && ev.rv != CkRv::PENDING.0 {
                 cg.errors += 1;
@@ -1941,11 +2456,13 @@ impl State {
             && ev.rv == CkRv::OK.0
             && ev.user_type != USER_TYPE_NONE
         {
-            if !self.logins.contains_key(&ev.user_type) && self.admit(1) {
-                self.logins.insert(ev.user_type, 0);
-            }
-            if let Some(calls) = self.logins.get_mut(&ev.user_type) {
-                *calls += 1;
+            // E19: fused login admission (probe + entry, not probe +
+            // insert + get_mut). Admission precedes insertion.
+            let is_new = !self.logins.contains_key(&ev.user_type);
+            if is_new && !self.admit(1) {
+                // Refused cell counts nothing; fall through to lifecycle.
+            } else {
+                *self.logins.entry(ev.user_type).or_default() += 1;
             }
         }
         if self.reconcile_conclusive(process, ev, meta) {
@@ -1963,24 +2480,35 @@ impl State {
         let MechanismCapture::Value(mechanism) = mechanism_capture(ev) else {
             return;
         };
-        if !self.mechanisms.contains_key(&mechanism) && self.admit(1) {
-            self.mechanisms.insert(mechanism, MechStat::default());
-        }
-        let Some(stat) = self.mechanisms.get_mut(&mechanism) else {
+        // E19: fuse the admission probe and the insert into one entry lookup.
+        // Admission still precedes insertion; the `contains_key` decides the
+        // budget before `entry` materializes the cell.
+        let is_new = !self.mechanisms.contains_key(&mechanism);
+        if is_new && !self.admit(1) {
             return;
-        };
+        }
+        let stat = self.mechanisms.entry(mechanism).or_default();
         record_call(stat, ev);
-        stat.ops
-            .extend(operation_bits(meta.semantics.operations).map(|(_, name)| name.to_string()));
-        if let Some(name) = direct_name(meta.semantics.direct) {
-            stat.ops.insert(name.to_string());
+        // E19: skip the `String` allocation when the operation name is
+        // already recorded. `BTreeSet<String>::contains` borrows `&str`,
+        // so the hot re-record path allocates nothing; output ordering
+        // (BTreeSet) is unchanged.
+        for (_, name) in operation_bits(meta.semantics.operations) {
+            if !stat.ops.contains(name) {
+                stat.ops.insert(name.to_owned());
+            }
+        }
+        if let Some(name) = direct_name(meta.semantics.direct)
+            && !stat.ops.contains(name)
+        {
+            stat.ops.insert(name.to_owned());
         }
         if self.policy.uses_unsafe_decoders() {
             let combo = (ev.shape, ev.p0, ev.p1, ev.p2);
             if ev.shape == shape::NONE {
                 stat.init_no_shape += 1;
-            } else if stat.param_combos.contains_key(&combo) {
-                *stat.param_combos.get_mut(&combo).unwrap() += 1;
+            } else if let Some(count) = stat.param_combos.get_mut(&combo) {
+                *count += 1;
             } else {
                 let _ = stat;
                 if self.admit(1) {
@@ -2041,12 +2569,16 @@ impl State {
             }
         }
         for mechanism in mechanisms {
-            if !self.mechanisms.contains_key(&mechanism) && self.admit(1) {
-                self.mechanisms.insert(mechanism, MechStat::default());
+            // E19: same fused admission-before-insertion as
+            // `record_requested_mechanism`: one probe plus one entry. A
+            // refused mechanism cell still records cgroup attribution,
+            // exactly as before.
+            let is_new = !self.mechanisms.contains_key(&mechanism);
+            if is_new && !self.admit(1) {
+                self.record_cgroup_mechanism(ev.cgroup_id, mechanism, ev.rv);
+                continue;
             }
-            if let Some(stat) = self.mechanisms.get_mut(&mechanism) {
-                record_call(stat, ev);
-            }
+            record_call(self.mechanisms.entry(mechanism).or_default(), ev);
             self.record_cgroup_mechanism(ev.cgroup_id, mechanism, ev.rv);
         }
 
@@ -2259,6 +2791,12 @@ impl State {
                         && flags & CKF_FIND_OBJECTS != 0)))
         });
         self.detached.retain(|_, detached| {
+            // A tombstoned key outlives one owner's cancel: withdrawing one
+            // claim cannot disprove the other, and dropping the record would
+            // let a later join adopt whatever is re-minted under the key.
+            if detached.collided {
+                return true;
+            }
             let selected_owner = detached.owner == Some((process, session));
             !(selected_owner
                 && (detached.pending.meta.semantics.operations & cancel_operation_mask(flags) != 0
@@ -2289,28 +2827,32 @@ impl State {
                     return;
                 }
                 let key = (process, session, ev.target_function);
-                let pending = self.pending.remove(&key).or_else(|| {
-                    let detached_key = self.detached.iter().find_map(|(key, value)| {
-                        (value.owner == Some((process, session))
-                            && value.pending.meta.function_id == Some(ev.target_function))
-                        .then_some(*key)
-                    });
-                    detached_key.and_then(|key| self.detached.remove(&key).map(|d| d.pending))
+                if let Some(pending) = self.pending.remove(&key) {
+                    self.complete_pending(process, ev, pending);
+                    return;
+                }
+                let detached_key = self.detached.iter().find_map(|(key, value)| {
+                    (value.owner == Some((process, session))
+                        && value.pending.meta.function_id == Some(ev.target_function))
+                    .then_some(*key)
                 });
+                let Some(detached_key) = detached_key else {
+                    self.evidence.async_orphans = self.evidence.async_orphans.saturating_add(1);
+                    return;
+                };
+                // A tombstoned key names two independent operations; this
+                // completion cannot prove which one finished, so it is refused
+                // and the tombstone stays for the other claimant.
+                if self.detached[&detached_key].collided {
+                    self.evidence.async_orphans = self.evidence.async_orphans.saturating_add(1);
+                    return;
+                }
+                let pending = self.detached.remove(&detached_key).map(|d| d.pending);
                 let Some(pending) = pending else {
                     self.evidence.async_orphans = self.evidence.async_orphans.saturating_add(1);
                     return;
                 };
-                let mut completed = pending.event;
-                completed.session = ev.session;
-                completed.rv = ev.rv;
-                completed.ts_ns = ev.ts_ns;
-                completed.duration_ns = ev.ts_ns.saturating_sub(pending.started_ns);
-                if completed.rv == CkRv::PENDING.0 {
-                    self.queue_pending(process, &completed, pending.meta);
-                } else {
-                    self.apply_completed(process, &completed, &pending.meta, true);
-                }
+                self.complete_pending(process, ev, pending);
             }
             lifecycle::ASYNC_GET_ID if ev.rv == CkRv::OK.0 => {
                 let key = (process, session, ev.target_function);
@@ -2327,26 +2869,58 @@ impl State {
                     self.evidence.async_orphans = self.evidence.async_orphans.saturating_add(1);
                     return;
                 };
-                if self
-                    .detached
-                    .insert(
-                        (
-                            session.module,
-                            slot,
-                            ev.target_function,
-                            ev.async_value,
-                            process.domain,
-                        ),
-                        Detached {
+                let detached_key = (
+                    session.module,
+                    slot,
+                    ev.target_function,
+                    ev.async_value,
+                    process.domain,
+                );
+                match self.detached.get_mut(&detached_key) {
+                    // F-75: a second independent process proves this key names
+                    // two operations. The first record stays (neither is
+                    // attributable now), the newcomer is dropped, and the key
+                    // is tombstoned so later joins and completions refuse
+                    // instead of cross-attributing. Still counted as a
+                    // duplicate, which keeps the PARTIAL verdict.
+                    Some(existing) if existing.process != process => {
+                        existing.collided = true;
+                        self.evidence.async_duplicates =
+                            self.evidence.async_duplicates.saturating_add(1);
+                    }
+                    // FU-1: a live tombstone survives even a same-owner
+                    // re-mint. The newcomer is dropped (its pending was
+                    // already consumed above), the original pending and
+                    // owner stand, and the duplicate is still counted.
+                    // One owner cannot unilaterally rewrite an ambiguous
+                    // record while the other owner's claim stands.
+                    Some(existing) if existing.collided => {
+                        self.evidence.async_duplicates =
+                            self.evidence.async_duplicates.saturating_add(1);
+                    }
+                    Some(existing) => {
+                        // Same owner re-minting one id with no live
+                        // tombstone: overwrite as before.
+                        *existing = Detached {
                             pending,
                             owner: Some((process, session)),
                             process,
-                        },
-                    )
-                    .is_some()
-                {
-                    self.evidence.async_duplicates =
-                        self.evidence.async_duplicates.saturating_add(1);
+                            collided: false,
+                        };
+                        self.evidence.async_duplicates =
+                            self.evidence.async_duplicates.saturating_add(1);
+                    }
+                    None => {
+                        self.detached.insert(
+                            detached_key,
+                            Detached {
+                                pending,
+                                owner: Some((process, session)),
+                                process,
+                                collided: false,
+                            },
+                        );
+                    }
                 }
             }
             lifecycle::ASYNC_JOIN if ev.rv == CkRv::OK.0 => {
@@ -2362,6 +2936,12 @@ impl State {
                     ev.async_value,
                     process.domain,
                 )) {
+                    Some(detached) if detached.collided => {
+                        // The key names two independent operations and the
+                        // module alone knows which one this join means: refuse
+                        // without moving custody.
+                        self.evidence.async_orphans = self.evidence.async_orphans.saturating_add(1);
+                    }
                     Some(detached) => {
                         // A successful join *assigns* the joining
                         // process/session, so custody moves whole: leaving
@@ -2376,6 +2956,22 @@ impl State {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Applies a completion to the in-flight record it named. Shared by the
+    /// process-scoped `pending` hit and the detached fallback so the two
+    /// lookup paths cannot drift into applying different completion rules.
+    fn complete_pending(&mut self, process: ProcessKey, ev: &Event, pending: Pending) {
+        let mut completed = pending.event;
+        completed.session = ev.session;
+        completed.rv = ev.rv;
+        completed.ts_ns = ev.ts_ns;
+        completed.duration_ns = ev.ts_ns.saturating_sub(pending.started_ns);
+        if completed.rv == CkRv::PENDING.0 {
+            self.queue_pending(process, &completed, pending.meta);
+        } else {
+            self.apply_completed(process, &completed, &pending.meta, true);
         }
     }
 
@@ -2644,6 +3240,8 @@ impl State {
         if self.reduced_histories.contains(&child) || !self.admit(1) {
             return;
         }
+        #[cfg(test)]
+        self.fork_op_visits.set(0);
         self.reduced_histories.insert(child);
         // Inherits every module's sessions; each carries its own module along.
         let sessions: Vec<(SessionRef, SessionInfo)> = self
@@ -2652,16 +3250,20 @@ impl State {
             .filter(|((owner, _), _)| *owner == parent)
             .map(|((_, session), info)| (*session, *info))
             .collect();
-        // The parent's in-flight ops, collected once: the loop below only
-        // reads them (child-keyed inserts never match the parent filter),
-        // so one pre-pass is equivalent to a per-session full-map clone and
-        // turns O(sessions x ops) into O(sessions + ops) per fork.
-        let parent_ops: Vec<((ProcessKey, SessionRef, u16), Binding)> = self
-            .active_ops
-            .iter()
-            .filter(|((owner, _, _), _)| *owner == parent)
-            .map(|(key, binding)| (*key, *binding))
-            .collect();
+        // The parent's in-flight ops, grouped once by session (ordered
+        // keys, so per-session op order matches the map order): each fork
+        // visits every parent op once during grouping plus once during its
+        // own session's inheritance — O(sessions + ops), not the
+        // O(sessions x ops) scan-per-session below used to pay.
+        let mut grouped: BTreeMap<SessionRef, Vec<(u16, Binding)>> = BTreeMap::new();
+        for ((owner, handle, operation), binding) in self.active_ops.iter() {
+            if *owner == parent {
+                grouped
+                    .entry(*handle)
+                    .or_default()
+                    .push((*operation, *binding));
+            }
+        }
         for (session, info) in sessions {
             if !info.fork_safe {
                 let key = (child, session);
@@ -2686,8 +3288,10 @@ impl State {
                 },
             );
             self.sessions.inherited = self.sessions.inherited.saturating_add(1);
-            for ((_, handle, operation), binding) in &parent_ops {
-                if *handle == session {
+            if let Some(ops) = grouped.get(&session) {
+                for (operation, binding) in ops {
+                    #[cfg(test)]
+                    self.fork_op_visits.set(self.fork_op_visits.get() + 1);
                     if binding.fork_safe {
                         let key = (child, session, *operation);
                         if self.active_ops.contains_key(&key) || self.admit(1) {
@@ -2772,6 +3376,11 @@ impl State {
     }
     pub fn pending_at_end(&self) -> u64 {
         (self.pending.len() + self.detached.len()) as u64
+    }
+    /// E20 test-only visit count from the last `fork_process`.
+    #[cfg(test)]
+    pub(crate) fn fork_op_visits(&self) -> u64 {
+        self.fork_op_visits.get()
     }
     pub fn has_process_state(&self, process: ProcessKey) -> bool {
         self.has_scope_state(process, None)

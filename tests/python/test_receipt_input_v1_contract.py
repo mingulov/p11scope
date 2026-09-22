@@ -4336,7 +4336,6 @@ def run_input_v1_contract(subject_path, golden):
                     type(value) is str for value in returned_by_token.values()
                 ):
                     raise SystemExit("stage3a3 str target fsencode was not immediate and singular")
-                raw_values = tuple(value for _token, value in state["a3_readlinks"])
                 for occurrence in admitted[:40]:
                     reads = [
                         (token, value)

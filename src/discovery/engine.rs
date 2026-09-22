@@ -58,6 +58,9 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::Arc;
 
+#[path = "inventory.rs"]
+pub(crate) mod inventory;
+
 pub struct Engine {
     plan: plan::AttachPlan,
     pinned: PinnedObjects,
@@ -73,6 +76,7 @@ pub struct Engine {
     manifest_inputs: Vec<ManifestInput>,
     base_counters: DiscoveryCounters,
     budget: CaptureWorkBudget,
+    inventory: Option<inventory::InventoryState>,
     next_view_id: u32,
     /// Retired live-view IDs available for reuse. Allocation pops before
     /// minting, so only simultaneously live views count against the ceiling.
@@ -7009,6 +7013,7 @@ impl Engine {
             manifest_inputs: Vec::new(),
             base_counters: DiscoveryCounters::default(),
             budget: CaptureWorkBudget::default(),
+            inventory: None,
             next_view_id: 0,
             retired_view_ids: Vec::new(),
             max_scan_pids: MAX_SCAN_PIDS,
@@ -7528,6 +7533,14 @@ impl Engine {
     }
 
     fn allocate_view_id(&mut self) -> Result<ProcessViewId> {
+        if self.inventory.is_some() {
+            self.inventory_state()?;
+            return self
+                .inventory
+                .as_mut()
+                .expect("checked Inventory state")
+                .reserve_owner(&mut self.next_view_id);
+        }
         if let Some(reused) = self.retired_view_ids.pop() {
             return Ok(ProcessViewId(reused));
         }
@@ -7544,6 +7557,10 @@ impl Engine {
     }
 
     fn release_view_id(&mut self, id: ProcessViewId) {
+        if let Some(inventory) = &mut self.inventory {
+            inventory.release_reservation(id);
+            return;
+        }
         // Skip-if-present: a duplicate retired entry would mint one ID to
         // two live views, so a double release is a silent no-op rather than
         // a debug-only abort.
@@ -7557,6 +7574,9 @@ impl Engine {
     }
 
     fn retain_view_id(&mut self, id: ProcessViewId) -> Result<()> {
+        if self.inventory.is_some() {
+            return self.inventory_state()?.require_reserved_or_retained(id);
+        }
         if id.0 as usize >= self.max_scan_pids {
             let max_scan_pids = self.max_scan_pids;
             bail!("capture process-view capacity {max_scan_pids} is exhausted");

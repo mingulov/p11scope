@@ -482,6 +482,25 @@ impl PinnedObjects {
         }
     }
 
+    /// Restores the scan-owned pin layer before Inventory rebinds every retained
+    /// module. Rebinding appends independent module/entry pin references; keeping
+    /// the previous binding's pins would charge untouched owners repeatedly.
+    /// Each retained raw alias keeps its own pin reference, even when several
+    /// aliases resolve to the same physical object. Object IDs, aliases, and
+    /// opened-file custody remain unchanged.
+    pub(crate) fn reset_scan_pin_claims(&mut self) {
+        for (view, claims) in &mut self.ownership {
+            claims.pins = self
+                .raw_ownership
+                .get(view)
+                .into_iter()
+                .flatten()
+                .filter_map(|raw| self.raw_to_id.get(raw).copied())
+                .filter(|id| self.by_id.contains_key(id))
+                .collect();
+        }
+    }
+
     pub(crate) fn rejects(&self, key: ObjectKey) -> bool {
         self.rejected_keys.contains(&key)
     }

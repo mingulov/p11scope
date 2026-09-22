@@ -1,6 +1,9 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 use super::session_fixture::ScriptedSession;
 use super::*;
+
+#[path = "inventory_claims_tests.rs"]
+mod inventory_claims;
 use crate::discovery::identity::test_fixture::{
     SHA as OVERLAY_SHA, backing_file as overlay_backing_file, module as overlay_module,
     overlay as overlay_key, pins as overlay_pins, reback as overlay_reback,

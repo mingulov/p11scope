@@ -2,6 +2,7 @@
 """Actual native root helper tests and narrow production hook contracts."""
 from pathlib import Path
 import argparse
+import re
 import subprocess
 import tempfile
 import unittest
@@ -23,10 +24,16 @@ def function(source, name):
 def hook_contract(main, identity):
     exit_body = function(main, "sched_process_exit")
     owner = "unsafe { p11_owner_cleanup() };"
-    root = "unsafe { p11_root_current_exit() };"
-    tail = exit_body[exit_body.index(owner) + len(owner):].lstrip()
-    if not tail.startswith(root):
-        raise AssertionError("root cleanup must unconditionally follow owner cleanup")
+    owner_at = exit_body.index(owner)
+    before_owner = re.sub(r"//[^\n]*", "", exit_body[:owner_at]).strip()
+    if before_owner != "{" or exit_body.count("p11_owner_cleanup") != 1:
+        raise AssertionError("owner cleanup must unconditionally begin the exit handler")
+    tail = exit_body[owner_at + len(owner):]
+    root = re.match(
+        r'\s*#\[cfg\(not\(feature = "inventory-only"\)\)\]'
+        r'\s*unsafe\s*\{\s*p11_root_current_exit\(\)\s*\};', tail)
+    if root is None or exit_body.count("p11_root_current_exit") != 1:
+        raise AssertionError("Detailed root cleanup must immediately follow owner cleanup; Inventory must omit it")
     if "p11_root_current_exit" in function(main, "sched_process_exec"):
         raise AssertionError("exec must retain affiliation")
     call = function(main, "p11_return")
@@ -45,17 +52,34 @@ def hook_contract(main, identity):
 class RootAffiliationTests(unittest.TestCase):
     def test_production_hook_order(self):
         main = (ROOT / "crates/ebpf/src/main.rs").read_text()
-        identity = (ROOT / "crates/ebpf/native/image_identity.c").read_text()
+        identity = (ROOT / "crates/ebpf/native/image_identity_fork.c").read_text()
         hook_contract(main, identity)
-        mutants = [
-            main.replace("unsafe { p11_root_current_exit() };", ""),
-            main.replace("unsafe { p11_root_current_exit() };", "if false { unsafe { p11_root_current_exit() }; }"),
+        exit_body = function(main, "sched_process_exit")
+        root_start = exit_body.index('#[cfg(not(feature = "inventory-only"))]')
+        root_end = exit_body.index('};', root_start) + 2
+        root_block = exit_body[root_start:root_end]
+        owner = "unsafe { p11_owner_cleanup() };"
+        changed_exits = [
+            exit_body.replace(root_block, ""),
+            exit_body.replace(root_block, "if false { " + root_block + " }"),
+            exit_body.replace(owner, "if false { " + owner, 1)
+                     .replace(root_block, root_block + " }", 1),
+            exit_body.replace(root_block, root_block.replace('#[cfg(not(feature = "inventory-only"))]', "")),
+            exit_body.replace(root_block, root_block.replace('not(feature = "inventory-only")', 'feature = "inventory-only"')),
+            exit_body.replace(owner, "OWNER_SWAP", 1)
+                     .replace(root_block, owner, 1)
+                     .replace("OWNER_SWAP", root_block, 1),
+            exit_body[:-1] + " unsafe { p11_root_current_exit() }; }",
+        ]
+        mutants = [main.replace(exit_body, changed, 1) for changed in changed_exits]
+        mutants += [
             main.replace("pub fn sched_process_exec(_ctx: RawTracePointContext) -> u32 {",
                          "pub fn sched_process_exec(_ctx: RawTracePointContext) -> u32 { unsafe { p11_root_current_exit() };"),
             main.replace("pub fn p11_return(ctx: RetProbeContext) -> u32 {",
                          "pub fn p11_return(ctx: RetProbeContext) -> u32 { unsafe { p11_root_current_exit() };"),
         ]
         for mutant in mutants:
+            self.assertNotEqual(mutant, main, "mutation must change the tested source")
             with self.assertRaises((AssertionError, ValueError)):
                 hook_contract(mutant, identity)
 

@@ -71,6 +71,7 @@ fn main() {
     println!("cargo:rerun-if-changed=crates/ebpf/src");
     println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity.c");
     println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity.h");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity_fork.c");
     println!("cargo:rerun-if-changed=crates/ebpf/native/task_owner.c");
     println!("cargo:rerun-if-changed=crates/ebpf/native/task_owner.h");
     println!("cargo:rerun-if-changed=crates/ebpf/native/root_affiliation.c");
@@ -138,7 +139,12 @@ fn build_variant(
     let native_units: &[&str] = if inventory {
         &["task_owner"]
     } else {
-        &["image_identity", "task_owner", "root_affiliation"]
+        &[
+            "image_identity",
+            "image_identity_fork",
+            "task_owner",
+            "root_affiliation",
+        ]
     };
     let mut native_bitcodes = Vec::new();
     for unit in native_units {
@@ -166,7 +172,7 @@ fn build_variant(
             .arg(&bitcode);
         if inventory {
             compile.arg("-DP11SCOPE_INVENTORY_ONLY");
-        } else if small_state_maps && *unit != "image_identity" {
+        } else if small_state_maps && !matches!(*unit, "image_identity" | "image_identity_fork") {
             compile.arg("-DP11SCOPE_SMALL_STATE_MAPS");
         }
         let status = compile

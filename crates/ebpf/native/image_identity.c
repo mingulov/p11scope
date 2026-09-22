@@ -21,12 +21,6 @@ struct cookie_result {
     u32 status;
 };
 
-extern u32 p11_link_fork_allowed(void);
-extern u32 p11_root_propagate_thread(struct task_struct *child, u64 clone_flags);
-extern u32 p11_link_emit_fork(u32 child_tgid, u64 clone_flags,
-                              const struct image_identity *parent,
-                              const struct image_identity *child);
-
 static __always_inline struct control *get_control(void)
 {
     u32 key = 0;
@@ -141,6 +135,14 @@ static __always_inline u32 identity_for(struct task_struct *task,
     return COOKIE_STATUS_OK;
 }
 
+/* Inline across native units so typed task pointers stay in their root's
+ * verifier context. The allocator and identity read remain the same body. */
+__attribute__((always_inline)) u32 p11_link_task_identity(struct task_struct *task,
+                                                        struct image_identity *out)
+{
+    return identity_for(task, out);
+}
+
 __attribute__((noinline)) u32 p11_link_current_identity(struct image_identity *out)
 {
     if (!out)
@@ -153,43 +155,6 @@ __attribute__((noinline)) u32 p11_link_current_identity(struct image_identity *o
         return COOKIE_STATUS_BAD_TASK;
     leader = current->group_leader;
     return identity_for(leader, out);
-}
-
-SEC("tp_btf/task_newtask")
-int task_newtask(u64 *ctx)
-{
-    u64 clone_flags;
-    struct task_struct *current;
-    struct task_struct *leader;
-    struct task_struct *child;
-    struct image_identity parent_identity;
-    struct image_identity child_identity;
-    u32 child_tgid;
-
-    if (!ctx)
-        return 0;
-    clone_flags = ctx[1];
-    child = (struct task_struct *)(unsigned long)ctx[0];
-    (void)p11_root_propagate_thread(child, clone_flags);
-    if (clone_flags & CLONE_THREAD)
-        return 0;
-    if (!p11_link_fork_allowed())
-        return 0;
-
-    current = bpf_get_current_task_btf();
-    if (!current || !child)
-        return 0;
-
-    leader = current->group_leader;
-    if (child->tgid <= 0)
-        return 0;
-    child_tgid = (u32)child->tgid;
-    if (identity_for(leader, &parent_identity) != COOKIE_STATUS_OK ||
-        identity_for(child, &child_identity) != COOKIE_STATUS_OK)
-        return 0;
-
-    (void)p11_link_emit_fork(child_tgid, clone_flags, &parent_identity, &child_identity);
-    return 0;
 }
 
 char LICENSE[] SEC("license") = "GPL";

@@ -52,6 +52,9 @@ _Static_assert(__builtin_offsetof(struct control, unavailable) == 16, "unavailab
 _Static_assert(__builtin_offsetof(struct control, create_failures) == 24, "create offset");
 _Static_assert(__builtin_offsetof(struct control, retry_exhausted) == 32, "retry offset");
 
+/* Native-unit bridge; the definition is always inlined into its caller. */
+u32 p11_link_task_identity(struct task_struct *task, struct image_identity *out);
+
 static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)1;
 static u64 *(*bpf_task_storage_get)(void *map, struct task_struct *task,
                                  u64 *value, u64 flags) = (void *)156;

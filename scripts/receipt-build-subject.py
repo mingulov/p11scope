@@ -21,6 +21,13 @@ class MutationError(RuntimeError):
 _MAX_OFFSET = 2**63 - 1
 
 
+# Candidate-only API contract: run_reconciled_build returns frozen
+# production bytes. The "ProductionFreeze" return-annotation name is pinned
+# by tests/python/test_receipt_discovery_api.py, so keep this alias defined
+# (also satisfies ruff F821 for the string annotation).
+ProductionFreeze = bytes
+
+
 @_dataclasses.dataclass(slots=True, eq=False)
 class _OpenDescription:
     kind: str
@@ -1601,7 +1608,7 @@ def run_reconciled_build(
     stable_sysroot_root,
     nightly_sysroot_root,
     private_parent_fd: int,
-) -> bytes:
+) -> "ProductionFreeze":
     if (
         type(expected_ledger_fd) is not int
         or expected_ledger_fd < 0

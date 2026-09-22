@@ -6,9 +6,9 @@ the tests invoke scripts/system-scope-measure.py main() on synthetic inputs
 shaped exactly like the audit PoC (owned workload refused, foreign-only
 traffic observed, TRUTH = owned count) and require the coverage assertion
 to fail with the window invalid — foreign/unknown sums must never certify
-owned coverage. A healthy owned-attributed control proves the gate still
-opens for attributable traffic, and a zero-observed case pins the honest
-G1-style zeros.
+owned coverage. A healthy owned-attributed control proves coverage while
+keeping its unauthenticated temporal window unknown, and a zero-observed
+case pins the honest G1-style zeros.
 
 F6's regression (all proxy calls zeroed must not accept) lives in
 scripts/check-capture-evidence.py self_test(), next to the lane's other
@@ -158,9 +158,11 @@ class OwnedCoverageTests(unittest.TestCase):
         self.assertEqual(record["evidence"]["refused_modules"],
                          [{"path": "owned.so", "reason": "capacity"}])
 
-    def test_owned_attributed_coverage_still_validates(self):
+    def test_owned_attributed_coverage_does_not_supply_temporal_proof(self):
         # Healthy control with real identity shapes: owned calls cover
-        # truth while foreign unknown-name traffic is also present.
+        # truth while foreign unknown-name traffic is also present. This
+        # system fixture has no authenticated loop-end bound, so coverage
+        # remains separate from temporal window validity.
         owned = {"dev": [8, 1], "ino": 11, "sha256": "aa"}
         foreign = {"dev": [8, 1], "ino": 12, "sha256": "bb"}
         with tempfile.TemporaryDirectory() as raw:
@@ -188,7 +190,8 @@ class OwnedCoverageTests(unittest.TestCase):
         self.assertTrue(tvo["counts_match"])
         self.assertIn("owned-attributed coverage 7 vs truth 7",
                       tvo["match_note"])
-        self.assertTrue(record["window"]["window_valid"])
+        self.assertEqual(record["phases"]["burst_window_relation"], "unknown")
+        self.assertFalse(record["window"]["window_valid"])
 
     def test_foreign_calls_cannot_cover_without_owned_attribution(self):
         # Admission alone is not coverage: the owned module is admitted

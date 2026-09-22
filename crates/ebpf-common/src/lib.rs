@@ -4,6 +4,8 @@
 //! same bytes out of the same map.
 #![no_std]
 
+pub mod inventory_callers;
+
 pub use pkcs11_module::layout::LinuxLayout;
 
 /// Conventional x86 userspace code selectors accepted by the observer.

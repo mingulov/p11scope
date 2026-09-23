@@ -5206,10 +5206,10 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
                     stale.reason.label(),
                 );
             };
-            if pending_fallbacks.len() >= p11scope_ebpf_common::MAX_SLOTS as usize {
+            if pending_fallbacks.len() >= crate::manifest_input::MAX_OBJECTS {
                 bail!(
                     "more than {} stale manifest objects require fallback",
-                    p11scope_ebpf_common::MAX_SLOTS
+                    crate::manifest_input::MAX_OBJECTS
                 );
             }
             stale_ids.insert(stale.object);

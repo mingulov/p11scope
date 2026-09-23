@@ -2751,9 +2751,9 @@ mod tests {
             plan
         };
         assert!(ensure_capacity(&make(424)).is_ok());
-        let error = ensure_capacity(&make(513)).unwrap_err();
-        assert!(error.contains("requires 513"));
-        assert!(error.contains("only 512"));
+        let error = ensure_capacity(&make(MAX_SLOTS as usize + 1)).unwrap_err();
+        assert!(error.contains(&format!("requires {}", MAX_SLOTS + 1)));
+        assert!(error.contains(&format!("only {MAX_SLOTS}")));
         assert!(error.contains("refusing to attach a prefix"));
     }
 
@@ -2798,12 +2798,20 @@ mod tests {
         let p = build(&m);
         assert!(p.slots.is_empty(), "a prefix is never attached");
         assert!(p.modules.is_empty());
-        assert_eq!(p.entries_seen, 513, "decoded occurrences survive refusal");
+        assert_eq!(
+            p.entries_seen,
+            MAX_SLOTS as usize + 1,
+            "decoded occurrences survive refusal"
+        );
         assert_eq!(p.modules_skipped.len(), 1);
         assert_eq!(p.modules_skipped[0].subject, "/opt/p11.so");
         assert!(
-            p.modules_skipped[0].reason.contains("513")
-                && p.modules_skipped[0].reason.contains("512"),
+            p.modules_skipped[0]
+                .reason
+                .contains(&format!("{}", MAX_SLOTS + 1))
+                && p.modules_skipped[0]
+                    .reason
+                    .contains(&format!("{MAX_SLOTS}")),
             "{:?}",
             p.modules_skipped[0]
         );
@@ -2866,7 +2874,11 @@ mod tests {
             inode: 99,
         };
         let scanned = [
-            scanned_with(TEST_OBJECT, "/opt/p11.so", (0..513).map(|i| i * 8)),
+            scanned_with(
+                TEST_OBJECT,
+                "/opt/p11.so",
+                (0..MAX_SLOTS + 1).map(|i| u64::from(i) * 8),
+            ),
             scanned_with(later, "/opt/later.so", [0x9000, 0x9010]),
         ];
         let manifest = manifest_with(vec![resolved("C_Sign", 0)]);
@@ -2886,7 +2898,7 @@ mod tests {
         assert!(
             p.modules_skipped[0]
                 .reason
-                .contains("module needs 513 more")
+                .contains(&format!("module needs {} more", MAX_SLOTS + 1))
         );
         assert!(p.modules_skipped[0].reason.contains("0 are in use"));
     }
@@ -2901,7 +2913,11 @@ mod tests {
             scanned_with(TEST_OBJECT, "/opt/p11.so", [0, 8]),
             scanned_with(later, "/opt/later.so", [0x9000, 0x9010]),
         ];
-        let manifest = manifest_with((0..513).map(|i| resolved("C_Sign", i * 8)).collect());
+        let manifest = manifest_with(
+            (0..u64::from(MAX_SLOTS + 1))
+                .map(|i| resolved("C_Sign", i * 8))
+                .collect(),
+        );
 
         let p = build_from_test_sources(&scanned, std::slice::from_ref(&manifest));
         assert_eq!(
@@ -2926,7 +2942,7 @@ mod tests {
         assert!(
             p.modules_skipped[0]
                 .reason
-                .contains("module needs 513 more")
+                .contains(&format!("module needs {} more", MAX_SLOTS + 1))
         );
         assert!(p.modules_skipped[0].reason.contains("0 are in use"));
     }
@@ -2984,6 +3000,23 @@ mod tests {
         plan.modules = modules;
         plan.entries_seen = plan.slots.len();
         plan
+    }
+
+    #[cfg(feature = "wide-detailed-2112")]
+    #[test]
+    fn wide_detailed_admits_all_2112_exact_targets_and_refuses_2113_whole() {
+        let object = PinnedObjectId(7);
+        let slots: Vec<_> = (0..2_113)
+            .map(|index| exact_slot(index, object, u64::from(index) * 8, 0, vec![]))
+            .collect();
+        let admitted =
+            AttachPlan::from_slots_with_policy(slots[..2_112].to_vec(), AdmissionPolicy::Detailed)
+                .expect("all 2,112 distinct physical offsets must fit the wide profile");
+        assert_eq!(admitted.slots.len(), 2_112);
+        assert_eq!(admitted.slots[2_111].index, 2_111);
+        let error = AttachPlan::from_slots_with_policy(slots, AdmissionPolicy::Detailed)
+            .expect_err("2,113 endpoints must be refused before any attachment");
+        assert!(error.contains("2113") && error.contains("2112"), "{error}");
     }
 
     fn provisional_plan(object: PinnedObjectId) -> AttachPlan {
@@ -3104,7 +3137,7 @@ mod tests {
     #[test]
     fn selection_table_capacity_counts_pending_overlap_and_retired_allocations() {
         let object = PinnedObjectId(7);
-        let allocated_slots = (0..510)
+        let allocated_slots = (0..MAX_SLOTS - 2)
             .map(|index| exact_slot(index, object, u64::from(index) * 8, 0, vec![ModuleId(0)]))
             .collect();
         let allocated = exact_plan(allocated_slots, vec![exact_module(0, object)]);
@@ -3126,7 +3159,7 @@ mod tests {
         );
         let mut committed = allocated.clone();
         assert_eq!(committed.extend_exact(fits).unwrap().new.len(), 2);
-        assert_eq!(committed.slots.len(), 512);
+        assert_eq!(committed.slots.len(), MAX_SLOTS as usize);
 
         let mut overflows = exact_plan(vec![pending], vec![exact_module(0, object)]);
         let before = overflows.clone();
@@ -3143,7 +3176,10 @@ mod tests {
                 )
                 .is_err()
         );
-        assert_eq!(overflows, before, "pending 513-slot work leaves no prefix");
+        assert_eq!(
+            overflows, before,
+            "pending over-budget work leaves no prefix"
+        );
 
         let retired_key = 0x20000;
         let mut retired = exact_plan(
@@ -3375,7 +3411,7 @@ mod tests {
             })
             .unwrap_err();
 
-        assert!(error.contains("512"), "{error}");
+        assert!(error.contains(&MAX_SLOTS.to_string()), "{error}");
         assert!(plan.provisional_get_function_list.is_empty());
         assert_eq!(plan.slots.len(), MAX_SLOTS as usize);
     }
@@ -3788,13 +3824,13 @@ mod tests {
             inode: u64::from(old.0),
         };
         let mut plan = exact_plan(
-            (0..511)
+            (0..MAX_SLOTS - 1)
                 .map(|index| exact_slot(index, old, u64::from(index) * 8, 0, vec![ModuleId(0)]))
                 .collect(),
             vec![exact_module(0, old)],
         );
         plan.extend_exact(exact_plan(
-            (0..500)
+            (0..MAX_SLOTS - 12)
                 .map(|index| exact_slot(index, old, u64::from(index) * 8, 0, vec![ModuleId(0)]))
                 .collect(),
             vec![exact_module(0, old)],
@@ -3806,7 +3842,11 @@ mod tests {
         let pinned = PinnedObjects::empty();
         let rebuilt = plan.rebuild_from_sources(
             &[
-                scanned_with(old_key, "/opt/old.so", (0..500).map(|index| index * 8)),
+                scanned_with(
+                    old_key,
+                    "/opt/old.so",
+                    (0..MAX_SLOTS - 12).map(|index| u64::from(index) * 8),
+                ),
                 scanned_with(
                     ObjectKey {
                         device: Device { major: 8, minor: 1 },
@@ -3831,7 +3871,7 @@ mod tests {
         let delta = plan.extend_exact(rebuilt).unwrap();
 
         assert_eq!(delta.new.len(), 1);
-        assert_eq!(delta.new[0].index, 511);
+        assert_eq!(delta.new[0].index, MAX_SLOTS - 1);
         assert_eq!(delta.new[0].object, later);
         assert!(plan.slots.iter().all(|slot| slot.object != crossing));
         assert_eq!(
@@ -3851,7 +3891,7 @@ mod tests {
         let later = PinnedObjectId(12);
         let descriptor = crate::kinds::function_id("C_Sign").unwrap() + 1;
         let mut plan = exact_plan(
-            (0..511)
+            (0..MAX_SLOTS - 1)
                 .map(|index| {
                     exact_slot(
                         index,
@@ -3873,7 +3913,7 @@ mod tests {
                         inode: u64::from(existing.0),
                     },
                     "/opt/existing-crossing.so",
-                    [0, 0x1000, 0x1008],
+                    [0, u64::from(MAX_SLOTS) * 8, u64::from(MAX_SLOTS + 1) * 8],
                 ),
                 scanned_with(
                     ObjectKey {
@@ -3898,13 +3938,13 @@ mod tests {
 
         let delta = plan.extend_exact(rebuilt).unwrap();
 
-        assert_eq!(delta.retire.len(), 511);
+        assert_eq!(delta.retire.len(), MAX_SLOTS as usize - 1);
         assert!(delta.retire.iter().all(|slot| slot.object == existing));
-        assert!((0..511).all(|slot| !plan.is_active(slot)));
+        assert!((0..MAX_SLOTS - 1).all(|slot| !plan.is_active(slot)));
         assert_eq!(delta.new.len(), 1);
-        assert_eq!(delta.new[0].index, 511);
+        assert_eq!(delta.new[0].index, MAX_SLOTS - 1);
         assert_eq!(delta.new[0].object, later);
-        assert!(plan.is_active(511));
+        assert!(plan.is_active(MAX_SLOTS - 1));
     }
 
     #[test]
@@ -3913,7 +3953,7 @@ mod tests {
         let rejected = PinnedObjectId(2);
         let descriptor = crate::kinds::function_id("C_Sign").unwrap() + 1;
         let mut plan = exact_plan(
-            (0..511)
+            (0..MAX_SLOTS - 1)
                 .map(|index| {
                     exact_slot(
                         index,
@@ -4020,7 +4060,7 @@ mod tests {
 
         let error = plan.extend_exact(rebuilt).unwrap_err();
 
-        assert!(error.contains("512"), "{error}");
+        assert!(error.contains(&MAX_SLOTS.to_string()), "{error}");
         assert_eq!(
             plan, before,
             "capacity failure must leave no attached prefix"

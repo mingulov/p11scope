@@ -3239,9 +3239,10 @@ fn broad_stripped_build_adds_nothing_beyond_selected() {
 }
 
 /// Case 12 (Task 1.6): broad is fit-or-refuse-whole. Six validated
-/// heuristic tables x 100 distinct targets exceed the 512 slot ceiling:
-/// selected admission takes the strongest-evidence prefix (4 tables) and
-/// spills 2; broad refuses the module whole with zero spill — a prefix
+/// heuristic tables exceed the selected profile's slot ceiling (100 targets
+/// each at 512, 400 each at 2112): selected admission takes the
+/// strongest-evidence prefix (4 tables) and spills 2; broad refuses the
+/// module whole with zero spill — a prefix
 /// would break the dormant-activation promise without forcing PARTIAL.
 #[test]
 fn broad_refuses_whole_when_validated_set_exceeds_budget() {
@@ -3256,16 +3257,25 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
         inode: 42,
     };
     let object = PinnedObjectId(7);
+    let per_table = if cfg!(feature = "wide-detailed-2112") {
+        400u32
+    } else {
+        100u32
+    };
+    assert!(
+        4 * per_table <= p11scope_ebpf_common::MAX_SLOTS
+            && 6 * per_table > p11scope_ebpf_common::MAX_SLOTS
+    );
     let tables: Vec<ScannedTable> = (0..6u32)
         .map(|table| ScannedTable {
             version: (3, 2),
             walk: "full",
-            entries: (0..100u32)
+            entries: (0..per_table)
                 .map(|entry| ScannedEntry {
                     name: "C_Sign",
                     object: key,
                     object_path: "/pool.so".into(),
-                    file_offset: u64::from(table * 100 + entry),
+                    file_offset: u64::from(table * per_table + entry),
                 })
                 .collect(),
             null_entries: vec![],
@@ -3288,7 +3298,7 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
             interfaces: vec![],
         },
         object,
-        entry_objects: vec![vec![object; 100]; 6],
+        entry_objects: vec![vec![object; per_table as usize]; 6],
     };
     let mut selected_counters = DiscoveryCounters::default();
     let selected = build_current_plan(
@@ -3302,7 +3312,7 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
         false,
     )
     .expect("selected plan builds");
-    assert_eq!(selected.slots.len(), 400);
+    assert_eq!(selected.slots.len(), (4 * per_table) as usize);
     assert_eq!(selected.uncorroborated_candidates, 2);
     assert!(selected.modules_skipped.is_empty());
 

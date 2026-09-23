@@ -6,6 +6,7 @@ license = "GPL-2.0-only"
 publish = false
 
 [features]
+wide-detailed-2112 = ["p11scope-ebpf-common/wide-detailed-2112"]
 inventory-only = []
 inventory-callers = ["inventory-only"]
 small-ring = ["p11scope-ebpf-common/small-ring"]

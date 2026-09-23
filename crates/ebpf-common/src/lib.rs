@@ -83,8 +83,12 @@ pub fn target_stack_arg_address(stack_pointer: u64, index: u8, layout: LinuxLayo
 
 /// Attach slots. One slot per unique {object, file_offset} target, not
 /// per function name — aliased names share a slot by construction.
-/// 512 covers the 104-entry 3.2 table several times over.
+/// The wide build is an explicit, finite Detailed qualification envelope.
+/// Inventory selects its own checked pre-load endpoint capacity.
+#[cfg(not(feature = "wide-detailed-2112"))]
 pub const MAX_SLOTS: u32 = 512;
+#[cfg(feature = "wide-detailed-2112")]
+pub const MAX_SLOTS: u32 = 2_112;
 
 /// Experimental slot-count candidate for the Package G (E11) dense/sparse
 /// storage comparison. This is NEVER a sufficiency claim and NEVER gates
@@ -95,7 +99,7 @@ pub const EXPERIMENTAL_SLOT_CANDIDATE: u32 = 8_192;
 /// Native task-owner slot bound shared with `native/task_owner.c`. The
 /// lookup checks, start-count bound and exec/exit cleanup loop all pin this
 /// literal; they move together or not at all.
-pub const NATIVE_OWNER_SLOT_BOUND: u32 = 512;
+pub const NATIVE_OWNER_SLOT_BOUND: u32 = MAX_SLOTS;
 
 /// Fixed static policy descriptors: count-only plus the 104 canonical
 /// PKCS#11 function-table entries.
@@ -875,8 +879,10 @@ pub const EVIDENCE_CELLS: u32 = 9;
 pub const START_ENTRIES: u32 = 16_384;
 #[cfg(feature = "small-state-maps")]
 pub const START_ENTRIES: u32 = 1;
-#[cfg(not(feature = "small-state-maps"))]
+#[cfg(all(not(feature = "small-state-maps"), not(feature = "wide-detailed-2112")))]
 pub const RV_ENTRIES: u32 = 4_096;
+#[cfg(all(not(feature = "small-state-maps"), feature = "wide-detailed-2112"))]
+pub const RV_ENTRIES: u32 = 8_192;
 #[cfg(feature = "small-state-maps")]
 pub const RV_ENTRIES: u32 = 1;
 
@@ -1457,7 +1463,14 @@ mod tests {
 
     #[test]
     fn slot_semantics_is_a_padding_free_map_value() {
-        assert_eq!(MAX_SLOTS, 512);
+        assert_eq!(
+            MAX_SLOTS,
+            if cfg!(feature = "wide-detailed-2112") {
+                2_112
+            } else {
+                512
+            }
+        );
         assert_eq!(core::mem::size_of::<SlotSemantics>(), 18);
         assert_eq!(core::mem::align_of::<SlotSemantics>(), 2);
         assert_eq!(ARG_NONE, u8::MAX);
@@ -1465,7 +1478,14 @@ mod tests {
 
     #[test]
     fn package_g_capacity_bounds_share_one_native_slot_literal() {
-        assert_eq!(MAX_SLOTS, 512);
+        assert_eq!(
+            MAX_SLOTS,
+            if cfg!(feature = "wide-detailed-2112") {
+                2_112
+            } else {
+                512
+            }
+        );
         assert_eq!(NATIVE_OWNER_SLOT_BOUND, MAX_SLOTS);
         assert_eq!(EXPERIMENTAL_SLOT_CANDIDATE, 8_192);
         assert_ne!(EXPERIMENTAL_SLOT_CANDIDATE, MAX_SLOTS);
@@ -1714,7 +1734,17 @@ mod tests {
     #[test]
     fn induced_gap_capacities_are_explicit() {
         #[cfg(not(feature = "small-state-maps"))]
-        assert_eq!((START_ENTRIES, RV_ENTRIES), (16_384, 4_096));
+        assert_eq!(
+            (START_ENTRIES, RV_ENTRIES),
+            (
+                16_384,
+                if cfg!(feature = "wide-detailed-2112") {
+                    8_192
+                } else {
+                    4_096
+                }
+            ),
+        );
         #[cfg(feature = "small-ring")]
         assert_eq!(RING_BYTES, 4_096);
         #[cfg(feature = "small-state-maps")]

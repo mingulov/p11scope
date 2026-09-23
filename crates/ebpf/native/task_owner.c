@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* Package G capacity contract: the 512 slot literal below is
- * NATIVE_OWNER_SLOT_BOUND == MAX_SLOTS. The lookup checks
+/* Package G capacity contract: P11SCOPE_OWNER_SLOT_BOUND is
+ * NATIVE_OWNER_SLOT_BOUND == MAX_SLOTS in the selected Detailed object. The lookup checks
  * (p11_owner_start_get/remove), the start-count bound (valid_owner,
  * p11_owner_start_insert) and the exec/exit cleanup loop (p11_owner_cleanup)
  * pin the same value; update them together or not at all. The
@@ -114,7 +114,7 @@ static __always_inline int valid_owner(struct owner_control *ctl, struct thread_
 #ifdef P11SCOPE_INVENTORY_ONLY
         owner->start_count != 0 ||
 #else
-        owner->start_count > 512 ||
+        owner->start_count > P11SCOPE_OWNER_SLOT_BOUND ||
 #endif
         (owner->selection_domains & ~owner->occupied)) {
         poison(ctl, OWNER_BAD_RECORD);
@@ -186,7 +186,7 @@ static __always_inline int release_empty(struct owner_control *ctl, struct threa
 static __always_inline int start_key_valid(struct thread_owner *owner,
                                           const struct owner_start_key *key)
 {
-    return key && key->slot < 512 && !key->pad &&
+    return key && key->slot < P11SCOPE_OWNER_SLOT_BOUND && !key->pad &&
         key->pid_tgid == owner->original_pid_tgid;
 }
 
@@ -207,7 +207,7 @@ static __always_inline struct thread_owner *peek_absent_owner(struct owner_contr
 __attribute__((noinline)) void *p11_owner_start_get(const struct owner_start_key *key, u32 required)
 {
     struct owner_control *ctl = control();
-    if (!healthy(ctl) || !key || key->slot >= 512 || key->pad)
+    if (!healthy(ctl) || !key || key->slot >= P11SCOPE_OWNER_SLOT_BOUND || key->pad)
         return (void *)0;
     if (!required && !owner_map_lookup(&START, key)) {
         /* START count cannot identify which particular absent slot is owed. */
@@ -250,7 +250,7 @@ static __always_inline long remove_start(struct owner_control *ctl, struct threa
 __attribute__((noinline)) long p11_owner_start_remove(const struct owner_start_key *key, u32 required)
 {
     struct owner_control *ctl = control();
-    if (!healthy(ctl) || !key || key->slot >= 512 || key->pad)
+    if (!healthy(ctl) || !key || key->slot >= P11SCOPE_OWNER_SLOT_BOUND || key->pad)
         return -1;
     if (!required && !owner_map_lookup(&START, key)) {
         peek_absent_owner(ctl);
@@ -282,7 +282,7 @@ __attribute__((noinline)) long p11_owner_start_insert(const struct owner_start_k
         release_empty(ctl, owner);
         return -1;
     }
-    if (owner->start_count >= 512) {
+    if (owner->start_count >= P11SCOPE_OWNER_SLOT_BOUND) {
         /* At the slot bound a nested entry still invalidates its own old
          * invocation. Do not leave it available for an ambiguous return. */
         count(&ctl->admission_failures);
@@ -486,7 +486,7 @@ __attribute__((noinline)) void p11_owner_cleanup(void)
         return;
 #ifndef P11SCOPE_INVENTORY_ONLY
     struct owner_start_key start = { .pid_tgid = owner->original_pid_tgid, .slot = 0, .pad = 0 };
-    for (u32 i = 0; i < 512; i++) {
+    for (u32 i = 0; i < P11SCOPE_OWNER_SLOT_BOUND; i++) {
         start.slot = i;
         if (owner_map_lookup(&START, &start)) {
             if (remove_start(ctl, owner, &start))

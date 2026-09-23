@@ -14,6 +14,7 @@ path = "src/lib.rs"
 
 [features]
 unsafe-unvalidated-metadata = []
+wide-detailed-2112 = ["p11scope-ebpf-common/wide-detailed-2112"]
 # Internal-only diagnostic: attribute every published discovery skip to the
 # site that raised it. Stderr only; the capture document is byte-identical
 # either way (src/discovery/attribution.rs).
@@ -38,6 +39,9 @@ aya-obj = "=0.3.0"
 p11scope-discover = { version = "0.0.0", path = "crates/discover" }
 sha2 = "=0.11.0"
 tempfile = "3"
+
+[build-dependencies]
+sha2 = "=0.11.0"
 
 [workspace]
 members = ["crates/discover", "crates/manifest", "crates/ebpf-common", "crates/bpf-multi"]

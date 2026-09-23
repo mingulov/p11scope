@@ -109,7 +109,7 @@ fn storage_comparison_covers_tiers_and_residency_without_sufficiency_claim() {
     // RV keeps its own key budget, independent of the slot budget.
     let rv = StorageModel::rv_key_budget();
     assert_eq!(rv, u64::from(RV_ENTRIES));
-    assert!(rv < u64::from(experimental_candidate_slots()));
+    assert!(rv >= 2 * u64::from(MAX_SLOTS));
 }
 
 // Checkbox 3: first-touch initialization/relookup under concurrency.
@@ -147,10 +147,11 @@ fn native_slot_checks_counts_and_cleanup_share_one_bound() {
     let source = std::fs::read_to_string("crates/ebpf/native/task_owner.c")
         .expect("native task_owner.c must be readable");
     for site in [
-        "key->slot < 512",
-        "key->slot >= 512",
-        "owner->start_count >= 512",
-        "owner->start_count > 512",
+        "key->slot < P11SCOPE_OWNER_SLOT_BOUND",
+        "key->slot >= P11SCOPE_OWNER_SLOT_BOUND",
+        "owner->start_count >= P11SCOPE_OWNER_SLOT_BOUND",
+        "owner->start_count > P11SCOPE_OWNER_SLOT_BOUND",
+        "i < P11SCOPE_OWNER_SLOT_BOUND",
         "start.slot = i",
     ] {
         assert!(
@@ -159,7 +160,10 @@ fn native_slot_checks_counts_and_cleanup_share_one_bound() {
         );
     }
     assert!(
-        source.matches("key->slot >= 512").count() >= 2,
+        source
+            .matches("key->slot >= P11SCOPE_OWNER_SLOT_BOUND")
+            .count()
+            == 2,
         "both native lookup and removal paths check the same slot bound"
     );
 }
@@ -212,12 +216,18 @@ fn attach_program_load_teardown_and_links_are_accounted_separately() {
 #[test]
 fn admission_envelope_publishes_limits_and_qualification_state() {
     let envelope = admission_envelope();
-    assert!(envelope.contains("stats_slots=512"), "envelope: {envelope}");
+    assert!(
+        envelope.contains(&format!("stats_slots={MAX_SLOTS}")),
+        "envelope: {envelope}"
+    );
     assert!(
         envelope.contains("start_inflight=16384"),
         "envelope: {envelope}"
     );
-    assert!(envelope.contains("rv_keys=4096"), "envelope: {envelope}");
+    assert!(
+        envelope.contains(&format!("rv_keys={RV_ENTRIES}")),
+        "envelope: {envelope}"
+    );
     assert!(
         envelope.contains("broader_admission=unqualified"),
         "envelope: {envelope}"

@@ -11,7 +11,7 @@ use std::path::Path;
 
 pub const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_TOTAL_OBJECT_BYTES: u64 = 512 * 1024 * 1024;
-const MAX_OBJECTS: usize = p11scope_ebpf_common::MAX_SLOTS as usize;
+pub(crate) const MAX_OBJECTS: usize = 512;
 const MAX_SURFACES: usize = 257; // legacy + the shared acquisition cap
 const MAX_FUNCTIONS: usize = 32_768;
 const MAX_PATH_BYTES: usize = 4096;
@@ -652,7 +652,7 @@ pub fn validate_structure(m: &Manifest) -> Vec<String> {
             m.vendor_interfaces.len()
         ));
     }
-    if m.alias_groups.len() > p11scope_ebpf_common::MAX_SLOTS as usize {
+    if m.alias_groups.len() > MAX_OBJECTS {
         problems.push(format!(
             "manifest has too many alias groups: {}",
             m.alias_groups.len()

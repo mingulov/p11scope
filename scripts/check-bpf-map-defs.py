@@ -1306,6 +1306,13 @@ SAFE_MAPS = {
 UNSAFE_MAPS = SAFE_MAPS | {
     "ATTR_BOOL_BITS": map_def(1, 4, 4, 16, 128),
 }
+WIDE_MAPS = SAFE_MAPS | {
+    "STATS": map_def(6, 4, 296, 2_112),
+    "RV_COUNTS": map_def(5, 16, 8, 8_192),
+}
+WIDE_UNSAFE_MAPS = WIDE_MAPS | {
+    "ATTR_BOOL_BITS": map_def(1, 4, 4, 16, 128),
+}
 SAFE_PROGRAMS = {
     "p11_entry",
     "p11_return",
@@ -1359,6 +1366,8 @@ FROZEN_INVENTORY = {
     "inventory-callers-small-discovery": (INVENTORY_CALLER_MAPS | {"DISCOVERY": map_def(27, 0, 0, 4096)}, INVENTORY_PROGRAMS),
     "default": (SAFE_MAPS, SAFE_PROGRAMS),
     "diagnostic": (UNSAFE_MAPS, UNSAFE_PROGRAMS),
+    "wide-default": (WIDE_MAPS, SAFE_PROGRAMS),
+    "wide-diagnostic": (WIDE_UNSAFE_MAPS, UNSAFE_PROGRAMS),
 }
 
 
@@ -1374,6 +1383,8 @@ FROZEN_SYMBOLS = {
     "inventory-callers-small-discovery": (False, False, 0, 0, 0),
     "default": (False, False, 0, 0, 0),
     "diagnostic": (True, True, 2, 2, 2),
+    "wide-default": (False, False, 0, 0, 0),
+    "wide-diagnostic": (True, True, 2, 2, 2),
 }
 
 
@@ -1448,6 +1459,8 @@ def self_test():
     assert SAFE_MAPS["EVIDENCE"] == map_def(6, 4, 8, 9)
     assert len(SAFE_MAPS) == 22
     assert len(UNSAFE_MAPS) == 23
+    assert len(WIDE_MAPS) == 22
+    assert len(WIDE_UNSAFE_MAPS) == 23
     assert len(SAFE_PROGRAMS) == 13
     assert len(UNSAFE_PROGRAMS) == 18
     good = (SAFE_MAPS, SAFE_PROGRAMS, {"p11_entry"} | REQUIRED_GLOBAL_HELPERS)
@@ -1466,6 +1479,8 @@ def self_test():
         } | REQUIRED_GLOBAL_HELPERS,
     )
     validate_policy_inventory(good, diagnostic)
+    validate_inventory("wide-default", WIDE_MAPS, SAFE_PROGRAMS, good[2])
+    validate_inventory("wide-diagnostic", WIDE_UNSAFE_MAPS, UNSAFE_PROGRAMS, diagnostic[2])
 
     def rejected(check, *arguments):
         if check is validate_inventory:
@@ -1485,6 +1500,10 @@ def self_test():
     # Each variant is compared against ITS OWN freeze, not the other one's.
     assert rejected(validate_inventory, "diagnostic", SAFE_MAPS, SAFE_PROGRAMS, set()) == [
         "map removed: ATTR_BOOL_BITS"
+    ]
+    assert rejected(validate_inventory, "wide-default", SAFE_MAPS, SAFE_PROGRAMS, set()) == [
+        "RV_COUNTS.max_entries: object=4096 frozen=8192",
+        "STATS.max_entries: object=512 frozen=2112",
     ]
     assert rejected(validate_inventory, "default", UNSAFE_MAPS, UNSAFE_PROGRAMS, set()) == [
         "map added: ATTR_BOOL_BITS"
@@ -1590,7 +1609,7 @@ def usage():
     return (
         f"usage: {sys.argv[0]} BPF_ELF MAP=MAX_ENTRIES [...] | "
         "--inventory VARIANT BPF_ELF (default, diagnostic, inventory[-small-discovery], "
-        "inventory-callers[-small-discovery]) | "
+        "inventory-callers[-small-discovery], wide-default, wide-diagnostic) | "
         "--policy-inventory DEFAULT_ELF DIAGNOSTIC_ELF | --json BPF_ELF | --self-test"
     )
 

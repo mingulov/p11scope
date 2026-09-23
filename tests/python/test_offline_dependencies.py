@@ -225,10 +225,8 @@ class OfflineFixture:
             ["git", "bundle", "create", str(self.shared / "source.bundle"), "HEAD"],
             cwd=REPOSITORY, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
-        (self.shared / "LICENSE").write_text("fixture GPL-3.0 license\n", encoding="utf-8")
-        (self.shared / "LICENSES").mkdir()
-        (self.shared / "LICENSES/GPL-2.0-only.txt").write_text(
-            "fixture GPL-2.0 license\n", encoding="utf-8")
+        (self.shared / "LICENSE-APACHE").write_text("fixture Apache license\n", encoding="utf-8")
+        (self.shared / "LICENSE-MIT").write_text("fixture MIT license\n", encoding="utf-8")
 
         self.vendor_template = temporary / "Cargo vendor result"
         self.vendor_template.mkdir()
@@ -384,8 +382,14 @@ class OfflineFixture:
 class OfflineDependenciesTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
-        self.fixture = OfflineFixture(Path(self.temporary.name))
-        self.fixture.testcase = self
+        self._fixture = None
+
+    @property
+    def fixture(self):
+        if self._fixture is None:
+            self._fixture = OfflineFixture(Path(self.temporary.name))
+            self._fixture.testcase = self
+        return self._fixture
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -395,6 +399,26 @@ class OfflineDependenciesTests(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         for needle in needles:
             self.assertIn(needle, result.stderr)
+
+    def test_maintained_recipe_matches_repository_inputs_and_both_shared_lock_identities(self):
+        helper = load_module(HELPER, "maintained_offline_dependency_recipe")
+        preparer = load_module(PREPARER, "maintained_offline_dependency_preparer")
+        manifest = helper._strict_manifest(REPOSITORY, preparer)
+        recipe = helper._read_json(REPOSITORY / "third-party/offline-dependencies.json", "fixed recipe")
+        with self.subTest(input="maintained recipe schema"):
+            try:
+                helper._validate_recipe(recipe, manifest, preparer, REPOSITORY)
+            except helper.OfflineDependencyError as error:
+                self.fail(str(error))
+        with self.subTest(input="maintained workspace and preparation bytes"):
+            try:
+                helper.check_fixed_recipe_inputs(REPOSITORY, recipe, manifest, preparer)
+            except helper.OfflineDependencyError as error:
+                self.fail(str(error))
+        for relative in ("Cargo.lock", "crates/ebpf/Cargo.lock"):
+            with self.subTest(input=relative):
+                shared, _ = helper._locked_dependencies([REPOSITORY / relative])
+                self.assertEqual(recipe["shared_git"], shared)
 
     def test_assemble_runs_fixed_offline_resolver_and_produces_complete_payload(self):
         self.fixture.assemble()
@@ -425,6 +449,16 @@ class OfflineDependenciesTests(unittest.TestCase):
         self.assertEqual(set(path.name for path in (self.fixture.output / "archives").iterdir()),
                          {"demo-1.0.0.crate"})
         self.assertTrue((self.fixture.output / "provenance/shared/source.bundle").is_file())
+        shared = self.fixture.output / "provenance/shared"
+        self.assertEqual({path.name for path in shared.iterdir()},
+                         {"source.bundle", "LICENSE-APACHE", "LICENSE-MIT", "packages.json"})
+        self.assertEqual((shared / "LICENSE-APACHE").read_bytes(), b"fixture Apache license\n")
+        self.assertEqual((shared / "LICENSE-MIT").read_bytes(), b"fixture MIT license\n")
+        provenance = json.loads((shared / "packages.json").read_text(encoding="utf-8"))
+        self.assertEqual(provenance["licenses"], {
+            "LICENSE-APACHE": digest(b"fixture Apache license\n"),
+            "LICENSE-MIT": digest(b"fixture MIT license\n"),
+        })
         self.assertTrue((self.fixture.output / "provenance/nightly/sysroot-Cargo.toml").is_file())
         recipe = json.loads(self.fixture.candidate.read_text())
         self.assertEqual(set(recipe), {"schema_version", "workspaces", "preparation", "nightly",
@@ -433,6 +467,75 @@ class OfflineDependenciesTests(unittest.TestCase):
         self.assertNotIn(str(self.fixture.root), self.fixture.candidate.read_text())
         for suffix in ("command.json", "tools.json", "inputs.json", "outcome.json"):
             self.assertTrue(Path(f"{self.fixture.prefix}.assemble.{suffix}").is_file())
+
+    def test_assemble_refuses_missing_or_obsolete_shared_license_entries(self):
+        for name in ("LICENSE-APACHE", "LICENSE-MIT"):
+            with self.subTest(missing=name):
+                path = self.fixture.shared / name
+                original = path.read_bytes()
+                path.unlink()
+                try:
+                    self.assert_refused(self.fixture.run("assemble"), "shared source entries mismatch")
+                    self.assertFalse(self.fixture.output.exists())
+                    self.assertFalse(self.fixture.candidate.exists())
+                finally:
+                    path.write_bytes(original)
+        for name in ("LICENSE", "LICENSES"):
+            with self.subTest(obsolete=name):
+                path = self.fixture.shared / name
+                if name == "LICENSES":
+                    path.mkdir()
+                    (path / "GPL-2.0-only.txt").write_text("obsolete GPL license\n", encoding="utf-8")
+                else:
+                    path.write_text("obsolete GPL license\n", encoding="utf-8")
+                try:
+                    self.assert_refused(self.fixture.run("assemble"), "shared source entries mismatch")
+                    self.assertFalse(self.fixture.output.exists())
+                    self.assertFalse(self.fixture.candidate.exists())
+                finally:
+                    if path.is_dir():
+                        shutil.rmtree(path)
+                    else:
+                        path.unlink()
+
+    def test_verify_refuses_tampering_with_either_delivered_shared_license(self):
+        self.fixture.assemble()
+        self.fixture.approve()
+        for name in ("LICENSE-APACHE", "LICENSE-MIT"):
+            with self.subTest(license=name):
+                path = self.fixture.output / "provenance/shared" / name
+                original = path.read_bytes()
+                path.write_bytes(original + b"tampered license\n")
+                prefix = self.fixture.prefix.parent / f"tampered {name}"
+                try:
+                    result = self.fixture.run("verify", prefix=prefix)
+                    self.assert_refused(result, "shared package provenance mismatch")
+                    self.assertFalse(Path(f"{prefix}.verify.outcome.json").exists())
+                    self.assertFalse(Path(f"{prefix}.verify.receipt.json").exists())
+                finally:
+                    path.write_bytes(original)
+
+    def test_verify_requires_exact_shared_license_digest_keys(self):
+        self.fixture.assemble()
+        self.fixture.approve()
+        path = self.fixture.output / "provenance/shared/packages.json"
+        original = path.read_text(encoding="utf-8")
+        for name in ("LICENSE-APACHE", "LICENSE-MIT", "LICENSE", "LICENSES/GPL-2.0-only.txt"):
+            with self.subTest(digest_key=name):
+                provenance = json.loads(original)
+                if name in ("LICENSE-APACHE", "LICENSE-MIT"):
+                    del provenance["licenses"][name]
+                else:
+                    provenance["licenses"][name] = "0" * 64
+                path.write_text(json.dumps(provenance) + "\n", encoding="utf-8")
+                prefix = self.fixture.prefix.parent / f"license digest {name.replace('/', '-')}"
+                try:
+                    result = self.fixture.run("verify", prefix=prefix)
+                    self.assert_refused(result, "shared package provenance mismatch")
+                    self.assertFalse(Path(f"{prefix}.verify.outcome.json").exists())
+                    self.assertFalse(Path(f"{prefix}.verify.receipt.json").exists())
+                finally:
+                    path.write_text(original, encoding="utf-8")
 
     def test_assemble_refuses_unrecognized_cargo_checksum_schema(self):
         mutations = (
@@ -730,9 +833,18 @@ class OfflineDependenciesTests(unittest.TestCase):
         pristine = Path(self.temporary.name) / "pristine"
         shutil.copytree(self.fixture.output, pristine)
         mutations = (
-            ("missing license", lambda p: (p / "provenance/shared/LICENSE").unlink(), "missing payload entry"),
-            ("missing nested license", lambda p: (p / "provenance/shared/LICENSES/GPL-2.0-only.txt").unlink(),
+            ("missing Apache license", lambda p: (p / "provenance/shared/LICENSE-APACHE").unlink(),
              "missing payload entry"),
+            ("missing MIT license", lambda p: (p / "provenance/shared/LICENSE-MIT").unlink(),
+             "missing payload entry"),
+            ("obsolete GPL license", lambda p: (
+                (p / "provenance/shared/LICENSE").write_text("obsolete\n"),
+                (p / "provenance/shared/LICENSE").chmod(0o644)),
+             "unexpected payload entry"),
+            ("obsolete GPL license directory", lambda p: (
+                (p / "provenance/shared/LICENSES").mkdir(),
+                (p / "provenance/shared/LICENSES").chmod(0o755)),
+             "unexpected payload entry"),
             ("missing archive", lambda p: (p / "archives/demo-1.0.0.crate").unlink(), "archive set mismatch"),
             ("extra entry", lambda p: ((p / "extra").write_text("extra"), (p / "extra").chmod(0o644)),
              "unexpected payload entry"),

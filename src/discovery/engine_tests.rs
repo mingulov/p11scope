@@ -1654,7 +1654,10 @@ fn capture_facts_keep_all_decoded_occurrences_for_a_capacity_refusal() {
 
     engine.publish_current_capture_facts().unwrap();
 
-    assert_eq!(engine.plan.entries_seen, 513);
+    assert_eq!(
+        engine.plan.entries_seen,
+        p11scope_ebpf_common::MAX_SLOTS as usize + 1
+    );
     assert!(engine.plan.slots.is_empty());
     assert_eq!(engine.plan.modules_skipped.len(), 1);
     assert!(engine.discovery.modules.is_empty());
@@ -1664,7 +1667,10 @@ fn capture_facts_keep_all_decoded_occurrences_for_a_capacity_refusal() {
     engine.pinned = PinnedObjects::empty();
     engine.modules.clear();
     engine.publish_current_capture_facts().unwrap();
-    assert_eq!(engine.plan.entries_seen, 513);
+    assert_eq!(
+        engine.plan.entries_seen,
+        p11scope_ebpf_common::MAX_SLOTS as usize + 1
+    );
     assert_eq!(engine.discovery.modules_skipped.len(), 1);
 }
 
@@ -1717,7 +1723,10 @@ fn capture_facts_keep_a_manifest_only_capacity_refusal() {
 
     engine.publish_current_capture_facts().unwrap();
 
-    assert_eq!(engine.plan.entries_seen, 514);
+    assert_eq!(
+        engine.plan.entries_seen,
+        p11scope_ebpf_common::MAX_SLOTS as usize + 2
+    );
     assert_eq!(engine.plan.slots.len(), 1);
     assert_eq!(engine.plan.modules_skipped.len(), 1);
     assert_eq!(engine.discovery.modules_skipped.len(), 1);
@@ -19138,12 +19147,18 @@ fn p11kit_like_64_table_module() -> ScannedModule {
 }
 
 /// Task 1.2 resource-bound test: ordered admission with a per-object cap.
-/// The 64-table replica must NOT refuse the module: the 4 strongest-evidence
-/// tables (the linked one first, bypassing the heuristic cap) become 416
-/// slots under the global resource bound, and the 60-table heuristic spill
-/// becomes `uncorroborated_candidates` evidence, never slots.
+/// The 64-table replica must NOT refuse the module. The linked table bypasses
+/// the independent K=4 heuristic cap; the global slot bound admits three
+/// heuristic tables at 512 or all four at 2112. Every spill stays explicit.
 #[test]
 fn ordered_admission_resource_bound_caps_heuristic_tables_per_object() {
+    let admitted_heuristics = if cfg!(feature = "wide-detailed-2112") {
+        4u64
+    } else {
+        3u64
+    };
+    let expected_slots = ((admitted_heuristics + 1) * 104) as usize;
+    let expected_spill = 63 - admitted_heuristics;
     let raw = p11kit_like_64_table_module();
     let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1)]);
     let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&raw), &mut pins);
@@ -19157,12 +19172,12 @@ fn ordered_admission_resource_bound_caps_heuristic_tables_per_object() {
     );
     assert_eq!(
         plan.slots.len(),
-        416,
-        "4 admitted tables x 104 entries become slots under the resource bound"
+        expected_slots,
+        "linked plus admitted heuristic tables become slots under the selected resource bound"
     );
     assert_eq!(
-        plan.uncorroborated_candidates, 60,
-        "the 60-table resource-bound spill is counted, never slotted"
+        plan.uncorroborated_candidates, expected_spill,
+        "resource-bound spill is counted, never slotted"
     );
     assert_eq!(
         plan.entries_seen, 6656,
@@ -19170,14 +19185,14 @@ fn ordered_admission_resource_bound_caps_heuristic_tables_per_object() {
     );
 
     // Evidence order, not discovery order: the linked table (index 63,
-    // decoded last) is admitted via the published bypass, the first three
-    // unlinked tables fill the resource bound, and tables 3..63 spill.
+    // decoded last) is admitted via the published bypass; the unlinked
+    // tables fill the selected bound and the remainder spills.
     let attached: BTreeSet<u64> = plan.slots.iter().map(|slot| slot.file_offset).collect();
     for table in 0..64u64 {
         let first_entry = 0x10000 + table * 104 * 8;
         assert_eq!(
             attached.contains(&first_entry),
-            table < 3 || table == 63,
+            table < admitted_heuristics || table == 63,
             "table {table} admission follows evidence order under the resource bound"
         );
     }
@@ -19196,24 +19211,29 @@ fn ordered_admission_resource_bound_caps_heuristic_tables_per_object() {
     assert_eq!(engine.discovery.modules.len(), 1);
     assert!(engine.discovery.modules_skipped.is_empty());
     assert_eq!(
-        engine.discovery.uncorroborated_candidates, 60,
+        engine.discovery.uncorroborated_candidates, expected_spill,
         "published evidence carries the resource-bound spill count"
     );
 }
 
-/// Task 1.3 mislabel guard on the 64-table replica: the three admitted
+/// Task 1.3 mislabel guard on the 64-table replica: every admitted
 /// unlinked tables' slots are named `unknown` — never the ordinal PKCS#11
 /// labels — while the linked table keeps its names. Every table carries
 /// (file_offset, entry count, linkage kind) into published evidence.
 #[test]
 fn admitted_heuristic_tables_are_unknown_with_provenance() {
+    let admitted_heuristics = if cfg!(feature = "wide-detailed-2112") {
+        4u64
+    } else {
+        3u64
+    };
     let raw = p11kit_like_64_table_module();
     let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1)]);
     let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&raw), &mut pins);
     assert!(skipped.is_empty(), "{skipped:?}");
     let plan = plan::build_from_reconciled_modules(&modules);
 
-    // All 312 slots of the three admitted unlinked tables, not just the
+    // All admitted unlinked slots, not just the
     // first entries: no ordinal label may survive on an unlinked table.
     let unknown: BTreeSet<u64> = plan
         .slots
@@ -19221,7 +19241,7 @@ fn admitted_heuristic_tables_are_unknown_with_provenance() {
         .filter(|slot| slot.names == ["unknown"])
         .map(|slot| slot.file_offset)
         .collect();
-    for table in [0u64, 1, 2] {
+    for table in 0..admitted_heuristics {
         for entry in 0..104u64 {
             let offset = 0x10000 + (table * 104 + entry) * 8;
             assert!(
@@ -19230,8 +19250,8 @@ fn admitted_heuristic_tables_are_unknown_with_provenance() {
             );
         }
     }
-    assert_eq!(unknown.len(), 3 * 104);
-    assert_eq!(plan.slots.len(), 416);
+    assert_eq!(unknown.len(), (admitted_heuristics * 104) as usize);
+    assert_eq!(plan.slots.len(), ((admitted_heuristics + 1) * 104) as usize);
 
     // Table 63 is interface-linked: ordinal 63*104 % 8 == 0 keeps C_Initialize.
     let linked = plan
@@ -19442,10 +19462,9 @@ fn published_tables_bypass_heuristic_cap_with_sufficient_budget() {
     }
 }
 
-/// Task 1.2 (b): the global budget still refuses atomically. With 400 slots
-/// already admitted, a module needing 136 new targets (top table 136 > 112
-/// remaining) is refused whole — no prefix — and a later small module still
-/// fits in the remaining budget.
+/// Task 1.2 (b): the global budget still refuses atomically. With
+/// MAX_SLOTS-112 already admitted, a module needing 136 new targets is
+/// refused whole; a later small module still fits in the remaining budget.
 #[test]
 fn global_budget_refuses_oversized_module_atomically_and_admits_later_small_module() {
     fn heuristic_module(
@@ -19492,8 +19511,11 @@ fn global_budget_refuses_oversized_module_atomically_and_admits_later_small_modu
         raw
     }
 
-    // Filler: 4 heuristic tables x 100 entries = 400 slots (within K=4).
-    let filler = heuristic_module(57, 4, 100, 0x100000);
+    // Four heuristic tables fill all but 112 slots in either profile.
+    let filler_per_table = (p11scope_ebpf_common::MAX_SLOTS as usize - 112) / 4;
+    let filler_slots = 4 * filler_per_table;
+    assert_eq!(filler_slots + 112, p11scope_ebpf_common::MAX_SLOTS as usize);
+    let filler = heuristic_module(57, 4, filler_per_table, 0x100000);
     // Oversized: 1 heuristic table x 136 entries; 136 > 112 remaining.
     let oversized = heuristic_module(58, 1, 136, 0x200000);
     // Small: 1 heuristic table x 2 entries; fits after the refusal.
@@ -19512,8 +19534,8 @@ fn global_budget_refuses_oversized_module_atomically_and_admits_later_small_modu
 
     assert_eq!(
         plan.slots.len(),
-        402,
-        "filler 400 + small 2 admit; the oversized 136 leave no prefix"
+        filler_slots + 2,
+        "filler plus small admit; the oversized 136 leave no prefix"
     );
     assert_eq!(
         plan.modules.len(),
@@ -19528,7 +19550,9 @@ fn global_budget_refuses_oversized_module_atomically_and_admits_later_small_modu
     );
     assert!(
         plan.modules_skipped[0].reason.contains("136")
-            && plan.modules_skipped[0].reason.contains("400 are in use"),
+            && plan.modules_skipped[0]
+                .reason
+                .contains(&format!("{filler_slots} are in use")),
         "refusal names the need and the budget: {:?}",
         plan.modules_skipped[0]
     );
@@ -19537,8 +19561,9 @@ fn global_budget_refuses_oversized_module_atomically_and_admits_later_small_modu
         "refusal is atomic, not a spill"
     );
     assert_eq!(
-        plan.entries_seen, 538,
-        "seen counts filler 400 + oversized 136 + small 2 despite refusal"
+        plan.entries_seen,
+        filler_slots + 138,
+        "seen counts filler + oversized 136 + small 2 despite refusal"
     );
 
     let attached: BTreeSet<u64> = plan.slots.iter().map(|slot| slot.file_offset).collect();

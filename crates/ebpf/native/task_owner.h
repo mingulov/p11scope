@@ -10,6 +10,9 @@ typedef unsigned long long u64;
 #define __type(name, value) typeof(value) *name
 #define OWNER_LEASED 1U
 #define OWNER_CAS_TRIES 8
+#ifndef P11SCOPE_OWNER_SLOT_BOUND
+#define P11SCOPE_OWNER_SLOT_BOUND 512U
+#endif
 #if defined(P11SCOPE_INVENTORY_ONLY)
 #define OWNER_LIMIT 64ULL
 #elif defined(P11SCOPE_SMALL_STATE_MAPS)

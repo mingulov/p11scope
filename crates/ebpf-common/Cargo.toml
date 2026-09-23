@@ -9,6 +9,7 @@ publish = false
 [features]
 # Userspace side needs aya's Pod impls; the kernel side must stay no_std.
 user = ["dep:aya"]
+wide-detailed-2112 = []
 # Shrinks only the ring for the event-loss induced-gap test.
 small-ring = []
 # Shrinks START and RV_COUNTS for their independent induced-gap tests.

@@ -18,6 +18,7 @@
 //! So: fallback per the brief — shell out to the same nightly command
 //! Task 3 used and copy the artifact into OUT_DIR ourselves.
 //!
+use sha2::{Digest, Sha256};
 use std::{env, path::PathBuf, process::Command};
 
 #[path = "build_support/bpf_tools.rs"]
@@ -96,6 +97,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=P11SCOPE_SMALL_STATE_MAPS");
     println!("cargo:rerun-if-env-changed=P11SCOPE_SMALL_DISCOVERY_RING");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_WIDE_DETAILED_2112");
     println!("cargo:rerun-if-env-changed=P11SCOPE_PREPARED_BPF_CARGO");
     println!("cargo:rerun-if-env-changed=P11SCOPE_PREPARED_BPF_RUSTC");
     println!("cargo:rerun-if-env-changed=LD_LIBRARY_PATH");
@@ -111,13 +113,20 @@ fn main() {
         env::var("P11SCOPE_SMALL_DISCOVERY_RING").as_deref(),
         Ok("1") | Ok("true")
     );
+    let wide_detailed = env::var_os("CARGO_FEATURE_WIDE_DETAILED_2112").is_some();
 
     for flavor in [
         BpfFlavor::Detailed,
         BpfFlavor::InventoryGlobal,
         BpfFlavor::InventoryCallers,
     ] {
-        build_variant(flavor, small_ring, small_state_maps, small_discovery_ring);
+        build_variant(
+            flavor,
+            small_ring,
+            small_state_maps,
+            small_discovery_ring,
+            wide_detailed,
+        );
     }
     println!(
         "cargo:rustc-env=P11SCOPE_INVENTORY_VARIANT={}",
@@ -142,6 +151,7 @@ fn build_variant(
     small_ring: bool,
     small_state_maps: bool,
     small_discovery_ring: bool,
+    wide_detailed: bool,
 ) {
     let inventory = !matches!(flavor, BpfFlavor::Detailed);
     let manifest_dir =
@@ -178,6 +188,7 @@ fn build_variant(
         let bitcode = out_dir.join(format!("{unit}-{suffix}.bc"));
         let mut compile = Command::new("clang-18");
         compile
+            .current_dir(&out_dir)
             .args([
                 "-target",
                 if target.starts_with("bpfeb") {
@@ -187,6 +198,7 @@ fn build_variant(
                 },
                 "-O2",
                 "-g",
+                "-fdebug-compilation-dir=/p11scope/native",
                 "-Wall",
                 "-Wextra",
                 "-Werror",
@@ -195,11 +207,14 @@ fn build_variant(
             ])
             .arg(manifest_dir.join(format!("crates/ebpf/native/{unit}.c")))
             .arg("-o")
-            .arg(&bitcode);
+            .arg(bitcode.file_name().expect("native bitcode basename"));
         if inventory {
             compile.arg("-DP11SCOPE_INVENTORY_ONLY");
         } else if small_state_maps && !matches!(*unit, "image_identity" | "image_identity_fork") {
             compile.arg("-DP11SCOPE_SMALL_STATE_MAPS");
+        }
+        if !inventory && wide_detailed && *unit == "task_owner" {
+            compile.arg("-DP11SCOPE_OWNER_SLOT_BOUND=2112U");
         }
         let status = compile
             .status()
@@ -208,7 +223,17 @@ fn build_variant(
             status.success(),
             "building native {unit} ({suffix}) failed: {status}"
         );
-        native_bitcodes.push(bitcode);
+        // Cargo does not fingerprint the contents of a native link-arg file.
+        // Give the linked input a content-addressed name so any C/object
+        // change also changes rustc's link flags and rebuilds the BPF ELF.
+        let digest = Sha256::digest(std::fs::read(&bitcode).expect("reading native bitcode"));
+        let digest_hex = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let linked_bitcode = out_dir.join(format!("{unit}-{suffix}-{digest_hex}.bc"));
+        std::fs::rename(&bitcode, &linked_bitcode).expect("naming native bitcode by content");
+        native_bitcodes.push(linked_bitcode);
     }
 
     let ebpf_manifest = manifest_dir.join("crates/ebpf/Cargo.toml");
@@ -232,6 +257,7 @@ fn build_variant(
     .arg(&target_dir);
     let mut features = Vec::new();
     match flavor {
+        BpfFlavor::Detailed if wide_detailed => features.push("wide-detailed-2112"),
         BpfFlavor::Detailed => {}
         BpfFlavor::InventoryGlobal => features.push("inventory-only"),
         BpfFlavor::InventoryCallers => features.push("inventory-callers"),

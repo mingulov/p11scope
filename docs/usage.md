@@ -348,11 +348,16 @@ written) instead of aborting it. Under `run`, a child the pause holds stopped
 is resumed before the observer signals it or hands it back. The stop signal is
 forwarded to the child's process group; a child still alive gets SIGTERM 5 s
 later and SIGKILL 5 s after that, so settling it takes at most 15 s (a second
-Ctrl-C sends SIGKILL at once). A stop still waiting for its pause cycle when
-the capture ends is reported as `pause: partial` (`--pause always` fails the
-run instead). A signal that lands inside an active pause cycle (which has a
-500 ms deadline) can instead end the run with a `pause coordination cancelled`
-error, after the same resume and settlement and without writing the `-o` file.
+Ctrl-C sends SIGKILL at once). If the run is stopped or times out while the
+command is still being handed to the child, the child is killed at once,
+never resumed, so a command that had not already started never runs. A stop
+still waiting for its pause cycle when the capture ends is reported as
+`pause: partial`. Under `--pause always` the run fails instead: no profile
+report is published (a trace `-o` stream keeps only the lines already
+written), and a `--duration` child is terminated rather than handed back. A
+signal that lands inside an active pause cycle (which has a 500 ms deadline)
+can also end the run with a `pause coordination cancelled` error, after the
+same resume and settlement and with the same `-o` outcome.
 
 A `--cgroup` capture sweeps every member's mappings, then deep-scans at most
 256 members per pass, rarest providers first; past the cap the capture

@@ -8315,8 +8315,9 @@ fn the_capture_loop_consumer_map_is_frozen() {
     // Final evidence and discovery: sanitized capture facts, never the live
     // plan's own counts. `active_slots` is the deliberate exception to
     // "history": it is a current-state count (U-14), but the one place
-    // allowed to read `plan.is_active` is `Engine::capture_facts` itself —
-    // `evidence_for` below must still only ever consume the already-read
+    // allowed to read it — `AttachPlan::active_slot_count`, via
+    // `Engine::capture_facts` — is `capture_facts()` itself; `evidence_for`
+    // below must still only ever consume the already-read
     // `facts.active_slots()` value, exactly like every other field here.
     for marker in [
         "facts: render::CaptureFacts,",
@@ -8330,10 +8331,16 @@ fn the_capture_loop_consumer_map_is_frozen() {
     ] {
         assert!(evidence.contains(marker), "consumer map lost {marker:?}");
     }
-    // `plan.is_active` is forbidden here for the same reason as the other two
-    // live-plan reads: it must not be re-derived a second time from the
-    // active topology inside this render-lane function, current-state or not.
-    for forbidden in ["plan.entries_seen", "plan.slots.len()", "plan.is_active"] {
+    // `plan.is_active`/`plan.active_slot_count()` are forbidden here for the
+    // same reason as the other two live-plan reads: none of them may be
+    // re-derived a second time from the active topology inside this
+    // render-lane function, current-state or not.
+    for forbidden in [
+        "plan.entries_seen",
+        "plan.slots.len()",
+        "plan.is_active",
+        "plan.active_slot_count()",
+    ] {
         assert!(
             !evidence.contains(forbidden),
             "published history was taken from active topology: {forbidden}"

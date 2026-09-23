@@ -5942,6 +5942,25 @@ impl DiscoveryLifecycleFixture {
         engine
     }
 
+    /// U-14: the scan-only sibling of `discover_before_load` — no
+    /// `--manifest` is ever passed, so the object this fixture's provider
+    /// is scanned from is pinned only through the process view that mapped
+    /// it (`identity::PinnedObjects`, no manifest-owned claim survives it).
+    /// `verify-attach-e2e.sh`'s `observed-scan` lane is the same shape.
+    fn discover_scan_only_before_load(&self) -> Engine {
+        let pid = self.child.pid();
+        let mut args = system_args(vec![self.provider.clone()], None);
+        args.scope = crate::cli::ScopeArg::Pid(pid);
+        let view = ProcessView::open(ProcessViewId(0), pid).expect("retain the owned generation");
+        let engine = Engine::discover(&args, &Scope::Pid(pid), Some(view))
+            .expect("scan-only discovery before dlopen");
+        assert!(
+            engine.modules.is_empty(),
+            "the child has not mapped the provider"
+        );
+        engine
+    }
+
     fn load(&mut self) {
         use std::os::unix::fs::MetadataExt as _;
 
@@ -6065,6 +6084,63 @@ fn lifecycle_completed_discovery_agreement_survives_real_child_exit() {
     assert!(module.corroborated);
     assert_eq!(module.corroboration, ["agreed"]);
     assert!(engine.plan.skipped.is_empty(), "{:?}", engine.plan.skipped);
+}
+
+/// U-14: pins "0 after a scan-only `--pid` exit" through the real engine
+/// exit path (conservative replay -> `extend_exact_prepared` key
+/// retirement, `engine.rs:8695-8712` -> `plan.rs`), not just at plan level
+/// like `capture_facts_reports_active_slots_separately_from_churned_allocations`
+/// does. No manifest is ever passed
+/// (`DiscoveryLifecycleFixture::discover_scan_only_before_load`), so the
+/// scanned object is pinned only through the process view that mapped it —
+/// unlike `lifecycle_completed_discovery_agreement_survives_real_child_exit`'s
+/// manifest-backed fixture, whose `active_slots` stays equal to `slots`
+/// after the same kind of exit.
+#[test]
+fn lifecycle_scan_only_exit_reports_zero_active_slots() {
+    let mut fixture = DiscoveryLifecycleFixture::start();
+    let mut engine = fixture.discover_scan_only_before_load();
+    fixture.load();
+    engine.request_refresh(fixture.child.pid());
+    refresh_inventory_once(&mut engine);
+    engine.publish_current_capture_facts().unwrap();
+
+    assert!(
+        engine.modules.iter().any(|module| module
+            .scanned
+            .tables
+            .iter()
+            .any(|table| table.entries.len() == 68)),
+        "a real complete table must have been acquired: {:?}",
+        engine.modules
+    );
+    let before_exit = engine.capture_facts();
+    assert!(
+        before_exit.slots > 0,
+        "the scan-only target's endpoints are planned while it runs"
+    );
+    assert_eq!(
+        before_exit.active_slots, before_exit.slots,
+        "everything the scan planned is active while the target is still running"
+    );
+
+    fixture.exit_and_reap();
+    refresh_inventory_once(&mut engine);
+    engine.publish_current_capture_facts().unwrap();
+
+    assert!(engine.expected_target_exit());
+    assert!(engine.views.is_empty());
+    assert!(
+        engine.modules.is_empty(),
+        "the live scan view really retired"
+    );
+
+    let facts = engine.capture_facts();
+    assert!(facts.slots > 0, "allocated slots survive the exit");
+    assert_eq!(
+        facts.active_slots, 0,
+        "a scan-only target's exit must retire every slot its unpinned object held"
+    );
 }
 
 #[test]

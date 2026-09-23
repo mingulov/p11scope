@@ -6698,15 +6698,15 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let ready = directory.path().join("ready");
         let term_seen = directory.path().join("term-seen");
+        // The paths travel as positional parameters, never as script text.
         let mut child = spawn(
             "/bin/sh",
             &[
                 "-c",
-                &format!(
-                    "exec 2>/dev/null; trap ': > {}' TERM; : > {}; while :; do sleep 1; done",
-                    term_seen.display(),
-                    ready.display(),
-                ),
+                "exec 2>/dev/null; trap ': > \"$2\"' TERM; : > \"$1\"; while :; do sleep 1; done",
+                "sh",
+                ready.to_str().unwrap(),
+                term_seen.to_str().unwrap(),
             ],
         );
         child.release().unwrap();
@@ -6757,13 +6757,17 @@ mod tests {
     }
 
     /// The scripted half of a pause-held owned child: the authorization map,
-    /// the discovery queue, and a count of resumes. Everything else the
-    /// shutdown test below drives is real — the coordinator, the owned child,
-    /// its pidfd SIGCONT, its `/proc` task states, and the settlement path.
+    /// the discovery queue, the coordinator's monotonic clock, and a count of
+    /// resumes. The clock advances by one tick per read, so no coordinator
+    /// deadline (the 500 ms cleanup bound included) depends on scheduling.
+    /// Everything else the shutdown test below drives is real — the
+    /// coordinator, the owned child, its pidfd SIGCONT, its `/proc` task
+    /// states, and the settlement path.
     #[derive(Default)]
     struct HeldPause {
         authorization: Option<u64>,
         queue: std::collections::VecDeque<crate::discovery::pause::DiscoveryItem>,
+        now_ns: u64,
         resumes: usize,
     }
 
@@ -6775,11 +6779,12 @@ mod tests {
 
     impl crate::discovery::pause::PauseIo for HeldPauseIo<'_> {
         fn now_ns(&mut self) -> std::result::Result<u64, String> {
-            crate::attach::monotonic_ns().ok_or_else(|| "monotonic clock read failed".into())
+            self.held.now_ns += 1;
+            Ok(self.held.now_ns)
         }
 
         fn wait_one_ms(&mut self) -> std::result::Result<(), String> {
-            std::thread::sleep(Duration::from_millis(1));
+            self.held.now_ns += 1_000_000;
             Ok(())
         }
 
@@ -6787,26 +6792,7 @@ mod tests {
             &mut self,
             pid: u32,
         ) -> std::result::Result<std::collections::BTreeMap<u32, u8>, String> {
-            let mut states = std::collections::BTreeMap::new();
-            let tasks = std::fs::read_dir(format!("/proc/{pid}/task"))
-                .map_err(|error| format!("task set of {pid}: {error}"))?;
-            for task in tasks {
-                let task = task.map_err(|error| error.to_string())?;
-                let tid = task
-                    .file_name()
-                    .to_string_lossy()
-                    .parse::<u32>()
-                    .map_err(|error| error.to_string())?;
-                let stat = std::fs::read(task.path().join("stat"))
-                    .map_err(|error| format!("task {tid} stat: {error}"))?;
-                let close = stat
-                    .iter()
-                    .rposition(|byte| *byte == b')')
-                    .ok_or("task stat without a comm delimiter")?;
-                let state = *stat.get(close + 2).ok_or("task stat without a state")?;
-                states.insert(tid, state);
-            }
-            Ok(states)
+            crate::discovery::pause::read_task_states(pid)
         }
 
         fn dequeue(
@@ -6941,7 +6927,9 @@ mod tests {
                 let mut record: p11scope_ebpf_common::DiscoveryRecord =
                     unsafe { std::mem::zeroed() };
                 record.pid_tgid = u64::from(child.pid()) << 32;
-                record.hook_ts_ns = crate::attach::monotonic_ns().unwrap();
+                // Stamped on the scripted clock at the arm's tick, as the
+                // kernel stamps it after the exchange: never older than the arm.
+                record.hook_ts_ns = held.now_ns;
                 held.queue
                     .push_back(crate::discovery::pause::DiscoveryItem::Record(record));
                 child.pin().send_signal(libc::SIGSTOP).unwrap();

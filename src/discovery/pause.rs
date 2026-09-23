@@ -2500,7 +2500,9 @@ fn collect_timed_retirement_with(
     Ok((records, malformed))
 }
 
-fn read_task_states(pid: u32) -> Result<BTreeMap<u32, u8>, String> {
+/// Every task of `pid` and its `/proc` state letter. Crate-visible so the
+/// owned-run shutdown tests read tasks exactly as the coordinator does.
+pub(crate) fn read_task_states(pid: u32) -> Result<BTreeMap<u32, u8>, String> {
     let directory = std::fs::read_dir(format!("/proc/{pid}/task"))
         .map_err(|error| format!("cannot enumerate task set for pid {pid}: {error}"))?;
     let mut states = BTreeMap::new();
@@ -6150,6 +6152,103 @@ mod tests {
                     assert_eq!(
                         error.to_string(),
                         format!("{MSG_UNSERVICED_AT_CLEANUP} [pause_diag=other_auto_nonconfirmed]")
+                    );
+                }
+                PausePolicy::Never => unreachable!(),
+            }
+        }
+    }
+
+    /// The same unserviced owner when the kernel consumes the arm between
+    /// cleanup's authorization read (ARMED, no owner yet) and its removal
+    /// (which returns REQUESTED). The removal opens the owner. Cleanup still
+    /// resumes the child once, and the owner closes unconfirmed.
+    #[test]
+    fn a_stop_consumed_between_the_cleanup_read_and_its_removal_is_reported() {
+        for policy in [PausePolicy::Auto, PausePolicy::Always] {
+            let mut io = FakeIo {
+                authorization: Some(PAUSE_REQUESTED),
+                authorization_results: VecDeque::from([Ok(Some(PAUSE_ARMED))]),
+                ..FakeIo::default()
+            };
+            let mut coordinator = PauseCoordinator::for_test(policy, 41, 9, stopped());
+            coordinator.arm_for_test();
+
+            let result = coordinator.cleanup(&mut io);
+
+            assert_eq!(
+                io.events,
+                ["detach", "dequeue", "account", "read", "remove", "resume"],
+                "{policy:?}: the removal's REQUESTED still earns one resume"
+            );
+            assert_eq!(io.authorization, None, "{policy:?}");
+            assert_eq!(coordinator.counters().attempts, 1, "{policy:?}");
+            assert_eq!(coordinator.counters().confirmed, 0, "{policy:?}");
+            match policy {
+                PausePolicy::Auto => {
+                    result.expect("an auto owner opened by the removal is partial");
+                    assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+                }
+                PausePolicy::Always => {
+                    let error = result.expect_err("always never reports an unconfirmed stop");
+                    assert!(error.required() && !error.lifecycle(), "{error}");
+                }
+                PausePolicy::Never => unreachable!(),
+            }
+        }
+    }
+
+    /// A confirmed cycle installs its one successor, the kernel consumes the
+    /// successor, and the capture ends before any frame services it. The
+    /// first owner stays confirmed. The successor's owner, opened by cleanup,
+    /// closes unconfirmed after cleanup's one protective resume. `auto` ends
+    /// `{attempts 2, confirmed 1, partial 1}`; `always` refuses.
+    #[test]
+    fn a_successor_consumed_after_a_confirmed_cycle_is_reported_at_shutdown() {
+        for policy in [PausePolicy::Auto, PausePolicy::Always] {
+            let mut io = successful_io(vec![record(10, 0, false)]);
+            let mut coordinator = PauseCoordinator::for_test(policy, 41, 9, stopped());
+            coordinator.arm_for_test();
+            coordinator.service(&mut io).unwrap();
+            assert!(coordinator.is_armed(), "{policy:?}: the successor is armed");
+            assert_eq!(io.authorization, Some(PAUSE_ARMED), "{policy:?}");
+            assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+
+            io.authorization = Some(PAUSE_REQUESTED);
+            let successor = record(io.fallback_now, 0, false);
+            io.queue
+                .extend([Ok(Some(DiscoveryItem::Record(successor))), Ok(None)]);
+            let result = coordinator.cleanup(&mut io);
+
+            assert_eq!(
+                io.events.iter().filter(|event| **event == "resume").count(),
+                2,
+                "{policy:?}: the cycle's resume, then cleanup's protective resume"
+            );
+            assert_eq!(io.authorization, None, "{policy:?}");
+            match policy {
+                PausePolicy::Auto => {
+                    result.expect("the unserviced successor is an auto partial");
+                    assert_eq!(
+                        coordinator.counters(),
+                        PauseCounters {
+                            attempts: 2,
+                            confirmed: 1,
+                            partial: 1,
+                        }
+                    );
+                    assert_eq!(coordinator.status(), PauseStatus::Partial);
+                }
+                PausePolicy::Always => {
+                    let error = result.expect_err("always never reports an unconfirmed stop");
+                    assert!(error.required() && !error.lifecycle(), "{error}");
+                    assert_eq!(
+                        coordinator.counters(),
+                        PauseCounters {
+                            attempts: 2,
+                            confirmed: 1,
+                            partial: 0,
+                        }
                     );
                 }
                 PausePolicy::Never => unreachable!(),

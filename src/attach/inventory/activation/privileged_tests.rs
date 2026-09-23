@@ -864,19 +864,7 @@ impl OwnedCaller {
         writeln!(self.input, "THREAD_EXIT")?;
         self.input.flush()?;
         ensure!(self.line()? == format!("ABANDONED {id} {tid}"));
-        // pthread_join returns at the kernel's clear-child-TID futex wake, which
-        // precedes release_task() unhashing the TID from /proc; wait for that
-        // release within the protocol's line deadline instead of sampling once.
-        let task = PathBuf::from(format!("/proc/{}/task/{tid}", self.child.id()));
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while task.try_exists()? {
-            ensure!(
-                Instant::now() < deadline,
-                "abandoned worker TID still exists"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        Ok(())
+        await_task_released(self.child.id(), tid, Duration::from_secs(5))
     }
 
     fn release_held_worker_exec(&mut self) -> Result<()> {
@@ -6747,6 +6735,55 @@ fn privileged_task4_detailed_physical_identity_controls() -> Result<()> {
     eprintln!("TASK4_LOSS ring=0 discovery=0 owner=0 output_rendered=4");
     evidence.finish()?;
     eprintln!("TASK4_CLEANUP owned_ids_released=true terminal_unsettled=true");
+    Ok(())
+}
+
+/// Waits until `/proc/<pid>/task/<tid>` is gone. `pthread_join` returns at the
+/// kernel's clear-child-TID futex wake, which precedes `release_task()` unhashing
+/// the TID from /proc, so a single sample right after a join can still see it.
+fn await_task_released(pid: u32, tid: u32, limit: Duration) -> Result<()> {
+    let task = PathBuf::from(format!("/proc/{pid}/task/{tid}"));
+    let deadline = Instant::now() + limit;
+    while task.try_exists()? {
+        ensure!(
+            Instant::now() < deadline,
+            "abandoned worker TID still exists"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
+}
+
+#[test]
+fn awaited_task_release_follows_join_and_refuses_a_live_thread() -> Result<()> {
+    // Regression for the post-join /proc window: a single immediate absence
+    // check fails a few percent of joins, so 200 joins catch a revert.
+    let pid = std::process::id();
+    for _ in 0..200 {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            // SAFETY: gettid has no arguments and cannot fail.
+            let _ = sender.send(unsafe { libc::syscall(libc::SYS_gettid) } as u32);
+        });
+        let tid = receiver.recv()?;
+        worker.join().expect("worker thread");
+        await_task_released(pid, tid, Duration::from_secs(5))?;
+        ensure!(!PathBuf::from(format!("/proc/{pid}/task/{tid}")).try_exists()?);
+    }
+    // A live thread is never reported as released, only as timing out.
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let (release, hold) = std::sync::mpsc::channel::<()>();
+    let worker = std::thread::spawn(move || {
+        // SAFETY: gettid has no arguments and cannot fail.
+        let _ = sender.send(unsafe { libc::syscall(libc::SYS_gettid) } as u32);
+        let _ = hold.recv();
+    });
+    let tid = receiver.recv()?;
+    let refused = await_task_released(pid, tid, Duration::from_millis(50));
+    release.send(())?;
+    worker.join().expect("held worker thread");
+    let error = refused.expect_err("a live thread must not be reported as released");
+    ensure!(error.to_string().contains("still exists"), "{error:#}");
     Ok(())
 }
 

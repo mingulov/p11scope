@@ -3117,6 +3117,48 @@ fn arming_a_view_without_an_executable_is_not_armable_not_partial() {
     assert_eq!(engine.loader_discovery().strategies.unavailable, 0);
 }
 
+/// True when `/proc/<pid>/maps` text has an executable mapping of exactly
+/// `image`. The kernel switches `/proc/<pid>/exe` in `begin_new_exec()`, before
+/// `load_elf_binary()` maps the new image, so an exe link alone is not readiness.
+fn maps_have_executable_image(maps: &str, image: &std::path::Path) -> bool {
+    maps.lines().any(|line| {
+        let mut fields = line.splitn(6, ' ');
+        let _range = fields.next();
+        let executable = fields
+            .next()
+            .is_some_and(|perms| perms.as_bytes().get(2) == Some(&b'x'));
+        let path = fields.nth(3).map(str::trim_start);
+        executable && path.is_some_and(|path| std::path::Path::new(path) == image)
+    })
+}
+
+#[test]
+fn exec_readiness_needs_the_new_images_executable_mapping() {
+    let image = std::path::Path::new("/usr/bin/busybox");
+    // The begin_new_exec() window: the exe link already names the image but
+    // none of its segments are mapped yet.
+    assert!(!maps_have_executable_image("", image));
+    assert!(!maps_have_executable_image(
+        "7ffd00000000-7ffd00021000 rw-p 00000000 00:00 0                          [stack]\n",
+        image
+    ));
+    // A read-only first segment is not yet an executable mapping.
+    assert!(!maps_have_executable_image(
+        "560000000000-560000001000 r--p 00000000 00:23 42                         /usr/bin/busybox\n",
+        image
+    ));
+    // Another file whose path merely ends like the image does not count.
+    assert!(!maps_have_executable_image(
+        "560000001000-560000002000 r-xp 00001000 00:23 43                         /opt/usr/bin/busybox\n",
+        image
+    ));
+    assert!(maps_have_executable_image(
+        "560000000000-560000001000 r--p 00000000 00:23 42                         /usr/bin/busybox\n\
+         560000001000-560000090000 r-xp 00001000 00:23 42                         /usr/bin/busybox\n",
+        image
+    ));
+}
+
 /// Task E1: a static executable (no PT_INTERP, so the locator returns
 /// `None`) is NotArmable, not partial: silent `Ok(false)`, no mark, no
 /// loader record, no `unavailable` growth.
@@ -3149,14 +3191,8 @@ fn arming_a_static_executable_is_not_armable_not_partial() {
     let mut spins = 0;
     let execed = || {
         std::fs::read_link(&exe).is_ok_and(|target| target == busybox)
-            && std::fs::read_to_string(&maps).is_ok_and(|maps| {
-                maps.lines().any(|line| {
-                    line.split_whitespace()
-                        .nth(1)
-                        .is_some_and(|perms| perms.as_bytes().get(2) == Some(&b'x'))
-                        && line.ends_with(busybox.to_string_lossy().as_ref())
-                })
-            })
+            && std::fs::read_to_string(&maps)
+                .is_ok_and(|maps| maps_have_executable_image(&maps, &busybox))
     };
     while !execed() {
         std::thread::sleep(std::time::Duration::from_millis(1));

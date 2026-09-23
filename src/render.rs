@@ -157,18 +157,23 @@ pub struct UretprobeOverride {
     pub reason: String,
 }
 
-/// The capture-lifetime, render-ready facts the binary may see: everything the
-/// headings, the final frame, and the JSON document are built from. Sanitized
-/// by construction — no pins, process views, open files, timing keys, or
-/// loader/pause identities cross this boundary (plan Task 8 Step 2).
+/// The render-ready facts the binary may see: everything the headings, the
+/// final frame, and the JSON document are built from. Sanitized by
+/// construction — no pins, process views, open files, timing keys, or
+/// loader/pause identities cross this boundary (plan Task 8 Step 2). Most
+/// fields are capture-lifetime history and never shrink once accepted;
+/// `active_slots` is the one exception (owner decision U-14, 2026-09-23) —
+/// see its own doc below.
 #[derive(Debug, Clone, Default)]
 pub struct CaptureFacts {
     pub(crate) discovery: DiscoveryEvidence,
     pub(crate) table_entries: usize,
     pub(crate) slots: usize,
-    /// Endpoint slots active in the plan when this report is written (owner
-    /// decision U-14, 2026-09-23): `slots` minus any this capture's churn
-    /// has already retired.
+    /// The plan's active-slot count right now, not capture-lifetime history:
+    /// it reaches 0 for a scan-only `--pid` capture once the target has
+    /// exited, and shrinks independently on a failed live attach or
+    /// replacement, or a lost process generation. See
+    /// `AttachPlan::active_slot_count`.
     pub(crate) active_slots: usize,
     pub(crate) attach_gap_ms: Option<u64>,
     pub(crate) loader_discovery: LoaderDiscovery,
@@ -190,17 +195,20 @@ impl CaptureFacts {
         self.table_entries
     }
 
-    /// Attach slots allocated over the whole capture, including any this
-    /// capture's churn later retired; see `active_slots` for what remains
-    /// attached.
+    /// Attach slots allocated over the whole capture. Capture-lifetime
+    /// history: it never shrinks, even once a target exits, an attach fails,
+    /// or a generation is lost. See `active_slots` for what is attached now.
     pub fn slots(&self) -> usize {
         self.slots
     }
 
-    /// Endpoint slots still active in the plan when this report is written
-    /// (owner decision U-14): `slots` minus any already retired by churn —
-    /// a provider generation exiting and being replaced never reuses a
-    /// retired slot.
+    /// The plan's active-slot count when this report is written (owner
+    /// decision U-14) — not capture-lifetime history, and not a churn count.
+    /// `slots - active_slots` mixes several causes (an ordinary target exit,
+    /// a failed live attach or replacement, a lost generation) and must not
+    /// be read as "N restarts". A scan-only `--pid` capture reports 0 once
+    /// its target has exited; a manifest-attested object can stay planned
+    /// and active independently of any one process view.
     pub fn active_slots(&self) -> usize {
         self.active_slots
     }
@@ -471,15 +479,17 @@ pub struct Evidence {
     pub table_entries: usize,
     /// Unique {object, file_offset} targets planned, allocated over the
     /// whole capture. The plan is append-only: a slot is never reused within
-    /// a capture, so a retired target (a provider generation exiting and
-    /// being replaced) still counts here — this number only grows with
-    /// churn (owner decision U-14, 2026-09-23). See `active_slots` for the
-    /// count still attached when this report was written.
+    /// a capture, so a retired target still counts here — this number never
+    /// shrinks. See `active_slots` for what is attached now.
     pub slots: usize,
-    /// Endpoint slots active in the plan when this report was written: the
-    /// allocated `slots` minus any this capture's churn has already retired
-    /// (owner decision U-14, 2026-09-23). Mirrors `plan.is_active` — not a
-    /// count of kernel links.
+    /// The plan's active-slot count when this report was written (owner
+    /// decision U-14, 2026-09-23): mirrors `plan.is_active`, not a count of
+    /// kernel links, and not capture-lifetime history like `slots`. It is 0
+    /// after an ordinary exit of a scan-only `--pid` target (a manifest-
+    /// attested object can stay planned and active on its own), and shrinks
+    /// independently on a failed live attach or replacement, or a lost
+    /// process generation. `slots - active_slots` is not a churn count: it
+    /// mixes all of those causes.
     pub active_slots: usize,
     /// Probes successfully attached (2 per fully-attached slot).
     pub attached_probes: usize,
@@ -2580,6 +2590,7 @@ mod tests {
         let mut ev = evidence();
         ev.table_entries = plan.entries_seen;
         ev.slots = plan.slots.len();
+        ev.active_slots = ev.slots;
         ev.attached_probes = 2;
         ev.semantic_unverified_slots = 1;
         ev.surfaces = plan.surfaces.clone();
@@ -2719,6 +2730,7 @@ mod tests {
     fn a_capture_that_attached_nothing_is_never_complete() {
         let mut ev = evidence();
         ev.slots = 0;
+        ev.active_slots = 0;
         ev.attached_probes = 0;
         ev.verdict();
         assert_eq!(
@@ -3247,8 +3259,10 @@ mod tests {
             "profile",
             CapturePolicy::Allowlisted,
         );
-        assert!(out.contains("10 slots"), "{out}");
-        assert!(out.contains("4 active"), "{out}");
+        assert!(
+            out.contains("10 slots (4 active)"),
+            "must pin the exact format docs/usage.md documents: {out}"
+        );
     }
 
     #[test]
@@ -4799,10 +4813,10 @@ mod tests {
     fn an_active_to_empty_lifecycle_keeps_its_history_in_every_renderer() {
         let mut ev = evidence();
         ev.child_still_running = Some(false);
-        // U-14: the exited generation's endpoints are retired, not attached,
-        // so active_slots must publish the smaller live count next to the
-        // unchanged allocation total in `slots`.
-        ev.active_slots = 61;
+        // U-14: an ordinary exit of a scan-only target retires every key an
+        // unpinned object loses, so active_slots reads 0 while `slots` keeps
+        // the unchanged capture-lifetime allocation total.
+        ev.active_slots = 0;
         ev.verdict();
         let reports = reports_fixture();
 
@@ -4822,7 +4836,7 @@ mod tests {
             assert_eq!(document["surfaces"][0]["walk"], "full");
             assert_eq!(document["table_entries"], 68);
             assert_eq!(document["slots"], 68);
-            assert_eq!(document["active_slots"], 61);
+            assert_eq!(document["active_slots"], 0);
             assert_eq!(document["attached_probes"], 136);
             // No exit-generated discovery loss and no false reconciliation.
             for counter in [

@@ -8058,7 +8058,10 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
     let mut evidence = Evidence {
         table_entries: 68,
         slots: 68,
-        active_slots: 68,
+        // U-14: `verify-attach-e2e.sh`'s real artifacts are exit captures —
+        // the workload runs to completion and exits — so active_slots reads
+        // 0 here, exercised below by `checker.exact_active_to_empty`.
+        active_slots: 0,
         attached_probes: 136,
         attach_failures: vec![],
         aliased: vec![],
@@ -8306,7 +8309,11 @@ fn the_capture_loop_consumer_map_is_frozen() {
     );
 
     // Final evidence and discovery: sanitized capture facts, never the live
-    // plan's own counts.
+    // plan's own counts. `active_slots` is the deliberate exception to
+    // "history": it is a current-state count (U-14), but the one place
+    // allowed to read `plan.is_active` is `Engine::capture_facts` itself —
+    // `evidence_for` below must still only ever consume the already-read
+    // `facts.active_slots()` value, exactly like every other field here.
     for marker in [
         "facts: render::CaptureFacts,",
         "table_entries: facts.table_entries()",
@@ -8319,6 +8326,9 @@ fn the_capture_loop_consumer_map_is_frozen() {
     ] {
         assert!(evidence.contains(marker), "consumer map lost {marker:?}");
     }
+    // `plan.is_active` is forbidden here for the same reason as the other two
+    // live-plan reads: it must not be re-derived a second time from the
+    // active topology inside this render-lane function, current-state or not.
     for forbidden in ["plan.entries_seen", "plan.slots.len()", "plan.is_active"] {
         assert!(
             !evidence.contains(forbidden),

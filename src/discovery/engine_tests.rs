@@ -5964,6 +5964,20 @@ fn lifecycle_completed_discovery_agreement_survives_real_child_exit() {
         engine.modules.is_empty(),
         "the live scan view really retired"
     );
+    // U-14: this fixture is manifest-backed (`discover_before_load` passes
+    // `args.manifests`), so its object stays pinned independently of the
+    // process view that exited — `identity::PinnedObjects::remove_view`
+    // "without disturbing ... a manifest that still owns the same opened
+    // object". active_slots therefore survives the exit exactly like the
+    // capture-lifetime facts around it; see
+    // `capture_facts_reports_active_slots_separately_from_churned_allocations`
+    // for the scan-only case, where the same exit drives it to 0.
+    let facts = engine.capture_facts();
+    assert!(facts.slots > 0, "allocated slots survive the exit");
+    assert_eq!(
+        facts.active_slots, facts.slots,
+        "a manifest-attested object stays active after its process view exits"
+    );
     assert_eq!(engine.discovery.uncorroborated, 0, "{:?}", engine.discovery);
     assert_eq!(engine.discovery.conflicts, 0);
     assert_eq!(
@@ -6967,11 +6981,7 @@ fn evidence_verdict(
     let mut evidence = render::Evidence {
         table_entries: plan.entries_seen,
         slots: plan.slots.len(),
-        active_slots: plan
-            .slots
-            .iter()
-            .filter(|slot| plan.is_active(slot.index))
-            .count(),
+        active_slots: plan.active_slot_count(),
         attached_probes: 0,
         attach_failures: Vec::new(),
         aliased: plan
@@ -7057,33 +7067,52 @@ fn evidence_verdict(
     evidence
 }
 
-/// U-14 (owner decision 2026-09-23): churn from provider restarts must not
-/// hide the currently-attached count behind the ever-growing allocation
-/// count. `slots` keeps counting every endpoint the capture ever allocated,
-/// retired ones included — the append-only plan never reuses a slot within a
-/// capture — while `active_slots` must report only what the plan still has
-/// attached when the report is written, mirroring `plan.is_active`.
+/// U-14 (owner decision 2026-09-23): a provider generation that exits and is
+/// replaced must not hide the currently-attached count behind the
+/// ever-growing allocation count. `slots` keeps counting every endpoint the
+/// capture ever allocated, retired ones included — the append-only plan
+/// never reuses a slot within a capture — while `active_slots` must report
+/// only what the plan still has attached when the report is written,
+/// mirroring `AttachPlan::active_slot_count`.
 #[test]
 fn capture_facts_reports_active_slots_separately_from_churned_allocations() {
     let mut engine = Engine::empty();
     // Generation 1: a provider with three probed endpoints.
     engine.plan = plan_with(3, 0);
-    // It exits: nothing pins its object any longer, so `retire_unpinned_targets`
-    // retires its three slots — they stay allocated, per the append-only plan.
+    // It exits: nothing pins its object any longer. Retire the way production
+    // does (`engine.rs` `restore_start_publication`, generation-loss cleanup):
+    // pass the plan's own slot count as `accepted_slots`, so an
+    // already-accepted aggregate owner is never downgraded — the three slots
+    // stay allocated, per the append-only plan.
+    let accepted = engine.plan.slots.len();
     engine
         .plan
-        .retire_unpinned_targets(&PinnedObjects::empty(), 0);
+        .retire_unpinned_targets(&PinnedObjects::empty(), accepted);
     assert!(
         (0..3).all(|slot| !engine.plan.is_active(slot)),
         "generation 1's slots must retire, not disappear"
     );
+    // U-14: this is the ordinary-exit case, not churn yet — nothing has
+    // replaced generation 1 at this point. A scan-only `--pid` capture whose
+    // target has simply exited reports active_slots == 0 while `slots`
+    // keeps the historical allocation total (contrast the manifest-backed
+    // fixture in `lifecycle_completed_discovery_agreement_survives_real_child_exit`,
+    // where the object stays pinned and active_slots does not drop).
+    let mid_exit_facts = engine.capture_facts();
+    assert_eq!(mid_exit_facts.slots, 3);
+    assert_eq!(
+        mid_exit_facts.active_slots, 0,
+        "an ordinary exit of a scan-only target must report zero active slots"
+    );
 
-    // Generation 2 replaces it: two fresh endpoints at new indices, never
-    // reusing the three retired ones.
-    for offset in 0..2u64 {
-        let index = engine.plan.slots.len() as u32;
-        engine.plan.slots.push(plan::Slot {
-            index,
+    // Generation 2 replaces it: merge a fresh rebuild plan for its own two
+    // endpoints the production way (`extend_exact`, as `live_candidate`
+    // does), which allocates new monotonic indices rather than reusing the
+    // three retired ones and keeps the plan's own bookkeeping consistent
+    // (unlike pushing `Slot`s onto `plan.slots` by hand).
+    let rebuilt_slots = (0..2u64)
+        .map(|offset| plan::Slot {
+            index: offset as u32,
             descriptor_index: 0,
             object: PinnedObjectId(43),
             object_path: "/opt/p11-v2.so".into(),
@@ -7094,9 +7123,30 @@ fn capture_facts_reports_active_slots_separately_from_churned_allocations() {
             semantic_authorized: true,
             semantic_ambiguous: false,
             fork_safe: false,
-            module_ids: vec![plan::ModuleId(1)],
-        });
-    }
+            module_ids: vec![plan::ModuleId(0)],
+        })
+        .collect();
+    let mut rebuilt = plan::AttachPlan::from_slots(rebuilt_slots);
+    rebuilt.modules = vec![plan::ModuleSummary {
+        id: plan::ModuleId(0),
+        object: PinnedObjectId(43),
+        key: ObjectKey {
+            device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+            inode: 43,
+        },
+        path: "/opt/p11-v2.so".into(),
+        tables: vec![],
+        interfaces: 0,
+        source: "scan",
+        corroborated: false,
+        skipped: vec![],
+    }];
+    let delta = engine.plan.extend_exact(rebuilt).unwrap();
+    assert_eq!(
+        delta.new.iter().map(|slot| slot.index).collect::<Vec<_>>(),
+        vec![3, 4],
+        "generation 2 must land on fresh monotonic indices, never the retired ones"
+    );
 
     let facts = engine.capture_facts();
     assert_eq!(
@@ -17997,11 +18047,7 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
     let mut evidence = render::Evidence {
         table_entries: plan.entries_seen,
         slots: plan.slots.len(),
-        active_slots: plan
-            .slots
-            .iter()
-            .filter(|slot| plan.is_active(slot.index))
-            .count(),
+        active_slots: plan.active_slot_count(),
         attached_probes: 0,
         attach_failures: vec![],
         aliased: vec![],

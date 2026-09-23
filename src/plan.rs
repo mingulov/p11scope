@@ -676,6 +676,20 @@ impl AttachPlan {
         position < self.slots.len() && !self.retired_slots.contains(&position)
     }
 
+    /// How many allocated slots are still active right now (U-14): the plan's
+    /// current active set, not a churn count. It reaches 0 for a scan-only
+    /// `--pid` capture once its target has exited (every key an unpinned
+    /// object loses retires together), and shrinks independently whenever a
+    /// live attach or replacement fails or a process generation is lost.
+    /// `self.slots.len() - active_slot_count()` therefore mixes several
+    /// causes and must not be read as a restart/replacement count.
+    pub fn active_slot_count(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| self.is_active(slot.index))
+            .count()
+    }
+
     /// The capture-lifetime aggregate owner, including an inactive slot, or
     /// `None` when no single module can own that cell's counts.
     pub fn module_of_slot(&self, slot: u32) -> Option<ModuleId> {

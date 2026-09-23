@@ -1050,9 +1050,10 @@ fn task4_validate_resource_samples(case: &str, samples: &[serde_json::Value]) ->
         samples.len() == phases.len(),
         "Task 4 FD phases missing or duplicated"
     );
-    let mut limit = None;
+    let mut baseline = None;
+    let mut attached_soft = None;
     let mut previous_time = 0_u128;
-    for (sample, &phase) in samples.iter().zip(phases) {
+    for (index, (sample, &phase)) in samples.iter().zip(phases).enumerate() {
         ensure!(
             sample["phase"].as_str() == Some(phase),
             "Task 4 FD phase order changed"
@@ -1068,13 +1069,28 @@ fn task4_validate_resource_samples(case: &str, samples: &[serde_json::Value]) ->
             count > 0 && count <= soft && soft <= hard && time >= previous_time,
             "invalid Task 4 FD occupancy/limit sample"
         );
-        if let Some(original) = limit {
+        if let Some((baseline_soft, baseline_hard)) = baseline {
             ensure!(
-                original == (soft, hard),
-                "Task 4 FD limit changed during case"
+                hard == baseline_hard,
+                "Task 4 FD hard limit changed during case"
             );
+            if index == 1 {
+                // Session::start may raise soft to hard before the first link.
+                // Its best-effort setrlimit also permits the original soft.
+                let session = matches!(case, "detailed" | "highslot-exit" | "highslot-exec");
+                ensure!(
+                    soft == baseline_soft || (session && soft == baseline_hard),
+                    "Task 4 FD attach limit transition changed"
+                );
+                attached_soft = Some(soft);
+            } else {
+                ensure!(
+                    attached_soft == Some(soft),
+                    "Task 4 FD limit changed after attach"
+                );
+            }
         } else {
-            limit = Some((soft, hard));
+            baseline = Some((soft, hard));
         }
         previous_time = time;
     }
@@ -1316,6 +1332,58 @@ fn task4_resource_samples_require_all_phases_and_stable_limit() -> Result<()> {
     assert!(task4_validate_resource_samples("detailed", &complete[..2]).is_err());
     let mut changed = complete;
     changed[2]["soft"] = serde_json::json!(4096);
+    assert!(task4_validate_resource_samples("detailed", &changed).is_err());
+    Ok(())
+}
+
+#[test]
+fn task4_resource_samples_allow_only_documented_attach_raise() -> Result<()> {
+    let sample = |phase: &str, count: u64, soft: u64, hard: u64, time: u64| {
+        serde_json::json!({
+            "phase":phase,"fd_count":count,"soft":soft,"hard":hard,
+            "timestamp_ns":time.to_string()
+        })
+    };
+    let raised = vec![
+        sample("baseline", 10, 8192, 524_288, 1),
+        sample("post_attach", 4230, 524_288, 524_288, 2),
+        sample("pre_detach", 4230, 524_288, 524_288, 3),
+    ];
+    task4_validate_resource_samples("detailed", &raised)?;
+    task4_validate_resource_samples("highslot-exit", &raised)?;
+    let mut exec = raised.clone();
+    exec.insert(2, sample("post_rebind", 4230, 524_288, 524_288, 3));
+    exec[3]["timestamp_ns"] = serde_json::json!("4");
+    task4_validate_resource_samples("highslot-exec", &exec)?;
+
+    let mut unchanged = raised.clone();
+    unchanged[1]["soft"] = serde_json::json!(8192);
+    unchanged[2]["soft"] = serde_json::json!(8192);
+    task4_validate_resource_samples("detailed", &unchanged)?;
+    task4_validate_resource_samples("inventory", &unchanged)?;
+    assert!(task4_validate_resource_samples("inventory", &raised).is_err());
+
+    let mut changed = raised.clone();
+    changed[1]["soft"] = serde_json::json!(16_384);
+    assert!(task4_validate_resource_samples("detailed", &changed).is_err());
+    changed = raised.clone();
+    changed[1]["hard"] = serde_json::json!(600_000);
+    assert!(task4_validate_resource_samples("detailed", &changed).is_err());
+    changed = raised.clone();
+    changed[2]["soft"] = serde_json::json!(8192);
+    assert!(task4_validate_resource_samples("detailed", &changed).is_err());
+    changed = exec.clone();
+    changed[2]["soft"] = serde_json::json!(8192);
+    assert!(task4_validate_resource_samples("highslot-exec", &changed).is_err());
+    changed = raised.clone();
+    changed[1]["fd_count"] = serde_json::json!(524_289);
+    assert!(task4_validate_resource_samples("detailed", &changed).is_err());
+    changed = raised.clone();
+    changed[2]["timestamp_ns"] = serde_json::json!("1");
+    assert!(task4_validate_resource_samples("detailed", &changed).is_err());
+    assert!(task4_validate_resource_samples("detailed", &raised[..2]).is_err());
+    changed = raised;
+    changed.swap(1, 2);
     assert!(task4_validate_resource_samples("detailed", &changed).is_err());
     Ok(())
 }

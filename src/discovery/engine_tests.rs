@@ -6563,6 +6563,7 @@ fn apply_outcome_keeps_static_timing_and_generation_loss_ownership() {
         static_failures: [failed.clone()].into_iter().collect(),
         newly_rejected_keys: BTreeSet::new(),
         selection_authorized: false,
+        unpublished_views: BTreeSet::new(),
     };
 
     engine.record_apply_timing(&outcome);
@@ -15270,12 +15271,13 @@ fn refresh_releases_view_ids_at_the_post_retirement_preflight_exits() {
 }
 
 /// U-11: a view the tick never admitted returns its ID only when nothing
-/// still names it. A conservative retirement commits the modules and pin
-/// claims of every new view that stayed current without retaining the view,
-/// and a record pass that fails after `queue_apply_outcome` can leave a
-/// retirement intent behind. A later generation reusing such an ID would
-/// inherit the old one's modules, claims, or retirement. Each leftover here
-/// is named by exactly one of those, and only the unnamed one is released.
+/// still names it: a committed module, a pin claim, or a retirement intent
+/// (a record pass that fails after `queue_apply_outcome` can leave one
+/// behind; U-07 stopped a conservative retirement from committing the
+/// modules and claims of a newcomer it does not retain). A later generation
+/// reusing such an ID would inherit the old one's modules, claims, or
+/// retirement. Each leftover here is named by exactly one of those, and only
+/// the unnamed one is released.
 #[test]
 fn unadmitted_view_ids_stay_allocated_while_engine_state_names_them() {
     let (mut engine, module, _, _) = engine_with_overlay(7);
@@ -15309,6 +15311,348 @@ fn unadmitted_view_ids_stay_allocated_while_engine_state_names_them() {
         engine.retired_view_ids,
         vec![free.0],
         "only the ID nothing names returns to the pool"
+    );
+}
+
+/// U-07 fixture: a cgroup-scope engine whose membership is exactly what the
+/// test writes to `cgroup.procs`, so no process outside the test is ever in
+/// scope. The providers are the module hints, and the tick quantum is lifted
+/// so wall time never defers an admission.
+fn u07_engine(members: &[u32], providers: &[PathBuf]) -> (Engine, tempfile::TempDir) {
+    let (mut engine, scope) = engine_over_cgroup_naming(members);
+    engine.module_hints = providers.to_vec();
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    (engine, scope)
+}
+
+fn u07_name_members(scope: &Path, members: &[u32]) {
+    let listing: String = members.iter().map(|pid| format!("{pid}\n")).collect();
+    std::fs::write(scope.join("cgroup.procs"), listing).expect("rewrite cgroup.procs");
+}
+
+/// One inventory tick that hands the tick's additions frame to the caller.
+fn u07_tick(engine: &mut Engine, session: &mut ScriptedSession, additions: &mut bool) {
+    let mut collect: Box<DiscoveryCollector<'_>> = Box::new(Engine::collect_discovery_records);
+    engine
+        .refresh_inventory(
+            session,
+            additions,
+            &mut Vec::new(),
+            &mut PendingViewRetirements::new(),
+            &mut *collect,
+            &mut PauseClosure::new(true),
+        )
+        .expect("an inventory refresh over a cgroup scope");
+}
+
+/// The plan's slots on the provider with this file name, as (active,
+/// inactive) slot indices.
+fn u07_provider_slots(engine: &Engine, provider: &str) -> (Vec<u32>, Vec<u32>) {
+    engine
+        .plan
+        .slots
+        .iter()
+        .filter(|slot| slot.object_path.ends_with(provider))
+        .map(|slot| slot.index)
+        .partition(|index| engine.plan.is_active(*index))
+}
+
+/// U-07. A foreign member that ends is an ordinary retirement, and the
+/// conservative replay that retires it only removes. That replay used to
+/// close the whole tick's additions frame, so a newcomer admitted in the same
+/// tick was published with every slot deactivated, never attached and never
+/// armed. As a known view it was never retried afterwards. Here the foreign
+/// member's retirement and the newcomer's admission share one tick, and the
+/// newcomer must leave that tick attached and armed.
+#[test]
+fn a_foreign_exit_retired_in_the_same_tick_does_not_strand_a_newcomer() {
+    let dir = tempfile::tempdir().expect("a fixture directory");
+    let provider = system_scope_build_fixture(dir.path(), "u07-newcomer");
+    let driver = system_scope_build_driver(dir.path());
+    let mut foreign = spawn_execed_sleep();
+    let (mut engine, scope) = u07_engine(&[foreign.id()], std::slice::from_ref(&provider));
+    let mut session = ScriptedSession::default();
+    u07_tick(&mut engine, &mut session, &mut true);
+    let foreign_view = engine
+        .views
+        .iter()
+        .find(|view| view.pid() == foreign.id())
+        .map(ProcessView::id)
+        .expect("tick 1 admits the foreign member");
+
+    // Between the ticks the foreign member ends and leaves the scope, and the
+    // newcomer joins it: tick 2 retires the one and admits the other.
+    foreign.kill().unwrap();
+    foreign.wait().unwrap();
+    let newcomer = system_scope_spawn_loaded(&driver, &provider);
+    u07_name_members(scope.path(), &[newcomer.pid()]);
+    let attached_before = session.attached_slots.len();
+    let mut additions = true;
+    u07_tick(&mut engine, &mut session, &mut additions);
+
+    assert!(
+        engine.views.iter().all(|view| view.id() != foreign_view),
+        "tick 2 retires the ended foreign member"
+    );
+    let newcomer_view = engine
+        .views
+        .iter()
+        .find(|view| view.pid() == newcomer.pid())
+        .map(ProcessView::id)
+        .expect("tick 2 admits the fully verified newcomer");
+    let (active, inactive) = u07_provider_slots(&engine, "u07-newcomer.so");
+    let attached = &session.attached_slots[attached_before..];
+    assert!(
+        !active.is_empty() && inactive.is_empty(),
+        "the newcomer was published without its links: active {active:?}, inactive {inactive:?}, attach calls {attached:?}"
+    );
+    assert_eq!(
+        attached.iter().sum::<usize>(),
+        active.len(),
+        "the same tick attaches exactly the newcomer's slots"
+    );
+    assert!(
+        !engine
+            .loader_registry
+            .ids_for_view(newcomer_view)
+            .is_empty(),
+        "the same tick arms the newcomer's loader"
+    );
+    assert!(
+        additions,
+        "retiring an ended member leaves the tick open for additions"
+    );
+}
+
+/// U-07. The conservative replay never attaches: that is a property of its
+/// own candidate, not of the tick, so a clean replay leaves the tick's
+/// additions frame open. Ownership uncertainty still closes it: a replay
+/// whose detach fails blocks additions for the rest of the tick, exactly as
+/// its PARTIAL reason says.
+#[test]
+fn a_conservative_replay_closes_the_tick_only_on_ownership_uncertainty() {
+    for detach_fails in [false, true] {
+        let (mut child, mut engine, _) = engine_with_one_accepted_provider();
+        let slots = engine.plan.slots.len();
+        assert_eq!(slots, 1, "the retired view owns one attached slot");
+        engine.pending_retirements.insert(engine.views[0].id());
+        let mut session = ScriptedSession::default();
+        session.fail_slot_detaches([detach_fails]);
+        let mut additions = true;
+        let mut pending = PendingViewRetirements::new();
+
+        let outcome =
+            engine.replay_pending_conservative(&mut session, &mut additions, &mut pending);
+
+        assert!(
+            !outcome.refused(),
+            "detach failed: {detach_fails}; the replay applied"
+        );
+        assert!(
+            engine.pending_retirements.is_empty(),
+            "detach failed: {detach_fails}; the replay consumed its retirement"
+        );
+        assert_eq!(
+            session.detached_slots.first(),
+            Some(&slots),
+            "detach failed: {detach_fails}; the replay detached the retired view's slots"
+        );
+        assert!(
+            session.attached_slots.is_empty(),
+            "detach failed: {detach_fails}; a conservative replay attaches nothing"
+        );
+        assert_eq!(
+            additions, !detach_fails,
+            "detach failed: {detach_fails}; only ownership uncertainty closes the tick"
+        );
+        let blocked = Skipped {
+            subject: "live discovery detach".into(),
+            reason:
+                "a one-shot detach failed; additions and replacements were blocked for this cycle"
+                    .into(),
+        };
+        assert_eq!(
+            engine.counters.object_skips.contains(&blocked),
+            detach_fails,
+            "detach failed: {detach_fails}; {:?}",
+            engine.counters.object_skips
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+}
+
+/// U-07. A tick whose additions are already closed (by its caller or by an
+/// earlier failure in the batch) cannot attach a newcomer, so it must not
+/// publish one: no view, module, pin claim or active slot of the newcomer is
+/// committed, its view ID returns to the pool, and its pid is requested
+/// again. The next open tick then admits it whole.
+#[test]
+fn a_closed_tick_leaves_a_newcomer_unpublished_and_requested() {
+    let dir = tempfile::tempdir().expect("a fixture directory");
+    let provider = system_scope_build_fixture(dir.path(), "u07-closed");
+    let driver = system_scope_build_driver(dir.path());
+    let newcomer = system_scope_spawn_loaded(&driver, &provider);
+    let (mut engine, _scope) = u07_engine(&[newcomer.pid()], std::slice::from_ref(&provider));
+    let mut session = ScriptedSession::default();
+
+    let mut additions = false;
+    u07_tick(&mut engine, &mut session, &mut additions);
+    assert!(
+        engine.views.is_empty(),
+        "a closed tick publishes no newcomer: {:?}",
+        engine
+            .views
+            .iter()
+            .map(|view| (view.id(), view.pid()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        engine.modules.is_empty(),
+        "a closed tick commits no newcomer module: {:?}",
+        engine
+            .modules
+            .iter()
+            .map(|module| (module.scanned.view, &module.scanned.path))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        engine.pinned.view_claims(ProcessViewId(0)).is_none(),
+        "a closed tick commits no newcomer pin claim"
+    );
+    let (active, _) = u07_provider_slots(&engine, "u07-closed.so");
+    assert!(active.is_empty(), "no newcomer slot is active: {active:?}");
+    assert!(
+        engine
+            .plan
+            .modules
+            .iter()
+            .all(|module| !module.path.ends_with("u07-closed.so")),
+        "the plan names no newcomer provider"
+    );
+    assert!(
+        session.attached_slots.is_empty(),
+        "a closed tick attaches nothing"
+    );
+    assert_eq!(
+        engine.retired_view_ids,
+        vec![0],
+        "the unpublished newcomer's view ID returns to the pool"
+    );
+    assert!(
+        engine.refresh_requested.contains(&newcomer.pid()),
+        "the unpublished newcomer is requested again"
+    );
+
+    let mut additions = true;
+    u07_tick(&mut engine, &mut session, &mut additions);
+    let view = engine
+        .views
+        .iter()
+        .find(|view| view.pid() == newcomer.pid())
+        .map(ProcessView::id)
+        .expect("the next open tick admits the newcomer");
+    let (active, inactive) = u07_provider_slots(&engine, "u07-closed.so");
+    assert!(
+        !active.is_empty(),
+        "the next open tick activates the newcomer's slots: inactive {inactive:?}"
+    );
+    assert_eq!(
+        session.attached_slots.iter().sum::<usize>(),
+        active.len(),
+        "the next open tick attaches exactly the newcomer's slots"
+    );
+    assert!(
+        !engine.loader_registry.ids_for_view(view).is_empty(),
+        "the next open tick arms the newcomer's loader"
+    );
+    assert!(
+        !engine.refresh_requested.contains(&newcomer.pid()),
+        "the admission consumes the retry request"
+    );
+}
+
+/// Task 1's carried concern, on the U-07 chain. Every newcomer is part of
+/// the tick's candidate, so a generation that ends while a newcomer's links
+/// are attached downgrades the whole candidate to a conservative
+/// retirement. That committed the surviving newcomer's modules, pin claims
+/// and attached slots but dropped its view. The orphaned module then named a
+/// view nothing retained, every later candidate read as stale, and discovery
+/// never admitted anything again. The survivor must stay unpublished, its
+/// links rolled back and its pid requested, and the next tick must admit it
+/// whole.
+#[test]
+fn a_generation_lost_during_a_newcomers_attach_leaves_no_orphaned_publication() {
+    let dir = tempfile::tempdir().expect("a fixture directory");
+    let provider = system_scope_build_fixture(dir.path(), "u07-survivor");
+    let driver = system_scope_build_driver(dir.path());
+    let survivor = system_scope_spawn_loaded(&driver, &provider);
+    // Killed and reaped inside `attach_targets`, between the link mutation's
+    // generation precheck and its postcheck; the test never waits on it.
+    let lost = spawn_execed_sleep().id();
+    let (mut engine, scope) = u07_engine(&[survivor.pid(), lost], std::slice::from_ref(&provider));
+    let mut session = ScriptedSession::losing_generation_at_attach(lost);
+
+    u07_tick(&mut engine, &mut session, &mut true);
+    let attached = session.attached_slots.iter().sum::<usize>();
+    assert!(attached > 0, "tick 1 attached the survivor's slots");
+    let retained: BTreeSet<_> = engine.views.iter().map(ProcessView::id).collect();
+    let orphaned: Vec<_> = engine
+        .modules
+        .iter()
+        .filter(|module| !retained.contains(&module.scanned.view))
+        .map(|module| (module.scanned.view, module.scanned.path.clone()))
+        .collect();
+    assert!(
+        orphaned.is_empty(),
+        "no committed module may name a view the engine does not retain: {orphaned:?}, retained {retained:?}"
+    );
+    assert!(
+        engine.views.iter().all(|view| view.pid() != survivor.pid()),
+        "a downgraded candidate retains no newcomer"
+    );
+    let (active, _) = u07_provider_slots(&engine, "u07-survivor.so");
+    assert!(
+        active.is_empty(),
+        "an unpublished survivor keeps no active link: {active:?}"
+    );
+    assert_eq!(
+        session
+            .detached_slot_indices
+            .iter()
+            .map(Vec::len)
+            .sum::<usize>(),
+        attached,
+        "the survivor's attached links were rolled back"
+    );
+    assert!(
+        engine.refresh_requested.contains(&survivor.pid()),
+        "the unpublished survivor is requested again"
+    );
+
+    u07_name_members(scope.path(), &[survivor.pid()]);
+    u07_tick(&mut engine, &mut session, &mut true);
+    let view = engine
+        .views
+        .iter()
+        .find(|view| view.pid() == survivor.pid())
+        .map(ProcessView::id)
+        .expect("the next tick admits the survivor");
+    let (active, _) = u07_provider_slots(&engine, "u07-survivor.so");
+    assert!(
+        !active.is_empty(),
+        "the next tick activates the survivor's slots"
+    );
+    assert!(
+        engine
+            .modules
+            .iter()
+            .all(|module| module.scanned.view == view),
+        "every committed module names the retained survivor"
+    );
+    assert!(
+        !engine.loader_registry.ids_for_view(view).is_empty(),
+        "the next tick arms the survivor's loader"
     );
 }
 

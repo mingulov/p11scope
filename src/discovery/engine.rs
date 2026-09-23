@@ -2421,6 +2421,9 @@ struct ApplyOutcome {
     static_failures: BTreeSet<PinnedTimingKey>,
     newly_rejected_keys: BTreeSet<ObjectKey>,
     selection_authorized: bool,
+    /// Inventory newcomers (`extra_views`) this apply left unpublished: none
+    /// of their pins, modules or links were committed (U-07).
+    unpublished_views: BTreeSet<ProcessViewId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8946,6 +8949,7 @@ impl Engine {
             candidate,
             extra_views,
             target_modules,
+            may_add,
             additions_allowed,
             &mut outcome,
         );
@@ -8975,31 +8979,60 @@ impl Engine {
     /// The one complete finalization for a candidate whose links were already
     /// mutated. It never short-circuits and never returns: a lost generation
     /// downgrades the disposition and cleans up, it does not unwind.
+    ///
+    /// An inventory newcomer (`extra_views`) is published whole or not at all
+    /// (U-07). Its links attach only in this apply and only while additions
+    /// ran, and only an Accepted candidate retains its view. A candidate that
+    /// lost a generation, or ran without additions, would otherwise publish
+    /// the newcomer without links or commit pins and modules naming a view
+    /// that nothing retains. Instead it commits none of the newcomer's
+    /// sources, detaches any link it attached, and reports it in
+    /// `unpublished_views` so the caller requests it again.
+    #[allow(clippy::too_many_arguments)]
     fn finalize_candidate(
         &mut self,
         session: &mut dyn EngineSession,
         mut candidate: LiveCandidate,
         extra_views: &[&ProcessView],
         target_modules: BTreeSet<PinnedTimingKey>,
+        additions_ran: bool,
         additions_allowed: &mut bool,
         outcome: &mut ApplyOutcome,
     ) {
         let selection_pending = candidate.selection_admission.take();
         outcome.stale_views = stale_process_views(&self.views, extra_views, &candidate.views);
         let retired = !outcome.stale_views.is_empty();
+        if retired || !additions_ran {
+            outcome.unpublished_views = extra_views
+                .iter()
+                .map(|view| view.id())
+                .filter(|view| !outcome.stale_views.contains(view))
+                .collect();
+        }
         if retired {
             *additions_allowed = false;
             outcome.static_failures.extend(target_modules);
-            let stale_views = outcome.stale_views.clone();
-            self.retire_stale_candidate_sources(
-                session,
-                &mut candidate,
-                &stale_views,
-                &mut *outcome,
-            );
+            let dropped: BTreeSet<_> = outcome
+                .stale_views
+                .union(&outcome.unpublished_views)
+                .copied()
+                .collect();
+            self.retire_stale_candidate_sources(session, &mut candidate, &dropped, &mut *outcome);
             self.mark_partial(
                 "live discovery generation",
                 "a process generation changed after link mutation; its targets were retired before context cleanup",
+            );
+        } else if !outcome.unpublished_views.is_empty() {
+            let unpublished = outcome.unpublished_views.clone();
+            self.retire_stale_candidate_sources(
+                session,
+                &mut candidate,
+                &unpublished,
+                &mut *outcome,
+            );
+            self.mark_partial(
+                "live inventory transaction",
+                "additions were blocked; newly observed process generations were left unpublished for a later tick",
             );
         }
         if let Some(pending) = selection_pending {
@@ -9259,8 +9292,9 @@ impl Engine {
         outcome.selection_authorized &= outcome.disposition == ApplyDisposition::Accepted;
     }
 
-    /// Drops the pins, modules, proofs, and live endpoints a lost process
-    /// generation owned. Infallible on purpose: it runs after link mutation.
+    /// Drops the pins, modules, proofs, and live endpoints that a lost process
+    /// generation, or a newcomer left unpublished, owned. Infallible on
+    /// purpose: it runs after link mutation.
     fn retire_stale_candidate_sources(
         &mut self,
         session: &mut dyn EngineSession,
@@ -12689,6 +12723,16 @@ impl Engine {
         outcome.changed
     }
 
+    /// Applies the queued conservative retirements and rejections. That
+    /// candidate only removes, so it runs with its own additions closed: a
+    /// property of the candidate, not of the tick. A replay that commits
+    /// cleanly leaves the caller's additions as they were. Closing the tick
+    /// for it stranded every newcomer the same tick admitted, published
+    /// without links, whenever an ordinary process ended (U-07). A replay
+    /// that does not commit cleanly still closes the tick: one that cannot be
+    /// rebuilt or applied, one that is refused or retired, and one whose
+    /// failed detach leaves ownership uncertain. Either way its batch never
+    /// confirms pause completeness: the caller fails the closure.
     fn replay_pending_conservative(
         &mut self,
         session: &mut dyn EngineSession,
@@ -12697,10 +12741,10 @@ impl Engine {
     ) -> ApplyOutcome {
         let retirements = self.pending_retirements.clone();
         let keys = self.pending_rejected_keys.clone();
-        *additions_allowed = false;
         let candidate = match self.conservative_candidate(&retirements, &keys) {
             Ok(candidate) => candidate,
             Err(_) => {
+                *additions_allowed = false;
                 self.mark_partial(
                     "live discovery transaction",
                     "a pending conservative candidate could not be rebuilt and remains queued",
@@ -12708,10 +12752,13 @@ impl Engine {
                 return ApplyOutcome::default();
             }
         };
-        let outcome = match self.apply_candidate(session, candidate, additions_allowed, false, &[])
+        let detach_failures = session.detach_failures().len();
+        let mut no_additions = false;
+        let outcome = match self.apply_candidate(session, candidate, &mut no_additions, false, &[])
         {
             Ok(outcome) => outcome,
             Err(_) => {
+                *additions_allowed = false;
                 self.mark_partial(
                     "live discovery transaction",
                     "a pending conservative candidate could not be applied and remains queued",
@@ -12719,6 +12766,9 @@ impl Engine {
                 return ApplyOutcome::default();
             }
         };
+        if !outcome.accepted() || session.detach_failures().len() > detach_failures {
+            *additions_allowed = false;
+        }
         self.record_apply_timing(&outcome);
         self.queue_conservative_outcome(&outcome, &retirements, &keys, pending_views);
         outcome
@@ -13060,6 +13110,11 @@ impl Engine {
                 let outcome =
                     self.replay_pending_conservative(session, additions_allowed, pending_views);
                 closure.observe_apply(&outcome);
+                // A batch that replays a retirement or a rejection never
+                // confirms pause completeness. That verdict is the closure's
+                // alone: the tick's additions stay open for unrelated
+                // generations (U-07).
+                closure.fail();
                 changed |= outcome.changed;
                 if outcome.refused() && pending_views.is_empty() {
                     break;
@@ -13129,8 +13184,7 @@ impl Engine {
                 // for an `ExecRefresh`, which keeps its view and rescans the
                 // same live generation: dropping its pins re-pins the same
                 // provider under a fresh ID, so a second full slot set is
-                // allocated for targets that already have one and the replay's
-                // `additions_allowed = false` stops the replacement attaching.
+                // allocated for targets that already have one.
                 if cause != RetirementCause::ExecRefresh {
                     self.pending_retirements.insert(view);
                 }
@@ -13755,13 +13809,12 @@ impl Engine {
     }
 
     /// Returns the IDs of views a tick opened but never admitted. Such a view
-    /// is normally named by nothing else, with two exceptions. A conservative
-    /// retirement commits the modules and pin claims of every new view that
-    /// stayed current, without retaining the view. And a record pass that
-    /// fails after `queue_apply_outcome` can leave a lost newcomer's
-    /// retirement intent behind. Those IDs stay allocated: a later generation
-    /// that reused one would inherit the old one's modules, claims, or
-    /// retirement.
+    /// is normally named by nothing else: an apply that does not retain a
+    /// newcomer commits none of its modules or pin claims either (U-07). A
+    /// record pass that fails after `queue_apply_outcome` can still leave a
+    /// lost newcomer's retirement intent behind. Any ID that engine state
+    /// still names stays allocated: a later generation that reused one would
+    /// inherit the old one's modules, claims, or retirement.
     fn release_unadmitted_views(&mut self, views: Vec<InventoryNewView>) {
         for (view, _, _) in views {
             let id = view.id();
@@ -14282,23 +14335,35 @@ impl Engine {
         let outcome =
             self.apply_candidate(session, candidate, additions_allowed, true, &extra_views)?;
         self.record_apply_timing(&outcome);
+        // Only a published newcomer is retained and armed. An unpublished one
+        // committed nothing, so it stays in `new_views` for release and is
+        // requested again, like a newcomer lost to a stale preflight (U-07).
         let new_view_ids: BTreeSet<_> = if conservative_only {
             BTreeSet::new()
         } else {
-            new_views.iter().map(|(view, _, _)| view.id()).collect()
+            new_views
+                .iter()
+                .map(|(view, _, _)| view.id())
+                .filter(|view| !outcome.unpublished_views.contains(view))
+                .collect()
         };
         let new_view_pids: Vec<_> = new_view_pids.into_iter().collect();
-        for view in &outcome.stale_views {
+        for view in outcome.stale_views.iter().chain(&outcome.unpublished_views) {
             if let Some(pid) = new_views
                 .iter()
                 .find(|(candidate, _, _)| candidate.id() == *view)
                 .map(|(view, _, _)| view.pid())
             {
                 self.request_refresh(pid);
+                failed_refresh_pids.insert(pid);
             }
         }
         if outcome.accepted() && !conservative_only {
-            for (view, _, _) in std::mem::take(new_views) {
+            let (admitted, unpublished): (Vec<_>, Vec<_>) = std::mem::take(new_views)
+                .into_iter()
+                .partition(|(view, _, _)| new_view_ids.contains(&view.id()));
+            *new_views = unpublished;
+            for (view, _, _) in admitted {
                 self.views.push(view);
             }
             self.record_cgroup_view_admissions(new_view_ids.iter().copied());

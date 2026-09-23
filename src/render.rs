@@ -363,10 +363,13 @@ pub struct DiscoveryEvidence {
     pub uncorroborated_candidates: u64,
     /// Attach slots two modules both publish: counted, never attributed.
     pub module_ambiguous: u64,
-    /// Modules the slot ceiling cut short. A module new to the capture is
-    /// refused whole, never attached in part; one already attached whose
-    /// growth did not fit keeps its endpoints and is listed as partially
-    /// covered, its reason opening with `admitted module needs` (G-03).
+    /// Modules the slot ceiling cut short, one record per module. A module
+    /// new to the capture, or an attached one whose sources list none of its
+    /// endpoints any more, is refused whole, never attached in part; one
+    /// already attached whose growth did not fit keeps its endpoints and is
+    /// listed as partially covered, its reason opening with `admitted module
+    /// needs` (G-03) and stating the largest omission the capture saw for it,
+    /// a lower bound that a later whole refusal supersedes.
     pub modules_skipped: Vec<SkippedOut>,
     /// Optional-manifest objects ignored only because one exact scan-opened
     /// replacement table covered every dropped claim. Numeric manifest/object

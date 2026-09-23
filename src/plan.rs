@@ -4,18 +4,21 @@
 //! unique {object, file_offset} across all of them. A target two modules both hand
 //! out is attached once (attaching twice would double-count every call through it),
 //! and because its counts then belong to neither module its semantics degrade to
-//! COUNT_ONLY (spec §4.7). A module new to the capture whose manifest targets
-//! exceed the remaining budget is refused whole, never truncated: a partially
-//! attached module would silently under-report a provider. Scan tables admit
-//! in publication-evidence order: corroborated/published tables bypass the
-//! per-object cap (global budget only, atomic refusal), unresolved heuristic
-//! tables admit until the per-object cap, and the heuristic spill is reported
-//! as `uncorroborated_candidates` — whole-module refusal of a new module
-//! stays only for the case where even the strongest table exceeds the
-//! remaining budget. A module whose sources still list endpoints this capture
-//! already attached for it is never refused whole (G-03): when what it needs
-//! next does not fit, it keeps those endpoints, no prefix of the rest is
-//! attached, and the omission is reported, so it is partial but never silent.
+//! COUNT_ONLY (spec §4.7). A module is never silently truncated: a partially
+//! attached module would under-report a provider. Scan tables admit in
+//! publication-evidence order: unresolved heuristic tables admit until the
+//! per-object cap, and their spill is reported as `uncorroborated_candidates`
+//! rather than refused. The demand that must fit atomically — the manifest
+//! subset, the strongest table, the union of the corroborated/published
+//! tables (which bypass the per-object cap), and under broad or Inventory
+//! admission the complete validated union — refuses the module whole when it
+//! exceeds the remaining budget. That holds for a module new to the capture
+//! and for one whose sources no longer list any endpoint the capture attached
+//! for it (its old endpoints retire; capture history still names it). A
+//! module whose sources still list such endpoints is never refused whole
+//! (G-03): when what it needs next does not fit, it keeps those endpoints, no
+//! prefix of the rest is attached, and the omission is reported, so it is
+//! partial but never silent.
 //!
 //! Both discovery sources — the memory scan and a manifest — lower into `Discovered`
 //! and go through the same `merge`, so there is exactly one implementation of the
@@ -1308,8 +1311,10 @@ struct Target<'a> {
 /// Borrowed scan decode behind one scan piece, for evidence-ordered table
 /// admission in `merge`. Manifest pieces carry `None`: their tables are
 /// operator-authoritative, admitted whole or refused whole as before — except
-/// that a module already attached keeps its attached targets when what it
-/// needs next does not fit (G-03).
+/// that a module whose sources still list targets the capture attached for it
+/// keeps those targets when what it needs next does not fit (G-03). An
+/// attached module whose sources list none of them is refused whole, like a
+/// new one.
 struct ScanEvidence<'a> {
     tables: &'a [ScannedTable],
     interfaces: &'a [ScannedInterface],

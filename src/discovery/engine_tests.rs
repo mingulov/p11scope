@@ -15895,6 +15895,166 @@ fn a_foreign_exit_during_arming_requests_the_newcomer_it_left_unarmed() {
     );
 }
 
+/// U-07 fix round 2 (C2). While the tick is still open, the retain before the
+/// arm phase drops the refresh request of every view it refreshed. A
+/// module-owning foreign view that ends while a refreshed view's loader
+/// candidate is admitted closes the tick inside the arm phase, so that view
+/// was left unarmed with no request. That is the main dlopen path: an
+/// exploratory member that gains a provider is armed as a refreshed view,
+/// and once it owns modules polling never rescans it. It must be requested,
+/// and the next tick must arm it.
+#[test]
+fn a_foreign_exit_during_arming_requests_the_refreshed_view_it_left_unarmed() {
+    let dir = tempfile::tempdir().expect("a fixture directory");
+    let provider = system_scope_build_fixture(dir.path(), "u07-rearm");
+    let foreign_provider = system_scope_build_fixture(dir.path(), "u07-rearm-foreign");
+    let driver = system_scope_build_driver(dir.path());
+    let mut member = LazyLoader::spawn(dir.path(), &provider);
+    let mut foreign = system_scope_spawn_loaded(&driver, &foreign_provider);
+    let (mut engine, scope) = u07_engine(
+        &[member.pid(), foreign.pid()],
+        &[provider.clone(), foreign_provider.clone()],
+    );
+    let mut session = ScriptedSession::default();
+    u07_tick(&mut engine, &mut session, &mut true);
+    let view_of = |engine: &Engine, pid: u32| {
+        engine
+            .views
+            .iter()
+            .find(|view| view.pid() == pid)
+            .map(ProcessView::id)
+    };
+    let view = view_of(&engine, member.pid()).expect("tick 1 admits the member");
+    let foreign_view = view_of(&engine, foreign.pid()).expect("tick 1 admits the foreign view");
+    assert!(
+        engine.loader_registry.ids_for_view(view).is_empty(),
+        "the module-free member stays exploratory"
+    );
+    assert!(
+        !engine.loader_registry.ids_for_view(foreign_view).is_empty(),
+        "tick 1 arms the module-owning foreign view"
+    );
+
+    // The member dlopens its provider; the request models the refresh event.
+    member.send(b'L');
+    member.wait_for(b"P11SCOPE_LAZY loaded\n");
+    engine.request_refresh(member.pid());
+    // Preflights 1 and 2 are the tick's own; 3 is the member's loader
+    // candidate, where the foreign view ends.
+    session.lose_generations_at_preflight([None, None, Some(foreign.pid())]);
+    let mut additions = true;
+    u07_tick(&mut engine, &mut session, &mut additions);
+    // The seam killed and reaped it: its guard must not signal the pid again.
+    // SAFETY: signal 0 only probes whether the pid still exists.
+    foreign.live = unsafe { libc::kill(foreign.pid() as libc::pid_t, 0) } == 0;
+
+    let (active, _) = u07_provider_slots(&engine, "u07-rearm.so");
+    assert!(
+        !active.is_empty(),
+        "the refresh attaches the member's new provider"
+    );
+    assert!(!additions, "the foreign exit inside arming closes the tick");
+    assert!(
+        engine.loader_registry.ids_for_view(view).is_empty(),
+        "the closed tick leaves the refreshed member unarmed"
+    );
+    assert!(
+        engine.refresh_requested.contains(&member.pid()),
+        "the refreshed view the closed tick left unarmed is requested again"
+    );
+
+    u07_name_members(scope.path(), &[member.pid()]);
+    u07_tick(&mut engine, &mut session, &mut true);
+    assert!(
+        !engine.loader_registry.ids_for_view(view).is_empty(),
+        "the next tick arms the member"
+    );
+    assert!(
+        !engine.refresh_requested.contains(&member.pid()),
+        "arming consumes the refresh request"
+    );
+}
+
+/// U-07 fix round 2 (C1). A downgraded exact target is replaced by detaching
+/// its old link with the retirements and attaching the replacement last. A
+/// candidate view that ends between the new-target attach and the
+/// replacement's generation precheck (here inside the failed-slot detach,
+/// the only session call in that window) fails that precheck. The
+/// replacement then did nothing: its target stayed active with no link, and
+/// only session start would ever link it again. The target must be left
+/// inactive with an explicit failure. Slot 0's exact descriptor is set on
+/// the plan directly, standing in for the authorized identity that
+/// corroboration would supply; the rebuilt candidate downgrades it.
+#[test]
+fn a_generation_lost_before_replacement_leaves_the_detached_targets_inactive() {
+    let (mut kept, mut engine, modules) = engine_with_one_accepted_provider();
+    let descriptor = crate::kinds::function_id("C_Initialize").unwrap() + 1;
+    let accepted = &mut engine.plan.slots[0];
+    accepted.descriptor_index = descriptor;
+    accepted.semantics = crate::kinds::DESCRIPTORS[descriptor as usize];
+    accepted.semantic_authorized = true;
+    accepted.semantic_ambiguous = false;
+    engine.plan.validate_slot_index().unwrap();
+
+    // A second candidate view, whose own provider is new; it is killed and
+    // reaped inside the apply's second detach. The test never waits on it.
+    let lost = spawn_execed_sleep().id();
+    let lost_view = ProcessView::open(ProcessViewId(4), lost).unwrap();
+    engine.next_view_id = 5;
+    let lost_module = child_provider_modules(&lost_view)[1].clone();
+    let lost_pins = pin_test_modules(&lost_view, std::slice::from_ref(&lost_module));
+    engine.views.push(lost_view);
+    let mut pins = engine.pinned.clone();
+    let skipped = pins.absorb(lost_pins);
+    let candidate = engine
+        .live_candidate(pins, vec![modules[0].clone(), lost_module], skipped)
+        .unwrap();
+    assert_eq!(
+        candidate.delta.replace.len(),
+        1,
+        "the candidate downgrades slot 0"
+    );
+    assert_eq!(
+        candidate.delta.new.len(),
+        1,
+        "the second view's provider is new"
+    );
+    let replaced = candidate.delta.replace[0].index;
+    let mut session = ScriptedSession::default();
+    session.lose_generations_at_detach([None, Some(lost)]);
+    let mut additions = true;
+
+    engine
+        .apply_candidate(&mut session, candidate, &mut additions, false, &[])
+        .unwrap();
+
+    assert_eq!(
+        session.detached_slot_indices.first(),
+        Some(&vec![replaced]),
+        "the replaced target's old link was detached first"
+    );
+    assert_eq!(
+        session.attached_slots,
+        [1],
+        "the new target attached before the generation was lost"
+    );
+    assert!(
+        !engine.plan.is_active(replaced),
+        "a target whose old link was detached and never replaced must not stay active"
+    );
+    assert!(
+        engine.counters.object_skips.contains(&u07_partial(
+            "live discovery replacement",
+            "a process generation changed before downgraded exact targets were replaced; they were deactivated",
+        )),
+        "the unreplaced target is an explicit failure: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(!additions, "the lost generation closes the tick");
+    kept.kill().unwrap();
+    kept.wait().unwrap();
+}
+
 /// Replays one queued retirement through `replay_pending_conservative` on
 /// `engine_with_one_accepted_provider`, whose accepted provider stays in the
 /// replay's candidate: the retired view is `retired`, not the provider's.

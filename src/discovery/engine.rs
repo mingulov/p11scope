@@ -8934,7 +8934,25 @@ impl Engine {
                             "one or more downgraded exact targets could not be replaced",
                         );
                     }
-                    None => {}
+                    None => {
+                        // The replacement precheck found a candidate generation
+                        // gone. The old links went with `selected` above and
+                        // nothing replaced them, so the targets must not stay
+                        // active without a link (U-07). They are cells already
+                        // accepted, so no ownership needs relabelling.
+                        for slot in &candidate.delta.replace {
+                            outcome
+                                .static_failures
+                                .extend(slot_timing_keys(slot, &timing_owners));
+                            candidate.plan.deactivate(slot.index);
+                        }
+                        if !candidate.delta.replace.is_empty() {
+                            self.mark_partial(
+                                "live discovery replacement",
+                                "a process generation changed before downgraded exact targets were replaced; they were deactivated",
+                            );
+                        }
+                    }
                 }
             } else {
                 for slot in &candidate.delta.replace {
@@ -14485,16 +14503,18 @@ impl Engine {
         // A closed tick skips arming: the whole phase when the closure came
         // after the apply, and every view after the one that raised it inside
         // the phase. A newly admitted newcomer has no refresh request that
-        // the retain above could keep, so without one its loader would never
-        // be armed and its dynamic exports never attached (U-07). Request
-        // each owned newcomer the closed tick left unarmed; the next open
+        // the retain above could keep, and a refreshed view's request was
+        // dropped there whenever the tick was still open. Without one, its
+        // loader would never be armed and its dynamic exports never attached
+        // (U-07). Once it owns modules polling never rescans it either.
+        // Request each owned view the closed tick left unarmed; the next open
         // tick rescans and arms it.
         if !*additions_allowed {
             let unarmed: Vec<_> = self
                 .views
                 .iter()
                 .filter(|view| {
-                    new_view_ids.contains(&view.id())
+                    (new_view_ids.contains(&view.id()) || refreshed_ok.contains(&view.id()))
                         && view.still_the_same()
                         && self.loader_registry.ids_for_view(view.id()).is_empty()
                         && !self.loader_arming_gated(view.id())

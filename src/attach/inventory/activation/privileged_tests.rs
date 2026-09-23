@@ -2,8 +2,10 @@
 //! Owned, ignored live gates. The parent runs these serially with its BPF lane.
 use super::*;
 use crate::capacity::CallerBudget;
-use crate::discovery::identity::pin_scanned_view_objects;
-use crate::discovery::scan::{CaptureWorkBudget, ScannedModule};
+use crate::discovery::identity::{ReconciledModule, pin_scanned_view_objects};
+use crate::discovery::scan::{
+    CaptureWorkBudget, ScannedEntry, ScannedInterface, ScannedModule, ScannedTable,
+};
 use crate::plan::Slot;
 use crate::process::{PidPin, ProcessView, ProcessViewId};
 use aya::maps::{Array, HashMap, Map, MapData, PerCpuArray, PerCpuHashMap};
@@ -53,6 +55,10 @@ impl OwnedFixture {
     }
 
     fn build_n(ia32: bool, endpoints: u32) -> Result<Self> {
+        Self::build_n_with_alias(ia32, endpoints, false)
+    }
+
+    fn build_n_with_alias(ia32: bool, endpoints: u32, alias_zero: bool) -> Result<Self> {
         ensure!(
             (1..=2_113).contains(&endpoints),
             "unsupported owned fixture size"
@@ -82,10 +88,17 @@ static void hold_in_body(unsigned id) {
     if (strcmp(resume, "RESUME")) _exit(4);
     printf("RESUMED %u\n", id);
 }
+
+
 "#,
         );
         for id in 0..endpoints {
             c.push_str(&format!("__attribute__((noinline,used)) unsigned long owned_{id}(unsigned long x) {{ __asm__ volatile(\"\" ::: \"memory\"); hold_in_body({id}); return x + {id}; }}\n"));
+        }
+        if alias_zero {
+            c.push_str(
+                "extern __typeof__(owned_0) owned_alias_0 __attribute__((alias(\"owned_0\")));\n",
+            );
         }
         c.push_str(&format!(
             "typedef unsigned long (*fn)(unsigned long);\nstatic fn const functions[{endpoints}] = {{\n",
@@ -314,6 +327,211 @@ int main(int argc, char **argv) {
         );
         Ok(())
     }
+}
+
+struct Task4IdentityFixture {
+    fixture: OwnedFixture,
+    copy_path: PathBuf,
+    original_slot: u32,
+    copy_slot: u32,
+}
+
+impl Task4IdentityFixture {
+    fn build(policy: AdmissionPolicy) -> Result<Self> {
+        let mut fixture = OwnedFixture::build_n_with_alias(false, 1, true)?;
+        let original_elf = open_object(&fixture.path).map_err(anyhow::Error::msg)?;
+        let snapshot = ElfSnapshot::read(&original_elf).map_err(anyhow::Error::msg)?;
+        let original_offset = snapshot
+            .defined_symbol("owned_0")
+            .map_err(anyhow::Error::msg)?
+            .context("owned_0")?
+            .file_offset;
+        let alias_offset = snapshot
+            .defined_symbol("owned_alias_0")
+            .map_err(anyhow::Error::msg)?
+            .context("owned_alias_0")?
+            .file_offset;
+        ensure!(original_offset == alias_offset && snapshot.is_executable_offset(original_offset));
+        let copy_path = fixture._directory.path().join("owned-provider-copy");
+        std::fs::copy(&fixture.path, &copy_path)?;
+        let copy_elf = open_object(&copy_path).map_err(anyhow::Error::msg)?;
+        let copy_snapshot = ElfSnapshot::read(&copy_elf).map_err(anyhow::Error::msg)?;
+        let copy_offset = copy_snapshot
+            .defined_symbol("owned_0")
+            .map_err(anyhow::Error::msg)?
+            .context("copy owned_0")?
+            .file_offset;
+        ensure!(copy_offset == original_offset);
+        let original_bytes = std::fs::read(&fixture.path)?;
+        let copy_bytes = std::fs::read(&copy_path)?;
+        ensure!(
+            original_bytes == copy_bytes && task4_hash(&copy_bytes) == fixture.expected_sha256,
+            "same-byte identity control changed ELF bytes"
+        );
+        let original_meta = std::fs::metadata(&fixture.path)?;
+        let copy_meta = std::fs::metadata(&copy_path)?;
+        ensure!(
+            (original_meta.dev(), original_meta.ino()) != (copy_meta.dev(), copy_meta.ino()),
+            "same-byte identity copy reused live inode"
+        );
+        let view =
+            ProcessView::open(ProcessViewId(0), std::process::id()).map_err(anyhow::Error::msg)?;
+        let module_for =
+            |path: &Path, entries: Vec<(&'static str, u64)>| -> Result<ScannedModule> {
+                let file = open_object(path).map_err(anyhow::Error::msg)?;
+                let mapping = mapping_file_key(&file).map_err(anyhow::Error::msg)?;
+                let key = ObjectKey {
+                    device: Device {
+                        major: mapping.device_major,
+                        minor: mapping.device_minor,
+                    },
+                    inode: mapping.inode,
+                };
+                let path_text = path.display().to_string();
+                Ok(ScannedModule {
+                    view: view.id(),
+                    mount_namespace: view.mount_namespace(),
+                    key,
+                    path: path_text.clone(),
+                    decoder_abi: Some(ElfAbi::Lp64),
+                    exports: vec![],
+                    tables: vec![ScannedTable {
+                        version: (2, 40),
+                        walk: "full",
+                        entries: entries
+                            .into_iter()
+                            .map(|(name, file_offset)| ScannedEntry {
+                                name,
+                                object: key,
+                                object_path: path_text.clone(),
+                                file_offset,
+                            })
+                            .collect(),
+                        null_entries: vec![],
+                        unpinned: vec![],
+                        address: 0,
+                        file_offset: Some(original_offset),
+                        live_return: false,
+                        manifest_supported: false,
+                    }],
+                    interfaces: vec![ScannedInterface {
+                        index: 0,
+                        name_class: "exact_standard",
+                        name_lossy: None,
+                        name_private: None,
+                        flags: 0,
+                        table: Some(0),
+                    }],
+                })
+            };
+        let modules = [
+            module_for(
+                &fixture.path,
+                vec![
+                    ("owned_0", original_offset),
+                    ("owned_alias_0", alias_offset),
+                ],
+            )?,
+            module_for(&copy_path, vec![("owned_0", copy_offset)])?,
+        ];
+        let (pins, skipped) =
+            pin_scanned_view_objects(&view, &modules, &mut CaptureWorkBudget::default())
+                .map_err(anyhow::Error::msg)?;
+        ensure!(skipped.is_empty(), "identity pins skipped: {skipped:?}");
+        let reconciled: Vec<_> = modules
+            .iter()
+            .map(|module| {
+                let id = pins
+                    .id_for_scanned(module, module.key, &module.path)
+                    .context("identity module lacks actual pin")?;
+                Ok(ReconciledModule {
+                    scanned: module.clone(),
+                    object: id,
+                    entry_objects: vec![vec![id; module.tables[0].entries.len()]],
+                })
+            })
+            .collect::<Result<_>>()?;
+        let plan = crate::plan::build_from_sources_for_policy(&reconciled, &[], &pins, policy);
+        ensure!(
+            plan.slots.len() == 2,
+            "identity planner collapsed distinct inodes"
+        );
+        let original_id = reconciled[0].object;
+        let copy_id = reconciled[1].object;
+        ensure!(original_id != copy_id);
+        let original_slot = plan
+            .slots
+            .iter()
+            .find(|slot| slot.object == original_id)
+            .context("original physical target omitted")?;
+        let copy_slot = plan
+            .slots
+            .iter()
+            .find(|slot| slot.object == copy_id)
+            .context("same-byte distinct-inode physical target omitted")?;
+        ensure!(
+            original_slot.file_offset == original_offset
+                && original_slot.aliased
+                && original_slot.names.len() == 2
+                && copy_slot.file_offset == copy_offset
+                && !copy_slot.aliased,
+            "identity plan lost alias or distinct-inode facts"
+        );
+        let (original_slot, copy_slot) = (original_slot.index, copy_slot.index);
+        fixture.plan = plan;
+        fixture.pins = pins;
+        Ok(Self {
+            fixture,
+            copy_path,
+            original_slot,
+            copy_slot,
+        })
+    }
+
+    fn assert_copy_caller(&self, caller: &OwnedCaller) -> Result<()> {
+        let executable = open_object(&PathBuf::from(format!("/proc/{}/exe", caller.child.id())))
+            .map_err(anyhow::Error::msg)?;
+        let mapping = mapping_file_key(&executable).map_err(anyhow::Error::msg)?;
+        let key = ObjectKey {
+            device: Device {
+                major: mapping.device_major,
+                minor: mapping.device_minor,
+            },
+            inode: mapping.inode,
+        };
+        let slot = &self.fixture.plan.slots[self.copy_slot as usize];
+        let pinned = self
+            .fixture
+            .pins
+            .summary(slot.object)
+            .context("copy caller pin")?;
+        let inspected = inspect_file(&executable).map_err(anyhow::Error::msg)?;
+        ensure!(
+            key == pinned.key
+                && inspected.identity.sha256.as_deref()
+                    == Some(self.fixture.expected_sha256.as_str())
+                && inspected.abi == ElfAbi::Lp64,
+            "copy caller executable differs from live pinned physical target"
+        );
+        eprintln!(
+            "OWNED_CALLER pid={} key={key:?} sha256={} abi={:?}",
+            caller.child.id(),
+            self.fixture.expected_sha256,
+            inspected.abi
+        );
+        Ok(())
+    }
+}
+
+#[test]
+fn task4_physical_identity_real_alias_and_same_bytes_distinct_inode() -> Result<()> {
+    let inventory = InventoryBudget::new(2, 16).map_err(anyhow::Error::msg)?;
+    let fixture = Task4IdentityFixture::build(AdmissionPolicy::Inventory(inventory))?;
+    ensure!(fixture.original_slot != fixture.copy_slot);
+    ensure!(fixture.fixture.targets()?.entries.len() == 2);
+    let detailed = Task4IdentityFixture::build(AdmissionPolicy::Detailed)?;
+    ensure!(detailed.original_slot != detailed.copy_slot);
+    Ok(())
 }
 
 struct OwnedCaller {
@@ -951,6 +1169,7 @@ struct Task4Evidence {
     directory: PathBuf,
     index: usize,
     case: &'static str,
+    control: Option<(&'static str, &'static str, &'static str, &'static str)>,
     profile: &'static str,
     fixture_sha256: String,
     offsets_sha256: String,
@@ -958,6 +1177,7 @@ struct Task4Evidence {
     ledger: Task4Rows,
     raw: Task4Rows,
     links: Option<Task4Rows>,
+    registration: Option<Task4Rows>,
     rendered: Task4Rows,
     resources: Vec<serde_json::Value>,
     ledger_calls: usize,
@@ -971,22 +1191,48 @@ impl Task4Evidence {
         fixture: &OwnedFixture,
         object: &[u8],
     ) -> Result<Self> {
+        Self::new_control(case, profile, fixture, object, None)
+    }
+
+    fn new_control(
+        case: &'static str,
+        profile: &'static str,
+        fixture: &OwnedFixture,
+        object: &[u8],
+        control: Option<(&'static str, &'static str, &'static str, &'static str)>,
+    ) -> Result<Self> {
         let directory = PathBuf::from(
             std::env::var_os("P11SCOPE_TASK4_EVIDENCE_DIR").context("Task 4 evidence dir")?,
         );
         let index: usize = std::env::var("P11SCOPE_TASK4_CASE_INDEX")?.parse()?;
+        Self::new_control_at(case, profile, fixture, object, control, directory, index)
+    }
+
+    fn new_control_at(
+        case: &'static str,
+        profile: &'static str,
+        fixture: &OwnedFixture,
+        object: &[u8],
+        control: Option<(&'static str, &'static str, &'static str, &'static str)>,
+        directory: PathBuf,
+        index: usize,
+    ) -> Result<Self> {
         ensure!(index < 100);
         let offsets = std::fs::read(directory.join(format!("offsets-{index:02}.json")))?;
         Ok(Self {
             ledger: Task4Rows::create(&directory, index, "ledger", "jsonl")?,
             raw: Task4Rows::create(&directory, index, "raw", "jsonl")?,
-            links: (case == "inventory")
+            links: matches!(case, "inventory" | "inventory-identity")
                 .then(|| Task4Rows::create(&directory, index, "links", "jsonl"))
+                .transpose()?,
+            registration: (control.is_some() && matches!(case, "detailed" | "detailed-identity"))
+                .then(|| Task4Rows::create(&directory, index, "registration", "jsonl"))
                 .transpose()?,
             rendered: Task4Rows::create(&directory, index, "rendered", "txt")?,
             directory,
             index,
             case,
+            control,
             profile,
             fixture_sha256: fixture.expected_sha256.clone(),
             offsets_sha256: task4_hash(&offsets),
@@ -1020,6 +1266,36 @@ impl Task4Evidence {
         Ok(())
     }
 
+    fn identity_caller(
+        &mut self,
+        caller: &mut OwnedCaller,
+        phase: &str,
+        slot: u32,
+        object: u32,
+    ) -> Result<()> {
+        for reply in caller.observed.drain(..) {
+            let words: Vec<_> = reply.split_whitespace().collect();
+            if words.first() == Some(&"RETURNED") {
+                ensure!(words.len() == 4 && words[1] == "0");
+                let input: u64 = words[2].parse()?;
+                let rv: u64 = words[3].parse()?;
+                ensure!(input == rv);
+                self.ledger.json(serde_json::json!({
+                    "kind":"call","phase":phase,"position":self.ledger_calls,
+                    "slot":slot,"object":object,"local_id":0,"pid":caller.child.id(),
+                    "input":input,"rv":rv,"reply":reply
+                }))?;
+                self.ledger_calls += 1;
+            } else {
+                self.ledger.json(serde_json::json!({
+                    "kind":"barrier","phase":phase,"slot":slot,"object":object,
+                    "pid":caller.child.id(),"reply":reply
+                }))?;
+            }
+        }
+        Ok(())
+    }
+
     fn raw_row(&mut self, row: serde_json::Value) -> Result<()> {
         self.raw.json(row)
     }
@@ -1028,6 +1304,13 @@ impl Task4Evidence {
         self.links
             .as_mut()
             .context("Task 4 Inventory links file missing")?
+            .json(row)
+    }
+
+    fn registration_row(&mut self, row: serde_json::Value) -> Result<()> {
+        self.registration
+            .as_mut()
+            .context("Task 4 Detailed registration file missing")?
             .json(row)
     }
 
@@ -1053,7 +1336,7 @@ impl Task4Evidence {
             .slots
             .get(slot)
             .context("raw CALL slot lacks physical target")?;
-        let metadata = std::fs::metadata(&fixture.path)?;
+        let metadata = std::fs::metadata(&physical.object_path)?;
         self.raw.json(serde_json::json!({
             "kind":"call", "phase":phase, "position":self.raw_calls,
             "slot":event.slot, "rv":event.rv, "event_type":event.event_type,
@@ -1098,17 +1381,38 @@ impl Task4Evidence {
         let ledger = self.ledger.contents()?;
         let raw = self.raw.contents()?;
         let links = self.links.as_mut().map(Task4Rows::contents).transpose()?;
+        let registration = self
+            .registration
+            .as_mut()
+            .map(Task4Rows::contents)
+            .transpose()?;
         let rendered = self.rendered.contents()?;
         let offsets = std::fs::read(
             self.directory
                 .join(format!("offsets-{:02}.json", self.index)),
         )?;
         ensure!(task4_hash(&offsets) == self.offsets_sha256);
-        let replay = task4_replay_files(self.case, &ledger, &raw, &rendered, &offsets)?;
+        let replay = if matches!(self.case, "inventory-identity" | "detailed-identity") {
+            task4_replay_identity_files(self.case, &ledger, &raw, &rendered, &offsets)?
+        } else {
+            task4_replay_files(self.case, &ledger, &raw, &rendered, &offsets)?
+        };
         ensure!(replay.0 == self.ledger_calls && replay.1 == self.raw_calls);
         if self.case == "inventory" {
             task4_replay_links(
                 links.as_deref().context("Inventory links bytes missing")?,
+                &offsets,
+            )?;
+            if self.control.is_some() {
+                task4_replay_link_availability(
+                    links.as_deref().context("Inventory links bytes missing")?,
+                )?;
+            }
+        } else if self.case == "inventory-identity" {
+            task4_replay_identity_links(
+                links
+                    .as_deref()
+                    .context("Inventory identity links bytes missing")?,
                 &offsets,
             )?;
         } else {
@@ -1158,13 +1462,67 @@ impl Task4Evidence {
             files.insert("links".into(), file("links.jsonl", bytes, rows));
             eprintln!("TASK4_LINKS sha256={} rows={}", task4_hash(bytes), rows);
         }
-        let manifest = serde_json::json!({
+        if let Some(bytes) = &registration {
+            task4_replay_registration(
+                bytes,
+                &offsets,
+                if self.case == "detailed-identity" {
+                    "second_attached"
+                } else {
+                    "attached"
+                },
+            )?;
+            let rows = self
+                .registration
+                .as_ref()
+                .context("registration row count")?
+                .rows;
+            files.insert(
+                "registration".into(),
+                file("registration.jsonl", bytes, rows),
+            );
+            eprintln!(
+                "TASK4_REGISTRATION sha256={} rows={rows}",
+                task4_hash(bytes)
+            );
+        }
+        if matches!(self.case, "inventory-identity" | "detailed-identity") {
+            let copy = std::fs::read(
+                self.directory
+                    .join(format!("fixture-{:02}-copy.elf", self.index)),
+            )?;
+            let identity = std::fs::read(
+                self.directory
+                    .join(format!("case-{:02}-identity.json", self.index)),
+            )?;
+            let original = std::fs::read(
+                self.directory
+                    .join(format!("fixture-{:02}.elf", self.index)),
+            )?;
+            task4_replay_identity_receipt(&identity, &offsets, &original, &copy)?;
+            ensure!(task4_hash(&copy) == self.fixture_sha256);
+            files.insert(
+                "fixture_copy".into(),
+                serde_json::json!({
+                    "name":format!("fixture-{:02}-copy.elf", self.index),
+                    "sha256":task4_hash(&copy),"bytes":copy.len(),"rows":1
+                }),
+            );
+            files.insert("identity".into(), file("identity.json", &identity, 1));
+        }
+        let mut manifest = serde_json::json!({
             "schema":2,"case_index":self.index,"case":self.case,"profile":self.profile,
             "fixture_sha256":self.fixture_sha256,"offsets_sha256":self.offsets_sha256,
             "object_sha256":self.object_sha256,
             "files":files,
             "replay":{"ok":true,"completed_calls":replay.0,"raw_calls":replay.1}
         });
+        if let Some((cell, outcome, fixture_mode, loaded_object_kind)) = self.control {
+            manifest["cell"] = cell.into();
+            manifest["outcome"] = outcome.into();
+            manifest["fixture_mode"] = fixture_mode.into();
+            manifest["loaded_object_kind"] = loaded_object_kind.into();
+        }
         let manifest_bytes = serde_json::to_vec(&manifest)?;
         let manifest_name = format!("case-{:02}-evidence.json", self.index);
         std::fs::OpenOptions::new()
@@ -1186,7 +1544,14 @@ impl Task4Evidence {
 }
 
 fn task4_validate_resource_samples(case: &str, samples: &[serde_json::Value]) -> Result<()> {
-    let phases: &[&str] = if case == "highslot-exec" {
+    let phases: &[&str] = if case == "detailed-identity" {
+        &[
+            "baseline",
+            "post_first_attach",
+            "post_second_attach",
+            "pre_detach",
+        ]
+    } else if case == "highslot-exec" {
         &["baseline", "post_attach", "post_rebind", "pre_detach"]
     } else {
         &["baseline", "post_attach", "pre_detach"]
@@ -1222,7 +1587,10 @@ fn task4_validate_resource_samples(case: &str, samples: &[serde_json::Value]) ->
             if index == 1 {
                 // Session::start may raise soft to hard before the first link.
                 // Its best-effort setrlimit also permits the original soft.
-                let session = matches!(case, "detailed" | "highslot-exit" | "highslot-exec");
+                let session = matches!(
+                    case,
+                    "detailed" | "detailed-identity" | "highslot-exit" | "highslot-exec"
+                );
                 ensure!(
                     soft == baseline_soft || (session && soft == baseline_hard),
                     "Task 4 FD attach limit transition changed"
@@ -1445,10 +1813,7 @@ fn task4_inventory_replay_requires_observed_repeat_snapshot() -> Result<()> {
         {"dev":1,"ino":2,"offset":64},{"dev":1,"ino":2,"offset":80}
     ]))?;
     let mut ledger = vec![serde_json::json!({"kind":"barrier","phase":"after_go","reply":"GO 77"})];
-    for (position, slot) in [0_u64, 1, 511, 512, 999, 2047, 2048, 2111]
-        .into_iter()
-        .enumerate()
-    {
+    for (position, slot) in [0_u64, 1, 0, 1].into_iter().enumerate() {
         let input = 0_u64.wrapping_sub(slot);
         ledger.push(serde_json::json!({"kind":"call","phase":if position < 2 {"after_go"} else {"after_repeat"},
             "position":position,"slot":slot,"input":input,"rv":0,
@@ -1529,7 +1894,7 @@ fn task4_inventory_replay_requires_observed_repeat_snapshot() -> Result<()> {
     raw = ordered;
     let first_step = first_step.context("fixture first step")?;
     ensure!(
-        task4_replay_files("inventory", &ledger_bytes, &lines(&raw)?, b"", &offsets)? == (8, 0)
+        task4_replay_files("inventory", &ledger_bytes, &lines(&raw)?, b"", &offsets)? == (4, 0)
     );
     let mut swapped_steps = raw.clone();
     swapped_steps.swap(first_step, first_step + 1);
@@ -1575,6 +1940,73 @@ fn task4_inventory_replay_requires_observed_repeat_snapshot() -> Result<()> {
         .find(|row| row["kind"] == "usage_phase" && row["phase"] == "after_repeat")
         .context("repeat phase")?["newly_positive"] = serde_json::json!([511]);
     assert!(task4_replay_files("inventory", &ledger_bytes, &lines(&raw)?, b"", &offsets).is_err());
+    Ok(())
+}
+
+#[test]
+fn task4_inventory_replay_accepts_exact_n511_boundary_repeats() -> Result<()> {
+    const N: usize = 511;
+    let offsets = serde_json::to_vec(
+        &(0..N)
+            .map(|slot| {
+                serde_json::json!({
+                    "dev":1,"ino":2,"offset":64+16*slot
+                })
+            })
+            .collect::<Vec<_>>(),
+    )?;
+    let mut ledger = vec![serde_json::json!({
+        "kind":"barrier","phase":"after_go","reply":"GO 77"
+    })];
+    for (position, slot) in (0..N).chain([0, N - 1]).enumerate() {
+        let input = 0_u64.wrapping_sub(slot as u64);
+        ledger.push(serde_json::json!({
+            "kind":"call","phase":if position < N {"after_go"} else {"after_repeat"},
+            "position":position,"slot":slot,"input":input,"rv":0,
+            "reply":format!("RETURNED {slot} {input} 0")
+        }));
+    }
+    let mut raw = Vec::new();
+    for (phase, value, positive, newly) in [
+        ("pre_go", 0, 0, Vec::new()),
+        ("after_go", 1, N, (0..N).collect()),
+        ("after_repeat", 1, N, Vec::new()),
+        ("terminal", 1, N, Vec::new()),
+    ] {
+        if phase == "after_go" {
+            for slot in 0..N {
+                raw.push(serde_json::json!({
+                    "kind":"usage_step","phase":"after_go","position":slot,
+                    "slot":slot,"before":0,"after":1
+                }));
+            }
+        }
+        raw.push(serde_json::json!({
+            "kind":"usage_phase","phase":phase,"cells_read":N,
+            "positive_count":positive,"newly_positive":newly
+        }));
+        for slot in 0..N {
+            raw.push(serde_json::json!({
+                "kind":"usage","phase":phase,"slot":slot,"value":value
+            }));
+        }
+    }
+    raw.push(serde_json::json!({
+        "kind":"terminal","phase":"terminal","usage_positive":N,
+        "terminal_unsettled":true,"usage_integrity_failures":0,"usage_read_failures":0
+    }));
+    let jsonl = |rows: &[serde_json::Value]| -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        for row in rows {
+            serde_json::to_writer(&mut bytes, row)?;
+            bytes.push(b'\n');
+        }
+        Ok(bytes)
+    };
+    ensure!(
+        task4_replay_files("inventory", &jsonl(&ledger)?, &jsonl(&raw)?, b"", &offsets)?
+            == (N + 2, 0)
+    );
     Ok(())
 }
 
@@ -1747,6 +2179,28 @@ fn task4_jsonl(bytes: &[u8]) -> Result<Vec<serde_json::Value>> {
         .collect()
 }
 
+fn task4_inventory_repeats(endpoints: usize) -> Vec<u32> {
+    if endpoints == 2_112 {
+        return vec![511, 512, 999, 2_047, 2_048, 2_111];
+    }
+    let mut ids = Vec::new();
+    for id in [
+        0,
+        endpoints.saturating_sub(1),
+        511,
+        512,
+        999,
+        2_047,
+        2_048,
+        2_111,
+    ] {
+        if id < endpoints && !ids.contains(&(id as u32)) {
+            ids.push(id as u32);
+        }
+    }
+    ids
+}
+
 fn task4_replay_links(bytes: &[u8], offsets_bytes: &[u8]) -> Result<()> {
     let links = task4_jsonl(bytes)?;
     let offsets: Vec<serde_json::Value> = serde_json::from_slice(offsets_bytes)?;
@@ -1854,6 +2308,1008 @@ fn task4_replay_links(bytes: &[u8], offsets_bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn task4_perf_availability(detail: &serde_json::Value) -> Result<serde_json::Value> {
+    Ok(
+        match detail["capability"].as_str().context("perf capability")? {
+            "base_only_5_15" => serde_json::json!({
+                "type":null,"offset":null,"cookie":null,"reason":"base_only_info_len_32"
+            }),
+            "partial_type_offset" => serde_json::json!({
+                "type":detail["type"],"offset":detail["offset"],
+                "cookie":null,"reason":"cookie_not_returned_len_48"
+            }),
+            "full_type_offset_cookie" => serde_json::json!({
+                "type":detail["type"],"offset":detail["offset"],
+                "cookie":detail["cookie"],"reason":null
+            }),
+            other => bail!("unknown perf capability {other}"),
+        },
+    )
+}
+
+fn task4_replay_link_availability(bytes: &[u8]) -> Result<()> {
+    for (position, row) in task4_jsonl(bytes)?.iter().enumerate() {
+        if position < 2 {
+            ensure!(row.get("kernel_perf_availability").is_none());
+        } else {
+            ensure!(
+                row["kernel_perf_availability"]
+                    == task4_perf_availability(&row["kernel_perf_detail"])?,
+                "Inventory optional perf availability differs from observed capability"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn task4_replay_identity_links(bytes: &[u8], offsets_bytes: &[u8]) -> Result<()> {
+    let rows = task4_jsonl(bytes)?;
+    let offsets: Vec<serde_json::Value> = serde_json::from_slice(offsets_bytes)?;
+    ensure!(rows.len() == 4 && offsets.len() == 2);
+    let mut ids = BTreeSet::new();
+    let mut roles = BTreeMap::new();
+    for (position, row) in rows.iter().enumerate() {
+        let common = &row["kernel_common"];
+        let link_id = common["link_id"].as_u64().context("identity link ID")?;
+        let program_id = common["program_id"]
+            .as_u64()
+            .context("identity program ID")?;
+        ensure!(
+            row["position"].as_u64() == Some(position as u64)
+                && link_id > 0
+                && program_id > 0
+                && ids.insert(link_id),
+            "identity link ordering or uniqueness changed"
+        );
+        let requested = &row["userspace_requested"];
+        ensure!(requested["source"] == "retained_inventory_attach_request");
+        if position < 2 {
+            let name = if position == 0 {
+                "sched_process_exec"
+            } else {
+                "sched_process_exit"
+            };
+            ensure!(
+                row["role"] == "lifecycle"
+                    && common["type"].as_u64()
+                        == Some(bpf_link_type::BPF_LINK_TYPE_RAW_TRACEPOINT as u64)
+                    && requested["program"] == name
+                    && requested["tracepoint"] == name
+                    && row.get("kernel_perf_detail").is_none()
+                    && row.get("kernel_perf_availability").is_none()
+            );
+            roles.insert(name, program_id);
+        } else {
+            let slot = position - 2;
+            let physical = &offsets[slot];
+            let cookie = 0x5055_5347_0000_0000_u64 | slot as u64;
+            ensure!(
+                row["role"] == "entry"
+                    && row["slot"].as_u64() == Some(slot as u64)
+                    && common["type"].as_u64()
+                        == Some(bpf_link_type::BPF_LINK_TYPE_PERF_EVENT as u64)
+                    && requested["program"] == "p11_usage_entry_lp64"
+                    && requested["object_id"] == physical["object"]
+                    && requested["dev"] == physical["dev"]
+                    && requested["ino"] == physical["ino"]
+                    && requested["offset"] == physical["offset"]
+                    && requested["cookie"].as_u64() == Some(cookie)
+                    && requested["pin_unchanged"] == true
+                    && row["kernel_perf_availability"]
+                        == task4_perf_availability(&row["kernel_perf_detail"])?,
+                "identity Inventory link differs from physical pin"
+            );
+            if let Some(prior) = roles.insert("entry", program_id) {
+                ensure!(prior == program_id);
+            }
+        }
+    }
+    ensure!(roles.len() == 3 && roles.values().copied().collect::<BTreeSet<_>>().len() == 3);
+    Ok(())
+}
+
+fn task4_replay_identity_receipt(
+    receipt_bytes: &[u8],
+    offsets_bytes: &[u8],
+    original: &[u8],
+    copy: &[u8],
+) -> Result<()> {
+    ensure!(
+        original == copy && !original.is_empty(),
+        "identity fixture bytes differ"
+    );
+    let receipt: serde_json::Value = serde_json::from_slice(receipt_bytes)?;
+    let offsets: Vec<serde_json::Value> = serde_json::from_slice(offsets_bytes)?;
+    ensure!(
+        offsets.len() == 2
+            && receipt["schema"].as_u64() == Some(1)
+            && receipt["mode"] == "alias_equal_bytes_distinct_inode"
+            && receipt["alias_pair"] == serde_json::json!(["owned_0", "owned_alias_0"])
+            && receipt["equal_bytes"] == true
+            && receipt["distinct_inode"] == true
+    );
+    let a = &receipt["original"];
+    let b = &receipt["copy"];
+    let digest = task4_hash(original);
+    for object in [a, b] {
+        let slot = object["slot"].as_u64().context("identity slot")? as usize;
+        let physical = offsets.get(slot).context("identity slot outside offsets")?;
+        ensure!(
+            object["object"] == physical["object"]
+                && object["dev"] == physical["dev"]
+                && object["ino"] == physical["ino"]
+                && object["offset"] == physical["offset"]
+                && object["names"] == physical["names"]
+                && object["sha256"] == digest
+                && object["abi"] == "Lp64"
+                && object["pin_key"]["inode"] == object["ino"]
+                && object["pin_key"]["device_major"].as_u64().is_some()
+                && object["pin_key"]["device_minor"].as_u64().is_some(),
+            "identity archive receipt does not join live pin/offset facts"
+        );
+    }
+    ensure!(
+        a["slot"] != b["slot"]
+            && a["object"] != b["object"]
+            && (a["dev"] != b["dev"] || a["ino"] != b["ino"])
+            && a["offset"] == b["offset"]
+            && a["names"] == serde_json::json!(["owned_0", "owned_alias_0"])
+            && b["names"] == serde_json::json!(["owned_0"]),
+        "identity alias or distinct-inode claim is false"
+    );
+    Ok(())
+}
+
+#[test]
+fn task4_identity_receipt_rejects_false_alias_and_inode_collapse() -> Result<()> {
+    let bytes = b"identical ELF bytes";
+    let offsets = serde_json::to_vec(&vec![
+        serde_json::json!({"slot":0,"object":0,"dev":1,"ino":10,"offset":99,
+            "names":["owned_0","owned_alias_0"]}),
+        serde_json::json!({"slot":1,"object":1,"dev":1,"ino":11,"offset":99,
+            "names":["owned_0"]}),
+    ])?;
+    let digest = task4_hash(bytes);
+    let mut receipt = serde_json::json!({
+        "schema":1,"mode":"alias_equal_bytes_distinct_inode",
+        "alias_pair":["owned_0","owned_alias_0"],
+        "equal_bytes":true,"distinct_inode":true,
+        "original":{"slot":0,"object":0,"dev":1,"ino":10,"offset":99,
+            "names":["owned_0","owned_alias_0"],"sha256":digest,"abi":"Lp64",
+            "pin_key":{"device_major":0,"device_minor":1,"inode":10}},
+        "copy":{"slot":1,"object":1,"dev":1,"ino":11,"offset":99,
+            "names":["owned_0"],"sha256":digest,"abi":"Lp64",
+            "pin_key":{"device_major":0,"device_minor":1,"inode":11}}
+    });
+    task4_replay_identity_receipt(&serde_json::to_vec(&receipt)?, &offsets, bytes, bytes)?;
+    receipt["original"]["names"] = serde_json::json!(["owned_0"]);
+    assert!(
+        task4_replay_identity_receipt(&serde_json::to_vec(&receipt)?, &offsets, bytes, bytes)
+            .is_err()
+    );
+    receipt["original"]["names"] = serde_json::json!(["owned_0", "owned_alias_0"]);
+    receipt["copy"]["ino"] = serde_json::json!(10);
+    assert!(
+        task4_replay_identity_receipt(&serde_json::to_vec(&receipt)?, &offsets, bytes, bytes)
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn task4_identity_inventory_replay_rejects_wrong_physical_join() -> Result<()> {
+    let offsets = serde_json::to_vec(&vec![
+        serde_json::json!({"slot":0,"object":0,"dev":1,"ino":10,"offset":99}),
+        serde_json::json!({"slot":1,"object":1,"dev":1,"ino":11,"offset":99}),
+    ])?;
+    let mut ledger = Vec::new();
+    for (slot, pid) in [(0, 100), (1, 101)] {
+        ledger.push(serde_json::json!({
+            "kind":"call","phase":"after_go","position":slot,"slot":slot,
+            "object":slot,"local_id":0,"pid":pid,"input":0,"rv":0,
+            "reply":"RETURNED 0 0 0"
+        }));
+    }
+    let mut raw = Vec::new();
+    for slot in 0..2 {
+        raw.push(serde_json::json!({"kind":"usage_step","phase":"after_go",
+            "position":slot,"slot":slot,"before":0,"after":1}));
+    }
+    for (phase, positive) in [("pre_go", 0), ("after_go", 2), ("terminal", 2)] {
+        raw.push(serde_json::json!({"kind":"usage_phase","phase":phase,
+            "cells_read":2,"positive_count":positive}));
+        for slot in 0..2 {
+            raw.push(serde_json::json!({"kind":"usage","phase":phase,
+                "slot":slot,"value":u64::from(positive != 0)}));
+        }
+    }
+    raw.push(serde_json::json!({"kind":"terminal","phase":"terminal",
+        "usage_positive":2,"terminal_unsettled":true}));
+    let encode = |rows: &[serde_json::Value]| -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        for row in rows {
+            serde_json::to_writer(&mut bytes, row)?;
+            bytes.push(b'\n');
+        }
+        Ok(bytes)
+    };
+    task4_replay_identity_files(
+        "inventory-identity",
+        &encode(&ledger)?,
+        &encode(&raw)?,
+        b"",
+        &offsets,
+    )?;
+    let mut wrong = ledger.clone();
+    wrong[1]["object"] = serde_json::json!(0);
+    assert!(
+        task4_replay_identity_files(
+            "inventory-identity",
+            &encode(&wrong)?,
+            &encode(&raw)?,
+            b"",
+            &offsets
+        )
+        .is_err()
+    );
+    let mut wrong: Vec<serde_json::Value> = serde_json::from_slice(&offsets)?;
+    wrong[1]["ino"] = serde_json::json!(10);
+    assert!(
+        task4_replay_identity_files(
+            "inventory-identity",
+            &encode(&ledger)?,
+            &encode(&raw)?,
+            b"",
+            &serde_json::to_vec(&wrong)?
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn task4_identity_source_serialization_synthetic_bundle() -> Result<()> {
+    let inventory = InventoryBudget::new(2, 16).map_err(anyhow::Error::msg)?;
+    let identity = Task4IdentityFixture::build(AdmissionPolicy::Inventory(inventory))?;
+    let scratch = tempfile::tempdir()?;
+    let directory = std::env::var_os("P11SCOPE_TASK4_SYNTHETIC_EVIDENCE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| scratch.path().to_path_buf());
+    std::fs::create_dir_all(&directory)?;
+    std::fs::write(
+        directory.join("SYNTHETIC.txt"),
+        "Task4a schema fixture only: owned caller replies and live pin facts are real; BPF link IDs, USAGE and terminal counters are fabricated. Not a live qualification.\n",
+    )?;
+    task4_identity_fixture_receipt_at(&identity, &directory, 0)?;
+    let fixture = &identity.fixture;
+    let mut evidence = Task4Evidence::new_control_at(
+        "inventory-identity",
+        "default",
+        fixture,
+        crate::EBPF_INVENTORY_OBJECT,
+        Some((
+            "inventory-physical-identity",
+            "complete-identity",
+            "alias_equal_bytes_distinct_inode",
+            "inventory-global.elf",
+        )),
+        directory.clone(),
+        0,
+    )?;
+    evidence.fd_sample("baseline")?;
+    for (position, name) in ["sched_process_exec", "sched_process_exit"]
+        .into_iter()
+        .enumerate()
+    {
+        evidence.link_row(serde_json::json!({
+            "position":position,"role":"lifecycle",
+            "kernel_common":{"link_id":100+position,"program_id":10+position,
+                "type":bpf_link_type::BPF_LINK_TYPE_RAW_TRACEPOINT as u32,"info_len":32},
+            "userspace_requested":{"source":"retained_inventory_attach_request",
+                "program":name,"tracepoint":name}
+        }))?;
+    }
+    for slot in &fixture.plan.slots {
+        let meta = std::fs::metadata(&slot.object_path)?;
+        evidence.link_row(serde_json::json!({
+            "position":slot.index+2,"role":"entry","slot":slot.index,
+            "kernel_common":{"link_id":102+slot.index,"program_id":12,
+                "type":bpf_link_type::BPF_LINK_TYPE_PERF_EVENT as u32,"info_len":32},
+            "kernel_perf_detail":{"capability":"base_only_5_15"},
+            "kernel_perf_availability":{"type":null,"offset":null,"cookie":null,
+                "reason":"base_only_info_len_32"},
+            "userspace_requested":{"source":"retained_inventory_attach_request",
+                "program":"p11_usage_entry_lp64","object_id":slot.object.0,
+                "dev":meta.dev(),"ino":meta.ino(),"offset":slot.file_offset,
+                "cookie":0x5055_5347_0000_0000_u64|u64::from(slot.index),
+                "abi":"Lp64","pin_unchanged":true}
+        }))?;
+    }
+    evidence.fd_sample("post_attach")?;
+    let original = fixture.spawn_gated()?;
+    let copy = OwnedCaller::spawn_inner(&identity.copy_path, true)?;
+    identity.assert_copy_caller(&copy)?;
+    let mut callers = vec![
+        (identity.original_slot, original),
+        (identity.copy_slot, copy),
+    ];
+    callers.sort_by_key(|(slot, _)| *slot);
+    for (slot, caller) in &mut callers {
+        let object = fixture.plan.slots[*slot as usize].object.0;
+        evidence.identity_caller(caller, "pre_go", *slot, object)?;
+        caller.go()?;
+        evidence.identity_caller(caller, "after_go", *slot, object)?;
+        caller.call_exact(0, 0)?;
+        evidence.identity_caller(caller, "after_go", *slot, object)?;
+        evidence.raw_row(serde_json::json!({
+            "kind":"usage_step","phase":"after_go","position":slot,
+            "slot":slot,"before":0,"after":1
+        }))?;
+    }
+    for (phase, positive, newly) in [
+        ("pre_go", 0, Vec::<u32>::new()),
+        ("after_go", 2, vec![0, 1]),
+        ("terminal", 2, Vec::<u32>::new()),
+    ] {
+        evidence.raw_row(serde_json::json!({
+            "kind":"usage_phase","phase":phase,"cells_read":2,
+            "positive_count":positive,"newly_positive":newly,
+            "usage_integrity_failures":0,"usage_read_failures":0,
+            "provider_changed":0,"malformed_discovery":0,
+            "terminal_unsettled":phase=="terminal","health":"Healthy"
+        }))?;
+        for slot in 0..2 {
+            evidence.raw_row(serde_json::json!({
+                "kind":"usage","phase":phase,"slot":slot,
+                "value":u64::from(positive != 0)
+            }))?;
+        }
+    }
+    for (slot, caller) in &mut callers {
+        caller.finish()?;
+        let object = fixture.plan.slots[*slot as usize].object.0;
+        evidence.identity_caller(caller, "terminal", *slot, object)?;
+    }
+    evidence.fd_sample("pre_detach")?;
+    evidence.raw_row(serde_json::json!({
+        "kind":"terminal","phase":"terminal","usage_positive":2,
+        "terminal_unsettled":true,"usage_integrity_failures":0,
+        "usage_read_failures":0,"health":"Healthy"
+    }))?;
+    evidence.finish()?;
+    eprintln!("TASK4_SYNTHETIC_BUNDLE path={}", directory.display());
+    Ok(())
+}
+
+#[test]
+fn task4_detailed_identity_source_serialization_synthetic_bundle() -> Result<()> {
+    let identity = Task4IdentityFixture::build(AdmissionPolicy::Detailed)?;
+    let scratch = tempfile::tempdir()?;
+    let directory = std::env::var_os("P11SCOPE_TASK4_SYNTHETIC_DETAILED_EVIDENCE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| scratch.path().to_path_buf());
+    std::fs::create_dir_all(&directory)?;
+    std::fs::write(
+        directory.join("SYNTHETIC.txt"),
+        "Task4a schema fixture only: owned caller replies and live pin facts are real; BPF registration/link IDs, START/STATS/RV/CALL and terminal counters are fabricated. Not a live qualification.\n",
+    )?;
+    task4_identity_fixture_receipt_at(&identity, &directory, 0)?;
+    let fixture = &identity.fixture;
+    let mut evidence = Task4Evidence::new_control_at(
+        "detailed-identity",
+        "default",
+        fixture,
+        crate::EBPF_OBJECT,
+        Some((
+            "detailed-physical-identity",
+            "complete-identity",
+            "alias_equal_bytes_distinct_inode",
+            "detailed.elf",
+        )),
+        directory.clone(),
+        0,
+    )?;
+    evidence.fd_sample("baseline")?;
+    evidence.fd_sample("post_first_attach")?;
+    let role_programs = [("return", "p11_return", 10), ("entry", "p11_entry", 11)];
+    for slot in &fixture.plan.slots {
+        let meta = std::fs::metadata(&slot.object_path)?;
+        for (role, program, program_id) in role_programs {
+            evidence.registration_row(serde_json::json!({
+                "kind":"static","phase":"second_attached",
+                "position":2*slot.index+u32::from(role=="entry"),
+                "slot":slot.index,"role":role,"program":program,
+                "program_id":program_id,"object":slot.object.0,
+                "dev":meta.dev(),"ino":meta.ino(),"offset":slot.file_offset,
+                "pin_unchanged":true
+            }))?;
+        }
+    }
+    for (position, (program_id, role, program)) in [
+        (10, "return", "p11_return"),
+        (10, "return", "p11_return"),
+        (11, "entry", "p11_entry"),
+        (11, "entry", "p11_entry"),
+        (20, "other", "sched_process_exec"),
+        (21, "other", "sched_process_exit"),
+        (22, "other", "task_newtask"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        evidence.registration_row(serde_json::json!({
+            "kind":"kernel_link","phase":"second_attached","position":position,
+            "link_id":100+position,"program_id":program_id,
+            "type":if role=="other" {
+                if program=="task_newtask" {bpf_link_type::BPF_LINK_TYPE_TRACING as u32}
+                else {bpf_link_type::BPF_LINK_TYPE_RAW_TRACEPOINT as u32}
+            } else {bpf_link_type::BPF_LINK_TYPE_PERF_EVENT as u32},
+            "info_len":32,"role":role,"program":program
+        }))?;
+    }
+    evidence.fd_sample("post_second_attach")?;
+    let original = fixture.spawn_gated()?;
+    let copy = OwnedCaller::spawn_inner(&identity.copy_path, true)?;
+    identity.assert_copy_caller(&copy)?;
+    let mut callers = vec![
+        (identity.original_slot, original),
+        (identity.copy_slot, copy),
+    ];
+    callers.sort_by_key(|(slot, _)| *slot);
+    let mut observed = Vec::new();
+    for (slot, caller) in &mut callers {
+        let object = fixture.plan.slots[*slot as usize].object.0;
+        evidence.identity_caller(caller, "pre_go", *slot, object)?;
+        caller.go()?;
+        evidence.identity_caller(caller, "after_go", *slot, object)?;
+        let image = ImageIdentity {
+            task_cookie: u64::from(*slot) + 1,
+            exec_id: 1,
+        };
+        let pid_tgid = u64::from(caller.child.id()) << 32 | u64::from(caller.child.id());
+        let start_ts = 1_000 + u64::from(*slot) * 1_000;
+        evidence.raw_row(serde_json::json!({
+            "kind":"image_witness","phase":"held_first_call","position":slot,
+            "slot":slot,"pid_tgid":pid_tgid,"ts_ns":start_ts,
+            "image":{"task_cookie":image.task_cookie,"exec_id":image.exec_id}
+        }))?;
+        for rv in [0, 5] {
+            caller.call_exact(0, rv)?;
+            evidence.identity_caller(caller, "after_go", *slot, object)?;
+            observed.push(Event {
+                event_type: event_type::CALL,
+                slot: *slot,
+                rv,
+                pid_tgid,
+                image,
+                ts_ns: start_ts + 50 + rv,
+                duration_ns: if rv == 0 { 50 } else { 40 },
+                ..Event::default()
+            });
+        }
+    }
+    for slot in 0..2 {
+        evidence.raw_row(serde_json::json!({
+            "kind":"stats","phase":"after_go","slot":slot,
+            "entered":2,"returned":2,"errors":1,"in_flight":0
+        }))?;
+    }
+    for slot in 0..2 {
+        for rv in [0, 5] {
+            evidence.raw_row(serde_json::json!({
+                "kind":"rv","phase":"after_go","slot":slot,"rv":rv,"count":1
+            }))?;
+        }
+    }
+    let mut tracer = crate::trace::Tracer::new(&fixture.plan);
+    let mut state = crate::semantics::State::with_policy(
+        &fixture.plan,
+        crate::attach::CapturePolicy::Allowlisted,
+    );
+    for event in &observed {
+        evidence.event(event, fixture, "after_go")?;
+        tracer.count_raw_call(event);
+        evidence.render(&tracer.on_event(event, &mut state))?;
+    }
+    ensure!(tracer.raw_calls() == 4 && state.pending_at_end() == 0);
+    for (slot, caller) in &mut callers {
+        caller.finish()?;
+        let object = fixture.plan.slots[*slot as usize].object.0;
+        evidence.identity_caller(caller, "terminal", *slot, object)?;
+    }
+    evidence.fd_sample("pre_detach")?;
+    evidence.raw_row(serde_json::json!({
+        "kind":"terminal","phase":"terminal","ring_loss":0,
+        "raw_calls":4,"rendered":4,"pending":0,"orphan_ops":0,"unmatched_closes":0,
+        "kernel":{"ring_loss":0,"start_insert_failures":0,"unmatched_returns":0,
+            "rv_update_failures":0,"cgroup_scope_failures":0,
+            "semantic_capture_failures":0,"template_tail_failures":0,
+            "unregistered_mechanisms":0,"abi_refusals":0},
+        "discovery":{"ring_loss":0,"export_state_failures":0,
+            "export_bounded_read_failures":0,"loader_hits":0,
+            "loader_state_read_failures":0,"abi_refusals":0}
+    }))?;
+    evidence.finish()?;
+    eprintln!("TASK4_SYNTHETIC_BUNDLE path={}", directory.display());
+    Ok(())
+}
+
+fn task4_replay_identity_files(
+    case: &str,
+    ledger_bytes: &[u8],
+    raw_bytes: &[u8],
+    rendered_bytes: &[u8],
+    offsets_bytes: &[u8],
+) -> Result<(usize, usize)> {
+    ensure!(matches!(case, "inventory-identity" | "detailed-identity"));
+    let offsets: Vec<serde_json::Value> = serde_json::from_slice(offsets_bytes)?;
+    ensure!(offsets.len() == 2);
+    for (slot, row) in offsets.iter().enumerate() {
+        ensure!(row["slot"].as_u64() == Some(slot as u64));
+    }
+    ensure!(
+        offsets[0]["object"] != offsets[1]["object"]
+            && (offsets[0]["dev"] != offsets[1]["dev"] || offsets[0]["ino"] != offsets[1]["ino"])
+            && offsets[0]["offset"] == offsets[1]["offset"],
+        "identity offsets collapsed distinct physical objects or split same bytes"
+    );
+    let ledger = task4_jsonl(ledger_bytes)?;
+    let raw = task4_jsonl(raw_bytes)?;
+    let calls: Vec<_> = ledger.iter().filter(|row| row["kind"] == "call").collect();
+    let events: Vec<_> = raw.iter().filter(|row| row["kind"] == "call").collect();
+    let detailed = case == "detailed-identity";
+    let expected_calls = if detailed { 4 } else { 2 };
+    ensure!(calls.len() == expected_calls && events.len() == if detailed { 4 } else { 0 });
+    let mut pids = BTreeMap::new();
+    for (position, call) in calls.iter().enumerate() {
+        let slot = if detailed { position / 2 } else { position };
+        let rv = if detailed && position % 2 == 1 { 5 } else { 0 };
+        let input = call["input"].as_u64().context("identity input")?;
+        let pid = call["pid"].as_u64().context("identity caller PID")?;
+        ensure!(
+            call["position"].as_u64() == Some(position as u64)
+                && call["phase"] == "after_go"
+                && call["slot"].as_u64() == Some(slot as u64)
+                && call["object"] == offsets[slot]["object"]
+                && call["local_id"].as_u64() == Some(0)
+                && call["rv"].as_u64() == Some(rv)
+                && call["reply"] == format!("RETURNED 0 {input} {rv}")
+                && input == rv
+                && pid > 0,
+            "identity call does not join actual local reply to physical slot"
+        );
+        if let Some(prior) = pids.insert(slot, pid) {
+            ensure!(prior == pid);
+        }
+    }
+    ensure!(pids.len() == 2 && pids[&0] != pids[&1]);
+    let terminal: Vec<_> = raw.iter().filter(|row| row["kind"] == "terminal").collect();
+    ensure!(terminal.len() == 1 && terminal[0]["phase"] == "terminal");
+    if detailed {
+        ensure!(raw.len() == 13 && rendered_bytes.ends_with(b"\n"));
+        let rendered: Vec<_> = rendered_bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .collect();
+        ensure!(rendered.len() == 4);
+        let witnesses: Vec<_> = raw
+            .iter()
+            .filter(|row| row["kind"] == "image_witness")
+            .collect();
+        ensure!(witnesses.len() == 2);
+        let stats: Vec<_> = raw.iter().filter(|row| row["kind"] == "stats").collect();
+        let rvs: Vec<_> = raw.iter().filter(|row| row["kind"] == "rv").collect();
+        ensure!(stats.len() == 2 && rvs.len() == 4);
+        for slot in 0..2 {
+            let witness = witnesses[slot];
+            ensure!(
+                witness["slot"].as_u64() == Some(slot as u64)
+                    && witness["phase"] == "held_first_call"
+                    && witness["pid_tgid"].as_u64() == Some(pids[&slot] << 32 | pids[&slot])
+                    && witness["ts_ns"].as_u64().is_some_and(|ts| ts != 0)
+                    && witness["image"]["task_cookie"]
+                        .as_u64()
+                        .is_some_and(|v| v != 0)
+                    && stats[slot]["slot"].as_u64() == Some(slot as u64)
+                    && stats[slot]["entered"].as_u64() == Some(2)
+                    && stats[slot]["returned"].as_u64() == Some(2)
+                    && stats[slot]["errors"].as_u64() == Some(1)
+                    && stats[slot]["in_flight"].as_u64() == Some(0)
+            );
+            for rv_index in 0..2 {
+                let position = 2 * slot + rv_index;
+                let event = events[position];
+                let rv = if rv_index == 0 { 0 } else { 5 };
+                let ts = event["ts_ns"].as_u64().context("identity CALL time")?;
+                let duration = event["duration_ns"]
+                    .as_u64()
+                    .context("identity CALL duration")?;
+                ensure!(
+                    event["position"].as_u64() == Some(position as u64)
+                        && event["slot"].as_u64() == Some(slot as u64)
+                        && event["rv"].as_u64() == Some(rv)
+                        && event["event_type"].as_u64() == Some(u64::from(event_type::CALL))
+                        && event["pid_tgid"].as_u64() == Some(pids[&slot] << 32 | pids[&slot])
+                        && event["image"] == witness["image"]
+                        && event["dev"] == offsets[slot]["dev"]
+                        && event["ino"] == offsets[slot]["ino"]
+                        && event["offset"] == offsets[slot]["offset"]
+                        && (rv_index != 0 || ts.checked_sub(duration) == witness["ts_ns"].as_u64())
+                        && rvs[position]["slot"].as_u64() == Some(slot as u64)
+                        && rvs[position]["rv"].as_u64() == Some(rv)
+                        && rvs[position]["count"].as_u64() == Some(1),
+                    "identity Detailed raw CALL/image/map join changed"
+                );
+                let line = std::str::from_utf8(rendered[position])?;
+                let rv_label = pkcs11_types::CkRv(rv).to_string();
+                let rv_label = rv_label.split(" (").next().unwrap_or(&rv_label);
+                ensure!(
+                    line.contains("owned_0")
+                        && line.contains(&format!("[semantics unverified] → {rv_label} "))
+                );
+            }
+        }
+        ensure!(
+            terminal[0]["ring_loss"].as_u64() == Some(0)
+                && terminal[0]["raw_calls"].as_u64() == Some(4)
+                && terminal[0]["rendered"].as_u64() == Some(4)
+                && terminal[0]["pending"].as_u64() == Some(0)
+        );
+    } else {
+        ensure!(raw.len() == 12 && rendered_bytes.is_empty());
+        let steps: Vec<_> = raw
+            .iter()
+            .filter(|row| row["kind"] == "usage_step")
+            .collect();
+        ensure!(steps.len() == 2);
+        for (slot, row) in steps.iter().enumerate() {
+            ensure!(
+                row["phase"] == "after_go"
+                    && row["position"].as_u64() == Some(slot as u64)
+                    && row["slot"].as_u64() == Some(slot as u64)
+                    && row["before"].as_u64() == Some(0)
+                    && row["after"].as_u64() == Some(1)
+            );
+        }
+        for (phase, positive) in [("pre_go", 0), ("after_go", 2), ("terminal", 2)] {
+            let usage: Vec<_> = raw
+                .iter()
+                .filter(|row| row["kind"] == "usage" && row["phase"] == phase)
+                .collect();
+            let snapshots: Vec<_> = raw
+                .iter()
+                .filter(|row| row["kind"] == "usage_phase" && row["phase"] == phase)
+                .collect();
+            ensure!(
+                usage.len() == 2
+                    && snapshots.len() == 1
+                    && snapshots[0]["positive_count"].as_u64() == Some(positive)
+                    && snapshots[0]["cells_read"].as_u64() == Some(2)
+            );
+            for (slot, row) in usage.iter().enumerate() {
+                ensure!(
+                    row["slot"].as_u64() == Some(slot as u64)
+                        && row["value"].as_u64() == Some(u64::from(positive != 0))
+                );
+            }
+        }
+        ensure!(
+            terminal[0]["usage_positive"].as_u64() == Some(2)
+                && terminal[0]["terminal_unsettled"].as_bool() == Some(true)
+        );
+    }
+    Ok((calls.len(), events.len()))
+}
+
+fn task4_record_registration(
+    session: &crate::attach::Session,
+    ids: &OwnedIds,
+    slots: &[Slot],
+    evidence: &mut Task4Evidence,
+    phase: &str,
+) -> Result<()> {
+    use crate::attach::{ProbeSide, RegisteredLink};
+    let n = slots.len();
+    let expected: BTreeSet<_> = slots
+        .iter()
+        .flat_map(|slot| {
+            [
+                (slot.index, ProbeSide::Return),
+                (slot.index, ProbeSide::Entry),
+            ]
+        })
+        .collect();
+    ensure!(
+        session.successful_static == expected,
+        "Detailed static registration tuple missing"
+    );
+    let retained: BTreeSet<_> = session
+        .links
+        .iter()
+        .filter_map(|link| match link {
+            RegisteredLink::UProbe { program, slot, .. } if *program == "p11_return" => {
+                Some((*slot, ProbeSide::Return))
+            }
+            RegisteredLink::UProbe { program, slot, .. } if *program == "p11_entry" => {
+                Some((*slot, ProbeSide::Entry))
+            }
+            _ => None,
+        })
+        .collect();
+    ensure!(retained == expected && session.retained_static.len() == n);
+    let return_program = session
+        .ebpf
+        .program("p11_return")
+        .context("return program")?
+        .info()?
+        .id();
+    let entry_program = session
+        .ebpf
+        .program("p11_entry")
+        .context("entry program")?
+        .info()?
+        .id();
+    ensure!(return_program != entry_program);
+    let lifecycle: BTreeMap<_, _> = ["sched_process_exec", "sched_process_exit", "task_newtask"]
+        .into_iter()
+        .map(|name| -> Result<_> {
+            Ok((session.ebpf.program(name).context(name)?.info()?.id(), name))
+        })
+        .collect::<Result<_>>()?;
+    ensure!(
+        lifecycle.len() == 3
+            && !lifecycle.contains_key(&return_program)
+            && !lifecycle.contains_key(&entry_program)
+    );
+    for (position, (slot, side)) in expected.iter().enumerate() {
+        let target = &slots[*slot as usize];
+        let retained = session
+            .retained_static
+            .get(slot)
+            .context("retained static target")?;
+        ensure!(
+            retained.slot.file_offset == target.file_offset
+                && retained.slot.object == target.object
+                && retained.abi == ElfAbi::Lp64
+        );
+        let metadata = std::fs::metadata(&retained.path)?;
+        let (role, program, program_id) = match side {
+            ProbeSide::Return => ("return", "p11_return", return_program),
+            ProbeSide::Entry => ("entry", "p11_entry", entry_program),
+        };
+        evidence.registration_row(serde_json::json!({
+            "kind":"static","phase":phase,"position":position,"slot":slot,
+            "role":role,"program":program,"program_id":program_id,
+            "object":target.object.0,"dev":metadata.dev(),"ino":metadata.ino(),
+            "offset":target.file_offset,"pin_unchanged":true
+        }))?;
+    }
+    let infos = owned_link_info_snapshot(&ids.programs)?;
+    ensure!(infos.len() == ids.links.len());
+    let mut role_counts = [0usize; 2];
+    for (position, (id, info)) in infos.iter().enumerate() {
+        ensure!(ids.links.contains(id) && info.raw.id == *id);
+        let (role, program) = if info.raw.prog_id == return_program {
+            role_counts[0] += 1;
+            ("return", "p11_return")
+        } else if info.raw.prog_id == entry_program {
+            role_counts[1] += 1;
+            ("entry", "p11_entry")
+        } else {
+            (
+                "other",
+                *lifecycle
+                    .get(&info.raw.prog_id)
+                    .context("unexpected non-static program in Detailed link census")?,
+            )
+        };
+        if role != "other" {
+            ensure!(info.raw.type_ == bpf_link_type::BPF_LINK_TYPE_PERF_EVENT as u32);
+        } else {
+            let expected = if program == "task_newtask" {
+                bpf_link_type::BPF_LINK_TYPE_TRACING as u32
+            } else {
+                bpf_link_type::BPF_LINK_TYPE_RAW_TRACEPOINT as u32
+            };
+            ensure!(
+                info.raw.type_ == expected,
+                "Detailed lifecycle link type differs from retained attach role"
+            );
+        }
+        evidence.registration_row(serde_json::json!({
+            "kind":"kernel_link","phase":phase,"position":position,
+            "link_id":id,"program_id":info.raw.prog_id,
+            "type":info.raw.type_,"info_len":info.returned_len,"role":role,
+            "program":program
+        }))?;
+    }
+    ensure!(
+        role_counts == [n, n] && infos.len() == 2 * n + 3,
+        "Detailed kernel per-program link census omitted a side or lifecycle role"
+    );
+    Ok(())
+}
+
+fn task4_replay_registration(bytes: &[u8], offsets_bytes: &[u8], phase: &str) -> Result<()> {
+    let rows = task4_jsonl(bytes)?;
+    let offsets: Vec<serde_json::Value> = serde_json::from_slice(offsets_bytes)?;
+    let n = offsets.len();
+    ensure!(rows.len() == 4 * n + 3 && n > 0);
+    let static_rows: Vec<_> = rows.iter().filter(|row| row["kind"] == "static").collect();
+    let kernel_rows: Vec<_> = rows
+        .iter()
+        .filter(|row| row["kind"] == "kernel_link")
+        .collect();
+    ensure!(static_rows.len() == 2 * n && static_rows.len() + kernel_rows.len() == rows.len());
+    let mut program_ids = BTreeMap::new();
+    for (position, row) in static_rows.iter().enumerate() {
+        let slot = position / 2;
+        let (role, program) = if position % 2 == 0 {
+            ("return", "p11_return")
+        } else {
+            ("entry", "p11_entry")
+        };
+        let program_id = row["program_id"]
+            .as_u64()
+            .context("registered program ID")?;
+        ensure!(
+            row["phase"] == phase
+                && row["position"].as_u64() == Some(position as u64)
+                && row["slot"].as_u64() == Some(slot as u64)
+                && row["role"] == role
+                && row["program"] == program
+                && row["dev"] == offsets[slot]["dev"]
+                && row["ino"] == offsets[slot]["ino"]
+                && row["offset"] == offsets[slot]["offset"]
+                && row["pin_unchanged"] == true
+                && program_id > 0
+                && row["object"].as_u64() == Some(offsets[slot]["object"].as_u64().unwrap_or(0)),
+            "Detailed retained static tuple differs from physical endpoint"
+        );
+        if let Some(prior) = program_ids.insert(role, program_id) {
+            ensure!(prior == program_id);
+        }
+    }
+    ensure!(program_ids.len() == 2 && program_ids["return"] != program_ids["entry"]);
+    let mut link_ids = BTreeSet::new();
+    let mut role_counts = [0usize; 2];
+    for (position, row) in kernel_rows.iter().enumerate() {
+        let id = row["link_id"].as_u64().context("kernel link ID")?;
+        let program_id = row["program_id"].as_u64().context("kernel program ID")?;
+        let (expected_role, expected_program) = if program_id == program_ids["return"] {
+            role_counts[0] += 1;
+            ("return", "p11_return")
+        } else if program_id == program_ids["entry"] {
+            role_counts[1] += 1;
+            ("entry", "p11_entry")
+        } else {
+            (
+                "other",
+                row["program"].as_str().context("lifecycle program")?,
+            )
+        };
+        let expected_type = match expected_role {
+            "return" | "entry" => bpf_link_type::BPF_LINK_TYPE_PERF_EVENT as u64,
+            "other" if expected_program == "task_newtask" => {
+                bpf_link_type::BPF_LINK_TYPE_TRACING as u64
+            }
+            "other" => bpf_link_type::BPF_LINK_TYPE_RAW_TRACEPOINT as u64,
+            _ => unreachable!(),
+        };
+        ensure!(
+            row["phase"] == phase
+                && row["position"].as_u64() == Some(position as u64)
+                && id > 0
+                && link_ids.insert(id)
+                && row["role"] == expected_role
+                && row["program"] == expected_program
+                && row["type"].as_u64() == Some(expected_type)
+                && row["info_len"]
+                    .as_u64()
+                    .is_some_and(|len| (12..=64).contains(&len)),
+            "Detailed unordered kernel link census changed"
+        );
+    }
+    ensure!(role_counts == [n, n]);
+    let others: BTreeSet<_> = kernel_rows
+        .iter()
+        .filter(|row| row["role"] == "other")
+        .map(|row| row["program"].as_str())
+        .collect::<Option<_>>()
+        .context("Detailed lifecycle census lacks program name")?;
+    ensure!(others == BTreeSet::from(["sched_process_exec", "sched_process_exit", "task_newtask"]));
+    Ok(())
+}
+
+#[test]
+fn task4_detailed_registration_rejects_missing_tail_entry_and_kernel_link() -> Result<()> {
+    let offsets = serde_json::to_vec(&vec![
+        serde_json::json!({"dev":1,"ino":2,"offset":100}),
+        serde_json::json!({"dev":1,"ino":2,"offset":200}),
+    ])?;
+    let mut rows = Vec::new();
+    for slot in 0..2_u64 {
+        for (role, program, program_id) in
+            [("return", "p11_return", 10), ("entry", "p11_entry", 11)]
+        {
+            rows.push(serde_json::json!({
+                "kind":"static","phase":"attached","position":rows.len(),
+                "slot":slot,"role":role,"program":program,"program_id":program_id,
+                "object":0,"dev":1,"ino":2,"offset":100+100*slot,"pin_unchanged":true
+            }));
+        }
+    }
+    for (position, program_id) in [10, 10, 11, 11].into_iter().enumerate() {
+        rows.push(serde_json::json!({
+            "kind":"kernel_link","phase":"attached","position":position,
+            "link_id":position+100,"program_id":program_id,
+            "type":bpf_link_type::BPF_LINK_TYPE_PERF_EVENT as u32,"info_len":32,
+            "role":if program_id == 10 {"return"} else {"entry"},
+            "program":if program_id == 10 {"p11_return"} else {"p11_entry"}
+        }));
+    }
+    for (index, program) in ["sched_process_exec", "sched_process_exit", "task_newtask"]
+        .into_iter()
+        .enumerate()
+    {
+        rows.push(serde_json::json!({
+            "kind":"kernel_link","phase":"attached","position":index+4,
+            "link_id":index+104,"program_id":index+20,
+            "type":if program=="task_newtask" {
+                bpf_link_type::BPF_LINK_TYPE_TRACING as u32
+            } else {bpf_link_type::BPF_LINK_TYPE_RAW_TRACEPOINT as u32},
+            "info_len":32,
+            "role":"other","program":program
+        }));
+    }
+    let encode = |rows: &[serde_json::Value]| -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        for row in rows {
+            serde_json::to_writer(&mut bytes, row)?;
+            bytes.push(b'\n');
+        }
+        Ok(bytes)
+    };
+    task4_replay_registration(&encode(&rows)?, &offsets, "attached")?;
+    let mut missing = rows.clone();
+    missing.remove(3);
+    assert!(task4_replay_registration(&encode(&missing)?, &offsets, "attached").is_err());
+    let mut missing = rows.clone();
+    missing.remove(7);
+    assert!(task4_replay_registration(&encode(&missing)?, &offsets, "attached").is_err());
+    Ok(())
+}
+
+#[test]
+fn task4_optional_perf_availability_rejects_unobserved_cookie() -> Result<()> {
+    let mut rows = vec![
+        serde_json::json!({"role":"lifecycle"}),
+        serde_json::json!({"role":"lifecycle"}),
+        serde_json::json!({
+            "role":"entry",
+            "kernel_perf_detail":{"capability":"base_only_5_15"},
+            "kernel_perf_availability":{
+                "type":null,"offset":null,"cookie":null,"reason":"base_only_info_len_32"
+            }
+        }),
+    ];
+    let encode = |rows: &[serde_json::Value]| -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        for row in rows {
+            serde_json::to_writer(&mut bytes, row)?;
+            bytes.push(b'\n');
+        }
+        Ok(bytes)
+    };
+    task4_replay_link_availability(&encode(&rows)?)?;
+    rows[2]["kernel_perf_availability"]["cookie"] = serde_json::json!(17);
+    assert!(task4_replay_link_availability(&encode(&rows)?).is_err());
+    rows[2]["kernel_perf_availability"]["cookie"] = serde_json::Value::Null;
+    rows[2]["kernel_perf_availability"]["reason"] = serde_json::json!("kernel_layout_5_15");
+    assert!(task4_replay_link_availability(&encode(&rows)?).is_err());
+    Ok(())
+}
+
 fn task4_replay_files(
     case: &str,
     ledger_bytes: &[u8],
@@ -1867,8 +3323,9 @@ fn task4_replay_files(
     ensure!(!offsets.is_empty());
     let calls: Vec<_> = ledger.iter().filter(|row| row["kind"] == "call").collect();
     let events: Vec<_> = raw.iter().filter(|row| row["kind"] == "call").collect();
+    let repeats = task4_inventory_repeats(offsets.len());
     let expected_calls = match case {
-        "inventory" => offsets.len() + 6,
+        "inventory" => offsets.len() + repeats.len(),
         "detailed" => offsets.len() * 2,
         "highslot-exit" | "highslot-exec" => 1,
         _ => bail!("unknown Task 4 evidence case {case}"),
@@ -1953,10 +3410,7 @@ fn task4_replay_files(
         );
         let expected = match case {
             "inventory" if position < offsets.len() => (position as u64, 0),
-            "inventory" => (
-                [511, 512, 999, 2047, 2048, 2111][position - offsets.len()],
-                0,
-            ),
+            "inventory" => (u64::from(repeats[position - offsets.len()]), 0),
             "detailed" => ((position / 2) as u64, if position % 2 == 0 { 0 } else { 5 }),
             "highslot-exit" => (2048, 0),
             "highslot-exec" => (2048, 5),
@@ -2374,6 +3828,97 @@ fn task4_fixture_receipt(fixture: &OwnedFixture) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(feature = "wide-detailed-2112"))]
+fn task4_identity_fixture_receipt(identity: &Task4IdentityFixture) -> Result<()> {
+    let directory = PathBuf::from(
+        std::env::var_os("P11SCOPE_TASK4_EVIDENCE_DIR")
+            .context("P11SCOPE_TASK4_EVIDENCE_DIR required")?,
+    );
+    let index: usize = std::env::var("P11SCOPE_TASK4_CASE_INDEX")?.parse()?;
+    task4_identity_fixture_receipt_at(identity, &directory, index)
+}
+
+fn task4_identity_fixture_receipt_at(
+    identity: &Task4IdentityFixture,
+    directory: &Path,
+    index: usize,
+) -> Result<()> {
+    ensure!(index < 100);
+    let fixture = &identity.fixture;
+    let original = std::fs::read(&fixture.path)?;
+    let copy = std::fs::read(&identity.copy_path)?;
+    ensure!(
+        original == copy && task4_hash(&original) == fixture.expected_sha256,
+        "identity fixture bytes changed after pinning"
+    );
+    let original_meta = std::fs::metadata(&fixture.path)?;
+    let copy_meta = std::fs::metadata(&identity.copy_path)?;
+    let offsets: Vec<_> = fixture
+        .plan
+        .slots
+        .iter()
+        .map(|slot| -> Result<_> {
+            let meta = std::fs::metadata(&slot.object_path)?;
+            Ok(serde_json::json!({
+                "slot":slot.index,"object":slot.object.0,"dev":meta.dev(),"ino":meta.ino(),
+                "offset":slot.file_offset,"names":slot.names
+            }))
+        })
+        .collect::<Result<_>>()?;
+    ensure!(offsets.len() == 2);
+    let original_slot = &fixture.plan.slots[identity.original_slot as usize];
+    let copy_slot = &fixture.plan.slots[identity.copy_slot as usize];
+    let original_pin = fixture
+        .pins
+        .summary(original_slot.object)
+        .context("original identity pin")?;
+    let copy_pin = fixture
+        .pins
+        .summary(copy_slot.object)
+        .context("copy identity pin")?;
+    let identity_row = serde_json::json!({
+        "schema":1,"mode":"alias_equal_bytes_distinct_inode",
+        "original":{"slot":identity.original_slot,"object":original_slot.object.0,
+            "dev":original_meta.dev(),"ino":original_meta.ino(),
+            "pin_key":{"device_major":original_pin.key.device.major,
+                "device_minor":original_pin.key.device.minor,"inode":original_pin.key.inode},
+            "sha256":task4_hash(&original),"abi":"Lp64",
+            "names":original_slot.names,"offset":original_slot.file_offset},
+        "copy":{"slot":identity.copy_slot,"object":copy_slot.object.0,
+            "dev":copy_meta.dev(),"ino":copy_meta.ino(),
+            "pin_key":{"device_major":copy_pin.key.device.major,
+                "device_minor":copy_pin.key.device.minor,"inode":copy_pin.key.inode},
+            "sha256":task4_hash(&copy),"abi":"Lp64",
+            "names":copy_slot.names,"offset":copy_slot.file_offset},
+        "alias_pair":["owned_0","owned_alias_0"],"equal_bytes":true,
+        "distinct_inode":true
+    });
+    let offsets_bytes = serde_json::to_vec(&offsets)?;
+    let identity_bytes = serde_json::to_vec(&identity_row)?;
+    std::fs::write(directory.join(format!("fixture-{index:02}.elf")), &original)?;
+    std::fs::write(
+        directory.join(format!("fixture-{index:02}-copy.elf")),
+        &copy,
+    )?;
+    std::fs::write(
+        directory.join(format!("offsets-{index:02}.json")),
+        &offsets_bytes,
+    )?;
+    std::fs::write(
+        directory.join(format!("case-{index:02}-identity.json")),
+        &identity_bytes,
+    )?;
+    eprintln!(
+        "TASK4_FIXTURE elf_sha256={} offsets_sha256={}",
+        task4_hash(&original),
+        task4_hash(&offsets_bytes)
+    );
+    eprintln!(
+        "TASK4_PHYSICAL endpoints=2 unique_keys=true alias_names=2 equal_bytes=true distinct_inode=true"
+    );
+    Ok(())
+}
+
 fn task4_inventory_usage(
     evidence: &mut Task4Evidence,
     ebpf: &aya::Ebpf,
@@ -2451,10 +3996,14 @@ fn task4_ids_phase(phase: &str, ids: &OwnedIds) {
 }
 
 fn wide_inventory_gate() -> Result<()> {
-    const N: u32 = 2_112;
+    inventory_sweep_gate(2_112, None)
+}
+
+fn inventory_sweep_gate(n: u32, cell: Option<&'static str>) -> Result<()> {
+    let repeats = task4_inventory_repeats(n as usize);
     let origin = Instant::now();
     eprintln!(
-        "TASK4_PROFILE name={} detailed_slots={} rv_keys={} inventory_budget=2112",
+        "TASK4_PROFILE name={} detailed_slots={} rv_keys={} inventory_budget={n}",
         if cfg!(feature = "wide-detailed-2112") {
             "wide-detailed-2112"
         } else {
@@ -2463,20 +4012,32 @@ fn wide_inventory_gate() -> Result<()> {
         p11scope_ebpf_common::MAX_SLOTS,
         p11scope_ebpf_common::RV_ENTRIES
     );
-    let mut fixture = OwnedFixture::build_n(false, N)?;
-    verify_task4_physical_slots(&fixture.plan.slots, N as usize)?;
+    let mut fixture = OwnedFixture::build_n(false, n)?;
+    verify_task4_physical_slots(&fixture.plan.slots, n as usize)?;
     task4_fixture_receipt(&fixture)?;
     let profile = if cfg!(feature = "wide-detailed-2112") {
         "wide-detailed-2112"
     } else {
         "default"
     };
-    let mut evidence =
-        Task4Evidence::new("inventory", profile, &fixture, crate::EBPF_INVENTORY_OBJECT)?;
+    let mut evidence = Task4Evidence::new_control(
+        "inventory",
+        profile,
+        &fixture,
+        crate::EBPF_INVENTORY_OBJECT,
+        cell.map(|name| {
+            (
+                name,
+                "complete",
+                "single_unique_offsets",
+                "inventory-global.elf",
+            )
+        }),
+    )?;
     evidence.fd_sample("baseline")?;
     let targets = fixture.targets()?;
     let budget =
-        InventoryBudget::new(u64::from(N), 8 * u64::from(N)).map_err(anyhow::Error::msg)?;
+        InventoryBudget::new(u64::from(n), 8 * u64::from(n)).map_err(anyhow::Error::msg)?;
     let prepare_start = Instant::now();
     let prepared = PreparedInventory::prepare(Scope::System, budget, AttachBackend::Singles)?;
     let prepare_ms = prepare_start.elapsed().as_millis();
@@ -2484,7 +4045,7 @@ fn wide_inventory_gate() -> Result<()> {
         super::super::inventory_map_data("USAGE", prepared.ebpf.map("USAGE").context("USAGE")?)?.1;
     let usage_meta = super::super::super::read_map_metadata("USAGE", usage_data)?;
     ensure!(
-        usage_meta.max_entries == N && usage_meta.value_size == 8,
+        usage_meta.max_entries == n && usage_meta.value_size == 8,
         "wrong loaded USAGE map"
     );
     for absent in ["START", "RV_COUNTS", "EVENTS"] {
@@ -2497,7 +4058,7 @@ fn wide_inventory_gate() -> Result<()> {
         "TASK4_LOADED_OBJECT kind=inventory-global.elf sha256={}",
         task4_hash(crate::EBPF_INVENTORY_OBJECT)
     );
-    eprintln!("TASK4_LOADED_MAPS USAGE=2112 START=absent RV_COUNTS=absent EVENTS=absent");
+    eprintln!("TASK4_LOADED_MAPS USAGE={n} START=absent RV_COUNTS=absent EVENTS=absent");
     let registry_start = Instant::now();
     let mut ids = OwnedIds::prepared(&prepared)?;
     let registry_ms = registry_start.elapsed().as_millis();
@@ -2506,29 +4067,35 @@ fn wide_inventory_gate() -> Result<()> {
         .activate(targets)
         .map_err(|error| anyhow::anyhow!("{error}"))?;
     let attach_ms = attach_start.elapsed().as_millis();
-    for row in ids.inspect_links(&active.state, N as usize)? {
+    for mut row in ids.inspect_links(&active.state, n as usize)? {
+        if cell.is_some() && row["role"] == "entry" {
+            row["kernel_perf_availability"] = task4_perf_availability(&row["kernel_perf_detail"])?;
+        }
         evidence.link_row(row)?;
     }
     ensure!(
-        ids.links.len() == N as usize + 2,
+        ids.links.len() == n as usize + 2,
         "incomplete Inventory link set"
     );
+    if cell.is_some() {
+        task4_ids_phase("attached", &ids);
+    }
     task4_ids_receipt(&ids);
     evidence.fd_sample("post_attach")?;
     eprintln!(
-        "TASK4_PHASE prepare_ms={prepare_ms} attach_ms={attach_ms} registry_ms={registry_ms} probes=2112"
+        "TASK4_PHASE prepare_ms={prepare_ms} attach_ms={attach_ms} registry_ms={registry_ms} probes={n}"
     );
     fixture.pins = PinnedObjects::empty();
     let window =
-        || InventoryReadWindow::new(N as usize, Instant::now() + Duration::from_secs(60)).unwrap();
+        || InventoryReadWindow::new(n as usize, Instant::now() + Duration::from_secs(60)).unwrap();
     let zero = active.usage_snapshot(window());
     assert_health(&zero)?;
     ensure!(
-        zero.usage.cells_read == N as usize && zero.usage.positive_count == 0,
+        zero.usage.cells_read == n as usize && zero.usage.positive_count == 0,
         "Inventory was positive before GO or missed initial cells"
     );
     evidence.inventory_snapshot("pre_go", &zero)?;
-    task4_inventory_usage(&mut evidence, &active.state.prepared.ebpf, "pre_go", N)?;
+    task4_inventory_usage(&mut evidence, &active.state.prepared.ebpf, "pre_go", n)?;
     let mut caller = fixture.spawn_gated()?;
     evidence.caller(&mut caller, "pre_go")?;
     await_lifecycle(&mut active, caller.child.id(), DISCOVERY_KIND_EXEC)?;
@@ -2542,7 +4109,7 @@ fn wide_inventory_gate() -> Result<()> {
             .map("USAGE")
             .context("serial Inventory USAGE evidence map")?,
     )?;
-    for id in 0..N {
+    for id in 0..n {
         let before = usage.get(&id, 0)?;
         ensure!(
             before == 0,
@@ -2563,29 +4130,35 @@ fn wide_inventory_gate() -> Result<()> {
         }
     }
     evidence.caller(&mut caller, "after_go")?;
-    eprintln!("TASK4_LEDGER phase=after_go physical_ids={N} completed_calls={N} first=0 tail=2111");
+    eprintln!(
+        "TASK4_LEDGER phase=after_go physical_ids={n} completed_calls={n} first=0 tail={}",
+        n - 1
+    );
     let positive = active.usage_snapshot(window());
     assert_health(&positive)?;
     ensure!(
-        positive.usage.cells_read == N as usize && positive.usage.positive_count == N as usize,
+        positive.usage.cells_read == n as usize && positive.usage.positive_count == n as usize,
         "Inventory did not read every cell positive"
     );
     ensure!(
-        positive.usage.newly_positive == (0..N).collect::<Vec<_>>(),
+        positive.usage.newly_positive == (0..n).collect::<Vec<_>>(),
         "Inventory per-ID set differs from owned workload ledger"
     );
     evidence.inventory_snapshot("after_go", &positive)?;
-    task4_inventory_usage(&mut evidence, &active.state.prepared.ebpf, "after_go", N)?;
-    eprintln!("TASK4_RAW_MAPS phase=after_go usage_positive={N} exact_ids=0..2111");
-    for id in [511, 512, 999, 2_047, 2_048, 2_111] {
+    task4_inventory_usage(&mut evidence, &active.state.prepared.ebpf, "after_go", n)?;
+    eprintln!(
+        "TASK4_RAW_MAPS phase=after_go usage_positive={n} exact_ids=0..{}",
+        n - 1
+    );
+    for &id in &repeats {
         caller.call_exact(id, 0)?;
         evidence.caller(&mut caller, "after_repeat")?;
     }
     let repeated = active.usage_snapshot(window());
     assert_health(&repeated)?;
     ensure!(
-        repeated.usage.cells_read == N as usize
-            && repeated.usage.positive_count == N as usize
+        repeated.usage.cells_read == n as usize
+            && repeated.usage.positive_count == n as usize
             && repeated.usage.newly_positive.is_empty(),
         "Inventory repeated calls changed the latched all-ID set"
     );
@@ -2594,9 +4167,17 @@ fn wide_inventory_gate() -> Result<()> {
         &mut evidence,
         &active.state.prepared.ebpf,
         "after_repeat",
-        N,
+        n,
     )?;
-    eprintln!("TASK4_REPEAT ids=511,512,999,2047,2048,2111 completed_calls=6 newly_positive=0");
+    eprintln!(
+        "TASK4_REPEAT ids={} completed_calls={} newly_positive=0",
+        repeats
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        repeats.len()
+    );
     caller.finish()?;
     evidence.caller(&mut caller, "after_repeat")?;
     await_lifecycle(&mut active, caller.child.id(), DISCOVERY_KIND_LEADER_EXIT)?;
@@ -2609,19 +4190,19 @@ fn wide_inventory_gate() -> Result<()> {
         .try_finish()
         .map_err(|_| anyhow::anyhow!("wide retirement did not finish"))?;
     ensure!(
-        retired.cleanup.closed == N as usize + 2 && retired.cleanup.failures.is_empty(),
+        retired.cleanup.closed == n as usize + 2 && retired.cleanup.failures.is_empty(),
         "Inventory retirement omitted owned links"
     );
     let terminal = retired.usage_snapshot(window());
     assert_health(&terminal)?;
     ensure!(
-        terminal.usage.cells_read == N as usize
-            && terminal.usage.positive_count == N as usize
+        terminal.usage.cells_read == n as usize
+            && terminal.usage.positive_count == n as usize
             && terminal.usage.newly_positive.is_empty(),
         "terminal Inventory map/health differs from all-ID positive ledger"
     );
     evidence.inventory_snapshot("terminal", &terminal)?;
-    task4_inventory_usage(&mut evidence, &retired.state.prepared.ebpf, "terminal", N)?;
+    task4_inventory_usage(&mut evidence, &retired.state.prepared.ebpf, "terminal", n)?;
     evidence.raw_row(serde_json::json!({
         "kind":"terminal","phase":"terminal",
         "usage_positive":terminal.usage.positive_count,
@@ -2631,7 +4212,7 @@ fn wide_inventory_gate() -> Result<()> {
         "health":format!("{:?}",terminal.health)
     }))?;
     eprintln!(
-        "TASK4_RAW_SUMMARY phase=terminal inventory_positive=2112 exact_physical_ids=true ordinary_return_maps=absent"
+        "TASK4_RAW_SUMMARY phase=terminal inventory_positive={n} exact_physical_ids=true ordinary_return_maps=absent"
     );
     drop(retired);
     let release_start = Instant::now();
@@ -2641,7 +4222,7 @@ fn wide_inventory_gate() -> Result<()> {
     evidence.finish()?;
     eprintln!(
         "TASK4_TIMING links={} prepare_ms={prepare_ms} attach_ms={attach_ms} stop_ms={stop_ms} registry_ms={registry_ms} release_ms={release_ms} elapsed_ms={}",
-        N + 2,
+        n + 2,
         origin.elapsed().as_millis()
     );
     eprintln!("TASK4_CLEANUP owned_ids_released=true terminal_unsettled=true");
@@ -2652,6 +4233,193 @@ fn wide_inventory_gate() -> Result<()> {
 #[ignore = "root-owned BPF lane; 2112 distinct physical Inventory entry probes and exact all-ID ledger"]
 fn privileged_task4_inventory_2112_lp64() -> Result<()> {
     wide_inventory_gate()
+}
+
+#[cfg(not(feature = "wide-detailed-2112"))]
+macro_rules! inventory_sweep_test {
+    ($name:ident, $n:literal, $cell:literal) => {
+        #[test]
+        #[ignore = "root-owned BPF lane; bounded physical Inventory sweep"]
+        fn $name() -> Result<()> {
+            inventory_sweep_gate($n, Some($cell))
+        }
+    };
+}
+#[cfg(not(feature = "wide-detailed-2112"))]
+inventory_sweep_test!(
+    privileged_task4_inventory_n511_lp64,
+    511,
+    "inventory-default-n511"
+);
+#[cfg(not(feature = "wide-detailed-2112"))]
+inventory_sweep_test!(
+    privileged_task4_inventory_n512_lp64,
+    512,
+    "inventory-default-n512"
+);
+#[cfg(not(feature = "wide-detailed-2112"))]
+inventory_sweep_test!(
+    privileged_task4_inventory_n513_lp64,
+    513,
+    "inventory-default-n513"
+);
+#[cfg(not(feature = "wide-detailed-2112"))]
+inventory_sweep_test!(
+    privileged_task4_inventory_n2048_lp64,
+    2048,
+    "inventory-default-n2048"
+);
+#[cfg(not(feature = "wide-detailed-2112"))]
+inventory_sweep_test!(
+    privileged_task4_inventory_n2049_lp64,
+    2049,
+    "inventory-default-n2049"
+);
+
+#[cfg(not(feature = "wide-detailed-2112"))]
+fn task4_identity_live_qualification_guard() -> Result<()> {
+    anyhow::bail!(
+        "UNQUALIFIED Task4 identity live control: alias invocation, independent PID sessions, and complete registration provenance require follow-up review"
+    )
+}
+
+#[cfg(not(feature = "wide-detailed-2112"))]
+#[test]
+#[ignore = "root-owned BPF lane; real aliased symbol and same-byte distinct-inode Inventory targets"]
+fn privileged_task4_inventory_physical_identity_controls() -> Result<()> {
+    task4_identity_live_qualification_guard()?;
+    let budget = InventoryBudget::new(2, 16).map_err(anyhow::Error::msg)?;
+    let identity = Task4IdentityFixture::build(AdmissionPolicy::Inventory(budget))?;
+    task4_identity_fixture_receipt(&identity)?;
+    let fixture = &identity.fixture;
+    let mut evidence = Task4Evidence::new_control(
+        "inventory-identity",
+        "default",
+        fixture,
+        crate::EBPF_INVENTORY_OBJECT,
+        Some((
+            "inventory-physical-identity",
+            "complete-identity",
+            "alias_equal_bytes_distinct_inode",
+            "inventory-global.elf",
+        )),
+    )?;
+    evidence.fd_sample("baseline")?;
+    eprintln!("TASK4_PROFILE name=default detailed_slots=512 rv_keys=4096 inventory_budget=2");
+    let prepared = PreparedInventory::prepare(Scope::System, budget, AttachBackend::Singles)?;
+    let usage_meta = super::super::super::read_map_metadata(
+        "USAGE",
+        super::super::inventory_map_data("USAGE", prepared.ebpf.map("USAGE").context("USAGE")?)?.1,
+    )?;
+    ensure!(usage_meta.max_entries == 2 && usage_meta.value_size == 8);
+    for absent in ["START", "RV_COUNTS", "EVENTS"] {
+        ensure!(prepared.ebpf.map(absent).is_none());
+    }
+    eprintln!(
+        "TASK4_LOADED_OBJECT kind=inventory-global.elf sha256={}",
+        task4_hash(crate::EBPF_INVENTORY_OBJECT)
+    );
+    eprintln!("TASK4_LOADED_MAPS USAGE=2 START=absent RV_COUNTS=absent EVENTS=absent");
+    let mut ids = OwnedIds::prepared(&prepared)?;
+    let mut active = prepared
+        .activate(fixture.targets()?)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    for mut row in ids.inspect_links(&active.state, 2)? {
+        if row["role"] == "entry" {
+            row["kernel_perf_availability"] = task4_perf_availability(&row["kernel_perf_detail"])?;
+        }
+        evidence.link_row(row)?;
+    }
+    ensure!(ids.links.len() == 4);
+    task4_ids_phase("attached", &ids);
+    task4_ids_receipt(&ids);
+    evidence.fd_sample("post_attach")?;
+    let window = || InventoryReadWindow::new(2, Instant::now() + Duration::from_secs(30)).unwrap();
+    let zero = active.usage_snapshot(window());
+    assert_health(&zero)?;
+    ensure!(zero.usage.cells_read == 2 && zero.usage.positive_count == 0);
+    evidence.inventory_snapshot("pre_go", &zero)?;
+    task4_inventory_usage(&mut evidence, &active.state.prepared.ebpf, "pre_go", 2)?;
+    let original = fixture.spawn_gated()?;
+    let copy = OwnedCaller::spawn_inner(&identity.copy_path, true)?;
+    identity.assert_copy_caller(&copy)?;
+    let mut callers = vec![
+        (identity.original_slot, original),
+        (identity.copy_slot, copy),
+    ];
+    callers.sort_by_key(|(slot, _)| *slot);
+    for (slot, caller) in &mut callers {
+        let object = fixture.plan.slots[*slot as usize].object.0;
+        evidence.identity_caller(caller, "pre_go", *slot, object)?;
+        await_lifecycle(&mut active, caller.child.id(), DISCOVERY_KIND_EXEC)?;
+        caller.go()?;
+        evidence.identity_caller(caller, "after_go", *slot, object)?;
+    }
+    let usage: Array<_, u64> = Array::try_from(
+        active
+            .state
+            .prepared
+            .ebpf
+            .map("USAGE")
+            .context("identity USAGE")?,
+    )?;
+    for (slot, caller) in &mut callers {
+        let object = fixture.plan.slots[*slot as usize].object.0;
+        let before = usage.get(slot, 0)?;
+        ensure!(before == 0);
+        caller.call_exact(0, 0)?;
+        evidence.identity_caller(caller, "after_go", *slot, object)?;
+        let after = usage.get(slot, 0)?;
+        ensure!(after == 1);
+        evidence.raw_row(serde_json::json!({
+            "kind":"usage_step","phase":"after_go","position":slot,
+            "slot":slot,"before":before,"after":after
+        }))?;
+    }
+    eprintln!("TASK4_LEDGER phase=after_go physical_ids=2 completed_calls=2 first=0 tail=1");
+    let positive = active.usage_snapshot(window());
+    assert_health(&positive)?;
+    ensure!(
+        positive.usage.cells_read == 2
+            && positive.usage.positive_count == 2
+            && positive.usage.newly_positive == vec![0, 1]
+    );
+    evidence.inventory_snapshot("after_go", &positive)?;
+    task4_inventory_usage(&mut evidence, &active.state.prepared.ebpf, "after_go", 2)?;
+    for (slot, caller) in &mut callers {
+        caller.finish()?;
+        let object = fixture.plan.slots[*slot as usize].object.0;
+        evidence.identity_caller(caller, "terminal", *slot, object)?;
+        await_lifecycle(&mut active, caller.child.id(), DISCOVERY_KIND_LEADER_EXIT)?;
+    }
+    evidence.fd_sample("pre_detach")?;
+    let mut retiring = active.begin_stop();
+    finish_owned_retirement_inner(&mut retiring, true, Duration::from_secs(60))?;
+    let mut retired = retiring
+        .try_finish()
+        .map_err(|_| anyhow::anyhow!("identity retirement unfinished"))?;
+    ensure!(retired.cleanup.closed == 4 && retired.cleanup.failures.is_empty());
+    let terminal = retired.usage_snapshot(window());
+    assert_health(&terminal)?;
+    ensure!(terminal.usage.positive_count == 2 && terminal.usage.newly_positive.is_empty());
+    evidence.inventory_snapshot("terminal", &terminal)?;
+    task4_inventory_usage(&mut evidence, &retired.state.prepared.ebpf, "terminal", 2)?;
+    evidence.raw_row(serde_json::json!({
+        "kind":"terminal","phase":"terminal","usage_positive":2,
+        "terminal_unsettled":terminal.terminal_unsettled,
+        "usage_integrity_failures":terminal.usage_integrity_failures,
+        "usage_read_failures":terminal.usage_read_failures,
+        "health":format!("{:?}",terminal.health)
+    }))?;
+    eprintln!(
+        "TASK4_RAW_SUMMARY phase=terminal inventory_positive=2 exact_physical_ids=true ordinary_return_maps=absent"
+    );
+    drop(retired);
+    ids.released_with_budget(Duration::from_secs(60))?;
+    eprintln!("TASK4_LOSS ring=0 usage=0 owner=0");
+    evidence.finish()?;
+    eprintln!("TASK4_CLEANUP owned_ids_released=true terminal_unsettled=true");
+    Ok(())
 }
 
 fn drain_task4_detailed(
@@ -2677,8 +4445,12 @@ fn drain_task4_detailed(
 }
 
 fn verify_task4_call_sequence(rows: &[(u32, u64)]) -> Result<()> {
+    verify_task4_call_sequence_n(rows, 2_112)
+}
+
+fn verify_task4_call_sequence_n(rows: &[(u32, u64)], endpoints: usize) -> Result<()> {
     ensure!(
-        rows.len() == 4_224,
+        rows.len() == endpoints * 2,
         "Detailed CALL sequence length differs from owned ledger"
     );
     for (position, &(slot, rv)) in rows.iter().enumerate() {
@@ -2690,6 +4462,15 @@ fn verify_task4_call_sequence(rows: &[(u32, u64)]) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[test]
+fn task4_detailed_n512_sequence_is_exact() {
+    let mut rows: Vec<_> = (0..512).flat_map(|slot| [(slot, 0), (slot, 5)]).collect();
+    assert!(verify_task4_call_sequence_n(&rows, 512).is_ok());
+    rows.swap(0, 2);
+    rows.swap(1, 3);
+    assert!(verify_task4_call_sequence_n(&rows, 512).is_err());
 }
 
 fn verify_task4_event_identity(
@@ -2759,11 +4540,15 @@ fn task4_call_sequence_rejects_swapped_physical_cookie_even_with_equal_aggregate
     assert!(verify_task4_call_sequence(&rows).is_err());
 }
 
-fn assert_task4_detailed_maps(session: &crate::attach::Session, completed: bool) -> Result<()> {
+fn assert_task4_detailed_maps(
+    session: &crate::attach::Session,
+    completed: bool,
+    endpoints: u32,
+) -> Result<()> {
     let expected = if completed { 2 } else { 0 };
     let stats: PerCpuArray<_, SlotStats> =
         PerCpuArray::try_from(session.ebpf.map("STATS").context("STATS")?)?;
-    for id in 0..2_112 {
+    for id in 0..endpoints {
         let mut total = SlotStats::ZERO;
         for cpu in stats.get(&id, 0)?.iter() {
             total.entered += cpu.entered;
@@ -2797,7 +4582,7 @@ fn assert_task4_detailed_maps(session: &crate::attach::Session, completed: bool)
     for entry in rvs.iter() {
         let (key, counts) = entry?;
         ensure!(
-            key.slot < 2_112 && key._pad == 0 && [0, 5].contains(&key.rv),
+            key.slot < endpoints && key._pad == 0 && [0, 5].contains(&key.rv),
             "foreign or malformed Detailed RV key: slot={} rv={} pad={}",
             key.slot,
             key.rv,
@@ -2810,10 +4595,10 @@ fn assert_task4_detailed_maps(session: &crate::attach::Session, completed: bool)
         );
     }
     ensure!(
-        seen.len() == if completed { 4_224 } else { 0 },
+        seen.len() == if completed { 2 * endpoints as usize } else { 0 },
         "Detailed RV key cardinality"
     );
-    for id in 0..2_112 {
+    for id in 0..endpoints {
         for rv in [0, 5] {
             ensure!(
                 seen.get(&(id, rv)).copied().unwrap_or(0) == u64::from(completed),
@@ -2836,14 +4621,14 @@ fn assert_task4_detailed_maps(session: &crate::attach::Session, completed: bool)
     Ok(())
 }
 
-#[cfg(feature = "wide-detailed-2112")]
 fn task4_detailed_rows(
     session: &crate::attach::Session,
     evidence: &mut Task4Evidence,
+    endpoints: u32,
 ) -> Result<()> {
     let stats: PerCpuArray<_, SlotStats> =
         PerCpuArray::try_from(session.ebpf.map("STATS").context("STATS")?)?;
-    for slot in 0..2_112 {
+    for slot in 0..endpoints {
         let mut entered = 0_u64;
         let mut returned = 0_u64;
         let mut errors = 0_u64;
@@ -2878,18 +4663,39 @@ fn task4_detailed_rows(
 
 #[cfg(feature = "wide-detailed-2112")]
 fn wide_detailed_gate() -> Result<()> {
+    detailed_sweep_gate(2_112, None)
+}
+
+fn detailed_sweep_gate(n: u32, cell: Option<&'static str>) -> Result<()> {
+    ensure!(
+        n <= p11scope_ebpf_common::MAX_SLOTS,
+        "Detailed sweep exceeds profile cap"
+    );
     let origin = Instant::now();
     eprintln!(
-        "TASK4_PROFILE name=wide-detailed-2112 detailed_slots=2112 rv_keys=8192 inventory_budget=2112"
+        "TASK4_PROFILE name={} detailed_slots={} rv_keys={} inventory_budget=2112",
+        if cfg!(feature = "wide-detailed-2112") {
+            "wide-detailed-2112"
+        } else {
+            "default"
+        },
+        p11scope_ebpf_common::MAX_SLOTS,
+        p11scope_ebpf_common::RV_ENTRIES
     );
-    let fixture = OwnedFixture::build_n(false, 2_112)?;
-    verify_task4_physical_slots(&fixture.plan.slots, 2_112)?;
+    let fixture = OwnedFixture::build_n(false, n)?;
+    verify_task4_physical_slots(&fixture.plan.slots, n as usize)?;
     task4_fixture_receipt(&fixture)?;
-    let mut evidence = Task4Evidence::new(
+    let profile = if cfg!(feature = "wide-detailed-2112") {
+        "wide-detailed-2112"
+    } else {
+        "default"
+    };
+    let mut evidence = Task4Evidence::new_control(
         "detailed",
-        "wide-detailed-2112",
+        profile,
         &fixture,
         crate::EBPF_OBJECT,
+        cell.map(|name| (name, "complete", "single_unique_offsets", "detailed.elf")),
     )?;
     evidence.fd_sample("baseline")?;
     let plan =
@@ -2909,7 +4715,7 @@ fn wide_detailed_gate() -> Result<()> {
     )?;
     let attach_ms = attach_start.elapsed().as_millis();
     ensure!(
-        session.attach_failures().is_empty() && session.attached_probes() == 4_224,
+        session.attach_failures().is_empty() && session.attached_probes() == 2 * n as usize,
         "wide Detailed did not retain every paired static probe"
     );
     ensure!(
@@ -2924,8 +4730,10 @@ fn wide_detailed_gate() -> Result<()> {
         Ok(crate::attach::read_map_metadata(name, detailed_map_data(map)?)?.max_entries)
     };
     ensure!(
-        map_max("STATS")? == 2_112 && map_max("RV_COUNTS")? == 8_192 && map_max("START")? == 16_384,
-        "wrong loaded wide Detailed map bounds"
+        map_max("STATS")? == p11scope_ebpf_common::MAX_SLOTS
+            && map_max("RV_COUNTS")? == p11scope_ebpf_common::RV_ENTRIES
+            && map_max("START")? == 16_384,
+        "wrong loaded Detailed map bounds"
     );
     let events_capacity = map_max("EVENTS")?;
     ensure!(events_capacity >= 4_096, "Detailed EVENTS ring too small");
@@ -2933,19 +4741,36 @@ fn wide_detailed_gate() -> Result<()> {
         "TASK4_LOADED_OBJECT kind=detailed.elf sha256={}",
         task4_hash(crate::EBPF_OBJECT)
     );
-    eprintln!("TASK4_LOADED_MAPS STATS=2112 RV_COUNTS=8192 START=16384 EVENTS={events_capacity}");
+    eprintln!(
+        "TASK4_LOADED_MAPS STATS={} RV_COUNTS={} START=16384 EVENTS={events_capacity}",
+        p11scope_ebpf_common::MAX_SLOTS,
+        p11scope_ebpf_common::RV_ENTRIES
+    );
     let registry_start = Instant::now();
     let ids = OwnedIds::detailed(&session)?;
     let registry_ms = registry_start.elapsed().as_millis();
     ensure!(
-        ids.links.len() >= 4_224,
+        ids.links.len() >= 2 * n as usize,
         "Detailed retained fewer links than paired probes"
     );
+    if cell.is_some() {
+        task4_record_registration(
+            &session,
+            &ids,
+            &fixture.plan.slots,
+            &mut evidence,
+            "attached",
+        )?;
+        task4_ids_phase("attached", &ids);
+    }
     task4_ids_receipt(&ids);
     evidence.fd_sample("post_attach")?;
-    eprintln!("TASK4_PHASE attach_ms={attach_ms} registry_ms={registry_ms} probes=4224");
-    assert_task4_detailed_maps(&session, false)?;
-    let mut events = Vec::with_capacity(4_224);
+    eprintln!(
+        "TASK4_PHASE attach_ms={attach_ms} registry_ms={registry_ms} probes={}",
+        2 * n
+    );
+    assert_task4_detailed_maps(&session, false, n)?;
+    let mut events = Vec::with_capacity(2 * n as usize);
     drain_task4_detailed(&mut session, &mut events)?;
     ensure!(events.is_empty(), "Detailed events preceded GO");
     caller.go()?;
@@ -2991,7 +4816,7 @@ fn wide_detailed_gate() -> Result<()> {
     }))?;
     caller.resume_exact_return(0, 0)?;
     evidence.caller(&mut caller, "after_go")?;
-    for id in 0..2_112 {
+    for id in 0..n {
         if id != 0 {
             caller.call_exact(id, 0)?;
         }
@@ -3004,16 +4829,18 @@ fn wide_detailed_gate() -> Result<()> {
     evidence.caller(&mut caller, "after_go")?;
     drain_task4_detailed(&mut session, &mut events)?;
     eprintln!(
-        "TASK4_LEDGER phase=after_go physical_ids=2112 completed_calls=4224 rv0=2112 rv5=2112 first=0 tail=2111"
+        "TASK4_LEDGER phase=after_go physical_ids={n} completed_calls={} rv0={n} rv5={n} first=0 tail={}",
+        2 * n,
+        n - 1
     );
-    assert_task4_detailed_maps(&session, true)?;
-    task4_detailed_rows(&session, &mut evidence)?;
+    assert_task4_detailed_maps(&session, true, n)?;
+    task4_detailed_rows(&session, &mut evidence, n)?;
     ensure!(
-        events.len() == 4_224,
+        events.len() == 2 * n as usize,
         "Detailed trace event count differs from fixture ledger"
     );
     let mut event_keys = BTreeMap::new();
-    let mut sequence = Vec::with_capacity(4_224);
+    let mut sequence = Vec::with_capacity(2 * n as usize);
     let mut tracer = crate::trace::Tracer::new(&plan);
     let mut state =
         crate::semantics::State::with_policy(&plan, crate::attach::CapturePolicy::Allowlisted);
@@ -3021,7 +4848,7 @@ fn wide_detailed_gate() -> Result<()> {
     let mut rendered_count = 0u64;
     for (position, event) in events.iter().enumerate() {
         ensure!(
-            event.slot < 2_112 && [0, 5].contains(&event.rv),
+            event.slot < n && [0, 5].contains(&event.rv),
             "foreign Detailed event"
         );
         verify_task4_event_identity(event, caller.child.id(), Some(witness_image))?;
@@ -3050,9 +4877,11 @@ fn wide_detailed_gate() -> Result<()> {
         evidence.render(&rendered)?;
         rendered_count += 1;
     }
-    verify_task4_call_sequence(&sequence)?;
+    verify_task4_call_sequence_n(&sequence, n as usize)?;
     ensure!(
-        tracer.raw_calls() == 4_224 && rendered_count == 4_224 && event_keys.len() == 4_224,
+        tracer.raw_calls() == u64::from(2 * n)
+            && rendered_count == u64::from(2 * n)
+            && event_keys.len() == 2 * n as usize,
         "Tracer raw count or distinct event keys differ"
     );
     ensure!(
@@ -3063,9 +4892,11 @@ fn wide_detailed_gate() -> Result<()> {
         "count-only Detailed fixture left reducer debt or semantic loss"
     );
     eprintln!(
-        "TASK4_REDUCER raw_calls=4224 rendered=4224 pending=0 semantic_evidence=zero orphan_ops=0 unmatched_closes=0"
+        "TASK4_REDUCER raw_calls={} rendered={} pending=0 semantic_evidence=zero orphan_ops=0 unmatched_closes=0",
+        2 * n,
+        2 * n
     );
-    for id in 0..2_112 {
+    for id in 0..n {
         for rv in [0, 5] {
             ensure!(
                 event_keys.get(&(id, rv)) == Some(&1),
@@ -3074,7 +4905,10 @@ fn wide_detailed_gate() -> Result<()> {
         }
     }
     eprintln!(
-        "TASK4_RAW_MAPS phase=after_go stats_entered=4224 stats_returned=4224 stats_errors=2112 rv_keys=4224 start=0 owner_outstanding=0"
+        "TASK4_RAW_MAPS phase=after_go stats_entered={} stats_returned={} stats_errors={n} rv_keys={} start=0 owner_outstanding=0",
+        2 * n,
+        2 * n,
+        2 * n
     );
     let rendered_digest = task4_digest_hex(rendered_hash.finalize());
     ensure!(
@@ -3082,7 +4916,10 @@ fn wide_detailed_gate() -> Result<()> {
         "rendered stream and retained bytes differ"
     );
     eprintln!(
-        "TASK4_TRACE phase=after_go calls=4224 rendered=4224 distinct_slot_rv=4224 ordered_ledger=true ring_malformed=0 rendered_sha256={rendered_digest}"
+        "TASK4_TRACE phase=after_go calls={} rendered={} distinct_slot_rv={} ordered_ledger=true ring_malformed=0 rendered_sha256={rendered_digest}",
+        2 * n,
+        2 * n,
+        2 * n
     );
     evidence.fd_sample("pre_detach")?;
     let stop_start = Instant::now();
@@ -3091,10 +4928,10 @@ fn wide_detailed_gate() -> Result<()> {
     let clean_detach = session.detach_failures().is_empty();
     drain_task4_detailed(&mut session, &mut events)?;
     ensure!(
-        events.len() == 4_224,
+        events.len() == 2 * n as usize,
         "terminal drain found unaccounted Detailed events"
     );
-    assert_task4_detailed_maps(&session, true)?;
+    assert_task4_detailed_maps(&session, true, n)?;
     let terminal_evidence = crate::metrics::kernel_evidence(&session)?;
     ensure!(
         terminal_evidence == crate::metrics::KernelEvidence::default(),
@@ -3131,7 +4968,12 @@ fn wide_detailed_gate() -> Result<()> {
         }
     }))?;
     eprintln!(
-        "TASK4_RAW_SUMMARY phase=terminal stats_entered=4224 stats_returned=4224 rv_keys=4224 raw_calls=4224 rendered=4224 ordered_ledger=true"
+        "TASK4_RAW_SUMMARY phase=terminal stats_entered={} stats_returned={} rv_keys={} raw_calls={} rendered={} ordered_ledger=true",
+        2 * n,
+        2 * n,
+        2 * n,
+        2 * n,
+        2 * n
     );
     drop(session);
     let release_start = Instant::now();
@@ -3160,6 +5002,295 @@ fn wide_detailed_gate() -> Result<()> {
 #[ignore = "root-owned BPF lane; 2112 distinct physical Detailed slots, 4224 CALL events and exact raw RV rows"]
 fn privileged_task4_detailed_2112_lp64() -> Result<()> {
     wide_detailed_gate()
+}
+
+macro_rules! detailed_sweep_test {
+    ($name:ident, $n:literal, $cell:literal) => {
+        #[test]
+        #[ignore = "root-owned BPF lane; bounded physical Detailed sweep"]
+        fn $name() -> Result<()> {
+            detailed_sweep_gate($n, Some($cell))
+        }
+    };
+}
+#[cfg(feature = "wide-detailed-2112")]
+detailed_sweep_test!(
+    privileged_task4_detailed_n511_lp64,
+    511,
+    "detailed-wide-n511"
+);
+#[cfg(feature = "wide-detailed-2112")]
+detailed_sweep_test!(
+    privileged_task4_detailed_n512_lp64,
+    512,
+    "detailed-wide-n512"
+);
+#[cfg(feature = "wide-detailed-2112")]
+detailed_sweep_test!(
+    privileged_task4_detailed_n513_lp64,
+    513,
+    "detailed-wide-n513"
+);
+#[cfg(feature = "wide-detailed-2112")]
+detailed_sweep_test!(
+    privileged_task4_detailed_n2048_lp64,
+    2048,
+    "detailed-wide-n2048"
+);
+#[cfg(feature = "wide-detailed-2112")]
+detailed_sweep_test!(
+    privileged_task4_detailed_n2049_lp64,
+    2049,
+    "detailed-wide-n2049"
+);
+#[cfg(not(feature = "wide-detailed-2112"))]
+detailed_sweep_test!(
+    privileged_task4_detailed_n512_lp64,
+    512,
+    "detailed-default-n512"
+);
+
+#[test]
+fn task4_detailed_physical_capacity_refusal() -> Result<()> {
+    for endpoints in [p11scope_ebpf_common::MAX_SLOTS + 1, 2_113] {
+        let fixture = OwnedFixture::build_n(false, endpoints)?;
+        verify_task4_physical_slots(&fixture.plan.slots, endpoints as usize)?;
+        let error = AttachPlan::from_slots_with_policy(
+            fixture.plan.slots.clone(),
+            AdmissionPolicy::Detailed,
+        )
+        .expect_err("Detailed plan admitted physical capacity overflow");
+        ensure!(
+            error.contains(&format!("requires {endpoints}"))
+                && error.contains(&format!("only {}", p11scope_ebpf_common::MAX_SLOTS)),
+            "wrong physical capacity refusal: {error}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "wide-detailed-2112"))]
+#[test]
+#[ignore = "root-owned BPF lane; real aliased symbol and same-byte distinct-inode Detailed targets"]
+fn privileged_task4_detailed_physical_identity_controls() -> Result<()> {
+    task4_identity_live_qualification_guard()?;
+    let identity = Task4IdentityFixture::build(AdmissionPolicy::Detailed)?;
+    task4_identity_fixture_receipt(&identity)?;
+    let fixture = &identity.fixture;
+    let mut evidence = Task4Evidence::new_control(
+        "detailed-identity",
+        "default",
+        fixture,
+        crate::EBPF_OBJECT,
+        Some((
+            "detailed-physical-identity",
+            "complete-identity",
+            "alias_equal_bytes_distinct_inode",
+            "detailed.elf",
+        )),
+    )?;
+    evidence.fd_sample("baseline")?;
+    eprintln!("TASK4_PROFILE name=default detailed_slots=512 rv_keys=4096 inventory_budget=2112");
+    let first = AttachPlan::from_slots_with_policy(
+        vec![fixture.plan.slots[0].clone()],
+        AdmissionPolicy::Detailed,
+    )
+    .map_err(anyhow::Error::msg)?;
+    let mut session = crate::attach::Session::start(
+        &first,
+        &Scope::System,
+        &fixture.pins,
+        crate::attach::CapturePolicy::Allowlisted,
+        None,
+        None,
+        None,
+        crate::attach::BackendSelection::Singles,
+    )?;
+    ensure!(session.attach_failures().is_empty() && session.attached_probes() == 2);
+    let first_ids = OwnedIds::detailed(&session)?;
+    task4_ids_phase("first_attached", &first_ids);
+    evidence.fd_sample("post_first_attach")?;
+    let (failed, completed) =
+        session.attach_targets(&[fixture.plan.slots[1].clone()], &fixture.pins)?;
+    ensure!(failed.is_empty() && completed.len() == 1 && completed[0].0 == 1);
+    ensure!(session.attach_failures().is_empty() && session.attached_probes() == 4);
+    let ids = OwnedIds::detailed(&session)?;
+    ensure!(
+        first_ids.maps == ids.maps
+            && first_ids.programs == ids.programs
+            && first_ids.links.is_subset(&ids.links)
+            && ids.links.len() == first_ids.links.len() + 2
+    );
+    task4_record_registration(
+        &session,
+        &ids,
+        &fixture.plan.slots,
+        &mut evidence,
+        "second_attached",
+    )?;
+    task4_ids_phase("second_attached", &ids);
+    task4_ids_receipt(&ids);
+    evidence.fd_sample("post_second_attach")?;
+    let map_max = |name| -> Result<u32> {
+        let map = session
+            .ebpf
+            .map(name)
+            .with_context(|| format!("{name} map"))?;
+        Ok(crate::attach::read_map_metadata(name, detailed_map_data(map)?)?.max_entries)
+    };
+    ensure!(
+        map_max("STATS")? == 512 && map_max("RV_COUNTS")? == 4_096 && map_max("START")? == 16_384
+    );
+    let events_capacity = map_max("EVENTS")?;
+    ensure!(events_capacity >= 4_096);
+    eprintln!(
+        "TASK4_LOADED_OBJECT kind=detailed.elf sha256={}",
+        task4_hash(crate::EBPF_OBJECT)
+    );
+    eprintln!("TASK4_LOADED_MAPS STATS=512 RV_COUNTS=4096 START=16384 EVENTS={events_capacity}");
+    assert_task4_detailed_maps(&session, false, 2)?;
+    let original = fixture.spawn_gated()?;
+    let copy = OwnedCaller::spawn_inner(&identity.copy_path, true)?;
+    identity.assert_copy_caller(&copy)?;
+    let mut callers = vec![
+        (identity.original_slot, original),
+        (identity.copy_slot, copy),
+    ];
+    callers.sort_by_key(|(slot, _)| *slot);
+    let mut events = Vec::new();
+    drain_task4_detailed(&mut session, &mut events)?;
+    ensure!(events.is_empty());
+    for (slot, caller) in &mut callers {
+        let object = fixture.plan.slots[*slot as usize].object.0;
+        evidence.identity_caller(caller, "pre_go", *slot, object)?;
+        caller.go()?;
+        evidence.identity_caller(caller, "after_go", *slot, object)?;
+    }
+    let mut witnesses = BTreeMap::new();
+    for (slot, caller) in &mut callers {
+        let object = fixture.plan.slots[*slot as usize].object.0;
+        caller.hold_exact_return_in_body(0, 0)?;
+        evidence.identity_caller(caller, "after_go", *slot, object)?;
+        let starts: HashMap<_, StartKey, CallStart> =
+            HashMap::try_from(session.ebpf.map("START").context("identity held START")?)?;
+        let held = starts.iter().collect::<std::result::Result<Vec<_>, _>>()?;
+        ensure!(held.len() == 1);
+        let (key, start) = held[0];
+        let pid_tgid = u64::from(caller.child.id()) << 32 | u64::from(caller.child.id());
+        ensure!(
+            key.slot == *slot
+                && key.pid_tgid == pid_tgid
+                && start.ts_ns != 0
+                && start.image.task_cookie != 0
+        );
+        let stats: PerCpuArray<_, SlotStats> =
+            PerCpuArray::try_from(session.ebpf.map("STATS").context("identity held STATS")?)?;
+        let mut entered = 0_u64;
+        let mut returned = 0_u64;
+        for cpu in stats.get(slot, 0)?.iter() {
+            entered += cpu.entered;
+            returned += cpu.returned;
+        }
+        ensure!((entered, returned) == (1, 0));
+        drain_task4_detailed(&mut session, &mut events)?;
+        ensure!(events.len() == 2 * (*slot as usize));
+        evidence.raw_row(serde_json::json!({
+            "kind":"image_witness","phase":"held_first_call","position":slot,
+            "slot":slot,"pid_tgid":pid_tgid,"ts_ns":start.ts_ns,
+            "image":{"task_cookie":start.image.task_cookie,"exec_id":start.image.exec_id}
+        }))?;
+        witnesses.insert(*slot, (start.image, start.ts_ns, caller.child.id()));
+        caller.resume_exact_return(0, 0)?;
+        evidence.identity_caller(caller, "after_go", *slot, object)?;
+        caller.call_exact(0, 5)?;
+        evidence.identity_caller(caller, "after_go", *slot, object)?;
+        drain_task4_detailed(&mut session, &mut events)?;
+        ensure!(events.len() == 2 * (*slot as usize + 1));
+    }
+    eprintln!(
+        "TASK4_LEDGER phase=after_go physical_ids=2 completed_calls=4 rv0=2 rv5=2 first=0 tail=1"
+    );
+    assert_task4_detailed_maps(&session, true, 2)?;
+    task4_detailed_rows(&session, &mut evidence, 2)?;
+    let mut tracer = crate::trace::Tracer::new(&fixture.plan);
+    let mut state = crate::semantics::State::with_policy(
+        &fixture.plan,
+        crate::attach::CapturePolicy::Allowlisted,
+    );
+    for (position, event) in events.iter().enumerate() {
+        let slot = (position / 2) as u32;
+        let rv = if position % 2 == 0 { 0 } else { 5 };
+        let (image, ts, pid) = witnesses[&slot];
+        ensure!(event.slot == slot && event.rv == rv);
+        verify_task4_event_identity(event, pid, Some(image))?;
+        if position % 2 == 0 {
+            ensure!(event.ts_ns.checked_sub(event.duration_ns) == Some(ts));
+        }
+        evidence.event(event, fixture, "after_go")?;
+        tracer.count_raw_call(event);
+        let rendered = tracer.on_event(event, &mut state);
+        let rv_label = pkcs11_types::CkRv(rv).to_string();
+        let rv_label = rv_label.split(" (").next().unwrap_or(&rv_label);
+        ensure!(
+            rendered.contains("owned_0")
+                && rendered.contains(&format!("[semantics unverified] → {rv_label} "))
+        );
+        evidence.render(&rendered)?;
+    }
+    ensure!(
+        tracer.raw_calls() == 4
+            && state.pending_at_end() == 0
+            && state.semantic_evidence() == crate::semantics::SemanticEvidence::default()
+    );
+    eprintln!(
+        "TASK4_TRACE phase=after_go calls=4 rendered=4 distinct_slot_rv=4 ordered_ledger=true ring_malformed=0 rendered_sha256={}",
+        task4_hash(&evidence.rendered.contents()?)
+    );
+    for (slot, caller) in &mut callers {
+        caller.finish()?;
+        let object = fixture.plan.slots[*slot as usize].object.0;
+        evidence.identity_caller(caller, "terminal", *slot, object)?;
+    }
+    evidence.fd_sample("pre_detach")?;
+    let detached = session.detach_producers();
+    drain_task4_detailed(&mut session, &mut events)?;
+    ensure!(events.len() == 4);
+    assert_task4_detailed_maps(&session, true, 2)?;
+    let kernel = crate::metrics::kernel_evidence(&session)?;
+    let discovery = session.counter_snapshot()?;
+    ensure!(
+        kernel == crate::metrics::KernelEvidence::default()
+            && discovery == crate::attach::CounterSnapshot::default()
+    );
+    evidence.raw_row(serde_json::json!({
+        "kind":"terminal","phase":"terminal","ring_loss":kernel.ring_loss,
+        "raw_calls":tracer.raw_calls(),"rendered":4,"pending":state.pending_at_end(),
+        "orphan_ops":state.orphan_ops(),"unmatched_closes":state.unmatched_closes(),
+        "kernel":{
+            "ring_loss":kernel.ring_loss,"start_insert_failures":kernel.start_insert_failures,
+            "unmatched_returns":kernel.unmatched_returns,"rv_update_failures":kernel.rv_update_failures,
+            "cgroup_scope_failures":kernel.cgroup_scope_failures,
+            "semantic_capture_failures":kernel.semantic_capture_failures,
+            "template_tail_failures":kernel.template_tail_failures,
+            "unregistered_mechanisms":kernel.unregistered_mechanisms,"abi_refusals":kernel.abi_refusals
+        },
+        "discovery":{
+            "ring_loss":discovery.ring_loss,"export_state_failures":discovery.export_state_failures,
+            "export_bounded_read_failures":discovery.export_bounded_read_failures,
+            "loader_hits":discovery.loader_hits,"loader_state_read_failures":discovery.loader_state_read_failures,
+            "abi_refusals":discovery.abi_refusals
+        }
+    }))?;
+    eprintln!(
+        "TASK4_RAW_SUMMARY phase=terminal stats_entered=4 stats_returned=4 rv_keys=4 raw_calls=4 rendered=4 ordered_ledger=true"
+    );
+    drop(session);
+    ids.released_with_budget(Duration::from_secs(60))?;
+    detached?;
+    eprintln!("TASK4_LOSS ring=0 discovery=0 owner=0 output_rendered=4");
+    evidence.finish()?;
+    eprintln!("TASK4_CLEANUP owned_ids_released=true terminal_unsettled=true");
+    Ok(())
 }
 
 #[test]

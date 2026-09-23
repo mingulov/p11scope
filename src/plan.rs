@@ -11,7 +11,11 @@
 //! only, atomic refusal), unresolved heuristic tables admit until the
 //! per-object cap, and the heuristic spill is reported as
 //! `uncorroborated_candidates` — whole-module refusal stays only for the case
-//! where even the strongest table exceeds the remaining budget.
+//! where even the strongest table exceeds the remaining budget. A module
+//! whose sources still list endpoints this capture already attached for it is
+//! never refused whole (G-03): when its growth does not fit, it keeps those
+//! endpoints, no prefix of the growth is attached, and the omission is
+//! reported, so it is partial but never silent.
 //!
 //! Both discovery sources — the memory scan and a manifest — lower into `Discovered`
 //! and go through the same `merge`, so there is exactly one implementation of the
@@ -162,6 +166,26 @@ fn drop_transparent_unknown(names: &mut Vec<String>) {
     }
 }
 
+/// Opens every `modules_skipped` reason for a module that was already
+/// attached when its growth did not fit (G-03): it keeps the endpoints it
+/// had, so it is partially covered, never refused. A whole refusal opens
+/// with `module needs` instead.
+const GROWTH_OMISSION: &str = "admitted module needs";
+
+/// Whether a `modules_skipped` reason records a partially covered module
+/// rather than one refused whole.
+pub(crate) fn is_growth_omission(reason: &str) -> bool {
+    reason.starts_with(GROWTH_OMISSION)
+}
+
+fn growth_omission_reason(omitted: usize, capacity: usize, in_use: usize, kept: usize) -> String {
+    format!(
+        "{GROWTH_OMISSION} {omitted} more; only {capacity} attach slots are available; \
+         {in_use} are in use — kept its {kept} attached endpoints and omitted the \
+         {omitted} new ones"
+    )
+}
+
 /// One function table a module published.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct TableSummary {
@@ -290,7 +314,9 @@ pub struct AttachPlan {
     /// they were decoded from is still admitted on its strongest tables.
     pub uncorroborated_candidates: u64,
     pub skipped: Vec<Skipped>,
-    /// Modules refused whole because the slot ceiling was reached.
+    /// Modules the slot ceiling cut short: refused whole, or — for a module
+    /// already attached whose growth did not fit — partially covered, its
+    /// endpoints kept and its growth omitted (G-03, [`is_growth_omission`]).
     pub modules_skipped: Vec<Skipped>,
     // Exact private owner for each public capacity refusal. Paths remain
     // diagnostic text and never identify capture-lifetime history.
@@ -472,6 +498,7 @@ impl AttachPlan {
         broad_admit: bool,
         admission_policy: AdmissionPolicy,
     ) -> AttachPlan {
+        let owned = self.active_keys_by_owner();
         let mut rebuilt = build_from_sources_with(
             scanned,
             manifests,
@@ -480,6 +507,7 @@ impl AttachPlan {
             ExistingAllocation {
                 slots: self.slots.len(),
                 active: &self.slot_by_key,
+                owned: &owned,
             },
             broad_admit,
             admission_policy,
@@ -722,6 +750,29 @@ impl AttachPlan {
         self.refused_module_objects
             .iter()
             .map(|(object, skipped)| (*object, skipped))
+    }
+
+    /// Every active exact target, under the object of each module that
+    /// currently owns it. A module found here is already admitted: when its
+    /// growth does not fit, it keeps these endpoints (G-03).
+    fn active_keys_by_owner(&self) -> BTreeMap<PinnedObjectId, BTreeSet<AttachKey>> {
+        let objects: BTreeMap<ModuleId, PinnedObjectId> = self
+            .modules
+            .iter()
+            .map(|module| (module.id, module.object))
+            .collect();
+        let mut owned: BTreeMap<PinnedObjectId, BTreeSet<AttachKey>> = BTreeMap::new();
+        for (key, position) in &self.slot_by_key {
+            let Some(slot) = self.slots.get(*position) else {
+                continue;
+            };
+            for module in &slot.module_ids {
+                if let Some(object) = objects.get(module) {
+                    owned.entry(*object).or_default().insert(*key);
+                }
+            }
+        }
+        owned
     }
 
     pub(crate) fn effective_semantics(&self, slot: &Slot) -> SlotSemantics {
@@ -1328,12 +1379,12 @@ fn merge(
     discovered: Vec<Discovered<'_>>,
     vendor_interfaces: usize,
     interface_list: String,
-    allocated_slots: usize,
-    existing_slots: &BTreeMap<AttachKey, usize>,
+    allocated: ExistingAllocation<'_>,
     broad_admit: bool,
     admission_policy: AdmissionPolicy,
 ) -> AttachPlan {
     let capacity = admission_policy.endpoint_limit();
+    let existing_slots = allocated.active;
     let mut groups: Vec<Vec<Discovered<'_>>> = Vec::new();
     let mut group_positions: BTreeMap<PinnedObjectId, usize> = BTreeMap::new();
     for module in discovered {
@@ -1354,249 +1405,272 @@ fn merge(
     let mut surfaces = Vec::new();
     let mut entries_seen = 0usize;
     let mut uncorroborated_candidates = 0u64;
-    let mut allocated_slots = allocated_slots;
+    let mut allocated_slots = allocated.slots;
     'groups: for group in groups {
         let key = group[0].key;
         let object = group[0].object;
         let path = group[0].path;
         let source = group[0].source;
         entries_seen += decoded_occurrence_count(&group);
-        // Manifest targets are operator-authoritative: admitted whole, and the
-        // module is refused whole when even they exceed the remaining budget.
-        let manifest_wanted: BTreeSet<AttachKey> = group
-            .iter()
-            .filter(|module| module.scan_evidence.is_none())
-            .flat_map(|module| &module.targets)
-            .map(|target| AttachKey {
-                object: target.object,
-                file_offset: target.file_offset,
-            })
-            .filter(|target| {
-                !positions.contains_key(&(target.object, target.file_offset))
-                    && !existing_slots.contains_key(target)
-            })
-            .collect();
-        if admission_policy
-            .checked_required(allocated_slots, manifest_wanted.len())
-            .is_err()
-        {
-            let skipped = Skipped {
-                subject: path.to_string(),
-                reason: format!(
-                    "module needs {} more; only {capacity} attach slots are available; {} are in use \
-                     — refusing to attach a prefix",
-                    manifest_wanted.len(),
-                    allocated_slots
-                ),
-            };
-            refused_module_objects.push((object, skipped.clone()));
-            modules_skipped.push(skipped);
-            continue;
-        }
-        // Scan tables admit in publication-evidence order. Corroborated tables
-        // (interface-linked, manifest/live-return supported) bypass the
-        // per-object cap, subject only to the global budget with atomic
-        // whole-module refusal; unresolved heuristic tables admit until the
-        // per-object cap, and their spill is counted, never slotted. Linkage
-        // is preferred, never gated: unlinked tables still admit in turn, so
-        // scan-only capture of never-called legacy providers keeps working.
-        // One object seen from several views decodes the same tables
-        // repeatedly: distinct tables admit once, scored by the strongest
-        // instance, so linkage observed from any view counts.
-        let mut distinct: BTreeMap<TableKey, (TableEvidenceScore, usize)> = BTreeMap::new();
-        let mut sequence = 0usize;
-        for (piece, module) in group.iter().enumerate() {
-            let Some(evidence) = &module.scan_evidence else {
-                continue;
-            };
-            for index in order_tables_by_evidence(evidence.tables, evidence.interfaces, &[], &[]) {
-                let score =
-                    table_evidence_score(index, evidence.tables, evidence.interfaces, &[], &[]);
-                let key = table_key(piece, index, &evidence.tables[index]);
-                distinct
-                    .entry(key)
-                    .and_modify(|slot| slot.0 = slot.0.max(score))
-                    .or_insert_with(|| {
-                        let slot = (score, sequence);
-                        sequence += 1;
-                        slot
-                    });
-            }
-        }
-        let mut ordered: Vec<(TableKey, TableEvidenceScore, usize)> = distinct
-            .into_iter()
-            .map(|(key, (score, sequence))| (key, score, sequence))
-            .collect();
-        // Strongest evidence first; ties keep first-seen order, so scoring
-        // never reorders what it cannot distinguish.
-        ordered.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.2.cmp(&right.2)));
-        // Every scan target of this group, by distinct table, for marginal
-        // budget accounting across views of one object.
-        let mut keys_of: BTreeMap<TableKey, BTreeSet<AttachKey>> = BTreeMap::new();
-        for (piece, module) in group.iter().enumerate() {
-            let Some(evidence) = &module.scan_evidence else {
-                continue;
-            };
-            for target in &module.targets {
-                let Some(index) = target.table else { continue };
-                let Some(table) = evidence.tables.get(index) else {
-                    continue;
-                };
-                keys_of
-                    .entry(table_key(piece, index, table))
-                    .or_default()
-                    .insert(AttachKey {
+        // G-03: the exact targets this module already has attached — active
+        // in the current plan with this module among their owners — that its
+        // sources still list. Empty for a module new to the capture.
+        let kept: BTreeSet<AttachKey> = allocated
+            .owned
+            .get(&object)
+            .map(|owned| {
+                group
+                    .iter()
+                    .flat_map(|module| &module.targets)
+                    .map(|target| AttachKey {
                         object: target.object,
                         file_offset: target.file_offset,
-                    });
-            }
-        }
-        let is_fresh = |key: &AttachKey| {
-            !positions.contains_key(&(key.object, key.file_offset))
-                && !existing_slots.contains_key(key)
-        };
-        let is_published = table_name_authorized;
-        // All-or-nothing refusal survives only here: when even the strongest
-        // table exceeds the remaining global budget, the module — scan and
-        // manifest parts alike — is refused whole. A manifest subset must not
-        // reattach an oversized scan as a prefix.
-        if let Some((top, _, _)) = ordered.first() {
-            let top_marginal = keys_of
-                .get(top)
-                .map_or(0, |keys| keys.iter().filter(|key| is_fresh(key)).count());
-            if admission_policy
-                .checked_required(allocated_slots, top_marginal)
-                .is_err()
-            {
-                let skipped = Skipped {
-                    subject: path.to_string(),
-                    reason: format!(
-                        "module needs {top_marginal} more; only {capacity} attach slots are available; \
-                         {allocated_slots} are in use — refusing to attach a prefix"
-                    ),
+                    })
+                    .filter(|key| owned.contains(key))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // The demand a capacity check refused this module while it has
+        // endpoints to keep. Admission then runs once more over `kept` alone:
+        // the module keeps every endpoint it has, no prefix of its growth is
+        // attached, and the growth is reported as omitted below. A module
+        // with nothing to keep is refused whole, as before.
+        let mut refused_growth: Option<BTreeSet<AttachKey>> = None;
+        let (fresh, admitted) = 'admission: loop {
+            let kept_only = refused_growth.is_some();
+            let admissible = |key: &AttachKey| !kept_only || kept.contains(key);
+            let refused: BTreeSet<AttachKey> = 'refused: {
+                // Manifest targets are operator-authoritative: admitted whole, and the
+                // module is refused whole when even they exceed the remaining budget.
+                let manifest_wanted: BTreeSet<AttachKey> = group
+                    .iter()
+                    .filter(|module| module.scan_evidence.is_none())
+                    .flat_map(|module| &module.targets)
+                    .map(|target| AttachKey {
+                        object: target.object,
+                        file_offset: target.file_offset,
+                    })
+                    .filter(|target| {
+                        admissible(target)
+                            && !positions.contains_key(&(target.object, target.file_offset))
+                            && !existing_slots.contains_key(target)
+                    })
+                    .collect();
+                if admission_policy
+                    .checked_required(allocated_slots, manifest_wanted.len())
+                    .is_err()
+                {
+                    break 'refused manifest_wanted;
+                }
+                // Scan tables admit in publication-evidence order. Corroborated tables
+                // (interface-linked, manifest/live-return supported) bypass the
+                // per-object cap, subject only to the global budget with atomic
+                // whole-module refusal; unresolved heuristic tables admit until the
+                // per-object cap, and their spill is counted, never slotted. Linkage
+                // is preferred, never gated: unlinked tables still admit in turn, so
+                // scan-only capture of never-called legacy providers keeps working.
+                // One object seen from several views decodes the same tables
+                // repeatedly: distinct tables admit once, scored by the strongest
+                // instance, so linkage observed from any view counts.
+                let mut distinct: BTreeMap<TableKey, (TableEvidenceScore, usize)> = BTreeMap::new();
+                let mut sequence = 0usize;
+                for (piece, module) in group.iter().enumerate() {
+                    let Some(evidence) = &module.scan_evidence else {
+                        continue;
+                    };
+                    for index in
+                        order_tables_by_evidence(evidence.tables, evidence.interfaces, &[], &[])
+                    {
+                        let score = table_evidence_score(
+                            index,
+                            evidence.tables,
+                            evidence.interfaces,
+                            &[],
+                            &[],
+                        );
+                        let key = table_key(piece, index, &evidence.tables[index]);
+                        distinct
+                            .entry(key)
+                            .and_modify(|slot| slot.0 = slot.0.max(score))
+                            .or_insert_with(|| {
+                                let slot = (score, sequence);
+                                sequence += 1;
+                                slot
+                            });
+                    }
+                }
+                let mut ordered: Vec<(TableKey, TableEvidenceScore, usize)> = distinct
+                    .into_iter()
+                    .map(|(key, (score, sequence))| (key, score, sequence))
+                    .collect();
+                // Strongest evidence first; ties keep first-seen order, so scoring
+                // never reorders what it cannot distinguish.
+                ordered
+                    .sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.2.cmp(&right.2)));
+                // Every scan target of this group, by distinct table, for marginal
+                // budget accounting across views of one object.
+                let mut keys_of: BTreeMap<TableKey, BTreeSet<AttachKey>> = BTreeMap::new();
+                for (piece, module) in group.iter().enumerate() {
+                    let Some(evidence) = &module.scan_evidence else {
+                        continue;
+                    };
+                    for target in &module.targets {
+                        let Some(index) = target.table else { continue };
+                        let Some(table) = evidence.tables.get(index) else {
+                            continue;
+                        };
+                        let key = AttachKey {
+                            object: target.object,
+                            file_offset: target.file_offset,
+                        };
+                        if admissible(&key) {
+                            keys_of
+                                .entry(table_key(piece, index, table))
+                                .or_default()
+                                .insert(key);
+                        }
+                    }
+                }
+                let is_fresh = |key: &AttachKey| {
+                    !positions.contains_key(&(key.object, key.file_offset))
+                        && !existing_slots.contains_key(key)
                 };
-                refused_module_objects.push((object, skipped.clone()));
-                modules_skipped.push(skipped);
-                continue 'groups;
+                let is_published = table_name_authorized;
+                // All-or-nothing refusal survives only here: when even the strongest
+                // table exceeds the remaining global budget, the module — scan and
+                // manifest parts alike — is refused whole. A manifest subset must not
+                // reattach an oversized scan as a prefix.
+                if let Some((top, _, _)) = ordered.first() {
+                    let top_fresh: BTreeSet<AttachKey> = keys_of
+                        .get(top)
+                        .map(|keys| keys.iter().filter(|key| is_fresh(key)).copied().collect())
+                        .unwrap_or_default();
+                    if admission_policy
+                        .checked_required(allocated_slots, top_fresh.len())
+                        .is_err()
+                    {
+                        break 'refused top_fresh;
+                    }
+                }
+                // Published tables bypass the per-object cap but stay atomic: their
+                // union with the manifest subset must fit the remaining global budget,
+                // else the whole module is refused. A published spill would be neither
+                // an honest refusal nor an honest uncorroborated count, so it never
+                // spills — it refuses.
+                let mut fresh: BTreeSet<AttachKey> = manifest_wanted;
+                let mut admitted: BTreeSet<TableKey> = BTreeSet::new();
+                let published: Vec<TableKey> = ordered
+                    .iter()
+                    .filter(|(_, score, _)| is_published(score))
+                    .map(|(key, _, _)| *key)
+                    .collect();
+                let mut published_union = fresh.clone();
+                for key in &published {
+                    if let Some(keys) = keys_of.get(key) {
+                        published_union.extend(keys.iter().filter(|key| is_fresh(key)).copied());
+                    }
+                }
+                if admission_policy
+                    .checked_required(allocated_slots, published_union.len())
+                    .is_err()
+                {
+                    break 'refused published_union;
+                }
+                fresh = published_union;
+                // Empty published tables cost nothing: admitted, never spilled, never
+                // counted — they are corroborated, not uncorroborated.
+                admitted.extend(published.iter().copied());
+                // Unresolved heuristic tables admit strongest-first until the
+                // per-object cap or the remaining global budget; the spill is
+                // uncorroborated evidence, never slots.
+                //
+                // Broad (Task 1.6 experiment) instead demands the complete validated
+                // set: every table's targets must fit the remaining global budget or
+                // the module refuses whole, like a published over-budget module. A
+                // strongest-prefix plus spill would break the dormant-activation
+                // promise (spill is informational, never PARTIAL), so broad never
+                // spills — it refuses, loudly, with the same shape. Empty tables cost
+                // nothing either way and admit, never spilling.
+                if broad_admit || admission_policy.admits_complete_validated_union() {
+                    let mut scan_union = fresh.clone();
+                    for (key, _, _) in &ordered {
+                        if let Some(keys) = keys_of.get(key) {
+                            scan_union.extend(keys.iter().filter(|key| is_fresh(key)).copied());
+                        }
+                    }
+                    if admission_policy
+                        .checked_required(allocated_slots, scan_union.len())
+                        .is_err()
+                    {
+                        break 'refused scan_union;
+                    }
+                    fresh = scan_union;
+                    admitted.extend(ordered.iter().map(|(key, _, _)| *key));
+                } else {
+                    let mut heuristic_admitted = 0usize;
+                    let mut spent = false;
+                    for (key, score, _) in &ordered {
+                        if is_published(score) {
+                            continue;
+                        }
+                        // A heuristic table with no attachable target costs nothing either
+                        // way: counted as spill, never consuming the cap.
+                        if keys_of.get(key).is_none_or(|keys| keys.is_empty()) {
+                            uncorroborated_candidates += 1;
+                            continue;
+                        }
+                        if spent || heuristic_admitted >= MAX_TABLES_PER_OBJECT {
+                            uncorroborated_candidates += 1;
+                            continue;
+                        }
+                        let marginal = keys_of.get(key).map_or(0, |keys| {
+                            keys.iter()
+                                .filter(|key| is_fresh(key) && !fresh.contains(key))
+                                .count()
+                        });
+                        if admission_policy
+                            .checked_required(allocated_slots, fresh.len())
+                            .and_then(|required| {
+                                admission_policy.checked_required(required, marginal)
+                            })
+                            .is_err()
+                        {
+                            // The budget is spent: this table and every weaker one spill.
+                            // Admission stays a strongest-evidence prefix — a strong
+                            // table is never skipped to admit a weaker one.
+                            uncorroborated_candidates += 1;
+                            spent = true;
+                            continue;
+                        }
+                        if let Some(keys) = keys_of.get(key) {
+                            fresh.extend(keys.iter().filter(|key| is_fresh(key)).copied());
+                        }
+                        admitted.insert(*key);
+                        heuristic_admitted += 1;
+                    }
+                }
+                break 'admission (fresh, admitted);
+            };
+            // Over `kept` alone nothing is fresh, so only the first pass
+            // refuses; were that ever broken, the module is refused whole
+            // rather than retried.
+            debug_assert!(!kept_only, "kept endpoints alone need no new slot");
+            if !kept_only && !kept.is_empty() {
+                refused_growth = Some(refused);
+                continue 'admission;
             }
-        }
-        // Published tables bypass the per-object cap but stay atomic: their
-        // union with the manifest subset must fit the remaining global budget,
-        // else the whole module is refused. A published spill would be neither
-        // an honest refusal nor an honest uncorroborated count, so it never
-        // spills — it refuses.
-        let mut fresh: BTreeSet<AttachKey> = manifest_wanted;
-        let mut admitted: BTreeSet<TableKey> = BTreeSet::new();
-        let published: Vec<TableKey> = ordered
-            .iter()
-            .filter(|(_, score, _)| is_published(score))
-            .map(|(key, _, _)| *key)
-            .collect();
-        let mut published_union = fresh.clone();
-        for key in &published {
-            if let Some(keys) = keys_of.get(key) {
-                published_union.extend(keys.iter().filter(|key| is_fresh(key)).copied());
-            }
-        }
-        if admission_policy
-            .checked_required(allocated_slots, published_union.len())
-            .is_err()
-        {
             let skipped = Skipped {
                 subject: path.to_string(),
                 reason: format!(
-                    "module needs {} more; only {capacity} attach slots are available; {} are in use \
-                     — refusing to attach a prefix",
-                    published_union.len(),
-                    allocated_slots
+                    "module needs {} more; only {capacity} attach slots are available; \
+                     {allocated_slots} are in use — refusing to attach a prefix",
+                    refused.len()
                 ),
             };
             refused_module_objects.push((object, skipped.clone()));
             modules_skipped.push(skipped);
             continue 'groups;
-        }
-        fresh = published_union;
-        // Empty published tables cost nothing: admitted, never spilled, never
-        // counted — they are corroborated, not uncorroborated.
-        admitted.extend(published.iter().copied());
-        // Unresolved heuristic tables admit strongest-first until the
-        // per-object cap or the remaining global budget; the spill is
-        // uncorroborated evidence, never slots.
-        //
-        // Broad (Task 1.6 experiment) instead demands the complete validated
-        // set: every table's targets must fit the remaining global budget or
-        // the module refuses whole, like a published over-budget module. A
-        // strongest-prefix plus spill would break the dormant-activation
-        // promise (spill is informational, never PARTIAL), so broad never
-        // spills — it refuses, loudly, with the same shape. Empty tables cost
-        // nothing either way and admit, never spilling.
-        if broad_admit || admission_policy.admits_complete_validated_union() {
-            let mut scan_union = fresh.clone();
-            for (key, _, _) in &ordered {
-                if let Some(keys) = keys_of.get(key) {
-                    scan_union.extend(keys.iter().filter(|key| is_fresh(key)).copied());
-                }
-            }
-            if admission_policy
-                .checked_required(allocated_slots, scan_union.len())
-                .is_err()
-            {
-                let skipped = Skipped {
-                    subject: path.to_string(),
-                    reason: format!(
-                        "module needs {} more; only {capacity} attach slots are available; {} are in use \
-                         — refusing to attach a prefix",
-                        scan_union.len(),
-                        allocated_slots
-                    ),
-                };
-                refused_module_objects.push((object, skipped.clone()));
-                modules_skipped.push(skipped);
-                continue 'groups;
-            }
-            fresh = scan_union;
-            admitted.extend(ordered.iter().map(|(key, _, _)| *key));
-        } else {
-            let mut heuristic_admitted = 0usize;
-            let mut spent = false;
-            for (key, score, _) in &ordered {
-                if is_published(score) {
-                    continue;
-                }
-                // A heuristic table with no attachable target costs nothing either
-                // way: counted as spill, never consuming the cap.
-                if keys_of.get(key).is_none_or(|keys| keys.is_empty()) {
-                    uncorroborated_candidates += 1;
-                    continue;
-                }
-                if spent || heuristic_admitted >= MAX_TABLES_PER_OBJECT {
-                    uncorroborated_candidates += 1;
-                    continue;
-                }
-                let marginal = keys_of.get(key).map_or(0, |keys| {
-                    keys.iter()
-                        .filter(|key| is_fresh(key) && !fresh.contains(key))
-                        .count()
-                });
-                if admission_policy
-                    .checked_required(allocated_slots, fresh.len())
-                    .and_then(|required| admission_policy.checked_required(required, marginal))
-                    .is_err()
-                {
-                    // The budget is spent: this table and every weaker one spill.
-                    // Admission stays a strongest-evidence prefix — a strong
-                    // table is never skipped to admit a weaker one.
-                    uncorroborated_candidates += 1;
-                    spent = true;
-                    continue;
-                }
-                if let Some(keys) = keys_of.get(key) {
-                    fresh.extend(keys.iter().filter(|key| is_fresh(key)).copied());
-                }
-                admitted.insert(*key);
-                heuristic_admitted += 1;
-            }
-        }
+        };
         allocated_slots = admission_policy
             .checked_required(allocated_slots, fresh.len())
             .expect("admitted target union was checked before allocation");
@@ -1638,6 +1712,10 @@ fn merge(
         let mut seen_surfaces = Vec::new();
         let mut group_surfaces = Vec::new();
         let mut group_skips = Vec::new();
+        // A refused growth's endpoints no other module attaches, and the kept
+        // endpoints this module stays attached through.
+        let mut omitted = BTreeSet::new();
+        let mut kept_attached = BTreeSet::new();
         for (piece, module) in group.into_iter().enumerate() {
             debug_assert_eq!(
                 module.entries_seen,
@@ -1654,6 +1732,23 @@ fn merge(
                     if !admitted_table {
                         continue;
                     }
+                }
+                if refused_growth.is_some() {
+                    let target_key = AttachKey {
+                        object: target.object,
+                        file_offset: target.file_offset,
+                    };
+                    if !kept.contains(&target_key) {
+                        // Never a new claim, not even on a target another
+                        // module attaches: kept endpoints keep their owners.
+                        if !positions.contains_key(&(target.object, target.file_offset))
+                            && !existing_slots.contains_key(&target_key)
+                        {
+                            omitted.insert(target_key);
+                        }
+                        continue;
+                    }
+                    kept_attached.insert(target_key);
                 }
                 let position = *positions
                     .entry((target.object, target.file_offset))
@@ -1736,6 +1831,20 @@ fn merge(
         }
         surfaces.extend(group_surfaces);
         skipped.extend(group_skips);
+        if let Some(demand) = refused_growth {
+            omitted.extend(demand);
+            let omission = Skipped {
+                subject: path.to_string(),
+                reason: growth_omission_reason(
+                    omitted.len(),
+                    capacity,
+                    allocated_slots,
+                    kept_attached.len(),
+                ),
+            };
+            refused_module_objects.push((object, omission.clone()));
+            modules_skipped.push(omission);
+        }
     }
 
     let slots: Vec<Slot> = building
@@ -1801,8 +1910,11 @@ pub fn build_from_reconciled_modules(modules: &[ReconciledModule]) -> AttachPlan
         modules.iter().map(lower_scanned).collect(),
         0,
         "absent".into(),
-        0,
-        &BTreeMap::new(),
+        ExistingAllocation {
+            slots: 0,
+            active: &BTreeMap::new(),
+            owned: &BTreeMap::new(),
+        },
         false,
         AdmissionPolicy::detailed(),
     )
@@ -1869,17 +1981,22 @@ fn build_from_sources_with_policy(
         ExistingAllocation {
             slots: 0,
             active: &BTreeMap::new(),
+            owned: &BTreeMap::new(),
         },
         broad_admit,
         admission_policy,
     )
 }
 
-/// Historical allocations and their still-active subset travel together.
-/// Retired slots count against capacity even though they are absent from `active`.
+/// Historical allocations, their still-active subset, and its current owners
+/// travel together. Retired slots count against capacity even though they are
+/// absent from `active`.
 struct ExistingAllocation<'a> {
     slots: usize,
     active: &'a BTreeMap<AttachKey, usize>,
+    /// `active`, under the object of each module that currently owns a
+    /// target: a module listed here is already admitted (G-03).
+    owned: &'a BTreeMap<PinnedObjectId, BTreeSet<AttachKey>>,
 }
 
 fn build_from_sources_with(
@@ -1908,8 +2025,7 @@ fn build_from_sources_with(
             || "absent".to_string(),
             |m| acquisition_label(&m.interface_list),
         ),
-        allocated.slots,
-        allocated.active,
+        allocated,
         broad_admit,
         admission_policy,
     );
@@ -1936,6 +2052,7 @@ fn build_from_test_sources_with_policy(
         ExistingAllocation {
             slots: 0,
             active: &BTreeMap::new(),
+            owned: &BTreeMap::new(),
         },
         false,
         admission_policy,
@@ -2103,8 +2220,11 @@ fn build(m: &Manifest) -> AttachPlan {
         discovered.into_iter().collect(),
         m.vendor_interfaces.len(),
         acquisition_label(&m.interface_list),
-        0,
-        &BTreeMap::new(),
+        ExistingAllocation {
+            slots: 0,
+            active: &BTreeMap::new(),
+            owned: &BTreeMap::new(),
+        },
         false,
         AdmissionPolicy::detailed(),
     );
@@ -2586,6 +2706,7 @@ mod tests {
             ExistingAllocation {
                 slots: 0,
                 active: &BTreeMap::new(),
+                owned: &BTreeMap::new(),
             },
             false,
             AdmissionPolicy::detailed(),
@@ -2626,6 +2747,7 @@ mod tests {
             ExistingAllocation {
                 slots: 0,
                 active: &BTreeMap::new(),
+                owned: &BTreeMap::new(),
             },
             false,
             AdmissionPolicy::detailed(),
@@ -3899,66 +4021,425 @@ mod tests {
         assert_eq!(plan.modules_skipped[0].subject, "/opt/crossing.so");
     }
 
+    /// The key a `scanned_with` fixture pins to `object`.
+    fn scanned_key(object: PinnedObjectId) -> ObjectKey {
+        ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: u64::from(object.0),
+        }
+    }
+
+    /// A provider already admitted on `admitted` count-only endpoints (the
+    /// shape a scan-derived plan has) at offsets `0, 8, …`, and the rebuilt
+    /// scan of it after it grew: a grown provider still exports every
+    /// function it had, so the scan lists every admitted offset plus
+    /// `growth` new ones past them.
+    fn grown_provider(
+        object: PinnedObjectId,
+        path: &str,
+        admitted: u32,
+        growth: u32,
+    ) -> (AttachPlan, ReconciledModule) {
+        let plan = exact_plan(
+            (0..admitted)
+                .map(|index| exact_slot(index, object, u64::from(index) * 8, 0, vec![ModuleId(0)]))
+                .collect(),
+            vec![exact_module(0, object)],
+        );
+        let grown = scanned_with(
+            scanned_key(object),
+            path,
+            (0..admitted + growth).map(|index| u64::from(index) * 8),
+        );
+        (plan, grown)
+    }
+
+    /// G-03 (owner decision 2026-09-23): an admitted provider that grows past
+    /// capacity keeps every endpoint it had and only its growth is refused,
+    /// explicitly; a later provider that fits still takes the remaining slot.
+    /// Growth is modelled faithfully: the rebuilt scan lists every admitted
+    /// offset plus the two new ones, over the count-only endpoints a
+    /// scan-derived plan carries.
     #[test]
-    fn capacity_rejection_retires_every_existing_key_and_admits_a_later_module() {
+    fn capacity_rejection_keeps_a_grown_providers_endpoints_and_admits_a_later_module() {
         let existing = PinnedObjectId(10);
         let later = PinnedObjectId(12);
-        let descriptor = crate::kinds::function_id("C_Sign").unwrap() + 1;
-        let mut plan = exact_plan(
-            (0..MAX_SLOTS - 1)
-                .map(|index| {
-                    exact_slot(
-                        index,
-                        existing,
-                        u64::from(index) * 8,
-                        descriptor,
-                        vec![ModuleId(0)],
-                    )
-                })
-                .collect(),
-            vec![exact_module(0, existing)],
-        );
+        let (mut plan, grown) =
+            grown_provider(existing, "/opt/existing-crossing.so", MAX_SLOTS - 1, 2);
         let pinned = PinnedObjects::empty();
         let rebuilt = plan.rebuild_from_sources(
             &[
-                scanned_with(
-                    ObjectKey {
-                        device: Device { major: 8, minor: 1 },
-                        inode: u64::from(existing.0),
-                    },
-                    "/opt/existing-crossing.so",
-                    [0, u64::from(MAX_SLOTS) * 8, u64::from(MAX_SLOTS + 1) * 8],
-                ),
-                scanned_with(
-                    ObjectKey {
-                        device: Device { major: 8, minor: 1 },
-                        inode: u64::from(later.0),
-                    },
-                    "/opt/later-fitting.so",
-                    [0x2000],
-                ),
+                grown,
+                scanned_with(scanned_key(later), "/opt/later-fitting.so", [0x2000]),
             ],
             &[],
             &pinned,
         );
 
-        assert_eq!(rebuilt.modules.len(), 1);
-        assert_eq!(rebuilt.modules[0].object, later);
-        assert_eq!(rebuilt.modules_skipped.len(), 1);
         assert_eq!(
-            rebuilt.modules_skipped[0].subject,
-            "/opt/existing-crossing.so"
+            rebuilt
+                .modules
+                .iter()
+                .map(|module| module.object)
+                .collect::<Vec<_>>(),
+            [existing, later],
+            "the grown provider stays admitted beside the later one"
+        );
+        assert_eq!(rebuilt.modules_skipped.len(), 1);
+        let omission = &rebuilt.modules_skipped[0];
+        assert_eq!(omission.subject, "/opt/existing-crossing.so");
+        assert!(
+            omission.reason.starts_with("admitted module needs 2 more;"),
+            "{omission:?}"
+        );
+        assert!(
+            omission
+                .reason
+                .contains(&format!("only {MAX_SLOTS} attach slots are available")),
+            "{omission:?}"
+        );
+        assert!(
+            omission.reason.contains(&format!(
+                "kept its {} attached endpoints and omitted the 2 new ones",
+                MAX_SLOTS - 1
+            )),
+            "{omission:?}"
         );
 
         let delta = plan.extend_exact(rebuilt).unwrap();
 
-        assert_eq!(delta.retire.len(), MAX_SLOTS as usize - 1);
-        assert!(delta.retire.iter().all(|slot| slot.object == existing));
-        assert!((0..MAX_SLOTS - 1).all(|slot| !plan.is_active(slot)));
+        assert!(
+            delta.retire.is_empty(),
+            "{} admitted endpoints retired",
+            delta.retire.len()
+        );
+        assert!(delta.replace.is_empty());
+        assert!((0..MAX_SLOTS - 1).all(|slot| plan.is_active(slot)));
+        assert!(
+            plan.slots[..MAX_SLOTS as usize - 1]
+                .iter()
+                .all(|slot| slot.object == existing && slot.module_ids == [ModuleId(0)])
+        );
         assert_eq!(delta.new.len(), 1);
         assert_eq!(delta.new[0].index, MAX_SLOTS - 1);
         assert_eq!(delta.new[0].object, later);
         assert!(plan.is_active(MAX_SLOTS - 1));
+        assert_eq!(
+            plan.active_slot_count(),
+            MAX_SLOTS as usize,
+            "kept endpoints stay in the active set"
+        );
+        assert!(
+            plan.slots
+                .iter()
+                .all(|slot| slot.object != existing
+                    || slot.file_offset < u64::from(MAX_SLOTS - 1) * 8),
+            "no prefix of the growth is attached"
+        );
+        assert_eq!(
+            plan.refused_modules()
+                .map(|(object, _)| object)
+                .collect::<Vec<_>>(),
+            [existing]
+        );
+    }
+
+    /// G-03 with no slot left at all: the grown provider keeps every
+    /// endpoint, its growth is refused and reported, and nothing else in the
+    /// plan changes.
+    #[test]
+    fn a_grown_provider_with_no_slot_left_keeps_its_endpoints_and_nothing_else_changes() {
+        let existing = PinnedObjectId(10);
+        // The scan names the object the way `exact_slot` does, so the kept
+        // endpoints' metadata is byte-for-byte what the plan already holds.
+        let (mut plan, grown) = grown_provider(existing, "/proc/self/fd/10", MAX_SLOTS, 2);
+        let before = plan.clone();
+
+        let rebuilt = plan.rebuild_from_sources(&[grown], &[], &PinnedObjects::empty());
+
+        assert_eq!(
+            rebuilt.slots.len(),
+            MAX_SLOTS as usize,
+            "every admitted endpoint and no growth"
+        );
+        assert_eq!(rebuilt.modules_skipped.len(), 1);
+        let omission = &rebuilt.modules_skipped[0];
+        assert_eq!(omission.subject, "/proc/self/fd/10");
+        assert!(
+            omission.reason.starts_with("admitted module needs 2 more;"),
+            "{omission:?}"
+        );
+        assert!(
+            omission.reason.contains(&format!(
+                "{MAX_SLOTS} are in use — kept its {MAX_SLOTS} attached endpoints"
+            )),
+            "{omission:?}"
+        );
+
+        let delta = plan.extend_exact(rebuilt).unwrap();
+
+        assert!(delta.new.is_empty());
+        assert!(delta.replace.is_empty());
+        assert!(delta.retire.is_empty());
+        assert_eq!(plan.slots, before.slots, "no endpoint changed");
+        assert_eq!(plan.active_slot_count(), MAX_SLOTS as usize);
+        assert!((0..MAX_SLOTS).all(|slot| plan.module_of_slot(slot) == Some(ModuleId(0))));
+        assert_eq!(plan.module_ambiguous, 0);
+        assert_eq!(
+            plan.modules
+                .iter()
+                .map(|module| (module.id, module.object))
+                .collect::<Vec<_>>(),
+            [(ModuleId(0), existing)]
+        );
+    }
+
+    /// G-03, retry: the same grown sources applied again allocate nothing,
+    /// retire nothing, and leave exactly one omission record — a refused
+    /// growth is a fixed point, neither a capacity sink nor a growing list.
+    #[test]
+    fn reapplying_a_refused_growth_allocates_nothing_and_keeps_one_omission() {
+        let existing = PinnedObjectId(10);
+        let later = PinnedObjectId(12);
+        let (mut plan, grown) =
+            grown_provider(existing, "/opt/existing-crossing.so", MAX_SLOTS - 1, 2);
+        let sources = [
+            grown,
+            scanned_with(scanned_key(later), "/opt/later-fitting.so", [0x2000]),
+        ];
+        let pinned = PinnedObjects::empty();
+
+        let first = plan.rebuild_from_sources(&sources, &[], &pinned);
+        let delta = plan.extend_exact(first).unwrap();
+        assert!(delta.retire.is_empty(), "{} retired", delta.retire.len());
+        assert_eq!(delta.new.len(), 1, "only the later provider is allocated");
+        let settled = plan.clone();
+
+        let second = plan.rebuild_from_sources(&sources, &[], &pinned);
+        let delta = plan.extend_exact(second).unwrap();
+
+        assert!(
+            delta.new.is_empty(),
+            "the refused growth burned {} slots",
+            delta.new.len()
+        );
+        assert!(delta.replace.is_empty());
+        assert!(delta.retire.is_empty());
+        assert_eq!(plan.slots, settled.slots);
+        assert_eq!(plan.active_slot_count(), MAX_SLOTS as usize);
+        assert_eq!(plan.modules_skipped.len(), 1);
+        assert_eq!(plan.modules_skipped[0].subject, "/opt/existing-crossing.so");
+        assert!(
+            plan.modules_skipped[0]
+                .reason
+                .starts_with("admitted module needs 2 more;"),
+            "{:?}",
+            plan.modules_skipped[0]
+        );
+        assert_eq!(plan.refused_modules().count(), 1);
+    }
+
+    /// The growth the owner named: an admitted provider builds a second
+    /// function table — published, as a live `C_GetFunctionList` return is —
+    /// that no longer fits. Its first table stays attached; the new table
+    /// stays visible as evidence and its endpoints are counted as omitted,
+    /// never spilled.
+    #[test]
+    fn a_provider_that_builds_a_second_table_past_capacity_keeps_its_first_table() {
+        use crate::discovery::scan::{ScannedEntry, ScannedTable};
+
+        let existing = PinnedObjectId(10);
+        let (mut plan, mut grown) = grown_provider(existing, "/proc/self/fd/10", MAX_SLOTS - 4, 0);
+        let key = scanned_key(existing);
+        grown.scanned.tables.push(ScannedTable {
+            version: (3, 0),
+            walk: "full",
+            entries: (0..8u64)
+                .map(|index| ScannedEntry {
+                    name: "C_Sign",
+                    object: key,
+                    object_path: "/proc/self/fd/10".into(),
+                    file_offset: 0x10000 + index * 8,
+                })
+                .collect(),
+            null_entries: vec![],
+            unpinned: vec![],
+            address: 0x9000,
+            file_offset: Some(0x9000),
+            live_return: true,
+            manifest_supported: false,
+        });
+        grown.entry_objects.push(vec![existing; 8]);
+        let before = plan.clone();
+
+        let rebuilt = plan.rebuild_from_sources(&[grown], &[], &PinnedObjects::empty());
+
+        assert_eq!(rebuilt.slots.len(), MAX_SLOTS as usize - 4);
+        assert_eq!(
+            rebuilt.modules[0].tables.len(),
+            2,
+            "the refused table is still reported as discovered"
+        );
+        assert_eq!(
+            rebuilt.uncorroborated_candidates, 0,
+            "a published table is omitted, never spilled"
+        );
+        assert_eq!(rebuilt.modules_skipped.len(), 1);
+        assert!(
+            rebuilt.modules_skipped[0]
+                .reason
+                .starts_with("admitted module needs 8 more;"),
+            "{:?}",
+            rebuilt.modules_skipped[0]
+        );
+
+        let delta = plan.extend_exact(rebuilt).unwrap();
+
+        assert!(delta.new.is_empty());
+        assert!(delta.replace.is_empty());
+        assert!(delta.retire.is_empty());
+        assert_eq!(plan.slots, before.slots);
+        assert_eq!(plan.active_slot_count(), MAX_SLOTS as usize - 4);
+    }
+
+    /// A manifest's targets are fixed at startup, so a manifest module never
+    /// gains targets mid-capture. Its demand can still rise: an endpoint
+    /// deactivated by a failed replacement or group reattach needs a fresh
+    /// slot when the next rebuild lists it again. With no slot left, that
+    /// re-admission is refused and the module keeps every other endpoint
+    /// instead of losing all of them.
+    #[test]
+    fn a_manifest_module_that_cannot_readmit_a_deactivated_endpoint_keeps_the_rest() {
+        let manifest = manifest_with(
+            (0..u64::from(MAX_SLOTS))
+                .map(|index| resolved("C_Sign", index * 8))
+                .collect(),
+        );
+        let mut plan = build_from_test_sources(&[], std::slice::from_ref(&manifest));
+        assert_eq!(plan.slots.len(), MAX_SLOTS as usize);
+        plan.deactivate(5);
+        let before = plan.clone();
+
+        let rebuilt = plan.rebuild_from_sources_with(
+            &[],
+            std::slice::from_ref(&manifest),
+            |key, _| u32::try_from(key.inode).ok().map(PinnedObjectId),
+            |_, _| true,
+            false,
+            AdmissionPolicy::detailed(),
+        );
+
+        assert_eq!(rebuilt.slots.len(), MAX_SLOTS as usize - 1);
+        assert_eq!(rebuilt.modules_skipped.len(), 1);
+        let omission = &rebuilt.modules_skipped[0];
+        assert_eq!(omission.subject, "/opt/p11.so");
+        assert!(
+            omission.reason.starts_with("admitted module needs 1 more;"),
+            "{omission:?}"
+        );
+
+        let delta = plan.extend_exact(rebuilt).unwrap();
+
+        assert!(delta.new.is_empty());
+        assert!(delta.replace.is_empty());
+        assert!(
+            delta.retire.is_empty(),
+            "{} manifest endpoints retired",
+            delta.retire.len()
+        );
+        assert_eq!(plan.slots, before.slots);
+        assert!(!plan.is_active(5));
+        assert_eq!(plan.active_slot_count(), MAX_SLOTS as usize - 1);
+    }
+
+    /// An endpoint the grown provider shares with another provider keeps
+    /// both owners, and an endpoint only the other provider owns is not
+    /// claimed by the refused growth: kept endpoints keep their current
+    /// ownership, whole.
+    #[test]
+    fn a_grown_provider_keeps_the_current_owners_of_its_shared_endpoints() {
+        use crate::discovery::scan::ScannedEntry;
+
+        let grown_object = PinnedObjectId(10);
+        let other_object = PinnedObjectId(11);
+        let other_offset = 0x100;
+        let mut slots = vec![exact_slot(
+            0,
+            grown_object,
+            0,
+            0,
+            vec![ModuleId(0), ModuleId(1)],
+        )];
+        slots.extend((1..MAX_SLOTS - 2).map(|index| {
+            exact_slot(
+                index,
+                grown_object,
+                u64::from(index) * 8,
+                0,
+                vec![ModuleId(0)],
+            )
+        }));
+        slots.push(exact_slot(
+            MAX_SLOTS - 2,
+            other_object,
+            other_offset,
+            0,
+            vec![ModuleId(1)],
+        ));
+        let mut plan = exact_plan(
+            slots,
+            vec![exact_module(0, grown_object), exact_module(1, other_object)],
+        );
+        assert_eq!(plan.module_ambiguous, 1);
+        let before = plan.clone();
+
+        // The grown provider lists every endpoint it has, two new ones, and
+        // a new claim on the other provider's own endpoint.
+        let mut grown = scanned_with(
+            scanned_key(grown_object),
+            "/proc/self/fd/10",
+            (0..MAX_SLOTS - 2)
+                .map(|index| u64::from(index) * 8)
+                .chain([u64::from(MAX_SLOTS) * 8, u64::from(MAX_SLOTS + 1) * 8]),
+        );
+        grown.scanned.tables[0].entries.push(ScannedEntry {
+            name: "C_Sign",
+            object: scanned_key(other_object),
+            object_path: "/proc/self/fd/11".into(),
+            file_offset: other_offset,
+        });
+        grown.entry_objects[0].push(other_object);
+        // The other provider still forwards into the shared endpoint.
+        let mut other = scanned_with(
+            scanned_key(other_object),
+            "/proc/self/fd/11",
+            [other_offset],
+        );
+        other.scanned.tables[0].entries.push(ScannedEntry {
+            name: "C_Sign",
+            object: scanned_key(grown_object),
+            object_path: "/proc/self/fd/10".into(),
+            file_offset: 0,
+        });
+        other.entry_objects[0].push(grown_object);
+
+        let rebuilt = plan.rebuild_from_sources(&[grown, other], &[], &PinnedObjects::empty());
+        assert_eq!(rebuilt.modules_skipped.len(), 1);
+        assert_eq!(rebuilt.modules_skipped[0].subject, "/proc/self/fd/10");
+        let delta = plan.extend_exact(rebuilt).unwrap();
+
+        assert!(delta.retire.is_empty(), "{} retired", delta.retire.len());
+        assert!(delta.replace.is_empty());
+        assert!(delta.new.is_empty());
+        assert_eq!(plan.slots, before.slots, "every owner set is unchanged");
+        assert_eq!(plan.slots[0].module_ids, [ModuleId(0), ModuleId(1)]);
+        assert_eq!(
+            plan.active_module_of_slot(MAX_SLOTS - 2),
+            Some(ModuleId(1)),
+            "the refused growth does not claim the other provider's endpoint"
+        );
+        assert_eq!(plan.module_ambiguous, 1);
+        assert_eq!(plan.active_slot_count(), MAX_SLOTS as usize - 1);
     }
 
     #[test]
@@ -3991,8 +4472,11 @@ mod tests {
             ],
             0,
             "absent".into(),
-            plan.slots.len(),
-            &plan.slot_by_key,
+            ExistingAllocation {
+                slots: plan.slots.len(),
+                active: &plan.slot_by_key,
+                owned: &plan.active_keys_by_owner(),
+            },
             false,
             AdmissionPolicy::detailed(),
         );
@@ -4256,19 +4740,41 @@ mod tests {
         );
         let rebuilt = plan.rebuild_from_sources(&expanded, &[], &PinnedObjects::empty());
         assert_eq!(rebuilt.modules_skipped.len(), 1);
+        assert_eq!(rebuilt.modules_skipped[0].subject, "/opt/provider-8.so");
+        assert!(
+            rebuilt.modules_skipped[0]
+                .reason
+                .starts_with("admitted module needs 1 more;"),
+            "{:?}",
+            rebuilt.modules_skipped[0]
+        );
+        // The over-budget provider was already admitted: it keeps its 64
+        // endpoints and leaves no new prefix (G-03).
         assert_eq!(
             rebuilt.slots.len(),
-            512,
-            "an over-budget provider leaves no new prefix"
+            576,
+            "an over-budget admitted provider keeps its endpoints and adds no prefix"
+        );
+        assert!(
+            rebuilt
+                .slots
+                .iter()
+                .all(|slot| slot.object != sources[8].object || slot.file_offset < 64 * 8),
+            "no endpoint of the growth is admitted"
         );
         assert_eq!(
             plan.slots.len(),
             576,
             "building a snapshot does not mutate allocations"
         );
-        // Applying this refused snapshot would retain Detailed's retirement
-        // semantics. Inventory's later link owner must retain old probes;
-        // a capacity refusal is neither an unload nor quiescence evidence.
+        // A capacity refusal is neither an unload nor quiescence evidence:
+        // applying the refused snapshot retires no old probe and allocates
+        // nothing.
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert!(delta.new.is_empty());
+        assert!(delta.replace.is_empty());
+        assert!(delta.retire.is_empty());
+        assert_eq!(plan.active_slot_count(), 576);
     }
 
     #[test]

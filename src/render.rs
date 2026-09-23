@@ -361,7 +361,10 @@ pub struct DiscoveryEvidence {
     pub uncorroborated_candidates: u64,
     /// Attach slots two modules both publish: counted, never attributed.
     pub module_ambiguous: u64,
-    /// Modules refused whole at the slot ceiling — never attached in part.
+    /// Modules the slot ceiling cut short. A module new to the capture is
+    /// refused whole, never attached in part; one already attached whose
+    /// growth did not fit keeps its endpoints and is listed as partially
+    /// covered, its reason opening with `admitted module needs` (G-03).
     pub modules_skipped: Vec<SkippedOut>,
     /// Optional-manifest objects ignored only because one exact scan-opened
     /// replacement table covered every dropped claim. Numeric manifest/object
@@ -1035,11 +1038,21 @@ pub fn live(
     if let Some(reason) = &ev.discovery.scan_unavailable {
         gap_fragments.push(format!("scan unavailable ({reason})"));
     }
+    // A module still attached on the endpoints it had when its growth did
+    // not fit is partially covered, not refused (G-03).
+    let partially_covered = ev
+        .discovery
+        .modules_skipped
+        .iter()
+        .filter(|module| crate::plan::is_growth_omission(&module.reason))
+        .count();
+    let refused = ev.discovery.modules_skipped.len() - partially_covered;
     for (label, count) in [
         ("discovery conflicts", ev.discovery.conflicts),
         ("uncorroborated modules", ev.discovery.uncorroborated),
         ("module-ambiguous slots", ev.discovery.module_ambiguous),
-        ("modules refused", ev.discovery.modules_skipped.len() as u64),
+        ("modules refused", refused as u64),
+        ("modules partially covered", partially_covered as u64),
         ("surface gaps", surface_gaps as u64),
         ("vendor interfaces", ev.vendor_interfaces as u64),
         ("events lost", ev.event_loss),
@@ -2751,6 +2764,14 @@ mod tests {
                     reason: "capacity".into(),
                 })
             },
+            // An admitted provider whose growth did not fit stays attached
+            // but is only partially covered (G-03).
+            |e: &mut Evidence| {
+                e.discovery.modules_skipped.push(SkippedOut {
+                    name: "/opt/grown.so".into(),
+                    reason: GROWTH_OMISSION.into(),
+                })
+            },
             // Only `--pid` gets this transitively from `slots == 0`: a cgroup
             // with one readable and one unreadable process still plans slots.
             |e: &mut Evidence| e.discovery.scan_unavailable = Some("ptrace".into()),
@@ -2997,6 +3018,50 @@ mod tests {
         assert!(out.contains("1 modules refused"), "{out}");
         assert!(out.contains("scan unavailable (ptrace)"), "{out}");
         assert!(out.contains("PARTIAL"), "{out}");
+    }
+
+    /// The omission record the planner writes for an admitted provider whose
+    /// growth did not fit (`plan::tests` pins the planner to this shape).
+    const GROWTH_OMISSION: &str = "admitted module needs 2 more; only 512 attach slots are \
+         available; 511 are in use — kept its 511 attached endpoints and omitted the 2 new ones";
+
+    /// G-03: an admitted provider whose growth did not fit is partially
+    /// covered, not refused. The live view counts it apart from the modules
+    /// refused whole, the verdict stays PARTIAL, and the JSON evidence
+    /// carries the record verbatim.
+    #[test]
+    fn live_view_counts_a_partially_covered_module_apart_from_refused_ones() {
+        let mut ev = evidence();
+        ev.discovery.modules_skipped = vec![
+            SkippedOut {
+                name: "/opt/new.so".into(),
+                reason: "module needs 3 more; only 512 attach slots are available; 511 are in \
+                         use — refusing to attach a prefix"
+                    .into(),
+            },
+            SkippedOut {
+                name: "/opt/grown.so".into(),
+                reason: GROWTH_OMISSION.into(),
+            },
+        ];
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+
+        let out = live(
+            &[],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+        );
+        assert!(out.contains("1 modules refused"), "{out}");
+        assert!(out.contains("1 modules partially covered"), "{out}");
+        assert!(!out.contains("2 modules refused"), "{out}");
+
+        let value = versioned_evidence(&ev);
+        assert_eq!(value["modules_skipped"][1]["name"], "/opt/grown.so");
+        assert_eq!(value["modules_skipped"][1]["reason"], GROWTH_OMISSION);
     }
 
     #[test]
@@ -3374,7 +3439,7 @@ mod tests {
         // MED: the gate used to re-list every gap condition by hand, so a new
         // fragment without a gate term rendered nothing. The table derives
         // the gate from the same fragments; each counter alone must surface.
-        let gap_cases: [(&str, EvidenceMutation); 22] = [
+        let gap_cases: [(&str, EvidenceMutation); 23] = [
             ("1 discovery conflicts", |e| e.discovery.conflicts = 1),
             ("1 uncorroborated modules", |e| {
                 e.discovery.uncorroborated = 1;
@@ -3386,6 +3451,12 @@ mod tests {
                 e.discovery.modules_skipped.push(SkippedOut {
                     name: "/opt/x.so".into(),
                     reason: "capacity".into(),
+                });
+            }),
+            ("1 modules partially covered", |e| {
+                e.discovery.modules_skipped.push(SkippedOut {
+                    name: "/opt/grown.so".into(),
+                    reason: GROWTH_OMISSION.into(),
                 });
             }),
             ("1 surface gaps", |e| {

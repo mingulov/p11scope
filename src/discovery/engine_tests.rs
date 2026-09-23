@@ -1733,6 +1733,81 @@ fn capture_facts_keep_a_manifest_only_capacity_refusal() {
     assert_eq!(engine.discovery.modules.len(), 1);
 }
 
+/// G-03 through the engine: an admitted provider whose live growth does not
+/// fit stays discovered with every endpoint it had, and the same growth seen
+/// again publishes one omission record for it, not a growing list — the
+/// evidence says the provider is partially covered, never that it is gone.
+#[test]
+fn a_grown_provider_stays_discovered_and_its_refused_growth_is_published_once() {
+    let admitted = p11scope_ebpf_common::MAX_SLOTS - 1;
+    let entries = |key: ObjectKey, path: &str, count: u32| -> Vec<ScannedEntry> {
+        (0..count)
+            .map(|index| ScannedEntry {
+                name: "C_Sign",
+                object: key,
+                object_path: path.into(),
+                file_offset: 8 * u64::from(index),
+            })
+            .collect()
+    };
+    let mut raw = overlay_module(overlay_key(62));
+    let (key, path) = (raw.key, raw.path.clone());
+    raw.tables[0].entries = entries(key, &path, admitted);
+    let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1)]);
+    let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&raw), &mut pins);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let mut engine = Engine::empty();
+    engine.plan = plan::build_from_reconciled_modules(&modules);
+    engine.pinned = pins;
+    engine.modules = modules;
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    engine.publish_current_capture_facts().unwrap();
+    assert_eq!(engine.plan.active_slot_count(), admitted as usize);
+
+    let mut grown = raw.clone();
+    grown.tables[0].entries = entries(key, &path, admitted + 2);
+    for _ in 0..2 {
+        let candidate = engine
+            .live_candidate(engine.pinned.clone(), vec![grown.clone()], Vec::new())
+            .unwrap();
+        assert!(candidate.delta.new.is_empty(), "{:?}", candidate.delta.new);
+        assert!(candidate.delta.replace.is_empty());
+        assert!(
+            candidate.delta.retire.is_empty(),
+            "{} admitted endpoints retired",
+            candidate.delta.retire.len()
+        );
+        engine.plan = candidate.plan;
+        engine.pinned = candidate.pinned;
+        engine.modules = candidate.modules;
+        engine.publish_current_capture_facts().unwrap();
+    }
+
+    assert_eq!(engine.plan.slots.len(), admitted as usize);
+    assert_eq!(engine.plan.active_slot_count(), admitted as usize);
+    assert_eq!(
+        engine.discovery.modules.len(),
+        1,
+        "the grown provider stays discovered"
+    );
+    assert_eq!(
+        engine.discovery.modules_skipped.len(),
+        1,
+        "{:?}",
+        engine.discovery.modules_skipped
+    );
+    let omission = &engine.discovery.modules_skipped[0];
+    assert_eq!(omission.name, path);
+    assert!(
+        omission.reason.starts_with("admitted module needs 2 more;"),
+        "{omission:?}"
+    );
+    assert_eq!(engine.plan.modules_skipped.len(), 1);
+}
+
 #[test]
 fn start_attempt_stages_initial_facts_before_active_cleanup() {
     let (mut engine, _, _, _) = engine_with_overlay(56);

@@ -700,6 +700,11 @@ pub(crate) struct OwnedChild {
     exec_reader: Option<OwnedFd>,
     prepared: Option<PreparedExecutable>,
     released: bool,
+    /// The CLOEXEC exec pipe reached EOF with no errno frame, so the child
+    /// has left this process's pre-exec image (it exec'd, or it died) and can
+    /// no longer take a release byte and start the command late. Only such a
+    /// child is ever resumed or asked to stop gracefully.
+    exec_confirmed: bool,
     reaped: bool,
     reaped_exit_code: Option<i32>,
     handed_off: bool,
@@ -747,6 +752,9 @@ impl OwnedChild {
         set_nonblocking(&exec_reader)?;
         // Allocate before fork so exhaustion cannot create an unguarded child.
         let generation = allocate_generation()?;
+        // SAFETY: an all-zero sigaction is SIG_DFL with an empty mask and no
+        // flags; prepared here so the child only passes it to sigaction.
+        let default_action: libc::sigaction = unsafe { std::mem::zeroed() };
 
         // SAFETY: all allocations and C strings were prepared above. The child
         // executes only async-signal-safe syscalls before exec/_exit.
@@ -758,6 +766,18 @@ impl OwnedChild {
             unsafe {
                 libc::close(release_writer.as_raw_fd());
                 libc::close(exec_reader.as_raw_fd());
+                // The observer's stop handlers belong to the observer. Until it
+                // execs, this child would run them and swallow a SIGINT or
+                // SIGTERM meant to end it. Reset both to the default action
+                // before setsid, so a session leader has already dropped them.
+                // `run` installs those handlers before it forks, and exec resets
+                // caught signals anyway, so the command's dispositions are
+                // unchanged.
+                for signal in STOP_SIGNALS {
+                    if libc::sigaction(signal, &default_action, std::ptr::null_mut()) != 0 {
+                        child_exec_failure_errno(exec_writer.as_raw_fd(), last_errno());
+                    }
+                }
                 if libc::setsid() < 0 {
                     child_exec_failure_errno(exec_writer.as_raw_fd(), last_errno());
                 }
@@ -821,6 +841,7 @@ impl OwnedChild {
             exec_reader: Some(exec_reader),
             prepared,
             released: false,
+            exec_confirmed: false,
             reaped: false,
             reaped_exit_code: None,
             handed_off: false,
@@ -903,6 +924,29 @@ impl OwnedChild {
             }
         })?;
         drop(writer);
+        // From here the release byte is the child's to take. A handoff that
+        // ends without a confirmed exec kills the child where it stands, so
+        // nothing later (a resume included) lets it run the abandoned command.
+        // An exec errno frame needs no kill: that child can only _exit(127).
+        let awaited = self.await_exec(&reader, deadline, &mut cancelled, &mut pending);
+        if let Err(error) = &awaited
+            && !self.exec_confirmed
+            && !matches!(error, ExecHandoffError::Exec(_))
+        {
+            self.abandon_unconfirmed_exec();
+        }
+        awaited
+    }
+
+    /// Waits on the exec pipe after the release byte was written: EOF with no
+    /// errno frame confirms the exec, and an errno frame is an exec failure.
+    fn await_exec(
+        &mut self,
+        reader: &OwnedFd,
+        deadline: Instant,
+        mut cancelled: impl FnMut() -> Option<i32>,
+        mut pending: impl FnMut(),
+    ) -> Result<(), ExecHandoffError> {
         let mut bytes = [0u8; std::mem::size_of::<i32>()];
         let mut used = 0;
         loop {
@@ -925,6 +969,7 @@ impl OwnedChild {
                     }));
                 }
                 ExecDrain::EmptyEof => {
+                    self.exec_confirmed = true;
                     if let Some(signal) = cancelled() {
                         return Err(ExecHandoffError::Cancelled(signal));
                     }
@@ -1032,6 +1077,12 @@ impl OwnedChild {
             return Err(io::Error::other("owned child was already reaped"));
         }
         self.begin_settlement(grace.saturating_add(FINAL_KILL_GRACE));
+        if !self.exec_confirmed {
+            // Still this process's pre-exec fork: resuming it or asking it to
+            // stop could let it take a written release byte and run the
+            // command. Kill it where it stands.
+            return self.kill_and_reap_tail();
+        }
         let initial = self.try_reap();
         let active = if matches!(&initial, Ok(None)) {
             Some(self.ensure_active_generation())
@@ -1137,12 +1188,27 @@ impl OwnedChild {
         !self.reaped && self.pin.still_the_same()
     }
 
-    /// SIGCONT the owned child through its pidfd, best effort. A child
-    /// held in T cannot observe SIGTERM/SIGINT, so every graceful settle
-    /// path resumes first; on a running child this is a no-op, and on an
-    /// exited child the error is ignored.
+    /// SIGCONT the owned child through its pidfd, best effort, and only once
+    /// its exec is confirmed. A child held in T cannot observe SIGTERM/SIGINT,
+    /// so every graceful settle path resumes first; on a running child this
+    /// is a no-op, and on an exited child the error is ignored. A pre-exec
+    /// child is never resumed: with the release byte written, resuming it
+    /// would run the command the handoff abandoned.
     fn resume_if_stopped(&self) {
-        let _ = self.pin.send_signal(libc::SIGCONT);
+        if self.exec_confirmed {
+            let _ = self.pin.send_signal(libc::SIGCONT);
+        }
+    }
+
+    /// The release byte left this process but no exec was confirmed: the
+    /// child may be stopped, descheduled, or about to take the byte. A
+    /// pending SIGKILL ends it before it next runs user code, so unless it
+    /// had already finished exec'ing, the abandoned command never starts.
+    /// Best effort and never a reap: settlement still reaps this exact child
+    /// after coordinator cleanup, and kills it again if this did not land.
+    fn abandon_unconfirmed_exec(&self) {
+        let _ = signal_group(self.pid, libc::SIGKILL);
+        let _ = self.pin.send_signal(libc::SIGKILL);
     }
 
     pub(crate) fn is_reaped(&self) -> bool {
@@ -1925,6 +1991,16 @@ fn settle_after_signal_with_grace_and(
     let signal = signals
         .first_signal()
         .ok_or_else(|| anyhow!("run: signal settlement lost the first signal identity"))?;
+    if !child.exec_confirmed {
+        // Graceful settlement is for a command that is running. A child whose
+        // exec was never confirmed is still this process's pre-exec fork:
+        // resuming or signalling it could let it take a written release byte
+        // and run the command. Kill it where it stands.
+        return child
+            .kill_and_reap_tail()
+            .map(ChildOutcome::Exited)
+            .map_err(|error| anyhow!("run: settling after signal: {error}"));
+    }
     // A child held in T (pause, or anything else) cannot observe the
     // forwarded signal; resume it first so SIGTERM can land instead of
     // pending through both grace windows into SIGKILL. Best effort and a
@@ -5117,6 +5193,178 @@ mod tests {
         );
         assert!(child.is_reaped());
         assert!(!marker.exists());
+    }
+
+    /// F-T4-1: a handoff that fails after the release byte was written kills
+    /// the pre-exec child on the spot. Nothing between that failure and
+    /// settlement can let it take the byte and run the abandoned command:
+    /// here an outside SIGCONT stands in for anything that resumes it while
+    /// the coordinator cleans up. Covers a deadline and a cancellation that
+    /// is observed only after the write.
+    #[test]
+    fn a_failed_handoff_kills_the_pre_exec_child_before_anything_can_resume_it() {
+        for cancel in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let marker = directory.path().join("ran");
+            let mut child = spawn("/usr/bin/touch", &[marker.to_str().unwrap()]);
+            wait_for_session_leader(&child);
+            let outside = duplicate_fd(child.pin().pidfd().unwrap());
+            child.pin().send_signal(libc::SIGSTOP).unwrap();
+            wait_until(
+                || original_child_is_stopped(outside.as_fd()),
+                "the pre-exec child never stopped behind its barrier",
+            );
+
+            let written = std::cell::Cell::new(false);
+            let result = child.release_until_with_pending(
+                Instant::now() + Duration::from_millis(if cancel { 5_000 } else { 40 }),
+                || (cancel && written.get()).then_some(libc::SIGTERM),
+                || written.set(true),
+            );
+            assert!(
+                written.get(),
+                "cancel={cancel}: the release byte was never written"
+            );
+            if cancel {
+                assert!(
+                    matches!(result, Err(ExecHandoffError::Cancelled(libc::SIGTERM))),
+                    "{result:?}"
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(ExecHandoffError::Deadline)),
+                    "{result:?}"
+                );
+            }
+            assert!(!child.released);
+
+            // Something resumes the child before settlement runs. Best effort:
+            // a child the handoff already killed may be gone.
+            // SAFETY: the duplicated original pidfd is live for this call.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    outside.as_raw_fd(),
+                    libc::SIGCONT,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            };
+            assert!(
+                child
+                    .pin()
+                    .wait_ready(Some(Duration::from_secs(5)))
+                    .unwrap(),
+                "cancel={cancel}: the abandoned child neither died nor exited"
+            );
+            assert_eq!(
+                child
+                    .terminate_with_grace(Duration::from_millis(20))
+                    .unwrap(),
+                128 + libc::SIGKILL,
+                "cancel={cancel}: the abandoned child must die by the handoff's SIGKILL"
+            );
+            assert!(
+                !marker.exists(),
+                "cancel={cancel}: the abandoned command ran"
+            );
+        }
+    }
+
+    /// F-T4-1: graceful settlement is for a running command. A child that
+    /// never confirmed an exec (never released at all, and held in T from
+    /// outside) is killed where it stands by both settlement paths. It is
+    /// never resumed, and never sent a stop signal it would sit on through a
+    /// grace window.
+    #[test]
+    fn an_unconfirmed_child_is_killed_where_it_stands_on_either_settlement_path() {
+        for signal_path in [false, true] {
+            let mut child = spawn("/bin/true", &[]);
+            wait_for_session_leader(&child);
+            let pidfd = duplicate_fd(child.pin().pidfd().unwrap());
+            child.pin().send_signal(libc::SIGSTOP).unwrap();
+            wait_until(
+                || original_child_is_stopped(pidfd.as_fd()),
+                "the pre-exec child never stopped behind its barrier",
+            );
+
+            let started = Instant::now();
+            let code = if signal_path {
+                let signals = SignalState::new();
+                signals.observe(libc::SIGTERM);
+                match settle_after_signal_with_grace(&mut child, &signals, TERM_GRACE).unwrap() {
+                    ChildOutcome::Exited(code) => code,
+                    ChildOutcome::TimedOutRunning => panic!("signal settlement left the child"),
+                }
+            } else {
+                child.terminate_with_grace(TERM_GRACE).unwrap()
+            };
+            let elapsed = started.elapsed();
+
+            assert_eq!(
+                code,
+                128 + libc::SIGKILL,
+                "signal_path={signal_path}: an unconfirmed child dies by SIGKILL, unresumed"
+            );
+            assert!(
+                elapsed < TERM_GRACE,
+                "signal_path={signal_path}: settlement waited {elapsed:?} on an unconfirmed child"
+            );
+            assert!(child.is_reaped());
+        }
+    }
+
+    /// The SIGINT and SIGTERM bits of one `/proc/<pid>/status` signal mask.
+    fn stop_signal_bits(pid: &str, field: &str) -> u64 {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+        let mask = status
+            .lines()
+            .find_map(|line| line.strip_prefix(field)?.strip_prefix(':'))
+            .unwrap_or_else(|| panic!("/proc/{pid}/status has no {field}"));
+        u64::from_str_radix(mask.trim(), 16).unwrap()
+            & ((1 << (libc::SIGINT - 1)) | (1 << (libc::SIGTERM - 1)))
+    }
+
+    /// F-T4-1 hardening: the observer's stop handlers stay the observer's.
+    /// The fork child resets SIGINT and SIGTERM to their default actions
+    /// before it becomes a session leader, so a stop signal ends a pre-exec
+    /// child instead of being swallowed by an inherited handler. exec resets
+    /// caught signals anyway, so the command starts with the same
+    /// dispositions either way.
+    #[test]
+    fn the_pre_exec_child_does_not_inherit_the_observer_stop_handlers() {
+        let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
+        let _stop = install_stop_flag().unwrap();
+        let both = (1u64 << (libc::SIGINT - 1)) | (1u64 << (libc::SIGTERM - 1));
+        assert_eq!(
+            stop_signal_bits("self", "SigCgt"),
+            both,
+            "the observer catches both stop signals"
+        );
+        let fixture_dir = tempfile::tempdir().unwrap();
+        let sleeper = build_sleeper(fixture_dir.path());
+        let mut child = spawn(sleeper.to_str().unwrap(), &[]);
+        wait_for_session_leader(&child);
+        let pid = child.pid().to_string();
+
+        assert_eq!(
+            stop_signal_bits(&pid, "SigCgt"),
+            0,
+            "the pre-exec child still runs the observer's stop handlers"
+        );
+        assert_eq!(stop_signal_bits(&pid, "SigIgn"), 0);
+        child.release().unwrap();
+        assert_eq!(
+            stop_signal_bits(&pid, "SigCgt"),
+            0,
+            "the command catches a stop signal"
+        );
+        assert_eq!(
+            stop_signal_bits(&pid, "SigIgn"),
+            0,
+            "the command ignores a stop signal"
+        );
+        assert_eq!(child.terminate_and_reap().unwrap(), 128 + libc::SIGTERM);
     }
 
     #[test]

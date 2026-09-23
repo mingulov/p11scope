@@ -10130,7 +10130,19 @@ fn is_upstream_provenance_filename(path: &str, text: &str, offset: usize, marker
     }
     let before = &text[..offset];
     let after = &text[offset + marker.len()..];
-    after.starts_with('"') && (before.ends_with('"') || before.ends_with("\"provenance/shared/"))
+    let Some(before_quote) = before
+        .strip_suffix('"')
+        .or_else(|| before.strip_suffix("\"provenance/shared/"))
+    else {
+        return false;
+    };
+    // A quoted marker assigned straight to a name is a license claim, not an
+    // upstream provenance filename (e.g. `PROJECT_LICENSE = "<marker>"`).
+    // Other quoted literals in these two files remain a known limitation.
+    let lead = before_quote.trim_end_matches([' ', '\t']);
+    let assigned =
+        lead.ends_with('=') && !["==", "!=", "<=", ">="].iter().any(|op| lead.ends_with(op));
+    after.starts_with('"') && !assigned
 }
 
 fn license_legal_surface_errors(root: &std::path::Path, tracked: &[String]) -> Vec<String> {
@@ -10518,6 +10530,8 @@ fn license_legal_surface_accepts_only_quoted_upstream_provenance_names() {
 
     for (path, content) in [
         (tool, format!("# this project uses {mit}\n")),
+        (tool, format!("PROJECT_LICENSE = \"{mit}\"\n")),
+        (test, format!("license = \"{apache}\"\n")),
         (
             test,
             format!("# this project uses {}\n", LICENSE_LEGACY_MARKERS[2]),

@@ -387,6 +387,29 @@ def u64(value, *, positive=False):
     )
 
 
+def exact_active_slots_bound(evidence):
+    """active_slots is the plan's current active set (U-14), not
+    capture-lifetime history: it can legitimately be 0 (a scan-only target's
+    ordinary exit) but must never exceed the allocated `slots` it is drawn
+    from — every lane, every document. `slots` is type-checked first so a
+    malformed `slots` fails with a stated reason here instead of a raw
+    TypeError from the `<=` comparison below. One helper, called from every
+    path that validates a live document (`exact_evidence_keys`,
+    `exact_common`, `exact_active_to_empty`), so none of them can drift out
+    of agreement or skip the check.
+    """
+    require(u64(evidence["slots"]), f"invalid slots: {evidence['slots']!r}")
+    require(
+        u64(evidence["active_slots"]),
+        f"invalid active_slots: {evidence['active_slots']!r}",
+    )
+    require(
+        evidence["active_slots"] <= evidence["slots"],
+        f"active_slots ({evidence['active_slots']}) exceeds allocated "
+        f"slots ({evidence['slots']})",
+    )
+
+
 def exact_keys(value, keys, label):
     require(isinstance(value, dict) and set(value) == set(keys), f"{label} key set: {value!r}")
 
@@ -599,20 +622,9 @@ def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, histo
         wanted.add("child_still_running")
     require(actual == wanted, f"unexpected evidence keys: missing={sorted(wanted - actual)}, extra={sorted(actual - wanted)}")
     if not historical:
-        # U-14: active_slots is the plan's current active set (0 after an
-        # ordinary scan-only exit is expected, not a loss), but it can never
-        # exceed the allocated `slots` it is drawn from — that would be an
-        # invalid plan, in every lane and every document, not just the
-        # active-to-empty lifecycle.
-        require(
-            u64(evidence["active_slots"]),
-            f"invalid active_slots: {evidence['active_slots']!r}",
-        )
-        require(
-            evidence["active_slots"] <= evidence["slots"],
-            f"active_slots ({evidence['active_slots']}) exceeds allocated "
-            f"slots ({evidence['slots']})",
-        )
+        # Historical v2-metrics documents predate active_slots (see above);
+        # every current document's bound lives in one shared helper.
+        exact_active_slots_bound(evidence)
     if child:
         require(isinstance(evidence["child_still_running"], bool),
                 f"invalid child_still_running: {evidence['child_still_running']!r}")
@@ -1395,18 +1407,11 @@ def exact_active_to_empty(document):
     # U-14: active_slots is the plan's current active set, not
     # capture-lifetime history. A scan-only target's ordinary exit retires
     # every slot its unpinned object held, so 0 is the expected value here,
-    # not a loss. It can still never exceed the allocated `slots` above —
-    # checked here too (not just in exact_evidence_keys) so a real renderer
-    # document that only ever reaches this function still gets the bound.
-    require(
-        u64(evidence["active_slots"]),
-        f"invalid active_slots: {evidence['active_slots']!r}",
-    )
-    require(
-        evidence["active_slots"] <= evidence["slots"],
-        f"active_slots ({evidence['active_slots']}) exceeds allocated "
-        f"slots ({evidence['slots']})",
-    )
+    # not a loss — exact_active_slots_bound only pins that it can never
+    # exceed the allocated `slots` above, checked here too (not just in
+    # exact_evidence_keys) so a real renderer document that only ever
+    # reaches this function still gets the bound.
+    exact_active_slots_bound(evidence)
     for counter in DISCOVERY_LOSS_COUNTERS:
         require(evidence[counter] == 0, f"an ordinary exit is not a {counter}")
     require(
@@ -1427,6 +1432,9 @@ def exact_active_to_empty(document):
 def exact_common(
     evidence, *, aliases, skipped, in_flight, discovery_skipped=0, run=False
 ):
+    # U-14: active_slots is bounded here too, so every terminal_capture_is_clean
+    # caller (which reaches exact_common but never exact_evidence_keys) gets it.
+    exact_active_slots_bound(evidence)
     require(evidence["attach_failures"] == [], evidence["attach_failures"])
     require(evidence["aliased"] == aliases, f"unexpected aliases: {evidence['aliased']}")
     require(
@@ -4036,6 +4044,11 @@ def self_test():
     negative_active_slots = copy.deepcopy(exited)
     negative_active_slots["evidence"]["active_slots"] = -1
     rejected(lambda: exact_metrics_schema(negative_active_slots))
+    # A malformed `slots` must fail with a stated reason, not a raw TypeError
+    # from the `<=` comparison exact_active_slots_bound also makes.
+    non_integer_slots = copy.deepcopy(exited)
+    non_integer_slots["evidence"]["slots"] = "68"
+    rejected(lambda: exact_metrics_schema(non_integer_slots))
     print("active_slots is accepted at 0 after an exit and bounded by slots: OK")
 
     # ---- consumer scheduling (Task 3.1 repair) --------------------------

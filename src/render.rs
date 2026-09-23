@@ -4526,6 +4526,20 @@ mod tests {
                 ev.loader_discovery.dlopen_timing.unproven = 1
             }),
             ("no timing", |ev| ev.loader_discovery.dlopen_timing.none = 1),
+            // Every LoaderTiming class except qualified_pre_constructor is a gap,
+            // for dlopen and initial-set timing alike (audit mutants M-1/M-2).
+            ("known pre-relocation timing", |ev| {
+                ev.loader_discovery.dlopen_timing.known_pre_relocation = 1
+            }),
+            ("initial-set unproven timing", |ev| {
+                ev.loader_discovery.initial_set_timing.unproven = 1
+            }),
+            ("initial-set no timing", |ev| {
+                ev.loader_discovery.initial_set_timing.none = 1
+            }),
+            ("initial-set known pre-relocation timing", |ev| {
+                ev.loader_discovery.initial_set_timing.known_pre_relocation = 1
+            }),
             ("initial-set capture none", |ev| {
                 ev.loader_discovery.initial_set_capture.none = 1
             }),

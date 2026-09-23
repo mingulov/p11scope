@@ -6439,6 +6439,74 @@ mod tests {
         );
     }
 
+    /// F-25's other shape: the child held in T also refuses to exit on
+    /// SIGTERM. Settlement must resume it first, so the forwarded SIGTERM is
+    /// actually delivered (its handler runs) instead of pending behind the
+    /// stop, and then escalate to SIGKILL on its fixed budget: two grace
+    /// windows plus the final kill grace, never a wait on the child itself.
+    #[test]
+    fn operator_stop_delivers_sigterm_to_a_held_child_then_escalates_within_the_bound() {
+        let directory = tempfile::tempdir().unwrap();
+        let ready = directory.path().join("ready");
+        let term_seen = directory.path().join("term-seen");
+        let mut child = spawn(
+            "/bin/sh",
+            &[
+                "-c",
+                &format!(
+                    "exec 2>/dev/null; trap ': > {}' TERM; : > {}; while :; do sleep 1; done",
+                    term_seen.display(),
+                    ready.display(),
+                ),
+            ],
+        );
+        child.release().unwrap();
+        wait_until(
+            || ready.exists(),
+            "the TERM fixture never installed its handler",
+        );
+        let rescue_pidfd = duplicate_fd(child.pin().pidfd().unwrap());
+        child.pin().send_signal(libc::SIGSTOP).unwrap();
+        wait_until(
+            || original_child_is_stopped(rescue_pidfd.as_fd()),
+            "the fixture child never entered the stopped state",
+        );
+
+        let signals = Arc::new(SignalState::new());
+        signals.observe(libc::SIGTERM);
+        let grace = Duration::from_secs(1);
+        let bound = grace.saturating_mul(2).saturating_add(FINAL_KILL_GRACE);
+        let settling = Arc::clone(&signals);
+        let (settled_tx, settled_rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        let settle = std::thread::spawn(move || {
+            let outcome = settle_after_signal_with_grace(&mut child, &settling, grace)
+                .map_err(|error| format!("{error:#}"));
+            settled_tx.send((outcome, child.is_reaped())).unwrap();
+        });
+        let settled = settled_rx.recv_timeout(bound);
+        let elapsed = started.elapsed();
+        if settled.is_err() {
+            // Unwedge the harness before failing: kill the exact child.
+            let _ = rescue_original_pidfd(
+                rescue_pidfd.as_raw_fd(),
+                &std::sync::atomic::AtomicBool::new(false),
+            );
+        }
+        settle.join().unwrap();
+        let (outcome, reaped) = settled.unwrap_or_else(|_| {
+            panic!("settling a held child that survives SIGTERM overran its {bound:?} budget")
+        });
+
+        assert_eq!(outcome, Ok(ChildOutcome::Exited(128 + libc::SIGKILL)));
+        assert!(reaped);
+        assert!(
+            term_seen.exists(),
+            "the forwarded SIGTERM never reached the held child: it was not resumed first"
+        );
+        assert!(elapsed < bound, "settlement took {elapsed:?}");
+    }
+
     #[test]
     fn also_failed_keeps_both_causes_in_order() {
         // WINS: one "also failed" core behind the four combine_* helpers.

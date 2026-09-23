@@ -4,18 +4,18 @@
 //! unique {object, file_offset} across all of them. A target two modules both hand
 //! out is attached once (attaching twice would double-count every call through it),
 //! and because its counts then belong to neither module its semantics degrade to
-//! COUNT_ONLY (spec §4.7). Manifest modules are refused whole when they exceed
-//! the remaining budget, never truncated: a partially attached module silently
-//! under-reports a provider. Scan tables admit in publication-evidence order:
-//! corroborated/published tables bypass the per-object cap (global budget
-//! only, atomic refusal), unresolved heuristic tables admit until the
-//! per-object cap, and the heuristic spill is reported as
-//! `uncorroborated_candidates` — whole-module refusal stays only for the case
-//! where even the strongest table exceeds the remaining budget. A module
-//! whose sources still list endpoints this capture already attached for it is
-//! never refused whole (G-03): when its growth does not fit, it keeps those
-//! endpoints, no prefix of the growth is attached, and the omission is
-//! reported, so it is partial but never silent.
+//! COUNT_ONLY (spec §4.7). A module new to the capture whose manifest targets
+//! exceed the remaining budget is refused whole, never truncated: a partially
+//! attached module would silently under-report a provider. Scan tables admit
+//! in publication-evidence order: corroborated/published tables bypass the
+//! per-object cap (global budget only, atomic refusal), unresolved heuristic
+//! tables admit until the per-object cap, and the heuristic spill is reported
+//! as `uncorroborated_candidates` — whole-module refusal of a new module
+//! stays only for the case where even the strongest table exceeds the
+//! remaining budget. A module whose sources still list endpoints this capture
+//! already attached for it is never refused whole (G-03): when what it needs
+//! next does not fit, it keeps those endpoints, no prefix of the rest is
+//! attached, and the omission is reported, so it is partial but never silent.
 //!
 //! Both discovery sources — the memory scan and a manifest — lower into `Discovered`
 //! and go through the same `merge`, so there is exactly one implementation of the
@@ -178,11 +178,15 @@ pub(crate) fn is_growth_omission(reason: &str) -> bool {
     reason.starts_with(GROWTH_OMISSION)
 }
 
+/// The omitted endpoints are not called new: an endpoint deactivated earlier
+/// in the capture and listed again needs a fresh slot just the same.
 fn growth_omission_reason(omitted: usize, capacity: usize, in_use: usize, kept: usize) -> String {
+    let endpoints = |count: usize| if count == 1 { "endpoint" } else { "endpoints" };
     format!(
         "{GROWTH_OMISSION} {omitted} more; only {capacity} attach slots are available; \
-         {in_use} are in use — kept its {kept} attached endpoints and omitted the \
-         {omitted} new ones"
+         {in_use} are in use — {omitted} {} not attached; kept its {kept} attached {}",
+        endpoints(omitted),
+        endpoints(kept),
     )
 }
 
@@ -1291,7 +1295,9 @@ struct Target<'a> {
 
 /// Borrowed scan decode behind one scan piece, for evidence-ordered table
 /// admission in `merge`. Manifest pieces carry `None`: their tables are
-/// operator-authoritative, admitted whole or refused whole as before.
+/// operator-authoritative, admitted whole or refused whole as before — except
+/// that a module already attached keeps its attached targets when what it
+/// needs next does not fit (G-03).
 struct ScanEvidence<'a> {
     tables: &'a [ScannedTable],
     interfaces: &'a [ScannedInterface],
@@ -1444,7 +1450,8 @@ fn merge(
             let admissible = |key: &AttachKey| !kept_only || kept.contains(key);
             let refused: BTreeSet<AttachKey> = 'refused: {
                 // Manifest targets are operator-authoritative: admitted whole, and the
-                // module is refused whole when even they exceed the remaining budget.
+                // module is refused whole when even they exceed the remaining budget
+                // (a module with endpoints to keep keeps them instead, above).
                 let manifest_wanted: BTreeSet<AttachKey> = group
                     .iter()
                     .filter(|module| module.scan_evidence.is_none())
@@ -1541,8 +1548,9 @@ fn merge(
                 let is_published = table_name_authorized;
                 // All-or-nothing refusal survives only here: when even the strongest
                 // table exceeds the remaining global budget, the module — scan and
-                // manifest parts alike — is refused whole. A manifest subset must not
-                // reattach an oversized scan as a prefix.
+                // manifest parts alike — is refused whole (or, with endpoints to keep,
+                // kept on them alone, above). A manifest subset must not reattach an
+                // oversized scan as a prefix.
                 if let Some((top, _, _)) = ordered.first() {
                     let top_fresh: BTreeSet<AttachKey> = keys_of
                         .get(top)
@@ -4029,6 +4037,27 @@ mod tests {
         assert_eq!(plan.modules_skipped[0].subject, "/opt/crossing.so");
     }
 
+    /// The omission record reads right in the singular and the plural, and
+    /// keeps the prefix `is_growth_omission` and its consumers key on.
+    #[test]
+    fn growth_omission_reason_counts_endpoints_in_singular_and_plural() {
+        assert_eq!(
+            growth_omission_reason(1, 512, 512, 1),
+            "admitted module needs 1 more; only 512 attach slots are available; 512 are in use \
+             — 1 endpoint not attached; kept its 1 attached endpoint"
+        );
+        assert_eq!(
+            growth_omission_reason(2, 512, 511, 511),
+            "admitted module needs 2 more; only 512 attach slots are available; 511 are in use \
+             — 2 endpoints not attached; kept its 511 attached endpoints"
+        );
+        assert!(is_growth_omission(&growth_omission_reason(1, 512, 512, 1)));
+        assert!(!is_growth_omission(
+            "module needs 2 more; only 512 attach slots are available; 511 are in use — \
+             refusing to attach a prefix"
+        ));
+    }
+
     /// The key a `scanned_with` fixture pins to `object`.
     fn scanned_key(object: PinnedObjectId) -> ObjectKey {
         ObjectKey {
@@ -4108,7 +4137,7 @@ mod tests {
         );
         assert!(
             omission.reason.contains(&format!(
-                "kept its {} attached endpoints and omitted the 2 new ones",
+                "2 endpoints not attached; kept its {} attached endpoints",
                 MAX_SLOTS - 1
             )),
             "{omission:?}"
@@ -4179,7 +4208,8 @@ mod tests {
         );
         assert!(
             omission.reason.contains(&format!(
-                "{MAX_SLOTS} are in use — kept its {MAX_SLOTS} attached endpoints"
+                "{MAX_SLOTS} are in use — 2 endpoints not attached; kept its {MAX_SLOTS} attached \
+                 endpoints"
             )),
             "{omission:?}"
         );
@@ -4612,6 +4642,14 @@ mod tests {
         assert_eq!(omission.subject, "/opt/p11.so");
         assert!(
             omission.reason.starts_with("admitted module needs 1 more;"),
+            "{omission:?}"
+        );
+        // The re-admitted endpoint is not called new.
+        assert!(
+            omission.reason.ends_with(&format!(
+                "— 1 endpoint not attached; kept its {} attached endpoints",
+                MAX_SLOTS - 1
+            )),
             "{omission:?}"
         );
 

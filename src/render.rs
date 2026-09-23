@@ -2771,7 +2771,7 @@ mod tests {
             |e: &mut Evidence| {
                 e.discovery.modules_skipped.push(SkippedOut {
                     name: "/opt/grown.so".into(),
-                    reason: GROWTH_OMISSION.into(),
+                    reason: GROWTH_OMISSION_RECORD.into(),
                 })
             },
             // Only `--pid` gets this transitively from `slots == 0`: a cgroup
@@ -3024,8 +3024,8 @@ mod tests {
 
     /// The omission record the planner writes for an admitted provider whose
     /// growth did not fit (`plan::tests` pins the planner to this shape).
-    const GROWTH_OMISSION: &str = "admitted module needs 2 more; only 512 attach slots are \
-         available; 511 are in use — kept its 511 attached endpoints and omitted the 2 new ones";
+    const GROWTH_OMISSION_RECORD: &str = "admitted module needs 2 more; only 512 attach slots \
+         are available; 511 are in use — 2 endpoints not attached; kept its 511 attached endpoints";
 
     /// G-03: an admitted provider whose growth did not fit is partially
     /// covered, not refused. The live view counts it apart from the modules
@@ -3043,7 +3043,7 @@ mod tests {
             },
             SkippedOut {
                 name: "/opt/grown.so".into(),
-                reason: GROWTH_OMISSION.into(),
+                reason: GROWTH_OMISSION_RECORD.into(),
             },
         ];
         ev.verdict();
@@ -3063,7 +3063,10 @@ mod tests {
 
         let value = versioned_evidence(&ev);
         assert_eq!(value["modules_skipped"][1]["name"], "/opt/grown.so");
-        assert_eq!(value["modules_skipped"][1]["reason"], GROWTH_OMISSION);
+        assert_eq!(
+            value["modules_skipped"][1]["reason"],
+            GROWTH_OMISSION_RECORD
+        );
     }
 
     #[test]
@@ -3458,7 +3461,7 @@ mod tests {
             ("1 modules partially covered", |e| {
                 e.discovery.modules_skipped.push(SkippedOut {
                     name: "/opt/grown.so".into(),
-                    reason: GROWTH_OMISSION.into(),
+                    reason: GROWTH_OMISSION_RECORD.into(),
                 });
             }),
             ("1 surface gaps", |e| {

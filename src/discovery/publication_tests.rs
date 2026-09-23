@@ -1402,7 +1402,9 @@ fn assert_instance_entries(
 }
 
 /// Plan linkage per template version-word offset: pins the sweep's own
-/// interface triples (1.3 behavior) apart from publication evidence.
+/// interface triples apart from publication evidence (U-15: only an
+/// `exact_standard` triple reads as `interface`; anything else reads
+/// as plain heuristic).
 fn template_linkage(engine: &Engine) -> std::collections::BTreeMap<u64, &'static str> {
     engine
         .plan()
@@ -1491,7 +1493,9 @@ fn no_active_wrappers_admits_only_templates_and_published_legacy() {
     assert_eq!(linkage.get(&None).map(Vec::len), Some(1));
     assert_eq!(linkage[&None], vec!["live_return"]);
     // The sweep's own triples are pinned, not widened: template[0]'s
-    // unreadable-name link (Task 1.4 concern 1) keeps its 1.3 reading.
+    // unreadable-name link is not `exact_standard`, so it carries no
+    // standard-layout evidence and reads as plain heuristic, never
+    // `interface` (U-15; F-T2-1).
     let template_offsets: Vec<u64> = visible
         .iter()
         .map(|table| MapLite::file_target(&maps, table.addr).1)
@@ -1500,14 +1504,16 @@ fn no_active_wrappers_admits_only_templates_and_published_legacy() {
         template_linkage(&engine),
         template_offsets
             .iter()
-            .zip(["interface", "heuristic", "heuristic", "heuristic"])
+            .zip(["heuristic", "heuristic", "heuristic", "heuristic"])
             .map(|(offset, linkage)| (*offset, linkage))
             .collect::<std::collections::BTreeMap<_, _>>(),
     );
 
     // Names: the published legacy table authorizes all 68 ordinal
-    // labels on its one slot; heuristic-only closures stay unknown.
-    let template_auth = |index: i64| index == 0;
+    // labels on its one slot; every heuristic-only closure — including
+    // template[0]'s, whose only link is not `exact_standard` (U-15) —
+    // stays unknown.
+    let template_auth = |_index: i64| false;
     let mut claimants: Vec<(&TablePrint, bool)> = vec![(&publish.legacy, true)];
     claimants.extend(
         visible
@@ -1523,7 +1529,14 @@ fn no_active_wrappers_admits_only_templates_and_published_legacy() {
         .filter(|(_, names)| **names == vec!["unknown".to_string()])
         .map(|(target, _)| target.clone())
         .collect();
-    assert_eq!(unknown.len(), 18, "heuristic-only idx1-3 closures");
+    // 4 templates x 6 index-specific closures, plus the 3 targets they
+    // share: template[0]'s link no longer authorizes them either, so
+    // they lose the "known" reading they only had through it (U-15).
+    assert_eq!(
+        unknown.len(),
+        27,
+        "heuristic-only idx0-3 closures plus the 3 shared targets"
+    );
 
     assert_eq!(engine.plan().uncorroborated_candidates, 0);
     assert!(engine.plan().skipped.is_empty());
@@ -1652,8 +1665,11 @@ fn holes_admit_index_17_despite_free_0_to_3() {
         .collect();
     assert_eq!(linkage_none, vec!["live_return", "live_return"]);
 
-    // Names: heap 17's closures authorize their ordinal labels.
-    let template_auth = |index: i64| index == 0;
+    // Names: heap 17's closures authorize their ordinal labels; the
+    // swept templates carry no exact_standard interface link and no
+    // live-return or manifest evidence of their own, so none of them
+    // are authorized (U-15; F-T2-1).
+    let template_auth = |_index: i64| false;
     let mut claimants: Vec<(&TablePrint, bool)> = vec![(&publish.legacy, true), (heap17, true)];
     claimants.extend(
         visible
@@ -2218,7 +2234,10 @@ fn direct_backend_forwarding_admits_cross_object_targets() {
     assert_instance_entries(&engine, &maps, heap0, true);
     assert_instance_entries(&engine, &maps, &publish.legacy, true);
 
-    let template_auth = |index: i64| index == 0;
+    // The swept templates carry no exact_standard interface link and no
+    // live-return or manifest evidence of their own, so none of them
+    // are authorized (U-15; F-T2-1).
+    let template_auth = |_index: i64| false;
     let mut claimants: Vec<(&TablePrint, bool)> = vec![(&publish.legacy, true), (heap0, true)];
     claimants.extend(
         visible
@@ -3175,13 +3194,13 @@ fn broad_fixed_pool_admits_all_validated_templates() {
             );
         }
     }
-    // Names: only the sweep's own template[0] interface link authorizes;
-    // the 60 pool tables are unlinked heuristic evidence (`unknown`).
-    let claimants: Vec<(&TablePrint, bool)> = templates
-        .iter()
-        .enumerate()
-        .map(|(index, table)| (table, index == 0))
-        .collect();
+    // Names: no evidence authorizes any pool table. The sweep's own
+    // template[0] interface link is not `exact_standard`, so it no
+    // longer authorizes names by itself (U-15; F-T2-1); broad observes
+    // no live records here and there is no manifest, so all 64 pool
+    // tables are unlinked heuristic evidence (`unknown`).
+    let claimants: Vec<(&TablePrint, bool)> =
+        templates.iter().map(|table| (table, false)).collect();
     assert_eq!(
         actual_slot_names(&engine),
         expected_slot_names(&maps, &claimants)

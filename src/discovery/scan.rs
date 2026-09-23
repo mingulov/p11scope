@@ -1934,10 +1934,18 @@ fn decode_candidate(
     let mut non_null = 0usize;
     let field_count = spans.iter().map(|span| span.fields().len()).sum();
     let mut slots: Vec<Option<(String, Device, u64, u64)>> = Vec::with_capacity(field_count);
+    let mut names: Vec<&'static str> = Vec::with_capacity(field_count);
     for ordinal in 0..field_count {
         if !budget.charge(1) {
             return Err(());
         }
+        // The target's version word selects the layout. A pinned name catalog
+        // that cannot name one of its ordinals refuses the candidate here,
+        // before any table budget is admitted, instead of panicking later.
+        let Some(name) = function_name(ordinal) else {
+            return Ok(None);
+        };
+        names.push(name);
         let Ok(value) = read_function_pointer(bytes, layout, ordinal) else {
             return Ok(None);
         };
@@ -2037,14 +2045,13 @@ fn decode_candidate(
 
     let mut entries = Vec::with_capacity(non_null);
     let mut null_entries = Vec::with_capacity(decoded_entries - non_null);
-    for (ordinal, slot) in slots.iter().enumerate() {
+    for (slot, &name) in slots.iter().zip(&names) {
         // Provisional ABI-positional label, not an attribution: presenting it
         // as the provider's function name requires linkage-or-manifest
         // authorization, applied where the table's evidence is complete (plan
         // lowering), where an unauthorized table is named `unknown`. Internal
         // same-ordinal matching (fallback proofs) keeps using these labels;
         // only the presented names are gated.
-        let name = function_name(ordinal).expect("validated shared field count");
         let Some((object_path, device, inode, file_offset)) = slot else {
             null_entries.push(name);
             continue;
@@ -4537,6 +4544,123 @@ mod tests {
         for reason in reasons {
             assert!(!scan_skip_truncates(&reason), "{reason:?} must stay benign");
         }
+    }
+
+    #[test]
+    fn every_layout_a_version_word_selects_is_fully_nameable() {
+        // decode_candidate names ordinals from the pinned catalog. Pin that every
+        // walkable layout a target can select stays inside it, so a dependency
+        // skew fails here instead of refusing (or panicking on) real tables.
+        let mut checked = 0;
+        for major in [2u64, 3] {
+            for minor in 0u64..=40 {
+                let Some((version, spans, _)) = spans_for(major | (minor << 8)) else {
+                    continue;
+                };
+                let fields: usize = spans.iter().map(|span| span.fields().len()).sum();
+                assert!(fields > 0, "{version:?}");
+                for ordinal in 0..fields {
+                    assert!(
+                        function_name(ordinal).is_some(),
+                        "{version:?} ordinal {ordinal} of {fields} has no catalog name"
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert!(
+            checked >= 41 + 3,
+            "every 2.0-2.40 and 3.0-3.2 layout is checked"
+        );
+    }
+
+    #[test]
+    fn table_name_authorization_matches_linkage_for_every_evidence_pattern() {
+        for bits in 0u8..16 {
+            let score = TableEvidenceScore {
+                linked: bits & 1 != 0,
+                live_return: bits & 2 != 0,
+                manifest: bits & 4 != 0,
+                full_walk: bits & 8 != 0,
+            };
+            let expected = if score.linked {
+                "interface"
+            } else if score.live_return {
+                "live_return"
+            } else if score.manifest {
+                "manifest"
+            } else {
+                "heuristic"
+            };
+            assert_eq!(table_linkage(&score), expected, "{score:?}");
+            // Names are published exactly when some publication evidence exists;
+            // walk plausibility alone never authorizes them.
+            assert_eq!(
+                table_name_authorized(&score),
+                expected != "heuristic",
+                "{score:?}"
+            );
+            let toggled = TableEvidenceScore {
+                full_walk: !score.full_walk,
+                ..score
+            };
+            assert_eq!(
+                table_name_authorized(&toggled),
+                table_name_authorized(&score),
+                "{score:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tables_order_by_evidence_strongest_first_and_stably() {
+        let table =
+            |address: u64, walk: &'static str, live_return: bool, manifest: bool| ScannedTable {
+                version: (2, 40),
+                walk,
+                entries: Vec::new(),
+                null_entries: Vec::new(),
+                unpinned: Vec::new(),
+                address,
+                file_offset: Some(address),
+                live_return,
+                manifest_supported: manifest,
+            };
+        let tables = [
+            table(0x1000, "full", false, false),         // 0: heuristic
+            table(0x2000, "full", false, true),          // 1: manifest
+            table(0x3000, "full", true, false),          // 2: live return
+            table(0x4000, "full", false, false),         // 3: heuristic, ties with 0
+            table(0x5000, "known_prefix", false, false), // 4: weakest
+            table(0x6000, "full", false, false),         // 5: linked by an interface
+            table(0x7000, "full", false, false),         // 6: caller-held live return
+            table(0x8000, "full", false, false),         // 7: caller-held manifest offset
+        ];
+        let interfaces = [ScannedInterface {
+            index: 0,
+            name_class: "exact_standard",
+            name_lossy: None,
+            name_private: None,
+            flags: 0,
+            table: Some(5),
+        }];
+        let order = order_tables_by_evidence(&tables, &interfaces, &[0x7000], &[0x8000]);
+        assert_eq!(order, [5, 2, 6, 1, 7, 0, 3, 4]);
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            (0..tables.len()).collect::<Vec<_>>(),
+            "a permutation"
+        );
+        let scores: Vec<_> = order
+            .iter()
+            .map(|&index| table_evidence_score(index, &tables, &interfaces, &[0x7000], &[0x8000]))
+            .collect();
+        assert!(
+            scores.windows(2).all(|pair| pair[0] >= pair[1]),
+            "{scores:?}"
+        );
     }
 
     #[test]

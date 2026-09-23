@@ -1871,10 +1871,17 @@ impl CaptureFacts {
         }
         for (object, refused) in plan.refused_modules() {
             let id = self.module_id_for_object(pinned, object)?;
-            history
+            // One record per module. A whole refusal stays the capture's
+            // record of it; a growth omission (G-03) yields to any newer
+            // record, so a larger growth or a later whole refusal is never
+            // hidden behind the first omission.
+            let known = history
                 .refusals
                 .entry(id)
                 .or_insert_with(|| refused.clone());
+            if plan::is_growth_omission(&known.reason) {
+                known.clone_from(refused);
+            }
         }
         for fallback in current.manifest_object_fallbacks {
             let key = (fallback.manifest, fallback.object);

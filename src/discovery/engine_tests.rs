@@ -1733,26 +1733,33 @@ fn capture_facts_keep_a_manifest_only_capacity_refusal() {
     assert_eq!(engine.discovery.modules.len(), 1);
 }
 
-/// G-03 through the engine: an admitted provider whose live growth does not
-/// fit stays discovered with every endpoint it had, and the same growth seen
-/// again publishes one omission record for it, not a growing list — the
-/// evidence says the provider is partially covered, never that it is gone.
-#[test]
-fn a_grown_provider_stays_discovered_and_its_refused_growth_is_published_once() {
-    let admitted = p11scope_ebpf_common::MAX_SLOTS - 1;
-    let entries = |key: ObjectKey, path: &str, count: u32| -> Vec<ScannedEntry> {
-        (0..count)
-            .map(|index| ScannedEntry {
-                name: "C_Sign",
-                object: key,
-                object_path: path.into(),
-                file_offset: 8 * u64::from(index),
-            })
-            .collect()
-    };
-    let mut raw = overlay_module(overlay_key(62));
-    let (key, path) = (raw.key, raw.path.clone());
-    raw.tables[0].entries = entries(key, &path, admitted);
+/// The overlay provider's table listing one `C_Sign` entry at each of
+/// `offsets` in its own object.
+fn overlay_entries(
+    raw: &ScannedModule,
+    offsets: impl IntoIterator<Item = u64>,
+) -> Vec<ScannedEntry> {
+    offsets
+        .into_iter()
+        .map(|file_offset| ScannedEntry {
+            name: "C_Sign",
+            object: raw.key,
+            object_path: raw.path.clone(),
+            file_offset,
+        })
+        .collect()
+}
+
+/// Offsets `0, 8, …` of the first `count` entries.
+fn first_offsets(count: u32) -> impl Iterator<Item = u64> {
+    (0..count).map(|index| 8 * u64::from(index))
+}
+
+/// An engine whose published plan admitted one overlay provider on
+/// `admitted` endpoints, and that provider's raw scan.
+fn engine_admitting_overlay(minor: u64, admitted: u32) -> (Engine, ScannedModule) {
+    let mut raw = overlay_module(overlay_key(minor));
+    raw.tables[0].entries = overlay_entries(&raw, first_offsets(admitted));
     let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1)]);
     let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&raw), &mut pins);
     assert!(skipped.is_empty(), "{skipped:?}");
@@ -1766,24 +1773,43 @@ fn a_grown_provider_stays_discovered_and_its_refused_growth_is_published_once() 
         .unwrap();
     engine.publish_current_capture_facts().unwrap();
     assert_eq!(engine.plan.active_slot_count(), admitted as usize);
+    (engine, raw)
+}
+
+/// One live rebuild of `raw`, committed and published the way an accepted
+/// candidate is; returns its link delta.
+fn commit_live_rebuild(engine: &mut Engine, raw: &ScannedModule) -> plan::AttachDelta {
+    let candidate = engine
+        .live_candidate(engine.pinned.clone(), vec![raw.clone()], Vec::new())
+        .unwrap();
+    engine.plan = candidate.plan;
+    engine.pinned = candidate.pinned;
+    engine.modules = candidate.modules;
+    engine.publish_current_capture_facts().unwrap();
+    candidate.delta
+}
+
+/// G-03 through the engine: an admitted provider whose live growth does not
+/// fit stays discovered with every endpoint it had, and the same growth seen
+/// again publishes one omission record for it, not a growing list — the
+/// evidence says the provider is partially covered, never that it is gone.
+#[test]
+fn a_grown_provider_stays_discovered_and_its_refused_growth_is_published_once() {
+    let admitted = p11scope_ebpf_common::MAX_SLOTS - 1;
+    let (mut engine, raw) = engine_admitting_overlay(62, admitted);
+    let path = raw.path.clone();
 
     let mut grown = raw.clone();
-    grown.tables[0].entries = entries(key, &path, admitted + 2);
+    grown.tables[0].entries = overlay_entries(&raw, first_offsets(admitted + 2));
     for _ in 0..2 {
-        let candidate = engine
-            .live_candidate(engine.pinned.clone(), vec![grown.clone()], Vec::new())
-            .unwrap();
-        assert!(candidate.delta.new.is_empty(), "{:?}", candidate.delta.new);
-        assert!(candidate.delta.replace.is_empty());
+        let delta = commit_live_rebuild(&mut engine, &grown);
+        assert!(delta.new.is_empty(), "{:?}", delta.new);
+        assert!(delta.replace.is_empty());
         assert!(
-            candidate.delta.retire.is_empty(),
+            delta.retire.is_empty(),
             "{} admitted endpoints retired",
-            candidate.delta.retire.len()
+            delta.retire.len()
         );
-        engine.plan = candidate.plan;
-        engine.pinned = candidate.pinned;
-        engine.modules = candidate.modules;
-        engine.publish_current_capture_facts().unwrap();
     }
 
     assert_eq!(engine.plan.slots.len(), admitted as usize);
@@ -1806,6 +1832,85 @@ fn a_grown_provider_stays_discovered_and_its_refused_growth_is_published_once() 
         "{omission:?}"
     );
     assert_eq!(engine.plan.modules_skipped.len(), 1);
+}
+
+/// G-03: a provider whose refused growth grows further publishes the larger
+/// omission — still one record for the module, never the stale first one.
+#[test]
+fn a_larger_growth_replaces_the_published_growth_omission() {
+    let admitted = p11scope_ebpf_common::MAX_SLOTS - 1;
+    let (mut engine, raw) = engine_admitting_overlay(63, admitted);
+    let mut grown = raw.clone();
+    grown.tables[0].entries = overlay_entries(&raw, first_offsets(admitted + 2));
+    commit_live_rebuild(&mut engine, &grown);
+    assert!(
+        engine.discovery.modules_skipped[0]
+            .reason
+            .starts_with("admitted module needs 2 more;"),
+        "{:?}",
+        engine.discovery.modules_skipped
+    );
+
+    grown.tables[0].entries = overlay_entries(&raw, first_offsets(admitted + 5));
+    let delta = commit_live_rebuild(&mut engine, &grown);
+
+    assert!(delta.new.is_empty() && delta.replace.is_empty() && delta.retire.is_empty());
+    assert_eq!(
+        engine.discovery.modules_skipped.len(),
+        1,
+        "{:?}",
+        engine.discovery.modules_skipped
+    );
+    let omission = &engine.discovery.modules_skipped[0];
+    assert!(
+        omission.reason.starts_with("admitted module needs 5 more;"),
+        "{omission:?}"
+    );
+    assert_eq!(
+        engine.plan.modules_skipped,
+        [plan::Skipped {
+            subject: omission.name.clone(),
+            reason: omission.reason.clone(),
+        }]
+    );
+}
+
+/// G-03: a module whose growth was omitted and that is later refused whole —
+/// its sources list none of the endpoints it had any more — is published as
+/// refused, not left reading "partially covered".
+#[test]
+fn a_later_whole_refusal_replaces_a_published_growth_omission() {
+    let admitted = p11scope_ebpf_common::MAX_SLOTS - 1;
+    let (mut engine, raw) = engine_admitting_overlay(64, admitted);
+    let mut grown = raw.clone();
+    grown.tables[0].entries = overlay_entries(&raw, first_offsets(admitted + 2));
+    commit_live_rebuild(&mut engine, &grown);
+    assert!(plan::is_growth_omission(
+        &engine.discovery.modules_skipped[0].reason
+    ));
+
+    // The provider changed: it lists only the two endpoints it never had.
+    let mut changed = raw.clone();
+    changed.tables[0].entries =
+        overlay_entries(&raw, first_offsets(admitted + 2).skip(admitted as usize));
+    let delta = commit_live_rebuild(&mut engine, &changed);
+
+    assert_eq!(delta.retire.len(), admitted as usize);
+    assert!(delta.new.is_empty());
+    assert_eq!(engine.plan.active_slot_count(), 0);
+    assert_eq!(
+        engine.discovery.modules_skipped.len(),
+        1,
+        "{:?}",
+        engine.discovery.modules_skipped
+    );
+    let refusal = &engine.discovery.modules_skipped[0];
+    assert!(
+        refusal.reason.starts_with("module needs 2 more;")
+            && refusal.reason.ends_with("refusing to attach a prefix"),
+        "{refusal:?}"
+    );
+    assert!(!plan::is_growth_omission(&refusal.reason), "{refusal:?}");
 }
 
 #[test]

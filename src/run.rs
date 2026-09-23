@@ -6507,6 +6507,286 @@ mod tests {
         assert!(elapsed < bound, "settlement took {elapsed:?}");
     }
 
+    /// The scripted half of a pause-held owned child: the authorization map,
+    /// the discovery queue, and a count of resumes. Everything else the
+    /// shutdown test below drives is real — the coordinator, the owned child,
+    /// its pidfd SIGCONT, its `/proc` task states, and the settlement path.
+    #[derive(Default)]
+    struct HeldPause {
+        authorization: Option<u64>,
+        queue: std::collections::VecDeque<crate::discovery::pause::DiscoveryItem>,
+        resumes: usize,
+    }
+
+    struct HeldPauseIo<'a> {
+        child: &'a OwnedChild,
+        held: &'a mut HeldPause,
+        signals: &'a SignalState,
+    }
+
+    impl crate::discovery::pause::PauseIo for HeldPauseIo<'_> {
+        fn now_ns(&mut self) -> std::result::Result<u64, String> {
+            crate::attach::monotonic_ns().ok_or_else(|| "monotonic clock read failed".into())
+        }
+
+        fn wait_one_ms(&mut self) -> std::result::Result<(), String> {
+            std::thread::sleep(Duration::from_millis(1));
+            Ok(())
+        }
+
+        fn task_states(
+            &mut self,
+            pid: u32,
+        ) -> std::result::Result<std::collections::BTreeMap<u32, u8>, String> {
+            let mut states = std::collections::BTreeMap::new();
+            let tasks = std::fs::read_dir(format!("/proc/{pid}/task"))
+                .map_err(|error| format!("task set of {pid}: {error}"))?;
+            for task in tasks {
+                let task = task.map_err(|error| error.to_string())?;
+                let tid = task
+                    .file_name()
+                    .to_string_lossy()
+                    .parse::<u32>()
+                    .map_err(|error| error.to_string())?;
+                let stat = std::fs::read(task.path().join("stat"))
+                    .map_err(|error| format!("task {tid} stat: {error}"))?;
+                let close = stat
+                    .iter()
+                    .rposition(|byte| *byte == b')')
+                    .ok_or("task stat without a comm delimiter")?;
+                let state = *stat.get(close + 2).ok_or("task stat without a state")?;
+                states.insert(tid, state);
+            }
+            Ok(states)
+        }
+
+        fn dequeue(
+            &mut self,
+        ) -> std::result::Result<Option<crate::discovery::pause::DiscoveryItem>, String> {
+            Ok(self.held.queue.pop_front())
+        }
+
+        fn arm(&mut self) -> std::result::Result<(), String> {
+            self.held.authorization = Some(p11scope_ebpf_common::PAUSE_ARMED);
+            Ok(())
+        }
+
+        fn authorization(&mut self) -> std::result::Result<Option<u64>, String> {
+            Ok(self.held.authorization)
+        }
+
+        fn remove_authorization(&mut self) -> std::result::Result<Option<u64>, String> {
+            Ok(self.held.authorization.take())
+        }
+
+        fn apply_batch(
+            &mut self,
+            _: Vec<p11scope_ebpf_common::DiscoveryRecord>,
+            _: Option<u64>,
+            _: bool,
+            _: bool,
+            _: &mut Option<crate::discovery::engine::TerminalBatch>,
+        ) -> std::result::Result<
+            crate::discovery::pause::PauseBatchOutcome,
+            crate::discovery::pause::PauseBatchError,
+        > {
+            Ok(Default::default())
+        }
+
+        fn account_unvalidated_records(&mut self, _: u64) {}
+
+        fn reconcile_terminal_authority(
+            &mut self,
+            _: &mut Option<crate::discovery::engine::TerminalBatch>,
+        ) -> std::result::Result<(), String> {
+            Ok(())
+        }
+
+        fn cleanup_terminal_batch_without_replay(
+            &mut self,
+            _: &mut Option<crate::discovery::engine::TerminalBatch>,
+        ) -> std::result::Result<(), String> {
+            Ok(())
+        }
+
+        fn revalidate_after_release(
+            &mut self,
+            _: bool,
+        ) -> std::result::Result<crate::discovery::pause::PauseRevalidationOutcome, String>
+        {
+            Err("post-release revalidation is not part of shutdown".into())
+        }
+
+        fn marker_seen(&mut self) -> std::result::Result<bool, String> {
+            Ok(false)
+        }
+
+        fn resume(&mut self) -> std::result::Result<(), String> {
+            self.held.resumes += 1;
+            self.child.pin().send_signal(libc::SIGCONT)
+        }
+
+        fn detach_pause_links(&mut self) -> std::result::Result<(), String> {
+            Ok(())
+        }
+
+        fn same_generation(
+            &mut self,
+            pid: u32,
+            generation: u64,
+        ) -> std::result::Result<bool, String> {
+            Ok(pid == self.child.pid()
+                && generation == self.child.generation().get()
+                && self.child.pin().still_the_same())
+        }
+
+        fn original_exited(&mut self) -> std::result::Result<bool, String> {
+            self.child.pin().original_exited()
+        }
+
+        fn cancelled(&mut self) -> std::result::Result<bool, String> {
+            Ok(self.signals.interrupted())
+        }
+    }
+
+    /// F-25 end to end, without BPF: the kernel consumed the pause arm and the
+    /// helper's SIGSTOP holds the owned child when the capture ends — by an
+    /// operator SIGTERM, by `--duration`, or by a capture error — before any
+    /// discovery frame serviced the stop. The two steps `Owned::finish` runs
+    /// (coordinator cleanup, then settlement) must resume the held child,
+    /// report the stop that never confirmed (`auto`: partial; `always`: a
+    /// required refusal), and settle the child well inside one TERM grace
+    /// window: terminated, or handed back running — never left in T.
+    #[test]
+    fn shutdown_resumes_reports_and_settles_a_child_held_by_an_unserviced_pause() {
+        let fixture_dir = tempfile::tempdir().unwrap();
+        let sleeper = build_sleeper(fixture_dir.path());
+        for policy in [cli::PausePolicy::Auto, cli::PausePolicy::Always] {
+            for end in [
+                CaptureEnd::Signal,
+                CaptureEnd::DurationExpired,
+                CaptureEnd::Error,
+            ] {
+                let case = format!("{policy:?}/{end:?}");
+                let mut child = spawn(sleeper.to_str().unwrap(), &[]);
+                let signals = SignalState::new();
+                let mut held = HeldPause::default();
+                let mut coordinator = {
+                    let mut io = HeldPauseIo {
+                        child: &child,
+                        held: &mut held,
+                        signals: &signals,
+                    };
+                    let mut coordinator =
+                        PauseCoordinator::preflight(policy, &child, &mut io).unwrap();
+                    assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Armed);
+                    coordinator
+                };
+                child.release().unwrap();
+
+                // The loader hook fires: the kernel's exchange consumes the
+                // arm, the helper's record is queued, and its SIGSTOP holds
+                // the child.
+                held.authorization = Some(p11scope_ebpf_common::PAUSE_REQUESTED);
+                // SAFETY: DiscoveryRecord is plain old data; all-zero is valid.
+                let mut record: p11scope_ebpf_common::DiscoveryRecord =
+                    unsafe { std::mem::zeroed() };
+                record.pid_tgid = u64::from(child.pid()) << 32;
+                record.hook_ts_ns = crate::attach::monotonic_ns().unwrap();
+                held.queue
+                    .push_back(crate::discovery::pause::DiscoveryItem::Record(record));
+                child.pin().send_signal(libc::SIGSTOP).unwrap();
+                wait_until(
+                    || original_child_is_stopped(child.pin().pidfd().unwrap()),
+                    "the helper's SIGSTOP never held the child",
+                );
+
+                if end == CaptureEnd::Signal {
+                    signals.observe(libc::SIGTERM);
+                }
+                let started = Instant::now();
+                let cleanup = {
+                    let mut io = HeldPauseIo {
+                        child: &child,
+                        held: &mut held,
+                        signals: &signals,
+                    };
+                    coordinator.cleanup(&mut io)
+                };
+                assert!(
+                    !original_child_is_stopped(child.pin().pidfd().unwrap()),
+                    "{case}: the child is still held stopped after cleanup"
+                );
+                assert_eq!(
+                    held.resumes, 1,
+                    "{case}: cleanup resumes the held child once"
+                );
+                assert_eq!(held.authorization, None, "{case}");
+                if policy == cli::PausePolicy::Auto {
+                    assert!(cleanup.is_ok(), "{case}: {cleanup:?}");
+                    assert_eq!(
+                        coordinator.counters(),
+                        crate::discovery::pause::PauseCounters {
+                            attempts: 1,
+                            confirmed: 0,
+                            partial: 1,
+                        },
+                        "{case}: the stop that never confirmed must be reported as partial"
+                    );
+                    assert_eq!(coordinator.status(), PauseStatus::Partial, "{case}");
+                } else {
+                    let error = cleanup
+                        .as_ref()
+                        .expect_err("always refuses a stop that never confirmed");
+                    assert!(error.required() && !error.lifecycle(), "{case}: {error}");
+                    assert_eq!(coordinator.counters().confirmed, 0, "{case}");
+                }
+
+                let mut retained = Some(child);
+                let mut pending = None;
+                let mut exit_code = None;
+                let mut still_running = false;
+                settle_owned_child(
+                    &mut retained,
+                    end,
+                    cleanup.is_ok(),
+                    false,
+                    &signals,
+                    &mut pending,
+                    &mut exit_code,
+                    &mut still_running,
+                )
+                .unwrap();
+                let elapsed = started.elapsed();
+
+                assert!(
+                    elapsed < TERM_GRACE,
+                    "{case}: shutdown waited out a TERM grace window ({elapsed:?})"
+                );
+                if end == CaptureEnd::DurationExpired && cleanup.is_ok() {
+                    // `--duration` without `--kill-on-timeout` hands it back.
+                    assert_eq!(exit_code, None, "{case}");
+                    assert!(still_running, "{case}");
+                    let staged = pending.as_ref().expect("a staged running handoff");
+                    assert!(
+                        !original_child_is_stopped(staged.pin().pidfd().unwrap()),
+                        "{case}: a handed-back child is never left stopped"
+                    );
+                    // Uncommitted: dropping the staged child kills and reaps it.
+                } else {
+                    assert_eq!(
+                        exit_code,
+                        Some(128 + libc::SIGTERM),
+                        "{case}: the resumed child must die by the SIGTERM it was sent"
+                    );
+                    assert!(!still_running, "{case}");
+                    assert!(retained.as_ref().unwrap().is_reaped(), "{case}");
+                    assert!(pending.is_none(), "{case}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn also_failed_keeps_both_causes_in_order() {
         // WINS: one "also failed" core behind the four combine_* helpers.

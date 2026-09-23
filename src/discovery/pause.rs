@@ -30,6 +30,7 @@ const MSG_PAUSE_CONFIRMATION_DEADLINE: &str = "pause confirmation deadline cross
 const MSG_PAUSE_RESUME_DEADLINE: &str = "pause resume observation deadline crossed";
 const MSG_PAUSE_CAUSAL_DEADLINE: &str = "pause causal deadline crossed";
 const MSG_COALESCED_RECORD_DEADLINE: &str = "coalesced record crossed winner deadline";
+const MSG_UNSERVICED_AT_CLEANUP: &str = "the capture ended before a pause cycle serviced its stop";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PauseDiagnostic {
@@ -1570,8 +1571,20 @@ impl PauseCoordinator {
         }
     }
 
+    /// The capture's final cleanup. When the capture ends (operator stop,
+    /// `--duration`, error) after the kernel consumed an arm but before any
+    /// service cycle reached it, the helper's stop is still holding the child:
+    /// its owner opens only here, where cleanup resumes that child. It never
+    /// confirmed, so it closes like every other unconfirmed owner — `auto`
+    /// partial, `always` refused — instead of rendering as a confirmed stop.
+    /// An owner already open before this call keeps its original outcome.
     pub(crate) fn cleanup(&mut self, io: &mut impl PauseIo) -> Result<(), PauseError> {
-        self.terminal_cleanup(io)
+        let owner_was_open = self.attempt_open;
+        self.terminal_cleanup(io)?;
+        if self.attempt_open && !owner_was_open {
+            return self.finish_nonconfirmed(MSG_UNSERVICED_AT_CLEANUP.into());
+        }
+        Ok(())
     }
 
     fn terminal_cleanup(&mut self, io: &mut impl PauseIo) -> Result<(), PauseError> {
@@ -6091,6 +6104,57 @@ mod tests {
             "the full retry must not resume twice"
         );
         assert!(coordinator.cleaned);
+    }
+
+    /// F-25: the capture can end (operator stop, `--duration`) after the
+    /// kernel consumed an arm and before the discovery frame that would have
+    /// serviced it. The helper's SIGSTOP still holds the child, so terminal
+    /// cleanup resumes it — and the owner that cleanup opens never confirmed,
+    /// so it must close like every other unconfirmed owner: `auto` counts it
+    /// partial, `always` refuses. It is never rendered as a confirmed stop.
+    #[test]
+    fn an_unserviced_stop_at_shutdown_is_resumed_and_never_reported_confirmed() {
+        for policy in [PausePolicy::Auto, PausePolicy::Always] {
+            let mut io = FakeIo {
+                queue: VecDeque::from([
+                    Ok(Some(DiscoveryItem::Record(record(10, 0, false)))),
+                    Ok(None),
+                ]),
+                authorization: Some(PAUSE_REQUESTED),
+                ..FakeIo::default()
+            };
+            let mut coordinator = PauseCoordinator::for_test(policy, 41, 9, stopped());
+            coordinator.arm_for_test();
+
+            let result = coordinator.cleanup(&mut io);
+
+            assert_eq!(
+                io.events,
+                [
+                    "detach", "dequeue", "dequeue", "account", "read", "remove", "resume"
+                ],
+                "{policy:?}: the held child is resumed once, after removal"
+            );
+            assert_eq!(io.authorization, None, "{policy:?}");
+            assert_eq!(coordinator.counters().confirmed, 0, "{policy:?}");
+            match policy {
+                PausePolicy::Auto => {
+                    result.expect("an auto owner that never confirmed is a partial attempt");
+                    assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+                    assert_eq!(coordinator.status(), PauseStatus::Partial);
+                }
+                PausePolicy::Always => {
+                    let error = result.expect_err("always never reports an unconfirmed stop");
+                    assert!(error.required(), "{error}");
+                    assert!(!error.lifecycle(), "{error}");
+                    assert_eq!(
+                        error.to_string(),
+                        format!("{MSG_UNSERVICED_AT_CLEANUP} [pause_diag=other_auto_nonconfirmed]")
+                    );
+                }
+                PausePolicy::Never => unreachable!(),
+            }
+        }
     }
 
     #[test]

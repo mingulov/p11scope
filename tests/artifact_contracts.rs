@@ -168,7 +168,7 @@ fn assert_start_owner_seam(ebpf: &str, owner: &str) -> Result<(), String> {
         "p11_owner_start_insert(const struct owner_start_key *key",
     )?;
     for marker in [
-        "key->slot >= 512 || key->pad",
+        "key->slot >= P11SCOPE_OWNER_SLOT_BOUND || key->pad",
         "start_key_valid(owner, key)",
         "long rc = remove_start(ctl, owner, key);",
     ] {
@@ -4521,10 +4521,19 @@ fn frozen_policy_inventory_matches_embedded_object() {
     let directory = tempfile::tempdir().expect("temporary inventory directory");
     let object = directory.path().join("p11scope-ebpf");
     fs::write(&object, p11scope::EBPF_OBJECT).expect("write embedded eBPF object");
-    let (variant, maps, programs) = if cfg!(feature = "unsafe-unvalidated-metadata") {
-        ("diagnostic", 23, 18)
+    let (variant, other_metadata, other_capacity) = match (
+        cfg!(feature = "wide-detailed-2112"),
+        cfg!(feature = "unsafe-unvalidated-metadata"),
+    ) {
+        (false, false) => ("default", "diagnostic", "wide-default"),
+        (false, true) => ("diagnostic", "default", "wide-diagnostic"),
+        (true, false) => ("wide-default", "wide-diagnostic", "default"),
+        (true, true) => ("wide-diagnostic", "wide-default", "diagnostic"),
+    };
+    let (maps, programs) = if cfg!(feature = "unsafe-unvalidated-metadata") {
+        (23, 18)
     } else {
-        ("default", 22, 13)
+        (22, 13)
     };
     let report = run_ok(
         "python3",
@@ -4545,30 +4554,27 @@ fn frozen_policy_inventory_matches_embedded_object() {
         )),
         "{report}"
     );
-    // The count line alone would still print if `--inventory` stopped validating,
-    // so prove the same object is rejected against the other variant's freeze.
-    let other = if variant == "default" {
-        "diagnostic"
-    } else {
-        "default"
-    };
-    let control = Command::new("python3")
-        .args([
-            "-I",
-            "scripts/check-bpf-map-defs.py",
-            "--inventory",
-            other,
-            object.to_str().unwrap(),
-        ])
-        .output()
-        .expect("run the inventory negative control");
-    let reason = String::from_utf8_lossy(&control.stderr);
-    assert!(
-        !control.status.success() && reason.contains(&format!("{other} map inventory differs")),
-        "the {other} freeze must reject the {variant} object BY COMPARING IT: any other \
-         non-zero exit (an unknown variant, a missing file) would satisfy a bare status \
-         check while nothing was compared. stderr was: {reason}"
-    );
+    // The count line alone would still print if `--inventory` stopped validating.
+    // Both the metadata shape and the capacity profile must reject this object.
+    for other in [other_metadata, other_capacity] {
+        let control = Command::new("python3")
+            .args([
+                "-I",
+                "scripts/check-bpf-map-defs.py",
+                "--inventory",
+                other,
+                object.to_str().unwrap(),
+            ])
+            .output()
+            .expect("run the inventory negative control");
+        let reason = String::from_utf8_lossy(&control.stderr);
+        assert!(
+            !control.status.success() && reason.contains(&format!("{other} map inventory differs")),
+            "the {other} freeze must reject the {variant} object BY COMPARING IT: any other \
+             non-zero exit (an unknown variant, a missing file) would satisfy a bare status \
+             check while nothing was compared. stderr was: {reason}"
+        );
+    }
 }
 
 #[test]
@@ -4578,6 +4584,29 @@ fn descriptor_cookie_and_consumers_source_guard_rejects_contract_regressions() {
     let owner = read("crates/ebpf/native/task_owner.c");
 
     assert_static_descriptor_cookie_contract(&attach, &ebpf, &owner).unwrap();
+    let remove_start = owner
+        .find("p11_owner_start_remove(const struct owner_start_key *key, u32 required)")
+        .expect("native START remover must exist");
+    let slot_bound = "key->slot >= P11SCOPE_OWNER_SLOT_BOUND || key->pad";
+    for (replacement, reason) in [
+        ("key->pad", "omitted slot bound"),
+        (
+            "key->slot >= P11SCOPE_OWNER_SLOT_BOUND && key->pad",
+            "bypassed slot bound",
+        ),
+    ] {
+        let changed_remove = owner[remove_start..].replacen(slot_bound, replacement, 1);
+        assert_ne!(
+            changed_remove,
+            &owner[remove_start..],
+            "{reason} mutation must change the remover"
+        );
+        let changed_owner = format!("{}{}", &owner[..remove_start], changed_remove);
+        assert!(
+            assert_static_descriptor_cookie_contract(&attach, &ebpf, &changed_owner).is_err(),
+            "native START remover must reject {reason}"
+        );
+    }
     let skipped_start_retirement = owner.replacen(
         "long rc = remove_start(ctl, owner, key);",
         "long rc = 0;",
@@ -10091,6 +10120,19 @@ fn license_tracked_files() -> Vec<String> {
         .collect()
 }
 
+fn is_upstream_provenance_filename(path: &str, text: &str, offset: usize, marker: &str) -> bool {
+    if !matches!(
+        path,
+        "scripts/offline-dependencies.py" | "tests/python/test_offline_dependencies.py"
+    ) || (marker != LICENSE_LEGACY_MARKERS[0] && marker != LICENSE_LEGACY_MARKERS[1])
+    {
+        return false;
+    }
+    let before = &text[..offset];
+    let after = &text[offset + marker.len()..];
+    after.starts_with('"') && (before.ends_with('"') || before.ends_with("\"provenance/shared/"))
+}
+
 fn license_legal_surface_errors(root: &std::path::Path, tracked: &[String]) -> Vec<String> {
     let mut errors = Vec::new();
     let is_tree = root.as_os_str() == ".";
@@ -10149,10 +10191,11 @@ fn license_legal_surface_errors(root: &std::path::Path, tracked: &[String]) -> V
         match fs::read(&full) {
             Ok(content) => {
                 let text = String::from_utf8_lossy(&content);
-                if LICENSE_LEGACY_MARKERS
-                    .iter()
-                    .any(|marker| text.contains(marker))
-                {
+                if LICENSE_LEGACY_MARKERS.iter().any(|marker| {
+                    text.match_indices(marker).any(|(offset, _)| {
+                        !is_upstream_provenance_filename(path, &text, offset, marker)
+                    })
+                }) {
                     errors.push(format!("{path} names a pre-relicense text"));
                 }
             }
@@ -10432,5 +10475,62 @@ fn license_legal_surface_checker_rejects_bad_fixtures() {
             errors.iter().any(|line| line.contains(want)),
             "missing error {want:?}: {errors:?}"
         );
+    }
+}
+
+#[test]
+fn license_legal_surface_accepts_only_quoted_upstream_provenance_names() {
+    let root = tempfile::TempDir::new().expect("tempdir");
+    license_write_fixture(root.path(), "LICENSE", b"Version 3, 29 June 2007\n");
+    license_write_fixture(
+        root.path(),
+        "LICENSES/GPL-2.0-only.txt",
+        b"Version 2, June 1991\n",
+    );
+    for (manifest, license) in LICENSE_MANIFESTS {
+        license_write_fixture(
+            root.path(),
+            manifest,
+            format!("[package]\nlicense = \"{license}\"\n").as_bytes(),
+        );
+    }
+    let tool = "scripts/offline-dependencies.py";
+    let test = "tests/python/test_offline_dependencies.py";
+    let other = "scripts/other.py";
+    let tracked = vec![tool.to_string(), test.to_string(), other.to_string()];
+    let apache = LICENSE_LEGACY_MARKERS[1];
+    let mit = LICENSE_LEGACY_MARKERS[0];
+    license_write_fixture(
+        root.path(),
+        tool,
+        format!("SHARED_LICENSES = (\"{apache}\", \"{mit}\")\n").as_bytes(),
+    );
+    license_write_fixture(
+        root.path(),
+        test,
+        format!("p / \"provenance/shared/{apache}\"\np / \"{mit}\"\n").as_bytes(),
+    );
+    license_write_fixture(root.path(), other, b"# no legacy text\n");
+    assert!(
+        license_legal_surface_errors(root.path(), &tracked).is_empty(),
+        "quoted upstream provenance filenames must be accepted in the two exact tools"
+    );
+
+    for (path, content) in [
+        (tool, format!("# this project uses {mit}\n")),
+        (
+            test,
+            format!("# this project uses {}\n", LICENSE_LEGACY_MARKERS[2]),
+        ),
+        (other, format!("UPSTREAM = \"{apache}\"\n")),
+    ] {
+        license_write_fixture(root.path(), path, content.as_bytes());
+        assert!(
+            license_legal_surface_errors(root.path(), &tracked)
+                .iter()
+                .any(|error| error == &format!("{path} names a pre-relicense text")),
+            "{path} must not gain a general legacy-license exemption"
+        );
+        license_write_fixture(root.path(), path, b"# no legacy text\n");
     }
 }

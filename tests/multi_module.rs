@@ -261,19 +261,31 @@ fn a_target_three_modules_share_is_one_ambiguity_not_three() {
 
 #[test]
 fn capacity_overflow_skips_whole_modules_and_says_which() {
-    // 512 slots available; three modules of 200 unique targets each.
+    let capacity = p11scope_ebpf_common::MAX_SLOTS as usize;
+    let per_module = capacity / 3 + 1;
+    // Two complete modules fit with spare capacity; the third does not.
     let big = |inode: u64| {
-        let entries: Vec<(&'static str, u64, u64)> = (0..200u64)
+        let entries: Vec<(&'static str, u64, u64)> = (0..per_module as u64)
             .map(|i| ("C_Sign", inode, 0x1000 + i * 0x10))
             .collect();
         module(inode, "/opt/big.so", &entries)
     };
     let plan = build_from_modules(&[big(1), big(2), big(3)]);
-    assert!(plan.slots.len() <= 512, "never exceed MAX_SLOTS");
+    assert_eq!(plan.slots.len(), 2 * per_module, "no partial third module");
+    assert!(plan.slots.len() < capacity, "spare capacity stays unused");
     assert_eq!(plan.modules.len(), 2, "two modules fit");
     assert_eq!(plan.modules_skipped.len(), 1);
     assert!(
-        plan.modules_skipped[0].reason.contains("512"),
+        plan.modules_skipped[0]
+            .reason
+            .contains(&format!("module needs {per_module} more")),
+        "the refused module's whole demand must be named: {:?}",
+        plan.modules_skipped[0]
+    );
+    assert!(
+        plan.modules_skipped[0]
+            .reason
+            .contains(&format!("{capacity} attach slots")),
         "the ceiling must be named: {:?}",
         plan.modules_skipped[0]
     );
@@ -281,7 +293,9 @@ fn capacity_overflow_skips_whole_modules_and_says_which() {
 
 #[test]
 fn an_oversized_module_does_not_refuse_a_later_module_that_fits() {
-    let oversized_entries: Vec<(&'static str, u64, u64)> = (0..513u64)
+    let capacity = p11scope_ebpf_common::MAX_SLOTS;
+    let oversized = u64::from(capacity) + 1;
+    let oversized_entries: Vec<(&'static str, u64, u64)> = (0..oversized)
         .map(|i| ("C_Sign", 1, 0x1000 + i * 0x10))
         .collect();
     let plan = build_from_modules(&[
@@ -305,7 +319,7 @@ fn an_oversized_module_does_not_refuse_a_later_module_that_fits() {
     );
     assert_eq!(plan.modules.len(), 1);
     assert_eq!(plan.modules[0].path, "/opt/small.so");
-    assert!(plan.slots.len() <= p11scope_ebpf_common::MAX_SLOTS as usize);
+    assert!(plan.slots.len() <= capacity as usize);
     assert_eq!(
         plan.modules_skipped.len(),
         1,
@@ -313,9 +327,15 @@ fn an_oversized_module_does_not_refuse_a_later_module_that_fits() {
     );
     assert_eq!(plan.modules_skipped[0].subject, "/opt/oversized.so");
     let reason = &plan.modules_skipped[0].reason;
-    assert!(reason.contains("module needs 513 more"), "{reason}");
+    assert!(
+        reason.contains(&format!("module needs {oversized} more")),
+        "{reason}"
+    );
     assert!(reason.contains("0 are in use"), "{reason}");
-    assert!(reason.contains("512 attach slots"), "{reason}");
+    assert!(
+        reason.contains(&format!("{capacity} attach slots")),
+        "{reason}"
+    );
 }
 
 // Session-scoped semantic state is keyed by the module that issued the handle:

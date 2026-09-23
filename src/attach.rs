@@ -1968,6 +1968,17 @@ fn is_fd_exhaustion(error: &anyhow::Error) -> bool {
     })
 }
 
+fn static_attach_error(
+    program: &str,
+    slot: &Slot,
+    error: aya::programs::ProgramError,
+) -> anyhow::Error {
+    anyhow::Error::new(error).context(format!(
+        "{program} at {}+{:#x}",
+        slot.object_path, slot.file_offset
+    ))
+}
+
 fn attach_targets_with(
     slots: &[Slot],
     policy: CapturePolicy,
@@ -1988,17 +1999,18 @@ fn attach_targets_with(
     let mut return_attached = BTreeSet::new();
     // EMFILE ends the run with one summary: links are retained, so no later
     // slot could succeed once the table is full.
-    let exhausted = |slot: &Slot, successful: &BTreeSet<(u32, ProbeSide)>| {
-        (
-            slot.index,
-            format!(
-                "fd table exhausted attaching slot {} ({} links attached); \
-                 raise RLIMIT_NOFILE (ulimit -n) and retry",
+    let exhausted =
+        |slot: &Slot, successful: &BTreeSet<(u32, ProbeSide)>, error: &anyhow::Error| {
+            (
                 slot.index,
-                successful.len()
-            ),
-        )
-    };
+                format!(
+                    "fd table exhausted attaching slot {} ({} links attached); \
+                 raise RLIMIT_NOFILE (ulimit -n) and retry: {error:#}",
+                    slot.index,
+                    successful.len()
+                ),
+            )
+        };
     for (slot, _) in &targets {
         match attach("p11_return", slot, slot_attach_point(slot)) {
             Ok(()) => {
@@ -2010,7 +2022,7 @@ fn attach_targets_with(
             }
             Err(error) => {
                 if is_fd_exhaustion(&error) {
-                    failures.push(exhausted(slot, &successful));
+                    failures.push(exhausted(slot, &successful, &error));
                     return Ok(AttachOutcome {
                         successful,
                         failures,
@@ -2051,7 +2063,7 @@ fn attach_targets_with(
                 }
                 Err(error) => {
                     if is_fd_exhaustion(&error) {
-                        failures.push(exhausted(slot, &successful));
+                        failures.push(exhausted(slot, &successful, &error));
                         return Ok(AttachOutcome {
                             successful,
                             failures,
@@ -3071,12 +3083,7 @@ impl Session {
                             });
                             Ok(())
                         }
-                        Err(error) => Err(anyhow!(
-                            "{program} at {}+{:#x}: {}",
-                            slot.object_path,
-                            slot.file_offset,
-                            error_chain(&error)
-                        )),
+                        Err(error) => Err(static_attach_error(program, slot, error)),
                     }
                 },
                 |_| monotonic_ns(),
@@ -6136,6 +6143,194 @@ mod tests {
             outcome.failures[0].1.contains("ulimit -n"),
             "summary must name the remedy: {}",
             outcome.failures[0].1
+        );
+    }
+
+    fn aya_attach_errno(errno: i32) -> aya::programs::ProgramError {
+        aya::programs::ProgramError::SyscallError(aya::sys::SyscallError {
+            call: "perf_event_open",
+            io_error: io::Error::from_raw_os_error(errno),
+        })
+    }
+
+    #[test]
+    fn static_attach_context_preserves_aya_errno() {
+        let error =
+            static_attach_error("p11_return", &test_slot(2), aya_attach_errno(libc::EMFILE));
+        assert!(
+            is_fd_exhaustion(&error),
+            "Aya's typed EMFILE must survive: {error:#}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("p11_return at /proc/self/fd/42+0x20")
+        );
+        assert!(error.chain().any(|cause| {
+            cause
+                .downcast_ref::<aya::programs::ProgramError>()
+                .is_some()
+        }));
+    }
+
+    #[test]
+    fn typed_aya_fd_exhaustion_stops_return_and_entry_passes() {
+        for (failed_program, failed_slot) in [("p11_return", 2), ("p11_entry", 1)] {
+            let slots = [test_slot(0), test_slot(1), test_slot(2), test_slot(3)];
+            let mut attempted = Vec::new();
+            let mut completions = Vec::new();
+            let outcome = attach_targets_with(
+                &slots,
+                CapturePolicy::Allowlisted,
+                false,
+                |_| Ok(ElfAbi::Lp64),
+                |program, slot, _| {
+                    attempted.push((program, slot.index));
+                    if program == failed_program && slot.index == failed_slot {
+                        return Err(static_attach_error(
+                            program,
+                            slot,
+                            aya_attach_errno(libc::EMFILE),
+                        ));
+                    }
+                    Ok(())
+                },
+                |slot| {
+                    completions.push(slot.index);
+                    Some(100 + u64::from(slot.index))
+                },
+            )
+            .unwrap();
+
+            assert!(
+                outcome.exhausted,
+                "{failed_program} must stop after typed Aya EMFILE"
+            );
+            assert_eq!(outcome.failures.len(), 1);
+            assert_eq!(outcome.failures[0].0, failed_slot);
+            assert!(outcome.failures[0].1.contains("fd table exhausted"));
+            assert!(
+                outcome.failures[0].1.contains("perf_event_open"),
+                "original cause lost: {}",
+                outcome.failures[0].1
+            );
+            assert!(outcome.failures[0].1.contains("/proc/self/fd/42"));
+            assert!(
+                outcome.failures[0].1.contains("os error 24"),
+                "original errno lost: {}",
+                outcome.failures[0].1
+            );
+            if failed_program == "p11_return" {
+                assert_eq!(
+                    attempted,
+                    [("p11_return", 0), ("p11_return", 1), ("p11_return", 2)]
+                );
+                assert_eq!(
+                    outcome.successful,
+                    [(0, ProbeSide::Return), (1, ProbeSide::Return)]
+                        .into_iter()
+                        .collect()
+                );
+                assert!(outcome.completed.is_empty());
+                assert!(completions.is_empty());
+            } else {
+                assert_eq!(
+                    attempted,
+                    [
+                        ("p11_return", 0),
+                        ("p11_return", 1),
+                        ("p11_return", 2),
+                        ("p11_return", 3),
+                        ("p11_entry", 0),
+                        ("p11_entry", 1)
+                    ]
+                );
+                assert_eq!(
+                    outcome.successful,
+                    [
+                        (0, ProbeSide::Return),
+                        (1, ProbeSide::Return),
+                        (2, ProbeSide::Return),
+                        (3, ProbeSide::Return),
+                        (0, ProbeSide::Entry)
+                    ]
+                    .into_iter()
+                    .collect()
+                );
+                assert_eq!(outcome.completed, [(0, Some(100))]);
+                assert_eq!(completions, [0]);
+            }
+        }
+    }
+
+    #[test]
+    fn emfile_text_without_typed_errno_continues_per_slot() {
+        let mut attempted = Vec::new();
+        let outcome = attach_targets_with(
+            &[test_slot(0), test_slot(1)],
+            CapturePolicy::Allowlisted,
+            false,
+            |_| Ok(ElfAbi::Lp64),
+            |program, slot, _| {
+                attempted.push((program, slot.index));
+                if program == "p11_return" && slot.index == 0 {
+                    bail!("diagnostic mentions EMFILE, but has no errno cause");
+                }
+                Ok(())
+            },
+            |_| Some(10),
+        )
+        .unwrap();
+        assert!(!outcome.exhausted);
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(
+            outcome.successful,
+            [(1, ProbeSide::Return), (1, ProbeSide::Entry)]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(outcome.completed, [(1, Some(10))]);
+        assert_eq!(
+            attempted,
+            [("p11_return", 0), ("p11_return", 1), ("p11_entry", 1)]
+        );
+    }
+
+    #[test]
+    fn typed_aya_einval_continues_per_slot() {
+        let mut attempted = Vec::new();
+        let outcome = attach_targets_with(
+            &[test_slot(0), test_slot(1)],
+            CapturePolicy::Allowlisted,
+            false,
+            |_| Ok(ElfAbi::Lp64),
+            |program, slot, _| {
+                attempted.push((program, slot.index));
+                if program == "p11_return" && slot.index == 0 {
+                    return Err(static_attach_error(
+                        program,
+                        slot,
+                        aya_attach_errno(libc::EINVAL),
+                    ));
+                }
+                Ok(())
+            },
+            |_| Some(10),
+        )
+        .unwrap();
+        assert!(!outcome.exhausted);
+        assert_eq!(outcome.failures.len(), 1);
+        assert!(outcome.failures[0].1.contains("perf_event_open"));
+        assert_eq!(
+            outcome.successful,
+            [(1, ProbeSide::Return), (1, ProbeSide::Entry)]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(outcome.completed, [(1, Some(10))]);
+        assert_eq!(
+            attempted,
+            [("p11_return", 0), ("p11_return", 1), ("p11_entry", 1)]
         );
     }
 

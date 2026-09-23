@@ -8790,6 +8790,9 @@ impl Engine {
                 .extend(target_modules.iter().cloned());
         }
         let may_add = *additions_allowed;
+        // Whether the attach mutation for `delta.new` ran. A precheck that
+        // finds a candidate generation already gone skips it (U-07).
+        let mut new_targets_attached = may_add;
         if !may_add {
             block_unperformed_static(
                 &mut candidate.plan,
@@ -8816,6 +8819,7 @@ impl Engine {
                 GenerationMutation::PostcheckFailed(result) => (Some(result), true),
             };
             generation_lost |= attach_stale;
+            new_targets_attached = attach.is_some();
             if let Some(attach) = attach {
                 match attach {
                     Ok((failed, completed)) => {
@@ -8949,7 +8953,7 @@ impl Engine {
             candidate,
             extra_views,
             target_modules,
-            may_add,
+            new_targets_attached,
             additions_allowed,
             &mut outcome,
         );
@@ -8981,13 +8985,21 @@ impl Engine {
     /// downgrades the disposition and cleans up, it does not unwind.
     ///
     /// An inventory newcomer (`extra_views`) is published whole or not at all
-    /// (U-07). Its links attach only in this apply and only while additions
-    /// ran, and only an Accepted candidate retains its view. A candidate that
-    /// lost a generation, or ran without additions, would otherwise publish
-    /// the newcomer without links or commit pins and modules naming a view
-    /// that nothing retains. Instead it commits none of the newcomer's
-    /// sources, detaches any link it attached, and reports it in
-    /// `unpublished_views` so the caller requests it again.
+    /// (U-07). Its links attach only in this apply and only when the attach
+    /// mutation ran (`new_targets_attached`), and only an Accepted candidate
+    /// retains its view. A candidate that lost a generation, or never ran
+    /// that mutation, would otherwise publish the newcomer without links or
+    /// commit pins and modules naming a view that nothing retains. Instead
+    /// it commits none of the newcomer's sources, detaches any link it
+    /// attached, and reports it in `unpublished_views` so the caller
+    /// requests it again.
+    ///
+    /// Any other new target the mutation never attached is left inactive,
+    /// never published as a live link: an active slot is keyed, so no later
+    /// candidate would re-add it. That runs after the lost and unpublished
+    /// sources are dropped, so a cell this candidate allocated for them keeps
+    /// no owner, and before the selection checks, so no table counts it as
+    /// attached.
     #[allow(clippy::too_many_arguments)]
     fn finalize_candidate(
         &mut self,
@@ -8995,14 +9007,14 @@ impl Engine {
         mut candidate: LiveCandidate,
         extra_views: &[&ProcessView],
         target_modules: BTreeSet<PinnedTimingKey>,
-        additions_ran: bool,
+        new_targets_attached: bool,
         additions_allowed: &mut bool,
         outcome: &mut ApplyOutcome,
     ) {
         let selection_pending = candidate.selection_admission.take();
         outcome.stale_views = stale_process_views(&self.views, extra_views, &candidate.views);
         let retired = !outcome.stale_views.is_empty();
-        if retired || !additions_ran {
+        if retired || !new_targets_attached {
             outcome.unpublished_views = extra_views
                 .iter()
                 .map(|view| view.id())
@@ -9034,6 +9046,28 @@ impl Engine {
                 "live inventory transaction",
                 "additions were blocked; newly observed process generations were left unpublished for a later tick",
             );
+        }
+        if !new_targets_attached {
+            let owners = candidate_timing_owners(&candidate);
+            let unattached: Vec<_> = candidate
+                .delta
+                .new
+                .iter()
+                .filter(|slot| candidate.plan.is_active(slot.index))
+                .cloned()
+                .collect();
+            for slot in &unattached {
+                outcome
+                    .static_failures
+                    .extend(slot_timing_keys(slot, &owners));
+                candidate.plan.deactivate(slot.index);
+            }
+            if !unattached.is_empty() {
+                self.mark_partial(
+                    "live discovery attach",
+                    "a process generation changed before new exact targets were attached; they were deactivated for a later attempt",
+                );
+            }
         }
         if let Some(pending) = selection_pending {
             let target_keys: BTreeSet<_> = pending
@@ -11881,6 +11915,20 @@ impl Engine {
         bail!(errors.join("; "))
     }
 
+    /// Whether the ownership gate in `arm_loader_or_partial` keeps this view
+    /// unarmed: in a multi-process scope, a view that owns no provider module
+    /// and no pin claim stays exploratory.
+    fn loader_arming_gated(&self, view_id: ProcessViewId) -> bool {
+        self.admits_generations()
+            && !self
+                .modules
+                .iter()
+                .any(|module| module.scanned.view == view_id)
+            && self.pinned.view_claims(view_id).is_none_or(|claims| {
+                claims.tables.is_empty() && claims.targets.is_empty() && claims.pins.is_empty()
+            })
+    }
+
     fn arm_loader_or_partial(
         &mut self,
         position: usize,
@@ -11900,15 +11948,7 @@ impl Engine {
         // stated, not a per-capture loss — and unrecorded, so gated views
         // never inflate the `unavailable` aggregate.
         let view_id = self.views[position].id();
-        if self.admits_generations()
-            && !self
-                .modules
-                .iter()
-                .any(|module| module.scanned.view == view_id)
-            && self.pinned.view_claims(view_id).is_none_or(|claims| {
-                claims.tables.is_empty() && claims.targets.is_empty() && claims.pins.is_empty()
-            })
-        {
+        if self.loader_arming_gated(view_id) {
             return Ok(false);
         }
         self.loader_arms = self.loader_arms.saturating_add(1);
@@ -14442,6 +14482,29 @@ impl Engine {
             }
             Err(error) => Some(error),
         };
+        // A closed tick skips arming: the whole phase when the closure came
+        // after the apply, and every view after the one that raised it inside
+        // the phase. A newly admitted newcomer has no refresh request that
+        // the retain above could keep, so without one its loader would never
+        // be armed and its dynamic exports never attached (U-07). Request
+        // each owned newcomer the closed tick left unarmed; the next open
+        // tick rescans and arms it.
+        if !*additions_allowed {
+            let unarmed: Vec<_> = self
+                .views
+                .iter()
+                .filter(|view| {
+                    new_view_ids.contains(&view.id())
+                        && view.still_the_same()
+                        && self.loader_registry.ids_for_view(view.id()).is_empty()
+                        && !self.loader_arming_gated(view.id())
+                })
+                .map(ProcessView::pid)
+                .collect();
+            for pid in unarmed {
+                self.request_refresh(pid);
+            }
+        }
         let cleanup = self.process_discovery_records(
             session,
             records,
@@ -15117,6 +15180,11 @@ pub(crate) mod session_fixture {
         /// killed and reaped inside that call, i.e. a generation lost after
         /// the candidate was built but before its admission reads the views.
         preflight_losses: RefCell<VecDeque<Option<u32>>>,
+        /// One entry per upcoming `detach_slots` call: `Some(pid)` is killed
+        /// and reaped inside that call, i.e. a generation lost during the
+        /// kernel's serialized link teardown, after the candidate's admission
+        /// and before the next generation check.
+        detach_losses: VecDeque<Option<u32>>,
         pub(crate) preflight_targets: RefCell<Vec<Vec<(u32, PinnedObjectId, u64)>>>,
     }
 
@@ -15196,6 +15264,15 @@ pub(crate) mod session_fixture {
         /// fails that call. Later calls succeed.
         pub(crate) fn fail_slot_detaches(&mut self, script: impl IntoIterator<Item = bool>) {
             self.detach_slot_script = script.into_iter().collect();
+        }
+
+        /// Schedules generation losses inside the next `detach_slots` calls:
+        /// `Some(pid)` kills and reaps `pid` in that call.
+        pub(crate) fn lose_generations_at_detach(
+            &mut self,
+            script: impl IntoIterator<Item = Option<u32>>,
+        ) {
+            self.detach_losses = script.into_iter().collect();
         }
 
         /// Schedules one rebuild report per upcoming `detach_slots` call.
@@ -15320,6 +15397,9 @@ pub(crate) mod session_fixture {
             self.detached_slots.push(slots.len());
             self.detached_slot_indices
                 .push(slots.iter().map(|slot| slot.index).collect());
+            if let Some(Some(pid)) = self.detach_losses.pop_front() {
+                kill_and_reap(pid);
+            }
             if self.detach_slot_script.pop_front().unwrap_or(false) {
                 self.detach_failures
                     .push("scripted one-shot slot detach failed".into());

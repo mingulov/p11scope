@@ -15656,6 +15656,398 @@ fn a_generation_lost_during_a_newcomers_attach_leaves_no_orphaned_publication() 
     );
 }
 
+fn u07_partial(subject: &str, reason: &str) -> Skipped {
+    Skipped {
+        subject: subject.into(),
+        reason: reason.into(),
+    }
+}
+
+/// U-07 fix round 1 (Important 1). A retained member's refresh finds a
+/// provider it dlopened after admission, so the tick's candidate allocates
+/// new slots for a view that stays current. A newcomer in the same
+/// candidate ends during the serialized detach, before the attach
+/// precheck, so the precheck fails and `attach_targets` never runs. Those
+/// new slots used to be committed active with no link. They stayed keyed,
+/// so no later candidate re-added them, and every rescan saw them as
+/// attached. They must be left inactive with an explicit failure, and the
+/// member's surviving refresh request must re-add and attach them on the
+/// next tick.
+#[test]
+fn a_generation_lost_before_attach_leaves_a_refreshed_views_new_targets_retryable() {
+    let dir = tempfile::tempdir().expect("a fixture directory");
+    let provider = system_scope_build_fixture(dir.path(), "u07-refreshed");
+    let mut member = LazyLoader::spawn(dir.path(), &provider);
+    let (mut engine, scope) = u07_engine(&[member.pid()], std::slice::from_ref(&provider));
+    let mut session = ScriptedSession::default();
+    u07_tick(&mut engine, &mut session, &mut true);
+    let view = engine
+        .views
+        .iter()
+        .find(|view| view.pid() == member.pid())
+        .map(ProcessView::id)
+        .expect("tick 1 admits the module-free member");
+    assert!(engine.modules.is_empty(), "tick 1 finds no provider");
+
+    // The member dlopens its provider; the request models the refresh event.
+    member.send(b'L');
+    member.wait_for(b"P11SCOPE_LAZY loaded\n");
+    engine.request_refresh(member.pid());
+    // Killed and reaped inside the candidate's detach, before its attach
+    // precheck; the test never waits on it.
+    let lost = spawn_execed_sleep().id();
+    u07_name_members(scope.path(), &[member.pid(), lost]);
+    session.lose_generations_at_detach([Some(lost)]);
+    let attach_calls = session.attached_slots.len();
+    u07_tick(&mut engine, &mut session, &mut true);
+
+    assert!(
+        engine.views.iter().any(|retained| retained.id() == view),
+        "the refreshed member stays retained"
+    );
+    let (active, inactive) = u07_provider_slots(&engine, "u07-refreshed.so");
+    assert!(
+        active.is_empty() && !inactive.is_empty(),
+        "new targets that were never attached must not stay active: active {active:?}, inactive {inactive:?}, attach calls {:?}",
+        &session.attached_slots[attach_calls..]
+    );
+    assert_eq!(
+        session.attached_slots.len(),
+        attach_calls,
+        "the failed precheck attached nothing"
+    );
+    assert!(
+        engine.counters.object_skips.contains(&u07_partial(
+            "live discovery attach",
+            "a process generation changed before new exact targets were attached; they were deactivated for a later attempt",
+        )),
+        "the unattached targets are an explicit failure: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine.refresh_requested.contains(&member.pid()),
+        "the member's refresh request survives for the retry"
+    );
+
+    u07_name_members(scope.path(), &[member.pid()]);
+    let attach_calls = session.attached_slots.len();
+    u07_tick(&mut engine, &mut session, &mut true);
+    let (active, _) = u07_provider_slots(&engine, "u07-refreshed.so");
+    assert!(
+        !active.is_empty(),
+        "the next tick re-adds the member's targets"
+    );
+    assert_eq!(
+        session.attached_slots[attach_calls..].iter().sum::<usize>(),
+        active.len(),
+        "the next tick attaches exactly the re-added targets"
+    );
+    assert!(
+        !engine.loader_registry.ids_for_view(view).is_empty(),
+        "the next tick arms the member's loader"
+    );
+    assert!(
+        !engine.refresh_requested.contains(&member.pid()),
+        "the retry consumes the refresh request"
+    );
+}
+
+/// U-07 fix round 1 (Minor 1). A closure raised in the record pass that
+/// follows a successful apply lands after the tick has already retained its
+/// newcomer. The arm phase is then skipped, and the retain there keeps only
+/// requests that already exist; a first-time newcomer has none. Its static
+/// links are attached, but its loader was never armed, so its dynamic
+/// coverage was silently lost for its lifetime. Here a module-free member
+/// whose leader exit is already recorded finishes exiting during the attach,
+/// and the post-apply pass retires it. That replay's preflight is refused,
+/// an unclean replay, so it closes the tick. The newcomer must be requested,
+/// and the next tick must arm it.
+#[test]
+fn a_closure_after_admission_requests_the_newcomer_it_left_unarmed() {
+    let dir = tempfile::tempdir().expect("a fixture directory");
+    let provider = system_scope_build_fixture(dir.path(), "u07-unarmed");
+    let driver = system_scope_build_driver(dir.path());
+    let exiting = spawn_execed_sleep();
+    let exiting_pid = exiting.id();
+    let (mut engine, scope) = u07_engine(&[exiting_pid], std::slice::from_ref(&provider));
+    u07_tick(&mut engine, &mut ScriptedSession::default(), &mut true);
+    let exiting_view = engine
+        .views
+        .iter()
+        .find(|view| view.pid() == exiting_pid)
+        .map(ProcessView::id)
+        .expect("tick 1 admits the module-free member");
+    // Its leader exit is recorded, but its pin does not prove the exit yet,
+    // so each record pass leaves the retirement queued until it does.
+    engine.queue_retirement(
+        exiting_view,
+        RetirementCause::ExpectedRemoval,
+        &mut PendingViewRetirements::new(),
+    );
+
+    let newcomer = system_scope_spawn_loaded(&driver, &provider);
+    u07_name_members(scope.path(), &[exiting_pid, newcomer.pid()]);
+    // The member finishes exiting inside the newcomer's attach; it is not a
+    // candidate view, so the newcomer's apply is accepted. Preflights 1 and 2
+    // are the tick's own; 3 is the post-apply replay that retires the member.
+    let mut session = ScriptedSession::losing_generation_at_attach(exiting_pid);
+    session.refuse_preflights([false, false, true]);
+    let mut additions = true;
+    u07_tick(&mut engine, &mut session, &mut additions);
+    drop(exiting);
+
+    let view = engine
+        .views
+        .iter()
+        .find(|view| view.pid() == newcomer.pid())
+        .map(ProcessView::id)
+        .expect("the newcomer is admitted");
+    let (active, _) = u07_provider_slots(&engine, "u07-unarmed.so");
+    assert!(!active.is_empty(), "the newcomer's slots are active");
+    assert_eq!(
+        session.attached_slots.iter().sum::<usize>(),
+        active.len(),
+        "the newcomer's static links are attached"
+    );
+    assert!(
+        !additions,
+        "the unclean replay after the apply closes the tick"
+    );
+    assert!(
+        engine.loader_registry.ids_for_view(view).is_empty(),
+        "the closed tick skips arming"
+    );
+    assert!(
+        engine.refresh_requested.contains(&newcomer.pid()),
+        "the newcomer the closed tick left unarmed is requested again"
+    );
+
+    u07_name_members(scope.path(), &[newcomer.pid()]);
+    u07_tick(&mut engine, &mut session, &mut true);
+    assert!(
+        !engine.loader_registry.ids_for_view(view).is_empty(),
+        "the next tick arms the newcomer"
+    );
+    assert!(
+        !engine.refresh_requested.contains(&newcomer.pid()),
+        "arming consumes the refresh request"
+    );
+}
+
+/// U-07 fix round 1 (Minor 1). A closure can also land inside the arm phase:
+/// a foreign generation that ends while the first newcomer's loader
+/// candidate is being admitted closes the tick. That skips every newcomer
+/// armed after it, and the first one is not armed either. Each owned
+/// newcomer left unarmed must be requested, and the next tick must arm it.
+#[test]
+fn a_foreign_exit_during_arming_requests_the_newcomer_it_left_unarmed() {
+    let dir = tempfile::tempdir().expect("a fixture directory");
+    let first = system_scope_build_fixture(dir.path(), "u07-arm-first");
+    let second = system_scope_build_fixture(dir.path(), "u07-arm-second");
+    let driver = system_scope_build_driver(dir.path());
+    let mut survivor = system_scope_spawn_loaded(&driver, &first);
+    let mut lost = system_scope_spawn_loaded(&driver, &second);
+    // Newcomers are admitted and armed in pid order: the lower pid survives
+    // and is armed first, and the higher pid is the foreign generation that
+    // ends inside that arm.
+    if lost.pid() < survivor.pid() {
+        std::mem::swap(&mut survivor, &mut lost);
+    }
+    let (mut engine, scope) = u07_engine(
+        &[survivor.pid(), lost.pid()],
+        &[first.clone(), second.clone()],
+    );
+    let mut session = ScriptedSession::default();
+    // Preflights 1 and 2 are the tick's own; 3 is the survivor's loader
+    // candidate, where the other newcomer ends.
+    session.lose_generations_at_preflight([None, None, Some(lost.pid())]);
+    let mut additions = true;
+    u07_tick(&mut engine, &mut session, &mut additions);
+    // The seam killed and reaped it: its guard must not signal the pid again.
+    // SAFETY: signal 0 only probes whether the pid still exists.
+    lost.live = unsafe { libc::kill(lost.pid() as libc::pid_t, 0) } == 0;
+
+    let view = engine
+        .views
+        .iter()
+        .find(|view| view.pid() == survivor.pid())
+        .map(ProcessView::id)
+        .expect("the surviving newcomer is admitted");
+    assert!(!additions, "the foreign exit inside arming closes the tick");
+    assert!(
+        engine.loader_registry.ids_for_view(view).is_empty(),
+        "the closed tick leaves the surviving newcomer unarmed"
+    );
+    assert!(
+        engine.refresh_requested.contains(&survivor.pid()),
+        "the newcomer the closed tick left unarmed is requested again"
+    );
+
+    u07_name_members(scope.path(), &[survivor.pid()]);
+    u07_tick(&mut engine, &mut session, &mut true);
+    assert!(
+        !engine.loader_registry.ids_for_view(view).is_empty(),
+        "the next tick arms the surviving newcomer"
+    );
+    assert!(
+        !engine.refresh_requested.contains(&survivor.pid()),
+        "arming consumes the refresh request"
+    );
+}
+
+/// Replays one queued retirement through `replay_pending_conservative` on
+/// `engine_with_one_accepted_provider`, whose accepted provider stays in the
+/// replay's candidate: the retired view is `retired`, not the provider's.
+fn u07_replay(
+    engine: &mut Engine,
+    session: &mut ScriptedSession,
+    retired: ProcessViewId,
+) -> (ApplyOutcome, bool) {
+    engine.pending_retirements.insert(retired);
+    let mut additions = true;
+    let outcome = engine.replay_pending_conservative(
+        session,
+        &mut additions,
+        &mut PendingViewRetirements::new(),
+    );
+    (outcome, additions)
+}
+
+/// U-07 fix round 1 (Minor 3a). A clean replay leaves the tick open, but a
+/// replay whose preflight refuses it committed nothing and still closes the
+/// tick; its retirement stays queued.
+#[test]
+fn a_refused_conservative_replay_closes_the_tick() {
+    let (mut child, mut engine, _) = engine_with_one_accepted_provider();
+    let retired = ProcessViewId(9);
+    let mut session = ScriptedSession::default();
+    session.refuse_preflights([true]);
+
+    let (outcome, additions) = u07_replay(&mut engine, &mut session, retired);
+
+    assert!(outcome.refused(), "the preflight refused the replay");
+    assert!(!additions, "a refused replay closes the tick");
+    assert_eq!(
+        engine.pending_retirements,
+        [retired].into_iter().collect(),
+        "the refused retirement stays queued"
+    );
+    assert!(
+        session.attached_slots.is_empty(),
+        "the replay attached nothing"
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+/// U-07 fix round 1 (Minor 3a). A replay whose candidate loses a generation
+/// during its detach commits only a conservative retirement, and still
+/// closes the tick.
+#[test]
+fn a_retired_conservative_replay_closes_the_tick() {
+    let (child, mut engine, _) = engine_with_one_accepted_provider();
+    let mut session = ScriptedSession::default();
+    // The accepted provider's process ends inside the replay's detach; the
+    // seam kills and reaps it.
+    session.lose_generations_at_detach([Some(child.id())]);
+
+    let (outcome, additions) = u07_replay(&mut engine, &mut session, ProcessViewId(9));
+
+    assert_eq!(
+        outcome.disposition,
+        ApplyDisposition::ConservativeRetirement,
+        "the lost generation retired the replay's candidate"
+    );
+    assert!(!additions, "a retired replay closes the tick");
+    assert!(
+        engine.counters.object_skips.contains(&u07_partial(
+            "live discovery generation",
+            "a process generation changed after link mutation; its targets were retired before context cleanup",
+        )),
+        "{:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        session.attached_slots.is_empty(),
+        "the replay attached nothing"
+    );
+}
+
+/// U-07 fix round 1 (Minor 3b). A replay whose conservative candidate cannot
+/// be rebuilt closes the tick and keeps its retirement queued.
+#[test]
+fn a_conservative_replay_that_cannot_be_rebuilt_closes_the_tick() {
+    let (mut child, mut engine, _) = engine_with_one_accepted_provider();
+    let retired = ProcessViewId(9);
+    // The capture-lifetime module registry no longer maps the accepted
+    // provider bijectively, so no candidate over it can be rebuilt.
+    engine
+        .capture_facts
+        .module_keys
+        .insert(plan::ModuleId(0), timing_key(0));
+    let mut session = ScriptedSession::default();
+
+    let (outcome, additions) = u07_replay(&mut engine, &mut session, retired);
+
+    assert!(outcome.refused(), "nothing was applied");
+    assert!(!additions, "an unrebuildable replay closes the tick");
+    assert_eq!(
+        engine.pending_retirements,
+        [retired].into_iter().collect(),
+        "the retirement stays queued"
+    );
+    assert!(
+        engine.counters.object_skips.contains(&u07_partial(
+            "live discovery transaction",
+            "a pending conservative candidate could not be rebuilt and remains queued",
+        )),
+        "{:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        session.detached_slots.is_empty() && session.attached_slots.is_empty(),
+        "no link was touched"
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+/// U-07 fix round 1 (Minor 3b). A replay whose conservative candidate cannot
+/// be applied closes the tick and keeps its retirement queued.
+#[test]
+fn a_conservative_replay_that_cannot_be_applied_closes_the_tick() {
+    let (mut child, mut engine, _) = engine_with_one_accepted_provider();
+    let retired = ProcessViewId(9);
+    // The accepted manifest history lost its source ordinals, so the replay's
+    // publication preflight refuses before any link mutation.
+    engine.manifest_ordinals.push(0);
+    let mut session = ScriptedSession::default();
+
+    let (outcome, additions) = u07_replay(&mut engine, &mut session, retired);
+
+    assert!(outcome.refused(), "nothing was applied");
+    assert!(!additions, "an inapplicable replay closes the tick");
+    assert_eq!(
+        engine.pending_retirements,
+        [retired].into_iter().collect(),
+        "the retirement stays queued"
+    );
+    assert!(
+        engine.counters.object_skips.contains(&u07_partial(
+            "live discovery transaction",
+            "a pending conservative candidate could not be applied and remains queued",
+        )),
+        "{:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        session.detached_slots.is_empty() && session.attached_slots.is_empty(),
+        "no link was touched"
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
 #[test]
 fn view_id_ceiling_follows_max_scan_pids() {
     let mut engine = Engine::empty();

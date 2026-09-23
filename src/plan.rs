@@ -4366,6 +4366,219 @@ mod tests {
         assert_eq!(plan.slots, before.slots);
     }
 
+    /// A provider that changed as well as grew: it no longer lists some
+    /// endpoints it had, and its growth does not fit. The dropped endpoints
+    /// retire exactly as before G-03, the ones it still lists stay attached,
+    /// and the growth is omitted: the provider is partially covered.
+    #[test]
+    fn a_changed_provider_whose_growth_is_refused_retires_only_what_it_dropped() {
+        let existing = PinnedObjectId(10);
+        let (mut plan, _) = grown_provider(existing, "/proc/self/fd/10", MAX_SLOTS - 1, 0);
+        let still_listed = MAX_SLOTS - 11;
+        let changed = scanned_with(
+            scanned_key(existing),
+            "/proc/self/fd/10",
+            (0..still_listed)
+                .map(|index| u64::from(index) * 8)
+                .chain([u64::from(MAX_SLOTS) * 8, u64::from(MAX_SLOTS + 1) * 8]),
+        );
+        let allocated = plan.slots.len();
+
+        let rebuilt = plan.rebuild_from_sources(&[changed], &[], &PinnedObjects::empty());
+
+        assert_eq!(rebuilt.slots.len(), still_listed as usize);
+        assert_eq!(rebuilt.modules_skipped.len(), 1);
+        let omission = &rebuilt.modules_skipped[0];
+        assert!(is_growth_omission(&omission.reason), "{omission:?}");
+        assert!(
+            omission.reason.starts_with("admitted module needs 2 more;"),
+            "{omission:?}"
+        );
+        assert!(
+            omission
+                .reason
+                .contains(&format!("kept its {still_listed} attached endpoints")),
+            "{omission:?}"
+        );
+
+        let delta = plan.extend_exact(rebuilt).unwrap();
+
+        assert!(delta.new.is_empty() && delta.replace.is_empty());
+        assert_eq!(
+            delta
+                .retire
+                .iter()
+                .map(|slot| slot.index)
+                .collect::<Vec<_>>(),
+            (still_listed..MAX_SLOTS - 1).collect::<Vec<_>>(),
+            "only the dropped endpoints retire"
+        );
+        assert!((0..still_listed).all(|slot| plan.is_active(slot)));
+        assert_eq!(plan.active_slot_count(), still_listed as usize);
+        assert_eq!(plan.slots.len(), allocated, "nothing is allocated");
+        assert_eq!(plan.modules_skipped.len(), 1);
+    }
+
+    /// A provider whose sources list none of the endpoints it had is handled
+    /// exactly as before G-03: refused whole when its listing does not fit,
+    /// admitted on that listing when it does — its old endpoints retire
+    /// either way. It is never admitted on no endpoint behind a growth record.
+    #[test]
+    fn a_provider_that_lists_none_of_its_endpoints_is_handled_as_before() {
+        let existing = PinnedObjectId(10);
+        let path = "/proc/self/fd/10";
+        let admitted = MAX_SLOTS - 1;
+        let beyond = |count: u32| (admitted..admitted + count).map(|index| u64::from(index) * 8);
+
+        let (mut plan, _) = grown_provider(existing, path, admitted, 0);
+        let rebuilt = plan.rebuild_from_sources(
+            &[scanned_with(scanned_key(existing), path, beyond(2))],
+            &[],
+            &PinnedObjects::empty(),
+        );
+        assert!(
+            rebuilt.modules.is_empty(),
+            "refused whole, never admitted on no endpoint: {:?}",
+            rebuilt.modules_skipped
+        );
+        assert!(rebuilt.slots.is_empty());
+        assert_eq!(
+            rebuilt.modules_skipped,
+            [Skipped {
+                subject: path.into(),
+                reason: format!(
+                    "module needs 2 more; only {MAX_SLOTS} attach slots are available; \
+                     {admitted} are in use — refusing to attach a prefix"
+                ),
+            }]
+        );
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert_eq!(delta.retire.len(), admitted as usize);
+        assert!(delta.new.is_empty());
+        assert_eq!(plan.active_slot_count(), 0);
+
+        let (mut plan, _) = grown_provider(existing, path, admitted, 0);
+        let rebuilt = plan.rebuild_from_sources(
+            &[scanned_with(scanned_key(existing), path, beyond(1))],
+            &[],
+            &PinnedObjects::empty(),
+        );
+        assert!(rebuilt.modules_skipped.is_empty());
+        assert_eq!(rebuilt.slots.len(), 1);
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert_eq!(delta.retire.len(), admitted as usize);
+        assert_eq!(delta.new.len(), 1);
+        assert_eq!(delta.new[0].index, admitted);
+        assert_eq!(plan.active_slot_count(), 1);
+    }
+
+    /// The published-union refusal rather than the strongest table's: the
+    /// admitted provider's strongest table is the one it has attached, and
+    /// its new published table does not fit. The attached table stays and
+    /// the new one is omitted, never spilled.
+    #[test]
+    fn a_published_union_refusal_keeps_the_admitted_table() {
+        use crate::discovery::scan::{ScannedEntry, ScannedTable, order_tables_by_evidence};
+
+        let existing = PinnedObjectId(10);
+        let key = scanned_key(existing);
+        // The provider was admitted from its one published table.
+        let mut admitted = scanned_with(
+            key,
+            "/proc/self/fd/10",
+            (0..MAX_SLOTS - 4).map(|index| u64::from(index) * 8),
+        );
+        admitted.scanned.tables[0].live_return = true;
+        let mut plan = build_from_test_sources(std::slice::from_ref(&admitted), &[]);
+        assert_eq!(plan.slots.len(), MAX_SLOTS as usize - 4);
+        // A published scan table authorizes names, never semantics: its
+        // slots are count-only, like an unlinked table's.
+        assert!(plan.slots.iter().all(|slot| slot.names == ["C_Sign"]
+            && slot.descriptor_index == 0
+            && !slot.semantic_authorized));
+        let mut grown = admitted;
+        grown.scanned.tables.push(ScannedTable {
+            version: (3, 0),
+            walk: "full",
+            entries: (0..8u64)
+                .map(|index| ScannedEntry {
+                    name: "C_Sign",
+                    object: key,
+                    object_path: "/proc/self/fd/10".into(),
+                    file_offset: 0x10000 + index * 8,
+                })
+                .collect(),
+            null_entries: vec![],
+            unpinned: vec![],
+            address: 0x9000,
+            file_offset: Some(0x9000),
+            live_return: true,
+            manifest_supported: false,
+        });
+        grown.entry_objects.push(vec![existing; 8]);
+        // Equal published evidence keeps discovery order: the attached table
+        // stays the strongest, so its demand is zero and only the published
+        // union can refuse.
+        assert_eq!(
+            order_tables_by_evidence(&grown.scanned.tables, &grown.scanned.interfaces, &[], &[]),
+            [0, 1]
+        );
+        let before = plan.clone();
+
+        let rebuilt = plan.rebuild_from_sources(&[grown], &[], &PinnedObjects::empty());
+
+        assert_eq!(rebuilt.slots.len(), MAX_SLOTS as usize - 4);
+        assert_eq!(rebuilt.uncorroborated_candidates, 0);
+        assert_eq!(rebuilt.modules_skipped.len(), 1);
+        let omission = &rebuilt.modules_skipped[0];
+        assert!(
+            omission.reason.starts_with("admitted module needs 8 more;"),
+            "{omission:?}"
+        );
+        assert!(
+            omission
+                .reason
+                .contains(&format!("kept its {} attached endpoints", MAX_SLOTS - 4)),
+            "{omission:?}"
+        );
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert!(delta.new.is_empty() && delta.replace.is_empty() && delta.retire.is_empty());
+        assert_eq!(plan.slots, before.slots);
+    }
+
+    /// One object mapped by two processes: its growth is seen through both
+    /// views, yet it is one module, omitted once, and its kept endpoints are
+    /// counted once.
+    #[test]
+    fn a_growth_seen_through_two_views_is_omitted_once() {
+        let existing = PinnedObjectId(10);
+        let (mut plan, grown) = grown_provider(existing, "/proc/self/fd/10", MAX_SLOTS - 1, 2);
+        let mut other_view = grown.clone();
+        other_view.scanned.view = ProcessViewId(1);
+        let before = plan.clone();
+
+        let rebuilt = plan.rebuild_from_sources(&[grown, other_view], &[], &PinnedObjects::empty());
+
+        assert_eq!(rebuilt.modules.len(), 1);
+        assert_eq!(rebuilt.slots.len(), MAX_SLOTS as usize - 1);
+        assert_eq!(rebuilt.modules_skipped.len(), 1);
+        assert_eq!(rebuilt.refused_modules().count(), 1);
+        let omission = &rebuilt.modules_skipped[0];
+        assert!(
+            omission.reason.starts_with("admitted module needs 2 more;"),
+            "{omission:?}"
+        );
+        assert!(
+            omission
+                .reason
+                .contains(&format!("kept its {} attached endpoints", MAX_SLOTS - 1)),
+            "{omission:?}"
+        );
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert!(delta.new.is_empty() && delta.replace.is_empty() && delta.retire.is_empty());
+        assert_eq!(plan.slots, before.slots);
+    }
+
     /// A manifest's targets are fixed at startup, so a manifest module never
     /// gains targets mid-capture. Its demand can still rise: an endpoint
     /// deactivated by a failed replacement or group reattach needs a fresh

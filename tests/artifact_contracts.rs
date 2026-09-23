@@ -8058,9 +8058,13 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
     let mut evidence = Evidence {
         table_entries: 68,
         slots: 68,
-        // U-14: `verify-attach-e2e.sh`'s real artifacts are exit captures —
-        // the workload runs to completion and exits — so active_slots reads
-        // 0 here, exercised below by `checker.exact_active_to_empty`.
+        // U-14: this fixture models `verify-attach-e2e.sh`'s `observed-scan`
+        // lane (`sources: ["scan"]` below, no manifest) — a scan-only exit
+        // capture, where active_slots reads 0. The same script's manifest-
+        // backed `observed` lane ends 68/68 instead: a manifest-attested
+        // object stays pinned and active after its process view exits, so
+        // 0 is not the reading for every real artifact, only this lane's.
+        // Exercised below by `checker.exact_active_to_empty`.
         active_slots: 0,
         attached_probes: 136,
         attach_failures: vec![],

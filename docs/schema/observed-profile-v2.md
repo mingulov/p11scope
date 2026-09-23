@@ -69,7 +69,7 @@ capture that never accepted one.
 A consumer that needs to know what is live now must observe now; this document
 answers what was observed, not what remains. `evidence.active_slots` is the one
 exception: it is read from the plan's current active set at render time, so it
-does say what remains attached. It reaches 0 for a scan-only `--pid` capture
+does say what remains active in the plan. It reaches 0 for a scan-only `--pid` capture
 once the target has exited (every key an unpinned object loses retires
 together; a manifest-attested object can stay planned and active on its own),
 and shrinks independently on a failed live attach or replacement, or a lost

@@ -455,15 +455,25 @@ provider can end with `"slots":680`.
 `active_slots` is the plan's active set right now, when the report is
 written — it is not capture-lifetime history like `slots` is. While a
 `--pid` target keeps running with everything attached, the two fields read
-the same (`68`/`68`). But an ordinary exit of a scan-only target retires
-every slot its now-unpinned object held, so the captures shown above — real
-runs against a workload that exits — read `"slots":68,"active_slots":0` in
-JSON and `68 slots (0 active)` on the live line by the time they end, not
-`68` twice (the historical output above predates `active_slots` and shows
-only `slots`). `slots - active_slots` is therefore not a churn count: an
-ordinary exit, a failed attach or replacement, and a lost generation all
-reduce it the same way, so the difference cannot say how many restarts
-happened.
+the same (`68`/`68`). An ordinary exit, a failed live attach or replacement,
+and a lost generation all reduce `active_slots` — never `slots` — so each
+only ever grows `slots - active_slots`; that difference is not a churn
+count and cannot say how many restarts happened, since an exit or a failed
+attach grows it exactly as one restart would.
+
+Whether an exit drives `active_slots` to 0 depends on how the target was
+pinned. A scan-only target's object is pinned to the process view that
+mapped it, so its exit retires every slot that object held. A
+`--manifest`-attested object stays pinned independently of any one process
+view — the manifest's own claim on it survives the exit — so `active_slots`
+keeps reading equal to `slots` afterward. The historical captures above are
+exactly that manifest-backed case (`scripts/verify-attach-e2e.sh`'s
+`observed` lane, run with `--manifest … --pid`), so if regenerated today
+they would still read `"slots":68,"active_slots":68` in JSON and `68 slots
+(68 active)` on the live line, not `0` (the historical output itself
+predates `active_slots` and shows only `slots`). The same script's
+`observed-scan` lane (manifest-free, memory scan only) exits the identical
+kind of workload without a manifest and ends `68`/`0` instead.
 
 ### More capture options
 

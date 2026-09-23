@@ -172,7 +172,9 @@ pub struct CaptureFacts {
     /// The plan's active-slot count right now, not capture-lifetime history:
     /// it reaches 0 for a scan-only `--pid` capture once the target has
     /// exited, and shrinks independently on a failed live attach or
-    /// replacement, or a lost process generation. See
+    /// replacement, or a lost process generation. A manifest-attested object
+    /// stays planned and active independently of any one process view, so a
+    /// manifest-backed capture's exit does not drive it to 0. See
     /// `AttachPlan::active_slot_count`.
     pub(crate) active_slots: usize,
     pub(crate) attach_gap_ms: Option<u64>,

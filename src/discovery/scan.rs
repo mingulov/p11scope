@@ -1709,8 +1709,9 @@ pub(crate) struct TableEvidenceScore {
     pub(crate) full_walk: bool,
 }
 
-/// Pure evidence score for the candidate at `index`: interface linkage (via
-/// `ScannedInterface.table`) first, then live-return identity, then manifest
+/// Pure evidence score for the candidate at `index`: standard interface
+/// linkage (via `ScannedInterface.table`, only for the `"exact_standard"`
+/// name class — U-15) first, then live-return identity, then manifest
 /// offset, then walk plausibility. No I/O — every input is already-decoded
 /// scan data or caller-held evidence.
 pub(crate) fn table_evidence_score(
@@ -1722,9 +1723,15 @@ pub(crate) fn table_evidence_score(
 ) -> TableEvidenceScore {
     let table = &tables[index];
     TableEvidenceScore {
-        linked: interfaces
-            .iter()
-            .any(|interface| interface.table == Some(index)),
+        // Only the standard `"PKCS 11"` interface implies the standard
+        // function-list layout: a vendor ("other"), "null" or "unreadable"
+        // interface's table may have a vendor or unknown layout, so its
+        // presence must not authorize this candidate's ordinal slots as
+        // standard PKCS#11 names (U-15). Such a table can still be
+        // authorized by live-return or manifest evidence below.
+        linked: interfaces.iter().any(|interface| {
+            interface.table == Some(index) && interface.name_class == "exact_standard"
+        }),
         // Either the export lowering recorded a live return at decode time, or
         // a caller-held generation-safe address matches this table instance.
         live_return: table.live_return || live_return_addresses.contains(&table.address),
@@ -4661,6 +4668,170 @@ mod tests {
             scores.windows(2).all(|pair| pair[0] >= pair[1]),
             "{scores:?}"
         );
+    }
+
+    /// U-15: only the standard `"PKCS 11"` interface implies the standard
+    /// function-list layout. A vendor (`"other"`), `"null"` or `"unreadable"`
+    /// interface's table has a vendor or unknown layout, so it must not gain
+    /// `linked`, must not report linkage `"interface"`, and must not be
+    /// name-authorized on that basis alone.
+    #[test]
+    fn table_name_authorization_requires_exact_standard_interface_linkage() {
+        let table = ScannedTable {
+            version: (2, 40),
+            walk: "full",
+            entries: Vec::new(),
+            null_entries: Vec::new(),
+            unpinned: Vec::new(),
+            address: 0x9000,
+            file_offset: Some(0x9000),
+            live_return: false,
+            manifest_supported: false,
+        };
+        let tables = [table];
+        for name_class in ["other", "null", "unreadable"] {
+            let interfaces = [ScannedInterface {
+                index: 0,
+                name_class,
+                name_lossy: None,
+                name_private: None,
+                flags: 0,
+                table: Some(0),
+            }];
+            let score = table_evidence_score(0, &tables, &interfaces, &[], &[]);
+            assert!(!score.linked, "{name_class} must not set linked");
+            assert_eq!(
+                table_linkage(&score),
+                "heuristic",
+                "{name_class} interface carries no standard-layout evidence"
+            );
+            assert!(
+                !table_name_authorized(&score),
+                "{name_class}-named interface must not authorize standard names"
+            );
+        }
+
+        let standard = [ScannedInterface {
+            index: 0,
+            name_class: "exact_standard",
+            name_lossy: None,
+            name_private: None,
+            flags: 0,
+            table: Some(0),
+        }];
+        let score = table_evidence_score(0, &tables, &standard, &[], &[]);
+        assert!(score.linked, "exact_standard must set linked");
+        assert_eq!(table_linkage(&score), "interface");
+        assert!(table_name_authorized(&score));
+    }
+
+    /// U-15: a table with a vendor-only interface link is not authorized by
+    /// that link, but stays authorized when live-return or manifest evidence
+    /// also names it — linkage alone never authorizes names, but it never
+    /// takes away authorization another evidence source already gave.
+    #[test]
+    fn vendor_linked_table_stays_authorized_via_live_return_or_manifest_evidence() {
+        let live_returned = ScannedTable {
+            version: (2, 40),
+            walk: "full",
+            entries: Vec::new(),
+            null_entries: Vec::new(),
+            unpinned: Vec::new(),
+            address: 0xa000,
+            file_offset: Some(0xa000),
+            live_return: true,
+            manifest_supported: false,
+        };
+        let manifest_backed = ScannedTable {
+            address: 0xb000,
+            file_offset: Some(0xb000),
+            live_return: false,
+            manifest_supported: true,
+            ..live_returned.clone()
+        };
+        let tables = [live_returned, manifest_backed];
+        let interfaces = [
+            ScannedInterface {
+                index: 0,
+                name_class: "other",
+                name_lossy: None,
+                name_private: Some(b"Vendor Wrapper".to_vec()),
+                flags: 0,
+                table: Some(0),
+            },
+            ScannedInterface {
+                index: 1,
+                name_class: "unreadable",
+                name_lossy: None,
+                name_private: None,
+                flags: 0,
+                table: Some(1),
+            },
+        ];
+
+        let live_score = table_evidence_score(0, &tables, &interfaces, &[], &[]);
+        assert!(!live_score.linked, "the vendor interface must not link");
+        assert!(live_score.live_return);
+        assert_eq!(table_linkage(&live_score), "live_return");
+        assert!(table_name_authorized(&live_score));
+
+        let manifest_score = table_evidence_score(1, &tables, &interfaces, &[], &[]);
+        assert!(
+            !manifest_score.linked,
+            "the unreadable interface must not link"
+        );
+        assert!(manifest_score.manifest);
+        assert_eq!(table_linkage(&manifest_score), "manifest");
+        assert!(table_name_authorized(&manifest_score));
+    }
+
+    /// U-15 consequence: linkage also drives ordering, so a table linked only
+    /// by a non-standard interface no longer jumps the queue on that link —
+    /// it orders by whatever plain evidence remains. With no other evidence
+    /// on either side, a stable sort keeps discovery order, exactly as if
+    /// the vendor interface did not exist.
+    #[test]
+    fn non_standard_interface_link_no_longer_outranks_heuristic_evidence_in_ordering() {
+        let discovered_first = ScannedTable {
+            version: (2, 40),
+            walk: "full",
+            entries: Vec::new(),
+            null_entries: Vec::new(),
+            unpinned: Vec::new(),
+            address: 0xc000,
+            file_offset: Some(0xc000),
+            live_return: false,
+            manifest_supported: false,
+        };
+        let vendor_linked_discovered_second = ScannedTable {
+            address: 0xd000,
+            file_offset: Some(0xd000),
+            ..discovered_first.clone()
+        };
+        let tables = [discovered_first, vendor_linked_discovered_second];
+        let interfaces = [ScannedInterface {
+            index: 0,
+            name_class: "other",
+            name_lossy: None,
+            name_private: Some(b"Vendor Wrapper".to_vec()),
+            flags: 0,
+            table: Some(1),
+        }];
+
+        let order = order_tables_by_evidence(&tables, &interfaces, &[], &[]);
+
+        assert_eq!(
+            order,
+            [0, 1],
+            "a vendor-only interface link no longer wins evidence priority; \
+             equal-evidence tables keep discovery order"
+        );
+        let vendor_linked_score = table_evidence_score(1, &tables, &interfaces, &[], &[]);
+        assert!(
+            !vendor_linked_score.linked,
+            "the vendor interface must not set linked"
+        );
+        assert_eq!(table_linkage(&vendor_linked_score), "heuristic");
     }
 
     #[test]

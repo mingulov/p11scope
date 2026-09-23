@@ -864,10 +864,18 @@ impl OwnedCaller {
         writeln!(self.input, "THREAD_EXIT")?;
         self.input.flush()?;
         ensure!(self.line()? == format!("ABANDONED {id} {tid}"));
-        ensure!(
-            !PathBuf::from(format!("/proc/{}/task/{tid}", self.child.id())).exists(),
-            "abandoned worker TID still exists"
-        );
+        // pthread_join returns at the kernel's clear-child-TID futex wake, which
+        // precedes release_task() unhashing the TID from /proc; wait for that
+        // release within the protocol's line deadline instead of sampling once.
+        let task = PathBuf::from(format!("/proc/{}/task/{tid}", self.child.id()));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while task.try_exists()? {
+            ensure!(
+                Instant::now() < deadline,
+                "abandoned worker TID still exists"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         Ok(())
     }
 

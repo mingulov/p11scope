@@ -95,6 +95,12 @@ durable facts, not the log paths.
   (`usability-t5-iso-recorded.log` and pristine-base
   `usability-t5-base-recorded.log` both red with *different* subtests),
   which exonerates the branch by base-identical behavior.
+- **Recurrence 2026-09-23 (canonical gate at `8cee338`, wide profile):**
+  `test_split_ack_interruption_cleans_up_original_launcher_handle`, adoption
+  `reason=pidfd-open-gone` after `recorded launch deadline expired`, on a
+  host that was also running six unrelated QEMU guests. Isolated re-run of
+  the same `artifact_contracts` binary: PASS (31.7 s). The default-profile
+  run of the same gate passed this test.
 
 ## 5. `run::tests::actual_handoff_helpers_preserve_errno_and_retry_without_renewing_deadlines` (lib; new in Task 2)
 
@@ -106,6 +112,10 @@ durable facts, not the log paths.
   `gates-task2/full-suite.log` (Task 2 run 1 only),
   `gates-task2/isolate-handoff.log` (PASS, 0.01 s),
   `gates-task2/base-handoff.log` (pristine-base PASS).
+- **Recurrence 2026-09-23 (canonical gate at `8cee338`, default profile):**
+  same assertion, now at `src/run.rs:5291`. Three isolated re-runs of the
+  same default lib test binary: PASS (0.01 s each). The wide-profile run of
+  the same gate passed this test.
 
 ## 6. `release_seal_denies_the_caller_path_to_every_reached_command` (artifact_contracts; new in Task 2)
 

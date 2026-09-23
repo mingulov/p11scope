@@ -1436,6 +1436,9 @@ fn merge(
         // attached, and the growth is reported as omitted below. A module
         // with nothing to keep is refused whole, as before.
         let mut refused_growth: Option<BTreeSet<AttachKey>> = None;
+        // The strongest table, when it was the one refused: its endpoints are
+        // then all in the omission record, never also counted as spill.
+        let mut refused_top: Option<TableKey> = None;
         let (fresh, admitted) = 'admission: loop {
             let kept_only = refused_growth.is_some();
             let admissible = |key: &AttachKey| !kept_only || kept.contains(key);
@@ -1549,6 +1552,7 @@ fn merge(
                         .checked_required(allocated_slots, top_fresh.len())
                         .is_err()
                     {
+                        refused_top = Some(*top);
                         break 'refused top_fresh;
                     }
                 }
@@ -1614,9 +1618,13 @@ fn merge(
                             continue;
                         }
                         // A heuristic table with no attachable target costs nothing either
-                        // way: counted as spill, never consuming the cap.
+                        // way: counted as spill, never consuming the cap — unless it is
+                        // the refused strongest table of a growth, whose endpoints the
+                        // omission record already reports.
                         if keys_of.get(key).is_none_or(|keys| keys.is_empty()) {
-                            uncorroborated_candidates += 1;
+                            if refused_top != Some(*key) {
+                                uncorroborated_candidates += 1;
+                            }
                             continue;
                         }
                         if spent || heuristic_admitted >= MAX_TABLES_PER_OBJECT {
@@ -4300,6 +4308,62 @@ mod tests {
         assert!(delta.retire.is_empty());
         assert_eq!(plan.slots, before.slots);
         assert_eq!(plan.active_slot_count(), MAX_SLOTS as usize - 4);
+    }
+
+    /// A refused growth whose strongest table is a new heuristic one holding
+    /// none of the endpoints the provider had: that table's endpoints are all
+    /// in the omission record, so it is not also counted as spill (G-03).
+    #[test]
+    fn a_refused_growths_strongest_heuristic_table_is_counted_once() {
+        use crate::discovery::scan::{ScannedEntry, ScannedTable};
+
+        let existing = PinnedObjectId(10);
+        let (mut plan, mut grown) = grown_provider(existing, "/proc/self/fd/10", MAX_SLOTS - 1, 0);
+        let key = scanned_key(existing);
+        // Equal heuristic evidence keeps discovery order, so the new table,
+        // decoded first, is the strongest one.
+        grown.scanned.tables.insert(
+            0,
+            ScannedTable {
+                version: (2, 40),
+                walk: "full",
+                entries: (0..2u64)
+                    .map(|index| ScannedEntry {
+                        name: "C_Sign",
+                        object: key,
+                        object_path: "/proc/self/fd/10".into(),
+                        file_offset: 0x10000 + index * 8,
+                    })
+                    .collect(),
+                null_entries: vec![],
+                unpinned: vec![],
+                address: 0x6000,
+                file_offset: Some(0x9000),
+                live_return: false,
+                manifest_supported: false,
+            },
+        );
+        grown.entry_objects.insert(0, vec![existing; 2]);
+        let before = plan.clone();
+
+        let rebuilt = plan.rebuild_from_sources(&[grown], &[], &PinnedObjects::empty());
+
+        assert_eq!(rebuilt.slots.len(), MAX_SLOTS as usize - 1);
+        assert_eq!(rebuilt.modules_skipped.len(), 1);
+        assert!(
+            rebuilt.modules_skipped[0]
+                .reason
+                .starts_with("admitted module needs 2 more;"),
+            "{:?}",
+            rebuilt.modules_skipped[0]
+        );
+        assert_eq!(
+            rebuilt.uncorroborated_candidates, 0,
+            "the refused table is reported once, in the omission record"
+        );
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert!(delta.new.is_empty() && delta.replace.is_empty() && delta.retire.is_empty());
+        assert_eq!(plan.slots, before.slots);
     }
 
     /// A manifest's targets are fixed at startup, so a manifest module never

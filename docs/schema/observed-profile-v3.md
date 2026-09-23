@@ -204,8 +204,9 @@ v2 profiles remain historical. Metrics consumers must dispatch live output on
 `p11scope/observed-profile/v2-metrics` documents remain readable as a
 separate compatibility shape. That shape predates — and therefore lacks —
 `task_uprobe_link_losses`, `abi_refusals`, `semantic_history_drops`,
-`scheduling`, and the five residual fields above (`drain_proven`,
-`verdict_detail`, `uretprobe_override`, `handoff_child_pid`, `p11scope_env`).
+`scheduling`, `active_slots` (U-14), and the five residual fields above
+(`drain_proven`, `verdict_detail`, `uretprobe_override`, `handoff_child_pid`,
+`p11scope_env`).
 
 A machine-readable JSON Schema for live v3 documents ships beside this file
 (`observed-profile-v3.schema.json`); it pins the closed evidence key sets

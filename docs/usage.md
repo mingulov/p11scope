@@ -445,16 +445,25 @@ the STATS fields include completed and in-flight calls, while `raw_calls`
 counts every well-formed non-fork event consumed before truncation.
 
 `slots` and `active_slots` in that evidence object (and in the live `profile`
-line's `N slots (M active)`) answer different questions. Endpoint slots are
-append-only for the life of a capture — a slot is never reused — so `slots`
-is every endpoint ever allocated, including ones a provider generation left
-behind by exiting and being replaced; it only ever grows. A service that
-restarts ten times over a 68-function provider can end with `"slots":680`.
-`active_slots` is the endpoint count still attached in the plan when the
-report is written — `68` in that same example, and equal to `slots` whenever
-nothing has churned, as in the single-generation captures above (both fields
-would read 68; the historical output predates `active_slots` and shows only
-`slots`).
+line's `N slots (M active)`) answer different questions. `slots` is every
+endpoint slot the capture has ever allocated: the plan is append-only, a slot
+is never reused, and a target exiting, a failed live attach or replacement,
+or a lost process generation all retire slots without giving them back — so
+`slots` only grows. A service that restarts ten times over a 68-function
+provider can end with `"slots":680`.
+
+`active_slots` is the plan's active set right now, when the report is
+written — it is not capture-lifetime history like `slots` is. While a
+`--pid` target keeps running with everything attached, the two fields read
+the same (`68`/`68`). But an ordinary exit of a scan-only target retires
+every slot its now-unpinned object held, so the captures shown above — real
+runs against a workload that exits — read `"slots":68,"active_slots":0` in
+JSON and `68 slots (0 active)` on the live line by the time they end, not
+`68` twice (the historical output above predates `active_slots` and shows
+only `slots`). `slots - active_slots` is therefore not a churn count: an
+ordinary exit, a failed attach or replacement, and a lost generation all
+reduce it the same way, so the difference cannot say how many restarts
+happened.
 
 ### More capture options
 

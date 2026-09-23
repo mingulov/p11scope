@@ -69,7 +69,11 @@ capture that never accepted one.
 A consumer that needs to know what is live now must observe now; this document
 answers what was observed, not what remains. `evidence.active_slots` is the one
 exception: it is read from the plan's current active set at render time, so it
-does say what remains attached — see `active_slots` below.
+does say what remains attached. It reaches 0 for a scan-only `--pid` capture
+once the target has exited (every key an unpinned object loses retires
+together; a manifest-attested object can stay planned and active on its own),
+and shrinks independently on a failed live attach or replacement, or a lost
+process generation — see `active_slots` below.
 
 ## Semantic-join authority
 
@@ -136,8 +140,8 @@ Discovery and attachment:
 | Field | Meaning |
 | --- | --- |
 | `table_entries` | Function records discovery decoded across every walked surface, with the same exact target occurrence deduplicated across sources. |
-| `slots` | Unique `{object, file_offset}` targets allocated over the whole capture. The plan is append-only — a slot is never reused within a capture — so a target retired by churn (a provider generation exiting and being replaced) still counts here; this number only grows. |
-| `active_slots` | The endpoint count still active in the plan when the report is written: `slots` minus any this capture's churn has already retired. Mirrors the plan's active set, not a count of kernel links. Equal to `slots` whenever nothing has churned. |
+| `slots` | Unique `{object, file_offset}` targets allocated over the whole capture. The plan is append-only — a slot is never reused within a capture — so a retired target (an exit, a failed attach or replacement, a lost generation, or a provider restart) still counts here; this number only grows. |
+| `active_slots` | The plan's active-slot count when the report is written — a current-state fact, not capture-lifetime history like every other field in this table. Mirrors the plan's active set, not a count of kernel links. It is 0 after an ordinary exit of a scan-only `--pid` target (a manifest-attested object can stay planned and active on its own), and shrinks independently on a failed live attach or replacement, or a lost process generation. `slots - active_slots` is not a churn count: it mixes all of those causes and must not be read as "N restarts". |
 | `attached_probes` | Successful probe attachments; two per fully attached slot. |
 | `attach_failures` | Per-slot attachment errors. |
 | `aliased` | Name groups that share one address and therefore one count. |

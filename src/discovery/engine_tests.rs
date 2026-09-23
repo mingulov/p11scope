@@ -3142,9 +3142,22 @@ fn arming_a_static_executable_is_not_armable_not_partial() {
     let pid = child.0.id();
     // Readiness: pre-exec the child is a fork of this dynamic test binary,
     // so only open the view once its exe link is the static busybox image.
+    // The kernel switches that link in begin_new_exec(), before the new
+    // image's segments are mapped, so also wait for its executable mapping.
     let exe = format!("/proc/{pid}/exe");
+    let maps = format!("/proc/{pid}/maps");
     let mut spins = 0;
-    let execed = || std::fs::read_link(&exe).is_ok_and(|target| target == busybox);
+    let execed = || {
+        std::fs::read_link(&exe).is_ok_and(|target| target == busybox)
+            && std::fs::read_to_string(&maps).is_ok_and(|maps| {
+                maps.lines().any(|line| {
+                    line.split_whitespace()
+                        .nth(1)
+                        .is_some_and(|perms| perms.as_bytes().get(2) == Some(&b'x'))
+                        && line.ends_with(busybox.to_string_lossy().as_ref())
+                })
+            })
+    };
     while !execed() {
         std::thread::sleep(std::time::Duration::from_millis(1));
         spins += 1;

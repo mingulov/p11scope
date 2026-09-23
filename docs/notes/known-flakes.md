@@ -77,6 +77,13 @@ durable facts, not the log paths.
   `usability-t5-iso-stopped.log` (63 s); Task 2
   `gates-task2/isolate-stopped-canary.log` (56 s; failed full runs 2
   AND 3).
+- **Recurrence 2026-09-23 (canonical gate at `f0d1801`, wide profile):**
+  `FAIL: test_owned_missing_capture`: `owned_case` expected
+  `phase deadline expired` but the owned readiness phase ended with
+  `CustodyError` plus custody-close `CleanupError`s. Three isolated
+  re-runs of the same wide `artifact_contracts` binary: PASS (42.7 s,
+  43.1 s, 42.7 s). The default-profile run of the same gate passed this
+  test.
 
 ## 4. `native_helper_suite_recorded_launcher_requires_authenticated_generations_and_bounded_cleanup` (artifact_contracts)
 

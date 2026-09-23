@@ -6317,22 +6317,32 @@ mod tests {
         // Callers detach and deactivate exactly the failed indices. After an
         // exhaustion stop, a slot left out of both lists would stay active and
         // link-less, or keep a return that can never pair with an entry.
-        for (failed_program, failed_slot) in [
-            ("p11_return", 0),
-            ("p11_return", 2),
-            ("p11_return", 3),
-            ("p11_entry", 0),
-            ("p11_entry", 1),
-            ("p11_entry", 3),
+        for (object_has_unsafe, failed_program, failed_slot) in [
+            (false, "p11_return", 0),
+            (false, "p11_return", 2),
+            (false, "p11_return", 3),
+            (false, "p11_entry", 0),
+            (false, "p11_entry", 1),
+            (false, "p11_entry", 3),
+            // Unsafe objects select one of several entry programs per slot; any
+            // entry-side exhaustion must still settle every slot.
+            (true, "p11_return", 1),
+            (true, "entry", 0),
+            (true, "entry", 2),
         ] {
             let slots = [test_slot(0), test_slot(1), test_slot(2), test_slot(3)];
             let outcome = attach_targets_with(
                 &slots,
                 CapturePolicy::Allowlisted,
-                false,
+                object_has_unsafe,
                 |_| Ok(ElfAbi::Lp64),
                 |program, slot, _| {
-                    if program == failed_program && slot.index == failed_slot {
+                    let failing = if failed_program == "entry" {
+                        program != "p11_return"
+                    } else {
+                        program == failed_program
+                    };
+                    if failing && slot.index == failed_slot {
                         return Err(static_attach_error(
                             program,
                             slot,
@@ -6345,7 +6355,9 @@ mod tests {
             )
             .unwrap();
 
-            let case = format!("{failed_program} exhausted at slot {failed_slot}");
+            let case = format!(
+                "{failed_program} exhausted at slot {failed_slot} (unsafe object: {object_has_unsafe})"
+            );
             assert!(outcome.exhausted, "{case}");
             assert_eq!(outcome.failures[0].0, failed_slot, "{case}");
             assert!(

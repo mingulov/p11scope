@@ -191,6 +191,9 @@ produced it.
 - `--drain-interval-ms <n>` — the capture-loop tick: 5 to 60000 ms (defaults:
   profile 1000 ms, trace 200 ms). A faster tick drains the ring sooner (less
   loss under bursts, more observer CPU); a slower tick does the opposite.
+  It does not delay a `run --pause` stop. Whatever this interval, the loop
+  checks for a pending stop every few milliseconds (one map read) and
+  services it at once, so the stop's 500 ms deadline does not depend on it.
 
 ```bash
 # Burst-heavy workload: bigger ring, faster drain.

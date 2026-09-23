@@ -14,7 +14,7 @@ use crate::cli::{self, CaptureArgs, Kind, RunArgs, ScopeArg};
 use crate::discovery::attribution;
 use crate::discovery::engine::Engine;
 use crate::discovery::pause::{
-    ArmResult, PauseCoordinator, PauseError, PauseStatus, SessionPauseIo,
+    ArmResult, PauseCoordinator, PauseError, PauseIo, PauseStatus, SessionPauseIo,
 };
 use crate::output::AtomicFile;
 use crate::process::{PidPin, ProcessView, ProcessViewId};
@@ -2807,15 +2807,95 @@ fn initial_tracking_evidence(
     }
 }
 
-/// One tick's discovery step, and the one place the pause policy changes the
-/// capture cadence.
+/// The discovery pass a capture tick runs, when the gate admits one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscoveryPass {
+    /// The frame's full pass, once per drain interval: `drain_discovery_tick`.
+    Frame,
+    /// Between frames, the pause service alone, for a stop the helper has
+    /// already requested: `service_pending_stop` (F-T4-2).
+    PendingStop,
+}
+
+/// The capture tick's discovery gate.
+///
+/// The full pass runs once per frame. 64db33a took discovery, the
+/// aggregate-map reads and the render off the per-tick drain path, where a
+/// discovery sweep stalled event draining. A pause stop cannot wait for that
+/// cadence. The helper's SIGSTOP starts a 500 ms causal deadline, and the
+/// drain interval is 1 s by default and up to 60 s. A stop serviced at the
+/// next frame misses the deadline, so its cycle fails (`auto` goes partial,
+/// `always` aborts), and the child stays stopped until that frame. Between
+/// frames the gate therefore asks `stop_pending`, and only there, and admits
+/// the pause service alone when a stop is pending. With no frame due and no
+/// stop pending, a tick runs no discovery.
+fn discovery_due(
+    since_frame: Duration,
+    drain: Duration,
+    stop_pending: impl FnOnce() -> bool,
+) -> Option<DiscoveryPass> {
+    if since_frame >= drain {
+        Some(DiscoveryPass::Frame)
+    } else if stop_pending() {
+        Some(DiscoveryPass::PendingStop)
+    } else {
+        None
+    }
+}
+
+/// The gate's between-frames question for an owned explicit pause: should
+/// this tick service a pending stop? A pending operator stop wins: the tick
+/// services nothing, the loop's end check ends the capture, and cleanup
+/// resumes a held child and reports the stop it never confirmed. Otherwise
+/// the coordinator answers, at the cost of one authorization read while an
+/// epoch is armed and nothing while it is not.
+fn pause_stop_due(coordinator: &PauseCoordinator, io: &mut impl PauseIo) -> bool {
+    matches!(io.cancelled(), Ok(false)) && coordinator.stop_pending(io)
+}
+
+/// The pause coordinator's share of either discovery pass: arm, then service.
+/// Re-arming is idempotent while the epoch is open and refused once the
+/// coordinator has retired the policy. That refusal returns `Ok(false)`, and
+/// it is exactly when the ordinary cadence takes over again.
+fn service_pause(
+    coordinator: &mut PauseCoordinator,
+    io: &mut impl PauseIo,
+) -> std::result::Result<bool, PauseError> {
+    match coordinator.arm(io)? {
+        ArmResult::Disabled => Ok(false),
+        ArmResult::Armed => coordinator.service(io).map(|()| true),
+    }
+}
+
+/// `pause_stop_due` for the capture loops. `never` and unowned captures
+/// return before any I/O.
+fn owned_stop_pending(
+    engine: &mut Engine,
+    session: &mut Session,
+    owned: Option<&Owned>,
+    interrupted: &SignalState,
+) -> bool {
+    let Some(owned) = owned.filter(|owned| owned.policy != cli::PausePolicy::Never) else {
+        return false;
+    };
+    let Some(child) = owned.child.as_ref() else {
+        return false;
+    };
+    let marker = marker_never_seen();
+    let cancelled = cancelled_by(interrupted);
+    let mut io = SessionPauseIo::new(engine, session, child, &marker, &cancelled);
+    pause_stop_due(&owned.coordinator, &mut io)
+}
+
+/// A frame's discovery pass, and the one place the pause policy changes the
+/// frame's discovery.
 ///
 /// `pause=never` — and any explicit policy that could not (or may no longer)
 /// arm — keeps the existing refresh cadence through `Engine::drain_discovery`.
 /// An ARMED explicit pause instead delegates to the coordinator, whose own
 /// 1 ms bounded loop owns the window; it returns to this loop only after owner
-/// closure, and the caller does not sleep while an owner is open, so an
-/// accepted stop is never slept through.
+/// closure. A stop that lands between frames does not wait for this pass: the
+/// gate (`discovery_due`) hands it to `service_pending_stop` on the next tick.
 ///
 /// Each drain owns its taken map handle for the duration of the call and
 /// returns it before the caller does anything else: there is never a second
@@ -2843,17 +2923,8 @@ fn drain_discovery_tick(
             .as_ref()
             .expect("the owned child is retained until finalization");
         let mut io = SessionPauseIo::new(engine, session, child, &marker, &cancelled);
-        // Re-arming is idempotent while the epoch is open and refused once the
-        // coordinator has retired the policy, which is exactly when the
-        // ordinary cadence takes over again.
-        match owned.coordinator.arm(&mut io) {
-            Ok(ArmResult::Disabled) => Ok(None),
-            Ok(ArmResult::Armed) => owned
-                .coordinator
-                .service(&mut io)
-                .map(|()| Some(io.plan_changed())),
-            Err(error) => Err(error),
-        }
+        service_pause(&mut owned.coordinator, &mut io)
+            .map(|serviced| serviced.then(|| io.plan_changed()))
     };
     match serviced {
         Ok(Some(changed)) => Ok((changed, true)),
@@ -2861,6 +2932,41 @@ fn drain_discovery_tick(
         Err(error) => {
             retire_pause_policy(error)?;
             Ok((engine.drain_discovery(session)?, false))
+        }
+    }
+}
+
+/// Between frames, services the stop the gate found pending (F-T4-2): the
+/// frame pass's own pause entry, `service_pause`, without the frame's
+/// ordinary discovery, so a disabled or retired policy leaves discovery to
+/// the next frame. An error is retired exactly as a frame retires it
+/// (`retire_pause_policy`: `always` or a lifecycle failure ends the capture).
+/// Whatever the call applied is reported as a plan change either way.
+fn service_pending_stop(
+    engine: &mut Engine,
+    session: &mut Session,
+    owned: Option<&mut Owned>,
+    interrupted: &SignalState,
+) -> Result<(bool, bool)> {
+    let Some(owned) = owned else {
+        return Ok((false, false));
+    };
+    let (serviced, plan_changed) = {
+        let marker = marker_never_seen();
+        let cancelled = cancelled_by(interrupted);
+        let child = owned
+            .child
+            .as_ref()
+            .expect("the owned child is retained until finalization");
+        let mut io = SessionPauseIo::new(engine, session, child, &marker, &cancelled);
+        let serviced = service_pause(&mut owned.coordinator, &mut io);
+        (serviced, io.plan_changed())
+    };
+    match serviced {
+        Ok(serviced) => Ok((plan_changed, serviced)),
+        Err(error) => {
+            retire_pause_policy(error)?;
+            Ok((plan_changed, false))
         }
     }
 }
@@ -2909,14 +3015,14 @@ fn capture_end(
     })
 }
 
-/// How long to wait before the next tick. An open pause owner replaces the
-/// ordinary refresh cadence with the coordinator's own bounded cycle, so a
-/// stopped child is serviced in milliseconds instead of waiting out a frame.
 /// Idle readiness timeout: with no backlog and no frame due, the loop
 /// waits on EVENTS readability up to this long instead of idling out
 /// the frame, so a burst landing mid-wait is drained on arrival rather
 /// than after a full sleep (audit F1). The timeout also keeps the
-/// frame, duration and signal cadence bounded when nothing arrives.
+/// frame, duration and signal cadence bounded when nothing arrives, and
+/// with it the pause: every tick asks the gate (`discovery_due`) for a
+/// pending stop, so a stopped child is serviced on the next tick, in
+/// milliseconds, instead of waiting out a frame (F-T4-2).
 /// Margin: one full timeout at the fastest measured unpaced burst
 /// (A2b, 127648/s) admits 256 records, far under the default
 /// 12483-record ring — but that bounds the REQUESTED wait only, never
@@ -3281,19 +3387,31 @@ fn capture_profile(
                 &mut context,
                 &mut consumers,
                 |context: &mut ProfileTickContext<'_, '_>, consumers: &mut CaptureConsumers<'_>| {
-                    if last_frame.elapsed() < drain {
+                    let Some(pass) = discovery_due(last_frame.elapsed(), drain, || {
+                        owned_stop_pending(context.0, context.1, context.2.as_deref(), interrupted)
+                    }) else {
                         return Ok((false, false, context.0.plan()));
-                    }
-                    *frame_tick += 1;
-                    let force_full = force_full_frame(*frame_tick);
+                    };
                     let phase_start = Instant::now();
-                    let (plan_changed, paused) = drain_discovery_tick(
-                        context.0,
-                        context.1,
-                        context.2.as_deref_mut(),
-                        interrupted,
-                        force_full,
-                    )?;
+                    let (plan_changed, paused) = match pass {
+                        DiscoveryPass::Frame => {
+                            *frame_tick += 1;
+                            let force_full = force_full_frame(*frame_tick);
+                            drain_discovery_tick(
+                                context.0,
+                                context.1,
+                                context.2.as_deref_mut(),
+                                interrupted,
+                                force_full,
+                            )?
+                        }
+                        DiscoveryPass::PendingStop => service_pending_stop(
+                            context.0,
+                            context.1,
+                            context.2.as_deref_mut(),
+                            interrupted,
+                        )?,
+                    };
                     consumers
                         .scheduling
                         .add_phase(SchedulingPhase::Discovery, phase_start.elapsed());
@@ -3756,22 +3874,37 @@ fn capture_trace(
                 >,
                     consumers: &mut CaptureConsumers<'_>,
                 | {
-                    if frame_clock.elapsed() < drain {
+                    let Some(pass) = discovery_due(frame_clock.elapsed(), drain, || {
+                        owned_stop_pending(context.0, context.1, context.2.as_deref(), interrupted)
+                    }) else {
                         return Ok((false, false, context.0.plan()));
+                    };
+                    if pass == DiscoveryPass::Frame {
+                        // Trace has no render block: the frame's discovery
+                        // pass itself advances the frame clock. A pending-stop
+                        // pass between frames leaves it alone.
+                        *frame_clock = Instant::now();
                     }
-                    // Trace has no render block: the discovery pass itself
-                    // advances the frame clock.
-                    *frame_clock = Instant::now();
-                    *frame_tick += 1;
-                    let force_full = force_full_frame(*frame_tick);
                     let phase_start = Instant::now();
-                    let (plan_changed, paused) = drain_discovery_tick(
-                        context.0,
-                        context.1,
-                        context.2.as_deref_mut(),
-                        interrupted,
-                        force_full,
-                    )?;
+                    let (plan_changed, paused) = match pass {
+                        DiscoveryPass::Frame => {
+                            *frame_tick += 1;
+                            let force_full = force_full_frame(*frame_tick);
+                            drain_discovery_tick(
+                                context.0,
+                                context.1,
+                                context.2.as_deref_mut(),
+                                interrupted,
+                                force_full,
+                            )?
+                        }
+                        DiscoveryPass::PendingStop => service_pending_stop(
+                            context.0,
+                            context.1,
+                            context.2.as_deref_mut(),
+                            interrupted,
+                        )?,
+                    };
                     consumers
                         .scheduling
                         .add_phase(SchedulingPhase::Discovery, phase_start.elapsed());
@@ -6763,12 +6896,45 @@ mod tests {
     /// Everything else the shutdown test below drives is real — the
     /// coordinator, the owned child, its pidfd SIGCONT, its `/proc` task
     /// states, and the settlement path.
+    ///
+    /// The F-T4-2 tick tests add a batch outcome (`required_complete`), a
+    /// scripted successor stop on the first resume, and counts of the scripted
+    /// I/O, so they can confirm a full cycle and price an idle tick. All of
+    /// these default to the shutdown test's behaviour.
     #[derive(Default)]
     struct HeldPause {
         authorization: Option<u64>,
         queue: std::collections::VecDeque<crate::discovery::pause::DiscoveryItem>,
         now_ns: u64,
         resumes: usize,
+        required_complete: bool,
+        successor_on_resume: bool,
+        hooks: Vec<u64>,
+        resumed_at: Vec<u64>,
+        authorization_reads: usize,
+        dequeues: usize,
+    }
+
+    /// The helper's stop, as the kernel performs it: a loader hook in the
+    /// owned child consumes the ARMED authorization (REQUESTED), queues its
+    /// record stamped on the coordinator's clock (never older than the arm it
+    /// consumed), and its SIGSTOP holds the child. Returns the hook timestamp
+    /// that starts the stop's causal deadline.
+    fn helper_stop(child: &OwnedChild, held: &mut HeldPause) -> u64 {
+        held.authorization = Some(p11scope_ebpf_common::PAUSE_REQUESTED);
+        // SAFETY: DiscoveryRecord is plain old data; all-zero is valid.
+        let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.pid_tgid = u64::from(child.pid()) << 32;
+        record.hook_ts_ns = held.now_ns;
+        held.queue
+            .push_back(crate::discovery::pause::DiscoveryItem::Record(record));
+        held.hooks.push(record.hook_ts_ns);
+        child.pin().send_signal(libc::SIGSTOP).unwrap();
+        wait_until(
+            || original_child_is_stopped(child.pin().pidfd().unwrap()),
+            "the helper's SIGSTOP never held the child",
+        );
+        record.hook_ts_ns
     }
 
     struct HeldPauseIo<'a> {
@@ -6798,6 +6964,7 @@ mod tests {
         fn dequeue(
             &mut self,
         ) -> std::result::Result<Option<crate::discovery::pause::DiscoveryItem>, String> {
+            self.held.dequeues += 1;
             Ok(self.held.queue.pop_front())
         }
 
@@ -6807,6 +6974,7 @@ mod tests {
         }
 
         fn authorization(&mut self) -> std::result::Result<Option<u64>, String> {
+            self.held.authorization_reads += 1;
             Ok(self.held.authorization)
         }
 
@@ -6825,7 +6993,9 @@ mod tests {
             crate::discovery::pause::PauseBatchOutcome,
             crate::discovery::pause::PauseBatchError,
         > {
-            Ok(Default::default())
+            let mut outcome = crate::discovery::pause::PauseBatchOutcome::default();
+            outcome.required_complete = self.held.required_complete;
+            Ok(outcome)
         }
 
         fn account_unvalidated_records(&mut self, _: u64) {}
@@ -6858,7 +7028,16 @@ mod tests {
 
         fn resume(&mut self) -> std::result::Result<(), String> {
             self.held.resumes += 1;
-            self.child.pin().send_signal(libc::SIGCONT)
+            self.held.resumed_at.push(self.held.now_ns);
+            self.child.pin().send_signal(libc::SIGCONT)?;
+            // A cascade: the child's next loader hook consumes the successor
+            // the cycle installed before this resume, right after it.
+            if std::mem::take(&mut self.held.successor_on_resume)
+                && self.held.authorization == Some(p11scope_ebpf_common::PAUSE_ARMED)
+            {
+                helper_stop(self.child, self.held);
+            }
+            Ok(())
         }
 
         fn detach_pause_links(&mut self) -> std::result::Result<(), String> {
@@ -6887,7 +7066,7 @@ mod tests {
     /// F-25 end to end, without BPF: the kernel consumed the pause arm and the
     /// helper's SIGSTOP holds the owned child when the capture ends — by an
     /// operator SIGTERM, by `--duration`, or by a capture error — before any
-    /// discovery frame serviced the stop. The two steps `Owned::finish` runs
+    /// capture tick serviced the stop. The two steps `Owned::finish` runs
     /// (coordinator cleanup, then settlement) must resume the held child,
     /// report the stop that never confirmed (`auto`: partial; `always`: a
     /// required refusal), and settle the child well inside one TERM grace
@@ -7020,6 +7199,318 @@ mod tests {
                     assert!(retained.as_ref().unwrap().is_reaped(), "{case}");
                     assert!(pending.is_none(), "{case}");
                 }
+            }
+        }
+    }
+
+    /// One capture tick's pause step, composed as both capture loops compose
+    /// it for an owned explicit pause. The discovery gate asks `pause_stop_due`
+    /// between frames only. The admitted pass then services the pause through
+    /// `service_pause`, the one entry that `drain_discovery_tick` (a frame) and
+    /// `service_pending_stop` (between frames) both call. A failed service is
+    /// retired as both retire it, through `retire_pause_policy`, where `Err`
+    /// ends the capture. Those session-bound wrappers need BPF, and the frame's
+    /// ordinary fallback for a disabled policy does not arise here.
+    fn held_pause_tick(
+        since_frame: Duration,
+        drain: Duration,
+        coordinator: &mut PauseCoordinator,
+        io: &mut HeldPauseIo<'_>,
+    ) -> (Option<DiscoveryPass>, Result<()>) {
+        let pass = discovery_due(since_frame, drain, || pause_stop_due(coordinator, io));
+        let retired = match pass.map(|_| service_pause(coordinator, io)) {
+            None | Some(Ok(true)) => Ok(()),
+            Some(Ok(false)) => panic!("{pass:?}: an armed pause must be serviced"),
+            Some(Err(error)) => retire_pause_policy(error),
+        };
+        (pass, retired)
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum HeldStop {
+        /// One helper stop, landing just after a frame.
+        One,
+        /// The same, and the successor its cycle installs is consumed right
+        /// after that cycle's resume, so `observe_resumed` only acknowledges it.
+        Cascade,
+        /// The cascade with the first stop serviced by a frame, so only the
+        /// successor waits between frames.
+        CascadeAfterFrame,
+        /// One stop whose required attachment fails: a genuinely failed cycle.
+        Failed,
+        /// One stop, with an operator stop already pending on the tick.
+        Signalled,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct HeldStopOutcome {
+        case: HeldStop,
+        policy: cli::PausePolicy,
+        /// The passes the first two ticks admitted.
+        first_ticks: [Option<DiscoveryPass>; 2],
+        /// A tick's pause failure ended the capture.
+        ended_by_pause_failure: bool,
+        /// Whether the child was still stopped after the last tick.
+        held_after_ticks: bool,
+        counters_after_ticks: crate::discovery::pause::PauseCounters,
+        /// After the capture's cleanup: the counters the report renders, and
+        /// whether cleanup refused the run.
+        counters_after_cleanup: crate::discovery::pause::PauseCounters,
+        cleanup_refused: bool,
+        resumes: usize,
+        /// The scripted I/O of the idle ticks after the first two.
+        idle_authorization_reads: usize,
+        idle_dequeues: usize,
+    }
+
+    /// F-T4-2 end to end, without BPF. A real owned child is held stopped by
+    /// the helper's SIGSTOP, with REQUESTED and its record queued. The real
+    /// coordinator is driven through one capture tick's pause step at the
+    /// profile default drain interval, with `since_frame = 0` (the frame has
+    /// just run). The scripted clock advances one idle wait per tick, and the
+    /// ticks span the whole 500 ms causal budget.
+    ///
+    /// The first tick must service the stop: confirmed, and the child resumed
+    /// (the kernel's waitid says so) before hook + 500 ms on the coordinator's
+    /// clock. In a cascade, the next tick must service the successor as well.
+    /// Afterwards an idle tick costs one authorization read while the
+    /// successor stays armed, and nothing once the pause is disarmed. The
+    /// semantics around it hold. A genuinely failed cycle still resumes the
+    /// child and goes partial under `auto`, and ends the capture under
+    /// `always`. A pending operator stop wins: the tick services nothing, and
+    /// cleanup resumes the child and reports the stop (`auto` partial, `always`
+    /// refused). Under the frame-only gate every stop stayed held through all
+    /// the ticks and cleanup reported it unconfirmed.
+    #[test]
+    fn a_pending_pause_stop_is_serviced_between_frames_within_its_causal_deadline() {
+        use crate::cli::PausePolicy::{Always, Auto};
+        use crate::discovery::pause::PauseCounters;
+        let fixture_dir = tempfile::tempdir().unwrap();
+        let sleeper = build_sleeper(fixture_dir.path());
+        let budget = crate::discovery::pause::CYCLE_NS;
+        let idle_wait = u64::try_from(READY_IDLE_POLL.as_nanos()).unwrap();
+        let ticks = usize::try_from(budget / idle_wait).unwrap();
+        let drain = PROFILE_CADENCE;
+        let cases = [
+            (HeldStop::One, Auto),
+            (HeldStop::Cascade, Auto),
+            (HeldStop::CascadeAfterFrame, Auto),
+            (HeldStop::Failed, Auto),
+            (HeldStop::Signalled, Auto),
+            (HeldStop::One, Always),
+            (HeldStop::Failed, Always),
+            (HeldStop::Signalled, Always),
+        ];
+        let mut observed = Vec::new();
+        let mut deadlines = Vec::new();
+        for (case, policy) in cases {
+            let mut child = spawn(sleeper.to_str().unwrap(), &[]);
+            let signals = SignalState::new();
+            let mut held = HeldPause {
+                required_complete: case != HeldStop::Failed,
+                successor_on_resume: matches!(
+                    case,
+                    HeldStop::Cascade | HeldStop::CascadeAfterFrame
+                ),
+                ..HeldPause::default()
+            };
+            let mut coordinator = {
+                let mut io = HeldPauseIo {
+                    child: &child,
+                    held: &mut held,
+                    signals: &signals,
+                };
+                let mut coordinator = PauseCoordinator::preflight(policy, &child, &mut io).unwrap();
+                assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Armed);
+                coordinator
+            };
+            child.release().unwrap();
+            helper_stop(&child, &mut held);
+            if case == HeldStop::Signalled {
+                signals.observe(libc::SIGTERM);
+            }
+
+            let mut passes = Vec::with_capacity(ticks);
+            let mut idle_from = None;
+            let mut ended_by_pause_failure = false;
+            for tick in 0..ticks {
+                if tick == 2 {
+                    idle_from = Some((held.authorization_reads, held.dequeues));
+                }
+                let since_frame = if tick == 0 && case == HeldStop::CascadeAfterFrame {
+                    drain
+                } else {
+                    Duration::ZERO
+                };
+                let mut io = HeldPauseIo {
+                    child: &child,
+                    held: &mut held,
+                    signals: &signals,
+                };
+                let (pass, retired) =
+                    held_pause_tick(since_frame, drain, &mut coordinator, &mut io);
+                passes.push(pass);
+                held.now_ns += idle_wait;
+                if retired.is_err() {
+                    ended_by_pause_failure = true;
+                    break;
+                }
+            }
+            let held_after_ticks = original_child_is_stopped(child.pin().pidfd().unwrap());
+            let counters_after_ticks = coordinator.counters();
+            let (idle_authorization_reads, idle_dequeues) = idle_from
+                .map_or((0, 0), |(reads, dequeues)| {
+                    (held.authorization_reads - reads, held.dequeues - dequeues)
+                });
+
+            // The capture ends: `Owned::finish` runs the coordinator's cleanup.
+            let cleanup = {
+                let mut io = HeldPauseIo {
+                    child: &child,
+                    held: &mut held,
+                    signals: &signals,
+                };
+                coordinator.cleanup(&mut io)
+            };
+            if let Err(error) = &cleanup {
+                assert!(
+                    error.required() && !error.lifecycle(),
+                    "{case:?}/{policy:?}: {error}"
+                );
+            }
+            assert!(
+                !original_child_is_stopped(child.pin().pidfd().unwrap()),
+                "{case:?}/{policy:?}: the child is still held stopped after cleanup"
+            );
+            observed.push(HeldStopOutcome {
+                case,
+                policy,
+                first_ticks: [passes[0], passes.get(1).copied().flatten()],
+                ended_by_pause_failure,
+                held_after_ticks,
+                counters_after_ticks,
+                counters_after_cleanup: coordinator.counters(),
+                cleanup_refused: cleanup.is_err(),
+                resumes: held.resumes,
+                idle_authorization_reads,
+                idle_dequeues,
+            });
+            if matches!(
+                case,
+                HeldStop::One | HeldStop::Cascade | HeldStop::CascadeAfterFrame
+            ) {
+                deadlines.push((case, policy, held.hooks.clone(), held.resumed_at.clone()));
+            }
+            // Dropping the child kills and reaps it.
+        }
+
+        let pending = Some(DiscoveryPass::PendingStop);
+        let confirmed = |stops| PauseCounters {
+            attempts: stops,
+            confirmed: stops,
+            partial: 0,
+        };
+        let unconfirmed = |partial| PauseCounters {
+            attempts: 1,
+            confirmed: 0,
+            partial,
+        };
+        let serviced =
+            |case, policy, first_ticks, stops, idle_authorization_reads| HeldStopOutcome {
+                case,
+                policy,
+                first_ticks,
+                ended_by_pause_failure: false,
+                held_after_ticks: false,
+                counters_after_ticks: confirmed(stops),
+                counters_after_cleanup: confirmed(stops),
+                cleanup_refused: false,
+                resumes: usize::try_from(stops).unwrap(),
+                idle_authorization_reads,
+                idle_dequeues: 0,
+            };
+        let expected = [
+            serviced(HeldStop::One, Auto, [pending, None], 1, ticks - 2),
+            serviced(HeldStop::Cascade, Auto, [pending, pending], 2, 0),
+            serviced(
+                HeldStop::CascadeAfterFrame,
+                Auto,
+                [Some(DiscoveryPass::Frame), pending],
+                2,
+                0,
+            ),
+            // The failed cycle resumes the child, counts one partial attempt
+            // and retires re-arming; the capture continues.
+            HeldStopOutcome {
+                case: HeldStop::Failed,
+                policy: Auto,
+                first_ticks: [pending, None],
+                ended_by_pause_failure: false,
+                held_after_ticks: false,
+                counters_after_ticks: unconfirmed(1),
+                counters_after_cleanup: unconfirmed(1),
+                cleanup_refused: false,
+                resumes: 1,
+                idle_authorization_reads: 0,
+                idle_dequeues: 0,
+            },
+            HeldStopOutcome {
+                case: HeldStop::Signalled,
+                policy: Auto,
+                first_ticks: [None, None],
+                ended_by_pause_failure: false,
+                held_after_ticks: true,
+                counters_after_ticks: PauseCounters::default(),
+                counters_after_cleanup: unconfirmed(1),
+                cleanup_refused: false,
+                resumes: 1,
+                idle_authorization_reads: 0,
+                idle_dequeues: 0,
+            },
+            serviced(HeldStop::One, Always, [pending, None], 1, ticks - 2),
+            // The failed cycle resumes the child, and its required failure
+            // ends the capture on that tick.
+            HeldStopOutcome {
+                case: HeldStop::Failed,
+                policy: Always,
+                first_ticks: [pending, None],
+                ended_by_pause_failure: true,
+                held_after_ticks: false,
+                counters_after_ticks: unconfirmed(0),
+                counters_after_cleanup: unconfirmed(0),
+                cleanup_refused: false,
+                resumes: 1,
+                idle_authorization_reads: 0,
+                idle_dequeues: 0,
+            },
+            HeldStopOutcome {
+                case: HeldStop::Signalled,
+                policy: Always,
+                first_ticks: [None, None],
+                ended_by_pause_failure: false,
+                held_after_ticks: true,
+                counters_after_ticks: PauseCounters::default(),
+                counters_after_cleanup: unconfirmed(0),
+                cleanup_refused: true,
+                resumes: 1,
+                idle_authorization_reads: 0,
+                idle_dequeues: 0,
+            },
+        ];
+        assert_eq!(observed, expected);
+
+        for (case, policy, hooks, resumed_at) in deadlines {
+            assert_eq!(
+                hooks.len(),
+                resumed_at.len(),
+                "{case:?}/{policy:?}: one resume per stop"
+            );
+            for (hook, resumed) in hooks.iter().zip(&resumed_at) {
+                assert!(
+                    *resumed <= hook + budget,
+                    "{case:?}/{policy:?}: the stop hooked at {hook} ns was resumed at \
+                     {resumed} ns, past its {budget} ns causal deadline"
+                );
             }
         }
     }
@@ -7762,6 +8253,77 @@ mod tests {
         );
     }
 
+    /// F-T4-2, the gate alone on scripted times. A frame ran at 0. The pause
+    /// helper's hook fires 1 ms later and its stop stays pending from then on.
+    /// The loop ticks every `READY_IDLE_POLL`, as an idle capture does. At
+    /// every drain interval (trace's 200 ms, profile's 1 s, the 60 s maximum),
+    /// the first tick after the hook must admit the pause service, well inside
+    /// the stop's 500 ms causal budget. The frame-only gate waited for the
+    /// next frame instead: 999 ms after the hook at the profile default. With
+    /// no stop pending the gate still admits frames only, once per drain
+    /// interval, and never asks the pause on a frame tick.
+    #[test]
+    fn a_pending_pause_stop_is_due_on_the_next_tick_at_any_drain_interval() {
+        let budget = Duration::from_nanos(crate::discovery::pause::CYCLE_NS);
+        let hook = Duration::from_millis(1);
+        let drains = [TRACE_CADENCE, PROFILE_CADENCE, Duration::from_secs(60)];
+        // The first tick the gate admits, its pass, and whether it asked for
+        // the pause state although it was a frame tick.
+        let first_due = |drain: Duration, hook: Option<Duration>| {
+            let mut since_frame = Duration::ZERO;
+            loop {
+                since_frame += READY_IDLE_POLL;
+                let mut asked = false;
+                let pass = discovery_due(since_frame, drain, || {
+                    asked = true;
+                    hook.is_some_and(|hook| since_frame >= hook)
+                });
+                if let Some(pass) = pass {
+                    return (since_frame, pass, asked && pass == DiscoveryPass::Frame);
+                }
+            }
+        };
+
+        let pending: Vec<_> = drains
+            .iter()
+            .map(|&drain| (drain, first_due(drain, Some(hook))))
+            .collect();
+        for (drain, (due, _, _)) in &pending {
+            let waited = *due - hook;
+            assert!(
+                waited <= budget,
+                "drain {drain:?}: the first due tick came {waited:?} after the hook, \
+                 past the {budget:?} causal budget"
+            );
+        }
+        for (drain, (due, pass, _)) in &pending {
+            assert_eq!(
+                *pass,
+                DiscoveryPass::PendingStop,
+                "drain {drain:?}: a pending stop between frames must admit the pause \
+                 service alone, not a frame"
+            );
+            assert!(
+                *due - hook <= READY_IDLE_POLL,
+                "drain {drain:?}: the stop waited {:?}, more than one idle tick",
+                *due - hook
+            );
+        }
+
+        for drain in drains {
+            let (due, pass, asked_on_frame) = first_due(drain, None);
+            assert_eq!(
+                (due, pass),
+                (drain, DiscoveryPass::Frame),
+                "drain {drain:?}: without a pending stop only the frame is due"
+            );
+            assert!(
+                !asked_on_frame,
+                "drain {drain:?}: a frame tick must not pay for the pause check"
+            );
+        }
+    }
+
     /// Both capture loops idle on ring readiness, not on a fixed sleep: a
     /// revert of either loop body to `thread::sleep` keeps every
     /// behavioral unit test green (the loops only run live), so pin the
@@ -7795,6 +8357,71 @@ mod tests {
                 "{function} idles on a fixed sleep instead of ring readiness"
             );
         }
+    }
+
+    /// F-T4-2's loop wiring, which the BPF-free tick tests cannot reach. Both
+    /// capture loops ask the one gate with the owned pending-stop check and
+    /// send a pending stop to the between-frames service. A frame is counted,
+    /// and trace's frame clock advanced, only on a frame pass, so a
+    /// pending-stop pass leaves the frame and discovery cadence unchanged.
+    /// Sliced like `capture_loops_idle_on_readiness`.
+    #[test]
+    fn capture_loops_service_a_pending_stop_between_frames() {
+        let source = include_str!("run.rs");
+        let tick_of = |start: &str, end: &str| {
+            source
+                .split_once(start)
+                .unwrap()
+                .1
+                .split_once(end)
+                .unwrap()
+                .0
+                .split_once("let tick = {")
+                .unwrap()
+                .1
+                .split_once("let mut finish_context =")
+                .unwrap()
+                .0
+        };
+        let profile = tick_of("fn capture_profile(", "fn write_json_report");
+        let trace = tick_of("fn capture_trace(", "fn terminal_trace_count_line");
+        for (function, tick) in [("capture_profile", profile), ("capture_trace", trace)] {
+            assert_eq!(
+                tick.matches("discovery_due(").count(),
+                1,
+                "{function} must gate discovery once per tick"
+            );
+            assert!(
+                tick.contains(
+                    "owned_stop_pending(context.0, context.1, context.2.as_deref(), interrupted)"
+                ),
+                "{function} must ask the gate for a pending pause stop"
+            );
+            assert!(
+                tick.contains("DiscoveryPass::PendingStop => service_pending_stop("),
+                "{function} must service a pending stop between frames"
+            );
+            let frame = tick
+                .split_once("DiscoveryPass::Frame => {")
+                .and_then(|(_, rest)| rest.split_once("DiscoveryPass::PendingStop =>"))
+                .unwrap_or_else(|| panic!("{function} must match the frame pass first"))
+                .0;
+            assert!(
+                frame.contains("*frame_tick += 1;") && frame.contains("drain_discovery_tick("),
+                "{function}: only a frame pass counts a frame and runs the full pass"
+            );
+            assert_eq!(tick.matches("*frame_tick += 1;").count(), 1, "{function}");
+        }
+        let reset = trace
+            .split_once("if pass == DiscoveryPass::Frame {")
+            .and_then(|(_, rest)| rest.split_once('}'))
+            .expect("trace must advance its frame clock inside a frame-pass guard")
+            .0;
+        assert!(
+            reset.contains("*frame_clock = Instant::now();"),
+            "only trace's frame pass advances its frame clock"
+        );
+        assert_eq!(trace.matches("*frame_clock = Instant::now();").count(), 1);
     }
 
     /// Requested-wait margin at the default ring: one full idle timeout

@@ -15,7 +15,9 @@ use std::time::Duration;
 
 pub(crate) use crate::events::DiscoveryItem;
 
-const CYCLE_NS: u64 = 500_000_000;
+/// The fixed causal deadline: a stop's cycle must finish within this long of
+/// its hook. Crate-visible so the run loop's gate tests measure against it.
+pub(crate) const CYCLE_NS: u64 = 500_000_000;
 const SAMPLE_NS: u64 = 1_000_000;
 const MAX_FAILURE_ITEMS: usize = 128;
 const MSG_ARM_FAILED: &str = "owned child generation changed before pause arm";
@@ -589,6 +591,21 @@ impl PauseCoordinator {
         self.set_diagnostic(PauseDiagnostic::ArmFailedBeforeEpoch);
         self.fail_cycle(io, message, lifecycle)
             .map(|()| ArmResult::Disabled)
+    }
+
+    /// Whether a stop may be waiting for `service` between capture frames
+    /// (F-T4-2). The run loop asks this on every tick between frames, so it
+    /// costs nothing unless an epoch is armed (the initial arm, a frame's
+    /// re-arm, or an installed successor), and then exactly one
+    /// authorization read. Only an exact ARMED readback proves that no hook
+    /// won the arm (see `service_received`). REQUESTED, an absent or unknown
+    /// state, and a failed read all count as pending, and `service`
+    /// classifies each under its existing deadlines and failure rules.
+    pub(crate) fn stop_pending(&self, io: &mut impl PauseIo) -> bool {
+        self.policy != PausePolicy::Never
+            && self.rearming_enabled
+            && self.armed
+            && !matches!(io.authorization(), Ok(Some(PAUSE_ARMED)))
     }
 
     pub(crate) fn service(&mut self, io: &mut impl PauseIo) -> Result<(), PauseError> {
@@ -3013,6 +3030,59 @@ mod tests {
         assert!(io.events.is_empty());
         assert_eq!(coordinator.counters(), PauseCounters::default());
         assert_eq!(coordinator.status(), PauseStatus::None);
+    }
+
+    /// F-T4-2: the run loop asks `stop_pending` on every tick between frames,
+    /// so it performs no I/O unless an epoch is armed, and exactly one
+    /// authorization read while one is. `never`, an unarmed pause, and a
+    /// retired policy (arm's own gate) all answer without I/O. Only an exact
+    /// ARMED readback proves no stop is pending. REQUESTED, an absent or
+    /// unknown state, and a failed read send the tick to `service`.
+    #[test]
+    fn stop_pending_costs_one_authorization_read_and_only_while_armed() {
+        for (policy, armed, rearming_enabled) in [
+            (PausePolicy::Never, true, true),
+            (PausePolicy::Auto, false, true),
+            (PausePolicy::Always, false, true),
+            (PausePolicy::Auto, true, false),
+        ] {
+            let mut io = FakeIo {
+                authorization: Some(PAUSE_REQUESTED),
+                ..FakeIo::default()
+            };
+            let mut coordinator = PauseCoordinator::for_test(policy, 41, 9, stopped());
+            coordinator.armed = armed;
+            coordinator.rearming_enabled = rearming_enabled;
+            assert!(
+                !coordinator.stop_pending(&mut io),
+                "{policy:?} armed={armed} rearming={rearming_enabled}"
+            );
+            assert!(io.events.is_empty(), "{policy:?}: {:?}", io.events);
+        }
+
+        for (authorization, pending) in [
+            (Ok(Some(PAUSE_ARMED)), false),
+            (Ok(Some(PAUSE_REQUESTED)), true),
+            (Ok(None), true),
+            (Ok(Some(999)), true),
+            (Err("read".to_string()), true),
+        ] {
+            for policy in [PausePolicy::Auto, PausePolicy::Always] {
+                let mut io = FakeIo {
+                    authorization_results: VecDeque::from([authorization.clone()]),
+                    ..FakeIo::default()
+                };
+                let mut coordinator = PauseCoordinator::for_test(policy, 41, 9, stopped());
+                coordinator.arm_for_test();
+                assert_eq!(
+                    coordinator.stop_pending(&mut io),
+                    pending,
+                    "{policy:?}: {authorization:?}"
+                );
+                assert_eq!(io.events, ["read"], "{policy:?}: {authorization:?}");
+                assert_eq!(coordinator.counters(), PauseCounters::default());
+            }
+        }
     }
 
     #[test]
@@ -6109,7 +6179,7 @@ mod tests {
     }
 
     /// F-25: the capture can end (operator stop, `--duration`) after the
-    /// kernel consumed an arm and before the discovery frame that would have
+    /// kernel consumed an arm and before the capture tick that would have
     /// serviced it. The helper's SIGSTOP still holds the child, so terminal
     /// cleanup resumes it — and the owner that cleanup opens never confirmed,
     /// so it must close like every other unconfirmed owner: `auto` counts it
@@ -6199,7 +6269,7 @@ mod tests {
     }
 
     /// A confirmed cycle installs its one successor, the kernel consumes the
-    /// successor, and the capture ends before any frame services it. The
+    /// successor, and the capture ends before any tick services it. The
     /// first owner stays confirmed. The successor's owner, opened by cleanup,
     /// closes unconfirmed after cleanup's one protective resume. `auto` ends
     /// `{attempts 2, confirmed 1, partial 1}`; `always` refuses.

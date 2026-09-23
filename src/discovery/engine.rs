@@ -7142,14 +7142,23 @@ impl Engine {
     /// The one immutable public view of capture-lifetime facts (plan Task 8
     /// Step 2). Every field is boundary-safe: no pins, views, files, timing
     /// keys, or loader/pause identity crosses it. Most fields are the
-    /// projected discovery evidence and finite aggregates, but `table_entries`
-    /// and `slots` are the exception — they are counts read live off the
-    /// engine's own `plan`, not sourced from `self.discovery`.
+    /// projected discovery evidence and finite aggregates, but `table_entries`,
+    /// `slots`, and `active_slots` are the exception — they are counts read
+    /// live off the engine's own `plan`, not sourced from `self.discovery`.
     pub fn capture_facts(&self) -> render::CaptureFacts {
         render::CaptureFacts {
             discovery: self.discovery.clone(),
             table_entries: self.plan.entries_seen,
             slots: self.plan.slots.len(),
+            // U-14: mirrors how `slots` reads the plan, but counts only what
+            // `plan.is_active` still has attached — retired churn (a
+            // provider generation that exited and was replaced) stays out.
+            active_slots: self
+                .plan
+                .slots
+                .iter()
+                .filter(|slot| self.plan.is_active(slot.index))
+                .count(),
             attach_gap_ms: self.timings.max_gap_ms(),
             loader_discovery: self.loader_discovery(),
             discovery_ring_loss: self.counter_snapshot.ring_loss,

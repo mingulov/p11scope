@@ -4704,6 +4704,7 @@ fn evidence_for(
     let mut ev = render::Evidence {
         table_entries: facts.table_entries(),
         slots: facts.slots(),
+        active_slots: facts.active_slots(),
         attached_probes,
         attach_failures: attach_failures.iter().map(|(_, msg)| msg.clone()).collect(),
         aliased: plan

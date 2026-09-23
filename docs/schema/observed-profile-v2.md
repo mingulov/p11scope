@@ -67,7 +67,9 @@ never the ones currently mapped, so "no modules discovered" can only mean a
 capture that never accepted one.
 
 A consumer that needs to know what is live now must observe now; this document
-answers what was observed, not what remains.
+answers what was observed, not what remains. `evidence.active_slots` is the one
+exception: it is read from the plan's current active set at render time, so it
+does say what remains attached — see `active_slots` below.
 
 ## Semantic-join authority
 
@@ -134,7 +136,8 @@ Discovery and attachment:
 | Field | Meaning |
 | --- | --- |
 | `table_entries` | Function records discovery decoded across every walked surface, with the same exact target occurrence deduplicated across sources. |
-| `slots` | Unique `{object, file_offset}` targets. |
+| `slots` | Unique `{object, file_offset}` targets allocated over the whole capture. The plan is append-only — a slot is never reused within a capture — so a target retired by churn (a provider generation exiting and being replaced) still counts here; this number only grows. |
+| `active_slots` | The endpoint count still active in the plan when the report is written: `slots` minus any this capture's churn has already retired. Mirrors the plan's active set, not a count of kernel links. Equal to `slots` whenever nothing has churned. |
 | `attached_probes` | Successful probe attachments; two per fully attached slot. |
 | `attach_failures` | Per-slot attachment errors. |
 | `aliased` | Name groups that share one address and therefore one count. |

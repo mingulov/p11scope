@@ -26,7 +26,8 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "abi_refusals", "aliased", "async_duplicates", "async_evictions",
+        "abi_refusals", "active_slots",
+        "aliased", "async_duplicates", "async_evictions",
         "async_orphans", "async_target_failures", "attach_failures",
         "attach_gap_ms", "attached_probes", "auth_state_ambiguities",
         "authority", "cgroup_scope_failures", "completeness", "discovery",
@@ -54,6 +55,7 @@
       ],
       "properties": {
         "abi_refusals": {"type": "integer", "minimum": 0},
+        "active_slots": {"type": "integer", "minimum": 0},
         "aliased": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}},
         "async_duplicates": {"type": "integer", "minimum": 0},
         "async_evictions": {"type": "integer", "minimum": 0},

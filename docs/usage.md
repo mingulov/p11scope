@@ -439,6 +439,18 @@ Immediately before `EVIDENCE`, trace emits one aggregate-only
 the STATS fields include completed and in-flight calls, while `raw_calls`
 counts every well-formed non-fork event consumed before truncation.
 
+`slots` and `active_slots` in that evidence object (and in the live `profile`
+line's `N slots (M active)`) answer different questions. Endpoint slots are
+append-only for the life of a capture — a slot is never reused — so `slots`
+is every endpoint ever allocated, including ones a provider generation left
+behind by exiting and being replaced; it only ever grows. A service that
+restarts ten times over a 68-function provider can end with `"slots":680`.
+`active_slots` is the endpoint count still attached in the plan when the
+report is written — `68` in that same example, and equal to `slots` whenever
+nothing has churned, as in the single-generation captures above (both fields
+would read 68; the historical output predates `active_slots` and shows only
+`slots`).
+
 ### More capture options
 
 - `--max-events <n>` — trace only (including `run --trace`): end the capture

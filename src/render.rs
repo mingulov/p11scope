@@ -166,6 +166,10 @@ pub struct CaptureFacts {
     pub(crate) discovery: DiscoveryEvidence,
     pub(crate) table_entries: usize,
     pub(crate) slots: usize,
+    /// Endpoint slots active in the plan when this report is written (owner
+    /// decision U-14, 2026-09-23): `slots` minus any this capture's churn
+    /// has already retired.
+    pub(crate) active_slots: usize,
     pub(crate) attach_gap_ms: Option<u64>,
     pub(crate) loader_discovery: LoaderDiscovery,
     pub(crate) discovery_ring_loss: u64,
@@ -186,9 +190,19 @@ impl CaptureFacts {
         self.table_entries
     }
 
-    /// Attach slots allocated over the whole capture.
+    /// Attach slots allocated over the whole capture, including any this
+    /// capture's churn later retired; see `active_slots` for what remains
+    /// attached.
     pub fn slots(&self) -> usize {
         self.slots
+    }
+
+    /// Endpoint slots still active in the plan when this report is written
+    /// (owner decision U-14): `slots` minus any already retired by churn —
+    /// a provider generation exiting and being replaced never reuses a
+    /// retired slot.
+    pub fn active_slots(&self) -> usize {
+        self.active_slots
     }
 
     pub fn attach_gap_ms(&self) -> Option<u64> {
@@ -455,8 +469,18 @@ pub struct Evidence {
     /// could not be pinned are both counted here and listed in `skipped`, so
     /// this reads as "seen" against `slots`' "attached".
     pub table_entries: usize,
-    /// Unique {object, file_offset} targets planned.
+    /// Unique {object, file_offset} targets planned, allocated over the
+    /// whole capture. The plan is append-only: a slot is never reused within
+    /// a capture, so a retired target (a provider generation exiting and
+    /// being replaced) still counts here — this number only grows with
+    /// churn (owner decision U-14, 2026-09-23). See `active_slots` for the
+    /// count still attached when this report was written.
     pub slots: usize,
+    /// Endpoint slots active in the plan when this report was written: the
+    /// allocated `slots` minus any this capture's churn has already retired
+    /// (owner decision U-14, 2026-09-23). Mirrors `plan.is_active` — not a
+    /// count of kernel links.
+    pub active_slots: usize,
     /// Probes successfully attached (2 per fully-attached slot).
     pub attached_probes: usize,
     pub attach_failures: Vec<String>,
@@ -975,10 +999,11 @@ pub fn live(
         + ev.semantic_state_drops
         + ev.pending_at_end;
     let mut evidence_line = format!(
-        "Evidence: {}/{} probes attached · {} slots · {} aliased · {} skipped · {} in-flight",
+        "Evidence: {}/{} probes attached · {} slots ({} active) · {} aliased · {} skipped · {} in-flight",
         ev.attached_probes,
         ev.slots * 2,
         ev.slots,
+        ev.active_slots,
         ev.aliased.len(),
         ev.skipped.len(),
         ev.in_flight_at_end,
@@ -1693,6 +1718,7 @@ mod tests {
         Evidence {
             table_entries: 68,
             slots: 68,
+            active_slots: 68,
             attached_probes: 136,
             attach_failures: vec![],
             aliased: vec![],
@@ -3201,6 +3227,28 @@ mod tests {
         assert!(out.contains("up 00:01:05"));
         assert!(out.contains("mode profile"));
         assert!(out.contains("approximation"));
+    }
+
+    /// U-14: the live evidence line must show the plan's currently-active
+    /// endpoint count next to the ever-growing allocation total, not just
+    /// the allocation total alone.
+    #[test]
+    fn live_view_shows_active_slots_next_to_allocated_slots() {
+        let mut ev = evidence();
+        ev.slots = 10;
+        ev.active_slots = 4;
+        ev.attached_probes = 8;
+        ev.verdict();
+        let out = live(
+            &[],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+        );
+        assert!(out.contains("10 slots"), "{out}");
+        assert!(out.contains("4 active"), "{out}");
     }
 
     #[test]
@@ -4751,6 +4799,10 @@ mod tests {
     fn an_active_to_empty_lifecycle_keeps_its_history_in_every_renderer() {
         let mut ev = evidence();
         ev.child_still_running = Some(false);
+        // U-14: the exited generation's endpoints are retired, not attached,
+        // so active_slots must publish the smaller live count next to the
+        // unchanged allocation total in `slots`.
+        ev.active_slots = 61;
         ev.verdict();
         let reports = reports_fixture();
 
@@ -4770,6 +4822,7 @@ mod tests {
             assert_eq!(document["surfaces"][0]["walk"], "full");
             assert_eq!(document["table_entries"], 68);
             assert_eq!(document["slots"], 68);
+            assert_eq!(document["active_slots"], 61);
             assert_eq!(document["attached_probes"], 136);
             // No exit-generated discovery loss and no false reconciliation.
             for counter in [

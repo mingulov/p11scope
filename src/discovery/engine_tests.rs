@@ -6967,6 +6967,11 @@ fn evidence_verdict(
     let mut evidence = render::Evidence {
         table_entries: plan.entries_seen,
         slots: plan.slots.len(),
+        active_slots: plan
+            .slots
+            .iter()
+            .filter(|slot| plan.is_active(slot.index))
+            .count(),
         attached_probes: 0,
         attach_failures: Vec::new(),
         aliased: plan
@@ -7050,6 +7055,58 @@ fn evidence_verdict(
     };
     evidence.verdict();
     evidence
+}
+
+/// U-14 (owner decision 2026-09-23): churn from provider restarts must not
+/// hide the currently-attached count behind the ever-growing allocation
+/// count. `slots` keeps counting every endpoint the capture ever allocated,
+/// retired ones included — the append-only plan never reuses a slot within a
+/// capture — while `active_slots` must report only what the plan still has
+/// attached when the report is written, mirroring `plan.is_active`.
+#[test]
+fn capture_facts_reports_active_slots_separately_from_churned_allocations() {
+    let mut engine = Engine::empty();
+    // Generation 1: a provider with three probed endpoints.
+    engine.plan = plan_with(3, 0);
+    // It exits: nothing pins its object any longer, so `retire_unpinned_targets`
+    // retires its three slots — they stay allocated, per the append-only plan.
+    engine
+        .plan
+        .retire_unpinned_targets(&PinnedObjects::empty(), 0);
+    assert!(
+        (0..3).all(|slot| !engine.plan.is_active(slot)),
+        "generation 1's slots must retire, not disappear"
+    );
+
+    // Generation 2 replaces it: two fresh endpoints at new indices, never
+    // reusing the three retired ones.
+    for offset in 0..2u64 {
+        let index = engine.plan.slots.len() as u32;
+        engine.plan.slots.push(plan::Slot {
+            index,
+            descriptor_index: 0,
+            object: PinnedObjectId(43),
+            object_path: "/opt/p11-v2.so".into(),
+            file_offset: offset * 8,
+            names: vec!["C_Sign".into()],
+            aliased: false,
+            semantics: p11scope_ebpf_common::SlotSemantics::COUNT_ONLY,
+            semantic_authorized: true,
+            semantic_ambiguous: false,
+            fork_safe: false,
+            module_ids: vec![plan::ModuleId(1)],
+        });
+    }
+
+    let facts = engine.capture_facts();
+    assert_eq!(
+        facts.slots, 5,
+        "allocated slots must include generation 1's three retired endpoints"
+    );
+    assert_eq!(
+        facts.active_slots, 2,
+        "active_slots must count only generation 2's still-attached endpoints"
+    );
 }
 
 #[test]
@@ -17940,6 +17997,11 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
     let mut evidence = render::Evidence {
         table_entries: plan.entries_seen,
         slots: plan.slots.len(),
+        active_slots: plan
+            .slots
+            .iter()
+            .filter(|slot| plan.is_active(slot.index))
+            .count(),
         attached_probes: 0,
         attach_failures: vec![],
         aliased: vec![],

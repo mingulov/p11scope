@@ -8058,6 +8058,7 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
     let mut evidence = Evidence {
         table_entries: 68,
         slots: 68,
+        active_slots: 68,
         attached_probes: 136,
         attach_failures: vec![],
         aliased: vec![],
@@ -8310,6 +8311,7 @@ fn the_capture_loop_consumer_map_is_frozen() {
         "facts: render::CaptureFacts,",
         "table_entries: facts.table_entries()",
         "slots: facts.slots()",
+        "active_slots: facts.active_slots()",
         "attach_gap_ms: facts.attach_gap_ms()",
         "loader_discovery: facts.loader_discovery()",
         "discovery: facts.discovery().clone()",
@@ -8317,7 +8319,7 @@ fn the_capture_loop_consumer_map_is_frozen() {
     ] {
         assert!(evidence.contains(marker), "consumer map lost {marker:?}");
     }
-    for forbidden in ["plan.entries_seen", "plan.slots.len()"] {
+    for forbidden in ["plan.entries_seen", "plan.slots.len()", "plan.is_active"] {
         assert!(
             !evidence.contains(forbidden),
             "published history was taken from active topology: {forbidden}"

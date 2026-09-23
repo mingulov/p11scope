@@ -555,6 +555,7 @@ mod tests {
             discovery: render::DiscoveryEvidence::default(),
             table_entries: 0,
             slots: 0,
+            active_slots: 0,
             attached_probes: 0,
             attach_failures: vec![],
             aliased: vec![],

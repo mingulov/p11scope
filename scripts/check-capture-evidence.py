@@ -178,7 +178,8 @@ RESIDUAL_EVIDENCE_KEYS = {
 }
 BASE_EVIDENCE_KEYS = set(COUNTERS) | {
     "authority", "discovery", "manifest_object_fallbacks", "modules_skipped",
-    "scan_unavailable", "scan_ms", "table_entries", "slots", "attached_probes",
+    "scan_unavailable", "scan_ms", "table_entries", "slots", "active_slots",
+    "attached_probes",
     "attach_failures", "aliased", "skipped", "in_flight_at_end", "surfaces",
     "vendor_interfaces", "interface_list", "attach_gap_ms", "pause",
     *PAUSE_COUNTERS, "loader_discovery", "templates_truncated", "provider_changed",
@@ -586,7 +587,9 @@ def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, histo
         # Retained v2-metrics documents predate scheduling evidence, like
         # the newer counters HISTORICAL_COUNTERS already excludes, and
         # predate the residual terminal/override/handoff/env evidence too.
+        # They also predate active_slots (U-14, 2026-09-23).
         wanted.discard("scheduling")
+        wanted.discard("active_slots")
         wanted -= RESIDUAL_EVIDENCE_KEYS
     wanted |= PROFILE_V3_FIELDS if profile else set()
     if terminal:
@@ -1372,7 +1375,7 @@ def exact_active_to_empty(document):
     require(evidence["discovery"], "history lost: no module survived the exit")
     require(document["capture"]["modules"], "history lost: capture.modules is empty")
     require(evidence["surfaces"], "history lost: no surface survived the exit")
-    for name in ("table_entries", "slots", "attached_probes"):
+    for name in ("table_entries", "slots", "active_slots", "attached_probes"):
         require(u64(evidence[name], positive=True), f"history lost: {name} is {evidence[name]!r}")
     for counter in DISCOVERY_LOSS_COUNTERS:
         require(evidence[counter] == 0, f"an ordinary exit is not a {counter}")
@@ -2299,6 +2302,7 @@ def evidence_fixture(surfaces, sources=("scan",), discovery_skipped=0):
         "scan_ms": 3,
         "table_entries": 0,
         "slots": 0,
+        "active_slots": 0,
         "attached_probes": 0,
         "attach_failures": [],
         "aliased": [],
@@ -2360,6 +2364,7 @@ def document_fixture(evidence, *, schema=PROFILE_SCHEMA, mode="profile", privacy
             evidence.pop("abi_refusals", None)
             evidence.pop("semantic_history_drops", None)
             evidence.pop("scheduling", None)
+            evidence.pop("active_slots", None)
             for field in RESIDUAL_EVIDENCE_KEYS:
                 evidence.pop(field, None)
     capture = {
@@ -2409,7 +2414,7 @@ def self_test():
     rejected(lambda: exact_role_counts(reversed_roles))
     print("observer and inspect make zero calls; only the offline helper makes ten: OK")
     clean_evidence = evidence_fixture(LEGACY_SURFACES)
-    clean_evidence.update(table_entries=68, slots=68, attached_probes=136)
+    clean_evidence.update(table_entries=68, slots=68, active_slots=68, attached_probes=136)
     clean = document_fixture(
         clean_evidence,
         schema=METRICS_SCHEMA,

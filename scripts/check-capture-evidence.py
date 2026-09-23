@@ -598,6 +598,21 @@ def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, histo
     if child:
         wanted.add("child_still_running")
     require(actual == wanted, f"unexpected evidence keys: missing={sorted(wanted - actual)}, extra={sorted(actual - wanted)}")
+    if not historical:
+        # U-14: active_slots is the plan's current active set (0 after an
+        # ordinary scan-only exit is expected, not a loss), but it can never
+        # exceed the allocated `slots` it is drawn from — that would be an
+        # invalid plan, in every lane and every document, not just the
+        # active-to-empty lifecycle.
+        require(
+            u64(evidence["active_slots"]),
+            f"invalid active_slots: {evidence['active_slots']!r}",
+        )
+        require(
+            evidence["active_slots"] <= evidence["slots"],
+            f"active_slots ({evidence['active_slots']}) exceeds allocated "
+            f"slots ({evidence['slots']})",
+        )
     if child:
         require(isinstance(evidence["child_still_running"], bool),
                 f"invalid child_still_running: {evidence['child_still_running']!r}")
@@ -1375,8 +1390,23 @@ def exact_active_to_empty(document):
     require(evidence["discovery"], "history lost: no module survived the exit")
     require(document["capture"]["modules"], "history lost: capture.modules is empty")
     require(evidence["surfaces"], "history lost: no surface survived the exit")
-    for name in ("table_entries", "slots", "active_slots", "attached_probes"):
+    for name in ("table_entries", "slots", "attached_probes"):
         require(u64(evidence[name], positive=True), f"history lost: {name} is {evidence[name]!r}")
+    # U-14: active_slots is the plan's current active set, not
+    # capture-lifetime history. A scan-only target's ordinary exit retires
+    # every slot its unpinned object held, so 0 is the expected value here,
+    # not a loss. It can still never exceed the allocated `slots` above —
+    # checked here too (not just in exact_evidence_keys) so a real renderer
+    # document that only ever reaches this function still gets the bound.
+    require(
+        u64(evidence["active_slots"]),
+        f"invalid active_slots: {evidence['active_slots']!r}",
+    )
+    require(
+        evidence["active_slots"] <= evidence["slots"],
+        f"active_slots ({evidence['active_slots']}) exceeds allocated "
+        f"slots ({evidence['slots']})",
+    )
     for counter in DISCOVERY_LOSS_COUNTERS:
         require(evidence[counter] == 0, f"an ordinary exit is not a {counter}")
     require(
@@ -3964,10 +3994,16 @@ def self_test():
 
     # ---- active-to-empty lifecycle --------------------------------------
     # The target exited normally: links, pins and views are gone, and every
-    # capture-lifetime fact is still reported.
+    # capture-lifetime fact is still reported. active_slots is not one of
+    # those facts (U-14): a real exit retires every slot a scan-only target's
+    # unpinned object held, so the exit document reports active_slots == 0
+    # while slots keeps the historical allocation total.
     exited = copy.deepcopy(live)
-    exited["evidence"].update(table_entries=68, slots=68, attached_probes=136)
+    exited["evidence"].update(
+        table_entries=68, slots=68, active_slots=0, attached_probes=136
+    )
     exact_active_to_empty(exited)
+    exact_metrics_schema(exited)
     for mutate in (
         lambda d: d["evidence"]["discovery"].clear(),
         lambda d: d["capture"]["modules"].clear(),
@@ -3978,6 +4014,9 @@ def self_test():
         lambda d: d["evidence"].update(discovery_truncated=1),
         lambda d: d["evidence"].update(discovery_ring_loss=1),
         lambda d: d["evidence"].update(state_reconciliations=1),
+        # active_slots == 0 (the baseline `exited` reading) is not a defect —
+        # only exceeding the allocated `slots` it is drawn from is.
+        lambda d: d["evidence"].update(active_slots=d["evidence"]["slots"] + 1),
         lambda d: d["functions"][0]["module"].update(ino=999),
         lambda d: d["functions"][0].update(
             module=None, module_ambiguous=False, module_unresolved=False
@@ -3987,6 +4026,17 @@ def self_test():
         mutate(bad)
         rejected(lambda bad=bad: exact_active_to_empty(bad))
     print("active-to-empty keeps its history and declares every owner: OK")
+
+    # The same bound applies to every document, not just the active-to-empty
+    # lifecycle: exact_evidence_keys (reached via exact_metrics_schema here)
+    # pins it once for every lane instead of every caller repeating it.
+    overflowed = copy.deepcopy(exited)
+    overflowed["evidence"]["active_slots"] = overflowed["evidence"]["slots"] + 1
+    rejected(lambda: exact_metrics_schema(overflowed))
+    negative_active_slots = copy.deepcopy(exited)
+    negative_active_slots["evidence"]["active_slots"] = -1
+    rejected(lambda: exact_metrics_schema(negative_active_slots))
+    print("active_slots is accepted at 0 after an exit and bounded by slots: OK")
 
     # ---- consumer scheduling (Task 3.1 repair) --------------------------
     # The loss splits are identities: capture + detach shares always sum to

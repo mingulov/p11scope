@@ -1579,6 +1579,19 @@ struct MultiLinkBundle<T> {
     links: Vec<T>,
 }
 
+/// Explicit failure for a slot left without a completed pair when fd exhaustion
+/// stops attachment. Callers detach and deactivate exactly the failed indices,
+/// so an unlisted slot would stay link-less or keep an entry-less return link.
+fn unfinished_after_exhaustion(slot: u32) -> (u32, String) {
+    (
+        slot,
+        format!(
+            "fd table exhausted before slot {slot} was fully attached; \
+             raise RLIMIT_NOFILE (ulimit -n) and retry"
+        ),
+    )
+}
+
 fn exhausted_multi(slot: u32, endpoints: usize, links: usize) -> (u32, String) {
     (
         slot,
@@ -1598,6 +1611,31 @@ fn exhausted_multi(slot: u32, endpoints: usize, links: usize) -> (u32, String) {
 /// [`BackendFallbackRequired`]. Returns the live links (one bundle per
 /// attached side) plus the singles-shaped [`AttachOutcome`].
 fn attach_target_groups_with<T>(
+    groups: &[StaticGroup],
+    completed_at: impl FnMut(&Slot) -> Option<u64>,
+    attach_link: impl FnMut(&'static str, &Path, &[(u64, u64)], bool) -> io::Result<T>,
+) -> Result<(Vec<MultiLinkBundle<T>>, AttachOutcome), BackendFallbackRequired> {
+    let (bundles, mut outcome) = attach_target_groups_unsettled(groups, completed_at, attach_link)?;
+    if outcome.exhausted {
+        // As for singles: after the summary, every member without a completed
+        // pair fails explicitly. Groups attach whole, so each kept bundle then
+        // belongs entirely to completed or entirely to failed members.
+        let mut settled: BTreeSet<u32> = outcome.failures.iter().map(|(slot, _)| *slot).collect();
+        settled.extend(outcome.completed.iter().map(|(slot, _)| *slot));
+        for member in groups.iter().flat_map(|group| &group.members) {
+            if settled.insert(member.slot.index) {
+                outcome
+                    .failures
+                    .push(unfinished_after_exhaustion(member.slot.index));
+            }
+        }
+    }
+    Ok((bundles, outcome))
+}
+
+/// [`attach_target_groups_with`] without settling unfinished members after
+/// exhaustion: the rebuild path records its own `was not reattached` remainder.
+fn attach_target_groups_unsettled<T>(
     groups: &[StaticGroup],
     mut completed_at: impl FnMut(&Slot) -> Option<u64>,
     mut attach_link: impl FnMut(&'static str, &Path, &[(u64, u64)], bool) -> io::Result<T>,
@@ -1812,7 +1850,7 @@ fn reattach_rebuilt_groups_with<T>(
                 entry_program: group.entry_program,
                 members: std::mem::take(&mut remaining),
             };
-            let (bundles, outcome) = match attach_target_groups_with(
+            let (bundles, outcome) = match attach_target_groups_unsettled(
                 std::slice::from_ref(&round),
                 &mut completed_at,
                 &mut attach_link,
@@ -2019,14 +2057,7 @@ fn attach_targets_with(
         settled.extend(completed.iter().map(|(slot, _)| *slot));
         for (slot, _) in &targets {
             if settled.insert(slot.index) {
-                failures.push((
-                    slot.index,
-                    format!(
-                        "fd table exhausted before slot {} was fully attached; \
-                             raise RLIMIT_NOFILE (ulimit -n) and retry",
-                        slot.index
-                    ),
-                ));
+                failures.push(unfinished_after_exhaustion(slot.index));
             }
         }
     };
@@ -5404,7 +5435,16 @@ mod tests {
         let (bundles, outcome) =
             attach_target_groups_with(&groups, |_| Some(7), mock.leaf()).unwrap();
         assert!(outcome.exhausted);
-        assert_eq!(outcome.failures.len(), 1);
+        // The summary first, then slot 1 (return-only) and the unattempted
+        // group's slots 2 and 3, each failed explicitly.
+        assert_eq!(
+            outcome
+                .failures
+                .iter()
+                .map(|(slot, _)| *slot)
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
         assert_eq!(outcome.failures[0].0, 0);
         assert_eq!(
             outcome.failures[0].1,
@@ -5422,6 +5462,58 @@ mod tests {
         );
         assert_eq!(outcome.successful.len(), 2);
         assert!(outcome.completed.is_empty());
+    }
+
+    #[test]
+    fn multi_exhaustion_fails_every_unfinished_member_explicitly() {
+        for (failed_path, failed_return, expected_failures, expected_completed) in [
+            ("/a.so", true, vec![0, 1, 2, 3], vec![]),
+            ("/a.so", false, vec![0, 1, 2, 3], vec![]),
+            ("/b.so", true, vec![2, 3], vec![0, 1]),
+            ("/b.so", false, vec![2, 3], vec![0, 1]),
+        ] {
+            let case = format!("{failed_path} return={failed_return}");
+            let (slots, targets) = two_groups();
+            let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
+            let mock = MockGroup {
+                calls: std::cell::RefCell::new(Vec::new()),
+                fail: Box::new(move |path, _, is_return| {
+                    (path == failed_path && is_return == failed_return)
+                        .then(|| io::Error::from_raw_os_error(libc::EMFILE))
+                }),
+            };
+            let (bundles, outcome) =
+                attach_target_groups_with(&groups, |_| Some(7), mock.leaf()).unwrap();
+            assert!(outcome.exhausted, "{case}");
+            let failed: Vec<u32> = outcome.failures.iter().map(|(slot, _)| *slot).collect();
+            let completed: Vec<u32> = outcome.completed.iter().map(|(slot, _)| *slot).collect();
+            assert_eq!(failed, expected_failures, "{case}");
+            assert_eq!(completed, expected_completed, "{case}");
+            assert!(
+                outcome.failures[0]
+                    .1
+                    .starts_with(&format!("fd table exhausted attaching slot {}", failed[0])),
+                "{case}: {}",
+                outcome.failures[0].1
+            );
+            for (slot, reason) in &outcome.failures[1..] {
+                assert!(
+                    reason.contains(&format!("before slot {slot} was fully attached")),
+                    "{case}: slot {slot} must fail explicitly: {reason}"
+                );
+            }
+            // A kept bundle belongs wholly to completed or wholly to failed
+            // members, so callers detach it whole without a group rebuild.
+            for bundle in &bundles {
+                let all_completed = bundle.slots.iter().all(|slot| completed.contains(slot));
+                let all_failed = bundle.slots.iter().all(|slot| failed.contains(slot));
+                assert!(
+                    all_completed || all_failed,
+                    "{case}: split bundle {:?}",
+                    bundle.slots
+                );
+            }
+        }
     }
 
     #[test]

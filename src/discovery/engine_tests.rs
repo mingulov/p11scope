@@ -3867,11 +3867,14 @@ fn engine_over_cgroup_naming(pids: &[u32]) -> (Engine, tempfile::TempDir) {
 }
 
 fn refresh_inventory_once(engine: &mut Engine) {
-    let mut session = ScriptedSession::with_records([], 0);
+    refresh_inventory_with(engine, &mut ScriptedSession::with_records([], 0));
+}
+
+fn refresh_inventory_with(engine: &mut Engine, session: &mut ScriptedSession) {
     let mut collect: Box<DiscoveryCollector<'_>> = Box::new(Engine::collect_discovery_records);
     engine
         .refresh_inventory(
-            &mut session,
+            session,
             &mut true,
             &mut Vec::new(),
             &mut PendingViewRetirements::new(),
@@ -15039,6 +15042,273 @@ fn refresh_releases_view_ids_for_members_that_ended_before_scan() {
         engine.next_view_id as usize,
         engine.views.len() + engine.retired_view_ids.len(),
         "tick 2: minted IDs balance: admitted + retired"
+    );
+}
+
+/// A live `sleep` child whose own image is already mapped. Until its exec
+/// completes the child is a fork of this test binary, and a scan racing that
+/// exec is not what the U-11 ticks below are about.
+fn spawn_execed_sleep() -> std::process::Child {
+    let child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let this_image = std::env::current_exe().unwrap();
+    let execed = || {
+        std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|image| {
+            image != this_image
+                && std::fs::read_to_string(format!("/proc/{pid}/maps"))
+                    .is_ok_and(|maps| maps_have_executable_image(&maps, &image))
+        })
+    };
+    let mut spins = 0;
+    while !execed() {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        spins += 1;
+        assert!(spins < 10_000, "sleep child {pid} never execed");
+    }
+    child
+}
+
+fn capacity_exhausted(engine: &Engine) -> bool {
+    engine
+        .counters
+        .object_skips
+        .iter()
+        .any(|skip| skip.reason.starts_with("capture process-view capacity"))
+}
+
+/// U-11, the `!targets_ok` exit. A candidate its target preflight refuses
+/// returns before any mutation and drops every view the tick just opened,
+/// and those IDs were never returned: a member held at that exit burned one
+/// ID per tick until the capture's process-view capacity was exhausted and
+/// the member was not scanned any more. Ticks well past the capacity now
+/// recycle one ID.
+#[test]
+fn refresh_releases_view_ids_when_the_target_preflight_refuses() {
+    let mut child = spawn_execed_sleep();
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[child.id()]);
+    engine.max_scan_pids = 2;
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    let mut session = ScriptedSession::refusing_preflight();
+
+    let ticks = 4;
+    for tick in 1..=ticks {
+        refresh_inventory_with(&mut engine, &mut session);
+        assert!(
+            engine.views.is_empty(),
+            "tick {tick}: a refused candidate admits nothing"
+        );
+    }
+
+    assert!(
+        !capacity_exhausted(&engine),
+        "ticks past the capacity never exhaust it: {:?}",
+        engine.counters.object_skips
+    );
+    assert_eq!(
+        engine.deep_scans, ticks as u64,
+        "every tick opened and scanned the member"
+    );
+    assert_eq!(
+        session.preflight_targets.borrow().len(),
+        ticks,
+        "every tick returned at its first preflight"
+    );
+    assert!(
+        engine.counters.object_skips.contains(&Skipped {
+            subject: "live inventory transaction".into(),
+            reason:
+                "candidate preflight failed; canonical identity, plan, and links were unchanged"
+                    .into(),
+        }),
+        "the refusal exit published its gap: {:?}",
+        engine.counters.object_skips
+    );
+    assert_eq!(
+        engine.retired_view_ids,
+        vec![0],
+        "the one ID returns to the pool at every refusal"
+    );
+    assert_eq!(engine.next_view_id, 1, "no tick mints a second ID");
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+/// U-11, the stale-generation exit. A process admitted this tick that ends
+/// before the inventory preflight reads the views makes the candidate stale:
+/// the tick re-requests the pid and returns, dropping the new view. The
+/// request is keyed by pid, and a later tick opens a fresh view under a fresh
+/// ID, so the dropped view's ID has to come back even though its pid is
+/// queued again. Every tick loses its newcomer exactly inside that preflight,
+/// well past the capacity.
+#[test]
+fn refresh_releases_view_ids_when_a_new_generation_ends_before_admission() {
+    let (mut engine, dir) = engine_over_cgroup_naming(&[]);
+    engine.max_scan_pids = 2;
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    let mut session = ScriptedSession::default();
+
+    let ticks = 4;
+    let mut lost = Vec::new();
+    for tick in 1..=ticks {
+        // The preflight kills and reaps this child; the test never waits on it.
+        let pid = spawn_execed_sleep().id();
+        std::fs::write(dir.path().join("cgroup.procs"), format!("{pid}\n")).unwrap();
+        session.lose_generations_at_preflight([Some(pid)]);
+        refresh_inventory_with(&mut engine, &mut session);
+        assert!(
+            engine.views.is_empty(),
+            "tick {tick}: a generation lost before admission is not admitted"
+        );
+        lost.push(pid);
+    }
+
+    assert!(
+        !capacity_exhausted(&engine),
+        "ticks past the capacity never exhaust it: {:?}",
+        engine.counters.object_skips
+    );
+    assert_eq!(
+        engine.deep_scans, ticks as u64,
+        "every tick opened and scanned its newcomer"
+    );
+    assert_eq!(
+        session.preflight_targets.borrow().len(),
+        ticks,
+        "every tick returned at its first preflight"
+    );
+    assert!(
+        engine.counters.object_skips.contains(&Skipped {
+            subject: "live inventory generation".into(),
+            reason: "an exact retained or newly opened process generation changed during inventory preflight"
+                .into(),
+        }),
+        "the stale exit published its loss: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        lost.iter()
+            .all(|pid| engine.refresh_requested.contains(pid)),
+        "every lost newcomer's pid is queued again: {:?}",
+        engine.refresh_requested
+    );
+    assert_eq!(
+        engine.retired_view_ids,
+        vec![0],
+        "the dropped view's ID returns although its pid is queued again"
+    );
+    assert_eq!(engine.next_view_id, 1, "no tick mints a second ID");
+}
+
+/// U-11, the post-retirement preflight exits. A candidate that passed its
+/// first preflight is checked again after conservative retirements, and both
+/// the refusal and the stale-generation return there dropped the tick's new
+/// views without their IDs. Tick 1 refuses the second preflight; tick 2
+/// loses the newcomer inside it.
+#[test]
+fn refresh_releases_view_ids_at_the_post_retirement_preflight_exits() {
+    // Tick 2's preflight kills and reaps this child; the test never waits on it.
+    let pid = spawn_execed_sleep().id();
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    let mut session = ScriptedSession::default();
+
+    session.refuse_preflights([false, true]);
+    refresh_inventory_with(&mut engine, &mut session);
+    assert!(engine.views.is_empty(), "tick 1: nothing is admitted");
+    assert_eq!(
+        session.preflight_targets.borrow().len(),
+        2,
+        "tick 1 returned at its second preflight"
+    );
+    assert!(
+        engine.counters.object_skips.contains(&Skipped {
+            subject: "live inventory transaction".into(),
+            reason: "post-retirement candidate preflight failed; conservative retirements were committed and additions were blocked"
+                .into(),
+        }),
+        "tick 1: the post-retirement refusal published its gap: {:?}",
+        engine.counters.object_skips
+    );
+    assert_eq!(
+        engine.retired_view_ids,
+        vec![0],
+        "tick 1: the refused newcomer's ID returns to the pool"
+    );
+    assert_eq!(engine.next_view_id, 1, "tick 1: one ID was minted");
+
+    session.lose_generations_at_preflight([None, Some(pid)]);
+    refresh_inventory_with(&mut engine, &mut session);
+    assert!(engine.views.is_empty(), "tick 2: nothing is admitted");
+    assert_eq!(
+        session.preflight_targets.borrow().len(),
+        4,
+        "tick 2 returned at its second preflight"
+    );
+    assert!(
+        engine.counters.object_skips.contains(&Skipped {
+            subject: "live inventory generation".into(),
+            reason: "an exact retained or newly opened process generation changed during post-retirement preflight"
+                .into(),
+        }),
+        "tick 2: the post-retirement stale exit published its loss: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine.refresh_requested.contains(&pid),
+        "tick 2: the lost newcomer's pid is queued again"
+    );
+    assert_eq!(
+        engine.retired_view_ids,
+        vec![0],
+        "tick 2: the lost newcomer's ID returns to the pool"
+    );
+    assert_eq!(engine.next_view_id, 1, "tick 2: no second ID was minted");
+}
+
+/// U-11: a view the tick never admitted returns its ID only when nothing
+/// still names it. A conservative retirement commits the modules and pin
+/// claims of every new view that stayed current without retaining the view,
+/// and a record pass that fails after `queue_apply_outcome` can leave a
+/// retirement intent behind. A later generation reusing such an ID would
+/// inherit the old one's modules, claims, or retirement. Each leftover here
+/// is named by exactly one of those, and only the unnamed one is released.
+#[test]
+fn unadmitted_view_ids_stay_allocated_while_engine_state_names_them() {
+    let (mut engine, module, _, _) = engine_with_overlay(7);
+    let claimed = module.view;
+    let listed = ProcessViewId(claimed.0 + 1);
+    let intended = ProcessViewId(claimed.0 + 2);
+    let free = ProcessViewId(claimed.0 + 3);
+    // The committed module moves to `listed`; its pin claims stay on `claimed`.
+    engine.modules[0].scanned.view = listed;
+    engine
+        .retirement_intents
+        .insert(intended, RetirementCause::GenerationLost);
+    engine.next_view_id = free.0 + 1;
+    assert!(engine.pinned.view_claims(claimed).is_some());
+    assert!(engine.pinned.view_claims(listed).is_none());
+
+    let pid = std::process::id();
+    let leftovers = [claimed, listed, intended, free]
+        .into_iter()
+        .map(|id| {
+            (
+                ProcessView::open(id, pid).unwrap(),
+                Vec::new(),
+                PinnedObjects::empty(),
+            )
+        })
+        .collect();
+    engine.release_unadmitted_views(leftovers);
+
+    assert_eq!(
+        engine.retired_view_ids,
+        vec![free.0],
+        "only the ID nothing names returns to the pool"
     );
 }
 

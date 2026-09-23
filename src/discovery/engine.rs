@@ -2056,6 +2056,7 @@ struct ScanInput {
 }
 
 type InventoryScan = (ProcessViewId, Vec<ScannedModule>, PinnedObjects);
+type InventoryNewView = (ProcessView, Vec<ScannedModule>, PinnedObjects);
 type InventoryScanOutcome = (Vec<InventoryScan>, BTreeSet<u32>, Vec<Skipped>);
 type PendingViewRetirements = BTreeMap<ProcessViewId, RetirementCause>;
 type TerminalSelectionHandoffs = BTreeMap<u16, Vec<DiscoveryRecord>>;
@@ -13724,6 +13725,12 @@ impl Engine {
         select_rotation_candidates(&pool, free_slots, &stale)
     }
 
+    /// One inventory tick. Every process view the tick opens waits in
+    /// `new_views` until an accepted candidate moves it into `self.views`,
+    /// and the tick has many earlier ways out: preflight refusals, stale
+    /// generations, queued retirements, a refused apply, and every `?`.
+    /// Whatever is still waiting when the tick returns was never admitted;
+    /// it is settled here, once, whichever exit was taken (U-11).
     fn refresh_inventory(
         &mut self,
         session: &mut dyn EngineSession,
@@ -13732,6 +13739,52 @@ impl Engine {
         pending_views: &mut PendingViewRetirements,
         collect: &mut DiscoveryCollector<'_>,
         closure: &mut PauseClosure,
+    ) -> Result<bool> {
+        let mut new_views = Vec::new();
+        let result = self.refresh_inventory_inner(
+            session,
+            additions_allowed,
+            records,
+            pending_views,
+            collect,
+            closure,
+            &mut new_views,
+        );
+        self.release_unadmitted_views(new_views);
+        result
+    }
+
+    /// Returns the IDs of views a tick opened but never admitted. Such a view
+    /// is normally named by nothing else, with two exceptions. A conservative
+    /// retirement commits the modules and pin claims of every new view that
+    /// stayed current, without retaining the view. And a record pass that
+    /// fails after `queue_apply_outcome` can leave a lost newcomer's
+    /// retirement intent behind. Those IDs stay allocated: a later generation
+    /// that reused one would inherit the old one's modules, claims, or
+    /// retirement.
+    fn release_unadmitted_views(&mut self, views: Vec<InventoryNewView>) {
+        for (view, _, _) in views {
+            let id = view.id();
+            let still_named = self.modules.iter().any(|module| module.scanned.view == id)
+                || self.pinned.view_claims(id).is_some()
+                || self.retirement_intents.contains_key(&id);
+            if !still_named {
+                self.release_view_id(id);
+            }
+        }
+    }
+
+    /// The tick itself. `refresh_inventory` owns `new_views` across its exits.
+    #[allow(clippy::too_many_arguments)]
+    fn refresh_inventory_inner(
+        &mut self,
+        session: &mut dyn EngineSession,
+        additions_allowed: &mut bool,
+        records: &mut Vec<QueuedDiscoveryRecord>,
+        pending_views: &mut PendingViewRetirements,
+        collect: &mut DiscoveryCollector<'_>,
+        closure: &mut PauseClosure,
+        new_views: &mut Vec<InventoryNewView>,
     ) -> Result<bool> {
         if matches!(self.scope, Scope::Pid(_)) {
             let mut stale: BTreeSet<_> = self
@@ -13914,7 +13967,6 @@ impl Engine {
                 ),
             });
         }
-        let mut new_views = Vec::new();
         let mut unprocessed = admitted.into_iter();
         while let Some(pid) = unprocessed.next() {
             // The tick quantum stops admissions before another scan: this
@@ -13996,7 +14048,7 @@ impl Engine {
             }
         }
 
-        for (view, _, _) in &new_views {
+        for (view, _, _) in new_views.iter() {
             if !view.still_the_same() {
                 skipped.push(Skipped {
                     subject: "process view".into(),
@@ -14009,9 +14061,9 @@ impl Engine {
         let mut refreshed_ok: BTreeSet<_> =
             refreshed_scans.iter().map(|(view, _, _)| *view).collect();
         let candidate =
-            self.inventory_candidate(&removed, &refreshed_scans, &new_views, skipped.clone())?;
+            self.inventory_candidate(&removed, &refreshed_scans, new_views, skipped.clone())?;
         let admission =
-            self.inventory_candidate_admission(session, &candidate, &removed, &new_views);
+            self.inventory_candidate_admission(session, &candidate, &removed, new_views);
         let mut changed = self.latch_candidate_ambiguity(&candidate.plan);
         self.pending_rejected_keys
             .extend(admission.newly_rejected_keys.iter().copied());
@@ -14023,7 +14075,7 @@ impl Engine {
                 .copied()
                 .collect();
             self.queue_stale_views(&retained_stale, pending_views);
-            for (view, _, _) in &new_views {
+            for (view, _, _) in new_views.iter() {
                 if admission.stale_views.contains(&view.id()) {
                     self.request_refresh(view.pid());
                     failed_refresh_pids.insert(view.pid());
@@ -14152,10 +14204,9 @@ impl Engine {
         refreshed_ok = refreshed_scans.iter().map(|(view, _, _)| *view).collect();
         refreshed_ok.retain(|view| !failed_retirements.contains(view));
         refreshed_scans.retain(|(view, _, _)| refreshed_ok.contains(view));
-        let candidate =
-            self.inventory_candidate(&removed, &refreshed_scans, &new_views, skipped)?;
+        let candidate = self.inventory_candidate(&removed, &refreshed_scans, new_views, skipped)?;
         let admission =
-            self.inventory_candidate_admission(session, &candidate, &removed, &new_views);
+            self.inventory_candidate_admission(session, &candidate, &removed, new_views);
         changed |= self.latch_candidate_ambiguity(&candidate.plan);
         self.pending_rejected_keys
             .extend(admission.newly_rejected_keys.iter().copied());
@@ -14167,7 +14218,7 @@ impl Engine {
                 .intersection(&retained_ids)
                 .copied()
                 .collect();
-            for (view, _, _) in &new_views {
+            for (view, _, _) in new_views.iter() {
                 if admission.stale_views.contains(&view.id()) {
                     self.request_refresh(view.pid());
                     failed_refresh_pids.insert(view.pid());
@@ -14247,7 +14298,7 @@ impl Engine {
             }
         }
         if outcome.accepted() && !conservative_only {
-            for (view, _, _) in std::mem::take(&mut new_views) {
+            for (view, _, _) in std::mem::take(new_views) {
                 self.views.push(view);
             }
             self.record_cgroup_view_admissions(new_view_ids.iter().copied());
@@ -14994,6 +15045,13 @@ pub(crate) mod session_fixture {
         kill_on_dynamic_attach: Option<u32>,
         /// Refuses every `preflight_targets`, i.e. a pure preflight refusal.
         refuse_preflight: bool,
+        /// One entry per upcoming `preflight_targets` call; `true` refuses
+        /// that call. Later calls follow `refuse_preflight`.
+        preflight_refusals: RefCell<VecDeque<bool>>,
+        /// One entry per upcoming `preflight_targets` call: `Some(pid)` is
+        /// killed and reaped inside that call, i.e. a generation lost after
+        /// the candidate was built but before its admission reads the views.
+        preflight_losses: RefCell<VecDeque<Option<u32>>>,
         pub(crate) preflight_targets: RefCell<Vec<Vec<(u32, PinnedObjectId, u64)>>>,
     }
 
@@ -15052,6 +15110,21 @@ pub(crate) mod session_fixture {
                 refuse_preflight: true,
                 ..Self::default()
             }
+        }
+
+        /// Schedules the outcome of the next `preflight_targets` calls; `true`
+        /// refuses that call.
+        pub(crate) fn refuse_preflights(&mut self, script: impl IntoIterator<Item = bool>) {
+            *self.preflight_refusals.borrow_mut() = script.into_iter().collect();
+        }
+
+        /// Schedules generation losses inside the next `preflight_targets`
+        /// calls: `Some(pid)` kills and reaps `pid` in that call.
+        pub(crate) fn lose_generations_at_preflight(
+            &mut self,
+            script: impl IntoIterator<Item = Option<u32>>,
+        ) {
+            *self.preflight_losses.borrow_mut() = script.into_iter().collect();
         }
 
         /// Schedules the outcome of the next one-shot slot detaches; `true`
@@ -15133,8 +15206,16 @@ pub(crate) mod session_fixture {
                     .map(|slot| (slot.index, slot.object, slot.file_offset))
                     .collect(),
             );
+            if let Some(Some(pid)) = self.preflight_losses.borrow_mut().pop_front() {
+                kill_and_reap(pid);
+            }
+            let refused = self
+                .preflight_refusals
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(self.refuse_preflight);
             attachment_admission(&self.detach_failures, !targets.is_empty())?;
-            if self.refuse_preflight {
+            if refused {
                 bail!("scripted target preflight refused the candidate");
             }
             Ok(())

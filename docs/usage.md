@@ -344,11 +344,15 @@ seconds or `30s`/`5m`/`1h`) requests shutdown after the given interval. Probe
 teardown and final reporting follow; with many attached functions, this can
 add seconds, and calls may still be observed while probes are being detached.
 Ctrl-C or SIGTERM also ends a capture cleanly (final frame printed, `-o` file
-written) instead of aborting it — unless the observer is
-wedged holding a paused child (observed once 2026-09-15 with `--pause auto`
-over an NSS dependency cascade: SIGTERM ignored, SIGKILL required; see the
-provider-qual note's gaps section). Prefer `--pause never` with `LD_PRELOAD` for
-dependency-heavy targets until that gap is fixed.
+written) instead of aborting it. Under `run`, a child the pause holds stopped
+is resumed before the observer signals it or hands it back. The stop signal is
+forwarded to the child's process group; a child still alive gets SIGTERM 5 s
+later and SIGKILL 5 s after that, so settling it takes at most 15 s (a second
+Ctrl-C sends SIGKILL at once). A stop still waiting for its pause cycle when
+the capture ends is reported as `pause: partial` (`--pause always` fails the
+run instead). A signal that lands inside an active pause cycle (which has a
+500 ms deadline) can instead end the run with a `pause coordination cancelled`
+error, after the same resume and settlement and without writing the `-o` file.
 
 A `--cgroup` capture sweeps every member's mappings, then deep-scans at most
 256 members per pass, rarest providers first; past the cap the capture

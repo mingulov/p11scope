@@ -1875,6 +1875,41 @@ fn a_larger_growth_replaces_the_published_growth_omission() {
     );
 }
 
+/// G-03: omission exposure is capture history. A growth whose omission later
+/// shrinks keeps publishing the largest omission the capture saw: the calls
+/// through the endpoints omitted earlier were missed all the same.
+#[test]
+fn a_smaller_later_growth_keeps_the_larger_published_omission() {
+    let admitted = p11scope_ebpf_common::MAX_SLOTS - 1;
+    let (mut engine, raw) = engine_admitting_overlay(65, admitted);
+    let mut grown = raw.clone();
+    grown.tables[0].entries = overlay_entries(&raw, first_offsets(admitted + 5));
+    commit_live_rebuild(&mut engine, &grown);
+
+    grown.tables[0].entries = overlay_entries(&raw, first_offsets(admitted + 2));
+    let delta = commit_live_rebuild(&mut engine, &grown);
+
+    assert!(delta.new.is_empty() && delta.replace.is_empty() && delta.retire.is_empty());
+    assert_eq!(
+        engine.discovery.modules_skipped.len(),
+        1,
+        "{:?}",
+        engine.discovery.modules_skipped
+    );
+    let omission = &engine.discovery.modules_skipped[0];
+    assert!(
+        omission.reason.starts_with("admitted module needs 5 more;"),
+        "{omission:?}"
+    );
+    assert_eq!(
+        engine.plan.modules_skipped,
+        [plan::Skipped {
+            subject: omission.name.clone(),
+            reason: omission.reason.clone(),
+        }]
+    );
+}
+
 /// G-03: a module whose growth was omitted and that is later refused whole —
 /// its sources list none of the endpoints it had any more — is published as
 /// refused, not left reading "partially covered".

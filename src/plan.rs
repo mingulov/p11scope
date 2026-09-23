@@ -178,6 +178,18 @@ pub(crate) fn is_growth_omission(reason: &str) -> bool {
     reason.starts_with(GROWTH_OMISSION)
 }
 
+/// The omitted count a growth omission states — the `N` of
+/// `admitted module needs N more;` — or `None` for any other reason.
+pub(crate) fn growth_omitted_count(reason: &str) -> Option<usize> {
+    reason
+        .strip_prefix(GROWTH_OMISSION)?
+        .strip_prefix(' ')?
+        .split_once(" more;")?
+        .0
+        .parse()
+        .ok()
+}
+
 /// The omitted endpoints are not called new: an endpoint deactivated earlier
 /// in the capture and listed again needs a fresh slot just the same.
 fn growth_omission_reason(omitted: usize, capacity: usize, in_use: usize, kept: usize) -> String {
@@ -4052,10 +4064,21 @@ mod tests {
              — 2 endpoints not attached; kept its 511 attached endpoints"
         );
         assert!(is_growth_omission(&growth_omission_reason(1, 512, 512, 1)));
-        assert!(!is_growth_omission(
-            "module needs 2 more; only 512 attach slots are available; 511 are in use — \
-             refusing to attach a prefix"
-        ));
+        let whole = "module needs 2 more; only 512 attach slots are available; 511 are in use — \
+                     refusing to attach a prefix";
+        assert!(!is_growth_omission(whole));
+        // The omitted count round-trips through the record the engine ranks.
+        for omitted in [1, 2, 511, 2_113] {
+            assert_eq!(
+                growth_omitted_count(&growth_omission_reason(omitted, 512, 511, 7)),
+                Some(omitted)
+            );
+        }
+        assert_eq!(growth_omitted_count(whole), None);
+        assert_eq!(
+            growth_omitted_count("admitted module needs many more;"),
+            None
+        );
     }
 
     /// The key a `scanned_with` fixture pins to `object`.

@@ -1871,15 +1871,25 @@ impl CaptureFacts {
         }
         for (object, refused) in plan.refused_modules() {
             let id = self.module_id_for_object(pinned, object)?;
-            // One record per module. A whole refusal stays the capture's
-            // record of it; a growth omission (G-03) yields to any newer
-            // record, so a larger growth or a later whole refusal is never
-            // hidden behind the first omission.
+            // One record per module, a high-water mark like every omission
+            // above: a whole refusal stays the capture's record of it and
+            // outranks any growth omission (G-03); among growth omissions the
+            // largest omitted count the capture saw is kept, so a growth that
+            // later shrinks never under-reports what was missed. That count
+            // is a lower bound on the endpoints omitted over the capture.
+            let rank = |reason: &str| {
+                (
+                    !plan::is_growth_omission(reason),
+                    plan::growth_omitted_count(reason).unwrap_or(0),
+                )
+            };
             let known = history
                 .refusals
                 .entry(id)
                 .or_insert_with(|| refused.clone());
-            if plan::is_growth_omission(&known.reason) {
+            if plan::is_growth_omission(&known.reason)
+                && rank(&refused.reason) >= rank(&known.reason)
+            {
                 known.clone_from(refused);
             }
         }

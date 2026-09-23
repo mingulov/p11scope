@@ -2011,6 +2011,25 @@ fn attach_targets_with(
                 ),
             )
         };
+    // After the summary, fail every slot without a completed pair explicitly:
+    // callers detach and deactivate exactly the failed indices, so an
+    // unlisted slot would stay link-less or keep a return that can never pair.
+    let fail_unfinished = |failures: &mut Vec<(u32, String)>, completed: &[(u32, Option<u64>)]| {
+        let mut settled: BTreeSet<u32> = failures.iter().map(|(slot, _)| *slot).collect();
+        settled.extend(completed.iter().map(|(slot, _)| *slot));
+        for (slot, _) in &targets {
+            if settled.insert(slot.index) {
+                failures.push((
+                    slot.index,
+                    format!(
+                        "fd table exhausted before slot {} was fully attached; \
+                             raise RLIMIT_NOFILE (ulimit -n) and retry",
+                        slot.index
+                    ),
+                ));
+            }
+        }
+    };
     for (slot, _) in &targets {
         match attach("p11_return", slot, slot_attach_point(slot)) {
             Ok(()) => {
@@ -2023,6 +2042,7 @@ fn attach_targets_with(
             Err(error) => {
                 if is_fd_exhaustion(&error) {
                     failures.push(exhausted(slot, &successful, &error));
+                    fail_unfinished(&mut failures, &completed);
                     return Ok(AttachOutcome {
                         successful,
                         failures,
@@ -2064,6 +2084,7 @@ fn attach_targets_with(
                 Err(error) => {
                     if is_fd_exhaustion(&error) {
                         failures.push(exhausted(slot, &successful, &error));
+                        fail_unfinished(&mut failures, &completed);
                         return Ok(AttachOutcome {
                             successful,
                             failures,
@@ -6130,8 +6151,23 @@ mod tests {
 
         assert_eq!(attempted, [("p11_return", 0), ("p11_return", 1)]);
         assert!(outcome.exhausted);
-        assert_eq!(outcome.failures.len(), 1);
+        // One summary first, then every unfinished slot explicitly: slot 0
+        // keeps only a return link and slot 2 was never attempted.
+        assert_eq!(
+            outcome
+                .failures
+                .iter()
+                .map(|(slot, _)| *slot)
+                .collect::<Vec<_>>(),
+            [1, 0, 2]
+        );
         assert_eq!(outcome.failures[0].0, 1);
+        for (slot, reason) in &outcome.failures[1..] {
+            assert!(
+                reason.contains(&format!("before slot {slot} was fully attached")),
+                "slot {slot} must fail explicitly: {reason}"
+            );
+        }
         assert!(
             outcome.failures[0]
                 .1
@@ -6206,7 +6242,20 @@ mod tests {
                 outcome.exhausted,
                 "{failed_program} must stop after typed Aya EMFILE"
             );
-            assert_eq!(outcome.failures.len(), 1);
+            // The summary is first; every unfinished slot follows explicitly.
+            let expected_failures: &[u32] = if failed_program == "p11_return" {
+                &[2, 0, 1, 3]
+            } else {
+                &[1, 2, 3]
+            };
+            assert_eq!(
+                outcome
+                    .failures
+                    .iter()
+                    .map(|(slot, _)| *slot)
+                    .collect::<Vec<_>>(),
+                expected_failures
+            );
             assert_eq!(outcome.failures[0].0, failed_slot);
             assert!(outcome.failures[0].1.contains("fd table exhausted"));
             assert!(
@@ -6259,6 +6308,86 @@ mod tests {
                 );
                 assert_eq!(outcome.completed, [(0, Some(100))]);
                 assert_eq!(completions, [0]);
+            }
+        }
+    }
+
+    #[test]
+    fn typed_aya_fd_exhaustion_fails_every_unfinished_slot_explicitly() {
+        // Callers detach and deactivate exactly the failed indices. After an
+        // exhaustion stop, a slot left out of both lists would stay active and
+        // link-less, or keep a return that can never pair with an entry.
+        for (failed_program, failed_slot) in [
+            ("p11_return", 0),
+            ("p11_return", 2),
+            ("p11_return", 3),
+            ("p11_entry", 0),
+            ("p11_entry", 1),
+            ("p11_entry", 3),
+        ] {
+            let slots = [test_slot(0), test_slot(1), test_slot(2), test_slot(3)];
+            let outcome = attach_targets_with(
+                &slots,
+                CapturePolicy::Allowlisted,
+                false,
+                |_| Ok(ElfAbi::Lp64),
+                |program, slot, _| {
+                    if program == failed_program && slot.index == failed_slot {
+                        return Err(static_attach_error(
+                            program,
+                            slot,
+                            aya_attach_errno(libc::EMFILE),
+                        ));
+                    }
+                    Ok(())
+                },
+                |slot| Some(100 + u64::from(slot.index)),
+            )
+            .unwrap();
+
+            let case = format!("{failed_program} exhausted at slot {failed_slot}");
+            assert!(outcome.exhausted, "{case}");
+            assert_eq!(outcome.failures[0].0, failed_slot, "{case}");
+            assert!(
+                outcome.failures[0]
+                    .1
+                    .contains(&format!("fd table exhausted attaching slot {failed_slot}")),
+                "{case}: the summary stays first: {}",
+                outcome.failures[0].1
+            );
+            let completed: BTreeSet<u32> =
+                outcome.completed.iter().map(|(slot, _)| *slot).collect();
+            let failed: Vec<u32> = outcome.failures.iter().map(|(slot, _)| *slot).collect();
+            let failed_set: BTreeSet<u32> = failed.iter().copied().collect();
+            assert_eq!(
+                failed.len(),
+                failed_set.len(),
+                "{case}: one record per slot"
+            );
+            assert!(completed.is_disjoint(&failed_set), "{case}");
+            assert_eq!(
+                completed
+                    .union(&failed_set)
+                    .copied()
+                    .collect::<BTreeSet<_>>(),
+                (0..4).collect(),
+                "{case}: every slot is a completed pair or an explicit failure"
+            );
+            for (slot, reason) in &outcome.failures[1..] {
+                assert!(
+                    reason.contains(&format!(
+                        "fd table exhausted before slot {slot} was fully attached"
+                    )) && reason.contains("ulimit -n"),
+                    "{case}: slot {slot} must fail explicitly, never silently: {reason}"
+                );
+            }
+            // Every retained link belongs to a completed pair or to a failed
+            // slot that the caller now detaches; nothing is orphaned.
+            for (slot, _) in &outcome.successful {
+                assert!(
+                    completed.contains(slot) || failed_set.contains(slot),
+                    "{case}: link for slot {slot} has no owner"
+                );
             }
         }
     }

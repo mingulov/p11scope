@@ -10120,6 +10120,76 @@ fn license_tracked_files() -> Vec<String> {
         .collect()
 }
 
+/// SHA-256 of each exact trimmed line in the two offline-dependency files that
+/// names upstream license filenames as provenance. Any other occurrence, in any
+/// syntax, is treated as a pre-relicense claim until reviewed and added here.
+const LICENSE_PROVENANCE_LINES: &[(&str, &str)] = &[
+    (
+        "scripts/offline-dependencies.py",
+        "f30fee0bf6b494d477f15672bcade1c817f83d7c203b91bc2a86b4ed0ce87476",
+    ),
+    (
+        "scripts/offline-dependencies.py",
+        "99bcb536a9d5ab98abe5d059b3635ffd4a779e7bff77c26657b48b2d9689c20c",
+    ),
+    (
+        "tests/python/test_offline_dependencies.py",
+        "e799b98f78039b23f8de996d2825bacca796071a6029596c71b4c4f061d62145",
+    ),
+    (
+        "tests/python/test_offline_dependencies.py",
+        "f8631cec6e9ee694665faea2c9a79039d1f01efafc1408bc79c47189485414bb",
+    ),
+    (
+        "tests/python/test_offline_dependencies.py",
+        "26582f2c5e3fc9e667744ab6f5de8fad086e46fefde91e7d507dbd2b6d6ec168",
+    ),
+    (
+        "tests/python/test_offline_dependencies.py",
+        "b34c40bdbcc7b946b272be45cad182655c271e6c3dbed080242c35bd941123d2",
+    ),
+    (
+        "tests/python/test_offline_dependencies.py",
+        "8fb78cd63cd752215f0a5edf3a3a8cb46b09432301e17183aae22e254eb9bbaf",
+    ),
+    (
+        "tests/python/test_offline_dependencies.py",
+        "d09efcaccf9bb61e9725c22a99e31f562c87e66cce4d3b7683a1c197a82cf705",
+    ),
+    (
+        "tests/python/test_offline_dependencies.py",
+        "d816903bcd5f58add26676417614c064ba09f82ab44efc993b53fbf25a802ba2",
+    ),
+    (
+        "tests/python/test_offline_dependencies.py",
+        "d1e8c556908966d787400bdedf8de0e974b742be0b0fc0f65f2af07fca73801c",
+    ),
+    (
+        "tests/python/test_offline_dependencies.py",
+        "ef028fd1fb095b6d9380d0d409a952228886e4cf29d40bf7b852c4cb7d917912",
+    ),
+    (
+        "tests/python/test_offline_dependencies.py",
+        "14d7dc1947ccf1250c6bc5d11f0df09ed3a1ee43f59444bc76e2a4364048dedd",
+    ),
+    (
+        "tests/python/test_offline_dependencies.py",
+        "d31bca7c7d65526fa98f95bedbaf371a1b0e1fe49611c1730ba218dada2f76eb",
+    ),
+    (
+        "tests/python/test_offline_dependencies.py",
+        "c5dfe15f3b79d887884126f2a1a6366a46c5b017793fb50643bbfecf9e0c3c1f",
+    ),
+];
+
+fn license_line_digest(line: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    Sha256::digest(line.trim().as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn is_upstream_provenance_filename(path: &str, text: &str, offset: usize, marker: &str) -> bool {
     if !matches!(
         path,
@@ -10128,21 +10198,14 @@ fn is_upstream_provenance_filename(path: &str, text: &str, offset: usize, marker
     {
         return false;
     }
-    let before = &text[..offset];
-    let after = &text[offset + marker.len()..];
-    let Some(before_quote) = before
-        .strip_suffix('"')
-        .or_else(|| before.strip_suffix("\"provenance/shared/"))
-    else {
-        return false;
-    };
-    // A quoted marker assigned straight to a name is a license claim, not an
-    // upstream provenance filename (e.g. `PROJECT_LICENSE = "<marker>"`).
-    // Other quoted literals in these two files remain a known limitation.
-    let lead = before_quote.trim_end_matches([' ', '\t']);
-    let assigned =
-        lead.ends_with('=') && !["==", "!=", "<=", ">="].iter().any(|op| lead.ends_with(op));
-    after.starts_with('"') && !assigned
+    let line_start = text[..offset].rfind('\n').map_or(0, |index| index + 1);
+    let line_end = text[offset..]
+        .find('\n')
+        .map_or(text.len(), |index| offset + index);
+    let digest = license_line_digest(&text[line_start..line_end]);
+    LICENSE_PROVENANCE_LINES
+        .iter()
+        .any(|(allowed_path, allowed)| *allowed_path == path && *allowed == digest)
 }
 
 fn license_legal_surface_errors(root: &std::path::Path, tracked: &[String]) -> Vec<String> {
@@ -10491,6 +10554,18 @@ fn license_legal_surface_checker_rejects_bad_fixtures() {
 }
 
 #[test]
+fn license_provenance_allowlist_names_only_existing_lines() {
+    for (path, digest) in LICENSE_PROVENANCE_LINES {
+        let text = fs::read_to_string(path).expect("allowlisted provenance file");
+        assert!(
+            text.lines()
+                .any(|line| license_line_digest(line) == *digest),
+            "{path}: allowlisted line {digest} no longer exists; remove it"
+        );
+    }
+}
+
+#[test]
 fn license_legal_surface_accepts_only_quoted_upstream_provenance_names() {
     let root = tempfile::TempDir::new().expect("tempdir");
     license_write_fixture(root.path(), "LICENSE", b"Version 3, 29 June 2007\n");
@@ -10520,7 +10595,11 @@ fn license_legal_surface_accepts_only_quoted_upstream_provenance_names() {
     license_write_fixture(
         root.path(),
         test,
-        format!("p / \"provenance/shared/{apache}\"\np / \"{mit}\"\n").as_bytes(),
+        format!(
+            "(self.shared / \"{apache}\").write_text(\"fixture Apache license\\n\", encoding=\"utf-8\")\n\
+             (self.shared / \"{mit}\").write_text(\"fixture MIT license\\n\", encoding=\"utf-8\")\n"
+        )
+        .as_bytes(),
     );
     license_write_fixture(root.path(), other, b"# no legacy text\n");
     assert!(
@@ -10531,6 +10610,8 @@ fn license_legal_surface_accepts_only_quoted_upstream_provenance_names() {
     for (path, content) in [
         (tool, format!("# this project uses {mit}\n")),
         (tool, format!("PROJECT_LICENSE = \"{mit}\"\n")),
+        (tool, format!("PROJECT_LICENSE = (\"{mit}\")\n")),
+        (tool, format!("SHARED_LICENSES = (\"{mit}\",)\n")),
         (test, format!("license = \"{apache}\"\n")),
         (
             test,

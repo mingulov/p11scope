@@ -13319,6 +13319,21 @@ impl Engine {
                 else {
                     self.retirement_intents.remove(&view);
                     self.ready_expected_removals.remove(&view);
+                    // Deferred reclamation: the intent was the reason this ID
+                    // stayed allocated past the tick that dropped its view
+                    // (`release_unadmitted_views`). With the intent settled,
+                    // the ID returns to the pool when modules and pin claims
+                    // do not name it — the `still_named` check minus the
+                    // intent — instead of leaking one per such event. A
+                    // double release is a silent no-op.
+                    let still_named = self
+                        .modules
+                        .iter()
+                        .any(|module| module.scanned.view == view)
+                        || self.pinned.view_claims(view).is_some();
+                    if !still_named {
+                        self.release_view_id(view);
+                    }
                     continue;
                 };
                 let ready = if self.ready_expected_removals.contains(&view)

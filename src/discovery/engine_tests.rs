@@ -15710,6 +15710,37 @@ fn unadmitted_view_ids_stay_allocated_while_engine_state_names_them() {
         vec![free.0],
         "only the ID nothing names returns to the pool"
     );
+
+    // G2: the leftover intent settles once record processing finds no
+    // retained view under it, and the ID it held returns to the pool
+    // instead of leaking one per such event toward the ceiling. A
+    // subsequent allocation reuses it.
+    let mut session = ScriptedSession::default();
+    let mut collect: Box<DiscoveryCollector<'_>> = Box::new(Engine::collect_discovery_records);
+    engine
+        .process_discovery_records(
+            &mut session,
+            &mut Vec::new(),
+            &mut PendingViewRetirements::new(),
+            &mut true,
+            &mut *collect,
+            &mut PauseClosure::new(true),
+        )
+        .expect("retirement settlement drains without records");
+    assert!(
+        !engine.retirement_intents.contains_key(&intended),
+        "settlement drains the leftover intent"
+    );
+    assert!(
+        engine.retired_view_ids.contains(&intended.0),
+        "the settled ID returns to the pool: {:?}",
+        engine.retired_view_ids
+    );
+    assert_eq!(
+        engine.allocate_view_id().unwrap(),
+        intended,
+        "a subsequent allocation reuses the settled ID"
+    );
 }
 
 /// U-07 fixture: a cgroup-scope engine whose membership is exactly what the

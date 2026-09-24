@@ -16736,6 +16736,145 @@ fn a_generation_skipped_replacement_recovers_the_surviving_owner() {
     assert!(!active.is_empty(), "A stays attached");
 }
 
+/// G3 (F3 sibling). Startup export attach needs the skipped-view retry too.
+/// Two views are armed with exports unattached; the earlier view's
+/// generation is lost during startup export attach, closing additions
+/// before the later view's work runs. The later view is left armed with
+/// hooks absent and — without the retry — no refresh queued, yet startup
+/// still succeeds. It must be requested again, and the next tick must
+/// attach its exports: exactly one live loader context, no double-arm.
+#[test]
+fn startup_export_attach_retries_the_view_a_lost_generation_skipped() {
+    let dir = tempfile::tempdir().expect("a fixture directory");
+    let first = system_scope_build_fixture(dir.path(), "u07-g3-first");
+    let second = system_scope_build_fixture(dir.path(), "u07-g3-second");
+    let driver = system_scope_build_driver(dir.path());
+    let mut earlier = system_scope_spawn_loaded(&driver, &first);
+    let (mut engine, scope) = u07_engine(&[earlier.pid()], &[first.clone(), second.clone()]);
+    let mut session = ScriptedSession::default();
+    // Ticks 1 and 2 admit one view each, armed but with exports unattached:
+    // the scripted failures record no links, like a startup that armed its
+    // loaders but has not attached exports yet.
+    session.fail_dynamic_attach_for(earlier.pid());
+    u07_tick(&mut engine, &mut session, &mut true);
+    let earlier_view = engine
+        .views
+        .iter()
+        .find(|view| view.pid() == earlier.pid())
+        .map(ProcessView::id)
+        .expect("tick 1 admits the earlier view");
+    let later = system_scope_spawn_loaded(&driver, &second);
+    session.fail_dynamic_attach_for(later.pid());
+    u07_name_members(scope.path(), &[earlier.pid(), later.pid()]);
+    u07_tick(&mut engine, &mut session, &mut true);
+    let later_view = engine
+        .views
+        .iter()
+        .find(|view| view.pid() == later.pid())
+        .map(ProcessView::id)
+        .expect("tick 2 admits the later view");
+    assert_eq!(
+        engine.views.iter().map(ProcessView::id).collect::<Vec<_>>(),
+        vec![earlier_view, later_view],
+        "startup export attach runs in admission order"
+    );
+    assert!(
+        session.dynamic_attach_calls.is_empty(),
+        "admission leaves both views' exports unattached"
+    );
+    assert_eq!(
+        engine.loader_registry.ids_for_view(earlier_view).len(),
+        1,
+        "admission arms the earlier view exactly once"
+    );
+    assert_eq!(
+        engine.loader_registry.ids_for_view(later_view).len(),
+        1,
+        "admission arms the later view exactly once"
+    );
+    let objects_of = |engine: &Engine, provider: &str| -> BTreeSet<PinnedObjectId> {
+        engine
+            .plan
+            .slots
+            .iter()
+            .filter(|slot| slot.object_path.ends_with(provider))
+            .map(|slot| slot.object)
+            .collect()
+    };
+
+    // Startup export attach: the earlier view ends inside its own export
+    // attachment, closing additions before the later view's work runs.
+    session.clear_dynamic_attach_failures();
+    session.lose_generation_at_dynamic_attach(earlier.pid());
+    let mut additions = true;
+    engine.attach_initial_exports(
+        &mut session,
+        &mut additions,
+        &mut PendingViewRetirements::new(),
+        &mut PauseClosure::new(true),
+    );
+    // The seam killed and reaped it: its guard must not signal the pid again.
+    // SAFETY: signal 0 only probes whether the pid still exists.
+    earlier.live = unsafe { libc::kill(earlier.pid() as libc::pid_t, 0) } == 0;
+    let earlier_objects = objects_of(&engine, "u07-g3-first.so");
+    let later_objects = objects_of(&engine, "u07-g3-second.so");
+
+    assert!(
+        !additions,
+        "the generation lost inside export work closes startup attach"
+    );
+    assert_eq!(
+        session.dynamic_attach_calls.len(),
+        1,
+        "only the earlier view's first export attached before the kill"
+    );
+    assert!(
+        session
+            .dynamic_attach_calls
+            .iter()
+            .all(|call| earlier_objects.contains(&call.object)),
+        "none of the later view's exports attached: {:?}",
+        &session.dynamic_attach_calls
+    );
+    assert!(!later_objects.is_empty(), "the later view stays published");
+    assert!(
+        !engine.loader_registry.ids_for_view(later_view).is_empty(),
+        "the later view stays armed through the skipped startup attach"
+    );
+    assert!(
+        engine.refresh_requested.contains(&later.pid()),
+        "the view skipped by the lost startup generation is requested again"
+    );
+
+    // The recovery tick attaches the later view's exports without re-arming it.
+    u07_name_members(scope.path(), &[later.pid()]);
+    let calls_before = session.dynamic_attach_calls.len();
+    u07_tick(&mut engine, &mut session, &mut true);
+    let later_objects = objects_of(&engine, "u07-g3-second.so");
+    assert!(
+        session.dynamic_attach_calls[calls_before..]
+            .iter()
+            .any(|call| later_objects.contains(&call.object)),
+        "the recovery tick attaches the later view's exports"
+    );
+    let live_contexts = engine
+        .loader_registry
+        .ids_for_view(later_view)
+        .into_iter()
+        .filter(|context| !engine.loader_registry.is_tombstoned(*context))
+        .count();
+    assert_eq!(
+        live_contexts, 1,
+        "the recovery does not double-arm the loader"
+    );
+    assert!(
+        !engine.refresh_requested.contains(&later.pid()),
+        "the recovery consumes the refresh request"
+    );
+    let (active, _) = u07_provider_slots(&engine, "u07-g3-second.so");
+    assert!(!active.is_empty(), "the later view stays published");
+}
+
 /// U-07 fix round 2 (C1). A downgraded exact target is replaced by detaching
 /// its old link with the retirements and attaching the replacement last. A
 /// candidate view that ends between the new-target attach and the

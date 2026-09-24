@@ -11452,6 +11452,51 @@ impl Engine {
         )
     }
 
+    /// Books one view's refreshed-export attach for the skipped-view
+    /// retry, shared by startup and tick attach. Stale views queue for
+    /// retirement, any incomplete view fails the closure, and only views
+    /// whose work closed additions skipped join the retry set — an ordinary
+    /// open-tick failure was attempted, not skipped.
+    fn note_export_attach_outcome(
+        &mut self,
+        view: ProcessViewId,
+        outcome: (bool, bool, bool),
+        pending_views: &mut PendingViewRetirements,
+        closure: &mut PauseClosure,
+        incomplete: &mut BTreeSet<ProcessViewId>,
+    ) {
+        let (retire, complete, skipped) = outcome;
+        if retire {
+            self.queue_stale_views(&[view].into_iter().collect(), pending_views);
+        }
+        if !complete {
+            closure.fail();
+            if skipped {
+                incomplete.insert(view);
+            }
+        }
+    }
+
+    /// Requests every still-current armed view whose export work the attach
+    /// skipped, shared by startup and tick attach. The next tick rescans
+    /// and re-attaches its exports, retiring its loader context before
+    /// arming again — no double-arm, no lost generation (C2).
+    fn request_skipped_export_views(&mut self, incomplete: &BTreeSet<ProcessViewId>) {
+        let pids: Vec<_> = self
+            .views
+            .iter()
+            .filter(|view| {
+                incomplete.contains(&view.id())
+                    && view.still_the_same()
+                    && !self.loader_registry.ids_for_view(view.id()).is_empty()
+            })
+            .map(ProcessView::pid)
+            .collect();
+        for pid in pids {
+            self.request_refresh(pid);
+        }
+    }
+
     fn attach_initial_exports(
         &mut self,
         session: &mut dyn EngineSession,
@@ -11460,15 +11505,23 @@ impl Engine {
         closure: &mut PauseClosure,
     ) {
         let views: Vec<_> = self.views.iter().map(ProcessView::id).collect();
+        let mut export_incomplete = BTreeSet::new();
         for view in views {
-            let (retire, complete, _) =
-                self.attach_refreshed_exports(view, session, additions_allowed);
-            if retire {
-                self.queue_stale_views(&[view].into_iter().collect(), pending_views);
-            }
-            if !complete {
-                closure.fail();
-            }
+            let outcome = self.attach_refreshed_exports(view, session, additions_allowed);
+            self.note_export_attach_outcome(
+                view,
+                outcome,
+                pending_views,
+                closure,
+                &mut export_incomplete,
+            );
+        }
+        // A generation lost mid-attach closes additions and skips every
+        // later view's exports, leaving it armed with hooks absent and its
+        // startup attach spent. Request it like the tick path does, so the
+        // next tick attaches its exports.
+        if !*additions_allowed {
+            self.request_skipped_export_views(&export_incomplete);
         }
     }
 
@@ -14560,28 +14613,21 @@ impl Engine {
         } else {
             Ok(false)
         };
-        // Views whose export work the closed tick skipped: an armed view
-        // past the closure keeps its loader but loses its dynamic hooks,
-        // with its refresh request already consumed. They are requested
-        // again below. An ordinary open-tick failure also reports
-        // incomplete, but its work was attempted, not skipped, so it stays
-        // out of the retry set.
+        // Views whose export work the closed tick skipped, booked by the
+        // helper shared with startup attach.
         let mut export_incomplete = BTreeSet::new();
         let fatal = match arm_result {
             Ok(arm_changed) => {
                 changed |= arm_changed;
                 for view in refreshed_ok.union(&new_view_ids).copied() {
-                    let (retire, complete, skipped) =
-                        self.attach_refreshed_exports(view, session, additions_allowed);
-                    if retire {
-                        self.queue_stale_views(&[view].into_iter().collect(), pending_views);
-                    }
-                    if !complete {
-                        closure.fail();
-                        if skipped {
-                            export_incomplete.insert(view);
-                        }
-                    }
+                    let outcome = self.attach_refreshed_exports(view, session, additions_allowed);
+                    self.note_export_attach_outcome(
+                        view,
+                        outcome,
+                        pending_views,
+                        closure,
+                        &mut export_incomplete,
+                    );
                 }
                 None
             }
@@ -14612,23 +14658,9 @@ impl Engine {
                 self.request_refresh(pid);
             }
             // The unarmed filter above cannot see an armed view whose export
-            // work the closed tick skipped. Request it too: the next tick
-            // rescans and re-attaches its exports, and the refresh retires
-            // its loader context before arming again — no double-arm, no
-            // lost generation (C2).
-            let skipped_exports: Vec<_> = self
-                .views
-                .iter()
-                .filter(|view| {
-                    export_incomplete.contains(&view.id())
-                        && view.still_the_same()
-                        && !self.loader_registry.ids_for_view(view.id()).is_empty()
-                })
-                .map(ProcessView::pid)
-                .collect();
-            for pid in skipped_exports {
-                self.request_refresh(pid);
-            }
+            // work the closed tick skipped. Request it too, with the helper
+            // shared with startup attach.
+            self.request_skipped_export_views(&export_incomplete);
         }
         let cleanup = self.process_discovery_records(
             session,
@@ -15423,6 +15455,10 @@ pub(crate) mod session_fixture {
 
         pub(crate) fn fail_dynamic_attach_for(&mut self, pid: u32) {
             self.fail_dynamic_attach_pids.insert(pid);
+        }
+
+        pub(crate) fn clear_dynamic_attach_failures(&mut self) {
+            self.fail_dynamic_attach_pids.clear();
         }
     }
 

@@ -354,6 +354,11 @@ pub(crate) struct PauseCoordinator {
     rearming_enabled: bool,
     may_be_stopped: bool,
     attempt_open: bool,
+    /// A cleanup discovered an unserviced stop (it opened the attempt) that
+    /// no successful cleanup has classified yet. Survives a failed cleanup;
+    /// the first successful cleanup after discovery applies it, so the retry
+    /// does not lose the classification to the attempt-open transition.
+    unserviced_stop_pending: bool,
     ring_loss_baseline: u64,
     active_deadline: Option<u64>,
     failure_deadline: Option<u64>,
@@ -445,6 +450,7 @@ impl PauseCoordinator {
             rearming_enabled: policy != PausePolicy::Never,
             may_be_stopped: false,
             attempt_open: false,
+            unserviced_stop_pending: false,
             ring_loss_baseline: 0,
             active_deadline: None,
             failure_deadline: None,
@@ -1594,11 +1600,18 @@ impl PauseCoordinator {
     /// its owner opens only here, where cleanup resumes that child. It never
     /// confirmed, so it closes like every other unconfirmed owner — `auto`
     /// partial, `always` refused — instead of rendering as a confirmed stop.
-    /// An owner already open before this call keeps its original outcome.
+    /// An owner already open before this call keeps its original outcome,
+    /// unless an earlier cleanup discovered its opening and failed before
+    /// classifying it: then this call applies that pending classification.
     pub(crate) fn cleanup(&mut self, io: &mut impl PauseIo) -> Result<(), PauseError> {
         let owner_was_open = self.attempt_open;
-        self.terminal_cleanup(io)?;
+        let result = self.terminal_cleanup(io);
         if self.attempt_open && !owner_was_open {
+            self.unserviced_stop_pending = true;
+        }
+        result?;
+        if self.attempt_open && self.unserviced_stop_pending {
+            self.unserviced_stop_pending = false;
             return self.finish_nonconfirmed(MSG_UNSERVICED_AT_CLEANUP.into());
         }
         Ok(())
@@ -6169,7 +6182,15 @@ mod tests {
         assert!(!coordinator.cleaned);
         io.fail_detach = false;
         io.fail_remove = false;
-        coordinator.cleanup(&mut io).unwrap();
+        // G4: the failed cleanup discovered the unserviced stop (REQUESTED
+        // opened the owner), so the successful retry still closes it
+        // unconfirmed — `always` refuses — instead of reporting success.
+        let retry = coordinator.cleanup(&mut io).unwrap_err();
+        assert!(
+            retry.required(),
+            "the retry refuses the unserviced stop: {retry}"
+        );
+        assert!(!retry.lifecycle(), "{retry}");
         assert_eq!(
             io.events.iter().filter(|event| **event == "resume").count(),
             1,
@@ -6208,6 +6229,69 @@ mod tests {
                 "{policy:?}: the held child is resumed once, after removal"
             );
             assert_eq!(io.authorization, None, "{policy:?}");
+            assert_eq!(coordinator.counters().confirmed, 0, "{policy:?}");
+            match policy {
+                PausePolicy::Auto => {
+                    result.expect("an auto owner that never confirmed is a partial attempt");
+                    assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+                    assert_eq!(coordinator.status(), PauseStatus::Partial);
+                }
+                PausePolicy::Always => {
+                    let error = result.expect_err("always never reports an unconfirmed stop");
+                    assert!(error.required(), "{error}");
+                    assert!(!error.lifecycle(), "{error}");
+                    assert_eq!(
+                        error.to_string(),
+                        format!("{MSG_UNSERVICED_AT_CLEANUP} [pause_diag=other_auto_nonconfirmed]")
+                    );
+                }
+                PausePolicy::Never => unreachable!(),
+            }
+        }
+    }
+
+    /// G4 (latent): the unserviced-stop classification survives a failed
+    /// cleanup. The first cleanup opens the attempt (unserviced stop
+    /// discovered) but fails on a detach error; the retry succeeds. The
+    /// successful cleanup must still close the owner unconfirmed — `auto`
+    /// counts it partial with its diagnostic, `always` refuses — instead of
+    /// losing the classification to the attempt-open transition.
+    #[test]
+    fn a_failed_cleanup_retry_keeps_the_unserviced_stop_classification() {
+        for policy in [PausePolicy::Auto, PausePolicy::Always] {
+            let mut io = FakeIo {
+                queue: VecDeque::from([
+                    Ok(Some(DiscoveryItem::Record(record(10, 0, false)))),
+                    Ok(None),
+                ]),
+                authorization: Some(PAUSE_REQUESTED),
+                fail_detach: true,
+                ..FakeIo::default()
+            };
+            let mut coordinator = PauseCoordinator::for_test(policy, 41, 9, stopped());
+            coordinator.arm_for_test();
+
+            let first = coordinator.cleanup(&mut io).unwrap_err();
+            assert!(
+                first.lifecycle(),
+                "{policy:?}: the detach failure is lifecycle"
+            );
+            assert_eq!(
+                coordinator.counters().attempts,
+                1,
+                "{policy:?}: the failed cleanup opened the owner"
+            );
+            assert!(!coordinator.cleaned, "{policy:?}");
+
+            io.fail_detach = false;
+            let result = coordinator.cleanup(&mut io);
+
+            assert_eq!(
+                io.events.iter().filter(|event| **event == "resume").count(),
+                1,
+                "{policy:?}: the retry must not resume twice"
+            );
+            assert!(coordinator.cleaned, "{policy:?}");
             assert_eq!(coordinator.counters().confirmed, 0, "{policy:?}");
             match policy {
                 PausePolicy::Auto => {

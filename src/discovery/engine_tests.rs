@@ -16373,6 +16373,146 @@ fn a_foreign_exit_during_arming_requests_the_refreshed_view_it_left_unarmed() {
     );
 }
 
+/// Whole-branch review finding 3 (Important). Two module-owning views are
+/// refreshed together. The earlier view ends inside its own export
+/// attachment, which closes the tick's additions. The later view is already
+/// armed, so the unarmed-only retry filter excludes it: its refresh request
+/// was consumed and its export work was skipped, so without a retry its
+/// dynamic export hooks stay absent for the capture. It must be requested
+/// again, and the next tick must attach its exports without re-arming its
+/// loader (C2: no double-arm, no lost generation).
+#[test]
+fn a_closed_tick_retries_the_armed_view_whose_exports_it_skipped() {
+    let dir = tempfile::tempdir().expect("a fixture directory");
+    let first = system_scope_build_fixture(dir.path(), "u07-exp-first");
+    let second = system_scope_build_fixture(dir.path(), "u07-exp-second");
+    let driver = system_scope_build_driver(dir.path());
+    let mut earlier = system_scope_spawn_loaded(&driver, &first);
+    let (mut engine, scope) =
+        u07_engine(&[earlier.pid()], &[first.clone(), second.clone()]);
+    let mut session = ScriptedSession::default();
+    // Ticks 1 and 2 admit one view each, which fixes the export-loop order:
+    // the earlier view's ID sorts first.
+    u07_tick(&mut engine, &mut session, &mut true);
+    let earlier_view = engine
+        .views
+        .iter()
+        .find(|view| view.pid() == earlier.pid())
+        .map(ProcessView::id)
+        .expect("tick 1 admits the earlier view");
+    let later = system_scope_spawn_loaded(&driver, &second);
+    u07_name_members(scope.path(), &[earlier.pid(), later.pid()]);
+    u07_tick(&mut engine, &mut session, &mut true);
+    let later_view = engine
+        .views
+        .iter()
+        .find(|view| view.pid() == later.pid())
+        .map(ProcessView::id)
+        .expect("tick 2 admits the later view");
+    assert!(
+        earlier_view < later_view,
+        "the earlier view's exports attach first: {earlier_view:?} vs {later_view:?}"
+    );
+    let objects_of = |engine: &Engine, provider: &str| -> BTreeSet<PinnedObjectId> {
+        engine
+            .plan
+            .slots
+            .iter()
+            .filter(|slot| slot.object_path.ends_with(provider))
+            .map(|slot| slot.object)
+            .collect()
+    };
+    let earlier_objects = objects_of(&engine, "u07-exp-first.so");
+    let later_objects = objects_of(&engine, "u07-exp-second.so");
+    assert!(
+        !earlier_objects.is_empty() && !later_objects.is_empty(),
+        "both providers own slots"
+    );
+    assert!(
+        session
+            .dynamic_attach_calls
+            .iter()
+            .any(|call| earlier_objects.contains(&call.object)),
+        "tick 1 attaches the earlier view's exports"
+    );
+    assert!(
+        session
+            .dynamic_attach_calls
+            .iter()
+            .any(|call| later_objects.contains(&call.object)),
+        "tick 2 attaches the later view's exports"
+    );
+
+    // Tick 3 refreshes both. The earlier view ends inside its own export
+    // attachment, closing additions before the later view's work runs.
+    engine.request_refresh(earlier.pid());
+    engine.request_refresh(later.pid());
+    session.lose_generation_at_dynamic_attach(earlier.pid());
+    let calls_before = session.dynamic_attach_calls.len();
+    let mut additions = true;
+    u07_tick(&mut engine, &mut session, &mut additions);
+    // The seam killed and reaped it: its guard must not signal the pid again.
+    // SAFETY: signal 0 only probes whether the pid still exists.
+    earlier.live = unsafe { libc::kill(earlier.pid() as libc::pid_t, 0) } == 0;
+    // The refresh re-pins both providers, so tick 3's calls are attributed by
+    // the committed post-tick IDs.
+    let earlier_objects = objects_of(&engine, "u07-exp-first.so");
+    let later_objects = objects_of(&engine, "u07-exp-second.so");
+
+    assert!(
+        !additions,
+        "the generation lost inside export work closes the tick"
+    );
+    assert_eq!(
+        session.dynamic_attach_calls.len(),
+        calls_before + 1,
+        "only the earlier view's first export attached before the kill"
+    );
+    assert!(
+        session.dynamic_attach_calls[calls_before..]
+            .iter()
+            .all(|call| earlier_objects.contains(&call.object)),
+        "none of the later view's exports attached: {:?}",
+        &session.dynamic_attach_calls[calls_before..]
+    );
+    assert!(
+        !engine.loader_registry.ids_for_view(later_view).is_empty(),
+        "the later view was armed before its exports were skipped"
+    );
+    assert!(
+        engine.refresh_requested.contains(&later.pid()),
+        "the armed view whose exports were skipped is requested again"
+    );
+
+    // The retry tick attaches the later view's exports without re-arming it.
+    u07_name_members(scope.path(), &[later.pid()]);
+    let calls_before = session.dynamic_attach_calls.len();
+    u07_tick(&mut engine, &mut session, &mut true);
+    let later_objects = objects_of(&engine, "u07-exp-second.so");
+    assert!(
+        session.dynamic_attach_calls[calls_before..]
+            .iter()
+            .any(|call| later_objects.contains(&call.object)),
+        "the retry tick attaches the later view's exports"
+    );
+    let live_contexts = engine
+        .loader_registry
+        .ids_for_view(later_view)
+        .into_iter()
+        .filter(|context| !engine.loader_registry.is_tombstoned(*context))
+        .count();
+    assert_eq!(
+        live_contexts, 1,
+        "the retry does not double-arm the loader"
+    );
+    assert!(
+        !engine.refresh_requested.contains(&later.pid()),
+        "the retry consumes the refresh request"
+    );
+    let (active, _) = u07_provider_slots(&engine, "u07-exp-second.so");
+    assert!(!active.is_empty(), "the later view stays published");
+}
+
 /// U-07 fix round 2 (C1). A downgraded exact target is replaced by detaching
 /// its old link with the retirements and attaching the replacement last. A
 /// candidate view that ends between the new-target attach and the

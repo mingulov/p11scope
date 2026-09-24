@@ -14507,6 +14507,11 @@ impl Engine {
         } else {
             Ok(false)
         };
+        // Views whose export work the tick left incomplete: a closed tick
+        // skips every unattached item, so an armed view past the closure
+        // keeps its loader but loses its dynamic hooks, with its refresh
+        // request already consumed. They are requested again below.
+        let mut export_incomplete = BTreeSet::new();
         let fatal = match arm_result {
             Ok(arm_changed) => {
                 changed |= arm_changed;
@@ -14518,6 +14523,7 @@ impl Engine {
                     }
                     if !complete {
                         closure.fail();
+                        export_incomplete.insert(view);
                     }
                 }
                 None
@@ -14546,6 +14552,24 @@ impl Engine {
                 .map(ProcessView::pid)
                 .collect();
             for pid in unarmed {
+                self.request_refresh(pid);
+            }
+            // The unarmed filter above cannot see an armed view whose export
+            // work the closed tick skipped. Request it too: the next tick
+            // rescans and re-attaches its exports, and the refresh retires
+            // its loader context before arming again — no double-arm, no
+            // lost generation (C2).
+            let skipped_exports: Vec<_> = self
+                .views
+                .iter()
+                .filter(|view| {
+                    export_incomplete.contains(&view.id())
+                        && view.still_the_same()
+                        && !self.loader_registry.ids_for_view(view.id()).is_empty()
+                })
+                .map(ProcessView::pid)
+                .collect();
+            for pid in skipped_exports {
                 self.request_refresh(pid);
             }
         }

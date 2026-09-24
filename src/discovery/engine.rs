@@ -8976,6 +8976,49 @@ impl Engine {
                                 "a process generation changed before downgraded exact targets were replaced; they were deactivated",
                             );
                         }
+                        // The deactivated slots' surviving owners are refreshed
+                        // later: a retained owner that is neither stale nor
+                        // newcomer would otherwise never be rescanned, leaving
+                        // its endpoints deactivated with their old links
+                        // detached indefinitely. The next tick rebuilds and
+                        // re-attaches them through the normal path — still no
+                        // active-without-link window — and consumes the
+                        // request, so one event re-requests exactly once.
+                        let mut owners = BTreeSet::new();
+                        for slot in &candidate.delta.replace {
+                            for module in &slot.module_ids {
+                                let object = candidate
+                                    .plan
+                                    .modules
+                                    .iter()
+                                    .find(|summary| summary.id == *module)
+                                    .map(|summary| summary.object);
+                                let Some(object) = object else {
+                                    continue;
+                                };
+                                owners.extend(
+                                    candidate
+                                        .modules
+                                        .iter()
+                                        .filter(|reconciled| reconciled.object == object)
+                                        .map(|reconciled| reconciled.scanned.view),
+                                );
+                            }
+                        }
+                        let pids: Vec<_> = owners
+                            .iter()
+                            .filter_map(|view| {
+                                self.views
+                                    .iter()
+                                    .find(|retained| {
+                                        retained.id() == *view && retained.still_the_same()
+                                    })
+                                    .map(ProcessView::pid)
+                            })
+                            .collect();
+                        for pid in pids {
+                            self.request_refresh(pid);
+                        }
                     }
                 }
             } else {

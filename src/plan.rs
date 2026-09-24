@@ -1652,7 +1652,13 @@ fn merge(
                             }
                             continue;
                         }
-                        if spent || heuristic_admitted >= MAX_TABLES_PER_OBJECT {
+                        // The kept-only retry after a refused growth admits
+                        // every table that still lists a kept endpoint: kept
+                        // endpoints need no new slot, so the cap must not
+                        // spill one of their tables and retire it (G-03).
+                        if !kept_only
+                            && (spent || heuristic_admitted >= MAX_TABLES_PER_OBJECT)
+                        {
                             uncorroborated_candidates += 1;
                             continue;
                         }
@@ -4422,6 +4428,125 @@ mod tests {
         let delta = plan.extend_exact(rebuilt).unwrap();
         assert!(delta.new.is_empty() && delta.replace.is_empty() && delta.retire.is_empty());
         assert_eq!(plan.slots, before.slots);
+    }
+
+    /// G-03 against the heuristic cap (whole-branch review finding 1): the
+    /// refused growth's new table sorts first and repeats one kept endpoint.
+    /// The kept-only retry must keep every kept endpoint — the newcomer table
+    /// must not consume one of the four cap slots, spill the old fourth
+    /// table, and retire its previously attached endpoint.
+    #[test]
+    fn a_refused_growths_new_table_does_not_spill_a_kept_heuristic_table() {
+        use crate::discovery::scan::{ScannedEntry, ScannedTable};
+
+        let existing = PinnedObjectId(10);
+        let filler = PinnedObjectId(12);
+        let key = scanned_key(existing);
+        // Four kept endpoints, one per heuristic table, plus filler to one
+        // slot short of the ceiling.
+        let mut slots: Vec<Slot> = (0..4u32)
+            .map(|index| {
+                exact_slot(index, existing, u64::from(index) * 8, 0, vec![ModuleId(0)])
+            })
+            .collect();
+        slots.extend((0..MAX_SLOTS - 5).map(|index| {
+            exact_slot(
+                4 + index,
+                filler,
+                0x2000 + u64::from(index) * 8,
+                0,
+                vec![ModuleId(1)],
+            )
+        }));
+        let mut plan = exact_plan(
+            slots,
+            vec![exact_module(0, existing), exact_module(1, filler)],
+        );
+
+        // The regrown scan: a new heuristic table decoded first — equal
+        // evidence keeps discovery order, so it sorts first — repeating kept
+        // offset 0 and adding two endpoints, then the four old tables with
+        // their kept endpoints.
+        let table = |address: u64, file_offset: u64, offsets: &[u64]| ScannedTable {
+            version: (2, 40),
+            walk: "full",
+            entries: offsets
+                .iter()
+                .map(|offset| ScannedEntry {
+                    name: "C_Sign",
+                    object: key,
+                    object_path: "/proc/self/fd/10".into(),
+                    file_offset: *offset,
+                })
+                .collect(),
+            null_entries: vec![],
+            unpinned: vec![],
+            address,
+            file_offset: Some(file_offset),
+            live_return: false,
+            manifest_supported: false,
+        };
+        let mut grown = scanned_with(key, "/proc/self/fd/10", []);
+        grown.scanned.tables = vec![
+            table(0x9000, 0x9000, &[0, 0x10000, 0x10008]),
+            table(0x7000, 0x0000, &[0]),
+            table(0x7100, 0x1000, &[8]),
+            table(0x7200, 0x2000, &[16]),
+            table(0x7300, 0x3000, &[24]),
+        ];
+        grown.entry_objects = vec![
+            vec![existing; 3],
+            vec![existing],
+            vec![existing],
+            vec![existing],
+            vec![existing],
+        ];
+        let filler_scan = scanned_with(
+            scanned_key(filler),
+            "/proc/self/fd/12",
+            (0..MAX_SLOTS - 5).map(|index| 0x2000 + u64::from(index) * 8),
+        );
+
+        let rebuilt =
+            plan.rebuild_from_sources(&[grown, filler_scan], &[], &PinnedObjects::empty());
+
+        assert_eq!(rebuilt.modules_skipped.len(), 1);
+        assert!(
+            rebuilt.modules_skipped[0]
+                .reason
+                .starts_with("admitted module needs 2 more;"),
+            "{:?}",
+            rebuilt.modules_skipped[0]
+        );
+        assert!(
+            rebuilt.modules_skipped[0]
+                .reason
+                .contains("2 endpoints not attached; kept its 4 attached endpoints"),
+            "{:?}",
+            rebuilt.modules_skipped[0]
+        );
+        assert_eq!(
+            rebuilt.uncorroborated_candidates, 0,
+            "kept tables are admitted, never spilled"
+        );
+        let kept: Vec<u64> = rebuilt
+            .slots
+            .iter()
+            .filter(|slot| slot.object == existing)
+            .map(|slot| slot.file_offset)
+            .collect();
+        assert_eq!(kept, [0, 8, 16, 24], "every kept endpoint stays slotted");
+
+        let delta = plan.extend_exact(rebuilt).unwrap();
+
+        assert!(
+            delta.retire.is_empty(),
+            "{} kept endpoints retired",
+            delta.retire.len()
+        );
+        assert!(delta.new.is_empty());
+        assert!(delta.replace.is_empty());
+        assert_eq!(plan.active_slot_count(), MAX_SLOTS as usize - 1);
     }
 
     /// A provider that changed as well as grew: it no longer lists some

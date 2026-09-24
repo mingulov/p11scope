@@ -8977,48 +8977,9 @@ impl Engine {
                             );
                         }
                         // The deactivated slots' surviving owners are refreshed
-                        // later: a retained owner that is neither stale nor
-                        // newcomer would otherwise never be rescanned, leaving
-                        // its endpoints deactivated with their old links
-                        // detached indefinitely. The next tick rebuilds and
-                        // re-attaches them through the normal path — still no
-                        // active-without-link window — and consumes the
-                        // request, so one event re-requests exactly once.
-                        let mut owners = BTreeSet::new();
-                        for slot in &candidate.delta.replace {
-                            for module in &slot.module_ids {
-                                let object = candidate
-                                    .plan
-                                    .modules
-                                    .iter()
-                                    .find(|summary| summary.id == *module)
-                                    .map(|summary| summary.object);
-                                let Some(object) = object else {
-                                    continue;
-                                };
-                                owners.extend(
-                                    candidate
-                                        .modules
-                                        .iter()
-                                        .filter(|reconciled| reconciled.object == object)
-                                        .map(|reconciled| reconciled.scanned.view),
-                                );
-                            }
-                        }
-                        let pids: Vec<_> = owners
-                            .iter()
-                            .filter_map(|view| {
-                                self.views
-                                    .iter()
-                                    .find(|retained| {
-                                        retained.id() == *view && retained.still_the_same()
-                                    })
-                                    .map(ProcessView::pid)
-                            })
-                            .collect();
-                        for pid in pids {
-                            self.request_refresh(pid);
-                        }
+                        // later (A1), through the helper shared with the
+                        // `else` branch below.
+                        self.request_replaced_owner_refresh(&candidate);
                     }
                 }
             } else {
@@ -9028,6 +8989,12 @@ impl Engine {
                         .extend(slot_timing_keys(slot, &timing_owners));
                     candidate.plan.deactivate(slot.index);
                 }
+                // Same stranded-owner shape as the precheck `None` arm
+                // above (#1): additions already closed, or the attach phase
+                // lost a generation before the replacement precheck ran. A
+                // retained owner that is neither stale nor newcomer would
+                // otherwise never be rescanned.
+                self.request_replaced_owner_refresh(&candidate);
             }
             if generation_lost {
                 *additions_allowed = false;
@@ -9043,6 +9010,52 @@ impl Engine {
             &mut outcome,
         );
         Ok(outcome)
+    }
+
+    /// Requests a refresh for the retained, still-current owners of a
+    /// skipped replacement's deactivated slots. A replacement skipped
+    /// before its links attach — the precheck's `None` arm (A1) or the
+    /// `else` branch when additions already closed or the attach phase
+    /// lost a generation (#1) — leaves the surviving owner's endpoints
+    /// deactivated with their old links detached; a retained owner that
+    /// is neither stale nor newcomer would otherwise never be rescanned.
+    /// The next tick rebuilds and re-attaches them through the normal
+    /// path — still no active-without-link window — and consumes the
+    /// request, so one event re-requests exactly once.
+    fn request_replaced_owner_refresh(&mut self, candidate: &LiveCandidate) {
+        let mut owners = BTreeSet::new();
+        for slot in &candidate.delta.replace {
+            for module in &slot.module_ids {
+                let object = candidate
+                    .plan
+                    .modules
+                    .iter()
+                    .find(|summary| summary.id == *module)
+                    .map(|summary| summary.object);
+                let Some(object) = object else {
+                    continue;
+                };
+                owners.extend(
+                    candidate
+                        .modules
+                        .iter()
+                        .filter(|reconciled| reconciled.object == object)
+                        .map(|reconciled| reconciled.scanned.view),
+                );
+            }
+        }
+        let pids: Vec<_> = owners
+            .iter()
+            .filter_map(|view| {
+                self.views
+                    .iter()
+                    .find(|retained| retained.id() == *view && retained.still_the_same())
+                    .map(ProcessView::pid)
+            })
+            .collect();
+        for pid in pids {
+            self.request_refresh(pid);
+        }
     }
 
     /// Everything a candidate can fail at, proven before its first link
@@ -15411,6 +15424,13 @@ pub(crate) mod session_fixture {
                 kill_on_attach: Some(pid),
                 ..Self::default()
             }
+        }
+
+        /// Schedules a generation loss inside the next `attach_targets`
+        /// call: kills and reaps `pid` exactly between that link mutation's
+        /// generation precheck and its postcheck.
+        pub(crate) fn lose_generation_at_attach(&mut self, pid: u32) {
+            self.kill_on_attach = Some(pid);
         }
 
         /// A session whose target preflight refuses every candidate.

@@ -16767,6 +16767,121 @@ fn a_generation_skipped_replacement_recovers_the_surviving_owner() {
     assert!(!active.is_empty(), "A stays attached");
 }
 
+/// #1 (A1 sibling). A replacement skipped by the `else` branch — the
+/// generation was already lost during the new-target attach, so the
+/// replacement's precheck never even runs — must not strand the surviving
+/// owner either. Newcomer B exits inside the new-target attach itself
+/// (after its precheck, before its postcheck); the retained owner A's
+/// downgraded slots are deactivated with their old links detached. A is
+/// retained, admitted, neither stale nor newcomer, so without a queued
+/// refresh no later tick ever rescans it. A must be requested again, and a
+/// later tick must rebuild and re-attach it — active WITH links (no U-07
+/// active-without-link window), exactly once (no spin).
+#[test]
+fn a_replacement_skipped_by_an_attach_phase_loss_recovers_the_surviving_owner() {
+    let dir = tempfile::tempdir().expect("a fixture directory");
+    let first = system_scope_build_fixture(dir.path(), "u07-else-owner");
+    let second = system_scope_build_fixture(dir.path(), "u07-else-newcomer");
+    let driver = system_scope_build_driver(dir.path());
+    let owner_a = system_scope_spawn_loaded(&driver, &first);
+    let (mut engine, scope) = u07_engine(&[owner_a.pid()], &[first.clone(), second.clone()]);
+    let mut session = ScriptedSession::default();
+    // Tick 1 admits A; its provider slots attach with links.
+    u07_tick(&mut engine, &mut session, &mut true);
+    assert!(
+        engine.views.iter().any(|view| view.pid() == owner_a.pid()),
+        "tick 1 admits A"
+    );
+    let (active, _) = u07_provider_slots(&engine, "u07-else-owner.so");
+    assert!(!active.is_empty(), "tick 1 attaches A's provider slots");
+    assert!(!session.attached_slots.is_empty(), "tick 1 links A's slots");
+    // Stand in for the authorized identity corroboration would supply (C1
+    // precedent): exact-authorized slots the next rebuild downgrades.
+    let descriptor = crate::kinds::function_id("C_Initialize").unwrap() + 1;
+    for index in &active {
+        let slot = &mut engine.plan.slots[*index as usize];
+        slot.descriptor_index = descriptor;
+        slot.semantics = crate::kinds::DESCRIPTORS[descriptor as usize];
+        slot.semantic_authorized = true;
+        slot.semantic_ambiguous = false;
+    }
+    engine.plan.validate_slot_index().unwrap();
+
+    // Tick 2 admits newcomer B, whose candidate downgrades A's exact slots.
+    // B exits inside the new-target attach — after its precheck, before its
+    // postcheck — so the attach-phase loss skips the replacement in the
+    // `else` branch, before the replacement precheck runs.
+    let mut newcomer_b = system_scope_spawn_loaded(&driver, &second);
+    u07_name_members(scope.path(), &[owner_a.pid(), newcomer_b.pid()]);
+    session.lose_generation_at_attach(newcomer_b.pid());
+    let attached_before_tick2: usize = session.attached_slots.iter().sum();
+    let mut additions = true;
+    u07_tick(&mut engine, &mut session, &mut additions);
+    // The seam killed and reaped it: its guard must not signal the pid again.
+    // SAFETY: signal 0 only probes whether the pid still exists.
+    newcomer_b.live = unsafe { libc::kill(newcomer_b.pid() as libc::pid_t, 0) } == 0;
+
+    assert!(!additions, "the generation lost mid-attach closes the tick");
+    assert!(
+        session.attached_slots.iter().sum::<usize>() > attached_before_tick2,
+        "the new-target attach ran before the generation was lost"
+    );
+    assert!(
+        !engine.counters.object_skips.contains(&u07_partial(
+            "live discovery replacement",
+            "a process generation changed before downgraded exact targets were replaced; they were deactivated",
+        )),
+        "tick 2 skips the replacement in the else branch, not the precheck None arm: {:?}",
+        engine.counters.object_skips
+    );
+    let (active, _) = u07_provider_slots(&engine, "u07-else-owner.so");
+    assert!(
+        active.is_empty(),
+        "the skipped replacement deactivates A's slots"
+    );
+    assert!(
+        engine
+            .views
+            .iter()
+            .all(|view| view.pid() != newcomer_b.pid()),
+        "B never joins the retained views"
+    );
+    assert!(
+        engine.refresh_requested.contains(&owner_a.pid()),
+        "the surviving owner is requested again"
+    );
+
+    // Tick 3 recovers A: its slots are active WITH links again, and the
+    // recovery consumes the re-request.
+    u07_name_members(scope.path(), &[owner_a.pid()]);
+    let attached_before: usize = session.attached_slots.iter().sum();
+    u07_tick(&mut engine, &mut session, &mut true);
+    let (active, _) = u07_provider_slots(&engine, "u07-else-owner.so");
+    assert!(
+        !active.is_empty(),
+        "the recovery tick re-attaches A's slots"
+    );
+    assert!(
+        session.attached_slots.iter().sum::<usize>() > attached_before,
+        "A's slots are active with links, not merely reactivated"
+    );
+    assert!(
+        !engine.refresh_requested.contains(&owner_a.pid()),
+        "the recovery consumes the re-request"
+    );
+
+    // No spin: tick 4 attaches nothing further for A.
+    let attached_before: usize = session.attached_slots.iter().sum();
+    u07_tick(&mut engine, &mut session, &mut true);
+    assert_eq!(
+        session.attached_slots.iter().sum::<usize>(),
+        attached_before,
+        "one consumed re-request per event: no re-request loop"
+    );
+    let (active, _) = u07_provider_slots(&engine, "u07-else-owner.so");
+    assert!(!active.is_empty(), "A stays attached");
+}
+
 /// G3 (F3 sibling). Startup export attach needs the skipped-view retry too.
 /// Two views are armed with exports unattached; the earlier view's
 /// generation is lost during startup export attach, closing additions

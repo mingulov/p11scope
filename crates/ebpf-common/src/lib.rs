@@ -387,6 +387,27 @@ pub fn inventory_mark_used_with(
     }
 }
 
+pub const STOP_GATE_STOP: u64 = 1 << 63;
+pub const STOP_GATE_COUNT_MASK: u64 = STOP_GATE_STOP - 1;
+
+/// Stop-gate admission (plan 2026-09-23 Task 1). `read` must be an atomic
+/// compare-exchange read of the shared word (CAS(p, 0, 0)); `add` must be a
+/// non-fetch atomic add whose result is never consumed. Returns true when the
+/// caller is admitted and MUST call `add(-1)` exactly once when its guarded
+/// body has finished all capture accesses.
+#[inline(always)]
+pub fn stop_gate_admit_with(mut read: impl FnMut() -> u64, mut add: impl FnMut(i64)) -> bool {
+    if read() & STOP_GATE_STOP != 0 {
+        return false;
+    }
+    add(1);
+    if read() & STOP_GATE_STOP != 0 {
+        add(-1);
+        return false;
+    }
+    true
+}
+
 /// A loaded program may observe only an explicitly selected scope under one
 /// immutable capture policy. Unknown and multi-bit configurations fail closed.
 pub const fn valid_config(flags: u64) -> bool {
@@ -2529,3 +2550,5 @@ mod safe_capture {
 
 #[cfg(test)]
 mod inventory_tests;
+#[cfg(test)]
+mod stop_gate_tests;

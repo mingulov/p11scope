@@ -1300,6 +1300,7 @@ SAFE_MAPS = {
         "ROOT_AFFILIATION": (29, 4, 8, 0, 1),
         "ROOT_CTL": (2, 4, 64, 1),
         "STATS": (6, 4, 296, 512),
+        "STOP_GATE": (2, 4, 8, 1, 1024),
         "TAIL_CALLS": (3, 4, 4, 2),
     }.items()
 }
@@ -1457,10 +1458,10 @@ def self_test():
     assert SAFE_MAPS["PAUSE_PIDS"] == map_def(1, 16, 8, 1)
     assert SAFE_MAPS["PID_FILTER"] == map_def(1, 4, 8, 1_024, 128)
     assert SAFE_MAPS["EVIDENCE"] == map_def(6, 4, 8, 9)
-    assert len(SAFE_MAPS) == 22
-    assert len(UNSAFE_MAPS) == 23
-    assert len(WIDE_MAPS) == 22
-    assert len(WIDE_UNSAFE_MAPS) == 23
+    assert len(SAFE_MAPS) == 23
+    assert len(UNSAFE_MAPS) == 24
+    assert len(WIDE_MAPS) == 23
+    assert len(WIDE_UNSAFE_MAPS) == 24
     assert len(SAFE_PROGRAMS) == 13
     assert len(UNSAFE_PROGRAMS) == 18
     good = (SAFE_MAPS, SAFE_PROGRAMS, {"p11_entry"} | REQUIRED_GLOBAL_HELPERS)

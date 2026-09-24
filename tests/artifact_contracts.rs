@@ -4531,9 +4531,9 @@ fn frozen_policy_inventory_matches_embedded_object() {
         (true, true) => ("wide-diagnostic", "wide-default", "diagnostic"),
     };
     let (maps, programs) = if cfg!(feature = "unsafe-unvalidated-metadata") {
-        (23, 18)
+        (24, 18)
     } else {
-        (22, 13)
+        (23, 13)
     };
     let report = run_ok(
         "python3",

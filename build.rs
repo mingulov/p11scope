@@ -315,6 +315,8 @@ fn build_variant(
         }
         append_flag("-C");
         append_flag("link-arg=--export=START");
+        append_flag("-C");
+        append_flag("link-arg=--export=STOP_GATE");
     }
     for bitcode in native_bitcodes {
         append_flag("-C");

@@ -43,11 +43,14 @@ use std::sync::Arc;
 mod inventory;
 #[allow(unused_imports)]
 pub(crate) use inventory::PreparedInventory;
+mod stop_gate;
+pub(crate) use stop_gate::{StopGate, stop_gate_map_data, validate_stop_gate};
 
 #[cfg(test)]
 mod lifecycle_tests;
 
 const BPF_F_RDONLY_PROG: u32 = 1 << 7;
+const BPF_F_MMAPABLE: u32 = 1024;
 #[derive(Debug)]
 pub(crate) enum DynamicLoaderAttachFailure {
     KernelUnavailable(anyhow::Error),
@@ -959,6 +962,9 @@ impl RootSeed {
 /// use p11scope::attach::OwnedPauseGeneration;
 /// ```
 pub struct Session {
+    /// Mmap of the STOP_GATE cell. Declared first so the mapping unmaps
+    /// before the map FDs owned by `ebpf` close.
+    stop_gate: StopGate,
     pub(crate) ebpf: Ebpf,
     events_domain: events::EventsDomain,
     /// The session's single retained `EVENTS` consumer, built once from
@@ -2326,6 +2332,7 @@ fn validate_program_inventory(ebpf: &Ebpf, unsafe_enabled: bool) -> Result<()> {
 enum SessionPreparation {
     ValidatePolicy,
     ValidateRuntime,
+    ValidateStopGate,
     ValidatePrograms,
     PublishScope,
     PrepareIdentity,
@@ -2351,6 +2358,7 @@ fn prepare_session_with(
     for step in [
         ValidatePolicy,
         ValidateRuntime,
+        ValidateStopGate,
         ValidatePrograms,
         PublishScope,
         PrepareIdentity,
@@ -2477,6 +2485,13 @@ fn unsupported_environment_context(error: anyhow::Error) -> anyhow::Error {
 impl Session {
     pub(crate) const fn capture_policy(&self) -> CapturePolicy {
         self.policy
+    }
+
+    /// The session's stop-gate mapping.
+    // A later stop-gate task drives userspace stop.
+    #[allow(dead_code)]
+    pub(crate) fn stop_gate(&self) -> &StopGate {
+        &self.stop_gate
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2606,6 +2621,7 @@ impl Session {
         let unsafe_enabled = object_has_unsafe && policy.uses_unsafe_decoders();
         let generation_token = pause_key.map(|key| key.generation_token);
         let mut uprobe_scope = UProbeScope::AllProcesses;
+        let mut stop_gate = None;
         let mut prepared_domain = None;
         let mut prepared_discovery_domain = None;
         let mut root_seed = None;
@@ -2618,6 +2634,14 @@ impl Session {
                 SessionPreparation::ValidateRuntime => {
                     validate_runtime_maps(&ebpf)
                         .context("validating live-discovery runtime maps")?;
+                }
+                SessionPreparation::ValidateStopGate => {
+                    validate_stop_gate(&ebpf).context("stop gate unavailable")?;
+                    let data = stop_gate_map_data(&ebpf).context("stop gate unavailable")?;
+                    stop_gate = Some(
+                        StopGate::from_map_fd(data.fd().as_fd())
+                            .context("stop gate unavailable")?,
+                    );
                 }
                 SessionPreparation::ValidatePrograms => {
                     validate_program_inventory(&ebpf, object_has_unsafe)
@@ -2764,6 +2788,7 @@ impl Session {
             })?;
 
         Ok(Self {
+            stop_gate: stop_gate.expect("preparation established the stop gate"),
             ebpf,
             events_domain,
             events_consumer: None,
@@ -4027,6 +4052,23 @@ mod tests {
     }
 
     #[test]
+    fn stop_gate_validation_rejects_wrong_type_flags_or_width() {
+        let expected = map_metadata(MapType::Array, 4, 8, 1, BPF_F_MMAPABLE);
+        compare_map_metadata("STOP_GATE", expected, expected).unwrap();
+        for actual in [
+            map_metadata(MapType::Hash, 4, 8, 1, BPF_F_MMAPABLE),
+            map_metadata(MapType::Array, 4, 8, 1, 0),
+            map_metadata(MapType::Array, 4, 4, 1, BPF_F_MMAPABLE),
+            map_metadata(MapType::Array, 4, 8, 2, BPF_F_MMAPABLE),
+        ] {
+            assert!(
+                compare_map_metadata("STOP_GATE", actual, expected).is_err(),
+                "{actual:?}"
+            );
+        }
+    }
+
+    #[test]
     fn identity_inventory_rejects_missing_extra_and_wrong_variants() {
         let valid = [
             ("TASK_COOKIE", true),
@@ -4510,6 +4552,7 @@ mod tests {
         let mut steps = vec![
             ValidatePolicy,
             ValidateRuntime,
+            ValidateStopGate,
             ValidatePrograms,
             PublishScope,
             PrepareIdentity,

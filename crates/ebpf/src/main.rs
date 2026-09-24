@@ -16,7 +16,7 @@ mod inventory;
 #[cfg(feature = "inventory-callers")]
 mod inventory_callers;
 
-use aya_ebpf::bindings::BPF_F_RDONLY_PROG;
+use aya_ebpf::bindings::{BPF_F_MMAPABLE, BPF_F_RDONLY_PROG};
 use aya_ebpf::macros::{map, raw_tracepoint, uprobe, uretprobe};
 use aya_ebpf::maps::ring_buf::RingBufEntry;
 #[cfg(not(feature = "inventory-only"))]
@@ -137,6 +137,13 @@ static COUNTERS: PerCpuArray<u64> = PerCpuArray::with_max_entries(DISCOVERY_COUN
 #[cfg(not(feature = "inventory-only"))]
 #[map]
 static PAUSE_PIDS: HashMap<PauseKey, u64> = HashMap::with_max_entries(1, 0);
+
+/// Stop gate: bit 63 is the stop request, the low 63 bits count admitted
+/// bodies. Userspace mmaps the single cell, so the map stays unfrozen and
+/// Detailed-only.
+#[cfg(not(feature = "inventory-only"))]
+#[map]
+static STOP_GATE: Array<u64> = Array::with_max_entries(1, BPF_F_MMAPABLE);
 
 /// Does this call belong to the capture scope? With no filter configured
 /// nothing is observed — scope is always explicit, and system-wide capture

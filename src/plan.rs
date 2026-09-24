@@ -1459,8 +1459,9 @@ fn merge(
         // attached, and the growth is reported as omitted below. A module
         // with nothing to keep is refused whole, as before.
         let mut refused_growth: Option<BTreeSet<AttachKey>> = None;
-        // The strongest table, when it was the one refused: its endpoints are
-        // then all in the omission record, never also counted as spill.
+        // The refused table — the strongest one, or a non-leading one that
+        // holds kept endpoints: its endpoints are all in the omission
+        // record, never also counted as spill.
         let mut refused_top: Option<TableKey> = None;
         let (fresh, admitted) = 'admission: loop {
             let kept_only = refused_growth.is_some();
@@ -1672,6 +1673,29 @@ fn merge(
                             })
                             .is_err()
                         {
+                            // A table the module already has attached must not
+                            // spill: its kept endpoints would vanish from the
+                            // snapshot and retire. Route to the refused-growth
+                            // retry like the leading table, so the kept
+                            // endpoints stay and the growth is omitted
+                            // explicitly. Tables with nothing to keep still
+                            // spill, counted once as uncorroborated.
+                            let keeps_attached = keys_of.get(key).is_some_and(|keys| {
+                                keys.iter().any(|candidate| kept.contains(candidate))
+                            });
+                            if !kept_only && keeps_attached {
+                                let demand: BTreeSet<AttachKey> = keys_of
+                                    .get(key)
+                                    .map(|keys| {
+                                        keys.iter()
+                                            .filter(|candidate| is_fresh(candidate))
+                                            .copied()
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                refused_top = Some(*key);
+                                break 'refused demand;
+                            }
                             // The budget is spent: this table and every weaker one spill.
                             // Admission stays a strongest-evidence prefix — a strong
                             // table is never skipped to admit a weaker one.
@@ -4532,6 +4556,121 @@ mod tests {
             .map(|slot| slot.file_offset)
             .collect();
         assert_eq!(kept, [0, 8, 16, 24], "every kept endpoint stays slotted");
+
+        let delta = plan.extend_exact(rebuilt).unwrap();
+
+        assert!(
+            delta.retire.is_empty(),
+            "{} kept endpoints retired",
+            delta.retire.len()
+        );
+        assert!(delta.new.is_empty());
+        assert!(delta.replace.is_empty());
+        assert_eq!(plan.active_slot_count(), MAX_SLOTS as usize - 1);
+    }
+
+    /// G1 (G-03 hole): growth on a NON-leading table must not spill kept
+    /// endpoints silently. T1 holds one kept endpoint and T2 one kept
+    /// endpoint plus two new ones, with one slot free. T2's budget failure
+    /// used to spill the whole table — its kept endpoint vanished from the
+    /// snapshot and retired — with no growth-omission record. It must route
+    /// to the refused-growth retry like the leading table: the kept
+    /// endpoint stays, the two new ones are refused with an explicit
+    /// omission, and nothing is double-counted as spill.
+    #[test]
+    fn a_non_leading_tables_growth_refuses_explicitly_and_keeps_its_kept_endpoint() {
+        use crate::discovery::scan::{ScannedEntry, ScannedTable};
+
+        let existing = PinnedObjectId(10);
+        let filler = PinnedObjectId(12);
+        let key = scanned_key(existing);
+        // Two kept endpoints plus filler to one slot short of the ceiling.
+        let mut slots = vec![
+            exact_slot(0, existing, 0, 0, vec![ModuleId(0)]),
+            exact_slot(1, existing, 8, 0, vec![ModuleId(0)]),
+        ];
+        slots.extend((0..MAX_SLOTS - 3).map(|index| {
+            exact_slot(
+                2 + index,
+                filler,
+                0x2000 + u64::from(index) * 8,
+                0,
+                vec![ModuleId(1)],
+            )
+        }));
+        let mut plan = exact_plan(
+            slots,
+            vec![exact_module(0, existing), exact_module(1, filler)],
+        );
+
+        // The regrown scan: equal heuristic evidence keeps discovery order,
+        // so T1 (one kept endpoint) sorts first and T2 (one kept endpoint
+        // plus two new ones) is the non-leading table whose growth does not
+        // fit the one free slot.
+        let table = |address: u64, file_offset: u64, offsets: &[u64]| ScannedTable {
+            version: (2, 40),
+            walk: "full",
+            entries: offsets
+                .iter()
+                .map(|offset| ScannedEntry {
+                    name: "C_Sign",
+                    object: key,
+                    object_path: "/proc/self/fd/10".into(),
+                    file_offset: *offset,
+                })
+                .collect(),
+            null_entries: vec![],
+            unpinned: vec![],
+            address,
+            file_offset: Some(file_offset),
+            live_return: false,
+            manifest_supported: false,
+        };
+        let mut grown = scanned_with(key, "/proc/self/fd/10", []);
+        grown.scanned.tables = vec![
+            table(0x7000, 0x0000, &[0]),
+            table(0x7100, 0x1000, &[8, 0x10000, 0x10008]),
+        ];
+        grown.entry_objects = vec![vec![existing], vec![existing; 3]];
+        let filler_scan = scanned_with(
+            scanned_key(filler),
+            "/proc/self/fd/12",
+            (0..MAX_SLOTS - 3).map(|index| 0x2000 + u64::from(index) * 8),
+        );
+
+        let rebuilt =
+            plan.rebuild_from_sources(&[grown, filler_scan], &[], &PinnedObjects::empty());
+
+        assert_eq!(rebuilt.modules_skipped.len(), 1);
+        assert_eq!(
+            rebuilt.modules_skipped[0].subject, "/proc/self/fd/10",
+            "the omission names the grown module"
+        );
+        assert!(
+            rebuilt.modules_skipped[0]
+                .reason
+                .starts_with("admitted module needs 2 more;"),
+            "{:?}",
+            rebuilt.modules_skipped[0]
+        );
+        assert!(
+            rebuilt.modules_skipped[0]
+                .reason
+                .contains("2 endpoints not attached; kept its 2 attached endpoints"),
+            "{:?}",
+            rebuilt.modules_skipped[0]
+        );
+        assert_eq!(
+            rebuilt.uncorroborated_candidates, 0,
+            "the refused growth is omitted, never also spilled"
+        );
+        let kept: Vec<u64> = rebuilt
+            .slots
+            .iter()
+            .filter(|slot| slot.object == existing)
+            .map(|slot| slot.file_offset)
+            .collect();
+        assert_eq!(kept, [0, 8], "both kept endpoints stay slotted");
 
         let delta = plan.extend_exact(rebuilt).unwrap();
 

@@ -3268,6 +3268,17 @@ struct CountedPass {
     force_full: bool,
 }
 
+/// Advances trace's frame clock on a frame pass: trace has no render
+/// block, so the frame's discovery pass itself advances the clock, and a
+/// pending-stop pass between frames leaves it alone. Shared by the trace
+/// loop and the cadence tests, so the clock and the cadence cannot drift
+/// apart between the loop and the tests.
+fn advance_trace_frame_clock(frame_clock: &mut Instant, pass: DiscoveryPass, now: Instant) {
+    if pass == DiscoveryPass::Frame {
+        *frame_clock = now;
+    }
+}
+
 /// Counts one gated discovery pass: only a frame pass counts a frame, and
 /// its forced-sweep verdict travels with it, so a pending-stop pass
 /// neither shifts the cadence nor forces a sweep.
@@ -4118,12 +4129,7 @@ fn capture_trace(
                     }) else {
                         return Ok((false, false, context.0.plan()));
                     };
-                    if pass == DiscoveryPass::Frame {
-                        // Trace has no render block: the frame's discovery
-                        // pass itself advances the frame clock. A pending-stop
-                        // pass between frames leaves it alone.
-                        *frame_clock = Instant::now();
-                    }
+                    advance_trace_frame_clock(frame_clock, pass, Instant::now());
                     let phase_start = Instant::now();
                     let counted = count_discovery_pass(frame_tick, pass);
                     let (plan_changed, paused) = match counted.pass {
@@ -8664,10 +8670,10 @@ mod tests {
     /// pending stop to the between-frames service. The count lives in the
     /// shared step — the tick body names the counter alias exactly twice
     /// (the borrow plus the shared-step call), so no direct `*frame_tick`
-    /// mutation outside the step can shift the cadence — and trace's frame
-    /// clock advances only on a frame pass, so a pending-stop pass leaves
-    /// the frame and discovery cadence unchanged. Sliced like
-    /// `capture_loops_idle_on_readiness`.
+    /// mutation outside the step can shift the cadence — and trace's
+    /// frame clock advances through its own shared step, never directly,
+    /// so a pending-stop pass leaves the frame and discovery cadence
+    /// unchanged. Sliced like `capture_loops_idle_on_readiness`.
     #[test]
     fn capture_loops_service_a_pending_stop_between_frames() {
         let source = include_str!("run.rs");
@@ -8735,16 +8741,17 @@ mod tests {
                 "{function} must run the full pass from exactly one arm"
             );
         }
-        let reset = trace
-            .split_once("if pass == DiscoveryPass::Frame {")
-            .and_then(|(_, rest)| rest.split_once('}'))
-            .expect("trace must advance its frame clock inside a frame-pass guard")
-            .0;
-        assert!(
-            reset.contains("*frame_clock = Instant::now();"),
-            "only trace's frame pass advances its frame clock"
+        assert_eq!(
+            trace
+                .matches("advance_trace_frame_clock(frame_clock, pass, Instant::now())")
+                .count(),
+            1,
+            "trace must advance its frame clock through the shared step once per tick"
         );
-        assert_eq!(trace.matches("*frame_clock = Instant::now();").count(), 1);
+        assert!(
+            !trace.contains("*frame_clock ="),
+            "trace must not advance its frame clock outside the shared step"
+        );
     }
 
     /// F-T8-1, one tick on scripted clock reads. The gate reads the frame clock
@@ -8998,6 +9005,76 @@ mod tests {
         (effects, totals)
     }
 
+    /// What one scripted trace tick did through the shared tick path: its
+    /// discovery pass, the frame-clock stamp after it, and the counted
+    /// frame state after it.
+    struct TraceTickEffect {
+        pass: Option<DiscoveryPass>,
+        /// Frame-clock stamp after this tick, as an offset from the
+        /// driver's clock start (production stamps `Instant::now()` on a
+        /// frame pass).
+        frame_stamp: Duration,
+        /// Cumulative frame count after this tick (shared counter).
+        frames: u64,
+        /// This tick's discovery forced a full sweep (shared cadence).
+        force_full: bool,
+    }
+
+    /// Cumulative effect counters over scripted trace ticks.
+    #[derive(Default)]
+    struct TraceTickEffectTotals {
+        forced_sweeps: usize,
+        pending_stops: usize,
+    }
+
+    /// Drives scripted ticks through the production trace tick path, as
+    /// `capture_trace` does: `discovery_due` on the frame-clock elapsed,
+    /// the shared clock-advance step, and the shared counted pass for
+    /// discovery. Discovery effects are recorded fakes; the gate, the
+    /// clock advance, the frame counting and the forced-sweep cadence are
+    /// production code. The clock starts a full interval before the first
+    /// tick, as `capture_trace` sets it. The gate and the advance share
+    /// one scripted read per tick: production stamps a fresh `now` right
+    /// after the gate, before the discovery drain, so the tick's work
+    /// never shifts the stamp and `work` stays unused here.
+    fn run_trace_ticks_with_effects(
+        drain: Duration,
+        ticks: &[ScriptedTick],
+    ) -> (Vec<TraceTickEffect>, TraceTickEffectTotals) {
+        let start = Instant::now();
+        let mut last_frame = start;
+        let mut frames = 0u64;
+        let mut totals = TraceTickEffectTotals::default();
+        let mut effects = Vec::new();
+        for tick in ticks {
+            let now = start + drain + tick.start;
+            let pass = discovery_due(now.duration_since(last_frame), drain, || tick.stop_pending);
+            let mut force_full = false;
+            if let Some(pass) = pass {
+                advance_trace_frame_clock(&mut last_frame, pass, now);
+                let counted = count_discovery_pass(&mut frames, pass);
+                force_full = counted.force_full;
+                match counted.pass {
+                    DiscoveryPass::Frame => {
+                        if force_full {
+                            totals.forced_sweeps += 1;
+                        }
+                    }
+                    DiscoveryPass::PendingStop => {
+                        totals.pending_stops += 1;
+                    }
+                }
+            }
+            effects.push(TraceTickEffect {
+                pass,
+                frame_stamp: last_frame.duration_since(start),
+                frames,
+                force_full,
+            });
+        }
+        (effects, totals)
+    }
+
     /// G6: pending-stop passes must not shift the forced-sweep cadence.
     /// Idle 2 ms ticks with stop-pending ticks scattered between frames and
     /// one 200 ms service straddling the frame-5 boundary: the next frame
@@ -9109,6 +9186,132 @@ mod tests {
             .map(|effect| (effect.pass, effect.fresh_snapshot, effect.render))
             .collect();
         assert_whole_profile_frames(&decided);
+    }
+
+    /// C5: the shared trace clock step advances the frame clock on a frame
+    /// pass and leaves it alone on any other pass.
+    #[test]
+    fn trace_frame_clock_advances_only_on_a_frame_pass() {
+        let start = Instant::now();
+        let mut clock = start;
+        let later = start + Duration::from_millis(200);
+        advance_trace_frame_clock(&mut clock, DiscoveryPass::PendingStop, later);
+        assert_eq!(
+            clock, start,
+            "a pending-stop pass leaves the frame clock alone"
+        );
+        advance_trace_frame_clock(&mut clock, DiscoveryPass::Frame, later);
+        assert_eq!(clock, later, "a frame pass stamps the frame clock");
+    }
+
+    /// C5 (G6 mirror for trace): pending-stop passes must not shift the
+    /// forced-sweep cadence or the frame clock. Idle 50 ms ticks over the
+    /// 200 ms drain with stop-pending ticks scattered between frames, a
+    /// cluster ahead of the forced frame, and a stop pending on a
+    /// frame-due tick itself (the frame wins): every frame pass counts
+    /// exactly one frame and stamps the clock at its gate time, every
+    /// pending stop leaves the count, the stamp and the sweep verdict
+    /// untouched, and the 5th frame forces the one full sweep. The gate,
+    /// the clock advance, the counting and the cadence are the shared
+    /// production path, not a test mirror.
+    #[test]
+    fn trace_pending_stop_passes_shift_neither_the_clock_nor_the_cadence() {
+        let drain = TRACE_CADENCE;
+        let ms = Duration::from_millis;
+        let idle = |start| ScriptedTick {
+            start,
+            work: Duration::ZERO,
+            stop_pending: false,
+        };
+        // Idle 50 ms ticks from 0 to 950 ms: frames land every drain from
+        // the first tick — at 0, 200, 400, 600 and the forced 800 ms —
+        // with no 6th frame in range.
+        let mut ticks: Vec<_> = (0u32..20).map(|k| idle(ms(50) * k)).collect();
+        // Scattered pending stops between the early frames.
+        for tick in [1, 5, 9, 13] {
+            ticks[tick].stop_pending = true;
+        }
+        // A cluster of pending stops ahead of the forced frame.
+        for tick in [14, 15] {
+            ticks[tick].stop_pending = true;
+        }
+        // A stop pending on the forced frame's own tick: the gate runs
+        // the frame, not the stop.
+        ticks[16].stop_pending = true;
+        let (effects, totals) = run_trace_ticks_with_effects(drain, &ticks);
+
+        // Every frame pass counts exactly one frame and stamps the clock
+        // at its gate time; nothing else counts or stamps.
+        for (index, effect) in effects.iter().enumerate() {
+            let (before, stamp_before) = if index == 0 {
+                (0, Duration::ZERO)
+            } else {
+                (effects[index - 1].frames, effects[index - 1].frame_stamp)
+            };
+            if effect.pass == Some(DiscoveryPass::Frame) {
+                assert_eq!(
+                    effect.frames,
+                    before + 1,
+                    "tick {index}: a frame pass counts exactly one frame"
+                );
+                assert_eq!(
+                    effect.frame_stamp,
+                    drain + ticks[index].start,
+                    "tick {index}: a frame pass stamps the clock at its gate time"
+                );
+            } else {
+                assert_eq!(
+                    effect.frames,
+                    before,
+                    "tick {index}: a {pass:?} pass must not count a frame",
+                    pass = effect.pass
+                );
+                assert_eq!(
+                    effect.frame_stamp,
+                    stamp_before,
+                    "tick {index}: a {pass:?} pass must not move the frame clock",
+                    pass = effect.pass
+                );
+            }
+        }
+        // Pending stops change nothing: no count, no stamp, no sweep.
+        for (index, effect) in effects.iter().enumerate() {
+            if effect.pass == Some(DiscoveryPass::PendingStop) {
+                assert!(
+                    !effect.force_full,
+                    "tick {index}: a pending stop forces no sweep"
+                );
+            }
+        }
+        assert_eq!(totals.pending_stops, 6, "the scripted pending stops");
+        // The frame wins its own tick: the stop pending there runs as the
+        // forced 5th frame.
+        assert_eq!(
+            effects[16].pass,
+            Some(DiscoveryPass::Frame),
+            "the gate runs the frame when both are due"
+        );
+        assert_eq!(effects[16].frames, 5, "that frame is the 5th");
+        assert!(
+            effects[16].force_full,
+            "the 5th frame forces the full sweep"
+        );
+        assert_eq!(effects[15].frames, 4, "no count across the cluster");
+        assert_eq!(
+            effects[15].frame_stamp, effects[12].frame_stamp,
+            "no clock shift across the cluster"
+        );
+        assert_eq!(totals.forced_sweeps, 1, "exactly one forced sweep");
+        assert_eq!(effects.last().unwrap().frames, 5, "no extra frame counts");
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| effect.pass == Some(DiscoveryPass::Frame))
+                .map(|effect| effect.frame_stamp)
+                .collect::<Vec<_>>(),
+            [200, 400, 600, 800, 1000].map(ms),
+            "frames stamp exactly one drain apart"
+        );
     }
 
     /// F-T8-1's loop wiring, which the scripted frame tests cannot reach. The

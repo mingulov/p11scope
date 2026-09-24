@@ -1682,19 +1682,19 @@ fn merge(
                             // A spent budget or a full cap still must not
                             // drop a table the module has attached: route
                             // to the refused-growth retry like a direct
-                            // budget failure — but only when the table
-                            // actually demands a fresh slot. Empty demand
-                            // means every endpoint is already attached, so
-                            // nothing can vanish: the table spills
-                            // informationally, and no refusal is recorded
-                            // (an unchanged provider stays COMPLETE).
-                            // Tables with nothing to keep still spill,
-                            // counted once as uncorroborated.
+                            // budget failure. Attached is not
+                            // surviving-in-admitted-tables: a kept table
+                            // with zero fresh demand still loses its kept
+                            // endpoints when it spills, so empty demand
+                            // routes too — the retry bypasses the cap and
+                            // preserves them, while the omission below is
+                            // suppressed for an empty total (an unchanged
+                            // provider stays COMPLETE). Tables with
+                            // nothing to keep still spill, counted once
+                            // as uncorroborated.
                             if let Some(demand) = kept_demand(key) {
-                                if !demand.is_empty() {
-                                    refused_top = Some(*key);
-                                    break 'refused demand;
-                                }
+                                refused_top = Some(*key);
+                                break 'refused demand;
                             }
                             uncorroborated_candidates += 1;
                             continue;
@@ -1715,18 +1715,16 @@ fn merge(
                             // spill: its kept endpoints would vanish from the
                             // snapshot and retire. Route to the refused-growth
                             // retry like the leading table, so the kept
-                            // endpoints stay and the growth is omitted
-                            // explicitly — but only for non-empty demand, as
-                            // above: empty demand has nothing to refuse and
-                            // spills informationally. Tables with nothing to
-                            // keep still spill, counted once as
-                            // uncorroborated.
+                            // endpoints stay and any growth is omitted
+                            // explicitly — for empty demand too, as above:
+                            // the retry preserves what a spill would drop,
+                            // and the omission below is suppressed for an
+                            // empty total. Tables with nothing to keep still
+                            // spill, counted once as uncorroborated.
                             if !kept_only {
                                 if let Some(demand) = kept_demand(key) {
-                                    if !demand.is_empty() {
-                                        refused_top = Some(*key);
-                                        break 'refused demand;
-                                    }
+                                    refused_top = Some(*key);
+                                    break 'refused demand;
                                 }
                             }
                             // The budget is spent: this table and every weaker one spill.
@@ -1928,17 +1926,23 @@ fn merge(
         skipped.extend(group_skips);
         if let Some(demand) = refused_growth {
             omitted.extend(demand);
-            let omission = Skipped {
-                subject: path.to_string(),
-                reason: growth_omission_reason(
-                    omitted.len(),
-                    capacity,
-                    allocated_slots,
-                    kept_attached.len(),
-                ),
-            };
-            refused_module_objects.push((object, omission.clone()));
-            modules_skipped.push(omission);
+            // A zero-demand kept table routes only for preservation: with
+            // nothing omitted there is no refusal to record, and the
+            // snapshot stays COMPLETE. Non-empty demand always leaves the
+            // total non-empty, so explicit refusals are unchanged.
+            if !omitted.is_empty() {
+                let omission = Skipped {
+                    subject: path.to_string(),
+                    reason: growth_omission_reason(
+                        omitted.len(),
+                        capacity,
+                        allocated_slots,
+                        kept_attached.len(),
+                    ),
+                };
+                refused_module_objects.push((object, omission.clone()));
+                modules_skipped.push(omission);
+            }
         }
     }
 
@@ -5049,9 +5053,10 @@ mod tests {
 
     /// C1: an unchanged provider whose five heuristic tables share the same
     /// attached endpoints must not record a growth refusal. The fifth table
-    /// reaches the cap branch with zero fresh demand, so there is no refused
-    /// demand to report — it spills informationally, every endpoint stays
-    /// attached, and the snapshot stays COMPLETE (`modules_skipped` empty).
+    /// reaches the cap branch with zero fresh demand, so it routes to the
+    /// kept-only retry for preservation — with empty total demand no
+    /// omission is recorded, every endpoint stays attached, and the snapshot
+    /// stays COMPLETE (`modules_skipped` empty).
     #[test]
     fn an_unchanged_provider_past_the_heuristic_cap_records_no_refusal() {
         use crate::discovery::scan::{ScannedEntry, ScannedTable};
@@ -5130,8 +5135,8 @@ mod tests {
             rebuilt.modules_skipped
         );
         assert_eq!(
-            rebuilt.uncorroborated_candidates, 1,
-            "the fifth table spills informationally, like before the retry routing"
+            rebuilt.uncorroborated_candidates, 0,
+            "the fifth table routes to the kept-only retry and admits there, it does not spill"
         );
         let kept: Vec<u64> = rebuilt
             .slots
@@ -5151,6 +5156,118 @@ mod tests {
         assert!(delta.new.is_empty());
         assert!(delta.replace.is_empty());
         assert_eq!(plan.active_slot_count(), 12);
+    }
+
+    /// D1: a zero-demand kept table past the cap must be preserved without
+    /// a refusal. The provider owns four attached endpoints; the refresh
+    /// adds an earlier alias table, so five distinct single-endpoint
+    /// heuristic tables ([0], [0], [8], [16], [24]) overflow the cap. The
+    /// fifth holds kept 24 with zero fresh demand: attached is not
+    /// surviving-in-admitted-tables, so it must route to the kept-only
+    /// retry (where the cap is bypassed) instead of spilling — and with
+    /// empty total demand no omission is recorded (COMPLETE intact).
+    #[test]
+    fn a_zero_demand_kept_table_past_the_cap_is_preserved_without_a_refusal() {
+        use crate::discovery::scan::{ScannedEntry, ScannedTable};
+
+        let existing = PinnedObjectId(10);
+        let filler = PinnedObjectId(12);
+        let key = scanned_key(existing);
+        // Four kept endpoints plus a little filler: every endpoint is
+        // already attached, so the refresh carries zero fresh demand and
+        // budget can never refuse — only the per-object cap can bite.
+        let mut slots = vec![
+            exact_slot(0, existing, 0, 0, vec![ModuleId(0)]),
+            exact_slot(1, existing, 8, 0, vec![ModuleId(0)]),
+            exact_slot(2, existing, 16, 0, vec![ModuleId(0)]),
+            exact_slot(3, existing, 24, 0, vec![ModuleId(0)]),
+        ];
+        slots.extend((0..10u32).map(|index| {
+            exact_slot(
+                4 + index,
+                filler,
+                0x2000 + u64::from(index) * 8,
+                0,
+                vec![ModuleId(1)],
+            )
+        }));
+        let mut plan = exact_plan(
+            slots,
+            vec![exact_module(0, existing), exact_module(1, filler)],
+        );
+
+        // Equal heuristic evidence keeps discovery order: the first four
+        // single-endpoint tables admit onto the four cap slots, and the
+        // fifth — holding only kept 24 — reaches the cap branch with
+        // nothing fresh.
+        let table = |address: u64, file_offset: u64, offsets: &[u64]| ScannedTable {
+            version: (2, 40),
+            walk: "full",
+            entries: offsets
+                .iter()
+                .map(|offset| ScannedEntry {
+                    name: "C_Sign",
+                    object: key,
+                    object_path: "/proc/self/fd/10".into(),
+                    file_offset: *offset,
+                })
+                .collect(),
+            null_entries: vec![],
+            unpinned: vec![],
+            address,
+            file_offset: Some(file_offset),
+            live_return: false,
+            manifest_supported: false,
+        };
+        let mut refreshed = scanned_with(key, "/proc/self/fd/10", []);
+        refreshed.scanned.tables = vec![
+            table(0x7000, 0x0000, &[0]),
+            table(0x7100, 0x1000, &[0]),
+            table(0x7200, 0x2000, &[8]),
+            table(0x7300, 0x3000, &[16]),
+            table(0x7400, 0x4000, &[24]),
+        ];
+        refreshed.entry_objects = vec![vec![existing]; 5];
+        let filler_scan = scanned_with(
+            scanned_key(filler),
+            "/proc/self/fd/12",
+            (0..10u32).map(|index| 0x2000 + u64::from(index) * 8),
+        );
+
+        let rebuilt =
+            plan.rebuild_from_sources(&[refreshed, filler_scan], &[], &PinnedObjects::empty());
+
+        assert_eq!(
+            MAX_TABLES_PER_OBJECT, 4,
+            "this test overflows the per-object cap by exactly one table"
+        );
+        assert!(
+            rebuilt.modules_skipped.is_empty(),
+            "empty total demand, so no refusal: {:?}",
+            rebuilt.modules_skipped
+        );
+        let kept: Vec<u64> = rebuilt
+            .slots
+            .iter()
+            .filter(|slot| slot.object == existing)
+            .map(|slot| slot.file_offset)
+            .collect();
+        assert_eq!(kept, [0, 8, 16, 24], "every kept endpoint stays slotted");
+        assert_eq!(
+            rebuilt.uncorroborated_candidates, 0,
+            "the fifth table routes to the kept-only retry, it does not spill"
+        );
+
+        let delta = plan.extend_exact(rebuilt).unwrap();
+
+        assert!(
+            delta.retire.is_empty(),
+            "{} kept endpoints retired",
+            delta.retire.len()
+        );
+        assert!(delta.new.is_empty());
+        assert!(delta.replace.is_empty());
+        assert_eq!(plan.active_slot_count(), 14);
     }
 
     /// A provider that changed as well as grew: it no longer lists some

@@ -6204,8 +6204,8 @@ fn lifecycle_completed_discovery_agreement_survives_real_child_exit() {
     // "without disturbing ... a manifest that still owns the same opened
     // object". active_slots therefore survives the exit exactly like the
     // capture-lifetime facts around it; see
-    // `capture_facts_reports_active_slots_separately_from_churned_allocations`
-    // for the scan-only case, where the same exit drives it to 0.
+    // `lifecycle_scan_only_exit_reports_zero_active_slots` for the scan-only
+    // case, where the same exit drives it to 0.
     let facts = engine.capture_facts();
     assert!(facts.slots > 0, "allocated slots survive the exit");
     assert_eq!(

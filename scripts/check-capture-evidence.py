@@ -3624,6 +3624,12 @@ def self_test():
         bad = copy.deepcopy(clean["evidence"])
         bad[field] = value
         rejected(lambda bad=bad: terminal_capture_is_clean(bad))
+    # U-14 through exact_common: terminal_capture_is_clean reaches the shared
+    # active_slots bound through exact_common, never exact_evidence_keys — an
+    # active set larger than the allocation it is drawn from is rejected.
+    overflowed_common = copy.deepcopy(clean["evidence"])
+    overflowed_common["active_slots"] = overflowed_common["slots"] + 1
+    rejected(lambda: terminal_capture_is_clean(overflowed_common))
     # The documented informational counters are not gaps: a lane attaching mid
     # execution must still read as clean.
     for field in sorted(INFORMATIONAL_COUNTERS):

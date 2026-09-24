@@ -199,7 +199,8 @@ impl CaptureFacts {
 
     /// Attach slots allocated over the whole capture. Capture-lifetime
     /// history: it never shrinks, even once a target exits, an attach fails,
-    /// or a generation is lost. See `active_slots` for what is attached now.
+    /// or a generation is lost. See `active_slots` for what is active in the
+    /// plan.
     pub fn slots(&self) -> usize {
         self.slots
     }
@@ -488,7 +489,7 @@ pub struct Evidence {
     /// Unique {object, file_offset} targets planned, allocated over the
     /// whole capture. The plan is append-only: a slot is never reused within
     /// a capture, so a retired target still counts here — this number never
-    /// shrinks. See `active_slots` for what is attached now.
+    /// shrinks. See `active_slots` for what is active in the plan.
     pub slots: usize,
     /// The plan's active-slot count when this report was written (owner
     /// decision U-14, 2026-09-23): mirrors `plan.is_active`, not a count of

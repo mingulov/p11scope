@@ -8059,7 +8059,7 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
         table_entries: 68,
         slots: 68,
         // U-14: this fixture models `verify-attach-e2e.sh`'s `observed-scan`
-        // lane (`sources: ["scan"]` below, no manifest) — a scan-only exit
+        // lane (`sources: ["scan"]` above, no manifest) — a scan-only exit
         // capture, where active_slots reads 0. The same script's manifest-
         // backed `observed` lane ends 68/68 instead: a manifest-attested
         // object stays pinned and active after its process view exits, so
@@ -8331,7 +8331,7 @@ fn the_capture_loop_consumer_map_is_frozen() {
     ] {
         assert!(evidence.contains(marker), "consumer map lost {marker:?}");
     }
-    // `plan.is_active`/`plan.active_slot_count()` are forbidden here for the
+    // `plan.is_active`/`active_slot_count` are forbidden here for the
     // same reason as the other two live-plan reads: none of them may be
     // re-derived a second time from the active topology inside this
     // render-lane function, current-state or not.
@@ -8339,7 +8339,7 @@ fn the_capture_loop_consumer_map_is_frozen() {
         "plan.entries_seen",
         "plan.slots.len()",
         "plan.is_active",
-        "plan.active_slot_count()",
+        "active_slot_count",
     ] {
         assert!(
             !evidence.contains(forbidden),

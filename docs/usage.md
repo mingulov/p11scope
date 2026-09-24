@@ -480,10 +480,10 @@ provider can end with `"slots":680`.
 written — it is not capture-lifetime history like `slots` is. While a
 `--pid` target keeps running with everything attached, the two fields read
 the same (`68`/`68`). An ordinary exit, a failed live attach or replacement,
-and a lost generation all reduce `active_slots` — never `slots` — so each
+and a lost generation can reduce `active_slots` — never `slots` — so each
 only ever grows `slots - active_slots`; that difference is not a churn
 count and cannot say how many restarts happened, since an exit or a failed
-attach grows it exactly as one restart would.
+attach grows it.
 
 Whether an exit drives `active_slots` to 0 depends on how the target was
 pinned. A scan-only target's object is pinned to the process view that

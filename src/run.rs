@@ -3016,6 +3016,25 @@ fn profile_frame_decisions(
     }
 }
 
+/// One profile tick's aggregate-map snapshot: a frame tick reads the maps
+/// fresh; any other tick reuses the cached snapshot (reading fresh when no
+/// snapshot was cached yet). Shared by the profile loop and the cadence
+/// tests, so the cached-vs-fresh composition is production code.
+fn profile_tick_snapshot<T: Clone>(
+    tick_frame: ProfileFrame,
+    cache: &mut Option<T>,
+    fresh: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if !tick_frame.fresh_snapshot {
+        if let Some(cached) = cache.as_ref() {
+            return Ok(cached.clone());
+        }
+    }
+    let snapshot = fresh()?;
+    *cache = Some(snapshot.clone());
+    Ok(snapshot)
+}
+
 /// The gate's between-frames question for an owned explicit pause: should
 /// this tick service a pending stop? A pending operator stop wins: the tick
 /// services nothing, the loop's end check ends the capture, and cleanup
@@ -3236,6 +3255,36 @@ pub(crate) const FULL_DISCOVERY_EVERY_N_FRAMES: u64 = 5;
 /// re-verifies warm instead.
 fn force_full_frame(frame_tick: u64) -> bool {
     frame_tick % FULL_DISCOVERY_EVERY_N_FRAMES == 0
+}
+
+/// One gated discovery pass with its frame count applied: the pass plus
+/// the forced-sweep verdict for it. Shared by both capture loops and the
+/// cadence tests, so the frame counter and the cadence cannot drift apart
+/// between the loops and the tests.
+struct CountedPass {
+    pass: DiscoveryPass,
+    /// Whether this pass's discovery forces a full inventory sweep. Only a
+    /// frame pass can force one; a pending-stop pass reports false.
+    force_full: bool,
+}
+
+/// Counts one gated discovery pass: only a frame pass counts a frame, and
+/// its forced-sweep verdict travels with it, so a pending-stop pass
+/// neither shifts the cadence nor forces a sweep.
+fn count_discovery_pass(frame_tick: &mut u64, pass: DiscoveryPass) -> CountedPass {
+    match pass {
+        DiscoveryPass::Frame => {
+            *frame_tick += 1;
+            CountedPass {
+                pass,
+                force_full: force_full_frame(*frame_tick),
+            }
+        }
+        DiscoveryPass::PendingStop => CountedPass {
+            pass,
+            force_full: false,
+        },
+    }
 }
 
 /// How long a tick sleeps: the pause slice still wins, a drain that
@@ -3590,18 +3639,15 @@ fn capture_profile(
                         return Ok((false, false, context.0.plan()));
                     };
                     let phase_start = Instant::now();
-                    let (plan_changed, paused) = match pass {
-                        DiscoveryPass::Frame => {
-                            *frame_tick += 1;
-                            let force_full = force_full_frame(*frame_tick);
-                            drain_discovery_tick(
-                                context.0,
-                                context.1,
-                                context.2.as_deref_mut(),
-                                interrupted,
-                                force_full,
-                            )?
-                        }
+                    let counted = count_discovery_pass(frame_tick, pass);
+                    let (plan_changed, paused) = match counted.pass {
+                        DiscoveryPass::Frame => drain_discovery_tick(
+                            context.0,
+                            context.1,
+                            context.2.as_deref_mut(),
+                            interrupted,
+                            counted.force_full,
+                        )?,
                         DiscoveryPass::PendingStop => service_pending_stop(
                             context.0,
                             context.1,
@@ -3633,22 +3679,18 @@ fn capture_profile(
                     Ok(None)
                 },
                 |context, consumers| {
-                    if !tick_frame.fresh_snapshot {
-                        if let Some((reports, kernel_evidence)) = snapshot_cache.as_ref() {
-                            return Ok((reports.clone(), *kernel_evidence));
+                    profile_tick_snapshot(tick_frame, snapshot_cache, || {
+                        let phase_start = Instant::now();
+                        let mut kernel_evidence = metrics::kernel_evidence(context.1)?;
+                        if !profile {
+                            kernel_evidence.ring_loss = 0;
                         }
-                    }
-                    let phase_start = Instant::now();
-                    let mut kernel_evidence = metrics::kernel_evidence(context.1)?;
-                    if !profile {
-                        kernel_evidence.ring_loss = 0;
-                    }
-                    let reports = metrics::read(context.1, context.0.plan())?;
-                    consumers
-                        .scheduling
-                        .add_phase(SchedulingPhase::Maps, phase_start.elapsed());
-                    *snapshot_cache = Some((reports.clone(), kernel_evidence));
-                    Ok((reports, kernel_evidence))
+                        let reports = metrics::read(context.1, context.0.plan())?;
+                        consumers
+                            .scheduling
+                            .add_phase(SchedulingPhase::Maps, phase_start.elapsed());
+                        Ok((reports, kernel_evidence))
+                    })
                 },
                 |context| {
                     context
@@ -4083,18 +4125,15 @@ fn capture_trace(
                         *frame_clock = Instant::now();
                     }
                     let phase_start = Instant::now();
-                    let (plan_changed, paused) = match pass {
-                        DiscoveryPass::Frame => {
-                            *frame_tick += 1;
-                            let force_full = force_full_frame(*frame_tick);
-                            drain_discovery_tick(
-                                context.0,
-                                context.1,
-                                context.2.as_deref_mut(),
-                                interrupted,
-                                force_full,
-                            )?
-                        }
+                    let counted = count_discovery_pass(frame_tick, pass);
+                    let (plan_changed, paused) = match counted.pass {
+                        DiscoveryPass::Frame => drain_discovery_tick(
+                            context.0,
+                            context.1,
+                            context.2.as_deref_mut(),
+                            interrupted,
+                            counted.force_full,
+                        )?,
                         DiscoveryPass::PendingStop => service_pending_stop(
                             context.0,
                             context.1,
@@ -8620,11 +8659,12 @@ mod tests {
     }
 
     /// F-T4-2's loop wiring, which the BPF-free tick tests cannot reach. Both
-    /// capture loops ask the one gate with the owned pending-stop check and
-    /// send a pending stop to the between-frames service. A frame is counted,
-    /// and trace's frame clock advanced, only on a frame pass, so a
-    /// pending-stop pass leaves the frame and discovery cadence unchanged.
-    /// Sliced like `capture_loops_idle_on_readiness`.
+    /// capture loops ask the one gate with the owned pending-stop check,
+    /// count the gated pass through the shared cadence step, and send a
+    /// pending stop to the between-frames service. The count lives in the
+    /// shared step and trace's frame clock advances only on a frame pass,
+    /// so a pending-stop pass leaves the frame and discovery cadence
+    /// unchanged. Sliced like `capture_loops_idle_on_readiness`.
     #[test]
     fn capture_loops_service_a_pending_stop_between_frames() {
         let source = include_str!("run.rs");
@@ -8657,20 +8697,34 @@ mod tests {
                 ),
                 "{function} must ask the gate for a pending pause stop"
             );
+            assert_eq!(
+                tick.matches("count_discovery_pass(frame_tick, pass)")
+                    .count(),
+                1,
+                "{function} must count the gated pass through the shared cadence step"
+            );
+            assert!(
+                tick.contains("match counted.pass {"),
+                "{function} must dispatch on the counted pass"
+            );
             assert!(
                 tick.contains("DiscoveryPass::PendingStop => service_pending_stop("),
                 "{function} must service a pending stop between frames"
             );
             let frame = tick
-                .split_once("DiscoveryPass::Frame => {")
+                .split_once("DiscoveryPass::Frame => ")
                 .and_then(|(_, rest)| rest.split_once("DiscoveryPass::PendingStop =>"))
                 .unwrap_or_else(|| panic!("{function} must match the frame pass first"))
                 .0;
             assert!(
-                frame.contains("*frame_tick += 1;") && frame.contains("drain_discovery_tick("),
-                "{function}: only a frame pass counts a frame and runs the full pass"
+                frame.contains("drain_discovery_tick(") && frame.contains("counted.force_full"),
+                "{function}: only a frame pass runs the full pass, with its counted sweep verdict"
             );
-            assert_eq!(tick.matches("*frame_tick += 1;").count(), 1, "{function}");
+            assert_eq!(
+                tick.matches("drain_discovery_tick(").count(),
+                1,
+                "{function} must run the full pass from exactly one arm"
+            );
         }
         let reset = trace
             .split_once("if pass == DiscoveryPass::Frame {")
@@ -8839,10 +8893,220 @@ mod tests {
         assert_eq!(frame_passes(&decided), 3, "frames at 0, 1.2 s and 2.2 s");
     }
 
+    /// What one scripted tick did through the shared tick path: its
+    /// discovery pass, its snapshot/render decisions, and the counted frame
+    /// state after it.
+    struct TickEffect {
+        pass: Option<DiscoveryPass>,
+        fresh_snapshot: bool,
+        render: bool,
+        /// Cumulative frame count after this tick (shared counter).
+        frames: u64,
+        /// This tick's discovery forced a full sweep (shared cadence).
+        force_full: bool,
+    }
+
+    /// Cumulative effect counters over scripted ticks.
+    #[derive(Default)]
+    struct TickEffectTotals {
+        forced_sweeps: usize,
+        fresh_snapshots: usize,
+        cached_snapshots: usize,
+        renders: usize,
+        pending_stops: usize,
+    }
+
+    /// Drives scripted ticks through the production tick path, as
+    /// `capture_profile` does: `profile_frame_decisions` for the frame, the
+    /// gate for the pass, the shared counted pass for discovery, the shared
+    /// snapshot step for the maps, and the frame's render verdict. Discovery,
+    /// snapshot and render effects are recorded fakes; the decisions, the
+    /// frame counting and the forced-sweep cadence are production code. The
+    /// clock starts a full interval before the first tick and a render resets
+    /// it at the tick's end, as `capture_profile` sets them.
+    fn run_profile_ticks_with_effects(
+        drain: Duration,
+        ticks: &[ScriptedTick],
+    ) -> (Vec<TickEffect>, TickEffectTotals) {
+        // Absolute times are shifted by one interval, so the clock starts at 0.
+        let mut last_frame = Duration::ZERO;
+        let mut frames = 0u64;
+        let mut cache: Option<u64> = None;
+        let mut snapshot_seq = 0u64;
+        let mut totals = TickEffectTotals::default();
+        let mut effects = Vec::new();
+        for tick in ticks {
+            let start = drain + tick.start;
+            let mut reads = 0;
+            let frame = profile_frame_decisions(
+                || {
+                    reads += 1;
+                    let at = if reads == 1 { start } else { start + tick.work };
+                    at.saturating_sub(last_frame)
+                },
+                drain,
+            );
+            let pass = discovery_due(frame.since_frame, drain, || tick.stop_pending);
+            let mut force_full = false;
+            if let Some(pass) = pass {
+                let counted = count_discovery_pass(&mut frames, pass);
+                force_full = counted.force_full;
+                match counted.pass {
+                    DiscoveryPass::Frame => {
+                        if force_full {
+                            totals.forced_sweeps += 1;
+                        }
+                    }
+                    DiscoveryPass::PendingStop => {
+                        totals.pending_stops += 1;
+                    }
+                }
+            }
+            let mut read_fresh = false;
+            profile_tick_snapshot(frame, &mut cache, || {
+                read_fresh = true;
+                snapshot_seq += 1;
+                Ok(snapshot_seq)
+            })
+            .unwrap();
+            if read_fresh {
+                totals.fresh_snapshots += 1;
+            } else {
+                totals.cached_snapshots += 1;
+            }
+            if frame.render {
+                totals.renders += 1;
+                last_frame = start + tick.work;
+            }
+            effects.push(TickEffect {
+                pass,
+                fresh_snapshot: frame.fresh_snapshot,
+                render: frame.render,
+                frames,
+                force_full,
+            });
+        }
+        (effects, totals)
+    }
+
+    /// G6: pending-stop passes must not shift the forced-sweep cadence.
+    /// Idle 2 ms ticks with stop-pending ticks scattered between frames and
+    /// one 200 ms service straddling the frame-5 boundary: the next frame
+    /// after the cluster performs exactly one forced sweep plus a fresh
+    /// snapshot and a render, the frame count advances by exactly one per
+    /// frame pass, and every pending stop leaves the count, the snapshot
+    /// and the render untouched. The counting, cadence and snapshot steps
+    /// are the shared production path, not a test mirror.
+    #[test]
+    fn pending_stop_passes_do_not_shift_the_forced_sweep_cadence() {
+        let drain = PROFILE_CADENCE;
+        let ms = Duration::from_millis;
+        let idle = |start| ScriptedTick {
+            start,
+            work: Duration::ZERO,
+            stop_pending: false,
+        };
+        // Idle 2 ms ticks from 0 to just under 5 s: frames land every
+        // drain from the first tick — at 0, 1, 2, 3 s and the forced 5th
+        // right after the cluster past 4 s — with no 6th frame in range.
+        let mut ticks: Vec<_> = (0u32..2500).map(|k| idle(ms(2) * k)).collect();
+        // Scattered pending stops between the early frames.
+        for tick in [50, 150, 250, 350, 450] {
+            ticks[tick].stop_pending = true;
+        }
+        // A cluster of pending stops ahead of the forced frame, including
+        // one 200 ms service straddling the frame-5 boundary at 4 s.
+        for tick in [2050, 2150, 2250, 2350, 2450] {
+            ticks[tick].stop_pending = true;
+        }
+        ticks[1999] = ScriptedTick {
+            start: ms(3998),
+            work: ms(200),
+            stop_pending: true,
+        };
+        let (effects, totals) = run_profile_ticks_with_effects(drain, &ticks);
+
+        // Every frame pass counts exactly one frame; nothing else counts.
+        for (index, effect) in effects.iter().enumerate() {
+            let before = if index == 0 {
+                0
+            } else {
+                effects[index - 1].frames
+            };
+            if effect.pass == Some(DiscoveryPass::Frame) {
+                assert_eq!(
+                    effect.frames,
+                    before + 1,
+                    "tick {index}: a frame pass counts exactly one frame"
+                );
+            } else {
+                assert_eq!(
+                    effect.frames,
+                    before,
+                    "tick {index}: a {pass:?} pass must not count a frame",
+                    pass = effect.pass
+                );
+            }
+        }
+        // Pending stops change nothing: no count, no forced sweep, no fresh
+        // snapshot, no render.
+        for (index, effect) in effects.iter().enumerate() {
+            if effect.pass == Some(DiscoveryPass::PendingStop) {
+                assert!(
+                    !effect.force_full && !effect.fresh_snapshot && !effect.render,
+                    "tick {index}: a pending stop forces nothing and renders nothing"
+                );
+            }
+        }
+        assert_eq!(totals.pending_stops, 11, "the scripted pending stops");
+        // The straddling service does none of the frame; the next frame
+        // after the cluster is the forced 5th: exactly one forced sweep
+        // plus a fresh snapshot and a render, frames 4 to 5.
+        assert_eq!(
+            (
+                effects[1999].pass,
+                effects[1999].fresh_snapshot,
+                effects[1999].render
+            ),
+            (Some(DiscoveryPass::PendingStop), false, false),
+            "the straddling service does none of the frame"
+        );
+        assert_eq!(
+            (
+                effects[2000].pass,
+                effects[2000].fresh_snapshot,
+                effects[2000].render
+            ),
+            (Some(DiscoveryPass::Frame), true, true),
+            "the tick after the service runs the frame"
+        );
+        assert_eq!(effects[2000].frames, 5, "that frame is the 5th");
+        assert!(
+            effects[2000].force_full,
+            "the 5th frame forces the full sweep"
+        );
+        assert_eq!(effects[1999].frames, 4, "no count across the service");
+        assert_eq!(totals.forced_sweeps, 1, "exactly one forced sweep");
+        assert_eq!(effects.last().unwrap().frames, 5, "no extra frame counts");
+        assert_eq!(totals.fresh_snapshots, 5, "one fresh snapshot per frame");
+        assert_eq!(totals.renders, 5, "one render per frame");
+        assert_eq!(
+            totals.cached_snapshots,
+            ticks.len() - 5,
+            "every other tick reuses the cached snapshot"
+        );
+        let decided: Vec<TickFrame> = effects
+            .iter()
+            .map(|effect| (effect.pass, effect.fresh_snapshot, effect.render))
+            .collect();
+        assert_whole_profile_frames(&decided);
+    }
+
     /// F-T8-1's loop wiring, which the scripted frame tests cannot reach. The
     /// profile loop reads its frame clock once per tick, through
     /// `profile_frame_decisions`, and its gate, snapshot and render all follow
-    /// that one read. Its only other read sizes the idle wait. Sliced like
+    /// that one read — the snapshot through the shared snapshot step. Its
+    /// only other read sizes the idle wait. Sliced like
     /// `capture_loops_idle_on_readiness`.
     #[test]
     fn the_profile_loop_decides_each_frame_from_one_clock_read() {
@@ -8864,8 +9128,8 @@ mod tests {
                 "the gate on that read",
             ),
             (
-                "if !tick_frame.fresh_snapshot {",
-                "the snapshot on that read",
+                "profile_tick_snapshot(tick_frame, snapshot_cache,",
+                "the snapshot on that read, through the shared step",
             ),
             (
                 "if tick_frame.render {",
@@ -8882,6 +9146,20 @@ mod tests {
                 "capture_profile: {decision}"
             );
         }
+        let snapshot_step = source
+            .split_once("fn profile_tick_snapshot")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        assert_eq!(
+            snapshot_step
+                .matches("if !tick_frame.fresh_snapshot {")
+                .count(),
+            1,
+            "the shared snapshot step gates the fresh read on the frame verdict"
+        );
         assert_eq!(
             profile.matches("last_frame.elapsed()").count(),
             2,

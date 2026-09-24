@@ -188,12 +188,16 @@ produced it.
   smaller ring overflows sooner. Overflow never corrupts counts — the
   aggregate maps are the count authority — but it is disclosed as `event_loss`
   with a `PARTIAL` verdict instead of `COMPLETE`.
-- `--drain-interval-ms <n>` — the capture-loop tick: 5 to 60000 ms (defaults:
-  profile 1000 ms, trace 200 ms). A faster tick drains the ring sooner (less
-  loss under bursts, more observer CPU); a slower tick does the opposite.
-  It does not delay a `run --pause` stop. Whatever this interval, the loop
-  checks for a pending stop every few milliseconds (one map read) and
-  services it at once, so the stop's 500 ms deadline does not depend on it.
+- `--drain-interval-ms <n>` — the frame interval: 5 to 60000 ms (defaults:
+  profile 1000 ms, trace 200 ms). A shorter interval refreshes discovery,
+  aggregate maps and live output more often, with more observer CPU cost.
+  Events drain on every loop tick. The frame interval does not delay a
+  `run --pause` stop. While a pause epoch is armed, the loop checks for a
+  pending stop on every loop tick (every 2 ms when idle; one map read between
+  frames) and services it at once. Busy ticks can spend up to 50 ms draining
+  events, and trace ticks can spend up to 250 ms writing output, so the check
+  is not a fixed wall-clock polling guarantee. The stop's 500 ms deadline is
+  unchanged.
 
 ```bash
 # Burst-heavy workload: bigger ring, faster drain.

@@ -2843,6 +2843,42 @@ fn discovery_due(
     }
 }
 
+/// One profile tick's frame decisions, all from one read of the time since
+/// the last frame (F-T8-1). The gate hands that read to `discovery_due`. The
+/// map snapshot and the render follow the same verdict, so a tick does the
+/// whole frame (its discovery pass, a fresh snapshot, the render and the
+/// frame-clock reset) or none of it.
+///
+/// Reading the clock again at the snapshot and at the render let a tick whose
+/// work crossed the frame boundary (an event drain of up to 50 ms, or a
+/// pending-stop service) render the frame and reset the clock without its
+/// discovery pass. Under sustained load that skipped nearly every frame's
+/// pass: ordinary discovery, the forced-sweep cadence, and the pause's
+/// re-arm. Trace needs no such split: its frame pass is its only frame
+/// decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProfileFrame {
+    /// The tick's one read, for the discovery gate.
+    since_frame: Duration,
+    /// Read the aggregate maps fresh instead of reusing the cached snapshot.
+    fresh_snapshot: bool,
+    /// Render the frame and reset the frame clock.
+    render: bool,
+}
+
+fn profile_frame_decisions(
+    mut since_frame: impl FnMut() -> Duration,
+    drain: Duration,
+) -> ProfileFrame {
+    let since_frame = since_frame();
+    let frame_due = since_frame >= drain;
+    ProfileFrame {
+        since_frame,
+        fresh_snapshot: frame_due,
+        render: frame_due,
+    }
+}
+
 /// The gate's between-frames question for an owned explicit pause: should
 /// this tick service a pending stop? A pending operator stop wins: the tick
 /// services nothing, the loop's end check ends the capture, and cleanup
@@ -2936,12 +2972,42 @@ fn drain_discovery_tick(
     }
 }
 
-/// Between frames, services the stop the gate found pending (F-T4-2): the
-/// frame pass's own pause entry, `service_pause`, without the frame's
-/// ordinary discovery, so a disabled or retired policy leaves discovery to
-/// the next frame. An error is retired exactly as a frame retires it
-/// (`retire_pause_policy`: `always` or a lifecycle failure ends the capture).
-/// Whatever the call applied is reported as a plan change either way.
+/// The pause I/O a capture tick drives: the coordinator's seam, plus whether
+/// this tick's batch application changed the attach plan (the loop then
+/// syncs its semantic consumers before draining events).
+trait TickPauseIo: PauseIo {
+    fn plan_changed(&self) -> bool;
+}
+
+impl TickPauseIo for SessionPauseIo<'_> {
+    fn plan_changed(&self) -> bool {
+        SessionPauseIo::plan_changed(self)
+    }
+}
+
+/// The between-frames pass's whole pause step (F-T4-2), generic over the
+/// pause I/O so the capture loops (session adapter) and the held-child tests
+/// run the same code. It runs the frame pass's own pause entry,
+/// `service_pause`, without the frame's ordinary discovery, so a disabled or
+/// retired policy leaves discovery to the next frame. An error is retired
+/// exactly as a frame retires it (`retire_pause_policy`: `always` or a
+/// lifecycle failure ends the capture). The tick's `(plan_changed, paused)`
+/// reports whatever the call applied either way.
+fn pending_stop_pass(
+    coordinator: &mut PauseCoordinator,
+    io: &mut impl TickPauseIo,
+) -> Result<(bool, bool)> {
+    let paused = match service_pause(coordinator, io) {
+        Ok(serviced) => serviced,
+        Err(error) => {
+            retire_pause_policy(error)?;
+            false
+        }
+    };
+    Ok((io.plan_changed(), paused))
+}
+
+/// `pending_stop_pass` for the capture loops, through the session adapter.
 fn service_pending_stop(
     engine: &mut Engine,
     session: &mut Session,
@@ -2951,24 +3017,14 @@ fn service_pending_stop(
     let Some(owned) = owned else {
         return Ok((false, false));
     };
-    let (serviced, plan_changed) = {
-        let marker = marker_never_seen();
-        let cancelled = cancelled_by(interrupted);
-        let child = owned
-            .child
-            .as_ref()
-            .expect("the owned child is retained until finalization");
-        let mut io = SessionPauseIo::new(engine, session, child, &marker, &cancelled);
-        let serviced = service_pause(&mut owned.coordinator, &mut io);
-        (serviced, io.plan_changed())
-    };
-    match serviced {
-        Ok(serviced) => Ok((plan_changed, serviced)),
-        Err(error) => {
-            retire_pause_policy(error)?;
-            Ok((plan_changed, false))
-        }
-    }
+    let marker = marker_never_seen();
+    let cancelled = cancelled_by(interrupted);
+    let child = owned
+        .child
+        .as_ref()
+        .expect("the owned child is retained until finalization");
+    let mut io = SessionPauseIo::new(engine, session, child, &marker, &cancelled);
+    pending_stop_pass(&mut owned.coordinator, &mut io)
 }
 
 /// `auto` is explicit best effort: a nonfatal coordinator failure has already
@@ -3020,9 +3076,11 @@ fn capture_end(
 /// the frame, so a burst landing mid-wait is drained on arrival rather
 /// than after a full sleep (audit F1). The timeout also keeps the
 /// frame, duration and signal cadence bounded when nothing arrives, and
-/// with it the pause: every tick asks the gate (`discovery_due`) for a
-/// pending stop, so a stopped child is serviced on the next tick, in
-/// milliseconds, instead of waiting out a frame (F-T4-2).
+/// with it the pause. While a pause epoch is armed, every tick between
+/// frames asks the gate (`discovery_due`) for a pending stop, and a frame
+/// tick services the pause in its own pass. A stopped child is therefore
+/// serviced on the next tick, in milliseconds, instead of waiting out a
+/// frame (F-T4-2).
 /// Margin: one full timeout at the fastest measured unpaced burst
 /// (A2b, 127648/s) admits 256 records, far under the default
 /// 12483-record ring — but that bounds the REQUESTED wait only, never
@@ -3372,6 +3430,8 @@ fn capture_profile(
         stdout.begin_tick(crate::sink::SINK_TICK_BUDGET);
         ticks += 1;
         let elapsed = clock.elapsed();
+        // One frame-clock read decides this tick's whole frame (F-T8-1).
+        let tick_frame = profile_frame_decisions(|| last_frame.elapsed(), drain);
         let tick = {
             let mut context = (&mut *engine, &mut *session, &mut owned);
             let mut consumers = CaptureConsumers {
@@ -3387,7 +3447,7 @@ fn capture_profile(
                 &mut context,
                 &mut consumers,
                 |context: &mut ProfileTickContext<'_, '_>, consumers: &mut CaptureConsumers<'_>| {
-                    let Some(pass) = discovery_due(last_frame.elapsed(), drain, || {
+                    let Some(pass) = discovery_due(tick_frame.since_frame, drain, || {
                         owned_stop_pending(context.0, context.1, context.2.as_deref(), interrupted)
                     }) else {
                         return Ok((false, false, context.0.plan()));
@@ -3436,7 +3496,7 @@ fn capture_profile(
                     Ok(None)
                 },
                 |context, consumers| {
-                    if last_frame.elapsed() < drain {
+                    if !tick_frame.fresh_snapshot {
                         if let Some((reports, kernel_evidence)) = snapshot_cache.as_ref() {
                             return Ok((reports.clone(), *kernel_evidence));
                         }
@@ -3468,7 +3528,7 @@ fn capture_profile(
             CaptureTick::End(end) => break Ok(end),
         };
 
-        if last_frame.elapsed() >= drain {
+        if tick_frame.render {
             last_frame = Instant::now();
             let render_start = Instant::now();
             let ev = evidence_for(
@@ -6897,10 +6957,16 @@ mod tests {
     /// coordinator, the owned child, its pidfd SIGCONT, its `/proc` task
     /// states, and the settlement path.
     ///
-    /// The F-T4-2 tick tests add a batch outcome (`required_complete`), a
-    /// scripted successor stop on the first resume, and counts of the scripted
-    /// I/O, so they can confirm a full cycle and price an idle tick. All of
-    /// these default to the shutdown test's behaviour.
+    /// The F-T4-2 tick tests add several scripted pieces, so they can confirm
+    /// a full cycle, observe what a tick hands the capture loop, and price an
+    /// idle tick:
+    /// - a batch outcome (`required_complete`);
+    /// - whether a batch with records changes the attach plan
+    ///   (`batch_changes_plan`, reported through `plan_changed` per tick);
+    /// - a successor stop on the first resume;
+    /// - counts of the scripted I/O.
+    ///
+    /// All of these default to the shutdown test's behaviour.
     #[derive(Default)]
     struct HeldPause {
         authorization: Option<u64>,
@@ -6908,6 +6974,8 @@ mod tests {
         now_ns: u64,
         resumes: usize,
         required_complete: bool,
+        batch_changes_plan: bool,
+        plan_changed: bool,
         successor_on_resume: bool,
         hooks: Vec<u64>,
         resumed_at: Vec<u64>,
@@ -6984,7 +7052,7 @@ mod tests {
 
         fn apply_batch(
             &mut self,
-            _: Vec<p11scope_ebpf_common::DiscoveryRecord>,
+            records: Vec<p11scope_ebpf_common::DiscoveryRecord>,
             _: Option<u64>,
             _: bool,
             _: bool,
@@ -6993,6 +7061,7 @@ mod tests {
             crate::discovery::pause::PauseBatchOutcome,
             crate::discovery::pause::PauseBatchError,
         > {
+            self.held.plan_changed |= self.held.batch_changes_plan && !records.is_empty();
             let mut outcome = crate::discovery::pause::PauseBatchOutcome::default();
             outcome.required_complete = self.held.required_complete;
             Ok(outcome)
@@ -7060,6 +7129,12 @@ mod tests {
 
         fn cancelled(&mut self) -> std::result::Result<bool, String> {
             Ok(self.signals.interrupted())
+        }
+    }
+
+    impl TickPauseIo for HeldPauseIo<'_> {
+        fn plan_changed(&self) -> bool {
+            self.held.plan_changed
         }
     }
 
@@ -7205,26 +7280,39 @@ mod tests {
 
     /// One capture tick's pause step, composed as both capture loops compose
     /// it for an owned explicit pause. The discovery gate asks `pause_stop_due`
-    /// between frames only. The admitted pass then services the pause through
-    /// `service_pause`, the one entry that `drain_discovery_tick` (a frame) and
-    /// `service_pending_stop` (between frames) both call. A failed service is
-    /// retired as both retire it, through `retire_pause_policy`, where `Err`
-    /// ends the capture. Those session-bound wrappers need BPF, and the frame's
-    /// ordinary fallback for a disabled policy does not arise here.
+    /// between frames only.
+    /// - A pending stop runs the production between-frames step,
+    ///   `pending_stop_pass`: all of `service_pending_stop` but its session
+    ///   adapter.
+    /// - A frame pass services an armed pause through the same `service_pause`
+    ///   entry that `drain_discovery_tick` calls. That wrapper, and its ordinary
+    ///   fallback for a disabled policy, need BPF and do not arise here.
+    ///
+    /// Returns the admitted pass and what the loop receives: the tick's
+    /// `(plan_changed, paused)`, or `Err` when the capture ends.
     fn held_pause_tick(
         since_frame: Duration,
         drain: Duration,
         coordinator: &mut PauseCoordinator,
         io: &mut HeldPauseIo<'_>,
-    ) -> (Option<DiscoveryPass>, Result<()>) {
+    ) -> (Option<DiscoveryPass>, Result<(bool, bool)>) {
         let pass = discovery_due(since_frame, drain, || pause_stop_due(coordinator, io));
-        let retired = match pass.map(|_| service_pause(coordinator, io)) {
-            None | Some(Ok(true)) => Ok(()),
-            Some(Ok(false)) => panic!("{pass:?}: an armed pause must be serviced"),
-            Some(Err(error)) => retire_pause_policy(error),
+        let handed = match pass {
+            None => Ok((false, false)),
+            Some(DiscoveryPass::PendingStop) => pending_stop_pass(coordinator, io),
+            Some(DiscoveryPass::Frame) => {
+                let serviced = service_pause(coordinator, io)
+                    .unwrap_or_else(|error| panic!("a frame pass failed: {error}"));
+                assert!(serviced, "a frame pass must service an armed pause");
+                Ok((io.plan_changed(), true))
+            }
         };
-        (pass, retired)
+        (pass, handed)
     }
+
+    /// One driven tick: the pass it admitted, then the `(plan_changed, paused)`
+    /// it handed the loop (both false when it ended the capture).
+    type HeldTick = (Option<DiscoveryPass>, bool, bool);
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum HeldStop {
@@ -7246,8 +7334,8 @@ mod tests {
     struct HeldStopOutcome {
         case: HeldStop,
         policy: cli::PausePolicy,
-        /// The passes the first two ticks admitted.
-        first_ticks: [Option<DiscoveryPass>; 2],
+        /// The first two ticks.
+        first_ticks: [HeldTick; 2],
         /// A tick's pause failure ended the capture.
         ended_by_pause_failure: bool,
         /// Whether the child was still stopped after the last tick.
@@ -7281,6 +7369,12 @@ mod tests {
     /// cleanup resumes the child and reports the stop (`auto` partial, `always`
     /// refused). Under the frame-only gate every stop stayed held through all
     /// the ticks and cleanup reported it unconfirmed.
+    ///
+    /// Each tick also records the `(plan_changed, paused)` it hands the loop.
+    /// A pause batch normally changes the attach plan (a new provider). One
+    /// `always` stop's batch attaches nothing new, because `always` stops on
+    /// every load, already-attached ones included. That tick pauses without a
+    /// plan change, so the pair's two halves can be told apart.
     #[test]
     fn a_pending_pause_stop_is_serviced_between_frames_within_its_causal_deadline() {
         use crate::cli::PausePolicy::{Always, Auto};
@@ -7308,6 +7402,7 @@ mod tests {
             let signals = SignalState::new();
             let mut held = HeldPause {
                 required_complete: case != HeldStop::Failed,
+                batch_changes_plan: (case, policy) != (HeldStop::One, Always),
                 successor_on_resume: matches!(
                     case,
                     HeldStop::Cascade | HeldStop::CascadeAfterFrame
@@ -7330,7 +7425,8 @@ mod tests {
                 signals.observe(libc::SIGTERM);
             }
 
-            let mut passes = Vec::with_capacity(ticks);
+            let idle: HeldTick = (None, false, false);
+            let mut first_ticks = [idle; 2];
             let mut idle_from = None;
             let mut ended_by_pause_failure = false;
             for tick in 0..ticks {
@@ -7342,16 +7438,20 @@ mod tests {
                 } else {
                     Duration::ZERO
                 };
+                // A fresh adapter per tick, as the loop builds one per pass.
+                held.plan_changed = false;
                 let mut io = HeldPauseIo {
                     child: &child,
                     held: &mut held,
                     signals: &signals,
                 };
-                let (pass, retired) =
-                    held_pause_tick(since_frame, drain, &mut coordinator, &mut io);
-                passes.push(pass);
+                let (pass, handed) = held_pause_tick(since_frame, drain, &mut coordinator, &mut io);
                 held.now_ns += idle_wait;
-                if retired.is_err() {
+                let (plan_changed, paused) = handed.as_ref().map_or((false, false), |pair| *pair);
+                if let Some(record) = first_ticks.get_mut(tick) {
+                    *record = (pass, plan_changed, paused);
+                }
+                if handed.is_err() {
                     ended_by_pause_failure = true;
                     break;
                 }
@@ -7385,7 +7485,7 @@ mod tests {
             observed.push(HeldStopOutcome {
                 case,
                 policy,
-                first_ticks: [passes[0], passes.get(1).copied().flatten()],
+                first_ticks,
                 ended_by_pause_failure,
                 held_after_ticks,
                 counters_after_ticks,
@@ -7404,7 +7504,8 @@ mod tests {
             // Dropping the child kills and reaps it.
         }
 
-        let pending = Some(DiscoveryPass::PendingStop);
+        let idle: HeldTick = (None, false, false);
+        let stop: HeldTick = (Some(DiscoveryPass::PendingStop), true, true);
         let confirmed = |stops| PauseCounters {
             attempts: stops,
             confirmed: stops,
@@ -7430,12 +7531,12 @@ mod tests {
                 idle_dequeues: 0,
             };
         let expected = [
-            serviced(HeldStop::One, Auto, [pending, None], 1, ticks - 2),
-            serviced(HeldStop::Cascade, Auto, [pending, pending], 2, 0),
+            serviced(HeldStop::One, Auto, [stop, idle], 1, ticks - 2),
+            serviced(HeldStop::Cascade, Auto, [stop, stop], 2, 0),
             serviced(
                 HeldStop::CascadeAfterFrame,
                 Auto,
-                [Some(DiscoveryPass::Frame), pending],
+                [(Some(DiscoveryPass::Frame), true, true), stop],
                 2,
                 0,
             ),
@@ -7444,7 +7545,7 @@ mod tests {
             HeldStopOutcome {
                 case: HeldStop::Failed,
                 policy: Auto,
-                first_ticks: [pending, None],
+                first_ticks: [stop, idle],
                 ended_by_pause_failure: false,
                 held_after_ticks: false,
                 counters_after_ticks: unconfirmed(1),
@@ -7457,7 +7558,7 @@ mod tests {
             HeldStopOutcome {
                 case: HeldStop::Signalled,
                 policy: Auto,
-                first_ticks: [None, None],
+                first_ticks: [idle, idle],
                 ended_by_pause_failure: false,
                 held_after_ticks: true,
                 counters_after_ticks: PauseCounters::default(),
@@ -7467,13 +7568,21 @@ mod tests {
                 idle_authorization_reads: 0,
                 idle_dequeues: 0,
             },
-            serviced(HeldStop::One, Always, [pending, None], 1, ticks - 2),
+            // Its batch attached nothing new: the tick pauses without a plan
+            // change.
+            serviced(
+                HeldStop::One,
+                Always,
+                [(Some(DiscoveryPass::PendingStop), false, true), idle],
+                1,
+                ticks - 2,
+            ),
             // The failed cycle resumes the child, and its required failure
             // ends the capture on that tick.
             HeldStopOutcome {
                 case: HeldStop::Failed,
                 policy: Always,
-                first_ticks: [pending, None],
+                first_ticks: [(Some(DiscoveryPass::PendingStop), false, false), idle],
                 ended_by_pause_failure: true,
                 held_after_ticks: false,
                 counters_after_ticks: unconfirmed(0),
@@ -7486,7 +7595,7 @@ mod tests {
             HeldStopOutcome {
                 case: HeldStop::Signalled,
                 policy: Always,
-                first_ticks: [None, None],
+                first_ticks: [idle, idle],
                 ended_by_pause_failure: false,
                 held_after_ticks: true,
                 counters_after_ticks: PauseCounters::default(),
@@ -8422,6 +8531,211 @@ mod tests {
             "only trace's frame pass advances its frame clock"
         );
         assert_eq!(trace.matches("*frame_clock = Instant::now();").count(), 1);
+    }
+
+    /// F-T8-1, one tick on scripted clock reads. The gate reads the frame clock
+    /// at drain − 1 ms, and the tick's work (a 30 ms event drain) then crosses
+    /// the frame boundary, so any later read sees drain + 29 ms. With separate
+    /// reads the snapshot and render decisions came from those later reads.
+    /// The frame rendered and reset the clock with no discovery pass:
+    /// `(false, true, true)`. With one read per tick, this tick skips the whole
+    /// frame and the next tick does all of it.
+    #[test]
+    fn a_profile_tick_does_the_whole_frame_or_none_of_it() {
+        let drain = PROFILE_CADENCE;
+        let decide = |reads: [Duration; 3]| {
+            let mut reads = reads.into_iter();
+            let frame =
+                profile_frame_decisions(|| reads.next().expect("at most three reads"), drain);
+            let discovery =
+                discovery_due(frame.since_frame, drain, || false) == Some(DiscoveryPass::Frame);
+            (discovery, frame.fresh_snapshot, frame.render)
+        };
+        let crossing = drain + Duration::from_millis(29);
+        assert_eq!(
+            decide([drain - Duration::from_millis(1), crossing, crossing]),
+            (false, false, false),
+            "a tick that starts before the frame boundary does none of the frame"
+        );
+        let next = drain + Duration::from_millis(30);
+        assert_eq!(
+            decide([next, next, next]),
+            (true, true, true),
+            "the next tick does all of it"
+        );
+    }
+
+    /// One scripted profile tick, offset from the loop's first tick.
+    #[derive(Clone, Copy)]
+    struct ScriptedTick {
+        start: Duration,
+        /// Its passes and its event drain. The gate reads the frame clock
+        /// before this work; any later frame decision reads after it.
+        work: Duration,
+        stop_pending: bool,
+    }
+
+    /// What one scripted tick decided: its discovery pass, whether it read the
+    /// maps fresh, and whether it rendered.
+    type TickFrame = (Option<DiscoveryPass>, bool, bool);
+
+    /// Drives scripted ticks through the production frame decisions, as
+    /// `capture_profile` does. Each tick gets `profile_frame_decisions` for its
+    /// frame, then `discovery_due` on its read for the pass. A render resets the
+    /// frame clock at the tick's end, where the render block runs. The clock
+    /// starts a full interval before the first tick, as `capture_profile` sets
+    /// it.
+    fn run_profile_ticks(drain: Duration, ticks: &[ScriptedTick]) -> Vec<TickFrame> {
+        // Absolute times are shifted by one interval, so the clock starts at 0.
+        let mut last_frame = Duration::ZERO;
+        ticks
+            .iter()
+            .map(|tick| {
+                let start = drain + tick.start;
+                let mut reads = 0;
+                let frame = profile_frame_decisions(
+                    || {
+                        reads += 1;
+                        let at = if reads == 1 { start } else { start + tick.work };
+                        at.saturating_sub(last_frame)
+                    },
+                    drain,
+                );
+                let pass = discovery_due(frame.since_frame, drain, || tick.stop_pending);
+                if frame.render {
+                    last_frame = start + tick.work;
+                }
+                (pass, frame.fresh_snapshot, frame.render)
+            })
+            .collect()
+    }
+
+    fn frame_passes(decided: &[TickFrame]) -> usize {
+        decided
+            .iter()
+            .filter(|(pass, _, _)| *pass == Some(DiscoveryPass::Frame))
+            .count()
+    }
+
+    fn assert_whole_profile_frames(decided: &[TickFrame]) {
+        for (index, &(pass, fresh_snapshot, render)) in decided.iter().enumerate() {
+            let frame = pass == Some(DiscoveryPass::Frame);
+            assert!(
+                frame == fresh_snapshot && frame == render,
+                "tick {index}: pass {pass:?}, fresh snapshot {fresh_snapshot}, render {render}"
+            );
+        }
+    }
+
+    /// F-T8-1: busy 30 ms ticks back to back for 20 s at the 1 s profile
+    /// default. Every frame must keep its discovery pass, at least 19. The
+    /// separate reads gave one, the very first. Each later tick that crossed
+    /// a boundary rendered and reset the clock without a pass, so the next
+    /// rendering tick's gate always fell 10 ms short.
+    #[test]
+    fn busy_profile_ticks_keep_one_discovery_pass_per_frame() {
+        let drain = PROFILE_CADENCE;
+        let ms = Duration::from_millis;
+        let busy: Vec<_> = (0u32..)
+            .map(|k| ScriptedTick {
+                start: ms(30) * k,
+                work: ms(30),
+                stop_pending: false,
+            })
+            .take_while(|tick| tick.start < Duration::from_secs(20))
+            .collect();
+        let decided = run_profile_ticks(drain, &busy);
+        assert!(
+            frame_passes(&decided) >= 19,
+            "20 s of busy 30 ms ticks gave {} discovery passes",
+            frame_passes(&decided)
+        );
+        assert_whole_profile_frames(&decided);
+    }
+
+    /// F-T8-1: a 200 ms pending-stop service straddles the frame boundary
+    /// between idle 2 ms ticks. It must not cost the next tick its frame pass.
+    #[test]
+    fn a_profile_pending_stop_cannot_skip_the_next_frames_discovery() {
+        let drain = PROFILE_CADENCE;
+        let ms = Duration::from_millis;
+        let idle = |start| ScriptedTick {
+            start,
+            work: Duration::ZERO,
+            stop_pending: false,
+        };
+        let mut straddle: Vec<_> = (0u32..500).map(|k| idle(ms(2) * k)).collect();
+        let service = straddle.len();
+        straddle.push(ScriptedTick {
+            start: ms(999),
+            work: ms(200),
+            stop_pending: true,
+        });
+        // The 1 ms pause slice follows the service, then 2 ms idle polls.
+        straddle.extend((0u32..900).map(|k| idle(ms(1200) + ms(2) * k)));
+        let decided = run_profile_ticks(drain, &straddle);
+        assert_eq!(
+            decided[service],
+            (Some(DiscoveryPass::PendingStop), false, false),
+            "the straddling service does none of the frame"
+        );
+        assert_eq!(
+            decided[service + 1],
+            (Some(DiscoveryPass::Frame), true, true),
+            "the tick after the service runs the frame's discovery pass"
+        );
+        assert_whole_profile_frames(&decided);
+        assert_eq!(frame_passes(&decided), 3, "frames at 0, 1.2 s and 2.2 s");
+    }
+
+    /// F-T8-1's loop wiring, which the scripted frame tests cannot reach. The
+    /// profile loop reads its frame clock once per tick, through
+    /// `profile_frame_decisions`, and its gate, snapshot and render all follow
+    /// that one read. Its only other read sizes the idle wait. Sliced like
+    /// `capture_loops_idle_on_readiness`.
+    #[test]
+    fn the_profile_loop_decides_each_frame_from_one_clock_read() {
+        let source = include_str!("run.rs");
+        let profile = source
+            .split_once("fn capture_profile(")
+            .unwrap()
+            .1
+            .split_once("fn write_json_report")
+            .unwrap()
+            .0;
+        for (marker, decision) in [
+            (
+                "let tick_frame = profile_frame_decisions(|| last_frame.elapsed(), drain);",
+                "the tick's one frame-clock read",
+            ),
+            (
+                "discovery_due(tick_frame.since_frame, drain,",
+                "the gate on that read",
+            ),
+            (
+                "if !tick_frame.fresh_snapshot {",
+                "the snapshot on that read",
+            ),
+            (
+                "if tick_frame.render {",
+                "the render and reset on that read",
+            ),
+            (
+                "drain.saturating_sub(last_frame.elapsed())",
+                "the idle wait",
+            ),
+        ] {
+            assert_eq!(
+                profile.matches(marker).count(),
+                1,
+                "capture_profile: {decision}"
+            );
+        }
+        assert_eq!(
+            profile.matches("last_frame.elapsed()").count(),
+            2,
+            "capture_profile reads its frame clock only for the tick's frame and the idle wait"
+        );
     }
 
     /// Requested-wait margin at the default ring: one full idle timeout

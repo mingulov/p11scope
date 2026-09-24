@@ -350,12 +350,22 @@ program preflight already covers the whole-machine lane.
 seconds or `30s`/`5m`/`1h`) requests shutdown after the given interval. Probe
 teardown and final reporting follow; with many attached functions, this can
 add seconds, and calls may still be observed while probes are being detached.
-Ctrl-C or SIGTERM also ends a capture cleanly (final frame printed, `-o` file
-written) instead of aborting it. Under `run`, a child the pause holds stopped
-is resumed before the observer signals it or hands it back. The stop signal is
-forwarded to the child's process group; a child still alive gets SIGTERM 5 s
-later and SIGKILL 5 s after that, so settling it takes at most 15 s (a second
-Ctrl-C sends SIGKILL at once). If the run is stopped or times out while the
+Ctrl-C, SIGTERM, or SIGHUP ends a capture cleanly (final frame printed, `-o`
+file written) instead of aborting it. Under `run`, a child the pause holds
+stopped is resumed before the observer signals it or hands it back. The stop
+signal is forwarded to the child's process group; a child still alive gets
+SIGTERM 5 s later and SIGKILL 5 s after that, so settling it takes at most
+15 s (a second Ctrl-C sends SIGKILL at once). A hangup — a closed terminal or
+a dropped ssh session — is handled exactly like SIGTERM, with the same outcome
+and exit status, as long as p11scope itself inherited the default SIGHUP
+disposition. An inherited ignore (`nohup p11scope ...`) is preserved, so the
+capture keeps running after logout. SIGQUIT keeps its default disposition
+(core dump, for debugging). SIGKILL cannot be handled, and p11scope installs
+no `PR_SET_PDEATHSIG`: if the observer is killed that way there is no final
+frame and no `-o` file, and a child the pause holds stopped stays stopped —
+its own session leaves its process group already orphaned, so the kernel
+sends no hangup when the observer dies; resume or kill the orphan by hand.
+If the run is stopped or times out while the
 command is still being handed to the child, the child is killed at once,
 never resumed, so a command that had not already started never runs. A stop
 still waiting for its pause cycle when the capture ends is reported as

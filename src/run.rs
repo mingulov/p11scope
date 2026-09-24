@@ -767,9 +767,10 @@ impl OwnedChild {
                 libc::close(release_writer.as_raw_fd());
                 libc::close(exec_reader.as_raw_fd());
                 // The observer's stop handlers belong to the observer. Until it
-                // execs, this child would run them and swallow a SIGINT or
-                // SIGTERM meant to end it. Reset both to the default action
-                // before setsid, so a session leader has already dropped them.
+                // execs, this child would run them and swallow a stop signal
+                // (SIGINT, SIGTERM, or SIGHUP) meant to end it. Reset all
+                // three to the default action before setsid, so a session
+                // leader has already dropped them.
                 // `run` installs those handlers before it forks, and exec resets
                 // caught signals anyway, so the command's dispositions are
                 // unchanged.
@@ -1447,17 +1448,20 @@ impl CaptureEnd {
     }
 }
 
-/// Both operator stop signals end a capture the same clean way. SIGTERM is
-/// what a supervisor (systemd, a container runtime, `timeout`) sends, and
-/// its default disposition would kill the process mid-write.
-const STOP_SIGNALS: [libc::c_int; 2] = [libc::SIGINT, libc::SIGTERM];
+/// All three operator stop signals end a capture the same clean way. SIGTERM
+/// is what a supervisor (systemd, a container runtime, `timeout`) sends,
+/// SIGHUP is what a closed terminal or a dropped ssh session sends, and
+/// every default disposition here would kill the process mid-write. SIGINT
+/// and SIGTERM are always caught; SIGHUP is installed only over the default
+/// disposition (see `install_stop_flag`), so an inherited ignore survives.
+const STOP_SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
 
 /// Installs handlers that only ever update atomic signal state — no allocation,
 /// no I/O, no locks, and no child signaling or cleanup. Every capture loop
 /// polls this state cooperatively, the same way it polls `--duration`
-/// elapsing, so Ctrl-C (or SIGTERM) ends a capture the same clean way: stop
-/// polling, print the final frame, write `-o` if given — never torn down
-/// mid-write.
+/// elapsing, so Ctrl-C, SIGTERM, or a hangup ends a capture the same clean
+/// way: stop polling, print the final frame, write `-o` if given — never
+/// torn down mid-write.
 ///
 /// `signal_hook::low_level::register` is used instead of a hand-rolled
 /// `libc::signal` handler: the callback is the signal-safe minimum, while the
@@ -1528,21 +1532,57 @@ impl SignalState {
 
 const HANDOFF_CLAIMED: u64 = 1 << 10;
 
+/// Reads one signal's current disposition without changing it. A null new
+/// action makes `sigaction` report only. An unreadable disposition (an
+/// invalid signal, which the callers never pass) reports as the default,
+/// which is the install-everything direction.
+fn current_disposition(signal: libc::c_int) -> libc::sighandler_t {
+    // SAFETY: zeroed sigaction is the documented output buffer, and a null
+    // new action reads the current disposition without installing.
+    let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+    let read = unsafe { libc::sigaction(signal, std::ptr::null(), &mut current) };
+    if read != 0 {
+        return libc::SIG_DFL;
+    }
+    current.sa_sigaction
+}
+
+/// Whether the hangup handler is installed over SIGHUP's observed
+/// disposition. After `execve` only `SIG_DFL` and `SIG_IGN` can be
+/// inherited; an inherited ignore (`nohup p11scope ...`) is preserved so
+/// the capture keeps running after logout, and anything else — the default
+/// in practice — takes the handler. A pure function so the decision is
+/// directly unit-testable without sending a real hangup.
+fn should_install_hangup_handler(disposition: libc::sighandler_t) -> bool {
+    disposition != libc::SIG_IGN
+}
+
 fn install_stop_flag() -> Result<Arc<SignalState>> {
     let state = Arc::new(SignalState::new());
     for signal in STOP_SIGNALS {
+        if signal == libc::SIGHUP && !should_install_hangup_handler(current_disposition(signal)) {
+            continue;
+        }
+        // A hangup is recorded as SIGTERM: the same stop path, the same
+        // forwarded signal, the same outcome and exit status.
+        let recorded = if signal == libc::SIGHUP {
+            libc::SIGTERM
+        } else {
+            signal
+        };
         let observed = Arc::clone(&state);
         // SAFETY: the callback performs only atomic operations.
-        unsafe { signal_hook::low_level::register(signal, move || observed.observe(signal)) }
+        unsafe { signal_hook::low_level::register(signal, move || observed.observe(recorded)) }
             .with_context(|| format!("installing handler for signal {signal}"))?;
     }
     Ok(state)
 }
 
-/// Whether a capture loop should stop this tick: interrupted (Ctrl-C or
-/// SIGTERM) or `--duration` elapsed. A pure function so the stop path is
-/// directly testable without sending a real signal — set the state,
-/// confirm this returns `true` regardless of `elapsed`/`duration`.
+/// Whether a capture loop should stop this tick: interrupted (Ctrl-C,
+/// SIGTERM, or a hangup, which is recorded as SIGTERM) or `--duration`
+/// elapsed. A pure function so the stop path is directly testable without
+/// sending a real signal — set the state, confirm this returns `true`
+/// regardless of `elapsed`/`duration`.
 fn should_stop(interrupted: &SignalState, elapsed: Duration, duration: Option<Duration>) -> bool {
     interrupted.interrupted() || duration.is_some_and(|d| elapsed >= d)
 }
@@ -9715,6 +9755,298 @@ mod tests {
         assert!(should_stop(&stop, Duration::ZERO, None));
         assert_eq!(stop.first_signal(), Some(libc::SIGTERM));
         assert_eq!(stop.sigint_deliveries(), 0);
+    }
+
+    /// Reads one signal's current disposition without changing it.
+    fn signal_disposition(signal: libc::c_int) -> libc::sighandler_t {
+        // SAFETY: zeroed sigaction is the documented output buffer, and a
+        // null new action reads the current disposition without installing.
+        let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+        let read = unsafe { libc::sigaction(signal, std::ptr::null(), &mut current) };
+        assert_eq!(read, 0, "reading the disposition of signal {signal}");
+        current.sa_sigaction
+    }
+
+    /// Sets one signal's disposition to `SIG_DFL` or `SIG_IGN` only.
+    fn set_disposition(signal: libc::c_int, disposition: libc::sighandler_t) {
+        // SAFETY: zeroed sigaction with an empty mask and no flags, naming
+        // only the default or ignore disposition for a valid signal.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = disposition;
+        let installed = unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) };
+        assert_eq!(installed, 0, "setting signal {signal} to {disposition}");
+    }
+
+    /// Restores a saved disposition when the scope ends, even on failure,
+    /// so one signal test cannot poison the next. Best effort: a restore
+    /// failure must not panic from `Drop`.
+    struct RestoreDisposition {
+        signal: libc::c_int,
+        previous: libc::sighandler_t,
+    }
+
+    impl Drop for RestoreDisposition {
+        fn drop(&mut self) {
+            // SAFETY: as in `set_disposition`; the saved value came from a
+            // live `sigaction` read of the same signal.
+            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            action.sa_sigaction = self.previous;
+            unsafe {
+                libc::sigaction(self.signal, &action, std::ptr::null_mut());
+            }
+        }
+    }
+
+    /// Whether this process currently ignores SIGHUP, via `/proc`.
+    fn sighup_ignored_in_own_status() -> bool {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let mask = status
+            .lines()
+            .find_map(|line| line.strip_prefix("SigIgn:"))
+            .expect("/proc/self/status has no SigIgn");
+        u64::from_str_radix(mask.trim(), 16).unwrap() & (1 << (libc::SIGHUP - 1)) != 0
+    }
+
+    /// F-T4-4: a real SIGHUP (raised in-process after the handler is
+    /// installed) stops a capture through exactly the SIGTERM path: the
+    /// same recorded identity, the same forwarded signal, the same exit
+    /// status — and a child the pause holds stopped is resumed first, so
+    /// it dies by the forwarded SIGTERM (143) instead of stranding in T
+    /// or burning grace into SIGKILL (137).
+    #[test]
+    fn sighup_stops_the_capture_like_sigterm_and_resumes_a_held_child() {
+        let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
+        // Never depend on the runner's inherited dispositions: the suite
+        // itself may run under a SIGHUP-ignoring parent. Only an ignore is
+        // reset — signal_hook installs its OS handler once per process, so
+        // a raw reset to default after another test installed would
+        // silently disarm the hangup while the registry still claims it.
+        if signal_disposition(libc::SIGHUP) == libc::SIG_IGN {
+            set_disposition(libc::SIGHUP, libc::SIG_DFL);
+        }
+        let stop = install_stop_flag().unwrap();
+        let caught = signal_disposition(libc::SIGHUP);
+        assert!(
+            caught != libc::SIG_DFL && caught != libc::SIG_IGN,
+            "SIGHUP must be caught before a real hangup is raised at this process"
+        );
+        assert!(!should_stop(&stop, Duration::ZERO, None));
+        let fixture_dir = tempfile::tempdir().unwrap();
+        let sleeper = build_sleeper(fixture_dir.path());
+        let sleeper = sleeper.to_str().unwrap();
+        let mut child = spawn(sleeper, &[]);
+        child.release().unwrap();
+        // SAFETY: signals the exact owned child only, never this process
+        // group; the hangup below goes to this thread via raise().
+        unsafe { libc::kill(child.pid() as libc::pid_t, libc::SIGSTOP) };
+        wait_until(
+            || child_is_stopped(child.pid()),
+            "the fixture child never entered the stopped state",
+        );
+        // SAFETY: raise() with a handled signal; the handler only sets atomics.
+        assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
+        assert!(should_stop(&stop, Duration::ZERO, None));
+        assert_eq!(stop.first_signal(), Some(libc::SIGTERM));
+        assert_eq!(stop.sigint_deliveries(), 0);
+        assert!(stop.cancel_flag().load(Ordering::SeqCst));
+        assert_eq!(
+            settle_after_signal_with_grace(&mut child, &stop, Duration::from_millis(300)).unwrap(),
+            ChildOutcome::Exited(128 + libc::SIGTERM)
+        );
+        assert!(child.is_reaped());
+    }
+
+    /// F-T4-4: the hangup-install decision installs over the default
+    /// disposition and preserves an inherited ignore. Pure, so no real
+    /// hangup is needed.
+    #[test]
+    fn hangup_handler_installs_over_the_default_disposition_only() {
+        assert!(should_install_hangup_handler(libc::SIG_DFL));
+        assert!(!should_install_hangup_handler(libc::SIG_IGN));
+    }
+
+    /// F-T4-4: an inherited SIGHUP ignore (`nohup`) survives the stop-flag
+    /// install: the hangup handler is installed only over the default
+    /// disposition, so the capture keeps running after logout. No real
+    /// hangup is sent; the disposition is read back directly.
+    #[test]
+    fn inherited_sighup_ignore_survives_stop_flag_install() {
+        let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
+        let _restore = RestoreDisposition {
+            signal: libc::SIGHUP,
+            previous: signal_disposition(libc::SIGHUP),
+        };
+        set_disposition(libc::SIGHUP, libc::SIG_IGN);
+        let _stop = install_stop_flag().unwrap();
+        assert_eq!(
+            signal_disposition(libc::SIGHUP),
+            libc::SIG_IGN,
+            "installing the stop flag must not replace an inherited SIGHUP ignore"
+        );
+        assert!(
+            sighup_ignored_in_own_status(),
+            "SigIgn lost the SIGHUP bit across the stop-flag install"
+        );
+    }
+
+    /// Best-effort restore of the child-subreaper flag. Only the SIGKILL
+    /// probe below sets it, and only while holding the signal-test mutex.
+    struct SubreaperGuard;
+
+    impl Drop for SubreaperGuard {
+        fn drop(&mut self) {
+            // SAFETY: prctl with only integer arguments.
+            unsafe {
+                libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 0, 0, 0, 0);
+            }
+        }
+    }
+
+    /// One `/proc/<pid>/stat` state letter, or `None` once the pid is gone.
+    fn child_stat_state(pid: u32) -> Option<char> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        stat.split(' ').nth(2)?.chars().next()
+    }
+
+    /// Reaps a direct child, blocking. The caller guarantees the child is
+    /// already dead or has an unstoppable signal pending.
+    fn reap_blocking(pid: libc::pid_t) -> i32 {
+        let mut status = 0;
+        loop {
+            // SAFETY: pid names a direct child; status is a live out-param.
+            let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+            if waited == pid {
+                return status;
+            }
+            assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::EINTR),
+                "reaping pid {pid} failed"
+            );
+        }
+    }
+
+    /// The SIGKILL probe's intermediate parent. Panic-free by construction:
+    /// this runs in a fork child that shares the test binary's address
+    /// space, so every failure exits with a distinct code instead of
+    /// unwinding into the harness. Diverges (until SIGKILLed) on success.
+    fn sigkill_probe_intermediate(mut writer: File, sleeper: &Path) -> ! {
+        let exit = |code: i32| -> ! {
+            // SAFETY: _exit runs no destructors and flushes nothing.
+            unsafe { libc::_exit(code) };
+        };
+        let mut child = match OwnedChild::spawn(OsString::from(sleeper.as_os_str()), Vec::new()) {
+            Ok(child) => child,
+            Err(_) => exit(11),
+        };
+        if child.release().is_err() {
+            exit(12);
+        }
+        if child.pin().send_signal(libc::SIGSTOP).is_err() {
+            exit(13);
+        }
+        let pidfd = match child.pin().pidfd() {
+            Ok(pidfd) => pidfd,
+            Err(_) => exit(14),
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !original_child_is_stopped(pidfd) {
+            if Instant::now() >= deadline {
+                exit(15);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let pid = child.pid().to_ne_bytes();
+        if writer.write_all(&pid).is_err() {
+            exit(16);
+        }
+        loop {
+            // SAFETY: pause waits for a signal; the parent SIGKILLs us.
+            unsafe { libc::pause() };
+        }
+    }
+
+    /// F-T4-4 observation (no production change): what happens to a stopped
+    /// owned child when the observer dies by SIGKILL. A forked intermediate
+    /// plays the observer — it spawns, releases, and stops a sleeper in its
+    /// own session, reports its pid, then waits to be SIGKILLed — while this
+    /// process, briefly a subreaper, reaps the orphan and records whether the
+    /// orphaned-process-group rule hung it up or left it stranded in T.
+    #[test]
+    fn sigkill_of_the_observer_strands_a_stopped_owned_child() {
+        use std::io::Read as _;
+
+        let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
+        // SAFETY: prctl with only integer arguments.
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+            0,
+            "this probe needs the subreaper flag to reap the orphan"
+        );
+        let _subreaper = SubreaperGuard;
+        let fixture_dir = tempfile::tempdir().unwrap();
+        let sleeper = build_sleeper(fixture_dir.path());
+        let (reader, writer) = pipe_pair();
+        // SAFETY: fork in a test thread; the child never touches a lock
+        // (spawn takes none) and exits via _exit on every failure path.
+        let parent = unsafe { libc::fork() };
+        assert!(parent >= 0, "forking the probe intermediate");
+        if parent == 0 {
+            drop(reader);
+            sigkill_probe_intermediate(writer, &sleeper);
+        }
+        drop(writer);
+        let mut pid = [0u8; 4];
+        let mut reader = reader;
+        reader
+            .read_exact(&mut pid)
+            .expect("the probe intermediate died before reporting its stopped child");
+        let orphan = u32::from_ne_bytes(pid);
+        // SAFETY: signaling the exact intermediate only, then reaping it.
+        assert_eq!(unsafe { libc::kill(parent, libc::SIGKILL) }, 0);
+        let parent_status = reap_blocking(parent);
+        assert!(
+            libc::WIFSIGNALED(parent_status) && libc::WTERMSIG(parent_status) == libc::SIGKILL,
+            "the probe intermediate was not SIGKILLed: status {parent_status:#x}"
+        );
+
+        // The orphaned-process-group rule, if it fires, delivers SIGHUP and
+        // SIGCONT promptly at orphaning. Anything still stopped after this
+        // window was stranded, not hung up.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let mut seen = Vec::new();
+        let stranded = loop {
+            match child_stat_state(orphan) {
+                None => break false,
+                Some(state) => {
+                    if seen.last() != Some(&state) {
+                        seen.push(state);
+                    }
+                    if Instant::now() >= deadline {
+                        break state == 'T';
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        };
+        assert!(
+            stranded,
+            "the orphaned stopped child did not stay stopped (states seen: {seen:?})"
+        );
+
+        // Cleanup, and the stranding proof: the orphan must be alive until
+        // this SIGKILL lands, then reaped without residue.
+        // SAFETY: signaling the exact orphan only.
+        assert_eq!(
+            unsafe { libc::kill(orphan as libc::pid_t, libc::SIGKILL) },
+            0,
+            "the stranded orphan died before cleanup"
+        );
+        let orphan_status = reap_blocking(orphan as libc::pid_t);
+        assert!(
+            libc::WIFSIGNALED(orphan_status) && libc::WTERMSIG(orphan_status) == libc::SIGKILL,
+            "the stranded orphan did not die by the cleanup SIGKILL: status {orphan_status:#x}"
+        );
     }
 
     #[test]

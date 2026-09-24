@@ -10758,6 +10758,152 @@ mod tests {
         );
     }
 
+    /// Env plumbing for the fresh-registry G7 pin (C2): the parent test
+    /// below re-execs the test binary with the observer entry filter plus
+    /// these variables, one run per phase.
+    const G7_OBSERVER_PHASE_ENV: &str = "P11SCOPE_G7_OBSERVER_PHASE";
+    const G7_SLEEPER_ENV: &str = "P11SCOPE_G7_SLEEPER";
+
+    /// Hidden entry point for the fresh-registry observer (C2): a no-op
+    /// pass in the normal suite, and one isolated observer run — the shared
+    /// `isolated_fidelity_observer` flow — when the parent test below
+    /// re-execs this binary with `P11SCOPE_G7_OBSERVER_PHASE` set. The
+    /// re-exec is the pin: the new process starts with an empty
+    /// `signal_hook` registry no suite order can pollute, so the install
+    /// always takes visibly and a recapture-after-registration regression
+    /// misreads caught dispositions here in every order. The inherited OS
+    /// dispositions are reset first so the observer takes its strict path
+    /// (no shim); the observer itself still sets every phase disposition.
+    #[test]
+    fn g7_fresh_registry_observer_entry() {
+        use std::io::Read as _;
+
+        let Ok(phase_text) = std::env::var(G7_OBSERVER_PHASE_ENV) else {
+            return;
+        };
+        let phase: u8 = phase_text
+            .parse()
+            .expect("P11SCOPE_G7_OBSERVER_PHASE names phase 1 or 2");
+        assert!(
+            phase == 1 || phase == 2,
+            "P11SCOPE_G7_OBSERVER_PHASE names phase 1 or 2, got {phase_text:?}"
+        );
+        let sleeper =
+            std::env::var(G7_SLEEPER_ENV).expect("P11SCOPE_G7_SLEEPER names the sleeper binary");
+        let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            set_disposition(signal, libc::SIG_DFL);
+        }
+        let (mut reader, writer) = pipe_pair();
+        // SAFETY: fork in a process running only this test, holding the
+        // signal-test mutex; the child never touches a harness lock and
+        // exits via _exit on every path.
+        let observer = unsafe { libc::fork() };
+        assert!(observer >= 0, "forking the fresh-registry observer");
+        if observer == 0 {
+            drop(reader);
+            isolated_fidelity_observer(writer, std::path::Path::new(&sleeper), phase);
+        }
+        drop(writer);
+        // Blocking reap: the parent bounds THIS process (60 s, then kill),
+        // so a wedged grandchild still fails the suite instead of hanging
+        // it — one bound, at the outermost layer.
+        let mut status = 0;
+        // SAFETY: observer names the direct fork child; status is a live
+        // out-param.
+        let waited = unsafe { libc::waitpid(observer, &mut status, 0) };
+        assert_eq!(waited, observer, "reaping the fresh-registry observer");
+        let mut report = Vec::new();
+        reader
+            .read_to_end(&mut report)
+            .expect("reading the observer report");
+        let report = String::from_utf8_lossy(&report);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "the phase{phase} observer failed with status {status:#x}: {report}"
+        );
+        assert!(
+            report.contains("OK phase"),
+            "the phase{phase} observer exited 0 without its phase report: {report:?}"
+        );
+        println!("FRESH-REGISTRY OK phase{phase}: {}", report.trim());
+    }
+
+    /// C2: install-through-capture pinned in a fresh registry. The
+    /// fork-child G7 test above cannot pin this in a polluted suite order:
+    /// when the test binary already owns the signals, the child's install
+    /// is an OS no-op against the inherited registry, so a regression that
+    /// recaptures startup dispositions after registration still reads the
+    /// IGN dispositions the test set and passes. This test instead re-execs
+    /// the test binary once per phase — capture, install, spawn, both mask
+    /// windows — in a process whose registry is empty by construction, and
+    /// the strict "1 passed" assertion proves each run executed exactly the
+    /// observer entry (a filter collision would run extra tests and fail
+    /// loudly rather than silently pollute the registry).
+    #[test]
+    fn install_through_capture_pins_in_a_fresh_registry() {
+        use std::process::Stdio;
+
+        let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
+        let own_before = [
+            signal_disposition(libc::SIGINT),
+            signal_disposition(libc::SIGTERM),
+            signal_disposition(libc::SIGHUP),
+        ];
+        let fixture_dir = tempfile::tempdir().unwrap();
+        let sleeper = build_sleeper(fixture_dir.path());
+        let test_binary = std::env::current_exe().expect("locating the test binary");
+        for phase in [1u8, 2u8] {
+            let mut child = std::process::Command::new(&test_binary)
+                .arg("--nocapture")
+                .arg("g7_fresh_registry_observer_entry")
+                .env(G7_OBSERVER_PHASE_ENV, phase.to_string())
+                .env(G7_SLEEPER_ENV, &sleeper)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawning the fresh-registry observer run");
+            // Bounded wait mirroring the fork-child reap: a wedged run
+            // fails the test instead of hanging the suite.
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let status = loop {
+                if let Some(status) = child.try_wait().expect("polling the observer run") {
+                    break status;
+                }
+                if Instant::now() >= deadline {
+                    child.kill().expect("killing the wedged observer run");
+                    child.wait().expect("reaping the wedged observer run");
+                    panic!("the phase{phase} observer run wedged; SIGKILLed after 60 s");
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            let output = child.wait_with_output().expect("reading the observer run");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                status.success(),
+                "the phase{phase} observer run failed with status {status}: {stdout}\n{stderr}"
+            );
+            assert!(
+                stdout.contains("test result: ok. 1 passed"),
+                "the phase{phase} run must execute exactly the observer entry: {stdout}\n{stderr}"
+            );
+            assert!(
+                stdout.contains(&format!("FRESH-REGISTRY OK phase{phase}")),
+                "the phase{phase} run exited 0 without its observer report: {stdout}\n{stderr}"
+            );
+        }
+        let own_after = [
+            signal_disposition(libc::SIGINT),
+            signal_disposition(libc::SIGTERM),
+            signal_disposition(libc::SIGHUP),
+        ];
+        assert_eq!(
+            own_after, own_before,
+            "the fresh-registry observer runs disturbed the test binary's dispositions"
+        );
+    }
+
     /// The fork child drops the observer's hangup handler before it becomes
     /// a session leader: until it execs it must neither run the handler nor
     /// swallow a hangup meant to end it. The command then starts with

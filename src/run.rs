@@ -8662,9 +8662,12 @@ mod tests {
     /// capture loops ask the one gate with the owned pending-stop check,
     /// count the gated pass through the shared cadence step, and send a
     /// pending stop to the between-frames service. The count lives in the
-    /// shared step and trace's frame clock advances only on a frame pass,
-    /// so a pending-stop pass leaves the frame and discovery cadence
-    /// unchanged. Sliced like `capture_loops_idle_on_readiness`.
+    /// shared step — the tick body names the counter alias exactly twice
+    /// (the borrow plus the shared-step call), so no direct `*frame_tick`
+    /// mutation outside the step can shift the cadence — and trace's frame
+    /// clock advances only on a frame pass, so a pending-stop pass leaves
+    /// the frame and discovery cadence unchanged. Sliced like
+    /// `capture_loops_idle_on_readiness`.
     #[test]
     fn capture_loops_service_a_pending_stop_between_frames() {
         let source = include_str!("run.rs");
@@ -8702,6 +8705,12 @@ mod tests {
                     .count(),
                 1,
                 "{function} must count the gated pass through the shared cadence step"
+            );
+            assert_eq!(
+                tick.matches("frame_tick").count(),
+                2,
+                "{function} must touch the frame counter only through the shared step: \
+                 the borrow plus the shared-step call, no direct mutation"
             );
             assert!(
                 tick.contains("match counted.pass {"),

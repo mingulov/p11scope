@@ -32,7 +32,7 @@ use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
@@ -755,6 +755,12 @@ impl OwnedChild {
         // SAFETY: an all-zero sigaction is SIG_DFL with an empty mask and no
         // flags; prepared here so the child only passes it to sigaction.
         let default_action: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: as above, but naming SIG_IGN; prepared here for the same
+        // reason, so restoring an inherited ignore stays signal-safe.
+        let mut ignore_action: libc::sigaction = unsafe { std::mem::zeroed() };
+        ignore_action.sa_sigaction = libc::SIG_IGN;
+        // Read before the fork: the child takes no locks.
+        let startup = startup_dispositions_for_child();
 
         // SAFETY: all allocations and C strings were prepared above. The child
         // executes only async-signal-safe syscalls before exec/_exit.
@@ -766,18 +772,27 @@ impl OwnedChild {
             unsafe {
                 libc::close(release_writer.as_raw_fd());
                 libc::close(exec_reader.as_raw_fd());
-                // The observer's stop handlers belong to the observer. Until it
-                // execs, this child would run them and swallow a stop signal
-                // (SIGINT, SIGTERM, or SIGHUP) meant to end it. Reset all
-                // three to the default action before setsid, so a session
-                // leader has already dropped them.
-                // `run` installs those handlers before it forks, and exec resets
-                // caught signals anyway, so the command's dispositions are
-                // unchanged.
+                // The observer's stop handlers belong to the observer, and the
+                // command inherits exactly what the observer inherited:
+                // restore the startup dispositions captured in `main`, so
+                // until it execs this child neither runs a handler nor
+                // swallows a stop signal meant to end it. SIGPIPE always
+                // resets to the default: the runtime ignored it before
+                // `main`, and the default matches `std::process::Command`.
+                // Applied before setsid, so a session leader has already
+                // settled them; exec resets caught signals anyway.
                 for signal in STOP_SIGNALS {
-                    if libc::sigaction(signal, &default_action, std::ptr::null_mut()) != 0 {
+                    let action = if startup.ignored(signal) {
+                        &ignore_action
+                    } else {
+                        &default_action
+                    };
+                    if libc::sigaction(signal, action, std::ptr::null_mut()) != 0 {
                         child_exec_failure_errno(exec_writer.as_raw_fd(), last_errno());
                     }
+                }
+                if libc::sigaction(libc::SIGPIPE, &default_action, std::ptr::null_mut()) != 0 {
+                    child_exec_failure_errno(exec_writer.as_raw_fd(), last_errno());
                 }
                 if libc::setsid() < 0 {
                     child_exec_failure_errno(exec_writer.as_raw_fd(), last_errno());
@@ -1555,6 +1570,88 @@ fn current_disposition(signal: libc::c_int) -> libc::sighandler_t {
 /// directly unit-testable without sending a real hangup.
 fn should_install_hangup_handler(disposition: libc::sighandler_t) -> bool {
     disposition != libc::SIG_IGN
+}
+
+/// The signal dispositions p11scope itself inherited, captured in `main`
+/// before any handler is installed. The owned command restores exactly
+/// these for every signal the observer changes, so the observed program
+/// behaves as if started directly: an ignore (`nohup`, a backgrounded
+/// non-interactive shell) stays ignored, a default stays default. SIGPIPE
+/// is not captured — the Rust runtime overwrote the original before `main`
+/// — and always resets to the default in the child, matching
+/// `std::process::Command`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StartupSignalDispositions {
+    int_ignored: bool,
+    term_ignored: bool,
+    hup_ignored: bool,
+}
+
+impl StartupSignalDispositions {
+    fn all_default() -> Self {
+        Self {
+            int_ignored: false,
+            term_ignored: false,
+            hup_ignored: false,
+        }
+    }
+
+    fn ignored(&self, signal: libc::c_int) -> bool {
+        match signal {
+            libc::SIGINT => self.int_ignored,
+            libc::SIGTERM => self.term_ignored,
+            libc::SIGHUP => self.hup_ignored,
+            _ => false,
+        }
+    }
+}
+
+/// Bit-packed startup dispositions: bit 0 is set once captured, bits 1-3
+/// record SIGINT/SIGTERM/SIGHUP ignored. An atomic so the pre-fork read in
+/// `OwnedChild::spawn` takes no lock.
+static STARTUP_SIGNAL_DISPOSITIONS: AtomicU8 = AtomicU8::new(0);
+const STARTUP_CAPTURED: u8 = 1 << 0;
+const STARTUP_INT_IGNORED: u8 = 1 << 1;
+const STARTUP_TERM_IGNORED: u8 = 1 << 2;
+const STARTUP_HUP_IGNORED: u8 = 1 << 3;
+
+/// Captures the dispositions p11scope itself inherited, for the owned
+/// command to restore. Called once by `main` before any handler installs.
+/// Anything but `SIG_IGN` reads as the default: after `execve` only the
+/// two exist, and a caught disposition here would mean a late call, in
+/// which case the child must still drop the handler.
+pub fn capture_startup_signal_dispositions() {
+    let mut packed = STARTUP_CAPTURED;
+    if current_disposition(libc::SIGINT) == libc::SIG_IGN {
+        packed |= STARTUP_INT_IGNORED;
+    }
+    if current_disposition(libc::SIGTERM) == libc::SIG_IGN {
+        packed |= STARTUP_TERM_IGNORED;
+    }
+    if current_disposition(libc::SIGHUP) == libc::SIG_IGN {
+        packed |= STARTUP_HUP_IGNORED;
+    }
+    STARTUP_SIGNAL_DISPOSITIONS.store(packed, Ordering::SeqCst);
+}
+
+/// The startup dispositions to restore in the fork child: the captured
+/// inheritance, or all-default when the embedder never captured (library
+/// use without `main` keeps the historical reset-to-default behavior).
+fn startup_dispositions_for_child() -> StartupSignalDispositions {
+    let packed = STARTUP_SIGNAL_DISPOSITIONS.load(Ordering::SeqCst);
+    if packed & STARTUP_CAPTURED == 0 {
+        return StartupSignalDispositions::all_default();
+    }
+    StartupSignalDispositions {
+        int_ignored: packed & STARTUP_INT_IGNORED != 0,
+        term_ignored: packed & STARTUP_TERM_IGNORED != 0,
+        hup_ignored: packed & STARTUP_HUP_IGNORED != 0,
+    }
+}
+
+#[cfg(test)]
+fn clear_startup_signal_dispositions_for_test() {
+    STARTUP_SIGNAL_DISPOSITIONS.store(0, Ordering::SeqCst);
 }
 
 fn install_stop_flag() -> Result<Arc<SignalState>> {
@@ -9797,6 +9894,16 @@ mod tests {
         }
     }
 
+    /// One full `/proc/<pid>/status` signal mask (`SigCgt`, `SigIgn`).
+    fn signal_mask(pid: &str, field: &str) -> u64 {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+        let mask = status
+            .lines()
+            .find_map(|line| line.strip_prefix(field)?.strip_prefix(':'))
+            .unwrap_or_else(|| panic!("/proc/{pid}/status has no {field}"));
+        u64::from_str_radix(mask.trim(), 16).unwrap()
+    }
+
     /// Whether this process currently ignores SIGHUP, via `/proc`.
     fn sighup_ignored_in_own_status() -> bool {
         let status = std::fs::read_to_string("/proc/self/status").unwrap();
@@ -9887,6 +9994,147 @@ mod tests {
             sighup_ignored_in_own_status(),
             "SigIgn lost the SIGHUP bit across the stop-flag install"
         );
+    }
+
+    /// F-T4-5: the owned command starts with SIGPIPE at its default. The
+    /// Rust runtime ignores SIGPIPE and an ignored disposition survives
+    /// `execve`, so without the reset the observed program sees EPIPE
+    /// errors instead of dying by SIGPIPE (and a shell cannot un-ignore
+    /// it) — unlike the same command under `std::process::Command`.
+    #[test]
+    fn owned_command_starts_with_default_sigpipe() {
+        let fixture_dir = tempfile::tempdir().unwrap();
+        let sleeper = build_sleeper(fixture_dir.path());
+        let sleeper = sleeper.to_str().unwrap();
+        let mut child = spawn(sleeper, &[]);
+        child.release().unwrap();
+        assert_eq!(
+            signal_mask(&child.pid().to_string(), "SigIgn") & (1 << (libc::SIGPIPE - 1)),
+            0,
+            "the owned command inherited the observer's ignored SIGPIPE"
+        );
+        child.terminate_and_reap().unwrap();
+    }
+
+    /// Clears the captured startup dispositions when the scope ends, even
+    /// on failure, so one fidelity test cannot poison the next.
+    struct ClearStartupDispositions;
+
+    impl Drop for ClearStartupDispositions {
+        fn drop(&mut self) {
+            clear_startup_signal_dispositions_for_test();
+        }
+    }
+
+    /// Fidelity rule: the owned command inherits exactly the dispositions
+    /// p11scope itself inherited for every signal p11scope changes. Under
+    /// an observer started with SIGHUP and SIGINT ignored, both stay
+    /// ignored in the child; started normally, none are. SIGPIPE is the
+    /// exception: it always resets to the default, matching
+    /// `std::process::Command`. The stop-flag install itself is not run
+    /// here: the child reads only the captured startup state.
+    #[test]
+    fn owned_command_inherits_ignored_stop_dispositions() {
+        let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
+        let _restore_int = RestoreDisposition {
+            signal: libc::SIGINT,
+            previous: signal_disposition(libc::SIGINT),
+        };
+        let _restore_hup = RestoreDisposition {
+            signal: libc::SIGHUP,
+            previous: signal_disposition(libc::SIGHUP),
+        };
+        let _clear_store = ClearStartupDispositions;
+        let fixture_dir = tempfile::tempdir().unwrap();
+        let sleeper = build_sleeper(fixture_dir.path());
+        let sleeper = sleeper.to_str().unwrap();
+
+        // An observer started with SIGHUP and SIGINT ignored.
+        set_disposition(libc::SIGINT, libc::SIG_IGN);
+        set_disposition(libc::SIGHUP, libc::SIG_IGN);
+        capture_startup_signal_dispositions();
+        let mut ignored = spawn(sleeper, &[]);
+        ignored.release().unwrap();
+        let ignored_mask = signal_mask(&ignored.pid().to_string(), "SigIgn");
+        assert_eq!(
+            ignored_mask & (1 << (libc::SIGINT - 1)),
+            1 << (libc::SIGINT - 1),
+            "the owned command lost the observer's inherited SIGINT ignore"
+        );
+        assert_eq!(
+            ignored_mask & (1 << (libc::SIGHUP - 1)),
+            1 << (libc::SIGHUP - 1),
+            "the owned command lost the observer's inherited SIGHUP ignore"
+        );
+        assert_eq!(
+            ignored_mask & (1 << (libc::SIGTERM - 1)),
+            0,
+            "the owned command ignores SIGTERM it did not inherit ignored"
+        );
+        assert_eq!(
+            ignored_mask & (1 << (libc::SIGPIPE - 1)),
+            0,
+            "SIGPIPE must reset to default even under an ignoring observer"
+        );
+        ignored.terminate_and_reap().unwrap();
+
+        // The same child started normally: nothing ignored.
+        set_disposition(libc::SIGINT, libc::SIG_DFL);
+        set_disposition(libc::SIGHUP, libc::SIG_DFL);
+        capture_startup_signal_dispositions();
+        let mut normal = spawn(sleeper, &[]);
+        normal.release().unwrap();
+        let normal_mask = signal_mask(&normal.pid().to_string(), "SigIgn");
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGPIPE] {
+            assert_eq!(
+                normal_mask & (1 << (signal - 1)),
+                0,
+                "the normally started command ignores signal {signal}"
+            );
+        }
+        normal.terminate_and_reap().unwrap();
+    }
+
+    /// The fork child drops the observer's hangup handler before it becomes
+    /// a session leader: until it execs it must neither run the handler nor
+    /// swallow a hangup meant to end it. The command then starts with
+    /// SIGHUP at its default, like every other stop signal.
+    #[test]
+    fn the_pre_exec_child_does_not_inherit_the_observer_hangup_handler() {
+        let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
+        // As in the hangup stop test: reset only an ignore, never disarm
+        // an already-installed handler behind the registry's back.
+        if signal_disposition(libc::SIGHUP) == libc::SIG_IGN {
+            set_disposition(libc::SIGHUP, libc::SIG_DFL);
+        }
+        let _stop = install_stop_flag().unwrap();
+        let caught = signal_disposition(libc::SIGHUP);
+        assert!(
+            caught != libc::SIG_DFL && caught != libc::SIG_IGN,
+            "the observer must catch SIGHUP for this fixture"
+        );
+        let fixture_dir = tempfile::tempdir().unwrap();
+        let sleeper = build_sleeper(fixture_dir.path());
+        let mut child = spawn(sleeper.to_str().unwrap(), &[]);
+        wait_for_session_leader(&child);
+        let pid = child.pid().to_string();
+        assert_eq!(
+            signal_mask(&pid, "SigCgt") & (1 << (libc::SIGHUP - 1)),
+            0,
+            "the pre-exec child still runs the observer's hangup handler"
+        );
+        child.release().unwrap();
+        assert_eq!(
+            signal_mask(&pid, "SigCgt") & (1 << (libc::SIGHUP - 1)),
+            0,
+            "the command catches SIGHUP"
+        );
+        assert_eq!(
+            signal_mask(&pid, "SigIgn") & (1 << (libc::SIGHUP - 1)),
+            0,
+            "the command ignores SIGHUP"
+        );
+        assert_eq!(child.terminate_and_reap().unwrap(), 128 + libc::SIGTERM);
     }
 
     /// Best-effort restore of the child-subreaper flag. Only the SIGKILL

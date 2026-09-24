@@ -7,7 +7,7 @@
 
 use anyhow::{Context as _, Result};
 use p11scope::cli::{self, CliError, Command};
-use p11scope::{capture, doctor, inspect, run_owned};
+use p11scope::{capture, capture_startup_signal_dispositions, doctor, inspect, run_owned};
 
 fn main() {
     match run() {
@@ -23,6 +23,9 @@ fn main() {
 }
 
 fn run() -> Result<i32> {
+    // Before any handler installs: the owned command inherits exactly the
+    // dispositions captured here for every signal the observer changes.
+    capture_startup_signal_dispositions();
     match cli::parse(std::env::args().skip(1)) {
         Ok(Command::Version) => {
             println!("p11scope {}", env!("CARGO_PKG_VERSION"));

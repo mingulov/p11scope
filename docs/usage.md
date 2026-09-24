@@ -365,6 +365,13 @@ no `PR_SET_PDEATHSIG`: if the observer is killed that way there is no final
 frame and no `-o` file, and a child the pause holds stopped stays stopped —
 its own session leaves its process group already orphaned, so the kernel
 sends no hangup when the observer dies; resume or kill the orphan by hand.
+The owned command starts with the signal dispositions p11scope itself
+inherited: a SIGINT, SIGTERM, or SIGHUP ignored on entry (under `nohup`, or
+a background job in a non-interactive shell) stays ignored across the fork,
+so the observed program behaves as if started directly. The exception is
+SIGPIPE, which the observer's runtime ignores before `main`: the child
+resets it to the default, matching `std::process::Command`, so a command
+that writes to a closed pipe dies by SIGPIPE instead of seeing EPIPE errors.
 If the run is stopped or times out while the
 command is still being handed to the child, the child is killed at once,
 never resumed, so a command that had not already started never runs. A stop

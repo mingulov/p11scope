@@ -5546,10 +5546,24 @@ mod tests {
             );
 
             let written = std::cell::Cell::new(false);
+            // Both arms share the long deadline. The cancel=false arm
+            // forces its Deadline the way the cancel=true arm forces its
+            // cancellation: the pending hook runs only after the release
+            // byte was written, so waiting it past the deadline reaches
+            // the Deadline path deterministically instead of racing a
+            // 40 ms stall through the checks before the write.
+            let deadline = Instant::now() + Duration::from_millis(5_000);
             let result = child.release_until_with_pending(
-                Instant::now() + Duration::from_millis(if cancel { 5_000 } else { 40 }),
+                deadline,
                 || (cancel && written.get()).then_some(libc::SIGTERM),
-                || written.set(true),
+                || {
+                    written.set(true);
+                    if !cancel {
+                        while Instant::now() < deadline {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                    }
+                },
             );
             assert!(
                 written.get(),

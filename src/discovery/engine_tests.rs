@@ -16834,6 +16834,14 @@ fn a_replacement_skipped_by_an_attach_phase_loss_recovers_the_surviving_owner() 
         "tick 2 skips the replacement in the else branch, not the precheck None arm: {:?}",
         engine.counters.object_skips
     );
+    assert!(
+        engine.counters.object_skips.contains(&u07_partial(
+            "live discovery replacement",
+            "additions had already closed or a generation was lost before downgraded exact targets were replaced; they were deactivated",
+        )),
+        "the else branch records its deactivation explicitly, like the None arm: {:?}",
+        engine.counters.object_skips
+    );
     let (active, _) = u07_provider_slots(&engine, "u07-else-owner.so");
     assert!(
         active.is_empty(),

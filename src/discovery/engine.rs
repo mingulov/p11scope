@@ -8989,6 +8989,12 @@ impl Engine {
                         .extend(slot_timing_keys(slot, &timing_owners));
                     candidate.plan.deactivate(slot.index);
                 }
+                if !candidate.delta.replace.is_empty() {
+                    self.mark_partial(
+                        "live discovery replacement",
+                        "additions had already closed or a generation was lost before downgraded exact targets were replaced; they were deactivated",
+                    );
+                }
                 // Same stranded-owner shape as the precheck `None` arm
                 // above (#1): additions already closed, or the attach phase
                 // lost a generation before the replacement precheck ran. A

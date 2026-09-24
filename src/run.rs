@@ -10109,6 +10109,377 @@ mod tests {
         normal.terminate_and_reap().unwrap();
     }
 
+    /// Raw `sigaction` write for the forked fidelity observer, which must
+    /// not panic: sets one signal to `SIG_DFL` or `SIG_IGN`, reporting
+    /// success.
+    fn try_set_disposition(signal: libc::c_int, disposition: libc::sighandler_t) -> bool {
+        // SAFETY: zeroed sigaction with an empty mask and no flags, naming
+        // only the default or ignore disposition for a valid signal.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = disposition;
+        unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) == 0 }
+    }
+
+    /// Raw `sigaction` read for the forked fidelity observer: one signal's
+    /// current disposition, or `None` when unreadable.
+    fn try_signal_disposition(signal: libc::c_int) -> Option<libc::sighandler_t> {
+        // SAFETY: zeroed sigaction is the documented output buffer, and a
+        // null new action reads the current disposition without installing.
+        let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+        if unsafe { libc::sigaction(signal, std::ptr::null(), &mut current) } != 0 {
+            return None;
+        }
+        Some(current.sa_sigaction)
+    }
+
+    /// One `/proc/<pid>/status` signal mask for the forked fidelity
+    /// observer, or `None` when the process is gone or the field is
+    /// unreadable.
+    fn try_signal_mask(pid: u32, field: &str) -> Option<u64> {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        let mask = status
+            .lines()
+            .find_map(|line| line.strip_prefix(field)?.strip_prefix(':'))?;
+        u64::from_str_radix(mask.trim(), 16).ok()
+    }
+
+    /// Best-effort pipe write for the forked fidelity observer: raw `write`
+    /// on the borrowed descriptor, so no `File` borrow crosses the exit
+    /// closures. Short writes and errors are ignored — the exit code alone
+    /// fails the test; the report only carries diagnostics.
+    fn observer_write(fd: libc::c_int, bytes: &[u8]) {
+        let mut written = 0;
+        while written < bytes.len() {
+            // SAFETY: fd is the live pipe writer; the slice pointer and
+            // length name the unwritten tail.
+            let done =
+                unsafe { libc::write(fd, bytes[written..].as_ptr().cast(), bytes.len() - written) };
+            if done <= 0 {
+                break;
+            }
+            written += done as usize;
+        }
+    }
+
+    /// Session-leader wait for the forked fidelity observer: true once the
+    /// pre-exec child has run `setsid` (after restoring its dispositions),
+    /// false on a 2 s deadline.
+    fn try_wait_for_session_leader(pid: u32) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        // SAFETY: getsid with a pid only.
+        while unsafe { libc::getsid(pid as libc::pid_t) } != pid as libc::pid_t {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        true
+    }
+
+    /// The isolated observer's stand-in caught handler. `signal_hook`
+    /// installs its trampoline once per signal per process: when the test
+    /// binary already owns a signal, the fork child's `install_stop_flag`
+    /// only appends a registry action and the OS disposition stays as the
+    /// child set it. The child then pins this empty handler instead, so the
+    /// observer's spawn-time dispositions are deterministic (caught) in
+    /// every suite order. Nothing is ever delivered to it.
+    extern "C" fn isolated_observer_caught_shim(_signal: libc::c_int) {}
+
+    /// Pins the caught shim above on one signal for the forked fidelity
+    /// observer, reporting success.
+    fn pin_caught_shim(signal: libc::c_int) -> bool {
+        // SAFETY: zeroed sigaction with an empty mask and no flags, naming
+        // the empty shim for a valid signal.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = isolated_observer_caught_shim as libc::sighandler_t;
+        unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) == 0 }
+    }
+
+    /// One isolated fidelity observer (G7): `phase` 1 plays an observer
+    /// started with every stop signal ignored, `phase` 2 one started
+    /// normally. Panic-free by construction like
+    /// `sigkill_probe_intermediate`: this runs in a fork child that shares
+    /// the test binary's address space, so every failure writes one
+    /// diagnostic line and exits with a distinct code instead of unwinding
+    /// into the harness. Exit 0 with the `OK` line on success; 11-19 fail
+    /// phase 1, 21-29 phase 2.
+    fn isolated_fidelity_observer(writer: File, sleeper: &Path, phase: u8) -> ! {
+        use std::os::fd::AsRawFd as _;
+
+        let fd = writer.as_raw_fd();
+        let exit = |code: i32| -> ! {
+            // SAFETY: _exit runs no destructors and flushes nothing.
+            unsafe { libc::_exit(code) };
+        };
+        let fail = |code: i32, message: String| -> ! {
+            observer_write(fd, message.as_bytes());
+            exit(code);
+        };
+        // Each phase runs in its own fork child, which installs exactly
+        // once: a caught disposition at entry means the test binary's
+        // registry already owns that signal (only `signal_hook` installs
+        // caught handlers in the test binary), so this child's install is
+        // an OS no-op there by registry design and the shim below stands
+        // in. Otherwise the install must take visibly — that strict check
+        // is what would catch an install regression.
+        let entry_caught = |signal: libc::c_int| {
+            try_signal_disposition(signal).is_some_and(|disposition| {
+                disposition != libc::SIG_DFL && disposition != libc::SIG_IGN
+            })
+        };
+        let inherited = [
+            entry_caught(libc::SIGINT),
+            entry_caught(libc::SIGTERM),
+            entry_caught(libc::SIGHUP),
+        ];
+        let stop_bits = (1u64 << (libc::SIGINT - 1))
+            | (1u64 << (libc::SIGTERM - 1))
+            | (1u64 << (libc::SIGHUP - 1));
+        // Phase setup: the startup dispositions to capture, and whether the
+        // spawned child must restore them ignored (phase 1) or all-default
+        // (phase 2).
+        let ignored = phase == 1;
+        let (setup, base) = if ignored {
+            (libc::SIG_IGN, 10)
+        } else {
+            (libc::SIG_DFL, 20)
+        };
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            if !try_set_disposition(signal, setup) {
+                fail(
+                    base + 1,
+                    format!("phase{phase}: cannot set signal {signal}\n"),
+                );
+            }
+        }
+        capture_startup_signal_dispositions();
+        if install_stop_flag().is_err() {
+            fail(
+                base + 2,
+                format!("phase{phase}: installing the stop flag failed\n"),
+            );
+        }
+        // The test's premise: current dispositions at spawn differ from the
+        // captured startup state (caught vs ignored in phase 1, caught vs
+        // default in phase 2), so the spawn below tells restoring the
+        // capture from rereading current state. HUP in phase 1 is the
+        // exception the install guarantees: it always skips an ignore.
+        let mut shimmed = Vec::new();
+        for (index, signal) in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP]
+            .into_iter()
+            .enumerate()
+        {
+            if ignored && signal == libc::SIGHUP {
+                if try_signal_disposition(signal) != Some(libc::SIG_IGN) {
+                    fail(
+                        base + 3,
+                        format!("phase{phase}: the install replaced the HUP ignore\n"),
+                    );
+                }
+                continue;
+            }
+            if !inherited[index] {
+                let current = try_signal_disposition(signal);
+                let caught = current.is_some_and(|disposition| {
+                    disposition != libc::SIG_DFL && disposition != libc::SIG_IGN
+                });
+                if !caught {
+                    fail(
+                        base + 3,
+                        format!("phase{phase}: premise broken for signal {signal}: {current:?}\n"),
+                    );
+                }
+            } else if !pin_caught_shim(signal) {
+                fail(
+                    base + 3,
+                    format!("phase{phase}: cannot shim signal {signal}\n"),
+                );
+            } else {
+                shimmed.push(signal.to_string());
+            }
+        }
+        if !shimmed.is_empty() {
+            observer_write(
+                fd,
+                format!(
+                    "phase{phase}: shimmed signals {} (test binary owns them)\n",
+                    shimmed.join(",")
+                )
+                .as_bytes(),
+            );
+        }
+        let mut child = match OwnedChild::spawn(OsString::from(sleeper.as_os_str()), Vec::new()) {
+            Ok(child) => child,
+            Err(error) => fail(base + 4, format!("phase{phase}: spawn failed: {error}\n")),
+        };
+        if !try_wait_for_session_leader(child.pid()) {
+            fail(
+                base + 5,
+                format!("phase{phase}: the pre-exec child never led its session\n"),
+            );
+        }
+        // Pre-exec the child has restored the capture but not exec'd: the
+        // stop bits are ignored (phase 1) or clear (phase 2), and no stop
+        // handler may be caught in either phase.
+        let pre_ign = try_signal_mask(child.pid(), "SigIgn");
+        let pre_cgt = try_signal_mask(child.pid(), "SigCgt");
+        let pre_ok = match (pre_ign, pre_cgt) {
+            (Some(ign), Some(cgt)) if cgt & stop_bits == 0 => {
+                if ignored {
+                    ign & stop_bits == stop_bits
+                } else {
+                    ign & stop_bits == 0
+                }
+            }
+            _ => false,
+        };
+        if !pre_ok {
+            fail(
+                base + 6,
+                format!("phase{phase}: pre-exec SigIgn={pre_ign:?} SigCgt={pre_cgt:?}\n"),
+            );
+        }
+        if child.release().is_err() {
+            fail(
+                base + 7,
+                format!("phase{phase}: releasing the child failed\n"),
+            );
+        }
+        let post_ign = try_signal_mask(child.pid(), "SigIgn");
+        let post_cgt = try_signal_mask(child.pid(), "SigCgt");
+        let post_ok = match (post_ign, post_cgt) {
+            (Some(ign), Some(cgt)) if cgt & stop_bits == 0 => {
+                if ignored {
+                    ign & stop_bits == stop_bits
+                } else {
+                    ign & stop_bits == 0
+                }
+            }
+            _ => false,
+        };
+        if !post_ok {
+            fail(
+                base + 8,
+                format!("phase{phase}: post-exec SigIgn={post_ign:?} SigCgt={post_cgt:?}\n"),
+            );
+        }
+        if ignored {
+            // This sleeper ignores SIGTERM by design under test: SIGKILL it
+            // rather than burning the 5 s SIGTERM grace in cleanup.
+            if child.pin().send_signal(libc::SIGKILL).is_err()
+                || child.terminate_and_reap().is_err()
+            {
+                fail(
+                    base + 9,
+                    format!("phase{phase}: reaping the child failed\n"),
+                );
+            }
+            observer_write(
+                fd,
+                b"OK phase1: ignored stops restored pre-exec and post-exec\n",
+            );
+        } else {
+            if child.terminate_and_reap().is_err() {
+                fail(
+                    base + 9,
+                    format!("phase{phase}: reaping the child failed\n"),
+                );
+            }
+            observer_write(
+                fd,
+                b"OK phase2: normal dispositions all clear pre-exec and post-exec\n",
+            );
+        }
+        exit(0)
+    }
+
+    /// G7: the owned command restores the captured startup ignores through
+    /// the stop-flag install. The in-process fidelity test omits the install
+    /// and never sets SIGTERM-ignore, so it cannot distinguish restoring
+    /// captured startup state from rereading unchanged current dispositions.
+    /// One fork child per phase plays the observer in isolation — ignored
+    /// stops (phase 1) or normal dispositions (phase 2), capture, install,
+    /// spawn — while this process only reaps and reports, so the test
+    /// binary's dispositions and the `signal_hook` registry are never
+    /// disturbed (pinned by the unchanged-disposition assertions).
+    #[test]
+    fn owned_command_restores_captured_ignores_through_the_stop_flag_install() {
+        use std::io::Read as _;
+
+        let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
+        let own_before = [
+            signal_disposition(libc::SIGINT),
+            signal_disposition(libc::SIGTERM),
+            signal_disposition(libc::SIGHUP),
+        ];
+        let fixture_dir = tempfile::tempdir().unwrap();
+        let sleeper = build_sleeper(fixture_dir.path());
+        let mut reports = String::new();
+        for phase in [1u8, 2u8] {
+            let (mut reader, writer) = pipe_pair();
+            // SAFETY: fork in a test thread holding the signal-test mutex,
+            // so no other thread is inside the `signal_hook` registry the
+            // child re-registers with; the child never touches a
+            // test-harness lock and exits via _exit on every path.
+            let observer = unsafe { libc::fork() };
+            assert!(observer >= 0, "forking the isolated observer");
+            if observer == 0 {
+                drop(reader);
+                isolated_fidelity_observer(writer, &sleeper, phase);
+            }
+            drop(writer);
+            // Bounded reap: a wedged observer fails the test instead of
+            // hanging the suite.
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let status = loop {
+                let mut status = 0;
+                // SAFETY: observer names the direct fork child; status is a
+                // live out-param; WNOWAIT-free WNOHANG only polls.
+                let waited = unsafe { libc::waitpid(observer, &mut status, libc::WNOHANG) };
+                assert!(
+                    waited >= 0,
+                    "reaping the isolated observer: {}",
+                    io::Error::last_os_error()
+                );
+                if waited == observer {
+                    break status;
+                }
+                if Instant::now() >= deadline {
+                    // SAFETY: signaling the exact observer only, then reaping it.
+                    unsafe {
+                        libc::kill(observer, libc::SIGKILL);
+                    }
+                    reap_blocking(observer);
+                    panic!("the isolated observer wedged; SIGKILLed after 60 s");
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            let mut report = Vec::new();
+            reader
+                .read_to_end(&mut report)
+                .expect("reading the observer report");
+            let report = String::from_utf8_lossy(&report);
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "the phase{phase} observer failed with status {status:#x}: {report}"
+            );
+            reports.push_str(&report);
+        }
+        assert!(
+            reports.contains("OK phase1") && reports.contains("OK phase2"),
+            "the isolated observers exited 0 without both phase reports: {reports:?}"
+        );
+        let own_after = [
+            signal_disposition(libc::SIGINT),
+            signal_disposition(libc::SIGTERM),
+            signal_disposition(libc::SIGHUP),
+        ];
+        assert_eq!(
+            own_after, own_before,
+            "the isolated observers disturbed the test binary's dispositions"
+        );
+    }
+
     /// The fork child drops the observer's hangup handler before it becomes
     /// a session leader: until it execs it must neither run the handler nor
     /// swallow a hangup meant to end it. The command then starts with

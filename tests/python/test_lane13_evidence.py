@@ -985,6 +985,58 @@ class Lane13EvidenceTests(unittest.TestCase):
                 raise
         return proc, evidence, evidence / ".lane13-body.pid", release, record
 
+    def start_recorded_hold(self, label):
+        """One recorded direct child, held after publication with no descendants."""
+        evidence = self.root / label
+        program = r'''
+import json
+import os
+from pathlib import Path
+import socket
+import sys
+
+control = socket.socket(fileno=int(sys.argv[1]))
+pid = os.getpid()
+fields = Path("/proc/self/stat").read_bytes().rpartition(b") ")[2].split()
+owner = os.environ["D2_OWNER_ID"]
+kind = "dispatch-sleep-build"
+record = {
+    "version": 1, "record_id": f"{owner}:{kind}:{pid}:{int(fields[19])}",
+    "owner": owner, "evidence": os.environ["P11SCOPE_LANE_EVIDENCE_DIR"],
+    "kind": kind, "pid": pid, "starttime": int(fields[19]),
+    "ppid": int(fields[1]), "pgid": int(fields[2]), "sid": int(fields[3]),
+    "exe": os.path.realpath("/proc/self/exe"),
+    "argv": [os.fsdecode(arg) for arg in Path("/proc/self/cmdline").read_bytes().split(b"\0") if arg],
+}
+with (Path(os.environ["D2_STATE"]) / "fixture-pids").open("w") as ledger:
+    ledger.write(json.dumps(record, separators=(",", ":")) + "\n")
+    ledger.flush()
+    os.fsync(ledger.fileno())
+control.sendall(b"ready")
+# No natural exit or further filesystem writes while the parent holds us.
+control.recv(1)
+'''
+        with ExitStack() as setup:
+            parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            setup.callback(child.close)
+            self.addCleanup(parent.close)
+            parent.settimeout(5)
+            proc = self.start_owned(
+                ["/usr/bin/python3", "-I", "-c", program, str(child.fileno())],
+                self.env | {"P11SCOPE_LANE_EVIDENCE_DIR": str(evidence)},
+                pass_fds=(child.fileno(),),
+            )
+            child.close()
+            self.assertEqual(parent.recv(5), b"ready",
+                             "controlled fixture did not publish its owned identity")
+            self.assertIsNone(proc.poll(), "controlled fixture exited before identity test")
+            record, = self.fixture_records()
+            self.assertEqual(record["pid"], proc.pid)
+            self.assertEqual(self.read_process_identity(proc.pid), {
+                key: record[key] for key in ("starttime", "ppid", "pgid", "sid")
+            })
+        return proc, parent, record
+
     def facts(self, evidence):
         return (evidence / "facts.log").read_text()
 
@@ -2298,32 +2350,11 @@ exit "$helper_status"
 
     def test_cleanup_rejects_between_read_and_pin_identity_change(self):
         decoy = self.start_decoy()
-        evidence = self.root / "identity-change"
-        proc = self.start_owned(
-            ["sh", str(self.gate)],
-            self.env | {
-                "D2_MODE": "sleep-build",
-                "P11SCOPE_LANE_EVIDENCE_DIR": str(evidence),
-            },
-        )
+        proc, control, target = self.start_recorded_hold("identity-change")
+        original_fd = self.owned_launches[target["owner"]]["pidfd"]
+        ledger = self.state / "fixture-pids"
+        original = ledger.read_bytes()
         try:
-            deadline = time.monotonic() + 5
-            ledger = self.state / "fixture-pids"
-            while time.monotonic() < deadline:
-                if (self.state / "sleep-build-ready").exists() and ledger.exists():
-                    records = self.fixture_records()
-                    if any(record["kind"] == "dispatch-sleep-build" for record in records):
-                        break
-                self.assertIsNone(proc.poll(), "controlled fixture exited before identity test")
-                time.sleep(0.01)
-            else:
-                self.fail("controlled fixture did not publish its owned identity")
-
-            original = ledger.read_bytes()
-            target = next(
-                record for record in self.fixture_records()
-                if record["kind"] == "dispatch-sleep-build"
-            )
             decoy_identity = self.read_process_identity(decoy.pid)
 
             def replace_identity(record):
@@ -2336,7 +2367,15 @@ exit "$helper_status"
                 ledger.write_text(json.dumps(replacement, separators=(",", ":")) + "\n")
 
             self.before_pidfd_open = replace_identity
-            failures = self.settle_recorded()
+            # This direct child has two valid authorities: its fixture record
+            # and start_owned's retained launch. Keep the authentication map,
+            # but defer independent launch settlement for this one assertion;
+            # otherwise that valid route kills the original even when the
+            # poisoned fixture record is correctly rejected.
+            failures = self.settle_recorded(defer_owned_process=proc)
+            self.assertTrue(self._pidfd_is_live(original_fd),
+                            "identity-race rejection signaled the original")
+            self.assertIsNone(decoy.poll(), "identity-race rejection signaled the decoy")
             self.assertEqual(len(failures), 1, failures)
             self.assertTrue(
                 any("identity record changed before pin" in failure for failure in failures),
@@ -2348,6 +2387,7 @@ exit "$helper_status"
             self.acknowledge_settlement_errors()
             self.assertEqual(self.settle_recorded(), [])
             proc.communicate(timeout=2)
+            self.assertFalse(self._pidfd_is_live(original_fd))
             self.assert_process_absent(target["pid"], target["starttime"])
             self.assertIsNone(decoy.poll())
 
@@ -2373,12 +2413,27 @@ exit "$helper_status"
             self.acknowledge_settlement_errors()
         finally:
             self.before_pidfd_open = None
+            ledger.write_bytes(original)
+            # Retained exact custody covers failed assertions too. Reap the
+            # direct child before cleanup_case can remove its filesystem.
+            if self._pidfd_is_live(original_fd):
+                try:
+                    signal.pidfd_send_signal(original_fd, signal.SIGKILL, None, 0)
+                except ProcessLookupError:
+                    pass
+            proc.communicate(timeout=2)
+            control.close()
             decoy.terminate()
             try:
                 decoy.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 decoy.kill()
                 decoy.wait(timeout=2)
+        self.assertFalse(self._pidfd_is_live(original_fd), "writer still live at deletion")
+        self.assertIsNotNone(proc.returncode, "original direct child was not reaped")
+        self.assertIsNotNone(decoy.returncode, "decoy direct child was not reaped")
+        self.cleanup_case()
+        self.assertFalse(self.root.exists())
 
     def test_actual_port_forward_timeout_is_nonpass_and_settled(self):
         decoy = self.start_decoy()

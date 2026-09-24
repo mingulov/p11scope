@@ -1463,6 +1463,12 @@ fn merge(
         // holds kept endpoints: its endpoints are all in the omission
         // record, never also counted as spill.
         let mut refused_top: Option<TableKey> = None;
+        // Spill accounting is per admission pass: the kept-only retry
+        // recounts this module's spill from scratch, so the first pass's
+        // counts are discarded before retrying. Otherwise every table the
+        // first pass spilled before the refusal would be counted again on
+        // the retry — a double spill alongside the omission.
+        let spill_baseline = uncorroborated_candidates;
         let (fresh, admitted) = 'admission: loop {
             let kept_only = refused_growth.is_some();
             let admissible = |key: &AttachKey| !kept_only || kept.contains(key);
@@ -1563,6 +1569,21 @@ fn merge(
                     !positions.contains_key(&(key.object, key.file_offset))
                         && !existing_slots.contains_key(key)
                 };
+                // A table the module already has attached must never spill:
+                // its kept endpoints would vanish from the snapshot and
+                // retire. Its fresh demand, when it holds any kept endpoint,
+                // routes to the refused-growth retry instead (G-03).
+                let kept_demand = |key: &TableKey| -> Option<BTreeSet<AttachKey>> {
+                    let keys = keys_of.get(key)?;
+                    keys.iter()
+                        .any(|candidate| kept.contains(candidate))
+                        .then(|| {
+                            keys.iter()
+                                .filter(|candidate| is_fresh(candidate))
+                                .copied()
+                                .collect()
+                        })
+                };
                 let is_published = table_name_authorized;
                 // All-or-nothing refusal survives only here: when even the strongest
                 // table exceeds the remaining global budget, the module — scan and
@@ -1658,6 +1679,15 @@ fn merge(
                         // endpoints need no new slot, so the cap must not
                         // spill one of their tables and retire it (G-03).
                         if !kept_only && (spent || heuristic_admitted >= MAX_TABLES_PER_OBJECT) {
+                            // A spent budget or a full cap still must not
+                            // drop a table the module has attached: route
+                            // to the refused-growth retry like a direct
+                            // budget failure. Tables with nothing to keep
+                            // still spill, counted once as uncorroborated.
+                            if let Some(demand) = kept_demand(key) {
+                                refused_top = Some(*key);
+                                break 'refused demand;
+                            }
                             uncorroborated_candidates += 1;
                             continue;
                         }
@@ -1680,21 +1710,11 @@ fn merge(
                             // endpoints stay and the growth is omitted
                             // explicitly. Tables with nothing to keep still
                             // spill, counted once as uncorroborated.
-                            let keeps_attached = keys_of.get(key).is_some_and(|keys| {
-                                keys.iter().any(|candidate| kept.contains(candidate))
-                            });
-                            if !kept_only && keeps_attached {
-                                let demand: BTreeSet<AttachKey> = keys_of
-                                    .get(key)
-                                    .map(|keys| {
-                                        keys.iter()
-                                            .filter(|candidate| is_fresh(candidate))
-                                            .copied()
-                                            .collect()
-                                    })
-                                    .unwrap_or_default();
-                                refused_top = Some(*key);
-                                break 'refused demand;
+                            if !kept_only {
+                                if let Some(demand) = kept_demand(key) {
+                                    refused_top = Some(*key);
+                                    break 'refused demand;
+                                }
                             }
                             // The budget is spent: this table and every weaker one spill.
                             // Admission stays a strongest-evidence prefix — a strong
@@ -1718,6 +1738,7 @@ fn merge(
             debug_assert!(!kept_only, "kept endpoints alone need no new slot");
             if !kept_only && !kept.is_empty() {
                 refused_growth = Some(refused);
+                uncorroborated_candidates = spill_baseline;
                 continue 'admission;
             }
             let skipped = Skipped {
@@ -4682,6 +4703,335 @@ mod tests {
         assert!(delta.new.is_empty());
         assert!(delta.replace.is_empty());
         assert_eq!(plan.active_slot_count(), MAX_SLOTS as usize - 1);
+    }
+
+    /// G-03 spill accounting (re-review): the kept-only retry must not
+    /// recount the first pass's spill. A leading empty table — entries all
+    /// unpinned during reconciliation — spills before the G1 refusal; the
+    /// retry sees it empty again and must count the one table exactly once,
+    /// alongside the growth omission, never twice.
+    #[test]
+    fn a_refused_growth_counts_a_leading_empty_table_once() {
+        use crate::discovery::scan::{ScannedEntry, ScannedTable};
+
+        let existing = PinnedObjectId(10);
+        let filler = PinnedObjectId(12);
+        let key = scanned_key(existing);
+        // Two kept endpoints plus filler to one slot short of the ceiling.
+        let mut slots = vec![
+            exact_slot(0, existing, 0, 0, vec![ModuleId(0)]),
+            exact_slot(1, existing, 8, 0, vec![ModuleId(0)]),
+        ];
+        slots.extend((0..MAX_SLOTS - 3).map(|index| {
+            exact_slot(
+                2 + index,
+                filler,
+                0x2000 + u64::from(index) * 8,
+                0,
+                vec![ModuleId(1)],
+            )
+        }));
+        let mut plan = exact_plan(
+            slots,
+            vec![exact_module(0, existing), exact_module(1, filler)],
+        );
+
+        // Equal heuristic evidence keeps discovery order: the empty table
+        // sorts first and spills, then T1 admits, then T2's growth refuses
+        // like G1's.
+        let table = |address: u64, file_offset: u64, offsets: &[u64]| ScannedTable {
+            version: (2, 40),
+            walk: "full",
+            entries: offsets
+                .iter()
+                .map(|offset| ScannedEntry {
+                    name: "C_Sign",
+                    object: key,
+                    object_path: "/proc/self/fd/10".into(),
+                    file_offset: *offset,
+                })
+                .collect(),
+            null_entries: vec![],
+            unpinned: vec![],
+            address,
+            file_offset: Some(file_offset),
+            live_return: false,
+            manifest_supported: false,
+        };
+        let mut grown = scanned_with(key, "/proc/self/fd/10", []);
+        grown.scanned.tables = vec![
+            table(0x6f00, 0x0f00, &[]),
+            table(0x7000, 0x0000, &[0]),
+            table(0x7100, 0x1000, &[8, 0x10000, 0x10008]),
+        ];
+        grown.entry_objects = vec![vec![existing; 0], vec![existing], vec![existing; 3]];
+        let filler_scan = scanned_with(
+            scanned_key(filler),
+            "/proc/self/fd/12",
+            (0..MAX_SLOTS - 3).map(|index| 0x2000 + u64::from(index) * 8),
+        );
+
+        let rebuilt =
+            plan.rebuild_from_sources(&[grown, filler_scan], &[], &PinnedObjects::empty());
+
+        assert_eq!(rebuilt.modules_skipped.len(), 1);
+        assert!(
+            rebuilt.modules_skipped[0]
+                .reason
+                .starts_with("admitted module needs 2 more;"),
+            "{:?}",
+            rebuilt.modules_skipped[0]
+        );
+        assert_eq!(
+            rebuilt.uncorroborated_candidates, 1,
+            "the one empty table spills exactly once, not once per admission pass"
+        );
+        let kept: Vec<u64> = rebuilt
+            .slots
+            .iter()
+            .filter(|slot| slot.object == existing)
+            .map(|slot| slot.file_offset)
+            .collect();
+        assert_eq!(kept, [0, 8], "both kept endpoints stay slotted");
+
+        let delta = plan.extend_exact(rebuilt).unwrap();
+
+        assert!(
+            delta.retire.is_empty(),
+            "{} kept endpoints retired",
+            delta.retire.len()
+        );
+        assert!(delta.new.is_empty());
+        assert!(delta.replace.is_empty());
+        assert_eq!(plan.active_slot_count(), MAX_SLOTS as usize - 1);
+    }
+
+    /// G-03 spill accounting (#2): an earlier all-growth table's budget
+    /// spill sets `spent`, and a later kept-holding table then reaches the
+    /// skip branch. It must route to the refused-growth retry like a direct
+    /// budget failure — the kept endpoints stay, the growth is omitted
+    /// explicitly — and the earlier spill is counted exactly once.
+    #[test]
+    fn a_spent_budget_routes_a_later_kept_table_to_the_refused_growth_retry() {
+        use crate::discovery::scan::{ScannedEntry, ScannedTable};
+
+        let existing = PinnedObjectId(10);
+        let filler = PinnedObjectId(12);
+        let key = scanned_key(existing);
+        // Two kept endpoints plus filler to one slot short of the ceiling.
+        let mut slots = vec![
+            exact_slot(0, existing, 0, 0, vec![ModuleId(0)]),
+            exact_slot(1, existing, 8, 0, vec![ModuleId(0)]),
+        ];
+        slots.extend((0..MAX_SLOTS - 3).map(|index| {
+            exact_slot(
+                2 + index,
+                filler,
+                0x2000 + u64::from(index) * 8,
+                0,
+                vec![ModuleId(1)],
+            )
+        }));
+        let mut plan = exact_plan(
+            slots,
+            vec![exact_module(0, existing), exact_module(1, filler)],
+        );
+
+        // Equal heuristic evidence keeps discovery order: the leading kept
+        // table admits (its demand is zero, so the leading-table check
+        // passes), the all-fresh table's two endpoints then do not fit the
+        // one free slot, so it spills and spends the budget, and the kept
+        // table reaches the skip branch instead of the budget check.
+        let table = |address: u64, file_offset: u64, offsets: &[u64]| ScannedTable {
+            version: (2, 40),
+            walk: "full",
+            entries: offsets
+                .iter()
+                .map(|offset| ScannedEntry {
+                    name: "C_Sign",
+                    object: key,
+                    object_path: "/proc/self/fd/10".into(),
+                    file_offset: *offset,
+                })
+                .collect(),
+            null_entries: vec![],
+            unpinned: vec![],
+            address,
+            file_offset: Some(file_offset),
+            live_return: false,
+            manifest_supported: false,
+        };
+        let mut grown = scanned_with(key, "/proc/self/fd/10", []);
+        grown.scanned.tables = vec![
+            table(0x7000, 0x0000, &[0]),
+            table(0x7100, 0x1000, &[0x10000, 0x10008]),
+            table(0x7200, 0x2000, &[8, 0x10010]),
+        ];
+        grown.entry_objects = vec![vec![existing], vec![existing; 2], vec![existing; 2]];
+        let filler_scan = scanned_with(
+            scanned_key(filler),
+            "/proc/self/fd/12",
+            (0..MAX_SLOTS - 3).map(|index| 0x2000 + u64::from(index) * 8),
+        );
+
+        let rebuilt =
+            plan.rebuild_from_sources(&[grown, filler_scan], &[], &PinnedObjects::empty());
+
+        assert_eq!(rebuilt.modules_skipped.len(), 1);
+        assert!(
+            rebuilt.modules_skipped[0]
+                .reason
+                .starts_with("admitted module needs 1 more;"),
+            "{:?}",
+            rebuilt.modules_skipped[0]
+        );
+        assert!(
+            rebuilt.modules_skipped[0]
+                .reason
+                .contains("1 endpoint not attached; kept its 2 attached endpoints"),
+            "{:?}",
+            rebuilt.modules_skipped[0]
+        );
+        assert_eq!(
+            rebuilt.uncorroborated_candidates, 1,
+            "the earlier all-growth spill counts exactly once"
+        );
+        let kept: Vec<u64> = rebuilt
+            .slots
+            .iter()
+            .filter(|slot| slot.object == existing)
+            .map(|slot| slot.file_offset)
+            .collect();
+        assert_eq!(kept, [0, 8], "both kept endpoints stay slotted");
+
+        let delta = plan.extend_exact(rebuilt).unwrap();
+
+        assert!(
+            delta.retire.is_empty(),
+            "{} kept endpoints retired",
+            delta.retire.len()
+        );
+        assert!(delta.new.is_empty());
+        assert!(delta.replace.is_empty());
+        assert_eq!(plan.active_slot_count(), MAX_SLOTS as usize - 1);
+    }
+
+    /// G-03 spill accounting (#3): a kept-holding table past
+    /// `MAX_TABLES_PER_OBJECT` with budget still available must route to
+    /// the refused-growth retry, not spill silently. The kept endpoint
+    /// stays, the table's fresh endpoint is omitted explicitly, and the
+    /// four genuinely-new tables spill counted exactly once each.
+    #[test]
+    fn a_kept_table_past_the_heuristic_cap_routes_to_the_refused_growth_retry() {
+        use crate::discovery::scan::{ScannedEntry, ScannedTable};
+
+        let existing = PinnedObjectId(10);
+        let filler = PinnedObjectId(12);
+        let key = scanned_key(existing);
+        // One kept endpoint plus a little filler: every fresh endpoint
+        // would fit by budget, so only the per-object cap can refuse.
+        let mut slots = vec![exact_slot(0, existing, 0, 0, vec![ModuleId(0)])];
+        slots.extend((0..10u32).map(|index| {
+            exact_slot(
+                1 + index,
+                filler,
+                0x2000 + u64::from(index) * 8,
+                0,
+                vec![ModuleId(1)],
+            )
+        }));
+        let mut plan = exact_plan(
+            slots,
+            vec![exact_module(0, existing), exact_module(1, filler)],
+        );
+
+        // Equal heuristic evidence keeps discovery order: four new tables
+        // admit onto the four cap slots, and the fifth table — holding the
+        // kept endpoint — reaches the cap branch with budget to spare.
+        let table = |address: u64, file_offset: u64, offsets: &[u64]| ScannedTable {
+            version: (2, 40),
+            walk: "full",
+            entries: offsets
+                .iter()
+                .map(|offset| ScannedEntry {
+                    name: "C_Sign",
+                    object: key,
+                    object_path: "/proc/self/fd/10".into(),
+                    file_offset: *offset,
+                })
+                .collect(),
+            null_entries: vec![],
+            unpinned: vec![],
+            address,
+            file_offset: Some(file_offset),
+            live_return: false,
+            manifest_supported: false,
+        };
+        let mut grown = scanned_with(key, "/proc/self/fd/10", []);
+        grown.scanned.tables = vec![
+            table(0x7000, 0x0000, &[0x10000]),
+            table(0x7100, 0x1000, &[0x10008]),
+            table(0x7200, 0x2000, &[0x10010]),
+            table(0x7300, 0x3000, &[0x10018]),
+            table(0x7400, 0x4000, &[0, 0x10020]),
+        ];
+        grown.entry_objects = vec![
+            vec![existing],
+            vec![existing],
+            vec![existing],
+            vec![existing],
+            vec![existing; 2],
+        ];
+        let filler_scan = scanned_with(
+            scanned_key(filler),
+            "/proc/self/fd/12",
+            (0..10u32).map(|index| 0x2000 + u64::from(index) * 8),
+        );
+
+        let rebuilt =
+            plan.rebuild_from_sources(&[grown, filler_scan], &[], &PinnedObjects::empty());
+
+        assert_eq!(
+            MAX_TABLES_PER_OBJECT, 4,
+            "this test fills exactly the per-object cap"
+        );
+        assert_eq!(rebuilt.modules_skipped.len(), 1);
+        assert!(
+            rebuilt.modules_skipped[0]
+                .reason
+                .starts_with("admitted module needs 1 more;"),
+            "{:?}",
+            rebuilt.modules_skipped[0]
+        );
+        assert!(
+            rebuilt.modules_skipped[0]
+                .reason
+                .contains("1 endpoint not attached; kept its 1 attached endpoint"),
+            "{:?}",
+            rebuilt.modules_skipped[0]
+        );
+        assert_eq!(
+            rebuilt.uncorroborated_candidates, 4,
+            "the four genuinely-new tables spill exactly once each"
+        );
+        let kept: Vec<u64> = rebuilt
+            .slots
+            .iter()
+            .filter(|slot| slot.object == existing)
+            .map(|slot| slot.file_offset)
+            .collect();
+        assert_eq!(kept, [0], "the kept endpoint stays slotted");
+
+        let delta = plan.extend_exact(rebuilt).unwrap();
+
+        assert!(
+            delta.retire.is_empty(),
+            "{} kept endpoints retired",
+            delta.retire.len()
+        );
+        assert!(delta.new.is_empty());
+        assert!(delta.replace.is_empty());
+        assert_eq!(plan.active_slot_count(), 11);
     }
 
     /// A provider that changed as well as grew: it no longer lists some

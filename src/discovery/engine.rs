@@ -9935,7 +9935,7 @@ impl Engine {
         let changed = outcome.changed;
         let mut required_complete = required_seed_complete && outcome.required_complete();
         if terminal_owner.is_none() && outcome.accepted() {
-            let (retire, dynamic_complete) = self.attach_export_work(
+            let (retire, dynamic_complete, _) = self.attach_export_work(
                 self.views[position].id(),
                 &collected.dynamic,
                 session,
@@ -11247,13 +11247,17 @@ impl Engine {
         })
     }
 
+    /// Attaches one view's dynamic export work. Returns
+    /// `(retire, complete, skipped)`: `skipped` is true only when closed
+    /// additions skipped unattached work, distinguishing it from an ordinary
+    /// open-tick failure, which leaves `complete` false with `skipped` false.
     fn attach_export_work(
         &mut self,
         view: ProcessViewId,
         work: &[DynamicExportWork],
         session: &mut dyn EngineSession,
         additions_allowed: &mut bool,
-    ) -> (bool, bool) {
+    ) -> (bool, bool, bool) {
         let Some(pid) = self
             .views
             .iter()
@@ -11261,16 +11265,18 @@ impl Engine {
             .map(ProcessView::pid)
         else {
             lose_unperformed_dynamic_work(&mut self.timings, work);
-            return (true, false);
+            return (true, false, false);
         };
         let mut retire = false;
         let mut complete = true;
+        let mut skipped = false;
         for work in work {
             if work.already_attached {
                 continue;
             }
             if !*additions_allowed {
                 complete = false;
+                skipped = true;
                 if let Some(module) = &work.module {
                     self.timings.lose(module);
                 }
@@ -11354,7 +11360,7 @@ impl Engine {
                 }
             }
         }
-        (retire, complete)
+        (retire, complete, skipped)
     }
 
     fn attach_refreshed_exports(
@@ -11362,7 +11368,7 @@ impl Engine {
         view: ProcessViewId,
         session: &mut dyn EngineSession,
         additions_allowed: &mut bool,
-    ) -> (bool, bool) {
+    ) -> (bool, bool, bool) {
         let modules: Vec<_> = self
             .modules
             .iter()
@@ -11370,7 +11376,7 @@ impl Engine {
             .map(|module| module.scanned.clone())
             .collect();
         if modules.is_empty() {
-            return (false, true);
+            return (false, true, false);
         }
         let contexts: Vec<_> = self
             .loader_registry
@@ -11389,14 +11395,18 @@ impl Engine {
                 "live export hook",
                 "a refreshed provider had no unique attached loader context",
             );
-            return (false, false);
+            return (false, false, false);
         };
         let pinned = self.pinned.clone();
         let collected =
             self.collect_dynamic_export_work(*context, &modules, &pinned, session, false, &[]);
-        let (retire, complete) =
+        let (retire, complete, skipped) =
             self.attach_export_work(view, &collected.dynamic, session, additions_allowed);
-        (retire, complete && collected.required_seed_complete)
+        (
+            retire,
+            complete && collected.required_seed_complete,
+            skipped,
+        )
     }
 
     fn attach_initial_exports(
@@ -11408,7 +11418,7 @@ impl Engine {
     ) {
         let views: Vec<_> = self.views.iter().map(ProcessView::id).collect();
         for view in views {
-            let (retire, complete) =
+            let (retire, complete, _) =
                 self.attach_refreshed_exports(view, session, additions_allowed);
             if retire {
                 self.queue_stale_views(&[view].into_iter().collect(), pending_views);
@@ -14507,23 +14517,27 @@ impl Engine {
         } else {
             Ok(false)
         };
-        // Views whose export work the tick left incomplete: a closed tick
-        // skips every unattached item, so an armed view past the closure
-        // keeps its loader but loses its dynamic hooks, with its refresh
-        // request already consumed. They are requested again below.
+        // Views whose export work the closed tick skipped: an armed view
+        // past the closure keeps its loader but loses its dynamic hooks,
+        // with its refresh request already consumed. They are requested
+        // again below. An ordinary open-tick failure also reports
+        // incomplete, but its work was attempted, not skipped, so it stays
+        // out of the retry set.
         let mut export_incomplete = BTreeSet::new();
         let fatal = match arm_result {
             Ok(arm_changed) => {
                 changed |= arm_changed;
                 for view in refreshed_ok.union(&new_view_ids).copied() {
-                    let (retire, complete) =
+                    let (retire, complete, skipped) =
                         self.attach_refreshed_exports(view, session, additions_allowed);
                     if retire {
                         self.queue_stale_views(&[view].into_iter().collect(), pending_views);
                     }
                     if !complete {
                         closure.fail();
-                        export_incomplete.insert(view);
+                        if skipped {
+                            export_incomplete.insert(view);
+                        }
                     }
                 }
                 None
@@ -15239,6 +15253,10 @@ pub(crate) mod session_fixture {
         /// Killed and reaped after one dynamic link mutation, before its
         /// generation postcheck.
         kill_on_dynamic_attach: Option<u32>,
+        /// Pids whose dynamic export attach fails ordinarily: no link is
+        /// recorded and no detach bookkeeping is damaged, so the tick stays
+        /// open. Mirrors a fixed-purpose attach error, not a refusal.
+        fail_dynamic_attach_pids: BTreeSet<u32>,
         /// Refuses every `preflight_targets`, i.e. a pure preflight refusal.
         refuse_preflight: bool,
         /// One entry per upcoming `preflight_targets` call; `true` refuses
@@ -15358,6 +15376,10 @@ pub(crate) mod session_fixture {
 
         pub(crate) fn lose_generation_at_dynamic_attach(&mut self, pid: u32) {
             self.kill_on_dynamic_attach = Some(pid);
+        }
+
+        pub(crate) fn fail_dynamic_attach_for(&mut self, pid: u32) {
+            self.fail_dynamic_attach_pids.insert(pid);
         }
     }
 
@@ -15498,6 +15520,9 @@ pub(crate) mod session_fixture {
         ) -> Result<(bool, Option<u64>)> {
             if self.has_dynamic_export(context, target, cookie, abi) {
                 return Ok((false, None));
+            }
+            if self.fail_dynamic_attach_pids.contains(&pid) {
+                bail!("scripted dynamic export attach failed");
             }
             attachment_admission(&self.detach_failures, true)?;
             self.dynamic_export_links

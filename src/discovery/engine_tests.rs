@@ -8152,9 +8152,9 @@ fn two_view_selection_claims_retire_independently() {
             &mut PendingViewRetirements::new(),
         )
         .unwrap();
-    let (retire, complete) =
+    let (retire, complete, skipped) =
         engine.attach_refreshed_exports(second_view_id, &mut session, &mut true);
-    assert!(!retire && complete);
+    assert!(!retire && complete && !skipped);
     let second_binding = *engine
         .selection_bindings
         .values()
@@ -16506,6 +16506,126 @@ fn a_closed_tick_retries_the_armed_view_whose_exports_it_skipped() {
     );
     let (active, _) = u07_provider_slots(&engine, "u07-exp-second.so");
     assert!(!active.is_empty(), "the later view stays published");
+}
+
+/// F3 residual (Important). An ordinary export-attach failure on an OPEN
+/// tick must not enter the skipped-view retry set: only work the closed
+/// tick skipped is re-requested. Here the earlier view's exports fail
+/// ordinarily while additions are still open, and the later view then ends
+/// inside its own export attachment, closing the tick. The earlier view
+/// must NOT be requested again, and the next tick must not retire/re-arm
+/// its loader (no context-ID burn).
+#[test]
+fn an_open_tick_export_failure_is_not_retried_by_a_later_closure() {
+    let dir = tempfile::tempdir().expect("a fixture directory");
+    let first = system_scope_build_fixture(dir.path(), "u07-exp-first");
+    let second = system_scope_build_fixture(dir.path(), "u07-exp-second");
+    let driver = system_scope_build_driver(dir.path());
+    let earlier = system_scope_spawn_loaded(&driver, &first);
+    let (mut engine, scope) = u07_engine(&[earlier.pid()], &[first.clone(), second.clone()]);
+    let mut session = ScriptedSession::default();
+    // Ticks 1 and 2 admit one view each, which fixes the export-loop order:
+    // the earlier view's ID sorts first.
+    u07_tick(&mut engine, &mut session, &mut true);
+    let earlier_view = engine
+        .views
+        .iter()
+        .find(|view| view.pid() == earlier.pid())
+        .map(ProcessView::id)
+        .expect("tick 1 admits the earlier view");
+    let mut later = system_scope_spawn_loaded(&driver, &second);
+    u07_name_members(scope.path(), &[earlier.pid(), later.pid()]);
+    u07_tick(&mut engine, &mut session, &mut true);
+    let later_view = engine
+        .views
+        .iter()
+        .find(|view| view.pid() == later.pid())
+        .map(ProcessView::id)
+        .expect("tick 2 admits the later view");
+    assert!(
+        earlier_view < later_view,
+        "the earlier view's exports attach first: {earlier_view:?} vs {later_view:?}"
+    );
+    let objects_of = |engine: &Engine, provider: &str| -> BTreeSet<PinnedObjectId> {
+        engine
+            .plan
+            .slots
+            .iter()
+            .filter(|slot| slot.object_path.ends_with(provider))
+            .map(|slot| slot.object)
+            .collect()
+    };
+    assert_eq!(
+        engine.loader_registry.ids_for_view(earlier_view).len(),
+        1,
+        "tick 2 arms the earlier view exactly once"
+    );
+
+    // Tick 3 refreshes both. The earlier view's exports fail ordinarily
+    // while the tick is still open; the later view then ends inside its
+    // own export attachment, closing additions.
+    engine.request_refresh(earlier.pid());
+    engine.request_refresh(later.pid());
+    session.fail_dynamic_attach_for(earlier.pid());
+    session.lose_generation_at_dynamic_attach(later.pid());
+    let calls_before = session.dynamic_attach_calls.len();
+    let mut additions = true;
+    u07_tick(&mut engine, &mut session, &mut additions);
+    // The seam killed and reaped it: its guard must not signal the pid again.
+    // SAFETY: signal 0 only probes whether the pid still exists.
+    later.live = unsafe { libc::kill(later.pid() as libc::pid_t, 0) } == 0;
+    // The refresh re-pins both providers, so tick 3's calls are attributed by
+    // the committed post-tick IDs.
+    let earlier_objects = objects_of(&engine, "u07-exp-first.so");
+    let later_objects = objects_of(&engine, "u07-exp-second.so");
+
+    assert!(
+        !additions,
+        "the generation lost inside export work closes the tick"
+    );
+    assert_eq!(
+        session.dynamic_attach_calls.len(),
+        calls_before + 1,
+        "only the later view's first export attached before the kill"
+    );
+    assert!(
+        session.dynamic_attach_calls[calls_before..]
+            .iter()
+            .all(|call| later_objects.contains(&call.object)),
+        "none of the earlier view's exports attached: {:?}",
+        &session.dynamic_attach_calls[calls_before..]
+    );
+    assert!(
+        !engine.loader_registry.ids_for_view(earlier_view).is_empty(),
+        "the earlier view stays armed through its ordinary failure"
+    );
+    assert!(
+        !engine.refresh_requested.contains(&earlier.pid()),
+        "an open-tick ordinary failure is not re-requested by a later closure"
+    );
+    assert!(
+        !earlier_objects.is_empty(),
+        "the earlier view stays published"
+    );
+
+    // The next tick must not retire/re-arm the earlier view's loader: its
+    // context count is unchanged and none of its exports re-attach.
+    u07_name_members(scope.path(), &[earlier.pid()]);
+    let calls_before = session.dynamic_attach_calls.len();
+    u07_tick(&mut engine, &mut session, &mut true);
+    let earlier_objects = objects_of(&engine, "u07-exp-first.so");
+    assert!(
+        session.dynamic_attach_calls[calls_before..]
+            .iter()
+            .all(|call| !earlier_objects.contains(&call.object)),
+        "no retry re-attaches the earlier view's exports: {:?}",
+        &session.dynamic_attach_calls[calls_before..]
+    );
+    assert_eq!(
+        engine.loader_registry.ids_for_view(earlier_view).len(),
+        1,
+        "no retry retires/re-arms the earlier view's loader"
+    );
 }
 
 /// U-07 fix round 2 (C1). A downgraded exact target is replaced by detaching

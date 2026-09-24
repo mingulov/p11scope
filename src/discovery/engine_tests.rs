@@ -16388,8 +16388,7 @@ fn a_closed_tick_retries_the_armed_view_whose_exports_it_skipped() {
     let second = system_scope_build_fixture(dir.path(), "u07-exp-second");
     let driver = system_scope_build_driver(dir.path());
     let mut earlier = system_scope_spawn_loaded(&driver, &first);
-    let (mut engine, scope) =
-        u07_engine(&[earlier.pid()], &[first.clone(), second.clone()]);
+    let (mut engine, scope) = u07_engine(&[earlier.pid()], &[first.clone(), second.clone()]);
     let mut session = ScriptedSession::default();
     // Ticks 1 and 2 admit one view each, which fixes the export-loop order:
     // the earlier view's ID sorts first.
@@ -16454,10 +16453,9 @@ fn a_closed_tick_retries_the_armed_view_whose_exports_it_skipped() {
     // The seam killed and reaped it: its guard must not signal the pid again.
     // SAFETY: signal 0 only probes whether the pid still exists.
     earlier.live = unsafe { libc::kill(earlier.pid() as libc::pid_t, 0) } == 0;
-    // The refresh re-pins both providers, so tick 3's calls are attributed by
-    // the committed post-tick IDs.
+    // The refresh re-pins the providers, so tick 3's single new call is
+    // attributed by the committed post-tick ID.
     let earlier_objects = objects_of(&engine, "u07-exp-first.so");
-    let later_objects = objects_of(&engine, "u07-exp-second.so");
 
     assert!(
         !additions,
@@ -16501,10 +16499,7 @@ fn a_closed_tick_retries_the_armed_view_whose_exports_it_skipped() {
         .into_iter()
         .filter(|context| !engine.loader_registry.is_tombstoned(*context))
         .count();
-    assert_eq!(
-        live_contexts, 1,
-        "the retry does not double-arm the loader"
-    );
+    assert_eq!(live_contexts, 1, "the retry does not double-arm the loader");
     assert!(
         !engine.refresh_requested.contains(&later.pid()),
         "the retry consumes the refresh request"

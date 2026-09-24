@@ -1656,9 +1656,7 @@ fn merge(
                         // every table that still lists a kept endpoint: kept
                         // endpoints need no new slot, so the cap must not
                         // spill one of their tables and retire it (G-03).
-                        if !kept_only
-                            && (spent || heuristic_admitted >= MAX_TABLES_PER_OBJECT)
-                        {
+                        if !kept_only && (spent || heuristic_admitted >= MAX_TABLES_PER_OBJECT) {
                             uncorroborated_candidates += 1;
                             continue;
                         }
@@ -4445,9 +4443,7 @@ mod tests {
         // Four kept endpoints, one per heuristic table, plus filler to one
         // slot short of the ceiling.
         let mut slots: Vec<Slot> = (0..4u32)
-            .map(|index| {
-                exact_slot(index, existing, u64::from(index) * 8, 0, vec![ModuleId(0)])
-            })
+            .map(|index| exact_slot(index, existing, u64::from(index) * 8, 0, vec![ModuleId(0)]))
             .collect();
         slots.extend((0..MAX_SLOTS - 5).map(|index| {
             exact_slot(

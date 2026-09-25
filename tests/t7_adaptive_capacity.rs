@@ -7,11 +7,12 @@
 
 use p11scope::capacity::{
     AdmissionError, AllocState, Allocation, BudgetError, CounterCell, DiskBudget, DurableAck,
-    DurableSink, EvidenceRotation, ExportError, ExportKind, ExportRecord, ExportSession,
+    DomainSide, DurableSink, EvidenceRotation, ExportError, ExportKind, ExportRecord,
+    ExportSession,
     FaultScript, FinalSnapshot, HistoryBudget, InjectedFault, InnerMapKind, LiveAdmission,
     OverlapError, OverlapPair, RamBudget, SegmentDirectory, SegmentError, SegmentSpec, SinkError,
-    SlotIdentity, StagedExport, StoreError, TICKET_CAS_TRIES, TicketAllocator, TicketError,
-    TicketPolicy, WriterSet, export_checksum,
+    SlotIdentity, StagedExport, StorageToken, StoreError, TICKET_CAS_TRIES, TicketAllocator,
+    TicketError, TicketPolicy, WriterSet, export_checksum,
 };
 use p11scope_ebpf_common::IMAGE_IDENTITY_TICKET_LIMIT;
 
@@ -296,6 +297,9 @@ struct CandidateEvidence {
 
 const COMPARISON_LIFETIMES: u64 = 16_384 + 16;
 const COMPARISON_LIVE_CAP: usize = 68;
+// Lifetimes held live across the B rollover / C rotation so the overlap and
+// writer-proof costs are exercised, not asserted by construction.
+const OVERLAP_HELD: usize = 8;
 
 fn run_candidate_a(policy: TicketPolicy) -> CandidateEvidence {
     let mut tickets = TicketAllocator::new(policy);
@@ -331,22 +335,62 @@ fn run_candidate_a(policy: TicketPolicy) -> CandidateEvidence {
 fn run_candidate_b() -> CandidateEvidence {
     let mut pair = OverlapPair::single(TicketPolicy::v1_c1());
     let mut live = LiveAdmission::new(COMPARISON_LIVE_CAP).expect("live cap");
-    let mut admitted = 0;
+    let mut admitted = 0u64;
     let mut max_link_factor = 1;
-    for _ in 0..COMPARISON_LIFETIMES {
+    // Phase 1: serial lifetimes on the old domain, short of the rollover edge
+    // by the held window.
+    for _ in 0..(16_384 - OVERLAP_HELD as u64) {
         let (side, cookie) = pair.allocate();
-        let cookie = cookie.expect("current domain has room");
+        let cookie = cookie.expect("old domain has room");
         let reservation = live.reserve(cookie).expect("low occupancy fits");
         let token = live.admit(reservation);
         live.release(token);
         pair.retire(side, cookie);
         admitted += 1;
-        if admitted == 16_384 {
-            pair.begin_overlap(TicketPolicy::v1_c1())
-                .expect("rollover at the old limit");
-            max_link_factor = pair.link_factor();
-            pair.alias_same_task(cookie, 1);
-        }
+    }
+    // Phase 2: hold OVERLAP_HELD old-domain lifetimes live up to the edge.
+    let mut held: Vec<(DomainSide, u64, StorageToken)> = Vec::new();
+    for _ in 0..OVERLAP_HELD {
+        let (side, cookie) = pair.allocate();
+        let cookie = cookie.expect("old domain has room");
+        assert_eq!(side, DomainSide::Old);
+        let reservation = live.reserve(cookie).expect("low occupancy fits");
+        held.push((side, cookie, live.admit(reservation)));
+        admitted += 1;
+    }
+    assert_eq!(admitted, 16_384);
+    // Rollover with old lifetimes still live: the new-domain arrivals below
+    // genuinely overlap them while the link factor is 2.
+    pair.begin_overlap(TicketPolicy::v1_c1())
+        .expect("rollover at the old limit");
+    max_link_factor = pair.link_factor();
+    assert_eq!(max_link_factor, 2);
+    for index in 0..OVERLAP_HELD {
+        let (side, cookie) = pair.allocate();
+        let cookie = cookie.expect("new domain has room");
+        assert_eq!(side, DomainSide::New);
+        let reservation = live.reserve(cookie).expect("overlap fits the cap");
+        held.push((side, cookie, live.admit(reservation)));
+        pair.alias_same_task(held[index].1, cookie);
+        admitted += 1;
+    }
+    assert_eq!(live.live_count(), 2 * OVERLAP_HELD);
+    // Drain the overlap window: every held lifetime retires on its own side,
+    // so the measured peak is exactly the overlap, not a serial tail.
+    for (side, cookie, token) in held {
+        live.release(token);
+        pair.retire(side, cookie);
+    }
+    assert_eq!(live.live_count(), 0);
+    // Phase 3: remaining new-domain lifetimes run serially under overlap.
+    while admitted < COMPARISON_LIFETIMES {
+        let (side, cookie) = pair.allocate();
+        let cookie = cookie.expect("new domain has room");
+        let reservation = live.reserve(cookie).expect("overlap fits the cap");
+        let token = live.admit(reservation);
+        live.release(token);
+        pair.retire(side, cookie);
+        admitted += 1;
     }
     let live_accounting = live.accounting();
     CandidateEvidence {
@@ -365,7 +409,7 @@ fn run_candidate_c(policy: TicketPolicy) -> CandidateEvidence {
     let mut live = LiveAdmission::new(COMPARISON_LIVE_CAP).expect("live cap");
     let mut rotation = EvidenceRotation::new();
     let mut rotations = 0;
-    for _ in 0..COMPARISON_LIFETIMES {
+    for _ in 0..(COMPARISON_LIFETIMES - OVERLAP_HELD as u64) {
         let cookie = tickets.allocate().expect("wide namespace admits");
         let reservation = live.reserve(cookie).expect("low occupancy fits");
         let token = live.admit(reservation);
@@ -373,14 +417,33 @@ fn run_candidate_c(policy: TicketPolicy) -> CandidateEvidence {
         tickets.retire(cookie);
         rotation.append(1);
     }
-    rotation.rotate(0).expect("seal evidence");
-    rotation.redirect_writers(0).expect("no live writers");
+    // Hold OVERLAP_HELD writers live across the seal so the writer-
+    // redirection proof covers a real count, not a vacuous zero.
+    let mut held: Vec<(u64, StorageToken)> = Vec::new();
+    for _ in 0..OVERLAP_HELD {
+        let cookie = tickets.allocate().expect("wide namespace admits");
+        let reservation = live.reserve(cookie).expect("low occupancy fits");
+        held.push((cookie, live.admit(reservation)));
+        rotation.append(1);
+    }
+    assert_eq!(live.live_count(), OVERLAP_HELD);
+    rotation
+        .rotate(OVERLAP_HELD as u64)
+        .expect("seal evidence with live writers");
+    rotation
+        .redirect_writers(OVERLAP_HELD as u64)
+        .expect("exact live-writer proof");
     let ack = DurableAck {
         through_id: COMPARISON_LIFETIMES - 1,
         checksum: 0,
     };
     rotation.release_retired(&ack).expect("covered ack");
     rotations += 1;
+    for (cookie, token) in held {
+        live.release(token);
+        tickets.retire(cookie);
+    }
+    assert_eq!(live.live_count(), 0);
     let live_accounting = live.accounting();
     CandidateEvidence {
         admitted: COMPARISON_LIFETIMES,
@@ -408,11 +471,23 @@ fn comparison_same_workload_reports_admission_refusal_aliasing_and_cost() {
     let b = run_candidate_b();
     assert_eq!(b.admitted, COMPARISON_LIFETIMES);
     assert_eq!(b.max_link_factor, 2);
-    assert!(b.aliases >= 1, "rollover creates cross-domain aliases");
+    assert_eq!(
+        b.aliases, OVERLAP_HELD,
+        "every task live across the rollover carries a cross-domain alias"
+    );
+    assert_eq!(
+        b.peak_live,
+        2 * OVERLAP_HELD,
+        "old- and new-domain lifetimes genuinely overlap"
+    );
     let c = run_candidate_c(wide);
     assert_eq!(c.admitted, COMPARISON_LIFETIMES);
     assert_eq!(c.rotations, 1);
     assert_eq!(c.aliases, 0);
+    assert_eq!(
+        c.peak_live, OVERLAP_HELD,
+        "rotation seals while writers are live, not at quiescence"
+    );
 }
 
 // Box 4 RED (E10): >16,384 serial lifetimes at low occupancy; old limit

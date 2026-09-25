@@ -30,22 +30,30 @@ its owner (controller) and expected verdict.
 
 ### Ordinary experiment (same workload, all candidates)
 
-Workload: 16,400 serial lifetimes at live occupancy ≤ 68 (E10 shape), with
+Workload: 16,400 lifetimes at live occupancy ≤ 68 (E10 shape), with
 reserve/admit/release cycling, tombstoning, and quota/accounting checks.
-Results (`comparison_same_workload_reports_admission_refusal_aliasing_and_cost`,
+A runs fully serial; B holds 8 old-domain lifetimes live across the
+rollover while 8 new-domain arrivals overlap them; C holds 8 writers live
+across the rotation seal. Overlap-concurrency disclosure: the B alias/link
+and C writer-proof costs below are measured over genuine overlap (peak
+live 16 and 8 respectively), not asserted by construction — but arrival
+churn, contention and delayed settlement under overlap stay live-only
+(L-T7-7). Results
+(`comparison_same_workload_reports_admission_refusal_aliasing_and_cost`,
 `serial_lifetimes_past_16384_at_low_occupancy_refuse_then_continue`):
 
 | Candidate | Admitted | Refused | Peak live | Aliases | Rotations | Max link factor |
 |---|---|---|---|---|---|---|
 | A, v1 (16,384) | 16,384 | 16 | 1 | 0 | 0 | 1 |
 | A, wide v2 (2^40) | 16,400 | 0 | 1 | 0 | 0 | 1 |
-| B (rollover at 16,384) | 16,400 | 0 | 1 | ≥1 | 1 | 2 |
-| C (wide identity + 1 rotation) | 16,400 | 0 | 1 | 0 | 1 | 1 |
+| B (rollover at 16,384) | 16,400 | 0 | 16 | 8 | 1 | 2 |
+| C (wide identity + 1 rotation) | 16,400 | 0 | 8 | 0 | 1 | 1 |
 
 Refusal at the old limit is exact (quota names identity tickets; every
 attempt/admission/refusal counted separately). Past the old limit, A-wide
-admits with zero aliases and no second domain; B pays link factor 2 during
-overlap plus a cross-domain alias map; C pays one writer-proof + ack rotation.
+admits with zero aliases and no second domain; B pays link factor 2 while
+16 lifetimes genuinely overlap, plus one cross-domain alias per carried
+task (8); C pays one writer-proof over 8 live writers plus a covering ack.
 
 ### Kernel-ownership proof comparison (source evidence, not assumption)
 

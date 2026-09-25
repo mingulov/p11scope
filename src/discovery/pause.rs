@@ -6197,7 +6197,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_requested_cleanup_detaches_drains_removes_and_protectively_resumes() {
+    fn malformed_requested_cleanup_drains_removes_protectively_resumes_and_detaches() {
         let mut io = FakeIo {
             queue: VecDeque::from([Ok(Some(DiscoveryItem::Malformed)), Ok(None)]),
             authorization: Some(PAUSE_REQUESTED),

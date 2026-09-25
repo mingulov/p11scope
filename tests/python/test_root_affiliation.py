@@ -31,6 +31,8 @@ def wrapper_contract(main, name):
     if (wrapper.count(name + "_impl(") != 1 or "p11_owner_cleanup" in wrapper
             or "p11_root_current_exit" in wrapper):
         raise AssertionError(f"{name} must delegate its guarded body to {name}_impl")
+    if wrapper.index("stop_gate_leave") < wrapper.index(name + "_impl("):
+        raise AssertionError(f"{name} must leave the gate only after its guarded body")
 
 
 def hook_contract(main, identity):
@@ -103,6 +105,8 @@ class RootAffiliationTests(unittest.TestCase):
             main.replace(exit_admission,
                          "pub fn sched_process_exit(_ctx: RawTracePointContext) -> u32 {\n", 1),
             main.replace(exit_call + "    stop_gate_leave();\n", exit_call, 1),
+            main.replace(exit_call + "    stop_gate_leave();\n",
+                         "    stop_gate_leave();\n" + exit_call, 1),
             main.replace(exit_call, "    unsafe { p11_owner_cleanup() };\n" + exit_call, 1),
             main.replace("pub fn sched_process_exec(_ctx: RawTracePointContext) -> u32 {\n"
                          "    if !stop_gate_enter() {\n        return 0;\n    }\n",

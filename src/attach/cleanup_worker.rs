@@ -75,9 +75,20 @@ pub(crate) struct CleanupProgress {
     pub elapsed: Duration,
 }
 
+/// What settled once the worker thread is reaped. The final line is
+/// derived from these counts, never from a progress snapshot: a
+/// snapshot taken while a close is still in flight would skew the
+/// released count. `uncertain` folds in links whose ownership
+/// transfer out of Aya failed (see
+/// [`CleanupWorker::note_transfer_failed`]), so a known transfer
+/// failure can never print an unqualified "completed".
 #[derive(Debug)]
 pub(crate) struct CleanupReceipt {
     pub completed: bool,
+    pub released: usize,
+    pub total: usize,
+    pub uncertain: usize,
+    pub elapsed: Duration,
     pub failures: Vec<String>,
 }
 
@@ -95,6 +106,7 @@ struct WorkerState {
     attempted: usize,
     released: usize,
     uncertain: usize,
+    transfer_failed: usize,
     failures: Vec<String>,
     started_at: Option<Duration>,
     done: bool,
@@ -165,6 +177,16 @@ impl CleanupWorker {
         let _ = self.tx.send(Command::Submit(links));
     }
 
+    /// Record links that never reached the worker because the
+    /// ownership transfer out of Aya failed. The join receipt folds
+    /// the count into `uncertain` and reports incomplete. Kept
+    /// separate from `uncertain` until join: completion counts settled
+    /// worker closes only, and folding early would let a transfer
+    /// failure mask an in-flight close.
+    pub(crate) fn note_transfer_failed(&self, count: usize) {
+        self.state.lock().unwrap().transfer_failed += count;
+    }
+
     pub(crate) fn progress(&self) -> CleanupProgress {
         let state = self.state.lock().unwrap();
         let remaining = state.total.saturating_sub(state.attempted);
@@ -203,9 +225,10 @@ impl CleanupWorker {
         state.released.saturating_add(state.uncertain) >= state.total
     }
 
-    /// Reaps the worker thread and reports what settled. Borrows so the
-    /// caller snapshots the final progress after settlement: the
-    /// start-error path settles otherwise-unstarted links here.
+    /// Reaps the worker thread and reports what settled. The receipt
+    /// carries the final counts, so the drive renders the final line
+    /// from it instead of a progress snapshot. The start-error path
+    /// settles otherwise-unstarted links here.
     pub(crate) fn join(&mut self) -> CleanupReceipt {
         let _ = self.tx.send(Command::Shutdown);
         if let Some(handle) = self.handle.take() {
@@ -220,8 +243,16 @@ impl CleanupWorker {
             state.failures.push(error.clone());
         }
         state.done = true;
+        let elapsed = state
+            .started_at
+            .map(|started| (self.clock)().saturating_sub(started))
+            .unwrap_or(Duration::ZERO);
         CleanupReceipt {
-            completed: state.failures.is_empty(),
+            completed: state.failures.is_empty() && state.transfer_failed == 0,
+            released: state.released,
+            total: state.total,
+            uncertain: state.uncertain.saturating_add(state.transfer_failed),
+            elapsed,
             failures: std::mem::take(&mut state.failures),
         }
     }
@@ -277,11 +308,15 @@ fn write_progress_line(out: &mut dyn Write, progress: &CleanupProgress) {
 const FIRST_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Print a progress line about once per `poll_interval` until the worker
-/// joins, then a final completed/incomplete line. The first pass polls
-/// without printing after a short sleep, so a fast session exits in
-/// milliseconds instead of sleeping the full cadence. A second signal
-/// prints the progress and "cleanup incomplete" and returns `Interrupted`;
-/// the caller exits and the kernel finishes the remaining closes at exit.
+/// joins, then a final completed/incomplete line rendered from the join
+/// receipt. The first pass polls without printing after a short sleep,
+/// so a fast session exits in milliseconds instead of sleeping the full
+/// cadence. Completion is checked before the second-signal predicate:
+/// a signal that lands after the last close settles must not rewrite a
+/// completed cleanup as incomplete. A second signal while closes are
+/// still unsettled prints the progress and "cleanup incomplete" and
+/// returns `Interrupted`; the caller exits and the kernel finishes the
+/// remaining closes at exit.
 pub(crate) fn drive_cleanup(
     mut worker: CleanupWorker,
     second_signal: impl Fn() -> bool,
@@ -290,34 +325,33 @@ pub(crate) fn drive_cleanup(
 ) -> CleanupExit {
     let mut first_poll = true;
     loop {
-        if second_signal() {
-            let progress = worker.progress();
-            write_progress_line(out, &progress);
-            let _ = writeln!(out, "p11scope: cleanup incomplete");
-            return CleanupExit::Interrupted(progress);
-        }
         if worker.is_done() {
             let receipt = worker.join();
-            let progress = worker.progress();
             if receipt.completed {
                 let _ = writeln!(
                     out,
                     "p11scope: cleanup completed, {}/{} links released, {} s",
-                    progress.released,
-                    progress.total,
-                    progress.elapsed.as_secs(),
+                    receipt.released,
+                    receipt.total,
+                    receipt.elapsed.as_secs(),
                 );
             } else {
                 let _ = writeln!(
                     out,
                     "p11scope: cleanup incomplete, {}/{} links released, {} uncertain, {} s",
-                    progress.released,
-                    progress.total,
-                    progress.uncertain,
-                    progress.elapsed.as_secs(),
+                    receipt.released,
+                    receipt.total,
+                    receipt.uncertain,
+                    receipt.elapsed.as_secs(),
                 );
             }
             return CleanupExit::Completed(receipt);
+        }
+        if second_signal() {
+            let progress = worker.progress();
+            write_progress_line(out, &progress);
+            let _ = writeln!(out, "p11scope: cleanup incomplete");
+            return CleanupExit::Interrupted(progress);
         }
         if first_poll {
             // A fast session is already settling: re-poll quickly without
@@ -436,6 +470,11 @@ mod tests {
         );
         assert_eq!(receipt.failures.len(), 1);
         assert!(receipt.failures[0].contains("p11_return"));
+        assert_eq!(
+            (receipt.released, receipt.total, receipt.uncertain),
+            (1, 2, 1),
+            "the receipt must carry the final counts, got: {receipt:?}"
+        );
     }
 
     #[test]
@@ -539,11 +578,105 @@ mod tests {
         );
         let mut out = Vec::new();
         let exit = drive_cleanup(worker, || false, &mut out, Duration::from_millis(1));
-        assert!(matches!(exit, CleanupExit::Completed(_)));
+        match exit {
+            CleanupExit::Completed(receipt) => {
+                assert_eq!(
+                    (receipt.released, receipt.total, receipt.uncertain),
+                    (2, 2, 0),
+                    "the final line renders receipt counts, got: {receipt:?}"
+                );
+            }
+            CleanupExit::Interrupted(_) => {
+                panic!("no signal: the drive must complete")
+            }
+        }
         let text = String::from_utf8(out).unwrap();
         assert!(
             text.contains("cleanup completed, 2/2 links released"),
             "completed cleanup must print N/N, got: {text}"
+        );
+    }
+
+    /// M3: a failed ownership transfer qualifies the final line. The
+    /// transfer-failed link never reaches the worker, but the join
+    /// receipt folds it into `uncertain` and reports incomplete, so the
+    /// drive prints "cleanup incomplete" instead of "cleanup completed".
+    #[test]
+    fn transfer_failure_qualifies_the_completed_line() {
+        let worker = CleanupWorker::pre_start_with(
+            Box::new(|_link, _| Ok(())),
+            scripted_clock(Arc::new(Mutex::new(Duration::ZERO))),
+        );
+        worker.note_transfer_failed(1);
+        worker.submit(
+            vec![multi(ProducerProgram::UProbe("p11_entry"))],
+            DetachOrder,
+        );
+        let mut out = Vec::new();
+        let exit = drive_cleanup(worker, || false, &mut out, Duration::from_millis(1));
+        match exit {
+            CleanupExit::Completed(receipt) => {
+                assert!(
+                    !receipt.completed,
+                    "a known transfer failure must not report completed: {receipt:?}"
+                );
+                assert_eq!(
+                    (receipt.released, receipt.total, receipt.uncertain),
+                    (1, 1, 1),
+                    "got: {receipt:?}"
+                );
+            }
+            CleanupExit::Interrupted(_) => {
+                panic!("no signal: the drive must complete")
+            }
+        }
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("cleanup incomplete, 1/1 links released, 1 uncertain"),
+            "got: {text}"
+        );
+        assert!(
+            !text.contains("cleanup completed"),
+            "the transfer failure must qualify the line, got: {text}"
+        );
+    }
+
+    /// M5: a signal that lands after the last close settles must not
+    /// rewrite a completed cleanup as incomplete. The drive checks
+    /// worker completion before the second-signal predicate.
+    #[test]
+    fn signal_after_last_close_still_reports_completed() {
+        let worker = CleanupWorker::pre_start_with(
+            Box::new(|_link, _| Ok(())),
+            scripted_clock(Arc::new(Mutex::new(Duration::ZERO))),
+        );
+        worker.submit(
+            vec![
+                multi(ProducerProgram::UProbe("p11_entry")),
+                multi(ProducerProgram::UProbe("p11_return")),
+            ],
+            DetachOrder,
+        );
+        for _ in 0..1000 {
+            if worker.is_done() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            worker.is_done(),
+            "the closes must settle before the drive starts"
+        );
+        let mut out = Vec::new();
+        let exit = drive_cleanup(worker, || true, &mut out, Duration::from_millis(1));
+        assert!(
+            matches!(exit, CleanupExit::Completed(_)),
+            "a settled worker must complete despite the pending signal"
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("cleanup completed, 2/2 links released"),
+            "got: {text}"
         );
     }
 

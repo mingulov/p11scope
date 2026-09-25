@@ -3433,11 +3433,13 @@ impl Session {
         let mut first_error = None;
         if had_links {
             let mut owned = Vec::new();
+            let mut transfer_failed = 0;
             for link in std::mem::take(&mut self.links) {
                 let producer = link.producer();
                 match take_owned_links(&mut self.ebpf, link) {
                     Ok(links) => owned.extend(links.into_iter().map(|link| (link, producer))),
                     Err(error) => {
+                        transfer_failed += 1;
                         let message = format!("{error:#}");
                         self.detach_failures.push(message.clone());
                         if first_error.is_none() {
@@ -3447,6 +3449,7 @@ impl Session {
                 }
             }
             let worker = self.take_cleanup_worker();
+            worker.note_transfer_failed(transfer_failed);
             worker.submit(owned, DetachOrder);
             match drive_cleanup(
                 worker,
@@ -3832,9 +3835,11 @@ impl Session {
 /// closing anything: singles become `FdLink`s via `take_link` plus
 /// `into_fd_links()` (Inventory precedent `activation.rs:433-466`), multis
 /// move their fds. A single uprobe id can expand to several `FdLink`s.
-/// A link that is not fd-backed detaches synchronously on drop instead —
-/// transfer runs after publication, never before a held child's resume —
-/// and still counts as closed.
+/// A link that is not fd-backed detaches synchronously on drop instead
+/// and still counts as closed. On the normal detach path the transfer
+/// runs after publication, never before a held child's resume; the
+/// `Drop` fallback reuses this transfer best-effort and offers no
+/// ordering guarantee.
 fn take_owned_links(ebpf: &mut Ebpf, link: RegisteredLink) -> Result<Vec<OwnedLink>> {
     match link {
         RegisteredLink::MultiUProbe { fds, .. } => Ok(vec![OwnedLink::Multi(fds)]),

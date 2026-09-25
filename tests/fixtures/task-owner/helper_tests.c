@@ -16,7 +16,6 @@ static u64 controlled_cas(u64 *cell, u64 old, u64 replacement);
 #include <string.h>
 
 unsigned char START, DISCOVERY_STATE;
-unsigned char STOP_GATE;
 struct task_struct { int index; };
 static struct task_struct tasks[3] = {{0}, {1}, {2}};
 static struct thread_owner owners[3];

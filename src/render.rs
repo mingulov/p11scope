@@ -685,7 +685,7 @@ pub const SINK_POLICY_BOUNDED_WAIT_DROP: &str = "bounded-wait-drop";
 /// capture. Discovery is measured directly here (Task 3.1 G-discovery-
 /// tick-slice), not as a residual of totals; `discovery` covers every
 /// discovery drain (tick + terminal), while `discovery_terminal` covers
-/// only the post-detach terminal drain, so the per-frame tick slice is
+/// only the pre-detach terminal drain, so the per-frame tick slice is
 /// `discovery - discovery_terminal`.
 #[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
 pub struct SchedulingPhaseMs {
@@ -694,10 +694,11 @@ pub struct SchedulingPhaseMs {
     pub drain: u64,
     pub maps: u64,
     pub render: u64,
-    /// Producer-detach work completed before publication. The terminal
-    /// callback publishes before the producers detach
-    /// (quiesce-then-publish), so Detailed reports carry 0: the
-    /// post-publication teardown is explicitly unmeasured, by design.
+    /// Producer-detach phase wall time within the published window.
+    /// The terminal callback publishes before the producers detach
+    /// (quiesce-then-publish), so post-stop-gate reads are 0 by
+    /// design: the teardown rides the worker final line plus the
+    /// `STOPGATE_TIMING` `cleanup_ms` evidence instead.
     pub detach: u64,
 }
 

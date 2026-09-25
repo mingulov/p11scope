@@ -6592,7 +6592,7 @@ fn privileged_task4_detailed_physical_identity_controls() -> Result<()> {
             first_ids.maps.len(),
             first_ids.programs.len(),
             first_ids.links.len()
-        ) == (22, 13, 7)
+        ) == (23, 13, 7)
     );
     let first_witness = task4_session_witness(&first, &first_ids, 1, original.child.id())?;
     task4_record_registration(
@@ -6625,7 +6625,7 @@ fn privileged_task4_detailed_physical_identity_controls() -> Result<()> {
             second_ids.maps.len(),
             second_ids.programs.len(),
             second_ids.links.len()
-        ) == (22, 13, 7)
+        ) == (23, 13, 7)
     );
     let second_witness = task4_session_witness(&second, &second_ids, 2, copy.child.id())?;
     ensure!(
@@ -6644,7 +6644,7 @@ fn privileged_task4_detailed_physical_identity_controls() -> Result<()> {
         "second_attached",
     )?;
     let ids = first_ids.union(&second_ids);
-    ensure!((ids.maps.len(), ids.programs.len(), ids.links.len()) == (44, 26, 14));
+    ensure!((ids.maps.len(), ids.programs.len(), ids.links.len()) == (46, 26, 14));
     task4_ids_phase("second_attached", &ids);
     task4_session_ids("second_attached", second_witness, &second_ids);
     task4_ids_receipt(&ids);

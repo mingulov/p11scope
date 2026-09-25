@@ -315,37 +315,37 @@ DESTINATIONS = {6: (8, 8), 7: (0x10, 8), 10: (0x28, 8),
                 "join": (0x58, 8), "get": (0x30, 8), 16: (0x104, 4)}
 LP64_OFFSETS = (0x70, 0x68, 0x60, 0x58, 0x48, 0x40)
 LP64_READS = {
-    6: ([1033, 908, 1037, 1000, 1035, 995], 1013),
-    7: ([1089, 1044, 1093, 1055, 1091, 1050], 1068),
-    10: ([1145, 1101, 1149, 1113, 1147, 1108], 1126),
-    11: ([1207, 1160, 1211, 1175, 1209, 1166], 1188),
-    8: ([1546, 1411, 1230, 1320, 1243, 1325], 1272),
-    9: ([1316, 1328, 1223, 1318, 1237, 1323], 1257),
-    16: ([1405, 1421, 1367, 1407, 1373, 1409], 1386),
-    "join": ([1528, 1432, 1534, 1460, 1531, 1447], 1474),
-    "get": ([1537, 1440, 1543, 1482, 1540, 1454], 1496),
+    6: ([1052, 927, 1056, 1019, 1054, 1014], 1032),
+    7: ([1108, 1063, 1112, 1074, 1110, 1069], 1087),
+    10: ([1164, 1120, 1168, 1132, 1166, 1127], 1145),
+    11: ([1226, 1179, 1230, 1194, 1228, 1185], 1207),
+    8: ([1575, 1440, 1249, 1339, 1262, 1344], 1291),
+    9: ([1335, 1347, 1242, 1337, 1256, 1342], 1276),
+    16: ([1434, 1450, 1396, 1436, 1402, 1438], 1415),
+    "join": ([1557, 1461, 1563, 1489, 1560, 1476], 1503),
+    "get": ([1566, 1469, 1572, 1511, 1569, 1483], 1525),
 }
-IA32_READS = {6: 1774, 7: 1863, 10: 1886, 11: 1913,
-              8: 1961, 9: 1938, 16: 2021, "join": 2051, "get": 2074}
-LP64_DISPATCH = {6: (902,), 7: (1039,), 10: (1095,), 11: (1155,),
-                 8: (1214, 1225), 9: (1217, 1218), 16: (1342, 1362),
-                 "join": (1427,), "get": (1435,)}
-IA32_DISPATCH = {6: (1771,), 7: (1860,), 10: (1884,), 11: (1911,),
-                 8: (1934,), 9: (1936,), 16: (2000,), "join": (2048,), "get": (2071,)}
+IA32_READS = {6: 1822, 7: 1911, 10: 1934, 11: 1961,
+              8: 2009, 9: 1986, 16: 2079, "join": 2109, "get": 2132}
+LP64_DISPATCH = {6: (921,), 7: (1058,), 10: (1114,), 11: (1174,),
+                 8: (1233, 1244), 9: (1236, 1237), 16: (1361, 1391),
+                 "join": (1456,), "get": (1464,)}
+IA32_DISPATCH = {6: (1819,), 7: (1908,), 10: (1932,), 11: (1959,),
+                 8: (1982,), 9: (1984,), 16: (2048,), "join": (2106,), "get": (2129,)}
 SCALAR_CALLS = {
-    "default": {909: 6, 922: 7, 935: 10, 951: 11, 1036: 8,
-                1069: 9, 1116: 16, 1287: "join", 1301: "get"},
-    "p11_entry_template": {2328: 6, 2341: 7, 2353: 10, 2370: 11,
-                           2386: 9, 2477: 8, 2528: 12, 2539: 13},
-    "p11_entry_template_pair": {2807: 6, 2820: 7, 2832: 10, 2849: 11,
-                                2865: 9, 2956: 8, 3007: 12, 3018: 13},
-    "p11_entry_template_types": {3417: 6, 3430: 7, 3442: 10, 3459: 11,
-                                 3475: 9, 3566: 8, 3617: 12, 3628: 13},
-    "p11_entry_template_second": {3226: 14, 3238: 15},
+    "default": {927: 6, 940: 7, 953: 10, 969: 11, 1054: 8,
+                1087: 9, 1144: 16, 1315: "join", 1329: "get"},
+    "p11_entry_template": {2404: 6, 2417: 7, 2429: 10, 2446: 11,
+                           2462: 9, 2553: 8, 2604: 12, 2615: 13},
+    "p11_entry_template_pair": {2913: 6, 2926: 7, 2938: 10, 2955: 11,
+                                2971: 9, 3062: 8, 3113: 12, 3124: 13},
+    "p11_entry_template_types": {3562: 6, 3575: 7, 3587: 10, 3604: 11,
+                                 3620: 9, 3711: 8, 3762: 12, 3773: 13},
+    "p11_entry_template_second": {3344: 14, 3356: 15},
 }
-SEMANTIC_INSERT = {"default": 1094, "p11_entry": 1347, "p11_entry_ia32": 2005,
-                   "p11_entry_template": 2572, "p11_entry_template_pair": 3051,
-                   "p11_entry_template_types": 3665}
+SEMANTIC_INSERT = {"default": 1112, "p11_entry": 1366, "p11_entry_ia32": 2053,
+                   "p11_entry_template": 2648, "p11_entry_template_pair": 3157,
+                   "p11_entry_template_types": 3810}
 BYTE_DOMAIN = frozenset(range(256))
 BRANCH = re.compile(r"if ([rw]\d+) (==|!=|s>|>|s>=|>=|<|<=) ([rw]\d+|-?0x[0-9a-f]+) goto [+-]0x[0-9a-f]+")
 
@@ -959,9 +959,9 @@ def retained_contract(consumer, variant, selectors):
     # Return copies these scalars while START is owned, before removal. They
     # are retained values, never permission to reuse the removed map pointer.
     delta = int(variant == "unsafe")
-    sites = {1297+delta: (0x30, 1, 1), 1370+delta: (0x30, 1, 0),
-             1344+delta: (0x20, None, 1), 1379+delta: (0x20, None, 0),
-             1531+delta: (0x30, 12, 1), 1552+delta: (0x30, 12, 0)}
+    sites = {1323+delta: (0x30, 1, 1), 1553+delta: (0x30, 1, 0),
+             1498+delta: (0x20, None, 1), 1562+delta: (0x20, None, 0),
+             1530+delta: (0x30, 12, 1), 1572+delta: (0x30, 12, 0)}
     for selector in selectors:
         abi = int(selector == 0x23)
         for present in (False, True):
@@ -1086,6 +1086,11 @@ def abi_contract(consumer, facts, variant):
                 require(cleaned and stack_read(state, state.get("r2"), 4) == ("constant", 8), consumer.label(pc) + ": ABI refusal evidence key/order")
                 require(D.counter_writeback_contract(consumer.lines, pc), consumer.label(pc) + ": ABI refusal counter update")
                 refused = True
+            elif text == "call 0x1" and map_name == ("map", "STOP_GATE"):
+                # The stop-gate release epilogue: admitted paths stop at
+                # admission above and never reach it, so only refusal paths
+                # arrive here, and only after cleanup plus refusal evidence.
+                require(cleaned and refused, consumer.label(pc) + ": gate release without ABI cleanup/refusal")
             elif text.startswith("call "):
                 require(False, consumer.label(pc) + ": unexpected helper before ABI admission")
             if m := LOAD.fullmatch(text):

@@ -245,9 +245,9 @@ class EntryObjectTests(unittest.TestCase):
             ("p11_entry_template_types", site('unsafe', 'p11_entry_template_types', 'if\\ r7\\ ==\\ 0x0\\ goto\\ \\+0x17'), "if r7 != 0x0 goto +0x17"),
             ("p11_entry_template_second", site('unsafe', 'p11_entry_template_second', 'r9\\ \\+=\\ 0xb0'), "r9 += 0x60"),
             ("p11_entry_template_second", site('unsafe', 'p11_entry_template_second', 'r4\\ =\\ r9'), "r4 = r10"),
-            ("p11_return", 1286, "if r8 != 0x1 goto +0x64"),
-            ("p11_return", 1297, "r2 = 0x8"),
-            ("p11_return", 1339, "r3 = *(u64 *)(r10 - 0xf8)"),
+            ("p11_return", 1311, "if r8 != 0x1 goto +0x1a"),
+            ("p11_return", 1322, "r2 = 0x8"),
+            ("p11_return", 1493, "r3 = *(u64 *)(r10 - 0xf8)"),
         ]
         for function, pc, new in cases:
             with self.subTest(function=function, pc=pc):
@@ -265,7 +265,7 @@ class EntryObjectTests(unittest.TestCase):
         # Low32(0x100000000) is zero. Low32(RSP32 + argument offset)
         # can also fit the IA32 limit while the complete address overflows.
         cases = [("default", "p11_entry", site('default', 'p11_entry', 'if\\ r1\\ ==\\ 0x0\\ goto\\ \\+0xe')),
-                 ("unsafe", "p11_entry", site("unsafe", "p11_entry", r"if r7 == 0x0 goto \+0xb6")),
+                 ("unsafe", "p11_entry", site("unsafe", "p11_entry", r"if r7 == 0x0 goto \+0xc0")),
                  ("default", "capture_scalar", site("default", "capture_scalar", r"if r1 > r0 goto .*")),
                  ("default", "capture_scalar", site("default", "capture_scalar", r"if r3 > -0x10 goto .*")),
                  ("unsafe", "capture_scalar", site("unsafe", "capture_scalar", r"if r1 > r0 goto .*")),
@@ -283,7 +283,7 @@ class EntryObjectTests(unittest.TestCase):
 
     def test_full_pointer_branch_restoration(self):
         for variant, pc in (("default", site("default", "p11_entry", r"if r1 == 0x0 goto \+0xe")),
-                            ("unsafe", site("unsafe", "p11_entry", r"if r7 == 0x0 goto \+0xb6"))):
+                            ("unsafe", site("unsafe", "p11_entry", r"if r7 == 0x0 goto \+0xc0"))):
             with self.subTest(variant=variant):
                 original = OBJECTS[variant]
                 old = dict(CHECKER["D"].instructions(CHECKER["D"].function_blocks(original)["p11_entry"]))[pc]
@@ -554,7 +554,7 @@ class EntryObjectTests(unittest.TestCase):
         cases = [
             ("p11_entry", site('default', 'p11_entry', 'r1\\ <<=\\ 0x20'), "r1 <<= 0x20", "r1 <<= 0x1f"),
             ("p11_entry", site('default', 'p11_entry', 'r0\\ >>=\\ 0x20', 0), "r0 >>= 0x20", "r0 >>= 0x1f"),
-            ("p11_entry", site('default', 'p11_entry', 'r1\\ =\\ r6'), "r1 = r6", "r1 = r10"),
+            ("p11_entry", site('default', 'p11_entry', 'r1\\ =\\ r6', 1), "r1 = r6", "r1 = r10"),
             ("p11_entry", site('default', 'p11_entry', 'if\\ r0\\ ==\\ 0x0\\ goto\\ \\+0xd'), "if r0 == 0x0 goto +0xd", "goto +0xd"),
             ("p11_entry", site('default', 'p11_entry', 'if\\ r0\\ ==\\ 0x0\\ goto\\ \\+0xd'), "if r0 == 0x0 goto +0xd", "if r0 != 0x0 goto +0xd"),
             ("p11_entry", site('default', 'p11_entry', 'if\\ r0\\ ==\\ 0x0\\ goto\\ \\+0xd'), "if r0 == 0x0 goto +0xd", "if r0 == 0x0 goto +0xc"),
@@ -679,8 +679,8 @@ class EntryObjectTests(unittest.TestCase):
                                 CHECKER["contract"](mutate(disassembly, name, pc, old, new), variant)
 
     def test_event_overlap_can_be_restored_before_submission(self):
-        changed = mutate(OBJECTS["default"], "p11_return", 1413,
-                         "*(u64 *)(r0 + 0x60) = r9", "*(u32 *)(r0 + 0x69) = r9")
+        changed = mutate(OBJECTS["default"], "p11_return", 1362,
+                         "*(u64 *)(r0 + 0x60) = r1", "*(u32 *)(r0 + 0x69) = r1")
         changed = mutate(changed, "p11_return", 1498, "r1 = 0x0", "r1 = *(u64 *)(r10 - 0xd0)")
         changed = mutate(changed, "p11_return", 1499,
                          "*(u32 *)(r0 + 0x11c) = r1", "*(u32 *)(r0 + 0x68) = r1")
@@ -710,10 +710,10 @@ class EntryObjectTests(unittest.TestCase):
                                 CHECKER["contract"](mutate(disassembly, name, argument_pc, old, new), variant)
 
     def test_atomic_event_slot_corruption(self):
-        changed = mutate(OBJECTS["default"], "p11_return", 1413,
-                         "*(u64 *)(r0 + 0x60) = r9", "r9 = 0x400")
-        changed = mutate(changed, "p11_return", 1414,
-                         "r1 = *(u64 *)(r10 - 0x130)",
+        changed = mutate(OBJECTS["default"], "p11_return", 1362,
+                         "*(u64 *)(r0 + 0x60) = r1", "r1 = 0x400")
+        changed = mutate(changed, "p11_return", 1363,
+                         "r1 = *(u64 *)(r10 - 0x128)",
                          "r9 = atomic_fetch_or((u64 *)(r0 + 0x68), r9)")
         with self.assertRaisesRegex(RuntimeError, r"Event.slot corrupted before submit"):
             CHECKER["contract"](changed, "default")

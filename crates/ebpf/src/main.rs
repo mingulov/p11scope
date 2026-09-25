@@ -35,21 +35,22 @@ use p11scope_ebpf_common::{
     discovery_usable_prefix, discovery_version_class, event_type, image_pair_matches,
     interface_continuation_next, interface_continuation_pack, interface_continuation_unpack,
     lifecycle, normalize_target_word, read_ia32_arg_with, return_allows_mechanism, shape,
-    target_layout_from_cs, target_stack_arg_address, target_word_end, valid_config,
-    valid_loader_cookie, CallStart, DiscoveryRecord, Event, FunctionNameKey, ImageIdentity,
-    LinuxLayout, PauseKey, RvKey, SlotSemantics, SlotStats, StartKey, StartState, StateKey,
-    ARG_NONE, CFG_FLAGS, COALESCED_NO_HELPER_RC, DISCOVERY_BYTES, DISCOVERY_COUNTER_CELLS,
-    DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES, DISCOVERY_COUNTER_EXPORT_STATE_FAILURES,
-    DISCOVERY_COUNTER_LOADER_HITS, DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES,
-    DISCOVERY_COUNTER_RING_LOSS, DISCOVERY_INTERFACES, DISCOVERY_KIND_EXEC,
-    DISCOVERY_KIND_FUNCTION_LIST_RETURN, DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN,
-    DISCOVERY_KIND_INTERFACE_RETURN, DISCOVERY_KIND_LEADER_EXIT, DISCOVERY_KIND_LOADER,
-    DISCOVERY_NAME_EXACT_STANDARD, DISCOVERY_NAME_NA, DISCOVERY_NAME_NULL, DISCOVERY_NAME_OTHER,
-    DISCOVERY_NAME_UNREADABLE, DISCOVERY_STATUS_COALESCED_NO_HELPER,
-    DISCOVERY_STATUS_LOADER_CONTEXT_INVALID, DISCOVERY_STATUS_READ_FAILURE, DISCOVERY_VERSION_NULL,
-    DISCOVERY_VERSION_UNREADABLE, DISCOVERY_VERSION_V3_0, DISCOVERY_VERSION_V3_1,
-    DISCOVERY_VERSION_V3_2, EVIDENCE_ABI_REFUSALS, EVIDENCE_CELLS, EVIDENCE_CGROUP_SCOPE_FAILURES,
-    EVIDENCE_RING_LOSS, EVIDENCE_RV_UPDATE_FAILURES, EVIDENCE_SEMANTIC_CAPTURE_FAILURES,
+    stop_gate_admit_with, target_layout_from_cs, target_stack_arg_address, target_word_end,
+    valid_config, valid_loader_cookie, CallStart, DiscoveryRecord, Event, FunctionNameKey,
+    ImageIdentity, LinuxLayout, PauseKey, RvKey, SlotSemantics, SlotStats, StartKey, StartState,
+    StateKey, ARG_NONE, CFG_FLAGS, COALESCED_NO_HELPER_RC, DISCOVERY_BYTES,
+    DISCOVERY_COUNTER_CELLS, DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES,
+    DISCOVERY_COUNTER_EXPORT_STATE_FAILURES, DISCOVERY_COUNTER_LOADER_HITS,
+    DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES, DISCOVERY_COUNTER_RING_LOSS,
+    DISCOVERY_INTERFACES, DISCOVERY_KIND_EXEC, DISCOVERY_KIND_FUNCTION_LIST_RETURN,
+    DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN, DISCOVERY_KIND_INTERFACE_RETURN,
+    DISCOVERY_KIND_LEADER_EXIT, DISCOVERY_KIND_LOADER, DISCOVERY_NAME_EXACT_STANDARD,
+    DISCOVERY_NAME_NA, DISCOVERY_NAME_NULL, DISCOVERY_NAME_OTHER, DISCOVERY_NAME_UNREADABLE,
+    DISCOVERY_STATUS_COALESCED_NO_HELPER, DISCOVERY_STATUS_LOADER_CONTEXT_INVALID,
+    DISCOVERY_STATUS_READ_FAILURE, DISCOVERY_VERSION_NULL, DISCOVERY_VERSION_UNREADABLE,
+    DISCOVERY_VERSION_V3_0, DISCOVERY_VERSION_V3_1, DISCOVERY_VERSION_V3_2, EVIDENCE_ABI_REFUSALS,
+    EVIDENCE_CELLS, EVIDENCE_CGROUP_SCOPE_FAILURES, EVIDENCE_RING_LOSS,
+    EVIDENCE_RV_UPDATE_FAILURES, EVIDENCE_SEMANTIC_CAPTURE_FAILURES,
     EVIDENCE_START_INSERT_FAILURES, EVIDENCE_UNMATCHED_RETURNS, EVIDENCE_UNREGISTERED_MECHANISMS,
     FLAG_CGROUP_FILTER, FLAG_PID_FILTER, FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED,
     FLAG_SYSTEM_FILTER, FUNCTION_NAME_MAX_BYTES, FUNCTION_NONE, LOADER_STATE_PRESENT,
@@ -144,6 +145,61 @@ static PAUSE_PIDS: HashMap<PauseKey, u64> = HashMap::with_max_entries(1, 0);
 #[cfg(not(feature = "inventory-only"))]
 #[map]
 static STOP_GATE: Array<u64> = Array::with_max_entries(1, BPF_F_MMAPABLE);
+
+/// Stop-gate admission for the static Detailed programs. Reads the shared
+/// word with a compare-exchange against (0, 0) and counts with a non-fetch
+/// atomic add whose result is never consumed; the object checker proves the
+/// fetch-free lowering in the built object. Returns true when the caller is
+/// admitted and MUST call [`stop_gate_leave`] exactly once when its guarded
+/// body has finished all capture accesses.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(always)]
+fn stop_gate_enter() -> bool {
+    let Some(cell) = STOP_GATE.get_ptr_mut(0) else {
+        return false;
+    };
+    // SAFETY: the pointer is the live STOP_GATE cell for the whole program.
+    // Compare-exchange against (0, 0) only reads the shared word, and the
+    // deliberately unused fetch-add result selects the non-fetch BPF ATOMIC
+    // ADD form, which the object checker verifies per program.
+    stop_gate_admit_with(
+        || unsafe {
+            core::intrinsics::atomic_cxchg::<
+                u64,
+                { core::intrinsics::AtomicOrdering::AcqRel },
+                { core::intrinsics::AtomicOrdering::Acquire },
+            >(cell, 0, 0)
+            .0
+        },
+        |delta| unsafe {
+            let _ = core::intrinsics::atomic_xadd::<
+                u64,
+                u64,
+                { core::intrinsics::AtomicOrdering::AcqRel },
+            >(cell, delta as u64);
+        },
+    )
+}
+
+/// Release one [`stop_gate_enter`] admission. The lookup cannot fail:
+/// STOP_GATE is Array<u64> with max_entries 1, so key 0 is always in
+/// bounds and the kernel returns the cell. Balancing is exact — the object
+/// checker proves a decrement on every exit path — so a skipped decrement
+/// would leak an in-flight count past the stop.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(always)]
+fn stop_gate_leave() {
+    // SAFETY: key 0 of a one-entry Array always resolves; see above.
+    let cell = unsafe { STOP_GATE.get_ptr_mut(0).unwrap_unchecked() };
+    // SAFETY: the pointer is the live STOP_GATE cell; the unused result
+    // lowers to a non-fetch BPF ATOMIC ADD, object-checked as in enter.
+    let _ = unsafe {
+        core::intrinsics::atomic_xadd::<u64, u64, { core::intrinsics::AtomicOrdering::AcqRel }>(
+            cell,
+            u64::MAX,
+        )
+    };
+}
 
 /// Does this call belong to the capture scope? With no filter configured
 /// nothing is observed — scope is always explicit, and system-wide capture
@@ -2106,39 +2162,78 @@ const ENTRY_ABI_ILP32: u8 = 2;
 #[cfg(not(feature = "inventory-only"))]
 #[uprobe]
 pub fn p11_entry(ctx: ProbeContext) -> u32 {
+    if !stop_gate_enter() {
+        return 0;
+    }
     #[cfg(not(feature = "unsafe-unvalidated-metadata"))]
-    return p11_entry_impl::<0, ENTRY_ABI_MIXED>(ctx);
+    let rc = p11_entry_impl::<0, ENTRY_ABI_MIXED>(ctx);
     #[cfg(feature = "unsafe-unvalidated-metadata")]
-    return p11_entry_impl::<0, ENTRY_ABI_LP64>(ctx);
+    let rc = p11_entry_impl::<0, ENTRY_ABI_LP64>(ctx);
+    stop_gate_leave();
+    rc
 }
 
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 #[uprobe]
 pub fn p11_entry_ia32(ctx: ProbeContext) -> u32 {
-    p11_entry_impl::<0, ENTRY_ABI_ILP32>(ctx)
+    if !stop_gate_enter() {
+        return 0;
+    }
+    let rc = p11_entry_impl::<0, ENTRY_ABI_ILP32>(ctx);
+    stop_gate_leave();
+    rc
 }
 
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 #[uprobe]
 pub fn p11_entry_template(ctx: ProbeContext) -> u32 {
-    p11_entry_impl::<1, ENTRY_ABI_MIXED>(ctx)
+    if !stop_gate_enter() {
+        return 0;
+    }
+    let rc = p11_entry_impl::<1, ENTRY_ABI_MIXED>(ctx);
+    stop_gate_leave();
+    rc
 }
 
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 #[uprobe]
 pub fn p11_entry_template_types(ctx: ProbeContext) -> u32 {
-    p11_entry_impl::<2, ENTRY_ABI_MIXED>(ctx)
+    if !stop_gate_enter() {
+        return 0;
+    }
+    let rc = p11_entry_impl::<2, ENTRY_ABI_MIXED>(ctx);
+    stop_gate_leave();
+    rc
 }
 
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 #[uprobe]
 pub fn p11_entry_template_pair(ctx: ProbeContext) -> u32 {
-    p11_entry_impl::<3, ENTRY_ABI_MIXED>(ctx)
+    // Admission is carried across the tail call: a successful tail call
+    // never returns here, so no leave runs before it; the continuation
+    // releases the carried admission, and fall-through leaves below.
+    if !stop_gate_enter() {
+        return 0;
+    }
+    let rc = p11_entry_impl::<3, ENTRY_ABI_MIXED>(ctx);
+    stop_gate_leave();
+    rc
 }
 
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 #[uprobe]
 pub fn p11_entry_template_second(ctx: ProbeContext) -> u32 {
+    // Carried admission: the pair program entered before the tail call and
+    // did not leave, so this continuation must not re-check the gate. It
+    // releases the carried admission on every exit instead.
+    let rc = p11_entry_template_second_impl(ctx);
+    stop_gate_leave();
+    rc
+}
+
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+#[inline(always)]
+fn p11_entry_template_second_impl(ctx: ProbeContext) -> u32 {
     let slot = slot_of(&ctx);
     let Some(flags) = scope_flags() else {
         return 0;
@@ -2482,6 +2577,17 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
 #[cfg(not(feature = "inventory-only"))]
 #[uretprobe]
 pub fn p11_return(ctx: RetProbeContext) -> u32 {
+    if !stop_gate_enter() {
+        return 0;
+    }
+    let rc = p11_return_impl(ctx);
+    stop_gate_leave();
+    rc
+}
+
+#[cfg(not(feature = "inventory-only"))]
+#[inline(always)]
+fn p11_return_impl(ctx: RetProbeContext) -> u32 {
     let slot = slot_of(&ctx);
     if slot >= MAX_SLOTS {
         return 0;

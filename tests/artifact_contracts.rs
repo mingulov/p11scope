@@ -4577,6 +4577,37 @@ fn frozen_policy_inventory_matches_embedded_object() {
     }
 }
 
+/// The static Detailed programs gate every capture access on the STOP_GATE
+/// admission discipline: a STOP_GATE relocation, a compare-exchange read
+/// before the first capture-map access, and a balancing decrement on every
+/// exit path. The template continuation carries admission across the tail
+/// call instead of re-checking. Under `unsafe-unvalidated-metadata` the
+/// embedded object is the diagnostic one.
+#[test]
+fn static_detailed_programs_honor_the_stop_gate() {
+    let directory = tempfile::tempdir().expect("temporary stop-gate object");
+    let object = directory.path().join("p11scope-ebpf");
+    fs::write(&object, p11scope::EBPF_OBJECT).expect("write embedded eBPF object");
+    let variant = if cfg!(feature = "unsafe-unvalidated-metadata") {
+        "unsafe"
+    } else {
+        "default"
+    };
+    let output = Command::new("python3")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .args(["-I", "tests/python/test_stop_gate_object.py", "--object"])
+        .arg(&object)
+        .args(["--variant", variant])
+        .output()
+        .expect("execute stop-gate object contracts");
+    assert!(
+        output.status.success(),
+        "stop-gate contracts: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn descriptor_cookie_and_consumers_source_guard_rejects_contract_regressions() {
     let attach = read("src/attach.rs");

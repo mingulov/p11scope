@@ -962,6 +962,49 @@ fn export_crash_between_stage_and_commit_replays_without_duplication() {
     assert_eq!(report.unaccounted, 1);
 }
 
+// Box 6: ordinary preflight math for the controller-owned live cells. Link,
+// FD, payload and segment budgets are pure arithmetic the controller
+// compares against the live host envelope before running privileged cells.
+#[test]
+fn capacity_preflight_budgets_for_t7_live_cells() {
+    use p11scope::capacity::{AttachCost, InventoryBudget};
+    for (n, links, payload) in [
+        (576u64, 578u64, 4608u64),
+        (1024, 1026, 8192),
+        (4097, 4099, 32776),
+        (6530, 6532, 52240),
+        (8192, 8194, 65536),
+    ] {
+        let cost = AttachCost::for_endpoints(n);
+        assert_eq!(cost.links, n);
+        assert_eq!(cost.program_loads, 2);
+        assert_eq!(cost.teardown_steps, 2 * n);
+        assert!(!cost.map_value_sharing_removes_link_cost);
+        assert_eq!(cost.links + 2, links, "N entry plus 2 lifecycle links");
+        assert_eq!(2 * cost.links, 2 * n, "paired Detailed probes");
+        let budget = InventoryBudget::new(n, 8 * n).expect("8N inventory payload");
+        assert_eq!(budget.payload_bytes(), payload);
+    }
+    // Segmented growth to the 6530 union: three full 2112 segments plus a
+    // 194 tail under one outer directory.
+    let spec = SegmentSpec {
+        kind: InnerMapKind::PerCpuArray,
+        key_bytes: 4,
+        value_bytes: 296,
+        max_entries: 2112,
+    };
+    let mut directory = SegmentDirectory::new(4).expect("directory");
+    for len in [2112, 2112, 2112, 194] {
+        directory.append(spec, len).expect("segment");
+    }
+    assert_eq!(directory.total_endpoints(), 6530);
+    let at_64 = directory.cost(64);
+    assert_eq!(at_64.fds, 5, "one outer plus one FD per inner map");
+    assert_eq!(at_64.per_cpu_payload_bytes, 6530 * 296 * 64);
+    assert_eq!(at_64.link_pairs, 6530);
+    assert_eq!(directory.cost(12).per_cpu_payload_bytes, 6530 * 296 * 12);
+}
+
 // Box 7: peak, current and retained are measured as separate dimensions.
 #[test]
 fn envelope_report_measures_peak_current_retained_separately() {

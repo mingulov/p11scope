@@ -5435,6 +5435,37 @@ inventory_sweep_test!(
     2049,
     "inventory-default-n2049"
 );
+// T7 (finish plan box 6): controller-owned live coverage at 576/1024/4097,
+// the 6530 motivating union, and the 8192 within-budget boundary. Inventory
+// N is profile-independent, so these run on the default profile only. Each
+// cell calls every admitted ID and requires the exact all-ID positive set;
+// the controller checks the FD/link preflight (ordinary T7 math test) first.
+#[cfg(not(feature = "wide-detailed-2112"))]
+inventory_sweep_test!(privileged_t7_inventory_n576_lp64, 576, "inventory-t7-n576");
+#[cfg(not(feature = "wide-detailed-2112"))]
+inventory_sweep_test!(
+    privileged_t7_inventory_n1024_lp64,
+    1024,
+    "inventory-t7-n1024"
+);
+#[cfg(not(feature = "wide-detailed-2112"))]
+inventory_sweep_test!(
+    privileged_t7_inventory_n4097_lp64,
+    4097,
+    "inventory-t7-n4097"
+);
+#[cfg(not(feature = "wide-detailed-2112"))]
+inventory_sweep_test!(
+    privileged_t7_inventory_n6530_lp64,
+    6530,
+    "inventory-t7-n6530"
+);
+#[cfg(not(feature = "wide-detailed-2112"))]
+inventory_sweep_test!(
+    privileged_t7_inventory_n8192_boundary_lp64,
+    8192,
+    "inventory-t7-n8192-boundary"
+);
 
 #[cfg(not(feature = "wide-detailed-2112"))]
 #[cfg(not(feature = "wide-detailed-2112"))]
@@ -6531,6 +6562,175 @@ detailed_sweep_test!(
     512,
     "detailed-default-n512"
 );
+
+// T7 (finish plan box 6): controller-owned live probe for a new RV key on an
+// already-hot endpoint. Slot 0 heats with RVs {0,5} while old slots 1..8
+// each take one call, then slot 0 takes a third RV. Profile-independent:
+// the exact key/STAT/event assertions hold under both RV map sizes.
+#[test]
+#[ignore = "root-owned BPF lane; third RV key on a hot Detailed slot with exact per-plane rows"]
+fn privileged_t7_detailed_hot_slot_third_rv_lp64() -> Result<()> {
+    const N: u32 = 8;
+    const HOT: u32 = 0;
+    eprintln!(
+        "TASK4_PROFILE name={} detailed_slots={} rv_keys={} hot_slot={HOT}",
+        if cfg!(feature = "wide-detailed-2112") {
+            "wide-detailed-2112"
+        } else {
+            "default"
+        },
+        p11scope_ebpf_common::MAX_SLOTS,
+        p11scope_ebpf_common::RV_ENTRIES
+    );
+    let fixture = OwnedFixture::build_n(false, N)?;
+    verify_task4_physical_slots(&fixture.plan.slots, N as usize)?;
+    task4_fixture_receipt(&fixture)?;
+    let plan =
+        AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::Detailed)
+            .map_err(anyhow::Error::msg)?;
+    let mut caller = fixture.spawn_gated()?;
+    let mut session = crate::attach::Session::start(
+        &plan,
+        &Scope::Pid(caller.child.id()),
+        &fixture.pins,
+        crate::attach::CapturePolicy::Allowlisted,
+        None,
+        None,
+        None,
+        crate::attach::BackendSelection::Singles,
+    )?;
+    ensure!(
+        session.attach_failures().is_empty() && session.attached_probes() == 2 * N as usize,
+        "hot-RV Detailed did not retain every paired static probe"
+    );
+    let map_max = |name| -> Result<u32> {
+        let map = session
+            .ebpf
+            .map(name)
+            .with_context(|| format!("{name} map"))?;
+        Ok(crate::attach::read_map_metadata(name, detailed_map_data(map)?)?.max_entries)
+    };
+    ensure!(
+        map_max("STATS")? == p11scope_ebpf_common::MAX_SLOTS
+            && map_max("RV_COUNTS")? == p11scope_ebpf_common::RV_ENTRIES
+            && map_max("START")? == 16_384,
+        "wrong loaded Detailed map bounds"
+    );
+    let ids = OwnedIds::detailed(&session)?;
+    let mut events = Vec::new();
+    drain_task4_detailed(&mut session, &mut events)?;
+    ensure!(events.is_empty(), "Detailed events preceded GO");
+    caller.go()?;
+    caller.call_exact(HOT, 0)?;
+    caller.call_exact(HOT, 5)?;
+    for id in 1..N {
+        caller.call_exact(id, 0)?;
+    }
+    caller.call_exact(HOT, 7)?;
+    drain_task4_detailed(&mut session, &mut events)?;
+    ensure!(
+        events.len() == (N + 2) as usize,
+        "hot-RV event count differs from the owned ledger"
+    );
+    let mut event_keys = BTreeMap::new();
+    for event in &events {
+        ensure!(event.slot < N, "foreign Detailed event");
+        *event_keys.entry((event.slot, event.rv)).or_insert(0u32) += 1;
+    }
+    for rv in [0u64, 5, 7] {
+        ensure!(
+            event_keys.get(&(HOT, rv)) == Some(&1),
+            "missing or doubled hot CALL slot {HOT} rv {rv}"
+        );
+    }
+    for id in 1..N {
+        ensure!(
+            event_keys.get(&(id, 0)) == Some(&1),
+            "missing or doubled old-cell CALL slot {id}"
+        );
+    }
+    let stats: PerCpuArray<_, SlotStats> =
+        PerCpuArray::try_from(session.ebpf.map("STATS").context("STATS")?)?;
+    let slot_total = |id: u32| -> Result<(u64, u64, u64)> {
+        let mut total = (0, 0, 0);
+        for cpu in stats.get(&id, 0)?.iter() {
+            total.0 += cpu.entered;
+            total.1 += cpu.returned;
+            total.2 += cpu.errors;
+        }
+        Ok(total)
+    };
+    ensure!(
+        slot_total(HOT)? == (3, 3, 2),
+        "hot slot raw STATS mismatch: {:?}",
+        slot_total(HOT)?
+    );
+    for id in 1..N {
+        ensure!(
+            slot_total(id)? == (1, 1, 0),
+            "old-cell slot {id} raw STATS mismatch: {:?}",
+            slot_total(id)?
+        );
+    }
+    let rvs: PerCpuHashMap<_, RvKey, u64> =
+        PerCpuHashMap::try_from(session.ebpf.map("RV_COUNTS").context("RV_COUNTS")?)?;
+    let mut seen = BTreeMap::new();
+    for entry in rvs.iter() {
+        let (key, counts) = entry?;
+        ensure!(
+            key.slot < N && key._pad == 0,
+            "foreign or malformed Detailed RV key"
+        );
+        ensure!(
+            seen.insert((key.slot, key.rv), counts.iter().sum::<u64>())
+                .is_none(),
+            "duplicate Detailed RV key"
+        );
+    }
+    ensure!(
+        seen.len() == (N + 2) as usize,
+        "hot-RV key cardinality differs: {}",
+        seen.len()
+    );
+    for rv in [0u64, 5, 7] {
+        ensure!(
+            seen.get(&(HOT, rv)) == Some(&1),
+            "hot slot RV key (0,{rv}) is not exactly once"
+        );
+    }
+    let starts: HashMap<_, StartKey, CallStart> =
+        HashMap::try_from(session.ebpf.map("START").context("START")?)?;
+    ensure!(
+        starts.iter().next().is_none(),
+        "Detailed START debt remains"
+    );
+    let owner: Array<_, ThreadOwnerControl> =
+        Array::try_from(session.ebpf.map("OWNER_CTL").context("OWNER_CTL")?)?;
+    ensure!(
+        crate::attach::owner_control_fields(owner.get(&0, 0)?)
+            == [THREAD_OWNER_LIMIT, 0, 0, 0, 0, 0, 0],
+        "Detailed owner debt or failure"
+    );
+    let terminal_evidence = crate::metrics::kernel_evidence(&session)?;
+    ensure!(
+        terminal_evidence == crate::metrics::KernelEvidence::default(),
+        "terminal Detailed kernel evidence changed: {terminal_evidence:?}"
+    );
+    let terminal_counters = session.counter_snapshot()?;
+    ensure!(
+        terminal_counters == crate::attach::CounterSnapshot::default(),
+        "terminal Detailed discovery loss changed"
+    );
+    let detached = session.detach_producers();
+    let clean_detach = session.detach_failures().is_empty();
+    drop(session);
+    ids.released_with_budget(Duration::from_secs(60))?;
+    caller.finish()?;
+    detached?;
+    ensure!(clean_detach, "Detailed detach retained failures");
+    eprintln!("T7_HOT_RV hot_slot={HOT} rvs=0,5,7 old_cells=1..{N} exact=true");
+    Ok(())
+}
 
 #[test]
 fn task4_detailed_physical_capacity_refusal() -> Result<()> {

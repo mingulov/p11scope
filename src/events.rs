@@ -179,6 +179,29 @@ pub(crate) enum BoundedRecord<T> {
     Reached,
 }
 
+/// A proven-Q bounded drain met an uncommitted (BUSY) record below the
+/// Q stop. Under a proven Q no admitted writer remains, so this is the
+/// ungated-writer signature. It carries the unread span, so committed
+/// records behind it are accounted, never silently lost.
+#[derive(Debug)]
+pub(crate) enum BoundedDrainError {
+    UngatedWriterBeforeQ { consumer: usize, stop: usize },
+}
+
+impl std::fmt::Display for BoundedDrainError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UngatedWriterBeforeQ { consumer, stop } => write!(
+                formatter,
+                "ungated writer before Q: consumer {consumer}, stop {stop} ({} bytes unread)",
+                stop.wrapping_sub(*consumer),
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BoundedDrainError {}
+
 /// Scheduling seam only. The native implementation delegates every byte read
 /// and discard to Aya's existing bounded parser.
 pub(crate) trait BoundedRecordSource: RecordSource {
@@ -554,7 +577,9 @@ pub(crate) fn event_drain_positions<S: BoundedRecordSource>(
 /// `post_q_record` when the producer has moved past `stop` — under a
 /// proven Q no admitted body remains, so that is an invariant violation
 /// (an ungated writer); `backlog` when the quantum ran out or the
-/// callback broke early, so the caller re-polls.
+/// callback broke early, so the caller re-polls. Fails with
+/// `BoundedDrainError::UngatedWriterBeforeQ` when an uncommitted (BUSY)
+/// record stands below `stop`: the other ungated-writer signature.
 pub(crate) fn poll_events_to_position<S: BoundedRecordSource>(
     drain: &mut EventDrain<S>,
     stop: usize,
@@ -595,7 +620,18 @@ pub(crate) fn poll_events_to_position<S: BoundedRecordSource>(
                 let post_q_record = drain.source.positions().producer != stop;
                 return Ok((post_q_record, false));
             }
-            BoundedRecord::Pending => return Ok((false, false)),
+            BoundedRecord::Pending => {
+                // Below the Q stop the producer must still hold data: it
+                // only advances, so it stands at or past the recorded stop.
+                // Pending is therefore necessarily a BUSY uncommitted
+                // record: the ungated-writer signature. At the stop the
+                // boundary is reached and clean.
+                let consumer = drain.source.consumer();
+                if consumer != stop {
+                    return Err(BoundedDrainError::UngatedWriterBeforeQ { consumer, stop }.into());
+                }
+                return Ok((false, false));
+            }
         }
     }
 }
@@ -771,7 +807,9 @@ pub(crate) fn discovery_drain_positions<S: BoundedRecordSource>(
 
 /// Drains one bounded discovery quantum up to the producer `stop`
 /// position read at Q, never consuming past it. Same
-/// `(post_q_record, backlog)` contract as the EVENTS drain.
+/// `(post_q_record, backlog)` contract as the EVENTS drain, including the
+/// `BoundedDrainError::UngatedWriterBeforeQ` failure on a BUSY record
+/// below `stop`.
 pub(crate) fn poll_discovery_to_position<S: BoundedRecordSource>(
     drain: &mut DiscoveryDrain<S>,
     stop: usize,
@@ -810,7 +848,18 @@ pub(crate) fn poll_discovery_to_position<S: BoundedRecordSource>(
                 let post_q_record = drain.source.positions().producer != stop;
                 return Ok((post_q_record, false));
             }
-            BoundedRecord::Pending => return Ok((false, false)),
+            BoundedRecord::Pending => {
+                // Below the Q stop the producer must still hold data: it
+                // only advances, so it stands at or past the recorded stop.
+                // Pending is therefore necessarily a BUSY uncommitted
+                // record: the ungated-writer signature. At the stop the
+                // boundary is reached and clean.
+                let consumer = drain.source.consumer();
+                if consumer != stop {
+                    return Err(BoundedDrainError::UngatedWriterBeforeQ { consumer, stop }.into());
+                }
+                return Ok((false, false));
+            }
         }
     }
 }

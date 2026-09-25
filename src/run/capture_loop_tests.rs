@@ -1557,6 +1557,123 @@ fn bounded_drain_maps_a_crossed_stop_to_post_q_record() {
     }
 }
 
+/// I2: a BUSY (uncommitted) record below the Q stop is the ungated-writer
+/// signature: the proven-Q drains must surface it as a named violation,
+/// not report clean. The scripted source yields Pending exactly when its
+/// queue runs dry below stop, like the ring reader facing BUSY; the stop
+/// one record past the script is the producer position Q recorded. The
+/// committed record ahead of BUSY still reaches the callback, and the
+/// error carries the unread span so nothing is silently lost.
+#[test]
+fn quiesced_drain_names_a_busy_record_below_q() {
+    use crate::events::{BoundedRecordSource as _, DiscoveryDrain, DiscoveryItem};
+    use std::ops::ControlFlow;
+
+    let events_script = ScriptedRecords::events([open_event(1)], usize::MAX);
+    let events_q = events_script.positions().producer + 8;
+    let mut events_drain = EventDrain::over_test_domain(events_script, 1);
+    let mut events_seen = 0;
+    let events = crate::events::poll_events_to_position(
+        &mut events_drain,
+        events_q,
+        Some(crate::events::TERMINAL_DRAIN_BOUND),
+        |_| {
+            events_seen += 1;
+            ControlFlow::Continue(())
+        },
+    );
+    let discovery_script = ScriptedRecords::records([discovery_bytes(11)], usize::MAX);
+    let discovery_q = discovery_script.positions().producer + 8;
+    let mut discovery_drain = DiscoveryDrain::over(discovery_script);
+    let mut discovery_seen = 0;
+    let discovery = crate::events::poll_discovery_to_position(
+        &mut discovery_drain,
+        discovery_q,
+        Some(crate::events::TERMINAL_DRAIN_BOUND),
+        |item| {
+            assert!(matches!(item, DiscoveryItem::Record(_)));
+            discovery_seen += 1;
+            ControlFlow::Continue(())
+        },
+    );
+    for (site, result) in [("events", events), ("discovery", discovery)] {
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains("ungated writer before Q"),
+            "{site}: expected the named violation, got: {message}"
+        );
+        assert!(
+            message.contains("consumer 8") && message.contains("stop 16"),
+            "{site}: the unread span must be accounted, got: {message}"
+        );
+    }
+    assert_eq!(
+        events_seen, 1,
+        "the committed record ahead of BUSY is still delivered"
+    );
+    assert_eq!(
+        discovery_seen, 1,
+        "the committed record ahead of BUSY is still delivered"
+    );
+}
+
+/// A bounded source standing exactly at its stop that still reports
+/// Pending: impossible from the ring reader (it reports Reached first),
+/// pinned here so the at-Q boundary keeps its clean meaning.
+struct PendingAtStop;
+
+impl crate::events::RecordSource for PendingAtStop {
+    fn next_record(&mut self) -> Option<impl std::ops::Deref<Target = [u8]> + '_> {
+        None::<&[u8]>
+    }
+}
+
+impl crate::events::BoundedRecordSource for PendingAtStop {
+    fn positions(&self) -> aya::maps::ring_buf::RingBufPositions {
+        aya::maps::ring_buf::RingBufPositions {
+            consumer: 16,
+            producer: 16,
+            capacity: 4096,
+        }
+    }
+    fn consumer(&self) -> usize {
+        16
+    }
+    fn bounded_record(
+        &mut self,
+        stop: usize,
+    ) -> Result<crate::events::BoundedRecord<impl std::ops::Deref<Target = [u8]> + '_>> {
+        if stop == usize::MAX {
+            // Unreachable: names the hidden item type for the always-pending body.
+            return Ok(crate::events::BoundedRecord::Item(&[][..]));
+        }
+        assert_eq!(stop, 16);
+        Ok(crate::events::BoundedRecord::Pending)
+    }
+}
+
+#[test]
+fn quiesced_drain_at_q_pending_stays_clean() {
+    use std::ops::ControlFlow;
+
+    let mut events_drain = EventDrain::over_test_domain(PendingAtStop, 1);
+    assert_eq!(
+        crate::events::poll_events_to_position(&mut events_drain, 16, Some(64), |_| {
+            ControlFlow::Continue(())
+        })
+        .unwrap(),
+        (false, false)
+    );
+    let mut discovery_drain = crate::events::DiscoveryDrain::over(PendingAtStop);
+    assert_eq!(
+        crate::events::poll_discovery_to_position(&mut discovery_drain, 16, Some(64), |_| {
+            ControlFlow::Continue(())
+        })
+        .unwrap(),
+        (false, false)
+    );
+}
+
 #[test]
 fn quiesced_profile_drain_reduces_pre_q_events_and_excludes_post_q_writes() {
     use crate::events::BoundedRecordSource as _;

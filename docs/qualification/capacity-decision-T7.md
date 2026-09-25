@@ -112,13 +112,47 @@ seam `TicketPolicy::control_image` / `validate_control`.
 
 ### Static pins (ordinary)
 
-- Aya 0.14.0 (pinned, `Cargo.lock`) ships map-in-map loader support:
-  `aya::maps::{ArrayOfMaps, HashOfMaps}`. Userspace can populate an outer
-  map with compatible inners created later (kernel map-in-map docs); array
-  size stays fixed at creation with per-CPU values per possible CPU.
+- Kernels pinned (both ends of the supported range): 5.15
+  (`5.15.221-0515221-generic`, plus Ubuntu `5.15.0-187-generic`) and
+  current (`7.2.6-070206-generic`). Live matrix evidence
+  (`sg-matrix-90b44ff` r1+r2 in the controller's vng cache) is in
+  progress and NOT stable: r1 ran 5.15.221 + 6.1/6.6/6.9/6.12/7.2.6
+  green on the stop-gate cells but infra-failed the Ubuntu 5.15.0-187
+  pair; r2 has re-run 187 green with a large-only cell still running.
+  No live segment verdict is claimed from it here — live pins stay
+  pending, owner L-T7-8 (load + verifier logs) / L-T7-9 (cost deltas).
+- Map-in-map UAPI + loader refs (verified ordinary):
+  - Kernel: `BPF_MAP_TYPE_ARRAY_OF_MAPS` /
+    `BPF_MAP_TYPE_HASH_OF_MAPS` (`/usr/include/linux/bpf.h`, beside
+    `BPF_MAP_TYPE_PERCPU_ARRAY` / `BPF_MAP_TYPE_PERCPU_HASH`). The
+    kernel checks inner compat as kind + key/value shape — implemented
+    as `SegmentSpec::compatible_with` (`max_entries` may differ);
+    array size stays fixed at creation with per-CPU values per
+    possible CPU.
+  - Aya 0.14.0 (pinned, `Cargo.lock`):
+    `aya::maps::{ArrayOfMaps, HashOfMaps}`
+    (`src/maps/of_maps/{array,hash_map}.rs`, re-exported at
+    `src/maps/mod.rs:104`). Asymmetric API the live loader must
+    honor: an outer update takes the inner map FD, but an outer
+    lookup returns the inner map ID (Aya converts ID→FD via
+    `map_from_id`).
+- Verifier notes (static; logs owed live by L-T7-8): every segmented op
+  is two lookups — outer (segment routing) then inner (per-CPU payload)
+  — modeled as 1+1 in `SegmentCost`, with static `inner_creations` /
+  `outer_publications` counts (one each per appended segment). Lookup
+  latency and publication syscall deltas stay live-only under L-T7-9.
+  Per-CPU inners must agree on key/value width across segments; value
+  bytes scale with possible CPUs (the 6530 payload math below).
+- 5.15 high-slot cleanup equivalent: the existing per-map worker-exit
+  cleanup (`privileged_task4_highslot_2048_worker_exit`, green in the
+  matrix on both 5.15 and current kernels) must be re-proven once per
+  inner map — each segment's inner needs its own cleanup sweep, and the
+  outer shedding an inner must not strand that inner's in-flight exits.
+  Owed live (L-T7-8).
 - Cost model (`SegmentDirectory::cost`, tested): +1 outer lookup per op,
   1 outer FD + 1 FD per inner, per-CPU payload = Σ len·value·CPUs, links
-  unchanged per endpoint. For the 6530 union as 2112+2112+2112+194:
+  unchanged per endpoint, static allocation/publication counts. For the
+  6530 union as 2112+2112+2112+194:
   5 FDs, payload 6,530·296·64 = 123,704,320 B (~118 MiB) at 64 possible
   CPUs, 23,194,560 B (~22 MiB) at 12 CPUs. Segments solve *growth*
   (additive capacity without touching live maps), not bytes: the dense

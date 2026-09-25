@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Background link cleanup after publication (stop-gate Task 5).
 //!
 //! After the report is published, the session moves its links out of Aya

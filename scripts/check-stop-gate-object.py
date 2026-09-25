@@ -15,7 +15,11 @@ object must prove the admission discipline:
   by walking the program's control-flow graph. The deny exit of
   ``stop_gate_enter`` carries no increment, so it must carry no
   decrement either: every exit must be balanced, and every capture
-  access must be inside admission.
+  access must be inside admission. The one exception is the leave's
+  own null check (the 5.15 verifier rejects an unchecked STOP_GATE
+  dereference): an admitted exit is excused only along the null edge
+  of a null check on the gate-cell pointer whose sibling path still
+  holds the decrement, so removing the decrement fails the proof.
 
 The continuations (``p11_entry_template_second`` after the template
 pair, ``interface_list_worker`` after ``interface_list_return`` and
@@ -97,6 +101,8 @@ PROGRAM_SECTIONS = (
     "tp_btf/task_newtask",
 )
 GATE_ADD = re.compile(r"lock \*\(u(32|64) \*\)\(r(\d+) ([+-]) 0x([0-9a-f]+)\) \+= (\S+)")
+GATE_NULL_EQ = re.compile(r"if r(\d+) == 0x0 goto \+0x([0-9a-f]+)")
+GATE_NULL_NE = re.compile(r"if r(\d+) != 0x0 goto \+0x([0-9a-f]+)")
 GATE_CAS = re.compile(r"r(\d+) = cmpxchg_(32|64)\(r(\d+) ([+-]) 0x([0-9a-f]+), r(\d+), r(\d+)\)")
 GATE_REGISTER = re.compile(r"r(\d+)")
 # The raw bytes lead the entry text; the last byte is followed by a tab,
@@ -152,6 +158,7 @@ class GateAnalysis:
         self.cas_sites, self.inc_sites, self.dec_sites = set(), set(), set()
         self.tail_sites = set()
         self.capture_sites = set()
+        self.leave_guards = {}
 
     def label(self, pc=None):
         base = f"{self.section}:{self.name}"
@@ -324,6 +331,80 @@ class GateAnalysis:
             if target.startswith(NATIVE_CALL_PREFIX):
                 self.capture_sites.add(pc)
 
+    def straight_dec(self, start):
+        """The decrement reached from `start` by straight-line code, if any.
+
+        Follows single-successor edges at most two steps (the delta load
+        plus the atomic itself, or an immediate-form atomic at `start`).
+        The skipped stretch must hold nothing but the decrement: no
+        capture, increment, CAS, or tail call hides inside a null skip.
+        """
+        current, steps = start, 0
+        while steps <= 2:
+            if current in self.dec_sites:
+                return current
+            if (
+                current in self.inc_sites
+                or current in self.cas_sites
+                or current in self.capture_sites
+                or current in self.tail_sites
+            ):
+                return None
+            successors = self.consumer.graph.get(current, ())
+            if len(successors) != 1:
+                return None
+            current, steps = successors[0], steps + 1
+        return None
+
+    def classify_leave_guards(self):
+        """Null checks whose sibling path holds the leave decrement.
+
+        The 5.15 verifier rejects an unchecked STOP_GATE dereference, so
+        every leave guards its lookup and the null edge skips the
+        decrement. Two codegen shapes occur: `if rX == 0 goto` over the
+        [delta load, decrement] pair rejoining right after it, and the
+        inverted `if rX != 0 goto` forward to the decrement with the
+        decrement path rejoining the fall-through. A guard excuses an
+        admitted exit only along its null edge, and only while the
+        decrement stays present on the sibling path: removing the
+        decrement dissolves the guard and the balance proof fails.
+        """
+        for pc, text in self.consumer.insns:
+            match = GATE_NULL_EQ.fullmatch(text)
+            null_is_taken = True
+            if match is None:
+                match = GATE_NULL_NE.fullmatch(text)
+                null_is_taken = False
+            if match is None:
+                continue
+            register, offset = match.groups()
+            if not self.is_gate_cell(pc, register):
+                continue
+            target = pc + 1 + int(offset, 16)
+            if null_is_taken:
+                null_edge, sibling = target, pc + 1
+            else:
+                null_edge, sibling = pc + 1, target
+            dec = self.straight_dec(sibling)
+            if dec is None:
+                continue
+            if null_is_taken:
+                if null_edge != dec + 1:
+                    continue
+            else:
+                current, rejoined = dec, False
+                for _ in range(2):
+                    successors = self.consumer.graph.get(current, ())
+                    if len(successors) != 1:
+                        break
+                    current = successors[0]
+                    if current == null_edge:
+                        rejoined = True
+                        break
+                if not rejoined:
+                    continue
+            self.leave_guards[pc] = null_edge
+
     def walk(self, initial, transition, violation):
         """Walk every (instruction, flag) state; the first violation raises."""
         consumer = self.consumer
@@ -337,10 +418,10 @@ class GateAnalysis:
             message = violation(pc, flag)
             if message is not None:
                 raise RuntimeError(self.label(pc) + ": " + message)
-            flag = transition(pc, flag)
-            pending.extend((successor, flag) for successor in consumer.graph[pc])
+            for successor in consumer.graph[pc]:
+                pending.append((successor, transition(pc, flag, successor)))
 
-    def admission(self, pc, admitted):
+    def admission(self, pc, admitted, successor):
         if pc in self.inc_sites:
             return True
         if pc in self.dec_sites:
@@ -355,7 +436,7 @@ class GateAnalysis:
                 return "decrement before the tail call drops the carried admission"
             return None
 
-        self.walk(False, lambda pc, seen: seen or pc in self.dec_sites, leaked)
+        self.walk(False, lambda pc, seen, successor: seen or pc in self.dec_sites, leaked)
 
         def unadmitted(pc, admitted):
             if pc in self.tail_sites and not admitted:
@@ -382,7 +463,7 @@ class GateAnalysis:
                 return "capture-map access before the gate CAS read"
             return None
 
-        self.walk(False, lambda pc, seen: seen or pc in self.cas_sites, early)
+        self.walk(False, lambda pc, seen, successor: seen or pc in self.cas_sites, early)
 
     def check_balance(self):
         exits = {
@@ -390,19 +471,32 @@ class GateAnalysis:
         }
         require(exits, self.label() + ": program has no exit")
 
-        def unbalanced(pc, admitted):
-            if pc in self.capture_sites and not admitted:
+        def transition(pc, flag, successor):
+            admitted, _excused = flag
+            if pc in self.inc_sites:
+                return (True, False)
+            if pc in self.dec_sites:
+                return (False, False)
+            if self.leave_guards.get(pc) == successor:
+                return (admitted, True)
+            return flag
+
+        def unbalanced(pc, flag):
+            admitted, excused = flag
+            if pc in self.capture_sites and (not admitted or excused):
                 return "capture-map access outside admission"
-            if pc in exits and admitted:
+            if pc in exits and admitted and not excused:
                 return "exit without a balancing decrement"
             return None
 
-        self.walk(self.role in (LEAVE_ONLY, LEAVE_TAIL), self.admission, unbalanced)
+        initial = (self.role in (LEAVE_ONLY, LEAVE_TAIL), False)
+        self.walk(initial, transition, unbalanced)
 
     def classify(self):
         self.check_relocation()
         self.classify_atomics()
         self.classify_calls()
+        self.classify_leave_guards()
         return self
 
     def check(self):

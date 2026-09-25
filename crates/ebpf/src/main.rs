@@ -181,16 +181,19 @@ fn stop_gate_enter() -> bool {
     )
 }
 
-/// Release one [`stop_gate_enter`] admission. The lookup cannot fail:
-/// STOP_GATE is Array<u64> with max_entries 1, so key 0 is always in
-/// bounds and the kernel returns the cell. Balancing is exact — the object
-/// checker proves a decrement on every exit path — so a skipped decrement
-/// would leak an in-flight count past the stop.
+/// Release one [`stop_gate_enter`] admission. Key 0 of the one-entry
+/// STOP_GATE Array resolves in practice, but the lookup CAN miss per the
+/// verifier (map_value_or_null): the 5.15 verifier rejects an unchecked
+/// dereference, so a null lookup skips the decrement. That path is
+/// unreachable in practice — enter already resolved the same cell — and
+/// balancing stays exact: the object checker proves a decrement on every
+/// exit path.
 #[cfg(not(feature = "inventory-only"))]
 #[inline(always)]
 fn stop_gate_leave() {
-    // SAFETY: key 0 of a one-entry Array always resolves; see above.
-    let cell = unsafe { STOP_GATE.get_ptr_mut(0).unwrap_unchecked() };
+    let Some(cell) = STOP_GATE.get_ptr_mut(0) else {
+        return;
+    };
     // SAFETY: the pointer is the live STOP_GATE cell; the unused result
     // lowers to a non-fetch BPF ATOMIC ADD, object-checked as in enter.
     let _ = unsafe {

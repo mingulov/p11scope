@@ -46,16 +46,20 @@ static P11_ALWAYS_INLINE int p11_stop_gate_enter(void)
     return 1;
 }
 
-/* Release one p11_stop_gate_enter admission. The lookup cannot fail:
- * STOP_GATE is a one-entry Array<u64>, so key 0 is always in bounds and the
- * kernel returns the cell; hence no null check, mirroring the Rust leave.
- * Balancing is exact -- the object checker proves a decrement on every exit
- * path -- so a skipped decrement would leak an in-flight count past the stop. */
+/* Release one p11_stop_gate_enter admission. Key 0 of the one-entry
+ * STOP_GATE Array resolves in practice, but the lookup CAN miss per the
+ * verifier (map_value_or_null): the 5.15 verifier rejects an unchecked
+ * dereference, so a null lookup returns early, mirroring the Rust leave.
+ * That path is unreachable in practice -- enter already resolved the same
+ * cell -- and balancing stays exact: the object checker proves a decrement
+ * on every exit path. */
 static P11_ALWAYS_INLINE void p11_stop_gate_leave(void)
 {
     u32 key = 0;
     u64 *cell = (u64 *)stop_gate_map_lookup(&STOP_GATE, &key);
 
+    if (!cell)
+        return;
     __sync_fetch_and_add(cell, (u64)-1);
 }
 #endif

@@ -14780,6 +14780,9 @@ impl Engine {
     /// Drains one discovery quantum after a failed producer detach. The exact
     /// prefix is applied without admitting new static or dynamic producers;
     /// any remaining records stay queued for bounded terminal evidence.
+    /// Test-only since quiesce-then-publish detached after publication: the
+    /// terminal drain takes the full or Q-bounded path instead.
+    #[cfg(test)]
     pub(crate) fn drain_discovery_terminal_bounded_from(
         &mut self,
         session: &mut dyn EngineSession,
@@ -14815,6 +14818,62 @@ impl Engine {
             return Err(failure);
         }
         Ok(outcome.changed)
+    }
+
+    /// Applies discovery records staged during stop-gate quiescence: the
+    /// exact prefix, without admitting new producers. Follow-up collects
+    /// drain the ring as today; anything they take is pre-Q (or the
+    /// terminal Q-drain flags it).
+    pub(crate) fn apply_quiesced_discovery(
+        &mut self,
+        session: &mut dyn EngineSession,
+        records: Vec<DiscoveryRecord>,
+        malformed: u64,
+    ) -> Result<bool> {
+        let mut collect = Self::collect_discovery_records;
+        Ok(self
+            .apply_discovery_batch_with(
+                session,
+                records,
+                malformed,
+                false,
+                false,
+                &mut collect,
+                None,
+            )?
+            .changed)
+    }
+
+    /// Drains the discovery ring to the producer `stop` position read at
+    /// Q, in bounded quanta, applying each exact prefix without admitting
+    /// producers. Sets `post_q_record` when the producer moved past `stop` —
+    /// the post-Q invariant violation.
+    pub(crate) fn drain_discovery_terminal_to_position(
+        &mut self,
+        session: &mut Session,
+        stop: usize,
+        post_q_record: &mut bool,
+    ) -> Result<bool> {
+        let mut changed = false;
+        let mut collect = Self::collect_discovery_records;
+        loop {
+            let (records, malformed, post_q, backlog) =
+                session.collect_discovery_to_position(stop, LIVE_DISCOVERY_DRAIN_QUANTUM)?;
+            *post_q_record |= post_q;
+            let outcome = self.apply_discovery_batch_with(
+                session,
+                records,
+                malformed,
+                false,
+                false,
+                &mut collect,
+                None,
+            )?;
+            changed |= outcome.changed;
+            if !backlog {
+                return Ok(changed);
+            }
+        }
     }
 
     pub(crate) fn drain_discovery_terminal_from(

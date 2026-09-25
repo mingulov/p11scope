@@ -2488,8 +2488,6 @@ impl Session {
     }
 
     /// The session's stop-gate mapping.
-    // A later stop-gate task drives userspace stop.
-    #[allow(dead_code)]
     pub(crate) fn stop_gate(&self) -> &StopGate {
         &self.stop_gate
     }
@@ -3544,6 +3542,116 @@ impl Session {
             .as_mut()
             .context("retained DISCOVERY consumer vanished after creation")?
             .dequeue())
+    }
+
+    fn ensure_events_consumer(&mut self) -> Result<()> {
+        if self.events_consumer.is_none() {
+            let consumer = events::OwnedDrain::for_session(&self.ebpf, &self.events_domain)?;
+            self.events_consumer = Some(consumer);
+        }
+        Ok(())
+    }
+
+    fn ensure_discovery_consumer(&mut self) -> Result<()> {
+        if self.discovery_consumer.is_none() {
+            let consumer =
+                events::OwnedDiscoveryDrain::for_session(&self.ebpf, &self.discovery_domain)?;
+            self.discovery_consumer = Some(consumer);
+        }
+        Ok(())
+    }
+
+    /// Polls the stop gate for quiescence for up to `budget`, servicing
+    /// the EVENTS/DISCOVERY drains between polls. The caller requests the
+    /// stop first (immediately, before the stop marker); `None` for
+    /// `service_events` skips the EVENTS consumer entirely (`--mode
+    /// metrics` never drains that ring). Field-split borrows keep the
+    /// gate shared while the service closures drain through the two
+    /// retained consumers.
+    pub(crate) fn quiesce_terminal(
+        &mut self,
+        budget: std::time::Duration,
+        mut service_events: Option<impl FnMut(&mut events::OwnedDrain)>,
+        mut service_discovery: impl FnMut(&mut events::OwnedDiscoveryDrain),
+        now: impl FnMut() -> std::time::Instant,
+    ) -> Result<crate::run::StopState> {
+        if service_events.is_some() {
+            self.ensure_events_consumer()?;
+        }
+        self.ensure_discovery_consumer()?;
+        let gate = &self.stop_gate;
+        let mut events = self.events_consumer.as_mut();
+        let discovery = self
+            .discovery_consumer
+            .as_mut()
+            .context("retained DISCOVERY consumer vanished after creation")?;
+        Ok(crate::run::quiesce_with(
+            gate,
+            budget,
+            || {
+                if let Some(service) = service_events.as_mut() {
+                    service(
+                        events
+                            .as_deref_mut()
+                            .expect("EVENTS service without an EVENTS consumer"),
+                    );
+                }
+                service_discovery(&mut *discovery);
+            },
+            now,
+        ))
+    }
+
+    /// The EVENTS ring's current positions, for reading the Q stop
+    /// position after quiescence is proven.
+    pub(crate) fn event_drain_positions(
+        &mut self,
+    ) -> Result<aya::maps::ring_buf::RingBufPositions> {
+        self.ensure_events_consumer()?;
+        Ok(events::event_drain_positions(
+            self.events_consumer
+                .as_ref()
+                .context("retained EVENTS consumer vanished after creation")?,
+        ))
+    }
+
+    /// The DISCOVERY ring's current positions, for reading the Q stop
+    /// position after quiescence is proven.
+    pub(crate) fn discovery_positions(&mut self) -> Result<aya::maps::ring_buf::RingBufPositions> {
+        self.ensure_discovery_consumer()?;
+        Ok(events::discovery_drain_positions(
+            self.discovery_consumer
+                .as_ref()
+                .context("retained DISCOVERY consumer vanished after creation")?,
+        ))
+    }
+
+    /// One DISCOVERY quantum bounded by the Q `stop` position: the
+    /// collected records, the malformed count, and the
+    /// `(post_q_record, backlog)` contract of the bounded drains.
+    pub(crate) fn collect_discovery_to_position(
+        &mut self,
+        stop: usize,
+        quantum: usize,
+    ) -> Result<(Vec<p11scope_ebpf_common::DiscoveryRecord>, u64, bool, bool)> {
+        self.ensure_discovery_consumer()?;
+        let consumer = self
+            .discovery_consumer
+            .as_mut()
+            .context("retained DISCOVERY consumer vanished after creation")?;
+        let mut records = Vec::new();
+        let mut malformed = 0u64;
+        let (post_q_record, backlog) =
+            events::poll_discovery_to_position(consumer, stop, Some(quantum), |item| {
+                match item {
+                    events::DiscoveryItem::Record(record) => records.push(record),
+                    events::DiscoveryItem::Malformed => {
+                        malformed = malformed.saturating_add(1);
+                    }
+                }
+                std::ops::ControlFlow::Continue(())
+            })?;
+        Ok((records, malformed, post_q_record, backlog))
     }
 
     #[allow(dead_code)] // Task 8 drives the Task 7 pause coordinator.

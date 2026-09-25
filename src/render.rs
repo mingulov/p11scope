@@ -1693,7 +1693,7 @@ pub fn profile_json(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use p11scope_ebpf_common::{LATENCY_BUCKETS, shape};
 
@@ -1743,7 +1743,7 @@ mod tests {
         }
     }
 
-    fn evidence() -> Evidence {
+    pub(crate) fn evidence() -> Evidence {
         Evidence {
             table_entries: 68,
             slots: 68,

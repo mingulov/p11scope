@@ -527,6 +527,79 @@ impl<S: RecordSource> EventDrain<S> {
     }
 }
 
+/// Maps a bounded-read failure to the post-Q flag: `BoundaryOutOfRange`
+/// means the consumer already stands past `stop`, so records past the Q
+/// positions existed and the producer moved after Q — the post-Q
+/// invariant violation (an unbounded terminal consumer, such as the
+/// root tail or a loader drain, already took them). Any other failure
+/// is genuine and propagates.
+fn map_bounded_error(error: anyhow::Error) -> Result<bool> {
+    match error.downcast::<aya::maps::ring_buf::RingBufBoundaryError>() {
+        Ok(aya::maps::ring_buf::RingBufBoundaryError::BoundaryOutOfRange { .. }) => Ok(true),
+        Ok(invalid) => Err(invalid.into()),
+        Err(error) => Err(error),
+    }
+}
+
+/// The EVENTS ring's current producer/consumer positions, for reading
+/// the Q stop positions after quiescence is proven.
+pub(crate) fn event_drain_positions<S: BoundedRecordSource>(
+    drain: &EventDrain<S>,
+) -> aya::maps::ring_buf::RingBufPositions {
+    drain.source.positions()
+}
+
+/// Drains one bounded EVENTS quantum up to the producer `stop` position
+/// read at Q, never consuming past it. Returns `(post_q_record, backlog)`:
+/// `post_q_record` when the producer has moved past `stop` — under a
+/// proven Q no admitted body remains, so that is an invariant violation
+/// (an ungated writer); `backlog` when the quantum ran out or the
+/// callback broke early, so the caller re-polls.
+pub(crate) fn poll_events_to_position<S: BoundedRecordSource>(
+    drain: &mut EventDrain<S>,
+    stop: usize,
+    quantum: Option<usize>,
+    mut f: impl FnMut(Event) -> ControlFlow<()>,
+) -> Result<(bool, bool)> {
+    let mut left = quantum;
+    loop {
+        if left == Some(0) {
+            return Ok((false, true));
+        }
+        // Decode to an owned event first: matching the borrowed item
+        // directly keeps the source borrow alive across the match,
+        // blocking the post-Reached positions read below.
+        let record: BoundedRecord<Option<Event>> = match drain.source.bounded_record(stop) {
+            Ok(bounded) => match bounded {
+                BoundedRecord::Item(item) => BoundedRecord::Item(decode(&item)),
+                BoundedRecord::Reached => BoundedRecord::Reached,
+                BoundedRecord::Pending => BoundedRecord::Pending,
+            },
+            Err(error) => return Ok((map_bounded_error(error)?, false)),
+        };
+        match record {
+            BoundedRecord::Item(event) => {
+                if let Some(left) = left.as_mut() {
+                    *left -= 1;
+                }
+                match event {
+                    Some(event) => {
+                        if f(event).is_break() {
+                            return Ok((false, true));
+                        }
+                    }
+                    None => drain.malformed = drain.malformed.saturating_add(1),
+                }
+            }
+            BoundedRecord::Reached => {
+                let post_q_record = drain.source.positions().producer != stop;
+                return Ok((post_q_record, false));
+            }
+            BoundedRecord::Pending => return Ok((false, false)),
+        }
+    }
+}
+
 /// A ring standing in for the live one: it hands out the scripted records
 /// and fails the test outright once a poll takes one more than `bound`, so a
 /// missing quantum is a panic on a finite script, never a hang.
@@ -568,6 +641,50 @@ impl RecordSource for ScriptedRecords {
             self.bound
         );
         Some(item)
+    }
+}
+
+#[cfg(test)]
+impl ScriptedRecords {
+    /// A record committed after the script was fixed: advances the producer
+    /// past any position observed before the push, like a post-Q write.
+    pub(crate) fn push_event(&mut self, event: &Event) {
+        self.queue.push_back(event_bytes(event));
+    }
+}
+
+#[cfg(test)]
+impl BoundedRecordSource for ScriptedRecords {
+    fn positions(&self) -> aya::maps::ring_buf::RingBufPositions {
+        aya::maps::ring_buf::RingBufPositions {
+            consumer: self.taken * 8,
+            producer: (self.taken + self.queue.len()) * 8,
+            capacity: 4096,
+        }
+    }
+    fn consumer(&self) -> usize {
+        self.taken * 8
+    }
+    fn bounded_record(
+        &mut self,
+        stop: usize,
+    ) -> Result<BoundedRecord<impl Deref<Target = [u8]> + '_>> {
+        if self.taken * 8 == stop {
+            return Ok(BoundedRecord::Reached);
+        }
+        match self.queue.pop_front() {
+            Some(item) => {
+                self.taken += 1;
+                assert!(
+                    self.taken <= self.bound,
+                    "the poll took record {} past its bound of {}",
+                    self.taken,
+                    self.bound
+                );
+                Ok(BoundedRecord::Item(item))
+            }
+            None => Ok(BoundedRecord::Pending),
+        }
     }
 }
 
@@ -640,6 +757,60 @@ impl<S: RecordSource> DiscoveryDrain<S> {
         match decode_discovery(&item) {
             Some(record) => Some(DiscoveryItem::Record(record)),
             None => Some(DiscoveryItem::Malformed),
+        }
+    }
+}
+
+/// The DISCOVERY ring's current producer/consumer positions, for reading
+/// the Q stop positions after quiescence is proven.
+pub(crate) fn discovery_drain_positions<S: BoundedRecordSource>(
+    drain: &DiscoveryDrain<S>,
+) -> aya::maps::ring_buf::RingBufPositions {
+    drain.source.positions()
+}
+
+/// Drains one bounded discovery quantum up to the producer `stop`
+/// position read at Q, never consuming past it. Same
+/// `(post_q_record, backlog)` contract as the EVENTS drain.
+pub(crate) fn poll_discovery_to_position<S: BoundedRecordSource>(
+    drain: &mut DiscoveryDrain<S>,
+    stop: usize,
+    quantum: Option<usize>,
+    mut f: impl FnMut(DiscoveryItem) -> ControlFlow<()>,
+) -> Result<(bool, bool)> {
+    let mut left = quantum;
+    loop {
+        if left == Some(0) {
+            return Ok((false, true));
+        }
+        // Decode to an owned item first: matching the borrowed item
+        // directly keeps the source borrow alive across the match,
+        // blocking the post-Reached positions read below.
+        let record: BoundedRecord<DiscoveryItem> = match drain.source.bounded_record(stop) {
+            Ok(bounded) => match bounded {
+                BoundedRecord::Item(item) => BoundedRecord::Item(match decode_discovery(&item) {
+                    Some(record) => DiscoveryItem::Record(record),
+                    None => DiscoveryItem::Malformed,
+                }),
+                BoundedRecord::Reached => BoundedRecord::Reached,
+                BoundedRecord::Pending => BoundedRecord::Pending,
+            },
+            Err(error) => return Ok((map_bounded_error(error)?, false)),
+        };
+        match record {
+            BoundedRecord::Item(item) => {
+                if let Some(left) = left.as_mut() {
+                    *left -= 1;
+                }
+                if f(item).is_break() {
+                    return Ok((false, true));
+                }
+            }
+            BoundedRecord::Reached => {
+                let post_q_record = drain.source.positions().producer != stop;
+                return Ok((post_q_record, false));
+            }
+            BoundedRecord::Pending => return Ok((false, false)),
         }
     }
 }

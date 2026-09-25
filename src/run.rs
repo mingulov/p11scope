@@ -3481,6 +3481,97 @@ fn capture_tick_with<'state, C, T>(
     Ok(CaptureTick::Continue { paused, snapshot })
 }
 
+/// Stop-gate quiescence state for the Detailed terminal path: the capture
+/// runs, requests the stop, then either observes quiescence (Q) or exhausts
+/// its owner budget without proof.
+#[allow(dead_code)] // Running/StopRequested name the pre-poll phases for later stop-gate tasks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StopState {
+    Running,
+    StopRequested,
+    Quiesced { at: Instant },
+    QuiescenceUnproven { waited: Duration },
+}
+
+/// The userspace stop-gate surface `quiesce_with` drives, so ordinary tests
+/// run the same code against a scripted fake.
+pub(crate) trait StopGateLike {
+    fn request_stop(&self);
+    fn quiescent(&self) -> bool;
+}
+
+impl StopGateLike for crate::attach::StopGate {
+    fn request_stop(&self) {
+        crate::attach::StopGate::request_stop(self);
+    }
+    fn quiescent(&self) -> bool {
+        crate::attach::StopGate::quiescent(self)
+    }
+}
+
+/// Requests the stop, then polls `quiescent()` until Q or the owner
+/// `budget` elapses, running `service` (the EVENTS/DISCOVERY drains, which
+/// admit no producers) between polls. The clock is injected so ordinary
+/// tests drive the budget without sleeping.
+pub(crate) fn quiesce_with(
+    gate: &impl StopGateLike,
+    budget: Duration,
+    mut service: impl FnMut(),
+    mut now: impl FnMut() -> Instant,
+) -> StopState {
+    gate.request_stop();
+    let start = now();
+    loop {
+        if gate.quiescent() {
+            return StopState::Quiesced { at: now() };
+        }
+        let waited = now().saturating_duration_since(start);
+        if waited >= budget {
+            return StopState::QuiescenceUnproven { waited };
+        }
+        service();
+    }
+}
+
+/// Owner stop budget (plan 2026-09-23): the quiescence wait ends after 5 s
+/// without proof, and the stop is reported as `QuiescenceUnproven` keeping
+/// the existing PARTIAL evidence.
+pub(crate) const STOP_QUIESCE_BUDGET: Duration = Duration::from_secs(5);
+
+/// The producer positions read at Q: both terminal drains stop here, in
+/// bounded quanta. `None` is unproven quiescence, which keeps today's path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TerminalQuiescence {
+    pub(crate) events_q: usize,
+    pub(crate) discovery_q: usize,
+}
+
+/// Which bound an EVENTS drain runs under. The live tick passes `Live`;
+/// the terminal drain passes `Terminal` on unproven quiescence (today's
+/// path: one explicitly bounded poll) or `Quiesced` on proven Q (drain to
+/// the Q positions, flagging a post-Q record through the latched bool).
+pub(crate) enum EventsDrainBound<'a> {
+    Live,
+    Terminal,
+    Quiesced {
+        events_q: usize,
+        post_q_record: &'a mut bool,
+    },
+}
+
+/// Named reason for the post-Q invariant violation: a record past the Q
+/// positions after proven quiescence. The report stays PARTIAL (the kept
+/// unproven marker); this names the concrete violation on stderr.
+pub(crate) const POST_Q_RECORD_REASON: &str =
+    "post-quiescence record past the Q positions (ungated writer)";
+
+/// Reports the post-Q invariant violation for one ring: PARTIAL with the
+/// named reason. The terminal evidence is already PARTIAL via the kept
+/// unproven marker; the reason says which ring broke quiescence.
+fn report_post_q_record(ring: &str) {
+    eprintln!("p11scope: terminal {ring} drain: {POST_Q_RECORD_REASON}");
+}
+
 fn finish_capture_with<C, T>(
     context: &mut C,
     loop_result: Result<CaptureEnd>,
@@ -3488,9 +3579,13 @@ fn finish_capture_with<C, T>(
     detach: impl FnOnce(&mut C) -> Result<()>,
     terminal: impl FnOnce(&mut C, CaptureEnd, bool) -> Result<T>,
 ) -> Result<T> {
+    // Quiesce-then-publish: the terminal drain, snapshot and publication
+    // run BEFORE the producers detach, so the report never waits on link
+    // teardown. The flag says detach has not run yet; quiescence reaches
+    // the terminal callback through its captured `TerminalQuiescence`.
     let end = finish(context, loop_result)?;
+    let terminal_result = terminal(context, end, false);
     let detach_result = detach(context);
-    let terminal_result = terminal(context, end, detach_result.is_ok());
     combine_detach(terminal_result, detach_result)
 }
 
@@ -3499,12 +3594,12 @@ fn finish_capture_with<C, T>(
 fn drain_capture_terminal_with<'state, C, T>(
     context: &mut C,
     consumers: &mut CaptureConsumers<'state>,
-    detached: bool,
+    quiesced: Option<TerminalQuiescence>,
     diagnostics: &mut dyn Write,
     discovery: impl for<'phase> FnOnce(
         &'phase mut C,
         &mut CaptureConsumers<'state>,
-        bool,
+        Option<TerminalQuiescence>,
     ) -> Result<(bool, &'phase crate::plan::AttachPlan)>,
     root: impl FnOnce(
         &mut C,
@@ -3514,7 +3609,7 @@ fn drain_capture_terminal_with<'state, C, T>(
     snapshot_and_publish: impl FnOnce(&mut C, &mut CaptureConsumers<'state>) -> Result<T>,
 ) -> Result<T> {
     {
-        let (plan_changed, plan) = discovery(context, consumers, detached)?;
+        let (plan_changed, plan) = discovery(context, consumers, quiesced)?;
         if plan_changed {
             consumers.state.sync_plan(plan);
             if let Some(tracer) = consumers.tracer.as_deref_mut() {
@@ -3581,9 +3676,28 @@ fn capture_profile(
     let drain_events = |session: &mut Session,
                         state: &mut semantics::State,
                         tracker: &mut process::Tracker,
-                        acc: &mut SchedulingAccumulator|
+                        acc: &mut SchedulingAccumulator,
+                        bound: EventsDrainBound<'_>|
      -> Result<u64> {
-        let terminal = session.producers_detached();
+        let (terminal, quiesced) = match bound {
+            EventsDrainBound::Live => (session.producers_detached(), None),
+            EventsDrainBound::Terminal => (true, None),
+            EventsDrainBound::Quiesced {
+                events_q,
+                post_q_record,
+            } => (true, Some((events_q, post_q_record))),
+        };
+        let drain = session.event_drain()?;
+        if let Some((events_q, post_q_record)) = quiesced {
+            let phase_start = Instant::now();
+            let (malformed, post_q) =
+                drain_profile_events_to_position(drain, events_q, state, tracker, scope)?;
+            *post_q_record |= post_q;
+            acc.add_phase(SchedulingPhase::Drain, phase_start.elapsed());
+            acc.note_drain_at(Instant::now());
+            acc.note_terminal_drain(false);
+            return Ok(malformed);
+        }
         let budget = ReadyBudget::tick();
         let phase_start = Instant::now();
         let outcome = poll_ready(
@@ -3592,10 +3706,11 @@ fn capture_profile(
             crate::events::LIVE_POLL_QUANTUM,
             &mut || interrupted.interrupted() || duration.is_some_and(|d| clock.elapsed() >= d),
             || {
-                select_and_drain_events(session, Session::live_poll_quantum, |session, quantum| {
-                    let drain = session.event_drain()?;
-                    drain_profile_events(drain, state, tracker, scope, quantum)
-                })
+                select_and_drain_events(
+                    &mut *drain,
+                    |_: &crate::events::OwnedDrain| crate::events::poll_quantum(terminal),
+                    |drain, quantum| drain_profile_events(drain, state, tracker, scope, quantum),
+                )
             },
         )?;
         acc.add_phase(SchedulingPhase::Drain, phase_start.elapsed());
@@ -3685,6 +3800,7 @@ fn capture_profile(
                             consumers.state,
                             consumers.tracker,
                             consumers.scheduling,
+                            EventsDrainBound::Live,
                         )?;
                     }
                     Ok(None)
@@ -3779,6 +3895,10 @@ fn capture_profile(
         );
     }
     })();
+    // First stop observation: request the stop immediately (before child
+    // waits, drains and snapshots) and emit the existing stop marker as
+    // the acknowledgement, adjacent to the request.
+    session.stop_gate().request_stop();
     if matches!(loop_result, Ok(CaptureEnd::Signal)) {
         eprintln!("{}", cancel_marker(interrupted.first_signal(), ticks));
     }
@@ -3792,6 +3912,72 @@ fn capture_profile(
         );
     } else {
         scheduling.note_loop_end(0, engine.capture_facts().discovery_losses()[0]);
+    }
+    // Poll for quiescence (owner budget), servicing the drains between
+    // polls without admitting producers. Discovery records stage here and
+    // apply after the poll; EVENTS reduce in place.
+    let mut service_error: Option<anyhow::Error> = None;
+    let mut staged_records = Vec::new();
+    let mut staged_malformed = 0u64;
+    let stop_state = session.quiesce_terminal(
+        STOP_QUIESCE_BUDGET,
+        if profile {
+            Some(|events_drain: &mut crate::events::OwnedDrain| {
+                if service_error.is_some() {
+                    return;
+                }
+                let phase_start = Instant::now();
+                match drain_profile_events(
+                    events_drain,
+                    &mut state,
+                    &mut process_tracker,
+                    scope,
+                    Some(crate::events::LIVE_POLL_QUANTUM),
+                ) {
+                    Ok((malformed, _)) => {
+                        malformed_records += malformed;
+                    }
+                    Err(error) => service_error = Some(error),
+                }
+                scheduling.add_phase(SchedulingPhase::Drain, phase_start.elapsed());
+            })
+        } else {
+            None
+        },
+        |discovery_drain: &mut crate::events::OwnedDiscoveryDrain| {
+            for _ in 0..crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM {
+                match discovery_drain.dequeue() {
+                    Some(crate::events::DiscoveryItem::Record(record)) => {
+                        staged_records.push(record);
+                    }
+                    Some(crate::events::DiscoveryItem::Malformed) => {
+                        staged_malformed = staged_malformed.saturating_add(1);
+                    }
+                    None => break,
+                }
+            }
+        },
+        Instant::now,
+    )?;
+    if let Some(error) = service_error {
+        return Err(error);
+    }
+    let quiesced = match stop_state {
+        StopState::Quiesced { .. } => Some(TerminalQuiescence {
+            events_q: if profile {
+                session.event_drain_positions()?.producer
+            } else {
+                0
+            },
+            discovery_q: session.discovery_positions()?.producer,
+        }),
+        StopState::QuiescenceUnproven { .. } | StopState::Running | StopState::StopRequested => {
+            None
+        }
+    };
+    if engine.apply_quiesced_discovery(session, staged_records, staged_malformed)? {
+        let plan = engine.plan();
+        state.sync_plan(plan);
     }
     let mut finish_context = (&mut *engine, &mut *session, &mut owned);
     finish_capture_with(
@@ -3807,7 +3993,7 @@ fn capture_profile(
             )
         },
         |context| context.1.detach_producers(),
-        |context, _end, detached| {
+        |context, _end, _detached| {
             let mut terminal_context = (
                 &mut *context.0,
                 &mut *context.1,
@@ -3826,17 +4012,24 @@ fn capture_profile(
             drain_capture_terminal_with(
                 &mut terminal_context,
                 &mut consumers,
-                detached,
+                quiesced,
                 &mut std::io::stderr(),
                 |context: &mut ProfileTerminalContext<'_, '_, '_, '_, '_, '_, '_>,
                  consumers: &mut CaptureConsumers<'_>,
-                 detached| {
+                 quiesced| {
                     let phase_start = Instant::now();
-                    let plan_changed = if detached {
-                        context.0.drain_discovery_terminal(context.1)?
-                    } else {
-                        context.0.drain_discovery_terminal_bounded_from(context.1)?
+                    let mut post_q_discovery = false;
+                    let plan_changed = match quiesced {
+                        Some(q) => context.0.drain_discovery_terminal_to_position(
+                            context.1,
+                            q.discovery_q,
+                            &mut post_q_discovery,
+                        )?,
+                        None => context.0.drain_discovery_terminal(context.1)?,
                     };
+                    if post_q_discovery {
+                        report_post_q_record("DISCOVERY");
+                    }
                     consumers
                         .scheduling
                         .add_phase(SchedulingPhase::Discovery, phase_start.elapsed());
@@ -3870,13 +4063,24 @@ fn capture_profile(
                 },
                 |context, consumers| {
                     context.3.begin_tick(crate::sink::SINK_TICK_BUDGET);
+                    let mut post_q_record = false;
                     if profile {
                         *consumers.malformed_records += drain_events(
                             context.1,
                             consumers.state,
                             consumers.tracker,
                             consumers.scheduling,
+                            match quiesced {
+                                Some(q) => EventsDrainBound::Quiesced {
+                                    events_q: q.events_q,
+                                    post_q_record: &mut post_q_record,
+                                },
+                                None => EventsDrainBound::Terminal,
+                            },
                         )?;
+                        if post_q_record {
+                            report_post_q_record("EVENTS");
+                        }
                     }
                     collect_sink_drops(context.3, consumers.scheduling, &mut None, Instant::now());
                     Ok(())
@@ -4175,6 +4379,7 @@ fn capture_trace(
                             interrupted.interrupted()
                                 || duration.is_some_and(|d| clock.elapsed() >= d)
                         },
+                        EventsDrainBound::Live,
                     )?;
                     Ok((*context.3 == Some(0)).then_some(CaptureEnd::LimitReached))
                 },
@@ -4229,6 +4434,10 @@ fn capture_trace(
         );
     }
     })();
+    // First stop observation: request the stop immediately (before child
+    // waits, drains and snapshots) and emit the existing stop marker as
+    // the acknowledgement, adjacent to the request.
+    session.stop_gate().request_stop();
     if matches!(loop_result, Ok(CaptureEnd::Signal)) {
         eprintln!("{}", cancel_marker(interrupted.first_signal(), ticks));
     }
@@ -4240,6 +4449,72 @@ fn capture_trace(
         metrics::lost_events(session).unwrap_or(0),
         engine.capture_facts().discovery_losses()[0],
     );
+    // Poll for quiescence (owner budget), servicing the drains between
+    // polls without admitting producers. Discovery records stage here and
+    // apply after the poll; EVENTS reduce in place.
+    let mut service_error: Option<anyhow::Error> = None;
+    let mut staged_records = Vec::new();
+    let mut staged_malformed = 0u64;
+    let stop_state = session.quiesce_terminal(
+        STOP_QUIESCE_BUDGET,
+        Some(|events_drain: &mut crate::events::OwnedDrain| {
+            if service_error.is_some() {
+                return;
+            }
+            stdout.begin_tick(crate::sink::SINK_TICK_BUDGET);
+            let phase_start = Instant::now();
+            match drain_trace_events_from(
+                events_drain,
+                &mut remaining,
+                &mut state,
+                &mut process_tracker,
+                scope,
+                &mut tracer,
+                stdout,
+                &mut stdout_open,
+                out_file,
+                Some(crate::events::LIVE_POLL_QUANTUM),
+            ) {
+                Ok((malformed, _)) => {
+                    malformed_records += malformed;
+                }
+                Err(error) => service_error = Some(error),
+            }
+            scheduling.add_phase(SchedulingPhase::Drain, phase_start.elapsed());
+            collect_sink_drops(stdout, &mut scheduling, &mut None, Instant::now());
+        }),
+        |discovery_drain: &mut crate::events::OwnedDiscoveryDrain| {
+            for _ in 0..crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM {
+                match discovery_drain.dequeue() {
+                    Some(crate::events::DiscoveryItem::Record(record)) => {
+                        staged_records.push(record);
+                    }
+                    Some(crate::events::DiscoveryItem::Malformed) => {
+                        staged_malformed = staged_malformed.saturating_add(1);
+                    }
+                    None => break,
+                }
+            }
+        },
+        Instant::now,
+    )?;
+    if let Some(error) = service_error {
+        return Err(error);
+    }
+    let quiesced = match stop_state {
+        StopState::Quiesced { .. } => Some(TerminalQuiescence {
+            events_q: session.event_drain_positions()?.producer,
+            discovery_q: session.discovery_positions()?.producer,
+        }),
+        StopState::QuiescenceUnproven { .. } | StopState::Running | StopState::StopRequested => {
+            None
+        }
+    };
+    if engine.apply_quiesced_discovery(session, staged_records, staged_malformed)? {
+        let plan = engine.plan();
+        state.sync_plan(plan);
+        tracer.sync_plan(plan);
+    }
     let mut finish_context = (&mut *engine, &mut *session, &mut owned);
     finish_capture_with(
         &mut finish_context,
@@ -4254,7 +4529,7 @@ fn capture_trace(
             )
         },
         |context| context.1.detach_producers(),
-        |context, end, detached| {
+        |context, end, _detached| {
             let mut terminal_context = (
                 &mut *context.0,
                 &mut *context.1,
@@ -4275,17 +4550,24 @@ fn capture_trace(
             drain_capture_terminal_with(
                 &mut terminal_context,
                 &mut consumers,
-                detached,
+                quiesced,
                 &mut std::io::stderr(),
                 |context: &mut TraceTickContext<'_, '_, '_, '_, '_, '_, '_, '_, '_>,
                  consumers: &mut CaptureConsumers<'_>,
-                 detached| {
+                 quiesced| {
                     let phase_start = Instant::now();
-                    let plan_changed = if detached {
-                        context.0.drain_discovery_terminal(context.1)?
-                    } else {
-                        context.0.drain_discovery_terminal_bounded_from(context.1)?
+                    let mut post_q_discovery = false;
+                    let plan_changed = match quiesced {
+                        Some(q) => context.0.drain_discovery_terminal_to_position(
+                            context.1,
+                            q.discovery_q,
+                            &mut post_q_discovery,
+                        )?,
+                        None => context.0.drain_discovery_terminal(context.1)?,
                     };
+                    if post_q_discovery {
+                        report_post_q_record("DISCOVERY");
+                    }
                     consumers
                         .scheduling
                         .add_phase(SchedulingPhase::Discovery, phase_start.elapsed());
@@ -4322,6 +4604,7 @@ fn capture_trace(
                 },
                 |context, consumers| {
                     context.5.begin_tick(crate::sink::SINK_TICK_BUDGET);
+                    let mut post_q_record = false;
                     *consumers.malformed_records += drain_trace_events(
                         context.1,
                         context.3,
@@ -4334,7 +4617,17 @@ fn capture_trace(
                         context.7,
                         consumers.scheduling,
                         &mut || false,
+                        match quiesced {
+                            Some(q) => EventsDrainBound::Quiesced {
+                                events_q: q.events_q,
+                                post_q_record: &mut post_q_record,
+                            },
+                            None => EventsDrainBound::Terminal,
+                        },
                     )?;
+                    if post_q_record {
+                        report_post_q_record("EVENTS");
+                    }
                     collect_sink_drops(context.5, consumers.scheduling, &mut None, Instant::now());
                     Ok(())
                 },
@@ -4916,6 +5209,100 @@ fn drain_profile_events<S: crate::events::RecordSource>(
     Ok((drain.take_malformed_delta(), may_remain))
 }
 
+/// Proven-Q profile drain: reads to the producer `stop` position observed
+/// at Q in bounded quanta. Returns the malformed delta and whether a
+/// post-Q record was observed (the invariant violation).
+fn drain_profile_events_to_position<S: crate::events::BoundedRecordSource>(
+    drain: &mut crate::events::EventDrain<S>,
+    stop: usize,
+    state: &mut semantics::State,
+    tracker: &mut process::Tracker,
+    scope: &Scope,
+) -> Result<(u64, bool)> {
+    let domain = drain.domain_id();
+    let mut failure = None;
+    let mut post_q_record = false;
+    loop {
+        let (post_q, backlog) = crate::events::poll_events_to_position(
+            drain,
+            stop,
+            Some(crate::events::TERMINAL_DRAIN_BOUND),
+            |ev| {
+                if let Err(error) = reduce_profile_event(domain, tracker, state, scope, ev) {
+                    failure = Some(error);
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            },
+        )?;
+        post_q_record |= post_q;
+        if failure.is_some() || !backlog {
+            break;
+        }
+    }
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    Ok((drain.take_malformed_delta(), post_q_record))
+}
+
+/// Proven-Q trace drain: reads to the producer `stop` position observed
+/// at Q in bounded quanta. The live line limit does not stop it: past the
+/// limit lines are unemitted but still observed into semantics, so the
+/// report covers activity up to Q. Returns the malformed delta and whether
+/// a post-Q record was observed (the invariant violation).
+#[allow(clippy::too_many_arguments)]
+fn drain_trace_events_to_position<S: crate::events::BoundedRecordSource, W: Write>(
+    drain: &mut crate::events::EventDrain<S>,
+    stop: usize,
+    remaining: &mut Option<u64>,
+    state: &mut semantics::State,
+    tracker: &mut process::Tracker,
+    scope: &Scope,
+    tracer: &mut trace::Tracer,
+    stdout: &mut dyn Write,
+    stdout_open: &mut bool,
+    out_file: &mut Option<W>,
+) -> Result<(u64, bool)> {
+    let mut write_error = None;
+    let mut reduction_error = None;
+    let mut post_q_record = false;
+    let domain = drain.domain_id();
+    loop {
+        let (post_q, backlog) = crate::events::poll_events_to_position(
+            drain,
+            stop,
+            Some(crate::events::TERMINAL_DRAIN_BOUND),
+            |ev| {
+                if let Err(error) = reduce_trace_event(
+                    domain,
+                    remaining,
+                    state,
+                    tracker,
+                    scope,
+                    tracer,
+                    stdout,
+                    stdout_open,
+                    out_file,
+                    &mut write_error,
+                    ev,
+                ) {
+                    reduction_error = Some(error);
+                    return ControlFlow::Break(());
+                }
+                ControlFlow::Continue(())
+            },
+        )?;
+        post_q_record |= post_q;
+        if reduction_error.is_some() || !backlog {
+            break;
+        }
+    }
+    combine_trace_errors(reduction_error.map_or(Ok(()), Err), write_error)?;
+    Ok((drain.take_malformed_delta(), post_q_record))
+}
+
 /// Drains what the ring buffer currently holds — one quantum on the live
 /// ring, whole after detach — rendering and emitting one line per completed
 /// call. Returns the per-poll malformed-record delta from this drain, to
@@ -4933,8 +5320,37 @@ fn drain_trace_events<W: Write>(
     out_file: &mut Option<W>,
     acc: &mut SchedulingAccumulator,
     should_yield: &mut impl FnMut() -> bool,
+    bound: EventsDrainBound<'_>,
 ) -> Result<u64> {
-    let terminal = session.producers_detached();
+    let (terminal, quiesced) = match bound {
+        EventsDrainBound::Live => (session.producers_detached(), None),
+        EventsDrainBound::Terminal => (true, None),
+        EventsDrainBound::Quiesced {
+            events_q,
+            post_q_record,
+        } => (true, Some((events_q, post_q_record))),
+    };
+    let drain = session.event_drain()?;
+    if let Some((events_q, post_q_record)) = quiesced {
+        let phase_start = Instant::now();
+        let (malformed, post_q) = drain_trace_events_to_position(
+            drain,
+            events_q,
+            remaining,
+            state,
+            tracker,
+            scope,
+            tracer,
+            stdout,
+            stdout_open,
+            out_file,
+        )?;
+        *post_q_record |= post_q;
+        acc.add_phase(SchedulingPhase::Drain, phase_start.elapsed());
+        acc.note_drain_at(Instant::now());
+        acc.note_terminal_drain(false);
+        return Ok(malformed);
+    }
     let budget = ReadyBudget::tick();
     let phase_start = Instant::now();
     let outcome = poll_ready(
@@ -4943,21 +5359,24 @@ fn drain_trace_events<W: Write>(
         crate::events::LIVE_POLL_QUANTUM,
         should_yield,
         || {
-            select_and_drain_events(session, Session::live_poll_quantum, |session, quantum| {
-                let drain = session.event_drain()?;
-                drain_trace_events_from(
-                    drain,
-                    remaining,
-                    state,
-                    tracker,
-                    scope,
-                    tracer,
-                    stdout,
-                    stdout_open,
-                    out_file,
-                    quantum,
-                )
-            })
+            select_and_drain_events(
+                &mut *drain,
+                |_: &crate::events::OwnedDrain| crate::events::poll_quantum(terminal),
+                |drain, quantum| {
+                    drain_trace_events_from(
+                        drain,
+                        remaining,
+                        state,
+                        tracker,
+                        scope,
+                        tracer,
+                        stdout,
+                        stdout_open,
+                        out_file,
+                        quantum,
+                    )
+                },
+            )
         },
     )?;
     acc.add_phase(SchedulingPhase::Drain, phase_start.elapsed());
@@ -10191,6 +10610,10 @@ mod tests {
                 tail[..detach].contains("finish_capture_loop("),
                 "real finish callback for {function}"
             );
+            // Supply order, not execution order: quiesce-then-publish runs
+            // the terminal callback before detach (pinned at runtime by
+            // `stop_requests_the_gate_before_any_detach`), while the shared
+            // shape still supplies detach first.
             assert!(
                 detach < terminal,
                 "detach callback must be supplied before terminal callback for {function}"
@@ -10201,21 +10624,20 @@ mod tests {
             );
             let terminal = &tail[terminal..];
             let discovery = terminal
-                .find("let plan_changed = if detached {")
-                .expect("detach-aware terminal discovery");
+                .find("let plan_changed = match quiesced {")
+                .expect("quiescence-aware terminal discovery");
             let plan = terminal
                 .find("Ok((plan_changed, context.0.plan()))")
                 .expect("actual engine plan handoff");
             let discovery = &terminal[discovery..plan];
-            let (_, after_if) = discovery.split_once("if detached {").unwrap();
-            let (success, after_else) = after_if.split_once("} else {").unwrap();
-            let (failure, _) = after_else.split_once("};").unwrap();
-            assert!(success.contains("context.0.drain_discovery_terminal(context.1)?"));
-            assert!(!success.contains("drain_discovery_terminal_bounded_from"));
-            assert!(
-                failure.contains("context.0.drain_discovery_terminal_bounded_from(context.1)?")
-            );
-            assert!(!failure.contains("context.0.drain_discovery_terminal(context.1)?"));
+            let (_, after_match) = discovery.split_once("match quiesced {").unwrap();
+            let (proven, after_none) = after_match.split_once("None =>").unwrap();
+            assert!(proven.contains("Some(q) =>"));
+            assert!(proven.contains("drain_discovery_terminal_to_position("));
+            assert!(!proven.contains("drain_discovery_terminal(context.1)"));
+            assert!(after_none.contains("context.0.drain_discovery_terminal(context.1)?"));
+            assert!(!after_none.contains("to_position"));
+            assert!(discovery.contains("report_post_q_record(\"DISCOVERY\")"));
         }
     }
 

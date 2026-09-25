@@ -191,18 +191,18 @@ fn finish_capture_preserves_settlement_detach_and_terminal_attempt_boundaries() 
             }
             Case::ErrorEnd => {
                 assert_eq!(result.unwrap(), 17);
-                assert_eq!(observed, Some((CaptureEnd::Error, true)));
-                assert_eq!(phases, ["finish", "detach", "terminal"]);
+                assert_eq!(observed, Some((CaptureEnd::Error, false)));
+                assert_eq!(phases, ["finish", "terminal", "detach"]);
             }
             Case::Success => {
                 assert_eq!(result.unwrap(), 17);
-                assert_eq!(observed, Some((CaptureEnd::DurationExpired, true)));
-                assert_eq!(phases, ["finish", "detach", "terminal"]);
+                assert_eq!(observed, Some((CaptureEnd::DurationExpired, false)));
+                assert_eq!(phases, ["finish", "terminal", "detach"]);
             }
             Case::DetachError => {
                 assert!(result.unwrap_err().to_string().contains("detach failure"));
                 assert_eq!(observed, Some((CaptureEnd::DurationExpired, false)));
-                assert_eq!(phases, ["finish", "detach", "terminal"]);
+                assert_eq!(phases, ["finish", "terminal", "detach"]);
             }
         }
     }
@@ -247,10 +247,10 @@ fn terminal_completed_root_reduces_and_retires_before_ordinary_drain_in_both_mod
             drain_capture_terminal_with(
                 &mut context,
                 &mut consumers,
-                true,
+                None,
                 &mut diagnostics,
-                |context: &mut TerminalContext, _, detached| {
-                    assert!(detached);
+                |context: &mut TerminalContext, _, quiesced| {
+                    assert_eq!(quiesced, None);
                     context.phases.push("discovery");
                     Ok((false, &context.plan))
                 },
@@ -410,7 +410,7 @@ fn terminal_absent_and_cancelled_roots_retain_pending_state() {
             drain_capture_terminal_with(
                 &mut context,
                 &mut consumers,
-                true,
+                None,
                 &mut diagnostics,
                 |context: &mut TickContext, _, _| Ok((false, &context.plan)),
                 |_, _| {
@@ -481,7 +481,7 @@ fn terminal_deferred_trace_writer_error_retires_then_skips_later_phases() {
         drain_capture_terminal_with(
             &mut context,
             &mut consumers,
-            true,
+            None,
             &mut diagnostics,
             |context: &mut TerminalContext, _, _| {
                 context.phases.push("discovery");
@@ -554,11 +554,11 @@ fn terminal_errors_stop_at_the_current_attempt_boundary() {
             drain_capture_terminal_with(
                 &mut context,
                 &mut consumers,
-                false,
+                None,
                 &mut diagnostics,
-                |context: &mut TickContext, _, detached| {
+                |context: &mut TickContext, _, quiesced| {
                     phases.borrow_mut().push("discovery");
-                    assert!(!detached);
+                    assert_eq!(quiesced, None);
                     if failure == "discovery" {
                         anyhow::bail!("discovery failure");
                     }
@@ -622,7 +622,7 @@ fn terminal_errors_stop_at_the_current_attempt_boundary() {
         drain_capture_terminal_with(
             &mut context,
             &mut consumers,
-            true,
+            None,
             &mut diagnostics,
             |context: &mut TickContext, _, _| Ok((false, &context.plan)),
             |_, _| {
@@ -669,7 +669,7 @@ fn terminal_discovery_syncs_new_and_downgraded_slots_for_both_consumers() {
         let snapshot = drain_capture_terminal_with(
             &mut context,
             &mut consumers,
-            true,
+            None,
             &mut diagnostics,
             |context: &mut TickContext, _, _| Ok((true, &context.plan)),
             |_, _| (Ok(OriginalRootDrain::Absent), None),
@@ -699,7 +699,7 @@ fn terminal_discovery_syncs_new_and_downgraded_slots_for_both_consumers() {
         let snapshot = drain_capture_terminal_with(
             &mut context,
             &mut consumers,
-            true,
+            None,
             &mut diagnostics,
             |context: &mut TickContext, _, _| Ok((true, &context.plan)),
             |_, _| (Ok(OriginalRootDrain::Absent), None),
@@ -911,10 +911,10 @@ fn capture_tick_limit_skips_live_snapshot_and_check_but_terminal_reduces_remaind
         drain_capture_terminal_with(
             &mut context,
             &mut consumers,
-            true,
+            None,
             &mut diagnostics,
-            |context: &mut TickContext, _, detached| {
-                assert!(detached);
+            |context: &mut TickContext, _, quiesced| {
+                assert_eq!(quiesced, None);
                 Ok((false, &context.plan))
             },
             |_, _| (Ok(OriginalRootDrain::Absent), None),
@@ -1134,5 +1134,382 @@ fn root_tail_cancellation_abandons_backlog_with_exact_malformed_delta() {
             assert_eq!(drain.take_malformed_delta(), 0);
         }
         _ => panic!("a pre-cancelled tail must abandon, not complete or vanish"),
+    }
+}
+
+#[test]
+fn stop_requests_the_gate_before_any_detach() {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    struct FakeGate {
+        phases: Rc<RefCell<Vec<&'static str>>>,
+        polls: Cell<u32>,
+    }
+
+    impl StopGateLike for FakeGate {
+        fn request_stop(&self) {
+            self.phases.borrow_mut().push("request_stop");
+        }
+        fn quiescent(&self) -> bool {
+            self.phases.borrow_mut().push("quiesce_poll");
+            self.polls.set(self.polls.get() + 1);
+            true
+        }
+    }
+
+    let shared = Rc::new(RefCell::new(Vec::new()));
+    let gate = FakeGate {
+        phases: Rc::clone(&shared),
+        polls: Cell::new(0),
+    };
+    // The production terminal wiring: request the stop and poll for
+    // quiescence first, servicing drains between polls ...
+    let at = Instant::now();
+    let state = quiesce_with(
+        &gate,
+        Duration::from_secs(5),
+        || shared.borrow_mut().push("service"),
+        || at,
+    );
+    // ... then settle, drain, snapshot, publish, and only then detach.
+    let mut phases = shared.take();
+    let result = finish_capture_with(
+        &mut phases,
+        Ok(CaptureEnd::DurationExpired),
+        |phases, result| {
+            phases.push("settle");
+            result
+        },
+        |phases| {
+            phases.push("detach");
+            Ok(())
+        },
+        |phases, _end, _detached| {
+            phases.push("drain");
+            phases.push("snapshot");
+            phases.push("publish");
+            Ok(7)
+        },
+    );
+    assert_eq!(result.unwrap(), 7);
+    assert_eq!(
+        phases,
+        [
+            "request_stop",
+            "quiesce_poll",
+            "settle",
+            "drain",
+            "snapshot",
+            "publish",
+            "detach"
+        ]
+    );
+    assert!(matches!(state, StopState::Quiesced { at: q } if q == at));
+    assert_eq!(gate.polls.get(), 1);
+}
+
+#[test]
+fn quiesce_reports_unproven_when_in_flight_never_drains() {
+    use std::cell::Cell;
+
+    struct NeverQuiescent {
+        polls: Cell<u32>,
+    }
+
+    impl StopGateLike for NeverQuiescent {
+        fn request_stop(&self) {}
+        fn quiescent(&self) -> bool {
+            self.polls.set(self.polls.get() + 1);
+            false
+        }
+    }
+
+    let gate = NeverQuiescent {
+        polls: Cell::new(0),
+    };
+    let t0 = Instant::now();
+    let mut tick = 0u32;
+    let mut services = 0u32;
+    let state = quiesce_with(
+        &gate,
+        Duration::from_secs(5),
+        || services += 1,
+        || {
+            let now = t0 + Duration::from_secs(u64::from(tick));
+            tick += 1;
+            now
+        },
+    );
+    match state {
+        StopState::QuiescenceUnproven { waited } => {
+            assert!(waited >= Duration::from_secs(5), "waited {waited:?}")
+        }
+        other => panic!("expected QuiescenceUnproven, got {other:?}"),
+    }
+    assert!(
+        services >= 1,
+        "the budget window must service drains, got {services}"
+    );
+    assert!(gate.polls.get() >= 1);
+    // The unproven report keeps today's unproven marker, split by story.
+    let mut clean = crate::render::tests::evidence();
+    clean.completeness = "COMPLETE";
+    clean.mark_terminal_drain_unproven();
+    assert_eq!(clean.completeness, "PARTIAL");
+    assert_eq!(
+        clean.verdict_detail,
+        crate::render::VERDICT_CLEAN_BUT_UNPROVEN
+    );
+    let mut gap = crate::render::tests::evidence();
+    gap.mark_terminal_drain_unproven();
+    assert_eq!(gap.completeness, "PARTIAL");
+    assert_eq!(gap.verdict_detail, crate::render::VERDICT_CONCRETE_GAP);
+}
+
+#[test]
+fn quiesced_drain_reads_to_the_positions_observed_at_q() {
+    use crate::events::{BoundedRecordSource as _, ScriptedRecords};
+    use std::ops::ControlFlow;
+
+    for post_q_write in [false, true] {
+        let mut script = ScriptedRecords::events([open_event(1), open_event(2)], usize::MAX);
+        let q = script.positions().producer;
+        if post_q_write {
+            script.push_event(&open_event(3));
+        }
+        let mut drain = EventDrain::over_test_domain(script, 1);
+        let mut seen = 0;
+        let (post_q_record, backlog) = crate::events::poll_events_to_position(
+            &mut drain,
+            q,
+            Some(crate::events::TERMINAL_DRAIN_BOUND),
+            |_| {
+                seen += 1;
+                ControlFlow::Continue(())
+            },
+        )
+        .unwrap();
+        assert_eq!(seen, 2, "post_q_write={post_q_write}");
+        assert_eq!(post_q_record, post_q_write, "post_q_write={post_q_write}");
+        assert!(!backlog, "post_q_write={post_q_write}");
+        assert_eq!(
+            drain.source().remaining(),
+            usize::from(post_q_write),
+            "post_q_write={post_q_write}"
+        );
+    }
+}
+
+fn discovery_bytes(pid: u32) -> Vec<u8> {
+    // SAFETY: repr(C) integer-only wire record, including zeroed reserved bytes.
+    let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+    record.kind = p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+    record.pid_tgid = u64::from(pid) << 32;
+    unsafe {
+        std::slice::from_raw_parts(
+            (&record as *const p11scope_ebpf_common::DiscoveryRecord).cast::<u8>(),
+            std::mem::size_of::<p11scope_ebpf_common::DiscoveryRecord>(),
+        )
+        .to_vec()
+    }
+}
+
+#[test]
+fn quiesced_discovery_drain_reads_to_the_positions_observed_at_q() {
+    use crate::events::{BoundedRecordSource as _, DiscoveryDrain, DiscoveryItem};
+    use std::ops::ControlFlow;
+
+    for post_q_write in [false, true] {
+        let mut script =
+            ScriptedRecords::records([discovery_bytes(11), discovery_bytes(12)], usize::MAX);
+        let q = script.positions().producer;
+        if post_q_write {
+            // Content is unread: the drain stops at Q with this still
+            // queued, and only the moved producer position matters.
+            script.push_event(&open_event(3));
+        }
+        let mut drain = DiscoveryDrain::over(script);
+        let mut seen = 0;
+        let (post_q_record, backlog) = crate::events::poll_discovery_to_position(
+            &mut drain,
+            q,
+            Some(crate::events::TERMINAL_DRAIN_BOUND),
+            |item| {
+                assert!(matches!(item, DiscoveryItem::Record(_)));
+                seen += 1;
+                ControlFlow::Continue(())
+            },
+        )
+        .unwrap();
+        assert_eq!(seen, 2, "post_q_write={post_q_write}");
+        assert_eq!(post_q_record, post_q_write, "post_q_write={post_q_write}");
+        assert!(!backlog, "post_q_write={post_q_write}");
+        assert_eq!(
+            drain.source().remaining(),
+            usize::from(post_q_write),
+            "post_q_write={post_q_write}"
+        );
+    }
+}
+
+/// A bounded source past its stop: every read fails the way Aya fails
+/// when the consumer already stands past the boundary (`crossed`) or the
+/// boundary itself is unusable (`!crossed`, a genuine bug).
+struct FailingBoundedSource {
+    crossed: bool,
+}
+
+impl crate::events::RecordSource for FailingBoundedSource {
+    fn next_record(&mut self) -> Option<impl std::ops::Deref<Target = [u8]> + '_> {
+        None::<&[u8]>
+    }
+}
+
+impl crate::events::BoundedRecordSource for FailingBoundedSource {
+    fn positions(&self) -> aya::maps::ring_buf::RingBufPositions {
+        aya::maps::ring_buf::RingBufPositions {
+            consumer: 16,
+            producer: 16,
+            capacity: 4096,
+        }
+    }
+    fn consumer(&self) -> usize {
+        16
+    }
+    fn bounded_record(
+        &mut self,
+        stop: usize,
+    ) -> Result<crate::events::BoundedRecord<impl std::ops::Deref<Target = [u8]> + '_>> {
+        if stop == usize::MAX {
+            // Unreachable: names the hidden item type for the always-failing body.
+            return Ok(crate::events::BoundedRecord::Item(&[][..]));
+        }
+        Err(if self.crossed {
+            aya::maps::ring_buf::RingBufBoundaryError::BoundaryOutOfRange {
+                consumer: 16,
+                stop: 8,
+                capacity: 4096,
+                distance: usize::MAX - 7,
+            }
+        } else {
+            aya::maps::ring_buf::RingBufBoundaryError::InvalidBoundary {
+                consumer: 16,
+                stop: 9,
+                capacity: 4096,
+            }
+        }
+        .into())
+    }
+}
+
+#[test]
+fn bounded_drain_maps_a_crossed_stop_to_post_q_record() {
+    use std::ops::ControlFlow;
+
+    for crossed in [true, false] {
+        let source = FailingBoundedSource { crossed };
+        let mut events_drain = EventDrain::over_test_domain(source, 1);
+        let events = crate::events::poll_events_to_position(&mut events_drain, 8, Some(64), |_| {
+            ControlFlow::Continue(())
+        });
+        let source = FailingBoundedSource { crossed };
+        let mut discovery_drain = crate::events::DiscoveryDrain::over(source);
+        let discovery =
+            crate::events::poll_discovery_to_position(&mut discovery_drain, 8, Some(64), |_| {
+                ControlFlow::Continue(())
+            });
+        if crossed {
+            // The consumer stands past the stop, so records past Q existed:
+            // the post-Q violation, not a drain failure.
+            assert_eq!(events.unwrap(), (true, false));
+            assert_eq!(discovery.unwrap(), (true, false));
+        } else {
+            // A misaligned boundary is a bug, never a post-Q write.
+            assert!(
+                events
+                    .unwrap_err()
+                    .to_string()
+                    .contains("invalid ring buffer boundary")
+            );
+            assert!(
+                discovery
+                    .unwrap_err()
+                    .to_string()
+                    .contains("invalid ring buffer boundary")
+            );
+        }
+    }
+}
+
+#[test]
+fn quiesced_profile_drain_reduces_pre_q_events_and_excludes_post_q_writes() {
+    use crate::events::BoundedRecordSource as _;
+
+    let domain = crate::events::EventsDomain::test_standin(7);
+    let plan = open_plan();
+    let fresh = || {
+        (
+            semantics::State::for_capture(
+                &plan,
+                crate::attach::CapturePolicy::Allowlisted,
+                domain.clone(),
+            ),
+            process::Tracker::for_producer(domain.clone(), 16),
+        )
+    };
+    // Baseline: the unbounded drain of the two pre-Q events.
+    let (mut base_state, mut base_tracker) = fresh();
+    let mut base_drain = EventDrain::over_test_domain(
+        ScriptedRecords::events([open_event(1), open_event(2)], usize::MAX),
+        1,
+    );
+    drain_profile_events(
+        &mut base_drain,
+        &mut base_state,
+        &mut base_tracker,
+        &Scope::Pid(7),
+        None,
+    )
+    .unwrap();
+    let baseline = (
+        base_state.sessions().opened,
+        base_state.sessions().closed,
+        base_state.pending_at_end(),
+    );
+    for post_q_write in [false, true] {
+        let (mut state, mut tracker) = fresh();
+        let mut script = ScriptedRecords::events([open_event(1), open_event(2)], usize::MAX);
+        let q = script.positions().producer;
+        if post_q_write {
+            script.push_event(&open_event(3));
+        }
+        let mut drain = EventDrain::over_test_domain(script, 1);
+        let (malformed, post_q_record) = drain_profile_events_to_position(
+            &mut drain,
+            q,
+            &mut state,
+            &mut tracker,
+            &Scope::Pid(7),
+        )
+        .unwrap();
+        assert_eq!(malformed, 0, "post_q_write={post_q_write}");
+        assert_eq!(post_q_record, post_q_write, "post_q_write={post_q_write}");
+        // Exactly the pre-Q reduction, with the post-Q write excluded from
+        // semantics and left queued.
+        assert_eq!(
+            (
+                state.sessions().opened,
+                state.sessions().closed,
+                state.pending_at_end()
+            ),
+            baseline,
+            "post_q_write={post_q_write}"
+        );
+        assert_eq!(
+            drain.source().remaining(),
+            usize::from(post_q_write),
+            "post_q_write={post_q_write}"
+        );
     }
 }

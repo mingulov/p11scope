@@ -291,6 +291,23 @@ int main(int argc, char **argv) {
             if (abandon) { hold_action = 0; printf("ABANDONED %u %u\n", id, work.tid); continue; }
             return 9;
         }
+        if (!strcmp(command, "FANOUT")) {
+            unsigned threads, percalls;
+            if (scanf("%u %u", &threads, &percalls) != 2 || threads < 1 || threads > 64 || threads > 576 || percalls < 1 || percalls > 1000000) return 2;
+            printf("FANOUT_START %u %u\n", threads, percalls);
+            struct thread_work works[64]; pthread_t workers[64];
+            for (unsigned t = 0; t < threads; t++) {
+                works[t].id = t; works[t].calls = percalls; works[t].sum = 0; works[t].tid = 0; works[t].action = 0;
+                if (pthread_create(&workers[t], NULL, thread_call, &works[t])) return 6;
+            }
+            unsigned long total = 0;
+            for (unsigned t = 0; t < threads; t++) {
+                if (pthread_join(workers[t], NULL)) return 7;
+                total += works[t].sum;
+            }
+            printf("FANOUT_DONE %u %u %lu\n", threads, percalls, total);
+            continue;
+        }
         int thread = !strcmp(command, "THREAD");
         if (!thread && strcmp(command, "CALL")) return 2;
         if (scanf("%u %u", &id, &calls) != 2 || id >= 576 || calls > 1000000) return 2;
@@ -900,6 +917,36 @@ impl OwnedCaller {
         );
         eprintln!("OWNED_THREAD pid={} tid={tid} {receipt}", self.child.id());
         Ok(tid)
+    }
+
+    fn fanout_calls(&mut self, threads: u32, percalls: u32) -> Result<()> {
+        self.start_fanout(threads, percalls)?;
+        self.finish_fanout(threads, percalls)
+    }
+
+    fn start_fanout(&mut self, threads: u32, percalls: u32) -> Result<()> {
+        writeln!(self.input, "FANOUT {threads} {percalls}")?;
+        self.input.flush()?;
+        ensure!(
+            self.line()? == format!("FANOUT_START {threads} {percalls}"),
+            "fanout start receipt differs"
+        );
+        Ok(())
+    }
+
+    fn finish_fanout(&mut self, threads: u32, percalls: u32) -> Result<()> {
+        let mut total = 0u64;
+        for t in 0..threads {
+            total += u64::from(percalls) * u64::from(t)
+                + u64::from(percalls) * u64::from(percalls.saturating_sub(1)) / 2;
+        }
+        let ledger = self.line()?;
+        ensure!(
+            ledger == format!("FANOUT_DONE {threads} {percalls} {total}"),
+            "independent fanout ledger differs: {ledger}"
+        );
+        eprintln!("OWNED_FANOUT pid={} {ledger}", self.child.id());
+        Ok(())
     }
 
     fn exec_self(&mut self) -> Result<()> {
@@ -6320,6 +6367,115 @@ fn detailed_sweep_gate(n: u32, cell: Option<&'static str>) -> Result<()> {
         origin.elapsed().as_millis()
     );
     eprintln!("TASK4_CLEANUP owned_ids_released=true terminal_unsettled=true");
+    Ok(())
+}
+
+#[test]
+#[ignore = "root-owned BPF lane; Detailed per-call overhead bench, timed 1-thread CALL and 8-thread FANOUT batches"]
+fn privileged_bench_overhead_detailed_calls() -> Result<()> {
+    const ENDPOINTS: u32 = 8;
+    const BATCH_1T: u32 = 4000;
+    const WORKERS_8T: u32 = 8;
+    const PERCALLS_8T: u32 = 500;
+    const BATCH_8T: u32 = WORKERS_8T * PERCALLS_8T;
+    const REPS: u32 = 25;
+    const WARMUP: u32 = 2;
+    const SLOT_1T: u32 = 0;
+
+    let fixture = OwnedFixture::build_n(false, ENDPOINTS)?;
+    let plan =
+        AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::Detailed)
+            .map_err(anyhow::Error::msg)?;
+    let mut caller = fixture.spawn_gated()?;
+    let mut session = crate::attach::Session::start(
+        &plan,
+        &Scope::Pid(caller.child.id()),
+        &fixture.pins,
+        crate::attach::CapturePolicy::Allowlisted,
+        None,
+        None,
+        None,
+        crate::attach::BackendSelection::Singles,
+    )?;
+    ensure!(
+        session.attach_failures().is_empty() && session.attached_probes() == 2 * ENDPOINTS as usize,
+        "bench Detailed did not retain every paired static probe"
+    );
+    let ids = OwnedIds::detailed(&session)?;
+    eprintln!(
+        "BENCH_OVERHEAD_OBJECT kind=detailed.elf sha256={}",
+        task4_hash(crate::EBPF_OBJECT)
+    );
+    caller.go()?;
+    for _ in 0..WARMUP {
+        caller.calls(SLOT_1T, BATCH_1T)?;
+        let mut warmed = Vec::new();
+        drain_task4_detailed(&mut session, &mut warmed)?;
+        ensure!(
+            warmed.len() == BATCH_1T as usize,
+            "warmup 1-thread event count differs from ledger"
+        );
+        caller.fanout_calls(WORKERS_8T, PERCALLS_8T)?;
+        let mut warmed8 = Vec::new();
+        drain_task4_detailed(&mut session, &mut warmed8)?;
+        ensure!(
+            warmed8.len() == BATCH_8T as usize,
+            "warmup 8-thread event count differs from ledger"
+        );
+    }
+    let mut wall_1t = Duration::new(0, 0);
+    for _ in 0..REPS {
+        caller.start_calls(SLOT_1T, BATCH_1T)?;
+        let start = Instant::now();
+        caller.finish_calls(SLOT_1T, BATCH_1T)?;
+        wall_1t += start.elapsed();
+        let mut events = Vec::new();
+        drain_task4_detailed(&mut session, &mut events)?;
+        ensure!(
+            events.len() == BATCH_1T as usize,
+            "timed 1-thread event count differs from ledger"
+        );
+    }
+    let mut wall_8t = Duration::new(0, 0);
+    for _ in 0..REPS {
+        caller.start_fanout(WORKERS_8T, PERCALLS_8T)?;
+        let start = Instant::now();
+        caller.finish_fanout(WORKERS_8T, PERCALLS_8T)?;
+        wall_8t += start.elapsed();
+        let mut events = Vec::new();
+        drain_task4_detailed(&mut session, &mut events)?;
+        ensure!(
+            events.len() == BATCH_8T as usize,
+            "timed 8-thread event count differs from ledger"
+        );
+    }
+    let calls_1t = u64::from(BATCH_1T) * u64::from(REPS);
+    let calls_8t = u64::from(BATCH_8T) * u64::from(REPS);
+    let wall_1t_ns = wall_1t.as_nanos();
+    let wall_8t_ns = wall_8t.as_nanos();
+    eprintln!(
+        "BENCH_OVERHEAD threads=1 reps={REPS} batch={BATCH_1T} calls={calls_1t} wall_ns={wall_1t_ns} calls_per_s={:.0} ns_per_call={:.1}",
+        calls_1t as f64 / wall_1t.as_secs_f64(),
+        wall_1t_ns as f64 / calls_1t as f64
+    );
+    eprintln!(
+        "BENCH_OVERHEAD threads=8 reps={REPS} workers={WORKERS_8T} percalls={PERCALLS_8T} calls={calls_8t} wall_ns={wall_8t_ns} calls_per_s={:.0} ns_per_call={:.1}",
+        calls_8t as f64 / wall_8t.as_secs_f64(),
+        wall_8t_ns as f64 / calls_8t as f64
+    );
+    let detached = session.detach_producers();
+    let clean_detach = session.detach_failures().is_empty();
+    let mut terminal = Vec::new();
+    drain_task4_detailed(&mut session, &mut terminal)?;
+    ensure!(
+        terminal.is_empty(),
+        "terminal drain found unaccounted Detailed events"
+    );
+    drop(session);
+    ids.released_with_budget(Duration::from_secs(60))?;
+    caller.finish()?;
+    detached?;
+    ensure!(clean_detach, "bench Detailed detach retained failures");
     Ok(())
 }
 

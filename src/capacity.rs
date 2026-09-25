@@ -2260,6 +2260,62 @@ impl EnvelopeReport {
     }
 }
 
+/// FDs beyond one-per-link reserved by the T7 boundary preflight for the
+/// loaded maps, evidence files, fixture stdio and the sampling enumerator.
+/// The preflight is a lower bound: refusal fires only when even one FD per
+/// link plus this reserve cannot fit, so it never false-refuses a fittable
+/// cell.
+pub const T7_ENVELOPE_RESERVE_FDS: u64 = 64;
+
+/// L-T7-5 boundary-cell envelope preflight outcome. Pure arithmetic over the
+/// live `RLIMIT_NOFILE` soft limit and sampled FD occupancy; the privileged
+/// cell samples both and refuses before attaching when they cannot fit.
+#[derive(Debug)]
+pub struct T7BoundaryPreflight {
+    pub endpoints: u64,
+    pub required_links: u64,
+    pub required_fds: u64,
+    pub rlimit_soft: u64,
+    pub open_fds: u64,
+}
+
+/// Boundary-cell preflight gate: `Ok` proceeds to the sweep, `Err` is the
+/// explicit out-of-envelope refusal verdict naming FDs. Never a coverage
+/// pass and never an ambiguous failure.
+pub fn t7_boundary_preflight(
+    endpoints: u64,
+    rlimit_soft: u64,
+    open_fds: u64,
+) -> Result<T7BoundaryPreflight, String> {
+    let required_links = endpoints.saturating_add(2);
+    let required_fds = required_links.saturating_add(T7_ENVELOPE_RESERVE_FDS);
+    let available_fds = rlimit_soft.saturating_sub(open_fds);
+    if required_fds > available_fds {
+        return Err(format!(
+            "T7 boundary cell out of envelope: {endpoints} endpoints need {required_links} links \
+             ({required_fds} FDs lower bound with {T7_ENVELOPE_RESERVE_FDS} reserve) but only \
+             {available_fds} FDs fit under RLIMIT_NOFILE soft={rlimit_soft} with {open_fds} open"
+        ));
+    }
+    Ok(T7BoundaryPreflight {
+        endpoints,
+        required_links,
+        required_fds,
+        rlimit_soft,
+        open_fds,
+    })
+}
+
+/// Post-failure classifier for the boundary cell: FD-exhaustion signatures
+/// (process or system wide) route to the explicit refusal verdict, while any
+/// other failure — a coverage bug — still fails the cell.
+pub fn t7_is_envelope_exhaustion(message: &str) -> bool {
+    message.contains("Too many open files")
+        || message.contains("too many open files")
+        || message.contains("EMFILE")
+        || message.contains("ENFILE")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

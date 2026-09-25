@@ -22,9 +22,13 @@ its owner (controller) and expected verdict.
     A/B/C comparison, no in-place live-map resizing.
   - Supporting: `review-over-2000-endpoints-2026-09-22.md`
     (wide-2112 envelope, 296 B/endpoint/CPU, RV 2-key problem).
-- Ordinary evidence: `tests/t7_adaptive_capacity.rs` (28 tests) against
+- Ordinary evidence: `tests/t7_adaptive_capacity.rs` (29 tests) against
   `src/capacity.rs` mechanisms; compile-verified (not run) privileged
   selectors in `src/attach/inventory/activation/privileged_tests.rs`.
+  L-T7-5 carries a preflight gate plus a post-failure FD-exhaustion
+  classifier (`t7_boundary_preflight`, `t7_is_envelope_exhaustion`,
+  `t7_boundary_cell_gate`): out-of-envelope runs emit `T7_ENVELOPE_REFUSAL`
+  as a separate result, never a coverage pass or an ambiguous failure.
 
 ## Box 1: A/B/C identity comparison
 

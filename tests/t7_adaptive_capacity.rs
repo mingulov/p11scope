@@ -1104,6 +1104,43 @@ fn capacity_preflight_budgets_for_t7_live_cells() {
     assert_eq!(directory.cost(12).per_cpu_payload_bytes, 6530 * 296 * 12);
 }
 
+// Box 6 (L-T7-5): the 8192 boundary cell refuses out-of-envelope runs with
+// an explicit FD-naming verdict instead of an ambiguous coverage failure.
+#[test]
+fn boundary_cell_preflight_refuses_out_of_envelope_with_fd_verdict() {
+    use p11scope::capacity::{
+        T7_ENVELOPE_RESERVE_FDS, t7_boundary_preflight, t7_is_envelope_exhaustion,
+    };
+    // Fits: the 8192 boundary under a generous host limit proceeds.
+    let fit = t7_boundary_preflight(8192, 1 << 20, 64).expect("fits");
+    assert_eq!(fit.endpoints, 8192);
+    assert_eq!(fit.required_links, 8194, "N entry plus 2 lifecycle links");
+    assert_eq!(
+        fit.required_fds,
+        8194 + T7_ENVELOPE_RESERVE_FDS,
+        "one FD per link lower bound plus the maps/evidence reserve"
+    );
+    // Refuses: the same cell under a tight limit names FDs and the limit.
+    let err = t7_boundary_preflight(8192, 4096, 64).unwrap_err();
+    for token in ["8192", "FD", "RLIMIT_NOFILE", "4096"] {
+        assert!(
+            err.contains(token),
+            "refusal names the envelope: {err}"
+        );
+    }
+    // Failure classification: FD-exhaustion signatures route to the refusal
+    // verdict; genuine coverage bugs still fail the cell.
+    assert!(t7_is_envelope_exhaustion(
+        "attach failed: Too many open files (os error 24)"
+    ));
+    assert!(t7_is_envelope_exhaustion("bpf link create: EMFILE"));
+    assert!(t7_is_envelope_exhaustion("map update: ENFILE"));
+    assert!(!t7_is_envelope_exhaustion(
+        "Inventory USAGE[3] did not latch its first call"
+    ));
+    assert!(!t7_is_envelope_exhaustion("incomplete Inventory link set"));
+}
+
 // Box 7: peak, current and retained are measured as separate dimensions.
 #[test]
 fn envelope_report_measures_peak_current_retained_separately() {

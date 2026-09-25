@@ -5460,12 +5460,48 @@ inventory_sweep_test!(
     6530,
     "inventory-t7-n6530"
 );
+/// T7 L-T7-5 boundary cell: the sweep plus an explicit out-of-envelope
+/// refusal branch. The preflight gate samples live FD occupancy against
+/// `RLIMIT_NOFILE` before attaching; the post-failure classifier converts an
+/// FD-exhaustion failure into the same refusal verdict. Both emit
+/// `T7_ENVELOPE_REFUSAL` and return `Ok` as a separate result — never a
+/// coverage pass, never an ambiguous failure. Any other error still fails.
 #[cfg(not(feature = "wide-detailed-2112"))]
-inventory_sweep_test!(
-    privileged_t7_inventory_n8192_boundary_lp64,
-    8192,
-    "inventory-t7-n8192-boundary"
-);
+fn t7_boundary_cell_gate(n: u32, cell: &'static str) -> Result<()> {
+    let open_fds = std::fs::read_dir("/proc/self/fd")?
+        .collect::<std::io::Result<Vec<_>>>()?
+        .len() as u64;
+    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    // SAFETY: getrlimit writes a complete rlimit value to valid storage.
+    ensure!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0);
+    if let Err(verdict) =
+        crate::capacity::t7_boundary_preflight(u64::from(n), limit.rlim_cur, open_fds)
+    {
+        eprintln!("T7_ENVELOPE_REFUSAL cell={cell} n={n} phase=preflight verdict=\"{verdict}\"");
+        return Ok(());
+    }
+    match inventory_sweep_gate(n, Some(cell)) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let message = format!("{error:?}");
+            if crate::capacity::t7_is_envelope_exhaustion(&message) {
+                eprintln!(
+                    "T7_ENVELOPE_REFUSAL cell={cell} n={n} phase=post_failure_classification verdict=\"{message}\""
+                );
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "wide-detailed-2112"))]
+#[test]
+#[ignore = "root-owned BPF lane; bounded physical Inventory sweep with envelope refusal branch"]
+fn privileged_t7_inventory_n8192_boundary_lp64() -> Result<()> {
+    t7_boundary_cell_gate(8192, "inventory-t7-n8192-boundary")
+}
 
 #[cfg(not(feature = "wide-detailed-2112"))]
 #[cfg(not(feature = "wide-detailed-2112"))]

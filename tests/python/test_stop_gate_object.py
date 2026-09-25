@@ -203,6 +203,114 @@ class StopGate(unittest.TestCase):
                 self.reject(bad, variant, 'continuation re-checks the gate')
                 print(f'verified {variant} continuation-recheck')
 
+    @staticmethod
+    def gate_null_branch(analysis, pc, text):
+        """The tested register if this branch null-checks the gate cell."""
+        match = C.GATE_NULL_EQ.fullmatch(text) or C.GATE_NULL_NE.fullmatch(text)
+        if match is None:
+            return None
+        return match.group(1) if analysis.is_gate_cell(pc, match.group(1)) else None
+
+    def test_leave_guard_inventory(self):
+        for variant, disassembly in self.objects:
+            with self.subTest(variant=variant):
+                analyses = self.analyses(disassembly, variant)
+                nongate_found = False
+                for name, entry in sorted(analyses.items()):
+                    with self.subTest(program=name):
+                        guards = entry.leave_guards
+                        self.assertEqual(len(guards), 1, (name, sorted(guards)))
+                        (guard, null_edge) = next(iter(guards.items()))
+                        text = decoded_text(entry, guard)
+                        match = C.GATE_NULL_EQ.fullmatch(text) or C.GATE_NULL_NE.fullmatch(text)
+                        self.assertIsNotNone(match, (name, guard, text))
+                        target = guard + 1 + int(match.group(2), 16)
+                        sibling = guard + 1 if '==' in text else target
+                        if '==' in text:
+                            self.assertEqual(null_edge, target)
+                        else:
+                            self.assertEqual(null_edge, guard + 1)
+                        # The sibling path still holds the decrement: walk at
+                        # most two straight-line steps to a classified dec.
+                        current, steps, found = sibling, 0, None
+                        while steps <= 2:
+                            if current in entry.dec_sites:
+                                found = current
+                                break
+                            successors = entry.consumer.graph.get(current, ())
+                            if len(successors) != 1:
+                                break
+                            current, steps = successors[0], steps + 1
+                        self.assertIsNotNone(found, (name, guard, text))
+                        # Every other gate-cell null check (enter's) is not a
+                        # guard, and no non-gate null check is either.
+                        others = [pc for pc, candidate in entry.consumer.insns
+                                  if pc != guard
+                                  and self.gate_null_branch(entry, pc, candidate) is not None]
+                        if entry.role in (C.ENTER, C.CARRY):
+                            self.assertEqual(len(others), 1, (name, others))
+                        else:
+                            self.assertEqual(others, [], (name, others))
+                        for pc, candidate in entry.consumer.insns:
+                            branch = (C.GATE_NULL_EQ.fullmatch(candidate)
+                                      or C.GATE_NULL_NE.fullmatch(candidate))
+                            if branch is not None and self.gate_null_branch(
+                                    entry, pc, candidate) is None:
+                                nongate_found = True
+                                self.assertNotIn(pc, guards, (name, pc, candidate))
+                self.assertTrue(nongate_found, variant)
+                print(f'verified {variant} leave-guard-inventory')
+
+    def test_leave_guard_shape_b_dissolution(self):
+        for variant, disassembly in self.objects:
+            with self.subTest(variant=variant):
+                program = self.analyses(disassembly, variant)['sched_process_exec']
+                self.assertEqual(len(program.dec_sites), 1)
+                (pc,) = sorted(program.dec_sites)
+                bad = replace_decoded(disassembly, 'sched_process_exec', pc,
+                                      decoded_text(program, pc), 'r0 = r0')
+                self.reject(bad, variant, 'exit without a balancing decrement')
+                print(f'verified {variant} shape-b-dissolution')
+
+    def test_leave_guard_direction_flip_rejected(self):
+        for variant, disassembly in self.objects:
+            with self.subTest(variant=variant):
+                entry = self.analyses(disassembly, variant)['p11_entry']
+                self.assertEqual(len(entry.leave_guards), 1)
+                (pc,) = sorted(entry.leave_guards)
+                old = decoded_text(entry, pc)
+                self.assertIn('== 0x0', old)
+                bad = replace_decoded(disassembly, 'p11_entry', pc,
+                                      old, old.replace('==', '!='))
+                self.reject(bad, variant, 'exit without a balancing decrement')
+                print(f'verified {variant} guard-direction-flip')
+
+    def test_capture_after_null_skip_rejected(self):
+        # The leave-tail worker has no enter/deny path, so a capture made
+        # reachable from the null edge arrives excused: the balance walk
+        # must fail it. (On p11_entry the same mutant trips
+        # the earlier CAS-before-capture clause via the deny path instead,
+        # so the worker isolates the excused-capture clause.)
+        for variant, disassembly in self.objects:
+            with self.subTest(variant=variant):
+                worker = self.analyses(disassembly, variant)['interface_list_worker']
+                self.assertEqual(len(worker.leave_guards), 1)
+                (guard,) = sorted(worker.leave_guards)
+                null_target = worker.leave_guards[guard]
+                old = decoded_text(worker, null_target)
+                self.assertNotIn('goto', old)
+                natives = [pc for pc in worker.capture_sites
+                           if worker.consumer.calls.get(pc, '').startswith('p11_')
+                           and pc < guard]
+                self.assertTrue(natives, (variant, guard))
+                capture = max(natives)
+                offset = (null_target + 1) - capture
+                self.assertGreater(offset, 0)
+                bad = replace_decoded(disassembly, 'interface_list_worker', null_target,
+                                      old, f'goto -0x{offset:x}')
+                self.reject(bad, variant, 'capture-map access outside admission')
+                print(f'verified {variant} capture-after-null-skip')
+
     def test_cas_operand_nonzero(self):
         for variant, disassembly in self.objects:
             with self.subTest(variant=variant):

@@ -4176,6 +4176,10 @@ fn capture_profile(
                         kernel_evidence.ring_loss,
                         context.0.capture_facts().discovery_losses()[0],
                     );
+                    // Pre-publication detach work only: the terminal
+                    // callback publishes before the producers detach, so
+                    // this reads 0 in every Detailed report and the
+                    // post-publication teardown stays explicitly unmeasured.
                     consumers.scheduling.add_phase(
                         SchedulingPhase::Detach,
                         Duration::from_millis(context.1.detach_wall_ms()),
@@ -4761,6 +4765,10 @@ fn capture_trace(
                         terminal_kernel.ring_loss,
                         context.0.capture_facts().discovery_losses()[0],
                     );
+                    // Pre-publication detach work only: the terminal
+                    // callback publishes before the producers detach, so
+                    // this reads 0 in every Detailed report and the
+                    // post-publication teardown stays explicitly unmeasured.
                     consumers.scheduling.add_phase(
                         SchedulingPhase::Detach,
                         Duration::from_millis(context.1.detach_wall_ms()),
@@ -5157,8 +5165,10 @@ pub(crate) enum SchedulingPhase {
 }
 
 /// Capture-lifetime consumer-scheduling counters. The loss splits are
-/// sampled at loop end (capture phase) and at terminal start (detach
-/// window); everything else accumulates per tick.
+/// sampled at loop end (capture phase) and at the terminal snapshot
+/// (quiesce + terminal-drain window; the `detach_*` names are kept for
+/// schema stability but the window ends before the post-publication
+/// detach); everything else accumulates per tick.
 #[derive(Debug, Default)]
 pub(crate) struct SchedulingAccumulator {
     drain_repolls: u64,
@@ -5235,6 +5245,10 @@ impl SchedulingAccumulator {
         self.loop_ended = true;
     }
 
+    /// Records the terminal-snapshot loss readings as the post-loop-end
+    /// share: the losses accrued after the capture loop ended through the
+    /// terminal snapshot (the quiesce + terminal-drain window), excluding
+    /// anything lost during or after the post-publication producer detach.
     pub(crate) fn note_terminal(&mut self, event_loss: u64, discovery_loss: u64) {
         self.detach_event_loss = event_loss.saturating_sub(self.capture_event_loss);
         self.detach_discovery_loss = discovery_loss.saturating_sub(self.capture_discovery_loss);
@@ -5841,37 +5855,76 @@ mod tests {
 
     static ACTUAL_SIGNAL_TEST: Mutex<()> = Mutex::new(());
 
-    /// Fake session recording every detach's duration, reporting wall time
-    /// through the same helper the real `Session` uses.
-    struct FakeDetachSession {
-        wall_ms: u64,
-        durations_ms: Vec<u64>,
-    }
-
-    impl FakeDetachSession {
-        fn detach(&mut self, had_links: bool, elapsed_ms: u64) {
-            self.durations_ms.push(elapsed_ms);
-            self.wall_ms =
-                crate::attach::record_detach_wall_ms(self.wall_ms, had_links, elapsed_ms);
-        }
-    }
-
+    /// I3: the published document's detach fields report pre-publication
+    /// work only. The terminal callback publishes before the producers
+    /// detach (quiesce-then-publish, so the report never waits on link
+    /// teardown): `phase_ms.detach` carries the detach work completed
+    /// before publication — 0 in every Detailed report, with the
+    /// post-publication teardown explicitly unmeasured by design — and the
+    /// `detach_*_loss` fields carry the loop-end→terminal-snapshot delta.
+    /// This inspects the real published JSON (accumulator → snapshot →
+    /// evidence → profile_json), not the helper through a fake, and pins
+    /// the schema definitions of all three fields.
     #[test]
-    fn run_reports_the_detach_time_of_the_real_teardown() {
-        // The `run` sequence: the post-publication detach closes the real
-        // links, then any later detach finds no links. The report must
-        // carry the real teardown's time, not the empty call's ~0 ms.
-        let mut session = FakeDetachSession {
-            wall_ms: 0,
-            durations_ms: Vec::new(),
+    fn published_detach_fields_report_pre_publication_work_only() {
+        let plan = crate::plan::AttachPlan::from_slots(vec![]);
+        let state = semantics::State::with_policy(&plan, crate::attach::CapturePolicy::Allowlisted);
+        let capture = render::CaptureMeta {
+            started: "t0",
+            ended: "t1",
+            kernel: "test",
+            policy: crate::attach::CapturePolicy::Allowlisted,
+            scope: "pid",
+            ring_bytes: p11scope_ebpf_common::RING_BYTES,
+            drain_interval_ms: 1000,
         };
-        session.detach(true, 120);
-        session.detach(false, 0);
-        assert_eq!(session.durations_ms, vec![120, 0]);
+        let document = |detach_ms: u64| {
+            let mut acc = SchedulingAccumulator::default();
+            if detach_ms > 0 {
+                acc.add_phase(SchedulingPhase::Detach, Duration::from_millis(detach_ms));
+            }
+            acc.note_loop_end(10, 4);
+            acc.note_terminal(14, 7);
+            let mut ev = crate::render::tests::evidence();
+            ev.scheduling = acc.snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64);
+            render::profile_json(&[], render::VersionedEvidence::wrap(&ev), &state, &capture)
+        };
+        // Pre-publication detach work reaches the document through the
+        // real path; the loss fields carry the terminal-minus-loop-end
+        // delta.
+        let j = document(120);
+        let scheduling = &j["evidence"]["scheduling"];
+        assert_eq!(scheduling["phase_ms"]["detach"].as_u64(), Some(120));
+        assert_eq!(scheduling["detach_event_loss"].as_u64(), Some(4));
+        assert_eq!(scheduling["detach_discovery_loss"].as_u64(), Some(3));
+        // The quiesce-then-publish flow records no pre-publication detach
+        // work: the document carries 0, explicitly unmeasured by design.
+        let j = document(0);
         assert_eq!(
-            session.wall_ms, 120,
-            "the reported detach time must come from the real teardown, not the second empty call"
+            j["evidence"]["scheduling"]["phase_ms"]["detach"].as_u64(),
+            Some(0)
         );
+        // The schema defines all three fields as pre-publication windows.
+        let schema_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("docs/schema/observed-profile-v3.schema.json");
+        let schema: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&schema_path).unwrap()).unwrap();
+        let properties =
+            &schema["properties"]["evidence"]["properties"]["scheduling"]["properties"];
+        let description =
+            |field: &serde_json::Value| field["description"].as_str().unwrap_or("").to_string();
+        assert!(
+            description(&properties["phase_ms"]["properties"]["detach"])
+                .contains("completed before publication"),
+            "phase_ms.detach must be defined as pre-publication work"
+        );
+        for field in ["detach_event_loss", "detach_discovery_loss"] {
+            assert!(
+                description(&properties[field])
+                    .contains("after the capture loop ended through the terminal snapshot"),
+                "{field} must be defined as the loop-end to terminal-snapshot window"
+            );
+        }
     }
 
     fn spawn(program: &str, args: &[&str]) -> OwnedChild {

@@ -694,6 +694,10 @@ pub struct SchedulingPhaseMs {
     pub drain: u64,
     pub maps: u64,
     pub render: u64,
+    /// Producer-detach work completed before publication. The terminal
+    /// callback publishes before the producers detach
+    /// (quiesce-then-publish), so Detailed reports carry 0: the
+    /// post-publication teardown is explicitly unmeasured, by design.
     pub detach: u64,
 }
 
@@ -710,12 +714,17 @@ pub struct SchedulingEvidence {
     pub drain_budget_exhaustions: u64,
     /// Ring loss sampled at capture-loop end, before producer detach.
     pub capture_event_loss: u64,
-    /// Ring loss accrued during the detach window (post-detach minus
-    /// capture-phase).
+    /// Ring loss accrued after the capture loop ended through the
+    /// terminal snapshot (the quiesce + terminal-drain window): the
+    /// terminal reading minus the loop-end reading. Excludes anything
+    /// lost during or after the post-publication producer detach.
     pub detach_event_loss: u64,
     /// Discovery-ring loss at capture-loop end, before producer detach.
     pub capture_discovery_loss: u64,
-    /// Discovery-ring loss accrued during the detach window.
+    /// Discovery-ring loss accrued after the capture loop ended through
+    /// the terminal snapshot (the quiesce + terminal-drain window): the
+    /// terminal reading minus the loop-end reading. Excludes anything
+    /// lost during or after the post-publication producer detach.
     pub detach_discovery_loss: u64,
     /// Explicit record bound of the post-detach terminal event drain.
     pub terminal_drain_bound: u64,

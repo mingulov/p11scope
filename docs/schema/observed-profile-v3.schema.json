@@ -177,9 +177,9 @@
             "drain_repolls": {"type": "integer", "minimum": 0},
             "drain_budget_exhaustions": {"type": "integer", "minimum": 0},
             "capture_event_loss": {"type": "integer", "minimum": 0},
-            "detach_event_loss": {"type": "integer", "minimum": 0},
+            "detach_event_loss": {"type": "integer", "minimum": 0, "description": "EVENTS ring losses accrued after the capture loop ended through the terminal snapshot (the quiesce + terminal-drain window): the terminal reading minus the loop-end reading. Excludes anything lost during or after the post-publication producer detach."},
             "capture_discovery_loss": {"type": "integer", "minimum": 0},
-            "detach_discovery_loss": {"type": "integer", "minimum": 0},
+            "detach_discovery_loss": {"type": "integer", "minimum": 0, "description": "Discovery-ring losses accrued after the capture loop ended through the terminal snapshot (the quiesce + terminal-drain window): the terminal reading minus the loop-end reading. Excludes anything lost during or after the post-publication producer detach."},
             "terminal_drain_bound": {"const": 65536},
             "terminal_drain_truncated": {"type": "boolean"},
             "sink_policy": {"const": "bounded-wait-drop"},
@@ -197,7 +197,7 @@
                 "drain": {"type": "integer", "minimum": 0},
                 "maps": {"type": "integer", "minimum": 0},
                 "render": {"type": "integer", "minimum": 0},
-                "detach": {"type": "integer", "minimum": 0}
+                "detach": {"type": "integer", "minimum": 0, "description": "Wall time of producer-detach work completed before publication, in whole milliseconds. The terminal callback publishes before the producers detach (quiesce-then-publish, so the report never waits on link teardown), so Detailed reports carry 0 here: post-publication teardown is explicitly unmeasured in the report, by design."}
               }
             }
           }

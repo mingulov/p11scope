@@ -3485,7 +3485,9 @@ impl Session {
     }
 
     /// Wall time the producer detach took, in whole milliseconds; zero
-    /// when detach never ran.
+    /// when detach never ran. Reports read this before publication (the
+    /// terminal callback publishes before the producers detach), so they
+    /// carry pre-publication detach work only.
     pub(crate) fn detach_wall_ms(&self) -> u64 {
         self.detach_wall_ms
     }
@@ -3944,7 +3946,7 @@ fn detach_wall_ms_since(start: std::time::Instant) -> u64 {
     start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
 
-/// Next reported detach wall time: a detach that finds no links keeps
+/// Next recorded detach wall time: a detach that finds no links keeps
 /// the real teardown's time instead of overwriting it with ~0 ms.
 pub(crate) fn record_detach_wall_ms(previous_ms: u64, detached_any: bool, elapsed_ms: u64) -> u64 {
     if detached_any {
@@ -4255,6 +4257,15 @@ mod tests {
         assert_eq!(super::detach_wall_ms_since(now), 0);
         let past = now - std::time::Duration::from_millis(61_234);
         assert_eq!(super::detach_wall_ms_since(past), 61_234);
+    }
+
+    #[test]
+    fn empty_detach_keeps_the_real_teardown_time() {
+        // The `60e7500` retention: the post-publication detach closes the
+        // real links, then any later detach finds no links and must not
+        // overwrite the real teardown's time with ~0 ms.
+        assert_eq!(super::record_detach_wall_ms(0, true, 120), 120);
+        assert_eq!(super::record_detach_wall_ms(120, false, 0), 120);
     }
 
     #[test]

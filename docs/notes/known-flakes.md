@@ -123,6 +123,10 @@ durable facts, not the log paths.
   same assertion, now at `src/run.rs:5291`. Three isolated re-runs of the
   same default lib test binary: PASS (0.01 s each). The wide-profile run of
   the same gate passed this test.
+- **Recurrence 2026-09-25 (canonical gate at `90b44ff`, wide profile):**
+  same assertion, now at `src/run.rs:6555`. Three isolated re-runs of the
+  same wide lib test binary (`p11scope-c0b65c82a1d894ac --exact ...`):
+  PASS. Default profile of the same gate passed this test. Gate accepted.
 
 ## 6. `release_seal_denies_the_caller_path_to_every_reached_command` (artifact_contracts; new in Task 2)
 

@@ -5760,6 +5760,39 @@ mod tests {
 
     static ACTUAL_SIGNAL_TEST: Mutex<()> = Mutex::new(());
 
+    /// Fake session recording every detach's duration, reporting wall time
+    /// through the same helper the real `Session` uses.
+    struct FakeDetachSession {
+        wall_ms: u64,
+        durations_ms: Vec<u64>,
+    }
+
+    impl FakeDetachSession {
+        fn detach(&mut self, had_links: bool, elapsed_ms: u64) {
+            self.durations_ms.push(elapsed_ms);
+            self.wall_ms =
+                crate::attach::record_detach_wall_ms(self.wall_ms, had_links, elapsed_ms);
+        }
+    }
+
+    #[test]
+    fn run_reports_the_detach_time_of_the_real_teardown() {
+        // The `run` sequence: the post-publication detach closes the real
+        // links, then any later detach finds no links. The report must
+        // carry the real teardown's time, not the empty call's ~0 ms.
+        let mut session = FakeDetachSession {
+            wall_ms: 0,
+            durations_ms: Vec::new(),
+        };
+        session.detach(true, 120);
+        session.detach(false, 0);
+        assert_eq!(session.durations_ms, vec![120, 0]);
+        assert_eq!(
+            session.wall_ms, 120,
+            "the reported detach time must come from the real teardown, not the second empty call"
+        );
+    }
+
     fn spawn(program: &str, args: &[&str]) -> OwnedChild {
         OwnedChild::spawn(
             OsString::from(program),

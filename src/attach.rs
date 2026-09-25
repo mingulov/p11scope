@@ -3469,7 +3469,8 @@ impl Session {
         } else {
             let _ = (second_signal, out);
         }
-        self.detach_wall_ms = detach_wall_ms_since(start);
+        self.detach_wall_ms =
+            record_detach_wall_ms(self.detach_wall_ms, had_links, detach_wall_ms_since(start));
         finish_producer_detach(
             &mut self.producers_detached,
             &self.detach_failures,
@@ -3941,6 +3942,16 @@ fn detach_registered_link(ebpf: &mut Ebpf, link: RegisteredLink) -> Result<()> {
 
 fn detach_wall_ms_since(start: std::time::Instant) -> u64 {
     start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+/// Next reported detach wall time: a detach that finds no links keeps
+/// the real teardown's time instead of overwriting it with ~0 ms.
+pub(crate) fn record_detach_wall_ms(previous_ms: u64, detached_any: bool, elapsed_ms: u64) -> u64 {
+    if detached_any {
+        elapsed_ms
+    } else {
+        previous_ms
+    }
 }
 
 fn finish_producer_detach(

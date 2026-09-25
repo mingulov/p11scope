@@ -271,16 +271,24 @@ fn write_progress_line(out: &mut dyn Write, progress: &CleanupProgress) {
     );
 }
 
+/// First-pass poll: a fast session settles here instead of sleeping
+/// the full printed cadence (10-50 ms keeps every capture's exit fast
+/// without a busy spin).
+const FIRST_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 /// Print a progress line about once per `poll_interval` until the worker
-/// joins, then a final completed/incomplete line. A second signal prints
-/// the progress and "cleanup incomplete" and returns `Interrupted`; the
-/// caller exits and the kernel finishes the remaining closes at exit.
+/// joins, then a final completed/incomplete line. The first pass polls
+/// without printing after a short sleep, so a fast session exits in
+/// milliseconds instead of sleeping the full cadence. A second signal
+/// prints the progress and "cleanup incomplete" and returns `Interrupted`;
+/// the caller exits and the kernel finishes the remaining closes at exit.
 pub(crate) fn drive_cleanup(
     mut worker: CleanupWorker,
     second_signal: impl Fn() -> bool,
     out: &mut dyn Write,
     poll_interval: Duration,
 ) -> CleanupExit {
+    let mut first_poll = true;
     loop {
         if second_signal() {
             let progress = worker.progress();
@@ -311,8 +319,16 @@ pub(crate) fn drive_cleanup(
             }
             return CleanupExit::Completed(receipt);
         }
-        write_progress_line(out, &worker.progress());
-        std::thread::sleep(poll_interval);
+        if first_poll {
+            // A fast session is already settling: re-poll quickly without
+            // printing rather than taxing every capture the full cadence.
+            // Later passes print about once per `poll_interval`.
+            first_poll = false;
+            std::thread::sleep(poll_interval.min(FIRST_POLL_INTERVAL));
+        } else {
+            write_progress_line(out, &worker.progress());
+            std::thread::sleep(poll_interval);
+        }
     }
 }
 
@@ -578,5 +594,84 @@ mod tests {
         }
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("cleanup incomplete"), "got: {text}");
+    }
+
+    /// M2: a fast session detaches in well under a second. The drive runs
+    /// with the production 1 s printed cadence; the first close outlasts
+    /// the first check but settles within the short first poll, so a
+    /// drive that sleeps the full interval before re-polling takes the
+    /// whole second.
+    #[test]
+    fn fast_session_detaches_well_under_one_second() {
+        let worker = CleanupWorker::pre_start_with(
+            Box::new(|_link, role| {
+                if role == ProducerProgram::UProbe("p11_entry") {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(())
+            }),
+            scripted_clock(Arc::new(Mutex::new(Duration::ZERO))),
+        );
+        worker.submit(
+            vec![
+                multi(ProducerProgram::UProbe("p11_entry")),
+                multi(ProducerProgram::UProbe("p11_return")),
+            ],
+            DetachOrder,
+        );
+        let mut out = Vec::new();
+        let start = std::time::Instant::now();
+        let exit = drive_cleanup(worker, || false, &mut out, Duration::from_secs(1));
+        let elapsed = start.elapsed();
+        assert!(matches!(exit, CleanupExit::Completed(_)));
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "a fast session must not sleep the full 1 s cadence, took {elapsed:?}"
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("cleanup completed, 2/2 links released"),
+            "got: {text}"
+        );
+    }
+
+    /// M2: the printed cadence stays about once per poll interval on a
+    /// slow session. Three 150 ms closes under a 100 ms cadence print
+    /// about four progress lines — neither a line per fast poll nor
+    /// silence. (The production cadence is 1 s; the 100 ms interval tests
+    /// the same mechanism without a multi-second test.)
+    #[test]
+    fn slow_session_keeps_about_one_line_per_poll_interval() {
+        let worker = CleanupWorker::pre_start_with(
+            Box::new(|_link, _| {
+                std::thread::sleep(Duration::from_millis(150));
+                Ok(())
+            }),
+            scripted_clock(Arc::new(Mutex::new(Duration::ZERO))),
+        );
+        worker.submit(
+            vec![
+                multi(ProducerProgram::UProbe("p11_entry")),
+                multi(ProducerProgram::UProbe("p11_return")),
+                multi(ProducerProgram::RawTracePoint("sched_process_exit")),
+            ],
+            DetachOrder,
+        );
+        let mut out = Vec::new();
+        let exit = drive_cleanup(worker, || false, &mut out, Duration::from_millis(100));
+        assert!(matches!(exit, CleanupExit::Completed(_)));
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("cleanup completed, 3/3 links released"),
+            "got: {text}"
+        );
+        let progress_lines = text
+            .lines()
+            .filter(|line| line.contains("links released") && !line.contains("cleanup completed"))
+            .count();
+        assert!(
+            (2..=6).contains(&progress_lines),
+            "about one line per 100 ms over ~450 ms, got {progress_lines} in: {text}"
+        );
     }
 }

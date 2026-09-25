@@ -245,9 +245,9 @@ class EntryObjectTests(unittest.TestCase):
             ("p11_entry_template_types", site('unsafe', 'p11_entry_template_types', 'if\\ r7\\ ==\\ 0x0\\ goto\\ \\+0x17'), "if r7 != 0x0 goto +0x17"),
             ("p11_entry_template_second", site('unsafe', 'p11_entry_template_second', 'r9\\ \\+=\\ 0xb0'), "r9 += 0x60"),
             ("p11_entry_template_second", site('unsafe', 'p11_entry_template_second', 'r4\\ =\\ r9'), "r4 = r10"),
-            ("p11_return", 1311, "if r8 != 0x1 goto +0x1a"),
-            ("p11_return", 1322, "r2 = 0x8"),
-            ("p11_return", 1493, "r3 = *(u64 *)(r10 - 0xf8)"),
+            ("p11_return", 1404, "if r8 != 0x1 goto +0x1a"),
+            ("p11_return", 1415, "r2 = 0x8"),
+            ("p11_return", 1586, "r3 = *(u64 *)(r10 - 0xf8)"),
         ]
         for function, pc, new in cases:
             with self.subTest(function=function, pc=pc):
@@ -710,9 +710,9 @@ class EntryObjectTests(unittest.TestCase):
                                 CHECKER["contract"](mutate(disassembly, name, argument_pc, old, new), variant)
 
     def test_atomic_event_slot_corruption(self):
-        changed = mutate(OBJECTS["default"], "p11_return", 1362,
+        changed = mutate(OBJECTS["default"], "p11_return", 1455,
                          "*(u64 *)(r0 + 0x60) = r1", "r1 = 0x400")
-        changed = mutate(changed, "p11_return", 1363,
+        changed = mutate(changed, "p11_return", 1456,
                          "r1 = *(u64 *)(r10 - 0x128)",
                          "r9 = atomic_fetch_or((u64 *)(r0 + 0x68), r9)")
         with self.assertRaisesRegex(RuntimeError, r"Event.slot corrupted before submit"):

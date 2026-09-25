@@ -21,8 +21,21 @@ def function(source, name):
     return source[start:end]
 
 
+def wrapper_contract(main, name):
+    wrapper = function(main, name)
+    head = re.sub(r"//[^\n]*", "", wrapper)
+    if not head.startswith("{\n    if !stop_gate_enter() {\n        return 0;\n    }"):
+        raise AssertionError(f"{name} must admit through the stop gate first")
+    if wrapper.count("stop_gate_enter") != 1 or wrapper.count("stop_gate_leave") != 1:
+        raise AssertionError(f"{name} must enter the gate once and leave once")
+    if (wrapper.count(name + "_impl(") != 1 or "p11_owner_cleanup" in wrapper
+            or "p11_root_current_exit" in wrapper):
+        raise AssertionError(f"{name} must delegate its guarded body to {name}_impl")
+
+
 def hook_contract(main, identity):
-    exit_body = function(main, "sched_process_exit")
+    wrapper_contract(main, "sched_process_exit")
+    exit_body = function(main, "sched_process_exit_impl")
     owner = "unsafe { p11_owner_cleanup() };"
     owner_at = exit_body.index(owner)
     before_owner = re.sub(r"//[^\n]*", "", exit_body[:owner_at]).strip()
@@ -34,17 +47,22 @@ def hook_contract(main, identity):
         r'\s*unsafe\s*\{\s*p11_root_current_exit\(\)\s*\};', tail)
     if root is None or exit_body.count("p11_root_current_exit") != 1:
         raise AssertionError("Detailed root cleanup must immediately follow owner cleanup; Inventory must omit it")
-    if "p11_root_current_exit" in function(main, "sched_process_exec"):
+    wrapper_contract(main, "sched_process_exec")
+    if ("p11_root_current_exit" in function(main, "sched_process_exec")
+            or "p11_root_current_exit" in function(main, "sched_process_exec_impl")):
         raise AssertionError("exec must retain affiliation")
-    call = function(main, "p11_return")
-    if "p11_root_current_exit" in call:
+    if ("p11_root_current_exit" in function(main, "p11_return")
+            or "p11_root_current_exit" in function(main, "p11_return_impl")):
         raise AssertionError("return must retain affiliation")
+    call = function(main, "p11_return_impl")
     if call.index("image_pair_matches") > call.index("p11_root_current_tag"):
         raise AssertionError("CALL tag must follow image guard")
     fork = function(main, "p11_link_emit_fork")
     if "root_affiliation: unsafe { p11_root_current_tag() }" not in fork:
         raise AssertionError("FORK must tag only the emitting parent")
     birth = identity[identity.index("int task_newtask("):]
+    if not birth.index("p11_stop_gate_enter()") < birth.index("p11_root_propagate_thread("):
+        raise AssertionError("fork admission must precede root propagation")
     if not birth.index("p11_root_propagate_thread(") < birth.index("if (clone_flags & CLONE_THREAD)") < birth.index("p11_link_fork_allowed()"):
         raise AssertionError("pre-wake thread propagation must precede semantic filters")
 
@@ -54,7 +72,7 @@ class RootAffiliationTests(unittest.TestCase):
         main = (ROOT / "crates/ebpf/src/main.rs").read_text()
         identity = (ROOT / "crates/ebpf/native/image_identity_fork.c").read_text()
         hook_contract(main, identity)
-        exit_body = function(main, "sched_process_exit")
+        exit_body = function(main, "sched_process_exit_impl")
         root_start = exit_body.index('#[cfg(not(feature = "inventory-only"))]')
         root_end = exit_body.index('};', root_start) + 2
         root_block = exit_body[root_start:root_end]
@@ -78,10 +96,26 @@ class RootAffiliationTests(unittest.TestCase):
             main.replace("pub fn p11_return(ctx: RetProbeContext) -> u32 {",
                          "pub fn p11_return(ctx: RetProbeContext) -> u32 { unsafe { p11_root_current_exit() };"),
         ]
+        exit_admission = ("pub fn sched_process_exit(_ctx: RawTracePointContext) -> u32 {\n"
+                          "    if !stop_gate_enter() {\n        return 0;\n    }\n")
+        exit_call = "    let rc = sched_process_exit_impl(_ctx);\n"
+        mutants += [
+            main.replace(exit_admission,
+                         "pub fn sched_process_exit(_ctx: RawTracePointContext) -> u32 {\n", 1),
+            main.replace(exit_call + "    stop_gate_leave();\n", exit_call, 1),
+            main.replace(exit_call, "    unsafe { p11_owner_cleanup() };\n" + exit_call, 1),
+            main.replace("pub fn sched_process_exec(_ctx: RawTracePointContext) -> u32 {\n"
+                         "    if !stop_gate_enter() {\n        return 0;\n    }\n",
+                         "pub fn sched_process_exec(_ctx: RawTracePointContext) -> u32 {\n", 1),
+        ]
         for mutant in mutants:
             self.assertNotEqual(mutant, main, "mutation must change the tested source")
             with self.assertRaises((AssertionError, ValueError)):
                 hook_contract(mutant, identity)
+        gate_removed = identity.replace("    if (!p11_stop_gate_enter())\n        return 0;\n", "")
+        self.assertNotEqual(gate_removed, identity, "mutation must change the tested source")
+        with self.assertRaises((AssertionError, ValueError)):
+            hook_contract(main, gate_removed)
 
     def test_native_production_helpers(self):
         with tempfile.TemporaryDirectory(prefix="p11scope-root-affiliation-") as directory:

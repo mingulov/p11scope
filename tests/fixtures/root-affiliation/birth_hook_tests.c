@@ -26,6 +26,8 @@ static u64 parent_tag = 1;
 static u64 child_tag;
 static u64 parent_cookie = PARENT_COOKIE;
 static u64 child_cookie = CHILD_COOKIE;
+unsigned char STOP_GATE;
+static u64 stop_gate_cell;
 static struct root_affiliation_control root_ctl = { .affiliation_reserved = 1 };
 static struct control cookie_ctl = {
     .limit = IMAGE_IDENTITY_TICKET_LIMIT,
@@ -49,6 +51,8 @@ static void *lookup(void *map, const void *key)
     assert(*(const u32 *)key == 0);
     if (map == &ROOT_CTL)
         return &root_ctl;
+    if (map == &STOP_GATE)
+        return &stop_gate_cell;
     assert(map == &COOKIE_CTL);
     return &cookie_ctl;
 }
@@ -131,6 +135,7 @@ int main(void)
     bpf_get_current_task_btf = identity_current;
     bpf_map_lookup_elem = lookup;
     bpf_task_storage_get = cookie_storage;
+    stop_gate_map_lookup = lookup;
     caller.group_leader = &parent_leader;
     parent_leader.group_leader = &parent_leader;
     child.group_leader = &child;
@@ -222,6 +227,23 @@ int main(void)
     assert(allowed_calls == 1 && !emit_calls && cookie_get_calls == 2);
     assert_cookies_unchanged(PARENT_COOKIE, 0, 17);
     child_cookie = CHILD_COOKIE;
+
+    /* A requested stop denies admission before root propagation or filtering. */
+    reset_observation();
+    allowed = 1;
+    stop_gate_cell = P11_STOP_GATE_STOP;
+    assert(!task_newtask(ctx));
+    assert(!child_tag && root_ctl.affiliation_reserved == 2 && !allowed_calls);
+    assert(!emit_calls && !cookie_get_calls);
+    assert(stop_gate_cell == P11_STOP_GATE_STOP);
+    assert_cookies_unchanged(PARENT_COOKIE, CHILD_COOKIE, 17);
+
+    /* Clearing the stop re-admits the hook; every admission is released. */
+    reset_observation();
+    stop_gate_cell = 0;
+    assert(!task_newtask(ctx));
+    assert(allowed_calls == 1 && emit_calls == 1 && cookie_get_calls == 2);
+    assert(stop_gate_cell == 0);
 
     puts("actual typed birth hook: root propagation precedes filtering; process FORK forwards exact identities");
 }

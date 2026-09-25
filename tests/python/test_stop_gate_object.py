@@ -162,7 +162,7 @@ class StopGate(unittest.TestCase):
                 (pc,) = sorted(pair.tail_sites)
                 bad = replace_decoded(disassembly, 'p11_entry_template_pair', pc,
                                       decoded_text(pair, pc), 'r0 = r0')
-                self.reject(bad, variant, 'pair program lost its tail call')
+                self.reject(bad, variant, 'carrying program lost its tail call')
                 print(f'verified {variant} pair-tail-removed')
 
     def test_pair_leave_before_tail(self):
@@ -202,6 +202,163 @@ class StopGate(unittest.TestCase):
                                       definition, old, new)
                 self.reject(bad, variant, 'continuation re-checks the gate')
                 print(f'verified {variant} continuation-recheck')
+
+    def test_cas_operand_nonzero(self):
+        for variant, disassembly in self.objects:
+            with self.subTest(variant=variant):
+                entry = self.analyses(disassembly, variant)['p11_entry']
+                self.assertGreaterEqual(len(entry.cas_sites), 1)
+                (pc,) = sorted(entry.cas_sites)[:1]
+                definition, register, old = self.zero_operand_def(entry, pc)
+                bad = replace_decoded(disassembly, 'p11_entry', definition,
+                                      old, f'{register} = 0x1')
+                self.reject(bad, variant, 'gate read CAS operand is nonzero')
+                print(f'verified {variant} cas-operand-nonzero')
+
+    def test_cas_operand_unknown(self):
+        for variant, disassembly in self.objects:
+            with self.subTest(variant=variant):
+                entry = self.analyses(disassembly, variant)['p11_entry']
+                self.assertGreaterEqual(len(entry.cas_sites), 1)
+                (pc,) = sorted(entry.cas_sites)[:1]
+                definition, register, old = self.zero_operand_def(entry, pc)
+                scratch = self.unknown_scratch(entry, definition, register)
+                bad = replace_decoded(disassembly, 'p11_entry', definition,
+                                      old, f'{register} = {scratch}')
+                self.reject(bad, variant, 'gate read CAS operand is not a known constant')
+                print(f'verified {variant} cas-operand-unknown')
+
+    def test_delta_non_unit(self):
+        for variant, disassembly in self.objects:
+            with self.subTest(variant=variant):
+                entry = self.analyses(disassembly, variant)['p11_entry']
+                self.assertEqual(len(entry.inc_sites), 1)
+                (pc,) = sorted(entry.inc_sites)
+                text = decoded_text(entry, pc)
+                match = C.GATE_ADD.fullmatch(text)
+                assert match, text
+                register = match.group(5)
+                assert register.startswith('r'), text
+                definitions = [at for at, candidate in entry.consumer.insns
+                               if at < pc and candidate == f'{register} = 0x1']
+                assert definitions, (entry.name, pc, text)
+                definition = max(definitions)
+                bad = replace_decoded(disassembly, 'p11_entry', definition,
+                                      f'{register} = 0x1', f'{register} = 0x2')
+                self.reject(bad, variant, 'gate delta is not +1/-1')
+                print(f'verified {variant} delta-non-unit')
+
+    def test_delta_unknown(self):
+        for variant, disassembly in self.objects:
+            with self.subTest(variant=variant):
+                entry = self.analyses(disassembly, variant)['p11_entry']
+                self.assertEqual(len(entry.inc_sites), 1)
+                (pc,) = sorted(entry.inc_sites)
+                text = decoded_text(entry, pc)
+                match = C.GATE_ADD.fullmatch(text)
+                assert match, text
+                register = match.group(5)
+                assert register.startswith('r'), text
+                definitions = [at for at, candidate in entry.consumer.insns
+                               if at < pc and candidate == f'{register} = 0x1']
+                assert definitions, (entry.name, pc, text)
+                definition = max(definitions)
+                scratch = self.unknown_scratch(entry, definition, register)
+                bad = replace_decoded(disassembly, 'p11_entry', definition,
+                                      f'{register} = 0x1', f'{register} = {scratch}')
+                self.reject(bad, variant, 'gate delta is not a known constant')
+                print(f'verified {variant} delta-unknown')
+
+    def test_cas_width_32(self):
+        for variant, disassembly in self.objects:
+            with self.subTest(variant=variant):
+                entry = self.analyses(disassembly, variant)['p11_entry']
+                self.assertGreaterEqual(len(entry.cas_sites), 1)
+                (pc,) = sorted(entry.cas_sites)[:1]
+                bad = replace_decoded(disassembly, 'p11_entry', pc,
+                                      'cmpxchg_64', 'cmpxchg_32')
+                self.reject(bad, variant, 'unrecognized gate compare-exchange')
+                print(f'verified {variant} cas-width-32')
+
+    def test_cas_offset_nonzero(self):
+        for variant, disassembly in self.objects:
+            with self.subTest(variant=variant):
+                entry = self.analyses(disassembly, variant)['p11_entry']
+                self.assertGreaterEqual(len(entry.cas_sites), 1)
+                (pc,) = sorted(entry.cas_sites)[:1]
+                text = decoded_text(entry, pc)
+                match = C.GATE_CAS.fullmatch(text)
+                assert match, text
+                _, _, base, sign, offset, _, _ = match.groups()
+                old = f'(r{base} {sign} 0x{offset},'
+                bad = replace_decoded(disassembly, 'p11_entry', pc,
+                                      old, f'(r{base} {sign} 0x8,')
+                self.reject(bad, variant, 'unrecognized gate compare-exchange')
+                print(f'verified {variant} cas-offset-nonzero')
+
+    def test_add_width_32(self):
+        for variant, disassembly in self.objects:
+            with self.subTest(variant=variant):
+                entry = self.analyses(disassembly, variant)['p11_entry']
+                self.assertEqual(len(entry.inc_sites), 1)
+                (pc,) = sorted(entry.inc_sites)
+                bad = replace_decoded(disassembly, 'p11_entry', pc,
+                                      '*(u64 *)', '*(u32 *)')
+                self.reject(bad, variant, 'unrecognized gate add')
+                print(f'verified {variant} add-width-32')
+
+    def test_add_offset_nonzero(self):
+        for variant, disassembly in self.objects:
+            with self.subTest(variant=variant):
+                entry = self.analyses(disassembly, variant)['p11_entry']
+                self.assertEqual(len(entry.dec_sites), 1)
+                (pc,) = sorted(entry.dec_sites)
+                text = decoded_text(entry, pc)
+                match = C.GATE_ADD.fullmatch(text)
+                assert match, text
+                _, base, sign, offset, _ = match.groups()
+                old = f'(r{base} {sign} 0x{offset})'
+                bad = replace_decoded(disassembly, 'p11_entry', pc,
+                                      old, f'(r{base} {sign} 0x8)')
+                self.reject(bad, variant, 'unrecognized gate add')
+                print(f'verified {variant} add-offset-nonzero')
+
+    @staticmethod
+    def zero_operand_def(analysis, pc):
+        """Locate the reaching `rN = 0x0` definition of a CAS zero operand.
+
+        Returns the definition pc, register, and old decoded text. The
+        operand must be callee-saved (calls between the definition and the
+        CAS preserve it) with no redefinition in between.
+        """
+        text = decoded_text(analysis, pc)
+        match = C.GATE_CAS.fullmatch(text)
+        assert match, text
+        for operand in (match.group(6), match.group(7)):
+            if int(operand) < 6:
+                continue
+            register = 'r' + operand
+            definitions = [at for at, candidate in analysis.consumer.insns
+                           if at < pc and candidate == f'{register} = 0x0']
+            if not definitions:
+                continue
+            definition = max(definitions)
+            shadowed = re.compile(rf'[rw]{operand} = .*')
+            for at, candidate in analysis.consumer.insns:
+                if definition < at < pc:
+                    assert not shadowed.fullmatch(candidate), (at, candidate)
+            return definition, register, f'{register} = 0x0'
+        raise AssertionError((analysis.name, pc, text))
+
+    @staticmethod
+    def unknown_scratch(analysis, definition, target):
+        """Pick a callee-saved register with no fact at the definition."""
+        state = analysis.facts.get(definition, {})
+        for operand in ('6', '7', '8', '9'):
+            scratch = 'r' + operand
+            if scratch != target and scratch not in state:
+                return scratch
+        raise AssertionError((analysis.name, definition, sorted(state)))
 
     @staticmethod
     def flip_delta(analysis, pc, sign):

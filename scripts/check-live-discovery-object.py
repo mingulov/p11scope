@@ -468,9 +468,81 @@ def pause_emitter(name):
     return name == "dl_debug_state" or name.endswith(("emit_export", "emit_lifecycle"))
 
 
+def map_cell_owners(lines):
+    """Must-facts: register -> ("map"|"cell", map name) per instruction.
+
+    Follows ld_imm64 map loads through lookups and copies; joins lose
+    facts by intersection. Anything unrecognized clears the register, so
+    callers fail closed on an unknown cell owner.
+    """
+    insns, graph = instruction_graph(lines)
+    if not insns:
+        return {}
+    relocs = {index: (kind, target) for index, kind, target in relocation_targets(lines)}
+    entries = instruction_entries(lines)
+    loads = {}
+    for index, pc, text in entries:
+        decoded = re.sub(r"^(?:[0-9a-f]{2}\s+){8,16}", "", text)
+        match = re.fullmatch(r"r(\d+) = 0x0 ll", decoded)
+        if match and relocs.get(index + 1, (None, None))[0] == "64":
+            loads[pc] = (match.group(1), relocs[index + 1][1])
+    texts = dict(insns)
+    incoming = {insns[0][0]: {}}
+    pending = [insns[0][0]]
+    while pending:
+        pc = pending.pop()
+        state = incoming[pc].copy()
+        text = texts[pc]
+        if re.search(r"\bcall ", text):
+            lookup = state.get("r1")
+            for register in range(6):
+                state.pop("r" + str(register), None)
+            if text == "call 0x1" and lookup is not None and lookup[0] == "map":
+                state["r0"] = ("cell", lookup[1])
+        elif pc in loads and re.fullmatch(r"r\d+ = 0x0 ll", text):
+            register, target = loads[pc]
+            state.pop("r" + register, None)
+            state["r" + register] = ("map", target)
+        elif match := re.fullmatch(r"r(\d+) = (r\d+|-?0x[0-9a-f]+)", text):
+            register = "r" + match.group(1)
+            state.pop(register, None)
+            if match.group(2).startswith("r") and match.group(2) in state:
+                state[register] = state[match.group(2)]
+        elif match := re.match(r"[rw](\d+)\s", text):
+            state.pop("r" + match.group(1), None)
+        for successor in graph[pc]:
+            if successor not in incoming:
+                merged = state.copy()
+            else:
+                merged = {key: value for key, value in incoming[successor].items()
+                          if state.get(key) == value}
+            if incoming.get(successor) != merged:
+                incoming[successor] = merged
+                pending.append(successor)
+    return incoming
+
+
+def cas_owners(lines):
+    """Classify each cmpxchg_64 site by its cell owner map, if known."""
+    facts = map_cell_owners(lines)
+    owners = {}
+    for _, pc, text in instruction_entries(lines):
+        match = re.search(r"cmpxchg_64\(r(\d+) [+-] 0x[0-9a-f]+,", text)
+        if match:
+            fact = facts.get(pc, {}).get("r" + match.group(1))
+            owners[pc] = fact[1] if fact is not None and fact[0] == "cell" else None
+    return owners
+
+
 def pause_cas_count(disassembly):
-    return sum(sum("cmpxchg_64" in line for line in lines)
-               for name, lines in function_blocks(disassembly).items() if pause_emitter(name))
+    total = 0
+    for name, lines in function_blocks(disassembly).items():
+        if not pause_emitter(name):
+            continue
+        owners = cas_owners(lines)
+        total += sum(1 for _, pc, text in instruction_entries(lines)
+                     if "cmpxchg_64" in text and owners.get(pc) == "PAUSE_PIDS")
+    return total
 
 
 def pause_object_contract(disassembly):
@@ -478,14 +550,23 @@ def pause_object_contract(disassembly):
     total_cas = 0
     total_signals = 0
     for function, lines in function_blocks(disassembly).items():
-        cas = [index for index, line in enumerate(lines) if "cmpxchg_64" in line]
         signals = [
             index for index, line in enumerate(lines) if re.search(r"call 0x6d\b", line)
         ]
         if pause_emitter(function):
+            owners = cas_owners(lines)
+            kinds = {}
+            for index, line in enumerate(lines):
+                if "cmpxchg_64" in line:
+                    kinds[index] = owners.get(line_pc(line))
+            if any(owner not in ("STOP_GATE", "PAUSE_PIDS") for owner in kinds.values()):
+                return False
+            cas = [index for index, owner in kinds.items() if owner == "PAUSE_PIDS"]
             total_cas += len(cas)
         elif signals:
             return False
+        else:
+            cas = []
         total_signals += len(signals)
         if signals:
             signal_blocks.append((function, lines, cas, signals))
@@ -708,7 +789,7 @@ def discovery_arguments(disassembly, function, operation, argument):
 
 
 def known_tail_relocations(lines):
-    allowed_maps = {"COUNTERS", "EVIDENCE", "TAIL_CALLS"}
+    allowed_maps = {"COUNTERS", "EVIDENCE", "TAIL_CALLS", "STOP_GATE"}
     return all(
         (kind == "64" and target in allowed_maps)
         or (kind == "32" and target in {".text", "memset"})
@@ -1254,21 +1335,25 @@ def _initializer_disassembly(loader_tail=""):
 
 def _pause_disassembly():
     block = """0000000000000000 <pause{index}>:
-       0:\tr0 = cmpxchg_64(r1 + 0x0, r0, r3)
-       1:\tif r0 == 0x1 goto +0x4
-       2:\tr7 = -0x8000000000000000 ll
-       3:\tif r0 == 0x2 goto +0x0
-       4:\tcall 0x5
-       5:\tgoto +0x7
-       6:\tcall 0x5
-       7:\tr1 = 0x13
-       8:\tcall 0x6d
-       9:\t*(u64 *)(r6 + 0x0) = r7
-      10:\t*(u64 *)(r6 + 0x8) = r7
-      11:\t*(u64 *)(r6 + 0x364) = r7
-      12:\t*(u64 *)(r6 + 0x378) = r7
-      13:\tcall 0x84
-      14:\texit"""
+       0:\tr1 = 0x0 ll
+\t\t0000000000000000:  R_BPF_64_64\tPAUSE_PIDS
+       2:\tcall 0x1
+       3:\tr1 = r0
+       4:\tr0 = cmpxchg_64(r1 + 0x0, r0, r3)
+       5:\tif r0 == 0x1 goto +0x4
+       6:\tr7 = -0x8000000000000000 ll
+       7:\tif r0 == 0x2 goto +0x0
+       8:\tcall 0x5
+       9:\tgoto +0x7
+      10:\tcall 0x5
+      11:\tr1 = 0x13
+      12:\tcall 0x6d
+      13:\t*(u64 *)(r6 + 0x0) = r7
+      14:\t*(u64 *)(r6 + 0x8) = r7
+      15:\t*(u64 *)(r6 + 0x364) = r7
+      16:\t*(u64 *)(r6 + 0x378) = r7
+      17:\tcall 0x84
+      18:\texit"""
     return "\n".join(block.format(index=name) for name in ("_emit_export", "_emit_lifecycle", "_dl_debug_state")).replace("pause_dl_debug_state", "dl_debug_state")
 
 
@@ -1755,11 +1840,11 @@ interface_continuation_pack(count, 0, symbol_id)
     for label, mutation in [
         (
             "object helper between CAS and winner timestamp",
-            pause.replace("       6:\tcall 0x5\n       7:\tr1 = 0x13", "       6:\tcall 0x7\n       7:\tcall 0x5", 1),
+            pause.replace("      10:\tcall 0x5\n      11:\tr1 = 0x13", "      10:\tcall 0x7\n      11:\tcall 0x5", 1),
         ),
-        ("missing object timestamp", pause.replace("       6:\tcall 0x5", "       6:\tr1 = 0x0", 1)),
-        ("post-signal object helper", pause.replace("       9:\t*(u64 *)(r6 + 0x0) = r7", "       9:\tcall 0x7", 1)),
-        ("post-signal object back edge", pause.replace("      10:\t*(u64 *)(r6 + 0x8) = r7", "      10:\tgoto -0x2", 1)),
+        ("missing object timestamp", pause.replace("      10:\tcall 0x5", "      10:\tr1 = 0x0", 1)),
+        ("post-signal object helper", pause.replace("      13:\t*(u64 *)(r6 + 0x0) = r7", "      13:\tcall 0x7", 1)),
+        ("post-signal object back edge", pause.replace("      14:\t*(u64 *)(r6 + 0x8) = r7", "      14:\tgoto -0x2", 1)),
     ]:
         if pause_object_contract(mutation):
             raise AssertionError(f"mutation accepted: {label}")
@@ -1777,6 +1862,29 @@ interface_continuation_pack(count, 0, symbol_id)
     extra_cas = pause + "\n0000000000100000 <p11_owner_fixture>:\n 131072: r0 = cmpxchg_64(r1 + 0x0, r0, r3)\n 131073: exit"
     assert pause_object_contract(extra_cas)
     assert not pause_object_contract(extra_cas.replace("131073: exit", "131073: call 0x6d\n 131074: exit"))
+    gate_prologue = ("\n0000000000200000 <gated_emit_export>:\n"
+                     " 131076: r1 = 0x0 ll\n"
+                     "\t\t0000000000000000:  R_BPF_64_64\tSTOP_GATE\n"
+                     " 131078: call 0x1\n"
+                     " 131079: r1 = r0\n"
+                     " 131080: r0 = cmpxchg_64(r1 + 0x0, r0, r7)\n"
+                     " 131081: exit")
+    assert pause_object_contract(pause + gate_prologue)
+    gate_block = pause.replace("0000000000000000 <pause_emit_export>:",
+                               "0000000000000000 <pause_emit_export>:\n"
+                               " 131082: r1 = 0x0 ll\n"
+                               "\t\t0000000000000000:  R_BPF_64_64\tSTOP_GATE\n"
+                               " 131084: call 0x1\n"
+                               " 131085: r1 = r0\n"
+                               " 131086: r0 = cmpxchg_64(r1 + 0x0, r0, r7)", 1)
+    assert pause_object_contract(gate_block)
+    unknown_block = pause.replace("R_BPF_64_64\tPAUSE_PIDS",
+                                  "R_BPF_64_64\tEVIDENCE", 1)
+    assert not pause_object_contract(unknown_block)
+    second_pause = pause.replace("       4:\tr0 = cmpxchg_64(r1 + 0x0, r0, r3)",
+                                 "       4:\tr0 = cmpxchg_64(r1 + 0x0, r0, r3)\n"
+                                 " 131087: r0 = cmpxchg_64(r1 + 0x0, r0, r3)", 1)
+    assert not pause_object_contract(second_pause)
 
     manifest = test_manifest(Path("/canonical/main.rs"), "default", good)
     _reject(

@@ -1,25 +1,30 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Stop-gate object contract for the static Detailed programs.
+"""Stop-gate object contract for the Detailed programs.
 
-For each static entry/return program the compiled object must prove the
-admission discipline of plan 2026-09-23 Task 2:
+For each static entry/return program (plan 2026-09-23 Task 2) and each
+discovery, lifecycle and native fork program (Task 3) the compiled
+object must prove the admission discipline:
 
 - a STOP_GATE relocation (the program looks the gate cell up);
 - a compare-exchange read of the gate cell before the first capture-map
-  access (STATS, START helpers, RV_COUNTS, EVENTS, EVIDENCE, identity);
+  or native-helper access (STATS, START helpers, RV_COUNTS, EVENTS,
+  EVIDENCE, identity, DISCOVERY, COUNTERS, discovery helpers, owner
+  cleanup, root exit/propagation, fork emission);
 - a balancing decrement on every exit path of an admitted body, checked
   by walking the program's control-flow graph. The deny exit of
   ``stop_gate_enter`` carries no increment, so it must carry no
   decrement either: every exit must be balanced, and every capture
   access must be inside admission.
 
-The template continuation ``p11_entry_template_second`` carries the
-pair program's admission across the tail call: it must reference
+The continuations (``p11_entry_template_second`` after the template
+pair, ``interface_list_worker`` after ``interface_list_return`` and
+after itself) carry admission across the tail call: they must reference
 STOP_GATE, must decrement on every exit, and must never re-check the
-gate (no CAS read, no increment). The pair program must not decrement
+gate (no CAS read, no increment). A carrying program must not decrement
 on any path from entry to the tail-call site, and every such path must
-be admitted.
+be admitted; a failed tail call falls through to cleanup and then
+leaves, which the balance walk proves.
 
 Gate-cell atomics are classified by following the gate-cell pointer
 from each STOP_GATE lookup to the atomic instructions through it: the
@@ -28,10 +33,10 @@ union across joins (LLVM shares one release epilogue between the
 enter second-read-failure path and the guarded-body release, joining
 two lookup provenances). A non-fetch ``lock``
 add of exactly +1/-1 and a 64-bit compare-exchange at cell offset 0
-are the only recognized forms; any other atomic through the gate cell
-(in particular any fetch form) is rejected, and the raw instruction
-bytes must agree (0xdb/imm 0 for register adds, 0xf1 for
-compare-exchange).
+with must-fact zero operands are the only recognized forms; any other
+atomic through the gate cell (in particular any fetch form) is
+rejected, and the raw instruction bytes must agree (0xdb/imm 0 for
+register adds, 0xf1 for compare-exchange).
 """
 
 import argparse
@@ -51,24 +56,46 @@ D = load_sibling("check-live-discovery-object.py")
 ENTRY = load_sibling("check-entry-object.py")
 
 SCHEMA = "p11scope-stop-gate-object/v1"
-CAPTURE_MAPS = frozenset({"STATS", "RV_COUNTS", "EVENTS", "EVIDENCE"})
-START_CALL_PREFIX = "p11_owner_start_"
-IDENTITY_CALL = "p11_link_current_identity"
+CAPTURE_MAPS = frozenset({"STATS", "RV_COUNTS", "EVENTS", "EVIDENCE", "DISCOVERY", "COUNTERS"})
+NATIVE_CALL_PREFIX = "p11_"
 TAIL_CALL = "call 0xc"
 ENTER = "enter"
+CARRY = "carry"
 LEAVE_ONLY = "leave-only"
+LEAVE_TAIL = "leave-tail"
+TASK3_PROGRAMS = {
+    "function_list_entry": ENTER,
+    "function_list_return": ENTER,
+    "interface_list_entry": ENTER,
+    "interface_list_return": CARRY,
+    "interface_list_worker": LEAVE_TAIL,
+    "interface_entry": ENTER,
+    "interface_return": ENTER,
+    "dl_debug_state": ENTER,
+    "sched_process_exec": ENTER,
+    "sched_process_exit": ENTER,
+    "task_newtask": ENTER,
+}
 PROGRAMS = {
-    "default": {"p11_entry": ENTER, "p11_return": ENTER},
+    "default": {"p11_entry": ENTER, "p11_return": ENTER, **TASK3_PROGRAMS},
     "unsafe": {
         "p11_entry": ENTER,
         "p11_entry_ia32": ENTER,
         "p11_entry_template": ENTER,
-        "p11_entry_template_pair": ENTER,
+        "p11_entry_template_pair": CARRY,
         "p11_entry_template_second": LEAVE_ONLY,
         "p11_entry_template_types": ENTER,
         "p11_return": ENTER,
+        **TASK3_PROGRAMS,
     },
 }
+PROGRAM_SECTIONS = (
+    "uprobe",
+    "uretprobe",
+    "raw_tp/sched_process_exec",
+    "raw_tp/sched_process_exit",
+    "tp_btf/task_newtask",
+)
 GATE_ADD = re.compile(r"lock \*\(u(32|64) \*\)\(r(\d+) ([+-]) 0x([0-9a-f]+)\) \+= (\S+)")
 GATE_CAS = re.compile(r"r(\d+) = cmpxchg_(32|64)\(r(\d+) ([+-]) 0x([0-9a-f]+), r(\d+), r(\d+)\)")
 GATE_REGISTER = re.compile(r"r(\d+)")
@@ -253,7 +280,11 @@ class GateAnalysis:
                 for operand in (expected, desired):
                     fact = state.get("r" + operand)
                     require(
-                        fact is None or fact == ("constant", 0),
+                        fact is not None,
+                        self.label(pc) + ": gate read CAS operand is not a known constant",
+                    )
+                    require(
+                        fact == ("constant", 0),
                         self.label(pc) + ": gate read CAS operand is nonzero",
                     )
                 self.check_raw(pc, 0xDB, 0xF1)
@@ -282,7 +313,7 @@ class GateAnalysis:
                 if state.get("r1", (None,))[0] == "map" and state["r1"][1] in CAPTURE_MAPS:
                     self.capture_sites.add(pc)
             elif pc in consumer.helper and text == "call 0x83":
-                if state.get("r1") == ("map", "EVENTS"):
+                if state.get("r1", (None,))[0] == "map" and state["r1"][1] in CAPTURE_MAPS:
                     self.capture_sites.add(pc)
             elif pc in consumer.helper and text in ("call 0x84", "call 0x85"):
                 self.capture_sites.add(pc)
@@ -290,7 +321,7 @@ class GateAnalysis:
                 if state.get("r2") == ("map", "TAIL_CALLS"):
                     self.tail_sites.add(pc)
             target = consumer.calls.get(pc, "")
-            if target.startswith(START_CALL_PREFIX) or target == IDENTITY_CALL:
+            if target.startswith(NATIVE_CALL_PREFIX):
                 self.capture_sites.add(pc)
 
     def walk(self, initial, transition, violation):
@@ -316,8 +347,8 @@ class GateAnalysis:
             return False
         return admitted
 
-    def check_pair_carry(self):
-        require(self.tail_sites, self.label() + ": pair program lost its tail call")
+    def check_tail_carry(self, initial):
+        require(self.tail_sites, self.label() + ": carrying program lost its tail call")
 
         def leaked(pc, seen):
             if pc in self.tail_sites and seen:
@@ -331,10 +362,10 @@ class GateAnalysis:
                 return "tail call without carried admission"
             return None
 
-        self.walk(False, self.admission, unadmitted)
+        self.walk(initial, self.admission, unadmitted)
 
     def check_cas_before_capture(self):
-        if self.role == LEAVE_ONLY:
+        if self.role in (LEAVE_ONLY, LEAVE_TAIL):
             reachable = D.reachable(self.consumer.graph, [self.consumer.insns[0][0]])
             require(
                 not (self.cas_sites & reachable),
@@ -366,7 +397,7 @@ class GateAnalysis:
                 return "exit without a balancing decrement"
             return None
 
-        self.walk(self.role == LEAVE_ONLY, self.admission, unbalanced)
+        self.walk(self.role in (LEAVE_ONLY, LEAVE_TAIL), self.admission, unbalanced)
 
     def classify(self):
         self.check_relocation()
@@ -380,8 +411,10 @@ class GateAnalysis:
             self.capture_sites,
             self.label() + ": no capture-map access classified",
         )
-        if self.name == "p11_entry_template_pair":
-            self.check_pair_carry()
+        if self.role == CARRY:
+            self.check_tail_carry(False)
+        if self.role == LEAVE_TAIL:
+            self.check_tail_carry(True)
         self.check_cas_before_capture()
         self.check_balance()
         return {
@@ -399,12 +432,12 @@ class GateAnalysis:
 def analyze(disassembly, variant):
     require(variant in PROGRAMS, "unknown variant " + variant)
     split = ENTRY.sections(disassembly)
-    for section in ("uprobe", "uretprobe", ".text"):
+    for section in (*PROGRAM_SECTIONS, ".text"):
         require(section in split, "missing " + section)
     analyses = {}
     for name, role in PROGRAMS[variant].items():
         found = None
-        for section in ("uprobe", "uretprobe"):
+        for section in PROGRAM_SECTIONS:
             blocks = D.function_blocks(split[section])
             if name in blocks:
                 require(found is None, "duplicate program " + name)

@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* Detailed-only typed birth wrapper; the core owns the identity domain. */
 #include "image_identity.h"
+#include "stop_gate.h"
 
 extern u32 p11_link_fork_allowed(void);
 extern u32 p11_root_propagate_thread(struct task_struct *child, u64 clone_flags);
@@ -8,8 +9,21 @@ extern u32 p11_link_emit_fork(u32 child_tgid, u64 clone_flags,
                               const struct image_identity *parent,
                               const struct image_identity *child);
 
+static __always_inline int task_newtask_impl(u64 *ctx);
+
 SEC("tp_btf/task_newtask")
 int task_newtask(u64 *ctx)
+{
+    int rc;
+
+    if (!p11_stop_gate_enter())
+        return 0;
+    rc = task_newtask_impl(ctx);
+    p11_stop_gate_leave();
+    return rc;
+}
+
+static __always_inline int task_newtask_impl(u64 *ctx)
 {
     u64 clone_flags;
     struct task_struct *current;

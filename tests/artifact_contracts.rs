@@ -4577,12 +4577,14 @@ fn frozen_policy_inventory_matches_embedded_object() {
     }
 }
 
-/// The static Detailed programs gate every capture access on the STOP_GATE
+/// The Detailed programs gate every capture access on the STOP_GATE
 /// admission discipline: a STOP_GATE relocation, a compare-exchange read
-/// before the first capture-map access, and a balancing decrement on every
-/// exit path. The template continuation carries admission across the tail
-/// call instead of re-checking. Under `unsafe-unvalidated-metadata` the
-/// embedded object is the diagnostic one.
+/// before the first capture-map or native-helper access, and a balancing
+/// decrement on every exit path. The static entry/return programs and the
+/// discovery, lifecycle and native fork programs enter through the gate;
+/// the template continuation and the interface-list worker carry admission
+/// across their tail calls instead of re-checking. Under
+/// `unsafe-unvalidated-metadata` the embedded object is the diagnostic one.
 #[test]
 fn static_detailed_programs_honor_the_stop_gate() {
     let directory = tempfile::tempdir().expect("temporary stop-gate object");

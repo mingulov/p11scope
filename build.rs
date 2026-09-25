@@ -80,6 +80,7 @@ fn main() {
     println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity.c");
     println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity.h");
     println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity_fork.c");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/stop_gate.h");
     println!("cargo:rerun-if-changed=crates/ebpf/native/task_owner.c");
     println!("cargo:rerun-if-changed=crates/ebpf/native/task_owner.h");
     println!("cargo:rerun-if-changed=crates/ebpf/native/root_affiliation.c");

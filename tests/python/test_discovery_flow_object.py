@@ -102,10 +102,13 @@ class DiscoveryFlow(unittest.TestCase):
     def test_typed_mutations(self):
         cases = [
             ('redirect-propagation', 'task_newtask', '@propagation-call', 'call 0x0', 'link'),
+            ('admission-entry-move', 'task_newtask', '\tr6 = r1', '\tr6 = r2', 'admission'),
+            ('admission-cas-removed', 'task_newtask', 'r0 = cmpxchg_64(r1 + 0x0, r0, r7)', 'r0 = 0x0', 'admission'),
+            ('admission-refund-delta', 'task_newtask', '\tr2 = -0x1', '\tr2 = -0x2', 'admission'),
             ('parent-null', 'p11_link_emit_fork', 'if r3 == 0x0 goto', 'if r3 != 0x0 goto', 'classification'),
             ('child-null', 'p11_link_emit_fork', 'if r4 == 0x0 goto', 'if r4 != 0x0 goto', 'classification'),
-            ('context-child-width', 'task_newtask', 'r7 = *(u64 *)(r1 + 0x0)', 'r7 = *(u32 *)(r1 + 0x0)', 'context'),
-            ('context-flags-width', 'task_newtask', 'r6 = *(u64 *)(r1 + 0x8)', 'r6 = *(u32 *)(r1 + 0x8)', 'context'),
+            ('context-child-width', 'task_newtask', 'r7 = *(u64 *)(r6 + 0x0)', 'r7 = *(u32 *)(r6 + 0x0)', 'context'),
+            ('context-flags-width', 'task_newtask', 'r6 = *(u64 *)(r6 + 0x8)', 'r6 = *(u32 *)(r6 + 0x8)', 'context'),
             ('flags-restore', 'task_newtask', '@flags-restore', 'w2 = w6', 'flags'),
             ('redirect-allowed', 'task_newtask', 'R_BPF_64_32\tp11_link_fork_allowed', 'R_BPF_64_32\tp11_link_emit_fork', 'link'),
             ('omit-emit', 'task_newtask', 'R_BPF_64_32\tp11_link_emit_fork', 'R_BPF_64_32\tmissing_bridge', 'link'),

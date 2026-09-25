@@ -201,6 +201,20 @@ fn stop_gate_leave() {
     };
 }
 
+/// Inventory builds have no STOP_GATE map and no stop protocol: the shared
+/// discovery and lifecycle wrappers below admit unconditionally so both
+/// flavors compile from one source. The no-op inlines away.
+#[cfg(feature = "inventory-only")]
+#[inline(always)]
+fn stop_gate_enter() -> bool {
+    true
+}
+
+/// Inventory release side of the no-op admission above.
+#[cfg(feature = "inventory-only")]
+#[inline(always)]
+fn stop_gate_leave() {}
+
 /// Does this call belong to the capture scope? With no filter configured
 /// nothing is observed — scope is always explicit, and system-wide capture
 /// requires the explicit system scope bit (never a missing filter).
@@ -1110,6 +1124,16 @@ fn take_selection_state(ctx: &RetProbeContext, scoped: bool) -> Option<(StateKey
 
 #[uprobe]
 pub fn function_list_entry(ctx: ProbeContext) -> u32 {
+    if !stop_gate_enter() {
+        return 0;
+    }
+    let rc = function_list_entry_impl(ctx);
+    stop_gate_leave();
+    rc
+}
+
+#[inline(always)]
+fn function_list_entry_impl(ctx: ProbeContext) -> u32 {
     if scope_auth().is_none() {
         return 0;
     }
@@ -1140,6 +1164,16 @@ pub fn function_list_entry(ctx: ProbeContext) -> u32 {
 
 #[uretprobe]
 pub fn function_list_return(ctx: RetProbeContext) -> u32 {
+    if !stop_gate_enter() {
+        return 0;
+    }
+    let rc = function_list_return_impl(ctx);
+    stop_gate_leave();
+    rc
+}
+
+#[inline(always)]
+fn function_list_return_impl(ctx: RetProbeContext) -> u32 {
     let scope = scope_auth();
     if scope.is_none() {
         let _ = take_export_state(&ctx, false);
@@ -1181,6 +1215,16 @@ pub fn function_list_return(ctx: RetProbeContext) -> u32 {
 
 #[uprobe]
 pub fn interface_list_entry(ctx: ProbeContext) -> u32 {
+    if !stop_gate_enter() {
+        return 0;
+    }
+    let rc = interface_list_entry_impl(ctx);
+    stop_gate_leave();
+    rc
+}
+
+#[inline(always)]
+fn interface_list_entry_impl(ctx: ProbeContext) -> u32 {
     if scope_auth().is_none() {
         return 0;
     }
@@ -1211,6 +1255,20 @@ pub fn interface_list_entry(ctx: ProbeContext) -> u32 {
 
 #[uretprobe]
 pub fn interface_list_return(ctx: RetProbeContext) -> u32 {
+    // Admission is carried across the tail call into interface_list_worker
+    // (slot 0): a successful tail call never returns here, so no leave runs
+    // before it; the worker releases the carried admission, and
+    // fall-through runs fail_export_state, then leaves below.
+    if !stop_gate_enter() {
+        return 0;
+    }
+    let rc = interface_list_return_impl(ctx);
+    stop_gate_leave();
+    rc
+}
+
+#[inline(always)]
+fn interface_list_return_impl(ctx: RetProbeContext) -> u32 {
     let scope = scope_auth();
     if scope.is_none() {
         let _ = take_export_state(&ctx, false);
@@ -1286,6 +1344,18 @@ pub fn interface_list_return(ctx: RetProbeContext) -> u32 {
 
 #[uretprobe]
 pub fn interface_list_worker(ctx: RetProbeContext) -> u32 {
+    // Carried admission: interface_list_return entered before the tail call
+    // (or the previous worker segment did) and did not leave, so this
+    // continuation must not re-check the gate. Each segment either
+    // tail-calls itself with the admission carried or finishes and leaves;
+    // a failed tail call runs fail_export_state, then leaves below.
+    let rc = interface_list_worker_impl(ctx);
+    stop_gate_leave();
+    rc
+}
+
+#[inline(always)]
+fn interface_list_worker_impl(ctx: RetProbeContext) -> u32 {
     let key = StateKey {
         pid_tgid: helpers::bpf_get_current_pid_tgid(),
         attach_cookie: 0,
@@ -1382,6 +1452,16 @@ pub fn interface_list_worker(ctx: RetProbeContext) -> u32 {
 
 #[uprobe]
 pub fn interface_entry(ctx: ProbeContext) -> u32 {
+    if !stop_gate_enter() {
+        return 0;
+    }
+    let rc = interface_entry_impl(ctx);
+    stop_gate_leave();
+    rc
+}
+
+#[inline(always)]
+fn interface_entry_impl(ctx: ProbeContext) -> u32 {
     let Some(scope) = scope_auth() else {
         return 0;
     };
@@ -1422,6 +1502,16 @@ pub fn interface_entry(ctx: ProbeContext) -> u32 {
 
 #[uretprobe]
 pub fn interface_return(ctx: RetProbeContext) -> u32 {
+    if !stop_gate_enter() {
+        return 0;
+    }
+    let rc = interface_return_impl(ctx);
+    stop_gate_leave();
+    rc
+}
+
+#[inline(always)]
+fn interface_return_impl(ctx: RetProbeContext) -> u32 {
     let scope = scope_auth();
     if scope.is_none() {
         let _ = take_selection_state(&ctx, false);
@@ -1496,6 +1586,16 @@ fn loader_runtime_ip(ctx: &ProbeContext) -> u64 {
 
 #[uprobe]
 pub fn dl_debug_state(ctx: ProbeContext) -> u32 {
+    if !stop_gate_enter() {
+        return 0;
+    }
+    let rc = dl_debug_state_impl(ctx);
+    stop_gate_leave();
+    rc
+}
+
+#[inline(always)]
+fn dl_debug_state_impl(ctx: ProbeContext) -> u32 {
     let Some(scope) = scope_auth() else {
         return 0;
     };
@@ -1583,6 +1683,16 @@ fn emit_lifecycle(kind: u8, scope: ScopeAuth, pause_eligible: bool) {
 
 #[raw_tracepoint(tracepoint = "sched_process_exec")]
 pub fn sched_process_exec(_ctx: RawTracePointContext) -> u32 {
+    if !stop_gate_enter() {
+        return 0;
+    }
+    let rc = sched_process_exec_impl(_ctx);
+    stop_gate_leave();
+    rc
+}
+
+#[inline(always)]
+fn sched_process_exec_impl(_ctx: RawTracePointContext) -> u32 {
     // Mandatory current-physical-task cleanup precedes all capture filters.
     unsafe { p11_owner_cleanup() };
     if let Some(scope) = scope_auth() {
@@ -1593,6 +1703,16 @@ pub fn sched_process_exec(_ctx: RawTracePointContext) -> u32 {
 
 #[raw_tracepoint(tracepoint = "sched_process_exit")]
 pub fn sched_process_exit(_ctx: RawTracePointContext) -> u32 {
+    if !stop_gate_enter() {
+        return 0;
+    }
+    let rc = sched_process_exit_impl(_ctx);
+    stop_gate_leave();
+    rc
+}
+
+#[inline(always)]
+fn sched_process_exit_impl(_ctx: RawTracePointContext) -> u32 {
     // Retained original keys also cover fatal nonleader post-de_thread exit.
     unsafe { p11_owner_cleanup() };
     #[cfg(not(feature = "inventory-only"))]

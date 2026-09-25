@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.dont_write_bytecode = True
 from _loader import load_sibling
 
-DECODER_SHA256 = 'b7e4069bf4134c0b48fcba748bb3ab5e6f1d41e405459f19c3e4d3097b731e2d'
+DECODER_SHA256 = '4458281def9699cc100d41248ce0ae53a284abb3cb9f38e72e2fba44ec47a188'
 _decoder = Path(__file__).with_name('check-live-discovery-object.py')
 if hashlib.sha256(_decoder.read_bytes()).hexdigest() != DECODER_SHA256:
     raise RuntimeError('discovery decoder source hash changed; review required')
@@ -121,15 +121,57 @@ def typed_birth(elf, secs):
         found = [c for c in calls if c[0] == 'task_newtask' and c[3] == target]
         require(len(found) == 1, tag + 'link: missing/redirected ' + target)
         links[target] = found[0][2]
-    prefix = recipe(hi, '''
+    gate = recipe(hi, '''
+        r6 = r1
+        r7 = 0x0
+        *(u32 *)(r10 - 0x18) = w7
+        r2 = r10
+        r2 += -0x18
+        r1 = 0x0 ll
+        call 0x1
+        r1 = r0
         if r1 == 0x0 goto ?
-        r7 = *(u64 *)(r1 + 0x0)
-        r6 = *(u64 *)(r1 + 0x8)
+        r0 = 0x0
+        r0 = cmpxchg_64(r1 + 0x0, r0, r7)
+        if r7 s> r0 goto ?
+        r2 = 0x1
+        lock *(u64 *)(r1 + 0x0) += r2
+        r2 = 0x0
+        r0 = 0x0
+        r0 = cmpxchg_64(r1 + 0x0, r0, r2)
+        if r0 s> -0x1 goto ?
+        r2 = -0x1
+        lock *(u64 *)(r1 + 0x0) += r2
+        goto ?
+        ''', tag + 'admission', calls)
+    require(gate[0][0] == hi[0][0], tag + 'admission: not entry')
+    gate_loads = [pc for pc, op in gate if op == 'r1 = 0x0 ll']
+    require(len(gate_loads) == 1, tag + 'admission: gate cell load missing/ambiguous')
+    load_index = next(index for index, line in enumerate(hook)
+                      if D.line_pc(line) == gate_loads[0])
+    require('R_BPF_64_64\tSTOP_GATE' in hook[load_index + 1],
+            tag + 'admission: not the gate cell')
+    admitted = D.relative_target(*gate[-4])
+    require(admitted is not None, tag + 'admission: admitted branch undecoded')
+    deny_targets = {D.relative_target(pc, op) for pc, op in gate
+                    if op.startswith(('if r1 == 0x0 goto ', 'if r7 s> r0 goto '))
+                    or op.startswith('goto ')}
+    require(len(deny_targets) == 1 and None not in deny_targets,
+            tag + 'admission: deny exits diverge')
+    (deny_pc,) = deny_targets
+    deny_index = next(index for index, (pc, _) in enumerate(hi) if pc == deny_pc)
+    require(hi[deny_index][1] == 'r0 = 0x0' and hi[deny_index + 1][1] == 'exit',
+            tag + 'admission: deny exit is not return-zero')
+    prefix = recipe(hi, '''
+        if r6 == 0x0 goto ?
+        r7 = *(u64 *)(r6 + 0x0)
+        r6 = *(u64 *)(r6 + 0x8)
         r1 = r7
         r2 = r6
         CALL:p11_root_propagate_thread
         ''', tag + 'context', calls)
-    require(prefix[0][0] == hi[0][0], tag + 'context: not entry')
+    require(hi[hi.index(gate[-1]) + 1] == prefix[0], tag + 'context: not guarded')
+    require(admitted == prefix[0][0], tag + 'admission: admitted path misses the guard')
     emit_pc = links['p11_link_emit_fork']
     before_emit = [i for i, (pc, _) in enumerate(hi) if pc == emit_pc][0]
     require(hi[before_emit - 1][1] == 'r2 = r6' and not any(

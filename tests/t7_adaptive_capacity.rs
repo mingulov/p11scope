@@ -555,6 +555,11 @@ fn segments_cost_model_counts_lookups_fds_and_percpu() {
         (1, 1)
     );
     assert_eq!(cost.fds, 3, "one outer plus one FD per inner map");
+    assert_eq!(
+        (cost.inner_creations, cost.outer_publications),
+        (2, 2),
+        "one inner creation plus one outer publication per segment"
+    );
     assert_eq!(cost.per_cpu_payload_bytes, 2 * 2112 * 296 * 12);
     assert_eq!(cost.link_pairs, 2 * 2112);
 }
@@ -1000,6 +1005,11 @@ fn capacity_preflight_budgets_for_t7_live_cells() {
     assert_eq!(directory.total_endpoints(), 6530);
     let at_64 = directory.cost(64);
     assert_eq!(at_64.fds, 5, "one outer plus one FD per inner map");
+    assert_eq!(
+        (at_64.inner_creations, at_64.outer_publications),
+        (4, 4),
+        "four inners created and published for the 6530 union"
+    );
     assert_eq!(at_64.per_cpu_payload_bytes, 6530 * 296 * 64);
     assert_eq!(at_64.link_pairs, 6530);
     assert_eq!(directory.cost(12).per_cpu_payload_bytes, 6530 * 296 * 12);

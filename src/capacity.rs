@@ -1328,14 +1328,19 @@ struct AppendedSegment {
 }
 
 /// Static per-operation cost of the directory layout: outer plus inner
-/// lookups, FDs, per-CPU payload bytes and link pairs. A sizing model like
-/// [`StorageModel`], not a live kernel measurement.
+/// lookups, FDs, per-CPU payload bytes and link pairs, plus the static
+/// allocation/publication counts (one inner creation and one outer-map
+/// publication per appended segment). A sizing model like [`StorageModel`],
+/// not a live kernel measurement: lookup latency, allocation timing and
+/// publication syscall deltas stay live-only under controller cell L-T7-9.
 pub struct SegmentCost {
     pub outer_lookups_per_op: u32,
     pub inner_lookups_per_op: u32,
     pub fds: u64,
     pub per_cpu_payload_bytes: u64,
     pub link_pairs: u64,
+    pub inner_creations: u64,
+    pub outer_publications: u64,
 }
 
 /// Appended endpoint segments in an outer directory. Segments only append:
@@ -1438,6 +1443,8 @@ impl SegmentDirectory {
             fds: 1 + self.segments.len() as u64,
             per_cpu_payload_bytes: payload.saturating_mul(u64::from(cpus)),
             link_pairs: self.next_base,
+            inner_creations: self.segments.len() as u64,
+            outer_publications: self.segments.len() as u64,
         }
     }
 }

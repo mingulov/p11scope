@@ -11,10 +11,10 @@ use p11scope_ebpf_common::{
     EXPERIMENTAL_SLOT_CANDIDATE, IMAGE_IDENTITY_TICKET_LIMIT, MAX_DESCRIPTORS, MAX_SLOTS,
     RING_BYTES, ROOT_AFFILIATION_LIMIT, RV_ENTRIES, START_ENTRIES, THREAD_OWNER_LIMIT,
 };
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::mem::size_of;
 use std::sync::{
-    Mutex,
+    Mutex, RwLock, RwLockReadGuard,
     atomic::{AtomicU64, Ordering},
 };
 
@@ -530,6 +530,1705 @@ pub fn admission_envelope() -> String {
         "stats_slots={MAX_SLOTS} start_inflight={START_ENTRIES} rv_keys={RV_ENTRIES} \
          descriptors={MAX_DESCRIPTORS} broader_admission=unqualified",
     )
+}
+
+/// Task 7 (finish plan): adaptive capacity, sustained identity, bounded history.
+///
+/// Candidate A core: the identity-ticket namespace is already u64 end to end
+/// (native `cookie_for`, `ImageIdentity.task_cookie`, `COOKIE_CTL`), with
+/// cookie 0 reserved and 16,384 enforced as an explicit policy comparison.
+/// These types version that policy, mirror the allocator semantics
+/// (monotonic, no reuse, quota/create/retry accounting) and add the separate
+/// live-admission accounting candidate A owes. Candidates B (bounded overlap)
+/// and C (stable identity plus replaceable evidence) are modeled with their
+/// own transition proofs so the comparison runs all three on one workload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TicketPolicy {
+    limit: u64,
+    version: u32,
+}
+
+impl TicketPolicy {
+    /// Version 1 is the C1 policy: exactly the historical 16,384 lifetime
+    /// bound. This is the default until a reviewed migration selects wider.
+    pub const fn v1_c1() -> Self {
+        Self {
+            limit: IMAGE_IDENTITY_TICKET_LIMIT,
+            version: 1,
+        }
+    }
+
+    /// A reviewed wider (or equal) namespace. Version 0 is reserved; version 1
+    /// is exactly the C1 bound; version 2+ carries an explicit reviewed limit.
+    pub fn reviewed(limit: u64, version: u32) -> Result<Self, String> {
+        if version == 0 {
+            return Err("ticket policy version 0 is reserved".into());
+        }
+        if limit == 0 {
+            return Err("ticket policy limit must be non-zero".into());
+        }
+        if version == 1 && limit != IMAGE_IDENTITY_TICKET_LIMIT {
+            return Err(format!(
+                "ticket policy v1 is exactly the C1 bound {IMAGE_IDENTITY_TICKET_LIMIT}, not {limit}"
+            ));
+        }
+        Ok(Self { limit, version })
+    }
+
+    pub const fn limit(self) -> u64 {
+        self.limit
+    }
+
+    pub const fn version(self) -> u32 {
+        self.version
+    }
+
+    /// The exact `COOKIE_CTL` image this policy publishes at load: the limit
+    /// with every counter at zero. Pure loader seam; the loader calls this
+    /// instead of spelling the constant, so a policy migration is one call
+    /// site plus the native/config review.
+    pub fn control_image(self) -> p11scope_ebpf_common::ImageIdentityControl {
+        p11scope_ebpf_common::ImageIdentityControl {
+            limit: self.limit,
+            ..Default::default()
+        }
+    }
+
+    /// Policy-parameterized freshness check mirroring
+    /// `attach::inventory::callers::validate_caller_control` for v1.
+    pub fn validate_control(
+        control: &p11scope_ebpf_common::ImageIdentityControl,
+        policy: TicketPolicy,
+    ) -> Result<(), String> {
+        if control.limit != policy.limit
+            || control.next_ticket != 0
+            || control.unavailable != 0
+            || control.create_failures != 0
+            || control.retry_exhausted != 0
+        {
+            return Err(format!(
+                "COOKIE_CTL is not a fresh caller identity control for ticket policy v{}",
+                policy.version
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// CAS attempts per allocation. Mirrors native `COOKIE_CAS_TRIES`.
+pub const TICKET_CAS_TRIES: u32 = 8;
+
+/// Scripted allocator fault, mirroring one native failure mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InjectedFault {
+    /// Another racing caller won the ticket CAS; burns one attempt.
+    CasContention,
+    /// The ticket CAS won but task-storage creation failed; the ticket is
+    /// consumed exactly like native and no identity exists for it.
+    CreateFailed,
+}
+
+/// Ordered fault script consumed by [`TicketAllocator::allocate_with_faults`].
+pub struct FaultScript {
+    script: Vec<InjectedFault>,
+    cursor: usize,
+}
+
+impl FaultScript {
+    pub fn new(script: Vec<InjectedFault>) -> Self {
+        Self { script, cursor: 0 }
+    }
+
+    fn next_fault(&mut self) -> Option<InjectedFault> {
+        let fault = self.script.get(self.cursor).copied();
+        if fault.is_some() {
+            self.cursor += 1;
+        }
+        fault
+    }
+}
+
+/// Ticket allocation refusal. Always names the resource.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TicketError {
+    Quota { wanted_cookie: u64, limit: u64 },
+    CreateFailed { consumed_cookie: u64 },
+    RetryExhausted,
+}
+
+impl std::fmt::Display for TicketError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Quota {
+                wanted_cookie,
+                limit,
+            } => write!(
+                f,
+                "identity tickets exhausted: cookie {wanted_cookie} exceeds limit {limit}"
+            ),
+            Self::CreateFailed { consumed_cookie } => write!(
+                f,
+                "identity tickets storage creation failed: ticket for cookie {consumed_cookie} consumed without an identity"
+            ),
+            Self::RetryExhausted => write!(
+                f,
+                "identity tickets CAS retry exhausted after {TICKET_CAS_TRIES} attempts"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TicketError {}
+
+/// Cumulative ticket accounting: attempts, admissions and every refusal mode.
+pub struct TicketAccounting {
+    pub attempted: u64,
+    pub admitted: u64,
+    pub quota_refusals: u64,
+    pub create_failures: u64,
+    pub retries_exhausted: u64,
+    pub live_unretired: u64,
+    pub next_ticket: u64,
+}
+
+/// Monotonic u64 ticket allocator mirroring native `cookie_for`.
+///
+/// Internal tickets run `0..limit`; the issued cookie is ticket + 1, so
+/// cookie 0 stays reserved and cookies run `1..=limit`. Allocation never
+/// reuses a cookie, retired or failed: a consumed ticket is gone. The wanted
+/// cookie saturates instead of wrapping near u64::MAX, so exhaustion fails
+/// closed before any arithmetic wrap.
+pub struct TicketAllocator {
+    policy: TicketPolicy,
+    next_ticket: u64,
+    retired: BTreeSet<u64>,
+    attempted: u64,
+    admitted: u64,
+    quota_refusals: u64,
+    create_failures: u64,
+    retries_exhausted: u64,
+}
+
+impl TicketAllocator {
+    pub fn new(policy: TicketPolicy) -> Self {
+        Self {
+            policy,
+            next_ticket: 0,
+            retired: BTreeSet::new(),
+            attempted: 0,
+            admitted: 0,
+            quota_refusals: 0,
+            create_failures: 0,
+            retries_exhausted: 0,
+        }
+    }
+
+    /// Restore the allocator counter after restart or policy migration.
+    /// Every replayed tombstone must name an issued cookie; anything else
+    /// fails closed rather than inventing history.
+    pub fn restore(
+        policy: TicketPolicy,
+        next_ticket: u64,
+        retired: &[u64],
+    ) -> Result<Self, String> {
+        if next_ticket > policy.limit {
+            return Err(format!(
+                "restored ticket counter {next_ticket} exceeds policy limit {}",
+                policy.limit
+            ));
+        }
+        let mut tombstones = BTreeSet::new();
+        for cookie in retired {
+            if *cookie == 0 || *cookie > next_ticket {
+                return Err(format!(
+                    "restored tombstone {cookie} names no issued cookie below counter {next_ticket}"
+                ));
+            }
+            tombstones.insert(*cookie);
+        }
+        Ok(Self {
+            policy,
+            next_ticket,
+            retired: tombstones,
+            attempted: 0,
+            admitted: 0,
+            quota_refusals: 0,
+            create_failures: 0,
+            retries_exhausted: 0,
+        })
+    }
+
+    pub fn policy(&self) -> TicketPolicy {
+        self.policy
+    }
+
+    pub fn allocate(&mut self) -> Result<u64, TicketError> {
+        self.attempted += 1;
+        if self.next_ticket >= self.policy.limit {
+            self.quota_refusals += 1;
+            return Err(TicketError::Quota {
+                wanted_cookie: self.next_ticket.saturating_add(1),
+                limit: self.policy.limit,
+            });
+        }
+        let cookie = self
+            .next_ticket
+            .checked_add(1)
+            .expect("ticket below the limit always has a successor cookie");
+        self.next_ticket += 1;
+        self.admitted += 1;
+        Ok(cookie)
+    }
+
+    /// Allocate under a scripted contention/failure workload. CAS contention
+    /// burns attempts up to [`TICKET_CAS_TRIES`]; a create failure consumes
+    /// one ticket exactly like native and reports it.
+    pub fn allocate_with_faults(&mut self, faults: &mut FaultScript) -> Result<u64, TicketError> {
+        let mut attempts = 0;
+        loop {
+            match faults.next_fault() {
+                None => return self.allocate(),
+                Some(InjectedFault::CasContention) => {
+                    attempts += 1;
+                    if attempts >= TICKET_CAS_TRIES {
+                        self.attempted += 1;
+                        self.retries_exhausted += 1;
+                        return Err(TicketError::RetryExhausted);
+                    }
+                }
+                Some(InjectedFault::CreateFailed) => {
+                    self.attempted += 1;
+                    if self.next_ticket >= self.policy.limit {
+                        self.quota_refusals += 1;
+                        return Err(TicketError::Quota {
+                            wanted_cookie: self.next_ticket.saturating_add(1),
+                            limit: self.policy.limit,
+                        });
+                    }
+                    let cookie = self
+                        .next_ticket
+                        .checked_add(1)
+                        .expect("ticket below the limit always has a successor cookie");
+                    self.next_ticket += 1;
+                    self.create_failures += 1;
+                    return Err(TicketError::CreateFailed {
+                        consumed_cookie: cookie,
+                    });
+                }
+            }
+        }
+    }
+
+    pub fn retire(&mut self, cookie: u64) {
+        if cookie != 0 && cookie <= self.next_ticket {
+            self.retired.insert(cookie);
+        }
+    }
+
+    pub fn resolve(&self, cookie: u64) -> SlotIdentity {
+        if cookie == 0 || cookie > self.next_ticket {
+            SlotIdentity::Unknown
+        } else if self.retired.contains(&cookie) {
+            SlotIdentity::Retired
+        } else {
+            SlotIdentity::Active
+        }
+    }
+
+    pub fn accounting(&self) -> TicketAccounting {
+        TicketAccounting {
+            attempted: self.attempted,
+            admitted: self.admitted,
+            quota_refusals: self.quota_refusals,
+            create_failures: self.create_failures,
+            retries_exhausted: self.retries_exhausted,
+            live_unretired: self.next_ticket - self.retired.len() as u64,
+            next_ticket: self.next_ticket,
+        }
+    }
+}
+
+/// Live-admission refusal. Always names the resource.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AdmissionError {
+    LiveBudgetExhausted { cookie: u64, cap: usize },
+    DuplicateReservation { cookie: u64 },
+}
+
+impl std::fmt::Display for AdmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LiveBudgetExhausted { cookie, cap } => write!(
+                f,
+                "live admissions exhausted: cookie {cookie} refused at cap {cap}"
+            ),
+            Self::DuplicateReservation { cookie } => write!(
+                f,
+                "live admissions duplicate reservation for cookie {cookie}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AdmissionError {}
+
+/// Cumulative live-admission accounting, separate from ticket accounting.
+pub struct LiveAccounting {
+    pub admitted_total: u64,
+    pub refused_total: u64,
+    pub rollbacks: u64,
+    pub releases: u64,
+    pub live: usize,
+    pub peak_live: usize,
+}
+
+/// A reservation that a failed creation can still roll back. Opaque: only
+/// [`LiveAdmission`] mints it, and `admit`/`rollback` consume it.
+#[derive(Debug)]
+pub struct AdmissionReservation {
+    cookie: u64,
+}
+
+/// Proof that live storage for the cookie exists. Only this token releases
+/// the admission: a lossy exit hint or a bare cookie cannot free the budget.
+#[derive(Debug)]
+pub struct StorageToken {
+    cookie: u64,
+}
+
+/// Candidate A live-admission accounting, independent of the ticket
+/// namespace. Reserve-then-admit lets a failed creation roll its reservation
+/// back instead of leaking budget; release requires the storage token tied
+/// to actual storage/task lifetime.
+pub struct LiveAdmission {
+    cap: usize,
+    reserved: BTreeSet<u64>,
+    live: BTreeSet<u64>,
+    peak_live: usize,
+    admitted_total: u64,
+    refused_total: u64,
+    rollbacks: u64,
+    releases: u64,
+}
+
+impl LiveAdmission {
+    pub fn new(cap: usize) -> Result<Self, String> {
+        if cap == 0 {
+            return Err("live admission cap must be non-zero".into());
+        }
+        Ok(Self {
+            cap,
+            reserved: BTreeSet::new(),
+            live: BTreeSet::new(),
+            peak_live: 0,
+            admitted_total: 0,
+            refused_total: 0,
+            rollbacks: 0,
+            releases: 0,
+        })
+    }
+
+    pub fn reserve(&mut self, cookie: u64) -> Result<AdmissionReservation, AdmissionError> {
+        if self.reserved.contains(&cookie) || self.live.contains(&cookie) {
+            return Err(AdmissionError::DuplicateReservation { cookie });
+        }
+        if self.reserved.len() + self.live.len() >= self.cap {
+            self.refused_total += 1;
+            return Err(AdmissionError::LiveBudgetExhausted {
+                cookie,
+                cap: self.cap,
+            });
+        }
+        self.reserved.insert(cookie);
+        Ok(AdmissionReservation { cookie })
+    }
+
+    pub fn admit(&mut self, reservation: AdmissionReservation) -> StorageToken {
+        assert!(
+            self.reserved.remove(&reservation.cookie),
+            "admission reservation must be outstanding"
+        );
+        self.live.insert(reservation.cookie);
+        self.admitted_total += 1;
+        self.peak_live = self.peak_live.max(self.live.len());
+        StorageToken {
+            cookie: reservation.cookie,
+        }
+    }
+
+    pub fn rollback(&mut self, reservation: AdmissionReservation) {
+        assert!(
+            self.reserved.remove(&reservation.cookie),
+            "rolled-back reservation must be outstanding"
+        );
+        self.rollbacks += 1;
+    }
+
+    pub fn release(&mut self, token: StorageToken) {
+        assert!(
+            self.live.remove(&token.cookie),
+            "released token must name a live admission"
+        );
+        self.releases += 1;
+    }
+
+    pub fn live_count(&self) -> usize {
+        self.live.len()
+    }
+
+    pub fn accounting(&self) -> LiveAccounting {
+        LiveAccounting {
+            admitted_total: self.admitted_total,
+            refused_total: self.refused_total,
+            rollbacks: self.rollbacks,
+            releases: self.releases,
+            live: self.live.len(),
+            peak_live: self.peak_live,
+        }
+    }
+}
+
+/// Which side of an overlap a cookie belongs to. History stays
+/// domain-qualified: equal numeric cookies on the two sides never merge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DomainSide {
+    Old,
+    New,
+}
+
+/// Candidate B transition refusal.
+#[derive(Debug, PartialEq, Eq)]
+pub enum OverlapError {
+    OverlapInProgress,
+    OldDomainStillProducing,
+    TerminalEvidenceUnacked,
+}
+
+impl std::fmt::Display for OverlapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OverlapInProgress => {
+                f.write_str("identity domains: overlap already in progress; no unbounded chain")
+            }
+            Self::OldDomainStillProducing => {
+                f.write_str("identity domains: old domain still producing; seal it before closing")
+            }
+            Self::TerminalEvidenceUnacked => {
+                f.write_str("identity domains: old domain terminal evidence lacks a durable ack")
+            }
+        }
+    }
+}
+
+impl std::error::Error for OverlapError {}
+
+/// Custody receipt for a closed old domain.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ClosedDomain {
+    pub retired_cookies: u64,
+    pub aliases_preserved: usize,
+}
+
+/// Candidate B: at most two overlapping identity domains. Opening the new
+/// domain doubles transient link/map/reader cost (`link_factor` 2) until the
+/// old domain is sealed, its terminal evidence acked, and it closes. Same
+/// tasks alive across the rollover need explicit cross-domain aliases; the
+/// alias map is part of the cost this candidate pays.
+pub struct OverlapPair {
+    old: TicketAllocator,
+    new: Option<TicketAllocator>,
+    aliases: BTreeMap<u64, u64>,
+    old_sealed: bool,
+    terminal_ack: Option<DurableAck>,
+}
+
+impl OverlapPair {
+    pub fn single(policy: TicketPolicy) -> Self {
+        Self {
+            old: TicketAllocator::new(policy),
+            new: None,
+            aliases: BTreeMap::new(),
+            old_sealed: false,
+            terminal_ack: None,
+        }
+    }
+
+    /// New arrivals use the new domain once it exists; otherwise the old one.
+    pub fn allocate(&mut self) -> (DomainSide, Result<u64, TicketError>) {
+        match self.new.as_mut() {
+            Some(new) => (DomainSide::New, new.allocate()),
+            None => (DomainSide::Old, self.old.allocate()),
+        }
+    }
+
+    pub fn retire(&mut self, side: DomainSide, cookie: u64) {
+        match (side, self.new.as_mut()) {
+            (DomainSide::New, Some(new)) => new.retire(cookie),
+            _ => self.old.retire(cookie),
+        }
+    }
+
+    pub fn begin_overlap(&mut self, policy: TicketPolicy) -> Result<(), OverlapError> {
+        if self.new.is_some() {
+            return Err(OverlapError::OverlapInProgress);
+        }
+        self.new = Some(TicketAllocator::new(policy));
+        Ok(())
+    }
+
+    /// Record that the same task holds `old_cookie` on the old domain and
+    /// `new_cookie` on the new one. Explicit by construction: never derived
+    /// from PID/starttime.
+    pub fn alias_same_task(&mut self, old_cookie: u64, new_cookie: u64) {
+        self.aliases.insert(old_cookie, new_cookie);
+    }
+
+    pub fn alias_count(&self) -> usize {
+        self.aliases.len()
+    }
+
+    /// Transient cost factor: 2 while two domains are attached, else 1.
+    pub fn link_factor(&self) -> u64 {
+        u64::from(self.new.is_some()) + 1
+    }
+
+    pub fn seal_old_domain(&mut self) {
+        self.old_sealed = true;
+    }
+
+    pub fn ack_old_terminal(&mut self, ack: DurableAck) {
+        self.terminal_ack = Some(ack);
+    }
+
+    pub fn close_old_domain(&mut self) -> Result<ClosedDomain, OverlapError> {
+        if !self.old_sealed {
+            return Err(OverlapError::OldDomainStillProducing);
+        }
+        if self.terminal_ack.is_none() {
+            return Err(OverlapError::TerminalEvidenceUnacked);
+        }
+        let Some(new) = self.new.take() else {
+            return Err(OverlapError::OldDomainStillProducing);
+        };
+        let retired_cookies = self.old.accounting().admitted;
+        self.old = new;
+        self.old_sealed = false;
+        self.terminal_ack = None;
+        Ok(ClosedDomain {
+            retired_cookies,
+            aliases_preserved: self.aliases.len(),
+        })
+    }
+}
+
+/// Candidate C store-transition refusal.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StoreError {
+    RotationInProgress,
+    WriterCountMismatch {
+        at_seal: u64,
+        redirected: u64,
+    },
+    UnackedRelease {
+        covered_through: u64,
+        needed_through: u64,
+    },
+    NothingToRelease,
+}
+
+impl std::fmt::Display for StoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RotationInProgress => f.write_str(
+                "evidence store: a retired store is still unreleased; no rotation chain",
+            ),
+            Self::WriterCountMismatch {
+                at_seal,
+                redirected,
+            } => write!(
+                f,
+                "evidence store: {redirected} writers redirected but {at_seal} were live at seal"
+            ),
+            Self::UnackedRelease {
+                covered_through,
+                needed_through,
+            } => write!(
+                f,
+                "evidence store: ack covers record {covered_through} but release needs {needed_through}"
+            ),
+            Self::NothingToRelease => f.write_str("evidence store: no retired store to release"),
+        }
+    }
+}
+
+impl std::error::Error for StoreError {}
+
+/// A sealed retired evidence store awaiting writer proof and a covering ack.
+#[derive(Debug)]
+pub struct SealedStore {
+    pub epoch: u64,
+    pub base_id: u64,
+    pub records: u64,
+    pub writers_at_seal: u64,
+}
+
+/// Candidate C: stable identity with a separately replaceable evidence
+/// store. Rotation seals the active store and opens a new epoch; the retired
+/// store releases only after an exact writer-redirection proof plus a
+/// durable ack covering every retired record. At most one retired store
+/// pends at a time.
+pub struct EvidenceRotation {
+    active_epoch: u64,
+    active_next_id: u64,
+    active_records: u64,
+    retired: Option<SealedStore>,
+    redirected: Option<u64>,
+}
+
+impl EvidenceRotation {
+    pub fn new() -> Self {
+        Self {
+            active_epoch: 0,
+            active_next_id: 0,
+            active_records: 0,
+            retired: None,
+            redirected: None,
+        }
+    }
+
+    pub fn append(&mut self, records: u64) {
+        self.active_next_id += records;
+        self.active_records += records;
+    }
+
+    pub fn rotate(&mut self, writers_at_seal: u64) -> Result<(), StoreError> {
+        if self.retired.is_some() {
+            return Err(StoreError::RotationInProgress);
+        }
+        let base_id = self.active_next_id - self.active_records;
+        self.retired = Some(SealedStore {
+            epoch: self.active_epoch,
+            base_id,
+            records: self.active_records,
+            writers_at_seal,
+        });
+        self.active_epoch += 1;
+        self.active_records = 0;
+        self.redirected = None;
+        Ok(())
+    }
+
+    pub fn redirect_writers(&mut self, redirected: u64) -> Result<(), StoreError> {
+        let Some(retired) = self.retired.as_ref() else {
+            return Err(StoreError::NothingToRelease);
+        };
+        if redirected != retired.writers_at_seal {
+            return Err(StoreError::WriterCountMismatch {
+                at_seal: retired.writers_at_seal,
+                redirected,
+            });
+        }
+        self.redirected = Some(redirected);
+        Ok(())
+    }
+
+    pub fn release_retired(&mut self, ack: &DurableAck) -> Result<SealedStore, StoreError> {
+        let Some(retired) = self.retired.as_ref() else {
+            return Err(StoreError::NothingToRelease);
+        };
+        if self.redirected != Some(retired.writers_at_seal) {
+            return Err(StoreError::WriterCountMismatch {
+                at_seal: retired.writers_at_seal,
+                redirected: self.redirected.unwrap_or(0),
+            });
+        }
+        let needed = retired.base_id + retired.records.saturating_sub(1);
+        if ack.through_id < needed {
+            return Err(StoreError::UnackedRelease {
+                covered_through: ack.through_id,
+                needed_through: needed,
+            });
+        }
+        self.redirected = None;
+        Ok(self.retired.take().expect("retired store checked above"))
+    }
+}
+
+/// Initial outer-directory bound for the segment experiment: the outer map
+/// capacity is a pre-creation choice, and raising this needs the live
+/// directory-exhaustion cell, not an assumption.
+pub const MAX_SEGMENTS: u32 = 16;
+
+/// Inner-map kind. Compatible inners share kind plus key/value shape; the
+/// kernel checks shape, not per-segment `max_entries`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InnerMapKind {
+    PerCpuArray,
+    Hash,
+}
+
+/// Compatible inner-map shape for one appended endpoint segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegmentSpec {
+    pub kind: InnerMapKind,
+    pub key_bytes: u32,
+    pub value_bytes: u32,
+    pub max_entries: u32,
+}
+
+impl SegmentSpec {
+    pub fn compatible_with(self, other: SegmentSpec) -> bool {
+        self.kind == other.kind
+            && self.key_bytes == other.key_bytes
+            && self.value_bytes == other.value_bytes
+    }
+}
+
+/// Segment-directory refusal. Always names the resource.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SegmentError {
+    DirectoryFull { cap: u32 },
+    IncompatibleSpec,
+    EmptySegment,
+    LengthOverflow,
+    UnknownEndpoint { endpoint: u64 },
+}
+
+impl std::fmt::Display for SegmentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DirectoryFull { cap } => {
+                write!(
+                    f,
+                    "segment directory exhausted: no room beyond {cap} segments"
+                )
+            }
+            Self::IncompatibleSpec => {
+                f.write_str("segment directory: inner map shape differs from the directory spec")
+            }
+            Self::EmptySegment => {
+                f.write_str("segment directory: appended segment must be non-empty")
+            }
+            Self::LengthOverflow => {
+                f.write_str("segment directory: endpoint base plus length overflowed")
+            }
+            Self::UnknownEndpoint { endpoint } => {
+                write!(f, "segment directory: endpoint {endpoint} is in no segment")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SegmentError {}
+
+struct AppendedSegment {
+    base: u64,
+    len: u32,
+    value_bytes: u64,
+}
+
+/// Static per-operation cost of the directory layout: outer plus inner
+/// lookups, FDs, per-CPU payload bytes and link pairs. A sizing model like
+/// [`StorageModel`], not a live kernel measurement.
+pub struct SegmentCost {
+    pub outer_lookups_per_op: u32,
+    pub inner_lookups_per_op: u32,
+    pub fds: u64,
+    pub per_cpu_payload_bytes: u64,
+    pub link_pairs: u64,
+}
+
+/// Appended endpoint segments in an outer directory. Segments only append:
+/// existing observations never migrate, and no live segment is replaced.
+/// Routing resolves a capture-local endpoint ID to its `(segment, index)`.
+pub struct SegmentDirectory {
+    cap: u32,
+    spec: Option<SegmentSpec>,
+    segments: Vec<AppendedSegment>,
+    next_base: u64,
+}
+
+impl SegmentDirectory {
+    pub fn new(cap: u32) -> Result<Self, String> {
+        if cap == 0 || cap > MAX_SEGMENTS {
+            return Err(format!(
+                "segment directory cap {cap} must be within 1..={MAX_SEGMENTS}"
+            ));
+        }
+        Ok(Self {
+            cap,
+            spec: None,
+            segments: Vec::new(),
+            next_base: 0,
+        })
+    }
+
+    pub fn append(&mut self, spec: SegmentSpec, len: u32) -> Result<u32, SegmentError> {
+        if self.segments.len() >= self.cap as usize {
+            return Err(SegmentError::DirectoryFull { cap: self.cap });
+        }
+        if len == 0 {
+            return Err(SegmentError::EmptySegment);
+        }
+        if let Some(first) = self.spec
+            && !first.compatible_with(spec)
+        {
+            return Err(SegmentError::IncompatibleSpec);
+        }
+        let base = self.next_base;
+        self.next_base = base
+            .checked_add(u64::from(len))
+            .ok_or(SegmentError::LengthOverflow)?;
+        let id = self.segments.len() as u32;
+        self.segments.push(AppendedSegment {
+            base,
+            len,
+            value_bytes: u64::from(spec.value_bytes),
+        });
+        if self.spec.is_none() {
+            self.spec = Some(spec);
+        }
+        Ok(id)
+    }
+
+    pub fn resolve(&self, endpoint: u64) -> Option<(u32, u32)> {
+        for (id, segment) in self.segments.iter().enumerate() {
+            let end = segment.base + u64::from(segment.len);
+            if endpoint >= segment.base && endpoint < end {
+                let index = u32::try_from(endpoint - segment.base)
+                    .expect("segment-relative index fits its u32 length");
+                return Some((id as u32, index));
+            }
+        }
+        None
+    }
+
+    pub fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+
+    pub fn total_endpoints(&self) -> u64 {
+        self.next_base
+    }
+
+    /// Cross-segment operation identity: the operation must name exactly the
+    /// segments it touches, and every endpoint must resolve.
+    pub fn check_cross_segment(&self, endpoints: &[u64]) -> Result<Vec<u32>, SegmentError> {
+        let mut touched = BTreeSet::new();
+        for endpoint in endpoints {
+            let Some((segment, _)) = self.resolve(*endpoint) else {
+                return Err(SegmentError::UnknownEndpoint {
+                    endpoint: *endpoint,
+                });
+            };
+            touched.insert(segment);
+        }
+        Ok(touched.into_iter().collect())
+    }
+
+    pub fn cost(&self, cpus: u32) -> SegmentCost {
+        let payload: u64 = self
+            .segments
+            .iter()
+            .map(|segment| u64::from(segment.len) * segment.value_bytes)
+            .sum();
+        SegmentCost {
+            outer_lookups_per_op: 1,
+            inner_lookups_per_op: 1,
+            fds: 1 + self.segments.len() as u64,
+            per_cpu_payload_bytes: payload.saturating_mul(u64::from(cpus)),
+            link_pairs: self.next_base,
+        }
+    }
+}
+
+/// Live-counter replacement refusal: writers were active, so the cell is untouched.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CounterError {
+    WritersActive { in_flight: u64 },
+}
+
+impl CounterError {
+    pub fn in_flight(&self) -> u64 {
+        match self {
+            Self::WritersActive { in_flight } => *in_flight,
+        }
+    }
+}
+
+impl std::fmt::Display for CounterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WritersActive { in_flight } => write!(
+                f,
+                "live counter replace refused: {in_flight} writers in flight"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CounterError {}
+
+/// Live-writer fence for one counter cell. Writers hold a read guard across
+/// their increment; replacement takes the write lock, so a successful swap
+/// observes every increment sequenced before it and no increment is lost.
+pub struct WriterSet {
+    lock: RwLock<()>,
+    in_flight: AtomicU64,
+}
+
+/// RAII live-writer guard. Dropping it ends the writer's critical section.
+pub struct WriterGuard<'a> {
+    _guard: RwLockReadGuard<'a, ()>,
+    in_flight: &'a AtomicU64,
+}
+
+impl Drop for WriterGuard<'_> {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl WriterSet {
+    pub fn new() -> Self {
+        Self {
+            lock: RwLock::new(()),
+            in_flight: AtomicU64::new(0),
+        }
+    }
+
+    pub fn hold(&self) -> WriterGuard<'_> {
+        let guard = self.lock.read().expect("writer set lock");
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        WriterGuard {
+            _guard: guard,
+            in_flight: &self.in_flight,
+        }
+    }
+
+    pub fn quiesced(&self) -> bool {
+        self.in_flight.load(Ordering::SeqCst) == 0
+    }
+
+    fn in_flight_count(&self) -> u64 {
+        self.in_flight.load(Ordering::SeqCst)
+    }
+}
+
+/// One live counter cell. Replacement without a proven writer transition is
+/// refused; a refused replace touches nothing.
+pub struct CounterCell {
+    value: AtomicU64,
+}
+
+impl CounterCell {
+    pub fn new() -> Self {
+        Self {
+            value: AtomicU64::new(0),
+        }
+    }
+
+    pub fn increment(&self) {
+        self.value.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn get(&self) -> u64 {
+        self.value.load(Ordering::SeqCst)
+    }
+
+    /// Swap the cell only when no writer is active. Returns the exact old
+    /// value, so every increment lands either in a returned old value or in
+    /// the cell: no replacement loses a concurrent increment.
+    pub fn try_replace_quiesced(&self, new: u64, writers: &WriterSet) -> Result<u64, CounterError> {
+        match writers.lock.try_write() {
+            Ok(_held) => Ok(self.value.swap(new, Ordering::SeqCst)),
+            Err(_) => Err(CounterError::WritersActive {
+                in_flight: writers.in_flight_count(),
+            }),
+        }
+    }
+}
+
+/// Exact allocation lifecycle. Reserved -> Initialized/readback -> Published
+/// -> ProducersEnabled -> Retired/Quarantined -> SettlementAcked. Partial
+/// attach or readback failure quarantines from Initialized or Published;
+/// nothing leaves Quarantined except toward settlement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllocState {
+    Reserved,
+    Initialized,
+    Published,
+    ProducersEnabled,
+    Retired,
+    Quarantined,
+    SettlementAcked,
+}
+
+/// Illegal allocation transition. The allocation keeps its prior state and
+/// payload: failure preserves prior data.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AllocTransitionError {
+    pub from: AllocState,
+    pub to: AllocState,
+}
+
+impl std::fmt::Display for AllocTransitionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "allocation transition {:?} -> {:?} is illegal",
+            self.from, self.to
+        )
+    }
+}
+
+impl std::error::Error for AllocTransitionError {}
+
+/// One allocation moving through [`AllocState`]. `payload_bytes` stands for
+/// the prior data a failed transition must preserve.
+pub struct Allocation {
+    id: u64,
+    state: AllocState,
+    payload_bytes: u64,
+}
+
+impl Allocation {
+    pub fn reserve(id: u64, payload_bytes: u64) -> Self {
+        Self {
+            id,
+            state: AllocState::Reserved,
+            payload_bytes,
+        }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn state(&self) -> AllocState {
+        self.state
+    }
+
+    pub fn payload_bytes(&self) -> u64 {
+        self.payload_bytes
+    }
+
+    pub fn transition(&mut self, to: AllocState) -> Result<(), AllocTransitionError> {
+        let legal = matches!(
+            (self.state, to),
+            (AllocState::Reserved, AllocState::Initialized)
+                | (AllocState::Initialized, AllocState::Published)
+                | (AllocState::Initialized, AllocState::Quarantined)
+                | (AllocState::Published, AllocState::ProducersEnabled)
+                | (AllocState::Published, AllocState::Quarantined)
+                | (AllocState::ProducersEnabled, AllocState::Retired)
+                | (AllocState::ProducersEnabled, AllocState::Quarantined)
+                | (AllocState::Retired, AllocState::SettlementAcked)
+                | (AllocState::Quarantined, AllocState::SettlementAcked)
+        );
+        if !legal {
+            return Err(AllocTransitionError {
+                from: self.state,
+                to,
+            });
+        }
+        self.state = to;
+        Ok(())
+    }
+}
+
+/// RAM, history or disk budget refusal. Always names the resource.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BudgetError {
+    RamExhausted { wanted: u64, available: u64 },
+    HistoryExhausted { wanted: u64, cap: u64 },
+    DiskExhausted { wanted: u64, available: u64 },
+}
+
+impl std::fmt::Display for BudgetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RamExhausted { wanted, available } => write!(
+                f,
+                "RAM budget exhausted: wanted {wanted} bytes with {available} available"
+            ),
+            Self::HistoryExhausted { wanted, cap } => write!(
+                f,
+                "history budget exhausted: wanted {wanted} records at cap {cap}"
+            ),
+            Self::DiskExhausted { wanted, available } => write!(
+                f,
+                "disk budget exhausted: wanted {wanted} bytes with {available} available"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BudgetError {}
+
+/// Live RAM byte budget with peak tracking.
+pub struct RamBudget {
+    limit: u64,
+    current: u64,
+    peak: u64,
+}
+
+impl RamBudget {
+    pub fn new(limit: u64) -> Result<Self, String> {
+        if limit == 0 {
+            return Err("RAM budget must be non-zero".into());
+        }
+        Ok(Self {
+            limit,
+            current: 0,
+            peak: 0,
+        })
+    }
+
+    pub fn acquire(&mut self, bytes: u64) -> Result<(), BudgetError> {
+        if bytes > self.limit - self.current {
+            return Err(BudgetError::RamExhausted {
+                wanted: bytes,
+                available: self.limit - self.current,
+            });
+        }
+        self.current += bytes;
+        self.peak = self.peak.max(self.current);
+        Ok(())
+    }
+
+    pub fn release(&mut self, bytes: u64) {
+        self.current = self.current.saturating_sub(bytes);
+    }
+
+    pub fn current(&self) -> u64 {
+        self.current
+    }
+
+    pub fn peak(&self) -> u64 {
+        self.peak
+    }
+
+    pub fn limit(&self) -> u64 {
+        self.limit
+    }
+}
+
+/// Retained-history record budget, independent of live RAM.
+pub struct HistoryBudget {
+    cap: u64,
+    current: u64,
+    peak: u64,
+}
+
+impl HistoryBudget {
+    pub fn new(cap: u64) -> Result<Self, String> {
+        if cap == 0 {
+            return Err("history budget must be non-zero".into());
+        }
+        Ok(Self {
+            cap,
+            current: 0,
+            peak: 0,
+        })
+    }
+
+    pub fn acquire_records(&mut self, records: u64) -> Result<(), BudgetError> {
+        if records > self.cap - self.current {
+            return Err(BudgetError::HistoryExhausted {
+                wanted: records,
+                cap: self.cap,
+            });
+        }
+        self.current += records;
+        self.peak = self.peak.max(self.current);
+        Ok(())
+    }
+
+    pub fn release_records(&mut self, records: u64) {
+        self.current = self.current.saturating_sub(records);
+    }
+
+    pub fn current(&self) -> u64 {
+        self.current
+    }
+
+    pub fn peak(&self) -> u64 {
+        self.peak
+    }
+
+    pub fn cap(&self) -> u64 {
+        self.cap
+    }
+}
+
+/// Durable-sink disk byte budget with full-sink refusal semantics.
+pub struct DiskBudget {
+    limit: u64,
+    used: u64,
+    peak: u64,
+}
+
+impl DiskBudget {
+    pub fn new(limit: u64) -> Result<Self, String> {
+        if limit == 0 {
+            return Err("disk budget must be non-zero".into());
+        }
+        Ok(Self {
+            limit,
+            used: 0,
+            peak: 0,
+        })
+    }
+
+    pub fn acquire(&mut self, bytes: u64) -> Result<(), BudgetError> {
+        if bytes > self.limit - self.used {
+            return Err(BudgetError::DiskExhausted {
+                wanted: bytes,
+                available: self.limit - self.used,
+            });
+        }
+        self.used += bytes;
+        self.peak = self.peak.max(self.used);
+        Ok(())
+    }
+
+    pub fn release(&mut self, bytes: u64) {
+        self.used = self.used.saturating_sub(bytes);
+    }
+
+    pub fn used(&self) -> u64 {
+        self.used
+    }
+
+    pub fn available(&self) -> u64 {
+        self.limit - self.used
+    }
+
+    pub fn peak(&self) -> u64 {
+        self.peak
+    }
+
+    pub fn limit(&self) -> u64 {
+        self.limit
+    }
+}
+
+/// Stable export record identifier. IDs are assigned once, never reused, and
+/// survive crash/replay: a re-staged batch carries the same IDs.
+pub type RecordId = u64;
+
+/// What one export record carries. Omission history travels with positives
+/// and counters: publication stages the whole pending set, never a subset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportKind {
+    PositiveEvidence,
+    CounterSnapshot,
+    OmissionHistory,
+}
+
+/// One staged export record with its stable ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExportRecord {
+    pub id: RecordId,
+    pub kind: ExportKind,
+    pub bytes: u64,
+}
+
+/// Content checksum over a record batch (FNV-1a over id/kind/bytes). The
+/// session and the sink compare this independently: a mere flush mints no
+/// ack without a matching readback.
+pub fn export_checksum(records: &[ExportRecord]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for record in records {
+        for word in [record.id, record.kind as u64, record.bytes] {
+            for byte in word.to_le_bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+    }
+    hash
+}
+
+/// Exact final snapshot presented before staging: record count plus content
+/// checksum. Construct it with [`FinalSnapshot::compute`]; anything else is
+/// compared, not trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FinalSnapshot {
+    pub records: u64,
+    pub checksum: u64,
+}
+
+impl FinalSnapshot {
+    pub fn compute(records: &[ExportRecord]) -> Self {
+        Self {
+            records: records.len() as u64,
+            checksum: export_checksum(records),
+        }
+    }
+}
+
+/// Durable export acknowledgement: every record through `through_id` is
+/// durable with a verified readback checksum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DurableAck {
+    pub through_id: RecordId,
+    pub checksum: u64,
+}
+
+/// A sink-side staged batch between write and commit. Dropping it without
+/// commit models a crash: the session still holds the records under the
+/// same stable IDs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StagedExport {
+    pub through_id: RecordId,
+    pub checksum: u64,
+    pub bytes: u64,
+}
+
+/// Durable-sink failure. Always names the failed step with byte counts.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SinkError {
+    WriteFailed {
+        written_bytes: u64,
+        total_bytes: u64,
+    },
+    ReadbackMismatch {
+        expected: u64,
+        actual: u64,
+    },
+    SinkFull {
+        needed_bytes: u64,
+        available_bytes: u64,
+    },
+}
+
+impl std::fmt::Display for SinkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WriteFailed {
+                written_bytes,
+                total_bytes,
+            } => write!(
+                f,
+                "durable sink write failed after {written_bytes} of {total_bytes} bytes"
+            ),
+            Self::ReadbackMismatch { expected, actual } => write!(
+                f,
+                "durable sink readback mismatch: expected checksum {expected}, got {actual}"
+            ),
+            Self::SinkFull {
+                needed_bytes,
+                available_bytes,
+            } => write!(
+                f,
+                "durable sink full: needed {needed_bytes} bytes with {available_bytes} available"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SinkError {}
+
+/// Two-phase durable sink: `stage` writes the batch, `commit` verifies the
+/// readback checksum and mints the ack. A flush alone never mints an ack.
+pub trait DurableSink {
+    fn stage(&mut self, records: &[ExportRecord]) -> Result<StagedExport, SinkError>;
+    fn commit(
+        &mut self,
+        staged: StagedExport,
+        readback_checksum: u64,
+    ) -> Result<DurableAck, SinkError>;
+}
+
+/// Export-session protocol refusal.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ExportError {
+    ProducersStillOpen {
+        open: u64,
+    },
+    FinalSnapshotMissing,
+    FinalSnapshotMismatch {
+        expected: FinalSnapshot,
+        actual: FinalSnapshot,
+    },
+    NothingStaged,
+    AckThroughMismatch {
+        expected: RecordId,
+        actual: RecordId,
+    },
+    AckChecksumMismatch {
+        expected: u64,
+        actual: u64,
+    },
+}
+
+impl std::fmt::Display for ExportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProducersStillOpen { open } => write!(
+                f,
+                "durable export refused: {open} producers still open (cutoff never established)"
+            ),
+            Self::FinalSnapshotMissing => {
+                f.write_str("durable export refused: final snapshot not included")
+            }
+            Self::FinalSnapshotMismatch { expected, actual } => write!(
+                f,
+                "durable export refused: final snapshot {expected:?} does not match pending {actual:?}"
+            ),
+            Self::NothingStaged => f.write_str("durable export: nothing staged to ack"),
+            Self::AckThroughMismatch { expected, actual } => write!(
+                f,
+                "durable export refused: ack covers through record {actual} but {expected} is staged"
+            ),
+            Self::AckChecksumMismatch { expected, actual } => write!(
+                f,
+                "durable export refused: ack checksum {actual} does not match staged {expected}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ExportError {}
+
+/// Replay classification: durable-log IDs at or below the ack are
+/// duplicates; anything else unaccounted-for is reported, never absorbed.
+pub struct ReplayReport {
+    pub duplicates: u64,
+    pub unaccounted: u64,
+}
+
+/// Bounded-retention durable export session. Reclaiming positive evidence
+/// requires, in order: stable record IDs, producer cutoff, exact final
+/// snapshot inclusion, and a covering ack from a two-phase durable sink.
+/// Staging always takes the whole pending set, so omission history cannot
+/// be stranded behind positives (A-F5).
+pub struct ExportSession {
+    next_id: RecordId,
+    pending: BTreeMap<RecordId, ExportRecord>,
+    producers_cut_off: bool,
+    snapshot: Option<FinalSnapshot>,
+    staged: Option<Vec<ExportRecord>>,
+    acked_through: Option<RecordId>,
+}
+
+impl ExportSession {
+    pub fn new() -> Self {
+        Self {
+            next_id: 0,
+            pending: BTreeMap::new(),
+            producers_cut_off: false,
+            snapshot: None,
+            staged: None,
+            acked_through: None,
+        }
+    }
+
+    pub fn append(&mut self, kind: ExportKind, bytes: u64) -> RecordId {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.pending.insert(id, ExportRecord { id, kind, bytes });
+        id
+    }
+
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub fn pending_batch(&self) -> Vec<ExportRecord> {
+        self.pending.values().copied().collect()
+    }
+
+    /// Fence producers before export. A nonzero open count refuses; the
+    /// cutoff is what authorizes reclamation, never a flush or an exit hint.
+    pub fn cutoff_producers(&mut self, open_producers: u64) -> Result<(), ExportError> {
+        if open_producers > 0 {
+            return Err(ExportError::ProducersStillOpen {
+                open: open_producers,
+            });
+        }
+        self.producers_cut_off = true;
+        Ok(())
+    }
+
+    /// Include the exact final snapshot. It is re-verified at stage time,
+    /// so appends between inclusion and staging cannot slip through.
+    pub fn include_final_snapshot(&mut self, snapshot: &FinalSnapshot) -> Result<(), ExportError> {
+        let actual = FinalSnapshot::compute(&self.pending_batch());
+        if *snapshot != actual {
+            return Err(ExportError::FinalSnapshotMismatch {
+                expected: *snapshot,
+                actual,
+            });
+        }
+        self.snapshot = Some(*snapshot);
+        Ok(())
+    }
+
+    /// Stage the whole pending set under its stable IDs. Re-staging after a
+    /// crash returns the same IDs; only the ack retires them.
+    pub fn stage_batch(&mut self) -> Result<Vec<ExportRecord>, ExportError> {
+        if !self.producers_cut_off {
+            return Err(ExportError::ProducersStillOpen { open: u64::MAX });
+        }
+        let Some(snapshot) = self.snapshot else {
+            return Err(ExportError::FinalSnapshotMissing);
+        };
+        let batch = self.pending_batch();
+        if batch.is_empty() {
+            return Err(ExportError::NothingStaged);
+        }
+        let actual = FinalSnapshot::compute(&batch);
+        if snapshot != actual {
+            return Err(ExportError::FinalSnapshotMismatch {
+                expected: snapshot,
+                actual,
+            });
+        }
+        self.staged = Some(batch.clone());
+        Ok(batch)
+    }
+
+    /// Retire the staged batch under a covering ack. Partial acks and
+    /// checksum mismatches are refused; the batch stays pending.
+    pub fn commit_ack(&mut self, ack: &DurableAck) -> Result<u64, ExportError> {
+        let Some(staged) = self.staged.as_ref() else {
+            return Err(ExportError::NothingStaged);
+        };
+        let Some(last) = staged.last() else {
+            return Err(ExportError::NothingStaged);
+        };
+        let expected_id = last.id;
+        let expected_checksum = export_checksum(staged);
+        let count = staged.len() as u64;
+        let ids: Vec<RecordId> = staged.iter().map(|record| record.id).collect();
+        if ack.through_id != expected_id {
+            return Err(ExportError::AckThroughMismatch {
+                expected: expected_id,
+                actual: ack.through_id,
+            });
+        }
+        if ack.checksum != expected_checksum {
+            return Err(ExportError::AckChecksumMismatch {
+                expected: expected_checksum,
+                actual: ack.checksum,
+            });
+        }
+        for id in ids {
+            self.pending.remove(&id);
+        }
+        self.acked_through = Some(ack.through_id);
+        self.staged = None;
+        Ok(count)
+    }
+
+    pub fn acked_through(&self) -> Option<RecordId> {
+        self.acked_through
+    }
+
+    /// Classify a replayed durable log against the ack frontier and pending.
+    pub fn replay_report(&self, durable_log: &[(RecordId, u64)]) -> ReplayReport {
+        let mut duplicates = 0;
+        let mut unaccounted = 0;
+        for (id, _) in durable_log {
+            if self.acked_through.is_some_and(|through| *id <= through) {
+                duplicates += 1;
+            } else if !self.pending.contains_key(id) {
+                unaccounted += 1;
+            }
+        }
+        ReplayReport {
+            duplicates,
+            unaccounted,
+        }
+    }
+}
+
+impl Default for ExportSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Default for EvidenceRotation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Default for CounterCell {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Default for WriterSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One resource dimension measured three ways: current live use, peak use,
+/// and retained (acknowledged but still held) use.
+pub struct ResourceGauge {
+    pub current: u64,
+    pub peak: u64,
+    pub retained: u64,
+}
+
+/// Peak/current/retained envelope report across the three bounded
+/// dimensions. Live resources track occupancy; history growth tracks its own
+/// budget; nothing is folded together.
+pub struct EnvelopeReport {
+    ram: ResourceGauge,
+    history: ResourceGauge,
+    disk: ResourceGauge,
+}
+
+impl EnvelopeReport {
+    pub fn capture(
+        ram: &RamBudget,
+        history: &HistoryBudget,
+        disk: &DiskBudget,
+        retained_ram: u64,
+        retained_history: u64,
+        retained_disk: u64,
+    ) -> Self {
+        Self {
+            ram: ResourceGauge {
+                current: ram.current(),
+                peak: ram.peak(),
+                retained: retained_ram,
+            },
+            history: ResourceGauge {
+                current: history.current(),
+                peak: history.peak(),
+                retained: retained_history,
+            },
+            disk: ResourceGauge {
+                current: disk.used(),
+                peak: disk.peak(),
+                retained: retained_disk,
+            },
+        }
+    }
+
+    pub fn render(&self) -> String {
+        format!(
+            "ram current={} peak={} retained={}\nhistory current={} peak={} retained={}\ndisk current={} peak={} retained={}\n",
+            self.ram.current,
+            self.ram.peak,
+            self.ram.retained,
+            self.history.current,
+            self.history.peak,
+            self.history.retained,
+            self.disk.current,
+            self.disk.peak,
+            self.disk.retained,
+        )
+    }
 }
 
 #[cfg(test)]

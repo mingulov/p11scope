@@ -8933,3 +8933,445 @@ fn privileged_inventory_activation_failure_preserves_usage_and_releases_resource
     drop(retired);
     ids.released()
 }
+
+// Task 6 (stop gate) Step 1: privileged live selectors. The controller owns
+// Steps 2-3 (privileged runs + overhead); these only compile here.
+
+/// Byte-level capture-state snapshot for the stop-gate freeze assertions:
+/// per-CPU STATS rows, per-CPU RV_COUNTS rows, full START rows, and both
+/// ring producer positions.
+/// One per-CPU STATS row: entered, returned, errors, total_ns, max_ns,
+/// and the latency buckets.
+type StopGateStatsRow = (u64, u64, u64, u64, u64, Vec<u64>);
+
+#[derive(Debug, PartialEq, Eq)]
+struct StopGateCaptureState {
+    stats: Vec<Vec<StopGateStatsRow>>,
+    rvs: BTreeMap<(u32, u64), Vec<u64>>,
+    starts: BTreeMap<(u64, u32), StopGateStartRow>,
+    events_producer: usize,
+    discovery_producer: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct StopGateStartRow {
+    ts_ns: u64,
+    session: u64,
+    slot_id: u64,
+    mechanism: u64,
+    mechanism_ptr: u64,
+    flags: u64,
+    out_ptr: u64,
+    user_type: u32,
+    shape: u32,
+    p0: u64,
+    p1: u64,
+    p2: u64,
+    async_value: u64,
+    attr_types: Vec<u64>,
+    attr_count: u32,
+    attr_total: u32,
+    attr_bools: u32,
+    attr_bools_seen: u32,
+    attr_types1: Vec<u64>,
+    attr_count1: u32,
+    attr_total1: u32,
+    attr_bools1: u32,
+    attr_bools_seen1: u32,
+    capture: u32,
+    target_function: u32,
+    task_cookie: u64,
+    exec_id: u64,
+}
+
+fn snapshot_stop_gate_state(
+    session: &mut crate::attach::Session,
+    endpoints: u32,
+) -> Result<StopGateCaptureState> {
+    let stats_map: PerCpuArray<_, SlotStats> =
+        PerCpuArray::try_from(session.ebpf.map("STATS").context("STATS")?)?;
+    let mut stats = Vec::with_capacity(endpoints as usize);
+    for slot in 0..endpoints {
+        let mut cpus = Vec::new();
+        for cpu in stats_map.get(&slot, 0)?.iter() {
+            cpus.push((
+                cpu.entered,
+                cpu.returned,
+                cpu.errors,
+                cpu.total_ns,
+                cpu.max_ns,
+                cpu.buckets.to_vec(),
+            ));
+        }
+        stats.push(cpus);
+    }
+    let rv_map: PerCpuHashMap<_, RvKey, u64> =
+        PerCpuHashMap::try_from(session.ebpf.map("RV_COUNTS").context("RV_COUNTS")?)?;
+    let mut rvs = BTreeMap::new();
+    for entry in rv_map.iter() {
+        let (key, counts) = entry?;
+        ensure!(
+            key.slot < endpoints && key._pad == 0,
+            "foreign Detailed RV key in stop-gate snapshot"
+        );
+        ensure!(
+            rvs.insert((key.slot, key.rv), counts.iter().copied().collect())
+                .is_none(),
+            "duplicate Detailed RV key in stop-gate snapshot"
+        );
+    }
+    let start_map: HashMap<_, StartKey, CallStart> =
+        HashMap::try_from(session.ebpf.map("START").context("START")?)?;
+    let mut starts = BTreeMap::new();
+    for entry in start_map.iter() {
+        let (key, start) = entry?;
+        ensure!(
+            key.slot < endpoints && key._pad == 0,
+            "foreign Detailed START key in stop-gate snapshot"
+        );
+        let row = StopGateStartRow {
+            ts_ns: start.ts_ns,
+            session: start.session,
+            slot_id: start.slot_id,
+            mechanism: start.mechanism,
+            mechanism_ptr: start.mechanism_ptr,
+            flags: start.flags,
+            out_ptr: start.out_ptr,
+            user_type: start.user_type,
+            shape: start.shape,
+            p0: start.p0,
+            p1: start.p1,
+            p2: start.p2,
+            async_value: start.async_value,
+            attr_types: start.attr_types.to_vec(),
+            attr_count: start.attr_count,
+            attr_total: start.attr_total,
+            attr_bools: start.attr_bools,
+            attr_bools_seen: start.attr_bools_seen,
+            attr_types1: start.attr_types1.to_vec(),
+            attr_count1: start.attr_count1,
+            attr_total1: start.attr_total1,
+            attr_bools1: start.attr_bools1,
+            attr_bools_seen1: start.attr_bools_seen1,
+            capture: start.capture,
+            target_function: start.target_function,
+            task_cookie: start.image.task_cookie,
+            exec_id: start.image.exec_id,
+        };
+        ensure!(
+            starts.insert((key.pid_tgid, key.slot), row).is_none(),
+            "duplicate Detailed START key in stop-gate snapshot"
+        );
+    }
+    let events_producer = session.event_drain_positions()?.producer;
+    let discovery_producer = session.discovery_positions()?.producer;
+    Ok(StopGateCaptureState {
+        stats,
+        rvs,
+        starts,
+        events_producer,
+        discovery_producer,
+    })
+}
+
+/// Request the stop, then poll for Q under the owner budget while servicing
+/// both drains, exactly like the production terminal path.
+fn stop_gate_request_and_quiesce(
+    session: &mut crate::attach::Session,
+    events: &mut Vec<Event>,
+) -> Result<crate::run::StopState> {
+    session.stop_gate().request_stop();
+    let mut discovery_malformed = 0u64;
+    let state = session.quiesce_terminal(
+        crate::run::STOP_QUIESCE_BUDGET,
+        Some(|drain: &mut crate::events::OwnedDrain| {
+            drain.poll(Some(256), |event| {
+                events.push(event);
+                ControlFlow::Continue(())
+            });
+        }),
+        |discovery: &mut crate::events::OwnedDiscoveryDrain| {
+            while let Some(item) = discovery.dequeue() {
+                if matches!(item, crate::events::DiscoveryItem::Malformed) {
+                    discovery_malformed += 1;
+                }
+            }
+        },
+        Instant::now,
+    )?;
+    ensure!(
+        discovery_malformed == 0,
+        "stop-gate quiesce serviced malformed discovery"
+    );
+    Ok(state)
+}
+
+fn stop_gate_start_session(
+    plan: &AttachPlan,
+    caller: &OwnedCaller,
+    pins: &PinnedObjects,
+) -> Result<crate::attach::Session> {
+    crate::attach::Session::start(
+        plan,
+        &Scope::Pid(caller.child.id()),
+        pins,
+        crate::attach::CapturePolicy::Allowlisted,
+        None,
+        None,
+        None,
+        crate::attach::BackendSelection::Singles,
+    )
+}
+
+#[test]
+#[ignore = "root-owned BPF lane; Detailed stop gate freezes capture state after quiescence"]
+fn privileged_stop_gate_freezes_capture_state_after_quiescence() -> Result<()> {
+    const ENDPOINTS: u32 = 8;
+    let fixture = OwnedFixture::build_n(false, ENDPOINTS)?;
+    let plan =
+        AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::Detailed)
+            .map_err(anyhow::Error::msg)?;
+    let mut caller = fixture.spawn_gated()?;
+    let mut session = stop_gate_start_session(&plan, &caller, &fixture.pins)?;
+    ensure!(
+        session.attach_failures().is_empty() && session.attached_probes() == 2 * ENDPOINTS as usize,
+        "stop-gate fixture did not retain every paired static probe"
+    );
+    let ids = OwnedIds::detailed(&session)?;
+    let mut events = Vec::new();
+    drain_task4_detailed(&mut session, &mut events)?;
+    ensure!(events.is_empty(), "Detailed events preceded GO");
+    caller.go()?;
+    for id in 0..ENDPOINTS {
+        caller.call_exact(id, 0)?;
+        caller.call_exact(id, 5)?;
+    }
+    drain_task4_detailed(&mut session, &mut events)?;
+    ensure!(
+        events.len() == 2 * ENDPOINTS as usize,
+        "stop-gate fixture completed-call count differs"
+    );
+    let stop_state = stop_gate_request_and_quiesce(&mut session, &mut events)?;
+    ensure!(
+        matches!(stop_state, crate::run::StopState::Quiesced { .. }),
+        "stop gate did not reach Q: {stop_state:?}"
+    );
+    let frozen = snapshot_stop_gate_state(&mut session, ENDPOINTS)?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        caller.calls(0, 1_000)?;
+        let current = snapshot_stop_gate_state(&mut session, ENDPOINTS)?;
+        ensure!(
+            current == frozen,
+            "capture state moved after Q while calls continued"
+        );
+        ensure!(
+            session.stop_gate().in_flight() == 0,
+            "stop gate shows bodies in flight after Q"
+        );
+        if Instant::now() >= deadline {
+            break;
+        }
+    }
+    drain_task4_detailed(&mut session, &mut events)?;
+    ensure!(
+        events.len() == 2 * ENDPOINTS as usize,
+        "post-Q calls emitted Detailed events"
+    );
+    let detached = session.detach_producers();
+    let clean_detach = session.detach_failures().is_empty();
+    drop(session);
+    ids.released_with_budget(Duration::from_secs(60))?;
+    caller.finish()?;
+    detached?;
+    ensure!(clean_detach, "stop-gate detach retained failures");
+    Ok(())
+}
+
+#[cfg(feature = "wide-detailed-2112")]
+#[test]
+#[ignore = "root-owned BPF lane; 2112-slot Detailed stop publishes before cleanup"]
+fn privileged_detailed_2112_stop_publishes_before_cleanup() -> Result<()> {
+    const ENDPOINTS: u32 = 2_112;
+    let origin = Instant::now();
+    let fixture = OwnedFixture::build_n(false, ENDPOINTS)?;
+    let plan =
+        AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::Detailed)
+            .map_err(anyhow::Error::msg)?;
+    let mut caller = fixture.spawn_gated()?;
+    let mut session = stop_gate_start_session(&plan, &caller, &fixture.pins)?;
+    ensure!(
+        session.attach_failures().is_empty() && session.attached_probes() == 2 * ENDPOINTS as usize,
+        "stop-gate fixture did not retain every paired static probe"
+    );
+    let ids = OwnedIds::detailed(&session)?;
+    let mut events = Vec::with_capacity(2 * ENDPOINTS as usize);
+    drain_task4_detailed(&mut session, &mut events)?;
+    ensure!(events.is_empty(), "Detailed events preceded GO");
+    caller.go()?;
+    for id in 0..ENDPOINTS {
+        caller.call_exact(id, 0)?;
+        caller.call_exact(id, 5)?;
+        if id % 32 == 31 {
+            drain_task4_detailed(&mut session, &mut events)?;
+        }
+    }
+    drain_task4_detailed(&mut session, &mut events)?;
+    let ack_start = Instant::now();
+    session.stop_gate().request_stop();
+    eprintln!("p11scope: stopping (stop-gate timing selector requested the stop)");
+    let ack_ms = ack_start.elapsed().as_millis();
+    let q_start = Instant::now();
+    let mut discovery_malformed = 0u64;
+    let stop_state = session.quiesce_terminal(
+        crate::run::STOP_QUIESCE_BUDGET,
+        Some(|drain: &mut crate::events::OwnedDrain| {
+            drain.poll(Some(256), |event| {
+                events.push(event);
+                ControlFlow::Continue(())
+            });
+        }),
+        |discovery: &mut crate::events::OwnedDiscoveryDrain| {
+            while let Some(item) = discovery.dequeue() {
+                if matches!(item, crate::events::DiscoveryItem::Malformed) {
+                    discovery_malformed += 1;
+                }
+            }
+        },
+        Instant::now,
+    )?;
+    let q_ms = q_start.elapsed().as_millis();
+    ensure!(
+        matches!(stop_state, crate::run::StopState::Quiesced { .. }),
+        "stop gate did not reach Q: {stop_state:?}"
+    );
+    ensure!(
+        discovery_malformed == 0,
+        "stop-gate quiesce serviced malformed discovery"
+    );
+    let publish_start = Instant::now();
+    let events_q = session.event_drain_positions()?.producer;
+    let discovery_q = session.discovery_positions()?.producer;
+    drain_task4_detailed(&mut session, &mut events)?;
+    ensure!(
+        events.len() == 2 * ENDPOINTS as usize,
+        "terminal drain missed pre-Q Detailed events"
+    );
+    assert_task4_detailed_maps(&session, true, ENDPOINTS)?;
+    ensure!(
+        session.event_drain_positions()?.producer == events_q
+            && session.discovery_positions()?.producer == discovery_q,
+        "rings moved between Q and the terminal drain"
+    );
+    let publish_ms = publish_start.elapsed().as_millis();
+    let cleanup_start = Instant::now();
+    let detached = session.detach_producers();
+    let cleanup_ms = cleanup_start.elapsed().as_millis();
+    let clean_detach = session.detach_failures().is_empty();
+    drop(session);
+    ids.released_with_budget(Duration::from_secs(60))?;
+    caller.finish()?;
+    detached?;
+    ensure!(clean_detach, "stop-gate detach retained failures");
+    ensure!(
+        ack_ms <= 500,
+        "stop acknowledgement exceeded the 500 ms owner budget: {ack_ms} ms"
+    );
+    ensure!(
+        q_ms <= 5_000,
+        "quiescence wait exceeded the 5 s owner budget: {q_ms} ms"
+    );
+    ensure!(
+        ack_ms + q_ms + publish_ms <= 10_000,
+        "stop report exceeded the 10 s owner budget"
+    );
+    ensure!(
+        publish_ms * 4 < cleanup_ms,
+        "publish {publish_ms} ms is not well below cleanup {cleanup_ms} ms"
+    );
+    eprintln!(
+        "STOPGATE_TIMING links={} ack_ms={ack_ms} q_ms={q_ms} publish_ms={publish_ms} cleanup_ms={cleanup_ms} elapsed_ms={}",
+        ids.links.len(),
+        origin.elapsed().as_millis()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "root-owned BPF lane; Detailed stop keeps in-flight calls as residual evidence"]
+fn privileged_stop_gate_keeps_calls_in_flight_as_residual() -> Result<()> {
+    const ENDPOINTS: u32 = 8;
+    let fixture = OwnedFixture::build_n(false, ENDPOINTS)?;
+    let plan =
+        AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::Detailed)
+            .map_err(anyhow::Error::msg)?;
+    let mut caller = fixture.spawn_gated()?;
+    let mut session = stop_gate_start_session(&plan, &caller, &fixture.pins)?;
+    ensure!(
+        session.attach_failures().is_empty() && session.attached_probes() == 2 * ENDPOINTS as usize,
+        "stop-gate fixture did not retain every paired static probe"
+    );
+    let ids = OwnedIds::detailed(&session)?;
+    let mut events = Vec::new();
+    drain_task4_detailed(&mut session, &mut events)?;
+    ensure!(events.is_empty(), "Detailed events preceded GO");
+    caller.go()?;
+    caller.hold_call_in_body(0, 23)?;
+    let stop_state = stop_gate_request_and_quiesce(&mut session, &mut events)?;
+    ensure!(
+        matches!(stop_state, crate::run::StopState::Quiesced { .. }),
+        "stop gate did not reach Q with a call held in the provider body: {stop_state:?}"
+    );
+    ensure!(
+        events.is_empty(),
+        "held Detailed entry emitted a completed CALL"
+    );
+    let at_q = snapshot_stop_gate_state(&mut session, ENDPOINTS)?;
+    ensure!(
+        at_q.starts.len() == 1,
+        "held Detailed call left no sole START residual"
+    );
+    let leader = u64::from(caller.child.id()) << 32 | u64::from(caller.child.id());
+    let ((pid_tgid, slot), row) = at_q.starts.iter().next().context("sole START row")?;
+    ensure!(
+        (*pid_tgid, *slot) == (leader, 0) && row.ts_ns != 0,
+        "START residual is not the held owned call"
+    );
+    for (slot, cpus) in at_q.stats.iter().enumerate() {
+        let mut entered = 0u64;
+        let mut returned = 0u64;
+        for cpu in cpus {
+            entered += cpu.0;
+            returned += cpu.1;
+        }
+        ensure!(
+            (entered, returned) == if slot == 0 { (1, 0) } else { (0, 0) },
+            "slot {slot} counted a completion for the held call"
+        );
+    }
+    ensure!(
+        at_q.rvs.is_empty(),
+        "held Detailed call fabricated an RV row"
+    );
+    caller.assert_body_held()?;
+    caller.resume_body(0)?;
+    caller.finish_calls(0, 23)?;
+    let after_release = snapshot_stop_gate_state(&mut session, ENDPOINTS)?;
+    ensure!(
+        after_release == at_q,
+        "releasing the held call changed post-Q capture state"
+    );
+    drain_task4_detailed(&mut session, &mut events)?;
+    ensure!(
+        events.is_empty(),
+        "post-Q completions emitted Detailed events"
+    );
+    let detached = session.detach_producers();
+    let clean_detach = session.detach_failures().is_empty();
+    drop(session);
+    ids.released_with_budget(Duration::from_secs(60))?;
+    caller.finish()?;
+    detached?;
+    ensure!(clean_detach, "stop-gate detach retained failures");
+    Ok(())
+}

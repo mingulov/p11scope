@@ -332,7 +332,6 @@ fn run_candidate_b() -> CandidateEvidence {
     let mut pair = OverlapPair::single(TicketPolicy::v1_c1());
     let mut live = LiveAdmission::new(COMPARISON_LIVE_CAP).expect("live cap");
     let mut admitted = 0u64;
-    let mut max_link_factor = 1;
     // Phase 1: serial lifetimes on the old domain, short of the rollover edge
     // by the held window.
     for _ in 0..(16_384 - OVERLAP_HELD as u64) {
@@ -359,7 +358,7 @@ fn run_candidate_b() -> CandidateEvidence {
     // genuinely overlap them while the link factor is 2.
     pair.begin_overlap(TicketPolicy::v1_c1())
         .expect("rollover at the old limit");
-    max_link_factor = pair.link_factor();
+    let max_link_factor = pair.link_factor();
     assert_eq!(max_link_factor, 2);
     for index in 0..OVERLAP_HELD {
         let (side, cookie) = pair.allocate();

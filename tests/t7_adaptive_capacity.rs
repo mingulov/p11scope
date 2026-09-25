@@ -139,18 +139,32 @@ fn ticket_cas_and_create_failures_consume_exactly_like_native() {
         Err(TicketError::RetryExhausted)
     );
     // A failed creation consumes its ticket, exactly like native: the ticket
-    // is gone but no live identity exists for it.
+    // is gone but no live identity exists for it, so it resolves to a
+    // distinct consumed-without-identity state, never Active.
     let mut create_fail = FaultScript::new(vec![InjectedFault::CreateFailed]);
     let err = allocator
         .allocate_with_faults(&mut create_fail)
         .unwrap_err();
     assert_eq!(err, TicketError::CreateFailed { consumed_cookie: 2 });
-    assert_eq!(allocator.resolve(2), SlotIdentity::Active);
+    assert_eq!(
+        allocator.resolve(2),
+        SlotIdentity::ConsumedWithoutIdentity
+    );
+    allocator.retire(2);
+    assert_eq!(
+        allocator.resolve(2),
+        SlotIdentity::ConsumedWithoutIdentity,
+        "a consumed-without-identity ticket has no identity to tombstone"
+    );
     assert_eq!(allocator.allocate(), Ok(3));
     let accounting = allocator.accounting();
     assert_eq!(accounting.create_failures, 1);
     assert_eq!(accounting.retries_exhausted, 1);
     assert_eq!(accounting.attempted, accounting.admitted + 2);
+    assert_eq!(
+        accounting.live_unretired, 2,
+        "consumed-without-identity tickets are not live"
+    );
 }
 
 // Box 1: live admission is reserved, admitted, rolled back and released.

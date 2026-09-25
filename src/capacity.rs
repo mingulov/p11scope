@@ -435,6 +435,11 @@ pub struct SlotIdentityAllocator {
 pub enum SlotIdentity {
     Active,
     Retired,
+    /// The ticket was consumed but storage creation failed, so no live
+    /// identity ever existed for it. Distinct from [`SlotIdentity::Active`]:
+    /// callers must not treat it as live, and [`TicketAllocator::retire`]
+    /// leaves it untouched (nothing to tombstone).
+    ConsumedWithoutIdentity,
     Unknown,
 }
 
@@ -702,6 +707,7 @@ pub struct TicketAllocator {
     policy: TicketPolicy,
     next_ticket: u64,
     retired: BTreeSet<u64>,
+    consumed_without_identity: BTreeSet<u64>,
     attempted: u64,
     admitted: u64,
     quota_refusals: u64,
@@ -715,6 +721,7 @@ impl TicketAllocator {
             policy,
             next_ticket: 0,
             retired: BTreeSet::new(),
+            consumed_without_identity: BTreeSet::new(),
             attempted: 0,
             admitted: 0,
             quota_refusals: 0,
@@ -750,6 +757,12 @@ impl TicketAllocator {
             policy,
             next_ticket,
             retired: tombstones,
+            // Restart replay recovers the counter and tombstones only; prior
+            // create-failure identities are not distinguished from Active
+            // after a restart (native keeps that count in COOKIE_CTL, which
+            // the loader seam replays separately). Live accounting proof is
+            // controller cell L-T7-7.
+            consumed_without_identity: BTreeSet::new(),
             attempted: 0,
             admitted: 0,
             quota_refusals: 0,
@@ -811,6 +824,7 @@ impl TicketAllocator {
                         .expect("ticket below the limit always has a successor cookie");
                     self.next_ticket += 1;
                     self.create_failures += 1;
+                    self.consumed_without_identity.insert(cookie);
                     return Err(TicketError::CreateFailed {
                         consumed_cookie: cookie,
                     });
@@ -820,7 +834,10 @@ impl TicketAllocator {
     }
 
     pub fn retire(&mut self, cookie: u64) {
-        if cookie != 0 && cookie <= self.next_ticket {
+        if cookie != 0
+            && cookie <= self.next_ticket
+            && !self.consumed_without_identity.contains(&cookie)
+        {
             self.retired.insert(cookie);
         }
     }
@@ -828,6 +845,8 @@ impl TicketAllocator {
     pub fn resolve(&self, cookie: u64) -> SlotIdentity {
         if cookie == 0 || cookie > self.next_ticket {
             SlotIdentity::Unknown
+        } else if self.consumed_without_identity.contains(&cookie) {
+            SlotIdentity::ConsumedWithoutIdentity
         } else if self.retired.contains(&cookie) {
             SlotIdentity::Retired
         } else {
@@ -842,7 +861,10 @@ impl TicketAllocator {
             quota_refusals: self.quota_refusals,
             create_failures: self.create_failures,
             retries_exhausted: self.retries_exhausted,
-            live_unretired: self.next_ticket - self.retired.len() as u64,
+            live_unretired: self
+                .next_ticket
+                .saturating_sub(self.retired.len() as u64)
+                .saturating_sub(self.consumed_without_identity.len() as u64),
             next_ticket: self.next_ticket,
         }
     }

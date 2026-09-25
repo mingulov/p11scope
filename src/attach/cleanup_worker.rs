@@ -190,19 +190,25 @@ impl CleanupWorker {
         }
     }
 
-    /// True once every submitted link has been attempted (or no worker
-    /// thread is running).
+    /// True once every submitted link has settled (released or
+    /// uncertain), or no worker thread is running. Started-but-unsettled
+    /// closes do not count: the final close may still be running when the
+    /// last attempt lands, and the drive must stay signal-responsive until
+    /// it settles.
     fn is_done(&self) -> bool {
         if self.handle.is_none() {
             return true;
         }
         let state = self.state.lock().unwrap();
-        state.attempted >= state.total
+        state.released.saturating_add(state.uncertain) >= state.total
     }
 
-    pub(crate) fn join(self) -> CleanupReceipt {
+    /// Reaps the worker thread and reports what settled. Borrows so the
+    /// caller snapshots the final progress after settlement: the
+    /// start-error path settles otherwise-unstarted links here.
+    pub(crate) fn join(&mut self) -> CleanupReceipt {
         let _ = self.tx.send(Command::Shutdown);
-        if let Some(handle) = self.handle {
+        if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
         let mut state = self.state.lock().unwrap();
@@ -226,6 +232,8 @@ fn run_cleanup(rx: mpsc::Receiver<Command>, state: Arc<Mutex<WorkerState>>, mut 
         match command {
             Command::Submit(links) => {
                 for (link, producer) in links {
+                    // Started, not settled: completion counts the release
+                    // or failure below, never this increment.
                     state.lock().unwrap().attempted += 1;
                     match closer(link, producer) {
                         Ok(()) => {
@@ -268,7 +276,7 @@ fn write_progress_line(out: &mut dyn Write, progress: &CleanupProgress) {
 /// the progress and "cleanup incomplete" and returns `Interrupted`; the
 /// caller exits and the kernel finishes the remaining closes at exit.
 pub(crate) fn drive_cleanup(
-    worker: CleanupWorker,
+    mut worker: CleanupWorker,
     second_signal: impl Fn() -> bool,
     out: &mut dyn Write,
     poll_interval: Duration,
@@ -281,8 +289,8 @@ pub(crate) fn drive_cleanup(
             return CleanupExit::Interrupted(progress);
         }
         if worker.is_done() {
-            let progress = worker.progress();
             let receipt = worker.join();
+            let progress = worker.progress();
             if receipt.completed {
                 let _ = writeln!(
                     out,
@@ -327,7 +335,7 @@ mod tests {
         let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
         let gate = Mutex::new(Some(gate_rx));
         let now = Arc::new(Mutex::new(Duration::ZERO));
-        let worker = CleanupWorker::pre_start_with(
+        let mut worker = CleanupWorker::pre_start_with(
             Box::new(move |_link, role| {
                 recorder.lock().unwrap().push(role);
                 if recorder.lock().unwrap().len() == 1 {
@@ -377,7 +385,7 @@ mod tests {
 
     #[test]
     fn cleanup_failure_is_reported_not_swallowed() {
-        let worker = CleanupWorker::pre_start_with(
+        let mut worker = CleanupWorker::pre_start_with(
             Box::new(|_link, role| {
                 if role == ProducerProgram::UProbe("p11_return") {
                     Err("close p11_return: bad fd".to_string())
@@ -451,5 +459,124 @@ mod tests {
             text.contains("links released"),
             "stderr must show the progress, got: {text}"
         );
+    }
+
+    /// M1: completion counts settled closes, not started ones. The last
+    /// close is gated open: once started it is attempted-but-unsettled,
+    /// and the worker must not report done until the close finishes.
+    #[test]
+    fn cleanup_completion_counts_settled_closes_not_started_ones() {
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let mut worker = CleanupWorker::pre_start_with(
+            Box::new(move |_link, role| {
+                if role == ProducerProgram::UProbe("p11_return") {
+                    let _ = gate_rx.recv();
+                }
+                Ok(())
+            }),
+            scripted_clock(Arc::new(Mutex::new(Duration::ZERO))),
+        );
+        worker.submit(
+            vec![
+                multi(ProducerProgram::UProbe("p11_entry")),
+                multi(ProducerProgram::UProbe("p11_return")),
+            ],
+            DetachOrder,
+        );
+        for _ in 0..1000 {
+            if worker.progress().attempted == 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let progress = worker.progress();
+        assert_eq!(progress.attempted, 2);
+        assert!(
+            !worker.is_done(),
+            "a started-but-unsettled last close is not done: {progress:?}"
+        );
+        gate_tx.send(()).unwrap();
+        let receipt = worker.join();
+        assert!(receipt.completed);
+    }
+
+    /// M1: a completed cleanup prints N/N. The last close sleeps past the
+    /// drive's poll, so a snapshot taken before settlement would catch it
+    /// in flight and print N-1/N.
+    #[test]
+    fn completed_cleanup_prints_n_over_n() {
+        let worker = CleanupWorker::pre_start_with(
+            Box::new(|_link, role| {
+                if role == ProducerProgram::UProbe("p11_return") {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                Ok(())
+            }),
+            scripted_clock(Arc::new(Mutex::new(Duration::ZERO))),
+        );
+        worker.submit(
+            vec![
+                multi(ProducerProgram::UProbe("p11_entry")),
+                multi(ProducerProgram::UProbe("p11_return")),
+            ],
+            DetachOrder,
+        );
+        let mut out = Vec::new();
+        let exit = drive_cleanup(worker, || false, &mut out, Duration::from_millis(1));
+        assert!(matches!(exit, CleanupExit::Completed(_)));
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("cleanup completed, 2/2 links released"),
+            "completed cleanup must print N/N, got: {text}"
+        );
+    }
+
+    /// M1: a second signal during the final close interrupts instead of
+    /// joining blindly on it. The last close is gated (with a 5 s
+    /// backstop so the old join-blind shape fails as Completed rather
+    /// than hanging the suite); the signal arms once the drive had time
+    /// to reach the final close.
+    #[test]
+    fn second_signal_during_final_close_reports_incomplete() {
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let worker = CleanupWorker::pre_start_with(
+            Box::new(move |_link, role| {
+                if role == ProducerProgram::UProbe("p11_return") {
+                    let _ = gate_rx.recv_timeout(Duration::from_secs(5));
+                }
+                Ok(())
+            }),
+            scripted_clock(Arc::new(Mutex::new(Duration::ZERO))),
+        );
+        worker.submit(
+            vec![
+                multi(ProducerProgram::UProbe("p11_entry")),
+                multi(ProducerProgram::UProbe("p11_return")),
+            ],
+            DetachOrder,
+        );
+        let start = std::time::Instant::now();
+        let mut out = Vec::new();
+        let exit = drive_cleanup(
+            worker,
+            move || start.elapsed() >= Duration::from_millis(100),
+            &mut out,
+            Duration::from_millis(1),
+        );
+        let _ = gate_tx.send(());
+        match exit {
+            CleanupExit::Interrupted(progress) => {
+                assert_eq!(progress.attempted, 2, "{progress:?}");
+                assert!(
+                    progress.released + progress.uncertain < progress.total,
+                    "the final close must still be unsettled: {progress:?}"
+                );
+            }
+            CleanupExit::Completed(_) => {
+                panic!("a second signal during the final close must interrupt, not join through it")
+            }
+        }
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("cleanup incomplete"), "got: {text}");
     }
 }

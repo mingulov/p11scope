@@ -6,13 +6,12 @@
 //! implementation lands (same RED discipline as `capacity_contract.rs`).
 
 use p11scope::capacity::{
-    AdmissionError, AllocState, Allocation, BudgetError, CounterCell, DiskBudget, DurableAck,
-    DomainSide, DurableSink, EvidenceRotation, ExportError, ExportKind, ExportRecord,
-    ExportSession,
-    FaultScript, FinalSnapshot, HistoryBudget, InjectedFault, InnerMapKind, LiveAdmission,
-    OverlapError, OverlapPair, RamBudget, SegmentDirectory, SegmentError, SegmentSpec, SinkError,
-    SlotIdentity, StagedExport, StorageToken, StoreError, TICKET_CAS_TRIES, TicketAllocator,
-    TicketError, TicketPolicy, WriterSet, export_checksum,
+    AdmissionError, AllocState, Allocation, BudgetError, CounterCell, DiskBudget, DomainSide,
+    DurableAck, DurableSink, EvidenceRotation, ExportError, ExportKind, ExportRecord,
+    ExportSession, FaultScript, FinalSnapshot, HistoryBudget, InjectedFault, InnerMapKind,
+    LiveAdmission, OverlapError, OverlapPair, RamBudget, SegmentDirectory, SegmentError,
+    SegmentSpec, SinkError, SlotIdentity, StagedExport, StorageToken, StoreError, TICKET_CAS_TRIES,
+    TicketAllocator, TicketError, TicketPolicy, WriterSet, export_checksum,
 };
 use p11scope_ebpf_common::IMAGE_IDENTITY_TICKET_LIMIT;
 
@@ -147,10 +146,7 @@ fn ticket_cas_and_create_failures_consume_exactly_like_native() {
         .allocate_with_faults(&mut create_fail)
         .unwrap_err();
     assert_eq!(err, TicketError::CreateFailed { consumed_cookie: 2 });
-    assert_eq!(
-        allocator.resolve(2),
-        SlotIdentity::ConsumedWithoutIdentity
-    );
+    assert_eq!(allocator.resolve(2), SlotIdentity::ConsumedWithoutIdentity);
     allocator.retire(2);
     assert_eq!(
         allocator.resolve(2),
@@ -1123,10 +1119,7 @@ fn boundary_cell_preflight_refuses_out_of_envelope_with_fd_verdict() {
     // Refuses: the same cell under a tight limit names FDs and the limit.
     let err = t7_boundary_preflight(8192, 4096, 64).unwrap_err();
     for token in ["8192", "FD", "RLIMIT_NOFILE", "4096"] {
-        assert!(
-            err.contains(token),
-            "refusal names the envelope: {err}"
-        );
+        assert!(err.contains(token), "refusal names the envelope: {err}");
     }
     // Failure classification: FD-exhaustion signatures route to the refusal
     // verdict; genuine coverage bugs still fail the cell.

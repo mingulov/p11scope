@@ -2322,6 +2322,35 @@ fn finish_capture_loop(
     Ok(end)
 }
 
+/// Settles a quiesce-block failure the way a capture-loop failure
+/// settles: the owned child still gets pause cleanup and policy
+/// settlement (with the loop's real end, so a `--duration` handoff
+/// survives a quiesce failure), producers still detach, and every error
+/// — quiesce, loop, settlement, detach — is retained. Settlement and
+/// detach run through context callbacks (like `finish_capture_with`) so
+/// ordinary tests drive the real combiner without an attach session.
+fn finish_quiesce_error<C>(
+    error: anyhow::Error,
+    loop_result: Result<CaptureEnd>,
+    context: &mut C,
+    settle: impl FnOnce(&mut C, CaptureEnd) -> Result<()>,
+    detach: impl FnOnce(&mut C) -> Result<()>,
+) -> anyhow::Error {
+    match loop_result {
+        Ok(end) => {
+            let finish = settle(context, end);
+            let detach = detach(context);
+            combine_capture_failure(error, finish, detach)
+        }
+        Err(loop_error) => {
+            let combined = also_failed(loop_error, error, "terminal quiescence");
+            let finish = settle(context, CaptureEnd::Error);
+            let detach = detach(context);
+            combine_capture_failure(combined, finish, detach)
+        }
+    }
+}
+
 /// A marker probe is not wired in this slice, so the coordinator is told the
 /// protected marker was never reached. ponytail: fixed `false` until the Gate B
 /// protected-marker probe lands; swap for the real read then.
@@ -3925,70 +3954,96 @@ fn capture_profile(
     }
     // Poll for quiescence (owner budget), servicing the drains between
     // polls without admitting producers. Discovery records stage here and
-    // apply after the poll; EVENTS reduce in place.
-    let mut service_error: Option<anyhow::Error> = None;
-    let mut staged_records = Vec::new();
-    let mut staged_malformed = 0u64;
-    let stop_state = session.quiesce_terminal(
-        STOP_QUIESCE_BUDGET,
-        if profile {
-            Some(|events_drain: &mut crate::events::OwnedDrain| {
-                if service_error.is_some() {
-                    return;
-                }
-                let phase_start = Instant::now();
-                match drain_profile_events(
-                    events_drain,
-                    &mut state,
-                    &mut process_tracker,
-                    scope,
-                    Some(crate::events::LIVE_POLL_QUANTUM),
-                ) {
-                    Ok((malformed, _)) => {
-                        malformed_records += malformed;
+    // apply after the poll; EVENTS reduce in place. Every failure below
+    // settles like a capture-loop failure (owned settlement with the
+    // loop's real end, then detach): a bare `?` here would skip both and
+    // SIGKILL a child `--duration` should hand back alive.
+    let quiesced = match (|| -> Result<Option<TerminalQuiescence>> {
+        let mut service_error: Option<anyhow::Error> = None;
+        let mut staged_records = Vec::new();
+        let mut staged_malformed = 0u64;
+        let stop_state = session.quiesce_terminal(
+            STOP_QUIESCE_BUDGET,
+            if profile {
+                Some(|events_drain: &mut crate::events::OwnedDrain| {
+                    if service_error.is_some() {
+                        return;
                     }
-                    Err(error) => service_error = Some(error),
-                }
-                scheduling.add_phase(SchedulingPhase::Drain, phase_start.elapsed());
-            })
-        } else {
-            None
-        },
-        |discovery_drain: &mut crate::events::OwnedDiscoveryDrain| {
-            for _ in 0..crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM {
-                match discovery_drain.dequeue() {
-                    Some(crate::events::DiscoveryItem::Record(record)) => {
-                        staged_records.push(record);
+                    let phase_start = Instant::now();
+                    match drain_profile_events(
+                        events_drain,
+                        &mut state,
+                        &mut process_tracker,
+                        scope,
+                        Some(crate::events::LIVE_POLL_QUANTUM),
+                    ) {
+                        Ok((malformed, _)) => {
+                            malformed_records += malformed;
+                        }
+                        Err(error) => service_error = Some(error),
                     }
-                    Some(crate::events::DiscoveryItem::Malformed) => {
-                        staged_malformed = staged_malformed.saturating_add(1);
-                    }
-                    None => break,
-                }
-            }
-        },
-        Instant::now,
-    )?;
-    if let Some(error) = service_error {
-        return Err(error);
-    }
-    let quiesced = match stop_state {
-        StopState::Quiesced { .. } => Some(TerminalQuiescence {
-            events_q: if profile {
-                session.event_drain_positions()?.producer
+                    scheduling.add_phase(SchedulingPhase::Drain, phase_start.elapsed());
+                })
             } else {
-                0
+                None
             },
-            discovery_q: session.discovery_positions()?.producer,
-        }),
-        StopState::QuiescenceUnproven { .. } | StopState::Running | StopState::StopRequested => {
-            None
+            |discovery_drain: &mut crate::events::OwnedDiscoveryDrain| {
+                for _ in 0..crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM {
+                    match discovery_drain.dequeue() {
+                        Some(crate::events::DiscoveryItem::Record(record)) => {
+                            staged_records.push(record);
+                        }
+                        Some(crate::events::DiscoveryItem::Malformed) => {
+                            staged_malformed = staged_malformed.saturating_add(1);
+                        }
+                        None => break,
+                    }
+                }
+            },
+            Instant::now,
+        )?;
+        if let Some(error) = service_error {
+            return Err(error);
+        }
+        let quiesced = match stop_state {
+            StopState::Quiesced { .. } => Some(TerminalQuiescence {
+                events_q: if profile {
+                    session.event_drain_positions()?.producer
+                } else {
+                    0
+                },
+                discovery_q: session.discovery_positions()?.producer,
+            }),
+            StopState::QuiescenceUnproven { .. }
+            | StopState::Running
+            | StopState::StopRequested => None,
+        };
+        if engine.apply_quiesced_discovery(session, staged_records, staged_malformed)? {
+            let plan = engine.plan();
+            state.sync_plan(plan);
+        }
+        Ok(quiesced)
+    })() {
+        Ok(quiesced) => quiesced,
+        Err(error) => {
+            let mut settle_context = (&mut *engine, &mut *session, &mut owned);
+            return Err(finish_quiesce_error(
+                error,
+                loop_result,
+                &mut settle_context,
+                |context, end| match context.2.as_deref_mut() {
+                    Some(owned) => owned.finish(context.0, context.1, end, interrupted),
+                    None => Ok(()),
+                },
+                |context| {
+                    context.1.detach_producers_driven(
+                        || interrupted.sigint_deliveries() >= 2,
+                        &mut std::io::stderr(),
+                    )
+                },
+            ));
         }
     };
-    if engine.apply_quiesced_discovery(session, staged_records, staged_malformed)? {
-        let plan = engine.plan();
-        state.sync_plan(plan);
-    }
     let mut finish_context = (&mut *engine, &mut *session, &mut owned);
     finish_capture_with(
         &mut finish_context,
@@ -4466,70 +4521,96 @@ fn capture_trace(
     );
     // Poll for quiescence (owner budget), servicing the drains between
     // polls without admitting producers. Discovery records stage here and
-    // apply after the poll; EVENTS reduce in place.
-    let mut service_error: Option<anyhow::Error> = None;
-    let mut staged_records = Vec::new();
-    let mut staged_malformed = 0u64;
-    let stop_state = session.quiesce_terminal(
-        STOP_QUIESCE_BUDGET,
-        Some(|events_drain: &mut crate::events::OwnedDrain| {
-            if service_error.is_some() {
-                return;
-            }
-            stdout.begin_tick(crate::sink::SINK_TICK_BUDGET);
-            let phase_start = Instant::now();
-            match drain_trace_events_from(
-                events_drain,
-                &mut remaining,
-                &mut state,
-                &mut process_tracker,
-                scope,
-                &mut tracer,
-                stdout,
-                &mut stdout_open,
-                out_file,
-                Some(crate::events::LIVE_POLL_QUANTUM),
-            ) {
-                Ok((malformed, _)) => {
-                    malformed_records += malformed;
+    // apply after the poll; EVENTS reduce in place. Every failure below
+    // settles like a capture-loop failure (owned settlement with the
+    // loop's real end, then detach): a bare `?` here would skip both and
+    // SIGKILL a child `--duration` should hand back alive.
+    let quiesced = match (|| -> Result<Option<TerminalQuiescence>> {
+        let mut service_error: Option<anyhow::Error> = None;
+        let mut staged_records = Vec::new();
+        let mut staged_malformed = 0u64;
+        let stop_state = session.quiesce_terminal(
+            STOP_QUIESCE_BUDGET,
+            Some(|events_drain: &mut crate::events::OwnedDrain| {
+                if service_error.is_some() {
+                    return;
                 }
-                Err(error) => service_error = Some(error),
-            }
-            scheduling.add_phase(SchedulingPhase::Drain, phase_start.elapsed());
-            collect_sink_drops(stdout, &mut scheduling, &mut None, Instant::now());
-        }),
-        |discovery_drain: &mut crate::events::OwnedDiscoveryDrain| {
-            for _ in 0..crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM {
-                match discovery_drain.dequeue() {
-                    Some(crate::events::DiscoveryItem::Record(record)) => {
-                        staged_records.push(record);
+                stdout.begin_tick(crate::sink::SINK_TICK_BUDGET);
+                let phase_start = Instant::now();
+                match drain_trace_events_from(
+                    events_drain,
+                    &mut remaining,
+                    &mut state,
+                    &mut process_tracker,
+                    scope,
+                    &mut tracer,
+                    stdout,
+                    &mut stdout_open,
+                    out_file,
+                    Some(crate::events::LIVE_POLL_QUANTUM),
+                ) {
+                    Ok((malformed, _)) => {
+                        malformed_records += malformed;
                     }
-                    Some(crate::events::DiscoveryItem::Malformed) => {
-                        staged_malformed = staged_malformed.saturating_add(1);
-                    }
-                    None => break,
+                    Err(error) => service_error = Some(error),
                 }
-            }
-        },
-        Instant::now,
-    )?;
-    if let Some(error) = service_error {
-        return Err(error);
-    }
-    let quiesced = match stop_state {
-        StopState::Quiesced { .. } => Some(TerminalQuiescence {
-            events_q: session.event_drain_positions()?.producer,
-            discovery_q: session.discovery_positions()?.producer,
-        }),
-        StopState::QuiescenceUnproven { .. } | StopState::Running | StopState::StopRequested => {
-            None
+                scheduling.add_phase(SchedulingPhase::Drain, phase_start.elapsed());
+                collect_sink_drops(stdout, &mut scheduling, &mut None, Instant::now());
+            }),
+            |discovery_drain: &mut crate::events::OwnedDiscoveryDrain| {
+                for _ in 0..crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM {
+                    match discovery_drain.dequeue() {
+                        Some(crate::events::DiscoveryItem::Record(record)) => {
+                            staged_records.push(record);
+                        }
+                        Some(crate::events::DiscoveryItem::Malformed) => {
+                            staged_malformed = staged_malformed.saturating_add(1);
+                        }
+                        None => break,
+                    }
+                }
+            },
+            Instant::now,
+        )?;
+        if let Some(error) = service_error {
+            return Err(error);
+        }
+        let quiesced = match stop_state {
+            StopState::Quiesced { .. } => Some(TerminalQuiescence {
+                events_q: session.event_drain_positions()?.producer,
+                discovery_q: session.discovery_positions()?.producer,
+            }),
+            StopState::QuiescenceUnproven { .. }
+            | StopState::Running
+            | StopState::StopRequested => None,
+        };
+        if engine.apply_quiesced_discovery(session, staged_records, staged_malformed)? {
+            let plan = engine.plan();
+            state.sync_plan(plan);
+            tracer.sync_plan(plan);
+        }
+        Ok(quiesced)
+    })() {
+        Ok(quiesced) => quiesced,
+        Err(error) => {
+            let mut settle_context = (&mut *engine, &mut *session, &mut owned);
+            return Err(finish_quiesce_error(
+                error,
+                loop_result,
+                &mut settle_context,
+                |context, end| match context.2.as_deref_mut() {
+                    Some(owned) => owned.finish(context.0, context.1, end, interrupted),
+                    None => Ok(()),
+                },
+                |context| {
+                    context.1.detach_producers_driven(
+                        || interrupted.sigint_deliveries() >= 2,
+                        &mut std::io::stderr(),
+                    )
+                },
+            ));
         }
     };
-    if engine.apply_quiesced_discovery(session, staged_records, staged_malformed)? {
-        let plan = engine.plan();
-        state.sync_plan(plan);
-        tracer.sync_plan(plan);
-    }
     let mut finish_context = (&mut *engine, &mut *session, &mut owned);
     finish_capture_with(
         &mut finish_context,
@@ -7160,6 +7241,73 @@ mod tests {
             if let Some(pending) = pending {
                 assert!(pending.still_running());
                 assert_eq!(pending.pid(), pid);
+            }
+        }
+    }
+
+    /// I1: a quiesce failure after `--duration` without
+    /// `--kill-on-timeout` settles with the loop's real end, so the live
+    /// child is handed back (not reaped by an `Error` settlement, and not
+    /// SIGKILLed by a skipped settlement's `Drop`). A failed loop still
+    /// reaps. The real `settle_owned_child` runs behind the combiner with
+    /// a real sleeper child.
+    #[test]
+    fn quiesce_error_after_duration_expiry_hands_back_the_living_child() {
+        for loop_failed in [false, true] {
+            let mut child = spawn("/bin/sleep", &["10"]);
+            let pid = child.pid();
+            child.release().unwrap();
+            let signals = SignalState::new();
+            let mut retained = Some(child);
+            let mut pending = None;
+            let mut exit_code = None;
+            let mut still_running = false;
+            let mut detached = false;
+            let loop_result: Result<CaptureEnd> = if loop_failed {
+                Err(anyhow::anyhow!("loop failure"))
+            } else {
+                Ok(CaptureEnd::DurationExpired)
+            };
+            let error = finish_quiesce_error(
+                anyhow::anyhow!("quiesce failure"),
+                loop_result,
+                &mut (),
+                |_, end| {
+                    settle_owned_child(
+                        &mut retained,
+                        end,
+                        true,
+                        false,
+                        &signals,
+                        &mut pending,
+                        &mut exit_code,
+                        &mut still_running,
+                    )
+                },
+                |_| {
+                    detached = true;
+                    Ok(())
+                },
+            );
+            assert!(detached, "loop_failed={loop_failed}");
+            let message = format!("{error:#}");
+            if loop_failed {
+                assert!(
+                    message.contains("loop failure") && message.contains("quiesce failure"),
+                    "either error dropped: {message}"
+                );
+                assert_eq!(exit_code, Some(128 + libc::SIGTERM));
+                assert!(!still_running);
+                assert!(pending.is_none());
+            } else {
+                assert_eq!(message, "quiesce failure");
+                assert_eq!(exit_code, None);
+                assert!(still_running);
+                let pending = pending.expect("the live child must be handed back");
+                assert_eq!(pending.pid(), pid);
+                assert!(pending.still_running());
+                // Dropping the pending handoff SIGKILLs the sleeper, as in
+                // the disposition test above.
             }
         }
     }
@@ -10645,6 +10793,11 @@ mod tests {
                 body.matches("finish_capture_with(").count(),
                 1,
                 "{function}"
+            );
+            assert_eq!(
+                body.matches("finish_quiesce_error(").count(),
+                1,
+                "{function} must route quiesce-block failures through owned settlement"
             );
             assert_eq!(
                 body.matches("drain_capture_terminal_with(").count(),

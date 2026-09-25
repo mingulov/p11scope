@@ -208,6 +208,121 @@ fn finish_capture_preserves_settlement_detach_and_terminal_attempt_boundaries() 
     }
 }
 
+/// I1: a quiesce-block failure settles like a capture-loop failure.
+/// Settlement (pause cleanup plus policy settlement in production) runs
+/// with the loop's real end, then detach runs, and every error — quiesce,
+/// settlement, detach — is retained in the returned error.
+#[test]
+fn quiesce_error_runs_settlement_with_the_loop_end_then_detaches() {
+    #[derive(Clone, Copy)]
+    enum Case {
+        Clean,
+        SettleError,
+        DetachError,
+        BothError,
+    }
+
+    for case in [
+        Case::Clean,
+        Case::SettleError,
+        Case::DetachError,
+        Case::BothError,
+    ] {
+        let mut phases = Vec::new();
+        let mut settled_end = None;
+        let error = finish_quiesce_error(
+            anyhow::anyhow!("quiesce failure"),
+            Ok(CaptureEnd::DurationExpired),
+            &mut phases,
+            |phases, end| {
+                phases.push("settle");
+                settled_end = Some(end);
+                if matches!(case, Case::SettleError | Case::BothError) {
+                    anyhow::bail!("settle failure");
+                }
+                Ok(())
+            },
+            |phases| {
+                phases.push("detach");
+                if matches!(case, Case::DetachError | Case::BothError) {
+                    anyhow::bail!("detach failure");
+                }
+                Ok(())
+            },
+        );
+        // Settlement runs (not skipped) with the loop's real end, before
+        // detach — the `--duration` handoff end survives a quiesce failure.
+        assert_eq!(settled_end, Some(CaptureEnd::DurationExpired));
+        assert_eq!(phases, ["settle", "detach"]);
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("quiesce failure"),
+            "quiesce error dropped: {message}"
+        );
+        match case {
+            Case::Clean => assert_eq!(message, "quiesce failure"),
+            Case::SettleError => {
+                assert!(
+                    message.contains("settle failure")
+                        && message.contains("owned cleanup/settlement"),
+                    "settlement error lost or mislabeled: {message}"
+                );
+            }
+            Case::DetachError => {
+                assert!(
+                    message.contains("detach failure")
+                        && message.contains("detaching capture producers"),
+                    "detach error lost or mislabeled: {message}"
+                );
+            }
+            Case::BothError => {
+                assert!(
+                    message.contains("settle failure") && message.contains("detach failure"),
+                    "cleanup errors lost: {message}"
+                );
+            }
+        }
+    }
+}
+
+/// I1: a loop failure plus a quiesce failure keeps both errors (the loop
+/// error is the capture failure, the quiesce error attaches to it), and
+/// settlement runs with `Error` — a failed loop never hands a child back.
+#[test]
+fn quiesce_error_after_loop_failure_keeps_both_errors_and_settles_as_error() {
+    let mut phases = Vec::new();
+    let mut settled_end = None;
+    let error = finish_quiesce_error(
+        anyhow::anyhow!("quiesce failure"),
+        Err(anyhow::anyhow!("loop failure")),
+        &mut phases,
+        |phases, end| {
+            phases.push("settle");
+            settled_end = Some(end);
+            Ok(())
+        },
+        |phases| {
+            phases.push("detach");
+            Ok(())
+        },
+    );
+    assert_eq!(settled_end, Some(CaptureEnd::Error));
+    assert_eq!(phases, ["settle", "detach"]);
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("loop failure"),
+        "loop error dropped: {message}"
+    );
+    assert!(
+        message.contains("quiesce failure"),
+        "quiesce error dropped: {message}"
+    );
+    assert!(
+        message.contains("terminal quiescence"),
+        "quiesce phase unlabeled: {message}"
+    );
+}
+
 #[test]
 fn terminal_completed_root_reduces_and_retires_before_ordinary_drain_in_both_modes() {
     for trace_mode in [false, true] {

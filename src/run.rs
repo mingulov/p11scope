@@ -3611,6 +3611,22 @@ fn report_post_q_record(ring: &str) {
     eprintln!("p11scope: terminal {ring} drain: {POST_Q_RECORD_REASON}");
 }
 
+/// The operator-visible line for unproven quiescence: the stop waited
+/// out its owner budget with calls still in flight (a leaked admission
+/// stalls here for the full budget with no other symptom).
+fn quiescence_unproven_line(waited: Duration, in_flight: u64) -> String {
+    format!(
+        "p11scope: terminal quiescence: QuiescenceUnproven after {waited:?}, {in_flight} calls still in flight"
+    )
+}
+
+/// Reports an unproven quiescence on the operator-visible path. No
+/// report-schema change: a `stop_quiescence` report field belongs to a
+/// later task.
+fn report_quiescence_unproven(waited: Duration, in_flight: u64) {
+    eprintln!("{}", quiescence_unproven_line(waited, in_flight));
+}
+
 fn finish_capture_with<C, T>(
     context: &mut C,
     loop_result: Result<CaptureEnd>,
@@ -4014,9 +4030,11 @@ fn capture_profile(
                 },
                 discovery_q: session.discovery_positions()?.producer,
             }),
-            StopState::QuiescenceUnproven { .. }
-            | StopState::Running
-            | StopState::StopRequested => None,
+            StopState::QuiescenceUnproven { waited } => {
+                report_quiescence_unproven(waited, session.stop_gate().in_flight());
+                None
+            }
+            StopState::Running | StopState::StopRequested => None,
         };
         if engine.apply_quiesced_discovery(session, staged_records, staged_malformed)? {
             let plan = engine.plan();
@@ -4584,9 +4602,11 @@ fn capture_trace(
                 events_q: session.event_drain_positions()?.producer,
                 discovery_q: session.discovery_positions()?.producer,
             }),
-            StopState::QuiescenceUnproven { .. }
-            | StopState::Running
-            | StopState::StopRequested => None,
+            StopState::QuiescenceUnproven { waited } => {
+                report_quiescence_unproven(waited, session.stop_gate().in_flight());
+                None
+            }
+            StopState::Running | StopState::StopRequested => None,
         };
         if engine.apply_quiesced_discovery(session, staged_records, staged_malformed)? {
             let plan = engine.plan();
@@ -10897,6 +10917,55 @@ mod tests {
             assert!(after_none.contains("context.0.drain_discovery_terminal(context.1)?"));
             assert!(!after_none.contains("to_position"));
             assert!(discovery.contains("report_post_q_record(\"DISCOVERY\")"));
+        }
+    }
+
+    /// I4: the operator-visible line for unproven quiescence names the
+    /// state with the budget it waited out and the calls still in flight,
+    /// so a leaked admission is a named line, not an unexplained 5 s stall.
+    #[test]
+    fn quiescence_unproven_line_names_waited_and_in_flight() {
+        let line = quiescence_unproven_line(Duration::from_secs(5), 3);
+        assert!(
+            line.contains("QuiescenceUnproven"),
+            "the state must be named: {line}"
+        );
+        assert!(line.contains("5s"), "the waited budget: {line}");
+        assert!(line.contains('3'), "the in-flight calls: {line}");
+        assert!(
+            line.starts_with("p11scope: "),
+            "stop-path convention: {line}"
+        );
+    }
+
+    /// I4: both quiesce blocks report `QuiescenceUnproven` with the
+    /// waited budget and the live in-flight count instead of discarding
+    /// them. The loops only run live, so the wiring is pinned statically
+    /// like the shared finish helpers above.
+    #[test]
+    fn quiesce_blocks_report_unproven_quiescence() {
+        let source = include_str!("run.rs");
+        let profile = source
+            .split_once("fn capture_profile(")
+            .unwrap()
+            .1
+            .split_once("fn capture_trace(")
+            .unwrap()
+            .0;
+        let trace = source
+            .split_once("fn capture_trace(")
+            .unwrap()
+            .1
+            .split_once("fn terminal_trace_count_line")
+            .unwrap()
+            .0;
+        for (function, body) in [("capture_profile", profile), ("capture_trace", trace)] {
+            assert_eq!(
+                body.matches("report_quiescence_unproven(waited, session.stop_gate().in_flight())")
+                    .count(),
+                1,
+                "{function} must report QuiescenceUnproven with waited and in_flight"
+            );
         }
     }
 

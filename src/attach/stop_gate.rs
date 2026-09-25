@@ -91,8 +91,6 @@ impl StopGate {
     }
 
     /// Bodies currently inside a guarded region.
-    // A later stop-gate task drives userspace stop.
-    #[allow(dead_code)]
     pub(crate) fn in_flight(&self) -> u64 {
         self.word().load(Ordering::SeqCst) & STOP_GATE_COUNT_MASK
     }

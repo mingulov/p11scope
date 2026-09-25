@@ -45,6 +45,10 @@ mod inventory;
 pub(crate) use inventory::PreparedInventory;
 mod stop_gate;
 pub(crate) use stop_gate::{StopGate, stop_gate_map_data, validate_stop_gate};
+mod cleanup_worker;
+pub(crate) use cleanup_worker::{
+    CleanupExit, CleanupWorker, DetachOrder, OwnedLink, drive_cleanup,
+};
 
 #[cfg(test)]
 mod lifecycle_tests;
@@ -1003,6 +1007,11 @@ pub struct Session {
     /// slot's last link detaches (see [`RetainedStaticTarget`]).
     retained_static: BTreeMap<u32, RetainedStaticTarget>,
     links: Vec<RegisteredLink>,
+    /// Background link cleanup, pre-started during preparation so the
+    /// worker thread exists before any submit. `None` once a detach has
+    /// driven it to completion; a fresh worker is created if links ever
+    /// need closing afterwards.
+    cleanup_worker: Option<CleanupWorker>,
 }
 
 /// A detach error leaves this Session's ownership bookkeeping inconsistent.
@@ -1060,7 +1069,7 @@ fn attach_lifecycle_with<S, T>(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProducerProgram {
+pub(crate) enum ProducerProgram {
     UProbe(&'static str),
     RawTracePoint(&'static str),
     BtfTracePoint(&'static str),
@@ -2807,6 +2816,7 @@ impl Session {
             process_creation_tracking_unavailable: None,
             retained_static: BTreeMap::new(),
             links,
+            cleanup_worker: Some(CleanupWorker::pre_start()),
         })
     }
 
@@ -3405,14 +3415,72 @@ impl Session {
     /// removed last. Kernel detach does not wait for callbacks already running
     /// on another CPU; callers must not claim that the terminal drain is final.
     pub fn detach_producers(&mut self) -> Result<()> {
+        self.detach_producers_driven(|| false, &mut std::io::stderr())
+    }
+
+    /// Move every producer link out of Aya into the background cleanup
+    /// worker, print progress to `out` about once a second until it joins,
+    /// then report. `second_signal` interrupts the wait: the progress and
+    /// "cleanup incomplete" are printed and the process exits — the kernel
+    /// finishes the remaining closes at exit.
+    pub(crate) fn detach_producers_driven(
+        &mut self,
+        second_signal: impl Fn() -> bool,
+        out: &mut dyn std::io::Write,
+    ) -> Result<()> {
         let start = std::time::Instant::now();
-        let detached = self.detach_links(|_| true);
+        let had_links = !self.links.is_empty();
+        let mut first_error = None;
+        if had_links {
+            let mut owned = Vec::new();
+            for link in std::mem::take(&mut self.links) {
+                let producer = link.producer();
+                match take_owned_links(&mut self.ebpf, link) {
+                    Ok(links) => owned.extend(links.into_iter().map(|link| (link, producer))),
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        self.detach_failures.push(message.clone());
+                        if first_error.is_none() {
+                            first_error = Some(anyhow!(message));
+                        }
+                    }
+                }
+            }
+            let worker = self.take_cleanup_worker();
+            worker.submit(owned, DetachOrder);
+            match drive_cleanup(
+                worker,
+                second_signal,
+                out,
+                std::time::Duration::from_secs(1),
+            ) {
+                CleanupExit::Completed(receipt) => {
+                    for failure in receipt.failures {
+                        if first_error.is_none() {
+                            first_error = Some(anyhow!(failure.clone()));
+                        }
+                        self.detach_failures.push(failure);
+                    }
+                }
+                CleanupExit::Interrupted(_) => {
+                    std::process::exit(128 + libc::SIGINT);
+                }
+            }
+        } else {
+            let _ = (second_signal, out);
+        }
         self.detach_wall_ms = detach_wall_ms_since(start);
         finish_producer_detach(
             &mut self.producers_detached,
             &self.detach_failures,
-            detached,
+            first_error.map_or(Ok(()), Err),
         )
+    }
+
+    fn take_cleanup_worker(&mut self) -> CleanupWorker {
+        self.cleanup_worker
+            .take()
+            .unwrap_or_else(CleanupWorker::pre_start)
     }
 
     /// Wall time the producer detach took, in whole milliseconds; zero
@@ -3757,6 +3825,72 @@ impl Session {
     }
 }
 
+/// Move one registered link out of Aya into worker-owned values, without
+/// closing anything: singles become `FdLink`s via `take_link` plus
+/// `into_fd_links()` (Inventory precedent `activation.rs:433-466`), multis
+/// move their fds. A single uprobe id can expand to several `FdLink`s.
+/// A link that is not fd-backed detaches synchronously on drop instead —
+/// transfer runs after publication, never before a held child's resume —
+/// and still counts as closed.
+fn take_owned_links(ebpf: &mut Ebpf, link: RegisteredLink) -> Result<Vec<OwnedLink>> {
+    match link {
+        RegisteredLink::MultiUProbe { fds, .. } => Ok(vec![OwnedLink::Multi(fds)]),
+        RegisteredLink::UProbe { program, id, .. }
+        | RegisteredLink::DiagnosticUProbe { program, id } => (|| {
+            let probe: &mut UProbe = ebpf
+                .program_mut(program)
+                .with_context(|| format!("program {program} missing during detach"))?
+                .try_into()?;
+            let taken = probe
+                .take_link(id)
+                .with_context(|| format!("detaching {program}"))?;
+            match taken.into_fd_links() {
+                Ok(links) => Ok(links.into_iter().map(OwnedLink::Fd).collect()),
+                Err(link) => {
+                    drop(link);
+                    Ok(Vec::new())
+                }
+            }
+        })(),
+        RegisteredLink::RawTracePoint { program, id } => (|| {
+            let tracepoint: &mut RawTracePoint = ebpf
+                .program_mut(program)
+                .with_context(|| format!("program {program} missing during detach"))?
+                .try_into()?;
+            let taken = tracepoint
+                .take_link(id)
+                .with_context(|| format!("detaching {program}"))?;
+            Ok(vec![OwnedLink::Fd(taken.into())])
+        })(),
+        RegisteredLink::BtfTracePoint { program, id } => (|| {
+            let tracepoint: &mut BtfTracePoint = ebpf
+                .program_mut(program)
+                .with_context(|| format!("program {program} missing during detach"))?
+                .try_into()?;
+            let taken = tracepoint
+                .take_link(id)
+                .with_context(|| format!("detaching {program}"))?;
+            Ok(vec![OwnedLink::Fd(taken.into())])
+        })(),
+        RegisteredLink::DynamicUProbe { program, id, .. } => (|| {
+            let probe: &mut UProbe = ebpf
+                .program_mut(program)
+                .with_context(|| format!("program {program} missing during detach"))?
+                .try_into()?;
+            let taken = probe
+                .take_link(id)
+                .with_context(|| format!("detaching {program}"))?;
+            match taken.into_fd_links() {
+                Ok(links) => Ok(links.into_iter().map(OwnedLink::Fd).collect()),
+                Err(link) => {
+                    drop(link);
+                    Ok(Vec::new())
+                }
+            }
+        })(),
+    }
+}
+
 fn detach_registered_link(ebpf: &mut Ebpf, link: RegisteredLink) -> Result<()> {
     match link {
         // Detach is drop: closing the last link fd detaches the kernel
@@ -3827,7 +3961,22 @@ fn finish_producer_detach(
 
 impl Drop for Session {
     fn drop(&mut self) {
-        let _ = self.detach_producers();
+        // Never block on a worker-owned link: leftovers move to the
+        // worker and close in the background (at process exit the kernel
+        // finishes). Evidence is best-effort; there is no caller to fail.
+        if self.links.is_empty() {
+            return;
+        }
+        let mut owned = Vec::new();
+        for link in std::mem::take(&mut self.links) {
+            let producer = link.producer();
+            if let Ok(links) = take_owned_links(&mut self.ebpf, link) {
+                owned.extend(links.into_iter().map(|link| (link, producer)));
+            }
+        }
+        let worker = self.take_cleanup_worker();
+        worker.submit(owned, DetachOrder);
+        drop(worker);
     }
 }
 

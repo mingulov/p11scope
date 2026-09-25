@@ -2145,7 +2145,6 @@ pub(crate) trait EngineSession {
     fn arm_pause(&mut self) -> Result<()>;
     fn pause_state(&self) -> Result<Option<u64>>;
     fn remove_pause(&mut self) -> Result<Option<u64>>;
-    fn detach_producers(&mut self) -> Result<()>;
 }
 
 impl EngineSession for Session {
@@ -2259,10 +2258,6 @@ impl EngineSession for Session {
 
     fn remove_pause(&mut self) -> Result<Option<u64>> {
         Session::remove_pause(self)
-    }
-
-    fn detach_producers(&mut self) -> Result<()> {
-        Session::detach_producers(self)
     }
 }
 
@@ -15764,10 +15759,6 @@ pub(crate) mod session_fixture {
 
         fn remove_pause(&mut self) -> Result<Option<u64>> {
             Ok(None)
-        }
-
-        fn detach_producers(&mut self) -> Result<()> {
-            Ok(())
         }
     }
 }

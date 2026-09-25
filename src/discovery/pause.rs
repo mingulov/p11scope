@@ -1653,9 +1653,6 @@ impl PauseCoordinator {
                 errors.push(error);
             }
         }
-        if let Err(error) = io.detach_pause_links() {
-            errors.push(error);
-        }
         let deadline = self.failure_bound(io, &mut errors);
         while self.failure_items < MAX_FAILURE_ITEMS {
             match self.timed_dequeue(io, Some(deadline)) {
@@ -1782,6 +1779,11 @@ impl PauseCoordinator {
             } else {
                 self.settle_cleanup_resume_debt();
             }
+        }
+        // After every resume is observed: a stopped child must never wait
+        // on serialized kernel teardown (F-T4-3).
+        if let Err(error) = io.detach_pause_links() {
+            errors.push(error);
         }
         if self.terminal_batch.is_none()
             && io.terminal_authority_pending()
@@ -2271,9 +2273,11 @@ impl PauseIo for SessionPauseIo<'_> {
     }
 
     fn detach_pause_links(&mut self) -> Result<(), String> {
-        self.session
-            .detach_producers()
-            .map_err(|error| format!("pause-capable link detach failed: {error:#}"))
+        // The stop gate was requested before pause cleanup; the links move
+        // to the background cleanup worker after publication instead of
+        // detaching here, so a held child is always resumed first and the
+        // run detach time is measured once, at the real teardown.
+        Ok(())
     }
 
     fn same_generation(&mut self, pid: u32, generation: u64) -> Result<bool, String> {
@@ -4395,12 +4399,12 @@ mod tests {
         assert_eq!(
             io.events,
             [
-                "detach",
                 "dequeue",
                 "account",
                 "unvalidated",
                 "read",
-                "remove"
+                "remove",
+                "detach"
             ]
         );
         assert_eq!(io.applied.len(), 1);
@@ -4485,6 +4489,36 @@ mod tests {
         );
         assert!(!io.terminal_authority_pending);
         assert!(coordinator.cleaned);
+    }
+
+    #[test]
+    fn held_child_is_resumed_before_any_link_detach() {
+        let mut io = FakeIo {
+            authorization: Some(PAUSE_REQUESTED),
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+        coordinator.begin_attempt();
+        coordinator.epoch.accepted = true;
+        coordinator.may_be_stopped = true;
+
+        let _ = coordinator.cleanup(&mut io);
+
+        let resume = io
+            .events
+            .iter()
+            .position(|event| *event == "resume")
+            .expect("the held child must be resumed during cleanup");
+        let detach = io
+            .events
+            .iter()
+            .position(|event| *event == "detach")
+            .expect("the links must detach during cleanup");
+        assert!(
+            resume < detach,
+            "a stopped child must never wait on serialized kernel teardown: resume at {resume}, detach at {detach}"
+        );
     }
 
     #[test]
@@ -4602,7 +4636,7 @@ mod tests {
     }
 
     #[test]
-    fn required_failure_uses_terminal_detach_before_accounting_and_resume() {
+    fn required_failure_resumes_the_held_child_before_terminal_detach() {
         let mut io = successful_io(vec![record(10, 0, false)]);
         io.fail_apply = true;
         let mut coordinator = PauseCoordinator::for_test(PausePolicy::Always, 41, 9, stopped());
@@ -4621,7 +4655,7 @@ mod tests {
             .iter()
             .position(|event| *event == "resume")
             .unwrap();
-        assert!(detach < resume);
+        assert!(resume < detach);
         assert_eq!(
             io.events.iter().filter(|event| **event == "detach").count(),
             1
@@ -5806,7 +5840,10 @@ mod tests {
                 .to_string()
                 .contains("[pause_diag=arm_failed_before_epoch]")
         );
-        assert_eq!(io.events.first(), Some(&"detach"));
+        assert_eq!(
+            io.events,
+            ["dequeue", "account", "read", "remove", "detach"]
+        );
         assert!(!io.events.contains(&"resume"));
     }
 
@@ -5950,9 +5987,9 @@ mod tests {
         let remove = io.events.iter().position(|event| *event == "remove");
         let resume = io.events.iter().position(|event| *event == "resume");
         assert!(
-            detach.unwrap() < apply.unwrap()
-                && apply.unwrap() < remove.unwrap()
+            apply.unwrap() < remove.unwrap()
                 && remove.unwrap() < resume.unwrap()
+                && resume.unwrap() < detach.unwrap()
         );
     }
 
@@ -6175,7 +6212,7 @@ mod tests {
         assert_eq!(
             io.events,
             [
-                "detach", "dequeue", "dequeue", "account", "read", "remove", "resume"
+                "dequeue", "dequeue", "account", "read", "remove", "resume", "detach"
             ],
             "cleanup must retain failures without short-circuiting before resume"
         );
@@ -6224,7 +6261,7 @@ mod tests {
             assert_eq!(
                 io.events,
                 [
-                    "detach", "dequeue", "dequeue", "account", "read", "remove", "resume"
+                    "dequeue", "dequeue", "account", "read", "remove", "resume", "detach"
                 ],
                 "{policy:?}: the held child is resumed once, after removal"
             );
@@ -6332,7 +6369,7 @@ mod tests {
 
             assert_eq!(
                 io.events,
-                ["detach", "dequeue", "account", "read", "remove", "resume"],
+                ["dequeue", "account", "read", "remove", "resume", "detach"],
                 "{policy:?}: the removal's REQUESTED still earns one resume"
             );
             assert_eq!(io.authorization, None, "{policy:?}");

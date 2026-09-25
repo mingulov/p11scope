@@ -79,8 +79,6 @@ impl StopGate {
     }
 
     /// True only when the stop bit is set and no body is admitted.
-    // A later stop-gate task drives userspace stop.
-    #[allow(dead_code)]
     pub(crate) fn quiescent(&self) -> bool {
         self.word()
             .compare_exchange(

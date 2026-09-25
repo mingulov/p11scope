@@ -1975,6 +1975,10 @@ impl Owned {
         engine.finish_owned_selection_coverage(
             end == CaptureEnd::TargetExit && matches!(observation, Ok(true)),
         );
+        // Request the stop gate before pause cleanup instead of detaching
+        // there: the links move to the background cleanup worker after
+        // publication, once the held child is resumed.
+        session.stop_gate().request_stop();
         let cleanup = {
             let marker = marker_never_seen();
             let cancelled = cancelled_by(signals);
@@ -2294,7 +2298,8 @@ fn finish_capture_error(
         Some(owned) => owned.finish(engine, session, CaptureEnd::Error, signals),
         None => Ok(()),
     };
-    let detach = session.detach_producers();
+    let detach = session
+        .detach_producers_driven(|| signals.sigint_deliveries() >= 2, &mut std::io::stderr());
     combine_capture_failure(error, finish, detach)
 }
 
@@ -2451,7 +2456,12 @@ fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOut
         Err(error) => {
             return Err(combine_preflight_failure_with(
                 error,
-                || session.detach_producers(),
+                || {
+                    session.detach_producers_driven(
+                        || stop.sigint_deliveries() >= 2,
+                        &mut std::io::stderr(),
+                    )
+                },
                 || {
                     child
                         .terminate_and_reap()
@@ -3992,7 +4002,12 @@ fn capture_profile(
                 interrupted,
             )
         },
-        |context| context.1.detach_producers(),
+        |context| {
+            context.1.detach_producers_driven(
+                || interrupted.sigint_deliveries() >= 2,
+                &mut std::io::stderr(),
+            )
+        },
         |context, _end, _detached| {
             let mut terminal_context = (
                 &mut *context.0,
@@ -4528,7 +4543,12 @@ fn capture_trace(
                 interrupted,
             )
         },
-        |context| context.1.detach_producers(),
+        |context| {
+            context.1.detach_producers_driven(
+                || interrupted.sigint_deliveries() >= 2,
+                &mut std::io::stderr(),
+            )
+        },
         |context, end, _detached| {
             let mut terminal_context = (
                 &mut *context.0,
@@ -10601,7 +10621,7 @@ mod tests {
             let finish = body.find("finish_capture_with(").unwrap();
             let tail = &body[finish..];
             let detach = tail
-                .find("|context| context.1.detach_producers(),")
+                .find("detach_producers_driven(")
                 .expect("shared detach callback");
             let terminal = tail
                 .find("drain_capture_terminal_with(")

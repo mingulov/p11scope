@@ -2589,6 +2589,11 @@ impl Session {
         let mut session =
             Self::start_inner(scope, policy, pause_key, ring_bytes, owned_child, backend)
                 .map_err(unsupported_environment_context)?;
+        #[cfg(test)]
+        crate::first_use_probe::discovery_loss(
+            crate::first_use_probe::DiscoveryStage::LifecycleActive,
+            &session,
+        );
         session
             .attach_plan(plan, objects)
             .map_err(unsupported_environment_context)?;
@@ -2598,6 +2603,11 @@ impl Session {
                 "a pinned provider object changed while attaching; refusing to observe changed bytes"
             );
         }
+        #[cfg(test)]
+        crate::first_use_probe::discovery_loss(
+            crate::first_use_probe::DiscoveryStage::StaticAttached,
+            &session,
+        );
         Ok(session)
     }
 

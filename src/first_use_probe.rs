@@ -4,7 +4,7 @@
 use p11scope_ebpf_common::Event;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::os::unix::fs::MetadataExt as _;
 use std::sync::mpsc::SyncSender;
@@ -39,6 +39,18 @@ struct Endpoint {
     file_offset: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DiscoveryStage {
+    LifecycleActive,
+    StaticAttached,
+    LoaderArmingFinished,
+    InitialExportsFinished,
+    BeforeLoop,
+    BeforeFirstDiscovery,
+    AfterFirstDiscovery,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "fact", rename_all = "snake_case")]
 enum Fact {
@@ -63,6 +75,13 @@ enum Fact {
     LoopStarted {
         domain: u64,
         at_ns: Option<u64>,
+    },
+    DiscoveryLoss {
+        stage: DiscoveryStage,
+        domain: u64,
+        read_started_ns: Option<u64>,
+        read_finished_ns: Option<u64>,
+        ring_loss: Option<u64>,
     },
     PublicationValidated {
         pid: u32,
@@ -234,6 +253,7 @@ struct Active {
     // Retain map identity until the journal stops, even if a failed session
     // is replaced. A later kernel map cannot reuse a recorded domain ID.
     domains: BTreeMap<u64, EventsDomain>,
+    loss_stages: BTreeSet<(u64, DiscoveryStage)>,
     notices: Option<SyncSender<Notice>>,
     loop_notified: bool,
     attached_notified: bool,
@@ -298,6 +318,7 @@ impl Probe {
             *state = Some(Active {
                 journal,
                 domains: BTreeMap::new(),
+                loss_stages: BTreeSet::new(),
                 notices,
                 loop_notified: false,
                 attached_notified: false,
@@ -477,6 +498,55 @@ pub(crate) fn loop_started(domain: &EventsDomain, at_ns: Option<u64>) {
             });
             a.notify(NoticeKind::LoopStarted, domain.id(), at_ns);
         }
+    });
+}
+
+/// Read the actual producer counter, never Engine's cached projection. The
+/// per-CPU aggregate has a read interval, not an invented atomic timestamp.
+pub(crate) fn discovery_loss(stage: DiscoveryStage, session: &crate::attach::Session) {
+    discovery_loss_with(
+        stage,
+        || session.events_domain(),
+        || {
+            session
+                .counter_snapshot()
+                .ok()
+                .map(|snapshot| snapshot.ring_loss)
+        },
+        crate::attach::monotonic_ns,
+    );
+}
+
+fn discovery_loss_with(
+    stage: DiscoveryStage,
+    domain: impl FnOnce() -> EventsDomain,
+    read: impl FnOnce() -> Option<u64>,
+    mut clock: impl FnMut() -> Option<u64>,
+) {
+    with_active(|active| {
+        let domain = domain();
+        if !active.hold(&domain) {
+            return;
+        }
+        let key = (domain.id(), stage);
+        if active.loss_stages.contains(&key) {
+            return;
+        }
+        if active.loss_stages.len() == active.journal.limit {
+            active.journal.dropped = active.journal.dropped.saturating_add(1);
+            return;
+        }
+        active.loss_stages.insert(key);
+        let read_started_ns = clock();
+        let ring_loss = read();
+        let read_finished_ns = clock();
+        active.journal.push(Fact::DiscoveryLoss {
+            stage,
+            domain: domain.id(),
+            read_started_ns,
+            read_finished_ns,
+            ring_loss,
+        });
     });
 }
 

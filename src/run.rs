@@ -3807,6 +3807,11 @@ fn capture_profile(
     let mut frames = 0u64;
     let mut ticks = 0u64;
     let mut last_snapshot: Option<(Vec<metrics::SlotReport>, metrics::KernelEvidence)> = None;
+    #[cfg(test)]
+    crate::first_use_probe::discovery_loss(
+        crate::first_use_probe::DiscoveryStage::BeforeLoop,
+        session,
+    );
     // Authoritative loop-start stamp (T2, G-14): the last clock read before
     // the first tick.
     scheduling.note_loop_start(crate::attach::monotonic_ns());
@@ -3841,6 +3846,11 @@ fn capture_profile(
                     }) else {
                         return Ok((false, false, context.0.plan()));
                     };
+                    #[cfg(test)]
+                    crate::first_use_probe::discovery_loss(
+                        crate::first_use_probe::DiscoveryStage::BeforeFirstDiscovery,
+                        context.1,
+                    );
                     let phase_start = Instant::now();
                     let counted = count_discovery_pass(frame_tick, pass);
                     let (plan_changed, paused) = match counted.pass {
@@ -3861,6 +3871,11 @@ fn capture_profile(
                     consumers
                         .scheduling
                         .add_phase(SchedulingPhase::Discovery, phase_start.elapsed());
+                    #[cfg(test)]
+                    crate::first_use_probe::discovery_loss(
+                        crate::first_use_probe::DiscoveryStage::AfterFirstDiscovery,
+                        context.1,
+                    );
                     Ok((plan_changed, paused, context.0.plan()))
                 },
                 |context| capture_end(

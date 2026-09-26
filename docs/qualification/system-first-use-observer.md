@@ -32,6 +32,7 @@ The outer supervisor bounds startup and cleanup as well as the loop.
 | `publication_validated` | Successful live table lowering before pin/admission. This is a separate path for later publications, including heap tables; it is not relabeled as a process sweep. Kernel publication-hook and later validation clocks remain separate. |
 | `attached` | Existing per-slot completion of retained entry/return links, bound to the opened physical object and file offset in the actual EVENTS domain. The clock is the existing post-attach observation, an upper bound on link activation. |
 | `loop_started` | The existing authoritative profile-loop timestamp. It is not sampled again by the adapter. |
+| `discovery_loss` | A direct read of the Session's cumulative discovery ring-loss counter, with before/after read clocks and the retained EVENTS producer domain. This is separate from the Engine's cached counter projection. Unknown reads remain null. |
 | `call` | A decoded CALL from the real profile drain, before semantic reduction. Includes only domain/slot, the binding available at consumption, PID/TID, image cookie/exec ID, raw kernel return/duration, checked derived entry time and userspace consumption time. Capture failure still invalidates the run. No argument values, handles, buffers or arbitrary memory are copied. |
 
 The workload's `mapped` phase is a post-dlopen/dlsym state observation,
@@ -69,6 +70,22 @@ journal integrity and the raw metadata. Its first-use verdict is always
 execution of the collector, not capture of an owned first call.
 
 ## Verification and remaining gates
+
+The discovery-loss diagnostic samples seven boundaries: lifecycle producers
+active, static attachment complete, loader arming finished, initial exports
+finished, before loop start, and before/after the first actual live discovery
+pass. Arming/export boundaries identify completed attempts, not universal
+attachment success. Repeated ticks do not read those counters again. Both
+the stage registry and facts are bounded by the journal limit, and overflow
+is explicit. Domain descriptors stay retained until the probe finishes.
+
+An external analysis must refuse missing/reordered boundaries, changed
+domains, missing or invalid read clocks, unknown/saturated counters and
+counter regression. Deltas span the enclosing read intervals because the
+per-CPU aggregate is not an atomic global snapshot. A nonzero initial sample
+must be preserved. These samples localize loss; they do not turn a globally
+invalid first-use comparison into a pass. Native boundary measurement is
+still required on newly frozen source and executables.
 
 Ordinary controls cover physical identity versus equal bytes, offsets,
 producer domains, slot rebinding, late binding, unknown clocks and invalid

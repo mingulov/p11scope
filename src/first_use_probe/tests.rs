@@ -298,3 +298,128 @@ fn marker_backpressure_never_blocks_capture_and_is_visible() {
     assert_eq!(j.notification_drops, 1);
     assert!(!j.intact());
 }
+
+#[test]
+fn discovery_loss_sampling_is_inert_without_a_probe_and_reads_each_boundary_once() {
+    discovery_loss_with(
+        DiscoveryStage::LifecycleActive,
+        || panic!("inactive probe requested a domain"),
+        || panic!("inactive probe read counters"),
+        || panic!("inactive probe read a clock"),
+    );
+    let probe = test_probe(42);
+    let reads = std::cell::Cell::new(0);
+    let mut clocks = [Some(100), Some(110)].into_iter();
+    for _ in 0..2 {
+        discovery_loss_with(
+            DiscoveryStage::LifecycleActive,
+            || EventsDomain::test_standin(29),
+            || {
+                reads.set(reads.get() + 1);
+                Some(7)
+            },
+            || clocks.next().expect("exactly two read bounds"),
+        );
+    }
+    let journal = probe.finish();
+    assert_eq!(reads.get(), 1);
+    assert!(journal.intact());
+    let value = serde_json::to_value(journal).unwrap();
+    assert_eq!(value["facts"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        value["facts"][0],
+        serde_json::json!({
+            "fact": "discovery_loss", "stage": "lifecycle_active", "domain": 29,
+            "read_started_ns": 100, "read_finished_ns": 110, "ring_loss": 7
+        })
+    );
+}
+
+#[test]
+fn discovery_loss_missing_reads_and_clocks_remain_explicit_unknowns() {
+    let probe = test_probe(42);
+    let mut clocks = [Some(100), None].into_iter();
+    discovery_loss_with(
+        DiscoveryStage::StaticAttached,
+        || EventsDomain::test_standin(29),
+        || None,
+        || clocks.next().unwrap(),
+    );
+    let journal = probe.finish();
+    let value = serde_json::to_value(journal).unwrap();
+    assert_eq!(value["facts"].as_array().unwrap().len(), 1);
+    assert_eq!(value["facts"][0]["read_started_ns"], 100);
+    assert!(value["facts"][0]["read_finished_ns"].is_null());
+    assert!(value["facts"][0]["ring_loss"].is_null());
+}
+
+#[test]
+fn discovery_loss_samples_keep_different_producer_domains_separate() {
+    let probe = test_probe(42);
+    for (domain, loss) in [(29, 7), (30, 0)] {
+        discovery_loss_with(
+            DiscoveryStage::LifecycleActive,
+            || EventsDomain::test_standin(domain),
+            || Some(loss),
+            || Some(100),
+        );
+    }
+    let value = serde_json::to_value(probe.finish()).unwrap();
+    assert_eq!(value["facts"].as_array().unwrap().len(), 2);
+    assert_eq!(value["facts"][0]["domain"], 29);
+    assert_eq!(value["facts"][0]["ring_loss"], 7);
+    assert_eq!(value["facts"][1]["domain"], 30);
+    assert_eq!(value["facts"][1]["ring_loss"], 0);
+}
+
+#[test]
+fn discovery_loss_stage_limit_bounds_reads_and_discloses_overflow() {
+    let probe = Probe::install(journal(1), None);
+    let reads = std::cell::Cell::new(0);
+    for stage in [
+        DiscoveryStage::LifecycleActive,
+        DiscoveryStage::StaticAttached,
+        DiscoveryStage::LoaderArmingFinished,
+        DiscoveryStage::InitialExportsFinished,
+        DiscoveryStage::BeforeLoop,
+        DiscoveryStage::BeforeFirstDiscovery,
+        DiscoveryStage::AfterFirstDiscovery,
+    ] {
+        discovery_loss_with(
+            stage,
+            || EventsDomain::test_standin(29),
+            || {
+                reads.set(reads.get() + 1);
+                Some(0)
+            },
+            || Some(100),
+        );
+    }
+    let journal = probe.finish();
+    assert_eq!(reads.get(), 1);
+    assert_eq!(journal.facts.len(), 1);
+    assert!(journal.dropped > 0);
+    assert!(!journal.intact());
+}
+
+#[test]
+fn discovery_loss_sampling_retains_the_actual_domain_descriptor() {
+    use std::io::Read as _;
+    use std::os::unix::net::UnixStream;
+    let probe = test_probe(42);
+    let (mut reader, writer) = UnixStream::pair().unwrap();
+    reader.set_nonblocking(true).unwrap();
+    discovery_loss_with(
+        DiscoveryStage::LifecycleActive,
+        || EventsDomain::test_with_fd(29, writer.into()),
+        || Some(0),
+        || Some(100),
+    );
+    assert_eq!(
+        reader.read(&mut [0]).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "the sampled producer's descriptor remains retained"
+    );
+    assert!(probe.finish().intact());
+    assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+}

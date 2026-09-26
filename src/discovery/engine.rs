@@ -15406,6 +15406,11 @@ impl Engine {
                     }
                 }
             }
+            #[cfg(test)]
+            crate::first_use_probe::discovery_loss(
+                crate::first_use_probe::DiscoveryStage::LoaderArmingFinished,
+                &session,
+            );
             if fatal.is_none() {
                 self.attach_initial_exports(
                     &mut session,
@@ -15417,6 +15422,11 @@ impl Engine {
                     self.mark_owned_selection_pending(generation);
                 }
             }
+            #[cfg(test)]
+            crate::first_use_probe::discovery_loss(
+                crate::first_use_probe::DiscoveryStage::InitialExportsFinished,
+                &session,
+            );
             let cleanup = self.process_discovery_records(
                 &mut session,
                 &mut records,

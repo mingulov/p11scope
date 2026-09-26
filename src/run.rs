@@ -2683,8 +2683,12 @@ fn preflight_uretprobe_hazard(target: Option<u32>, overridden: bool) -> Result<O
         uretprobe_hazard::Action::Refuse(reason) => Err(anyhow!(
             "refusing to attach: {reason}. Re-run with \
              --allow-uretprobe-on-confined-target to accept that risk, or capture on a kernel \
-             that exempts the trampoline — scripts/matrix/verify-uretprobe-seccomp.sh \
-             classifies the one you are on"
+             that exempts the trampoline (`p11scope doctor` shows this kernel's `uretprobe vs \
+             seccomp` verdict)"
+        )),
+        // HIGH-1: missing privilege is not a hazard; the override is not offered.
+        uretprobe_hazard::Action::NotPermitted(why) => Err(anyhow!(
+            uretprobe_hazard::not_permitted_message(&why, unsafe { libc::geteuid() } == 0)
         )),
     }
 }
@@ -8969,7 +8973,14 @@ mod tests {
                 run_owned(&run_args(cli::PausePolicy::Never, &["/bin/true"]))
                     .expect_err("an unavailable capture lane must refuse")
             );
-            assert!(never.contains("refusing to attach"), "{never}");
+            // HIGH-1: without privilege the self-probe's refusal names the
+            // missing privilege instead of a hazard; either is the
+            // environment's own category, never a pause failure.
+            let environment = |text: &str| {
+                text.contains("refusing to attach")
+                    || text.contains("cannot load p11scope's BPF programs")
+            };
+            assert!(environment(&never), "{never}");
             assert!(
                 !never.contains("pause"),
                 "an environment failure is not a pause failure: {never}"
@@ -8983,7 +8994,8 @@ mod tests {
                 run_owned(&overridden).expect_err("an unavailable capture lane must refuse")
             );
             assert!(
-                behind_override.contains("attach session"),
+                behind_override.contains("attach session")
+                    || behind_override.contains("cannot load p11scope's BPF programs"),
                 "{behind_override}"
             );
             assert!(
@@ -8997,7 +9009,7 @@ mod tests {
             );
             assert!(always.contains("pause"), "{always}");
             assert!(
-                always.contains("refusing to attach"),
+                environment(&always),
                 "the required-pause category must not hide the real cause: {always}"
             );
         }

@@ -222,50 +222,49 @@ fn b6_doctor_reports_rows_and_verdict() {
 
 #[test]
 fn b7_run_refuses_without_capture_lane() {
-    if !capture_available() {
-        // Hazard-first (Package A, F-01): without the override the run
-        // refuses on the uretprobe hazard before any attach attempt.
-        let hazard = run(&["run", "--", "/bin/true"]);
-        assert_eq!(hazard.code, Some(1));
-        assert!(
-            hazard.stderr.contains("refusing to attach"),
-            "{}",
-            hazard.stderr
-        );
-        assert!(
-            hazard
-                .stderr
-                .contains("--allow-uretprobe-on-confined-target"),
-            "{}",
-            hazard.stderr
-        );
-        assert!(
-            !hazard.stderr.contains("starting attach session"),
-            "{}",
-            hazard.stderr
-        );
-        // F7 pins (Task 3) behind the explicit override: the attach
-        // refusal below is reachable once the hazard risk is accepted.
-        let refused = run(&[
-            "run",
-            "--allow-uretprobe-on-confined-target",
-            "--",
-            "/bin/true",
-        ]);
-        assert_eq!(refused.code, Some(1));
-        assert!(
-            refused.stderr.contains("starting attach session"),
-            "{}",
-            refused.stderr
-        );
-        // F7 fixed (Task 3): the attach hint keeps its cause list and now
-        // points at `p11scope doctor`, which knows the actual cause.
-        assert!(
-            refused.stderr.contains("p11scope doctor"),
-            "{}",
-            refused.stderr
-        );
-    } else {
+    if !capture_available() && unsafe { libc::geteuid() } != 0 {
+        // HIGH-1 (flipped from the F-01 hazard pin): without privilege the
+        // uretprobe self-probe cannot load BPF, which is a missing-privilege
+        // fact, not a seccomp hazard. The refusal says so, points at doctor,
+        // and never offers the override — which cannot grant privilege, so
+        // taking it changes nothing.
+        for args in [
+            &["run", "--", "/bin/true"][..],
+            &[
+                "run",
+                "--allow-uretprobe-on-confined-target",
+                "--",
+                "/bin/true",
+            ][..],
+        ] {
+            let refused = run(args);
+            assert_eq!(refused.code, Some(1), "{args:?}");
+            assert!(
+                refused
+                    .stderr
+                    .contains("cannot load p11scope's BPF programs"),
+                "{args:?}: {}",
+                refused.stderr
+            );
+            assert!(
+                refused.stderr.contains("p11scope doctor"),
+                "{args:?}: {}",
+                refused.stderr
+            );
+            assert!(
+                !refused
+                    .stderr
+                    .contains("--allow-uretprobe-on-confined-target"),
+                "{args:?}: {}",
+                refused.stderr
+            );
+            assert!(
+                !refused.stderr.contains("starting attach session"),
+                "{args:?}: {}",
+                refused.stderr
+            );
+        }
+    } else if capture_available() {
         let outcome = run(&["run", "--", "/bin/true"]);
         assert!(outcome.code.is_some());
     }
@@ -580,36 +579,12 @@ fn t3_f7_attach_refusal_points_at_doctor() {
     // F7 fixed (Task 3): the attach hint keeps its cause list and doc
     // pointer, and now names `p11scope doctor` as the command that knows
     // which cause applies. Exit 1 unchanged.
-    if !capture_available() {
-        // Hazard-first (Package A, F-01): without the override the run
-        // refuses on the uretprobe hazard before any attach attempt.
-        let hazard = run(&["run", "--", "/bin/true"]);
-        assert_eq!(hazard.code, Some(1));
-        assert!(
-            hazard.stderr.contains("refusing to attach"),
-            "{}",
-            hazard.stderr
-        );
-        assert!(
-            hazard
-                .stderr
-                .contains("--allow-uretprobe-on-confined-target"),
-            "{}",
-            hazard.stderr
-        );
-        assert!(
-            !hazard.stderr.contains("starting attach session"),
-            "{}",
-            hazard.stderr
-        );
-        // F7 pins behind the explicit override: the attach refusal below
-        // is reachable once the hazard risk is accepted.
-        let refused = run(&[
-            "run",
-            "--allow-uretprobe-on-confined-target",
-            "--",
-            "/bin/true",
-        ]);
+    if !capture_available() && unsafe { libc::geteuid() } != 0 {
+        // HIGH-1: `run` now stops at the self-probe with the missing
+        // privilege (pinned in b7), so the attach hint is pinned where it is
+        // still reached: an unconfined `--pid` target needs no self-probe.
+        let target = SleepTarget::spawn();
+        let refused = run(&["profile", "--pid", &target.pid(), "--duration", "1"]);
         assert_eq!(refused.code, Some(1));
         assert!(
             refused.stderr.contains("starting attach session"),

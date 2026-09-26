@@ -536,7 +536,10 @@ kind of workload without a manifest and ends `68`/`0` instead.
   can kill it. An unproven kernel (the self-probe could not reach a verdict)
   refuses the same way wherever the target cannot be shown unconfined —
   unreadable targets, `--cgroup`/`--system` scopes, and `run` children,
-  which may confine themselves after attach. See `p11scope doctor` and
+  which may confine themselves after attach. A self-probe the kernel refused
+  for lack of privilege is not a hazard verdict: it is reported as missing
+  privilege (root, or CAP_SYS_ADMIN, CAP_BPF and CAP_PERFMON), and the
+  override does not apply to it. See `p11scope doctor` and
   `src/uretprobe_hazard.rs`. When the override is taken, the flag plus the
   hazard reason is recorded in report evidence (`evidence.uretprobe_override`),
   not just on stderr.

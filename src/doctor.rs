@@ -576,6 +576,9 @@ fn uretprobe_seccomp_check() -> Check {
         crate::uretprobe_hazard::KernelVerdict::Unknown(why) => {
             Status::Warn(format!("could not be determined: {why}"))
         }
+        crate::uretprobe_hazard::KernelVerdict::NotPermitted(why) => Status::Warn(format!(
+            "not assessed: this process may not load BPF ({why}); rerun doctor with sudo"
+        )),
     };
     Check {
         name: "uretprobe vs seccomp".to_string(),

@@ -228,6 +228,32 @@ Existing gates that stay green as regressions: wide/default 2112 and sweep
 cells, `task4_detailed_physical_capacity_refusal` (ordinary over-capacity
 refusal both profiles), old 576 Inventory gate.
 
+## Fix round 2: L-T7-3/4 fixture size (what changed for the consensus)
+
+Live L-T7-3/4 failed instantly (`unsupported owned fixture size`): the
+owned fixture capped at 2,113 endpoints while the selectors need
+4,097/6,530. Root cause was the fixture bound alone — the Inventory path
+is parametric in N end to end (budget to u32 capacity to USAGE
+`map_max_entries`, per-ID latch assertions, exact all-ID set, N+2 links),
+so no segment or loader work was needed for these RV-less cells.
+
+Fix: `OWNED_FIXTURE_MAX_ENDPOINTS = 8_192` (largest owned selector N:
+L-T7-5 boundary; covers 4097/6530; larger still refused loudly with the
+same message). Proof: new ordinary gate
+`task4_owned_fixture_admits_t7_live_selector_sizes` (RED reproduced the
+exact live error; GREEN compiles each N with distinct physical offsets
+and an admitted Inventory plan). L-T7-3/4 keep their exact-coverage
+verdicts; live expectations for the re-run: FD headroom for 4,099/6,532
+links (lower bound links + 64 reserve vs live `ulimit -n`; the cells
+have no refusal branch, so a short host fails loudly) and linear
+runtime (~76 s at 1024 implies roughly 5/8 min at 4097/6530).
+
+Consensus impact: none on the A+segments decision. The 4097/6530
+exact-coverage proof stays live-owed but is unblocked. The ~118 MiB
+uncertainty above is unchanged and strictly Detailed-dense (L-T7-9):
+Inventory USAGE is a plain 8N-byte array (52,240 B at 6530). No live
+limit changed; no native/map-lifecycle source changed.
+
 ## Open uncertainties (for the consensus)
 
 1. The 6530 dense byte envelope (~118 MiB payload at 64 possible CPUs,

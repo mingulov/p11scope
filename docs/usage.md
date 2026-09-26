@@ -519,7 +519,13 @@ kind of workload without a manifest and ends `68`/`0` instead.
   never replaced; the profile report re-checks the name before publishing.
   An existing trace file is truncated only once the capture has attached: a
   capture that fails before that leaves it as it was, and removes a file it
-  had only just created. To keep no report file, leave out `-o`.
+  had only just created. To keep no report file, leave out `-o`. Every
+  directory on the way to the file must be a real directory (no symlinks)
+  owned by root, you, or the user who ran `sudo`, and not group- or
+  world-writable unless it has the sticky bit (as `/tmp` does); otherwise
+  `-o` is refused, naming the directory, its mode and a fix. A home
+  directory created under Ubuntu's default umask (0775) needs
+  `chmod g-w,o-w` first.
 - `--max-events <n>` — trace only (including `run --trace`): end the capture
   after `<n>` call events instead of running until `--duration`, interrupt, or
   target exit. Refused with a usage error on profile, which publishes one

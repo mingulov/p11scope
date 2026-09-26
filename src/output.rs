@@ -525,11 +525,22 @@ fn validate_trusted_directory(directory: &std::fs::File, path: &Path) -> std::io
         ));
     }
     if mode & 0o022 != 0 && mode & libc::S_ISVTX == 0 {
+        // M-4: say why and how to fix it. Ubuntu's default umask 0002 makes
+        // every user directory 0775, which is exactly this case.
+        let who = match (mode & 0o020 != 0, mode & 0o002 != 0) {
+            (true, true) => "its group and other users",
+            (true, false) => "its group",
+            _ => "other users",
+        };
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!(
-                "output directory ancestor {} is untrusted: writable",
-                path.display()
+                "output directory ancestor {0} is untrusted: writable by {who} (mode {1:04o}) \
+                 without the sticky bit, so someone else could replace the report before or \
+                 after it is written. Write into a directory only its owner can write, for \
+                 example after `chmod g-w,o-w {0}`, or choose another -o directory",
+                path.display(),
+                mode & 0o7777
             ),
         ));
     }
@@ -1081,6 +1092,36 @@ mod tests {
         std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o1707)).unwrap();
         drop(AtomicFile::create(&ancestor.join("sticky.json")).unwrap());
         drop(create_private_stream(&ancestor.join("sticky.log")).unwrap());
+    }
+
+    /// M-4 (hint text only; the policy is unchanged): Ubuntu's default
+    /// umask 0002 makes every user directory 0775, so `sudo p11scope ...
+    /// -o ~/captures/p.json` is refused. The refusal must say why (group-
+    /// writable without the sticky bit: another user could swap the report)
+    /// and how to fix it, not just "untrusted: writable".
+    #[test]
+    fn a_writable_ancestor_refusal_says_why_and_how_to_fix_it() {
+        let dir = private_tempdir();
+        let captures = dir.path().join("captures");
+        std::fs::create_dir(&captures).unwrap();
+        for (mode, who) in [
+            (0o775, "writable by its group"),
+            (0o757, "writable by other users"),
+            (0o777, "writable by its group and other users"),
+        ] {
+            std::fs::set_permissions(&captures, std::fs::Permissions::from_mode(mode)).unwrap();
+            let error = AtomicFile::create(&captures.join("p.json"))
+                .err()
+                .expect("a writable ancestor must refuse");
+            assert!(error.contains("untrusted"), "{error}");
+            assert!(error.contains(who), "{mode:o}: {error}");
+            assert!(error.contains(&format!("mode {mode:04o}")), "{error}");
+            assert!(error.contains("sticky"), "{error}");
+            assert!(
+                error.contains(&format!("chmod g-w,o-w {}", captures.display())),
+                "{error}"
+            );
+        }
     }
 
     #[test]

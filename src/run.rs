@@ -4315,9 +4315,13 @@ fn capture_profile(
                         .scheduling
                         .add_phase(SchedulingPhase::Render, render_start.elapsed());
                     collect_sink_drops(context.3, consumers.scheduling, &mut None, Instant::now());
-                    ev.scheduling = consumers
-                        .scheduling
-                        .snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64);
+                    settle_terminal_scheduling(
+                        &mut ev,
+                        consumers
+                            .scheduling
+                            .snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64),
+                        profile,
+                    );
 
                     if let Some(mut out_file) = context.5.take() {
                         let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
@@ -5063,6 +5067,11 @@ fn emit_trace_terminal_accounted<W: Write>(
         trace::evidence_line(evidence, policy, trace_truncated).len() + 1
     });
     evidence.scheduling.sink_dropped_bytes = total;
+    // F-4: the terminal flush's own drops landed after the verdict. Judge the
+    // record and the returned evidence on the final accounting. With `-o`
+    // stdout is display only, so this never changes the file record's
+    // length and the byte-exact total above stays exact.
+    evidence.settle_terminal(true);
     if let Some(file) = out_file.as_mut() {
         writeln!(
             file,
@@ -5073,6 +5082,20 @@ fn emit_trace_terminal_accounted<W: Write>(
         file.flush().context("flushing trace output file")?;
     }
     Ok(())
+}
+
+/// F-4: the final frame's flush and the last sink accounting land after the
+/// verdict the frame showed. The published document is judged on that final
+/// snapshot, never on the frame's: set it, then re-derive and seal. A
+/// profile/metrics stdout carries display frames only, so its drops are
+/// stated there but never gate (`Evidence::stdout_data_sink`).
+fn settle_terminal_scheduling(
+    ev: &mut render::Evidence,
+    scheduling: render::SchedulingEvidence,
+    include_selection: bool,
+) {
+    ev.scheduling = scheduling;
+    ev.settle_terminal(include_selection);
 }
 
 /// Prints (and, if given, appends to the `-o` file) every rendered line.
@@ -11071,6 +11094,100 @@ mod tests {
         assert_eq!(
             record["scheduling"]["sink_policy"].as_str().unwrap(),
             render::SINK_POLICY_BOUNDED_WAIT_DROP,
+        );
+    }
+
+    /// F-4: drops that happen only in the terminal flush land after the
+    /// terminal verdict was taken. When stdout is the data sink (trace
+    /// without `-o`), they are lost data, so the production terminal helper
+    /// must re-judge the evidence it returns on the final accounting.
+    #[test]
+    fn terminal_trace_drops_on_the_data_sink_settle_the_returned_verdict() {
+        let (reader, writer) = pipe_pair();
+        let mut sink =
+            crate::sink::SinkWriter::new(crate::sink::StdoutInner::File(writer)).unwrap();
+        let mut stdout_open = true;
+        let mut scheduling = SchedulingAccumulator::default();
+        sink.begin_tick(crate::sink::SINK_TICK_BUDGET);
+        // 65 KB with no reader: the pipe holds it, so nothing drops before
+        // the terminal snapshot, and the terminal records cannot fit.
+        emit_pre_terminal_lines(&mut sink, &mut stdout_open, &mut None, 65, 1000);
+        flush_stdout(&mut sink, &mut stdout_open).unwrap();
+        collect_sink_drops(&mut sink, &mut scheduling, &mut None, Instant::now());
+        let snapshot = scheduling.snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64);
+        assert_eq!(snapshot.sink_dropped_bytes, 0, "fixture dropped too early");
+        let mut evidence = terminal_evidence_for(snapshot);
+        // What the trace terminal does for a capture with no `-o` file.
+        evidence.stdout_data_sink = true;
+        evidence.verdict_with_selection(true);
+        evidence.mark_terminal_drain_unproven();
+        let before = evidence.gap_classes.observation.causes.clone();
+        assert!(!before.contains(&"scheduling.sink_dropped_bytes"));
+
+        let (_, _, tracer) = trace_fixture();
+        emit_trace_terminal_accounted(
+            &mut evidence,
+            CapturePolicy::AggregateOnly,
+            false,
+            DEFAULT_TRACE_MAX_EVENTS,
+            false,
+            &[],
+            &tracer,
+            &mut scheduling,
+            &mut sink,
+            &mut stdout_open,
+            &mut None::<Vec<u8>>,
+        )
+        .unwrap();
+        let done = Arc::new(AtomicBool::new(true));
+        let reader = spawn_slow_sink_reader(reader, Arc::new(AtomicBool::new(false)), done);
+        drop(sink);
+        reader.join().unwrap();
+
+        assert!(
+            evidence.scheduling.sink_dropped_bytes > 0,
+            "fixture dropped nothing in the terminal flush: test is vacuous"
+        );
+        assert!(
+            evidence
+                .gap_classes
+                .observation
+                .causes
+                .contains(&"scheduling.sink_dropped_bytes"),
+            "terminal data-sink drops must reach the returned verdict: {:?}",
+            evidence.gap_classes
+        );
+        assert_eq!(evidence.verdict_detail, render::VERDICT_CONCRETE_GAP);
+        assert_eq!(evidence.completeness, "PARTIAL");
+    }
+
+    /// F-4, profile terminal: the document is judged on the final snapshot.
+    /// A truncation that only the final snapshot carries is a concrete gap;
+    /// display-frame drops are stated but are no gap for a profile document.
+    #[test]
+    fn profile_terminal_settles_on_the_final_scheduling_snapshot() {
+        let mut clean = render::tests::evidence();
+        clean.verdict();
+        clean.mark_terminal_drain_unproven();
+        assert_eq!(clean.verdict_detail, render::VERDICT_CLEAN_BUT_UNPROVEN);
+
+        let mut dropped = clean.clone();
+        let mut scheduling = dropped.scheduling.clone();
+        scheduling.sink_dropped_bytes = 1;
+        scheduling.sink_timeouts = 1;
+        settle_terminal_scheduling(&mut dropped, scheduling, true);
+        assert_eq!(dropped.scheduling.sink_dropped_bytes, 1);
+        assert_eq!(dropped.completeness, "PARTIAL");
+        assert_eq!(dropped.verdict_detail, render::VERDICT_CLEAN_BUT_UNPROVEN);
+
+        let mut truncated = clean.clone();
+        let mut scheduling = truncated.scheduling.clone();
+        scheduling.terminal_drain_truncated = true;
+        settle_terminal_scheduling(&mut truncated, scheduling, true);
+        assert_eq!(truncated.verdict_detail, render::VERDICT_CONCRETE_GAP);
+        assert_eq!(
+            truncated.gap_classes.observation.causes,
+            ["scheduling.terminal_drain_truncated"]
         );
     }
 

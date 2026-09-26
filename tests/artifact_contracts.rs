@@ -1284,7 +1284,7 @@ fn official_build_is_safe_only() {
     // official build runs the recorded toolchain binaries directly, offline.
     let command = [
         "CARGO_TARGET_DIR=\"$OFFICIAL_TARGET\" \\",
-        "RUSTFLAGS=\"-C target-feature=+crt-static\" \\",
+        "CARGO_ENCODED_RUSTFLAGS=\"-C${RELEASE_FLAG_SEPARATOR}target-feature=+crt-static${RELEASE_FLAG_SEPARATOR}--remap-path-prefix=$RELEASE_SOURCE_ROOT=/p11scope${RELEASE_FLAG_SEPARATOR}--remap-path-prefix=$HOME/.cargo=/cargo${RELEASE_FLAG_SEPARATOR}--remap-path-prefix=$HOME/.rustup=/rustup\" \\",
         "RUSTC=\"$T4_TOOLCHAIN_RUSTC\" \\",
         "P11SCOPE_PREPARED_BPF_CARGO=\"$t4_nightly_cargo\" \\",
         "P11SCOPE_PREPARED_BPF_RUSTC=\"$t4_nightly_rustc\" \\",
@@ -1293,6 +1293,23 @@ fn official_build_is_safe_only() {
     ]
     .join("\n");
     assert!(official.contains(&command));
+    // The official bytes carry no build-host paths: the remap roots are the
+    // resolved checkout and the refused-then-default Cargo and rustup homes.
+    for definition in [
+        "RELEASE_FLAG_SEPARATOR=$(printf '\\037')",
+        "RELEASE_SOURCE_ROOT=$(pwd -P)",
+    ] {
+        assert!(
+            official.contains(definition),
+            "official build misses {definition}"
+        );
+    }
+    assert!(
+        !official
+            .lines()
+            .any(|line| line.trim_start().starts_with("RUSTFLAGS=")),
+        "official build must pass its flags encoded, never as space-separated RUSTFLAGS"
+    );
     assert!(
         !official.contains("cargo +1.88"),
         "official build resolves cargo through the argv[0]-dispatching shim"

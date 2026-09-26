@@ -682,8 +682,17 @@ rm -rf "$OFFICIAL_TARGET"
 # not invocable as cargo and `+1.88` cannot survive path pinning. Run the
 # recorded toolchain binaries directly instead, offline, with RUSTC supplied
 # command-locally so cargo never resolves the compiler through PATH.
+# The official bytes must not embed the build host's checkout, Cargo home or
+# rustup home (panic locations, BTF/DWARF line info of the embedded BPF
+# object), so each is remapped to a fixed prefix. The 0x1f-separated encoded
+# form keeps paths with spaces intact, and build.rs forwards the same flags
+# to the embedded BPF build, whose sources live under the same three roots.
+# Inherited CARGO_HOME and RUSTUP_HOME are refused above, so both are the
+# defaults under HOME.
+RELEASE_FLAG_SEPARATOR=$(printf '\037')
+RELEASE_SOURCE_ROOT=$(pwd -P)
 CARGO_TARGET_DIR="$OFFICIAL_TARGET" \
-RUSTFLAGS="-C target-feature=+crt-static" \
+CARGO_ENCODED_RUSTFLAGS="-C${RELEASE_FLAG_SEPARATOR}target-feature=+crt-static${RELEASE_FLAG_SEPARATOR}--remap-path-prefix=$RELEASE_SOURCE_ROOT=/p11scope${RELEASE_FLAG_SEPARATOR}--remap-path-prefix=$HOME/.cargo=/cargo${RELEASE_FLAG_SEPARATOR}--remap-path-prefix=$HOME/.rustup=/rustup" \
 RUSTC="$T4_TOOLCHAIN_RUSTC" \
 P11SCOPE_PREPARED_BPF_CARGO="$t4_nightly_cargo" \
 P11SCOPE_PREPARED_BPF_RUSTC="$t4_nightly_rustc" \

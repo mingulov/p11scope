@@ -870,6 +870,39 @@ _OBSERVER_REASON_MAP = {
 }
 
 
+def qualifying_observer_window(phase_mono_ns, *, t_spawn_ns, t_exit_ns,
+                              burst_go_ns, burst_end_ns, t_go_ns,
+                              frame_gate=False):
+    """Prove the measurement interval from complete observer-owned stamps.
+
+    The permissive diagnostic parser still supports partial stamps and FD
+    estimates. Neither can qualify an interval. Counts, physical matching,
+    loss and observer exit are separate checks in assess_window/main.
+    """
+    result = {"valid": False, "source": "observer_phase_mono_ns"}
+    auth = _observer_phase_ts(phase_mono_ns)
+    if auth is None or any(value is None for value in auth):
+        return {**result, "detail": "observer phase timestamps missing, partial or malformed"}
+    attach, start, end, reason = auth
+    if reason not in _OBSERVER_REASON_MAP or reason == "error":
+        return {**result, "detail": "observer phase terminal reason is unknown or error"}
+    bounds = [t_spawn_ns, t_exit_ns, burst_go_ns, burst_end_ns, t_go_ns]
+    if any(type(value) is not int or value < 0 for value in bounds):
+        return {**result, "detail": "observer phase comparison has invalid harness/workload timestamps"}
+    if not t_spawn_ns <= attach <= start < end <= t_exit_ns:
+        return {**result, "detail": "observer phase interval contradicts the observer lifetime"}
+    if not start <= burst_go_ns <= burst_end_ns <= end:
+        return {**result, "detail": "observer phase interval does not contain the workload burst"}
+    if not t_spawn_ns <= t_go_ns <= burst_go_ns:
+        return {**result, "detail": "observer phase post-GO truth contradicts the workload release"}
+    if frame_gate and not start <= t_go_ns:
+        return {**result, "detail": "observer phase interval contradicts the frame release"}
+    return {"valid": True, "source": "observer_phase_mono_ns",
+            "detail": "complete observer phase timestamps contain the owned burst",
+            "attach_mono_ns": attach, "loop_start_mono_ns": start,
+            "loop_end_mono_ns": end, "loop_end_reason": reason}
+
+
 def _observer_phase_s(phase_ms, key):
     """In-observer phase timer as seconds, or None when absent/unusable."""
     if not isinstance(phase_ms, dict):
@@ -1773,6 +1806,37 @@ def main(argv):
         observer_problems.append(f"observer terminated by {observer_signal}")
     if observer_exit != 0:
         observer_problems.append(f"observer exit={observer_exit}")
+    phase_authority = qualifying_observer_window(
+        observer_phase_ts,
+        t_spawn_ns=meta["timing"]["t_spawn_mono_ns"],
+        t_exit_ns=meta["timing"]["t_exit_mono_ns"],
+        burst_go_ns=burst_go_ns, burst_end_ns=burst_end_ns,
+        t_go_ns=meta["timing"]["t_go_mono_ns"],
+        frame_gate=meta["condition"].get("gate", "frame") == "frame")
+    if not phase_authority["valid"]:
+        observer_problems.append(phase_authority["detail"])
+    else:
+        # Preserve earlier external estimates for diagnosis. Accepted window
+        # and capture duration use the actual loop start, not attach/GO time.
+        diagnostic_keys = ("t_attached_mono_ns", "t_loop_end_mono_ns",
+                           "attach_boundary_source", "capture_boundary_source",
+                           "capture_measured_s", "burst_window_relation")
+        phases["diagnostic_window_estimate"] = {
+            key: phases.get(key) for key in diagnostic_keys}
+        phases["t_attached_mono_ns"] = phase_authority["attach_mono_ns"]
+        phases["t_loop_start_mono_ns"] = phase_authority["loop_start_mono_ns"]
+        phases["t_loop_end_mono_ns"] = phase_authority["loop_end_mono_ns"]
+        phases["t_expiry_mono_ns"] = (phase_authority["loop_end_mono_ns"]
+                                      if phase_authority["loop_end_reason"] == "expiry" else None)
+        phases["loop_end_reason"] = _OBSERVER_REASON_MAP[phase_authority["loop_end_reason"]]
+        phases["loop_end_source"] = "observer_authoritative"
+        phases["attach_boundary_source"] = "observer_authoritative"
+        phases["capture_boundary_source"] = "observer_authoritative"
+        phases["capture_measured_s"] = (phase_authority["loop_end_mono_ns"]
+                                        - phase_authority["loop_start_mono_ns"]) / 1e9
+        phases["capture_proven_lower_bound_s"] = phases["capture_measured_s"]
+        phases["burst_window_relation"] = "inside"
+        phases["burst_outside_window"] = False
     observer_outcome = ("; ".join(observer_problems)
                         if observer_problems else None)
     window = assess_window(
@@ -1784,6 +1848,7 @@ def main(argv):
         coverage_detail=window_coverage_detail,
         observer_outcome=observer_outcome,
         burst_window_relation=phases["burst_window_relation"])
+    window["observer_phase_authority"] = phase_authority
 
     # Task 3.1 repair: scheduling consistency + which-bound-broke
     # attribution + the cancel control-latency probe. A missing scheduling
@@ -1933,10 +1998,10 @@ def main(argv):
             sorted(samples, key=lambda row: int(row["t_mono_ns"]))),
         "artifacts": meta["artifacts"],
         "limitations": [
-            "Phase boundaries are externally derived (fd trace + stderr "
-            "markers), not in-observer timestamps; drain/detach/publish "
-            "splits are approximate. Without a loop-end marker, an early "
-            "exit leaves the measured window unknown rather than assumed.",
+            "Window validity requires complete observer attach/loop-start/loop-end "
+            "timestamps containing the workload burst. FD/stderr estimates remain "
+            "diagnostic; drain/detach/publish splits are approximate. Partial or "
+            "malformed observer stamps cannot qualify an estimated window.",
             "BPF load is folded into attach_s (no external marker).",
             "Observer CPU/RSS are wall-window samples; noisy under concurrent "
             "build load (sibling workers) — see the design note.",

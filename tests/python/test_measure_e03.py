@@ -179,11 +179,14 @@ def run_measure(tmp, *, scope="pid", mode="profile", workload_argv,
     return record, Path(summary).read_text(encoding="utf-8")
 
 
-def profile_report(*, functions, discovery, skipped=(), probes=2, slots=1):
+def profile_report(*, functions, discovery, skipped=(), probes=2, slots=1,
+                   phase_mono_ns=None):
     evidence = {name: 0 for name in CHECKER["COUNTERS"]}
     evidence.update(attached_probes=probes, slots=slots,
                     completeness="PARTIAL", discovery=discovery,
                     modules_skipped=list(skipped))
+    if phase_mono_ns is not None:
+        evidence["scheduling"] = {"phase_mono_ns": phase_mono_ns}
     return json.dumps({"schema": "synthetic", "capture": {},
                        "functions": functions, "evidence": evidence})
 
@@ -288,6 +291,95 @@ class CollapseInferenceTests(unittest.TestCase):
         self.assertTrue(window["window_valid"])
 
 
+class ObserverWindowAcceptanceTests(unittest.TestCase):
+    def stamps(self, **changes):
+        return {"attach_mono_ns": 2_000_000_000,
+                "loop_start_mono_ns": 2_500_000_000,
+                "loop_end_mono_ns": 10_000_000_000,
+                "loop_end_reason": "expiry", **changes}
+
+    def measure(self, stamps, *, gate="marker", t_go_ns=3_000_000_000,
+                burst_go_ns=3_000_000_000, burst_end_ns=4_000_000_000):
+        report = json.loads(profile_report(
+            functions=[{"names": ["C_GenerateRandom"], "calls": 7}],
+            discovery=[]))
+        if stamps is not None:
+            report["evidence"]["scheduling"] = {"phase_mono_ns": stamps}
+        with tempfile.TemporaryDirectory() as directory:
+            return run_measure(
+                Path(directory), scope="pid", mode="profile",
+                workload_argv=["owned-workload"], observer_pid=77,
+                report_text=json.dumps(report), truth={"C_GenerateRandom": 7},
+                gate=gate, samples=ramp_samples(attach_s=2, end_s=12, detach_s=10.5),
+                t_go_ns=t_go_ns, burst_go_ns=burst_go_ns,
+                burst_end_ns=burst_end_ns,
+                stderr_lines=[(2_000_000_000, COMPLETION)])
+
+    def test_fd_estimates_remain_diagnostic_but_cannot_qualify_a_window(self):
+        record, summary = self.measure(None)
+        self.assertTrue(record["truth_vs_observed"]["counts_match"])
+        self.assertEqual(record["phases"]["attach_boundary_source"], "fd_95pct_estimate")
+        self.assertIsNotNone(record["phases"]["capture_measured_s"])
+        self.assertFalse(record["window"]["window_valid"])
+        self.assertIn("observer phase", summary)
+
+    def test_missing_malformed_and_partial_observer_stamps_refuse_qualification(self):
+        for stamps in [None, {}, [],
+                       self.stamps(attach_mono_ns=None),
+                       self.stamps(loop_start_mono_ns=None),
+                       self.stamps(loop_end_mono_ns=None),
+                       self.stamps(loop_end_reason=None),
+                       self.stamps(loop_end_reason="unrecognized"),
+                       self.stamps(loop_end_reason="error"),
+                       self.stamps(attach_mono_ns=True),
+                       self.stamps(attach_mono_ns=2e9),
+                       self.stamps(attach_mono_ns="2000000000"),
+                       self.stamps(attach_mono_ns=-1),
+                       self.stamps(loop_start_mono_ns=1_000_000_000)]:
+            with self.subTest(stamps=stamps):
+                record, _ = self.measure(stamps)
+                self.assertFalse(record["window"]["window_valid"])
+
+    def test_calls_before_actual_loop_start_are_outside_even_after_attach(self):
+        record, _ = self.measure(self.stamps(loop_start_mono_ns=5_000_000_000))
+        self.assertTrue(record["truth_vs_observed"]["counts_match"])
+        self.assertFalse(record["window"]["window_valid"])
+
+    def test_phase_stamp_after_observer_exit_is_not_authority(self):
+        record, _ = self.measure(self.stamps(loop_end_mono_ns=13_000_000_000))
+        self.assertFalse(record["window"]["window_valid"])
+
+    def test_burst_after_authoritative_end_is_refused(self):
+        record, _ = self.measure(self.stamps(loop_end_mono_ns=3_500_000_000))
+        self.assertFalse(record["window"]["window_valid"])
+
+    def test_complete_observer_stamps_qualify_both_frame_and_marker_windows(self):
+        for gate in ["frame", "marker"]:
+            with self.subTest(gate=gate):
+                record, _ = self.measure(self.stamps(), gate=gate)
+                self.assertTrue(record["window"]["window_valid"])
+                self.assertTrue(record["window"]["observer_phase_authority"]["valid"])
+                self.assertEqual(record["phases"]["capture_measured_s"], 7.5)
+                self.assertEqual(record["phases"]["capture_boundary_source"], "observer_authoritative")
+
+    def test_post_go_truth_cannot_precede_release_even_for_a_weak_gate(self):
+        for gate in ["frame", "marker"]:
+            with self.subTest(gate=gate):
+                record, _ = self.measure(self.stamps(), gate=gate, t_go_ns=4_500_000_000)
+                self.assertFalse(record["window"]["window_valid"])
+
+    def test_frame_release_before_loop_start_remains_invalid(self):
+        record, _ = self.measure(self.stamps(loop_start_mono_ns=3_500_000_000),
+                                 gate="frame", burst_go_ns=4_000_000_000,
+                                 burst_end_ns=4_500_000_000)
+        self.assertFalse(record["window"]["window_valid"])
+
+    def test_exact_loop_bounds_are_accepted(self):
+        record, _ = self.measure(self.stamps(loop_start_mono_ns=3_000_000_000),
+                                 burst_end_ns=10_000_000_000)
+        self.assertTrue(record["window"]["window_valid"])
+
+
 class FrameBoundaryTests(unittest.TestCase):
     def derive(self, *, burst_go_ns, burst_end_ns, marker_ns=None,
                duration_s=8.0, marker_line=TARGET_EXIT,
@@ -362,13 +454,17 @@ class FrameBoundaryTests(unittest.TestCase):
         self.assertEqual(phases["burst_window_relation"], "unknown")
         self.assertIsNone(phases["burst_outside_window"])
 
-    def test_raw_main_uses_frame_bounds_not_late_fd_max(self):
+    def test_raw_main_uses_observer_stamps_with_frame_gate_despite_late_fd_max(self):
         with tempfile.TemporaryDirectory() as raw:
             target, module = complete_target_receipt(4242, 99)
             record, _ = run_measure(
                 Path(raw), scope="pid", mode="profile",
                 workload_argv=["/w/workload", "/w/owned.so", "7", "0", "0"],
                 report_text=profile_report(
+                    phase_mono_ns={"attach_mono_ns": 2_000_000_000,
+                                   "loop_start_mono_ns": 2_500_000_000,
+                                   "loop_end_mono_ns": 5_000_000_000,
+                                   "loop_end_reason": "target_exit"},
                     functions=[{"names": ["C_GenerateRandom"], "calls": 7,
                                 "module": {"dev": [8, 1], "ino": 11,
                                            "sha256": "aa"}}],

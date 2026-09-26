@@ -5616,29 +5616,42 @@ fn start_retained_with<S>(
     if named && discovered.views.len() != 1 {
         bail!("the named process generation was not retained through discovery");
     }
+    // Before any session exists a stale view costs one plan rebuild, and each
+    // pass removes at least one accepted view, so this is bounded by them.
     loop {
         let stale = stale_views(&discovered.views);
-        if !stale.is_empty() {
-            if named {
-                bail!("the named process generation changed before attach");
-            }
-            remove_stale_views(discovered, &stale)?;
-            continue;
-        }
-
-        let session = start(&discovered.plan, &discovered.pinned)?;
-        let stale = stale_views(&discovered.views);
         if stale.is_empty() {
-            return Ok(session);
+            break;
         }
-        // No event/map consumer can see this session. Dropping it first tears down
-        // every just-created link before stale ownership changes or a retry begins.
-        drop(session);
         if named {
-            bail!("the named process generation changed while attaching");
+            bail!("the named process generation changed before attach");
         }
         remove_stale_views(discovered, &stale)?;
     }
+
+    let session = start(&discovered.plan, &discovered.pinned)?;
+    let stale = stale_views(&discovered.views);
+    if stale.is_empty() {
+        return Ok(session);
+    }
+    if named {
+        // No event/map consumer can see this session. Dropping it first tears
+        // down every just-created link before the named capture fails.
+        drop(session);
+        bail!("the named process generation changed while attaching");
+    }
+    // H-2: a multi-process capture starts once. Restarting the whole session
+    // for an ambient exit during the seconds-long load and attach detached
+    // every link and attached them all again, once per exit and with no bound.
+    // A view that went stale meanwhile is retired live instead, like any
+    // member that ends mid-capture: the startup record pass settles it — a
+    // provable exit as an expected removal, anything else as a counted
+    // generation loss — and its conservative replay retires every endpoint
+    // only that view owned. Until then its links stay exactly the ones the
+    // accepted plan names.
+    let stale: BTreeSet<_> = stale.into_iter().collect();
+    discovered.queue_stale_views(&stale, &mut PendingViewRetirements::new());
+    Ok(session)
 }
 
 fn export_abi(kind: u8) -> Option<HookAbi> {

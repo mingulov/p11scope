@@ -18348,8 +18348,9 @@ fn named_generation_change_during_attach_drops_before_event_consumption() {
 }
 
 /// Mutation caught: retrying without subtracting an originally accepted stale
-/// view can spin forever under cgroup churn. Three accepted views permit only
-/// three stale-session retries, followed by the final stable start.
+/// view can spin forever under cgroup churn. Before any session exists, each
+/// accepted view that went stale is removed with one plan rebuild, and the
+/// session then starts exactly once.
 #[test]
 fn cgroup_retries_retire_one_original_view_each_time_and_publish_partial() {
     let views: Vec<_> = (0..3)
@@ -18365,15 +18366,11 @@ fn cgroup_retries_retire_one_original_view_each_time_and_publish_partial() {
         false,
         |_| {
             checks.set(checks.get() + 1);
-            if checks.get() % 2 == 0 {
-                original
-                    .get(checks.get() / 2 - 1)
-                    .copied()
-                    .into_iter()
-                    .collect()
-            } else {
-                Vec::new()
-            }
+            original
+                .get(checks.get() - 1)
+                .copied()
+                .into_iter()
+                .collect()
         },
         |_, _| {
             starts.set(starts.get() + 1);
@@ -18383,7 +18380,12 @@ fn cgroup_retries_retire_one_original_view_each_time_and_publish_partial() {
     )
     .unwrap();
 
-    assert_eq!(starts.get(), original.len() + 1);
+    assert_eq!(starts.get(), 1, "the session starts once");
+    assert_eq!(
+        checks.get(),
+        original.len() + 2,
+        "one check per removal, one before and one after the start"
+    );
     assert!(discovered.views.is_empty());
     assert_eq!(
         discovered
@@ -18408,14 +18410,106 @@ fn cgroup_retries_retire_one_original_view_each_time_and_publish_partial() {
             .map(render::capture_skipped_out)
             .all(|skip| skip.name == "discovery subject" && skip.reason == "discovery unavailable")
     );
+    assert_eq!(*log.borrow(), ["start"], "no session was torn down");
+    drop(session);
+}
+
+/// H-2. A multi-process capture started a whole new session — every link
+/// detached, the plan rebuilt, BPF reloaded and reattached — whenever any
+/// retained view went stale during the seconds-long load and attach, once per
+/// ambient exit and with no bound, and the dropped session's loss counters went
+/// with it. It now starts once and retires the stale view live, like any
+/// member that ends mid-capture: a provable exit is an expected removal (no
+/// loss), anything else a counted generation loss.
+#[test]
+fn multi_process_start_retires_views_that_went_stale_during_attach_live() {
+    let mut exiting = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let exiting_pid = exiting.id();
+    let views = vec![
+        ProcessView::open(ProcessViewId(0), exiting_pid).unwrap(),
+        crate::process::unprovable_process_view_for_test(ProcessViewId(1), std::process::id())
+            .unwrap(),
+        ProcessView::open(ProcessViewId(2), std::process::id()).unwrap(),
+    ];
+    let (exited, unprovable, kept) = (views[0].id(), views[1].id(), views[2].id());
+    let mut discovered = lifecycle_discovered(views);
+    discovered.scope = Scope::System;
+    let checks = Cell::new(0usize);
+    let starts = Cell::new(0usize);
+    let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let session = start_retained_with(
+        &mut discovered,
+        false,
+        |views| {
+            checks.set(checks.get() + 1);
+            if checks.get() == 1 {
+                // Nothing is stale yet when the session starts.
+                return Vec::new();
+            }
+            if checks.get() == 2 {
+                exiting.kill().unwrap();
+                exiting.wait().unwrap();
+            }
+            crate::process::stale_view_ids(views)
+        },
+        |_, _| {
+            starts.set(starts.get() + 1);
+            log.borrow_mut().push("start");
+            Ok(FakeSession(std::rc::Rc::clone(&log)))
+        },
+    )
+    .expect("an ambient exit during attach never fails a multi-process start");
+
+    assert_eq!(starts.get(), 1, "one session, never restarted");
+    assert_eq!(*log.borrow(), ["start"], "the session was not torn down");
     assert_eq!(
-        log.borrow()
-            .iter()
-            .filter(|event| **event == "drop")
-            .count(),
-        original.len(),
-        "every stale post-start pass tears down its whole session"
+        discovered.views.len(),
+        3,
+        "stale views retire live, not here"
     );
+    assert_eq!(
+        discovered.retirement_intents.get(&exited),
+        Some(&RetirementCause::ExpectedRemoval),
+        "a provable exit is the process ending"
+    );
+    assert_eq!(
+        discovered.retirement_intents.get(&unprovable),
+        Some(&RetirementCause::GenerationLost),
+        "a generation whose end cannot be proven is a counted loss"
+    );
+    assert!(!discovered.retirement_intents.contains_key(&kept));
+    assert!(
+        discovered
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.subject == "live discovery generation"),
+        "the unprovable generation's loss is published: {:?}",
+        discovered.counters.object_skips
+    );
+
+    // The startup record pass retires them like any live retirement.
+    let mut collect: Box<DiscoveryCollector<'_>> = Box::new(Engine::collect_discovery_records);
+    discovered
+        .process_discovery_records(
+            &mut ScriptedSession::default(),
+            &mut Vec::new(),
+            &mut PendingViewRetirements::new(),
+            &mut true,
+            &mut *collect,
+            &mut PauseClosure::new(true),
+        )
+        .unwrap();
+    assert!(discovered.retirement_intents.is_empty());
+    assert!(discovered.pending_retirements.is_empty());
+    assert!(
+        discovered.views.iter().all(|view| view.id() != exited),
+        "the exited view is gone"
+    );
+    assert!(discovered.views.iter().any(|view| view.id() == kept));
     drop(session);
 }
 

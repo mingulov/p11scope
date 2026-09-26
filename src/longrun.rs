@@ -7,9 +7,10 @@
 //! stops draining is a deep freeze), and first-drain loss shares (ramp-up
 //! loss vs steady-state loss, for the early-ring-loss diagnosis). Pure:
 //! every observation is passed in, so the detector is fully testable with
-//! synthetic streams. The capture loop feeds it per tick and prints one
-//! `p11scope: longrun:` stderr line at loop end — diagnostics, not report
-//! evidence, so no capture-verdict or schema semantics change.
+//! synthetic streams. The capture loop feeds it per tick and attempts one
+//! `p11scope: longrun:` stderr line at loop end. Delivery is best effort;
+//! absence is not a clean result. These diagnostics do not change the
+//! capture verdict or report schema.
 
 /// Worst observed forced-sweep tick: the 3.1-repair E-system-tick max
 /// (`31r-esys4`, `docs/notes/2026-09-20-task-3.1-repair.md`). A tick slower
@@ -77,8 +78,8 @@ impl LongRunReport {
         }
     }
 
-    /// The one stderr line the capture loop prints at loop end — always
-    /// printed, so a soak can tell "clean" from "detector never ran".
+    /// The stderr line attempted at loop end when samples are available.
+    /// A soak must distinguish its absence from a delivered clean result.
     pub fn report_line(&self) -> String {
         let numbers = format!(
             "ticks {}, max tick {}ms, max gap {}ms, events {}, discovery {}",

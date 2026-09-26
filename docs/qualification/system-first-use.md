@@ -107,3 +107,28 @@ PID and system profile controls still pass. Trace currently has no physical
 module rows, so its aggregate equality cannot qualify an owned window;
 adding attributable trace evidence remains open. These acceptance changes
 do not modify the captured data or promote an old run to live qualification.
+
+## Capture-loop health diagnostics (ordinary verification)
+
+Both profile/metrics and trace now feed the existing long-run detector
+from actual completed service ticks, drain gaps and first/loop-end loss
+samples. Deliberate readiness waits and later terminal work are excluded
+from tick service time. Diagnostic milliseconds round up, so 1895ms is
+within the existing bound and 1895ms plus one nanosecond exceeds it.
+These thresholds are historical diagnostic bounds, not product latency
+guarantees. Early and steady loss shares remain separate.
+
+At loop end the observer attempts a `p11scope: longrun:` stderr line.
+Missing completed ticks or required counter readings produce `unavailable`;
+metrics reports its absent event stream as `n/a`. A slow or closed pipe or
+socket cannot make this optional diagnostic wait or panic before cleanup.
+Delivery is best effort: a missing line never establishes a clean result.
+Capture verdicts and the existing report schema retain their meanings.
+
+Five scheduling integration controls, three descriptor controls and the
+existing detector tests pass. The default workspace suite passed (1616
+library tests, 45 privileged tests ignored; 139 artifact tests), as did the
+wide run/sink suites (161 and 18 tests) and both strict all-target Clippy
+checks. Actual public-loop measurements, the run-mode early-loss repair and
+the supported-boundary G-14 green result remain pending; these ordinary
+checks alone do not close them.

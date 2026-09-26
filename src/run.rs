@@ -3815,6 +3815,7 @@ fn capture_profile(
     loop {
         stdout.begin_tick(crate::sink::SINK_TICK_BUDGET);
         ticks += 1;
+        let tick_start = Instant::now();
         let elapsed = clock.elapsed();
         // One frame-clock read decides this tick's whole frame (F-T8-1).
         let tick_frame = profile_frame_decisions(|| last_frame.elapsed(), drain);
@@ -3876,6 +3877,18 @@ fn capture_profile(
                             consumers.scheduling,
                             EventsDrainBound::Live,
                         )?;
+                    }
+                    if !consumers.scheduling.longrun_first_loss_sampled {
+                        let event_loss = if profile {
+                            metrics::lost_events(context.1).ok()
+                        } else {
+                            None
+                        };
+                        consumers.scheduling.note_longrun_first_loss(
+                            event_loss,
+                            context.0.capture_facts().discovery_losses()[0],
+                            profile,
+                        );
                     }
                     Ok(None)
                 },
@@ -3959,6 +3972,7 @@ fn capture_profile(
             &mut last_sink_note,
             Instant::now(),
         );
+        scheduling.note_longrun_tick(ticks, tick_start.elapsed());
         wait_until_ready(
             session.events_readiness_fd(),
             ready_sleep_duration(
@@ -3987,21 +4001,19 @@ fn capture_profile(
         Ok(end) => end.reason_label(),
         Err(_) => render::LOOP_END_ERROR,
     };
-    if profile {
-        scheduling.note_loop_end(
-            metrics::lost_events(session).unwrap_or(0),
-            engine.capture_facts().discovery_losses()[0],
-            loop_end_ns,
-            loop_end_reason,
-        );
+    let loop_event_loss = if profile {
+        metrics::lost_events(session).ok()
     } else {
-        scheduling.note_loop_end(
-            0,
-            engine.capture_facts().discovery_losses()[0],
-            loop_end_ns,
-            loop_end_reason,
-        );
-    }
+        Some(0)
+    };
+    scheduling.note_loop_end(
+        loop_event_loss.unwrap_or(0),
+        engine.capture_facts().discovery_losses()[0],
+        loop_end_ns,
+        loop_end_reason,
+    );
+    // Diagnostics are optional; closed/slow stderr cannot skip owned cleanup.
+    let _ = crate::sink::try_stderr_line(&scheduling.longrun_line(loop_event_loss.is_some()));
     // Poll for quiescence (owner budget), servicing the drains between
     // polls without admitting producers. Discovery records stage here and
     // apply after the poll; EVENTS reduce in place. Every failure below
@@ -4421,6 +4433,7 @@ fn capture_trace(
     loop {
         stdout.begin_tick(crate::sink::SINK_TICK_BUDGET);
         ticks += 1;
+        let tick_start = Instant::now();
         let elapsed = clock.elapsed();
         let tick = {
             let mut context = (
@@ -4511,6 +4524,13 @@ fn capture_trace(
                         },
                         EventsDrainBound::Live,
                     )?;
+                    if !consumers.scheduling.longrun_first_loss_sampled {
+                        consumers.scheduling.note_longrun_first_loss(
+                            metrics::lost_events(context.1).ok(),
+                            context.0.capture_facts().discovery_losses()[0],
+                            true,
+                        );
+                    }
                     Ok((*context.3 == Some(0)).then_some(CaptureEnd::LimitReached))
                 },
                 |context, consumers| {
@@ -4554,6 +4574,7 @@ fn capture_trace(
             &mut last_sink_note,
             Instant::now(),
         );
+        scheduling.note_longrun_tick(ticks, tick_start.elapsed());
         wait_until_ready(
             session.events_readiness_fd(),
             ready_sleep_duration(
@@ -4582,12 +4603,14 @@ fn capture_trace(
         Ok(end) => end.reason_label(),
         Err(_) => render::LOOP_END_ERROR,
     };
+    let loop_event_loss = metrics::lost_events(session).ok();
     scheduling.note_loop_end(
-        metrics::lost_events(session).unwrap_or(0),
+        loop_event_loss.unwrap_or(0),
         engine.capture_facts().discovery_losses()[0],
         loop_end_ns,
         loop_end_reason,
     );
+    let _ = crate::sink::try_stderr_line(&scheduling.longrun_line(loop_event_loss.is_some()));
     // Poll for quiescence (owner budget), servicing the drains between
     // polls without admitting producers. Discovery records stage here and
     // apply after the poll; EVENTS reduce in place. Every failure below
@@ -5262,6 +5285,9 @@ pub(crate) struct SchedulingAccumulator {
     loop_start_mono_ns: Option<u64>,
     loop_end_mono_ns: Option<u64>,
     loop_end_reason: &'static str,
+    longrun: crate::longrun::LongRunDetector,
+    longrun_first_loss_sampled: bool,
+    longrun_first_loss_unavailable: bool,
 }
 
 impl Default for SchedulingAccumulator {
@@ -5291,11 +5317,61 @@ impl Default for SchedulingAccumulator {
             loop_start_mono_ns: None,
             loop_end_mono_ns: None,
             loop_end_reason: crate::render::LOOP_END_UNSTARTED,
+            longrun: crate::longrun::LongRunDetector::default(),
+            longrun_first_loss_sampled: false,
+            longrun_first_loss_unavailable: false,
         }
     }
 }
 
 impl SchedulingAccumulator {
+    fn note_longrun_tick(&mut self, tick: u64, elapsed: Duration) {
+        if !self.loop_ended {
+            // Round up for the diagnostic bound: 1895ms + 1ns is over it.
+            let ms = elapsed
+                .as_nanos()
+                .div_ceil(1_000_000)
+                .min(u128::from(u64::MAX)) as u64;
+            self.longrun.note_tick(tick, ms);
+        }
+    }
+
+    fn note_longrun_first_loss(
+        &mut self,
+        event_loss: Option<u64>,
+        discovery_loss: u64,
+        expects_events: bool,
+    ) {
+        if self.loop_ended || self.longrun_first_loss_sampled {
+            return;
+        }
+        self.longrun_first_loss_sampled = true;
+        self.longrun_first_loss_unavailable = expects_events && event_loss.is_none();
+        self.longrun
+            .note_first_drain_loss(event_loss, discovery_loss);
+    }
+
+    fn longrun_report(&self, end_loss_available: bool) -> Option<crate::longrun::LongRunReport> {
+        if !self.loop_ended
+            || !self.longrun_first_loss_sampled
+            || self.longrun_first_loss_unavailable
+            || !end_loss_available
+        {
+            return None;
+        }
+        let report = self
+            .longrun
+            .finish(self.capture_event_loss, self.capture_discovery_loss);
+        (report.ticks_observed > 0).then_some(report)
+    }
+
+    fn longrun_line(&self, end_loss_available: bool) -> String {
+        self.longrun_report(end_loss_available).map_or_else(
+            || "p11scope: longrun: unavailable (no completed tick or complete loss samples)".into(),
+            |report| report.report_line(),
+        )
+    }
+
     pub(crate) fn note_live_drain(&mut self, outcome: &ReadyOutcome) {
         self.drain_repolls = self.drain_repolls.saturating_add(outcome.repolls);
         if outcome.budget_exhausted {
@@ -5320,7 +5396,10 @@ impl SchedulingAccumulator {
             return;
         }
         if let Some(last) = self.last_drain_end {
-            let gap_ms = now.saturating_duration_since(last).as_millis();
+            let gap = now.saturating_duration_since(last);
+            let gap_ms = gap.as_millis();
+            self.longrun
+                .note_gap(gap.as_nanos().div_ceil(1_000_000).min(u128::from(u64::MAX)) as u64);
             self.max_inter_drain_gap_ms = self
                 .max_inter_drain_gap_ms
                 .max(gap_ms.min(u128::from(u64::MAX)) as u64);
@@ -9352,6 +9431,102 @@ mod tests {
         // The loss path is unchanged by the new arguments.
         assert_eq!(ev.capture_event_loss, 10);
         assert_eq!(ev.capture_discovery_loss, 3);
+    }
+
+    #[test]
+    fn capture_longrun_tick_budget_distinguishes_exact_bound_and_one_ns_over() {
+        for (elapsed, over) in [
+            (Duration::from_millis(1_895), false),
+            (Duration::from_millis(1_895) + Duration::from_nanos(1), true),
+        ] {
+            let mut acc = SchedulingAccumulator::default();
+            acc.note_longrun_first_loss(Some(0), 0, true);
+            acc.note_longrun_tick(1, elapsed);
+            acc.note_loop_end(0, 0, Some(300), render::LOOP_END_EXPIRY);
+            let report = acc.longrun_report(true).unwrap();
+            assert_eq!(report.ticks_observed, 1);
+            assert_eq!(
+                report
+                    .findings
+                    .iter()
+                    .any(|f| f.code == crate::longrun::FINDING_TICK_OVER_BUDGET),
+                over
+            );
+        }
+    }
+
+    #[test]
+    fn capture_longrun_gap_and_loss_stop_at_capture_end() {
+        let mut acc = SchedulingAccumulator::default();
+        let start = Instant::now();
+        acc.note_longrun_first_loss(Some(2), 3, true);
+        acc.note_longrun_first_loss(Some(99), 99, true);
+        acc.note_longrun_tick(1, Duration::from_millis(50));
+        acc.note_drain_at(start);
+        acc.note_drain_at(start + Duration::from_millis(10_001));
+        acc.note_loop_end(6, 9, Some(300), render::LOOP_END_EXPIRY);
+        let report = acc.longrun_report(true).unwrap();
+        assert_eq!(report.early_event_loss, Some(2));
+        assert_eq!(report.steady_event_loss, Some(4));
+        assert_eq!(report.early_discovery_loss, Some(3));
+        assert_eq!(report.steady_discovery_loss, Some(6));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.code == crate::longrun::FINDING_LOOP_STALLED)
+        );
+        acc.note_terminal(100, 100);
+        acc.note_drain_at(start + Duration::from_secs(60));
+        acc.note_longrun_tick(2, Duration::from_secs(30));
+        assert_eq!(acc.longrun_report(true).unwrap(), report);
+    }
+
+    #[test]
+    fn capture_longrun_exact_stall_bound_is_clean() {
+        let mut acc = SchedulingAccumulator::default();
+        let start = Instant::now();
+        acc.note_longrun_first_loss(Some(0), 0, true);
+        acc.note_longrun_tick(1, Duration::from_millis(10));
+        acc.note_drain_at(start);
+        acc.note_drain_at(start + Duration::from_millis(10_000));
+        acc.note_loop_end(0, 0, Some(300), render::LOOP_END_EXPIRY);
+        assert!(acc.longrun_report(true).unwrap().is_clean());
+    }
+
+    #[test]
+    fn capture_longrun_unavailable_samples_never_become_clean_zeros() {
+        let mut acc = SchedulingAccumulator::default();
+        assert!(acc.longrun_report(true).is_none());
+        acc.note_longrun_first_loss(None, 0, true);
+        acc.note_longrun_tick(1, Duration::from_millis(10));
+        acc.note_loop_end(0, 0, Some(300), render::LOOP_END_EXPIRY);
+        assert!(acc.longrun_report(true).is_none());
+
+        let mut acc = SchedulingAccumulator::default();
+        acc.note_longrun_first_loss(Some(0), 0, true);
+        acc.note_longrun_tick(1, Duration::from_millis(10));
+        acc.note_loop_end(0, 0, Some(300), render::LOOP_END_EXPIRY);
+        assert!(acc.longrun_report(false).is_none());
+    }
+
+    #[test]
+    fn capture_longrun_metrics_has_no_event_stream_and_preserves_report_fields() {
+        let mut observed = SchedulingAccumulator::default();
+        observed.note_longrun_first_loss(None, 3, false);
+        observed.note_longrun_tick(1, Duration::from_millis(10));
+        observed.note_loop_end(0, 6, Some(300), render::LOOP_END_EXPIRY);
+        let report = observed.longrun_report(true).unwrap();
+        assert_eq!(report.early_event_loss, None);
+        assert_eq!(report.steady_event_loss, None);
+        assert_eq!(report.early_discovery_loss, Some(3));
+        assert_eq!(report.steady_discovery_loss, Some(3));
+        let mut control = SchedulingAccumulator::default();
+        control.note_loop_end(0, 6, Some(300), render::LOOP_END_EXPIRY);
+        assert_eq!(
+            serde_json::to_value(observed.snapshot(65536)).unwrap(),
+            serde_json::to_value(control.snapshot(65536)).unwrap()
+        );
     }
 
     /// T2/G-14: a fresh accumulator snapshots unreached phases as null with

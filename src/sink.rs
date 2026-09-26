@@ -153,6 +153,20 @@ pub(crate) fn stdout_sink() -> io::Result<SinkWriter<StdoutInner>> {
     stdout_sink_from(std::io::stdout().as_raw_fd())
 }
 
+/// Best-effort diagnostics: use existing descriptor-safe transports and
+/// immediate nonblocking writes. A full pipe/socket must not delay cleanup.
+/// Callers must not treat a missing diagnostic as a successful measurement.
+pub(crate) fn try_stderr_line(line: &str) -> io::Result<SinkDrops> {
+    try_diagnostic_line_on_fd(std::io::stderr().as_raw_fd(), line)
+}
+
+fn try_diagnostic_line_on_fd(fd: RawFd, line: &str) -> io::Result<SinkDrops> {
+    let mut sink = stdout_sink_from(fd)?;
+    writeln!(sink, "{line}")?;
+    sink.abort_wait()?;
+    Ok(sink.take_drops())
+}
+
 /// Builds the stdout sink for any writer fd (production passes fd 1),
 /// dispatching on file type so the shared description's status flags
 /// are never changed: pipes and terminals are reopened as private
@@ -418,6 +432,45 @@ mod tests {
     use std::io::Read as _;
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
+
+    #[test]
+    fn diagnostic_line_reaches_a_ready_reader_without_waiting() {
+        let (writer, mut reader) = pair();
+        reader
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let drops = try_diagnostic_line_on_fd(writer.as_raw_fd(), "diagnostic").unwrap();
+        let mut received = [0; 11];
+        reader.read_exact(&mut received).unwrap();
+        assert_eq!(&received, b"diagnostic\n");
+        assert_eq!(drops, SinkDrops::default());
+    }
+
+    #[test]
+    fn diagnostic_line_sheds_a_stalled_sink_without_changing_shared_flags() {
+        let (writer, _reader) = pair();
+        let mut filler = writer.try_clone().unwrap();
+        filler.set_nonblocking(true).unwrap();
+        while filler.write(&[7; 65536]).is_ok() {}
+        filler.set_nonblocking(false).unwrap();
+        let started = Instant::now();
+        let drops = try_diagnostic_line_on_fd(writer.as_raw_fd(), "diagnostic").unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(drops.dropped_bytes, 11);
+        assert_eq!(drops.timeouts, 1);
+        // SAFETY: querying flags on our still-owned socket.
+        assert_eq!(
+            unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
+            0
+        );
+    }
+
+    #[test]
+    fn diagnostic_line_returns_closed_sink_errors_without_panicking() {
+        let (writer, reader) = pair();
+        drop(reader);
+        assert!(try_diagnostic_line_on_fd(writer.as_raw_fd(), "diagnostic").is_err());
+    }
 
     fn pair() -> (UnixStream, UnixStream) {
         UnixStream::pair().unwrap()

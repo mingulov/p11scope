@@ -12,10 +12,10 @@ kernel objects. This closes Gate 2 of the 2026-09-26 product finish plan.
 
 | Profile / cell | Result | Test command wall time |
 | --- | --- | ---: |
-| Default Inventory, 576 endpoints | PASS: complete capture and cleanup | 47.04s |
-| Default Inventory, 1024 endpoints | PASS: complete capture and cleanup | 83.46s |
-| Default Inventory, 4097 endpoints | PASS: complete capture and cleanup | 335.53s |
-| Default Inventory, 6530 endpoints | PASS: complete capture and cleanup | 539.15s |
+| Default Inventory, 576 endpoints | PASS: full owned entry set and cleanup | 47.04s |
+| Default Inventory, 1024 endpoints | PASS: full owned entry set and cleanup | 83.46s |
+| Default Inventory, 4097 endpoints | PASS: full owned entry set and cleanup | 335.53s |
+| Default Inventory, 6530 endpoints | PASS: full owned entry set and cleanup | 539.15s |
 | Default Inventory, 8192 boundary | PASS: expected preflight FD refusal | 0.17s |
 | Default Detailed, hot slot / third return value | PASS | 3.28s |
 | Wide Detailed, hot slot / third return value | PASS | 3.58s |
@@ -25,6 +25,11 @@ All four snapshots and the unique terminal record are present. The 6530
 raw file is 2143581 bytes; its link evidence is 3622428 bytes. Both remain
 within the unchanged 16 MiB file limit. The 8192 case proves the specified
 refusal under soft FD limit 8192; it supplies no 8192-endpoint capture result.
+
+The Inventory terminal records deliberately retain `terminal_unsettled=true`.
+These cells prove their independently driven entry set and owned cleanup;
+they do not establish callback quiescence or exact entry/return accounting
+across a general stop boundary.
 
 The run uses single-probe links and the private owned fixture. Much of its
 wall time is retirement of those links. These totals are not throughput,
@@ -81,7 +86,7 @@ The checked-in register remains a template; the execution copy is
 ## Product boundary
 
 Public `--mode metrics` already avoids event-stream decoding, but retains
-the existing planner's finite physical-target slots: 512 by default or
+the existing planner's finite lifetime target slots: 512 by default or
 2112 in the explicit wide build. The compact Inventory path tested here
 still needs public command/coordinator integration. Its evidence means an
 entry was observed; it does not establish exact call counts or returns.

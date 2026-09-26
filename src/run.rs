@@ -10739,6 +10739,9 @@ mod tests {
         use crate::events::{EventDrain, ScriptedRecords};
         let (mut state, mut tracker, mut tracer) = trace_fixture();
         let reports = [metrics::SlotReport {
+            file_offset: 0,
+            target_object: None,
+            ordinals: Vec::new(),
             names: vec!["C_Initialize".to_string()],
             aliased: false,
             semantic_authorized: true,
@@ -10814,6 +10817,9 @@ mod tests {
     fn task_8d_terminal_trace_emission_orders_exact_count_before_evidence() {
         let (mut state, mut tracker, mut tracer) = trace_fixture();
         let reports = [metrics::SlotReport {
+            file_offset: 0,
+            target_object: None,
+            ordinals: Vec::new(),
             names: vec!["C_Initialize".to_string()],
             aliased: false,
             semantic_authorized: true,

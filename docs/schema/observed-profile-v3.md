@@ -168,6 +168,17 @@ trace evidence object. Historical documents predate them (see Migration).
   switch: `{name, effect, value}` objects, `value` `null` when unset.
   Absent means the narrow default.
 
+## Row identity and export linkage
+
+Every `functions[]` row carries `target` (`{object: {dev, ino, sha256} |
+null, file_offset}`, the exact function the row counts) and `ordinals` (sorted
+`{table_file_offset, ordinal}` positions reaching it). Several rows may read
+`["unknown"]`; `target` tells them apart, and `ordinals` discloses when several
+positions share one target. `discovery[].tables[]` adds the linkage value
+`exports` and the `exports_agreeing` count (see the v2 document's `tables[]`
+and `functions[]` rows). Export linkage presents standard names only: scan-found
+slots stay semantics-unverified and count-only whatever their linkage.
+
 ## Added `capture` fields
 
 `capture.scope` is exactly `pid`, `cgroup`, or `system`, naming which scope

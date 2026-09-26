@@ -366,7 +366,46 @@
         "multi_rebuild_gaps": {"type": "integer", "minimum": 0}
       }
     },
-    "functions": {"type": "array"}
+    "functions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["names", "aliased", "target", "ordinals", "module", "module_ambiguous", "module_unresolved", "calls"],
+        "properties": {
+          "names": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+          "target": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["object", "file_offset"],
+            "properties": {
+              "object": {
+                "type": ["object", "null"],
+                "additionalProperties": false,
+                "required": ["dev", "ino", "sha256"],
+                "properties": {
+                  "dev": {"type": "array", "items": {"type": "integer", "minimum": 0}},
+                  "ino": {"type": "integer", "minimum": 0},
+                  "sha256": {"type": ["string", "null"]}
+                }
+              },
+              "file_offset": {"type": "integer", "minimum": 0}
+            }
+          },
+          "ordinals": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["table_file_offset", "ordinal"],
+              "properties": {
+                "table_file_offset": {"type": ["integer", "null"], "minimum": 0},
+                "ordinal": {"type": "integer", "minimum": 0, "maximum": 103}
+              }
+            }
+          }
+        }
+      }
+    }
   },
   "allOf": [
     {

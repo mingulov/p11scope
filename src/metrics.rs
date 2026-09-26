@@ -41,6 +41,12 @@ pub struct SlotReport {
     pub buckets: [u64; LATENCY_BUCKETS],
     /// CK_RV → count.
     pub rv_counts: BTreeMap<u64, u64>,
+    /// The slot's exact target offset inside its pinned object.
+    pub file_offset: u64,
+    /// The pinned object that offset is in, when the plan recorded it.
+    pub target_object: Option<crate::plan::TargetObject>,
+    /// Every table ordinal that reached the target (`plan::SlotOrdinal`).
+    pub ordinals: Vec<crate::plan::SlotOrdinal>,
 }
 
 fn slot_report(
@@ -67,6 +73,9 @@ fn slot_report(
         max_ns: acc.max_ns,
         buckets: acc.buckets,
         rv_counts,
+        file_offset: slot.file_offset,
+        target_object: plan.target_object_of(slot),
+        ordinals: plan.ordinals_of(slot),
     }
 }
 
@@ -248,6 +257,157 @@ mod tests {
     fn empty_buckets_have_no_percentile() {
         let b = [0u64; LATENCY_BUCKETS];
         assert_eq!(percentile_ns(&b, 0.5), None);
+    }
+
+    /// Review answer (c) / F-2: unnamed rows are distinct, keyed by their
+    /// exact target, and carry every table ordinal reaching them. The live
+    /// table and trace name them by ordinal — never a bare `unknown` and
+    /// never the positional guess as a name.
+    #[test]
+    fn unnamed_rows_carry_their_target_and_ordinals() {
+        use crate::discovery::identity::ReconciledModule;
+        use crate::discovery::scan::{ScannedEntry, ScannedModule, ScannedTable, standard_ordinal};
+        use crate::process::{MountNamespaceId, ProcessViewId};
+        use p11scope_manifest::maps::{Device, ObjectKey};
+        use serde_json::json;
+
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: 42,
+        };
+        let entry = |name: &'static str, file_offset: u64| ScannedEntry {
+            name,
+            object: key,
+            object_path: "/opt/p11.so".into(),
+            file_offset,
+        };
+        let object = crate::plan::TEST_PINNED_OBJECT;
+        let plan = crate::plan::build_from_reconciled_modules(&[ReconciledModule {
+            object,
+            entry_objects: vec![vec![object; 3]],
+            exports: Default::default(),
+            scanned: ScannedModule {
+                view: ProcessViewId(0),
+                mount_namespace: MountNamespaceId {
+                    device: 1,
+                    inode: 1,
+                },
+                key,
+                path: "/opt/p11.so".into(),
+                decoder_abi: Some(p11scope_manifest::elf::ElfAbi::Lp64),
+                exports: vec!["C_GetFunctionList".into()],
+                tables: vec![ScannedTable {
+                    version: (2, 40),
+                    walk: "full",
+                    // A heuristic table: two ordinals share one stub.
+                    entries: vec![
+                        entry("C_Sign", 0x10),
+                        entry("C_SignUpdate", 0x10),
+                        entry("C_Verify", 0x20),
+                    ],
+                    null_entries: vec![],
+                    unpinned: vec![],
+                    address: 0x7000,
+                    file_offset: Some(0x100),
+                    live_return: false,
+                    manifest_supported: false,
+                }],
+                interfaces: vec![],
+            },
+        }]);
+        assert_eq!(plan.slots.len(), 2);
+        let reports: Vec<SlotReport> = plan
+            .slots
+            .iter()
+            .map(|slot| {
+                slot_report(
+                    &plan,
+                    slot,
+                    SlotStats {
+                        returned: 1,
+                        entered: 1,
+                        ..SlotStats::ZERO
+                    },
+                    BTreeMap::new(),
+                )
+            })
+            .collect();
+        let ordinal = |name| u64::from(standard_ordinal(name).expect("standard name"));
+        let evidence = crate::render::tests::evidence();
+        let document = crate::render::json(
+            &reports,
+            &evidence,
+            &crate::render::CaptureMeta {
+                started: "t0",
+                ended: "t1",
+                kernel: "6.8.0",
+                policy: crate::attach::CapturePolicy::Allowlisted,
+                scope: "pid",
+                ring_bytes: p11scope_ebpf_common::RING_BYTES,
+                drain_interval_ms: 1000,
+            },
+        );
+        let functions = document["functions"].as_array().unwrap();
+        let row = |offset: u64| {
+            functions
+                .iter()
+                .find(|function| function["target"]["file_offset"] == offset)
+                .unwrap_or_else(|| panic!("no row targets {offset:#x}: {functions:?}"))
+        };
+        let shared = row(0x10);
+        assert_eq!(
+            shared["names"],
+            json!(["unknown"]),
+            "never a positional name"
+        );
+        assert_eq!(
+            shared["ordinals"],
+            json!([
+                {"table_file_offset": 0x100, "ordinal": ordinal("C_Sign")},
+                {"table_file_offset": 0x100, "ordinal": ordinal("C_SignUpdate")},
+            ])
+        );
+        assert_eq!(
+            row(0x20)["ordinals"],
+            json!([{"table_file_offset": 0x100, "ordinal": ordinal("C_Verify")}])
+        );
+        assert_ne!(shared["target"], row(0x20)["target"], "rows are distinct");
+
+        let live = crate::render::live(
+            &reports,
+            &evidence,
+            std::time::Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            crate::attach::CapturePolicy::Allowlisted,
+        );
+        let shared_label = format!(
+            "unknown#{}|unknown#{}",
+            ordinal("C_Sign"),
+            ordinal("C_SignUpdate")
+        );
+        assert!(live.contains(&shared_label), "{live}");
+        assert!(
+            live.contains(&format!("unknown#{} ", ordinal("C_Verify"))),
+            "{live}"
+        );
+
+        let shared_slot = plan
+            .slots
+            .iter()
+            .find(|slot| slot.file_offset == 0x10)
+            .unwrap()
+            .index;
+        let mut state = crate::semantics::State::new(&plan);
+        let line = crate::trace::Tracer::new(&plan).on_event(
+            &p11scope_ebpf_common::Event {
+                slot: shared_slot,
+                pid_tgid: 7 << 32,
+                ..p11scope_ebpf_common::Event::default()
+            },
+            &mut state,
+        );
+        assert!(line.contains(&shared_label), "{line}");
     }
 
     #[test]

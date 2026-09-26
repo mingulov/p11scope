@@ -8198,6 +8198,9 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
     assert_eq!(evidence.completeness, "PARTIAL");
 
     let mut owned = p11scope::metrics::SlotReport {
+        file_offset: 0,
+        target_object: None,
+        ordinals: Vec::new(),
         names: vec!["C_Sign".into()],
         aliased: false,
         semantic_authorized: true,

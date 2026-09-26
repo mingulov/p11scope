@@ -990,10 +990,11 @@ impl Evidence {
 }
 
 fn label(r: &SlotReport) -> String {
+    let names = crate::plan::presented_label(&r.names, &r.ordinals, r.file_offset);
     if r.aliased {
-        format!("{} (aliased)", r.names.join("|"))
+        format!("{names} (aliased)")
     } else {
-        r.names.join("|")
+        names
     }
 }
 
@@ -1193,10 +1194,27 @@ struct ModuleRef {
     sha256: Option<String>,
 }
 
+/// A row's exact attach target: the stable key of `functions[]`.
+#[derive(Serialize)]
+struct TargetOut {
+    /// The pinned object, identified as `discovery[].objects[]` does;
+    /// `null` only when no pin identity was recorded for it.
+    object: Option<crate::plan::TargetObject>,
+    /// Offset of the probed function inside that object's file.
+    file_offset: u64,
+}
+
 #[derive(Serialize)]
 struct FunctionOut {
     names: Vec<String>,
     aliased: bool,
+    /// Which exact function this row counts — distinct for every row, named
+    /// or not (review answer (c)).
+    target: TargetOut,
+    /// Every table ordinal reaching `target`. A position, never a name: an
+    /// unnamed row stays `["unknown"]`; two or more entries disclose that
+    /// several ordinals share this target.
+    ordinals: Vec<crate::plan::SlotOrdinal>,
     /// `null` when two modules publish this target: the counts are real, the
     /// owner is not knowable, and guessing one would credit a provider's calls
     /// to another.
@@ -1253,6 +1271,11 @@ fn functions_out(reports: &[SlotReport], modules: &[DiscoveredModule]) -> Vec<Fu
         .map(|r| FunctionOut {
             names: r.names.clone(),
             aliased: r.aliased,
+            target: TargetOut {
+                object: r.target_object.clone(),
+                file_offset: r.file_offset,
+            },
+            ordinals: r.ordinals.clone(),
             module: r
                 .module
                 .and_then(|id| modules.iter().find(|module| module.id == id))
@@ -1767,6 +1790,9 @@ pub(crate) mod tests {
 
     fn report(name: &str, calls: u64, in_flight: u64, aliased: bool) -> SlotReport {
         SlotReport {
+            file_offset: 0,
+            target_object: None,
+            ordinals: Vec::new(),
             names: vec![name.into()],
             aliased,
             semantic_authorized: true,

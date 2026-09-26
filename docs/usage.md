@@ -128,7 +128,12 @@ explicitly `PARTIAL`, not a claim that the proxy layer was captured.
 
 The commands below begin with **passive diagnostics**. Without an accepted
 manifest, scanned function slots are count-only: use their aggregate counts,
-return values and latency. Missing mechanism or session evidence does not mean
+return values and latency. They still carry standard names when the provider's
+own `.dynsym` exports every standard name exactly where its function table
+points (`discovery[].tables[].linkage: "exports"`, as SoftHSM2 does); a table
+with no such evidence stays unnamed, and its rows read `unknown#<ordinal>` in
+the live table and trace (`functions[].ordinals` and `functions[].target` in
+JSON), never a guessed name. Missing mechanism or session evidence does not mean
 the application used none. For those semantics, use the separate
 [attested capture workflow](#attested-semantic-capture).
 

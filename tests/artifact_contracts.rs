@@ -7524,6 +7524,7 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
         matches!(
             line,
             "run: python3 -I scripts/prepare-dependencies.py"
+                | "run: python3 -I scripts/prepare-dependencies.py --check"
                 | ". scripts/prepared-dependency-tools.sh"
                 | r#""$P11SCOPE_PREPARED_PYTHON" -I scripts/check-prepared-dependencies.py \"#
         )

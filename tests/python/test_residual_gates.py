@@ -36,6 +36,35 @@ class ResidualGates(unittest.TestCase):
         self.assertIn("release-preview", text)
         self.assertIn("build-release.sh", text)
 
+    def test_dispatch_only_jobs_can_be_dispatched(self):
+        """F-28: jobs gated on workflow_dispatch need that trigger in `on:`;
+        without it they can never run."""
+        text = ci_text()
+        on_line = next(line for line in text.splitlines() if line.startswith("on:"))
+        on_block = on_line
+        if on_line == "on:":
+            on_block = text.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
+        self.assertIn("workflow_dispatch", on_block)
+        for job in ("privileged-e2e", "release-preview"):
+            block = text.split(f"\n  {job}:\n", 1)[1]
+            gate = block.splitlines()[0].strip()
+            self.assertTrue(
+                gate.startswith("if: ${{ github.event_name == 'workflow_dispatch'"),
+                f"{job}: {gate}",
+            )
+
+    def test_release_preview_passes_an_evidence_root(self):
+        """F-28: build-release.sh exits 2 without its one evidence-root
+        argument, whose parent must be a private directory."""
+        block = ci_text().split("\n  release-preview:\n", 1)[1]
+        block = block.split("\n  coverage:\n", 1)[0]
+        self.assertIn('mkdir -m 700 "$RUNNER_TEMP/release-evidence"', block)
+        self.assertIn(
+            '- run: scripts/build-release.sh "$RUNNER_TEMP/release-evidence/receipt"',
+            block,
+        )
+        self.assertNotIn("- run: scripts/build-release.sh\n", block)
+
     def test_advisory_gate_exists(self):
         """F-27: cargo audit/deny CI gate + deny.toml."""
         text = ci_text()

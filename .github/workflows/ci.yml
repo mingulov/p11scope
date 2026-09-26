@@ -1,5 +1,19 @@
 name: ci
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  # Manual runs from the Actions tab. The two dispatch-only jobs below run
+  # only when their input is selected; every other job runs as on push.
+  workflow_dispatch:
+    inputs:
+      release_preview:
+        description: Run release-preview (hosted; builds and verifies the release artifacts)
+        type: boolean
+        default: true
+      privileged_e2e:
+        description: Run privileged-e2e (waits for a [self-hosted, bpf] runner)
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
@@ -87,7 +101,16 @@ jobs:
       # vendored upstream lock (crates.io aya-obj) cannot build it. Both
       # standalone steps inject that patch and resolve unlocked; the
       # shipped combination stays locked by the root workspace steps.
-      - run: cargo +1.88 fetch --config 'patch.crates-io.aya-obj.path="third-party/src/aya-obj-0.3.0-p2"' --manifest-path third-party/src/aya-0.14.0-p2/Cargo.toml
+      # Resolving unlocked rewrites the tree's vendored Cargo.lock, which is
+      # part of the recipe-pinned tree digest that the dependency check below
+      # and every later scripts/cargo.sh preparation verify, so each unlocked
+      # step restores the recipe's lock before it ends.
+      - name: Fetch the standalone aya tree
+        shell: bash
+        run: |
+          cp -p third-party/src/aya-0.14.0-p2/Cargo.lock "$RUNNER_TEMP/aya-0.14.0-p2.Cargo.lock"
+          cargo +1.88 fetch --config 'patch.crates-io.aya-obj.path="third-party/src/aya-obj-0.3.0-p2"' --manifest-path third-party/src/aya-0.14.0-p2/Cargo.toml
+          cp -p "$RUNNER_TEMP/aya-0.14.0-p2.Cargo.lock" third-party/src/aya-0.14.0-p2/Cargo.lock
       - run: cargo +1.88 fetch --locked --manifest-path third-party/src/aya-obj-0.3.0-p2/Cargo.toml
       - name: Verify prepared dependency selection
         shell: bash
@@ -108,9 +131,17 @@ jobs:
       - name: Aya dependency unit tests
         env:
           CARGO_PROFILE_TEST_OVERFLOW_CHECKS: "true"
-        run: cargo +1.88 test --offline --config 'patch.crates-io.aya-obj.path="third-party/src/aya-obj-0.3.0-p2"' --manifest-path third-party/src/aya-0.14.0-p2/Cargo.toml --target-dir target/aya-tests --lib
+        shell: bash
+        run: |
+          cargo +1.88 test --offline --config 'patch.crates-io.aya-obj.path="third-party/src/aya-obj-0.3.0-p2"' --manifest-path third-party/src/aya-0.14.0-p2/Cargo.toml --target-dir target/aya-tests --lib
+          cp -p "$RUNNER_TEMP/aya-0.14.0-p2.Cargo.lock" third-party/src/aya-0.14.0-p2/Cargo.lock
       - run: cargo +1.88 test --locked --offline --manifest-path third-party/src/aya-obj-0.3.0-p2/Cargo.toml --target-dir target/aya-obj-tests --lib
+      - name: Prove the prepared dependency trees are unchanged
+        run: python3 -I scripts/prepare-dependencies.py --check
       - run: cargo +1.88 clippy --locked --offline --workspace --all-targets -- -D warnings
+      # The wide Detailed profile changes the embedded BPF object and the slot
+      # bound; lint it so a default-only change cannot break the other profile.
+      - run: cargo +1.88 clippy --locked --offline -p p11scope --all-targets --features wide-detailed-2112 -- -D warnings
       # libtest exits 0 when a filter matches nothing, so this step proves a test
       # actually ran rather than trusting the source to keep naming one. A rename,
       # an #[ignore], a #[cfg] that excludes it, or a deleted #[test] all empty the
@@ -254,7 +285,7 @@ jobs:
   # the job waits rather than going green. Real and runnable: dispatch it
   # from the Actions tab once a [self-hosted, bpf] runner exists.
   privileged-e2e:
-    if: ${{ github.event_name == 'workflow_dispatch' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.privileged_e2e }}
     runs-on: [self-hosted, bpf]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -276,7 +307,7 @@ jobs:
   # release ran. Hosted runners suffice (passwordless sudo covers the
   # receipt steps); no special labels needed.
   release-preview:
-    if: ${{ github.event_name == 'workflow_dispatch' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.release_preview }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -294,7 +325,18 @@ jobs:
       - run: docker build -f deploy/Dockerfile.holder -t p11scope-holder:preview .
       - run: docker run --rm -i hadolint/hadolint < deploy/Dockerfile.observer
       - run: docker run --rm -i hadolint/hadolint < deploy/Dockerfile.holder
-      - run: scripts/build-release.sh
+      # The release driver takes one absent evidence root whose parent is a
+      # private (0700) directory outside the checkout; the receipt, logs and
+      # dist/ binaries land under it and are kept as a run artifact.
+      - run: mkdir -m 700 "$RUNNER_TEMP/release-evidence"
+      - run: scripts/build-release.sh "$RUNNER_TEMP/release-evidence/receipt"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: release-preview-receipt
+          path: ${{ runner.temp }}/release-evidence/receipt
+          if-no-files-found: warn
+          retention-days: 30
       - uses: anchore/sbom-action@d8a2c0130026bf585de5c176ab8f7ce62d75bf04 # v0.20.7
         with:
           image: p11scope-observer:preview

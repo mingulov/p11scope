@@ -1707,7 +1707,7 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
                 .map_err(|error| anyhow!("--pid {p}: {error}"))?;
             (Scope::Pid(*p), Some(view))
         }
-        ScopeArg::Cgroup(c) => (scope::cgroup(c)?, None),
+        ScopeArg::Cgroup(c) => (scope::capture_cgroup(c)?, None),
         // No named view and no cgroup path: discovery sweeps /proc itself.
         ScopeArg::System => (Scope::System, None),
     };

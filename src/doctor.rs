@@ -256,7 +256,7 @@ fn attach_preflight_checks(pid: Option<u32>, cgroup: Option<&Path>) -> Vec<Check
                 }
             });
             let cgroup_scope = cgroup.is_none_or(|path| {
-                crate::scope::cgroup(path)
+                crate::scope::capture_cgroup(path)
                     .and_then(|scope| crate::attach::Session::preflight(&scope))
                     .is_ok_and(|fact| fact.scope)
             });
@@ -1061,6 +1061,14 @@ fn cgroup_check(cgroup: &Path) -> Check {
             status: Status::Fail(
                 "cgroup v2 required: no unified hierarchy for --cgroup attach".to_string(),
             ),
+        };
+    }
+    // The same acceptance rule a capture applies (M-3), so doctor and
+    // capture never disagree about a `--cgroup` path.
+    if let Err(error) = crate::scope::capture_cgroup(cgroup) {
+        return Check {
+            name: "cgroup path".to_string(),
+            status: Status::Fail(format!("{error:#}")),
         };
     }
     let status = match std::fs::metadata(cgroup) {

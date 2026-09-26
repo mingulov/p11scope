@@ -797,3 +797,42 @@ fn high2_inspect_of_an_unreadable_target_exits_1_with_the_fix() {
         );
     }
 }
+
+/// M-3: `--cgroup` must name a cgroup v2 directory. A plain directory (a
+/// typo, or `/`) used to pass scope validation, so a privileged capture ran
+/// its full duration against an inode no task ever matches and exited 0
+/// with an empty report — or, for `/`, walked the whole filesystem. It is
+/// refused up front now, by capture and doctor alike, whatever the
+/// privilege. `/sys/fs/cgroup` itself is cgroup v2 and still passes scope
+/// validation (whatever the capture then needs).
+#[test]
+fn m3_cgroup_scope_must_be_a_cgroup_v2_directory() {
+    let plain = tempfile::tempdir().unwrap();
+    let plain = plain.path().to_str().unwrap().to_string();
+    for path in [plain.as_str(), "/"] {
+        let refused = run(&["profile", "--cgroup", path, "--duration", "1"]);
+        assert_eq!(refused.code, Some(1), "{path}: {}", refused.stderr);
+        assert!(
+            refused.stderr.contains("not a cgroup v2 directory"),
+            "{path}: {}",
+            refused.stderr
+        );
+        let doctor = run(&["doctor", "--cgroup", path]);
+        assert!(
+            doctor
+                .stdout
+                .lines()
+                .any(|line| line.starts_with("cgroup path")
+                    && line.contains("FAIL")
+                    && line.contains("not a cgroup v2 directory")),
+            "{path}: {}",
+            doctor.stdout
+        );
+    }
+    let real = run(&["profile", "--cgroup", "/sys/fs/cgroup", "--duration", "1"]);
+    assert!(
+        !real.stderr.contains("not a cgroup v2 directory"),
+        "{}",
+        real.stderr
+    );
+}

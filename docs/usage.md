@@ -331,7 +331,10 @@ Both `profile` and `trace` require exactly one of `--pid`, `--cgroup`, or
 inputs. `--cgroup` matches that
 cgroup and every descendant beneath it
 (kernel ≥5.15 due to attach cookies), so pointing it at a container's or pod's
-directory reaches the workload's actual nested cgroup. `--system` requests
+directory reaches the workload's actual nested cgroup. The path must be a
+cgroup v2 directory (under `/sys/fs/cgroup`): any other directory, `/`
+included, is refused with `not a cgroup v2 directory` before discovery, by
+`doctor --cgroup` as well. `--system` requests
 whole-machine capture with no cgroup path: the BPF scope gate admits
 all tasks subject to the owner-health and config checks, and userspace
 discovery sweeps `/proc` under the same `--max-scan-pids` cap (default 256,

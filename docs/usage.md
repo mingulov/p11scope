@@ -351,7 +351,11 @@ seconds or `30s`/`5m`/`1h`) requests shutdown after the given interval. Probe
 teardown and final reporting follow; with many attached functions, this can
 add seconds, and calls may still be observed while probes are being detached.
 Ctrl-C, SIGTERM, or SIGHUP ends a capture cleanly (final frame printed, `-o`
-file written) instead of aborting it. Under `run`, a child the pause holds
+file written) instead of aborting it. A stop that arrives during `profile` or
+`trace` startup, before anything is attached (discovery can take seconds),
+is honoured once discovery returns: exit 1 with `interrupted by SIGINT during
+startup`, no report, no temporary file left behind, and a previous trace
+`-o` file left as it was. Under `run`, a child the pause holds
 stopped is resumed before the observer signals it or hands it back. The stop
 signal is forwarded to the child's process group; a child still alive gets
 SIGTERM 5 s later and SIGKILL 5 s after that, so settling it takes at most

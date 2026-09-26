@@ -1729,18 +1729,25 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
         flag: "--allow-uretprobe-on-confined-target",
         reason,
     });
+    // M-1: own Ctrl-C/SIGTERM/SIGHUP before anything exists that a default
+    // disposition would strand — the `-o` temp file below, a created trace
+    // file — and before discovery, which can take seconds. A stop that lands
+    // before the attach is honoured just after discovery (which cannot be
+    // interrupted part-way), by returning an error that drops the sink.
+    let stop = install_stop_flag()?;
     // Before the discovery scan: a bad `-o` path must fail fast (F-Scale-6)
     // instead of after a scan — and still before any probe is on. The profile
     // sink stays an atomically-published temp file; opening it early only
     // moves the trust failure earlier.
     let out = OutputSink::open(kind, a.out.as_deref())?;
-    let mut engine = Engine::discover(a, &scope, named_view)?;
+    let discovered = Engine::discover(a, &scope, named_view);
+    refuse_if_interrupted_before_attach(&stop)?;
+    let mut engine = discovered?;
     // Zero modules is not an error (spec §4.10): the capture still runs, still
     // writes its report, and says here how to find out why it found nothing.
     if engine.plan().modules.is_empty() {
         eprintln!("{}", no_modules_hint(&a.scope));
     }
-    let stop = install_stop_flag()?;
     let mut session = engine
         .start_session(policy, a.ring_bytes, a.attach_backend)
         .context("starting attach session")?;
@@ -1773,6 +1780,23 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// A stop signal observed before the capture attached ends startup with an
+/// error naming it (M-1): nothing was captured, so there is no report to
+/// write, and returning drops the `-o` sink, which removes its temp file (or
+/// a trace file it created) and leaves a previous file untouched. Once the
+/// session is attached, the capture loop's own stop path takes over and
+/// publishes the report as usual.
+fn refuse_if_interrupted_before_attach(stop: &SignalState) -> Result<()> {
+    match stop.first_signal() {
+        None => Ok(()),
+        Some(signal) => Err(anyhow!(
+            "interrupted by {} during startup, before anything was attached: nothing was \
+             captured and no report was written",
+            stop_signal_name(signal)
+        )),
+    }
 }
 
 /// The no-duration notice (SYSPLAN residual F-17): "until interrupted" is
@@ -11431,6 +11455,49 @@ mod tests {
             "2024-01-01T00:00:00Z"
         );
         assert_eq!(fmt_rfc3339(UNIX_EPOCH), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn an_interruption_before_attach_is_refused_by_name() {
+        let stop = SignalState::new();
+        assert!(refuse_if_interrupted_before_attach(&stop).is_ok());
+        stop.observe(libc::SIGTERM);
+        let error = refuse_if_interrupted_before_attach(&stop).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("interrupted by SIGTERM"), "{text}");
+        assert!(text.contains("no report was written"), "{text}");
+    }
+
+    /// M-1: `capture` must own Ctrl-C/SIGTERM/SIGHUP before it creates the
+    /// `-o` temp file and starts discovery (a default disposition there kills
+    /// the process and leaves `.p11scope.<pid>.*.tmp` behind), and must look
+    /// at the flag again before attaching.
+    #[test]
+    fn capture_owns_stop_signals_before_output_and_discovery() {
+        let source = include_str!("run.rs");
+        let body = source
+            .split_once("pub fn capture(a: &CaptureArgs)")
+            .unwrap()
+            .1
+            .split_once("\nfn no_duration_notice")
+            .unwrap()
+            .0;
+        let at = |needle: &str| {
+            assert_eq!(body.matches(needle).count(), 1, "{needle}");
+            body.find(needle).unwrap()
+        };
+        let install = at("install_stop_flag()");
+        let open = at("OutputSink::open(");
+        let discover = at("Engine::discover(");
+        let refuse = at("refuse_if_interrupted_before_attach(&stop)");
+        let attach = at("start_session(");
+        assert!(install < open, "stop flag after the output sink opened");
+        assert!(
+            open < discover,
+            "output sink must stay a fail-fast preflight"
+        );
+        assert!(discover < refuse, "no interruption check after discovery");
+        assert!(refuse < attach, "interruption checked only after attach");
     }
 
     /// Exercises the interrupt path directly, with no real signal sent:

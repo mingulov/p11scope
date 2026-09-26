@@ -77,9 +77,9 @@ controls reproduced the defect in the detector and capture integration,
 while the measured-zero control already passed. The repair now passes the
 18 affected default/wide controls, the complete default workspace suite
 (1618 library tests, 45 privileged ignored; 139 artifact tests and the other
-workspace suites), formatting and strict Clippy in both profiles. A fresh
-live metrics comparison is still required; the original native output is
-preserved unchanged.
+workspace suites), formatting and strict Clippy in both profiles. The
+focused live comparison below verifies the repair; the original native
+output is preserved unchanged.
 
 The first full attempt exposed a separate timing-sensitive harness defect:
 a deadline expiring inside process-identity checks was sanitized into a
@@ -88,6 +88,27 @@ failure. `f066e48` preserves a typed timeout while keeping arbitrary error
 text private; the original negative readiness cases and the complete fresh
 workspace run then passed. Neither timeout budgets nor acceptance
 assertions were relaxed. The failed full run remains part of the evidence.
+
+## Focused metrics repair comparison
+
+Fresh source `b056222885fbcf768300c36c9ac56c959847c994`, tree
+`45c79c885a50167d102cfaca6129ddd9ff683ca0`, default release observer and
+discover, same kernel and predeclared 100-call paced workload. The new
+clean-source build and all 29 frozen artifacts were checked before and
+after execution.
+
+- Exact owned counts: 106/106, with valid observer phase timestamps and
+  physical/generation attribution.
+- One delivered diagnostic: 463 completed ticks, maximum service tick
+  1ms, `max gap n/a`, event-loss samples explicitly unavailable, discovery
+  early/steady losses 0/0.
+- Four supervisors settled; typed map/program/link census unchanged.
+- Capture remains `PARTIAL / concrete_gap`; `drain_proven=false`.
+
+This closes the missing-gap diagnostic defect. A short gated PID comparison
+does not qualify arbitrary first use, system scale, terminal quiescence or
+performance. Only the affected metrics case was repeated; the four earlier
+mode comparisons retain their original source pin and outputs.
 
 ## Custody and remaining work
 
@@ -112,9 +133,14 @@ Workspace evidence root:
 - `live/pid-profile-burst-lease2/`, `live/pid-metrics-small/` and
   `live/pid-trace-small/`: the three subsequent comparisons, each with its
   own 55-file sealed bundle and original raw output.
+- `pins-gap-b056222/`: 29 fresh release/source/controller pins for the
+  diagnostic repair. `live/pid-metrics-small-b056222/` contains its sealed
+  55-file raw/analysis bundle, 10679876 bytes.
+- `gap-verification-b056222/`: 22 sealed ordinary verification files,
+  including the failed full run, deterministic timeout regression,
+  successful complete rerun and explicit working-tree-to-commit lineage.
 
-The missing-gap diagnostic repair still needs its focused live check. The
-five gated/ungated first-use classes, seven transition facts, safe
+The five gated/ungated first-use classes, seven transition facts, safe
 pre-execution comparison, run-mode overflow repair and supported-boundary
 G-14 green result also remain open. See the [original requirements](t2-first-use-requirements.md)
 and [resource pilot](system-resource-pilot.md).

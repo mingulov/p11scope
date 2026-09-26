@@ -2,6 +2,8 @@
 # System first use: evidence and open feasibility work (T2)
 
 The active requirements are the [six original T2 boxes](t2-first-use-requirements.md).
+The [resource and latency pilot](system-resource-pilot.md) defines the
+preliminary measurement protocol for T7/T12; its axes are not executed results.
 Cold CLI startup is supporting evidence; it does not complete the gated /
 ungated provider-first-use matrix. The earlier ordinary evidence below
 was produced unprivileged on the dev host (`7.0.0-31-generic`) at T2 BASE

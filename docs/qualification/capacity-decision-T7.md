@@ -254,6 +254,56 @@ uncertainty above is unchanged and strictly Detailed-dense (L-T7-9):
 Inventory USAGE is a plain 8N-byte array (52,240 B at 6530). No live
 limit changed; no native/map-lifecycle source changed.
 
+## Fix round 2f: evidence bounds and static sweep cap audit
+
+At `1a8a2b5`, the N=4097 and N=6530 tests both exited 101 because every
+evidence file shared a 20,000-row cap. The passing N=576/1024 runs establish
+the normal raw schedule: four N-cell USAGE dumps, N per-call transitions,
+four phase rows and one terminal row (`5N + 5`). N=4097 reached the terminal
+phase; N=6530 reached the repeated-call dump. Their earlier exact positives
+are useful evidence, but neither failed run qualifies the complete cell.
+Keep these original results in `T7-live-host-r2`; rerun all seven cells at
+new immutable pins before accepting the repair.
+
+The ordinary regressions exercise the real evidence constructor and files
+for N=4097/6530/8192, including their final records and newline. The old
+writer fails all three at row 20,000. The repaired writer budgets each
+Inventory file separately with checked arithmetic:
+
+| File | Expected rows at N=8192 | Allowed rows | Other bound |
+|---|---:|---:|---|
+| Raw | 40,965 (`5N+5`) | `8N+64` = 65,600 | 16 MiB |
+| Caller ledger | at most 8,202 for this schedule | `2N+64` = 16,448 | 16 MiB |
+| Link receipts | 8,194 (`N+2`) | `2N+8` = 16,392 | 16 MiB |
+| Rendered | 0 currently | `N+64` = 8,256 | 16 MiB |
+
+The limit counts evidence records, not supported endpoints. Ten times the
+normal workload is still refused; a rejected write preserves existing
+bytes. A separate byte-bound test writes exactly 16 MiB and rejects the
+next byte. Detailed and identity cases retain their previous row bound.
+No fixture workload, map size, output schema or capture claim changes.
+
+The r2 cap audit uses complete small cells where required; do not extrapolate
+complete raw-file size from the truncated large files:
+
+| Bound | Observed basis and projection | Disposition |
+|---|---|---|
+| 16 MiB per file | Complete N=1024 raw = 332,107 B; linear projection to 8192 ~2.66 MB. N=6530 links = 3,622,428 B / 6532 rows; projection to 8194 links ~4.55 MB. N=6530 ledger = 951,281 B / 6540 rows; projection ~1.20 MB. | Keep; fresh complete large files must confirm these estimates. |
+| 8192 owned fixture endpoints | N=6530 ELF = 1,096,104 B, offsets = 274,261 B; N=8192 ordinary fixture regression succeeds with distinct offsets. | Keep; 8193 remains refused. |
+| 64-FD reserve | Initial observed open FDs = 9; pre-detach 618/1066/4139 for 578/1026/4099 links, at most 40 above the link count. N=6530 post-attach = 6569 for 6532 links. | Keep policy reserve; measure actual FDs again. The reserve is a budget, not a proof of exact physical need. |
+| N=8192 boundary | 8194 links alone exceed the 8188 available FDs observed under soft limit 8192; links + reserve = 8258. | Explicit preflight refusal remains the expected cell, never a capture pass. |
+| Retirement deadline | N=576: 39,236 ms / 578 links; N=1024: 72,265 ms / 1026 links (~70.4 ms/link). N=6530 projects ~460 s, beyond the old fixed 420 s. | Scale to `max(420 s, 150 ms * (N+2))`: 614.85/979.8/1229.1 s at 4097/6530/8192. This bounds serial owned work at over twice the measured cost; it does not certify acceptable product stop latency. |
+| Snapshot / ID-release windows | Each snapshot permits N cells within 60 s. Small-cell release took 49/51 ms. | Keep 60 s each; retain actual timings and failures. |
+| Outer cell deadline | Original runner bounds each whole test to 1800 s. Largest retirement budget is ~1229 s, leaving ~571 s for setup, snapshots and release. | Keep; fail with preserved partial evidence on timeout. No retry-until-green. |
+
+The fixed retirement deadline is changed on this measured per-link basis;
+no sleep or lifecycle synchronization is relaxed. Responsive public stop,
+cleanup cost and supported performance envelopes remain T5/T12 obligations.
+The rerun must preserve typed `(map|prog|link, id)` census entries, reject
+enumeration failures, prove exact selectors and pins, and finish with
+terminal records and owned cleanup. Ordinary writer passes alone cannot
+close the live gate.
+
 ## Open uncertainties (for the consensus)
 
 1. The 6530 dense byte envelope (~118 MiB payload at 64 possible CPUs,

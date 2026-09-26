@@ -1373,17 +1373,48 @@ fn task4_digest_hex(digest: impl AsRef<[u8]>) -> String {
 }
 
 const TASK4_FILE_LIMIT: usize = 16 * 1024 * 1024;
-const TASK4_ROW_LIMIT: usize = 20_000;
+const TASK4_LEGACY_ROW_LIMIT: usize = 20_000;
+
+fn task4_row_limit(case: &str, name: &str, endpoints: usize) -> Result<usize> {
+    if case != "inventory" {
+        return Ok(TASK4_LEGACY_ROW_LIMIT);
+    }
+    // A sweep emits four N-cell USAGE dumps, N per-call transitions and
+    // five phase/terminal rows: 5N + 5 raw rows. Keep bounded headroom for
+    // diagnostics without letting a loop produce ten times the owned work.
+    // Ledger: N calls plus repeats/barriers. Links: N entries + two owners.
+    // Rendered output is currently empty; allow one line per endpoint.
+    let (per_endpoint, fixed) = match name {
+        "raw" => (8usize, 64),
+        "ledger" => (2, 64),
+        "links" => (2, 8),
+        "rendered" => (1, 64),
+        _ => bail!("unrecognized Inventory evidence file: {name}"),
+    };
+    endpoints
+        .checked_mul(per_endpoint)
+        .and_then(|rows| rows.checked_add(fixed))
+        .context("Task 4 evidence row budget overflow")
+}
 
 struct Task4Rows {
     path: PathBuf,
     file: std::fs::File,
     rows: usize,
     bytes: usize,
+    row_limit: usize,
 }
 
 impl Task4Rows {
-    fn create(directory: &Path, index: usize, name: &str, suffix: &str) -> Result<Self> {
+    fn create(
+        directory: &Path,
+        index: usize,
+        name: &str,
+        suffix: &str,
+        case: &str,
+        endpoints: usize,
+    ) -> Result<Self> {
+        let row_limit = task4_row_limit(case, name, endpoints)?;
         let path = directory.join(format!("case-{index:02}-{name}.{suffix}"));
         let file = std::fs::OpenOptions::new()
             .write(true)
@@ -1394,6 +1425,7 @@ impl Task4Rows {
             file,
             rows: 0,
             bytes: 0,
+            row_limit,
         })
     }
 
@@ -1406,8 +1438,10 @@ impl Task4Rows {
             self.path.display()
         );
         ensure!(
-            self.rows < TASK4_ROW_LIMIT,
-            "Task 4 evidence row limit exceeded"
+            self.rows < self.row_limit,
+            "Task 4 evidence row limit exceeded ({}): {}",
+            self.row_limit,
+            self.path.display()
         );
         self.file.write_all(bytes)?;
         self.bytes += bytes.len();
@@ -1483,16 +1517,26 @@ impl Task4Evidence {
     ) -> Result<Self> {
         ensure!(index < 100);
         let offsets = std::fs::read(directory.join(format!("offsets-{index:02}.json")))?;
+        let rows = |name, suffix| {
+            Task4Rows::create(
+                &directory,
+                index,
+                name,
+                suffix,
+                case,
+                fixture.plan.slots.len(),
+            )
+        };
         Ok(Self {
-            ledger: Task4Rows::create(&directory, index, "ledger", "jsonl")?,
-            raw: Task4Rows::create(&directory, index, "raw", "jsonl")?,
+            ledger: rows("ledger", "jsonl")?,
+            raw: rows("raw", "jsonl")?,
             links: matches!(case, "inventory" | "inventory-identity")
-                .then(|| Task4Rows::create(&directory, index, "links", "jsonl"))
+                .then(|| rows("links", "jsonl"))
                 .transpose()?,
             registration: (control.is_some() && matches!(case, "detailed" | "detailed-identity"))
-                .then(|| Task4Rows::create(&directory, index, "registration", "jsonl"))
+                .then(|| rows("registration", "jsonl"))
                 .transpose()?,
-            rendered: Task4Rows::create(&directory, index, "rendered", "txt")?,
+            rendered: rows("rendered", "txt")?,
             directory,
             index,
             case,
@@ -5351,7 +5395,17 @@ fn inventory_sweep_gate(n: u32, cell: Option<&'static str>) -> Result<()> {
     evidence.fd_sample("pre_detach")?;
     let stop_start = Instant::now();
     let mut retiring = active.begin_stop();
-    finish_owned_retirement_inner(&mut retiring, true, Duration::from_secs(420))?;
+    // r2 measured 39.236 s / 578 links and 72.265 s / 1026 links.
+    // Serial detach therefore projects beyond the old 420 s budget at
+    // N=6530. Budget bounded owned work at >2x the measured per-link cost;
+    // this is a harness deadline, not a product stop-latency acceptance.
+    let stop_budget = Duration::from_millis((u64::from(n) + 2) * 150).max(Duration::from_secs(420));
+    eprintln!(
+        "TASK4_RETIRE_BUDGET links={} budget_ms={}",
+        n + 2,
+        stop_budget.as_millis()
+    );
+    finish_owned_retirement_inner(&mut retiring, true, stop_budget)?;
     let stop_ms = stop_start.elapsed().as_millis();
     let mut retired = retiring
         .try_finish()
@@ -6772,6 +6826,135 @@ fn privileged_t7_detailed_hot_slot_third_rv_lp64() -> Result<()> {
     detached?;
     ensure!(clean_detach, "Detailed detach retained failures");
     eprintln!("T7_HOT_RV hot_slot={HOT} rvs=0,5,7 old_cells=1..{N} exact=true");
+    Ok(())
+}
+
+fn task4_writer_evidence(endpoints: u32) -> Result<(tempfile::TempDir, Task4Evidence)> {
+    let directory = tempfile::tempdir()?;
+    let fixture = OwnedFixture::build_n(false, endpoints)?;
+    let offsets: Vec<_> = fixture
+        .plan
+        .slots
+        .iter()
+        .map(|slot| slot.file_offset)
+        .collect();
+    std::fs::write(
+        directory.path().join("offsets-00.json"),
+        serde_json::to_vec(&offsets)?,
+    )?;
+    let evidence = Task4Evidence::new_control_at(
+        "inventory",
+        if cfg!(feature = "wide-detailed-2112") {
+            "wide-detailed-2112"
+        } else {
+            "default"
+        },
+        &fixture,
+        crate::EBPF_INVENTORY_OBJECT,
+        None,
+        directory.path().to_owned(),
+        0,
+    )?;
+    Ok((directory, evidence))
+}
+
+fn task4_assert_complete_writer_sweep(
+    endpoints: u32,
+    raw_rows: usize,
+    ledger_rows: usize,
+    link_rows: usize,
+) -> Result<()> {
+    let (_directory, mut evidence) = task4_writer_evidence(endpoints)?;
+    for (writer, rows) in [
+        (&mut evidence.raw, raw_rows),
+        (&mut evidence.ledger, ledger_rows),
+        (evidence.links.as_mut().context("links writer")?, link_rows),
+    ] {
+        for position in 0..rows {
+            writer.json(serde_json::json!({
+                "kind": if position + 1 == rows { "terminal" } else { "sample" },
+                "position": position,
+            }))?;
+        }
+        let bytes = writer.contents()?;
+        let lines: Vec<_> = bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|row| !row.is_empty())
+            .collect();
+        ensure!(lines.len() == rows, "writer omitted an evidence row");
+        let terminal: serde_json::Value = serde_json::from_slice(lines[rows - 1])?;
+        ensure!(terminal["kind"] == "terminal" && terminal["position"] == rows - 1);
+        ensure!(
+            bytes.last() == Some(&b'\n'),
+            "writer lost the final delimiter"
+        );
+    }
+    Ok(())
+}
+
+// Counts are hand-derived from the live sweep's four map snapshots, per-entry
+// transition rows and phase/terminal records, not from the writer's budget.
+// This catches a fixed cap that truncates a valid sweep before its terminal row.
+#[test]
+fn task4_evidence_preserves_n4097_sweep() -> Result<()> {
+    task4_assert_complete_writer_sweep(4_097, 20_490, 4_107, 4_099)
+}
+
+#[test]
+fn task4_evidence_preserves_n6530_sweep() -> Result<()> {
+    task4_assert_complete_writer_sweep(6_530, 32_655, 6_540, 6_532)
+}
+
+#[test]
+fn task4_evidence_preserves_n8192_sweep() -> Result<()> {
+    task4_assert_complete_writer_sweep(8_192, 40_965, 8_202, 8_194)
+}
+
+#[test]
+fn task4_evidence_refuses_runaway_rows_without_writing() -> Result<()> {
+    let (_directory, mut evidence) = task4_writer_evidence(8_192)?;
+    for (writer, runaway_rows) in [
+        (&mut evidence.raw, 409_650),
+        (&mut evidence.ledger, 82_020),
+        (evidence.links.as_mut().context("links writer")?, 81_940),
+    ] {
+        let mut refused = false;
+        for written in 0..runaway_rows {
+            if let Err(error) = writer.write(b"{}\n") {
+                ensure!(
+                    format!("{error:#}").contains("row limit"),
+                    "wrong refusal: {error:#}"
+                );
+                let before = writer.contents()?;
+                ensure!(before.len() == written * 3, "failed row was partly written");
+                ensure!(writer.write(b"unexpected\n").is_err());
+                ensure!(
+                    writer.contents()? == before,
+                    "refusal changed existing evidence"
+                );
+                refused = true;
+                break;
+            }
+        }
+        ensure!(refused, "writer admitted a tenfold runaway");
+    }
+    Ok(())
+}
+
+#[test]
+fn task4_evidence_byte_limit_preserves_existing_bytes() -> Result<()> {
+    let (_directory, mut evidence) = task4_writer_evidence(1)?;
+    let at_limit = vec![b'x'; 16 * 1024 * 1024];
+    evidence.raw.write(&at_limit)?;
+    let error = evidence
+        .raw
+        .write(b"x")
+        .expect_err("oversize file admitted");
+    ensure!(format!("{error:#}").contains("16 MiB"));
+    ensure!(
+        evidence.raw.contents()? == at_limit,
+        "failed write changed evidence"
+    );
     Ok(())
 }
 

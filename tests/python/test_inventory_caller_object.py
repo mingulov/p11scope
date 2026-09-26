@@ -298,6 +298,17 @@ class EntryMachine:
                 else:
                     value = r(src) if cls == 3 else immediate
                     self.write(r(dst) + offset, (value & ((1 << (8 * size)) - 1)).to_bytes(size, "little"))
+            elif op == 0xdb and immediate == 0x00:
+                # Non-fetch 64-bit atomic ADD: only a per-CPU loss counter may
+                # take it. The global USAGE cell changes solely through its
+                # exact zero-to-one CAS; every fetch form stays refused.
+                pointer = r(dst) + offset
+                name = self.segment(pointer, 8)[0]
+                require(name in {"EVIDENCE", "USAGE_EVIDENCE", "CALLER_EVIDENCE"},
+                        "caller entry atomic add outside a per-CPU counter cell")
+                old = int.from_bytes(self.read(pointer, 8), "little")
+                self.write(pointer, struct.pack("<Q", (old + r(src)) & MASK))
+                self.trace.append(("counter-add", self.pc, name))
             elif op == 0xdb and immediate == 0xf1:
                 pointer, expected, replacement = r(dst) + offset, r(0), r(src)
                 old = int.from_bytes(self.read(pointer, 8), "little")

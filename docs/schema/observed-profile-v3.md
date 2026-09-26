@@ -11,8 +11,10 @@ v2, and the historical v2-metrics document is not accepted as a v3
 profile. All profile fields documented by
 [`observed-profile-v2.md`](observed-profile-v2.md) remain unchanged except for
 the profile identifier, the `lane` discriminator, the six original additions
-below, and the five residual additions (`drain_proven`, `verdict_detail`,
-`uretprobe_override`, `handoff_child_pid`, `p11scope_env`).
+below, the five residual additions (`drain_proven`, `verdict_detail`,
+`uretprobe_override`, `handoff_child_pid`, `p11scope_env`), the verdict
+classes (`gap_classes` and its three published inputs), and row identity
+(`functions[].target`, `functions[].ordinals`, table linkage `exports`).
 
 Under the default `allowlisted` policy, every emitted mechanism has
 `params: null` and `templates.operations` is always empty. The diagnostic
@@ -153,8 +155,41 @@ trace evidence object. Historical documents predate them (see Migration).
   any `COMPLETE` without it.
 - `verdict_detail` is exactly `clean_proven` (no gap, latch set),
   `clean_but_unproven` (no gap, latch unset — the terminal `PARTIAL` with
-  nothing concrete behind it), or `concrete_gap` (a gap forced `PARTIAL`).
-  Clean and lossy runs no longer share one signal.
+  nothing concrete behind it), `attribution_only` (counts are exact; only a
+  name, owner, mechanism, or semantic interpretation is withheld — for
+  example every scan-found slot is count-only), or `concrete_gap` (an
+  observation loss or degraded semantics forced `PARTIAL`). It is a function
+  of `gap_classes` alone. Clean, names-withheld, and lossy runs no longer
+  share one signal; `completeness` is `PARTIAL` for all but `clean_proven`.
+- `gap_classes` is `{observation, attribution, semantics, open_calls,
+  settlement, stdout_data_sink}`. Each of the first three is `{status,
+  causes}`: `causes` lists, in a fixed order, the evidence fields that put the
+  class in that status (a dotted name such as
+  `scheduling.sink_dropped_bytes` names a nested field; `interface_selection`
+  names a selection coverage loss; `loader_discovery` a live-loader timing or
+  strategy gap). `observation` is `exact` or `lossy`: a call or record could
+  be missing, or a count could be wrong. `attribution` is `attested` or
+  `withheld`: `semantic_unverified_slots`, `aliased`, `module_ambiguous`,
+  `module_unresolved_slots`, `unregistered_mechanisms`,
+  `discovery_conflicts`, `discovery_uncorroborated`, or a
+  `selection_count_only` tuple. `semantics` is `complete`, `degraded`, or
+  `not_applicable` (no slot carries semantics). `open_calls` is
+  `in_flight_at_end`; for now a nonzero value is also an observation cause,
+  because an entry whose return never arrives cannot yet be told apart from
+  a lost return. `settlement` is `proven` or `unproven` (`drain_proven`).
+  `stdout_data_sink` is true only for a trace written to stdout (no `-o`):
+  only then are `scheduling.sink_dropped_bytes` an observation loss; a
+  profile, metrics, or `-o` capture's stdout carries display frames only,
+  and its drops are stated but are not a gap. A NULL function-table entry
+  (`skipped` reason `null pointer`) is never a cause: a NULL pointer cannot
+  be called, so no call is missed through it. The release oracle recomputes
+  every class and `verdict_detail` from the counters and refuses a document
+  that disagrees.
+- `semantic_unverified_slots`, `unprotected_live_windows` (0 or 1: a live
+  loader or export window no confirmed pause owner protected, inferred from
+  `loader_discovery.hits > 0` and `pause` other than `sigstop`), and
+  `module_unresolved_slots` (the number of `functions[].module_unresolved`
+  rows) are the three verdict inputs that were previously unpublished.
 - `uretprobe_override` is `null` when the hazard preflight proceeded clean,
   else `{flag, reason}`: the exact `--allow-uretprobe-on-confined-target`
   flag plus the preflight's reason for requiring it. Disclosed, never a

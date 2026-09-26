@@ -3123,6 +3123,78 @@ def self_test():
         settle_fixture_verdict(bad)
         rejected(lambda bad=bad: exact_capture_modules(bad))
     print("function rows carry an exact target and sorted unique ordinals: OK")
+    # Review answer (a) / F-1: the oracle recomputes the verdict from the
+    # counters and refuses a document whose classes or detail disagree.
+    def verdict_doc(**counters):
+        document = copy.deepcopy(clean)
+        document["evidence"].update(counters)
+        return settle_fixture_verdict(document)
+
+    attributed = verdict_doc(semantic_unverified_slots=68)
+    exact_metrics_schema(attributed)
+    require(
+        attributed["evidence"]["verdict_detail"] == "attribution_only"
+        and attributed["evidence"]["gap_classes"]["attribution"]["causes"]
+        == ["semantic_unverified_slots"]
+        and attributed["evidence"]["gap_classes"]["observation"]["status"] == "exact"
+        and attributed["evidence"]["gap_classes"]["semantics"]["status"] == "not_applicable",
+        f"names-only withholding is attribution_only: {attributed['evidence']['gap_classes']}",
+    )
+    lossy = verdict_doc(unmatched_returns=1)
+    exact_metrics_schema(lossy)
+    require(lossy["evidence"]["verdict_detail"] == "concrete_gap", lossy["evidence"])
+    null_only = verdict_doc(skipped=[{"name": "C_GetFunctionStatus", "reason": "null pointer"}])
+    exact_metrics_schema(null_only)
+    require(
+        null_only["evidence"]["gap_classes"]["observation"]["causes"] == [],
+        "a NULL table entry cannot be called, so it is never an observation loss",
+    )
+    unreadable = verdict_doc(skipped=[{"name": "C_Sign", "reason": ENTRY_UNAVAILABLE}])
+    require(
+        unreadable["evidence"]["gap_classes"]["observation"]["causes"] == ["skipped"],
+        unreadable["evidence"]["gap_classes"],
+    )
+    open_calls = verdict_doc(in_flight_at_end=2)
+    require(
+        open_calls["evidence"]["gap_classes"]["observation"]["causes"] == ["in_flight_at_end"]
+        and open_calls["evidence"]["gap_classes"]["open_calls"] == 2,
+        "open calls stay an observation gap until unpaired entries are separable (F-9)",
+    )
+    display_drops = copy.deepcopy(clean)
+    display_drops["evidence"]["scheduling"]["sink_dropped_bytes"] = 5
+    settle_fixture_verdict(display_drops)
+    require(
+        display_drops["evidence"]["gap_classes"]["observation"]["causes"] == [],
+        "stdout display drops are no observation loss when stdout is not the data sink",
+    )
+    data_drops = copy.deepcopy(display_drops)
+    data_drops["evidence"]["gap_classes"]["stdout_data_sink"] = True
+    settle_fixture_verdict(data_drops)
+    require(
+        data_drops["evidence"]["gap_classes"]["observation"]["causes"]
+        == ["scheduling.sink_dropped_bytes"],
+        data_drops["evidence"]["gap_classes"],
+    )
+    for document, mutate in (
+        (lossy, lambda d: d["evidence"].update(verdict_detail="clean_but_unproven")),
+        (lossy, lambda d: d["evidence"].update(verdict_detail="attribution_only")),
+        (lossy, lambda d: d["evidence"]["gap_classes"]["observation"].update(causes=[])),
+        (lossy, lambda d: d["evidence"]["gap_classes"]["observation"].update(status="exact")),
+        (attributed, lambda d: d["evidence"].update(verdict_detail="concrete_gap")),
+        (attributed, lambda d: d["evidence"].update(verdict_detail="clean_but_unproven")),
+        (attributed, lambda d: d["evidence"].update(semantic_unverified_slots=0)),
+        (attributed, lambda d: d["evidence"]["gap_classes"].update(extra=1)),
+        (attributed, lambda d: d["evidence"]["gap_classes"].pop("settlement")),
+        (attributed, lambda d: d["evidence"].pop("gap_classes")),
+        (attributed, lambda d: d["evidence"].update(unprotected_live_windows=-1)),
+        (open_calls, lambda d: d["evidence"]["gap_classes"].update(open_calls=0)),
+        (data_drops, lambda d: d["evidence"]["gap_classes"].update(stdout_data_sink=False)),
+        (null_only, lambda d: d["evidence"]["skipped"][0].update(reason=ENTRY_UNAVAILABLE)),
+    ):
+        bad = copy.deepcopy(document)
+        mutate(bad)
+        rejected(lambda bad=bad: exact_metrics_schema(bad))
+    print("verdict_detail and gap_classes are recomputed from the counters: OK")
     for discovery, document in documents.items():
         validate_clean_metrics(document, {"C_Initialize": 1}, discovery=discovery)
         for other in documents:
@@ -3839,6 +3911,7 @@ def self_test():
     owned_aggregate["evidence"]["skipped"] = [
         {"name": DISCOVERY_SUBJECT, "reason": DISCOVERY_UNAVAILABLE}
     ]
+    settle_fixture_verdict(owned_aggregate)
     for lane in ("owned-default-metrics", "owned-feature-metrics"):
         validate_canary(lane, owned_aggregate)
         for calls in (28, 29, 31):
@@ -3879,6 +3952,7 @@ def self_test():
         validate_canary(lane, two_skips)
     safe_refusal = copy.deepcopy(safe)
     safe_refusal["evidence"]["skipped"] = [dict(CANARY_DISCOVERY_SKIP)]
+    settle_fixture_verdict(safe_refusal)
     validate_canary("default-safe-profile", safe_refusal)
     for lane, doc, extras in (
         ("owned-default-metrics", owned_aggregate, 3),
@@ -4402,6 +4476,7 @@ def self_test():
         table_entries=68, slots=68, active_slots=0, attached_probes=136
     )
     exact_active_to_empty(exited)
+    settle_fixture_verdict(exited)
     exact_metrics_schema(exited)
     for mutate in (
         lambda d: d["evidence"]["discovery"].clear(),

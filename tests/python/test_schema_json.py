@@ -86,6 +86,12 @@ class SchemaOracleAgreement(unittest.TestCase):
             CHECKER["MAX_FUNCTION_ORDINALS"],
         )
 
+    def test_gap_classes_shape_matches_oracle(self):
+        """`evidence.gap_classes` keys match the oracle's closed set."""
+        classes = evidence_schema()["properties"]["gap_classes"]
+        self.assertEqual(set(classes["properties"]), set(CHECKER["GAP_CLASS_KEYS"]))
+        self.assertEqual(set(classes["required"]), set(CHECKER["GAP_CLASS_KEYS"]))
+
     def test_enums_match_oracle(self):
         """Closed enums in the schema equal the oracle's vocabularies."""
         props = evidence_schema()["properties"]

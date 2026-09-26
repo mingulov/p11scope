@@ -4915,6 +4915,10 @@ fn capture_trace(
                             .as_deref()
                             .and_then(|owned| owned.still_running.then_some(owned.pid)),
                     );
+                    // Trace without `-o` writes its data to stdout, so only
+                    // there are slow-sink drops lost data (review F-4).
+                    evidence.stdout_data_sink = context.7.is_none();
+                    evidence.verdict_with_selection(true);
                     evidence.mark_terminal_drain_unproven();
                     if *consumers.malformed_records > 0 {
                         eprintln!(
@@ -6015,6 +6019,8 @@ fn evidence_for(
         scheduling,
         drain_proven: false,
         verdict_detail: render::VERDICT_CONCRETE_GAP,
+        gap_classes: render::GapClasses::default(),
+        stdout_data_sink: false,
         uretprobe_override,
         handoff_child_pid,
         p11scope_env: render::snapshot_process_env(),

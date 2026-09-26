@@ -622,6 +622,8 @@ mod tests {
             scheduling: render::SchedulingEvidence::default(),
             drain_proven: false,
             verdict_detail: render::VERDICT_CONCRETE_GAP,
+            gap_classes: render::GapClasses::default(),
+            stdout_data_sink: false,
             uretprobe_override: None,
             handoff_child_pid: None,
             p11scope_env: vec![],

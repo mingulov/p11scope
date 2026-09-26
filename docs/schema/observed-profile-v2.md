@@ -281,25 +281,26 @@ pointer, cookie, context id, delta, proof id, absent-state sentinel, signal
 record, interface name, marker, or process identity is published beside the
 counts (`docs/privacy/allowlist-v1.md`).
 
-#### What live discovery does not publish
+#### The unprotected live window
 
-The completeness verdict consumes one more live-discovery fact that is
-deliberately **not** a field: whether any module's first required attach key
-was learned from a live loader or export event that no confirmed pause owner
-protected. The design forbids publishing it, and this document does not.
+The completeness verdict consumes one more live-discovery fact: whether any
+module's first required attach key was learned from a live loader or export
+event that no confirmed pause owner protected. The v3 documents publish it as
+`unprotected_live_windows` (0 or 1) and name it among
+`gap_classes.observation.causes`; v2 did not publish it. It was held back
+because the value is an inference, never for privacy: both of its inputs are
+already public.
 
-It is worth stating plainly how the unpublished input is obtained, because it
-is an inference and not a measurement: the implementation treats a capture as
-having had an unprotected live window when `loader_discovery.hits > 0` and
-`pause` is not `sigstop` — "a live window happened at all, and no confirmed
-pause owner protected it". That is a capture-level approximation of a
-per-module condition, and it is inexact in both directions: over-inclusive,
-because a hit that established no module's first required key still forces
-`PARTIAL`; and under-inclusive, because the export-event lane can establish a
-first required key without incrementing `hits`. It can only ever downgrade a
-verdict, never raise one, and its runtime proof is still outstanding. A
-consumer must not reconstruct it from `hits` and `pause`: it is not a published
-field, and the inference behind it is expected to be replaced by a measured one.
+It is worth stating plainly how the value is obtained: the implementation
+treats a capture as having had an unprotected live window when
+`loader_discovery.hits > 0` and `pause` is not `sigstop` — "a live window
+happened at all, and no confirmed pause owner protected it". That is a
+capture-level approximation of a per-module condition, and it is inexact in
+both directions: over-inclusive, because a hit that established no module's
+first required key still forces `PARTIAL`; and under-inclusive, because the
+export-event lane can establish a first required key without incrementing
+`hits`. It can only ever downgrade a verdict, never raise one, and it is
+expected to be replaced by a measured value.
 
 Process and semantic uncertainty:
 

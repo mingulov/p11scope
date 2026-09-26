@@ -102,6 +102,65 @@ impl LoaderDiscovery {
 pub const VERDICT_CLEAN_PROVEN: &str = "clean_proven";
 pub const VERDICT_CLEAN_BUT_UNPROVEN: &str = "clean_but_unproven";
 pub const VERDICT_CONCRETE_GAP: &str = "concrete_gap";
+/// No observation loss and no semantic degradation: the counts are exact,
+/// only a name, owner, mechanism, or semantic interpretation is withheld
+/// (review answer (a)). Still `PARTIAL`.
+pub const VERDICT_ATTRIBUTION_ONLY: &str = "attribution_only";
+
+/// The skip reason of a NULL function-table entry. A NULL pointer can never
+/// be called, so no call can be missed through it: it is a published fact,
+/// never an observation gap.
+pub(crate) const NULL_POINTER_REASON: &str = "null pointer";
+
+/// One closed gap class: its status and the evidence fields that put it
+/// there, in the fixed order `Evidence::gap_classes` checks them.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct GapClass {
+    pub status: &'static str,
+    pub causes: Vec<&'static str>,
+}
+
+/// The verdict's inputs split into what they mean (review answer (a)):
+/// `observation` — could a call or record be missing, or a count be wrong
+/// (`exact` | `lossy`); `attribution` — is a name, owner, mechanism, or
+/// semantic interpretation withheld while counts stay exact (`attested` |
+/// `withheld`); `semantics` — are the event-derived sections degraded
+/// (`complete` | `degraded` | `not_applicable` when no slot carries
+/// semantics); `open_calls` — calls entered but not returned at the snapshot;
+/// `settlement` — whether the terminal drain is proven (`proven` |
+/// `unproven`); `stdout_data_sink` — whether stdout carried the capture's
+/// data, the only case in which slow-sink drops are an observation loss.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct GapClasses {
+    pub observation: GapClass,
+    pub attribution: GapClass,
+    pub semantics: GapClass,
+    pub open_calls: u64,
+    pub settlement: &'static str,
+    pub stdout_data_sink: bool,
+}
+
+impl Default for GapClasses {
+    fn default() -> Self {
+        Self {
+            observation: GapClass {
+                status: "exact",
+                causes: Vec::new(),
+            },
+            attribution: GapClass {
+                status: "attested",
+                causes: Vec::new(),
+            },
+            semantics: GapClass {
+                status: "complete",
+                causes: Vec::new(),
+            },
+            open_calls: 0,
+            settlement: "unproven",
+            stdout_data_sink: false,
+        }
+    }
+}
 
 /// Every `P11SCOPE_*` switch that can change capture behavior, with its
 /// effect. `--help` and `docs/usage.md` list exactly these (plus the
@@ -276,7 +335,10 @@ impl InterfaceSelection {
         }
     }
 
-    fn complete(&self) -> bool {
+    /// Every selection fact that bounds what was observed: nothing
+    /// truncated, every provider covered, every standard export resolved,
+    /// and no successful selection of a table the inventory does not hold.
+    fn observation_complete(&self) -> bool {
         !self.selection_truncated
             && self
                 .providers
@@ -287,12 +349,19 @@ impl InterfaceSelection {
                 .iter()
                 .all(|export| matches!(export.status, "present" | "legacy_absent"))
             && self.tuples.iter().all(|tuple| {
-                tuple.authority != SelectionAuthority::SelectionCountOnly
-                    && !(tuple.rv == 0
-                        && tuple.result.is_some()
-                        && tuple.inventory_matches.is_empty()
-                        && tuple.authority == SelectionAuthority::None)
+                !(tuple.rv == 0
+                    && tuple.result.is_some()
+                    && tuple.inventory_matches.is_empty()
+                    && tuple.authority == SelectionAuthority::None)
             })
+    }
+
+    /// A selection-only table was counted without inventory authority: its
+    /// counts are exact, its semantic attribution is withheld.
+    fn has_count_only_authority(&self) -> bool {
+        self.tuples
+            .iter()
+            .any(|tuple| tuple.authority == SelectionAuthority::SelectionCountOnly)
     }
 }
 
@@ -508,10 +577,10 @@ pub struct Evidence {
     /// Discovered entries with no attachable target, and why. Also published
     /// per module in `discovery[].skipped`.
     pub skipped: Vec<SkippedOut>,
-    /// Planned slots whose scan-only names are not authorized for semantic
-    /// interpretation. Derived from the plan; public v2 derives the same fact
-    /// from discovery provenance instead of serializing a duplicate counter.
-    #[serde(skip)]
+    /// Planned slots whose names are not authorized for semantic
+    /// interpretation (every scan-found slot, whatever its linkage). Counts
+    /// through them are exact; only their semantics are withheld, so this is
+    /// an attribution gate, never an observation loss.
     pub semantic_unverified_slots: usize,
     pub in_flight_at_end: u64,
     /// Per-surface discovery provenance (walk outcome, acquisition status).
@@ -629,17 +698,15 @@ pub struct Evidence {
     pub pid_descendant_gaps: u64,
     #[serde(skip)]
     pub multi_rebuild_gaps: u64,
-    /// Modules whose first required attach key was learned from a live loader
-    /// or export event outside a confirmed pause owner (design §5.7). Design
-    /// §5.7 explicitly forbids a public field for this, so it follows the
-    /// existing `semantic_unverified_slots` precedent and only gates the
-    /// verdict.
-    #[serde(skip)]
+    /// Whether a live window (design §5.7: a first required attach key learned
+    /// from a live loader or export event) went unprotected by a confirmed
+    /// pause owner: 0 or 1, inferred as `loader_discovery.hits > 0` and
+    /// `pause != "sigstop"`. Published so a `PARTIAL` behind it is visible;
+    /// §5.7 kept it unpublished only because the inference is inexact, never
+    /// for privacy — both inputs are already public.
     pub unprotected_live_windows: usize,
-    /// Allocated aggregate cells with no accepted sole owner. Published per
-    /// row as `functions[].module_unresolved`; the count itself stays internal
-    /// and only gates the verdict.
-    #[serde(skip)]
+    /// Allocated aggregate cells with no accepted sole owner — the count of
+    /// `functions[].module_unresolved` rows. An attribution gate.
     pub module_unresolved_slots: usize,
     /// Everything discovery learned, flattened into this object.
     #[serde(flatten)]
@@ -653,8 +720,17 @@ pub struct Evidence {
     /// discipline.
     pub drain_proven: bool,
     /// Which terminal story `completeness` tells: [`VERDICT_CLEAN_PROVEN`],
-    /// [`VERDICT_CLEAN_BUT_UNPROVEN`], or [`VERDICT_CONCRETE_GAP`].
+    /// [`VERDICT_CLEAN_BUT_UNPROVEN`], [`VERDICT_ATTRIBUTION_ONLY`], or
+    /// [`VERDICT_CONCRETE_GAP`] — derived from `gap_classes` alone.
     pub verdict_detail: &'static str,
+    /// The closed classes behind `completeness` and `verdict_detail`, with
+    /// the evidence fields that put each class where it is.
+    pub gap_classes: GapClasses,
+    /// Whether stdout carried the capture's data (trace without `-o`). Only
+    /// then are slow-sink drops an observation loss; a profile, metrics, or
+    /// `-o` capture's stdout carries display frames only.
+    #[serde(skip)]
+    pub stdout_data_sink: bool,
     /// The uretprobe/hazard override behind this capture, if any (SYSPLAN
     /// residual F-01). `None` exactly when the preflight proceeded clean.
     pub uretprobe_override: Option<UretprobeOverride>,
@@ -888,83 +964,257 @@ impl Evidence {
     }
 
     pub(crate) fn verdict_with_selection(&mut self, include_selection: bool) {
-        let surfaces_complete = self
-            .surfaces
-            .iter()
-            .all(|s| s.walk == "full" && s.acquisition == "ok");
-        let interface_list_complete = !self.interface_list.starts_with("error:");
-        let discovery_complete = !self.discovery.modules.is_empty()
-            && self.slots > 0
-            && self.discovery.scan_unavailable.is_none()
-            && self.discovery.conflicts == 0
-            && self.discovery.uncorroborated == 0
-            && self.discovery.module_ambiguous == 0
-            && self.discovery.modules_skipped.is_empty();
-        self.completeness = if discovery_complete
-            && self.attach_failures.is_empty()
-            && self.skipped.is_empty()
-            && self.semantic_unverified_slots == 0
-            && self.aliased.is_empty()
-            && self.in_flight_at_end == 0
-            && surfaces_complete
-            && self.vendor_interfaces == 0
-            && self.event_loss == 0
-            && self.start_insert_failures == 0
-            && self.unmatched_returns == 0
-            && self.rv_update_failures == 0
-            && self.cgroup_scope_failures == 0
-            && self.abi_refusals == 0
-            && self.semantic_capture_failures == 0
-            && self.unregistered_mechanisms == 0
-            && self.template_tail_failures == 0
-            && self.process_tracking_failures == 0
-            && self.process_tracking_evictions == 0
-            && self.state_reconciliations == 0
-            && self.session_cancel_ambiguities == 0
-            && self.session_cancel_unknown_flags == 0
-            && self.operation_state_imports == 0
-            && self.auth_state_ambiguities == 0
-            && self.async_target_failures == 0
-            && self.async_orphans == 0
-            && self.async_duplicates == 0
-            && self.async_evictions == 0
-            && self.fork_state_ambiguities == 0
-            && self.semantic_state_drops == 0
-            && self.semantic_history_drops == 0
-            && self.pending_at_end == 0
-            && self.malformed_records == 0
-            && !self.templates_truncated
-            && self.shape_decode_total_failures == 0
-            && !self.provider_changed
-            && interface_list_complete
-            // Live discovery (design §5.7, §9.1, §9.2). Each of these is
-            // sticky because the counter behind it is never reset in the
-            // pipeline: a later clean tick cannot subtract a loss.
-            && self.unprotected_live_windows == 0
-            && self.module_unresolved_slots == 0
-            && self.discovery_ring_loss == 0
-            && self.discovery_state_failures == 0
-            && self.discovery_read_failures == 0
-            && self.discovery_truncated == 0
-            && self.task_uprobe_link_losses == 0
-            && self.pause_partial == 0
-            && !self.scheduling.terminal_drain_truncated
-            && self.scheduling.sink_dropped_bytes == 0
-            && self.loader_discovery.complete()
-            && (!include_selection
-                || self.interface_selection.complete()
-                    && self.pid_descendant_gaps == 0
-                    && self.multi_rebuild_gaps == 0)
-        {
-            "COMPLETE"
+        let classes = self.gap_classes(include_selection);
+        let clean = classes.observation.causes.is_empty()
+            && classes.attribution.causes.is_empty()
+            && classes.semantics.causes.is_empty();
+        self.completeness = if clean { "COMPLETE" } else { "PARTIAL" };
+        self.verdict_detail =
+            if !classes.observation.causes.is_empty() || !classes.semantics.causes.is_empty() {
+                VERDICT_CONCRETE_GAP
+            } else if !classes.attribution.causes.is_empty() {
+                VERDICT_ATTRIBUTION_ONLY
+            } else if self.drain_proven {
+                VERDICT_CLEAN_PROVEN
+            } else {
+                VERDICT_CLEAN_BUT_UNPROVEN
+            };
+        self.gap_classes = classes;
+    }
+
+    /// Every verdict gate, each in exactly one class (review answer (a)).
+    /// `completeness` is `COMPLETE` only when all three cause lists are
+    /// empty, so the gate stays exactly as strict as the single conjunction
+    /// it replaces — except that a NULL-pointer skip is no longer a gate (a
+    /// NULL entry cannot be called, so nothing is missed through it) and
+    /// slow-sink drops gate only when stdout carried the data.
+    ///
+    /// Classes are sticky exactly like their counters: the pipeline never
+    /// resets one, so a later clean tick cannot subtract a loss.
+    pub(crate) fn gap_classes(&self, include_selection: bool) -> GapClasses {
+        fn cause(causes: &mut Vec<&'static str>, name: &'static str, hit: bool) {
+            if hit {
+                causes.push(name);
+            }
+        }
+        let mut observation = Vec::new();
+        let o = &mut observation;
+        cause(o, "discovery", self.discovery.modules.is_empty());
+        cause(o, "slots", self.slots == 0);
+        cause(
+            o,
+            "scan_unavailable",
+            self.discovery.scan_unavailable.is_some(),
+        );
+        cause(
+            o,
+            "modules_skipped",
+            !self.discovery.modules_skipped.is_empty(),
+        );
+        cause(o, "attach_failures", !self.attach_failures.is_empty());
+        cause(
+            o,
+            "skipped",
+            self.skipped
+                .iter()
+                .any(|skip| skip.reason != NULL_POINTER_REASON),
+        );
+        // F-9: an entry without its return cannot yet be told apart from a
+        // lost return, so open calls stay an observation gap for now.
+        cause(o, "in_flight_at_end", self.in_flight_at_end > 0);
+        cause(
+            o,
+            "surfaces",
+            self.surfaces
+                .iter()
+                .any(|s| s.walk != "full" || s.acquisition != "ok"),
+        );
+        cause(o, "vendor_interfaces", self.vendor_interfaces > 0);
+        cause(
+            o,
+            "interface_list",
+            self.interface_list.starts_with("error:"),
+        );
+        cause(o, "event_loss", self.event_loss > 0);
+        cause(o, "start_insert_failures", self.start_insert_failures > 0);
+        cause(o, "unmatched_returns", self.unmatched_returns > 0);
+        cause(o, "rv_update_failures", self.rv_update_failures > 0);
+        cause(o, "cgroup_scope_failures", self.cgroup_scope_failures > 0);
+        cause(o, "abi_refusals", self.abi_refusals > 0);
+        cause(o, "malformed_records", self.malformed_records > 0);
+        cause(o, "provider_changed", self.provider_changed);
+        // Live discovery (design §5.7, §9.1, §9.2).
+        cause(
+            o,
+            "unprotected_live_windows",
+            self.unprotected_live_windows > 0,
+        );
+        cause(o, "discovery_ring_loss", self.discovery_ring_loss > 0);
+        cause(
+            o,
+            "discovery_state_failures",
+            self.discovery_state_failures > 0,
+        );
+        cause(
+            o,
+            "discovery_read_failures",
+            self.discovery_read_failures > 0,
+        );
+        cause(o, "discovery_truncated", self.discovery_truncated > 0);
+        cause(
+            o,
+            "task_uprobe_link_losses",
+            self.task_uprobe_link_losses > 0,
+        );
+        cause(o, "pause_partial", self.pause_partial > 0);
+        cause(o, "loader_discovery", !self.loader_discovery.complete());
+        cause(
+            o,
+            "scheduling.terminal_drain_truncated",
+            self.scheduling.terminal_drain_truncated,
+        );
+        cause(
+            o,
+            "scheduling.sink_dropped_bytes",
+            self.stdout_data_sink && self.scheduling.sink_dropped_bytes > 0,
+        );
+        if include_selection {
+            cause(
+                o,
+                "interface_selection",
+                !self.interface_selection.observation_complete(),
+            );
+            cause(o, "pid_descendant_gaps", self.pid_descendant_gaps > 0);
+            cause(o, "multi_rebuild_gaps", self.multi_rebuild_gaps > 0);
+        }
+
+        let mut attribution = Vec::new();
+        let a = &mut attribution;
+        cause(
+            a,
+            "semantic_unverified_slots",
+            self.semantic_unverified_slots > 0,
+        );
+        cause(a, "aliased", !self.aliased.is_empty());
+        cause(a, "module_ambiguous", self.discovery.module_ambiguous > 0);
+        cause(
+            a,
+            "module_unresolved_slots",
+            self.module_unresolved_slots > 0,
+        );
+        cause(
+            a,
+            "unregistered_mechanisms",
+            self.unregistered_mechanisms > 0,
+        );
+        cause(a, "discovery_conflicts", self.discovery.conflicts > 0);
+        cause(
+            a,
+            "discovery_uncorroborated",
+            self.discovery.uncorroborated > 0,
+        );
+        if include_selection {
+            cause(
+                a,
+                "interface_selection.selection_count_only",
+                self.interface_selection.has_count_only_authority(),
+            );
+        }
+
+        let mut semantics = Vec::new();
+        let s = &mut semantics;
+        cause(
+            s,
+            "semantic_capture_failures",
+            self.semantic_capture_failures > 0,
+        );
+        cause(s, "template_tail_failures", self.template_tail_failures > 0);
+        cause(
+            s,
+            "process_tracking_failures",
+            self.process_tracking_failures > 0,
+        );
+        cause(
+            s,
+            "process_tracking_evictions",
+            self.process_tracking_evictions > 0,
+        );
+        cause(s, "state_reconciliations", self.state_reconciliations > 0);
+        cause(
+            s,
+            "session_cancel_ambiguities",
+            self.session_cancel_ambiguities > 0,
+        );
+        cause(
+            s,
+            "session_cancel_unknown_flags",
+            self.session_cancel_unknown_flags > 0,
+        );
+        cause(
+            s,
+            "operation_state_imports",
+            self.operation_state_imports > 0,
+        );
+        cause(s, "auth_state_ambiguities", self.auth_state_ambiguities > 0);
+        cause(s, "async_target_failures", self.async_target_failures > 0);
+        cause(s, "async_orphans", self.async_orphans > 0);
+        cause(s, "async_duplicates", self.async_duplicates > 0);
+        cause(s, "async_evictions", self.async_evictions > 0);
+        cause(s, "fork_state_ambiguities", self.fork_state_ambiguities > 0);
+        cause(s, "semantic_state_drops", self.semantic_state_drops > 0);
+        cause(s, "semantic_history_drops", self.semantic_history_drops > 0);
+        cause(s, "pending_at_end", self.pending_at_end > 0);
+        cause(s, "templates_truncated", self.templates_truncated);
+        cause(
+            s,
+            "shape_decode_total_failures",
+            self.shape_decode_total_failures > 0,
+        );
+
+        let semantics_status = if !semantics.is_empty() {
+            "degraded"
+        } else if self.slots == 0 || self.semantic_unverified_slots >= self.slots {
+            "not_applicable"
         } else {
-            "PARTIAL"
+            "complete"
         };
-        self.verdict_detail = match (self.completeness, self.drain_proven) {
-            ("COMPLETE", true) => VERDICT_CLEAN_PROVEN,
-            ("COMPLETE", false) => VERDICT_CLEAN_BUT_UNPROVEN,
-            _ => VERDICT_CONCRETE_GAP,
-        };
+        GapClasses {
+            observation: GapClass {
+                status: if observation.is_empty() {
+                    "exact"
+                } else {
+                    "lossy"
+                },
+                causes: observation,
+            },
+            attribution: GapClass {
+                status: if attribution.is_empty() {
+                    "attested"
+                } else {
+                    "withheld"
+                },
+                causes: attribution,
+            },
+            semantics: GapClass {
+                status: semantics_status,
+                causes: semantics,
+            },
+            open_calls: self.in_flight_at_end,
+            settlement: if self.drain_proven {
+                "proven"
+            } else {
+                "unproven"
+            },
+            stdout_data_sink: self.stdout_data_sink,
+        }
+    }
+
+    /// Terminal settlement after the last accounting has landed (F-4):
+    /// recompute from every final counter, then seal. Callers run it after
+    /// the final scheduling snapshot, never before.
+    pub(crate) fn settle_terminal(&mut self, include_selection: bool) {
+        self.verdict_with_selection(include_selection);
+        self.mark_terminal_drain_unproven();
     }
 
     /// A detached perf link stops new invocations but does not wait for BPF
@@ -980,10 +1230,10 @@ impl Evidence {
         if self.drain_proven {
             return;
         }
+        // A gap already names its story (`concrete_gap` or
+        // `attribution_only`); only a clean run needs the unproven one.
         if self.completeness == "COMPLETE" {
             self.verdict_detail = VERDICT_CLEAN_BUT_UNPROVEN;
-        } else {
-            self.verdict_detail = VERDICT_CONCRETE_GAP;
         }
         self.completeness = "PARTIAL";
     }
@@ -1889,6 +2139,8 @@ pub(crate) mod tests {
             scheduling: SchedulingEvidence::default(),
             drain_proven: false,
             verdict_detail: VERDICT_CONCRETE_GAP,
+            gap_classes: GapClasses::default(),
+            stdout_data_sink: false,
             uretprobe_override: None,
             handoff_child_pid: None,
             p11scope_env: vec![],
@@ -2415,6 +2667,117 @@ pub(crate) mod tests {
         let mut ev = evidence();
         ev.verdict();
         assert_eq!(ev.completeness, "COMPLETE");
+    }
+
+    /// Review answer (a) / F-1: a capture whose only gate is withheld
+    /// names/semantics is `attribution_only`, never `concrete_gap`; any
+    /// observation loss is `concrete_gap`; `completeness` stays PARTIAL for
+    /// both. The inputs that drive it are published.
+    #[test]
+    fn withheld_attribution_alone_is_not_a_concrete_gap() {
+        for (label, mutate) in [
+            (
+                "semantic_unverified_slots",
+                (|ev: &mut Evidence| ev.semantic_unverified_slots = 68) as fn(&mut Evidence),
+            ),
+            ("aliased", |ev| {
+                ev.aliased = vec![vec!["C_A".into(), "C_B".into()]]
+            }),
+            ("module_unresolved_slots", |ev| {
+                ev.module_unresolved_slots = 1
+            }),
+            ("unregistered_mechanisms", |ev| {
+                ev.unregistered_mechanisms = 1
+            }),
+        ] {
+            let mut ev = evidence();
+            mutate(&mut ev);
+            ev.verdict();
+            assert_eq!(ev.completeness, "PARTIAL", "{label}");
+            assert_eq!(ev.verdict_detail, "attribution_only", "{label}");
+            ev.mark_terminal_drain_unproven();
+            assert_eq!(
+                ev.verdict_detail, "attribution_only",
+                "{label} after the seal"
+            );
+        }
+        for (label, mutate) in [
+            (
+                "event_loss",
+                (|ev: &mut Evidence| ev.event_loss = 1) as fn(&mut Evidence),
+            ),
+            ("in_flight_at_end", |ev| ev.in_flight_at_end = 1),
+            ("unprotected_live_windows", |ev| {
+                ev.unprotected_live_windows = 1
+            }),
+            ("pending_at_end", |ev| ev.pending_at_end = 1),
+        ] {
+            let mut ev = evidence();
+            ev.semantic_unverified_slots = 68;
+            mutate(&mut ev);
+            ev.verdict();
+            assert_eq!(ev.verdict_detail, "concrete_gap", "{label}");
+        }
+        let mut ev = evidence();
+        ev.semantic_unverified_slots = 68;
+        ev.unprotected_live_windows = 1;
+        ev.module_unresolved_slots = 2;
+        ev.verdict();
+        let value = serde_json::to_value(&ev).unwrap();
+        assert_eq!(value["semantic_unverified_slots"], 68);
+        assert_eq!(value["unprotected_live_windows"], 1);
+        assert_eq!(value["module_unresolved_slots"], 2);
+    }
+
+    /// `gap_classes` names every contributing counter in its one class.
+    #[test]
+    fn gap_classes_name_every_contributing_counter() {
+        let mut ev = evidence();
+        ev.semantic_unverified_slots = 68;
+        ev.event_loss = 2;
+        ev.state_reconciliations = 1;
+        ev.in_flight_at_end = 3;
+        ev.verdict();
+        assert_eq!(
+            serde_json::to_value(&ev).unwrap()["gap_classes"],
+            serde_json::json!({
+                "observation": {"status": "lossy", "causes": ["in_flight_at_end", "event_loss"]},
+                "attribution": {"status": "withheld", "causes": ["semantic_unverified_slots"]},
+                "semantics": {"status": "degraded", "causes": ["state_reconciliations"]},
+                "open_calls": 3,
+                "settlement": "unproven",
+                "stdout_data_sink": false,
+            })
+        );
+        // Every slot count-only and nothing degraded: semantics do not apply.
+        let mut ev = evidence();
+        ev.semantic_unverified_slots = ev.slots;
+        ev.verdict();
+        assert_eq!(ev.gap_classes.semantics.status, "not_applicable");
+        assert_eq!(ev.verdict_detail, VERDICT_ATTRIBUTION_ONLY);
+    }
+
+    /// A NULL function-table entry cannot be called, so no call is missed
+    /// through it: the published skip is a fact, not an observation gap.
+    #[test]
+    fn a_null_table_entry_is_not_an_observation_loss() {
+        let mut ev = evidence();
+        ev.skipped = vec![SkippedOut {
+            name: "C_GetFunctionStatus".into(),
+            reason: "null pointer".into(),
+        }];
+        ev.verdict();
+        assert_eq!(ev.completeness, "COMPLETE");
+        ev.mark_terminal_drain_unproven();
+        assert_eq!(ev.verdict_detail, "clean_but_unproven");
+
+        let mut ev = evidence();
+        ev.skipped = vec![SkippedOut {
+            name: "C_Sign".into(),
+            reason: ENTRY_UNAVAILABLE.into(),
+        }];
+        ev.verdict();
+        assert_eq!(ev.verdict_detail, "concrete_gap");
     }
 
     #[test]
@@ -3192,8 +3555,11 @@ pub(crate) mod tests {
         assert!(value.get("terminal_drain_unproven").is_none());
     }
 
+    /// Slow-sink drops lose data only when stdout carried the data (trace
+    /// without `-o`); a profile/metrics/`-o` stdout carries display frames,
+    /// so there the drops are stated but are no observation gap.
     #[test]
-    fn sink_drops_force_partial_with_stated_counts() {
+    fn sink_drops_force_partial_only_when_stdout_is_the_data_sink() {
         let mut ev = evidence();
         ev.verdict();
         assert_eq!(ev.completeness, "COMPLETE");
@@ -3201,10 +3567,18 @@ pub(crate) mod tests {
         ev.scheduling.sink_dropped_bytes = 1024;
         ev.scheduling.sink_timeouts = 1;
         ev.verdict();
-
-        assert_eq!(ev.completeness, "PARTIAL");
+        assert_eq!(ev.completeness, "COMPLETE", "display-only drops");
         assert_eq!(ev.scheduling.sink_dropped_bytes, 1024);
         assert_eq!(ev.scheduling.sink_timeouts, 1);
+
+        ev.stdout_data_sink = true;
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        assert_eq!(ev.verdict_detail, VERDICT_CONCRETE_GAP);
+        assert_eq!(
+            ev.gap_classes.observation.causes,
+            ["scheduling.sink_dropped_bytes"]
+        );
     }
 
     #[test]
@@ -3340,10 +3714,12 @@ pub(crate) mod tests {
     fn any_gap_forces_partial() {
         for mutate in [
             (|e: &mut Evidence| e.attach_failures.push("boom".into())) as fn(&mut Evidence),
+            // A NULL-pointer skip is not a gap (it cannot be called);
+            // any other entry skip is.
             |e: &mut Evidence| {
                 e.skipped.push(SkippedOut {
                     name: "C_X".into(),
-                    reason: "null pointer".into(),
+                    reason: ENTRY_UNAVAILABLE.into(),
                 })
             },
             |e: &mut Evidence| e.aliased.push(vec!["C_A".into(), "C_B".into()]),

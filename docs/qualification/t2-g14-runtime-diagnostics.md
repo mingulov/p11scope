@@ -56,6 +56,39 @@ The older run-mode burst overflow is a separate open case: its 20000-call
 ungated workload lost up to 7521 of 20006 events before the first drain.
 Passing this gated, paced profile baseline does not repair that failure.
 
+## Other predeclared mode comparisons at the same pin
+
+| Cell | Counts | Measurement window | Diagnostic maximum tick / event-drain gap |
+| --- | --- | --- | --- |
+| PID/profile, unpaced 20000-call gated burst | 20006/20006; reported event loss 0 | Valid observer clocks and physical attribution | 30ms / 30ms |
+| PID/metrics, paced 100-call burst | 106/106; no EVENTS stream | Valid observer clocks and physical attribution | 41ms / not sampled |
+| PID/trace, paced 100-call burst | 106 delivered lines; loss crosscheck passes, reported loss 0 | Observer clocks valid; owned attribution invalid because trace lacks physical module rows | 26ms / 27ms |
+
+All three returned normally with four settled supervisors and unchanged
+typed map/program/link censuses. The burst ran after KryProbe released the
+shared lane, in a new directory; the earlier NOT_RUN lease refusal remains.
+Trace's matching aggregate count is diagnostic only. Its attribution check
+correctly refuses to qualify the owned window.
+
+The metrics run exposed a new diagnostic defect: `max gap 0ms` was printed
+although this mode takes no event-drain samples. Missing interval data must
+be `n/a`; an actually sampled zero interval must stay zero. Two ordinary
+controls reproduced the defect in the detector and capture integration,
+while the measured-zero control already passed. The repair now passes the
+18 affected default/wide controls, the complete default workspace suite
+(1618 library tests, 45 privileged ignored; 139 artifact tests and the other
+workspace suites), formatting and strict Clippy in both profiles. A fresh
+live metrics comparison is still required; the original native output is
+preserved unchanged.
+
+The first full attempt exposed a separate timing-sensitive harness defect:
+a deadline expiring inside process-identity checks was sanitized into a
+generic custody error. Two deterministic regressions reproduced that
+failure. `f066e48` preserves a typed timeout while keeping arbitrary error
+text private; the original negative readiness cases and the complete fresh
+workspace run then passed. Neither timeout budgets nor acceptance
+assertions were relaxed. The failed full run remains part of the evidence.
+
 ## Custody and remaining work
 
 Workspace evidence root:
@@ -76,8 +109,11 @@ Workspace evidence root:
   typed before/after censuses and analysis. `bundle-files.json` seals them.
 - `live/pid-profile-burst/`: NOT_RUN lease refusal. KryProbe owned the shared
   BPF lane; this is not a measurement failure or an executed test.
+- `live/pid-profile-burst-lease2/`, `live/pid-metrics-small/` and
+  `live/pid-trace-small/`: the three subsequent comparisons, each with its
+  own 55-file sealed bundle and original raw output.
 
-The predeclared burst, metrics and trace comparisons remain pending. The
+The missing-gap diagnostic repair still needs its focused live check. The
 five gated/ungated first-use classes, seven transition facts, safe
 pre-execution comparison, run-mode overflow repair and supported-boundary
 G-14 green result also remain open. See the [original requirements](t2-first-use-requirements.md)

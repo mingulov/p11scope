@@ -9521,6 +9521,7 @@ mod tests {
         assert_eq!(report.steady_event_loss, None);
         assert_eq!(report.early_discovery_loss, Some(3));
         assert_eq!(report.steady_discovery_loss, Some(3));
+        assert!(observed.longrun_line(true).contains("max gap n/a"));
         let mut control = SchedulingAccumulator::default();
         control.note_loop_end(0, 6, Some(300), render::LOOP_END_EXPIRY);
         assert_eq!(

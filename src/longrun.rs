@@ -59,7 +59,8 @@ pub struct LongRunReport {
     pub findings: Vec<LongRunFinding>,
     pub ticks_observed: u64,
     pub max_tick_ms: u64,
-    pub max_gap_ms: u64,
+    /// None when no inter-drain interval was sampled (including metrics).
+    pub max_gap_ms: Option<u64>,
     pub early_event_loss: Option<u64>,
     pub steady_event_loss: Option<u64>,
     pub early_discovery_loss: Option<u64>,
@@ -81,11 +82,14 @@ impl LongRunReport {
     /// The stderr line attempted at loop end when samples are available.
     /// A soak must distinguish its absence from a delivered clean result.
     pub fn report_line(&self) -> String {
+        let gap = self
+            .max_gap_ms
+            .map_or_else(|| "n/a".to_string(), |ms| format!("{ms}ms"));
         let numbers = format!(
-            "ticks {}, max tick {}ms, max gap {}ms, events {}, discovery {}",
+            "ticks {}, max tick {}ms, max gap {}, events {}, discovery {}",
             self.ticks_observed,
             self.max_tick_ms,
-            self.max_gap_ms,
+            gap,
             Self::fmt_split(self.early_event_loss, self.steady_event_loss),
             Self::fmt_split(self.early_discovery_loss, self.steady_discovery_loss),
         );
@@ -115,7 +119,7 @@ pub struct LongRunDetector {
     max_tick_ms: u64,
     max_tick_at: u64,
     over_budget_ticks: u64,
-    max_gap_ms: u64,
+    max_gap_ms: Option<u64>,
     first_event_loss: Option<u64>,
     first_discovery_loss: Option<u64>,
 }
@@ -144,7 +148,7 @@ impl LongRunDetector {
 
     /// One inter-drain gap, as computed by the scheduling accumulator.
     pub fn note_gap(&mut self, gap_ms: u64) {
-        self.max_gap_ms = self.max_gap_ms.max(gap_ms);
+        self.max_gap_ms = Some(self.max_gap_ms.map_or(gap_ms, |max| max.max(gap_ms)));
     }
 
     /// Loss counters read once, after the first drain: the ramp-up share.
@@ -218,12 +222,14 @@ impl LongRunDetector {
                 at_tick: Some(self.max_tick_at),
             });
         }
-        if self.max_gap_ms > self.config.stall_gap_ms {
+        if let Some(gap_ms) = self.max_gap_ms
+            && gap_ms > self.config.stall_gap_ms
+        {
             findings.push(LongRunFinding {
                 code: FINDING_LOOP_STALLED,
                 detail: format!(
                     "max gap {}ms over {}ms stall bound",
-                    self.max_gap_ms, self.config.stall_gap_ms
+                    gap_ms, self.config.stall_gap_ms
                 ),
                 at_tick: None,
             });
@@ -274,12 +280,31 @@ mod tests {
         assert!(report.is_clean());
         assert_eq!(report.ticks_observed, 120);
         assert_eq!(report.max_tick_ms, 2);
-        assert_eq!(report.max_gap_ms, 45);
+        assert_eq!(report.max_gap_ms, Some(45));
         assert_eq!(report.steady_event_loss, Some(0));
         assert_eq!(report.steady_discovery_loss, Some(0));
         let line = report.report_line();
         assert!(line.contains("p11scope: longrun: clean"), "{line}");
         assert!(line.contains("ticks 120"), "{line}");
+    }
+
+    #[test]
+    fn unobserved_drain_gap_never_reports_a_measured_zero() {
+        let mut detector = LongRunDetector::default();
+        detector.note_tick(1, 2);
+        detector.note_first_drain_loss(None, 0);
+        let line = detector.finish(0, 0).report_line();
+        assert!(line.contains("max gap n/a"), "{line}");
+    }
+
+    #[test]
+    fn observed_zero_drain_gap_remains_a_measured_zero() {
+        let mut detector = LongRunDetector::default();
+        detector.note_tick(1, 2);
+        detector.note_first_drain_loss(Some(0), 0);
+        detector.note_gap(0);
+        let line = detector.finish(0, 0).report_line();
+        assert!(line.contains("max gap 0ms"), "{line}");
     }
 
     // T2 (RED): a tick past the forced-sweep max is a finding.
@@ -317,7 +342,7 @@ mod tests {
             .expect("loop_stalled finding");
         assert_eq!(finding.at_tick, None);
         assert!(finding.detail.contains("12000ms"), "{}", finding.detail);
-        assert_eq!(report.max_gap_ms, 12_000);
+        assert_eq!(report.max_gap_ms, Some(12_000));
     }
 
     #[test]

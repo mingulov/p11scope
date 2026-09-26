@@ -11870,7 +11870,11 @@ impl Engine {
                 "live loader arming",
                 "loader generation, mapping, or pinned identity changed during attach",
             );
-            if matches!(self.scope, Scope::Pid(_)) {
+            // A named target that provably exited mid-arm is the target
+            // ending: its retirement is queued as an expected removal and the
+            // capture ends the ordinary way. Only a replaced or unprovable
+            // generation fails the named capture.
+            if matches!(self.scope, Scope::Pid(_)) && !self.original_exited(view_id) {
                 return Err(LoaderArmFailure::ordinary(anyhow!(
                     "the named process generation changed during loader attachment"
                 )));
@@ -12227,8 +12231,13 @@ impl Engine {
                     "live loader arming",
                     "the process generation changed before the loader-arm postcheck",
                 );
+                // `generation_valid` is false for an exit and a replacement
+                // alike; the retained pin tells them apart, as it does for
+                // `queue_retirement`, which already queued an expected removal.
+                let exited = self.original_exited(view_id);
                 match failure {
                     Some(LoaderArmFailure::Invariant(error)) => Err(error),
+                    _ if named && exited => Ok(changed),
                     Some(LoaderArmFailure::Ordinary(error)) if named => Err(error),
                     _ if named => {
                         bail!("the named process generation changed during loader arming")
@@ -12810,6 +12819,29 @@ impl Engine {
             }
         }
         Ok((changed, true))
+    }
+
+    /// Whether an inventory preflight's stale views include a generation
+    /// that was *lost*, not one that merely ended. A newly opened view is
+    /// counted as before; a retained view whose original pin proves it exited
+    /// is the process ending, which `queue_retirement` turns into an expected
+    /// removal — and for a named target, the ordinary end of the capture.
+    /// Asked before the retirement drops the view, while the pin is still held.
+    fn inventory_preflight_lost_generation(
+        &self,
+        retained_stale: &BTreeSet<ProcessViewId>,
+        stale: &BTreeSet<ProcessViewId>,
+    ) -> bool {
+        self.retained_generation_lost(retained_stale)
+            || stale.iter().any(|view| !retained_stale.contains(view))
+    }
+
+    /// Whether any of these retained views changed generation other than by
+    /// a provable exit of its original process.
+    fn retained_generation_lost(&self, retained_stale: &BTreeSet<ProcessViewId>) -> bool {
+        retained_stale
+            .iter()
+            .any(|view| !self.original_exited(*view))
     }
 
     fn queue_stale_views(
@@ -14424,6 +14456,8 @@ impl Engine {
                 .intersection(&retained_ids)
                 .copied()
                 .collect();
+            let generation_lost =
+                self.inventory_preflight_lost_generation(&retained_stale, &admission.stale_views);
             self.queue_stale_views(&retained_stale, pending_views);
             for (view, _, _) in new_views.iter() {
                 if admission.stale_views.contains(&view.id()) {
@@ -14431,10 +14465,14 @@ impl Engine {
                     failed_refresh_pids.insert(view.pid());
                 }
             }
-            self.mark_live_loss(
-                "live inventory generation",
-                "an exact retained or newly opened process generation changed during inventory preflight",
-            );
+            if generation_lost {
+                self.mark_live_loss(
+                    "live inventory generation",
+                    "an exact retained or newly opened process generation changed during inventory preflight",
+                );
+            } else {
+                self.invalidate_causal_timing();
+            }
             changed |= self.process_discovery_records(
                 session,
                 records,
@@ -14568,17 +14606,22 @@ impl Engine {
                 .intersection(&retained_ids)
                 .copied()
                 .collect();
+            let generation_lost =
+                self.inventory_preflight_lost_generation(&retained_stale, &admission.stale_views);
+            let retained_lost = self.retained_generation_lost(&retained_stale);
             for (view, _, _) in new_views.iter() {
                 if admission.stale_views.contains(&view.id()) {
                     self.request_refresh(view.pid());
                     failed_refresh_pids.insert(view.pid());
                 }
             }
-            if !admission.stale_views.is_empty() {
+            if generation_lost {
                 self.mark_live_loss(
                     "live inventory generation",
                     "an exact retained or newly opened process generation changed during post-retirement preflight",
                 );
+            } else if !admission.stale_views.is_empty() {
+                self.invalidate_causal_timing();
             }
             let outcome = ApplyOutcome {
                 stale_views: retained_stale,
@@ -14612,7 +14655,7 @@ impl Engine {
             for view in removed.iter().chain(&refreshed_ok) {
                 self.scan_inputs.remove(view);
             }
-            if matches!(self.scope, Scope::Pid(_)) && !outcome.stale_views.is_empty() {
+            if matches!(self.scope, Scope::Pid(_)) && retained_lost {
                 bail!("the named process generation changed during inventory preflight");
             }
             return Ok(changed);
@@ -15506,6 +15549,9 @@ pub(crate) mod session_fixture {
         /// Killed and reaped after one dynamic link mutation, before its
         /// generation postcheck.
         kill_on_dynamic_attach: Option<u32>,
+        /// Killed and reaped inside the next `attach_dynamic_loader`, i.e.
+        /// between a loader arm's generation precheck and its postcheck.
+        kill_on_dynamic_loader_attach: Option<u32>,
         /// Pids whose dynamic export attach fails ordinarily: no link is
         /// recorded and no detach bookkeeping is damaged, so the tick stays
         /// open. Mirrors a fixed-purpose attach error, not a refusal.
@@ -15636,6 +15682,13 @@ pub(crate) mod session_fixture {
 
         pub(crate) fn lose_generation_at_dynamic_attach(&mut self, pid: u32) {
             self.kill_on_dynamic_attach = Some(pid);
+        }
+
+        /// Schedules a generation loss inside the next `attach_dynamic_loader`:
+        /// kills and reaps `pid` between the loader arm's generation precheck
+        /// and its postcheck.
+        pub(crate) fn lose_generation_at_dynamic_loader_attach(&mut self, pid: u32) {
+            self.kill_on_dynamic_loader_attach = Some(pid);
         }
 
         pub(crate) fn fail_dynamic_attach_for(&mut self, pid: u32) {
@@ -15820,6 +15873,9 @@ pub(crate) mod session_fixture {
                 .map_err(DynamicLoaderAttachFailure::Registry)?;
             self.dynamic_loader_links.push(identity);
             self.dynamic_loader_attach_calls += 1;
+            if let Some(pid) = self.kill_on_dynamic_loader_attach.take() {
+                kill_and_reap(pid);
+            }
             Ok(false)
         }
 

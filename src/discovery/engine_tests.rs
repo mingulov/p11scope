@@ -10703,6 +10703,105 @@ fn rt_add_deferral_fallback_after_target_exit_is_bounded_loss_not_fatal() {
     assert!(engine.discovery_truncated > truncated_before);
 }
 
+/// Asserts the named capture ended the ordinary way after its target exited:
+/// the view retired as an expected removal, and no generation loss was
+/// published for a process that provably just ended.
+fn assert_named_target_exit_ended_capture(engine: &Engine) {
+    assert!(
+        engine.expected_target_exit(),
+        "the capture ends as a target exit: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(engine.views.is_empty());
+    assert!(
+        engine.counters.object_skips.iter().all(|skip| {
+            skip.subject != "live discovery generation"
+                && skip.subject != "live inventory generation"
+                && !skip.reason.contains("generation changed")
+        }),
+        "a proven exit is not a lost generation: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// RB-1 remainder, loader arming. A `--pid`/`run` target that exits while its
+/// loader context is being attached failed the whole capture with "the named
+/// process generation changed during loader attachment": `still_the_same()` is
+/// false for an exit and a replacement alike, and the arm path never asked the
+/// retained pin which one it was. A provable exit is the target ending.
+#[test]
+fn named_target_exit_during_loader_arming_ends_the_capture_not_fails_it() {
+    let (_fixture, view, _module, _pins) = loaded_seed_provider();
+    let pid = view.pid();
+    let view_id = view.id();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Pid(pid);
+    engine.next_view_id = 1;
+    engine.views.push(view);
+    let mut session = ScriptedSession::default();
+    session.lose_generation_at_dynamic_loader_attach(pid);
+    let mut pending = PendingViewRetirements::new();
+
+    let armed = engine.arm_loader_or_partial(0, &mut session, &mut true, &mut pending);
+
+    armed.expect("a named target that exited mid-arm is not a capture failure");
+    assert_eq!(session.dynamic_loader_attach_calls, 1);
+    assert_eq!(
+        pending.get(&view_id),
+        Some(&RetirementCause::ExpectedRemoval)
+    );
+    apply_ordinary_batch(&mut engine, &mut session, Vec::new())
+        .expect("the next batch retires the exited target");
+    assert_named_target_exit_ended_capture(&engine);
+    assert!(engine.loader_registry.ids_for_view(view_id).is_empty());
+}
+
+/// RB-1 remainder, inventory preflight. A named target that exits between a
+/// refresh's scan and either inventory preflight is the target ending, not a
+/// changed generation: the capture ends as a target exit with its report.
+/// The post-retirement preflight used to fail the capture with "the named
+/// process generation changed during inventory preflight"; the first one
+/// published a false generation loss.
+#[test]
+fn named_target_exit_during_inventory_preflight_ends_the_capture_not_fails_it() {
+    for (label, losses) in [
+        ("first", vec![Some(())]),
+        ("post-retirement", vec![None, Some(())]),
+    ] {
+        // The preflight kills and reaps this child; the test never waits on it.
+        let pid = spawn_execed_sleep().id();
+        let mut engine = Engine::empty();
+        engine.scope = Scope::Pid(pid);
+        engine.next_view_id = 1;
+        engine
+            .views
+            .push(ProcessView::open(ProcessViewId(0), pid).unwrap());
+        engine.request_refresh(pid);
+        engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+        let mut session = ScriptedSession::default();
+        session.lose_generations_at_preflight(losses.iter().map(|loss| loss.map(|()| pid)));
+        let mut collect: Box<DiscoveryCollector<'_>> = Box::new(Engine::collect_discovery_records);
+
+        let refreshed = engine.refresh_inventory(
+            &mut session,
+            &mut true,
+            &mut Vec::new(),
+            &mut PendingViewRetirements::new(),
+            &mut *collect,
+            &mut PauseClosure::new(true),
+        );
+
+        refreshed.unwrap_or_else(|error| {
+            panic!("{label} preflight: a named target's exit is not a capture failure: {error:#}")
+        });
+        assert!(
+            session.preflight_targets.borrow().len() >= losses.len(),
+            "{label}: the scripted exit ran inside that preflight"
+        );
+        assert_named_target_exit_ended_capture(&engine);
+    }
+}
+
 /// Mutation caught: an expected process exit cannot silently discard a
 /// deferred memory acquisition that never ran.
 #[test]

@@ -452,6 +452,15 @@ C_DigestInit                       50      0     2.0µs     4.1µs    65.5µs   
 Evidence: 136/136 probes attached · 68 slots · 0 aliased · 0 skipped · 0 in-flight → COMPLETE
 ```
 
+A current capture's evidence line names why it is `PARTIAL`, grouped by the
+same classes `evidence.gap_classes` publishes, for example
+`→ PARTIAL: attribution withheld (68 semantics-unverified/count-only slots)`
+for a clean scan-only capture (`verdict_detail: "attribution_only"`: counts
+are exact, only semantic interpretation is withheld), or
+`→ PARTIAL: observation lossy (12 events lost)` for a lossy one
+(`"concrete_gap"`). `→ PARTIAL: terminal drain unproven` means nothing
+concrete is behind the verdict (`"clean_but_unproven"`).
+
 **Historical pre-terminal-drain output**, `trace` against the same workload
 (`scripts/verify-attach-e2e.sh`'s harness, captured while writing this doc —
 `sess#N` is a per-capture pseudonym, never the provider's raw session handle):

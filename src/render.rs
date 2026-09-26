@@ -1298,25 +1298,6 @@ pub fn live(
         ));
     }
     s.push_str("(~ = log2-bucket approximation, lower bound)\n");
-    let surface_gaps = ev
-        .surfaces
-        .iter()
-        .filter(|s| s.walk != "full" || s.acquisition != "ok")
-        .count();
-    let state_gaps = ev.process_tracking_failures
-        + ev.process_tracking_evictions
-        + ev.state_reconciliations
-        + ev.session_cancel_ambiguities
-        + ev.session_cancel_unknown_flags
-        + ev.operation_state_imports
-        + ev.auth_state_ambiguities
-        + ev.async_target_failures
-        + ev.async_orphans
-        + ev.async_duplicates
-        + ev.async_evictions
-        + ev.fork_state_ambiguities
-        + ev.semantic_state_drops
-        + ev.pending_at_end;
     let mut evidence_line = format!(
         "Evidence: {}/{} probes attached · {} slots ({} active) · {} aliased · {} skipped · {} in-flight",
         ev.attached_probes,
@@ -1332,86 +1313,6 @@ pub fn live(
             " · semantic_history_drops={}",
             ev.semantic_history_drops
         ));
-    }
-    // Gap fragments in render order — discovery first, since it explains a
-    // PARTIAL verdict that has no attach failure and no skip behind it. The
-    // gate derives from these same fragments, so a new gap cannot be added
-    // without surfacing.
-    let mut gap_fragments: Vec<String> = Vec::new();
-    if ev.discovery.modules.is_empty() {
-        gap_fragments.push("no modules discovered".to_string());
-    }
-    if let Some(reason) = &ev.discovery.scan_unavailable {
-        gap_fragments.push(format!("scan unavailable ({reason})"));
-    }
-    // A module still attached on the endpoints it had when its growth did
-    // not fit is partially covered, not refused (G-03).
-    let partially_covered = ev
-        .discovery
-        .modules_skipped
-        .iter()
-        .filter(|module| crate::plan::is_growth_omission(&module.reason))
-        .count();
-    let refused = ev.discovery.modules_skipped.len() - partially_covered;
-    for (label, count) in [
-        ("discovery conflicts", ev.discovery.conflicts),
-        ("uncorroborated modules", ev.discovery.uncorroborated),
-        ("module-ambiguous slots", ev.discovery.module_ambiguous),
-        ("modules refused", refused as u64),
-        ("modules partially covered", partially_covered as u64),
-        ("surface gaps", surface_gaps as u64),
-        ("vendor interfaces", ev.vendor_interfaces as u64),
-        ("events lost", ev.event_loss),
-        ("start inserts failed", ev.start_insert_failures),
-        ("unmatched returns", ev.unmatched_returns),
-        ("RV updates failed", ev.rv_update_failures),
-        ("cgroup checks failed", ev.cgroup_scope_failures),
-        ("ABI probe hits refused", ev.abi_refusals),
-        ("semantic captures failed", ev.semantic_capture_failures),
-        ("unregistered mechanisms", ev.unregistered_mechanisms),
-        ("template tail calls failed", ev.template_tail_failures),
-    ] {
-        if count > 0 {
-            gap_fragments.push(format!("{count} {label}"));
-        }
-    }
-    if ev.semantic_unverified_slots > 0 {
-        gap_fragments.push(format!(
-            "{} semantics-unverified/count-only slot{}",
-            ev.semantic_unverified_slots,
-            if ev.semantic_unverified_slots == 1 {
-                ""
-            } else {
-                "s"
-            }
-        ));
-    }
-    for (label, count) in [
-        ("semantic state gaps", state_gaps),
-        ("malformed records", ev.malformed_records),
-    ] {
-        if count > 0 {
-            gap_fragments.push(format!("{count} {label}"));
-        }
-    }
-    if ev.templates_truncated {
-        gap_fragments.push("templates truncated".to_string());
-    }
-    if ev.shape_decode_total_failures > 0 {
-        gap_fragments.push(format!(
-            "{} mechanisms never decoded",
-            ev.shape_decode_total_failures
-        ));
-    }
-    if ev.provider_changed {
-        gap_fragments.push("provider changed".to_string());
-    }
-    if !gap_fragments.is_empty() {
-        evidence_line.push_str(" ·");
-        for fragment in &gap_fragments {
-            evidence_line.push(' ');
-            evidence_line.push_str(fragment);
-        }
     }
     let mut info_fragments: Vec<String> = Vec::new();
     for (label, count) in [
@@ -1431,9 +1332,196 @@ pub fn live(
         evidence_line.push_str(" · ");
         evidence_line.push_str(&info_fragments.join(" "));
     }
-    evidence_line.push_str(&format!(" → {}\n", ev.completeness));
+    // F-13: why the verdict is what it is, from the classes the verdict used,
+    // so a gate can never force PARTIAL without being named here.
+    evidence_line.push_str(&format!(" → {}{}\n", ev.completeness, verdict_reasons(ev)));
     s.push_str(&evidence_line);
     s
+}
+
+/// `": observation lossy (12 events lost); attribution withheld (68
+/// semantics-unverified/count-only slots)"` — one group per class with a
+/// cause, from `ev.gap_classes` — or `": terminal drain unproven"` when the
+/// terminal seal is the only reason. Empty when `COMPLETE`.
+fn verdict_reasons(ev: &Evidence) -> String {
+    if ev.completeness == "COMPLETE" {
+        return String::new();
+    }
+    let classes = &ev.gap_classes;
+    let mut groups: Vec<String> = [
+        ("observation", &classes.observation),
+        ("attribution", &classes.attribution),
+        ("semantics", &classes.semantics),
+    ]
+    .into_iter()
+    .filter_map(|(label, class)| {
+        let fragments = cause_fragments(ev, &class.causes);
+        (!fragments.is_empty())
+            .then(|| format!("{label} {} ({})", class.status, fragments.join(", ")))
+    })
+    .collect();
+    if groups.is_empty() && !ev.drain_proven {
+        groups.push("terminal drain unproven".into());
+    }
+    if groups.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", groups.join("; "))
+    }
+}
+
+/// The reducer-state counters the live line aggregates into one
+/// "semantic state gaps" fragment.
+fn semantic_state_counter(ev: &Evidence, cause: &str) -> Option<u64> {
+    Some(match cause {
+        "process_tracking_failures" => ev.process_tracking_failures,
+        "process_tracking_evictions" => ev.process_tracking_evictions,
+        "state_reconciliations" => ev.state_reconciliations,
+        "session_cancel_ambiguities" => ev.session_cancel_ambiguities,
+        "session_cancel_unknown_flags" => ev.session_cancel_unknown_flags,
+        "operation_state_imports" => ev.operation_state_imports,
+        "auth_state_ambiguities" => ev.auth_state_ambiguities,
+        "async_target_failures" => ev.async_target_failures,
+        "async_orphans" => ev.async_orphans,
+        "async_duplicates" => ev.async_duplicates,
+        "async_evictions" => ev.async_evictions,
+        "fork_state_ambiguities" => ev.fork_state_ambiguities,
+        "semantic_state_drops" => ev.semantic_state_drops,
+        "pending_at_end" => ev.pending_at_end,
+        _ => return None,
+    })
+}
+
+/// One human fragment per verdict cause, stating the count behind it. A
+/// cause without a phrase renders as its own field name, so a new gate
+/// always surfaces.
+fn cause_fragments(ev: &Evidence, causes: &[&'static str]) -> Vec<String> {
+    let count = |n: u64, label: &str| format!("{n} {label}");
+    let mut fragments = Vec::new();
+    let mut state_gaps = 0u64;
+    for &cause in causes {
+        if let Some(value) = semantic_state_counter(ev, cause) {
+            state_gaps = state_gaps.saturating_add(value);
+            continue;
+        }
+        let fragment = match cause {
+            "discovery" => "no modules discovered".to_string(),
+            "slots" => "no slots planned".to_string(),
+            "scan_unavailable" => format!(
+                "scan unavailable ({})",
+                ev.discovery
+                    .scan_unavailable
+                    .as_deref()
+                    .unwrap_or("unknown")
+            ),
+            "modules_skipped" => {
+                // A module still attached on the endpoints it had when its
+                // growth did not fit is partially covered, not refused (G-03).
+                let partially_covered = ev
+                    .discovery
+                    .modules_skipped
+                    .iter()
+                    .filter(|module| crate::plan::is_growth_omission(&module.reason))
+                    .count() as u64;
+                let refused = ev.discovery.modules_skipped.len() as u64 - partially_covered;
+                for (n, label) in [
+                    (refused, "modules refused"),
+                    (partially_covered, "modules partially covered"),
+                ] {
+                    if n > 0 {
+                        fragments.push(count(n, label));
+                    }
+                }
+                continue;
+            }
+            "attach_failures" => count(ev.attach_failures.len() as u64, "attach failures"),
+            "skipped" => count(
+                ev.skipped
+                    .iter()
+                    .filter(|skip| skip.reason != NULL_POINTER_REASON)
+                    .count() as u64,
+                "entries skipped",
+            ),
+            "in_flight_at_end" => count(ev.in_flight_at_end, "calls in flight"),
+            "surfaces" => count(
+                ev.surfaces
+                    .iter()
+                    .filter(|s| s.walk != "full" || s.acquisition != "ok")
+                    .count() as u64,
+                "surface gaps",
+            ),
+            "vendor_interfaces" => count(ev.vendor_interfaces as u64, "vendor interfaces"),
+            "interface_list" => "interface list failed".to_string(),
+            "event_loss" => count(ev.event_loss, "events lost"),
+            "start_insert_failures" => count(ev.start_insert_failures, "start inserts failed"),
+            "unmatched_returns" => count(ev.unmatched_returns, "unmatched returns"),
+            "rv_update_failures" => count(ev.rv_update_failures, "RV updates failed"),
+            "cgroup_scope_failures" => count(ev.cgroup_scope_failures, "cgroup checks failed"),
+            "abi_refusals" => count(ev.abi_refusals, "ABI probe hits refused"),
+            "malformed_records" => count(ev.malformed_records, "malformed records"),
+            "provider_changed" => "provider changed".to_string(),
+            "unprotected_live_windows" => "unprotected live window".to_string(),
+            "discovery_ring_loss" => count(ev.discovery_ring_loss, "discovery records lost"),
+            "discovery_state_failures" => {
+                count(ev.discovery_state_failures, "discovery state failures")
+            }
+            "discovery_read_failures" => {
+                count(ev.discovery_read_failures, "discovery read failures")
+            }
+            "discovery_truncated" => count(ev.discovery_truncated, "discovery records truncated"),
+            "task_uprobe_link_losses" => {
+                count(ev.task_uprobe_link_losses, "task-uprobe links lost")
+            }
+            "pause_partial" => count(ev.pause_partial, "partial pauses"),
+            "loader_discovery" => "live loader timing unproven".to_string(),
+            "scheduling.terminal_drain_truncated" => "terminal drain truncated".to_string(),
+            "scheduling.sink_dropped_bytes" => {
+                count(ev.scheduling.sink_dropped_bytes, "output bytes dropped")
+            }
+            "interface_selection" => "interface selection incomplete".to_string(),
+            "pid_descendant_gaps" => count(ev.pid_descendant_gaps, "descendant gaps"),
+            "multi_rebuild_gaps" => count(ev.multi_rebuild_gaps, "multi-attach rebuild gaps"),
+            "semantic_unverified_slots" => format!(
+                "{} semantics-unverified/count-only slot{}",
+                ev.semantic_unverified_slots,
+                if ev.semantic_unverified_slots == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ),
+            "aliased" => count(ev.aliased.len() as u64, "aliased slots"),
+            "module_ambiguous" => count(ev.discovery.module_ambiguous, "module-ambiguous slots"),
+            "module_unresolved_slots" => count(ev.module_unresolved_slots as u64, "unowned slots"),
+            "unregistered_mechanisms" => {
+                count(ev.unregistered_mechanisms, "unregistered mechanisms")
+            }
+            "discovery_conflicts" => count(ev.discovery.conflicts, "discovery conflicts"),
+            "discovery_uncorroborated" => {
+                count(ev.discovery.uncorroborated, "uncorroborated modules")
+            }
+            "interface_selection.selection_count_only" => {
+                "count-only interface selection".to_string()
+            }
+            "semantic_capture_failures" => {
+                count(ev.semantic_capture_failures, "semantic captures failed")
+            }
+            "template_tail_failures" => {
+                count(ev.template_tail_failures, "template tail calls failed")
+            }
+            "semantic_history_drops" => count(ev.semantic_history_drops, "semantic history drops"),
+            "templates_truncated" => "templates truncated".to_string(),
+            "shape_decode_total_failures" => {
+                count(ev.shape_decode_total_failures, "mechanisms never decoded")
+            }
+            other => other.to_string(),
+        };
+        fragments.push(fragment);
+    }
+    if state_gaps > 0 {
+        fragments.push(count(state_gaps, "semantic state gaps"));
+    }
+    fragments
 }
 
 /// The module a slot's counts belong to, as `functions[]` renders it.
@@ -3441,6 +3529,55 @@ pub(crate) mod tests {
         assert_eq!(v["evidence"]["discovery"][0]["interfaces"], 3);
     }
 
+    /// F-13: the evidence line names why a verdict is PARTIAL, from the
+    /// same classes the verdict uses — including gates that used to have no
+    /// fragment (an unprotected live window) and the terminal seal alone.
+    #[test]
+    fn live_view_names_why_the_verdict_is_partial() {
+        let frame = |mutate: fn(&mut Evidence), seal: bool| {
+            let mut ev = evidence();
+            mutate(&mut ev);
+            ev.verdict();
+            if seal {
+                ev.mark_terminal_drain_unproven();
+            }
+            live(
+                &[],
+                &ev,
+                Duration::ZERO,
+                "/opt/p11.so",
+                "profile",
+                CapturePolicy::Allowlisted,
+            )
+        };
+        let out = frame(|ev| ev.event_loss = 12, false);
+        assert!(
+            out.contains("→ PARTIAL: observation lossy (12 events lost)"),
+            "{out}"
+        );
+        let out = frame(|ev| ev.semantic_unverified_slots = 68, true);
+        assert!(
+            out.contains(
+                "→ PARTIAL: attribution withheld (68 semantics-unverified/count-only slots)"
+            ),
+            "{out}"
+        );
+        let out = frame(|ev| ev.unprotected_live_windows = 1, false);
+        assert!(
+            out.contains("→ PARTIAL: observation lossy (unprotected live window)"),
+            "{out}"
+        );
+        let out = frame(|ev| ev.pending_at_end = 2, false);
+        assert!(
+            out.contains("→ PARTIAL: semantics degraded (2 semantic state gaps)"),
+            "{out}"
+        );
+        let out = frame(|_| {}, true);
+        assert!(out.contains("→ PARTIAL: terminal drain unproven"), "{out}");
+        let out = frame(|_| {}, false);
+        assert!(out.trim_end().ends_with("→ COMPLETE"), "{out}");
+    }
+
     #[test]
     fn live_view_shows_every_discovery_gap_behind_a_partial_verdict() {
         let mut ev = evidence();
@@ -3879,9 +4016,9 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn live_view_gap_fragments_render_in_discovery_first_order() {
-        // MED: the gap block is table-driven; discovery stays first by
-        // documented intent, so pin the relative order, not exact bytes.
+    fn live_view_gap_fragments_render_in_class_order() {
+        // MED: the gap block is table-driven; pin the relative order, not
+        // exact bytes.
         let mut ev = evidence();
         ev.discovery.conflicts = 1;
         ev.event_loss = 2;
@@ -3896,11 +4033,15 @@ pub(crate) mod tests {
             "profile",
             CapturePolicy::Allowlisted,
         );
+        // F-13: fragments group by class — observation, then attribution —
+        // each in its gate order.
         let positions = [
-            out.find("1 discovery conflicts").unwrap(),
+            out.find("observation lossy (").unwrap(),
             out.find("2 events lost").unwrap(),
             out.find("3 malformed records").unwrap(),
             out.find("provider changed").unwrap(),
+            out.find("attribution withheld (").unwrap(),
+            out.find("1 discovery conflicts").unwrap(),
         ];
         assert!(
             positions.windows(2).all(|w| w[0] < w[1]),

@@ -3318,7 +3318,7 @@ fn task4_detailed_identity_source_serialization_synthetic_bundle() -> Result<()>
                 return_program + 4,
                 "other",
                 "task_newtask",
-                bpf_link_type::BPF_LINK_TYPE_TRACING as u32,
+                bpf_link_type::BPF_LINK_TYPE_RAW_TRACEPOINT as u32,
             ),
         ]
         .into_iter()
@@ -4187,11 +4187,13 @@ fn task4_record_registration(
         if role != "other" {
             ensure!(info.raw.type_ == bpf_link_type::BPF_LINK_TYPE_PERF_EVENT as u32);
         } else {
-            let expected = if program == "task_newtask" {
-                bpf_link_type::BPF_LINK_TYPE_TRACING as u32
-            } else {
-                bpf_link_type::BPF_LINK_TYPE_RAW_TRACEPOINT as u32
-            };
+            // All three lifecycle hooks report a raw-tracepoint link. The
+            // typed `task_newtask` is a tp_btf program (TRACING +
+            // BPF_TRACE_RAW_TP), which the kernel attaches through
+            // bpf_raw_tp_link_attach, not bpf_tracing_prog_attach: only
+            // fentry/fexit/fmod_ret get a TRACING link. Measured on host 7.0
+            // and every vng kernel 5.15.0-187..7.2.6.
+            let expected = bpf_link_type::BPF_LINK_TYPE_RAW_TRACEPOINT as u32;
             ensure!(
                 info.raw.type_ == expected,
                 "Detailed lifecycle link type differs from retained attach role"
@@ -4322,7 +4324,6 @@ fn task4_replay_registration(bytes: &[u8], offsets_bytes: &[u8], phase: &str) ->
             };
             let kind = match role {
                 "return" | "entry" => bpf_link_type::BPF_LINK_TYPE_PERF_EVENT as u64,
-                "other" if program == "task_newtask" => bpf_link_type::BPF_LINK_TYPE_TRACING as u64,
                 "other" => bpf_link_type::BPF_LINK_TYPE_RAW_TRACEPOINT as u64,
                 _ => unreachable!(),
             };
@@ -4409,9 +4410,7 @@ fn task4_detailed_registration_rejects_missing_tail_entry_and_kernel_link() -> R
         rows.push(serde_json::json!({
             "kind":"kernel_link","phase":"attached","position":index+4,
             "link_id":index+104,"program_id":index+20,
-            "type":if program=="task_newtask" {
-                bpf_link_type::BPF_LINK_TYPE_TRACING as u32
-            } else {bpf_link_type::BPF_LINK_TYPE_RAW_TRACEPOINT as u32},
+            "type":bpf_link_type::BPF_LINK_TYPE_RAW_TRACEPOINT as u32,
             "info_len":32,
             "role":"other","program":program,
             "session_generation":1,"stats_map_id":21,"scope_pid":77,
@@ -4969,7 +4968,8 @@ fn task4_fixture_receipt(fixture: &OwnedFixture) -> Result<()> {
         .iter()
         .map(|slot| {
             serde_json::json!({
-                "dev": metadata.dev(), "ino": metadata.ino(), "offset": slot.file_offset,
+                "object": slot.object.0, "dev": metadata.dev(), "ino": metadata.ino(),
+                "offset": slot.file_offset,
             })
         })
         .collect();

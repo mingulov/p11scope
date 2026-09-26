@@ -623,7 +623,15 @@ promise. With no `--pid`, target readability is explicitly `unassessed`.
 `doctor --extra-strict` is the qualification gate: it refuses (exit 1, with
 an `extra-strict refusal:` line naming every violating row) when any assessed
 lane warns or fails, and states `extra-strict: no qualification violations`
-when the host is fully clean.
+when the host is fully clean. Three rows are limits of this build, the same
+on every host, and are listed on an `extra-strict: not counted` line instead
+of refusing: the two `loader timing` rows (`unproven`/`none`: the loader
+timing catalog is empty) and `run initial-set capture: none` (an owned `run`
+cannot prove it captured its child's initial provider set, so its reports
+stay `PARTIAL`; `run` itself works, and the verdict line says so). A
+`kernel.perf_event_paranoid` or `kernel.yama.ptrace_scope` restriction is
+`ok` when doctor holds the capability that lifts it (`CAP_SYS_ADMIN`;
+`CAP_SYS_PTRACE` for Yama 1-2), as under `sudo`.
 
 | Tier | Proven prefix | Meaning and loss |
 | --- | --- | --- |

@@ -143,11 +143,14 @@ fn bounded_verifier_diagnostic(verifier_text: &str) -> String {
 }
 
 const KERNEL_FLOOR: (u32, u32) = (5, 15);
+const CAP_SYS_PTRACE_BIT: u32 = 19;
+const CAP_SYS_ADMIN_BIT: u32 = 21;
+
 /// Named diagnostic bits decoded from `CapEff` in `/proc/self/status`.
 const CAP_BITS: [(u32, &str); 6] = [
     (2, "CAP_DAC_READ_SEARCH"),
-    (19, "CAP_SYS_PTRACE"),
-    (21, "CAP_SYS_ADMIN"),
+    (CAP_SYS_PTRACE_BIT, "CAP_SYS_PTRACE"),
+    (CAP_SYS_ADMIN_BIT, "CAP_SYS_ADMIN"),
     (38, "CAP_PERFMON"),
     (39, "CAP_BPF"),
     (40, "CAP_CHECKPOINT_RESTORE"),
@@ -157,6 +160,7 @@ const CAP_BITS: [(u32, &str); 6] = [
 /// `verdict`) so the table layout and exit code are testable without any of
 /// these probes running.
 pub fn probe(pid: Option<u32>, cgroup: Option<&Path>) -> Vec<Check> {
+    let held = |bit: u32| read_cap_eff().is_ok_and(|mask| mask & (1u64 << bit) != 0);
     let mut checks = vec![
         kernel_release_check(),
         btf_check(),
@@ -166,12 +170,24 @@ pub fn probe(pid: Option<u32>, cgroup: Option<&Path>) -> Vec<Check> {
             "/proc/sys/kernel/perf_event_paranoid",
             3,
             "uprobes need CAP_SYS_ADMIN on this host",
+            // Every paranoid level leaves perf events to CAP_SYS_ADMIN.
+            Some(SysctlLift {
+                capability: "CAP_SYS_ADMIN",
+                up_to: i64::MAX,
+                held: held(CAP_SYS_ADMIN_BIT),
+            }),
         ),
         sysctl_check(
             "kernel.yama.ptrace_scope",
             "/proc/sys/kernel/yama/ptrace_scope",
             1,
             "same-uid non-descendants need CAP_SYS_PTRACE",
+            // Yama 1 and 2 yield to CAP_SYS_PTRACE; 3 forbids attach to all.
+            Some(SysctlLift {
+                capability: "CAP_SYS_PTRACE",
+                up_to: 2,
+                held: held(CAP_SYS_PTRACE_BIT),
+            }),
         ),
         capabilities_check(),
     ];
@@ -334,22 +350,54 @@ fn lockdown_check() -> Check {
 /// `Ok` below `warn_at`, `Warn` at or above it (with the actionable reason),
 /// and `Ok` when the file is absent — an absent restriction is permissive,
 /// not a problem.
-fn sysctl_check(name: &str, path: &str, warn_at: i64, warn_msg: &str) -> Check {
-    let status = match std::fs::read_to_string(path) {
+fn sysctl_check(
+    name: &str,
+    path: &str,
+    warn_at: i64,
+    warn_msg: &str,
+    lift: Option<SysctlLift>,
+) -> Check {
+    Check {
+        name: name.to_string(),
+        status: sysctl_status(std::fs::read_to_string(path), path, warn_at, warn_msg, lift),
+    }
+}
+
+/// The capability that lifts a restrictive sysctl value (for values up to
+/// `up_to`), and whether this process holds it. A restriction this process
+/// is exempt from does not limit its captures, so it is not a warning — and
+/// must not fail `--extra-strict` for `sudo p11scope doctor` on a stock
+/// Ubuntu host (`perf_event_paranoid=4`, `ptrace_scope=1`) (HIGH-5).
+struct SysctlLift {
+    capability: &'static str,
+    up_to: i64,
+    held: bool,
+}
+
+fn sysctl_status(
+    read: std::io::Result<String>,
+    path: &str,
+    warn_at: i64,
+    warn_msg: &str,
+    lift: Option<SysctlLift>,
+) -> Status {
+    match read {
         Ok(content) => {
             let trimmed = content.trim();
             match trimmed.parse::<i64>() {
-                Ok(v) if v >= warn_at => Status::Warn(format!("{v} — {warn_msg}")),
+                Ok(v) if v >= warn_at => match lift {
+                    Some(lift) if lift.held && v <= lift.up_to => Status::Ok(format!(
+                        "{v} — {warn_msg}; this process has {}",
+                        lift.capability
+                    )),
+                    _ => Status::Warn(format!("{v} — {warn_msg}")),
+                },
                 Ok(v) => Status::Ok(v.to_string()),
                 Err(_) => Status::Warn(format!("{trimmed}: unparsable value")),
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Status::Ok("not present".to_string()),
         Err(e) => Status::Warn(format!("{path}: {e}")),
-    };
-    Check {
-        name: name.to_string(),
-        status,
     }
 }
 
@@ -1171,8 +1219,13 @@ fn verdict_line(checks: &[Check]) -> String {
             Status::NotApplicable(_) => {}
             Status::Fail(detail) => parts.push(format!("run capture unavailable ({detail})")),
             // The probe reports Warn("none") while the timing catalog is
-            // empty ("never eligible"): that is not availability.
-            Status::Warn(detail) => parts.push(format!("run capture not eligible ({detail})")),
+            // empty ("never eligible"): that is not availability — but `run`
+            // itself still works. What `none` limits is the proof that the
+            // child's initial provider set was captured from its first
+            // constructor, which keeps every `run` report PARTIAL (HIGH-5).
+            Status::Warn(detail) => parts.push(format!(
+                "run initial-set capture {detail} (run reports stay PARTIAL; run itself works)"
+            )),
             Status::Ok(_) => parts.push("run capture available".to_string()),
         }
     }
@@ -1223,13 +1276,37 @@ pub fn verdict(checks: &[Check]) -> i32 {
     if gated { 1 } else { 0 }
 }
 
+/// Rows whose warning is a limit of this build, identical on every host:
+/// the compiled-in loader timing catalog is exactly empty (D3 amendment §3),
+/// so the two timing rows can be no better than `unproven`/`none` and an
+/// owned `run` can never prove it captured its child's initial provider set
+/// (`run initial-set capture: none`, which keeps `run` reports `PARTIAL`).
+/// No host can clear them, so `--extra-strict` — a host qualification —
+/// lists them without counting them (HIGH-5). Only these exact by-design
+/// values are exempt: any other value (a future catalog) counts as usual.
+const BUILD_LIMIT_ROWS: [(&str, &[&str]); 3] = [
+    ("loader timing (initial_set)", &["unproven", "none"]),
+    ("loader timing (dlopen)", &["unproven", "none"]),
+    ("run initial-set capture", &["none"]),
+];
+
+fn is_build_limit(check: &Check) -> bool {
+    let Status::Warn(detail) = &check.status else {
+        return false;
+    };
+    BUILD_LIMIT_ROWS
+        .iter()
+        .any(|(name, values)| check.name == *name && values.contains(&detail.as_str()))
+}
+
 /// Extra-strict qualification (T2): every `Warn` or `Fail` row is a
-/// qualification violation, in any lane — not just the gated rows.
+/// qualification violation, in any lane — not just the gated rows — except
+/// the by-design [`BUILD_LIMIT_ROWS`] values, which no host can clear.
 /// `NotApplicable` rows (lanes nobody requested) never violate.
 pub fn extra_strict_violations(checks: &[Check]) -> Vec<&Check> {
     checks
         .iter()
-        .filter(|c| matches!(c.status, Status::Warn(_) | Status::Fail(_)))
+        .filter(|c| matches!(c.status, Status::Warn(_) | Status::Fail(_)) && !is_build_limit(c))
         .collect()
 }
 
@@ -1250,6 +1327,18 @@ pub fn verdict_extra_strict(checks: &[Check]) -> i32 {
 pub fn render_extra_strict(checks: &[Check]) -> String {
     let mut out = render(checks);
     let violations = extra_strict_violations(checks);
+    let exempt: Vec<&str> = checks
+        .iter()
+        .filter(|c| is_build_limit(c))
+        .map(|c| c.name.as_str())
+        .collect();
+    if !exempt.is_empty() {
+        let _ = writeln!(
+            out,
+            "extra-strict: not counted (limits of this build, the same on every host): {}",
+            exempt.join("; ")
+        );
+    }
     if violations.is_empty() {
         out.push_str("extra-strict: no qualification violations\n");
     } else {
@@ -2106,6 +2195,9 @@ mod tests {
 
         // Fable: the probe always emits Warn("none") ("never eligible while
         // the catalog is empty"), so Warn must not render as "available".
+        // HIGH-5: nor as "run capture not eligible" — `run` itself works on
+        // a capable host; what `none` limits is its initial-set proof, which
+        // keeps its reports PARTIAL.
         let ineligible = vec![Check {
             name: "run initial-set capture".into(),
             status: Status::Warn("none".into()),
@@ -2113,9 +2205,13 @@ mod tests {
         assert_eq!(verdict(&ineligible), 0);
         let line = verdict_line(&ineligible);
         assert!(
-            line.contains("run capture not eligible (none)"),
+            line.contains(
+                "run initial-set capture none (run reports stay PARTIAL; run itself works)"
+            ),
             "verdict text misstates an ineligible lane: {line}"
         );
+        assert!(!line.contains("not eligible"), "{line}");
+        assert!(!line.contains("run capture available"), "{line}");
     }
 
     /// A degraded timing value is a warning: it makes complete timing
@@ -2203,6 +2299,127 @@ mod tests {
         );
     }
 
+    fn capable_host_environment_rows() -> Vec<Check> {
+        [
+            "kernel release",
+            "BTF /sys/kernel/btf/vmlinux",
+            "lockdown",
+            "kernel.perf_event_paranoid",
+            "kernel.yama.ptrace_scope",
+            "effective capabilities",
+            "BPF map create",
+            UPROBE_ATTACH_SELF_ROW,
+            "uretprobe vs seccomp",
+            "cgroup version",
+            "host program preflight",
+            "lifecycle preflight",
+        ]
+        .into_iter()
+        .map(|name| Check {
+            name: name.into(),
+            status: Status::Ok("ok".into()),
+        })
+        .collect()
+    }
+
+    /// HIGH-5: the loader timing rows and `run initial-set capture` warn on
+    /// every host because this build's timing catalog is empty. They are
+    /// limits of the build, not of the host, so a host whose every other
+    /// row is clean must pass `--extra-strict` — and the refusal/pass line
+    /// still names them, so nothing is hidden.
+    #[test]
+    fn extra_strict_passes_a_capable_host_whatever_this_build_cannot_prove() {
+        let mut checks = capable_host_environment_rows();
+        checks.extend(live_discovery_checks(Some(std::process::id()), true));
+        let names = |checks: &[Check]| {
+            extra_strict_violations(checks)
+                .iter()
+                .map(|check| check.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&checks), Vec::<String>::new());
+        assert_eq!(verdict_extra_strict(&checks), 0);
+        let rendered = render_extra_strict(&checks);
+        assert!(
+            rendered.contains("extra-strict: no qualification violations"),
+            "{rendered}"
+        );
+        for row in [
+            "loader timing (initial_set)",
+            "loader timing (dlopen)",
+            "run initial-set capture",
+        ] {
+            let line = rendered
+                .lines()
+                .find(|line| line.starts_with("extra-strict: not counted"))
+                .unwrap_or_else(|| panic!("no not-counted line:\n{rendered}"));
+            assert!(line.contains(row), "{line}");
+        }
+
+        // A real host problem still refuses, beside the exempt rows.
+        checks[0].status = Status::Warn("below floor".into());
+        assert_eq!(names(&checks), vec!["kernel release".to_string()]);
+        // And a build-limit row with a value this build could reach (a
+        // future catalog) is no longer exempt.
+        let mut failed = capable_host_environment_rows();
+        failed.push(Check {
+            name: "run initial-set capture".into(),
+            status: Status::Fail("refused".into()),
+        });
+        assert_eq!(verdict_extra_strict(&failed), 1);
+    }
+
+    /// HIGH-5: a restrictive sysctl is only a limit for a process that
+    /// lacks the capability which lifts it. As root on stock Ubuntu
+    /// (`perf_event_paranoid=4`, `ptrace_scope=1`) neither row limits the
+    /// capture, so neither may fail `--extra-strict`; unprivileged, both
+    /// still warn, and `ptrace_scope=3` binds even root.
+    #[test]
+    fn a_sysctl_lifted_by_a_held_capability_is_not_a_warning() {
+        let paranoid = |held| {
+            sysctl_status(
+                Ok("4\n".into()),
+                "/proc/sys/kernel/perf_event_paranoid",
+                3,
+                "uprobes need CAP_SYS_ADMIN on this host",
+                Some(SysctlLift {
+                    capability: "CAP_SYS_ADMIN",
+                    up_to: i64::MAX,
+                    held,
+                }),
+            )
+        };
+        let Status::Ok(detail) = paranoid(true) else {
+            panic!(
+                "CAP_SYS_ADMIN lifts perf_event_paranoid: {:?}",
+                paranoid(true)
+            );
+        };
+        assert!(detail.starts_with("4 — "), "{detail}");
+        assert!(
+            detail.contains("this process has CAP_SYS_ADMIN"),
+            "{detail}"
+        );
+        assert!(matches!(paranoid(false), Status::Warn(_)));
+
+        let ptrace = |value: &str, held| {
+            sysctl_status(
+                Ok(value.into()),
+                "/proc/sys/kernel/yama/ptrace_scope",
+                1,
+                "same-uid non-descendants need CAP_SYS_PTRACE",
+                Some(SysctlLift {
+                    capability: "CAP_SYS_PTRACE",
+                    up_to: 2,
+                    held,
+                }),
+            )
+        };
+        assert!(matches!(ptrace("1", true), Status::Ok(_)));
+        assert!(matches!(ptrace("1", false), Status::Warn(_)));
+        assert!(matches!(ptrace("3", true), Status::Warn(_)));
+    }
+
     // T2 extra-strict (RED): any Warn refuses, even where the default
     // verdict stays green.
     #[test]
@@ -2256,6 +2473,9 @@ mod tests {
     }
 
     // T2 extra-strict (RED): the render names every violating row.
+    // HIGH-5: `loader timing (dlopen): unproven` used to be the sample warn
+    // here; it is a by-design limit of this build now listed as not counted,
+    // so a genuine host warning stands in for it.
     #[test]
     fn extra_strict_render_names_violating_rows() {
         let checks = vec![
@@ -2264,18 +2484,30 @@ mod tests {
                 status: Status::Fail("EPERM".into()),
             },
             Check {
+                name: "live export reads".into(),
+                status: Status::Warn("unavailable".into()),
+            },
+            Check {
                 name: "loader timing (dlopen)".into(),
                 status: Status::Warn("unproven".into()),
             },
         ];
         let out = render_extra_strict(&checks);
+        let refusal = out
+            .lines()
+            .find(|line| line.starts_with("extra-strict refusal:"))
+            .unwrap_or_else(|| panic!("refusal line missing: {out:?}"));
+        assert!(refusal.contains("BPF map create"), "{out:?}");
+        assert!(refusal.contains("live export reads"), "{out:?}");
+        assert!(refusal.contains("2 qualification violation"), "{out:?}");
+        assert!(!refusal.contains("loader timing (dlopen)"), "{out:?}");
         assert!(
-            out.contains("extra-strict refusal:"),
-            "refusal line missing: {out:?}"
+            out.contains(
+                "extra-strict: not counted (limits of this build, the same on every host): \
+                 loader timing (dlopen)"
+            ),
+            "{out:?}"
         );
-        assert!(out.contains("BPF map create"), "{out:?}");
-        assert!(out.contains("loader timing (dlopen)"), "{out:?}");
-        assert!(out.contains("2 qualification violation"), "{out:?}");
     }
 
     // T2 extra-strict (RED): a clean render says so explicitly.

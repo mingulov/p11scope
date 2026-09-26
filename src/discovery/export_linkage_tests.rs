@@ -284,3 +284,63 @@ fn the_fixture_source_is_the_2_40_layout() {
     assert_eq!(text.matches("unsigned long C_").count(), LEGACY_ORDINALS);
     assert!(text.contains("{ 2, 40, {"));
 }
+
+/// An entry reconciliation could not pin (for example one forwarded into an
+/// object it could not open) is moved from `entries` to `unpinned`, never
+/// dropped from the evidence. If its standard name is exported by this
+/// object, the table points somewhere else for that name: a contradiction,
+/// not a neutral hole.
+#[test]
+fn an_unpinned_entry_whose_name_is_exported_contradicts_the_table() {
+    use super::{
+        ExportAgreement, ObjectExports, ScannedEntry, ScannedTable, Skipped, export_agreement,
+    };
+    use p11scope_manifest::maps::{Device, ObjectKey};
+
+    let object = ObjectKey {
+        device: Device { major: 8, minor: 1 },
+        inode: 42,
+    };
+    let table = ScannedTable {
+        version: (2, 40),
+        walk: "full",
+        entries: vec![ScannedEntry {
+            name: "C_Initialize",
+            object,
+            object_path: "/opt/p11.so".into(),
+            file_offset: 0x10,
+        }],
+        null_entries: vec!["C_GetFunctionStatus"],
+        unpinned: vec![Skipped {
+            subject: "C_Sign".into(),
+            reason: "/opt/dep.so could not be reconciled to a comparable pinned object; \
+                     entry was not attached"
+                .into(),
+        }],
+        address: 0x7000,
+        file_offset: Some(0x100),
+        live_return: false,
+        manifest_supported: false,
+    };
+    let symbols = vec![
+        ("C_Initialize".to_string(), 0x10),
+        ("C_Sign".to_string(), 0x40),
+        ("C_GetFunctionStatus".to_string(), 0x50),
+    ];
+    let agreement = export_agreement(
+        &table,
+        &ObjectExports {
+            object,
+            symbols: &symbols,
+        },
+    );
+    assert_eq!(
+        agreement,
+        ExportAgreement {
+            agreeing: 1,
+            disagreeing: 1,
+        },
+        "the unpinned C_Sign contradicts; the NULL entry stays neutral"
+    );
+    assert!(!agreement.corroborates());
+}

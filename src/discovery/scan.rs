@@ -1803,6 +1803,15 @@ pub(crate) fn export_agreement(
             agreement.disagreeing += 1;
         }
     }
+    // Reconciliation moves an entry it could not pin (its target lies in an
+    // object it could not open) to `unpinned` under the same ordinal label.
+    // Its target is not this object's export, so an exported name there is a
+    // contradiction. NULL entries stay neutral: they point at nothing.
+    agreement.disagreeing += table
+        .unpinned
+        .iter()
+        .filter(|skip| exports.offsets_of(&skip.subject).next().is_some())
+        .count();
     agreement
 }
 

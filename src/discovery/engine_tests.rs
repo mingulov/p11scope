@@ -9808,7 +9808,10 @@ fn selection_result_flags_publish_only_a_finite_class() {
     for (flags, class) in [
         (0, "zero"),
         (cryptoki_sys::CKF_INTERFACE_FORK_SAFE, "fork_safe"),
-        (p11scope_ebpf_common::DISCOVERY_INTERFACE_FLAGS_OTHER, "other"),
+        (
+            p11scope_ebpf_common::DISCOVERY_INTERFACE_FLAGS_OTHER,
+            "other",
+        ),
         (HOSTILE, "other"),
         (u64::MAX, "other"),
     ] {
@@ -9817,7 +9820,10 @@ fn selection_result_flags_publish_only_a_finite_class() {
         // Request flags stay the caller's scalar argument.
         assert_eq!(json["request"]["flags"], 1);
         let text = json.to_string();
-        assert!(!text.contains(&HOSTILE.to_string()), "raw word leaked: {text}");
+        assert!(
+            !text.contains(&HOSTILE.to_string()),
+            "raw word leaked: {text}"
+        );
         assert!(!text.contains("SECRET"), "raw bytes leaked: {text}");
     }
     let json = serde_json::to_value(render::SelectionTuple {

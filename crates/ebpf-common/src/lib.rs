@@ -2322,16 +2322,25 @@ mod tests {
         // Hostile result flags: every word outside {0, FORK_SAFE} is one class,
         // and a record carrying the raw word is refused.
         assert_eq!(interface_flags_class(0), DISCOVERY_INTERFACE_FLAGS_ZERO);
-        assert_eq!(interface_flags_class(1), DISCOVERY_INTERFACE_FLAGS_FORK_SAFE);
+        assert_eq!(
+            interface_flags_class(1),
+            DISCOVERY_INTERFACE_FLAGS_FORK_SAFE
+        );
         assert_eq!(interface_flags_class(2), DISCOVERY_INTERFACE_FLAGS_OTHER);
         for hostile in [3, 0x5345_4352_4554_2121, 1 << 63, u64::MAX] {
-            assert_eq!(interface_flags_class(hostile), DISCOVERY_INTERFACE_FLAGS_OTHER);
+            assert_eq!(
+                interface_flags_class(hostile),
+                DISCOVERY_INTERFACE_FLAGS_OTHER
+            );
             let mut raw = discovery_record(DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN);
             raw.symbol_id = 2;
             raw.name_class = DISCOVERY_NAME_OTHER;
             raw.announced_count = 1;
             raw.interface_flags = hostile;
-            assert!(!valid_discovery_record(&raw), "{hostile:#x} crossed the ring");
+            assert!(
+                !valid_discovery_record(&raw),
+                "{hostile:#x} crossed the ring"
+            );
             raw.interface_flags = interface_flags_class(hostile);
             assert!(valid_discovery_record(&raw));
         }
@@ -2382,7 +2391,10 @@ mod tests {
         listed.interface_index = 15;
         listed.announced_count = 16;
         listed.interface_flags = 7;
-        assert!(!valid_discovery_record(&listed), "a raw flags word never crosses the ring");
+        assert!(
+            !valid_discovery_record(&listed),
+            "a raw flags word never crosses the ring"
+        );
         listed.interface_flags = DISCOVERY_INTERFACE_FLAGS_OTHER;
         assert!(valid_discovery_record(&listed));
         listed.interface_index = 16;
@@ -2399,7 +2411,10 @@ mod tests {
         direct.name_class = DISCOVERY_NAME_NULL;
         direct.interface_flags = 9;
         direct.status_flags = DISCOVERY_STATUS_READ_FAILURE;
-        assert!(!valid_discovery_record(&direct), "a raw flags word never crosses the ring");
+        assert!(
+            !valid_discovery_record(&direct),
+            "a raw flags word never crosses the ring"
+        );
         direct.interface_flags = DISCOVERY_INTERFACE_FLAGS_OTHER;
         assert!(valid_discovery_record(&direct));
         direct.interface_index = DISCOVERY_VERSION_OTHER + 1;

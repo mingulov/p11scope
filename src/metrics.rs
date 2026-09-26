@@ -7,8 +7,7 @@
 use crate::attach::Session;
 use crate::plan::{AttachPlan, ModuleId};
 use anyhow::{Context as _, Result};
-use aya::maps::{PerCpuArray, PerCpuHashMap};
-use aya::maps::Array;
+use aya::maps::{Array, PerCpuArray, PerCpuHashMap};
 use p11scope_ebpf_common::{
     EVIDENCE_ABI_REFUSALS, EVIDENCE_CGROUP_SCOPE_FAILURES, EVIDENCE_RING_LOSS,
     EVIDENCE_RV_UPDATE_FAILURES, EVIDENCE_SEMANTIC_CAPTURE_FAILURES,
@@ -16,9 +15,9 @@ use p11scope_ebpf_common::{
     EVIDENCE_UNREGISTERED_MECHANISMS, ImageIdentityControl, LATENCY_BUCKETS, OWNER_BAD_CONTROL,
     OWNER_BAD_RECORD, OWNER_BOOKKEEPING_FAILED, OWNER_CLASSIFIER_FAILED, OWNER_DELETE_FAILED,
     OWNER_LOOKUP_UNKNOWN, OWNER_REFUND_FAILED, OWNER_STATE_DELETE_FAILED, ROOT_BAD_CELL,
-    ROOT_BAD_CONTROL, ROOT_CAPACITY, ROOT_CREATE_FAILED, ROOT_EXISTING_CHILD,
-    ROOT_EXIT_CLASSIFIER, ROOT_EXIT_DELETE, ROOT_REFUND_FAILED, ROOT_RESERVE_CAS,
-    RootAffiliationControl, RvKey, SlotStats, ThreadOwnerControl,
+    ROOT_BAD_CONTROL, ROOT_CAPACITY, ROOT_CREATE_FAILED, ROOT_EXISTING_CHILD, ROOT_EXIT_CLASSIFIER,
+    ROOT_EXIT_DELETE, ROOT_REFUND_FAILED, ROOT_RESERVE_CAS, RootAffiliationControl, RvKey,
+    SlotStats, ThreadOwnerControl,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -270,9 +269,11 @@ fn control_cell<T: aya::Pod>(session: &Session, name: &str) -> Result<Option<T>>
     let Some(map) = session.ebpf.map(name) else {
         return Ok(None);
     };
-    let cell: Array<_, T> =
-        Array::try_from(map).with_context(|| format!("{name} control map"))?;
-    Ok(Some(cell.get(&0, 0).with_context(|| format!("{name} control cell"))?))
+    let cell: Array<_, T> = Array::try_from(map).with_context(|| format!("{name} control map"))?;
+    Ok(Some(
+        cell.get(&0, 0)
+            .with_context(|| format!("{name} control cell"))?,
+    ))
 }
 
 static HALT_NOTICE: AtomicBool = AtomicBool::new(false);

@@ -6713,17 +6713,33 @@ fn privileged_detailed_multithread_owner_accounting_exact() -> Result<()> {
         calls == u64::from(threads) * u64::from(PERCALLS) && in_flight == 0,
         "captured calls differ from the independent ledger"
     );
-    ensure!(rv_total == calls, "RV_COUNTS rows disagree with STATS calls");
-    ensure!(reports.len() == plan.slots.len(), "one report per planned slot");
+    ensure!(
+        rv_total == calls,
+        "RV_COUNTS rows disagree with STATS calls"
+    );
+    ensure!(
+        reports.len() == plan.slots.len(),
+        "one report per planned slot"
+    );
     for (slot, report) in plan.slots.iter().zip(&reports) {
         // Thread t calls endpoint t with input 0, and endpoint t returns t.
         let rv = u64::from(slot.index);
         ensure!(
             report.calls == u64::from(PERCALLS)
                 && report.rv_counts == BTreeMap::from([(rv, u64::from(PERCALLS))])
-                && report.errors == if rv == 0 || rv == 0x204 { 0 } else { u64::from(PERCALLS) },
+                && report.errors
+                    == if rv == 0 || rv == 0x204 {
+                        0
+                    } else {
+                        u64::from(PERCALLS)
+                    },
             "per-slot counts differ from the ledger: {:?}",
-            (report.names.clone(), report.calls, &report.rv_counts, report.errors)
+            (
+                report.names.clone(),
+                report.calls,
+                &report.rv_counts,
+                report.errors
+            )
         );
     }
     let mut session = session;
@@ -6733,7 +6749,10 @@ fn privileged_detailed_multithread_owner_accounting_exact() -> Result<()> {
     ids.released_with_budget(Duration::from_secs(60))?;
     caller.finish()?;
     detached?;
-    ensure!(clean_detach, "multithread Detailed detach retained failures");
+    ensure!(
+        clean_detach,
+        "multithread Detailed detach retained failures"
+    );
     Ok(())
 }
 
@@ -6750,9 +6769,8 @@ fn privileged_detailed_owner_poison_is_disclosed() -> Result<()> {
         AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::Detailed)
             .map_err(anyhow::Error::msg)?;
     let mut caller = fixture.spawn_gated()?;
-    crate::attach::TEST_OWNER_POISON.with(|seed| {
-        seed.set(p11scope_ebpf_common::OWNER_CLASSIFIER_FAILED)
-    });
+    crate::attach::TEST_OWNER_POISON
+        .with(|seed| seed.set(p11scope_ebpf_common::OWNER_CLASSIFIER_FAILED));
     let started = crate::attach::Session::start(
         &plan,
         &Scope::Pid(caller.child.id()),

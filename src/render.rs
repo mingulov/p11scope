@@ -1887,7 +1887,7 @@ pub(crate) mod tests {
             discovery_read_failures: 0,
             discovery_truncated: 0,
             task_uprobe_link_losses: 0,
-        kernel_control: Default::default(),
+            kernel_control: Default::default(),
             loader_discovery: LoaderDiscovery::default(),
             interface_selection: InterfaceSelection::default(),
             attach_mechanisms: vec![],

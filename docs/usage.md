@@ -527,7 +527,9 @@ kind of workload without a manifest and ends `68`/`0` instead.
   text table. A scan that fails soft (the target changed mid-scan) still
   prints JSON: the success schema with `scan.status` failed and the
   reason, exit 1. A target that cannot be read at all stays a hard
-  error: one stderr line, empty stdout, exit 1.
+  error: one stderr line, empty stdout, exit 1 — including a target whose
+  `/proc/<pid>/maps` is unreadable (another user's process without sudo),
+  which is never reported as "0 PKCS#11 modules mapped".
 - `--allow-uretprobe-on-confined-target` — accept the uretprobe hazard on a
   target that confines syscalls instead of refusing to attach. The default
   refusal is deliberate: on affected kernels a uretprobe on a confined target

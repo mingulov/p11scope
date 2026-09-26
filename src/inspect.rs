@@ -18,6 +18,12 @@ use std::path::PathBuf;
 
 const DOC_ID: &str = "p11scope/inspect/v1";
 
+/// The scan's refusal when it could not take the target's mapping snapshot
+/// at all (`/proc/<pid>/maps` unreadable, empty, or unparseable). No module
+/// inventory exists behind it, so `inspect` must not render it as a scan
+/// that found nothing (HIGH-2).
+const INITIAL_MAPS_REFUSAL: &str = "memory scan refused: initial mapping validation unavailable";
+
 /// Renders a completed scan. Pure: takes the scan result and the pinned identities,
 /// returns the text — so the layout is unit-testable without a target process.
 pub fn render_text(pid: u32, outcome: &ScanOutcome, pinned: &PinnedObjects) -> String {
@@ -341,6 +347,9 @@ fn emit_diagnosis(
             return Ok(1);
         }
     };
+    if let Some(reason) = unreadable_mappings(&outcome) {
+        return Err(unreadable_target_error(pid, reason));
+    }
     let outcome = with_extra_skips(outcome, pin_skips);
 
     if json {
@@ -350,6 +359,34 @@ fn emit_diagnosis(
         write!(out, "{}", render_text(pid, &outcome, &pinned))?;
     }
     Ok(0)
+}
+
+/// The cause, when the scan could not read the target's mappings at all:
+/// no module was found and the initial mapping snapshot was refused.
+fn unreadable_mappings(outcome: &ScanOutcome) -> Option<&str> {
+    if !outcome.modules().is_empty() {
+        return None;
+    }
+    outcome.skipped().iter().find_map(|skipped| {
+        let rest = skipped.reason.strip_prefix(INITIAL_MAPS_REFUSAL)?;
+        Some(rest.strip_prefix(": ").unwrap_or(rest))
+    })
+}
+
+/// "The target could not be read at all" (docs/usage.md, exit codes): a hard
+/// error, so `main` prints one stderr line and stdout stays empty. A
+/// permission refusal names the fix: another user's process needs root.
+fn unreadable_target_error(pid: u32, reason: &str) -> anyhow::Error {
+    let denied = reason.contains("Permission denied") || reason.contains("not permitted");
+    let fix = if denied {
+        format!(
+            "; its modules are unknown, not absent. A process owned by another user needs \
+             root: run `sudo p11scope inspect --pid {pid}`"
+        )
+    } else {
+        "; its modules are unknown, not absent".to_string()
+    };
+    anyhow::anyhow!("cannot read /proc/{pid}/maps ({reason}){fix}")
 }
 
 /// The machine-readable soft-failure document: the success schema with
@@ -443,6 +480,38 @@ mod tests {
             );
             assert!(!error.contains("0 PKCS#11 modules"), "{error}");
         }
+    }
+
+    /// The scan's refusal wording is what `inspect` keys on; if the scan
+    /// ever renames it, this fails instead of silently reporting 0 modules.
+    #[test]
+    fn the_initial_maps_refusal_prefix_matches_the_scan() {
+        let scan = include_str!("discovery/scan.rs");
+        assert!(
+            scan.contains(&format!("\"{INITIAL_MAPS_REFUSAL}\"")),
+            "src/discovery/scan.rs no longer emits {INITIAL_MAPS_REFUSAL:?}"
+        );
+    }
+
+    /// A same-uid target whose `mem` is refused still has an inventory from
+    /// maps: that stays a success (`status: unavailable`, exit 0).
+    #[test]
+    fn a_readable_inventory_without_memory_is_not_an_unreadable_target() {
+        let outcome = ScanOutcome::Unavailable {
+            reason: "ptrace",
+            modules: Vec::new(),
+            skipped: Vec::new(),
+        };
+        assert_eq!(unreadable_mappings(&outcome), None);
+        let mut stdout = Vec::new();
+        let code = emit_diagnosis(
+            4242,
+            true,
+            &mut stdout,
+            Ok((outcome, (PinnedObjects::empty(), Vec::new()))),
+        )
+        .unwrap();
+        assert_eq!(code, 0);
     }
 
     /// The text contract is unchanged: same line, same exit code.

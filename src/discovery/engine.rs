@@ -4328,10 +4328,12 @@ fn build_current_plan(
     identity_mismatches: usize,
     manifest_fallbacks: usize,
     broad_admit: bool,
+    admission_scope: plan::AdmissionScope,
 ) -> Result<plan::AttachPlan> {
     // Every plan reference is a capture-local pinned ID. Raw mapping keys remain
     // evidence only and cannot select an attach fd.
-    let mut plan = plan::build_from_sources_broad(modules, manifests, pinned, broad_admit);
+    let mut plan =
+        plan::build_from_sources_scoped(modules, manifests, pinned, broad_admit, admission_scope);
     record_object_skips(&mut plan, &counters.object_skips);
     for object in corroborated {
         if let Some(summary) = plan
@@ -4352,7 +4354,13 @@ fn build_current_plan(
             identity_mismatches + manifest_fallbacks
         );
     }
-    if let Some(error) = refusal_error(&plan) {
+    // A named capture that can attach nothing has nothing to observe. A
+    // shared-scope capture still starts: its refusals are published and
+    // printed, and a provider that loads, or is corroborated, later in the
+    // capture can still be admitted into the reserve.
+    if plan.admission_scope() == plan::AdmissionScope::Named
+        && let Some(error) = refusal_error(&plan)
+    {
         bail!(error);
     }
     plan::ensure_capacity(&plan).map_err(|error| anyhow!(error))?;
@@ -5500,6 +5508,7 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
     }
     let manifest_fallbacks = counters.manifest_fallbacks.len();
     let broad_admit = discovered.broad_admit;
+    let admission_scope = discovered.admission_scope();
     let mut plan = build_current_plan(
         &modules,
         &accepted,
@@ -5509,6 +5518,7 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
         identity_mismatches,
         manifest_fallbacks,
         broad_admit,
+        admission_scope,
     )
     .inspect_err(|_| counters.report_notes())?;
     discovered
@@ -7208,6 +7218,19 @@ impl Engine {
             }
         }
         aggregate
+    }
+
+    /// The admission rule this capture's plan keeps for its whole lifetime
+    /// (GT-5). A named process, or a capture the operator aimed with
+    /// `--module` (whose scan sees only the named objects), admits
+    /// first-come. Any other cgroup or system capture admits in value order,
+    /// whole modules only, with a reserve for late corroborated providers.
+    fn admission_scope(&self) -> plan::AdmissionScope {
+        if matches!(self.scope, Scope::Pid(_)) || !self.module_hints.is_empty() {
+            plan::AdmissionScope::Named
+        } else {
+            plan::AdmissionScope::Shared
+        }
     }
 
     /// True once a named target's expected exit has been fully finalized:

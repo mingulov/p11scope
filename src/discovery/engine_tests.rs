@@ -1674,6 +1674,64 @@ fn capture_facts_keep_all_decoded_occurrences_for_a_capacity_refusal() {
     assert_eq!(engine.discovery.modules_skipped.len(), 1);
 }
 
+/// GT-5. A cgroup or system capture without `--module` admits in value
+/// order (`plan::AdmissionScope::Shared`); a named process, or a capture the
+/// operator aimed with `--module`, keeps first-come admission. A shared
+/// capture whose every discovered module is refused still starts — the
+/// refusal is published, and a later provider can still be admitted — where
+/// a named capture that can attach nothing fails at startup as before.
+#[test]
+fn shared_scope_capture_starts_when_every_module_is_refused() {
+    let (cgroup, _dir) = engine_over_cgroup_naming(&[]);
+    assert_eq!(cgroup.admission_scope(), plan::AdmissionScope::Shared);
+    let mut system = Engine::empty();
+    system.scope = Scope::System;
+    assert_eq!(system.admission_scope(), plan::AdmissionScope::Shared);
+    system.module_hints = vec!["/usr/lib/softhsm/libsofthsm2.so".into()];
+    assert_eq!(system.admission_scope(), plan::AdmissionScope::Named);
+    assert_eq!(
+        Engine::empty().admission_scope(),
+        plan::AdmissionScope::Named
+    );
+
+    let mut raw = overlay_module(overlay_key(57));
+    raw.tables[0].entries =
+        overlay_entries(&raw, first_offsets(p11scope_ebpf_common::MAX_SLOTS + 1));
+    let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1)]);
+    let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&raw), &mut pins);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let build = |scope| {
+        build_current_plan(
+            &modules,
+            &[],
+            &pins,
+            &mut DiscoveryCounters::default(),
+            &BTreeSet::new(),
+            0,
+            0,
+            false,
+            scope,
+        )
+    };
+
+    let error = build(plan::AdmissionScope::Named).expect_err("nothing to attach");
+    assert!(
+        error.to_string().contains("leaving nothing to attach"),
+        "{error:#}"
+    );
+    let shared = build(plan::AdmissionScope::Shared).expect("a shared capture still starts");
+    assert_eq!(shared.admission_scope(), plan::AdmissionScope::Shared);
+    assert!(shared.slots.is_empty());
+    assert_eq!(shared.modules_skipped.len(), 1);
+    assert!(
+        shared.modules_skipped[0]
+            .reason
+            .ends_with("name it with --module <path>"),
+        "{:?}",
+        shared.modules_skipped[0]
+    );
+}
+
 #[test]
 fn capture_facts_keep_a_manifest_only_capacity_refusal() {
     let (_, pins) = pinned_self();
@@ -1707,6 +1765,7 @@ fn capture_facts_keep_a_manifest_only_capacity_refusal() {
         0,
         0,
         false,
+        plan::AdmissionScope::Named,
     )
     .unwrap();
     engine.counters = counters;
@@ -18679,6 +18738,7 @@ fn corroboration_marks_the_exact_reconciled_object_not_the_raw_key_peer() {
         0,
         0,
         false,
+        plan::AdmissionScope::Named,
     )
     .unwrap();
 

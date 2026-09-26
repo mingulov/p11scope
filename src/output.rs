@@ -249,15 +249,87 @@ impl Drop for AtomicFile {
     }
 }
 
-/// Opens (creating/truncating) a private regular file for an appended line
+/// The trace `-o` sink between its fail-fast preflight and the start of the
+/// capture (M-2). Opening it proves the path is usable before discovery and
+/// attach, but a capture can still fail after that, so nothing a previous
+/// run left at the name is changed until [`PrivateStream::begin`]: the
+/// capture has attached and is about to write its first line. A stream that
+/// is dropped without beginning removes the file only if this open created
+/// it (and it is still that file), and otherwise leaves it byte-for-byte and
+/// mode-for-mode as it was.
+#[must_use = "a PrivateStream that never begins leaves the previous file untouched; call begin() once the capture starts"]
+pub struct PrivateStream {
+    directory: std::fs::File,
+    file: Option<std::fs::File>,
+    final_name: CString,
+    final_path: PathBuf,
+    identity: FileIdentity,
+    created: bool,
+}
+
+impl PrivateStream {
+    /// The capture has started: make the file private (0600) and empty, and
+    /// hand it to the writer.
+    pub fn begin(mut self) -> Result<std::fs::File, String> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let file = self
+            .file
+            .as_ref()
+            .expect("an unbegun PrivateStream holds its file");
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| {
+                format!(
+                    "setting output {} private failed: {error}",
+                    self.final_path.display()
+                )
+            })?;
+        file.set_len(0).map_err(|error| {
+            format!(
+                "truncating output {} failed: {error}",
+                self.final_path.display()
+            )
+        })?;
+        Ok(self
+            .file
+            .take()
+            .expect("an unbegun PrivateStream holds its file"))
+    }
+}
+
+impl std::fmt::Debug for PrivateStream {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PrivateStream")
+            .field("final_path", &self.final_path)
+            .field("created", &self.created)
+            .field("begun", &self.file.is_none())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for PrivateStream {
+    fn drop(&mut self) {
+        if self.file.is_some()
+            && self.created
+            && metadata_at(&self.directory, &self.final_name).is_ok_and(|metadata| {
+                metadata.is_file()
+                    && metadata.identity == self.identity
+                    && metadata.owner == unsafe { libc::geteuid() }
+            })
+        {
+            let _ = unlinkat(&self.directory, &self.final_name);
+        }
+    }
+}
+
+/// Opens (creating if absent) a private regular file for an appended line
 /// stream — trace `-o`, which streams lines as they arrive and so cannot be
 /// published atomically like `AtomicFile`. The parent is retained without
 /// following any path symlink, and O_NOFOLLOW protects the final component
 /// too. O_NONBLOCK makes a planted FIFO fail instead of blocking, mode 0600.
-/// An existing target is only truncated after it proved to be a regular file
-/// owned by the caller; its mode is then made private too.
-pub fn create_private_stream(path: &Path) -> Result<std::fs::File, String> {
-    use std::os::unix::fs::PermissionsExt as _;
+/// An existing target must be a regular file owned by the caller; it is only
+/// truncated and made private by [`PrivateStream::begin`].
+pub fn create_private_stream(path: &Path) -> Result<PrivateStream, String> {
     if path.as_os_str().as_bytes().last() == Some(&b'/') {
         return Err(format!("output {} has no file name", path.display()));
     }
@@ -271,7 +343,7 @@ pub fn create_private_stream(path: &Path) -> Result<std::fs::File, String> {
         .file_name()
         .ok_or_else(|| format!("output {} has no file name", final_path.display()))?;
     let final_name = c_name(final_name, "output file name")?;
-    let file = openat_stream(&directory, &final_name)
+    let (file, created) = openat_stream(&directory, &final_name)
         .map_err(|error| format!("opening output {} failed: {error}", final_path.display()))?;
     let metadata = file
         .metadata()
@@ -289,16 +361,14 @@ pub fn create_private_stream(path: &Path) -> Result<std::fs::File, String> {
             metadata.uid()
         ));
     }
-    file.set_len(0)
-        .map_err(|error| format!("truncating output {} failed: {error}", final_path.display()))?;
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .map_err(|error| {
-            format!(
-                "setting output {} private failed: {error}",
-                final_path.display()
-            )
-        })?;
-    Ok(file)
+    Ok(PrivateStream {
+        directory,
+        identity: FileIdentity::from_metadata(&metadata),
+        file: Some(file),
+        final_name,
+        final_path,
+        created,
+    })
 }
 
 fn normalize_output_path(path: PathBuf) -> Result<PathBuf, String> {
@@ -511,20 +581,41 @@ fn uid_has_account(uid: u32) -> bool {
     status == 0 && !result.is_null()
 }
 
-fn openat_stream(directory: &std::fs::File, name: &CString) -> std::io::Result<std::fs::File> {
-    let fd = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-            0o600,
-        )
-    };
-    if fd == -1 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+/// Opens the trace target without truncating it, and says whether this call
+/// created it: `O_EXCL` first, then the existing file, retried a few times
+/// if the name comes and goes between the two.
+fn openat_stream(
+    directory: &std::fs::File,
+    name: &CString,
+) -> std::io::Result<(std::fs::File, bool)> {
+    let flags = libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    let mut last = std::io::Error::from_raw_os_error(libc::ENOENT);
+    for _ in 0..8 {
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                flags | libc::O_CREAT | libc::O_EXCL,
+                0o600,
+            )
+        };
+        if fd != -1 {
+            return Ok((unsafe { std::fs::File::from_raw_fd(fd) }, true));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EEXIST) {
+            return Err(error);
+        }
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if fd != -1 {
+            return Ok((unsafe { std::fs::File::from_raw_fd(fd) }, false));
+        }
+        last = std::io::Error::last_os_error();
+        if last.raw_os_error() != Some(libc::ENOENT) {
+            return Err(last);
+        }
     }
+    Err(last)
 }
 
 fn openat_profile(directory: &std::fs::File, name: &CString) -> std::io::Result<std::fs::File> {
@@ -712,20 +803,53 @@ mod tests {
         assert!(create_private_stream(&fifo).is_err());
     }
 
+    /// M-2: opening the trace sink is the fail-fast preflight, not the
+    /// start of the capture. A capture that fails after it (discovery,
+    /// attach) must leave a previous file byte-for-byte and mode-for-mode as
+    /// it was, and must not leave behind a file it created.
+    #[test]
+    fn private_stream_leaves_an_existing_file_untouched_until_the_capture_begins() {
+        let dir = private_tempdir();
+        let path = dir.path().join("trace.log");
+        std::fs::write(&path, b"previous trace\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        drop(create_private_stream(&path).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"previous trace\n");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    #[test]
+    fn private_stream_removes_a_file_it_created_when_the_capture_never_began() {
+        let dir = private_tempdir();
+        let path = dir.path().join("trace.log");
+        drop(create_private_stream(&path).unwrap());
+        assert!(
+            std::fs::symlink_metadata(&path).is_err(),
+            "an unstarted capture left {}",
+            path.display()
+        );
+    }
+
     #[test]
     fn private_stream_creates_0600_and_truncates_an_existing_file() {
         let dir = private_tempdir();
         let path = dir.path().join("trace.log");
-        let mut file = create_private_stream(&path).unwrap();
+        let mut file = create_private_stream(&path).unwrap().begin().unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
         std::io::Write::write_all(&mut file, b"first").unwrap();
         drop(file);
-        // A pre-existing, world-readable target is truncated and made private.
+        // A pre-existing, world-readable target is truncated and made private
+        // once the capture begins.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        drop(create_private_stream(&path).unwrap());
+        let stream = create_private_stream(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        drop(stream.begin().unwrap());
         assert_eq!(std::fs::read(&path).unwrap(), b"");
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -1144,8 +1268,8 @@ mod tests {
             }
         }
         assert_eq!(
-            calls, 3,
-            "expected verify + Drop temp stats and the final check"
+            calls, 4,
+            "expected verify + Drop temp stats, the final check and the unbegun-stream Drop"
         );
     }
 }

@@ -107,3 +107,33 @@ fn directory_and_special_file_outputs_are_refused_before_the_discovery_scan() {
         .collect();
     assert!(litter.is_empty(), "{litter:?}");
 }
+
+/// M-2: a trace whose capture never starts (here: discovery fails on a
+/// missing manifest, after the sink preflight) must not destroy the
+/// previous `-o` file. Privilege-independent: discovery fails either way.
+#[test]
+fn a_failed_trace_keeps_the_previous_output_file() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let previous = dir.path().join("prior-trace.log");
+    std::fs::write(&previous, b"yesterday's trace lines\n").unwrap();
+    let fresh = dir.path().join("fresh-trace.log");
+
+    for out in [previous.clone(), fresh.clone()] {
+        let mut args = poisoned_profile_args(out);
+        args.kind = Kind::Trace;
+        args.duration = Some(std::time::Duration::from_secs(1));
+        let error = capture(&args).expect_err("the poisoned manifest fails discovery");
+        let text = format!("{error:#}");
+        assert!(text.contains("manifest"), "{text}");
+    }
+    assert_eq!(
+        std::fs::read(&previous).unwrap(),
+        b"yesterday's trace lines\n"
+    );
+    assert!(
+        std::fs::symlink_metadata(&fresh).is_err(),
+        "a capture that never started left {}",
+        fresh.display()
+    );
+}

@@ -507,7 +507,9 @@ kind of workload without a manifest and ends `68`/`0` instead.
   or an existing device node, FIFO, socket or symbolic link (for example
   `/dev/null` or `/dev/stdout`) is refused before the capture starts and is
   never replaced; the profile report re-checks the name before publishing.
-  To keep no report file, leave out `-o`.
+  An existing trace file is truncated only once the capture has attached: a
+  capture that fails before that leaves it as it was, and removes a file it
+  had only just created. To keep no report file, leave out `-o`.
 - `--max-events <n>` — trace only (including `run --trace`): end the capture
   after `<n>` call events instead of running until `--duration`, interrupt, or
   target exit. Refused with a usage error on profile, which publishes one

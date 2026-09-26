@@ -1806,7 +1806,8 @@ fn capture_policy(kind: Kind, metrics: bool, unsafe_requested: bool) -> Result<C
 enum OutputSink {
     None,
     Profile(Box<AtomicFile>),
-    Trace(std::fs::File),
+    /// Truncated only once the trace loop begins (M-2).
+    Trace(crate::output::PrivateStream),
 }
 
 impl OutputSink {
@@ -4381,7 +4382,7 @@ fn capture_trace(
     policy: CapturePolicy,
     duration: Option<Duration>,
     max_events: Option<u64>,
-    out: Option<std::fs::File>,
+    out: Option<crate::output::PrivateStream>,
     interrupted: &SignalState,
     mut owned: Option<&mut Owned>,
     drain: Duration,
@@ -4390,7 +4391,21 @@ fn capture_trace(
     let trace_limit = resolve_trace_max_events(max_events);
     let mut remaining = Some(trace_limit);
     // A line stream, not a published artifact: opened by the caller before the
-    // attach, then appended to as lines arrive.
+    // attach, then appended to as lines arrive. Only now, with the session
+    // attached and the loop about to write, may a previous `-o` file be
+    // truncated (M-2); every earlier failure leaves it as it was.
+    let out = match out.map(crate::output::PrivateStream::begin).transpose() {
+        Ok(out) => out,
+        Err(error) => {
+            return Err(finish_capture_error(
+                anyhow::Error::msg(error).context("creating trace output"),
+                engine,
+                session,
+                owned.as_deref_mut(),
+                interrupted,
+            ));
+        }
+    };
     let mut out_sink = out.map(buffered_sink);
     let out_file = &mut out_sink;
     let mut stdout_sink = crate::sink::stdout_sink()?;

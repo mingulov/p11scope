@@ -9996,7 +9996,11 @@ fn aggregate_policy_returns_before_both_events_reserves() {
 // its exact SPDX header line:
 //
 // - Rust: `//! SPDX-License-Identifier: GPL-3.0-or-later` first line, except
-//   `crates/ebpf/src/main.rs` which carries `GPL-2.0-only`.
+//   the BPF program sources under `crates/ebpf/src/`, which carry
+//   `GPL-2.0-only`, and the shared kernel/userspace ABI crate under
+//   `crates/ebpf-common/src/`, which is compiled into both the GPL-2.0-only
+//   BPF object and the GPL-3.0-or-later observer and therefore carries
+//   `GPL-2.0-only OR GPL-3.0-or-later`.
 // - Python/Shell: `# SPDX-License-Identifier: GPL-3.0-or-later` after the
 //   shebang, else first line.
 // - Markdown: `<!-- SPDX-License-Identifier: GPL-3.0-or-later -->` first line.
@@ -10072,7 +10076,10 @@ const LICENSE_LEGACY_MARKERS: &[&str] = &[
 const LICENSE_MANIFESTS: &[(&str, &str)] = &[
     ("Cargo.toml", "GPL-3.0-or-later"),
     ("crates/discover/Cargo.toml", "GPL-3.0-or-later"),
-    ("crates/ebpf-common/Cargo.toml", "GPL-3.0-or-later"),
+    (
+        "crates/ebpf-common/Cargo.toml",
+        "GPL-2.0-only OR GPL-3.0-or-later",
+    ),
     ("crates/ebpf/Cargo.toml", "GPL-2.0-only"),
     ("crates/manifest/Cargo.toml", "GPL-3.0-or-later"),
 ];
@@ -10096,6 +10103,9 @@ fn license_expected_header(path: &str) -> Option<&'static str> {
     if path.ends_with(".rs") {
         if path.starts_with("crates/ebpf/src/") {
             return Some("//! SPDX-License-Identifier: GPL-2.0-only");
+        }
+        if path.starts_with("crates/ebpf-common/src/") {
+            return Some("//! SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-or-later");
         }
         return Some("//! SPDX-License-Identifier: GPL-3.0-or-later");
     }
@@ -10459,6 +10469,10 @@ fn license_header_checker_rejects_bad_fixtures() {
             b"//! SPDX-License-Identifier: GPL-2.0-only\n#![no_std]\n",
         ),
         (
+            "crates/ebpf-common/src/lib.rs",
+            b"//! SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-or-later\n#![no_std]\n",
+        ),
+        (
             "shebang.py",
             b"#!/usr/bin/env python3\n# SPDX-License-Identifier: GPL-3.0-or-later\n",
         ),
@@ -10525,6 +10539,12 @@ fn license_header_checker_rejects_bad_fixtures() {
         ),
         (
             "crates/ebpf/src/main.rs",
+            b"//! SPDX-License-Identifier: GPL-3.0-or-later\n",
+        ),
+        // The shared ABI crate is compiled into the GPL-2.0-only BPF object, so
+        // a GPL-3.0-or-later-only header there is a license conflict.
+        (
+            "crates/ebpf-common/src/lib.rs",
             b"//! SPDX-License-Identifier: GPL-3.0-or-later\n",
         ),
         (

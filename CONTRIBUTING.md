@@ -6,11 +6,15 @@
 ```text
 Public license: GPL-3.0-or-later
 BPF sources: GPL-2.0-only
+Shared BPF/userspace ABI (crates/ebpf-common): GPL-2.0-only OR GPL-3.0-or-later
 ```
 
 Userspace code, docs, and scripts are licensed under GPL-3.0-or-later
 (see `LICENSE`); BPF programs are licensed under GPL-2.0-only
-(see `LICENSES/GPL-2.0-only.txt`). Per-file SPDX tags state which applies
+(see `LICENSES/GPL-2.0-only.txt`). The shared ABI crate `crates/ebpf-common`
+is compiled into both the GPL-2.0-only BPF object and the GPL-3.0-or-later
+observer, so it is offered under either license
+(`GPL-2.0-only OR GPL-3.0-or-later`). Per-file SPDX tags state which applies
 to each file.
 
 ## Contributions

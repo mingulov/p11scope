@@ -1,4 +1,4 @@
-//! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-or-later
 //! Shared wire records for positive caller/object Inventory evidence.
 //!
 //! Caller-use rows retain historical physical-use evidence, not process liveness,

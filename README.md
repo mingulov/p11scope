@@ -315,9 +315,13 @@ it; the eBPF observer itself is new code.
 Public license: GPL-3.0-or-later — see [LICENSE](LICENSE).
 BPF sources: GPL-2.0-only — see
 [LICENSES/GPL-2.0-only.txt](LICENSES/GPL-2.0-only.txt).
+Shared BPF/userspace ABI crate (`crates/ebpf-common`):
+GPL-2.0-only OR GPL-3.0-or-later.
 
 Per-file SPDX tags (`GPL-3.0-or-later` for userspace, docs, and scripts;
-`GPL-2.0-only` for BPF programs) remove any ambiguity.
+`GPL-2.0-only` for BPF programs; `GPL-2.0-only OR GPL-3.0-or-later` for
+`crates/ebpf-common`, which is compiled into both the BPF object and the
+userspace observer) remove any ambiguity.
 
 Contributions require a CLA granting broad sublicensing/relicensing rights;
 see [CONTRIBUTING.md](CONTRIBUTING.md).

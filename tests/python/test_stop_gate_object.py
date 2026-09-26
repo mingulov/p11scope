@@ -468,6 +468,57 @@ class StopGate(unittest.TestCase):
                 return scratch
         raise AssertionError((analysis.name, definition, sorted(state)))
 
+    def counter_sites(self, disassembly, section, function, map_name):
+        lines = C.D.function_blocks(C.ENTRY.sections(disassembly)[section])[function]
+        facts = C.counter_cell_facts(lines)
+        insns, _ = C.D.instruction_graph(lines)
+        return lines, facts, insns, [
+            (pc, text) for pc, text in insns
+            if (match := C.CELL_ATOMIC.fullmatch(text))
+            and facts.get(pc, {}).get('r' + match.group(2), (None, None))[:2] == ('cell', map_name)
+        ]
+
+    def test_counter_cells_must_be_atomic(self):
+        """Per-CPU counters are updated only by non-fetch atomic adds: a plain
+        writeback of any STATS/EVIDENCE/COUNTERS cell, a fetch-form add, or an
+        RV_COUNTS row created without BPF_NOEXIST is rejected."""
+        for variant, disassembly in self.objects:
+            for section, function, map_name in (('uretprobe', 'p11_return', 'STATS'),
+                                                ('uretprobe', 'p11_return', 'EVIDENCE'),
+                                                ('uprobe', 'p11_entry', 'STATS'),
+                                                ('uprobe', 'dl_debug_state', 'COUNTERS')):
+                with self.subTest(variant=variant, function=function, map=map_name):
+                    _, _, _, sites = self.counter_sites(disassembly, section, function, map_name)
+                    self.assertTrue(sites, (function, map_name))
+                    for pc, text in sites:
+                        plain = re.sub(r'^lock (\*\(u(?:32|64) \*\)\(r\d+ [+-] 0x[0-9a-f]+\)) \+= (r\d+)$',
+                                       r'\1 = \2', text)
+                        self.assertNotEqual(plain, text)
+                        bad = replace_decoded(disassembly, function, pc, text, plain)
+                        self.reject(bad, variant, f'non-atomic write to a {map_name} counter cell')
+                        fetch = re.sub(r'^lock \*\((u(?:32|64)) \*\)\((r\d+ [+-] 0x[0-9a-f]+)\) \+= (r\d+)$',
+                                       r'\3 = atomic_fetch_add((\1 *)(\2), \3)', text)
+                        bad = replace_decoded(disassembly, function, pc, text, fetch)
+                        # A gated program already refuses every fetch form; the
+                        # counter rule refuses it everywhere else (.text callees).
+                        with self.assertRaisesRegex(
+                                RuntimeError,
+                                'fetch-form atomic (is forbidden in gated programs'
+                                f'|on a {map_name} counter cell)'):
+                            C.check_decoded(bad, variant)
+                    print(f'verified {variant} {function} {map_name}: {len(sites)} atomic counter sites')
+            with self.subTest(variant=variant, map='RV_COUNTS'):
+                lines, facts, insns, _ = self.counter_sites(disassembly, 'uretprobe', 'p11_return', 'RV_COUNTS')
+                creates = [pc for pc, text in insns
+                           if text == 'call 0x2' and facts.get(pc, {}).get('r1') == ('map', 'RV_COUNTS')]
+                self.assertEqual(len(creates), 1)
+                definition = max(at for at, text in insns if at < creates[0] and text == 'r4 = 0x1')
+                self.assertFalse(any(re.fullmatch(r'[rw]4 = .*', text) for at, text in insns
+                                     if definition < at < creates[0]))
+                bad = replace_decoded(disassembly, 'p11_return', definition, 'r4 = 0x1', 'r4 = 0x0')
+                self.reject(bad, variant, 'RV_COUNTS row created without BPF_NOEXIST')
+                print(f'verified {variant} RV_COUNTS NOEXIST creation')
+
     @staticmethod
     def flip_delta(analysis, pc, sign):
         """Flip a register-form gate add by rewriting its reaching definition.

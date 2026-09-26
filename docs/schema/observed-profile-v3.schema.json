@@ -36,6 +36,7 @@
         "discovery_uncorroborated", "discovery_uncorroborated_candidates",
         "drain_proven", "event_loss", "fork_state_ambiguities",
         "handoff_child_pid", "in_flight_at_end", "interface_list",
+        "kernel_control",
         "loader_discovery", "malformed_records", "manifest_object_fallbacks",
         "module_ambiguous", "modules_skipped", "operation_state_imports",
         "orphan_ops", "p11scope_env", "pause", "pause_attempts",
@@ -82,6 +83,27 @@
         "fork_state_ambiguities": {"type": "integer", "minimum": 0},
         "handoff_child_pid": {"type": ["integer", "null"], "minimum": 1},
         "in_flight_at_end": {"type": "integer", "minimum": 0},
+        "kernel_control": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["capture_halted", "owner_poison", "owner_admission_failures",
+                       "identity_unavailable", "identity_budget_exhausted",
+                       "root_affiliation_failures"],
+          "properties": {
+            "capture_halted": {"type": "boolean"},
+            "owner_poison": {"type": "array", "uniqueItems": true, "items": {"enum": [
+              "bad_control", "lookup_unknown", "bad_record", "delete_failed",
+              "bookkeeping_failed", "refund_failed", "classifier_failed",
+              "state_delete_failed", "unknown"]}},
+            "owner_admission_failures": {"type": "integer", "minimum": 0},
+            "identity_unavailable": {"type": "integer", "minimum": 0},
+            "identity_budget_exhausted": {"type": "boolean"},
+            "root_affiliation_failures": {"type": "array", "uniqueItems": true, "items": {"enum": [
+              "bad_control", "capacity", "reserve_contention", "create_failed",
+              "existing_child", "bad_cell", "exit_classifier", "exit_delete",
+              "refund_failed", "unknown"]}}
+          }
+        },
         "interface_list": {"type": "string"},
         "loader_discovery": {
           "type": "object",
@@ -332,7 +354,7 @@
                   "request": {"$ref": "#/$defs/selection_request"},
                   "rv": {"type": "integer", "minimum": 0},
                   "result": {
-                    "anyOf": [{"$ref": "#/$defs/selection_request"}, {"type": "null"}]
+                    "anyOf": [{"$ref": "#/$defs/selection_result"}, {"type": "null"}]
                   },
                   "table_match": {"type": "boolean"},
                   "inventory_matches": {
@@ -420,6 +442,16 @@
         "name": {"enum": ["null", "exact_standard", "other", "unreadable"]},
         "version": {"enum": ["null", "unreadable", "v2_40", "v3_0", "v3_1", "v3_2", "other"]},
         "flags": {"type": "integer", "minimum": 0}
+      }
+    },
+    "selection_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "flags"],
+      "properties": {
+        "name": {"enum": ["null", "exact_standard", "other", "unreadable"]},
+        "version": {"enum": ["null", "unreadable", "v2_40", "v3_0", "v3_1", "v3_2", "other"]},
+        "flags": {"enum": ["zero", "fork_safe", "other"]}
       }
     }
   }

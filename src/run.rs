@@ -5987,6 +5987,7 @@ fn evidence_for(
         discovery_read_failures,
         discovery_truncated,
         task_uprobe_link_losses: facts.task_uprobe_link_losses(),
+        kernel_control: kernel_evidence.control.evidence(),
         loader_discovery: facts.loader_discovery(),
         interface_selection,
         attach_mechanisms: if include_selection {

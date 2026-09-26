@@ -38,6 +38,7 @@ static int allowed_calls;
 static int cookie_get_calls;
 static int cookie_create_calls;
 static int emit_calls;
+static int child_storage_absent;
 static u32 emitted_tgid;
 static u64 emitted_flags;
 static struct image_identity emitted_parent;
@@ -85,7 +86,7 @@ static u64 *cookie_storage(void *map, struct task_struct *task, u64 *initial, u6
     if (task == &parent_leader)
         return &parent_cookie;
     assert(task == &child);
-    return &child_cookie;
+    return child_storage_absent ? NULL : &child_cookie;
 }
 
 u32 p11_link_fork_allowed(void)
@@ -244,6 +245,23 @@ int main(void)
     assert(!task_newtask(ctx));
     assert(allowed_calls == 1 && emit_calls == 1 && cookie_get_calls == 2);
     assert(stop_gate_cell == 0);
+
+    /* Lifetime identity budget exhausted: an in-scope fork whose child has no
+     * cookie yet is dropped without a record, and the drop is counted in
+     * COOKIE_CTL.unavailable (read into evidence, forcing PARTIAL). No ticket
+     * is spent and no storage is created. */
+    reset_observation();
+    child_storage_absent = 1;
+    cookie_ctl.next_ticket = IMAGE_IDENTITY_TICKET_LIMIT;
+    cookie_ctl.unavailable = 0;
+    assert(!task_newtask(ctx));
+    assert(allowed_calls == 1 && !emit_calls && cookie_get_calls == 2);
+    assert(cookie_ctl.unavailable == 1 && !cookie_create_calls);
+    assert(cookie_ctl.next_ticket == IMAGE_IDENTITY_TICKET_LIMIT);
+    assert(!task_newtask(ctx));
+    assert(!emit_calls && cookie_ctl.unavailable == 2);
+    child_storage_absent = 0;
+    cookie_ctl.next_ticket = 17;
 
     puts("actual typed birth hook: root propagation precedes filtering; process FORK forwards exact identities");
 }

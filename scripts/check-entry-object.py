@@ -79,6 +79,18 @@ def address(state, base, sign, offset):
     return None
 
 
+def join_fact(left, right):
+    """Must-join of one register/stack fact. Two map-helper results from
+    different lookups (LLVM shares one counter-update tail between several
+    lookups) are still a map value disjoint from the BPF frame; only which
+    lookup produced it is forgotten."""
+    if left == right:
+        return left
+    if left and right and left[0] == right[0] == "result":
+        return ("result", None)
+    return None
+
+
 def forget_stack(state, offset, size):
     for key in list(state):
         if isinstance(key, tuple) and key[0] == "stack":
@@ -95,10 +107,15 @@ def forget_atomic_memory(state, text):
     """Read-modify-write effects precede and survive result-register handling."""
     match = ATOMIC_POINTER.search(text) or EXCHANGE_POINTER.search(text)
     pointer = address(state, *match.groups()[1:]) if match else None
+    base = state.get("r" + match[2]) if match else None
     if pointer and pointer[0] == "stack":
         forget_stack(state, pointer[1], int(match[1]) // 8)
     elif pointer and pointer[0] == "event":
         forget_event_slot(state, pointer[1], int(match[1]) // 8)
+    elif pointer is None and base is not None and base[0] == "result":
+        # As for plain stores: a map helper's result (a counter or gate cell)
+        # is disjoint from the BPF frame and the reserved event.
+        return
     else:
         # Unsupported syntax/address cannot establish which tracked bytes survive.
         for key in list(state):
@@ -300,7 +317,9 @@ class Consumer:
             state = self.step(pc, incoming[pc])
             for successor in self.graph[pc]:
                 previous = incoming.get(successor)
-                merged = state.copy() if previous is None else {k: v for k, v in previous.items() if state.get(k) == v}
+                merged = state.copy() if previous is None else {
+                    k: joined for k, v in previous.items()
+                    if (joined := join_fact(v, state.get(k))) is not None}
                 if previous != merged:
                     incoming[successor] = merged
                     pending.append(successor)
@@ -485,7 +504,12 @@ class SinkProof:
         if self.effect_start and ("atomic" in text or "xchg" in text or text.startswith("lock ")):
             match = ATOMIC_POINTER.search(text) or EXCHANGE_POINTER.search(text)
             pointer = address(before, *match.groups()[1:]) if match else None
-            require(pointer and pointer[0] == "stack" and -512 <= pointer[1] < 0,
+            # As for plain stores: a map helper's result is disjoint from the
+            # BPF frame, so a non-fetch counter add through it (loss evidence)
+            # cannot touch a saved sink. Fetch forms also write a register.
+            counter = (text.startswith("lock ") and match is not None and pointer is None
+                       and before.get("r" + match[2], (None,))[0] == "result")
+            require(counter or (pointer and pointer[0] == "stack" and -512 <= pointer[1] < 0),
                     error("unsupported callee memory footprint"))
         if pc in self.dispatches:
             branch = BRANCH.fullmatch(text)

@@ -8158,6 +8158,7 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
         discovery_read_failures: 0,
         discovery_truncated: 0,
         task_uprobe_link_losses: 0,
+        kernel_control: Default::default(),
         loader_discovery: p11scope::render::LoaderDiscovery {
             strategies: p11scope::render::LoaderStrategies {
                 debug_state_every_hit: 1,

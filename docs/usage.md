@@ -817,6 +817,33 @@ cgroup discovery considers at most 256 members by default (`--max-scan-pids`)
 and planning has 512 attach slots. Every bounded omission forces `PARTIAL`;
 no retry renews a budget.
 
+Kernel-side capture state has its own fixed limits, all disclosed in
+`evidence.kernel_control` and each forcing `PARTIAL` when exceeded:
+
+- **Identity budget (lifetime).** Detailed capture (`profile`, `trace`) gives
+  each process it tracks a private identity ticket. The budget is **16,384
+  tickets for the whole capture**; tickets are never reused. Under `--cgroup`
+  and `--system`, *every* process created in scope spends tickets at fork
+  time (parent and child), whether or not it ever calls PKCS #11. On a host
+  creating about 5 processes per second the budget lasts under an hour. Once
+  it is spent, new processes in scope get no identity: their fork records
+  are dropped and their calls count only as `semantic_capture_failures` and
+  in-flight calls. Each refusal is counted in
+  `evidence.kernel_control.identity_unavailable`, and
+  `identity_budget_exhausted` reads `true`. For long captures of busy
+  hosts, prefer `--pid` or a narrow `--cgroup`, or split the capture.
+- **Concurrent owners.** At most 16,448 threads can hold an in-flight call
+  record at once; an admission beyond that is refused and counted
+  (`start_insert_failures`, `kernel_control.owner_admission_failures`).
+- **Owner health.** If the in-kernel call-ownership accounting ever detects
+  an internal inconsistency, it stops *all* capture for the rest of the run
+  rather than guess. The report then carries
+  `kernel_control.capture_halted: true` with the finite reason names in
+  `kernel_control.owner_poison`, p11scope prints one
+  `p11scope: kernel capture halted ...` line to stderr when it first
+  sees the halt, and the verdict is a concrete-gap `PARTIAL`: counts after
+  that moment are missing, never silently smaller.
+
 An optional manifest's missing or identity-mismatched object is ignored only
 after one exact scan-opened table for that object covers every dropped claim
 and remains admitted in the final plan. The fallback is per object and is

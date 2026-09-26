@@ -327,11 +327,46 @@ pub struct SelectionTuple {
     pub module: u32,
     pub request: SelectionRequest,
     pub rv: u64,
+    /// Result `flags` publish only as a finite class (see
+    /// [`selection_result_flags_class`]); request flags are a scalar argument.
+    #[serde(serialize_with = "serialize_selection_result")]
     pub result: Option<SelectionRequest>,
     pub table_match: bool,
     pub inventory_matches: Vec<SelectionMatch>,
     pub authority: SelectionAuthority,
     pub count: u64,
+}
+
+/// The finite class of a returned interface flags word: `zero`,
+/// `fork_safe` (exactly `CKF_INTERFACE_FORK_SAFE`), or `other`. The kernel
+/// already reduces live results to this domain; the class is applied again
+/// here so no path (live, offline helper, stale object) publishes the word.
+pub fn selection_result_flags_class(flags: u64) -> &'static str {
+    match flags {
+        0 => "zero",
+        cryptoki_sys::CKF_INTERFACE_FORK_SAFE => "fork_safe",
+        _ => "other",
+    }
+}
+
+fn serialize_selection_result<S: serde::Serializer>(
+    result: &Option<SelectionRequest>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    #[derive(Serialize)]
+    struct PublishedResult {
+        name: p11scope_manifest::manifest::SelectionNameClass,
+        version: p11scope_manifest::manifest::SelectionVersionClass,
+        flags: &'static str,
+    }
+    result
+        .as_ref()
+        .map(|result| PublishedResult {
+            name: result.name,
+            version: result.version,
+            flags: selection_result_flags_class(result.flags),
+        })
+        .serialize(serializer)
 }
 
 /// What discovery learned, carried into evidence (spec §4.8). Flattened into
@@ -619,6 +654,9 @@ pub struct Evidence {
     /// Matched leader exits whose retained process generation stayed live,
     /// proving task-uprobe link loss; counted once per process view.
     pub task_uprobe_link_losses: u64,
+    /// Native kernel control state (owner poison, identity and root-affiliation
+    /// refusals), read at every snapshot. A halt or any loss forces PARTIAL.
+    pub kernel_control: crate::metrics::KernelControlEvidence,
     /// The always-present finite live-loader aggregate (design §9.2).
     pub loader_discovery: LoaderDiscovery,
     #[serde(skip)]
@@ -947,6 +985,7 @@ impl Evidence {
             && self.discovery_read_failures == 0
             && self.discovery_truncated == 0
             && self.task_uprobe_link_losses == 0
+            && self.kernel_control.complete()
             && self.pause_partial == 0
             && !self.scheduling.terminal_drain_truncated
             && self.scheduling.sink_dropped_bytes == 0
@@ -1848,6 +1887,7 @@ pub(crate) mod tests {
             discovery_read_failures: 0,
             discovery_truncated: 0,
             task_uprobe_link_losses: 0,
+        kernel_control: Default::default(),
             loader_discovery: LoaderDiscovery::default(),
             interface_selection: InterfaceSelection::default(),
             attach_mechanisms: vec![],

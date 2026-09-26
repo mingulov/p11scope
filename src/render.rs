@@ -2725,11 +2725,13 @@ pub(crate) mod tests {
                 value if value == pkcs11_types::CkRv::PENDING.0 => "CKR_PENDING",
                 value => unreachable!("unexpected fixture RV {value:#x}"),
             };
-            // Task 1.3: the scan-only table is unlinked, so the trace names
-            // the slot `unknown` — the counts and RVs are retained unchanged.
+            // Task 1.3: the scan-only table is unlinked, so the trace never
+            // names the slot — it shows the ordinal that reached it (review
+            // answer (c)); the counts and RVs are retained unchanged.
+            let ordinal = crate::discovery::scan::standard_ordinal("C_OpenSession").unwrap();
             assert_eq!(
                 &line[15..],
-                format!(" pid 100 tid 1 unknown [semantics unverified] → {rv} 100ns"),
+                format!(" pid 100 tid 1 unknown#{ordinal} [semantics unverified] → {rv} 100ns"),
                 "the generated trace must retain every aggregate RV without semantic payload"
             );
         }

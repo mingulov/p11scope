@@ -3486,6 +3486,15 @@ mod tests {
         let mut expected = allocated.clone();
         expected.slots[0].names.push("C_Verify".into());
         expected.slots[0].aliased = true;
+        // The selected position is disclosed too (review answer (c)); a
+        // selection table has no table location.
+        expected.slot_ordinals.insert(
+            AttachKey::of(&expected.slots[0]),
+            BTreeSet::from([SlotOrdinal {
+                table_file_offset: None,
+                ordinal: standard_ordinal("C_Verify").unwrap(),
+            }]),
+        );
         assert_eq!(rebuilt, expected, "only finite alias metadata may change");
         assert_eq!(rebuilt.module_of_slot(0), Some(ModuleId(0)));
     }

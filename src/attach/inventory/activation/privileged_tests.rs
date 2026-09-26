@@ -49,6 +49,13 @@ struct OwnedFixture {
     expected_abi: ElfAbi,
 }
 
+/// Largest owned-fixture endpoint count: the biggest controller-owned live
+/// selector N (L-T7-5 boundary at 8192; covers L-T7-3 4097 and L-T7-4 6530).
+/// The Inventory path is parametric in N (budget to u32 capacity to
+/// `map_max_entries`), so this fixture bound — not a map or plan limit — is
+/// what admits those cells. Anything larger is unowned and stays refused.
+const OWNED_FIXTURE_MAX_ENDPOINTS: u32 = 8_192;
+
 impl OwnedFixture {
     fn build(ia32: bool) -> Result<Self> {
         Self::build_n(ia32, 576)
@@ -151,7 +158,7 @@ impl OwnedFixture {
         alias_zero: bool,
     ) -> Result<(tempfile::TempDir, PathBuf)> {
         ensure!(
-            (1..=2_113).contains(&endpoints),
+            (1..=OWNED_FIXTURE_MAX_ENDPOINTS).contains(&endpoints),
             "unsupported owned fixture size"
         );
         let directory = tempfile::tempdir()?;
@@ -6765,6 +6772,28 @@ fn privileged_t7_detailed_hot_slot_third_rv_lp64() -> Result<()> {
     detached?;
     ensure!(clean_detach, "Detailed detach retained failures");
     eprintln!("T7_HOT_RV hot_slot={HOT} rvs=0,5,7 old_cells=1..{N} exact=true");
+    Ok(())
+}
+
+// T7 fix round 2: the owned fixture must admit every owned live selector N
+// (L-T7-3 4097, L-T7-4 6530, L-T7-5 8192 boundary). Live L-T7-3/4 failed
+// instantly with `unsupported owned fixture size`; this gate proves the
+// fixture (compile + ELF + distinct physical offsets + Inventory plan)
+// builds at each selector size without BPF. Anything larger stays refused.
+#[test]
+fn task4_owned_fixture_admits_t7_live_selector_sizes() -> Result<()> {
+    for endpoints in [4_097u32, 6_530, 8_192] {
+        let fixture = OwnedFixture::build_n(false, endpoints)?;
+        verify_task4_physical_slots(&fixture.plan.slots, endpoints as usize)?;
+    }
+    let error = match OwnedFixture::build_n(false, 8_193) {
+        Ok(_) => bail!("fixture admitted past 8192"),
+        Err(error) => error,
+    };
+    ensure!(
+        format!("{error:?}").contains("unsupported owned fixture size"),
+        "wrong oversize fixture refusal: {error:?}"
+    );
     Ok(())
 }
 

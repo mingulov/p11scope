@@ -9,6 +9,7 @@ pub mod doctor;
 pub mod events;
 pub mod inspect;
 pub mod kinds;
+pub mod longrun;
 pub mod manifest_input;
 pub mod metrics;
 pub mod output;

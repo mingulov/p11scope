@@ -4,6 +4,8 @@
 The active requirements are the [six original T2 boxes](t2-first-use-requirements.md).
 The [resource and latency pilot](system-resource-pilot.md) defines the
 preliminary measurement protocol for T7/T12; its axes are not executed results.
+The [G-14 runtime report](t2-g14-runtime-diagnostics.md) records the new
+public PID/profile baseline, exact owned counts and remaining loader gaps.
 Cold CLI startup is supporting evidence; it does not complete the gated /
 ungated provider-first-use matrix. The earlier ordinary evidence below
 was produced unprivileged on the dev host (`7.0.0-31-generic`) at T2 BASE
@@ -129,6 +131,7 @@ Five scheduling integration controls, three descriptor controls and the
 existing detector tests pass. The default workspace suite passed (1616
 library tests, 45 privileged tests ignored; 139 artifact tests), as did the
 wide run/sink suites (161 and 18 tests) and both strict all-target Clippy
-checks. Actual public-loop measurements, the run-mode early-loss repair and
-the supported-boundary G-14 green result remain pending; these ordinary
-checks alone do not close them.
+checks. The new runtime report confirms the diagnostic in one owned public
+PID/profile run. The other mode comparisons, run-mode early-loss repair and
+supported-boundary G-14 green result remain pending; these ordinary checks
+alone do not close them.

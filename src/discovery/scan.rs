@@ -2640,9 +2640,11 @@ fn opened_file_identity_guard(
     view: &ProcessView,
     file: &File,
     expected: ObjectKey,
+    mounts: &mut crate::process::MountTableCache,
     budget: &mut CaptureWorkBudget,
 ) -> Result<(), String> {
-    let actual = crate::discovery::identity::retained_object_key(view, file, budget)?;
+    let actual =
+        crate::discovery::identity::retained_object_key_cached(view, file, mounts, budget)?;
     if actual == expected {
         return Ok(());
     }
@@ -3157,6 +3159,8 @@ fn scan_process_view_with_io_mode(
     let mut hint_matched = vec![false; request.hints.len()];
 
     let groups = candidate_groups(&maps);
+    // One mount-table read serves every object this scan opens (H-3).
+    let mut mounts = crate::process::MountTableCache::default();
     for (key, group) in groups {
         if budget.scan_stopped() {
             break;
@@ -3224,7 +3228,7 @@ fn scan_process_view_with_io_mode(
                 continue;
             }
         };
-        if let Err(reason) = opened_file_identity_guard(view, &file, key, budget) {
+        if let Err(reason) = opened_file_identity_guard(view, &file, key, &mut mounts, budget) {
             skipped.push(Skipped { subject, reason });
             continue;
         }
@@ -5102,6 +5106,44 @@ mod tests {
         );
     }
 
+    /// H-3 regression: one scan read its view's `/proc/<pid>/mountinfo` once
+    /// per mapped executable object — a full kernel render and parse of the
+    /// mount table each time, charged to the capture's non-renewable I/O
+    /// allowance. On a container host with hundreds of objects and a thousand
+    /// mounts that is tens of megabytes per scan. One scan reads it once while
+    /// it stays unchanged.
+    #[test]
+    fn one_scan_reads_its_mount_table_once() {
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+        let objects = candidate_groups(&maps).len();
+        assert!(
+            objects >= 3,
+            "this test process maps several objects: {objects}"
+        );
+        let hooks = HookRegistry::default();
+        let request = ScanRequest {
+            pid: std::process::id(),
+            hints: &[],
+            hooks: &hooks,
+        };
+        let witness = crate::process::MountChangeWitness::new();
+        let before = crate::process::mountinfo_reads_for_test();
+
+        scan_process_view_without_memory(&request, &view, &mut CaptureWorkBudget::default())
+            .unwrap();
+
+        let reads = crate::process::mountinfo_reads_for_test() - before;
+        // A mount change elsewhere on the host during the scan must be read
+        // again; only an unchanged table has to be read exactly once.
+        if !witness.changed() {
+            assert_eq!(
+                reads, 1,
+                "one mount-table read for {objects} mapped objects"
+            );
+        }
+    }
+
     #[test]
     fn opened_file_identity_rejects_same_size_inode_before_hint_matching() {
         let directory = tempfile::tempdir().unwrap();
@@ -5135,6 +5177,7 @@ mod tests {
                 &view,
                 &replacement_file,
                 captured,
+                &mut crate::process::MountTableCache::default(),
                 &mut CaptureWorkBudget::default(),
             )
             .is_err(),
@@ -5149,7 +5192,7 @@ mod tests {
             .iter()
             .position(|line| {
                 *line
-                    == "if let Err(reason) = opened_file_identity_guard(view, &file, key, budget) {"
+                    == "if let Err(reason) = opened_file_identity_guard(view, &file, key, &mut mounts, budget) {"
             })
             .expect("the shared identity guard must run in the scan");
         assert_eq!(
@@ -5189,10 +5232,9 @@ mod tests {
         let guard_body = &include_str!("scan.rs")[include_str!("scan.rs")
             .find("fn opened_file_identity_guard(")
             .expect("identity guard")..];
-        assert!(
-            guard_body
-                .contains("crate::discovery::identity::retained_object_key(view, file, budget)")
-        );
+        assert!(guard_body.contains(
+            "crate::discovery::identity::retained_object_key_cached(view, file, mounts, budget)"
+        ));
         for decision in [
             "if !request.hints.is_empty() && !hinted {\n            continue;\n        }",
             "if hinted && !attributable {",

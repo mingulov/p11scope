@@ -11,8 +11,9 @@ use crate::discovery::hooks::{HookAbi, HookRegistry};
 use crate::discovery::identity::{
     ManifestStaleReason, PinnedObjectId, PinnedObjects, PinnedTimingKey, ReconciledModule,
     StaleManifestObject, bind_scanned_modules, canonicalize_scanned_overlays, open_view_object,
-    pin_manifest_objects_deferred_in_views_with_budget, pin_scanned_view_objects,
-    retained_object_key, target_paths_equal, view_object_key,
+    open_view_object_cached, pin_manifest_objects_deferred_in_views_with_budget,
+    pin_scanned_view_objects, retained_object_key, retained_object_key_cached, target_paths_equal,
+    view_object_key_cached,
 };
 use crate::discovery::loader::{LoaderContextId, LoaderContextSpec, LoaderRegistry};
 use crate::discovery::noise::DiscoveryNoiseAggregator;
@@ -8090,10 +8091,12 @@ impl Engine {
         budget: &mut CaptureWorkBudget,
     ) -> Result<Option<LoaderLocator>> {
         let pid = view.pid();
+        // One mount-table read serves every identity below (H-3).
+        let mut mounts = crate::process::MountTableCache::default();
         let before_maps = Self::read_maps(view, budget)?;
         let executable_path = PathBuf::from(format!("/proc/{pid}/exe"));
-        let before_executable =
-            view_object_key(view, &executable_path, budget).map_err(anyhow::Error::msg)?;
+        let before_executable = view_object_key_cached(view, &executable_path, &mut mounts, budget)
+            .map_err(anyhow::Error::msg)?;
         let executable = view
             .run_while_same(|| std::fs::File::open(&executable_path))
             .map_err(anyhow::Error::msg)??;
@@ -8105,7 +8108,8 @@ impl Engine {
             bail!("retained executable changed during bounded PT_INTERP discovery");
         }
         let retained_executable =
-            retained_object_key(view, &executable, budget).map_err(anyhow::Error::msg)?;
+            retained_object_key_cached(view, &executable, &mut mounts, budget)
+                .map_err(anyhow::Error::msg)?;
 
         let interpreter_file = if let Some(interpreter) = &interpreter {
             let path = PathBuf::from(format!("/proc/{pid}/root")).join(
@@ -8113,7 +8117,8 @@ impl Engine {
                     .strip_prefix("/")
                     .expect("bounded PT_INTERP paths are absolute"),
             );
-            let (file, key) = open_view_object(view, &path, budget).map_err(anyhow::Error::msg)?;
+            let (file, key) = open_view_object_cached(view, &path, &mut mounts, budget)
+                .map_err(anyhow::Error::msg)?;
             let object = read_elf_snapshot(&file, budget).map_err(anyhow::Error::msg)?;
             if object.abi() != executable_abi {
                 bail!("retained executable and PT_INTERP have different target ABIs");
@@ -8125,8 +8130,8 @@ impl Engine {
         };
 
         let after_maps = Self::read_maps(view, budget)?;
-        let after_executable =
-            view_object_key(view, &executable_path, budget).map_err(anyhow::Error::msg)?;
+        let after_executable = view_object_key_cached(view, &executable_path, &mut mounts, budget)
+            .map_err(anyhow::Error::msg)?;
         if before_executable != retained_executable || retained_executable != after_executable {
             bail!("retained executable identity changed during PT_INTERP discovery");
         }

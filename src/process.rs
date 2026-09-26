@@ -326,11 +326,140 @@ fn ensure_same_mount_namespace(
     }
 }
 
-fn open_then_mountinfo_checked<T>(
+#[cfg(test)]
+thread_local! {
+    static MOUNTINFO_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many `/proc/<pid>/mountinfo` tables this thread has read through a
+/// retained process view (H-3 seam).
+#[cfg(test)]
+pub(crate) fn mountinfo_reads_for_test() -> u64 {
+    MOUNTINFO_READS.with(std::cell::Cell::get)
+}
+
+/// Opens and reads one retained view's mount table, charged to `budget`. The
+/// table fd is returned open: it stays pollable for later changes.
+fn read_view_mountinfo(
+    pid: u32,
+    budget: &mut CaptureWorkBudget,
+) -> Result<(std::fs::File, String), String> {
+    let table = std::fs::File::open(format!("/proc/{pid}/mountinfo"))
+        .map_err(|error| format!("cannot open pid {pid}'s mount table: {error}"))?;
+    #[cfg(test)]
+    MOUNTINFO_READS.with(|reads| reads.set(reads.get() + 1));
+    let text = read_mountinfo(&table, budget)
+        .map_err(|error| format!("cannot read pid {pid}'s mount table: {error}"))?;
+    Ok((table, text))
+}
+
+/// Whether the mount namespace behind an open `/proc/<pid>/mountinfo` changed
+/// since the fd was opened or last polled: the kernel reports
+/// `POLLPRI|POLLERR` exactly then (proc(5), `mounts_poll`). A failed poll
+/// counts as a change.
+fn mount_table_changed(table: &std::fs::File) -> bool {
+    let mut poll = libc::pollfd {
+        fd: table.as_raw_fd(),
+        events: libc::POLLPRI,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd for an fd this function borrows, zero timeout.
+    let ready = unsafe { libc::poll(&mut poll, 1, 0) };
+    ready != 0 || poll.revents & (libc::POLLPRI | libc::POLLERR | libc::POLLNVAL) != 0
+}
+
+/// Reports whether this process's mount table changed after it was created,
+/// so a test counting mount-table reads can tell a real change (which must be
+/// read again) from a redundant read.
+#[cfg(test)]
+pub(crate) struct MountChangeWitness(std::fs::File);
+
+#[cfg(test)]
+impl MountChangeWitness {
+    pub(crate) fn new() -> Self {
+        Self(std::fs::File::open("/proc/self/mountinfo").unwrap())
+    }
+
+    pub(crate) fn changed(&self) -> bool {
+        mount_table_changed(&self.0)
+    }
+}
+
+/// One retained view's mount table, read once and reused for as long as the
+/// kernel reports its mount namespace unchanged (H-3). A scan used to read
+/// and parse `/proc/<pid>/mountinfo` once per mapped object.
+///
+/// Reuse is exact, not a heuristic: the table fd stays open, and
+/// `/proc/<pid>/mountinfo` reports `POLLPRI` once the namespace's mount table
+/// changes after the fd was opened or last polled (proc(5); the kernel's
+/// `mounts_poll`). Every use first proves "unchanged since read" with a
+/// zero-timeout poll, after the object was opened, so the answer is as fresh
+/// as a table read after the open — the property `open_then_mountinfo`
+/// exists for. Any change, or a failed poll, reads the table again. One
+/// cache serves one view: another view, or a view of another pid, reads its
+/// own table.
+pub(crate) struct MountTableCache {
+    table: Option<CachedMountTable>,
+    changed: fn(&std::fs::File) -> bool,
+}
+
+struct CachedMountTable {
+    owner: (ProcessViewId, u32),
+    file: std::fs::File,
+    text: String,
+}
+
+impl Default for MountTableCache {
+    fn default() -> Self {
+        Self {
+            table: None,
+            changed: mount_table_changed,
+        }
+    }
+}
+
+impl MountTableCache {
+    /// A cache whose change detector is `changed` instead of `poll(2)`.
+    #[cfg(test)]
+    pub(crate) fn with_change_detector_for_test(changed: fn(&std::fs::File) -> bool) -> Self {
+        Self {
+            table: None,
+            changed,
+        }
+    }
+
+    /// Forgets the table, so the next use reads a fresh one.
+    pub(crate) fn invalidate(&mut self) {
+        self.table = None;
+    }
+
+    fn refresh(
+        &mut self,
+        owner: (ProcessViewId, u32),
+        budget: &mut CaptureWorkBudget,
+    ) -> Result<(), String> {
+        if let Some(table) = &self.table
+            && table.owner == owner
+            && !(self.changed)(&table.file)
+        {
+            return Ok(());
+        }
+        self.table = None;
+        let (file, text) = read_view_mountinfo(owner.1, budget)?;
+        self.table = Some(CachedMountTable { owner, file, text });
+        Ok(())
+    }
+
+    fn text(&self) -> &str {
+        self.table.as_ref().map_or("", |table| table.text.as_str())
+    }
+}
+
+fn open_then_mountinfo_checked<T, M>(
     mut ensure_retained: impl FnMut() -> Result<(), String>,
     open: impl FnOnce() -> Result<T, String>,
-    read_mountinfo: impl FnOnce() -> Result<String, String>,
-) -> Result<(T, String), String> {
+    read_mountinfo: impl FnOnce() -> Result<M, String>,
+) -> Result<(T, M), String> {
     ensure_retained()?;
     let opened = open()?;
     ensure_retained()?;
@@ -465,16 +594,25 @@ impl ProcessView {
         open_then_mountinfo_checked(
             || self.ensure_retained(),
             open,
-            || {
-                let table = std::fs::File::open(format!("/proc/{}/mountinfo", self.pid()))
-                    .map_err(|error| {
-                        format!("cannot open pid {}'s mount table: {error}", self.pid())
-                    })?;
-                read_mountinfo(table, budget).map_err(|error| {
-                    format!("cannot read pid {}'s mount table: {error}", self.pid())
-                })
-            },
+            || read_view_mountinfo(self.pid(), budget).map(|(_, text)| text),
         )
+    }
+
+    /// [`Self::open_then_mountinfo`] against `mounts`, which reads this view's
+    /// table once and proves it unchanged — after `open` — on every later use.
+    pub(crate) fn open_then_cached_mountinfo<'c, T>(
+        &self,
+        open: impl FnOnce() -> Result<T, String>,
+        mounts: &'c mut MountTableCache,
+        budget: &mut CaptureWorkBudget,
+    ) -> Result<(T, &'c str), String> {
+        let owner = (self.id(), self.pid());
+        let (opened, ()) = open_then_mountinfo_checked(
+            || self.ensure_retained(),
+            open,
+            || mounts.refresh(owner, budget),
+        )?;
+        Ok((opened, mounts.text()))
     }
 }
 
@@ -855,7 +993,7 @@ mod tests {
             },
             || {
                 events.borrow_mut().push("mountinfo");
-                Ok("17 1 8:1 / / rw - ext4 /dev/root rw\n".into())
+                Ok::<String, String>("17 1 8:1 / / rw - ext4 /dev/root rw\n".into())
             },
         )
         .unwrap();

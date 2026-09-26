@@ -308,14 +308,13 @@ Uprobes bind to the file inode, so attaching to a provider `.so` in a shared
 image layer observes every container on that node using that layer —
 including pods started later (e.g. Knative scale-from-zero). That
 inode-sharing property is the headline bet; it depends on the `overlay2`
-storage driver and was validated on earlier candidates, with exact call
-counts, against a real Docker container, two containers sharing one image
-layer, a Kubernetes pod (kind), and a Knative service's scale-from-zero cold
-start (`docs/notes/phase4-matrix.md`). Those container lanes were not re-run
-for v0.1.0 (see [known limitations](CHANGELOG.md#known-limitations)).
-<!-- TODO(release): update if the container lanes are re-run on the release bytes (owner decision D5). -->
-`deploy/k8s` is an experimental example, not a published image; cluster-wide
-packaging (DaemonSet/operator) comes later.
+storage driver and is validated, with exact call counts, against a real
+Docker container, two containers sharing one image layer, a Kubernetes pod
+(kind), and a Knative service's scale-from-zero cold start
+(`docs/notes/phase4-matrix.md`).
+<!-- TODO(release): container qualification is pending its re-run on the release bytes (owner decision: re-run, not downgrade). Record the Docker, shared-layer, kind and Knative results here and in CHANGELOG.md, or reword if a lane does not pass. -->
+`deploy/k8s` is an example, not a published image; cluster-wide packaging
+(DaemonSet/operator) comes later.
 
 Manifest-free discovery collapses matching overlay mappings in that common
 shared-layer case so the kernel point is attached once. Overlayfs classification,

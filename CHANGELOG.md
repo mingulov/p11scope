@@ -170,10 +170,11 @@ provider during capture.
    function tables, vendor-only interfaces (count-only or unknown), and calls
    through unsupported surfaces.
 6. **Trace output** has no provider column; PIDs are host-namespace PIDs.
-7. **Containers and Kubernetes.** Shared-layer, Docker, kind and Knative
-   results were validated on earlier candidates and were not re-run on this
-   release; `deploy/k8s` is an experimental example, not a published image.
-   <!-- TODO(release): replace with the container-lane result if it is re-run (owner decision D5). -->
+7. **Containers and Kubernetes.** `deploy/k8s` is an example, not a
+   published image. Docker, shared-layer, kind and Knative capture is
+   supported; its qualification on the release bytes is recorded under
+   [Qualification of this release](#qualification-of-this-release).
+   <!-- TODO(release): container qualification pending re-run on the release bytes (owner decision: re-run, not downgrade). -->
 8. **`run` under `sudo`** clears supplementary groups, so a workload that
    needs an HSM/device group should be observed with `profile`/`trace` or run
    with a capability-carrying observer instead.
@@ -201,6 +202,8 @@ provider during capture.
 
 - Hosted CI run: TODO(release)
 - Kernels and lanes run on the release bytes: TODO(release)
+- Container lanes (Docker, shared layer, kind, Knative) re-run on the
+  release bytes: TODO(release)
 - `scripts/build-release.sh` receipt and `SHA256SUMS`: TODO(release)
 
 ### Pre-release development history

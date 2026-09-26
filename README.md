@@ -11,13 +11,13 @@ table (including stripped providers with no `C_*` symbols), attaches probes by
 file offset, and produces a versioned `observed-profile.json` for migration
 assessment and incident diagnostics.
 
-> **Status: unreleased; the current candidate is undergoing release qualification.**
-> Memory-scan discovery, `C_GetInterface`, `inspect`, `doctor`, public `run`,
-> multi-module capture, schema v3, and owned-child live discovery are
-> implemented. A previous frozen MVP passed the Ubuntu 22.04/5.15 and Ubuntu
-> 24.04/6.8 runtime matrix, but those results do not qualify the current candidate. Fresh
-> exact-tip runtime qualification, CI, packaging, publication, and release
-> remain pending.
+> **Status: v0.1.0**, the first release of the existing commands: `doctor`,
+> `inspect`, `profile` (including `--mode metrics`), `trace`, and `run`, with
+> memory-scan discovery, multi-module capture, and schema v3. Read the
+> [known limitations](CHANGELOG.md#known-limitations) before relying on a
+> capture; `--system` is a preview. What was qualified on the release commit
+> (kernels, lanes, hosted CI run) is recorded in
+> [CHANGELOG.md](CHANGELOG.md#qualification-of-this-release).
 
 Function-table support is cumulative: legacy PKCS #11 2.00, every 2.01–2.40
 table, and standard 3.0, 3.1, and 3.2 interfaces (all 104 slots published in
@@ -29,8 +29,8 @@ and leaves deceptive/vendor tables undecoded. The explicit offline helper
 performs ten fixed `C_GetInterface` queries before any provider initialization;
 live observation remains passive.
 
-**v0.1.0, unreleased.** See [CHANGELOG.md](CHANGELOG.md) for what is in the
-tree, and
+See [CHANGELOG.md](CHANGELOG.md) for what v0.1.0 contains and its known
+limitations, [Install](#install) to build and install it, and
 [docs/usage.md](docs/usage.md) for the full operator's guide (privileges,
 kernel floor, overhead, and the evidence/completeness model — every
 quantitative claim there cites the script that measured it).
@@ -58,8 +58,8 @@ ordinary fresh checkout therefore needs archive access. Git-based source exports
 generated trees, their receipts, and the local archive cache while retaining
 the recipe and patches. An offline distribution must add the exact pinned
 archives explicitly. All locked registry packages and the fixed
-`pkcs11-proxy-ng` Git revision are separate Cargo inputs and must already be
-available in the Cargo cache for a fully offline build.
+`pkcs11-components` Git revision (`d0a47c7`) are separate Cargo inputs and
+must already be available in the Cargo cache for a fully offline build.
 
 For a self-contained full source export and its fixed unprivileged recipient
 bootstrap, use Python >=3.11, or Python 3.10 with the distro `python3-tomli`
@@ -67,9 +67,79 @@ package installed and verified before disconnection; see [the offline build
 guide](docs/build-offline.md).
 
 See [development setup](docs/development.md) for the Ubuntu 26.04 primary-host
-packages, pinned Rust/BPF tools, canonical checks, and the exact Git dependency
-bootstrap. Ubuntu 26.04 is a development host choice, not a product runtime
-dependency.
+packages, pinned Rust/BPF tools, and canonical checks. Ubuntu 26.04 is a
+development host choice, not a product runtime dependency. The command above
+is a debug build of every binary; [Install](#install) builds the release
+artifacts.
+
+## Install
+
+p11scope v0.1.0 is distributed as source.
+<!-- TODO(release): if binaries are attached to the GitHub release, name them and SHA256SUMS here. -->
+`cargo install` is not supported: the root manifest patches two crates whose
+trees `scripts/prepare-dependencies.py` generates. The official artifacts are
+built and verified by `scripts/build-release.sh` (see
+[RELEASING.md](RELEASING.md)); the commands below build the same shapes by
+hand.
+
+**Build prerequisites** (x86-64 Linux; Ubuntu package names): the pinned
+toolchains from [docs/development.md](docs/development.md). The scripts select
+the stable toolchain as `+1.88`, and the static observer needs its musl
+target:
+
+```sh
+sudo apt-get install -y build-essential clang-18 llvm python3 git
+rustup toolchain install 1.88 --profile minimal
+rustup target add --toolchain 1.88 x86_64-unknown-linux-musl
+rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
+cargo +1.88 install bpf-linker --version 0.10.4 --locked
+```
+
+**Observer (`p11scope`).** A static musl binary with the BPF object embedded;
+it never loads a provider, so one binary serves every host:
+
+```sh
+RUSTFLAGS='-C target-feature=+crt-static' ./scripts/cargo.sh +1.88 build \
+  --locked --release --no-default-features \
+  --target x86_64-unknown-linux-musl --bin p11scope
+sudo install -m 0755 target/x86_64-unknown-linux-musl/release/p11scope /usr/local/bin/
+```
+
+**Optional helper (`p11scope-discover`).** Needed only for
+[attested semantic capture](docs/usage.md#attested-semantic-capture). It loads
+the provider with `dlopen`, so it is dynamically linked and must match the
+provider's C library: build it on (or in a container of) a glibc system for
+glibc providers, and on a musl system such as Alpine for musl providers.
+
+```sh
+./scripts/cargo.sh +1.88 build --locked --release -p p11scope-discover
+sudo install -m 0755 target/release/p11scope-discover /usr/local/bin/
+```
+
+The helper runs unprivileged and drops groups, IDs, and capabilities before
+loading provider code. Never give it capabilities or a set-id bit.
+
+**Kernel and privileges.** Linux 5.15 or newer with BTF
+(`/sys/kernel/btf/vmlinux`). Captures need root (`sudo p11scope ...`) or file
+capabilities on the observer. The capability set measured in
+[docs/usage.md](docs/usage.md#privileges-per-environment) is:
+
+```sh
+sudo setcap 'cap_sys_admin,cap_bpf,cap_perfmon,cap_sys_ptrace,cap_dac_read_search+ep' \
+  /usr/local/bin/p11scope
+```
+
+Anyone who can execute a capability-carrying observer can observe other
+users' processes, so restrict who may execute it (for example, a dedicated
+group and mode `0750`).
+
+**Check the install:**
+
+```sh
+p11scope --version
+p11scope-discover --version
+sudo p11scope doctor
+```
 
 ## Why
 
@@ -136,27 +206,29 @@ absent from the shipped eBPF object, and `metrics` mode refuses it outright.
 The official release artifact is built `--no-default-features`, so packaging
 fails if the unsafe path is reachable at all.
 
-The inventory is maintained in the written, field-by-field allowlist
-([docs/privacy/allowlist-v2.md](docs/privacy/allowlist-v2.md)) and a
-secret-canary suite (`scripts/verify-canaries.sh`) that plants sentinel PINs,
+The field-by-field inventory is
+[docs/privacy/allowlist-v1.md](docs/privacy/allowlist-v1.md), extended by
+[docs/privacy/allowlist-v2.md](docs/privacy/allowlist-v2.md) (interface
+selection, attach mechanism, descendant rebuild, task-uprobe loss and ABI
+refusal evidence). It is backed by a secret-canary suite (`scripts/verify-canaries.sh`) that plants sentinel PINs,
 key material, and buffer contents in a real workload and scans every output
 artifact and every observer-owned BPF map for leaks — including hostile-alias
 lanes, secret/unterminated/hostile-alias `C_GetInterface` names, and the
 transient raw `pMechanism` address the return probe needs.
 
-See [what you will see](docs/superpowers/specs/2026-08-10-p11scope-outputs.md)
-for the CLI, live output, trace lines, and an example `observed-profile.json`.
+See the [quickstart](docs/usage.md#quickstart) for the CLI, live output, and
+trace lines, and [the v3 schema](docs/schema/observed-profile-v3.md) for the
+report format.
 
 ## Honest claims
 
 - Zero application changes, no PKCS#11 interposition, attachable to running
-  processes and containers. The accepted Slice 1b-1 contract scans mapped
-  providers at attach; calls *before* attach are outside the capture window.
-  This branch also wires internal live discovery, but capture-history
-  correctness and product gates remain incomplete, so late-provider coverage
-  is not yet a supported claim. A suitable manifest can still supply offsets
-  when one already exists and can be hash-matched (and corroborated when the
-  provider is mapped). **Not**
+  processes and containers. Discovery scans the providers already mapped at
+  attach and keeps watching for later loads while the capture runs. Calls
+  *before* attach are outside the capture window, and the first calls after a
+  late `dlopen` can be missed before that provider's probes land. A suitable
+  manifest can still supply offsets when one already exists and can be
+  hash-matched (and corroborated when the provider is mapped). **Not**
   "undetectable", **not** zero overhead: measured at roughly a **5x
   wall-clock slowdown** against unobserved SoftHSM2 — deliberately the worst
   case, since its microsecond-scale software crypto makes probe overhead
@@ -182,7 +254,7 @@ for the CLI, live output, trace lines, and an example `observed-profile.json`.
   explicitly `PARTIAL`, not a claim that the proxy layer was captured.
 - Discovery has one capture-wide 512 MiB attempted-I/O allowance shared by
   memory scans and scan-sourced file hashes across all selected processes and
-  retries, with 64 MiB per scan/hash operation. It also stops at 512 accepted
+  retries, with at most 256 MiB per scan/hash operation. It also stops at 512 accepted
   table candidates, 53,248 decoded entries, 512 interface records, 256 cgroup
   members, and 512 attach slots. Any bounded omission is evidence and forces
   `PARTIAL`; a retry never renews the allowance.
@@ -216,7 +288,9 @@ for the CLI, live output, trace lines, and an example `observed-profile.json`.
   invocations but does not wait for BPF callbacks already running on another
   CPU, so a completed capture cannot honestly claim a proven final drain. A
   clean run is `PARTIAL` with every concrete gap counter zero; that is the
-  contract the release lanes assert. Absence of a call means "not observed in
+  contract the release lanes assert.
+  <!-- TODO(release): restate with the final verdict_detail values once the verdict split lands. -->
+  Absence of a call means "not observed in
   this window," never "the application cannot do it"; aliased table entries are
   ambiguous by construction; requested attributes are what the app asked for,
   not the key's effective policy. Full honest-claims section:
@@ -234,11 +308,14 @@ Uprobes bind to the file inode, so attaching to a provider `.so` in a shared
 image layer observes every container on that node using that layer —
 including pods started later (e.g. Knative scale-from-zero). That
 inode-sharing property is the headline bet; it depends on the `overlay2`
-storage driver and is validated, with exact call counts, against a real
-Docker container, two containers sharing one image layer, a Kubernetes pod
-(kind), and a Knative service's scale-from-zero cold start
-(`docs/notes/phase4-matrix.md`). Cluster-wide packaging (DaemonSet/operator)
-comes after v1.
+storage driver and was validated on earlier candidates, with exact call
+counts, against a real Docker container, two containers sharing one image
+layer, a Kubernetes pod (kind), and a Knative service's scale-from-zero cold
+start (`docs/notes/phase4-matrix.md`). Those container lanes were not re-run
+for v0.1.0 (see [known limitations](CHANGELOG.md#known-limitations)).
+<!-- TODO(release): update if the container lanes are re-run on the release bytes (owner decision D5). -->
+`deploy/k8s` is an experimental example, not a published image; cluster-wide
+packaging (DaemonSet/operator) comes later.
 
 Manifest-free discovery collapses matching overlay mappings in that common
 shared-layer case so the kernel point is attached once. Overlayfs classification,
@@ -265,11 +342,7 @@ rename).
 Memory scanning is heuristic discovery. Live and terminal evidence are PARTIAL
 while scan-only semantic claims remain. P11Lab joins reject scan-only and
 conflict modules; an accepted manifest may authorize only its exact pinned
-object, offset, and canonical function name. The owned-child `run` path and
-capture-history corrections in the frozen pre-W3 candidate at `ae8494d`
-passed the local 5.15/6.8 semantic campaign. Those results do not qualify the
-W3 tip. The project remains unreleased while exact-tip runtime qualification,
-CI, packaging, publication, and release review are pending. `p11scope run` never
+object, offset, and canonical function name. `p11scope run` never
 implicitly releases a root child: a non-root observer keeps its UID/GID while
 losing capabilities, and a sudo-root observer requires valid non-root
 `SUDO_UID`/`SUDO_GID` values naming one existing non-root account and drops to
@@ -284,11 +357,10 @@ For now, the sudo path clears supplementary groups, so workloads needing an
 HSM/device group should use an already-running target until explicit run-as
 group selection is implemented.
 
-Fresh final-candidate unprivileged self-tests, local packaging subsets, and
-the Jammy/Noble owned-run campaign are recorded in the productization evidence
-index. Container and Kubernetes results predate the final candidate and remain
-historical support evidence, not an exact-tip rerun. No remote exact-tip CI or
-complete release-build result is claimed.
+The runtime qualification that applies to v0.1.0 (kernels, lanes, and the
+hosted CI run on the release commit) is recorded in
+[CHANGELOG.md](CHANGELOG.md#qualification-of-this-release); earlier campaign
+results in `docs/` are historical evidence.
 
 When used, the helper recreates the table in its own process; it never reads or
 injects into the observed process. Uprobes are bound to the verified target

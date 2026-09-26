@@ -1,299 +1,212 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Changelog
 
-## Unreleased — productization slice 1b MVP
+All notable changes to p11scope are recorded here. Versions follow
+[Semantic Versioning](https://semver.org/). Report schema identifiers are
+versioned separately and are opaque, exact dispatch keys.
 
-Corrective Tasks 1–5 and the owner-selected semantic-authority implementation
-are complete. Public `run`, owned-child live discovery, and capture-history
-correction are integrated. The frozen candidate passed all six
-semantic/privacy/cleanup rows on Ubuntu 22.04 kernel 5.15 and Ubuntu 24.04
-kernel 6.8, and the combined `main` tree passes all four locked workspace
-gates. Exact-tip CI, packaging, final security review, and release remain
-pending.
+## [0.1.0] - UNRELEASED
 
-- **Uretprobe/seccomp safety**: attaching a uretprobe makes the *target* issue
-  `__NR_uretprobe` on Linux 6.11+, so a seccomp-confined target could be killed
-  by being observed. Measured: Ubuntu `6.11.0-17` is affected and `6.11.0-29` is
-  not, so the affected set is not a version range and nothing consults `uname`.
-  p11scope now probes the kernel with a forked child of its own, refuses to
-  attach to a confined target on an affected kernel (override:
-  `--allow-uretprobe-on-confined-target`), reports a signalled death as one
-  instead of as an exit code, and adds a `uretprobe vs seccomp` row to `doctor`.
-  Unconfined targets are unaffected and pay nothing.
+<!-- TODO(release): the owner replaces UNRELEASED with the tag date (YYYY-MM-DD). -->
 
-- **Discovery**: `profile` and `trace` scan the target's mapped memory once at
-  attach, so neither a manifest nor the offline helper is required. Repeatable
-  `--module` hints and `--manifest` inputs are optional; manifests are
-  corroborated against the scan when possible. `--manifest` is explicit operator
-  attestation of exact accepted function-name/offset claims. Scan-only discovery
-  is semantics-unverified and count-only; aggregate counts/RVs/latency remain
-  available, but live and terminal evidence are PARTIAL while those claims remain.
-  P11Lab joins reject scan-only and conflict modules.
-- **Diagnostics**: `inspect --pid` reports mapped providers, table surfaces,
-  interface discovery and pinned file identities without loading BPF;
-  `doctor` probes host/target scan, BPF and uprobe availability before capture.
-  It rejects unsupported `doctor --module` input instead of ignoring it; use
-  `inspect --pid ... --module ...` for module-specific discovery.
-- **Multiple modules**: one capture plan can attach several providers, with
-  module-scoped session/operation/async state and explicit count-only evidence
-  when two modules publish the same target.
-- **Evidence**: profile and metrics schemas are now
-  `p11scope/observed-profile/v3` and `v3-metrics`, with
-  `capture.modules[]`, per-function module identity, `evidence.discovery[]`,
-  `authority: "hash-pinned"`, and explicit scan/corroboration/capacity gaps.
-  Top-level skip records retain exact standard function names but bound all
-  other names and reasons to finite categories, so cgroup scans do not publish
-  bystander paths, numeric PID labels, `/proc/<pid>` paths, or raw error chains.
-- **Owned command**: `p11scope run -- ...` starts capture before releasing the
-  child and tracks later provider loads with the loader/export path. Existing
-  external processes still use the initial memory scan or a suitable
-  pre-existing, hash-matched manifest.
-- **System scope**: `profile` and `trace` accept `--system` for whole-machine
-  capture — no `--pid` or `--cgroup` needed. The BPF scope gate passes all
-  tasks, discovery sweeps `/proc` under the same scan cap, per-process and
-  per-module attribution is still recorded, fork children are admitted
-  without a destination check, and `capture.scope` in the JSON report reads
-  `"system"`.
-- **Corrective work bounds**: one 512 MiB attempted-I/O budget covers all
-  memory scans and scan-sourced hashes in a capture (64 MiB per operation),
-  with ceilings of 512 accepted tables, 53,248 decoded entries, 512 interfaces,
-  256 cgroup members, and 512 attach slots. Any omission forces `PARTIAL`.
-- **Process and file identity**: selected process generations survive through
-  attach; stale cgroup views are subtracted before a bounded rebuild from
-  retained inputs. Ordinary incomparable file identities fail closed; only the
-  existing overlay-specific collapse remains, with explicit `PARTIAL`
-  uncertainty.
-- **Discovery hygiene**: interface names are confined to one readable VMA and
-  escaped in text `inspect`. Stale optional-manifest objects fall back per
-  object only after exact scan coverage survives final planning; malformed,
-  incomparable, permission/I/O, invalid-offset, and stale-sole-source cases are
-  fatal.
-- **Output safety**: `-o` rejects symlinked, writable, or unrelated-owner
-  ancestors, normalizes both output sinks, and falls back safely when
-  `openat2` is blocked by seccomp.
-- **Privacy-first 1.0**: the default boundary is bounded function,
-  registered-mechanism, return-code, latency, and lifecycle evidence. There is
-  no object-handle correlation or promised symbolic `CKA_CLASS`/
-  `CKA_KEY_TYPE` output.
-- **Discovery helper hygiene**: inherited descriptors and loader-sensitive
-  environment, including `LD_LIBRARY_PATH`, are stripped before provider loading.
+First release. p11scope is a passive, non-interposing PKCS#11 observer for
+Linux: it attaches eBPF uprobes to a running application's PKCS#11 provider at
+offsets discovered from the provider's own function table, and reports which
+functions, return values and latencies it observed — without replacing the
+module, changing the application's configuration, or calling into the
+provider during capture.
 
-## Unreleased — productization slice 1a
+### Commands
 
-Trust simplification. The lease/provenance/hardened-oracle authorization lane
-described in the corrective-release section below is removed: the observer no
-longer forks a lease supervisor, leases candidate objects, runs a sibling
-discovery oracle at attach time, or exits 78 on a lease break. Reasoning:
-`docs/notes/2026-08-15-architecture-and-gap-analysis.md` (A5, A7) and
-`docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust-design.md`
-(§4.11, §10.6); restorable from history at `263935a`.
+- `p11scope doctor` — read-only preflight. Loads the real embedded BPF object,
+  performs a self-uprobe, and reports one finite availability tier (T0–T4)
+  for the host and an optional `--pid`/`--cgroup` target.
+- `p11scope inspect --pid PID` — read-only discovery report: mapped providers,
+  function-table surfaces, interface discovery and pinned file identities
+  (`--json` for machine output). It loads no BPF and makes no PKCS#11 calls.
+- `p11scope profile` — aggregate function, return-value and latency counts for
+  a `--pid`, a `--cgroup` (and every descendant cgroup), or the whole machine
+  (`--system`). `--mode metrics` reads the aggregate maps only and reads no
+  call arguments in the kernel.
+- `p11scope trace` — one line per completed call for a bounded window, ending
+  in a machine-readable evidence record.
+- `p11scope run [--pause never|auto|always] [--trace] -- CMD` — starts an owned
+  command and starts capture before releasing it, so providers the command
+  loads later are hooked through the loader/export path.
+- `p11scope-discover --module /abs/path/provider.so [-o manifest.json]` — the
+  optional offline helper. It executes provider code in its own unprivileged
+  process and writes a `p11scope-manifest/5` manifest. The observer never runs
+  it; passing its output with `--manifest` is an explicit operator attestation
+  of function names and offsets.
+- `--version` on both binaries prints the release version.
 
-- **CLI**: single parser for `profile`/`trace` with `--duration` suffixes
-  (`30`, `30s`, `5m`, `1h`). `--provenance-module`, `--trusted-workload`, and
-  the `p11scope discover` subcommand are removed; each now errors with a hint
-  pointing at `docs/usage.md`. Discovery is only the separate offline helper,
-  `p11scope-discover --module <provider.so> [-o <manifest.json>]` — it
-  executes provider code, is opt-in, and is never run by the observer.
-- **Provider identity**: manifest objects are structurally validated, opened
-  once, and identity-matched (SHA-256, and build-id when present) against the
-  pinned file descriptor. `fstat` (inode, size, ctime) is re-checked
-  before/after attach — attach is refused on a mismatch — and again during
-  capture; an in-place change sets `evidence.provider_changed`, which forces
-  `PARTIAL` and shows " · provider changed" on the live line.
-- Ctrl-C **or SIGTERM** now ends a capture cleanly (final frame printed, `-o`
-  written), not just Ctrl-C.
-- `profile -o` is published atomically (private temp beside the target,
-  fsync, rename); `trace -o` opens a private 0600 regular file with
-  `O_NOFOLLOW`.
-- **CI**: a GitHub Actions skeleton (`.github/workflows/ci.yml`) runs the
-  unprivileged checks and a sudo e2e gate; first run pending.
-- **Scripts**: the release gates (`scripts/gates.sh`, `scripts/lib.sh` —
-  renamed from `trusted-p11scope.sh`) run binaries directly under `sudo`,
-  dropping the trusted staging directory, `fs.suid_dumpable` sysctl step, and
-  provenance/lease steps the removed lane required. `scripts/attach-pod.sh`
-  and `scripts/container-authority.py` are deleted; a pod-attach wrapper
-  returns in Slice 1b.
+### Discovery
 
-## Unreleased corrective release
+- Manifest-free memory-scan discovery of providers already mapped by the
+  target, including stripped providers with no `C_*` symbols. Cumulative
+  function-table support: PKCS#11 2.00, 2.01–2.40, 3.0, 3.1 and all 104 slots
+  of the final 3.2 interface. Alternate, null or unreadable interface names
+  are walked only as independently corroborated known prefixes.
+- Discovery continues while a capture runs: loader hooks on the five built-in
+  entry points (`C_GetFunctionList`, `C_GetInterfaceList`, `C_GetInterface`,
+  `NSC_GetFunctionList`, `FC_GetFunctionList`, plus `--hook-symbol`) pick up
+  providers loaded after attach.
+- Every accepted provider file is opened once, pinned by descriptor and
+  SHA-256, and re-checked with `fstat` before, during and after capture; a
+  change sets `evidence.provider_changed` and forces `PARTIAL`.
+- Static probes use one multi-uprobe link per attach group on kernels 6.9+ and
+  per-offset links below (`--attach-backend auto|multi|singles`).
 
-The gates reopened by the 2026-08-13 deep review — safe metadata,
-lazy-dependency provenance, `$ORIGIN`, and lease-break teardown — are
-implemented, and the privileged host and container lanes have been rerun
-against them. Not yet done: the final consolidated security re-review, and any
-packaging, tag, or publication. This is reviewed engineering work awaiting its
-release gate.
+### Reports and evidence
 
-**Safe by default**
+- `profile` writes `p11scope/observed-profile/v3` and `profile --mode metrics`
+  writes `p11scope/observed-profile/v3-metrics`
+  ([docs/schema/observed-profile-v3.md](docs/schema/observed-profile-v3.md),
+  with a JSON Schema beside it). Optional discovery input is
+  `p11scope-manifest/5`.
+- Function-level call, error, return-value and latency counts come from the
+  kernel aggregate maps (`STATS`, `RV_COUNTS`), which are the count authority:
+  per-call event loss is counted and disclosed but never changes them.
+- Every report carries finite gap counters and a verdict. A written report's
+  terminal verdict is always `PARTIAL`: detaching a perf link does not wait
+  for BPF callbacks already running on another CPU, so no terminal snapshot
+  can prove a final drain.
+  <!-- TODO(release): name the final verdict_detail values once the verdict split lands. -->
+- Manifest-free (scan-only) function slots are semantics-unverified and
+  count-only; mechanism, session and lifecycle semantics need an accepted
+  `--manifest`.
 
-- Capture policy is fixed in the eBPF object before attachment and its policy
-  maps are frozen, so the emitted `capture.privacy_mode` describes kernel
-  behavior, not userspace intent. `profile`/`trace` default to `allowlisted`;
-  `metrics` is always `aggregate-only` and reads no call arguments at all.
-- Under `allowlisted`, pointer-derived bytes reach output only by exact
-  membership in a finite published set — the mechanism registry, or the 104
-  published function names. Aliasing a metadata pointer into unrelated
-  readable memory yields no decoded value rather than an arbitrary read.
-- The previous unvalidated fixed-offset decoders survive only behind the
+### Privacy boundary
+
+- The default capture policy is `allowlisted`: pointer-derived bytes reach
+  output only by exact membership in a finite published set (a registered
+  mechanism id or one of the 104 published function names). There is no
+  decoder for PINs, key material, `CKA_VALUE`, labels, `CKA_ID`, plaintext,
+  ciphertext, signatures, wrapped blobs, random output, raw mechanism bytes,
+  raw session handles or ordinary buffers. Under this policy every mechanism
+  has `params: null` and `templates.operations` is empty.
+- The older unvalidated decoders exist only in a build with the
   off-by-default `unsafe-unvalidated-metadata` Cargo feature *and* an explicit
-  `--unsafe-unvalidated-metadata` flag. The flag cannot reach code absent from
-  the object, `metrics` refuses it, and the official artifact is built
-  `--no-default-features` with packaging that fails if the unsafe path is
-  reachable.
+  `--unsafe-unvalidated-metadata` flag. The release artifact is built with
+  `--no-default-features` and cannot enable them.
+- The field-by-field inventory is
+  [docs/privacy/allowlist-v1.md](docs/privacy/allowlist-v1.md) plus the
+  [allowlist-v2.md](docs/privacy/allowlist-v2.md) extension. The secret-canary
+  suite (`scripts/verify-canaries.sh`) plants sentinel PINs, keys, labels and
+  buffers and scans every output and observer-owned BPF map for them.
 
-**Provenance and continuity**
+### Safety
 
-- Discovery emits `p11scope-manifest/5`: bounded process-memory pointer
-  snapshots, reporting build IDs, mandatory whole-file SHA-256 identities, and
-  the exact-inode provenance closure recorded separately from attach objects.
-- Stored manifests never authorize probes by themselves. Every attach requires
-  bounded fresh unprivileged discovery through a pinned root-owned sibling
-  helper, an operator-selected `--provenance-module`, and exact
-  function-name/object/offset agreement. There is no raw-manifest bypass.
-- Authorization accepts only a pass in which every file-backed executable
-  mapping was read-leased beforehand; the provider loads by absolute path so
-  `$ORIGIN` and lazy dependencies resolve as the target sees them. Content
-  identity alone is treated as insufficient — a path can be retargeted to a
-  byte-identical unleased inode — so comparison is by exact inode with a
-  bounded churn retry.
-- Before any BPF load the CLI becomes a lease supervisor and forks the worker.
-  A lease break kills the worker through its pidfd, releases leases, and exits
-  78. Profile output publishes atomically only on normal completion; an
-  aborted trace still receives a terminal `PARTIAL` `EVIDENCE` record naming
-  the break reason, so truncation cannot read as completeness.
+- On kernels where a uretprobe makes the target issue `__NR_uretprobe`, a
+  seccomp-confined target could be killed by being observed. p11scope probes
+  the kernel with its own child and refuses to attach to a confined target on
+  an affected kernel unless `--allow-uretprobe-on-confined-target` is given;
+  `doctor` reports the row.
+- `run` never releases a root child: under `sudo` it drops the child to the
+  invoking `SUDO_UID`/`SUDO_GID` account with no capabilities, `no_new_privs`,
+  a small environment allowlist and no unrelated inherited descriptors.
 
-**Evidence**
+### Fixed limits of the release build
 
-- A written profile is now always `PARTIAL`: a detached perf link does not
-  wait for BPF callbacks already running on another CPU, so no terminal
-  snapshot can prove a final drain. A clean run is `PARTIAL` with every
-  concrete gap counter zero, asserted by
-  `scripts/check-capture-evidence.py: terminal_capture_is_clean`.
-- Independent START, RV, cgroup, semantic, process, fork, cancellation, and
-  async loss evidence still prevents a degraded capture from overclaiming.
-- Cumulative function-table support covers 2.00, 2.01–2.40, 3.0, 3.1, and all
-  104 published 3.2 slots. Alternate/null interface names are walked only as
-  structurally corroborated prefixes; vendor lookalikes stay undecoded.
-- Schemas: profile `v1.4`, metrics `v1.1-metrics`. Profile `v1.3` and
-  `v1-metrics` were internal waypoints that no consumer received, so the
-  published migrations are v1.2→v1.4 and v0-metrics→v1.1-metrics.
+- 512 physical probe-target (attach) slots per capture. Slots are lifetime
+  allocations: a slot retired by an exiting provider is not reused
+  (`slots` vs `active_slots`).
+- 256 loader contexts per capture for late-load (`dlopen`) tracking.
+- One capture-wide 512 MiB attempted-I/O budget for memory scans and
+  scan-sourced file hashes, at most 256 MiB per scan/hash operation; 512
+  accepted table candidates, 53,248 decoded table entries and 512 interface
+  records. `--cgroup` and `--system` deep-scan at most 256 processes per pass
+  by default (`--max-scan-pids`). Manifest inputs are capped at 16 MiB per
+  manifest, 256 MiB per object and 512 MiB per manifest.
+- The per-call event ring defaults to 4 MiB (`--ring-bytes`, 4K–64M); the
+  live-discovery ring is a fixed 64 KiB. `trace` stops at 10,000,000 events
+  unless `--max-events` sets another cap.
+- Any bounded omission is reported and forces `PARTIAL`. The
+  `wide-detailed-2112` Cargo feature builds a 2,112-slot profile from source;
+  it is not the release artifact's profile.
+  <!-- TODO(release): confirm the release profile (owner decision D3). -->
 
-**Operations**
+### Platform and privileges
 
-- `scripts/attach-pod.sh` wraps the previously manual existing-pod workflow:
-  resolve namespace/pod/container to a host cgroup and PID, safe-copy and
-  discover the provider, rewrite attach paths, and run the trusted cgroup
-  capture. It requires an explicit `--trusted-workload` acknowledgement.
-- Container provider copies are byte-capped, so a compromised image cannot
-  fill the host filesystem through the copy step.
-- The release gates exercise live verifier loading, observer-owned map-id
-  canaries, START/RV/ring saturation, and dynamic glibc/musl 68/92/104 walks.
-
-## v0.1.0
-
-First release. A non-interposing PKCS#11 observer: attach to a running
-process or cgroup, watch its real PKCS#11 calls, get back a versioned
-report — no source changes, no config changes, no replacing the provider
-module.
-
-### Discovery and attach
-
-- `p11scope-discover` loads a provider and reads its live function table,
-  resolving pointers to mapped ELF objects — including stripped providers
-  with no `C_*` symbols
-  — and writes a manifest of file offsets `p11scope` attaches to. Handles
-  both the legacy `C_GetFunctionList` table and PKCS#11 3.x
-  `C_GetInterfaceList`.
-- `p11scope` attaches eBPF uprobes at those offsets before the workload
-  runs, scoped to a `--pid` or a `--cgroup` (and every descendant cgroup
-  beneath it — a container or pod directory works even though its
-  processes live in a nested child cgroup).
-- Attaching to a shared image layer's `.so` observes every container on
-  that node using that layer, including containers started after attach
-  (proven against Docker, kind, and Knative scale-from-zero).
-
-### Capture modes
-
-- `profile` (default): aggregate function/mechanism/error/latency counts,
-  session lifecycle, login activity, template attribute usage, per-cgroup
-  breakdown, and a live-refreshing terminal summary while the capture
-  runs. `--mode metrics` is a lighter maps-only variant with no event
-  stream.
-- `trace`: one line per completed call, in arrival order, for a bounded
-  investigation window — timestamp, pid/tid, session pseudonym, function,
-  mechanism and safe parameters, return code, duration. Reports
-  `LOST n events` on its own line whenever the ring buffer dropped
-  anything; a trace never silently pretends completeness.
-- Ctrl-C (SIGINT) ends either capture cleanly: polling stops, the final
-  frame prints, and (with `-o`) the report is written — the same clean
-  exit as `--duration` elapsing.
-
-### Privacy
-
-- A written, field-by-field allowlist (`docs/privacy/allowlist-v1.md`):
-  every captured field justified, every tempting-but-rejected field
-  (PINs, PIN length, key material, plaintext, ciphertext, labels,
-  `CKA_ID`, GCM IV/AAD contents, raw session handles, sign/digest/encrypt
-  input lengths) refused in code, not just in prose.
-- A secret-canary test suite (`scripts/verify-canaries.sh`) plants
-  sentinel PINs, key material, labels, and buffer contents in a real
-  workload and scans every output artifact and BPF map dump for leaks.
-- No PINs, key material, plaintext, ciphertext, signatures, wrapped
-  blobs, raw mechanism byte arrays, or raw handles, in any mode, at any
-  privilege level.
-
-### Evidence and honesty
-
-- Every `observed-profile.json` (schema `p11scope/observed-profile/v1.2`,
-  `docs/schema/observed-profile-v1.md`) carries an evidence section
-  ending in a `COMPLETE`/`PARTIAL` verdict — attach failures, aliased
-  functions, ring-buffer event loss, malformed records, truncated
-  templates, and undecoded parameters all force `PARTIAL` rather than a
-  silently confident report. Aggregate function counts are the count
-  authority and stay exact even when the event stream loses data.
-- Actionable error messages for unsupported environments: missing
-  capabilities, kernel lockdown, and restrictive `perf_event_paranoid`
-  all produce a named cause and a hint, never a raw verifier dump or a
-  silent zero-count capture (`docs/notes/phase5-unsupported.md`).
-
-### Measured, not asserted
-
-- Privileges required per environment: host needs `CAP_SYS_ADMIN` alone;
-  Docker/kind need `CAP_SYS_PTRACE` + `CAP_SYS_ADMIN`. Neither needs full
-  root (`docs/notes/phase4-privileges.md`).
-- Overhead against unobserved SoftHSM2 (deliberately the worst case:
-  microsecond-scale software crypto, so probe overhead is proportionally
-  largest here): roughly a 5x wall-clock slowdown, ~3.25-3.4µs added to
-  every ~0.8µs call. The same absolute overhead against a millisecond-scale
-  network HSM would be comparatively negligible
-  (`docs/notes/phase5-overhead.md`, `scripts/bench-overhead.sh`).
-- Correctness validated end to end against a deterministic oracle on the
-  host, in Docker (single container and a shared image layer), on a
-  Kubernetes pod (kind), through a Knative scale-from-zero cold start, on
-  a prefork server with cgroup-scoped attach preceding every forked
-  child, and against an independent PKCS#11 test client's own call trace
-  (`docs/notes/phase4-matrix.md`).
+- x86-64 Linux, kernel 5.15 or newer. p11scope does not check the kernel
+  version itself; an unsupported kernel fails with a named cause and a hint.
+  <!-- TODO(release): list the kernels actually qualified on the tag commit (owner decision D4). -->
+- Capture needs root (`sudo`) or file capabilities on the observer binary.
+  On the measured hosts, uprobe attach required `CAP_SYS_ADMIN`
+  (`CAP_BPF` + `CAP_PERFMON` did not suffice under a restrictive
+  `perf_event_paranoid`), and scanning a same-UID non-descendant also needed
+  `CAP_SYS_PTRACE`. See
+  [docs/usage.md](docs/usage.md#privileges-per-environment).
 
 ### Release artifacts
 
-- `p11scope`: fully static musl build (the observer never dlopens a
-  provider, so a static build is safe and gives one dependency-free
-  binary).
-- `p11scope-discover`: dynamic glibc and dynamic musl builds (a static
-  helper cannot dlopen a provider `.so`).
-- Built and verified by `scripts/build-release.sh`.
+- `p11scope` — statically linked musl binary with the BPF object embedded; one
+  file, no runtime dependencies.
+- `p11scope-discover` — dynamically linked glibc and musl builds; use the one
+  that matches the provider's C library (a static helper cannot `dlopen` a
+  provider).
+- `scripts/build-release.sh` builds and verifies both. Release builds remap
+  build-host paths, so the binaries do not embed the builder's home or
+  checkout directory.
 
 ### Known limitations
 
-- No SIGINT-triggered mid-run auto-discovery; a manifest is generated
-  once and reused, matched by ELF build-ID.
-- Per-container attribution over a shared cgroup attach is exposed as
-  `cgroups[]` in the profile output, keyed by cgroup id; there is no
-  narrower Kubernetes cgroup than the node's kubepods root that is stable
-  *before* a not-yet-created pod exists (Knative scale-from-zero row,
-  `docs/notes/phase4-matrix.md`).
-- x86-64 only in this release; AArch64 is the first item planned after
-  v1 (`docs/superpowers/plans/ROADMAP.md`).
-- The RSA-PSS parameter decode path has no adversarial canary for a
-  malformed `ulParameterLen` (the GCM equivalent does); the failure mode
-  is a bounded out-of-bounds scalar read, not a secret leak
-  (`docs/privacy/allowlist-v1.md`, "Summary of weak points").
+1. **Capacity.** The 512 slots are shared by every provider in the capture
+   and admission is first come, first served. A refused provider, or a
+   refused growth of an admitted one, is reported and forces `PARTIAL`.
+2. **`--system` is a preview.** Whole-machine capture shares the 512 slots
+   with every ambient provider on the host (NSS, `p11-kit-trust`, p11-kit
+   proxies, …), takes seconds to start, and on busy hosts loses live-discovery
+   records (reported as loss). Aim it with `--system --module <path>`.
+   <!-- TODO(release): restate after the admission fix and its measurement (owner decision D2). -->
+3. **Coverage window.** Calls made before attach are not observed, and the
+   first calls after a late `dlopen` can be missed before that provider's
+   probes land — also under `run`, including with `--pause auto`. Manifest-free
+   captures are count-only by design.
+   <!-- TODO(release): restate with the measured `run` numbers after the `run` fixes land. -->
+4. **Exec.** A `--pid` target that calls `exec` is not re-bound to the new
+   image.
+5. **Not observed.** Statically linked providers, JIT-generated or anonymous
+   function tables, vendor-only interfaces (count-only or unknown), and calls
+   through unsupported surfaces.
+6. **Trace output** has no provider column; PIDs are host-namespace PIDs.
+7. **Containers and Kubernetes.** Shared-layer, Docker, kind and Knative
+   results were validated on earlier candidates and were not re-run on this
+   release; `deploy/k8s` is an experimental example, not a published image.
+   <!-- TODO(release): replace with the container-lane result if it is re-run (owner decision D5). -->
+8. **`run` under `sudo`** clears supplementary groups, so a workload that
+   needs an HSM/device group should be observed with `profile`/`trace` or run
+   with a capability-carrying observer instead.
+9. **Overhead** was measured as roughly a 5x wall-clock slowdown against
+   SoftHSM2 at 1M calls/s (about 3.3 µs added per call) — a worst case, not
+   an envelope. At that rate most per-call events are lost; aggregate counts
+   stay exact.
+   <!-- TODO(release): replace with the re-bench on the release bytes. -->
+10. **Not claimed.** Continuous system inventory, caller attribution,
+    capacity growth, cumulative counters across all providers by default,
+    operation-level semantics beyond attested manifests, a first-use
+    guarantee, supported event rates, long-duration/soak behaviour, and
+    AArch64.
+
+### Fixed during release-readiness work (2026-09-26)
+
+<!-- TODO(release): the release coordinator fills this list from the 2026-09-26
+     release-readiness commits: one line per user-visible fix, newest last. -->
+
+- TODO(release): …
+
+### Qualification of this release
+
+<!-- TODO(release): fill in from the tag commit before tagging. -->
+
+- Hosted CI run: TODO(release)
+- Kernels and lanes run on the release bytes: TODO(release)
+- `scripts/build-release.sh` receipt and `SHA256SUMS`: TODO(release)
+
+### Pre-release development history
+
+Before this entry, this file described internal milestones (an early
+schema-v1.2 MVP, a corrective lease/provenance lane that was later removed,
+and the productization slices that led to schema v3). None of them was
+released, and several of their statements no longer describe the product.
+They are superseded by this entry and remain in the Git history of this file.

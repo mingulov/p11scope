@@ -6,14 +6,15 @@ how to run it, and what its output actually proves. Measured examples below
 name the script that produced them so they can be reproduced; fixed
 implementation limits are code contracts, not measurements.
 
-> **Status: unreleased; the current candidate is undergoing release qualification.**
-> Memory-scan discovery, `C_GetInterface`, `inspect`, `doctor`, public `run`,
-> multi-module capture, schema v3, and owned-child live discovery are
-> implemented. The frozen pre-W3 candidate at `ae8494d` passed all six
-> semantic/privacy/cleanup rows on Ubuntu 22.04 kernel 5.15 and Ubuntu 24.04
-> kernel 6.8. Those historical results do not qualify the current candidate. Fresh
-> exact-tip runtime qualification, CI, complete packaging, publication, and
-> release remain pending.
+> **Status: v0.1.0.** This guide describes the v0.1.0 release: `doctor`,
+> `inspect`, `profile` (including `--mode metrics`), `trace`, and `run`, with
+> memory-scan discovery, `C_GetInterface`, multi-module capture, owned-child
+> live discovery, and schema v3. Its
+> [known limitations](../CHANGELOG.md#known-limitations) apply throughout;
+> `--system` is a preview. What was qualified on the release commit is
+> recorded in
+> [CHANGELOG.md](../CHANGELOG.md#qualification-of-this-release). To build and
+> install the binaries, see [Install](../README.md#install).
 > See the
 > [safe metadata design](superpowers/specs/2026-08-13-safe-and-unvalidated-metadata-design.md)
 > and the
@@ -69,8 +70,9 @@ flag, and the observer prints a warning naming the exposure when it is active.
 The official release artifact is built `--no-default-features`, and packaging
 fails if the unsafe path is reachable. See
 [docs/superpowers/specs/2026-08-10-p11scope-outputs.md](superpowers/specs/2026-08-10-p11scope-outputs.md#what-you-will-not-see-by-design-in-every-mode)
-for the design commitment and
-[docs/privacy/allowlist-v2.md](privacy/allowlist-v2.md) for the field-by-field
+for the design commitment, and
+[docs/privacy/allowlist-v1.md](privacy/allowlist-v1.md) with its
+[v2 extension](privacy/allowlist-v2.md) for the field-by-field
 enforcement (what is captured, why, and how each read is gated — structural
 where a leak is impossible by construction, runtime-gated where a length/
 null check stands in front of the read, each gate named with the test that
@@ -223,9 +225,9 @@ tuning beyond these two points is unmeasured, not tuned-down.
 This is an explicit trust decision about the provider's function names and
 offsets. Use a helper that can load the exact provider: a 32-bit provider
 requires a 32-bit helper, and its loader/libc must be compatible. The observer
-remains x86-64. Final release artifact/helper combinations are still undergoing
-qualification; a source-build result alone is not a packaged compatibility
-guarantee.
+remains x86-64. The release builds the helper for glibc and for musl; use the
+build that matches the provider's C library
+([Install](../README.md#install)).
 
 ```bash
 # Run as an ordinary user. This helper loads and executes provider code.
@@ -259,9 +261,7 @@ compatibility for unobserved calls or undecoded parameters.
 
 The memory scan builds the initial attach plan. For an owned command,
 `p11scope run` starts capture before releasing the child and can acquire a
-provider loaded later. The frozen pre-W3 candidate at `ae8494d` passed the
-local six-row campaign on kernels 5.15 and 6.8; that campaign has not been
-repeated on the current candidate. For an already running external process, a provider
+provider loaded later. For an already running external process, a provider
 loaded before attachment can still be
 missed. If a suitable manifest was prepared while the same provider identity
 was available, pass it
@@ -335,9 +335,10 @@ directory reaches the workload's actual nested cgroup. `--system` requests
 whole-machine capture with no cgroup path: the BPF scope gate admits
 all tasks subject to the owner-health and config checks, and userspace
 discovery sweeps `/proc` under the same `--max-scan-pids` cap (default 256,
-rarest providers first). Scope admission does not promise that every process
-or call is captured, and live exact-tip qualification for the system lane is
-still pending: earlier receipts from other scopes do not qualify it.
+rarest providers first). `--system` is a preview in v0.1.0 (see the
+[known limitations](../CHANGELOG.md#known-limitations)): scope admission does
+not promise that every process or call is captured, and the whole-machine
+scope shares the 512 attach slots with every ambient provider.
 Per-process and per-module attribution is still recorded —
 each retained generation keeps its own view and pins — and `capture.scope`
 in the JSON report reads `"system"`. Fork children are admitted without a
@@ -408,7 +409,7 @@ When the bounded unmatched-exit ledger is full, a novel unmatched exit latches
 one lower-bound overflow increment. If admission already counted the gap,
 coalescing overflow marks `PARTIAL` without another increment. Replayed or
 further unremembered exits do not increment again.
-Arbitrary enter-then-migrate-out before refresh or exit remains outside W3's
+Arbitrary enter-then-migrate-out before refresh or exit remains outside the
 `COMPLETE` and runtime-qualified claims; no migration subsystem is provided.
 PID scope remains exact and does not attach process-creation tracking.
 
@@ -527,6 +528,8 @@ kind of workload without a manifest and ends `68`/`0` instead.
   not just on stderr.
 - `--version` — print the observer version (`p11scope <semver>`) and exit 0.
   Takes no scope or subcommand; anything after it is a usage error.
+  `p11scope-discover --version` prints the helper's version
+  (`p11scope-discover <semver>`, the same release version) the same way.
 - `--attach-backend auto|multi|singles` — the static probe backend. `auto`
   (default) uses one multi-uprobe link per attach group on kernels 6.9+ and
   per-offset links below; `multi` forces multi (needs 6.6+); `singles` forces
@@ -856,11 +859,7 @@ evidence are PARTIAL while scan-only semantic claims remain. P11Lab joins reject
 scan-only and conflict modules. An accepted manifest authorizes only the exact
 pinned object, offset, and canonical function name it attests; stale fallback,
 hash agreement, path identity, and raw `{dev,ino}` never transfer that
-attestation. The owned-child `run` path and capture-history corrections in the
-frozen pre-W3 candidate at `ae8494d` passed the local 5.15/6.8 semantic
-campaign. Those results have not been repeated on the current candidate. Exact-tip
-runtime qualification, CI, complete packaging, publication, and release
-remain pending.
+attestation.
 
 **`PARTIAL`** is forced by any single gap in that list — an attach
 failure, ring-buffer loss, a template the in-kernel walk couldn't finish
@@ -916,9 +915,12 @@ What this tool proves, and what it deliberately does not claim to:
 
 ## Related docs
 
-- [`docs/privacy/allowlist-v2.md`](privacy/allowlist-v2.md) — the
+- [`docs/privacy/allowlist-v1.md`](privacy/allowlist-v1.md) — the
   field-by-field decoder inventory, policy boundary, and implemented
-  hostile-pointer canary coverage.
+  hostile-pointer canary coverage, extended by
+  [`docs/privacy/allowlist-v2.md`](privacy/allowlist-v2.md) (interface
+  selection, attach mechanism, descendant rebuild, task-uprobe loss, and ABI
+  refusal evidence).
 - [`docs/schema/observed-profile-v3.md`](schema/observed-profile-v3.md) —
   the versioned `observed-profile.json` schema (current:
   `p11scope/observed-profile/v3`), the integration boundary

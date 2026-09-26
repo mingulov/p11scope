@@ -991,6 +991,11 @@ pub struct Session {
     /// Wall time the producer detach took, in whole milliseconds; zero
     /// until `detach_producers` runs.
     detach_wall_ms: u64,
+    /// CLOCK_MONOTONIC reading when the session became fully attached
+    /// (T2, G-14): `None` until `note_attach_complete` runs at loop entry,
+    /// so a session that never reached its loop reports no attach time —
+    /// never 0, never an estimate.
+    attach_mono_ns: Option<u64>,
     successful_static: BTreeSet<StaticEndpoint>,
     dynamic_attach_evidence: DynamicAttachEvidence,
     policy: CapturePolicy,
@@ -2501,6 +2506,18 @@ impl Session {
         &self.stop_gate
     }
 
+    /// Stamps attach completion with one CLOCK_MONOTONIC read (T2, G-14).
+    /// Called once at loop entry, when the session is fully attached; later
+    /// discovery-driven attaches do not re-stamp it.
+    pub(crate) fn note_attach_complete(&mut self) {
+        self.attach_mono_ns = monotonic_ns();
+    }
+
+    /// The attach-completion stamp, if the session reached its loop.
+    pub(crate) fn attach_mono_ns(&self) -> Option<u64> {
+        self.attach_mono_ns
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn start(
         plan: &AttachPlan,
@@ -2806,6 +2823,7 @@ impl Session {
             detach_failures: vec![],
             producers_detached: false,
             detach_wall_ms: 0,
+            attach_mono_ns: None,
             successful_static: BTreeSet::new(),
             dynamic_attach_evidence: DynamicAttachEvidence::default(),
             policy,

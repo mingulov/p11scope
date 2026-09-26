@@ -1461,6 +1461,17 @@ impl CaptureEnd {
     fn allows_handoff(self, kill_on_timeout: bool) -> bool {
         matches!(self, Self::DurationExpired) && !kill_on_timeout
     }
+
+    /// The closed `LOOP_END_*` label this ending publishes (T2, G-14).
+    fn reason_label(self) -> &'static str {
+        match self {
+            Self::DurationExpired => render::LOOP_END_EXPIRY,
+            Self::Signal => render::LOOP_END_OPERATOR_STOP,
+            Self::TargetExit => render::LOOP_END_TARGET_EXIT,
+            Self::LimitReached => render::LOOP_END_LIMIT_REACHED,
+            Self::Error => render::LOOP_END_ERROR,
+        }
+    }
 }
 
 /// All three operator stop signals end a capture the same clean way. SIGTERM
@@ -1832,6 +1843,10 @@ fn run_loop(
     uretprobe_override: Option<render::UretprobeOverride>,
 ) -> Result<render::Evidence> {
     report_attach_failures(session);
+    // Authoritative attach stamp (T2, G-14): the session is fully attached
+    // on every path that reaches a loop; later discovery-driven attaches
+    // do not re-stamp it.
+    session.note_attach_complete();
     let drain = resolve_drain_cadence(kind, drain_interval);
     let evidence = match kind {
         Kind::Profile => {
@@ -3786,11 +3801,15 @@ fn capture_profile(
     let mut stdout_open = true;
     let wall_start = SystemTime::now();
     let mut scheduling = SchedulingAccumulator::default();
+    scheduling.note_attach(session.attach_mono_ns());
     let mut last_sink_note = None;
     let mut last_frame = Instant::now() - drain;
     let mut frames = 0u64;
     let mut ticks = 0u64;
     let mut last_snapshot: Option<(Vec<metrics::SlotReport>, metrics::KernelEvidence)> = None;
+    // Authoritative loop-start stamp (T2, G-14): the last clock read before
+    // the first tick.
+    scheduling.note_loop_start(crate::attach::monotonic_ns());
     #[rustfmt::skip]
     let loop_result = (|| -> Result<CaptureEnd> {
     loop {
@@ -3960,13 +3979,28 @@ fn capture_profile(
     if matches!(loop_result, Ok(CaptureEnd::TargetExit)) {
         eprintln!("{}", target_exit_marker(ticks));
     }
+    // Authoritative loop-end stamp (T2, G-14): one clock read beside the
+    // loss sampling, with the loop's real ending (an Err result is an
+    // error ending — the loop still ended).
+    let loop_end_ns = crate::attach::monotonic_ns();
+    let loop_end_reason = match &loop_result {
+        Ok(end) => end.reason_label(),
+        Err(_) => render::LOOP_END_ERROR,
+    };
     if profile {
         scheduling.note_loop_end(
             metrics::lost_events(session).unwrap_or(0),
             engine.capture_facts().discovery_losses()[0],
+            loop_end_ns,
+            loop_end_reason,
         );
     } else {
-        scheduling.note_loop_end(0, engine.capture_facts().discovery_losses()[0]);
+        scheduling.note_loop_end(
+            0,
+            engine.capture_facts().discovery_losses()[0],
+            loop_end_ns,
+            loop_end_reason,
+        );
     }
     // Poll for quiescence (owner budget), servicing the drains between
     // polls without admitting producers. Discovery records stage here and
@@ -4359,6 +4393,7 @@ fn capture_trace(
     );
     let mut last_reported_loss: u64 = 0;
     let mut scheduling = SchedulingAccumulator::default();
+    scheduling.note_attach(session.attach_mono_ns());
     let mut last_sink_note = None;
     let mut last_frame = Instant::now() - drain;
     let mut frames = 0u64;
@@ -4378,6 +4413,9 @@ fn capture_trace(
         ));
     }
     let clock = Instant::now();
+    // Authoritative loop-start stamp (T2, G-14): the last clock read before
+    // the first tick.
+    scheduling.note_loop_start(crate::attach::monotonic_ns());
     #[rustfmt::skip]
     let loop_result = (|| -> Result<CaptureEnd> {
     loop {
@@ -4537,9 +4575,18 @@ fn capture_trace(
         eprintln!("{}", target_exit_marker(ticks));
     }
 
+    // Authoritative loop-end stamp (T2, G-14): one clock read beside the
+    // loss sampling, with the loop's real ending.
+    let loop_end_ns = crate::attach::monotonic_ns();
+    let loop_end_reason = match &loop_result {
+        Ok(end) => end.reason_label(),
+        Err(_) => render::LOOP_END_ERROR,
+    };
     scheduling.note_loop_end(
         metrics::lost_events(session).unwrap_or(0),
         engine.capture_facts().discovery_losses()[0],
+        loop_end_ns,
+        loop_end_reason,
     );
     // Poll for quiescence (owner budget), servicing the drains between
     // polls without admitting producers. Discovery records stage here and
@@ -5189,7 +5236,7 @@ pub(crate) enum SchedulingPhase {
 /// (quiesce + terminal-drain window; the `detach_*` names are kept for
 /// schema stability but the window ends before the post-publication
 /// detach); everything else accumulates per tick.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct SchedulingAccumulator {
     drain_repolls: u64,
     drain_budget_exhaustions: u64,
@@ -5211,6 +5258,41 @@ pub(crate) struct SchedulingAccumulator {
     sink_stall_ms: u64,
     sink_timeouts: u64,
     sink_dropped_bytes: u64,
+    attach_mono_ns: Option<u64>,
+    loop_start_mono_ns: Option<u64>,
+    loop_end_mono_ns: Option<u64>,
+    loop_end_reason: &'static str,
+}
+
+impl Default for SchedulingAccumulator {
+    fn default() -> Self {
+        Self {
+            drain_repolls: 0,
+            drain_budget_exhaustions: 0,
+            last_backlog: false,
+            last_drain_end: None,
+            loop_ended: false,
+            max_inter_drain_gap_ms: 0,
+            phase_discovery_ms: 0,
+            phase_discovery_terminal_ms: 0,
+            phase_drain_ms: 0,
+            phase_maps_ms: 0,
+            phase_render_ms: 0,
+            phase_detach_ms: 0,
+            capture_event_loss: 0,
+            detach_event_loss: 0,
+            capture_discovery_loss: 0,
+            detach_discovery_loss: 0,
+            terminal_drain_truncated: false,
+            sink_stall_ms: 0,
+            sink_timeouts: 0,
+            sink_dropped_bytes: 0,
+            attach_mono_ns: None,
+            loop_start_mono_ns: None,
+            loop_end_mono_ns: None,
+            loop_end_reason: crate::render::LOOP_END_UNSTARTED,
+        }
+    }
 }
 
 impl SchedulingAccumulator {
@@ -5259,9 +5341,28 @@ impl SchedulingAccumulator {
         *slot = slot.saturating_add(ms);
     }
 
-    pub(crate) fn note_loop_end(&mut self, event_loss: u64, discovery_loss: u64) {
+    /// Authoritative attach-completion stamp (T2, G-14): the session's
+    /// attach timestamp, read once the session is fully attached.
+    pub(crate) fn note_attach(&mut self, at_mono_ns: Option<u64>) {
+        self.attach_mono_ns = at_mono_ns;
+    }
+
+    /// Authoritative capture-loop-start stamp (T2, G-14).
+    pub(crate) fn note_loop_start(&mut self, at_mono_ns: Option<u64>) {
+        self.loop_start_mono_ns = at_mono_ns;
+    }
+
+    pub(crate) fn note_loop_end(
+        &mut self,
+        event_loss: u64,
+        discovery_loss: u64,
+        at_mono_ns: Option<u64>,
+        reason: &'static str,
+    ) {
         self.capture_event_loss = event_loss;
         self.capture_discovery_loss = discovery_loss;
+        self.loop_end_mono_ns = at_mono_ns;
+        self.loop_end_reason = reason;
         self.loop_ended = true;
     }
 
@@ -5299,6 +5400,12 @@ impl SchedulingAccumulator {
                 maps: self.phase_maps_ms,
                 render: self.phase_render_ms,
                 detach: self.phase_detach_ms,
+            },
+            phase_mono_ns: render::PhaseMonoNs {
+                attach_mono_ns: self.attach_mono_ns,
+                loop_start_mono_ns: self.loop_start_mono_ns,
+                loop_end_mono_ns: self.loop_end_mono_ns,
+                loop_end_reason: self.loop_end_reason,
             },
             max_inter_drain_gap_ms: self.max_inter_drain_gap_ms,
         }
@@ -5903,7 +6010,7 @@ mod tests {
             if detach_ms > 0 {
                 acc.add_phase(SchedulingPhase::Detach, Duration::from_millis(detach_ms));
             }
-            acc.note_loop_end(10, 4);
+            acc.note_loop_end(10, 4, None, crate::render::LOOP_END_UNSTARTED);
             acc.note_terminal(14, 7);
             let mut ev = crate::render::tests::evidence();
             ev.scheduling = acc.snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64);
@@ -9135,7 +9242,7 @@ mod tests {
         let before = Instant::now();
         acc.note_drain_at(before);
         acc.note_drain_at(before + Duration::from_millis(40));
-        acc.note_loop_end(10, 3);
+        acc.note_loop_end(10, 3, None, crate::render::LOOP_END_UNSTARTED);
         acc.note_terminal(14, 3);
 
         let ev = acc.snapshot(65536);
@@ -9167,7 +9274,7 @@ mod tests {
         let before = Instant::now();
         acc.note_drain_at(before);
         acc.note_drain_at(before + Duration::from_millis(40));
-        acc.note_loop_end(0, 0);
+        acc.note_loop_end(0, 0, None, crate::render::LOOP_END_UNSTARTED);
         acc.note_drain_at(before + Duration::from_secs(60));
 
         let ev = acc.snapshot(65536);
@@ -9222,6 +9329,69 @@ mod tests {
         assert!(ev.terminal_drain_truncated);
         assert_eq!(ev.terminal_drain_bound, 65_536);
         assert!(!acc.last_drain_had_backlog());
+    }
+
+    /// T2/G-14 (RED): authoritative phase stamps noted on the accumulator
+    /// reach the published snapshot exactly.
+    #[test]
+    fn accumulator_carries_authoritative_phase_timestamps_into_snapshot() {
+        let mut acc = SchedulingAccumulator::default();
+        acc.note_attach(Some(100));
+        acc.note_loop_start(Some(200));
+        acc.note_loop_end(10, 3, Some(300), crate::render::LOOP_END_EXPIRY);
+
+        let ev = acc.snapshot(65536);
+
+        assert_eq!(ev.phase_mono_ns.attach_mono_ns, Some(100));
+        assert_eq!(ev.phase_mono_ns.loop_start_mono_ns, Some(200));
+        assert_eq!(ev.phase_mono_ns.loop_end_mono_ns, Some(300));
+        assert_eq!(
+            ev.phase_mono_ns.loop_end_reason,
+            crate::render::LOOP_END_EXPIRY
+        );
+        // The loss path is unchanged by the new arguments.
+        assert_eq!(ev.capture_event_loss, 10);
+        assert_eq!(ev.capture_discovery_loss, 3);
+    }
+
+    /// T2/G-14: a fresh accumulator snapshots unreached phases as null with
+    /// the unstarted reason — never 0, never an estimate.
+    #[test]
+    fn fresh_accumulator_snapshot_marks_phases_unstarted() {
+        let ev = SchedulingAccumulator::default().snapshot(65536);
+
+        assert_eq!(ev.phase_mono_ns.attach_mono_ns, None);
+        assert_eq!(ev.phase_mono_ns.loop_start_mono_ns, None);
+        assert_eq!(ev.phase_mono_ns.loop_end_mono_ns, None);
+        assert_eq!(
+            ev.phase_mono_ns.loop_end_reason,
+            crate::render::LOOP_END_UNSTARTED
+        );
+    }
+
+    /// T2/G-14 (RED): every loop ending maps to its closed reason label.
+    #[test]
+    fn capture_end_maps_to_closed_loop_end_reason() {
+        assert_eq!(
+            CaptureEnd::DurationExpired.reason_label(),
+            crate::render::LOOP_END_EXPIRY
+        );
+        assert_eq!(
+            CaptureEnd::Signal.reason_label(),
+            crate::render::LOOP_END_OPERATOR_STOP
+        );
+        assert_eq!(
+            CaptureEnd::TargetExit.reason_label(),
+            crate::render::LOOP_END_TARGET_EXIT
+        );
+        assert_eq!(
+            CaptureEnd::LimitReached.reason_label(),
+            crate::render::LOOP_END_LIMIT_REACHED
+        );
+        assert_eq!(
+            CaptureEnd::Error.reason_label(),
+            crate::render::LOOP_END_ERROR
+        );
     }
 
     /// No sleeps while backlog exists; the pause slice still wins; an

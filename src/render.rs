@@ -681,6 +681,42 @@ pub struct SkippedOut {
 /// through the sink and what did not.
 pub const SINK_POLICY_BOUNDED_WAIT_DROP: &str = "bounded-wait-drop";
 
+/// Why the capture loop ended, as published in [`PhaseMonoNs`]. Closed
+/// set, pinned by the capture-evidence oracle.
+pub const LOOP_END_EXPIRY: &str = "expiry";
+pub const LOOP_END_OPERATOR_STOP: &str = "operator_stop";
+pub const LOOP_END_TARGET_EXIT: &str = "target_exit";
+pub const LOOP_END_LIMIT_REACHED: &str = "limit_reached";
+pub const LOOP_END_ERROR: &str = "error";
+/// The loop had not ended when snapshotted — mid-loop frames, or a capture
+/// that never reached its loop.
+pub const LOOP_END_UNSTARTED: &str = "unstarted";
+
+/// Authoritative observer phase timestamps (T2, G-14): CLOCK_MONOTONIC
+/// readings the observer takes itself at attach completion, capture-loop
+/// start, and capture-loop end. `None` (JSON null) when the phase was never
+/// reached — never 0, never an FD estimate. Measurement scripts prefer these
+/// over retrospective FD estimates whenever present.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct PhaseMonoNs {
+    pub attach_mono_ns: Option<u64>,
+    pub loop_start_mono_ns: Option<u64>,
+    pub loop_end_mono_ns: Option<u64>,
+    /// One of the `LOOP_END_*` labels.
+    pub loop_end_reason: &'static str,
+}
+
+impl Default for PhaseMonoNs {
+    fn default() -> Self {
+        Self {
+            attach_mono_ns: None,
+            loop_start_mono_ns: None,
+            loop_end_mono_ns: None,
+            loop_end_reason: LOOP_END_UNSTARTED,
+        }
+    }
+}
+
 /// In-observer per-phase wall time in milliseconds, cumulative over the
 /// capture. Discovery is measured directly here (Task 3.1 G-discovery-
 /// tick-slice), not as a residual of totals; `discovery` covers every
@@ -741,6 +777,8 @@ pub struct SchedulingEvidence {
     pub sink_dropped_bytes: u64,
     /// Cumulative per-phase wall time.
     pub phase_ms: SchedulingPhaseMs,
+    /// Authoritative observer phase timestamps (T2, G-14).
+    pub phase_mono_ns: PhaseMonoNs,
     /// Largest gap between consecutive event drains during the capture
     /// loop. The undrained detach window and terminal drain never extend
     /// it (frozen at loop end): the detach window is separately counted
@@ -764,6 +802,7 @@ impl Default for SchedulingEvidence {
             sink_timeouts: 0,
             sink_dropped_bytes: 0,
             phase_ms: SchedulingPhaseMs::default(),
+            phase_mono_ns: PhaseMonoNs::default(),
             max_inter_drain_gap_ms: 0,
         }
     }
@@ -3170,6 +3209,7 @@ pub(crate) mod tests {
             "sink_timeouts",
             "sink_dropped_bytes",
             "phase_ms",
+            "phase_mono_ns",
             "max_inter_drain_gap_ms",
         ] {
             assert!(
@@ -3183,6 +3223,36 @@ pub(crate) mod tests {
                 "phase timers lack {key}"
             );
         }
+    }
+
+    #[test]
+    fn phase_mono_ns_serializes_with_nulls_and_closed_reason() {
+        let value = serde_json::to_value(evidence()).unwrap();
+        let phase = &value["scheduling"]["phase_mono_ns"];
+        for key in [
+            "attach_mono_ns",
+            "loop_start_mono_ns",
+            "loop_end_mono_ns",
+            "loop_end_reason",
+        ] {
+            assert!(phase.get(key).is_some(), "phase stamps lack {key}");
+        }
+        assert!(phase["attach_mono_ns"].is_null());
+        assert!(phase["loop_start_mono_ns"].is_null());
+        assert!(phase["loop_end_mono_ns"].is_null());
+        assert_eq!(phase["loop_end_reason"], LOOP_END_UNSTARTED);
+
+        let stamped = PhaseMonoNs {
+            attach_mono_ns: Some(100),
+            loop_start_mono_ns: Some(200),
+            loop_end_mono_ns: Some(300),
+            loop_end_reason: LOOP_END_EXPIRY,
+        };
+        let value = serde_json::to_value(stamped).unwrap();
+        assert_eq!(value["attach_mono_ns"], 100);
+        assert_eq!(value["loop_start_mono_ns"], 200);
+        assert_eq!(value["loop_end_mono_ns"], 300);
+        assert_eq!(value["loop_end_reason"], "expiry");
     }
 
     #[test]

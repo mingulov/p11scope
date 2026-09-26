@@ -40,7 +40,7 @@ fn paused_run(pause: PausePolicy, marker: &Path) -> RunArgs {
         command: vec![
             "/bin/sh".into(),
             "-c".into(),
-            format!("printf ran > {}", marker.display()),
+            format!("printf ran > {}", marker.display()).into(),
         ],
     }
 }

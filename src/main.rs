@@ -42,7 +42,8 @@ fn run() -> Result<i32> {
     // Before any handler installs: the owned command inherits exactly the
     // dispositions captured here for every signal the observer changes.
     capture_startup_signal_dispositions();
-    match cli::parse(std::env::args().skip(1)) {
+    // `args_os`: `std::env::args()` panics on a non-UTF-8 argument (M-9).
+    match cli::parse(std::env::args_os().skip(1)) {
         Ok(Command::Version) => {
             print_stdout(format_args!("p11scope {}\n", env!("CARGO_PKG_VERSION")))
         }

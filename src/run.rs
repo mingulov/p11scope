@@ -2445,7 +2445,7 @@ fn stop_signal_name(signal: libc::c_int) -> String {
 fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOutcome> {
     let policy = capture_policy(args.kind, args.metrics, args.unsafe_requested)?;
     warn_unsafe_policy(policy);
-    let mut command = args.command.iter().map(OsString::from);
+    let mut command = args.command.iter().cloned();
     let program = command
         .next()
         .ok_or_else(|| anyhow!("run: no command to exec"))?;
@@ -8911,7 +8911,7 @@ mod tests {
             pause,
             attach_backend: BackendSelection::default(),
             kill_on_timeout: false,
-            command: command.iter().map(|a| a.to_string()).collect(),
+            command: command.iter().map(OsString::from).collect(),
         }
     }
 

@@ -836,3 +836,58 @@ fn m3_cgroup_scope_must_be_a_cgroup_v2_directory() {
         real.stderr
     );
 }
+
+/// M-9: Linux arguments are bytes. A non-UTF-8 argument used to panic in
+/// `std::env::args()` (exit 101) before parsing even started — for a
+/// `--module` path, and for a `run` child argument `run` promises to pass
+/// through exactly. Paths and the `run` command keep their bytes; a flag or
+/// number that is not UTF-8 is an ordinary usage error.
+#[test]
+fn m9_non_utf8_arguments_never_panic() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+    let run_os = |args: &[&OsStr]| {
+        let output = Command::new(bin()).args(args).output().unwrap();
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    let target = SleepTarget::spawn();
+    let pid = target.pid();
+    let os = |text: &str| OsStr::new(text).to_owned();
+    let module = OsStr::from_bytes(b"/opt/caf\xe9/pkcs11.so").to_owned();
+
+    let (code, stderr) = run_os(&[
+        &os("inspect"),
+        &os("--pid"),
+        &os(&pid),
+        &os("--module"),
+        &module,
+    ]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+
+    let (code, stderr) = run_os(&[
+        &os("run"),
+        &os("--"),
+        &os("/bin/echo"),
+        OsStr::from_bytes(b"caf\xe9"),
+    ]);
+    assert!(matches!(code, Some(0) | Some(1)), "{code:?}: {stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+
+    for args in [
+        vec![OsStr::from_bytes(b"prof\xe9le").to_owned()],
+        vec![
+            os("profile"),
+            os("--pid"),
+            OsStr::from_bytes(b"12\xe9").to_owned(),
+        ],
+    ] {
+        let refs: Vec<&OsStr> = args.iter().map(|arg| arg.as_os_str()).collect();
+        let (code, stderr) = run_os(&refs);
+        assert_eq!(code, Some(2), "{args:?}: {stderr}");
+        assert!(!stderr.contains("panicked"), "{stderr}");
+    }
+}

@@ -656,3 +656,100 @@ fn j6_k8s_doc_pins() {
         assert!(path.is_file(), "missing {}", path.display());
     }
 }
+
+#[derive(Clone, Copy, Debug)]
+enum ClosedReader {
+    Stdout,
+    Stderr,
+}
+
+/// Runs p11scope with stdout or stderr connected to a pipe whose reader has
+/// already gone away (`p11scope doctor | true`, or `2>&1 | tee` after the
+/// operator's Ctrl-C killed `tee`), capturing the other stream. The Rust
+/// runtime ignores SIGPIPE, so every write there fails with EPIPE.
+fn run_with_closed_reader(args: &[&str], closed: ClosedReader) -> Outcome {
+    use std::os::fd::{FromRawFd as _, OwnedFd};
+    use std::process::Stdio;
+    let mut fds = [0 as libc::c_int; 2];
+    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+    let (reader, writer) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    drop(reader);
+    let mut command = Command::new(bin());
+    command.args(args);
+    match closed {
+        ClosedReader::Stdout => command.stdout(Stdio::from(writer)).stderr(Stdio::piped()),
+        ClosedReader::Stderr => command.stderr(Stdio::from(writer)).stdout(Stdio::piped()),
+    };
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("run p11scope {args:?}: {error}"));
+    Outcome {
+        code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+/// HIGH-4: a reader that went away is never a panic (exit 101). Help and
+/// version still exit 0, doctor still exits with its verdict, and every
+/// other command keeps its own exit code.
+#[test]
+fn high4_a_closed_stdout_reader_never_panics() {
+    let doctor_verdict = if capture_available() { 0 } else { 1 };
+    for (args, expected) in [
+        (&["--help"][..], Some(0)),
+        (&["profile", "--help"][..], Some(0)),
+        (&["--version"][..], Some(0)),
+        (&["doctor"][..], None),
+    ] {
+        let outcome = run_with_closed_reader(args, ClosedReader::Stdout);
+        assert!(
+            !outcome.stderr.contains("panicked"),
+            "{args:?}: {}",
+            outcome.stderr
+        );
+        assert_ne!(outcome.code, Some(101), "{args:?}: {}", outcome.stderr);
+        match expected {
+            Some(code) => assert_eq!(outcome.code, Some(code), "{args:?}: {}", outcome.stderr),
+            None => assert!(
+                outcome.code == Some(doctor_verdict) || outcome.code == Some(0),
+                "{args:?}: {:?} {}",
+                outcome.code,
+                outcome.stderr
+            ),
+        }
+    }
+}
+
+#[test]
+fn high4_a_closed_stderr_reader_never_panics() {
+    let target = SleepTarget::spawn();
+    let pid = target.pid();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let out = dir.path().join("observed.json");
+    let out = out.to_str().unwrap();
+    for (args, allowed) in [
+        (&["frobnicate"][..], &[2][..]),
+        (&["run", "--", "/bin/true"][..], &[0, 1][..]),
+        (&["inspect", "--pid", "99999999"][..], &[1][..]),
+        (
+            &["profile", "--pid", &pid, "--duration", "1", "-o", out][..],
+            &[0, 1][..],
+        ),
+        (&["trace", "--pid", &pid, "--duration", "1"][..], &[0, 1][..]),
+    ] {
+        let outcome = run_with_closed_reader(args, ClosedReader::Stderr);
+        assert!(
+            outcome.code.is_some_and(|code| allowed.contains(&code)),
+            "{args:?}: exit {:?} (101 is a panic on the closed stderr)",
+            outcome.code
+        );
+    }
+    let litter: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().starts_with(".p11scope."))
+        .collect();
+    assert!(litter.is_empty(), "{litter:?}");
+}

@@ -24,6 +24,10 @@ class CustodyError(RuntimeError):
     pass
 
 
+class DeadlineExpired(CustodyError):
+    """A finite custody deadline elapsed; safe to classify without its text."""
+
+
 class Cancelled(CustodyError):
     pass
 
@@ -55,7 +59,7 @@ def _remaining(deadline):
         raise CustodyError('deadline must be finite')
     value = deadline - time.monotonic()
     if value <= 0:
-        raise CustodyError('custody deadline expired')
+        raise DeadlineExpired('custody deadline expired')
     return value
 
 
@@ -558,7 +562,7 @@ class Custody:
                     status = os.waitid(os.P_PIDFD, fd, os.WEXITED | os.WNOHANG)
                     if status is None:
                         if not select.select([fd], [], [], _remaining(deadline))[0]:
-                            raise CustodyError('orphan reap deadline expired')
+                            raise DeadlineExpired('orphan reap deadline expired')
                         status = os.waitid(os.P_PIDFD, fd, os.WEXITED | os.WNOHANG)
                     if status is None or status.si_pid != pid:
                         raise CustodyError('orphan was not reaped')

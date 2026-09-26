@@ -78,8 +78,11 @@ def sanitized(phase, error):
         else:
             # Do not use str(error): accepted legacy validators can attach raw
             # bytes, and subprocess failures can attach argv/stdout/stderr.
-            kind = type(item).__name__
-            kind = kind if re.fullmatch(r'[A-Za-z0-9_]{1,64}', kind) else 'Error'
+            if isinstance(item, custody.DeadlineExpired):
+                kind = 'phase deadline expired'
+            else:
+                kind = type(item).__name__
+                kind = kind if re.fullmatch(r'[A-Za-z0-9_]{1,64}', kind) else 'Error'
             issues.append(f'{phase}: {kind}')
             if isinstance(item, custody.CleanupError):
                 pending.extend(item.errors)

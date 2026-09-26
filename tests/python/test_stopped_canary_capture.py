@@ -709,10 +709,10 @@ record(os.getpid())
 if case.startswith('capture_first'):
     marker()
     time.sleep(.08)
-if case in ('death_unknown', 'missing_ready'):
+if case == 'death_unknown' or case.startswith('missing_ready'):
     child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
     record(child.pid)
-    if case == 'missing_ready':
+    if case.startswith('missing_ready'):
         marker()
         child.wait()
     time.sleep(.08)
@@ -781,6 +781,7 @@ def owned_case(pid, directory, case, program, provider):
     handles, signals, waits, replays, readiness_deadlines = [], [], [], [], []
     launch, retain, send = owner.launch, owner.retain_observer_child, signal.pidfd_send_signal
     check, frames, dump, refuse = coordinator.check, source.frames, source.dump, source.refuse
+    snapshot = c.Group.snapshot
     replay = capture.evidence.assert_stopped_snapshot
     positive = case.startswith(('ready_first', 'capture_first'))
     def launched(*args, **kwargs):
@@ -817,6 +818,15 @@ def owned_case(pid, directory, case, program, provider):
             send(observer.fd, signal.SIGKILL)
             assert select.select([observer.fd], [], [], 1)[0]
             raise capture.CaptureError('injected observer death after workload STOP')
+    def snapshotted(group, deadline, **kwargs):
+        rows = snapshot(group, deadline, **kwargs)
+        if (case == 'missing_ready_snapshot_deadline' and group.role == 'observer'
+                and coordinator.phase == 'owned-readiness'
+                and coordinator.capture_ready(deadline)):
+            # The observer has really started its unreported child. Force the
+            # shared deadline to expire inside custody, not at check()/sleep.
+            c._remaining(time.monotonic() - 1)
+        return rows
     def framed(*args):
         raw = frames(*args)
         header = capture.dumper.TASK_STORAGE_HEADER
@@ -864,6 +874,8 @@ def owned_case(pid, directory, case, program, provider):
                     (source, 'refuse', refused),
                     (capture.evidence, 'assert_stopped_snapshot', replayed)):
                 stack.enter_context(patch.object(target, name, side_effect=side_effect))
+            if case == 'missing_ready_snapshot_deadline':
+                stack.enter_context(patch.object(c.Group, 'snapshot', side_effect=snapshotted, autospec=True))
             stack.enter_context(patch.object(c, 'Custody', return_value=owner))
             if case in ('missing_ready', 'missing_capture'):
                 stack.enter_context(patch.object(capture, 'READY_SECONDS', .25))
@@ -910,7 +922,7 @@ def owned_case(pid, directory, case, program, provider):
             assert not list(Path(directory).glob(f'.{config.lane}.*'))
         if case in ('death_unknown', 'death_stopped'):
             assert 'custody-close' in str(error), str(error)
-        if case in ('missing_ready', 'missing_capture'):
+        if case.startswith('missing_ready') or case == 'missing_capture':
             assert 'phase deadline expired' in str(error), str(error)
             assert not config.go.exists() and not source.opened_rings
         for fd in handles:
@@ -946,6 +958,27 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.build.cleanup()
+
+    def test_custody_deadline_has_a_bounded_specific_diagnostic(self):
+        try:
+            c._remaining(time.monotonic() - 1)
+        except c.CustodyError as error:
+            self.assertEqual(capture.sanitized('owned-readiness', error),
+                             ['owned-readiness: phase deadline expired'])
+        else:
+            self.fail('expired custody deadline was accepted')
+
+    def test_other_custody_errors_cannot_masquerade_as_timeouts(self):
+        error = c.CustodyError('phase deadline expired SECRET_LEGACY_BYTES')
+        self.assertEqual(capture.sanitized('owned-readiness', error),
+                         ['owned-readiness: CustodyError'])
+        try:
+            c._remaining(float('nan'))
+        except c.CustodyError as error:
+            self.assertEqual(capture.sanitized('owned-readiness', error),
+                             ['owned-readiness: CustodyError'])
+        else:
+            self.fail('nonfinite custody deadline was accepted')
 
     def probe(self, name):
         old = c._subreaper()
@@ -1315,7 +1348,7 @@ for case in ('ready_first', 'capture_first', 'ready_first_feature', 'capture_fir
              'death_unknown', 'death_stopped', 'wrong_executable', 'extra_child', 'stale_generation',
              'foreign_ready', 'unavailable_children', 'root_missing', 'root_invalid', 'root_control',
              'cookie', 'cookie_history', 'owner', 'start', 'events', 'observer_bad_exit',
-             'cgroup_value', 'missing_ready', 'missing_capture'):
+             'cgroup_value', 'missing_ready', 'missing_capture', 'missing_ready_snapshot_deadline'):
     def test(self, case=case):
         self.probe('owned:' + case)
     setattr(StoppedCanaryCaptureTests, 'test_owned_' + case, test)

@@ -4569,7 +4569,7 @@ fn max_scan_pids_bounds_initial_scan_and_refresh() {
             let capped =
                 Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
             let mut sweep_budget = CaptureWorkBudget::default();
-            let sweep = sweep_process_maps(&pids, &mut sweep_budget);
+            let (sweep, _) = sweep_process_maps(&pids, &mut sweep_budget).into_selection();
             // Probe one below the sweep length so selection takes the grouped
             // path: `usize::MAX` would return the under-cap identity (all pids),
             // not the representative-plus-individual candidate count.
@@ -24646,4 +24646,161 @@ fn e06_e14_rotation_and_lifecycle_recovery_at_scale() {
         f_seen <= 20,
         "under-cap admission covers F at once: frame {f_seen}"
     );
+}
+
+#[test]
+fn maps_sweep_refusal_is_reported_even_without_a_deep_scan_slot() {
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.scheduler.set_quantum_ns_for_test(u64::MAX);
+    engine.budget.set_deadline(Some(0));
+    let pid = std::process::id();
+    let selected = engine.reconcile_slice(&[pid], &BTreeSet::new(), 0);
+
+    assert!(selected.is_empty());
+    assert_eq!(engine.scheduler.cursor_for_test(), Some(pid));
+    assert_eq!(engine.budget.attempted_io_bytes(), 0);
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "process maps sweep" && skip.reason.contains("unavailable")
+        }),
+        "a refused maps snapshot must remain unknown even when deep scanning cannot run: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(engine.views.is_empty());
+    assert!(engine.modules.is_empty());
+}
+
+#[test]
+fn maps_sweep_open_failure_is_not_a_successful_empty_snapshot() {
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.scheduler.set_quantum_ns_for_test(u64::MAX);
+    // Linux PIDs are positive signed integers: this name cannot identify a
+    // process even if another test creates processes concurrently.
+    let pid = u32::MAX;
+    let selected = engine.reconcile_slice(&[pid], &BTreeSet::new(), 1);
+
+    assert_eq!(selected, vec![pid], "unknown work remains eligible");
+    assert_eq!(engine.scheduler.cursor_for_test(), Some(pid));
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "process maps sweep" && skip.reason.contains("unavailable")
+        }),
+        "open failure must not disappear as an empty maps list: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+#[test]
+fn maps_sweep_success_does_not_invent_unavailable_evidence() {
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.scheduler.set_quantum_ns_for_test(u64::MAX);
+    let pid = std::process::id();
+    let selected = engine.reconcile_slice(&[pid], &BTreeSet::new(), 1);
+
+    assert_eq!(selected, vec![pid]);
+    assert_eq!(engine.scheduler.cursor_for_test(), Some(pid));
+    assert!(engine.budget.attempted_io_bytes() > 0);
+    assert!(engine.counters.object_skips.is_empty());
+}
+
+#[test]
+fn maps_sweep_initial_failure_keeps_unknown_candidates_and_reports_the_gap() {
+    let pids = [std::process::id(), u32::MAX];
+    let mut budget = CaptureWorkBudget::default();
+    let sweep = sweep_process_maps(&pids, &mut budget);
+    assert_eq!(sweep.attempted(), 2);
+    assert_eq!(sweep.read(), 1);
+    assert!(matches!(sweep.snapshots[0].1, MapsSnapshot::Read(_)));
+    assert!(matches!(sweep.snapshots[1].1, MapsSnapshot::Unavailable));
+
+    let (hints, skipped) = sweep.into_selection();
+    assert_eq!(select_deep_scan_candidates(&hints, 2), pids);
+    let skipped = skipped.expect("unavailable initial maps need their own evidence");
+    assert!(skipped.reason.contains("1 of 2 attempted processes"));
+    assert_eq!(
+        render::capture_skipped_out(&skipped),
+        render::SkippedOut {
+            name: "discovery subject".into(),
+            reason: "discovery unavailable".into(),
+        }
+    );
+}
+
+#[test]
+fn maps_sweep_distinguishes_successful_eof_from_failed_io() {
+    struct FailedRead;
+    impl std::io::Read for FailedRead {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("private-error-canary"))
+        }
+    }
+    let mut budget = CaptureWorkBudget::default();
+    let mut sweep = MapsSweep::default();
+    sweep.record(
+        1,
+        read_maps_or_refuse(std::io::Cursor::new([]), &mut budget, || Some(1)),
+    );
+    sweep.record(2, read_maps_or_refuse(FailedRead, &mut budget, || Some(1)));
+    assert!(matches!(&sweep.snapshots[0].1, MapsSnapshot::Read(entries) if entries.is_empty()));
+    assert!(matches!(sweep.snapshots[1].1, MapsSnapshot::Unavailable));
+    assert_eq!(sweep.read(), 1);
+    let (_, skipped) = sweep.into_selection();
+    let skipped = skipped.unwrap();
+    assert!(!skipped.reason.contains("private-error-canary"));
+    assert_eq!(
+        render::capture_skipped_out(&skipped).reason,
+        "discovery unavailable"
+    );
+}
+
+#[test]
+fn maps_sweep_failed_attempt_advances_without_counting_as_read() {
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.scheduler.set_quantum_ns_for_test(u64::MAX);
+    engine.scheduler.set_slice_pids_for_test(1);
+    let pid = std::process::id();
+    engine.scheduler.advance_cursor(pid);
+    let pids = [pid, u32::MAX];
+
+    assert_eq!(
+        engine.reconcile_slice(&pids, &BTreeSet::new(), 1),
+        vec![u32::MAX]
+    );
+    assert!(engine.counters.object_skips.iter().any(|skip| {
+        skip.reason == "reconciliation sweep covered 0 of 2 observed processes and revalidated 0 retained generations; 1 deferred to the next sweep"
+    }));
+    assert_eq!(engine.scheduler.cursor_for_test(), Some(u32::MAX));
+    assert_eq!(
+        engine.reconcile_slice(&pids, &BTreeSet::new(), 1),
+        vec![pid],
+        "the next slice reaches the process after the failed read"
+    );
+    assert_eq!(engine.scheduler.cursor_for_test(), Some(pid));
+}
+
+#[test]
+fn maps_sweep_refusal_does_not_retire_a_retained_generation() {
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.scheduler.set_quantum_ns_for_test(u64::MAX);
+    engine.budget.set_deadline(Some(0));
+    let pid = std::process::id();
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(7), pid).unwrap());
+    assert!(
+        engine
+            .reconcile_slice(&[pid], &[pid].into_iter().collect(), 0)
+            .is_empty()
+    );
+    assert_eq!(engine.views.len(), 1);
+    assert_eq!(engine.views[0].id(), ProcessViewId(7));
+    assert!(engine.views[0].still_the_same());
+    assert!(engine.pending_retirements.is_empty());
+    assert!(engine.retirement_intents.is_empty());
+    assert_eq!(engine.counters.object_skips.len(), 1);
 }

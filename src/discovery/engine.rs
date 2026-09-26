@@ -4027,21 +4027,82 @@ fn scan_cap_reason(total: usize, selected: usize, cap: usize, live: bool) -> Str
     }
 }
 
-/// Phase 1 of the two-phase scan: read every in-scope pid's maps snapshot.
-/// Cheap by construction — bounded read plus parse only, no decode, no view
-/// allocation. A pid whose maps cannot be read keeps its place with an empty
-/// entry list, so selection still sees every in-scope pid and the deep path
-/// publishes the loss exactly as today.
-fn sweep_process_maps(pids: &[u32], budget: &mut CaptureWorkBudget) -> Vec<(u32, Vec<MapEntry>)> {
-    pids.iter()
-        .map(|&pid| {
-            let entries = std::fs::File::open(format!("/proc/{pid}/maps"))
-                .map_err(|error| error.to_string())
-                .and_then(|maps| read_maps_or_refuse(maps, budget, crate::attach::monotonic_ns))
-                .unwrap_or_default();
-            (pid, entries)
+enum MapsSnapshot {
+    Read(Vec<MapEntry>),
+    Unavailable,
+}
+
+#[derive(Default)]
+struct MapsSweep {
+    snapshots: Vec<(u32, MapsSnapshot)>,
+}
+
+impl MapsSweep {
+    fn record(&mut self, pid: u32, result: Result<Vec<MapEntry>, String>) {
+        let snapshot = match result {
+            Ok(entries) => MapsSnapshot::Read(entries),
+            Err(_) => MapsSnapshot::Unavailable,
+        };
+        self.snapshots.push((pid, snapshot));
+    }
+
+    fn attempted(&self) -> usize {
+        self.snapshots.len()
+    }
+
+    fn read(&self) -> usize {
+        self.snapshots
+            .iter()
+            .filter(|(_, snapshot)| matches!(snapshot, MapsSnapshot::Read(_)))
+            .count()
+    }
+
+    fn unavailable_skip(&self) -> Option<Skipped> {
+        let unavailable = self.attempted() - self.read();
+        (unavailable != 0).then(|| Skipped {
+            subject: "process maps sweep".into(),
+            reason: format!(
+                "maps snapshots unavailable for {unavailable} of {} attempted processes; provider presence remains unknown",
+                self.attempted()
+            ),
         })
-        .collect()
+    }
+
+    /// Rarity ordering consumes advisory hints only. Unknown snapshots stay
+    /// eligible as individual candidates, alongside successful snapshots
+    /// with no provider hint. This projection is never mapping or absence
+    /// authority: an admitted deep scan acquires its own retained view.
+    /// Return the gap with the hints so both callers publish it even when
+    /// none of these candidates can receive a deep-scan slot.
+    fn into_selection(self) -> (Vec<(u32, Vec<MapEntry>)>, Option<Skipped>) {
+        let skipped = self.unavailable_skip();
+        let hints = self
+            .snapshots
+            .into_iter()
+            .map(|(pid, snapshot)| {
+                let hints = match snapshot {
+                    MapsSnapshot::Read(entries) => entries,
+                    MapsSnapshot::Unavailable => Vec::new(),
+                };
+                (pid, hints)
+            })
+            .collect();
+        (hints, skipped)
+    }
+}
+
+/// Phase 1 reads every in-scope pid's maps snapshot with bounded I/O and
+/// parsing, without decode or view allocation. Failed or budget-refused
+/// snapshots remain unavailable, independently of later deep-scan selection.
+fn sweep_process_maps(pids: &[u32], budget: &mut CaptureWorkBudget) -> MapsSweep {
+    let mut sweep = MapsSweep::default();
+    for &pid in pids {
+        let result = std::fs::File::open(format!("/proc/{pid}/maps"))
+            .map_err(|error| error.to_string())
+            .and_then(|maps| read_maps_or_refuse(maps, budget, crate::attach::monotonic_ns));
+        sweep.record(pid, result);
+    }
+    sweep
 }
 
 /// Discovery for one capture: scan the scope, read and corroborate any manifests,
@@ -4077,7 +4138,12 @@ fn discover_plan(
     // deep-scans the selected candidates only. Under the cap selection is
     // the identity, so the sweep (and its budget charge) is skipped there.
     let selected = if pids.len() > max_scan_pids {
-        let sweep = sweep_process_maps(&pids, &mut discovered.budget);
+        let (sweep, unavailable) =
+            sweep_process_maps(&pids, &mut discovered.budget).into_selection();
+        if let Some(skipped) = unavailable {
+            attribution::note(&skipped);
+            discovered.base_counters.object_skips.push(skipped);
+        }
         select_deep_scan_candidates(&sweep, max_scan_pids)
     } else {
         pids.clone()
@@ -13930,7 +13996,7 @@ impl Engine {
         let slice_pids = self.scheduler.slice_pids();
         let order = DiscoveryScheduler::rotated_after(pids, self.scheduler.cursor());
         let start = crate::attach::monotonic_ns();
-        let mut slice: Vec<(u32, Vec<MapEntry>)> = Vec::new();
+        let mut slice = MapsSweep::default();
         let mut revalidated = 0u64;
         let mut quantum_stopped = false;
         let mut clock_failed = start.is_none();
@@ -13956,19 +14022,23 @@ impl Engine {
             {
                 revalidated = revalidated.saturating_add(1);
             }
-            let entries = std::fs::File::open(format!("/proc/{pid}/maps"))
+            let result = std::fs::File::open(format!("/proc/{pid}/maps"))
                 .map_err(|error| error.to_string())
                 .and_then(|maps| {
                     read_maps_or_refuse(maps, &mut self.budget, crate::attach::monotonic_ns)
-                })
-                .unwrap_or_default();
-            slice.push((pid, entries));
+                });
+            slice.record(pid, result);
             self.scheduler.advance_cursor(pid);
         }
-        let read = slice.len();
+        let attempted = slice.attempted();
+        let read = slice.read();
+        let (slice, unavailable) = slice.into_selection();
+        if let Some(skipped) = unavailable {
+            self.mark_partial(&skipped.subject, &skipped.reason);
+        }
         let enumerated = pids.len();
-        if read < enumerated {
-            let left = enumerated.saturating_sub(read);
+        if attempted < enumerated {
+            let left = enumerated.saturating_sub(attempted);
             let tail = if clock_failed {
                 format!("wall clock unavailable, {left} deferred to the next sweep")
             } else if quantum_stopped {

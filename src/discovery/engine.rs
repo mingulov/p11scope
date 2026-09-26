@@ -9495,6 +9495,17 @@ impl Engine {
                 "a manifest selection table failed indivisible attachment and was rolled back",
             );
         }
+        // PC-1: a candidate whose additions never ran — a closed tick, a
+        // conservative replay, a generation lost before the attach — gives
+        // back the cells it allocated for them. No link ever pointed at them,
+        // so no count can be in them. Kept, they burned the capture-lifetime
+        // budget: every conservative replay after an ordinary process exit
+        // allocated one more cell per listed-but-inactive endpoint.
+        if !new_targets_attached {
+            candidate
+                .plan
+                .withdraw_unlinked_additions(self.plan.slots.len());
+        }
         record_object_skips(&mut candidate.plan, &self.counters.object_skips);
         outcome.changed |= candidate.plan != self.plan;
         self.pinned = candidate.pinned;

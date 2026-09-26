@@ -1329,6 +1329,34 @@ impl AttachPlan {
             .count();
     }
 
+    /// Gives back the cells at `accepted..` — every cell this candidate
+    /// allocated past the accepted plan — when none of them was ever linked
+    /// (PC-1). "Allocated slot IDs are never given back" protects a cell that
+    /// a link may have counted into; a candidate whose attach never ran has
+    /// no such cell, and keeping them burned the lifetime budget whenever the
+    /// same listed-but-inactive endpoints were planned again with additions
+    /// closed. Only a wholly inactive tail is withdrawn: an active cell means
+    /// a link exists, and then nothing is given back.
+    pub(crate) fn withdraw_unlinked_additions(&mut self, accepted: usize) {
+        if self.slots.len() <= accepted
+            || (accepted..self.slots.len()).any(|position| self.is_active(position as u32))
+        {
+            return;
+        }
+        self.slots.truncate(accepted);
+        self.aggregate_owners.truncate(accepted);
+        self.retired_slots.retain(|position| *position < accepted);
+        self.slot_by_key.retain(|_, position| *position < accepted);
+        let slot_by_key = &self.slot_by_key;
+        self.provisional_get_function_list
+            .retain(|key, _| slot_by_key.contains_key(key));
+        self.module_ambiguous = self
+            .aggregate_owners
+            .iter()
+            .filter(|owner| matches!(owner, AggregateOwner::Ambiguous))
+            .count();
+    }
+
     pub(crate) fn validate_slot_index(&self) -> Result<(), String> {
         if self.aggregate_owners.len() != self.slots.len() {
             return Err("aggregate-owner state does not match allocated slots".into());

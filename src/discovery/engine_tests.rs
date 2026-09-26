@@ -11735,6 +11735,122 @@ fn peer_candidate(engine: &mut Engine, modules: &[ScannedModule]) -> LiveCandida
     candidate
 }
 
+/// `entries` endpoints of one heuristic table at `0x1000, 0x1008, …` of
+/// `module`'s own object.
+fn with_endpoints(mut module: ScannedModule, entries: u32) -> ScannedModule {
+    let table = module.tables[0].clone();
+    module.tables = vec![ScannedTable {
+        entries: (0..entries)
+            .map(|entry| ScannedEntry {
+                name: "C_Sign",
+                object: module.key,
+                object_path: module.path.clone(),
+                file_offset: 0x1000 + u64::from(entry) * 8,
+            })
+            .collect(),
+        ..table
+    }];
+    module
+}
+
+/// PC-1 (A row 1-04). Every ordinary process exit in a cgroup or system
+/// capture queues a conservative replay, which rebuilds the plan from every
+/// still-listed module with additions closed. A listed endpoint that is not
+/// active — its attach failed, or a closed tick blocked it — was allocated a
+/// fresh capture-lifetime cell by every such replay and deactivated unlinked
+/// in the same breath. Under churn that burned the whole slot budget: the
+/// replays kept draining, but a provider that fit the active slots many times
+/// over was then refused for the rest of the capture. A candidate whose
+/// additions never ran gives its unlinked cells back.
+#[test]
+fn conservative_replays_under_churn_never_burn_capacity() {
+    let capacity = p11scope_ebpf_common::MAX_SLOTS;
+    let child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let _reap = ChildReaper(child);
+    let view = ProcessView::open(ProcessViewId(3), _reap.0.id()).unwrap();
+    let modules = child_provider_modules(&view);
+    let busy = with_endpoints(modules[0].clone(), capacity - 100);
+    let late = with_endpoints(modules[1].clone(), 50);
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.next_view_id = 4;
+    engine.views.push(view);
+    let pins = pin_test_modules(&engine.views[0], std::slice::from_ref(&busy));
+    let candidate = engine
+        .live_candidate(pins, vec![busy.clone()], Vec::new())
+        .unwrap();
+    let mut session = ScriptedSession::default();
+    // Thirty of the busy provider's attaches fail: listed, not active.
+    session.fail_target_slots(0..30);
+    let outcome = engine
+        .apply_candidate(&mut session, candidate, &mut true, false, &[])
+        .unwrap();
+    assert!(outcome.accepted());
+    session.fail_target_slots([]);
+    let allocated = engine.plan.slots.len();
+    assert_eq!(allocated, capacity as usize - 100);
+    assert_eq!(engine.plan.active_slot_count(), allocated - 30);
+
+    // Churn: an ambient process with no modules exits, again and again.
+    for exit in 0..8 {
+        engine.pending_retirements.insert(ProcessViewId(100 + exit));
+        engine.replay_pending_conservative(
+            &mut session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        );
+        assert!(
+            engine.pending_retirements.is_empty(),
+            "exit {exit}: the replay drained its retirement"
+        );
+        assert_eq!(
+            engine.plan.slots.len(),
+            allocated,
+            "exit {exit}: a replay with additions closed allocates nothing"
+        );
+    }
+    assert!(
+        engine.plan.modules_skipped.is_empty(),
+        "no capacity refusal was published: {:?}",
+        engine.plan.modules_skipped
+    );
+
+    // Discovery still admits a later provider that fits, and retries the
+    // busy provider's inactive endpoints in the same open candidate.
+    let mut pins = engine.pinned.clone();
+    let skipped = pins.absorb(pin_test_modules(
+        &engine.views[0],
+        std::slice::from_ref(&late),
+    ));
+    let candidate = engine
+        .live_candidate(pins, vec![busy, late], skipped)
+        .unwrap();
+    let outcome = engine
+        .apply_candidate(&mut session, candidate, &mut true, false, &[])
+        .unwrap();
+    assert!(outcome.accepted());
+    assert!(
+        engine.plan.modules_skipped.is_empty(),
+        "the late provider was admitted: {:?}",
+        engine.plan.modules_skipped
+    );
+    assert_eq!(engine.plan.slots.len(), allocated + 30 + 50);
+    assert_eq!(engine.plan.active_slot_count(), allocated + 50);
+}
+
+/// Kills and reaps its child when dropped.
+struct ChildReaper(std::process::Child);
+
+impl Drop for ChildReaper {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 #[test]
 fn post_mutation_generation_loss_never_owns_the_cell_it_allocated() {
     let (child, mut engine, modules) = engine_with_one_accepted_provider();

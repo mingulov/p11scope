@@ -148,7 +148,7 @@ Task 0b notes adjudicated:
 | F-72 | C_GetInterface admission gaps | source-fixed | T13 | `f_e08_named_gi_heap_matches_list_element` + live replay | `41fbff2,d155a54` (d6c5bea); authority gates retained by design |
 | F-73 | interface rescans burn life | source-fixed | T13 | `e09_repeated_interface_rescans_charge_once_but_work_every_time` | `bacda87`; 512 ceiling retained by design |
 | F-74 | harness invents collapse cause | source-fixed | T13 | `tests/python/test_measure_e03.py` (21 tests) | `0523989,b396ba9`; fd-plateau still estimated (disclosed) |
-| F-75 | async cross-process collision | source-fixed | T13 | `e20_collision_tombstone_lifecycle_matrix` + real-BPF E20 (T9) | `2ef93d1,64874e1,fc24b41,fe2f867` (e1f6d3a,672df5f) |
+| F-75 | async cross-process collision | source-fixed | T13 | `e20_collision_tombstone_lifecycle_matrix` + live E20 same-domain check NOT implemented (open, T9) | `2ef93d1,64874e1,fc24b41,fe2f867` (e1f6d3a,672df5f) |
 
 ## R-01–R-06
 
@@ -207,7 +207,7 @@ Task 0b notes adjudicated:
 | E17 | slow sink/burst/cancel | required-open | T10 | NONE-YET | SE:294 |
 | E18 | metrics extraction cost | required-open | T8 | NONE-YET | SE:304; O-6 |
 | E19 | reducer/trace allocs | required-open | T9 | NONE-YET | SE:316 |
-| E20 | semantic scaling/isolation | required-open | T9 | `e20_collision_tombstone_lifecycle_matrix` + real-BPF E20 | SE:327; F-75 unit-fixed, live pending |
+| E20 | semantic scaling/isolation | required-open | T9 | `e20_collision_tombstone_lifecycle_matrix` (unit only); live E20 same-domain collision check NOT implemented | SE:327; F-75 unit-fixed; live check NOT implemented, open requirement |
 | E21 | parser/privacy stress | required-open | T12 | NONE-YET | SE:355; F-05/F-41 |
 | E22 | catalog vs real coverage | required-open | T9 | NONE-YET | SE:366; G-12 runtime conformance for all 104 |
 | E23 | backend/kernel matrix | required-open | T12 | NONE-YET | SE:376; safety subset first |

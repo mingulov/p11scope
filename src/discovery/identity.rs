@@ -813,6 +813,8 @@ impl PinnedObjects {
             .next_id
             .checked_add(1)
             .expect("capture object id overflow");
+        #[cfg(test)]
+        crate::first_use_probe::known(&entry.file, &entry.sha256);
         self.raw_to_id.insert(entry.raw.clone(), id);
         self.by_id.insert(id, entry);
         Some(id)

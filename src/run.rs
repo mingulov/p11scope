@@ -3810,6 +3810,8 @@ fn capture_profile(
     // Authoritative loop-start stamp (T2, G-14): the last clock read before
     // the first tick.
     scheduling.note_loop_start(crate::attach::monotonic_ns());
+    #[cfg(test)]
+    crate::first_use_probe::loop_started(&session.events_domain(), scheduling.loop_start_mono_ns);
     #[rustfmt::skip]
     let loop_result = (|| -> Result<CaptureEnd> {
     loop {
@@ -5498,6 +5500,8 @@ fn reduce_profile_event(
     scope: &Scope,
     ev: p11scope_ebpf_common::Event,
 ) -> Result<()> {
+    #[cfg(test)]
+    crate::first_use_probe::call(domain, &ev);
     tracker.check_root_event(domain, ev.root_affiliation)?;
     if !observe_fork(domain, tracker, state, scope, &ev)
         && let Some(process) = identify_tracked(domain, tracker, state, &ev)
@@ -8997,6 +9001,41 @@ mod tests {
             pid_tgid: u64::from(std::process::id()) << 32,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn first_use_probe_records_the_actual_profile_drain_before_reduction() {
+        use crate::events::{EventDrain, ScriptedRecords};
+        let pid = std::process::id();
+        let probe = crate::first_use_probe::test_probe(pid);
+        let plan = crate::plan::AttachPlan::from_slots(vec![]);
+        let mut state = semantics::State::new(&plan);
+        let mut tracker = process::Tracker::new();
+        let mut event = call_event();
+        event.ts_ns = 100;
+        event.duration_ns = 20;
+        event.image.task_cookie = 29;
+        let mut drain = EventDrain::over_test_domain(ScriptedRecords::events([event], 1), 91);
+        drain_profile_events(
+            &mut drain,
+            &mut state,
+            &mut tracker,
+            &Scope::System,
+            Some(1),
+        )
+        .unwrap();
+        let journal = serde_json::to_value(probe.finish()).unwrap();
+        let facts = journal["facts"].as_array().unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0]["fact"], "call");
+        assert_eq!(facts[0]["domain"], 91);
+        assert_eq!(facts[0]["task_cookie"], 29);
+        assert_eq!(facts[0]["entry_ns"], 80);
+        assert!(
+            facts[0]["endpoint"].is_null(),
+            "no later display-plan fallback"
+        );
+        assert!(facts[0]["consumed_ns"].as_u64().unwrap() > 0);
     }
 
     /// One event past the quantum, then a record the live profile poll must

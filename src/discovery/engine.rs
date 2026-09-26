@@ -9674,6 +9674,8 @@ impl Engine {
         additions_allowed: &mut bool,
         pending_views: &mut PendingViewRetirements,
     ) -> Result<DiscoveryRecordOutcome> {
+        #[cfg(test)]
+        crate::first_use_probe::publication_validated(&self.views[position], &lowered, hook_ts_ns);
         let (pins, pin_skips) = {
             let view = &self.views[position];
             pin_scanned_view_objects(view, std::slice::from_ref(&lowered), &mut self.budget)

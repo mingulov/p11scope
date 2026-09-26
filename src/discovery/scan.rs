@@ -3039,7 +3039,10 @@ pub fn scan_process_view(
     view: &ProcessView,
     budget: &mut CaptureWorkBudget,
 ) -> Result<ScanOutcome, String> {
-    scan_process_view_with_io(request, view, budget, &mut ProcScanIo)
+    let result = scan_process_view_with_io(request, view, budget, &mut ProcScanIo);
+    #[cfg(test)]
+    crate::first_use_probe::scan_returned(view, true, budget, &result);
+    result
 }
 
 /// Enumerates and pins the current module/export surface while deliberately
@@ -3050,7 +3053,10 @@ pub(crate) fn scan_process_view_without_memory(
     view: &ProcessView,
     budget: &mut CaptureWorkBudget,
 ) -> Result<ScanOutcome, String> {
-    scan_process_view_with_io_mode(request, view, budget, &mut ProcScanIo, false)
+    let result = scan_process_view_with_io_mode(request, view, budget, &mut ProcScanIo, false);
+    #[cfg(test)]
+    crate::first_use_probe::scan_returned(view, false, budget, &result);
+    result
 }
 
 fn scan_process_view_with_io(

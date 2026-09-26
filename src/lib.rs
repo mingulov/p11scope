@@ -7,6 +7,8 @@ pub mod cli;
 pub mod discovery;
 pub mod doctor;
 pub mod events;
+#[cfg(test)]
+mod first_use_probe;
 pub mod inspect;
 pub mod kinds;
 pub mod longrun;

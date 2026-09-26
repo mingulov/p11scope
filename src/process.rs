@@ -408,6 +408,11 @@ impl ProcessView {
         self.mount_namespace
     }
 
+    #[cfg(test)]
+    pub(crate) fn first_use_birth_ticks(&self) -> Option<u64> {
+        self.pin.start_time
+    }
+
     pub(crate) fn admitted_ns(&self) -> u64 {
         self.admitted_ns
     }

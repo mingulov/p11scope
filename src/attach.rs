@@ -3207,6 +3207,8 @@ impl Session {
         self.successful_static.extend(successful);
         let failed: Vec<_> = failures.iter().map(|(slot, _)| *slot).collect();
         self.attach_failures.extend(failures);
+        #[cfg(test)]
+        crate::first_use_probe::attached(&self.events_domain, targets, objects, &completed);
         Ok((failed, completed))
     }
 
@@ -3354,6 +3356,10 @@ impl Session {
         // Regroup and resolve program fds before the first link mutation:
         // a failure here leaves every old link untouched.
         let regrouped: Vec<Slot> = survivors.iter().map(|target| target.slot.clone()).collect();
+        #[cfg(test)]
+        if !regrouped.is_empty() {
+            crate::first_use_probe::unsupported_rebuild();
+        }
         let targets: BTreeMap<u32, (PathBuf, ElfAbi)> = survivors
             .iter()
             .map(|target| (target.slot.index, (target.path.clone(), target.abi)))

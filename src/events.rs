@@ -90,7 +90,7 @@ impl EventsDomain {
         Self::test_with_fd(id, std::fs::File::open("/dev/null").unwrap().into())
     }
     #[cfg(test)]
-    fn test_with_fd(id: u64, fd: OwnedFd) -> Self {
+    pub(crate) fn test_with_fd(id: u64, fd: OwnedFd) -> Self {
         Self(Arc::new(RetainedEvents {
             id: NonZeroU64::new(id).unwrap(),
             _fd: fd,

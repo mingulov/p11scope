@@ -6,6 +6,8 @@ The [resource and latency pilot](system-resource-pilot.md) defines the
 preliminary measurement protocol for T7/T12; its axes are not executed results.
 The [G-14 runtime report](t2-g14-runtime-diagnostics.md) records the new
 public PID/profile baseline, exact owned counts and remaining loader gaps.
+The [owned first-use fixture](system-first-use-fixture.md) now has ordinary
+controls; its native observer adapter and five-class matrix remain pending.
 Cold CLI startup is supporting evidence; it does not complete the gated /
 ungated provider-first-use matrix. The earlier ordinary evidence below
 was produced unprivileged on the dev host (`7.0.0-31-generic`) at T2 BASE

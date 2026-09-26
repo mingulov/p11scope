@@ -105,6 +105,7 @@ pub struct InspectArgs {
 pub struct DoctorArgs {
     pub pid: Option<u32>,
     pub cgroup: Option<PathBuf>,
+    pub extra_strict: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,7 +176,7 @@ pub const USAGE: &str = "usage:
                    [--attach-backend auto|multi|singles]
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>] -- CMD [ARGS...]
   p11scope inspect --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--json]
-  p11scope doctor  [--pid <n>] [--cgroup <path>]
+  p11scope doctor  [--pid <n>] [--cgroup <path>] [--extra-strict]
   p11scope-discover --module <provider.so> [-o <manifest.json>]   (offline helper; executes provider code)
 
 notes: discovery scans the target's mapped memory — no manifest and no helper are required.
@@ -332,7 +333,7 @@ capture evidence records the active value of each (evidence.p11scope_env); docs/
 /// shared notes footer. Every line is verbatim from [`USAGE`]; update
 /// both together when the CLI changes.
 const DOCTOR_HELP: &str = "usage:
-  p11scope doctor  [--pid <n>] [--cgroup <path>]
+  p11scope doctor  [--pid <n>] [--cgroup <path>] [--extra-strict]
 
 notes: discovery scans the target's mapped memory — no manifest and no helper are required.
 --module narrows the scan to named providers. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
@@ -592,12 +593,14 @@ fn parse_doctor(mut args: impl Iterator<Item = String>) -> Result<DoctorArgs, Cl
     let mut doctor = DoctorArgs {
         pid: None,
         cgroup: None,
+        extra_strict: false,
     };
     while let Some(a) = args.next() {
         match a.as_str() {
             "--help" | "-h" => return Err(CliError::Help(HelpTopic::Doctor)),
             "--pid" => doctor.pid = Some(require_pid(&mut args)?),
             "--cgroup" => doctor.cgroup = Some(require_value(&mut args, "--cgroup")?.into()),
+            "--extra-strict" => doctor.extra_strict = true,
             "--module" => {
                 return Err(usage_err(
                     "doctor --module is not supported; use inspect --pid <n> --module \
@@ -874,6 +877,25 @@ mod tests {
             parse(args(&["doctor", "--module", "/opt/provider.so"])),
             Err(CliError::Usage(m)) if m.contains("doctor --module is not supported")
         ));
+    }
+
+    #[test]
+    fn doctor_extra_strict_defaults_off_and_parses() {
+        let Command::Doctor(d) = parse(args(&["doctor"])).unwrap() else {
+            panic!("expected doctor");
+        };
+        assert!(!d.extra_strict);
+        let Command::Doctor(d) = parse(args(&["doctor", "--extra-strict"])).unwrap() else {
+            panic!("expected doctor");
+        };
+        assert!(d.extra_strict);
+        let Command::Doctor(d) =
+            parse(args(&["doctor", "--pid", "123", "--extra-strict"])).unwrap()
+        else {
+            panic!("expected doctor");
+        };
+        assert!(d.extra_strict);
+        assert_eq!(d.pid, Some(123));
     }
 
     #[test]
@@ -1344,8 +1366,8 @@ mod tests {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(1099511628211);
         }
-        assert_eq!(USAGE.len(), 3444);
-        assert_eq!(hash, 0x30b2d862_636e3087);
+        assert_eq!(USAGE.len(), 3461);
+        assert_eq!(hash, 0x9986ad8b_a334f261);
         assert_eq!(HelpTopic::Global.text(), USAGE);
     }
 

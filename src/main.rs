@@ -43,7 +43,7 @@ fn run() -> Result<i32> {
         // not be read at all": one line here, exit 1, never a panic.
         Ok(Command::Inspect(a)) => inspect::run(a.pid, &a.modules, &a.hooks, a.json)
             .with_context(|| format!("inspect --pid {}", a.pid)),
-        Ok(Command::Doctor(a)) => doctor::run(a.pid, a.cgroup.as_deref()),
+        Ok(Command::Doctor(a)) => doctor::run(a.pid, a.cgroup.as_deref(), a.extra_strict),
         Err(CliError::Help(topic)) => {
             // Exit-0 help goes to stdout, so `p11scope --help | grep …` works.
             println!("{}", topic.text());

@@ -1220,11 +1220,65 @@ pub fn verdict(checks: &[Check]) -> i32 {
     if gated { 1 } else { 0 }
 }
 
+/// Extra-strict qualification (T2): every `Warn` or `Fail` row is a
+/// qualification violation, in any lane — not just the gated rows.
+/// `NotApplicable` rows (lanes nobody requested) never violate.
+pub fn extra_strict_violations(checks: &[Check]) -> Vec<&Check> {
+    checks
+        .iter()
+        .filter(|c| matches!(c.status, Status::Warn(_) | Status::Fail(_)))
+        .collect()
+}
+
+/// Extra-strict exit code: 0 only when no row violates, 1 otherwise.
+pub fn verdict_extra_strict(checks: &[Check]) -> i32 {
+    if extra_strict_violations(checks).is_empty() {
+        0
+    } else {
+        1
+    }
+}
+
+/// Extra-strict render: the standard table plus one trailing line that
+/// either names every violating row (refusal) or states explicitly that
+/// no qualification violation was found. Row names are static probe
+/// labels, never target-controlled bytes, so the refusal line cannot be
+/// forged the way a detail could (F-59).
+pub fn render_extra_strict(checks: &[Check]) -> String {
+    let mut out = render(checks);
+    let violations = extra_strict_violations(checks);
+    if violations.is_empty() {
+        out.push_str("extra-strict: no qualification violations\n");
+    } else {
+        let names: Vec<&str> = violations.iter().map(|c| c.name.as_str()).collect();
+        let noun = if violations.len() == 1 {
+            "violation"
+        } else {
+            "violations"
+        };
+        let _ = writeln!(
+            out,
+            "extra-strict refusal: {} qualification {noun}: {}",
+            violations.len(),
+            names.join("; ")
+        );
+    }
+    out
+}
+
 /// `p11scope doctor`: probes, prints the table, returns the exit code.
-pub fn run(pid: Option<u32>, cgroup: Option<&Path>) -> Result<i32> {
+/// With `extra_strict`, any `Warn`/`Fail` row refuses (exit 1) and the
+/// render names every violating row; otherwise the default gated verdict
+/// applies and the render is unchanged.
+pub fn run(pid: Option<u32>, cgroup: Option<&Path>, extra_strict: bool) -> Result<i32> {
     let checks = probe(pid, cgroup);
-    print!("{}", render(&checks));
-    Ok(verdict(&checks))
+    if extra_strict {
+        print!("{}", render_extra_strict(&checks));
+        Ok(verdict_extra_strict(&checks))
+    } else {
+        print!("{}", render(&checks));
+        Ok(verdict(&checks))
+    }
 }
 
 #[cfg(test)]
@@ -2132,6 +2186,96 @@ mod tests {
             before,
             "doctor left a BPF program, link, or map loaded"
         );
+    }
+
+    // T2 extra-strict (RED): any Warn refuses, even where the default
+    // verdict stays green.
+    #[test]
+    fn extra_strict_refuses_on_any_warn() {
+        let checks = vec![
+            Check {
+                name: "BPF map create".into(),
+                status: Status::Ok("created".into()),
+            },
+            Check {
+                name: "kernel.perf_event_paranoid".into(),
+                status: Status::Warn("4 — needs privilege".into()),
+            },
+        ];
+        assert_eq!(verdict(&checks), 0, "default verdict tolerates warns");
+        assert_eq!(verdict_extra_strict(&checks), 1);
+        let names: Vec<&str> = extra_strict_violations(&checks)
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["kernel.perf_event_paranoid"]);
+    }
+
+    // T2 extra-strict (RED): a Fail outside the gated rows refuses too.
+    #[test]
+    fn extra_strict_refuses_on_fail_outside_gated_rows() {
+        let checks = vec![Check {
+            name: "kernel release".into(),
+            status: Status::Fail("below floor".into()),
+        }];
+        assert_eq!(verdict(&checks), 0, "kernel release is not a gated row");
+        assert_eq!(verdict_extra_strict(&checks), 1);
+        assert_eq!(extra_strict_violations(&checks).len(), 1);
+    }
+
+    // T2 extra-strict (RED): Ok and NotApplicable rows never violate.
+    #[test]
+    fn extra_strict_passes_all_ok_and_not_applicable() {
+        let checks = vec![
+            Check {
+                name: "BPF map create".into(),
+                status: Status::Ok("created".into()),
+            },
+            Check {
+                name: "target readability".into(),
+                status: Status::NotApplicable("no --pid".into()),
+            },
+        ];
+        assert_eq!(verdict_extra_strict(&checks), 0);
+        assert!(extra_strict_violations(&checks).is_empty());
+    }
+
+    // T2 extra-strict (RED): the render names every violating row.
+    #[test]
+    fn extra_strict_render_names_violating_rows() {
+        let checks = vec![
+            Check {
+                name: "BPF map create".into(),
+                status: Status::Fail("EPERM".into()),
+            },
+            Check {
+                name: "loader timing (dlopen)".into(),
+                status: Status::Warn("unproven".into()),
+            },
+        ];
+        let out = render_extra_strict(&checks);
+        assert!(
+            out.contains("extra-strict refusal:"),
+            "refusal line missing: {out:?}"
+        );
+        assert!(out.contains("BPF map create"), "{out:?}");
+        assert!(out.contains("loader timing (dlopen)"), "{out:?}");
+        assert!(out.contains("2 qualification violation"), "{out:?}");
+    }
+
+    // T2 extra-strict (RED): a clean render says so explicitly.
+    #[test]
+    fn extra_strict_render_clean_states_no_violations() {
+        let checks = vec![Check {
+            name: "BPF map create".into(),
+            status: Status::Ok("created".into()),
+        }];
+        let out = render_extra_strict(&checks);
+        assert!(
+            out.contains("extra-strict: no qualification violations"),
+            "{out:?}"
+        );
+        assert!(!out.contains("refusal"), "{out:?}");
     }
 
     // SYSPLAN residual F-59 (RED): render() sanitizes newlines in details so

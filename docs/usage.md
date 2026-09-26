@@ -591,7 +591,9 @@ changing capture behavior, it joins the table above and the `--help` list.
   or when a still-running child is handed back (without `--kill-on-timeout`).
 - `1` — a runtime failure: one line on stderr, never a panic. `run` reports
   the child's nonzero exit code instead. `doctor` exits 1 when any requested
-  lane reports failure; `inspect` exits 1 when the target cannot be read.
+  lane reports failure (`--extra-strict` refuses on any warning or failure
+  in any assessed lane instead); `inspect` exits 1 when the target cannot
+  be read.
 - `2` — a CLI usage error (unknown flag, missing value, mutually exclusive
   options, removed subcommand).
 
@@ -600,6 +602,10 @@ changing capture behavior, it joins the table above and the `--help` list.
 `doctor` reports one finite availability tier for the requested host and
 target. The tier is preflight evidence, not capture authority or a completeness
 promise. With no `--pid`, target readability is explicitly `unassessed`.
+`doctor --extra-strict` is the qualification gate: it refuses (exit 1, with
+an `extra-strict refusal:` line naming every violating row) when any assessed
+lane warns or fails, and states `extra-strict: no qualification violations`
+when the host is fully clean.
 
 | Tier | Proven prefix | Meaning and loss |
 | --- | --- | --- |

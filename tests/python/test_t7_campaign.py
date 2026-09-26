@@ -12,6 +12,52 @@ RUNNER = runpy.run_path(str(ROOT / "scripts/run-t7-static-campaign.py"))
 
 
 class CampaignTests(unittest.TestCase):
+    RELEASE = "OWNED_RELEASED OwnedIds { maps: {11}, programs: {21}, links: {31} }\n"
+
+    def cleanup(self, before, after, *, programs_before=(), programs_after=(), log=RELEASE):
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            for tag, records in (("before", programs_before), ("after", programs_after)):
+                (directory / f"{tag}-prog.stdout").write_text(json.dumps(records))
+            return RUNNER["validate_cleanup"](directory, before, after, log,
+                                               expect_owned=True)
+
+    def test_ambient_device_program_churn_is_recorded_without_hiding_owned_leaks(self):
+        changes = self.cleanup(
+            [("prog", 7)], [("prog", 8)],
+            programs_before=[{"id": 7, "type": "cgroup_device"}],
+            programs_after=[{"id": 8, "type": "cgroup_device"}])
+        self.assertEqual(changes["new_objects"], [("prog", 8)])
+        self.assertEqual(changes["missing_baseline_objects"], [("prog", 7)])
+        self.assertEqual(len(changes["ambient_device_program_changes"]), 2)
+        with self.assertRaisesRegex(ValueError, "owned.*present"):
+            self.cleanup([], [("prog", 21)],
+                         programs_after=[{"id": 21, "type": "cgroup_device"}])
+
+    def test_unknown_program_map_and_link_changes_still_abort(self):
+        for kind in ("prog", "map", "link"):
+            for before, after in (([], [(kind, 7)]), ([(kind, 7)], [])):
+                with self.subTest(kind=kind, before=before), self.assertRaises(ValueError):
+                    self.cleanup(before, after,
+                                 programs_before=[{"id": 7, "type": "kprobe"}],
+                                 programs_after=[{"id": 7, "type": "kprobe"}])
+
+    def test_cgroup_name_cannot_replace_kernel_program_type(self):
+        for program in ({"id": 7, "name": "sd_devices"},
+                        {"id": 7, "name": "sd_devices", "type": "kprobe"}):
+            with self.subTest(program=program), self.assertRaises(ValueError):
+                self.cleanup([], [("prog", 7)], programs_after=[program])
+
+    def test_owned_receipt_must_be_complete_unique_and_absent_from_baseline(self):
+        for receipt in ("", self.RELEASE * 2,
+                        self.RELEASE.replace("{11}", "{11, 11}"),
+                        self.RELEASE.replace("{21}", "{}")):
+            with self.subTest(receipt=receipt), self.assertRaises(ValueError):
+                self.cleanup([], [], log=receipt)
+        with self.assertRaisesRegex(ValueError, "owned.*baseline"):
+            self.cleanup([("map", 11)], [("map", 11)])
+        self.assertEqual(self.cleanup([], [])["ambient_device_program_changes"], [])
+
     def test_ids_in_different_kernel_namespaces_remain_distinct(self):
         with tempfile.TemporaryDirectory() as directory:
             def run(command, **kwargs):

@@ -75,7 +75,13 @@ all five current shared live leases and the Cargo-heavy lease, checks exact
 one-body listings, validates source/binary/embedded-object/oracle/driver
 pins and kernel/BTF, and records typed `(map|prog|link, id)` censuses before
 and after each cell. Enumeration failure aborts with evidence preserved.
-No host BPF object is deleted. A changed census prevents further cells.
+No host BPF object is deleted. Every ID in the unique owned-release receipt
+must be absent from both the baseline and the final census. Any map/link
+change or unexplained program change prevents further cells. Changes whose
+kernel-reported program type is `cgroup_device` are retained separately as
+ambient device-policy changes: none of the pinned T7 objects loads that
+program type. A matching name such as `sd_devices` alone never exempts an
+object, and even that type cannot exempt an ID claimed by the owned receipt.
 The 1800-second test deadline has ten seconds of termination grace; a timeout
 never passes. Failed completed tests retain their evidence and later safe
 cells still run. Each cell and the campaign have durable JSON records.

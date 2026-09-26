@@ -103,6 +103,40 @@ def validate_test_exit(exit_code, log):
         "ok. 1 passed; 0 failed; 0 ignored; 0 measured; "), "test body did not pass")
 
 
+def validate_cleanup(directory, before, after, log, *, expect_owned):
+    """Check exact owned IDs; retain unrelated host device-policy changes."""
+    receipts = re.findall(r"^OWNED_RELEASED OwnedIds \{ maps: \{([^}]*)\}, "
+                          r"programs: \{([^}]*)\}, links: \{([^}]*)\} \}$", log, re.M)
+    require(len(receipts) == (1 if expect_owned else 0), "missing/duplicate owned release receipt")
+    owned = set()
+    for receipt in receipts:
+        for kind, encoded in zip(("map", "prog", "link"), receipt):
+            values = encoded.split(", ")
+            require(all(re.fullmatch(r"[1-9][0-9]*", value) for value in values),
+                    "incomplete owned release receipt")
+            require(len(values) == len(set(values)), "duplicate owned ID")
+            owned.update((kind, int(value)) for value in values)
+    require(not owned.intersection(before), "owned IDs overlap the baseline")
+    require(not owned.intersection(after), "owned IDs remain present after release")
+    changes = {"new_objects": sorted(set(after) - set(before)),
+               "missing_baseline_objects": sorted(set(before) - set(after)),
+               "owned_objects_released": sorted(owned), "ambient_device_program_changes": []}
+    for direction, tag in (("new_objects", "after"), ("missing_baseline_objects", "before")):
+        for kind, identifier in changes[direction]:
+            require(kind == "prog", f"unattributed kernel {kind} change: {identifier}")
+            payload = (directory / f"{tag}-prog.stdout").read_text()
+            parse_census("prog", payload)
+            record = next((row for row in json.loads(payload) if row["id"] == identifier), None)
+            # None of the pinned T7 objects loads a cgroup-device program.
+            # Kernel-reported type, not a program name or an ID range, makes
+            # this unrelated to the owned uprobe/lifecycle objects. All other
+            # program changes and every map/link change remain fatal.
+            require(record is not None and record.get("type") == "cgroup_device",
+                    f"unattributed kernel program change: {identifier}")
+            changes["ambient_device_program_changes"].append({"direction": direction, **record})
+    return changes
+
+
 def validate_inventory_phases(rows, n):
     snapshots = [row for row in rows if row.get("kind") == "usage_phase"]
     require([row.get("phase") for row in snapshots] ==
@@ -232,15 +266,12 @@ def run_campaign(pins_path, output):
                                             check=False, timeout=1830)
                 cell.update({"exit_code": result.returncode, "elapsed_s": time.monotonic() - start})
                 after = take_census(directory, "after")
-                cell["new_objects"] = sorted(set(after) - set(before))
-                cell["missing_baseline_objects"] = sorted(set(before) - set(after))
-                require(not cell["new_objects"] and not cell["missing_baseline_objects"],
-                        "kernel census changed; preserve lane evidence and investigate ownership")
+                log = (directory / "test.log").read_text()
+                cell.update(validate_cleanup(directory, before, after, log, expect_owned=n != 8192))
                 require(result.returncode not in {124, 137, -9, -15},
                         "cell exceeded its deadline or was killed; reconcile owned processes before continuing")
                 verify_pins(pins, pins_path.parent)
                 try:
-                    log = (directory / "test.log").read_text()
                     validate_test_exit(result.returncode, log)
                     cell["behavior"] = verify_cell_evidence(evidence, index, profile, n, log, pins)
                     cell["outcome"] = "PASS"

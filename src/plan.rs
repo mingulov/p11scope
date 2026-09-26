@@ -2270,7 +2270,7 @@ fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
                 name_authorized: authorized,
                 table: Some(index),
                 aliases: if score.exports && entry.object == exports.object {
-                    exports.aliases_at(entry.name, entry.file_offset).collect()
+                    exports.aliases_at(entry.name, entry.file_offset)
                 } else {
                     Vec::new()
                 },

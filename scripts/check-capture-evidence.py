@@ -2511,7 +2511,9 @@ def self_test():
         mode="metrics",
         privacy="aggregate-only",
     )
-    clean["functions"] = function_items([(["unknown"], 2)])
+    clean["functions"] = function_items(
+        [(["C_GetFunctionList"], 1), (["C_Initialize"], 1)]
+    )
     validate_clean_metrics(clean, {"C_Initialize": 1})
     historical = document_fixture(
         clean_evidence,
@@ -2554,15 +2556,22 @@ def self_test():
     bad["functions"] += function_items([(["unknown"], 1)])
     rejected(lambda: validate_clean_metrics(bad, {"C_Initialize": 1}))
     print("unexpected positive function rejected: OK")
-    # A scan-only slot carrying an ordinal label is a mislabel, not evidence.
-    bad = copy.deepcopy(clean)
-    bad["functions"] = function_items([(["unknown"], 1), (["C_Initialize"], 1)])
-    rejected(lambda: validate_clean_metrics(bad, {"C_Initialize": 1}))
-    print("scan-only ordinal label rejected: OK")
+    # GT-2: SoftHSM2's scan table is export-linked, so a withheld name, a
+    # heuristic linkage or a partial agreement is a regression, not evidence.
+    for mutate in (
+        lambda d: d["functions"][0].update(names=["unknown"]),
+        lambda d: d["evidence"]["discovery"][0]["tables"][0].update(linkage="heuristic"),
+        lambda d: d["evidence"]["discovery"][0]["tables"][0].update(exports_agreeing=67),
+        lambda d: d["evidence"]["discovery"][0]["tables"][0].update(exports_agreeing=None),
+    ):
+        bad = copy.deepcopy(clean)
+        mutate(bad)
+        rejected(lambda bad=bad: validate_clean_metrics(bad, {"C_Initialize": 1}))
+    print("scan-only SoftHSM2 names are export-linked and exact: OK")
     bad = copy.deepcopy(clean)
     bad["functions"][0]["calls"] = 3
     rejected(lambda: validate_clean_metrics(bad, {"C_Initialize": 1}))
-    print("scan-only total exact count required: OK")
+    print("scan-only per-name exact count required: OK")
     doubled = copy.deepcopy(clean)
     for item in doubled["functions"]:
         item["calls"] *= 2
@@ -2899,8 +2908,9 @@ def self_test():
         discovery_uncorroborated_candidates=PROXY_SPILL,
         skipped=[],
     )
+    soft_names = [[f"C_Fixture{index:02d}"] for index in range(68)]
     proxy["functions"] = function_items(
-        [(["unknown"], 1)] + [(["unknown"], 0)] * 67
+        [(soft_names[0], 1)] + [(names, 0) for names in soft_names[1:]]
     ) + function_items(
         [(["unknown"], 1)] + [(["unknown"], 0)] * (PROXY_ADMITTED_SLOTS - 1),
         identity=proxy_id,
@@ -2948,8 +2958,14 @@ def self_test():
         lambda d: d["evidence"]["surfaces"].pop(),
         # A surface neither module owns is a gap, never an allowance.
         lambda d: d["evidence"]["surfaces"][-1].update(source="/usr/lib/other.so table 3.2"),
-        # A labeled slot in a scan-only capture is a mislabel, not evidence.
-        lambda d: d["functions"][0].update(names=["C_Initialize"]),
+        # A labeled slot in a heuristic proxy table is a mislabel, not
+        # evidence; an unnamed or duplicated SoftHSM2 slot is a GT-2
+        # regression, as is its table losing export linkage.
+        lambda d: d["functions"][68].update(names=["C_Initialize"]),
+        lambda d: d["functions"][0].update(names=["unknown"]),
+        lambda d: d["functions"][1].update(names=list(d["functions"][0]["names"])),
+        lambda d: d["evidence"]["discovery"][0]["tables"][0].update(linkage="heuristic"),
+        lambda d: d["evidence"]["discovery"][0]["tables"][0].update(exports_agreeing=0),
         # A proxy slot reattributed to SoftHSM2 breaks the per-module split.
         lambda d: d["functions"][68].update(module=dict(soft_id)),
         # A target both providers publish is attached once: two probes per

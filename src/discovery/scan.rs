@@ -1731,8 +1731,9 @@ pub(crate) struct ObjectExports<'a> {
     pub(crate) symbols: &'a [(String, u64)],
 }
 
-impl ObjectExports<'_> {
+impl<'a> ObjectExports<'a> {
     /// No witness: every table scores exactly as before export linkage.
+    #[cfg(test)]
     pub(crate) const NONE: ObjectExports<'static> = ObjectExports {
         object: ObjectKey {
             device: Device { major: 0, minor: 0 },
@@ -1751,15 +1752,13 @@ impl ObjectExports<'_> {
     }
 
     /// Standard names defined at `offset` in this object, other than `name`.
-    pub(crate) fn aliases_at<'b>(
-        &'b self,
-        name: &'b str,
-        offset: u64,
-    ) -> impl Iterator<Item = &'b str> + 'b {
-        self.symbols
+    pub(crate) fn aliases_at(&self, name: &str, offset: u64) -> Vec<&'a str> {
+        let symbols: &'a [(String, u64)] = self.symbols;
+        symbols
             .iter()
-            .filter(move |(symbol, at)| *at == offset && symbol != name)
+            .filter(|(symbol, at)| *at == offset && symbol != name)
             .map(|(symbol, _)| symbol.as_str())
+            .collect()
     }
 }
 

@@ -31,7 +31,7 @@ use crate::discovery::scan::{
     CaptureWorkBudget, IO_CEILING_REASON, InspectedFileKey, ScannedModule, Skipped, read_mountinfo,
 };
 use crate::manifest_input::{MAX_TOTAL_OBJECT_BYTES, validate_structure};
-use crate::process::{MountNamespaceId, ProcessView, ProcessViewId};
+use crate::process::{MountNamespaceId, MountTableCache, ProcessView, ProcessViewId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Pin {
@@ -958,12 +958,22 @@ fn identity_of_in_mountinfo(
 /// view checks as the first read. The retry is purely opportunistic: success
 /// returns the key, while persistent absence — or a failed re-read — returns
 /// today's error text unchanged. No other error retries.
+#[cfg(test)]
 fn identity_of_in_mountinfo_with_reread(
     file: &std::fs::File,
     mountinfo: &str,
     reread: impl FnOnce() -> Result<String, String>,
 ) -> Result<MappingFileKey, String> {
-    match identity_of_in_mountinfo(file, mountinfo) {
+    reread_on_missing_mount(identity_of_in_mountinfo(file, mountinfo), file, reread)
+}
+
+/// The retry half of the rule above, given the first resolution's result.
+fn reread_on_missing_mount(
+    first: Result<MappingFileKey, String>,
+    file: &std::fs::File,
+    reread: impl FnOnce() -> Result<String, String>,
+) -> Result<MappingFileKey, String> {
+    match first {
         Err(error) if is_missing_mount_id_error(&error) => match reread() {
             Ok(fresh) => identity_of_in_mountinfo(file, &fresh),
             Err(_) => Err(error),
@@ -983,11 +993,21 @@ pub fn open_view_object(
     path: &Path,
     budget: &mut CaptureWorkBudget,
 ) -> Result<(std::fs::File, ObjectKey), String> {
-    let (file, mountinfo) = view.open_then_mountinfo(|| open_regular(path), budget)?;
-    let key = object_key(identity_of_in_mountinfo_with_reread(
-        &file,
-        &mountinfo,
-        || Ok(view.open_then_mountinfo(|| Ok(()), budget)?.1),
+    open_view_object_cached(view, path, &mut MountTableCache::default(), budget)
+}
+
+/// [`open_view_object`] over a mount table `mounts` reads once per view.
+pub(crate) fn open_view_object_cached(
+    view: &ProcessView,
+    path: &Path,
+    mounts: &mut MountTableCache,
+    budget: &mut CaptureWorkBudget,
+) -> Result<(std::fs::File, ObjectKey), String> {
+    let (file, mountinfo) =
+        view.open_then_cached_mountinfo(|| open_regular(path), mounts, budget)?;
+    let first = identity_of_in_mountinfo(&file, mountinfo);
+    let key = object_key(identity_in_cached_table(
+        view, &file, first, mounts, budget,
     )?);
     Ok((file, key))
 }
@@ -1000,6 +1020,33 @@ pub fn view_object_key(
     Ok(open_view_object(view, path, budget)?.1)
 }
 
+pub(crate) fn view_object_key_cached(
+    view: &ProcessView,
+    path: &Path,
+    mounts: &mut MountTableCache,
+    budget: &mut CaptureWorkBudget,
+) -> Result<ObjectKey, String> {
+    Ok(open_view_object_cached(view, path, mounts, budget)?.1)
+}
+
+/// The cached-table form of the rule above: a missing mount row still forces
+/// exactly one fresh read of the table, under the same retained view checks.
+fn identity_in_cached_table(
+    view: &ProcessView,
+    file: &std::fs::File,
+    first: Result<MappingFileKey, String>,
+    mounts: &mut MountTableCache,
+    budget: &mut CaptureWorkBudget,
+) -> Result<MappingFileKey, String> {
+    reread_on_missing_mount(first, file, || {
+        mounts.invalidate();
+        Ok(view
+            .open_then_cached_mountinfo(|| Ok(()), mounts, budget)?
+            .1
+            .to_owned())
+    })
+}
+
 /// The same identity for a descriptor already retained across a pre-exec
 /// barrier, which must not be reopened by path.
 pub fn retained_object_key(
@@ -1007,11 +1054,20 @@ pub fn retained_object_key(
     file: &std::fs::File,
     budget: &mut CaptureWorkBudget,
 ) -> Result<ObjectKey, String> {
-    let ((), mountinfo) = view.open_then_mountinfo(|| Ok(()), budget)?;
-    Ok(object_key(identity_of_in_mountinfo_with_reread(
-        file,
-        &mountinfo,
-        || Ok(view.open_then_mountinfo(|| Ok(()), budget)?.1),
+    retained_object_key_cached(view, file, &mut MountTableCache::default(), budget)
+}
+
+/// [`retained_object_key`] over a mount table `mounts` reads once per view.
+pub(crate) fn retained_object_key_cached(
+    view: &ProcessView,
+    file: &std::fs::File,
+    mounts: &mut MountTableCache,
+    budget: &mut CaptureWorkBudget,
+) -> Result<ObjectKey, String> {
+    let ((), mountinfo) = view.open_then_cached_mountinfo(|| Ok(()), mounts, budget)?;
+    let first = identity_of_in_mountinfo(file, mountinfo);
+    Ok(object_key(identity_in_cached_table(
+        view, file, first, mounts, budget,
     )?))
 }
 
@@ -1531,12 +1587,14 @@ pub fn pin_scanned_view_objects(
         }
         return Ok((pinned, skipped));
     }
+    // One mount-table read serves every object pinned here (H-3).
+    let mut mounts = MountTableCache::default();
     for raw in wanted {
         // Opening through /proc/<pid>/root is a per-pid action (spec §4.5).
         if !view.still_the_same() {
             return Err(exited());
         }
-        let candidate = pin_scanned_object(view, raw.clone(), budget);
+        let candidate = pin_scanned_object(view, raw.clone(), &mut mounts, budget);
         record_scanned_candidate(&mut pinned, view.id(), raw, candidate, &mut skipped);
     }
     if !view.still_the_same() {
@@ -1714,16 +1772,17 @@ pub fn reconcile_scanned_modules(
 fn pin_scanned_object(
     view: &ProcessView,
     raw: RawObjectInstance,
+    mounts: &mut MountTableCache,
     budget: &mut CaptureWorkBudget,
 ) -> Result<Entry, String> {
     // The target's own filesystem view: a container's object is never copied out.
-    let (file, mountinfo) = view.open_then_mountinfo(
+    let (file, mountinfo) = view.open_then_cached_mountinfo(
         || open_object(Path::new(&format!("/proc/{}/root{}", view.pid(), raw.path))),
+        mounts,
         budget,
     )?;
-    let found = identity_of_in_mountinfo_with_reread(&file, &mountinfo, || {
-        Ok(view.open_then_mountinfo(|| Ok(()), budget)?.1)
-    })?;
+    let first = identity_of_in_mountinfo(&file, mountinfo);
+    let found = identity_in_cached_table(view, &file, first, mounts, budget)?;
     if object_key(found) != raw.key {
         return Err(format!(
             "identity_mismatch: the mapping is {:?} but {} now opens as {:?} \
@@ -1956,6 +2015,58 @@ mod tests {
             .find(|entry| entry.raw.key == key)
             .expect("fixture pin");
         entry.abi = abi;
+    }
+
+    /// H-3: one cache reads a view's mount table once and serves every later
+    /// identity from it, giving the same keys as a fresh read each time. A
+    /// table the kernel reports changed is read again; another view reads its
+    /// own.
+    #[test]
+    fn a_cached_mount_table_is_read_once_and_again_after_a_change() {
+        let witness = crate::process::MountChangeWitness::new();
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let files: Vec<_> = ["/proc/self/exe", "/bin/sh", "/proc/self/status"]
+            .iter()
+            .map(|path| std::fs::File::open(path).unwrap())
+            .collect();
+        let mut budget = CaptureWorkBudget::default();
+        let fresh: Vec<_> = files
+            .iter()
+            .map(|file| retained_object_key(&view, file, &mut budget).unwrap())
+            .collect();
+
+        let mut unchanged = MountTableCache::default();
+        let before = crate::process::mountinfo_reads_for_test();
+        let cached: Vec<_> = files
+            .iter()
+            .map(|file| {
+                retained_object_key_cached(&view, file, &mut unchanged, &mut budget).unwrap()
+            })
+            .collect();
+        assert_eq!(cached, fresh);
+        let unchanged_reads = crate::process::mountinfo_reads_for_test() - before;
+
+        let mut changing = MountTableCache::with_change_detector_for_test(|_| true);
+        let before = crate::process::mountinfo_reads_for_test();
+        for (file, key) in files.iter().zip(&fresh) {
+            assert_eq!(
+                retained_object_key_cached(&view, file, &mut changing, &mut budget).unwrap(),
+                *key
+            );
+        }
+        assert_eq!(crate::process::mountinfo_reads_for_test() - before, 3);
+
+        let other = ProcessView::open(ProcessViewId(1), std::process::id()).unwrap();
+        let before = crate::process::mountinfo_reads_for_test();
+        retained_object_key_cached(&other, &files[0], &mut unchanged, &mut budget).unwrap();
+        retained_object_key_cached(&other, &files[1], &mut unchanged, &mut budget).unwrap();
+        let other_reads = crate::process::mountinfo_reads_for_test() - before;
+        // A mount change elsewhere on the host must be read again; only an
+        // unchanged table has to be read exactly once per view.
+        if !witness.changed() {
+            assert_eq!(unchanged_reads, 1, "one read serves every identity");
+            assert_eq!(other_reads, 1, "another view reads its own table, once");
+        }
     }
 
     #[test]

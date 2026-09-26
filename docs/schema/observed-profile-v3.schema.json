@@ -172,7 +172,7 @@
         "scheduling": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["drain_repolls", "drain_budget_exhaustions", "capture_event_loss", "detach_event_loss", "capture_discovery_loss", "detach_discovery_loss", "terminal_drain_bound", "terminal_drain_truncated", "sink_policy", "sink_stall_ms", "sink_timeouts", "sink_dropped_bytes", "max_inter_drain_gap_ms", "phase_ms"],
+          "required": ["drain_repolls", "drain_budget_exhaustions", "capture_event_loss", "detach_event_loss", "capture_discovery_loss", "detach_discovery_loss", "terminal_drain_bound", "terminal_drain_truncated", "sink_policy", "sink_stall_ms", "sink_timeouts", "sink_dropped_bytes", "max_inter_drain_gap_ms", "phase_ms", "phase_mono_ns"],
           "properties": {
             "drain_repolls": {"type": "integer", "minimum": 0},
             "drain_budget_exhaustions": {"type": "integer", "minimum": 0},
@@ -198,6 +198,17 @@
                 "maps": {"type": "integer", "minimum": 0},
                 "render": {"type": "integer", "minimum": 0},
                 "detach": {"type": "integer", "minimum": 0, "description": "Wall time of producer-detach work completed before publication, in whole milliseconds. The terminal callback publishes before the producers detach (quiesce-then-publish, so the report never waits on link teardown), so Detailed reports carry 0 here: post-publication teardown is explicitly unmeasured in the report, by design."}
+              }
+            },
+            "phase_mono_ns": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["attach_mono_ns", "loop_start_mono_ns", "loop_end_mono_ns", "loop_end_reason"],
+              "properties": {
+                "attach_mono_ns": {"type": ["integer", "null"], "minimum": 0, "description": "Authoritative CLOCK_MONOTONIC reading when the session became fully attached, or null when the capture never reached its loop."},
+                "loop_start_mono_ns": {"type": ["integer", "null"], "minimum": 0, "description": "Authoritative CLOCK_MONOTONIC reading at the first capture-loop tick, or null when the loop never started."},
+                "loop_end_mono_ns": {"type": ["integer", "null"], "minimum": 0, "description": "Authoritative CLOCK_MONOTONIC reading when the capture loop ended, or null when the loop never ended."},
+                "loop_end_reason": {"enum": ["expiry", "operator_stop", "target_exit", "limit_reached", "error", "unstarted"]}
               }
             }
           }

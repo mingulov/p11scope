@@ -105,9 +105,16 @@ SCHEDULING_U64_KEYS = (
 )
 SCHEDULING_KEYS = set(SCHEDULING_U64_KEYS) | {
     "terminal_drain_truncated", "sink_policy", "phase_ms",
+    "phase_mono_ns",
 }
 SCHEDULING_PHASE_KEYS = ("discovery", "discovery_terminal", "drain",
                            "maps", "render", "detach")
+# Authoritative observer phase stamps (T2, G-14): CLOCK_MONOTONIC ns or
+# null when the phase was never reached, plus a closed loop-end reason.
+SCHEDULING_PHASE_TS_KEYS = ("attach_mono_ns", "loop_start_mono_ns",
+                            "loop_end_mono_ns", "loop_end_reason")
+SCHEDULING_LOOP_END_REASONS = {"expiry", "operator_stop", "target_exit",
+                               "limit_reached", "error", "unstarted"}
 PAUSE_VALUES = ("none", "sigstop", "partial")
 PAUSE_COUNTERS = ("pause_attempts", "pause_confirmed", "pause_partial")
 DISCOVERY_LOSS_COUNTERS = (
@@ -749,6 +756,39 @@ def exact_scheduling_evidence(evidence):
     )
     for name in SCHEDULING_PHASE_KEYS:
         require(u64(phases[name]), f"scheduling.phase_ms.{name}: invalid counter {phases[name]!r}")
+    stamps = scheduling["phase_mono_ns"]
+    require(isinstance(stamps, dict), "scheduling.phase_mono_ns must be an object")
+    require(
+        set(stamps) == set(SCHEDULING_PHASE_TS_KEYS),
+        f"unexpected phase_mono_ns keys: {sorted(stamps)}",
+    )
+    for name in SCHEDULING_PHASE_TS_KEYS[:3]:
+        value = stamps[name]
+        require(
+            value is None or u64(value),
+            f"scheduling.phase_mono_ns.{name}: invalid stamp {value!r}",
+        )
+    require(
+        stamps["loop_end_reason"] in SCHEDULING_LOOP_END_REASONS,
+        f"scheduling.phase_mono_ns.loop_end_reason: invalid reason "
+        f"{stamps['loop_end_reason']!r}",
+    )
+    # Identities: present stamps are nondecreasing (attach, then loop
+    # start, then loop end), and the reason agrees with whether the loop
+    # ended — an ended loop never reports "unstarted" and vice versa.
+    present = [stamps[name] for name in SCHEDULING_PHASE_TS_KEYS[:3]
+               if stamps[name] is not None]
+    require(
+        present == sorted(present),
+        f"scheduling.phase_mono_ns: stamps out of order "
+        f"{[stamps[name] for name in SCHEDULING_PHASE_TS_KEYS[:3]]!r}",
+    )
+    require(
+        (stamps["loop_end_mono_ns"] is None)
+        == (stamps["loop_end_reason"] == "unstarted"),
+        f"scheduling.phase_mono_ns: loop_end {stamps['loop_end_mono_ns']!r} "
+        f"disagrees with reason {stamps['loop_end_reason']!r}",
+    )
     event_split = scheduling["capture_event_loss"] + scheduling["detach_event_loss"]
     require(
         event_split == evidence["event_loss"],
@@ -2321,6 +2361,12 @@ def scheduling_fixture(**overrides):
     fixture["terminal_drain_truncated"] = False
     fixture["sink_policy"] = SCHEDULING_SINK_POLICY
     fixture["phase_ms"] = {name: 0 for name in SCHEDULING_PHASE_KEYS}
+    fixture["phase_mono_ns"] = {
+        "attach_mono_ns": None,
+        "loop_start_mono_ns": None,
+        "loop_end_mono_ns": None,
+        "loop_end_reason": "unstarted",
+    }
     for name, value in overrides.items():
         require(
             name in SCHEDULING_KEYS,
@@ -4067,9 +4113,32 @@ def self_test():
         drain_repolls=3, sink_dropped_bytes=0,
     )
     exact_scheduling_evidence(scheduled["evidence"])
+    # A fully stamped run passes: ordered stamps plus a matching reason.
+    stamped = copy.deepcopy(scheduled)
+    stamped["evidence"]["scheduling"]["phase_mono_ns"] = {
+        "attach_mono_ns": 100, "loop_start_mono_ns": 200,
+        "loop_end_mono_ns": 300, "loop_end_reason": "expiry",
+    }
+    exact_scheduling_evidence(stamped["evidence"])
     for mutate in (
         lambda d: d["evidence"].pop("scheduling"),
         lambda d: d["evidence"]["scheduling"].pop("sink_policy"),
+        lambda d: d["evidence"]["scheduling"].pop("phase_mono_ns"),
+        lambda d: d["evidence"]["scheduling"]["phase_mono_ns"].pop(
+            "loop_end_reason"),
+        lambda d: d["evidence"]["scheduling"]["phase_mono_ns"].update(
+            loop_end_reason="timeout"),
+        lambda d: d["evidence"]["scheduling"]["phase_mono_ns"].update(
+            attach_mono_ns=-1),
+        lambda d: d["evidence"]["scheduling"]["phase_mono_ns"].update(
+            attach_mono_ns=True),
+        lambda d: d["evidence"]["scheduling"]["phase_mono_ns"].update(
+            attach_mono_ns=300, loop_start_mono_ns=200,
+            loop_end_mono_ns=400, loop_end_reason="expiry"),
+        lambda d: d["evidence"]["scheduling"]["phase_mono_ns"].update(
+            loop_end_mono_ns=300, loop_end_reason="unstarted"),
+        lambda d: d["evidence"]["scheduling"]["phase_mono_ns"].update(
+            loop_end_reason="expiry"),
         lambda d: d["evidence"]["scheduling"].update(sink_policy="drop-all"),
         lambda d: d["evidence"]["scheduling"].update(drain_repolls=-1),
         lambda d: d["evidence"]["scheduling"].update(drain_repolls=True),

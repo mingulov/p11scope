@@ -829,6 +829,47 @@ def assess_owned_coverage(functions, discovery, refused, owned_paths,
             "total_calls": total_calls, "note": note}
 
 
+def _observer_phase_ts(phase_mono_ns):
+    """Validated authoritative stamps or None.
+
+    Returns the (attach, loop_start, loop_end, reason) tuple when the
+    observer's own phase stamps are well-formed, else None. Fail-closed:
+    any malformed shape keeps the FD estimates. Partial stamps (phases
+    the loop has not reached yet) are valid: present values must simply
+    be nondecreasing.
+    """
+    if not isinstance(phase_mono_ns, dict):
+        return None
+    attach = phase_mono_ns.get("attach_mono_ns")
+    start = phase_mono_ns.get("loop_start_mono_ns")
+    end = phase_mono_ns.get("loop_end_mono_ns")
+    reason = phase_mono_ns.get("loop_end_reason")
+    for value in (attach, start, end):
+        if value is None:
+            continue
+        if (not isinstance(value, int) or isinstance(value, bool)
+                or value < 0):
+            return None
+    present = [value for value in (attach, start, end)
+               if value is not None]
+    if present != sorted(present):
+        return None
+    if reason is not None and not isinstance(reason, str):
+        return None
+    return (attach, start, end, reason)
+
+
+# Observer loop-end reasons mapped onto the phases reason vocabulary.
+# The verbatim observer label is always kept in loop_end_reason_observer.
+_OBSERVER_REASON_MAP = {
+    "expiry": "expiry",
+    "operator_stop": "cancel",
+    "target_exit": "target-exit",
+    "limit_reached": "limit",
+    "error": "error",
+}
+
+
 def _observer_phase_s(phase_ms, key):
     """In-observer phase timer as seconds, or None when absent/unusable."""
     if not isinstance(phase_ms, dict):
@@ -984,8 +1025,8 @@ def owned_pid_target_causal(condition, mapped_generation):
 
 
 def derive_phases(samples, stderr_rows, duration_s, t_spawn_ns, t_exit_ns,
-                  t_go_ns=None, phase_ms=None, burst_go_ns=None,
-                  burst_end_ns=None, gate=None,
+                  t_go_ns=None, phase_ms=None, phase_mono_ns=None,
+                  burst_go_ns=None, burst_end_ns=None, gate=None,
                   owned_target_exit_causal=False):
     """Split wall time into phases from external traces.
 
@@ -1024,6 +1065,12 @@ def derive_phases(samples, stderr_rows, duration_s, t_spawn_ns, t_exit_ns,
       (audit F9). The in-observer detach timer is authoritative in that
       case; an estimated 0.0 without one is unconfirmed, never proof of
       instant teardown.
+    `phase_mono_ns`: the observer's own phase stamps
+      (evidence.scheduling.phase_mono_ns), when the report carries them.
+      On legacy gates a validated triple replaces the FD attach estimate,
+      the attach+duration expiry, and the marker-or-expiry loop end; the
+      FD estimates stay published beside them. Frame gates keep their
+      boundary discipline and only record the stamps.
     """
     method_warnings = []
     t_discovery = None
@@ -1075,6 +1122,7 @@ def derive_phases(samples, stderr_rows, duration_s, t_spawn_ns, t_exit_ns,
         "t_gate_release_mono_ns": t_go_ns if gate == "frame" else None,
         "t_discovery_mono_ns": t_discovery,
         "t_attached_mono_ns": None,
+        "t_loop_start_mono_ns": None,
         "t_expiry_mono_ns": None,
         "t_attached_fd_estimate_mono_ns": None,
         "t_expiry_fd_estimate_mono_ns": None,
@@ -1083,6 +1131,8 @@ def derive_phases(samples, stderr_rows, duration_s, t_spawn_ns, t_exit_ns,
         "t_loop_end_observed_mono_ns": None,
         "t_loop_end_mono_ns": None,
         "loop_end_reason": "expiry",
+        "loop_end_source": None,
+        "loop_end_reason_observer": None,
         "t_detach_start_mono_ns": None,
         "t_detach_end_mono_ns": None,
         "burst_go_mono_ns": burst_go_ns,
@@ -1102,6 +1152,36 @@ def derive_phases(samples, stderr_rows, duration_s, t_spawn_ns, t_exit_ns,
     else:
         phases["attach_boundary_source"] = "fd_95pct_estimate"
         phases["capture_boundary_source"] = "fd_estimate_plus_duration"
+    auth = _observer_phase_ts(phase_mono_ns)
+    if auth is not None:
+        # Sample-independent observer facts, recorded on every path
+        # (including the no-sample early returns below).
+        phases["t_loop_start_mono_ns"] = auth[1]
+        phases["loop_end_reason_observer"] = auth[3]
+
+    def apply_authoritative_facts():
+        """Observer-owned boundary facts (T2, G-14).
+
+        For the degenerate fd-trace paths that return before the main
+        estimator: no derived durations, but the observer's own facts
+        are published, never dropped. Frame gates keep their boundary
+        discipline and record nothing here.
+        """
+        if auth is None or is_frame_gate:
+            return
+        attach_ns, _, end_ns, reason = auth
+        if attach_ns is not None:
+            phases["t_attached_mono_ns"] = attach_ns
+            phases["attach_boundary_source"] = "observer_authoritative"
+        if end_ns is not None:
+            phases["t_loop_end_mono_ns"] = end_ns
+            phases["loop_end_source"] = "observer_authoritative"
+            if isinstance(reason, str):
+                phases["loop_end_reason"] = _OBSERVER_REASON_MAP.get(
+                    reason, reason)
+            if reason == "expiry":
+                phases["t_expiry_mono_ns"] = end_ns
+                phases["capture_boundary_source"] = "observer_authoritative"
 
     def classify_frame_burst():
         if burst_go_ns is None or burst_end_ns is None:
@@ -1173,6 +1253,7 @@ def derive_phases(samples, stderr_rows, duration_s, t_spawn_ns, t_exit_ns,
         classify_frame_burst()
     if not samples:
         method_warnings.append("no sampler rows; only wall time is known")
+        apply_authoritative_facts()
         return phases, discovery_line
     samples = sorted(samples, key=lambda row: int(row["t_mono_ns"]))
     fds = [int(row["fds"]) for row in samples]
@@ -1185,6 +1266,7 @@ def derive_phases(samples, stderr_rows, duration_s, t_spawn_ns, t_exit_ns,
         method_warnings.append(
             "no attach ramp visible in fd trace (<=10 fds above baseline); "
             "attach/detach phases unknown")
+        apply_authoritative_facts()
         return phases, discovery_line
     hi = 0.95 * run_max
     attach_idx = next(i for i, value in enumerate(fds) if value >= hi)
@@ -1200,6 +1282,21 @@ def derive_phases(samples, stderr_rows, duration_s, t_spawn_ns, t_exit_ns,
         phases["t_attached_mono_ns"] = t_attached
         phases["t_expiry_mono_ns"] = t_expiry
         phases["attach_s"] = phases["attach_fd_estimate_s"]
+        if auth is not None and auth[0] is not None:
+            # Authoritative attach replaces the FD estimate (T2, G-14);
+            # the estimate stays published beside it for comparison.
+            t_attached = auth[0]
+            t_expiry = t_attached + int(duration_s * 1e9)
+            phases["t_attached_mono_ns"] = t_attached
+            phases["t_expiry_mono_ns"] = t_expiry
+            phases["attach_boundary_source"] = "observer_authoritative"
+            if t_discovery is not None:
+                phases["attach_s"] = max(
+                    0.0, (t_attached - t_discovery) / 1e9)
+        if auth is not None and auth[2] is not None and auth[3] == "expiry":
+            t_expiry = auth[2]
+            phases["t_expiry_mono_ns"] = t_expiry
+            phases["capture_boundary_source"] = "observer_authoritative"
     if t_loop_markers:
         t_loop_end, loop_end_reason = min(t_loop_markers)
     else:
@@ -1211,12 +1308,29 @@ def derive_phases(samples, stderr_rows, duration_s, t_spawn_ns, t_exit_ns,
             loop_end_reason = "fd-estimated-expiry"
     else:
         phases["t_loop_end_mono_ns"] = t_loop_end
+        phases["loop_end_source"] = "external_markers_or_expiry"
     phases["loop_end_reason"] = loop_end_reason
+    authoritative_end = (not is_frame_gate and auth is not None
+                         and auth[2] is not None)
+    if authoritative_end:
+        if t_loop_markers and abs(t_loop_end - auth[2]) > 1_000_000_000:
+            method_warnings.append(
+                "externally observed loop end disagrees with the "
+                f"authoritative observer stamp by "
+                f"{abs(t_loop_end - auth[2]) / 1e9:.2f}s; using the "
+                "observer value")
+        t_loop_end = auth[2]
+        phases["t_loop_end_mono_ns"] = t_loop_end
+        phases["loop_end_source"] = "observer_authoritative"
+        if isinstance(auth[3], str):
+            phases["loop_end_reason"] = _OBSERVER_REASON_MAP.get(
+                auth[3], auth[3])
     if t_loop_markers and t_loop_end < t_attached:
         method_warnings.append(
             "loop-end marker precedes estimated attach (coarse fd sampling "
             "dated attach late); measured window unknown")
-    elif not t_loop_markers and t_exit_ns < t_expiry:
+    elif (not t_loop_markers and t_exit_ns < t_expiry
+            and not authoritative_end):
         method_warnings.append(
             f"capture_measured unknown: observer exited "
             f"{(t_expiry - t_exit_ns) / 1e9:.2f}s before estimated expiry "
@@ -1595,6 +1709,8 @@ def main(argv):
     scheduling_timers = evidence.get("scheduling")
     observer_phase_ms = (scheduling_timers.get("phase_ms")
                          if isinstance(scheduling_timers, dict) else None)
+    observer_phase_ts = (scheduling_timers.get("phase_mono_ns")
+                         if isinstance(scheduling_timers, dict) else None)
     phases, discovery_line = derive_phases(
         samples, stderr_rows,
         float(meta["condition"]["duration_s"]),
@@ -1602,6 +1718,7 @@ def main(argv):
         int(meta["timing"]["t_exit_mono_ns"]),
         int(meta["timing"]["t_go_mono_ns"]),
         phase_ms=observer_phase_ms,
+        phase_mono_ns=observer_phase_ts,
         burst_go_ns=burst_go_ns, burst_end_ns=burst_end_ns,
         gate=meta["condition"].get("gate"),
         owned_target_exit_causal=owned_pid_target_causal(

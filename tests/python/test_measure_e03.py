@@ -578,6 +578,163 @@ class EarlyExitTests(unittest.TestCase):
                         phases["method_warnings"])
 
 
+class AuthoritativePhaseTests(unittest.TestCase):
+    def test_authoritative_attach_replaces_fd_estimate(self):
+        # FD ramp says attach at 4 s; the observer's own stamp says 2 s.
+        # The stamp wins, the estimate stays published beside it.
+        rows = [{"t_mono_ns": 1_000_000_000, "line": COMPLETION}]
+        phases, _ = MEASURE["derive_phases"](
+            ramp_samples(attach_s=4, end_s=15), rows, 8.0, 0,
+            15_000_000_000, 4_500_000_000,
+            phase_mono_ns={"attach_mono_ns": 2_000_000_000,
+                           "loop_start_mono_ns": 2_500_000_000,
+                           "loop_end_mono_ns": 10_000_000_000,
+                           "loop_end_reason": "expiry"})
+        self.assertEqual(phases["t_attached_mono_ns"], 2_000_000_000)
+        self.assertEqual(phases["t_attached_fd_estimate_mono_ns"],
+                         4_000_000_000)
+        self.assertEqual(phases["attach_boundary_source"],
+                         "observer_authoritative")
+        self.assertEqual(phases["t_loop_start_mono_ns"], 2_500_000_000)
+        self.assertAlmostEqual(phases["attach_s"], 1.0)
+        self.assertAlmostEqual(phases["attach_fd_estimate_s"], 3.0)
+
+    def test_authoritative_expiry_sets_exact_window(self):
+        # No markers: without stamps the window is attach+duration by
+        # assumption; the observer's expiry stamp makes it exact.
+        phases, _ = MEASURE["derive_phases"](
+            ramp_samples(attach_s=4, end_s=15), [], 8.0, 0,
+            15_000_000_000, 4_500_000_000,
+            phase_mono_ns={"attach_mono_ns": 2_000_000_000,
+                           "loop_start_mono_ns": 2_500_000_000,
+                           "loop_end_mono_ns": 10_000_000_000,
+                           "loop_end_reason": "expiry"})
+        self.assertEqual(phases["t_expiry_mono_ns"], 10_000_000_000)
+        self.assertEqual(phases["capture_boundary_source"],
+                         "observer_authoritative")
+        self.assertEqual(phases["t_loop_end_mono_ns"], 10_000_000_000)
+        self.assertEqual(phases["loop_end_source"], "observer_authoritative")
+        self.assertEqual(phases["loop_end_reason"], "expiry")
+        self.assertEqual(phases["loop_end_reason_observer"], "expiry")
+        self.assertAlmostEqual(phases["capture_measured_s"], 8.0)
+
+    def test_authoritative_target_exit_beats_unknown_early_exit(self):
+        # Same shape as EarlyExitTests' unknown case, but the observer
+        # names its own ending: exact window, no unknown.
+        phases, _ = MEASURE["derive_phases"](
+            ramp_samples(attach_s=1, end_s=4, detach_s=3.5), [], 8.0, 0,
+            4_000_000_000, 1_500_000_000,
+            burst_go_ns=1_500_000_000, burst_end_ns=2_500_000_000,
+            phase_mono_ns={"attach_mono_ns": 1_000_000_000,
+                           "loop_start_mono_ns": 1_200_000_000,
+                           "loop_end_mono_ns": 3_000_000_000,
+                           "loop_end_reason": "target_exit"})
+        self.assertEqual(phases["t_loop_end_mono_ns"], 3_000_000_000)
+        self.assertEqual(phases["loop_end_reason"], "target-exit")
+        self.assertEqual(phases["loop_end_reason_observer"], "target_exit")
+        self.assertAlmostEqual(phases["capture_measured_s"], 2.0)
+
+    def test_malformed_stamps_keep_fd_estimates(self):
+        # Fail-closed: any malformed shape keeps the FD behavior exactly.
+        for bad in ("nope", ["attach"], 42,
+                    {"attach_mono_ns": -1, "loop_start_mono_ns": None,
+                     "loop_end_mono_ns": None, "loop_end_reason": "expiry"},
+                    {"attach_mono_ns": True, "loop_start_mono_ns": None,
+                     "loop_end_mono_ns": None, "loop_end_reason": "expiry"},
+                    {"attach_mono_ns": 5_000_000_000,
+                     "loop_start_mono_ns": 2_000_000_000,
+                     "loop_end_mono_ns": 9_000_000_000,
+                     "loop_end_reason": "expiry"},
+                    {"attach_mono_ns": 2_000_000_000,
+                     "loop_start_mono_ns": 2_500_000_000,
+                     "loop_end_mono_ns": None,
+                     "loop_end_reason": 42}):
+            with self.subTest(bad=bad):
+                phases, _ = MEASURE["derive_phases"](
+                    ramp_samples(attach_s=4, end_s=15), [], 8.0, 0,
+                    15_000_000_000, 4_500_000_000,
+                    phase_mono_ns=bad)
+                self.assertEqual(phases["t_attached_mono_ns"], 4_000_000_000)
+                self.assertEqual(phases["attach_boundary_source"],
+                                 "fd_95pct_estimate")
+                self.assertEqual(phases["capture_boundary_source"],
+                                 "fd_estimate_plus_duration")
+                self.assertIsNone(phases["t_loop_start_mono_ns"])
+
+    def test_partial_stamps_apply_attach_without_loop_end(self):
+        # Mid-loop evidence: attach and loop start are known, the loop
+        # has not ended. Attach goes authoritative; the loop end stays
+        # on the FD path.
+        phases, _ = MEASURE["derive_phases"](
+            ramp_samples(attach_s=4, end_s=15), [], 8.0, 0,
+            15_000_000_000, 4_500_000_000,
+            phase_mono_ns={"attach_mono_ns": 2_000_000_000,
+                           "loop_start_mono_ns": 2_500_000_000,
+                           "loop_end_mono_ns": None,
+                           "loop_end_reason": "unstarted"})
+        self.assertEqual(phases["t_attached_mono_ns"], 2_000_000_000)
+        self.assertEqual(phases["attach_boundary_source"],
+                         "observer_authoritative")
+        self.assertEqual(phases["loop_end_source"],
+                         "external_markers_or_expiry")
+        self.assertEqual(phases["loop_end_reason_observer"], "unstarted")
+        self.assertAlmostEqual(phases["capture_measured_s"], 8.0)
+
+    def test_frame_gate_keeps_boundary_discipline(self):
+        # Frame gates record the stamps but never re-derive boundaries.
+        rows = [{"t_mono_ns": 2_000_000_000, "line": COMPLETION}]
+        phases, _ = MEASURE["derive_phases"](
+            ramp_samples(attach_s=4, end_s=7, detach_s=5.5,
+                         step_s=0.5, baseline=30, plateau=60),
+            rows, 8.0, 1_000_000_000, 7_000_000_000, 3_000_000_000,
+            burst_go_ns=3_100_000_000, burst_end_ns=4_400_000_000,
+            gate="frame",
+            phase_mono_ns={"attach_mono_ns": 2_000_000_000,
+                           "loop_start_mono_ns": 2_500_000_000,
+                           "loop_end_mono_ns": 6_000_000_000,
+                           "loop_end_reason": "expiry"})
+        self.assertEqual(phases["attach_boundary_source"],
+                         "frame_gate_release_latest_bound")
+        self.assertEqual(phases["capture_boundary_source"], "external_bounds")
+        self.assertIsNone(phases["t_loop_end_mono_ns"])
+        self.assertEqual(phases["t_loop_start_mono_ns"], 2_500_000_000)
+        self.assertEqual(phases["loop_end_reason_observer"], "expiry")
+
+    def test_marker_disagreement_with_authority_warns(self):
+        # A stderr marker 2 s after the observer's own loop end is a real
+        # contradiction (pipe delay cannot explain 2 s): warn, use stamps.
+        rows = [{"t_mono_ns": 5_000_000_000, "line": TARGET_EXIT}]
+        phases, _ = MEASURE["derive_phases"](
+            ramp_samples(attach_s=1, end_s=7, detach_s=5.5), rows, 8.0, 0,
+            7_000_000_000, 1_500_000_000,
+            phase_mono_ns={"attach_mono_ns": 1_000_000_000,
+                           "loop_start_mono_ns": 1_200_000_000,
+                           "loop_end_mono_ns": 3_000_000_000,
+                           "loop_end_reason": "target_exit"})
+        self.assertEqual(phases["t_loop_end_mono_ns"], 3_000_000_000)
+        self.assertTrue(any("disagrees with the authoritative" in warning
+                            for warning in phases["method_warnings"]),
+                        phases["method_warnings"])
+
+    def test_no_samples_still_records_authoritative_facts(self):
+        # Degenerate fd trace: no derived durations, but the observer's
+        # own facts are still published, never dropped.
+        phases, _ = MEASURE["derive_phases"](
+            [], [], 8.0, 0, 15_000_000_000, 4_500_000_000,
+            phase_mono_ns={"attach_mono_ns": 2_000_000_000,
+                           "loop_start_mono_ns": 2_500_000_000,
+                           "loop_end_mono_ns": 10_000_000_000,
+                           "loop_end_reason": "expiry"})
+        self.assertEqual(phases["t_attached_mono_ns"], 2_000_000_000)
+        self.assertEqual(phases["attach_boundary_source"],
+                         "observer_authoritative")
+        self.assertEqual(phases["t_loop_start_mono_ns"], 2_500_000_000)
+        self.assertEqual(phases["t_loop_end_mono_ns"], 10_000_000_000)
+        self.assertTrue(any("no sampler rows" in warning
+                            for warning in phases["method_warnings"]),
+                        phases["method_warnings"])
+
+
 class DiscoveryMarkerTests(unittest.TestCase):
     def test_summaries_before_completion_do_not_move_discovery(self):
         rows = [

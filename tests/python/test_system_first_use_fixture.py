@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
@@ -169,6 +170,35 @@ class FirstUseFixtureTest(unittest.TestCase):
         result = subprocess.run(self.command(), capture_output=True, text=True, timeout=3)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.ledger.read_text(), "preserve this\n")
+
+    def test_receipt_collision_preserves_raw_file_and_proves_call_already_happened(self):
+        directory = self.work / "receipt"
+        directory.mkdir(mode=0o700)
+        (directory / "maps-before").write_bytes(b"preserve existing receipt\n")
+        # The sender endpoint is passed explicitly; no observer handshake exists.
+        receive, send = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        with receive, send:
+            result = subprocess.run([*self.command(), str(send.fileno()), "ab" * 32,
+                                     str(directory)], pass_fds=(send.fileno(),),
+                                    capture_output=True, text=True, timeout=3)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((directory / "maps-before").read_bytes(), b"preserve existing receipt\n")
+        phases = [row["phase"] for row in self.rows()]
+        self.assertIn("entry_executed", phases)
+        self.assertIn("entry_returned", phases)
+        self.assertIn("receipt_started", phases)
+        self.assertNotIn("receipt_sent", phases)
+        self.assertIn("receipt acquisition", result.stderr)
+
+    def test_bad_receipt_arguments_fail_before_workload(self):
+        receive, send = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        with receive, send:
+            result = subprocess.run([*self.command(), str(send.fileno()), "bad-nonce",
+                                     str(self.work)], pass_fds=(send.fileno(),),
+                                    capture_output=True, text=True, timeout=3)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("receipt arguments", result.stderr)
+        self.assertFalse(self.ledger.exists())
 
 
 if __name__ == "__main__":

@@ -143,9 +143,16 @@ static int wait_gate(const char *path) {
     return 0;
 }
 
+#include "system-first-use-receipt.h"
+
 int main(int argc, char **argv) {
-    if (argc != 5) {
-        fprintf(stderr, "usage: %s provider.so ledger.jsonl publication-gate|- entry-gate|-\n", argv[0]);
+    if (argc != 5 && argc != 8) {
+        fprintf(stderr, "usage: %s provider.so ledger.jsonl publication-gate|- entry-gate|- [receipt-fd nonce receipt-dir]\n", argv[0]);
+        return 2;
+    }
+    int receipt_fd = argc == 8 ? receipt_arguments(argv[5], argv[6]) : -1;
+    if (argc == 8 && receipt_fd < 0) {
+        fprintf(stderr, "invalid receipt arguments\n");
         return 2;
     }
     birth = process_birth();
@@ -192,6 +199,8 @@ int main(int argc, char **argv) {
     if (rv || body.count != 1 || !body.mono_ns || body.mono_ns > returned) goto done;
     if (emit("entry_executed", body.mono_ns, ",\"body_count\":1") ||
         emit("entry_returned", returned, ",\"rv\":0")) goto done;
+    if (receipt_fd >= 0 && post_call_receipt(receipt_fd, argv[6], argv[7],
+                                            (uintptr_t)table->functions[0])) goto done;
     if (dlclose(handle)) { handle = NULL; goto done; }
     handle = NULL;
     if (emit("unloaded", now_ns(), "")) goto done;
@@ -200,6 +209,7 @@ int main(int argc, char **argv) {
 invalid_table:
     fprintf(stderr, "invalid table: require version 2.40 and 68 distinct entries\n");
 done:
+    if (receipt_fd >= 0) close(receipt_fd);
     if (handle) dlclose(handle);
     if (fclose(ledger)) status = 1;
     return status;

@@ -454,7 +454,7 @@ class Custody:
         self.check_cancelled()
         return group
 
-    def launch(self, argv, *, role='observer', stdout=None, stderr=None, deadline=None):
+    def launch(self, argv, *, role='observer', stdout=None, stderr=None, deadline=None, pass_fds=()):
         self._require_active()
         self.check_cancelled()
         if self.sealed or self.helper_depth:
@@ -466,6 +466,7 @@ class Custody:
         owned = OwnedProcess(self)
         self.processes.append(owned)
         owned.popen = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
+                                       pass_fds=pass_fds,
                                        preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_SETMASK, self.child_mask))
         self._pin(owned.popen.pid, None, role=role, wait_owner='custody', origin='direct',
                   deadline=deadline, owned=owned)

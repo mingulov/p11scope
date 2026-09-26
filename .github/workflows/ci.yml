@@ -171,6 +171,7 @@ jobs:
       - run: python3 -I tests/python/test_system_scope_measure_launch.py -v
       - run: python3 -I tests/python/test_measure_e03.py -v
       - run: python3 -I tests/python/test_system_first_use_fixture.py -v
+      - run: python3 -I tests/python/test_system_first_use_receipt.py -v
       - run: python3 -I tests/python/test_system_scope_sample.py -v
       - run: scripts/verify-inspect-doctor.sh
       - run: scripts/verify-attach-e2e.sh

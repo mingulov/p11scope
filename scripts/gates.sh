@@ -31,6 +31,7 @@ python3 -I scripts/check-live-discovery-evidence.py --self-test
 python3 -I tests/python/test_system_scope_measure_launch.py -v
 python3 -I tests/python/test_measure_e03.py -v
 python3 -I tests/python/test_system_first_use_fixture.py -v
+python3 -I tests/python/test_system_first_use_receipt.py -v
 python3 -I tests/python/test_system_scope_sample.py -v
 # The inspect/doctor lane is unprivileged and takes seconds, so it runs first:
 # if the CLI cannot even read a target, nothing below is worth waiting for.

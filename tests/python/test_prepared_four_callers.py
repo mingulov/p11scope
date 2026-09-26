@@ -481,6 +481,7 @@ class PreparedFourCallersTests(unittest.TestCase):
                 "scripts/prepared-dependency-tools.sh",
                 "scripts/prepared-dependency-snapshot.sh",
                 "scripts/merge-checksum-ledgers.py",
+                "scripts/matrix/matrix-lib.sh",
                 "scripts/matrix/verify-shared-layer.sh",
             ):
                 destination = root / relative

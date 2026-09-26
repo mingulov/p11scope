@@ -27,14 +27,22 @@
 # (running as root via sudo), which already has it.
 #
 # Part 2 (privilege measurement) is below the fork-scoping proof.
+#
+# Two entry points:
+#   verify-fork-scope.sh ABSENT_EVIDENCE_ROOT   receipt run: builds the
+#       product from this clean checkout with the prepared toolchain;
+#   P11SCOPE_BIN=/abs/p11scope verify-fork-scope.sh   direct run against a
+#       prebuilt product (P11SCOPE_DISCOVER_BIN defaults to its sibling
+#       p11scope-discover), in a fresh private work directory
+#       (P11SCOPE_MATRIX_TMPDIR, else TMPDIR, else /tmp).
 set -eu
 cd "$(dirname "$0")/../.."
 . scripts/lib.sh
 
 MODULE=/usr/lib/softhsm/libsofthsm2.so
-WORK=${P11SCOPE_RECEIPT_WORK:-target/matrix-fork}
+WORK=${P11SCOPE_RECEIPT_WORK-}
 EXPECTED=scripts/matrix/fork-expected.txt
-PRODUCT=$WORK/target
+PRODUCT=
 
 receipt_prepare_root() {
     t4_candidate=$1
@@ -286,16 +294,19 @@ if [ "${1-}" = --self-test ]; then
     exit 0
 fi
 
-if [ -z "${P11SCOPE_RECEIPT_BODY-}" ]; then
+if [ -z "${P11SCOPE_RECEIPT_BODY-}" ] && [ -z "${P11SCOPE_BIN-}" ]; then
     receipt_receipt_run "$@"
     exit 0
 fi
 [ "$#" -eq 0 ] || exit 2
-[ -n "${P11SCOPE_PREPARED_STABLE_CARGO-}" ] \
-    && [ -n "${P11SCOPE_PREPARED_STABLE_RUSTC-}" ] \
-    && [ -n "${P11SCOPE_PREPARED_BPF_CARGO-}" ] \
-    && [ -n "${P11SCOPE_PREPARED_BPF_RUSTC-}" ] \
-    || { echo "prepared stable/BPF Cargo/rustc handoff required" >&2; exit 1; }
+. scripts/matrix/matrix-lib.sh
+if [ -z "${P11SCOPE_BIN-}" ]; then
+    [ -n "${P11SCOPE_PREPARED_STABLE_CARGO-}" ] \
+        && [ -n "${P11SCOPE_PREPARED_STABLE_RUSTC-}" ] \
+        && [ -n "${P11SCOPE_PREPARED_BPF_CARGO-}" ] \
+        && [ -n "${P11SCOPE_PREPARED_BPF_RUSTC-}" ] \
+        || { echo "prepared stable/BPF Cargo/rustc handoff required" >&2; exit 1; }
+fi
 command -v gcc >/dev/null || { echo "gcc required"; exit 1; }
 command -v softhsm2-util >/dev/null || { echo "softhsm2-util required"; exit 1; }
 command -v systemd-run >/dev/null || { echo "systemd-run required"; exit 1; }
@@ -303,7 +314,15 @@ command -v capsh >/dev/null || { echo "capsh required"; exit 1; }
 sudo -n true 2>/dev/null || { echo "passwordless sudo required"; exit 1; }
 test -f "$MODULE" || { echo "SoftHSM2 not installed at $MODULE"; exit 1; }
 
-mkdir -p "$WORK"
+# SoftHSM, systemd-run and the observer all receive paths under WORK, so it
+# must be absolute; a relative one under a group-writable checkout would also
+# make the observer refuse `-o`.
+if [ -n "$WORK" ]; then
+    matrix_absolute_work
+else
+    matrix_private_work fork
+fi
+PRODUCT=$WORK/target
 UNIT="p11scope-fork-$$"
 CGROUP_PATH="/sys/fs/cgroup/system.slice/${UNIT}.scope"
 LAUNCHER_PID=
@@ -326,12 +345,16 @@ cleanup() {
 . scripts/cleanup-traps.sh
 
 echo "=== build product + fork-harness ==="
-RUSTC="$P11SCOPE_PREPARED_STABLE_RUSTC" \
-    P11SCOPE_PREPARED_BPF_CARGO="$P11SCOPE_PREPARED_BPF_CARGO" \
-    P11SCOPE_PREPARED_BPF_RUSTC="$P11SCOPE_PREPARED_BPF_RUSTC" \
-    "$P11SCOPE_PREPARED_STABLE_CARGO" build --locked --offline --release --workspace \
-    --target-dir "$PRODUCT"
-P11SCOPE_BIN=$(realpath "$PRODUCT/release/p11scope")
+if ! matrix_prebuilt_product; then
+    RUSTC="$P11SCOPE_PREPARED_STABLE_RUSTC" \
+        P11SCOPE_PREPARED_BPF_CARGO="$P11SCOPE_PREPARED_BPF_CARGO" \
+        P11SCOPE_PREPARED_BPF_RUSTC="$P11SCOPE_PREPARED_BPF_RUSTC" \
+        "$P11SCOPE_PREPARED_STABLE_CARGO" build --locked --offline --release --workspace \
+        --target-dir "$PRODUCT"
+    P11SCOPE_EXE=$(realpath "$PRODUCT/release/p11scope")
+    P11SCOPE_DISCOVER_EXE=$(realpath "$PRODUCT/release/p11scope-discover")
+fi
+matrix_report_product
 gcc -O0 -o "$WORK/fork-harness" scripts/matrix/fork-harness.c -ldl
 gcc -O0 -o "$WORK/harness" spike/harness.c -ldl
 
@@ -340,7 +363,7 @@ export SOFTHSM2_CONF="$WORK/softhsm2.conf"
 rm -rf "$WORK/tokens"
 mkdir -p "$WORK/tokens"
 cat > "$SOFTHSM2_CONF" <<EOF
-directories.tokendir = $PWD/$WORK/tokens
+directories.tokendir = $WORK/tokens
 objectstore.backend = file
 log.level = ERROR
 slots.removable = false
@@ -357,20 +380,20 @@ echo "=== discover ==="
 # can describe a provider that is not mapped yet; the capture reports it as
 # uncorroborated, and that is the honest reading. Live discovery of a module
 # loaded after attach is Slice 1b-2.
-"$PRODUCT/release/p11scope-discover" --module "$MODULE" -o "$WORK/manifest.json"
+"$P11SCOPE_DISCOVER_EXE" --module "$MODULE" -o "$WORK/manifest.json"
 
 echo "=== Part 1: fork-scoping capture ==="
 echo "cgroup unit: ${UNIT}.scope"
 rm -f "$WORK/go"
 mkfifo "$WORK/go"
 ( sudo systemd-run --scope --unit="$UNIT" -- sh -c \
-    "read -r _ < '$PWD/$WORK/go'; \
-     exec env SOFTHSM2_CONF='$SOFTHSM2_CONF' '$PWD/$WORK/fork-harness' '$MODULE'" ) &
+    "read -r _ < '$WORK/go'; \
+     exec env SOFTHSM2_CONF='$SOFTHSM2_CONF' '$WORK/fork-harness' '$MODULE'" ) &
 LAUNCHER_PID=$!
 sleep 1     # let systemd-run establish the cgroup
 test -d "$CGROUP_PATH" || { echo "cgroup was not created: $CGROUP_PATH"; exit 1; }
 
-sudo "$P11SCOPE_BIN" profile --manifest "$WORK/manifest.json" \
+sudo "$P11SCOPE_EXE" profile --manifest "$WORK/manifest.json" \
     --cgroup "$CGROUP_PATH" \
     --mode metrics --duration 20 -o "$WORK/observed.json" \
     > "$WORK/profile.log" 2>&1 &
@@ -477,7 +500,7 @@ measure_privileges() {
     rm -f "$mp_out"
     set +e
     sudo capsh --caps="$mp_caps" --keep=1 --user="$(whoami)" $mp_amb \
-        -- -c "'$P11SCOPE_BIN' profile $* --pid $PRIV_PID \
+        -- -c "'$P11SCOPE_EXE' profile $* --pid $PRIV_PID \
                --mode metrics --duration 1 -o '$mp_out'" \
         > "$WORK/priv-$mp_label.log" 2>&1
     mp_rc=$?
@@ -495,7 +518,7 @@ MEASURE
 
 echo "--- unprivileged, manifest-free ---"
 set +e
-UNPRIV_OUT=$("$P11SCOPE_BIN" profile --pid "$PRIV_PID" \
+UNPRIV_OUT=$("$P11SCOPE_EXE" profile --pid "$PRIV_PID" \
     --mode metrics --duration 1 2>&1)
 UNPRIV_RC=$?
 set -e

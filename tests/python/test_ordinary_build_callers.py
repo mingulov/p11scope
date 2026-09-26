@@ -43,7 +43,8 @@ class OrdinaryBuildCallerTests(unittest.TestCase):
         self.base = Path(self.temporary.name)
         self.root = self.base / "checkout with spaces"
         (self.root / "scripts/matrix").mkdir(parents=True)
-        for relative in ("scripts/cargo.sh", "scripts/lib.sh", "scripts/cleanup-traps.sh"):
+        for relative in ("scripts/cargo.sh", "scripts/lib.sh", "scripts/cleanup-traps.sh",
+                         "scripts/matrix/matrix-lib.sh"):
             destination = self.root / relative
             shutil.copy2(ROOT / relative, destination)
         shutil.copy2(FIXTURES / "record-preparer.py",

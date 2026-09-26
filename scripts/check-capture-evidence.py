@@ -1992,17 +1992,23 @@ def validate_lane02_owned_run_metrics(document, expected, pause):
         require(partial == 0, partial)
 
 
-def validate_shared_layer_metrics(document, expected, multiplier=1):
-    """Clean metrics plus exactly one bounded shared-overlay uncertainty."""
+def validate_shared_layer_metrics(document, expected, multiplier=1, uncertainties=1):
+    """Clean metrics plus exactly `uncertainties` bounded shared-overlay records.
+
+    One record per collapsed overlay object: the provider, and, where loader
+    discovery pins the dynamic loader from the same image layer, the loader.
+    The lane states the exact number; nothing else may be skipped.
+    """
+    require(uncertainties >= 1, f"invalid shared-overlay uncertainty count: {uncertainties}")
     validate_clean_metrics(
         document,
         expected,
         multiplier,
-        discovery_skipped=1,
+        discovery_skipped=uncertainties,
     )
     require(
         document["evidence"]["skipped"]
-        == [{"name": DISCOVERY_SUBJECT, "reason": SHARED_OVERLAY_UNCERTAINTY}],
+        == [{"name": DISCOVERY_SUBJECT, "reason": SHARED_OVERLAY_UNCERTAINTY}] * uncertainties,
         f"unexpected shared-overlay uncertainty: {document['evidence']['skipped']}",
     )
 def validate_lane13_knative_metrics(document, expected):
@@ -2543,7 +2549,16 @@ def self_test():
         bad = copy.deepcopy(shared)
         mutate(bad)
         rejected(lambda bad=bad: validate_shared_layer_metrics(bad, {"C_Initialize": 1}))
-    print("shared-layer metrics permits exactly one bounded overlay uncertainty: OK")
+    shared_loader = copy.deepcopy(shared)
+    shared_loader["evidence"]["skipped"].append(copy.deepcopy(shared["evidence"]["skipped"][0]))
+    validate_shared_layer_metrics(shared_loader, {"C_Initialize": 1}, 1, 2)
+    rejected(lambda: validate_shared_layer_metrics(shared, {"C_Initialize": 1}, 1, 2))
+    rejected(lambda: validate_shared_layer_metrics(shared_loader, {"C_Initialize": 1}, 1, 3))
+    rejected(lambda: validate_shared_layer_metrics(shared, {"C_Initialize": 1}, 1, 0))
+    shared_loader_mixed = copy.deepcopy(shared_loader)
+    shared_loader_mixed["evidence"]["skipped"][1].update(reason="discovery unavailable")
+    rejected(lambda: validate_shared_layer_metrics(shared_loader_mixed, {"C_Initialize": 1}, 1, 2))
+    print("shared-layer metrics permits exactly the stated bounded overlay uncertainties: OK")
     bad = copy.deepcopy(clean)
     bad["functions"] += function_items([(["unknown"], 1)])
     rejected(lambda: validate_clean_metrics(bad, {"C_Initialize": 1}))
@@ -4179,12 +4194,14 @@ def main(argv):
             expected_counts(argv[2]),
             argv[3],
         )
-    elif argv[0] == "shared-layer-metrics" and len(argv) in (3, 4):
-        multiplier = int(argv[3]) if len(argv) == 4 else 1
+    elif argv[0] == "shared-layer-metrics" and len(argv) in (3, 4, 5):
+        multiplier = int(argv[3]) if len(argv) >= 4 else 1
+        uncertainties = int(argv[4]) if len(argv) == 5 else 1
         validate_shared_layer_metrics(
             load_json(argv[1]),
             expected_counts(argv[2]),
             multiplier,
+            uncertainties,
         )
     elif argv[0].startswith("clean-metrics") and len(argv) in (3, 4):
         discovery = argv[0][len("clean-metrics") :].lstrip("-") or "scan"
@@ -4205,7 +4222,7 @@ def main(argv):
         raise AssertionError(
             "usage: check-capture-evidence.py "
             "clean-metrics[-corroborated|-manifest-only] OUTPUT EXPECTED [MULTIPLIER] | "
-            "shared-layer-metrics OUTPUT EXPECTED [MULTIPLIER] | "
+            "shared-layer-metrics OUTPUT EXPECTED [MULTIPLIER [UNCERTAINTIES]] | "
             "lane13-knative-metrics OUTPUT EXPECTED | "
             "lane02-owned-run-metrics OUTPUT EXPECTED POLICY | "
             "canary LANE OUTPUT [32|64] | induced G[1-5] OUTPUT | --self-test"

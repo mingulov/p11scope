@@ -4133,7 +4133,7 @@ fn receipt_receipt_drivers_execute_behavioral_self_tests() {
         "broad-and-a-only-b-only-68-68-136-exact-accepted",
         "broad-cardinality-mutation-rejected",
         "leaf-cardinality-mutation-rejected",
-        "broad-2-C_GetFunctionList-2-uncertainty-1-leaves-1-C_GetFunctionList-1-uncertainty-0-exact-accepted",
+        "broad-2-C_GetFunctionList-2-uncertainty-2-leaves-1-C_GetFunctionList-1-uncertainty-0-exact-accepted",
         "multiplier-function-uncertainty-mutation-rejected",
         "image-container-identity-mutation-rejected",
     ];

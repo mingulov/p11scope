@@ -304,6 +304,15 @@ enumeration failures, prove exact selectors and pins, and finish with
 terminal records and owned cleanup. Ordinary writer passes alone cannot
 close the live gate.
 
+## R2f static live closure (2026-09-26)
+
+The repinned seven-cell campaign passed at `f265b9e938e64bda5c58368fe56b6e45a8109de9`.
+The 4097/6530 cells now retain all snapshots, terminal records and owned
+cleanup; their raw files have 20490/32655 rows. The 8192 cell remains an
+expected FD refusal. See [the complete result and custody record](t7-r2f-static-campaign.md).
+The acceptance verifier passes `t7-static` and still refuses `system-product`.
+L-T7-7..L-T7-10 and the public/growth/performance obligations below remain open.
+
 ## Open uncertainties (for the consensus)
 
 1. The 6530 dense byte envelope (~118 MiB payload at 64 possible CPUs,

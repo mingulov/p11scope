@@ -404,6 +404,47 @@ mod tests {
         assert_eq!(document["skipped"], serde_json::json!([]));
     }
 
+    /// HIGH-2: when the scan could not read the target's mappings at all
+    /// (another user's process: `/proc/<pid>/maps` is EACCES), inspect knows
+    /// nothing about its modules. That is the documented hard error — one
+    /// stderr line naming the cause and the fix, empty stdout, exit 1 — never
+    /// "0 PKCS#11 modules mapped" with `scan.status: scanned` and exit 0.
+    #[test]
+    fn unreadable_target_mappings_are_a_hard_error_not_zero_modules() {
+        let unreadable = || {
+            Ok((
+                ScanOutcome::Scanned {
+                    modules: Vec::new(),
+                    skipped: vec![Skipped {
+                        subject: "capture discovery".into(),
+                        reason: "memory scan refused: initial mapping validation unavailable: \
+                                 Permission denied (os error 13)"
+                            .into(),
+                    }],
+                    scan_ms: 0,
+                },
+                (PinnedObjects::empty(), Vec::new()),
+            ))
+        };
+        for json in [false, true] {
+            let mut stdout = Vec::new();
+            let result = emit_diagnosis(1379, json, &mut stdout, unreadable());
+            assert!(
+                stdout.is_empty(),
+                "json={json}: {}",
+                String::from_utf8_lossy(&stdout)
+            );
+            let error = format!("{:#}", result.expect_err("an unreadable target must fail"));
+            assert!(error.contains("/proc/1379/maps"), "{error}");
+            assert!(error.contains("Permission denied"), "{error}");
+            assert!(
+                error.contains("sudo p11scope inspect --pid 1379"),
+                "{error}"
+            );
+            assert!(!error.contains("0 PKCS#11 modules"), "{error}");
+        }
+    }
+
     /// The text contract is unchanged: same line, same exit code.
     #[test]
     fn soft_diagnosis_failure_without_json_keeps_the_text_line() {

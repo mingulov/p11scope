@@ -756,3 +756,69 @@ fn high4_a_closed_stderr_reader_never_panics() {
         .collect();
     assert!(litter.is_empty(), "{litter:?}");
 }
+
+/// HIGH-1: without privilege the uretprobe self-probe cannot load BPF at
+/// all. That is a missing-privilege fact, not a seccomp hazard: the refusal
+/// must say what privilege is missing and must never recommend the safety
+/// override (which would only disable the interlock and then hit the same
+/// privilege error at attach).
+#[test]
+fn high1_missing_privilege_is_named_and_never_offers_the_override() {
+    if capture_available() || unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    for args in [
+        &["run", "--", "/bin/true"][..],
+        &[
+            "run",
+            "--allow-uretprobe-on-confined-target",
+            "--",
+            "/bin/true",
+        ][..],
+        &["profile", "--system", "--duration", "1"][..],
+        &["profile", "--cgroup", "/sys/fs/cgroup", "--duration", "1"][..],
+    ] {
+        let refused = run(args);
+        assert_eq!(refused.code, Some(1), "{args:?}: {}", refused.stderr);
+        assert!(
+            !refused
+                .stderr
+                .contains("--allow-uretprobe-on-confined-target"),
+            "{args:?}: {}",
+            refused.stderr
+        );
+        assert!(
+            !refused.stderr.contains("seccomp") && !refused.stderr.contains("trampoline"),
+            "{args:?}: a privilege failure reported as a hazard: {}",
+            refused.stderr
+        );
+        assert!(
+            refused.stderr.contains("requires root") && refused.stderr.contains("sudo"),
+            "{args:?}: {}",
+            refused.stderr
+        );
+    }
+}
+
+/// HIGH-2: a target whose mappings cannot be read (pid 1 belongs to root)
+/// is the documented hard error — exit 1, empty stdout, one stderr line
+/// with the cause and the fix — never a clean "0 PKCS#11 modules mapped".
+#[test]
+fn high2_inspect_of_an_unreadable_target_exits_1_with_the_fix() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    for args in [
+        &["inspect", "--pid", "1"][..],
+        &["inspect", "--pid", "1", "--json"][..],
+    ] {
+        let inspect = run(args);
+        assert_eq!(inspect.code, Some(1), "{args:?}: {}", inspect.stdout);
+        assert!(inspect.stdout.is_empty(), "{args:?}: {}", inspect.stdout);
+        assert!(
+            inspect.stderr.contains("sudo p11scope inspect --pid 1"),
+            "{args:?}: {}",
+            inspect.stderr
+        );
+    }
+}

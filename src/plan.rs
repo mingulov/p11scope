@@ -2475,6 +2475,7 @@ struct ExistingAllocation<'a> {
     owned: &'a BTreeMap<PinnedObjectId, BTreeSet<AttachKey>>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_from_sources_with(
     scanned: &[ReconciledModule],
     manifests: &[Manifest],

@@ -16427,6 +16427,7 @@ fn a_generation_lost_before_attach_leaves_a_refreshed_views_new_targets_retryabl
     u07_name_members(scope.path(), &[member.pid(), lost]);
     session.lose_generations_at_detach([Some(lost)]);
     let attach_calls = session.attached_slots.len();
+    let allocated = engine.plan.slots.len();
     u07_tick(&mut engine, &mut session, &mut true);
 
     assert!(
@@ -16435,9 +16436,14 @@ fn a_generation_lost_before_attach_leaves_a_refreshed_views_new_targets_retryabl
     );
     let (active, inactive) = u07_provider_slots(&engine, "u07-refreshed.so");
     assert!(
-        active.is_empty() && !inactive.is_empty(),
+        active.is_empty() && inactive.is_empty(),
         "new targets that were never attached must not stay active: active {active:?}, inactive {inactive:?}, attach calls {:?}",
         &session.attached_slots[attach_calls..]
+    );
+    assert_eq!(
+        engine.plan.slots.len(),
+        allocated,
+        "PC-1: cells no link ever used are given back, not burned"
     );
     assert_eq!(
         session.attached_slots.len(),
@@ -18539,11 +18545,12 @@ fn cgroup_retries_retire_one_original_view_each_time_and_publish_partial() {
 /// loss), anything else a counted generation loss.
 #[test]
 fn multi_process_start_retires_views_that_went_stale_during_attach_live() {
-    let mut exiting = std::process::Command::new("sleep")
+    let child = std::process::Command::new("sleep")
         .arg("30")
         .spawn()
         .unwrap();
-    let exiting_pid = exiting.id();
+    let exiting = std::cell::RefCell::new(ChildReaper(child));
+    let exiting_pid = exiting.borrow().0.id();
     let views = vec![
         ProcessView::open(ProcessViewId(0), exiting_pid).unwrap(),
         crate::process::unprovable_process_view_for_test(ProcessViewId(1), std::process::id())
@@ -18566,8 +18573,9 @@ fn multi_process_start_retires_views_that_went_stale_during_attach_live() {
                 return Vec::new();
             }
             if checks.get() == 2 {
-                exiting.kill().unwrap();
-                exiting.wait().unwrap();
+                let mut exiting = exiting.borrow_mut();
+                exiting.0.kill().unwrap();
+                exiting.0.wait().unwrap();
             }
             crate::process::stale_view_ids(views)
         },

@@ -5,6 +5,8 @@
 //! `profile`, `trace`, and `run` share exactly one profile loop and one trace
 //! loop, and so integration tests can exercise them directly.
 
+use std::io::Write as _;
+
 use anyhow::{Context as _, Result};
 use p11scope::cli::{self, CliError, Command};
 use p11scope::{capture, capture_startup_signal_dispositions, doctor, inspect, run_owned};
@@ -16,9 +18,23 @@ fn main() {
         Err(e) => {
             // Every failure the observer can name arrives here as one line: an
             // unreadable target, a stale manifest, an environment without BPF.
-            eprintln!("p11scope: {e:#}");
+            // Never `eprintln!`: a closed stderr would turn exit 1 into a
+            // panic (HIGH-4), so a failed diagnostic write is dropped.
+            let _ = writeln!(std::io::stderr(), "p11scope: {e:#}");
             std::process::exit(1);
         }
+    }
+}
+
+/// Writes exit-0 text (help, version) to stdout. A reader that went away
+/// (`p11scope --help | head -1`, EPIPE) is not a failure of the command: the
+/// Rust runtime ignores SIGPIPE, so `println!` would panic here (HIGH-4).
+fn print_stdout(text: std::fmt::Arguments<'_>) -> Result<i32> {
+    let mut stdout = std::io::stdout().lock();
+    match stdout.write_fmt(text).and_then(|()| stdout.flush()) {
+        Ok(()) => Ok(0),
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(0),
+        Err(error) => Err(error).context("writing stdout"),
     }
 }
 
@@ -28,8 +44,7 @@ fn run() -> Result<i32> {
     capture_startup_signal_dispositions();
     match cli::parse(std::env::args().skip(1)) {
         Ok(Command::Version) => {
-            println!("p11scope {}", env!("CARGO_PKG_VERSION"));
-            Ok(0)
+            print_stdout(format_args!("p11scope {}\n", env!("CARGO_PKG_VERSION")))
         }
         // `kind` travels inside the arguments, so both capture subcommands share
         // one arm as well as one parser.
@@ -44,13 +59,10 @@ fn run() -> Result<i32> {
         Ok(Command::Inspect(a)) => inspect::run(a.pid, &a.modules, &a.hooks, a.json)
             .with_context(|| format!("inspect --pid {}", a.pid)),
         Ok(Command::Doctor(a)) => doctor::run(a.pid, a.cgroup.as_deref(), a.extra_strict),
-        Err(CliError::Help(topic)) => {
-            // Exit-0 help goes to stdout, so `p11scope --help | grep …` works.
-            println!("{}", topic.text());
-            Ok(0)
-        }
+        // Exit-0 help goes to stdout, so `p11scope --help | grep …` works.
+        Err(CliError::Help(topic)) => print_stdout(format_args!("{}\n", topic.text())),
         Err(CliError::Usage(msg)) => {
-            eprintln!("{msg}");
+            let _ = writeln!(std::io::stderr(), "{msg}");
             Ok(2)
         }
     }

@@ -737,7 +737,10 @@ fn high4_a_closed_stderr_reader_never_panics() {
             &["profile", "--pid", &pid, "--duration", "1", "-o", out][..],
             &[0, 1][..],
         ),
-        (&["trace", "--pid", &pid, "--duration", "1"][..], &[0, 1][..]),
+        (
+            &["trace", "--pid", &pid, "--duration", "1"][..],
+            &[0, 1][..],
+        ),
     ] {
         let outcome = run_with_closed_reader(args, ClosedReader::Stderr);
         assert!(

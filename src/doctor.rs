@@ -9,7 +9,7 @@
 //! No BPF program stays loaded after `doctor` returns: `bpf_checks` owns the
 //! probe handles are locally owned and drop before `probe` returns.
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use aya::programs::ProgramError;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -1270,14 +1270,26 @@ pub fn render_extra_strict(checks: &[Check]) -> String {
 /// With `extra_strict`, any `Warn`/`Fail` row refuses (exit 1) and the
 /// render names every violating row; otherwise the default gated verdict
 /// applies and the render is unchanged.
+///
+/// The table is written without `print!`: a reader that went away
+/// (`p11scope doctor | head`, EPIPE) must not turn the verdict into a panic
+/// (HIGH-4), so a broken pipe still exits with the verdict code.
 pub fn run(pid: Option<u32>, cgroup: Option<&Path>, extra_strict: bool) -> Result<i32> {
     let checks = probe(pid, cgroup);
-    if extra_strict {
-        print!("{}", render_extra_strict(&checks));
-        Ok(verdict_extra_strict(&checks))
+    let (text, code) = if extra_strict {
+        (render_extra_strict(&checks), verdict_extra_strict(&checks))
     } else {
-        print!("{}", render(&checks));
-        Ok(verdict(&checks))
+        (render(&checks), verdict(&checks))
+    };
+    write_report(&mut std::io::stdout().lock(), &text)?;
+    Ok(code)
+}
+
+fn write_report(out: &mut dyn std::io::Write, text: &str) -> Result<()> {
+    match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(error).context("writing the doctor report to stdout"),
     }
 }
 

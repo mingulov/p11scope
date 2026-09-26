@@ -30,6 +30,10 @@ checked ledger close and a successful process exit.
 These are workload facts. In particular, object stat is not observer
 knowledge, and neither table publication nor successful return proves the
 observer captured a call. Scan/attach/observed-entry facts remain absent.
+The `mapped` time is sampled after `dlopen` and symbol lookup return; it
+is a workload observation of the loaded state, not an exact kernel VMA
+creation timestamp. `publication_returned` is likewise sampled by the
+driver after return. Keep those authorities explicit when comparing times.
 The original file stat is not a live map_files receipt. The optional
 post-call receipt described below binds the addressed mapping to retained
 physical custody without adding an observer wait before the call.
@@ -111,7 +115,59 @@ child is terminal. Required controls are file and heap tables, a new mount
 namespace, and `map_files` EPERM after dropping the relevant capabilities.
 An ordinary suite's permission-related skip does not satisfy this prerequisite.
 
-Native results are pending. The five-class gated/ungated observer matrix,
-retained-probe comparison, pre-execution mechanism and seven independently
-sourced transition facts remain required follow-up work. A valid physical
-receipt does not prove observer entry capture.
+## Executed native prerequisite (2026-09-26)
+
+Subject: clean commit `df1fb7de4b7e539a03c1bc89967f212e947a16d2`, tree
+`293ffceec44b7f9b41e91a277f5f940942dfa3ae`, host `7.0.0-31-generic`.
+Fresh driver/provider binaries, fixture sources, collector, helpers and
+controller were frozen before execution. The r3 campaign passed:
+
+| Control | Result |
+|---|---|
+| File table; receive after child terminal | Exact mapped-file and namespace receipt verified |
+| Heap table; receive after child terminal | Exact mapped-file and namespace receipt verified |
+| Short-lived new mount namespace | Distinct namespace retained and verified after child terminal |
+| Relevant capabilities removed | `map_files` returned EPERM after the ordinary call; no fallback receipt |
+
+Each child was waited and its pidfd closed. All positive cases retained
+the actual mapping device `0:35` separately from the opened file device
+`0:37`; the target mountinfo bridge joined those domains without rewriting
+either. The fresh namespace's inode differed from the parent namespace.
+The outer supervisor recorded successful command exit, terminal proof,
+settlement and cleanup, with no wrapper cleanup failure. Typed BPF census
+was unchanged and all six shared leases were released. No BPF observer
+was attached by this prerequisite.
+
+Earlier attempts remain preserved. R1 was NOT_RUN because KryProbe held
+the live lane. R2's four native controls succeeded, but its controller
+failed an inappropriate live-launch check after the fast collector had
+already exited; its subsequently recovered supervisor receipt confirmed
+successful settlement. R2 remains INVALID. The correction adds a bounded,
+nonce-checked collector-start gate before any workload is launched, so the
+existing outer owner can verify its live session first. It does not gate
+the workload's call. Ordinary release, wrong-nonce and timeout controls
+passed before the complete r3 run.
+
+The full default workspace/all-target gate passed against the exact content
+subsequently committed as this subject: library 1,618 passed / 45 ignored,
+artifact contracts 139 passed, and the remaining workspace suites passed.
+Formatting, workspace check and strict Clippy also passed. Five deliberate
+receiver defects (birth, expected physical identity, body truth, duplicate
+packet, descriptor leak) were each rejected by assertions. A clean source
+export contained all ten changed files with matching tested hashes, and
+the fixture 9/9 and receiver 14/14 suites passed from the extracted archive.
+The initial export check assumed a flat archive layout; that controller
+error was preserved, and validation used the actual `p11scope-source` root
+of the same archive. This is scoped source-export verification, not the
+complete installed/offline release gate.
+
+The readback-sealed evidence bundle is
+`/home/user/src/m/p11scope-ws/preserved/evidence-roots/product-finish-20260926/t2-first-use-custody-df1fb7d/`.
+It contains the native attempts, source/binary pins, raw snapshots, ledgers,
+receipts, supervisor evidence, ordinary RED/GREEN/mutation logs, full gate
+results and source export. `bundle-files.json` records every retained file.
+
+The five-class gated/ungated observer matrix, retained-probe comparison,
+pre-execution mechanism and seven independently sourced transition facts
+remain required follow-up work. A valid physical receipt does not prove
+observer entry capture.

@@ -43,3 +43,67 @@ fn untrusted_output_is_refused_before_the_discovery_scan() {
     assert!(text.contains("untrusted"), "{text}");
     assert!(!text.contains("manifest"), "{text}");
 }
+
+fn poisoned_profile_args(out: PathBuf) -> CaptureArgs {
+    CaptureArgs {
+        kind: Kind::Profile,
+        modules: Vec::new(),
+        // Read inside `Engine::discover`: if discovery ran first, the missing
+        // manifest would be the error instead of the output refusal.
+        manifests: vec![PathBuf::from("/definitely/not/a/manifest.json")],
+        hooks: HookRegistry::builtin(),
+        scope: ScopeArg::Pid(std::process::id()),
+        metrics: false,
+        duration: None,
+        out: Some(out),
+        max_events: None,
+        max_scan_pids: None,
+        ring_bytes: None,
+        drain_interval: None,
+        unsafe_requested: false,
+        allow_confined_uretprobe: false,
+        attach_backend: BackendSelection::default(),
+    }
+}
+
+/// HIGH-3 / RB-1: `-o <directory>`, `-o dir/` and `-o <FIFO>` used to pass
+/// the preflight and fail (or replace the node) only at publication, after
+/// the whole capture. They are refused before the discovery scan now.
+#[test]
+fn directory_and_special_file_outputs_are_refused_before_the_discovery_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let captures = dir.path().join("captures");
+    std::fs::create_dir(&captures).unwrap();
+    let mut slashed = captures.clone().into_os_string();
+    slashed.push("/");
+    let fifo = dir.path().join("null");
+    let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+
+    for (out, expected) in [
+        (captures.clone(), "is a directory"),
+        (PathBuf::from(slashed), "names a directory"),
+        (fifo.clone(), "a FIFO"),
+    ] {
+        let error = capture(&poisoned_profile_args(out.clone()))
+            .expect_err("a non-file output must fail the capture");
+        let text = format!("{error:#}");
+        assert!(text.contains(expected), "{}: {text}", out.display());
+        assert!(!text.contains("manifest"), "{}: {text}", out.display());
+    }
+    use std::os::unix::fs::FileTypeExt as _;
+    assert!(
+        std::fs::symlink_metadata(&fifo)
+            .unwrap()
+            .file_type()
+            .is_fifo()
+    );
+    let litter: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .chain(std::fs::read_dir(&captures).unwrap())
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().starts_with(".p11scope."))
+        .collect();
+    assert!(litter.is_empty(), "{litter:?}");
+}

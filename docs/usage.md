@@ -501,6 +501,13 @@ kind of workload without a manifest and ends `68`/`0` instead.
 
 ### More capture options
 
+- `-o <file>` — write the profile report (published atomically: a private
+  0600 temporary file beside the target, fsync, rename) or the trace stream
+  to `<file>`. `-o` names a file: an existing directory, a path ending in `/`,
+  or an existing device node, FIFO, socket or symbolic link (for example
+  `/dev/null` or `/dev/stdout`) is refused before the capture starts and is
+  never replaced; the profile report re-checks the name before publishing.
+  To keep no report file, leave out `-o`.
 - `--max-events <n>` — trace only (including `run --trace`): end the capture
   after `<n>` call events instead of running until `--duration`, interrupt, or
   target exit. Refused with a usage error on profile, which publishes one

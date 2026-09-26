@@ -58,7 +58,8 @@ Task 0b notes adjudicated:
 - Task 0b "40 findings open" reconciles as 37 F-findings `required-open`
   (44 rows with F-58/F-16/F-61 splits) plus accepted-boundary items the
   estimate had counted as open. "24 with no fixing task" is now 6
-  NEEDS-OWNER (see list at end); the rest are routed to finish tasks below.
+  NEEDS-OWNER at that checkpoint; the 2026-09-26 product-quality plan routes
+  those six below without changing their required-open disposition.
 
 ## F-01–F-75
 
@@ -97,17 +98,17 @@ Task 0b notes adjudicated:
 | F-30 | docs/help drift | source-fixed | T13 | `usage_doc_documents_every_cli_flag` + `tests/python/test_help_usage_drift.py` | `e29464b,b0c78ae` |
 | F-31 | 4-artifact verdict predicate | required-open | T10 | NONE-YET | pin `initial_set_timing` + `known_pre_relocation`; monotonicity property |
 | F-32 | dual-backend equivalence gate | required-open | T13 | NONE-YET | recurring multi-vs-singles lane (manual owned lane) |
-| F-33 | discover helper sandbox | required-open | NEEDS-OWNER | NONE-YET | `crates/discover/src/main.rs:314`; uid-drop only |
+| F-33 | discover helper sandbox | required-open | T5/T13 | NONE-YET | `crates/discover/src/main.rs:314`; uid-drop only |
 | F-34 | BPF trust root unaudited | required-open | T8 | NONE-YET | `crates/ebpf/`, `identity.rs`; open bodies + sign/attest |
 | F-35 | spoofing residuals | required-open | T3 | NONE-YET | loader contexts, task_cookie, manifest re-check |
-| F-36 | stringly-typed errors | required-open | NEEDS-OWNER | NONE-YET | `Result<_,String>` pervasive |
+| F-36 | stringly-typed errors | required-open | T5/T6 | NONE-YET | `Result<_,String>` pervasive |
 | F-37 | whole-history clones | required-open | T12 | NONE-YET | `engine.rs:1117,1195,1401`; E25/O-13 measurement first |
 | F-38 | function_id per-call hotspot | refuted | T13 | NONE-YET | FI revalidation + `task-Eperf-report.md:110-115`; production caches id in SlotMeta |
-| F-39 | cfg(test) in prod modules | required-open | NEEDS-OWNER | NONE-YET | `hooks.rs:19`, `loader.rs:2`, `pause.rs:460` |
+| F-39 | cfg(test) in prod modules | required-open | T13 | NONE-YET | `hooks.rs:19`, `loader.rs:2`, `pause.rs:460` |
 | F-40 | no coverage measurement | source-fixed | T13 | `cargo llvm-cov --lib --fail-under-lines "$(cat .coverage-floor)"` (floor 83) | `b0c78ae` |
 | F-41 | decoder/budget property gaps | required-open | T12 | NONE-YET | P1–P7 suites + spans 2^16 oracle; E21/E22 |
 | F-42 | dual-authority consumer risk | required-open | T8 | NONE-YET | type the STATS-vs-EVENTS split; `src/events.rs`, `src/semantics.rs` |
-| F-43 | aya fork, no exit plan | required-open | NEEDS-OWNER | NONE-YET | `Cargo.toml:47`; `third-party/`; rebase vs pinned-fork policy |
+| F-43 | aya fork, no exit plan | required-open | T13 | NONE-YET | `Cargo.toml:47`; `third-party/`; rebase vs pinned-fork policy |
 | F-44 | dead Tracker::identify | source-fixed | T13 | NONE-YET | `e29464b` (cfg(test) ladder; `retire` deleted) |
 | F-45 | re-round duplicate failures | required-open | T5 | NONE-YET | `src/attach.rs:1776` |
 | F-46 | debug_assert UAPI layouts | required-open | T8 | NONE-YET | `crates/bpf-multi/src/lib.rs:157`; const asserts |
@@ -118,9 +119,9 @@ Task 0b notes adjudicated:
 | F-51 | unsafe w/o Safety docs | required-open | T13 | NONE-YET | 174 unsafe sites, 0 Safety docs in `src/` |
 | F-52 | no shared lint config | required-open | T13 | NONE-YET | add `[lints]`/clippy.toml/rustfmt.toml + missing_docs |
 | F-53 | mapped-file SIGBUS race | accepted-boundary | T13 | NONE-YET | `crates/manifest/src/elf.rs:351` SAFETY; plan-accepted |
-| F-54 | expect()-as-invariant | required-open | NEEDS-OWNER | NONE-YET | 173 non-test `expect()` sites; target-byte paths first |
+| F-54 | expect()-as-invariant | required-open | T5/T8 | NONE-YET | 173 non-test `expect()` sites; target-byte paths first |
 | F-55 | raw bytes in attach_failures | required-open | T10 | NONE-YET | `src/render.rs:402`; sanitize at ingestion |
-| F-56 | discover -o hygiene | required-open | NEEDS-OWNER | NONE-YET | `crates/discover/src/main.rs:419,460` |
+| F-56 | discover -o hygiene | required-open | T5/T10 | NONE-YET | `crates/discover/src/main.rs:419,460` |
 | F-57 | SUDO_UID selector semantics | accepted-boundary | T13 | NONE-YET | `src/run.rs:452-504`; bounded; document in runbook |
 | F-58-T7 | u64 counter wraps in release | required-open | T8 | NONE-YET | saturating-rule consistency (STRIDE T7) |
 | F-58-R2 | malformed-EVENTS forensics | required-open | T8 | NONE-YET | `src/events.rs:327` counter-only (STRIDE R2) |
@@ -253,12 +254,14 @@ scope; F2/F10 overlap E10/E14–E15 evidence owned above.
 | refuted | 2 | 3 | 1 | 0 | 0 | 0 | 6 |
 | optional | 1 | 0 | 9 | 0 | 0 | 0 | 10 |
 
-## NEEDS-OWNER (6)
+## Ownership completed, checks still open (2026-09-26)
 
-F-33 (discover sandbox), F-36 (stringly errors), F-39 (cfg(test) in prod),
-F-43 (aya fork exit), F-54 (expect cleanup), F-56 (discover -o hygiene).
-No finish-plan task owns these; Task 0b gate needs an owner decision or a
-new task for each.
+F-33 is owned by T5 implementation plus T13's helper trust/privilege policy;
+F-36 by T5/T6 at touched runtime boundaries; F-39 by T13 maintenance;
+F-43 by T13 dependency/update policy; F-54 by T5/T8 target-derived panic
+handling; F-56 by T5/T10 discover output integrity and privacy. This follows
+the product-quality review's deferred-disposition table. Assignment closes
+no finding: all six still require concrete tests and final evidence.
 
 ## INPUT-MISSING
 
@@ -269,4 +272,3 @@ should preserve it per continuation-plan U-01).
 Out of ledger scope (not findings): SPEC R01–R10 are requirements owned by
 T13 reconciliation, not dispositions; SYSTEM-PLAN R1–R8, RP E-1/E-2, and
 SB/DG/roadmap items were not in the delegated inventory.
-

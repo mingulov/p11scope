@@ -34,6 +34,7 @@ jobs:
           UNRUN: scripts/dump-owned-bpf-maps.py (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/k8s-profile-entry.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/qualify-task-storage-canary.py (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
+          UNRUN: scripts/run-t7-static-campaign.py (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/system-scope-measure.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/system-scope-owned.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/system-scope-receipt.py (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
@@ -128,6 +129,8 @@ jobs:
       # a pure model check: it compiles spike/harness.c with gcc, reads it with
       # readelf, runs it under `timeout 5`, and needs a non-root caller (the
       # runner is one). The two container-less live lanes follow the block.
+      - run: python3 -I tests/python/test_system_test_manifest.py -v
+      - run: python3 -I tests/python/test_t7_campaign.py -v
       - run: scripts/verify-inspect-doctor.sh --self-test
       - run: scripts/verify-attach-e2e.sh --self-test
       - run: scripts/verify-induced-gaps.sh --self-test

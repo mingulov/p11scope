@@ -8084,6 +8084,7 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
             source: "scan",
             file_offset: None,
             linkage: "heuristic",
+            exports_agreeing: Some(0),
         }],
         interfaces: 0,
         skipped: vec![],

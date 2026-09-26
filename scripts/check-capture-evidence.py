@@ -1691,8 +1691,12 @@ def validate_proxy_capacity_fallback(document, module_path=None):
         )
         require(target["path"] == record["path"], target)
     # Task 1.3 provenance: every decoded table carries its version-word file
-    # offset and linkage kind. Zero interfaces means heuristic decode, so the
-    # slots are named `unknown`, never ordinal PKCS#11 labels.
+    # offset and linkage kind. Zero interfaces, but SoftHSM2's own `.dynsym`
+    # defines every standard name exactly where its table points (GT-2), so
+    # its table is export-linked and its slots are named. p11-kit's closure
+    # templates point at per-closure trampolines, never at the three standard
+    # names libp11-kit exports, so they contradict their exports, stay
+    # heuristic, and their slots stay `unknown`.
     soft_tables = by_path[soft["path"]]["tables"]
     require(len(soft_tables) == 1, soft_tables)
     require(
@@ -1700,7 +1704,8 @@ def validate_proxy_capacity_fallback(document, module_path=None):
         == {"version": [2, 40], "entries": 68, "source": "scan"},
         soft_tables,
     )
-    require(soft_tables[0]["linkage"] == "heuristic", soft_tables)
+    require(soft_tables[0]["linkage"] == "exports", soft_tables)
+    require(soft_tables[0]["exports_agreeing"] == 68, soft_tables)
     require(u64(soft_tables[0]["file_offset"]), soft_tables)
     proxy_tables = by_path[proxy["path"]]["tables"]
     require(len(proxy_tables) == PROXY_TABLES, len(proxy_tables))
@@ -1725,6 +1730,7 @@ def validate_proxy_capacity_fallback(document, module_path=None):
             shape = key
         require(key == shape, f"proxy tables mix provider builds: {shape} vs {key}")
         require(table["linkage"] == "heuristic", table)
+        require(u64(table["exports_agreeing"]), table)
         require(u64(table["file_offset"]), table)
         offsets.add(table["file_offset"])
     require(len(offsets) == PROXY_TABLES, "proxy tables share a file offset")
@@ -1778,8 +1784,16 @@ def validate_proxy_capacity_fallback(document, module_path=None):
     attributed = Counter()
     called_soft = 0
     called_proxy = 0
+    soft_names = set()
     for item in functions:
-        require(item["names"] == ["unknown"], f"scan-only function must be unnamed: {item}")
+        if item["module"] == soft_id:
+            require(
+                len(item["names"]) == 1 and item["names"][0].startswith("C_"),
+                f"export-linked SoftHSM2 function must be named: {item}",
+            )
+            soft_names.add(item["names"][0])
+        else:
+            require(item["names"] == ["unknown"], f"heuristic proxy function must be unnamed: {item}")
         require(item["aliased"] is False, item)
         require(item["module_ambiguous"] is False, item)
         require(item["module"] in (soft_id, proxy_id), item)
@@ -1793,6 +1807,7 @@ def validate_proxy_capacity_fallback(document, module_path=None):
         dict(attributed) == {"soft": 68, "proxy": admitted_slots},
         f"per-module function split: {dict(attributed)}",
     )
+    require(len(soft_names) == 68, f"SoftHSM2 names are not 68 distinct: {sorted(soft_names)}")
     # A green lane claims two-provider call coverage (audit F6): one global
     # positive count lets complete loss on either provider pass, so each
     # provider must have handled at least one call.
@@ -1847,10 +1862,12 @@ def validate_clean_metrics(
 ):
     """SoftHSM2 counted exactly, with discovery stated rather than assumed.
 
-    Since the 1.3 mislabel guard, scan-only tables carry no linkage and their
-    slots are named `unknown` — never ordinal PKCS#11 labels — so the scan
-    lane asserts exact counts on totals, while manifest-authorized lanes
-    (manifest-only, corroborated) keep exact per-name counts.
+    SoftHSM2 defines every standard name in its own `.dynsym`, and its one
+    2.40 table points at each of them exactly, so even a scan-only capture
+    names its slots through export linkage (GT-2): every lane keeps exact
+    per-name counts. A scan table must say so — `exports_agreeing` is all 68
+    ordinals and its linkage is never `heuristic` (a live return may still
+    outrank `exports`).
     """
     require(discovery in CLEAN_DISCOVERY, f"unknown clean-metrics discovery: {discovery}")
     wanted_sources, allowances = CLEAN_DISCOVERY[discovery]
@@ -1901,31 +1918,19 @@ def validate_clean_metrics(
         )
     exact_capture_modules(document)
 
+    for module in evidence["discovery"]:
+        for table in module["tables"]:
+            if table["source"] != "scan":
+                require(table["exports_agreeing"] is None, f"manifest table compared: {table}")
+                continue
+            require(
+                table["exports_agreeing"] == 68 and table["linkage"] != "heuristic",
+                f"SoftHSM2 scan table is not export-corroborated: {table}",
+            )
+
     wanted = {name: calls * multiplier for name, calls in expected.items()}
     require("C_GetFunctionList" not in wanted, "expected-count file must omit bootstrap")
     wanted["C_GetFunctionList"] = multiplier
-    if discovery == "scan":
-        # Scan-only: unlinked heuristic tables are count-only under `unknown`
-        # (1.3 mislabel guard) — the bootstrap loader call included — so
-        # exactness is on the total, never per name.
-        total = 0
-        for item in document["functions"]:
-            calls = item["calls"]
-            require(u64(calls), f"invalid call count: {item}")
-            require(
-                item["names"] == ["unknown"],
-                f"scan-only function must be unnamed: {item}",
-            )
-            require(
-                item["aliased"] is False,
-                f"clean metrics cannot contain aliases: {item}",
-            )
-            total += calls
-        require(
-            total == sum(wanted.values()),
-            f"scan-only total calls: want {sum(wanted.values())}, got {total}",
-        )
-        return
     actual = Counter()
     for item in document["functions"]:
         calls = item["calls"]
@@ -2312,7 +2317,8 @@ def discovery_fixture(sources=("scan",)):
                     "entries": 68,
                     "source": source,
                     "file_offset": 0x1000 if source == "scan" else None,
-                    "linkage": "heuristic" if source == "scan" else "manifest",
+                    "linkage": "exports" if source == "scan" else "manifest",
+                    "exports_agreeing": 68 if source == "scan" else None,
                 }
                 for source in sources
             ],
@@ -2866,6 +2872,7 @@ def self_test():
                     "source": "scan",
                     "file_offset": 0x2000 + index * 840,
                     "linkage": "heuristic",
+                    "exports_agreeing": 0,
                 }
                 for index in range(PROXY_TABLES)
             ],

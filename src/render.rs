@@ -2246,6 +2246,7 @@ pub(crate) mod tests {
                 source: "scan",
                 file_offset: None,
                 linkage: "heuristic",
+                exports_agreeing: Some(0),
             }],
             interfaces: 1,
             skipped: vec![],
@@ -2435,6 +2436,7 @@ pub(crate) mod tests {
         };
         let object = crate::plan::TEST_PINNED_OBJECT;
         let plan = crate::plan::build_from_reconciled_modules(&[ReconciledModule {
+            exports: Default::default(),
             object,
             entry_objects: vec![vec![object, object], vec![object]],
             scanned: ScannedModule {
@@ -2538,6 +2540,7 @@ pub(crate) mod tests {
             inode: 42,
         };
         let plan = crate::plan::build_from_reconciled_modules(&[ReconciledModule {
+            exports: Default::default(),
             object: crate::plan::TEST_PINNED_OBJECT,
             entry_objects: vec![vec![crate::plan::TEST_PINNED_OBJECT]],
             scanned: ScannedModule {

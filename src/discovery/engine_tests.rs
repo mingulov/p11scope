@@ -16,7 +16,7 @@ use crate::discovery::identity::{
 };
 use crate::discovery::loader::LoaderContextSpec;
 use crate::discovery::scan::{
-    IO_CEILING_REASON, SCAN_DEADLINE_REASON, ScanLimits, ScannedEntry, ScannedTable,
+    IO_CEILING_REASON, ObjectExports, SCAN_DEADLINE_REASON, ScanLimits, ScannedEntry, ScannedTable,
     WORK_CEILING_REASON, order_tables_by_evidence,
 };
 use crate::discovery::scheduler::MAX_PENDING_REFRESH;
@@ -4037,6 +4037,7 @@ fn an_empty_scan_pass_is_not_a_loss_once_the_capture_attaches_that_table() {
             source: "scan",
             file_offset: None,
             linkage: "heuristic",
+            exports_agreeing: Some(0),
         }],
         interfaces: 0,
         source: "scan",
@@ -18539,6 +18540,7 @@ fn corroboration_marks_the_exact_reconciled_object_not_the_raw_key_peer() {
         inode: 42,
     };
     let module = |view, object, path: &str, offset| ReconciledModule {
+        exports: Default::default(),
         object,
         entry_objects: vec![vec![object]],
         scanned: ScannedModule {
@@ -18623,6 +18625,7 @@ fn pending_fallback_outcome_follows_the_final_overlay_canonical_id_without_autho
         inode: 42,
     };
     let module = |view: ProcessViewId, path: &str| ReconciledModule {
+        exports: Default::default(),
         object: PinnedObjectId(200),
         entry_objects: vec![vec![PinnedObjectId(200)]],
         scanned: ScannedModule {
@@ -18688,6 +18691,7 @@ fn pending_corroboration_rebuild_resolves_the_current_final_id() {
         inode: 42,
     };
     let module = |object| ReconciledModule {
+        exports: Default::default(),
         object,
         entry_objects: vec![vec![object]],
         scanned: ScannedModule {
@@ -19292,6 +19296,7 @@ fn p2_retained_scan_error_keeps_counters_and_survives_attachment() {
             } else {
                 "heuristic"
             },
+            exports_agreeing: (source != "manifest").then_some(0),
         });
         record_object_skips(&mut plan, std::slice::from_ref(&refusal));
         record_object_skips(&mut plan, &[]);
@@ -21368,7 +21373,7 @@ fn linked_candidate_table_sorts_before_unlinked_lookalike() {
         table: Some(1),
     }];
 
-    let order = order_tables_by_evidence(&tables, &interfaces, &[], &[]);
+    let order = order_tables_by_evidence(&tables, &interfaces, &[], &[], &ObjectExports::NONE);
 
     assert_eq!(
         order,
@@ -22780,6 +22785,7 @@ fn loader_rescan_with_a_stale_generation_refuses_without_mutation() {
     engine.views.push(view);
     engine.next_view_id = 1;
     engine.modules = vec![ReconciledModule {
+        exports: Default::default(),
         object: PinnedObjectId(7),
         scanned: ScannedModule {
             view: view_id,
@@ -22947,6 +22953,7 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
         FailureMode {
             name: "module without opened identity",
             modules: vec![ReconciledModule {
+                exports: Default::default(),
                 object: object_without_identity,
                 scanned: reconciled.scanned.clone(),
                 entry_objects: Vec::new(),
@@ -22967,6 +22974,7 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
         FailureMode {
             name: "table without parallel identities",
             modules: vec![ReconciledModule {
+                exports: Default::default(),
                 object: so_id,
                 scanned: reconciled.scanned.clone(),
                 entry_objects: Vec::new(),
@@ -22979,6 +22987,7 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
         FailureMode {
             name: "entry target without identity",
             modules: vec![ReconciledModule {
+                exports: Default::default(),
                 object: so_id,
                 scanned: reconciled.scanned.clone(),
                 entry_objects: vec![vec![

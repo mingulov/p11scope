@@ -280,7 +280,10 @@ impl ElfSnapshot {
 /// The shared exports walk: names from `wanted` that the image exports in
 /// `.dynsym`, in dynsym order with their file offsets. Per-symbol faults skip
 /// the symbol; the walk itself cannot fail.
-fn exports_matching_in_object(object: &object::File<'_>, wanted: &[&str]) -> Vec<(String, u64)> {
+pub(crate) fn exports_matching_in_object(
+    object: &object::File<'_>,
+    wanted: &[&str],
+) -> Vec<(String, u64)> {
     let mut found = Vec::new();
     for symbol in object.dynamic_symbols() {
         let Ok(name) = symbol.name() else { continue };

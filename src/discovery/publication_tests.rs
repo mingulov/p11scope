@@ -3306,6 +3306,7 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
         })
         .collect();
     let module = ReconciledModule {
+        exports: Default::default(),
         scanned: ScannedModule {
             view: ProcessViewId(0),
             mount_namespace: namespace,
@@ -3360,6 +3361,7 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
     // nothing — never a silent prefix.
     let small_object = PinnedObjectId(8);
     let small = ReconciledModule {
+        exports: Default::default(),
         scanned: ScannedModule {
             view: ProcessViewId(0),
             mount_namespace: namespace,

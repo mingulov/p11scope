@@ -17,11 +17,11 @@ use crate::discovery::identity::{
 use crate::discovery::loader::{LoaderContextId, LoaderContextSpec, LoaderRegistry};
 use crate::discovery::noise::DiscoveryNoiseAggregator;
 use crate::discovery::scan::{
-    CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedEntry, ScannedInterface, ScannedModule,
-    ScannedTable, Skipped, TableIdentity, decode_exact_table, exact_table_addresses,
-    exact_table_bytes, index_maps_or_refuse, read_elf_snapshot, read_maps_or_refuse,
-    scan_process_view, scan_process_view_without_memory, scan_skip_truncates, spans_for,
-    table_evidence_score, table_linkage, target_layout,
+    CaptureWorkBudget, ObjectExports, ScanOutcome, ScanRequest, ScannedEntry, ScannedInterface,
+    ScannedModule, ScannedTable, Skipped, TableIdentity, decode_exact_table, exact_table_addresses,
+    exact_table_bytes, export_agreement, index_maps_or_refuse, read_elf_snapshot,
+    read_maps_or_refuse, scan_process_view, scan_process_view_without_memory, scan_skip_truncates,
+    spans_for, table_evidence_score, table_linkage, target_layout,
 };
 use crate::discovery::scheduler::{
     DiscoveryScheduler, InventoryCadence, MAX_PENDING_REFRESH, MAX_POLLING_RESCANS,
@@ -1593,14 +1593,22 @@ impl CaptureFacts {
                 }
                 let table_fact = (table.version, table.entries.len());
                 let table_occurrence = tables.entry(table_fact).or_insert(0usize);
+                // The same witness `plan::lower_scanned` scores by, so the
+                // published linkage and the plan's naming never disagree.
+                let exports = ObjectExports {
+                    object: module.scanned.key,
+                    symbols: &module.exports,
+                };
                 let table_score = table_evidence_score(
                     table_index,
                     &module.scanned.tables,
                     &module.scanned.interfaces,
                     &[],
                     &[],
+                    &exports,
                 );
                 let linkage = table_linkage(&table_score);
+                let exports_agreeing = export_agreement(table, &exports).agreeing;
                 history
                     .tables
                     .entry(TableOccurrence::Scan {
@@ -1617,6 +1625,7 @@ impl CaptureFacts {
                         if known.linkage == "heuristic" && linkage != "heuristic" {
                             known.linkage = linkage;
                         }
+                        known.exports_agreeing = known.exports_agreeing.max(Some(exports_agreeing));
                     })
                     .or_insert(plan::TableSummary {
                         version: table_fact.0,
@@ -1624,6 +1633,7 @@ impl CaptureFacts {
                         source: "scan",
                         file_offset: table.file_offset,
                         linkage,
+                        exports_agreeing: Some(exports_agreeing),
                     });
                 *table_occurrence += 1;
                 *surface_occurrence += 1;
@@ -1763,6 +1773,7 @@ impl CaptureFacts {
                         source: "manifest",
                         file_offset: None,
                         linkage: "manifest",
+                        exports_agreeing: None,
                     });
                 for (function_index, function) in surface.functions.iter().enumerate() {
                     let key = DecodedOccurrence::ManifestFunction {

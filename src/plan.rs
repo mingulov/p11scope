@@ -27,8 +27,8 @@
 use crate::discovery::identity::{PinnedObjectId, PinnedObjects, ReconciledModule};
 pub use crate::discovery::scan::Skipped;
 use crate::discovery::scan::{
-    ScannedInterface, ScannedTable, TableEvidenceScore, order_tables_by_evidence,
-    table_evidence_score, table_linkage, table_name_authorized,
+    ObjectExports, ScannedInterface, ScannedTable, TableEvidenceScore, export_agreement,
+    order_tables_by_evidence, table_evidence_score, table_linkage, table_name_authorized,
 };
 use p11scope_ebpf_common::{MAX_SLOTS, SlotSemantics};
 use p11scope_manifest::manifest::{
@@ -221,9 +221,16 @@ pub struct TableSummary {
     pub file_offset: Option<u64>,
     /// Strongest publication evidence behind this table: "interface" (named by
     /// an interface triple), "live_return" (returned by a live provider
-    /// export), "manifest" (operator-authoritative), or "heuristic" (bare
-    /// decode with no linkage — its names are presented as `unknown`).
+    /// export), "manifest" (operator-authoritative), "exports" (every
+    /// standard name the object itself exports sits exactly at its ordinal's
+    /// target), or "heuristic" (bare decode with no linkage — its names are
+    /// presented as `unknown`). Every non-heuristic linkage names the table;
+    /// none of them gives a scan target semantic authority.
     pub linkage: &'static str,
+    /// Ordinals whose target is exactly the same-named `.dynsym` definition
+    /// in the table's own object. `None` for manifest tables, which are not
+    /// compared.
+    pub exports_agreeing: Option<usize>,
 }
 
 /// One module that contributed targets to this plan.
@@ -1306,6 +1313,11 @@ struct Target<'a> {
     /// Index into the scan piece's `tables` this target was decoded from.
     /// `None` for manifest targets, which are authoritative and never capped.
     table: Option<usize>,
+    /// Other standard names the target's object exports at this exact
+    /// target, presented beside `name` when an export-corroborated table
+    /// published it: an application reaches the target through any of them
+    /// with `dlsym`, so the counts belong to the group.
+    aliases: Vec<&'a str>,
 }
 
 /// Borrowed scan decode behind one scan piece, for evidence-ordered table
@@ -1318,6 +1330,7 @@ struct Target<'a> {
 struct ScanEvidence<'a> {
     tables: &'a [ScannedTable],
     interfaces: &'a [ScannedInterface],
+    exports: ObjectExports<'a>,
 }
 
 /// Identity of one heuristic table for cross-view dedup: one object seen
@@ -1512,15 +1525,20 @@ fn merge(
                     let Some(evidence) = &module.scan_evidence else {
                         continue;
                     };
-                    for index in
-                        order_tables_by_evidence(evidence.tables, evidence.interfaces, &[], &[])
-                    {
+                    for index in order_tables_by_evidence(
+                        evidence.tables,
+                        evidence.interfaces,
+                        &[],
+                        &[],
+                        &evidence.exports,
+                    ) {
                         let score = table_evidence_score(
                             index,
                             evidence.tables,
                             evidence.interfaces,
                             &[],
                             &[],
+                            &evidence.exports,
                         );
                         let key = table_key(piece, index, &evidence.tables[index]);
                         distinct
@@ -1862,10 +1880,14 @@ fn merge(
                 if !slot.module_ids.contains(&id) {
                     slot.module_ids.push(id);
                 }
-                slot.name_authority
-                    .entry(presented_name(target.name_authorized, target.name).to_string())
-                    .and_modify(|authorized| *authorized |= target.semantic_authorized)
-                    .or_insert(target.semantic_authorized);
+                for name in std::iter::once(presented_name(target.name_authorized, target.name))
+                    .chain(target.aliases.iter().copied())
+                {
+                    slot.name_authority
+                        .entry(name.to_string())
+                        .and_modify(|authorized| *authorized |= target.semantic_authorized)
+                        .or_insert(target.semantic_authorized);
+                }
                 slot.fork_safe &= target.fork_safe;
             }
             let summary = &mut modules[id.0 as usize];
@@ -2172,6 +2194,12 @@ fn presented_name(authorized: bool, name: &str) -> &str {
 
 fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
     let scanned = &module.scanned;
+    // The module object's own `.dynsym`: the export-linkage witness for
+    // every table this module published.
+    let exports = ObjectExports {
+        object: scanned.key,
+        symbols: &module.exports,
+    };
     let mut tables = Vec::new();
     let mut surfaces = Vec::new();
     let mut targets = Vec::new();
@@ -2192,7 +2220,14 @@ fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
         entries_seen += published;
         // Same score inputs `merge` admits by, so provenance, the heuristic
         // cap, and name authorization can never disagree about one table.
-        let score = table_evidence_score(index, &scanned.tables, &scanned.interfaces, &[], &[]);
+        let score = table_evidence_score(
+            index,
+            &scanned.tables,
+            &scanned.interfaces,
+            &[],
+            &[],
+            &exports,
+        );
         let authorized = table_name_authorized(&score);
         tables.push(TableSummary {
             version: table.version,
@@ -2200,6 +2235,7 @@ fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
             source: "scan",
             file_offset: table.file_offset,
             linkage: table_linkage(&score),
+            exports_agreeing: Some(export_agreement(table, &exports).agreeing),
         });
         surfaces.push(SurfaceSummary {
             source: format!(
@@ -2233,6 +2269,11 @@ fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
                 semantic_authorized: false,
                 name_authorized: authorized,
                 table: Some(index),
+                aliases: if score.exports && entry.object == exports.object {
+                    exports.aliases_at(entry.name, entry.file_offset).collect()
+                } else {
+                    Vec::new()
+                },
             },
         ));
         skipped.extend(table.null_entries.iter().map(|name| Skipped {
@@ -2260,6 +2301,7 @@ fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
         scan_evidence: Some(ScanEvidence {
             tables: &scanned.tables,
             interfaces: &scanned.interfaces,
+            exports,
         }),
     }
 }
@@ -2357,6 +2399,7 @@ fn lower_manifest(
             source: "manifest",
             file_offset: None,
             linkage: "manifest",
+            exports_agreeing: None,
         });
         let fork_safe = matches!(
             &surface.source,
@@ -2411,6 +2454,7 @@ fn lower_manifest(
                     targets.push(Target {
                         name: &f.name,
                         table: None,
+                        aliases: Vec::new(),
                         object,
                         object_path: &record.path,
                         file_offset: *file_offset,
@@ -2551,6 +2595,7 @@ mod tests {
             .collect();
         let object = PinnedObjectId(key.inode as u32);
         ReconciledModule {
+            exports: Default::default(),
             object,
             entry_objects: vec![vec![object; entries.len()]],
             scanned: ScannedModule {
@@ -3735,6 +3780,7 @@ mod tests {
                 semantic_authorized: true,
                 name_authorized: true,
                 table: None,
+                aliases: Vec::new(),
             })
             .collect();
         Discovered {
@@ -5424,7 +5470,13 @@ mod tests {
         // stays the strongest, so its demand is zero and only the published
         // union can refuse.
         assert_eq!(
-            order_tables_by_evidence(&grown.scanned.tables, &grown.scanned.interfaces, &[], &[]),
+            order_tables_by_evidence(
+                &grown.scanned.tables,
+                &grown.scanned.interfaces,
+                &[],
+                &[],
+                &ObjectExports::NONE,
+            ),
             [0, 1]
         );
         let before = plan.clone();

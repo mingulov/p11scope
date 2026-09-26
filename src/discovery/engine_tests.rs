@@ -10678,6 +10678,31 @@ fn rt_add_deferral_duplicate_adds_coalesce_and_settle_once() {
     assert_eq!(engine.loader_records_accepted, 2);
 }
 
+/// Live regression (GT-1): `run --pause auto` of a short-lived child lost the
+/// whole capture — the next tick's deferred loader scan found the child gone,
+/// and "pid N exited before discovery" aborted the capture with no report.
+/// A process that exits before its deferred scan runs is a bounded, counted
+/// discovery loss for that view, never a capture-fatal error.
+#[test]
+fn rt_add_deferral_fallback_after_target_exit_is_bounded_loss_not_fatal() {
+    let (mut fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
+    record.announced_count = 1;
+    apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+    assert_eq!(engine.pending_loader_scans.len(), 1);
+    let truncated_before = engine.discovery_truncated;
+
+    fixture.child.kill().unwrap();
+    fixture.child.wait().unwrap();
+
+    let outcome = apply_ordinary_batch(&mut engine, &mut session, Vec::new());
+
+    let outcome = outcome.expect("an exited target's deferred scan must not abort the capture");
+    assert!(!outcome.required_complete);
+    assert!(engine.pending_loader_scans.is_empty());
+    assert_eq!(engine.loader_memory_scan_attempts, 1);
+    assert!(engine.discovery_truncated > truncated_before);
+}
+
 /// Mutation caught: an expected process exit cannot silently discard a
 /// deferred memory acquisition that never ran.
 #[test]

@@ -10142,6 +10142,14 @@ impl Engine {
                     self.record_pending_loader_scan_loss(
                         "a deferred loader memory scan remained unresolved after its one bounded fallback attempt",
                     );
+                    // A target that provably exited before its fallback ran is
+                    // the same bounded generation loss the record path takes:
+                    // counted above, never a reason to abandon the capture.
+                    if self.original_exited(key.view) {
+                        self.invalidate_causal_timing();
+                        required_complete = false;
+                        continue;
+                    }
                     return Err(error);
                 }
             }

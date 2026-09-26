@@ -10,8 +10,11 @@
 #include "root_affiliation.h"
 static struct root_affiliation_control root_ctl;
 static int reserve_cas_fail, refund_cas_fail;
+static u64 *root_lost_race_cell;
 static u64 injected_root_cas(u64 *cell, u64 old, u64 replacement)
 {
+    if (cell == root_lost_race_cell)
+        return old + 1; /* Another CPU won a race on this counter. */
     if (cell == &root_ctl.affiliation_reserved &&
         ((replacement > old && reserve_cas_fail) || (replacement < old && refund_cas_fail)))
         return old + 1;
@@ -67,7 +70,7 @@ static void root_reset(void)
     memset(root_miss, 0, sizeof(root_miss));
     root_gets = root_creates = root_deletes = root_control_reads = 0;
     reserve_cas_fail = refund_cas_fail = root_create_fail = root_delete_error = root_control_missing = 0;
-    debt_at_delete = 0;
+    debt_at_delete = 0; root_lost_race_cell = NULL;
     root_map_lookup = root_lookup; root_storage_get = root_get;
     root_storage_delete = root_delete; root_current_task = current_task;
 }
@@ -180,8 +183,17 @@ static void churn_and_independence(void)
     root_delete_error = -16; p11_owner_cleanup(); p11_root_current_exit();
     assert(!ctl.outstanding && root_ctl.affiliation_reserved == 1 && root_ctl.failure_flags);
 }
+/* Root failure counters are exact: a lost race on the counter cell never
+ * drops the increment that accompanies a sticky failure flag. */
+static void exact_failure_counters(void)
+{
+    root_reset(); seed(); tags[0] = 2;
+    root_lost_race_cell = &root_ctl.malformed_failures;
+    assert(!p11_root_current_tag());
+    assert(root_ctl.failure_flags == ROOT_BAD_CELL && root_ctl.malformed_failures == 1);
+}
 int main(void)
 {
-    unknown_parent(); propagation_failures(); settlement(); churn_and_independence(); injected_freshness_violation();
+    exact_failure_counters(); unknown_parent(); propagation_failures(); settlement(); churn_and_independence(); injected_freshness_violation();
     puts("actual root helpers: unknown, positive propagation, bounded leases, failure debt, independent exit and churn passed");
 }

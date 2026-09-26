@@ -1,4 +1,15 @@
+#include "image_identity.h"
+/* A counter increment must survive another CPU winning a race on its cell. */
+static u64 *lost_race_cell;
+static u64 injected_identity_cas(u64 *cell, u64 old, u64 replacement)
+{
+    if (cell == lost_race_cell)
+        return old + 1;
+    return __sync_val_compare_and_swap(cell, old, replacement);
+}
+#define __sync_val_compare_and_swap injected_identity_cas
 #include "image_identity.c"
+#undef __sync_val_compare_and_swap
 #include <assert.h>
 #include <stdio.h>
 static struct control ctl;
@@ -53,5 +64,14 @@ int main(void) {
     assert(p11_link_current_identity(0) == COOKIE_STATUS_BAD_TASK);
     worker.group_leader = 0;
     assert(p11_link_current_identity(&out) == COOKIE_STATUS_BAD_TASK);
+    /* Exact failure counters: a lost race on the counter cell drops nothing. */
+    control_present = 1; worker.group_leader = &leader; present = 0; fail_create = 0;
+    ctl.limit = IMAGE_IDENTITY_TICKET_LIMIT; ctl.next_ticket = IMAGE_IDENTITY_TICKET_LIMIT;
+    ctl.unavailable = 0; lost_race_cell = &ctl.unavailable;
+    assert(p11_link_current_identity(&out) == COOKIE_STATUS_QUOTA);
+    assert(ctl.unavailable == 1);
+    ctl.next_ticket = 0; ctl.create_failures = 0; fail_create = 1; lost_race_cell = &ctl.create_failures;
+    assert(p11_link_current_identity(&out) == COOKIE_STATUS_CREATE_FAILED);
+    assert(ctl.create_failures == 1 && ctl.unavailable == 2);
     puts("native control: malformed, near-limit exhaustion, stable cookie/exec, zero cell, creation failure, null refusal passed");
 }

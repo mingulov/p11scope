@@ -21,11 +21,13 @@ struct {
     __type(value, struct owner_control);
 } OWNER_CTL SEC(".maps");
 
+/* Exact under contention: a non-fetch atomic add never loses an increment
+ * (a single compare-exchange silently dropped it whenever another CPU won).
+ * The result is never consumed, so it lowers to the non-fetch BPF atomic. */
 static __always_inline void count(u64 *cell)
 {
-    u64 old = *(volatile u64 *)cell;
-    if (old != ~0ULL)
-        __sync_val_compare_and_swap(cell, old, old + 1);
+    if (*(volatile u64 *)cell != ~0ULL)
+        __sync_fetch_and_add(cell, 1);
 }
 
 static __always_inline void poison(struct owner_control *ctl, u64 reason)
@@ -40,7 +42,7 @@ static __always_inline struct owner_control *control(void)
     struct owner_control *ctl = owner_map_lookup(&OWNER_CTL, &key);
     if (!ctl)
         return (void *)0;
-    if (ctl->limit != OWNER_LIMIT || ctl->outstanding > OWNER_LIMIT) {
+    if (ctl->limit != OWNER_LIMIT || *(volatile u64 *)&ctl->outstanding > OWNER_CONTROL_BOUND) {
         poison(ctl, OWNER_BAD_CONTROL);
         return (void *)0;
     }
@@ -57,36 +59,49 @@ __attribute__((always_inline)) u32 p11_owner_healthy(void)
     return healthy(control());
 }
 
+/* Every non-nested PKCS#11 call reserves at entry and refunds at return, so
+ * this one shared count is the hottest cell in the object. No step here may
+ * fail because another CPU touched the count: a bounded compare-exchange loop
+ * did, and its refund side poisoned the whole capture under ordinary
+ * multi-threaded load. Both sides use non-fetch atomic adds whose results are
+ * never consumed (the only atomic-add form this toolchain lowers correctly).
+ *
+ * Admission claims one unit and keeps it only if the count it then reads is
+ * within the limit; otherwise it undoes exactly its own unit. Every kept claim
+ * read a count including every other live kept claim, so kept claims never
+ * exceed OWNER_LIMIT, while in-flight claims may transiently exceed it (see
+ * OWNER_CONTROL_BOUND). */
 static __always_inline int reserve_local(struct owner_control *ctl)
 {
-#pragma unroll
-    for (int i = 0; i < OWNER_CAS_TRIES; i++) {
-        u64 old = *(volatile u64 *)&ctl->outstanding;
-        if (old >= OWNER_LIMIT)
-            break;
-        if (__sync_val_compare_and_swap(&ctl->outstanding, old, old + 1) == old)
-            return 1;
+    if (*(volatile u64 *)&ctl->outstanding >= OWNER_LIMIT) {
+        count(&ctl->admission_failures);
+        return 0;
     }
-    count(&ctl->admission_failures);
-    return 0;
+    __sync_fetch_and_add(&ctl->outstanding, 1);
+    if (*(volatile u64 *)&ctl->outstanding > OWNER_LIMIT) {
+        __sync_fetch_and_add(&ctl->outstanding, (u64)-1);
+        count(&ctl->admission_failures);
+        return 0;
+    }
+    return 1;
 }
 
+/* The caller settles a lease it holds, so the count includes that lease and
+ * cannot be zero unless the accounting is already broken: only that, never
+ * contention, poisons. The pre-check never lets a refund wrap the count. */
 static __always_inline int refund_local(struct owner_control *ctl)
 {
-#pragma unroll
-    for (int i = 0; i < OWNER_CAS_TRIES; i++) {
-        u64 old = *(volatile u64 *)&ctl->outstanding;
-        if (!old || old > OWNER_LIMIT)
-            break;
-        if (__sync_val_compare_and_swap(&ctl->outstanding, old, old - 1) == old)
-            return 1;
+    u64 old = *(volatile u64 *)&ctl->outstanding;
+    if (!old || old > OWNER_CONTROL_BOUND) {
+        poison(ctl, OWNER_REFUND_FAILED);
+        return 0;
     }
-    poison(ctl, OWNER_REFUND_FAILED);
-    return 0;
+    __sync_fetch_and_add(&ctl->outstanding, (u64)-1);
+    return 1;
 }
 
 /* BPF global functions deliberately take no map-value pointers across their
- * ABI. Keeping these retry loops out of their transaction callers gives older
+ * ABI. Keeping the accounting out of its transaction callers gives older
  * verifiers one bounded state frontier per accounting operation. */
 __attribute__((noinline)) u32 p11_owner_reserve(void)
 {

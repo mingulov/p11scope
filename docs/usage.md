@@ -191,6 +191,9 @@ produced it.
 - `--drain-interval-ms <n>` — the frame interval: 5 to 60000 ms (defaults:
   profile 1000 ms, trace 200 ms). A shorter interval refreshes discovery,
   aggregate maps and live output more often, with more observer CPU cost.
+  The profile live display redraws (clear screen, then the frame) only when
+  stdout is a terminal; into a file, a pipe or a service log it writes
+  nothing per frame and prints the final frame once, as plain text.
   Events drain on every loop tick. The frame interval does not delay a
   `run --pause` stop. While a pause epoch is armed, the loop checks for a
   pending stop on every loop tick (every 2 ms when idle; one map read between

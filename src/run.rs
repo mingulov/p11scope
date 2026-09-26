@@ -3749,6 +3749,7 @@ fn capture_profile(
     // Opened by the caller before the attach; published by `commit()` only
     // once the final report is written.
     let has_output = output.is_some();
+    let live_display = LiveDisplay::for_stdout();
     let mut stdout_sink = crate::sink::stdout_sink()?;
     stdout_sink.set_cancel_flag(interrupted.cancel_flag());
     let stdout: &mut crate::sink::SinkWriter<crate::sink::StdoutInner> = &mut stdout_sink;
@@ -4001,12 +4002,10 @@ fn capture_profile(
                 mode,
                 policy,
             );
-            write_stdout(
-                stdout,
-                &mut stdout_open,
-                format!("\x1b[2J\x1b[H{frame}").as_bytes(),
-            )?;
-            flush_stdout(stdout, &mut stdout_open)?;
+            if let Some(bytes) = live_display.frame_bytes(&frame, false) {
+                write_stdout(stdout, &mut stdout_open, bytes.as_bytes())?;
+                flush_stdout(stdout, &mut stdout_open)?;
+            }
             scheduling.add_phase(SchedulingPhase::Render, render_start.elapsed());
             if !stdout_open && !has_output {
                 break Ok(CaptureEnd::Error);
@@ -4334,12 +4333,10 @@ fn capture_profile(
                         mode,
                         policy,
                     );
-                    write_stdout(
-                        context.3,
-                        context.4,
-                        format!("\x1b[2J\x1b[H{frame}").as_bytes(),
-                    )?;
-                    flush_stdout(context.3, context.4)?;
+                    if let Some(bytes) = live_display.frame_bytes(&frame, true) {
+                        write_stdout(context.3, context.4, bytes.as_bytes())?;
+                        flush_stdout(context.3, context.4)?;
+                    }
                     consumers
                         .scheduling
                         .add_phase(SchedulingPhase::Render, render_start.elapsed());
@@ -5139,6 +5136,36 @@ fn write_stdout(writer: &mut dyn Write, open: &mut bool, bytes: &[u8]) -> Result
             Ok(())
         }
         Err(error) => Err(error).context("writing stdout"),
+    }
+}
+
+/// How the profile live display reaches stdout (M-10). On a terminal every
+/// frame clears the screen and redraws. Anywhere else (systemd, `nohup`,
+/// `> file`, a pipe) a redraw is noise — one full ANSI frame per drain
+/// interval, and, into a slow reader, display backpressure — so nothing is
+/// written per frame and the final frame is written once, as plain text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LiveDisplay {
+    terminal: bool,
+}
+
+impl LiveDisplay {
+    fn for_stdout() -> Self {
+        use std::io::IsTerminal as _;
+        Self {
+            terminal: std::io::stdout().is_terminal(),
+        }
+    }
+
+    /// The bytes one frame writes, or `None` for no write at all.
+    fn frame_bytes(self, frame: &str, final_frame: bool) -> Option<String> {
+        if self.terminal {
+            Some(format!("\x1b[2J\x1b[H{frame}"))
+        } else if final_frame {
+            Some(frame.to_string())
+        } else {
+            None
+        }
     }
 }
 
@@ -11467,6 +11494,36 @@ mod tests {
             "2024-01-01T00:00:00Z"
         );
         assert_eq!(fmt_rfc3339(UNIX_EPOCH), "1970-01-01T00:00:00Z");
+    }
+
+    /// M-10: the clear-screen redraw is for a terminal. Under systemd,
+    /// `nohup`, `> file` or a pipe, a long capture wrote one full ANSI
+    /// clear-screen frame per drain interval (86,400 a day); now nothing is
+    /// written per frame there, and the final frame is written once,
+    /// without the escape.
+    #[test]
+    fn live_frames_redraw_only_on_a_terminal() {
+        let frame = "p11scope — 3 calls\n";
+        let terminal = LiveDisplay { terminal: true };
+        for final_frame in [false, true] {
+            assert_eq!(
+                terminal.frame_bytes(frame, final_frame).as_deref(),
+                Some("\x1b[2J\x1b[Hp11scope — 3 calls\n")
+            );
+        }
+        let piped = LiveDisplay { terminal: false };
+        assert_eq!(piped.frame_bytes(frame, false), None);
+        assert_eq!(piped.frame_bytes(frame, true).as_deref(), Some(frame));
+    }
+
+    /// Both profile frame sites go through `LiveDisplay`; nothing else in
+    /// the capture loops writes the clear-screen escape.
+    #[test]
+    fn every_profile_frame_goes_through_the_live_display() {
+        let source = include_str!("run.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        assert_eq!(production.matches("\\x1b[2J").count(), 1);
+        assert_eq!(production.matches("live_display.frame_bytes(").count(), 2);
     }
 
     #[test]

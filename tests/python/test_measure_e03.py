@@ -16,6 +16,7 @@ Run: python3 -I tests/python/test_measure_e03.py -v
 """
 
 import contextlib
+import copy
 import io
 import json
 import runpy
@@ -208,11 +209,14 @@ def owned_receipt(*, associated=True):
     return [receipt]
 
 
-def trace_report(*, stats_returned, raw_calls, discovery, probes=2):
+def trace_report(*, stats_returned, raw_calls, discovery, probes=2,
+                 phase_mono_ns=None):
     evidence = {name: 0 for name in CHECKER["COUNTERS"]}
     evidence.update(schema="p11scope/capture-evidence/v1",
                     completeness="PARTIAL", attached_probes=probes,
                     slots=1, discovery=discovery, modules_skipped=[])
+    if phase_mono_ns is not None:
+        evidence["scheduling"] = {"phase_mono_ns": phase_mono_ns}
     return "\n".join([
         "CAPTURE privacy=allowlisted",
         "COUNT_EVIDENCE " + json.dumps({
@@ -300,15 +304,20 @@ class ObserverWindowAcceptanceTests(unittest.TestCase):
 
     def measure(self, stamps, *, gate="marker", t_go_ns=3_000_000_000,
                 burst_go_ns=3_000_000_000, burst_end_ns=4_000_000_000):
+        target, module = complete_target_receipt(77, 99)
+        identity = {"dev": [8, 1], "ino": 11, "sha256": "aa" * 32}
         report = json.loads(profile_report(
-            functions=[{"names": ["C_GenerateRandom"], "calls": 7}],
-            discovery=[]))
+            functions=[{"names": ["C_GenerateRandom"], "calls": 7,
+                        "module": identity}],
+            discovery=[{**identity, "path": "/w/owned.so", "tables": [{}]}]))
         if stamps is not None:
             report["evidence"]["scheduling"] = {"phase_mono_ns": stamps}
         with tempfile.TemporaryDirectory() as directory:
             return run_measure(
                 Path(directory), scope="pid", mode="profile",
                 workload_argv=["owned-workload"], observer_pid=77,
+                target_receipt=target, receipt=module,
+                mapped_pid=77, mapped_starttime=99,
                 report_text=json.dumps(report), truth={"C_GenerateRandom": 7},
                 gate=gate, samples=ramp_samples(attach_s=2, end_s=12, detach_s=10.5),
                 t_go_ns=t_go_ns, burst_go_ns=burst_go_ns,
@@ -378,6 +387,115 @@ class ObserverWindowAcceptanceTests(unittest.TestCase):
         record, _ = self.measure(self.stamps(loop_start_mono_ns=3_000_000_000),
                                  burst_end_ns=10_000_000_000)
         self.assertTrue(record["window"]["window_valid"])
+
+
+class OwnedWindowAcceptanceTests(unittest.TestCase):
+    """Every identity negative has valid clocks and matching global counts."""
+
+    def inputs(self, *, scope="pid", mode="profile"):
+        target, module = complete_target_receipt(4242, 99)
+        identity = {"dev": [8, 1], "ino": 11, "sha256": "aa" * 32}
+        stamps = {"attach_mono_ns": 2_000_000_000,
+                  "loop_start_mono_ns": 2_500_000_000,
+                  "loop_end_mono_ns": 10_000_000_000,
+                  "loop_end_reason": "expiry"}
+        discovery = [{**identity, "path": "/w/owned.so", "tables": [{}]}]
+        report = (trace_report(stats_returned=7, raw_calls=7,
+                               discovery=discovery, phase_mono_ns=stamps)
+                  if mode == "trace" else profile_report(
+                      functions=[{"names": ["C_GenerateRandom"], "calls": 7,
+                                  "module": identity}],
+                      discovery=discovery, phase_mono_ns=stamps))
+        return dict(scope=scope, mode=mode, workload_argv=["/w/owned.so"],
+                    observer_pid=4242 if scope == "pid" else None,
+                    receipt=module, target_receipt=target,
+                    mapped_pid=4242, mapped_starttime=99, report_text=report,
+                    truth={"C_GenerateRandom": 7}, t_go_ns=3_000_000_000,
+                    burst_go_ns=3_000_000_000, burst_end_ns=4_000_000_000)
+
+    def measure(self, inputs):
+        with tempfile.TemporaryDirectory() as directory:
+            return run_measure(Path(directory), **inputs)[0]
+
+    def assert_identity_rejected(self, inputs, note):
+        record = self.measure(inputs)
+        self.assertTrue(record["window"]["observer_phase_authority"]["valid"])
+        self.assertTrue(record["truth_vs_observed"]["counts_match"])
+        self.assertFalse(record["window"]["window_valid"])
+        self.assertIn(note, record["window"]["window_note"])
+
+    def test_complete_pid_receipt_and_owned_activity_qualify(self):
+        record = self.measure(self.inputs())
+        self.assertTrue(record["window"]["window_valid"])
+
+    def test_system_physical_counterexample_has_an_otherwise_valid_window(self):
+        inputs = self.inputs(scope="system")
+        self.assertTrue(self.measure(inputs)["window"]["window_valid"])
+        report = json.loads(inputs["report_text"])
+        report["functions"][0]["module"]["ino"] = 22
+        inputs["report_text"] = json.dumps(report)
+        record = self.measure(inputs)
+        self.assertTrue(record["window"]["observer_phase_authority"]["valid"])
+        self.assertFalse(record["truth_vs_observed"]["counts_match"])
+        self.assertFalse(record["window"]["window_valid"])
+
+    def test_pid_selection_and_generation_are_required_even_with_valid_clocks(self):
+        for changes in ({"observer_pid": 4243}, {"mapped_pid": 4243},
+                        {"mapped_starttime": 100}, {"mapped_pid": None},
+                        {"mapped_endpoint": "0x1900"}, {"target_receipt": None}):
+            with self.subTest(changes=changes):
+                self.assert_identity_rejected(self.inputs() | changes,
+                                              "owned PID generation")
+
+    def test_changed_receipt_cannot_authorize_another_mapping(self):
+        for field in ("starttime", "pinned", "mapping_bridge"):
+            inputs = self.inputs()
+            receipt = inputs["target_receipt"]
+            if field == "starttime":
+                receipt[field] = 100
+            elif field == "pinned":
+                receipt[field]["ino"] = 22
+            else:
+                receipt[field]["range"] = "1000-3000"
+            with self.subTest(field=field):
+                self.assert_identity_rejected(inputs, "owned PID generation")
+
+    def test_foreign_physical_rows_cannot_qualify_matching_pid_totals(self):
+        for changes in ({"ino": 22}, {"dev": [8, 2]},
+                        {"sha256": "bb" * 32}, None):
+            inputs = self.inputs()
+            report = json.loads(inputs["report_text"])
+            if changes is None:
+                del report["functions"][0]["module"]
+            else:
+                report["functions"][0]["module"].update(changes)
+            inputs["report_text"] = json.dumps(report)
+            with self.subTest(changes=changes):
+                self.assert_identity_rejected(inputs, "receipt-attributed")
+
+    def test_discovery_alone_cannot_replace_owned_activity(self):
+        inputs = self.inputs()
+        report = json.loads(inputs["report_text"])
+        owned_row = copy.deepcopy(report["functions"][0])
+        owned_row["calls"] = 0
+        report["functions"][0]["module"]["ino"] = 22
+        report["functions"].append(owned_row)
+        inputs["report_text"] = json.dumps(report)
+        self.assert_identity_rejected(inputs, "receipt-attributed")
+
+    def test_pid_trace_aggregate_is_diagnostic_without_physical_rows(self):
+        self.assert_identity_rejected(self.inputs(mode="trace"),
+                                      "lacks per-module attribution")
+
+    def test_empty_truth_is_not_a_successful_workload(self):
+        for scope in ("pid", "system"):
+            for truth in ({}, {"C_GenerateRandom": 0}):
+                inputs = self.inputs(scope=scope)
+                report = json.loads(inputs["report_text"])
+                report["functions"][0]["calls"] = 0
+                inputs.update(truth=truth, report_text=json.dumps(report))
+                with self.subTest(scope=scope, truth=truth):
+                    self.assert_identity_rejected(inputs, "positive owned workload")
 
 
 class FrameBoundaryTests(unittest.TestCase):
@@ -467,9 +585,9 @@ class FrameBoundaryTests(unittest.TestCase):
                                    "loop_end_reason": "target_exit"},
                     functions=[{"names": ["C_GenerateRandom"], "calls": 7,
                                 "module": {"dev": [8, 1], "ino": 11,
-                                           "sha256": "aa"}}],
+                                           "sha256": "aa" * 32}}],
                     discovery=[{"path": "/w/owned.so", "dev": [8, 1],
-                                "ino": 11, "sha256": "aa", "tables": [{}]}]),
+                                "ino": 11, "sha256": "aa" * 32, "tables": [{}]}]),
                 stderr_lines=[(2_000_000_000, COMPLETION),
                               (5_000_000_000, TARGET_EXIT)],
                 truth={"C_GenerateRandom": 7},

@@ -1057,6 +1057,34 @@ def owned_pid_target_causal(condition, mapped_generation):
     return selected_pid == receipt_pid
 
 
+def qualifying_owned_workload(condition, mapped_generation, truth, owned,
+                              *, is_trace):
+    """Keep diagnostic count equality separate from owned window evidence."""
+    problem = None
+    if (not truth or any(type(value) is not int or value < 0
+                         for value in truth.values()) or sum(truth.values()) <= 0):
+        problem = "positive owned workload truth is missing"
+    elif condition.get("scope") == "pid" and not owned_pid_target_causal(
+            condition, mapped_generation):
+        problem = "owned PID generation does not match the selected PID and mapping receipt"
+    elif is_trace:
+        problem = ("trace lacks per-module attribution; matching aggregate counts "
+                   "remain diagnostic")
+    elif not owned["owned_admitted"]:
+        problem = f"receipt-attributed owned admission is unproven: {owned['note']}"
+    elif not owned["owned_calls"]:
+        problem = "receipt-attributed owned activity is missing"
+    elif condition.get("scope") == "pid":
+        positive_truth = {name: count for name, count in truth.items() if count}
+        positive_owned = {name: count for name, count in
+                          (owned["owned_observed"] or {}).items() if count}
+        if positive_owned != positive_truth:
+            problem = ("receipt-attributed PID calls do not equal the owned workload "
+                       f"truth ({positive_owned} vs {positive_truth})")
+    return {"valid": problem is None,
+            "detail": problem or "receipt-attributed owned workload is established"}
+
+
 def derive_phases(samples, stderr_rows, duration_s, t_spawn_ns, t_exit_ns,
                   t_go_ns=None, phase_ms=None, phase_mono_ns=None,
                   burst_go_ns=None, burst_end_ns=None, gate=None,
@@ -1806,6 +1834,10 @@ def main(argv):
         observer_problems.append(f"observer terminated by {observer_signal}")
     if observer_exit != 0:
         observer_problems.append(f"observer exit={observer_exit}")
+    owned_authority = qualifying_owned_workload(
+        meta["condition"], mapped_generation, truth, owned, is_trace=is_trace)
+    if not owned_authority["valid"]:
+        observer_problems.append(owned_authority["detail"])
     phase_authority = qualifying_observer_window(
         observer_phase_ts,
         t_spawn_ns=meta["timing"]["t_spawn_mono_ns"],
@@ -1849,6 +1881,7 @@ def main(argv):
         observer_outcome=observer_outcome,
         burst_window_relation=phases["burst_window_relation"])
     window["observer_phase_authority"] = phase_authority
+    window["owned_workload_authority"] = owned_authority
 
     # Task 3.1 repair: scheduling consistency + which-bound-broke
     # attribution + the cancel control-latency probe. A missing scheduling
@@ -2005,7 +2038,10 @@ def main(argv):
             "BPF load is folded into attach_s (no external marker).",
             "Observer CPU/RSS are wall-window samples; noisy under concurrent "
             "build load (sibling workers) — see the design note.",
-            "counts_match for pid scope requires exact per-name equality; "
+            "counts_match for pid scope is diagnostic aggregate equality. "
+            "A qualifying PID window additionally requires the selected owned "
+            "generation, a complete mapping receipt, and exact receipt-attributed "
+            "per-name rows. Trace windows remain unknown without physical rows. "
             "for system profile/metrics scope it requires receipt-attributed "
             "per-name rows to cover truth (scan-only unknown names use the "
             "owned-attributed total); system trace remains unknown because "

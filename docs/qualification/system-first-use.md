@@ -87,3 +87,21 @@ malformed, contradictory, pre-loop and post-loop cases fail window validity;
 complete frame and marker controls pass. `tests/python/test_measure_e03.py`
 is now invoked by hosted CI and the local gate entry point. This ordinary
 repair supplies no new live first-use, performance or caller-identity result.
+
+### Owned-workload authority
+
+`window.owned_workload_authority` separately requires positive workload
+truth and receipt-attributed activity. PID windows must bind the selected
+PID to the complete mapping receipt and the workload's recorded generation;
+their physical module rows must exactly match the workload counts. This
+uses existing fixture custody receipts and does not add a runtime image
+identity key. Matching aggregate `counts_match` remains a diagnostic fact.
+
+Valid-clock controls reproduced 19 false-positive subcases: wrong selected
+PID/generation/endpoint, changed mapping receipts, foreign or missing module
+identity, admission without owned calls, empty workload truth, and an
+unattributed PID trace total. All now reject window qualification. Positive
+PID and system profile controls still pass. Trace currently has no physical
+module rows, so its aggregate equality cannot qualify an owned window;
+adding attributable trace evidence remains open. These acceptance changes
+do not modify the captured data or promote an old run to live qualification.

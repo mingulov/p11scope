@@ -87,10 +87,17 @@ impl LoaderDiscovery {
     /// True when nothing live discovery did leaves a completeness gap:
     /// only `debug_state_every_hit`, `qualified_pre_constructor`, and
     /// `initial_set_capture.eligible` are neutral (design §9.2).
+    ///
+    /// A dlopen timing class is a gap only once a load happened. Every hit
+    /// of a bound context is counted before its record is reserved, so zero
+    /// `hits` proves no load occurred during the capture: an armed loader
+    /// that never fired cannot have missed a late provider's first call. An
+    /// unbound context counts nothing, so `unavailable` stays a gap on its
+    /// own.
     fn complete(&self) -> bool {
         self.strategies.dlopen_return == 0
             && self.strategies.unavailable == 0
-            && self.dlopen_timing.gaps() == 0
+            && (self.hits == 0 || self.dlopen_timing.gaps() == 0)
             && self.initial_set_timing.gaps() == 0
             && self.initial_set_capture.none == 0
             && self.state_read_failures == 0
@@ -5270,6 +5277,58 @@ pub(crate) mod tests {
         assert_eq!(ev.completeness, "PARTIAL");
     }
 
+    /// A clean `profile --pid` of an already-loaded provider arms the
+    /// target's loader, which then never fires: `hits` 0, one bound context
+    /// whose dlopen timing is unproven only because the timing catalog is
+    /// empty. Every hit of a bound context is counted before any record is
+    /// reserved, so zero hits proves no load happened during the capture and
+    /// no late provider's first call can have been missed. It was classified
+    /// as observation loss anyway, and the verdict read `concrete_gap`.
+    /// Once a load does happen, unproven timing stays a gap (a `run` whose
+    /// child dlopens its provider).
+    #[test]
+    fn an_armed_loader_that_never_fired_is_not_an_observation_gap() {
+        let mut quiet = evidence();
+        quiet.loader_discovery.strategies.debug_state_every_hit = 1;
+        quiet.loader_discovery.dlopen_timing.unproven = 1;
+        quiet.loader_discovery.hits = 0;
+        quiet.verdict();
+        assert!(
+            !quiet
+                .gap_classes(true)
+                .observation
+                .causes
+                .contains(&"loader_discovery"),
+            "{:?}",
+            quiet.gap_classes(true)
+        );
+
+        let mut loaded = quiet.clone();
+        loaded.loader_discovery.hits = 2;
+        loaded.verdict();
+        assert!(
+            loaded
+                .gap_classes(true)
+                .observation
+                .causes
+                .contains(&"loader_discovery")
+        );
+        assert_eq!(loaded.completeness, "PARTIAL");
+
+        let mut unarmed = quiet.clone();
+        unarmed.loader_discovery.strategies.unavailable = 1;
+        unarmed.loader_discovery.dlopen_timing.none = 1;
+        unarmed.verdict();
+        assert!(
+            unarmed
+                .gap_classes(true)
+                .observation
+                .causes
+                .contains(&"loader_discovery"),
+            "an unarmed loader counts no hits, so zero proves nothing"
+        );
+    }
+
     /// A protected window removes exactly one gap — its own. It is not a
     /// licence to call the rest of the capture complete.
     #[test]
@@ -5334,13 +5393,19 @@ pub(crate) mod tests {
             ("loader unavailable", |ev| {
                 ev.loader_discovery.strategies.unavailable = 1
             }),
+            // A dlopen timing class is a gap once a load happened (hits).
             ("unproven timing", |ev| {
+                ev.loader_discovery.hits = 1;
                 ev.loader_discovery.dlopen_timing.unproven = 1
             }),
-            ("no timing", |ev| ev.loader_discovery.dlopen_timing.none = 1),
+            ("no timing", |ev| {
+                ev.loader_discovery.hits = 1;
+                ev.loader_discovery.dlopen_timing.none = 1
+            }),
             // Every LoaderTiming class except qualified_pre_constructor is a gap,
             // for dlopen and initial-set timing alike (audit mutants M-1/M-2).
             ("known pre-relocation timing", |ev| {
+                ev.loader_discovery.hits = 1;
                 ev.loader_discovery.dlopen_timing.known_pre_relocation = 1
             }),
             ("initial-set unproven timing", |ev| {

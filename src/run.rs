@@ -1765,8 +1765,10 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
         // No named view and no cgroup path: discovery sweeps /proc itself.
         ScopeArg::System => (Scope::System, None),
     };
-    if kind == Kind::Trace && a.duration.is_none() {
-        eprintln!("{}", no_duration_notice());
+    match (kind, a.duration) {
+        (Kind::Trace, None) => eprintln!("{}", no_duration_notice()),
+        (Kind::Profile, None) => eprintln!("{}", no_profile_duration_notice()),
+        _ => {}
     }
     warn_unsafe_policy(policy);
     let accepted = preflight_uretprobe_hazard(
@@ -1862,6 +1864,14 @@ fn no_duration_notice() -> String {
          process exits (event cap still applies: default {DEFAULT_TRACE_MAX_EVENTS} events, \
          --max-events to change)"
     )
+}
+
+/// The profile counterpart: no event cap applies to an aggregate
+/// capture, so the notice only names the interrupt that ends it.
+fn no_profile_duration_notice() -> String {
+    "p11scope: no --duration given; profile captures until interrupted (Ctrl-C) or the \
+     process exits"
+        .to_string()
 }
 
 fn capture_policy(kind: Kind, metrics: bool, unsafe_requested: bool) -> Result<CapturePolicy> {
@@ -13965,5 +13975,19 @@ mod correction1_tests {
             "{notice:?}"
         );
         assert!(notice.contains("--max-events"), "{notice:?}");
+    }
+
+    #[test]
+    fn no_profile_duration_notice_says_it_captures_until_ctrl_c() {
+        let notice = no_profile_duration_notice();
+        assert!(
+            notice.starts_with("p11scope: no --duration given; "),
+            "{notice:?}"
+        );
+        assert!(
+            notice.contains("profile captures until interrupted (Ctrl-C)"),
+            "{notice:?}"
+        );
+        assert!(!notice.contains('\n'), "one line: {notice:?}");
     }
 }

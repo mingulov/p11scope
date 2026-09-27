@@ -892,6 +892,55 @@ fn m9_non_utf8_arguments_never_panic() {
     }
 }
 
+/// SE-09: profile without --duration prints one stderr line at start
+/// saying it captures until Ctrl-C (trace already warns).
+#[test]
+fn se09_profile_without_duration_names_ctrl_c_on_stderr() {
+    use std::io::Read as _;
+    use std::process::Stdio;
+    let target = SleepTarget::spawn();
+    let mut child = Command::new(bin())
+        .args(["profile", "--pid", &target.pid()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn p11scope profile");
+    // The notice prints before discovery; give it time to land, then stop
+    // the capture the way an operator would. Without privilege it has
+    // already exited 1 at the BPF preflight and the signal is a no-op.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let _ = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) };
+    let mut waited = 0;
+    while waited < 120 && child.try_wait().expect("poll profile").is_none() {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        waited += 1;
+    }
+    if child.try_wait().expect("poll profile").is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("profile without --duration did not stop on SIGINT");
+    }
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .expect("piped stderr")
+        .read_to_string(&mut stderr)
+        .expect("read profile stderr");
+    assert!(
+        stderr.contains("profile captures until interrupted (Ctrl-C)"),
+        "{stderr}"
+    );
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|line| line.contains("no --duration given"))
+            .count(),
+        1,
+        "exactly one no-duration line: {stderr}"
+    );
+}
+
 /// SE-08: `-o -` never creates a file literally named `-`. Trace
 /// treats it as stdout (its default); profile refuses it with a usage
 /// error saying how to write to stdout.

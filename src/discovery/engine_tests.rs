@@ -10963,6 +10963,60 @@ fn rt_add_deferral_fallback_after_target_exit_is_bounded_loss_not_fatal() {
     assert!(engine.discovery_truncated > truncated_before);
 }
 
+/// Live: `run --pause auto` of a child that dlopens SoftHSM2 captured
+/// 2000/2000 calls with 6-7 confirmed stops, and still read `concrete_gap`
+/// because its loader context's dlopen timing was "unproven". Timing is
+/// unproven only for want of a loader timing catalog; a stop does not need
+/// one. When every loader hit of the view was held by a pause cycle (and so
+/// every table it published was attached before the child resumed), the
+/// context is pause-protected, not a gap. One unpaused hit keeps it lossy.
+#[test]
+fn a_loader_context_whose_every_hit_was_paused_is_pause_protected() {
+    let (_fixture, mut engine, _context, mut record, mut session) = armed_seed_route(2);
+    record.announced_count = 0;
+
+    engine.set_pause_owned_batch(true);
+    apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+    engine.set_pause_owned_batch(false);
+
+    let aggregate = engine.loader_discovery();
+    assert_eq!(aggregate.strategies.debug_state_every_hit, 1);
+    assert_eq!(
+        aggregate.dlopen_timing.unproven, 0,
+        "a held hit is not unproven timing: {aggregate:?}"
+    );
+    assert_eq!(aggregate.dlopen_timing.pause_protected, 1);
+
+    let mut unpaused = record;
+    unpaused.hook_ts_ns += 1;
+    apply_ordinary_batch(&mut engine, &mut session, vec![unpaused]).unwrap();
+    let aggregate = engine.loader_discovery();
+    assert_eq!(aggregate.dlopen_timing.pause_protected, 0);
+    assert_eq!(
+        aggregate.dlopen_timing.unproven, 1,
+        "one hit the child ran through keeps the context lossy"
+    );
+}
+
+/// An owned run published "the empty timing catalog leaves initial-set
+/// capture unproven" as a `discovery subject / discovery unavailable` skip
+/// on every run, beside the `loader_discovery.initial_set_capture` class that
+/// already states exactly that gap: nothing was unavailable, and the one fact
+/// was counted twice. The aggregate is the one authority for it now.
+#[test]
+fn the_initial_set_timing_gap_is_not_also_published_as_a_skip() {
+    let source = include_str!("engine.rs");
+    let marker = [
+        "the empty timing catalog leaves ",
+        "initial-set capture unproven",
+    ]
+    .concat();
+    assert!(
+        !source.contains(&marker),
+        "the initial-set timing gap is published by loader_discovery alone"
+    );
+}
+
 /// GT-4: `attach_gap_ms` was `null` on ordinary `run` captures. An RT_ADD or
 /// RT_DELETE hit only defers a memory scan until the RT_CONSISTENT that ends
 /// the loader transaction; a process that exits first never relocated or

@@ -70,11 +70,24 @@ provider during capture.
 - Every report carries finite gap counters and a verdict. A written report's
   terminal verdict is always `PARTIAL`: detaching a perf link does not wait
   for BPF callbacks already running on another CPU, so no terminal snapshot
-  can prove a final drain.
-  <!-- TODO(release): name the final verdict_detail values once the verdict split lands. -->
+  can prove a final drain. `evidence.verdict_detail` says what is behind it —
+  `clean_but_unproven` (no gap), `attribution_only` (counts exact; a name,
+  owner, mechanism or semantic interpretation withheld) or `concrete_gap`
+  (an observation loss or degraded semantics) — and `evidence.gap_classes`
+  lists the causing fields per class (`observation`, `attribution`,
+  `semantics`). The live evidence line names the same reason.
 - Manifest-free (scan-only) function slots are semantics-unverified and
   count-only; mechanism, session and lifecycle semantics need an accepted
-  `--manifest`.
+  `--manifest`. They still carry standard function names when the provider's
+  own `.dynsym` exports every standard name exactly where its table points
+  (`discovery[].tables[].linkage: "exports"`); otherwise a row reads
+  `unknown#<ordinal>`. Every row carries its exact target
+  (`functions[].target`: pinned object identity and file offset) and the
+  table positions that reach it (`functions[].ordinals`).
+- `evidence.kernel_control` discloses the in-kernel accounting state: a
+  `capture_halted` flag with finite reason names, and counts of owner
+  admission and identity refusals. Any of them forces a concrete-gap
+  `PARTIAL`, and p11scope prints one stderr line when capture halts.
 
 ### Privacy boundary
 
@@ -118,6 +131,12 @@ provider during capture.
   records. `--cgroup` and `--system` deep-scan at most 256 processes per pass
   by default (`--max-scan-pids`). Manifest inputs are capped at 16 MiB per
   manifest, 256 MiB per object and 512 MiB per manifest.
+- Kernel-side capture state: a lifetime budget of 16,384 process identities
+  per `profile`/`trace` capture (never reused; under `--cgroup` and
+  `--system` every process created in scope spends them, whether or not it
+  calls PKCS#11) and at most 16,448 threads with an in-flight call at once.
+  Exhaustion is counted in `evidence.kernel_control`
+  (`identity_budget_exhausted`, `owner_admission_failures`).
 - The per-call event ring defaults to 4 MiB (`--ring-bytes`, 4K–64M); the
   live-discovery ring is a fixed 64 KiB. `trace` stops at 10,000,000 events
   unless `--max-events` sets another cap.
@@ -151,14 +170,23 @@ provider during capture.
 
 ### Known limitations
 
-1. **Capacity.** The 512 slots are shared by every provider in the capture
-   and admission is first come, first served. A refused provider, or a
-   refused growth of an admitted one, is reported and forces `PARTIAL`.
+1. **Capacity.** The 512 slots are shared by every provider in the capture.
+   `--pid`, `run` and captures aimed with `--module` admit providers in
+   discovery order. `--cgroup`/`--system` captures without `--module` admit
+   each provider whole or not at all, by value (`--manifest` providers, then
+   corroborated tables, then heuristic finds, proxy closure arrays last), and
+   heuristic finds may not use the last 128 slots (25%), kept for
+   corroborated providers found later. A refused provider, or a refused growth
+   of an admitted one, is reported with what holds the slots and forces
+   `PARTIAL`.
 2. **`--system` is a preview.** Whole-machine capture shares the 512 slots
    with every ambient provider on the host (NSS, `p11-kit-trust`, p11-kit
    proxies, …), takes seconds to start, and on busy hosts loses live-discovery
-   records (reported as loss). Aim it with `--system --module <path>`.
-   <!-- TODO(release): restate after the admission fix and its measurement (owner decision D2). -->
+   records (reported as loss). Aim it with `--system --module <path>`. Long
+   `--cgroup`/`--system` captures of busy hosts can spend the 16,384-identity
+   budget (about an hour at 5 new processes per second); later processes are
+   then counted only as identity refusals.
+   <!-- TODO(release): restate with the measured `--system` result on a desktop-class host (owner decision D2). -->
 3. **Coverage window.** Calls made before attach are not observed, and the
    first calls after a late `dlopen` can be missed before that provider's
    probes land — also under `run`, including with `--pause auto`. Manifest-free
@@ -191,10 +219,39 @@ provider during capture.
 
 ### Fixed during release-readiness work (2026-09-26)
 
-<!-- TODO(release): the release coordinator fills this list from the 2026-09-26
-     release-readiness commits: one line per user-visible fix, newest last. -->
+Fixes to defects found while qualifying this release, before it was tagged:
 
-- TODO(release): …
+- `run --pause auto` of a command that exits before its deferred loader scan
+  keeps the capture and writes the report instead of failing with none.
+- A `--pid` or `run` capture whose target exits while live discovery is
+  arming or preflighting ends normally with its report instead of failing.
+- Already-loaded providers are named: tables whose ordinals agree with the
+  provider's own exports get standard function names instead of `unknown`
+  rows, and every row carries its exact target and ordinals.
+- The verdict is split: a clean scan-only capture reads `attribution_only`
+  rather than `concrete_gap`; the terminal verdict is judged on the final
+  output accounting; the live line names why it is `PARTIAL`.
+- `--cgroup`/`--system` admission is by value and whole-module with a
+  capacity reserve, so ambient proxies (p11-kit) can no longer take every
+  slot and starve the provider of interest; refusals name the slot holders
+  and `--module`.
+- A multi-process capture starts once and retires views that go stale
+  meanwhile; a view's mount table is read once per scan; attach cells a
+  candidate allocated but never linked are given back.
+- In-kernel call-owner accounting no longer breaks under multi-core
+  contention (it could halt all capture), and its state is disclosed in
+  `evidence.kernel_control`; interface flags are published only as a finite
+  class.
+- `-o` refuses names that are not regular files (directories, `/dev/null`,
+  FIFOs, sockets, symlinks) instead of replacing them, and keeps a previous
+  trace file until the capture has attached; a closed stdout or stderr pipe
+  no longer panics; Ctrl-C during startup is honoured without leaving
+  temporary files; `inspect` of a target whose maps cannot be read exits 1
+  instead of reporting no modules.
+  <!-- TODO(release): the items in this bullet come from fix/rr-cli-output; drop any that is not merged by the tag. -->
+- `p11scope-discover --version`; release builds no longer embed build-host
+  paths; hosted CI can run its manual release-preview job.
+<!-- TODO(release): add any further user-visible fixes merged before the tag. -->
 
 ### Qualification of this release
 

@@ -26,7 +26,7 @@ change after step 5 means starting again from step 3.
 - Resolve every other release placeholder, then check that none remain:
 
   ```sh
-  git grep -n 'TODO(release)'   # must print nothing
+  git grep -n 'TODO[(]release)'   # must print nothing
   ```
 
   They mark the tag date, the qualification record in `CHANGELOG.md`, and

@@ -157,18 +157,26 @@ sudo p11scope doctor
 
   Start with a passive diagnostic capture. This manifest-free path retains
   aggregate function counts, return values and latency; scanned slots are
-  semantics-unverified and count-only:
+  semantics-unverified and count-only. Rows carry standard function names
+  when the provider's own `.dynsym` exports every standard name exactly where
+  its function table points (`linkage: "exports"`, as SoftHSM2 does);
+  otherwise they read `unknown#<ordinal>`, never a guessed name. `doctor` and
+  `inspect` need the same privileges as a capture to assess or read another
+  user's process:
 
   ```bash
-  p11scope doctor --pid 12345
-  p11scope inspect --pid 12345
+  sudo p11scope doctor --pid 12345
+  sudo p11scope inspect --pid 12345
   sudo p11scope profile --pid 12345 --duration 60 -o diagnostic-profile.json
   ```
 
-  Whole-machine capture needs no PID or cgroup path:
+  Whole-machine capture (a preview in v0.1.0) needs no PID or cgroup path;
+  `--module` aims it at one provider:
 
   ```bash
   sudo p11scope profile --system --duration 60 -o system-profile.json
+  sudo p11scope profile --system --module /usr/lib/softhsm/libsofthsm2.so \
+    --duration 60 -o softhsm-profile.json
   ```
 
   For semantic capture, follow the separate
@@ -248,10 +256,27 @@ report format.
   named cause and a hint, never a panic or a raw verifier dump
   (`docs/notes/phase5-unsupported.md`).
 - `inspect` shows every provider-shaped module mapped by the target; an
-  optional `--module` only narrows that set. On the measured p11-kit stack,
-  p11-kit's fixed closure array exceeds the 512-slot ceiling and is refused
-  whole, while the later-fitting SoftHSM2 backend attaches; the report is
-  explicitly `PARTIAL`, not a claim that the proxy layer was captured.
+  optional `--module` only narrows that set. A target whose memory maps it
+  cannot read is an error (exit 1), never an empty module list. On the
+  measured p11-kit stack, p11-kit's fixed closure array exceeds the 512-slot
+  ceiling and is refused whole, while the later-fitting SoftHSM2 backend
+  attaches; the report is explicitly `PARTIAL`, not a claim that the proxy
+  layer was captured.
+- A capture has 512 attach slots. `--pid`, `run`, and any capture aimed with
+  `--module` admit providers in discovery order. A `--cgroup` or `--system`
+  capture without `--module` admits each provider whole or not at all, by
+  value — `--manifest` providers first, then providers whose function table
+  is corroborated, then heuristic finds, proxy closure arrays last. Heuristic
+  finds and closure arrays may not use the last 128 slots (25%), which stay
+  free for corroborated providers found later in the capture. A refusal names
+  what holds the slots; in such a shared capture it also names the reserve and
+  suggests `--module`.
+- Kernel-side state has fixed limits too: a lifetime budget of 16,384 process
+  identities per `profile`/`trace` capture (under `--cgroup` and `--system`
+  every process created in scope spends them) and 16,448 concurrent in-flight
+  call owners. Exhaustion, and any in-kernel accounting fault that halts
+  capture, is disclosed in `evidence.kernel_control` (`capture_halted`,
+  `identity_budget_exhausted`) and forces `PARTIAL`.
 - Discovery has one capture-wide 512 MiB attempted-I/O allowance shared by
   memory scans and scan-sourced file hashes across all selected processes and
   retries, with at most 256 MiB per scan/hash operation. It also stops at 512 accepted
@@ -286,11 +311,14 @@ report format.
   functions, event loss) — `COMPLETE`/`PARTIAL`, never silently confident.
   **A terminal snapshot is always `PARTIAL`**: detaching a perf link stops new
   invocations but does not wait for BPF callbacks already running on another
-  CPU, so a completed capture cannot honestly claim a proven final drain. A
-  clean run is `PARTIAL` with every concrete gap counter zero; that is the
-  contract the release lanes assert.
-  <!-- TODO(release): restate with the final verdict_detail values once the verdict split lands. -->
-  Absence of a call means "not observed in
+  CPU, so a completed capture cannot honestly claim a proven final drain.
+  `evidence.verdict_detail` says what is behind a `PARTIAL`:
+  `clean_but_unproven` (no gap; only the final drain is unproven),
+  `attribution_only` (counts are exact; a name, owner, mechanism or semantic
+  interpretation is withheld, as for every count-only scanned slot), or
+  `concrete_gap` (an observation loss or degraded semantics), and
+  `evidence.gap_classes` names the fields that caused it. The live evidence
+  line states the same reason. Absence of a call means "not observed in
   this window," never "the application cannot do it"; aliased table entries are
   ambiguous by construction; requested attributes are what the app asked for,
   not the key's effective policy. Full honest-claims section:
@@ -336,7 +364,9 @@ Provider identity is pinned by SHA-256 at attach and re-checked (`fstat`
 ino/size/ctime) before, during, and after capture; a change during capture
 sets `evidence.provider_changed`, which forces the report `PARTIAL`. Profile
 output is published atomically (private temp beside the target, fsync,
-rename).
+rename). `-o` names a regular file: a directory, a device node such as
+`/dev/null`, a FIFO, a socket or a symbolic link is refused before the capture
+starts, never replaced.
 
 Memory scanning is heuristic discovery. Live and terminal evidence are PARTIAL
 while scan-only semantic claims remain. P11Lab joins reject scan-only and

@@ -140,9 +140,10 @@ the application used none. For those semantics, use the separate
 [attested capture workflow](#attested-semantic-capture).
 
 ```bash
-# 1. What can this host do, and what does the target map?
-p11scope doctor --pid 12345
-p11scope inspect --pid 12345
+# 1. What can this host do, and what does the target map? (sudo: reading
+#    another user's process, and the BPF preflight, need the capture's privileges)
+sudo p11scope doctor --pid 12345
+sudo p11scope inspect --pid 12345
 
 # 2. Count-only diagnostics — no helper or observer-initiated provider calls.
 sudo p11scope profile --pid 12345 --duration 60 -o observed-profile.json
@@ -343,7 +344,14 @@ discovery sweeps `/proc` under the same `--max-scan-pids` cap (default 256,
 rarest providers first). `--system` is a preview in v0.1.0 (see the
 [known limitations](../CHANGELOG.md#known-limitations)): scope admission does
 not promise that every process or call is captured, and the whole-machine
-scope shares the 512 attach slots with every ambient provider.
+scope shares the 512 attach slots with every ambient provider. Without
+`--module`, a `--cgroup` or `--system` capture admits each provider whole or
+not at all, by value: `--manifest` providers, then providers with a
+corroborated function table, then heuristic finds, proxy closure arrays last;
+heuristic finds and closure arrays may not use the last 128 slots (25%), kept
+for corroborated providers found later. A refusal names what holds the slots,
+the reserve, and `--module <path>` as the way to capture one provider, which
+admits in discovery order as `--pid` and `run` do.
 Per-process and per-module attribution is still recorded —
 each retained generation keeps its own view and pins — and `capture.scope`
 in the JSON report reads `"system"`. Fork children are admitted without a

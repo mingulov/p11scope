@@ -102,3 +102,11 @@ matrix_select_timeout() {
 # usable resolver (the host's resolver is a loopback stub), so apt inside the
 # image build cannot resolve its archive. It affects only the image build,
 # never the containers or pods under test.
+
+# `p11scope profile` draws its live frame only when stdout is a terminal
+# (cb59e2e), and that frame, drawn only once every probe is attached, is the
+# lanes' attach-before-run barrier (wait_for_capture_ready). Observers
+# therefore run under `python3 -I "$MATRIX_PTY" COMMAND...`, which gives the
+# command a pseudo-terminal, copies its output to stdout, forwards
+# SIGINT/SIGTERM/SIGHUP exactly once and returns the command's status.
+MATRIX_PTY=$(pwd -P)/scripts/matrix/pty-run.py

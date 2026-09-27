@@ -138,7 +138,7 @@ printf '%s\n' "$UNPRIV_OUT" | is_linux_permission_denial \
 
 echo "=== capture one container after observer readiness ==="
 launch_root_recorded_process "$WORK/profile.pid" "$WORK/profile.log" \
-    "$MATRIX_TIMEOUT" --foreground --signal=TERM --kill-after=35s 45s \
+    python3 -I "$MATRIX_PTY" "$MATRIX_TIMEOUT" --foreground --signal=TERM --kill-after=35s 45s \
     "$P11SCOPE_EXE" profile \
     --cgroup "$CGROUP_PATH" \
     --mode metrics --duration 30 -o "$WORK/observed.json"

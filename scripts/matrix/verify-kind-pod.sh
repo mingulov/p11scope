@@ -195,7 +195,7 @@ printf '%s\n' "$UNPRIV_OUT" | is_linux_permission_denial \
     || { echo "unprivileged profile did not fail closed" >&2; exit 1; }
 
 echo "=== attach before the pod workload makes a single call ==="
-set -- timeout --signal=TERM --kill-after=5s 45s \
+set -- python3 -I "$MATRIX_PTY" timeout --signal=TERM --kill-after=5s 45s \
     "$P11SCOPE_EXE" profile \
     --cgroup "$POD_CG" \
     --mode metrics --duration 20 -o "$WORK/observed.json"
@@ -204,7 +204,13 @@ SPID=$ROOT_LAUNCH_PID
 SUPERVISOR_PID=$ROOT_PROCESS_PID
 SUPERVISOR_STARTTIME=$ROOT_PROCESS_STARTTIME
 wait_for_capture_ready "$WORK/profile.log" aggregate-only metrics
-timeout --signal=TERM --kill-after=5s 60s kubectl exec "$POD" -- touch /tmp/go
+# Release the workload from the node, through the harness's own mount view.
+# `kubectl exec ... touch` would start a short-lived process inside the pod
+# cgroup during the capture; live discovery must then account for a process
+# that may exit before its mappings can be read, which the capture honestly
+# reports as a discovery loss. The docker lanes release their workload from
+# the host the same way (a bind-mounted go-file).
+sudo -n touch "/proc/$MAPPED_PROVIDER_PID/root/tmp/go"
 if wait "$WPID"; then
     WPID=
 else

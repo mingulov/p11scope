@@ -38,6 +38,19 @@ def main(argv):
         (item["calls"] for item in document["functions"] if item["calls"]),
         reverse=True,
     )
+    evidence = document["evidence"]
+    print(
+        "verdict:", evidence.get("verdict_detail"),
+        "gap_classes:", evidence.get("gap_classes"),
+        "drain_proven:", evidence.get("drain_proven"),
+    )
+    named = sorted(
+        (name, item["calls"])
+        for item in document["functions"]
+        if item["calls"]
+        for name in item["names"]
+    )
+    print(f"per-name counts: {named}")
     print(f"per-slot counts: want {wanted}")
     print(f"per-slot counts: got  {actual}")
     if actual != wanted:

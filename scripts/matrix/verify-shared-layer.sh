@@ -497,7 +497,7 @@ run_capture() {
     wait_for_cgroup_provider "$LEAF_A_PATH" libsofthsm2.so
     wait_for_cgroup_provider "$LEAF_B_PATH" libsofthsm2.so
     launch_root_recorded_process "$WORK/$label.pid" "$WORK/$label.log" \
-        "$MATRIX_TIMEOUT" --foreground --signal=TERM --kill-after=35s 45s \
+        python3 -I "$MATRIX_PTY" "$MATRIX_TIMEOUT" --foreground --signal=TERM --kill-after=35s 45s \
         "$P11SCOPE_EXE" profile \
         --cgroup "$cgroup" \
         --mode metrics --duration 30 -o "$WORK/$label.json"

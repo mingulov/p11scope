@@ -321,6 +321,9 @@ pub(crate) trait PauseIo {
 
     /// The owned pause chain ended while `publication_pending` held.
     fn note_unpaused_publication(&mut self) {}
+
+    /// A cycle did not confirm: its stop protects nothing.
+    fn note_unconfirmed_cycle(&mut self) {}
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1491,6 +1494,7 @@ impl PauseCoordinator {
     ) -> Result<(), PauseError> {
         let message = message.into();
         self.set_message_diagnostic(&message);
+        io.note_unconfirmed_cycle();
         if !lifecycle {
             self.set_diagnostic(PauseDiagnostic::OtherAutoNonconfirmed);
         }
@@ -2155,7 +2159,8 @@ impl PauseIo for SessionPauseIo<'_> {
         }
         let records = terminal_dispatch.then(Vec::new).unwrap_or(records);
         let before_ns = attach::monotonic_ns();
-        let result = match self.engine.apply_discovery_batch_with(
+        self.engine.set_pause_owned_batch(pause_owned);
+        let applied = self.engine.apply_discovery_batch_with(
             self.session,
             records,
             std::mem::take(&mut self.malformed),
@@ -2163,7 +2168,9 @@ impl PauseIo for SessionPauseIo<'_> {
             terminal_dispatch,
             &mut collect,
             deadline,
-        ) {
+        );
+        self.engine.set_pause_owned_batch(false);
+        let result = match applied {
             Ok(outcome) => {
                 self.plan_changed |= outcome.changed;
                 Ok(outcome.required_complete)
@@ -2344,6 +2351,11 @@ impl PauseIo for SessionPauseIo<'_> {
 
     fn note_unpaused_publication(&mut self) {
         self.engine.note_owned_pause_gap(MSG_UNPAUSED_PUBLICATION);
+        self.engine.note_unprotected_owned(self.child.pid());
+    }
+
+    fn note_unconfirmed_cycle(&mut self) {
+        self.engine.note_unprotected_owned(self.child.pid());
     }
 }
 

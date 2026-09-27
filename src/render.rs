@@ -39,18 +39,23 @@ pub struct LoaderStrategies {
 }
 
 /// One load kind's timing classification, per exact bound context (design
-/// §9.2). With the empty compiled-in catalog (D3 amendment §3) only `unproven`
-/// and `none` are ever reachable, and both force `PARTIAL`.
+/// §9.2). With the empty compiled-in catalog (D3 amendment §3) the catalog
+/// classes are never reachable: a context is `unproven` or `none`, both
+/// gaps, unless an owned `run`'s pause held every one of its loader hits and
+/// table publications until the probes were attached — `pause_protected`,
+/// which needs no catalog and is not a gap.
 #[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
 pub struct LoaderTiming {
     pub qualified_pre_constructor: u64,
     pub known_pre_relocation: u64,
     pub unproven: u64,
     pub none: u64,
+    pub pause_protected: u64,
 }
 
 impl LoaderTiming {
-    /// Every classification except `qualified_pre_constructor` is a gap.
+    /// Every classification except `qualified_pre_constructor` and
+    /// `pause_protected` is a gap.
     fn gaps(&self) -> u64 {
         self.known_pre_relocation
             .saturating_add(self.unproven)
@@ -64,6 +69,9 @@ impl LoaderTiming {
 pub struct InitialSetCapture {
     pub eligible: u64,
     pub none: u64,
+    /// The owned child's initial set was held by its pause (see
+    /// `LoaderTiming::pause_protected`); not a gap.
+    pub pause_protected: u64,
 }
 
 /// The whole public live-loader surface: finite aggregate counts, never a
@@ -85,8 +93,9 @@ pub struct LoaderDiscovery {
 
 impl LoaderDiscovery {
     /// True when nothing live discovery did leaves a completeness gap:
-    /// only `debug_state_every_hit`, `qualified_pre_constructor`, and
-    /// `initial_set_capture.eligible` are neutral (design §9.2).
+    /// only `debug_state_every_hit`, `qualified_pre_constructor`,
+    /// `pause_protected`, and `initial_set_capture.eligible` /
+    /// `.pause_protected` are neutral (design §9.2).
     ///
     /// A dlopen timing class is a gap only once a load happened. Every hit
     /// of a bound context is counted before its record is reserved, so zero
@@ -5126,6 +5135,7 @@ pub(crate) mod tests {
                     "known_pre_relocation",
                     "unproven",
                     "none",
+                    "pause_protected",
                 ],
             ),
             (
@@ -5135,9 +5145,13 @@ pub(crate) mod tests {
                     "known_pre_relocation",
                     "unproven",
                     "none",
+                    "pause_protected",
                 ],
             ),
-            ("initial_set_capture", vec!["eligible", "none"]),
+            (
+                "initial_set_capture",
+                vec!["eligible", "none", "pause_protected"],
+            ),
         ] {
             let object = aggregate[group]
                 .as_object()
@@ -5326,6 +5340,48 @@ pub(crate) mod tests {
                 .causes
                 .contains(&"loader_discovery"),
             "an unarmed loader counts no hits, so zero proves nothing"
+        );
+    }
+
+    /// An owned run whose pause held every loader hit and table publication
+    /// until the probes were attached is not an observation gap for its
+    /// loader timing, even with the empty catalog; the same run with one
+    /// unpaused hit stays lossy.
+    #[test]
+    fn a_pause_protected_loader_context_is_not_an_observation_gap() {
+        let mut protected = evidence();
+        protected.loader_discovery.hits = 5;
+        protected.loader_discovery.strategies.debug_state_every_hit = 2;
+        protected.loader_discovery.dlopen_timing.pause_protected = 1;
+        protected
+            .loader_discovery
+            .initial_set_timing
+            .pause_protected = 1;
+        protected
+            .loader_discovery
+            .initial_set_capture
+            .pause_protected = 1;
+        protected.verdict();
+        assert!(
+            !protected
+                .gap_classes(true)
+                .observation
+                .causes
+                .contains(&"loader_discovery"),
+            "{:?}",
+            protected.gap_classes(true)
+        );
+
+        let mut lossy = protected.clone();
+        lossy.loader_discovery.dlopen_timing.pause_protected = 0;
+        lossy.loader_discovery.dlopen_timing.unproven = 1;
+        lossy.verdict();
+        assert!(
+            lossy
+                .gap_classes(true)
+                .observation
+                .causes
+                .contains(&"loader_discovery")
         );
     }
 

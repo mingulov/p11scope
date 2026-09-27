@@ -254,16 +254,17 @@ carries no meaning (a real document's object keys arrive sorted).
 | `strategies.debug_state_every_hit` | Exact bound contexts served by the `_dl_debug_state` hook on every hit. The only strategy that leaves no completeness gap. |
 | `strategies.dlopen_return` | **Structurally zero in this build.** The key is always published, but this slice attaches `_dl_debug_state` only and has no `dlopen_return` product path at all, so nothing can increment it. Read a zero here as "this strategy does not exist yet", not as "it was available and unused". |
 | `strategies.unavailable` | Contexts with no usable loader binding. Forces `PARTIAL`. |
-| `dlopen_timing.*` | One classification for each exact bound context whose load kind is an ordinary `dlopen`: `qualified_pre_constructor` (the only value with no gap), `known_pre_relocation`, `unproven`, `none`. |
-| `initial_set_timing.*` | The same four classifications for the owned run's pre-exec initial-set context. |
-| `initial_set_capture.eligible` / `.none` | Whether an owned `run` could capture its child's initial provider set before the child's first constructor ran. `none` forces `PARTIAL`. |
+| `dlopen_timing.*` | One classification for each exact bound context whose load kind is an ordinary `dlopen`: `qualified_pre_constructor`, `known_pre_relocation`, `unproven`, `none`, `pause_protected`. `qualified_pre_constructor` and `pause_protected` are not gaps. `pause_protected` (v3 documents only): an owned `run` whose confirmed pause held every loader hit of the context and every table it published until that table's probes were attached, so no call through the table ran unobserved. Any hit, deferred scan or attach that happened while the child ran, and any unconfirmed cycle, leaves the context `unproven`. |
+| `initial_set_timing.*` | The same five classifications for the owned run's pre-exec initial-set context. |
+| `initial_set_capture.eligible` / `.none` / `.pause_protected` | Whether an owned `run` could capture its child's initial provider set before the child's first constructor ran (`eligible`), could not (`none`, forces `PARTIAL`), or had it held by its pause as above (`pause_protected`, not a gap). |
 | `hits` | Scoped BPF debug-state hit counter, incremented before ring reservation and never derived from received-record counts. A hit is not a loss: this counter alone never changes the verdict. |
 | `state_read_failures` | The separate BPF counter for `_r_debug.r_state` reads. There is no second public copy of it, in this object or beside it. |
 
-With the empty compiled-in timing catalog this build ships, only `unproven` and
-`none` are reachable in either timing group, and `initial_set_capture.eligible`
-is unreachable. Both reachable values are gaps, so any capture that recorded an
-exact bound loader context at all is `PARTIAL`.
+With the empty compiled-in timing catalog this build ships, only `unproven`,
+`none` and `pause_protected` are reachable in either timing group, and
+`initial_set_capture.eligible` is unreachable. A dlopen timing class is a gap
+only once a load happened (`hits > 0`): an armed loader that never fired cannot
+have missed a late provider's first call.
 
 The three classification groups are one partition of the same exact bound
 context set, not three independent tallies:
@@ -353,9 +354,10 @@ them:
   unattempted pause, `pause: none`, is not);
 - in `loader_discovery`: `strategies.dlopen_return` and `strategies.unavailable`
   are zero, every timing classification other than `qualified_pre_constructor`
-  is zero in **both** timing groups, `initial_set_capture.none` is zero, and
-  `state_read_failures` is zero. `hits` and
-  `initial_set_capture.eligible` are not gaps;
+  and `pause_protected` is zero in **both** timing groups (the dlopen group
+  only when `hits > 0`), `initial_set_capture.none` is zero, and
+  `state_read_failures` is zero. `hits`, `initial_set_capture.eligible` and
+  `.pause_protected` are not gaps;
 - no `functions[]` row is `module_unresolved`;
 - the unpublished unprotected-live-window input above is zero.
 

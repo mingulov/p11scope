@@ -88,6 +88,16 @@ pub struct Engine {
     terminal_batch: Option<TerminalBatch>,
     terminal_journal: Option<TerminalJournal>,
     pending_discovery_records: Vec<QueuedDiscoveryRecord>,
+    /// Set while a pause cycle applies its batch (the owned child stopped).
+    pause_owned_batch: bool,
+    /// The records the running pause-owned batch was handed.
+    held_records: BTreeSet<(u64, u64, u8)>,
+    /// Views with at least one loader hit held by a pause stop, and views
+    /// where a loader hit, export return, deferred scan or static attach
+    /// happened while the child ran. A bound loader context is
+    /// pause-protected only in the first set and not in the second.
+    paused_loader_views: BTreeSet<ProcessViewId>,
+    unpaused_loader_views: BTreeSet<ProcessViewId>,
     /// A live frame's work budget (H-1); `LIVE_FRAME_WORK_BUDGET_NS` except
     /// in tests.
     frame_work_budget_ns: u64,
@@ -6952,6 +6962,11 @@ fn arm_refreshed_views_with(
     Ok(changed)
 }
 
+/// A record's identity within one batch: who produced it, when, and what.
+fn held_record_key(record: &DiscoveryRecord) -> (u64, u64, u8) {
+    (record.pid_tgid, record.hook_ts_ns, record.kind)
+}
+
 /// Whether an unresolvable record of an ended generation could have announced
 /// code that then ran unobserved, so the capture's causal gap is unproven. A
 /// loader hit in RT_ADD or RT_DELETE state cannot: dlopen relocates and
@@ -7186,6 +7201,10 @@ impl Engine {
             terminal_batch: None,
             terminal_journal: None,
             pending_discovery_records: Vec::new(),
+            pause_owned_batch: false,
+            held_records: BTreeSet::new(),
+            paused_loader_views: BTreeSet::new(),
+            unpaused_loader_views: BTreeSet::new(),
             // Ordinary tests exercise discovery semantics, not wall-clock
             // bounds, on loaded CI hosts; the H-1 tests opt in explicitly.
             frame_work_budget_ns: if cfg!(test) {
@@ -7280,18 +7299,37 @@ impl Engine {
             state_read_failures: self.counter_snapshot.loader_state_read_failures,
             ..render::LoaderDiscovery::default()
         };
-        for class in self.loader_contexts.values() {
+        for ((view, _, _), class) in &self.loader_contexts {
+            // Pause-protected: every loader hit of this view was held by a
+            // pause stop, nothing it published was scanned or attached while
+            // the child ran, and every cycle confirmed. That needs no loader
+            // timing catalog: the child was stopped at each hit and at each
+            // table publication until its probes were attached.
+            let protected = class.bound
+                && self.paused_loader_views.contains(view)
+                && !self.unpaused_loader_views.contains(view);
             let timing = if class.initial_set {
                 // Exactly one initial-set context per owned run, and the empty
                 // catalog can never make it eligible (D3 amendment §3).
-                aggregate.initial_set_capture.none =
-                    aggregate.initial_set_capture.none.saturating_add(1);
+                if protected {
+                    aggregate.initial_set_capture.pause_protected = aggregate
+                        .initial_set_capture
+                        .pause_protected
+                        .saturating_add(1);
+                } else {
+                    aggregate.initial_set_capture.none =
+                        aggregate.initial_set_capture.none.saturating_add(1);
+                }
                 &mut aggregate.initial_set_timing
             } else {
                 &mut aggregate.dlopen_timing
             };
             if class.bound {
-                timing.unproven = timing.unproven.saturating_add(1);
+                if protected {
+                    timing.pause_protected = timing.pause_protected.saturating_add(1);
+                } else {
+                    timing.unproven = timing.unproven.saturating_add(1);
+                }
                 aggregate.strategies.debug_state_every_hit =
                     aggregate.strategies.debug_state_every_hit.saturating_add(1);
             } else {
@@ -7376,6 +7414,56 @@ impl Engine {
         self.frame_deadline_ns = None;
         self.frame_deferred = false;
         result
+    }
+
+    /// Marks the batches a pause cycle applies while the owned child is
+    /// stopped: its records were held by that stop, and whatever they
+    /// publish is attached before the child resumes.
+    pub(crate) fn set_pause_owned_batch(&mut self, owned: bool) {
+        self.pause_owned_batch = owned;
+    }
+
+    /// A pause cycle for `pid` did not confirm: nothing about its views can
+    /// be called pause-protected.
+    pub(crate) fn note_unprotected_owned(&mut self, pid: u32) {
+        let views: Vec<_> = self
+            .views
+            .iter()
+            .filter(|view| view.pid() == pid)
+            .map(ProcessView::id)
+            .collect();
+        self.unpaused_loader_views.extend(views);
+    }
+
+    /// Books whether a publishing record (a loader hit or an export return)
+    /// was held by a pause stop: only a record this pause-owned batch was
+    /// handed is. Every other one — an ordinary frame, a carried-over or a
+    /// nested-collected record — ran while the child was running.
+    fn note_record_protection(&mut self, record: &DiscoveryRecord) {
+        if !matches!(
+            record.kind,
+            DISCOVERY_KIND_LOADER
+                | DISCOVERY_KIND_FUNCTION_LIST_RETURN
+                | DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN
+                | DISCOVERY_KIND_INTERFACE_RETURN
+        ) {
+            return;
+        }
+        let pid = (record.pid_tgid >> 32) as u32;
+        let held = self.held_records.contains(&held_record_key(record));
+        let views: Vec<_> = self
+            .views
+            .iter()
+            .filter(|view| view.pid() == pid)
+            .map(ProcessView::id)
+            .collect();
+        for view in views {
+            if !held {
+                self.unpaused_loader_views.insert(view);
+            } else if record.kind == DISCOVERY_KIND_LOADER {
+                self.paused_loader_views.insert(view);
+            }
+        }
     }
 
     /// The capture's operator-stop flag: a live frame that sees it set
@@ -9282,6 +9370,31 @@ impl Engine {
                 *additions_allowed = false;
             }
         }
+        if new_targets_attached && !self.pause_owned_batch && !candidate.delta.new.is_empty() {
+            // Provider slots attached while the child ran: whatever it
+            // called before this attach went unobserved.
+            let objects: BTreeSet<_> = candidate
+                .delta
+                .new
+                .iter()
+                .flat_map(|slot| slot.module_ids.iter())
+                .filter_map(|id| {
+                    candidate
+                        .plan
+                        .modules
+                        .iter()
+                        .find(|module| module.id == *id)
+                        .map(|module| module.object)
+                })
+                .collect();
+            let views: Vec<_> = candidate
+                .modules
+                .iter()
+                .filter(|module| objects.contains(&module.object))
+                .map(|module| module.scanned.view)
+                .collect();
+            self.unpaused_loader_views.extend(views);
+        }
         self.finalize_candidate(
             session,
             candidate,
@@ -10355,6 +10468,9 @@ impl Engine {
                 required_complete = false;
                 continue;
             };
+            if !self.pause_owned_batch {
+                self.unpaused_loader_views.insert(key.view);
+            }
             match self.process_validated_loader_scan(
                 position,
                 key.context,
@@ -13636,6 +13752,7 @@ impl Engine {
                         .extend(std::iter::once(queued).chain(batch));
                     break;
                 }
+                self.note_record_protection(&queued.record);
                 let record = queued.record;
                 let origin = (queued.record.pid_tgid >> 32) as u32;
                 match self.dispatch_discovery_record(
@@ -15421,6 +15538,11 @@ impl Engine {
         collect: &mut DiscoveryCollector<'_>,
     ) -> Result<DiscoveryBatchOutcome> {
         self.charge_discovery_drain(records.len(), malformed);
+        self.held_records = if self.pause_owned_batch {
+            records.iter().map(held_record_key).collect()
+        } else {
+            BTreeSet::new()
+        };
         let mut queued = std::mem::take(&mut self.pending_discovery_records);
         queued.extend(records.into_iter().map(|record| QueuedDiscoveryRecord {
             record,
@@ -15771,10 +15893,10 @@ impl Engine {
                 {
                     self.record_loader_arm(view, true);
                 }
-                self.mark_partial(
-                    "owned initial-set discovery",
-                    "the empty timing catalog leaves initial-set capture unproven",
-                );
+                // The initial set's timing gap is stated once, by
+                // `loader_discovery.initial_set_capture`: publishing it as a
+                // "discovery unavailable" skip too counted one fact twice and
+                // named nothing that was unavailable.
             } else {
                 fatal = self.arm_initial_views(
                     &mut session,

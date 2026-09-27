@@ -127,10 +127,11 @@
             "initial_set_capture": {
               "type": "object",
               "additionalProperties": false,
-              "required": ["eligible", "none"],
+              "required": ["eligible", "none", "pause_protected"],
               "properties": {
                 "eligible": {"type": "integer", "minimum": 0},
-                "none": {"type": "integer", "minimum": 0}
+                "none": {"type": "integer", "minimum": 0},
+                "pause_protected": {"type": "integer", "minimum": 0}
               }
             },
             "hits": {"type": "integer", "minimum": 0},
@@ -507,12 +508,13 @@
     "loader_timing": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["qualified_pre_constructor", "known_pre_relocation", "unproven", "none"],
+      "required": ["qualified_pre_constructor", "known_pre_relocation", "unproven", "none", "pause_protected"],
       "properties": {
         "qualified_pre_constructor": {"type": "integer", "minimum": 0},
         "known_pre_relocation": {"type": "integer", "minimum": 0},
         "unproven": {"type": "integer", "minimum": 0},
-        "none": {"type": "integer", "minimum": 0}
+        "none": {"type": "integer", "minimum": 0},
+        "pause_protected": {"type": "integer", "minimum": 0}
       }
     },
     "selection_request": {

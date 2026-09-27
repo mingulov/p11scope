@@ -76,12 +76,13 @@ LOADER_TIMING_KEYS = (
     "known_pre_relocation",
     "unproven",
     "none",
+    "pause_protected",
 )
 LOADER_DISCOVERY_GROUPS = {
     "strategies": ("debug_state_every_hit", "dlopen_return", "unavailable"),
     "dlopen_timing": LOADER_TIMING_KEYS,
     "initial_set_timing": LOADER_TIMING_KEYS,
-    "initial_set_capture": ("eligible", "none"),
+    "initial_set_capture": ("eligible", "none", "pause_protected"),
 }
 LOADER_DISCOVERY_COUNTERS = ("hits", "state_read_failures")
 # Consumer-scheduling evidence (Task 3.1 repair): one nested object, closed
@@ -907,14 +908,16 @@ def exact_task_uprobe_link_losses(evidence):
 
 def loader_discovery_complete(loader):
     """render.rs `LoaderDiscovery::complete`: only neutral strategies,
-    qualified pre-constructor timing, and eligible initial sets."""
+    qualified pre-constructor or pause-protected timing, and eligible or
+    pause-protected initial sets; dlopen timing is a gap only once a load
+    happened (hits > 0)."""
     def timing_gaps(timing):
         return timing["known_pre_relocation"] + timing["unproven"] + timing["none"]
 
     return (
         loader["strategies"]["dlopen_return"] == 0
         and loader["strategies"]["unavailable"] == 0
-        and timing_gaps(loader["dlopen_timing"]) == 0
+        and (loader["hits"] == 0 or timing_gaps(loader["dlopen_timing"]) == 0)
         and timing_gaps(loader["initial_set_timing"]) == 0
         and loader["initial_set_capture"]["none"] == 0
         and loader["state_read_failures"] == 0
@@ -2272,21 +2275,18 @@ def validate_clean_metrics(
 
 
 def validate_lane02_owned_run_metrics(document, expected, pause):
-    """Lane 02: one owned child, one bounded discovery-unavailable projection."""
+    """Lane 02: one owned child. Its initial-set timing gap is stated once, by
+    `loader_discovery`, never also as a discovery-unavailable skip; under a
+    confirmed pause both contexts may be pause-protected instead of unproven."""
     require(pause in ("never", "auto", "always"), f"unknown Lane02 pause: {pause!r}")
     validate_clean_metrics(
         document,
         expected,
         discovery="scan",
-        discovery_skipped=1,
         run=True,
     )
     evidence = document["evidence"]
-    require(
-        evidence["skipped"]
-        == [{"name": DISCOVERY_SUBJECT, "reason": DISCOVERY_UNAVAILABLE}],
-        f"unexpected Lane02 skips: {evidence['skipped']}",
-    )
+    require(evidence["skipped"] == [], f"unexpected Lane02 skips: {evidence['skipped']}")
     require(evidence["child_still_running"] is False, evidence["child_still_running"])
     loader = evidence["loader_discovery"]
     require(loader["state_read_failures"] == 0, loader["state_read_failures"])
@@ -2295,18 +2295,17 @@ def validate_lane02_owned_run_metrics(document, expected, pause):
         == {"debug_state_every_hit": 2, "dlopen_return": 0, "unavailable": 0},
         f"unexpected Lane02 loader strategies: {loader['strategies']}",
     )
-    timing = {
-        "qualified_pre_constructor": 0,
-        "known_pre_relocation": 0,
-        "unproven": 1,
-        "none": 0,
-    }
-    require(loader["dlopen_timing"] == timing, loader["dlopen_timing"])
-    require(loader["initial_set_timing"] == timing, loader["initial_set_timing"])
-    require(
-        loader["initial_set_capture"] == {"eligible": 0, "none": 1},
-        loader["initial_set_capture"],
+    unproven = {key: 0 for key in LOADER_TIMING_KEYS} | {"unproven": 1}
+    protected = {key: 0 for key in LOADER_TIMING_KEYS} | {"pause_protected": 1}
+    allowed = (unproven,) if pause == "never" else (unproven, protected)
+    require(loader["dlopen_timing"] in allowed, loader["dlopen_timing"])
+    require(loader["initial_set_timing"] in allowed, loader["initial_set_timing"])
+    capture = (
+        {"eligible": 0, "none": 0, "pause_protected": 1}
+        if loader["initial_set_timing"] == protected
+        else {"eligible": 0, "none": 1, "pause_protected": 0}
     )
+    require(loader["initial_set_capture"] == capture, loader["initial_set_capture"])
     attempts, confirmed, partial = (evidence[name] for name in PAUSE_COUNTERS)
     if pause == "never":
         require(
@@ -2967,12 +2966,10 @@ def self_test():
     rejected(lambda: validate_clean_metrics(clean, {"C_Initialize": 1}, 2))
     print("clean metrics multiplier is exact: OK")
 
-    # Lane 02 owns one child and publishes one sanitized timing-proof skip.
+    # Lane 02 owns one child; its timing gap lives in loader_discovery alone.
     for pause in ("never", "auto", "always"):
         owned = copy.deepcopy(clean)
-        owned["evidence"]["skipped"] = [
-            {"name": DISCOVERY_SUBJECT, "reason": DISCOVERY_UNAVAILABLE}
-        ]
+        owned["evidence"]["skipped"] = []
         owned["evidence"]["child_still_running"] = False
         owned["evidence"]["loader_discovery"] = loader_discovery_fixture(
             strategies__debug_state_every_hit=2,
@@ -2990,11 +2987,12 @@ def self_test():
             lambda d: d["evidence"].pop("child_still_running"),
             lambda d: d["evidence"].update(child_still_running="no"),
             lambda d: d["evidence"].update(child_still_running=True),
-            lambda d: d["evidence"].update(skipped=[]),
             lambda d: d["evidence"]["skipped"].append(
                 {"name": DISCOVERY_SUBJECT, "reason": DISCOVERY_UNAVAILABLE}
             ),
-            lambda d: d["evidence"]["skipped"][0].update(reason=TABLE_UNAVAILABLE),
+            lambda d: d["evidence"]["skipped"].append(
+                {"name": DISCOVERY_SUBJECT, "reason": TABLE_UNAVAILABLE}
+            ),
             lambda d: d["evidence"]["loader_discovery"].update(state_read_failures=1),
             lambda d: d["evidence"]["discovery"][0].update(loader_pid=7),
             lambda d: d["functions"].__setitem__(0, function_items(
@@ -3031,6 +3029,35 @@ def self_test():
                 zero_loader, {"C_Initialize": 1}, pause
             )
         )
+        # A confirmed pause may protect both contexts; `never` never can.
+        guarded = copy.deepcopy(owned)
+        guarded["evidence"]["loader_discovery"] = loader_discovery_fixture(
+            strategies__debug_state_every_hit=2,
+            dlopen_timing__pause_protected=1,
+            initial_set_timing__pause_protected=1,
+            initial_set_capture__pause_protected=1,
+        )
+        settle_fixture_verdict(guarded)
+        if pause == "never":
+            rejected(
+                lambda guarded=guarded: validate_lane02_owned_run_metrics(
+                    guarded, {"C_Initialize": 1}, "never"
+                )
+            )
+        else:
+            validate_lane02_owned_run_metrics(guarded, {"C_Initialize": 1}, pause)
+            mismatched = copy.deepcopy(guarded)
+            mismatched["evidence"]["loader_discovery"]["initial_set_capture"] = {
+                "eligible": 0,
+                "none": 1,
+                "pause_protected": 0,
+            }
+            settle_fixture_verdict(mismatched)
+            rejected(
+                lambda mismatched=mismatched, pause=pause: validate_lane02_owned_run_metrics(
+                    mismatched, {"C_Initialize": 1}, pause
+                )
+            )
     print("lane02 owned-run metrics self-test: OK")
 
     # A lane whose target maps the provider only after attach: the manifest is

@@ -1765,8 +1765,10 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
         // No named view and no cgroup path: discovery sweeps /proc itself.
         ScopeArg::System => (Scope::System, None),
     };
-    if kind == Kind::Trace && a.duration.is_none() {
-        eprintln!("{}", no_duration_notice());
+    match (kind, a.duration) {
+        (Kind::Trace, None) => eprintln!("{}", no_duration_notice()),
+        (Kind::Profile, None) => eprintln!("{}", no_profile_duration_notice()),
+        _ => {}
     }
     warn_unsafe_policy(policy);
     let accepted = preflight_uretprobe_hazard(
@@ -1862,6 +1864,14 @@ fn no_duration_notice() -> String {
          process exits (event cap still applies: default {DEFAULT_TRACE_MAX_EVENTS} events, \
          --max-events to change)"
     )
+}
+
+/// The profile counterpart: no event cap applies to an aggregate
+/// capture, so the notice only names the interrupt that ends it.
+fn no_profile_duration_notice() -> String {
+    "p11scope: no --duration given; profile captures until interrupted (Ctrl-C) or the \
+     process exits"
+        .to_string()
 }
 
 fn capture_policy(kind: Kind, metrics: bool, unsafe_requested: bool) -> Result<CapturePolicy> {
@@ -2804,7 +2814,7 @@ fn report_attach_failures(session: &Session) {
 /// The per-slot attach diagnostic. The failure message embeds the module's
 /// `/proc/<pid>/maps` filename (attach.rs builds it from `slot.object_path`),
 /// which the target controls, so this terminal boundary escapes control bytes
-/// — the stored `attach_failures` evidence keeps the raw string.
+/// — and the stored `attach_failures` evidence keeps the same escaped form.
 fn format_attach_failure(slot: u32, message: &str) -> String {
     format!(
         "attach failed (slot {slot}): {}",
@@ -6134,7 +6144,10 @@ fn evidence_for(
         slots: facts.slots(),
         active_slots: facts.active_slots(),
         attached_probes,
-        attach_failures: attach_failures.iter().map(|(_, msg)| msg.clone()).collect(),
+        attach_failures: attach_failures
+            .iter()
+            .map(|(_, msg)| render::escape_controls(msg).into_owned())
+            .collect(),
         aliased: plan
             .slots
             .iter()
@@ -7065,6 +7078,51 @@ mod tests {
         assert!(message.starts_with("p11scope: 2/2 attach attempts failed"));
         assert!(message.ends_with(r"First underlying error: at /opt/p\u{1b}[2Jevil\r.so: EPERM"));
         assert!(!message.contains('\u{1b}') && !message.contains('\r'));
+    }
+
+    #[test]
+    fn stored_attach_failures_escape_target_controls_like_the_terminal() {
+        let (engine, _) = crate::discovery::engine::tests::selection_output_engines();
+        let state = semantics::State::new(engine.plan());
+        let failures = [(
+            3u32,
+            "p11_return at /opt/p\u{1b}[2Jevil\r.so+0x10: EPERM".to_string(),
+        )];
+        let scheduling =
+            SchedulingAccumulator::default().snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64);
+        let evidence = evidence_for(
+            &engine,
+            engine.capture_facts(),
+            0,
+            false,
+            false,
+            &failures,
+            &[],
+            metrics::KernelEvidence::default(),
+            process::TrackingEvidence::default(),
+            0,
+            &state,
+            false,
+            true,
+            Default::default(),
+            None,
+            false,
+            scheduling,
+            None,
+            None,
+        );
+        assert_eq!(
+            evidence.attach_failures,
+            [r"p11_return at /opt/p\u{1b}[2Jevil\r.so+0x10: EPERM".to_string()]
+        );
+        let stored = &evidence.attach_failures[0];
+        assert!(
+            !stored.contains('\u{1b}') && !stored.contains('\r'),
+            "{stored:?}"
+        );
+        // The JSON value carries the same escaped form, not raw bytes.
+        let value = render::versioned_evidence(&evidence);
+        assert_eq!(value["attach_failures"][0].as_str(), Some(stored.as_str()));
     }
 
     #[test]
@@ -14102,5 +14160,19 @@ mod correction1_tests {
             "{notice:?}"
         );
         assert!(notice.contains("--max-events"), "{notice:?}");
+    }
+
+    #[test]
+    fn no_profile_duration_notice_says_it_captures_until_ctrl_c() {
+        let notice = no_profile_duration_notice();
+        assert!(
+            notice.starts_with("p11scope: no --duration given; "),
+            "{notice:?}"
+        );
+        assert!(
+            notice.contains("profile captures until interrupted (Ctrl-C)"),
+            "{notice:?}"
+        );
+        assert!(!notice.contains('\n'), "one line: {notice:?}");
     }
 }

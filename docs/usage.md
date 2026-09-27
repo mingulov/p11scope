@@ -544,7 +544,12 @@ kind of workload without a manifest and ends `68`/`0` instead.
   never replaced; the profile report re-checks the name before publishing.
   An existing trace file is truncated only once the capture has attached: a
   capture that fails before that leaves it as it was, and removes a file it
-  had only just created. To keep no report file, leave out `-o`. Every
+  had only just created. To keep no report file, leave out `-o`.
+  `-o -` means stdout for trace (including `run --trace`), whose lines
+  already stream to stdout when `-o` is omitted; profile (including `run`
+  without `--trace`) refuses `-o -` because its report requires a file —
+  omit `-o` for display frames on stdout. No command ever creates a file
+  literally named `-`. Every
   directory on the way to the file must be a real directory (no symlinks)
   owned by root, you, or the user who ran `sudo`, and not group- or
   world-writable unless it has the sticky bit (as `/tmp` does); otherwise

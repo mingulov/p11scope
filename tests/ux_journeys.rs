@@ -891,3 +891,233 @@ fn m9_non_utf8_arguments_never_panic() {
         assert!(!stderr.contains("panicked"), "{stderr}");
     }
 }
+
+/// SE-09: profile without --duration prints one stderr line at start
+/// saying it captures until Ctrl-C (trace already warns).
+#[test]
+fn se09_profile_without_duration_names_ctrl_c_on_stderr() {
+    use std::io::Read as _;
+    use std::process::Stdio;
+    let target = SleepTarget::spawn();
+    let mut child = Command::new(bin())
+        .args(["profile", "--pid", &target.pid()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn p11scope profile");
+    // The notice prints before discovery; give it time to land, then stop
+    // the capture the way an operator would. Without privilege it has
+    // already exited 1 at the BPF preflight and the signal is a no-op.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let _ = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) };
+    let mut waited = 0;
+    while waited < 120 && child.try_wait().expect("poll profile").is_none() {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        waited += 1;
+    }
+    if child.try_wait().expect("poll profile").is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("profile without --duration did not stop on SIGINT");
+    }
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .expect("piped stderr")
+        .read_to_string(&mut stderr)
+        .expect("read profile stderr");
+    assert!(
+        stderr.contains("profile captures until interrupted (Ctrl-C)"),
+        "{stderr}"
+    );
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|line| line.contains("no --duration given"))
+            .count(),
+        1,
+        "exactly one no-duration line: {stderr}"
+    );
+}
+
+/// SE-08: `-o -` never creates a file literally named `-`. Trace
+/// treats it as stdout (its default); profile refuses it with a usage
+/// error saying how to write to stdout.
+#[test]
+fn se08_dash_output_never_creates_a_file_named_dash() {
+    let dir = tempfile::tempdir().unwrap();
+    let run_in = |args: &[&str]| {
+        Command::new(bin())
+            .args(args)
+            .current_dir(dir.path())
+            .output()
+            .unwrap_or_else(|error| panic!("run p11scope {args:?}: {error}"))
+    };
+    // Profile refuses: exit 2, names `-o -`, says how to get stdout.
+    let refused = run_in(&["profile", "--pid", "1", "-o", "-"]);
+    assert_eq!(refused.status.code(), Some(2));
+    let stderr = String::from_utf8(refused.stderr).expect("stderr is UTF-8");
+    assert!(stderr.contains("-o -"), "{stderr}");
+    assert!(stderr.contains("omit -o"), "{stderr}");
+    assert!(stderr.contains("usage:"), "{stderr}");
+    // Trace accepts `-o -` as stdout: never exit 2, never a file.
+    let target = SleepTarget::spawn();
+    let pid = target.pid();
+    let traced = run_in(&["trace", "--pid", &pid, "-o", "-", "--duration", "1"]);
+    assert_ne!(traced.status.code(), Some(2));
+    assert!(
+        !dir.path().join("-").exists(),
+        "a file literally named `-` was created"
+    );
+    let litter: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert!(litter.is_empty(), "{litter:?}");
+}
+
+/// SE-07: a scalar flag given twice is a usage error (exit 2) naming
+/// the flag, instead of silent last-wins.
+#[test]
+fn se07_repeated_scalar_flag_is_a_usage_error_exit_2() {
+    let target = SleepTarget::spawn();
+    let pid = target.pid();
+    let cases: Vec<(Vec<String>, &str)> = [
+        (
+            vec![
+                "profile",
+                "--pid",
+                &pid,
+                "--duration",
+                "5",
+                "--duration",
+                "10",
+            ],
+            "--duration",
+        ),
+        (
+            vec!["profile", "--pid", &pid, "-o", "a.json", "-o", "b.json"],
+            "-o",
+        ),
+        (vec!["profile", "--pid", "1", "--pid", "2"], "--pid"),
+        (
+            vec![
+                "run",
+                "--pause",
+                "never",
+                "--pause",
+                "auto",
+                "--",
+                "/bin/true",
+            ],
+            "--pause",
+        ),
+    ]
+    .into_iter()
+    .map(|(args, flag)| {
+        (
+            args.into_iter().map(str::to_string).collect::<Vec<_>>(),
+            flag,
+        )
+    })
+    .collect();
+    for (argv, flag) in &cases {
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let usage = run(&refs);
+        assert_eq!(usage.code, Some(2), "{argv:?}: {}", usage.stderr);
+        assert!(
+            usage.stderr.contains(&format!("{flag} given twice")),
+            "{argv:?}: {}",
+            usage.stderr
+        );
+        assert!(usage.stderr.contains("usage:"), "{argv:?}");
+    }
+}
+
+/// SE-06: empty-string option values are usage errors (exit 2),
+/// naming the flag.
+#[test]
+fn se06_empty_option_values_are_usage_errors_exit_2() {
+    let target = SleepTarget::spawn();
+    let pid = target.pid();
+    let cases: Vec<(Vec<String>, &str)> = [
+        (vec!["profile", "--pid", &pid, "--module", ""], "--module"),
+        (
+            vec!["profile", "--pid", &pid, "--manifest", ""],
+            "--manifest",
+        ),
+        (vec!["profile", "--cgroup", ""], "--cgroup"),
+        (vec!["profile", "--pid", &pid, "-o", ""], "-o"),
+        (
+            vec!["profile", "--pid", &pid, "--hook-symbol", ""],
+            "empty symbol name",
+        ),
+    ]
+    .into_iter()
+    .map(|(args, flag)| {
+        (
+            args.into_iter().map(str::to_string).collect::<Vec<_>>(),
+            flag,
+        )
+    })
+    .collect();
+    for (argv, flag) in &cases {
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let usage = run(&refs);
+        assert_eq!(usage.code, Some(2), "{argv:?}: {}", usage.stderr);
+        assert!(usage.stderr.contains(flag), "{argv:?}: {}", usage.stderr);
+        assert!(usage.stderr.contains("usage:"), "{argv:?}");
+    }
+}
+
+/// SE-05: `--pid 0` names no process; it is a usage error (exit 2),
+/// not a late runtime pin failure (exit 1).
+#[test]
+fn se05_pid_zero_is_a_usage_error_exit_2() {
+    for argv in [
+        vec!["profile", "--pid", "0"],
+        vec!["trace", "--pid", "0"],
+        vec!["inspect", "--pid", "0"],
+    ] {
+        let usage = run(&argv);
+        assert_eq!(usage.code, Some(2), "{argv:?}: {}", usage.stderr);
+        assert!(
+            usage.stderr.contains("--pid must be greater than zero"),
+            "{argv:?}: {}",
+            usage.stderr
+        );
+        assert!(usage.stderr.contains("usage:"), "{argv:?}");
+    }
+}
+
+/// SE-04: `--duration 0` (bare or suffixed) is a usage error, not a
+/// zero-length capture: exit 2 with a clear message on every surface.
+#[test]
+fn se04_zero_duration_is_a_usage_error_exit_2() {
+    let target = SleepTarget::spawn();
+    let pid = target.pid();
+    let cases: Vec<Vec<String>> = [
+        vec!["profile", "--pid", &pid, "--duration", "0"],
+        vec!["profile", "--pid", &pid, "--duration", "0s"],
+        vec!["profile", "--pid", &pid, "--duration", "0m"],
+        vec!["trace", "--pid", &pid, "--duration", "0"],
+        vec!["run", "--duration", "0", "--", "/bin/true"],
+    ]
+    .into_iter()
+    .map(|args| args.into_iter().map(str::to_string).collect())
+    .collect();
+    for argv in &cases {
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let usage = run(&refs);
+        assert_eq!(usage.code, Some(2), "{argv:?}: {}", usage.stderr);
+        assert!(
+            usage
+                .stderr
+                .contains("--duration must be greater than zero"),
+            "{argv:?}: {}",
+            usage.stderr
+        );
+        assert!(usage.stderr.contains("usage:"), "{argv:?}");
+    }
+}
